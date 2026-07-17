@@ -5098,7 +5098,9 @@ pub const AppState = struct {
                 return;
             }
             self.app_config.mcp_integration_enabled = summary.installedCount() > 0;
-            if (summary.conflictCount() > 0) {
+            if (summary.failedCount() > 0) {
+                self.setSidebarNotice("Enabled Verde MCP where possible; some provider configs could not be updated.");
+            } else if (summary.conflictCount() > 0) {
                 self.setSidebarNotice("Enabled Verde MCP where possible; an existing 'verde' entry was preserved.");
             } else {
                 self.setSidebarNotice("Enabled Verde tools in detected agent providers.");
@@ -8819,8 +8821,12 @@ pub const AppState = struct {
                 self.markDirty();
                 return;
             };
-            self.app_config.mcp_integration_enabled = false;
-            self.setSidebarNotice("Disabled Verde MCP tools in agent providers.");
+            self.app_config.mcp_integration_enabled = self.settings_mcp_summary.installedCount() > 0 or self.settings_mcp_summary.failedCount() > 0;
+            if (self.settings_mcp_summary.failedCount() > 0) {
+                self.setSidebarNotice("Removed Verde MCP where possible; some provider configs could not be updated.");
+            } else {
+                self.setSidebarNotice("Disabled Verde MCP tools in agent providers.");
+            }
         } else {
             const summary = provider_mcp.install(self.allocator) catch |err| {
                 log.warn("failed to install provider MCP registrations: {s}", .{@errorName(err)});
@@ -8835,7 +8841,9 @@ pub const AppState = struct {
                 return;
             }
             self.app_config.mcp_integration_enabled = summary.installedCount() > 0;
-            if (summary.conflictCount() > 0) {
+            if (summary.failedCount() > 0) {
+                self.setSidebarNotice("Enabled Verde MCP where possible; some provider configs could not be updated.");
+            } else if (summary.conflictCount() > 0) {
                 self.setSidebarNotice("Enabled Verde MCP where possible; existing entries were preserved.");
             } else {
                 self.setSidebarNotice("Enabled Verde MCP tools in detected providers.");

@@ -5,6 +5,8 @@ const platform_paths = @import("platform_paths");
 const platform_runtime = @import("platform_runtime");
 const process_env = @import("process_env.zig");
 
+const log = std.log.scoped(.provider_mcp);
+
 const MANAGED_ENV_KEY = "VERDE_MCP_MANAGED";
 const MANAGED_ENV_VALUE = "1";
 const CODEX_BLOCK_BEGIN = "# >>> verde managed mcp >>>";
@@ -26,6 +28,7 @@ pub const RegistrationStatus = enum {
     not_installed,
     installed,
     conflict,
+    failed,
 };
 
 pub const Summary = struct {
@@ -65,6 +68,14 @@ pub const Summary = struct {
         var count: usize = 0;
         for (ALL_PROVIDERS) |provider| {
             if (self.forProvider(provider) == .conflict) count += 1;
+        }
+        return count;
+    }
+
+    pub fn failedCount(self: Summary) usize {
+        var count: usize = 0;
+        for (ALL_PROVIDERS) |provider| {
+            if (self.forProvider(provider) == .failed) count += 1;
         }
         return count;
     }
@@ -132,10 +143,18 @@ pub fn install(allocator: std.mem.Allocator) !Summary {
 pub fn uninstall(allocator: std.mem.Allocator) !Summary {
     const home = try platform_paths.userHome(allocator);
     defer allocator.free(home);
-    for (ALL_PROVIDERS) |provider| {
-        try removeProviderAtHome(allocator, home, provider);
+    var failed = [_]bool{false} ** ALL_PROVIDERS.len;
+    for (ALL_PROVIDERS, 0..) |provider, index| {
+        removeProviderAtHome(allocator, home, provider) catch |err| {
+            log.warn("failed to remove {s} MCP registration: {s}", .{ @tagName(provider), @errorName(err) });
+            failed[index] = true;
+        };
     }
-    return inspectAtHome(allocator, home);
+    var summary = inspectAtHome(allocator, home);
+    for (ALL_PROVIDERS, 0..) |provider, index| {
+        if (failed[index]) setSummaryStatus(&summary, provider, .failed);
+    }
+    return summary;
 }
 
 fn detectedProviders() [5]bool {
@@ -164,18 +183,28 @@ fn installAtHome(
     executable: []const u8,
     detected: [5]bool,
 ) !Summary {
+    var failed = [_]bool{false} ** ALL_PROVIDERS.len;
     for (ALL_PROVIDERS, 0..) |provider, index| {
         if (!detected[index]) continue;
         installProviderAtHome(allocator, home, executable, provider) catch |err| switch (err) {
             error.ProviderMcpConflict => continue,
-            else => return err,
+            else => {
+                log.warn("failed to install {s} MCP registration: {s}", .{ @tagName(provider), @errorName(err) });
+                failed[index] = true;
+                continue;
+            },
         };
     }
 
     var summary: Summary = .{};
     for (ALL_PROVIDERS, 0..) |provider, index| {
         const status = inspectProviderAtHome(allocator, home, provider);
-        setSummaryStatus(&summary, provider, if (!detected[index] and status == .not_installed) .unavailable else status);
+        setSummaryStatus(&summary, provider, if (failed[index])
+            .failed
+        else if (!detected[index] and status == .not_installed)
+            .unavailable
+        else
+            status);
     }
     return summary;
 }
@@ -497,4 +526,29 @@ test "an unmanaged verde entry does not block other providers" {
     );
     try std.testing.expectEqual(RegistrationStatus.conflict, summary.claude);
     try std.testing.expectEqual(RegistrationStatus.installed, summary.cursor);
+}
+
+test "OpenCode registration preserves an existing schema config" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(home);
+    const path = try configPathAlloc(std.testing.allocator, home, OPENCODE_SPEC.relative_path);
+    defer std.testing.allocator.free(path);
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    try writeFileAtomic(std.testing.allocator, threaded.io(), path,
+        \\{
+        \\  "$schema": "https://opencode.ai/config.json",
+        \\  "autoupdate": false,
+        \\  "disabled_providers": ["openrouter", "google"]
+        \\}
+    );
+
+    try installJsonAtHome(std.testing.allocator, home, "/opt/verde/bin/verde", OPENCODE_SPEC);
+    try std.testing.expectEqual(RegistrationStatus.installed, inspectJsonAtHome(std.testing.allocator, home, OPENCODE_SPEC));
+    const updated = (try readFileIfPresent(std.testing.allocator, threaded.io(), path)).?;
+    defer std.testing.allocator.free(updated);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "disabled_providers") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "VERDE_MCP_MANAGED") != null);
 }

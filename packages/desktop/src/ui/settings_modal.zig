@@ -631,6 +631,8 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     var mcp_status_buf: [120]u8 = undefined;
     const mcp_status = if (state.settings_mcp_summary.detectedCount() == 0)
         "No supported providers detected · Codex, Claude, Cursor, OpenCode, or Amp"
+    else if (state.settings_mcp_summary.failedCount() > 0)
+        std.fmt.bufPrint(&mcp_status_buf, "Installed for {d} provider(s) · {d} provider config update(s) failed", .{ state.settings_mcp_summary.installedCount(), state.settings_mcp_summary.failedCount() }) catch "Some provider configs could not be updated"
     else if (state.settings_mcp_summary.conflictCount() > 0)
         std.fmt.bufPrint(&mcp_status_buf, "Installed for {d} provider(s) · {d} existing verde entry conflict(s) preserved", .{ state.settings_mcp_summary.installedCount(), state.settings_mcp_summary.conflictCount() }) catch "Some existing verde entries were preserved"
     else
