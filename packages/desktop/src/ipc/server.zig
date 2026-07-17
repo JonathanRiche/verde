@@ -287,7 +287,7 @@ fn writeBrowserStatus(s: *std.json.Stringify, state: *app_state.AppState) !void 
     try s.objectField("visible");
     try s.write(state.isBrowserVisible());
     try s.objectField("suspended");
-    try s.write(state.isBrowserSurfaceSuspendedForLayout() or state.isBrowserSurfaceSuspendedForPaletteOverlay());
+    try s.write(state.isBrowserSurfaceSuspendedForLayout() or state.isBrowserSurfaceSuspendedForPaletteOverlay() or state.isBrowserSurfaceSuspendedForEmptyState());
     try s.objectField("workspace_index");
     if (location) |loc| try s.write(loc.index) else try s.write(null);
     try s.objectField("workspace_id");
@@ -312,6 +312,8 @@ fn writeBrowserStatus(s: *std.json.Stringify, state: *app_state.AppState) !void 
     try s.write(state.isBrowserSurfaceSuspendedForPaletteOverlay());
     try s.objectField("surface_suspended_for_layout");
     try s.write(state.isBrowserSurfaceSuspendedForLayout());
+    try s.objectField("surface_suspended_for_empty_state");
+    try s.write(state.isBrowserSurfaceSuspendedForEmptyState());
     try s.objectField("workspace_header_open_menu_open");
     try s.write(state.isWorkspaceHeaderOpenMenuOpen());
     try s.objectField("sidebar_context_menu_open");
@@ -357,30 +359,31 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
     return try okValueResponse(allocator, id_value, .{
         .protocol_version = PROTOCOL_VERSION,
         .commands = &.{
-            "status",                             "capabilities",                        "workspaces",                          "panes",
-            "active",                             "inspect",                             "threads",                             "terminals",
-            "herdr.open",                         "herdr.handoff",                       "herdr.unlink",                        "herdr.status",
-            "surfaces",                           "surface.list",                        "surface.inspect",                     "surface.focus",
-            "surface.clearAttention",             "notification.create",                 "notification.update",                 "notification.clear",
-            "processes",                          "workspace.select",                    "workspace.create",                    "workspace.rename",
-            "workspace.close",                    "workspace.reopen",                    "workspace.archive",                   "pane.focus",
-            "pane.split",                         "pane.resize",                         "pane.move",                           "pane.minimize",
-            "pane.maximize",                      "pane.restore",                        "pane.close",                          "chat.status",
-            "chat.transcript",                    "chat.draft.set",                      "chat.draft.append",                   "chat.send",
-            "chat.followup",                      "chat.stop",                           "chat.approve",                        "browser.open",
-            "browser.navigate",                   "browser.status",                      "browser.close",                       "browser.toggle",
-            "browser.back",                       "browser.forward",                     "browser.reload",                      "browser.focus",
-            "browser.blur",                       "browser.toolbarHit",                  "browser.selectAllFocused",            "browser.copyFocused",
-            "browser.cutFocused",                 "browser.pasteTextFocused",            "browser.eval",                        "browser.postJson",
-            "browser.inspector.enable",           "browser.inspector.disable",           "browser.inspector.toggle",            "browser.inspector.mode",
-            "browser.inspector.menuOpen",         "browser.inspector.menuClose",         "browser.overlay.workspaceMenuOpen",   "browser.overlay.workspaceMenuClose",
-            "browser.overlay.sidebarMenuOpen",    "browser.overlay.sidebarMenuClose",    "browser.overlay.composerMenuOpen",    "browser.overlay.composerMenuClose",
-            "browser.overlay.workspaceModalOpen", "browser.overlay.workspaceModalClose", "browser.overlay.threadModalOpen",     "browser.overlay.threadModalClose",
-            "browser.overlay.imageModalOpen",     "browser.overlay.imageModalClose",     "browser.overlay.transcriptModalOpen", "browser.overlay.transcriptModalClose",
-            "palette.list",                       "palette.run",                         "terminal.write",                      "terminal.tail",
-            "terminal.screen",                    "process.list",                        "process.inspect",                     "process.start",
-            "process.stop",                       "process.restart",                     "process.logs",                        "agent.open",
-            "stack.status",                       "stack.start",                         "stack.stop",                          "stack.restart",
+            "status",                               "capabilities",                       "workspaces",                          "panes",
+            "active",                               "inspect",                            "threads",                             "terminals",
+            "herdr.open",                           "herdr.handoff",                      "herdr.unlink",                        "herdr.status",
+            "surfaces",                             "surface.list",                       "surface.inspect",                     "surface.focus",
+            "surface.clearAttention",               "notification.create",                "notification.update",                 "notification.clear",
+            "processes",                            "workspace.select",                   "workspace.create",                    "workspace.rename",
+            "workspace.close",                      "workspace.reopen",                   "workspace.archive",                   "pane.focus",
+            "pane.split",                           "pane.resize",                        "pane.move",                           "pane.minimize",
+            "pane.maximize",                        "pane.restore",                       "pane.close",                          "chat.status",
+            "chat.transcript",                      "chat.draft.set",                     "chat.draft.append",                   "chat.send",
+            "chat.followup",                        "chat.stop",                          "chat.approve",                        "browser.open",
+            "browser.navigate",                     "browser.status",                     "browser.close",                       "browser.toggle",
+            "browser.back",                         "browser.forward",                    "browser.reload",                      "browser.focus",
+            "browser.blur",                         "browser.toolbarHit",                 "browser.selectAllFocused",            "browser.copyFocused",
+            "browser.cutFocused",                   "browser.pasteTextFocused",           "browser.eval",                        "browser.postJson",
+            "browser.screenshot",                   "browser.inspector.enable",           "browser.inspector.disable",           "browser.inspector.toggle",
+            "browser.inspector.mode",               "browser.inspector.menuOpen",         "browser.inspector.menuClose",         "browser.overlay.workspaceMenuOpen",
+            "browser.overlay.workspaceMenuClose",   "browser.overlay.sidebarMenuOpen",    "browser.overlay.sidebarMenuClose",    "browser.overlay.composerMenuOpen",
+            "browser.overlay.composerMenuClose",    "browser.overlay.workspaceModalOpen", "browser.overlay.workspaceModalClose", "browser.overlay.threadModalOpen",
+            "browser.overlay.threadModalClose",     "browser.overlay.imageModalOpen",     "browser.overlay.imageModalClose",     "browser.overlay.transcriptModalOpen",
+            "browser.overlay.transcriptModalClose", "palette.list",                       "palette.run",                         "terminal.write",
+            "terminal.tail",                        "terminal.screen",                    "process.list",                        "process.inspect",
+            "process.start",                        "process.stop",                       "process.restart",                     "process.logs",
+            "agent.open",                           "stack.status",                       "stack.start",                         "stack.stop",
+            "stack.restart",
         },
         .events = &.{},
         .encodings = &.{"json"},
@@ -1112,6 +1115,29 @@ fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
             return try errorResponseAlloc(allocator, id_value, "browser_eval_failed", @errorName(err));
         };
         return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "screenshot")) {
+        var capture = state.captureBrowserScreenshot() catch |err| switch (err) {
+            error.BrowserNotVisible => return try errorResponseAlloc(allocator, id_value, "rejected", "browser pane is not visible"),
+            error.BrowserScreenshotUnavailable => return try errorResponseAlloc(allocator, id_value, "unsupported", "browser backend does not expose a CPU frame for screenshots"),
+            else => return try errorResponseAlloc(allocator, id_value, "browser_screenshot_failed", @errorName(err)),
+        };
+        defer capture.deinit(state.allocator);
+        const encoded_len = std.base64.standard.Encoder.calcSize(capture.png_bytes.len);
+        const encoded = try allocator.alloc(u8, encoded_len);
+        defer allocator.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, capture.png_bytes);
+        return try okValueResponse(allocator, id_value, .{
+            .accepted = true,
+            .url = state.browserStateConst().current_url,
+            .path = capture.path,
+            .mime_type = "image/png",
+            .width = capture.width,
+            .height = capture.height,
+            .byte_len = capture.png_bytes.len,
+            .data_base64 = encoded,
+        });
     }
 
     if (std.mem.eql(u8, command, "postJson")) {

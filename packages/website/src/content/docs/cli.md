@@ -156,6 +156,7 @@ verde live browser copy [--json]
 verde live browser cut [--json]
 verde live browser paste-text --text "hello" [--json]
 verde live browser eval --script "document.title" [--json]
+verde live browser screenshot [--json]
 verde live browser post-json --json-payload '{"type":"ping"}' [--json]
 verde live browser inspector-enable [--json]
 verde live browser inspector-disable [--json]
@@ -168,6 +169,9 @@ or WebView2). `browser open` opens a URL in the workspace's browser pane,
 creating one if needed. `browser eval` runs JavaScript in the loaded page and
 returns the result as JSON. The inspector commands control
 [Design Mode](/docs/design-mode) for browser-to-agent visual feedback.
+`browser screenshot` stores and returns the visible viewport as PNG data when
+the active presentation exposes a CPU-side frame. Native child-view backends
+return `unsupported` until their platform snapshot path is available.
 `select-all` and `copy` operate on the focused page element or selection;
 `cut` and `paste-text` target the focused editable element.
 
@@ -268,6 +272,12 @@ controls to compatible agents. It is primarily used by agent integrations;
 most users do not invoke it directly. The bridge handles MCP initialization,
 tool discovery, and tool calls, and requires the relevant live Verde target for
 operations that control the app.
+
+The bridge includes embedded-browser tools for status, open/navigation, DOM
+inspection, selector-based click and typing, and viewport screenshots. Browser
+actions correlate asynchronous webview evaluation results before returning to
+the agent. Potentially sensitive clicks, password entry, and form submission
+require an explicit confirmed retry so the agent client can ask the user first.
 
 ## Provider integrations
 

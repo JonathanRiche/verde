@@ -122,6 +122,7 @@ You can drive the browser pane from the CLI:
 verde live browser open --url https://example.com
 verde live browser navigate --url https://example.com/dashboard
 verde live browser eval --script "document.title"
+verde live browser screenshot --json
 verde live browser status --json
 ```
 

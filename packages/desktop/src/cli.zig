@@ -193,7 +193,7 @@ fn printHelp(out: output.Output) !void {
         \\  workspace select|create|rename|close|reopen ...
         \\  pane focus|split|resize|move|minimize|maximize|restore|close ...
         \\  chat status|transcript|send|followup|stop|approve|draft ...
-        \\  browser open|navigate|status|close|toggle|back|forward|reload|eval|post-json|inspector-* ...
+        \\  browser open|navigate|status|close|toggle|back|forward|reload|eval|screenshot|post-json|inspector-* ...
         \\  palette list|run ...
         \\  terminal write|tail|screen --pane <id> ...
         \\  process list|inspect|start|stop|restart|logs ...
@@ -2237,6 +2237,10 @@ fn handleLiveBrowser(allocator: std.mem.Allocator, out: output.Output, io: std.I
         }, json);
         return;
     }
+    if (std.mem.eql(u8, subcommand, "screenshot")) {
+        try sendLiveRequest(allocator, out, io, "browser.screenshot", .{}, json);
+        return;
+    }
     if (std.mem.eql(u8, subcommand, "post-json")) {
         try sendLiveRequest(allocator, out, io, "browser.postJson", .{
             .json = args.optionValue(argv, "--json-payload") orelse trailingFreeArg(argv, 2) orelse "",
@@ -3077,6 +3081,29 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTool(&s, "restart_process", "Restart a configured Verde process.");
     try writeMcpTool(&s, "stop_process", "Stop a configured Verde process.");
     try writeMcpTool(&s, "start_process", "Start a configured Verde process.");
+    try writeMcpTypedTool(&s, "browser_status", "Inspect the embedded browser state, URL, and last action result.", &.{});
+    try writeMcpTypedTool(&s, "open_browser", "Open or move Verde's embedded browser to a URL in a workspace.", &.{
+        .{ .name = "url", .type_name = "string", .description = "Optional URL to open." },
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace name or path." },
+    });
+    try writeMcpTypedTool(&s, "navigate_browser", "Navigate the open embedded browser to a URL.", &.{
+        .{ .name = "url", .type_name = "string", .description = "URL to navigate to.", .required = true },
+    });
+    try writeMcpTypedTool(&s, "inspect_browser_page", "Read visible page text and interactive elements with reusable CSS selectors.", &.{
+        .{ .name = "max_elements", .type_name = "integer", .description = "Maximum interactive elements to return; defaults to 100." },
+        .{ .name = "text_limit", .type_name = "integer", .description = "Maximum visible-text characters to return; defaults to 12000." },
+    });
+    try writeMcpTypedTool(&s, "click_browser_element", "Click by CSS selector. Sensitive actions require confirmed=true after user confirmation.", &.{
+        .{ .name = "selector", .type_name = "string", .description = "CSS selector for the element to click.", .required = true },
+        .{ .name = "confirmed", .type_name = "boolean", .description = "True only after the user confirms a sensitive action." },
+    });
+    try writeMcpTypedTool(&s, "type_browser_text", "Replace text by CSS selector. Password fields and form submission require confirmed=true after user confirmation.", &.{
+        .{ .name = "selector", .type_name = "string", .description = "CSS selector for the input or editable element.", .required = true },
+        .{ .name = "text", .type_name = "string", .description = "Replacement text to enter.", .required = true },
+        .{ .name = "submit", .type_name = "boolean", .description = "Submit the containing form after typing." },
+        .{ .name = "confirmed", .type_name = "boolean", .description = "True only after the user confirms password entry or submission." },
+    });
+    try writeMcpTypedTool(&s, "capture_browser_screenshot", "Capture the visible browser viewport and return a PNG when CPU-frame capture is supported.", &.{});
     try s.endArray();
     try s.endObject();
     try s.endObject();
@@ -3099,6 +3126,47 @@ fn writeMcpTool(s: *std.json.Stringify, name: []const u8, description: []const u
     try s.endObject();
 }
 
+const McpToolInput = struct {
+    name: []const u8,
+    type_name: []const u8,
+    description: []const u8,
+    required: bool = false,
+};
+
+fn writeMcpTypedTool(s: *std.json.Stringify, name: []const u8, description: []const u8, inputs: []const McpToolInput) !void {
+    try s.beginObject();
+    try s.objectField("name");
+    try s.write(name);
+    try s.objectField("description");
+    try s.write(description);
+    try s.objectField("inputSchema");
+    try s.beginObject();
+    try s.objectField("type");
+    try s.write("object");
+    try s.objectField("properties");
+    try s.beginObject();
+    for (inputs) |input| {
+        try s.objectField(input.name);
+        try s.beginObject();
+        try s.objectField("type");
+        try s.write(input.type_name);
+        try s.objectField("description");
+        try s.write(input.description);
+        try s.endObject();
+    }
+    try s.endObject();
+    try s.objectField("required");
+    try s.beginArray();
+    for (inputs) |input| {
+        if (input.required) try s.write(input.name);
+    }
+    try s.endArray();
+    try s.objectField("additionalProperties");
+    try s.write(false);
+    try s.endObject();
+    try s.endObject();
+}
+
 fn mcpToolsCall(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id_value: std.json.Value, params: std.json.Value) !void {
     if (params != .object) return try mcpError(allocator, out, id_value, -32602, "tools/call params must be an object");
     const tool_name = jsonString(params.object.get("name") orelse .null) orelse
@@ -3110,7 +3178,71 @@ fn mcpToolsCall(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id
     const pane_id = mcpArgU32(arguments, "pane_id") orelse mcpArgU32(arguments, "pane");
     const lines = mcpArgU32(arguments, "lines");
 
+    if (std.mem.eql(u8, tool_name, "inspect_browser_page")) {
+        const script = try mcpBrowserInspectScriptAlloc(
+            allocator,
+            mcpArgU32(arguments, "max_elements") orelse 100,
+            mcpArgU32(arguments, "text_limit") orelse 12_000,
+        );
+        defer allocator.free(script);
+        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, script) catch |err| {
+            return try mcpError(allocator, out, id_value, -32000, @errorName(err));
+        };
+        defer allocator.free(response);
+        return try mcpToolTextResult(allocator, out, id_value, response);
+    }
+    if (std.mem.eql(u8, tool_name, "click_browser_element")) {
+        const selector = mcpArgString(arguments, "selector") orelse
+            return try mcpError(allocator, out, id_value, -32602, "click_browser_element requires selector");
+        const script = try mcpBrowserClickScriptAlloc(allocator, selector, mcpArgBool(arguments, "confirmed") orelse false);
+        defer allocator.free(script);
+        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, script) catch |err| {
+            return try mcpError(allocator, out, id_value, -32000, @errorName(err));
+        };
+        defer allocator.free(response);
+        return try mcpToolTextResult(allocator, out, id_value, response);
+    }
+    if (std.mem.eql(u8, tool_name, "type_browser_text")) {
+        const selector = mcpArgString(arguments, "selector") orelse
+            return try mcpError(allocator, out, id_value, -32602, "type_browser_text requires selector");
+        const input_text = mcpArgString(arguments, "text") orelse
+            return try mcpError(allocator, out, id_value, -32602, "type_browser_text requires text");
+        const script = try mcpBrowserTypeScriptAlloc(
+            allocator,
+            selector,
+            input_text,
+            mcpArgBool(arguments, "submit") orelse false,
+            mcpArgBool(arguments, "confirmed") orelse false,
+        );
+        defer allocator.free(script);
+        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, script) catch |err| {
+            return try mcpError(allocator, out, id_value, -32000, @errorName(err));
+        };
+        defer allocator.free(response);
+        return try mcpToolTextResult(allocator, out, id_value, response);
+    }
+    if (std.mem.eql(u8, tool_name, "capture_browser_screenshot")) {
+        const response = sendLiveRequestAlloc(allocator, io, "browser.screenshot", .{}, 1) catch |err| {
+            return try mcpError(allocator, out, id_value, -32000, @errorName(err));
+        };
+        defer allocator.free(response);
+        return try mcpToolScreenshotResult(allocator, out, id_value, response);
+    }
+
     const response = blk: {
+        if (std.mem.eql(u8, tool_name, "browser_status")) {
+            break :blk sendLiveRequestAlloc(allocator, io, "browser.status", .{}, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "open_browser")) {
+            break :blk sendLiveRequestAlloc(allocator, io, "browser.open", .{
+                .workspace = workspace,
+                .url = mcpArgString(arguments, "url"),
+            }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "navigate_browser")) {
+            const url = mcpArgString(arguments, "url") orelse return try mcpError(allocator, out, id_value, -32602, "navigate_browser requires url");
+            break :blk sendLiveRequestAlloc(allocator, io, "browser.navigate", .{ .url = url }, 1);
+        }
         if (std.mem.eql(u8, tool_name, "list_surfaces")) {
             break :blk sendLiveRequestAlloc(allocator, io, "surfaces", .{}, 1);
         }
@@ -3184,6 +3316,104 @@ fn mcpToolsCall(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id
     try mcpToolTextResult(allocator, out, id_value, response);
 }
 
+fn mcpBrowserEvalAndWaitAlloc(allocator: std.mem.Allocator, io: std.Io, script_body: []const u8) ![]u8 {
+    const nonce = try std.fmt.allocPrint(allocator, "{d}-{d}", .{ platform_runtime.processId(), platform_runtime.monotonicTimestampNs() });
+    defer allocator.free(nonce);
+    const script = try mcpBrowserWrapScriptAlloc(allocator, nonce, script_body);
+    defer allocator.free(script);
+
+    const accepted = try sendLiveRequestAlloc(allocator, io, "browser.eval", .{ .script = script }, 1);
+    defer allocator.free(accepted);
+    if (!liveResponseOk(allocator, accepted)) return error.BrowserActionRejected;
+
+    var attempt: usize = 0;
+    while (attempt < 150) : (attempt += 1) {
+        try std.Io.sleep(io, .fromMilliseconds(20), .awake);
+        const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{}, 1);
+        defer allocator.free(status);
+        if (try mcpBrowserActionResultAlloc(allocator, status, nonce)) |result| return result;
+    }
+    return error.BrowserActionTimeout;
+}
+
+fn liveResponseOk(allocator: std.mem.Allocator, response: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    return jsonBool(parsed.value.object.get("ok") orelse .null) orelse false;
+}
+
+fn mcpBrowserActionResultAlloc(allocator: std.mem.Allocator, status: []const u8, nonce: []const u8) !?[]u8 {
+    var parsed_status = std.json.parseFromSlice(std.json.Value, allocator, status, .{}) catch return null;
+    defer parsed_status.deinit();
+    if (parsed_status.value != .object) return null;
+    const result = parsed_status.value.object.get("result") orelse return null;
+    if (result != .object) return null;
+    const raw_action = jsonString(result.object.get("last_eval_result") orelse .null) orelse return null;
+
+    var parsed_action = std.json.parseFromSlice(std.json.Value, allocator, raw_action, .{}) catch return null;
+    defer parsed_action.deinit();
+    if (parsed_action.value != .object) return null;
+    const actual_nonce = jsonString(parsed_action.value.object.get("verdeAgentBrowserNonce") orelse .null) orelse return null;
+    if (!std.mem.eql(u8, actual_nonce, nonce)) return null;
+    return try allocator.dupe(u8, raw_action);
+}
+
+fn mcpBrowserWrapScriptAlloc(allocator: std.mem.Allocator, nonce: []const u8, script_body: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    try writer.writer.writeAll("(()=>{const __verdeNonce=");
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.write(nonce);
+    try writer.writer.writeAll(";try{const result=(()=>{");
+    try writer.writer.writeAll(script_body);
+    try writer.writer.writeAll("})();return {verdeAgentBrowserNonce:__verdeNonce,ok:true,url:String(location.href),result};}catch(error){return {verdeAgentBrowserNonce:__verdeNonce,ok:false,url:String(location.href),error:String(error&&error.message||error)};}})()");
+    return try writer.toOwnedSlice();
+}
+
+fn mcpBrowserInspectScriptAlloc(allocator: std.mem.Allocator, requested_elements: u32, requested_text_limit: u32) ![]u8 {
+    const max_elements = std.math.clamp(requested_elements, 1, 250);
+    const text_limit = std.math.clamp(requested_text_limit, 1_000, 50_000);
+    return try std.fmt.allocPrint(allocator,
+        \\const visible=(el)=>{{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'}};
+        \\const selectorFor=(el)=>{{if(el.id)return '#'+CSS.escape(el.id);const parts=[];let node=el;while(node&&node.nodeType===1&&parts.length<6){{let part=node.localName;if(node.getAttribute('name'))part+='[name="'+CSS.escape(node.getAttribute('name'))+'"]';else{{let i=1,p=node;while((p=p.previousElementSibling))if(p.localName===node.localName)i++;part+=':nth-of-type('+i+')'}}parts.unshift(part);node=node.parentElement}}return parts.join(' > ')}};
+        \\const nodes=[...document.querySelectorAll('a[href],button,input,textarea,select,[role="button"],[role="link"],[contenteditable="true"],[tabindex]')].filter(visible).slice(0,{d});
+        \\return {{title:document.title,text:String(document.body?.innerText||'').slice(0,{d}),elements:nodes.map((el)=>{{const r=el.getBoundingClientRect();return {{selector:selectorFor(el),tag:el.localName,role:el.getAttribute('role'),type:el.getAttribute('type'),name:el.getAttribute('name'),text:String(el.innerText||el.value||el.getAttribute('aria-label')||'').trim().slice(0,300),href:el.href||null,disabled:Boolean(el.disabled||el.getAttribute('aria-disabled')==='true'),rect:{{x:r.x,y:r.y,width:r.width,height:r.height}}}}}})}};
+    , .{ max_elements, text_limit });
+}
+
+fn mcpBrowserClickScriptAlloc(allocator: std.mem.Allocator, selector: []const u8, confirmed: bool) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    try writer.writer.writeAll("const selector=");
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.write(selector);
+    try writer.writer.writeAll(";const el=document.querySelector(selector);if(!el)throw new Error('No element matches selector');if(el.disabled||el.getAttribute('aria-disabled')==='true')throw new Error('Element is disabled');const label=String(el.innerText||el.value||el.getAttribute('aria-label')||'').trim();const sensitive=el.matches('input[type=submit],button[type=submit]')||/(buy|purchase|pay|delete|remove|send|submit|confirm|publish)/i.test(label);if(sensitive&&!");
+    try writer.writer.writeAll(if (confirmed) "true" else "false");
+    try writer.writer.writeAll(")return {clicked:false,sensitive:true,confirmation_required:true,selector,label};el.scrollIntoView({block:'center',inline:'center'});if(typeof el.focus==='function')el.focus({preventScroll:true});if(typeof el.click==='function')el.click();else el.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window}));return {clicked:true,sensitive,selector,tag:el.localName,label,href:el.href||null};");
+    return try writer.toOwnedSlice();
+}
+
+fn mcpBrowserTypeScriptAlloc(allocator: std.mem.Allocator, selector: []const u8, text: []const u8, submit: bool, confirmed: bool) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    try writer.writer.writeAll("const selector=");
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.write(selector);
+    try writer.writer.writeAll(";const text=");
+    try s.write(text);
+    try writer.writer.writeAll(";const el=document.querySelector(selector);if(!el)throw new Error('No element matches selector');const isField=el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement||el.isContentEditable;if(!isField)throw new Error('Element is not an editable field');const sensitive=(el instanceof HTMLInputElement&&el.type==='password')||");
+    try writer.writer.writeAll(if (submit) "true" else "false");
+    try writer.writer.writeAll(";if(sensitive&&!");
+    try writer.writer.writeAll(if (confirmed) "true" else "false");
+    try writer.writer.writeAll(")return {typed:false,sensitive:true,confirmation_required:true,selector};el.focus();if(el.isContentEditable)el.textContent=text;else{const proto=el instanceof HTMLTextAreaElement?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;const setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;if(setter)setter.call(el,text);else el.value=text}el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:text}));el.dispatchEvent(new Event('change',{bubbles:true}));if(");
+    try writer.writer.writeAll(if (submit) "true" else "false");
+    try writer.writer.writeAll("){if(el.form&&typeof el.form.requestSubmit==='function')el.form.requestSubmit();else el.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',bubbles:true,cancelable:true}))}return {typed:true,submitted:");
+    try writer.writer.writeAll(if (submit) "true" else "false");
+    try writer.writer.writeAll(",sensitive,selector,tag:el.localName};");
+    return try writer.toOwnedSlice();
+}
+
 fn mcpToolTextResult(allocator: std.mem.Allocator, out: output.Output, id_value: std.json.Value, text: []const u8) !void {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     defer writer.deinit();
@@ -3197,6 +3427,61 @@ fn mcpToolTextResult(allocator: std.mem.Allocator, out: output.Output, id_value:
     try s.write("text");
     try s.objectField("text");
     try s.write(text);
+    try s.endObject();
+    try s.endArray();
+    try s.endObject();
+    try s.endObject();
+    try out.stdout("{s}\n", .{writer.written()});
+}
+
+fn mcpToolScreenshotResult(allocator: std.mem.Allocator, out: output.Output, id_value: std.json.Value, response: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch
+        return try mcpToolTextResult(allocator, out, id_value, response);
+    defer parsed.deinit();
+    if (parsed.value != .object or !(jsonBool(parsed.value.object.get("ok") orelse .null) orelse false)) {
+        return try mcpToolTextResult(allocator, out, id_value, response);
+    }
+    const result = parsed.value.object.get("result") orelse return try mcpToolTextResult(allocator, out, id_value, response);
+    if (result != .object) return try mcpToolTextResult(allocator, out, id_value, response);
+    const data = jsonString(result.object.get("data_base64") orelse .null) orelse
+        return try mcpToolTextResult(allocator, out, id_value, response);
+
+    var metadata: std.Io.Writer.Allocating = .init(allocator);
+    defer metadata.deinit();
+    var metadata_json: std.json.Stringify = .{ .writer = &metadata.writer, .options = .{} };
+    try metadata_json.beginObject();
+    try metadata_json.objectField("ok");
+    try metadata_json.write(true);
+    inline for (.{ "url", "path", "mime_type" }) |field| {
+        try metadata_json.objectField(field);
+        if (jsonString(result.object.get(field) orelse .null)) |value| try metadata_json.write(value) else try metadata_json.write(null);
+    }
+    inline for (.{ "width", "height", "byte_len" }) |field| {
+        try metadata_json.objectField(field);
+        if (jsonInt(result.object.get(field) orelse .null)) |value| try metadata_json.write(value) else try metadata_json.write(null);
+    }
+    try metadata_json.endObject();
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try mcpBeginResult(&s, id_value);
+    try s.beginObject();
+    try s.objectField("content");
+    try s.beginArray();
+    try s.beginObject();
+    try s.objectField("type");
+    try s.write("text");
+    try s.objectField("text");
+    try s.write(metadata.written());
+    try s.endObject();
+    try s.beginObject();
+    try s.objectField("type");
+    try s.write("image");
+    try s.objectField("data");
+    try s.write(data);
+    try s.objectField("mimeType");
+    try s.write("image/png");
     try s.endObject();
     try s.endArray();
     try s.endObject();
@@ -3708,4 +3993,28 @@ test "Windows attach console handler catches only interrupt controls" {
     try std.testing.expectEqual(WINDOWS_ATTACH_CTRL_C, windowsAttachControlEventBit(CTRL_C_EVENT).?);
     try std.testing.expectEqual(WINDOWS_ATTACH_CTRL_BREAK, windowsAttachControlEventBit(CTRL_BREAK_EVENT).?);
     try std.testing.expect(windowsAttachControlEventBit(2) == null);
+}
+
+test "browser MCP action result is correlated by nonce" {
+    const allocator = std.testing.allocator;
+    const status =
+        \\{"ok":true,"result":{"last_eval_result":"{\"verdeAgentBrowserNonce\":\"test-nonce\",\"ok\":true,\"url\":\"http://localhost:3000\"}"}}
+    ;
+    const matched = (try mcpBrowserActionResultAlloc(allocator, status, "test-nonce")) orelse return error.MissingBrowserActionResult;
+    defer allocator.free(matched);
+    try std.testing.expect(std.mem.indexOf(u8, matched, "localhost:3000") != null);
+    try std.testing.expect((try mcpBrowserActionResultAlloc(allocator, status, "other-nonce")) == null);
+}
+
+test "browser MCP scripts JSON-escape selectors and typed text" {
+    const allocator = std.testing.allocator;
+    const click = try mcpBrowserClickScriptAlloc(allocator, "button[data-label='say \\\"hi\\\"']", false);
+    defer allocator.free(click);
+    try std.testing.expect(std.mem.indexOf(u8, click, "const selector=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, click, "confirmation_required") != null);
+
+    const typed = try mcpBrowserTypeScriptAlloc(allocator, "#message", "hello\nworld", true, true);
+    defer allocator.free(typed);
+    try std.testing.expect(std.mem.indexOf(u8, typed, "hello\\nworld") != null);
+    try std.testing.expect(std.mem.indexOf(u8, typed, "requestSubmit") != null);
 }
