@@ -2857,12 +2857,12 @@ fn renderUsageHeader(state: *app_state.AppState, bubble: palette.Rect, y: f32, h
     renderUsageHeaderIcon(state, icon_rect, clip);
     queueChromeLabel(state, .{ .x = icon_rect.x + icon + theme.scaledUi(11.0), .y = y + theme.scaledUi(3.0), .w = bubble.w - pad * 2.0 - icon - theme.scaledUi(11.0), .h = theme.scaledUi(22.0) }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(16.0), clip);
     queueText(state, .{ .x = icon_rect.x + icon + theme.scaledUi(11.0), .y = y + theme.scaledUi(27.0), .w = bubble.w - pad * 2.0 - icon - theme.scaledUi(11.0), .h = theme.scaledUi(18.0) }, "Rate limits, reset windows, and recent token activity", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), clip);
-    queueRect(state, .{ .x = bubble.x + pad, .y = y + height - 1.0, .w = bubble.w - pad * 2.0, .h = 1.0 }, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 190)));
+    queueRectClipped(state, .{ .x = bubble.x + pad, .y = y + height - 1.0, .w = bubble.w - pad * 2.0, .h = 1.0 }, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 190)), clip);
 }
 
 /// Renders a small bar-chart glyph for the usage card header without relying on font symbols.
 fn renderUsageHeaderIcon(state: *app_state.AppState, rect: palette.Rect, clip: palette.Rect) void {
-    queueRounded(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 42)), rect.w * 0.5);
+    queueRoundedClipped(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 42)), rect.w * 0.5, clip);
 
     const bar_w = theme.scaledUi(3.0);
     const gap = theme.scaledUi(2.5);
@@ -2899,13 +2899,13 @@ fn renderUsageLimitRow(state: *app_state.AppState, rect: palette.Rect, row: Usag
         queueFixedTextLine(state, .{ .x = rect.x + rect.w * 0.73, .y = rect.y, .w = rect.w * 0.27, .h = label_h }, row.reset, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), clip);
     }
     const bar = palette.Rect{ .x = rect.x, .y = rect.y + theme.scaledUi(25.0), .w = rect.w, .h = bar_h };
-    queueRounded(state, bar, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 210)), bar_h * 0.5);
-    queueRounded(state, .{ .x = bar.x, .y = bar.y, .w = bar.w * @as(f32, @floatFromInt(percent)) / 100.0, .h = bar.h }, paletteColor(usagePercentColor(percent)), bar_h * 0.5);
+    queueRoundedClipped(state, bar, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 210)), bar_h * 0.5, clip);
+    queueRoundedClipped(state, .{ .x = bar.x, .y = bar.y, .w = bar.w * @as(f32, @floatFromInt(percent)) / 100.0, .h = bar.h }, paletteColor(usagePercentColor(percent)), bar_h * 0.5, clip);
 }
 
 /// Renders one account-activity metric tile in the usage card.
 fn renderUsageStatTile(state: *app_state.AppState, rect: palette.Rect, row: UsageTextRow, clip: palette.Rect) void {
-    queueRounded(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 135)), theme.scaledUi(9.0));
+    queueRoundedClipped(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 135)), theme.scaledUi(9.0), clip);
     queueText(state, .{ .x = rect.x + theme.scaledUi(11.0), .y = rect.y + theme.scaledUi(8.0), .w = rect.w - theme.scaledUi(22.0), .h = theme.scaledUi(16.0) }, row.label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(11.5), clip);
     queueFixedTextLine(state, .{ .x = rect.x + theme.scaledUi(11.0), .y = rect.y + theme.scaledUi(28.0), .w = rect.w - theme.scaledUi(22.0), .h = theme.scaledUi(19.0) }, row.value, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.5), clip);
 }
@@ -3004,7 +3004,7 @@ fn renderSlashCommandResultCard(
         .h = theme.scaledUi(16.0),
     }, "completed", paletteColor(theme.COLOR_GREEN), theme.scaledUi(11.5), clip);
 
-    queueRect(state, .{ .x = bubble.x + pad, .y = bubble.y + pad + header_h - 1.0, .w = bubble.w - pad * 2.0, .h = 1.0 }, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 180)));
+    queueRectClipped(state, .{ .x = bubble.x + pad, .y = bubble.y + pad + header_h - 1.0, .w = bubble.w - pad * 2.0, .h = 1.0 }, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 180)), clip);
 
     const body = std.mem.trim(u8, body_raw, "\n\r\t ");
     const body_y = bubble.y + pad + header_h + theme.scaledUi(12.0);
@@ -3169,12 +3169,12 @@ fn renderDiffSummaryCard(
     }), counts orelse "", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), clip);
 
     // Separator below header
-    queueRect(state, snapRect(.{
+    queueRectClipped(state, snapRect(.{
         .x = bubble.x + pad_x,
         .y = header_y + header_h - 1.0,
         .w = bubble.w - pad_x * 2.0,
         .h = 1.0,
-    }), paletteColor(theme.COLOR_PANEL_MUTED));
+    }), paletteColor(theme.COLOR_PANEL_MUTED), clip);
 
     var row_y = bubble.y + pad_y + header_h;
     const file_font = theme.scaledUi(13.5);
@@ -3194,7 +3194,7 @@ fn renderDiffSummaryCard(
         // Chevron at left
         const chev_x = bubble.x + pad_x + theme.scaledUi(6.0);
         const chev_y = row_y + row_h * 0.5;
-        queueCardChevron(state, chev_x, chev_y, expanded, paletteColor(theme.COLOR_TEXT_SUBTLE));
+        queueCardChevron(state, chev_x, chev_y, expanded, paletteColor(theme.COLOR_TEXT_SUBTLE), clip);
 
         // Path
         const path_x = chev_x + theme.scaledUi(14.0);
@@ -3408,7 +3408,7 @@ fn renderToolCallGroup(
         .w = @max(bubble.w - (text_x - bubble.x) - pad_x - chev_w, theme.scaledUi(40.0)),
         .h = theme.scaledUi(20.0),
     }, summary, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), clip);
-    queueCardChevron(state, bubble.x + bubble.w - pad_x - chev_w * 0.5, bubble.y + header_h * 0.5, expanded, paletteColor(theme.COLOR_TEXT_SUBTLE));
+    queueCardChevron(state, bubble.x + bubble.w - pad_x - chev_w * 0.5, bubble.y + header_h * 0.5, expanded, paletteColor(theme.COLOR_TEXT_SUBTLE), clip);
     state.recordCardToggleHit(.{
         .rect = .{ .x = bubble.x, .y = bubble.y, .w = bubble.w, .h = header_h },
         .key = key,
@@ -3500,12 +3500,12 @@ fn renderCommandEventRow(
         }
         break :blk theme.COLOR_GREEN;
     };
-    queueRounded(state, .{
+    queueRoundedClipped(state, .{
         .x = status_cx - status_dia * 0.5,
         .y = status_cy - status_dia * 0.5,
         .w = status_dia,
         .h = status_dia,
-    }, paletteColor(status_color), status_dia * 0.5);
+    }, paletteColor(status_color), status_dia * 0.5, clip);
 
     const copy_w = theme.scaledUi(56.0);
     const copy_h = theme.scaledUi(26.0);
@@ -3513,7 +3513,7 @@ fn renderCommandEventRow(
     const chev_box_w = theme.scaledUi(18.0);
     const chev_cx = bubble.x + bubble.w - pad_x - chev_box_w * 0.5;
     const chev_cy = status_cy;
-    queueCardChevron(state, chev_cx, chev_cy, expanded, paletteColor(theme.COLOR_TEXT_SUBTLE));
+    queueCardChevron(state, chev_cx, chev_cy, expanded, paletteColor(theme.COLOR_TEXT_SUBTLE), clip);
 
     const text_x = status_cx + status_dia * 0.5 + theme.scaledUi(10.0);
     const copy_rect = snapRect(palette.Rect{
@@ -3661,23 +3661,26 @@ fn intersectClipRect(parent: ?palette.Rect, child: palette.Rect) ?palette.Rect {
 }
 
 /// Right-pointing triangle when collapsed, down-pointing when expanded.
-fn queueCardChevron(state: *app_state.AppState, cx: f32, cy: f32, expanded: bool, color: palette.Color) void {
+/// Clipped so rows scrolled out of the transcript never bleed into other panes.
+fn queueCardChevron(state: *app_state.AppState, cx: f32, cy: f32, expanded: bool, color: palette.Color, clip: palette.Rect) void {
     const half = theme.scaledUi(4.0);
     if (expanded) {
-        queueTriangle(
+        queueTriangleClipped(
             state,
             .{ .x = cx - half, .y = cy - half * 0.5 },
             .{ .x = cx + half, .y = cy - half * 0.5 },
             .{ .x = cx, .y = cy + half * 0.7 },
             color,
+            clip,
         );
     } else {
-        queueTriangle(
+        queueTriangleClipped(
             state,
             .{ .x = cx - half * 0.5, .y = cy - half },
             .{ .x = cx + half * 0.7, .y = cy },
             .{ .x = cx - half * 0.5, .y = cy + half },
             color,
+            clip,
         );
     }
 }
@@ -4485,8 +4488,10 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
     const access_rect = state.palette_composer.accessRect();
     const icon_size = theme.scaledUi(22.0);
     const provider_slot = theme.scaledUi(COMPOSER_PROVIDER_LOGO_SLOT_CSS);
+    // Pad must match the composer's scaled `pill_padding_x` so the logo sits
+    // inside the pill's scaled leading reserve instead of over the label.
     const model_icon_slot = palette.Rect{
-        .x = model_rect.x + COMPOSER_TOOLBAR_PILL_PAD_X,
+        .x = model_rect.x + theme.scaledUi(COMPOSER_TOOLBAR_PILL_PAD_X),
         .y = model_rect.y + (model_rect.h - provider_slot) * 0.5,
         .w = provider_slot,
         .h = provider_slot,
@@ -4539,7 +4544,7 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
 
     if (state.palette_composer.showFastToggle()) {
         const fast_icon_rect = snapIconRectOrigin(palette.Rect{
-            .x = fast_rect.x + COMPOSER_TOOLBAR_PILL_PAD_X,
+            .x = fast_rect.x + theme.scaledUi(COMPOSER_TOOLBAR_PILL_PAD_X),
             .y = fast_rect.y + (fast_rect.h - icon_size) * 0.5,
             .w = icon_size,
             .h = icon_size,
@@ -4555,7 +4560,7 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
     // (and its lock glyph) only draws when a host re-enables the toggle.
     if (state.palette_composer.showAccessToggle()) {
         drawAccessIcon(state, snapIconRectOrigin(palette.Rect{
-            .x = access_rect.x + COMPOSER_TOOLBAR_PILL_PAD_X,
+            .x = access_rect.x + theme.scaledUi(COMPOSER_TOOLBAR_PILL_PAD_X),
             .y = access_rect.y + (access_rect.h - icon_size) * 0.5,
             .w = icon_size,
             .h = icon_size,
@@ -4619,8 +4624,16 @@ fn queueRect(state: *app_state.AppState, rect: palette.Rect, color: palette.Colo
     state.palette_overlay_batch.rect(state.allocator, snapRect(rect), color) catch {};
 }
 
+fn queueRectClipped(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, clip: palette.Rect) void {
+    state.palette_overlay_batch.rectClipped(state.allocator, snapRect(rect), color, clip) catch {};
+}
+
 fn queueRounded(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, radius: f32) void {
     state.palette_overlay_batch.roundedRect(state.allocator, rect, color, radius) catch {};
+}
+
+fn queueTriangleClipped(state: *app_state.AppState, p0: palette.draw.Vec2, p1: palette.draw.Vec2, p2: palette.draw.Vec2, color: palette.Color, clip: palette.Rect) void {
+    state.palette_overlay_batch.triangleClipped(state.allocator, p0, p1, p2, color, clip) catch {};
 }
 
 fn queueTriangle(state: *app_state.AppState, p0: palette.draw.Vec2, p1: palette.draw.Vec2, p2: palette.draw.Vec2, color: palette.Color) void {
