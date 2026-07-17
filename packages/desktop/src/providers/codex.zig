@@ -1188,7 +1188,10 @@ pub const Client = struct {
             if (detectTurnTerminalState(root, thread_id, started_turn_id)) |terminal_state| {
                 switch (terminal_state) {
                     .completed => break,
-                    .failed => return error.CodexTurnFailed,
+                    .failed => {
+                        emitTurnFailure(root, request);
+                        return error.CodexTurnFailed;
+                    },
                     .interrupted => return error.CodexTurnInterrupted,
                 }
             }
@@ -2818,6 +2821,16 @@ fn emitItemEvent(
         }
     }
 
+    if (std.mem.eql(u8, item_type, "contextCompaction")) {
+        const method = getOptionalObjectString(root, "method") orelse return false;
+        if (!std.mem.eql(u8, method, "item/completed")) return false;
+        on_stream_event(context, .{ .message = .{
+            .title = "Context compacted",
+            .body = "Codex summarized earlier conversation context to make room for the rest of this turn.",
+        } });
+        return true;
+    }
+
     return false;
 }
 
@@ -3274,6 +3287,19 @@ fn detectTurnTerminalState(root: std.json.Value, thread_id: []const u8, turn_id:
     return null;
 }
 
+fn extractTurnFailureMessage(root: std.json.Value) ?[]const u8 {
+    const params = getObjectField(root, "params") orelse return null;
+    const turn = getObjectField(params, "turn") orelse return null;
+    const error_value = getObjectField(turn, "error") orelse return null;
+    return getOptionalObjectString(error_value, "message");
+}
+
+fn emitTurnFailure(root: std.json.Value, request: provider_types.SendPromptRequest) void {
+    const on_failure = request.on_failure orelse return;
+    const message = extractTurnFailureMessage(root) orelse return;
+    on_failure(request.stream_context, message);
+}
+
 fn findFirstStringByPath(value: std.json.Value, fields: []const []const u8) ?[]const u8 {
     var current = value;
     for (fields) |field| {
@@ -3366,6 +3392,31 @@ fn approvalDecisionString(value: provider_types.ApprovalDecision) []const u8 {
         .deny => "decline",
     };
 }
+
+const TestFailureCapture = struct {
+    message: ?[]const u8 = null,
+
+    fn handle(context: ?*anyopaque, message: []const u8) void {
+        const self: *TestFailureCapture = @ptrCast(@alignCast(context orelse return));
+        self.message = message;
+    }
+};
+
+const TestStreamEventCapture = struct {
+    title: ?[]const u8 = null,
+    body: ?[]const u8 = null,
+
+    fn handle(context: ?*anyopaque, event: provider_types.StreamEvent) void {
+        const self: *TestStreamEventCapture = @ptrCast(@alignCast(context orelse return));
+        switch (event) {
+            .message => |message| {
+                self.title = message.title;
+                self.body = message.body;
+            },
+            .diff => {},
+        }
+    }
+};
 
 test "remote codex app-server command quotes cwd" {
     const command = try buildRemoteCodexCommandLineAlloc(std.testing.allocator, .{
@@ -3730,6 +3781,15 @@ test "detectTurnTerminalState matches turn completion status for the started tur
     const terminal = detectTurnTerminalState(parsed.value, "thread-123", "turn-456");
     try std.testing.expectEqual(TurnTerminalState.failed, terminal.?);
     try std.testing.expectEqual(@as(?TurnTerminalState, null), detectTurnTerminalState(parsed.value, "thread-123", "other-turn"));
+    try std.testing.expectEqualStrings("boom", extractTurnFailureMessage(parsed.value).?);
+
+    var capture: TestFailureCapture = .{};
+    emitTurnFailure(parsed.value, .{
+        .prompt = "test",
+        .stream_context = &capture,
+        .on_failure = TestFailureCapture.handle,
+    });
+    try std.testing.expectEqualStrings("boom", capture.message.?);
 }
 
 test "isContextCompactionCompleted matches compact item completion" {
@@ -3752,6 +3812,14 @@ test "isContextCompactionCompleted matches compact item completion" {
 
     try std.testing.expect(isContextCompactionCompleted(parsed.value, "thread-123"));
     try std.testing.expect(!isContextCompactionCompleted(parsed.value, "other-thread"));
+
+    var capture: TestStreamEventCapture = .{};
+    try std.testing.expect(emitItemEvent(parsed.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqualStrings("Context compacted", capture.title.?);
+    try std.testing.expectEqualStrings(
+        "Codex summarized earlier conversation context to make room for the rest of this turn.",
+        capture.body.?,
+    );
 }
 
 test "isThreadCompactionIdle matches idle fallback" {
