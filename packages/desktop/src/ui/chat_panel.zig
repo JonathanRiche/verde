@@ -32,6 +32,7 @@ const COMPOSER_FOLLOWUP_PIN_Z: i32 = 126;
 /// Height of the pinned follow-up card shown above the composer while a reply
 /// streams and a message is queued/steered. One label line plus two prompt lines.
 const FOLLOWUP_PIN_HEIGHT: f32 = 60.0;
+const APPROVAL_CARD_HEIGHT: f32 = 104.0;
 /// File mention search must sit above composer chrome and toolbar menus.
 const COMPOSER_FILE_SEARCH_Z: i32 = 150;
 /// Must match `PaletteComposerPrompt` `pill_padding_x` in `state.zig` so toolbar glyphs align with label insets.
@@ -72,6 +73,13 @@ var transcript_scrollbar_max_scroll: f32 = 0.0;
 var transcript_scrollbar_drag_grab_offset: f32 = 0.0;
 var transcript_scrollbar_drag_active: bool = false;
 var transcript_scrollbar_drag_pane_id: ?app_state.WorkspacePaneId = null;
+
+const ApprovalHitCache = struct {
+    pane_id: ?app_state.WorkspacePaneId = null,
+    approve_rect: palette.Rect = .{},
+    deny_rect: palette.Rect = .{},
+};
+var approval_hits: ApprovalHitCache = .{};
 
 const FileSearchHitCache = struct {
     panel_rect: palette.Rect = .{},
@@ -233,12 +241,22 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
         theme.scaledUi(FOLLOWUP_PIN_HEIGHT) + theme.scaledUi(10.0)
     else
         0.0;
+    const pending_approval = if (live_composer) state.pendingApprovalSnapshot() catch null else null;
+    defer if (pending_approval) |approval| {
+        state.allocator.free(approval.call_id);
+        state.allocator.free(approval.title);
+        state.allocator.free(approval.body);
+    };
+    const approval_reserve = if (pending_approval != null)
+        theme.scaledUi(APPROVAL_CARD_HEIGHT) + theme.scaledUi(10.0)
+    else
+        0.0;
 
     const body = palette.Rect{
         .x = rect.x,
         .y = header.y + header.h,
         .w = rect.w,
-        .h = @max(composer_y - (header.y + header.h) - attachment_reserve - followup_reserve, theme.scaledUi(120.0)),
+        .h = @max(composer_y - (header.y + header.h) - attachment_reserve - followup_reserve - approval_reserve, theme.scaledUi(120.0)),
     };
     const process_strip_height = if (pane_id == null and state.currentProject().managed_processes.items.len > 0)
         theme.scaledUi(52.0)
@@ -331,6 +349,17 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
         }
     } else {
         state.setFollowupPinRect(null);
+    }
+    if (pending_approval) |approval| {
+        const card_rect = palette.Rect{
+            .x = composer_rect.x,
+            .y = composer_rect.y - attachment_reserve - followup_reserve - theme.scaledUi(APPROVAL_CARD_HEIGHT) - theme.scaledUi(8.0),
+            .w = composer_rect.w,
+            .h = theme.scaledUi(APPROVAL_CARD_HEIGHT),
+        };
+        renderApprovalCard(state, card_rect, approval, pane_id);
+    } else if (live_composer) {
+        approval_hits = .{};
     }
     if (terminal_height > 0.0) {
         terminal_panel.renderDockAt(state, .{
@@ -829,6 +858,17 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
         return false;
     }
 
+    if (clicks <= 1 and (rectContains(approval_hits.approve_rect, x, y) or rectContains(approval_hits.deny_rect, x, y))) {
+        if (approval_hits.pane_id) |id| _ = state.focusCurrentProjectWorkspacePane(id);
+        if (rectContains(approval_hits.approve_rect, x, y)) {
+            state.resolvePendingApproval(.approve);
+        } else {
+            state.resolvePendingApproval(.deny);
+        }
+        approval_hits = .{};
+        return true;
+    }
+
     const hit = findTranscriptHit(x, y) orelse return false;
     const pane_id = hit.pane_id;
     if (pane_id) |id| _ = state.focusCurrentProjectWorkspacePane(id);
@@ -898,6 +938,27 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
     state.clearTranscriptMarkdownSelection();
     state.blurPaletteComposer();
     return false;
+}
+
+// Pending provider approval card above the composer.
+fn renderApprovalCard(state: *app_state.AppState, rect: palette.Rect, approval: app_state.PendingApproval, pane_id: ?app_state.WorkspacePaneId) void {
+    const pad = theme.scaledUi(14.0);
+    const button_h = theme.scaledUi(30.0);
+    const button_w = theme.scaledUi(92.0);
+    const gap = theme.scaledUi(8.0);
+    queueRounded(state, rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(12.0));
+    queueBorder(state, rect, paletteColor(theme.COLOR_GREEN), theme.scaledUi(12.0), theme.scaledUi(1.0));
+    queueText(state, .{ .x = rect.x + pad, .y = rect.y + theme.scaledUi(10.0), .w = rect.w - pad * 2.0, .h = theme.scaledUi(20.0) }, approval.title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), rect);
+    queueText(state, .{ .x = rect.x + pad, .y = rect.y + theme.scaledUi(34.0), .w = @max(rect.w - pad * 2.0 - button_w * 2.0 - gap - theme.scaledUi(12.0), theme.scaledUi(80.0)), .h = theme.scaledUi(42.0) }, approval.body, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), rect);
+
+    const deny_rect = palette.Rect{ .x = rect.x + rect.w - pad - button_w * 2.0 - gap, .y = rect.y + rect.h - pad - button_h, .w = button_w, .h = button_h };
+    const approve_rect = palette.Rect{ .x = deny_rect.x + button_w + gap, .y = deny_rect.y, .w = button_w, .h = button_h };
+    queueRounded(state, deny_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0));
+    queueBorder(state, deny_rect, paletteColor(theme.borderMuted()), theme.scaledUi(8.0), theme.scaledUi(1.0));
+    queueText(state, deny_rect, "Decline", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), deny_rect);
+    queueRounded(state, approve_rect, paletteColor(theme.COLOR_GREEN), theme.scaledUi(8.0));
+    queueText(state, approve_rect, "Allow", paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), approve_rect);
+    approval_hits = .{ .pane_id = pane_id, .approve_rect = approve_rect, .deny_rect = deny_rect };
 }
 
 /// Selects all assistant markdown in the current thread (persisted messages, pending timeline, and stream tail when present).
