@@ -3512,7 +3512,14 @@ fn renderCommandEventRow(
     });
     const text_color = if (failed) paletteColor(theme.COLOR_DIFF_REMOVE) else paletteColor(theme.COLOR_TEXT_MUTED);
 
-    const copy_bg = if (grouped) theme.withAlpha(theme.COLOR_PANEL_ALT, 235) else theme.withAlpha(theme.COLOR_PANEL_MUTED, 180);
+    const copy_hovered = rectContains(copy_rect, state.palette_mouse_x, state.palette_mouse_y);
+    // Match the composer model pill: a quiet translucent resting fill that
+    // becomes lighter and more opaque when the pointer enters the control.
+    const copy_bg = if (copy_hovered)
+        theme.withAlpha(theme.lighten(theme.COLOR_PANEL_ALT, 0.08), 210)
+    else
+        theme.withAlpha(theme.COLOR_PANEL_MUTED, 86);
+    const copy_text_color = if (copy_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
     queueRoundedClipped(state, copy_rect, paletteColor(copy_bg), theme.scaledUi(5.0), clip);
     const copy_label_h = theme.scaledUi(14.0);
     queueFixedTextLine(state, .{
@@ -3520,7 +3527,7 @@ fn renderCommandEventRow(
         .y = copy_rect.y + (copy_rect.h - copy_label_h) * 0.5,
         .w = copy_rect.w - theme.scaledUi(20.0),
         .h = copy_label_h,
-    }, "Copy", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(11.5), clip);
+    }, "Copy", paletteColor(copy_text_color), theme.scaledUi(11.5), clip);
     state.recordTranscriptCopyHit(copy_rect, body_raw, toolCopyIdentity(message_index, body_raw));
 
     const mono_w = font_size * 0.55;
