@@ -4451,11 +4451,12 @@ fn renderPendingFollowupPin(
     }, prompt, paletteColor(theme.COLOR_WHITE), body_font, rect);
 }
 
-// The run summary words are nearly all cap-height (no descenders), so their
-// optical center sits slightly above the pill's geometric center. Lift the
-// glyphs by the same amount so they align with the text instead of the pill
-// box. Tuned against screenshots: 0 reads a hair low, 2.5 floats high.
-const RUN_PILL_ICON_OPTICAL_LIFT: f32 = 1.0;
+// Vertical nudge from the pill's geometric center to the label text's optical
+// midline. The run labels are lowercase-heavy ("Full access"), so their ink
+// mass sits below center — negative drops the glyphs onto it. Measured from
+// screenshots at 1.667x display scale: glyph ink centered ~3px above the
+// cap-band midline at +1.0, so -1.0 (a ~3.3px swing) lands brain/lock on it.
+const RUN_PILL_ICON_OPTICAL_LIFT: f32 = -1.0;
 
 // Centers a square glyph box of `size` inside a reserved run-pill label cell;
 // the cell's spare width splits evenly into the word-side and separator-side
