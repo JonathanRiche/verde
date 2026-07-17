@@ -174,3 +174,9 @@ pub fn shutdownOwnedProviderProcesses() void {
     cursor.shutdownOwnedServer();
     runtime_log.diagnostic("provider shutdown done cursor", .{});
 }
+
+/// Stops a Codex app-server launched by this process so a durable send can
+/// transfer server ownership to the session daemon.
+pub fn releaseOwnedCodexServer() void {
+    codex.shutdownOwnedServer();
+}

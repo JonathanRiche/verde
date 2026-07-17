@@ -26,7 +26,9 @@ pub const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\verde-sessionizer-";
 // attach to a process that cannot list/tail those turns.
 // Version 8 retires daemons whose Codex client could silently discard
 // app-server tool requests and leave GUI turns pending forever.
-pub const PROTOCOL_VERSION: u32 = 8;
+// Version 9 transfers Codex server ownership to the daemon and retains
+// completed chat turns until the desktop consumes them.
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
@@ -1121,7 +1123,7 @@ pub const Daemon = struct {
         }
         for (self.chat_turns.items) |turn| {
             lockTurn(turn);
-            const keep_alive = turn.status == .running or turn.status == .waiting_approval;
+            const keep_alive = chatTurnKeepsDaemonAlive(turn.status, turn.consumed, turn.worker_done);
             turn.mutex.unlock();
             if (keep_alive) {
                 self.idle_since_ms = null;
@@ -1666,6 +1668,7 @@ fn drainSessionsThread(context: DrainThreadContext) void {
             deleteSocketPath(context.socket_path);
             var cleanup_threaded = std.Io.Threaded.init_single_threaded;
             deleteFilePath(cleanup_threaded.io(), context.pid_path);
+            harness.shutdownOwnedProviderProcesses();
             std.process.exit(0);
         }
         sleepMs(20);
@@ -1701,6 +1704,14 @@ fn lockDaemon(daemon: *Daemon) void {
 
 fn lockTurn(turn: *ChatTurn) void {
     while (!turn.mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn chatTurnKeepsDaemonAlive(status: ChatTurnStatus, consumed: bool, worker_done: bool) bool {
+    if (status == .running or status == .waiting_approval) return true;
+    // A finished result exists only in daemon memory until the desktop tails
+    // and consumes it. Exiting after the generic idle timeout would discard
+    // replies whenever Verde remained closed for more than 30 seconds.
+    return !consumed or !worker_done;
 }
 
 fn sleepMs(milliseconds: i64) void {
@@ -2601,6 +2612,15 @@ test "Windows pipe rollout rejects legacy daemons" {
     ).?;
     try std.testing.expect(recreated_pipe_status.protocol_version != PROTOCOL_VERSION);
     try std.testing.expect(unflushed_pipe_status.protocol_version != PROTOCOL_VERSION);
+}
+
+test "daemon retains chat turns until their result is consumed" {
+    try std.testing.expect(chatTurnKeepsDaemonAlive(.running, false, false));
+    try std.testing.expect(chatTurnKeepsDaemonAlive(.waiting_approval, false, false));
+    try std.testing.expect(chatTurnKeepsDaemonAlive(.completed, false, true));
+    try std.testing.expect(chatTurnKeepsDaemonAlive(.failed, false, true));
+    try std.testing.expect(chatTurnKeepsDaemonAlive(.aborted, false, true));
+    try std.testing.expect(!chatTurnKeepsDaemonAlive(.completed, true, true));
 }
 
 const TestCliPathMapping = struct {
