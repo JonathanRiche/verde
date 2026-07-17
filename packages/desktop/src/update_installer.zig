@@ -8,13 +8,33 @@ const process_env = @import("process_env.zig");
 pub const Launch = enum {
     started,
     started_and_exit_required,
+    aur_yay,
+    aur_paru,
+    aur_helper_missing,
 };
+
+pub fn aurCommand(launch_result: Launch) ?[]const []const u8 {
+    return switch (launch_result) {
+        .aur_yay => &.{ "yay", "-S", "verde-bin" },
+        .aur_paru => &.{ "paru", "-S", "verde-bin" },
+        else => null,
+    };
+}
 
 /// Starts the official Verde installer. Windows waits for the caller to exit
 /// before replacing its locked executable, then launches the updated app.
 pub fn launch(allocator: std.mem.Allocator) !Launch {
     return switch (builtin.os.tag) {
-        .linux, .macos => {
+        .linux => {
+            if (try detectLinuxAurLaunch(allocator)) |launch_result| return launch_result;
+            try spawnDetached(allocator, &.{
+                "sh",
+                "-c",
+                "curl -fsSL https://verdeai.dev/install.sh | sh",
+            });
+            return .started;
+        },
+        .macos => {
             try spawnDetached(allocator, &.{
                 "sh",
                 "-c",
@@ -43,6 +63,50 @@ pub fn launch(allocator: std.mem.Allocator) !Launch {
     };
 }
 
+fn detectLinuxAurLaunch(allocator: std.mem.Allocator) !?Launch {
+    var env_map = try process_env.buildAugmentedEnvMap(allocator);
+    defer env_map.deinit();
+
+    const pacman = process_env.resolveExecutableInEnvMapAlloc(allocator, &env_map, "pacman") catch return null;
+    defer allocator.free(pacman);
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const executable_path = try std.process.executablePathAlloc(threaded.io(), allocator);
+    defer allocator.free(executable_path);
+    const owner_result = try std.process.run(allocator, threaded.io(), .{
+        .argv = &.{ pacman, "-Qoq", executable_path },
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(1024),
+        .environ_map = &env_map,
+    });
+    defer allocator.free(owner_result.stdout);
+    defer allocator.free(owner_result.stderr);
+    switch (owner_result.term) {
+        .exited => |code| if (code != 0) return null,
+        else => return null,
+    }
+    if (!isVerdeBinPackage(owner_result.stdout)) return null;
+
+    if (resolveAndFree(allocator, &env_map, "yay")) return .aur_yay;
+    if (resolveAndFree(allocator, &env_map, "paru")) return .aur_paru;
+    return .aur_helper_missing;
+}
+
+fn resolveAndFree(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    executable: []const u8,
+) bool {
+    const path = process_env.resolveExecutableInEnvMapAlloc(allocator, env_map, executable) catch return false;
+    allocator.free(path);
+    return true;
+}
+
+fn isVerdeBinPackage(output: []const u8) bool {
+    return std.mem.eql(u8, std.mem.trim(u8, output, &std.ascii.whitespace), "verde-bin");
+}
+
 fn spawnDetached(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     var env_map = try process_env.buildAugmentedEnvMap(allocator);
     defer env_map.deinit();
@@ -69,4 +133,16 @@ fn spawnDetached(allocator: std.mem.Allocator, argv: []const []const u8) !void {
         if (child.id) |process| std.os.windows.CloseHandle(process);
         child.id = null;
     }
+}
+
+test "AUR ownership detection accepts only verde-bin" {
+    try std.testing.expect(isVerdeBinPackage("verde-bin\n"));
+    try std.testing.expect(!isVerdeBinPackage("verde\n"));
+    try std.testing.expect(!isVerdeBinPackage("other-package\n"));
+}
+
+test "AUR launch results expose the package helper command" {
+    try std.testing.expectEqualStrings("yay", aurCommand(.aur_yay).?[0]);
+    try std.testing.expectEqualStrings("paru", aurCommand(.aur_paru).?[0]);
+    try std.testing.expect(aurCommand(.started) == null);
 }

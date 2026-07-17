@@ -107,9 +107,11 @@ flow still fails, run:
 verde update --json
 ```
 
-The JSON error is suitable for scripts and issue reports. Linux/macOS also
-need `curl`; Windows uses PowerShell. You can always use the install command on
-the [homepage](/#install) to replace the current installation manually.
+The JSON error is suitable for scripts and issue reports. Standalone
+Linux/macOS installs need `curl`; Windows uses PowerShell. A `verde-bin`
+installation owned by pacman needs either `yay` or `paru`, and the in-app flow
+opens that helper in a terminal pane. You can always use the install command on
+the [homepage](/#install) to replace a standalone installation manually.
 
 ## Source-build errors
 

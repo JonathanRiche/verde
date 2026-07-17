@@ -46,14 +46,19 @@ verde update
 verde update --json
 ```
 
-`verde update` launches the official installer for the current platform. On
-Linux and macOS, restart Verde after the installer finishes. On Windows, the
-updater waits for the running app to exit, installs the new release, and starts
-Verde again. The command requires network access to the release assets.
+`verde update` launches the official installer for the current platform. For
+an Arch installation owned by the `verde-bin` AUR package, it reports the
+detected `yay` or `paru` command instead so the package manager remains the
+owner of the installation. On Linux and macOS, restart Verde after the
+installer finishes. On Windows, the updater waits for the running app to exit,
+installs the new release, and starts Verde again. The command requires network
+access to the release assets.
 
-You can also check and install releases from **Settings → Updates**. That card
-shows the installed version, release notes, **Check now**, **Install update**,
-and the **Check automatically** preference.
+You can also check and install releases from **Settings → Updates**. For an AUR
+install, Verde opens `yay` or `paru` in an interactive terminal pane so sudo
+password prompts and package progress remain visible. The card shows the
+installed version, release notes, **Check now**, **Install update**, and the
+**Check automatically** preference.
 
 ## Theme packages
 

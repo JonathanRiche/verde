@@ -242,6 +242,32 @@ fn handleUpdate(allocator: std.mem.Allocator, out: output.Output, argv: []const 
         std.process.exit(1);
     };
 
+    if (update_installer.aurCommand(launch)) |command| {
+        if (json) {
+            try out.jsonValue(allocator, .{
+                .ok = true,
+                .result = .{
+                    .status = "package_manager_required",
+                    .command = if (launch == .aur_yay) "yay -S verde-bin" else "paru -S verde-bin",
+                },
+            });
+        } else {
+            try out.stdout("This Verde installation is managed by the AUR. Run `{s} -S verde-bin` in a terminal.\n", .{command[0]});
+        }
+        return;
+    }
+    if (launch == .aur_helper_missing) {
+        if (json) {
+            try out.jsonValue(allocator, .{
+                .ok = false,
+                .@"error" = .{ .code = "aur_helper_missing", .message = "Install yay or paru to update the AUR package." },
+            });
+        } else {
+            try out.stderr("Verde is managed by the AUR, but neither yay nor paru was found.\n", .{});
+        }
+        std.process.exit(1);
+    }
+
     const app_exit_required = launch == .started_and_exit_required;
     if (json) {
         try out.jsonValue(allocator, .{

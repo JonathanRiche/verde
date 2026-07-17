@@ -525,7 +525,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     if (state.update_state.status != .checking) {
         queueControlHit(state, layout.updates_check, layout.body_clip, .updates_check, queue_hit);
     }
-    if (state.update_state.status == .update_available and !state.update_installer_started) {
+    if (state.updateInstallerButtonEnabled()) {
         queueControlHit(state, layout.updates_download, layout.body_clip, .updates_download, queue_hit);
     }
     queueControlHit(state, layout.updates_automatic, layout.body_clip, .updates_automatic, queue_hit);
@@ -645,14 +645,14 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     }, update_status, paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
     const check_style: ButtonStyle = if (state.update_state.status == .checking) .disabled else .secondary;
     drawActionButton(state, layout.updates_check, if (state.update_state.status == .checking) "Checking…" else "Check now", check_style, isControlHovered(state, .updates_check), layout.body_clip);
-    const install_ready = state.update_state.status == .update_available and !state.update_installer_started;
-    const update_action_label = if (state.update_installer_started)
-        "Installer started"
-    else if (state.update_state.status == .update_available)
-        "Install update"
+    const update_button_enabled = state.updateInstallerButtonEnabled();
+    const update_button_style: ButtonStyle = if (!update_button_enabled)
+        .disabled
+    else if (state.update_installer_started)
+        .secondary
     else
-        "No update available";
-    drawActionButton(state, layout.updates_download, update_action_label, if (install_ready) .primary else .disabled, isControlHovered(state, .updates_download), layout.body_clip);
+        .primary;
+    drawActionButton(state, layout.updates_download, state.updateInstallerButtonLabel(), update_button_style, isControlHovered(state, .updates_download), layout.body_clip);
     drawSwitchRow(state, layout.updates_automatic, "Check automatically", state.settings_draft.check_for_updates_automatically, isControlHovered(state, .updates_automatic), layout.body_clip);
     const notes_x = layout.updates_card.x + m.card_pad;
     const notes_w = layout.updates_card.w - m.card_pad * 2.0;

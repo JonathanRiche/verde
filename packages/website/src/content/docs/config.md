@@ -103,8 +103,9 @@ can also install the newest release without opening Settings:
 verde update
 ```
 
-On Linux and macOS, restart Verde after the installer completes. The Windows
-updater exits the running app, installs the release, and relaunches it.
+On Linux and macOS, restart Verde after the installer completes. AUR-managed
+Linux installs open `yay` or `paru` in an interactive terminal pane. The
+Windows updater exits the running app, installs the release, and relaunches it.
 
 ## Transcript preferences
 
