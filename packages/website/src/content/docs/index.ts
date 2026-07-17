@@ -14,6 +14,8 @@ import type { HighlighterCore } from 'shiki/core'
 
 import quickstartRaw from './quickstart.md?raw'
 import providersRaw from './providers.md?raw'
+import chatRaw from './chat.md?raw'
+import designModeRaw from './design-mode.md?raw'
 import panesRaw from './panes.md?raw'
 import keybindsRaw from './keybinds.md?raw'
 import cliRaw from './cli.md?raw'
@@ -94,6 +96,8 @@ function parseFrontmatter(raw: string, githubPath: string): DocEntry {
 const docs: DocEntry[] = [
   parseFrontmatter(quickstartRaw, 'src/content/docs/quickstart.md'),
   parseFrontmatter(providersRaw, 'src/content/docs/providers.md'),
+  parseFrontmatter(chatRaw, 'src/content/docs/chat.md'),
+  parseFrontmatter(designModeRaw, 'src/content/docs/design-mode.md'),
   parseFrontmatter(panesRaw, 'src/content/docs/panes.md'),
   parseFrontmatter(keybindsRaw, 'src/content/docs/keybinds.md'),
   parseFrontmatter(cliRaw, 'src/content/docs/cli.md'),

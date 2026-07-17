@@ -1,8 +1,8 @@
 ---
 title: CLI reference
-description: The full verde CLI surface — top-level commands, offline state, live discovery, browser, chat, terminal, and process control, shell completion, and exit codes.
+description: The verde CLI surface — updates, offline state, live browser and chat control, persistent terminal sessions, integrations, completion, and exit codes.
 section: Reference
-order: 5
+order: 7
 slug: cli
 ---
 
@@ -17,6 +17,7 @@ verde                         # Launch the desktop app
 verde app                     # Launch the desktop app explicitly
 verde --help                  # Show CLI help
 verde version [--json]        # Print version metadata
+verde update [--json]         # Install the latest Verde release
 verde capabilities [--json]   # Print supported CLI/live features
 verde open <url> [--json]     # Open a URL in this Verde workspace's browser pane
 verde completion <shell>      # Print shell completion script
@@ -24,6 +25,8 @@ verde state <command>         # Read persisted state while the app is closed
 verde notify [options]        # Update the current terminal surface
 verde integrations <command>  # Inspect and install optional provider hooks
 verde theme <command>         # Import, validate, export, or reset themes
+verde session <command>       # Manage persistent terminal sessions
+verde mcp                     # Run Verde's stdio MCP bridge
 verde herdr <command>         # Open or inspect Herdr-backed remote workspaces
 verde live <command>          # Control or inspect the running app
 ```
@@ -35,6 +38,22 @@ Use `--json` when scripting. Live IPC responses use a stable envelope:
 ```
 
 Errors return `ok: false` with an `error.code` and `error.message`.
+
+## Updates
+
+```bash
+verde update
+verde update --json
+```
+
+`verde update` launches the official installer for the current platform. On
+Linux and macOS, restart Verde after the installer finishes. On Windows, the
+updater waits for the running app to exit, installs the new release, and starts
+Verde again. The command requires network access to the release assets.
+
+You can also check and install releases from **Settings → Updates**. That card
+shows the installed version, release notes, **Check now**, **Install update**,
+and the **Check automatically** preference.
 
 ## Theme packages
 
@@ -67,23 +86,23 @@ to be running.
 
 ```bash
 verde state path [--json]
-verde state projects [--json]
+verde state workspaces [--json]
 verde state panes --project <id|index|path|current> [--json]
 verde state threads --project <id|index|path|current> [--json]
 verde state transcript --project <id|index|path|current> --thread <index|provider-id> [--json]
 ```
 
 - `path` prints the SDL pref path and `state.sqlite` location.
-- `projects` lists imported projects and the selected project.
+- `workspaces` lists imported projects and the selected workspace. `projects`
+  remains an alias for compatibility.
 - `panes` prints the saved workspace layout and terminal dock state for a project.
 - `threads` lists saved chat threads for a project.
 - `transcript` prints one saved chat transcript by thread index or provider thread id.
 
 ## Live discovery commands
 
-Live commands talk to the running desktop app over a current-user Unix socket at
-Verde's SDL pref path. Start the app first (`verde` or `mise run dev` from
-source).
+Live commands talk to the running desktop app over current-user local IPC: a
+Unix socket on Linux/macOS or a named pipe on Windows. Start the app first.
 
 ```bash
 verde live capabilities [--json]
@@ -101,13 +120,18 @@ verde live browser status [--json]
 verde live workspace select --project <id|index|path|current> [--json]
 verde live workspace create --path /path/to/project [--json]
 verde live workspace rename --project <id|index|path|current> --label "New name" [--json]
-verde live workspace archive --project <id|index|path|current> [--json]
+verde live workspace close --project <id|index|path|current> [--json]
+verde live workspace reopen [--project <id|index|path>] [--json]
 ```
 
 - `capabilities` prints the live method list without requiring the app to be running.
 - `status` returns protocol version, app pid, selected project, focused pane, current pane graph, terminal/process summary, and browser runtime state.
 - `active` returns the current project and focused pane.
 - `surfaces` lists in-memory terminal surface status and attention metadata.
+- `workspace close` removes a workspace from the active sidebar without
+  deleting its saved threads or layout. `archive` is an alias for `close`.
+- `workspace reopen` restores the specified closed workspace, or the most
+  recently closed one when `--project` is omitted.
 
 ## Browser control
 
@@ -115,14 +139,24 @@ verde live workspace archive --project <id|index|path|current> [--json]
 verde live browser status [--json]
 verde live browser open --url https://example.com [--project <id|index|path|current|self>] [--json]
 verde live browser navigate --url https://example.com [--json]
+verde live browser back [--json]
+verde live browser forward [--json]
+verde live browser reload [--json]
+verde live browser focus [--json]
+verde live browser blur [--json]
 verde live browser eval --script "document.title" [--json]
 verde live browser post-json --json-payload '{"type":"ping"}' [--json]
+verde live browser inspector-enable [--json]
+verde live browser inspector-disable [--json]
+verde live browser inspector-toggle [--json]
+verde live browser inspector-mode --mode point|draw-box|draw-freeform [--json]
 ```
 
 The browser pane uses the host platform's native webview (WPE WebKit, WKWebView,
 or WebView2). `browser open` opens a URL in the workspace's browser pane,
 creating one if needed. `browser eval` runs JavaScript in the loaded page and
-returns the result as JSON.
+returns the result as JSON. The inspector commands control
+[Design Mode](/docs/design-mode) for browser-to-agent visual feedback.
 
 ## Chat control
 
@@ -156,6 +190,8 @@ write through the same active PTY input path as the UI.
 ```bash
 verde live terminal write --pane <pane-id> --text $'cargo test\r' [--json]
 verde live terminal write --focused --text $'printf "ok\\n"\r' [--json]
+verde live terminal tail --pane <pane-id> [--lines <count>] [--json]
+verde live terminal screen --pane <pane-id> [--lines <count>] [--json]
 verde live process list [--project <id|index|path|current>] [--json]
 verde live process start --name <name> [--project <id|index|path|current>] [--json]
 verde live process stop --name <name> [--project <id|index|path|current>] [--json]
@@ -166,9 +202,12 @@ verde live agent open --provider codex [--project <id|index|path|current>] [--js
 verde live stack start [--project <id|index|path|current>] [--json]
 verde live stack stop [--project <id|index|path|current>] [--json]
 verde live stack restart [--project <id|index|path|current>] [--json]
+verde live stack status [--project <id|index|path|current>] [--json]
 ```
 
 - `terminal write` sends text to the active terminal tab/pane. Include `\r` when you want to submit a shell command.
+- `terminal tail` returns recent terminal output; `screen` returns the current
+  visible terminal screen.
 - `process start`, `stop`, and `restart` control entries loaded from `verde.yml`.
 - `agent open --provider codex` opens a first-class Codex TUI in the selected workspace without requiring a `verde.yml` entry.
 - `stack start`, `stop`, and `restart` apply the same action to every configured process and agent in the selected workspace.
@@ -177,11 +216,45 @@ verde live stack restart [--project <id|index|path|current>] [--json]
 
 ```bash
 verde live pane split --pane <pane-id> --kind chat|terminal --axis horizontal|vertical [--json]
+verde live pane focus --pane <pane-id> [--json]
+verde live pane resize --first <pane-id> --second <pane-id> --axis horizontal|vertical --ratio <0..1> [--json]
 verde live pane move --pane <pane-id> --direction left|right|up|down [--json]
+verde live pane minimize --pane <pane-id> [--json]
+verde live pane maximize --pane <pane-id> [--json]
+verde live pane restore --pane <pane-id> [--json]
 verde live pane close --pane <pane-id> [--json]
 verde live palette list [--json]
 verde live palette run --command pane.split_terminal_down [--json]
 ```
+
+## Persistent terminal sessions
+
+The session daemon keeps terminal processes addressable independently of a
+particular visible pane. List and inspect sessions even when the desktop app is
+not running; persisted metadata remains available if the daemon is offline.
+
+```bash
+verde session list [--json]
+verde session inspect --id <session-id> [--json]
+verde session new [--workspace <id>] [--cwd <path>] [--name <name>] -- <command...>
+verde session attach --id <session-id>
+verde session write --id <session-id> --text $'cargo test\r' [--json]
+verde session tail --id <session-id> [--lines <count>] [--json]
+verde session screen --id <session-id> [--lines <count>] [--json]
+verde session kill --id <session-id> [--json]
+verde session cleanup [--json]
+```
+
+`attach` is interactive. For automation, prefer `write`, `tail`, and `screen`
+with an explicit session id.
+
+## MCP bridge
+
+`verde mcp` starts a JSONL stdio MCP server that exposes Verde's local live
+controls to compatible agents. It is primarily used by agent integrations;
+most users do not invoke it directly. The bridge handles MCP initialization,
+tool discovery, and tool calls, and requires the relevant live Verde target for
+operations that control the app.
 
 ## Provider integrations
 
@@ -259,7 +332,8 @@ the process exit code.
 
 ## Shell completion
 
-`verde completion` prints static completion scripts for bash, zsh, and fish.
+`verde completion` prints static completion scripts for bash, zsh, fish, and
+PowerShell.
 The generated completions cover command names, nested live-control commands,
 flags, and fixed flag values such as `--kind chat|terminal`,
 `--axis horizontal|vertical`, and `--decision approve|deny`.
@@ -268,6 +342,7 @@ flags, and fixed flag values such as `--kind chat|terminal`,
 verde completion bash
 verde completion zsh
 verde completion fish
+verde completion powershell
 ```
 
 Common install patterns:

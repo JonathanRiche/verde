@@ -2,7 +2,7 @@
 title: Keybinds
 description: Every default keybind in Verde, plus how to remap or disable each binding in verde.json.
 section: Workspace
-order: 4
+order: 6
 slug: keybinds
 ---
 
@@ -19,6 +19,7 @@ below.
 | `Ctrl+Shift+P` / `Cmd+Shift+P` | Command palette                    |
 | `Ctrl+T` / `Cmd+T`          | New chat thread                       |
 | `Ctrl+W` / `Cmd+W`, `Alt+X` | Close the focused pane                |
+| `Ctrl+Shift+W` / `Cmd+Shift+W` | Close the current workspace (reopen from the command palette) |
 | `Ctrl+R` / `Cmd+R`, `Ctrl+Shift+R`, `F5` | Refresh / reload app         |
 | `Alt+O`                     | Open the default project              |
 | `Ctrl+Shift+O`              | Open in external editor               |
@@ -87,7 +88,6 @@ binding keys below.
 | Combo                              | Action                          |
 | ---------------------------------- | ------------------------------- |
 | `Ctrl+Alt+T` / `Cmd+Alt+T`         | New terminal tab                |
-| `Ctrl+Shift+W` / `Cmd+Shift+W`     | Close the active terminal tab    |
 | `Ctrl+Shift+R` / `Cmd+Shift+R`     | Rename the active terminal tab  |
 | `Ctrl+Shift+PageUp`                | Previous terminal tab           |
 | `Ctrl+Shift+PageDown`              | Next terminal tab               |
@@ -111,9 +111,10 @@ stops, the view stops. Do not expect a multi-frame glide.
 
 ## Remapping
 
-Override any binding under `keybinds` in `$XDG_CONFIG_HOME/verde/verde.json` (or
-`~/.config/verde/verde.json`). Use a string for one shortcut, or a string array
-for multiple shortcuts on the same action:
+Override any binding under `keybinds` in your `verde.json`. On Unix it is under
+`$XDG_CONFIG_HOME/verde` or `~/.config/verde`; on Windows it is under
+`%APPDATA%\Verde`. Use a string for one shortcut, or a string array for multiple
+shortcuts on the same action:
 
 ```json
 {
@@ -121,6 +122,7 @@ for multiple shortcuts on the same action:
     "new_thread": "CommandOrControl+T",
     "browser": "Ctrl+B",
     "workspace": {
+      "close_current": "CommandOrControl+Shift+W",
       "focus_up": "Ctrl+K",
       "focus_down": "Ctrl+J",
       "focus_left": "Ctrl+H",
@@ -178,7 +180,7 @@ or an array of shortcuts.
 | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | top         | `refresh`, `open_default`, `open_editor`, `new_thread`, `command_palette`, `toggle_sidebar`, `toggle_sidebar_hidden`, `toggle_browser`, `toggle_terminal`                                                                       |
 | chat        | `chat_up`, `chat_down`, `chat_page_up`, `chat_page_down`                                                                                                                                                                          |
-| `workspace` | `split_chat_vertical`, `split_chat_horizontal`, `split_terminal_vertical`, `split_terminal_horizontal`, `toggle_maximize`, `minimize`, `close`, `focus_left`, `focus_right`, `focus_up`, `focus_down`, `focus_prompt`, `move_*`, `grow_*`, `select`, `previous`, `next` |
+| `workspace` | `split_chat_vertical`, `split_chat_horizontal`, `split_terminal_vertical`, `split_terminal_horizontal`, `toggle_maximize`, `minimize`, `close`, `close_current`, `focus_left`, `focus_right`, `focus_up`, `focus_down`, `focus_prompt`, `move_*`, `grow_*`, `select`, `previous`, `next` |
 | `terminal`  | `new_tab`, `close`, `rename_tab`, `tab_previous`, `tab_next`, `split_up`, `split_down`, `split_left`, `split_right`, `focus_up`, `focus_down`, `focus_left`, `focus_right`                                                       |
 
 Keybinds are loaded on startup and on app refresh. See [Configuration &

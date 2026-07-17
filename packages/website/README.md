@@ -16,16 +16,18 @@ Run from `packages/website` with `bun`:
 
 ```bash
 bun install
-bun run dev      # alchemy dev — local development (use this)
-bun run build    # vite build → dist/client + dist/server
-bun run deploy   # alchemy deploy → Cloudflare (production: verdeai.dev)
+bun run dev       # Alchemy-managed local development
+bun test          # Website unit tests
+bun run build     # Production client + SSR build
+bun run preview   # Serve the compiled build locally
+bun run types     # Generate Cloudflare binding types
+bun run deploy    # Deploy production through Alchemy
 ```
 
-> **Heads up:** prefer `bun run dev` (`alchemy dev`) over raw `vite dev`. A custom
-> Vite plugin (`serveStaleClientAssetsFromDist`) serves images/CSS/fonts from the
-> last `bun run build`, so under raw `vite dev` those assets do **not** hot-reload
-> until you rebuild. Component logic in `.tsx` still hot-reloads. See
-> [`CLAUDE.md`](CLAUDE.md) for the full explanation and other notes.
+Use `bun run dev` for development. It runs `alchemy dev`, which owns the Vite
+process and local Cloudflare bindings. Do not start raw `vite dev`; bypassing
+Alchemy can serve stale built assets or omit required runtime configuration.
+See [`AGENTS.md`](AGENTS.md) for the agent workflow and verification rules.
 
 ## Layout
 
@@ -43,4 +45,4 @@ bun run deploy   # alchemy deploy → Cloudflare (production: verdeai.dev)
 
 Marketing copy must reflect what the desktop app actually ships. When provider,
 keybind, command-palette, or CLI behavior changes in `packages/desktop`, update
-this site to match — see [`CLAUDE.md`](CLAUDE.md) for the sources of truth.
+this site to match — see [`AGENTS.md`](AGENTS.md) for the sources of truth.

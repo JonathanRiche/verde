@@ -4,14 +4,12 @@
   "type": "module",
   "scripts": {
     "dev": "alchemy dev",
-    "dev:vite": "rm -rf node_modules/.vite && vite dev --port 3000",
     "build": "vite build",
-    "deploy": "alchemy deploy",
-    "destroy": "alchemy destroy",
-    "start": "node .output/server/index.mjs",
+    "test": "bun test",
     "preview": "vite preview",
-    "cf-typegen": "wrangler types",
-    "test": "bun test"
+    "types": "wrangler types",
+    "deploy": "alchemy deploy",
+    "destroy": "alchemy destroy"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.1.18",
