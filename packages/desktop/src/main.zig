@@ -2291,7 +2291,7 @@ fn handleFontSizeShortcut(state: *AppState, event: *const sdl.KeyboardEvent) boo
         else => return false,
     };
     const current = state.app_config.font_size;
-    const next = clampf(current + delta, 11.0, 24.0);
+    const next = clampf(current + delta, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE);
     if (@abs(next - current) < 0.01) return true;
     state.app_config.font_size = next;
     ui_theme.installFonts(
