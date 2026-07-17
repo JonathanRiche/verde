@@ -17,6 +17,7 @@ import CopyButton from '../components/CopyButton'
 export const Route = createFileRoute('/')({ component: App })
 
 const DEFAULT_INSTALL_COMMAND = 'curl -fsSL https://verdeai.dev/install.sh | sh'
+const WINDOWS_INSTALL_COMMAND = 'irm https://verdeai.dev/install.ps1 | iex'
 
 /* ───────────────────────── Feature icons ───────────────────────── */
 
@@ -92,8 +93,8 @@ const MODE_LABELS: Record<string, string> = {
 const featureCards = [
   {
     icon: 'browser',
-    title: 'Embedded browser pane',
-    body: 'A real native webview tiled next to your agent — WPE WebKit on Linux, WKWebView on macOS, WebView2 on Windows. Toggle it with Ctrl+B.',
+    title: 'Browser + Design Mode',
+    body: 'Tile a native webview beside your agent, then point at an element or draw a region and send the visual context directly to a chat or terminal TUI.',
   },
   {
     icon: 'terminal',
@@ -118,7 +119,7 @@ const featureCards = [
   {
     icon: 'theme',
     title: 'Themes that match your rig',
-    body: 'A warm-green native theme out of the box, with Omarchy colors.toml auto-detection on Linux so the app blends into your desktop.',
+    body: 'Import portable theme packages on Linux, macOS, or Windows, or let Verde follow your active Omarchy colors.toml automatically.',
   },
 ]
 
@@ -266,7 +267,7 @@ function App() {
                 <CopyButton command={DEFAULT_INSTALL_COMMAND} />
               </div>
               <p class="hero-install-note">
-                Linux and macOS · pulls the latest GitHub release
+                Linux and macOS · Windows installer below · latest GitHub release
               </p>
             </div>
           </div>
@@ -697,11 +698,11 @@ function App() {
         <div class="wrap">
           <div class="band-header band-header--center">
             <p class="tag tag-static">Install</p>
-            <h2 class="heading">One command on Linux or macOS.</h2>
+            <h2 class="heading">One command on Linux, macOS, or Windows.</h2>
             <p class="band-body">
               The installer detects your platform, downloads the matching release
-              artifact from GitHub, and drops Verde into <code>~/.local</code> or{' '}
-              <code>/Applications</code>.
+              artifact from GitHub, and installs Verde into <code>~/.local</code>,{' '}
+              <code>/Applications</code>, or your Windows user profile.
             </p>
           </div>
 
@@ -716,7 +717,16 @@ function App() {
               <CopyButton command={DEFAULT_INSTALL_COMMAND} />
             </div>
             <p class="install-primary-note">
-              Then install and authenticate at least one provider CLI —{' '}
+              <strong>Windows x64 · PowerShell</strong>
+            </p>
+            <div class="install-primary-cmd">
+              <span class="hero-install-prompt">PS&gt;</span>
+              <code>{WINDOWS_INSTALL_COMMAND}</code>
+              <CopyButton command={WINDOWS_INSTALL_COMMAND} />
+            </div>
+            <p class="install-primary-note">
+              Windows installs without administrator access and creates a Start
+              Menu shortcut. Then install and authenticate at least one provider CLI —{' '}
               <code>codex login</code>, Claude Code, <code>opencode</code>,{' '}
               <code>agent login</code> for Cursor, or <code>amp</code>.
             </p>

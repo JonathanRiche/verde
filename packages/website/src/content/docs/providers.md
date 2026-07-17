@@ -28,6 +28,19 @@ machine, and supports each agent in one or both of two modes:
 All of them run against the project directory you imported into Verde. Tokens,
 transcripts, and project files stay on your machine.
 
+## Readiness check
+
+If none of the GUI providers is available at launch, Verde opens **Connect an
+AI provider**. Each provider reports **Ready**, **CLI not found**, **Sign-in
+needed**, or **Could not verify** while Verde checks its executable and local
+authentication. Install or sign in using the instructions below, then choose
+**Check again**. **Open setup guide** returns to this page and **Not now**
+dismisses the screen.
+
+Amp is excluded from this check because it is TUI-only. A GUI provider can
+also become unavailable later—for example, after credentials expire—in which
+case sending shows an explicit error instead of dropping the prompt.
+
 ## Codex
 
 Install the [Codex CLI](https://github.com/openai/codex) and authenticate:
@@ -39,9 +52,10 @@ codex login
 Verify `codex` is on `PATH` from a normal shell. Verde starts `codex app-server`
 when a Codex thread begins; you do not need to start it yourself.
 
-Codex threads support the Fast/Default speed toggle in the composer toolbar.
-The pill maps to Codex's `service_tier` / `fast_mode`. If you change the
-underlying Codex service tier configuration, no Verde change is needed.
+Codex threads expose **Default** and **Fast** under the composer's **Run** pill.
+The setting maps to Codex's `service_tier` / `fast_mode`. The Run menu also
+shows the reasoning levels supported by the selected model and the thread's
+access setting.
 
 ## Claude Code
 
@@ -56,9 +70,8 @@ Install [OpenCode](https://github.com/anomalyco/opencode) and verify `opencode`
 is on `PATH`. Verde starts `opencode serve` on demand when an OpenCode thread
 begins.
 
-OpenCode does not have a Codex-style speed tier concept. The composer's
-Fast/Default toggle is hidden automatically when OpenCode is the selected
-provider — do not expect to see it.
+OpenCode does not have a Codex-style speed tier concept, so the **Speed** row is
+hidden when OpenCode is selected.
 
 ## Cursor
 
@@ -72,6 +85,10 @@ agent login
 `CURSOR_API_KEY` is also supported for headless environments where interactive
 login is not possible. Verde talks to the Cursor ACP server (`agent acp`) over
 its native protocol.
+
+Cursor models that advertise fast-mode support show **Default** and **Fast**
+under the **Run** pill. The row is hidden for Cursor models without that
+capability.
 
 ## Amp
 
@@ -93,13 +110,19 @@ agent runs (only when Amp is running inside a Verde pane). You can also toggle
 it from the settings modal under **Status pip hooks**, and remove it with
 `verde integrations remove amp --global`.
 
-## Switching providers
+## Models and run settings
 
-Each chat thread is bound to one provider. The composer's provider switcher
-shows the four GUI chat providers and indicates which are detected and
-authenticated on your machine. Picking a provider that is not installed or
-signed in produces an explicit failure with a hint — Verde will not silently
-drop the prompt.
+The searchable model picker groups models by provider, marks defaults, and
+supports `Ctrl+1` through `Ctrl+9` for its visible results. OpenCode, Claude
+Code, and Cursor model lists are loaded from the installed provider; Codex uses
+Verde's supported model list.
+
+Before a new thread sends its first message, choosing a model can also switch
+the provider. Once the transcript has started, the provider is locked to keep
+the provider session consistent. The **Run** pill contains only controls the
+selected provider/model supports: reasoning, **Default/Fast** speed, and
+**Supervised/Full access** permissions. See [Chat, models & runs](/docs/chat)
+for the complete behavior.
 
 To run several providers side by side, create additional chat threads (one per
 provider) and tile them in the same workspace. Each thread keeps its own

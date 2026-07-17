@@ -57,9 +57,13 @@ See [Provider setup](/docs/providers) for the full per-provider notes.
 verde
 ```
 
-The first launch opens an empty workspace. The sidebar on the left lists your
-projects and threads; the main area is where chat, terminal, and browser panes
-live as a tiling tree.
+The first launch opens an empty workspace. If no GUI provider is ready, the
+**Connect an AI provider** screen shows which CLIs are missing, need sign-in, or
+are ready. Finish setup and choose **Check again**, or choose **Not now** to
+continue without a chat provider.
+
+The sidebar on the left lists your projects and threads; the main area is where
+chat, terminal, and browser panes live as a tiling tree.
 
 ## Import a project
 
@@ -74,9 +78,13 @@ See [Configuration & state](/docs/config) for the schema.
 ## Start a chat thread
 
 1. With a project imported, press `Ctrl+T` (or `Cmd+T` on macOS) to create a new chat thread.
-2. Pick a provider from the composer's provider switcher. If a provider CLI is missing or not authenticated, Verde will tell you instead of silently failing.
-3. Type a prompt and press `Enter` to send. The transcript grows as the agent streams; tool calls and command runs render as compact rows underneath the assistant turns.
-4. Press `Tab` while focused in a chat thread to return focus to the prompt box.
+2. Open the searchable model picker. Before the first message you can choose both the provider and model; after that, the provider stays bound to the thread.
+3. Open the **Run** pill to choose available reasoning and speed options, plus **Supervised** or **Full access** command permissions.
+4. Type a prompt and press `Enter` to send. The transcript grows as the agent streams; consecutive tool calls collapse into a status summary you can expand.
+5. Press `Tab` while focused in a chat thread to return focus to the prompt box.
+
+See [Chat, models & runs](/docs/chat) for provider readiness, model shortcuts,
+follow-ups, approvals, and transcript preferences.
 
 ## Tile a browser pane
 
@@ -92,6 +100,11 @@ verde live browser open --url http://localhost:3000
 verde live browser navigate --url http://localhost:3000/dashboard
 verde live browser eval --script "document.title"
 ```
+
+Click the browser inspector to enter **Design Mode**. Select an element, box,
+or freeform region; describe the change; then route the resulting context to a
+chat or terminal agent. See [Design Mode](/docs/design-mode) for platform
+screenshot support and delivery behavior.
 
 ## Split a terminal
 
@@ -117,6 +130,10 @@ The full set of defaults and how to remap them is in [Keybinds](/docs/keybinds).
 workspaces, and app commands in a single searchable list. Press `Ctrl+Enter` on
 any result to open it in a fresh pane.
 
+Closing a workspace with `Ctrl+Shift+W` removes it from the active sidebar but
+keeps its layout and threads. Use the command palette's reopen action to bring
+it back.
+
 Slash commands like `/stack` and `/process` run from the composer alongside each
 provider's own commands. See [Panes & tiling](/docs/panes) for the full pane
 surface.
@@ -124,6 +141,8 @@ surface.
 ## Where to go next
 
 - [Provider setup](/docs/providers) — provider-specific notes and troubleshooting.
+- [Chat, models & runs](/docs/chat) — model selection, run permissions, approvals, and transcript controls.
+- [Design Mode](/docs/design-mode) — send browser selections to chat and terminal agents.
 - [Panes & tiling](/docs/panes) — splits, focus, resize, zoom, the terminal dock, and the browser pane.
 - [Keybinds](/docs/keybinds) — every default and how to remap.
 - [CLI reference](/docs/cli) — drive Verde from your shell with `verde live` and `verde state`.

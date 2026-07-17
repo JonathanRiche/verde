@@ -2,7 +2,7 @@
 title: Panes & tiling
 description: How Verde's tiled workspace is laid out — splits, focus, resize, zoom, the sidebar, the terminal dock, and the embedded browser pane.
 section: Workspace
-order: 3
+order: 5
 slug: panes
 ---
 
@@ -80,8 +80,11 @@ it's done or errors, so you can watch several agents from a rail a few pixels
 wide. Context menus (new thread, close, expand) still work from the collapsed
 rail.
 
-Right-click the sidebar for project import, rename, archive, and the new-thread
-/ pencil button for opening a Codex TUI directly.
+Right-click the sidebar for project import, rename, and **Close workspace**, and
+use the new-thread / pencil button to open a Codex TUI directly. Closing a
+workspace archives it without deleting its saved panes, threads, or layout.
+Use the command palette's reopen action—or `verde live workspace reopen`—to
+restore it.
 
 ## The terminal dock
 
@@ -90,7 +93,6 @@ engine. Each terminal pane is a full terminal with tabs, splits, OSC titles,
 scrollback with a scrollbar, and per-terminal zoom.
 
 - `Ctrl+Alt+T` — new terminal tab inside the focused terminal pane.
-- `Ctrl+Shift+W` — close the active terminal tab.
 - `Ctrl+Shift+R` — rename the active terminal tab.
 - `Ctrl+Shift+PageUp` / `Ctrl+Shift+PageDown` — previous / next terminal tab.
 - `Ctrl+Alt+↑ ↓ ← →` — move focus between terminal splits inside the focused terminal pane.
@@ -98,6 +100,10 @@ scrollback with a scrollbar, and per-terminal zoom.
 
 Per-terminal zoom is independent of the workspace-level zoom (`Alt+Z`). It
 persists per terminal surface, not per workspace.
+
+Terminal applications can render Kitty graphics-protocol images inline. The
+image follows terminal scrolling and is cleared when the application erases or
+replaces it, like other terminal content.
 
 ## The browser pane
 
@@ -114,13 +120,18 @@ verde live browser eval --script "document.title"
 verde live browser status --json
 ```
 
-See [CLI reference](/docs/cli) for the full browser command surface.
+The inspector button enters **Design Mode**, where you can select an element or
+draw a region and send its context to a chat or terminal agent. See
+[Design Mode](/docs/design-mode) for selection modes, routing, and screenshot
+support, and [CLI reference](/docs/cli) for the full browser command surface.
 
 ## Persisting layouts
 
 Workspace layouts, per-terminal zoom, terminal tab state, and the browser
 pane's URL all persist across launches in Verde's SQLite state. Closing the
-app and reopening it restores the same tiling tree for each project.
+app and reopening it restores the same tiling tree for each project. Closing a
+workspace from the sidebar or with `Ctrl+Shift+W` also preserves that state;
+reopen the workspace from the command palette when you need it again.
 
 You can inspect the persisted layout without launching the app:
 

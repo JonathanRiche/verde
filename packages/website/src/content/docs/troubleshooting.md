@@ -1,8 +1,8 @@
 ---
 title: Troubleshooting
-description: Common Verde issues — provider authentication, the Linux WPE WebKit browser runtime, WebView2 on Windows, source-build errors, and how to read the runtime logs.
+description: Provider readiness, browser and Design Mode support, updates, source-build errors, and runtime logs.
 section: Reference
-order: 7
+order: 9
 slug: troubleshooting
 ---
 
@@ -39,6 +39,18 @@ this order:
    ```
 
 For provider-specific setup, see [Provider setup](/docs/providers).
+
+## Provider readiness does not update
+
+After installing a provider CLI or completing its login flow, return to
+**Connect an AI provider** and choose **Check again**. If its state still says
+**CLI not found**, launch Verde from the same shell where the provider command
+works; desktop launchers can inherit a different `PATH`. If it says **Sign-in
+needed**, run the provider's login command outside Verde and retry. A timed-out
+or failed probe appears as **Could not verify** and should be checked against
+the runtime log.
+
+Amp never appears on this screen because it is a terminal-only provider.
 
 ## Linux browser runtime missing
 
@@ -77,6 +89,28 @@ and packaged builds must ship or locate `WebView2Loader.dll` next to
 `verde.exe` or on the DLL search path. The Windows native-webview build also
 requires the Microsoft WebView2 SDK headers at compile time.
 
+## Design Mode has no screenshot
+
+The element and region selector works with WPE WebKit on Linux, WKWebView on
+macOS, and WebView2 on Windows. Selection screenshots currently require the
+Linux WPE backend's frame-copy support. On macOS and Windows, Verde sends the
+instruction and DOM context without an image; this is expected. See
+[Design Mode](/docs/design-mode) for routing details.
+
+## Update check or install fails
+
+Open **Settings → Updates** and choose **Check now** again. Update checks and
+installers need access to GitHub release metadata and assets. If the in-app
+flow still fails, run:
+
+```bash
+verde update --json
+```
+
+The JSON error is suitable for scripts and issue reports. Linux/macOS also
+need `curl`; Windows uses PowerShell. You can always use the install command on
+the [homepage](/#install) to replace the current installation manually.
+
 ## Source-build errors
 
 Source builds require Zig `0.16.0` and SDL3 development files for your
@@ -114,7 +148,8 @@ bash ./scripts/release/install-linux-local.sh
 
 ## Reading the runtime logs
 
-On Linux, Verde writes runtime logs under SDL's pref path:
+Verde writes runtime logs under SDL's platform pref path. On Linux, the usual
+paths are:
 
 - `~/.local/share/verde/Native/logs/verde.stderr.log`
 - `~/.local/share/verde/Native/logs/last-crash.log`

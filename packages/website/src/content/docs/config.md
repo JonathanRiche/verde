@@ -1,15 +1,17 @@
 ---
 title: Configuration & state
-description: verde.json user config, verde.yml stack config, theme tokens, Omarchy color auto-detection, state files, and runtime logs.
+description: verde.json settings, update and transcript preferences, verde.yml stacks, themes, state files, and runtime logs.
 section: Reference
-order: 6
+order: 8
 slug: config
 ---
 
 ## verde.json
 
 User config is loaded from `$XDG_CONFIG_HOME/verde/verde.json` or
-`~/.config/verde/verde.json`. It is read on startup and on app refresh.
+`~/.config/verde/verde.json` on Linux/macOS, and
+`%APPDATA%\Verde\verde.json` on Windows. `VERDE_CONFIG` can point to a custom
+file. It is read on startup and on app refresh.
 
 ```json
 {
@@ -26,11 +28,24 @@ User config is loaded from `$XDG_CONFIG_HOME/verde/verde.json` or
   "ui": {
     "font_size": 20
   },
+  "open": {
+    "default": "folder",
+    "links": "verde_browser"
+  },
   "terminal": {
     "font_size": 18,
     "profiles": [
       { "label": "Local Agent", "command": ["my-agent", "--interactive"] }
     ]
+  },
+  "transcript": {
+    "tool_call_groups": "collapsed"
+  },
+  "updates": {
+    "check_automatically": true
+  },
+  "notifications": {
+    "enabled": true
   },
   "keybinds": {
     "new_thread": "CommandOrControl+T",
@@ -51,6 +66,52 @@ Keybinds are loaded on startup and on app refresh. Use a string for one
 shortcut or a string array for multiple shortcuts. Use `null`, an empty string,
 or an empty array to disable a binding. See [Keybinds](/docs/keybinds) for the
 full keybinds reference.
+
+Most of these options also appear in Settings:
+
+- **Appearance** — theme and UI font size.
+- **Transcript** — tool-call groups: `collapsed`, `expanded`, or
+  `remember_last`.
+- **Terminal** — font size, launch profiles, and whether terminal link clicks
+  open in Verde's browser pane or the system browser.
+- **Workspace** — the default open action for project files and folders.
+- **Agent integrations** — status-pip hooks for supported provider CLIs.
+- **Updates** — check now, install an available release, and automatic checks.
+- **Notifications** — enable or disable desktop notifications.
+
+Settings that write `verde.json` apply when you choose **Save**. Provider hook
+installation/removal runs immediately because it updates the provider's own
+configuration.
+
+## Updates
+
+Automatic update checks are enabled by default. Disable them in Settings or
+with:
+
+```json
+{
+  "updates": {
+    "check_automatically": false
+  }
+}
+```
+
+The Updates card shows the installed version and available release notes. You
+can also install the newest release without opening Settings:
+
+```bash
+verde update
+```
+
+On Linux and macOS, restart Verde after the installer completes. The Windows
+updater exits the running app, installs the release, and relaunches it.
+
+## Transcript preferences
+
+`transcript.tool_call_groups` controls how consecutive transcript tool calls
+open: `collapsed`, `expanded`, or `remember_last`. Failed groups open so their
+error remains visible. With `remember_last`, Verde also maintains its internal
+last-expanded state for the next group. See [Chat, models & runs](/docs/chat).
 
 ## verde.yml stack config
 
@@ -167,7 +228,7 @@ verde state path --json
 You can read projects, panes, threads, and transcripts offline:
 
 ```bash
-verde state projects --json
+verde state workspaces --json
 verde state panes --project current --json
 verde state threads --project current --json
 verde state transcript --project current --thread 0 --json
@@ -177,7 +238,9 @@ See [CLI reference](/docs/cli) for the full state command surface.
 
 ## Logs
 
-On Linux, Verde writes runtime logs under SDL's pref path:
+Verde writes runtime logs under SDL's platform pref path. Discover the exact
+directory on your machine with `verde state path --json`. On Linux, the usual
+paths are:
 
 - `~/.local/share/verde/Native/logs/verde.stderr.log`
 - `~/.local/share/verde/Native/logs/last-crash.log`
