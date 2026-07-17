@@ -55,12 +55,53 @@ switch models because not every provider exposes equivalent controls.
 
 ## Send, steer, and stop
 
-Press `Enter` to send the composer. While an agent is working, a new prompt can
-be queued as a follow-up; **Stop** aborts the active run. Verde keeps the draft
-with its thread, so changing panes does not discard unfinished text.
+Press `Enter` to send the composer. While an agent is working, type another
+message and press `Tab`: Codex tries to steer the active turn, while Claude
+Code, OpenCode, and Cursor queue the message as the next turn. The pending
+message stays pinned above the composer. Double-click that pin to pull it back
+into an empty composer for editing, then press `Tab` to queue it again.
+
+**Stop** aborts the active run. Verde keeps the draft with its thread, so
+changing panes does not discard unfinished text.
 
 The same paths are scriptable with `verde live chat send`, `followup`, `stop`,
 and `draft`. See [CLI reference](/docs/cli#chat-control).
+
+## Attach images and mention files
+
+Paste an image with `Ctrl+V` (`Cmd+V` on macOS) while the chat composer owns
+focus. Verde stages it above the composer instead of converting it to text.
+Paste again to attach multiple images, remove individual previews before
+sending, and click a transcript image to open its full-size preview.
+
+Codex, Claude Code, and OpenCode accept local image attachments. Cursor accepts
+them only when its ACP session advertises image support. Remote Herdr Codex GUI
+sends do not currently accept local image attachments; Verde reports the
+limitation instead of silently dropping them.
+
+To reference a workspace file, type `@` followed by part of its name or path.
+Verde searches the imported workspace, shows up to eight matching files, and
+inserts the selected relative path into the prompt. Use the arrow keys and
+`Enter`, or click a result.
+
+## History and provider threads
+
+Each workspace ends with a **History · N** row in the expanded sidebar. It
+opens the command palette scoped to that workspace's saved chats, grouped into
+**Today**, **This week**, and **Older**. Search there to find a thread, press
+`Enter` to open it in an existing chat pane, or `Ctrl+Enter` to open it in a
+new pane. Press `Tab` on a result for thread actions.
+
+Right-click a workspace—or use `Ctrl+Shift+P`—to import an existing Codex,
+OpenCode, or Claude Code provider thread. The import dialog lists recent
+provider sessions and also accepts a provider thread ID. Cursor thread import
+is not supported yet.
+
+Imported and Verde-created provider threads can be refreshed with **Sync
+thread** when they have a provider thread ID and no request is running. The
+same thread menu can open a linked thread in its provider TUI, return a TUI
+thread to chat, or archive the thread. Archiving removes it from the active
+sidebar without deleting its persisted transcript.
 
 ## Approvals and input requests
 

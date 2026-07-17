@@ -27,10 +27,15 @@ pane header buttons for everything else.
 
 For chat-vs-chat splits and terminal-vertical splits, use the pane header
 buttons: `C|` and `C-` split a chat pane vertically or horizontally; `T|` and
-`T-` do the same for terminals. Right-click inside a terminal pane to spawn
-shell tabs or agent launch-profile tabs (Claude, OpenCode, Codex, Cursor, Amp),
-or to add a new workspace terminal pane around the focused one. Context menus
-also offer **Close pane** directly.
+`T-` do the same for terminals. Right-click terminal content for selection
+copy, zoom, workspace splits around the focused pane, and **Close pane**.
+Right-click a terminal tab to rename or close it. If `terminal.profiles` is
+configured in `verde.json`, the first custom launch profile also appears in
+the terminal context menu.
+
+Use `Ctrl+Alt+T` for a new shell tab. Launch Codex, Claude, OpenCode, Cursor, or
+Amp TUIs from the command palette; the built-in agent launchers are not entries
+in the terminal right-click menu.
 
 Terminal-internal tabs live inside the focused terminal pane. Workspace split
 actions create new workspace panes in the tiling tree, not new tabs inside a
@@ -148,10 +153,17 @@ verde live panes --project current --json
 ## Command palette and slash commands
 
 `Ctrl+Shift+P` opens the command palette — a single ranked list of threads, panes,
-workspaces, and app commands. `Ctrl+Enter` on any result opens it in a fresh
-pane. The palette also carries **Start New … TUI** entries for Codex, Claude,
+workspaces, and app commands. `Ctrl+Enter` on a thread result opens it in a
+fresh pane. The palette also carries **Start New … TUI** entries for Codex, Claude,
 OpenCode, Cursor, and Amp, and **Open Current Thread in TUI** entries that
 promote a GUI chat thread into that provider's terminal TUI.
+
+The sidebar's **History · N** row opens the same palette scoped to one
+workspace's saved threads. Thread actions include open in a new pane, sync from
+the provider, open as a TUI or chat, and archive. Workspace actions also import
+existing Codex, OpenCode, and Claude Code threads. See
+[Chat, models & runs](/docs/chat#history-and-provider-threads) for the complete
+workflow and current provider limitations.
 
 Typing `/` in the composer opens a slash-command picker. Running a command
 shows a pending row in the transcript while it executes, then a result card
@@ -160,7 +172,7 @@ shows a pending row in the transcript while it executes, then a result card
 Workspace commands, available with every provider:
 
 - `/stack` — start / stop / restart / status for every process and agent declared in the workspace's `verde.yml`.
-- `/process` — start / stop / restart / focus a single declared process by name.
+- `/process` — start / stop / restart / focus a single declared process by name; `/process crashed` refreshes status and reports the number of crashed processes.
 - `//text` — escape hatch: send a literal prompt that begins with a slash.
 
 Provider-native commands surface in the same picker:

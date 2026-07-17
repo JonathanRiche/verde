@@ -44,7 +44,7 @@ the app:
 | Provider    | Setup                                                                              |
 | ----------- | ---------------------------------------------------------------------------------- |
 | Codex       | Install the [Codex CLI](https://github.com/openai/codex), then run `codex login`.  |
-| Claude Code | Install [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and log in.  |
+| Claude Code | Install [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and Node.js, ensure `node` is on `PATH`, then log in. |
 | OpenCode    | Install [OpenCode](https://github.com/anomalyco/opencode); ensure `opencode` is on `PATH`. |
 | Cursor      | Install the [Cursor CLI](https://cursor.com/docs/cli/installation), ensure `agent` is on `PATH`, run `agent login`. `CURSOR_API_KEY` is also supported for headless environments. |
 | Amp         | Install [Amp](https://ampcode.com); ensure `amp` is on `PATH`. Amp runs as a terminal TUI rather than a chat pane — launch it from the command palette. |

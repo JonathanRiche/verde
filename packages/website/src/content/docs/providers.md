@@ -62,7 +62,9 @@ access setting.
 Install [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and log in
 on your machine. Verde talks to the local runtime through Anthropic's Claude
 Agent SDK — there is no Verde-side authentication. Make sure the Claude Code
-binary is reachable from the shell environment Verde was launched from.
+binary and `node` are both reachable from the shell environment Verde was
+launched from. Packaged Verde installs include the provider bridge; Verde runs
+it with the Node.js executable found on `PATH`.
 
 ## OpenCode
 

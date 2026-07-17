@@ -83,6 +83,31 @@ Settings that write `verde.json` apply when you choose **Save**. Provider hook
 installation/removal runs immediately because it updates the provider's own
 configuration.
 
+### Open actions
+
+`open.default` controls the workspace header's primary open action. Supported
+string values are `folder`, `editor`, `cursor`, `vscode`, and `zed`. `editor`
+uses the configured system editor; the named values target that application
+directly.
+
+For another editor or workspace tool, use a custom action:
+
+```json
+{
+  "open": {
+    "default": {
+      "label": "Workbench",
+      "action": "my-editor ."
+    },
+    "links": "system_browser"
+  }
+}
+```
+
+The custom command runs through the platform shell with the imported project
+as its working directory. `open.links` accepts `verde_browser` or
+`system_browser` and controls where links clicked in terminal output open.
+
 ## Updates
 
 Automatic update checks are enabled by default. Disable them in Settings or
@@ -96,8 +121,10 @@ with:
 }
 ```
 
-The Updates card shows the installed version and available release notes. You
-can also install the newest release without opening Settings:
+The Updates card shows the installed version and a wrapped release-note
+preview. Use **Show more** to expand the notes in place or **Open release page**
+for the complete GitHub release. You can also install the newest release
+without opening Settings:
 
 ```bash
 verde update
