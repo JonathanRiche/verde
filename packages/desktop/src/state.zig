@@ -10568,6 +10568,21 @@ pub const AppState = struct {
         return self.currentThread().provider == .codex or self.opencode_reasoning_menu.items.len > 0;
     }
 
+    /// 0..1 gauge for the run pill's brain glyph: position of the selected
+    /// reasoning level within the provider's ordered menu. (index+1)/count so
+    /// the lowest level keeps a visible sliver instead of an empty silhouette;
+    /// single-level (or unknown) menus read as full.
+    pub fn currentComposerReasoningFillRatio(self: *const AppState) f32 {
+        const thread = self.currentThread();
+        const count: usize = if (thread.provider == .codex)
+            CODEX_REASONING_OPTIONS.len
+        else
+            self.opencode_reasoning_menu.items.len;
+        if (count <= 1) return 1.0;
+        const index = self.composerReasoningIndexForThread(thread) orelse return 1.0;
+        return @as(f32, @floatFromInt(@min(index, count - 1) + 1)) / @as(f32, @floatFromInt(count));
+    }
+
     pub fn currentComposerShowsFastToggle(self: *const AppState) bool {
         const thread = self.currentThread();
         const cursor_model = if (thread.provider == .cursor) self.cursorModelOptionForRef(thread.model_ref) else null;

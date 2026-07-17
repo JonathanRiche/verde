@@ -4581,8 +4581,9 @@ const NF_MD_BRAIN = "\u{F09D1}"; // brain — reasoning/thinking level on the ru
 
 /// Renders a single codicon glyph centered inside `rect` using the icon font.
 /// SDL_ttf rasterizes the glyph with proper antialiasing at the requested
-/// pixel size so it stays crisp on HiDPI displays.
-fn queueComposerIcon(state: *app_state.AppState, rect: palette.Rect, glyph: []const u8, color: palette.Color) void {
+/// pixel size so it stays crisp on HiDPI displays. `clip` trims the drawn
+/// glyph (renderer pixel space) for partial-fill effects.
+fn queueComposerIcon(state: *app_state.AppState, rect: palette.Rect, glyph: []const u8, color: palette.Color, clip: ?palette.Rect) void {
     // Glyph cell rendered slightly under the full rect height to leave the
     // codicon's drawn extent visually balanced with adjacent label text.
     const font_size = rect.h * 0.96;
@@ -4594,27 +4595,51 @@ fn queueComposerIcon(state: *app_state.AppState, rect: palette.Rect, glyph: []co
         font_size,
         .icon,
         null,
-        null,
+        clip,
     ) catch {};
 }
 
 fn drawBoltIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
-    queueComposerIcon(state, rect, NF_FA_FLASH, color);
+    queueComposerIcon(state, rect, NF_FA_FLASH, color, null);
 }
 
 fn drawDefaultModeIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
     // Default mode: hollow circle — reads as "off / standard" against the
     // filled lightning bolt that marks Fast.
-    queueComposerIcon(state, rect, NF_COD_CIRCLE, color);
+    queueComposerIcon(state, rect, NF_COD_CIRCLE, color, null);
 }
 
 fn drawAccessIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
     const glyph = if (state.currentThread().access_mode == .full_access) NF_COD_UNLOCK else NF_COD_LOCK;
-    queueComposerIcon(state, rect, glyph, color);
+    queueComposerIcon(state, rect, glyph, color, null);
 }
 
+/// Faint fraction of the brain silhouette that stays visible above the fill,
+/// keeping the glyph's outline readable at low reasoning levels.
+const THINKING_ICON_EMPTY_ALPHA: f32 = 0.32;
+
 fn drawThinkingIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
-    queueComposerIcon(state, rect, NF_MD_BRAIN, color);
+    // Reasoning gauge: the brain fills bottom-up with the selected level — a
+    // faint full silhouette underneath, and the bright glyph clipped to the
+    // bottom `ratio` of the box on top, so Low shows a sliver and the top
+    // level a solid brain.
+    const ratio = std.math.clamp(state.currentComposerReasoningFillRatio(), 0.0, 1.0);
+    if (ratio >= 1.0) {
+        queueComposerIcon(state, rect, NF_MD_BRAIN, color, null);
+        return;
+    }
+    var faint = color;
+    faint.a *= THINKING_ICON_EMPTY_ALPHA;
+    queueComposerIcon(state, rect, NF_MD_BRAIN, faint, null);
+    if (ratio <= 0.0) return;
+    const snapped = snapRect(rect);
+    const fill_h = @round(snapped.h * ratio);
+    queueComposerIcon(state, rect, NF_MD_BRAIN, color, .{
+        .x = snapped.x,
+        .y = snapped.y + snapped.h - fill_h,
+        .w = snapped.w,
+        .h = fill_h,
+    });
 }
 
 fn stableText(state: *app_state.AppState, value: []const u8) []const u8 {
