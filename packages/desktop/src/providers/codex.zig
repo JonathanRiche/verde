@@ -27,6 +27,7 @@ const ServerRequestKind = enum {
     command_approval,
     file_change_approval,
     permissions_approval,
+    mcp_elicitation,
     dynamic_tool,
     unsupported,
 };
@@ -1622,6 +1623,7 @@ pub const Client = struct {
             .command_approval => try handleCommandApprovalRequest(self, root, request_id, request),
             .file_change_approval => try handleFileChangeApprovalRequest(self, root, request_id, request),
             .permissions_approval => try handlePermissionsApprovalRequest(self, root, request_id, request),
+            .mcp_elicitation => try handleMcpElicitationRequest(self, root, request_id, request),
             .dynamic_tool => try handleDynamicToolCallRequest(self, root, request_id, request),
             .unsupported => {
                 // App-server stops the turn while a server request is unanswered.
@@ -2148,6 +2150,7 @@ fn serverRequestKind(method: []const u8) ServerRequestKind {
     if (std.mem.eql(u8, method, "item/commandExecution/requestApproval")) return .command_approval;
     if (std.mem.eql(u8, method, "item/fileChange/requestApproval")) return .file_change_approval;
     if (std.mem.eql(u8, method, "item/permissions/requestApproval")) return .permissions_approval;
+    if (std.mem.eql(u8, method, "mcpServer/elicitation/request")) return .mcp_elicitation;
     if (std.mem.eql(u8, method, "item/tool/call")) return .dynamic_tool;
     return .unsupported;
 }
@@ -2872,6 +2875,75 @@ fn handlePermissionsApprovalRequest(self: *Client, root: std.json.Value, request
     });
 }
 
+fn handleMcpElicitationRequest(
+    self: *Client,
+    root: std.json.Value,
+    request_id: std.json.Value,
+    request: provider_types.SendPromptRequest,
+) !void {
+    const params = getObjectField(root, "params") orelse .null;
+    const elicitation = getObjectField(params, "request") orelse params;
+    const mode = getOptionalObjectString(elicitation, "mode") orelse "form";
+    const message = getOptionalObjectString(elicitation, "message") orelse "Codex requested additional input.";
+    const server_name = getOptionalObjectString(params, "serverName") orelse "MCP server";
+
+    // Verde currently supports the binary confirmation subset of form
+    // elicitations. Structured forms must be declined because accepting them
+    // without schema-valid content would terminate the turn with a protocol
+    // error in app-server.
+    if (!std.mem.eql(u8, mode, "form") and !std.mem.eql(u8, mode, "openai/form")) {
+        try respondMcpElicitation(request_id, self, .deny);
+        return;
+    }
+    const schema = getObjectField(elicitation, "requestedSchema") orelse .null;
+    if (!mcpElicitationAllowsEmptyContent(schema)) {
+        if (request.on_stream_event) |on_stream_event| {
+            on_stream_event(request.stream_context, .{ .message = .{
+                .title = "Input request unsupported",
+                .body = message,
+            } });
+        }
+        try respondMcpElicitation(request_id, self, .deny);
+        return;
+    }
+
+    const decision = if (request.on_approval_request) |on_approval_request|
+        on_approval_request(request.stream_context, .{
+            .call_id = "",
+            .title = server_name,
+            .body = message,
+        })
+    else
+        .deny;
+    try respondMcpElicitation(request_id, self, decision);
+}
+
+fn mcpElicitationAllowsEmptyContent(schema: std.json.Value) bool {
+    if (schema == .null) return true;
+    if (schema != .object) return false;
+    const required = schema.object.get("required") orelse return true;
+    return required == .array and required.array.items.len == 0;
+}
+
+fn respondMcpElicitation(
+    request_id: std.json.Value,
+    self: *Client,
+    decision: provider_types.ApprovalDecision,
+) !void {
+    switch (decision) {
+        .approve => try respondToServerRequest(request_id, self, .{
+            .action = "accept",
+            .content = .{},
+            ._meta = @as(?u8, null),
+        }),
+        .deny => try respondToServerRequest(request_id, self, .{
+            .action = "decline",
+            .content = @as(?u8, null),
+            ._meta = @as(?u8, null),
+        }),
+    }
+}
+
 fn handleDynamicToolCallRequest(
     self: *Client,
     root: std.json.Value,
@@ -3592,6 +3664,28 @@ test "unknown Codex server request receives method not found" {
         "{\"id\":42,\"error\":{\"code\":-32601,\"message\":\"Unsupported Codex app-server request: currentTime/read\"}}",
         payload,
     );
+}
+
+test "MCP elicitation server request is recognized" {
+    try std.testing.expectEqual(
+        ServerRequestKind.mcp_elicitation,
+        serverRequestKind("mcpServer/elicitation/request"),
+    );
+}
+
+test "MCP elicitation only accepts content-free schemas" {
+    const allocator = std.testing.allocator;
+    var empty_schema = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"type":"object","properties":{}}
+    , .{});
+    defer empty_schema.deinit();
+    try std.testing.expect(mcpElicitationAllowsEmptyContent(empty_schema.value));
+
+    var required_schema = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}
+    , .{});
+    defer required_schema.deinit();
+    try std.testing.expect(!mcpElicitationAllowsEmptyContent(required_schema.value));
 }
 
 test "detectTurnTerminalState recognizes thread idle fallback for the active thread" {
