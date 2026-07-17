@@ -42,6 +42,7 @@ pub fn handleSettingsModalWheel(state: *runtime.AppState, width: f32, height: f3
 pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32) void {
     state.palette_modal_hits.clearRetainingCapacity();
     registerProviderOnboardingHits(state, width, height);
+    registerMcpOnboardingHits(state, width, height);
     registerImageModalHits(state, width, height);
     registerTranscriptSelectionModalHits(state, width, height);
     registerWorkspaceAddModalHits(state, width, height);
@@ -150,6 +151,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     renderThreadImportModal(state, width, height);
     renderHerdrProfilePickerModal(state, width, height);
     renderProviderOnboardingModal(state, width, height);
+    renderMcpOnboardingModal(state, width, height);
     settings_modal.render(state, width, height);
     command_palette.render(state, width, height);
     debug_window.render(state, width, height);
@@ -253,8 +255,11 @@ fn queueModalHit(state: *runtime.AppState, rect: palette.Rect, action: runtime.P
 }
 
 fn drawActionButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8, color: [4]f32) void {
-    queuePaletteRoundedRect(state, rect, paletteColor(color), theme.scaledUi(7.0));
-    queuePaletteBorder(state, rect, paletteColor(theme.lighten(color, 0.06)), theme.scaledUi(7.0), theme.scaledUi(1.0));
+    const hovered = pointInRect(state.palette_mouse_x, state.palette_mouse_y, rect);
+    const fill = if (hovered) theme.lighten(color, 0.055) else color;
+    const border = if (hovered) theme.lighten(color, 0.14) else theme.lighten(color, 0.06);
+    queuePaletteRoundedRect(state, rect, paletteColor(fill), theme.scaledUi(7.0));
+    queuePaletteBorder(state, rect, paletteColor(border), theme.scaledUi(7.0), theme.scaledUi(if (hovered) 1.5 else 1.0));
     const font_size = theme.scaledUi(14.0);
     const estimated_text_width = @as(f32, @floatFromInt(label.len)) * font_size * 0.52;
     queuePaletteText(state, .{
@@ -274,7 +279,7 @@ fn drawModalChromeVisual(state: *runtime.AppState, width: f32, height: f32, moda
 
 fn registerModalChromeHits(state: *runtime.AppState, width: f32, height: f32, modal: palette.Rect, dismissible: bool) void {
     const scrim: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = width, .h = height };
-    if (dismissible) queueModalHit(state, scrim, .modal_dismiss, 0);
+    queueModalHit(state, scrim, if (dismissible) .modal_dismiss else .modal_block, 0);
     queueModalHit(state, modal, .modal_block, 0);
 }
 
@@ -480,6 +485,8 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
         }
         if (!down) return true;
         switch (hit.action) {
+            .mcp_onboarding_not_now => state.completeMcpOnboarding(false),
+            .mcp_onboarding_enable => state.completeMcpOnboarding(true),
             .provider_onboarding_close => state.dismissProviderOnboarding(),
             .provider_onboarding_recheck => state.recheckProviderReadiness(),
             .provider_onboarding_open_guide => state.openProviderSetupGuide(),
@@ -572,19 +579,24 @@ fn focusModalInput(state: *runtime.AppState, focus: runtime.PaletteModalTextFocu
     }
 }
 
-/// Routed from main when the mouse moves while a modal input is dragged.
-/// Updates the cursor to the new x, extending the selection from the anchor.
-pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, _: f32) void {
-    if (!state.modal_text_drag_active) return;
-    if (state.palette_modal_text_focus == .none) return;
-    const value = focusedValue(state);
-    const rect = state.modal_text_input_rect;
-    if (rect.w <= 0.0) return;
-    const text_x = rect.x + theme.scaledUi(10.0);
-    const rel = @max(x - text_x, 0.0);
-    const offset = modalOffsetForClickX(value, state.modal_text_input_font_size, rel);
-    const cursor = focusedCursor(state) orelse return;
-    cursor.* = offset;
+/// Routes modal pointer motion and reports whether the workspace is occluded.
+pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, _: f32) bool {
+    if (state.modal_text_drag_active and state.palette_modal_text_focus != .none) {
+        const value = focusedValue(state);
+        const rect = state.modal_text_input_rect;
+        if (rect.w > 0.0) {
+            const text_x = rect.x + theme.scaledUi(10.0);
+            const rel = @max(x - text_x, 0.0);
+            const offset = modalOffsetForClickX(value, state.modal_text_input_font_size, rel);
+            if (focusedCursor(state)) |cursor| cursor.* = offset;
+        }
+    }
+    return state.palette_modal_hits.items.len > 0;
+}
+
+/// True while any Palette modal owns pointer input for the window.
+pub fn hasPaletteModal(state: *const runtime.AppState) bool {
+    return state.palette_modal_hits.items.len > 0;
 }
 
 pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
@@ -605,6 +617,7 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
 
 pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) bool {
     const has_modal_open = state.modal_image_path != null or
+        state.mcp_onboarding_visible or
         state.provider_onboarding_visible or
         state.rename_project_index != null or
         state.transcriptSelectionBuffer() != null or
@@ -628,6 +641,10 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
         .@"return", .kp_enter => {
             if (state.provider_onboarding_visible) {
                 state.recheckProviderReadiness();
+                return true;
+            }
+            if (state.mcp_onboarding_visible) {
+                state.completeMcpOnboarding(true);
                 return true;
             }
             if (state.palette_modal_text_focus == .project_rename) {
@@ -729,6 +746,8 @@ fn dismissTopModal(state: *runtime.AppState) void {
     }
     if (state.provider_onboarding_visible) {
         state.dismissProviderOnboarding();
+    } else if (state.mcp_onboarding_visible) {
+        state.completeMcpOnboarding(false);
     } else if (state.modal_image_path != null) {
         state.closeImageModal();
     } else if (state.transcriptSelectionBuffer() != null) {
@@ -872,6 +891,25 @@ fn registerProviderOnboardingHits(state: *runtime.AppState, width: f32, height: 
     queueModalHit(state, .{ .x = modal.x + modal.w - pad - check_w - gap - guide_w, .y = button_y, .w = guide_w, .h = button_h }, .provider_onboarding_open_guide, 0);
 }
 
+fn mcpOnboardingRect(width: f32, height: f32) palette.Rect {
+    const modal_w = theme.clampf(width * 0.5, theme.scaledUi(520.0), theme.scaledUi(680.0));
+    const modal_h = theme.clampf(height * 0.56, theme.scaledUi(400.0), theme.scaledUi(440.0));
+    return .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
+}
+
+fn registerMcpOnboardingHits(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!state.mcp_onboarding_visible or state.provider_onboarding_visible) return;
+    const modal = mcpOnboardingRect(width, height);
+    registerModalChromeHits(state, width, height, modal, false);
+    const pad = theme.scaledUi(22.0);
+    const button_h = theme.scaledUi(36.0);
+    const skip_w = theme.scaledUi(104.0);
+    const enable_w = theme.scaledUi(176.0);
+    const button_y = modal.y + modal.h - pad - button_h;
+    queueModalHit(state, .{ .x = modal.x + pad, .y = button_y, .w = skip_w, .h = button_h }, .mcp_onboarding_not_now, 0);
+    queueModalHit(state, .{ .x = modal.x + modal.w - pad - enable_w, .y = button_y, .w = enable_w, .h = button_h }, .mcp_onboarding_enable, 0);
+}
+
 fn registerWorkspaceAddModalHits(state: *runtime.AppState, width: f32, height: f32) void {
     if (!state.show_project_creator) return;
     const modal_w = theme.clampf(width * 0.34, theme.scaledUi(360.0), theme.scaledUi(500.0));
@@ -990,6 +1028,45 @@ fn registerHerdrProfilePickerHits(state: *runtime.AppState, width: f32, height: 
     const submit_rect: palette.Rect = .{ .x = cancel_rect.x + button_w + gap, .y = button_y, .w = button_w, .h = button_h };
     queueModalHit(state, cancel_rect, .herdr_profile_cancel, 0);
     queueModalHit(state, submit_rect, .herdr_profile_submit, 0);
+}
+
+// Renders the one-time opt-in for provider-native Verde MCP registration.
+fn renderMcpOnboardingModal(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!state.mcp_onboarding_visible or state.provider_onboarding_visible) return;
+    const modal = mcpOnboardingRect(width, height);
+    drawModalChromeVisual(state, width, height, modal);
+    const pad = theme.scaledUi(22.0);
+    const clip = modal;
+    var y = modal.y + pad;
+
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(28.0) }, "Make Verde work better with your agents", paletteColor(theme.COLOR_WHITE), theme.scaledUi(22.0), clip);
+    y += theme.scaledUi(36.0);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(40.0) }, "Enable Verde's MCP tools for agents you start in terminal panes or use through Verde.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.5), clip);
+    y += theme.scaledUi(54.0);
+
+    const benefit_h = theme.scaledUi(52.0);
+    const benefit_gap = theme.scaledUi(7.0);
+    renderMcpBenefitRow(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = benefit_h }, "Test apps", "Inspect and interact with Verde's embedded browser.", clip);
+    y += benefit_h + benefit_gap;
+    renderMcpBenefitRow(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = benefit_h }, "Work with processes", "Start configured services and read their logs.", clip);
+    y += benefit_h + benefit_gap;
+    renderMcpBenefitRow(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = benefit_h }, "Understand the workspace", "Use the current Verde workspace and its panes automatically.", clip);
+    const benefits_bottom = y + benefit_h;
+
+    const button_h = theme.scaledUi(36.0);
+    const button_y = modal.y + modal.h - pad - button_h;
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = benefits_bottom + theme.scaledUi(16.0), .w = modal.w - pad * 2.0, .h = theme.scaledUi(28.0) }, "Updates detected providers' user settings and preserves existing servers. Remove it any time in Settings.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), clip);
+    drawActionButton(state, .{ .x = modal.x + pad, .y = button_y, .w = theme.scaledUi(104.0), .h = button_h }, "Not now", theme.COLOR_PANEL_ALT);
+    drawActionButton(state, .{ .x = modal.x + modal.w - pad - theme.scaledUi(176.0), .y = button_y, .w = theme.scaledUi(176.0), .h = button_h }, "Enable Verde tools", theme.COLOR_SECONDARY_GREEN);
+}
+
+// Renders one capability included with Verde's MCP server.
+fn renderMcpBenefitRow(state: *runtime.AppState, rect: palette.Rect, title: []const u8, detail: []const u8, clip: palette.Rect) void {
+    queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 105)), theme.scaledUi(9.0));
+    queuePaletteBorder(state, rect, paletteColor(theme.withAlpha(theme.borderMuted(), 90)), theme.scaledUi(9.0), theme.scaledUi(1.0));
+    const text_x = rect.x + theme.scaledUi(14.0);
+    queuePaletteText(state, .{ .x = text_x, .y = rect.y + theme.scaledUi(7.0), .w = rect.w - theme.scaledUi(28.0), .h = theme.scaledUi(18.0) }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.5), clip);
+    queuePaletteText(state, .{ .x = text_x, .y = rect.y + theme.scaledUi(27.0), .w = rect.w - theme.scaledUi(28.0), .h = theme.scaledUi(17.0) }, detail, paletteColor(theme.lighten(theme.COLOR_TEXT_SUBTLE, 0.1)), theme.scaledUi(12.5), clip);
 }
 
 /// Shows the attachment preview modal for the selected image.

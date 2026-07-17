@@ -3172,7 +3172,10 @@ fn mcpToolsCall(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id
     const tool_name = jsonString(params.object.get("name") orelse .null) orelse
         return try mcpError(allocator, out, id_value, -32602, "tools/call requires name");
     const arguments = params.object.get("arguments") orelse .null;
-    const workspace = mcpArgString(arguments, "workspace") orelse mcpArgString(arguments, "project");
+    const workspace = mcpArgString(arguments, "workspace") orelse
+        mcpArgString(arguments, "project") orelse
+        getenvSlice("VERDE_WORKSPACE_ID") orelse
+        getenvSlice("VERDE_WORKSPACE_PATH");
     const process_name = mcpArgString(arguments, "name");
     const session_id = mcpArgString(arguments, "session_id") orelse mcpArgString(arguments, "session");
     const pane_id = mcpArgU32(arguments, "pane_id") orelse mcpArgU32(arguments, "pane");

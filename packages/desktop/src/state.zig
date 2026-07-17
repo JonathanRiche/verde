@@ -22,6 +22,7 @@ const platform_runtime = @import("platform_runtime");
 const platform_process = @import("platform/process.zig");
 const process_env = @import("process_env.zig");
 const provider_hooks = @import("provider_hooks.zig");
+const provider_mcp = @import("provider_mcp.zig");
 const runtime_log = @import("runtime_log.zig");
 const slash_commands = @import("slash_commands.zig");
 const stack_config = @import("stack.zig");
@@ -137,6 +138,8 @@ pub const SurfaceState = struct {
 const SETTINGS_MODAL_FADE_MS: f32 = 160.0;
 
 pub const PaletteModalAction = enum {
+    mcp_onboarding_not_now,
+    mcp_onboarding_enable,
     provider_onboarding_close,
     provider_onboarding_recheck,
     provider_onboarding_open_guide,
@@ -4447,6 +4450,7 @@ pub const AppState = struct {
     palette_frame_text: std.ArrayList(u8),
     palette_frame_text_arena: std.heap.ArenaAllocator,
     palette_modal_hits: std.ArrayList(PaletteModalHit),
+    palette_modal_pointer_captured: bool,
     code_copy_buttons: std.ArrayList(CodeCopyButtonHit),
     code_copy_recent_identity: u64,
     code_copy_recent_until_ms: i64,
@@ -4541,6 +4545,7 @@ pub const AppState = struct {
     /// live accelerator hints; set by main after keybinds load/reload.
     keyboard_config: ?*const keybinds.NativeKeyboardConfig,
     show_project_creator: bool,
+    mcp_onboarding_visible: bool,
     provider_onboarding_visible: bool,
     provider_onboarding_dismissed: bool,
     show_settings_modal: bool,
@@ -4554,6 +4559,7 @@ pub const AppState = struct {
     settings_hook_claude_installed: bool,
     settings_hook_codex_installed: bool,
     settings_hook_amp_installed: bool,
+    settings_mcp_summary: provider_mcp.Summary,
     settings_scroll_y: f32,
     settings_hover_control: ?u8,
     settings_close_hovered: bool,
@@ -4745,6 +4751,7 @@ pub const AppState = struct {
             .palette_frame_text = .empty,
             .palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator),
             .palette_modal_hits = .empty,
+            .palette_modal_pointer_captured = false,
             .code_copy_buttons = .empty,
             .code_copy_recent_identity = 0,
             .code_copy_recent_until_ms = 0,
@@ -4817,6 +4824,7 @@ pub const AppState = struct {
             .command_palette_action_selected = 0,
             .keyboard_config = null,
             .show_project_creator = false,
+            .mcp_onboarding_visible = false,
             .provider_onboarding_visible = false,
             .provider_onboarding_dismissed = false,
             .show_settings_modal = false,
@@ -4827,6 +4835,7 @@ pub const AppState = struct {
             .settings_hook_claude_installed = false,
             .settings_hook_codex_installed = false,
             .settings_hook_amp_installed = false,
+            .settings_mcp_summary = .{},
             .settings_scroll_y = 0.0,
             .settings_hover_control = null,
             .settings_close_hovered = false,
@@ -4950,6 +4959,12 @@ pub const AppState = struct {
             state.vscode_logo_texture = state.loadEmbeddedTexture(VSCODE_LOGO_BYTES);
             state.zed_logo_texture = state.loadEmbeddedTexture(ZED_LOGO_BYTES);
         }
+        if (state.app_config.mcp_integration_enabled) {
+            state.settings_mcp_summary = provider_mcp.install(state.allocator) catch |err| blk: {
+                log.warn("failed to refresh enabled provider MCP registrations: {s}", .{@errorName(err)});
+                break :blk provider_mcp.inspect(state.allocator);
+            };
+        }
         return state;
     }
 
@@ -5061,6 +5076,43 @@ pub const AppState = struct {
         self.markDirty();
     }
 
+    /// Completes the one-time MCP onboarding choice. Enabling registers Verde
+    /// in every detected provider's user config; declining makes no external
+    /// changes and remains reversible from Settings.
+    pub fn completeMcpOnboarding(self: *AppState, enable: bool) void {
+        if (enable) {
+            const summary = provider_mcp.install(self.allocator) catch |err| {
+                log.warn("failed to install provider MCP registrations: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Could not enable Verde MCP tools.");
+                self.markDirty();
+                return;
+            };
+            self.settings_mcp_summary = summary;
+            if (summary.detectedCount() == 0) {
+                self.setSidebarNotice("No supported agent providers were detected.");
+                self.markDirty();
+                return;
+            }
+            self.app_config.mcp_integration_enabled = summary.installedCount() > 0;
+            if (summary.conflictCount() > 0) {
+                self.setSidebarNotice("Enabled Verde MCP where possible; an existing 'verde' entry was preserved.");
+            } else {
+                self.setSidebarNotice("Enabled Verde tools in detected agent providers.");
+            }
+        } else {
+            self.app_config.mcp_integration_enabled = false;
+            self.setSidebarNotice("Verde MCP tools were not enabled. You can enable them in Settings.");
+        }
+
+        self.app_config.mcp_onboarding_completed = true;
+        app_config.saveAppConfig(self.allocator, &self.app_config) catch |err| {
+            log.warn("failed to persist MCP onboarding choice: {s}", .{@errorName(err)});
+            self.setSidebarNotice("MCP choice applied, but could not save Verde settings.");
+        };
+        self.mcp_onboarding_visible = false;
+        self.markDirty();
+    }
+
     pub fn pollProviderReadiness(self: *AppState) void {
         var completed = false;
         var snapshot: ProviderReadinessSnapshot = .{};
@@ -5081,6 +5133,8 @@ pub const AppState = struct {
         } else if (!self.provider_onboarding_dismissed) {
             self.provider_onboarding_visible = true;
         }
+        self.mcp_onboarding_visible = !self.app_config.mcp_onboarding_completed;
+        if (self.mcp_onboarding_visible) self.blurPaletteComposer();
         self.markDirty();
     }
 
@@ -8730,6 +8784,7 @@ pub const AppState = struct {
         self.settings_hook_claude_installed = provider_hooks.claudeGlobalHooksInstalled(self.allocator);
         self.settings_hook_codex_installed = provider_hooks.codexGlobalHooksInstalled(self.allocator);
         self.settings_hook_amp_installed = provider_hooks.ampGlobalHooksInstalled(self.allocator);
+        self.settings_mcp_summary = provider_mcp.inspect(self.allocator);
         self.settings_scroll_y = 0.0;
         self.settings_hover_control = null;
         self.settings_close_hovered = false;
@@ -8747,6 +8802,46 @@ pub const AppState = struct {
         self.palette_modal_text_focus = .none;
         self.blurPaletteComposer();
         self.noteInteraction();
+        self.markDirty();
+    }
+
+    /// Installs or removes Verde's user-scoped MCP registration across all
+    /// detected providers. Existing non-Verde entries are never overwritten.
+    pub fn toggleGlobalMcpIntegration(self: *AppState) void {
+        if (self.app_config.mcp_integration_enabled or self.settings_mcp_summary.installedCount() > 0) {
+            self.settings_mcp_summary = provider_mcp.uninstall(self.allocator) catch |err| {
+                log.warn("failed to remove provider MCP registrations: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Could not remove all Verde MCP registrations.");
+                self.markDirty();
+                return;
+            };
+            self.app_config.mcp_integration_enabled = false;
+            self.setSidebarNotice("Disabled Verde MCP tools in agent providers.");
+        } else {
+            const summary = provider_mcp.install(self.allocator) catch |err| {
+                log.warn("failed to install provider MCP registrations: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Could not enable Verde MCP tools.");
+                self.markDirty();
+                return;
+            };
+            self.settings_mcp_summary = summary;
+            if (summary.detectedCount() == 0) {
+                self.setSidebarNotice("No supported agent providers were detected.");
+                self.markDirty();
+                return;
+            }
+            self.app_config.mcp_integration_enabled = summary.installedCount() > 0;
+            if (summary.conflictCount() > 0) {
+                self.setSidebarNotice("Enabled Verde MCP where possible; existing entries were preserved.");
+            } else {
+                self.setSidebarNotice("Enabled Verde MCP tools in detected providers.");
+            }
+        }
+        self.app_config.mcp_onboarding_completed = true;
+        app_config.saveAppConfig(self.allocator, &self.app_config) catch |err| {
+            log.warn("failed to persist MCP integration preference: {s}", .{@errorName(err)});
+            self.setSidebarNotice("MCP change applied, but could not save Verde settings.");
+        };
         self.markDirty();
     }
 
@@ -15957,20 +16052,52 @@ pub const AppState = struct {
     /// True when the mouse rests on a clickable Palette control so the main
     /// loop can show a pointer (hand) cursor.
     pub fn pointerCursorWanted(self: *const AppState) bool {
-        if (self.projects.items.len == 0) return false;
         const point: palette.draw.Vec2 = .{ .x = self.palette_mouse_x, .y = self.palette_mouse_y };
+        for (self.palette_modal_hits.items) |hit| {
+            const interactive = switch (hit.action) {
+                .mcp_onboarding_not_now,
+                .mcp_onboarding_enable,
+                .provider_onboarding_close,
+                .provider_onboarding_recheck,
+                .provider_onboarding_open_guide,
+                .image_close,
+                .project_rename_cancel,
+                .project_rename_submit,
+                .transcript_close,
+                .thread_import_refresh,
+                .thread_import_cancel,
+                .thread_import_submit,
+                .thread_import_select,
+                .herdr_profile_refresh,
+                .herdr_profile_cancel,
+                .herdr_profile_submit,
+                .herdr_profile_select,
+                .project_import_browse,
+                .project_import_submit,
+                .project_import_create_dir,
+                .project_import_cancel,
+                .settings_control,
+                .settings_theme_option,
+                .settings_close,
+                .settings_cancel,
+                .settings_save,
+                .command_palette_row,
+                .command_palette_action_row,
+                => true,
+                .modal_dismiss,
+                .modal_block,
+                .project_rename_input,
+                .thread_import_input,
+                .project_import_input,
+                .command_palette_input,
+                => false,
+            };
+            if (interactive and hit.rect.contains(point)) return true;
+        }
+        if (self.palette_modal_hits.items.len > 0) return false;
+        if (self.projects.items.len == 0) return false;
         if (self.palette_model_picker.wantsPointerAt(point)) return true;
-        if (self.show_settings_modal) {
-            // Settings hit rects only exist for currently-actionable controls,
-            // so disabled buttons keep the default cursor.
-            for (self.palette_modal_hits.items) |hit| {
-                const interactive = switch (hit.action) {
-                    .settings_control, .settings_theme_option, .settings_close, .settings_cancel, .settings_save => true,
-                    else => false,
-                };
-                if (interactive and hit.rect.contains(point)) return true;
-            }
-        } else {
+        if (!self.show_settings_modal) {
             for (self.card_toggle_hits.items) |hit| {
                 if (hit.rect.contains(point)) return true;
             }
