@@ -314,7 +314,16 @@ pub const Client = struct {
         var env_map = try process_env.buildAugmentedEnvMap(self.allocator);
         defer env_map.deinit();
 
-        const executable = try process_env.resolveExecutableInEnvMapAlloc(self.allocator, &env_map, self.config.executable);
+        // The Claude provider drives its bridge through Node; a missing Node
+        // runtime otherwise surfaces only as an opaque FileNotFound. Name the
+        // missing runtime so the failure is actionable (mirrors cursor.zig).
+        const executable = process_env.resolveExecutableInEnvMapAlloc(self.allocator, &env_map, self.config.executable) catch |err| switch (err) {
+            error.FileNotFound => {
+                runtime_log.diagnostic("claude provider requires the Node.js runtime; '{s}' was not found on PATH. Install Node.js 18+ (e.g. `winget install OpenJS.NodeJS.LTS` on Windows), then restart Verde.", .{self.config.executable});
+                return err;
+            },
+            else => return err,
+        };
         defer self.allocator.free(executable);
 
         const bridge_path = try providerBridgePathAlloc(self.allocator);
