@@ -220,7 +220,9 @@ pub fn clampf(value: f32, min_value: f32, max_value: f32) f32 {
 }
 
 pub fn uiScaleFactor() f32 {
-    return current_ui_scale;
+    // Configured UI font size acts as whole-UI zoom on top of the display
+    // scale; DEFAULT_FONT_SIZE keeps the factor at 1.0 for the default config.
+    return current_ui_scale * (current_font_size / DEFAULT_FONT_SIZE);
 }
 
 pub fn scaledUi(value: f32) f32 {
