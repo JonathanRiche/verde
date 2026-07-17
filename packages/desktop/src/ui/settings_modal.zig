@@ -26,6 +26,7 @@ pub const Control = enum(u8) {
     open_zed,
     links_verde_browser,
     links_system_browser,
+    mcp_tools,
     hooks_claude,
     hooks_codex,
     hooks_amp,
@@ -123,6 +124,9 @@ const SettingsLayout = struct {
     open_cells: [OPEN_CHOICES.len]palette.Rect,
     custom_open: ?palette.Rect = null,
     integrations_card: palette.Rect,
+    mcp_tools: palette.Rect,
+    mcp_hint_y: f32,
+    hooks_label_y: f32,
     hooks_claude: palette.Rect,
     hooks_codex: palette.Rect,
     hooks_amp: palette.Rect,
@@ -218,8 +222,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const transcript_h = m.labeledBlockH(1);
     const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h + m.row_gap + m.label_h + m.inner_gap + m.row_h;
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra;
-    // Title, field label, three toggle rows (Claude + Codex + Amp), hint.
-    const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
+    // MCP controls and status, followed by the provider status-hook controls.
+    const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap * 2.0 + m.label_h * 4.0 + m.row_h * 4.0 + m.inner_gap * 6.0;
     // Same shape as the integrations card: title, field label, one toggle row, hint.
     const notifications_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     // The modal width depends only on the window, so the notes block can be
@@ -335,7 +339,11 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     y += workspace_h + m.card_gap;
 
     const integrations_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = integrations_h };
-    const hooks_claude_y = integrations_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
+    const mcp_tools_y = integrations_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
+    const mcp_tools: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = mcp_tools_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
+    const mcp_hint_y = mcp_tools_y + m.row_h + m.inner_gap;
+    const hooks_label_y = mcp_hint_y + m.label_h + m.row_gap;
+    const hooks_claude_y = hooks_label_y + m.label_h + m.inner_gap;
     const hooks_claude: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_claude_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const hooks_codex_y = hooks_claude_y + m.row_h + m.inner_gap;
     const hooks_codex: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_codex_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
@@ -405,6 +413,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .open_cells = open_cells,
         .custom_open = custom_open,
         .integrations_card = integrations_card,
+        .mcp_tools = mcp_tools,
+        .mcp_hint_y = mcp_hint_y,
+        .hooks_label_y = hooks_label_y,
         .hooks_claude = hooks_claude,
         .hooks_codex = hooks_codex,
         .hooks_amp = hooks_amp,
@@ -519,6 +530,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     for (OPEN_CHOICES, 0..) |choice, index| {
         queueControlHit(state, layout.open_cells[index], layout.body_clip, choice.control, queue_hit);
     }
+    queueControlHit(state, layout.mcp_tools, layout.body_clip, .mcp_tools, queue_hit);
     queueControlHit(state, layout.hooks_claude, layout.body_clip, .hooks_claude, queue_hit);
     queueControlHit(state, layout.hooks_codex, layout.body_clip, .hooks_codex, queue_hit);
     queueControlHit(state, layout.hooks_amp, layout.body_clip, .hooks_amp, queue_hit);
@@ -613,7 +625,28 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
 
     // Agent integrations
     drawCardTitle(state, layout.integrations_card, "Agent integrations", layout.body_clip);
-    drawFieldLabel(state, layout.integrations_card, m, "Status pip hooks (global)", layout.body_clip);
+    drawFieldLabel(state, layout.integrations_card, m, "Verde agent tools (global)", layout.body_clip);
+    const mcp_installed = state.settings_mcp_summary.installedCount() > 0;
+    drawSwitchRow(state, layout.mcp_tools, "Enable Verde MCP", mcp_installed, isControlHovered(state, .mcp_tools), layout.body_clip);
+    var mcp_status_buf: [120]u8 = undefined;
+    const mcp_status = if (state.settings_mcp_summary.detectedCount() == 0)
+        "No supported providers detected · Codex, Claude, Cursor, OpenCode, or Amp"
+    else if (state.settings_mcp_summary.conflictCount() > 0)
+        std.fmt.bufPrint(&mcp_status_buf, "Installed for {d} provider(s) · {d} existing verde entry conflict(s) preserved", .{ state.settings_mcp_summary.installedCount(), state.settings_mcp_summary.conflictCount() }) catch "Some existing verde entries were preserved"
+    else
+        std.fmt.bufPrint(&mcp_status_buf, "Installed for {d} of {d} detected provider(s) · workspace-aware in Verde panes", .{ state.settings_mcp_summary.installedCount(), state.settings_mcp_summary.detectedCount() }) catch "Workspace-aware in Verde panes";
+    queueText(state, .{
+        .x = layout.integrations_card.x + m.card_pad,
+        .y = layout.mcp_hint_y,
+        .w = layout.integrations_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, mcp_status, paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+    queueText(state, .{
+        .x = layout.integrations_card.x + m.card_pad,
+        .y = layout.hooks_label_y,
+        .w = layout.integrations_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, "Status pip hooks (global)", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
     drawSwitchRow(state, layout.hooks_claude, "Claude", state.settings_hook_claude_installed, isControlHovered(state, .hooks_claude), layout.body_clip);
     drawSwitchRow(state, layout.hooks_codex, "Codex", state.settings_hook_codex_installed, isControlHovered(state, .hooks_codex), layout.body_clip);
     drawSwitchRow(state, layout.hooks_amp, "Amp", state.settings_hook_amp_installed, isControlHovered(state, .hooks_amp), layout.body_clip);
@@ -811,6 +844,10 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .links_verde_browser => state.settings_draft.link_open_target = .verde_browser,
         .links_system_browser => state.settings_draft.link_open_target = .system_browser,
         // Acts immediately (filesystem side effect), independent of Save/Cancel.
+        .mcp_tools => {
+            state.toggleGlobalMcpIntegration();
+            return;
+        },
         .hooks_claude => {
             state.toggleClaudeGlobalHooks();
             return;

@@ -107,6 +107,10 @@ pub const AppConfig = struct {
     tool_call_group_preference: ToolCallGroupPreference = .collapsed,
     tool_call_groups_last_expanded: bool = false,
     check_for_updates_automatically: bool = true,
+    // User-scoped provider registration is opt-in because it updates each
+    // detected agent's global configuration outside Verde's own config dir.
+    mcp_integration_enabled: bool = false,
+    mcp_onboarding_completed: bool = false,
     // Fire a desktop notification when an agent surface finishes (transitions
     // to `.done`). Defaults on so the feature works without first opening
     // Settings; users can disable it from the Settings cog / verde.json.
@@ -264,6 +268,7 @@ pub fn saveAppConfig(allocator: std.mem.Allocator, config: *const AppConfig) !vo
     try writeTranscriptSection(tree_allocator, &root.object, config);
     try writeUpdatesSection(tree_allocator, &root.object, config);
     try writeNotificationsSection(tree_allocator, &root.object, config);
+    try writeIntegrationsSection(tree_allocator, &root.object, config);
 
     const encoded = try std.json.Stringify.valueAlloc(allocator, root, .{ .whitespace = .indent_2 });
     defer allocator.free(encoded);
@@ -432,6 +437,12 @@ fn writeNotificationsSection(allocator: std.mem.Allocator, object: *std.json.Obj
     try notifications_object.put(allocator, "enabled", .{ .bool = config.notifications_enabled });
 }
 
+fn writeIntegrationsSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
+    const integrations_object = try objectSection(allocator, object, "integrations");
+    try integrations_object.put(allocator, "mcp_enabled", .{ .bool = config.mcp_integration_enabled });
+    try integrations_object.put(allocator, "mcp_onboarding_completed", .{ .bool = config.mcp_onboarding_completed });
+}
+
 fn colorToHex(allocator: std.mem.Allocator, color: [4]f32) ![]u8 {
     const r: u8 = @intFromFloat(@round(theme.clampf(color[0], 0.0, 1.0) * 255.0));
     const g: u8 = @intFromFloat(@round(theme.clampf(color[1], 0.0, 1.0) * 255.0));
@@ -485,6 +496,9 @@ fn applyAppOverrides(allocator: std.mem.Allocator, config: *AppConfig, root: std
     if (root.object.get("notifications")) |notifications_value| {
         applyNotificationsOverrides(config, notifications_value);
     }
+    if (root.object.get("integrations")) |integrations_value| {
+        applyIntegrationsOverrides(config, integrations_value);
+    }
 }
 
 fn applyTranscriptOverrides(config: *AppConfig, transcript_value: std.json.Value) void {
@@ -537,6 +551,27 @@ fn applyNotificationsOverrides(config: *AppConfig, notifications_value: std.json
             config.notifications_enabled = enabled_value.bool;
         } else {
             log.warn("notifications.enabled must be a boolean when provided", .{});
+        }
+    }
+}
+
+fn applyIntegrationsOverrides(config: *AppConfig, integrations_value: std.json.Value) void {
+    if (integrations_value != .object) {
+        log.warn("integrations must be an object when provided", .{});
+        return;
+    }
+    if (integrations_value.object.get("mcp_enabled")) |enabled_value| {
+        if (enabled_value == .bool) {
+            config.mcp_integration_enabled = enabled_value.bool;
+        } else {
+            log.warn("integrations.mcp_enabled must be a boolean when provided", .{});
+        }
+    }
+    if (integrations_value.object.get("mcp_onboarding_completed")) |completed_value| {
+        if (completed_value == .bool) {
+            config.mcp_onboarding_completed = completed_value.bool;
+        } else {
+            log.warn("integrations.mcp_onboarding_completed must be a boolean when provided", .{});
         }
     }
 }

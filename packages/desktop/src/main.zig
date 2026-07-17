@@ -1486,6 +1486,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             ui_layout.updateHerdrProfilePickerHover(state, event.motion.x, event.motion.y);
             ui_layout.updateSettingsModalHover(state, event.motion.x, event.motion.y);
             ui_layout.updateCommandPaletteHover(state, event.motion.x, event.motion.y);
+            const modal_owns_motion = ui_layout.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
+            if (state.palette_modal_pointer_captured or modal_owns_motion) {
+                return true;
+            }
             // Composer popovers (model picker / run config) draw above the
             // panes, so their hover/drag routing must win over transcript and
             // pane motion handlers below.
@@ -1493,7 +1497,6 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             chat_panel_ui.handleTranscriptPaletteMouseMotion(state);
-            ui_layout.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             const ctrl_down = isCtrlPressed() or isKeymodPressed(SDL_GetModState(), sdl.Keymod.ctrl);
             if (workspace_panes_ui.hasActivePaneDrag() and workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, ctrl_down)) {
                 return true;
@@ -1514,6 +1517,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             _ = state.handleBrowserMouse(browserMouseMotionEvent(&event.motion));
         },
         .mouse_button_down, .mouse_button_up => {
+            if (event.button.button == 1 and !event.button.down and state.palette_modal_pointer_captured) {
+                state.palette_modal_pointer_captured = false;
+                state.modal_text_drag_active = false;
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (event.button.button == 1 and sidebar_ui.hasActiveThreadDrag()) {
                 if (sidebar_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
                     syncWindowTextInput(window, state);
@@ -1521,6 +1530,11 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 }
             }
             if (event.button.button == 1 and ui_layout.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down, event.button.clicks)) {
+                if (event.button.down) state.palette_modal_pointer_captured = true;
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (ui_layout.hasPaletteModal(state)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -1668,6 +1682,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             )) {
                 return true;
             }
+            if (ui_layout.hasPaletteModal(state)) return true;
             // Composer popovers overlay the panes; scrolling their lists must
             // win over sidebar/terminal/transcript wheel handlers below.
             if (state.routeComposerPopoverWheel(&event.wheel, ui_scale)) {
@@ -2416,6 +2431,7 @@ test {
     _ = @import("providers/claude.zig");
     _ = @import("providers/diagnostics.zig");
     _ = @import("providers/opencode.zig");
+    _ = @import("provider_mcp.zig");
     _ = @import("slash_commands.zig");
     _ = @import("update_installer.zig");
     _ = @import("updater.zig");
