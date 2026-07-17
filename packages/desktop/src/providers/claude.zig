@@ -573,11 +573,15 @@ fn providerBridgeInstalledPathsAlloc(
         return paths;
     }
 
-    // Packaged CLI binaries live in bin/, while the Windows GUI executable may
-    // live at the package root. Probe both layouts before falling back to dev.
+    // Packaged CLI binaries live in bin/, while the Windows GUI executable and
+    // flat Linux installs (e.g. AUR's /usr/lib/verde) keep everything beside
+    // the executable. Probe both layouts, then the system-wide share locations
+    // distro packages may use, before falling back to dev trees.
     try appendProviderBridgePath(allocator, &paths, &.{ exe_dir, "..", "share", "verde", "provider_bridge.mjs" });
-    if (os_tag == .windows) {
-        try appendProviderBridgePath(allocator, &paths, &.{ exe_dir, "share", "verde", "provider_bridge.mjs" });
+    try appendProviderBridgePath(allocator, &paths, &.{ exe_dir, "share", "verde", "provider_bridge.mjs" });
+    if (os_tag != .windows) {
+        try appendProviderBridgePath(allocator, &paths, &.{"/usr/local/share/verde/provider_bridge.mjs"});
+        try appendProviderBridgePath(allocator, &paths, &.{"/usr/share/verde/provider_bridge.mjs"});
     }
     return paths;
 }
@@ -785,6 +789,17 @@ test "Windows provider bridge probes CLI and package-root GUI layouts" {
     }
     try std.testing.expect(std.mem.endsWith(u8, paths.items[0], "/package/share/verde/provider_bridge.mjs"));
     try std.testing.expect(std.mem.endsWith(u8, paths.items[1], "/package/bin/share/verde/provider_bridge.mjs"));
+}
+
+test "Linux provider bridge probes packaged, flat, and system share layouts" {
+    var paths = try providerBridgeInstalledPathsAlloc(std.testing.allocator, .linux, "/usr/lib/verde");
+    defer deinitOwnedPaths(std.testing.allocator, &paths);
+
+    try std.testing.expectEqual(@as(usize, 4), paths.items.len);
+    try std.testing.expectEqualStrings("/usr/lib/share/verde/provider_bridge.mjs", paths.items[0]);
+    try std.testing.expectEqualStrings("/usr/lib/verde/share/verde/provider_bridge.mjs", paths.items[1]);
+    try std.testing.expectEqualStrings("/usr/local/share/verde/provider_bridge.mjs", paths.items[2]);
+    try std.testing.expectEqualStrings("/usr/share/verde/provider_bridge.mjs", paths.items[3]);
 }
 
 test "Windows detached bridge source uses PowerShell temp paths and tree cleanup" {
