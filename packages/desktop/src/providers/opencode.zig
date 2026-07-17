@@ -12,9 +12,8 @@ const log = std.log.scoped(.native_opencode);
 
 const MAX_HTTP_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_HEALTH_WAIT_ATTEMPTS = 30;
-/// SO_RCVTIMEO for health probes: long enough for a healthy local server
-/// under load, short enough that a wedged server cannot hang startup or
-/// shutdown (see checkHealth).
+/// Health-probe receive deadline: long enough for a healthy local server under
+/// load, short enough that a wedged server cannot hang startup or shutdown.
 const HEALTH_PROBE_RECV_TIMEOUT_MS = 2_000;
 const DEFAULT_BASE_URL = "http://127.0.0.1:4096";
 const MESSAGE_POLL_LIMIT = 12;
@@ -348,7 +347,7 @@ pub const Client = struct {
     // blocked forever inside std.http.Client.fetch — which has no read
     // timeout — hanging ensureServer, the provider-readiness worker, and app
     // shutdown, which joins that worker. So the probe speaks minimal HTTP/1.1
-    // over a raw socket with SO_RCVTIMEO instead of using requestJson.
+    // over a stream raced against a std.Io timeout instead of using requestJson.
     fn checkHealth(self: *Client) bool {
         return self.probeHealthBounded() catch |err| {
             log.debug("opencode health probe failed: {s}", .{@errorName(err)});
@@ -368,7 +367,8 @@ pub const Client = struct {
         // unbounded fetch.
         const address = try std.Io.net.IpAddress.parse(host.bytes, port);
 
-        var threaded = std.Io.Threaded.init_single_threaded;
+        var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
         const io = threaded.io();
 
         // Threaded Io has no connect-timeout support yet (it panics on a
@@ -377,17 +377,6 @@ pub const Client = struct {
         // guard that matters for a live-but-stuck server.
         var stream = try address.connect(io, .{ .mode = .stream });
         defer stream.close(io);
-
-        const receive_timeout: std.c.timeval = .{
-            .sec = HEALTH_PROBE_RECV_TIMEOUT_MS / 1000,
-            .usec = (HEALTH_PROBE_RECV_TIMEOUT_MS % 1000) * 1000,
-        };
-        try std.posix.setsockopt(
-            stream.socket.handle,
-            std.posix.SOL.SOCKET,
-            std.posix.SO.RCVTIMEO,
-            std.mem.asBytes(&receive_timeout),
-        );
 
         const auth_header = try self.makeAuthorizationHeader();
         defer if (auth_header) |header| self.allocator.free(header.value);
@@ -405,28 +394,40 @@ pub const Client = struct {
             );
         defer self.allocator.free(request);
 
-        try writeAllRaw(stream.socket.handle, request);
+        try streamWriteAllWithIo(io, stream, request);
 
         // Only the status line matters; 128 bytes is ample for
         // "HTTP/1.1 200 OK\r\n" plus slack for unusual reason phrases.
+        const Event = union(enum) {
+            read: std.Io.net.Stream.Reader.Error!usize,
+            timeout: std.Io.Cancelable!void,
+        };
         var response_buffer: [128]u8 = undefined;
+        var result_buffer: [2]Event = undefined;
+        var select = std.Io.Select(Event).init(io, &result_buffer);
+        defer select.cancelDiscard();
+
         var filled: usize = 0;
+        try select.concurrent(.read, streamReadSomeWithIo, .{ io, stream, response_buffer[filled..] });
+        try select.concurrent(.timeout, std.Io.sleep, .{
+            io,
+            std.Io.Duration.fromMilliseconds(HEALTH_PROBE_RECV_TIMEOUT_MS),
+            std.Io.Clock.awake,
+        });
         while (filled < response_buffer.len) {
-            const read_raw = std.c.read(
-                stream.socket.handle,
-                response_buffer[filled..].ptr,
-                response_buffer.len - filled,
-            );
-            if (read_raw == 0) break;
-            if (read_raw < 0) {
-                const errno = std.c._errno().*;
-                if (errno == @intFromEnum(std.c.E.INTR)) continue;
-                // EAGAIN here is SO_RCVTIMEO expiring: the wedged-server case.
-                if (errno == @intFromEnum(std.c.E.AGAIN)) return false;
-                return error.HealthProbeReadFailed;
+            switch (try select.await()) {
+                .read => |result| {
+                    const read_len = try result;
+                    if (read_len == 0) break;
+                    filled += read_len;
+                    if (std.mem.indexOf(u8, response_buffer[0..filled], "\r\n") != null) break;
+                    try select.concurrent(.read, streamReadSomeWithIo, .{ io, stream, response_buffer[filled..] });
+                },
+                .timeout => |result| {
+                    try result;
+                    return false;
+                },
             }
-            filled += @intCast(read_raw);
-            if (std.mem.indexOf(u8, response_buffer[0..filled], "\r\n") != null) break;
         }
         return statusLineIsOk(response_buffer[0..filled]);
     }
@@ -1132,17 +1133,21 @@ fn encodeBase64Alloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     return out;
 }
 
-fn writeAllRaw(fd: std.c.fd_t, bytes: []const u8) !void {
-    var remaining = bytes;
-    while (remaining.len > 0) {
-        const written = std.c.write(fd, remaining.ptr, remaining.len);
-        if (written < 0) {
-            const errno = std.c._errno().*;
-            if (errno == @intFromEnum(std.c.E.INTR)) continue;
-            return error.HealthProbeWriteFailed;
-        }
-        remaining = remaining[@intCast(written)..];
-    }
+fn streamReadSomeWithIo(io: std.Io, stream: std.Io.net.Stream, buffer: []u8) std.Io.net.Stream.Reader.Error!usize {
+    var reader_buffer: [0]u8 = .{};
+    var reader = stream.reader(io, &reader_buffer);
+    var buffers: [1][]u8 = .{buffer};
+    return reader.interface.readVec(&buffers) catch |err| switch (err) {
+        error.EndOfStream => 0,
+        error.ReadFailed => reader.err orelse error.Unexpected,
+    };
+}
+
+fn streamWriteAllWithIo(io: std.Io, stream: std.Io.net.Stream, bytes: []const u8) !void {
+    var buffer: [1024]u8 = undefined;
+    var writer = stream.writer(io, &buffer);
+    try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
 }
 
 // Accepts any HTTP version ("HTTP/1.1 200 OK", "HTTP/1.0 200 ...").
@@ -2408,22 +2413,13 @@ test "checkHealth times out against a server that accepts but never responds" {
     // The kernel completes the TCP handshake via the backlog, so the probe
     // connects fine and then gets no bytes — the exact failure observed live
     // 2026-07-15, where the old fetch-based probe blocked forever.
-    const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM | std.c.SOCK.CLOEXEC, 0);
-    try std.testing.expect(fd >= 0);
-    defer _ = std.c.close(fd);
-
-    var bind_addr: std.c.sockaddr.in = .{
-        .family = std.c.AF.INET,
-        .port = 0,
-        .addr = std.mem.nativeToBig(u32, 0x7f00_0001),
-    };
-    try std.testing.expectEqual(0, std.c.bind(fd, @ptrCast(&bind_addr), @sizeOf(std.c.sockaddr.in)));
-    try std.testing.expectEqual(0, std.c.listen(fd, 1));
-
-    var bound_addr: std.c.sockaddr.in = undefined;
-    var bound_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
-    try std.testing.expectEqual(0, std.c.getsockname(fd, @ptrCast(&bound_addr), &bound_len));
-    const port = std.mem.bigToNative(u16, bound_addr.port);
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const listen_address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try listen_address.listen(io, .{});
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
 
     const base_url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{port});
     defer std.testing.allocator.free(base_url);
