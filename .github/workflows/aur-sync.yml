@@ -7,6 +7,11 @@ on:
         description: Release tag to sync, for example v0.1.5
         required: true
         type: string
+      force_pkgrel_bump:
+        description: Bump pkgrel even when release metadata is unchanged
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -46,7 +51,11 @@ jobs:
       - name: Update AUR package metadata
         shell: bash
         run: |
-          bash ./scripts/release/update-aur-verde-bin.sh "${{ steps.tag.outputs.value }}" /tmp/verde-bin-aur
+          args=("${{ steps.tag.outputs.value }}" /tmp/verde-bin-aur)
+          if [[ "${{ inputs.force_pkgrel_bump }}" == "true" ]]; then
+            args+=(--force-pkgrel-bump)
+          fi
+          bash ./scripts/release/update-aur-verde-bin.sh "${args[@]}"
 
       - name: Commit and push AUR update
         shell: bash

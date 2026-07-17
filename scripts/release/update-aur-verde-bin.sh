@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <tag-or-version> <aur-repo-dir>" >&2
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  echo "usage: $0 <tag-or-version> <aur-repo-dir> [--force-pkgrel-bump]" >&2
+  exit 1
+fi
+
+FORCE_PKGREL_BUMP=false
+if [[ ${3:-} == "--force-pkgrel-bump" ]]; then
+  FORCE_PKGREL_BUMP=true
+elif [[ $# -eq 3 ]]; then
+  echo "unknown option: $3" >&2
   exit 1
 fi
 
@@ -43,6 +51,19 @@ fi
 
 PKGBUILD="${AUR_REPO_DIR}/PKGBUILD"
 SRCINFO="${AUR_REPO_DIR}/.SRCINFO"
+ORIGINAL_PKGBUILD="${WORK_DIR}/PKGBUILD.original"
+ORIGINAL_SRCINFO="${WORK_DIR}/.SRCINFO.original"
+CURRENT_VERSION="$(sed -n -E 's/^pkgver=(.+)$/\1/p' "${PKGBUILD}")"
+CURRENT_PKGREL="$(sed -n -E 's/^pkgrel=([0-9]+)$/\1/p' "${PKGBUILD}")"
+
+if [[ -z "${CURRENT_VERSION}" || ! "${CURRENT_PKGREL}" =~ ^[0-9]+$ ]]; then
+  echo "failed to resolve current pkgver/pkgrel from ${PKGBUILD}" >&2
+  exit 1
+fi
+
+cp "${PKGBUILD}" "${ORIGINAL_PKGBUILD}"
+cp "${SRCINFO}" "${ORIGINAL_SRCINFO}"
+
 REQUIRED_DEPENDS=(
   "libwpe"
   "wpebackend-fdo"
@@ -180,6 +201,27 @@ if ! grep -Fq $'\toptdepends = zenity: native folder picker integration' "${SRCI
   mv "${SRCINFO}.tmp" "${SRCINFO}"
 fi
 
+if [[ "${CURRENT_VERSION}" != "${VERSION}" ]]; then
+  NEXT_PKGREL=1
+elif [[ "${FORCE_PKGREL_BUMP}" == true ]] || \
+  ! cmp -s "${ORIGINAL_PKGBUILD}" "${PKGBUILD}" || \
+  ! cmp -s "${ORIGINAL_SRCINFO}" "${SRCINFO}"; then
+  NEXT_PKGREL=$((CURRENT_PKGREL + 1))
+else
+  NEXT_PKGREL="${CURRENT_PKGREL}"
+fi
+
+sed -i -E "s/^pkgrel=.*/pkgrel=${NEXT_PKGREL}/" "${PKGBUILD}"
+awk -v pkgrel="${NEXT_PKGREL}" '
+  $1 == "pkgrel" && $2 == "=" {
+    print "\tpkgrel = " pkgrel
+    next
+  }
+  { print }
+' "${SRCINFO}" > "${SRCINFO}.tmp"
+mv "${SRCINFO}.tmp" "${SRCINFO}"
+
 echo "Updated verde-bin metadata to ${TAG}"
+echo "pkgrel: ${NEXT_PKGREL}"
 echo "linux sha256: ${LINUX_SHA}"
 echo "license sha256: ${LICENSE_SHA}"
