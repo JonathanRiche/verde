@@ -1171,13 +1171,15 @@ fn appNeedsContinuousFrames(state: *AppState) bool {
         state.hasPendingSlashCommand() or
         // Run-config stepper thumbs slide for ~160ms after a selection.
         state.runConfigStepperAnimating() or
+        // Settings modal fades in/out for ~160ms.
+        state.settingsModalAnimating() or
         // Pulsing sidebar status pips need a steady tick or the sine wave
         // gets sampled at the 1Hz "Working" label cadence and looks steppy.
         state.sidebar_pulse_animating;
 }
 
 fn eventWaitTimeoutMs(state: *AppState) c_int {
-    if (state.isPickerPending() or state.isBrowserVisible() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or workspace_panes_ui.isCompletionPulseAnimating() or ui_layout.isSidebarAnimating() or state.runConfigStepperAnimating()) {
+    if (state.isPickerPending() or state.isBrowserVisible() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or workspace_panes_ui.isCompletionPulseAnimating() or ui_layout.isSidebarAnimating() or state.runConfigStepperAnimating() or state.settingsModalAnimating()) {
         return ACTIVE_WAIT_TIMEOUT_MS;
     }
     // Terminal output only reaches the screen when the loop wakes and polls

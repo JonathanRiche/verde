@@ -133,6 +133,9 @@ pub const SurfaceState = struct {
     }
 };
 
+/// Settings modal fade in/out duration.
+const SETTINGS_MODAL_FADE_MS: f32 = 160.0;
+
 pub const PaletteModalAction = enum {
     provider_onboarding_close,
     provider_onboarding_recheck,
@@ -4516,6 +4519,12 @@ pub const AppState = struct {
     provider_onboarding_visible: bool,
     provider_onboarding_dismissed: bool,
     show_settings_modal: bool,
+    /// Settings modal fade: 0 hidden → 1 shown. Ticked once per rendered
+    /// frame from the modal's render path; finishing the fade-out is what
+    /// actually clears `show_settings_modal`.
+    settings_modal_anim_progress: f32,
+    settings_modal_anim_last_ms: i64,
+    settings_modal_closing: bool,
     settings_draft: SettingsDraft,
     settings_hook_claude_installed: bool,
     settings_hook_codex_installed: bool,
@@ -4779,6 +4788,9 @@ pub const AppState = struct {
             .provider_onboarding_visible = false,
             .provider_onboarding_dismissed = false,
             .show_settings_modal = false,
+            .settings_modal_anim_progress = 0.0,
+            .settings_modal_anim_last_ms = 0,
+            .settings_modal_closing = false,
             .settings_draft = .{},
             .settings_hook_claude_installed = false,
             .settings_hook_codex_installed = false,
@@ -8676,6 +8688,9 @@ pub const AppState = struct {
         self.settings_theme_dropdown_open = false;
         self.settings_theme_hover_index = null;
         self.settings_theme_menu_scroll = 0;
+        self.settings_modal_closing = false;
+        self.settings_modal_anim_progress = 0.0;
+        self.settings_modal_anim_last_ms = 0;
         self.show_settings_modal = true;
         if (self.app_config.check_for_updates_automatically and self.update_state.status == .idle) {
             self.update_state.start();
@@ -8764,7 +8779,8 @@ pub const AppState = struct {
     }
 
     pub fn cancelSettingsModal(self: *AppState) void {
-        self.show_settings_modal = false;
+        if (self.settings_modal_closing) return;
+        self.beginSettingsModalClose();
         self.settings_hover_control = null;
         self.settings_close_hovered = false;
         self.settings_theme_dropdown_open = false;
@@ -8795,7 +8811,7 @@ pub const AppState = struct {
         self.app_config_file_mtime = app_config.configFileMtime(self.allocator) catch self.app_config_file_mtime;
         self.applyTerminalFontSizesFromConfig();
         self.app_config_runtime_sync_pending = true;
-        self.show_settings_modal = false;
+        self.beginSettingsModalClose();
         self.settings_hover_control = null;
         self.settings_close_hovered = false;
         self.settings_theme_dropdown_open = false;
@@ -8820,6 +8836,43 @@ pub const AppState = struct {
 
     pub fn isSettingsModalOpen(self: *const AppState) bool {
         return self.show_settings_modal;
+    }
+
+    /// Starts the settings modal fade-out; the modal stays visible (input
+    /// blocked) until the fade completes in `tickSettingsModalAnimation`.
+    fn beginSettingsModalClose(self: *AppState) void {
+        if (!self.show_settings_modal) return;
+        self.settings_modal_closing = true;
+        self.settings_modal_anim_last_ms = 0;
+    }
+
+    /// Advances the settings modal fade toward shown/hidden; called once per
+    /// rendered frame while the modal is visible.
+    pub fn tickSettingsModalAnimation(self: *AppState) void {
+        if (!self.show_settings_modal) return;
+        const now = monotonicMs();
+        const last = self.settings_modal_anim_last_ms;
+        self.settings_modal_anim_last_ms = now;
+        // First tick after open/close starts the clock without jumping.
+        if (last == 0 or now <= last) return;
+        // Clamp so a stalled frame advances the fade instead of skipping it.
+        const elapsed: f32 = @floatFromInt(@min(now - last, 100));
+        const step = elapsed / SETTINGS_MODAL_FADE_MS;
+        if (self.settings_modal_closing) {
+            self.settings_modal_anim_progress -= step;
+            if (self.settings_modal_anim_progress <= 0.0) {
+                self.settings_modal_anim_progress = 0.0;
+                self.settings_modal_closing = false;
+                self.show_settings_modal = false;
+            }
+        } else if (self.settings_modal_anim_progress < 1.0) {
+            self.settings_modal_anim_progress = @min(self.settings_modal_anim_progress + step, 1.0);
+        }
+    }
+
+    /// True while the settings modal fade needs frames pumped.
+    pub fn settingsModalAnimating(self: *const AppState) bool {
+        return self.show_settings_modal and (self.settings_modal_closing or self.settings_modal_anim_progress < 1.0);
     }
 
     pub fn settingsThemeChoiceCount(self: *const AppState) usize {
