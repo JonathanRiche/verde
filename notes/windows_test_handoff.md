@@ -33,9 +33,15 @@ Runtime. `WebView2Loader.dll` is included but is not the browser runtime.
 - For provider tests, install only the provider CLIs you normally trust and
   use. Record their versions and installation method. Native Windows must work
   without WSL; WSL is a separate optional-profile test.
+- The Claude provider additionally requires Node.js 18+ on `PATH`, because Verde
+  runs its packaged provider bridge (`share\verde\provider_bridge.mjs`) through
+  Node to reach Anthropic's Agent SDK. The native Claude CLI alone is not
+  sufficient; Claude can succeed in PowerShell while Verde reports `FileNotFound`
+  if Node is absent. Other providers and the app shell do not need Node.
 
-No SDL, SDL_ttf, Vulkan, Rust, Zig, Node, Bun, CMake, or Visual Studio install
-should be needed to run the extracted preview.
+No SDL, SDL_ttf, Vulkan, Rust, Zig, Bun, CMake, or Visual Studio install should
+be needed to run the extracted preview. Node is a runtime prerequisite only for
+the Claude provider, as noted above.
 
 ## Windows local control, hooks, and firewall policy
 
