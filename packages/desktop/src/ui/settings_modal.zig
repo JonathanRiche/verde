@@ -14,6 +14,9 @@ pub const Control = enum(u8) {
     terminal_font_dec,
     terminal_font_inc,
     theme_dropdown,
+    tool_groups_collapsed,
+    tool_groups_expanded,
+    tool_groups_remember_last,
     open_folder,
     open_editor,
     open_cursor,
@@ -102,6 +105,10 @@ const SettingsLayout = struct {
     theme_dropdown: palette.Rect,
     ui_font_dec: palette.Rect,
     ui_font_inc: palette.Rect,
+    transcript_card: palette.Rect,
+    tool_groups_collapsed: palette.Rect,
+    tool_groups_expanded: palette.Rect,
+    tool_groups_remember_last: palette.Rect,
     terminal_card: palette.Rect,
     terminal_font_dec: palette.Rect,
     terminal_font_inc: palette.Rect,
@@ -189,6 +196,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const custom_extra: f32 = if (state.settings_draft.open_action == .custom) m.row_h + m.inner_gap else 0.0;
 
     const appearance_h = m.labeledBlockH(2);
+    const transcript_h = m.labeledBlockH(1);
     const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h + m.row_gap + m.label_h + m.inner_gap + m.row_h;
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra;
     // Title, field label, three toggle rows (Claude + Codex + Amp), hint.
@@ -198,7 +206,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     // Version/status, action row, automatic-check preference, and a release-note preview.
     const updates_h = m.card_pad * 2.0 + m.title_h + m.inner_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h * 2.0;
 
-    const body_h = appearance_h + m.card_gap + terminal_h + m.card_gap + workspace_h + m.card_gap + integrations_h + m.card_gap + updates_h + m.card_gap + notifications_h;
+    const body_h = appearance_h + m.card_gap + transcript_h + m.card_gap + terminal_h + m.card_gap + workspace_h + m.card_gap + integrations_h + m.card_gap + updates_h + m.card_gap + notifications_h;
     const modal_h = m.header_h + m.modal_pad + body_h + m.modal_pad + m.footer_h;
     const modal = layoutModal(width, height, modal_h);
 
@@ -251,6 +259,15 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const ui_stepper = stepperRects(appearance_card, m.card_pad, ui_font_y, m);
 
     y += appearance_h + m.card_gap;
+
+    const transcript_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = transcript_h };
+    const tool_group_y = transcript_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
+    const tool_group_w = (content_w - m.card_pad * 2.0 - m.inner_gap * 2.0) / 3.0;
+    const tool_groups_collapsed: palette.Rect = .{ .x = transcript_card.x + m.card_pad, .y = tool_group_y, .w = tool_group_w, .h = m.row_h };
+    const tool_groups_expanded: palette.Rect = .{ .x = tool_groups_collapsed.x + tool_group_w + m.inner_gap, .y = tool_group_y, .w = tool_group_w, .h = m.row_h };
+    const tool_groups_remember_last: palette.Rect = .{ .x = tool_groups_expanded.x + tool_group_w + m.inner_gap, .y = tool_group_y, .w = tool_group_w, .h = m.row_h };
+
+    y += transcript_h + m.card_gap;
 
     const terminal_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = terminal_h };
     const terminal_font_y = terminal_card.y + m.card_pad + m.title_h + m.row_gap;
@@ -332,6 +349,10 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .theme_dropdown = theme_dropdown,
         .ui_font_dec = ui_stepper.dec,
         .ui_font_inc = ui_stepper.inc,
+        .transcript_card = transcript_card,
+        .tool_groups_collapsed = tool_groups_collapsed,
+        .tool_groups_expanded = tool_groups_expanded,
+        .tool_groups_remember_last = tool_groups_remember_last,
         .terminal_card = terminal_card,
         .terminal_font_dec = terminal_stepper.dec,
         .terminal_font_inc = terminal_stepper.inc,
@@ -439,6 +460,9 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.theme_dropdown, layout.body_clip, .theme_dropdown, queue_hit);
     queueControlHit(state, layout.ui_font_dec, layout.body_clip, .ui_font_dec, queue_hit);
     queueControlHit(state, layout.ui_font_inc, layout.body_clip, .ui_font_inc, queue_hit);
+    queueControlHit(state, layout.tool_groups_collapsed, layout.body_clip, .tool_groups_collapsed, queue_hit);
+    queueControlHit(state, layout.tool_groups_expanded, layout.body_clip, .tool_groups_expanded, queue_hit);
+    queueControlHit(state, layout.tool_groups_remember_last, layout.body_clip, .tool_groups_remember_last, queue_hit);
     queueControlHit(state, layout.terminal_font_dec, layout.body_clip, .terminal_font_dec, queue_hit);
     queueControlHit(state, layout.terminal_font_inc, layout.body_clip, .terminal_font_inc, queue_hit);
     queueControlHit(state, layout.links_verde_browser, layout.body_clip, .links_verde_browser, queue_hit);
@@ -472,6 +496,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
 
     drawHeaderBar(state, layout, dirty);
     drawCard(state, layout.appearance_card, layout.body_clip);
+    drawCard(state, layout.transcript_card, layout.body_clip);
     drawCard(state, layout.terminal_card, layout.body_clip);
     drawCard(state, layout.workspace_card, layout.body_clip);
     drawCard(state, layout.integrations_card, layout.body_clip);
@@ -483,6 +508,13 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     drawFieldLabel(state, layout.appearance_card, m, "Theme", layout.body_clip);
     drawThemeDropdown(state, layout);
     drawStepperRow(state, layout.appearance_card, m, layout.ui_font_dec.y, "UI font size", state.settings_draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE, .ui_font_dec, .ui_font_inc, layout.ui_font_dec, layout.ui_font_inc, layout.body_clip);
+
+    // Transcript
+    drawCardTitle(state, layout.transcript_card, "Transcript", layout.body_clip);
+    drawFieldLabel(state, layout.transcript_card, m, "Tool call groups", layout.body_clip);
+    drawToggleCell(state, layout.tool_groups_collapsed, "Collapsed", state.settings_draft.tool_call_group_preference == .collapsed, isControlHovered(state, .tool_groups_collapsed), layout.body_clip);
+    drawToggleCell(state, layout.tool_groups_expanded, "Expanded", state.settings_draft.tool_call_group_preference == .expanded, isControlHovered(state, .tool_groups_expanded), layout.body_clip);
+    drawToggleCell(state, layout.tool_groups_remember_last, "Remember last", state.settings_draft.tool_call_group_preference == .remember_last, isControlHovered(state, .tool_groups_remember_last), layout.body_clip);
 
     // Terminal
     drawCardTitle(state, layout.terminal_card, "Terminal", layout.body_clip);
@@ -682,6 +714,9 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
                 state.settings_theme_hover_index = null;
             }
         },
+        .tool_groups_collapsed => state.settings_draft.tool_call_group_preference = .collapsed,
+        .tool_groups_expanded => state.settings_draft.tool_call_group_preference = .expanded,
+        .tool_groups_remember_last => state.settings_draft.tool_call_group_preference = .remember_last,
         .open_folder => state.settings_draft.open_action = .folder,
         .open_editor => state.settings_draft.open_action = .editor,
         .open_cursor => state.settings_draft.open_action = .cursor,

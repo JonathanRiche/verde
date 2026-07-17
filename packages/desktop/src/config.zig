@@ -60,6 +60,12 @@ pub const LinkOpenTarget = enum {
     system_browser,
 };
 
+pub const ToolCallGroupPreference = enum {
+    collapsed,
+    expanded,
+    remember_last,
+};
+
 pub const TerminalLaunchProfileConfig = struct {
     label: []u8,
     command: []const []u8,
@@ -98,6 +104,8 @@ pub const AppConfig = struct {
     default_open_action: DefaultOpenAction = .folder,
     link_open_target: LinkOpenTarget = .verde_browser,
     terminal_launch_profiles: []TerminalLaunchProfileConfig = &.{},
+    tool_call_group_preference: ToolCallGroupPreference = .collapsed,
+    tool_call_groups_last_expanded: bool = false,
     check_for_updates_automatically: bool = true,
     // Fire a desktop notification when an agent surface finishes (transitions
     // to `.done`). Defaults on so the feature works without first opening
@@ -253,6 +261,7 @@ pub fn saveAppConfig(allocator: std.mem.Allocator, config: *const AppConfig) !vo
     try writeInstalledThemesSection(tree_allocator, &root.object, config);
     try writeOpenSection(tree_allocator, &root.object, config);
     try writeTerminalSection(tree_allocator, &root.object, config);
+    try writeTranscriptSection(tree_allocator, &root.object, config);
     try writeUpdatesSection(tree_allocator, &root.object, config);
     try writeNotificationsSection(tree_allocator, &root.object, config);
 
@@ -402,6 +411,17 @@ fn writeTerminalSection(allocator: std.mem.Allocator, object: *std.json.ObjectMa
     try terminal_object.put(allocator, "profiles", .{ .array = profiles });
 }
 
+fn writeTranscriptSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
+    const transcript_object = try objectSection(allocator, object, "transcript");
+    const preference: []const u8 = switch (config.tool_call_group_preference) {
+        .collapsed => "collapsed",
+        .expanded => "expanded",
+        .remember_last => "remember_last",
+    };
+    try transcript_object.put(allocator, "tool_call_groups", .{ .string = preference });
+    try transcript_object.put(allocator, "tool_call_groups_last_expanded", .{ .bool = config.tool_call_groups_last_expanded });
+}
+
 fn writeUpdatesSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
     const updates_object = try objectSection(allocator, object, "updates");
     try updates_object.put(allocator, "check_automatically", .{ .bool = config.check_for_updates_automatically });
@@ -452,6 +472,9 @@ fn applyAppOverrides(allocator: std.mem.Allocator, config: *AppConfig, root: std
     if (root.object.get("terminal")) |terminal_value| {
         applyTerminalOverrides(allocator, config, terminal_value);
     }
+    if (root.object.get("transcript")) |transcript_value| {
+        applyTranscriptOverrides(config, transcript_value);
+    }
     if (root.object.get("installed_themes")) |installed_value| {
         applyInstalledThemeOverrides(allocator, config, installed_value);
     }
@@ -461,6 +484,32 @@ fn applyAppOverrides(allocator: std.mem.Allocator, config: *AppConfig, root: std
     }
     if (root.object.get("notifications")) |notifications_value| {
         applyNotificationsOverrides(config, notifications_value);
+    }
+}
+
+fn applyTranscriptOverrides(config: *AppConfig, transcript_value: std.json.Value) void {
+    if (transcript_value != .object) {
+        log.warn("transcript must be an object when provided", .{});
+        return;
+    }
+    if (transcript_value.object.get("tool_call_groups")) |preference_value| {
+        if (preference_value == .string) {
+            config.tool_call_group_preference = if (std.mem.eql(u8, preference_value.string, "expanded"))
+                .expanded
+            else if (std.mem.eql(u8, preference_value.string, "remember_last"))
+                .remember_last
+            else
+                .collapsed;
+        } else {
+            log.warn("transcript.tool_call_groups must be a string when provided", .{});
+        }
+    }
+    if (transcript_value.object.get("tool_call_groups_last_expanded")) |last_value| {
+        if (last_value == .bool) {
+            config.tool_call_groups_last_expanded = last_value.bool;
+        } else {
+            log.warn("transcript.tool_call_groups_last_expanded must be a boolean when provided", .{});
+        }
     }
 }
 
@@ -970,6 +1019,18 @@ test "app config accepts automatic update check preference" {
     applyAppOverrides(std.testing.allocator, &config, root.value);
 
     try std.testing.expect(!config.check_for_updates_automatically);
+}
+
+test "app config accepts tool call group preference" {
+    var root = try parseTestRoot("{\"transcript\":{\"tool_call_groups\":\"remember_last\",\"tool_call_groups_last_expanded\":true}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(ToolCallGroupPreference.remember_last, config.tool_call_group_preference);
+    try std.testing.expect(config.tool_call_groups_last_expanded);
 }
 
 test "app config accepts custom open default" {
