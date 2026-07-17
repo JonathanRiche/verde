@@ -130,6 +130,31 @@ if ! grep -Fq '${pkgdir}/usr/bin/verde-launch' "${PKGBUILD}"; then
   mv "${PKGBUILD}.tmp" "${PKGBUILD}"
 fi
 
+# The flat /usr/lib/verde install dropped share/verde, so packaged binaries
+# could not resolve provider_bridge.mjs (ProviderBridgeNotFound in Claude
+# chats). Preserve the release bin/ + share/ layout so the executable's
+# ../share/verde probe works, and point the wrappers at bin/.
+if ! grep -Fq '${install_root}/share/verde' "${PKGBUILD}"; then
+  awk '
+    $0 == "  cp -a \"${release_root}/bin/.\" \"${install_root}/\"" {
+      print "  install -d \"${install_root}/share\""
+      print "  cp -a \"${release_root}/bin\" \"${install_root}/bin\""
+      print "  cp -a \"${release_root}/share/verde\" \"${install_root}/share/verde\""
+      next
+    }
+    $0 == "exec /usr/lib/verde/verde \"$@\"" {
+      print "exec /usr/lib/verde/bin/verde \"$@\""
+      next
+    }
+    $0 == "exec /usr/lib/verde/verde-launch \"$@\"" {
+      print "exec /usr/lib/verde/bin/verde-launch \"$@\""
+      next
+    }
+    { print }
+  ' "${PKGBUILD}" > "${PKGBUILD}.tmp"
+  mv "${PKGBUILD}.tmp" "${PKGBUILD}"
+fi
+
 awk \
   -v version="${VERSION}" \
   -v linux_sha="${LINUX_SHA}" \
