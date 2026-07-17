@@ -16883,6 +16883,7 @@ pub const AppState = struct {
 
     pub fn deinit(self: *AppState) void {
         runtime_log.diagnostic("AppState.deinit begin", .{});
+        startShutdownWatchdog();
         self.preparePendingSendsForShutdown();
         runtime_log.diagnostic("AppState.deinit pending sends prepared", .{});
         self.finishPickerThread();
@@ -16938,6 +16939,7 @@ pub const AppState = struct {
         self.projects.deinit(self.allocator);
         self.archived_projects.deinit(self.allocator);
         self.surfaces.deinit(self.allocator);
+        shutdown_watchdog_deinit_complete.store(true, .release);
         runtime_log.diagnostic("AppState.deinit complete", .{});
     }
 
@@ -18670,6 +18672,38 @@ fn readThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             else => "Failed to import the selected Cursor thread.",
         },
     };
+}
+
+/// Shutdown joins provider worker threads whose I/O can block on a stuck
+/// peer (observed live 2026-07-15: an opencode health probe never returned,
+/// leaving the window closed but the process only killable via SIGKILL).
+/// 10s is generous for every legitimate deinit step while short enough that
+/// a wedged close still terminates without user intervention.
+const SHUTDOWN_WATCHDOG_TIMEOUT_MS: u64 = 10_000;
+const SHUTDOWN_WATCHDOG_POLL_MS: u64 = 200;
+
+var shutdown_watchdog_deinit_complete: std.atomic.Value(bool) = .init(false);
+
+fn startShutdownWatchdog() void {
+    const thread = std.Thread.spawn(.{}, shutdownWatchdogMain, .{}) catch |err| {
+        runtime_log.diagnostic("shutdown watchdog spawn failed: {s}", .{@errorName(err)});
+        return;
+    };
+    thread.detach();
+}
+
+fn shutdownWatchdogMain() void {
+    var waited_ms: u64 = 0;
+    while (waited_ms < SHUTDOWN_WATCHDOG_TIMEOUT_MS) : (waited_ms += SHUTDOWN_WATCHDOG_POLL_MS) {
+        if (shutdown_watchdog_deinit_complete.load(.acquire)) return;
+        platform_runtime.sleepMillis(SHUTDOWN_WATCHDOG_POLL_MS);
+    }
+    if (shutdown_watchdog_deinit_complete.load(.acquire)) return;
+    runtime_log.diagnostic(
+        "AppState.deinit watchdog expired after {d} ms; forcing process exit",
+        .{SHUTDOWN_WATCHDOG_TIMEOUT_MS},
+    );
+    std.process.exit(0);
 }
 
 fn providerReadinessWorker(state: *ProviderReadinessState) void {

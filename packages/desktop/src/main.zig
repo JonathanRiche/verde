@@ -2393,9 +2393,10 @@ test {
     _ = @import("platform/mod.zig");
     _ = @import("providers/claude.zig");
     _ = @import("providers/diagnostics.zig");
+    _ = @import("providers/opencode.zig");
     _ = @import("slash_commands.zig");
-    _ = @import("ui/command_palette.zig");
     _ = @import("update_installer.zig");
     _ = @import("updater.zig");
+    _ = @import("ui/command_palette.zig");
     _ = @import("windows_conpty_compile_test.zig");
 }
