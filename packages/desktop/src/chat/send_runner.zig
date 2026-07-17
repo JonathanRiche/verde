@@ -37,6 +37,7 @@ pub const Sink = struct {
     on_turn_id: ?*const fn (?*anyopaque, []const u8) void = null,
     on_stream_delta: ?*const fn (?*anyopaque, []const u8) void = null,
     on_stream_event: ?*const fn (?*anyopaque, harness.StreamEvent) void = null,
+    on_failure: ?*const fn (?*anyopaque, []const u8) void = null,
     on_should_stop: ?*const fn (?*anyopaque) bool = null,
     on_approval_request: ?*const fn (?*anyopaque, harness.ApprovalRequest) harness.ApprovalDecision = null,
 };
@@ -95,6 +96,7 @@ pub fn run(allocator: std.mem.Allocator, request: Request, sink: Sink) !Result {
         .on_turn_id = sink.on_turn_id,
         .on_stream_delta = sink.on_stream_delta,
         .on_stream_event = sink.on_stream_event,
+        .on_failure = sink.on_failure,
         .on_should_stop = sink.on_should_stop,
         .on_approval_request = sink.on_approval_request,
     });

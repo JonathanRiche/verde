@@ -549,8 +549,9 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
             state.status = .aborted;
             return;
         }
-        const message = formatSendWorkerError(page_alloc, request.provider, err) catch null;
-        state.error_message = message;
+        if (state.error_message == null) {
+            state.error_message = formatSendWorkerError(page_alloc, request.provider, err) catch null;
+        }
         state.result = null;
         state.status = .failed;
     }
@@ -660,6 +661,7 @@ pub fn runSendWorker(
         .on_turn_id = handleSendTurnId,
         .on_stream_delta = handleSendStreamDelta,
         .on_stream_event = handleSendStreamEvent,
+        .on_failure = handleSendFailure,
         .on_should_stop = handleSendShouldStop,
         .on_approval_request = handleSendApprovalRequest,
     }) catch |err| {
@@ -1534,6 +1536,17 @@ fn handleSendStreamEvent(context: ?*anyopaque, event: ai_harness.StreamEvent) vo
             loop_wakeup.notify();
         },
     }
+}
+
+fn handleSendFailure(context: ?*anyopaque, message: []const u8) void {
+    const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
+    const page_alloc = std.heap.page_allocator;
+
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    if (send_state.status != .pending) return;
+    if (send_state.error_message) |old| page_alloc.free(old);
+    send_state.error_message = page_alloc.dupe(u8, message) catch null;
 }
 
 fn handleSendShouldStop(context: ?*anyopaque) bool {

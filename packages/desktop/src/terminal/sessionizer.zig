@@ -1938,6 +1938,7 @@ fn chatTurnThread(allocator: std.mem.Allocator, turn: *ChatTurn) void {
         .on_turn_id = chatSinkTurnId,
         .on_stream_delta = chatSinkDelta,
         .on_stream_event = chatSinkEvent,
+        .on_failure = chatSinkFailure,
         .on_should_stop = chatSinkShouldStop,
         .on_approval_request = chatSinkApproval,
     });
@@ -1957,8 +1958,11 @@ fn chatTurnThread(allocator: std.mem.Allocator, turn: *ChatTurn) void {
         allocator.free(value.reply_text);
     } else |err| {
         turn.status = if (turn.cancel_requested) .aborted else .failed;
-        turn.error_message = allocator.dupe(u8, @errorName(err)) catch null;
-        turn.appendStringEvent(allocator, if (turn.status == .aborted) "aborted" else "failed", "message", @errorName(err));
+        if (turn.error_message == null) {
+            turn.error_message = allocator.dupe(u8, @errorName(err)) catch null;
+        }
+        const message = turn.error_message orelse @errorName(err);
+        turn.appendStringEvent(allocator, if (turn.status == .aborted) "aborted" else "failed", "message", message);
     }
     turn.worker_done = true;
 }
@@ -2013,6 +2017,15 @@ fn chatSinkEvent(context: ?*anyopaque, event: harness.StreamEvent) void {
         },
         .diff => turn.appendEvent(allocator, "diff", "{}"),
     }
+}
+
+fn chatSinkFailure(context: ?*anyopaque, message: []const u8) void {
+    const turn = chatTurnFromContext(context) orelse return;
+    const allocator = turn.allocator;
+    lockTurn(turn);
+    defer turn.mutex.unlock();
+    if (turn.error_message) |old| allocator.free(old);
+    turn.error_message = allocator.dupe(u8, message) catch null;
 }
 
 fn chatSinkShouldStop(context: ?*anyopaque) bool {
