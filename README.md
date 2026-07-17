@@ -120,6 +120,23 @@ From Arch/Linux, `mise run build-windows` cross-builds the pinned
 MSVC lane. Both use `scripts/windows-dependencies.json` and the deterministic
 bootstrap cache instead of discovering arbitrary system SDK copies.
 
+Building the native MSVC lane on Windows additionally requires:
+
+- **Visual Studio Build Tools with the Windows SDK**, with the build run from a
+  Developer shell (`vcvars64.bat`) so `INCLUDE` exposes the SDK's `winrt`
+  headers. The WebView2 C++ layer includes `wrl.h`, which Zig does not locate on
+  its own; without the Developer environment the build fails with
+  `'wrl.h' file not found`.
+- **LLVM** on `PATH` (or `LIBCLANG_PATH` pointing at its `bin`); the vendored
+  `fff` crate's `bindgen` build step loads `libclang.dll`. Without it the build
+  fails with "Unable to find libclang".
+- Rust `1.95.0` with the `x86_64-pc-windows-msvc` target, Bun, and Node 18+.
+
+Run `scripts\dev\build-windows.ps1` from a Developer Command Prompt (or a `cmd`
+shell that has called `vcvars64.bat`). Windows PowerShell 5.1 can misreport a
+successful build by treating tool stderr as a fatal error, so prefer `cmd` or
+PowerShell 7.
+
 For release-style local installs, use the packaged install scripts:
 
 ```bash
