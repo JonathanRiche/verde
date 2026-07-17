@@ -2408,12 +2408,15 @@ fn renderTranscriptImages(state: *app_state.AppState, column: palette.Rect, y: f
             const inset = theme.scaledUi(6.0);
             const image_rect = palette.Rect{ .x = frame.x + inset, .y = frame.y + inset, .w = frame.w - inset * 2.0, .h = frame.h - inset * 2.0 };
             const dims = runtime.scaledImageSize(cached.width, cached.height, image_rect.w, image_rect.h);
-            queueImage(state, .{
-                .x = image_rect.x + (image_rect.w - dims[0]) * 0.5,
-                .y = image_rect.y + (image_rect.h - dims[1]) * 0.5,
-                .w = dims[0],
-                .h = dims[1],
-            }, cached, frame);
+            const image_clip = intersectClipRect(clip, frame) orelse frame;
+            if (image_clip.w > 0.0 and image_clip.h > 0.0) {
+                queueImage(state, .{
+                    .x = image_rect.x + (image_rect.w - dims[0]) * 0.5,
+                    .y = image_rect.y + (image_rect.h - dims[1]) * 0.5,
+                    .w = dims[0],
+                    .h = dims[1],
+                }, cached, image_clip);
+            }
         } else {
             queueText(state, .{ .x = frame.x + pad, .y = frame.y + pad, .w = frame.w - pad * 2.0, .h = theme.scaledUi(20.0) }, image.file_name, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
         }
