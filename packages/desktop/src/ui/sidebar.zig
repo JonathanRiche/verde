@@ -153,6 +153,28 @@ pub fn pointerOverSidebar(x: f32, y: f32) bool {
     return rectContainsPoint(palette_sidebar_rect, x, y) or rectContainsPoint(sidebar_menu_panel_rect, x, y);
 }
 
+/// True when the mouse rests on a clickable sidebar control (rail buttons,
+/// workspace/thread rows, enabled context-menu rows) so the main loop can
+/// show a pointer (hand) cursor. Every retained hit rect is actionable in
+/// `handlePaletteMouseButton`, so any hit under the point qualifies.
+pub fn wantsPointerAt(state: *const runtime.AppState, x: f32, y: f32) bool {
+    if (state.sidebar_context_menu_open) {
+        var row: usize = 0;
+        while (row < sidebar_menu_row_count) : (row += 1) {
+            // Disabled rows swallow clicks but perform nothing, so they keep
+            // the default cursor.
+            if (sidebar_menu_row_enabled[row] and rectContainsPoint(sidebar_menu_row_rects[row], x, y)) return true;
+        }
+    }
+    if (!rectContainsPoint(palette_sidebar_rect, x, y)) return false;
+    var index = palette_hit_count;
+    while (index > 0) {
+        index -= 1;
+        if (rectContainsPoint(palette_hits[index].rect, x, y)) return true;
+    }
+    return false;
+}
+
 pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
     if (state.isSidebarHidden()) {
         const reveal = x <= theme.scaledUi(HIDDEN_SIDEBAR_EDGE_REVEAL_CSS) or rectContainsPoint(palette_sidebar_rect, x, y);

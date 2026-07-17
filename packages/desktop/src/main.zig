@@ -653,8 +653,8 @@ fn mainInner(init: std.process.Init) !void {
 }
 
 // Resolves the OS mouse cursor each frame: terminal-reported shapes win,
-// then clickable composer controls (pills, popover rows/segments) show a
-// pointer hand, otherwise the default arrow.
+// then clickable composer controls (pills, popover rows/segments) and
+// sidebar controls show a pointer hand, otherwise the default arrow.
 fn syncMouseCursor(state: *const AppState, pointer_cursor: *sdl.Cursor) void {
     // The settings modal covers the workspace behind a scrim, so shapes from
     // occluded terminal panes must not win while it is open.
@@ -668,7 +668,27 @@ fn syncMouseCursor(state: *const AppState, pointer_cursor: *sdl.Cursor) void {
         sdl.setCursor(pointer_cursor) catch {};
         return;
     }
+    // Modal scrims (settings, command palette, importers) intercept clicks
+    // before the sidebar and workspace headers in event routing, so any modal
+    // hit under the mouse must also suppress their pointer affordance.
+    if (!modalHitAtMouse(state) and
+        (sidebar_ui.wantsPointerAt(state, state.palette_mouse_x, state.palette_mouse_y) or
+            chat_panel_ui.workspaceHeaderWantsPointerAt(state, state.palette_mouse_x, state.palette_mouse_y)))
+    {
+        sdl.setCursor(pointer_cursor) catch {};
+        return;
+    }
     sdl.setCursor(sdl.getDefaultCursor()) catch {};
+}
+
+// True when any retained modal hit rect (scrim or control) covers the current
+// mouse position; mirrors ui_layout.handlePaletteMouseButton's precedence.
+fn modalHitAtMouse(state: *const AppState) bool {
+    const point: palette.draw.Vec2 = .{ .x = state.palette_mouse_x, .y = state.palette_mouse_y };
+    for (state.palette_modal_hits.items) |hit| {
+        if (hit.rect.contains(point)) return true;
+    }
+    return false;
 }
 
 fn configuredPaletteRendererBackend() palette_frame_renderer.Backend {
