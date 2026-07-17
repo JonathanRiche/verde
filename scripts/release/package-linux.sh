@@ -157,7 +157,9 @@ EOF
 }
 
 mkdir -p "$OUTPUT_DIR"
-BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR" -Dbrowser-backend=native_webview -Dversion="$VERSION")
+# Release artifacts must not inherit CPU features from the CI runner. GitHub's
+# AMD runners can otherwise emit SSE4a instructions that crash on Intel CPUs.
+BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR" -Dcpu=baseline -Dbrowser-backend=native_webview -Dversion="$VERSION")
 
 cd "$DESKTOP_ROOT"
 "${BUILD_ARGS[@]}"
