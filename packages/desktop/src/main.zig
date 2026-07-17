@@ -656,9 +656,13 @@ fn mainInner(init: std.process.Init) !void {
 // then clickable composer controls (pills, popover rows/segments) show a
 // pointer hand, otherwise the default arrow.
 fn syncMouseCursor(state: *const AppState, pointer_cursor: *sdl.Cursor) void {
-    if (terminal_panel_ui.mouseShapeAtPoint(state, state.palette_mouse_x, state.palette_mouse_y)) |shape| {
-        sdl.setCursor(if (shape == .pointer) pointer_cursor else sdl.getDefaultCursor()) catch {};
-        return;
+    // The settings modal covers the workspace behind a scrim, so shapes from
+    // occluded terminal panes must not win while it is open.
+    if (!state.show_settings_modal) {
+        if (terminal_panel_ui.mouseShapeAtPoint(state, state.palette_mouse_x, state.palette_mouse_y)) |shape| {
+            sdl.setCursor(if (shape == .pointer) pointer_cursor else sdl.getDefaultCursor()) catch {};
+            return;
+        }
     }
     if (state.pointerCursorWanted()) {
         sdl.setCursor(pointer_cursor) catch {};

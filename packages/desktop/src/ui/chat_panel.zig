@@ -45,6 +45,7 @@ const TRANSCRIPT_MARKDOWN_FONT_SIZE: f32 = 15.5;
 /// Direct wheel scroll (no inertia); larger than legacy 64 for faster scanning.
 const TRANSCRIPT_WHEEL_PIXELS: f32 = 96.0;
 const TRANSCRIPT_PAGE_VIEW_FRAC: f32 = 0.88;
+const TOOL_OUTPUT_COLLAPSED_LINES: usize = 18;
 
 var transcript_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 var transcript_pane_id: ?app_state.WorkspacePaneId = null;
@@ -684,17 +685,30 @@ fn transcriptMarkdownBubbleHit(
     const scroll_y = state.transcript_palette_scroll_y;
     var content_y = column.y - scroll_y;
 
-    for (thread.messages.items, 0..) |message, msg_idx| {
-        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) continue;
+    var msg_idx: usize = 0;
+    while (msg_idx < thread.messages.items.len) {
+        const message = thread.messages.items[msg_idx];
+        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) {
+            msg_idx += 1;
+            continue;
+        }
+        const group_end = if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) toolCallGroupEnd(thread.messages.items, msg_idx) else msg_idx + 1;
+        if (group_end - msg_idx >= 2) {
+            content_y += toolCallGroupHeight(state, thread.messages.items, msg_idx, group_end, 0, column.w) + theme.scaledUi(12.0);
+            msg_idx = group_end;
+            continue;
+        }
         const item_h = transcriptCommittedMessageHeight(state, msg_idx, message, column.w);
         if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
             content_y += item_h + theme.scaledUi(12.0);
+            msg_idx += 1;
             continue;
         }
         if (assistantTranscriptMarkdownHit(state, column, content_y, item_h, message.role, message.body, false, false, msg_idx, mouse_x, mouse_y)) |hit| {
             return hit;
         }
         content_y += item_h + theme.scaledUi(12.0);
+        msg_idx += 1;
     }
 
     const send_state = thread.send_state;
@@ -703,18 +717,31 @@ fn transcriptMarkdownBubbleHit(
     if (send_state.status != .pending) return null;
 
     const base_idx = thread.messages.items.len;
-    for (send_state.pending_events.items, 0..) |event, pi| {
-        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) continue;
-        const msg_idx = base_idx + pi;
+    var pi: usize = 0;
+    while (pi < send_state.pending_events.items.len) {
+        const event = send_state.pending_events.items[pi];
+        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) {
+            pi += 1;
+            continue;
+        }
+        const group_end = if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) toolCallGroupEnd(send_state.pending_events.items, pi) else pi + 1;
+        if (group_end - pi >= 2) {
+            content_y += toolCallGroupHeight(state, send_state.pending_events.items, pi, group_end, base_idx, column.w) + theme.scaledUi(12.0);
+            pi = group_end;
+            continue;
+        }
+        const pending_msg_idx = base_idx + pi;
         const item_h = transcriptMessageHeight(null, null, event.body, event.role, column.w, event.author, false);
         if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
             content_y += item_h + theme.scaledUi(12.0);
+            pi += 1;
             continue;
         }
-        if (assistantTranscriptMarkdownHit(state, column, content_y, item_h, event.role, event.body, false, false, msg_idx, mouse_x, mouse_y)) |hit| {
+        if (assistantTranscriptMarkdownHit(state, column, content_y, item_h, event.role, event.body, false, false, pending_msg_idx, mouse_x, mouse_y)) |hit| {
             return hit;
         }
         content_y += item_h + theme.scaledUi(12.0);
+        pi += 1;
     }
 
     const stream_text: []const u8 = send_state.partial_text.items;
@@ -738,17 +765,30 @@ fn transcriptMarkdownBubbleLinkHit(
     const scroll_y = state.transcript_palette_scroll_y;
     var content_y = column.y - scroll_y;
 
-    for (thread.messages.items, 0..) |message, msg_idx| {
-        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) continue;
+    var msg_idx: usize = 0;
+    while (msg_idx < thread.messages.items.len) {
+        const message = thread.messages.items[msg_idx];
+        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) {
+            msg_idx += 1;
+            continue;
+        }
+        const group_end = if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) toolCallGroupEnd(thread.messages.items, msg_idx) else msg_idx + 1;
+        if (group_end - msg_idx >= 2) {
+            content_y += toolCallGroupHeight(state, thread.messages.items, msg_idx, group_end, 0, column.w) + theme.scaledUi(12.0);
+            msg_idx = group_end;
+            continue;
+        }
         const item_h = transcriptCommittedMessageHeight(state, msg_idx, message, column.w);
         if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
             content_y += item_h + theme.scaledUi(12.0);
+            msg_idx += 1;
             continue;
         }
         if (assistantTranscriptMarkdownLinkHit(state, column, content_y, item_h, message.role, message.body, false, false, false, mouse_x, mouse_y)) |hit| {
             return hit;
         }
         content_y += item_h + theme.scaledUi(12.0);
+        msg_idx += 1;
     }
 
     const send_state = thread.send_state;
@@ -756,17 +796,30 @@ fn transcriptMarkdownBubbleLinkHit(
     defer send_state.mutex.unlock();
     if (send_state.status != .pending) return null;
 
-    for (send_state.pending_events.items) |event| {
-        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) continue;
+    var pi: usize = 0;
+    while (pi < send_state.pending_events.items.len) {
+        const event = send_state.pending_events.items[pi];
+        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) {
+            pi += 1;
+            continue;
+        }
+        const group_end = if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) toolCallGroupEnd(send_state.pending_events.items, pi) else pi + 1;
+        if (group_end - pi >= 2) {
+            content_y += toolCallGroupHeight(state, send_state.pending_events.items, pi, group_end, thread.messages.items.len, column.w) + theme.scaledUi(12.0);
+            pi = group_end;
+            continue;
+        }
         const item_h = transcriptMessageHeight(null, null, event.body, event.role, column.w, event.author, false);
         if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
             content_y += item_h + theme.scaledUi(12.0);
+            pi += 1;
             continue;
         }
         if (assistantTranscriptMarkdownLinkHit(state, column, content_y, item_h, event.role, event.body, false, false, false, mouse_x, mouse_y)) |hit| {
             return hit;
         }
         content_y += item_h + theme.scaledUi(12.0);
+        pi += 1;
     }
 
     const stream_text: []const u8 = send_state.partial_text.items;
@@ -1799,13 +1852,33 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
     state.transcript_palette_scroll_y = scroll_y;
 
     var content_y = column.y - scroll_y;
-    for (thread.messages.items, 0..) |message, msg_idx| {
-        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) continue;
+    var msg_idx: usize = 0;
+    while (msg_idx < thread.messages.items.len) {
+        const message = thread.messages.items[msg_idx];
+        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) {
+            msg_idx += 1;
+            continue;
+        }
+        const group_end = if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body))
+            toolCallGroupEnd(thread.messages.items, msg_idx)
+        else
+            msg_idx + 1;
+        if (group_end - msg_idx >= 2) {
+            const item_h = toolCallGroupHeight(state, thread.messages.items, msg_idx, group_end, 0, column.w);
+            if (content_y + item_h >= column.y and content_y <= column.y + column.h) {
+                const last = thread.messages.items[group_end - 1];
+                renderToolCallGroup(state, thread.messages.items, msg_idx, group_end, 0, column, content_y, item_h, clip, thread.backgroundCommandIsRunning(last.body), null);
+            }
+            content_y += item_h + theme.scaledUi(12.0);
+            msg_idx = group_end;
+            continue;
+        }
         const item_h = transcriptCommittedMessageHeight(state, msg_idx, message, column.w);
         if (content_y + item_h >= column.y and content_y <= column.y + column.h) {
             renderTranscriptMessage(state, thread, column, content_y, item_h, message, clip, msg_idx);
         }
         content_y += item_h + theme.scaledUi(12.0);
+        msg_idx += 1;
     }
 
     content_y = renderPendingSlashCommand(state, column, content_y, clip);
@@ -1856,9 +1929,24 @@ fn snapTranscriptScrollY(value: f32, max_scroll: ?f32) f32 {
 
 fn transcriptContentHeight(state: *app_state.AppState, thread: anytype, width: f32) f32 {
     var total: f32 = theme.scaledUi(4.0);
-    for (thread.messages.items, 0..) |message, message_index| {
-        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) continue;
+    var message_index: usize = 0;
+    while (message_index < thread.messages.items.len) {
+        const message = thread.messages.items[message_index];
+        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) {
+            message_index += 1;
+            continue;
+        }
+        const group_end = if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body))
+            toolCallGroupEnd(thread.messages.items, message_index)
+        else
+            message_index + 1;
+        if (group_end - message_index >= 2) {
+            total += toolCallGroupHeight(state, thread.messages.items, message_index, group_end, 0, width) + theme.scaledUi(12.0);
+            message_index = group_end;
+            continue;
+        }
         total += transcriptCommittedMessageHeight(state, message_index, message, width) + theme.scaledUi(12.0);
+        message_index += 1;
     }
     total += transcriptPendingSlashCommandHeight(state, width);
     total += transcriptPendingStreamHeight(state, thread, width);
@@ -2008,10 +2096,25 @@ fn transcriptPendingStreamHeight(state: *app_state.AppState, thread: *const app_
 
     const base = thread.messages.items.len;
     var total: f32 = 0;
-    for (send_state.pending_events.items, 0..) |event, pi| {
-        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) continue;
+    var pi: usize = 0;
+    while (pi < send_state.pending_events.items.len) {
+        const event = send_state.pending_events.items[pi];
+        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) {
+            pi += 1;
+            continue;
+        }
+        const group_end = if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body))
+            toolCallGroupEnd(send_state.pending_events.items, pi)
+        else
+            pi + 1;
+        if (group_end - pi >= 2) {
+            total += toolCallGroupHeight(state, send_state.pending_events.items, pi, group_end, base, column_width) + theme.scaledUi(12.0);
+            pi = group_end;
+            continue;
+        }
         const msg_idx = base + pi;
         total += transcriptMessageHeight(state, msg_idx, event.body, event.role, column_width, event.author, false) + theme.scaledUi(12.0);
+        pi += 1;
     }
     const stream_text: []const u8 = send_state.partial_text.items;
     const body_for_height = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
@@ -2028,15 +2131,45 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
 
     var y = content_y;
     const pending_count = send_state.pending_events.items.len;
-    for (send_state.pending_events.items, 0..) |event, pi| {
-        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) continue;
+    var pi: usize = 0;
+    while (pi < pending_count) {
+        const event = send_state.pending_events.items[pi];
+        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) {
+            pi += 1;
+            continue;
+        }
+        const group_end = if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body))
+            toolCallGroupEnd(send_state.pending_events.items, pi)
+        else
+            pi + 1;
+        if (group_end - pi >= 2) {
+            const item_h = toolCallGroupHeight(state, send_state.pending_events.items, pi, group_end, base_message_index, column.w);
+            if (y + item_h >= column.y and y <= column.y + column.h) {
+                renderToolCallGroup(
+                    state,
+                    send_state.pending_events.items,
+                    pi,
+                    group_end,
+                    base_message_index,
+                    column,
+                    y,
+                    item_h,
+                    clip,
+                    group_end == pending_count,
+                    send_state.started_at_ms,
+                );
+            }
+            y += item_h + theme.scaledUi(12.0);
+            pi = group_end;
+            continue;
+        }
         const msg_idx = base_message_index + pi;
         const item_h = transcriptMessageHeight(state, msg_idx, event.body, event.role, column.w, event.author, false);
         if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
             const is_last = pi + 1 == pending_count;
             const is_backgrounded = std.mem.eql(u8, event.author, "Backgrounded command");
             if (y + item_h >= column.y and y <= column.y + column.h) {
-                renderCommandEventRow(state, column, y, item_h, event.author, event.body, clip, msg_idx, is_last or is_backgrounded);
+                renderCommandEventRow(state, column, y, item_h, event.author, event.body, clip, msg_idx, is_last or is_backgrounded, false);
             }
         } else if (event.role == .system and isDiffSummaryMessage(event.author, event.body)) {
             if (y + item_h >= column.y and y <= column.y + column.h) {
@@ -2053,6 +2186,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
             }
         }
         y += item_h + theme.scaledUi(12.0);
+        pi += 1;
     }
 
     var status_buf: [40]u8 = undefined;
@@ -2094,6 +2228,82 @@ fn isCommandSystemEvent(author: []const u8) bool {
         std.mem.eql(u8, author, "Background task failed") or
         std.mem.eql(u8, author, "Background task stopped") or
         std.mem.eql(u8, author, "Failed to background command");
+}
+
+fn commandEventFailed(author: []const u8) bool {
+    return std.mem.eql(u8, author, "Command failed") or
+        std.mem.eql(u8, author, "Background task failed") or
+        std.mem.eql(u8, author, "Failed to background command");
+}
+
+fn toolCallGroupDefaultExpanded(state: *const app_state.AppState, failed: bool) bool {
+    if (failed) return true;
+    return switch (state.app_config.tool_call_group_preference) {
+        .collapsed => false,
+        .expanded => true,
+        .remember_last => state.app_config.tool_call_groups_last_expanded,
+    };
+}
+
+fn toolCallGroupKey(message_index: usize) u64 {
+    var hasher = std.hash.Wyhash.init(0x7001CA117001CA11);
+    hasher.update(std.mem.asBytes(&message_index));
+    hasher.update("tool_call_group");
+    return hasher.final();
+}
+
+fn toolOutputKey(message_index: usize) u64 {
+    var hasher = std.hash.Wyhash.init(0x0A77F00D0A77F00D);
+    hasher.update(std.mem.asBytes(&message_index));
+    hasher.update("tool_output");
+    return hasher.final();
+}
+
+fn toolCopyIdentity(message_index: usize, body: []const u8) u64 {
+    var hasher = std.hash.Wyhash.init(0xC0A17C0A17C0A17);
+    hasher.update(std.mem.asBytes(&message_index));
+    hasher.update(body);
+    return hasher.final();
+}
+
+fn toolCallGroupEnd(entries: anytype, start: usize) usize {
+    var end = start;
+    while (end < entries.len) : (end += 1) {
+        const entry = entries[end];
+        if (entry.role != .system or !shouldRenderPaletteCommandRow(entry.author, entry.body)) break;
+    }
+    return end;
+}
+
+fn toolCallGroupFailed(entries: anytype, start: usize, end: usize) bool {
+    return toolCallGroupFailureCount(entries, start, end) > 0;
+}
+
+fn toolCallGroupFailureCount(entries: anytype, start: usize, end: usize) usize {
+    var count: usize = 0;
+    for (entries[start..end]) |entry| {
+        if (commandEventFailed(entry.author)) count += 1;
+    }
+    return count;
+}
+
+test "tool call groups stop before user-required system events" {
+    const Event = struct {
+        role: app_state.ChatRole,
+        author: []const u8,
+        body: []const u8,
+    };
+    const entries = [_]Event{
+        .{ .role = .system, .author = "Ran command", .body = "git status" },
+        .{ .role = .system, .author = "Read", .body = "README.md" },
+        .{ .role = .system, .author = "Approval required", .body = "Allow this command?" },
+        .{ .role = .system, .author = "Command failed", .body = "exit 1" },
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), toolCallGroupEnd(entries[0..], 0));
+    try std.testing.expect(!toolCallGroupFailed(entries[0..], 0, 2));
+    try std.testing.expect(toolCallGroupFailed(entries[0..], 3, 4));
+    try std.testing.expectEqual(@as(usize, 1), toolCallGroupFailureCount(entries[0..], 0, entries.len));
 }
 
 /// True when the body looks like an executed shell one-liner (e.g. Codex/OpenCode style `/usr/bin/bash -lc '…'`).
@@ -2192,6 +2402,7 @@ fn paletteCommandRowDisplayAuthor(original_author: []const u8, body_raw: []const
 fn transcriptCommandEventHeight(
     state: ?*app_state.AppState,
     message_index: ?usize,
+    author: []const u8,
     body_raw: []const u8,
     column_width: f32,
 ) f32 {
@@ -2204,7 +2415,7 @@ fn transcriptCommandEventHeight(
     const expanded = blk: {
         const app = state orelse break :blk false;
         const idx = message_index orelse break :blk false;
-        break :blk app.isCardExpanded(commandCardKey(idx));
+        break :blk app.isCardExpandedDefault(commandCardKey(idx), commandEventFailed(author));
     };
     if (!expanded) return header_h;
 
@@ -2212,7 +2423,14 @@ fn transcriptCommandEventHeight(
     const inner_w = @max(column_width - pad_x * 2.0, theme.scaledUi(80.0));
     const chars_per_line = @max(@as(usize, @intFromFloat(inner_w / (font_size * 0.52))), 1);
     const line_count = wrappedLineCount(body, chars_per_line);
-    return header_h + @as(f32, @floatFromInt(line_count)) * line_h + pad_y;
+    const show_all = blk: {
+        const app = state orelse break :blk false;
+        const idx = message_index orelse break :blk false;
+        break :blk app.isCardExpanded(toolOutputKey(idx));
+    };
+    const visible_lines = if (show_all) line_count else @min(line_count, TOOL_OUTPUT_COLLAPSED_LINES);
+    const show_more_h: f32 = if (!show_all and line_count > visible_lines) theme.scaledUi(28.0) else 0.0;
+    return header_h + @as(f32, @floatFromInt(visible_lines)) * line_h + show_more_h + pad_y;
 }
 
 fn transcriptCommittedMessageHeight(state: *app_state.AppState, message_index: usize, message: app_state.ChatMessage, column_width: f32) f32 {
@@ -2283,7 +2501,7 @@ fn transcriptMessageHeightStream(
         return slashCommandResultHeight(state, message_index, body_raw, column_width);
     }
     if (role == .system and shouldRenderPaletteCommandRow(message_author, body_raw)) {
-        return transcriptCommandEventHeight(state, message_index, body_raw, column_width);
+        return transcriptCommandEventHeight(state, message_index, message_author, body_raw, column_width);
     }
     if (role == .system and isDiffSummaryMessage(message_author, body_raw)) {
         return diffSummaryHeight(state, message_index, body_raw, column_width);
@@ -2355,7 +2573,7 @@ fn renderTranscriptMessage(state: *app_state.AppState, thread: *const app_state.
         return;
     }
     if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
-        renderCommandEventRow(state, column, y, height, message.author, message.body, clip, message_index, thread.backgroundCommandIsRunning(message.body));
+        renderCommandEventRow(state, column, y, height, message.author, message.body, clip, message_index, thread.backgroundCommandIsRunning(message.body), false);
         return;
     }
     if (message.role == .system and isDiffSummaryMessage(message.author, message.body)) {
@@ -3055,6 +3273,157 @@ fn commandCardKey(message_index: usize) u64 {
     return hasher.final();
 }
 
+fn toolCallGroupHeight(
+    state: *app_state.AppState,
+    entries: anytype,
+    start: usize,
+    end: usize,
+    base_message_index: usize,
+    column_width: f32,
+) f32 {
+    const header_h = theme.scaledUi(48.0);
+    const failed_count = toolCallGroupFailureCount(entries, start, end);
+    const failed = failed_count > 0;
+    const default_expanded = toolCallGroupDefaultExpanded(state, failed);
+    if (!state.isCardExpandedDefault(toolCallGroupKey(base_message_index + start), default_expanded)) return header_h;
+
+    const inset = theme.scaledUi(10.0);
+    const child_width = @max(column_width - inset * 2.0, theme.scaledUi(80.0));
+    var height = header_h + theme.scaledUi(8.0);
+    for (entries[start..end], start..) |entry, index| {
+        height += transcriptCommandEventHeight(state, base_message_index + index, entry.author, entry.body, child_width);
+        height += theme.scaledUi(8.0);
+    }
+    return height + theme.scaledUi(2.0);
+}
+
+// Consecutive command/tool events are rendered as one transcript region.
+fn renderToolCallGroup(
+    state: *app_state.AppState,
+    entries: anytype,
+    start: usize,
+    end: usize,
+    base_message_index: usize,
+    column: palette.Rect,
+    y: f32,
+    height: f32,
+    clip: palette.Rect,
+    running: bool,
+    started_at_ms: ?i64,
+) void {
+    const failed_count = toolCallGroupFailureCount(entries, start, end);
+    const failed = failed_count > 0;
+    const default_expanded = toolCallGroupDefaultExpanded(state, failed);
+    const key = toolCallGroupKey(base_message_index + start);
+    const expanded = state.isCardExpandedDefault(key, default_expanded);
+    const bubble = palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height };
+    queueRoundedShellClipped(
+        state,
+        bubble,
+        paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 235)),
+        paletteColor(if (failed) theme.COLOR_DIFF_REMOVE else if (running) theme.COLOR_GREEN else theme.borderMuted()),
+        transcriptBubbleCornerRadius(),
+        clip,
+    );
+
+    const header_h = theme.scaledUi(48.0);
+    const pad_x = theme.scaledUi(14.0);
+    const status_dia = theme.scaledUi(9.0);
+    const status_color = if (failed) theme.COLOR_DIFF_REMOVE else if (running) theme.COLOR_GREEN else theme.COLOR_TEXT_MUTED;
+    queueRoundedClipped(state, .{
+        .x = bubble.x + pad_x,
+        .y = bubble.y + (header_h - status_dia) * 0.5,
+        .w = status_dia,
+        .h = status_dia,
+    }, paletteColor(status_color), status_dia * 0.5, clip);
+
+    var summary_buf: [128]u8 = undefined;
+    const count = end - start;
+    const noun = if (count == 1) "tool call" else "tool calls";
+    const running_count: usize = @intFromBool(running);
+    const completed_count = count -| failed_count -| running_count;
+    const summary = if (running) blk: {
+        if (started_at_ms == null) {
+            if (failed_count > 0) {
+                break :blk std.fmt.bufPrint(
+                    &summary_buf,
+                    "{d} {s}  ·  {d} completed  ·  {d} failed  ·  {d} running",
+                    .{ count, noun, completed_count, failed_count, running_count },
+                ) catch "Tool calls running";
+            }
+            break :blk std.fmt.bufPrint(
+                &summary_buf,
+                "{d} {s}  ·  {d} completed  ·  {d} running",
+                .{ count, noun, completed_count, running_count },
+            ) catch "Tool calls running";
+        }
+        var elapsed_buf: [32]u8 = undefined;
+        const elapsed = formatElapsedDuration(&elapsed_buf, started_at_ms.?);
+        if (failed_count > 0) {
+            break :blk std.fmt.bufPrint(
+                &summary_buf,
+                "{d} {s}  ·  {d} completed  ·  {d} failed  ·  {d} running  ·  {s}",
+                .{ count, noun, completed_count, failed_count, running_count, elapsed },
+            ) catch "Tool calls running";
+        }
+        break :blk std.fmt.bufPrint(
+            &summary_buf,
+            "{d} {s}  ·  {d} completed  ·  {d} running  ·  {s}",
+            .{ count, noun, completed_count, running_count, elapsed },
+        ) catch "Tool calls running";
+    } else if (failed_count > 0)
+        std.fmt.bufPrint(
+            &summary_buf,
+            "{d} {s}  ·  {d} completed  ·  {d} failed",
+            .{ count, noun, completed_count, failed_count },
+        ) catch "Tool calls completed with failures"
+    else
+        std.fmt.bufPrint(&summary_buf, "{d} {s}  ·  {d} completed", .{ count, noun, completed_count }) catch "Tool calls completed";
+
+    const chev_w = theme.scaledUi(22.0);
+    const text_x = bubble.x + pad_x + status_dia + theme.scaledUi(11.0);
+    queueFixedTextLine(state, .{
+        .x = text_x,
+        .y = bubble.y + theme.scaledUi(14.0),
+        .w = @max(bubble.w - (text_x - bubble.x) - pad_x - chev_w, theme.scaledUi(40.0)),
+        .h = theme.scaledUi(20.0),
+    }, summary, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), clip);
+    queueCardChevron(state, bubble.x + bubble.w - pad_x - chev_w * 0.5, bubble.y + header_h * 0.5, expanded, paletteColor(theme.COLOR_TEXT_SUBTLE));
+    state.recordCardToggleHit(.{
+        .rect = .{ .x = bubble.x, .y = bubble.y, .w = bubble.w, .h = header_h },
+        .key = key,
+        .kind = .tool_call_group,
+        .default_expanded = default_expanded,
+    });
+
+    if (!expanded) return;
+    const inset = theme.scaledUi(10.0);
+    const child_column = palette.Rect{
+        .x = column.x + inset,
+        .y = column.y,
+        .w = @max(column.w - inset * 2.0, theme.scaledUi(80.0)),
+        .h = column.h,
+    };
+    var child_y = y + header_h + theme.scaledUi(8.0);
+    for (entries[start..end], start..) |entry, index| {
+        const message_index = base_message_index + index;
+        const child_h = transcriptCommandEventHeight(state, message_index, entry.author, entry.body, child_column.w);
+        renderCommandEventRow(
+            state,
+            child_column,
+            child_y,
+            child_h,
+            entry.author,
+            entry.body,
+            clip,
+            message_index,
+            running and index + 1 == end,
+            true,
+        );
+        child_y += child_h + theme.scaledUi(8.0);
+    }
+}
+
 fn renderCommandEventRow(
     state: *app_state.AppState,
     column: palette.Rect,
@@ -3065,18 +3434,19 @@ fn renderCommandEventRow(
     clip: palette.Rect,
     message_index: usize,
     running: bool,
+    grouped: bool,
 ) void {
     const bubble = palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height };
-    const rr = transcriptBubbleCornerRadius();
-    const failed = std.mem.eql(u8, original_author, "Command failed") or
-        std.mem.eql(u8, original_author, "Background task failed") or
-        std.mem.eql(u8, original_author, "Failed to background command");
+    const rr = if (grouped) theme.scaledUi(8.0) else transcriptBubbleCornerRadius();
+    const failed = commandEventFailed(original_author);
     const stopped = std.mem.eql(u8, original_author, "Background task stopped");
+    const fill_color = if (grouped) theme.darken(theme.background(), 0.035) else theme.COLOR_PANEL_ALT;
+    const resting_border = if (grouped) theme.withAlpha(theme.borderMuted(), 185) else theme.borderMuted();
     queueRoundedShellClipped(
         state,
         bubble,
-        paletteColor(theme.COLOR_PANEL_ALT),
-        paletteColor(if (failed) theme.COLOR_DIFF_REMOVE else if (stopped) theme.COLOR_YELLOW else theme.borderMuted()),
+        paletteColor(fill_color),
+        paletteColor(if (failed) theme.COLOR_DIFF_REMOVE else if (stopped) theme.COLOR_YELLOW else resting_border),
         rr,
         clip,
     );
@@ -3088,7 +3458,8 @@ fn renderCommandEventRow(
     const header_h = line_h + pad_y * 2.0;
 
     const key = commandCardKey(message_index);
-    const expanded = state.isCardExpanded(key);
+    const default_expanded = failed;
+    const expanded = state.isCardExpandedDefault(key, default_expanded);
 
     const body = std.mem.trim(u8, body_raw, "\n\r\t ");
     const label = paletteCommandRowDisplayAuthor(original_author, body_raw);
@@ -3116,13 +3487,22 @@ fn renderCommandEventRow(
         .h = status_dia,
     }, paletteColor(status_color), status_dia * 0.5);
 
+    const copy_w = theme.scaledUi(56.0);
+    const copy_h = theme.scaledUi(26.0);
+    const copy_gap = theme.scaledUi(8.0);
     const chev_box_w = theme.scaledUi(18.0);
     const chev_cx = bubble.x + bubble.w - pad_x - chev_box_w * 0.5;
     const chev_cy = status_cy;
     queueCardChevron(state, chev_cx, chev_cy, expanded, paletteColor(theme.COLOR_TEXT_SUBTLE));
 
     const text_x = status_cx + status_dia * 0.5 + theme.scaledUi(10.0);
-    const text_right = bubble.x + bubble.w - pad_x - chev_box_w - theme.scaledUi(6.0);
+    const copy_rect = snapRect(palette.Rect{
+        .x = bubble.x + bubble.w - pad_x - chev_box_w - copy_gap - copy_w,
+        .y = bubble.y + (header_h - copy_h) * 0.5,
+        .w = copy_w,
+        .h = copy_h,
+    });
+    const text_right = copy_rect.x - copy_gap;
     const text_w = @max(text_right - text_x, theme.scaledUi(40.0));
     const header_text_clip = intersectClipRect(clip, .{
         .x = text_x,
@@ -3132,9 +3512,20 @@ fn renderCommandEventRow(
     });
     const text_color = if (failed) paletteColor(theme.COLOR_DIFF_REMOVE) else paletteColor(theme.COLOR_TEXT_MUTED);
 
+    const copy_bg = if (grouped) theme.withAlpha(theme.COLOR_PANEL_ALT, 235) else theme.withAlpha(theme.COLOR_PANEL_MUTED, 180);
+    queueRoundedClipped(state, copy_rect, paletteColor(copy_bg), theme.scaledUi(5.0), clip);
+    const copy_label_h = theme.scaledUi(14.0);
+    queueFixedTextLine(state, .{
+        .x = copy_rect.x + theme.scaledUi(10.0),
+        .y = copy_rect.y + (copy_rect.h - copy_label_h) * 0.5,
+        .w = copy_rect.w - theme.scaledUi(20.0),
+        .h = copy_label_h,
+    }, "Copy", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(11.5), clip);
+    state.recordTranscriptCopyHit(copy_rect, body_raw, toolCopyIdentity(message_index, body_raw));
+
     const mono_w = font_size * 0.55;
     const text_y = bubble.y + pad_y + (line_h - font_size * 1.25) * 0.5;
-    const icon_text = ">_";
+    const icon_text = if (grouped) "$" else ">_";
     const icon_w = @as(f32, @floatFromInt(icon_text.len)) * mono_w;
     const gap = theme.scaledUi(7.0);
     const label_x = text_x + icon_w + gap;
@@ -3184,16 +3575,47 @@ fn renderCommandEventRow(
         .rect = .{ .x = bubble.x, .y = bubble.y, .w = bubble.w, .h = header_h },
         .key = key,
         .kind = .command_card,
+        .default_expanded = default_expanded,
     });
 
     if (expanded) {
+        if (grouped) {
+            queueRoundedClipped(state, .{
+                .x = bubble.x + theme.scaledUi(1.0),
+                .y = bubble.y + header_h,
+                .w = @max(bubble.w - theme.scaledUi(2.0), 1.0),
+                .h = @max(bubble.h - header_h - theme.scaledUi(1.0), 1.0),
+            }, paletteColor(theme.darken(theme.background(), 0.065)), theme.scaledUi(6.0), clip);
+            queueRoundedClipped(state, .{
+                .x = bubble.x + pad_x,
+                .y = bubble.y + header_h,
+                .w = @max(bubble.w - pad_x * 2.0, 1.0),
+                .h = theme.scaledUi(1.0),
+            }, paletteColor(theme.withAlpha(theme.borderMuted(), 170)), 0.0, clip);
+        }
         const inner = palette.Rect{
             .x = bubble.x + pad_x,
             .y = bubble.y + header_h,
             .w = @max(bubble.w - pad_x * 2.0, theme.scaledUi(40.0)),
             .h = @max(bubble.h - header_h - pad_y, theme.scaledUi(1.0)),
         };
-        renderWrappedBody(state, inner, body, paletteColor(theme.COLOR_TEXT_MUTED), font_size, clip);
+        const chars_per_line = @max(@as(usize, @intFromFloat(inner.w / (font_size * 0.52))), 1);
+        const line_count = wrappedLineCount(body, chars_per_line);
+        const output_key = toolOutputKey(message_index);
+        const show_all = state.isCardExpanded(output_key);
+        const visible_lines = if (show_all) line_count else @min(line_count, TOOL_OUTPUT_COLLAPSED_LINES);
+        const body_h = @as(f32, @floatFromInt(visible_lines)) * line_h;
+        renderWrappedBody(state, .{ .x = inner.x, .y = inner.y, .w = inner.w, .h = body_h }, body, paletteColor(theme.COLOR_TEXT_MUTED), font_size, clip);
+        if (!show_all and line_count > visible_lines) {
+            const more_rect = palette.Rect{
+                .x = inner.x,
+                .y = inner.y + body_h,
+                .w = theme.scaledUi(112.0),
+                .h = theme.scaledUi(26.0),
+            };
+            queueFixedTextLine(state, more_rect, "Show more", paletteColor(theme.COLOR_GREEN), theme.scaledUi(12.0), clip);
+            state.recordCardToggleHit(.{ .rect = more_rect, .key = output_key, .kind = .tool_output });
+        }
     }
 }
 

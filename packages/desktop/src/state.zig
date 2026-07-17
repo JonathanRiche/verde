@@ -184,6 +184,7 @@ pub const SettingsDraft = struct {
     theme_choice: usize = 1,
     open_action: SettingsOpenAction = .folder,
     link_open_target: app_config.LinkOpenTarget = .verde_browser,
+    tool_call_group_preference: app_config.ToolCallGroupPreference = .collapsed,
     check_for_updates_automatically: bool = true,
     notifications_enabled: bool = true,
 };
@@ -224,6 +225,8 @@ const BrowserContextMenuPayloadItem = struct {
 /// Kinds of expand/collapse cards that share the same per-frame hit list.
 pub const CardToggleKind = enum(u8) {
     command_card,
+    tool_call_group,
+    tool_output,
     diff_file,
 };
 
@@ -234,6 +237,7 @@ pub const CardToggleHit = struct {
     rect: palette.Rect,
     key: u64,
     kind: CardToggleKind,
+    default_expanded: bool = false,
 };
 
 pub const PaletteModalTextFocus = enum {
@@ -4415,7 +4419,7 @@ pub const AppState = struct {
     code_copy_recent_identity: u64,
     code_copy_recent_until_ms: i64,
     card_toggle_hits: std.ArrayList(CardToggleHit),
-    expanded_cards: std.AutoHashMap(u64, void),
+    expanded_cards: std.AutoHashMap(u64, bool),
     palette_modal_text_focus: PaletteModalTextFocus,
     gl_texture_uploads_enabled: bool,
     browser_textures_enabled: bool,
@@ -4700,7 +4704,7 @@ pub const AppState = struct {
             .code_copy_recent_identity = 0,
             .code_copy_recent_until_ms = 0,
             .card_toggle_hits = .empty,
-            .expanded_cards = std.AutoHashMap(u64, void).init(allocator),
+            .expanded_cards = std.AutoHashMap(u64, bool).init(allocator),
             .palette_modal_text_focus = .none,
             .gl_texture_uploads_enabled = options.gl_texture_uploads_enabled,
             .browser_textures_enabled = options.browser_textures_enabled,
@@ -8635,6 +8639,7 @@ pub const AppState = struct {
             .theme_choice = self.app_config.themeChoiceIndex(),
             .open_action = settingsOpenActionFromConfig(self.app_config.default_open_action),
             .link_open_target = self.app_config.link_open_target,
+            .tool_call_group_preference = self.app_config.tool_call_group_preference,
             .check_for_updates_automatically = self.app_config.check_for_updates_automatically,
             .notifications_enabled = self.app_config.notifications_enabled,
         };
@@ -8646,6 +8651,7 @@ pub const AppState = struct {
         if (draft.terminal_font_size != self.app_config.terminal_font_size) return true;
         if (draft.theme_choice != self.app_config.themeChoiceIndex()) return true;
         if (draft.link_open_target != self.app_config.link_open_target) return true;
+        if (draft.tool_call_group_preference != self.app_config.tool_call_group_preference) return true;
         if (draft.check_for_updates_automatically != self.app_config.check_for_updates_automatically) return true;
         if (draft.notifications_enabled != self.app_config.notifications_enabled) return true;
         return draft.open_action != settingsOpenActionFromConfig(self.app_config.default_open_action);
@@ -8774,6 +8780,7 @@ pub const AppState = struct {
         self.app_config.font_size = theme.clampf(self.settings_draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE);
         self.app_config.terminal_font_size = theme.clampf(self.settings_draft.terminal_font_size, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE);
         self.app_config.link_open_target = self.settings_draft.link_open_target;
+        self.app_config.tool_call_group_preference = self.settings_draft.tool_call_group_preference;
         const previous_auto_update_check = self.app_config.check_for_updates_automatically;
         errdefer self.app_config.check_for_updates_automatically = previous_auto_update_check;
         self.app_config.check_for_updates_automatically = self.settings_draft.check_for_updates_automatically;
@@ -15534,13 +15541,30 @@ pub const AppState = struct {
         access.setSelected(if (thread.access_mode == .full_access) 1 else 0);
     }
 
-    /// True when the mouse rests on a clickable composer control — toolbar
-    /// pills, the send button, model-picker rows/rail, or run-config stepper
-    /// segments — so the main loop can show a pointer (hand) cursor.
+    /// True when the mouse rests on a clickable Palette control so the main
+    /// loop can show a pointer (hand) cursor.
     pub fn pointerCursorWanted(self: *const AppState) bool {
         if (self.projects.items.len == 0) return false;
         const point: palette.draw.Vec2 = .{ .x = self.palette_mouse_x, .y = self.palette_mouse_y };
         if (self.palette_model_picker.wantsPointerAt(point)) return true;
+        if (self.show_settings_modal) {
+            // Settings hit rects only exist for currently-actionable controls,
+            // so disabled buttons keep the default cursor.
+            for (self.palette_modal_hits.items) |hit| {
+                const interactive = switch (hit.action) {
+                    .settings_control, .settings_theme_option, .settings_close, .settings_cancel, .settings_save => true,
+                    else => false,
+                };
+                if (interactive and hit.rect.contains(point)) return true;
+            }
+        } else {
+            for (self.card_toggle_hits.items) |hit| {
+                if (hit.rect.contains(point)) return true;
+            }
+            for (self.code_copy_buttons.items) |hit| {
+                if (hit.rect.contains(point)) return true;
+            }
+        }
         if (self.run_config_open) {
             var kinds: [3]RunConfigRowKind = undefined;
             const count = self.runConfigVisibleRows(&kinds);
@@ -18506,7 +18530,11 @@ pub const AppState = struct {
 
     /// Returns true when the given card key was previously toggled to expanded.
     pub fn isCardExpanded(self: *AppState, key: u64) bool {
-        return self.expanded_cards.contains(key);
+        return self.isCardExpandedDefault(key, false);
+    }
+
+    pub fn isCardExpandedDefault(self: *AppState, key: u64, default_expanded: bool) bool {
+        return self.expanded_cards.get(key) orelse default_expanded;
     }
 
     /// Hit-tests the most recent frame's card-toggle headers. On hit, flips
@@ -18515,15 +18543,38 @@ pub const AppState = struct {
         for (self.card_toggle_hits.items) |hit| {
             if (x < hit.rect.x or x > hit.rect.x + hit.rect.w) continue;
             if (y < hit.rect.y or y > hit.rect.y + hit.rect.h) continue;
-            if (self.expanded_cards.fetchRemove(hit.key) == null) {
-                self.expanded_cards.put(hit.key, {}) catch |err| {
-                    log.warn("failed to store expanded card: {s}", .{@errorName(err)});
+            const expanded = !self.isCardExpandedDefault(hit.key, hit.default_expanded);
+            self.expanded_cards.put(hit.key, expanded) catch |err| {
+                log.warn("failed to store expanded card: {s}", .{@errorName(err)});
+            };
+            if (hit.kind == .tool_call_group and self.app_config.tool_call_group_preference == .remember_last) {
+                self.app_config.tool_call_groups_last_expanded = expanded;
+                app_config.saveAppConfig(self.allocator, &self.app_config) catch |err| {
+                    log.warn("failed to save tool call group expansion preference: {s}", .{@errorName(err)});
                 };
             }
             self.markDirty();
             return true;
         }
         return false;
+    }
+
+    /// Registers a transcript copy action using the same per-frame payload
+    /// storage and feedback state as fenced Markdown code blocks.
+    pub fn recordTranscriptCopyHit(self: *AppState, rect: palette.Rect, payload: []const u8, identity: u64) void {
+        const payload_offset = self.palette_frame_text.items.len;
+        self.palette_frame_text.appendSlice(self.allocator, payload) catch |err| {
+            log.warn("failed to retain transcript copy payload: {s}", .{@errorName(err)});
+            return;
+        };
+        self.code_copy_buttons.append(self.allocator, .{
+            .rect = rect,
+            .payload_offset = payload_offset,
+            .payload_len = payload.len,
+            .identity = identity,
+        }) catch |err| {
+            log.warn("failed to retain transcript copy hit: {s}", .{@errorName(err)});
+        };
     }
 
     /// Hit-tests the most recent frame's code-block copy buttons. On hit,
