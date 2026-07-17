@@ -11,7 +11,7 @@
     "start": "node .output/server/index.mjs",
     "preview": "vite preview",
     "cf-typegen": "wrangler types",
-    "test": "vitest run"
+    "test": "bun test"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.1.18",

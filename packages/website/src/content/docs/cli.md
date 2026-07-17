@@ -23,6 +23,7 @@ verde completion <shell>      # Print shell completion script
 verde state <command>         # Read persisted state while the app is closed
 verde notify [options]        # Update the current terminal surface
 verde integrations <command>  # Inspect and install optional provider hooks
+verde theme <command>         # Import, validate, export, or reset themes
 verde herdr <command>         # Open or inspect Herdr-backed remote workspaces
 verde live <command>          # Control or inspect the running app
 ```
@@ -34,6 +35,30 @@ Use `--json` when scripting. Live IPC responses use a stable envelope:
 ```
 
 Errors return `ok: false` with an `error.code` and `error.message`.
+
+## Theme packages
+
+Theme commands run without launching the desktop UI. Imports accept local JSON,
+ordinary HTTP(S) URLs, and GitHub `blob` links. A successful import installs and
+activates the theme; it then appears alongside Verde and Omarchy in the Settings
+theme dropdown.
+
+```bash
+verde theme import <file-or-url> [--dry-run] [--json]
+verde theme validate <file-or-url> [--json]
+verde theme export [file] [--name <name>] [--json]
+verde theme reset [--json]
+
+# Hosted example from the Verde theme gallery
+verde theme validate https://verdeai.dev/themes/kanagawa.json
+verde theme import https://verdeai.dev/themes/kanagawa.json
+```
+
+`validate` and `import --dry-run` do not change `verde.json`. `export` resolves
+Omarchy-derived colors into a portable package, so the result can be used on
+Linux, macOS, or Windows. Theme packages only apply allowlisted visual colors
+and optional UI/terminal font sizes; font-family and command settings are never
+imported.
 
 ## Offline state commands
 

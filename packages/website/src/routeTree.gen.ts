@@ -16,6 +16,7 @@ import { Route as InstallDotps1RouteImport } from './routes/install[.]ps1'
 import { Route as AboutRouteImport } from './routes/about'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as DocsIndexRouteImport } from './routes/docs/index'
+import { Route as ThemesSlugRouteImport } from './routes/themes/$slug'
 import { Route as DocsSlugRouteImport } from './routes/docs/$slug'
 
 const LlmsDottxtRoute = LlmsDottxtRouteImport.update({
@@ -53,6 +54,11 @@ const DocsIndexRoute = DocsIndexRouteImport.update({
   path: '/docs/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ThemesSlugRoute = ThemesSlugRouteImport.update({
+  id: '/themes/$slug',
+  path: '/themes/$slug',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const DocsSlugRoute = DocsSlugRouteImport.update({
   id: '/docs/$slug',
   path: '/docs/$slug',
@@ -67,6 +73,7 @@ export interface FileRoutesByFullPath {
   '/llms-full.txt': typeof LlmsFullDottxtRoute
   '/llms.txt': typeof LlmsDottxtRoute
   '/docs/$slug': typeof DocsSlugRoute
+  '/themes/$slug': typeof ThemesSlugRoute
   '/docs/': typeof DocsIndexRoute
 }
 export interface FileRoutesByTo {
@@ -77,6 +84,7 @@ export interface FileRoutesByTo {
   '/llms-full.txt': typeof LlmsFullDottxtRoute
   '/llms.txt': typeof LlmsDottxtRoute
   '/docs/$slug': typeof DocsSlugRoute
+  '/themes/$slug': typeof ThemesSlugRoute
   '/docs': typeof DocsIndexRoute
 }
 export interface FileRoutesById {
@@ -88,6 +96,7 @@ export interface FileRoutesById {
   '/llms-full.txt': typeof LlmsFullDottxtRoute
   '/llms.txt': typeof LlmsDottxtRoute
   '/docs/$slug': typeof DocsSlugRoute
+  '/themes/$slug': typeof ThemesSlugRoute
   '/docs/': typeof DocsIndexRoute
 }
 export interface FileRouteTypes {
@@ -100,6 +109,7 @@ export interface FileRouteTypes {
     | '/llms-full.txt'
     | '/llms.txt'
     | '/docs/$slug'
+    | '/themes/$slug'
     | '/docs/'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -110,6 +120,7 @@ export interface FileRouteTypes {
     | '/llms-full.txt'
     | '/llms.txt'
     | '/docs/$slug'
+    | '/themes/$slug'
     | '/docs'
   id:
     | '__root__'
@@ -120,6 +131,7 @@ export interface FileRouteTypes {
     | '/llms-full.txt'
     | '/llms.txt'
     | '/docs/$slug'
+    | '/themes/$slug'
     | '/docs/'
   fileRoutesById: FileRoutesById
 }
@@ -131,6 +143,7 @@ export interface RootRouteChildren {
   LlmsFullDottxtRoute: typeof LlmsFullDottxtRoute
   LlmsDottxtRoute: typeof LlmsDottxtRoute
   DocsSlugRoute: typeof DocsSlugRoute
+  ThemesSlugRoute: typeof ThemesSlugRoute
   DocsIndexRoute: typeof DocsIndexRoute
 }
 
@@ -185,6 +198,13 @@ declare module '@tanstack/solid-router' {
       preLoaderRoute: typeof DocsIndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/themes/$slug': {
+      id: '/themes/$slug'
+      path: '/themes/$slug'
+      fullPath: '/themes/$slug'
+      preLoaderRoute: typeof ThemesSlugRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/docs/$slug': {
       id: '/docs/$slug'
       path: '/docs/$slug'
@@ -203,6 +223,7 @@ const rootRouteChildren: RootRouteChildren = {
   LlmsFullDottxtRoute: LlmsFullDottxtRoute,
   LlmsDottxtRoute: LlmsDottxtRoute,
   DocsSlugRoute: DocsSlugRoute,
+  ThemesSlugRoute: ThemesSlugRoute,
   DocsIndexRoute: DocsIndexRoute,
 }
 export const routeTree = rootRouteImport

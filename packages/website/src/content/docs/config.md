@@ -107,8 +107,22 @@ it is launched through the configured process entry.
 
 ## Themes
 
-Verde ships a warm-green native theme out of the box. Override individual theme
-tokens in `verde.json` under `theme.colors`:
+Verde ships a warm-green native theme out of the box. Choose Verde, Omarchy, or
+an installed theme from **Settings → Appearance → Theme**. The website's theme
+gallery provides portable packages that import and activate in one command:
+
+```bash
+verde theme import https://verdeai.dev/themes/kanagawa.json
+```
+
+Imported themes remain in the same Settings dropdown after switching away.
+You can also import a local JSON file or a GitHub file-page URL. Use
+`verde theme validate <file-or-url>` to check a package without installing it,
+and `verde theme export [file] --name "My theme"` to create a portable package
+from the currently resolved colors.
+
+To override individual theme tokens manually, edit `verde.json` under
+`theme.colors`:
 
 ```json
 {

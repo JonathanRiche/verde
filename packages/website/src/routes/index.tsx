@@ -2,6 +2,7 @@ import { createFileRoute, getRouteApi } from '@tanstack/solid-router'
 import { For, Show, createSignal, onMount } from 'solid-js'
 
 import { availableThemes, displayedTheme, setActiveThemeSlug } from '../lib/site-theme'
+import { themeImportCommand, themePackageUrl } from '../lib/theme-package'
 
 const rootRoute = getRouteApi('__root__')
 
@@ -420,19 +421,19 @@ function App() {
         </div>
       </section>
 
-      {/* ── Omarchy theme showcase ── */}
+      {/* ── Portable theme showcase ── */}
       <Show when={availableThemes.length > 0}>
         <section id="themes" class="themes-band">
           <div class="wrap">
             <div class="band-header band-header--center">
-              <p class="tag tag-static">Omarchy themes</p>
+              <p class="tag tag-static">Portable themes</p>
               <h2 class="heading">It dresses like your desktop.</h2>
               <p class="band-body">
                 On Omarchy, Verde auto-detects the active theme's{' '}
-                <code>colors.toml</code> and restyles itself to match — no Verde
-                config needed. Pick one: every shot is the real app recaptured
-                under that theme, and this whole page re-skins itself from the
-                same palette, exactly like the app does.
+                <code>colors.toml</code> with no config needed. On any platform,
+                pick a palette below and import it from this site. Every shot is
+                the real app recaptured under that theme, and this page re-skins
+                itself from the same colors.
               </p>
             </div>
 
@@ -463,9 +464,34 @@ function App() {
               />
             </div>
 
+            <div class="theme-import-card" aria-live="polite">
+              <div class="theme-import-copy">
+                <span class="theme-import-kicker">Install {theme().name}</span>
+                <code>{themeImportCommand(theme().slug)}</code>
+                <span class="theme-import-result">
+                  Imports, activates, and adds it to the Settings theme dropdown.
+                </span>
+              </div>
+              <div class="theme-import-actions">
+                <CopyButton
+                  command={themeImportCommand(theme().slug)}
+                  label={`Copy ${theme().name} import command`}
+                />
+                <a
+                  class="theme-json-link"
+                  href={themePackageUrl(theme().slug)}
+                  download={`${theme().slug}.json`}
+                >
+                  JSON file
+                </a>
+              </div>
+            </div>
+
             <p class="themes-note">
-              Works with any Omarchy theme, not just these — Verde follows{' '}
-              <code>~/.config/omarchy/current/theme/colors.toml</code>. See{' '}
+              These URLs are ordinary, versioned JSON files, so they also work
+              with <code>verde theme validate</code> and automation. Verde still
+              follows <code>~/.config/omarchy/current/theme/colors.toml</code>{' '}
+              automatically. See{' '}
               <a href="/docs/config" class="text-link">Configuration &amp; state</a>{' '}
               for the detection order and manual overrides.
             </p>

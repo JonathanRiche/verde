@@ -934,6 +934,78 @@ pre code {
   border-radius: inherit;
 }
 
+.theme-import-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 1.25rem;
+  max-width: 58rem;
+  margin: 1rem auto 0;
+  padding: 1rem 1rem 1rem 1.2rem;
+  border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-md);
+  background:
+    linear-gradient(90deg, var(--accent-wash), transparent 44%),
+    var(--panel-strong);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+}
+
+.theme-import-copy {
+  display: grid;
+  min-width: 0;
+  gap: 0.28rem;
+}
+
+.theme-import-kicker {
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.theme-import-copy code {
+  overflow-x: auto;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.84rem;
+  line-height: 1.5;
+  white-space: nowrap;
+  scrollbar-width: thin;
+}
+
+.theme-import-result {
+  color: var(--subtle);
+  font-size: 0.78rem;
+}
+
+.theme-import-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+}
+
+.theme-json-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.1rem;
+  padding: 0 0.85rem;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  transition: border-color 160ms ease, color 160ms ease, background 160ms ease;
+}
+
+.theme-json-link:hover {
+  border-color: var(--accent);
+  background: var(--accent-wash);
+  color: var(--text);
+}
+
 .themes-note {
   max-width: 44rem;
   margin: 2rem auto 0;
@@ -941,6 +1013,17 @@ pre code {
   color: var(--subtle);
   font-size: 0.95rem;
   line-height: 1.65;
+}
+
+@media (max-width: 680px) {
+  .theme-import-card {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .theme-import-actions {
+    justify-content: space-between;
+  }
 }
 
 /* ── Nav theme dropdown (shares state + swatch styles with the chips) ── */
