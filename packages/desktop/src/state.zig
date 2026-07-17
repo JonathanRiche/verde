@@ -4361,6 +4361,18 @@ pub const AppState = struct {
     const DRAFT_CAPACITY = 64 * 1024;
     const SAVE_DEBOUNCE_MS: i64 = 750;
 
+    const UpdateInstallerTerminalStatus = enum {
+        running,
+        succeeded,
+        failed,
+    };
+
+    const UpdateInstallerTerminal = struct {
+        project_index: usize,
+        dock_id: u32,
+        status: UpdateInstallerTerminalStatus = .running,
+    };
+
     allocator: std.mem.Allocator,
     storage: *const Storage,
     projects: std.ArrayList(Project),
@@ -4538,6 +4550,7 @@ pub const AppState = struct {
     settings_update_notes_expanded: bool,
     update_state: updater.State,
     update_installer_started: bool,
+    update_installer_terminal: ?UpdateInstallerTerminal,
     update_exit_requested: bool,
     app_config_file_mtime: i128,
     app_config_runtime_sync_pending: bool,
@@ -4805,6 +4818,7 @@ pub const AppState = struct {
             .settings_update_notes_expanded = false,
             .update_state = .{},
             .update_installer_started = false,
+            .update_installer_terminal = null,
             .update_exit_requested = false,
             .app_config_file_mtime = -1,
             .app_config_runtime_sync_pending = false,
@@ -8939,7 +8953,10 @@ pub const AppState = struct {
     }
 
     pub fn installAvailableUpdate(self: *AppState) void {
-        if (self.update_installer_started) return;
+        if (self.update_installer_started) {
+            _ = self.focusUpdateInstallerTerminal();
+            return;
+        }
         const launch = update_installer.launch(self.allocator) catch |err| {
             log.warn("failed to launch update installer: {s}", .{@errorName(err)});
             const url = self.update_state.downloadUrl() orelse updater.State.releasesUrl();
@@ -8950,6 +8967,19 @@ pub const AppState = struct {
             self.setSidebarNotice("Could not start the installer; opened the release download instead.");
             return;
         };
+        if (launch == .aur_helper_missing) {
+            self.setSidebarNotice("Verde is AUR-managed, but yay or paru was not found.");
+            self.markDirty();
+            return;
+        }
+        if (update_installer.aurCommand(launch) != null) {
+            self.startAurUpdateTerminal(launch) catch |err| {
+                log.warn("failed to open AUR update terminal: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Could not open the AUR updater terminal.");
+                self.markDirty();
+            };
+            return;
+        }
         self.update_installer_started = true;
         self.update_exit_requested = launch == .started_and_exit_required;
         self.setSidebarNotice(if (self.update_exit_requested)
@@ -8957,6 +8987,105 @@ pub const AppState = struct {
         else
             "Verde update installer started. Restart Verde when it completes.");
         self.markDirty();
+    }
+
+    pub fn updateInstallerButtonEnabled(self: *const AppState) bool {
+        if (self.update_state.status != .update_available) return false;
+        return !self.update_installer_started or self.update_installer_terminal != null;
+    }
+
+    pub fn updateInstallerButtonLabel(self: *const AppState) []const u8 {
+        if (self.update_installer_terminal) |update_terminal| {
+            return switch (update_terminal.status) {
+                .running => "Updating — view terminal",
+                .succeeded => "Installed — restart Verde",
+                .failed => "Update failed — view terminal",
+            };
+        }
+        if (self.update_installer_started) return "Installer started";
+        if (self.update_state.status == .update_available) return "Install update";
+        return "No update available";
+    }
+
+    fn startAurUpdateTerminal(self: *AppState, launch: update_installer.Launch) !void {
+        const command = update_installer.aurCommand(launch) orelse return error.InvalidAurLaunch;
+        if (self.projects.items.len == 0) return error.NoProjectSelected;
+        self.ensureCurrentProjectWorkspace();
+
+        const project_index = self.selected_project_index;
+        const dock_id = try self.createProjectTerminalDock(project_index);
+        errdefer _ = self.projects.items[project_index].removeTerminalDockById(self.allocator, dock_id);
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
+        const project_path = self.projects.items[project_index].path;
+        try dock.restartWithProfilePersistent(self.allocator, project_path, .{
+            .kind = .custom,
+            .label = "Update Verde",
+            .command = command,
+        }, self.storage.pref_path, dock_id);
+
+        var layout = &self.projects.items[project_index].workspace_layout;
+        const pane_id = try layout.ensureTerminalPane(self.allocator, dock_id);
+        const pane = layout.paneByIdMutable(pane_id) orelse return error.TerminalPaneUnavailable;
+        switch (pane.ref) {
+            .terminal => |*terminal_ref| terminal_ref.purpose = .editor,
+            else => return error.TerminalPaneUnavailable,
+        }
+        layout.maximized_pane_id = null;
+        dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
+        dock.visible = false;
+
+        self.update_installer_started = true;
+        self.update_installer_terminal = .{
+            .project_index = project_index,
+            .dock_id = dock_id,
+        };
+        self.cancelSettingsModal();
+        self.requestTerminalDockFocus(dock_id);
+        self.setSidebarNotice("AUR updater opened in a terminal. Complete any password prompt there.");
+        self.noteTerminalInputActivity();
+        self.markDirty();
+    }
+
+    fn focusUpdateInstallerTerminal(self: *AppState) bool {
+        const update_terminal = self.update_installer_terminal orelse return false;
+        if (update_terminal.project_index >= self.projects.items.len) return false;
+        if (self.projectTerminalDock(update_terminal.project_index, update_terminal.dock_id) == null) return false;
+        self.selected_project_index = update_terminal.project_index;
+        self.ensureCurrentProjectWorkspace();
+        var layout = &self.projects.items[update_terminal.project_index].workspace_layout;
+        _ = layout.ensureTerminalPane(self.allocator, update_terminal.dock_id) catch return false;
+        layout.maximized_pane_id = null;
+        self.cancelSettingsModal();
+        self.requestTerminalDockFocus(update_terminal.dock_id);
+        self.markDirty();
+        return true;
+    }
+
+    fn pollUpdateInstallerTerminal(self: *AppState) bool {
+        const update_terminal = self.update_installer_terminal orelse return false;
+        if (update_terminal.status != .running) return false;
+        const dock = self.projectTerminalDock(update_terminal.project_index, update_terminal.dock_id) orelse {
+            self.update_installer_terminal.?.status = .failed;
+            self.setSidebarNotice("The AUR updater terminal was closed before it finished.");
+            self.markDirty();
+            return true;
+        };
+        const snapshot = dock.activeSessionSnapshot() orelse return false;
+        if (snapshot.running) return false;
+        if (snapshot.exit_code == null and snapshot.signal == null) return false;
+        const succeeded = snapshot.exit_code != null and snapshot.exit_code.? == 0;
+        self.update_installer_terminal.?.status = if (succeeded) .succeeded else .failed;
+        self.setSidebarNotice(if (succeeded)
+            "Verde was updated. Restart Verde to use the new version."
+        else
+            "The AUR update failed. Review the updater terminal for details.");
+        self.markDirty();
+        return true;
+    }
+
+    fn isUpdateInstallerTerminal(self: *const AppState, project_index: usize, dock_id: u32) bool {
+        const update_terminal = self.update_installer_terminal orelse return false;
+        return update_terminal.project_index == project_index and update_terminal.dock_id == dock_id;
     }
 
     pub fn consumeUpdateExitRequest(self: *AppState) bool {
@@ -10835,11 +10964,15 @@ pub const AppState = struct {
             }
             self.pollManagedProcesses(project_index);
         }
+        visible_changed = self.pollUpdateInstallerTerminal() or visible_changed;
         if (visible_changed) self.last_terminal_activity_ms = monotonicMs();
         return visible_changed;
     }
 
     fn closeExitedEditorTerminalPane(self: *AppState, project_index: usize, dock_id: u32) bool {
+        // The updater is an interactive one-shot command whose final output
+        // must remain visible instead of being auto-closed like editor tasks.
+        if (self.isUpdateInstallerTerminal(project_index, dock_id)) return false;
         if (project_index >= self.projects.items.len) return false;
         var project = &self.projects.items[project_index];
         var layout = &project.workspace_layout;
