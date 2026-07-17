@@ -1472,10 +1472,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (workspace_panes_ui.hasActivePaneDrag() and workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, ctrl_down)) {
                 return true;
             }
-            if (terminal_panel_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, event.motion.state)) {
+            // Focus the workspace leaf before forwarding motion to its content.
+            // Mouse-aware TUIs consume motion, which must not prevent hover focus.
+            if (workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, ctrl_down)) {
                 return true;
             }
-            if (workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, ctrl_down)) {
+            if (terminal_panel_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, event.motion.state)) {
                 return true;
             }
             browser_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
