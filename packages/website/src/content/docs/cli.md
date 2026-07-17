@@ -144,11 +144,17 @@ verde live workspace reopen [--project <id|index|path>] [--json]
 verde live browser status [--json]
 verde live browser open --url https://example.com [--project <id|index|path|current|self>] [--json]
 verde live browser navigate --url https://example.com [--json]
+verde live browser close [--json]
+verde live browser toggle [--json]
 verde live browser back [--json]
 verde live browser forward [--json]
 verde live browser reload [--json]
 verde live browser focus [--json]
 verde live browser blur [--json]
+verde live browser select-all [--json]
+verde live browser copy [--json]
+verde live browser cut [--json]
+verde live browser paste-text --text "hello" [--json]
 verde live browser eval --script "document.title" [--json]
 verde live browser post-json --json-payload '{"type":"ping"}' [--json]
 verde live browser inspector-enable [--json]
@@ -162,6 +168,8 @@ or WebView2). `browser open` opens a URL in the workspace's browser pane,
 creating one if needed. `browser eval` runs JavaScript in the loaded page and
 returns the result as JSON. The inspector commands control
 [Design Mode](/docs/design-mode) for browser-to-agent visual feedback.
+`select-all` and `copy` operate on the focused page element or selection;
+`cut` and `paste-text` target the focused editable element.
 
 ## Chat control
 

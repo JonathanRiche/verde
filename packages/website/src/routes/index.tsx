@@ -170,13 +170,13 @@ const comparisonRows: { label: string; cells: Cell[] }[] = [
   { label: 'Native tiling chat / terminal / browser', cells: [true, 'partial', false, false] },
   { label: 'Embedded browser pane', cells: [true, false, 'partial', false] },
   { label: 'Local-only, no hosted relay', cells: [true, true, false, 'partial'] },
-  { label: 'Scriptable over a local IPC socket', cells: [true, true, false, false] },
+  { label: 'Scriptable over local IPC', cells: [true, true, false, false] },
   { label: 'No Electron / Chromium bundle', cells: [true, true, false, false] },
   { label: 'Layouts that persist across launches', cells: [true, 'partial', 'partial', false] },
 ]
 
 const stack = [
-  { label: 'Zig 0.16', detail: 'Single static binary, no Electron' },
+  { label: 'Zig 0.16', detail: 'Native executable, no Electron UI' },
   { label: 'SDL3 + Palette', detail: 'Our Zig GUI framework, built in-tree' },
   { label: 'Ghostty VT', detail: 'Embedded terminal engine (libghostty-vt)' },
   { label: 'Native webview', detail: 'WPE WebKit · WKWebView · WebView2' },
@@ -576,7 +576,8 @@ function App() {
             <p class="tag tag-static">Scripting</p>
             <h2 class="heading">Drive Verde from your shell.</h2>
             <p class="band-body">
-              Every running instance exposes a Unix-socket IPC. The{' '}
+              Every running instance exposes current-user local IPC: a Unix
+              socket on Linux and macOS, or a named pipe on Windows. The{' '}
               <code>verde live</code> and <code>verde state</code> subcommands let
               you inspect panes, send prompts, write to terminals, and script the
               app from your dotfiles, hooks, or CI.
@@ -671,8 +672,8 @@ function App() {
               Zig and SDL3, <span class="heading-strike">not Electron.</span>
             </h2>
             <p class="band-body">
-              Built as a single native binary on top of Verde's own Palette UI
-              framework. No Chromium bundle, no JavaScript runtime, no telemetry
+              Built as a native desktop package on top of Verde's own Palette UI
+              framework. No Electron UI, no bundled Chromium, and no telemetry
               sink — just the ingredients a workstation tool should be made of.
             </p>
           </div>

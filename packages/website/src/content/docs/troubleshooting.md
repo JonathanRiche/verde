@@ -27,8 +27,8 @@ this order:
    ```
 
    Claude Code is authenticated through its own SDK; Verde has no Verde-side
-   login for it. Make sure the Claude Code binary is reachable from the shell
-   environment Verde was launched from.
+   login for it. Make sure the Claude Code binary and `node` are both reachable
+   from the shell environment Verde was launched from.
 
 3. **Is the project imported?** Verde runs the provider against the imported project directory. A provider CLI in a different working directory will not see the same files.
 
