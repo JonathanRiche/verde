@@ -115,6 +115,9 @@ pub const SurfaceState = struct {
     provider_thread_id: ?[]u8 = null,
     title: []u8 = "",
     status: SurfaceStatus = .idle,
+    /// Unix ms when `status` last changed value; 0 while unknown. Drives the
+    /// sidebar's elapsed "Working · m:ss" label for terminal panes.
+    status_changed_at_ms: i64 = 0,
     progress: ?f32 = null,
     attention: bool = false,
     unread_count: u32 = 0,
@@ -1538,6 +1541,16 @@ pub const ChatThread = struct {
         if (!self.send_state.mutex.tryLock()) return true;
         defer self.send_state.mutex.unlock();
         return self.send_state.status == .pending;
+    }
+
+    /// Unix ms when the in-flight send began, or null when no send is pending
+    /// (or the worker holds the lock this frame — callers fall back to a
+    /// time-less label rather than blocking the render thread).
+    pub fn sendStartedAtMsForUi(self: *const ChatThread) ?i64 {
+        if (!self.send_state.mutex.tryLock()) return null;
+        defer self.send_state.mutex.unlock();
+        if (self.send_state.status != .pending) return null;
+        return self.send_state.started_at_ms;
     }
 
     fn finishSendThread(self: *ChatThread) void {
@@ -9321,6 +9334,7 @@ pub const AppState = struct {
             }
         }
         if (update.clear) {
+            if (s.status != .idle) s.status_changed_at_ms = unixTimestampMs();
             s.status = .idle;
             s.progress = null;
             s.attention = false;
@@ -9329,7 +9343,10 @@ pub const AppState = struct {
             try replaceOwnedOptionalSlice(self.allocator, &s.last_event_body, null);
             _ = self.clearTerminalNotificationBySession(update.session_id);
         } else {
-            if (update.status) |value| s.status = value;
+            if (update.status) |value| {
+                if (value != s.status) s.status_changed_at_ms = unixTimestampMs();
+                s.status = value;
+            }
             if (update.progress) |value| s.progress = theme.clampf(value, 0.0, 1.0);
             if (update.attention) |value| s.attention = value;
             if (update.unread_increment > 0) s.unread_count +|= update.unread_increment;
@@ -9492,7 +9509,7 @@ pub const AppState = struct {
     }
 
     /// Selects a workspace and focuses one of its open layout panes directly
-    /// from the sidebar's live "OPEN" list, restoring it first if minimized.
+    /// from the sidebar's live pane list, restoring it first if minimized.
     pub fn focusWorkspaceOpenPane(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) void {
         if (project_index >= self.projects.items.len) return;
         self.selected_project_index = project_index;
