@@ -171,7 +171,7 @@ Use `processes:` for normal long-running commands such as dev servers. Use
 `agents:` for terminal/TUI AI tools that should behave like first-class Verde
 surfaces. With the Codex example above, Verde creates or reuses a terminal dock
 for the agent and wires Codex hook events into pane/workspace attention. Plain
-`codex` managed commands are launched with `features.codex_hooks=true` when
+`codex` managed commands are launched with `features.hooks=true` when
 `hooks: true` is set, so `PermissionRequest` can mark the surface `waiting` and
 `Stop` can mark it `done`.
 

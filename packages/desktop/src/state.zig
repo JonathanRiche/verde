@@ -14303,12 +14303,12 @@ pub const AppState = struct {
                 process.provider == .codex and
                 process.hooks and
                 isCodexExecutable(process.argv.items[0]) and
-                !argvContains(process.argv.items, "features.codex_hooks");
+                !argvContainsCodexHooksFeature(process.argv.items);
             for (process.argv.items, 0..) |arg, index| {
                 try appendOwnedString(self.allocator, &launch.argv, arg);
                 if (index == 0 and add_codex_hooks) {
                     try appendOwnedString(self.allocator, &launch.argv, "-c");
-                    try appendOwnedString(self.allocator, &launch.argv, "features.codex_hooks=true");
+                    try appendOwnedString(self.allocator, &launch.argv, "features.hooks=true");
                 }
             }
             return launch;
@@ -14340,11 +14340,16 @@ pub const AppState = struct {
             error.WindowsPowerShellNotFound;
     }
 
-    fn argvContains(argv: []const []u8, needle: []const u8) bool {
+    fn argvContainsCodexHooksFeature(argv: []const []u8) bool {
         for (argv) |arg| {
-            if (std.mem.indexOf(u8, arg, needle) != null) return true;
+            if (containsCodexHooksFeature(arg)) return true;
         }
         return false;
+    }
+
+    fn containsCodexHooksFeature(text: []const u8) bool {
+        return std.mem.indexOf(u8, text, "features.hooks") != null or
+            std.mem.indexOf(u8, text, "features.codex_hooks") != null;
     }
 
     fn isCodexExecutable(path: []const u8) bool {
@@ -14361,16 +14366,16 @@ pub const AppState = struct {
         if (!(process.kind == .agent and process.provider == .codex and process.hooks)) {
             return self.allocator.dupe(u8, process.command);
         }
-        if (std.mem.indexOf(u8, process.command, "features.codex_hooks") != null) {
+        if (containsCodexHooksFeature(process.command)) {
             return self.allocator.dupe(u8, process.command);
         }
 
         const trimmed = std.mem.trim(u8, process.command, " \t\r\n");
         if (std.mem.eql(u8, trimmed, "codex")) {
-            return self.allocator.dupe(u8, "codex -c features.codex_hooks=true");
+            return self.allocator.dupe(u8, "codex -c features.hooks=true");
         }
         if (std.mem.startsWith(u8, trimmed, "codex ")) {
-            return try std.fmt.allocPrint(self.allocator, "codex -c features.codex_hooks=true {s}", .{trimmed["codex ".len..]});
+            return try std.fmt.allocPrint(self.allocator, "codex -c features.hooks=true {s}", .{trimmed["codex ".len..]});
         }
         return self.allocator.dupe(u8, process.command);
     }
@@ -19802,6 +19807,17 @@ test "new Codex threads default to GPT-5.6 Sol with low reasoning" {
     defer thread.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(DEFAULT_CODEX_MODEL, thread.model_ref.?);
     try std.testing.expectEqual(DEFAULT_CODEX_REASONING_EFFORT, thread.reasoning_effort.?);
+}
+
+test "Codex hook feature detection accepts current and legacy names" {
+    try std.testing.expect(AppState.containsCodexHooksFeature("features.hooks=true"));
+    try std.testing.expect(AppState.containsCodexHooksFeature("features.codex_hooks=false"));
+    try std.testing.expect(!AppState.containsCodexHooksFeature("features.goals=true"));
+
+    const current_argv = [_][]const u8{ "codex", "-c", "features.hooks=true" };
+    const legacy_argv = [_][]const u8{ "codex", "--config=features.codex_hooks=true" };
+    try std.testing.expect(AppState.argvContainsCodexHooksFeature(&current_argv));
+    try std.testing.expect(AppState.argvContainsCodexHooksFeature(&legacy_argv));
 }
 
 test "initial send snapshot restores retryable draft and attachment" {
