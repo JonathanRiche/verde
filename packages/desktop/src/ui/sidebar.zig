@@ -35,10 +35,14 @@ const SIDEBAR_THREAD_ROW_STEP_CSS: f32 = 42.0;
 const SIDEBAR_THREAD_ICON_LEADING_PAD_CSS: f32 = 10.0;
 /// Horizontal gap between the icon slot and the title.
 const SIDEBAR_THREAD_ICON_TITLE_GAP_CSS: f32 = 10.0;
-/// Relative-time label starts this far from the row's right edge.
-const SIDEBAR_THREAD_TIME_COLUMN_CSS: f32 = 60.0;
-/// Padding between truncated title and the time column.
-const SIDEBAR_THREAD_TITLE_TIME_GAP_CSS: f32 = 2.0;
+/// Width reserved for the live status column ("Working · 59:59"); titles only
+/// give up this width while a status label is actually present.
+const SIDEBAR_STATUS_COLUMN_CSS: f32 = 96.0;
+/// Horizontal padding of the expanded rail's content column. Kept tight so
+/// pane titles keep as many characters as possible at typical rail widths.
+const SIDEBAR_PAD_X_CSS: f32 = 16.0;
+/// Indent of pane rows beneath their workspace header row.
+const SIDEBAR_ROW_INDENT_CSS: f32 = 16.0;
 /// Compact workspace-row badge width for Herdr-backed workspaces.
 const SIDEBAR_HERDR_BADGE_W_CSS: f32 = 50.0;
 const HIDDEN_SIDEBAR_EDGE_REVEAL_CSS: f32 = 8.0;
@@ -60,7 +64,7 @@ const SidebarHitKind = enum {
     workspace_row,
     workspace_avatar,
     open_pane,
-    /// Per-workspace "History · N" row; opens the command palette scoped to
+    /// Per-workspace history action icon; opens the command palette scoped to
     /// that workspace's saved threads.
     history,
     settings,
@@ -107,6 +111,7 @@ var sidebar_menu_row_count: usize = 0;
 
 var settings_hovered: bool = false;
 var terminal_action_hovered: ?usize = null;
+var history_action_hovered: ?usize = null;
 
 const WorkspaceDragState = struct {
     pending: bool = false,
@@ -186,6 +191,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
     var new_project_hover: ?usize = null;
     var new_new_thread_hover: ?usize = null;
     var new_terminal_hover: ?usize = null;
+    var new_history_hover: ?usize = null;
     var new_settings_hover = false;
     if (rectContainsPoint(palette_sidebar_rect, x, y)) {
         // Walk hits in reverse so later (visually-topmost) rows win when
@@ -205,6 +211,9 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
                 .new_terminal => {
                     if (!state.isSidebarCollapsed() and new_terminal_hover == null) new_terminal_hover = hit.project_index;
                 },
+                .history => {
+                    if (!state.isSidebarCollapsed() and new_history_hover == null) new_history_hover = hit.project_index;
+                },
                 .settings => new_settings_hover = true,
                 else => {},
             }
@@ -214,10 +223,12 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
     const project_changed = state.sidebar_project_hover != new_project_hover;
     const new_thread_changed = state.sidebar_new_thread_hover != new_new_thread_hover;
     const terminal_changed = terminal_action_hovered != new_terminal_hover;
+    const history_changed = history_action_hovered != new_history_hover;
     const settings_changed = settings_hovered != new_settings_hover;
     terminal_action_hovered = new_terminal_hover;
+    history_action_hovered = new_history_hover;
     settings_hovered = new_settings_hover;
-    if (!project_changed and !new_thread_changed and !terminal_changed and !settings_changed) return;
+    if (!project_changed and !new_thread_changed and !terminal_changed and !history_changed and !settings_changed) return;
 
     state.sidebar_project_hover = new_project_hover;
     state.sidebar_new_thread_hover = new_new_thread_hover;
@@ -443,11 +454,15 @@ fn finishWorkspaceDrag(state: *runtime.AppState, x: f32, y: f32) bool {
     _ = sdl.captureMouse(false);
 
     if (!drag.active) {
-        // No meaningful movement — treat as a plain click on the row.
+        // No meaningful movement — treat as a plain click on the row. First
+        // click selects the workspace (which auto-expands its subtree in the
+        // expanded rail); only a click on the already-selected row toggles the
+        // manual collapse flag, so selecting never immediately re-hides panes.
         if (drag.project_index < state.projects.items.len) {
             state.noteInteraction();
+            const was_selected = state.selected_project_index == drag.project_index;
             state.selected_project_index = drag.project_index;
-            if (drag.toggle_project_on_click) {
+            if (drag.toggle_project_on_click and was_selected) {
                 state.projects.items[drag.project_index].collapsed = !state.projects.items[drag.project_index].collapsed;
             }
             state.syncRenameBuffer();
@@ -698,19 +713,25 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
     }
 }
 
+/// Expanded workspace rail: one compact pinned header row, a cross-workspace
+/// "ACTIVE" attention cluster, then the workspace tree. Only the selected
+/// workspace expands its pane list; the others stay one header row tall and
+/// surface live work through the cluster, so rail height tracks activity
+/// rather than structure.
 fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) void {
-    const pad_x = theme.scaledUi(25.0);
+    const pad_x = theme.scaledUi(SIDEBAR_PAD_X_CSS);
     const rail_w = @max(rect.w - pad_x * 2.0, theme.scaledUi(140.0));
     const x = rect.x + pad_x;
 
-    // The logo, sidebar-collapse toggle, "WORKSPACES" label, and add-workspace
-    // button stay pinned at the top of the rail; only the workspace list
-    // scrolls beneath them. The header is rendered AFTER the list (with a
-    // background strip first) so any list rows scrolled into the header band
-    // are visually overwritten — no z-index plumbing required.
-    const header_top = rect.y + theme.scaledUi(31.0);
-    const projects_label_y = header_top + theme.scaledUi(92.0);
-    const list_top = projects_label_y + theme.scaledUi(38.0);
+    // Single pinned header row (logo mark + right-aligned add/collapse
+    // controls); the old wordmark + "WORKSPACES" band spent ~130px of rail
+    // height on labels the list itself already communicates. The header is
+    // rendered AFTER the list (with a background strip first) so any list rows
+    // scrolled into the header band are visually overwritten — no z-index
+    // plumbing required.
+    const header_top = rect.y + theme.scaledUi(14.0);
+    const header_h = theme.scaledUi(32.0);
+    const list_top = header_top + header_h + theme.scaledUi(12.0);
     // Reserve a band at the bottom of the rail for sticky chrome. Clipping the
     // list short here also caps `sidebar_max_scroll_y` (computed below from
     // `list_clip.y + list_clip.h`), so the list scrolls to rest above the
@@ -721,78 +742,92 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     const clip = list_clip;
     var y = list_top - sidebar_scroll_y;
 
+    y = renderAttentionClusterSection(state, x, rail_w, list_clip, clip, y);
+
     var project_index: usize = 0;
     while (project_index < state.projects.items.len) : (project_index += 1) {
         const project = &state.projects.items[project_index];
         const selected = state.selected_project_index == project_index;
-        const collapsed = project.collapsed;
-        const row_h = theme.scaledUi(28.0);
-        const action_w = theme.scaledUi(32.0);
-        const action_gap = theme.scaledUi(2.0);
-        const action_cluster_w = action_w * 2.0 + action_gap;
-        const row_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w - action_cluster_w - theme.scaledUi(6.0), .h = row_h };
+        // Only the selected workspace expands. Other workspaces stay one
+        // header row tall — their live panes surface through the cluster
+        // above — so the tree never buries the active workspace under idle
+        // pane lists and rail height keeps tracking activity.
+        const effective_collapsed = project.collapsed or !selected;
+        const row_h = theme.scaledUi(30.0);
+        const group_top = y;
+        // Full-width row: the hover zone covers the trailing action cluster so
+        // moving onto the hover-revealed icons doesn't clear the row hover.
+        const row_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w, .h = row_h };
         const project_visible = rowVisible(row_rect, list_clip);
         const project_hovered = state.sidebar_project_hover == project_index;
         if (project_visible) {
-            if (selected) {
-                // Darker than the sidebar panel itself (matches the chat
-                // transcript's CHAT_BLACK) plus a muted border so the active
-                // workspace reads as a recessed card.
-                state.palette_overlay_batch.panel(
-                    state.allocator,
-                    snapRect(row_rect),
-                    paletteColor(theme.background()),
-                    paletteColor(theme.COLOR_PANEL_MUTED),
-                    theme.scaledUi(6.0),
-                    theme.scaledUi(1.0),
-                ) catch {};
-            } else if (project_hovered) {
-                queuePaletteRoundedRect(state, row_rect, paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 180)), theme.scaledUi(6.0));
+            if (project_hovered and !selected) {
+                queuePaletteRoundedRect(state, snapRect(row_rect), paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 180)), theme.scaledUi(6.0));
             }
+            addPaletteHit(row_rect, .workspace_row, project_index, 0);
         }
-        if (project_visible) addPaletteHit(row_rect, .workspace_row, project_index, 0);
 
         const cy = y + row_h * 0.5;
-        // Inset the chevron from the bordered row's left edge so the chevron
-        // visually centers within the card rather than hugging the border.
-        var tx = x + theme.scaledUi(14.0);
+        var tx = x + theme.scaledUi(6.0);
         const chevron_color: [4]f32 = if (selected or project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE;
-        if (project_visible) queuePaletteChevron(state, tx, cy, chevron_color, collapsed);
+        if (project_visible) queuePaletteChevron(state, tx, cy, chevron_color, effective_collapsed);
         // Chevron renders into a ~14px wide cell — leave room before the
         // folder icon so the arrow doesn't crowd the project title.
         tx += theme.scaledUi(18.0);
         if (project_visible) queuePaletteFolderIcon(state, tx, cy, theme.scaledUi(14.0), theme.scaledUi(10.0), if (selected) theme.COLOR_SECONDARY_GREEN else if (project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE, selected);
         tx += theme.scaledUi(20.0);
+
+        // Trailing action cluster (new chat, new terminal, history) renders
+        // only on hover/selection to keep quiet rows quiet, but its width is
+        // always reserved so the workspace label never reflows on hover.
+        const action_w = theme.scaledUi(30.0);
+        const action_gap = theme.scaledUi(2.0);
+        const action_cluster_w = action_w * 3.0 + action_gap * 2.0;
+        const show_actions = selected or project_hovered;
+        const content_right = row_rect.x + row_rect.w - action_cluster_w - theme.scaledUi(6.0);
         const badge_label = herdrRuntimeBadgeLabel(project);
         const badge_w = theme.scaledUi(SIDEBAR_HERDR_BADGE_W_CSS);
         const badge_gap = theme.scaledUi(6.0);
-        const label_right = if (badge_label != null) row_rect.x + row_rect.w - badge_w - badge_gap else row_rect.x + row_rect.w;
-        if (project_visible) queuePaletteText(state, .{ .x = tx, .y = y + theme.scaledUi(4.0), .w = @max(label_right - tx, theme.scaledUi(24.0)), .h = row_h }, project.label, paletteColor(if (selected or project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), row_rect);
+        const label_right = if (badge_label != null) content_right - badge_w - badge_gap else content_right;
+        if (project_visible) queuePaletteText(state, .{ .x = tx, .y = y + theme.scaledUi(5.0), .w = @max(label_right - tx, theme.scaledUi(24.0)), .h = row_h }, project.label, paletteColor(if (selected or project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), row_rect);
         if (project_visible) {
             if (badge_label) |label| {
-                renderHerdrRuntimeBadge(state, .{ .x = row_rect.x + row_rect.w - badge_w, .y = y + theme.scaledUi(5.0), .w = badge_w, .h = row_h - theme.scaledUi(10.0) }, label, selected or project_hovered, row_rect);
+                renderHerdrRuntimeBadge(state, .{ .x = content_right - badge_w, .y = y + theme.scaledUi(6.0), .w = badge_w, .h = row_h - theme.scaledUi(12.0) }, label, selected or project_hovered, row_rect);
             }
         }
-        // Adjacent, independently-hovered actions make chat and terminal pane
-        // creation equally discoverable without turning them into one control.
-        const action_x = rect.x + rect.w - pad_x - action_cluster_w;
-        const new_rect: palette.Rect = .{ .x = action_x, .y = y, .w = action_w, .h = row_h };
-        const terminal_rect: palette.Rect = .{ .x = action_x + action_w + action_gap, .y = y, .w = action_w, .h = row_h };
-        const new_hovered = state.sidebar_new_thread_hover == project_index;
-        const terminal_hovered = terminal_action_hovered == project_index;
-        if (project_visible) {
-            renderPaletteSidebarActionIcon(state, new_rect, NF_COD_EDIT, new_hovered, list_clip);
+        if (project_visible and show_actions) {
+            const action_x = row_rect.x + row_rect.w - action_cluster_w;
+            const new_rect: palette.Rect = .{ .x = action_x, .y = y, .w = action_w, .h = row_h };
+            const terminal_rect: palette.Rect = .{ .x = action_x + action_w + action_gap, .y = y, .w = action_w, .h = row_h };
+            const history_rect: palette.Rect = .{ .x = action_x + (action_w + action_gap) * 2.0, .y = y, .w = action_w, .h = row_h };
+            renderPaletteSidebarActionIcon(state, new_rect, NF_COD_EDIT, state.sidebar_new_thread_hover == project_index, list_clip);
             addPaletteHit(new_rect, .new_thread, project_index, 0);
-            renderPaletteSidebarActionIcon(state, terminal_rect, NF_COD_TERMINAL, terminal_hovered, list_clip);
+            renderPaletteSidebarActionIcon(state, terminal_rect, NF_COD_TERMINAL, terminal_action_hovered == project_index, list_clip);
             addPaletteHit(terminal_rect, .new_terminal, project_index, 0);
+            renderPaletteSidebarActionIcon(state, history_rect, NF_COD_HISTORY, history_action_hovered == project_index, list_clip);
+            addPaletteHit(history_rect, .history, project_index, 0);
         }
         y += row_h + theme.scaledUi(4.0);
 
-        if (!collapsed) {
+        if (!effective_collapsed) {
             y = renderOpenPanesSection(state, project_index, project, x, rail_w, list_clip, clip, y);
-            y = renderHistoryRow(state, project_index, project, x, rail_w, list_clip, clip, y);
-        } else {
-            y = renderAttentionPanesSection(state, project_index, project, x, rail_w, list_clip, clip, y);
+        }
+
+        // 3px accent bar spanning the active workspace group — mirrors the
+        // collapsed rail's selected-chip bar so both rails share one selection
+        // cue. Clamped to the list band so it never bleeds into the pinned
+        // header/footer strips while scrolled.
+        if (selected) {
+            const bar_top = @max(group_top + theme.scaledUi(4.0), list_clip.y);
+            const bar_bottom = @min(y - theme.scaledUi(4.0), list_clip.y + list_clip.h);
+            if (bar_bottom - bar_top > theme.scaledUi(4.0)) {
+                queuePaletteRoundedRect(state, .{
+                    .x = rect.x + theme.scaledUi(2.0),
+                    .y = bar_top,
+                    .w = theme.scaledUi(3.0),
+                    .h = bar_bottom - bar_top,
+                }, paletteColor(theme.COLOR_SECONDARY_GREEN), theme.scaledUi(1.5));
+            }
         }
         y += theme.scaledUi(8.0);
     }
@@ -842,17 +877,59 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
 
     // Pinned header — painted last so any scrolled rows in the header band
     // are covered by the panel-colored strip before the chrome paints on top.
+    // A single compact row: logo mark, then add-workspace and collapse
+    // controls right-aligned.
     queuePaletteRect(state, .{ .x = rect.x, .y = rect.y, .w = rect.w - theme.scaledUi(1.0), .h = list_top - rect.y }, paletteColor(theme.COLOR_PANEL));
-    queuePaletteLogoMark(state, .{ .x = x, .y = header_top, .w = theme.scaledUi(42.0), .h = theme.scaledUi(42.0) });
-    queuePaletteText(state, .{ .x = x + theme.scaledUi(54.0), .y = header_top + theme.scaledUi(4.0), .w = theme.scaledUi(130.0), .h = theme.scaledUi(38.0) }, "verde", paletteColor(theme.COLOR_WHITE), theme.heading_font_size, rect);
+    const logo = theme.scaledUi(28.0);
+    queuePaletteLogoMark(state, .{ .x = x, .y = header_top + (header_h - logo) * 0.5, .w = logo, .h = logo });
 
-    const toggle_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - theme.scaledUi(28.0), .y = header_top + theme.scaledUi(6.0), .w = theme.scaledUi(28.0), .h = theme.scaledUi(28.0) };
+    const btn_w = theme.scaledUi(28.0);
+    const toggle_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - btn_w, .y = header_top + (header_h - btn_w) * 0.5, .w = btn_w, .h = btn_w };
     renderPaletteSidebarToggle(state, toggle_rect, true);
-
-    queuePaletteText(state, .{ .x = x, .y = projects_label_y, .w = theme.scaledUi(150.0), .h = theme.scaledUi(24.0) }, "WORKSPACES", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(16.0), rect);
-    const add_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - theme.scaledUi(28.0), .y = projects_label_y - theme.scaledUi(2.0), .w = theme.scaledUi(28.0), .h = theme.scaledUi(28.0) };
+    const add_rect: palette.Rect = .{ .x = toggle_rect.x - btn_w - theme.scaledUi(4.0), .y = toggle_rect.y, .w = btn_w, .h = btn_w };
     renderPaletteSidebarActionIcon(state, add_rect, NF_COD_ADD, null, rect);
     addPaletteHit(add_rect, .add_workspace, 0, 0);
+}
+
+/// Cross-workspace "ACTIVE" cluster at the top of the expanded list: every
+/// working/waiting/error pane outside the selected workspace, tagged with its
+/// workspace initial. This generalizes the collapsed rail's punch-through so
+/// other workspaces' live activity stays visible while their subtrees stay
+/// compact; the selected workspace's own panes render in its group below.
+fn renderAttentionClusterSection(
+    state: *runtime.AppState,
+    x: f32,
+    rail_w: f32,
+    list_clip: palette.Rect,
+    clip: palette.Rect,
+    y_in: f32,
+) f32 {
+    var y = y_in;
+    var any = false;
+    var project_index: usize = 0;
+    while (project_index < state.projects.items.len) : (project_index += 1) {
+        if (project_index == state.selected_project_index) continue;
+        const project = &state.projects.items[project_index];
+        for (project.workspace_layout.panes.items) |*pane| {
+            if (!paneNeedsAttention(state, project_index, project, pane)) continue;
+            if (!any) {
+                any = true;
+                const label_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w, .h = theme.scaledUi(18.0) };
+                if (rowVisible(label_rect, list_clip)) queuePaletteText(state, label_rect, "ACTIVE", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), clip);
+                y += theme.scaledUi(20.0);
+            }
+            const row_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w, .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS) };
+            if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip, true);
+            y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
+        }
+    }
+    if (any) {
+        // Hairline divider separates the live board from the workspace tree.
+        const divider_rect: palette.Rect = .{ .x = x, .y = y + theme.scaledUi(2.0), .w = rail_w, .h = theme.scaledUi(1.0) };
+        if (rowVisible(divider_rect, list_clip)) queuePaletteRect(state, divider_rect, paletteColor(theme.borderMuted()));
+        y += theme.scaledUi(12.0);
+    }
+    return y;
 }
 
 fn herdrRuntimeBadgeLabel(project: *const native_state.Project) ?[]const u8 {
@@ -1203,9 +1280,11 @@ fn queuePaletteRect(state: *runtime.AppState, rect: palette.Rect, color: palette
     };
 }
 
-/// Renders the live "OPEN" list of a workspace's layout panes (chat / terminal
-/// / browser) above the saved-chats history, so every pane kind is visible and
-/// directly focusable from the sidebar. Returns the advanced y cursor.
+/// Renders the live list of a workspace's layout panes (chat / terminal /
+/// browser), so every pane kind is visible and directly focusable from the
+/// sidebar. Indentation alone carries the grouping — the old "OPEN" section
+/// label repeated per workspace without adding information. Returns the
+/// advanced y cursor.
 fn renderOpenPanesSection(
     state: *runtime.AppState,
     project_index: usize,
@@ -1220,24 +1299,25 @@ fn renderOpenPanesSection(
     const layout = &project.workspace_layout;
     if (layout.panes.items.len == 0) return y;
 
-    const label_rect: palette.Rect = .{ .x = x + theme.scaledUi(24.0), .y = y, .w = rail_w - theme.scaledUi(24.0), .h = theme.scaledUi(20.0) };
-    if (rowVisible(label_rect, list_clip)) queuePaletteText(state, label_rect, "OPEN", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), clip);
-    y += theme.scaledUi(22.0);
-
+    const indent = theme.scaledUi(SIDEBAR_ROW_INDENT_CSS);
     for (layout.panes.items) |*pane| {
         const row_rect: palette.Rect = .{
-            .x = x + theme.scaledUi(24.0),
+            .x = x + indent,
             .y = y,
-            .w = rail_w - theme.scaledUi(42.0),
+            .w = rail_w - indent,
             .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS),
         };
-        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip);
+        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip, false);
         y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
     }
-    y += theme.scaledUi(6.0);
+    y += theme.scaledUi(4.0);
     return y;
 }
 
+/// Renders one live pane row: provider glyph, truncated title, and a trailing
+/// status column ("Working · m:ss" / "Waiting" / "Failed"). With
+/// `show_workspace_tag` (attention-cluster rows) a small workspace-initial
+/// chip leads the row so cross-workspace rows stay attributable.
 fn renderOpenPaneRow(
     state: *runtime.AppState,
     project_index: usize,
@@ -1245,6 +1325,7 @@ fn renderOpenPaneRow(
     pane: *const native_state.WorkspacePane,
     rect: palette.Rect,
     clip: palette.Rect,
+    show_workspace_tag: bool,
 ) void {
     const layout = &project.workspace_layout;
     const focused = state.selected_project_index == project_index and layout.focused_pane_id == pane.id;
@@ -1258,8 +1339,30 @@ fn renderOpenPaneRow(
 
     const dim = pane.minimized;
     const cy = rect.y + rect.h * 0.5;
-    const icon_x = rect.x + theme.scaledUi(SIDEBAR_THREAD_ICON_LEADING_PAD_CSS);
+    var icon_x = rect.x + theme.scaledUi(SIDEBAR_THREAD_ICON_LEADING_PAD_CSS);
+    var title_left = theme.scaledUi(SIDEBAR_THREAD_ICON_LEADING_PAD_CSS + SIDEBAR_THREAD_PROVIDER_GLYPH_CSS + SIDEBAR_THREAD_ICON_TITLE_GAP_CSS);
     const muted = if (dim) theme.COLOR_TEXT_SUBTLE else theme.COLOR_TEXT_MUTED;
+
+    if (show_workspace_tag) {
+        // Workspace-initial chip mirrors the collapsed rail's avatar mark so
+        // cross-workspace rows reuse an already-learned identity cue.
+        const chip = theme.scaledUi(18.0);
+        const chip_rect: palette.Rect = .{ .x = rect.x + theme.scaledUi(4.0), .y = cy - chip * 0.5, .w = chip, .h = chip };
+        queuePaletteRoundedRect(state, chip_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(5.0));
+        var letter_buf: [1]u8 = undefined;
+        const letter = workspaceInitial(&letter_buf, project.label);
+        const letter_font = theme.scaledUi(10.0);
+        const letter_w = letter_font * 0.6;
+        queuePaletteText(state, .{
+            .x = @round(chip_rect.x + (chip - letter_w) * 0.5),
+            .y = @round(chip_rect.y + (chip - letter_font * 1.25) * 0.5),
+            .w = letter_w + theme.scaledUi(3.0),
+            .h = letter_font * 1.25,
+        }, letter, paletteColor(theme.COLOR_TEXT_MUTED), letter_font, clip);
+        const shift = chip + theme.scaledUi(8.0);
+        icon_x += shift;
+        title_left += shift;
+    }
 
     // Backing storage for the terminal pane's live tab title and the foreground
     // process name used for provider detection; must outlive the render below,
@@ -1269,6 +1372,9 @@ fn renderOpenPaneRow(
     var title: []const u8 = "";
     var running = false;
     var status: ?native_state.SurfaceStatus = null;
+    // Unix ms when the pane's live work began, when known; drives the elapsed
+    // portion of the status label.
+    var status_started_at_ms: ?i64 = null;
     switch (pane.ref) {
         .chat => |ref| {
             if (ref.thread_index < project.threads.items.len) {
@@ -1276,6 +1382,7 @@ fn renderOpenPaneRow(
                 queuePaletteProviderGlyph(state, thread.provider, icon_x, cy, clip);
                 title = thread.title;
                 running = thread.isSendPendingForUi();
+                if (running) status_started_at_ms = thread.sendStartedAtMsForUi();
             } else {
                 queuePaletteChatBubbleIcon(state, icon_x, cy, muted);
                 title = "Chat";
@@ -1285,7 +1392,10 @@ fn renderOpenPaneRow(
             const surface = state.projectTerminalSurface(project_index, ref.dock_id);
             if (surface) |s| {
                 status = s.status;
-                if (s.status == .working) running = true;
+                if (s.status == .working) {
+                    running = true;
+                    if (s.status_changed_at_ms > 0) status_started_at_ms = s.status_changed_at_ms;
+                }
             }
             // Detect a running agent (Claude/Codex/Amp/etc.) from the surface
             // provider or the foreground process name, and draw a split
@@ -1331,9 +1441,14 @@ fn renderOpenPaneRow(
         },
     }
 
-    const title_left_css = SIDEBAR_THREAD_ICON_LEADING_PAD_CSS + SIDEBAR_THREAD_PROVIDER_GLYPH_CSS + SIDEBAR_THREAD_ICON_TITLE_GAP_CSS;
+    // Status label computed before truncation so the title only surrenders
+    // width while a label is actually present.
+    var status_buf: [24]u8 = undefined;
+    const status_label = paneStatusLabelText(&status_buf, status, running, status_started_at_ms);
+    const status_reserve = if (status_label.len > 0) theme.scaledUi(SIDEBAR_STATUS_COLUMN_CSS) else theme.scaledUi(14.0);
+
     var title_buf = std.mem.zeroes([64:0]u8);
-    const title_chars: usize = @intFromFloat(@max((rect.w - theme.scaledUi(title_left_css + SIDEBAR_THREAD_TIME_COLUMN_CSS)) / theme.scaledUi(7.0), 8.0));
+    const title_chars: usize = @intFromFloat(@max((rect.w - title_left - status_reserve) / theme.scaledUi(7.0), 8.0));
     const shown = truncatedThreadTitle(&title_buf, title, title_chars);
 
     const emphasis = focused or hovered;
@@ -1349,23 +1464,67 @@ fn renderOpenPaneRow(
     const title_font = theme.scaledUi(13.5);
     const title_line = title_font * 1.30;
     queuePaletteText(state, .{
-        .x = rect.x + theme.scaledUi(title_left_css),
+        .x = rect.x + title_left,
         .y = @round(rect.y + (rect.h - title_line) * 0.5),
-        .w = rect.w - theme.scaledUi(title_left_css + 12.0),
+        .w = rect.w - title_left - theme.scaledUi(12.0),
         .h = title_line,
     }, shown, paletteColor(title_color), title_font, clip);
 
+    // Trailing status column: pulsing pip plus the status text in the same
+    // color. The at-a-glance words/elapsed-time are what the expanded rail
+    // offers over the collapsed rail's bare dots.
     if (paneStatusColor(status, running)) |pip_color| {
-        const animated = running or (if (status) |s| s == .waiting else false);
+        const animated = running or (if (status) |s| s == .working or s == .waiting else false);
         const pulse: f32 = if (animated) attentionPulse(state) else 1.0;
-        const dot = theme.scaledUi(7.0);
+        const dot = theme.scaledUi(6.0);
+        const status_font = theme.scaledUi(11.0);
+        // Approximate right-alignment with the same per-char width heuristic
+        // the title truncation uses; labels are short and near-uniform.
+        const est_w = @as(f32, @floatFromInt(status_label.len)) * status_font * 0.54;
+        const label_x = rect.x + rect.w - theme.scaledUi(10.0) - est_w;
         queuePaletteRoundedRect(state, .{
-            .x = rect.x + rect.w - theme.scaledUi(15.0),
+            .x = label_x - dot - theme.scaledUi(6.0),
             .y = cy - dot * 0.5,
             .w = dot,
             .h = dot,
         }, paletteColor(theme.withAlpha(pip_color, @intFromFloat(pulse * 255.0))), dot * 0.5);
+        if (status_label.len > 0) {
+            queuePaletteText(state, .{
+                .x = label_x,
+                .y = @round(cy - status_font * 0.65),
+                .w = est_w + theme.scaledUi(8.0),
+                .h = status_font * 1.3,
+            }, status_label, paletteColor(pip_color), status_font, clip);
+        }
     }
+}
+
+/// Formats a pane row's live status label; empty when the pane is quiet.
+/// Working panes show elapsed time ("Working · 1:20", or "h:mm:ss" once the
+/// word no longer fits alongside an hours-long timer).
+fn paneStatusLabelText(buf: []u8, status: ?native_state.SurfaceStatus, running: bool, started_at_ms: ?i64) []const u8 {
+    const working = running or (if (status) |s| s == .working else false);
+    if (working) {
+        if (started_at_ms) |start| {
+            if (start > 0) {
+                const total_seconds: u64 = @intCast(@max(@divTrunc(unixTimestampMs() - start, std.time.ms_per_s), 0));
+                const hours = total_seconds / 3600;
+                const minutes = (total_seconds / 60) % 60;
+                const seconds = total_seconds % 60;
+                if (hours > 0) return std.fmt.bufPrint(buf, "{d}:{d:0>2}:{d:0>2}", .{ hours, minutes, seconds }) catch "Working";
+                return std.fmt.bufPrint(buf, "Working · {d}:{d:0>2}", .{ minutes, seconds }) catch "Working";
+            }
+        }
+        return "Working";
+    }
+    if (status) |s| {
+        return switch (s) {
+            .waiting => "Waiting",
+            .@"error" => "Failed",
+            else => "",
+        };
+    }
+    return "";
 }
 
 fn openPaneChatThreadIndex(state: *const runtime.AppState, project_index: usize, pane_id: native_state.WorkspacePaneId) ?usize {
@@ -1379,78 +1538,7 @@ fn openPaneChatThreadIndex(state: *const runtime.AppState, project_index: usize,
     };
 }
 
-/// Quiet per-workspace "History · N" trailing row. The saved-thread list
-/// itself lives in the command palette (this row opens it scoped to the
-/// workspace); the rail only tracks live panes.
-fn renderHistoryRow(
-    state: *runtime.AppState,
-    project_index: usize,
-    project: *native_state.Project,
-    x: f32,
-    rail_w: f32,
-    list_clip: palette.Rect,
-    clip: palette.Rect,
-    y_in: f32,
-) f32 {
-    var y = y_in;
-    const row_rect: palette.Rect = .{
-        .x = x + theme.scaledUi(24.0),
-        .y = y,
-        .w = rail_w - theme.scaledUi(42.0),
-        .h = theme.scaledUi(28.0),
-    };
-    if (rowVisible(row_rect, list_clip)) {
-        const hovered = state.palette_mouse_in_workspace and rectContainsPoint(row_rect, state.palette_mouse_x, state.palette_mouse_y);
-        if (hovered) {
-            queuePaletteRoundedRect(state, snapRect(row_rect), paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 180)), theme.scaledUi(7.0));
-        }
-        addPaletteHit(row_rect, .history, project_index, 0);
-        var label_buf: [40]u8 = undefined;
-        const count = project.committedThreadCountCached(state.allocator);
-        const label = std.fmt.bufPrint(&label_buf, "History · {d}", .{count}) catch "History";
-        const font_size = theme.scaledUi(12.5);
-        queuePaletteText(state, .{
-            .x = row_rect.x + theme.scaledUi(10.0),
-            .y = row_rect.y + (row_rect.h - font_size * 1.3) * 0.5,
-            .w = row_rect.w - theme.scaledUi(20.0),
-            .h = font_size * 1.3,
-        }, label, paletteColor(if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE), font_size, clip);
-    }
-    y += theme.scaledUi(30.0);
-    return y;
-}
-
-/// Collapsed workspaces hide quiet panes but punch attention panes through
-/// as compact rows, so the rail reads as a live status board: its height
-/// tracks activity, never history or pane count. Idle collapsed workspaces
-/// stay one header line tall.
-fn renderAttentionPanesSection(
-    state: *runtime.AppState,
-    project_index: usize,
-    project: *const native_state.Project,
-    x: f32,
-    rail_w: f32,
-    list_clip: palette.Rect,
-    clip: palette.Rect,
-    y_in: f32,
-) f32 {
-    var y = y_in;
-    const layout = &project.workspace_layout;
-    for (layout.panes.items) |*pane| {
-        if (!paneNeedsAttention(state, project_index, project, pane)) continue;
-        const row_rect: palette.Rect = .{
-            .x = x + theme.scaledUi(24.0),
-            .y = y,
-            .w = rail_w - theme.scaledUi(42.0),
-            .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS),
-        };
-        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip);
-        y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
-    }
-    return y;
-}
-
-/// True when a pane should punch through a collapsed workspace row: chat
+/// True when a pane should punch through to the attention cluster: chat
 /// sends in flight, or terminal surfaces working/waiting/errored (or flagged
 /// for attention/unread by hooks). `done`/idle panes stay hidden so finished
 /// work stops occupying the rail once it has nothing new to report.
@@ -1578,6 +1666,7 @@ const NF_COD_ADD = "\u{EA60}";
 const NF_COD_EDIT = "\u{EA73}";
 const NF_COD_GEAR = "\u{EB51}";
 const NF_COD_TERMINAL = "\u{EA85}";
+const NF_COD_HISTORY = "\u{EA82}";
 // Panel-style sidebar toggle (VS Code's layout-sidebar-left): filled left pane
 // while the rail is expanded, hollow "off" variant while collapsed.
 const NF_COD_LAYOUT_SIDEBAR_LEFT = "\u{EBF3}";

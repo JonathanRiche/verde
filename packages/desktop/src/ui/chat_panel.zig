@@ -378,10 +378,12 @@ fn estimateWorkspaceOriginX(state: *app_state.AppState, workspace_width: f32) f3
     var i: usize = 0;
     while (i < 8) : (i += 1) {
         const total_width = workspace_width + sidebar_width;
+        // Mirror computeRootLayout's expanded-rail ratio/clamps so the
+        // estimated workspace origin stays in sync with the real layout.
         sidebar_width = if (state.isSidebarCollapsed())
             theme.clampf(total_width * 0.07, theme.scaledUi(60.0), theme.scaledUi(76.0))
         else
-            theme.clampf(total_width * 0.235, theme.scaledUi(230.0), @min(theme.scaledUi(360.0), total_width * 0.38));
+            theme.clampf(total_width * 0.19, theme.scaledUi(260.0), @min(theme.scaledUi(360.0), total_width * 0.32));
     }
     return sidebar_width;
 }

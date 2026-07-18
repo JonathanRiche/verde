@@ -168,7 +168,10 @@ fn computeRootLayout(state: *runtime.AppState, width: f32, height: f32) RootLayo
     else if (width < theme.scaledUi(900.0))
         theme.clampf(width * 0.34, theme.scaledUi(180.0), theme.scaledUi(240.0))
     else
-        theme.clampf(width * 0.235, theme.scaledUi(300.0), @min(theme.scaledUi(465.0), width * 0.38));
+        // The compacted rail (tight padding, no History rows, hover-only
+        // actions, ~96px status column) reads comfortably well below the old
+        // 465px cap; keep width for the workspace panes instead.
+        theme.clampf(width * 0.19, theme.scaledUi(260.0), @min(theme.scaledUi(360.0), width * 0.32));
 
     const hidden = state.isSidebarHidden();
     const target_sidebar_x = if (hidden and !state.isSidebarHoverRevealed()) -target_sidebar_width else 0.0;
