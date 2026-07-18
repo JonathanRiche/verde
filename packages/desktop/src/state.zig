@@ -10611,38 +10611,95 @@ pub const AppState = struct {
 
     pub fn currentComposerReasoningLabel(self: *const AppState) []const u8 {
         const thread = self.currentThread();
-        if (self.composerReasoningIndexForThread(thread)) |index| {
-            if (thread.provider == .codex) {
+        if (thread.provider == .codex) {
+            if (self.composerReasoningIndexForThread(thread)) |index| {
                 if (index < CODEX_REASONING_OPTIONS.len) return std.mem.sliceTo(CODEX_REASONING_OPTIONS[index].label, 0);
-            } else {
-                const rows = self.opencode_reasoning_menu.items;
-                if (index < rows.len) return std.mem.sliceTo(rows[index].label, 0);
             }
         }
+        // Menu-independent for the other providers: the shared reasoning menu
+        // tracks the focused thread only, so unfocused pane previews must
+        // label from the thread's own fields. Matches the menu rows' labels
+        // for the focused thread (they are built from the same values).
         if (thread.reasoning_effort) |effort| return reasoningEffortDisplayLabel(effort);
-        if (thread.opencode_reasoning_variant) |variant| return std.mem.sliceTo(variant, 0);
+        if (thread.opencode_reasoning_variant) |variant| {
+            const raw = std.mem.sliceTo(variant, 0);
+            return if (thread.provider == .cursor) cursorReasoningValueLabel(raw) else raw;
+        }
         return "Default";
     }
 
     /// Whether the run summary carries a reasoning-level segment; keeps the
     /// summary builder and the chat panel's glyph-slot ordering in sync.
     pub fn currentComposerShowsReasoningSegment(self: *const AppState) bool {
-        return self.currentThread().provider == .codex or self.opencode_reasoning_menu.items.len > 0;
+        return self.threadReasoningGauge(self.currentThread()) != null;
+    }
+
+    /// Position/count of `thread`'s reasoning level within the same row list
+    /// `refreshOpencodeReasoningMenu` would build for it (leading "Default"
+    /// row included). Derived from the thread's own provider/model
+    /// capabilities — NOT the shared popover menu, which only tracks the
+    /// focused thread — so unfocused pane previews summarize correctly. Null
+    /// when the provider/model exposes no reasoning levels.
+    const ReasoningGauge = struct { index: usize, count: usize };
+
+    fn threadReasoningGauge(self: *const AppState, thread: *const ChatThread) ?ReasoningGauge {
+        switch (thread.provider) {
+            .codex => return .{
+                .index = composerReasoningIndexForOptions(CODEX_REASONING_OPTIONS[0..], thread.reasoning_effort) orelse 0,
+                .count = CODEX_REASONING_OPTIONS.len,
+            },
+            .claude => {
+                const opt = self.claudeModelOptionForRef(thread.model_ref) orelse return null;
+                if (!opt.reasoning_supported) return null;
+                const values = opt.claude_effort_values orelse CLAUDE_STANDARD_EFFORT_VALUES[0..];
+                var count: usize = 1; // leading "Default" row
+                var index: usize = 0;
+                for (values) |value| {
+                    const effort = parseReasoningEffort(value) orelse continue;
+                    if (thread.reasoning_effort) |selected| {
+                        if (selected == effort) index = count;
+                    }
+                    count += 1;
+                }
+                if (count <= 1) return null;
+                return .{ .index = index, .count = count };
+            },
+            .opencode => {
+                const opt = self.opencodeModelOptionForRef(thread.model_ref) orelse return null;
+                if (!opt.reasoning_supported) return null;
+                const keys = opt.reasoning_variant_keys orelse return null;
+                if (keys.len == 0) return null;
+                var index: usize = 0;
+                for (keys, 0..) |key, i| {
+                    if (thread.opencode_reasoning_variant) |variant| {
+                        if (std.mem.eql(u8, std.mem.sliceTo(variant, 0), std.mem.sliceTo(key, 0))) index = i + 1;
+                    }
+                }
+                return .{ .index = index, .count = keys.len + 1 };
+            },
+            .cursor => {
+                const opt = self.cursorModelOptionForRef(thread.model_ref) orelse return null;
+                const values = opt.cursor_reasoning_values orelse return null;
+                if (values.len == 0) return null;
+                var index: usize = 0;
+                for (values, 0..) |value, i| {
+                    if (thread.opencode_reasoning_variant) |variant| {
+                        if (std.mem.eql(u8, std.mem.sliceTo(variant, 0), std.mem.sliceTo(value, 0))) index = i + 1;
+                    }
+                }
+                return .{ .index = index, .count = values.len + 1 };
+            },
+        }
     }
 
     /// 0..1 gauge for the run pill's brain glyph: position of the selected
-    /// reasoning level within the provider's ordered menu. (index+1)/count so
-    /// the lowest level keeps a visible sliver instead of an empty silhouette;
-    /// single-level (or unknown) menus read as full.
+    /// reasoning level within the provider's ordered level list.
+    /// (index+1)/count so the lowest level keeps a visible sliver instead of
+    /// an empty silhouette; single-level (or unknown) lists read as full.
     pub fn currentComposerReasoningFillRatio(self: *const AppState) f32 {
-        const thread = self.currentThread();
-        const count: usize = if (thread.provider == .codex)
-            CODEX_REASONING_OPTIONS.len
-        else
-            self.opencode_reasoning_menu.items.len;
-        if (count <= 1) return 1.0;
-        const index = self.composerReasoningIndexForThread(thread) orelse return 1.0;
-        return @as(f32, @floatFromInt(@min(index, count - 1) + 1)) / @as(f32, @floatFromInt(count));
+        const gauge = self.threadReasoningGauge(self.currentThread()) orelse return 1.0;
+        if (gauge.count <= 1) return 1.0;
+        return @as(f32, @floatFromInt(@min(gauge.index, gauge.count - 1) + 1)) / @as(f32, @floatFromInt(gauge.count));
     }
 
     pub fn currentComposerShowsFastToggle(self: *const AppState) bool {
