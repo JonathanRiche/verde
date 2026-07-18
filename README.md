@@ -301,6 +301,7 @@ verde live workspace select --project <id|index|path|current> [--json]
 verde live workspace create --path /path/to/project [--json]
 verde live workspace rename --project <id|index|path|current> --label "New name" [--json]
 verde live workspace archive --project <id|index|path|current> [--json]
+verde live chat open --workspace <id|index|path> --provider cursor [--model <id>] [--json]
 ```
 
 - `capabilities` prints the live method list without requiring the app to be
@@ -429,6 +430,12 @@ click or type by CSS selector, and return screenshots as MCP image content.
 Potentially sensitive clicks, password entry, and form submission require an
 explicit confirmed retry so the agent client can ask the user first.
 
+The MCP bridge also advertises `open_chat`. It requires `workspace_id` and one
+of the native GUI providers (`opencode`, `codex`, `claude`, or `cursor`), with
+optional `model`, `target_pane_id`, `axis`, and `focus` arguments. This is
+separate from terminal/TUI agent opening and never requires compositor or mouse
+automation.
+
 ### Workspace Control
 
 Workspace commands mutate the project rail and return the updated workspace
@@ -480,6 +487,7 @@ Chat commands resolve the target pane to its backing chat thread. They use the
 same draft, composer, send, stop, and approval paths as the UI.
 
 ```bash
+verde live chat open --workspace <id|index|path> --provider opencode|codex|claude|cursor [--model <id>] [--pane <pane-id>] [--axis horizontal|vertical] [--no-focus] [--json]
 verde live chat status --pane <pane-id> [--json]
 verde live chat status --focused [--json]
 verde live chat transcript --pane <pane-id> [--json]
@@ -493,6 +501,12 @@ verde live chat approve --pane <pane-id> --decision approve [--json]
 verde live chat approve --pane <pane-id> --decision deny [--json]
 ```
 
+- `open` atomically creates a fresh native GUI thread and chat pane in the
+  explicitly supplied workspace. It validates the provider/model combination
+  before changing the workspace, defaults to the provider's current model and
+  the workspace's focused pane, and focuses the new workspace/pane unless
+  `--no-focus` is passed. The result includes stable `workspace_id`, `pane_id`,
+  `thread_id`, `provider`, and `model` fields.
 - `status` returns thread title, provider, model, message count, send state, and
   pending approval status.
 - `transcript` returns persisted messages for the pane's thread.

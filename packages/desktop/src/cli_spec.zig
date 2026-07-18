@@ -136,6 +136,7 @@ pub const live_capabilities = [_][]const u8{
     "pane.maximize",
     "pane.restore",
     "pane.close",
+    "chat.open",
     "chat.status",
     "chat.transcript",
     "chat.draft.set",
@@ -221,6 +222,7 @@ pub const workspace_commands = [_][]const u8{
 };
 
 pub const chat_commands = [_][]const u8{
+    "open",
     "status",
     "transcript",
     "draft",
@@ -290,6 +292,7 @@ pub const all_flags = [_][]const u8{
     "--thread",
     "--pane",
     "--focused",
+    "--no-focus",
     "--kind",
     "--axis",
     "--first",
@@ -322,6 +325,7 @@ pub const all_flags = [_][]const u8{
     "--decision",
     "--name",
     "--provider",
+    "--model",
     "--lines",
     "--script",
     "--json-payload",
@@ -352,6 +356,7 @@ pub const workspace_rename_flags = [_][]const u8{ "--workspace", "--project", "-
 pub const workspace_close_flags = [_][]const u8{ "--workspace", "--project", "--json" };
 pub const workspace_reopen_flags = [_][]const u8{ "--workspace", "--project", "--json" };
 pub const workspace_archive_flags = workspace_close_flags;
+pub const chat_open_flags = [_][]const u8{ "--workspace", "--project", "--provider", "--model", "--pane", "--axis", "--no-focus", "--json" };
 pub const chat_draft_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--text", "--json" };
 pub const chat_send_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--prompt", "--text", "--json" };
 pub const chat_approve_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--call", "--decision", "--json" };
@@ -372,7 +377,7 @@ pub const kind_values = [_][]const u8{ "chat", "terminal" };
 pub const axis_values = [_][]const u8{ "horizontal", "vertical" };
 pub const direction_values = [_][]const u8{ "left", "right", "up", "down" };
 pub const decision_values = [_][]const u8{ "approve", "deny" };
-pub const provider_values = [_][]const u8{"codex"};
+pub const provider_values = [_][]const u8{ "opencode", "codex", "claude", "cursor" };
 pub const inspector_mode_values = [_][]const u8{ "point", "draw-box", "draw-freeform" };
 
 pub fn shellSupported(name: []const u8) bool {
