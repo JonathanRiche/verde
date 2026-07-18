@@ -3067,7 +3067,11 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try s.beginObject();
     try s.objectField("tools");
     try s.beginArray();
-    try writeMcpTool(&s, "list_surfaces", "List live Verde terminal surfaces.");
+    try writeMcpTypedTool(&s, "list_workspaces", "List open Verde workspaces, including their ids, paths, and the desktop-selected workspace.", &.{});
+    try writeMcpTypedTool(&s, "list_panes", "List chat and terminal panes in a Verde workspace.", &.{
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
+    });
+    try writeMcpTool(&s, "list_surfaces", "List registered live terminal control surfaces. Use list_panes for ordinary Verde terminal panes.");
     try writeMcpTool(&s, "inspect_surface", "Inspect one Verde terminal surface.");
     try writeMcpTool(&s, "focus_surface", "Focus a Verde terminal surface.");
     try writeMcpTool(&s, "read_surface_screen", "Read the current screen text for a terminal surface pane.");
@@ -3075,12 +3079,30 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTool(&s, "write_surface_text", "Write text to a terminal surface pane.");
     try writeMcpTool(&s, "notify_surface", "Update terminal surface status or notification text.");
     try writeMcpTool(&s, "clear_surface_attention", "Clear terminal surface attention.");
-    try writeMcpTool(&s, "list_processes", "List configured Verde processes.");
-    try writeMcpTool(&s, "inspect_process", "Inspect a configured Verde process.");
-    try writeMcpTool(&s, "tail_process_logs", "Read recent output for a configured Verde process.");
-    try writeMcpTool(&s, "restart_process", "Restart a configured Verde process.");
-    try writeMcpTool(&s, "stop_process", "Stop a configured Verde process.");
-    try writeMcpTool(&s, "start_process", "Start a configured Verde process.");
+    try writeMcpTypedTool(&s, "list_processes", "List configured Verde processes in a workspace.", &.{
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
+    });
+    try writeMcpTypedTool(&s, "inspect_process", "Inspect a configured Verde process.", &.{
+        .{ .name = "name", .type_name = "string", .description = "Configured process name.", .required = true },
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current." },
+    });
+    try writeMcpTypedTool(&s, "tail_process_logs", "Read recent output for a configured Verde process.", &.{
+        .{ .name = "name", .type_name = "string", .description = "Configured process name.", .required = true },
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current." },
+        .{ .name = "lines", .type_name = "integer", .description = "Optional number of recent lines to return." },
+    });
+    try writeMcpTypedTool(&s, "restart_process", "Restart a configured Verde process.", &.{
+        .{ .name = "name", .type_name = "string", .description = "Configured process name.", .required = true },
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current." },
+    });
+    try writeMcpTypedTool(&s, "stop_process", "Stop a configured Verde process.", &.{
+        .{ .name = "name", .type_name = "string", .description = "Configured process name.", .required = true },
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current." },
+    });
+    try writeMcpTypedTool(&s, "start_process", "Start a configured Verde process.", &.{
+        .{ .name = "name", .type_name = "string", .description = "Configured process name.", .required = true },
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current." },
+    });
     try writeMcpTypedTool(&s, "browser_status", "Inspect the embedded browser state, URL, and last action result.", &.{});
     try writeMcpTypedTool(&s, "open_browser", "Open or move Verde's embedded browser to a URL in a workspace.", &.{
         .{ .name = "url", .type_name = "string", .description = "Optional URL to open." },
@@ -3233,6 +3255,12 @@ fn mcpToolsCall(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id
     }
 
     const response = blk: {
+        if (std.mem.eql(u8, tool_name, "list_workspaces")) {
+            break :blk sendLiveRequestAlloc(allocator, io, "workspaces", .{}, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "list_panes")) {
+            break :blk sendLiveRequestAlloc(allocator, io, "panes", .{ .workspace = workspace }, 1);
+        }
         if (std.mem.eql(u8, tool_name, "browser_status")) {
             break :blk sendLiveRequestAlloc(allocator, io, "browser.status", .{}, 1);
         }
