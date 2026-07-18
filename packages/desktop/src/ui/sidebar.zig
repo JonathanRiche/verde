@@ -6,6 +6,7 @@ const sdl = @import("zsdl3");
 const theme = @import("theme.zig");
 const colors = @import("colors.zig");
 const runtime = @import("runtime.zig");
+const command_palette = @import("command_palette.zig");
 const utils = @import("../utils.zig");
 const profiler = @import("../profiler.zig");
 const platform_runtime = @import("platform_runtime");
@@ -64,6 +65,9 @@ const SidebarHitKind = enum {
     /// Per-workspace history action icon; opens the command palette scoped to
     /// that workspace's saved threads.
     history,
+    /// Search trigger (expanded pill / collapsed icon); opens the command
+    /// palette unscoped.
+    command_palette,
     settings,
 };
 
@@ -109,6 +113,7 @@ var sidebar_menu_row_count: usize = 0;
 var settings_hovered: bool = false;
 var terminal_action_hovered: ?usize = null;
 var history_action_hovered: ?usize = null;
+var search_trigger_hovered: bool = false;
 
 const WorkspaceDragState = struct {
     pending: bool = false,
@@ -189,6 +194,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
     var new_new_thread_hover: ?usize = null;
     var new_terminal_hover: ?usize = null;
     var new_history_hover: ?usize = null;
+    var new_search_hover = false;
     var new_settings_hover = false;
     if (rectContainsPoint(palette_sidebar_rect, x, y)) {
         // Walk hits in reverse so later (visually-topmost) rows win when
@@ -211,6 +217,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
                 .history => {
                     if (!state.isSidebarCollapsed() and new_history_hover == null) new_history_hover = hit.project_index;
                 },
+                .command_palette => new_search_hover = true,
                 .settings => new_settings_hover = true,
                 else => {},
             }
@@ -221,11 +228,13 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
     const new_thread_changed = state.sidebar_new_thread_hover != new_new_thread_hover;
     const terminal_changed = terminal_action_hovered != new_terminal_hover;
     const history_changed = history_action_hovered != new_history_hover;
+    const search_changed = search_trigger_hovered != new_search_hover;
     const settings_changed = settings_hovered != new_settings_hover;
     terminal_action_hovered = new_terminal_hover;
     history_action_hovered = new_history_hover;
+    search_trigger_hovered = new_search_hover;
     settings_hovered = new_settings_hover;
-    if (!project_changed and !new_thread_changed and !terminal_changed and !history_changed and !settings_changed) return;
+    if (!project_changed and !new_thread_changed and !terminal_changed and !history_changed and !search_changed and !settings_changed) return;
 
     state.sidebar_project_hover = new_project_hover;
     state.sidebar_new_thread_hover = new_new_thread_hover;
@@ -281,6 +290,9 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                 if (hit.project_index < state.projects.items.len) {
                     state.openCommandPalette(hit.project_index);
                 }
+            },
+            .command_palette => {
+                state.openCommandPalette(null);
             },
             .settings => {
                 state.openSettingsModal();
@@ -728,7 +740,12 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     // plumbing required.
     const header_top = rect.y + theme.scaledUi(14.0);
     const header_h = theme.scaledUi(32.0);
-    const list_top = header_top + header_h + theme.scaledUi(12.0);
+    // Command-palette trigger pill sits pinned between the header row and the
+    // scrolling list, so the palette — now the only route to saved threads —
+    // keeps a visible entry point.
+    const search_h = theme.scaledUi(30.0);
+    const search_top = header_top + header_h + theme.scaledUi(10.0);
+    const list_top = search_top + search_h + theme.scaledUi(12.0);
     // Reserve a band at the bottom of the rail for sticky chrome. Clipping the
     // list short here also caps `sidebar_max_scroll_y` (computed below from
     // `list_clip.y + list_clip.h`), so the list scrolls to rest above the
@@ -759,7 +776,7 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         const project_hovered = state.sidebar_project_hover == project_index;
         if (project_visible) {
             if (project_hovered and !selected) {
-                queuePaletteRoundedRect(state, snapRect(row_rect), paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 180)), theme.scaledUi(6.0));
+                queuePaletteRoundedRect(state, snapRect(row_rect), paletteColor(theme.withAlpha(theme.COLOR_GREEN, 48)), theme.scaledUi(6.0));
             }
             addPaletteHit(row_rect, .workspace_row, project_index, 0);
         }
@@ -771,7 +788,7 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         // Chevron renders into a ~14px wide cell — leave room before the
         // folder icon so the arrow doesn't crowd the project title.
         tx += theme.scaledUi(18.0);
-        if (project_visible) queuePaletteFolderIcon(state, tx, cy, theme.scaledUi(14.0), theme.scaledUi(10.0), if (selected) theme.COLOR_SECONDARY_GREEN else if (project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE, selected);
+        if (project_visible) queuePaletteFolderIcon(state, tx, cy, theme.scaledUi(14.0), theme.scaledUi(10.0), if (selected) theme.COLOR_GREEN else if (project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE, selected);
         tx += theme.scaledUi(20.0);
 
         // Trailing action cluster (new chat, new terminal, history) renders
@@ -823,7 +840,7 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
                     .y = bar_top,
                     .w = theme.scaledUi(3.0),
                     .h = bar_bottom - bar_top,
-                }, paletteColor(theme.COLOR_SECONDARY_GREEN), theme.scaledUi(1.5));
+                }, paletteColor(theme.COLOR_GREEN), theme.scaledUi(1.5));
             }
         }
         y += theme.scaledUi(8.0);
@@ -886,6 +903,51 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     const add_rect: palette.Rect = .{ .x = toggle_rect.x - btn_w - theme.scaledUi(4.0), .y = toggle_rect.y, .w = btn_w, .h = btn_w };
     renderPaletteSidebarActionIcon(state, add_rect, NF_COD_ADD, null, rect);
     addPaletteHit(add_rect, .add_workspace, 0, 0);
+
+    renderPaletteSearchTrigger(state, .{ .x = x, .y = search_top, .w = rail_w, .h = search_h });
+}
+
+/// Pinned command-palette trigger, kept deliberately quiet: a search glyph,
+/// muted "Search" label, and the configured shortcut as plain subtle text.
+/// No box/border/badge chrome — it uses the same accent hover wash as list
+/// rows so it reads as part of the rail under any theme.
+fn renderPaletteSearchTrigger(state: *runtime.AppState, rect: palette.Rect) void {
+    const hovered = search_trigger_hovered;
+    if (hovered) {
+        queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.withAlpha(theme.COLOR_GREEN, 48)), theme.scaledUi(6.0));
+    }
+    addPaletteHit(rect, .command_palette, 0, 0);
+
+    const cy = rect.y + rect.h * 0.5;
+    const fg = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE;
+    const icon_font = theme.scaledUi(12.5);
+    queuePaletteIcon(state, .{
+        .x = rect.x + theme.scaledUi(8.0),
+        .y = cy - icon_font * 0.55,
+        .w = icon_font,
+        .h = icon_font,
+    }, NF_COD_SEARCH, icon_font, paletteColor(fg), null);
+
+    const label_font = theme.scaledUi(12.5);
+    queuePaletteText(state, .{
+        .x = rect.x + theme.scaledUi(28.0),
+        .y = @round(cy - label_font * 0.65),
+        .w = theme.scaledUi(80.0),
+        .h = label_font * 1.3,
+    }, "Search", paletteColor(fg), label_font, rect);
+
+    const hint = command_palette.commandPaletteShortcutHint(state);
+    if (hint.len == 0) return;
+    const hint_font = theme.scaledUi(10.0);
+    // Same per-char width estimate the rail uses elsewhere for right-aligned
+    // labels; shortcut strings are short ASCII so the error stays invisible.
+    const hint_w = @as(f32, @floatFromInt(hint.len)) * hint_font * 0.54;
+    queuePaletteText(state, .{
+        .x = rect.x + rect.w - hint_w - theme.scaledUi(8.0),
+        .y = @round(cy - hint_font * 0.65),
+        .w = hint_w + theme.scaledUi(6.0),
+        .h = hint_font * 1.3,
+    }, hint, paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 210)), hint_font, rect);
 }
 
 /// Cross-workspace "ACTIVE" cluster at the top of the expanded list: every
@@ -936,17 +998,19 @@ fn herdrRuntimeBadgeLabel(project: *const native_state.Project) ?[]const u8 {
 
 // Renders the compact Herdr runtime badge inside a workspace row.
 fn renderHerdrRuntimeBadge(state: *runtime.AppState, rect: palette.Rect, label: []const u8, emphasized: bool, clip: palette.Rect) void {
+    // Accent washes so the badge follows the active theme; the emphasized
+    // state reverses the label out against the stronger fill.
     const bg = if (emphasized)
-        theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 210)
+        theme.withAlpha(theme.COLOR_GREEN, 200)
     else
-        theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 95);
+        theme.withAlpha(theme.COLOR_GREEN, 56);
     queuePaletteRoundedRect(state, rect, paletteColor(bg), theme.scaledUi(6.0));
     queuePaletteText(state, .{
         .x = rect.x + theme.scaledUi(6.0),
         .y = rect.y + theme.scaledUi(1.0),
         .w = rect.w - theme.scaledUi(12.0),
         .h = rect.h,
-    }, label, paletteColor(if (emphasized) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(9.0), clip);
+    }, label, paletteColor(if (emphasized) theme.background() else theme.COLOR_TEXT_MUTED), theme.scaledUi(9.0), clip);
 }
 
 fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) void {
@@ -970,6 +1034,12 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
     renderPaletteSidebarActionIcon(state, terminal_rect, NF_COD_TERMINAL, null, rect);
     addPaletteHit(terminal_rect, .new_terminal, state.selected_project_index, 0);
     y += theme.scaledUi(34.0);
+    // Palette trigger parity with the expanded rail's search pill, so the
+    // collapsed rail keeps a visible route to search/history too.
+    const search_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
+    renderPaletteSidebarActionIcon(state, search_rect, NF_COD_SEARCH, null, rect);
+    addPaletteHit(search_rect, .command_palette, 0, 0);
+    y += theme.scaledUi(34.0);
 
     // Hairline divider, then a vertical "activity dock" of workspace avatars so
     // the narrow rail shows every workspace, which one is active, and whether
@@ -991,9 +1061,9 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
         // mirroring (and amplifying) the green filled folder of the expanded
         // view's selected row — with a left accent bar for an unmistakable cue.
         const bg = if (selected)
-            paletteColor(theme.COLOR_SECONDARY_GREEN)
+            paletteColor(theme.COLOR_GREEN)
         else if (hovered)
-            paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 110))
+            paletteColor(theme.withAlpha(theme.COLOR_GREEN, 56))
         else
             paletteColor(theme.COLOR_PANEL_ALT);
         queuePaletteRoundedRect(state, avatar_rect, bg, theme.scaledUi(9.0));
@@ -1004,7 +1074,7 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
                 .y = avatar_rect.y + (avatar - bar_h) * 0.5,
                 .w = theme.scaledUi(3.0),
                 .h = bar_h,
-            }, paletteColor(theme.COLOR_SECONDARY_GREEN), theme.scaledUi(1.5));
+            }, paletteColor(theme.COLOR_GREEN), theme.scaledUi(1.5));
         }
 
         // Workspace initial as the avatar mark. queuePaletteText is left-aligned,
@@ -1060,7 +1130,7 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
 fn renderPaletteSidebarToggle(state: *runtime.AppState, rect: palette.Rect, expanded: bool) void {
     const hovered = state.palette_mouse_in_workspace and rectContainsPoint(rect, state.palette_mouse_x, state.palette_mouse_y);
     if (hovered) {
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 180)), theme.scaledUi(8.0));
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 56)), theme.scaledUi(8.0));
     }
     const fg = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
     const icon_font = theme.scaledUi(17.0);
@@ -1078,7 +1148,7 @@ fn renderPaletteSidebarToggle(state: *runtime.AppState, rect: palette.Rect, expa
 fn renderPaletteSidebarActionIcon(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8, hover_override: ?bool, clip: ?palette.Rect) void {
     const hovered = hover_override orelse (state.palette_mouse_in_workspace and rectContainsPoint(rect, state.palette_mouse_x, state.palette_mouse_y));
     if (hovered) {
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 180)), theme.scaledUi(8.0));
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 56)), theme.scaledUi(8.0));
     }
     const fg = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
     const icon_font = theme.scaledUi(17.0);
@@ -1094,7 +1164,7 @@ fn renderPaletteSidebarActionIcon(state: *runtime.AppState, rect: palette.Rect, 
 fn renderPaletteSettingsButton(state: *runtime.AppState, rect: palette.Rect, clip: ?palette.Rect) void {
     const settings_hover = state.palette_mouse_in_workspace and rectContainsPoint(rect, state.palette_mouse_x, state.palette_mouse_y);
     if (settings_hover) {
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 180)), theme.scaledUi(8.0));
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 56)), theme.scaledUi(8.0));
     }
     const fg = if (settings_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
     const icon_font = theme.scaledUi(17.0);
@@ -1268,7 +1338,7 @@ fn collapsedPaneIndicator(
             };
         }
     }
-    return .{ .color = if (selected_pane) theme.COLOR_SECONDARY_GREEN else theme.COLOR_TEXT_SUBTLE };
+    return .{ .color = if (selected_pane) theme.COLOR_GREEN else theme.COLOR_TEXT_SUBTLE };
 }
 
 fn queuePaletteRect(state: *runtime.AppState, rect: palette.Rect, color: palette.Color) void {
@@ -1327,10 +1397,12 @@ fn renderOpenPaneRow(
     const layout = &project.workspace_layout;
     const focused = state.selected_project_index == project_index and layout.focused_pane_id == pane.id;
     const hovered = state.palette_mouse_in_workspace and rectContainsPoint(rect, state.palette_mouse_x, state.palette_mouse_y);
+    // Accent-tinted fills (not the gray border token) so focus/hover track
+    // the active theme; alphas follow the command palette's selection washes.
     if (focused) {
-        queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.borderMuted()), theme.scaledUi(7.0));
+        queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.withAlpha(theme.COLOR_GREEN, 72)), theme.scaledUi(7.0));
     } else if (hovered) {
-        queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 210)), theme.scaledUi(7.0));
+        queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.withAlpha(theme.COLOR_GREEN, 48)), theme.scaledUi(7.0));
     }
     addPaletteHit(rect, .open_pane, project_index, pane.id);
 
@@ -1664,6 +1736,7 @@ const NF_COD_EDIT = "\u{EA73}";
 const NF_COD_GEAR = "\u{EB51}";
 const NF_COD_TERMINAL = "\u{EA85}";
 const NF_COD_HISTORY = "\u{EA82}";
+const NF_COD_SEARCH = "\u{EA6D}";
 // Panel-style sidebar toggle (VS Code's layout-sidebar-left): filled left pane
 // while the rail is expanded, hollow "off" variant while collapsed.
 const NF_COD_LAYOUT_SIDEBAR_LEFT = "\u{EBF3}";

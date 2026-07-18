@@ -1515,6 +1515,15 @@ fn keybindHintFor(state: *runtime.AppState, ref: ?KeybindRef) []const u8 {
     return formatKeybind(&hint_buf, bindings[0]);
 }
 
+/// Formats the first loaded command-palette accelerator for UI hints (the
+/// sidebar's search-trigger badge), so the label tracks user rebinds instead
+/// of hardcoding the default. Returns "" when unbound.
+pub fn commandPaletteShortcutHint(state: *runtime.AppState) []const u8 {
+    const config = state.keyboard_config orelse return "";
+    if (config.command_palette.len == 0) return "";
+    return formatKeybind(&hint_buf, config.command_palette[0]);
+}
+
 fn formatKeybind(buf: []u8, keybind: keybinds.Keybind) []const u8 {
     var n: usize = 0;
     if (keybind.primary or keybind.ctrl) n += copyInto(buf[n..], "Ctrl+");
