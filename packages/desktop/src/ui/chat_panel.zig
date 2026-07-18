@@ -1710,7 +1710,7 @@ fn renderProcessDashboard(state: *app_state.AppState, rect: palette.Rect) void {
         bx -= button_w + button_gap;
         renderProcessDashboardButton(state, .{ .x = bx, .y = by, .w = button_w, .h = button_h }, "R", process_index, .restart, clip);
         bx -= button_w + button_gap;
-        if (process.status == .running or process.status == .starting or process.status == .restarting) {
+        if (process.status == .running or process.status == .starting or process.status == .stopping or process.status == .restarting) {
             renderProcessDashboardButton(state, .{ .x = bx, .y = by, .w = button_w, .h = button_h }, "X", process_index, .stop, clip);
         } else {
             renderProcessDashboardButton(state, .{ .x = bx, .y = by, .w = button_w, .h = button_h }, "S", process_index, .start, clip);
@@ -1747,7 +1747,7 @@ fn renderProcessDashboardButton(state: *app_state.AppState, rect: palette.Rect, 
 fn managedProcessStatusColor(status: app_state.ManagedProcessStatus) palette.Color {
     return paletteColor(switch (status) {
         .running => theme.COLOR_GREEN,
-        .starting, .restarting => theme.COLOR_YELLOW,
+        .starting, .stopping, .restarting => theme.COLOR_YELLOW,
         .crashed => theme.COLOR_DIFF_REMOVE,
         .stopped => theme.COLOR_TEXT_SUBTLE,
     });

@@ -2201,6 +2201,7 @@ pub const ManagedProcessStatus = enum {
     stopped,
     starting,
     running,
+    stopping,
     crashed,
     restarting,
 };
@@ -13905,21 +13906,42 @@ pub const AppState = struct {
         const project = &self.projects.items[project_index];
         for (project.managed_processes.items) |*process| {
             const dock_id = process.dock_id orelse continue;
-            const dock = self.projectTerminalDock(project_index, dock_id) orelse continue;
-            const snapshot = dock.activeSessionSnapshot() orelse continue;
+            const dock = self.projectTerminalDock(project_index, dock_id) orelse {
+                finalizeExplicitManagedProcessStop(process);
+                continue;
+            };
+            const snapshot = dock.activeSessionSnapshot() orelse {
+                finalizeExplicitManagedProcessStop(process);
+                continue;
+            };
+            if (process.explicit_stop) {
+                if (snapshot.running) {
+                    process.status = .stopping;
+                    continue;
+                }
+                process.exit_code = snapshot.exit_code;
+                process.signal = snapshot.signal;
+                finalizeExplicitManagedProcessStop(process);
+                continue;
+            }
             if (snapshot.running) {
                 process.status = .running;
                 process.exit_code = null;
                 process.signal = null;
                 continue;
             }
-            if (process.status == .stopped and process.explicit_stop) continue;
             process.exit_code = snapshot.exit_code;
             process.signal = snapshot.signal;
             if (process.last_exit_ms == 0) process.last_exit_ms = unixTimestampMs();
             const clean_exit = snapshot.exit_code != null and snapshot.exit_code.? == 0;
-            process.status = if (clean_exit or process.explicit_stop) .stopped else .crashed;
+            process.status = if (clean_exit) .stopped else .crashed;
         }
+    }
+
+    fn finalizeExplicitManagedProcessStop(process: *ManagedProcess) void {
+        if (!process.explicit_stop) return;
+        process.status = .stopped;
+        if (process.last_exit_ms == 0) process.last_exit_ms = unixTimestampMs();
     }
 
     pub fn pollManagedProcesses(self: *AppState, project_index: usize) void {
@@ -14355,8 +14377,8 @@ pub const AppState = struct {
         var project = &self.projects.items[project_index];
         var process = project.managedProcessByName(name) orelse return false;
         process.explicit_stop = true;
-        process.status = .stopped;
-        process.last_exit_ms = unixTimestampMs();
+        process.status = .stopping;
+        process.last_exit_ms = 0;
         process.next_restart_ms = 0;
         process.pending_watch_restart_ms = 0;
         if (process.dock_id) |dock_id| {
@@ -14364,6 +14386,7 @@ pub const AppState = struct {
                 _ = dock.terminateActiveSession();
             }
         }
+        self.refreshManagedProcessStatuses(project_index);
         self.markDirty();
         return true;
     }
