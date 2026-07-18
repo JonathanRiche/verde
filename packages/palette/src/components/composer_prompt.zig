@@ -35,8 +35,10 @@ pub const ComposerPromptConfig = struct {
     separator_color: draw.Color = .{ .r = 0.48, .g = 0.52, .b = 0.58, .a = 0.35 },
     send_color: draw.Color = .{ .r = 0.32, .g = 0.54, .b = 0.39, .a = 1.0 },
     send_hover_color: draw.Color = .{ .r = 0.38, .g = 0.64, .b = 0.47, .a = 1.0 },
+    send_foreground_color: draw.Color = draw.Color.white,
     stop_button_color: draw.Color = .{ .r = 0.78, .g = 0.58, .b = 0.10, .a = 1.0 },
     stop_button_hover_color: draw.Color = .{ .r = 0.90, .g = 0.68, .b = 0.14, .a = 1.0 },
+    stop_foreground_color: draw.Color = draw.Color.white,
     text_color: draw.Color = draw.Color.white,
     placeholder_color: draw.Color = .{ .r = 0.58, .g = 0.62, .b = 0.68, .a = 0.82 },
     icon_color: draw.Color = .{ .r = 0.78, .g = 0.82, .b = 0.88, .a = 1.0 },
@@ -107,8 +109,10 @@ pub const ComposerPromptStyle = struct {
     separator_color: draw.Color,
     send_color: draw.Color,
     send_hover_color: draw.Color,
+    send_foreground_color: draw.Color,
     stop_button_color: draw.Color,
     stop_button_hover_color: draw.Color,
+    stop_foreground_color: draw.Color,
     text_color: draw.Color,
     placeholder_color: draw.Color,
     icon_color: draw.Color,
@@ -482,8 +486,10 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 .separator_color = config.separator_color,
                 .send_color = config.send_color,
                 .send_hover_color = config.send_hover_color,
+                .send_foreground_color = config.send_foreground_color,
                 .stop_button_color = config.stop_button_color,
                 .stop_button_hover_color = config.stop_button_hover_color,
+                .stop_foreground_color = config.stop_foreground_color,
                 .text_color = config.text_color,
                 .placeholder_color = config.placeholder_color,
                 .icon_color = config.icon_color,
@@ -839,11 +845,11 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             };
             try batch.panel(allocator, geometry.send, send_panel_color, null, geometry.send.h * 0.5, 0.0);
             if (self.send_state == .stop) {
-                try renderStopSquare(allocator, batch, geometry.send, if (self.hovered_part == .send) 1.0 else self.stop_pulse_factor);
+                try renderStopSquare(allocator, batch, geometry.send, self.style.stop_foreground_color, if (self.hovered_part == .send) 1.0 else self.stop_pulse_factor);
             } else if (self.send_state == .pending) {
-                try self.renderCenteredIcon(allocator, batch, geometry.send, self.sendIcon(), draw.Color.white);
+                try self.renderCenteredIcon(allocator, batch, geometry.send, self.sendIcon(), self.style.send_foreground_color);
             } else {
-                try renderSendArrow(allocator, batch, geometry.send);
+                try renderSendArrow(allocator, batch, geometry.send, self.style.send_foreground_color);
             }
         }
 
@@ -948,7 +954,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             });
         }
 
-        fn renderStopSquare(allocator: std.mem.Allocator, batch: *draw.RenderBatch, button: draw.Rect, pulse: f32) !void {
+        fn renderStopSquare(allocator: std.mem.Allocator, batch: *draw.RenderBatch, button: draw.Rect, color: draw.Color, pulse: f32) !void {
             const inner = sendGlyphBounds(button);
             const m = @min(inner.w, inner.h);
             const side = m * (0.46 + pulse * 0.08);
@@ -960,11 +966,11 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 .y = cy - side * 0.5,
                 .w = side,
                 .h = side,
-            }, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 0.72 + pulse * 0.28 }, cr, button);
+            }, .{ .r = color.r, .g = color.g, .b = color.b, .a = color.a * (0.72 + pulse * 0.28) }, cr, button);
         }
 
         /// Send: wide triangular head + narrow stem (same-width stem under an equilateral head reads as a "house").
-        fn renderSendArrow(allocator: std.mem.Allocator, batch: *draw.RenderBatch, button: draw.Rect) !void {
+        fn renderSendArrow(allocator: std.mem.Allocator, batch: *draw.RenderBatch, button: draw.Rect, color: draw.Color) !void {
             const inner = sendGlyphBounds(button);
             const m = @min(inner.w, inner.h);
             const cx = inner.x + inner.w * 0.5;
@@ -980,13 +986,13 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 .y = y0 + head_h,
                 .w = half_w_stem * 2.0,
                 .h = stem_h,
-            }), draw.Color.white, button);
+            }), color, button);
             try batch.triangleClipped(
                 allocator,
                 snapPoint(.{ .x = cx, .y = y0 }),
                 snapPoint(.{ .x = cx - half_w_head, .y = y0 + head_h }),
                 snapPoint(.{ .x = cx + half_w_head, .y = y0 + head_h }),
-                draw.Color.white,
+                color,
                 button,
             );
         }

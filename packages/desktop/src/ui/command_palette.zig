@@ -432,7 +432,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     // background keeps a subtle elevation while guaranteeing the text tokens land
     // on a dark surface, matching the contrast the rest of the UI gets on PANEL.
     // The scrim is a touch heavier (0.55) so background content reads as dimmed.
-    queueRect(state, .{ .x = 0.0, .y = 0.0, .w = width, .h = height }, .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.55 });
+    queueRect(state, .{ .x = 0.0, .y = 0.0, .w = width, .h = height }, paletteColor(theme.scrim(0.55)));
     queueRoundedRect(state, modal_rect, paletteColor(theme.lighten(theme.background(), 0.04)), theme.scaledUi(16.0));
     queueBorder(state, modal_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(16.0), theme.scaledUi(1.0));
 

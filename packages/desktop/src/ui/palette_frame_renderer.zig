@@ -7,6 +7,7 @@ const app_state = @import("../state.zig");
 const browser_texture = @import("../browser/texture.zig");
 const stb_image = @import("../stb_image.zig");
 const text_measure = @import("text_measure.zig");
+const theme = @import("theme.zig");
 
 pub const Backend = enum {
     sdl_gpu,
@@ -241,7 +242,12 @@ pub const Renderer = struct {
             allocator,
             @ptrCast(window),
             batch,
-            .{ .r = 0.0235, .g = 0.0235, .b = 0.0275, .a = 1.0 },
+            .{
+                .r = theme.background()[0],
+                .g = theme.background()[1],
+                .b = theme.background()[2],
+                .a = theme.background()[3],
+            },
         );
     }
 

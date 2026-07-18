@@ -3850,7 +3850,7 @@ fn renderTranscriptBubbleFromParts(
     const bubble_x = if (role == .user) column.x + column.w - bubble_width else column.x;
     const bubble = snapRect(palette.Rect{ .x = bubble_x, .y = y, .w = bubble_width, .h = height });
     const bg = switch (role) {
-        .user => theme.darken(theme.COLOR_SECONDARY_GREEN, 0.03),
+        .user => theme.withAlpha(theme.accent(), 64),
         .assistant => theme.withAlpha(theme.background(), 242),
         .system => theme.withAlpha(theme.COLOR_YELLOW, 54),
     };
@@ -4290,7 +4290,7 @@ fn renderInactiveComposerSubmit(state: *app_state.AppState, rect: palette.Rect) 
         // This preview is read-only; keep the send affordance disabled so it
         // does not imply that clicks/keystrokes will be handled by this pane.
         queueRounded(state, button, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 122)), size * 0.5);
-        drawInactiveComposerSendArrow(state, button, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 135)));
+        drawInactiveComposerSendArrow(state, button, paletteColor(theme.withAlpha(theme.foregroundOn(theme.COLOR_GREEN), 135)));
     }
 }
 

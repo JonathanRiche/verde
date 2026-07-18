@@ -1037,7 +1037,7 @@ fn renderLeaf(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: 
     const alpha = @max(focus_alpha, pulse);
     if (alpha > 0.01) {
         // p=1 -> full pulse color; p=0 -> resting focus-border color.
-        var border_color = lerpColor(theme.COLOR_SECONDARY_GREEN, theme.COLOR_DIFF_ADD, pulse);
+        var border_color = lerpColor(theme.accent(), theme.success(), pulse);
         border_color[3] *= alpha;
         queueBorder(state, rect, paletteColor(border_color), 0.0, theme.scaledUi(2.0));
     }
@@ -1082,7 +1082,7 @@ fn renderSplitTriggerButton(state: *runtime.AppState, rect: palette.Rect, active
     _ = clip;
     if (active) {
         queueRounded(state, rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
-        queueBorder(state, rect, paletteColor(theme.COLOR_SECONDARY_GREEN), theme.scaledUi(5.0), theme.scaledUi(1.0));
+        queueBorder(state, rect, paletteColor(theme.accent()), theme.scaledUi(5.0), theme.scaledUi(1.0));
     } else if (emphasized) {
         queueRounded(state, rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(5.0));
         queueBorder(state, rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(5.0), theme.scaledUi(1.0));

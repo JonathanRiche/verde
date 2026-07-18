@@ -81,12 +81,52 @@ pub fn background() [4]f32 {
     return current_colors.background;
 }
 
+pub fn accent() [4]f32 {
+    return current_colors.accent;
+}
+
+pub fn border() [4]f32 {
+    return current_colors.border;
+}
+
 pub fn borderMuted() [4]f32 {
     return current_colors.border_muted;
 }
 
+pub fn warning() [4]f32 {
+    return current_colors.warning;
+}
+
+pub fn success() [4]f32 {
+    return current_colors.diff_add;
+}
+
+pub fn danger() [4]f32 {
+    return current_colors.diff_remove;
+}
+
 pub fn selection() [4]f32 {
     return current_colors.selection;
+}
+
+/// Chooses the active theme foreground or background token with the clearest
+/// luminance separation from a filled control. This keeps accent buttons
+/// readable for both light and dark custom themes.
+pub fn foregroundOn(fill: [4]f32) [4]f32 {
+    const fill_luma = relativeLuma(fill);
+    const text_distance = @abs(relativeLuma(current_colors.text) - fill_luma);
+    const background_distance = @abs(relativeLuma(current_colors.background) - fill_luma);
+    return if (text_distance >= background_distance) current_colors.text else current_colors.background;
+}
+
+/// Modal overlay color. Kept as a semantic token so modal surfaces do not
+/// embed independent palette values throughout the UI.
+pub fn scrim(alpha: f32) [4]f32 {
+    return .{ 0.0, 0.0, 0.0, clampf(alpha, 0.0, 1.0) };
+}
+
+fn relativeLuma(color: [4]f32) f32 {
+    return color[0] * 0.2126 + color[1] * 0.7152 + color[2] * 0.0722;
 }
 
 /// Returns a smooth 0..1 breathing pulse for in-progress UI chrome.

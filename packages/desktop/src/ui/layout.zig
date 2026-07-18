@@ -270,12 +270,12 @@ fn drawActionButton(state: *runtime.AppState, rect: palette.Rect, label: []const
         .y = rect.y + (rect.h - font_size * 1.25) * 0.5,
         .w = @max(@min(estimated_text_width + theme.scaledUi(2.0), rect.w - theme.scaledUi(8.0)), theme.scaledUi(8.0)),
         .h = font_size * 1.25,
-    }, label, paletteColor(theme.COLOR_WHITE), font_size, rect);
+    }, label, paletteColor(theme.foregroundOn(fill)), font_size, rect);
 }
 
 fn drawModalChromeVisual(state: *runtime.AppState, width: f32, height: f32, modal: palette.Rect) void {
     const scrim: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = width, .h = height };
-    queuePaletteRoundedRect(state, scrim, .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.68 }, 0.0);
+    queuePaletteRoundedRect(state, scrim, paletteColor(theme.scrim(0.68)), 0.0);
     queuePaletteRoundedRect(state, modal, paletteColor(theme.COLOR_PANEL), theme.scaledUi(12.0));
     queuePaletteBorder(state, modal, paletteColor(theme.withAlpha(theme.borderMuted(), 110)), theme.scaledUi(12.0), theme.scaledUi(1.0));
 }
@@ -287,7 +287,7 @@ fn registerModalChromeHits(state: *runtime.AppState, width: f32, height: f32, mo
 }
 
 fn drawTextField(state: *runtime.AppState, rect: palette.Rect, value: []const u8, hint: []const u8, focused: bool, cursor: usize) void {
-    const border = if (focused) theme.COLOR_SECONDARY_GREEN else theme.COLOR_PANEL_MUTED;
+    const border = if (focused) theme.accent() else theme.COLOR_PANEL_MUTED;
     queuePaletteRoundedRect(state, rect, paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.03)), theme.scaledUi(7.0));
     queuePaletteBorder(state, rect, paletteColor(border), theme.scaledUi(7.0), theme.scaledUi(1.0));
     const text = if (value.len > 0) value else hint;
@@ -1060,7 +1060,7 @@ fn renderMcpOnboardingModal(state: *runtime.AppState, width: f32, height: f32) v
     const button_y = modal.y + modal.h - pad - button_h;
     queuePaletteText(state, .{ .x = modal.x + pad, .y = benefits_bottom + theme.scaledUi(16.0), .w = modal.w - pad * 2.0, .h = theme.scaledUi(28.0) }, "Updates detected providers' user settings and preserves existing servers. Remove it any time in Settings.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), clip);
     drawActionButton(state, .{ .x = modal.x + pad, .y = button_y, .w = theme.scaledUi(104.0), .h = button_h }, "Not now", theme.COLOR_PANEL_ALT);
-    drawActionButton(state, .{ .x = modal.x + modal.w - pad - theme.scaledUi(176.0), .y = button_y, .w = theme.scaledUi(176.0), .h = button_h }, "Enable Verde tools", theme.COLOR_SECONDARY_GREEN);
+    drawActionButton(state, .{ .x = modal.x + modal.w - pad - theme.scaledUi(176.0), .y = button_y, .w = theme.scaledUi(176.0), .h = button_h }, "Enable Verde tools", theme.accent());
 }
 
 // Renders one capability included with Verde's MCP server.
@@ -1107,7 +1107,7 @@ fn renderProviderOnboardingModal(state: *runtime.AppState, width: f32, height: f
     drawActionButton(state, .{ .x = modal.x + pad, .y = button_y, .w = close_w, .h = button_h }, "Not now", theme.COLOR_PANEL_ALT);
     drawActionButton(state, .{ .x = modal.x + modal.w - pad - check_w - gap - guide_w, .y = button_y, .w = guide_w, .h = button_h }, "Open setup guide", theme.COLOR_PANEL_MUTED);
     const checking = snapshot.codex == .checking and snapshot.opencode == .checking and snapshot.claude == .checking and snapshot.cursor == .checking;
-    drawActionButton(state, .{ .x = modal.x + modal.w - pad - check_w, .y = button_y, .w = check_w, .h = button_h }, if (checking) "Checking..." else "Check again", theme.COLOR_SECONDARY_GREEN);
+    drawActionButton(state, .{ .x = modal.x + modal.w - pad - check_w, .y = button_y, .w = check_w, .h = button_h }, if (checking) "Checking..." else "Check again", theme.accent());
 }
 
 // Renders one provider's executable/auth status and its shortest recovery step.
@@ -1116,7 +1116,7 @@ fn renderProviderReadinessRow(state: *runtime.AppState, rect: palette.Rect, prov
     queuePaletteBorder(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 190)), theme.scaledUi(9.0), theme.scaledUi(1.0));
 
     const dot_color = switch (readiness) {
-        .ready => theme.COLOR_SECONDARY_GREEN,
+        .ready => theme.success(),
         .signed_out => theme.COLOR_YELLOW,
         .missing => theme.COLOR_DIFF_REMOVE,
         .checking => theme.COLOR_TEXT_MUTED,
@@ -1227,7 +1227,7 @@ fn renderWorkspaceRenameModal(state: *runtime.AppState, width: f32, height: f32)
     const cancel_rect: palette.Rect = .{ .x = input_rect.x, .y = modal.y + modal.h - pad - theme.scaledUi(34.0), .w = button_w, .h = theme.scaledUi(34.0) };
     const submit_rect: palette.Rect = .{ .x = cancel_rect.x + cancel_rect.w + gap, .y = cancel_rect.y, .w = button_w, .h = cancel_rect.h };
     drawActionButton(state, cancel_rect, "Cancel", theme.COLOR_PANEL_ALT);
-    drawActionButton(state, submit_rect, "Rename", theme.COLOR_SECONDARY_GREEN);
+    drawActionButton(state, submit_rect, "Rename", theme.accent());
 }
 
 fn renderWorkspaceAddModal(state: *runtime.AppState, width: f32, height: f32) void {
@@ -1256,7 +1256,7 @@ fn renderWorkspaceAddModal(state: *runtime.AppState, width: f32, height: f32) vo
     const input_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0 - add_w - row_gap, .h = theme.scaledUi(34.0) };
     const add_rect: palette.Rect = .{ .x = input_rect.x + input_rect.w + row_gap, .y = y, .w = add_w, .h = theme.scaledUi(34.0) };
     drawTextField(state, input_rect, state.importDirectoryDraft(), "/path/to/workspace", state.palette_modal_text_focus == .project_import, state.project_import_cursor);
-    drawActionButton(state, add_rect, "Add", theme.COLOR_SECONDARY_GREEN);
+    drawActionButton(state, add_rect, "Add", theme.accent());
     y += theme.scaledUi(46.0);
     const cancel_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = theme.scaledUi(120.0), .h = theme.scaledUi(34.0) };
     drawActionButton(state, cancel_rect, "Cancel", theme.COLOR_PANEL_ALT);
