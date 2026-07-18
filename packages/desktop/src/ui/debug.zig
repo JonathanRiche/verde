@@ -268,7 +268,7 @@ fn renderLogEntries(state: *runtime.AppState, rect: palette.Rect, font_size: f32
 fn renderTab(state: *runtime.AppState, x: f32, y: f32, w: f32, h: f32, label: []const u8, tab: DebugTab) f32 {
     const rect: palette.Rect = .{ .x = x, .y = y, .w = w, .h = h };
     const selected = active_tab == tab;
-    queuePaletteRoundedRect(state, rect, paletteColor(if (selected) theme.COLOR_SECONDARY_GREEN else theme.COLOR_PANEL_ALT), theme.scaledUi(7.0));
+    queuePaletteRoundedRect(state, rect, paletteColor(if (selected) theme.withAlpha(theme.accent(), 72) else theme.COLOR_PANEL_ALT), theme.scaledUi(7.0));
     queuePaletteText(state, .{ .x = x + theme.scaledUi(10.0), .y = y + theme.scaledUi(7.0), .w = w - theme.scaledUi(20.0), .h = h - theme.scaledUi(10.0) }, label, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), debug_window_rect);
     addDebugHit(rect, .{ .kind = .tab, .tab = tab });
     return x + w;
@@ -276,7 +276,7 @@ fn renderTab(state: *runtime.AppState, x: f32, y: f32, w: f32, h: f32, label: []
 
 fn renderToggle(state: *runtime.AppState, x: f32, y: f32, w: f32, h: f32, label: []const u8, enabled: bool, kind: DebugHitKind) f32 {
     const rect: palette.Rect = .{ .x = x, .y = y, .w = w, .h = h };
-    queuePaletteRoundedRect(state, rect, paletteColor(if (enabled) theme.COLOR_SECONDARY_GREEN else theme.COLOR_PANEL_ALT), theme.scaledUi(6.0));
+    queuePaletteRoundedRect(state, rect, paletteColor(if (enabled) theme.withAlpha(theme.accent(), 72) else theme.COLOR_PANEL_ALT), theme.scaledUi(6.0));
     queuePaletteText(state, .{ .x = x + theme.scaledUi(9.0), .y = y + theme.scaledUi(6.0), .w = w - theme.scaledUi(18.0), .h = h - theme.scaledUi(8.0) }, label, paletteColor(theme.COLOR_WHITE), theme.scaledUi(12.0), debug_window_rect);
     addDebugHit(rect, .{ .kind = kind });
     return x + w;

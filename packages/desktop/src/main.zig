@@ -2433,6 +2433,7 @@ test {
     _ = @import("providers/opencode.zig");
     _ = @import("provider_mcp.zig");
     _ = @import("slash_commands.zig");
+    _ = @import("theme_coverage_test.zig");
     _ = @import("update_installer.zig");
     _ = @import("updater.zig");
     _ = @import("ui/command_palette.zig");

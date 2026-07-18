@@ -574,15 +574,20 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect) void {
 
     // Refresh / navigate: accent color signals the primary action in the row.
     const navigate_rect: palette.Rect = .{ .x = cursor_x, .y = address_rect.y, .w = button_size, .h = button_size };
-    renderToolbarIconButton(state, navigate_rect, NF_COD_REFRESH, theme.COLOR_SECONDARY_GREEN, theme.COLOR_WHITE, rectHovered(navigate_rect), false);
+    renderToolbarIconButton(state, navigate_rect, NF_COD_REFRESH, theme.accent(), theme.foregroundOn(theme.accent()), rectHovered(navigate_rect), false);
     addPaletteHit(navigate_rect, .navigate);
     cursor_x += button_size + gap;
 
     const can_use_inspector = state.canUseBrowserInspector();
     const inspector_active = state.isBrowserInspectorEnabled();
     const inspector_mode = state.browserInspectorMode();
-    const inspector_base = if (inspector_active) theme.COLOR_SECONDARY_GREEN else theme.COLOR_PANEL_ALT;
-    const inspector_icon = if (can_use_inspector) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE;
+    const inspector_base = if (inspector_active) theme.accent() else theme.COLOR_PANEL_ALT;
+    const inspector_icon = if (!can_use_inspector)
+        theme.COLOR_TEXT_SUBTLE
+    else if (inspector_active)
+        theme.foregroundOn(inspector_base)
+    else
+        theme.COLOR_WHITE;
 
     const inspect_rect: palette.Rect = .{ .x = cursor_x, .y = address_rect.y, .w = button_size, .h = button_size };
     const inspect_menu_rect: palette.Rect = .{ .x = inspect_rect.x + inspect_rect.w, .y = address_rect.y, .w = dropdown_width, .h = button_size };
@@ -636,7 +641,7 @@ fn renderInspectorModeMenuRow(state: *app_state.AppState, rect: palette.Rect, la
         queuePaletteRoundedRect(
             state,
             rect,
-            paletteColor(if (selected) theme.COLOR_SECONDARY_GREEN else theme.lighten(theme.COLOR_PANEL_ALT, 0.08)),
+            paletteColor(if (selected) theme.withAlpha(theme.accent(), 64) else theme.lighten(theme.COLOR_PANEL_ALT, 0.08)),
             theme.scaledUi(6.0),
         );
     }
@@ -777,7 +782,7 @@ fn renderPaletteAddressField(state: *app_state.AppState, rect: palette.Rect) voi
     queuePaletteBorder(
         state,
         rect,
-        paletteColor(if (focused) theme.COLOR_SECONDARY_GREEN else theme.COLOR_PANEL_MUTED),
+        paletteColor(if (focused) theme.accent() else theme.COLOR_PANEL_MUTED),
         theme.scaledUi(8.0),
         theme.scaledUi(1.0),
     );
@@ -1042,13 +1047,14 @@ fn renderPanePlaceholder(state: *app_state.AppState, pane_rect: palette.Rect) vo
         .w = button_width,
         .h = button_height,
     };
-    queuePaletteRoundedRect(state, button_rect, paletteColor(if (rectHovered(button_rect)) theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.08) else theme.COLOR_SECONDARY_GREEN), theme.scaledUi(8.0));
+    const button_fill = if (rectHovered(button_rect)) theme.lighten(theme.accent(), 0.08) else theme.accent();
+    queuePaletteRoundedRect(state, button_rect, paletteColor(button_fill), theme.scaledUi(8.0));
     queuePaletteText(state, .{
         .x = button_rect.x + theme.scaledUi(14.0),
         .y = button_rect.y + (button_rect.h - body_size * 1.25) * 0.5,
         .w = button_rect.w - theme.scaledUi(28.0),
         .h = body_size * 1.25,
-    }, "Set up dev server", paletteColor(theme.COLOR_WHITE), body_size, button_rect);
+    }, "Set up dev server", paletteColor(theme.foregroundOn(button_fill)), body_size, button_rect);
     addPaletteHit(button_rect, .setup_dev_server);
 }
 

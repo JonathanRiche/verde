@@ -169,7 +169,26 @@ fn textLabel() [4]f32 {
 }
 
 fn textHint() [4]f32 {
-    return theme.lighten(theme.COLOR_TEXT_SUBTLE, 0.18);
+    return theme.mix(theme.COLOR_TEXT_SUBTLE, theme.COLOR_WHITE, 0.18);
+}
+
+// Settings controls need predictable contrast against the modal. Omarchy's
+// terminal color0/color8 may be light, so panel_alt/panel_muted are unsuitable
+// as opaque fills even though they remain useful as palette accents elsewhere.
+fn raisedSurface(amount: f32) [4]f32 {
+    return theme.mix(theme.background(), theme.COLOR_WHITE, amount);
+}
+
+fn cardSurface() [4]f32 {
+    return raisedSurface(0.10);
+}
+
+fn controlSurface() [4]f32 {
+    return raisedSurface(0.16);
+}
+
+fn controlHoverSurface() [4]f32 {
+    return raisedSurface(0.22);
 }
 
 fn metrics() Metrics {
@@ -1022,7 +1041,7 @@ fn releaseNotesPreview(notes: []const u8) []const u8 {
 }
 
 fn drawModalChrome(state: *runtime.AppState, width: f32, height: f32, modal: palette.Rect) void {
-    queueRoundedRect(state, .{ .x = 0.0, .y = 0.0, .w = width, .h = height }, .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.68 * current_fade_alpha }, 0.0);
+    queueRoundedRect(state, .{ .x = 0.0, .y = 0.0, .w = width, .h = height }, paletteColor(theme.scrim(0.68 * current_fade_alpha)), 0.0);
     queueRoundedRect(state, modal, paletteColor(theme.COLOR_PANEL), radiusLg());
     queueBorder(state, modal, paletteColor(theme.withAlpha(theme.borderMuted(), 110)), radiusLg(), theme.scaledUi(1.0));
 }
@@ -1084,7 +1103,7 @@ fn drawFooterBar(state: *runtime.AppState, layout: SettingsLayout, dirty: bool) 
 const FooterStyle = enum { primary, secondary };
 
 fn drawCard(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect) void {
-    queueRoundedRectClipped(state, rect, paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.03)), radiusMd(), clip);
+    queueRoundedRectClipped(state, rect, paletteColor(cardSurface()), radiusMd(), clip);
 }
 
 fn drawCardTitle(state: *runtime.AppState, card: palette.Rect, title: []const u8, clip: palette.Rect) void {
@@ -1111,13 +1130,13 @@ fn drawThemeDropdown(state: *runtime.AppState, layout: SettingsLayout) void {
     const rect = layout.theme_dropdown;
     const hovered = isControlHovered(state, .theme_dropdown);
     const background = if (state.settings_theme_dropdown_open)
-        theme.withAlpha(theme.COLOR_GREEN, 34)
+        theme.withAlpha(theme.accent(), 34)
     else if (hovered)
-        theme.lighten(theme.COLOR_PANEL_MUTED, 0.06)
+        controlHoverSurface()
     else
-        theme.lighten(theme.COLOR_PANEL_MUTED, 0.02);
+        controlSurface();
     queueRoundedRectClipped(state, rect, paletteColor(background), radiusSm(), layout.body_clip);
-    queueBorderClipped(state, rect, paletteColor(if (state.settings_theme_dropdown_open) theme.withAlpha(theme.COLOR_GREEN, 150) else theme.withAlpha(theme.COLOR_WHITE, 24)), radiusSm(), theme.scaledUi(1.0), layout.body_clip);
+    queueBorderClipped(state, rect, paletteColor(if (state.settings_theme_dropdown_open) theme.withAlpha(theme.accent(), 150) else theme.withAlpha(theme.COLOR_WHITE, 24)), radiusSm(), theme.scaledUi(1.0), layout.body_clip);
 
     const selected = @min(state.settings_draft.theme_choice, state.settingsThemeChoiceCount() - 1);
     queueText(state, .{
@@ -1139,7 +1158,7 @@ fn drawThemeDropdown(state: *runtime.AppState, layout: SettingsLayout) void {
 fn drawThemeDropdownMenu(state: *runtime.AppState, layout: SettingsLayout) void {
     if (!state.settings_theme_dropdown_open) return;
     const menu = themeMenuRect(state, layout);
-    queueRoundedRectClipped(state, menu, paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.06)), radiusSm(), layout.body_clip);
+    queueRoundedRectClipped(state, menu, paletteColor(raisedSurface(0.14)), radiusSm(), layout.body_clip);
     queueBorderClipped(state, menu, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 34)), radiusSm(), theme.scaledUi(1.0), layout.body_clip);
 
     for (0..themeMenuVisibleCount(state)) |visible_index| {
@@ -1148,12 +1167,12 @@ fn drawThemeDropdownMenu(state: *runtime.AppState, layout: SettingsLayout) void 
         const selected = choice_index == state.settings_draft.theme_choice;
         const hovered = state.settings_theme_hover_index == choice_index;
         if (selected or hovered) {
-            const color = if (selected) theme.withAlpha(theme.COLOR_GREEN, 38) else theme.lighten(theme.COLOR_PANEL_MUTED, 0.05);
+            const color = if (selected) theme.withAlpha(theme.accent(), 38) else controlHoverSurface();
             queueRoundedRectClipped(state, row, paletteColor(color), theme.scaledUi(4.0), layout.body_clip);
         }
 
         const dot_size = theme.scaledUi(6.0);
-        const dot_color = if (selected) theme.COLOR_GREEN else theme.withAlpha(theme.COLOR_TEXT_MUTED, 110);
+        const dot_color = if (selected) theme.accent() else theme.withAlpha(theme.COLOR_TEXT_MUTED, 110);
         queueRoundedRectClipped(state, .{
             .x = row.x + theme.scaledUi(10.0),
             .y = row.y + (row.h - dot_size) * 0.5,
@@ -1188,20 +1207,20 @@ fn drawThemeDropdownMenu(state: *runtime.AppState, layout: SettingsLayout) void 
 
 fn drawToggleCell(state: *runtime.AppState, rect: palette.Rect, label: []const u8, selected: bool, hovered: bool, clip: palette.Rect) void {
     const bg = if (selected)
-        theme.withAlpha(theme.COLOR_GREEN, 44)
+        theme.withAlpha(theme.accent(), 44)
     else if (hovered)
-        theme.lighten(theme.COLOR_PANEL_MUTED, 0.06)
+        controlHoverSurface()
     else
-        theme.lighten(theme.COLOR_PANEL_MUTED, 0.02);
+        controlSurface();
     queueRoundedRectClipped(state, rect, paletteColor(bg), radiusSm(), clip);
     // Unselected cells need a visible edge or they read as disabled.
-    const border = if (selected) theme.withAlpha(theme.COLOR_GREEN, 140) else theme.withAlpha(theme.COLOR_WHITE, 26);
+    const border = if (selected) theme.withAlpha(theme.accent(), 140) else theme.withAlpha(theme.COLOR_WHITE, 26);
     queueBorderClipped(state, rect, paletteColor(border), radiusSm(), theme.scaledUi(1.0), clip);
 
     const dot_size = theme.scaledUi(7.0);
     const dot_x = rect.x + theme.scaledUi(10.0);
     const dot_y = rect.y + (rect.h - dot_size) * 0.5;
-    const dot_color = if (selected) theme.COLOR_GREEN else theme.withAlpha(theme.COLOR_TEXT_MUTED, 180);
+    const dot_color = if (selected) theme.accent() else theme.withAlpha(theme.COLOR_TEXT_MUTED, 180);
     queueRoundedRectClipped(state, .{ .x = dot_x, .y = dot_y, .w = dot_size, .h = dot_size }, paletteColor(dot_color), theme.scaledUi(3.5), clip);
 
     const text_color = if (selected or hovered) theme.COLOR_WHITE else textLabel();
@@ -1216,7 +1235,7 @@ fn drawToggleCell(state: *runtime.AppState, rect: palette.Rect, label: []const u
 // Boolean setting row: label on the left, switch track on the right.
 fn drawSwitchRow(state: *runtime.AppState, rect: palette.Rect, label: []const u8, on: bool, hovered: bool, clip: palette.Rect) void {
     if (hovered) {
-        queueRoundedRectClipped(state, rect, paletteColor(theme.lighten(theme.COLOR_PANEL_MUTED, 0.05)), radiusSm(), clip);
+        queueRoundedRectClipped(state, rect, paletteColor(controlHoverSurface()), radiusSm(), clip);
     }
     queueText(state, .{
         .x = rect.x + theme.scaledUi(10.0),
@@ -1233,7 +1252,7 @@ fn drawSwitchRow(state: *runtime.AppState, rect: palette.Rect, label: []const u8
         .w = track_w,
         .h = track_h,
     };
-    const track_color = if (on) theme.withAlpha(theme.COLOR_GREEN, 200) else theme.withAlpha(theme.COLOR_PANEL_MUTED, 235);
+    const track_color = if (on) theme.withAlpha(theme.accent(), 200) else controlSurface();
     queueRoundedRectClipped(state, track, paletteColor(track_color), track_h * 0.5, clip);
     if (!on) {
         queueBorderClipped(state, track, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 34)), track_h * 0.5, theme.scaledUi(1.0), clip);
@@ -1242,7 +1261,7 @@ fn drawSwitchRow(state: *runtime.AppState, rect: palette.Rect, label: []const u8
     const knob_pad = theme.scaledUi(3.0);
     const knob = track_h - knob_pad * 2.0;
     const knob_x = if (on) track.x + track.w - knob_pad - knob else track.x + knob_pad;
-    const knob_color = if (on) theme.COLOR_WHITE else theme.withAlpha(theme.COLOR_WHITE, 190);
+    const knob_color = if (on) theme.foregroundOn(theme.accent()) else theme.withAlpha(theme.COLOR_WHITE, 190);
     queueRoundedRectClipped(state, .{ .x = knob_x, .y = track.y + knob_pad, .w = knob, .h = knob }, paletteColor(knob_color), knob * 0.5, clip);
 }
 
@@ -1259,18 +1278,18 @@ fn drawSegmentedPair(
     clip: palette.Rect,
 ) void {
     const container: palette.Rect = .{ .x = left.x, .y = left.y, .w = left.w + right.w, .h = left.h };
-    queueRoundedRectClipped(state, container, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 120)), radiusSm(), clip);
+    queueRoundedRectClipped(state, container, paletteColor(controlSurface()), radiusSm(), clip);
     queueBorderClipped(state, container, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 26)), radiusSm(), theme.scaledUi(1.0), clip);
 
     if (left_hovered and !left_selected) {
-        queueRoundedRectClipped(state, left, paletteColor(theme.lighten(theme.COLOR_PANEL_MUTED, 0.06)), radiusSm(), clip);
+        queueRoundedRectClipped(state, left, paletteColor(controlHoverSurface()), radiusSm(), clip);
     }
     if (right_hovered and left_selected) {
-        queueRoundedRectClipped(state, right, paletteColor(theme.lighten(theme.COLOR_PANEL_MUTED, 0.06)), radiusSm(), clip);
+        queueRoundedRectClipped(state, right, paletteColor(controlHoverSurface()), radiusSm(), clip);
     }
     const selected_rect = if (left_selected) left else right;
-    queueRoundedRectClipped(state, selected_rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 44)), radiusSm(), clip);
-    queueBorderClipped(state, selected_rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 150)), radiusSm(), theme.scaledUi(1.0), clip);
+    queueRoundedRectClipped(state, selected_rect, paletteColor(theme.withAlpha(theme.accent(), 44)), radiusSm(), clip);
+    queueBorderClipped(state, selected_rect, paletteColor(theme.withAlpha(theme.accent(), 150)), radiusSm(), theme.scaledUi(1.0), clip);
 
     const left_color = if (left_selected or left_hovered) theme.COLOR_WHITE else textLabel();
     const right_color = if (!left_selected or right_hovered) theme.COLOR_WHITE else textLabel();
@@ -1283,13 +1302,16 @@ const ButtonStyle = enum { primary, secondary, disabled };
 // Push button for immediate actions (update check/install), with a real
 // disabled look so inert states don't read as clickable pills.
 fn drawActionButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8, style: ButtonStyle, hovered: bool, clip: palette.Rect) void {
+    var button_fill: ?[4]f32 = null;
     switch (style) {
         .primary => {
-            const bg = if (hovered) theme.lighten(theme.COLOR_GREEN, 0.08) else theme.COLOR_GREEN;
+            const accent = theme.accent();
+            const bg = if (hovered) theme.mix(accent, theme.foregroundOn(accent), 0.10) else accent;
+            button_fill = bg;
             queueRoundedRectClipped(state, rect, paletteColor(bg), radiusSm(), clip);
         },
         .secondary => {
-            const bg = if (hovered) theme.lighten(theme.COLOR_PANEL_MUTED, 0.08) else theme.lighten(theme.COLOR_PANEL_MUTED, 0.02);
+            const bg = if (hovered) controlHoverSurface() else controlSurface();
             queueRoundedRectClipped(state, rect, paletteColor(bg), radiusSm(), clip);
             queueBorderClipped(state, rect, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 30)), radiusSm(), theme.scaledUi(1.0), clip);
         },
@@ -1297,7 +1319,12 @@ fn drawActionButton(state: *runtime.AppState, rect: palette.Rect, label: []const
             queueBorderClipped(state, rect, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 16)), radiusSm(), theme.scaledUi(1.0), clip);
         },
     }
-    const text_color = if (style == .disabled) textHint() else theme.COLOR_WHITE;
+    const text_color = if (style == .disabled)
+        textHint()
+    else if (button_fill) |fill|
+        theme.foregroundOn(fill)
+    else
+        theme.COLOR_WHITE;
     queueCenteredText(state, rect, label, paletteColor(text_color), theme.scaledUi(13.0), clip);
 }
 
@@ -1343,7 +1370,7 @@ fn drawStepperRow(
 
     const pill_x = dec_rect.x;
     const pill: palette.Rect = .{ .x = pill_x, .y = row_y, .w = m.stepperW(), .h = m.row_h };
-    queueRoundedRectClipped(state, pill, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 120)), radiusSm(), clip);
+    queueRoundedRectClipped(state, pill, paletteColor(controlSurface()), radiusSm(), clip);
 
     var value_buf: [8]u8 = undefined;
     const value_text = std.fmt.bufPrint(&value_buf, "{d:.0}", .{value}) catch "?";
@@ -1360,7 +1387,7 @@ fn drawStepperRow(
 
 fn drawStepButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8, enabled: bool, hovered: bool, clip: palette.Rect) void {
     if (hovered and enabled) {
-        queueRoundedRectClipped(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 140)), theme.scaledUi(5.0), clip);
+        queueRoundedRectClipped(state, rect, paletteColor(controlHoverSurface()), theme.scaledUi(5.0), clip);
     }
     const text_color = if (enabled) theme.COLOR_WHITE else textHint();
     queueCenteredText(state, rect, label, paletteColor(text_color), theme.scaledUi(15.0), clip);
@@ -1368,11 +1395,11 @@ fn drawStepButton(state: *runtime.AppState, rect: palette.Rect, label: []const u
 
 fn drawFooterButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8, style: FooterStyle) void {
     const bg: [4]f32 = switch (style) {
-        .primary => theme.COLOR_GREEN,
-        .secondary => theme.COLOR_PANEL_MUTED,
+        .primary => theme.accent(),
+        .secondary => controlSurface(),
     };
     const text_color: [4]f32 = switch (style) {
-        .primary => theme.COLOR_WHITE,
+        .primary => theme.foregroundOn(bg),
         .secondary => theme.COLOR_WHITE,
     };
     queueRoundedRect(state, rect, paletteColor(bg), radiusMd());
@@ -1381,7 +1408,7 @@ fn drawFooterButton(state: *runtime.AppState, rect: palette.Rect, label: []const
 
 fn drawIconButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8, hovered: bool) void {
     if (hovered) {
-        queueRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 140)), radiusSm());
+        queueRoundedRect(state, rect, paletteColor(controlHoverSurface()), radiusSm());
     }
     queueCenteredText(state, rect, label, paletteColor(if (hovered) theme.COLOR_WHITE else textLabel()), theme.scaledUi(17.0), rect);
 }

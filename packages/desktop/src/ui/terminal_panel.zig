@@ -621,7 +621,7 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
         renderTerminalScrollbar(state, rect, grid_rect, scrollbar);
     }
     dock.markPaneRendered(pane_id);
-    if (focused) queueBorder(state, rect, paletteColor(theme.COLOR_SECONDARY_GREEN), 0.0, theme.scaledUi(1.0));
+    if (focused) queueBorder(state, rect, paletteColor(theme.accent()), 0.0, theme.scaledUi(1.0));
 }
 
 fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const ghostty_vt.RenderState, terminal_model: ?*ghostty_vt.Terminal, rect: palette.Rect, font_scale: f32) void {
