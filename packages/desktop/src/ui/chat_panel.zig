@@ -39,9 +39,16 @@ const COMPOSER_FILE_SEARCH_Z: i32 = 150;
 const COMPOSER_TOOLBAR_PILL_PAD_X: f32 = 13.0;
 /// Provider logo slot in the model pill.
 const COMPOSER_PROVIDER_LOGO_SLOT_CSS: f32 = 26.0;
-const TRANSCRIPT_MAX_WIDTH: f32 = 900.0;
+/// Shared max width for the chat content column. The composer card and the
+/// transcript bubble column both clamp to this (via `chatContentColumn`) so
+/// they always stay vertically aligned at the same width.
+const CHAT_CONTENT_MAX_WIDTH: f32 = 900.0;
 const TRANSCRIPT_LINE_HEIGHT: f32 = 22.0;
-const TRANSCRIPT_MARKDOWN_FONT_SIZE: f32 = 15.5;
+/// Bubble body text matches the composer's input text exactly (same CSS units,
+/// same `uiScaleFactor()`), so reading the thread and typing a prompt share one
+/// type size. Line height, glyph estimates, and code sizes all derive from this
+/// via `markdownOptions`, so bubble heights track it automatically.
+const TRANSCRIPT_MARKDOWN_FONT_SIZE: f32 = app_state.PALETTE_COMPOSER_FONT_SIZE;
 /// Direct wheel scroll (no inertia); larger than legacy 64 for faster scanning.
 const TRANSCRIPT_WHEEL_PIXELS: f32 = 96.0;
 const TRANSCRIPT_PAGE_VIEW_FRAC: f32 = 0.88;
@@ -178,6 +185,18 @@ fn paneOwnsActiveChatState(state: *const app_state.AppState, pane_id: ?app_state
     return state.isCurrentProjectWorkspacePaneFocused(id) or state.isCurrentProjectWorkspacePaneMaximized(id);
 }
 
+/// Single source of truth for the chat lane's centered content column: the
+/// composer card and the transcript bubble column both take their x/width from
+/// this formula so they render at exactly the same width on the same axis.
+/// Responsive: per-side inset scales with lane width (clamped 16–48px) and the
+/// column caps at CHAT_CONTENT_MAX_WIDTH on wide panes. x/w are snapped to
+/// whole pixels so both surfaces land on identical device pixels.
+fn chatContentColumn(lane_x: f32, lane_w: f32) struct { x: f32, w: f32 } {
+    const side_margin = theme.clampf(lane_w * 0.045, theme.scaledUi(16.0), theme.scaledUi(48.0));
+    const width = @max(theme.scaledUi(220.0), @min(lane_w - side_margin * 2.0, theme.scaledUi(CHAT_CONTENT_MAX_WIDTH)));
+    return .{ .x = @round(lane_x + (lane_w - width) * 0.5), .w = @round(width) };
+}
+
 pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: palette.Rect, pane_id: ?app_state.WorkspacePaneId, header_right_reserve: f32) void {
     const live_composer = paneOwnsActiveChatState(state, pane_id);
     const restore_thread_index = if (pane_id != null and state.projects.items.len > 0)
@@ -286,11 +305,13 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
     const composer_lane_w = if (split_chat_browser) transcript_body.w - browser_width else transcript_body.w;
     const composer_lane_x = transcript_body.x;
 
-    const composer_width = @max(theme.scaledUi(220.0), @min(composer_lane_w - side_margin * 2.0, theme.scaledUi(980.0)));
+    // Composer shares the transcript's content column so the prompt box and the
+    // conversation bubbles are always the same width on the same center axis.
+    const composer_column = chatContentColumn(composer_lane_x, composer_lane_w);
     const composer_rect = palette.Rect{
-        .x = composer_lane_x + (composer_lane_w - composer_width) * 0.5,
+        .x = composer_column.x,
         .y = composer_y,
-        .w = composer_width,
+        .w = composer_column.w,
         .h = composer_height,
     };
 
@@ -1833,9 +1854,10 @@ fn appendTranscriptHit(hit: TranscriptHit) void {
 fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?app_state.WorkspacePaneId) void {
     transcript_rect = rect;
     transcript_pane_id = pane_id;
-    const gutter = theme.scaledUi(if (rect.w < theme.scaledUi(760.0)) 32.0 else 64.0);
-    const column_width = @min(rect.w - gutter, theme.scaledUi(TRANSCRIPT_MAX_WIDTH));
-    const column = snapRect(palette.Rect{ .x = rect.x + (rect.w - column_width) * 0.5, .y = rect.y + theme.scaledUi(28.0), .w = column_width, .h = @max(rect.h - theme.scaledUi(42.0), 1.0) });
+    // Bubble column comes from the same shared formula as the composer card so
+    // transcript content and the prompt box stay width-aligned at every size.
+    const content_column = chatContentColumn(rect.x, rect.w);
+    const column = snapRect(palette.Rect{ .x = content_column.x, .y = rect.y + theme.scaledUi(28.0), .w = content_column.w, .h = @max(rect.h - theme.scaledUi(42.0), 1.0) });
     // Clip to full transcript body (same x/w as layout rect) so GL text and bubbles
     // stay below the workspace header when scrolled.
     const clip = rect;
