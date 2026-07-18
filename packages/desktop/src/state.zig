@@ -2373,7 +2373,7 @@ fn defaultAgentTui(provider: stack_config.AgentProvider) ?DefaultAgentTui {
         .codex => .{ .name = "codex", .command = "codex", .provider = .codex, .notify = true, .mcp = true, .hooks = true },
         .claude => .{ .name = "claude", .command = "claude", .provider = .claude },
         .opencode => .{ .name = "opencode", .command = opencodeTuiCommandForOs(builtin.os.tag), .provider = .opencode },
-        .cursor => .{ .name = "cursor", .command = "agent", .provider = .cursor },
+        .cursor => .{ .name = "cursor", .command = "agent", .provider = .cursor, .notify = true, .hooks = true },
         .amp => .{ .name = "amp", .command = "amp", .provider = .amp },
         .other => null,
     };
@@ -4584,6 +4584,7 @@ pub const AppState = struct {
     settings_draft: SettingsDraft,
     settings_hook_claude_installed: bool,
     settings_hook_codex_installed: bool,
+    settings_hook_cursor_installed: bool,
     settings_hook_amp_installed: bool,
     settings_mcp_summary: provider_mcp.Summary,
     settings_scroll_y: f32,
@@ -4860,6 +4861,7 @@ pub const AppState = struct {
             .settings_draft = .{},
             .settings_hook_claude_installed = false,
             .settings_hook_codex_installed = false,
+            .settings_hook_cursor_installed = false,
             .settings_hook_amp_installed = false,
             .settings_mcp_summary = .{},
             .settings_scroll_y = 0.0,
@@ -8811,6 +8813,7 @@ pub const AppState = struct {
         self.syncSettingsDraftFromConfig();
         self.settings_hook_claude_installed = provider_hooks.claudeGlobalHooksInstalled(self.allocator);
         self.settings_hook_codex_installed = provider_hooks.codexGlobalHooksInstalled(self.allocator);
+        self.settings_hook_cursor_installed = provider_hooks.cursorGlobalHooksInstalled(self.allocator);
         self.settings_hook_amp_installed = provider_hooks.ampGlobalHooksInstalled(self.allocator);
         self.settings_mcp_summary = provider_mcp.inspect(self.allocator);
         self.settings_scroll_y = 0.0;
@@ -8926,6 +8929,31 @@ pub const AppState = struct {
             };
             self.settings_hook_codex_installed = true;
             self.setSidebarNotice("Enabled global Codex status hooks.");
+        }
+        self.markDirty();
+    }
+
+    /// Installs or removes Cursor's user-scoped hooks. Cursor consumes the same
+    /// hook file in its terminal agent and desktop Agent UI.
+    pub fn toggleCursorGlobalHooks(self: *AppState) void {
+        if (self.settings_hook_cursor_installed) {
+            provider_hooks.removeCursorGlobalHooks(self.allocator) catch |err| {
+                log.warn("failed to remove global Cursor hooks: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Could not remove Cursor hooks.");
+                self.markDirty();
+                return;
+            };
+            self.settings_hook_cursor_installed = false;
+            self.setSidebarNotice("Disabled global Cursor status hooks.");
+        } else {
+            provider_hooks.ensureCursorGlobalHooks(self.allocator) catch |err| {
+                log.warn("failed to install global Cursor hooks: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Could not install Cursor hooks.");
+                self.markDirty();
+                return;
+            };
+            self.settings_hook_cursor_installed = true;
+            self.setSidebarNotice("Enabled global Cursor status hooks.");
         }
         self.markDirty();
     }
@@ -14206,7 +14234,13 @@ pub const AppState = struct {
         switch (process.provider orelse return) {
             .codex => try provider_hooks.ensureCodexProjectHooks(self.allocator, project_path),
             .claude => try provider_hooks.ensureClaudeProjectHooks(self.allocator, project_path),
-            .opencode, .cursor, .amp, .other => {},
+            // Hooks add status reporting but are not required to run Cursor.
+            // Keep automatic TUI launch fail-open for malformed user config;
+            // explicit Settings/CLI installation still reports the error.
+            .cursor => provider_hooks.ensureCursorProjectHooks(self.allocator, project_path) catch |err| {
+                log.warn("could not install Cursor project status hooks: {s}", .{@errorName(err)});
+            },
+            .opencode, .amp, .other => {},
         }
     }
 

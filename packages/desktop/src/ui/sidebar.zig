@@ -1906,6 +1906,7 @@ fn providerFromComm(comm: []const u8) ?TerminalAgentProvider {
     if (std.mem.eql(u8, comm, "codex")) return .codex;
     if (std.mem.eql(u8, comm, "opencode")) return .opencode;
     if (std.mem.startsWith(u8, comm, "cursor")) return .cursor;
+    if (std.mem.eql(u8, comm, "agent")) return .cursor;
     if (std.mem.eql(u8, comm, "amp")) return .amp;
     return null;
 }

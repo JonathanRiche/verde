@@ -1574,7 +1574,7 @@ const integration_providers = [_]IntegrationProvider{
     .{ .name = "codex", .hook_state = "project-local", .installable = true, .installed = false, .reason = "Codex hooks are supported through project-local .codex/hooks.json when enabled for a Verde session." },
     .{ .name = "amp", .hook_state = "global-plugin", .installable = true, .installed = false, .reason = "Amp lifecycle events are supported through a global ~/.config/amp/plugins/verde-notify.ts plugin." },
     .{ .name = "opencode", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
-    .{ .name = "cursor", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
+    .{ .name = "cursor", .hook_state = "project-local", .installable = true, .installed = false, .reason = "Cursor Agent uses the same .cursor/hooks.json format in its terminal and desktop UI; Verde status updates require inherited Verde pane identity." },
 };
 
 fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8) !void {
@@ -1587,10 +1587,10 @@ fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []
             \\  verde integrations remove <claude|codex|amp|opencode|cursor> [--global]
             \\  verde integrations disable <claude|codex|amp|opencode|cursor>
             \\
-            \\  --global installs Claude/Codex hooks in ~/.claude/settings.json or
-            \\  ~/.codex/hooks.json, and installs Amp's plugin in ~/.config/amp/plugins
-            \\  for all projects (no-op outside Verde panes); otherwise supported hooks
-            \\  are project-local where the provider supports that.
+            \\  --global installs Claude/Codex/Cursor hooks in their user config files,
+            \\  and installs Amp's plugin in ~/.config/amp/plugins for all projects
+            \\  (no-op outside Verde panes); otherwise supported hooks are project-local
+            \\  where the provider supports that.
             \\
             \\Provider hooks are optional. Verde does not overwrite provider config
             \\or change provider login/auth behavior.
@@ -1661,6 +1661,25 @@ fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []
             try out.stdout("verde integrations {s} codex --global: removed global Codex hooks from ~/.codex/hooks.json\n", .{command});
             return;
         }
+        if (global and std.mem.eql(u8, provider.name, "cursor")) {
+            provider_hooks.removeCursorGlobalHooks(allocator) catch |err| {
+                try out.stderr("verde integrations {s} cursor --global: {s}\n", .{ command, @errorName(err) });
+                std.process.exit(1);
+            };
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = command,
+                    .installed = false,
+                    .changed = true,
+                    .status = "removed",
+                    .scope = "global",
+                });
+                return;
+            }
+            try out.stdout("verde integrations {s} cursor --global: removed global Cursor hooks from ~/.cursor/hooks.json\n", .{command});
+            return;
+        }
         if (global and std.mem.eql(u8, provider.name, "amp")) {
             provider_hooks.removeAmpGlobalHooks(allocator) catch |err| {
                 try out.stderr("verde integrations {s} amp --global: {s}\n", .{ command, @errorName(err) });
@@ -1726,7 +1745,7 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
             .verde_env = std.mem.eql(u8, verde_env, "1"),
             .has_terminal_identity = has_identity,
             .providers = integration_providers[0..],
-            .summary = "Claude/Codex hooks and the Amp global plugin are available; other providers currently use generic verde notify, OSC, and MCP paths.",
+            .summary = "Claude/Codex/Cursor hooks and the Amp global plugin are available; other providers currently use generic verde notify, OSC, and MCP paths.",
         });
         return;
     }
@@ -1734,7 +1753,7 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
         \\Integration doctor:
         \\  VERDE=1: {s}
         \\  terminal identity: {s}
-        \\  hook installers: claude, codex project-local/global; amp global plugin
+        \\  hook installers: claude, codex, cursor project-local/global; amp global plugin
         \\  generic paths: verde notify, OSC 777 notify, MCP surface tools
         \\
     , .{
@@ -1866,6 +1885,53 @@ fn installIntegration(allocator: std.mem.Allocator, out: output.Output, json: bo
             return;
         }
         try out.stdout("verde integrations install amp --global: installed global Amp plugin in ~/.config/amp/plugins/verde-notify.ts\n", .{});
+        return;
+    }
+
+    if (std.mem.eql(u8, provider.name, "cursor") and global) {
+        provider_hooks.ensureCursorGlobalHooks(allocator) catch |err| {
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = "install",
+                    .installed = false,
+                    .status = "error",
+                    .scope = "global",
+                    .reason = @errorName(err),
+                });
+                return;
+            }
+            try out.stderr("verde integrations install cursor --global: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        if (json) {
+            try out.jsonValue(allocator, .{
+                .provider = provider.name,
+                .action = "install",
+                .installed = true,
+                .status = "installed",
+                .scope = "global",
+                .path = "~/.cursor/hooks.json",
+            });
+            return;
+        }
+        try out.stdout("verde integrations install cursor --global: merged global Cursor hooks into ~/.cursor/hooks.json\n", .{});
+        return;
+    }
+
+    if (std.mem.eql(u8, provider.name, "cursor")) {
+        try provider_hooks.ensureCursorProjectHooks(allocator, project_path);
+        if (json) {
+            try out.jsonValue(allocator, .{
+                .provider = provider.name,
+                .action = "install",
+                .installed = true,
+                .status = "installed",
+                .path = ".cursor/hooks.json",
+            });
+            return;
+        }
+        try out.stdout("verde integrations install cursor: merged project-local Cursor hooks into .cursor/hooks.json\n", .{});
         return;
     }
 
