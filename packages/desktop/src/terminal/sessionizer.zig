@@ -28,7 +28,8 @@ pub const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\verde-sessionizer-";
 // app-server tool requests and leave GUI turns pending forever.
 // Version 9 transfers Codex server ownership to the daemon and retains
 // completed chat turns until the desktop consumes them.
-pub const PROTOCOL_VERSION: u32 = 9;
+// Version 10 terminates the complete PTY process group for managed processes.
+pub const PROTOCOL_VERSION: u32 = 10;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
@@ -603,7 +604,7 @@ const PosixPtyBackend = if (builtin.os.tag == .windows) struct {} else struct {
     }
 
     fn deinit(self: *Self, _: std.mem.Allocator) void {
-        if (self.running) std.posix.kill(self.child_pid, std.posix.SIG.TERM) catch {};
+        if (self.running) _ = self.signalTermination();
         _ = std.c.close(self.master_fd);
         _ = self.captureExitStatus();
     }
@@ -643,10 +644,30 @@ const PosixPtyBackend = if (builtin.os.tag == .windows) struct {} else struct {
 
     fn terminate(self: *Self) bool {
         if (!self.running) return false;
-        std.posix.kill(self.child_pid, std.posix.SIG.TERM) catch return false;
+        if (!self.signalTermination()) return false;
         self.running = false;
         _ = self.captureExitStatus();
         return true;
+    }
+
+    fn signalTermination(self: *Self) bool {
+        const foreground_process_group: ?std.posix.pid_t = if (self.foregroundProcessGroup()) |pgrp| @intCast(pgrp) else null;
+        var signaled = signalDescendantProcessGroups(
+            std.heap.smp_allocator,
+            self.child_pid,
+            foreground_process_group,
+            std.c.SIG.TERM,
+        ) > 0;
+
+        // forkpty makes the child a process-group leader. Signal both that
+        // group and a distinct foreground group so script runners cannot
+        // leave their actual application alive after the launcher exits.
+        if (foreground_process_group) |pgrp| {
+            if (pgrp != self.child_pid and std.c.kill(-pgrp, std.c.SIG.TERM) == 0) signaled = true;
+        }
+        if (std.c.kill(-self.child_pid, std.c.SIG.TERM) == 0) signaled = true;
+        if (!signaled and std.c.kill(self.child_pid, std.c.SIG.TERM) == 0) signaled = true;
+        return signaled;
     }
 
     fn foregroundProcessGroup(self: *const Self) ?usize {
