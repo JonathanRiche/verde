@@ -3949,15 +3949,96 @@ fn renderInactiveComposerToolbar(state: *app_state.AppState, rect: palette.Rect)
     }
 
     // The live composer consolidates reasoning/speed/access into one run
-    // pill; the read-only preview mirrors that with the same summary text.
+    // pill; the read-only preview mirrors that with the same summary text
+    // and the same embedded state glyphs (brain gauge / bolt / lock).
     // Measure the joined label (it spans up to three settings and includes
     // multibyte separators) instead of guessing from byte count.
     var summary_buf: [192]u8 = undefined;
-    const summary_label = state.composerRunSummary(&summary_buf);
-    const summary_text_w = text_measure.textWidth(.ui, theme.scaledUi(12.5), summary_label);
-    const summary_w = theme.clampf(summary_text_w + theme.scaledUi(26.0), theme.scaledUi(76.0), theme.scaledUi(320.0));
+    const summary = state.composerRunSummaryParts(&summary_buf);
+    // Slot order mirrors syncPaletteComposerControls: optional reasoning
+    // glyph, optional speed glyph, then the always-present access glyph.
+    var slots: [3]InactiveRunSlot = undefined;
+    var slot_count: usize = 0;
+    if (summary.reasoning_offset) |offset| {
+        slots[slot_count] = .{ .byte_offset = offset, .kind = .reasoning };
+        slot_count += 1;
+    }
+    if (summary.fast_offset) |offset| {
+        slots[slot_count] = .{ .byte_offset = offset, .kind = .speed };
+        slot_count += 1;
+    }
+    slots[slot_count] = .{ .byte_offset = summary.access_offset, .kind = .access };
+    slot_count += 1;
+
+    const summary_text_w = text_measure.textWidth(.ui, theme.scaledUi(12.5), summary.text);
+    const cells_w = @as(f32, @floatFromInt(slot_count)) * theme.scaledUi(INACTIVE_RUN_PILL_ICON_CELL_CSS);
+    const summary_w = theme.clampf(summary_text_w + cells_w + theme.scaledUi(26.0), theme.scaledUi(76.0), theme.scaledUi(340.0));
     if (x + summary_w <= max_x) {
-        renderInactiveComposerPill(state, .{ .x = x, .y = y, .w = summary_w, .h = pill_h }, summary_label, false);
+        renderInactiveComposerRunPill(state, .{ .x = x, .y = y, .w = summary_w, .h = pill_h }, summary.text, slots[0..slot_count]);
+    }
+}
+
+/// One host-drawn state glyph inside the inactive preview's run pill;
+/// `byte_offset` splits the summary text exactly like the live pill's
+/// ComposerPromptIconSlot.
+const InactiveRunSlot = struct {
+    byte_offset: usize,
+    kind: enum { reasoning, speed, access },
+};
+
+/// Glyph cell width inside the inactive run pill; the preview is a scaled-
+/// down echo of the live pill (12.5pt vs 15pt labels), so the cell shrinks
+/// with it. Same convention as `COMPOSER_RUN_PILL_ICON_CELL`.
+const INACTIVE_RUN_PILL_ICON_CELL_CSS: f32 = 24.0;
+/// Drawn glyph size inside an inactive run-pill cell (live pill draws 22).
+const INACTIVE_RUN_PILL_ICON_SIZE_CSS: f32 = 18.0;
+
+// Renders the inactive preview's run pill: summary text broken around glyph
+// cells so brain/bolt/lock land beside the segment each one describes,
+// matching the live run pill's walk (including the half-space nudge that
+// centers each glyph over the word gap).
+fn renderInactiveComposerRunPill(state: *app_state.AppState, pill: palette.Rect, label: []const u8, slots: []const InactiveRunSlot) void {
+    queueRounded(state, pill, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 86)), pill.h * 0.5);
+    const font = theme.scaledUi(12.5);
+    const cell_w = theme.scaledUi(INACTIVE_RUN_PILL_ICON_CELL_CSS);
+    const icon_size = theme.scaledUi(INACTIVE_RUN_PILL_ICON_SIZE_CSS);
+    const icon_color = paletteColor(.{ 0.82, 0.85, 0.91, 1.0 });
+    const label_right = pill.x + pill.w - theme.scaledUi(10.0);
+    const label_y = pill.y + (pill.h - theme.scaledUi(15.0)) * 0.5;
+    const label_h = theme.scaledUi(16.0);
+    var x = pill.x + theme.scaledUi(13.0);
+    var byte: usize = 0;
+    for (slots) |slot| {
+        const offset = @min(slot.byte_offset, label.len);
+        if (offset > byte) {
+            const seg = label[byte..offset];
+            const seg_w = text_measure.textWidth(.ui, font, seg);
+            queueChromeLabel(state, .{ .x = x, .y = label_y, .w = seg_w + theme.scaledUi(2.0), .h = label_h }, seg, paletteColor(theme.COLOR_WHITE), font, pill);
+            x += seg_w;
+            byte = offset;
+        }
+        // Center the glyph over the word gap: cell spare plus the separator's
+        // leading space, mirroring reasoningIconSlotRects.
+        var space_end = byte;
+        while (space_end < label.len and label[space_end] == ' ') : (space_end += 1) {}
+        const gap_shift = text_measure.textWidth(.ui, font, label[byte..space_end]) * 0.5;
+        if (x + gap_shift + cell_w > label_right) break;
+        const cell = palette.Rect{ .x = x + gap_shift, .y = pill.y, .w = cell_w, .h = pill.h };
+        switch (slot.kind) {
+            // The brain inks its full em; draw it smaller so the three glyphs
+            // read as the same visual weight (matches the live pill).
+            .reasoning => drawThinkingIcon(state, composerIconRectInCell(cell, icon_size * 0.85), icon_color),
+            .speed => if (state.currentThread().fast_mode == .on)
+                drawBoltIcon(state, composerIconRectInCell(cell, icon_size), icon_color)
+            else
+                drawDefaultModeIcon(state, composerIconRectInCell(cell, icon_size), icon_color),
+            .access => drawAccessIcon(state, composerIconRectInCell(cell, icon_size), icon_color),
+        }
+        x += cell_w;
+    }
+    if (byte < label.len) {
+        const tail = label[byte..];
+        queueChromeLabel(state, .{ .x = x, .y = label_y, .w = @max(label_right - x, theme.scaledUi(1.0)), .h = label_h }, tail, paletteColor(theme.COLOR_WHITE), font, pill);
     }
 }
 
