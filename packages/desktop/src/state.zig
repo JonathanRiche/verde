@@ -11089,11 +11089,15 @@ pub const AppState = struct {
             var exited_editor_dock_id: ?u32 = null;
             for (project.terminal_docks.items) |*entry| {
                 const dock_visible = entry.dock.visible or project.workspace_layout.hasTerminalDockPane(entry.id);
+                const managed_process_explicitly_stopped = if (project.managedProcessByDockId(entry.id)) |process|
+                    process.explicit_stop
+                else
+                    false;
                 if (dock_visible and !entry.dock.hasRunningSession() and project.workspace_layout.hasEditorTerminalDockPane(entry.id)) {
                     exited_editor_dock_id = entry.id;
                     break;
                 }
-                if (project_selected and dock_visible and !entry.dock.hasRunningSession() and entry.dock.reserveAutoRestart(now_ms)) {
+                if (project_selected and dock_visible and !managed_process_explicitly_stopped and !entry.dock.hasRunningSession() and entry.dock.reserveAutoRestart(now_ms)) {
                     const start_result = if (entry.dock.hasRestorableSession())
                         entry.dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, entry.id)
                     else
