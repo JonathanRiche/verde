@@ -32,7 +32,7 @@ const COMPOSER_FOLLOWUP_PIN_Z: i32 = 126;
 /// Height of the pinned follow-up card shown above the composer while a reply
 /// streams and a message is queued/steered. One label line plus two prompt lines.
 const FOLLOWUP_PIN_HEIGHT: f32 = 60.0;
-const APPROVAL_CARD_HEIGHT: f32 = 104.0;
+const APPROVAL_CARD_HEIGHT: f32 = 112.0;
 /// File mention search must sit above composer chrome and toolbar menus.
 const COMPOSER_FILE_SEARCH_Z: i32 = 150;
 /// Must match `PaletteComposerPrompt` `pill_padding_x` in `state.zig` so toolbar glyphs align with label insets.
@@ -96,6 +96,11 @@ const ApprovalHitCache = struct {
     deny_rect: palette.Rect = .{},
 };
 var approval_hits: ApprovalHitCache = .{};
+
+const ApprovalAction = enum {
+    approve,
+    deny,
+};
 
 const FileSearchHitCache = struct {
     panel_rect: palette.Rect = .{},
@@ -544,6 +549,27 @@ pub fn transcriptActionWantsPointerAt(x: f32, y: f32) bool {
     return false;
 }
 
+/// True when the mouse rests on either pending-approval action.
+pub fn approvalActionWantsPointerAt(x: f32, y: f32) bool {
+    return approvalActionAt(x, y) != null;
+}
+
+/// Handles the approval card before pane and transcript routing because the
+/// card overlays the strip between those two regions.
+pub fn handleApprovalPaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool) bool {
+    const action = approvalActionAt(x, y) orelse return false;
+    if (!down) return true;
+
+    if (approval_hits.pane_id) |id| _ = state.focusCurrentProjectWorkspacePane(id);
+    state.resolvePendingApproval(switch (action) {
+        .approve => .approve,
+        .deny => .deny,
+    });
+    approval_hits = .{};
+    state.noteInteraction();
+    return true;
+}
+
 pub fn handleTranscriptPaletteWheel(state: *app_state.AppState, x: f32, y: f32, wheel_y: f32) bool {
     if (wheel_y == 0.0) return false;
     const hit = findTranscriptHit(x, y) orelse return false;
@@ -909,17 +935,6 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
         return false;
     }
 
-    if (clicks <= 1 and (rectContains(approval_hits.approve_rect, x, y) or rectContains(approval_hits.deny_rect, x, y))) {
-        if (approval_hits.pane_id) |id| _ = state.focusCurrentProjectWorkspacePane(id);
-        if (rectContains(approval_hits.approve_rect, x, y)) {
-            state.resolvePendingApproval(.approve);
-        } else {
-            state.resolvePendingApproval(.deny);
-        }
-        approval_hits = .{};
-        return true;
-    }
-
     const hit = findTranscriptHit(x, y) orelse return false;
     const pane_id = hit.pane_id;
     if (pane_id) |id| _ = state.focusCurrentProjectWorkspacePane(id);
@@ -997,23 +1012,56 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
 
 // Pending provider approval card above the composer.
 fn renderApprovalCard(state: *app_state.AppState, rect: palette.Rect, approval: app_state.PendingApproval, pane_id: ?app_state.WorkspacePaneId) void {
-    const pad = theme.scaledUi(14.0);
-    const button_h = theme.scaledUi(30.0);
-    const button_w = theme.scaledUi(92.0);
-    const gap = theme.scaledUi(8.0);
+    const pad = theme.scaledUi(16.0);
+    const button_h = theme.scaledUi(36.0);
+    const button_w = theme.scaledUi(96.0);
+    const gap = theme.scaledUi(12.0);
     queueRounded(state, rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(12.0));
     queueBorder(state, rect, paletteColor(theme.COLOR_GREEN), theme.scaledUi(12.0), theme.scaledUi(1.0));
-    queueText(state, .{ .x = rect.x + pad, .y = rect.y + theme.scaledUi(10.0), .w = rect.w - pad * 2.0, .h = theme.scaledUi(20.0) }, approval.title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), rect);
-    queueText(state, .{ .x = rect.x + pad, .y = rect.y + theme.scaledUi(34.0), .w = @max(rect.w - pad * 2.0 - button_w * 2.0 - gap - theme.scaledUi(12.0), theme.scaledUi(80.0)), .h = theme.scaledUi(42.0) }, approval.body, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), rect);
+    queueText(state, .{ .x = rect.x + pad, .y = rect.y + theme.scaledUi(12.0), .w = rect.w - pad * 2.0, .h = theme.scaledUi(20.0) }, approval.title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), rect);
+    queueText(state, .{ .x = rect.x + pad, .y = rect.y + theme.scaledUi(38.0), .w = @max(rect.w - pad * 2.0 - button_w * 2.0 - gap - theme.scaledUi(16.0), theme.scaledUi(80.0)), .h = theme.scaledUi(44.0) }, approval.body, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), rect);
 
     const deny_rect = palette.Rect{ .x = rect.x + rect.w - pad - button_w * 2.0 - gap, .y = rect.y + rect.h - pad - button_h, .w = button_w, .h = button_h };
     const approve_rect = palette.Rect{ .x = deny_rect.x + button_w + gap, .y = deny_rect.y, .w = button_w, .h = button_h };
-    queueRounded(state, deny_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0));
-    queueBorder(state, deny_rect, paletteColor(theme.borderMuted()), theme.scaledUi(8.0), theme.scaledUi(1.0));
-    queueText(state, deny_rect, "Decline", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), deny_rect);
-    queueRounded(state, approve_rect, paletteColor(theme.COLOR_GREEN), theme.scaledUi(8.0));
-    queueText(state, approve_rect, "Allow", paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), approve_rect);
+    const deny_hovered = rectContains(deny_rect, state.palette_mouse_x, state.palette_mouse_y);
+    const approve_hovered = rectContains(approve_rect, state.palette_mouse_x, state.palette_mouse_y);
+    queueRounded(state, deny_rect, paletteColor(if (deny_hovered) theme.lighten(theme.COLOR_PANEL_MUTED, 0.10) else theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0));
+    queueBorder(state, deny_rect, paletteColor(if (deny_hovered) theme.COLOR_TEXT_MUTED else theme.borderMuted()), theme.scaledUi(8.0), theme.scaledUi(1.0));
+    queueApprovalButtonLabel(state, deny_rect, "Decline", paletteColor(if (deny_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED));
+    queueRounded(state, approve_rect, paletteColor(if (approve_hovered) theme.lighten(theme.COLOR_GREEN, 0.08) else theme.COLOR_GREEN), theme.scaledUi(8.0));
+    queueApprovalButtonLabel(state, approve_rect, "Allow", paletteColor(theme.COLOR_WHITE));
     approval_hits = .{ .pane_id = pane_id, .approve_rect = approve_rect, .deny_rect = deny_rect };
+}
+
+fn approvalActionAt(x: f32, y: f32) ?ApprovalAction {
+    if (rectContains(approval_hits.approve_rect, x, y)) return .approve;
+    if (rectContains(approval_hits.deny_rect, x, y)) return .deny;
+    return null;
+}
+
+test "approval actions use their rendered button rectangles" {
+    const previous = approval_hits;
+    defer approval_hits = previous;
+    approval_hits = .{
+        .approve_rect = .{ .x = 120.0, .y = 40.0, .w = 80.0, .h = 36.0 },
+        .deny_rect = .{ .x = 28.0, .y = 40.0, .w = 80.0, .h = 36.0 },
+    };
+
+    try std.testing.expectEqual(ApprovalAction.approve, approvalActionAt(160.0, 58.0).?);
+    try std.testing.expectEqual(ApprovalAction.deny, approvalActionAt(68.0, 58.0).?);
+    try std.testing.expect(approvalActionAt(114.0, 58.0) == null);
+}
+
+fn queueApprovalButtonLabel(state: *app_state.AppState, rect: palette.Rect, label: []const u8, color: palette.Color) void {
+    const font_size = theme.scaledUi(13.0);
+    const label_w = text_measure.textWidth(.ui, font_size, label);
+    const label_h = theme.scaledUi(18.0);
+    queueChromeLabel(state, .{
+        .x = rect.x + @max((rect.w - label_w) * 0.5, 0.0),
+        .y = rect.y + @max((rect.h - label_h) * 0.5, 0.0),
+        .w = @min(label_w, rect.w),
+        .h = label_h,
+    }, label, color, font_size, rect);
 }
 
 /// Selects all assistant markdown in the current thread (persisted messages, pending timeline, and stream tail when present).
