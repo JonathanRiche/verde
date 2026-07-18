@@ -192,7 +192,7 @@ fn printHelp(out: output.Output) !void {
         \\  inspect --pane <id> [--workspace <id|index|current>] [--json]
         \\  workspace select|create|rename|close|reopen ...
         \\  pane focus|split|resize|move|minimize|maximize|restore|close ...
-        \\  chat status|transcript|send|followup|stop|approve|draft ...
+        \\  chat open|status|transcript|send|followup|stop|approve|draft ...
         \\  browser open|navigate|status|close|toggle|back|forward|reload|eval|screenshot|post-json|inspector-* ...
         \\  palette list|run ...
         \\  terminal write|tail|screen --pane <id> ...
@@ -2091,6 +2091,32 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
         try out.stderr("missing live chat command\n", .{});
         std.process.exit(2);
     };
+    if (std.mem.eql(u8, subcommand, "open")) {
+        const workspace_id = workspaceOption(argv) orelse {
+            try out.stderr("verde live chat open requires --workspace\n", .{});
+            std.process.exit(2);
+        };
+        const provider = args.optionValue(argv, "--provider") orelse {
+            try out.stderr("verde live chat open requires --provider\n", .{});
+            std.process.exit(2);
+        };
+        const target_pane_id = if (args.optionValue(argv, "--pane")) |value|
+            std.fmt.parseInt(u32, value, 10) catch {
+                try out.stderr("invalid --pane value: {s}\n", .{value});
+                std.process.exit(2);
+            }
+        else
+            null;
+        try sendLiveRequest(allocator, out, io, "chat.open", .{
+            .workspace_id = workspace_id,
+            .provider = provider,
+            .model = args.optionValue(argv, "--model"),
+            .target_pane_id = target_pane_id,
+            .axis = args.optionValue(argv, "--axis") orelse "horizontal",
+            .focus = !args.hasFlag(argv, "--no-focus"),
+        }, json);
+        return;
+    }
     if (std.mem.eql(u8, subcommand, "draft")) {
         const draft_command = args.positional(argv, 2) orelse {
             try out.stderr("missing live chat draft command\n", .{});
@@ -3137,6 +3163,14 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTypedTool(&s, "list_panes", "List chat and terminal panes in a Verde workspace.", &.{
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
     });
+    try writeMcpTypedTool(&s, "open_chat", "Create a native GUI chat pane for a specific provider in an explicitly selected Verde workspace.", &.{
+        .{ .name = "workspace_id", .type_name = "string", .description = "Required workspace id, index, or path. Pass a stable id to avoid desktop-selection dependence.", .required = true },
+        .{ .name = "provider", .type_name = "string", .description = "GUI provider: opencode, codex, claude, or cursor.", .required = true },
+        .{ .name = "model", .type_name = "string", .description = "Optional model id; defaults to the provider's current default." },
+        .{ .name = "target_pane_id", .type_name = "integer", .description = "Optional pane beside which to place the chat; defaults to the workspace's focused pane." },
+        .{ .name = "axis", .type_name = "string", .description = "Optional split axis: horizontal or vertical; defaults to horizontal." },
+        .{ .name = "focus", .type_name = "boolean", .description = "Whether to select the workspace and focus the new chat; defaults to true." },
+    });
     try writeMcpTool(&s, "list_surfaces", "List registered live terminal control surfaces. Use list_panes for ordinary Verde terminal panes.");
     try writeMcpTool(&s, "inspect_surface", "Inspect one Verde terminal surface.");
     try writeMcpTool(&s, "focus_surface", "Focus a Verde terminal surface.");
@@ -3321,6 +3355,36 @@ fn mcpToolsCall(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id
     }
 
     const response = blk: {
+        if (std.mem.eql(u8, tool_name, "open_chat")) {
+            const workspace_id = mcpArgString(arguments, "workspace_id") orelse
+                return try mcpError(allocator, out, id_value, -32602, "open_chat requires workspace_id");
+            const provider = mcpArgString(arguments, "provider") orelse
+                return try mcpError(allocator, out, id_value, -32602, "open_chat requires provider");
+            const model = mcpArgString(arguments, "model");
+            if (mcpArgIsNonNull(arguments, "model") and model == null) {
+                return try mcpError(allocator, out, id_value, -32602, "open_chat model must be a string");
+            }
+            const target_pane_id = mcpArgU32(arguments, "target_pane_id");
+            if (mcpArgIsNonNull(arguments, "target_pane_id") and target_pane_id == null) {
+                return try mcpError(allocator, out, id_value, -32602, "open_chat target_pane_id must be a non-negative integer");
+            }
+            const axis = mcpArgString(arguments, "axis");
+            if (mcpArgIsNonNull(arguments, "axis") and axis == null) {
+                return try mcpError(allocator, out, id_value, -32602, "open_chat axis must be a string");
+            }
+            const focus = mcpArgBool(arguments, "focus");
+            if (mcpArgIsNonNull(arguments, "focus") and focus == null) {
+                return try mcpError(allocator, out, id_value, -32602, "open_chat focus must be a boolean");
+            }
+            break :blk sendLiveRequestAlloc(allocator, io, "chat.open", .{
+                .workspace_id = workspace_id,
+                .provider = provider,
+                .model = model,
+                .target_pane_id = target_pane_id,
+                .axis = axis orelse "horizontal",
+                .focus = focus orelse true,
+            }, 1);
+        }
         if (std.mem.eql(u8, tool_name, "list_workspaces")) {
             break :blk sendLiveRequestAlloc(allocator, io, "workspaces", .{}, 1);
         }
@@ -3624,7 +3688,7 @@ fn mcpArgU32(arguments: std.json.Value, name: []const u8) ?u32 {
     if (arguments != .object) return null;
     const value = arguments.object.get(name) orelse .null;
     return switch (value) {
-        .integer => |int| if (int >= 0) @intCast(int) else null,
+        .integer => |int| if (int >= 0 and int <= std.math.maxInt(u32)) @intCast(int) else null,
         .number_string => |text| std.fmt.parseInt(u32, text, 10) catch null,
         else => null,
     };
@@ -3646,6 +3710,14 @@ fn mcpArgBool(arguments: std.json.Value, name: []const u8) ?bool {
     return switch (arguments.object.get(name) orelse .null) {
         .bool => |value| value,
         else => null,
+    };
+}
+
+fn mcpArgIsNonNull(arguments: std.json.Value, name: []const u8) bool {
+    if (arguments != .object) return false;
+    return switch (arguments.object.get(name) orelse .null) {
+        .null => false,
+        else => true,
     };
 }
 
@@ -3848,6 +3920,7 @@ fn optionConsumesValue(name: []const u8) bool {
         std.mem.eql(u8, name, "--decision") or
         std.mem.eql(u8, name, "--name") or
         std.mem.eql(u8, name, "--provider") or
+        std.mem.eql(u8, name, "--model") or
         std.mem.eql(u8, name, "--lines") or
         std.mem.eql(u8, name, "--thread");
 }
@@ -4075,6 +4148,7 @@ fn flagIsBare(name: []const u8) bool {
         std.mem.eql(u8, name, "-h") or
         std.mem.eql(u8, name, "--json") or
         std.mem.eql(u8, name, "--focused") or
+        std.mem.eql(u8, name, "--no-focus") or
         std.mem.eql(u8, name, "--clear") or
         std.mem.eql(u8, name, "--quiet");
 }
@@ -4084,6 +4158,13 @@ test "value-taking cli spec flags are covered by free arg parser" {
         if (flagIsBare(flag)) continue;
         try std.testing.expect(optionConsumesValue(flag));
     }
+}
+
+test "provider-aware chat opening is advertised by the live CLI" {
+    for (spec.live_capabilities) |capability| {
+        if (std.mem.eql(u8, capability, "chat.open")) return;
+    }
+    return error.MissingChatOpenCapability;
 }
 
 test "Windows attach console handler catches only interrupt controls" {

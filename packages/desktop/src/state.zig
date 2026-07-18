@@ -2139,6 +2139,12 @@ pub const BrowserOpenResult = struct {
     moved_from_workspace: ?usize,
 };
 
+pub const OpenChatResult = struct {
+    pane_id: WorkspacePaneId,
+    thread_index: usize,
+    focused: bool,
+};
+
 pub const BrowserScreenshotResult = struct {
     path: []u8,
     png_bytes: []u8,
@@ -14492,7 +14498,7 @@ pub const AppState = struct {
             error.WindowsPowerShellNotFound;
     }
 
-    fn argvContainsCodexHooksFeature(argv: []const []u8) bool {
+    fn argvContainsCodexHooksFeature(argv: []const []const u8) bool {
         for (argv) |arg| {
             if (containsCodexHooksFeature(arg)) return true;
         }
@@ -15329,6 +15335,47 @@ pub const AppState = struct {
         return self.splitWorkspacePaneWithChatPlacement(project_index, pane_id, axis, true);
     }
 
+    pub fn openWorkspaceChat(
+        self: *AppState,
+        project_index: usize,
+        provider: Provider,
+        model_ref: ?[]const u8,
+        target_pane_id: ?WorkspacePaneId,
+        axis: WorkspaceSplitAxis,
+        focus: bool,
+    ) !OpenChatResult {
+        if (project_index >= self.projects.items.len) return error.ProjectNotFound;
+        if (model_ref) |requested_model| {
+            if (!self.providerSupportsModel(provider, requested_model)) return error.InvalidModel;
+        }
+        const selected_model = model_ref orelse composerDefaultModelRef(self, provider);
+        const result = try createWorkspaceChatPane(
+            &self.projects.items[project_index],
+            self.allocator,
+            provider,
+            selected_model,
+            target_pane_id,
+            axis,
+            focus,
+        );
+        if (focus) {
+            self.selected_project_index = project_index;
+            self.requestComposerFocus();
+            self.syncPaletteComposerFromDraft();
+            self.syncRenameBuffer();
+        }
+        self.setSidebarNotice("New chat pane ready.");
+        return result;
+    }
+
+    pub fn providerSupportsModel(self: *const AppState, provider: Provider, model_ref: []const u8) bool {
+        for (composerModelOptions(self, provider)) |option| {
+            const available_model = option.value orelse continue;
+            if (std.mem.eql(u8, available_model, model_ref)) return true;
+        }
+        return false;
+    }
+
     pub fn splitWorkspacePaneWithChatPlacement(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, new_after: bool) bool {
         if (project_index >= self.projects.items.len) return false;
         var project = &self.projects.items[project_index];
@@ -15360,6 +15407,73 @@ pub const AppState = struct {
         self.setSidebarNotice("New chat pane ready.");
         self.markDirty();
         return true;
+    }
+
+    fn createWorkspaceChatPane(
+        project: *Project,
+        allocator: std.mem.Allocator,
+        provider: Provider,
+        model_ref: []const u8,
+        target_pane_id: ?WorkspacePaneId,
+        axis: WorkspaceSplitAxis,
+        focus: bool,
+    ) !OpenChatResult {
+        var layout = &project.workspace_layout;
+        const target_id = target_pane_id orelse layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse
+            return error.TargetPaneNotFound;
+        const target = layout.paneById(target_id) orelse return error.TargetPaneNotFound;
+        if (target.minimized) return error.TargetPaneMinimized;
+
+        const previous_focused_pane_id = layout.focused_pane_id;
+        const previous_maximized_pane_id = layout.maximized_pane_id;
+        const previous_thread_index = project.selected_thread_index;
+
+        var thread = try ChatThread.init(allocator, "New thread");
+        var thread_owned = true;
+        errdefer if (thread_owned) thread.deinit(allocator);
+        const owned_model_ref = try allocator.dupeZ(u8, model_ref);
+        allocator.free(thread.model_ref.?);
+        thread.model_ref = owned_model_ref;
+        thread.provider = provider;
+        thread.reasoning_effort = if (provider == .codex) DEFAULT_CODEX_REASONING_EFFORT else null;
+
+        try project.threads.append(allocator, thread);
+        thread_owned = false;
+        var thread_appended = true;
+        errdefer if (thread_appended) {
+            var removed_thread = project.threads.pop().?;
+            removed_thread.deinit(allocator);
+            project.selected_thread_index = previous_thread_index;
+        };
+        const thread_index = project.threads.items.len - 1;
+
+        const previous_next_pane_id = layout.next_pane_id;
+        errdefer layout.next_pane_id = previous_next_pane_id;
+        const new_pane_id = try layout.createChatPane(allocator, thread_index);
+        var pane_appended = true;
+        errdefer if (pane_appended) {
+            var removed_ref = layout.panes.pop().?.ref;
+            deinitWorkspacePaneRef(&removed_ref, allocator);
+        };
+
+        try layout.splitPaneWithLeaf(allocator, target_id, new_pane_id, axis, true);
+        pane_appended = false;
+        thread_appended = false;
+
+        if (focus) {
+            layout.maximized_pane_id = null;
+            project.selected_thread_index = thread_index;
+            project.last_content_pane_id = new_pane_id;
+        } else {
+            layout.focused_pane_id = previous_focused_pane_id;
+            layout.maximized_pane_id = previous_maximized_pane_id;
+            project.selected_thread_index = previous_thread_index;
+        }
+        return .{
+            .pane_id = new_pane_id,
+            .thread_index = thread_index,
+            .focused = focus,
+        };
     }
 
     pub fn splitCurrentProjectWorkspacePaneWithThread(
@@ -19964,6 +20078,111 @@ test "new Codex threads default to GPT-5.6 Sol with low reasoning" {
     defer thread.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(DEFAULT_CODEX_MODEL, thread.model_ref.?);
     try std.testing.expectEqual(DEFAULT_CODEX_REASONING_EFFORT, thread.reasoning_effort.?);
+}
+
+test "provider-aware chat creation scopes mutation and rejects invalid models" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.projects = .empty;
+    state.selected_project_index = 0;
+    state.opencode_model_options = .empty;
+    state.claude_model_options = .empty;
+    state.cursor_model_options = .empty;
+    state.dirty = false;
+    state.last_dirty_at_ms = 0;
+    state.last_interaction_at_ms = 0;
+    @memset(&state.sidebar_notice_storage, 0);
+    defer {
+        for (state.projects.items) |*project| project.deinit(allocator);
+        state.projects.deinit(allocator);
+    }
+
+    var first = try Project.init(allocator, "first", "First", "/tmp/first", 0);
+    state.projects.append(allocator, first) catch |err| {
+        first.deinit(allocator);
+        return err;
+    };
+    var second = try Project.init(allocator, "second", "Second", "/tmp/second", 0);
+    state.projects.append(allocator, second) catch |err| {
+        second.deinit(allocator);
+        return err;
+    };
+
+    const first_thread_count = state.projects.items[0].threads.items.len;
+    const first_pane_count = state.projects.items[0].workspace_layout.panes.items.len;
+    const second_thread_count = state.projects.items[1].threads.items.len;
+    const second_pane_count = state.projects.items[1].workspace_layout.panes.items.len;
+    const second_focused_pane = state.projects.items[1].workspace_layout.focused_pane_id;
+
+    try std.testing.expect(state.providerSupportsModel(.opencode, DEFAULT_OPENCODE_MODEL));
+    try std.testing.expect(state.providerSupportsModel(.codex, DEFAULT_CODEX_MODEL));
+    try std.testing.expect(state.providerSupportsModel(.claude, DEFAULT_CLAUDE_MODEL));
+    try std.testing.expect(state.providerSupportsModel(.cursor, DEFAULT_CURSOR_MODEL));
+
+    const result = try state.openWorkspaceChat(1, .cursor, "composer-2", 1, .vertical, false);
+    try std.testing.expectEqual(@as(usize, 0), state.selected_project_index);
+    try std.testing.expectEqual(first_thread_count, state.projects.items[0].threads.items.len);
+    try std.testing.expectEqual(first_pane_count, state.projects.items[0].workspace_layout.panes.items.len);
+    try std.testing.expectEqual(second_thread_count + 1, state.projects.items[1].threads.items.len);
+    try std.testing.expectEqual(second_pane_count + 1, state.projects.items[1].workspace_layout.panes.items.len);
+    try std.testing.expectEqual(second_focused_pane, state.projects.items[1].workspace_layout.focused_pane_id);
+    try std.testing.expect(!result.focused);
+    const thread = &state.projects.items[1].threads.items[result.thread_index];
+    try std.testing.expectEqual(Provider.cursor, thread.provider);
+    try std.testing.expectEqualStrings("composer-2", thread.model_ref.?);
+
+    const default_cases = [_]struct {
+        provider: Provider,
+        model: []const u8,
+    }{
+        .{ .provider = .opencode, .model = state.cachedDefaultModelRefForProvider(.opencode) },
+        .{ .provider = .codex, .model = DEFAULT_CODEX_MODEL },
+        .{ .provider = .claude, .model = DEFAULT_CLAUDE_MODEL },
+        .{ .provider = .cursor, .model = DEFAULT_CURSOR_MODEL },
+    };
+    for (default_cases) |case| {
+        const default_result = try state.openWorkspaceChat(1, case.provider, null, 1, .horizontal, false);
+        const default_thread = &state.projects.items[1].threads.items[default_result.thread_index];
+        try std.testing.expectEqual(case.provider, default_thread.provider);
+        try std.testing.expectEqualStrings(case.model, default_thread.model_ref.?);
+    }
+
+    const thread_count_before_rejection = state.projects.items[1].threads.items.len;
+    const pane_count_before_rejection = state.projects.items[1].workspace_layout.panes.items.len;
+    try std.testing.expectError(error.InvalidModel, state.openWorkspaceChat(1, .codex, "composer-2", 1, .horizontal, true));
+    try std.testing.expectEqual(thread_count_before_rejection, state.projects.items[1].threads.items.len);
+    try std.testing.expectEqual(pane_count_before_rejection, state.projects.items[1].workspace_layout.panes.items.len);
+
+    try std.testing.expectError(error.TargetPaneNotFound, state.openWorkspaceChat(1, .codex, null, 999, .horizontal, true));
+    try std.testing.expectEqual(thread_count_before_rejection, state.projects.items[1].threads.items.len);
+    try std.testing.expectEqual(pane_count_before_rejection, state.projects.items[1].workspace_layout.panes.items.len);
+}
+
+test "provider-aware chat creation focuses requested pane" {
+    const allocator = std.testing.allocator;
+    var project = try Project.init(allocator, "test", "Test", "/tmp/test", 0);
+    defer project.deinit(allocator);
+
+    const cases = [_]struct {
+        provider: Provider,
+        model: []const u8,
+    }{
+        .{ .provider = .opencode, .model = DEFAULT_OPENCODE_MODEL },
+        .{ .provider = .codex, .model = DEFAULT_CODEX_MODEL },
+        .{ .provider = .claude, .model = DEFAULT_CLAUDE_MODEL },
+        .{ .provider = .cursor, .model = DEFAULT_CURSOR_MODEL },
+    };
+    const previous_pane_count = project.workspace_layout.panes.items.len;
+    for (cases) |case| {
+        const result = try AppState.createWorkspaceChatPane(&project, allocator, case.provider, case.model, null, .horizontal, true);
+        try std.testing.expect(result.focused);
+        try std.testing.expectEqual(@as(?WorkspacePaneId, result.pane_id), project.workspace_layout.focused_pane_id);
+        try std.testing.expectEqual(result.thread_index, project.selected_thread_index);
+        try std.testing.expectEqual(case.provider, project.threads.items[result.thread_index].provider);
+        try std.testing.expectEqualStrings(case.model, project.threads.items[result.thread_index].model_ref.?);
+    }
+    try std.testing.expectEqual(previous_pane_count + cases.len, project.workspace_layout.panes.items.len);
 }
 
 test "Codex hook feature detection accepts current and legacy names" {

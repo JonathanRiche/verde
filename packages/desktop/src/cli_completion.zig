@@ -209,6 +209,8 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.workspace_reopen_flags);
     try w.writeAll("\"\n  local workspace_archive_flags=\"");
     try writeWords(w, &spec.workspace_archive_flags);
+    try w.writeAll("\"\n  local chat_open_flags=\"");
+    try writeWords(w, &spec.chat_open_flags);
     try w.writeAll("\"\n  local chat_draft_flags=\"");
     try writeWords(w, &spec.chat_draft_flags);
     try w.writeAll("\"\n  local chat_send_flags=\"");
@@ -261,7 +263,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    --decision) COMPREPLY=( $(compgen -W "$decision_values" -- "$cur") ); return 0 ;;
         \\    --provider) COMPREPLY=( $(compgen -W "$provider_values" -- "$cur") ); return 0 ;;
         \\    --mode) COMPREPLY=( $(compgen -W "$inspector_mode_values" -- "$cur") ); return 0 ;;
-        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--target|--script|--json-payload|--prompt|--call|--name|--lines|--command|--label|--profile|--remote|--cwd|--remote-cwd|--local-dir) return 0 ;;
+        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--target|--script|--json-payload|--prompt|--call|--name|--model|--lines|--command|--label|--profile|--remote|--cwd|--remote-cwd|--local-dir) return 0 ;;
         \\  esac
         \\
         \\  if [[ "$cur" == -* ]]; then
@@ -343,6 +345,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\            ;;
         \\          chat)
         \\            case "$third" in
+        \\              open) COMPREPLY=( $(compgen -W "$chat_open_flags" -- "$cur") ) ;;
         \\              draft) COMPREPLY=( $(compgen -W "$chat_draft_flags" -- "$cur") ) ;;
         \\              send|followup) COMPREPLY=( $(compgen -W "$chat_send_flags" -- "$cur") ) ;;
         \\              approve) COMPREPLY=( $(compgen -W "$chat_approve_flags" -- "$cur") ) ;;
@@ -501,6 +504,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.workspace_reopen_flags);
     try w.writeAll("\"\n  local workspace_archive_flags=\"");
     try writeWords(w, &spec.workspace_archive_flags);
+    try w.writeAll("\"\n  local chat_open_flags=\"");
+    try writeWords(w, &spec.chat_open_flags);
     try w.writeAll("\"\n  local chat_draft_flags=\"");
     try writeWords(w, &spec.chat_draft_flags);
     try w.writeAll("\"\n  local chat_send_flags=\"");
@@ -553,7 +558,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    --decision) compadd -- ${(s: :)decision_values}; return ;;
         \\    --provider) compadd -- ${(s: :)provider_values}; return ;;
         \\    --mode) compadd -- ${(s: :)inspector_mode_values}; return ;;
-        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--target|--script|--json-payload|--prompt|--call|--name|--lines|--command|--label|--profile|--remote|--cwd|--remote-cwd|--local-dir) return ;;
+        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--target|--script|--json-payload|--prompt|--call|--name|--model|--lines|--command|--label|--profile|--remote|--cwd|--remote-cwd|--local-dir) return ;;
         \\  esac
         \\
         \\  if [[ "$cur" == -* ]]; then
@@ -635,6 +640,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\            ;;
         \\          chat)
         \\            case "$third" in
+        \\              open) compadd -- ${(s: :)chat_open_flags} ;;
         \\              draft) compadd -- ${(s: :)chat_draft_flags} ;;
         \\              send|followup) compadd -- ${(s: :)chat_send_flags} ;;
         \\              approve) compadd -- ${(s: :)chat_approve_flags} ;;
@@ -785,6 +791,7 @@ fn writeFish(w: *std.Io.Writer) !void {
         \\complete -c verde -l thread -r -d 'Thread index or provider id'
         \\complete -c verde -l pane -r -d 'Workspace pane id'
         \\complete -c verde -l focused -d 'Use the focused pane'
+        \\complete -c verde -l no-focus -d 'Create without changing workspace or pane focus'
         \\complete -c verde -l first -r -d 'First sibling pane id'
         \\complete -c verde -l second -r -d 'Second sibling pane id'
         \\complete -c verde -l ratio -r -d 'Split ratio'
@@ -797,6 +804,7 @@ fn writeFish(w: *std.Io.Writer) !void {
         \\complete -c verde -l call -r -d 'Approval call id'
         \\complete -c verde -l name -r -d 'Configured process name'
         \\complete -c verde -l provider -r -d 'Provider name'
+        \\complete -c verde -l model -r -d 'Provider model id'
         \\complete -c verde -l lines -r -d 'Number of output lines'
         \\complete -c verde -l mode -r -d 'Browser inspector mode'
         \\complete -c verde -l command -r -d 'Command palette id'

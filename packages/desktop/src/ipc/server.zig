@@ -359,31 +359,31 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
     return try okValueResponse(allocator, id_value, .{
         .protocol_version = PROTOCOL_VERSION,
         .commands = &.{
-            "status",                               "capabilities",                       "workspaces",                          "panes",
-            "active",                               "inspect",                            "threads",                             "terminals",
-            "herdr.open",                           "herdr.handoff",                      "herdr.unlink",                        "herdr.status",
-            "surfaces",                             "surface.list",                       "surface.inspect",                     "surface.focus",
-            "surface.clearAttention",               "notification.create",                "notification.update",                 "notification.clear",
-            "processes",                            "workspace.select",                   "workspace.create",                    "workspace.rename",
-            "workspace.close",                      "workspace.reopen",                   "workspace.archive",                   "pane.focus",
-            "pane.split",                           "pane.resize",                        "pane.move",                           "pane.minimize",
-            "pane.maximize",                        "pane.restore",                       "pane.close",                          "chat.status",
-            "chat.transcript",                      "chat.draft.set",                     "chat.draft.append",                   "chat.send",
-            "chat.followup",                        "chat.stop",                          "chat.approve",                        "browser.open",
-            "browser.navigate",                     "browser.status",                     "browser.close",                       "browser.toggle",
-            "browser.back",                         "browser.forward",                    "browser.reload",                      "browser.focus",
-            "browser.blur",                         "browser.toolbarHit",                 "browser.selectAllFocused",            "browser.copyFocused",
-            "browser.cutFocused",                   "browser.pasteTextFocused",           "browser.eval",                        "browser.postJson",
-            "browser.screenshot",                   "browser.inspector.enable",           "browser.inspector.disable",           "browser.inspector.toggle",
-            "browser.inspector.mode",               "browser.inspector.menuOpen",         "browser.inspector.menuClose",         "browser.overlay.workspaceMenuOpen",
-            "browser.overlay.workspaceMenuClose",   "browser.overlay.sidebarMenuOpen",    "browser.overlay.sidebarMenuClose",    "browser.overlay.composerMenuOpen",
-            "browser.overlay.composerMenuClose",    "browser.overlay.workspaceModalOpen", "browser.overlay.workspaceModalClose", "browser.overlay.threadModalOpen",
-            "browser.overlay.threadModalClose",     "browser.overlay.imageModalOpen",     "browser.overlay.imageModalClose",     "browser.overlay.transcriptModalOpen",
-            "browser.overlay.transcriptModalClose", "palette.list",                       "palette.run",                         "terminal.write",
-            "terminal.tail",                        "terminal.screen",                    "process.list",                        "process.inspect",
-            "process.start",                        "process.stop",                       "process.restart",                     "process.logs",
-            "agent.open",                           "stack.status",                       "stack.start",                         "stack.stop",
-            "stack.restart",
+            "status",                              "capabilities",                         "workspaces",                         "panes",
+            "active",                              "inspect",                              "threads",                            "terminals",
+            "herdr.open",                          "herdr.handoff",                        "herdr.unlink",                       "herdr.status",
+            "surfaces",                            "surface.list",                         "surface.inspect",                    "surface.focus",
+            "surface.clearAttention",              "notification.create",                  "notification.update",                "notification.clear",
+            "processes",                           "workspace.select",                     "workspace.create",                   "workspace.rename",
+            "workspace.close",                     "workspace.reopen",                     "workspace.archive",                  "pane.focus",
+            "pane.split",                          "pane.resize",                          "pane.move",                          "pane.minimize",
+            "pane.maximize",                       "pane.restore",                         "pane.close",                         "chat.open",
+            "chat.status",                         "chat.transcript",                      "chat.draft.set",                     "chat.draft.append",
+            "chat.send",                           "chat.followup",                        "chat.stop",                          "chat.approve",
+            "browser.open",                        "browser.navigate",                     "browser.status",                     "browser.close",
+            "browser.toggle",                      "browser.back",                         "browser.forward",                    "browser.reload",
+            "browser.focus",                       "browser.blur",                         "browser.toolbarHit",                 "browser.selectAllFocused",
+            "browser.copyFocused",                 "browser.cutFocused",                   "browser.pasteTextFocused",           "browser.eval",
+            "browser.postJson",                    "browser.screenshot",                   "browser.inspector.enable",           "browser.inspector.disable",
+            "browser.inspector.toggle",            "browser.inspector.mode",               "browser.inspector.menuOpen",         "browser.inspector.menuClose",
+            "browser.overlay.workspaceMenuOpen",   "browser.overlay.workspaceMenuClose",   "browser.overlay.sidebarMenuOpen",    "browser.overlay.sidebarMenuClose",
+            "browser.overlay.composerMenuOpen",    "browser.overlay.composerMenuClose",    "browser.overlay.workspaceModalOpen", "browser.overlay.workspaceModalClose",
+            "browser.overlay.threadModalOpen",     "browser.overlay.threadModalClose",     "browser.overlay.imageModalOpen",     "browser.overlay.imageModalClose",
+            "browser.overlay.transcriptModalOpen", "browser.overlay.transcriptModalClose", "palette.list",                       "palette.run",
+            "terminal.write",                      "terminal.tail",                        "terminal.screen",                    "process.list",
+            "process.inspect",                     "process.start",                        "process.stop",                       "process.restart",
+            "process.logs",                        "agent.open",                           "stack.status",                       "stack.start",
+            "stack.stop",                          "stack.restart",
         },
         .events = &.{},
         .encodings = &.{"json"},
@@ -868,6 +868,8 @@ fn paneCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
 }
 
 fn chatCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
+    if (std.mem.eql(u8, command, "open")) return try chatOpenResponse(allocator, id_value, state, params);
+
     const target = resolvePaneTarget(state, params) orelse
         return try errorResponseAlloc(allocator, id_value, "not_found", "chat pane not found");
     if (!targetIsChat(state, target)) return try errorResponseAlloc(allocator, id_value, "invalid_target", "target pane is not a chat pane");
@@ -899,6 +901,67 @@ fn chatCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
 
     if (!accepted) return try errorResponseAlloc(allocator, id_value, "rejected", "chat operation did not apply");
     return try chatStatusResponse(allocator, id_value, state, target.project_index, target.pane_id);
+}
+
+fn chatOpenResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+    _ = stringParam(params, "workspace_id") orelse
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open requires an explicit workspace_id");
+    const project_index = resolveProjectIndex(state, params) orelse
+        return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+
+    const provider_name = stringParam(params, "provider") orelse
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open requires provider");
+    const provider = parseProvider(provider_name) orelse
+        return try errorResponseAlloc(allocator, id_value, "unsupported_provider", "chat.open provider must be one of: opencode, codex, claude, cursor");
+
+    const model_ref = stringParam(params, "model");
+    if (paramIsNonNull(params, "model") and model_ref == null) {
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open model must be a string");
+    }
+    const axis_name = stringParam(params, "axis") orelse "horizontal";
+    const axis = parseAxis(axis_name) orelse
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid chat.open split axis");
+    if (paramIsNonNull(params, "focus") and boolParam(params, "focus") == null) {
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open focus must be a boolean");
+    }
+    const focus = boolParam(params, "focus") orelse true;
+
+    const target_value = if (params == .object)
+        params.object.get("target_pane_id") orelse params.object.get("pane")
+    else
+        null;
+    var target_pane_id: ?app_state.WorkspacePaneId = null;
+    if (target_value) |value| switch (value) {
+        .null => {},
+        else => {
+            const raw_target = jsonInt(value) orelse
+                return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open target_pane_id must be a non-negative integer");
+            if (raw_target < 0 or raw_target > std.math.maxInt(app_state.WorkspacePaneId)) {
+                return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open target_pane_id is out of range");
+            }
+            target_pane_id = @intCast(raw_target);
+        },
+    };
+
+    const result = state.openWorkspaceChat(project_index, provider, model_ref, target_pane_id, axis, focus) catch |err| switch (err) {
+        error.ProjectNotFound => return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found"),
+        error.TargetPaneNotFound => return try errorResponseAlloc(allocator, id_value, "not_found", "target pane not found"),
+        error.TargetPaneMinimized => return try errorResponseAlloc(allocator, id_value, "rejected", "target pane is minimized"),
+        error.InvalidModel => return try errorResponseAlloc(allocator, id_value, "invalid_model", "model is not available for the requested provider"),
+        else => return try errorResponseAlloc(allocator, id_value, "internal_error", @errorName(err)),
+    };
+    const project = &state.projects.items[project_index];
+    const thread = &project.threads.items[result.thread_index];
+    return try chatOpenResultResponse(
+        allocator,
+        id_value,
+        project.id,
+        project_index,
+        result,
+        thread.local_thread_id,
+        thread.provider,
+        thread.model_ref.?,
+    );
 }
 
 fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
@@ -1329,7 +1392,7 @@ fn resolvePaneTarget(state: *app_state.AppState, params: std.json.Value) ?PaneTa
 fn resolveProjectIndex(state: *app_state.AppState, params: std.json.Value) ?usize {
     if (state.projects.items.len == 0) return null;
     if (params == .object) {
-        if (jsonString(params.object.get("workspace") orelse params.object.get("project") orelse .null)) |project_ref| {
+        if (jsonString(params.object.get("workspace_id") orelse params.object.get("workspace") orelse params.object.get("project") orelse .null)) |project_ref| {
             if (std.mem.eql(u8, project_ref, "current")) return state.selected_project_index;
             if (std.fmt.parseInt(usize, project_ref, 10)) |index| {
                 if (index < state.projects.items.len) return index;
@@ -1838,6 +1901,43 @@ fn chatStatusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, st
     return try writer.toOwnedSlice();
 }
 
+fn chatOpenResultResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    workspace_id: []const u8,
+    workspace_index: usize,
+    result: app_state.OpenChatResult,
+    thread_id: []const u8,
+    provider: app_state.Provider,
+    model: []const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&s, id_value);
+    try s.objectField("result");
+    try s.beginObject();
+    try s.objectField("workspace_id");
+    try s.write(workspace_id);
+    try s.objectField("workspace_index");
+    try s.write(workspace_index);
+    try s.objectField("pane_id");
+    try s.write(result.pane_id);
+    try s.objectField("thread_id");
+    try s.write(thread_id);
+    try s.objectField("thread_index");
+    try s.write(result.thread_index);
+    try s.objectField("provider");
+    try s.write(@tagName(provider));
+    try s.objectField("model");
+    try s.write(model);
+    try s.objectField("focused");
+    try s.write(result.focused);
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
 fn chatTranscriptResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, project_index: usize, pane_id: app_state.WorkspacePaneId) ![]u8 {
     const project = &state.projects.items[project_index];
     const pane = project.workspace_layout.paneById(pane_id) orelse return try errorResponseAlloc(allocator, id_value, "not_found", "pane not found");
@@ -2024,6 +2124,14 @@ fn boolParam(params: std.json.Value, name: []const u8) ?bool {
     };
 }
 
+fn paramIsNonNull(params: std.json.Value, name: []const u8) bool {
+    if (params != .object) return false;
+    return switch (params.object.get(name) orelse .null) {
+        .null => false,
+        else => true,
+    };
+}
+
 fn parseSurfaceStatus(value: []const u8) ?app_state.SurfaceStatus {
     inline for (std.meta.fields(app_state.SurfaceStatus)) |field| {
         if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
@@ -2088,4 +2196,38 @@ test "live transcript response budget is bounded before JSON allocation" {
     }};
     try std.testing.expect(transcriptFitsLiveResponse(&messages, 1024));
     try std.testing.expect(!transcriptFitsLiveResponse(&messages, 512));
+}
+
+test "chat open response exposes stable identifiers" {
+    const allocator = std.testing.allocator;
+    const response = try chatOpenResultResponse(
+        allocator,
+        .{ .integer = 9 },
+        "workspace-1",
+        2,
+        .{ .pane_id = 7, .thread_index = 3, .focused = true },
+        "chat-123",
+        .cursor,
+        "composer-2",
+    );
+    defer allocator.free(response);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings("workspace-1", jsonString(result.get("workspace_id").?).?);
+    try std.testing.expectEqual(@as(i64, 7), jsonInt(result.get("pane_id").?).?);
+    try std.testing.expectEqualStrings("chat-123", jsonString(result.get("thread_id").?).?);
+    try std.testing.expectEqualStrings("cursor", jsonString(result.get("provider").?).?);
+    try std.testing.expectEqualStrings("composer-2", jsonString(result.get("model").?).?);
+    try std.testing.expect(boolParam(.{ .object = result }, "focused").?);
+}
+
+test "GUI provider parser excludes terminal-only providers" {
+    try std.testing.expectEqual(app_state.Provider.opencode, parseProvider("opencode").?);
+    try std.testing.expectEqual(app_state.Provider.codex, parseProvider("codex").?);
+    try std.testing.expectEqual(app_state.Provider.claude, parseProvider("claude").?);
+    try std.testing.expectEqual(app_state.Provider.cursor, parseProvider("cursor").?);
+    try std.testing.expect(parseProvider("amp") == null);
+    try std.testing.expect(parseProvider("other") == null);
 }
