@@ -2840,8 +2840,10 @@ fn handleCommandApprovalRequest(self: *Client, root: std.json.Value, request_id:
     else blk: {
         const on_approval_request = request.on_approval_request orelse break :blk .deny;
         const body = extractCommandApprovalSummary(root) orelse "Codex requested command approval.";
+        const call_id = try serverRequestApprovalIdAlloc(self.allocator, request_id);
+        defer self.allocator.free(call_id);
         break :blk on_approval_request(request.stream_context, .{
-            .call_id = "",
+            .call_id = call_id,
             .title = "Command approval",
             .body = body,
         });
@@ -2858,8 +2860,10 @@ fn handleFileChangeApprovalRequest(self: *Client, root: std.json.Value, request_
     else blk: {
         const on_approval_request = request.on_approval_request orelse break :blk .deny;
         const body = extractFileChangeApprovalSummary(root) orelse "Codex requested file change approval.";
+        const call_id = try serverRequestApprovalIdAlloc(self.allocator, request_id);
+        defer self.allocator.free(call_id);
         break :blk on_approval_request(request.stream_context, .{
-            .call_id = "",
+            .call_id = call_id,
             .title = "File change approval",
             .body = body,
         });
@@ -2876,8 +2880,10 @@ fn handlePermissionsApprovalRequest(self: *Client, root: std.json.Value, request
     else blk: {
         const on_approval_request = request.on_approval_request orelse break :blk .deny;
         const body = extractPermissionsApprovalSummary(root) orelse "Codex requested additional permissions.";
+        const call_id = try serverRequestApprovalIdAlloc(self.allocator, request_id);
+        defer self.allocator.free(call_id);
         break :blk on_approval_request(request.stream_context, .{
-            .call_id = "",
+            .call_id = call_id,
             .title = "Permissions request",
             .body = body,
         });
@@ -2920,15 +2926,24 @@ fn handleMcpElicitationRequest(
         return;
     }
 
-    const decision = if (request.on_approval_request) |on_approval_request|
-        on_approval_request(request.stream_context, .{
-            .call_id = "",
+    const decision = if (request.on_approval_request) |on_approval_request| blk: {
+        const call_id = try serverRequestApprovalIdAlloc(self.allocator, request_id);
+        defer self.allocator.free(call_id);
+        break :blk on_approval_request(request.stream_context, .{
+            .call_id = call_id,
             .title = server_name,
             .body = message,
-        })
-    else
-        .deny;
+        });
+    } else .deny;
     try respondMcpElicitation(request_id, self, decision);
+}
+
+fn serverRequestApprovalIdAlloc(allocator: std.mem.Allocator, request_id: std.json.Value) ![]u8 {
+    return switch (request_id) {
+        .integer => |value| std.fmt.allocPrint(allocator, "rpc-int:{d}", .{value}),
+        .string => |value| std.fmt.allocPrint(allocator, "rpc-string:{s}", .{value}),
+        else => error.InvalidServerRequestId,
+    };
 }
 
 fn mcpElicitationAllowsEmptyContent(schema: std.json.Value) bool {
@@ -3667,6 +3682,17 @@ test "shouldAutoApproveRequest follows approval policy" {
     try std.testing.expect(shouldAutoApproveRequest(.{ .prompt = "hi", .approval_policy = .never }));
     try std.testing.expect(!shouldAutoApproveRequest(.{ .prompt = "hi", .approval_policy = .on_request }));
     try std.testing.expect(!shouldAutoApproveRequest(.{ .prompt = "hi" }));
+}
+
+test "Codex server approval request ids are non-empty" {
+    const allocator = std.testing.allocator;
+    const integer_id = try serverRequestApprovalIdAlloc(allocator, .{ .integer = 42 });
+    defer allocator.free(integer_id);
+    try std.testing.expectEqualStrings("rpc-int:42", integer_id);
+
+    const string_id = try serverRequestApprovalIdAlloc(allocator, .{ .string = "" });
+    defer allocator.free(string_id);
+    try std.testing.expectEqualStrings("rpc-string:", string_id);
 }
 
 test "dynamic tool server request returns a failure result instead of hanging" {

@@ -339,6 +339,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         fast_enabled: bool = false,
         access_enabled: bool = false,
         send_state: ComposerPromptSendState = .send,
+        stop_pulse_factor: f32 = 1.0,
         undo_stack: std.ArrayList(EditSnapshot) = .empty,
         redo_stack: std.ArrayList(EditSnapshot) = .empty,
         font_metrics: ?text_layout.FontMetrics = null,
@@ -614,6 +615,11 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             self.send_state = state;
         }
 
+        /// Sets the host-driven 0..1 breathing emphasis for the stop control.
+        pub fn setStopPulseFactor(self: *Component, factor: f32) void {
+            self.stop_pulse_factor = @max(0.0, @min(factor, 1.0));
+        }
+
         pub fn setModelOptions(self: *Component, context: ?*anyopaque, count: usize, label: ?ComposerPromptOptionLabelFn) void {
             self.model_options = .{ .context = context, .count = count, .label = label };
             if (self.model_index) |index| {
@@ -820,14 +826,20 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                     break :blk draw.Color{ .r = self.style.send_color.r, .g = self.style.send_color.g, .b = self.style.send_color.b, .a = 0.48 };
                 if (self.send_state == .stop) {
                     if (self.hovered_part == .send) break :blk self.style.stop_button_hover_color;
-                    break :blk self.style.stop_button_color;
+                    const alpha = 0.76 + self.stop_pulse_factor * 0.24;
+                    break :blk draw.Color{
+                        .r = self.style.stop_button_color.r,
+                        .g = self.style.stop_button_color.g,
+                        .b = self.style.stop_button_color.b,
+                        .a = self.style.stop_button_color.a * alpha,
+                    };
                 }
                 if (self.hovered_part == .send) break :blk self.style.send_hover_color;
                 break :blk self.style.send_color;
             };
             try batch.panel(allocator, geometry.send, send_panel_color, null, geometry.send.h * 0.5, 0.0);
             if (self.send_state == .stop) {
-                try renderStopSquare(allocator, batch, geometry.send);
+                try renderStopSquare(allocator, batch, geometry.send, if (self.hovered_part == .send) 1.0 else self.stop_pulse_factor);
             } else if (self.send_state == .pending) {
                 try self.renderCenteredIcon(allocator, batch, geometry.send, self.sendIcon(), draw.Color.white);
             } else {
@@ -936,10 +948,10 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             });
         }
 
-        fn renderStopSquare(allocator: std.mem.Allocator, batch: *draw.RenderBatch, button: draw.Rect) !void {
+        fn renderStopSquare(allocator: std.mem.Allocator, batch: *draw.RenderBatch, button: draw.Rect, pulse: f32) !void {
             const inner = sendGlyphBounds(button);
             const m = @min(inner.w, inner.h);
-            const side = m * 0.52;
+            const side = m * (0.46 + pulse * 0.08);
             const cx = inner.x + inner.w * 0.5;
             const cy = inner.y + inner.h * 0.5;
             const cr = @max(side * 0.18, 1.5);
@@ -948,7 +960,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 .y = cy - side * 0.5,
                 .w = side,
                 .h = side,
-            }, draw.Color.white, cr, button);
+            }, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 0.72 + pulse * 0.28 }, cr, button);
         }
 
         /// Send: wide triangular head + narrow stem (same-width stem under an equilateral head reads as a "house").

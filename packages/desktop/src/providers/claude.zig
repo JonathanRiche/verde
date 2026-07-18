@@ -365,6 +365,11 @@ pub const Client = struct {
         child.child.stdout = null;
         if (response.error_message) |message| {
             provider_diagnostics.logError(.claude_bridge, null, message);
+            if (stream_request) |request| {
+                if (request.on_failure) |on_failure| {
+                    on_failure(request.stream_context, message);
+                }
+            }
             return error.ClaudeRequestFailed;
         }
         switch (term) {
