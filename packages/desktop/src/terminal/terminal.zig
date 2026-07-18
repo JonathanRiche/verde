@@ -136,6 +136,15 @@ pub const SessionSnapshot = struct {
     signal: ?u32 = null,
 };
 
+pub const RuntimeProcessSnapshot = struct {
+    pid: ?u32 = null,
+    process_group: ?u32 = null,
+    started_at_ms: i64 = 0,
+    running: bool,
+    foreground: bool,
+    launch_kind: TerminalLaunchKind,
+};
+
 pub const NotificationEvent = struct {
     session_id: []const u8,
     pane_id: u32,
@@ -738,6 +747,17 @@ pub const Dock = struct {
         const pane = self.activePaneConst() orelse return null;
         const session = pane.session orelse return null;
         return session.snapshot();
+    }
+
+    /// Returns the process identity already cached by terminal polling. Shell
+    /// panes appear only while a foreground command is active; custom/agent
+    /// profiles represent the launched process itself.
+    pub fn activeRuntimeProcessSnapshot(self: *const Dock) ?RuntimeProcessSnapshot {
+        const pane = self.activePaneConst() orelse return null;
+        const session = pane.session orelse return null;
+        const snapshot = session.runtimeProcessSnapshot();
+        if (snapshot.launch_kind == .shell and !snapshot.foreground) return null;
+        return snapshot;
     }
 
     pub fn activeOutputTailAlloc(self: *const Dock, allocator: std.mem.Allocator, max_bytes: usize) !?[]u8 {
@@ -1916,6 +1936,10 @@ const UnsupportedSession = struct {
         return .{ .running = false };
     }
 
+    pub fn runtimeProcessSnapshot(_: *const UnsupportedSession) RuntimeProcessSnapshot {
+        return .{ .running = false, .foreground = false, .launch_kind = .shell };
+    }
+
     pub fn writeInput(_: *UnsupportedSession, _: []const u8) !bool {
         return false;
     }
@@ -1999,6 +2023,7 @@ const UnixSession = struct {
     remote_output_offset: usize = 0,
     daemon_shell_pid: ?usize = null,
     daemon_foreground_process_group: ?usize = null,
+    created_at_ms: i64 = 0,
     suppress_next_daemon_replay: bool = false,
     suppress_pty_responses: bool = false,
     defer_daemon_replay_until_resize: bool = false,
@@ -2085,6 +2110,7 @@ const UnixSession = struct {
                 .launch_label = launch_label,
                 .session_id = try allocator.dupe(u8, options.session_id.?),
                 .pref_path = try allocator.dupe(u8, options.pref_path.?),
+                .created_at_ms = platform_runtime.unixTimestampMs(),
             };
             self.stream = self.terminal.vtStream();
             self.stream.handler.effects.write_pty = &UnixSession.streamWritePty;
@@ -2127,6 +2153,7 @@ const UnixSession = struct {
             .cell_height = CELL_PIXEL_HEIGHT,
             .launch_kind = options.profile.kind,
             .launch_label = launch_label,
+            .created_at_ms = platform_runtime.unixTimestampMs(),
         };
         self.stream = self.terminal.vtStream();
         self.stream.handler.effects.write_pty = &UnixSession.streamWritePty;
@@ -2435,6 +2462,22 @@ const UnixSession = struct {
             return .{ .running = false, .signal = @intFromEnum(std.c.W.TERMSIG(status)) };
         }
         return .{ .running = false };
+    }
+
+    pub fn runtimeProcessSnapshot(self: *const UnixSession) RuntimeProcessSnapshot {
+        const process_group = self.foregroundProcessGroup();
+        const root_pid: ?usize = switch (self.backend) {
+            .local => if (self.child_pid > 0) @intCast(self.child_pid) else null,
+            .daemon => self.daemon_shell_pid,
+        };
+        return .{
+            .pid = if (process_group orelse root_pid) |value| std.math.cast(u32, value) else null,
+            .process_group = if (process_group) |value| std.math.cast(u32, value) else null,
+            .started_at_ms = self.created_at_ms,
+            .running = self.running,
+            .foreground = process_group != null,
+            .launch_kind = self.launch_kind,
+        };
     }
 
     pub fn writeInput(self: *UnixSession, bytes: []const u8) !bool {

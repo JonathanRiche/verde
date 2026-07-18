@@ -3179,8 +3179,32 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTool(&s, "write_surface_text", "Write text to a terminal surface pane.");
     try writeMcpTool(&s, "notify_surface", "Update terminal surface status or notification text.");
     try writeMcpTool(&s, "clear_surface_attention", "Clear terminal surface attention.");
-    try writeMcpTypedTool(&s, "list_processes", "List configured Verde processes in a workspace.", &.{
+    try writeMcpTypedTool(&s, "list_processes", "List tracked workspace commands, agents, terminal processes, background tasks, and active leases.", &.{
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
+    });
+    try writeMcpTypedTool(&s, "check_command", "Classify a command and return structured conflicts before starting it.", &.{
+        .{ .name = "command", .type_name = "string", .description = "Command that may be started.", .required = true },
+        .{ .name = "resources", .type_name = "array", .items_type_name = "string", .description = "Optional explicit workspace resources, such as build, deps, db, or port:3000." },
+        .{ .name = "owner", .type_name = "string", .description = "Optional opaque owner id; defaults to VERDE_SESSION_ID." },
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current." },
+    });
+    try writeMcpTypedTool(&s, "acquire_lease", "Acquire or renew an expiring workspace resource lease. Conflicts are rejected unless force is true.", &.{
+        .{ .name = "command", .type_name = "string", .description = "Command the lease protects.", .required = true },
+        .{ .name = "resources", .type_name = "array", .items_type_name = "string", .description = "Optional explicit workspace resources. Classified commands infer a conventional resource." },
+        .{ .name = "owner", .type_name = "string", .description = "Opaque owner id; defaults to VERDE_SESSION_ID." },
+        .{ .name = "ttl_ms", .type_name = "integer", .description = "Lease lifetime in milliseconds; defaults to 120000 and is capped at one hour." },
+        .{ .name = "force", .type_name = "boolean", .description = "Run anyway despite conflicts and notify affected terminal agents." },
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current." },
+    });
+    try writeMcpTypedTool(&s, "release_lease", "Release one lease, or all leases belonging to the owner when lease_id is omitted.", &.{
+        .{ .name = "lease_id", .type_name = "string", .description = "Optional lease id returned by acquire_lease." },
+        .{ .name = "owner", .type_name = "string", .description = "Opaque owner id; defaults to VERDE_SESSION_ID." },
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current." },
+    });
+    try writeMcpTypedTool(&s, "wait_for_process", "Wait until a tracked process completes, is replaced, disappears, or the bounded timeout expires.", &.{
+        .{ .name = "process_id", .type_name = "string", .description = "Stable process id returned by list_processes or check_command.", .required = true },
+        .{ .name = "timeout_ms", .type_name = "integer", .description = "Maximum wait in milliseconds; defaults to 300000 and is capped at 900000." },
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current." },
     });
     try writeMcpTypedTool(&s, "inspect_process", "Inspect a configured Verde process.", &.{
         .{ .name = "name", .type_name = "string", .description = "Configured process name.", .required = true },
@@ -3251,6 +3275,7 @@ fn writeMcpTool(s: *std.json.Stringify, name: []const u8, description: []const u
 const McpToolInput = struct {
     name: []const u8,
     type_name: []const u8,
+    items_type_name: ?[]const u8 = null,
     description: []const u8,
     required: bool = false,
 };
@@ -3272,6 +3297,13 @@ fn writeMcpTypedTool(s: *std.json.Stringify, name: []const u8, description: []co
         try s.beginObject();
         try s.objectField("type");
         try s.write(input.type_name);
+        if (input.items_type_name) |items_type_name| {
+            try s.objectField("items");
+            try s.beginObject();
+            try s.objectField("type");
+            try s.write(items_type_name);
+            try s.endObject();
+        }
         try s.objectField("description");
         try s.write(input.description);
         try s.endObject();
@@ -3299,9 +3331,13 @@ fn mcpToolsCall(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id
         getenvSlice("VERDE_WORKSPACE_ID") orelse
         getenvSlice("VERDE_WORKSPACE_PATH");
     const process_name = mcpArgString(arguments, "name");
+    const coordination_owner = mcpArgString(arguments, "owner") orelse getenvSlice("VERDE_SESSION_ID");
     const session_id = mcpArgString(arguments, "session_id") orelse mcpArgString(arguments, "session");
     const pane_id = mcpArgU32(arguments, "pane_id") orelse mcpArgU32(arguments, "pane");
     const lines = mcpArgU32(arguments, "lines");
+    var resource_storage: [16][]const u8 = undefined;
+    const resources = mcpArgStringArray(arguments, "resources", &resource_storage) catch |err|
+        return try mcpError(allocator, out, id_value, -32602, @errorName(err));
 
     if (std.mem.eql(u8, tool_name, "inspect_browser_page")) {
         const script = try mcpBrowserInspectScriptAlloc(
@@ -3352,6 +3388,19 @@ fn mcpToolsCall(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id
         };
         defer allocator.free(response);
         return try mcpToolScreenshotResult(allocator, out, id_value, response);
+    }
+    if (std.mem.eql(u8, tool_name, "wait_for_process")) {
+        const process_id = mcpArgString(arguments, "process_id") orelse
+            return try mcpError(allocator, out, id_value, -32602, "wait_for_process requires process_id");
+        const response = mcpWaitForWorkspaceProcessAlloc(
+            allocator,
+            io,
+            workspace,
+            process_id,
+            @min(mcpArgU32(arguments, "timeout_ms") orelse 300_000, 900_000),
+        ) catch |err| return try mcpError(allocator, out, id_value, -32000, @errorName(err));
+        defer allocator.free(response);
+        return try mcpToolTextResult(allocator, out, id_value, response);
     }
 
     const response = blk: {
@@ -3447,7 +3496,36 @@ fn mcpToolsCall(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id
             break :blk sendLiveRequestAlloc(allocator, io, "surface.clearAttention", .{ .session_id = session }, 1);
         }
         if (std.mem.eql(u8, tool_name, "list_processes")) {
-            break :blk sendLiveRequestAlloc(allocator, io, "processes", .{ .workspace = workspace }, 1);
+            break :blk sendLiveRequestAlloc(allocator, io, "workspace.processes", .{ .workspace = workspace }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "check_command")) {
+            const command = mcpArgString(arguments, "command") orelse return try mcpError(allocator, out, id_value, -32602, "check_command requires command");
+            break :blk sendLiveRequestAlloc(allocator, io, "workspace.checkCommand", .{
+                .workspace = workspace,
+                .command = command,
+                .resources = resources,
+                .owner = coordination_owner,
+            }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "acquire_lease")) {
+            const command = mcpArgString(arguments, "command") orelse return try mcpError(allocator, out, id_value, -32602, "acquire_lease requires command");
+            const owner = coordination_owner orelse return try mcpError(allocator, out, id_value, -32602, "acquire_lease requires owner outside a Verde terminal session");
+            break :blk sendLiveRequestAlloc(allocator, io, "workspace.acquireLease", .{
+                .workspace = workspace,
+                .command = command,
+                .resources = resources,
+                .owner = owner,
+                .ttl_ms = mcpArgU32(arguments, "ttl_ms"),
+                .force = mcpArgBool(arguments, "force") orelse false,
+            }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "release_lease")) {
+            const owner = coordination_owner orelse return try mcpError(allocator, out, id_value, -32602, "release_lease requires owner outside a Verde terminal session");
+            break :blk sendLiveRequestAlloc(allocator, io, "workspace.releaseLease", .{
+                .workspace = workspace,
+                .lease_id = mcpArgString(arguments, "lease_id"),
+                .owner = owner,
+            }, 1);
         }
         if (std.mem.eql(u8, tool_name, "inspect_process")) {
             const name = process_name orelse return try mcpError(allocator, out, id_value, -32602, "inspect_process requires name");
@@ -3575,6 +3653,109 @@ fn mcpBrowserTypeScriptAlloc(allocator: std.mem.Allocator, selector: []const u8,
     return try writer.toOwnedSlice();
 }
 
+fn mcpWaitForWorkspaceProcessAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace: ?[]const u8,
+    process_id: []const u8,
+    timeout_ms: u32,
+) ![]u8 {
+    const started_ns = platform_runtime.monotonicTimestampNs();
+    while (true) {
+        const response = try sendLiveRequestAlloc(allocator, io, "workspace.processes", .{ .workspace = workspace }, 1);
+        defer allocator.free(response);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+        defer parsed.deinit();
+        if (!workspaceProcessResponseOk(parsed.value)) return error.WorkspaceProcessPollRejected;
+        const poll = workspaceProcessPoll(parsed.value, process_id);
+        const elapsed_ms: u64 = @intCast(@divTrunc(platform_runtime.monotonicTimestampNs() - started_ns, std.time.ns_per_ms));
+        if (poll.outcome != .active) {
+            return try workspaceProcessWaitResultAlloc(allocator, process_id, @tagName(poll.outcome), false, elapsed_ms, poll.snapshot);
+        }
+        if (elapsed_ms >= timeout_ms) {
+            return try workspaceProcessWaitResultAlloc(allocator, process_id, "timed_out", true, elapsed_ms, poll.snapshot);
+        }
+        const remaining_ms: u64 = timeout_ms - elapsed_ms;
+        try std.Io.sleep(io, .fromMilliseconds(@min(remaining_ms, 500)), .awake);
+    }
+}
+
+const WorkspaceProcessPoll = struct {
+    outcome: enum { active, completed, replaced, gone },
+    snapshot: ?std.json.Value = null,
+};
+
+fn workspaceProcessResponseOk(root: std.json.Value) bool {
+    if (root != .object) return false;
+    return jsonBool(root.object.get("ok") orelse .null) orelse false;
+}
+
+fn workspaceProcessPoll(root: std.json.Value, process_id: []const u8) WorkspaceProcessPoll {
+    if (root != .object) return .{ .outcome = .gone };
+    const result = root.object.get("result") orelse return .{ .outcome = .gone };
+    if (result != .object) return .{ .outcome = .gone };
+    const processes = result.object.get("processes") orelse return .{ .outcome = .gone };
+    if (processes != .array) return .{ .outcome = .gone };
+    const terminal_prefix = terminalProcessIdPrefix(process_id);
+    var replaced = false;
+    for (processes.array.items) |process| {
+        if (process != .object) continue;
+        const candidate_id = jsonString(process.object.get("id") orelse .null) orelse continue;
+        if (std.mem.eql(u8, candidate_id, process_id)) {
+            const status = jsonString(process.object.get("status") orelse .null) orelse "unknown";
+            return .{
+                .outcome = if (workspaceProcessStatusActive(status)) .active else .completed,
+                .snapshot = process,
+            };
+        }
+        if (terminal_prefix) |prefix| {
+            if (std.mem.startsWith(u8, candidate_id, prefix)) replaced = true;
+        }
+    }
+    return .{ .outcome = if (replaced) .replaced else .gone };
+}
+
+fn terminalProcessIdPrefix(process_id: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, process_id, "term:")) return null;
+    const separator = std.mem.lastIndexOfScalar(u8, process_id, ':') orelse return null;
+    return process_id[0 .. separator + 1];
+}
+
+fn workspaceProcessStatusActive(status: []const u8) bool {
+    return std.mem.eql(u8, status, "starting") or
+        std.mem.eql(u8, status, "running") or
+        std.mem.eql(u8, status, "stopping") or
+        std.mem.eql(u8, status, "restarting") or
+        std.mem.eql(u8, status, "waiting") or
+        std.mem.eql(u8, status, "pending");
+}
+
+fn workspaceProcessWaitResultAlloc(
+    allocator: std.mem.Allocator,
+    process_id: []const u8,
+    outcome: []const u8,
+    timed_out: bool,
+    elapsed_ms: u64,
+    snapshot: ?std.json.Value,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    try s.objectField("process_id");
+    try s.write(process_id);
+    try s.objectField("outcome");
+    try s.write(outcome);
+    try s.objectField("timed_out");
+    try s.write(timed_out);
+    try s.objectField("elapsed_ms");
+    try s.write(elapsed_ms);
+    try s.objectField("process");
+    if (snapshot) |value| try writeJsonValue(&s, value) else try s.write(null);
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
 fn mcpToolTextResult(allocator: std.mem.Allocator, out: output.Output, id_value: std.json.Value, text: []const u8) !void {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     defer writer.deinit();
@@ -3682,6 +3863,17 @@ fn mcpBeginResult(s: *std.json.Stringify, id_value: std.json.Value) !void {
 fn mcpArgString(arguments: std.json.Value, name: []const u8) ?[]const u8 {
     if (arguments != .object) return null;
     return jsonString(arguments.object.get(name) orelse .null);
+}
+
+fn mcpArgStringArray(arguments: std.json.Value, name: []const u8, storage: *[16][]const u8) ![]const []const u8 {
+    if (arguments != .object) return storage[0..0];
+    const value = arguments.object.get(name) orelse return storage[0..0];
+    if (value == .null) return storage[0..0];
+    if (value != .array or value.array.items.len > storage.len) return error.InvalidStringArray;
+    for (value.array.items, 0..) |item, index| {
+        storage[index] = jsonString(item) orelse return error.InvalidStringArray;
+    }
+    return storage[0..value.array.items.len];
 }
 
 fn mcpArgU32(arguments: std.json.Value, name: []const u8) ?u32 {
@@ -4165,6 +4357,43 @@ test "provider-aware chat opening is advertised by the live CLI" {
         if (std.mem.eql(u8, capability, "chat.open")) return;
     }
     return error.MissingChatOpenCapability;
+}
+
+test "workspace coordination is advertised by the live CLI" {
+    const expected = [_][]const u8{
+        "workspace.processes",
+        "workspace.checkCommand",
+        "workspace.acquireLease",
+        "workspace.releaseLease",
+    };
+    for (expected) |wanted| {
+        var found = false;
+        for (spec.live_capabilities) |capability| {
+            if (!std.mem.eql(u8, capability, wanted)) continue;
+            found = true;
+            break;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "workspace process polling distinguishes active completion and replacement" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\{"ok":true,"result":{"processes":[{"id":"proc:workspace:web","status":"running"},{"id":"term:session:42","status":"failed"}]}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(workspaceProcessPoll(parsed.value, "proc:workspace:web").outcome == .active);
+    try std.testing.expect(workspaceProcessPoll(parsed.value, "term:session:42").outcome == .completed);
+    try std.testing.expect(workspaceProcessPoll(parsed.value, "term:session:17").outcome == .replaced);
+    try std.testing.expect(workspaceProcessPoll(parsed.value, "task:missing").outcome == .gone);
+    try std.testing.expect(workspaceProcessResponseOk(parsed.value));
+
+    var rejected = try std.json.parseFromSlice(std.json.Value, allocator, "{\"ok\":false,\"error\":{\"code\":\"invalid_stack_config\"}}", .{});
+    defer rejected.deinit();
+    try std.testing.expect(!workspaceProcessResponseOk(rejected.value));
 }
 
 test "Windows attach console handler catches only interrupt controls" {

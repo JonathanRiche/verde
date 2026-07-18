@@ -1387,7 +1387,9 @@ pub const BackgroundTask = struct {
     task_id: ?[:0]const u8 = null,
     pid_path: ?[:0]const u8 = null,
     log_path: ?[:0]const u8 = null,
+    pid: ?u32 = null,
     status: BackgroundTaskStatus,
+    started_at_ms: i64 = 0,
     updated_at_ms: i64 = 0,
     last_poll_ms: i64 = 0,
 
@@ -1686,6 +1688,10 @@ pub const ChatThread = struct {
 
         for (self.background_tasks.items) |*task| {
             if (!std.mem.eql(u8, task.command, command)) continue;
+            if (status == .running and task.status != .running) {
+                task.started_at_ms = unixTimestampMs();
+                task.pid = null;
+            }
             task.status = status;
             task.updated_at_ms = unixTimestampMs();
             try refreshBackgroundTaskMetadata(task, allocator, body_raw);
@@ -1695,6 +1701,7 @@ pub const ChatThread = struct {
         var task: BackgroundTask = .{
             .command = try allocator.dupeZ(u8, command),
             .status = status,
+            .started_at_ms = unixTimestampMs(),
             .updated_at_ms = unixTimestampMs(),
         };
         errdefer task.deinit(allocator);
@@ -2234,6 +2241,7 @@ pub const ManagedProcess = struct {
     mcp: bool = false,
     hooks: bool = false,
     watch: std.ArrayList([]u8) = .empty,
+    resources: std.ArrayList([]u8) = .empty,
     status: ManagedProcessStatus = .stopped,
     exit_code: ?u32 = null,
     signal: ?u32 = null,
@@ -2267,6 +2275,7 @@ pub const ManagedProcess = struct {
             .mcp = definition.mcp,
             .hooks = definition.hooks,
             .watch = .empty,
+            .resources = .empty,
         };
         errdefer process.deinit(allocator);
         if (launch == .argv) {
@@ -2274,6 +2283,9 @@ pub const ManagedProcess = struct {
         }
         for (definition.watch.items) |pattern| {
             try appendOwnedString(allocator, &process.watch, pattern);
+        }
+        for (definition.resources.items) |resource| {
+            try appendOwnedString(allocator, &process.resources, resource);
         }
         return process;
     }
@@ -2313,6 +2325,11 @@ pub const ManagedProcess = struct {
         for (definition.watch.items) |pattern| {
             try appendOwnedString(allocator, &self.watch, pattern);
         }
+        for (self.resources.items) |resource| allocator.free(resource);
+        self.resources.clearRetainingCapacity();
+        for (definition.resources.items) |resource| {
+            try appendOwnedString(allocator, &self.resources, resource);
+        }
         if (reset_watch_state) self.resetWatchState();
     }
 
@@ -2323,6 +2340,8 @@ pub const ManagedProcess = struct {
         allocator.free(self.cwd);
         for (self.watch.items) |pattern| allocator.free(pattern);
         self.watch.deinit(allocator);
+        for (self.resources.items) |resource| allocator.free(resource);
+        self.resources.deinit(allocator);
     }
 
     fn resetWatchState(self: *ManagedProcess) void {
@@ -2355,6 +2374,119 @@ pub const ManagedProcess = struct {
         argv.deinit(allocator);
     }
 };
+
+/// An expiring, workspace-scoped claim on resources shared by agents and
+/// commands. Leases are intentionally not persisted: expiration handles
+/// crashed owners, while a Verde restart must never leave a stale blocker.
+pub const WorkspaceLease = struct {
+    id: []u8,
+    owner: []u8,
+    command: []u8,
+    resources: std.ArrayList([]u8) = .empty,
+    created_at_ms: i64,
+    expires_at_ms: i64,
+
+    fn deinit(self: *WorkspaceLease, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.owner);
+        allocator.free(self.command);
+        for (self.resources.items) |resource| allocator.free(resource);
+        self.resources.deinit(allocator);
+    }
+};
+
+pub const CommandClass = enum {
+    other,
+    build,
+    @"test",
+    formatter,
+    package_install,
+    migration,
+    dev_server,
+};
+
+/// Conservatively classifies commands whose shared output is well-known.
+/// Unknown commands remain concurrent unless callers declare resources.
+pub fn classifyWorkspaceCommand(command: []const u8) CommandClass {
+    if (commandHasAnyToken(command, &.{ "migrate", "migration", "migrations" })) return .migration;
+    if (isPackageInstallCommand(command)) return .package_install;
+    if (commandHasAnyToken(command, &.{ "fmt", "format", "formatter", "prettier", "gofmt", "rustfmt" })) return .formatter;
+    if (commandHasAnyToken(command, &.{ "test", "tests", "pytest", "vitest", "jest" })) return .@"test";
+    if (commandHasAnyToken(command, &.{ "build", "compile" }) or commandStartsWithToken(command, "make")) return .build;
+    if (commandHasAnyToken(command, &.{ "dev", "serve", "server" })) return .dev_server;
+    return .other;
+}
+
+pub fn inferredWorkspaceResource(command: []const u8) ?[]const u8 {
+    return switch (classifyWorkspaceCommand(command)) {
+        .build, .@"test" => "build",
+        .formatter => "source",
+        .package_install => "deps",
+        .migration => "db",
+        .other, .dev_server => null,
+    };
+}
+
+fn commandHasAnyToken(command: []const u8, wanted: []const []const u8) bool {
+    var tokens = std.mem.tokenizeAny(u8, command, " \t\r\n'\"=,:;()[]{}");
+    while (tokens.next()) |token| {
+        for (wanted) |candidate| {
+            if (std.ascii.eqlIgnoreCase(token, candidate)) return true;
+        }
+    }
+    return false;
+}
+
+fn commandStartsWithAnyToken(command: []const u8, wanted: []const []const u8) bool {
+    for (wanted) |candidate| {
+        if (commandStartsWithToken(command, candidate)) return true;
+    }
+    return false;
+}
+
+fn commandStartsWithToken(command: []const u8, wanted: []const u8) bool {
+    var tokens = std.mem.tokenizeAny(u8, command, " \t\r\n'\"");
+    while (tokens.next()) |token| {
+        if (std.ascii.eqlIgnoreCase(token, "exec") or
+            std.ascii.eqlIgnoreCase(token, "sh") or
+            std.ascii.eqlIgnoreCase(token, "bash") or
+            std.ascii.eqlIgnoreCase(token, "zsh") or
+            std.mem.eql(u8, token, "-c") or
+            std.mem.eql(u8, token, "-lc")) continue;
+        return std.ascii.eqlIgnoreCase(std.fs.path.basename(token), wanted);
+    }
+    return false;
+}
+
+fn isPackageInstallCommand(command: []const u8) bool {
+    const managers = [_][]const u8{ "npm", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "cargo", "gem", "bundle", "composer" };
+    const has_manager = commandHasAnyToken(command, &managers) or commandStartsWithAnyToken(command, &managers);
+    return has_manager and commandHasAnyToken(command, &.{ "install", "add", "remove", "update", "upgrade" });
+}
+
+pub fn workspaceResourcesOverlap(left: anytype, right: anytype) bool {
+    for (left) |left_resource| {
+        for (right) |right_resource| {
+            if (std.mem.eql(u8, left_resource, right_resource)) return true;
+        }
+    }
+    return false;
+}
+
+fn workspaceLeaseResourcesEqual(left: anytype, right: anytype) bool {
+    if (left.len != right.len) return false;
+    for (left) |resource| {
+        var found = false;
+        for (right) |candidate| {
+            if (std.mem.eql(u8, resource, candidate)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
 
 fn appendOwnedString(allocator: std.mem.Allocator, list: *std.ArrayList([]u8), value: []const u8) !void {
     const owned = try allocator.dupe(u8, value);
@@ -3899,6 +4031,8 @@ pub const Project = struct {
     terminal_dock: terminal.Dock,
     terminal_docks: std.ArrayList(TerminalDockEntry) = .empty,
     managed_processes: std.ArrayList(ManagedProcess) = .empty,
+    workspace_leases: std.ArrayList(WorkspaceLease) = .empty,
+    next_workspace_lease_id: u64 = 1,
     last_stack_config_refresh_ms: i64 = 0,
     stack_config_error: ?[]u8 = null,
     next_terminal_dock_id: u32 = 1,
@@ -3929,6 +4063,8 @@ pub const Project = struct {
             .terminal_dock = terminal_dock,
             .terminal_docks = .empty,
             .managed_processes = .empty,
+            .workspace_leases = .empty,
+            .next_workspace_lease_id = 1,
             .last_stack_config_refresh_ms = 0,
             .stack_config_error = null,
             .next_terminal_dock_id = 1,
@@ -4131,6 +4267,8 @@ pub const Project = struct {
         self.terminal_docks.deinit(allocator);
         for (self.managed_processes.items) |*process| process.deinit(allocator);
         self.managed_processes.deinit(allocator);
+        for (self.workspace_leases.items) |*lease| lease.deinit(allocator);
+        self.workspace_leases.deinit(allocator);
         if (self.stack_config_error) |message| allocator.free(message);
         self.workspace_layout.deinit(allocator);
         for (self.threads.items) |*thread| {
@@ -14002,6 +14140,109 @@ pub const AppState = struct {
         return self.terminalPaneScreenTextForProject(self.selected_project_index, pane_id);
     }
 
+    /// Removes expired leases before every read or mutation. Live commands are
+    /// serialized on the desktop thread, so lease state needs no separate lock
+    /// or expiry worker.
+    pub fn pruneExpiredWorkspaceLeases(self: *AppState, project_index: usize) void {
+        if (project_index >= self.projects.items.len) return;
+        const project = &self.projects.items[project_index];
+        const now_ms = unixTimestampMs();
+        var index: usize = 0;
+        while (index < project.workspace_leases.items.len) {
+            if (project.workspace_leases.items[index].expires_at_ms > now_ms) {
+                index += 1;
+                continue;
+            }
+            var expired = project.workspace_leases.orderedRemove(index);
+            expired.deinit(self.allocator);
+        }
+    }
+
+    pub fn acquireWorkspaceLease(
+        self: *AppState,
+        project_index: usize,
+        owner: []const u8,
+        command: []const u8,
+        resources: []const []const u8,
+        ttl_ms: i64,
+        force: bool,
+    ) !*WorkspaceLease {
+        if (project_index >= self.projects.items.len) return error.ProjectNotFound;
+        if (owner.len == 0) return error.LeaseOwnerRequired;
+        if (resources.len == 0) return error.LeaseResourcesRequired;
+        self.pruneExpiredWorkspaceLeases(project_index);
+        const project = &self.projects.items[project_index];
+        const now_ms = unixTimestampMs();
+
+        for (project.workspace_leases.items) |*lease| {
+            if (!std.mem.eql(u8, lease.owner, owner)) continue;
+            if (!workspaceLeaseResourcesEqual(lease.resources.items, resources)) continue;
+            lease.expires_at_ms = now_ms + ttl_ms;
+            if (!std.mem.eql(u8, lease.command, command)) {
+                const replacement = try self.allocator.dupe(u8, command);
+                self.allocator.free(lease.command);
+                lease.command = replacement;
+            }
+            return lease;
+        }
+
+        if (!force) {
+            for (project.workspace_leases.items) |lease| {
+                if (std.mem.eql(u8, lease.owner, owner)) continue;
+                if (workspaceResourcesOverlap(lease.resources.items, resources)) return error.LeaseConflict;
+            }
+        }
+
+        var lease: WorkspaceLease = lease: {
+            const id = try std.fmt.allocPrint(self.allocator, "lease:{d}", .{project.next_workspace_lease_id});
+            errdefer self.allocator.free(id);
+            const owned_owner = try self.allocator.dupe(u8, owner);
+            errdefer self.allocator.free(owned_owner);
+            const owned_command = try self.allocator.dupe(u8, command);
+            errdefer self.allocator.free(owned_command);
+            break :lease .{
+                .id = id,
+                .owner = owned_owner,
+                .command = owned_command,
+                .created_at_ms = now_ms,
+                .expires_at_ms = now_ms + ttl_ms,
+            };
+        };
+        project.next_workspace_lease_id += 1;
+        errdefer lease.deinit(self.allocator);
+        for (resources) |resource| try appendOwnedString(self.allocator, &lease.resources, resource);
+        try project.workspace_leases.append(self.allocator, lease);
+        return &project.workspace_leases.items[project.workspace_leases.items.len - 1];
+    }
+
+    pub fn releaseWorkspaceLease(self: *AppState, project_index: usize, owner: []const u8, lease_id: ?[]const u8) usize {
+        if (project_index >= self.projects.items.len or owner.len == 0) return 0;
+        self.pruneExpiredWorkspaceLeases(project_index);
+        const project = &self.projects.items[project_index];
+        var released: usize = 0;
+        var index: usize = 0;
+        while (index < project.workspace_leases.items.len) {
+            const lease = &project.workspace_leases.items[index];
+            if (!std.mem.eql(u8, lease.owner, owner) or
+                (lease_id != null and !std.mem.eql(u8, lease.id, lease_id.?)))
+            {
+                index += 1;
+                continue;
+            }
+            var removed = project.workspace_leases.orderedRemove(index);
+            removed.deinit(self.allocator);
+            released += 1;
+            if (lease_id != null) break;
+        }
+        return released;
+    }
+
+    pub fn activeWorkspaceLeaseCount(self: *AppState, project_index: usize) usize {
+        self.pruneExpiredWorkspaceLeases(project_index);
+        if (project_index >= self.projects.items.len) return 0;
+        return self.projects.items[project_index].workspace_leases.items.len;
+    }
+
     pub fn refreshProjectStackConfig(self: *AppState, project_index: usize) !void {
         if (project_index >= self.projects.items.len) return;
         var project = &self.projects.items[project_index];
@@ -18270,6 +18511,7 @@ pub const AppState = struct {
             task.last_poll_ms = now_ms;
 
             const pid = readBackgroundTaskPid(self.allocator, task.pid_path.?) orelse continue;
+            task.pid = pid;
             if (backgroundTaskProcessIsAlive(pid)) continue;
 
             task.status = .completed;
@@ -20326,6 +20568,58 @@ test "dev server URL detection accepts loopback URLs only" {
     try std.testing.expect(AppState.localDevServerUrl("docs: https://example.com") == null);
     try std.testing.expect(AppState.localDevServerUrl("bad: http://localhost.example.com:5173") == null);
     try std.testing.expect(AppState.localDevServerUrl("bad: http://127.0.0.11:5173") == null);
+}
+
+test "workspace commands classify conservatively and infer shared resources" {
+    try std.testing.expectEqual(CommandClass.build, classifyWorkspaceCommand("mise run build"));
+    try std.testing.expectEqual(CommandClass.@"test", classifyWorkspaceCommand("bun test packages/desktop"));
+    try std.testing.expectEqual(CommandClass.formatter, classifyWorkspaceCommand("zig fmt src/main.zig"));
+    try std.testing.expectEqual(CommandClass.package_install, classifyWorkspaceCommand("pnpm install"));
+    try std.testing.expectEqual(CommandClass.migration, classifyWorkspaceCommand("rails db:migrate"));
+    try std.testing.expectEqual(CommandClass.dev_server, classifyWorkspaceCommand("npm run dev"));
+    try std.testing.expectEqual(CommandClass.other, classifyWorkspaceCommand("rg TODO src"));
+    try std.testing.expectEqual(CommandClass.other, classifyWorkspaceCommand("cat build/log.txt"));
+    try std.testing.expectEqualStrings("build", inferredWorkspaceResource("cargo test").?);
+    try std.testing.expect(inferredWorkspaceResource("rg TODO src") == null);
+    const build_resources = [_][]const u8{ "build", "port:3000" };
+    const build_request = [_][]const u8{"build"};
+    const dependency_resources = [_][]const u8{"deps"};
+    const database_resources = [_][]const u8{"db"};
+    try std.testing.expect(workspaceResourcesOverlap(build_resources[0..], build_request[0..]));
+    try std.testing.expect(!workspaceResourcesOverlap(dependency_resources[0..], database_resources[0..]));
+}
+
+test "workspace leases reject conflicts, renew, expire, and enforce ownership" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.projects = .empty;
+    defer {
+        for (state.projects.items) |*project| project.deinit(allocator);
+        state.projects.deinit(allocator);
+    }
+
+    var project = try Project.init(allocator, "lease-test", "Lease test", "/tmp/lease-test", 0);
+    state.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+
+    const resources = [_][]const u8{"build"};
+    const first = try state.acquireWorkspaceLease(0, "agent-a", "mise run build", &resources, 60_000, false);
+    const first_expiry = first.expires_at_ms;
+    try std.testing.expectEqualStrings("lease:1", first.id);
+    try std.testing.expectError(error.LeaseConflict, state.acquireWorkspaceLease(0, "agent-b", "cargo test", &resources, 60_000, false));
+
+    const renewed = try state.acquireWorkspaceLease(0, "agent-a", "cargo test", &resources, 120_000, false);
+    try std.testing.expectEqualStrings("lease:1", renewed.id);
+    try std.testing.expect(renewed.expires_at_ms >= first_expiry);
+    try std.testing.expectEqual(@as(usize, 0), state.releaseWorkspaceLease(0, "agent-b", renewed.id));
+    try std.testing.expectEqual(@as(usize, 1), state.releaseWorkspaceLease(0, "agent-a", renewed.id));
+
+    const expiring = try state.acquireWorkspaceLease(0, "agent-a", "mise run build", &resources, 60_000, false);
+    expiring.expires_at_ms = 0;
+    try std.testing.expectEqual(@as(usize, 0), state.activeWorkspaceLeaseCount(0));
 }
 
 fn unixTimestampSeconds() i64 {
