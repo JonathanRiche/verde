@@ -436,6 +436,14 @@ optional `model`, `target_pane_id`, `axis`, and `focus` arguments. This is
 separate from terminal/TUI agent opening and never requires compositor or mouse
 automation.
 
+Workspace command coordination is available through `list_processes`,
+`check_command`, `acquire_lease`, `release_lease`, and `wait_for_process`.
+The process registry combines configured processes, each dock's currently
+active terminal command, GUI agent turns, and background tasks. Coordination
+clients can declare explicit resources such as `build`, `deps`, `db`, or
+`port:3000`; leases expire automatically so a crashed owner cannot permanently
+block the workspace.
+
 ### Workspace Control
 
 Workspace commands mutate the project rail and return the updated workspace
@@ -607,6 +615,8 @@ processes:
     command_windows: "npm.cmd run dev"
     cwd: "."
     restart: on_crash
+    resources:
+      - "port:3000"
 
   worker:
     # Structured argv bypasses the local shell and preserves spaces exactly.
@@ -632,7 +642,10 @@ surfaces. With the Codex example above, Verde creates or reuses a terminal dock
 for the agent and wires Codex hook events into pane/workspace attention. Plain
 `codex` managed commands are launched with `features.hooks=true` when
 `hooks: true` is set, so `PermissionRequest` can mark the surface `waiting` and
-`Stop` can mark it `done`.
+`Stop` can mark it `done`. Add `resources:` to either kind when the command owns
+shared output, dependencies, a database, or a fixed server port; these values
+are used by workspace conflict checks in addition to conservative command
+classification.
 
 For portable stacks, prefer `argv:` when the executable and arguments are the
 same on every platform. Use `command_windows:` and `command_unix:` only when a

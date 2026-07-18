@@ -202,7 +202,7 @@ fn handleRequest(allocator: std.mem.Allocator, state: *app_state.AppState, reque
     if (std.mem.eql(u8, method, "surface.clearAttention")) return try surfaceClearAttentionResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "notification.create") or std.mem.eql(u8, method, "notification.update")) return try notificationUpdateResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "notification.clear")) return try notificationClearResponse(allocator, id_value, state, params);
-    if (std.mem.eql(u8, method, "processes")) return try managedProcessesResponse(allocator, id_value, state, params);
+    if (std.mem.eql(u8, method, "processes")) return try workspaceProcessesResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "inspect")) return try inspectResponse(allocator, id_value, state, params);
     if (std.mem.startsWith(u8, method, "workspace.")) return try workspaceCommandResponse(allocator, id_value, state, params, method["workspace.".len..]);
     if (std.mem.startsWith(u8, method, "pane.")) return try paneCommandResponse(allocator, id_value, state, params, method["pane.".len..]);
@@ -383,7 +383,8 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
             "terminal.write",                      "terminal.tail",                        "terminal.screen",                    "process.list",
             "process.inspect",                     "process.start",                        "process.stop",                       "process.restart",
             "process.logs",                        "agent.open",                           "stack.status",                       "stack.start",
-            "stack.stop",                          "stack.restart",
+            "stack.stop",                          "stack.restart",                        "workspace.processes",                "workspace.checkCommand",
+            "workspace.acquireLease",              "workspace.releaseLease",
         },
         .events = &.{},
         .encodings = &.{"json"},
@@ -770,6 +771,18 @@ fn inspectResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state
 }
 
 fn workspaceCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
+    if (std.mem.eql(u8, command, "processes")) {
+        return try workspaceProcessesResponse(allocator, id_value, state, params);
+    }
+    if (std.mem.eql(u8, command, "checkCommand")) {
+        return try workspaceCheckCommandResponse(allocator, id_value, state, params, false);
+    }
+    if (std.mem.eql(u8, command, "acquireLease")) {
+        return try workspaceAcquireLeaseResponse(allocator, id_value, state, params);
+    }
+    if (std.mem.eql(u8, command, "releaseLease")) {
+        return try workspaceReleaseLeaseResponse(allocator, id_value, state, params);
+    }
     if (std.mem.eql(u8, command, "select")) {
         const project_index = resolveProjectIndex(state, params) orelse
             return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
@@ -1424,7 +1437,11 @@ fn resolveClosedProjectIndex(state: *app_state.AppState, params: std.json.Value)
 }
 
 fn resolveProjectIndexNullable(state: *app_state.AppState, params: std.json.Value) ?usize {
-    if (params == .object and (params.object.get("workspace") != null or params.object.get("project") != null)) return resolveProjectIndex(state, params);
+    if (params == .object and
+        (params.object.get("workspace_id") != null or params.object.get("workspace") != null or params.object.get("project") != null))
+    {
+        return resolveProjectIndex(state, params);
+    }
     return null;
 }
 
@@ -1606,6 +1623,748 @@ fn writeTerminalsArray(s: *std.json.Stringify, state: *app_state.AppState, maybe
     try s.endArray();
 }
 
+fn workspaceProcessesResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+    const project_index = resolveProjectIndexNullable(state, params);
+    if (project_index) |index| {
+        if (index >= state.projects.items.len) return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+        if (try refreshStackConfigOrError(allocator, id_value, state, index)) |response| return response;
+        state.pruneExpiredWorkspaceLeases(index);
+    } else {
+        var index: usize = 0;
+        while (index < state.projects.items.len) : (index += 1) {
+            if (try refreshStackConfigOrError(allocator, id_value, state, index)) |response| return response;
+            state.pruneExpiredWorkspaceLeases(index);
+        }
+    }
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&s, id_value);
+    try s.objectField("result");
+    try s.beginObject();
+    try s.objectField("processes");
+    try writeWorkspaceProcessesArray(&s, state, project_index);
+    try s.objectField("leases");
+    try writeWorkspaceLeasesArray(&s, state, project_index);
+    try s.objectField("polled_at_ms");
+    try s.write(platform_runtime.unixTimestampMs());
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+fn writeWorkspaceProcessesArray(s: *std.json.Stringify, state: *app_state.AppState, maybe_project_index: ?usize) !void {
+    try s.beginArray();
+    for (state.projects.items, 0..) |*project, project_index| {
+        if (maybe_project_index) |wanted| if (wanted != project_index) continue;
+        state.refreshManagedProcessStatuses(project_index);
+        for (project.managed_processes.items) |*process| try writeManagedProcess(s, state, project_index, process);
+
+        for (project.terminal_docks.items) |*entry| {
+            if (managedProcessUsesDock(project, entry.id)) continue;
+            try writeTerminalWorkspaceProcess(s, state, project_index, entry.id, &entry.dock);
+        }
+        try writeTerminalWorkspaceProcess(s, state, project_index, 0, &project.terminal_dock);
+
+        for (project.threads.items, 0..) |*thread, thread_index| {
+            try writeGuiAgentWorkspaceProcess(s, project, project_index, thread, thread_index);
+            try writeBackgroundWorkspaceProcesses(s, project, project_index, thread, thread_index, false);
+        }
+        for (project.archived_threads.items, 0..) |*thread, thread_index| {
+            try writeBackgroundWorkspaceProcesses(s, project, project_index, thread, thread_index, true);
+        }
+    }
+    try s.endArray();
+}
+
+fn managedProcessUsesDock(project: *const app_state.Project, dock_id: u32) bool {
+    for (project.managed_processes.items) |process| {
+        if (process.dock_id != null and process.dock_id.? == dock_id) return true;
+    }
+    return false;
+}
+
+fn writeTerminalWorkspaceProcess(
+    s: *std.json.Stringify,
+    state: *app_state.AppState,
+    project_index: usize,
+    dock_id: u32,
+    dock: anytype,
+) !void {
+    const snapshot = dock.activeRuntimeProcessSnapshot() orelse return;
+    const session_id = dock.activeSessionId() orelse return;
+    var label_buffer: [96]u8 = undefined;
+    const command = dock.activeForegroundProcessName(&label_buffer) orelse dock.activeProcessLabel(&label_buffer);
+    const identity = snapshot.process_group orelse snapshot.pid orelse 0;
+    const process_id = try std.fmt.allocPrint(state.allocator, "term:{s}:{d}", .{ session_id, identity });
+    defer state.allocator.free(process_id);
+    const project = &state.projects.items[project_index];
+    const surface = state.surfaceBySessionIdConst(session_id);
+
+    try s.beginObject();
+    try s.objectField("id");
+    try s.write(process_id);
+    try s.objectField("source");
+    try s.write("terminal");
+    try s.objectField("workspace_index");
+    try s.write(project_index);
+    try s.objectField("workspace_id");
+    try s.write(project.id);
+    try s.objectField("name");
+    try s.write(command);
+    try s.objectField("command");
+    try s.write(command);
+    try s.objectField("cwd");
+    if (dock.cwd) |cwd| try s.write(cwd) else try s.write(project.path);
+    try s.objectField("status");
+    try s.write(if (snapshot.running) "running" else "stopped");
+    try s.objectField("classification");
+    try s.write(@tagName(app_state.classifyWorkspaceCommand(command)));
+    try s.objectField("resources");
+    try writeWorkspaceResources(s, &.{}, command);
+    try s.objectField("pid");
+    if (snapshot.pid) |pid| try s.write(pid) else try s.write(null);
+    try s.objectField("process_group");
+    if (snapshot.process_group) |process_group| try s.write(process_group) else try s.write(null);
+    try s.objectField("started_at_ms");
+    try s.write(snapshot.started_at_ms);
+    try s.objectField("dock_id");
+    try s.write(dock_id);
+    try s.objectField("pane_id");
+    if (workspacePaneIdForDock(project, dock_id)) |pane_id| try s.write(pane_id) else try s.write(null);
+    try s.objectField("owner");
+    try s.beginObject();
+    try s.objectField("id");
+    try s.write(session_id);
+    try s.objectField("kind");
+    try s.write(if (surface != null and surface.?.provider != null) "agent" else "terminal");
+    try s.objectField("session_id");
+    try s.write(session_id);
+    try s.objectField("title");
+    if (surface) |owner_surface| try s.write(owner_surface.title) else try s.write(command);
+    try s.objectField("provider");
+    if (surface) |owner_surface| {
+        if (owner_surface.provider) |provider| try s.write(@tagName(provider)) else try s.write(null);
+    } else try s.write(null);
+    try s.objectField("cancel_method");
+    try s.write("terminal.write Ctrl-C or close the pane");
+    try s.endObject();
+    try s.endObject();
+}
+
+fn workspacePaneIdForDock(project: *const app_state.Project, dock_id: u32) ?app_state.WorkspacePaneId {
+    for (project.workspace_layout.panes.items) |pane| {
+        switch (pane.ref) {
+            .terminal => |ref| if (ref.dock_id == dock_id) return pane.id,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn writeGuiAgentWorkspaceProcess(
+    s: *std.json.Stringify,
+    project: *const app_state.Project,
+    project_index: usize,
+    thread: *const app_state.ChatThread,
+    thread_index: usize,
+) !void {
+    if (!thread.isSendPendingForUi()) return;
+    var id_buffer: [160]u8 = undefined;
+    const process_id = std.fmt.bufPrint(&id_buffer, "turn:{s}", .{thread.local_thread_id}) catch thread.local_thread_id;
+    var command_buffer: [96]u8 = undefined;
+    const command = std.fmt.bufPrint(&command_buffer, "{s} GUI agent", .{@tagName(thread.provider)}) catch "GUI agent";
+    try s.beginObject();
+    try s.objectField("id");
+    try s.write(process_id);
+    try s.objectField("source");
+    try s.write("gui_agent");
+    try s.objectField("workspace_index");
+    try s.write(project_index);
+    try s.objectField("workspace_id");
+    try s.write(project.id);
+    try s.objectField("name");
+    try s.write(thread.title);
+    try s.objectField("command");
+    try s.write(command);
+    try s.objectField("cwd");
+    try s.write(project.path);
+    try s.objectField("status");
+    try s.write("running");
+    try s.objectField("classification");
+    try s.write("other");
+    try s.objectField("resources");
+    try s.beginArray();
+    try s.endArray();
+    try s.objectField("pid");
+    try s.write(null);
+    try s.objectField("process_group");
+    try s.write(null);
+    try s.objectField("started_at_ms");
+    if (thread.sendStartedAtMsForUi()) |started_at_ms| try s.write(started_at_ms) else try s.write(null);
+    try s.objectField("thread_index");
+    try s.write(thread_index);
+    try s.objectField("thread_id");
+    try s.write(thread.local_thread_id);
+    try s.objectField("owner");
+    try s.beginObject();
+    try s.objectField("id");
+    try s.write(thread.local_thread_id);
+    try s.objectField("kind");
+    try s.write("gui_agent");
+    try s.objectField("thread_id");
+    try s.write(thread.local_thread_id);
+    try s.objectField("provider");
+    try s.write(@tagName(thread.provider));
+    try s.objectField("title");
+    try s.write(thread.title);
+    try s.objectField("cancel_method");
+    try s.write("chat.stop");
+    try s.endObject();
+    try s.endObject();
+}
+
+fn writeBackgroundWorkspaceProcesses(
+    s: *std.json.Stringify,
+    project: *const app_state.Project,
+    project_index: usize,
+    thread: *const app_state.ChatThread,
+    thread_index: usize,
+    archived: bool,
+) !void {
+    for (thread.background_tasks.items, 0..) |task, task_index| {
+        var id_buffer: [256]u8 = undefined;
+        const process_id = if (task.task_id) |task_id|
+            std.fmt.bufPrint(&id_buffer, "task:{s}", .{task_id}) catch task_id
+        else
+            std.fmt.bufPrint(&id_buffer, "task:{s}:{d}", .{ thread.local_thread_id, task_index }) catch thread.local_thread_id;
+        try s.beginObject();
+        try s.objectField("id");
+        try s.write(process_id);
+        try s.objectField("source");
+        try s.write("background_task");
+        try s.objectField("workspace_index");
+        try s.write(project_index);
+        try s.objectField("workspace_id");
+        try s.write(project.id);
+        try s.objectField("name");
+        try s.write(task.command);
+        try s.objectField("command");
+        try s.write(task.command);
+        try s.objectField("cwd");
+        try s.write(project.path);
+        try s.objectField("status");
+        try s.write(@tagName(task.status));
+        try s.objectField("classification");
+        try s.write(@tagName(app_state.classifyWorkspaceCommand(task.command)));
+        try s.objectField("resources");
+        try writeWorkspaceResources(s, &.{}, task.command);
+        try s.objectField("pid");
+        if (task.pid) |pid| try s.write(pid) else try s.write(null);
+        try s.objectField("process_group");
+        if (task.pid) |pid| try s.write(pid) else try s.write(null);
+        try s.objectField("started_at_ms");
+        try s.write(task.started_at_ms);
+        try s.objectField("updated_at_ms");
+        try s.write(task.updated_at_ms);
+        try s.objectField("thread_index");
+        try s.write(thread_index);
+        try s.objectField("thread_id");
+        try s.write(thread.local_thread_id);
+        try s.objectField("archived_thread");
+        try s.write(archived);
+        try s.objectField("owner");
+        try s.beginObject();
+        try s.objectField("id");
+        try s.write(thread.local_thread_id);
+        try s.objectField("kind");
+        try s.write("gui_agent");
+        try s.objectField("thread_id");
+        try s.write(thread.local_thread_id);
+        try s.objectField("provider");
+        try s.write(@tagName(thread.provider));
+        try s.objectField("title");
+        try s.write(thread.title);
+        try s.objectField("cancel_method");
+        try s.write("stop the owning agent or background PID");
+        try s.endObject();
+        try s.endObject();
+    }
+}
+
+fn writeWorkspaceResources(s: *std.json.Stringify, explicit: anytype, command: []const u8) !void {
+    try s.beginArray();
+    for (explicit) |resource| try s.write(resource);
+    if (app_state.inferredWorkspaceResource(command)) |inferred| {
+        var duplicate = false;
+        for (explicit) |resource| {
+            if (std.mem.eql(u8, resource, inferred)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) try s.write(inferred);
+    }
+    try s.endArray();
+}
+
+fn writeWorkspaceLeasesArray(s: *std.json.Stringify, state: *app_state.AppState, maybe_project_index: ?usize) !void {
+    try s.beginArray();
+    for (state.projects.items, 0..) |*project, project_index| {
+        if (maybe_project_index) |wanted| if (wanted != project_index) continue;
+        for (project.workspace_leases.items) |*lease| {
+            try s.beginObject();
+            try s.objectField("id");
+            try s.write(lease.id);
+            try s.objectField("workspace_index");
+            try s.write(project_index);
+            try s.objectField("workspace_id");
+            try s.write(project.id);
+            try s.objectField("owner");
+            try s.write(lease.owner);
+            try s.objectField("command");
+            try s.write(lease.command);
+            try s.objectField("resources");
+            try s.beginArray();
+            for (lease.resources.items) |resource| try s.write(resource);
+            try s.endArray();
+            try s.objectField("created_at_ms");
+            try s.write(lease.created_at_ms);
+            try s.objectField("expires_at_ms");
+            try s.write(lease.expires_at_ms);
+            try s.endObject();
+        }
+    }
+    try s.endArray();
+}
+
+const WorkspaceResourceRequest = struct {
+    storage: [16][]const u8 = undefined,
+    len: usize = 0,
+
+    fn items(self: *const WorkspaceResourceRequest) []const []const u8 {
+        return self.storage[0..self.len];
+    }
+
+    fn append(self: *WorkspaceResourceRequest, resource: []const u8) !void {
+        const trimmed = std.mem.trim(u8, resource, " \t\r\n");
+        if (trimmed.len == 0 or trimmed.len > 128) return error.InvalidResource;
+        for (self.items()) |existing| {
+            if (std.mem.eql(u8, existing, trimmed)) return;
+        }
+        if (self.len >= self.storage.len) return error.TooManyResources;
+        self.storage[self.len] = trimmed;
+        self.len += 1;
+    }
+};
+
+fn workspaceResourceRequest(params: std.json.Value, command: []const u8) !WorkspaceResourceRequest {
+    var request: WorkspaceResourceRequest = .{};
+    if (params == .object) {
+        if (params.object.get("resources")) |resources| {
+            if (resources != .array) return error.InvalidResource;
+            for (resources.array.items) |resource| {
+                const value = jsonString(resource) orelse return error.InvalidResource;
+                try request.append(value);
+            }
+        }
+        if (stringParam(params, "resource")) |resource| try request.append(resource);
+    }
+    if (app_state.inferredWorkspaceResource(command)) |resource| try request.append(resource);
+    return request;
+}
+
+fn workspaceCheckCommandResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    state: *app_state.AppState,
+    params: std.json.Value,
+    acquire_rejected: bool,
+) ![]u8 {
+    const project_index = resolveProjectIndex(state, params) orelse
+        return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+    const command = stringParam(params, "command") orelse "";
+    const owner = stringParam(params, "owner") orelse "";
+    const resource_request = workspaceResourceRequest(params, command) catch |err|
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", @errorName(err));
+    if (command.len == 0 and resource_request.len == 0) {
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "workspace.checkCommand requires command or resources");
+    }
+    state.pruneExpiredWorkspaceLeases(project_index);
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&s, id_value);
+    try s.objectField("result");
+    try s.beginObject();
+    try s.objectField("workspace_index");
+    try s.write(project_index);
+    try s.objectField("workspace_id");
+    try s.write(state.projects.items[project_index].id);
+    try s.objectField("command");
+    try s.write(command);
+    try s.objectField("classification");
+    try s.write(@tagName(app_state.classifyWorkspaceCommand(command)));
+    try s.objectField("resources");
+    try s.beginArray();
+    for (resource_request.items()) |resource| try s.write(resource);
+    try s.endArray();
+    try s.objectField("conflicts");
+    const conflict_count = try writeWorkspaceConflicts(&s, state, project_index, owner, resource_request.items());
+    try s.objectField("allowed");
+    try s.write(conflict_count == 0);
+    try s.objectField("conflict_count");
+    try s.write(conflict_count);
+    if (acquire_rejected) {
+        try s.objectField("acquired");
+        try s.write(false);
+    }
+    try s.objectField("warning");
+    if (conflict_count > 0) try s.write("Another command owns a requested workspace resource.") else try s.write(null);
+    try s.objectField("options");
+    try s.beginArray();
+    try s.write("wait");
+    try s.write("cancel_existing");
+    try s.write("run_anyway");
+    try s.write("open_owner");
+    try s.endArray();
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+fn workspaceAcquireLeaseResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+    const project_index = resolveProjectIndex(state, params) orelse
+        return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+    const owner = stringParam(params, "owner") orelse
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "workspace.acquireLease requires owner");
+    const command = stringParam(params, "command") orelse "";
+    const resources = workspaceResourceRequest(params, command) catch |err|
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", @errorName(err));
+    if (resources.len == 0) return try errorResponseAlloc(allocator, id_value, "invalid_request", "workspace.acquireLease requires resources or a classified command");
+    const force = boolParam(params, "force") orelse false;
+    const ttl_ms = std.math.clamp(intParam(params, "ttl_ms") orelse 120_000, 1_000, 3_600_000);
+
+    if (!force and workspaceProcessConflictCount(state, project_index, owner, resources.items()) > 0) {
+        return try workspaceCheckCommandResponse(allocator, id_value, state, params, true);
+    }
+    const lease = state.acquireWorkspaceLease(project_index, owner, command, resources.items(), ttl_ms, force) catch |err| switch (err) {
+        error.LeaseConflict => return try workspaceCheckCommandResponse(allocator, id_value, state, params, true),
+        error.LeaseOwnerRequired, error.LeaseResourcesRequired => return try errorResponseAlloc(allocator, id_value, "invalid_request", @errorName(err)),
+        else => return err,
+    };
+    if (force) notifyForcedWorkspaceConflictOwners(state, project_index, owner, command, resources.items());
+
+    return try okValueResponse(allocator, id_value, .{
+        .acquired = true,
+        .forced = force,
+        .workspace_index = project_index,
+        .workspace_id = state.projects.items[project_index].id,
+        .lease_id = lease.id,
+        .owner = lease.owner,
+        .command = lease.command,
+        .resources = lease.resources.items,
+        .created_at_ms = lease.created_at_ms,
+        .expires_at_ms = lease.expires_at_ms,
+    });
+}
+
+fn workspaceReleaseLeaseResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+    const project_index = resolveProjectIndex(state, params) orelse
+        return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+    const owner = stringParam(params, "owner") orelse
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "workspace.releaseLease requires owner");
+    const lease_id = stringParam(params, "lease_id") orelse stringParam(params, "id");
+    const released = state.releaseWorkspaceLease(project_index, owner, lease_id);
+    return try okValueResponse(allocator, id_value, .{
+        .released = released,
+        .workspace_index = project_index,
+        .workspace_id = state.projects.items[project_index].id,
+        .lease_id = lease_id,
+        .owner = owner,
+    });
+}
+
+fn writeWorkspaceConflicts(
+    s: *std.json.Stringify,
+    state: *app_state.AppState,
+    project_index: usize,
+    request_owner: []const u8,
+    request_resources: []const []const u8,
+) !usize {
+    var count: usize = 0;
+    const project = &state.projects.items[project_index];
+    try s.beginArray();
+    for (project.managed_processes.items) |*process| {
+        if (!managedProcessStatusActive(process.status)) continue;
+        const command = if (process.command.len > 0) process.command else process.name;
+        const resource = conflictingWorkspaceResource(request_resources, process.resources.items, command) orelse continue;
+        const dock = if (process.dock_id) |dock_id| state.projectTerminalDock(project_index, dock_id) else null;
+        const session_id = if (dock) |process_dock| process_dock.activeSessionId() else null;
+        if (session_id != null and std.mem.eql(u8, request_owner, session_id.?)) continue;
+        const id = try std.fmt.allocPrint(state.allocator, "proc:{s}:{s}", .{ project.id, process.name });
+        defer state.allocator.free(id);
+        try writeWorkspaceConflict(s, .{
+            .kind = "process",
+            .source = "configured",
+            .resource = resource,
+            .id = id,
+            .owner = session_id orelse id,
+            .owner_kind = if (process.kind == .agent) "agent" else "managed_process",
+            .session_id = session_id,
+            .pane_id = process.pane_id,
+            .command = command,
+            .status = @tagName(process.status),
+            .started_at_ms = process.last_start_ms,
+            .cancel_method = "process.stop",
+        });
+        count += 1;
+    }
+    for (project.terminal_docks.items) |*entry| {
+        if (managedProcessUsesDock(project, entry.id)) continue;
+        count += try writeTerminalWorkspaceConflict(s, state, project_index, entry.id, &entry.dock, request_owner, request_resources);
+    }
+    count += try writeTerminalWorkspaceConflict(s, state, project_index, 0, &project.terminal_dock, request_owner, request_resources);
+    for (project.threads.items) |*thread| count += try writeBackgroundWorkspaceConflicts(s, thread, request_owner, request_resources);
+    for (project.archived_threads.items) |*thread| count += try writeBackgroundWorkspaceConflicts(s, thread, request_owner, request_resources);
+
+    for (project.workspace_leases.items) |*lease| {
+        if (std.mem.eql(u8, request_owner, lease.owner)) continue;
+        const resource = firstWorkspaceResourceOverlap(request_resources, lease.resources.items) orelse continue;
+        try writeWorkspaceConflict(s, .{
+            .kind = "lease",
+            .source = "lease",
+            .resource = resource,
+            .id = lease.id,
+            .owner = lease.owner,
+            .owner_kind = "agent",
+            .command = lease.command,
+            .status = "leased",
+            .started_at_ms = lease.created_at_ms,
+            .expires_at_ms = lease.expires_at_ms,
+            .cancel_method = "workspace.releaseLease (owner only)",
+        });
+        count += 1;
+    }
+    try s.endArray();
+    return count;
+}
+
+const WorkspaceConflict = struct {
+    kind: []const u8,
+    source: []const u8,
+    resource: []const u8,
+    id: []const u8,
+    owner: []const u8,
+    owner_kind: []const u8,
+    session_id: ?[]const u8 = null,
+    pane_id: ?u32 = null,
+    thread_id: ?[]const u8 = null,
+    command: []const u8,
+    status: []const u8,
+    started_at_ms: i64 = 0,
+    expires_at_ms: ?i64 = null,
+    cancel_method: []const u8,
+};
+
+fn writeWorkspaceConflict(s: *std.json.Stringify, conflict: WorkspaceConflict) !void {
+    try s.beginObject();
+    inline for (.{
+        .{ "kind", conflict.kind },
+        .{ "source", conflict.source },
+        .{ "resource", conflict.resource },
+        .{ "id", conflict.id },
+        .{ "owner", conflict.owner },
+        .{ "owner_kind", conflict.owner_kind },
+        .{ "command", conflict.command },
+        .{ "status", conflict.status },
+        .{ "cancel_method", conflict.cancel_method },
+    }) |field| {
+        try s.objectField(field[0]);
+        try s.write(field[1]);
+    }
+    try s.objectField("session_id");
+    if (conflict.session_id) |value| try s.write(value) else try s.write(null);
+    try s.objectField("pane_id");
+    if (conflict.pane_id) |value| try s.write(value) else try s.write(null);
+    try s.objectField("thread_id");
+    if (conflict.thread_id) |value| try s.write(value) else try s.write(null);
+    try s.objectField("started_at_ms");
+    try s.write(conflict.started_at_ms);
+    try s.objectField("expires_at_ms");
+    if (conflict.expires_at_ms) |value| try s.write(value) else try s.write(null);
+    try s.endObject();
+}
+
+fn writeTerminalWorkspaceConflict(
+    s: *std.json.Stringify,
+    state: *app_state.AppState,
+    project_index: usize,
+    dock_id: u32,
+    dock: anytype,
+    request_owner: []const u8,
+    request_resources: []const []const u8,
+) !usize {
+    const snapshot = dock.activeRuntimeProcessSnapshot() orelse return 0;
+    if (!snapshot.running) return 0;
+    const session_id = dock.activeSessionId() orelse return 0;
+    if (std.mem.eql(u8, request_owner, session_id)) return 0;
+    var label_buffer: [96]u8 = undefined;
+    const command = dock.activeForegroundProcessName(&label_buffer) orelse dock.activeProcessLabel(&label_buffer);
+    const resource = conflictingWorkspaceResource(request_resources, &.{}, command) orelse return 0;
+    const process_id = try std.fmt.allocPrint(state.allocator, "term:{s}:{d}", .{ session_id, snapshot.process_group orelse snapshot.pid orelse 0 });
+    defer state.allocator.free(process_id);
+    try writeWorkspaceConflict(s, .{
+        .kind = "process",
+        .source = "terminal",
+        .resource = resource,
+        .id = process_id,
+        .owner = session_id,
+        .owner_kind = if (state.surfaceBySessionIdConst(session_id) != null) "agent" else "terminal",
+        .session_id = session_id,
+        .pane_id = workspacePaneIdForDock(&state.projects.items[project_index], dock_id),
+        .command = command,
+        .status = "running",
+        .started_at_ms = snapshot.started_at_ms,
+        .cancel_method = "terminal.write Ctrl-C or close the pane",
+    });
+    return 1;
+}
+
+fn writeBackgroundWorkspaceConflicts(
+    s: *std.json.Stringify,
+    thread: *const app_state.ChatThread,
+    request_owner: []const u8,
+    request_resources: []const []const u8,
+) !usize {
+    if (std.mem.eql(u8, request_owner, thread.local_thread_id)) return 0;
+    var count: usize = 0;
+    for (thread.background_tasks.items, 0..) |task, task_index| {
+        if (task.status != .running) continue;
+        const resource = conflictingWorkspaceResource(request_resources, &.{}, task.command) orelse continue;
+        var id_buffer: [256]u8 = undefined;
+        const process_id = if (task.task_id) |task_id|
+            std.fmt.bufPrint(&id_buffer, "task:{s}", .{task_id}) catch task_id
+        else
+            std.fmt.bufPrint(&id_buffer, "task:{s}:{d}", .{ thread.local_thread_id, task_index }) catch thread.local_thread_id;
+        try writeWorkspaceConflict(s, .{
+            .kind = "process",
+            .source = "background_task",
+            .resource = resource,
+            .id = process_id,
+            .owner = thread.local_thread_id,
+            .owner_kind = "gui_agent",
+            .thread_id = thread.local_thread_id,
+            .command = task.command,
+            .status = "running",
+            .started_at_ms = task.started_at_ms,
+            .cancel_method = "stop the owning agent or background PID",
+        });
+        count += 1;
+    }
+    return count;
+}
+
+fn managedProcessStatusActive(status: app_state.ManagedProcessStatus) bool {
+    return status == .starting or status == .running or status == .stopping or status == .restarting;
+}
+
+fn conflictingWorkspaceResource(request: []const []const u8, explicit: anytype, command: []const u8) ?[]const u8 {
+    if (firstWorkspaceResourceOverlap(request, explicit)) |resource| return resource;
+    const inferred = app_state.inferredWorkspaceResource(command) orelse return null;
+    for (request) |resource| if (std.mem.eql(u8, resource, inferred)) return resource;
+    return null;
+}
+
+fn firstWorkspaceResourceOverlap(left: anytype, right: anytype) ?[]const u8 {
+    for (left) |left_resource| {
+        for (right) |right_resource| {
+            if (std.mem.eql(u8, left_resource, right_resource)) return left_resource;
+        }
+    }
+    return null;
+}
+
+fn workspaceProcessConflictCount(state: *app_state.AppState, project_index: usize, owner: []const u8, resources: []const []const u8) usize {
+    if (project_index >= state.projects.items.len) return 0;
+    const project = &state.projects.items[project_index];
+    var count: usize = 0;
+    for (project.managed_processes.items) |*process| {
+        if (!managedProcessStatusActive(process.status)) continue;
+        const command = if (process.command.len > 0) process.command else process.name;
+        if (conflictingWorkspaceResource(resources, process.resources.items, command) == null) continue;
+        const session_id = if (process.dock_id) |dock_id|
+            if (state.projectTerminalDock(project_index, dock_id)) |dock| dock.activeSessionId() else null
+        else
+            null;
+        if (session_id != null and std.mem.eql(u8, owner, session_id.?)) continue;
+        count += 1;
+    }
+    for (project.terminal_docks.items) |*entry| {
+        if (managedProcessUsesDock(project, entry.id)) continue;
+        count += terminalWorkspaceConflictCount(&entry.dock, owner, resources);
+    }
+    count += terminalWorkspaceConflictCount(&project.terminal_dock, owner, resources);
+    for (project.threads.items) |*thread| count += backgroundWorkspaceConflictCount(thread, owner, resources);
+    for (project.archived_threads.items) |*thread| count += backgroundWorkspaceConflictCount(thread, owner, resources);
+    return count;
+}
+
+fn terminalWorkspaceConflictCount(dock: anytype, owner: []const u8, resources: []const []const u8) usize {
+    const snapshot = dock.activeRuntimeProcessSnapshot() orelse return 0;
+    if (!snapshot.running) return 0;
+    const session_id = dock.activeSessionId() orelse return 0;
+    if (std.mem.eql(u8, owner, session_id)) return 0;
+    var label_buffer: [96]u8 = undefined;
+    const command = dock.activeForegroundProcessName(&label_buffer) orelse dock.activeProcessLabel(&label_buffer);
+    return if (conflictingWorkspaceResource(resources, &.{}, command) != null) 1 else 0;
+}
+
+fn backgroundWorkspaceConflictCount(thread: *const app_state.ChatThread, owner: []const u8, resources: []const []const u8) usize {
+    if (std.mem.eql(u8, owner, thread.local_thread_id)) return 0;
+    var count: usize = 0;
+    for (thread.background_tasks.items) |task| {
+        if (task.status == .running and conflictingWorkspaceResource(resources, &.{}, task.command) != null) count += 1;
+    }
+    return count;
+}
+
+fn notifyForcedWorkspaceConflictOwners(
+    state: *app_state.AppState,
+    project_index: usize,
+    request_owner: []const u8,
+    command: []const u8,
+    resources: []const []const u8,
+) void {
+    if (project_index >= state.projects.items.len) return;
+    const project = &state.projects.items[project_index];
+    for (project.terminal_docks.items) |*entry| {
+        notifyForcedWorkspaceDockOwner(state, &entry.dock, request_owner, command, resources);
+    }
+    notifyForcedWorkspaceDockOwner(state, &project.terminal_dock, request_owner, command, resources);
+}
+
+fn notifyForcedWorkspaceDockOwner(
+    state: *app_state.AppState,
+    dock: anytype,
+    request_owner: []const u8,
+    command: []const u8,
+    resources: []const []const u8,
+) void {
+    if (terminalWorkspaceConflictCount(dock, request_owner, resources) == 0) return;
+    const session_id = dock.activeSessionId() orelse return;
+    if (state.surfaceBySessionIdConst(session_id) == null) return;
+    _ = state.updateSurface(.{
+        .session_id = session_id,
+        .attention = true,
+        .unread_increment = 1,
+        .last_event_title = "Conflicting command started",
+        .last_event_body = command,
+    }) catch {};
+}
+
 fn managedProcessesResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
     const project_index = resolveProjectIndexNullable(state, params);
     if (project_index) |index| {
@@ -1688,7 +2447,16 @@ fn writeManagedProcessesArray(s: *std.json.Stringify, state: *app_state.AppState
 
 fn writeManagedProcess(s: *std.json.Stringify, state: *app_state.AppState, project_index: usize, process: *const app_state.ManagedProcess) !void {
     const project = &state.projects.items[project_index];
+    const process_id = try std.fmt.allocPrint(state.allocator, "proc:{s}:{s}", .{ project.id, process.name });
+    defer state.allocator.free(process_id);
+    const dock = if (process.dock_id) |dock_id| state.projectTerminalDock(project_index, dock_id) else null;
+    const runtime_process = if (dock) |active_dock| active_dock.activeRuntimeProcessSnapshot() else null;
+    const session_id = if (dock) |active_dock| active_dock.activeSessionId() else null;
     try s.beginObject();
+    try s.objectField("id");
+    try s.write(process_id);
+    try s.objectField("source");
+    try s.write("configured");
     try s.objectField("workspace_index");
     try s.write(project_index);
     try s.objectField("workspace_id");
@@ -1715,6 +2483,29 @@ fn writeManagedProcess(s: *std.json.Stringify, state: *app_state.AppState, proje
     try s.write(process.hooks);
     try s.objectField("status");
     try s.write(@tagName(process.status));
+    try s.objectField("classification");
+    try s.write(@tagName(app_state.classifyWorkspaceCommand(if (process.command.len > 0) process.command else process.name)));
+    try s.objectField("resources");
+    try writeWorkspaceResources(s, process.resources.items, if (process.command.len > 0) process.command else process.name);
+    try s.objectField("owner");
+    try s.beginObject();
+    try s.objectField("id");
+    if (session_id) |value| try s.write(value) else try s.write(process_id);
+    try s.objectField("kind");
+    try s.write(if (process.kind == .agent) "agent" else "managed_process");
+    try s.objectField("session_id");
+    if (session_id) |value| try s.write(value) else try s.write(null);
+    try s.objectField("cancel_method");
+    try s.write("process.stop");
+    try s.endObject();
+    try s.objectField("pid");
+    if (runtime_process) |snapshot| {
+        if (snapshot.pid) |pid| try s.write(pid) else try s.write(null);
+    } else try s.write(null);
+    try s.objectField("process_group");
+    if (runtime_process) |snapshot| {
+        if (snapshot.process_group) |process_group| try s.write(process_group) else try s.write(null);
+    } else try s.write(null);
     try s.objectField("exit_code");
     if (process.exit_code) |exit_code| try s.write(exit_code) else try s.write(null);
     try s.objectField("signal");
@@ -1757,15 +2548,15 @@ fn writeManagedProcess(s: *std.json.Stringify, state: *app_state.AppState, proje
     if (process.pending_watch_restart_ms != 0) try s.write("watch_restart_pending");
     try s.endArray();
     if (process.dock_id) |dock_id| {
-        if (state.projectTerminalDock(project_index, dock_id)) |dock| {
+        if (state.projectTerminalDock(project_index, dock_id)) |process_dock| {
             try s.objectField("running");
-            try s.write(dock.hasRunningSession());
+            try s.write(process_dock.hasRunningSession());
             try s.objectField("active_tab_index");
-            try s.write(dock.active_tab_index);
+            try s.write(process_dock.active_tab_index);
             try s.objectField("tab_count");
-            try s.write(dock.tabs.items.len);
+            try s.write(process_dock.tabs.items.len);
             try s.objectField("terminal_cwd");
-            if (dock.cwd) |cwd| try s.write(cwd) else try s.write(null);
+            if (process_dock.cwd) |cwd| try s.write(cwd) else try s.write(null);
         }
     }
     try s.endObject();

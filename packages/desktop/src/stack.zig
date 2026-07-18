@@ -48,6 +48,7 @@ pub const ProcessDefinition = struct {
     mcp: bool = false,
     hooks: bool = false,
     watch: std.ArrayList([]u8) = .empty,
+    resources: std.ArrayList([]u8) = .empty,
 
     pub fn deinit(self: *ProcessDefinition, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -60,6 +61,8 @@ pub const ProcessDefinition = struct {
         allocator.free(self.cwd);
         for (self.watch.items) |pattern| allocator.free(pattern);
         self.watch.deinit(allocator);
+        for (self.resources.items) |resource| allocator.free(resource);
+        self.resources.deinit(allocator);
     }
 
     /// Selects one launch description without serializing structured argv into
@@ -124,6 +127,7 @@ const Section = enum {
 const ListField = enum {
     none,
     watch,
+    resources,
     argv,
     argv_windows,
     argv_unix,
@@ -201,6 +205,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8, source_path: []c
                 .mcp = false,
                 .hooks = false,
                 .watch = .empty,
+                .resources = .empty,
             });
             current_index = config.processes.items.len - 1;
             list_field = .none;
@@ -214,6 +219,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8, source_path: []c
             errdefer allocator.free(value);
             switch (list_field) {
                 .watch => try process.watch.append(allocator, value),
+                .resources => try process.resources.append(allocator, value),
                 .argv => try process.argv.append(allocator, value),
                 .argv_windows => try process.argv_windows.append(allocator, value),
                 .argv_unix => try process.argv_unix.append(allocator, value),
@@ -268,6 +274,9 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8, source_path: []c
         } else if (std.mem.eql(u8, key, "watch")) {
             if (raw_value.len != 0) return error.InvalidStackConfig;
             list_field = .watch;
+        } else if (std.mem.eql(u8, key, "resources")) {
+            if (raw_value.len != 0) return error.InvalidStackConfig;
+            list_field = .resources;
         }
     }
 
@@ -352,6 +361,9 @@ test "parse verde stack config" {
         \\    command: "npm run dev"
         \\    cwd: "."
         \\    restart: on_crash
+        \\    resources:
+        \\      - "build"
+        \\      - "port:3000"
         \\    watch:
         \\      - "src/**"
         \\agents:
@@ -371,6 +383,8 @@ test "parse verde stack config" {
     try std.testing.expectEqualStrings("web", config.processes.items[0].name);
     try std.testing.expectEqual(ProcessKind.process, config.processes.items[0].kind);
     try std.testing.expectEqual(RestartPolicy.on_crash, config.processes.items[0].restart);
+    try std.testing.expectEqualStrings("build", config.processes.items[0].resources.items[0]);
+    try std.testing.expectEqualStrings("port:3000", config.processes.items[0].resources.items[1]);
     try std.testing.expectEqualStrings("src/**", config.processes.items[0].watch.items[0]);
     try std.testing.expectEqualStrings("codex", config.processes.items[1].name);
     try std.testing.expectEqual(ProcessKind.agent, config.processes.items[1].kind);

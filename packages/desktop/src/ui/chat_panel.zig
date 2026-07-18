@@ -165,6 +165,7 @@ pub fn renderWorkspace(state: *app_state.AppState, width: f32, height: f32) void
 pub fn resetTranscriptHitCache() void {
     transcript_hit_count = 0;
     usage_action_hit_count = 0;
+    process_dashboard_hit_count = 0;
 }
 
 pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
@@ -183,6 +184,17 @@ pub fn renderWorkspaceAtForPane(state: *app_state.AppState, rect: palette.Rect, 
 fn paneOwnsActiveChatState(state: *const app_state.AppState, pane_id: ?app_state.WorkspacePaneId) bool {
     const id = pane_id orelse return true;
     return state.isCurrentProjectWorkspacePaneFocused(id) or state.isCurrentProjectWorkspacePaneMaximized(id);
+}
+
+fn paneShowsProcessDashboard(state: *const app_state.AppState, pane_id: ?app_state.WorkspacePaneId) bool {
+    const id = pane_id orelse return true;
+    if (state.projects.items.len == 0) return false;
+    const project = state.currentProject();
+    const pane = project.workspace_layout.paneById(id) orelse return false;
+    return switch (pane.ref) {
+        .chat => |ref| ref.thread_index == project.selected_thread_index,
+        else => false,
+    };
 }
 
 /// Single source of truth for the chat lane's centered content column: the
@@ -287,7 +299,8 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
         .w = rect.w,
         .h = @max(composer_y - (header.y + header.h) - attachment_reserve - followup_reserve - approval_reserve, theme.scaledUi(120.0)),
     };
-    const process_strip_height = if (pane_id == null and state.currentProject().managed_processes.items.len > 0)
+    const process_strip_height = if (paneShowsProcessDashboard(state, pane_id) and
+        (state.currentProject().managed_processes.items.len > 0 or state.activeWorkspaceLeaseCount(state.selected_project_index) > 0))
         theme.scaledUi(52.0)
     else
         0.0;
@@ -1708,8 +1721,10 @@ fn renderEmptyProjects(state: *app_state.AppState, rect: palette.Rect) void {
 fn renderProcessDashboard(state: *app_state.AppState, rect: palette.Rect) void {
     if (state.projects.items.len == 0) return;
     const project = state.currentProject();
-    if (project.managed_processes.items.len == 0) return;
+    const total_items = project.managed_processes.items.len + project.workspace_leases.items.len;
+    if (total_items == 0) return;
 
+    // Compact workspace command and lease strip.
     const clip = snapRect(rect);
     queuePanel(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 232)), paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 180)), theme.scaledUi(6.0), theme.scaledUi(1.0));
     queueChromeLabel(state, .{
@@ -1721,8 +1736,10 @@ fn renderProcessDashboard(state: *app_state.AppState, rect: palette.Rect) void {
 
     var x = rect.x + theme.scaledUi(76.0);
     const row_y = rect.y + theme.scaledUi(7.0);
-    const max_items = @min(project.managed_processes.items.len, 5);
-    for (project.managed_processes.items[0..max_items], 0..) |process, process_index| {
+    const max_items = @min(total_items, 5);
+    const max_processes = @min(project.managed_processes.items.len, max_items);
+    var rendered_items: usize = 0;
+    for (project.managed_processes.items[0..max_processes], 0..) |process, process_index| {
         const item_w = theme.clampf(rect.w * 0.18, theme.scaledUi(120.0), theme.scaledUi(190.0));
         if (x + item_w > rect.x + rect.w - theme.scaledUi(8.0)) break;
         const item = palette.Rect{ .x = x, .y = row_y, .w = item_w, .h = rect.h - theme.scaledUi(14.0) };
@@ -1758,11 +1775,22 @@ fn renderProcessDashboard(state: *app_state.AppState, rect: palette.Rect) void {
             renderProcessDashboardButton(state, .{ .x = bx, .y = by, .w = button_w, .h = button_h }, "S", process_index, .start, clip);
         }
         x += item_w + theme.scaledUi(8.0);
+        rendered_items += 1;
     }
 
-    if (project.managed_processes.items.len > max_items) {
+    const available_lease_items = max_items - rendered_items;
+    const max_leases = @min(project.workspace_leases.items.len, available_lease_items);
+    for (project.workspace_leases.items[0..max_leases]) |lease| {
+        const item_w = theme.clampf(rect.w * 0.18, theme.scaledUi(120.0), theme.scaledUi(190.0));
+        if (x + item_w > rect.x + rect.w - theme.scaledUi(8.0)) break;
+        renderWorkspaceLeaseDashboardItem(state, .{ .x = x, .y = row_y, .w = item_w, .h = rect.h - theme.scaledUi(14.0) }, lease, clip);
+        x += item_w + theme.scaledUi(8.0);
+        rendered_items += 1;
+    }
+
+    if (total_items > rendered_items) {
         var more_buffer: [32]u8 = undefined;
-        const more = std.fmt.bufPrint(&more_buffer, "+{d}", .{project.managed_processes.items.len - max_items}) catch "+";
+        const more = std.fmt.bufPrint(&more_buffer, "+{d}", .{total_items - rendered_items}) catch "+";
         queueChromeLabel(state, .{
             .x = rect.x + rect.w - theme.scaledUi(42.0),
             .y = rect.y + theme.scaledUi(15.0),
@@ -1770,6 +1798,27 @@ fn renderProcessDashboard(state: *app_state.AppState, rect: palette.Rect) void {
             .h = theme.scaledUi(18.0),
         }, more, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), clip);
     }
+}
+
+fn renderWorkspaceLeaseDashboardItem(state: *app_state.AppState, item: palette.Rect, lease: app_state.WorkspaceLease, clip: palette.Rect) void {
+    queueRounded(state, item, paletteColor(theme.withAlpha(theme.background(), 210)), theme.scaledUi(5.0));
+    const dot = palette.Rect{ .x = item.x + theme.scaledUi(9.0), .y = item.y + theme.scaledUi(12.0), .w = theme.scaledUi(8.0), .h = theme.scaledUi(8.0) };
+    queueRounded(state, dot, paletteColor(theme.COLOR_YELLOW), theme.scaledUi(4.0));
+    queueChromeLabel(state, .{
+        .x = item.x + theme.scaledUi(24.0),
+        .y = item.y + theme.scaledUi(5.0),
+        .w = item.w - theme.scaledUi(32.0),
+        .h = theme.scaledUi(18.0),
+    }, if (lease.command.len > 0) lease.command else "Resource lease", paletteColor(theme.COLOR_WHITE), theme.scaledUi(12.0), clip);
+    var detail_buffer: [160]u8 = undefined;
+    const resource = if (lease.resources.items.len > 0) lease.resources.items[0] else "resource";
+    const detail = std.fmt.bufPrint(&detail_buffer, "{s} · {s}", .{ lease.owner, resource }) catch lease.owner;
+    queueChromeLabel(state, .{
+        .x = item.x + theme.scaledUi(24.0),
+        .y = item.y + theme.scaledUi(23.0),
+        .w = item.w - theme.scaledUi(32.0),
+        .h = theme.scaledUi(16.0),
+    }, detail, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(11.0), clip);
 }
 
 fn renderProcessDashboardButton(state: *app_state.AppState, rect: palette.Rect, label: []const u8, process_index: usize, action: ProcessDashboardAction, clip: palette.Rect) void {
