@@ -672,6 +672,7 @@ fn syncMouseCursor(state: *const AppState, pointer_cursor: *sdl.Cursor) void {
     if (!modalHitAtMouse(state) and
         (sidebar_ui.wantsPointerAt(state, state.palette_mouse_x, state.palette_mouse_y) or
             chat_panel_ui.workspaceHeaderWantsPointerAt(state, state.palette_mouse_x, state.palette_mouse_y) or
+            chat_panel_ui.approvalActionWantsPointerAt(state.palette_mouse_x, state.palette_mouse_y) or
             chat_panel_ui.transcriptActionWantsPointerAt(state.palette_mouse_x, state.palette_mouse_y)))
     {
         sdl.setCursor(pointer_cursor) catch {};
@@ -1545,6 +1546,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (event.button.button == 1 and debug_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            // The approval card overlays the gap between transcript and
+            // composer, so it must receive clicks before pane/browser routing.
+            if (event.button.button == 1 and chat_panel_ui.handleApprovalPaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
