@@ -1069,7 +1069,7 @@ const AssistantSnapshot = struct {
         }
 
         const finish = self.finish orelse return false;
-        return !std.mem.eql(u8, finish, "tool-calls");
+        return !std.mem.eql(u8, finish, "tool-calls") and !std.mem.eql(u8, finish, "unknown");
     }
 
     fn hasRenderablePostBaselineContent(self: *const AssistantSnapshot, baseline_assistant_id: ?[]const u8) bool {
@@ -1102,6 +1102,7 @@ const EventStreamContext = struct {
     request: provider_types.SendPromptRequest,
     child: ?platform_process.OwnedChild = null,
     streamed_text: std.ArrayListUnmanaged(u8) = .empty,
+    visible_text_part_ids: std.ArrayListUnmanaged([]u8) = .empty,
     mutex: Mutex = .{},
     condition: Condition = .{},
     open_state: EventStreamOpenState = .starting,
@@ -1112,6 +1113,8 @@ const EventStreamContext = struct {
         self.allocator.free(self.session_id);
         if (self.baseline_assistant_id) |message_id| self.allocator.free(message_id);
         self.streamed_text.deinit(self.allocator);
+        for (self.visible_text_part_ids.items) |part_id| self.allocator.free(part_id);
+        self.visible_text_part_ids.deinit(self.allocator);
     }
 };
 
@@ -1148,6 +1151,26 @@ fn streamWriteAllWithIo(io: std.Io, stream: std.Io.net.Stream, bytes: []const u8
     var writer = stream.writer(io, &buffer);
     try writer.interface.writeAll(bytes);
     try writer.interface.flush();
+}
+
+fn readEventStreamLine(reader: *std.Io.Reader, line_writer: *std.Io.Writer.Allocating, max_line_bytes: usize) !?[]const u8 {
+    line_writer.clearRetainingCapacity();
+    const line_len = try reader.streamDelimiterLimit(&line_writer.writer, '\n', .limited(max_line_bytes));
+    const next = reader.peekByte() catch |err| switch (err) {
+        error.EndOfStream => return if (line_len == 0) null else line_writer.written(),
+        else => |read_err| return read_err,
+    };
+    std.debug.assert(next == '\n');
+    reader.toss(1);
+    return line_writer.written();
+}
+
+fn discardEventStreamLineRemainder(reader: *std.Io.Reader) !bool {
+    _ = reader.discardDelimiterInclusive('\n') catch |err| switch (err) {
+        error.EndOfStream => return false,
+        else => |read_err| return read_err,
+    };
+    return true;
 }
 
 // Accepts any HTTP version ("HTTP/1.1 200 OK", "HTTP/1.0 200 ...").
@@ -1477,6 +1500,7 @@ fn extractAssistantTextAlloc(allocator: std.mem.Allocator, value: std.json.Value
         if (part != .object) continue;
         const type_name = getOptionalObjectString(part, "type") orelse continue;
         if (!std.mem.eql(u8, type_name, "text")) continue;
+        if (jsonBool(getObjectField(part, "ignored")) == true or jsonBool(getObjectField(part, "synthetic")) == true) continue;
         const chunk = getOptionalObjectString(part, "text") orelse "";
         try text.appendSlice(allocator, chunk);
     }
@@ -1663,6 +1687,7 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
         .environ_map = &env_map,
     });
 
+    const stdout = child.child.stdout.?;
     context.mutex.lock();
     context.child = child;
     context.mutex.unlock();
@@ -1673,19 +1698,28 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
     opened = true;
     signalEventStreamOpenState(context, .ready);
 
-    const stdout = context.child.?.child.stdout.?;
     var read_buffer: [64 * 1024]u8 = undefined;
     var threaded_read = std.Io.Threaded.init_single_threaded;
     var file_reader = stdout.reader(threaded_read.io(), &read_buffer);
+    var line_writer: std.Io.Writer.Allocating = .init(context.allocator);
+    defer line_writer.deinit();
 
     var event_name: std.ArrayList(u8) = .empty;
     defer event_name.deinit(context.allocator);
     var event_data: std.ArrayList(u8) = .empty;
     defer event_data.deinit(context.allocator);
 
-    while (true) {
+    event_loop: while (true) {
         if (isEventStreamStopRequested(context)) return;
-        const maybe_line = try file_reader.interface.takeDelimiter('\n');
+        const maybe_line = readEventStreamLine(&file_reader.interface, &line_writer, MAX_HTTP_BODY_BYTES) catch |err| switch (err) {
+            error.StreamTooLong => {
+                if (!try discardEventStreamLineRemainder(&file_reader.interface)) break :event_loop;
+                event_name.clearRetainingCapacity();
+                event_data.clearRetainingCapacity();
+                continue :event_loop;
+            },
+            else => |read_err| return read_err,
+        };
         if (maybe_line == null) break;
 
         const raw_line = maybe_line.?;
@@ -1734,10 +1768,7 @@ fn signalEventStreamStop(handle: EventStreamHandle) void {
     log.info("stopping OpenCode event stream session_len={d}", .{handle.context.session_id.len});
     handle.context.mutex.lock();
     handle.context.stop_requested = true;
-    if (handle.context.child) |*child| {
-        var threaded = std.Io.Threaded.init_single_threaded;
-        child.kill(threaded.io());
-    }
+    if (handle.context.child) |*child| child.terminateTree();
     handle.context.mutex.unlock();
     handle.worker.join();
     handle.context.deinit();
@@ -1759,7 +1790,7 @@ fn cleanupEventStreamChild(context: *EventStreamContext) void {
     if (maybe_child) |*owned_child| {
         if (owned_child.child.id != null) {
             var threaded = std.Io.Threaded.init_single_threaded;
-            _ = owned_child.wait(threaded.io()) catch owned_child.kill(threaded.io());
+            owned_child.kill(threaded.io());
         }
     }
 
@@ -1774,12 +1805,17 @@ fn processEventStreamMessage(context: *EventStreamContext, raw_event_name: []con
 
     const envelope = parseEventEnvelope(parsed.value, raw_event_name) orelse return false;
 
-    if (std.mem.eql(u8, envelope.event_type, "session.idle")) {
+    if (std.mem.eql(u8, envelope.event_type, "session.idle") and eventTargetsSession(envelope.properties, context.session_id)) {
         signalEventStreamIdle(context);
         return false;
     }
 
     if (std.mem.eql(u8, envelope.event_type, "session.status")) {
+        return false;
+    }
+
+    if (std.mem.eql(u8, envelope.event_type, "message.part.updated")) {
+        try handleMessagePartUpdated(context, envelope.properties);
         return false;
     }
 
@@ -1846,6 +1882,26 @@ fn eventTargetsSession(value: std.json.Value, session_id: []const u8) bool {
     return std.mem.eql(u8, event_session_id, session_id);
 }
 
+fn handleMessagePartUpdated(context: *EventStreamContext, properties: std.json.Value) !void {
+    const part_id = visibleTextPartId(properties, context.session_id) orelse return;
+
+    context.mutex.lock();
+    defer context.mutex.unlock();
+    if (containsString(context.visible_text_part_ids.items, part_id)) return;
+    const owned_part_id = try context.allocator.dupe(u8, part_id);
+    errdefer context.allocator.free(owned_part_id);
+    try context.visible_text_part_ids.append(context.allocator, owned_part_id);
+}
+
+fn visibleTextPartId(properties: std.json.Value, session_id: []const u8) ?[]const u8 {
+    const part = getObjectField(properties, "part") orelse return null;
+    if (!eventTargetsSession(part, session_id) and !eventTargetsSession(properties, session_id)) return null;
+    const part_type = getOptionalObjectString(part, "type") orelse return null;
+    if (!std.mem.eql(u8, part_type, "text")) return null;
+    if (jsonBool(getObjectField(part, "ignored")) == true or jsonBool(getObjectField(part, "synthetic")) == true) return null;
+    return getOptionalObjectString(part, "id");
+}
+
 fn handleMessagePartDelta(context: *EventStreamContext, properties: std.json.Value) !void {
     if (!eventTargetsSession(properties, context.session_id)) return;
 
@@ -1856,6 +1912,12 @@ fn handleMessagePartDelta(context: *EventStreamContext, properties: std.json.Val
 
     const field = getOptionalObjectString(properties, "field") orelse return;
     if (!std.mem.eql(u8, field, "text")) return;
+
+    const part_id = getOptionalObjectString(properties, "partID") orelse return;
+    context.mutex.lock();
+    const is_visible_text = containsString(context.visible_text_part_ids.items, part_id);
+    context.mutex.unlock();
+    if (!is_visible_text) return;
 
     const delta = getOptionalObjectString(properties, "delta") orelse return;
     if (delta.len == 0) return;
@@ -1895,35 +1957,71 @@ fn handleSessionDiff(context: *EventStreamContext, properties: std.json.Value) !
     } });
 }
 
-/// Subagent runs can append additional assistant messages after the root reply for the
-/// current user turn. Picking the newest-by-`time.created` assistant then points at an
-/// often-empty sub-leaf while the root message is still streaming or accumulating text.
+/// OpenCode creates one assistant message per model step. Prefer the latest visible or
+/// terminal step for the current user while retaining the first step as an in-flight fallback.
 fn findPrimaryAssistantAfterLastUser(root: std.json.Value) ?std.json.Value {
     if (root != .array) return null;
 
     var last_user_index: ?usize = null;
+    var last_user_id: ?[]const u8 = null;
     for (root.array.items, 0..) |item, index| {
         if (item != .object) continue;
         const info = getObjectField(item, "info") orelse continue;
         const role = getOptionalObjectString(info, "role") orelse continue;
         if (std.mem.eql(u8, role, "user")) {
             last_user_index = index;
+            last_user_id = getOptionalObjectString(info, "id");
         }
     }
 
     const after_user = last_user_index orelse return null;
+    var first_assistant: ?std.json.Value = null;
+    var reply_assistant: ?std.json.Value = null;
     var i = after_user + 1;
     while (i < root.array.items.len) : (i += 1) {
         const item = root.array.items[i];
         if (item != .object) continue;
         const info = getObjectField(item, "info") orelse continue;
         const role = getOptionalObjectString(info, "role") orelse continue;
-        if (std.mem.eql(u8, role, "assistant")) {
-            return item;
+        if (!std.mem.eql(u8, role, "assistant")) continue;
+        if (jsonBool(getObjectField(info, "summary")) == true) continue;
+        if (last_user_id) |user_id| {
+            if (getOptionalObjectString(info, "parentID")) |parent_id| {
+                if (!std.mem.eql(u8, parent_id, user_id)) continue;
+            }
+        }
+
+        if (first_assistant == null) first_assistant = item;
+        if (assistantMessageHasVisibleText(item) or assistantMessageIsTerminal(info) or assistantMessageHasError(info)) {
+            reply_assistant = item;
         }
     }
 
-    return null;
+    return reply_assistant orelse first_assistant;
+}
+
+fn assistantMessageHasVisibleText(value: std.json.Value) bool {
+    const parts = getObjectField(value, "parts") orelse return false;
+    if (parts != .array) return false;
+    for (parts.array.items) |part| {
+        if (part != .object) continue;
+        const part_type = getOptionalObjectString(part, "type") orelse continue;
+        if (!std.mem.eql(u8, part_type, "text")) continue;
+        if (jsonBool(getObjectField(part, "ignored")) == true or jsonBool(getObjectField(part, "synthetic")) == true) continue;
+        const text = getOptionalObjectString(part, "text") orelse continue;
+        if (std.mem.trim(u8, text, &std.ascii.whitespace).len > 0) return true;
+    }
+    return false;
+}
+
+fn assistantMessageIsTerminal(info: std.json.Value) bool {
+    const finish = getOptionalObjectString(info, "finish") orelse return false;
+    return !std.mem.eql(u8, finish, "tool-calls") and !std.mem.eql(u8, finish, "unknown");
+}
+
+fn assistantMessageHasError(info: std.json.Value) bool {
+    const error_value = getObjectField(info, "error") orelse return false;
+    return error_value != .null;
 }
 
 fn findLatestAssistantMessage(value: std.json.Value) ?std.json.Value {
@@ -2276,13 +2374,59 @@ fn parseModelRef(model_ref: []const u8) struct { []const u8, []const u8 } {
 test "extractAssistantTextAlloc joins text parts" {
     const allocator = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
-        \\{"parts":[{"type":"text","text":"hello "},{"type":"text","text":"world"},{"type":"tool","text":"ignored"}]}
+        \\{"parts":[{"type":"text","text":"hello "},{"type":"reasoning","text":"hidden"},{"type":"text","text":"discarded","ignored":true},{"type":"text","text":"world"},{"type":"tool","text":"ignored"}]}
     , .{});
     defer parsed.deinit();
 
     const text = try extractAssistantTextAlloc(allocator, parsed.value);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("hello world", text);
+}
+
+test "readEventStreamLine accepts SSE lines larger than the file buffer" {
+    const allocator = std.testing.allocator;
+    const large_len = 96 * 1024;
+    const payload = try allocator.alloc(u8, large_len + 6);
+    defer allocator.free(payload);
+    @memset(payload[0..large_len], 'x');
+    @memcpy(payload[large_len..], "\nlast\n");
+
+    var reader = std.Io.Reader.fixed(payload);
+    var line_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer line_writer.deinit();
+
+    const large_line = (try readEventStreamLine(&reader, &line_writer, MAX_HTTP_BODY_BYTES)).?;
+    try std.testing.expectEqual(large_len, large_line.len);
+    try std.testing.expectEqualStrings("last", (try readEventStreamLine(&reader, &line_writer, MAX_HTTP_BODY_BYTES)).?);
+    try std.testing.expectEqual(null, try readEventStreamLine(&reader, &line_writer, MAX_HTTP_BODY_BYTES));
+}
+
+test "oversized SSE lines can be discarded before reading the next event" {
+    var reader = std.Io.Reader.fixed("oversized\nok\n");
+    var line_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer line_writer.deinit();
+
+    try std.testing.expectError(error.StreamTooLong, readEventStreamLine(&reader, &line_writer, 4));
+    try std.testing.expect(try discardEventStreamLineRemainder(&reader));
+    try std.testing.expectEqualStrings("ok", (try readEventStreamLine(&reader, &line_writer, 4)).?);
+}
+
+test "visibleTextPartId rejects reasoning and ignored text parts" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[
+        \\  {"part":{"id":"reasoning","sessionID":"root","type":"reasoning"}},
+        \\  {"part":{"id":"ignored","sessionID":"root","type":"text","ignored":true}},
+        \\  {"part":{"id":"visible","sessionID":"root","type":"text"}},
+        \\  {"part":{"id":"other-session","sessionID":"child","type":"text"}}
+        \\]
+    , .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(null, visibleTextPartId(parsed.value.array.items[0], "root"));
+    try std.testing.expectEqual(null, visibleTextPartId(parsed.value.array.items[1], "root"));
+    try std.testing.expectEqualStrings("visible", visibleTextPartId(parsed.value.array.items[2], "root").?);
+    try std.testing.expectEqual(null, visibleTextPartId(parsed.value.array.items[3], "root"));
 }
 
 test "extractAssistantTaskSummaryAlloc summarizes task tool state" {
@@ -2317,8 +2461,8 @@ test "findPrimaryAssistantAfterLastUser picks root assistant for latest user tur
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
         \\[
         \\  {"info":{"role":"user","id":"u1","time":{"created":1}},"parts":[{"type":"text","text":"hi"}]},
-        \\  {"info":{"role":"assistant","id":"root","time":{"created":2}},"parts":[{"type":"text","text":"main"}]},
-        \\  {"info":{"role":"assistant","id":"sub","time":{"created":99}},"parts":[]}
+        \\  {"info":{"role":"assistant","id":"root","parentID":"u1","time":{"created":2}},"parts":[{"type":"text","text":"main"}]},
+        \\  {"info":{"role":"assistant","id":"sub","parentID":"u1","time":{"created":99}},"parts":[]}
         \\]
     , .{});
     defer parsed.deinit();
@@ -2327,6 +2471,40 @@ test "findPrimaryAssistantAfterLastUser picks root assistant for latest user tur
     const info_obj = getObjectField(item, "info") orelse return error.TestUnexpectedNull;
     const id = getOptionalObjectString(info_obj, "id") orelse return error.TestUnexpectedNull;
     try std.testing.expectEqualStrings("root", id);
+}
+
+test "findPrimaryAssistantAfterLastUser picks final step after tool calls" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[
+        \\  {"info":{"role":"user","id":"u1"},"parts":[{"type":"text","text":"test it"}]},
+        \\  {"info":{"role":"assistant","id":"tool-1","parentID":"u1","finish":"tool-calls"},"parts":[{"type":"reasoning","text":"first"}]},
+        \\  {"info":{"role":"assistant","id":"tool-2","parentID":"u1","finish":"tool-calls"},"parts":[{"type":"tool"}]},
+        \\  {"info":{"role":"assistant","id":"final","parentID":"u1","finish":"stop"},"parts":[{"type":"text","text":"complete report"}]},
+        \\  {"info":{"role":"assistant","id":"summary","parentID":"u1","finish":"stop","summary":true},"parts":[{"type":"text","text":"summary"}]}
+        \\]
+    , .{});
+    defer parsed.deinit();
+
+    const item = findPrimaryAssistantAfterLastUser(parsed.value) orelse return error.TestUnexpectedNull;
+    const info = getObjectField(item, "info") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("final", getOptionalObjectString(info, "id") orelse return error.TestUnexpectedNull);
+}
+
+test "findPrimaryAssistantAfterLastUser supports messages without parent IDs" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[
+        \\  {"info":{"role":"user","id":"u1"},"parts":[{"type":"text","text":"test it"}]},
+        \\  {"info":{"role":"assistant","id":"tool","finish":"tool-calls"},"parts":[{"type":"tool"}]},
+        \\  {"info":{"role":"assistant","id":"final","finish":"stop"},"parts":[{"type":"text","text":"complete report"}]}
+        \\]
+    , .{});
+    defer parsed.deinit();
+
+    const item = findPrimaryAssistantAfterLastUser(parsed.value) orelse return error.TestUnexpectedNull;
+    const info = getObjectField(item, "info") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("final", getOptionalObjectString(info, "id") orelse return error.TestUnexpectedNull);
 }
 
 test "appendSessionDiffFiles keeps nested patch bodies and derives counts" {
