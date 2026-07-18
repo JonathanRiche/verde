@@ -1,6 +1,7 @@
 //! User-scoped MCP registration for agent providers launched inside Verde.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const platform_paths = @import("platform_paths");
 const platform_runtime = @import("platform_runtime");
 const process_env = @import("process_env.zig");
@@ -288,7 +289,11 @@ fn readFileIfPresent(allocator: std.mem.Allocator, io: std.Io, path: []const u8)
 }
 
 fn ensureParentDir(io: std.Io, path: []const u8) !void {
-    if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
+    const dir = std.fs.path.dirname(path) orelse return;
+    std.Io.Dir.cwd().access(io, dir, .{}) catch |err| switch (err) {
+        error.FileNotFound => try std.Io.Dir.cwd().createDirPath(io, dir),
+        else => return err,
+    };
 }
 
 fn writeFileAtomic(allocator: std.mem.Allocator, io: std.Io, path: []const u8, content: []const u8) !void {
@@ -578,6 +583,32 @@ test "OpenCode registration preserves an existing schema config" {
     defer std.testing.allocator.free(updated);
     try std.testing.expect(std.mem.indexOf(u8, updated, "disabled_providers") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated, "VERDE_MCP_MANAGED") != null);
+}
+
+test "OpenCode registration supports a symlinked config directory" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(home);
+    const config_dir = try configPathAlloc(std.testing.allocator, home, ".config");
+    defer std.testing.allocator.free(config_dir);
+    const target_dir = try configPathAlloc(std.testing.allocator, home, "opencode-target");
+    defer std.testing.allocator.free(target_dir);
+    const link_path = try configPathAlloc(std.testing.allocator, config_dir, "opencode");
+    defer std.testing.allocator.free(link_path);
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try std.Io.Dir.cwd().createDirPath(io, config_dir);
+    try std.Io.Dir.cwd().createDirPath(io, target_dir);
+    try std.Io.Dir.cwd().symLink(io, "../opencode-target", link_path, .{ .is_directory = true });
+
+    const path = try configPathAlloc(std.testing.allocator, home, OPENCODE_SPEC.relative_path);
+    defer std.testing.allocator.free(path);
+    try writeFileAtomic(std.testing.allocator, io, path, "{}");
+    try installJsonAtHome(std.testing.allocator, home, "/opt/verde/bin/verde", OPENCODE_SPEC);
+    try std.testing.expectEqual(RegistrationStatus.installed, inspectJsonAtHome(std.testing.allocator, home, OPENCODE_SPEC));
 }
 
 test "existing provider config is detected without relying on PATH" {
