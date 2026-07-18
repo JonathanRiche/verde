@@ -260,7 +260,7 @@ pub const PaletteModalTextFocus = enum {
 /// Composer body text size (CSS units, scaled by `setUiScale`). Public because
 /// the transcript's bubble body text keys off it (`chat_panel.zig`) so the
 /// prompt box and the chat thread always read at the same size.
-pub const PALETTE_COMPOSER_FONT_SIZE: f32 = 20.0;
+pub const PALETTE_COMPOSER_FONT_SIZE: f32 = 18.0;
 const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 15.0;
 const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 18.0;
 const PALETTE_COMPOSER_TEXT_ADVANCE_SCALE: f32 = 1.0;
