@@ -4083,6 +4083,14 @@ pub const Project = struct {
     fn removeTerminalDockById(self: *Project, allocator: std.mem.Allocator, dock_id: u32) bool {
         for (self.terminal_docks.items, 0..) |*entry, index| {
             if (entry.id != dock_id) continue;
+            if (self.managedProcessByDockId(dock_id)) |process| {
+                process.dock_id = null;
+                process.pane_id = null;
+                process.status = .stopped;
+                process.explicit_stop = true;
+                process.next_restart_ms = 0;
+                process.pending_watch_restart_ms = 0;
+            }
             entry.deinit(allocator);
             _ = self.terminal_docks.orderedRemove(index);
             return true;
@@ -14012,7 +14020,16 @@ pub const AppState = struct {
         if (project_index >= self.projects.items.len) return false;
         self.selected_project_index = project_index;
         var project = &self.projects.items[project_index];
-        const dock_id = process.dock_id orelse try self.createProjectTerminalDock(project_index);
+        const dock_id = if (process.dock_id) |saved_dock_id|
+            if (project.terminalDockEntryById(saved_dock_id) != null)
+                saved_dock_id
+            else stale: {
+                process.dock_id = null;
+                process.pane_id = null;
+                break :stale try self.createProjectTerminalDock(project_index);
+            }
+        else
+            try self.createProjectTerminalDock(project_index);
         process.dock_id = dock_id;
 
         const cwd = try self.resolveManagedProcessCwd(project.path, process.cwd);
@@ -19818,6 +19835,40 @@ test "Codex hook feature detection accepts current and legacy names" {
     const legacy_argv = [_][]const u8{ "codex", "--config=features.codex_hooks=true" };
     try std.testing.expect(AppState.argvContainsCodexHooksFeature(&current_argv));
     try std.testing.expect(AppState.argvContainsCodexHooksFeature(&legacy_argv));
+}
+
+test "removing a managed process dock clears its stale association" {
+    const allocator = std.testing.allocator;
+    var project = try Project.init(allocator, "test", "Test", "/tmp", 0);
+    defer project.deinit(allocator);
+
+    var dock = try terminal.Dock.init(allocator);
+    project.terminal_docks.append(allocator, .{ .id = 2, .dock = dock }) catch |err| {
+        dock.deinit(allocator);
+        return err;
+    };
+
+    var process: ManagedProcess = .{
+        .name = try allocator.dupe(u8, "matchit"),
+        .kind = .process,
+        .command = try allocator.dupe(u8, "bun run matchit"),
+        .cwd = try allocator.dupe(u8, "."),
+        .restart = .manual,
+        .status = .running,
+        .dock_id = 2,
+        .pane_id = 39,
+    };
+    project.managed_processes.append(allocator, process) catch |err| {
+        process.deinit(allocator);
+        return err;
+    };
+
+    try std.testing.expect(project.removeTerminalDockById(allocator, 2));
+    const detached = project.managedProcessByName("matchit") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(ManagedProcessStatus.stopped, detached.status);
+    try std.testing.expect(detached.dock_id == null);
+    try std.testing.expect(detached.pane_id == null);
+    try std.testing.expect(detached.explicit_stop);
 }
 
 test "initial send snapshot restores retryable draft and attachment" {
