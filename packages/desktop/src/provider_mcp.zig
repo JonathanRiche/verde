@@ -130,13 +130,20 @@ pub fn inspect(allocator: std.mem.Allocator) Summary {
     return inspectAtHome(allocator, home);
 }
 
+/// Returns whether Verde owns the selected provider's current MCP entry.
+pub fn isInstalled(allocator: std.mem.Allocator, provider: Provider) bool {
+    const home = platform_paths.userHome(allocator) catch return false;
+    defer allocator.free(home);
+    return inspectProviderAtHome(allocator, home, provider) == .installed;
+}
+
 /// Installs or refreshes Verde's user-scoped MCP entry for every detected provider.
 pub fn install(allocator: std.mem.Allocator) !Summary {
     const home = try platform_paths.userHome(allocator);
     defer allocator.free(home);
     const executable = try platform_runtime.executablePathAlloc(allocator);
     defer allocator.free(executable);
-    return installAtHome(allocator, home, executable, detectedProviders());
+    return installAtHome(allocator, home, executable, detectedProvidersAtHome(allocator, home));
 }
 
 /// Removes only MCP entries carrying Verde's ownership marker.
@@ -157,24 +164,44 @@ pub fn uninstall(allocator: std.mem.Allocator) !Summary {
     return summary;
 }
 
-fn detectedProviders() [5]bool {
-    return .{
+fn detectedProvidersAtHome(allocator: std.mem.Allocator, home: []const u8) [5]bool {
+    var detected = [5]bool{
         process_env.commandExists("codex"),
         process_env.commandExists("claude"),
         process_env.commandExists("agent") or process_env.commandExists("cursor-agent"),
         process_env.commandExists("opencode"),
         process_env.commandExists("amp"),
     };
+    for (ALL_PROVIDERS, 0..) |provider, index| {
+        detected[index] = detected[index] or providerConfigExistsAtHome(allocator, home, provider);
+    }
+    return detected;
 }
 
 fn inspectAtHome(allocator: std.mem.Allocator, home: []const u8) Summary {
-    const detected = detectedProviders();
+    const detected = detectedProvidersAtHome(allocator, home);
     var summary: Summary = .{};
     for (ALL_PROVIDERS, 0..) |provider, index| {
         const status = inspectProviderAtHome(allocator, home, provider);
         setSummaryStatus(&summary, provider, if (!detected[index] and status == .not_installed) .unavailable else status);
     }
     return summary;
+}
+
+fn providerConfigExistsAtHome(allocator: std.mem.Allocator, home: []const u8, provider: Provider) bool {
+    const relative_path = switch (provider) {
+        .codex => ".codex/config.toml",
+        .claude => CLAUDE_SPEC.relative_path,
+        .cursor => CURSOR_SPEC.relative_path,
+        .opencode => OPENCODE_SPEC.relative_path,
+        .amp => AMP_SPEC.relative_path,
+    };
+    const path = configPathAlloc(allocator, home, relative_path) catch return false;
+    defer allocator.free(path);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    std.Io.Dir.cwd().access(threaded.io(), path, .{}) catch return false;
+    return true;
 }
 
 fn installAtHome(
@@ -551,4 +578,19 @@ test "OpenCode registration preserves an existing schema config" {
     defer std.testing.allocator.free(updated);
     try std.testing.expect(std.mem.indexOf(u8, updated, "disabled_providers") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated, "VERDE_MCP_MANAGED") != null);
+}
+
+test "existing provider config is detected without relying on PATH" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(home);
+    const path = try configPathAlloc(std.testing.allocator, home, OPENCODE_SPEC.relative_path);
+    defer std.testing.allocator.free(path);
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    try writeFileAtomic(std.testing.allocator, threaded.io(), path, "{}");
+
+    try std.testing.expect(providerConfigExistsAtHome(std.testing.allocator, home, .opencode));
+    try std.testing.expect(!providerConfigExistsAtHome(std.testing.allocator, home, .amp));
 }

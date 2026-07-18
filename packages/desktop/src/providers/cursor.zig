@@ -3,6 +3,8 @@
 const std = @import("std");
 const provider_diagnostics = @import("diagnostics.zig");
 const platform_process = @import("../platform/process.zig");
+const platform_runtime = @import("platform_runtime");
+const provider_mcp = @import("../provider_mcp.zig");
 const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
 const runtime_log = @import("../runtime_log.zig");
@@ -174,12 +176,17 @@ pub const Client = struct {
 
         const cwd = try self.cwdAbsoluteAlloc(allocator);
         defer allocator.free(cwd);
+        const mcp_executable = if (provider_mcp.isInstalled(allocator, .cursor))
+            try platform_runtime.executablePathAlloc(allocator)
+        else
+            null;
+        defer if (mcp_executable) |executable| allocator.free(executable);
 
         var state: ReadThreadState = .{};
         errdefer state.deinit(allocator);
 
         try acp.writeLine(try makeInitializeRequestAlloc(allocator, 1));
-        try acp.writeLine(try makeSessionLoadRequestAlloc(allocator, 2, thread_id, cwd));
+        try acp.writeLine(try makeSessionLoadRequestAlloc(allocator, 2, thread_id, cwd, mcp_executable));
         try acp.closeStdin();
 
         var read_buffer: [16 * 1024]u8 = undefined;
@@ -216,15 +223,20 @@ pub const Client = struct {
 
         const cwd = try self.cwdAbsoluteAllocForRequest(allocator, request);
         defer allocator.free(cwd);
+        const mcp_executable = if (provider_mcp.isInstalled(allocator, .cursor))
+            try platform_runtime.executablePathAlloc(allocator)
+        else
+            null;
+        defer if (mcp_executable) |executable| allocator.free(executable);
 
         var state: SendPromptState = .{};
         errdefer state.deinit(allocator);
 
         try acp.writeLine(try makeInitializeRequestAlloc(allocator, 1));
         if (request.thread_id) |thread_id| {
-            try acp.writeLine(try makeSessionLoadRequestAlloc(allocator, 2, thread_id, cwd));
+            try acp.writeLine(try makeSessionLoadRequestAlloc(allocator, 2, thread_id, cwd, mcp_executable));
         } else {
-            try acp.writeLine(try makeSessionNewRequestAlloc(allocator, 2, cwd));
+            try acp.writeLine(try makeSessionNewRequestAlloc(allocator, 2, cwd, mcp_executable));
         }
 
         var read_buffer: [16 * 1024]u8 = undefined;
@@ -613,12 +625,12 @@ fn makeSessionListRequestAlloc(allocator: std.mem.Allocator, id: i64, cwd_owned:
     return writer.toOwnedSlice();
 }
 
-fn makeSessionNewRequestAlloc(allocator: std.mem.Allocator, id: i64, cwd: []const u8) ![]u8 {
-    return makeSessionSetupRequestAlloc(allocator, id, "session/new", null, cwd);
+fn makeSessionNewRequestAlloc(allocator: std.mem.Allocator, id: i64, cwd: []const u8, mcp_executable: ?[]const u8) ![]u8 {
+    return makeSessionSetupRequestAlloc(allocator, id, "session/new", null, cwd, mcp_executable);
 }
 
-fn makeSessionLoadRequestAlloc(allocator: std.mem.Allocator, id: i64, session_id: []const u8, cwd: []const u8) ![]u8 {
-    return makeSessionSetupRequestAlloc(allocator, id, "session/load", session_id, cwd);
+fn makeSessionLoadRequestAlloc(allocator: std.mem.Allocator, id: i64, session_id: []const u8, cwd: []const u8, mcp_executable: ?[]const u8) ![]u8 {
+    return makeSessionSetupRequestAlloc(allocator, id, "session/load", session_id, cwd, mcp_executable);
 }
 
 fn makeSessionSetupRequestAlloc(
@@ -627,6 +639,7 @@ fn makeSessionSetupRequestAlloc(
     method: []const u8,
     session_id: ?[]const u8,
     cwd: []const u8,
+    mcp_executable: ?[]const u8,
 ) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -643,6 +656,27 @@ fn makeSessionSetupRequestAlloc(
     try stringify.write(cwd);
     try stringify.objectField("mcpServers");
     try stringify.beginArray();
+    if (mcp_executable) |executable| {
+        try stringify.beginObject();
+        try stringify.objectField("name");
+        try stringify.write("verde");
+        try stringify.objectField("command");
+        try stringify.write(executable);
+        try stringify.objectField("args");
+        try stringify.beginArray();
+        try stringify.write("mcp");
+        try stringify.endArray();
+        try stringify.objectField("env");
+        try stringify.beginArray();
+        try stringify.beginObject();
+        try stringify.objectField("name");
+        try stringify.write("VERDE_MCP_MANAGED");
+        try stringify.objectField("value");
+        try stringify.write("1");
+        try stringify.endObject();
+        try stringify.endArray();
+        try stringify.endObject();
+    }
     try stringify.endArray();
     try stringify.endObject();
     try stringify.endObject();
@@ -1437,6 +1471,23 @@ test "makeInitializeRequestAlloc writes ACP initialize JSON-RPC" {
     defer parsed.deinit();
     try std.testing.expectEqual(@as(i64, 42), responseId(parsed.value).?);
     try std.testing.expectEqualStrings("initialize", getOptionalObjectString(parsed.value, "method").?);
+}
+
+test "session setup passes Verde MCP through ACP" {
+    const json = try makeSessionNewRequestAlloc(std.testing.allocator, 2, "/tmp/project", "/opt/verde/bin/verde");
+    defer std.testing.allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const params = getObjectField(parsed.value, "params").?;
+    const servers = getObjectField(params, "mcpServers").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), servers.len);
+    try std.testing.expectEqualStrings("verde", getOptionalObjectString(servers[0], "name").?);
+    try std.testing.expectEqualStrings("/opt/verde/bin/verde", getOptionalObjectString(servers[0], "command").?);
+    const args = getObjectField(servers[0], "args").?.array.items;
+    try std.testing.expectEqualStrings("mcp", args[0].string);
+    const environment = getObjectField(servers[0], "env").?.array.items;
+    try std.testing.expectEqualStrings("VERDE_MCP_MANAGED", getOptionalObjectString(environment[0], "name").?);
+    try std.testing.expectEqualStrings("1", getOptionalObjectString(environment[0], "value").?);
 }
 
 test "makePromptRequestAlloc writes text and image content blocks" {
