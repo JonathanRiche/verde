@@ -24,6 +24,12 @@ const CODEX_HOOK_EVENTS = [_]CodexHookEvent{
     .{ .name = "Stop", .status_message = "Marking Verde agent done" },
 };
 
+const CURSOR_HOOK_MARKER = "verde-cursor-notify-hook";
+const CURSOR_PROJECT_HOOK_REL_PATH = ".cursor/hooks/verde-cursor-notify-hook.sh";
+const CURSOR_WINDOWS_PROJECT_HOOK_REL_PATH = ".cursor/hooks/verde-cursor-notify-hook.ps1";
+const CURSOR_HOOKS_JSON_REL_PATH = ".cursor/hooks.json";
+const CURSOR_HOOK_EVENTS = [_][]const u8{ "sessionStart", "beforeSubmitPrompt", "preToolUse", "stop" };
+
 pub fn ensureCodexProjectHooks(allocator: std.mem.Allocator, project_path: []const u8) !void {
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
@@ -290,6 +296,94 @@ fn writeClaudeHookEvent(s: *std.json.Stringify, event: []const u8, hook_path: []
     try s.endArray();
 }
 
+/// Installs Cursor Agent hooks for one project. Cursor uses the same
+/// `.cursor/hooks.json` file in its terminal agent and desktop Agent UI, so the
+/// generated entries intentionally use Cursor's native lower-camel event names.
+pub fn ensureCursorProjectHooks(allocator: std.mem.Allocator, project_path: []const u8) !void {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+
+    const hook_rel_path = cursorProjectHookRelPathForOs(builtin.os.tag);
+    const hook_path = try std.fs.path.join(allocator, &.{ project_path, hook_rel_path });
+    defer allocator.free(hook_path);
+    const hooks_path = try std.fs.path.join(allocator, &.{ project_path, CURSOR_HOOKS_JSON_REL_PATH });
+    defer allocator.free(hooks_path);
+    const io = threaded.io();
+
+    try ensureParentDir(io, hook_path);
+    try writeCursorHookScript(allocator, io, hook_path);
+
+    const existing = std.Io.Dir.cwd().readFileAlloc(io, hooks_path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => try allocator.dupe(u8, "{}"),
+        else => return err,
+    };
+    defer allocator.free(existing);
+
+    // Cursor runs project hooks from the project root. Keep this command
+    // canonical and checkout-independent because `.cursor/hooks.json` is often
+    // committed and the same file is consumed by the terminal and desktop UI.
+    const hook_command = try hookCommandAllocForOs(allocator, builtin.os.tag, hook_rel_path);
+    defer allocator.free(hook_command);
+    const merged = try mergeCursorHooks(allocator, existing, hook_command);
+    defer if (merged) |content| allocator.free(content);
+    if (merged) |content| {
+        try ensureParentDir(io, hooks_path);
+        try writeFileAtomic(allocator, io, hooks_path, content, .default_file);
+    }
+}
+
+fn writeCursorHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    const script = if (builtin.os.tag == .windows) cursorPowerShellHookScript() else
+        \\#!/bin/sh
+        \\# verde-cursor-notify-hook
+        \\[ "${VERDE:-}" = "1" ] || exit 0
+        \\[ -n "${VERDE_SESSION_ID:-}" ] || exit 0
+        \\
+        \\payload="${TMPDIR:-/tmp}/verde-cursor-hook.$$"
+        \\cat > "$payload" 2>/dev/null || true
+        \\event="$(sed -n 's/.*"hook_event_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
+        \\
+        \\status=""
+        \\title=""
+        \\case "$event" in
+        \\  sessionStart) status="idle" ;;
+        \\  beforeSubmitPrompt)
+        \\    status="working"
+        \\    if command -v jq >/dev/null 2>&1; then
+        \\      title="$(jq -r '.prompt // empty' "$payload" 2>/dev/null)"
+        \\    else
+        \\      title="$(sed -n 's/.*"prompt"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
+        \\    fi
+        \\    title="$(printf '%s' "$title" | tr '\n\t' '  ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g' | cut -c1-72)"
+        \\    ;;
+        \\  preToolUse) status="working" ;;
+        \\  stop)
+        \\    result="$(sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
+        \\    if [ "$result" = "error" ]; then status="error"; else status="done"; fi
+        \\    ;;
+        \\  *) rm -f "$payload"; exit 0 ;;
+        \\esac
+        \\
+        \\cli="${VERDE_CLI:-verde}"
+        \\case "$cli" in
+        \\  *" (deleted)") cli="${cli% (deleted)}" ;;
+        \\esac
+        \\if ! command -v "$cli" >/dev/null 2>&1; then
+        \\  if [ -x "./zig-out/bin/verde" ]; then cli="./zig-out/bin/verde"; else cli="verde"; fi
+        \\fi
+        \\if [ -n "$title" ]; then
+        \\  "$cli" notify --quiet --status "$status" --title "$title" --provider cursor >/dev/null 2>&1 || true
+        \\else
+        \\  "$cli" notify --quiet --status "$status" --provider cursor >/dev/null 2>&1 || true
+        \\fi
+        \\rm -f "$payload"
+        \\printf '{}\n'
+        \\exit 0
+        \\
+    ;
+    try writeFileAtomic(allocator, io, path, script, hookPermissionsForOs(builtin.os.tag));
+}
+
 fn codexProjectHookRelPathForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
     return if (os_tag == .windows) CODEX_WINDOWS_HOOK_REL_PATH else CODEX_HOOK_REL_PATH;
 }
@@ -298,12 +392,20 @@ fn claudeProjectHookRelPathForOs(comptime os_tag: std.Target.Os.Tag) []const u8 
     return if (os_tag == .windows) CLAUDE_WINDOWS_HOOK_REL_PATH else CLAUDE_HOOK_REL_PATH;
 }
 
+fn cursorProjectHookRelPathForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
+    return if (os_tag == .windows) CURSOR_WINDOWS_PROJECT_HOOK_REL_PATH else CURSOR_PROJECT_HOOK_REL_PATH;
+}
+
 fn codexGlobalHookRelPathForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
     return if (os_tag == .windows) CODEX_WINDOWS_GLOBAL_HOOK_REL else CODEX_GLOBAL_HOOK_REL;
 }
 
 fn claudeGlobalHookRelPathForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
     return if (os_tag == .windows) CLAUDE_WINDOWS_GLOBAL_HOOK_REL else CLAUDE_GLOBAL_HOOK_REL;
+}
+
+fn cursorGlobalHookRelPathForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
+    return if (os_tag == .windows) CURSOR_WINDOWS_GLOBAL_HOOK_REL else CURSOR_GLOBAL_HOOK_REL;
 }
 
 fn hookPermissionsForOs(comptime os_tag: std.Target.Os.Tag) std.Io.File.Permissions {
@@ -394,6 +496,46 @@ fn claudePowerShellHookScript() []const u8 {
     ;
 }
 
+fn cursorPowerShellHookScript() []const u8 {
+    return
+    \\# verde-cursor-notify-hook
+    \\if ($env:VERDE -ne '1' -or [string]::IsNullOrWhiteSpace($env:VERDE_SESSION_ID)) { exit 0 }
+    \\$payload = $null
+    \\try {
+    \\  $payloadText = [Console]::In.ReadToEnd()
+    \\  if (-not [string]::IsNullOrWhiteSpace($payloadText)) { $payload = ConvertFrom-Json -InputObject $payloadText }
+    \\} catch {}
+    \\$eventName = if ($null -ne $payload -and $null -ne $payload.hook_event_name) { [string]$payload.hook_event_name } else { '' }
+    \\$status = ''
+    \\$title = ''
+    \\switch ($eventName) {
+    \\  'sessionStart' { $status = 'idle' }
+    \\  'beforeSubmitPrompt' {
+    \\    $status = 'working'
+    \\    if ($null -ne $payload -and $null -ne $payload.prompt) {
+    \\      $title = [regex]::Replace([string]$payload.prompt, '\s+', ' ').Trim()
+    \\      if ($title.Length -gt 72) { $title = $title.Substring(0, 72) }
+    \\    }
+    \\  }
+    \\  'preToolUse' { $status = 'working' }
+    \\  'stop' {
+    \\    $result = if ($null -ne $payload -and $null -ne $payload.status) { [string]$payload.status } else { '' }
+    \\    $status = if ($result -eq 'error') { 'error' } else { 'done' }
+    \\  }
+    \\  default { exit 0 }
+    \\}
+    \\$cli = if ([string]::IsNullOrWhiteSpace($env:VERDE_CLI)) { 'verde.exe' } else { $env:VERDE_CLI }
+    \\if ($cli.EndsWith(' (deleted)')) { $cli = $cli.Substring(0, $cli.Length - 10) }
+    \\$notifyArgs = @('notify', '--quiet', '--status', $status, '--provider', 'cursor')
+    \\if (-not [string]::IsNullOrWhiteSpace($title)) { $notifyArgs += @('--title', $title) }
+    \\# $env:VERDE_LIVE_ENDPOINT is inherited, so the CLI reaches the owning Verde pane.
+    \\try { & $cli @notifyArgs *> $null } catch {}
+    \\[Console]::Out.WriteLine('{}')
+    \\exit 0
+    \\
+    ;
+}
+
 // Global (all-projects) Claude hooks live in ~/.claude/settings.json with the
 // hook script at an absolute path so it resolves from any working directory.
 const CLAUDE_GLOBAL_HOOK_REL = ".claude/verde-claude-notify-hook.sh";
@@ -401,6 +543,11 @@ const CLAUDE_WINDOWS_GLOBAL_HOOK_REL = ".claude/verde-claude-notify-hook.ps1";
 const CLAUDE_GLOBAL_SETTINGS_REL = ".claude/settings.json";
 const CLAUDE_GLOBAL_HOOK_NEEDLE = "verde-claude-notify-hook";
 const CLAUDE_HOOK_EVENTS = [_][]const u8{ "SessionStart", "UserPromptSubmit", "Notification", "Stop" };
+
+const CURSOR_GLOBAL_HOOK_REL = ".cursor/hooks/verde-cursor-notify-hook.sh";
+const CURSOR_WINDOWS_GLOBAL_HOOK_REL = ".cursor/hooks/verde-cursor-notify-hook.ps1";
+const CURSOR_GLOBAL_HOOKS_JSON_REL = ".cursor/hooks.json";
+const CURSOR_GLOBAL_HOOK_NEEDLE = "verde-cursor-notify-hook";
 
 const AMP_GLOBAL_PLUGIN_REL = ".config/amp/plugins/verde-notify.ts";
 const AMP_GLOBAL_PLUGIN_NEEDLE = "verde-amp-notify-plugin";
@@ -560,6 +707,83 @@ pub fn removeCodexGlobalHooks(allocator: std.mem.Allocator) !void {
     const updated = try removeCodexHooksFromJson(allocator, existing, hook_command);
     defer if (updated) |u| allocator.free(u);
     if (updated) |u| try writeFileAtomic(allocator, io, hooks_path, u, .default_file);
+    std.Io.Dir.cwd().deleteFile(io, hook_path) catch {};
+}
+
+/// True when Verde's managed Cursor hook is present in the user hook file
+/// shared by Cursor's desktop Agent UI and terminal agent.
+pub fn cursorGlobalHooksInstalled(allocator: std.mem.Allocator) bool {
+    const home = homeDirAlloc(allocator) catch return false;
+    defer allocator.free(home);
+    const hooks_path = std.fs.path.join(allocator, &.{ home, CURSOR_GLOBAL_HOOKS_JSON_REL }) catch return false;
+    defer allocator.free(hooks_path);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const content = std.Io.Dir.cwd().readFileAlloc(threaded.io(), hooks_path, allocator, .limited(8 * 1024 * 1024)) catch return false;
+    defer allocator.free(content);
+    return std.mem.indexOf(u8, content, CURSOR_GLOBAL_HOOK_NEEDLE) != null;
+}
+
+/// Installs the Cursor notify hook globally while preserving existing user
+/// hooks. Cursor reloads this file for both its GUI and CLI agent surfaces.
+pub fn ensureCursorGlobalHooks(allocator: std.mem.Allocator) !void {
+    const home = homeDirAlloc(allocator) catch return error.NoHomeDir;
+    defer allocator.free(home);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const hook_path = try std.fs.path.join(allocator, &.{ home, cursorGlobalHookRelPathForOs(builtin.os.tag) });
+    defer allocator.free(hook_path);
+    const hooks_path = try std.fs.path.join(allocator, &.{ home, CURSOR_GLOBAL_HOOKS_JSON_REL });
+    defer allocator.free(hooks_path);
+
+    try ensureParentDir(io, hook_path);
+    try writeCursorHookScript(allocator, io, hook_path);
+
+    const existing = std.Io.Dir.cwd().readFileAlloc(io, hooks_path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => try allocator.dupe(u8, "{}"),
+        else => return err,
+    };
+    defer allocator.free(existing);
+
+    const hook_command = try hookCommandAllocForOs(allocator, builtin.os.tag, hook_path);
+    defer allocator.free(hook_command);
+    const merged = try mergeCursorHooks(allocator, existing, hook_command);
+    defer if (merged) |content| allocator.free(content);
+    if (merged) |content| {
+        try ensureParentDir(io, hooks_path);
+        try writeFileAtomic(allocator, io, hooks_path, content, .default_file);
+    }
+}
+
+/// Removes only Verde's Cursor entries and managed script. Idempotent.
+pub fn removeCursorGlobalHooks(allocator: std.mem.Allocator) !void {
+    const home = homeDirAlloc(allocator) catch return error.NoHomeDir;
+    defer allocator.free(home);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const hook_path = try std.fs.path.join(allocator, &.{ home, cursorGlobalHookRelPathForOs(builtin.os.tag) });
+    defer allocator.free(hook_path);
+    const hooks_path = try std.fs.path.join(allocator, &.{ home, CURSOR_GLOBAL_HOOKS_JSON_REL });
+    defer allocator.free(hooks_path);
+
+    const existing = std.Io.Dir.cwd().readFileAlloc(io, hooks_path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.Io.Dir.cwd().deleteFile(io, hook_path) catch {};
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(existing);
+
+    const hook_command = try hookCommandAllocForOs(allocator, builtin.os.tag, hook_path);
+    defer allocator.free(hook_command);
+    const updated = try removeCursorHooksFromJson(allocator, existing, hook_command);
+    defer if (updated) |content| allocator.free(content);
+    if (updated) |content| try writeFileAtomic(allocator, io, hooks_path, content, .default_file);
     std.Io.Dir.cwd().deleteFile(io, hook_path) catch {};
 }
 
@@ -832,6 +1056,92 @@ fn removeClaudeHooksFromJson(allocator: std.mem.Allocator, content: []const u8, 
     return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
 }
 
+fn cursorEntryReferencesHook(entry: std.json.Value, hook_path: []const u8) bool {
+    if (entry != .object) return false;
+    const command = entry.object.get("command") orelse return false;
+    return command == .string and std.mem.eql(u8, command.string, hook_path);
+}
+
+fn cursorHookEntry(arena: std.mem.Allocator, hook_path: []const u8) !std.json.Value {
+    var entry: std.json.ObjectMap = .empty;
+    try entry.put(arena, "command", .{ .string = try arena.dupe(u8, hook_path) });
+    try entry.put(arena, "timeout", .{ .integer = 5 });
+    return .{ .object = entry };
+}
+
+fn ensureCursorEvent(arena: std.mem.Allocator, hooks: *std.json.ObjectMap, event: []const u8, hook_path: []const u8) !bool {
+    if (hooks.getPtr(event)) |value| {
+        if (value.* != .array) return error.CursorHooksEventNotArray;
+        for (value.array.items) |entry| {
+            if (cursorEntryReferencesHook(entry, hook_path)) return false;
+        }
+        try value.array.append(try cursorHookEntry(arena, hook_path));
+        return true;
+    }
+    var entries = std.json.Array.init(arena);
+    try entries.append(try cursorHookEntry(arena, hook_path));
+    try hooks.put(arena, event, .{ .array = entries });
+    return true;
+}
+
+fn mergeCursorHooks(allocator: std.mem.Allocator, content: []const u8, hook_path: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return error.CursorHooksParse;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.CursorHooksNotObject;
+    const arena = parsed.arena.allocator();
+    const root = &parsed.value.object;
+
+    var changed = false;
+    if (root.get("version") == null) {
+        try root.put(arena, "version", .{ .integer = 1 });
+        changed = true;
+    }
+    if (root.getPtr("hooks")) |value| {
+        if (value.* != .object) return error.CursorHooksHooksNotObject;
+    } else {
+        try root.put(arena, "hooks", .{ .object = .empty });
+        changed = true;
+    }
+    const hooks = &root.getPtr("hooks").?.object;
+    for (CURSOR_HOOK_EVENTS) |event| {
+        if (try ensureCursorEvent(arena, hooks, event, hook_path)) changed = true;
+    }
+    if (!changed) return null;
+    return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
+}
+
+fn removeCursorHooksFromJson(allocator: std.mem.Allocator, content: []const u8, hook_path: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const arena = parsed.arena.allocator();
+    const root = &parsed.value.object;
+    const hooks_value = root.getPtr("hooks") orelse return null;
+    if (hooks_value.* != .object) return null;
+    const hooks = &hooks_value.object;
+
+    var changed = false;
+    for (CURSOR_HOOK_EVENTS) |event| {
+        const value = hooks.getPtr(event) orelse continue;
+        if (value.* != .array) continue;
+        var kept = std.json.Array.init(arena);
+        for (value.array.items) |entry| {
+            if (cursorEntryReferencesHook(entry, hook_path)) {
+                changed = true;
+                continue;
+            }
+            try kept.append(entry);
+        }
+        if (kept.items.len == 0) {
+            _ = hooks.orderedRemove(event);
+        } else {
+            value.* = .{ .array = kept };
+        }
+    }
+    if (!changed) return null;
+    return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
+}
+
 fn ensureParentDir(io: std.Io, path: []const u8) !void {
     if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
 }
@@ -900,10 +1210,67 @@ test "ensureCodexProjectHooks refuses unmanaged hooks json" {
     try std.testing.expectError(error.CodexHooksJsonExists, ensureCodexProjectHooks(std.testing.allocator, project_path));
 }
 
+test "ensureCursorProjectHooks merges lifecycle hooks without replacing user hooks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(project_path);
+
+    try tmp.dir.createDirPath(std.testing.io, ".cursor");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, ".cursor/hooks.json", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io,
+            \\{"version":1,"hooks":{"stop":[{"command":"user-stop-hook"}]},"userSetting":true}
+        );
+    }
+
+    try ensureCursorProjectHooks(std.testing.allocator, project_path);
+    try ensureCursorProjectHooks(std.testing.allocator, project_path);
+
+    const hook_path = try std.fs.path.join(std.testing.allocator, &.{ project_path, CURSOR_PROJECT_HOOK_REL_PATH });
+    defer std.testing.allocator.free(hook_path);
+    const hooks_path = try std.fs.path.join(std.testing.allocator, &.{ project_path, CURSOR_HOOKS_JSON_REL_PATH });
+    defer std.testing.allocator.free(hooks_path);
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    const script = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), hook_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(script);
+    try std.testing.expect(std.mem.indexOf(u8, script, CURSOR_HOOK_MARKER) != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "--provider cursor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "beforeSubmitPrompt") != null);
+
+    const hooks = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), hooks_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(hooks);
+    try std.testing.expect(std.mem.indexOf(u8, hooks, "user-stop-hook") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hooks, "userSetting") != null);
+    for (CURSOR_HOOK_EVENTS) |event| {
+        try std.testing.expect(std.mem.indexOf(u8, hooks, event) != null);
+    }
+    try std.testing.expectEqual(CURSOR_HOOK_EVENTS.len, std.mem.count(u8, hooks, CURSOR_PROJECT_HOOK_REL_PATH));
+}
+
+test "Cursor hook removal preserves unrelated configuration" {
+    const hook_path = "/home/test/.cursor/hooks/verde-cursor-notify-hook.sh";
+    const original =
+        \\{"version":1,"hooks":{"stop":[{"command":"user-stop-hook"}]},"userSetting":true}
+    ;
+    const merged = (try mergeCursorHooks(std.testing.allocator, original, hook_path)).?;
+    defer std.testing.allocator.free(merged);
+    const removed = (try removeCursorHooksFromJson(std.testing.allocator, merged, hook_path)).?;
+    defer std.testing.allocator.free(removed);
+
+    try std.testing.expect(std.mem.indexOf(u8, removed, "user-stop-hook") != null);
+    try std.testing.expect(std.mem.indexOf(u8, removed, "userSetting") != null);
+    try std.testing.expect(std.mem.indexOf(u8, removed, CURSOR_GLOBAL_HOOK_NEEDLE) == null);
+}
+
 test "Windows hook commands quote Unicode paths and select PowerShell scripts" {
     const allocator = std.testing.allocator;
     try std.testing.expectEqualStrings(CODEX_WINDOWS_HOOK_REL_PATH, codexProjectHookRelPathForOs(.windows));
     try std.testing.expectEqualStrings(CLAUDE_WINDOWS_HOOK_REL_PATH, claudeProjectHookRelPathForOs(.windows));
+    try std.testing.expectEqualStrings(CURSOR_WINDOWS_PROJECT_HOOK_REL_PATH, cursorProjectHookRelPathForOs(.windows));
 
     const hook_path = "C:\\Users\\Zoë Tester\\Client Repo\\.verde\\hooks\\codex-notify-hook.ps1";
     const command = try hookCommandAllocForOs(allocator, .windows, hook_path);
@@ -930,4 +1297,10 @@ test "PowerShell hooks use inherited transport-neutral endpoint and safe invocat
     try std.testing.expect(std.mem.indexOf(u8, claude_script, "$env:VERDE_LIVE_ENDPOINT") != null);
     try std.testing.expect(std.mem.indexOf(u8, claude_script, "ConvertFrom-Json") != null);
     try std.testing.expect(std.mem.indexOf(u8, claude_script, "& $cli notify") != null);
+
+    const cursor_script = cursorPowerShellHookScript();
+    try std.testing.expect(std.mem.indexOf(u8, cursor_script, "$env:VERDE_LIVE_ENDPOINT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cursor_script, "beforeSubmitPrompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cursor_script, "--provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cursor_script, "'cursor'") != null);
 }

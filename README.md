@@ -343,16 +343,19 @@ verde integrations list
 verde integrations doctor
 verde integrations install codex
 verde integrations install claude
+verde integrations install cursor
 ```
 
 `verde integrations` reports hook support without touching provider auth.
-Codex and Claude support project-local and `--global` hook installers. On
-Windows their generated scripts are `.verde/hooks/codex-notify-hook.ps1` and
-`.verde/hooks/claude-notify-hook.ps1`; Unix hosts use `.sh` scripts. Verde
-refuses to replace unmanaged provider settings. Amp supports its global plugin;
-OpenCode and Cursor remain usable chat providers but do not currently have a
-managed hook installer. The generic `verde notify`, OSC notification, and MCP
-surface paths remain available for terminal tools.
+Codex, Claude, and Cursor support project-local and `--global` hook installers.
+Cursor's `.cursor/hooks.json` format is shared by Cursor Agent's terminal and
+desktop Agent UIs; Verde status updates remain a no-op unless that Cursor
+session inherited a Verde pane identity. On Windows the generated scripts use
+`.ps1`; Unix hosts use `.sh` scripts. Verde merges Cursor hooks without
+replacing unrelated user entries and refuses to replace unmanaged Claude/Codex
+project settings. Amp supports its global plugin; OpenCode remains usable as a
+chat provider without a managed hook installer. The generic `verde notify`,
+OSC notification, and MCP surface paths remain available for terminal tools.
 
 Windows hook commands invoke the generated script with Windows PowerShell using
 `-NoProfile -NonInteractive -ExecutionPolicy Bypass -File`. `Bypass` applies
