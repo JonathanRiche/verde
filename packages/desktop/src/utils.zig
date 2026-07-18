@@ -1386,7 +1386,121 @@ fn formatSendWorkerError(
             u8,
             "Remote Herdr GUI sends currently support Codex only. Use the Herdr terminal/TUI pane for this provider.",
         ),
-        else => std.fmt.allocPrint(allocator, "Provider request failed: {s}", .{@errorName(err)}),
+        else => std.fmt.allocPrint(allocator, "{s} request failed. Check the provider status and retry.", .{providerLabel(provider)}),
+    };
+}
+
+const CLAUDE_USAGE_LIMIT_MESSAGE = "Claude's 5-hour usage limit has been reached. View usage to see the reset time and your other plan limits.";
+const CLAUDE_PLAN_LIMIT_MESSAGE = "Claude's plan usage limit has been reached. View usage to see which window was exhausted and when it resets.";
+const CLAUDE_WEEKLY_LIMIT_MESSAGE = "Claude's weekly usage limit has been reached. View usage to see the reset time and your other plan limits.";
+const CLAUDE_OPUS_WEEKLY_LIMIT_MESSAGE = "Claude's weekly Opus usage limit has been reached. View usage to see the reset time and your other plan limits.";
+const CLAUDE_SONNET_WEEKLY_LIMIT_MESSAGE = "Claude's weekly Sonnet usage limit has been reached. View usage to see the reset time and your other plan limits.";
+const CODEX_USAGE_LIMIT_MESSAGE = "Codex's usage limit has been reached. View usage to see which window was exhausted and when it resets.";
+const CODEX_FIVE_HOUR_LIMIT_MESSAGE = "Codex's 5-hour usage limit has been reached. View usage to see the reset time and your other plan limits.";
+
+fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var index: usize = 0;
+    while (index + needle.len <= haystack.len) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn isProviderUsageLimitFailure(provider: app_state.Provider, message: []const u8) bool {
+    if (provider != .claude and provider != .codex) return false;
+    const markers = [_][]const u8{
+        "usage limit",
+        "usage_limit",
+        "hit your limit",
+        "limit has been reached",
+        "5-hour limit",
+        "5 hour limit",
+        "five hour limit",
+    };
+    for (markers) |marker| {
+        if (asciiContainsIgnoreCase(message, marker)) return true;
+    }
+    return false;
+}
+
+/// Converts provider failures into stable, actionable transcript text.
+pub fn providerFailureDisplayMessage(provider: app_state.Provider, message: []const u8) []const u8 {
+    if (!isProviderUsageLimitFailure(provider, message)) return message;
+    return switch (provider) {
+        .claude => if (asciiContainsIgnoreCase(message, "seven_day_opus") or asciiContainsIgnoreCase(message, "weekly opus"))
+            CLAUDE_OPUS_WEEKLY_LIMIT_MESSAGE
+        else if (asciiContainsIgnoreCase(message, "seven_day_sonnet") or asciiContainsIgnoreCase(message, "weekly sonnet"))
+            CLAUDE_SONNET_WEEKLY_LIMIT_MESSAGE
+        else if (asciiContainsIgnoreCase(message, "seven_day") or asciiContainsIgnoreCase(message, "weekly usage"))
+            CLAUDE_WEEKLY_LIMIT_MESSAGE
+        else if (asciiContainsIgnoreCase(message, "five_hour") or
+            asciiContainsIgnoreCase(message, "5-hour") or
+            asciiContainsIgnoreCase(message, "5 hour") or
+            asciiContainsIgnoreCase(message, "five hour"))
+            CLAUDE_USAGE_LIMIT_MESSAGE
+        else
+            CLAUDE_PLAN_LIMIT_MESSAGE,
+        .codex => if (asciiContainsIgnoreCase(message, "5-hour") or
+            asciiContainsIgnoreCase(message, "5 hour") or
+            asciiContainsIgnoreCase(message, "five hour"))
+            CODEX_FIVE_HOUR_LIMIT_MESSAGE
+        else
+            CODEX_USAGE_LIMIT_MESSAGE,
+        else => unreachable,
+    };
+}
+
+/// Identifies a normalized provider usage-limit row for transcript rendering.
+pub fn usageLimitProviderForDisplayMessage(message: []const u8) ?app_state.Provider {
+    const claude_messages = [_][]const u8{
+        CLAUDE_USAGE_LIMIT_MESSAGE,
+        CLAUDE_PLAN_LIMIT_MESSAGE,
+        CLAUDE_WEEKLY_LIMIT_MESSAGE,
+        CLAUDE_OPUS_WEEKLY_LIMIT_MESSAGE,
+        CLAUDE_SONNET_WEEKLY_LIMIT_MESSAGE,
+    };
+    for (claude_messages) |candidate| {
+        if (std.mem.eql(u8, message, candidate)) return .claude;
+    }
+    if (std.mem.eql(u8, message, CODEX_USAGE_LIMIT_MESSAGE) or
+        std.mem.eql(u8, message, CODEX_FIVE_HOUR_LIMIT_MESSAGE)) return .codex;
+    return null;
+}
+
+/// Identifies persisted failures written before provider error details were retained.
+pub fn legacyProviderFailureForDisplayMessage(message_raw: []const u8) ?app_state.Provider {
+    const message = std.mem.trim(u8, message_raw, &std.ascii.whitespace);
+    const claude_messages = [_][]const u8{
+        "ClaudeRequestFailed",
+        "Provider request failed: ClaudeRequestFailed",
+    };
+    for (claude_messages) |candidate| {
+        if (std.mem.eql(u8, message, candidate)) return .claude;
+    }
+    const codex_messages = [_][]const u8{
+        "CodexTurnFailed",
+        "Provider request failed: CodexTurnFailed",
+    };
+    for (codex_messages) |candidate| {
+        if (std.mem.eql(u8, message, candidate)) return .codex;
+    }
+    return null;
+}
+
+/// Returns the provider for any failure row that can offer a `/usage` action.
+pub fn providerFailureActionProvider(message: []const u8) ?app_state.Provider {
+    return usageLimitProviderForDisplayMessage(message) orelse legacyProviderFailureForDisplayMessage(message);
+}
+
+/// Replaces opaque legacy enum names with an honest explanation.
+pub fn providerFailureActionBody(message: []const u8) []const u8 {
+    const provider = legacyProviderFailureForDisplayMessage(message) orelse return message;
+    return switch (provider) {
+        .claude => "This older Claude failure did not save its original details. View current usage to check whether a plan limit caused it.",
+        .codex => "This older Codex failure did not save its original details. View current usage to check whether a plan limit caused it.",
+        else => unreachable,
     };
 }
 
@@ -1546,7 +1660,11 @@ fn handleSendFailure(context: ?*anyopaque, message: []const u8) void {
     defer send_state.mutex.unlock();
     if (send_state.status != .pending) return;
     if (send_state.error_message) |old| page_alloc.free(old);
-    send_state.error_message = page_alloc.dupe(u8, message) catch null;
+    const display_message = if (send_state.provider) |provider|
+        providerFailureDisplayMessage(provider, message)
+    else
+        message;
+    send_state.error_message = page_alloc.dupe(u8, display_message) catch null;
 }
 
 fn handleSendShouldStop(context: ?*anyopaque) bool {
@@ -2240,4 +2358,32 @@ test "upsertPendingDiffFileLocked preserves patch when later updates omit it" {
 
     try std.testing.expectEqual(@as(usize, 1), files.items.len);
     try std.testing.expectEqualStrings("@@ -1 +1 @@\n-old\n+new\n", files.items[0].patch.?);
+}
+
+test "provider failure display identifies Claude and Codex usage limits" {
+    try std.testing.expectEqualStrings(
+        CLAUDE_PLAN_LIMIT_MESSAGE,
+        providerFailureDisplayMessage(.claude, "You've hit your limit · resets 10pm"),
+    );
+    try std.testing.expectEqualStrings(
+        CLAUDE_USAGE_LIMIT_MESSAGE,
+        providerFailureDisplayMessage(.claude, "Claude five_hour usage limit reached"),
+    );
+    try std.testing.expectEqualStrings(
+        CODEX_USAGE_LIMIT_MESSAGE,
+        providerFailureDisplayMessage(.codex, "Usage limit reached. Try again later."),
+    );
+    try std.testing.expectEqualStrings(
+        "Authentication failed",
+        providerFailureDisplayMessage(.claude, "Authentication failed"),
+    );
+    try std.testing.expectEqual(app_state.Provider.claude, usageLimitProviderForDisplayMessage(CLAUDE_USAGE_LIMIT_MESSAGE).?);
+    try std.testing.expectEqual(app_state.Provider.codex, usageLimitProviderForDisplayMessage(CODEX_USAGE_LIMIT_MESSAGE).?);
+}
+
+test "legacy provider failures retain an actionable usage path" {
+    try std.testing.expectEqual(app_state.Provider.claude, providerFailureActionProvider("ClaudeRequestFailed").?);
+    try std.testing.expectEqual(app_state.Provider.codex, providerFailureActionProvider("Provider request failed: CodexTurnFailed").?);
+    try std.testing.expect(std.mem.indexOf(u8, providerFailureActionBody("ClaudeRequestFailed"), "did not save") != null);
+    try std.testing.expect(providerFailureActionProvider("Authentication failed") == null);
 }

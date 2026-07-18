@@ -593,6 +593,24 @@ function formatClaudeUsageSummary(usage, contextUsage) {
   return lines.join("\n");
 }
 
+function claudeRejectedRateLimitMessage(message) {
+  if (message?.type !== "rate_limit_event" || message?.rate_limit_info?.status !== "rejected") return null;
+  switch (message.rate_limit_info.rateLimitType) {
+    case "five_hour":
+      return "Claude five_hour usage limit has been reached.";
+    case "seven_day":
+      return "Claude seven_day usage limit has been reached.";
+    case "seven_day_opus":
+      return "Claude seven_day_opus usage limit has been reached.";
+    case "seven_day_sonnet":
+      return "Claude seven_day_sonnet usage limit has been reached.";
+    case "overage":
+      return "Claude overage usage limit has been reached.";
+    default:
+      return "Claude usage limit has been reached.";
+  }
+}
+
 function formatClaudeCompactSummary(metadata, fallbackText) {
   const lines = [
     "Claude thread context compacted.",
@@ -822,6 +840,8 @@ async function handleClaudeSendPrompt(sdk, request) {
     const backgroundState = { trackedToolUseIds: new Set(), scheduledToolUseIds: new Set(), sawTracked: false, pendingBackgrounds: [] };
     let sawResult = false;
     for await (const message of query) {
+      const rateLimitFailure = claudeRejectedRateLimitMessage(message);
+      if (rateLimitFailure) throw new Error(rateLimitFailure);
       if (message?.type === "system" && message?.subtype === "init" && message.session_id) {
         sessionId = message.session_id;
         write({ type: "thread_id", thread_id: sessionId });
@@ -829,6 +849,10 @@ async function handleClaudeSendPrompt(sdk, request) {
       }
       if (message?.type === "result") {
         sessionId = message.session_id ?? sessionId;
+        if (message.is_error) {
+          const errors = Array.isArray(message.errors) ? message.errors.filter((item) => typeof item === "string" && item.length > 0) : [];
+          throw new Error(errors.join("\n") || message.stop_reason || "Claude request failed during execution.");
+        }
         if (typeof message.result === "string") reply = message.result;
         if (backgroundState.pendingBackgrounds.length > 0) {
           await Promise.allSettled(backgroundState.pendingBackgrounds);

@@ -9,6 +9,8 @@ const log = std.log.scoped(.ui_theme);
 
 pub const DEFAULT_FONT_SIZE: f32 = 24.0;
 pub const RESPONSIVE_BASE_FONT_SIZE: f32 = 22.0;
+/// Slow, low-distraction cadence shared by live-work indicators.
+pub const ACTIVITY_PULSE_PERIOD_NS: i128 = 1_600_000_000;
 
 pub const ThemeColors = struct {
     background: [4]f32 = colors.CHAT_BLACK,
@@ -85,6 +87,13 @@ pub fn borderMuted() [4]f32 {
 
 pub fn selection() [4]f32 {
     return current_colors.selection;
+}
+
+/// Returns a smooth 0..1 breathing pulse for in-progress UI chrome.
+pub fn activityPulse(now_ns: i128) f32 {
+    const phase = @as(f32, @floatFromInt(@mod(now_ns, ACTIVITY_PULSE_PERIOD_NS))) /
+        @as(f32, @floatFromInt(ACTIVITY_PULSE_PERIOD_NS));
+    return 0.5 + 0.5 * @sin(phase * std.math.tau);
 }
 
 pub fn withAlpha(color: [4]f32, alpha: u8) [4]f32 {

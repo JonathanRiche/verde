@@ -10750,6 +10750,41 @@ pub const AppState = struct {
         return true;
     }
 
+    /// Runs the focused Claude or Codex thread's `/usage` command without
+    /// replacing a draft the user may already be composing.
+    pub fn showCurrentProviderUsage(self: *AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        if (self.hasPendingSlashCommand()) {
+            self.setSidebarNotice("A slash command is already running.");
+            return true;
+        }
+
+        const thread = self.currentThread();
+        const commands = ai_harness.slashCommandsForProvider(harnessProviderForDbProvider(thread.provider));
+        for (commands) |command| {
+            if (command.id != .usage or command.availability != .available) continue;
+
+            const saved_draft = self.allocator.dupe(u8, self.currentDraft()) catch {
+                self.setSidebarNotice("Failed to preserve the current draft before loading usage.");
+                return true;
+            };
+            defer self.allocator.free(saved_draft);
+
+            self.beginProviderSlashCommand(command, "", "/usage") catch |err| {
+                log.err("failed to start provider usage command: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Failed to load provider usage.");
+                return true;
+            };
+            self.setDraft(saved_draft);
+            self.syncPaletteComposerFromDraft();
+            self.noteInteraction();
+            return true;
+        }
+
+        self.setSidebarNotice("Usage details are not available for this provider.");
+        return true;
+    }
+
     fn appendSlashCommandInsertionSpace(self: *AppState) void {
         const text = self.currentDraft();
         if (text.len > 0 and text[text.len - 1] == ' ') return;
@@ -15893,7 +15928,9 @@ pub const AppState = struct {
         // own the reasoning data instead.
         self.palette_composer.setShowReasoningToggle(true);
         self.palette_composer.model_index = self.composerModelIndex(thread.provider, thread.model_ref);
-        self.palette_composer.setSendState(if (thread.isSendPendingForUi()) .stop else .send);
+        const send_pending = thread.isSendPendingForUi();
+        self.palette_composer.setSendState(if (send_pending) .stop else .send);
+        self.palette_composer.setStopPulseFactor(if (send_pending) theme.activityPulse(profiler.nowNs()) else 1.0);
         if (self.palette_composer.model_index) |index| {
             if (index < model_options.len) {
                 self.palette_composer.setModelLabel(self.allocator, std.mem.sliceTo(model_options[index].label, 0)) catch |err| {
@@ -18145,7 +18182,10 @@ pub const AppState = struct {
                 const call_id = jsonValueString(approval_value.object.get("call_id") orelse .null) orelse "";
                 const title = jsonValueString(approval_value.object.get("title") orelse .null) orelse "Approval requested";
                 const body = jsonValueString(approval_value.object.get("body") orelse .null) orelse "";
-                if (call_id.len > 0 and send_state.pending_approval == null) {
+                // Older daemons can emit an empty ID for Codex MCP
+                // elicitations. Preserve it so the matching daemon turn can
+                // still be approved or denied after a desktop upgrade.
+                if (send_state.pending_approval == null) {
                     send_state.pending_approval = .{
                         .call_id = try std.heap.page_allocator.dupe(u8, call_id),
                         .title = try std.heap.page_allocator.dupe(u8, title),

@@ -62,6 +62,14 @@ const TranscriptHit = struct {
 var transcript_hit_count: usize = 0;
 var transcript_hits: [MAX_TRANSCRIPT_HITS]TranscriptHit = [_]TranscriptHit{.{}} ** MAX_TRANSCRIPT_HITS;
 
+const UsageActionHit = struct {
+    rect: palette.Rect = .{},
+};
+
+const MAX_USAGE_ACTION_HITS = 16;
+var usage_action_hit_count: usize = 0;
+var usage_action_hits: [MAX_USAGE_ACTION_HITS]UsageActionHit = [_]UsageActionHit{.{}} ** MAX_USAGE_ACTION_HITS;
+
 /// Geometry of the transcript scrollbar from the last paint. Captured during
 /// render so the mouse handlers can do hit-testing without rebuilding the
 /// layout themselves. `track` is empty when the column is short enough that
@@ -149,6 +157,7 @@ pub fn renderWorkspace(state: *app_state.AppState, width: f32, height: f32) void
 
 pub fn resetTranscriptHitCache() void {
     transcript_hit_count = 0;
+    usage_action_hit_count = 0;
 }
 
 pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
@@ -568,6 +577,14 @@ pub fn pointerOverTranscript(x: f32, y: f32) bool {
     return findTranscriptHit(x, y) != null;
 }
 
+pub fn transcriptActionWantsPointerAt(x: f32, y: f32) bool {
+    var index: usize = 0;
+    while (index < usage_action_hit_count) : (index += 1) {
+        if (rectContains(usage_action_hits[index].rect, x, y)) return true;
+    }
+    return false;
+}
+
 pub fn handleTranscriptPaletteWheel(state: *app_state.AppState, x: f32, y: f32, wheel_y: f32) bool {
     if (wheel_y == 0.0) return false;
     const hit = findTranscriptHit(x, y) orelse return false;
@@ -977,6 +994,10 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
             }
             return true;
         }
+    }
+
+    if (clicks <= 1 and transcriptActionWantsPointerAt(x, y)) {
+        return state.showCurrentProviderUsage();
     }
 
     if (clicks <= 1 and state.consumeCodeCopyButtonClick(x, y)) {
@@ -2204,7 +2225,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
                 .system => if (event.author.len > 0) event.author else "System",
             };
             if (y + item_h >= column.y and y <= column.y + column.h) {
-                renderTranscriptBubbleFromParts(state, column, y, item_h, event.role, role_label, event.body, false, false, clip, msg_idx, false);
+                renderTranscriptBubbleFromParts(state, column, y, item_h, event.role, role_label, event.body, false, false, clip, msg_idx, false, false);
             }
         }
         y += item_h + theme.scaledUi(12.0);
@@ -2219,7 +2240,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
     const assistant_h = transcriptMessageHeightStream(null, null, body, .assistant, column.w, "", stream_plain, stream_text.len > 0);
     const stream_msg_idx = base_message_index + send_state.pending_events.items.len;
     if (y + assistant_h >= column.y and y <= column.y + column.h) {
-        renderTranscriptBubbleFromParts(state, column, y, assistant_h, .assistant, working_label, body, stream_text.len == 0, stream_plain, clip, stream_msg_idx, stream_text.len > 0);
+        renderTranscriptBubbleFromParts(state, column, y, assistant_h, .assistant, working_label, body, stream_text.len == 0, stream_plain, clip, stream_msg_idx, stream_text.len > 0, true);
     }
 }
 
@@ -2531,6 +2552,9 @@ fn transcriptMessageHeightStream(
     if (role == .system and isUsageSummaryMessage(message_author, body_raw)) {
         return usageSummaryHeight(body_raw, column_width);
     }
+    if (role == .system and utils.providerFailureActionProvider(body_raw) != null) {
+        return providerFailureActionHeight(body_raw, column_width);
+    }
     const body = std.mem.trim(u8, body_raw, "\n\r\t ");
     const font_size = theme.scaledUi(TRANSCRIPT_MARKDOWN_FONT_SIZE);
     const body_width = if (role == .user) column_width * 0.62 else column_width;
@@ -2606,13 +2630,110 @@ fn renderTranscriptMessage(state: *app_state.AppState, thread: *const app_state.
         renderUsageSummaryCard(state, column, y, height, message.body, clip);
         return;
     }
+    if (message.role == .system) {
+        if (utils.providerFailureActionProvider(message.body)) |provider| {
+            renderProviderFailureActionCard(state, column, y, height, provider, message.body, clip);
+            return;
+        }
+    }
     const role_label = switch (message.role) {
         .user => "You",
         .assistant => if (message.author.len > 0) message.author else "Assistant",
         .system => if (message.author.len > 0) message.author else "System",
     };
-    renderTranscriptBubbleFromParts(state, column, y, height, message.role, role_label, message.body, false, false, clip, message_index, false);
+    renderTranscriptBubbleFromParts(state, column, y, height, message.role, role_label, message.body, false, false, clip, message_index, false, false);
     renderTranscriptImages(state, column, y, height, message, clip);
+}
+
+fn providerFailureActionHeight(body_raw: []const u8, column_width: f32) f32 {
+    const font_size = theme.scaledUi(TRANSCRIPT_MARKDOWN_FONT_SIZE);
+    const inner_width = @max(column_width - theme.scaledUi(32.0), theme.scaledUi(80.0));
+    const chars_per_line = @max(@as(usize, @intFromFloat(inner_width / (font_size * 0.52))), 1);
+    const display_body = utils.providerFailureActionBody(body_raw);
+    const line_count = wrappedLineCount(std.mem.trim(u8, display_body, "\n\r\t "), chars_per_line);
+    const body_height = @as(f32, @floatFromInt(line_count)) * font_size * 1.38;
+    return theme.scaledUi(99.0) + body_height;
+}
+
+fn recordUsageActionHit(rect: palette.Rect) void {
+    if (usage_action_hit_count >= usage_action_hits.len) return;
+    usage_action_hits[usage_action_hit_count] = .{ .rect = rect };
+    usage_action_hit_count += 1;
+}
+
+// Provider failure region with a direct provider-usage action.
+fn renderProviderFailureActionCard(
+    state: *app_state.AppState,
+    column: palette.Rect,
+    y: f32,
+    height: f32,
+    provider: app_state.Provider,
+    body_raw: []const u8,
+    clip: palette.Rect,
+) void {
+    const bubble = snapRect(palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height });
+    queueRoundedShellClipped(
+        state,
+        bubble,
+        paletteColor(theme.withAlpha(theme.COLOR_YELLOW, 42)),
+        paletteColor(theme.withAlpha(theme.COLOR_YELLOW, 210)),
+        transcriptBubbleCornerRadius(),
+        clip,
+    );
+
+    const pad = theme.scaledUi(16.0);
+    var title_buf: [80]u8 = undefined;
+    const is_usage_limit = utils.usageLimitProviderForDisplayMessage(body_raw) != null;
+    const title = if (is_usage_limit)
+        std.fmt.bufPrint(&title_buf, "{s} usage limit reached", .{utils.providerLabel(provider)}) catch "Usage limit reached"
+    else
+        std.fmt.bufPrint(&title_buf, "{s} request failed", .{utils.providerLabel(provider)}) catch "Provider request failed";
+    queueChromeLabel(state, .{
+        .x = bubble.x + pad,
+        .y = bubble.y + theme.scaledUi(11.0),
+        .w = bubble.w - pad * 2.0,
+        .h = theme.scaledUi(20.0),
+    }, title, paletteColor(theme.COLOR_YELLOW), theme.scaledUi(13.0), clip);
+
+    const font_size = theme.scaledUi(TRANSCRIPT_MARKDOWN_FONT_SIZE);
+    const inner_width = @max(bubble.w - pad * 2.0, theme.scaledUi(80.0));
+    const chars_per_line = @max(@as(usize, @intFromFloat(inner_width / (font_size * 0.52))), 1);
+    const body = std.mem.trim(u8, utils.providerFailureActionBody(body_raw), "\n\r\t ");
+    const line_count = wrappedLineCount(body, chars_per_line);
+    const body_height = @as(f32, @floatFromInt(line_count)) * font_size * 1.38;
+    renderWrappedBody(state, .{
+        .x = bubble.x + pad,
+        .y = bubble.y + theme.scaledUi(38.0),
+        .w = inner_width,
+        .h = body_height,
+    }, body, paletteColor(theme.COLOR_WHITE), font_size, clip);
+
+    const button = snapRect(palette.Rect{
+        .x = bubble.x + pad,
+        .y = bubble.y + theme.scaledUi(50.0) + body_height,
+        .w = theme.scaledUi(116.0),
+        .h = theme.scaledUi(34.0),
+    });
+    const hovered = rectContains(button, state.palette_mouse_x, state.palette_mouse_y);
+    const button_fill = if (hovered)
+        theme.withAlpha(theme.lighten(theme.COLOR_PANEL_ALT, 0.10), 245)
+    else
+        theme.withAlpha(theme.COLOR_PANEL_MUTED, 205);
+    queueRoundedShellClipped(
+        state,
+        button,
+        paletteColor(button_fill),
+        paletteColor(theme.withAlpha(theme.COLOR_GREEN, if (hovered) 230 else 165)),
+        theme.scaledUi(8.0),
+        clip,
+    );
+    queueFixedTextLine(state, .{
+        .x = button.x + theme.scaledUi(13.0),
+        .y = button.y + theme.scaledUi(8.0),
+        .w = button.w - theme.scaledUi(26.0),
+        .h = theme.scaledUi(18.0),
+    }, "View usage", paletteColor(if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
+    if (intersectClipRect(clip, button)) |visible_button| recordUsageActionHit(visible_button);
 }
 
 fn renderTranscriptImages(state: *app_state.AppState, column: palette.Rect, y: f32, height: f32, message: app_state.ChatMessage, clip: palette.Rect) void {
@@ -3687,6 +3808,7 @@ fn queueCardChevron(state: *app_state.AppState, cx: f32, cy: f32, expanded: bool
     }
 }
 
+// Transcript message bubble, including the live activity cue for a pending assistant turn.
 fn renderTranscriptBubbleFromParts(
     state: *app_state.AppState,
     column: palette.Rect,
@@ -3700,6 +3822,7 @@ fn renderTranscriptBubbleFromParts(
     clip: palette.Rect,
     message_index: usize,
     streaming: bool,
+    active: bool,
 ) void {
     const bubble_width = if (role == .user) column.w * 0.62 else column.w;
     const bubble_x = if (role == .user) column.x + column.w - bubble_width else column.x;
@@ -3710,8 +3833,39 @@ fn renderTranscriptBubbleFromParts(
         .system => theme.withAlpha(theme.COLOR_YELLOW, 54),
     };
     const rr = transcriptBubbleCornerRadius();
-    queueRoundedShellClipped(state, bubble, paletteColor(bg), paletteColor(theme.COLOR_PANEL_MUTED), rr, clip);
-    queueText(state, snapRect(.{ .x = bubble.x + theme.scaledUi(14.0), .y = bubble.y + theme.scaledUi(9.0), .w = bubble.w - theme.scaledUi(28.0), .h = theme.scaledUi(20.0) }), role_label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
+    const activity = if (active) theme.activityPulse(profiler.nowNs()) else 0.0;
+    const border_color = if (active)
+        theme.withAlpha(theme.COLOR_GREEN, @intFromFloat(92.0 + activity * 88.0))
+    else
+        theme.COLOR_PANEL_MUTED;
+    queueRoundedShellClipped(state, bubble, paletteColor(bg), paletteColor(border_color), rr, clip);
+
+    var label_x = bubble.x + theme.scaledUi(14.0);
+    if (active) {
+        const core_d = theme.scaledUi(5.5);
+        const halo_d = core_d + theme.scaledUi(5.0) * activity;
+        const center_x = label_x + halo_d * 0.5;
+        const center_y = bubble.y + theme.scaledUi(19.0);
+        queueRoundedClipped(state, .{
+            .x = center_x - halo_d * 0.5,
+            .y = center_y - halo_d * 0.5,
+            .w = halo_d,
+            .h = halo_d,
+        }, paletteColor(theme.withAlpha(theme.COLOR_GREEN, @intFromFloat(28.0 + activity * 48.0))), halo_d * 0.5, clip);
+        queueRoundedClipped(state, .{
+            .x = center_x - core_d * 0.5,
+            .y = center_y - core_d * 0.5,
+            .w = core_d,
+            .h = core_d,
+        }, paletteColor(theme.withAlpha(theme.COLOR_GREEN, @intFromFloat(180.0 + activity * 75.0))), core_d * 0.5, clip);
+        label_x += halo_d + theme.scaledUi(6.0);
+    }
+    queueText(state, snapRect(.{
+        .x = label_x,
+        .y = bubble.y + theme.scaledUi(9.0),
+        .w = @max(bubble.x + bubble.w - theme.scaledUi(14.0) - label_x, theme.scaledUi(20.0)),
+        .h = theme.scaledUi(20.0),
+    }), role_label, paletteColor(if (active) theme.COLOR_GREEN else theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
     const body_rect = palette.Rect{
         .x = bubble.x + theme.scaledUi(14.0),
         .y = bubble.y + theme.scaledUi(34.0),
@@ -4100,12 +4254,14 @@ fn renderInactiveComposerSubmit(state: *app_state.AppState, rect: palette.Rect) 
         .h = size,
     };
     if (state.currentThread().isSendPendingForUi()) {
-        queueRounded(state, button, paletteColor(theme.withAlpha(theme.COLOR_YELLOW, 185)), size * 0.5);
+        const pulse = theme.activityPulse(profiler.nowNs());
+        queueRounded(state, button, paletteColor(theme.withAlpha(theme.COLOR_YELLOW, @intFromFloat(188.0 + pulse * 67.0))), size * 0.5);
+        const stop_side = size * (0.29 + pulse * 0.06);
         const stop = palette.Rect{
-            .x = button.x + size * 0.34,
-            .y = button.y + size * 0.34,
-            .w = size * 0.32,
-            .h = size * 0.32,
+            .x = button.x + (size - stop_side) * 0.5,
+            .y = button.y + (size - stop_side) * 0.5,
+            .w = stop_side,
+            .h = stop_side,
         };
         queueRounded(state, stop, paletteColor(theme.withAlpha(theme.background(), 230)), theme.scaledUi(2.0));
     } else {

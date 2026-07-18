@@ -14,16 +14,13 @@ const Provider = native_state.Provider;
 
 const log = std.log.scoped(.native_ui_sidebar);
 
-/// Shared ~1.1s sine pulse (0.10..1.0) for working/waiting pips and badges.
+/// Shared ~1.6s breathing pulse (0.35..1.0) for working/waiting pips and badges.
 /// Marks the frame as hosting an active pip animation so the main loop keeps
 /// a ~30fps tick going; without it the loop sleeps between sends' 1Hz label
 /// updates and the pulse visibly steps.
 fn attentionPulse(state: *runtime.AppState) f32 {
     state.sidebar_pulse_animating = true;
-    // Phase math in f64: ms-since-boot exceeds f32's 24-bit mantissa after
-    // ~4.6h of uptime, which would quantize the sine into visible steps.
-    const now_ms: f64 = @floatFromInt(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
-    return @floatCast(0.55 + 0.45 * @sin(now_ms / 180.0));
+    return 0.35 + 0.65 * theme.activityPulse(profiler.nowNs());
 }
 
 /// Saved-thread row: provider bitmap slot (CSS px). Match `COMPOSER_PROVIDER_LOGO_SLOT_CSS` in `chat_panel.zig`.
@@ -1147,7 +1144,7 @@ fn workspaceStatusColor(state: *runtime.AppState, project_index: usize) ?[4]f32 
         }
     }
     if (has_waiting) return theme.COLOR_YELLOW;
-    if (has_working) return theme.COLOR_SECONDARY_GREEN;
+    if (has_working) return theme.COLOR_GREEN;
     return null;
 }
 
@@ -1455,7 +1452,7 @@ fn renderOpenPaneRow(
     const title_color = if (dim)
         theme.COLOR_TEXT_SUBTLE
     else if (running)
-        theme.COLOR_SECONDARY_GREEN
+        theme.COLOR_GREEN
     else if (emphasis)
         theme.COLOR_WHITE
     else
@@ -1571,14 +1568,14 @@ fn paneNeedsAttention(
 fn paneStatusColor(status: ?native_state.SurfaceStatus, running: bool) ?[4]f32 {
     if (status) |s| {
         return switch (s) {
-            .working => theme.COLOR_SECONDARY_GREEN,
+            .working => theme.COLOR_GREEN,
             .waiting => theme.COLOR_YELLOW,
             .@"error" => theme.COLOR_DIFF_REMOVE,
             .done => null,
-            .idle => if (running) theme.COLOR_SECONDARY_GREEN else null,
+            .idle => if (running) theme.COLOR_GREEN else null,
         };
     }
-    if (running) return theme.COLOR_SECONDARY_GREEN;
+    if (running) return theme.COLOR_GREEN;
     return null;
 }
 

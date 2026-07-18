@@ -74,16 +74,14 @@ const MAX_WINDOW_WIDTH: c_int = 1520;
 const MAX_WINDOW_HEIGHT: c_int = 980;
 const ACTIVE_WAIT_TIMEOUT_MS: c_int = 16;
 const IDLE_WAIT_TIMEOUT_MS: c_int = 50;
-// ~30fps tick while a sidebar status pip is pulsing. The pulse is a ~1.1s
+// ~30fps tick while a sidebar status pip is pulsing. The pulse is a ~1.6s
 // sine (sidebar.zig), so 30fps already looks perfectly smooth at half the
 // render cost of the 16ms ACTIVE tier; pips can stay lit for minutes while
 // agents work, so the cheaper cadence matters.
 const PIP_PULSE_WAIT_TIMEOUT_MS: c_int = 33;
-// Wake the event loop at least 4 times per second while any chat turn is in
-// flight so the "Working - mm:ss" label (computed from wall clock) ticks
-// even when no streamed tokens or input events arrive. Streamed tokens wake
-// the loop immediately via loop_wakeup; this is only the fallback heartbeat.
-const PENDING_SEND_WAIT_TIMEOUT_MS: c_int = 250;
+// Pending chat turns animate the stop control and in-transcript activity cue
+// at the same economical ~30fps cadence as sidebar pips.
+const PENDING_SEND_WAIT_TIMEOUT_MS: c_int = 33;
 // In-flight provider slash commands currently complete as one bridge result
 // rather than token streaming, so the transcript row owns its liveness cue.
 const SLASH_COMMAND_ANIMATION_WAIT_TIMEOUT_MS: c_int = 33;
@@ -673,7 +671,8 @@ fn syncMouseCursor(state: *const AppState, pointer_cursor: *sdl.Cursor) void {
     // hit under the mouse must also suppress their pointer affordance.
     if (!modalHitAtMouse(state) and
         (sidebar_ui.wantsPointerAt(state, state.palette_mouse_x, state.palette_mouse_y) or
-            chat_panel_ui.workspaceHeaderWantsPointerAt(state, state.palette_mouse_x, state.palette_mouse_y)))
+            chat_panel_ui.workspaceHeaderWantsPointerAt(state, state.palette_mouse_x, state.palette_mouse_y) or
+            chat_panel_ui.transcriptActionWantsPointerAt(state.palette_mouse_x, state.palette_mouse_y)))
     {
         sdl.setCursor(pointer_cursor) catch {};
         return;
@@ -1193,6 +1192,8 @@ fn appNeedsContinuousFrames(state: *AppState) bool {
         state.runConfigStepperAnimating() or
         // Settings modal fades in/out for ~160ms.
         state.settingsModalAnimating() or
+        // Pending turns animate the stop control and transcript activity cue.
+        state.pending_send_count > 0 or
         // Pulsing sidebar status pips need a steady tick or the sine wave
         // gets sampled at the 1Hz "Working" label cadence and looks steppy.
         state.sidebar_pulse_animating;
@@ -1208,9 +1209,8 @@ fn eventWaitTimeoutMs(state: *AppState) c_int {
     // echo ready, while output extends it for continuously redrawing TUIs.
     if (state.terminalActivityBurstActive()) return ACTIVE_WAIT_TIMEOUT_MS;
     if (state.sidebar_pulse_animating) return PIP_PULSE_WAIT_TIMEOUT_MS;
-    // While a chat turn is pending we still want the wall-clock "Working"
-    // label to tick. pollSend bumps once per whole second; this just caps
-    // the SDL wait so we actually reach pollSend before that second elapses.
+    // Pending turns own visible activity motion as well as the wall-clock
+    // "Working" label, so they share the sidebar pip's 30fps cadence.
     if (state.pending_send_count > 0) return PENDING_SEND_WAIT_TIMEOUT_MS;
     if (state.hasPendingSlashCommand()) return SLASH_COMMAND_ANIMATION_WAIT_TIMEOUT_MS;
     if (state.hasRunningBackgroundTasks()) return BACKGROUND_TASK_WAIT_TIMEOUT_MS;
