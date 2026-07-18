@@ -74,7 +74,7 @@ Manual smoke:
    ./zig-out/bin/verde live process list --json
    ```
    Expect the agent metadata fields in process output.
-   Verde automatically enables `features.codex_hooks=true` for plain `codex` managed commands when `hooks: true` is set. When Codex runs in that pane, `PermissionRequest` hooks should mark the Verde surface `waiting`, and `Stop` hooks should mark it `done`.
+   Verde automatically enables `features.hooks=true` for plain `codex` managed commands when `hooks: true` is set. When Codex runs in that pane, `PermissionRequest` hooks should mark the Verde surface `waiting`, and `Stop` hooks should mark it `done`.
 
 9. Test first-class Codex TUI open:
    ```sh
