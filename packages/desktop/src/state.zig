@@ -19193,22 +19193,7 @@ pub const AppState = struct {
             }
         }
         if (result.object.get("pending_approval")) |approval_value| {
-            if (approval_value == .object) {
-                const call_id = jsonValueString(approval_value.object.get("call_id") orelse .null) orelse "";
-                const title = jsonValueString(approval_value.object.get("title") orelse .null) orelse "Approval requested";
-                const body = jsonValueString(approval_value.object.get("body") orelse .null) orelse "";
-                // Older daemons can emit an empty ID for Codex MCP
-                // elicitations. Preserve it so the matching daemon turn can
-                // still be approved or denied after a desktop upgrade.
-                if (send_state.pending_approval == null) {
-                    send_state.pending_approval = .{
-                        .call_id = try std.heap.page_allocator.dupe(u8, call_id),
-                        .title = try std.heap.page_allocator.dupe(u8, title),
-                        .body = try std.heap.page_allocator.dupe(u8, body),
-                    };
-                    changed = true;
-                }
-            }
+            if (try syncDaemonPendingApprovalLocked(send_state, approval_value)) changed = true;
         }
         if (std.mem.eql(u8, status_text, "completed")) {
             const provider_thread_id = jsonValueString(result.object.get("provider_thread_id") orelse .null) orelse send_state.provisional_provider_thread_id orelse "";
@@ -19230,6 +19215,44 @@ pub const AppState = struct {
         }
         if (changed) send_state.ui_revision +%= 1;
         return changed;
+    }
+
+    fn syncDaemonPendingApprovalLocked(send_state: *SendState, approval_value: std.json.Value) !bool {
+        const page_alloc = std.heap.page_allocator;
+        if (approval_value == .null) {
+            if (send_state.pending_approval == null) return false;
+            freePendingApprovalLocked(page_alloc, &send_state.pending_approval);
+            send_state.approval_decision = null;
+            return true;
+        }
+        if (approval_value != .object) return error.InvalidDaemonResponse;
+
+        const call_id = jsonValueString(approval_value.object.get("call_id") orelse .null) orelse "";
+        const title = jsonValueString(approval_value.object.get("title") orelse .null) orelse "Approval requested";
+        const body = jsonValueString(approval_value.object.get("body") orelse .null) orelse "";
+        // Older daemons can emit an empty ID for Codex MCP elicitations.
+        // Preserve it so the matching daemon turn can still be approved or
+        // denied after a desktop upgrade.
+        if (send_state.pending_approval) |current| {
+            if (std.mem.eql(u8, current.call_id, call_id) and
+                std.mem.eql(u8, current.title, title) and
+                std.mem.eql(u8, current.body, body)) return false;
+        }
+
+        const owned_call_id = try page_alloc.dupe(u8, call_id);
+        errdefer page_alloc.free(owned_call_id);
+        const owned_title = try page_alloc.dupe(u8, title);
+        errdefer page_alloc.free(owned_title);
+        const owned_body = try page_alloc.dupe(u8, body);
+        errdefer page_alloc.free(owned_body);
+        freePendingApprovalLocked(page_alloc, &send_state.pending_approval);
+        send_state.pending_approval = .{
+            .call_id = owned_call_id,
+            .title = owned_title,
+            .body = owned_body,
+        };
+        send_state.approval_decision = null;
+        return true;
     }
 
     fn applyDaemonChatEventLocked(self: *AppState, send_state: *SendState, kind: []const u8, payload_json: []const u8) !void {
@@ -20862,6 +20885,24 @@ fn trailingFileSearchToken(draft: []const u8) ?FileSearchToken {
         .query_start = token_start + 1,
         .end = draft.len,
     };
+}
+
+test "daemon null approval clears the desktop approval cache" {
+    const page_alloc = std.heap.page_allocator;
+    var send_state: SendState = .{
+        .pending_approval = .{
+            .call_id = page_alloc.dupe(u8, "rpc-int:2") catch unreachable,
+            .title = page_alloc.dupe(u8, "codex_apps") catch unreachable,
+            .body = page_alloc.dupe(u8, "Allow GitHub access?") catch unreachable,
+        },
+        .approval_decision = .approve,
+    };
+    defer freePendingApprovalLocked(page_alloc, &send_state.pending_approval);
+
+    try std.testing.expect(try AppState.syncDaemonPendingApprovalLocked(&send_state, .null));
+    try std.testing.expect(send_state.pending_approval == null);
+    try std.testing.expect(send_state.approval_decision == null);
+    try std.testing.expect(!try AppState.syncDaemonPendingApprovalLocked(&send_state, .null));
 }
 
 test "empty workspace ignores hidden composer and slash input" {
