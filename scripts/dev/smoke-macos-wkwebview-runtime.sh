@@ -44,16 +44,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-assert_no_native_webview_helper_processes() {
-  local matches
-  matches="$(pgrep -af '[v]erde-browser-cef|[v]erde-browser-cef-process|[l]ibcef|[C]hromium Embedded Framework' || true)"
-  if [[ -n "$matches" ]]; then
-    echo "native macOS WKWebView smoke found unexpected CEF/helper process:" >&2
-    printf '%s\n' "$matches" >&2
-    exit 1
-  fi
-}
-
 VERDE_OPEN_BROWSER_ON_START=1 VERDE_BROWSER_START_URL="$START_URL" \
   "$APP_BIN" >/tmp/verde-macos-wkwebview-runtime.log 2>&1 &
 APP_PID="$!"
@@ -97,7 +87,6 @@ if [[ -z "$STATUS_JSON" ]]; then
   exit 1
 fi
 
-assert_no_native_webview_helper_processes
 
 STATUS_JSON="$STATUS_JSON" python3 - <<'PY'
 import json
@@ -117,4 +106,3 @@ PY
 
 cleanup
 APP_PID=""
-assert_no_native_webview_helper_processes

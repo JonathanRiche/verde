@@ -379,6 +379,7 @@ fn mapEventKind(raw_kind: c_int) ipc.EventKind {
         7 => .eval_result,
         9 => .context_menu,
         10 => .context_menu_dismissed,
+        11 => .cursor_changed,
         else => .failed,
     };
 }

@@ -7,11 +7,10 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window");
     const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: sdl_gpu");
-    const browser_backend = b.option(BrowserBackendKind, "browser-backend", "Browser backend: native_webview, cef, or stub");
+    const browser_backend = b.option(BrowserBackendKind, "browser-backend", "Browser backend: native_webview or stub");
     const terminal_backend = b.option(bool, "terminal_backend", "Enable the native terminal backend");
     const local_ipc = b.option(bool, "local_ipc", "Enable the local live-control IPC backend");
     const windows_integrations = b.option(bool, "windows_integrations", "Enable native Windows integrations");
-    const cef_sdk_path = b.option([]const u8, "cef-sdk-path", "Path to a CEF binary distribution for the embedded browser pane");
     const build_fff = b.option(bool, "build-fff", "Build the vendored fff-c library with Cargo");
     const fff_cargo_target = b.option([]const u8, "fff-cargo-target", "Rust target triple used to build fff-c");
     const fff_lib_dir = b.option([]const u8, "fff-lib-dir", "Directory containing the fff-c link library");
@@ -26,7 +25,6 @@ pub fn build(b: *std.Build) void {
     const webview2_include_dir = b.option([]const u8, "webview2-include-dir", "Directory containing WebView2.h");
     const webview2_loader_lib = b.option([]const u8, "webview2-loader-lib", "Exact WebView2 loader import library");
     const webview2_loader_dll = b.option([]const u8, "webview2-loader-dll", "Path to WebView2Loader.dll to install beside the desktop executable");
-    const cef_stub_preview = b.option(bool, "cef-stub-preview", "Use the in-app CEF pane scaffold without a real CEF SDK");
 
     const build_cmd = addDesktopCommand(b, optimize, .{
         .subcommand = null,
@@ -39,7 +37,6 @@ pub fn build(b: *std.Build) void {
         .terminal_backend = terminal_backend,
         .local_ipc = local_ipc,
         .windows_integrations = windows_integrations,
-        .cef_sdk_path = cef_sdk_path,
         .build_fff = build_fff,
         .fff_cargo_target = fff_cargo_target,
         .fff_lib_dir = fff_lib_dir,
@@ -54,7 +51,6 @@ pub fn build(b: *std.Build) void {
         .webview2_include_dir = webview2_include_dir,
         .webview2_loader_lib = webview2_loader_lib,
         .webview2_loader_dll = webview2_loader_dll,
-        .cef_stub_preview = cef_stub_preview,
     });
     b.default_step.dependOn(&build_cmd.step);
 
@@ -69,7 +65,6 @@ pub fn build(b: *std.Build) void {
         .terminal_backend = terminal_backend,
         .local_ipc = local_ipc,
         .windows_integrations = windows_integrations,
-        .cef_sdk_path = cef_sdk_path,
         .build_fff = build_fff,
         .fff_cargo_target = fff_cargo_target,
         .fff_lib_dir = fff_lib_dir,
@@ -84,7 +79,6 @@ pub fn build(b: *std.Build) void {
         .webview2_include_dir = webview2_include_dir,
         .webview2_loader_lib = webview2_loader_lib,
         .webview2_loader_dll = webview2_loader_dll,
-        .cef_stub_preview = cef_stub_preview,
     });
     const run_step = b.step("run", "Run the desktop app from the repo root");
     run_step.dependOn(&run_cmd.step);
@@ -103,7 +97,6 @@ pub fn build(b: *std.Build) void {
         .terminal_backend = terminal_backend,
         .local_ipc = local_ipc,
         .windows_integrations = windows_integrations,
-        .cef_sdk_path = cef_sdk_path,
         .build_fff = build_fff,
         .fff_cargo_target = fff_cargo_target,
         .fff_lib_dir = fff_lib_dir,
@@ -118,7 +111,6 @@ pub fn build(b: *std.Build) void {
         .webview2_include_dir = webview2_include_dir,
         .webview2_loader_lib = webview2_loader_lib,
         .webview2_loader_dll = webview2_loader_dll,
-        .cef_stub_preview = cef_stub_preview,
     });
     const test_step = b.step("test", "Run desktop tests from the repo root");
     test_step.dependOn(&test_cmd.step);
@@ -134,7 +126,6 @@ pub fn build(b: *std.Build) void {
         .terminal_backend = terminal_backend,
         .local_ipc = local_ipc,
         .windows_integrations = windows_integrations,
-        .cef_sdk_path = cef_sdk_path,
         .build_fff = build_fff,
         .fff_cargo_target = fff_cargo_target,
         .fff_lib_dir = fff_lib_dir,
@@ -149,7 +140,6 @@ pub fn build(b: *std.Build) void {
         .webview2_include_dir = webview2_include_dir,
         .webview2_loader_lib = webview2_loader_lib,
         .webview2_loader_dll = webview2_loader_dll,
-        .cef_stub_preview = cef_stub_preview,
     });
     const test_compile_step = b.step("test-compile", "Compile desktop tests without running them");
     test_compile_step.dependOn(&test_compile_cmd.step);
@@ -166,7 +156,6 @@ const DesktopCommandOptions = struct {
     terminal_backend: ?bool = null,
     local_ipc: ?bool = null,
     windows_integrations: ?bool = null,
-    cef_sdk_path: ?[]const u8 = null,
     build_fff: ?bool = null,
     fff_cargo_target: ?[]const u8 = null,
     fff_lib_dir: ?[]const u8 = null,
@@ -181,7 +170,6 @@ const DesktopCommandOptions = struct {
     webview2_include_dir: ?[]const u8 = null,
     webview2_loader_lib: ?[]const u8 = null,
     webview2_loader_dll: ?[]const u8 = null,
-    cef_stub_preview: ?bool = null,
 };
 
 fn addDesktopCommand(
@@ -215,9 +203,6 @@ fn addDesktopCommand(
     appendBoolOption(b, &argv, "terminal_backend", options.terminal_backend);
     appendBoolOption(b, &argv, "local_ipc", options.local_ipc);
     appendBoolOption(b, &argv, "windows_integrations", options.windows_integrations);
-    if (options.cef_sdk_path) |value| {
-        argv.append(b.allocator, b.fmt("-Dcef-sdk-path={s}", .{value})) catch @panic("OOM");
-    }
     if (options.build_fff) |value| {
         argv.append(b.allocator, b.fmt("-Dbuild-fff={}", .{value})) catch @panic("OOM");
     }
@@ -236,9 +221,6 @@ fn addDesktopCommand(
     appendStringOption(b, &argv, "webview2-include-dir", options.webview2_include_dir);
     appendStringOption(b, &argv, "webview2-loader-lib", options.webview2_loader_lib);
     appendStringOption(b, &argv, "webview2-loader-dll", options.webview2_loader_dll);
-    if (options.cef_stub_preview) |value| {
-        argv.append(b.allocator, b.fmt("-Dcef-stub-preview={}", .{value})) catch @panic("OOM");
-    }
     appendInstallArgs(b, &argv);
 
     const cmd = b.addSystemCommand(argv.items);
@@ -316,6 +298,5 @@ const PaletteRendererBackend = enum {
 
 const BrowserBackendKind = enum {
     native_webview,
-    cef,
     stub,
 };

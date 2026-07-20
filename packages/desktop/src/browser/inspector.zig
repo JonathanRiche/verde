@@ -31,10 +31,6 @@ pub fn enableScriptAlloc(allocator: std.mem.Allocator, mode: browser_runtime.Ins
         \\      window.__VERDE_BROWSER_IPC__.postMessage(payload);
         \\      return true;
         \\    }}
-        \\    if (window.__VERDE_CEF_IPC__ && typeof window.__VERDE_CEF_IPC__.postMessage === "function") {{
-        \\      window.__VERDE_CEF_IPC__.postMessage(payload);
-        \\      return true;
-        \\    }}
         \\    if (window.verde && typeof window.verde.postMessage === "function") {{
         \\      window.verde.postMessage(payload);
         \\      return true;

@@ -199,21 +199,9 @@ $ChecksumLines = @(
 )
 Set-Content -LiteralPath (Join-Path $PackageRoot "SHA256SUMS.txt") -Value $ChecksumLines -Encoding UTF8
 
-$ForbiddenNames = @(
-  "libcef.dll",
-  "verde-browser-cef.exe",
-  "verde-browser-cef-process.exe",
-  "chrome_100_percent.pak",
-  "chrome_200_percent.pak",
-  "resources.pak",
-  "icudtl.dat"
-)
 foreach ($Entry in (Get-ChildItem -LiteralPath $PackageRoot -Recurse -Force)) {
   if ($Entry.Extension -in @(".pdb", ".lib", ".a")) {
     throw "Windows package unexpectedly contains a development artifact: $($Entry.FullName)"
-  }
-  if ($Entry.Name -in $ForbiddenNames) {
-    throw "Windows native package unexpectedly contains CEF payload: $($Entry.FullName)"
   }
 }
 

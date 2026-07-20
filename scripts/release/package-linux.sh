@@ -98,30 +98,6 @@ copy_runtime_library() {
   fi
 }
 
-assert_no_cef_payload() {
-  local root_dir="$1"
-  local cef_payload=(
-    "verde-browser-cef"
-    "verde-browser-cef-process"
-    "libcef.so"
-    "chrome-sandbox"
-    "chrome_100_percent.pak"
-    "chrome_200_percent.pak"
-    "resources.pak"
-    "icudtl.dat"
-    "v8_context_snapshot.bin"
-    "vk_swiftshader_icd.json"
-    "locales"
-  )
-
-  for name in "${cef_payload[@]}"; do
-    if [[ -e "$root_dir/bin/$name" ]]; then
-      echo "native webview package unexpectedly contains CEF payload: bin/$name" >&2
-      exit 1
-    fi
-  done
-}
-
 write_linux_launcher() {
   local launcher_path="$1"
 
@@ -178,7 +154,6 @@ copy_runtime_library "libSDL3_ttf.so" "$PACKAGE_ROOT/bin"
 if [[ -x "$PREFIX_DIR/bin/verde-browser-linux" ]]; then
   install -m 755 "$PREFIX_DIR/bin/verde-browser-linux" "$PACKAGE_ROOT/bin/verde-browser-linux"
 fi
-assert_no_cef_payload "$PACKAGE_ROOT"
 write_linux_launcher "$PACKAGE_ROOT/bin/verde-launch"
 install -m 644 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" "$PACKAGE_ROOT/share/pixmaps/verde.png"
 install -m 644 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" "$PACKAGE_ROOT/share/icons/hicolor/256x256/apps/verde.png"

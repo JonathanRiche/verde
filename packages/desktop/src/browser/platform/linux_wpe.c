@@ -43,6 +43,7 @@ enum verde_browser_linux_event_kind {
     VERDE_BROWSER_LINUX_EVENT_FAILED = 8,
     VERDE_BROWSER_LINUX_EVENT_CONTEXT_MENU = 9,
     VERDE_BROWSER_LINUX_EVENT_CONTEXT_MENU_DISMISSED = 10,
+    VERDE_BROWSER_LINUX_EVENT_CURSOR_CHANGED = 11,
 };
 
 enum verde_browser_linux_modifier_bits {
@@ -78,6 +79,7 @@ struct verde_browser_linux {
     struct verde_browser_linux_context_menu_item context_items[VERDE_BROWSER_LINUX_CONTEXT_MENU_ITEM_MAX];
     guint context_item_count;
     GQueue *events;
+    char *cursor_shape;
 
     EGLDisplay egl_display;
     EGLContext egl_context;
@@ -156,6 +158,30 @@ static void verde_browser_linux_queue_event(struct verde_browser_linux *browser,
     event->kind = kind;
     event->payload = payload != NULL ? g_strdup(payload) : NULL;
     g_queue_push_tail(browser->events, event);
+}
+
+static const char *verde_browser_linux_normalize_cursor_shape(const char *shape) {
+    static const char *const shapes[] = {
+        "default", "pointer", "text", "vertical_text", "crosshair", "wait", "progress", "help",
+        "context_menu", "cell", "alias", "copy", "move", "grab", "grabbing", "no_drop",
+        "not_allowed", "col_resize", "row_resize", "ew_resize", "ns_resize", "nwse_resize",
+        "nesw_resize", "n_resize", "ne_resize", "e_resize", "se_resize", "s_resize", "sw_resize",
+        "w_resize", "nw_resize", "all_scroll", "zoom_in", "zoom_out", "hidden", "custom",
+    };
+    if (shape == NULL) return "default";
+    for (size_t index = 0; index < G_N_ELEMENTS(shapes); index += 1) {
+        if (g_str_equal(shape, shapes[index])) return shapes[index];
+    }
+    return "default";
+}
+
+static void verde_browser_linux_queue_cursor(struct verde_browser_linux *browser, const char *shape) {
+    if (browser == NULL) return;
+    const char *normalized = verde_browser_linux_normalize_cursor_shape(shape);
+    if (g_strcmp0(browser->cursor_shape, normalized) == 0) return;
+    g_free(browser->cursor_shape);
+    browser->cursor_shape = g_strdup(normalized);
+    verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_CURSOR_CHANGED, browser->cursor_shape);
 }
 
 static gboolean verde_browser_linux_env_has_value(const char *name) {
@@ -720,6 +746,14 @@ static void verde_browser_linux_on_script_message(WebKitUserContentManager *mana
     g_free(payload);
 }
 
+static void verde_browser_linux_on_cursor_message(WebKitUserContentManager *manager, JSCValue *value, gpointer user_data) {
+    struct verde_browser_linux *browser = user_data;
+    char *payload = verde_browser_linux_value_to_json_or_string(value);
+    (void)manager;
+    verde_browser_linux_queue_cursor(browser, payload);
+    g_free(payload);
+}
+
 static void verde_browser_linux_on_uri_changed(GObject *object, GParamSpec *pspec, gpointer user_data) {
     struct verde_browser_linux *browser = user_data;
     const char *uri = webkit_web_view_get_uri(WEBKIT_WEB_VIEW(object));
@@ -740,6 +774,9 @@ static void verde_browser_linux_on_load_changed(WebKitWebView *web_view, WebKitL
     struct verde_browser_linux *browser = user_data;
     (void)web_view;
     verde_browser_linux_mark_active_for(browser, VERDE_BROWSER_LINUX_ACTIVE_AFTER_LOAD_US);
+    if (load_event == WEBKIT_LOAD_STARTED) {
+        verde_browser_linux_queue_cursor(browser, "default");
+    }
     if (load_event == WEBKIT_LOAD_FINISHED) {
         verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_DOCUMENT_LOADED, NULL);
     }
@@ -869,6 +906,7 @@ static void verde_browser_linux_destroy_exportable(gpointer user_data) {
 struct verde_browser_linux *verde_browser_linux_create(void) {
     struct verde_browser_linux *browser = g_new0(struct verde_browser_linux, 1);
     browser->events = g_queue_new();
+    browser->cursor_shape = g_strdup("default");
     browser->target_width = 1280;
     browser->target_height = 720;
     browser->device_scale = 1.0;
@@ -919,7 +957,6 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
         "(function(){"
         "const bridge={postMessage:function(payload){window.webkit.messageHandlers.verde.postMessage(String(payload));}};"
         "window.__VERDE_BROWSER_IPC__=bridge;"
-        "window.__VERDE_CEF_IPC__=bridge;"
         "window.verde=bridge;"
         "})();",
         WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
@@ -929,9 +966,81 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
     );
     webkit_user_content_manager_add_script(browser->content_manager, bridge_script);
     webkit_user_script_unref(bridge_script);
+
+    // The legacy libwpe exportable API does not expose WebKit's selected
+    // cursor. Observe computed cursor values inside every frame instead.
+    WebKitUserScript *cursor_script = webkit_user_script_new(
+        "(function(){"
+        "if(window.__VERDE_CURSOR_OBSERVER__)return;"
+        "window.__VERDE_CURSOR_OBSERVER__=true;"
+        "const channel=window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.verdeCursor;"
+        "if(!channel)return;"
+        "const names={"
+        "'default':'default','pointer':'pointer','text':'text','vertical-text':'vertical_text',"
+        "'crosshair':'crosshair','wait':'wait','progress':'progress','help':'help',"
+        "'context-menu':'context_menu','cell':'cell','alias':'alias','copy':'copy','move':'move',"
+        "'grab':'grab','grabbing':'grabbing','no-drop':'no_drop','not-allowed':'not_allowed',"
+        "'col-resize':'col_resize','row-resize':'row_resize','ew-resize':'ew_resize','ns-resize':'ns_resize',"
+        "'nwse-resize':'nwse_resize','nesw-resize':'nesw_resize','n-resize':'n_resize',"
+        "'ne-resize':'ne_resize','e-resize':'e_resize','se-resize':'se_resize','s-resize':'s_resize',"
+        "'sw-resize':'sw_resize','w-resize':'w_resize','nw-resize':'nw_resize','all-scroll':'all_scroll',"
+        "'zoom-in':'zoom_in','zoom-out':'zoom_out','none':'hidden',"
+        "'-webkit-grab':'grab','-webkit-grabbing':'grabbing','-webkit-zoom-in':'zoom_in','-webkit-zoom-out':'zoom_out'"
+        "};"
+        "const clickable=\"a[href],area[href],button:not(:disabled),summary,[role='button'],[onclick],"
+        "input[type='button']:not(:disabled),input[type='submit']:not(:disabled),"
+        "input[type='reset']:not(:disabled),input[type='image']:not(:disabled)\";"
+        "const editable=\"textarea,input:not([type]),input[type='text'],input[type='search'],"
+        "input[type='email'],input[type='url'],input[type='tel'],input[type='password'],"
+        "input[type='number'],[contenteditable]:not([contenteditable='false'])\";"
+        "function automatic(element,event){"
+        "if(element.closest(clickable))return 'pointer';"
+        "if(element.closest(editable))return 'text';"
+        "let node=null;"
+        "if(document.caretPositionFromPoint){const position=document.caretPositionFromPoint(event.clientX,event.clientY);node=position&&position.offsetNode;}"
+        "else if(document.caretRangeFromPoint){const range=document.caretRangeFromPoint(event.clientX,event.clientY);node=range&&range.startContainer;}"
+        "if(node&&node.nodeType===Node.TEXT_NODE){"
+        "const parent=node.parentElement;"
+        "if(parent&&getComputedStyle(parent).userSelect!=='none')return 'text';"
+        "}"
+        "return 'default';"
+        "}"
+        "function normalize(element,event){"
+        "let value=getComputedStyle(element).cursor.trim().toLowerCase();"
+        "if(value.indexOf('url(')!==-1){const comma=value.lastIndexOf(',');value=comma===-1?'default':value.slice(comma+1).trim();}"
+        "if(value==='auto')return automatic(element,event);"
+        "return names[value]||'default';"
+        "}"
+        "let last='';"
+        "function update(event){"
+        "const element=event.target instanceof Element?event.target:null;"
+        "if(!element)return;"
+        "if(element.localName==='iframe'){last='';return;}"
+        "const next=normalize(element,event);"
+        "if(next===last)return;"
+        "last=next;"
+        "channel.postMessage(next);"
+        "}"
+        "addEventListener('mouseout',function(event){if(!event.relatedTarget)last='';},true);"
+        "for(const name of ['pointerover','pointermove','pointerdown','pointerup','pointercancel',"
+        "'mouseover','mousemove','mousedown','mouseup','dragstart','dragover','dragend','drop'])"
+        "addEventListener(name,update,true);"
+        "})();",
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+        NULL,
+        NULL
+    );
+    webkit_user_content_manager_add_script(browser->content_manager, cursor_script);
+    webkit_user_script_unref(cursor_script);
+
     g_signal_connect(browser->content_manager, "script-message-received::verde", G_CALLBACK(verde_browser_linux_on_script_message), browser);
     if (!webkit_user_content_manager_register_script_message_handler(browser->content_manager, "verde", NULL)) {
         verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "Failed to register WPE script message handler.");
+    }
+    g_signal_connect(browser->content_manager, "script-message-received::verdeCursor", G_CALLBACK(verde_browser_linux_on_cursor_message), browser);
+    if (!webkit_user_content_manager_register_script_message_handler(browser->content_manager, "verdeCursor", NULL)) {
+        verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "Failed to register WPE cursor message handler.");
     }
 
     g_signal_connect(browser->web_view, "notify::uri", G_CALLBACK(verde_browser_linux_on_uri_changed), browser);
@@ -952,6 +1061,7 @@ void verde_browser_linux_destroy(struct verde_browser_linux *browser) {
     }
     if (browser->content_manager != NULL) {
         webkit_user_content_manager_unregister_script_message_handler(browser->content_manager, "verde", NULL);
+        webkit_user_content_manager_unregister_script_message_handler(browser->content_manager, "verdeCursor", NULL);
         g_object_unref(browser->content_manager);
     }
     verde_browser_linux_clear_context_menu(browser, FALSE);
@@ -964,6 +1074,7 @@ void verde_browser_linux_destroy(struct verde_browser_linux *browser) {
     }
     if (browser->web_view != NULL) g_object_unref(browser->web_view);
     if (browser->webkit_backend != NULL) g_object_unref(browser->webkit_backend);
+    g_free(browser->cursor_shape);
     g_free(browser->rgba_scratch);
     verde_browser_linux_deinit_egl(browser);
     verde_browser_linux_unmap_frame_slots(browser);

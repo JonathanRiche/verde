@@ -47,14 +47,6 @@ run = "bash -lc 'case \"$(uname -s)\" in Darwin) scripts/dev/check-macos-wkwebvi
 description = "Runs the guided macOS WKWebView physical-input sign-off flow."
 run = "bash -lc 'case \"$(uname -s)\" in Darwin) scripts/dev/run-macos-wkwebview-manual-signoff.sh ;; *) echo \"mac-webview-manual-signoff is only supported on macOS\" >&2; exit 1 ;; esac'"
 
-[tasks.dev-cef]
-description = "Builds and runs Verde with the legacy CEF browser backend."
-run = "VERDE_BROWSER_BACKEND=cef VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && source scripts/release/cef-common.sh && verde_cef_ensure_sdk \"$(verde_cef_host_os)\" \"$(uname -m)\" >/dev/null && zig build run --release=safe -Dbrowser-backend=cef -Dcef-sdk-path=\"$VERDE_CEF_SDK_PATH_RESOLVED\"'"
-
-[tasks.build-cef]
-description = "Builds Verde with the legacy CEF browser backend."
-run = "VERDE_BROWSER_BACKEND=cef VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && case \"$(uname -s)\" in Darwin) VERDE_BROWSER_BACKEND=cef scripts/release/install-macos-local.sh ;; Linux) scripts/release/install-linux-local-cef.sh ;; *) echo \"unsupported build host: $(uname -s)\" >&2; exit 1 ;; esac'"
-
 [tasks.dev-sdl-gpu]
 description = "Builds and runs Verde with the experimental SDL_GPU palette renderer and WPE on Linux."
 run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && VERDE_BROWSER_LINUX_WPE=1 zig build run --release=safe -Dpalette-renderer=sdl_gpu -Dbrowser-backend=native_webview'"

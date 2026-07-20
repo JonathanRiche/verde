@@ -67,12 +67,12 @@ The 15-PageUp capture keeps the sidebar, transcript, and composer text readable 
 Use this checklist for the native webview migration. For the current macOS
 WKWebView handoff, `mac_webview.md` is the authoritative signoff document.
 
-1. Start the default native webview path without downloading CEF:
+1. Start the default native webview path:
    ```bash
    mise run dev
    ```
 
-2. Verify the default native install payload excludes CEF:
+2. Verify the default native install payload:
    ```bash
    scripts/dev/check-native-webview-install.sh
    ```
@@ -127,7 +127,7 @@ WKWebView handoff, `mac_webview.md` is the authoritative signoff document.
       mise run check-mac-webview
       ```
       This refreshes the installed local macOS app before checking installed
-      Swift symbols, codesign, CEF-free contents, source-level native-keyboard
+      Swift symbols, codesign, app contents, source-level native-keyboard
       ownership checks for the doubled-key fix, runtime startup, and the
       manual-evidence validator self-test for doubled text, address-focus,
       inspector status, URL-match, and generated unavailable-evidence handling.

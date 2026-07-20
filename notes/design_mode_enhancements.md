@@ -272,7 +272,7 @@ browser via the bundled inspector:
   zlib via `std.compress.flate`), stores it under
   `{pref_path}/inspector-captures/`, and attaches it through the existing
   multi-image prompt contract. Backends without a CPU frame gracefully send
-  text-only context (`copyFramePixels` is null on macOS/Windows/CEF/stub).
+  text-only context (`copyFramePixels` is null on macOS, Windows, and stub builds).
 - **Pending state on the bubble.** Submit disables the input, dims the panel,
   and shows a spinner; the host acks via a new
   `InspectorHandle.notifyPromptResult("sent" | "drafted" | "failed", message)`
@@ -320,7 +320,7 @@ browser via the bundled inspector:
 - **Compact transcript rendering** for design-mode messages: collapse the
   selection-context block so the card reads "crop + caption" like Factory's,
   instead of showing the full context text.
-- **Screenshot capture on macOS/Windows/CEF** backends (needs a per-backend
+- **Screenshot capture on macOS/Windows** backends (needs a per-backend
   snapshot API; only the Linux WPE offscreen path has CPU frames today).
 - **Capture race hardening**: the overlay hides for two rAFs before submit,
   which in practice yields a clean frame, but the host captures "latest frame"

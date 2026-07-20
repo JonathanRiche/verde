@@ -35,4 +35,4 @@ The playground exercises:
 - draw-box mode for visible top-level region selection
 - draw-freeform mode for pencil-style region selection
 - fixed prompt textarea overlay
-- structured event emission intended for later Zig/CEF integration
+- structured event emission for the Zig browser bridge

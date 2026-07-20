@@ -74,11 +74,6 @@ pub const Controller = struct {
     }
 
     /// The stub does not use an external browser SDK.
-    pub fn sdkConfigured(self: *const Controller) bool {
-        _ = self;
-        return false;
-    }
-
     /// The stub has no real pane session.
     pub fn paneSessionId(self: *const Controller) ?browser_types.SessionId {
         _ = self;

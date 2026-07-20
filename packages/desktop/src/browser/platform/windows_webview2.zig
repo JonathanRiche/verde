@@ -35,6 +35,7 @@ extern fn verde_windows_webview2_reload(handle: ?*anyopaque) c_int;
 extern fn verde_windows_webview2_focus(handle: ?*anyopaque) c_int;
 extern fn verde_windows_webview2_blur(handle: ?*anyopaque) c_int;
 extern fn verde_windows_webview2_has_focus(handle: ?*anyopaque) c_int;
+extern fn verde_windows_webview2_owns_cursor(handle: ?*anyopaque) c_int;
 extern fn verde_windows_webview2_is_ready(handle: ?*anyopaque) c_int;
 extern fn verde_windows_webview2_pop_event(handle: ?*anyopaque, kind: *c_int, payload: *?[*:0]u8) c_int;
 extern fn verde_windows_webview2_free_string(value: ?[*:0]u8) void;
@@ -82,11 +83,6 @@ pub const Controller = struct {
     }
 
     pub fn supportsPopout(self: *const Controller) bool {
-        _ = self;
-        return false;
-    }
-
-    pub fn sdkConfigured(self: *const Controller) bool {
         _ = self;
         return false;
     }
@@ -193,6 +189,12 @@ pub const Controller = struct {
     pub fn hasFocus(self: *const Controller) bool {
         const handle = self.handle orelse return false;
         return verde_windows_webview2_has_focus(handle) != 0;
+    }
+
+    /// Reports whether Win32 currently hit-tests the pointer into WebView2's child window.
+    pub fn ownsCursor(self: *const Controller) bool {
+        const handle = self.handle orelse return false;
+        return verde_windows_webview2_owns_cursor(handle) != 0;
     }
 
     pub fn presentationKind(self: *const Controller) browser_types.PresentationKind {

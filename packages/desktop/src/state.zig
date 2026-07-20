@@ -4861,6 +4861,7 @@ pub const AppState = struct {
     browser_pane_max: [2]f32,
     browser_pane_input_size: [2]f32,
     browser_pane_hovered: bool,
+    browser_cursor_shape: browser_runtime.CursorShape,
     app_window_screen_origin: [2]i32,
     app_window_display_scale: f32,
     browser_surface_suspended_for_palette_overlay: bool,
@@ -5144,6 +5145,7 @@ pub const AppState = struct {
             .browser_pane_max = .{ 0.0, 0.0 },
             .browser_pane_input_size = .{ 0.0, 0.0 },
             .browser_pane_hovered = false,
+            .browser_cursor_shape = .default,
             .app_window_screen_origin = .{ 0, 0 },
             .app_window_display_scale = 1.0,
             .browser_surface_suspended_for_palette_overlay = false,
@@ -12137,6 +12139,7 @@ pub const AppState = struct {
         self.browser_surface_suspended_for_empty_state = false;
         self.unfocusBrowserPane();
         self.browser_pane_hovered = false;
+        self.browser_cursor_shape = .default;
         self.browser_address_focused = false;
         self.browser_inspector_menu_open = false;
         self.browser_state.controller.shutdown();
@@ -12724,6 +12727,26 @@ pub const AppState = struct {
             y <= self.browser_pane_max[1];
     }
 
+    /// Returns the browser-requested cursor only for texture-backed content under the pointer.
+    pub fn browserCursorShapeAtPoint(self: *const AppState, x: f32, y: f32) ?browser_runtime.CursorShape {
+        if (!self.browserPaneContains(x, y)) return null;
+        return switch (self.browser_state.controller.presentationKind()) {
+            .snapshot_texture, .offscreen_texture => self.browser_cursor_shape,
+            .native_child_view, .native_wayland_surface, .helper_window, .stub => null,
+        };
+    }
+
+    /// Reports when WKWebView or WebView2 should control the shared OS cursor.
+    pub fn nativeBrowserOwnsCursor(self: *const AppState) bool {
+        if (!self.isBrowserVisible() or
+            self.browser_surface_suspended_for_layout or
+            self.browser_surface_suspended_for_empty_state or
+            self.browser_surface_suspended_for_palette_overlay or
+            self.browserBlockedByPaletteOverlay()) return false;
+        if (self.browser_state.controller.presentationKind() != .native_child_view) return false;
+        return self.browser_state.controller.nativeSurfaceOwnsCursor();
+    }
+
     /// Forwards browser-pane pointer input after converting it into pane-local coordinates.
     pub fn handleBrowserMouse(self: *AppState, event: browser_runtime.MouseEvent) bool {
         if (!self.isBrowserVisible()) return false;
@@ -13087,6 +13110,9 @@ pub const AppState = struct {
                 .document_loaded => {
                     self.reapplyBrowserInspectorAfterLoad();
                     self.runBrowserStartupEvalIfRequested();
+                },
+                .cursor_changed => |shape| {
+                    self.browser_cursor_shape = shape;
                 },
                 .js_message => |message| {
                     const inspector_message = isInspectorBridgeMessage(message);
@@ -17728,7 +17754,6 @@ pub const AppState = struct {
             \\  const post=(text)=>{
             \\    const payload=JSON.stringify({source:'verde-browser-clipboard',text:String(text||''),cut:true});
             \\    if(window.__VERDE_BROWSER_IPC__&&typeof window.__VERDE_BROWSER_IPC__.postMessage==='function'){window.__VERDE_BROWSER_IPC__.postMessage(payload);return;}
-            \\    if(window.__VERDE_CEF_IPC__&&typeof window.__VERDE_CEF_IPC__.postMessage==='function'){window.__VERDE_CEF_IPC__.postMessage(payload);return;}
             \\    if(window.verde&&typeof window.verde.postMessage==='function'){window.verde.postMessage(payload);return;}
             \\    if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.verde){window.webkit.messageHandlers.verde.postMessage(payload);}
             \\  };
@@ -17763,7 +17788,6 @@ pub const AppState = struct {
             \\  const post=(text)=>{
             \\    const payload=JSON.stringify({source:'verde-browser-clipboard',text:String(text||''),cut:false});
             \\    if(window.__VERDE_BROWSER_IPC__&&typeof window.__VERDE_BROWSER_IPC__.postMessage==='function'){window.__VERDE_BROWSER_IPC__.postMessage(payload);return;}
-            \\    if(window.__VERDE_CEF_IPC__&&typeof window.__VERDE_CEF_IPC__.postMessage==='function'){window.__VERDE_CEF_IPC__.postMessage(payload);return;}
             \\    if(window.verde&&typeof window.verde.postMessage==='function'){window.verde.postMessage(payload);return;}
             \\    if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.verde){window.webkit.messageHandlers.verde.postMessage(payload);}
             \\  };

@@ -297,7 +297,6 @@ static void verde_win_install_bridge(VerdeWinWebView *browser) {
             L"bridge={postMessage:function(payload){window.chrome.webview."
             L"postMessage(String(payload));}};"
             L"window.__VERDE_BROWSER_IPC__=bridge;"
-            L"window.__VERDE_CEF_IPC__=bridge;"
             L"window.verde=bridge;"
             L"})();";
     browser->webview->AddScriptToExecuteOnDocumentCreated(bridge_script, nullptr);
@@ -861,6 +860,16 @@ extern "C" int verde_windows_webview2_has_focus(void *handle) {
     if (browser == nullptr || browser->host == nullptr) return 0;
     const HWND focused = GetFocus();
     return focused == browser->host || (focused != nullptr && IsChild(browser->host, focused)) ? 1 : 0;
+}
+
+extern "C" int verde_windows_webview2_owns_cursor(void *handle) {
+    auto *browser = static_cast<VerdeWinWebView *>(handle);
+    if (browser == nullptr || browser->host == nullptr || !browser->visible ||
+        !IsWindowVisible(browser->host)) return 0;
+    POINT point{};
+    if (!GetCursorPos(&point)) return 0;
+    const HWND hit = WindowFromPoint(point);
+    return hit == browser->host || (hit != nullptr && IsChild(browser->host, hit)) ? 1 : 0;
 }
 
 extern "C" int verde_windows_webview2_pop_event(void *handle, int *kind,

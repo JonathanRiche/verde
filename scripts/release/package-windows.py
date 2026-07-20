@@ -24,15 +24,6 @@ DEPENDENCY_LICENSES = (
     "WebView2-LICENSE.txt",
     "WebView2-NOTICE.txt",
 )
-FORBIDDEN_PACKAGE_NAMES = {
-    "chrome_100_percent.pak",
-    "chrome_200_percent.pak",
-    "icudtl.dat",
-    "libcef.dll",
-    "resources.pak",
-    "verde-browser-cef-process.exe",
-    "verde-browser-cef.exe",
-}
 FORBIDDEN_FFF_MARKERS = (
     b"verde_fff_stub",
     b"VERDE_FFF_STUB",
@@ -300,8 +291,6 @@ def verify_package_tree(root: Path, expected_version: str) -> dict[str, object]:
             continue
         if path.suffix.lower() in {".a", ".lib", ".pdb"}:
             raise RuntimeError(f"package contains a development artifact: {path}")
-        if path.name.lower() in FORBIDDEN_PACKAGE_NAMES:
-            raise RuntimeError(f"native Windows package contains a CEF artifact: {path}")
 
     installer = require_file(root / "install.ps1", "preview installer").read_text(encoding="utf-8")
     for marker in (APP_USER_MODEL_ID, "9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3", "PropertyId = 5"):

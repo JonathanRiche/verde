@@ -60,23 +60,6 @@ set_macos_build_version() {
   chmod 755 "$binary"
 }
 
-assert_no_cef_payload() {
-  local app_dir="$1"
-  local macos_dir="$app_dir/Contents/MacOS"
-  local cef_payload=(
-    "verde-browser-cef"
-    "verde-browser-cef-process"
-    "Chromium Embedded Framework.framework"
-  )
-
-  for name in "${cef_payload[@]}"; do
-    if [[ -e "$macos_dir/$name" ]]; then
-      echo "native webview app unexpectedly contains CEF payload: Contents/MacOS/$name" >&2
-      exit 1
-    fi
-  done
-}
-
 cd "$REPO_ROOT/packages/desktop"
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-$MACOS_MIN_VERSION}"
 if [[ -n "${SDKROOT:-}" ]]; then
@@ -114,7 +97,6 @@ mkdir -p \
 install -m 755 "$PREFIX_DIR/bin/verde" "$APP_DIR/Contents/MacOS/verde"
 install -m 755 "$PREFIX_DIR/bin/libfff_c.dylib" "$APP_DIR/Contents/MacOS/libfff_c.dylib"
 ditto "$PREFIX_DIR/bin/SDL3.framework" "$APP_DIR/Contents/MacOS/SDL3.framework"
-assert_no_cef_payload "$APP_DIR"
 install -m 644 "$PREFIX_DIR/share/verde/provider_bridge.mjs" "$APP_DIR/Contents/Resources/provider_bridge.mjs"
 set_macos_build_version "$APP_DIR/Contents/MacOS/verde"
 
