@@ -55,13 +55,18 @@ for symbol in "${required_exports[@]}"; do
   fi
 done
 
-if ! rg -q "addMacOSSwiftWebView\\(b, exe\\)" packages/desktop/build.zig; then
+if ! rg -q "addMacOSSwiftWebView\\(b, exe, target\\.result\\.cpu\\.arch\\)" packages/desktop/build.zig; then
   echo "macOS app build is not wired to addMacOSSwiftWebView" >&2
   exit 1
 fi
 
-if ! rg -q "addMacOSSwiftWebView\\(b, exe_tests\\)" packages/desktop/build.zig; then
+if ! rg -q "addMacOSSwiftWebView\\(b, exe_tests, target\\.result\\.cpu\\.arch\\)" packages/desktop/build.zig; then
   echo "macOS native-webview tests are not wired to addMacOSSwiftWebView" >&2
+  exit 1
+fi
+
+if ! rg -Uq 'if #available\(macOS 13\.3, \*\) \{\n\s+self\.webView\.isInspectable = true' packages/desktop/src/browser/platform/macos_wkwebview.swift; then
+  echo "Swift WKWebView shim does not enable Web Inspector on supported macOS versions" >&2
   exit 1
 fi
 

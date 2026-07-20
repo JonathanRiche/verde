@@ -15,7 +15,7 @@ const db_types = @import("db/types.zig");
 const fff = @import("fff.zig");
 const herdr = @import("herdr.zig");
 const keybinds = @import("keybinds.zig");
-const loop_wakeup = @import("loop_wakeup.zig");
+const loop_wakeup = @import("loop_wakeup");
 const notifier = @import("notifier.zig");
 const platform_paths = @import("platform_paths");
 const platform_runtime = @import("platform_runtime");
@@ -236,6 +236,7 @@ pub const BrowserContextMenuItem = struct {
     enabled: bool,
     separator: bool,
     submenu: bool,
+    parent_index: ?u32,
 };
 
 const BrowserContextMenuPayload = struct {
@@ -250,6 +251,7 @@ const BrowserContextMenuPayloadItem = struct {
     enabled: bool = false,
     separator: bool = false,
     submenu: bool = false,
+    items: []const BrowserContextMenuPayloadItem = &.{},
 };
 
 /// Kinds of expand/collapse cards that share the same per-frame hit list.
@@ -4890,6 +4892,8 @@ pub const AppState = struct {
     browser_context_menu_anchor_x: f32,
     browser_context_menu_anchor_y: f32,
     browser_context_menu_items: std.ArrayList(BrowserContextMenuItem),
+    browser_context_menu_selected_index: ?u32,
+    browser_context_menu_active_parent: ?u32,
     /// Split "Open" header menu (folder / editors); palette workspace chrome only.
     workspace_header_open_menu_open: bool,
     workspace_header_open_menu_pane_id: ?WorkspacePaneId,
@@ -5170,6 +5174,8 @@ pub const AppState = struct {
             .browser_context_menu_anchor_x = 0.0,
             .browser_context_menu_anchor_y = 0.0,
             .browser_context_menu_items = .empty,
+            .browser_context_menu_selected_index = null,
+            .browser_context_menu_active_parent = null,
             .workspace_header_open_menu_open = false,
             .workspace_header_open_menu_pane_id = null,
             .sidebar_context_menu_open = false,
@@ -12809,6 +12815,8 @@ pub const AppState = struct {
         self.browser_context_menu_open = false;
         self.browser_context_menu_anchor_x = 0.0;
         self.browser_context_menu_anchor_y = 0.0;
+        self.browser_context_menu_selected_index = null;
+        self.browser_context_menu_active_parent = null;
     }
 
     pub fn dismissBrowserContextMenu(self: *AppState) void {
@@ -12837,6 +12845,34 @@ pub const AppState = struct {
         };
     }
 
+    fn appendBrowserContextMenuPayloadItems(
+        self: *AppState,
+        items: []const BrowserContextMenuPayloadItem,
+        parent_index: ?u32,
+    ) void {
+        for (items) |item| {
+            const label = self.allocator.dupe(u8, item.label) catch |err| {
+                log.warn("failed to retain browser context menu label: {s}", .{@errorName(err)});
+                continue;
+            };
+            self.browser_context_menu_items.append(self.allocator, .{
+                .index = item.index,
+                .label = label,
+                .enabled = item.enabled,
+                .separator = item.separator,
+                .submenu = item.submenu,
+                .parent_index = parent_index,
+            }) catch |err| {
+                self.allocator.free(label);
+                log.warn("failed to append browser context menu item: {s}", .{@errorName(err)});
+                continue;
+            };
+            if (item.items.len > 0) {
+                self.appendBrowserContextMenuPayloadItems(item.items, item.index);
+            }
+        }
+    }
+
     fn openBrowserContextMenuFromPayload(self: *AppState, payload: []const u8) void {
         var parsed = std.json.parseFromSlice(BrowserContextMenuPayload, self.allocator, payload, .{ .allocate = .alloc_always }) catch |err| {
             log.warn("failed to parse browser context menu payload: {s}", .{@errorName(err)});
@@ -12852,22 +12888,7 @@ pub const AppState = struct {
         self.browser_context_menu_anchor_x = self.browser_pane_min[0] + parsed.value.x * (@max(displayed_width, 1.0) / input_width);
         self.browser_context_menu_anchor_y = self.browser_pane_min[1] + parsed.value.y * (@max(displayed_height, 1.0) / input_height);
 
-        for (parsed.value.items) |item| {
-            const label = self.allocator.dupe(u8, item.label) catch |err| {
-                log.warn("failed to retain browser context menu label: {s}", .{@errorName(err)});
-                continue;
-            };
-            self.browser_context_menu_items.append(self.allocator, .{
-                .index = item.index,
-                .label = label,
-                .enabled = item.enabled,
-                .separator = item.separator,
-                .submenu = item.submenu,
-            }) catch |err| {
-                self.allocator.free(label);
-                log.warn("failed to append browser context menu item: {s}", .{@errorName(err)});
-            };
-        }
+        self.appendBrowserContextMenuPayloadItems(parsed.value.items, null);
         self.browser_context_menu_open = self.browser_context_menu_items.items.len > 0;
         self.browser_address_focused = false;
         self.browser_inspector_menu_open = false;
@@ -13181,6 +13202,12 @@ pub const AppState = struct {
             needs_render = true;
         }
         return needs_render;
+    }
+
+    /// Records browser presentation after the main renderer successfully submits a frame.
+    pub fn noteBrowserFramePresented(self: *AppState) void {
+        if (!self.browser_textures_enabled or !self.isBrowserVisible()) return;
+        self.browser_state.controller.noteFramePresented();
     }
 
     fn pollPendingBrowserDevServer(self: *AppState) bool {

@@ -108,6 +108,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "platform_windows_known_folders", .module = platform_windows_known_folders_module },
         },
     });
+    const loop_wakeup_module = b.createModule(.{
+        .root_source_file = b.path("src/loop_wakeup.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
+        },
+    });
     const chat_markdown = b.createModule(.{
         .root_source_file = b.path("src/ui/chat_markdown.zig"),
         .target = target,
@@ -139,6 +147,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "build_options", .module = build_options_module },
+            .{ .name = "loop_wakeup", .module = loop_wakeup_module },
             .{ .name = "platform_paths", .module = platform_paths_module },
             .{ .name = "platform_runtime", .module = platform_runtime_module },
         },
@@ -191,6 +200,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = build_options_module },
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
+                .{ .name = "loop_wakeup", .module = loop_wakeup_module },
                 .{ .name = "palette", .module = palette_module },
                 .{ .name = "platform_paths", .module = platform_paths_module },
                 .{ .name = "platform_runtime", .module = platform_runtime_module },
@@ -265,6 +275,7 @@ pub fn build(b: *std.Build) void {
                         .{ .name = "build_options", .module = build_options_module },
                         .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                         .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
+                        .{ .name = "loop_wakeup", .module = loop_wakeup_module },
                         .{ .name = "palette", .module = palette_module },
                         .{ .name = "platform_paths", .module = platform_paths_module },
                         .{ .name = "platform_runtime", .module = platform_runtime_module },
@@ -527,6 +538,27 @@ pub fn build(b: *std.Build) void {
     }
     addTestArtifact(b, test_step, browser_contract_tests, target);
     test_compile_step.dependOn(&browser_contract_tests.step);
+    if (target.result.os.tag == .linux and browser_backend == .native_webview) {
+        const linux_browser_helper_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/browser/platform/linux_helper_main.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        linux_browser_helper_tests.root_module.link_libc = true;
+        linux_browser_helper_tests.root_module.addCSourceFile(.{
+            .file = b.path("src/browser/platform/linux_wpe.c"),
+            .flags = &.{"-DVERDE_BROWSER_LINUX_TESTING=1"},
+        });
+        linux_browser_helper_tests.root_module.linkSystemLibrary("wpe-webkit-2.0", .{ .use_pkg_config = .force });
+        linux_browser_helper_tests.root_module.linkSystemLibrary("wpebackend-fdo-1.0", .{ .use_pkg_config = .force });
+        linux_browser_helper_tests.root_module.linkSystemLibrary("egl", .{ .use_pkg_config = .force });
+        linux_browser_helper_tests.root_module.linkSystemLibrary("glesv2", .{ .use_pkg_config = .force });
+        linux_browser_helper_tests.root_module.linkSystemLibrary("javascriptcoregtk-6.0", .{ .use_pkg_config = .force });
+        addTestArtifact(b, test_step, linux_browser_helper_tests, target);
+        test_compile_step.dependOn(&linux_browser_helper_tests.step);
+    }
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
@@ -536,6 +568,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = build_options_module },
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
+                .{ .name = "loop_wakeup", .module = loop_wakeup_module },
                 .{ .name = "palette", .module = palette.module("palette") },
                 .{ .name = "platform_paths", .module = platform_paths_module },
                 .{ .name = "platform_runtime", .module = platform_runtime_module },

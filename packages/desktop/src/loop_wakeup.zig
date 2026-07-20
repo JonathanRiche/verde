@@ -16,6 +16,12 @@ extern fn SDL_RegisterEvents(numevents: c_int) u32;
 var wake_event_type: u32 = 0;
 var wake_pending: std.atomic.Value(bool) = .init(false);
 
+pub const NotifyResult = enum {
+    queued,
+    coalesced,
+    unavailable,
+};
+
 /// Registers the custom SDL event. Call once on the main thread after
 /// sdl.init and before any background thread can call notify().
 pub fn init() void {
@@ -27,14 +33,21 @@ pub fn init() void {
 /// pending. No-op (drops the wake) before init(); callers only mutate state
 /// the main loop will pick up on its fallback timeout anyway.
 pub fn notify() void {
-    if (wake_event_type == 0) return;
-    if (wake_pending.swap(true, .acq_rel)) return;
+    _ = notifyResult();
+}
+
+/// Thread-safe variant that exposes whether an existing wake covered this update.
+pub fn notifyResult() NotifyResult {
+    if (wake_event_type == 0) return .unavailable;
+    if (wake_pending.swap(true, .acq_rel)) return .coalesced;
     var event: sdl.Event = std.mem.zeroes(sdl.Event);
     event.common.type = @enumFromInt(wake_event_type);
     if (!sdl.pushEvent(&event)) {
         // Queue full or filtered: clear the flag so a later notify retries.
         wake_pending.store(false, .release);
+        return .unavailable;
     }
+    return .queued;
 }
 
 /// Returns true when `event` is our wake event and clears the coalescing
@@ -44,4 +57,22 @@ pub fn consume(event: *const sdl.Event) bool {
     if (@intFromEnum(event.type) != wake_event_type) return false;
     wake_pending.store(false, .release);
     return true;
+}
+
+test "wake notifications report unavailable and coalesced states without queueing duplicates" {
+    const previous_type = wake_event_type;
+    const previous_pending = wake_pending.load(.acquire);
+    defer {
+        wake_event_type = previous_type;
+        wake_pending.store(previous_pending, .release);
+    }
+
+    wake_event_type = 0;
+    wake_pending.store(false, .release);
+    try std.testing.expectEqual(NotifyResult.unavailable, notifyResult());
+
+    wake_event_type = 1;
+    wake_pending.store(true, .release);
+    try std.testing.expectEqual(NotifyResult.coalesced, notifyResult());
+    try std.testing.expect(wake_pending.load(.acquire));
 }

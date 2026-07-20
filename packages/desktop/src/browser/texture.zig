@@ -10,6 +10,11 @@ pub const PixelFormat = enum {
     bgra,
 };
 
+pub const UploadResult = enum {
+    uploaded,
+    deferred,
+};
+
 /// One caller-owned CPU copy of the most recent browser frame, used for
 /// screenshot crops (e.g. inspector design-mode selections).
 pub const CopiedFrame = struct {
@@ -75,34 +80,52 @@ pub const PaneTexture = struct {
     }
 
     /// Uploads one RGBA frame into the pane texture.
-    pub fn uploadRgba(self: *PaneTexture, width: u32, height: u32, pixels: []const u8) !void {
+    pub fn uploadRgba(self: *PaneTexture, width: u32, height: u32, pixels: []const u8) !UploadResult {
         std.debug.assert(width > 0 and height > 0);
         std.debug.assert(pixels.len == width * height * 4);
 
-        try self.uploadPixels(width, height, .rgba, pixels);
+        return try self.uploadPixels(width, height, .rgba, pixels, true);
     }
 
     /// Uploads one BGRA frame into the pane texture without an intermediate CPU-side swizzle.
-    pub fn uploadBgra(self: *PaneTexture, width: u32, height: u32, pixels: []const u8) !void {
+    pub fn uploadBgra(self: *PaneTexture, width: u32, height: u32, pixels: []const u8) !UploadResult {
         std.debug.assert(width > 0 and height > 0);
         std.debug.assert(pixels.len == width * height * 4);
 
-        try self.uploadPixels(width, height, .bgra, pixels);
+        return try self.uploadPixels(width, height, .bgra, pixels, true);
+    }
+
+    /// Uploads a BGRA frame whose backend already owns frame pacing.
+    pub fn uploadBgraImmediately(self: *PaneTexture, width: u32, height: u32, pixels: []const u8) !UploadResult {
+        std.debug.assert(width > 0 and height > 0);
+        std.debug.assert(pixels.len == width * height * 4);
+        return try self.uploadPixels(width, height, .bgra, pixels, false);
     }
 
     // Reuses the existing texture storage when the browser viewport size stays stable.
-    fn uploadPixels(self: *PaneTexture, width: u32, height: u32, format: PixelFormat, pixels: []const u8) !void {
+    fn uploadPixels(self: *PaneTexture, width: u32, height: u32, format: PixelFormat, pixels: []const u8, allow_throttle: bool) !UploadResult {
         const upload_fn = external_upload_fn orelse return error.TextureUnavailable;
-        if (self.texture_id != 0 and shouldThrottleExternalUpload(self.last_upload_ms)) return;
+        if (allow_throttle and self.texture_id != 0 and shouldThrottleExternalUpload(self.last_upload_ms)) return .deferred;
         try upload_fn(external_upload_context, self, width, height, format, pixels);
+        return .uploaded;
     }
 };
 
 fn shouldThrottleExternalUpload(last_upload_ms: i64) bool {
+    return shouldThrottleExternalUploadAt(last_upload_ms, monotonicTimestampMs());
+}
+
+fn shouldThrottleExternalUploadAt(last_upload_ms: i64, now_ms: i64) bool {
     if (last_upload_ms == 0) return false;
-    return monotonicTimestampMs() - last_upload_ms < EXTERNAL_BROWSER_UPLOAD_INTERVAL_MS;
+    return now_ms - last_upload_ms < EXTERNAL_BROWSER_UPLOAD_INTERVAL_MS;
 }
 
 fn monotonicTimestampMs() i64 {
     return @intCast(@divTrunc(platform_runtime.monotonicTimestampNs(), std.time.ns_per_ms));
+}
+
+test "external upload throttle reports deferred only inside its interval" {
+    try std.testing.expect(!shouldThrottleExternalUploadAt(0, 100));
+    try std.testing.expect(shouldThrottleExternalUploadAt(100, 132));
+    try std.testing.expect(!shouldThrottleExternalUploadAt(100, 133));
 }

@@ -1,6 +1,6 @@
 const app_state = @import("state.zig");
 const ai_harness = @import("harness.zig");
-const loop_wakeup = @import("loop_wakeup.zig");
+const loop_wakeup = @import("loop_wakeup");
 const platform_runtime = @import("platform_runtime");
 const windows_integrations = @import("platform/windows/integrations.zig");
 const process_env = @import("process_env.zig");

@@ -22,9 +22,10 @@
 #define VERDE_BROWSER_LINUX_FRAME_BYTES_MAX (4096u * 2160u * 4u)
 #define VERDE_BROWSER_LINUX_ACTIVE_FRAME_MIN_INTERVAL_US 16666
 #define VERDE_BROWSER_LINUX_IDLE_FRAME_MIN_INTERVAL_US 100000
-#define VERDE_BROWSER_LINUX_ACTIVE_AFTER_INPUT_US 400000
-#define VERDE_BROWSER_LINUX_ACTIVE_AFTER_LOAD_US 2000000
+#define VERDE_BROWSER_LINUX_FRAME_PRODUCTION_LEAD_MAX_US 16000
+#define VERDE_BROWSER_LINUX_FRAME_TIMER_LEAD_US 750
 #define VERDE_BROWSER_LINUX_CONTEXT_MENU_ITEM_MAX 96
+#define VERDE_BROWSER_LINUX_FRAME_INTERVAL_SAMPLE_MAX 256
 
 #if WEBKIT_CHECK_VERSION(2, 52, 0)
 #define VERDE_BROWSER_LINUX_HAS_CONTEXT_MENU_DETAILS 1
@@ -92,6 +93,8 @@ struct verde_browser_linux {
 
     unsigned char *frame_slots[VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT];
     gboolean frame_slots_ready[VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT];
+    gboolean frame_slots_owned[VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT];
+    guint64 frame_slot_sequences[VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT];
     guint8 frame_next_slot;
     guint64 frame_next_sequence;
     guint64 frame_ready_sequence;
@@ -103,8 +106,28 @@ struct verde_browser_linux {
     gboolean frame_slots_failure_reported;
     gboolean frame_import_failure_reported;
     gint64 last_frame_published_us;
-    gint64 active_until_us;
+    gint64 frame_exported_at_us;
+    gint64 frame_published_at_us;
     guint frame_complete_timer_id;
+    gint64 frame_complete_deadline_us;
+    gint64 frame_complete_dispatched_us;
+    gint64 frame_production_lead_us;
+    gboolean supports_bgra_read;
+
+    guint64 metric_exported_frames;
+    guint64 metric_delayed_exports;
+    guint64 metric_dropped_exports;
+    guint64 metric_published_frames;
+    guint64 metric_frame_complete_scheduled;
+    guint64 metric_frame_complete_fired;
+    guint64 metric_frame_complete_deadline_misses;
+    guint64 metric_slot_overwrites;
+    guint64 metric_slot_contention;
+    guint64 metric_slot_releases;
+    gint64 metric_last_export_us;
+    gint64 metric_last_report_us;
+    guint metric_export_interval_count;
+    gint64 metric_export_intervals_us[VERDE_BROWSER_LINUX_FRAME_INTERVAL_SAMPLE_MAX];
 
     gboolean visible;
     gint target_width;
@@ -117,40 +140,88 @@ int verde_browser_linux_set_bounds(struct verde_browser_linux *browser, int x, i
 
 static gboolean verde_browser_linux_frame_log_enabled(void);
 
-static void verde_browser_linux_mark_active_for(struct verde_browser_linux *browser, gint64 duration_us) {
-    if (browser == NULL) return;
-    const gint64 active_until_us = g_get_monotonic_time() + duration_us;
-    if (active_until_us > browser->active_until_us) browser->active_until_us = active_until_us;
-}
-
-static void verde_browser_linux_mark_active(struct verde_browser_linux *browser) {
-    verde_browser_linux_mark_active_for(browser, VERDE_BROWSER_LINUX_ACTIVE_AFTER_INPUT_US);
-}
-
 static gint64 verde_browser_linux_frame_min_interval_us(struct verde_browser_linux *browser, gint64 now_us) {
-    if (browser != NULL && now_us <= browser->active_until_us) return VERDE_BROWSER_LINUX_ACTIVE_FRAME_MIN_INTERVAL_US;
+    (void)now_us;
+    // WPE is damage driven: a static visible page does not export frames. Keep
+    // producing/damaged visible pages at display cadence instead of degrading
+    // real animations merely because the last input happened in the past.
+    if (browser != NULL && browser->visible) return VERDE_BROWSER_LINUX_ACTIVE_FRAME_MIN_INTERVAL_US;
     return VERDE_BROWSER_LINUX_IDLE_FRAME_MIN_INTERVAL_US;
+}
+
+static gint64 verde_browser_linux_completion_deadline_us(gint64 last_frame_us, gint64 now_us, gint64 interval_us, gint64 production_lead_us) {
+    const gint64 requested_lead_us = production_lead_us + VERDE_BROWSER_LINUX_FRAME_TIMER_LEAD_US;
+    const gint64 lead_us = CLAMP(requested_lead_us, 0, MIN(MAX(interval_us - 1, 0), VERDE_BROWSER_LINUX_FRAME_PRODUCTION_LEAD_MAX_US));
+    return MAX(now_us, last_frame_us + interval_us - lead_us);
+}
+
+static void verde_browser_linux_note_frame_production_lead(struct verde_browser_linux *browser, gint64 now_us) {
+    if (browser == NULL || browser->frame_complete_dispatched_us <= 0 || now_us <= browser->frame_complete_dispatched_us) return;
+    const gint64 observed_us = now_us - browser->frame_complete_dispatched_us;
+    browser->frame_complete_dispatched_us = 0;
+    // A damage-free page can leave the last completion timestamp parked for
+    // seconds. Do not treat that idle gap as frame-production latency when
+    // input eventually damages the page again.
+    if (observed_us > VERDE_BROWSER_LINUX_ACTIVE_FRAME_MIN_INTERVAL_US * 2) return;
+    const gint64 bounded_observed_us = MIN(observed_us, VERDE_BROWSER_LINUX_FRAME_PRODUCTION_LEAD_MAX_US);
+    browser->frame_production_lead_us = browser->frame_production_lead_us == 0
+        ? bounded_observed_us
+        : (browser->frame_production_lead_us * 3 + bounded_observed_us) / 4;
 }
 
 static void verde_browser_linux_dispatch_frame_complete(struct verde_browser_linux *browser) {
     if (browser == NULL || browser->exportable == NULL) return;
+    browser->frame_complete_dispatched_us = g_get_monotonic_time();
     wpe_view_backend_exportable_fdo_dispatch_frame_complete(browser->exportable);
 }
 
 static gboolean verde_browser_linux_frame_complete_timer(gpointer user_data) {
     struct verde_browser_linux *browser = user_data;
     if (browser != NULL) {
+        const gint64 now_us = g_get_monotonic_time();
         browser->frame_complete_timer_id = 0;
+        browser->metric_frame_complete_fired += 1;
+        if (browser->frame_complete_deadline_us > 0 && now_us - browser->frame_complete_deadline_us > 2000) {
+            browser->metric_frame_complete_deadline_misses += 1;
+        }
+        browser->frame_complete_deadline_us = 0;
         verde_browser_linux_dispatch_frame_complete(browser);
     }
     return G_SOURCE_REMOVE;
 }
 
-static void verde_browser_linux_schedule_frame_complete(struct verde_browser_linux *browser, gint64 delay_us) {
-    if (browser == NULL || browser->frame_complete_timer_id != 0) return;
+static void verde_browser_linux_schedule_frame_complete_at(struct verde_browser_linux *browser, gint64 deadline_us) {
+    if (browser == NULL) return;
+    if (browser->frame_complete_timer_id != 0) {
+        if (browser->frame_complete_deadline_us <= deadline_us) return;
+        g_source_remove(browser->frame_complete_timer_id);
+        browser->frame_complete_timer_id = 0;
+    }
+    const gint64 now_us = g_get_monotonic_time();
+    if (deadline_us <= now_us) {
+        browser->frame_complete_deadline_us = 0;
+        browser->metric_frame_complete_fired += 1;
+        verde_browser_linux_dispatch_frame_complete(browser);
+        return;
+    }
+    const gint64 delay_us = deadline_us - now_us;
     guint delay_ms = (guint)((delay_us + 999) / 1000);
     if (delay_ms == 0) delay_ms = 1;
+    browser->frame_complete_deadline_us = deadline_us;
     browser->frame_complete_timer_id = g_timeout_add(delay_ms, verde_browser_linux_frame_complete_timer, browser);
+    browser->metric_frame_complete_scheduled += 1;
+}
+
+static void verde_browser_linux_mark_active(struct verde_browser_linux *browser) {
+    if (browser == NULL || browser->frame_complete_timer_id == 0) return;
+    const gint64 now_us = g_get_monotonic_time();
+    const gint64 active_deadline_us = verde_browser_linux_completion_deadline_us(
+        browser->last_frame_published_us,
+        now_us,
+        VERDE_BROWSER_LINUX_ACTIVE_FRAME_MIN_INTERVAL_US,
+        browser->frame_production_lead_us
+    );
+    verde_browser_linux_schedule_frame_complete_at(browser, active_deadline_us);
 }
 
 static void verde_browser_linux_queue_event(struct verde_browser_linux *browser, int kind, const char *payload) {
@@ -304,11 +375,11 @@ static void verde_browser_linux_json_append_string(GString *json, const char *va
     g_string_append_c(json, '"');
 }
 
-static void verde_browser_linux_json_append_menu_label(GString *json, const char *value) {
+static void verde_browser_linux_json_append_menu_label(GString *json, const char *value, gboolean preserve_underscores) {
     g_string_append_c(json, '"');
     if (value != NULL) {
         for (const unsigned char *cursor = (const unsigned char *)value; *cursor != '\0'; cursor += 1) {
-            if (*cursor == '_') continue;
+            if (*cursor == '_' && !preserve_underscores) continue;
             switch (*cursor) {
             case '"':
                 g_string_append(json, "\\\"");
@@ -411,15 +482,72 @@ static GVariant *verde_browser_linux_context_menu_item_get_target_compat(WebKitC
 #endif
 }
 
-static void verde_browser_linux_toggle_inspector_compat(WebKitWebView *web_view) {
-#if WEBKIT_CHECK_VERSION(2, 52, 0)
-    webkit_web_view_toggle_inspector(web_view);
-#else
-    (void)web_view;
-#endif
+static void verde_browser_linux_context_menu_items_to_json(
+    struct verde_browser_linux *browser,
+    WebKitContextMenu *menu,
+    GString *json,
+    gboolean remote_inspector_configured
+) {
+    GList *items = webkit_context_menu_get_items(menu);
+    gboolean first = TRUE;
+    for (GList *node = items; node != NULL; node = node->next) {
+        WebKitContextMenuItem *item = WEBKIT_CONTEXT_MENU_ITEM(node->data);
+        if (item == NULL) continue;
+
+        const gboolean separator = webkit_context_menu_item_is_separator(item);
+        WebKitContextMenu *submenu = webkit_context_menu_item_get_submenu(item);
+        GAction *action = webkit_context_menu_item_get_gaction(item);
+        WebKitContextMenuAction stock_action = webkit_context_menu_item_get_stock_action(item);
+        const gboolean inspect_setup_required = stock_action == WEBKIT_CONTEXT_MENU_ACTION_INSPECT_ELEMENT &&
+            !remote_inspector_configured;
+        const gchar *title = inspect_setup_required
+            ? "Inspect Element (set WEBKIT_INSPECTOR_SERVER)"
+            : verde_browser_linux_context_menu_item_get_title_compat(item, stock_action);
+        const gboolean action_enabled = action != NULL && g_action_get_enabled(action);
+        const gboolean has_submenu_items = submenu != NULL && webkit_context_menu_get_n_items(submenu) > 0;
+        const gboolean stock_action_supported = stock_action == WEBKIT_CONTEXT_MENU_ACTION_INSPECT_ELEMENT
+            ? remote_inspector_configured
+            : verde_browser_linux_context_stock_action_is_supported(stock_action);
+        const gboolean enabled = !separator && !inspect_setup_required &&
+            (has_submenu_items || (submenu == NULL && (action_enabled || stock_action_supported)));
+
+        // Decide whether the row can be represented before writing its comma.
+        // This keeps skipped/overflow rows from leaving a trailing `,]` payload.
+        if (browser == NULL || browser->context_item_count >= VERDE_BROWSER_LINUX_CONTEXT_MENU_ITEM_MAX) continue;
+        const guint index = browser->context_item_count;
+        struct verde_browser_linux_context_menu_item *stored = &browser->context_items[index];
+        stored->label = g_strdup(title);
+        stored->stock_action = stock_action;
+        stored->action = action != NULL ? g_object_ref(action) : NULL;
+        stored->target = verde_browser_linux_context_menu_item_get_target_compat(item);
+        if (stored->target != NULL) stored->target = g_variant_ref(stored->target);
+        stored->enabled = enabled;
+        stored->separator = separator;
+        stored->submenu = submenu != NULL;
+        browser->context_item_count += 1;
+
+        if (!first) g_string_append_c(json, ',');
+        first = FALSE;
+        g_string_append_printf(json, "{\"index\":%u,\"separator\":%s,\"enabled\":%s,\"submenu\":%s,\"label\":",
+            index,
+            separator ? "true" : "false",
+            enabled ? "true" : "false",
+            submenu != NULL ? "true" : "false");
+        verde_browser_linux_json_append_menu_label(json, title, inspect_setup_required);
+        if (submenu != NULL) {
+            g_string_append(json, ",\"items\":[");
+            verde_browser_linux_context_menu_items_to_json(browser, submenu, json, remote_inspector_configured);
+            g_string_append_c(json, ']');
+        }
+        g_string_append_c(json, '}');
+    }
 }
 
-static char *verde_browser_linux_context_menu_to_json(struct verde_browser_linux *browser, WebKitContextMenu *menu) {
+static char *verde_browser_linux_context_menu_to_json_with_inspector(
+    struct verde_browser_linux *browser,
+    WebKitContextMenu *menu,
+    gboolean remote_inspector_configured
+) {
     if (browser != NULL) verde_browser_linux_clear_context_items(browser);
     if (menu == NULL) return g_strdup("{\"x\":0,\"y\":0,\"items\":[]}");
     gint x = 0;
@@ -427,55 +555,169 @@ static char *verde_browser_linux_context_menu_to_json(struct verde_browser_linux
     verde_browser_linux_context_menu_get_position_compat(menu, &x, &y);
     GString *json = g_string_new(NULL);
     g_string_append_printf(json, "{\"x\":%d,\"y\":%d,\"items\":[", x, y);
-
-    GList *items = webkit_context_menu_get_items(menu);
-    guint index = 0;
-    gboolean first = TRUE;
-    for (GList *node = items; node != NULL; node = node->next, index += 1) {
-        WebKitContextMenuItem *item = WEBKIT_CONTEXT_MENU_ITEM(node->data);
-        if (item == NULL) continue;
-        if (!first) g_string_append_c(json, ',');
-        first = FALSE;
-
-        const gboolean separator = webkit_context_menu_item_is_separator(item);
-        WebKitContextMenu *submenu = webkit_context_menu_item_get_submenu(item);
-        GAction *action = webkit_context_menu_item_get_gaction(item);
-        WebKitContextMenuAction stock_action = webkit_context_menu_item_get_stock_action(item);
-        const gchar *title = verde_browser_linux_context_menu_item_get_title_compat(item, stock_action);
-        if (stock_action == WEBKIT_CONTEXT_MENU_ACTION_INSPECT_ELEMENT &&
-            !verde_browser_linux_remote_inspector_configured()) {
-            continue;
-        }
-        const gboolean action_enabled = action != NULL && g_action_get_enabled(action);
-        const gboolean enabled = !separator && submenu == NULL && (action_enabled || verde_browser_linux_context_stock_action_is_supported(stock_action));
-        if (browser != NULL && index < VERDE_BROWSER_LINUX_CONTEXT_MENU_ITEM_MAX) {
-            struct verde_browser_linux_context_menu_item *stored = &browser->context_items[index];
-            stored->label = g_strdup(title);
-            stored->stock_action = stock_action;
-            stored->action = action != NULL ? g_object_ref(action) : NULL;
-            stored->target = verde_browser_linux_context_menu_item_get_target_compat(item);
-            if (stored->target != NULL) stored->target = g_variant_ref(stored->target);
-            stored->enabled = enabled;
-            stored->separator = separator;
-            stored->submenu = submenu != NULL;
-            if (index >= browser->context_item_count) browser->context_item_count = index + 1;
-        }
-
-        g_string_append_printf(json, "{\"index\":%u,\"separator\":%s,\"enabled\":%s,\"submenu\":%s,\"label\":",
-            index,
-            separator ? "true" : "false",
-            enabled ? "true" : "false",
-            submenu != NULL ? "true" : "false");
-        verde_browser_linux_json_append_menu_label(json, title);
-        g_string_append_c(json, '}');
-    }
+    verde_browser_linux_context_menu_items_to_json(browser, menu, json, remote_inspector_configured);
     g_string_append(json, "]}");
     return g_string_free(json, FALSE);
 }
 
+static char *verde_browser_linux_context_menu_to_json(struct verde_browser_linux *browser, WebKitContextMenu *menu) {
+    return verde_browser_linux_context_menu_to_json_with_inspector(
+        browser,
+        menu,
+        verde_browser_linux_remote_inspector_configured()
+    );
+}
+
+#ifdef VERDE_BROWSER_LINUX_TESTING
+static void verde_browser_linux_test_append_stock(WebKitContextMenu *menu, WebKitContextMenuAction action) {
+    webkit_context_menu_append(menu, webkit_context_menu_item_new_from_stock_action(action));
+}
+
+char *verde_browser_linux_test_context_menu_payload(unsigned int scenario, int inspector_configured) {
+    struct verde_browser_linux browser = {0};
+    WebKitContextMenu *menu = webkit_context_menu_new();
+    switch (scenario) {
+    case 0:
+        verde_browser_linux_test_append_stock(menu, WEBKIT_CONTEXT_MENU_ACTION_GO_BACK);
+        verde_browser_linux_test_append_stock(menu, WEBKIT_CONTEXT_MENU_ACTION_GO_FORWARD);
+        verde_browser_linux_test_append_stock(menu, WEBKIT_CONTEXT_MENU_ACTION_STOP);
+        verde_browser_linux_test_append_stock(menu, WEBKIT_CONTEXT_MENU_ACTION_RELOAD);
+        verde_browser_linux_test_append_stock(menu, WEBKIT_CONTEXT_MENU_ACTION_INSPECT_ELEMENT);
+        break;
+    case 1:
+        verde_browser_linux_test_append_stock(menu, WEBKIT_CONTEXT_MENU_ACTION_OPEN_LINK);
+        verde_browser_linux_test_append_stock(menu, WEBKIT_CONTEXT_MENU_ACTION_OPEN_LINK_IN_NEW_WINDOW);
+        verde_browser_linux_test_append_stock(menu, WEBKIT_CONTEXT_MENU_ACTION_DOWNLOAD_LINK_TO_DISK);
+        verde_browser_linux_test_append_stock(menu, WEBKIT_CONTEXT_MENU_ACTION_COPY_LINK_TO_CLIPBOARD);
+        break;
+    case 2:
+        verde_browser_linux_test_append_stock(menu, WEBKIT_CONTEXT_MENU_ACTION_OPEN_IMAGE_IN_NEW_WINDOW);
+        verde_browser_linux_test_append_stock(menu, WEBKIT_CONTEXT_MENU_ACTION_DOWNLOAD_IMAGE_TO_DISK);
+        verde_browser_linux_test_append_stock(menu, WEBKIT_CONTEXT_MENU_ACTION_COPY_IMAGE_TO_CLIPBOARD);
+        break;
+    case 3:
+        verde_browser_linux_test_append_stock(menu, WEBKIT_CONTEXT_MENU_ACTION_CUT);
+        verde_browser_linux_test_append_stock(menu, WEBKIT_CONTEXT_MENU_ACTION_COPY);
+        verde_browser_linux_test_append_stock(menu, WEBKIT_CONTEXT_MENU_ACTION_PASTE);
+        break;
+    case 4: {
+        verde_browser_linux_test_append_stock(menu, WEBKIT_CONTEXT_MENU_ACTION_COPY);
+        webkit_context_menu_append(menu, webkit_context_menu_item_new_separator());
+        verde_browser_linux_test_append_stock(menu, WEBKIT_CONTEXT_MENU_ACTION_PASTE);
+        break;
+    }
+    case 5: {
+        WebKitContextMenu *submenu = webkit_context_menu_new();
+        verde_browser_linux_test_append_stock(submenu, WEBKIT_CONTEXT_MENU_ACTION_COPY);
+        webkit_context_menu_append(menu, webkit_context_menu_item_new_with_submenu("More", submenu));
+        g_object_unref(submenu);
+        break;
+    }
+    default:
+        break;
+    }
+    char *payload = verde_browser_linux_context_menu_to_json_with_inspector(
+        &browser,
+        menu,
+        inspector_configured != 0
+    );
+    verde_browser_linux_clear_context_items(&browser);
+    g_object_unref(menu);
+    return payload;
+}
+
+int64_t verde_browser_linux_test_active_completion_deadline_us(int64_t last_frame_us, int64_t now_us) {
+    return verde_browser_linux_completion_deadline_us(last_frame_us, now_us, VERDE_BROWSER_LINUX_ACTIVE_FRAME_MIN_INTERVAL_US, 0);
+}
+
+int64_t verde_browser_linux_test_active_completion_deadline_with_lead_us(int64_t last_frame_us, int64_t now_us, int64_t production_lead_us) {
+    return verde_browser_linux_completion_deadline_us(last_frame_us, now_us, VERDE_BROWSER_LINUX_ACTIVE_FRAME_MIN_INTERVAL_US, production_lead_us);
+}
+
+int64_t verde_browser_linux_test_updated_production_lead_us(int64_t existing_lead_us, int64_t dispatched_us, int64_t published_us) {
+    struct verde_browser_linux browser = {0};
+    browser.frame_production_lead_us = existing_lead_us;
+    browser.frame_complete_dispatched_us = dispatched_us;
+    verde_browser_linux_note_frame_production_lead(&browser, published_us);
+    return browser.frame_production_lead_us;
+}
+
+int64_t verde_browser_linux_test_frame_interval_us(int visible) {
+    struct verde_browser_linux browser = {0};
+    browser.visible = visible != 0;
+    return verde_browser_linux_frame_min_interval_us(&browser, 0);
+}
+#endif
+
 static gboolean verde_browser_linux_frame_log_enabled(void) {
     const char *value = getenv("VERDE_BROWSER_FRAME_LOG");
     return value != NULL && strcmp(value, "1") == 0;
+}
+
+static int verde_browser_linux_compare_i64(const void *left, const void *right) {
+    const gint64 a = *(const gint64 *)left;
+    const gint64 b = *(const gint64 *)right;
+    return (a > b) - (a < b);
+}
+
+static gint64 verde_browser_linux_percentile_us(const gint64 *sorted, guint count, guint percentile) {
+    if (count == 0) return 0;
+    const guint index = (guint)(((guint64)(count - 1) * percentile) / 100u);
+    return sorted[index];
+}
+
+static void verde_browser_linux_note_export(struct verde_browser_linux *browser, gint64 now_us) {
+    if (browser == NULL) return;
+    browser->metric_exported_frames += 1;
+    if (browser->metric_last_export_us > 0 &&
+        browser->metric_export_interval_count < VERDE_BROWSER_LINUX_FRAME_INTERVAL_SAMPLE_MAX) {
+        browser->metric_export_intervals_us[browser->metric_export_interval_count++] = now_us - browser->metric_last_export_us;
+    }
+    browser->metric_last_export_us = now_us;
+}
+
+static void verde_browser_linux_maybe_log_frame_metrics(struct verde_browser_linux *browser, gint64 now_us) {
+    if (browser == NULL || !verde_browser_linux_frame_log_enabled()) return;
+    if (browser->metric_last_report_us != 0 && now_us - browser->metric_last_report_us < G_USEC_PER_SEC) return;
+    browser->metric_last_report_us = now_us;
+
+    gint64 sorted[VERDE_BROWSER_LINUX_FRAME_INTERVAL_SAMPLE_MAX];
+    const guint sample_count = browser->metric_export_interval_count;
+    if (sample_count > 0) {
+        memcpy(sorted, browser->metric_export_intervals_us, sample_count * sizeof(gint64));
+        qsort(sorted, sample_count, sizeof(gint64), verde_browser_linux_compare_i64);
+    }
+    fprintf(stderr,
+        "verde-browser-linux WPE metrics exported=%" G_GUINT64_FORMAT
+        " published=%" G_GUINT64_FORMAT
+        " delayed=%" G_GUINT64_FORMAT
+        " dropped=%" G_GUINT64_FORMAT
+        " complete_scheduled=%" G_GUINT64_FORMAT
+        " complete_fired=%" G_GUINT64_FORMAT
+        " deadline_missed=%" G_GUINT64_FORMAT
+        " slot_overwrite=%" G_GUINT64_FORMAT
+        " slot_contention=%" G_GUINT64_FORMAT
+        " slot_release=%" G_GUINT64_FORMAT
+        " production_lead_us=%" G_GINT64_FORMAT
+        " interval_p50_us=%" G_GINT64_FORMAT
+        " interval_p95_us=%" G_GINT64_FORMAT
+        " interval_p99_us=%" G_GINT64_FORMAT "\n",
+        browser->metric_exported_frames,
+        browser->metric_published_frames,
+        browser->metric_delayed_exports,
+        browser->metric_dropped_exports,
+        browser->metric_frame_complete_scheduled,
+        browser->metric_frame_complete_fired,
+        browser->metric_frame_complete_deadline_misses,
+        browser->metric_slot_overwrites,
+        browser->metric_slot_contention,
+        browser->metric_slot_releases,
+        browser->frame_production_lead_us,
+        verde_browser_linux_percentile_us(sorted, sample_count, 50),
+        verde_browser_linux_percentile_us(sorted, sample_count, 95),
+        verde_browser_linux_percentile_us(sorted, sample_count, 99));
+    fflush(stderr);
+    browser->metric_export_interval_count = 0;
 }
 
 static gboolean verde_browser_linux_prefer_dark_scheme_enabled(void) {
@@ -612,6 +854,8 @@ static gboolean verde_browser_linux_init_egl(struct verde_browser_linux *browser
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glGenFramebuffers(1, &browser->framebuffer);
+    const char *extensions = (const char *)glGetString(GL_EXTENSIONS);
+    browser->supports_bgra_read = extensions != NULL && strstr(extensions, "GL_EXT_read_format_bgra") != NULL;
     return browser->texture != 0 && browser->framebuffer != 0;
 }
 
@@ -628,62 +872,122 @@ static void verde_browser_linux_deinit_egl(struct verde_browser_linux *browser) 
     browser->egl_surface = EGL_NO_SURFACE;
 }
 
-static gboolean verde_browser_linux_publish_pixels(struct verde_browser_linux *browser, guint32 width, guint32 height, const unsigned char *rgba) {
-    if (browser == NULL || width == 0 || height == 0 || rgba == NULL) return FALSE;
-    const size_t byte_len = (size_t)width * (size_t)height * 4u;
+enum verde_browser_linux_frame_export_result {
+    VERDE_BROWSER_LINUX_FRAME_EXPORT_OK,
+    VERDE_BROWSER_LINUX_FRAME_EXPORT_DROPPED,
+    VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED,
+};
+
+static gint verde_browser_linux_acquire_frame_slot(struct verde_browser_linux *browser, size_t byte_len) {
+    if (browser == NULL) return -1;
     if (!verde_browser_linux_shared_frames_enabled(browser) || byte_len > VERDE_BROWSER_LINUX_FRAME_BYTES_MAX) {
         if (!browser->frame_slots_failure_reported) {
             verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "WPE frame slots are unavailable or too small.");
             browser->frame_slots_failure_reported = TRUE;
         }
-        return FALSE;
+        return -1;
     }
     browser->frame_slots_failure_reported = FALSE;
-    browser->frame_import_failure_reported = FALSE;
 
-    const gint frame_slot = browser->frame_next_slot;
-    unsigned char *bgra = browser->frame_slots[frame_slot];
-    for (size_t index = 0; index < (size_t)width * (size_t)height; index += 1) {
-        const size_t offset = index * 4u;
-        bgra[offset + 0] = rgba[offset + 2];
-        bgra[offset + 1] = rgba[offset + 1];
-        bgra[offset + 2] = rgba[offset + 0];
-        bgra[offset + 3] = 255;
+    // A frame replaced before the helper emits its metadata was never visible
+    // to the desktop and can be reclaimed locally. Published slots remain
+    // producer-owned until the desktop acknowledges their sequence.
+    if (browser->frame_dirty && browser->frame_ready_slot >= 0) {
+        const guint previous = (guint)browser->frame_ready_slot;
+        browser->frame_slots_owned[previous] = FALSE;
+        browser->frame_slot_sequences[previous] = 0;
+        browser->frame_dirty = FALSE;
+        browser->metric_slot_overwrites += 1;
     }
 
-    browser->frame_next_slot = (guint8)((browser->frame_next_slot + 1) % VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT);
-    browser->frame_ready_sequence = ++browser->frame_next_sequence;
+    for (guint offset = 0; offset < VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT; offset += 1) {
+        const guint frame_slot = (browser->frame_next_slot + offset) % VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT;
+        if (browser->frame_slots_owned[frame_slot]) continue;
+        browser->frame_next_slot = (guint8)((frame_slot + 1) % VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT);
+        return (gint)frame_slot;
+    }
+    browser->metric_slot_contention += 1;
+    return -2;
+}
+
+static void verde_browser_linux_publish_frame_slot(
+    struct verde_browser_linux *browser,
+    gint frame_slot,
+    guint32 width,
+    guint32 height,
+    size_t byte_len,
+    gint64 exported_at_us
+) {
+    const guint64 sequence = ++browser->frame_next_sequence;
+    browser->frame_slots_owned[frame_slot] = TRUE;
+    browser->frame_slot_sequences[frame_slot] = sequence;
+    browser->frame_ready_sequence = sequence;
     browser->frame_ready_slot = frame_slot;
     browser->frame_width = (gint)width;
     browser->frame_height = (gint)height;
     browser->frame_byte_len = byte_len;
+    browser->frame_exported_at_us = exported_at_us;
+    browser->frame_published_at_us = g_get_monotonic_time();
+    browser->last_frame_published_us = browser->frame_published_at_us;
     browser->frame_dirty = TRUE;
-    return TRUE;
+    browser->metric_published_frames += 1;
 }
 
-static gboolean verde_browser_linux_export_egl_image(struct verde_browser_linux *browser, struct wpe_fdo_egl_exported_image *image) {
-    if (browser == NULL || image == NULL) return FALSE;
+static enum verde_browser_linux_frame_export_result verde_browser_linux_export_egl_image(
+    struct verde_browser_linux *browser,
+    struct wpe_fdo_egl_exported_image *image,
+    gint64 exported_at_us
+) {
+    if (browser == NULL || image == NULL) return VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
     const guint32 width = wpe_fdo_egl_exported_image_get_width(image);
     const guint32 height = wpe_fdo_egl_exported_image_get_height(image);
     const size_t byte_len = (size_t)width * (size_t)height * 4u;
-    if (width == 0 || height == 0 || byte_len > VERDE_BROWSER_LINUX_FRAME_BYTES_MAX) return FALSE;
-    if (browser->rgba_scratch_len < byte_len) {
-        unsigned char *next = g_realloc(browser->rgba_scratch, byte_len);
-        if (next == NULL) return FALSE;
-        browser->rgba_scratch = next;
-        browser->rgba_scratch_len = byte_len;
-    }
+    if (width == 0 || height == 0 || byte_len > VERDE_BROWSER_LINUX_FRAME_BYTES_MAX) return VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
+    const gint frame_slot = verde_browser_linux_acquire_frame_slot(browser, byte_len);
+    if (frame_slot == -2) return VERDE_BROWSER_LINUX_FRAME_EXPORT_DROPPED;
+    if (frame_slot < 0) return VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
 
-    if (!eglMakeCurrent(browser->egl_display, browser->egl_surface, browser->egl_surface, browser->egl_context)) return FALSE;
+    if (!eglMakeCurrent(browser->egl_display, browser->egl_surface, browser->egl_surface, browser->egl_context)) return VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
     glBindTexture(GL_TEXTURE_2D, browser->texture);
     browser->gl_egl_image_target_texture_2d(GL_TEXTURE_2D, wpe_fdo_egl_exported_image_get_egl_image(image));
     glBindFramebuffer(GL_FRAMEBUFFER, browser->framebuffer);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, browser->texture, 0);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return FALSE;
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
     glViewport(0, 0, (GLsizei)width, (GLsizei)height);
-    glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, GL_RGBA, GL_UNSIGNED_BYTE, browser->rgba_scratch);
 
-    return verde_browser_linux_publish_pixels(browser, width, height, browser->rgba_scratch);
+    unsigned char *bgra = browser->frame_slots[frame_slot];
+    gboolean read_directly = FALSE;
+    // SDL_GPU exposes no portable external EGLImage/dmabuf texture import API.
+    // Reading BGRA directly into the acknowledged shared slot is therefore the
+    // supported zero-intermediate-copy path; retain RGBA+swizzle as a fallback.
+    if (browser->supports_bgra_read) {
+        while (glGetError() != GL_NO_ERROR) {}
+        glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, bgra);
+        read_directly = glGetError() == GL_NO_ERROR;
+        if (!read_directly) browser->supports_bgra_read = FALSE;
+    }
+    if (!read_directly) {
+        while (glGetError() != GL_NO_ERROR) {}
+        if (browser->rgba_scratch_len < byte_len) {
+            unsigned char *next = g_realloc(browser->rgba_scratch, byte_len);
+            if (next == NULL) return VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
+            browser->rgba_scratch = next;
+            browser->rgba_scratch_len = byte_len;
+        }
+        glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, GL_RGBA, GL_UNSIGNED_BYTE, browser->rgba_scratch);
+        if (glGetError() != GL_NO_ERROR) return VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
+        for (size_t index = 0; index < (size_t)width * (size_t)height; index += 1) {
+            const size_t pixel = index * 4u;
+            bgra[pixel + 0] = browser->rgba_scratch[pixel + 2];
+            bgra[pixel + 1] = browser->rgba_scratch[pixel + 1];
+            bgra[pixel + 2] = browser->rgba_scratch[pixel + 0];
+            bgra[pixel + 3] = 255;
+        }
+    }
+
+    verde_browser_linux_publish_frame_slot(browser, frame_slot, width, height, byte_len, exported_at_us);
+    browser->frame_import_failure_reported = FALSE;
+    return VERDE_BROWSER_LINUX_FRAME_EXPORT_OK;
 }
 
 static void verde_browser_linux_export_raw_egl_image(void *data, EGLImageKHR image) {
@@ -696,39 +1000,66 @@ static void verde_browser_linux_export_fdo_egl_image(void *data, struct wpe_fdo_
     struct verde_browser_linux *browser = data;
     if (browser == NULL || image == NULL) return;
     const gint64 now_us = g_get_monotonic_time();
+    verde_browser_linux_note_export(browser, now_us);
     const gint64 min_interval_us = verde_browser_linux_frame_min_interval_us(browser, now_us);
+    const gint64 paced_interval_us = MAX(min_interval_us - browser->frame_production_lead_us - VERDE_BROWSER_LINUX_FRAME_TIMER_LEAD_US, 1);
     const gint64 elapsed_us = now_us - browser->last_frame_published_us;
-    if (browser->last_frame_published_us > 0 && elapsed_us < min_interval_us) {
+    if (browser->last_frame_published_us > 0 && elapsed_us < paced_interval_us) {
         wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image(browser->exportable, image);
-        verde_browser_linux_schedule_frame_complete(browser, min_interval_us - elapsed_us);
+        browser->metric_delayed_exports += 1;
+        verde_browser_linux_schedule_frame_complete_at(browser, verde_browser_linux_completion_deadline_us(
+            browser->last_frame_published_us,
+            now_us,
+            min_interval_us,
+            browser->frame_production_lead_us
+        ));
+        verde_browser_linux_maybe_log_frame_metrics(browser, now_us);
         return;
     }
-    const gboolean ok = verde_browser_linux_export_egl_image(browser, image);
+    const enum verde_browser_linux_frame_export_result result = verde_browser_linux_export_egl_image(browser, image, now_us);
+    if (result == VERDE_BROWSER_LINUX_FRAME_EXPORT_OK) {
+        // Include EGL readback/publication work in the lead so dispatch occurs
+        // early enough for the completed frame—not just the callback—to land
+        // on the intended refresh interval.
+        verde_browser_linux_note_frame_production_lead(browser, browser->frame_published_at_us);
+    }
     wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image(browser->exportable, image);
-    verde_browser_linux_dispatch_frame_complete(browser);
-    if (!ok) {
+    verde_browser_linux_schedule_frame_complete_at(browser, verde_browser_linux_completion_deadline_us(
+        browser->last_frame_published_us,
+        now_us,
+        min_interval_us,
+        browser->frame_production_lead_us
+    ));
+    if (result != VERDE_BROWSER_LINUX_FRAME_EXPORT_OK) {
+        browser->metric_dropped_exports += 1;
+    }
+    if (result == VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED) {
         if (!browser->frame_import_failure_reported) {
             verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "Failed to import WPE EGL frame.");
             browser->frame_import_failure_reported = TRUE;
         }
+        verde_browser_linux_maybe_log_frame_metrics(browser, now_us);
         return;
     }
-    browser->last_frame_published_us = now_us;
-    if (verde_browser_linux_frame_log_enabled()) {
-        fprintf(stderr, "verde-browser-linux WPE frame seq=%" G_GUINT64_FORMAT " shared_slot=%d size=%dx%d bytes=%zu\n",
+    if (result == VERDE_BROWSER_LINUX_FRAME_EXPORT_OK && verde_browser_linux_frame_log_enabled()) {
+        fprintf(stderr, "verde-browser-linux WPE frame seq=%" G_GUINT64_FORMAT " shared_slot=%d size=%dx%d bytes=%zu exported_us=%" G_GINT64_FORMAT " published_us=%" G_GINT64_FORMAT "\n",
             browser->frame_ready_sequence,
             browser->frame_ready_slot,
             browser->frame_width,
             browser->frame_height,
-            (size_t)browser->frame_byte_len);
+            (size_t)browser->frame_byte_len,
+            browser->frame_exported_at_us,
+            browser->frame_published_at_us);
         fflush(stderr);
     }
+    verde_browser_linux_maybe_log_frame_metrics(browser, now_us);
 }
 
 static void verde_browser_linux_export_shm_buffer(void *data, struct wpe_fdo_shm_exported_buffer *buffer) {
     struct verde_browser_linux *browser = data;
     wpe_view_backend_exportable_fdo_egl_dispatch_release_shm_exported_buffer(browser->exportable, buffer);
-    verde_browser_linux_dispatch_frame_complete(browser);
+    const gint64 now_us = g_get_monotonic_time();
+    verde_browser_linux_schedule_frame_complete_at(browser, now_us + verde_browser_linux_frame_min_interval_us(browser, now_us));
 }
 
 static char *verde_browser_linux_value_to_json_or_string(JSCValue *value) {
@@ -773,7 +1104,7 @@ static void verde_browser_linux_on_title_changed(GObject *object, GParamSpec *ps
 static void verde_browser_linux_on_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_event, gpointer user_data) {
     struct verde_browser_linux *browser = user_data;
     (void)web_view;
-    verde_browser_linux_mark_active_for(browser, VERDE_BROWSER_LINUX_ACTIVE_AFTER_LOAD_US);
+    verde_browser_linux_mark_active(browser);
     if (load_event == WEBKIT_LOAD_STARTED) {
         verde_browser_linux_queue_cursor(browser, "default");
     }
@@ -1103,7 +1434,7 @@ int verde_browser_linux_set_device_scale(struct verde_browser_linux *browser, do
 
 int verde_browser_linux_show(struct verde_browser_linux *browser, int width, int height, const char *url) {
     if (browser == NULL) return 0;
-    verde_browser_linux_mark_active_for(browser, VERDE_BROWSER_LINUX_ACTIVE_AFTER_LOAD_US);
+    verde_browser_linux_mark_active(browser);
     if (width > 0 && height > 0) {
         verde_browser_linux_set_bounds(browser, 0, 0, width, height);
     }
@@ -1144,7 +1475,7 @@ int verde_browser_linux_resize(struct verde_browser_linux *browser, int width, i
 
 int verde_browser_linux_navigate(struct verde_browser_linux *browser, const char *url) {
     if (browser == NULL || url == NULL) return 0;
-    verde_browser_linux_mark_active_for(browser, VERDE_BROWSER_LINUX_ACTIVE_AFTER_LOAD_US);
+    verde_browser_linux_mark_active(browser);
     webkit_web_view_load_uri(browser->web_view, url);
     return 1;
 }
@@ -1165,27 +1496,28 @@ int verde_browser_linux_post_json(struct verde_browser_linux *browser, const cha
 
 int verde_browser_linux_go_back(struct verde_browser_linux *browser) {
     if (browser == NULL) return 0;
-    verde_browser_linux_mark_active_for(browser, VERDE_BROWSER_LINUX_ACTIVE_AFTER_LOAD_US);
+    verde_browser_linux_mark_active(browser);
     if (webkit_web_view_can_go_back(browser->web_view)) webkit_web_view_go_back(browser->web_view);
     return 1;
 }
 
 int verde_browser_linux_go_forward(struct verde_browser_linux *browser) {
     if (browser == NULL) return 0;
-    verde_browser_linux_mark_active_for(browser, VERDE_BROWSER_LINUX_ACTIVE_AFTER_LOAD_US);
+    verde_browser_linux_mark_active(browser);
     if (webkit_web_view_can_go_forward(browser->web_view)) webkit_web_view_go_forward(browser->web_view);
     return 1;
 }
 
 int verde_browser_linux_reload(struct verde_browser_linux *browser) {
     if (browser == NULL) return 0;
-    verde_browser_linux_mark_active_for(browser, VERDE_BROWSER_LINUX_ACTIVE_AFTER_LOAD_US);
+    verde_browser_linux_mark_active(browser);
     webkit_web_view_reload(browser->web_view);
     return 1;
 }
 
 int verde_browser_linux_focus(struct verde_browser_linux *browser) {
     if (browser == NULL) return 0;
+    verde_browser_linux_mark_active(browser);
     wpe_view_backend_add_activity_state(browser->view_backend, wpe_view_activity_state_focused);
     return 1;
 }
@@ -1209,8 +1541,19 @@ int verde_browser_linux_poll_event(struct verde_browser_linux *browser, int *kin
     return 1;
 }
 
-int verde_browser_linux_poll_frame(struct verde_browser_linux *browser, char **path, uint64_t *sequence, int *slot, int *width, int *height, size_t *byte_len) {
-    if (browser == NULL || path == NULL || sequence == NULL || slot == NULL || width == NULL || height == NULL || byte_len == NULL) return 0;
+int verde_browser_linux_poll_frame(
+    struct verde_browser_linux *browser,
+    char **path,
+    uint64_t *sequence,
+    int *slot,
+    int *width,
+    int *height,
+    size_t *byte_len,
+    uint64_t *exported_at_ns,
+    uint64_t *published_at_ns
+) {
+    if (browser == NULL || path == NULL || sequence == NULL || slot == NULL || width == NULL || height == NULL ||
+        byte_len == NULL || exported_at_ns == NULL || published_at_ns == NULL) return 0;
     while (g_main_context_pending(NULL)) {
         g_main_context_iteration(NULL, FALSE);
     }
@@ -1221,7 +1564,18 @@ int verde_browser_linux_poll_frame(struct verde_browser_linux *browser, char **p
     *width = browser->frame_width;
     *height = browser->frame_height;
     *byte_len = browser->frame_byte_len;
+    *exported_at_ns = (uint64_t)MAX(browser->frame_exported_at_us, 0) * 1000u;
+    *published_at_ns = (uint64_t)MAX(browser->frame_published_at_us, 0) * 1000u;
     browser->frame_dirty = FALSE;
+    return 1;
+}
+
+int verde_browser_linux_release_frame_slot(struct verde_browser_linux *browser, unsigned int slot, uint64_t sequence) {
+    if (browser == NULL || slot >= VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT) return 0;
+    if (!browser->frame_slots_owned[slot] || browser->frame_slot_sequences[slot] != sequence) return 0;
+    browser->frame_slots_owned[slot] = FALSE;
+    browser->frame_slot_sequences[slot] = 0;
+    browser->metric_slot_releases += 1;
     return 1;
 }
 
@@ -1335,12 +1689,9 @@ static gboolean verde_browser_linux_perform_context_menu_stock_action(struct ver
         webkit_web_view_execute_editing_command(browser->web_view, WEBKIT_EDITING_COMMAND_PASTE);
         return TRUE;
     case WEBKIT_CONTEXT_MENU_ACTION_INSPECT_ELEMENT:
-        if (!verde_browser_linux_remote_inspector_configured()) {
-            verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "WPE Inspect Element requires WEBKIT_INSPECTOR_SERVER or WEBKIT_INSPECTOR_HTTP_SERVER.");
-            return TRUE;
-        }
-        verde_browser_linux_toggle_inspector_compat(browser->web_view);
-        return TRUE;
+        // Only WebKit's supplied GAction retains the clicked-node hit test.
+        // A generic inspector toggle would open developer tools at no element.
+        return FALSE;
     default:
         return FALSE;
     }
@@ -1393,14 +1744,6 @@ static gboolean verde_browser_linux_perform_context_menu_label_action(struct ver
         webkit_web_view_execute_editing_command(browser->web_view, WEBKIT_EDITING_COMMAND_PASTE);
         return TRUE;
     }
-    if (verde_browser_linux_context_label_equals(label, "Inspect Element")) {
-        if (!verde_browser_linux_remote_inspector_configured()) {
-            verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "WPE Inspect Element requires WEBKIT_INSPECTOR_SERVER or WEBKIT_INSPECTOR_HTTP_SERVER.");
-            return TRUE;
-        }
-        verde_browser_linux_toggle_inspector_compat(browser->web_view);
-        return TRUE;
-    }
     return FALSE;
 }
 
@@ -1430,18 +1773,13 @@ int verde_browser_linux_context_menu_activate(struct verde_browser_linux *browse
     gboolean handled = FALSE;
     const gboolean is_inspect = item->stock_action == WEBKIT_CONTEXT_MENU_ACTION_INSPECT_ELEMENT ||
         verde_browser_linux_context_label_equals(item->label, "Inspect Element");
-    if (item->stock_action == WEBKIT_CONTEXT_MENU_ACTION_INSPECT_ELEMENT &&
-        item->action != NULL &&
-        g_action_get_enabled(item->action)) {
+    if (item->action != NULL && g_action_get_enabled(item->action)) {
         g_action_activate(item->action, item->target);
         handled = TRUE;
     }
     if (!handled) handled = verde_browser_linux_perform_context_menu_stock_action(browser, item->stock_action);
     if (!handled) handled = verde_browser_linux_perform_context_menu_label_action(browser, item->label);
-    if (!handled && item->action != NULL && g_action_get_enabled(item->action)) {
-        g_action_activate(item->action, item->target);
-    }
-    if (is_inspect) verde_browser_linux_open_remote_inspector(browser);
+    if (handled && is_inspect) verde_browser_linux_open_remote_inspector(browser);
     verde_browser_linux_mark_active(browser);
     if (verde_browser_linux_frame_log_enabled()) {
         fprintf(stderr, "verde-browser-linux WPE context-menu activate index=%u handled=%d label=%s\n",
