@@ -9980,13 +9980,23 @@ pub const AppState = struct {
         return null;
     }
 
-    /// Selects a workspace and focuses one of its open layout panes directly
-    /// from the sidebar's live pane list, restoring it first if minimized.
+    /// Selects a workspace and reveals one of its open layout panes, restoring
+    /// it first if minimized and leaving any maximized view.
     pub fn focusWorkspaceOpenPane(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) void {
+        self.focusWorkspaceOpenPaneWithZoom(project_index, pane_id, false);
+    }
+
+    /// Selects a pane from the sidebar while keeping a maximized workspace maximized.
+    pub fn focusWorkspaceOpenPaneFromSidebar(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) void {
+        self.focusWorkspaceOpenPaneWithZoom(project_index, pane_id, true);
+    }
+
+    fn focusWorkspaceOpenPaneWithZoom(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, preserve_zoom: bool) void {
         if (project_index >= self.projects.items.len) return;
         self.selected_project_index = project_index;
         var project = &self.projects.items[project_index];
         var layout = &project.workspace_layout;
+        const was_maximized = layout.maximized_pane_id != null;
         var target: ?*WorkspacePane = null;
         for (layout.panes.items) |*pane| {
             if (pane.id == pane_id) {
@@ -10002,14 +10012,14 @@ pub const AppState = struct {
             };
         }
         layout.focused_pane_id = pane_id;
-        layout.maximized_pane_id = null;
+        layout.maximized_pane_id = if (preserve_zoom and was_maximized) pane_id else null;
         switch (pane.ref) {
             .chat => |ref| {
                 self.terminal_focused = false;
                 project.selected_thread_index = ref.thread_index;
                 self.requestComposerFocus();
             },
-            .terminal => self.requestTerminalFocus(),
+            .terminal => |ref| self.requestTerminalDockFocus(ref.dock_id),
             .browser => {
                 self.terminal_focused = false;
                 self.composer_focused = false;
@@ -21033,6 +21043,51 @@ test "provider-aware chat creation focuses requested pane" {
         try std.testing.expectEqualStrings(case.model, project.threads.items[result.thread_index].model_ref.?);
     }
     try std.testing.expectEqual(previous_pane_count + cases.len, project.workspace_layout.panes.items.len);
+}
+
+test "sidebar open pane focus keeps the clicked terminal pane maximized" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.projects = .empty;
+    state.surfaces = .empty;
+    state.selected_project_index = 0;
+    state.browser_state = try browser_runtime.State.init(allocator);
+    state.browser_pane_focused = false;
+    state.browser_address_focused = true;
+    state.terminal_focused = false;
+    state.composer_focused = true;
+    state.palette_composer.focused = true;
+    state.palette_modal_text_focus = .none;
+    state.dirty = false;
+    state.last_dirty_at_ms = 0;
+    state.last_interaction_at_ms = 0;
+    defer {
+        for (state.projects.items) |*project| project.deinit(allocator);
+        state.projects.deinit(allocator);
+        state.surfaces.deinit(allocator);
+        state.browser_state.deinit();
+    }
+
+    var project = try Project.init(allocator, "test", "Test", "/tmp/test", 0);
+    state.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    const layout = &state.projects.items[0].workspace_layout;
+    const first_terminal_pane_id = try layout.createTerminalPane(allocator, 1);
+    const clicked_terminal_pane_id = try layout.createTerminalPane(allocator, 2);
+    layout.focused_pane_id = first_terminal_pane_id;
+    layout.maximized_pane_id = first_terminal_pane_id;
+
+    state.focusWorkspaceOpenPaneFromSidebar(0, clicked_terminal_pane_id);
+
+    try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(state.terminal_focused);
+    try std.testing.expect(!state.composer_focused);
+    try std.testing.expect(!state.palette_composer.focused);
+    try std.testing.expect(!state.browser_address_focused);
 }
 
 test "Codex hook feature detection accepts current and legacy names" {
