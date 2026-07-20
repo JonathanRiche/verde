@@ -60,6 +60,8 @@ file. It is read on startup and on app refresh.
       "focus_down": "Ctrl+J",
       "focus_left": "Ctrl+H",
       "focus_right": "Ctrl+L",
+      "pane_previous": "Ctrl+Shift+Tab",
+      "pane_next": "Ctrl+Tab",
       "previous": "Alt+Up",
       "next": "Alt+Down"
     }

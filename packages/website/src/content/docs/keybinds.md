@@ -32,8 +32,13 @@ below.
 | `Ctrl+Shift+S`             | Toggle the sidebar's hidden mode      |
 | `Ctrl+B`                    | Toggle the embedded browser pane      |
 | `Tab`                       | Inside a chat pane, focus the prompt box |
+| `Ctrl+Tab`                  | Focus the next pane in sidebar order     |
+| `Ctrl+Shift+Tab`            | Focus the previous pane in sidebar order |
 | `Alt+1 … Alt+9, Alt+0`     | Jump between workspaces by sidebar order |
 | `Alt+↑` / `Alt+↓`          | Cycle to the previous / next workspace |
+
+Pane cycling wraps at either end. When a pane is zoomed, cycling switches the
+zoomed pane without restoring the split layout.
 
 ### Focus (vim-style)
 
@@ -127,6 +132,8 @@ shortcuts on the same action:
       "focus_down": "Ctrl+J",
       "focus_left": "Ctrl+H",
       "focus_right": "Ctrl+L",
+      "pane_previous": "Ctrl+Shift+Tab",
+      "pane_next": "Ctrl+Tab",
       "previous": "Alt+Up",
       "next": "Alt+Down",
       "move_left": "Ctrl+Shift+H",
@@ -180,7 +187,7 @@ or an array of shortcuts.
 | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | top         | `refresh`, `open_default`, `open_editor`, `new_thread`, `command_palette`, `toggle_sidebar`, `toggle_sidebar_hidden`, `toggle_browser`, `toggle_terminal`                                                                       |
 | chat        | `chat_up`, `chat_down`, `chat_page_up`, `chat_page_down`                                                                                                                                                                          |
-| `workspace` | `split_chat_vertical`, `split_chat_horizontal`, `split_terminal_vertical`, `split_terminal_horizontal`, `toggle_maximize`, `minimize`, `close`, `close_current`, `focus_left`, `focus_right`, `focus_up`, `focus_down`, `focus_prompt`, `move_*`, `grow_*`, `select`, `previous`, `next` |
+| `workspace` | `split_chat_vertical`, `split_chat_horizontal`, `split_terminal_vertical`, `split_terminal_horizontal`, `toggle_maximize`, `minimize`, `close`, `close_current`, `focus_left`, `focus_right`, `focus_up`, `focus_down`, `focus_prompt`, `pane_previous`, `pane_next`, `move_*`, `grow_*`, `select`, `previous`, `next` |
 | `terminal`  | `new_tab`, `close`, `rename_tab`, `tab_previous`, `tab_next`, `split_up`, `split_down`, `split_left`, `split_right`, `focus_up`, `focus_down`, `focus_left`, `focus_right`                                                       |
 
 Keybinds are loaded on startup and on app refresh. See [Configuration &

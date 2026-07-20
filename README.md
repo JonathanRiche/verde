@@ -709,6 +709,8 @@ Example config:
       "focus_down": ["Alt+Down", "Ctrl+J"],
       "focus_left": ["Alt+Left", "Ctrl+H"],
       "focus_right": ["Alt+Right", "Ctrl+L"],
+      "pane_previous": "Ctrl+Shift+Tab",
+      "pane_next": "Ctrl+Tab",
       "focus_prompt": "Tab",
       "move_up": "Ctrl+Shift+K",
       "move_down": "Ctrl+Shift+J",

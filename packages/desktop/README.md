@@ -134,6 +134,8 @@ Config supports UI and terminal font size, keybind overrides, and the default ac
       "focus_down": ["Alt+Down", "Ctrl+J"],
       "focus_left": ["Alt+Left", "Ctrl+H"],
       "focus_right": ["Alt+Right", "Ctrl+L"],
+      "pane_previous": "Ctrl+Shift+Tab",
+      "pane_next": "Ctrl+Tab",
       "close": ["CommandOrControl+W", "Alt+X"]
     },
     "terminal": {
