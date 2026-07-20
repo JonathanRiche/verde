@@ -41,6 +41,11 @@ file. It is read on startup and on app refresh.
   "transcript": {
     "tool_call_groups": "collapsed"
   },
+  "chat": {
+    "automatic_titles": true,
+    "title_provider": "codex",
+    "title_model": "gpt-5.6-luna"
+  },
   "updates": {
     "check_automatically": true
   },
@@ -72,6 +77,8 @@ Most of these options also appear in Settings:
 - **Appearance** — theme and UI font size.
 - **Transcript** — tool-call groups: `collapsed`, `expanded`, or
   `remember_last`.
+- **Chat** — generate concise chat titles automatically after the opening
+  exchange and choose the provider and model used for titles.
 - **Terminal** — font size, launch profiles, and whether terminal link clicks
   open in Verde's browser pane or the system browser.
 - **Workspace** — the default open action for project files and folders.
@@ -107,6 +114,14 @@ For another editor or workspace tool, use a custom action:
 The custom command runs through the platform shell with the imported project
 as its working directory. `open.links` accepts `verde_browser` or
 `system_browser` and controls where links clicked in terminal output open.
+
+## Chat titles
+
+Automatic titles are enabled by default and run after the opening user and
+assistant exchange completes. `chat.title_provider` accepts `codex`, `claude`,
+`cursor`, or `opencode`; `chat.title_model` is the model reference understood
+by that provider. The default is GPT-5.6 Luna from Codex / ChatGPT. A title
+generation failure leaves Verde's prompt-derived fallback title unchanged.
 
 ## Updates
 

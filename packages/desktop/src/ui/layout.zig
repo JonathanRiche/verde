@@ -531,12 +531,20 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             },
             .settings_control => settings_modal.applyControl(state, hit.index),
             .settings_theme_option => settings_modal.applyThemeOption(state, hit.index),
+            .settings_title_provider_option => settings_modal.applyChatTitleProviderOption(state, hit.index),
+            .settings_title_model_option => settings_modal.applyChatTitleModelOption(state, hit.index),
             .modal_dismiss => dismissTopModal(state),
             .modal_block => {
                 state.palette_modal_text_focus = .none;
                 if (state.settings_theme_dropdown_open) {
                     state.settings_theme_dropdown_open = false;
                     state.settings_theme_hover_index = null;
+                    state.markDirty();
+                }
+                if (state.settings_title_provider_dropdown_open or state.settings_title_model_dropdown_open) {
+                    state.settings_title_provider_dropdown_open = false;
+                    state.settings_title_model_dropdown_open = false;
+                    state.settings_title_menu_hover_index = null;
                     state.markDirty();
                 }
             },
@@ -1206,7 +1214,7 @@ fn renderImageModal(state: *runtime.AppState, width: f32, height: f32) void {
     }
 }
 
-/// Shows the modal used to rename the active workspace.
+/// Shows the modal used to rename the active workspace or chat.
 fn renderWorkspaceRenameModal(state: *runtime.AppState, width: f32, height: f32) void {
     const rename_index = state.rename_project_index orelse return;
     if (rename_index >= state.projects.items.len) {
@@ -1218,10 +1226,11 @@ fn renderWorkspaceRenameModal(state: *runtime.AppState, width: f32, height: f32)
     const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
     drawModalChromeVisual(state, width, height, modal);
     const pad = theme.scaledUi(18.0);
-    queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + pad, .w = modal.w - pad * 2.0, .h = theme.scaledUi(24.0) }, "Rename workspace", paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), modal);
+    const renaming_thread = state.rename_thread_index != null;
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + pad, .w = modal.w - pad * 2.0, .h = theme.scaledUi(24.0) }, if (renaming_thread) "Rename chat" else "Rename workspace", paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), modal);
     queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(44.0), .w = modal.w - pad * 2.0, .h = theme.scaledUi(20.0) }, state.projects.items[rename_index].path, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), modal);
     const input_rect: palette.Rect = .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(76.0), .w = modal.w - pad * 2.0, .h = theme.scaledUi(34.0) };
-    drawTextField(state, input_rect, state.renameInputPublic(), "Workspace label", state.palette_modal_text_focus == .project_rename, state.project_rename_cursor);
+    drawTextField(state, input_rect, state.renameInputPublic(), if (renaming_thread) "Chat title" else "Workspace label", state.palette_modal_text_focus == .project_rename, state.project_rename_cursor);
     const gap = theme.scaledUi(10.0);
     const button_w = (input_rect.w - gap) * 0.5;
     const cancel_rect: palette.Rect = .{ .x = input_rect.x, .y = modal.y + modal.h - pad - theme.scaledUi(34.0), .w = button_w, .h = theme.scaledUi(34.0) };
