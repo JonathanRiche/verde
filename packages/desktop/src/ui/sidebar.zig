@@ -99,6 +99,8 @@ const SidebarContextMenuAction = enum {
     workspace_archive,
     thread_open_tui,
     thread_open_chat,
+    thread_rename,
+    thread_regenerate_title,
     thread_sync,
     thread_archive,
 };
@@ -560,6 +562,8 @@ fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) boo
                 .workspace_archive => state.closeProjectAtIndex(pi),
                 .thread_open_tui => state.openThreadInTui(pi, ti),
                 .thread_open_chat => state.openThreadInChat(pi, ti),
+                .thread_rename => state.beginThreadRename(pi, ti),
+                .thread_regenerate_title => state.regenerateThreadTitleAtIndex(pi, ti),
                 .thread_sync => state.syncThreadFromProvider(pi, ti),
                 .thread_archive => state.archiveThreadAtIndex(pi, ti),
             }
@@ -643,6 +647,7 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
             const pi = state.sidebar_context_menu_project_index;
             const ti = state.sidebar_context_menu_thread_index;
             var can_sync = false;
+            var can_regenerate_title = false;
             var can_archive = true;
             var provider: Provider = .opencode;
             var in_tui = false;
@@ -651,11 +656,14 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
                 if (ti < proj.threads.items.len) {
                     const th = proj.threads.items[ti];
                     can_sync = th.provider_thread_id != null and !th.isSendPendingForUi();
+                    can_regenerate_title = state.canRegenerateThreadTitle(pi, ti);
                     can_archive = !th.isSendPendingForUi();
                     provider = th.provider;
                     in_tui = state.threadIsOpenInTui(pi, ti);
                 }
             }
+            appendSidebarContextMenuRow(.thread_rename, true, "Rename chat");
+            appendSidebarContextMenuRow(.thread_regenerate_title, can_regenerate_title, "Regenerate title");
             appendSidebarContextMenuRow(.thread_sync, can_sync, "Sync thread");
             if (in_tui) {
                 appendSidebarContextMenuRow(.thread_open_chat, true, "Open as chat");

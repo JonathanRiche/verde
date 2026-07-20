@@ -19,6 +19,9 @@ pub const Control = enum(u8) {
     tool_groups_collapsed,
     tool_groups_expanded,
     tool_groups_remember_last,
+    automatic_chat_titles,
+    chat_title_provider_dropdown,
+    chat_title_model_dropdown,
     open_folder,
     open_editor,
     open_cursor,
@@ -53,6 +56,7 @@ const OPEN_CHOICES = [_]OpenChoice{
 };
 
 const THEME_MENU_MAX_ROWS: usize = 6;
+const TITLE_MENU_MAX_ROWS: usize = 6;
 const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
 const NF_COD_CHEVRON_UP = "\u{EAB7}";
 
@@ -115,6 +119,11 @@ const SettingsLayout = struct {
     tool_groups_collapsed: palette.Rect,
     tool_groups_expanded: palette.Rect,
     tool_groups_remember_last: palette.Rect,
+    chat_card: palette.Rect,
+    automatic_chat_titles: palette.Rect,
+    chat_title_provider_dropdown: palette.Rect,
+    chat_title_model_dropdown: palette.Rect,
+    chat_hint_y: f32,
     terminal_card: palette.Rect,
     terminal_font_dec: palette.Rect,
     terminal_font_inc: palette.Rect,
@@ -241,6 +250,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
 
     const appearance_h = m.labeledBlockH(2);
     const transcript_h = m.labeledBlockH(1);
+    const chat_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h + m.row_gap + m.label_h + m.inner_gap + m.row_h;
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra;
     // MCP controls and status, followed by the provider status-hook controls.
@@ -255,7 +265,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     // (preview or expanded), and the show-more / release-page links row.
     const updates_h = m.card_pad * 2.0 + m.title_h + m.inner_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + updates_notes_h + m.inner_gap + m.label_h;
 
-    const body_h = appearance_h + m.card_gap + transcript_h + m.card_gap + terminal_h + m.card_gap + workspace_h + m.card_gap + integrations_h + m.card_gap + updates_h + m.card_gap + notifications_h;
+    const body_h = appearance_h + m.card_gap + transcript_h + m.card_gap + chat_h + m.card_gap + terminal_h + m.card_gap + workspace_h + m.card_gap + integrations_h + m.card_gap + updates_h + m.card_gap + notifications_h;
     const modal_h = m.header_h + m.modal_pad + body_h + m.modal_pad + m.footer_h;
     const modal = layoutModal(width, height, modal_h);
 
@@ -317,6 +327,29 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const tool_groups_remember_last: palette.Rect = .{ .x = tool_groups_expanded.x + tool_group_w + m.inner_gap, .y = tool_group_y, .w = tool_group_w, .h = m.row_h };
 
     y += transcript_h + m.card_gap;
+
+    const chat_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = chat_h };
+    const automatic_chat_titles_y = chat_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
+    const automatic_chat_titles: palette.Rect = .{ .x = chat_card.x + m.card_pad, .y = automatic_chat_titles_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
+    const title_generator_label_y = automatic_chat_titles_y + m.row_h + m.row_gap;
+    const title_generator_y = title_generator_label_y + m.label_h + m.inner_gap;
+    const title_generator_w = content_w - m.card_pad * 2.0;
+    const title_provider_w = (title_generator_w - m.inner_gap) * 0.42;
+    const chat_title_provider_dropdown: palette.Rect = .{
+        .x = chat_card.x + m.card_pad,
+        .y = title_generator_y,
+        .w = title_provider_w,
+        .h = m.row_h,
+    };
+    const chat_title_model_dropdown: palette.Rect = .{
+        .x = chat_title_provider_dropdown.x + chat_title_provider_dropdown.w + m.inner_gap,
+        .y = title_generator_y,
+        .w = title_generator_w - title_provider_w - m.inner_gap,
+        .h = m.row_h,
+    };
+    const chat_hint_y = title_generator_y + m.row_h + m.inner_gap;
+
+    y += chat_h + m.card_gap;
 
     const terminal_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = terminal_h };
     const terminal_font_y = terminal_card.y + m.card_pad + m.title_h + m.row_gap;
@@ -426,6 +459,11 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .tool_groups_collapsed = tool_groups_collapsed,
         .tool_groups_expanded = tool_groups_expanded,
         .tool_groups_remember_last = tool_groups_remember_last,
+        .chat_card = chat_card,
+        .automatic_chat_titles = automatic_chat_titles,
+        .chat_title_provider_dropdown = chat_title_provider_dropdown,
+        .chat_title_model_dropdown = chat_title_model_dropdown,
+        .chat_hint_y = chat_hint_y,
         .terminal_card = terminal_card,
         .terminal_font_dec = terminal_stepper.dec,
         .terminal_font_inc = terminal_stepper.inc,
@@ -525,6 +563,62 @@ fn registerThemeOptionHits(
     }
 }
 
+fn dropdownMenuRect(dropdown: palette.Rect, row_count: usize) palette.Rect {
+    return .{
+        .x = dropdown.x,
+        .y = dropdown.y + dropdown.h + theme.scaledUi(4.0),
+        .w = dropdown.w,
+        .h = @as(f32, @floatFromInt(row_count)) * metrics().row_h,
+    };
+}
+
+fn dropdownOptionRect(menu: palette.Rect, visible_index: usize) palette.Rect {
+    return .{
+        .x = menu.x,
+        .y = menu.y + @as(f32, @floatFromInt(visible_index)) * metrics().row_h,
+        .w = menu.w,
+        .h = metrics().row_h,
+    };
+}
+
+fn titleProviderMenuRect(state: *const runtime.AppState, layout: SettingsLayout) palette.Rect {
+    return dropdownMenuRect(layout.chat_title_provider_dropdown, @min(state.settingsChatTitleProviderCount(), TITLE_MENU_MAX_ROWS));
+}
+
+fn titleModelMenuVisibleCount(state: *const runtime.AppState) usize {
+    return @min(state.settingsChatTitleModelCount(), TITLE_MENU_MAX_ROWS);
+}
+
+fn titleModelMenuMaxScroll(state: *const runtime.AppState) usize {
+    return state.settingsChatTitleModelCount() - titleModelMenuVisibleCount(state);
+}
+
+fn titleModelMenuRect(state: *const runtime.AppState, layout: SettingsLayout) palette.Rect {
+    return dropdownMenuRect(layout.chat_title_model_dropdown, titleModelMenuVisibleCount(state));
+}
+
+fn registerTitleOptionHits(
+    state: *runtime.AppState,
+    layout: SettingsLayout,
+    queue_hit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void,
+) void {
+    if (state.settings_title_provider_dropdown_open) {
+        const menu = titleProviderMenuRect(state, layout);
+        for (0..state.settingsChatTitleProviderCount()) |option_index| {
+            const rect = intersectRect(dropdownOptionRect(menu, option_index), layout.body_clip) orelse continue;
+            queue_hit(state, rect, .settings_title_provider_option, option_index);
+        }
+    }
+    if (state.settings_title_model_dropdown_open) {
+        state.settings_title_model_menu_scroll = @min(state.settings_title_model_menu_scroll, titleModelMenuMaxScroll(state));
+        const menu = titleModelMenuRect(state, layout);
+        for (0..titleModelMenuVisibleCount(state)) |visible_index| {
+            const rect = intersectRect(dropdownOptionRect(menu, visible_index), layout.body_clip) orelse continue;
+            queue_hit(state, rect, .settings_title_model_option, state.settings_title_model_menu_scroll + visible_index);
+        }
+    }
+}
+
 /// Registers palette hit targets for the settings modal.
 pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void) void {
     if (!state.show_settings_modal) return;
@@ -547,6 +641,9 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.tool_groups_collapsed, layout.body_clip, .tool_groups_collapsed, queue_hit);
     queueControlHit(state, layout.tool_groups_expanded, layout.body_clip, .tool_groups_expanded, queue_hit);
     queueControlHit(state, layout.tool_groups_remember_last, layout.body_clip, .tool_groups_remember_last, queue_hit);
+    queueControlHit(state, layout.automatic_chat_titles, layout.body_clip, .automatic_chat_titles, queue_hit);
+    queueControlHit(state, layout.chat_title_provider_dropdown, layout.body_clip, .chat_title_provider_dropdown, queue_hit);
+    queueControlHit(state, layout.chat_title_model_dropdown, layout.body_clip, .chat_title_model_dropdown, queue_hit);
     queueControlHit(state, layout.terminal_font_dec, layout.body_clip, .terminal_font_dec, queue_hit);
     queueControlHit(state, layout.terminal_font_inc, layout.body_clip, .terminal_font_inc, queue_hit);
     queueControlHit(state, layout.links_verde_browser, layout.body_clip, .links_verde_browser, queue_hit);
@@ -572,6 +669,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.updates_release_page, layout.body_clip, .updates_release_page, queue_hit);
     queueControlHit(state, layout.notifications_toggle, layout.body_clip, .notifications_toggle, queue_hit);
     registerThemeOptionHits(state, layout, queue_hit);
+    registerTitleOptionHits(state, layout, queue_hit);
 }
 
 /// Renders the settings modal over the workspace.
@@ -593,6 +691,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     drawHeaderBar(state, layout, dirty);
     drawCard(state, layout.appearance_card, layout.body_clip);
     drawCard(state, layout.transcript_card, layout.body_clip);
+    drawCard(state, layout.chat_card, layout.body_clip);
     drawCard(state, layout.terminal_card, layout.body_clip);
     drawCard(state, layout.workspace_card, layout.body_clip);
     drawCard(state, layout.integrations_card, layout.body_clip);
@@ -611,6 +710,32 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     drawToggleCell(state, layout.tool_groups_collapsed, "Collapsed", state.settings_draft.tool_call_group_preference == .collapsed, isControlHovered(state, .tool_groups_collapsed), layout.body_clip);
     drawToggleCell(state, layout.tool_groups_expanded, "Expanded", state.settings_draft.tool_call_group_preference == .expanded, isControlHovered(state, .tool_groups_expanded), layout.body_clip);
     drawToggleCell(state, layout.tool_groups_remember_last, "Remember last", state.settings_draft.tool_call_group_preference == .remember_last, isControlHovered(state, .tool_groups_remember_last), layout.body_clip);
+
+    // Chat titles
+    drawCardTitle(state, layout.chat_card, "Chat", layout.body_clip);
+    drawFieldLabel(state, layout.chat_card, m, "Titles", layout.body_clip);
+    drawSwitchRow(state, layout.automatic_chat_titles, "Generate automatically", state.settings_draft.automatic_chat_titles_enabled, isControlHovered(state, .automatic_chat_titles), layout.body_clip);
+    const title_generator_label_y = layout.chat_title_provider_dropdown.y - m.inner_gap - m.label_h;
+    queueText(state, .{
+        .x = layout.chat_title_provider_dropdown.x,
+        .y = title_generator_label_y,
+        .w = layout.chat_title_provider_dropdown.w,
+        .h = m.label_h,
+    }, "Provider", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    queueText(state, .{
+        .x = layout.chat_title_model_dropdown.x,
+        .y = title_generator_label_y,
+        .w = layout.chat_title_model_dropdown.w,
+        .h = m.label_h,
+    }, "Model", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    drawChatTitleDropdown(state, layout.chat_title_provider_dropdown, state.settingsChatTitleProviderLabel(state.settingsChatTitleProviderSelectedIndex()), .chat_title_provider_dropdown, state.settings_title_provider_dropdown_open, layout.body_clip);
+    drawChatTitleDropdown(state, layout.chat_title_model_dropdown, state.settingsChatTitleModelSelectedLabel(), .chat_title_model_dropdown, state.settings_title_model_dropdown_open, layout.body_clip);
+    queueText(state, .{
+        .x = layout.chat_card.x + m.card_pad,
+        .y = layout.chat_hint_y,
+        .w = layout.chat_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, "Default: GPT-5.6 Luna from Codex / ChatGPT", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
 
     // Terminal
     drawCardTitle(state, layout.terminal_card, "Terminal", layout.body_clip);
@@ -764,6 +889,8 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
 
     drawBodyScrollbar(state, layout);
     drawThemeDropdownMenu(state, layout);
+    drawChatTitleDropdownMenu(state, layout, true);
+    drawChatTitleDropdownMenu(state, layout, false);
     drawFooterBar(state, layout, dirty);
 }
 
@@ -788,6 +915,21 @@ pub fn handleWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y:
         }
         return true;
     }
+    if (state.settings_title_provider_dropdown_open and rectContains(titleProviderMenuRect(state, layout), x, y)) return true;
+    if (state.settings_title_model_dropdown_open and rectContains(titleModelMenuRect(state, layout), x, y)) {
+        const max_scroll = titleModelMenuMaxScroll(state);
+        const next = if (wheel_y < 0.0)
+            @min(state.settings_title_model_menu_scroll + 1, max_scroll)
+        else if (wheel_y > 0.0)
+            state.settings_title_model_menu_scroll -| 1
+        else
+            state.settings_title_model_menu_scroll;
+        if (next != state.settings_title_model_menu_scroll) {
+            state.settings_title_model_menu_scroll = next;
+            state.markDirty();
+        }
+        return true;
+    }
     if (layout.max_scroll_y <= 0.0) return true;
     if (!rectContains(layout.body_clip, x, y)) return true;
 
@@ -803,10 +945,11 @@ pub fn handleWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y:
 /// Updates settings-modal hover using hits from `refreshPaletteModalHits`.
 pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
     if (!state.show_settings_modal) {
-        if (state.settings_hover_control != null or state.settings_close_hovered or state.settings_theme_hover_index != null) {
+        if (state.settings_hover_control != null or state.settings_close_hovered or state.settings_theme_hover_index != null or state.settings_title_menu_hover_index != null) {
             state.settings_hover_control = null;
             state.settings_close_hovered = false;
             state.settings_theme_hover_index = null;
+            state.settings_title_menu_hover_index = null;
             state.markDirty();
         }
         return;
@@ -814,6 +957,7 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
 
     var new_hover: ?u8 = null;
     var theme_hover: ?usize = null;
+    var title_hover: ?usize = null;
     var close_hovered = false;
     var i = state.palette_modal_hits.items.len;
     while (i > 0) {
@@ -827,16 +971,21 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
             theme_hover = hit.index;
             break;
         }
+        if ((hit.action == .settings_title_provider_option or hit.action == .settings_title_model_option) and rectContains(hit.rect, x, y)) {
+            title_hover = hit.index;
+            break;
+        }
         if (hit.action != .settings_control) continue;
         if (!rectContains(hit.rect, x, y)) continue;
         new_hover = @intCast(hit.index);
         break;
     }
 
-    if (state.settings_hover_control == new_hover and state.settings_close_hovered == close_hovered and state.settings_theme_hover_index == theme_hover) return;
+    if (state.settings_hover_control == new_hover and state.settings_close_hovered == close_hovered and state.settings_theme_hover_index == theme_hover and state.settings_title_menu_hover_index == title_hover) return;
     state.settings_hover_control = new_hover;
     state.settings_close_hovered = close_hovered;
     state.settings_theme_hover_index = theme_hover;
+    state.settings_title_menu_hover_index = title_hover;
     state.markDirty();
 }
 
@@ -847,6 +996,9 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         state.settings_theme_dropdown_open = false;
         state.settings_theme_hover_index = null;
     }
+    if (control != .chat_title_provider_dropdown) state.settings_title_provider_dropdown_open = false;
+    if (control != .chat_title_model_dropdown) state.settings_title_model_dropdown_open = false;
+    if (control != .chat_title_provider_dropdown and control != .chat_title_model_dropdown) state.settings_title_menu_hover_index = null;
     switch (control) {
         .ui_font_dec => state.settings_draft.font_size = theme.clampf(state.settings_draft.font_size - 1.0, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE),
         .ui_font_inc => state.settings_draft.font_size = theme.clampf(state.settings_draft.font_size + 1.0, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE),
@@ -864,6 +1016,25 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .tool_groups_collapsed => state.settings_draft.tool_call_group_preference = .collapsed,
         .tool_groups_expanded => state.settings_draft.tool_call_group_preference = .expanded,
         .tool_groups_remember_last => state.settings_draft.tool_call_group_preference = .remember_last,
+        .automatic_chat_titles => state.settings_draft.automatic_chat_titles_enabled = !state.settings_draft.automatic_chat_titles_enabled,
+        .chat_title_provider_dropdown => {
+            state.settings_title_provider_dropdown_open = !state.settings_title_provider_dropdown_open;
+            if (state.settings_title_provider_dropdown_open) {
+                state.settings_title_menu_hover_index = state.settingsChatTitleProviderSelectedIndex();
+            } else {
+                state.settings_title_menu_hover_index = null;
+            }
+        },
+        .chat_title_model_dropdown => {
+            state.settings_title_model_dropdown_open = !state.settings_title_model_dropdown_open;
+            if (state.settings_title_model_dropdown_open) {
+                const selected = state.settingsChatTitleModelSelectedIndex() orelse 0;
+                state.settings_title_menu_hover_index = selected;
+                ensureTitleModelChoiceVisible(state, selected);
+            } else {
+                state.settings_title_menu_hover_index = null;
+            }
+        },
         .open_folder => state.settings_draft.open_action = .folder,
         .open_editor => state.settings_draft.open_action = .editor,
         .open_cursor => state.settings_draft.open_action = .cursor,
@@ -919,9 +1090,24 @@ pub fn applyThemeOption(state: *runtime.AppState, choice_index: usize) void {
     state.selectSettingsThemeChoice(choice_index);
 }
 
-/// Handles navigation while the settings theme dropdown owns keyboard focus.
+pub fn applyChatTitleProviderOption(state: *runtime.AppState, option_index: usize) void {
+    state.selectSettingsChatTitleProvider(option_index);
+}
+
+pub fn applyChatTitleModelOption(state: *runtime.AppState, option_index: usize) void {
+    state.selectSettingsChatTitleModel(option_index);
+}
+
+/// Handles navigation while a settings dropdown owns keyboard focus.
 pub fn handleKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
-    if (!state.show_settings_modal or !state.settings_theme_dropdown_open) return false;
+    if (!state.show_settings_modal) return false;
+    if (state.settings_theme_dropdown_open) return handleThemeKeyDown(state, key);
+    if (state.settings_title_provider_dropdown_open) return handleTitleProviderKeyDown(state, key);
+    if (state.settings_title_model_dropdown_open) return handleTitleModelKeyDown(state, key);
+    return false;
+}
+
+fn handleThemeKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
     const count = state.settingsThemeChoiceCount();
     if (count == 0) return false;
     const current = state.settings_theme_hover_index orelse state.settings_draft.theme_choice;
@@ -948,6 +1134,59 @@ pub fn handleKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
     return true;
 }
 
+fn handleTitleProviderKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
+    const count = state.settingsChatTitleProviderCount();
+    if (count == 0) return false;
+    const current = state.settings_title_menu_hover_index orelse state.settingsChatTitleProviderSelectedIndex();
+    const next = switch (key) {
+        .up => current -| 1,
+        .down => @min(current + 1, count - 1),
+        .home => 0,
+        .end => count - 1,
+        .escape => {
+            state.settings_title_provider_dropdown_open = false;
+            state.settings_title_menu_hover_index = null;
+            state.markDirty();
+            return true;
+        },
+        .@"return", .kp_enter => {
+            state.selectSettingsChatTitleProvider(current);
+            return true;
+        },
+        else => return false,
+    };
+    state.settings_title_menu_hover_index = next;
+    state.markDirty();
+    return true;
+}
+
+fn handleTitleModelKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
+    const count = state.settingsChatTitleModelCount();
+    if (count == 0) return false;
+    const current = @min(state.settings_title_menu_hover_index orelse state.settingsChatTitleModelSelectedIndex() orelse 0, count - 1);
+    const next = switch (key) {
+        .up => current -| 1,
+        .down => @min(current + 1, count - 1),
+        .home => 0,
+        .end => count - 1,
+        .escape => {
+            state.settings_title_model_dropdown_open = false;
+            state.settings_title_menu_hover_index = null;
+            state.markDirty();
+            return true;
+        },
+        .@"return", .kp_enter => {
+            state.selectSettingsChatTitleModel(current);
+            return true;
+        },
+        else => return false,
+    };
+    state.settings_title_menu_hover_index = next;
+    ensureTitleModelChoiceVisible(state, next);
+    state.markDirty();
+    return true;
+}
+
 fn ensureThemeChoiceVisible(state: *runtime.AppState, choice_index: usize) void {
     if (choice_index < state.settings_theme_menu_scroll) {
         state.settings_theme_menu_scroll = choice_index;
@@ -958,6 +1197,18 @@ fn ensureThemeChoiceVisible(state: *runtime.AppState, choice_index: usize) void 
         }
     }
     state.settings_theme_menu_scroll = @min(state.settings_theme_menu_scroll, themeMenuMaxScroll(state));
+}
+
+fn ensureTitleModelChoiceVisible(state: *runtime.AppState, option_index: usize) void {
+    if (option_index < state.settings_title_model_menu_scroll) {
+        state.settings_title_model_menu_scroll = option_index;
+    } else {
+        const visible_count = titleModelMenuVisibleCount(state);
+        if (option_index >= state.settings_title_model_menu_scroll + visible_count) {
+            state.settings_title_model_menu_scroll = option_index - visible_count + 1;
+        }
+    }
+    state.settings_title_model_menu_scroll = @min(state.settings_title_model_menu_scroll, titleModelMenuMaxScroll(state));
 }
 
 const NOTES_FONT_SIZE = 12.0;
@@ -1200,6 +1451,92 @@ fn drawThemeDropdownMenu(state: *runtime.AppState, layout: SettingsLayout) void 
         const travel = track.h - thumb_h;
         const max_scroll = themeMenuMaxScroll(state);
         const progress = @as(f32, @floatFromInt(state.settings_theme_menu_scroll)) / @as(f32, @floatFromInt(max_scroll));
+        queueRoundedRectClipped(state, track, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 20)), theme.scaledUi(1.0), layout.body_clip);
+        queueRoundedRectClipped(state, .{ .x = track.x, .y = track.y + travel * progress, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 100)), theme.scaledUi(1.0), layout.body_clip);
+    }
+}
+
+// Chat title provider/model selector control.
+fn drawChatTitleDropdown(
+    state: *runtime.AppState,
+    rect: palette.Rect,
+    label: []const u8,
+    control: Control,
+    open: bool,
+    clip: palette.Rect,
+) void {
+    const background = if (open)
+        theme.withAlpha(theme.accent(), 34)
+    else if (isControlHovered(state, control))
+        controlHoverSurface()
+    else
+        controlSurface();
+    queueRoundedRectClipped(state, rect, paletteColor(background), radiusSm(), clip);
+    queueBorderClipped(state, rect, paletteColor(if (open) theme.withAlpha(theme.accent(), 150) else theme.withAlpha(theme.COLOR_WHITE, 24)), radiusSm(), theme.scaledUi(1.0), clip);
+    queueText(state, .{
+        .x = rect.x + theme.scaledUi(10.0),
+        .y = rect.y + (rect.h - theme.scaledUi(15.0)) * 0.5,
+        .w = rect.w - theme.scaledUi(38.0),
+        .h = theme.scaledUi(15.0),
+    }, label, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), clip);
+    const chevron_size = theme.scaledUi(14.0);
+    queueIconText(state, .{
+        .x = rect.x + rect.w - theme.scaledUi(18.0),
+        .y = rect.y + (rect.h - chevron_size) * 0.5,
+        .w = chevron_size,
+        .h = chevron_size,
+    }, if (open) NF_COD_CHEVRON_UP else NF_COD_CHEVRON_DOWN, paletteColor(textLabel()), chevron_size, clip);
+}
+
+// Chat title provider/model popup rows.
+fn drawChatTitleDropdownMenu(state: *runtime.AppState, layout: SettingsLayout, provider_menu: bool) void {
+    const open = if (provider_menu) state.settings_title_provider_dropdown_open else state.settings_title_model_dropdown_open;
+    if (!open) return;
+    const count = if (provider_menu) state.settingsChatTitleProviderCount() else state.settingsChatTitleModelCount();
+    const visible_count = if (provider_menu) count else titleModelMenuVisibleCount(state);
+    const scroll = if (provider_menu) 0 else state.settings_title_model_menu_scroll;
+    const menu = if (provider_menu) titleProviderMenuRect(state, layout) else titleModelMenuRect(state, layout);
+    queueRoundedRectClipped(state, menu, paletteColor(raisedSurface(0.14)), radiusSm(), layout.body_clip);
+    queueBorderClipped(state, menu, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 34)), radiusSm(), theme.scaledUi(1.0), layout.body_clip);
+
+    const selected_index = if (provider_menu) state.settingsChatTitleProviderSelectedIndex() else state.settingsChatTitleModelSelectedIndex() orelse std.math.maxInt(usize);
+    for (0..visible_count) |visible_index| {
+        const option_index = scroll + visible_index;
+        const row = dropdownOptionRect(menu, visible_index);
+        const selected = option_index == selected_index;
+        const hovered = state.settings_title_menu_hover_index == option_index;
+        if (selected or hovered) {
+            const color = if (selected) theme.withAlpha(theme.accent(), 38) else controlHoverSurface();
+            queueRoundedRectClipped(state, row, paletteColor(color), theme.scaledUi(4.0), layout.body_clip);
+        }
+
+        const dot_size = theme.scaledUi(6.0);
+        const dot_color = if (selected) theme.accent() else theme.withAlpha(theme.COLOR_TEXT_MUTED, 110);
+        queueRoundedRectClipped(state, .{
+            .x = row.x + theme.scaledUi(10.0),
+            .y = row.y + (row.h - dot_size) * 0.5,
+            .w = dot_size,
+            .h = dot_size,
+        }, paletteColor(dot_color), dot_size * 0.5, layout.body_clip);
+        const label = if (provider_menu) state.settingsChatTitleProviderLabel(option_index) else state.settingsChatTitleModelLabel(option_index);
+        queueText(state, .{
+            .x = row.x + theme.scaledUi(25.0),
+            .y = row.y + (row.h - theme.scaledUi(15.0)) * 0.5,
+            .w = row.w - theme.scaledUi(42.0),
+            .h = theme.scaledUi(15.0),
+        }, label, paletteColor(if (selected or hovered) theme.COLOR_WHITE else textLabel()), theme.scaledUi(13.0), layout.body_clip);
+    }
+
+    if (!provider_menu and count > visible_count) {
+        const track: palette.Rect = .{
+            .x = menu.x + menu.w - theme.scaledUi(5.0),
+            .y = menu.y + theme.scaledUi(4.0),
+            .w = theme.scaledUi(2.0),
+            .h = menu.h - theme.scaledUi(8.0),
+        };
+        const thumb_h = track.h * @as(f32, @floatFromInt(visible_count)) / @as(f32, @floatFromInt(count));
+        const travel = track.h - thumb_h;
+        const progress = @as(f32, @floatFromInt(scroll)) / @as(f32, @floatFromInt(titleModelMenuMaxScroll(state)));
         queueRoundedRectClipped(state, track, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 20)), theme.scaledUi(1.0), layout.body_clip);
         queueRoundedRectClipped(state, .{ .x = track.x, .y = track.y + travel * progress, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 100)), theme.scaledUi(1.0), layout.body_clip);
     }

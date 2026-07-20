@@ -78,6 +78,8 @@ const KeybindRef = enum {
 /// Static command table — add a row here to add a palette entry.
 const STATIC_COMMANDS = [_]Command{
     .{ .id = "thread.new", .title = "New Chat", .keywords = "thread conversation start", .section = .threads, .keybind = .new_thread, .run = runNewChat, .enabled = hasProjects },
+    .{ .id = "thread.rename_current", .title = "Rename Current Chat", .keywords = "thread title label", .section = .threads, .run = runRenameCurrentChat, .enabled = currentThreadCommitted },
+    .{ .id = "thread.regenerate_title", .title = "Regenerate Chat Title", .keywords = "thread rename luna automatic", .section = .threads, .run = runRegenerateChatTitle, .enabled = canRegenerateChatTitle },
     .{ .id = "thread.sync_current", .title = "Sync Current Thread", .keywords = "refresh provider", .section = .threads, .run = runSyncCurrentThread, .enabled = canSyncCurrentThread },
     .{ .id = "thread.open_current_codex_tui", .title = "Open Codex TUI for Current Thread", .keywords = "open codex tui current thread terminal resume active focused", .section = .threads, .run = runOpenCurrentThreadInTui, .enabled = canOpenFocusedCodexThreadInTui },
     .{ .id = "thread.open_current_tui", .title = "Open Current Thread in TUI", .keywords = "open agent tui current thread opencode claude cursor terminal resume active focused", .section = .threads, .run = runOpenCurrentThreadInTui, .enabled = canOpenFocusedNonCodexThreadInTui },
@@ -984,6 +986,17 @@ fn currentThreadNotPending(state: *runtime.AppState) bool {
     return thread.committed and !thread.isSendPendingForUi();
 }
 
+fn currentThreadCommitted(state: *runtime.AppState) bool {
+    if (state.selected_project_index >= state.projects.items.len) return false;
+    const project = &state.projects.items[state.selected_project_index];
+    if (project.selected_thread_index >= project.threads.items.len) return false;
+    return project.threads.items[project.selected_thread_index].committed;
+}
+
+fn canRegenerateChatTitle(state: *runtime.AppState) bool {
+    return state.canRegenerateCurrentThreadTitle();
+}
+
 fn canSyncCurrentThread(state: *runtime.AppState) bool {
     if (state.selected_project_index >= state.projects.items.len) return false;
     const thread_index = focusedGuiThreadIndex(state) orelse return false;
@@ -1119,6 +1132,14 @@ fn runAddWorkspace(state: *runtime.AppState) void {
 
 fn runRenameWorkspace(state: *runtime.AppState) void {
     state.beginProjectRename(state.selected_project_index);
+}
+
+fn runRenameCurrentChat(state: *runtime.AppState) void {
+    state.beginCurrentThreadRename();
+}
+
+fn runRegenerateChatTitle(state: *runtime.AppState) void {
+    state.regenerateCurrentThreadTitle();
 }
 
 fn runCloseWorkspace(state: *runtime.AppState) void {

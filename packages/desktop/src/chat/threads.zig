@@ -118,8 +118,51 @@ pub fn makeThreadTitle(allocator: std.mem.Allocator, prompt: []const u8) ![:0]co
     return try allocator.dupeZ(u8, compact[0..count]);
 }
 
+/// Normalizes a model response into one concise, single-line thread title.
+pub fn makeGeneratedThreadTitle(allocator: std.mem.Allocator, response: []const u8) !?[:0]const u8 {
+    const first_line_end = std.mem.findScalar(u8, response, '\n') orelse response.len;
+    var title = std.mem.trim(u8, response[0..first_line_end], &std.ascii.whitespace);
+    if (std.mem.startsWith(u8, title, "Title:")) {
+        title = std.mem.trimStart(u8, title["Title:".len..], &std.ascii.whitespace);
+    }
+    title = std.mem.trim(u8, title, " \t\r`\"'");
+    if (title.len == 0) return null;
+
+    var compact: [72]u8 = undefined;
+    var count: usize = 0;
+    var saw_space = false;
+    for (title) |char| {
+        const normalized = if (std.ascii.isWhitespace(char)) ' ' else char;
+        if (normalized == ' ') {
+            if (count == 0 or saw_space) continue;
+            saw_space = true;
+        } else {
+            saw_space = false;
+        }
+        if (count == compact.len) break;
+        compact[count] = normalized;
+        count += 1;
+    }
+    while (count > 0 and compact[count - 1] == ' ') count -= 1;
+    // If the byte limit lands inside UTF-8, omit the partial codepoint.
+    while (count > 0 and !std.unicode.utf8ValidateSlice(compact[0..count])) count -= 1;
+    if (count == 0) return null;
+    return try allocator.dupeZ(u8, compact[0..count]);
+}
+
 /// Restores persisted enum values to a valid known variant.
 pub fn sanitizeEnum(comptime Enum: type, value: *Enum, fallback: Enum) void {
     const raw = @as(*u8, @ptrCast(value)).*;
     value.* = std.enums.fromInt(Enum, raw) orelse fallback;
+}
+
+test "generated thread title strips response framing" {
+    const title = (try makeGeneratedThreadTitle(std.testing.allocator, "  Title: `Fix flaky auth tests`  \nExtra explanation")) orelse return error.TestExpectedEqual;
+    defer std.testing.allocator.free(title);
+
+    try std.testing.expectEqualStrings("Fix flaky auth tests", title);
+}
+
+test "generated thread title rejects an empty first line" {
+    try std.testing.expect((try makeGeneratedThreadTitle(std.testing.allocator, "\nA later explanation")) == null);
 }

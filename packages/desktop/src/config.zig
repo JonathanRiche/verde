@@ -10,6 +10,22 @@ pub const MAX_FONT_SIZE: f32 = 32.0;
 pub const DEFAULT_TERMINAL_FONT_SIZE: f32 = 18.0;
 pub const MIN_TERMINAL_FONT_SIZE: f32 = 13.5;
 pub const MAX_TERMINAL_FONT_SIZE: f32 = 60.0;
+pub const DEFAULT_CHAT_TITLE_MODEL = "gpt-5.6-luna";
+
+pub const ChatTitleProvider = enum {
+    codex,
+    claude,
+    cursor,
+    opencode,
+
+    pub fn parse(value: []const u8) ?ChatTitleProvider {
+        if (std.mem.eql(u8, value, "codex")) return .codex;
+        if (std.mem.eql(u8, value, "claude")) return .claude;
+        if (std.mem.eql(u8, value, "cursor")) return .cursor;
+        if (std.mem.eql(u8, value, "opencode")) return .opencode;
+        return null;
+    }
+};
 
 pub const CustomOpenAction = struct {
     label: []u8,
@@ -106,6 +122,9 @@ pub const AppConfig = struct {
     terminal_launch_profiles: []TerminalLaunchProfileConfig = &.{},
     tool_call_group_preference: ToolCallGroupPreference = .collapsed,
     tool_call_groups_last_expanded: bool = false,
+    automatic_chat_titles_enabled: bool = true,
+    chat_title_provider: ChatTitleProvider = .codex,
+    chat_title_model: ?[]u8 = null,
     check_for_updates_automatically: bool = true,
     // User-scoped provider registration is opt-in because it updates each
     // detected agent's global configuration outside Verde's own config dir.
@@ -118,11 +137,27 @@ pub const AppConfig = struct {
 
     pub fn deinit(self: *AppConfig, allocator: std.mem.Allocator) void {
         if (self.active_theme) |name| allocator.free(name);
+        if (self.chat_title_model) |model| allocator.free(model);
         for (self.installed_themes) |*installed| installed.deinit(allocator);
         allocator.free(self.installed_themes);
         self.default_open_action.deinit(allocator);
         for (self.terminal_launch_profiles) |*profile| profile.deinit(allocator);
         allocator.free(self.terminal_launch_profiles);
+    }
+
+    pub fn chatTitleModel(self: AppConfig) []const u8 {
+        return self.chat_title_model orelse switch (self.chat_title_provider) {
+            .codex => DEFAULT_CHAT_TITLE_MODEL,
+            .claude => "default",
+            .cursor => "composer-2",
+            .opencode => "opencode/gpt-5.4",
+        };
+    }
+
+    pub fn setChatTitleModel(self: *AppConfig, allocator: std.mem.Allocator, model: []const u8) !void {
+        const owned_model = try allocator.dupe(u8, model);
+        if (self.chat_title_model) |previous| allocator.free(previous);
+        self.chat_title_model = owned_model;
     }
 
     pub fn activeThemeIndex(self: AppConfig) ?usize {
@@ -266,6 +301,7 @@ pub fn saveAppConfig(allocator: std.mem.Allocator, config: *const AppConfig) !vo
     try writeOpenSection(tree_allocator, &root.object, config);
     try writeTerminalSection(tree_allocator, &root.object, config);
     try writeTranscriptSection(tree_allocator, &root.object, config);
+    try writeChatSection(tree_allocator, &root.object, config);
     try writeUpdatesSection(tree_allocator, &root.object, config);
     try writeNotificationsSection(tree_allocator, &root.object, config);
     try writeIntegrationsSection(tree_allocator, &root.object, config);
@@ -427,6 +463,13 @@ fn writeTranscriptSection(allocator: std.mem.Allocator, object: *std.json.Object
     try transcript_object.put(allocator, "tool_call_groups_last_expanded", .{ .bool = config.tool_call_groups_last_expanded });
 }
 
+fn writeChatSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
+    const chat_object = try objectSection(allocator, object, "chat");
+    try chat_object.put(allocator, "automatic_titles", .{ .bool = config.automatic_chat_titles_enabled });
+    try chat_object.put(allocator, "title_provider", .{ .string = @tagName(config.chat_title_provider) });
+    try chat_object.put(allocator, "title_model", .{ .string = config.chatTitleModel() });
+}
+
 fn writeUpdatesSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
     const updates_object = try objectSection(allocator, object, "updates");
     try updates_object.put(allocator, "check_automatically", .{ .bool = config.check_for_updates_automatically });
@@ -486,6 +529,9 @@ fn applyAppOverrides(allocator: std.mem.Allocator, config: *AppConfig, root: std
     if (root.object.get("transcript")) |transcript_value| {
         applyTranscriptOverrides(config, transcript_value);
     }
+    if (root.object.get("chat")) |chat_value| {
+        applyChatOverrides(allocator, config, chat_value);
+    }
     if (root.object.get("installed_themes")) |installed_value| {
         applyInstalledThemeOverrides(allocator, config, installed_value);
     }
@@ -523,6 +569,40 @@ fn applyTranscriptOverrides(config: *AppConfig, transcript_value: std.json.Value
             config.tool_call_groups_last_expanded = last_value.bool;
         } else {
             log.warn("transcript.tool_call_groups_last_expanded must be a boolean when provided", .{});
+        }
+    }
+}
+
+fn applyChatOverrides(allocator: std.mem.Allocator, config: *AppConfig, chat_value: std.json.Value) void {
+    if (chat_value != .object) {
+        log.warn("chat must be an object when provided", .{});
+        return;
+    }
+    if (chat_value.object.get("automatic_titles")) |enabled_value| {
+        if (enabled_value == .bool) {
+            config.automatic_chat_titles_enabled = enabled_value.bool;
+        } else {
+            log.warn("chat.automatic_titles must be a boolean when provided", .{});
+        }
+    }
+    if (chat_value.object.get("title_provider")) |provider_value| {
+        if (provider_value == .string) {
+            if (ChatTitleProvider.parse(provider_value.string)) |provider| {
+                config.chat_title_provider = provider;
+            } else {
+                log.warn("chat.title_provider must be codex, claude, cursor, or opencode", .{});
+            }
+        } else {
+            log.warn("chat.title_provider must be a string when provided", .{});
+        }
+    }
+    if (chat_value.object.get("title_model")) |model_value| {
+        if (model_value == .string and model_value.string.len > 0) {
+            config.setChatTitleModel(allocator, model_value.string) catch {
+                log.warn("could not allocate chat.title_model", .{});
+            };
+        } else {
+            log.warn("chat.title_model must be a non-empty string when provided", .{});
         }
     }
 }
@@ -1054,6 +1134,29 @@ test "app config accepts automatic update check preference" {
     applyAppOverrides(std.testing.allocator, &config, root.value);
 
     try std.testing.expect(!config.check_for_updates_automatically);
+}
+
+test "app config accepts automatic chat title preference" {
+    var root = try parseTestRoot("{\"chat\":{\"automatic_titles\":false}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expect(!config.automatic_chat_titles_enabled);
+}
+
+test "app config accepts chat title provider and model" {
+    var root = try parseTestRoot("{\"chat\":{\"title_provider\":\"claude\",\"title_model\":\"haiku\"}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(ChatTitleProvider.claude, config.chat_title_provider);
+    try std.testing.expectEqualStrings("haiku", config.chatTitleModel());
 }
 
 test "app config accepts tool call group preference" {
