@@ -103,6 +103,9 @@ private final class VerdeMacBrowser: NSObject, WKScriptMessageHandler, WKNavigat
         self.container.autoresizesSubviews = true
         self.webView = WKWebView(frame: .zero, configuration: configuration)
         self.webView.autoresizingMask = [.width, .height]
+        if #available(macOS 13.3, *) {
+            self.webView.isInspectable = true
+        }
 
         super.init()
 

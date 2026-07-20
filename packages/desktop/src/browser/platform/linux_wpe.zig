@@ -6,6 +6,7 @@ const browser_queue = @import("../queue.zig");
 const browser_texture = @import("../texture.zig");
 const browser_types = @import("../types.zig");
 const ipc = @import("linux_ipc.zig");
+const loop_wakeup = @import("loop_wakeup");
 
 const log = std.log.scoped(.linux_wpe);
 
@@ -34,6 +35,10 @@ fn monotonicTimestampNs() i128 {
     if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
     return @as(i128, @intCast(ts.sec)) * std.time.ns_per_s +
         @as(i128, @intCast(ts.nsec));
+}
+
+fn monotonicTimestampNsU64() u64 {
+    return @intCast(@max(monotonicTimestampNs(), 0));
 }
 
 fn nanosToMillis(nanos: i128) f64 {
@@ -108,17 +113,188 @@ const SharedQueue = struct {
     }
 };
 
+const FrameRelease = struct {
+    sequence: u64,
+    slot: u8,
+};
+
+const MetricSamples = struct {
+    values: [256]u64 = undefined,
+    len: usize = 0,
+
+    fn add(self: *MetricSamples, value: u64) void {
+        if (self.len >= self.values.len) return;
+        self.values[self.len] = value;
+        self.len += 1;
+    }
+
+    fn percentile(self: *const MetricSamples, percent: usize) u64 {
+        if (self.len == 0) return 0;
+        var sorted: [256]u64 = undefined;
+        @memcpy(sorted[0..self.len], self.values[0..self.len]);
+        var index: usize = 1;
+        while (index < self.len) : (index += 1) {
+            const value = sorted[index];
+            var cursor = index;
+            while (cursor > 0 and sorted[cursor - 1] > value) : (cursor -= 1) {
+                sorted[cursor] = sorted[cursor - 1];
+            }
+            sorted[cursor] = value;
+        }
+        return sorted[((self.len - 1) * percent) / 100];
+    }
+
+    fn clear(self: *MetricSamples) void {
+        self.len = 0;
+    }
+};
+
+const FrameMetrics = struct {
+    received: u64 = 0,
+    stale_rejected: u64 = 0,
+    pending_overwritten: u64 = 0,
+    slot_releases: u64 = 0,
+    wake_requested: u64 = 0,
+    wake_coalesced: u64 = 0,
+    upload_deferred: u64 = 0,
+    upload_completed: u64 = 0,
+    screenshot_copies: u64 = 0,
+    presented: u64 = 0,
+    last_received_ns: u64 = 0,
+    last_presented_ns: u64 = 0,
+    last_input_serial: u64 = 0,
+    last_presented_input_serial: u64 = 0,
+    last_report_ns: u64 = 0,
+    receive_intervals: MetricSamples = .{},
+    present_intervals: MetricSamples = .{},
+    helper_transport: MetricSamples = .{},
+    export_to_receive: MetricSamples = .{},
+    export_to_present: MetricSamples = .{},
+    input_to_frame: MetricSamples = .{},
+    input_to_present: MetricSamples = .{},
+    upload_duration: MetricSamples = .{},
+
+    fn noteReceived(self: *FrameMetrics, event: ipc.Event, received_at_ns: u64) void {
+        self.received += 1;
+        if (self.last_received_ns > 0 and received_at_ns >= self.last_received_ns) {
+            self.receive_intervals.add(received_at_ns - self.last_received_ns);
+        }
+        if (event.helper_sent_at_ns > 0 and received_at_ns >= event.helper_sent_at_ns) {
+            self.helper_transport.add(received_at_ns - event.helper_sent_at_ns);
+        }
+        if (event.exported_at_ns > 0 and received_at_ns >= event.exported_at_ns) {
+            self.export_to_receive.add(received_at_ns - event.exported_at_ns);
+        }
+        if (event.input_serial != 0 and event.input_serial != self.last_input_serial) {
+            self.last_input_serial = event.input_serial;
+            if (event.input_sent_at_ns > 0 and received_at_ns >= event.input_sent_at_ns) {
+                self.input_to_frame.add(received_at_ns - event.input_sent_at_ns);
+            }
+        }
+        self.last_received_ns = received_at_ns;
+    }
+
+    fn notePresented(self: *FrameMetrics, input_serial: u64, input_sent_at_ns: u64, exported_at_ns: u64, presented_at_ns: u64) void {
+        self.presented += 1;
+        if (self.last_presented_ns > 0 and presented_at_ns >= self.last_presented_ns) {
+            self.present_intervals.add(presented_at_ns - self.last_presented_ns);
+        }
+        if (exported_at_ns > 0 and presented_at_ns >= exported_at_ns) {
+            self.export_to_present.add(presented_at_ns - exported_at_ns);
+        }
+        if (input_serial != 0 and input_serial != self.last_presented_input_serial) {
+            self.last_presented_input_serial = input_serial;
+            if (input_sent_at_ns > 0 and presented_at_ns >= input_sent_at_ns) {
+                self.input_to_present.add(presented_at_ns - input_sent_at_ns);
+            }
+        }
+        self.last_presented_ns = presented_at_ns;
+    }
+
+    fn maybeLog(self: *FrameMetrics, now_ns: u64) void {
+        if (!frameLogEnabled()) return;
+        if (self.last_report_ns != 0 and now_ns - self.last_report_ns < std.time.ns_per_s) return;
+        self.last_report_ns = now_ns;
+        log.info(
+            "frame-pipeline received={} presented={} stale={} overwritten={} releases={} wakes={}/{} upload_deferred={} uploaded={} screenshots={} receive_interval_ms[p50={d:.2} p95={d:.2} p99={d:.2}] present_interval_ms[p50={d:.2} p95={d:.2} p99={d:.2}] transport_ms[p50={d:.2} p95={d:.2} p99={d:.2}]",
+            .{
+                self.received,
+                self.presented,
+                self.stale_rejected,
+                self.pending_overwritten,
+                self.slot_releases,
+                self.wake_requested,
+                self.wake_coalesced,
+                self.upload_deferred,
+                self.upload_completed,
+                self.screenshot_copies,
+                nanosToMillis(@intCast(self.receive_intervals.percentile(50))),
+                nanosToMillis(@intCast(self.receive_intervals.percentile(95))),
+                nanosToMillis(@intCast(self.receive_intervals.percentile(99))),
+                nanosToMillis(@intCast(self.present_intervals.percentile(50))),
+                nanosToMillis(@intCast(self.present_intervals.percentile(95))),
+                nanosToMillis(@intCast(self.present_intervals.percentile(99))),
+                nanosToMillis(@intCast(self.helper_transport.percentile(50))),
+                nanosToMillis(@intCast(self.helper_transport.percentile(95))),
+                nanosToMillis(@intCast(self.helper_transport.percentile(99))),
+            },
+        );
+        log.info(
+            "frame-latency export_receive_ms[p50={d:.2} p95={d:.2} p99={d:.2}] export_present_ms[p50={d:.2} p95={d:.2} p99={d:.2}] input_receive_ms[p50={d:.2} p95={d:.2} p99={d:.2}] input_present_ms[p50={d:.2} p95={d:.2} p99={d:.2}] upload_ms[p50={d:.2} p95={d:.2} p99={d:.2}]",
+            .{
+                nanosToMillis(@intCast(self.export_to_receive.percentile(50))),
+                nanosToMillis(@intCast(self.export_to_receive.percentile(95))),
+                nanosToMillis(@intCast(self.export_to_receive.percentile(99))),
+                nanosToMillis(@intCast(self.export_to_present.percentile(50))),
+                nanosToMillis(@intCast(self.export_to_present.percentile(95))),
+                nanosToMillis(@intCast(self.export_to_present.percentile(99))),
+                nanosToMillis(@intCast(self.input_to_frame.percentile(50))),
+                nanosToMillis(@intCast(self.input_to_frame.percentile(95))),
+                nanosToMillis(@intCast(self.input_to_frame.percentile(99))),
+                nanosToMillis(@intCast(self.input_to_present.percentile(50))),
+                nanosToMillis(@intCast(self.input_to_present.percentile(95))),
+                nanosToMillis(@intCast(self.input_to_present.percentile(99))),
+                nanosToMillis(@intCast(self.upload_duration.percentile(50))),
+                nanosToMillis(@intCast(self.upload_duration.percentile(95))),
+                nanosToMillis(@intCast(self.upload_duration.percentile(99))),
+            },
+        );
+        self.receive_intervals.clear();
+        self.present_intervals.clear();
+        self.helper_transport.clear();
+        self.export_to_receive.clear();
+        self.export_to_present.clear();
+        self.input_to_frame.clear();
+        self.input_to_present.clear();
+        self.upload_duration.clear();
+    }
+};
+
 const SharedFrame = struct {
     mutex: Mutex = .{},
     slots: [FRAME_SLOT_COUNT][]align(std.heap.page_size_min) u8 = undefined,
     slot_ready: [FRAME_SLOT_COUNT]bool = [_]bool{false} ** FRAME_SLOT_COUNT,
-    staging: std.ArrayList(u8) = .empty,
+    current_slot: ?u8 = null,
+    releases: [FRAME_SLOT_COUNT * 2]FrameRelease = undefined,
+    release_count: usize = 0,
     path: ?[]u8 = null,
     sequence: u64 = 0,
     width: u32 = 0,
     height: u32 = 0,
     byte_len: usize = 0,
     dirty: bool = false,
+    exported_at_ns: u64 = 0,
+    published_at_ns: u64 = 0,
+    helper_sent_at_ns: u64 = 0,
+    received_at_ns: u64 = 0,
+    input_serial: u64 = 0,
+    input_sent_at_ns: u64 = 0,
+    uploaded_sequence: u64 = 0,
+    uploaded_exported_at_ns: u64 = 0,
+    uploaded_input_serial: u64 = 0,
+    uploaded_input_sent_at_ns: u64 = 0,
+    presented_sequence: u64 = 0,
+    metrics: FrameMetrics = .{},
 
     /// Releases the latest published helper frame metadata.
     fn deinit(self: *SharedFrame, allocator: std.mem.Allocator) void {
@@ -133,48 +309,97 @@ const SharedFrame = struct {
             std.posix.munmap(self.slots[index]);
             self.slot_ready[index] = false;
         }
-        self.staging.deinit(allocator);
         self.path = null;
+        self.current_slot = null;
         self.sequence = 0;
         self.width = 0;
         self.height = 0;
         self.byte_len = 0;
         self.dirty = false;
+        self.release_count = 0;
     }
 
-    /// Replaces the latest published helper frame metadata.
-    fn update(self: *SharedFrame, allocator: std.mem.Allocator, event: ipc.Event) !void {
+    fn queueReleaseLocked(self: *SharedFrame, release: FrameRelease) void {
+        if (release.sequence == 0) return;
+        for (self.releases[0..self.release_count]) |pending| {
+            if (pending.sequence == release.sequence and pending.slot == release.slot) return;
+        }
+        if (self.release_count >= self.releases.len) return;
+        self.releases[self.release_count] = release;
+        self.release_count += 1;
+    }
+
+    fn popRelease(self: *SharedFrame) ?FrameRelease {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.release_count == 0) return null;
+        self.release_count -= 1;
+        return self.releases[self.release_count];
+    }
+
+    fn restoreRelease(self: *SharedFrame, release: FrameRelease) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.queueReleaseLocked(release);
+    }
+
+    fn noteWake(self: *SharedFrame, result: loop_wakeup.NotifyResult) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.metrics.wake_requested += 1;
+        if (result == .coalesced) self.metrics.wake_coalesced += 1;
+    }
+
+    /// Replaces the latest published helper frame metadata without copying its pixels.
+    fn update(self: *SharedFrame, allocator: std.mem.Allocator, event: ipc.Event) !bool {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         if (event.frame_sequence <= self.sequence) {
-            if (event.frame_path) |path| deleteFramePath(path);
-            return;
-        }
-
-        if (event.frame_path) |path| {
-            if (self.path) |old_path| {
-                deleteFramePath(old_path);
-                allocator.free(old_path);
+            self.metrics.stale_rejected += 1;
+            if (event.frame_path) |path| {
+                deleteFramePath(path);
+            } else if (event.frame_slot < FRAME_SLOT_COUNT) {
+                const is_current = event.frame_sequence == self.sequence and self.current_slot == event.frame_slot;
+                if (!is_current) self.queueReleaseLocked(.{ .sequence = event.frame_sequence, .slot = event.frame_slot });
             }
-            self.path = try allocator.dupe(u8, path);
-        } else {
+            return false;
+        }
+        if (event.frame_path == null) {
             if (event.frame_slot >= FRAME_SLOT_COUNT) return error.InvalidFrameSlot;
             if (!self.slot_ready[event.frame_slot]) return error.InvalidFrameSlot;
             if (event.byte_len > self.slots[event.frame_slot].len) return error.FrameTooLarge;
-            try self.staging.resize(allocator, event.byte_len);
-            @memcpy(self.staging.items[0..event.byte_len], self.slots[event.frame_slot][0..event.byte_len]);
-            if (self.path) |old_path| {
-                deleteFramePath(old_path);
-                allocator.free(old_path);
-                self.path = null;
-            }
         }
+
+        if (self.current_slot) |slot| {
+            self.queueReleaseLocked(.{ .sequence = self.sequence, .slot = slot });
+        }
+        if (self.dirty) self.metrics.pending_overwritten += 1;
+        if (self.path) |old_path| {
+            deleteFramePath(old_path);
+            allocator.free(old_path);
+            self.path = null;
+        }
+        if (event.frame_path) |path| {
+            self.path = try allocator.dupe(u8, path);
+            self.current_slot = null;
+        } else {
+            self.current_slot = event.frame_slot;
+        }
+
         self.sequence = event.frame_sequence;
         self.width = event.width;
         self.height = event.height;
         self.byte_len = event.byte_len;
+        self.exported_at_ns = event.exported_at_ns;
+        self.published_at_ns = event.published_at_ns;
+        self.helper_sent_at_ns = event.helper_sent_at_ns;
+        self.received_at_ns = monotonicTimestampNsU64();
+        self.input_serial = event.input_serial;
+        self.input_sent_at_ns = event.input_sent_at_ns;
         self.dirty = true;
+        self.metrics.noteReceived(event, self.received_at_ns);
+        return true;
     }
 
     /// Uploads the latest dirty helper snapshot into the pane texture.
@@ -184,71 +409,82 @@ const SharedFrame = struct {
         frame_buffer: *std.ArrayList(u8),
         texture: *browser_texture.PaneTexture,
     ) !bool {
-        var upload_path: ?[]u8 = null;
-        var upload_sequence: u64 = 0;
-        var upload_width: u32 = 0;
-        var upload_height: u32 = 0;
-        var upload_byte_len: usize = 0;
-        var upload_pixels: []u8 = &.{};
-
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            if (!self.dirty or self.width == 0 or self.height == 0 or self.byte_len == 0) {
-                return false;
-            }
-            upload_sequence = self.sequence;
-            upload_width = self.width;
-            upload_height = self.height;
-            upload_byte_len = self.byte_len;
-            if (self.path) |path| {
-                upload_path = path;
-                self.path = null;
-            } else {
-                try frame_buffer.resize(allocator, upload_byte_len);
-                @memcpy(frame_buffer.items[0..upload_byte_len], self.staging.items[0..upload_byte_len]);
-                upload_pixels = frame_buffer.items[0..upload_byte_len];
-            }
-            self.dirty = false;
-        }
-        defer {
-            if (upload_path) |path| {
-                deleteFramePath(path);
-                allocator.free(path);
-            }
-        }
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.dirty or self.width == 0 or self.height == 0 or self.byte_len == 0) return false;
 
         const read_start = monotonicTimestampNs();
-        if (upload_path) |path| {
-            try frame_buffer.resize(allocator, upload_byte_len);
+        var upload_pixels: []const u8 = undefined;
+        if (self.path) |path| {
+            try frame_buffer.resize(allocator, self.byte_len);
             var threaded = std.Io.Threaded.init_single_threaded;
             const file = try std.Io.Dir.openFileAbsolute(threaded.io(), path, .{ .mode = .read_only });
             defer file.close(threaded.io());
-
             var read_buffer: [8 * 1024]u8 = undefined;
             var reader = file.reader(threaded.io(), &read_buffer);
-            try reader.interface.readSliceAll(frame_buffer.items[0..upload_byte_len]);
-            upload_pixels = frame_buffer.items[0..upload_byte_len];
+            try reader.interface.readSliceAll(frame_buffer.items[0..self.byte_len]);
+            upload_pixels = frame_buffer.items[0..self.byte_len];
+        } else {
+            const slot = self.current_slot orelse return false;
+            upload_pixels = self.slots[slot][0..self.byte_len];
         }
         const read_end = monotonicTimestampNs();
 
         const upload_start = monotonicTimestampNs();
-        try texture.uploadBgra(upload_width, upload_height, upload_pixels);
+        const result = try texture.uploadBgraImmediately(self.width, self.height, upload_pixels);
         const upload_end = monotonicTimestampNs();
+        switch (result) {
+            .deferred => {
+                self.metrics.upload_deferred += 1;
+                return false;
+            },
+            .uploaded => {
+                self.metrics.upload_completed += 1;
+                self.metrics.upload_duration.add(@intCast(@max(upload_end - upload_start, 0)));
+                self.uploaded_sequence = self.sequence;
+                self.uploaded_exported_at_ns = self.exported_at_ns;
+                self.uploaded_input_serial = self.input_serial;
+                self.uploaded_input_sent_at_ns = self.input_sent_at_ns;
+                self.dirty = false;
+            },
+        }
+        if (self.path) |path| {
+            deleteFramePath(path);
+            allocator.free(path);
+            self.path = null;
+        }
         if (frameLogEnabled()) {
             log.info(
-                "snapshot frame seq={} read_ms={d:.3} upload_ms={d:.3} bytes={} size={}x{}",
+                "snapshot frame seq={} exported_ns={} published_ns={} helper_sent_ns={} received_ns={} read_ms={d:.3} upload_ms={d:.3} bytes={} size={}x{}",
                 .{
-                    upload_sequence,
+                    self.sequence,
+                    self.exported_at_ns,
+                    self.published_at_ns,
+                    self.helper_sent_at_ns,
+                    self.received_at_ns,
                     nanosToMillis(read_end - read_start),
                     nanosToMillis(upload_end - upload_start),
-                    upload_byte_len,
-                    upload_width,
-                    upload_height,
+                    self.byte_len,
+                    self.width,
+                    self.height,
                 },
             );
         }
         return true;
+    }
+
+    fn notePresented(self: *SharedFrame, presented_at_ns: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.uploaded_sequence == 0 or self.uploaded_sequence == self.presented_sequence) return;
+        self.presented_sequence = self.uploaded_sequence;
+        self.metrics.notePresented(
+            self.uploaded_input_serial,
+            self.uploaded_input_sent_at_ns,
+            self.uploaded_exported_at_ns,
+            presented_at_ns,
+        );
+        self.metrics.maybeLog(presented_at_ns);
     }
 };
 
@@ -319,6 +555,7 @@ pub const Controller = struct {
     host_window: u64 = 0,
     current_url: ?[]u8 = null,
     wayland_subsurface: WaylandSubsurface = .{},
+    next_input_serial: u64 = 0,
 
     /// Creates the helper-backed Linux browser controller.
     pub fn init(allocator: std.mem.Allocator) !Controller {
@@ -664,7 +901,15 @@ pub const Controller = struct {
         if (waylandSubsurfaceEnabled()) {
             return false;
         }
-        return try self.frame.uploadIntoTexture(self.allocator, &self.frame_buffer, texture);
+        try self.flushFrameReleases();
+        const uploaded = try self.frame.uploadIntoTexture(self.allocator, &self.frame_buffer, texture);
+        try self.flushFrameReleases();
+        return uploaded;
+    }
+
+    /// Records when the app successfully submitted the render containing the latest uploaded frame.
+    pub fn noteFramePresented(self: *Controller) void {
+        self.frame.notePresented(monotonicTimestampNsU64());
     }
 
     /// Returns a caller-owned copy of the most recent helper frame, or null when
@@ -679,19 +924,19 @@ pub const Controller = struct {
             frame_width = self.frame.width;
             frame_height = self.frame.height;
             frame_byte_len = self.frame.byte_len;
-            if (frame_byte_len > 0 and frame_width > 0 and frame_height > 0 and
-                self.frame.staging.items.len >= frame_byte_len)
-            {
+            if (self.frame.current_slot) |slot| {
+                if (frame_byte_len == 0 or frame_width == 0 or frame_height == 0 or
+                    self.frame.slots[slot].len < frame_byte_len) return null;
+                self.frame.metrics.screenshot_copies += 1;
                 return .{
                     .width = frame_width,
                     .height = frame_height,
                     .format = .bgra,
-                    .pixels = try allocator.dupe(u8, self.frame.staging.items[0..frame_byte_len]),
+                    .pixels = try allocator.dupe(u8, self.frame.slots[slot][0..frame_byte_len]),
                 };
             }
         }
-        // Temp-file frames bypass staging; fall back to the main-thread-owned
-        // copy of the last uploaded frame.
+        // Temp-file fallback frames retain the main-thread-owned upload buffer.
         if (frame_byte_len == 0 or frame_width == 0 or frame_height == 0) return null;
         if (self.frame_buffer.items.len < frame_byte_len) return null;
         return .{
@@ -773,7 +1018,14 @@ pub const Controller = struct {
     fn sendCommand(self: *Controller, command: ipc.Command) !void {
         _ = self.child_pid orelse return error.BrowserUnavailable;
         const stdin_file = self.stdin_file orelse return error.BrowserUnavailable;
-        const encoded = try std.json.Stringify.valueAlloc(self.allocator, command, .{});
+        var outbound = command;
+        if (commandWakesFrame(command.kind)) {
+            self.next_input_serial +%= 1;
+            if (self.next_input_serial == 0) self.next_input_serial = 1;
+            outbound.input_serial = self.next_input_serial;
+            outbound.input_sent_at_ns = monotonicTimestampNsU64();
+        }
+        const encoded = try std.json.Stringify.valueAlloc(self.allocator, outbound, .{});
         defer self.allocator.free(encoded);
 
         var write_buffer: [8 * 1024]u8 = undefined;
@@ -783,6 +1035,22 @@ pub const Controller = struct {
         try writer.interface.writeAll(encoded);
         try writer.interface.writeByte('\n');
         try writer.interface.flush();
+    }
+
+    fn flushFrameReleases(self: *Controller) !void {
+        while (self.frame.popRelease()) |release| {
+            self.sendCommand(.{
+                .kind = .frame_release,
+                .frame_sequence = release.sequence,
+                .frame_slot = release.slot,
+            }) catch |err| {
+                self.frame.restoreRelease(release);
+                return err;
+            };
+            self.frame.mutex.lock();
+            self.frame.metrics.slot_releases += 1;
+            self.frame.mutex.unlock();
+        }
     }
 
     // Closes the helper stdin pipe so the helper reader thread can observe EOF and exit cleanly.
@@ -821,6 +1089,29 @@ fn visibleHelperEnabled() bool {
     const session_type = if (std.c.getenv("XDG_SESSION_TYPE")) |value_ptr| std.mem.span(value_ptr) else null;
     const gdk_backend = if (std.c.getenv("GDK_BACKEND")) |value_ptr| std.mem.span(value_ptr) else null;
     return visibleHelperEnabledFromValues(override_value, unsafe_wayland, session_type, gdk_backend);
+}
+
+fn commandWakesFrame(kind: ipc.CommandKind) bool {
+    return switch (kind) {
+        .show,
+        .set_bounds,
+        .resize_pane,
+        .navigate,
+        .eval,
+        .post_json,
+        .go_back,
+        .go_forward,
+        .reload,
+        .focus,
+        .mouse_move,
+        .mouse_button,
+        .mouse_wheel,
+        .key_input,
+        .text_input,
+        .context_menu_activate,
+        => true,
+        .hide, .set_host_window, .blur, .context_menu_dismiss, .frame_release, .quit => false,
+    };
 }
 
 fn waylandDiagnosticHelperEnabled() bool {
@@ -920,12 +1211,15 @@ fn helperReaderMain(context: *ReaderContext) !void {
         defer parsed.deinit();
 
         if (parsed.value.kind == .frame_ready) {
-            try context.frame.update(context.allocator, parsed.value);
+            _ = try context.frame.update(context.allocator, parsed.value);
+            const wake_result = loop_wakeup.notifyResult();
+            context.frame.noteWake(wake_result);
             continue;
         }
 
         const event = try convertHelperEvent(context.allocator, parsed.value);
         try context.queue.push(context.allocator, event);
+        loop_wakeup.notify();
     }
 }
 

@@ -390,6 +390,15 @@ pub const Controller = struct {
         }
     }
 
+    /// Records a successful app frame submission for browser presentation metrics.
+    pub fn noteFramePresented(self: *Controller) void {
+        const backend = if (self.backend) |*backend| backend else return;
+        switch (backend.*) {
+            .native_webview => |*active| active.noteFramePresented(),
+            .stub => {},
+        }
+    }
+
     /// Alias used by the compile-time backend contract.
     pub fn isRuntimeInitialized(self: *const Controller) bool {
         return self.runtimeInitialized();

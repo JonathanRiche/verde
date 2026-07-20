@@ -22,6 +22,7 @@ pub const CommandKind = enum {
     text_input,
     context_menu_activate,
     context_menu_dismiss,
+    frame_release,
     quit,
 };
 
@@ -41,6 +42,10 @@ pub const Command = struct {
     pressed: bool = false,
     key_code: u32 = 0,
     host_window: u64 = 0,
+    frame_sequence: u64 = 0,
+    frame_slot: u8 = 0,
+    input_serial: u64 = 0,
+    input_sent_at_ns: u64 = 0,
     ctrl: bool = false,
     shift: bool = false,
     alt: bool = false,
@@ -72,6 +77,11 @@ pub const Event = struct {
     height: u32 = 0,
     byte_len: usize = 0,
     frame_slot: u8 = 0,
+    exported_at_ns: u64 = 0,
+    published_at_ns: u64 = 0,
+    helper_sent_at_ns: u64 = 0,
+    input_serial: u64 = 0,
+    input_sent_at_ns: u64 = 0,
     payload: ?[]const u8 = null,
     frame_path: ?[]const u8 = null,
 };

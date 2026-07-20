@@ -13,7 +13,7 @@ const browser_texture = @import("browser/texture.zig");
 const chat_threads = @import("chat/threads.zig");
 const cli = @import("cli.zig");
 const live_ipc = @import("ipc/server.zig");
-const loop_wakeup = @import("loop_wakeup.zig");
+const loop_wakeup = @import("loop_wakeup");
 const keybinds = @import("keybinds.zig");
 const platform_runtime = @import("platform_runtime");
 const windows_integrations = @import("platform/windows/integrations.zig");
@@ -653,6 +653,7 @@ fn mainInner(init: std.process.Init) !void {
             }
         }.run, .{&state});
 
+        var frame_submitted = false;
         recordSpan(&frame_sample, .draw_backend, struct {
             fn run(
                 palette_command_renderer: *palette_frame_renderer.Renderer,
@@ -660,15 +661,21 @@ fn mainInner(init: std.process.Init) !void {
                 allocator_arg: std.mem.Allocator,
                 framebuffer_width: c_int,
                 framebuffer_height: c_int,
+                submitted: *bool,
             ) void {
                 palette_command_renderer.renderBatch(
                     allocator_arg,
                     &app_state.palette_overlay_batch,
                     @floatFromInt(framebuffer_width),
                     @floatFromInt(framebuffer_height),
-                ) catch |err| log.warn("failed to render palette overlay batch: {s}", .{@errorName(err)});
+                ) catch |err| {
+                    log.warn("failed to render palette overlay batch: {s}", .{@errorName(err)});
+                    return;
+                };
+                submitted.* = true;
             }
-        }.run, .{ &palette_renderer, &state, allocator, fb_width, fb_height });
+        }.run, .{ &palette_renderer, &state, allocator, fb_width, fb_height, &frame_submitted });
+        if (frame_submitted) state.noteBrowserFramePresented();
         const swap_start = profiler.nowNs();
         frame_sample.add(.swap_window, profiler.elapsedNs(swap_start));
         frame_sample.rendered = true;

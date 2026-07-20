@@ -33,6 +33,11 @@ const BrowserContextMenuAction = union(enum) {
     close_pane,
 };
 
+const BrowserContextMenuHit = struct {
+    rect: palette.Rect,
+    action: BrowserContextMenuAction,
+};
+
 const BrowserHitKind = enum {
     address,
     back,
@@ -57,7 +62,13 @@ var palette_hit_count: usize = 0;
 var palette_toolbar_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 var palette_menu_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 var palette_context_menu_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+var palette_context_menu_panels: [8]palette.Rect = undefined;
+var palette_context_menu_panel_count: usize = 0;
+var palette_context_menu_hits: [128]BrowserContextMenuHit = undefined;
+var palette_context_menu_hit_count: usize = 0;
 var palette_mouse_pos: [2]f32 = .{ -1.0, -1.0 };
+
+const CLOSE_PANE_MENU_INDEX = std.math.maxInt(u32);
 
 /// Renders the browser dock that manages the in-app browser pane and bridge controls.
 pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
@@ -66,6 +77,8 @@ pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
     palette_toolbar_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
     palette_menu_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
     palette_context_menu_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
+    palette_context_menu_panel_count = 0;
+    palette_context_menu_hit_count = 0;
 
     const toolbar_height = theme.scaledUi(TOOLBAR_HEIGHT);
     renderPaneCanvas(state, .{
@@ -80,6 +93,20 @@ pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
 
 pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) void {
     palette_mouse_pos = .{ x, y };
+    if (state.browser_context_menu_open) {
+        if (browserContextMenuActionAtPoint(x, y)) |action| {
+            switch (action) {
+                .backend_item => |item| if (item.enabled and !item.separator) {
+                    state.browser_context_menu_selected_index = item.index;
+                    state.browser_context_menu_active_parent = if (item.submenu) item.index else item.parent_index;
+                },
+                .close_pane => {
+                    state.browser_context_menu_selected_index = CLOSE_PANE_MENU_INDEX;
+                    state.browser_context_menu_active_parent = null;
+                },
+            }
+        }
+    }
     // Drag-to-extend the URL-bar selection. We re-find the address hit rect
     // each frame (the toolbar may have re-laid out) so the cursor stays
     // accurate even if the field moves under the pointer.
@@ -131,13 +158,16 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
 
     if (state.browser_context_menu_open) {
         if (!down) {
-            return rectContainsPoint(palette_context_menu_rect, x, y);
+            return browserContextMenuContainsPoint(x, y);
         }
-        if (rectContainsPoint(palette_context_menu_rect, x, y)) {
-            if (browserContextMenuActionAtPoint(state, x, y)) |action| {
+        if (browserContextMenuContainsPoint(x, y)) {
+            if (browserContextMenuActionAtPoint(x, y)) |action| {
                 switch (action) {
                     .backend_item => |item| {
-                        if (item.enabled and !item.separator and !item.submenu) {
+                        if (item.enabled and !item.separator and item.submenu) {
+                            state.browser_context_menu_selected_index = item.index;
+                            state.browser_context_menu_active_parent = item.index;
+                        } else if (item.enabled and !item.separator) {
                             state.activateBrowserContextMenuItem(item.index);
                         }
                     },
@@ -269,6 +299,7 @@ pub fn handlePaletteTextInput(state: *app_state.AppState, text: []const u8) bool
 }
 
 pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const sdl.KeyboardEvent) bool {
+    if (state.browser_context_menu_open) return handleBrowserContextMenuKeyDown(state, event);
     if (!state.browser_address_focused) return false;
     if (!event.down) return true;
 
@@ -319,6 +350,127 @@ pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const sdl.Keyboa
     }
     state.noteInteraction();
     return true;
+}
+
+fn handleBrowserContextMenuKeyDown(state: *app_state.AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!event.down) return true;
+    switch (event.key) {
+        .escape => state.dismissBrowserContextMenu(),
+        .up => moveBrowserContextMenuSelection(state, -1),
+        .down => moveBrowserContextMenuSelection(state, 1),
+        .home => selectBrowserContextMenuBoundary(state, false),
+        .end => selectBrowserContextMenuBoundary(state, true),
+        .left => closeBrowserContextSubmenu(state),
+        .right => openSelectedBrowserContextSubmenu(state),
+        .@"return", .kp_enter, .space => activateSelectedBrowserContextMenuItem(state),
+        else => return true,
+    }
+    state.noteInteraction();
+    return true;
+}
+
+fn contextMenuItemByIndex(state: *const app_state.AppState, item_index: u32) ?*const app_state.BrowserContextMenuItem {
+    for (state.browser_context_menu_items.items) |*item| {
+        if (item.index == item_index) return item;
+    }
+    return null;
+}
+
+fn selectableBrowserContextMenuIndexes(state: *const app_state.AppState, parent_index: ?u32, indexes: *[128]u32) usize {
+    return selectableBrowserContextMenuIndexesFromItems(
+        state.browser_context_menu_items.items,
+        parent_index,
+        state.currentProjectVisibleBrowserPaneId() != null,
+        indexes,
+    );
+}
+
+fn selectableBrowserContextMenuIndexesFromItems(
+    items: []const app_state.BrowserContextMenuItem,
+    parent_index: ?u32,
+    include_close_pane: bool,
+    indexes: *[128]u32,
+) usize {
+    var count: usize = 0;
+    for (items) |item| {
+        if (item.parent_index != parent_index or !item.enabled or item.separator) continue;
+        if (count >= indexes.len) break;
+        indexes[count] = item.index;
+        count += 1;
+    }
+    if (parent_index == null and include_close_pane and count < indexes.len) {
+        indexes[count] = CLOSE_PANE_MENU_INDEX;
+        count += 1;
+    }
+    return count;
+}
+
+fn nextBrowserContextMenuSelection(indexes: []const u32, current: ?u32, direction: i32) u32 {
+    std.debug.assert(indexes.len > 0);
+    var selected: usize = if (direction < 0) indexes.len - 1 else 0;
+    if (current) |selected_index| {
+        for (indexes, 0..) |item_index, index| {
+            if (item_index != selected_index) continue;
+            selected = if (direction < 0)
+                (index + indexes.len - 1) % indexes.len
+            else
+                (index + 1) % indexes.len;
+            break;
+        }
+    }
+    return indexes[selected];
+}
+
+fn moveBrowserContextMenuSelection(state: *app_state.AppState, direction: i32) void {
+    var indexes: [128]u32 = undefined;
+    const count = selectableBrowserContextMenuIndexes(state, state.browser_context_menu_active_parent, &indexes);
+    if (count == 0) return;
+    state.browser_context_menu_selected_index = nextBrowserContextMenuSelection(
+        indexes[0..count],
+        state.browser_context_menu_selected_index,
+        direction,
+    );
+}
+
+fn selectBrowserContextMenuBoundary(state: *app_state.AppState, last: bool) void {
+    var indexes: [128]u32 = undefined;
+    const count = selectableBrowserContextMenuIndexes(state, state.browser_context_menu_active_parent, &indexes);
+    if (count == 0) return;
+    state.browser_context_menu_selected_index = indexes[if (last) count - 1 else 0];
+}
+
+fn openSelectedBrowserContextSubmenu(state: *app_state.AppState) void {
+    const selected = state.browser_context_menu_selected_index orelse return;
+    if (selected == CLOSE_PANE_MENU_INDEX) return;
+    const item = contextMenuItemByIndex(state, selected) orelse return;
+    if (!item.enabled or !item.submenu) return;
+    state.browser_context_menu_active_parent = item.index;
+    selectBrowserContextMenuBoundary(state, false);
+}
+
+fn closeBrowserContextSubmenu(state: *app_state.AppState) void {
+    const parent_index = state.browser_context_menu_active_parent orelse return;
+    const parent_item = contextMenuItemByIndex(state, parent_index) orelse return;
+    state.browser_context_menu_active_parent = parent_item.parent_index;
+    state.browser_context_menu_selected_index = parent_item.index;
+}
+
+fn activateSelectedBrowserContextMenuItem(state: *app_state.AppState) void {
+    const selected = state.browser_context_menu_selected_index orelse return;
+    if (selected == CLOSE_PANE_MENU_INDEX) {
+        state.dismissBrowserContextMenu();
+        if (state.currentProjectVisibleBrowserPaneId()) |pane_id| {
+            _ = state.closeCurrentProjectWorkspacePane(pane_id);
+        }
+        return;
+    }
+    const item = contextMenuItemByIndex(state, selected) orelse return;
+    if (!item.enabled or item.separator) return;
+    if (item.submenu) {
+        openSelectedBrowserContextSubmenu(state);
+        return;
+    }
+    state.activateBrowserContextMenuItem(item.index);
 }
 
 fn moveAddressCursor(state: *app_state.AppState, target: usize, shift: bool) void {
@@ -658,39 +810,86 @@ fn renderInspectorModeMenuRow(state: *app_state.AppState, rect: palette.Rect, la
     addPaletteHit(rect, kind);
 }
 
+// Renders the root browser context menu plus the active recursive submenu chain.
 fn renderBrowserContextMenu(state: *app_state.AppState) void {
     if (!state.browser_context_menu_open or state.browser_context_menu_items.items.len == 0) return;
-    const menu_width = theme.scaledUi(230.0);
+    if (state.browser_context_menu_selected_index == null) {
+        selectBrowserContextMenuBoundary(state, false);
+    }
+    const root_height = browserContextMenuContentHeight(state, null);
+    const root_rect = clampedBrowserContextMenuRect(
+        state,
+        state.browser_context_menu_anchor_x,
+        state.browser_context_menu_anchor_y,
+        root_height,
+    );
+    palette_context_menu_rect = root_rect;
+    renderBrowserContextMenuPanel(state, null, root_rect, 0);
+}
+
+fn browserContextMenuContentHeight(state: *const app_state.AppState, parent_index: ?u32) f32 {
     const row_height = theme.scaledUi(30.0);
     const separator_height = theme.scaledUi(9.0);
     const pad = theme.scaledUi(6.0);
-    const show_close_pane = state.currentProjectVisibleBrowserPaneId() != null;
-    var content_height = pad * 2.0;
+    var height = pad * 2.0;
     for (state.browser_context_menu_items.items) |item| {
-        content_height += if (item.separator) separator_height else row_height;
+        if (item.parent_index != parent_index) continue;
+        height += if (item.separator) separator_height else row_height;
     }
-    if (show_close_pane) content_height += separator_height + row_height;
+    if (parent_index == null and state.currentProjectVisibleBrowserPaneId() != null) {
+        height += separator_height + row_height;
+    }
+    return height;
+}
 
-    var x = state.browser_context_menu_anchor_x;
-    var y = state.browser_context_menu_anchor_y;
-    const min_x = state.browser_pane_min[0] + theme.scaledUi(4.0);
-    const min_y = state.browser_pane_min[1] + theme.scaledUi(4.0);
-    const max_x = state.browser_pane_max[0] - menu_width - theme.scaledUi(4.0);
-    const max_y = state.browser_pane_max[1] - content_height - theme.scaledUi(4.0);
-    x = theme.clampf(x, min_x, @max(min_x, max_x));
-    y = theme.clampf(y, min_y, @max(min_y, max_y));
-    palette_context_menu_rect = .{ .x = x, .y = y, .w = menu_width, .h = content_height };
+fn clampedBrowserContextMenuRect(state: *const app_state.AppState, desired_x: f32, desired_y: f32, height: f32) palette.Rect {
+    const menu_width = theme.scaledUi(260.0);
+    const edge = theme.scaledUi(4.0);
+    const min_x = state.browser_pane_min[0] + edge;
+    const min_y = state.browser_pane_min[1] + edge;
+    const max_x = state.browser_pane_max[0] - menu_width - edge;
+    const max_y = state.browser_pane_max[1] - height - edge;
+    return .{
+        .x = theme.clampf(desired_x, min_x, @max(min_x, max_x)),
+        .y = theme.clampf(desired_y, min_y, @max(min_y, max_y)),
+        .w = menu_width,
+        .h = height,
+    };
+}
 
-    queuePaletteRoundedRect(state, palette_context_menu_rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 245)), theme.scaledUi(8.0));
-    queuePaletteBorder(state, palette_context_menu_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), theme.scaledUi(1.0));
+fn browserContextMenuParentIsOpen(state: *const app_state.AppState, candidate: u32) bool {
+    var current = state.browser_context_menu_active_parent;
+    while (current) |item_index| {
+        if (item_index == candidate) return true;
+        const item = contextMenuItemByIndex(state, item_index) orelse return false;
+        current = item.parent_index;
+    }
+    return false;
+}
 
-    var row_y = palette_context_menu_rect.y + pad;
+// Renders one menu level and recursively places the open child beside its parent row.
+fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32, panel_rect: palette.Rect, depth: usize) void {
+    if (depth >= palette_context_menu_panels.len) return;
+    palette_context_menu_panels[palette_context_menu_panel_count] = panel_rect;
+    palette_context_menu_panel_count += 1;
+
+    queuePaletteRoundedRect(state, panel_rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 245)), theme.scaledUi(8.0));
+    queuePaletteBorder(state, panel_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), theme.scaledUi(1.0));
+
+    const row_height = theme.scaledUi(30.0);
+    const separator_height = theme.scaledUi(9.0);
+    const pad = theme.scaledUi(6.0);
+    var row_y = panel_rect.y + pad;
+    var open_child: ?app_state.BrowserContextMenuItem = null;
+    var open_child_y: f32 = 0.0;
+
     for (state.browser_context_menu_items.items) |item| {
+        if (item.parent_index != parent_index) continue;
         if (item.separator) {
             queuePaletteRect(state, snapRect(.{
-                .x = palette_context_menu_rect.x + pad,
+                .x = panel_rect.x + pad,
                 .y = row_y + separator_height * 0.5,
-                .w = palette_context_menu_rect.w - pad * 2.0,
+                .w = panel_rect.w - pad * 2.0,
                 .h = theme.scaledUi(1.0),
             }), paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 180)));
             row_y += separator_height;
@@ -698,39 +897,53 @@ fn renderBrowserContextMenu(state: *app_state.AppState) void {
         }
 
         const row_rect: palette.Rect = .{
-            .x = palette_context_menu_rect.x + pad,
+            .x = panel_rect.x + pad,
             .y = row_y,
-            .w = palette_context_menu_rect.w - pad * 2.0,
+            .w = panel_rect.w - pad * 2.0,
             .h = row_height,
         };
-        const usable = item.enabled and !item.submenu;
-        if (rectHovered(row_rect) and usable) {
+        const selected = state.browser_context_menu_selected_index == item.index;
+        if (selected or (rectHovered(row_rect) and item.enabled)) {
             queuePaletteRoundedRect(state, row_rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
         }
+        const trailing_width = if (item.submenu) theme.scaledUi(22.0) else 0.0;
         queuePaletteText(state, .{
             .x = row_rect.x + theme.scaledUi(8.0),
             .y = row_rect.y + (row_rect.h - theme.scaledUi(13.0) * 1.25) * 0.5,
-            .w = row_rect.w - theme.scaledUi(16.0),
+            .w = row_rect.w - theme.scaledUi(16.0) - trailing_width,
             .h = theme.scaledUi(13.0) * 1.25,
-        }, item.label, paletteColor(if (usable) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), row_rect);
+        }, item.label, paletteColor(if (item.enabled) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), row_rect);
+        if (item.submenu) {
+            queuePaletteText(state, .{
+                .x = row_rect.x + row_rect.w - theme.scaledUi(18.0),
+                .y = row_rect.y + (row_rect.h - theme.scaledUi(13.0) * 1.25) * 0.5,
+                .w = theme.scaledUi(12.0),
+                .h = theme.scaledUi(13.0) * 1.25,
+            }, ">", paletteColor(if (item.enabled) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), row_rect);
+            if (browserContextMenuParentIsOpen(state, item.index)) {
+                open_child = item;
+                open_child_y = row_rect.y - pad;
+            }
+        }
+        addBrowserContextMenuHit(row_rect, .{ .backend_item = item });
         row_y += row_height;
     }
-    if (show_close_pane) {
+
+    if (parent_index == null and state.currentProjectVisibleBrowserPaneId() != null) {
         queuePaletteRect(state, snapRect(.{
-            .x = palette_context_menu_rect.x + pad,
+            .x = panel_rect.x + pad,
             .y = row_y + separator_height * 0.5,
-            .w = palette_context_menu_rect.w - pad * 2.0,
+            .w = panel_rect.w - pad * 2.0,
             .h = theme.scaledUi(1.0),
         }), paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 180)));
         row_y += separator_height;
-
         const close_rect: palette.Rect = .{
-            .x = palette_context_menu_rect.x + pad,
+            .x = panel_rect.x + pad,
             .y = row_y,
-            .w = palette_context_menu_rect.w - pad * 2.0,
+            .w = panel_rect.w - pad * 2.0,
             .h = row_height,
         };
-        if (rectHovered(close_rect)) {
+        if (state.browser_context_menu_selected_index == CLOSE_PANE_MENU_INDEX or rectHovered(close_rect)) {
             queuePaletteRoundedRect(state, close_rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
         }
         queuePaletteText(state, .{
@@ -739,24 +952,45 @@ fn renderBrowserContextMenu(state: *app_state.AppState) void {
             .w = close_rect.w - theme.scaledUi(16.0),
             .h = theme.scaledUi(13.0) * 1.25,
         }, "Close Pane", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), close_rect);
-        row_y += row_height;
+        addBrowserContextMenuHit(close_rect, .close_pane);
+    }
+
+    if (open_child) |child| {
+        const overlap = theme.scaledUi(2.0);
+        const right_x = panel_rect.x + panel_rect.w - overlap;
+        const child_x = if (right_x + panel_rect.w <= state.browser_pane_max[0] - theme.scaledUi(4.0))
+            right_x
+        else
+            panel_rect.x - panel_rect.w + overlap;
+        const child_rect = clampedBrowserContextMenuRect(
+            state,
+            child_x,
+            open_child_y,
+            browserContextMenuContentHeight(state, child.index),
+        );
+        renderBrowserContextMenuPanel(state, child.index, child_rect, depth + 1);
     }
 }
 
-fn browserContextMenuActionAtPoint(state: *app_state.AppState, x: f32, y: f32) ?BrowserContextMenuAction {
-    if (!rectContainsPoint(palette_context_menu_rect, x, y)) return null;
-    const row_height = theme.scaledUi(30.0);
-    const separator_height = theme.scaledUi(9.0);
-    const pad = theme.scaledUi(6.0);
-    var row_y = palette_context_menu_rect.y + pad;
-    for (state.browser_context_menu_items.items) |item| {
-        const height = if (item.separator) separator_height else row_height;
-        if (!item.separator and y >= row_y and y <= row_y + height) return .{ .backend_item = item };
-        row_y += height;
+fn addBrowserContextMenuHit(rect: palette.Rect, action: BrowserContextMenuAction) void {
+    if (palette_context_menu_hit_count >= palette_context_menu_hits.len) return;
+    palette_context_menu_hits[palette_context_menu_hit_count] = .{ .rect = rect, .action = action };
+    palette_context_menu_hit_count += 1;
+}
+
+fn browserContextMenuContainsPoint(x: f32, y: f32) bool {
+    for (palette_context_menu_panels[0..palette_context_menu_panel_count]) |panel| {
+        if (rectContainsPoint(panel, x, y)) return true;
     }
-    if (state.currentProjectVisibleBrowserPaneId() != null) {
-        row_y += separator_height;
-        if (y >= row_y and y <= row_y + row_height) return .close_pane;
+    return false;
+}
+
+fn browserContextMenuActionAtPoint(x: f32, y: f32) ?BrowserContextMenuAction {
+    var index = palette_context_menu_hit_count;
+    while (index > 0) {
+        index -= 1;
+        const hit = palette_context_menu_hits[index];
+        if (rectContainsPoint(hit.rect, x, y)) return hit.action;
     }
     return null;
 }
@@ -1062,4 +1296,23 @@ fn browserPageIsEmpty(browser_state: *const browser_runtime.State) bool {
     const raw = browser_state.current_url orelse browser_state.addressInput();
     const url = std.mem.trim(u8, raw, &std.ascii.whitespace);
     return url.len == 0 or std.mem.eql(u8, url, "about:blank");
+}
+
+test "browser context-menu keyboard selection filters rows by level and wraps" {
+    var label: [0]u8 = .{};
+    const items = [_]app_state.BrowserContextMenuItem{
+        .{ .index = 1, .label = &label, .enabled = true, .separator = false, .submenu = true, .parent_index = null },
+        .{ .index = 2, .label = &label, .enabled = false, .separator = false, .submenu = false, .parent_index = null },
+        .{ .index = 3, .label = &label, .enabled = true, .separator = true, .submenu = false, .parent_index = null },
+        .{ .index = 4, .label = &label, .enabled = true, .separator = false, .submenu = false, .parent_index = 1 },
+    };
+    var indexes: [128]u32 = undefined;
+
+    const root_count = selectableBrowserContextMenuIndexesFromItems(&items, null, true, &indexes);
+    try std.testing.expectEqualSlices(u32, &.{ 1, CLOSE_PANE_MENU_INDEX }, indexes[0..root_count]);
+    try std.testing.expectEqual(@as(u32, 1), nextBrowserContextMenuSelection(indexes[0..root_count], CLOSE_PANE_MENU_INDEX, 1));
+    try std.testing.expectEqual(CLOSE_PANE_MENU_INDEX, nextBrowserContextMenuSelection(indexes[0..root_count], 1, -1));
+
+    const child_count = selectableBrowserContextMenuIndexesFromItems(&items, 1, false, &indexes);
+    try std.testing.expectEqualSlices(u32, &.{4}, indexes[0..child_count]);
 }

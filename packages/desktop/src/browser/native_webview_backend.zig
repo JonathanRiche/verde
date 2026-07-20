@@ -286,6 +286,12 @@ pub const Backend = struct {
         return true;
     }
 
+    /// Records successful app submission for Linux browser frame latency metrics.
+    pub fn noteFramePresented(self: *Backend) void {
+        if (builtin.os.tag != .linux) return;
+        self.platform.noteFramePresented();
+    }
+
     /// Alias used by the shared backend contract.
     pub fn pollEvent(self: *Backend) ?browser_types.Event {
         return self.popEvent();

@@ -3,7 +3,7 @@
 const std = @import("std");
 const ipc = @import("linux_ipc.zig");
 
-const IDLE_SLEEP_MS = 2;
+const IDLE_SLEEP_MS = 1;
 const IPC_LINE_BUFFER_BYTES = 256 * 1024;
 
 const RawBrowser = opaque {};
@@ -32,8 +32,14 @@ extern fn verde_browser_linux_text_input(browser: ?*RawBrowser, text: [*:0]const
 extern fn verde_browser_linux_context_menu_activate(browser: ?*RawBrowser, index: c_uint) c_int;
 extern fn verde_browser_linux_context_menu_dismiss(browser: ?*RawBrowser) c_int;
 extern fn verde_browser_linux_poll_event(browser: ?*RawBrowser, kind: *c_int, payload: *?[*:0]u8) c_int;
-extern fn verde_browser_linux_poll_frame(browser: ?*RawBrowser, path: *?[*:0]u8, sequence: *u64, slot: *c_int, width: *c_int, height: *c_int, byte_len: *usize) c_int;
+extern fn verde_browser_linux_poll_frame(browser: ?*RawBrowser, path: *?[*:0]u8, sequence: *u64, slot: *c_int, width: *c_int, height: *c_int, byte_len: *usize, exported_at_ns: *u64, published_at_ns: *u64) c_int;
+extern fn verde_browser_linux_release_frame_slot(browser: ?*RawBrowser, slot: c_uint, sequence: u64) c_int;
 extern fn verde_browser_linux_free_string(payload: ?[*:0]u8) void;
+extern fn verde_browser_linux_test_context_menu_payload(scenario: c_uint, inspector_configured: c_int) ?[*:0]u8;
+extern fn verde_browser_linux_test_active_completion_deadline_us(last_frame_us: i64, now_us: i64) i64;
+extern fn verde_browser_linux_test_active_completion_deadline_with_lead_us(last_frame_us: i64, now_us: i64, production_lead_us: i64) i64;
+extern fn verde_browser_linux_test_updated_production_lead_us(existing_lead_us: i64, dispatched_us: i64, published_us: i64) i64;
+extern fn verde_browser_linux_test_frame_interval_us(visible: c_int) i64;
 
 const Mutex = struct {
     inner: std.atomic.Mutex = .unlocked,
@@ -116,18 +122,24 @@ pub fn main(init: std.process.Init) !void {
     const reader_thread = try std.Thread.spawn(.{}, stdinReaderMain, .{&reader_context});
     defer reader_thread.join();
 
+    var last_input_serial: u64 = 0;
+    var last_input_sent_at_ns: u64 = 0;
     while (true) {
         var did_work = false;
         while (queue.pop()) |command| {
             did_work = true;
             defer if (command.payload) |payload| allocator.free(payload);
+            if (command.input_serial != 0) {
+                last_input_serial = command.input_serial;
+                last_input_sent_at_ns = command.input_sent_at_ns;
+            }
             if (!try applyCommand(allocator, browser, command)) {
                 std.process.exit(0);
             }
         }
 
         did_work = (try flushBrowserEvents(allocator, init.io, browser)) > 0 or did_work;
-        did_work = (try flushBrowserFrames(allocator, init.io, browser)) > 0 or did_work;
+        did_work = (try flushBrowserFrames(allocator, init.io, browser, last_input_serial, last_input_sent_at_ns)) > 0 or did_work;
         if (queue.isDrained()) {
             std.process.exit(0);
         }
@@ -145,6 +157,12 @@ fn sleepMillis(ms: u64) void {
         .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
     };
     _ = std.c.nanosleep(&request, null);
+}
+
+fn monotonicTimestampNs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
 /// Reads JSON-line commands from stdin and forwards them into the helper's command queue.
@@ -177,6 +195,10 @@ fn stdinReaderMain(context: *ReaderContext) !void {
             .pressed = parsed.value.pressed,
             .key_code = parsed.value.key_code,
             .host_window = parsed.value.host_window,
+            .frame_sequence = parsed.value.frame_sequence,
+            .frame_slot = parsed.value.frame_slot,
+            .input_serial = parsed.value.input_serial,
+            .input_sent_at_ns = parsed.value.input_sent_at_ns,
             .ctrl = parsed.value.ctrl,
             .shift = parsed.value.shift,
             .alt = parsed.value.alt,
@@ -299,6 +321,7 @@ fn applyCommand(allocator: std.mem.Allocator, browser: *RawBrowser, command: ipc
             _ = verde_browser_linux_context_menu_activate(browser, index);
         },
         .context_menu_dismiss => _ = verde_browser_linux_context_menu_dismiss(browser),
+        .frame_release => _ = verde_browser_linux_release_frame_slot(browser, command.frame_slot, command.frame_sequence),
         .quit => return false,
     }
     return true;
@@ -332,7 +355,13 @@ fn flushBrowserEvents(allocator: std.mem.Allocator, io: std.Io, browser: *RawBro
 }
 
 /// Serializes any newly rendered browser snapshot onto stdout as a frame-ready event.
-fn flushBrowserFrames(allocator: std.mem.Allocator, io: std.Io, browser: *RawBrowser) !usize {
+fn flushBrowserFrames(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    browser: *RawBrowser,
+    input_serial: u64,
+    input_sent_at_ns: u64,
+) !usize {
     const stdout_file = std.Io.File.stdout();
     var write_buffer: [16 * 1024]u8 = undefined;
     var writer = stdout_file.writerStreaming(io, &write_buffer);
@@ -346,7 +375,9 @@ fn flushBrowserFrames(allocator: std.mem.Allocator, io: std.Io, browser: *RawBro
         var width: c_int = 0;
         var height: c_int = 0;
         var byte_len: usize = 0;
-        if (verde_browser_linux_poll_frame(browser, &frame_path, &frame_sequence, &frame_slot, &width, &height, &byte_len) == 0) break;
+        var exported_at_ns: u64 = 0;
+        var published_at_ns: u64 = 0;
+        if (verde_browser_linux_poll_frame(browser, &frame_path, &frame_sequence, &frame_slot, &width, &height, &byte_len, &exported_at_ns, &published_at_ns) == 0) break;
         defer if (frame_path != null) verde_browser_linux_free_string(frame_path);
 
         const event: ipc.Event = .{
@@ -356,6 +387,11 @@ fn flushBrowserFrames(allocator: std.mem.Allocator, io: std.Io, browser: *RawBro
             .height = @intCast(@max(height, 0)),
             .byte_len = byte_len,
             .frame_slot = if (frame_slot >= 0) @intCast(frame_slot) else 0,
+            .exported_at_ns = exported_at_ns,
+            .published_at_ns = published_at_ns,
+            .helper_sent_at_ns = monotonicTimestampNs(),
+            .input_serial = input_serial,
+            .input_sent_at_ns = input_sent_at_ns,
             .frame_path = if (frame_path) |value| std.mem.span(value) else null,
         };
         const encoded = try std.json.Stringify.valueAlloc(allocator, event, .{});
@@ -392,4 +428,87 @@ fn encodeModifierMask(command: ipc.Command) c_uint {
     if (command.alt) mask |= 1 << 2;
     if (command.super) mask |= 1 << 3;
     return mask;
+}
+
+const TestContextMenuPayload = struct {
+    x: f32 = 0,
+    y: f32 = 0,
+    items: []const TestContextMenuItem = &.{},
+};
+
+const TestContextMenuItem = struct {
+    index: u32 = 0,
+    label: []const u8 = "",
+    enabled: bool = false,
+    separator: bool = false,
+    submenu: bool = false,
+    items: []const TestContextMenuItem = &.{},
+};
+
+fn parseTestContextMenu(scenario: c_uint, inspector_configured: bool) !std.json.Parsed(TestContextMenuPayload) {
+    const payload = verde_browser_linux_test_context_menu_payload(scenario, @intFromBool(inspector_configured)) orelse
+        return error.TestUnexpectedResult;
+    defer verde_browser_linux_free_string(payload);
+    return try std.json.parseFromSlice(
+        TestContextMenuPayload,
+        std.testing.allocator,
+        std.mem.span(payload),
+        .{ .allocate = .alloc_always },
+    );
+}
+
+test "WPE context menus serialize page link image and editable actions as valid JSON" {
+    const expected = [_][]const []const u8{
+        &.{ "Back", "Forward", "Stop", "Reload" },
+        &.{ "Open Link", "Open Link in New Window", "Download Linked File", "Copy Link" },
+        &.{ "Open Image in New Window", "Download Image", "Copy Image" },
+        &.{ "Cut", "Copy", "Paste" },
+    };
+    for (expected, 0..) |labels, scenario| {
+        var parsed = try parseTestContextMenu(@intCast(scenario), false);
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.items.len >= labels.len);
+        for (labels, 0..) |label, index| {
+            try std.testing.expectEqualStrings(label, parsed.value.items[index].label);
+        }
+    }
+}
+
+test "WPE Inspect Element remains informative when remote inspection is not configured" {
+    var unavailable = try parseTestContextMenu(0, false);
+    defer unavailable.deinit();
+    const setup_item = unavailable.value.items[unavailable.value.items.len - 1];
+    try std.testing.expectEqualStrings("Inspect Element (set WEBKIT_INSPECTOR_SERVER)", setup_item.label);
+    try std.testing.expect(!setup_item.enabled);
+
+    var configured = try parseTestContextMenu(0, true);
+    defer configured.deinit();
+    const inspect_item = configured.value.items[configured.value.items.len - 1];
+    try std.testing.expectEqualStrings("Inspect Element", inspect_item.label);
+    try std.testing.expect(inspect_item.enabled);
+}
+
+test "WPE context-menu separators and recursive submenus retain structure" {
+    var separated = try parseTestContextMenu(4, false);
+    defer separated.deinit();
+    try std.testing.expectEqual(@as(usize, 3), separated.value.items.len);
+    try std.testing.expect(separated.value.items[1].separator);
+
+    var nested = try parseTestContextMenu(5, false);
+    defer nested.deinit();
+    try std.testing.expectEqual(@as(usize, 1), nested.value.items.len);
+    try std.testing.expect(nested.value.items[0].submenu);
+    try std.testing.expect(nested.value.items[0].enabled);
+    try std.testing.expectEqual(@as(usize, 1), nested.value.items[0].items.len);
+    try std.testing.expectEqualStrings("Copy", nested.value.items[0].items[0].label);
+}
+
+test "WPE frame pacing uses active cadence while visible and does not postpone overdue work" {
+    try std.testing.expectEqual(@as(i64, 1_000_000 / 60), verde_browser_linux_test_frame_interval_us(1));
+    try std.testing.expectEqual(@as(i64, 1_000_000 / 10), verde_browser_linux_test_frame_interval_us(0));
+    try std.testing.expectEqual(@as(i64, 115_916), verde_browser_linux_test_active_completion_deadline_us(100_000, 110_000));
+    try std.testing.expectEqual(@as(i64, 113_916), verde_browser_linux_test_active_completion_deadline_with_lead_us(100_000, 110_000, 2_000));
+    try std.testing.expectEqual(@as(i64, 130_000), verde_browser_linux_test_active_completion_deadline_us(100_000, 130_000));
+    try std.testing.expectEqual(@as(i64, 2_000), verde_browser_linux_test_updated_production_lead_us(2_000, 100_000, 200_000));
+    try std.testing.expectEqual(@as(i64, 2_250), verde_browser_linux_test_updated_production_lead_us(2_000, 100_000, 103_000));
 }
