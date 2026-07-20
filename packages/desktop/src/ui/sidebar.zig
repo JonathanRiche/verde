@@ -283,7 +283,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                 startWorkspaceDrag(state, hit.project_index, x, y, true);
             },
             .open_pane => {
-                state.focusWorkspaceOpenPane(hit.project_index, @intCast(hit.thread_index));
+                state.focusWorkspaceOpenPaneFromSidebar(hit.project_index, @intCast(hit.thread_index));
             },
             .workspace_avatar => {
                 startWorkspaceDrag(state, hit.project_index, x, y, false);
