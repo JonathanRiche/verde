@@ -9991,6 +9991,39 @@ pub const AppState = struct {
         self.focusWorkspaceOpenPaneWithZoom(project_index, pane_id, true);
     }
 
+    /// Cycles through the current workspace's panes in their sidebar list order.
+    pub fn focusCurrentProjectWorkspacePaneInSidebarOrder(self: *AppState, delta: i32) bool {
+        if (self.projects.items.len == 0 or delta == 0) return false;
+        const project_index = self.selected_project_index;
+        const layout = &self.projects.items[project_index].workspace_layout;
+        if (layout.panes.items.len == 0) return false;
+
+        var current_index: ?usize = null;
+        if (layout.focused_pane_id) |focused_pane_id| {
+            for (layout.panes.items, 0..) |pane, index| {
+                if (pane.id == focused_pane_id) {
+                    current_index = index;
+                    break;
+                }
+            }
+        }
+
+        const target_index = if (current_index) |index|
+            if (delta < 0)
+                if (index == 0) layout.panes.items.len - 1 else index - 1
+            else if (index + 1 == layout.panes.items.len)
+                0
+            else
+                index + 1
+        else if (delta < 0)
+            layout.panes.items.len - 1
+        else
+            0;
+        const target_pane_id = layout.panes.items[target_index].id;
+        self.focusWorkspaceOpenPaneFromSidebar(project_index, target_pane_id);
+        return true;
+    }
+
     fn focusWorkspaceOpenPaneWithZoom(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, preserve_zoom: bool) void {
         if (project_index >= self.projects.items.len) return;
         self.selected_project_index = project_index;
@@ -21116,6 +21149,7 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
         return err;
     };
     const layout = &state.projects.items[0].workspace_layout;
+    const chat_pane_id = layout.panes.items[0].id;
     const first_terminal_pane_id = try layout.createTerminalPane(allocator, 1);
     const clicked_terminal_pane_id = try layout.createTerminalPane(allocator, 2);
     layout.focused_pane_id = first_terminal_pane_id;
@@ -21129,6 +21163,16 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     try std.testing.expect(!state.composer_focused);
     try std.testing.expect(!state.palette_composer.focused);
     try std.testing.expect(!state.browser_address_focused);
+
+    try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(1));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(-1));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(-1));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, first_terminal_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, first_terminal_pane_id), layout.maximized_pane_id);
 }
 
 test "Codex hook feature detection accepts current and legacy names" {
