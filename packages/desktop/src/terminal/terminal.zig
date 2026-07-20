@@ -2687,7 +2687,20 @@ const UnixSession = struct {
             @as(usize, self.rows) - visible_rows
         else
             0;
-        const adjusted_y = local_y + @as(f32, @floatFromInt(row_offset * @as(usize, logical_cell_height)));
+        // Primary-screen scrollback correction: rendering shows the scrolled
+        // viewport, but mouse reports must be in live-screen coordinates. A
+        // viewport stuck above the bottom (bounded attach replay, scrollbar
+        // drag) otherwise skews every TUI click down by the scroll distance —
+        // and because the TUI owns the wheel while mouse reporting is on, the
+        // user cannot scroll the pane back to clear the skew. Alternate
+        // screens have no scrollback, so this is zero there.
+        const bar = self.terminal.screens.active.pages.scrollbar();
+        const scrollback_rows = bar.total -| (bar.offset + bar.len);
+        const scrollback_px = @as(f32, @floatFromInt(scrollback_rows)) * @as(f32, @floatFromInt(logical_cell_height));
+        const adjusted_y = local_y + @as(f32, @floatFromInt(row_offset * @as(usize, logical_cell_height))) - scrollback_px;
+        // Clicks on pure-history rows have no live-screen equivalent; a
+        // negative y would encode a bogus cell, so drop the report instead.
+        if (adjusted_y < 0.0) return;
         var buffer: [64]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buffer);
         try ghostty_vt.input.encodeMouse(&writer, .{
@@ -3017,6 +3030,13 @@ const UnixSession = struct {
         self.stream.nextSlice(text);
         try self.repairTerminalState(allocator);
         self.resetAlternateViewport();
+        // Initial attach replay can leave the primary-screen viewport parked
+        // above the bottom (the bounded replay ends mid-history). Snap it to
+        // the live screen once so rendering and TUI mouse coordinates agree;
+        // ordinary drains skip this to preserve intentional user scrollback.
+        if (suppress_replay_responses and self.terminal.screens.active_key == .primary) {
+            self.terminal.scrollViewport(.{ .bottom = {} });
+        }
         return true;
     }
 
