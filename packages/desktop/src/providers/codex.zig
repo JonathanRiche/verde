@@ -11,7 +11,8 @@ const runtime_log = @import("../runtime_log.zig");
 const OVERLOAD_ERROR_CODE = -32001;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const DEFAULT_WS_URL = "ws://127.0.0.1:4500";
-const MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024;
+// Codex can return saved thread history in one frame; match its own app-server client limit.
+const MAX_WS_MESSAGE_BYTES = 128 * 1024 * 1024;
 const MAX_HTTP_LINE_BYTES = 16 * 1024;
 const MAX_RPC_RETRIES = 4;
 const INTERRUPTIBLE_READ_POLL_MS = 250;
@@ -1107,6 +1108,9 @@ pub const Client = struct {
 
         const params = .{
             .threadId = thread_id,
+            // Verde already owns the visible transcript, so avoid returning the
+            // potentially very large saved history merely to resume the thread.
+            .excludeTurns = true,
         };
         const payload = try self.callRpcForResultAlloc("thread/resume", params);
         defer self.allocator.free(payload);
@@ -2597,6 +2601,16 @@ fn appendImportedMessagesForItem(
         return;
     }
 
+    if (std.mem.eql(u8, item_type, "mcpToolCall")) {
+        const status = getOptionalObjectString(item, "status") orelse return;
+        if (!std.mem.eql(u8, status, "completed") and !std.mem.eql(u8, status, "failed")) return;
+        var label_buf: [512]u8 = undefined;
+        const label = formatMcpToolCallLabel(&label_buf, item) orelse return;
+        const author: []const u8 = if (std.mem.eql(u8, status, "failed")) "Command failed" else "Ran command";
+        try appendImportedMessage(allocator, messages, .system, author, label);
+        return;
+    }
+
     if (std.mem.eql(u8, item_type, "fileChange")) {
         const changes = getObjectField(item, "changes") orelse return;
         const body = try buildImportedFileChangeSummaryAlloc(allocator, changes);
@@ -2801,11 +2815,13 @@ fn emitItemEvent(
     context: ?*anyopaque,
     on_stream_event: *const fn (?*anyopaque, provider_types.StreamEvent) void,
 ) bool {
+    const method = getOptionalObjectString(root, "method") orelse return false;
     const params = getObjectField(root, "params") orelse return false;
     const item = getObjectField(params, "item") orelse return false;
     const item_type = getOptionalObjectString(item, "type") orelse return false;
 
     if (std.mem.eql(u8, item_type, "commandExecution")) {
+        if (!std.mem.eql(u8, method, "item/completed")) return true;
         const command = getOptionalObjectString(item, "command") orelse return false;
         const status = getOptionalObjectString(item, "status") orelse "completed";
         on_stream_event(context, .{ .message = .{
@@ -2815,14 +2831,27 @@ fn emitItemEvent(
         return true;
     }
 
+    if (std.mem.eql(u8, item_type, "mcpToolCall")) {
+        if (!std.mem.eql(u8, method, "item/completed")) return true;
+        const status = getOptionalObjectString(item, "status") orelse return false;
+        if (!std.mem.eql(u8, status, "completed") and !std.mem.eql(u8, status, "failed")) return true;
+        var label_buf: [512]u8 = undefined;
+        const label = formatMcpToolCallLabel(&label_buf, item) orelse return false;
+        on_stream_event(context, .{ .message = .{
+            .title = if (std.mem.eql(u8, status, "failed")) "Command failed" else "Ran command",
+            .body = label,
+        } });
+        return true;
+    }
+
     if (std.mem.eql(u8, item_type, "fileChange")) {
+        if (!std.mem.eql(u8, method, "item/completed")) return true;
         if (buildFileChangeItemSummary(item, context, on_stream_event)) {
             return true;
         }
     }
 
     if (std.mem.eql(u8, item_type, "contextCompaction")) {
-        const method = getOptionalObjectString(root, "method") orelse return false;
         if (!std.mem.eql(u8, method, "item/completed")) return false;
         on_stream_event(context, .{ .message = .{
             .title = "Context compacted",
@@ -2832,6 +2861,12 @@ fn emitItemEvent(
     }
 
     return false;
+}
+
+fn formatMcpToolCallLabel(buffer: []u8, item: std.json.Value) ?[]const u8 {
+    const server = getOptionalObjectString(item, "server") orelse return null;
+    const tool = getOptionalObjectString(item, "tool") orelse return null;
+    return std.fmt.bufPrint(buffer, "{s}.{s}", .{ server, tool }) catch tool;
 }
 
 fn handleCommandApprovalRequest(self: *Client, root: std.json.Value, request_id: std.json.Value, request: provider_types.SendPromptRequest) !void {
@@ -3420,13 +3455,21 @@ const TestFailureCapture = struct {
 const TestStreamEventCapture = struct {
     title: ?[]const u8 = null,
     body: ?[]const u8 = null,
+    message_count: usize = 0,
+    title_storage: [128]u8 = undefined,
+    body_storage: [1024]u8 = undefined,
 
     fn handle(context: ?*anyopaque, event: provider_types.StreamEvent) void {
         const self: *TestStreamEventCapture = @ptrCast(@alignCast(context orelse return));
         switch (event) {
             .message => |message| {
-                self.title = message.title;
-                self.body = message.body;
+                const title_len = @min(message.title.len, self.title_storage.len);
+                const body_len = @min(message.body.len, self.body_storage.len);
+                @memcpy(self.title_storage[0..title_len], message.title[0..title_len]);
+                @memcpy(self.body_storage[0..body_len], message.body[0..body_len]);
+                self.title = self.title_storage[0..title_len];
+                self.body = self.body_storage[0..body_len];
+                self.message_count += 1;
             },
             .diff => {},
         }
@@ -3486,6 +3529,13 @@ test "appendImportedMessagesForItem maps transcript items into chat messages" {
         \\    "status": "completed"
         \\  },
         \\  {
+        \\    "type": "mcpToolCall",
+        \\    "id": "m1",
+        \\    "server": "verde",
+        \\    "tool": "capture_browser_screenshot",
+        \\    "status": "completed"
+        \\  },
+        \\  {
         \\    "type": "fileChange",
         \\    "id": "f1",
         \\    "changes": [
@@ -3514,7 +3564,7 @@ test "appendImportedMessagesForItem maps transcript items into chat messages" {
         try appendImportedMessagesForItem(allocator, item, &messages);
     }
 
-    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 5), messages.items.len);
     try std.testing.expectEqual(provider_types.MessageRole.user, messages.items[0].role);
     try std.testing.expectEqualStrings("You", messages.items[0].author);
     try std.testing.expectEqualStrings("Look at this\n\n[Image: /tmp/screenshot.png]", messages.items[0].body);
@@ -3523,8 +3573,10 @@ test "appendImportedMessagesForItem maps transcript items into chat messages" {
     try std.testing.expectEqualStrings("I checked it.", messages.items[1].body);
     try std.testing.expectEqualStrings("Ran command", messages.items[2].author);
     try std.testing.expectEqualStrings("git status", messages.items[2].body);
-    try std.testing.expectEqualStrings("Changed files", messages.items[3].author);
-    try std.testing.expectEqualStrings("src/main.zig  +1 / -1", messages.items[3].body);
+    try std.testing.expectEqualStrings("Ran command", messages.items[3].author);
+    try std.testing.expectEqualStrings("verde.capture_browser_screenshot", messages.items[3].body);
+    try std.testing.expectEqualStrings("Changed files", messages.items[4].author);
+    try std.testing.expectEqualStrings("src/main.zig  +1 / -1", messages.items[4].body);
 }
 
 test "formatUsageSummaryAlloc renders concise usage summary" {
@@ -3816,6 +3868,118 @@ test "detectTurnTerminalState matches turn completion status for the started tur
         .on_failure = TestFailureCapture.handle,
     });
     try std.testing.expectEqualStrings("boom", capture.message.?);
+}
+
+test "command execution emits only its completed lifecycle event" {
+    const allocator = std.testing.allocator;
+    const started_json =
+        \\{
+        \\  "method": "item/started",
+        \\  "params": {
+        \\    "item": {
+        \\      "id": "command-1",
+        \\      "type": "commandExecution",
+        \\      "command": "git status",
+        \\      "status": "inProgress"
+        \\    }
+        \\  }
+        \\}
+    ;
+    var started = try std.json.parseFromSlice(std.json.Value, allocator, started_json, .{});
+    defer started.deinit();
+
+    var capture: TestStreamEventCapture = .{};
+    try std.testing.expect(emitItemEvent(started.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqual(@as(usize, 0), capture.message_count);
+
+    const completed_json =
+        \\{
+        \\  "method": "item/completed",
+        \\  "params": {
+        \\    "item": {
+        \\      "id": "command-1",
+        \\      "type": "commandExecution",
+        \\      "command": "git status",
+        \\      "status": "completed"
+        \\    }
+        \\  }
+        \\}
+    ;
+    var completed = try std.json.parseFromSlice(std.json.Value, allocator, completed_json, .{});
+    defer completed.deinit();
+
+    try std.testing.expect(emitItemEvent(completed.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqual(@as(usize, 1), capture.message_count);
+    try std.testing.expectEqualStrings("Ran command", capture.title.?);
+    try std.testing.expectEqualStrings("git status", capture.body.?);
+}
+
+test "MCP calls emit one grouped command event on completion" {
+    const allocator = std.testing.allocator;
+    const started_json =
+        \\{
+        \\  "method": "item/started",
+        \\  "params": {
+        \\    "item": {
+        \\      "id": "mcp-1",
+        \\      "type": "mcpToolCall",
+        \\      "server": "verde",
+        \\      "tool": "capture_browser_screenshot",
+        \\      "status": "inProgress"
+        \\    }
+        \\  }
+        \\}
+    ;
+    var started = try std.json.parseFromSlice(std.json.Value, allocator, started_json, .{});
+    defer started.deinit();
+
+    var capture: TestStreamEventCapture = .{};
+    try std.testing.expect(emitItemEvent(started.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqual(@as(usize, 0), capture.message_count);
+
+    const completed_json =
+        \\{
+        \\  "method": "item/completed",
+        \\  "params": {
+        \\    "item": {
+        \\      "id": "mcp-1",
+        \\      "type": "mcpToolCall",
+        \\      "server": "verde",
+        \\      "tool": "capture_browser_screenshot",
+        \\      "status": "completed"
+        \\    }
+        \\  }
+        \\}
+    ;
+    var completed = try std.json.parseFromSlice(std.json.Value, allocator, completed_json, .{});
+    defer completed.deinit();
+
+    try std.testing.expect(emitItemEvent(completed.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqual(@as(usize, 1), capture.message_count);
+    try std.testing.expectEqualStrings("Ran command", capture.title.?);
+    try std.testing.expectEqualStrings("verde.capture_browser_screenshot", capture.body.?);
+
+    const failed_json =
+        \\{
+        \\  "method": "item/completed",
+        \\  "params": {
+        \\    "item": {
+        \\      "id": "mcp-2",
+        \\      "type": "mcpToolCall",
+        \\      "server": "blender",
+        \\      "tool": "execute_blender_code",
+        \\      "status": "failed"
+        \\    }
+        \\  }
+        \\}
+    ;
+    var failed = try std.json.parseFromSlice(std.json.Value, allocator, failed_json, .{});
+    defer failed.deinit();
+
+    try std.testing.expect(emitItemEvent(failed.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqual(@as(usize, 2), capture.message_count);
+    try std.testing.expectEqualStrings("Command failed", capture.title.?);
+    try std.testing.expectEqualStrings("blender.execute_blender_code", capture.body.?);
 }
 
 test "isContextCompactionCompleted matches compact item completion" {
