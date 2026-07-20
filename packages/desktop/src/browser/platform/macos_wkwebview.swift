@@ -88,7 +88,6 @@ private final class VerdeMacBrowser: NSObject, WKScriptMessageHandler, WKNavigat
         (function(){
           const bridge={postMessage:function(payload){window.webkit.messageHandlers.verde.postMessage(String(payload));}};
           window.__VERDE_BROWSER_IPC__=bridge;
-          window.__VERDE_CEF_IPC__=bridge;
           window.verde=bridge;
         })();
         """
@@ -250,6 +249,14 @@ private final class VerdeMacBrowser: NSObject, WKScriptMessageHandler, WKNavigat
             return view === webView || view.isDescendant(of: webView)
         }
         return false
+    }
+
+    func ownsCursor() -> Bool {
+        guard visible, let window, let contentView = window.contentView, !container.isHidden else { return false }
+        let windowPoint = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+        let contentPoint = contentView.convert(windowPoint, from: nil)
+        guard let hitView = contentView.hitTest(contentPoint) else { return false }
+        return hitView === webView || hitView.isDescendant(of: webView)
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -571,6 +578,14 @@ public func verde_macos_webview_has_focus(_ handle: UnsafeMutableRawPointer?) ->
     onMain {
         guard let browser = browserFromOpaque(handle) else { return 0 }
         return browser.hasFocus() ? 1 : 0
+    }
+}
+
+@_cdecl("verde_macos_webview_owns_cursor")
+public func verde_macos_webview_owns_cursor(_ handle: UnsafeMutableRawPointer?) -> Int32 {
+    onMain {
+        guard let browser = browserFromOpaque(handle) else { return 0 }
+        return browser.ownsCursor() ? 1 : 0
     }
 }
 

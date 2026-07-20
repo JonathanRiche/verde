@@ -134,13 +134,6 @@ Common pitfalls:
 
 - **Bare `zig build` does not compile.** It defaults to Debug + the WPE `verde-browser-linux` helper, which trips a vendored `packages/ghostty/.../osc.zig` comptime `@sizeOf` assertion and a `crt1.o` linker error. Always pass `--release=safe -Dbrowser-backend=native_webview`, or use `mise run build`.
 - **Running `zig build` from `packages/desktop`.** That installs to `packages/desktop/zig-out`, not the top-level `zig-out/bin/verde` the app launches from. Always build from the repo root.
-- **CEF fallback.** CEF is still available as an explicit fallback if you need the legacy Chromium backend:
-  ```bash
-  mise run build-cef
-  # or
-  zig build --release=safe -Dbrowser-backend=cef -Dcef-sdk-path=/path/to/cef
-  ```
-
 For release-style local installs, use the packaged install scripts:
 
 ```bash

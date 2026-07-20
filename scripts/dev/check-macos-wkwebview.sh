@@ -173,21 +173,6 @@ if ! awk '
   exit 1
 fi
 
-for script in scripts/release/install-macos-local.sh scripts/release/package-macos-app.sh; do
-  if ! rg -q 'BROWSER_BACKEND="\$\{VERDE_BROWSER_BACKEND:-native_webview\}"' "$script"; then
-    echo "$script does not default macOS packaging to native_webview" >&2
-    exit 1
-  fi
-  if ! rg -q 'if \[\[ "\$BROWSER_BACKEND" == "cef" \]\]; then' "$script"; then
-    echo "$script does not guard CEF setup behind the explicit cef backend" >&2
-    exit 1
-  fi
-  if ! rg -q 'verde_cef_ensure_sdk macos "\$ARCH"' "$script"; then
-    echo "$script no longer makes CEF SDK setup explicit to the cef backend path" >&2
-    exit 1
-  fi
-done
-
 if [[ ! -d "$APP_DIR" ]]; then
   echo "installed app not found: $APP_DIR" >&2
   echo "run: mise run build" >&2
@@ -215,35 +200,10 @@ for symbol in "${required_exports[@]}"; do
   fi
 done
 
-if find "$APP_DIR" \( \
-  -name 'Chromium Embedded Framework.framework' -o \
-  -name 'verde-browser-cef' -o \
-  -name 'verde-browser-cef-process' -o \
-  -name 'libcef*' -o \
-  -name '*.pak' -o \
-  -name 'locales' \
-\) -print -quit | rg -q .; then
-  echo "installed native macOS app unexpectedly contains CEF/Chromium payload" >&2
-  find "$APP_DIR" \( \
-    -name 'Chromium Embedded Framework.framework' -o \
-    -name 'verde-browser-cef' -o \
-    -name 'verde-browser-cef-process' -o \
-    -name 'libcef*' -o \
-    -name '*.pak' -o \
-    -name 'locales' \
-  \) -print >&2
-  exit 1
-fi
-
 while IFS= read -r binary; do
   linked_libs="$(otool -L "$binary" 2>/dev/null || true)"
   if [[ -z "$linked_libs" ]]; then
     continue
-  fi
-  if printf '%s\n' "$linked_libs" | rg -qi 'libcef|Chromium Embedded Framework|verde-browser-cef'; then
-    echo "installed native macOS app unexpectedly links CEF/Chromium from: $binary" >&2
-    printf '%s\n' "$linked_libs" >&2
-    exit 1
   fi
   if printf '%s\n' "$linked_libs" | rg -q '/opt/homebrew|/usr/local|/Users/.*/development/verde-simple-webview'; then
     echo "installed native macOS app has non-app-local dependency reference in: $binary" >&2

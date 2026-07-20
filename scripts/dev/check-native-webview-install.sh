@@ -26,28 +26,6 @@ for name in "${required_payload[@]}"; do
   fi
 done
 
-cef_payload=(
-  "verde-browser-cef"
-  "verde-browser-cef-process"
-  "libcef.so"
-  "chrome-sandbox"
-  "chrome_100_percent.pak"
-  "chrome_200_percent.pak"
-  "resources.pak"
-  "icudtl.dat"
-  "v8_context_snapshot.bin"
-  "vk_swiftshader_icd.json"
-  "locales"
-  "Chromium Embedded Framework.framework"
-)
-
-for name in "${cef_payload[@]}"; do
-  if [[ -e "$PREFIX_DIR/bin/$name" ]]; then
-    echo "native webview install unexpectedly contains CEF payload: bin/$name" >&2
-    exit 1
-  fi
-done
-
 if [[ "$(uname -s)" == "Linux" ]]; then
   if ! command -v readelf >/dev/null 2>&1; then
     echo "missing required command for native install verification: readelf" >&2

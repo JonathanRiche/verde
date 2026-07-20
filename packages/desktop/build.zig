@@ -12,12 +12,11 @@ pub fn build(b: *std.Build) void {
     const version_z: [:0]const u8 = b.allocator.dupeSentinel(u8, version, 0) catch @panic("OOM");
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window") orelse false;
     const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: sdl_gpu") orelse .sdl_gpu;
-    const browser_backend = b.option(BrowserBackendKind, "browser-backend", "Browser backend: native_webview, cef, or stub") orelse .native_webview;
+    const browser_backend = b.option(BrowserBackendKind, "browser-backend", "Browser backend: native_webview or stub") orelse .native_webview;
     const terminal_backend = b.option(bool, "terminal_backend", "Enable the native terminal backend") orelse true;
     const local_ipc = b.option(bool, "local_ipc", "Enable the local live-control IPC backend") orelse true;
     const windows_integrations = b.option(bool, "windows_integrations", "Enable native Windows shell/clipboard/application integrations") orelse
         (target.result.os.tag == .windows);
-    const cef_sdk_path = b.option([]const u8, "cef-sdk-path", "Path to a CEF binary distribution for the embedded browser pane");
     const build_fff_enabled = b.option(bool, "build-fff", "Build the vendored fff-c library with Cargo") orelse true;
     const fff_cargo_target = b.option([]const u8, "fff-cargo-target", "Rust target triple used to build fff-c") orelse
         b.graph.environ_map.get("VERDE_FFF_CARGO_TARGET") orelse
@@ -54,10 +53,6 @@ pub fn build(b: *std.Build) void {
         b.graph.environ_map.get("WEBVIEW2_LOADER_LIB");
     const webview2_loader_dll = b.option([]const u8, "webview2-loader-dll", "Path to WebView2Loader.dll to install beside the executable") orelse
         b.graph.environ_map.get("WEBVIEW2_LOADER_DLL");
-    const cef_stub_preview = b.option(bool, "cef-stub-preview", "Use the in-app CEF pane scaffold without a real CEF SDK") orelse false;
-    const cef_supported = target.result.os.tag == .linux or target.result.os.tag == .macos;
-    const cef_sdk_configured = cef_sdk_path != null and cef_supported;
-    const build_cef_backend = browser_backend == .cef and cef_sdk_configured and !cef_stub_preview;
     const fff_root = b.path("../../vendor/fff");
 
     if (target.result.os.tag == .windows and (!terminal_backend or !local_ipc or !windows_integrations)) {
@@ -131,8 +126,6 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "terminal_backend", terminal_backend);
     build_options.addOption(bool, "local_ipc", local_ipc);
     build_options.addOption(bool, "windows_integrations", windows_integrations);
-    build_options.addOption(bool, "cef_sdk_configured", cef_sdk_configured);
-    build_options.addOption(bool, "cef_stub_preview", cef_stub_preview);
     const build_options_module = build_options.createModule();
     const version_stamp = b.addWriteFiles().add("BUILD_VERSION", b.fmt("{s}\n", .{version}));
     b.getInstallStep().dependOn(&b.addInstallFileWithDir(
@@ -397,35 +390,6 @@ pub fn build(b: *std.Build) void {
         browser_helper.root_module.linkSystemLibrary("javascriptcoregtk-6.0", .{ .use_pkg_config = .force });
         b.installArtifact(browser_helper);
     }
-    if (build_cef_backend) {
-        const build_cef_helper = b.addSystemCommand(&.{
-            "bash",
-            "-lc",
-            b.fmt(
-                "cmake -S src/browser/cef/c -B .zig-cache/verde-cef-helper -DCMAKE_BUILD_TYPE=Release -DCEF_ROOT={s} -DVERDE_OUTPUT_DIR=$PWD/zig-out/bin && cmake --build .zig-cache/verde-cef-helper --target verde-browser-cef verde-browser-cef-process --parallel \"${{VERDE_CEF_BUILD_JOBS:-2}}\"",
-                .{cef_sdk_path.?},
-            ),
-        });
-        build_cef_helper.setCwd(b.path("."));
-        b.getInstallStep().dependOn(&build_cef_helper.step);
-        const install_cef_helper = b.addInstallBinFile(
-            .{ .cwd_relative = "zig-out/bin/verde-browser-cef" },
-            "verde-browser-cef",
-        );
-        install_cef_helper.step.dependOn(&build_cef_helper.step);
-        b.getInstallStep().dependOn(&install_cef_helper.step);
-        const install_cef_process_helper = b.addInstallBinFile(
-            .{ .cwd_relative = "zig-out/bin/verde-browser-cef-process" },
-            "verde-browser-cef-process",
-        );
-        install_cef_process_helper.step.dependOn(&build_cef_helper.step);
-        b.getInstallStep().dependOn(&install_cef_process_helper.step);
-        switch (target.result.os.tag) {
-            .linux => installLinuxCefRuntime(b, cef_sdk_path.?),
-            .macos => installMacOSCefRuntime(b, cef_sdk_path.?),
-            else => {},
-        }
-    }
     const install_fff = b.addInstallBinFile(.{ .cwd_relative = fff_runtime_lib }, fffRuntimeName(target.result.os.tag));
     if (build_fff) |build_step| install_fff.step.dependOn(&build_step.step);
     b.getInstallStep().dependOn(&install_fff.step);
@@ -653,7 +617,6 @@ const PaletteRendererBackend = enum {
 
 const BrowserBackendKind = enum {
     native_webview,
-    cef,
     stub,
 };
 
@@ -1143,70 +1106,4 @@ fn macOSHomebrewPrefix(b: *std.Build) ?[]const u8 {
         return prefix;
     }
     return null;
-}
-
-fn configureLinuxCefBinary(
-    b: *std.Build,
-    compile: *std.Build.Step.Compile,
-    sdk_path: []const u8,
-) void {
-    const sdk_root: std.Build.LazyPath = .{ .cwd_relative = sdk_path };
-    const release_dir = b.pathJoin(&.{ sdk_path, "Release" });
-
-    compile.root_module.link_libcpp = true;
-    compile.root_module.addIncludePath(sdk_root);
-    compile.root_module.addLibraryPath(.{ .cwd_relative = release_dir });
-    compile.root_module.linkSystemLibrary("cef", .{});
-    compile.root_module.addCSourceFile(.{
-        .file = b.path("src/browser/cef/c/native_linux.cc"),
-        .flags = &.{"-std=c++17"},
-    });
-}
-
-fn installLinuxCefRuntime(b: *std.Build, sdk_path: []const u8) void {
-    const release_files = [_][]const u8{
-        "libcef.so",
-        "libEGL.so",
-        "libGLESv2.so",
-        "libvk_swiftshader.so",
-        "libvulkan.so.1",
-        "v8_context_snapshot.bin",
-        "vk_swiftshader_icd.json",
-        "chrome-sandbox",
-    };
-    for (release_files) |name| {
-        b.getInstallStep().dependOn(&b.addInstallFileWithDir(
-            .{ .cwd_relative = b.pathJoin(&.{ sdk_path, "Release", name }) },
-            .bin,
-            name,
-        ).step);
-    }
-
-    const resource_files = [_][]const u8{
-        "chrome_100_percent.pak",
-        "chrome_200_percent.pak",
-        "resources.pak",
-        "icudtl.dat",
-    };
-    for (resource_files) |name| {
-        b.getInstallStep().dependOn(&b.addInstallFileWithDir(
-            .{ .cwd_relative = b.pathJoin(&.{ sdk_path, "Resources", name }) },
-            .bin,
-            name,
-        ).step);
-    }
-
-    b.getInstallStep().dependOn(&b.addInstallDirectory(.{
-        .source_dir = .{ .cwd_relative = b.pathJoin(&.{ sdk_path, "Resources", "locales" }) },
-        .install_dir = .bin,
-        .install_subdir = "locales",
-    }).step);
-}
-
-fn installMacOSCefRuntime(b: *std.Build, sdk_path: []const u8) void {
-    b.getInstallStep().dependOn(&b.addInstallDirectory(.{
-        .source_dir = .{ .cwd_relative = b.pathJoin(&.{ sdk_path, "Release", "Chromium Embedded Framework.framework" }) },
-        .install_dir = .bin,
-        .install_subdir = "Chromium Embedded Framework.framework",
-    }).step);
 }

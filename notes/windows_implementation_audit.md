@@ -68,7 +68,7 @@ Implemented:
   output against the committed bytes.
 - Both PEs embed a Verde icon, version metadata, `asInvoker`, long-path
   awareness, and Per-Monitor-V2 DPI awareness.
-- Package verification rejects missing runtime DLLs, unexpected DLLs, CEF or
+- Package verification rejects missing runtime DLLs, unexpected DLLs, or
   development artifacts, incorrect PE architecture/subsystems, missing
   resources, or a broken provider-bridge layout.
 

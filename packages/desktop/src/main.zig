@@ -95,6 +95,33 @@ const MACOS_CMD_W_CLOSE_SUPPRESS_MS: i64 = 750;
 // but the final event may briefly report focus again; suppress that tail too.
 const LINUX_SUSPICIOUS_CLOSE_BURST_SUPPRESS_MS: i64 = 3500;
 var linux_wayland_browser_host: browser_runtime.LinuxWaylandHost = .{};
+const SYSTEM_CURSOR_COUNT = @typeInfo(sdl.SystemCursor).@"enum".fields.len;
+
+const SystemCursorCache = struct {
+    cursors: [SYSTEM_CURSOR_COUNT]?*sdl.Cursor = [_]?*sdl.Cursor{null} ** SYSTEM_CURSOR_COUNT,
+    attempted: [SYSTEM_CURSOR_COUNT]bool = [_]bool{false} ** SYSTEM_CURSOR_COUNT,
+    native_browser_owned: bool = false,
+
+    fn deinit(self: *SystemCursorCache) void {
+        for (&self.cursors, &self.attempted) |*cursor, *attempted| {
+            if (cursor.*) |value| value.destroy();
+            cursor.* = null;
+            attempted.* = false;
+        }
+        self.native_browser_owned = false;
+    }
+
+    fn get(self: *SystemCursorCache, kind: sdl.SystemCursor) ?*sdl.Cursor {
+        if (kind == .default) return sdl.getDefaultCursor();
+        const index: usize = @intCast(@intFromEnum(kind));
+        if (!self.attempted[index]) {
+            self.attempted[index] = true;
+            self.cursors[index] = sdl.createSystemCursor(kind) catch null;
+        }
+        return self.cursors[index] orelse sdl.getDefaultCursor();
+    }
+};
+
 const PALETTE_GPU_UI_FONT_PATHS = [_][:0]const u8{
     "src/assets/fonts/CalSans-Regular.ttf",
     "packages/desktop/src/assets/fonts/CalSans-Regular.ttf",
@@ -256,8 +283,8 @@ fn mainInner(init: std.process.Init) !void {
         },
     );
     defer window.destroy();
-    const pointer_cursor = try sdl.createSystemCursor(.pointer);
-    defer pointer_cursor.destroy();
+    var cursor_cache: SystemCursorCache = .{};
+    defer cursor_cache.deinit();
     window.setPosition(initial_window_frame.x, initial_window_frame.y) catch {};
     activateMacosHostWindow(window);
     if (builtin.os.tag == .macos) {
@@ -544,7 +571,7 @@ fn mainInner(init: std.process.Init) !void {
                 changed.* = app_state.pollTerminals();
             }
         }.run, .{ &state, &terminal_needs_render });
-        syncMouseCursor(&state, pointer_cursor);
+        syncMouseCursor(&state, &cursor_cache);
         pollAppConfigFileChanges(&state);
         if (state.app_config_runtime_sync_pending) {
             state.app_config_runtime_sync_pending = false;
@@ -650,21 +677,32 @@ fn mainInner(init: std.process.Init) !void {
     }
 }
 
-// Resolves the OS mouse cursor each frame: terminal-reported shapes win,
-// then clickable composer controls (pills, popover rows/segments) and
-// sidebar controls show a pointer hand, otherwise the default arrow.
-fn syncMouseCursor(state: *const AppState, pointer_cursor: *sdl.Cursor) void {
+// Resolves the OS mouse cursor each frame: terminal and browser-reported
+// shapes win, then interactive Palette controls, otherwise the default arrow.
+fn syncMouseCursor(state: *const AppState, cache: *SystemCursorCache) void {
+    // WKWebView and windowed WebView2 apply CSS cursors themselves. Calling
+    // SDL_SetCursor while their child view is hit would overwrite that choice.
+    if (!modalHitAtMouse(state) and state.nativeBrowserOwnsCursor()) {
+        cache.native_browser_owned = true;
+        return;
+    }
     // The settings modal covers the workspace behind a scrim, so shapes from
     // occluded terminal panes must not win while it is open.
     if (!state.show_settings_modal) {
         if (terminal_panel_ui.mouseShapeAtPoint(state, state.palette_mouse_x, state.palette_mouse_y)) |shape| {
-            sdl.setCursor(if (shape == .pointer) pointer_cursor else sdl.getDefaultCursor()) catch {};
+            applySystemCursor(cache, if (shape == .pointer) .pointer else .default);
             return;
         }
     }
     if (state.pointerCursorWanted()) {
-        sdl.setCursor(pointer_cursor) catch {};
+        applySystemCursor(cache, .pointer);
         return;
+    }
+    if (!modalHitAtMouse(state)) {
+        if (state.browserCursorShapeAtPoint(state.palette_mouse_x, state.palette_mouse_y)) |shape| {
+            applyBrowserCursor(cache, shape);
+            return;
+        }
     }
     // Modal scrims (settings, command palette, importers) intercept clicks
     // before the sidebar and workspace headers in event routing, so any modal
@@ -675,10 +713,63 @@ fn syncMouseCursor(state: *const AppState, pointer_cursor: *sdl.Cursor) void {
             chat_panel_ui.approvalActionWantsPointerAt(state.palette_mouse_x, state.palette_mouse_y) or
             chat_panel_ui.transcriptActionWantsPointerAt(state.palette_mouse_x, state.palette_mouse_y)))
     {
-        sdl.setCursor(pointer_cursor) catch {};
+        applySystemCursor(cache, .pointer);
         return;
     }
-    sdl.setCursor(sdl.getDefaultCursor()) catch {};
+    applySystemCursor(cache, .default);
+}
+
+fn applyBrowserCursor(cache: *SystemCursorCache, shape: browser_runtime.CursorShape) void {
+    if (shape == .hidden) {
+        if (sdl.cursorVisible()) sdl.hideCursor() catch {};
+        return;
+    }
+    applySystemCursor(cache, systemCursorForBrowserShape(shape));
+}
+
+fn applySystemCursor(cache: *SystemCursorCache, kind: sdl.SystemCursor) void {
+    if (!sdl.cursorVisible()) sdl.showCursor() catch {};
+    const cursor = cache.get(kind);
+    const browser_released_cursor = cache.native_browser_owned;
+    cache.native_browser_owned = false;
+    if (browser_released_cursor or sdl.getCursor() != cursor) sdl.setCursor(cursor) catch {};
+}
+
+// SDL 3.2 provides the core browser cursor set. Preserve richer browser semantics
+// in app state and use the closest available system shape for the rest.
+fn systemCursorForBrowserShape(shape: browser_runtime.CursorShape) sdl.SystemCursor {
+    return switch (shape) {
+        .default, .context_menu, .help, .custom => .default,
+        .pointer, .alias, .copy, .grab, .grabbing => .pointer,
+        .text, .vertical_text => .text,
+        .crosshair, .cell, .zoom_in, .zoom_out => .crosshair,
+        .wait => .wait,
+        .progress => .progress,
+        .move, .all_scroll => .move,
+        .no_drop, .not_allowed => .not_allowed,
+        .col_resize, .ew_resize => .ew_resize,
+        .row_resize, .ns_resize => .ns_resize,
+        .nwse_resize => .nwse_resize,
+        .nesw_resize => .nesw_resize,
+        .n_resize => .n_resize,
+        .ne_resize => .ne_resize,
+        .e_resize => .e_resize,
+        .se_resize => .se_resize,
+        .s_resize => .s_resize,
+        .sw_resize => .sw_resize,
+        .w_resize => .w_resize,
+        .nw_resize => .nw_resize,
+        .hidden => .default,
+    };
+}
+
+test "browser cursor shapes map to cached SDL system cursor families" {
+    try std.testing.expectEqual(sdl.SystemCursor.pointer, systemCursorForBrowserShape(.pointer));
+    try std.testing.expectEqual(sdl.SystemCursor.text, systemCursorForBrowserShape(.vertical_text));
+    try std.testing.expectEqual(sdl.SystemCursor.pointer, systemCursorForBrowserShape(.grabbing));
+    try std.testing.expectEqual(sdl.SystemCursor.ne_resize, systemCursorForBrowserShape(.ne_resize));
+    try std.testing.expectEqual(sdl.SystemCursor.not_allowed, systemCursorForBrowserShape(.no_drop));
+    try std.testing.expectEqual(sdl.SystemCursor.default, systemCursorForBrowserShape(.custom));
 }
 
 // True when any retained modal hit rect (scrim or control) covers the current
@@ -1725,7 +1816,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
 }
 
 fn browserInputDebugEnabled() bool {
-    return std.c.getenv("VERDE_CEF_INPUT_DEBUG") != null;
+    return std.c.getenv("VERDE_BROWSER_INPUT_DEBUG") != null;
 }
 
 fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {

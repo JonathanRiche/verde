@@ -112,12 +112,6 @@ pub const Backend = struct {
         return self.platform.supportsInspector();
     }
 
-    /// Reports that the native webview backend does not use the CEF SDK.
-    pub fn sdkConfigured(self: *const Backend) bool {
-        _ = self;
-        return false;
-    }
-
     /// Returns the active pane session identifier if the browser has been shown.
     pub fn paneSessionId(self: *const Backend) ?browser_types.SessionId {
         if (!self.visible) return null;
@@ -233,6 +227,13 @@ pub const Backend = struct {
     pub fn hasNativeFocus(self: *const Backend) bool {
         if (builtin.os.tag != .macos and builtin.os.tag != .windows) return false;
         return self.platform.hasFocus();
+    }
+
+    /// Lets a native child webview retain its CSS-selected OS cursor.
+    pub fn ownsNativeCursor(self: *const Backend) bool {
+        if (builtin.os.tag != .macos and builtin.os.tag != .windows) return false;
+        if (!self.visible) return false;
+        return self.platform.ownsCursor();
     }
 
     pub fn macosAppKitDiagnostics(self: *const Backend, allocator: std.mem.Allocator) ?[]u8 {

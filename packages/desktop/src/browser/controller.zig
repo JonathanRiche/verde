@@ -3,7 +3,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const browser_input = @import("input.zig");
-const browser_cef = @import("cef/backend.zig");
 const browser_native_webview = @import("native_webview_backend.zig");
 const browser_stub = @import("platform/stub_backend.zig");
 const browser_texture = @import("texture.zig");
@@ -12,14 +11,12 @@ const build_options = @import("build_options");
 
 const Backend = union(enum) {
     native_webview: browser_native_webview.Backend,
-    cef: browser_cef.Backend,
     stub: browser_stub.Controller,
 
     /// Releases whichever backend is currently active.
     fn deinit(self: *Backend) void {
         switch (self.*) {
             .native_webview => |*backend| backend.deinit(),
-            .cef => |*backend| backend.deinit(),
             .stub => |*backend| backend.deinit(),
         }
     }
@@ -62,7 +59,6 @@ pub const Controller = struct {
         try self.applyPaneBounds(backend);
         switch (backend.*) {
             .native_webview => |*active| try active.show(),
-            .cef => |*active| try active.show(),
             .stub => |*active| try active.show(),
         }
         self.visible = true;
@@ -73,7 +69,6 @@ pub const Controller = struct {
         if (self.backend) |*backend| {
             switch (backend.*) {
                 .native_webview => |*active| try active.hide(),
-                .cef => |*active| try active.hide(),
                 .stub => |*active| try active.hide(),
             }
         }
@@ -104,7 +99,6 @@ pub const Controller = struct {
         try self.applyPaneBounds(backend);
         switch (backend.*) {
             .native_webview => |*active| try active.navigate(url),
-            .cef => |*active| try active.navigate(url),
             .stub => |*active| try active.navigate(url),
         }
     }
@@ -114,7 +108,6 @@ pub const Controller = struct {
         const backend = try self.ensureBackend();
         switch (backend.*) {
             .native_webview => |*active| try active.eval(js),
-            .cef => |*active| try active.eval(js),
             .stub => |*active| try active.eval(js),
         }
     }
@@ -124,7 +117,6 @@ pub const Controller = struct {
         const backend = try self.ensureBackend();
         switch (backend.*) {
             .native_webview => |*active| try active.postJson(json),
-            .cef => |*active| try active.postJson(json),
             .stub => |*active| try active.postJson(json),
         }
     }
@@ -134,7 +126,6 @@ pub const Controller = struct {
         const backend = try self.ensureBackend();
         switch (backend.*) {
             .native_webview => |*active| try active.goBack(),
-            .cef => |*active| try active.goBack(),
             .stub => |*active| try active.goBack(),
         }
     }
@@ -144,7 +135,6 @@ pub const Controller = struct {
         const backend = try self.ensureBackend();
         switch (backend.*) {
             .native_webview => |*active| try active.goForward(),
-            .cef => |*active| try active.goForward(),
             .stub => |*active| try active.goForward(),
         }
     }
@@ -154,7 +144,6 @@ pub const Controller = struct {
         const backend = try self.ensureBackend();
         switch (backend.*) {
             .native_webview => |*active| try active.reload(),
-            .cef => |*active| try active.reload(),
             .stub => |*active| try active.reload(),
         }
     }
@@ -164,7 +153,6 @@ pub const Controller = struct {
         const backend = try self.ensureBackend();
         switch (backend.*) {
             .native_webview => |*active| try active.focus(),
-            .cef => |*active| try active.focus(),
             .stub => |*active| try active.focus(),
         }
     }
@@ -174,7 +162,6 @@ pub const Controller = struct {
         if (self.backend) |*backend| {
             switch (backend.*) {
                 .native_webview => |*active| try active.blur(),
-                .cef => |*active| try active.blur(),
                 .stub => |*active| try active.blur(),
             }
         }
@@ -185,7 +172,7 @@ pub const Controller = struct {
         const backend = if (self.backend) |*backend| backend else return false;
         return switch (backend.*) {
             .native_webview => |*active| active.hasNativeFocus(),
-            .cef, .stub => false,
+            .stub => false,
         };
     }
 
@@ -193,7 +180,7 @@ pub const Controller = struct {
         const backend = if (self.backend) |*backend| backend else return null;
         return switch (backend.*) {
             .native_webview => |*active| active.macosAppKitDiagnostics(allocator),
-            .cef, .stub => null,
+            .stub => null,
         };
     }
 
@@ -223,7 +210,6 @@ pub const Controller = struct {
     fn applyPaneBounds(self: *Controller, backend: *Backend) !void {
         switch (backend.*) {
             .native_webview => |*active| try active.setPaneBounds(self.pane_bounds),
-            .cef => |*active| try active.setPaneBounds(self.pane_bounds),
             .stub => |*active| try active.setPaneBounds(self.pane_bounds),
         }
     }
@@ -231,7 +217,6 @@ pub const Controller = struct {
     fn applyHostWindow(self: *Controller, backend: *Backend) !void {
         switch (backend.*) {
             .native_webview => |*active| try active.setHostWindow(self.host_window),
-            .cef => |*active| try active.setHostWindow(self.host_window),
             .stub => |*active| try active.setHostWindow(self.host_window),
         }
     }
@@ -241,7 +226,6 @@ pub const Controller = struct {
         const backend = try self.ensureBackend();
         return switch (backend.*) {
             .native_webview => |*active| try active.handleMouse(event),
-            .cef => |*active| try active.handleMouse(event),
             .stub => |*active| try active.handleMouse(event),
         };
     }
@@ -251,7 +235,6 @@ pub const Controller = struct {
         const backend = try self.ensureBackend();
         return switch (backend.*) {
             .native_webview => |*active| try active.handleKey(event),
-            .cef => |*active| try active.handleKey(event),
             .stub => |*active| try active.handleKey(event),
         };
     }
@@ -261,7 +244,7 @@ pub const Controller = struct {
         const backend = try self.ensureBackend();
         switch (backend.*) {
             .native_webview => |*active| try active.activateContextMenuItem(index),
-            .cef, .stub => {},
+            .stub => {},
         }
     }
 
@@ -270,7 +253,7 @@ pub const Controller = struct {
         if (self.backend) |*backend| {
             switch (backend.*) {
                 .native_webview => |*active| try active.dismissContextMenu(),
-                .cef, .stub => {},
+                .stub => {},
             }
         }
     }
@@ -282,7 +265,6 @@ pub const Controller = struct {
         };
         return switch (backend.*) {
             .native_webview => |*active| active.runtimeKind(),
-            .cef => |*active| active.runtimeKind(),
             .stub => .stub,
         };
     }
@@ -292,7 +274,6 @@ pub const Controller = struct {
         const backend = if (self.backend) |*backend| backend else return false;
         return switch (backend.*) {
             .native_webview => |*active| active.isRuntimeInitialized(),
-            .cef => |*active| active.isRuntimeInitialized(),
             .stub => true,
         };
     }
@@ -307,7 +288,6 @@ pub const Controller = struct {
         const backend = if (self.backend) |*backend| backend else return .keep_warm;
         return switch (backend.*) {
             .native_webview => |*active| active.runtimeMode(),
-            .cef => |*active| active.runtimeMode(),
             .stub => .keep_warm,
         };
     }
@@ -317,8 +297,16 @@ pub const Controller = struct {
         const backend = if (self.backend) |*backend| backend else return configuredPresentationKind();
         return switch (backend.*) {
             .native_webview => |*active| active.presentationKind(),
-            .cef => |*active| active.presentationKind(),
             .stub => .stub,
+        };
+    }
+
+    /// Reports whether the pointer is currently over a native child webview.
+    pub fn nativeSurfaceOwnsCursor(self: *const Controller) bool {
+        const backend = if (self.backend) |*backend| backend else return false;
+        return switch (backend.*) {
+            .native_webview => |*active| active.ownsNativeCursor(),
+            .stub => false,
         };
     }
 
@@ -327,13 +315,11 @@ pub const Controller = struct {
         const backend = if (self.backend) |*backend| backend else {
             return switch (configuredBackendKind()) {
                 .native_webview => browser_native_webview.configuredSupportsPopout(),
-                .cef => false,
                 .stub => false,
             };
         };
         return switch (backend.*) {
             .native_webview => |*active| active.supportsPopout(),
-            .cef => |*active| active.supportsPopout(),
             .stub => false,
         };
     }
@@ -343,23 +329,11 @@ pub const Controller = struct {
         const backend = if (self.backend) |*backend| backend else {
             return switch (configuredBackendKind()) {
                 .native_webview => browser_native_webview.configuredSupportsInspector(),
-                .cef => build_options.cef_sdk_configured,
                 .stub => false,
             };
         };
         return switch (backend.*) {
             .native_webview => |*active| active.supportsInspector(),
-            .cef => |*active| active.supportsInspector(),
-            .stub => false,
-        };
-    }
-
-    /// Reports whether the build has been configured with a real CEF SDK path.
-    pub fn sdkConfigured(self: *const Controller) bool {
-        const backend = if (self.backend) |*backend| backend else return build_options.cef_sdk_configured;
-        return switch (backend.*) {
-            .native_webview => |*active| active.sdkConfigured(),
-            .cef => |*active| active.sdkConfigured(),
             .stub => false,
         };
     }
@@ -369,7 +343,6 @@ pub const Controller = struct {
         const backend = if (self.backend) |*backend| backend else return null;
         return switch (backend.*) {
             .native_webview => |*active| active.paneSessionId(),
-            .cef => |*active| active.paneSessionId(),
             .stub => null,
         };
     }
@@ -379,7 +352,6 @@ pub const Controller = struct {
         const backend = if (self.backend) |*backend| backend else return null;
         return switch (backend.*) {
             .native_webview => |*active| active.paneTexture(),
-            .cef => |*active| active.paneTexture(),
             .stub => null,
         };
     }
@@ -390,7 +362,6 @@ pub const Controller = struct {
         const backend = if (self.backend) |*backend| backend else return null;
         return switch (backend.*) {
             .native_webview => |*active| active.copyFramePixels(allocator),
-            .cef => |*active| active.copyFramePixels(allocator),
             .stub => null,
         };
     }
@@ -400,7 +371,6 @@ pub const Controller = struct {
         const backend = if (self.backend) |*backend| backend else return null;
         const event = switch (backend.*) {
             .native_webview => |*active| active.popEvent(),
-            .cef => |*active| active.popEvent(),
             .stub => |*active| active.popEvent(),
         } orelse return null;
         switch (event) {
@@ -416,7 +386,7 @@ pub const Controller = struct {
         const backend = if (self.backend) |*backend| backend else return false;
         switch (backend.*) {
             .native_webview => |*active| return active.uploadFrame(),
-            .cef, .stub => return false,
+            .stub => return false,
         }
     }
 
@@ -430,7 +400,6 @@ pub const Controller = struct {
         if (self.backend == null) {
             self.backend = switch (configuredBackendKind()) {
                 .native_webview => .{ .native_webview = try browser_native_webview.Backend.init(self.allocator) },
-                .cef => .{ .cef = try browser_cef.Backend.init(self.allocator) },
                 .stub => .{ .stub = try browser_stub.Controller.init(self.allocator) },
             };
             try self.applyHostWindow(&self.backend.?);
@@ -442,7 +411,6 @@ pub const Controller = struct {
 fn configuredBackendKind() browser_types.BackendKind {
     return switch (build_options.browser_backend) {
         .native_webview => .native_webview,
-        .cef => .cef,
         .stub => .stub,
     };
 }
@@ -450,7 +418,6 @@ fn configuredBackendKind() browser_types.BackendKind {
 fn configuredRuntimeKind() browser_types.RuntimeKind {
     return switch (configuredBackendKind()) {
         .native_webview => .native_webview,
-        .cef => .cef,
         .stub => .stub,
     };
 }
@@ -458,7 +425,6 @@ fn configuredRuntimeKind() browser_types.RuntimeKind {
 fn configuredPresentationKind() browser_types.PresentationKind {
     return switch (configuredBackendKind()) {
         .native_webview => browser_native_webview.configuredPresentationKind(),
-        .cef => .offscreen_texture,
         .stub => .stub,
     };
 }

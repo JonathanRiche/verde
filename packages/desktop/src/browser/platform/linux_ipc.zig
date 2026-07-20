@@ -59,6 +59,7 @@ pub const EventKind = enum {
     eval_result,
     context_menu,
     context_menu_dismissed,
+    cursor_changed,
     frame_ready,
     failed,
 };

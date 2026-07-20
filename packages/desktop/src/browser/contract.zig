@@ -32,7 +32,6 @@ pub const BrowserBackend = struct {
         const presentation_kind_fn: fn (*const T) browser_types.PresentationKind = T.presentationKind;
         const supports_inspector_fn: fn (*const T) bool = T.supportsInspector;
         const supports_popout_fn: fn (*const T) bool = T.supportsPopout;
-        const sdk_configured_fn: fn (*const T) bool = T.sdkConfigured;
         const pane_session_fn: fn (*const T) ?browser_types.SessionId = T.paneSessionId;
         const pane_texture_fn: fn (*const T) ?browser_texture.PaneTexture = T.paneTexture;
         const copy_frame_fn: fn (*T, std.mem.Allocator) anyerror!?browser_texture.CopiedFrame = T.copyFramePixels;
@@ -62,7 +61,6 @@ pub const BrowserBackend = struct {
         _ = presentation_kind_fn;
         _ = supports_inspector_fn;
         _ = supports_popout_fn;
-        _ = sdk_configured_fn;
         _ = pane_session_fn;
         _ = pane_texture_fn;
         _ = copy_frame_fn;
@@ -77,7 +75,6 @@ test "browser backends satisfy app-facing contract" {
         BrowserBackend.assertImplementation(@import("platform/linux_wpe.zig").Controller);
         BrowserBackend.assertImplementation(@import("platform/macos_wkwebview.zig").Controller);
         BrowserBackend.assertImplementation(@import("platform/windows_webview2.zig").Controller);
-        BrowserBackend.assertImplementation(@import("cef/backend.zig").Backend);
         BrowserBackend.assertImplementation(@import("platform/stub_backend.zig").Controller);
     }
 }

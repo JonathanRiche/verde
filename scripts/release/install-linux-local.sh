@@ -27,30 +27,6 @@ copy_glob_if_present() {
   fi
 }
 
-assert_no_cef_payload() {
-  local prefix="$1"
-  local cef_payload=(
-    "verde-browser-cef"
-    "verde-browser-cef-process"
-    "libcef.so"
-    "chrome-sandbox"
-    "chrome_100_percent.pak"
-    "chrome_200_percent.pak"
-    "resources.pak"
-    "icudtl.dat"
-    "v8_context_snapshot.bin"
-    "vk_swiftshader_icd.json"
-    "locales"
-  )
-
-  for name in "${cef_payload[@]}"; do
-    if [[ -e "$prefix/bin/$name" ]]; then
-      echo "native webview install unexpectedly contains CEF payload: bin/$name" >&2
-      exit 1
-    fi
-  done
-}
-
 wpe_runtime_hint() {
   cat >&2 <<'EOF'
 Verde's Linux browser pane uses WPE WebKit.
@@ -138,7 +114,6 @@ rm -rf "$PREFIX/share/verde/node_modules"
 if [[ -e "$SCRIPT_DIR/share/verde/provider_bridge.mjs" ]]; then
   install -m 644 "$SCRIPT_DIR/share/verde/provider_bridge.mjs" "$PREFIX/share/verde/provider_bridge.mjs"
 fi
-assert_no_cef_payload "$PREFIX"
 warn_missing_wpe_runtime "$PREFIX/bin/verde-browser-linux"
 
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then

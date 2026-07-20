@@ -34,6 +34,7 @@ extern fn verde_macos_webview_reload(handle: ?*anyopaque) c_int;
 extern fn verde_macos_webview_focus(handle: ?*anyopaque) c_int;
 extern fn verde_macos_webview_blur(handle: ?*anyopaque) c_int;
 extern fn verde_macos_webview_has_focus(handle: ?*anyopaque) c_int;
+extern fn verde_macos_webview_owns_cursor(handle: ?*anyopaque) c_int;
 extern fn verde_macos_webview_appkit_diagnostics(handle: ?*anyopaque) ?[*:0]u8;
 extern fn verde_macos_webview_pop_event(handle: ?*anyopaque, kind: *c_int, payload: *?[*:0]u8) c_int;
 extern fn verde_macos_webview_free_string(value: ?[*:0]u8) void;
@@ -84,11 +85,6 @@ pub const Controller = struct {
     }
 
     pub fn supportsPopout(self: *const Controller) bool {
-        _ = self;
-        return false;
-    }
-
-    pub fn sdkConfigured(self: *const Controller) bool {
         _ = self;
         return false;
     }
@@ -195,6 +191,12 @@ pub const Controller = struct {
     pub fn hasFocus(self: *const Controller) bool {
         const handle = self.handle orelse return false;
         return verde_macos_webview_has_focus(handle) != 0;
+    }
+
+    /// Reports whether AppKit currently hit-tests the pointer into WKWebView.
+    pub fn ownsCursor(self: *const Controller) bool {
+        const handle = self.handle orelse return false;
+        return verde_macos_webview_owns_cursor(handle) != 0;
     }
 
     pub fn appKitDiagnostics(self: *const Controller, allocator: std.mem.Allocator) ?[]u8 {

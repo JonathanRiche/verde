@@ -390,11 +390,6 @@ pub const Controller = struct {
         return false;
     }
 
-    pub fn sdkConfigured(self: *const Controller) bool {
-        _ = self;
-        return false;
-    }
-
     pub fn paneSessionId(self: *const Controller) ?browser_types.SessionId {
         if (self.child_pid == null and !(waylandSubsurfaceEnabled() and self.wayland_subsurface.handle != null)) return null;
         return 1;
@@ -946,9 +941,21 @@ fn convertHelperEvent(allocator: std.mem.Allocator, event: ipc.Event) !browser_t
         .eval_result => .{ .eval_result = try allocator.dupe(u8, event.payload orelse "null") },
         .context_menu => .{ .context_menu = try allocator.dupe(u8, event.payload orelse "{}") },
         .context_menu_dismissed => .context_menu_dismissed,
+        .cursor_changed => .{ .cursor_changed = browser_types.CursorShape.parse(event.payload orelse "default") },
         .failed => .{ .failed = try allocator.dupe(u8, event.payload orelse "Linux browser helper failed.") },
         .frame_ready => unreachable,
     };
+}
+
+test "WPE helper cursor events preserve normalized browser shapes" {
+    const event = try convertHelperEvent(std.testing.allocator, .{
+        .kind = .cursor_changed,
+        .payload = "grabbing",
+    });
+    switch (event) {
+        .cursor_changed => |shape| try std.testing.expectEqual(browser_types.CursorShape.grabbing, shape),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 fn execHelperChild(

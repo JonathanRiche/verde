@@ -8,7 +8,7 @@ Read this document and continue the WPE Linux webview path. Focus only on the en
 VERDE_BROWSER_LINUX_WPE=1
 ```
 
-Do not spend time on GTK/WebKitGTK, CEF, Windows, macOS, or the `VERDE_BROWSER_LINUX_SUBSURFACE=1` probe unless needed for comparison. Keep default Linux fallback behavior unchanged.
+Do not spend time on GTK/WebKitGTK, Windows, macOS, or the `VERDE_BROWSER_LINUX_SUBSURFACE=1` probe unless needed for comparison. Keep default Linux fallback behavior unchanged.
 
 Current state: WPE renders in the Verde pane and now receives an explicit device scale on HiDPI Wayland outputs. On the local Hyprland eDP monitor at scale `1.67`, `https://lytx.io/` reported `devicePixelRatio=1.6666666269302368` and a logical viewport of `670x787`, with a visible in-pane render captured at `/tmp/verde-wpe-hidpi-scale.png`. The remaining WPE work is performance/usability hardening: remove the CPU readback path if possible, keep checking input/scroll feel, and solve dark color-scheme matching without regressing page rendering.
 
@@ -168,7 +168,7 @@ Snapshot request throttling remains conservative:
 - Size-change requests still coalesce through the existing `snapshot_pending` / `snapshot_requested_while_pending` path.
 - Scaling still only runs when WebKit returns a different size than the requested pane size.
 
-The default snapshot transfer path now uses three memfd-backed shared frame slots modeled after the CEF helper path. The desktop process creates anonymous `memfd_create` fds named `verde-browser-linux-frame-*`, sizes them to `4096 * 2160 * 4`, maps them shared, passes fixed fd numbers to the WebKitGTK helper through `VERDE_BROWSER_LINUX_FRAME0_FD` through `VERDE_BROWSER_LINUX_FRAME2_FD`, and copies each announced slot into a staging buffer before uploading. This removes per-frame temp-file create/read/delete from the normal Wayland snapshot path.
+The default snapshot transfer path now uses three memfd-backed shared frame slots. The desktop process creates anonymous `memfd_create` fds named `verde-browser-linux-frame-*`, sizes them to `4096 * 2160 * 4`, maps them shared, passes fixed fd numbers to the WebKitGTK helper through `VERDE_BROWSER_LINUX_FRAME0_FD` through `VERDE_BROWSER_LINUX_FRAME2_FD`, and copies each announced slot into a staging buffer before uploading. This removes per-frame temp-file create/read/delete from the normal Wayland snapshot path.
 
 The old file transfer path remains as a fallback if shared slot creation or helper-side `mmap` is unavailable. Helper frame diagnostics include `shared_slot=<n>` for shared frames and `shared_slot=-1` for fallback file frames when `VERDE_BROWSER_FRAME_LOG=1` is set.
 
