@@ -20511,8 +20511,14 @@ pub const AppState = struct {
             return;
         }
         if (send_state.daemon_owned) {
-            runtime_log.diagnostic("shutdown leaving daemon-owned send running provider={s} thread_title_len={d}", .{ @tagName(thread.provider), thread.title.len });
+            const stop_requested = send_state.stop_requested;
+            if (stop_requested) {
+                runtime_log.diagnostic("shutdown forwarding daemon-owned send stop provider={s} thread_title_len={d}", .{ @tagName(thread.provider), thread.title.len });
+            } else {
+                runtime_log.diagnostic("shutdown leaving daemon-owned send running provider={s} thread_title_len={d}", .{ @tagName(thread.provider), thread.title.len });
+            }
             send_state.mutex.unlock();
+            if (stop_requested) self.issuePendingThreadStop(null, project_path, thread);
             return;
         }
         send_state.stop_requested = true;
