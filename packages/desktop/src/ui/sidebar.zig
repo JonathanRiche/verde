@@ -102,6 +102,7 @@ const SidebarContextMenuAction = enum {
     thread_rename,
     thread_regenerate_title,
     thread_sync,
+    thread_handoff,
     thread_archive,
 };
 
@@ -565,6 +566,20 @@ fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) boo
                 .thread_rename => state.beginThreadRename(pi, ti),
                 .thread_regenerate_title => state.regenerateThreadTitleAtIndex(pi, ti),
                 .thread_sync => state.syncThreadFromProvider(pi, ti),
+                .thread_handoff => {
+                    if (pi < state.projects.items.len) {
+                        for (state.projects.items[pi].workspace_layout.panes.items) |pane| {
+                            if (pane.minimized) continue;
+                            switch (pane.ref) {
+                                .chat => |ref| if (ref.thread_index == ti) {
+                                    state.beginThreadHandoff(pi, ti, pane.id);
+                                    break;
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                },
                 .thread_archive => state.archiveThreadAtIndex(pi, ti),
             }
             return true;
@@ -665,6 +680,7 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
             appendSidebarContextMenuRow(.thread_rename, true, "Rename chat");
             appendSidebarContextMenuRow(.thread_regenerate_title, can_regenerate_title, "Regenerate title");
             appendSidebarContextMenuRow(.thread_sync, can_sync, "Sync thread");
+            appendSidebarContextMenuRow(.thread_handoff, can_archive, "Handoff to another agent");
             if (in_tui) {
                 appendSidebarContextMenuRow(.thread_open_chat, true, "Open as chat");
             } else {

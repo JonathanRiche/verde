@@ -4,6 +4,7 @@ const std = @import("std");
 const provider_types = @import("provider_types.zig");
 
 pub const LocalSlashCommandId = enum(u8) {
+    handoff,
     stack,
     process,
 };
@@ -16,6 +17,12 @@ pub const LocalSlashCommand = struct {
 };
 
 pub const LOCAL_COMMANDS = [_]LocalSlashCommand{
+    .{
+        .id = .handoff,
+        .name = "/handoff",
+        .summary = "Hand this chat off to another GUI chat or agent TUI.",
+        .usage = "/handoff",
+    },
     .{
         .id = .stack,
         .name = "/stack",
@@ -143,6 +150,11 @@ test "parse recognizes local slash commands" {
     try std.testing.expect(parsed == .local);
     try std.testing.expectEqual(LocalSlashCommandId.stack, parsed.local.command.id);
     try std.testing.expectEqualStrings("status", parsed.local.args);
+
+    const handoff = parse("/handoff", TEST_PROVIDER_COMMANDS[0..]);
+    try std.testing.expect(handoff == .local);
+    try std.testing.expectEqual(LocalSlashCommandId.handoff, handoff.local.command.id);
+    try std.testing.expectEqualStrings("", handoff.local.args);
 }
 
 test "parse recognizes literal slash escape" {

@@ -81,6 +81,7 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "thread.rename_current", .title = "Rename Current Chat", .keywords = "thread title label", .section = .threads, .run = runRenameCurrentChat, .enabled = currentThreadCommitted },
     .{ .id = "thread.regenerate_title", .title = "Regenerate Chat Title", .keywords = "thread rename luna automatic", .section = .threads, .run = runRegenerateChatTitle, .enabled = canRegenerateChatTitle },
     .{ .id = "thread.sync_current", .title = "Sync Current Thread", .keywords = "refresh provider", .section = .threads, .run = runSyncCurrentThread, .enabled = canSyncCurrentThread },
+    .{ .id = "thread.handoff_current", .title = "Handoff Current Chat or TUI", .keywords = "transfer provider model agent continue context", .section = .threads, .run = runHandoffCurrent, .enabled = canHandoffFocusedPane },
     .{ .id = "thread.open_current_codex_tui", .title = "Open Codex TUI for Current Thread", .keywords = "open codex tui current thread terminal resume active focused", .section = .threads, .run = runOpenCurrentThreadInTui, .enabled = canOpenFocusedCodexThreadInTui },
     .{ .id = "thread.open_current_tui", .title = "Open Current Thread in TUI", .keywords = "open agent tui current thread opencode claude cursor terminal resume active focused", .section = .threads, .run = runOpenCurrentThreadInTui, .enabled = canOpenFocusedNonCodexThreadInTui },
     .{ .id = "thread.archive_current", .title = "Archive Current Thread", .keywords = "delete remove chat", .section = .threads, .run = runArchiveCurrentThread, .enabled = currentThreadNotPending },
@@ -156,8 +157,8 @@ var last_query_len: usize = 0;
 var last_scope: ?usize = null;
 
 /// Action submenu geometry (Tab on a thread row).
-const MAX_ACTIONS: usize = 5;
-const ThreadAction = enum { open, open_split, open_tui, sync, archive };
+const MAX_ACTIONS: usize = 6;
+const ThreadAction = enum { open, open_split, open_tui, sync, handoff, archive };
 var action_rects: [MAX_ACTIONS]palette.Rect = undefined;
 var action_kinds: [MAX_ACTIONS]ThreadAction = undefined;
 var action_labels: [MAX_ACTIONS][]const u8 = undefined;
@@ -411,6 +412,11 @@ pub fn runActionRow(state: *runtime.AppState, action_index: usize) void {
         .sync => {
             state.closeCommandPalette();
             state.syncThreadFromProvider(tr.project, tr.thread);
+        },
+        .handoff => {
+            state.closeCommandPalette();
+            openThread(state, tr, false);
+            state.beginHandoffFromFocusedPane();
         },
         .archive => {
             state.archiveThreadAtIndex(tr.project, tr.thread);
@@ -866,6 +872,7 @@ fn computeActionMenuLayout(state: *runtime.AppState) void {
     appendAction(.open_split, "Open in New Pane", true);
     appendAction(.open_tui, if (in_tui) "Open as Chat" else "Open in TUI", in_tui or can_sync);
     appendAction(.sync, "Sync Thread", can_sync);
+    appendAction(.handoff, "Handoff to Another Agent", !pending);
     appendAction(.archive, "Archive Thread", !pending);
 
     const row_h = theme.scaledUi(32.0);
@@ -1024,6 +1031,23 @@ fn canOpenFocusedNonCodexThreadInTui(state: *runtime.AppState) bool {
     return provider != .codex and canOpenFocusedThreadInTui(state);
 }
 
+fn canHandoffFocusedPane(state: *runtime.AppState) bool {
+    if (state.selected_project_index >= state.projects.items.len) return false;
+    const project = &state.projects.items[state.selected_project_index];
+    const pane_id = project.workspace_layout.focused_pane_id orelse return false;
+    return switch (state.workspacePaneKindById(pane_id) orelse return false) {
+        .chat => blk: {
+            const thread_index = state.workspaceChatThreadIndexByPane(pane_id) orelse break :blk false;
+            break :blk thread_index < project.threads.items.len and !project.threads.items[thread_index].isSendPendingForUi();
+        },
+        .terminal => blk: {
+            const dock_id = state.workspaceTerminalDockIdByPane(pane_id) orelse break :blk false;
+            break :blk state.projectTerminalSurface(state.selected_project_index, dock_id) != null;
+        },
+        .browser => false,
+    };
+}
+
 fn disabledNoticeForCommand(state: *runtime.AppState, id: []const u8) []const u8 {
     if (std.mem.eql(u8, id, "thread.open_current_codex_tui") or std.mem.eql(u8, id, "thread.open_current_tui")) {
         const thread_index = focusedGuiThreadIndex(state) orelse return "Focus a GUI chat pane before opening a thread in TUI.";
@@ -1060,6 +1084,10 @@ fn runNewChat(state: *runtime.AppState) void {
 fn runSyncCurrentThread(state: *runtime.AppState) void {
     const thread_index = focusedGuiThreadIndex(state) orelse return;
     state.syncThreadFromProvider(state.selected_project_index, thread_index);
+}
+
+fn runHandoffCurrent(state: *runtime.AppState) void {
+    state.beginHandoffFromFocusedPane();
 }
 
 fn runOpenCurrentThreadInTui(state: *runtime.AppState) void {
