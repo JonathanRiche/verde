@@ -687,6 +687,12 @@ fn mainInner(init: std.process.Init) !void {
 // Resolves the OS mouse cursor each frame: terminal and browser-reported
 // shapes win, then interactive Palette controls, otherwise the default arrow.
 fn syncMouseCursor(state: *const AppState, cache: *SystemCursorCache) void {
+    // Workspace pane chrome overlays chat, terminal, and native browser
+    // content, so its pointer affordance must win before content cursors.
+    if (!modalHitAtMouse(state) and workspace_panes_ui.wantsPointerAt(state.palette_mouse_x, state.palette_mouse_y)) {
+        applySystemCursor(cache, .pointer);
+        return;
+    }
     // WKWebView and windowed WebView2 apply CSS cursors themselves. Calling
     // SDL_SetCursor while their child view is hit would overwrite that choice.
     if (!modalHitAtMouse(state) and state.nativeBrowserOwnsCursor()) {
@@ -1650,6 +1656,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             // The approval card overlays the gap between transcript and
             // composer, so it must receive clicks before pane/browser routing.
             if (event.button.button == 1 and chat_panel_ui.handleApprovalPaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            // Pane chrome overlays native browser and terminal content, so its
+            // precise hits must be handled before either content surface.
+            if (workspace_panes_ui.handlePaneChromeMouseButton(state, event.button.x, event.button.y, event.button.button, event.button.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }

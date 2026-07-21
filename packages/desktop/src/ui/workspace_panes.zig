@@ -19,9 +19,27 @@ const theme = @import("theme.zig");
 
 const FOCUS_ANIM_DURATION_MS: i64 = 160;
 const THREAD_DROP_PREVIEW_Z: i32 = 140;
+const PANE_ZOOM_CONTROL_Z: i32 = 150;
 const PANE_CONTEXT_MENU_Z: i32 = 180;
 const INACTIVE_PANE_FADE_ALPHA: u8 = 72;
 const PANE_DRAG_THRESHOLD_CSS: f32 = 8.0;
+const PANE_CHROME_CONTROL_SIZE_CSS: f32 = 30.0;
+const PANE_CHROME_CONTROL_GAP_CSS: f32 = 6.0;
+const PANE_CHROME_RIGHT_MARGIN_CSS: f32 = 10.0;
+const CHAT_PANE_HEADER_RIGHT_RESERVE_CSS: f32 = PANE_CHROME_CONTROL_SIZE_CSS * 2.0 +
+    PANE_CHROME_CONTROL_GAP_CSS + PANE_CHROME_RIGHT_MARGIN_CSS;
+const BROWSER_TOOLBAR_RIGHT_RESERVE_CSS: f32 = PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS;
+const ZOOM_ICON_SIZE_CSS: f32 = 17.0;
+const TERMINAL_ZOOM_HOVER_WIDTH_CSS: f32 = 112.0;
+const TERMINAL_ZOOM_HOVER_HEIGHT_CSS: f32 = 48.0;
+const FOCUS_BORDER_WIDTH_CSS: f32 = 2.0;
+const ZOOM_BORDER_WIDTH_CSS: f32 = 3.0;
+const ZOOM_ICON_FOREGROUND_MIX: f32 = 0.30;
+const ZOOM_BORDER_FOREGROUND_MIX: f32 = 0.60;
+
+// Font Awesome glyphs bundled in SymbolsNerdFontMono and rendered with Palette's icon role.
+const NF_FA_EXPAND = "\u{F065}";
+const NF_FA_COMPRESS = "\u{F066}";
 
 fn nowMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
@@ -662,17 +680,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
                 split_menu_open_for = null;
             },
             .restore => _ = state.restoreCurrentProjectWorkspacePane(hit.pane_id),
-            .toggle_split_menu => {
-                _ = state.focusCurrentProjectWorkspacePane(hit.pane_id);
-                split_menu_show_paste = false;
-                split_menu_kind = .split_button;
-                split_menu_anchor = hit.rect;
-                if (split_menu_open_for) |id| {
-                    split_menu_open_for = if (id == hit.pane_id) null else hit.pane_id;
-                } else {
-                    split_menu_open_for = hit.pane_id;
-                }
-            },
+            .toggle_split_menu => toggleSplitMenu(state, hit),
             .copy_selection => {
                 copyTranscriptSelectionToClipboard(state);
                 split_menu_open_for = null;
@@ -749,6 +757,55 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
         if (!rectContains(pane_rect.rect, x, y)) continue;
         _ = state.focusCurrentProjectWorkspacePane(pane_rect.pane_id);
         return false;
+    }
+    return false;
+}
+
+/// Handles pane chrome before browser and terminal content can consume its click.
+pub fn handlePaneChromeMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, down: bool) bool {
+    if (button != 1) return false;
+    var i: usize = hit_cache.count;
+    while (i > 0) {
+        i -= 1;
+        const hit = hit_cache.hits[i];
+        if (!rectContains(hit.rect, x, y)) continue;
+        switch (hit.action) {
+            .maximize => {
+                if (down) _ = state.toggleCurrentProjectWorkspacePaneMaximized(hit.pane_id);
+            },
+            .toggle_split_menu => {
+                if (down) toggleSplitMenu(state, hit);
+            },
+            else => continue,
+        }
+        return true;
+    }
+    return false;
+}
+
+fn toggleSplitMenu(state: *runtime.AppState, hit: WorkspacePaneHit) void {
+    _ = state.focusCurrentProjectWorkspacePane(hit.pane_id);
+    split_menu_show_paste = false;
+    split_menu_kind = .split_button;
+    split_menu_anchor = hit.rect;
+    if (split_menu_open_for) |id| {
+        split_menu_open_for = if (id == hit.pane_id) null else hit.pane_id;
+    } else {
+        split_menu_open_for = hit.pane_id;
+    }
+}
+
+/// True when the mouse rests on interactive workspace pane chrome.
+pub fn wantsPointerAt(x: f32, y: f32) bool {
+    var i: usize = hit_cache.count;
+    while (i > 0) {
+        i -= 1;
+        const hit = hit_cache.hits[i];
+        if (!rectContains(hit.rect, x, y)) continue;
+        return switch (hit.action) {
+            .focus, .resize_split => false,
+            else => true,
+        };
     }
     return false;
 }
@@ -999,15 +1056,14 @@ fn updateResizeDrag(state: *runtime.AppState, hit: WorkspacePaneHit, x: f32, y: 
     state.resizeCurrentProjectWorkspaceSplit(hit.pane_id, hit.sibling_pane_id, hit.axis, ratio);
 }
 
-const PANE_HEADER_RIGHT_RESERVE: f32 = 46.0;
-
 fn renderLeaf(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: palette.Rect) void {
     const kind = state.workspacePaneKindById(pane_id) orelse return;
     if (pane_rect_count < pane_rects.len) {
         pane_rects[pane_rect_count] = .{ .pane_id = pane_id, .rect = rect };
         pane_rect_count += 1;
     }
-    const reserve = theme.scaledUi(PANE_HEADER_RIGHT_RESERVE);
+    const maximized = state.isCurrentProjectWorkspacePaneMaximized(pane_id);
+    const reserve = if (kind == .chat) theme.scaledUi(CHAT_PANE_HEADER_RIGHT_RESERVE_CSS) else 0.0;
     const header_h = switch (kind) {
         .chat => chat_panel.paneHeaderHeight(rect),
         .terminal => terminal_panel.paneHeaderHeight(),
@@ -1021,26 +1077,114 @@ fn renderLeaf(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: 
         },
         .browser => {
             browser_pane_rendered = true;
-            browser_panel.renderDockAt(state, rect);
+            browser_panel.renderDockAtWithReserve(state, rect, theme.scaledUi(BROWSER_TOOLBAR_RIGHT_RESERVE_CSS));
         },
     }
     renderInactivePaneFade(state, pane_id, rect);
     if (kind == .chat and header_h > 0.0) {
         const header_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = header_h };
-        renderPaneOverlay(state, pane_id, header_rect, reserve);
+        renderPaneOverlay(state, pane_id, header_rect);
     }
+    renderZoomControl(state, pane_id, kind, rect, header_h, maximized);
     // Resting/focus border fade plus a transient completion pulse. The pulse can
     // light up an unfocused pane (alpha 0 at rest), so the visible alpha is the
     // max of the two and the color eases from the pulse color back to resting.
     const focus_alpha = focusBorderAlpha(pane_id);
     const pulse = completionPulseFactor(pane_id);
-    const alpha = @max(focus_alpha, pulse);
+    const alpha = @max(@max(focus_alpha, pulse), if (maximized) @as(f32, 1.0) else @as(f32, 0.0));
     if (alpha > 0.01) {
         // p=1 -> full pulse color; p=0 -> resting focus-border color.
-        var border_color = lerpColor(theme.accent(), theme.success(), pulse);
+        const resting_color = if (maximized) zoomBorderAccent() else theme.accent();
+        var border_color = lerpColor(resting_color, theme.success(), pulse);
         border_color[3] *= alpha;
-        queueBorder(state, rect, paletteColor(border_color), 0.0, theme.scaledUi(2.0));
+        const border_width = theme.scaledUi(if (maximized) ZOOM_BORDER_WIDTH_CSS else FOCUS_BORDER_WIDTH_CSS);
+        queueBorder(state, rect, paletteColor(border_color), 0.0, border_width);
     }
+}
+
+// Top-right zoom control for chat, terminal, and browser workspace panes.
+fn renderZoomControl(
+    state: *runtime.AppState,
+    pane_id: runtime.WorkspacePaneId,
+    kind: runtime.WorkspacePaneKind,
+    pane_rect: palette.Rect,
+    header_h: f32,
+    maximized: bool,
+) void {
+    const control_size = theme.scaledUi(PANE_CHROME_CONTROL_SIZE_CSS);
+    const margin = theme.scaledUi(PANE_CHROME_RIGHT_MARGIN_CSS);
+    const split_reserve = if (kind == .chat or kind == .terminal)
+        theme.scaledUi(PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS)
+    else
+        0.0;
+    const control_rect: palette.Rect = .{
+        .x = pane_rect.x + pane_rect.w - margin - split_reserve - control_size,
+        .y = switch (kind) {
+            .chat => pane_rect.y + @max((header_h - control_size) * 0.5, theme.scaledUi(4.0)),
+            .terminal => pane_rect.y + margin,
+            .browser => pane_rect.y + (browser_panel.paneToolbarHeight() - control_size) * 0.5,
+        },
+        .w = control_size,
+        .h = control_size,
+    };
+    const hovered = state.palette_mouse_in_workspace and rectContains(control_rect, state.palette_mouse_x, state.palette_mouse_y);
+    if (kind == .terminal and !maximized) {
+        const hover_rect: palette.Rect = .{
+            .x = pane_rect.x + pane_rect.w - theme.scaledUi(TERMINAL_ZOOM_HOVER_WIDTH_CSS),
+            .y = pane_rect.y,
+            .w = theme.scaledUi(TERMINAL_ZOOM_HOVER_WIDTH_CSS),
+            .h = theme.scaledUi(TERMINAL_ZOOM_HOVER_HEIGHT_CSS),
+        };
+        if (!rectContains(hover_rect, state.palette_mouse_x, state.palette_mouse_y)) return;
+    }
+
+    const previous_z = state.palette_overlay_batch.setZIndex(PANE_ZOOM_CONTROL_Z);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
+
+    const icon_color = if (maximized)
+        zoomIconAccent()
+    else if (hovered)
+        zoomIconAccent()
+    else
+        theme.COLOR_TEXT_MUTED;
+    const icon_size = theme.scaledUi(ZOOM_ICON_SIZE_CSS);
+    const icon_rect: palette.Rect = .{
+        .x = control_rect.x + (control_rect.w - icon_size) * 0.5,
+        .y = control_rect.y + (control_rect.h - icon_size) * 0.5,
+        .w = icon_size,
+        .h = icon_size,
+    };
+    queueIcon(
+        state,
+        icon_rect,
+        if (maximized) NF_FA_COMPRESS else NF_FA_EXPAND,
+        paletteColor(icon_color),
+        icon_size,
+        pane_rect,
+    );
+    appendHit(.{ .pane_id = pane_id, .action = .maximize, .rect = control_rect });
+
+    if (kind == .terminal) {
+        const split_rect: palette.Rect = .{
+            .x = pane_rect.x + pane_rect.w - margin - control_size,
+            .y = control_rect.y,
+            .w = control_size,
+            .h = control_size,
+        };
+        const menu_open_here = if (split_menu_open_for) |id| id == pane_id else false;
+        const split_emphasized = rectContains(split_rect, state.palette_mouse_x, state.palette_mouse_y) or menu_open_here;
+        renderSplitTriggerButton(state, split_rect, menu_open_here, split_emphasized, pane_rect);
+        appendHit(.{ .pane_id = pane_id, .action = .toggle_split_menu, .rect = split_rect });
+        if (menu_open_here and split_menu_kind == .split_button) split_menu_anchor = split_rect;
+    }
+}
+
+fn zoomIconAccent() [4]f32 {
+    return theme.mix(theme.accent(), theme.current_colors.text, ZOOM_ICON_FOREGROUND_MIX);
+}
+
+fn zoomBorderAccent() [4]f32 {
+    return theme.mix(theme.accent(), theme.current_colors.text, ZOOM_BORDER_FOREGROUND_MIX);
 }
 
 fn renderInactivePaneFade(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: palette.Rect) void {
@@ -1049,7 +1193,7 @@ fn renderInactivePaneFade(state: *runtime.AppState, pane_id: runtime.WorkspacePa
     queueRect(state, rect, paletteColor(theme.withAlpha(theme.background(), INACTIVE_PANE_FADE_ALPHA)));
 }
 
-fn renderPaneOverlay(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, header_rect: palette.Rect, reserve: f32) void {
+fn renderPaneOverlay(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, header_rect: palette.Rect) void {
     const focused = state.isCurrentProjectWorkspacePaneFocused(pane_id);
     // Focus hit covers the header area only, registered first so it sits at lowest
     // priority. Clicks on icons (registered later) take precedence; clicks on the
@@ -1058,24 +1202,21 @@ fn renderPaneOverlay(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId,
     appendHit(.{ .pane_id = pane_id, .action = .focus, .rect = header_rect });
 
     const menu_open_here = if (split_menu_open_for) |id| id == pane_id else false;
-    const header_hovered = rectContains(header_rect, state.palette_mouse_x, state.palette_mouse_y);
-
     // Render only when focused — non-focused panes keep their panel header clean.
     if (focused) {
-        // Split trigger (+): always visible on focused pane, brightens on header hover.
-        const split_w = theme.scaledUi(24.0);
-        const split_h = theme.scaledUi(20.0);
-        const right_margin = theme.scaledUi(10.0);
+        // Split trigger (+): always visible on focused pane, brightens on direct hover.
+        const split_w = theme.scaledUi(PANE_CHROME_CONTROL_SIZE_CSS);
+        const split_h = theme.scaledUi(PANE_CHROME_CONTROL_SIZE_CSS);
+        const right_margin = theme.scaledUi(PANE_CHROME_RIGHT_MARGIN_CSS);
         const split_x = header_rect.x + header_rect.w - right_margin - split_w;
         const split_y = header_rect.y + (header_rect.h - split_h) * 0.5;
         const split_rect = palette.Rect{ .x = split_x, .y = split_y, .w = split_w, .h = split_h };
         const split_active = menu_open_here;
-        const split_emphasized = header_hovered or split_active;
+        const split_emphasized = rectContains(split_rect, state.palette_mouse_x, state.palette_mouse_y) or split_active;
         renderSplitTriggerButton(state, split_rect, split_active, split_emphasized, header_rect);
         appendHit(.{ .pane_id = pane_id, .action = .toggle_split_menu, .rect = split_rect });
         if (menu_open_here and split_menu_kind == .split_button) split_menu_anchor = split_rect;
     }
-    _ = reserve;
 }
 
 fn renderSplitTriggerButton(state: *runtime.AppState, rect: palette.Rect, active: bool, emphasized: bool, clip: palette.Rect) void {
@@ -1386,6 +1527,19 @@ fn queueBorder(state: *runtime.AppState, rect: palette.Rect, color: palette.Colo
 
 fn queueText(state: *runtime.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: palette.Rect) void {
     state.palette_overlay_batch.text(state.allocator, rect, stableText(state, value), color, font_size, clip) catch {};
+}
+
+fn queueIcon(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8, color: palette.Color, font_size: f32, clip: palette.Rect) void {
+    state.palette_overlay_batch.roleText(
+        state.allocator,
+        rect,
+        stableText(state, glyph),
+        color,
+        font_size,
+        .icon,
+        null,
+        clip,
+    ) catch {};
 }
 
 fn paletteColor(color: [4]f32) palette.Color {
