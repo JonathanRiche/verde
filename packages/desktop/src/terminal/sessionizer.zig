@@ -30,7 +30,8 @@ pub const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\verde-sessionizer-";
 // completed chat turns until the desktop consumes them.
 // Version 10 terminates the complete PTY process group for managed processes.
 // Version 11 updates daemon-owned Codex resume limits and tool event mapping.
-pub const PROTOCOL_VERSION: u32 = 11;
+// Version 12 actively interrupts app-server turns when daemon sends are stopped.
+pub const PROTOCOL_VERSION: u32 = 12;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;

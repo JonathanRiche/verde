@@ -1144,7 +1144,19 @@ pub const Client = struct {
         defer reply.deinit(allocator);
 
         while (true) {
-            const message = try self.readTextMessageAllocInterruptible(self.allocator, request);
+            const message = self.readTextMessageAllocInterruptible(self.allocator, request) catch |err| {
+                if (err == error.CodexTurnInterrupted) {
+                    // The app-server keeps running a turn after its client
+                    // disconnects. Do not await this response: cancelling the
+                    // in-flight read may have discarded bytes from that stream.
+                    _ = self.sendRequest("turn/interrupt", .{
+                        .threadId = thread_id,
+                    }) catch |interrupt_err| {
+                        runtime_log.diagnostic("failed to interrupt stopped Codex turn: {s}", .{@errorName(interrupt_err)});
+                    };
+                }
+                return err;
+            };
             defer self.allocator.free(message);
 
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
