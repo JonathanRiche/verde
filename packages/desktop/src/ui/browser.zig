@@ -72,6 +72,11 @@ const CLOSE_PANE_MENU_INDEX = std.math.maxInt(u32);
 
 /// Renders the browser dock that manages the in-app browser pane and bridge controls.
 pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
+    renderDockAtWithReserve(state, rect, 0.0);
+}
+
+/// Renders the browser dock while leaving toolbar space for workspace chrome.
+pub fn renderDockAtWithReserve(state: *app_state.AppState, rect: palette.Rect, toolbar_right_reserve: f32) void {
     if (!state.isBrowserVisible()) return;
     palette_hit_count = 0;
     palette_toolbar_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
@@ -87,8 +92,13 @@ pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
         .w = rect.w,
         .h = @max(rect.h - toolbar_height, theme.scaledUi(180.0)),
     });
-    renderToolbar(state, rect);
+    renderToolbar(state, rect, toolbar_right_reserve);
     renderBrowserContextMenu(state);
+}
+
+/// Returns the height reserved for the browser pane's toolbar chrome.
+pub fn paneToolbarHeight() f32 {
+    return theme.scaledUi(TOOLBAR_HEIGHT);
 }
 
 pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) void {
@@ -683,14 +693,14 @@ fn renderInspectorSplitButton(
 }
 
 /// Renders the compact browser toolbar with URL entry and primary actions.
-fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect) void {
+fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_reserve: f32) void {
     const toolbar_height = theme.scaledUi(TOOLBAR_HEIGHT);
     const button_size = theme.scaledUi(TOOLBAR_BUTTON_SIZE);
     const dropdown_width = theme.scaledUi(TOOLBAR_DROPDOWN_WIDTH);
     const pad_x = theme.scaledUi(10.0);
     const pad_y = (toolbar_height - button_size) * 0.5;
     const gap = theme.scaledUi(TOOLBAR_GAP);
-    const avail = @max(dock_rect.w - pad_x * 2.0, theme.scaledUi(180.0));
+    const avail = @max(dock_rect.w - pad_x * 2.0 - right_reserve, theme.scaledUi(180.0));
 
     // Layout: [field] [back][fwd][refresh] [inspect|menu] [close]
     // Five neutral buttons + one split button (= 1.5 button widths) + 5 gaps.

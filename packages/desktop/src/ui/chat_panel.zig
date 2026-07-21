@@ -18,6 +18,9 @@ const text_measure = @import("text_measure.zig");
 const theme = @import("theme.zig");
 
 const TOP_BAR_HEIGHT: f32 = 57.0; // ~70% of legacy 82px cap
+const WORKSPACE_HEADER_ICON_CONTROL_CSS: f32 = 30.0;
+const WORKSPACE_HEADER_CHEVRON_CONTROL_CSS: f32 = 22.0;
+const WORKSPACE_HEADER_CONTROL_GAP_CSS: f32 = 6.0;
 const COMPOSER_HEIGHT: f32 = 220.0;
 /// Toolbar logos and drawn icons must sit above `PaletteComposerPrompt` geometry (`z_index` 120) so
 /// interleaved SDL_GPU rendering does not paint the composer panel over them.
@@ -1286,17 +1289,6 @@ fn queueWorkspaceHeaderFolderIcon(state: *app_state.AppState, x: f32, center_y: 
     }, col, theme.scaledUi(1.5));
 }
 
-fn queueWorkspaceHeaderChevron(state: *app_state.AppState, cx: f32, cy: f32, color: palette.Color) void {
-    const half = theme.scaledUi(4.0);
-    queueTriangle(
-        state,
-        .{ .x = cx - half, .y = cy - half },
-        .{ .x = cx, .y = cy },
-        .{ .x = cx - half, .y = cy + half },
-        color,
-    );
-}
-
 fn queueWorkspaceHeaderGlobe(state: *app_state.AppState, cx: f32, cy: f32, size: f32, color: palette.Color) void {
     const r = size * 0.5;
     const sq = palette.Rect{ .x = cx - r, .y = cy - r, .w = size, .h = size };
@@ -1413,28 +1405,21 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
         "New chat";
 
     const button_h = theme.scaledUi(30.0);
-    const button_gap = theme.scaledUi(8.0);
+    const button_gap = theme.scaledUi(WORKSPACE_HEADER_CONTROL_GAP_CSS);
     const title_gap = theme.scaledUi(16.0);
     const label_font = theme.scaledUi(14.0);
     const title_font = theme.scaledUi(18.0);
 
-    const open_label = state.defaultOpenButtonLabel();
     const open_folder = state.defaultOpenShowsFolderIcon();
     const open_tex = state.defaultOpenIconTexture();
-    const open_has_icon = open_folder or open_tex != null;
-    const label_w = @as(f32, @floatFromInt(open_label.len)) * label_font * 0.52;
-    const open_main_w = theme.clampf(
-        label_w + theme.scaledUi(if (open_has_icon) 54.0 else 28.0),
-        theme.scaledUi(82.0),
-        theme.scaledUi(184.0),
-    );
-    const chevron_w = theme.scaledUi(30.0);
-    const browser_w = theme.scaledUi(106.0);
+    const open_main_w = theme.scaledUi(WORKSPACE_HEADER_ICON_CONTROL_CSS);
+    const chevron_w = theme.scaledUi(WORKSPACE_HEADER_CHEVRON_CONTROL_CSS);
+    const browser_w = theme.scaledUi(WORKSPACE_HEADER_ICON_CONTROL_CSS);
     const open_combo_w = open_main_w + chevron_w;
     const actions_w = open_combo_w + button_gap + browser_w;
 
-    const header_inner_w = rect.w - padding_x * 2.0 - right_reserve;
-    const actions_x = rect.x + padding_x + @max(theme.scaledUi(180.0), header_inner_w - actions_w);
+    const actions_right = rect.x + rect.w - right_reserve - button_gap;
+    const actions_x = actions_right - actions_w;
     const title_max_w = @max(actions_x - rect.x - padding_x - title_gap, theme.scaledUi(96.0));
 
     var title_buf: [256]u8 = undefined;
@@ -1464,34 +1449,20 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
 
     const open_main_hover = mouse_ok and rectContains(open_main_rect, mx, my);
     const chevron_hover = mouse_ok and rectContains(chevron_rect, mx, my);
-    const combo_hover = open_main_hover or chevron_hover;
     const browser_hover = mouse_ok and rectContains(browser_rect, mx, my);
 
-    const combo_base = theme.COLOR_PANEL_ALT;
-    const combo_bg = if (combo_hover) theme.lighten(combo_base, 0.08) else combo_base;
-    const open_combo_rect = palette.Rect{ .x = open_combo_x, .y = actions_y, .w = open_combo_w, .h = button_h };
-    const combo_radius = theme.scaledUi(10.0);
-    queueRounded(state, open_combo_rect, paletteColor(combo_bg), combo_radius);
-
-    const sep_col = theme.withAlpha(theme.background(), 110);
-    queueRect(state, .{
-        .x = chevron_rect.x,
-        .y = chevron_rect.y + theme.scaledUi(5.0),
-        .w = 1.0,
-        .h = button_h - theme.scaledUi(10.0),
-    }, paletteColor(sep_col));
-
     const icon_slot = theme.scaledUi(16.0);
-    const icon_x = open_main_rect.x + theme.scaledUi(14.0);
+    const icon_x = open_main_rect.x + (open_main_rect.w - icon_slot) * 0.5;
     const icon_cy = open_main_rect.y + button_h * 0.5;
     const text_color_open: palette.Color = paletteColor(if (!state.canRunDefaultOpenAction())
         theme.COLOR_TEXT_MUTED
-    else if (combo_hover)
+    else if (open_main_hover)
         theme.COLOR_WHITE
     else
         theme.COLOR_TEXT_MUTED);
     if (open_folder) {
-        queueWorkspaceHeaderFolderIcon(state, icon_x, icon_cy, text_color_open);
+        const folder_w = theme.scaledUi(13.0);
+        queueWorkspaceHeaderFolderIcon(state, open_main_rect.x + (open_main_rect.w - folder_w) * 0.5, icon_cy, text_color_open);
     } else if (open_tex) |cached| {
         const scaled = runtime.scaledImageSize(cached.width, cached.height, icon_slot, icon_slot);
         queueImage(state, .{
@@ -1500,46 +1471,32 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
             .w = scaled[0],
             .h = scaled[1],
         }, cached, rect);
+    } else {
+        queueIconText(state, .{
+            .x = open_main_rect.x + (open_main_rect.w - icon_slot) * 0.5,
+            .y = open_main_rect.y + (open_main_rect.h - icon_slot) * 0.5,
+            .w = icon_slot,
+            .h = icon_slot,
+        }, NF_COD_LINK_EXTERNAL, text_color_open, icon_slot, rect);
     }
-    const text_x = if (open_has_icon)
-        icon_x + icon_slot + theme.scaledUi(10.0)
-    else
-        open_main_rect.x + theme.scaledUi(14.0);
-    queueChromeLabel(state, .{
-        .x = text_x,
-        .y = open_main_rect.y + (button_h - label_font * 1.25) * 0.5,
-        .w = open_main_w - (text_x - open_main_rect.x) - theme.scaledUi(8.0),
-        .h = label_font * 1.25,
-    }, open_label, text_color_open, label_font, rect);
 
-    const chev_cx = chevron_rect.x + chevron_rect.w * 0.5 + theme.scaledUi(2.0);
-    const chev_cy = chevron_rect.y + chevron_rect.h * 0.5;
-    queueWorkspaceHeaderChevron(
-        state,
-        chev_cx,
-        chev_cy,
-        paletteColor(if (chevron_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE),
-    );
+    const chevron_size = theme.scaledUi(12.0);
+    queueIconText(state, .{
+        .x = chevron_rect.x + (chevron_rect.w - chevron_size) * 0.5,
+        .y = chevron_rect.y + (chevron_rect.h - chevron_size) * 0.5,
+        .w = chevron_size,
+        .h = chevron_size,
+    }, NF_COD_CHEVRON_DOWN, paletteColor(if (chevron_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE), chevron_size, rect);
 
-    const browser_base = theme.COLOR_PANEL_ALT;
-    const browser_bg = if (browser_hover) theme.lighten(browser_base, 0.08) else browser_base;
-    const browser_radius = theme.scaledUi(6.0);
-    queuePanel(state, browser_rect, paletteColor(browser_bg), paletteColor(theme.lighten(browser_bg, 0.06)), browser_radius, theme.scaledUi(1.0));
-
-    const browser_label = "Browser";
-    const globe_size = theme.scaledUi(14.0);
-    const icon_gap = theme.scaledUi(5.0);
-    const browser_text_w = @as(f32, @floatFromInt(browser_label.len)) * label_font * 0.52;
-    const browser_content_w = globe_size + icon_gap + browser_text_w;
-    const browser_start_x = browser_rect.x + (browser_rect.w - browser_content_w) * 0.5;
+    const globe_size = theme.scaledUi(16.0);
     const browser_cy = browser_rect.y + browser_rect.h * 0.5;
-    queueWorkspaceHeaderGlobe(state, browser_start_x + globe_size * 0.5, browser_cy, globe_size, paletteColor(theme.COLOR_TEXT_MUTED));
-    queueChromeLabel(state, .{
-        .x = browser_start_x + globe_size + icon_gap,
-        .y = browser_rect.y + (browser_rect.h - label_font * 1.25) * 0.5,
-        .w = browser_text_w + theme.scaledUi(4.0),
-        .h = label_font * 1.25,
-    }, browser_label, paletteColor(theme.COLOR_WHITE), label_font, rect);
+    queueWorkspaceHeaderGlobe(
+        state,
+        browser_rect.x + browser_rect.w * 0.5,
+        browser_cy,
+        globe_size,
+        paletteColor(if (browser_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED),
+    );
 
     if (!state.workspace_header_open_menu_open or !paneIdEqual(state.workspace_header_open_menu_pane_id, pane_id)) return;
 
@@ -4734,6 +4691,8 @@ const NF_FA_FLASH = "\u{F0E7}"; // lightning bolt
 const NF_COD_LOCK = "\u{EA75}";
 const NF_COD_UNLOCK = "\u{EB74}";
 const NF_COD_CIRCLE = "\u{EABC}"; // hollow circle — reads as "inactive / default" next to the bolt
+const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
+const NF_COD_LINK_EXTERNAL = "\u{EB14}";
 const NF_MD_BRAIN = "\u{F09D1}"; // brain — reasoning/thinking level on the run pill
 
 /// Renders a single codicon glyph centered inside `rect` using the icon font.
