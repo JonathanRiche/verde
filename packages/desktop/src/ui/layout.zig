@@ -45,6 +45,7 @@ pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32
     registerMcpOnboardingHits(state, width, height);
     registerImageModalHits(state, width, height);
     registerTranscriptSelectionModalHits(state, width, height);
+    registerHandoffModalHits(state, width, height);
     registerWorkspaceAddModalHits(state, width, height);
     registerWorkspaceRenameModalHits(state, width, height);
     registerThreadImportModalHits(state, width, height);
@@ -146,6 +147,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     defer state.palette_overlay_batch.restoreZIndex(modal_z);
     renderImageModal(state, width, height);
     renderTranscriptSelectionModal(state, width, height);
+    renderHandoffModal(state, width, height);
     renderWorkspaceAddModal(state, width, height);
     renderWorkspaceRenameModal(state, width, height);
     renderThreadImportModal(state, width, height);
@@ -505,6 +507,20 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .herdr_profile_cancel => state.cancelHerdrProfilePicker(),
             .herdr_profile_submit => state.handoffProjectToSelectedHerdrProfile(),
             .herdr_profile_select => state.selectHerdrProfile(hit.index),
+            .handoff_cancel => state.cancelHandoff(),
+            .handoff_prepare => state.prepareHandoffTarget(),
+            .handoff_surface_gui => state.setHandoffTargetSurface(.gui_chat),
+            .handoff_surface_tui => state.setHandoffTargetSurface(.tui),
+            .handoff_provider_codex => state.setHandoffTargetProvider(.codex),
+            .handoff_provider_opencode => state.setHandoffTargetProvider(.opencode),
+            .handoff_provider_claude => state.setHandoffTargetProvider(.claude),
+            .handoff_provider_cursor => state.setHandoffTargetProvider(.cursor),
+            .handoff_context_summary => state.setHandoffContextMode(.summary),
+            .handoff_context_recent => state.setHandoffContextMode(.recent),
+            .handoff_context_full => state.setHandoffContextMode(.full),
+            .handoff_target_new => state.setHandoffUseExisting(false),
+            .handoff_target_existing => state.setHandoffUseExisting(true),
+            .handoff_target_next => state.cycleHandoffExistingTarget(),
             .project_import_browse => unreachable,
             .project_import_submit => {
                 state.importProjectFromInput() catch |err| {
@@ -634,6 +650,7 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
         state.transcriptSelectionBuffer() != null or
         state.thread_import_provider != null or
         state.herdr_profile_picker_project_index != null or
+        state.handoff_modal_open or
         state.show_project_creator or
         state.show_settings_modal or
         state.command_palette_open;
@@ -675,6 +692,10 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
             }
             if (state.herdr_profile_picker_project_index != null) {
                 state.handoffProjectToSelectedHerdrProfile();
+                return true;
+            }
+            if (state.handoff_modal_open) {
+                state.prepareHandoffTarget();
                 return true;
             }
             return false;
@@ -771,6 +792,8 @@ fn dismissTopModal(state: *runtime.AppState) void {
         state.cancelThreadImport();
     } else if (state.herdr_profile_picker_project_index != null) {
         state.cancelHerdrProfilePicker();
+    } else if (state.handoff_modal_open) {
+        state.cancelHandoff();
     } else if (state.show_settings_modal) {
         state.cancelSettingsModal();
     }
@@ -1006,6 +1029,73 @@ fn registerThreadImportModalHits(state: *runtime.AppState, width: f32, height: f
     const submit_rect: palette.Rect = .{ .x = cancel_rect.x + button_w + gap, .y = button_y, .w = button_w, .h = button_h };
     queueModalHit(state, cancel_rect, .thread_import_cancel, 0);
     queueModalHit(state, submit_rect, .thread_import_submit, 0);
+}
+
+fn handoffModalRect(width: f32, height: f32) palette.Rect {
+    const modal_w = theme.clampf(width * 0.58, theme.scaledUi(580.0), theme.scaledUi(780.0));
+    const modal_h = theme.clampf(height * 0.82, theme.scaledUi(560.0), theme.scaledUi(720.0));
+    return .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
+}
+
+fn registerHandoffModalHits(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!state.handoff_modal_open) return;
+    const modal = handoffModalRect(width, height);
+    registerModalChromeHits(state, width, height, modal, true);
+    const pad = theme.scaledUi(20.0);
+    const gap = theme.scaledUi(8.0);
+    const content_w = modal.w - pad * 2.0;
+    const row_h = theme.scaledUi(34.0);
+
+    var y = modal.y + theme.scaledUi(96.0);
+    const surface_w = (content_w - gap) * 0.5;
+    queueModalHit(state, .{ .x = modal.x + pad, .y = y, .w = surface_w, .h = row_h }, .handoff_surface_gui, 0);
+    queueModalHit(state, .{ .x = modal.x + pad + surface_w + gap, .y = y, .w = surface_w, .h = row_h }, .handoff_surface_tui, 0);
+
+    y += theme.scaledUi(58.0);
+    const provider_w = (content_w - gap * 3.0) * 0.25;
+    const provider_actions = [_]runtime.PaletteModalAction{
+        .handoff_provider_codex,
+        .handoff_provider_opencode,
+        .handoff_provider_claude,
+        .handoff_provider_cursor,
+    };
+    for (provider_actions, 0..) |action, index| {
+        queueModalHit(state, .{
+            .x = modal.x + pad + @as(f32, @floatFromInt(index)) * (provider_w + gap),
+            .y = y,
+            .w = provider_w,
+            .h = row_h,
+        }, action, 0);
+    }
+
+    y += theme.scaledUi(58.0);
+    const new_w = content_w * 0.22;
+    const next_w = content_w * 0.16;
+    const existing_w = content_w - new_w - next_w - gap * 2.0;
+    queueModalHit(state, .{ .x = modal.x + pad, .y = y, .w = new_w, .h = row_h }, .handoff_target_new, 0);
+    queueModalHit(state, .{ .x = modal.x + pad + new_w + gap, .y = y, .w = existing_w, .h = row_h }, .handoff_target_existing, 0);
+    queueModalHit(state, .{ .x = modal.x + pad + new_w + gap + existing_w + gap, .y = y, .w = next_w, .h = row_h }, .handoff_target_next, 0);
+
+    y += theme.scaledUi(90.0);
+    const context_w = (content_w - gap * 2.0) / 3.0;
+    const context_actions = [_]runtime.PaletteModalAction{
+        .handoff_context_summary,
+        .handoff_context_recent,
+        .handoff_context_full,
+    };
+    for (context_actions, 0..) |action, index| {
+        queueModalHit(state, .{
+            .x = modal.x + pad + @as(f32, @floatFromInt(index)) * (context_w + gap),
+            .y = y,
+            .w = context_w,
+            .h = row_h,
+        }, action, 0);
+    }
+
+    const button_y = modal.y + modal.h - pad - row_h;
+    const button_w = (content_w - gap) * 0.5;
+    queueModalHit(state, .{ .x = modal.x + pad, .y = button_y, .w = button_w, .h = row_h }, .handoff_cancel, 0);
+    queueModalHit(state, .{ .x = modal.x + pad + button_w + gap, .y = button_y, .w = button_w, .h = row_h }, .handoff_prepare, 0);
 }
 
 fn registerHerdrProfilePickerHits(state: *runtime.AppState, width: f32, height: f32) void {
@@ -1360,6 +1450,103 @@ fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) vo
     const submit_rect: palette.Rect = .{ .x = cancel_rect.x + button_w + gap, .y = button_y, .w = button_w, .h = button_h };
     drawActionButton(state, cancel_rect, "Cancel", theme.COLOR_PANEL_MUTED);
     drawActionButton(state, submit_rect, "Import", theme.COLOR_GREEN);
+}
+
+// Renders the cross-provider handoff target and context chooser.
+fn renderHandoffModal(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!state.handoff_modal_open) return;
+    if (state.handoff_project_index >= state.projects.items.len) {
+        state.cancelHandoff();
+        return;
+    }
+    const modal = handoffModalRect(width, height);
+    drawModalChromeVisual(state, width, height, modal);
+    const project = &state.projects.items[state.handoff_project_index];
+    const pad = theme.scaledUi(20.0);
+    const gap = theme.scaledUi(8.0);
+    const content_w = modal.w - pad * 2.0;
+    const row_h = theme.scaledUi(34.0);
+    const content_x = modal.x + pad;
+
+    queuePaletteText(state, .{ .x = content_x, .y = modal.y + pad, .w = content_w, .h = theme.scaledUi(24.0) }, "Handoff to another agent", paletteColor(theme.COLOR_WHITE), theme.scaledUi(18.0), modal);
+    var source_buf: [512]u8 = undefined;
+    const source = std.fmt.bufPrint(&source_buf, "Source: {s} · pane {d} · {s}", .{ project.label, state.handoff_source_pane_id, handoffProviderLabel(state.handoff_source_provider) }) catch "Source chat or TUI";
+    queuePaletteText(state, .{ .x = content_x, .y = modal.y + theme.scaledUi(50.0), .w = content_w, .h = theme.scaledUi(20.0) }, source, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), modal);
+
+    queuePaletteText(state, .{ .x = content_x, .y = modal.y + theme.scaledUi(76.0), .w = content_w, .h = theme.scaledUi(18.0) }, "TARGET SURFACE", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), modal);
+    var y = modal.y + theme.scaledUi(96.0);
+    const surface_w = (content_w - gap) * 0.5;
+    drawActionButton(state, .{ .x = content_x, .y = y, .w = surface_w, .h = row_h }, "GUI chat", if (state.handoff_target_surface == .gui_chat) theme.accent() else theme.COLOR_PANEL_ALT);
+    drawActionButton(state, .{ .x = content_x + surface_w + gap, .y = y, .w = surface_w, .h = row_h }, "Agent TUI", if (state.handoff_target_surface == .tui) theme.accent() else theme.COLOR_PANEL_ALT);
+
+    queuePaletteText(state, .{ .x = content_x, .y = y + theme.scaledUi(40.0), .w = content_w, .h = theme.scaledUi(18.0) }, "TARGET PROVIDER", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), modal);
+    y += theme.scaledUi(58.0);
+    const providers = [_]runtime.Provider{ .codex, .opencode, .claude, .cursor };
+    const provider_w = (content_w - gap * 3.0) * 0.25;
+    for (providers, 0..) |provider, index| {
+        const rect: palette.Rect = .{ .x = content_x + @as(f32, @floatFromInt(index)) * (provider_w + gap), .y = y, .w = provider_w, .h = row_h };
+        drawActionButton(state, rect, handoffProviderLabel(provider), if (state.handoff_target_provider == provider) theme.accent() else theme.COLOR_PANEL_ALT);
+    }
+
+    queuePaletteText(state, .{ .x = content_x, .y = y + theme.scaledUi(40.0), .w = content_w, .h = theme.scaledUi(18.0) }, "TARGET THREAD", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), modal);
+    y += theme.scaledUi(58.0);
+    const new_w = content_w * 0.22;
+    const next_w = content_w * 0.16;
+    const existing_w = content_w - new_w - next_w - gap * 2.0;
+    drawActionButton(state, .{ .x = content_x, .y = y, .w = new_w, .h = row_h }, "New", if (!state.handoff_use_existing) theme.accent() else theme.COLOR_PANEL_ALT);
+    drawActionButton(state, .{ .x = content_x + new_w + gap, .y = y, .w = existing_w, .h = row_h }, state.handoffExistingTargetLabel(), if (state.handoff_use_existing) theme.accent() else theme.COLOR_PANEL_ALT);
+    drawActionButton(state, .{ .x = content_x + new_w + gap + existing_w + gap, .y = y, .w = next_w, .h = row_h }, "Next", theme.COLOR_PANEL_ALT);
+
+    var model_buf: [512]u8 = undefined;
+    const model = std.fmt.bufPrint(&model_buf, "Model: {s} · adjust model, reasoning, and permissions in the editable target", .{state.handoffTargetModelLabel()}) catch "Provider default model";
+    queuePaletteText(state, .{ .x = content_x, .y = y + theme.scaledUi(42.0), .w = content_w, .h = theme.scaledUi(20.0) }, model, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), modal);
+
+    queuePaletteText(state, .{ .x = content_x, .y = y + theme.scaledUi(68.0), .w = content_w, .h = theme.scaledUi(18.0) }, "CONTEXT TO EMBED", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), modal);
+    y += theme.scaledUi(90.0);
+    const context_w = (content_w - gap * 2.0) / 3.0;
+    const modes = [_]struct { value: @TypeOf(state.handoff_context_mode), label: []const u8 }{
+        .{ .value = .summary, .label = "Summary" },
+        .{ .value = .recent, .label = "Recent messages" },
+        .{ .value = .full, .label = "Full transcript" },
+    };
+    for (modes, 0..) |mode, index| {
+        const rect: palette.Rect = .{ .x = content_x + @as(f32, @floatFromInt(index)) * (context_w + gap), .y = y, .w = context_w, .h = row_h };
+        drawActionButton(state, rect, mode.label, if (state.handoff_context_mode == mode.value) theme.accent() else theme.COLOR_PANEL_ALT);
+    }
+
+    const disclosure_y = y + theme.scaledUi(46.0);
+    queuePaletteText(state, .{ .x = content_x, .y = disclosure_y, .w = content_w, .h = theme.scaledUi(18.0) }, "Shares transcript selection, workspace/path, Git state, processes, source IDs, and Verde history commands.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), modal);
+    queuePaletteText(state, .{ .x = content_x, .y = disclosure_y + theme.scaledUi(19.0), .w = content_w, .h = theme.scaledUi(18.0) }, "Attachment bytes and likely credential-bearing lines are excluded. The provider thread ID stays source-only.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), modal);
+
+    const preview_y = disclosure_y + theme.scaledUi(48.0);
+    const button_y = modal.y + modal.h - pad - row_h;
+    const preview_rect: palette.Rect = .{ .x = content_x, .y = preview_y, .w = content_w, .h = @max(button_y - preview_y - theme.scaledUi(14.0), theme.scaledUi(72.0)) };
+    queuePaletteRoundedRect(state, preview_rect, paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.025)), theme.scaledUi(8.0));
+    queuePaletteBorder(state, preview_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), theme.scaledUi(1.0));
+    var preview_header: [128]u8 = undefined;
+    const header = std.fmt.bufPrint(&preview_header, "PACKAGE PREVIEW · {d} bytes", .{state.handoffPreviewText().len}) catch "PACKAGE PREVIEW";
+    queuePaletteText(state, .{ .x = preview_rect.x + theme.scaledUi(12.0), .y = preview_rect.y + theme.scaledUi(9.0), .w = preview_rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(18.0) }, header, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(10.5), preview_rect);
+    var lines = std.mem.splitScalar(u8, state.handoffPreviewText(), '\n');
+    var line_y = preview_rect.y + theme.scaledUi(31.0);
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (line_y + theme.scaledUi(16.0) > preview_rect.y + preview_rect.h - theme.scaledUi(6.0)) break;
+        queuePaletteText(state, .{ .x = preview_rect.x + theme.scaledUi(12.0), .y = line_y, .w = preview_rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(16.0) }, line, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(11.0), preview_rect);
+        line_y += theme.scaledUi(16.0);
+    }
+
+    const button_w = (content_w - gap) * 0.5;
+    drawActionButton(state, .{ .x = content_x, .y = button_y, .w = button_w, .h = row_h }, "Cancel", theme.COLOR_PANEL_ALT);
+    drawActionButton(state, .{ .x = content_x + button_w + gap, .y = button_y, .w = button_w, .h = row_h }, "Prepare editable draft", theme.accent());
+}
+
+fn handoffProviderLabel(provider: runtime.Provider) []const u8 {
+    return switch (provider) {
+        .codex => "Codex",
+        .opencode => "OpenCode",
+        .claude => "Claude",
+        .cursor => "Cursor",
+    };
 }
 
 /// Shows the modal used to choose a saved Herdr remote profile for workspace handoff.
