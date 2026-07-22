@@ -2628,6 +2628,15 @@ fn supportedAgentTuiProviderFromName(name: []const u8) ?stack_config.AgentProvid
     return if (defaultAgentTui(provider) != null) provider else null;
 }
 
+fn agentTuiProviderFromProcessName(name: []const u8) ?stack_config.AgentProvider {
+    if (std.mem.eql(u8, name, "codex")) return .codex;
+    if (std.mem.eql(u8, name, "claude")) return .claude;
+    if (std.mem.eql(u8, name, "opencode")) return .opencode;
+    if (std.mem.eql(u8, name, "agent") or std.mem.startsWith(u8, name, "cursor")) return .cursor;
+    if (std.mem.eql(u8, name, "amp")) return .amp;
+    return null;
+}
+
 pub const WorkspaceSplitAxis = enum {
     horizontal,
     vertical,
@@ -11971,13 +11980,30 @@ pub const AppState = struct {
             const provider = process.provider orelse continue;
             if (defaultAgentTui(provider) != null) return provider;
         }
+        if (self.projectTerminalDock(project_index, dock_id)) |dock| {
+            var process_name_buf: [96]u8 = undefined;
+            if (dock.activeForegroundProcessName(&process_name_buf)) |name| {
+                if (agentTuiProviderFromProcessName(name)) |provider| return provider;
+            }
+        }
         return null;
     }
 
-    pub fn workspaceAgentTuiHistoryAt(self: *const AppState, project_index: usize, dock_id: u32) i64 {
-        if (self.workspaceAgentTuiProvider(project_index, dock_id) == null) return 0;
-        const dock = self.projectTerminalDock(project_index, dock_id) orelse return 0;
-        return dock.activeTabAgentHistoryAt();
+    pub fn workspaceAgentTuiHistoryAt(self: *AppState, project_index: usize, dock_id: u32) i64 {
+        const provider = self.workspaceAgentTuiProvider(project_index, dock_id) orelse return 0;
+        const existing = if (self.projectTerminalDock(project_index, dock_id)) |dock| dock.activeTabAgentHistoryAt() else 0;
+        if (existing != 0) return existing;
+
+        // Amp panes created before TUI history had no persisted provider marker.
+        // Its lifecycle plugin distinguishes session startup (`idle`) from a
+        // real agent call, so a non-idle surface safely migrates prior activity.
+        if (provider != .amp) return 0;
+        const surface = self.projectTerminalSurface(project_index, dock_id) orelse return 0;
+        if (surface.status == .idle or surface.status_changed_at_ms == 0) return 0;
+        const activity_at = surface.status_changed_at_ms;
+        const dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return 0;
+        if (dock.noteActiveTabAgentHistory(activity_at)) self.markDirty();
+        return activity_at;
     }
 
     pub fn focusedWorkspaceTerminalDockId(self: *const AppState) ?u32 {
