@@ -230,6 +230,7 @@ pub const SettingsDraft = struct {
     tool_call_group_preference: app_config.ToolCallGroupPreference = .collapsed,
     automatic_chat_titles_enabled: bool = true,
     chat_title_provider: app_config.ChatTitleProvider = .codex,
+    new_chat_pane_behavior: app_config.NewChatPaneBehavior = .new_pane,
     check_for_updates_automatically: bool = true,
     notifications_enabled: bool = true,
 };
@@ -2759,6 +2760,31 @@ pub const WorkspaceLayout = struct {
             if (pane.minimized) continue;
             switch (pane.ref) {
                 .chat => |ref| if (ref.thread_index == thread_index) return pane.id,
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn retargetPreferredChatPane(self: *WorkspaceLayout, thread_index: usize) ?WorkspacePaneId {
+        if (self.focused_pane_id) |focused_pane_id| {
+            if (self.paneByIdMutable(focused_pane_id)) |pane| {
+                if (!pane.minimized) switch (pane.ref) {
+                    .chat => |*ref| {
+                        ref.thread_index = thread_index;
+                        return pane.id;
+                    },
+                    else => {},
+                };
+            }
+        }
+        for (self.panes.items) |*pane| {
+            if (pane.minimized) continue;
+            switch (pane.ref) {
+                .chat => |*ref| {
+                    ref.thread_index = thread_index;
+                    return pane.id;
+                },
                 else => {},
             }
         }
@@ -8508,6 +8534,26 @@ pub const AppState = struct {
 
     pub fn createThreadForProject(self: *AppState, index: usize) void {
         if (index >= self.projects.items.len) return;
+        if (self.app_config.new_chat_pane_behavior == .new_pane) {
+            self.selected_project_index = index;
+            var layout = &self.projects.items[index].workspace_layout;
+            _ = layout.ensureDefaultChat(self.allocator) catch |err| {
+                log.err("failed to prepare workspace for new chat pane: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Failed to prepare the workspace.");
+                return;
+            };
+            if (layout.gridNewPanePlacement()) |placement| {
+                _ = self.splitWorkspacePaneWithChatPlacement(index, placement.pane_id, placement.axis, placement.new_after);
+                return;
+            }
+            const target_pane_id = layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse {
+                self.setSidebarNotice("No workspace pane selected.");
+                return;
+            };
+            _ = self.splitWorkspacePaneWithChatPlacement(index, target_pane_id, .vertical, true);
+            return;
+        }
+
         var project = &self.projects.items[index];
         const thread_index = project.addThread(self.allocator) catch {
             self.setSidebarNotice("Failed to create a new thread.");
@@ -8545,18 +8591,7 @@ pub const AppState = struct {
         var layout = &project.workspace_layout;
         _ = try layout.ensureDefaultChat(self.allocator);
 
-        var chat_pane_id: ?WorkspacePaneId = null;
-        for (layout.panes.items) |*pane| {
-            if (pane.minimized) continue;
-            switch (pane.ref) {
-                .chat => |*ref| {
-                    ref.thread_index = thread_index;
-                    chat_pane_id = pane.id;
-                    break;
-                },
-                else => {},
-            }
-        }
+        var chat_pane_id = layout.retargetPreferredChatPane(thread_index);
 
         if (chat_pane_id == null) {
             const new_pane_id = try layout.createChatPane(self.allocator, thread_index);
@@ -9627,6 +9662,7 @@ pub const AppState = struct {
             .tool_call_group_preference = self.app_config.tool_call_group_preference,
             .automatic_chat_titles_enabled = self.app_config.automatic_chat_titles_enabled,
             .chat_title_provider = self.app_config.chat_title_provider,
+            .new_chat_pane_behavior = self.app_config.new_chat_pane_behavior,
             .check_for_updates_automatically = self.app_config.check_for_updates_automatically,
             .notifications_enabled = self.app_config.notifications_enabled,
         };
@@ -9645,6 +9681,7 @@ pub const AppState = struct {
         if (draft.tool_call_group_preference != self.app_config.tool_call_group_preference) return true;
         if (draft.automatic_chat_titles_enabled != self.app_config.automatic_chat_titles_enabled) return true;
         if (draft.chat_title_provider != self.app_config.chat_title_provider) return true;
+        if (draft.new_chat_pane_behavior != self.app_config.new_chat_pane_behavior) return true;
         if (!std.mem.eql(u8, self.settingsChatTitleModelRef(), self.app_config.chatTitleModel())) return true;
         if (draft.check_for_updates_automatically != self.app_config.check_for_updates_automatically) return true;
         if (draft.notifications_enabled != self.app_config.notifications_enabled) return true;
@@ -9862,6 +9899,7 @@ pub const AppState = struct {
         self.app_config.tool_call_group_preference = self.settings_draft.tool_call_group_preference;
         self.app_config.automatic_chat_titles_enabled = self.settings_draft.automatic_chat_titles_enabled;
         self.app_config.chat_title_provider = self.settings_draft.chat_title_provider;
+        self.app_config.new_chat_pane_behavior = self.settings_draft.new_chat_pane_behavior;
         try self.app_config.setChatTitleModel(self.allocator, self.settingsChatTitleModelRef());
         const previous_auto_update_check = self.app_config.check_for_updates_automatically;
         errdefer self.app_config.check_for_updates_automatically = previous_auto_update_check;
@@ -21957,6 +21995,22 @@ test "workspace layout grid placement follows pane hotkey order" {
     try std.testing.expectEqual(pane2, placement.pane_id);
     try std.testing.expectEqual(WorkspaceSplitAxis.horizontal, placement.axis);
     try std.testing.expect(placement.new_after);
+}
+
+test "workspace chat replacement prefers the focused chat pane" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const second_pane_id = try layout.createChatPane(allocator, 1);
+    try layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
+    layout.focused_pane_id = second_pane_id;
+
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.retargetPreferredChatPane(2));
+    const first_pane = layout.paneById(1) orelse return error.TestExpectedEqual;
+    const second_pane = layout.paneById(second_pane_id) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 0), first_pane.ref.chat.thread_index);
+    try std.testing.expectEqual(@as(usize, 2), second_pane.ref.chat.thread_index);
 }
 
 test "dev server URL detection accepts loopback URLs only" {

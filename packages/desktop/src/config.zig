@@ -82,6 +82,11 @@ pub const ToolCallGroupPreference = enum {
     remember_last,
 };
 
+pub const NewChatPaneBehavior = enum {
+    new_pane,
+    replace_pane,
+};
+
 pub const TerminalLaunchProfileConfig = struct {
     label: []u8,
     command: []const []u8,
@@ -125,6 +130,7 @@ pub const AppConfig = struct {
     automatic_chat_titles_enabled: bool = true,
     chat_title_provider: ChatTitleProvider = .codex,
     chat_title_model: ?[]u8 = null,
+    new_chat_pane_behavior: NewChatPaneBehavior = .new_pane,
     check_for_updates_automatically: bool = true,
     // User-scoped provider registration is opt-in because it updates each
     // detected agent's global configuration outside Verde's own config dir.
@@ -468,6 +474,7 @@ fn writeChatSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, c
     try chat_object.put(allocator, "automatic_titles", .{ .bool = config.automatic_chat_titles_enabled });
     try chat_object.put(allocator, "title_provider", .{ .string = @tagName(config.chat_title_provider) });
     try chat_object.put(allocator, "title_model", .{ .string = config.chatTitleModel() });
+    try chat_object.put(allocator, "new_pane_behavior", .{ .string = @tagName(config.new_chat_pane_behavior) });
 }
 
 fn writeUpdatesSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
@@ -603,6 +610,19 @@ fn applyChatOverrides(allocator: std.mem.Allocator, config: *AppConfig, chat_val
             };
         } else {
             log.warn("chat.title_model must be a non-empty string when provided", .{});
+        }
+    }
+    if (chat_value.object.get("new_pane_behavior")) |behavior_value| {
+        if (behavior_value == .string) {
+            if (std.mem.eql(u8, behavior_value.string, "new_pane")) {
+                config.new_chat_pane_behavior = .new_pane;
+            } else if (std.mem.eql(u8, behavior_value.string, "replace_pane")) {
+                config.new_chat_pane_behavior = .replace_pane;
+            } else {
+                log.warn("chat.new_pane_behavior must be new_pane or replace_pane", .{});
+            }
+        } else {
+            log.warn("chat.new_pane_behavior must be a string when provided", .{});
         }
     }
 }
@@ -1157,6 +1177,18 @@ test "app config accepts chat title provider and model" {
 
     try std.testing.expectEqual(ChatTitleProvider.claude, config.chat_title_provider);
     try std.testing.expectEqualStrings("haiku", config.chatTitleModel());
+}
+
+test "app config defaults new chats to new panes and accepts replacement preference" {
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expectEqual(NewChatPaneBehavior.new_pane, config.new_chat_pane_behavior);
+
+    var root = try parseTestRoot("{\"chat\":{\"new_pane_behavior\":\"replace_pane\"}}");
+    defer root.deinit();
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(NewChatPaneBehavior.replace_pane, config.new_chat_pane_behavior);
 }
 
 test "app config accepts tool call group preference" {

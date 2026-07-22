@@ -44,7 +44,8 @@ file. It is read on startup and on app refresh.
   "chat": {
     "automatic_titles": true,
     "title_provider": "codex",
-    "title_model": "gpt-5.6-luna"
+    "title_model": "gpt-5.6-luna",
+    "new_pane_behavior": "new_pane"
   },
   "updates": {
     "check_automatically": true
@@ -83,7 +84,8 @@ Most of these options also appear in Settings:
   exchange and choose the provider and model used for titles.
 - **Terminal** — font size, launch profiles, and whether terminal link clicks
   open in Verde's browser pane or the system browser.
-- **Workspace** — the default open action for project files and folders.
+- **Workspace** — the default open action for project files and folders, plus
+  whether new chats create panes or replace an existing chat pane.
 - **Agent integrations** — status-pip hooks for supported provider CLIs.
 - **Updates** — check now, install an available release, and automatic checks.
 - **Notifications** — enable or disable desktop notifications.
@@ -124,6 +126,11 @@ assistant exchange completes. `chat.title_provider` accepts `codex`, `claude`,
 `cursor`, or `opencode`; `chat.title_model` is the model reference understood
 by that provider. The default is GPT-5.6 Luna from Codex / ChatGPT. A title
 generation failure leaves Verde's prompt-derived fallback title unchanged.
+
+Ctrl+T and the workspace pencil button create and focus a new chat pane by
+default. Set `chat.new_pane_behavior` to `replace_pane`, or choose **Replace
+chat pane** under **Settings → Workspace → New chat action**, to reuse an
+existing visible chat pane instead.
 
 ## Updates
 

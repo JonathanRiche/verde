@@ -22,6 +22,8 @@ pub const Control = enum(u8) {
     automatic_chat_titles,
     chat_title_provider_dropdown,
     chat_title_model_dropdown,
+    new_chat_new_pane,
+    new_chat_replace_pane,
     open_folder,
     open_editor,
     open_cursor,
@@ -133,6 +135,8 @@ const SettingsLayout = struct {
     workspace_card: palette.Rect,
     open_cells: [OPEN_CHOICES.len]palette.Rect,
     custom_open: ?palette.Rect = null,
+    new_chat_new_pane: palette.Rect,
+    new_chat_replace_pane: palette.Rect,
     integrations_card: palette.Rect,
     mcp_tools: palette.Rect,
     mcp_hint_y: f32,
@@ -252,7 +256,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const transcript_h = m.labeledBlockH(1);
     const chat_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h + m.row_gap + m.label_h + m.inner_gap + m.row_h;
-    const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra;
+    const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra + m.row_gap + m.label_h + m.inner_gap + m.row_h;
     // MCP controls and status, followed by the provider status-hook controls.
     const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap * 2.0 + m.label_h * 4.0 + m.row_h * 5.0 + m.inner_gap * 7.0;
     // Same shape as the integrations card: title, field label, one toggle row, hint.
@@ -389,6 +393,11 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
             .h = m.row_h,
         };
     }
+    const new_chat_label_y = open_y + open_grid_h + custom_extra + m.row_gap;
+    const new_chat_y = new_chat_label_y + m.label_h + m.inner_gap;
+    const new_chat_cell_w = (content_w - m.card_pad * 2.0) * 0.5;
+    const new_chat_new_pane: palette.Rect = .{ .x = open_x, .y = new_chat_y, .w = new_chat_cell_w, .h = m.row_h };
+    const new_chat_replace_pane: palette.Rect = .{ .x = new_chat_new_pane.x + new_chat_cell_w, .y = new_chat_y, .w = new_chat_cell_w, .h = m.row_h };
 
     y += workspace_h + m.card_gap;
 
@@ -473,6 +482,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .workspace_card = workspace_card,
         .open_cells = open_cells,
         .custom_open = custom_open,
+        .new_chat_new_pane = new_chat_new_pane,
+        .new_chat_replace_pane = new_chat_replace_pane,
         .integrations_card = integrations_card,
         .mcp_tools = mcp_tools,
         .mcp_hint_y = mcp_hint_y,
@@ -651,6 +662,8 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     for (OPEN_CHOICES, 0..) |choice, index| {
         queueControlHit(state, layout.open_cells[index], layout.body_clip, choice.control, queue_hit);
     }
+    queueControlHit(state, layout.new_chat_new_pane, layout.body_clip, .new_chat_new_pane, queue_hit);
+    queueControlHit(state, layout.new_chat_replace_pane, layout.body_clip, .new_chat_replace_pane, queue_hit);
     queueControlHit(state, layout.mcp_tools, layout.body_clip, .mcp_tools, queue_hit);
     queueControlHit(state, layout.hooks_claude, layout.body_clip, .hooks_claude, queue_hit);
     queueControlHit(state, layout.hooks_codex, layout.body_clip, .hooks_codex, queue_hit);
@@ -772,6 +785,23 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
             drawToggleCell(state, custom_row, custom_label, true, false, layout.body_clip);
         }
     }
+    queueText(state, .{
+        .x = layout.new_chat_new_pane.x,
+        .y = layout.new_chat_new_pane.y - m.inner_gap - m.label_h,
+        .w = layout.new_chat_new_pane.w + layout.new_chat_replace_pane.w,
+        .h = m.label_h,
+    }, "New chat action", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    drawSegmentedPair(
+        state,
+        layout.new_chat_new_pane,
+        layout.new_chat_replace_pane,
+        "Create new pane",
+        "Replace chat pane",
+        state.settings_draft.new_chat_pane_behavior == .new_pane,
+        isControlHovered(state, .new_chat_new_pane),
+        isControlHovered(state, .new_chat_replace_pane),
+        layout.body_clip,
+    );
 
     // Agent integrations
     drawCardTitle(state, layout.integrations_card, "Agent integrations", layout.body_clip);
@@ -1035,6 +1065,8 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
                 state.settings_title_menu_hover_index = null;
             }
         },
+        .new_chat_new_pane => state.settings_draft.new_chat_pane_behavior = .new_pane,
+        .new_chat_replace_pane => state.settings_draft.new_chat_pane_behavior = .replace_pane,
         .open_folder => state.settings_draft.open_action = .folder,
         .open_editor => state.settings_draft.open_action = .editor,
         .open_cursor => state.settings_draft.open_action = .cursor,
