@@ -10327,6 +10327,12 @@ pub const AppState = struct {
             if (value.len > 0) {
                 if (self.terminalDockForSurface(s)) |dock| {
                     _ = dock.setActiveTabPinnedTitle(self.allocator, value);
+                    // Codex and Cursor provide titles on their prompt-submit
+                    // hooks, making this authoritative first-turn activity even
+                    // when the prompt was submitted without a local Enter event.
+                    if (s.provider != null) {
+                        _ = dock.noteActiveTabAgentHistory(unixTimestampMs());
+                    }
                 }
             }
         }
@@ -11994,6 +12000,19 @@ pub const AppState = struct {
         const dock_snapshot = self.projectTerminalDock(project_index, dock_id) orelse return 0;
         const existing = dock_snapshot.activeTabAgentHistoryAt();
         if (existing != 0) return existing;
+
+        // Prompt-submit hooks persist a title for Codex and Cursor. Use it to
+        // migrate panes whose first turn happened before history enrollment.
+        if (provider == .codex or provider == .cursor) {
+            if (dock_snapshot.activeTabPinnedTitle()) |title| {
+                if (title.len > 0) {
+                    const activity_at = unixTimestampMs();
+                    const dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return 0;
+                    if (dock.noteActiveTabAgentHistory(activity_at)) self.markDirty();
+                    return activity_at;
+                }
+            }
+        }
 
         // Amp panes created before TUI history had no persisted provider marker.
         // Foreground-process detection is their only identity after restart, so
@@ -16862,7 +16881,6 @@ pub const AppState = struct {
         };
         var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return;
         _ = dock.setActiveTabPinnedProvider(self.allocator, @tagName(thread.provider));
-        _ = dock.setActiveTabPinnedTitle(self.allocator, thread.title);
 
         pane.ref = .{ .terminal = .{ .dock_id = dock_id } };
         pane.minimized = false;

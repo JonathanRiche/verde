@@ -553,6 +553,11 @@ pub const Dock = struct {
         return true;
     }
 
+    pub fn activeTabPinnedTitle(self: *const Dock) ?[]const u8 {
+        const tab = self.activeTabConst() orelse return null;
+        return tab.pinned_title;
+    }
+
     /// Records the provider (tag name) of the agent running in the active tab so
     /// the sidebar can draw its logo after a restart, before the process revives.
     pub fn setActiveTabPinnedProvider(self: *Dock, allocator: std.mem.Allocator, provider: []const u8) bool {
