@@ -11991,13 +11991,24 @@ pub const AppState = struct {
 
     pub fn workspaceAgentTuiHistoryAt(self: *AppState, project_index: usize, dock_id: u32) i64 {
         const provider = self.workspaceAgentTuiProvider(project_index, dock_id) orelse return 0;
-        const existing = if (self.projectTerminalDock(project_index, dock_id)) |dock| dock.activeTabAgentHistoryAt() else 0;
+        const dock_snapshot = self.projectTerminalDock(project_index, dock_id) orelse return 0;
+        const existing = dock_snapshot.activeTabAgentHistoryAt();
         if (existing != 0) return existing;
 
         // Amp panes created before TUI history had no persisted provider marker.
-        // Its lifecycle plugin distinguishes session startup (`idle`) from a
-        // real agent call, so a non-idle surface safely migrates prior activity.
+        // Foreground-process detection is their only identity after restart, so
+        // enroll them when first encountered. Newly created panes are pinned and
+        // still wait for their first submitted prompt below.
         if (provider != .amp) return 0;
+        if (dock_snapshot.activeTabPinnedProvider() == null) {
+            const activity_at = unixTimestampMs();
+            const dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return 0;
+            if (dock.noteActiveTabAgentHistory(activity_at)) self.markDirty();
+            return activity_at;
+        }
+
+        // Programmatic Amp submissions do not pass through terminal key input.
+        // The lifecycle plugin distinguishes startup (`idle`) from a real call.
         const surface = self.projectTerminalSurface(project_index, dock_id) orelse return 0;
         if (surface.status == .idle or surface.status_changed_at_ms == 0) return 0;
         const activity_at = surface.status_changed_at_ms;
