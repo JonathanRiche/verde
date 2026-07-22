@@ -1947,6 +1947,24 @@ pub fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x
     }, clip);
 }
 
+pub fn queuePaletteAgentTuiProviderGlyph(state: *runtime.AppState, provider: native_state.AgentTuiProvider, x: f32, center_y: f32, clip: palette.Rect) void {
+    const terminal_provider: TerminalAgentProvider = switch (provider) {
+        .codex => .codex,
+        .opencode => .opencode,
+        .claude => .claude,
+        .cursor => .cursor,
+        .amp => .amp,
+        .other => return,
+    };
+    const image_size = theme.scaledUi(SIDEBAR_THREAD_PROVIDER_GLYPH_CSS);
+    queuePaletteProviderGlyphInRect(state, terminal_provider, .{
+        .x = x,
+        .y = center_y - image_size * 0.5,
+        .w = image_size,
+        .h = image_size,
+    }, clip);
+}
+
 const TerminalAgentProvider = enum {
     codex,
     opencode,

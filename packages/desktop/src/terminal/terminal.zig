@@ -181,6 +181,7 @@ pub const PersistedTab = struct {
     observed_title: ?[]const u8 = null,
     pinned_title: ?[]const u8 = null,
     pinned_provider: ?[]const u8 = null,
+    agent_history_at: i64 = 0,
     active_pane_id: u32 = 0,
     root_node_id: u32 = 0,
     nodes: []const PersistedNode = &.{},
@@ -334,6 +335,9 @@ pub const Tab = struct {
     /// provider logo after a restart, before the agent process is revived (its
     /// foreground process name isn't available until then).
     pinned_provider: ?[]u8 = null,
+    /// Last user-submitted input in an explicitly tagged agent TUI. A nonzero
+    /// value enrolls this tab in workspace history and survives restarts.
+    agent_history_at: i64 = 0,
     root: *PaneNode,
     active_pane_id: u32,
 
@@ -569,6 +573,19 @@ pub const Dock = struct {
     pub fn activeTabPinnedProvider(self: *const Dock) ?[]const u8 {
         const tab = self.activeTabConst() orelse return null;
         return tab.pinned_provider;
+    }
+
+    pub fn noteActiveTabAgentHistory(self: *Dock, timestamp: i64) bool {
+        const tab = self.activeTab() orelse return false;
+        if (tab.agent_history_at == timestamp) return false;
+        tab.agent_history_at = timestamp;
+        self.workspace_changed = true;
+        return true;
+    }
+
+    pub fn activeTabAgentHistoryAt(self: *const Dock) i64 {
+        const tab = self.activeTabConst() orelse return 0;
+        return tab.agent_history_at;
     }
 
     /// Remembers the active pane's live OSC title on its tab so it can be shown
@@ -1116,6 +1133,7 @@ pub const Dock = struct {
                 .observed_title = if (tab.observed_title) |observed| try arena_allocator.dupe(u8, observed) else null,
                 .pinned_title = if (tab.pinned_title) |pinned| try arena_allocator.dupe(u8, pinned) else null,
                 .pinned_provider = if (tab.pinned_provider) |pinned| try arena_allocator.dupe(u8, pinned) else null,
+                .agent_history_at = tab.agent_history_at,
                 .active_pane_id = tab.active_pane_id,
                 .root_node_id = root_node_id,
                 .nodes = try nodes.toOwnedSlice(arena_allocator),
@@ -1148,6 +1166,7 @@ pub const Dock = struct {
                 .observed_title = if (persisted_tab.observed_title) |observed| try allocator.dupe(u8, observed) else null,
                 .pinned_title = if (persisted_tab.pinned_title) |pinned| try allocator.dupe(u8, pinned) else null,
                 .pinned_provider = if (persisted_tab.pinned_provider) |pinned| try allocator.dupe(u8, pinned) else null,
+                .agent_history_at = persisted_tab.agent_history_at,
                 .root = root,
                 .active_pane_id = persisted_tab.active_pane_id,
             };
@@ -4523,11 +4542,14 @@ test "persisted layout accepts leaves without session metadata" {
         .mouse_event = .any,
         .mouse_format = .sgr,
     }, pane.restored_modes.?);
+    try std.testing.expectEqual(@as(i64, 0), dock.activeTabAgentHistoryAt());
+    try std.testing.expect(dock.noteActiveTabAgentHistory(1_234));
 
     const round_trip_json = (try dock.persistedLayoutJson(allocator)).?;
     defer allocator.free(round_trip_json);
     var round_trip = try std.json.parseFromSlice(PersistedWorkspace, allocator, round_trip_json, .{});
     defer round_trip.deinit();
+    try std.testing.expectEqual(@as(i64, 1_234), round_trip.value.tabs[0].agent_history_at);
     try std.testing.expectEqual(pane.restored_modes.?, round_trip.value.tabs[0].nodes[0].terminal_modes.?);
 }
 

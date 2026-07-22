@@ -116,6 +116,7 @@ const STATIC_COMMANDS = [_]Command{
 };
 
 const ThreadRef = struct { project: usize, thread: usize };
+const AgentTuiRef = struct { project: usize, pane: runtime.WorkspacePaneId };
 
 const ResultRef = union(enum) {
     /// Non-selectable section label.
@@ -123,6 +124,7 @@ const ResultRef = union(enum) {
     /// Index into `STATIC_COMMANDS`.
     command: usize,
     thread: ThreadRef,
+    agent_tui: AgentTuiRef,
     /// Project index for a "Switch to <workspace>" row.
     workspace: usize,
     /// Archived-project index for a "Reopen <workspace>" row.
@@ -364,6 +366,10 @@ pub fn activateRow(state: *runtime.AppState, row_index: usize, split: bool) void
             state.closeCommandPalette();
             openThread(state, tr, split);
         },
+        .agent_tui => |tui| {
+            state.closeCommandPalette();
+            openAgentTuiHistoryEntry(state, tui);
+        },
         .workspace => |pi| {
             state.closeCommandPalette();
             if (pi < state.projects.items.len) {
@@ -598,11 +604,27 @@ fn buildSuggestions(state: *runtime.AppState) void {
     }
 }
 
-/// Sidebar "History" scope: one workspace's committed threads, recency
-/// bucketed when browsing, filtered when searching.
+/// Sidebar "History" scope: one workspace's agent TUIs and committed threads,
+/// recency bucketed when browsing and filtered when searching.
 fn buildScopedHistory(state: *runtime.AppState, project_index: usize, query: []const u8) void {
     if (project_index >= state.projects.items.len) return;
     const project = &state.projects.items[project_index];
+    var agent_header_emitted = false;
+    for (project.workspace_layout.panes.items) |pane| {
+        const dock_id = switch (pane.ref) {
+            .terminal => |ref| ref.dock_id,
+            else => continue,
+        };
+        if (state.workspaceAgentTuiHistoryAt(project_index, dock_id) == 0) continue;
+        const provider = state.workspaceAgentTuiProvider(project_index, dock_id) orelse continue;
+        if (query.len > 0 and !matchAgentTui(state, project_index, dock_id, provider, query)) continue;
+        if (!agent_header_emitted) {
+            appendResult(.{ .header = "AGENT TUIS" });
+            agent_header_emitted = true;
+        }
+        appendResult(.{ .agent_tui = .{ .project = project_index, .pane = pane.id } });
+        if (result_count >= MAX_ROWS) return;
+    }
     const sorted = project.sortedCommittedThreadIndices(state.allocator);
     const now = unixTimestampSeconds();
     var bucket: usize = 0; // 0 = none emitted, 1 = today, 2 = week, 3 = older
@@ -662,6 +684,19 @@ fn buildRanked(state: *runtime.AppState, query: []const u8) void {
                 });
             }
         }
+        for (project.workspace_layout.panes.items) |pane| {
+            const dock_id = switch (pane.ref) {
+                .terminal => |ref| ref.dock_id,
+                else => continue,
+            };
+            if (state.workspaceAgentTuiHistoryAt(pi, dock_id) == 0) continue;
+            const provider = state.workspaceAgentTuiProvider(pi, dock_id) orelse continue;
+            if (!matchAgentTui(state, pi, dock_id, provider, query)) continue;
+            appendCandidate(&candidates, &candidate_count, .{
+                .ref = .{ .agent_tui = .{ .project = pi, .pane = pane.id } },
+                .score = fuzzyScore(agentTuiSearchLabel(provider), query) orelse 200,
+            });
+        }
     }
     for (state.archived_projects.items, 0..) |*project, ai| {
         const label_score = fuzzyScore(project.label, query);
@@ -716,6 +751,24 @@ fn matchThread(thread: anytype, query: []const u8) ?i32 {
         budget -= body.len;
     }
     return null;
+}
+
+fn matchAgentTui(state: *runtime.AppState, project_index: usize, dock_id: u32, provider: AgentProvider, query: []const u8) bool {
+    if (fuzzyScore(agentTuiSearchLabel(provider), query) != null) return true;
+    var title_buf: [96]u8 = undefined;
+    const dock = state.projectTerminalDock(project_index, dock_id) orelse return false;
+    return fuzzyScore(dock.activeProcessLabel(&title_buf), query) != null;
+}
+
+fn agentTuiSearchLabel(provider: AgentProvider) []const u8 {
+    return switch (provider) {
+        .codex => "Codex TUI",
+        .claude => "Claude TUI",
+        .opencode => "OpenCode TUI",
+        .cursor => "Cursor TUI",
+        .amp => "Amp TUI",
+        .other => "Agent TUI",
+    };
 }
 
 /// Case-insensitive scoring: exact substring ranks far above subsequence
@@ -948,6 +1001,25 @@ fn openThread(state: *runtime.AppState, tr: ThreadRef, split: bool) void {
         return;
     }
     state.selectThreadForProject(tr.project, tr.thread);
+}
+
+fn openAgentTuiHistoryEntry(state: *runtime.AppState, tui: AgentTuiRef) void {
+    if (tui.project >= state.projects.items.len) return;
+    var minimized: ?bool = null;
+    for (state.projects.items[tui.project].workspace_layout.panes.items) |pane| {
+        if (pane.id == tui.pane) {
+            minimized = pane.minimized;
+            break;
+        }
+    }
+    const is_minimized = minimized orelse return;
+    state.selected_project_index = tui.project;
+    if (is_minimized) {
+        _ = state.restoreWorkspacePane(tui.project, tui.pane);
+    } else {
+        state.focusWorkspaceOpenPane(tui.project, tui.pane);
+        state.markDirty();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,6 +1413,7 @@ fn renderRows(state: *runtime.AppState) void {
             },
             .command => |ci| renderCommandRow(state, i, ci, rect, row_clip),
             .thread => |tr| renderThreadRow(state, i, tr, rect, row_clip),
+            .agent_tui => |tui| renderAgentTuiRow(state, i, tui, rect, row_clip),
             .workspace => |pi| renderWorkspaceRow(state, i, pi, rect, row_clip),
             .closed_workspace => |ai| renderClosedWorkspaceRow(state, i, ai, rect, row_clip),
         }
@@ -1432,6 +1505,52 @@ fn renderThreadRow(state: *runtime.AppState, row_index: usize, tr: ThreadRef, re
         queueText(state, .{ .x = right, .y = text_y, .w = open_w, .h = font_size * 1.3 }, "open", paletteColor(theme.COLOR_GREEN), theme.scaledUi(12.0), row_clip);
     }
     if (show_workspace) {
+        right -= workspace_w;
+        queueText(state, .{ .x = right, .y = text_y, .w = workspace_w - theme.scaledUi(8.0), .h = font_size * 1.3 }, project.label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
+    }
+}
+
+fn renderAgentTuiRow(state: *runtime.AppState, row_index: usize, tui: AgentTuiRef, rect: palette.Rect, row_clip: palette.Rect) void {
+    renderRowBackground(state, row_index, rect, row_clip);
+    if (tui.project >= state.projects.items.len) return;
+    const project = &state.projects.items[tui.project];
+    var dock_id: ?u32 = null;
+    var minimized = false;
+    for (project.workspace_layout.panes.items) |pane| {
+        if (pane.id != tui.pane) continue;
+        dock_id = switch (pane.ref) {
+            .terminal => |ref| ref.dock_id,
+            else => return,
+        };
+        minimized = pane.minimized;
+        break;
+    }
+    const resolved_dock_id = dock_id orelse return;
+    const provider = state.workspaceAgentTuiProvider(tui.project, resolved_dock_id) orelse return;
+    const emphasis = state.command_palette_selected == row_index;
+    const font_size = theme.scaledUi(13.5);
+    const text_y = rect.y + (rect.h - font_size * 1.3) * 0.5;
+    sidebar.queuePaletteAgentTuiProviderGlyph(state, provider, rect.x + theme.scaledUi(10.0), rect.y + rect.h * 0.5, row_clip);
+
+    var title_buf: [96]u8 = undefined;
+    const title = if (state.projectTerminalDock(tui.project, resolved_dock_id)) |dock|
+        dock.activeProcessLabel(&title_buf)
+    else
+        agentTuiSearchLabel(provider);
+    const status_w = theme.scaledUi(52.0);
+    const workspace_w = if (state.command_palette_scope_project == null) theme.scaledUi(96.0) else 0.0;
+    const title_x = rect.x + theme.scaledUi(42.0);
+    queueText(state, .{
+        .x = title_x,
+        .y = text_y,
+        .w = rect.w - (title_x - rect.x) - workspace_w - status_w - theme.scaledUi(16.0),
+        .h = font_size * 1.3,
+    }, title, paletteColor(if (emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), font_size, row_clip);
+
+    var right = rect.x + rect.w - theme.scaledUi(8.0);
+    right -= status_w;
+    queueText(state, .{ .x = right, .y = text_y, .w = status_w, .h = font_size * 1.3 }, if (minimized) "saved" else "open", paletteColor(if (minimized) theme.COLOR_TEXT_SUBTLE else theme.COLOR_GREEN), theme.scaledUi(12.0), row_clip);
+    if (state.command_palette_scope_project == null) {
         right -= workspace_w;
         queueText(state, .{ .x = right, .y = text_y, .w = workspace_w - theme.scaledUi(8.0), .h = font_size * 1.3 }, project.label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
     }
