@@ -510,11 +510,26 @@ function formatResetText(value) {
 }
 
 function addClaudeLimitLine(lines, label, window) {
-  if (!window || typeof window !== "object") return;
+  if (!window || typeof window !== "object") return false;
   const left = formatPercentLeftFromUtilization(window.utilization);
-  if (left === null) return;
+  if (left === null) return false;
   const reset = formatResetText(window.resets_at);
   lines.push(`• ${label}: ${left}% left${reset ? ` (${reset})` : ""}`);
+  return true;
+}
+
+function addClaudeModelScopedLimitLines(addLimit, limits) {
+  for (const window of Array.isArray(limits.model_scoped) ? limits.model_scoped : []) {
+    const name = typeof window?.display_name === "string" ? window.display_name.trim() : "";
+    if (name) addLimit(`Claude ${name} weekly`, window);
+  }
+
+  for (const window of Array.isArray(limits.limits) ? limits.limits : []) {
+    const name = typeof window?.scope?.model?.display_name === "string" ? window.scope.model.display_name.trim() : "";
+    if (window?.kind === "weekly_scoped" && name) {
+      addLimit(`Claude ${name} weekly`, { utilization: window.percent, resets_at: window.resets_at });
+    }
+  }
 }
 
 function addClaudeRateLimitLines(lines, usage) {
@@ -524,10 +539,17 @@ function addClaudeRateLimitLines(lines, usage) {
     return;
   }
   const beforeCount = lines.length;
-  addClaudeLimitLine(lines, "Claude 5h", limits.five_hour);
-  addClaudeLimitLine(lines, "Claude weekly", limits.seven_day);
-  addClaudeLimitLine(lines, "Claude Opus weekly", limits.seven_day_opus);
-  addClaudeLimitLine(lines, "Claude Sonnet weekly", limits.seven_day_sonnet);
+  const addedLabels = new Set();
+  const addLimit = (label, window) => {
+    const key = label.toLowerCase();
+    if (addedLabels.has(key)) return;
+    if (addClaudeLimitLine(lines, label, window)) addedLabels.add(key);
+  };
+  addLimit("Claude 5h", limits.five_hour);
+  addLimit("Claude weekly", limits.seven_day);
+  addLimit("Claude Opus weekly", limits.seven_day_opus);
+  addLimit("Claude Sonnet weekly", limits.seven_day_sonnet);
+  addClaudeModelScopedLimitLines(addLimit, limits);
   if (lines.length === beforeCount && usage?.rate_limits_available === false) {
     lines.push("• Plan rate limits: unavailable for this Claude account/session type.");
   }
