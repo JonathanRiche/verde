@@ -1274,14 +1274,9 @@ fn openHotkeyWorkspacePane(state: *AppState, kind: HotkeyPaneKind, fallback_axis
     };
 }
 
-// The "new thread" hotkey: while building the 2x2 grid (first four panes) it
-// tiles a fresh chat thread into the next grid slot like the split hotkeys;
-// once the grid is full it falls back to the default behavior (reuse a visible
-// chat pane, otherwise split the focused pane).
+// The new-thread policy and pane placement are shared with the sidebar pencil
+// action so both entry points honor the same setting.
 fn openHotkeyWorkspaceChatThread(state: *AppState) bool {
-    if (workspace_panes_ui.gridNewPanePlacement(state)) |p| {
-        return state.splitCurrentProjectWorkspacePaneWithChatPlacement(p.pane_id, p.axis, p.new_after);
-    }
     state.createThreadForProject(state.selected_project_index);
     return true;
 }
