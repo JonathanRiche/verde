@@ -1956,13 +1956,7 @@ pub fn queuePaletteAgentTuiProviderGlyph(state: *runtime.AppState, provider: nat
         .amp => .amp,
         .other => return,
     };
-    const image_size = theme.scaledUi(SIDEBAR_THREAD_PROVIDER_GLYPH_CSS);
-    queuePaletteProviderGlyphInRect(state, terminal_provider, .{
-        .x = x,
-        .y = center_y - image_size * 0.5,
-        .w = image_size,
-        .h = image_size,
-    }, clip);
+    queuePaletteAgentTerminalGlyph(state, terminal_provider, x, center_y, theme.COLOR_WHITE, clip);
 }
 
 const TerminalAgentProvider = enum {

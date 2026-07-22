@@ -141,6 +141,11 @@ const Candidate = struct {
     score: i32,
 };
 
+const HistoryEntry = struct {
+    ref: ResultRef,
+    at: i64,
+};
+
 /// Per-frame layout + results, rebuilt by `computeLayout` (called both from
 /// the pre-event hit registration and the render pass, so hits and visuals
 /// agree even when state changed between the two).
@@ -609,32 +614,44 @@ fn buildSuggestions(state: *runtime.AppState) void {
 fn buildScopedHistory(state: *runtime.AppState, project_index: usize, query: []const u8) void {
     if (project_index >= state.projects.items.len) return;
     const project = &state.projects.items[project_index];
-    var agent_header_emitted = false;
+    var entries: [MAX_CANDIDATES]HistoryEntry = undefined;
+    var entry_count: usize = 0;
+
     for (project.workspace_layout.panes.items) |pane| {
         const dock_id = switch (pane.ref) {
             .terminal => |ref| ref.dock_id,
             else => continue,
         };
-        if (state.workspaceAgentTuiHistoryAt(project_index, dock_id) == 0) continue;
+        const activity_at_ms = state.workspaceAgentTuiHistoryAt(project_index, dock_id);
+        if (activity_at_ms == 0) continue;
         const provider = state.workspaceAgentTuiProvider(project_index, dock_id) orelse continue;
         if (query.len > 0 and !matchAgentTui(state, project_index, dock_id, provider, query)) continue;
-        if (!agent_header_emitted) {
-            appendResult(.{ .header = "AGENT TUIS" });
-            agent_header_emitted = true;
-        }
-        appendResult(.{ .agent_tui = .{ .project = project_index, .pane = pane.id } });
-        if (result_count >= MAX_ROWS) return;
+        if (entry_count >= entries.len) break;
+        entries[entry_count] = .{
+            .ref = .{ .agent_tui = .{ .project = project_index, .pane = pane.id } },
+            .at = @divTrunc(activity_at_ms, std.time.ms_per_s),
+        };
+        entry_count += 1;
     }
+
     const sorted = project.sortedCommittedThreadIndices(state.allocator);
+    for (sorted) |ti| {
+        if (ti >= project.threads.items.len or entry_count >= entries.len) continue;
+        const thread = &project.threads.items[ti];
+        if (query.len > 0 and matchThread(thread, query) == null) continue;
+        entries[entry_count] = .{
+            .ref = .{ .thread = .{ .project = project_index, .thread = ti } },
+            .at = thread.last_activity_at,
+        };
+        entry_count += 1;
+    }
+
+    std.sort.pdq(HistoryEntry, entries[0..entry_count], {}, historyEntryLessThan);
     const now = unixTimestampSeconds();
     var bucket: usize = 0; // 0 = none emitted, 1 = today, 2 = week, 3 = older
-    for (sorted) |ti| {
-        if (ti >= project.threads.items.len) continue;
-        const thread = &project.threads.items[ti];
-        if (query.len > 0) {
-            if (matchThread(thread, query) == null) continue;
-        } else {
-            const age = now - thread.last_activity_at;
+    for (entries[0..entry_count]) |entry| {
+        if (query.len == 0) {
+            const age = now - entry.at;
             const next_bucket: usize = if (age < 60 * 60 * 24) 1 else if (age < 60 * 60 * 24 * 7) 2 else 3;
             if (next_bucket > bucket) {
                 bucket = next_bucket;
@@ -645,9 +662,13 @@ fn buildScopedHistory(state: *runtime.AppState, project_index: usize, query: []c
                 } });
             }
         }
-        appendResult(.{ .thread = .{ .project = project_index, .thread = ti } });
+        appendResult(entry.ref);
         if (result_count >= MAX_ROWS) break;
     }
+}
+
+fn historyEntryLessThan(_: void, a: HistoryEntry, b: HistoryEntry) bool {
+    return a.at > b.at;
 }
 
 /// Query view: every source scored into one ranked list.
@@ -1538,16 +1559,22 @@ fn renderAgentTuiRow(state: *runtime.AppState, row_index: usize, tui: AgentTuiRe
     else
         agentTuiSearchLabel(provider);
     const status_w = theme.scaledUi(52.0);
+    const time_w = theme.scaledUi(56.0);
     const workspace_w = if (state.command_palette_scope_project == null) theme.scaledUi(96.0) else 0.0;
-    const title_x = rect.x + theme.scaledUi(42.0);
+    const title_x = rect.x + theme.scaledUi(54.0);
     queueText(state, .{
         .x = title_x,
         .y = text_y,
-        .w = rect.w - (title_x - rect.x) - workspace_w - status_w - theme.scaledUi(16.0),
+        .w = rect.w - (title_x - rect.x) - workspace_w - status_w - time_w - theme.scaledUi(16.0),
         .h = font_size * 1.3,
     }, title, paletteColor(if (emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), font_size, row_clip);
 
     var right = rect.x + rect.w - theme.scaledUi(8.0);
+    var time_buf: [24]u8 = undefined;
+    const activity_at = @divTrunc(state.workspaceAgentTuiHistoryAt(tui.project, resolved_dock_id), std.time.ms_per_s);
+    const relative_time = sidebar.formatRelativeTime(&time_buf, activity_at);
+    right -= time_w;
+    queueText(state, .{ .x = right, .y = text_y, .w = time_w, .h = font_size * 1.3 }, relative_time, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
     right -= status_w;
     queueText(state, .{ .x = right, .y = text_y, .w = status_w, .h = font_size * 1.3 }, if (minimized) "saved" else "open", paletteColor(if (minimized) theme.COLOR_TEXT_SUBTLE else theme.COLOR_GREEN), theme.scaledUi(12.0), row_clip);
     if (state.command_palette_scope_project == null) {
