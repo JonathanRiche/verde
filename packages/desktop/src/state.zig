@@ -2623,6 +2623,11 @@ fn agentTuiProviderLabel(provider: ?stack_config.AgentProvider) []const u8 {
     };
 }
 
+fn supportedAgentTuiProviderFromName(name: []const u8) ?stack_config.AgentProvider {
+    const provider = std.meta.stringToEnum(stack_config.AgentProvider, name) orelse return null;
+    return if (defaultAgentTui(provider) != null) provider else null;
+}
+
 pub const WorkspaceSplitAxis = enum {
     horizontal,
     vertical,
@@ -11950,6 +11955,31 @@ pub const AppState = struct {
         return null;
     }
 
+    /// Returns the supported agent provider explicitly associated with a TUI
+    /// dock. Generic terminals are deliberately not inferred from their live
+    /// foreground process, so they never become workspace history entries.
+    pub fn workspaceAgentTuiProvider(self: *const AppState, project_index: usize, dock_id: u32) ?AgentTuiProvider {
+        if (project_index >= self.projects.items.len) return null;
+        if (self.projectTerminalDock(project_index, dock_id)) |dock| {
+            if (dock.activeTabPinnedProvider()) |name| {
+                if (supportedAgentTuiProviderFromName(name)) |provider| return provider;
+            }
+        }
+        const project = &self.projects.items[project_index];
+        for (project.managed_processes.items) |process| {
+            if (process.kind != .agent or process.dock_id != dock_id) continue;
+            const provider = process.provider orelse continue;
+            if (defaultAgentTui(provider) != null) return provider;
+        }
+        return null;
+    }
+
+    pub fn workspaceAgentTuiHistoryAt(self: *const AppState, project_index: usize, dock_id: u32) i64 {
+        if (self.workspaceAgentTuiProvider(project_index, dock_id) == null) return 0;
+        const dock = self.projectTerminalDock(project_index, dock_id) orelse return 0;
+        return dock.activeTabAgentHistoryAt();
+    }
+
     pub fn focusedWorkspaceTerminalDockId(self: *const AppState) ?u32 {
         if (self.projects.items.len == 0) return null;
         const layout = &self.projects.items[self.selected_project_index].workspace_layout;
@@ -14681,8 +14711,12 @@ pub const AppState = struct {
                 else => {},
             }
         }
+        const is_agent_tui = self.workspaceAgentTuiProvider(self.selected_project_index, dock_id) != null;
         var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
         const handled = dock.handleKeyDown(self.allocator, keyboard, event);
+        if (handled and is_agent_tui and (event.key == .@"return" or event.key == .kp_enter)) {
+            if (dock.noteActiveTabAgentHistory(unixTimestampMs())) self.markDirty();
+        }
         if (dock.consumeWorkspaceChange()) self.markDirty();
         if (handled) self.noteTerminalInputActivity();
         return handled;
@@ -15405,6 +15439,9 @@ pub const AppState = struct {
         process.next_restart_ms = 0;
         process.pending_watch_restart_ms = 0;
         process.explicit_stop = false;
+        if (process.provider) |provider| {
+            _ = dock.setActiveTabPinnedProvider(self.allocator, @tagName(provider));
+        }
         if (process.kind == .agent and process.notify) {
             if (dock.activeSessionId()) |session_id| {
                 _ = try self.updateSurface(.{
@@ -15521,6 +15558,7 @@ pub const AppState = struct {
             return false;
         };
         var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
+        _ = dock.setActiveTabPinnedProvider(self.allocator, @tagName(stack_config.AgentProvider.amp));
 
         layout = &project.workspace_layout;
         const new_pane_id = layout.createTerminalPane(self.allocator, dock_id) catch |err| {
@@ -16372,6 +16410,16 @@ pub const AppState = struct {
             self.setSidebarNotice("Cannot close the last workspace pane.");
             return false;
         }
+        if (layout.paneById(pane_id)) |pane| {
+            switch (pane.ref) {
+                .terminal => |ref| if (self.workspaceAgentTuiHistoryAt(project_index, ref.dock_id) != 0) {
+                    if (!self.minimizeWorkspacePane(project_index, pane_id)) return false;
+                    self.setSidebarNotice("Agent TUI saved to workspace history.");
+                    return true;
+                },
+                else => {},
+            }
+        }
         var removed_ref = layout.closePane(self.allocator, pane_id) orelse return false;
         defer deinitWorkspacePaneRef(&removed_ref, self.allocator);
         switch (removed_ref) {
@@ -16776,6 +16824,8 @@ pub const AppState = struct {
             return;
         };
         var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return;
+        _ = dock.setActiveTabPinnedProvider(self.allocator, @tagName(thread.provider));
+        _ = dock.setActiveTabPinnedTitle(self.allocator, thread.title);
 
         pane.ref = .{ .terminal = .{ .dock_id = dock_id } };
         pane.minimized = false;
