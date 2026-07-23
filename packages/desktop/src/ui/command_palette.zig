@@ -118,7 +118,7 @@ const STATIC_COMMANDS = [_]Command{
 };
 
 const ThreadRef = struct { project: usize, thread: usize };
-const AgentTuiRef = struct { project: usize, pane: runtime.WorkspacePaneId };
+const AgentTuiRef = struct { project: usize, dock: u32 };
 
 const ResultRef = union(enum) {
     /// Non-selectable section label.
@@ -619,18 +619,16 @@ fn buildScopedHistory(state: *runtime.AppState, project_index: usize, query: []c
     var entries: [MAX_CANDIDATES]HistoryEntry = undefined;
     var entry_count: usize = 0;
 
-    for (project.workspace_layout.panes.items) |pane| {
-        const dock_id = switch (pane.ref) {
-            .terminal => |ref| ref.dock_id,
-            else => continue,
-        };
+    const dock_count = project.terminal_docks.items.len + 1;
+    for (0..dock_count) |dock_index| {
+        const dock_id: u32 = if (dock_index == 0) 0 else project.terminal_docks.items[dock_index - 1].id;
         const activity_at_ms = state.workspaceAgentTuiHistoryAt(project_index, dock_id);
         if (activity_at_ms == 0) continue;
         const provider = state.workspaceAgentTuiProvider(project_index, dock_id) orelse continue;
         if (query.len > 0 and !matchAgentTui(state, project_index, dock_id, provider, query)) continue;
         if (entry_count >= entries.len) break;
         entries[entry_count] = .{
-            .ref = .{ .agent_tui = .{ .project = project_index, .pane = pane.id } },
+            .ref = .{ .agent_tui = .{ .project = project_index, .dock = dock_id } },
             .at = @divTrunc(activity_at_ms, std.time.ms_per_s),
         };
         entry_count += 1;
@@ -707,16 +705,14 @@ fn buildRanked(state: *runtime.AppState, query: []const u8) void {
                 });
             }
         }
-        for (project.workspace_layout.panes.items) |pane| {
-            const dock_id = switch (pane.ref) {
-                .terminal => |ref| ref.dock_id,
-                else => continue,
-            };
+        const dock_count = project.terminal_docks.items.len + 1;
+        for (0..dock_count) |dock_index| {
+            const dock_id: u32 = if (dock_index == 0) 0 else project.terminal_docks.items[dock_index - 1].id;
             if (state.workspaceAgentTuiHistoryAt(pi, dock_id) == 0) continue;
             const provider = state.workspaceAgentTuiProvider(pi, dock_id) orelse continue;
             if (!matchAgentTui(state, pi, dock_id, provider, query)) continue;
             appendCandidate(&candidates, &candidate_count, .{
-                .ref = .{ .agent_tui = .{ .project = pi, .pane = pane.id } },
+                .ref = .{ .agent_tui = .{ .project = pi, .dock = dock_id } },
                 .score = fuzzyScore(agentTuiSearchLabel(provider), query) orelse 200,
             });
         }
@@ -1027,13 +1023,7 @@ fn openThread(state: *runtime.AppState, tr: ThreadRef, split: bool) void {
 }
 
 fn openAgentTuiHistoryEntry(state: *runtime.AppState, tui: AgentTuiRef) void {
-    if (tui.project >= state.projects.items.len) return;
-    for (state.projects.items[tui.project].workspace_layout.panes.items) |pane| {
-        if (pane.id != tui.pane) continue;
-        state.focusWorkspaceOpenPane(tui.project, tui.pane);
-        state.markDirty();
-        return;
-    }
+    _ = state.openWorkspaceAgentTuiHistory(tui.project, tui.dock);
 }
 
 // ---------------------------------------------------------------------------
@@ -1532,31 +1522,32 @@ fn renderThreadRow(state: *runtime.AppState, row_index: usize, tr: ThreadRef, re
     }
 }
 
+// History row for a saved agent TUI terminal session.
 fn renderAgentTuiRow(state: *runtime.AppState, row_index: usize, tui: AgentTuiRef, rect: palette.Rect, row_clip: palette.Rect) void {
     renderRowBackground(state, row_index, rect, row_clip);
     if (tui.project >= state.projects.items.len) return;
     const project = &state.projects.items[tui.project];
-    var dock_id: ?u32 = null;
-    for (project.workspace_layout.panes.items) |pane| {
-        if (pane.id != tui.pane) continue;
-        dock_id = switch (pane.ref) {
-            .terminal => |ref| ref.dock_id,
-            else => return,
-        };
-        break;
-    }
-    const resolved_dock_id = dock_id orelse return;
-    const provider = state.workspaceAgentTuiProvider(tui.project, resolved_dock_id) orelse return;
+    const provider = state.workspaceAgentTuiProvider(tui.project, tui.dock) orelse return;
     const emphasis = state.command_palette_selected == row_index;
     const font_size = theme.scaledUi(13.5);
     const text_y = rect.y + (rect.h - font_size * 1.3) * 0.5;
     sidebar.queuePaletteAgentTuiProviderGlyph(state, provider, rect.x + theme.scaledUi(10.0), rect.y + rect.h * 0.5, row_clip);
 
     var title_buf: [96]u8 = undefined;
-    const title = if (state.projectTerminalDock(tui.project, resolved_dock_id)) |dock|
+    const title = if (state.projectTerminalDock(tui.project, tui.dock)) |dock|
         dock.activeProcessLabel(&title_buf)
     else
         agentTuiSearchLabel(provider);
+    var is_open = false;
+    for (project.workspace_layout.panes.items) |pane| {
+        switch (pane.ref) {
+            .terminal => |ref| if (ref.dock_id == tui.dock) {
+                is_open = true;
+                break;
+            },
+            else => {},
+        }
+    }
     const status_w = theme.scaledUi(52.0);
     const time_w = theme.scaledUi(56.0);
     const workspace_w = if (state.command_palette_scope_project == null) theme.scaledUi(96.0) else 0.0;
@@ -1570,12 +1561,12 @@ fn renderAgentTuiRow(state: *runtime.AppState, row_index: usize, tui: AgentTuiRe
 
     var right = rect.x + rect.w - theme.scaledUi(8.0);
     var time_buf: [24]u8 = undefined;
-    const activity_at = @divTrunc(state.workspaceAgentTuiHistoryAt(tui.project, resolved_dock_id), std.time.ms_per_s);
+    const activity_at = @divTrunc(state.workspaceAgentTuiHistoryAt(tui.project, tui.dock), std.time.ms_per_s);
     const relative_time = sidebar.formatRelativeTime(&time_buf, activity_at);
     right -= time_w;
     queueText(state, .{ .x = right, .y = text_y, .w = time_w, .h = font_size * 1.3 }, relative_time, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
     right -= status_w;
-    queueText(state, .{ .x = right, .y = text_y, .w = status_w, .h = font_size * 1.3 }, "open", paletteColor(theme.COLOR_GREEN), theme.scaledUi(12.0), row_clip);
+    queueText(state, .{ .x = right, .y = text_y, .w = status_w, .h = font_size * 1.3 }, if (is_open) "open" else "saved", paletteColor(if (is_open) theme.COLOR_GREEN else theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
     if (state.command_palette_scope_project == null) {
         right -= workspace_w;
         queueText(state, .{ .x = right, .y = text_y, .w = workspace_w - theme.scaledUi(8.0), .h = font_size * 1.3 }, project.label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);

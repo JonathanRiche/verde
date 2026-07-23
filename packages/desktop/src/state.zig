@@ -12011,6 +12011,34 @@ pub const AppState = struct {
         return activity_at;
     }
 
+    /// Recreates a workspace pane around a saved agent TUI dock. The dock and
+    /// its session outlive pane closure, so this reattaches instead of starting
+    /// a second provider process.
+    pub fn openWorkspaceAgentTuiHistory(self: *AppState, project_index: usize, dock_id: u32) bool {
+        if (project_index >= self.projects.items.len) return false;
+        if (self.workspaceAgentTuiHistoryAt(project_index, dock_id) == 0) return false;
+        if (self.projectTerminalDock(project_index, dock_id) == null) return false;
+
+        self.selected_project_index = project_index;
+        self.ensureCurrentProjectWorkspace();
+        var project = &self.projects.items[project_index];
+        const pane_id = project.workspace_layout.ensureTerminalPane(self.allocator, dock_id) catch {
+            self.setSidebarNotice("Failed to reopen agent TUI.");
+            return false;
+        };
+        project.workspace_layout.maximized_pane_id = null;
+        if (project.managedProcessByDockId(dock_id)) |process| process.pane_id = pane_id;
+        if (self.projectTerminalDock(project_index, dock_id)) |dock| {
+            if (dock.activeSessionId()) |session_id| {
+                if (self.surfaceBySessionId(session_id)) |surface| surface.pane_id = pane_id;
+            }
+        }
+        self.requestTerminalDockFocus(dock_id);
+        self.setSidebarNotice("Agent TUI reopened from history.");
+        self.markDirty();
+        return true;
+    }
+
     pub fn focusedWorkspaceTerminalDockId(self: *const AppState) ?u32 {
         if (self.projects.items.len == 0) return null;
         const layout = &self.projects.items[self.selected_project_index].workspace_layout;
@@ -16396,7 +16424,8 @@ pub const AppState = struct {
         switch (removed_ref) {
             .chat => self.setSidebarNotice("Chat pane closed."),
             .terminal => |ref| {
-                if (!layout.hasTerminalDockPane(ref.dock_id)) {
+                const preserve_agent_history = self.workspaceAgentTuiHistoryAt(project_index, ref.dock_id) != 0;
+                if (!layout.hasTerminalDockPane(ref.dock_id) and !preserve_agent_history) {
                     if (ref.dock_id == 0) {
                         project.terminal_dock.terminateAllSessions();
                         project.terminal_dock.visible = false;
@@ -16405,8 +16434,11 @@ pub const AppState = struct {
                         _ = project.removeTerminalDockById(self.allocator, ref.dock_id);
                     }
                 }
+                if (preserve_agent_history) {
+                    if (project.managedProcessByDockId(ref.dock_id)) |process| process.pane_id = null;
+                }
                 if (self.selected_project_index == project_index and !layout.hasVisiblePaneKind(.terminal)) self.terminal_focused = false;
-                self.setSidebarNotice("Terminal pane closed.");
+                self.setSidebarNotice(if (preserve_agent_history) "Agent TUI closed. Reopen it from History." else "Terminal pane closed.");
             },
             .browser => {
                 self.browser_state.setControlsVisible(false);
