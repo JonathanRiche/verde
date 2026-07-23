@@ -88,7 +88,7 @@ follow-ups, approvals, and transcript preferences.
 
 ## Tile a browser pane
 
-Press `Ctrl+B` to toggle the embedded browser pane next to the focused chat. On
+Press `Ctrl+Shift+B` to toggle the embedded browser pane next to the focused chat. On
 Linux it uses WPE WebKit, on macOS WKWebView, on Windows WebView2 — never a
 bundled Chromium. Use it to keep docs, a preview server, or a staging URL in
 view while the agent works.

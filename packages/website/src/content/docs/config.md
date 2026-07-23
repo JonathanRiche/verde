@@ -55,7 +55,7 @@ file. It is read on startup and on app refresh.
   },
   "keybinds": {
     "new_thread": "CommandOrControl+T",
-    "browser": "Ctrl+B",
+    "browser": "Ctrl+Shift+B",
     "workspace": {
       "focus_up": "Ctrl+K",
       "focus_down": "Ctrl+J",

@@ -111,7 +111,7 @@ replaces it, like other terminal content.
 
 ## The browser pane
 
-Press `Ctrl+B` to toggle the embedded browser pane next to the focused chat.
+Press `Ctrl+Shift+B` to toggle the embedded browser pane next to the focused chat.
 The backend is the host platform's native webview: WPE WebKit on Linux,
 WKWebView on macOS, WebView2 on Windows. No bundled Chromium.
 

@@ -696,7 +696,7 @@ Example config:
     "new_thread": "CommandOrControl+T",
     "sidebar": "CommandOrControl+S",
     "sidebar_hidden": "Ctrl+Shift+S",
-    "browser": "Ctrl+B",
+    "browser": "Ctrl+Shift+B",
     "chat": {
       "model_picker": "Alt+M",
       "run_config": "Alt+R"

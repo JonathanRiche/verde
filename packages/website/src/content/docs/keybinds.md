@@ -30,7 +30,7 @@ below.
 | -------------------------- | ------------------------------------- |
 | `Ctrl+S` / `Cmd+S`          | Toggle the sidebar (visible ↔ icon)   |
 | `Ctrl+Shift+S`             | Toggle the sidebar's hidden mode      |
-| `Ctrl+B`                    | Toggle the embedded browser pane      |
+| `Ctrl+Shift+B`              | Toggle the embedded browser pane      |
 | `Tab`                       | Inside a chat pane, focus the prompt box |
 | `Ctrl+Tab`                  | Focus the next pane in sidebar order     |
 | `Ctrl+Shift+Tab`            | Focus the previous pane in sidebar order |
@@ -124,7 +124,7 @@ shortcuts on the same action:
 {
   "keybinds": {
     "new_thread": "CommandOrControl+T",
-    "browser": "Ctrl+B",
+    "browser": "Ctrl+Shift+B",
     "workspace": {
       "close_current": "CommandOrControl+Shift+W",
       "focus_up": "Ctrl+K",
