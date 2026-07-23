@@ -1502,14 +1502,19 @@ fn writePane(s: *std.json.Stringify, state: *app_state.AppState, project_index: 
                 if (thread.model_ref) |model| try s.write(model) else try s.write(null);
                 try s.objectField("send_pending");
                 try s.write(thread.isSendPendingForUi());
+                try s.objectField("completion_pending");
+                try s.write(thread.completion_pending);
+                try s.objectField("completed_at_ms");
+                if (thread.completion_pending) try s.write(thread.completed_at_ms) else try s.write(null);
                 const pending_approval = threadHasPendingApproval(thread);
                 try s.objectField("pending_approval");
                 try s.write(pending_approval);
                 try s.objectField("attention");
-                try s.write(pending_approval);
+                try s.write(pending_approval or thread.completion_pending);
                 try s.objectField("attention_reasons");
                 try s.beginArray();
                 if (pending_approval) try s.write("pending_approval");
+                if (thread.completion_pending) try s.write("completed");
                 try s.endArray();
             }
         },
@@ -1560,6 +1565,10 @@ fn writeThreadSummary(s: *std.json.Stringify, thread: app_state.ChatThread, inde
     try s.write(thread.messages.items.len);
     try s.objectField("send_pending");
     try s.write(thread.isSendPendingForUi());
+    try s.objectField("completion_pending");
+    try s.write(thread.completion_pending);
+    try s.objectField("completed_at_ms");
+    if (thread.completion_pending) try s.write(thread.completed_at_ms) else try s.write(null);
     try s.endObject();
 }
 
@@ -1843,7 +1852,7 @@ fn writeBackgroundWorkspaceProcesses(
         try s.objectField("command");
         try s.write(task.command);
         try s.objectField("cwd");
-        try s.write(project.path);
+        try s.write(task.cwd orelse project.path);
         try s.objectField("status");
         try s.write(@tagName(task.status));
         try s.objectField("classification");
@@ -1854,6 +1863,8 @@ fn writeBackgroundWorkspaceProcesses(
         if (task.pid) |pid| try s.write(pid) else try s.write(null);
         try s.objectField("process_group");
         if (task.pid) |pid| try s.write(pid) else try s.write(null);
+        try s.objectField("provider_process_id");
+        if (task.process_id) |provider_process_id| try s.write(provider_process_id) else try s.write(null);
         try s.objectField("started_at_ms");
         try s.write(task.started_at_ms);
         try s.objectField("updated_at_ms");
@@ -2614,6 +2625,12 @@ fn writeSurface(s: *std.json.Stringify, surface: *const app_state.SurfaceState) 
     try s.write(surface.title);
     try s.objectField("status");
     try s.write(@tagName(surface.status));
+    try s.objectField("display_status");
+    try s.write(@tagName(surface.displayStatus()));
+    try s.objectField("completion_pending");
+    try s.write(surface.completion_pending);
+    try s.objectField("completed_at_ms");
+    if (surface.completion_pending) try s.write(surface.completed_at_ms) else try s.write(null);
     try s.objectField("progress");
     if (surface.progress) |value| try s.write(value) else try s.write(null);
     try s.objectField("attention");

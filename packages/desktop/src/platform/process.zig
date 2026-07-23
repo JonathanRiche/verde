@@ -181,6 +181,38 @@ pub fn processIdIsAlive(pid: u32) bool {
     return true;
 }
 
+/// Requests graceful termination of a persisted detached process tree.
+/// Success means the operating system accepted the request, not that the
+/// process has already exited; callers should continue polling liveness.
+pub fn terminateProcessIdTree(pid: u32) !void {
+    if (pid == 0) return error.InvalidProcessId;
+    if (builtin.os.tag == .windows) {
+        var pid_buffer: [16]u8 = undefined;
+        const pid_text = std.fmt.bufPrint(&pid_buffer, "{d}", .{pid}) catch return error.InvalidProcessId;
+        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        var child = try spawn(std.heap.page_allocator, threaded.io(), .{
+            .argv = &.{ "taskkill.exe", "/PID", pid_text, "/T" },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+            .own_process_tree = false,
+        });
+        const term = try child.wait(threaded.io());
+        switch (term) {
+            .exited => |code| if (code != 0) return error.TerminationFailed,
+            else => return error.TerminationFailed,
+        }
+        return;
+    }
+    if (builtin.os.tag == .wasi) return error.UnsupportedPlatform;
+    const native_pid = std.math.cast(std.posix.pid_t, pid) orelse return error.InvalidProcessId;
+    std.posix.kill(-native_pid, .TERM) catch |err| switch (err) {
+        error.ProcessNotFound => try std.posix.kill(native_pid, .TERM),
+        else => return err,
+    };
+}
+
 const win32 = if (builtin.os.tag == .windows) struct {
     const BasicLimitInformation = extern struct {
         per_process_user_time_limit: windows.LARGE_INTEGER,

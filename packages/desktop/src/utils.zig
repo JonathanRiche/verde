@@ -1643,6 +1643,21 @@ fn handleSendStreamEvent(context: ?*anyopaque, event: ai_harness.StreamEvent) vo
             send_state.ui_revision +%= 1;
             loop_wakeup.notify();
         },
+        .tool_call => |tool_call| {
+            // Content-less reasoning drives the "Thinking" header indicator
+            // instead of a timeline row, so no text flush either: nothing is
+            // inserted into the transcript.
+            if (transientThinkStatus(tool_call)) |thinking| {
+                send_state.thinking = thinking;
+                send_state.ui_revision +%= 1;
+                loop_wakeup.notify();
+                return;
+            }
+            flushPendingAssistantTextLocked(send_state, page_alloc);
+            upsertPendingToolCallEvent(page_alloc, &send_state.pending_events, tool_call) catch return;
+            send_state.ui_revision +%= 1;
+            loop_wakeup.notify();
+        },
         .diff => |diff| {
             flushPendingAssistantTextLocked(send_state, page_alloc);
             mergePendingDiffFilesLocked(page_alloc, &send_state.pending_diff_files, diff.files);
@@ -1650,6 +1665,253 @@ fn handleSendStreamEvent(context: ?*anyopaque, event: ai_harness.StreamEvent) vo
             loop_wakeup.notify();
         },
     }
+}
+
+fn toolCallDefaultTitle(tool_call: ai_harness.ToolCallUpdate) []const u8 {
+    return switch (tool_call.kind orelse .other) {
+        .read => "Read",
+        .edit => "Edit",
+        .delete => "Delete",
+        .move => "Move",
+        .search => "Search",
+        .execute => if ((tool_call.status orelse .unknown) == .failed) "Command failed" else "Ran command",
+        .think => switch (tool_call.status orelse .unknown) {
+            // Live reasoning reads as an activity ("Thinking"), not a noun.
+            .pending, .in_progress => "Thinking",
+            else => "Think",
+        },
+        .fetch => "Fetch",
+        .mcp => "MCP tool",
+        .other => "Cursor tool",
+    };
+}
+
+fn isGenericMcpToolTitle(title: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(title, "MCP: tool") or
+        std.ascii.eqlIgnoreCase(title, "MCP tool");
+}
+
+fn toolCallDisplayAuthor(tool_call: ai_harness.ToolCallUpdate) []const u8 {
+    const title = std.mem.trim(u8, tool_call.title, &std.ascii.whitespace);
+    if ((tool_call.kind orelse .other) == .mcp and title.len > 0 and !isGenericMcpToolTitle(title)) {
+        return title;
+    }
+    return toolCallDefaultTitle(tool_call);
+}
+
+fn toolCallBodyAlloc(allocator: std.mem.Allocator, tool_call: ai_harness.ToolCallUpdate) !?[]u8 {
+    const Field = struct {
+        label: []const u8,
+        value: ?[]const u8,
+    };
+    const fields = [_]Field{
+        .{ .label = "Input", .value = tool_call.input },
+        .{ .label = "Output", .value = tool_call.output },
+        .{ .label = "Error", .value = tool_call.error_text },
+        .{ .label = "Locations", .value = tool_call.locations },
+    };
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var wrote = false;
+    const title = std.mem.trim(u8, tool_call.title, &std.ascii.whitespace);
+    const generic_mcp_title = (tool_call.kind orelse .other) == .mcp and isGenericMcpToolTitle(title);
+    if (title.len > 0 and !generic_mcp_title and !std.mem.eql(u8, title, toolCallDisplayAuthor(tool_call))) {
+        try writer.writer.print("Tool:\n{s}", .{title});
+        wrote = true;
+    }
+    for (fields) |field| {
+        const value = field.value orelse continue;
+        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+        if (trimmed.len == 0) continue;
+        if (wrote) try writer.writer.writeAll("\n\n");
+        try writer.writer.print("{s}:\n{s}", .{ field.label, trimmed });
+        wrote = true;
+    }
+    if (!wrote) {
+        const raw = tool_call.raw orelse {
+            writer.deinit();
+            return null;
+        };
+        const trimmed = std.mem.trim(u8, raw, &std.ascii.whitespace);
+        if (trimmed.len == 0) {
+            writer.deinit();
+            return null;
+        }
+        try writer.writer.print("Raw event:\n{s}", .{trimmed});
+    }
+    return try writer.toOwnedSlice();
+}
+
+fn hasVisibleText(value: ?[]const u8) bool {
+    const text = value orelse return false;
+    return std.mem.trim(u8, text, &std.ascii.whitespace).len > 0;
+}
+
+fn hasToolCallContent(input: ?[]const u8, output: ?[]const u8, error_text: ?[]const u8) bool {
+    return hasVisibleText(input) or hasVisibleText(output) or hasVisibleText(error_text);
+}
+
+/// Detects content-less think lifecycle updates. These carry pure liveness
+/// ("the model is reasoning right now"), so the pending stream header shows
+/// them next to the elapsed-time label instead of a transcript row. Returns
+/// whether reasoning is currently active, or null for think updates that
+/// carry real thought content (those stay timeline rows).
+pub fn transientThinkStatus(tool_call: ai_harness.ToolCallUpdate) ?bool {
+    if ((tool_call.kind orelse .other) != .think) return null;
+    if (hasToolCallContent(tool_call.input, tool_call.output, tool_call.error_text)) return null;
+    return switch (tool_call.status orelse .unknown) {
+        .pending, .in_progress => true,
+        else => false,
+    };
+}
+
+/// A think row without thought content is pure liveness feedback ("Thinking");
+/// once its terminal status lands there is nothing left worth keeping, so the
+/// row disappears instead of persisting as a confusing "Think - completed".
+fn isTransientThinkTerminal(
+    kind: ?ai_harness.ToolCallKind,
+    status: ?ai_harness.ToolCallStatus,
+    input: ?[]const u8,
+    output: ?[]const u8,
+    error_text: ?[]const u8,
+) bool {
+    if ((kind orelse .other) != .think) return false;
+    switch (status orelse .unknown) {
+        .completed, .failed, .cancelled => {},
+        else => return false,
+    }
+    return !hasToolCallContent(input, output, error_text);
+}
+
+/// Content-less rows need a placeholder body. Think rows use a quiet ellipsis:
+/// the raw status tagName both reads poorly next to "Thinking" and matches the
+/// status-only-row hiding in the transcript renderer.
+fn toolCallFallbackBody(kind: ?ai_harness.ToolCallKind, status: ?ai_harness.ToolCallStatus) []const u8 {
+    if ((kind orelse .other) == .think) return "…";
+    return @tagName(status orelse .unknown);
+}
+
+/// Upserts a provider tool-call lifecycle update by stable call identity.
+///
+/// Updates may omit title/content, so existing useful fields are retained
+/// while status/kind advance. An empty call ID is treated as an append-only
+/// compatibility event because it cannot be correlated safely.
+pub fn upsertPendingToolCallEvent(
+    allocator: std.mem.Allocator,
+    events: *std.ArrayListUnmanaged(app_state.PendingTimelineEvent),
+    tool_call: ai_harness.ToolCallUpdate,
+) !void {
+    if (tool_call.call_id.len > 0) {
+        for (events.items, 0..) |*existing, index| {
+            const existing_id = existing.tool_call_id orelse continue;
+            if (!std.mem.eql(u8, existing_id, tool_call.call_id)) continue;
+
+            if (std.mem.trim(u8, tool_call.title, &std.ascii.whitespace).len > 0) {
+                try replaceOptionalOwned(allocator, &existing.tool_call_title, tool_call.title);
+            }
+            if (tool_call.input) |value| try replaceOptionalOwned(allocator, &existing.tool_call_input, value);
+            if (tool_call.output) |value| try replaceOptionalOwned(allocator, &existing.tool_call_output, value);
+            if (tool_call.error_text) |value| try replaceOptionalOwned(allocator, &existing.tool_call_error, value);
+            if (tool_call.locations) |value| try replaceOptionalOwned(allocator, &existing.tool_call_locations, value);
+            if (tool_call.raw) |value| try replaceOptionalOwned(allocator, &existing.tool_call_raw, value);
+            if (tool_call.kind) |kind| existing.tool_call_kind = kind;
+            if (tool_call.status) |status| existing.tool_call_status = status;
+
+            if (isTransientThinkTerminal(
+                existing.tool_call_kind,
+                existing.tool_call_status,
+                existing.tool_call_input,
+                existing.tool_call_output,
+                existing.tool_call_error,
+            )) {
+                freePendingTimelineEvent(allocator, existing.*);
+                _ = events.orderedRemove(index);
+                return;
+            }
+
+            const merged: ai_harness.ToolCallUpdate = .{
+                .call_id = existing_id,
+                .title = existing.tool_call_title orelse "",
+                .kind = existing.tool_call_kind,
+                .status = existing.tool_call_status,
+                .input = existing.tool_call_input,
+                .output = existing.tool_call_output,
+                .error_text = existing.tool_call_error,
+                .locations = existing.tool_call_locations,
+                .raw = existing.tool_call_raw,
+            };
+            const owned_author = try allocator.dupe(u8, toolCallDisplayAuthor(merged));
+            errdefer allocator.free(owned_author);
+            const owned_body = (try toolCallBodyAlloc(allocator, merged)) orelse try allocator.dupe(u8, toolCallFallbackBody(merged.kind, merged.status));
+            errdefer allocator.free(owned_body);
+            allocator.free(existing.author);
+            allocator.free(existing.body);
+            existing.author = owned_author;
+            existing.body = owned_body;
+            return;
+        }
+    }
+
+    // A terminal think event with no prior row (e.g. attach-tail replay)
+    // would only materialize the row we intend to drop; skip it entirely.
+    if (isTransientThinkTerminal(tool_call.kind, tool_call.status, tool_call.input, tool_call.output, tool_call.error_text)) return;
+
+    const body = try toolCallBodyAlloc(allocator, tool_call);
+    errdefer if (body) |owned| allocator.free(owned);
+    const title = toolCallDisplayAuthor(tool_call);
+    const owned_author = try allocator.dupe(u8, title);
+    errdefer allocator.free(owned_author);
+    const owned_body = body orelse try allocator.dupe(u8, toolCallFallbackBody(tool_call.kind, tool_call.status));
+    errdefer allocator.free(owned_body);
+    const owned_call_id = if (tool_call.call_id.len > 0)
+        try allocator.dupe(u8, tool_call.call_id)
+    else
+        null;
+    errdefer if (owned_call_id) |id| allocator.free(id);
+    const owned_title = try dupeOptionalNonEmpty(allocator, tool_call.title);
+    errdefer if (owned_title) |value| allocator.free(value);
+    const owned_input = try dupeOptional(allocator, tool_call.input);
+    errdefer if (owned_input) |value| allocator.free(value);
+    const owned_output = try dupeOptional(allocator, tool_call.output);
+    errdefer if (owned_output) |value| allocator.free(value);
+    const owned_error = try dupeOptional(allocator, tool_call.error_text);
+    errdefer if (owned_error) |value| allocator.free(value);
+    const owned_locations = try dupeOptional(allocator, tool_call.locations);
+    errdefer if (owned_locations) |value| allocator.free(value);
+    const owned_raw = try dupeOptional(allocator, tool_call.raw);
+    errdefer if (owned_raw) |value| allocator.free(value);
+
+    try events.append(allocator, .{
+        .role = .system,
+        .author = owned_author,
+        .body = owned_body,
+        .tool_call_id = owned_call_id,
+        .tool_call_kind = tool_call.kind orelse .other,
+        .tool_call_status = tool_call.status orelse .unknown,
+        .tool_call_title = owned_title,
+        .tool_call_input = owned_input,
+        .tool_call_output = owned_output,
+        .tool_call_error = owned_error,
+        .tool_call_locations = owned_locations,
+        .tool_call_raw = owned_raw,
+    });
+}
+
+fn replaceOptionalOwned(allocator: std.mem.Allocator, target: *?[]u8, value: []const u8) !void {
+    const owned = try allocator.dupe(u8, value);
+    if (target.*) |old| allocator.free(old);
+    target.* = owned;
+}
+
+fn dupeOptional(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
+    const text = value orelse return null;
+    return try allocator.dupe(u8, text);
+}
+
+fn dupeOptionalNonEmpty(allocator: std.mem.Allocator, value: []const u8) !?[]u8 {
+    if (std.mem.trim(u8, value, &std.ascii.whitespace).len == 0) return null;
+    return try allocator.dupe(u8, value);
 }
 
 fn handleSendFailure(context: ?*anyopaque, message: []const u8) void {
@@ -1797,15 +2059,24 @@ pub fn freePendingApprovalLocked(allocator: std.mem.Allocator, approval: *?app_s
     freePendingApproval(allocator, approval);
 }
 
+fn freePendingTimelineEvent(allocator: std.mem.Allocator, event: app_state.PendingTimelineEvent) void {
+    allocator.free(event.author);
+    allocator.free(event.body);
+    if (event.tool_call_id) |call_id| allocator.free(call_id);
+    if (event.tool_call_title) |value| allocator.free(value);
+    if (event.tool_call_input) |value| allocator.free(value);
+    if (event.tool_call_output) |value| allocator.free(value);
+    if (event.tool_call_error) |value| allocator.free(value);
+    if (event.tool_call_locations) |value| allocator.free(value);
+    if (event.tool_call_raw) |value| allocator.free(value);
+}
+
 /// Releases owned streamed timeline events copied out of the send worker.
 pub fn freePendingTimelineEvents(
     allocator: std.mem.Allocator,
     events: *std.ArrayListUnmanaged(app_state.PendingTimelineEvent),
 ) void {
-    for (events.items) |event| {
-        allocator.free(event.author);
-        allocator.free(event.body);
-    }
+    for (events.items) |event| freePendingTimelineEvent(allocator, event);
     events.deinit(allocator);
     events.* = .empty;
 }
@@ -1881,11 +2152,186 @@ pub fn appendPendingDiffSummaryEvent(
     };
 }
 
+/// Downgrades tool calls still marked running once their turn is over.
+/// A finished/stopped/failed turn can never deliver the terminal lifecycle
+/// event anymore, so leftover `.pending`/`.in_progress` rows would otherwise
+/// pulse forever in the persisted transcript. Content-less think rows are
+/// transient liveness feedback and are removed outright instead.
+pub fn cancelLingeringToolCallEvents(
+    allocator: std.mem.Allocator,
+    events: *std.ArrayListUnmanaged(app_state.PendingTimelineEvent),
+) void {
+    var index: usize = events.items.len;
+    while (index > 0) {
+        index -= 1;
+        const event = &events.items[index];
+        const status = event.tool_call_status orelse continue;
+        switch (status) {
+            .pending, .in_progress => {},
+            else => continue,
+        }
+        if ((event.tool_call_kind orelse .other) == .think and
+            !hasToolCallContent(event.tool_call_input, event.tool_call_output, event.tool_call_error))
+        {
+            freePendingTimelineEvent(allocator, event.*);
+            _ = events.orderedRemove(index);
+            continue;
+        }
+        event.tool_call_status = .cancelled;
+    }
+}
+
 pub fn pendingTimelineEventsContainAssistant(events: []const app_state.PendingTimelineEvent) bool {
     for (events) |event| {
         if (event.role == .assistant) return true;
     }
     return false;
+}
+
+test "structured tool-call updates upsert and merge lifecycle content" {
+    var events: std.ArrayListUnmanaged(app_state.PendingTimelineEvent) = .empty;
+    defer freePendingTimelineEvents(std.testing.allocator, &events);
+
+    try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
+        .call_id = "call-1",
+        .title = "Edit `/tmp/a.txt`",
+        .kind = .edit,
+        .status = .in_progress,
+        .input = "{\"path\":\"/tmp/a.txt\"}",
+        .raw = "{\"status\":\"in_progress\"}",
+    });
+    try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
+        .call_id = "call-1",
+        .title = "",
+        .kind = .edit,
+        .status = .completed,
+        .output = "Updated 3 lines",
+        .raw = "{\"status\":\"completed\"}",
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    const event = events.items[0];
+    try std.testing.expectEqualStrings("call-1", event.tool_call_id.?);
+    try std.testing.expectEqual(ai_harness.ToolCallStatus.completed, event.tool_call_status.?);
+    try std.testing.expectEqualStrings("Edit", event.author);
+    try std.testing.expect(std.mem.indexOf(u8, event.body, "Edit `/tmp/a.txt`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, event.body, "{\"path\":\"/tmp/a.txt\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, event.body, "Updated 3 lines") != null);
+}
+
+test "tagged MCP completion promotes the specific tool name" {
+    var events: std.ArrayListUnmanaged(app_state.PendingTimelineEvent) = .empty;
+    defer freePendingTimelineEvents(std.testing.allocator, &events);
+
+    try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
+        .call_id = "call-mcp",
+        .title = "MCP: tool",
+        .kind = .mcp,
+        .status = .in_progress,
+    });
+    try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
+        .call_id = "call-mcp",
+        .title = "MCP: navigate_browser",
+        .kind = .mcp,
+        .status = .completed,
+        .output = "{\"success\":true}",
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqualStrings("MCP: navigate_browser", events.items[0].author);
+    try std.testing.expectEqualStrings("Output:\n{\"success\":true}", events.items[0].body);
+}
+
+test "lingering running tool calls are cancelled at turn end" {
+    var events: std.ArrayListUnmanaged(app_state.PendingTimelineEvent) = .empty;
+    defer freePendingTimelineEvents(std.testing.allocator, &events);
+
+    try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
+        .call_id = "call-running",
+        .title = "Ran command",
+        .kind = .execute,
+        .status = .in_progress,
+    });
+    try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
+        .call_id = "call-done",
+        .title = "Ran command",
+        .kind = .execute,
+        .status = .completed,
+    });
+    try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
+        .call_id = "call-think",
+        .title = "",
+        .kind = .think,
+        .status = .in_progress,
+    });
+
+    cancelLingeringToolCallEvents(std.testing.allocator, &events);
+
+    try std.testing.expectEqual(@as(usize, 2), events.items.len);
+    try std.testing.expectEqual(ai_harness.ToolCallStatus.cancelled, events.items[0].tool_call_status.?);
+    try std.testing.expectEqual(ai_harness.ToolCallStatus.completed, events.items[1].tool_call_status.?);
+}
+
+test "transient think detection drives the pending thinking indicator" {
+    try std.testing.expectEqual(
+        @as(?bool, true),
+        transientThinkStatus(.{ .call_id = "t", .title = "", .kind = .think, .status = .in_progress }),
+    );
+    try std.testing.expectEqual(
+        @as(?bool, false),
+        transientThinkStatus(.{ .call_id = "t", .title = "", .kind = .think, .status = .completed }),
+    );
+    // Think updates carrying real thought content stay timeline rows.
+    try std.testing.expectEqual(
+        @as(?bool, null),
+        transientThinkStatus(.{ .call_id = "t", .title = "", .kind = .think, .status = .completed, .output = "weighed options" }),
+    );
+    try std.testing.expectEqual(
+        @as(?bool, null),
+        transientThinkStatus(.{ .call_id = "t", .title = "", .kind = .execute, .status = .in_progress }),
+    );
+}
+
+test "content-less think rows are transient across their lifecycle" {
+    var events: std.ArrayListUnmanaged(app_state.PendingTimelineEvent) = .empty;
+    defer freePendingTimelineEvents(std.testing.allocator, &events);
+
+    try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
+        .call_id = "think-1",
+        .title = "",
+        .kind = .think,
+        .status = .in_progress,
+    });
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqualStrings("Thinking", events.items[0].author);
+
+    try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
+        .call_id = "think-1",
+        .title = "",
+        .kind = .think,
+        .status = .completed,
+    });
+    try std.testing.expectEqual(@as(usize, 0), events.items.len);
+
+    // A terminal think replayed without a prior row must not materialize one.
+    try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
+        .call_id = "think-2",
+        .title = "",
+        .kind = .think,
+        .status = .completed,
+    });
+    try std.testing.expectEqual(@as(usize, 0), events.items.len);
+
+    // Think rows carrying real thought content (e.g. Cursor) persist.
+    try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
+        .call_id = "think-3",
+        .title = "",
+        .kind = .think,
+        .status = .completed,
+        .output = "Considered zoom handling trade-offs",
+    });
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqualStrings("Think", events.items[0].author);
 }
 
 pub const ClipboardImageCapture = struct {

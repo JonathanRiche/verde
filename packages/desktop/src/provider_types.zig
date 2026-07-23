@@ -167,11 +167,51 @@ pub const StreamDiffFile = struct {
     patch: ?[]const u8 = null,
 };
 
+pub const ToolCallKind = enum(u8) {
+    read,
+    edit,
+    delete,
+    move,
+    search,
+    execute,
+    think,
+    fetch,
+    mcp,
+    other,
+};
+
+pub const ToolCallStatus = enum(u8) {
+    pending,
+    in_progress,
+    completed,
+    failed,
+    cancelled,
+    unknown,
+};
+
+/// Provider-neutral lifecycle update for one tool invocation.
+///
+/// All slices are borrowed for the duration of `on_stream_event`. Providers
+/// should preserve a stable `call_id`; consumers use it to upsert one visible
+/// call as start/update/completion events arrive.
+pub const ToolCallUpdate = struct {
+    call_id: []const u8,
+    title: []const u8,
+    kind: ?ToolCallKind = null,
+    status: ?ToolCallStatus = null,
+    input: ?[]const u8 = null,
+    output: ?[]const u8 = null,
+    error_text: ?[]const u8 = null,
+    locations: ?[]const u8 = null,
+    raw: ?[]const u8 = null,
+};
+
 pub const StreamEvent = union(enum) {
     message: struct {
         title: []const u8,
         body: []const u8,
     },
+    tool_call: ToolCallUpdate,
     diff: struct {
         files: []const StreamDiffFile,
     },

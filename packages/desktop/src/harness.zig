@@ -26,6 +26,9 @@ pub const ServiceTier = types.ServiceTier;
 pub const ApprovalDecision = types.ApprovalDecision;
 pub const ApprovalRequest = types.ApprovalRequest;
 pub const StreamDiffFile = types.StreamDiffFile;
+pub const ToolCallKind = types.ToolCallKind;
+pub const ToolCallStatus = types.ToolCallStatus;
+pub const ToolCallUpdate = types.ToolCallUpdate;
 pub const StreamEvent = types.StreamEvent;
 pub const SendPromptRequest = types.SendPromptRequest;
 pub const SendPromptResult = types.SendPromptResult;
@@ -126,6 +129,13 @@ pub const ProviderClient = union(Provider) {
             .codex => |*client| client.interruptThread(request),
             .claude => |*client| client.interruptThread(request),
             .cursor => |*client| client.interruptThread(request),
+        };
+    }
+
+    pub fn terminateBackgroundTerminal(self: *ProviderClient, thread_id: []const u8, process_id: []const u8) !void {
+        return switch (self.*) {
+            .codex => |*client| client.terminateBackgroundTerminal(thread_id, process_id),
+            else => error.UnsupportedOperation,
         };
     }
 

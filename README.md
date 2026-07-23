@@ -418,6 +418,10 @@ verde live browser post-json --json-payload '{"type":"ping"}' [--json]
 Managed agents receive the browser through Verde's MCP bridge. Browser tools
 open and navigate the pane, inspect visible text and interactive elements,
 click or type by CSS selector, and return screenshots as MCP image content.
+`open_browser` targets the agent's workspace by default: an explicit tool
+argument wins, followed by `VERDE_WORKSPACE_ID`, `VERDE_WORKSPACE_PATH`, and
+finally the MCP process working directory. It does not use the workspace
+currently selected in the desktop unless none of that agent context resolves.
 Potentially sensitive clicks, password entry, and form submission require an
 explicit confirmed retry so the agent client can ask the user first.
 
@@ -577,6 +581,7 @@ Verde includes embedded terminal panes powered by Ghostty's `libghostty-vt` term
 - In a chat composer, run slash commands such as `/stack` and `/process` to control configured workspace processes, alongside each provider's own slash commands.
 - Create a new chat thread with `CommandOrControl+T`, or split a terminal pane below the focused workspace pane with `CommandOrControl+Shift+T`.
 - Switch workspaces by sidebar order with `Alt+1` through `Alt+9`, and `Alt+0` for the tenth workspace.
+- Focus panes in the current workspace by sidebar order with `Ctrl+1` through `Ctrl+9`, and `Ctrl+0` for the tenth pane.
 - Move between workspace panes with `Alt+Arrow` or `Ctrl+H/J/K/L`.
 - Move the focused workspace pane by swapping it with the adjacent pane using `Ctrl+Shift+H/J/K/L`.
 - In a focused chat thread pane, press `Tab` to return keyboard focus to the prompt box.
@@ -712,6 +717,18 @@ Example config:
       "focus_right": ["Alt+Right", "Ctrl+L"],
       "pane_previous": "Ctrl+Shift+Tab",
       "pane_next": "Ctrl+Tab",
+      "pane_select": [
+        "Ctrl+1",
+        "Ctrl+2",
+        "Ctrl+3",
+        "Ctrl+4",
+        "Ctrl+5",
+        "Ctrl+6",
+        "Ctrl+7",
+        "Ctrl+8",
+        "Ctrl+9",
+        "Ctrl+0"
+      ],
       "focus_prompt": "Tab",
       "move_up": "Ctrl+Shift+K",
       "move_down": "Ctrl+Shift+J",
@@ -753,6 +770,7 @@ Example config:
 ```
 
 Keybinds are loaded on startup and app refresh. Use a string for one shortcut or a string array for multiple shortcuts. Use `null`, an empty string, or an empty array to disable a binding.
+The `workspace.pane_select` array is positional: its first shortcut focuses the first pane shown under the current workspace in the sidebar, its second shortcut focuses the second pane, and so on.
 The nested `chat` bindings only run while a GUI chat pane is focused; they do not intercept input in terminal or browser panes. The model picker includes initial provider selection on a fresh thread.
 
 ## Logs

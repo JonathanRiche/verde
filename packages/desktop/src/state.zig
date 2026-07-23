@@ -136,12 +136,21 @@ pub const SurfaceState = struct {
     /// Unix ms when `status` last changed value; 0 while unknown. Drives the
     /// sidebar's elapsed "Working · m:ss" label for terminal panes.
     status_changed_at_ms: i64 = 0,
+    /// A completion remains pending until the user focuses this pane or clears
+    /// it through the CLI/MCP surface controls. It is persisted independently
+    /// from the live status so a later working update cannot erase the notice.
+    completion_pending: bool = false,
+    completed_at_ms: i64 = 0,
     progress: ?f32 = null,
     attention: bool = false,
     unread_count: u32 = 0,
     last_event_title: ?[]u8 = null,
     last_event_body: ?[]u8 = null,
     last_event_at_ms: i64 = 0,
+
+    pub fn displayStatus(self: *const SurfaceState) SurfaceStatus {
+        return if (self.completion_pending) .done else self.status;
+    }
 
     pub fn deinit(self: *SurfaceState, allocator: std.mem.Allocator) void {
         allocator.free(self.session_id);
@@ -286,6 +295,17 @@ pub const CardToggleHit = struct {
     key: u64,
     kind: CardToggleKind,
     default_expanded: bool = false,
+};
+
+pub const BackgroundTaskAction = enum { stop, output };
+
+pub const BackgroundTaskActionHit = struct {
+    rect: palette.Rect,
+    project_index: usize,
+    thread_index: usize,
+    task_index: usize,
+    message_index: usize,
+    action: BackgroundTaskAction,
 };
 
 pub const PaletteModalTextFocus = enum {
@@ -1113,11 +1133,13 @@ pub const VSCODE_LOGO_BYTES = @embedFile("assets/editor_logos/vscode.png");
 pub const ZED_LOGO_BYTES = @embedFile("assets/editor_logos/zed.png");
 
 const LoadedPersistedState = db_types.LoadedState;
+const PersistedChatCompletion = db_types.PersistedChatCompletion;
 const PersistedImageAttachment = db_types.PersistedImageAttachment;
 const PersistedHerdrWorkspaceLink = db_types.PersistedHerdrWorkspaceLink;
 const PersistedMessage = db_types.PersistedMessage;
 const PersistedProject = db_types.PersistedProject;
 const PersistedState = db_types.PersistedState;
+const PersistedSurfaceCompletion = db_types.PersistedSurfaceCompletion;
 const PersistedThread = db_types.PersistedThread;
 
 // `utils.zig` owns the cross-cutting runtime helpers that are shared with the UI shell.
@@ -1126,6 +1148,8 @@ const appendPendingDiffSummaryEvent = utils.appendPendingDiffSummaryEvent;
 const approvalPolicyForMode = utils.approvalPolicyForMode;
 const captureClipboardImage = utils.captureClipboardImage;
 const extensionForImageMime = utils.extensionForImageMime;
+const cancelLingeringToolCallEvents = utils.cancelLingeringToolCallEvents;
+const transientThinkStatus = utils.transientThinkStatus;
 const flushPendingAssistantTextLocked = utils.flushPendingAssistantTextLocked;
 const freePendingApproval = utils.freePendingApproval;
 const freePendingApprovalLocked = utils.freePendingApprovalLocked;
@@ -1138,6 +1162,7 @@ const pickerWorker = utils.pickerWorker;
 const sandboxModeForMode = utils.sandboxModeForMode;
 const serviceTierForMode = utils.serviceTierForMode;
 const sendWorker = utils.sendWorker;
+const upsertPendingToolCallEvent = utils.upsertPendingToolCallEvent;
 const uploadTexture = utils.uploadTexture;
 
 pub const ModelOption = struct {
@@ -1384,6 +1409,9 @@ pub const ChatMessage = struct {
     body: [:0]const u8,
     image: ?ChatImageAttachment = null,
     extra_images: []ChatImageAttachment = &.{},
+    tool_call_id: ?[]const u8 = null,
+    tool_call_kind: ?ai_harness.ToolCallKind = null,
+    tool_call_status: ?ai_harness.ToolCallStatus = null,
 };
 
 pub const ChatImageAttachment = struct {
@@ -1427,9 +1455,16 @@ pub const BackgroundTaskStatus = enum {
 pub const BackgroundTask = struct {
     command: [:0]const u8,
     task_id: ?[:0]const u8 = null,
+    item_id: ?[:0]const u8 = null,
+    process_id: ?[:0]const u8 = null,
+    provider_thread_id: ?[:0]const u8 = null,
+    cwd: ?[:0]const u8 = null,
+    provider: ?Provider = null,
     pid_path: ?[:0]const u8 = null,
     log_path: ?[:0]const u8 = null,
     pid: ?u32 = null,
+    pid_verified: bool = false,
+    stop_requested: bool = false,
     status: BackgroundTaskStatus,
     started_at_ms: i64 = 0,
     updated_at_ms: i64 = 0,
@@ -1438,6 +1473,10 @@ pub const BackgroundTask = struct {
     fn deinit(self: BackgroundTask, allocator: std.mem.Allocator) void {
         allocator.free(self.command);
         if (self.task_id) |value| allocator.free(value);
+        if (self.item_id) |value| allocator.free(value);
+        if (self.process_id) |value| allocator.free(value);
+        if (self.provider_thread_id) |value| allocator.free(value);
+        if (self.cwd) |value| allocator.free(value);
         if (self.pid_path) |value| allocator.free(value);
         if (self.log_path) |value| allocator.free(value);
     }
@@ -1459,6 +1498,8 @@ pub const ChatThread = struct {
     provider: Provider = .opencode,
     harness: Harness = .local_cli,
     tui_dock_id: ?u32 = null,
+    completion_pending: bool = false,
+    completed_at_ms: i64 = 0,
     messages: std.ArrayList(ChatMessage),
     background_tasks: std.ArrayList(BackgroundTask),
     send_state: *SendState,
@@ -1493,6 +1534,8 @@ pub const ChatThread = struct {
             .provider = .codex,
             .harness = .local_cli,
             .tui_dock_id = null,
+            .completion_pending = false,
+            .completed_at_ms = 0,
             .messages = .empty,
             .background_tasks = .empty,
             .send_state = send_state,
@@ -1750,6 +1793,13 @@ pub const ChatThread = struct {
         }
         try replaceOptionalZ(allocator, &task.pid_path, explicit_pid_path);
         try replaceOptionalZ(allocator, &task.log_path, backgroundTaskMetadataValue(body_raw, "Output log:"));
+        try replaceOptionalZ(allocator, &task.item_id, backgroundTaskMetadataValue(body_raw, "Codex item ID:"));
+        try replaceOptionalZ(allocator, &task.process_id, backgroundTaskMetadataValue(body_raw, "Process ID:"));
+        try replaceOptionalZ(allocator, &task.provider_thread_id, backgroundTaskMetadataValue(body_raw, "Provider thread ID:"));
+        try replaceOptionalZ(allocator, &task.cwd, backgroundTaskMetadataValue(body_raw, "CWD:"));
+        if (backgroundTaskMetadataValue(body_raw, "Provider:")) |value| {
+            task.provider = std.meta.stringToEnum(Provider, value);
+        }
     }
 
     fn noteBackgroundTaskEvent(self: *ChatThread, allocator: std.mem.Allocator, author: []const u8, body_raw: []const u8) !void {
@@ -1757,12 +1807,20 @@ pub const ChatThread = struct {
         const command = backgroundCommandFromEventBody(body_raw);
         if (command.len == 0) return;
 
+        const task_id = backgroundTaskMetadataValue(body_raw, "Verde task ID:");
+        const item_id = backgroundTaskMetadataValue(body_raw, "Codex item ID:");
+        const process_id = backgroundTaskMetadataValue(body_raw, "Process ID:");
+        const provider_thread_id = backgroundTaskMetadataValue(body_raw, "Provider thread ID:");
         for (self.background_tasks.items) |*task| {
-            if (!std.mem.eql(u8, task.command, command)) continue;
-            if (status == .running and task.status != .running) {
-                task.started_at_ms = unixTimestampMs();
-                task.pid = null;
-            }
+            const identity_matches = (task_id != null and task.task_id != null and std.mem.eql(u8, task.task_id.?, task_id.?)) or
+                (item_id != null and task.item_id != null and provider_thread_id != null and task.provider_thread_id != null and
+                    std.mem.eql(u8, task.item_id.?, item_id.?) and std.mem.eql(u8, task.provider_thread_id.?, provider_thread_id.?)) or
+                (item_id == null and task.item_id == null and process_id != null and task.process_id != null and
+                    provider_thread_id != null and task.provider_thread_id != null and std.mem.eql(u8, task.process_id.?, process_id.?) and
+                    std.mem.eql(u8, task.provider_thread_id.?, provider_thread_id.?));
+            const legacy_command_matches = task_id == null and item_id == null and process_id == null and task.task_id == null and task.item_id == null and
+                task.process_id == null and std.mem.eql(u8, task.command, command);
+            if (!identity_matches and !legacy_command_matches) continue;
             task.status = status;
             task.updated_at_ms = unixTimestampMs();
             try refreshBackgroundTaskMetadata(task, allocator, body_raw);
@@ -1792,20 +1850,17 @@ pub const ChatThread = struct {
     pub fn backgroundCommandIsRunning(self: *const ChatThread, body_raw: []const u8) bool {
         const command = backgroundCommandFromEventBody(body_raw);
         if (command.len == 0) return false;
+        const task_id = backgroundTaskMetadataValue(body_raw, "Verde task ID:");
+        const item_id = backgroundTaskMetadataValue(body_raw, "Codex item ID:");
+        const process_id = backgroundTaskMetadataValue(body_raw, "Process ID:");
         for (self.background_tasks.items) |task| {
-            if (task.status == .running and std.mem.eql(u8, task.command, command)) return true;
+            if (task.status != .running) continue;
+            if (task_id != null and task.task_id != null and std.mem.eql(u8, task_id.?, task.task_id.?)) return true;
+            if (item_id != null and task.item_id != null and std.mem.eql(u8, item_id.?, task.item_id.?)) return true;
+            if (process_id != null and task.process_id != null and std.mem.eql(u8, process_id.?, task.process_id.?)) return true;
+            if (task_id == null and item_id == null and process_id == null and std.mem.eql(u8, task.command, command)) return true;
         }
         return false;
-    }
-
-    fn stopRunningBackgroundTasks(self: *ChatThread) void {
-        const now_ms = unixTimestampMs();
-        for (self.background_tasks.items) |*task| {
-            if (task.status == .running) {
-                task.status = .stopped;
-                task.updated_at_ms = now_ms;
-            }
-        }
     }
 
     fn deinitSendState(self: *ChatThread, allocator: std.mem.Allocator) void {
@@ -1860,6 +1915,7 @@ pub const ChatThread = struct {
         for (self.messages.items) |message| {
             allocator.free(message.author);
             allocator.free(message.body);
+            if (message.tool_call_id) |call_id| allocator.free(call_id);
             if (message.image) |*image| image.deinit(allocator);
             for (message.extra_images) |*image| image.deinit(allocator);
             allocator.free(message.extra_images);
@@ -4511,6 +4567,10 @@ pub const SendState = struct {
     daemon_last_seq: u64 = 0,
     daemon_owned: bool = false,
     partial_text: std.ArrayListUnmanaged(u8) = .empty,
+    /// True while the provider reports an active content-less reasoning item.
+    /// Surfaced as "Thinking - mm:ss" in the pending stream header rather
+    /// than as a transcript tool row.
+    thinking: bool = false,
     pending_events: std.ArrayListUnmanaged(PendingTimelineEvent) = .empty,
     pending_diff_files: std.ArrayListUnmanaged(PendingDiffFile) = .empty,
     pending_approval: ?PendingApproval = null,
@@ -4573,6 +4633,15 @@ pub const PendingTimelineEvent = struct {
     role: ChatRole,
     author: []u8,
     body: []u8,
+    tool_call_id: ?[]u8 = null,
+    tool_call_kind: ?ai_harness.ToolCallKind = null,
+    tool_call_status: ?ai_harness.ToolCallStatus = null,
+    tool_call_title: ?[]u8 = null,
+    tool_call_input: ?[]u8 = null,
+    tool_call_output: ?[]u8 = null,
+    tool_call_error: ?[]u8 = null,
+    tool_call_locations: ?[]u8 = null,
+    tool_call_raw: ?[]u8 = null,
 };
 pub const SendResultPayload = struct {
     provider_thread_id: []const u8,
@@ -4722,6 +4791,7 @@ pub const AppState = struct {
     code_copy_recent_identity: u64,
     code_copy_recent_until_ms: i64,
     card_toggle_hits: std.ArrayList(CardToggleHit),
+    background_task_action_hits: std.ArrayList(BackgroundTaskActionHit),
     expanded_cards: std.AutoHashMap(u64, bool),
     palette_modal_text_focus: PaletteModalTextFocus,
     gl_texture_uploads_enabled: bool,
@@ -5047,6 +5117,7 @@ pub const AppState = struct {
             .code_copy_recent_identity = 0,
             .code_copy_recent_until_ms = 0,
             .card_toggle_hits = .empty,
+            .background_task_action_hits = .empty,
             .expanded_cards = std.AutoHashMap(u64, bool).init(allocator),
             .palette_modal_text_focus = .none,
             .gl_texture_uploads_enabled = options.gl_texture_uploads_enabled,
@@ -8362,6 +8433,10 @@ pub const AppState = struct {
             self.setSidebarNotice("Finish this workspace's running provider requests before closing it.");
             return false;
         }
+        if (projectHasRunningBackgroundTasks(&self.projects.items[index])) {
+            self.setSidebarNotice("Stop this workspace's background tasks before closing it.");
+            return false;
+        }
 
         self.cancelThreadImport();
         var removed = self.projects.orderedRemove(index);
@@ -8414,6 +8489,12 @@ pub const AppState = struct {
         return false;
     }
 
+    fn projectHasRunningBackgroundTasks(project: *const Project) bool {
+        for (project.threads.items) |*thread| if (threadHasRunningBackgroundTasks(thread)) return true;
+        for (project.archived_threads.items) |*thread| if (threadHasRunningBackgroundTasks(thread)) return true;
+        return false;
+    }
+
     pub fn archiveThreadAtIndex(self: *AppState, project_index: usize, thread_index: usize) void {
         if (project_index >= self.projects.items.len) {
             self.setSidebarNotice("Workspace not found.");
@@ -8428,6 +8509,10 @@ pub const AppState = struct {
 
         if (project.threads.items[thread_index].isSendPending()) {
             self.setSidebarNotice("Finish this thread's provider request before archiving.");
+            return;
+        }
+        if (threadHasRunningBackgroundTasks(&project.threads.items[thread_index])) {
+            self.setSidebarNotice("Stop this thread's background tasks before archiving so their controls remain available.");
             return;
         }
 
@@ -8979,6 +9064,7 @@ pub const AppState = struct {
         send_state.daemon_turn_id = turn_id;
         send_state.daemon_last_seq = 0;
         send_state.daemon_owned = true;
+        send_state.thinking = false;
         send_state.partial_text.clearRetainingCapacity();
         freePendingTimelineEventsLocked(page_alloc, &send_state.pending_events);
         freePendingDiffFilesLocked(page_alloc, &send_state.pending_diff_files);
@@ -9138,6 +9224,7 @@ pub const AppState = struct {
     fn applyPersisted(self: *AppState, persisted: PersistedState) !void {
         self.sidebar_collapsed = persisted.sidebar_collapsed;
         if (persisted.projects.len == 0) {
+            try self.restorePersistedSurfaceCompletions(persisted.surface_completions);
             self.selected_project_index = 0;
             self.next_project_number = 1;
             self.syncRenameBuffer();
@@ -9228,6 +9315,9 @@ pub const AppState = struct {
                                 try ChatImageAttachment.init(self.allocator, image.path, image.mime, image.byte_size)
                             else
                                 null,
+                            .tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id),
+                            .tool_call_kind = message.tool_call_kind,
+                            .tool_call_status = message.tool_call_status,
                         });
                     }
                     thread.rebuildBackgroundTasksFromMessages(self.allocator);
@@ -9265,6 +9355,9 @@ pub const AppState = struct {
                             try ChatImageAttachment.init(self.allocator, image.path, image.mime, image.byte_size)
                         else
                             null,
+                        .tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id),
+                        .tool_call_kind = message.tool_call_kind,
+                        .tool_call_status = message.tool_call_status,
                     });
                 }
                 thread.rebuildBackgroundTasksFromMessages(self.allocator);
@@ -9290,6 +9383,9 @@ pub const AppState = struct {
                             try ChatImageAttachment.init(self.allocator, image.path, image.mime, image.byte_size)
                         else
                             null,
+                        .tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id),
+                        .tool_call_kind = message.tool_call_kind,
+                        .tool_call_status = message.tool_call_status,
                     });
                 }
                 fallback_thread.rebuildBackgroundTasksFromMessages(self.allocator);
@@ -9310,9 +9406,104 @@ pub const AppState = struct {
             self.selected_project_index = @min(persisted.selected_project_index, self.projects.items.len - 1);
         }
         self.next_project_number = self.projects.items.len + self.archived_projects.items.len + 1;
+        try self.restorePersistedSurfaceCompletions(persisted.surface_completions);
+        self.restorePersistedChatCompletions(persisted.chat_completions);
         self.syncRenameBuffer();
         self.requestTranscriptScrollToBottom();
         self.dirty = false;
+    }
+
+    fn restorePersistedSurfaceCompletions(self: *AppState, completions: []const PersistedSurfaceCompletion) !void {
+        // Reload mirrors the durable ledger exactly without discarding live
+        // working/waiting state that may already have arrived this process.
+        for (self.surfaces.items) |*surface| {
+            if (!surface.completion_pending) continue;
+            surface.completion_pending = false;
+            surface.completed_at_ms = 0;
+            if (surface.status == .done) surface.status = .idle;
+        }
+
+        for (completions) |completion| {
+            const surface = self.surfaceBySessionId(completion.session_id);
+            if (surface == null) {
+                try self.surfaces.append(self.allocator, .{
+                    .session_id = try self.allocator.dupe(u8, completion.session_id),
+                    .workspace_id = try self.allocator.dupe(u8, completion.workspace_id),
+                    .workspace_path = try self.allocator.dupe(u8, completion.workspace_path),
+                    .dock_id = completion.dock_id,
+                    .pane_id = completion.pane_id,
+                    .provider = completion.provider,
+                    .provider_thread_id = if (completion.provider_thread_id) |value| try self.allocator.dupe(u8, value) else null,
+                    .title = try self.allocator.dupe(u8, completion.title),
+                    .status = .done,
+                    .status_changed_at_ms = completion.completed_at_ms,
+                    .completion_pending = true,
+                    .completed_at_ms = completion.completed_at_ms,
+                    .last_event_title = if (completion.last_event_title) |value| try self.allocator.dupe(u8, value) else null,
+                    .last_event_body = if (completion.last_event_body) |value| try self.allocator.dupe(u8, value) else null,
+                    .last_event_at_ms = completion.completed_at_ms,
+                });
+                continue;
+            }
+
+            var restored = surface.?;
+            try replaceOwnedSlice(self.allocator, &restored.workspace_id, completion.workspace_id);
+            try replaceOwnedSlice(self.allocator, &restored.workspace_path, completion.workspace_path);
+            restored.dock_id = completion.dock_id;
+            restored.pane_id = completion.pane_id;
+            restored.provider = completion.provider;
+            try replaceOwnedOptionalSlice(self.allocator, &restored.provider_thread_id, completion.provider_thread_id);
+            try replaceOwnedSlice(self.allocator, &restored.title, completion.title);
+            try replaceOwnedOptionalSlice(self.allocator, &restored.last_event_title, completion.last_event_title);
+            try replaceOwnedOptionalSlice(self.allocator, &restored.last_event_body, completion.last_event_body);
+            if (restored.status == .idle) {
+                restored.status = .done;
+                restored.status_changed_at_ms = completion.completed_at_ms;
+            }
+            restored.completion_pending = true;
+            restored.completed_at_ms = completion.completed_at_ms;
+            restored.last_event_at_ms = completion.completed_at_ms;
+        }
+    }
+
+    fn restorePersistedChatCompletions(self: *AppState, completions: []const PersistedChatCompletion) void {
+        for (self.projects.items) |*project| {
+            clearProjectChatCompletionFlags(project);
+            restoreProjectChatCompletions(project, completions);
+        }
+        for (self.archived_projects.items) |*project| {
+            clearProjectChatCompletionFlags(project);
+            restoreProjectChatCompletions(project, completions);
+        }
+    }
+
+    fn clearProjectChatCompletionFlags(project: *Project) void {
+        for (project.threads.items) |*thread| {
+            thread.completion_pending = false;
+            thread.completed_at_ms = 0;
+        }
+        for (project.archived_threads.items) |*thread| {
+            thread.completion_pending = false;
+            thread.completed_at_ms = 0;
+        }
+    }
+
+    fn restoreProjectChatCompletions(project: *Project, completions: []const PersistedChatCompletion) void {
+        for (completions) |completion| {
+            if (!std.mem.eql(u8, project.id, completion.workspace_id)) continue;
+            for (project.threads.items) |*thread| {
+                if (!std.mem.eql(u8, thread.local_thread_id, completion.local_thread_id)) continue;
+                thread.completion_pending = true;
+                thread.completed_at_ms = completion.completed_at_ms;
+                break;
+            }
+            for (project.archived_threads.items) |*thread| {
+                if (!std.mem.eql(u8, thread.local_thread_id, completion.local_thread_id)) continue;
+                thread.completion_pending = true;
+                thread.completed_at_ms = completion.completed_at_ms;
+                break;
+            }
+        }
     }
 
     fn buildPersistedState(self: *const AppState, backing_allocator: std.mem.Allocator) !LoadedPersistedState {
@@ -9486,6 +9677,9 @@ pub const AppState = struct {
             .author = try allocator.dupe(u8, message.author),
             .body = try allocator.dupe(u8, message.body),
             .image = try persistedImageSnapshot(allocator, message.image),
+            .tool_call_id = try dupeOptionalSlice(allocator, message.tool_call_id),
+            .tool_call_kind = message.tool_call_kind,
+            .tool_call_status = message.tool_call_status,
         };
     }
 
@@ -10285,9 +10479,7 @@ pub const AppState = struct {
             surface = &self.surfaces.items[self.surfaces.items.len - 1];
         }
         var s = surface.?;
-        // Remember the status before this update so we can fire a one-shot
-        // desktop notification only on the `!= .done` -> `.done` transition.
-        const prev_status = s.status;
+        var completion_became_pending = false;
         if (update.workspace_id) |value| try replaceOwnedSlice(self.allocator, &s.workspace_id, value);
         if (update.workspace_path) |value| try replaceOwnedSlice(self.allocator, &s.workspace_path, value);
         if (update.dock_id) |value| s.dock_id = value;
@@ -10303,8 +10495,9 @@ pub const AppState = struct {
         if (update.provider_thread_id) |value| try replaceOwnedOptionalSlice(self.allocator, &s.provider_thread_id, value);
         if (update.title) |value| {
             try replaceOwnedSlice(self.allocator, &s.title, value);
-            // Pin the title on the terminal tab so it persists across restarts
-            // (surfaces are in-memory only) and survives Codex's folder-name OSC.
+            // Pin the title on the terminal tab so it survives Codex's
+            // folder-name OSC and remains available beyond the completion
+            // ledger's acknowledgement lifetime.
             if (value.len > 0) {
                 if (self.terminalDockForSurface(s)) |dock| {
                     _ = dock.setActiveTabPinnedTitle(self.allocator, value);
@@ -10318,8 +10511,13 @@ pub const AppState = struct {
             }
         }
         if (update.clear) {
+            if (s.completion_pending or s.status == .done) {
+                _ = try self.storage.client.clearSurfaceCompletion(s.session_id);
+            }
             if (s.status != .idle) s.status_changed_at_ms = unixTimestampMs();
             s.status = .idle;
+            s.completion_pending = false;
+            s.completed_at_ms = 0;
             s.progress = null;
             s.attention = false;
             s.unread_count = 0;
@@ -10328,8 +10526,14 @@ pub const AppState = struct {
             _ = self.clearTerminalNotificationBySession(update.session_id);
         } else {
             if (update.status) |value| {
-                if (value != s.status) s.status_changed_at_ms = unixTimestampMs();
+                const now_ms = unixTimestampMs();
+                if (value != s.status) s.status_changed_at_ms = now_ms;
                 s.status = value;
+                if (value == .done and !s.completion_pending) {
+                    s.completion_pending = true;
+                    s.completed_at_ms = now_ms;
+                    completion_became_pending = true;
+                }
             }
             if (update.progress) |value| s.progress = theme.clampf(value, 0.0, 1.0);
             if (update.attention) |value| s.attention = value;
@@ -10342,22 +10546,39 @@ pub const AppState = struct {
                 try replaceOwnedOptionalSlice(self.allocator, &s.last_event_body, value);
                 s.last_event_at_ms = unixTimestampMs();
             }
+            if (s.completion_pending) {
+                try self.storage.client.upsertSurfaceCompletion(persistedSurfaceCompletion(s));
+            }
         }
         // Notify on the completion edge. Runs on the main thread (live commands
         // are drained from the main loop), so spawning the notifier here is safe.
-        if (!update.clear and self.app_config.notifications_enabled and
-            prev_status != .done and s.status == .done)
-        {
+        if (!update.clear and self.app_config.notifications_enabled and completion_became_pending) {
             self.fireCompletionNotification(s);
         }
         self.markDirty();
         return s;
     }
 
+    fn persistedSurfaceCompletion(surface: *const SurfaceState) PersistedSurfaceCompletion {
+        return .{
+            .session_id = surface.session_id,
+            .workspace_id = surface.workspace_id,
+            .workspace_path = surface.workspace_path,
+            .dock_id = surface.dock_id,
+            .pane_id = surface.pane_id,
+            .provider = surface.provider,
+            .provider_thread_id = surface.provider_thread_id,
+            .title = surface.title,
+            .completed_at_ms = surface.completed_at_ms,
+            .last_event_title = surface.last_event_title,
+            .last_event_body = surface.last_event_body,
+        };
+    }
+
     // Resolves the terminal dock that owns a surface (by workspace + dock id),
-    // so notify-provided metadata can be pinned onto its tab. Surfaces are
-    // in-memory only; pinning onto the tab persists across restarts via the
-    // workspace layout.
+    // so notify-provided metadata can be pinned onto its tab. Live surface
+    // state is in memory; the unacknowledged completion edge and pinned tab
+    // metadata persist independently across restarts.
     fn terminalDockForSurface(self: *AppState, surface: *const SurfaceState) ?*terminal.Dock {
         for (self.projects.items, 0..) |*project, idx| {
             const owns = std.mem.eql(u8, surface.workspace_id, project.id) or
@@ -10414,19 +10635,58 @@ pub const AppState = struct {
     }
 
     pub fn clearSurfaceAttentionBySession(self: *AppState, session_id: []const u8) bool {
-        const terminal_changed = self.clearTerminalNotificationBySession(session_id);
-        const surface = self.surfaceBySessionId(session_id) orelse return terminal_changed;
+        for (self.surfaces.items, 0..) |*surface, index| {
+            if (std.mem.eql(u8, surface.session_id, session_id)) {
+                return self.clearSurfaceAttentionAtIndex(index);
+            }
+        }
+        return self.clearTerminalNotificationBySession(session_id);
+    }
+
+    pub fn clearSurfaceAttentionForDock(self: *AppState, project_index: usize, dock_id: u32) bool {
+        if (project_index >= self.projects.items.len) return false;
+        var changed = false;
+        var surface_index: usize = 0;
+        while (surface_index < self.surfaces.items.len) : (surface_index += 1) {
+            const surface = &self.surfaces.items[surface_index];
+            if (surface.dock_id != dock_id or !self.surfaceBelongsToProject(surface, project_index)) continue;
+            if (self.clearSurfaceAttentionAtIndex(surface_index)) changed = true;
+        }
+        return changed;
+    }
+
+    fn clearSurfaceAttentionAtIndex(self: *AppState, surface_index: usize) bool {
+        if (surface_index >= self.surfaces.items.len) return false;
+        const terminal_changed = self.clearTerminalNotificationBySession(self.surfaces.items[surface_index].session_id);
+        const surface = &self.surfaces.items[surface_index];
         // Focusing the pane acknowledges a finished turn, so clear the "done"
         // indicator — it shouldn't re-appear in the sidebar once you've come
         // back and looked. Genuine waiting/error states persist (you still need
         // to act on them).
-        const done_ack = surface.status == .done;
+        const done_ack = surface.completion_pending or surface.status == .done;
         if (!surface.attention and surface.unread_count == 0 and !done_ack) return terminal_changed;
+        if (done_ack) {
+            _ = self.storage.client.clearSurfaceCompletion(surface.session_id) catch |err| {
+                log.err("failed to persist surface completion acknowledgement: {s}", .{@errorName(err)});
+                return terminal_changed;
+            };
+        }
         surface.attention = false;
         surface.unread_count = 0;
-        if (done_ack) surface.status = .idle;
+        if (done_ack) {
+            surface.completion_pending = false;
+            surface.completed_at_ms = 0;
+            if (surface.status == .done) surface.status = .idle;
+        }
         self.markDirty();
         return true;
+    }
+
+    fn surfaceBelongsToProject(self: *const AppState, surface: *const SurfaceState, project_index: usize) bool {
+        if (project_index >= self.projects.items.len) return false;
+        const project = &self.projects.items[project_index];
+        return std.mem.eql(u8, surface.workspace_id, project.id) or
+            self.projectPathMatches(surface.workspace_path, project.path);
     }
 
     fn clearTerminalNotificationBySession(self: *AppState, session_id: []const u8) bool {
@@ -10442,10 +10702,8 @@ pub const AppState = struct {
 
     pub fn terminalDockSurfaceAttention(self: *const AppState, project_index: usize, dock_id: u32) bool {
         if (project_index >= self.projects.items.len) return false;
-        const dock = self.projectTerminalDock(project_index, dock_id) orelse return false;
-        const session_id = dock.activeSessionId() orelse return false;
-        const surface = self.surfaceBySessionIdConst(session_id) orelse return false;
-        return surface.attention or surface.unread_count > 0 or surface.status == .waiting or surface.status == .@"error";
+        const surface = self.projectTerminalSurface(project_index, dock_id) orelse return false;
+        return surface.completion_pending or surface.attention or surface.unread_count > 0 or surface.status == .waiting or surface.status == .@"error";
     }
 
     pub fn projectSurfaceAttention(self: *const AppState, project_index: usize) bool {
@@ -10456,7 +10714,7 @@ pub const AppState = struct {
                 if (!project.workspace_layout.hasTerminalDockPane(surface.dock_id)) continue;
                 // The pane you're actively in shouldn't raise a background alert.
                 if (self.isFocusedTerminalSurface(project_index, surface.dock_id)) continue;
-                if (surface.attention or surface.unread_count > 0 or surface.status == .waiting or surface.status == .@"error") return true;
+                if (surface.completion_pending or surface.attention or surface.unread_count > 0 or surface.status == .waiting or surface.status == .@"error") return true;
             }
         }
         return false;
@@ -10483,13 +10741,19 @@ pub const AppState = struct {
     pub fn projectTerminalSurface(self: *const AppState, project_index: usize, dock_id: u32) ?*const SurfaceState {
         if (project_index >= self.projects.items.len) return null;
         const project = &self.projects.items[project_index];
+        const active_session_id = if (self.projectTerminalDock(project_index, dock_id)) |dock| dock.activeSessionId() else null;
+        var fallback: ?*const SurfaceState = null;
         for (self.surfaces.items) |*surface| {
             if (surface.dock_id != dock_id) continue;
             if (std.mem.eql(u8, surface.workspace_id, project.id) or self.projectPathMatches(surface.workspace_path, project.path)) {
-                return surface;
+                if (surface.completion_pending) return surface;
+                if (active_session_id) |session_id| {
+                    if (std.mem.eql(u8, surface.session_id, session_id)) return surface;
+                }
+                fallback = surface;
             }
         }
-        return null;
+        return fallback;
     }
 
     /// Selects a workspace and reveals one of its open layout panes, leaving
@@ -10501,6 +10765,17 @@ pub const AppState = struct {
     /// Selects a pane from the sidebar while keeping a maximized workspace maximized.
     pub fn focusWorkspaceOpenPaneFromSidebar(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) void {
         self.focusWorkspaceOpenPaneWithZoom(project_index, pane_id, true);
+    }
+
+    /// Focuses a pane by its zero-based position in the current workspace's sidebar list.
+    pub fn focusCurrentProjectWorkspacePaneAtSidebarIndex(self: *AppState, pane_index: usize) bool {
+        if (self.projects.items.len == 0) return false;
+        const project_index = self.selected_project_index;
+        const layout = &self.projects.items[project_index].workspace_layout;
+        if (pane_index >= layout.panes.items.len) return false;
+
+        self.focusWorkspaceOpenPaneFromSidebar(project_index, layout.panes.items[pane_index].id);
+        return true;
     }
 
     /// Cycles through the current workspace's panes in their sidebar list order.
@@ -10531,9 +10806,7 @@ pub const AppState = struct {
             layout.panes.items.len - 1
         else
             0;
-        const target_pane_id = layout.panes.items[target_index].id;
-        self.focusWorkspaceOpenPaneFromSidebar(project_index, target_pane_id);
-        return true;
+        return self.focusCurrentProjectWorkspacePaneAtSidebarIndex(target_index);
     }
 
     fn focusWorkspaceOpenPaneWithZoom(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, preserve_zoom: bool) void {
@@ -10556,6 +10829,7 @@ pub const AppState = struct {
             .chat => |ref| {
                 self.terminal_focused = false;
                 project.selected_thread_index = ref.thread_index;
+                _ = self.clearChatCompletion(project_index, ref.thread_index);
                 self.requestComposerFocus();
             },
             .terminal => |ref| self.requestTerminalDockFocus(ref.dock_id),
@@ -11048,6 +11322,7 @@ pub const AppState = struct {
     fn releaseMessage(self: *AppState, message: ChatMessage) void {
         self.allocator.free(message.author);
         self.allocator.free(message.body);
+        if (message.tool_call_id) |call_id| self.allocator.free(call_id);
         if (message.image) |image| {
             self.evictCachedImageTexture(image.path);
             var owned_image = image;
@@ -16198,6 +16473,7 @@ pub const AppState = struct {
         if (thread_index >= project.threads.items.len) return false;
         project.selected_thread_index = thread_index;
         project.workspace_layout.focused_pane_id = pane_id;
+        _ = self.clearChatCompletion(self.selected_project_index, thread_index);
         self.terminal_focused = false;
         self.unfocusBrowserPane();
         self.browser_address_focused = false;
@@ -16231,6 +16507,7 @@ pub const AppState = struct {
                 var project = &self.projects.items[project_index];
                 if (ref.thread_index < project.threads.items.len) {
                     project.selected_thread_index = ref.thread_index;
+                    _ = self.clearChatCompletion(project_index, ref.thread_index);
                 }
                 project.last_content_pane_id = pane_id;
                 if (self.selected_project_index == project_index) {
@@ -16272,6 +16549,7 @@ pub const AppState = struct {
         };
         if (thread_index >= project.threads.items.len) return false;
         project.selected_thread_index = thread_index;
+        _ = self.clearChatCompletion(self.selected_project_index, thread_index);
         self.syncPaletteComposerFromDraft();
         self.palette_composer.focused = true;
         self.composer_focused = true;
@@ -16365,6 +16643,7 @@ pub const AppState = struct {
                 var project = &self.projects.items[project_index];
                 if (ref.thread_index < project.threads.items.len) {
                     project.selected_thread_index = ref.thread_index;
+                    _ = self.clearChatCompletion(project_index, ref.thread_index);
                 }
                 if (self.selected_project_index == project_index) self.terminal_focused = false;
             },
@@ -17089,9 +17368,51 @@ pub const AppState = struct {
     }
 
     pub fn requestComposerFocus(self: *AppState) void {
+        _ = self.acknowledgeFocusedChatCompletion();
         self.composer_focus_requested = true;
         self.terminal_focused = false;
         self.unfocusBrowserPane();
+    }
+
+    pub fn acknowledgeFocusedChatCompletion(self: *AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        const project = &self.projects.items[self.selected_project_index];
+        const pane_id = project.workspace_layout.focused_pane_id orelse return false;
+        const pane = project.workspace_layout.paneById(pane_id) orelse return false;
+        const thread_index = switch (pane.ref) {
+            .chat => |ref| ref.thread_index,
+            else => return false,
+        };
+        return self.clearChatCompletion(self.selected_project_index, thread_index);
+    }
+
+    pub fn acknowledgeFocusedPaneCompletion(self: *AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        const project_index = self.selected_project_index;
+        const project = &self.projects.items[project_index];
+        const pane_id = project.workspace_layout.focused_pane_id orelse return false;
+        const pane = project.workspace_layout.paneById(pane_id) orelse return false;
+        return switch (pane.ref) {
+            .chat => |ref| self.clearChatCompletion(project_index, ref.thread_index),
+            .terminal => |ref| self.clearSurfaceAttentionForDock(project_index, ref.dock_id),
+            .browser => false,
+        };
+    }
+
+    fn clearChatCompletion(self: *AppState, project_index: usize, thread_index: usize) bool {
+        if (project_index >= self.projects.items.len) return false;
+        const project = &self.projects.items[project_index];
+        if (thread_index >= project.threads.items.len) return false;
+        const thread = &project.threads.items[thread_index];
+        if (!thread.completion_pending) return false;
+        _ = self.storage.client.clearChatCompletion(project.id, thread.local_thread_id) catch |err| {
+            log.err("failed to persist chat completion acknowledgement: {s}", .{@errorName(err)});
+            return false;
+        };
+        thread.completion_pending = false;
+        thread.completed_at_ms = 0;
+        self.markDirty();
+        return true;
     }
 
     pub fn requestTerminalFocus(self: *AppState) void {
@@ -17112,11 +17433,7 @@ pub const AppState = struct {
         self.browser_address_focused = false;
         self.palette_modal_text_focus = .none;
         if (self.focusedWorkspaceTerminalDockId()) |dock_id| {
-            if (self.currentProjectTerminalDock(dock_id)) |dock| {
-                if (dock.activeSessionId()) |session_id| {
-                    _ = self.clearSurfaceAttentionBySession(session_id);
-                }
-            }
+            _ = self.clearSurfaceAttentionForDock(self.selected_project_index, dock_id);
         }
     }
 
@@ -18944,6 +19261,7 @@ pub const AppState = struct {
         self.palette_modal_hits.deinit(self.allocator);
         self.code_copy_buttons.deinit(self.allocator);
         self.card_toggle_hits.deinit(self.allocator);
+        self.background_task_action_hits.deinit(self.allocator);
         self.expanded_cards.deinit();
         self.closeTranscriptSelectionModal();
         self.clearProjects();
@@ -19595,7 +19913,7 @@ pub const AppState = struct {
 
     fn threadHasRunningBackgroundTasks(thread: *const ChatThread) bool {
         for (thread.background_tasks.items) |task| {
-            if (task.status == .running and task.pid_path != null) return true;
+            if (task.status == .running) return true;
         }
         return false;
     }
@@ -19627,7 +19945,7 @@ pub const AppState = struct {
             task.pid = pid;
             if (backgroundTaskProcessIsAlive(pid)) continue;
 
-            task.status = .completed;
+            task.status = if (task.stop_requested) .stopped else .completed;
             task.updated_at_ms = now_ms;
             const body = backgroundTaskCompletionBodyAlloc(self.allocator, task) catch |err| {
                 log.warn("failed to build background task completion body: {s}", .{@errorName(err)});
@@ -19637,7 +19955,7 @@ pub const AppState = struct {
             self.appendMessageToThread(
                 thread,
                 .system,
-                "Background task completed",
+                if (task.stop_requested) "Background task stopped" else "Background task completed",
                 body,
                 null,
                 &.{},
@@ -19658,20 +19976,20 @@ pub const AppState = struct {
     }
 
     fn backgroundTaskCompletionBodyAlloc(allocator: std.mem.Allocator, task: *const BackgroundTask) ![:0]u8 {
-        if (task.task_id) |task_id| {
-            if (task.log_path) |log_path| {
-                return try ChatThread.allocPrintZCompat(allocator, "{s}\n\nVerde task ID: {s}\nOutput log: {s}", .{
-                    task.command,
-                    task_id,
-                    log_path,
-                });
-            }
-            return try ChatThread.allocPrintZCompat(allocator, "{s}\n\nVerde task ID: {s}", .{
-                task.command,
-                task_id,
-            });
-        }
-        return try allocator.dupeZ(u8, task.command);
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        errdefer writer.deinit();
+        try writer.writer.writeAll(task.command);
+        if (task.task_id) |value| try writer.writer.print("\n\nVerde task ID: {s}", .{value});
+        if (task.item_id) |value| try writer.writer.print("\nCodex item ID: {s}", .{value});
+        if (task.process_id) |value| try writer.writer.print("\nProcess ID: {s}", .{value});
+        if (task.provider_thread_id) |value| try writer.writer.print("\nProvider thread ID: {s}", .{value});
+        if (task.log_path) |value| try writer.writer.print("\nOutput log: {s}", .{value});
+        if (task.pid_path) |value| try writer.writer.print("\nPID file: {s}", .{value});
+        if (task.cwd) |value| try writer.writer.print("\nCWD: {s}", .{value});
+        if (task.provider) |value| try writer.writer.print("\nProvider: {s}", .{@tagName(value)});
+        const owned = try writer.toOwnedSlice();
+        defer allocator.free(owned);
+        return try allocator.dupeZ(u8, owned);
     }
 
     fn readBackgroundTaskPid(allocator: std.mem.Allocator, pid_path: []const u8) ?u32 {
@@ -19826,6 +20144,37 @@ pub const AppState = struct {
             const owned_body = try std.heap.page_allocator.dupe(u8, body);
             errdefer std.heap.page_allocator.free(owned_body);
             try send_state.pending_events.append(std.heap.page_allocator, .{ .role = .system, .author = owned_author, .body = owned_body });
+        } else if (std.mem.eql(u8, kind, "tool_call")) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, payload_json, .{});
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidDaemonResponse;
+            const object = parsed.value.object;
+            const call_id = jsonValueString(object.get("call_id") orelse .null) orelse "";
+            const title = jsonValueString(object.get("title") orelse .null) orelse "";
+            const kind_text = jsonValueString(object.get("kind") orelse .null);
+            const status_text = jsonValueString(object.get("status") orelse .null);
+            const update: ai_harness.ToolCallUpdate = .{
+                .call_id = call_id,
+                .title = title,
+                .kind = if (kind_text) |value| parseToolCallKind(value) else null,
+                .status = if (status_text) |value| parseToolCallStatus(value) else null,
+                .input = jsonValueString(object.get("input") orelse .null),
+                .output = jsonValueString(object.get("output") orelse .null),
+                .error_text = jsonValueString(object.get("error_text") orelse .null),
+                .locations = jsonValueString(object.get("locations") orelse .null),
+                .raw = jsonValueString(object.get("raw") orelse .null),
+            };
+            // Content-less reasoning drives the "Thinking" header indicator
+            // instead of a timeline row; mirror the GUI-owned stream path.
+            if (transientThinkStatus(update)) |thinking| {
+                send_state.thinking = thinking;
+                return;
+            }
+            // Flush like the GUI-owned stream path does, so tool rows land
+            // between assistant text segments instead of stacking above one
+            // ever-growing trailing bubble on daemon-owned turns.
+            flushPendingAssistantTextLocked(send_state, std.heap.page_allocator);
+            try upsertPendingToolCallEvent(std.heap.page_allocator, &send_state.pending_events, update);
         } else if (std.mem.eql(u8, kind, "thread_id")) {
             if (daemonPayloadStringAlloc(payload_json, "thread_id")) |thread_id| {
                 defer std.heap.page_allocator.free(thread_id);
@@ -19837,6 +20186,28 @@ pub const AppState = struct {
                 try replacePageOwned(&send_state.active_turn_id, turn_id);
             }
         }
+    }
+
+    fn parseToolCallKind(value: []const u8) ai_harness.ToolCallKind {
+        if (std.mem.eql(u8, value, "read")) return .read;
+        if (std.mem.eql(u8, value, "edit")) return .edit;
+        if (std.mem.eql(u8, value, "delete")) return .delete;
+        if (std.mem.eql(u8, value, "move")) return .move;
+        if (std.mem.eql(u8, value, "search")) return .search;
+        if (std.mem.eql(u8, value, "execute")) return .execute;
+        if (std.mem.eql(u8, value, "think")) return .think;
+        if (std.mem.eql(u8, value, "fetch")) return .fetch;
+        if (std.mem.eql(u8, value, "mcp")) return .mcp;
+        return .other;
+    }
+
+    fn parseToolCallStatus(value: []const u8) ai_harness.ToolCallStatus {
+        if (std.mem.eql(u8, value, "pending")) return .pending;
+        if (std.mem.eql(u8, value, "in_progress")) return .in_progress;
+        if (std.mem.eql(u8, value, "completed")) return .completed;
+        if (std.mem.eql(u8, value, "failed")) return .failed;
+        if (std.mem.eql(u8, value, "cancelled")) return .cancelled;
+        return .unknown;
     }
 
     fn pollThreadSend(self: *AppState, project_index: usize, thread_index: usize, thread: *ChatThread) bool {
@@ -19896,6 +20267,7 @@ pub const AppState = struct {
                 send_state.approval_decision = null;
                 send_state.provider = null;
                 send_state.started_at_ms = 0;
+                send_state.thinking = false;
                 completed_daemon_turn_id = send_state.daemon_turn_id;
                 send_state.daemon_turn_id = null;
                 send_state.daemon_owned = false;
@@ -19922,6 +20294,7 @@ pub const AppState = struct {
                 send_state.approval_decision = null;
                 send_state.provider = null;
                 send_state.started_at_ms = 0;
+                send_state.thinking = false;
                 completed_daemon_turn_id = send_state.daemon_turn_id;
                 send_state.daemon_turn_id = null;
                 send_state.daemon_owned = false;
@@ -19949,6 +20322,7 @@ pub const AppState = struct {
                 send_state.approval_decision = null;
                 send_state.provider = null;
                 send_state.started_at_ms = 0;
+                send_state.thinking = false;
                 completed_daemon_turn_id = send_state.daemon_turn_id;
                 send_state.daemon_turn_id = null;
                 send_state.daemon_owned = false;
@@ -19966,6 +20340,13 @@ pub const AppState = struct {
             if (project_index < self.projects.items.len) {
                 self.projects.items[project_index].invalidateSidebarThreadCache();
             }
+        }
+
+        // The turn is over on every terminal path, so no provider can deliver
+        // the terminal lifecycle event for a still-running tool row anymore;
+        // downgrade leftovers before they persist into the transcript.
+        if (next_status == .completed or next_status == .aborted or next_status == .failed) {
+            cancelLingeringToolCallEvents(std.heap.page_allocator, &completed_events);
         }
 
         switch (next_status) {
@@ -20021,7 +20402,6 @@ pub const AppState = struct {
                 self.applyPendingTimelineEvents(thread, &completed_events) catch |err| {
                     log.err("failed to apply aborted timeline events: {s}", .{@errorName(err)});
                 };
-                thread.stopRunningBackgroundTasks();
                 if (!had_pending_followup) {
                     self.appendMessageToThread(
                         thread,
@@ -20049,23 +20429,38 @@ pub const AppState = struct {
         if (next_status == .completed or next_status == .aborted) {
             self.dispatchPendingFollowup(project_index, thread_index, thread);
         }
-        // Notify on a real chat turn completion. Skip when a follow-up is queued
-        // (the turn continues immediately) so we only fire once the agent truly
-        // rests, mirroring the terminal-agent `.done` notification.
+        // Record a real chat turn completion. Skip when a follow-up is queued
+        // (the turn continues immediately) so DONE only appears once the agent
+        // truly rests, mirroring the terminal-agent `.done` notification.
         if (next_status == .completed and !had_pending_followup) {
-            self.maybeNotifyChatCompletion(project_index, thread_index, thread);
+            self.noteChatCompletion(project_index, thread_index, thread);
         }
         return next_status != .idle or stream_changed or daemon_changed;
     }
 
-    // Fires a desktop notification for a finished in-app chat turn, unless the
-    // user is actively watching that thread in the focused window. Provider is
-    // known here (no hook/CLI dependency), so the logo is always correct.
-    fn maybeNotifyChatCompletion(self: *AppState, project_index: usize, thread_index: usize, thread: *const ChatThread) void {
-        if (!self.app_config.notifications_enabled) return;
-        if (self.isChatThreadVisibleAndFocused(project_index, thread_index)) return;
+    // Records a finished in-app chat turn unless that exact pane currently has
+    // focus. The independent ledger survives ordinary state saves and process
+    // restarts until any pane-focus route acknowledges it.
+    fn noteChatCompletion(self: *AppState, project_index: usize, thread_index: usize, thread: *ChatThread) void {
+        if (self.isChatThreadFocused(project_index, thread_index)) {
+            _ = self.clearChatCompletion(project_index, thread_index);
+            return;
+        }
         if (project_index >= self.projects.items.len) return;
         const project = &self.projects.items[project_index];
+        const completed_at_ms = unixTimestampMs();
+        thread.completion_pending = true;
+        thread.completed_at_ms = completed_at_ms;
+        self.storage.client.upsertChatCompletion(.{
+            .workspace_id = project.id,
+            .local_thread_id = thread.local_thread_id,
+            .completed_at_ms = completed_at_ms,
+        }) catch |err| {
+            log.err("failed to persist chat completion: {s}", .{@errorName(err)});
+        };
+        self.markDirty();
+
+        if (!self.app_config.notifications_enabled) return;
 
         const title = if (thread.title.len > 0)
             thread.title
@@ -20088,28 +20483,22 @@ pub const AppState = struct {
         notifier.notifyAgentDone(self.allocator, title, body, icon);
     }
 
-    // True when the given chat thread is currently on screen in the focused
-    // window: the window holds input focus, its project is selected, and a
-    // visible chat pane (respecting maximize) shows that thread.
-    fn isChatThreadVisibleAndFocused(self: *const AppState, project_index: usize, thread_index: usize) bool {
+    // True only when the exact chat pane owns focus in the focused window.
+    // Merely being visible beside a terminal/browser pane must still queue DONE.
+    fn isChatThreadFocused(self: *const AppState, project_index: usize, thread_index: usize) bool {
         if (!self.window_input_focus) return false;
         if (project_index != self.selected_project_index) return false;
         if (project_index >= self.projects.items.len) return false;
         const layout = &self.projects.items[project_index].workspace_layout;
+        const focused_pane_id = layout.focused_pane_id orelse return false;
         if (layout.maximized_pane_id) |max_id| {
-            const pane = layout.paneById(max_id) orelse return false;
-            return switch (pane.ref) {
-                .chat => |ref| ref.thread_index == thread_index,
-                else => false,
-            };
+            if (max_id != focused_pane_id) return false;
         }
-        for (layout.panes.items) |pane| {
-            switch (pane.ref) {
-                .chat => |ref| if (ref.thread_index == thread_index) return true,
-                else => {},
-            }
-        }
-        return false;
+        const pane = layout.paneById(focused_pane_id) orelse return false;
+        return switch (pane.ref) {
+            .chat => |ref| ref.thread_index == thread_index,
+            else => false,
+        };
     }
 
     fn capturePendingProviderThreadId(self: *AppState, thread: *ChatThread) void {
@@ -20627,20 +21016,60 @@ pub const AppState = struct {
         if (events.items.len == 0) return;
         self.trimThreadMessages(thread, events.items.len);
         for (events.items) |event| {
+            if (std.mem.eql(u8, event.author, "__verde_codex_background_snapshot")) {
+                try self.reconcileCodexBackgroundSnapshot(thread, event.body);
+                continue;
+            }
+            const known_background = std.mem.eql(u8, event.author, "Backgrounded command") and backgroundTaskForEventBody(thread, event.body) != null;
+            if (known_background) {
+                try thread.noteBackgroundTaskEvent(self.allocator, event.author, event.body);
+                if (backgroundTaskForEventBody(thread, event.body)) |task| task.pid_verified = task.task_id != null;
+                continue;
+            }
             try thread.messages.append(self.allocator, .{
                 .role = event.role,
                 .author = try self.dupeZ(event.author),
                 .body = try self.dupeZ(event.body),
                 .image = null,
+                .tool_call_id = if (event.tool_call_id) |call_id| try self.allocator.dupe(u8, call_id) else null,
+                .tool_call_kind = event.tool_call_kind,
+                .tool_call_status = event.tool_call_status,
             });
             if (event.role == .system) {
                 thread.noteBackgroundTaskEvent(self.allocator, event.author, event.body) catch |err| {
                     log.warn("failed to record background task event: {s}", .{@errorName(err)});
                 };
+                if (std.mem.eql(u8, event.author, "Backgrounded command")) {
+                    if (backgroundTaskForEventBody(thread, event.body)) |task| task.pid_verified = task.task_id != null;
+                }
             }
         }
         thread.touch();
         self.markDirty();
+    }
+
+    fn reconcileCodexBackgroundSnapshot(self: *AppState, thread: *ChatThread, body: []const u8) !void {
+        const provider_thread_id = ChatThread.backgroundTaskMetadataValue(body, "Provider thread ID:") orelse return;
+        const now_ms = unixTimestampMs();
+        for (thread.background_tasks.items) |*task| {
+            if (task.status != .running or task.provider != .codex or task.item_id == null or task.provider_thread_id == null) continue;
+            if (!std.mem.eql(u8, task.provider_thread_id.?, provider_thread_id)) continue;
+            var present = false;
+            var lines = std.mem.splitScalar(u8, body, '\n');
+            while (lines.next()) |line| {
+                const prefix = "Codex item ID:";
+                if (std.mem.startsWith(u8, line, prefix) and std.mem.eql(u8, std.mem.trim(u8, line[prefix.len..], " \t"), task.item_id.?)) {
+                    present = true;
+                    break;
+                }
+            }
+            if (present) continue;
+            task.status = .completed;
+            task.updated_at_ms = now_ms;
+            const completion_body = try backgroundTaskCompletionBodyAlloc(self.allocator, task);
+            defer self.allocator.free(completion_body);
+            try self.appendMessageToThread(thread, .system, "Background task completed", completion_body, null, &.{});
+        }
     }
 
     fn applySendFailure(
@@ -20651,16 +21080,23 @@ pub const AppState = struct {
     ) !void {
         self.trimThreadMessages(thread, events.items.len + 1);
         for (events.items) |event| {
+            if (std.mem.eql(u8, event.author, "__verde_codex_background_snapshot")) continue;
             try thread.messages.append(self.allocator, .{
                 .role = event.role,
                 .author = try self.dupeZ(event.author),
                 .body = try self.dupeZ(event.body),
                 .image = null,
+                .tool_call_id = if (event.tool_call_id) |call_id| try self.allocator.dupe(u8, call_id) else null,
+                .tool_call_kind = event.tool_call_kind,
+                .tool_call_status = event.tool_call_status,
             });
             if (event.role == .system) {
                 thread.noteBackgroundTaskEvent(self.allocator, event.author, event.body) catch |err| {
                     log.warn("failed to record background task event: {s}", .{@errorName(err)});
                 };
+                if (std.mem.eql(u8, event.author, "Backgrounded command")) {
+                    if (backgroundTaskForEventBody(thread, event.body)) |task| task.pid_verified = task.task_id != null;
+                }
             }
         }
         try thread.messages.append(self.allocator, .{
@@ -20815,6 +21251,165 @@ pub const AppState = struct {
         self.card_toggle_hits.append(self.allocator, hit) catch |err| {
             log.warn("failed to retain card toggle hit: {s}", .{@errorName(err)});
         };
+    }
+
+    pub fn recordBackgroundTaskActionHit(self: *AppState, hit: BackgroundTaskActionHit) void {
+        self.background_task_action_hits.append(self.allocator, hit) catch |err| {
+            log.warn("failed to retain background task action hit: {s}", .{@errorName(err)});
+        };
+    }
+
+    pub fn recordBackgroundTaskActionForMessage(self: *AppState, rect: palette.Rect, message_index: usize, body: []const u8, action: BackgroundTaskAction) void {
+        if (rect.w < 2 or rect.h < 2) return;
+        for (self.projects.items, 0..) |*project, project_index| for (project.threads.items, 0..) |*thread, thread_index| {
+            if (message_index >= thread.messages.items.len or !std.mem.eql(u8, thread.messages.items[message_index].body, body)) continue;
+            const task = backgroundTaskForEventBody(thread, body) orelse continue;
+            const task_index = (@intFromPtr(task) - @intFromPtr(thread.background_tasks.items.ptr)) / @sizeOf(BackgroundTask);
+            self.recordBackgroundTaskActionHit(.{ .rect = rect, .project_index = project_index, .thread_index = thread_index, .task_index = task_index, .message_index = message_index, .action = action });
+            return;
+        };
+    }
+
+    pub fn consumeBackgroundTaskActionClick(self: *AppState, x: f32, y: f32) bool {
+        for (self.background_task_action_hits.items) |hit| {
+            if (x < hit.rect.x or x > hit.rect.x + hit.rect.w or y < hit.rect.y or y > hit.rect.y + hit.rect.h) continue;
+            if (hit.project_index >= self.projects.items.len) return true;
+            var project = &self.projects.items[hit.project_index];
+            if (hit.thread_index >= project.threads.items.len) return true;
+            const thread = &project.threads.items[hit.thread_index];
+            if (hit.message_index >= thread.messages.items.len) return true;
+            if (hit.task_index >= thread.background_tasks.items.len) return true;
+            const task = &thread.background_tasks.items[hit.task_index];
+            if (backgroundTaskForEventBody(thread, thread.messages.items[hit.message_index].body) != task) {
+                self.setSidebarNotice("Background task is no longer available.");
+                return true;
+            }
+            switch (hit.action) {
+                .stop => self.stopBackgroundTask(hit.project_index, thread, task),
+                .output => self.openBackgroundTaskOutput(hit.project_index, task, hit.message_index),
+            }
+            return true;
+        }
+        return false;
+    }
+
+    fn backgroundTaskForEventBody(thread: *ChatThread, body: []const u8) ?*BackgroundTask {
+        const task_id = ChatThread.backgroundTaskMetadataValue(body, "Verde task ID:");
+        const item_id = ChatThread.backgroundTaskMetadataValue(body, "Codex item ID:");
+        const process_id = ChatThread.backgroundTaskMetadataValue(body, "Process ID:");
+        for (thread.background_tasks.items) |*task| {
+            if (task_id != null and task.task_id != null and std.mem.eql(u8, task_id.?, task.task_id.?)) return task;
+            if (item_id != null and task.item_id != null and std.mem.eql(u8, item_id.?, task.item_id.?) and
+                sameOptionalIdentity(task.provider_thread_id, ChatThread.backgroundTaskMetadataValue(body, "Provider thread ID:"))) return task;
+            if (item_id == null and task.item_id == null and process_id != null and task.process_id != null and
+                std.mem.eql(u8, process_id.?, task.process_id.?) and sameOptionalIdentity(task.provider_thread_id, ChatThread.backgroundTaskMetadataValue(body, "Provider thread ID:"))) return task;
+            if (task_id == null and item_id == null and process_id == null and
+                std.mem.eql(u8, ChatThread.backgroundCommandFromEventBody(body), task.command)) return task;
+        }
+        return null;
+    }
+
+    fn sameOptionalIdentity(a: ?[:0]const u8, b: ?[]const u8) bool {
+        if (a == null or b == null) return false;
+        return std.mem.eql(u8, a.?, b.?);
+    }
+
+    fn stopBackgroundTask(self: *AppState, project_index: usize, thread: *ChatThread, task: *BackgroundTask) void {
+        if (task.status != .running or task.stop_requested) return;
+        if (task.provider == .codex or task.process_id != null) {
+            const thread_id = task.provider_thread_id orelse {
+                self.setSidebarNotice("Codex background task is missing its thread ID.");
+                return;
+            };
+            const process_id = task.process_id orelse {
+                self.setSidebarNotice("Codex background task is missing its process ID.");
+                return;
+            };
+            const target = self.providerExecutionTargetForProjectThread(project_index, thread, 0) orelse return;
+            const config: ai_harness.ProviderConfig = .{ .codex = .{
+                .cwd = target.cwd(),
+                .launch_on_connect = false,
+                .remote_ssh = if (target.remoteHost()) |host| .{ .host = host, .cwd = target.cwd() } else null,
+            } };
+            var client = ai_harness.connect(self.allocator, config) catch |err| {
+                log.warn("failed to connect for background task stop: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Failed to connect to Codex to stop the background task.");
+                return;
+            };
+            defer client.deinit();
+            client.terminateBackgroundTerminal(thread_id, process_id) catch |err| {
+                log.warn("failed to stop Codex background task: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Codex could not stop the background task.");
+                return;
+            };
+            task.stop_requested = true;
+            task.status = .stopped;
+            const body = backgroundTaskCompletionBodyAlloc(self.allocator, task) catch return;
+            defer self.allocator.free(body);
+            self.appendMessageToThread(thread, .system, "Background task stopped", body, null, &.{}) catch return;
+            self.markDirty();
+            return;
+        }
+        if (!task.pid_verified) {
+            self.setSidebarNotice("Cannot safely stop this restored PID; wait for a new live task event.");
+            return;
+        }
+        const pid = task.pid orelse if (task.pid_path) |path| readBackgroundTaskPid(self.allocator, path) else null;
+        const resolved_pid = pid orelse {
+            self.setSidebarNotice("Background task PID is not available yet.");
+            return;
+        };
+        platform_process.terminateProcessIdTree(resolved_pid) catch |err| {
+            log.warn("failed to stop background process tree: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to request background task termination.");
+            return;
+        };
+        task.pid = resolved_pid;
+        task.stop_requested = true;
+        task.last_poll_ms = 0;
+        self.setSidebarNotice("Stopping background task...");
+        self.markDirty();
+    }
+
+    fn openBackgroundTaskOutput(self: *AppState, project_index: usize, task: *BackgroundTask, message_index: usize) void {
+        const log_path = task.log_path orelse {
+            const key = commandCardKey(message_index);
+            self.expanded_cards.put(key, true) catch {};
+            self.setSidebarNotice("Codex process details are shown in the expanded card; retained live output is not exposed by this API.");
+            self.markDirty();
+            return;
+        };
+        const command = backgroundLogFollowCommandAlloc(self.allocator, log_path) catch {
+            self.setSidebarNotice("Failed to prepare background task output command.");
+            return;
+        };
+        defer self.allocator.free(command);
+        self.selected_project_index = project_index;
+        const pane_id = self.openCurrentProjectTerminalPaneForCommand() orelse return;
+        _ = self.writeWorkspaceTerminalPane(pane_id, command) catch {
+            self.setSidebarNotice("Failed to open background task output.");
+            return;
+        };
+        self.markDirty();
+    }
+
+    pub fn commandCardKey(message_index: usize) u64 {
+        var hasher = std.hash.Wyhash.init(0xC0DEC0DEC0DEC0DE);
+        hasher.update(std.mem.asBytes(&message_index));
+        hasher.update("command_card");
+        return hasher.final();
+    }
+
+    fn backgroundLogFollowCommandAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+        var escaped: std.ArrayList(u8) = .empty;
+        defer escaped.deinit(allocator);
+        for (path) |byte| {
+            if (byte == '\'') try escaped.appendSlice(allocator, if (builtin.os.tag == .windows) "''" else "'\\''") else try escaped.append(allocator, byte);
+        }
+        return if (builtin.os.tag == .windows)
+            std.fmt.allocPrint(allocator, "Get-Content -LiteralPath '{s}' -Tail 200 -Wait\r", .{escaped.items})
+        else
+            std.fmt.allocPrint(allocator, "tail -n 200 -f -- '{s}'\n", .{escaped.items});
     }
 
     /// Returns true when the given card key was previously toggled to expanded.
@@ -21733,6 +22328,40 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(-1));
     try std.testing.expectEqual(@as(?WorkspacePaneId, first_terminal_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, first_terminal_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(state.focusCurrentProjectWorkspacePaneAtSidebarIndex(2));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(!state.focusCurrentProjectWorkspacePaneAtSidebarIndex(3));
+}
+
+test "visible chat is not treated as focused when a sibling pane owns focus" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.projects = .empty;
+    state.selected_project_index = 0;
+    state.window_input_focus = true;
+    defer {
+        for (state.projects.items) |*project| project.deinit(allocator);
+        state.projects.deinit(allocator);
+    }
+
+    var project = try Project.init(allocator, "test", "Test", "/tmp/test", 0);
+    state.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+
+    const layout = &state.projects.items[0].workspace_layout;
+    const chat_pane_id = layout.panes.items[0].id;
+    const terminal_pane_id = try layout.createTerminalPane(allocator, 1);
+    layout.focused_pane_id = terminal_pane_id;
+
+    try std.testing.expect(!state.isChatThreadFocused(0, 0));
+    layout.focused_pane_id = chat_pane_id;
+    try std.testing.expect(state.isChatThreadFocused(0, 0));
+    state.window_input_focus = false;
+    try std.testing.expect(!state.isChatThreadFocused(0, 0));
 }
 
 test "Codex hook feature detection accepts current and legacy names" {

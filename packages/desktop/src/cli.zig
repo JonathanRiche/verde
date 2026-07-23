@@ -24,6 +24,7 @@ const ui_theme = @import("ui/theme.zig");
 const VERSION = build_options.version;
 const SOCKET_NAME = live_endpoint.SOCKET_NAME;
 const LIVE_RESPONSE_TIMEOUT_MS: u32 = 5000;
+const MCP_TOOL_NAME_FIELD = "_verdeMcpTool";
 const TERMINAL_GET_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
     .macos => @bitCast(@as(u32, 0x40087468)),
     .windows => 0,
@@ -1536,20 +1537,64 @@ fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, ar
     };
     const clear = args.hasFlag(argv, "--clear");
     const method = if (clear) "notification.clear" else "notification.create";
+    const workspace_id = args.optionValue(argv, "--workspace") orelse getenvSlice("VERDE_WORKSPACE_ID");
+    const workspace_path = getenvSlice("VERDE_WORKSPACE_PATH");
+    const dock_id = parseOptionalU32(args.optionValue(argv, "--dock") orelse getenvSlice("VERDE_DOCK_ID"));
+    const pane_id = parseOptionalU32(args.optionValue(argv, "--pane") orelse getenvSlice("VERDE_PANE_ID"));
+    const provider = args.optionValue(argv, "--provider") orelse getenvSlice("VERDE_PROVIDER");
+    const title = args.optionValue(argv, "--title");
+    const body = args.optionValue(argv, "--body");
+    const status = args.optionValue(argv, "--status");
+    const label = args.optionValue(argv, "--label");
     const response = sendLiveRequestAlloc(allocator, io, method, .{
         .session_id = session_id,
-        .workspace_id = args.optionValue(argv, "--workspace") orelse getenvSlice("VERDE_WORKSPACE_ID"),
-        .workspace_path = getenvSlice("VERDE_WORKSPACE_PATH"),
-        .dock_id = parseOptionalU32(args.optionValue(argv, "--dock") orelse getenvSlice("VERDE_DOCK_ID")),
-        .pane_id = parseOptionalU32(args.optionValue(argv, "--pane") orelse getenvSlice("VERDE_PANE_ID")),
-        .provider = args.optionValue(argv, "--provider") orelse getenvSlice("VERDE_PROVIDER"),
-        .title = args.optionValue(argv, "--title"),
-        .body = args.optionValue(argv, "--body"),
-        .status = args.optionValue(argv, "--status"),
+        .workspace_id = workspace_id,
+        .workspace_path = workspace_path,
+        .dock_id = dock_id,
+        .pane_id = pane_id,
+        .provider = provider,
+        .title = title,
+        .body = body,
+        .status = status,
         .progress = parseOptionalF32(args.optionValue(argv, "--progress")),
-        .label = args.optionValue(argv, "--label"),
+        .label = label,
         .attention = if (args.hasFlag(argv, "--attention")) true else null,
     }, 1) catch |err| {
+        if (clear or (status != null and std.mem.eql(u8, status.?, "done"))) {
+            persistOfflineSurfaceCompletion(allocator, .{
+                .session_id = session_id,
+                .workspace_id = workspace_id orelse "",
+                .workspace_path = workspace_path orelse "",
+                .dock_id = dock_id orelse 0,
+                .pane_id = pane_id,
+                .provider = if (provider) |value| std.meta.stringToEnum(db_types.Provider, value) else null,
+                .provider_thread_id = getenvSlice("VERDE_PROVIDER_THREAD_ID"),
+                .title = label orelse title orelse "",
+                .completed_at_ms = unixTimestampMs(),
+                .last_event_title = title orelse label,
+                .last_event_body = body,
+            }, clear) catch |persist_err| {
+                if (!args.hasFlag(argv, "--quiet")) {
+                    try out.stderr("verde notify: app unavailable ({s}); failed to persist completion ({s})\n", .{ @errorName(err), @errorName(persist_err) });
+                }
+                return;
+            };
+            if (args.hasFlag(argv, "--json")) {
+                try out.jsonValue(allocator, .{
+                    .ok = true,
+                    .offline = true,
+                    .session_id = session_id,
+                    .cleared = clear,
+                });
+            } else if (!args.hasFlag(argv, "--quiet")) {
+                if (clear) {
+                    try out.stdout("Completion cleared.\n", .{});
+                } else {
+                    try out.stdout("Completion saved for Verde.\n", .{});
+                }
+            }
+            return;
+        }
         if (!args.hasFlag(argv, "--quiet")) try out.stderr("verde notify: running app unavailable ({s})\n", .{@errorName(err)});
         return;
     };
@@ -1558,6 +1603,22 @@ fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, ar
         try out.stdout("{s}\n", .{response});
     } else if (!args.hasFlag(argv, "--quiet")) {
         try printLiveResponse(out, response);
+    }
+}
+
+fn persistOfflineSurfaceCompletion(
+    allocator: std.mem.Allocator,
+    record: db_types.PersistedSurfaceCompletion,
+    clear: bool,
+) !void {
+    const pref_path = try prefPath(allocator);
+    defer allocator.free(pref_path);
+    var client = try db_client.Client.init(allocator, pref_path);
+    defer client.deinit();
+    if (clear) {
+        _ = try client.clearSurfaceCompletion(record.session_id);
+    } else {
+        try client.upsertSurfaceCompletion(record);
     }
 }
 
@@ -3087,6 +3148,14 @@ fn printLiveResponse(out: output.Output, response: []const u8) !void {
 }
 
 fn handleMcp(allocator: std.mem.Allocator, out: output.Output, io: std.Io) !void {
+    const cwd_workspace = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch null;
+    defer if (cwd_workspace) |path| allocator.free(path);
+    const default_workspace = mcpDefaultWorkspace(
+        getenvSlice("VERDE_WORKSPACE_ID"),
+        getenvSlice("VERDE_WORKSPACE_PATH"),
+        cwd_workspace,
+    );
+
     const stdin_file = std.Io.File.stdin();
     var read_buffer: [256 * 1024]u8 = undefined;
     var reader = stdin_file.reader(io, &read_buffer);
@@ -3116,13 +3185,17 @@ fn handleMcp(allocator: std.mem.Allocator, out: output.Output, io: std.Io) !void
         } else if (std.mem.eql(u8, method, "tools/list")) {
             try mcpToolsList(allocator, out, id_value);
         } else if (std.mem.eql(u8, method, "tools/call")) {
-            try mcpToolsCall(allocator, out, io, id_value, params);
+            try mcpToolsCall(allocator, out, io, id_value, params, default_workspace);
         } else if (std.mem.eql(u8, method, "notifications/initialized")) {
             continue;
         } else {
             try mcpError(allocator, out, id_value, -32601, "method not found");
         }
     }
+}
+
+fn mcpDefaultWorkspace(workspace_id: ?[]const u8, workspace_path: ?[]const u8, cwd: ?[]const u8) ?[]const u8 {
+    return workspace_id orelse workspace_path orelse cwd;
 }
 
 fn mcpInitialize(allocator: std.mem.Allocator, out: output.Output, id_value: std.json.Value) !void {
@@ -3228,9 +3301,9 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current." },
     });
     try writeMcpTypedTool(&s, "browser_status", "Inspect the embedded browser state, URL, and last action result.", &.{});
-    try writeMcpTypedTool(&s, "open_browser", "Open or move Verde's embedded browser to a URL in a workspace.", &.{
+    try writeMcpTypedTool(&s, "open_browser", "Open or move Verde's embedded browser to a URL in a workspace. Defaults to the workspace containing the agent.", &.{
         .{ .name = "url", .type_name = "string", .description = "Optional URL to open." },
-        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace name or path." },
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
     });
     try writeMcpTypedTool(&s, "navigate_browser", "Navigate the open embedded browser to a URL.", &.{
         .{ .name = "url", .type_name = "string", .description = "URL to navigate to.", .required = true },
@@ -3321,15 +3394,21 @@ fn writeMcpTypedTool(s: *std.json.Stringify, name: []const u8, description: []co
     try s.endObject();
 }
 
-fn mcpToolsCall(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id_value: std.json.Value, params: std.json.Value) !void {
+fn mcpToolsCall(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    io: std.Io,
+    id_value: std.json.Value,
+    params: std.json.Value,
+    default_workspace: ?[]const u8,
+) !void {
     if (params != .object) return try mcpError(allocator, out, id_value, -32602, "tools/call params must be an object");
     const tool_name = jsonString(params.object.get("name") orelse .null) orelse
         return try mcpError(allocator, out, id_value, -32602, "tools/call requires name");
     const arguments = params.object.get("arguments") orelse .null;
     const workspace = mcpArgString(arguments, "workspace") orelse
         mcpArgString(arguments, "project") orelse
-        getenvSlice("VERDE_WORKSPACE_ID") orelse
-        getenvSlice("VERDE_WORKSPACE_PATH");
+        default_workspace;
     const process_name = mcpArgString(arguments, "name");
     const coordination_owner = mcpArgString(arguments, "owner") orelse getenvSlice("VERDE_SESSION_ID");
     const session_id = mcpArgString(arguments, "session_id") orelse mcpArgString(arguments, "session");
@@ -3350,7 +3429,7 @@ fn mcpToolsCall(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id
             return try mcpError(allocator, out, id_value, -32000, @errorName(err));
         };
         defer allocator.free(response);
-        return try mcpToolTextResult(allocator, out, id_value, response);
+        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
     }
     if (std.mem.eql(u8, tool_name, "click_browser_element")) {
         const selector = mcpArgString(arguments, "selector") orelse
@@ -3361,7 +3440,7 @@ fn mcpToolsCall(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id
             return try mcpError(allocator, out, id_value, -32000, @errorName(err));
         };
         defer allocator.free(response);
-        return try mcpToolTextResult(allocator, out, id_value, response);
+        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
     }
     if (std.mem.eql(u8, tool_name, "type_browser_text")) {
         const selector = mcpArgString(arguments, "selector") orelse
@@ -3380,14 +3459,14 @@ fn mcpToolsCall(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id
             return try mcpError(allocator, out, id_value, -32000, @errorName(err));
         };
         defer allocator.free(response);
-        return try mcpToolTextResult(allocator, out, id_value, response);
+        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
     }
     if (std.mem.eql(u8, tool_name, "capture_browser_screenshot")) {
         const response = sendLiveRequestAlloc(allocator, io, "browser.screenshot", .{}, 1) catch |err| {
             return try mcpError(allocator, out, id_value, -32000, @errorName(err));
         };
         defer allocator.free(response);
-        return try mcpToolScreenshotResult(allocator, out, id_value, response);
+        return try mcpToolScreenshotResult(allocator, out, id_value, response, tool_name);
     }
     if (std.mem.eql(u8, tool_name, "wait_for_process")) {
         const process_id = mcpArgString(arguments, "process_id") orelse
@@ -3400,7 +3479,7 @@ fn mcpToolsCall(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id
             @min(mcpArgU32(arguments, "timeout_ms") orelse 300_000, 900_000),
         ) catch |err| return try mcpError(allocator, out, id_value, -32000, @errorName(err));
         defer allocator.free(response);
-        return try mcpToolTextResult(allocator, out, id_value, response);
+        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
     }
 
     const response = blk: {
@@ -3552,7 +3631,7 @@ fn mcpToolsCall(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id
         return try mcpError(allocator, out, id_value, -32000, @errorName(err));
     };
     defer allocator.free(response);
-    try mcpToolTextResult(allocator, out, id_value, response);
+    try mcpToolTextResult(allocator, out, id_value, response, tool_name);
 }
 
 fn mcpBrowserEvalAndWaitAlloc(allocator: std.mem.Allocator, io: std.Io, script_body: []const u8) ![]u8 {
@@ -3756,7 +3835,51 @@ fn workspaceProcessWaitResultAlloc(
     return try writer.toOwnedSlice();
 }
 
-fn mcpToolTextResult(allocator: std.mem.Allocator, out: output.Output, id_value: std.json.Value, text: []const u8) !void {
+fn mcpToolResponseWithNameAlloc(allocator: std.mem.Allocator, text: []const u8, tool_name: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch
+        return allocator.dupe(u8, text);
+    defer parsed.deinit();
+    if (parsed.value != .object) return allocator.dupe(u8, text);
+    const result = parsed.value.object.get("result") orelse return allocator.dupe(u8, text);
+    if (result != .object) return allocator.dupe(u8, text);
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    var outer = parsed.value.object.iterator();
+    while (outer.next()) |entry| {
+        try s.objectField(entry.key_ptr.*);
+        if (!std.mem.eql(u8, entry.key_ptr.*, "result")) {
+            try writeJsonValue(&s, entry.value_ptr.*);
+            continue;
+        }
+
+        try s.beginObject();
+        var fields = result.object.iterator();
+        while (fields.next()) |field| {
+            if (std.mem.eql(u8, field.key_ptr.*, MCP_TOOL_NAME_FIELD)) continue;
+            try s.objectField(field.key_ptr.*);
+            try writeJsonValue(&s, field.value_ptr.*);
+        }
+        try s.objectField(MCP_TOOL_NAME_FIELD);
+        try s.write(tool_name);
+        try s.endObject();
+    }
+    try s.endObject();
+    return writer.toOwnedSlice();
+}
+
+fn mcpToolTextResult(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    id_value: std.json.Value,
+    text: []const u8,
+    tool_name: []const u8,
+) !void {
+    const tagged_text = try mcpToolResponseWithNameAlloc(allocator, text, tool_name);
+    defer allocator.free(tagged_text);
+
     var writer: std.Io.Writer.Allocating = .init(allocator);
     defer writer.deinit();
     var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
@@ -3768,7 +3891,7 @@ fn mcpToolTextResult(allocator: std.mem.Allocator, out: output.Output, id_value:
     try s.objectField("type");
     try s.write("text");
     try s.objectField("text");
-    try s.write(text);
+    try s.write(tagged_text);
     try s.endObject();
     try s.endArray();
     try s.endObject();
@@ -3776,22 +3899,30 @@ fn mcpToolTextResult(allocator: std.mem.Allocator, out: output.Output, id_value:
     try out.stdout("{s}\n", .{writer.written()});
 }
 
-fn mcpToolScreenshotResult(allocator: std.mem.Allocator, out: output.Output, id_value: std.json.Value, response: []const u8) !void {
+fn mcpToolScreenshotResult(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    id_value: std.json.Value,
+    response: []const u8,
+    tool_name: []const u8,
+) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch
-        return try mcpToolTextResult(allocator, out, id_value, response);
+        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
     defer parsed.deinit();
     if (parsed.value != .object or !(jsonBool(parsed.value.object.get("ok") orelse .null) orelse false)) {
-        return try mcpToolTextResult(allocator, out, id_value, response);
+        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
     }
-    const result = parsed.value.object.get("result") orelse return try mcpToolTextResult(allocator, out, id_value, response);
-    if (result != .object) return try mcpToolTextResult(allocator, out, id_value, response);
+    const result = parsed.value.object.get("result") orelse return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+    if (result != .object) return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
     const data = jsonString(result.object.get("data_base64") orelse .null) orelse
-        return try mcpToolTextResult(allocator, out, id_value, response);
+        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
 
     var metadata: std.Io.Writer.Allocating = .init(allocator);
     defer metadata.deinit();
     var metadata_json: std.json.Stringify = .{ .writer = &metadata.writer, .options = .{} };
     try metadata_json.beginObject();
+    try metadata_json.objectField(MCP_TOOL_NAME_FIELD);
+    try metadata_json.write(tool_name);
     try metadata_json.objectField("ok");
     try metadata_json.write(true);
     inline for (.{ "url", "path", "mime_type" }) |field| {
@@ -4411,6 +4542,41 @@ test "browser MCP action result is correlated by nonce" {
     defer allocator.free(matched);
     try std.testing.expect(std.mem.indexOf(u8, matched, "localhost:3000") != null);
     try std.testing.expect((try mcpBrowserActionResultAlloc(allocator, status, "other-nonce")) == null);
+}
+
+test "MCP workspace defaults prefer identity and fall back to agent cwd" {
+    try std.testing.expectEqualStrings(
+        "workspace-3",
+        mcpDefaultWorkspace("workspace-3", "/workspace/three", "/agent/cwd").?,
+    );
+    try std.testing.expectEqualStrings(
+        "/workspace/three",
+        mcpDefaultWorkspace(null, "/workspace/three", "/agent/cwd").?,
+    );
+    try std.testing.expectEqualStrings(
+        "/agent/cwd",
+        mcpDefaultWorkspace(null, null, "/agent/cwd").?,
+    );
+    try std.testing.expect(mcpDefaultWorkspace(null, null, null) == null);
+}
+
+test "MCP tool responses carry the invoked Verde tool name" {
+    const allocator = std.testing.allocator;
+    const tagged = try mcpToolResponseWithNameAlloc(
+        allocator,
+        "{\"id\":1,\"ok\":true,\"result\":{\"success\":true}}",
+        "navigate_browser",
+    );
+    defer allocator.free(tagged);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, tagged, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?;
+    try std.testing.expect(jsonBool(result.object.get("success") orelse .null).?);
+    try std.testing.expectEqualStrings(
+        "navigate_browser",
+        jsonString(result.object.get(MCP_TOOL_NAME_FIELD) orelse .null).?,
+    );
 }
 
 test "browser MCP scripts JSON-escape selectors and typed text" {

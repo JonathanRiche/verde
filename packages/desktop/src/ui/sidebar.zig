@@ -973,11 +973,15 @@ fn renderPaletteSearchTrigger(state: *runtime.AppState, rect: palette.Rect) void
     }, hint, paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 210)), hint_font, rect);
 }
 
-/// Cross-workspace "ACTIVE" cluster at the top of the expanded list: every
-/// working/waiting/done/error pane outside the selected workspace, tagged with
-/// its workspace initial. This generalizes the collapsed rail's punch-through
-/// so other workspaces' activity stays visible while their subtrees stay
-/// compact; the selected workspace's own panes render in its group below.
+const AttentionClusterRow = struct {
+    project_index: usize,
+    pane: *const native_state.WorkspacePane,
+    completed_at_ms: ?i64,
+};
+
+/// Global "ACTIVE" cluster at the top of the expanded list: every
+/// working/waiting/done/error pane across all workspaces, including the
+/// selected workspace. Pending completions sort first in completion order.
 fn renderAttentionClusterSection(
     state: *runtime.AppState,
     x: f32,
@@ -987,31 +991,84 @@ fn renderAttentionClusterSection(
     y_in: f32,
 ) f32 {
     var y = y_in;
-    var any = false;
+    var rows: [palette_hits.len]AttentionClusterRow = undefined;
+    var row_count: usize = 0;
+
     var project_index: usize = 0;
     while (project_index < state.projects.items.len) : (project_index += 1) {
-        if (project_index == state.selected_project_index) continue;
         const project = &state.projects.items[project_index];
         for (project.workspace_layout.panes.items) |*pane| {
             if (!paneNeedsAttention(state, project_index, project, pane)) continue;
-            if (!any) {
-                any = true;
-                const label_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w, .h = theme.scaledUi(18.0) };
-                if (rowVisible(label_rect, list_clip)) queuePaletteText(state, label_rect, "ACTIVE", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), clip);
-                y += theme.scaledUi(20.0);
-            }
-            const row_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w, .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS) };
-            if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip, true);
-            y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
+            if (row_count >= rows.len) continue;
+            rows[row_count] = .{
+                .project_index = project_index,
+                .pane = pane,
+                .completed_at_ms = paneCompletionTime(state, project_index, pane),
+            };
+            row_count += 1;
         }
     }
-    if (any) {
-        // Hairline divider separates the live board from the workspace tree.
-        const divider_rect: palette.Rect = .{ .x = x, .y = y + theme.scaledUi(2.0), .w = rail_w, .h = theme.scaledUi(1.0) };
-        if (rowVisible(divider_rect, list_clip)) queuePaletteRect(state, divider_rect, paletteColor(theme.borderMuted()));
-        y += theme.scaledUi(12.0);
+    if (row_count == 0) return y;
+
+    sortAttentionClusterRows(rows[0..row_count]);
+
+    const label_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w, .h = theme.scaledUi(18.0) };
+    if (rowVisible(label_rect, list_clip)) queuePaletteText(state, label_rect, "ACTIVE", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), clip);
+    y += theme.scaledUi(20.0);
+
+    for (rows[0..row_count]) |row| {
+        const project = &state.projects.items[row.project_index];
+        const row_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w, .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS) };
+        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, row.project_index, project, row.pane, row_rect, clip, true);
+        y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
     }
+
+    // Hairline divider separates the live board from the workspace tree.
+    const divider_rect: palette.Rect = .{ .x = x, .y = y + theme.scaledUi(2.0), .w = rail_w, .h = theme.scaledUi(1.0) };
+    if (rowVisible(divider_rect, list_clip)) queuePaletteRect(state, divider_rect, paletteColor(theme.borderMuted()));
+    y += theme.scaledUi(12.0);
     return y;
+}
+
+fn sortAttentionClusterRows(rows: []AttentionClusterRow) void {
+    var sort_index: usize = 1;
+    while (sort_index < rows.len) : (sort_index += 1) {
+        const current = rows[sort_index];
+        var insert_index = sort_index;
+        while (insert_index > 0 and attentionClusterRowLessThan(current, rows[insert_index - 1])) : (insert_index -= 1) {
+            rows[insert_index] = rows[insert_index - 1];
+        }
+        rows[insert_index] = current;
+    }
+}
+
+fn paneCompletionTime(
+    state: *const runtime.AppState,
+    project_index: usize,
+    pane: *const native_state.WorkspacePane,
+) ?i64 {
+    return switch (pane.ref) {
+        .chat => |ref| blk: {
+            if (project_index >= state.projects.items.len) break :blk null;
+            const project = &state.projects.items[project_index];
+            if (ref.thread_index >= project.threads.items.len) break :blk null;
+            const thread = &project.threads.items[ref.thread_index];
+            break :blk if (thread.completion_pending) thread.completed_at_ms else null;
+        },
+        .terminal => |ref| blk: {
+            const surface = state.projectTerminalSurface(project_index, ref.dock_id) orelse break :blk null;
+            break :blk if (surface.completion_pending) surface.completed_at_ms else null;
+        },
+        else => null,
+    };
+}
+
+fn attentionClusterRowLessThan(left: AttentionClusterRow, right: AttentionClusterRow) bool {
+    if (left.completed_at_ms != null and right.completed_at_ms == null) return true;
+    if (left.completed_at_ms == null or right.completed_at_ms == null) return false;
+    if (left.completed_at_ms.? != right.completed_at_ms.?) return left.completed_at_ms.? < right.completed_at_ms.?;
+    if (left.project_index != right.project_index) return left.project_index < right.project_index;
+    return left.pane.id < right.pane.id;
 }
 
 fn herdrRuntimeBadgeLabel(project: *const native_state.Project) ?[]const u8 {
@@ -1224,7 +1281,7 @@ fn workspaceStatusColor(state: *runtime.AppState, project_index: usize) ?[4]f32 
         switch (pane.ref) {
             .terminal => |ref| {
                 if (state.projectTerminalSurface(project_index, ref.dock_id)) |surface| {
-                    switch (surface.status) {
+                    switch (surface.displayStatus()) {
                         .@"error" => return theme.COLOR_DIFF_REMOVE,
                         .waiting => has_waiting = true,
                         .done => has_done = true,
@@ -1234,7 +1291,14 @@ fn workspaceStatusColor(state: *runtime.AppState, project_index: usize) ?[4]f32 
                 }
             },
             .chat => |ref| {
-                if (ref.thread_index < project.threads.items.len and project.threads.items[ref.thread_index].isSendPendingForUi()) has_working = true;
+                if (ref.thread_index < project.threads.items.len) {
+                    const thread = &project.threads.items[ref.thread_index];
+                    if (thread.completion_pending) {
+                        has_done = true;
+                    } else if (thread.isSendPendingForUi()) {
+                        has_working = true;
+                    }
+                }
             },
             .browser => {},
         }
@@ -1342,13 +1406,18 @@ fn collapsedPaneIndicator(
     switch (pane.ref) {
         .chat => |ref| {
             if (ref.thread_index < project.threads.items.len) {
-                running = project.threads.items[ref.thread_index].isSendPendingForUi();
+                const thread = &project.threads.items[ref.thread_index];
+                if (thread.completion_pending) {
+                    status = .done;
+                } else {
+                    running = thread.isSendPendingForUi();
+                }
             }
         },
         .terminal => |ref| {
             if (state.projectTerminalSurface(project_index, ref.dock_id)) |surface| {
-                status = surface.status;
-                running = surface.status == .working;
+                status = surface.displayStatus();
+                running = !surface.completion_pending and surface.status == .working;
             }
         },
         .browser => {},
@@ -1474,7 +1543,11 @@ fn renderOpenPaneRow(
                 const thread = &project.threads.items[ref.thread_index];
                 queuePaletteProviderGlyph(state, thread.provider, icon_x, cy, clip);
                 title = thread.title;
-                running = thread.isSendPendingForUi();
+                if (thread.completion_pending) {
+                    status = .done;
+                } else {
+                    running = thread.isSendPendingForUi();
+                }
                 if (running) status_started_at_ms = thread.sendStartedAtMsForUi();
             } else {
                 queuePaletteChatBubbleIcon(state, icon_x, cy, muted);
@@ -1484,8 +1557,8 @@ fn renderOpenPaneRow(
         .terminal => |ref| {
             const surface = state.projectTerminalSurface(project_index, ref.dock_id);
             if (surface) |s| {
-                status = s.status;
-                if (s.status == .working) {
+                status = s.displayStatus();
+                if (!s.completion_pending and s.status == .working) {
                     running = true;
                     if (s.status_changed_at_ms > 0) status_started_at_ms = s.status_changed_at_ms;
                 }
@@ -1642,13 +1715,14 @@ fn paneNeedsAttention(
     switch (pane.ref) {
         .chat => |ref| {
             if (ref.thread_index >= project.threads.items.len) return false;
-            return project.threads.items[ref.thread_index].isSendPendingForUi();
+            const thread = &project.threads.items[ref.thread_index];
+            return thread.completion_pending or thread.isSendPendingForUi();
         },
         .terminal => |ref| {
             const surface = state.projectTerminalSurface(project_index, ref.dock_id) orelse return false;
             // Done remains visible here until the terminal focus path
             // acknowledges it by resetting the surface to idle.
-            return switch (surface.status) {
+            return switch (surface.displayStatus()) {
                 .working, .waiting, .done, .@"error" => true,
                 .idle => false,
             };
@@ -2083,4 +2157,22 @@ test "done pane status uses the themed success treatment" {
     var label_buf: [24]u8 = undefined;
     try std.testing.expectEqualStrings("Done", paneStatusLabelText(&label_buf, .done, false, null));
     try std.testing.expectEqual(theme.success(), paneStatusColor(.done, false).?);
+}
+
+test "ACTIVE rows put durable completions first in finish order" {
+    var panes = [_]native_state.WorkspacePane{
+        .{ .id = 1, .ref = .{ .browser = .{} } },
+        .{ .id = 2, .ref = .{ .browser = .{} } },
+        .{ .id = 3, .ref = .{ .browser = .{} } },
+    };
+    var rows = [_]AttentionClusterRow{
+        .{ .project_index = 0, .pane = &panes[0], .completed_at_ms = null },
+        .{ .project_index = 1, .pane = &panes[1], .completed_at_ms = 200 },
+        .{ .project_index = 0, .pane = &panes[2], .completed_at_ms = 100 },
+    };
+
+    sortAttentionClusterRows(&rows);
+    try std.testing.expectEqual(@as(native_state.WorkspacePaneId, 3), rows[0].pane.id);
+    try std.testing.expectEqual(@as(native_state.WorkspacePaneId, 2), rows[1].pane.id);
+    try std.testing.expectEqual(@as(native_state.WorkspacePaneId, 1), rows[2].pane.id);
 }

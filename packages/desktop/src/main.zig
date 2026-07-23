@@ -641,6 +641,7 @@ fn mainInner(init: std.process.Init) !void {
         _ = state.palette_frame_text_arena.reset(.retain_capacity);
         state.code_copy_buttons.clearRetainingCapacity();
         state.card_toggle_hits.clearRetainingCapacity();
+        state.background_task_action_hits.clearRetainingCapacity();
 
         recordSpan(&frame_sample, .render_root, struct {
             fn run(app_state: *AppState, framebuffer_width: c_int, framebuffer_height: c_int) void {
@@ -1336,6 +1337,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
         },
         .window_focus_gained => {
             state.window_input_focus = true;
+            _ = state.acknowledgeFocusedPaneCompletion();
         },
         .window_focus_lost => {
             state.window_input_focus = false;
@@ -1352,6 +1354,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             const action = keyboard.actionForEvent(&event.key);
+            if (keyboard.workspacePaneSelectIndexForEvent(&event.key)) |pane_ordinal| {
+                if (state.focusCurrentProjectWorkspacePaneAtSidebarIndex(pane_ordinal)) {
+                    syncWindowTextInput(window, state);
+                    return true;
+                }
+            }
             // Pane-level bindings must stay app-owned even when an embedded
             // terminal has keyboard focus. Resolve them before terminal-owned
             // shortcut routing so Alt+Z zoom does not leak into TUIs such as

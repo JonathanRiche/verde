@@ -14,6 +14,7 @@ const FALLBACK_EXECUTABLE = "cursor-agent";
 const DEFAULT_MODEL = "composer-2";
 const MAX_ACP_LINE_BYTES = 16 * 1024 * 1024;
 const MAX_CURSOR_OUTPUT_BYTES = 8 * 1024 * 1024;
+const MCP_TOOL_NAME_FIELD = "_verdeMcpTool";
 
 const Mutex = struct {
     inner: std.atomic.Mutex = .unlocked,
@@ -936,7 +937,17 @@ fn handleLiveSessionUpdate(
         const event = (try cursorToolEventAlloc(allocator, update, kind)) orelse return;
         defer event.deinit(allocator);
         if (request.on_stream_event) |on_stream_event| {
-            on_stream_event(request.stream_context, .{ .message = .{ .title = event.title, .body = event.body } });
+            on_stream_event(request.stream_context, .{ .tool_call = .{
+                .call_id = event.call_id,
+                .title = event.title,
+                .kind = event.tool_kind,
+                .status = event.status,
+                .input = event.input,
+                .output = event.output,
+                .error_text = event.error_text,
+                .locations = event.locations,
+                .raw = event.raw,
+            } });
         }
     }
 }
@@ -1015,48 +1026,115 @@ fn contentText(update: std.json.Value) ?[]const u8 {
 }
 
 const CursorToolEvent = struct {
+    call_id: []u8,
     title: []u8,
-    body: []u8,
+    tool_kind: ?provider_types.ToolCallKind,
+    status: ?provider_types.ToolCallStatus,
+    input: ?[]u8,
+    output: ?[]u8,
+    error_text: ?[]u8,
+    locations: ?[]u8,
+    raw: []u8,
 
     fn deinit(self: CursorToolEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.call_id);
         allocator.free(self.title);
-        allocator.free(self.body);
+        if (self.input) |value| allocator.free(value);
+        if (self.output) |value| allocator.free(value);
+        if (self.error_text) |value| allocator.free(value);
+        if (self.locations) |value| allocator.free(value);
+        allocator.free(self.raw);
     }
 };
 
 fn cursorToolEventAlloc(allocator: std.mem.Allocator, update: std.json.Value, kind: []const u8) !?CursorToolEvent {
-    const title_text = cursorToolTitle(update);
-    const body = try cursorToolBodyAlloc(allocator, update);
-    errdefer if (body) |text| allocator.free(text);
-    const status = getTrimmedObjectString(update, "status");
+    _ = kind;
+    const title = try cursorToolTitleAlloc(allocator, update);
+    errdefer allocator.free(title);
+    const call_id_text = cursorToolCallId(update) orelse "";
+    const status = cursorToolStatus(update);
+    const input = try cursorToolInputAlloc(allocator, update);
+    errdefer if (input) |value| allocator.free(value);
+    const output = try cursorToolOutputAlloc(allocator, update);
+    errdefer if (output) |value| allocator.free(value);
+    const error_text = try cursorToolErrorAlloc(allocator, update, status);
+    errdefer if (error_text) |value| allocator.free(value);
+    const locations = try cursorToolLocationsAlloc(allocator, update);
+    errdefer if (locations) |value| allocator.free(value);
+    const raw = try jsonValueCompactAlloc(allocator, update);
+    errdefer allocator.free(raw);
 
-    if (body) |text| {
-        if (isNoisyCursorToolStatus(text)) {
-            allocator.free(text);
-            return null;
-        }
-        return .{
-            .title = try allocator.dupe(u8, title_text),
-            .body = text,
-        };
+    const has_meaningful_content = input != null or output != null or error_text != null or locations != null;
+    if (call_id_text.len == 0 and !has_meaningful_content and title.len == 0) {
+        allocator.free(title);
+        return null;
     }
-    if (status) |text| {
-        if (isNoisyCursorToolStatus(text)) return null;
-        return .{
-            .title = try allocator.dupe(u8, title_text),
-            .body = try allocator.dupe(u8, text),
-        };
-    }
-    if (std.mem.eql(u8, kind, "tool_call") and !std.mem.eql(u8, title_text, "Cursor tool")) {
-        return .{
-            .title = try allocator.dupe(u8, title_text),
-            .body = try allocator.dupe(u8, "Started"),
-        };
+
+    return .{
+        .call_id = try allocator.dupe(u8, call_id_text),
+        .title = title,
+        .tool_kind = cursorToolKind(update),
+        .status = status,
+        .input = input,
+        .output = output,
+        .error_text = error_text,
+        .locations = locations,
+        .raw = raw,
+    };
+}
+
+fn cursorToolCallId(update: std.json.Value) ?[]const u8 {
+    if (getTrimmedObjectString(update, "toolCallId")) |call_id| return call_id;
+    if (getObjectField(update, "toolCall")) |tool_call| {
+        if (getTrimmedObjectString(tool_call, "toolCallId")) |call_id| return call_id;
+        if (getTrimmedObjectString(tool_call, "id")) |call_id| return call_id;
     }
     return null;
 }
 
-fn cursorToolTitle(update: std.json.Value) []const u8 {
+fn cursorToolKind(update: std.json.Value) ?provider_types.ToolCallKind {
+    if (cursorMcpToolName(update) != null) return .mcp;
+    const explicit_kind = getTrimmedObjectString(update, "kind") orelse nested: {
+        const tool_call = getObjectField(update, "toolCall") orelse break :nested null;
+        break :nested getTrimmedObjectString(tool_call, "kind");
+    };
+    if (explicit_kind) |kind| {
+        if (std.mem.eql(u8, kind, "read")) return .read;
+        if (std.mem.eql(u8, kind, "edit")) return .edit;
+        if (std.mem.eql(u8, kind, "delete")) return .delete;
+        if (std.mem.eql(u8, kind, "move")) return .move;
+        if (std.mem.eql(u8, kind, "search")) return .search;
+        if (std.mem.eql(u8, kind, "execute")) return .execute;
+        if (std.mem.eql(u8, kind, "think")) return .think;
+        if (std.mem.eql(u8, kind, "fetch")) return .fetch;
+        // ACP `other` is deliberately non-specific. Let provider titles such
+        // as `MCP: ...` refine it, and otherwise preserve an earlier kind.
+        if (!std.mem.eql(u8, kind, "other")) return .other;
+    }
+
+    const title = cursorToolTitle(update) orelse "";
+    if (std.ascii.startsWithIgnoreCase(title, "mcp") or std.ascii.startsWithIgnoreCase(title, "verde:")) return .mcp;
+    if (getTrimmedObjectString(update, "command") != null or title.len > 0 and title[0] == '`') return .execute;
+    if (std.ascii.startsWithIgnoreCase(title, "read")) return .read;
+    if (std.ascii.startsWithIgnoreCase(title, "edit") or std.ascii.startsWithIgnoreCase(title, "write")) return .edit;
+    if (std.ascii.startsWithIgnoreCase(title, "grep") or std.ascii.startsWithIgnoreCase(title, "find") or std.ascii.startsWithIgnoreCase(title, "search")) return .search;
+    return null;
+}
+
+fn cursorToolStatus(update: std.json.Value) ?provider_types.ToolCallStatus {
+    const status = getTrimmedObjectString(update, "status") orelse nested: {
+        const tool_call = getObjectField(update, "toolCall") orelse return null;
+        break :nested getTrimmedObjectString(tool_call, "status") orelse return null;
+    };
+    if (std.mem.eql(u8, status, "pending")) return .pending;
+    if (std.mem.eql(u8, status, "in_progress")) return .in_progress;
+    if (std.mem.eql(u8, status, "completed")) return .completed;
+    if (std.mem.eql(u8, status, "failed")) return .failed;
+    if (std.mem.eql(u8, status, "cancelled") or std.mem.eql(u8, status, "canceled")) return .cancelled;
+    return .unknown;
+}
+
+fn cursorToolTitle(update: std.json.Value) ?[]const u8 {
     if (getTrimmedObjectString(update, "title")) |title| return title;
     if (getTrimmedObjectString(update, "name")) |name| return name;
     if (getTrimmedObjectString(update, "toolName")) |tool_name| return tool_name;
@@ -1065,45 +1143,107 @@ fn cursorToolTitle(update: std.json.Value) []const u8 {
         if (getTrimmedObjectString(tool_call, "name")) |name| return name;
         if (getTrimmedObjectString(tool_call, "toolName")) |tool_name| return tool_name;
     }
-    return "Cursor tool";
+    return null;
 }
 
-fn cursorToolBodyAlloc(allocator: std.mem.Allocator, update: std.json.Value) !?[]u8 {
-    if (getTrimmedObjectString(update, "command")) |command| return try toolBodyWithNameAlloc(allocator, update, command);
-    if (getTrimmedObjectString(update, "body")) |body| return try allocator.dupe(u8, body);
-    if (getTrimmedObjectString(update, "description")) |description| return try allocator.dupe(u8, description);
-    if (try cursorToolStructuredBodyAlloc(allocator, update)) |body| return body;
-    if (getObjectField(update, "toolCall")) |tool_call| {
-        if (getTrimmedObjectString(tool_call, "command")) |command| return try toolBodyWithNameAlloc(allocator, update, command);
-        if (getTrimmedObjectString(tool_call, "body")) |body| return try allocator.dupe(u8, body);
-        if (getTrimmedObjectString(tool_call, "description")) |description| return try allocator.dupe(u8, description);
-        if (try cursorToolStructuredBodyAlloc(allocator, tool_call)) |body| return body;
+fn cursorToolTitleAlloc(allocator: std.mem.Allocator, update: std.json.Value) ![]u8 {
+    if (cursorMcpToolName(update)) |tool_name| {
+        return std.fmt.allocPrint(allocator, "MCP: {s}", .{tool_name});
     }
-    if (contentText(update)) |text| {
-        const trimmed = std.mem.trim(u8, text, &std.ascii.whitespace);
-        if (trimmed.len > 0) return try allocator.dupe(u8, trimmed);
+    if (cursorToolTitle(update)) |title| return allocator.dupe(u8, title);
+    return allocator.dupe(u8, "");
+}
+
+fn cursorMcpToolName(update: std.json.Value) ?[]const u8 {
+    if (getTrimmedObjectString(update, MCP_TOOL_NAME_FIELD)) |name| return name;
+    for ([_][]const u8{ "rawOutput", "output", "result" }) |field_name| {
+        const field = getObjectField(update, field_name) orelse continue;
+        if (getTrimmedObjectString(field, MCP_TOOL_NAME_FIELD)) |name| return name;
+    }
+    if (getObjectField(update, "toolCall")) |tool_call| {
+        if (getTrimmedObjectString(tool_call, MCP_TOOL_NAME_FIELD)) |name| return name;
+        for ([_][]const u8{ "rawOutput", "output", "result" }) |field_name| {
+            const field = getObjectField(tool_call, field_name) orelse continue;
+            if (getTrimmedObjectString(field, MCP_TOOL_NAME_FIELD)) |name| return name;
+        }
     }
     return null;
 }
 
-fn cursorToolStructuredBodyAlloc(allocator: std.mem.Allocator, value: std.json.Value) !?[]u8 {
-    const field_names = [_][]const u8{ "input", "args", "arguments", "rawInput", "params" };
+fn cursorToolInputAlloc(allocator: std.mem.Allocator, update: std.json.Value) !?[]u8 {
+    const field_names = [_][]const u8{ "rawInput", "input", "args", "arguments", "params", "command" };
+    if (try cursorToolFieldsAlloc(allocator, update, &field_names)) |value| return value;
+    if (getObjectField(update, "toolCall")) |tool_call| {
+        return cursorToolFieldsAlloc(allocator, tool_call, &field_names);
+    }
+    return null;
+}
+
+fn cursorToolOutputAlloc(allocator: std.mem.Allocator, update: std.json.Value) !?[]u8 {
+    const field_names = [_][]const u8{ "rawOutput", "output", "result", "content" };
+    if (try cursorToolFieldsAlloc(allocator, update, &field_names)) |value| return value;
+    if (getObjectField(update, "toolCall")) |tool_call| {
+        return cursorToolFieldsAlloc(allocator, tool_call, &field_names);
+    }
+    return null;
+}
+
+fn cursorToolErrorAlloc(
+    allocator: std.mem.Allocator,
+    update: std.json.Value,
+    status: ?provider_types.ToolCallStatus,
+) !?[]u8 {
+    const field_names = [_][]const u8{ "error", "errorMessage" };
+    if (try cursorToolFieldsAlloc(allocator, update, &field_names)) |value| return value;
+    if (getObjectField(update, "toolCall")) |tool_call| {
+        if (try cursorToolFieldsAlloc(allocator, tool_call, &field_names)) |value| return value;
+    }
+    if ((status orelse .unknown) != .failed) return null;
+    if (getTrimmedObjectString(update, "body")) |body| return try allocator.dupe(u8, body);
+    if (getTrimmedObjectString(update, "description")) |description| return try allocator.dupe(u8, description);
+    return null;
+}
+
+fn cursorToolLocationsAlloc(allocator: std.mem.Allocator, update: std.json.Value) !?[]u8 {
+    const field_names = [_][]const u8{"locations"};
+    if (try cursorToolFieldsAlloc(allocator, update, &field_names)) |value| return value;
+    if (getObjectField(update, "toolCall")) |tool_call| {
+        return cursorToolFieldsAlloc(allocator, tool_call, &field_names);
+    }
+    return null;
+}
+
+fn cursorToolFieldsAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    field_names: []const []const u8,
+) !?[]u8 {
     for (field_names) |field_name| {
         const field = getObjectField(value, field_name) orelse continue;
         switch (field) {
             .string => |text| {
                 const trimmed = std.mem.trim(u8, text, &std.ascii.whitespace);
-                if (trimmed.len > 0) return try toolBodyWithNameAlloc(allocator, value, trimmed);
+                if (trimmed.len > 0) return try allocator.dupe(u8, trimmed);
             },
-            .object, .array => {
-                const json = try jsonValueCompactAlloc(allocator, field);
-                errdefer allocator.free(json);
+            .object => |object| {
+                if (object.count() == 0) continue;
+                const json = (try jsonObjectForToolDisplayAlloc(allocator, object)) orelse continue;
                 const trimmed = std.mem.trim(u8, json, &std.ascii.whitespace);
                 if (trimmed.len == 0) {
                     allocator.free(json);
                     continue;
                 }
-                return try toolBodyWithNameOwnedAlloc(allocator, value, json);
+                return json;
+            },
+            .array => |array| {
+                if (array.items.len == 0) continue;
+                const json = try jsonValueCompactAlloc(allocator, field);
+                const trimmed = std.mem.trim(u8, json, &std.ascii.whitespace);
+                if (trimmed.len == 0) {
+                    allocator.free(json);
+                    continue;
+                }
+                return json;
             },
             else => {},
         }
@@ -1111,17 +1251,26 @@ fn cursorToolStructuredBodyAlloc(allocator: std.mem.Allocator, value: std.json.V
     return null;
 }
 
-fn toolBodyWithNameAlloc(allocator: std.mem.Allocator, update: std.json.Value, body: []const u8) ![]u8 {
-    const title = cursorToolTitle(update);
-    if (std.mem.eql(u8, title, "Cursor tool")) return allocator.dupe(u8, body);
-    return std.fmt.allocPrint(allocator, "{s}: {s}", .{ title, body });
-}
+fn jsonObjectForToolDisplayAlloc(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) !?[]u8 {
+    if (object.count() == 0) return null;
+    if (object.count() == 1 and object.get(MCP_TOOL_NAME_FIELD) != null) return null;
 
-fn toolBodyWithNameOwnedAlloc(allocator: std.mem.Allocator, update: std.json.Value, body: []u8) ![]u8 {
-    const title = cursorToolTitle(update);
-    if (std.mem.eql(u8, title, "Cursor tool")) return body;
-    defer allocator.free(body);
-    return std.fmt.allocPrint(allocator, "{s}: {s}", .{ title, body });
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try stringify.beginObject();
+    var fields = object.iterator();
+    while (fields.next()) |field| {
+        if (std.mem.eql(u8, field.key_ptr.*, MCP_TOOL_NAME_FIELD)) continue;
+        try stringify.objectField(field.key_ptr.*);
+        try stringify.write(field.value_ptr.*);
+    }
+    try stringify.endObject();
+    const json = try writer.toOwnedSlice();
+    return @as(?[]u8, json);
 }
 
 fn jsonValueCompactAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
@@ -1136,13 +1285,6 @@ fn getTrimmedObjectString(value: std.json.Value, key: []const u8) ?[]const u8 {
     const text = getOptionalObjectString(value, key) orelse return null;
     const trimmed = std.mem.trim(u8, text, &std.ascii.whitespace);
     return if (trimmed.len > 0) trimmed else null;
-}
-
-fn isNoisyCursorToolStatus(text: []const u8) bool {
-    const trimmed = std.mem.trim(u8, text, &std.ascii.whitespace);
-    return std.mem.eql(u8, trimmed, "pending") or
-        std.mem.eql(u8, trimmed, "in_progress") or
-        std.mem.eql(u8, trimmed, "completed");
 }
 
 fn appendChatMessageChunk(
@@ -1548,14 +1690,20 @@ test "handleReadSessionUpdate combines consecutive role chunks" {
     try std.testing.expectEqualStrings("hello", state.messages.items[0].body);
 }
 
-test "cursorToolEvent suppresses status-only ACP tool updates" {
+test "cursorToolEvent preserves status-only ACP lifecycle updates" {
     const payload =
         \\{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"in_progress"}
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
     defer parsed.deinit();
-    const event = try cursorToolEventAlloc(std.testing.allocator, parsed.value, "tool_call_update");
-    try std.testing.expect(event == null);
+    const event = (try cursorToolEventAlloc(std.testing.allocator, parsed.value, "tool_call_update")).?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("call-1", event.call_id);
+    try std.testing.expectEqualStrings("", event.title);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.in_progress, event.status.?);
+    try std.testing.expect(event.tool_kind == null);
+    try std.testing.expect(event.input == null);
+    try std.testing.expect(event.output == null);
 }
 
 test "cursorToolEvent keeps meaningful ACP tool text" {
@@ -1567,7 +1715,8 @@ test "cursorToolEvent keeps meaningful ACP tool text" {
     const event = (try cursorToolEventAlloc(std.testing.allocator, parsed.value, "tool_call")).?;
     defer event.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("Shell", event.title);
-    try std.testing.expectEqualStrings("Shell: git status --short", event.body);
+    try std.testing.expectEqual(provider_types.ToolCallKind.execute, event.tool_kind.?);
+    try std.testing.expectEqualStrings("git status --short", event.input.?);
 }
 
 test "cursorToolEvent keeps non-lifecycle status failures" {
@@ -1579,7 +1728,7 @@ test "cursorToolEvent keeps non-lifecycle status failures" {
     const event = (try cursorToolEventAlloc(std.testing.allocator, parsed.value, "tool_call_update")).?;
     defer event.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("edit", event.title);
-    try std.testing.expectEqualStrings("failed", event.body);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.failed, event.status.?);
 }
 
 test "cursorToolEvent shows tool call starts with structured input" {
@@ -1591,7 +1740,47 @@ test "cursorToolEvent shows tool call starts with structured input" {
     const event = (try cursorToolEventAlloc(std.testing.allocator, parsed.value, "tool_call")).?;
     defer event.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("Read", event.title);
-    try std.testing.expectEqualStrings("Read: {\"path\":\"/tmp/a.txt\"}", event.body);
+    try std.testing.expectEqual(provider_types.ToolCallKind.read, event.tool_kind.?);
+    try std.testing.expectEqualStrings("{\"path\":\"/tmp/a.txt\"}", event.input.?);
+}
+
+test "cursorToolEvent ignores empty ACP input containers" {
+    const payload =
+        \\{"sessionUpdate":"tool_call","toolCallId":"call-2","title":"Read File","kind":"read","rawInput":{},"locations":[{"path":"/tmp/a.txt"}],"status":"pending"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const event = (try cursorToolEventAlloc(std.testing.allocator, parsed.value, "tool_call")).?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expect(event.input == null);
+    try std.testing.expectEqualStrings("[{\"path\":\"/tmp/a.txt\"}]", event.locations.?);
+    try std.testing.expectEqualStrings(payload, event.raw);
+}
+
+test "cursorToolEvent ignores empty ACP output arrays" {
+    const payload =
+        \\{"sessionUpdate":"tool_call_update","toolCallId":"call-3","title":"MCP: tool","kind":"other","content":[],"status":"completed"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const event = (try cursorToolEventAlloc(std.testing.allocator, parsed.value, "tool_call_update")).?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expectEqual(provider_types.ToolCallKind.mcp, event.tool_kind.?);
+    try std.testing.expect(event.output == null);
+    try std.testing.expectEqualStrings(payload, event.raw);
+}
+
+test "cursorToolEvent promotes tagged Verde MCP results into the title" {
+    const payload =
+        \\{"sessionUpdate":"tool_call_update","toolCallId":"call-4","status":"completed","rawOutput":{"success":true,"_verdeMcpTool":"navigate_browser"}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const event = (try cursorToolEventAlloc(std.testing.allocator, parsed.value, "tool_call_update")).?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("MCP: navigate_browser", event.title);
+    try std.testing.expectEqual(provider_types.ToolCallKind.mcp, event.tool_kind.?);
+    try std.testing.expectEqualStrings("{\"success\":true}", event.output.?);
 }
 
 test "handleSendPromptLine accepts session/load response without sessionId" {
