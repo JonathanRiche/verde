@@ -1398,6 +1398,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     return true;
                 }
             }
+            if (handleGuiChatShortcut(state, keyboard, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (keyboard.workspaceSelectIndexForEvent(&event.key)) |workspace_ordinal| {
                 if (state.selectProjectAtIndex(workspace_ordinal)) {
                     syncWindowTextInput(window, state);
@@ -2097,6 +2101,21 @@ fn handleWorkspaceContextMenuShortcut(state: *AppState, event: *const sdl.Keyboa
         return false;
     }
     return workspace_panes_ui.openFocusedChatPaneContextMenu(state);
+}
+
+fn handleGuiChatShortcut(
+    state: *AppState,
+    keyboard: *const keybinds.NativeKeyboardConfig,
+    event: *const sdl.KeyboardEvent,
+) bool {
+    const action = keyboard.chatActionForEvent(event) orelse return false;
+    if (state.terminal_focused or state.isBrowserPaneFocused() or state.browser_address_focused) return false;
+    if (state.focusedWorkspacePaneKind() != .chat and state.focusedWorkspaceChatPaneId() == null) return false;
+    switch (action) {
+        .model_picker => state.togglePaletteModelPickerFromShortcut(),
+        .run_config => state.toggleRunConfigPopoverFromShortcut(),
+    }
+    return true;
 }
 
 fn handleComposerFocusShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {

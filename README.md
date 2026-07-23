@@ -697,6 +697,10 @@ Example config:
     "sidebar": "CommandOrControl+S",
     "sidebar_hidden": "Ctrl+Shift+S",
     "browser": "Ctrl+B",
+    "chat": {
+      "model_picker": "Alt+M",
+      "run_config": "Alt+R"
+    },
     "workspace": {
       "split_chat_vertical": "CommandOrControl+Alt+C",
       "split_chat_horizontal": "CommandOrControl+Alt+Shift+C",
@@ -749,6 +753,7 @@ Example config:
 ```
 
 Keybinds are loaded on startup and app refresh. Use a string for one shortcut or a string array for multiple shortcuts. Use `null`, an empty string, or an empty array to disable a binding.
+The nested `chat` bindings only run while a GUI chat pane is focused; they do not intercept input in terminal or browser panes. The model picker includes initial provider selection on a fresh thread.
 
 ## Logs
 
