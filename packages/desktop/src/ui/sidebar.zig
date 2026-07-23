@@ -5,6 +5,7 @@ const palette = @import("palette");
 const sdl = @import("zsdl3");
 const theme = @import("theme.zig");
 const colors = @import("colors.zig");
+const globe_icon = @import("globe_icon.zig");
 const runtime = @import("runtime.zig");
 const command_palette = @import("command_palette.zig");
 const utils = @import("../utils.zig");
@@ -1602,7 +1603,7 @@ fn renderOpenPaneRow(
             title = stripLeadingTitleSymbols(title);
         },
         .browser => {
-            queuePaletteGlobeIcon(state, icon_x + theme.scaledUi(7.0), cy, theme.scaledUi(13.0), paletteColor(muted));
+            globe_icon.queue(state, icon_x + theme.scaledUi(7.0), cy, theme.scaledUi(13.0), paletteColor(muted));
             title = browserPaneTitle(pane);
         },
     }
@@ -1759,15 +1760,6 @@ fn browserPaneTitle(pane: *const native_state.WorkspacePane) []const u8 {
     const url = ref.url orelse return "Browser";
     if (url.len == 0) return "Browser";
     return url;
-}
-
-/// Draws a minimal globe glyph (circle + equator + meridian) for browser panes.
-fn queuePaletteGlobeIcon(state: *runtime.AppState, cx: f32, cy: f32, size: f32, color: palette.Color) void {
-    const r = size * 0.5;
-    const stroke = @max(theme.scaledUi(1.0), size * 0.09);
-    queuePaletteBorder(state, .{ .x = cx - r, .y = cy - r, .w = size, .h = size }, color, r, stroke);
-    queuePaletteRect(state, .{ .x = cx - r, .y = cy - stroke * 0.5, .w = size, .h = stroke }, color);
-    queuePaletteRect(state, .{ .x = cx - stroke * 0.5, .y = cy - r, .w = stroke, .h = size }, color);
 }
 
 fn rowVisible(row: palette.Rect, viewport: palette.Rect) bool {
