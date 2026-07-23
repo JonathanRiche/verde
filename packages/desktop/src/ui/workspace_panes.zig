@@ -34,8 +34,12 @@ const TERMINAL_ZOOM_HOVER_WIDTH_CSS: f32 = 112.0;
 const TERMINAL_ZOOM_HOVER_HEIGHT_CSS: f32 = 48.0;
 const FOCUS_BORDER_WIDTH_CSS: f32 = 2.0;
 const ZOOM_BORDER_WIDTH_CSS: f32 = 3.0;
+const STATUS_BORDER_WIDTH_CSS: f32 = 3.0;
+const STATUS_ZOOM_BORDER_WIDTH_CSS: f32 = 4.0;
 const ZOOM_ICON_FOREGROUND_MIX: f32 = 0.30;
 const ZOOM_BORDER_FOREGROUND_MIX: f32 = 0.60;
+const DONE_PULSE_PERIOD_MS: i64 = 2800;
+const WORKING_PULSE_PERIOD_MS: i64 = 2200;
 
 // Font Awesome glyphs bundled in SymbolsNerdFontMono and rendered with Palette's icon role.
 const NF_FA_EXPAND = "\u{F065}";
@@ -130,36 +134,16 @@ pub fn isFocusAnimating() bool {
     return (nowMs() - focus_anim_start_ms) < FOCUS_ANIM_DURATION_MS;
 }
 
-// "Completion pulse": when a pane's agent work transitions to `.done` we flash
-// its tiled border in a distinct themed color for ~2s, then ease back to the
-// resting focus-border color. This is the workspace-pane analog of the sidebar
-// "done" pip. We track per-pane status here (on the main thread, in renderAt)
-// because the IPC worker thread owns surface updates and must not read layout.
-const COMPLETION_PULSE_DURATION_MS: i64 = 2000;
-// Number of brighten/dim cycles the border performs across the pulse window.
-const COMPLETION_PULSE_CYCLES: f32 = 2.0;
-// One slot per layout pane we can realistically have on screen at once.
-const MAX_COMPLETION_PULSE_SLOTS = MAX_WORKSPACE_PANE_RECTS;
-
-const CompletionPulseSlot = struct {
-    pane_id: runtime.WorkspacePaneId = 0,
-    // Last observed surface status for this pane, used to detect the
-    // `!= .done` -> `.done` edge that triggers a fresh pulse.
-    last_status: runtime.SurfaceStatus = .idle,
-    start_ms: i64 = std.math.minInt(i64) >> 2,
-    used: bool = false,
+const PaneAgentVisualStatus = enum {
+    idle,
+    working,
+    done,
 };
 
-var completion_pulse_slots: [MAX_COMPLETION_PULSE_SLOTS]CompletionPulseSlot =
-    [_]CompletionPulseSlot{.{}} ** MAX_COMPLETION_PULSE_SLOTS;
+var pane_status_animating = false;
 
-pub fn isCompletionPulseAnimating() bool {
-    const now = nowMs();
-    for (completion_pulse_slots) |slot| {
-        if (!slot.used) continue;
-        if ((now - slot.start_ms) < COMPLETION_PULSE_DURATION_MS) return true;
-    }
-    return false;
+pub fn isPaneStatusAnimating() bool {
+    return pane_status_animating;
 }
 
 pub fn hasActivePaneDrag() bool {
@@ -465,83 +449,38 @@ fn tickFocusAnimation(state: *runtime.AppState) void {
     focus_anim_start_ms = nowMs();
 }
 
-// Scans the current project's panes for terminal surfaces that just finished
-// (`status` flipped to `.done`) and stamps a completion pulse for that pane.
-// Runs on the main thread from renderAt so it can safely read layout/surfaces.
-fn tickCompletionPulse(state: *runtime.AppState) void {
-    if (state.projects.items.len == 0) return;
-    if (state.selected_project_index >= state.projects.items.len) return;
-    const layout = &state.projects.items[state.selected_project_index].workspace_layout;
-    const now = nowMs();
-    for (layout.panes.items) |pane| {
-        const dock_id = switch (pane.ref) {
-            .terminal => |ref| ref.dock_id,
-            else => continue,
-        };
-        const surface = state.projectTerminalSurface(state.selected_project_index, dock_id);
-        const status: runtime.SurfaceStatus = if (surface) |s| s.status else .idle;
-        const slot = completionPulseSlot(pane.id);
-        // Trigger on the transition into `.done`; holding at `.done` must not
-        // re-fire, and a never-seen pane adopts its current status silently.
-        if (slot.used and slot.last_status != .done and status == .done) {
-            slot.start_ms = now;
-        }
-        slot.last_status = status;
-        slot.used = true;
-    }
-}
-
-// Returns the tracking slot for a pane, reusing an existing one or claiming a
-// free/oldest slot. Pane ids are reused sparingly so a small table is fine.
-fn completionPulseSlot(pane_id: runtime.WorkspacePaneId) *CompletionPulseSlot {
-    var free: ?*CompletionPulseSlot = null;
-    var oldest: *CompletionPulseSlot = &completion_pulse_slots[0];
-    for (&completion_pulse_slots) |*slot| {
-        if (slot.used and slot.pane_id == pane_id) return slot;
-        if (!slot.used and free == null) free = slot;
-        if (slot.start_ms < oldest.start_ms) oldest = slot;
-    }
-    const target = free orelse oldest;
-    target.* = .{ .pane_id = pane_id };
-    return target;
-}
-
-// Fraction of the pulse window over which the color is held near full strength
-// before easing back to the resting border. Keeping the pulse sustained for
-// most of the ~2s (rather than decaying immediately) is what makes it readable.
-const COMPLETION_PULSE_RELEASE_START: f32 = 0.65;
-
-// Pulse intensity in [0,1] for a pane: held near 1 for most of the window with a
-// gentle throb so the border visibly "pulses", then eased to 0 at the tail so it
-// settles back to the resting border color. 0 means no active pulse.
-fn completionPulseFactor(pane_id: runtime.WorkspacePaneId) f32 {
-    for (completion_pulse_slots) |slot| {
-        if (!slot.used or slot.pane_id != pane_id) continue;
-        const elapsed = nowMs() - slot.start_ms;
-        if (elapsed < 0 or elapsed >= COMPLETION_PULSE_DURATION_MS) return 0.0;
-        const t = @as(f32, @floatFromInt(elapsed)) / @as(f32, @floatFromInt(COMPLETION_PULSE_DURATION_MS));
-        // Sustain at full strength, then smoothly ease to 0 over the tail.
-        const sustain = if (t < COMPLETION_PULSE_RELEASE_START)
-            @as(f32, 1.0)
-        else blk: {
-            const r = (t - COMPLETION_PULSE_RELEASE_START) / (1.0 - COMPLETION_PULSE_RELEASE_START);
-            break :blk 0.5 + 0.5 * @cos(std.math.pi * r);
-        };
-        // Throb with a floor (0.55..1.0) so the pulse stays on its distinct
-        // color during the window instead of dipping back to resting mid-pulse.
-        const throb = 0.775 + 0.225 * @cos(2.0 * std.math.pi * COMPLETION_PULSE_CYCLES * t);
-        return sustain * throb;
-    }
-    return 0.0;
-}
-
-fn lerpColor(a: [4]f32, b: [4]f32, t: f32) [4]f32 {
-    return .{
-        a[0] + (b[0] - a[0]) * t,
-        a[1] + (b[1] - a[1]) * t,
-        a[2] + (b[2] - a[2]) * t,
-        a[3] + (b[3] - a[3]) * t,
+fn paneAgentVisualStatus(state: *const runtime.AppState, pane_id: runtime.WorkspacePaneId) PaneAgentVisualStatus {
+    if (state.projects.items.len == 0 or state.selected_project_index >= state.projects.items.len) return .idle;
+    const project = &state.projects.items[state.selected_project_index];
+    const pane = project.workspace_layout.paneById(pane_id) orelse return .idle;
+    return switch (pane.ref) {
+        .chat => |ref| blk: {
+            if (ref.thread_index >= project.threads.items.len) break :blk .idle;
+            const thread = &project.threads.items[ref.thread_index];
+            if (thread.completion_pending) break :blk .done;
+            break :blk if (thread.isSendPendingForUi()) .working else .idle;
+        },
+        .terminal => |ref| blk: {
+            const surface = state.projectTerminalSurface(state.selected_project_index, ref.dock_id) orelse break :blk .idle;
+            break :blk switch (surface.displayStatus()) {
+                .done => .done,
+                .working => .working,
+                else => .idle,
+            };
+        },
+        .browser => .idle,
     };
+}
+
+fn paneStatusPulse(status: PaneAgentVisualStatus, timestamp_ms: i64) f32 {
+    const period_ms = switch (status) {
+        .done => DONE_PULSE_PERIOD_MS,
+        .working => WORKING_PULSE_PERIOD_MS,
+        .idle => return 0.0,
+    };
+    const elapsed: f32 = @floatFromInt(@mod(timestamp_ms, period_ms));
+    const phase = elapsed / @as(f32, @floatFromInt(period_ms));
+    return 0.5 + 0.5 * @sin(phase * std.math.tau);
 }
 
 fn easeOutCubic(t: f32) f32 {
@@ -567,7 +506,7 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
     state.ensureCurrentProjectWorkspace();
     state.debug_workspace_visible_pane_count = state.currentProjectWorkspaceVisiblePaneCount();
     tickFocusAnimation(state);
-    tickCompletionPulse(state);
+    pane_status_animating = false;
     hit_cache.count = 0;
     pane_rect_count = 0;
     browser_pane_rendered = false;
@@ -1067,16 +1006,30 @@ fn renderLeaf(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: 
         renderPaneOverlay(state, pane_id, header_rect);
     }
     renderZoomControl(state, pane_id, kind, rect, header_h, maximized);
-    // Resting/focus border fade plus a transient completion pulse. The pulse can
-    // light up an unfocused pane (alpha 0 at rest), so the visible alpha is the
-    // max of the two and the color eases from the pulse color back to resting.
+    // Pane status frame. DONE and WORKING intentionally override the ordinary
+    // focus/unfocused and zoom colors so agent state remains legible in tiled
+    // and maximized layouts without tinting the pane's content.
+    const agent_status = paneAgentVisualStatus(state, pane_id);
+    if (agent_status != .idle) {
+        pane_status_animating = true;
+        const pulse = paneStatusPulse(agent_status, nowMs());
+        var border_color = switch (agent_status) {
+            .done => theme.success(),
+            .working => theme.accent(),
+            .idle => unreachable,
+        };
+        const min_alpha: f32 = if (agent_status == .done) 0.72 else 0.52;
+        border_color[3] *= min_alpha + (1.0 - min_alpha) * pulse;
+        const border_width = theme.scaledUi(if (maximized) STATUS_ZOOM_BORDER_WIDTH_CSS else STATUS_BORDER_WIDTH_CSS);
+        queueBorder(state, rect, paletteColor(border_color), 0.0, border_width);
+        return;
+    }
+
+    // Quiet panes retain the existing animated focus border.
     const focus_alpha = focusBorderAlpha(pane_id);
-    const pulse = completionPulseFactor(pane_id);
-    const alpha = @max(@max(focus_alpha, pulse), if (maximized) @as(f32, 1.0) else @as(f32, 0.0));
+    const alpha = @max(focus_alpha, if (maximized) @as(f32, 1.0) else @as(f32, 0.0));
     if (alpha > 0.01) {
-        // p=1 -> full pulse color; p=0 -> resting focus-border color.
-        const resting_color = if (maximized) zoomBorderAccent() else theme.accent();
-        var border_color = lerpColor(resting_color, theme.success(), pulse);
+        var border_color = if (maximized) zoomBorderAccent() else theme.accent();
         border_color[3] *= alpha;
         const border_width = theme.scaledUi(if (maximized) ZOOM_BORDER_WIDTH_CSS else FOCUS_BORDER_WIDTH_CSS);
         queueBorder(state, rect, paletteColor(border_color), 0.0, border_width);
@@ -1453,4 +1406,17 @@ fn queueIcon(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8, co
 
 fn paletteColor(color: [4]f32) palette.Color {
     return .{ .r = color[0], .g = color[1], .b = color[2], .a = color[3] };
+}
+
+test "pane status pulses are bounded and use deliberately slow periods" {
+    try std.testing.expect(DONE_PULSE_PERIOD_MS > WORKING_PULSE_PERIOD_MS);
+    try std.testing.expect(WORKING_PULSE_PERIOD_MS >= 2000);
+
+    inline for (.{ PaneAgentVisualStatus.done, PaneAgentVisualStatus.working }) |status| {
+        const period = if (status == .done) DONE_PULSE_PERIOD_MS else WORKING_PULSE_PERIOD_MS;
+        try std.testing.expectApproxEqAbs(@as(f32, 0.5), paneStatusPulse(status, 0), 0.0001);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), paneStatusPulse(status, @divTrunc(period, 4)), 0.0001);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.5), paneStatusPulse(status, @divTrunc(period, 2)), 0.0001);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), paneStatusPulse(status, @divTrunc(period * 3, 4)), 0.0001);
+    }
 }
