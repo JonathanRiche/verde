@@ -7274,6 +7274,7 @@ pub const AppState = struct {
         if (index >= self.projects.items.len) return false;
         self.selected_project_index = index;
         self.ensureCurrentProjectWorkspace();
+        self.restorePersistedBrowserPaneAfterProjectSelection(index);
         self.workspace_header_open_menu_open = false;
         self.workspace_header_open_menu_pane_id = null;
         self.sidebar_context_menu_open = false;
@@ -12950,6 +12951,22 @@ pub const AppState = struct {
     fn browserPaneSnapshotUrl(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) ?[]const u8 {
         const ref = self.browserPaneRefMutable(project_index, pane_id) orelse return null;
         return ref.url;
+    }
+
+    // A browser pane can be restored in a workspace that was not selected at
+    // launch. Reopen its runtime when that workspace later becomes visible.
+    fn restorePersistedBrowserPaneAfterProjectSelection(self: *AppState, project_index: usize) void {
+        if (!self.browser_textures_enabled or self.browser_state.controls_visible) return;
+        if (project_index >= self.projects.items.len) return;
+        if (!self.projects.items[project_index].workspace_layout.hasVisiblePaneKind(.browser)) return;
+
+        _ = self.openBrowserInWorkspace(project_index, null) catch |err| {
+            log.warn("failed to restore browser pane after workspace selection: {s}", .{@errorName(err)});
+            self.browser_state.status = .failed;
+            self.browser_state.setLastError("Failed to restore browser pane after selecting its workspace.") catch {};
+            self.setSidebarNotice("Failed to reopen browser.");
+            return;
+        };
     }
 
     fn applyBrowserPaneSnapshotToRuntime(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) void {
