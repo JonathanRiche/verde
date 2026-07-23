@@ -254,6 +254,7 @@ pub const Client = struct {
                         if (request.on_thread_id) |on_thread_id| on_thread_id(request.stream_context, session_id);
                         if (request.on_turn_id) |on_turn_id| on_turn_id(request.stream_context, session_id);
                         try acp.writeLine(try makePromptRequestAlloc(allocator, 3, session_id, request, state.capabilities.image));
+                        state.prompt_submitted = true;
                     }
                 },
                 .prompt_done => break,
@@ -483,6 +484,7 @@ const ReadThreadState = struct {
 const SendPromptState = struct {
     capabilities: AcpCapabilities = .{},
     session_id: ?[]u8 = null,
+    prompt_submitted: bool = false,
     reply: std.ArrayList(u8) = .empty,
 
     fn deinit(self: *SendPromptState, allocator: std.mem.Allocator) void {
@@ -569,6 +571,9 @@ fn handleSendPromptLine(
         return .continue_reading;
     }
     if (isMethod(parsed.value, "session/update")) {
+        // Cursor replays session history while loading an existing session.
+        // Only updates emitted after this turn's prompt was submitted are live.
+        if (!state.prompt_submitted) return .continue_reading;
         try handleLiveSessionUpdate(allocator, parsed.value, request, state);
         return .continue_reading;
     }
@@ -1602,6 +1607,31 @@ test "handleSendPromptLine accepts session/load response without sessionId" {
     const action = try handleSendPromptLine(std.testing.allocator, line, request, &state, null);
     try std.testing.expectEqual(SendLineAction.session_ready, action);
     try std.testing.expectEqualStrings("existing-session", state.session_id.?);
+}
+
+test "handleSendPromptLine ignores session history replay before prompt submission" {
+    var state: SendPromptState = .{};
+    defer state.deinit(std.testing.allocator);
+    const request = provider_types.SendPromptRequest{
+        .thread_id = "existing-session",
+        .prompt = "continue",
+    };
+    const line =
+        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"existing-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replayed history"}}}}
+    ;
+
+    try std.testing.expectEqual(
+        SendLineAction.continue_reading,
+        try handleSendPromptLine(std.testing.allocator, line, request, &state, null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.reply.items.len);
+
+    state.prompt_submitted = true;
+    try std.testing.expectEqual(
+        SendLineAction.continue_reading,
+        try handleSendPromptLine(std.testing.allocator, line, request, &state, null),
+    );
+    try std.testing.expectEqualStrings("replayed history", state.reply.items);
 }
 
 test "makePermissionResponseAlloc writes selected ACP option id" {
