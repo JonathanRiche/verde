@@ -2809,6 +2809,12 @@ pub const WorkspaceLayout = struct {
         return self.paneById(pane_id);
     }
 
+    fn focusCreatedPane(self: *WorkspaceLayout, pane_id: WorkspacePaneId) void {
+        const was_maximized = self.maximized_pane_id != null;
+        self.focused_pane_id = pane_id;
+        if (was_maximized) self.maximized_pane_id = pane_id;
+    }
+
     fn visiblePaneCount(self: *const WorkspaceLayout) usize {
         return self.panes.items.len;
     }
@@ -6849,7 +6855,7 @@ pub const AppState = struct {
 
         project = &self.projects.items[project_index];
         const pane_id = try project.workspace_layout.ensureTerminalPane(self.allocator, dock_id);
-        project.workspace_layout.maximized_pane_id = null;
+        project.workspace_layout.focusCreatedPane(pane_id);
         self.requestTerminalDockFocus(dock_id);
         return .{ .dock_id = dock_id, .pane_id = pane_id };
     }
@@ -6899,8 +6905,7 @@ pub const AppState = struct {
                 if (thread.committed or thread.messages.items.len > 0 or thread.currentDraft().len > 0) return null;
                 deinitWorkspacePaneRef(&pane.ref, self.allocator);
                 pane.ref = .{ .terminal = .{ .dock_id = dock_id } };
-                layout.focused_pane_id = pane.id;
-                layout.maximized_pane_id = null;
+                layout.focusCreatedPane(pane.id);
                 return pane.id;
             },
             else => return null,
@@ -8016,8 +8021,7 @@ pub const AppState = struct {
                 return;
             };
         }
-        layout.focused_pane_id = new_pane_id;
-        layout.maximized_pane_id = null;
+        layout.focusCreatedPane(new_pane_id);
         project.selected_thread_index = thread_index;
         self.terminal_focused = false;
         self.requestComposerFocus();
@@ -8525,6 +8529,7 @@ pub const AppState = struct {
         _ = try layout.ensureDefaultChat(self.allocator);
 
         var chat_pane_id = layout.retargetPreferredChatPane(thread_index);
+        var created_pane = false;
 
         if (chat_pane_id == null) {
             const new_pane_id = try layout.createChatPane(self.allocator, thread_index);
@@ -8535,10 +8540,15 @@ pub const AppState = struct {
                 try layout.replaceRootWithLeaf(self.allocator, new_pane_id);
             }
             chat_pane_id = new_pane_id;
+            created_pane = true;
         }
 
-        layout.focused_pane_id = chat_pane_id;
-        layout.maximized_pane_id = null;
+        if (created_pane) {
+            layout.focusCreatedPane(chat_pane_id.?);
+        } else {
+            layout.focused_pane_id = chat_pane_id;
+            layout.maximized_pane_id = null;
+        }
         project.selected_thread_index = thread_index;
         self.terminal_focused = false;
     }
@@ -10141,7 +10151,7 @@ pub const AppState = struct {
             .terminal => |*terminal_ref| terminal_ref.purpose = .editor,
             else => return error.TerminalPaneUnavailable,
         }
-        layout.maximized_pane_id = null;
+        layout.focusCreatedPane(pane_id);
         dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
         dock.visible = false;
 
@@ -12140,11 +12150,12 @@ pub const AppState = struct {
         const layout = &self.projects.items[self.selected_project_index].workspace_layout;
         const terminal_open = layout.visibleTerminalPaneIdForDock(0) != null;
 
-        _ = layout.ensureTerminalPane(self.allocator, 0) catch |err| {
+        const pane_id = layout.ensureTerminalPane(self.allocator, 0) catch |err| {
             log.err("failed to open terminal workspace pane: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to open terminal pane.");
             return;
         };
+        if (!terminal_open) layout.focusCreatedPane(pane_id);
         dock.visible = false;
         self.requestTerminalFocus();
         self.setSidebarNotice(if (terminal_open) "Terminal focused." else "Terminal opened.");
@@ -15323,6 +15334,7 @@ pub const AppState = struct {
         process.next_restart_ms = 0;
         process.pending_watch_restart_ms = 0;
         process.explicit_stop = false;
+        const terminal_pane_open = project.workspace_layout.visibleTerminalPaneIdForDock(dock_id) != null;
         process.pane_id = try project.workspace_layout.ensureTerminalPane(self.allocator, dock_id);
         if (process.kind == .agent and process.notify) {
             if (dock.activeSessionId()) |session_id| {
@@ -15341,7 +15353,11 @@ pub const AppState = struct {
                 });
             }
         }
-        project.workspace_layout.maximized_pane_id = null;
+        if (terminal_pane_open) {
+            project.workspace_layout.maximized_pane_id = null;
+        } else {
+            project.workspace_layout.focusCreatedPane(process.pane_id.?);
+        }
         self.requestTerminalDockFocus(dock_id);
         self.markDirty();
         return true;
@@ -15431,7 +15447,7 @@ pub const AppState = struct {
                 });
             }
         }
-        layout.maximized_pane_id = null;
+        layout.focusCreatedPane(new_pane_id);
         dock.visible = false;
         self.requestTerminalDockFocus(dock_id);
         var notice_buf: [96]u8 = undefined;
@@ -15542,7 +15558,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to split workspace.");
             return false;
         };
-        layout.maximized_pane_id = null;
+        layout.focusCreatedPane(new_pane_id);
         dock.visible = false;
         self.requestTerminalDockFocus(dock_id);
         _ = self.writeWorkspaceTerminalPaneForProject(project_index, new_pane_id, "amp\r") catch |err| {
@@ -15777,6 +15793,7 @@ pub const AppState = struct {
         }
         if (process.dock_id) |dock_id| {
             process.pane_id = try self.projects.items[project_index].workspace_layout.ensureTerminalPane(self.allocator, dock_id);
+            self.projects.items[project_index].workspace_layout.focusCreatedPane(process.pane_id.?);
             _ = self.focusCurrentProjectWorkspacePane(process.pane_id.?);
             self.requestTerminalDockFocus(dock_id);
             self.markDirty();
@@ -16538,7 +16555,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to split workspace.");
             return false;
         };
-        layout.maximized_pane_id = null;
+        layout.focusCreatedPane(new_pane_id);
         project.selected_thread_index = thread_index;
         if (self.selected_project_index == project_index) {
             self.terminal_focused = false;
@@ -16601,7 +16618,7 @@ pub const AppState = struct {
         thread_appended = false;
 
         if (focus) {
-            layout.maximized_pane_id = null;
+            layout.focusCreatedPane(new_pane_id);
             project.selected_thread_index = thread_index;
             project.last_content_pane_id = new_pane_id;
         } else {
@@ -16642,7 +16659,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to split workspace.");
             return false;
         };
-        layout.maximized_pane_id = null;
+        layout.focusCreatedPane(new_pane_id);
         project.selected_thread_index = thread_index;
         self.terminal_focused = false;
         self.requestComposerFocus();
@@ -16709,7 +16726,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to split workspace.");
             return null;
         };
-        layout.maximized_pane_id = null;
+        layout.focusCreatedPane(new_pane_id);
         dock.visible = false;
         self.requestTerminalDockFocus(dock_id);
         return new_pane_id;
@@ -16868,7 +16885,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to split workspace.");
             return false;
         };
-        layout.maximized_pane_id = null;
+        layout.focusCreatedPane(new_pane_id);
         dock.visible = false;
         if (self.selected_project_index == project_index) self.requestTerminalDockFocus(dock_id);
         self.setSidebarNotice("Terminal pane created.");
@@ -21594,6 +21611,40 @@ test "provider-aware chat creation focuses requested pane" {
         try std.testing.expectEqualStrings(case.model, project.threads.items[result.thread_index].model_ref.?);
     }
     try std.testing.expectEqual(previous_pane_count + cases.len, project.workspace_layout.panes.items.len);
+}
+
+test "focused chat creation transfers zoom to the new pane" {
+    const allocator = std.testing.allocator;
+    var project = try Project.init(allocator, "test", "Test", "/tmp/test", 0);
+    defer project.deinit(allocator);
+
+    const initial_pane_id = project.workspace_layout.focused_pane_id orelse return error.TestExpectedEqual;
+    project.workspace_layout.maximized_pane_id = initial_pane_id;
+
+    const zoomed_result = try AppState.createWorkspaceChatPane(
+        &project,
+        allocator,
+        .codex,
+        DEFAULT_CODEX_MODEL,
+        initial_pane_id,
+        .vertical,
+        true,
+    );
+    try std.testing.expectEqual(@as(?WorkspacePaneId, zoomed_result.pane_id), project.workspace_layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, zoomed_result.pane_id), project.workspace_layout.maximized_pane_id);
+
+    project.workspace_layout.maximized_pane_id = null;
+    const unzoomed_result = try AppState.createWorkspaceChatPane(
+        &project,
+        allocator,
+        .codex,
+        DEFAULT_CODEX_MODEL,
+        zoomed_result.pane_id,
+        .horizontal,
+        true,
+    );
+    try std.testing.expectEqual(@as(?WorkspacePaneId, unzoomed_result.pane_id), project.workspace_layout.focused_pane_id);
+    try std.testing.expect(project.workspace_layout.maximized_pane_id == null);
 }
 
 test "sidebar open pane focus keeps the clicked terminal pane maximized" {
