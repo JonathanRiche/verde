@@ -128,14 +128,14 @@ const paletteRows = [
   { section: 'Threads', icon: '◷', label: 'Restore GUI thread sync controls', hint: 'verde' },
   { section: 'Panes', icon: '▦', label: 'Jump to browser pane', hint: 'Ctrl+L' },
   { section: 'Workspaces', icon: '⦿', label: 'kylos-apparel', hint: 'Alt+1' },
-  { section: 'App', icon: '⌘', label: 'Toggle embedded browser', hint: 'Ctrl+B' },
+  { section: 'App', icon: '⌘', label: 'Toggle embedded browser', hint: 'Ctrl+Shift+B' },
 ]
 
 const keybinds = [
   { combo: 'Ctrl+Shift+P', desc: 'Command palette — threads, panes, workspaces' },
   { combo: 'Ctrl+T', desc: 'New chat thread' },
   { combo: 'Ctrl+Shift+T', desc: 'Split a terminal pane next to the focus' },
-  { combo: 'Ctrl+B', desc: 'Toggle the embedded browser pane' },
+  { combo: 'Ctrl+Shift+B', desc: 'Toggle the embedded browser pane' },
   { combo: 'Ctrl+H / J / K / L', desc: 'Move focus across panes, vim-style' },
   { combo: 'Ctrl+Shift+H / J / K / L', desc: 'Swap panes — rearrange the tiling' },
   { combo: 'Alt+Shift+←↑↓→', desc: 'Resize the focused pane' },

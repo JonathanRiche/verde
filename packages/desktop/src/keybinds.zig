@@ -993,7 +993,7 @@ fn cloneDefaultTerminalKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 
 fn cloneDefaultBrowserKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("Ctrl+B"),
+        try parseDefaultAccelerator("Ctrl+Shift+B"),
     });
 }
 
@@ -1577,7 +1577,7 @@ test "default open editor keybind uses ctrl shift o" {
     try std.testing.expectEqual(sdl.Keycode.o, config.open_editor[0].key);
 }
 
-test "default browser keybind uses ctrl plus b" {
+test "default browser keybind uses ctrl shift b" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
@@ -1586,6 +1586,7 @@ test "default browser keybind uses ctrl plus b" {
     try std.testing.expect(config.toggle_browser[0].ctrl);
     try std.testing.expect(!config.toggle_browser[0].meta);
     try std.testing.expect(!config.toggle_browser[0].primary);
+    try std.testing.expect(config.toggle_browser[0].shift);
     try std.testing.expectEqual(sdl.Keycode.b, config.toggle_browser[0].key);
 }
 
