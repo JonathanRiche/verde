@@ -3642,7 +3642,10 @@ fn renderCommandEventRow(
             .h = font_size * 1.25,
         }), separator, text_color, font_size, header_text_clip);
 
-        const display_body = truncateMonoToWidth(state.allocator, firstTextLine(body), body_w, font_size);
+        const owned_preview = commandRowPreviewAlloc(state.allocator, body) catch null;
+        defer if (owned_preview) |preview| state.allocator.free(preview);
+        const preview = owned_preview orelse firstTextLine(body);
+        const display_body = truncateMonoToWidth(state.allocator, preview, body_w, font_size);
         defer if (display_body.allocated) state.allocator.free(display_body.text);
         queueFixedTextLine(state, snapRect(.{
             .x = body_x,
@@ -3688,13 +3691,22 @@ fn renderCommandEventRow(
         const body_h = @as(f32, @floatFromInt(visible_lines)) * line_h;
         renderWrappedBody(state, .{ .x = inner.x, .y = inner.y, .w = inner.w, .h = body_h }, body, paletteColor(theme.COLOR_TEXT_MUTED), font_size, clip);
         if (!show_all and line_count > visible_lines) {
+            const more_label = "Show more";
+            const more_font = theme.scaledUi(12.0);
+            const more_pad_x = theme.scaledUi(6.0);
+            const more_w = @as(f32, @floatFromInt(more_label.len)) * more_font * 0.55 + more_pad_x * 2.0;
             const more_rect = palette.Rect{
-                .x = inner.x,
+                .x = inner.x + inner.w - more_w,
                 .y = inner.y + body_h,
-                .w = theme.scaledUi(112.0),
+                .w = more_w,
                 .h = theme.scaledUi(26.0),
             };
-            queueFixedTextLine(state, more_rect, "Show more", paletteColor(theme.COLOR_GREEN), theme.scaledUi(12.0), clip);
+            queueFixedTextLine(state, .{
+                .x = more_rect.x + more_pad_x,
+                .y = more_rect.y,
+                .w = more_rect.w - more_pad_x * 2.0,
+                .h = more_rect.h,
+            }, more_label, paletteColor(theme.COLOR_GREEN), more_font, clip);
             state.recordCardToggleHit(.{ .rect = more_rect, .key = output_key, .kind = .tool_output });
         }
     }
@@ -3902,10 +3914,38 @@ fn firstTextLine(text: []const u8) []const u8 {
     return text;
 }
 
-test "command row preview uses only its first text line" {
-    try std.testing.expectEqualStrings("Tool:", firstTextLine("Tool:\nRead File"));
-    try std.testing.expectEqualStrings("Output:", firstTextLine("Output:\r\n{\"success\":true}"));
-    try std.testing.expectEqualStrings("git status", firstTextLine("git status"));
+fn commandRowPreviewAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var preview: std.ArrayList(u8) = .empty;
+    errdefer preview.deinit(allocator);
+    try preview.ensureTotalCapacity(allocator, text.len);
+
+    var pending_space = false;
+    for (text) |byte| {
+        const whitespace = switch (byte) {
+            ' ', '\t', '\n', '\r' => true,
+            else => false,
+        };
+        if (whitespace) {
+            pending_space = preview.items.len > 0;
+            continue;
+        }
+        if (pending_space) preview.appendAssumeCapacity(' ');
+        preview.appendAssumeCapacity(byte);
+        pending_space = false;
+    }
+    return preview.toOwnedSlice(allocator);
+}
+
+test "command row preview includes content after its input label" {
+    const preview = try commandRowPreviewAlloc(std.testing.allocator, "Input:\n  {\"cmd\":\"mise run build\"}");
+    defer std.testing.allocator.free(preview);
+    try std.testing.expectEqualStrings("Input: {\"cmd\":\"mise run build\"}", preview);
+}
+
+test "command row preview flattens CRLF without trailing whitespace" {
+    const preview = try commandRowPreviewAlloc(std.testing.allocator, "Output:\r\n{\"success\":true}\n\n");
+    defer std.testing.allocator.free(preview);
+    try std.testing.expectEqualStrings("Output: {\"success\":true}", preview);
 }
 
 /// Truncates `text` so it fits in `max_width` pixels at `font_size` using the
