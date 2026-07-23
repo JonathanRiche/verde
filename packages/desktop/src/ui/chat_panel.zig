@@ -13,6 +13,7 @@ const chat_markdown = @import("chat_markdown.zig");
 const colors = @import("colors.zig");
 const composer_pickers = @import("composer_pickers.zig");
 const file_icons = @import("file_icons.zig");
+const globe_icon = @import("globe_icon.zig");
 const runtime = @import("runtime.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const text_measure = @import("text_measure.zig");
@@ -1295,58 +1296,6 @@ fn queueWorkspaceHeaderFolderIcon(state: *app_state.AppState, x: f32, center_y: 
     }, col, theme.scaledUi(1.5));
 }
 
-fn queueWorkspaceHeaderGlobe(state: *app_state.AppState, cx: f32, cy: f32, size: f32, color: palette.Color) void {
-    const r = size * 0.5;
-    const sq = palette.Rect{ .x = cx - r, .y = cy - r, .w = size, .h = size };
-    const stroke = @max(theme.scaledUi(1.05), size * 0.078);
-    queueBorder(state, sq, color, r, stroke);
-
-    const eq_w = size - stroke * 1.8;
-    queueRect(state, .{
-        .x = cx - eq_w * 0.5,
-        .y = cy - stroke * 0.5,
-        .w = eq_w,
-        .h = stroke,
-    }, color);
-
-    queueGlobeMeridianArc(state, cx, cy, r, stroke, color, -1.0);
-    queueGlobeMeridianArc(state, cx, cy, r, stroke, color, 1.0);
-}
-
-fn queueGlobeMeridianArc(
-    state: *app_state.AppState,
-    cx: f32,
-    cy: f32,
-    r: f32,
-    stroke: f32,
-    color: palette.Color,
-    sign: f32,
-) void {
-    const bulge = 0.47;
-    const N: usize = 17;
-    var i: usize = 0;
-    while (i + 1 < N) : (i += 1) {
-        const t0 = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(N - 1));
-        const t1 = @as(f32, @floatFromInt(i + 1)) / @as(f32, @floatFromInt(N - 1));
-        const y0 = cy - r + t0 * (2 * r);
-        const y1 = cy - r + t1 * (2 * r);
-        const ym = (y0 + y1) * 0.5;
-        const dy = ym - cy;
-        const chord_sq = r * r - dy * dy;
-        if (chord_sq <= 0) continue;
-        const chord = @sqrt(chord_sq);
-        const x = cx + sign * chord * bulge;
-        const seg_h = y1 - y0;
-        if (seg_h <= 0) continue;
-        queueRect(state, .{
-            .x = x - stroke * 0.5,
-            .y = y0,
-            .w = stroke,
-            .h = seg_h,
-        }, color);
-    }
-}
-
 fn paneIdEqual(a: ?app_state.WorkspacePaneId, b: ?app_state.WorkspacePaneId) bool {
     if (a) |left| {
         return if (b) |right| left == right else false;
@@ -1496,7 +1445,7 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
 
     const globe_size = theme.scaledUi(16.0);
     const browser_cy = browser_rect.y + browser_rect.h * 0.5;
-    queueWorkspaceHeaderGlobe(
+    globe_icon.queue(
         state,
         browser_rect.x + browser_rect.w * 0.5,
         browser_cy,
