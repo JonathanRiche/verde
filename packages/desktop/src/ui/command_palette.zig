@@ -68,7 +68,6 @@ const KeybindRef = enum {
     toggle_terminal,
     workspace_close,
     workspace_toggle_maximize,
-    workspace_minimize,
     workspace_split_chat_vertical,
     workspace_split_chat_horizontal,
     workspace_split_terminal_vertical,
@@ -96,7 +95,6 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "pane.browser", .title = "Toggle Browser Pane", .keywords = "web url", .section = .panes, .keybind = .toggle_browser, .run = runToggleBrowser, .enabled = hasProjects },
     .{ .id = "pane.close", .title = "Close Pane", .section = .panes, .keybind = .workspace_close, .run = runClosePane, .enabled = hasProjects },
     .{ .id = "pane.zoom", .title = "Zoom Pane", .keywords = "maximize restore fullscreen", .section = .panes, .keybind = .workspace_toggle_maximize, .run = runZoomPane, .enabled = hasProjects },
-    .{ .id = "pane.minimize", .title = "Minimize Pane", .keywords = "hide", .section = .panes, .keybind = .workspace_minimize, .run = runMinimizePane, .enabled = hasProjects },
     .{ .id = "workspace.add", .title = "Add Workspace", .keywords = "new project folder directory", .section = .workspaces, .run = runAddWorkspace },
     .{ .id = "workspace.rename", .title = "Rename Workspace", .keywords = "label", .section = .workspaces, .run = runRenameWorkspace, .enabled = hasProjects },
     .{ .id = "workspace.close", .title = "Close Workspace", .keywords = "archive remove project save state", .section = .workspaces, .run = runCloseWorkspace, .enabled = workspaceNotBusy },
@@ -1026,20 +1024,11 @@ fn openThread(state: *runtime.AppState, tr: ThreadRef, split: bool) void {
 
 fn openAgentTuiHistoryEntry(state: *runtime.AppState, tui: AgentTuiRef) void {
     if (tui.project >= state.projects.items.len) return;
-    var minimized: ?bool = null;
     for (state.projects.items[tui.project].workspace_layout.panes.items) |pane| {
-        if (pane.id == tui.pane) {
-            minimized = pane.minimized;
-            break;
-        }
-    }
-    const is_minimized = minimized orelse return;
-    state.selected_project_index = tui.project;
-    if (is_minimized) {
-        _ = state.restoreWorkspacePane(tui.project, tui.pane);
-    } else {
+        if (pane.id != tui.pane) continue;
         state.focusWorkspaceOpenPane(tui.project, tui.pane);
         state.markDirty();
+        return;
     }
 }
 
@@ -1235,10 +1224,6 @@ fn runClosePane(state: *runtime.AppState) void {
 
 fn runZoomPane(state: *runtime.AppState) void {
     _ = state.toggleFocusedWorkspacePaneMaximized();
-}
-
-fn runMinimizePane(state: *runtime.AppState) void {
-    _ = state.minimizeFocusedWorkspacePane();
 }
 
 fn runAddWorkspace(state: *runtime.AppState) void {
@@ -1536,14 +1521,12 @@ fn renderAgentTuiRow(state: *runtime.AppState, row_index: usize, tui: AgentTuiRe
     if (tui.project >= state.projects.items.len) return;
     const project = &state.projects.items[tui.project];
     var dock_id: ?u32 = null;
-    var minimized = false;
     for (project.workspace_layout.panes.items) |pane| {
         if (pane.id != tui.pane) continue;
         dock_id = switch (pane.ref) {
             .terminal => |ref| ref.dock_id,
             else => return,
         };
-        minimized = pane.minimized;
         break;
     }
     const resolved_dock_id = dock_id orelse return;
@@ -1576,7 +1559,7 @@ fn renderAgentTuiRow(state: *runtime.AppState, row_index: usize, tui: AgentTuiRe
     right -= time_w;
     queueText(state, .{ .x = right, .y = text_y, .w = time_w, .h = font_size * 1.3 }, relative_time, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
     right -= status_w;
-    queueText(state, .{ .x = right, .y = text_y, .w = status_w, .h = font_size * 1.3 }, if (minimized) "saved" else "open", paletteColor(if (minimized) theme.COLOR_TEXT_SUBTLE else theme.COLOR_GREEN), theme.scaledUi(12.0), row_clip);
+    queueText(state, .{ .x = right, .y = text_y, .w = status_w, .h = font_size * 1.3 }, "open", paletteColor(theme.COLOR_GREEN), theme.scaledUi(12.0), row_clip);
     if (state.command_palette_scope_project == null) {
         right -= workspace_w;
         queueText(state, .{ .x = right, .y = text_y, .w = workspace_w - theme.scaledUi(8.0), .h = font_size * 1.3 }, project.label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
@@ -1700,7 +1683,6 @@ fn keybindHintFor(state: *runtime.AppState, ref: ?KeybindRef) []const u8 {
         .toggle_terminal => config.toggle_terminal,
         .workspace_close => config.workspace_close,
         .workspace_toggle_maximize => config.workspace_toggle_maximize,
-        .workspace_minimize => config.workspace_minimize,
         .workspace_split_chat_vertical => config.workspace_split_chat_vertical,
         .workspace_split_chat_horizontal => config.workspace_split_chat_horizontal,
         .workspace_split_terminal_vertical => config.workspace_split_terminal_vertical,

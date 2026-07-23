@@ -183,7 +183,6 @@ fn renderStateTab(state: *runtime.AppState, rect: palette.Rect) void {
     y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "terminal_visible: {}", .{state.isTerminalVisible()});
     y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "selected_project_index: {d}", .{state.selected_project_index});
     y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "workspace_visible_panes: {d}", .{state.debug_workspace_visible_pane_count});
-    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "workspace_minimized_panes: {d}", .{state.currentProjectWorkspaceMinimizedPaneCount()});
     if (state.currentProjectWorkspaceMaximizedPaneId()) |pane_id| {
         y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "workspace_maximized_pane: {d}", .{pane_id});
     } else {

@@ -1124,7 +1124,6 @@ fn workspacePaneIdForDock(state: *const app_state.AppState, dock_id: u32) ?app_s
     if (state.projects.items.len == 0) return null;
     const layout = &state.projects.items[state.selected_project_index].workspace_layout;
     for (layout.panes.items) |pane| {
-        if (pane.minimized) continue;
         switch (pane.ref) {
             .terminal => |ref| if (ref.dock_id == dock_id) return pane.id,
             else => {},
