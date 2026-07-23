@@ -128,6 +128,10 @@ Config supports UI and terminal font size, keybind overrides, and the default ac
     "sidebar": "CommandOrControl+S",
     "sidebar_hidden": "Ctrl+Shift+S",
     "browser": "Ctrl+B",
+    "chat": {
+      "model_picker": "Alt+M",
+      "run_config": "Alt+R"
+    },
     "workspace": {
       "split_terminal_horizontal": "CommandOrControl+Shift+T",
       "focus_up": ["Alt+Up", "Ctrl+K"],
@@ -159,6 +163,7 @@ Config supports UI and terminal font size, keybind overrides, and the default ac
 ```
 
 Keybind values can be a string, a string array, `null`, an empty string, or an empty array. `null` and empty values disable that binding.
+The nested `chat` bindings only run while a GUI chat pane is focused; they do not intercept input in terminal or browser panes. The model picker includes initial provider selection on a fresh thread.
 
 `open.default` accepts `folder`, `editor`, `cursor`, `vscode`, `zed`, or a custom shell action:
 

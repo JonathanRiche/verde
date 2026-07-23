@@ -62,6 +62,11 @@ pub const NativeTerminalAction = enum {
     focus_right,
 };
 
+pub const NativeChatAction = enum {
+    model_picker,
+    run_config,
+};
+
 pub const Keybind = struct {
     alt: bool = false,
     ctrl: bool = false,
@@ -125,6 +130,8 @@ pub const NativeKeyboardConfig = struct {
     chat_down: []Keybind,
     chat_page_up: []Keybind,
     chat_page_down: []Keybind,
+    chat_model_picker: []Keybind,
+    chat_run_config: []Keybind,
     workspace_previous: []Keybind,
     workspace_next: []Keybind,
     workspace_pane_previous: []Keybind,
@@ -180,6 +187,8 @@ pub const NativeKeyboardConfig = struct {
             .chat_down = try cloneDefaultChatDownKeybinds(allocator),
             .chat_page_up = try cloneDefaultChatPageUpKeybinds(allocator),
             .chat_page_down = try cloneDefaultChatPageDownKeybinds(allocator),
+            .chat_model_picker = try cloneDefaultChatModelPickerKeybinds(allocator),
+            .chat_run_config = try cloneDefaultChatRunConfigKeybinds(allocator),
             .workspace_previous = try cloneDefaultWorkspacePreviousKeybinds(allocator),
             .workspace_next = try cloneDefaultWorkspaceNextKeybinds(allocator),
             .workspace_pane_previous = try cloneDefaultWorkspacePanePreviousKeybinds(allocator),
@@ -246,6 +255,8 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.chat_down);
         self.allocator.free(self.chat_page_up);
         self.allocator.free(self.chat_page_down);
+        self.allocator.free(self.chat_model_picker);
+        self.allocator.free(self.chat_run_config);
         self.allocator.free(self.workspace_previous);
         self.allocator.free(self.workspace_next);
         self.allocator.free(self.workspace_pane_previous);
@@ -403,6 +414,12 @@ pub const NativeKeyboardConfig = struct {
         return matchesAny(self.workspace_focus_prompt, event);
     }
 
+    pub fn chatActionForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?NativeChatAction {
+        if (matchesAny(self.chat_model_picker, event)) return .model_picker;
+        if (matchesAny(self.chat_run_config, event)) return .run_config;
+        return null;
+    }
+
     pub fn workspaceSelectIndexForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?usize {
         for (self.workspace_select, 0..) |binding, index| {
             if (binding.matches(event)) {
@@ -541,6 +558,9 @@ pub const NativeKeyboardConfig = struct {
                 self.toggle_terminal = bindings;
             }
         }
+        if (keybinds_value.object.get("chat")) |chat_value| {
+            self.applyChatOverrides(chat_value);
+        }
         if (keybinds_value.object.get("workspace")) |workspace_value| {
             self.applyWorkspaceOverrides(workspace_value);
         }
@@ -566,6 +586,25 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(chat_page_down_value, "chat_page_down")) |bindings| {
                 self.allocator.free(self.chat_page_down);
                 self.chat_page_down = bindings;
+            }
+        }
+    }
+
+    fn applyChatOverrides(self: *NativeKeyboardConfig, chat_value: std.json.Value) void {
+        if (chat_value != .object) {
+            log.warn("keybinds.chat must be an object when provided", .{});
+            return;
+        }
+        if (chat_value.object.get("model_picker")) |value| {
+            if (self.parseOverrideValue(value, "chat.model_picker")) |bindings| {
+                self.allocator.free(self.chat_model_picker);
+                self.chat_model_picker = bindings;
+            }
+        }
+        if (chat_value.object.get("run_config")) |value| {
+            if (self.parseOverrideValue(value, "chat.run_config")) |bindings| {
+                self.allocator.free(self.chat_run_config);
+                self.chat_run_config = bindings;
             }
         }
     }
@@ -979,6 +1018,18 @@ fn cloneDefaultChatPageUpKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 fn cloneDefaultChatPageDownKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("PageDown"),
+    });
+}
+
+fn cloneDefaultChatModelPickerKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+M"),
+    });
+}
+
+fn cloneDefaultChatRunConfigKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+R"),
     });
 }
 
@@ -1750,6 +1801,39 @@ test "default chat scroll keybinds use arrows and paging keys" {
     try std.testing.expectEqual(sdl.Keycode.down, config.chat_down[0].key);
     try std.testing.expectEqual(sdl.Keycode.pageup, config.chat_page_up[0].key);
     try std.testing.expectEqual(sdl.Keycode.pagedown, config.chat_page_down[0].key);
+}
+
+test "default GUI chat composer keybinds use alt mnemonics" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.chat_model_picker.len);
+    try std.testing.expect(config.chat_model_picker[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.m, config.chat_model_picker[0].key);
+    try std.testing.expectEqual(@as(usize, 1), config.chat_run_config.len);
+    try std.testing.expect(config.chat_run_config[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.r, config.chat_run_config[0].key);
+}
+
+test "GUI chat composer keybinds are configurable and disableable" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"chat": {
+        \\  "model_picker": "Ctrl+Shift+M",
+        \\  "run_config": null
+        \\}}}
+    , .{});
+    defer parsed.deinit();
+
+    config.applyOverrides(parsed.value);
+
+    try std.testing.expectEqual(@as(usize, 1), config.chat_model_picker.len);
+    try std.testing.expect(config.chat_model_picker[0].ctrl);
+    try std.testing.expect(config.chat_model_picker[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.m, config.chat_model_picker[0].key);
+    try std.testing.expectEqual(@as(usize, 0), config.chat_run_config.len);
 }
 
 test "chat page down keybind override accepts a single accelerator" {

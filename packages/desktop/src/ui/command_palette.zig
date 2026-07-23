@@ -63,6 +63,8 @@ const Command = struct {
 /// hints stay correct when the user rebinds in verde.json.
 const KeybindRef = enum {
     new_thread,
+    chat_model_picker,
+    chat_run_config,
     toggle_sidebar,
     toggle_browser,
     toggle_terminal,
@@ -77,6 +79,8 @@ const KeybindRef = enum {
 /// Static command table — add a row here to add a palette entry.
 const STATIC_COMMANDS = [_]Command{
     .{ .id = "thread.new", .title = "New Chat", .keywords = "thread conversation start", .section = .threads, .keybind = .new_thread, .run = runNewChat, .enabled = hasProjects },
+    .{ .id = "thread.choose_model", .title = "Choose Chat Model", .keywords = "provider initial picker", .section = .threads, .keybind = .chat_model_picker, .run = runChooseChatModel, .enabled = hasFocusedGuiChat },
+    .{ .id = "thread.run_config", .title = "Configure Reasoning and Run Settings", .keywords = "effort speed access permissions", .section = .threads, .keybind = .chat_run_config, .run = runChatRunConfig, .enabled = hasFocusedGuiChat },
     .{ .id = "thread.rename_current", .title = "Rename Current Chat", .keywords = "thread title label", .section = .threads, .run = runRenameCurrentChat, .enabled = currentThreadCommitted },
     .{ .id = "thread.regenerate_title", .title = "Regenerate Chat Title", .keywords = "thread rename luna automatic", .section = .threads, .run = runRegenerateChatTitle, .enabled = canRegenerateChatTitle },
     .{ .id = "thread.sync_current", .title = "Sync Current Thread", .keywords = "refresh provider", .section = .threads, .run = runSyncCurrentThread, .enabled = canSyncCurrentThread },
@@ -1044,6 +1048,10 @@ fn hasProjects(state: *runtime.AppState) bool {
     return state.projects.items.len > 0;
 }
 
+fn hasFocusedGuiChat(state: *runtime.AppState) bool {
+    return focusedGuiThreadIndex(state) != null;
+}
+
 fn workspaceNotBusy(state: *runtime.AppState) bool {
     if (state.selected_project_index >= state.projects.items.len) return false;
     for (state.projects.items[state.selected_project_index].threads.items) |*thread| {
@@ -1161,6 +1169,14 @@ fn focusedGuiThreadProvider(state: *runtime.AppState) ?Provider {
 fn runNewChat(state: *runtime.AppState) void {
     if (state.projects.items.len == 0) return;
     state.createThreadForProject(@min(state.selected_project_index, state.projects.items.len - 1));
+}
+
+fn runChooseChatModel(state: *runtime.AppState) void {
+    state.openPaletteModelPicker();
+}
+
+fn runChatRunConfig(state: *runtime.AppState) void {
+    state.openRunConfigPopover();
 }
 
 fn runSyncCurrentThread(state: *runtime.AppState) void {
@@ -1678,6 +1694,8 @@ fn keybindHintFor(state: *runtime.AppState, ref: ?KeybindRef) []const u8 {
     const config = state.keyboard_config orelse return "";
     const bindings = switch (keybind_ref) {
         .new_thread => config.new_thread,
+        .chat_model_picker => config.chat_model_picker,
+        .chat_run_config => config.chat_run_config,
         .toggle_sidebar => config.toggle_sidebar,
         .toggle_browser => config.toggle_browser,
         .toggle_terminal => config.toggle_terminal,

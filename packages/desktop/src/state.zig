@@ -945,7 +945,10 @@ fn paletteModelPickerEvent(context: ?*anyopaque, event: palette.RichPickerEvent)
             state.setCurrentThreadModelRef(option.value);
             state.syncPaletteComposerControls();
         },
-        .highlighted, .open_changed => {},
+        .open_changed => |open| {
+            if (!open) state.restoreComposerAfterShortcutPopover();
+        },
+        .highlighted => {},
     }
 }
 
@@ -4694,6 +4697,9 @@ pub const AppState = struct {
     palette_model_picker: PaletteModelPicker,
     model_picker_entries: std.ArrayList(ModelPickerEntry),
     run_config_open: bool,
+    /// Restores the prompt caret after a keyboard-opened composer popover
+    /// closes. Mouse-opened popovers leave focus where the click placed it.
+    composer_popover_restore_focus: bool,
     /// Index into the currently visible run-config rows for keyboard focus.
     run_config_focused_row: usize,
     /// Monotonic-ms timestamp of the last stepper animation tick; drives the
@@ -5021,6 +5027,7 @@ pub const AppState = struct {
             .palette_model_picker = PaletteModelPicker.init(0),
             .model_picker_entries = .empty,
             .run_config_open = false,
+            .composer_popover_restore_focus = false,
             .run_config_focused_row = 0,
             .run_config_last_tick_ms = 0,
             .run_steppers = .{ PaletteRunStepper.init(0), PaletteRunStepper.init(2), PaletteRunStepper.init(2) },
@@ -17331,6 +17338,7 @@ pub const AppState = struct {
 
     pub fn openPaletteModelPicker(self: *AppState) void {
         if (self.projects.items.len == 0) return;
+        self.composer_popover_restore_focus = false;
         if (self.opencode_model_options.items.len == 0) {
             self.refreshOpencodeModelOptionsCacheAsync();
         }
@@ -17356,11 +17364,27 @@ pub const AppState = struct {
     }
 
     pub fn closePaletteModelPicker(self: *AppState) void {
+        self.composer_popover_restore_focus = false;
         if (!self.palette_model_picker.isOpen()) return;
         _ = self.palette_model_picker.handleInput(self.allocator, .close) catch |err| blk: {
             log.warn("failed to close model picker: {s}", .{@errorName(err)});
             break :blk false;
         };
+    }
+
+    pub fn togglePaletteModelPickerFromShortcut(self: *AppState) void {
+        const restore_focus = self.composer_popover_restore_focus or
+            self.palette_composer.focused or self.composer_focused;
+        if (self.palette_model_picker.isOpen()) {
+            self.closePaletteModelPicker();
+            if (restore_focus) self.requestComposerFocus();
+            self.noteInteraction();
+            return;
+        }
+        self.openPaletteModelPicker();
+        if (self.palette_model_picker.isOpen()) {
+            self.composer_popover_restore_focus = restore_focus;
+        }
     }
 
     /// Fresh, never-sent threads may still switch provider; committed threads
@@ -17577,6 +17601,7 @@ pub const AppState = struct {
 
     pub fn openRunConfigPopover(self: *AppState) void {
         if (self.projects.items.len == 0) return;
+        self.composer_popover_restore_focus = false;
         self.closePaletteModelPicker();
         self.palette_composer.active_menu = null;
         self.palette_composer.hovered_menu_index = null;
@@ -17592,6 +17617,7 @@ pub const AppState = struct {
     }
 
     pub fn closeRunConfigPopover(self: *AppState) void {
+        self.composer_popover_restore_focus = false;
         self.run_config_open = false;
     }
 
@@ -17601,6 +17627,31 @@ pub const AppState = struct {
         } else {
             self.openRunConfigPopover();
         }
+    }
+
+    pub fn toggleRunConfigPopoverFromShortcut(self: *AppState) void {
+        const restore_focus = self.composer_popover_restore_focus or
+            self.palette_composer.focused or self.composer_focused;
+        if (self.run_config_open) {
+            self.closeRunConfigPopover();
+            if (restore_focus) self.requestComposerFocus();
+            self.noteInteraction();
+            return;
+        }
+        self.openRunConfigPopover();
+        if (self.run_config_open) self.composer_popover_restore_focus = restore_focus;
+    }
+
+    fn closeRunConfigPopoverFromKeyboard(self: *AppState) void {
+        const restore_focus = self.composer_popover_restore_focus;
+        self.closeRunConfigPopover();
+        if (restore_focus) self.requestComposerFocus();
+    }
+
+    fn restoreComposerAfterShortcutPopover(self: *AppState) void {
+        const restore_focus = self.composer_popover_restore_focus;
+        self.composer_popover_restore_focus = false;
+        if (restore_focus) self.requestComposerFocus();
     }
 
     pub fn routePaletteComposerTextInput(self: *AppState, text: []const u8) bool {
@@ -17637,7 +17688,7 @@ pub const AppState = struct {
                 return self.routePaletteModelPickerKey(.{ .code = .escape });
             }
             if (self.run_config_open) {
-                self.closeRunConfigPopover();
+                self.closeRunConfigPopoverFromKeyboard();
                 self.noteInteraction();
                 return true;
             }
@@ -17794,7 +17845,7 @@ pub const AppState = struct {
         var kinds: [3]RunConfigRowKind = undefined;
         const count = self.runConfigVisibleRows(&kinds);
         if (count == 0) {
-            self.closeRunConfigPopover();
+            self.closeRunConfigPopoverFromKeyboard();
             return true;
         }
         if (self.run_config_focused_row >= count) self.run_config_focused_row = count - 1;
@@ -17810,7 +17861,7 @@ pub const AppState = struct {
                 return true;
             },
             .enter => {
-                self.closeRunConfigPopover();
+                self.closeRunConfigPopoverFromKeyboard();
                 self.noteInteraction();
                 return true;
             },
