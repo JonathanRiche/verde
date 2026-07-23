@@ -132,7 +132,12 @@ verde live workspace reopen [--project <id|index|path>] [--json]
 - `capabilities` prints the live method list without requiring the app to be running.
 - `status` returns protocol version, app pid, selected project, focused pane, current pane graph, terminal/process summary, and browser runtime state.
 - `active` returns the current project and focused pane.
-- `surfaces` lists in-memory terminal surface status and attention metadata.
+- `surfaces` lists terminal surface status and attention metadata. Unacknowledged
+  completions persist across app and terminal-daemon restarts until the pane is
+  focused or the completion is cleared through the surface controls.
+- `panes` and `threads` expose native-chat `completion_pending` and
+  `completed_at_ms` fields. Focusing that chat pane through `pane focus`
+  acknowledges and clears the durable completion.
 - `workspace close` removes a workspace from the active sidebar without
   deleting its saved threads or layout. `archive` is an alias for `close`.
 - `workspace reopen` restores the specified closed workspace, or the most

@@ -6,13 +6,16 @@ const zqlite = @import("zqlite");
 
 const schema = @import("schema.zig");
 const db_types = @import("types.zig");
+const provider_types = @import("../provider_types.zig");
 
 const LoadedState = db_types.LoadedState;
+const PersistedChatCompletion = db_types.PersistedChatCompletion;
 const PersistedHerdrWorkspaceLink = db_types.PersistedHerdrWorkspaceLink;
 const PersistedImageAttachment = db_types.PersistedImageAttachment;
 const PersistedMessage = db_types.PersistedMessage;
 const PersistedProject = db_types.PersistedProject;
 const PersistedState = db_types.PersistedState;
+const PersistedSurfaceCompletion = db_types.PersistedSurfaceCompletion;
 const PersistedThread = db_types.PersistedThread;
 
 pub const STATE_DB_NAME = "state.sqlite";
@@ -112,7 +115,53 @@ pub const Client = struct {
         if (workspace_rows.err) |err| return err;
 
         loaded.value.projects = try workspaces.toOwnedSlice(arena);
+        loaded.value.surface_completions = try self.loadSurfaceCompletions(arena);
+        loaded.value.chat_completions = try self.loadChatCompletions(arena);
         return loaded;
+    }
+
+    pub fn upsertSurfaceCompletion(self: *const Self, completion: PersistedSurfaceCompletion) !void {
+        try self.conn.exec(
+            "insert into surface_completions (session_id, workspace_id, workspace_path, dock_id, pane_id, provider, provider_thread_id, title, completed_at_ms, last_event_title, last_event_body) " ++
+                "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) " ++
+                "on conflict(session_id) do update set workspace_id = excluded.workspace_id, workspace_path = excluded.workspace_path, dock_id = excluded.dock_id, " ++
+                "pane_id = excluded.pane_id, provider = excluded.provider, provider_thread_id = excluded.provider_thread_id, title = excluded.title, " ++
+                "completed_at_ms = excluded.completed_at_ms, last_event_title = excluded.last_event_title, last_event_body = excluded.last_event_body",
+            .{
+                completion.session_id,
+                completion.workspace_id,
+                completion.workspace_path,
+                @as(i64, @intCast(completion.dock_id)),
+                if (completion.pane_id) |pane_id| @as(i64, @intCast(pane_id)) else null,
+                encodeOptionalEnum(completion.provider),
+                completion.provider_thread_id,
+                completion.title,
+                completion.completed_at_ms,
+                completion.last_event_title,
+                completion.last_event_body,
+            },
+        );
+    }
+
+    pub fn clearSurfaceCompletion(self: *const Self, session_id: []const u8) !bool {
+        try self.conn.exec("delete from surface_completions where session_id = ?1", .{session_id});
+        return self.conn.changes() > 0;
+    }
+
+    pub fn upsertChatCompletion(self: *const Self, completion: PersistedChatCompletion) !void {
+        try self.conn.exec(
+            "insert into chat_completions (workspace_id, local_thread_id, completed_at_ms) values (?1, ?2, ?3) " ++
+                "on conflict(workspace_id, local_thread_id) do update set completed_at_ms = excluded.completed_at_ms",
+            .{ completion.workspace_id, completion.local_thread_id, completion.completed_at_ms },
+        );
+    }
+
+    pub fn clearChatCompletion(self: *const Self, workspace_id: []const u8, local_thread_id: []const u8) !bool {
+        try self.conn.exec(
+            "delete from chat_completions where workspace_id = ?1 and local_thread_id = ?2",
+            .{ workspace_id, local_thread_id },
+        );
+        return self.conn.changes() > 0;
     }
 
     pub fn save(self: *const Self, state: PersistedState) !void {
@@ -173,6 +222,58 @@ pub const Client = struct {
         try self.conn.commit();
     }
 
+    fn loadSurfaceCompletions(self: *const Self, allocator: std.mem.Allocator) ![]const PersistedSurfaceCompletion {
+        var completions: std.ArrayList(PersistedSurfaceCompletion) = .empty;
+        defer completions.deinit(allocator);
+
+        var rows = try self.conn.rows(
+            "select session_id, workspace_id, workspace_path, dock_id, pane_id, provider, provider_thread_id, title, completed_at_ms, last_event_title, last_event_body " ++
+                "from surface_completions order by completed_at_ms, session_id",
+            .{},
+        );
+        defer rows.deinit();
+
+        while (rows.next()) |row| {
+            try completions.append(allocator, .{
+                .session_id = try allocator.dupe(u8, row.text(0)),
+                .workspace_id = try allocator.dupe(u8, row.text(1)),
+                .workspace_path = try allocator.dupe(u8, row.text(2)),
+                .dock_id = @intCast(row.int(3)),
+                .pane_id = if (row.nullableInt(4)) |value| @intCast(value) else null,
+                .provider = decodeOptionalEnum(db_types.Provider, row.nullableInt(5)),
+                .provider_thread_id = try dupeOptionalText(allocator, row.nullableText(6)),
+                .title = try allocator.dupe(u8, row.text(7)),
+                .completed_at_ms = row.int(8),
+                .last_event_title = try dupeOptionalText(allocator, row.nullableText(9)),
+                .last_event_body = try dupeOptionalText(allocator, row.nullableText(10)),
+            });
+        }
+        if (rows.err) |err| return err;
+        return try completions.toOwnedSlice(allocator);
+    }
+
+    fn loadChatCompletions(self: *const Self, allocator: std.mem.Allocator) ![]const PersistedChatCompletion {
+        var completions: std.ArrayList(PersistedChatCompletion) = .empty;
+        defer completions.deinit(allocator);
+
+        var rows = try self.conn.rows(
+            "select workspace_id, local_thread_id, completed_at_ms from chat_completions " ++
+                "order by completed_at_ms, workspace_id, local_thread_id",
+            .{},
+        );
+        defer rows.deinit();
+
+        while (rows.next()) |row| {
+            try completions.append(allocator, .{
+                .workspace_id = try allocator.dupe(u8, row.text(0)),
+                .local_thread_id = try allocator.dupe(u8, row.text(1)),
+                .completed_at_ms = row.int(2),
+            });
+        }
+        if (rows.err) |err| return err;
+        return try completions.toOwnedSlice(allocator);
+    }
+
     fn loadThreads(self: *const Self, allocator: std.mem.Allocator, project_id: i64) ![]const PersistedThread {
         var threads: std.ArrayList(PersistedThread) = .empty;
         defer threads.deinit(allocator);
@@ -221,7 +322,7 @@ pub const Client = struct {
         defer messages.deinit(allocator);
 
         var message_rows = try self.conn.rows(
-            "select role, author, body, image_path, image_mime, image_byte_size " ++
+            "select role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status " ++
                 "from messages where thread_id = ?1 order by sort_index",
             .{thread_id},
         );
@@ -238,6 +339,9 @@ pub const Client = struct {
                     message_row.nullableText(4),
                     message_row.nullableInt(5),
                 ),
+                .tool_call_id = try dupeOptionalText(allocator, message_row.nullableText(6)),
+                .tool_call_kind = decodeOptionalEnum(provider_types.ToolCallKind, message_row.nullableInt(7)),
+                .tool_call_status = decodeOptionalEnum(provider_types.ToolCallStatus, message_row.nullableInt(8)),
             });
         }
         if (message_rows.err) |err| return err;
@@ -315,8 +419,8 @@ pub const Client = struct {
         for (messages, 0..) |message, message_index| {
             const image = message.image;
             try self.conn.exec(
-                "insert into messages (thread_id, sort_index, role, author, body, image_path, image_mime, image_byte_size) " ++
-                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "insert into messages (thread_id, sort_index, role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status) " ++
+                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 .{
                     thread_id,
                     @as(i64, @intCast(message_index)),
@@ -326,6 +430,9 @@ pub const Client = struct {
                     if (image) |attachment| attachment.path else null,
                     if (image) |attachment| attachment.mime else null,
                     if (image) |attachment| @as(i64, @intCast(attachment.byte_size)) else null,
+                    message.tool_call_id,
+                    encodeOptionalEnum(message.tool_call_kind),
+                    encodeOptionalEnum(message.tool_call_status),
                 },
             );
         }
@@ -412,6 +519,84 @@ fn testDirPathAlloc(dir: std.Io.Dir, allocator: std.mem.Allocator) ![]u8 {
     var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const len = try dir.realPath(testing.io, &buffer);
     return allocator.dupe(u8, buffer[0..len]);
+}
+
+test "surface completions survive state saves and clear explicitly" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+
+    var client = try Client.init(testing.allocator, pref_path);
+    defer client.deinit();
+
+    try client.save(.{});
+    try client.upsertSurfaceCompletion(.{
+        .session_id = "session-later",
+        .workspace_id = "workspace-2",
+        .workspace_path = "/tmp/two",
+        .dock_id = 2,
+        .pane_id = 12,
+        .provider = .cursor,
+        .title = "Later",
+        .completed_at_ms = 200,
+    });
+    try client.upsertSurfaceCompletion(.{
+        .session_id = "session-first",
+        .workspace_id = "workspace-1",
+        .workspace_path = "/tmp/one",
+        .dock_id = 1,
+        .pane_id = 11,
+        .provider = .codex,
+        .title = "First",
+        .completed_at_ms = 100,
+    });
+
+    // Ordinary app-state snapshots must not erase the independent completion
+    // ledger, including when another process writes the ledger between saves.
+    try client.save(.{ .sidebar_collapsed = true });
+
+    var loaded = (try client.load(testing.allocator)).?;
+    defer loaded.deinit();
+    try testing.expectEqual(@as(usize, 2), loaded.value.surface_completions.len);
+    try testing.expectEqualStrings("session-first", loaded.value.surface_completions[0].session_id);
+    try testing.expectEqualStrings("session-later", loaded.value.surface_completions[1].session_id);
+    try testing.expect(try client.clearSurfaceCompletion("session-first"));
+    try testing.expect(!try client.clearSurfaceCompletion("session-first"));
+}
+
+test "chat completions survive state saves and clear explicitly" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+
+    var client = try Client.init(testing.allocator, pref_path);
+    defer client.deinit();
+
+    try client.save(.{});
+    try client.upsertChatCompletion(.{
+        .workspace_id = "workspace-2",
+        .local_thread_id = "chat-later",
+        .completed_at_ms = 200,
+    });
+    try client.upsertChatCompletion(.{
+        .workspace_id = "workspace-1",
+        .local_thread_id = "chat-first",
+        .completed_at_ms = 100,
+    });
+
+    try client.save(.{ .sidebar_collapsed = true });
+
+    var loaded = (try client.load(testing.allocator)).?;
+    defer loaded.deinit();
+    try testing.expectEqual(@as(usize, 2), loaded.value.chat_completions.len);
+    try testing.expectEqualStrings("chat-first", loaded.value.chat_completions[0].local_thread_id);
+    try testing.expectEqualStrings("chat-later", loaded.value.chat_completions[1].local_thread_id);
+    try testing.expect(try client.clearChatCompletion("workspace-1", "chat-first"));
+    try testing.expect(!try client.clearChatCompletion("workspace-1", "chat-first"));
 }
 
 test "save clears orphaned threads left behind by manual db edits" {

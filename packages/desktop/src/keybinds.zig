@@ -161,6 +161,7 @@ pub const NativeKeyboardConfig = struct {
     workspace_focus_up: []Keybind,
     workspace_focus_down: []Keybind,
     workspace_focus_prompt: []Keybind,
+    workspace_pane_select: []Keybind,
     workspace_move_left: []Keybind,
     workspace_move_right: []Keybind,
     workspace_move_up: []Keybind,
@@ -218,6 +219,7 @@ pub const NativeKeyboardConfig = struct {
             .workspace_focus_up = try cloneDefaultWorkspaceFocusUpKeybinds(allocator),
             .workspace_focus_down = try cloneDefaultWorkspaceFocusDownKeybinds(allocator),
             .workspace_focus_prompt = try cloneDefaultWorkspaceFocusPromptKeybinds(allocator),
+            .workspace_pane_select = try cloneDefaultWorkspacePaneSelectKeybinds(allocator),
             .workspace_move_left = try cloneDefaultWorkspaceMoveLeftKeybinds(allocator),
             .workspace_move_right = try cloneDefaultWorkspaceMoveRightKeybinds(allocator),
             .workspace_move_up = try cloneDefaultWorkspaceMoveUpKeybinds(allocator),
@@ -286,6 +288,7 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.workspace_focus_up);
         self.allocator.free(self.workspace_focus_down);
         self.allocator.free(self.workspace_focus_prompt);
+        self.allocator.free(self.workspace_pane_select);
         self.allocator.free(self.workspace_move_left);
         self.allocator.free(self.workspace_move_right);
         self.allocator.free(self.workspace_move_up);
@@ -422,6 +425,15 @@ pub const NativeKeyboardConfig = struct {
 
     pub fn workspaceSelectIndexForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?usize {
         for (self.workspace_select, 0..) |binding, index| {
+            if (binding.matches(event)) {
+                return index;
+            }
+        }
+        return null;
+    }
+
+    pub fn workspacePaneSelectIndexForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?usize {
+        for (self.workspace_pane_select, 0..) |binding, index| {
             if (binding.matches(event)) {
                 return index;
             }
@@ -776,6 +788,12 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(value, "workspace.focus_prompt")) |bindings| {
                 self.allocator.free(self.workspace_focus_prompt);
                 self.workspace_focus_prompt = bindings;
+            }
+        }
+        if (workspace_value.object.get("pane_select")) |value| {
+            if (self.parseOverrideValue(value, "workspace.pane_select")) |bindings| {
+                self.allocator.free(self.workspace_pane_select);
+                self.workspace_pane_select = bindings;
             }
         }
         if (workspace_value.object.get("move_left")) |value| {
@@ -1163,6 +1181,21 @@ fn cloneDefaultWorkspaceFocusPromptKeybinds(allocator: std.mem.Allocator) ![]Key
     });
 }
 
+fn cloneDefaultWorkspacePaneSelectKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Ctrl+1"),
+        try parseDefaultAccelerator("Ctrl+2"),
+        try parseDefaultAccelerator("Ctrl+3"),
+        try parseDefaultAccelerator("Ctrl+4"),
+        try parseDefaultAccelerator("Ctrl+5"),
+        try parseDefaultAccelerator("Ctrl+6"),
+        try parseDefaultAccelerator("Ctrl+7"),
+        try parseDefaultAccelerator("Ctrl+8"),
+        try parseDefaultAccelerator("Ctrl+9"),
+        try parseDefaultAccelerator("Ctrl+0"),
+    });
+}
+
 fn cloneDefaultWorkspaceMoveLeftKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Ctrl+Shift+H"),
@@ -1516,6 +1549,35 @@ test "workspace select override accepts ordered accelerator array" {
     try std.testing.expectEqual(sdl.Keycode.@"1", config.workspace_select[0].key);
     try std.testing.expect(config.workspace_select[1].ctrl);
     try std.testing.expectEqual(sdl.Keycode.@"2", config.workspace_select[1].key);
+}
+
+test "workspace pane select defaults map ctrl number order" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 10), config.workspace_pane_select.len);
+    try std.testing.expect(config.workspace_pane_select[0].ctrl);
+    try std.testing.expectEqual(sdl.Keycode.@"1", config.workspace_pane_select[0].key);
+    try std.testing.expect(config.workspace_pane_select[9].ctrl);
+    try std.testing.expectEqual(sdl.Keycode.@"0", config.workspace_pane_select[9].key);
+}
+
+test "workspace pane select override accepts ordered accelerator array" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"workspace": {"pane_select": ["Alt+1", "Alt+2"]}}}
+    , .{});
+    defer parsed.deinit();
+
+    config.applyOverrides(parsed.value);
+
+    try std.testing.expectEqual(@as(usize, 2), config.workspace_pane_select.len);
+    try std.testing.expect(config.workspace_pane_select[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.@"1", config.workspace_pane_select[0].key);
+    try std.testing.expect(config.workspace_pane_select[1].alt);
+    try std.testing.expectEqual(sdl.Keycode.@"2", config.workspace_pane_select[1].key);
 }
 
 test "new thread keybind override accepts a single accelerator" {

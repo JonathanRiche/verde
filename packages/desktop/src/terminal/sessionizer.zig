@@ -31,7 +31,10 @@ pub const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\verde-sessionizer-";
 // Version 10 terminates the complete PTY process group for managed processes.
 // Version 11 updates daemon-owned Codex resume limits and tool event mapping.
 // Version 12 actively interrupts app-server turns when daemon sends are stopped.
-pub const PROTOCOL_VERSION: u32 = 12;
+// Version 13 transports structured tool-call lifecycle events to the desktop.
+// Version 14 preserves provider-specific tool titles and inferred MCP kinds.
+// Version 15 carries exact Verde MCP method names through Cursor tool results.
+pub const PROTOCOL_VERSION: u32 = 15;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
@@ -2037,6 +2040,35 @@ fn chatSinkEvent(context: ?*anyopaque, event: harness.StreamEvent) void {
             const payload = writer.toOwnedSlice() catch return;
             defer allocator.free(payload);
             turn.appendEvent(allocator, "message", payload);
+        },
+        .tool_call => |tool_call| {
+            var writer: std.Io.Writer.Allocating = .init(allocator);
+            defer writer.deinit();
+            var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+            s.beginObject() catch return;
+            s.objectField("call_id") catch return;
+            s.write(tool_call.call_id) catch return;
+            s.objectField("title") catch return;
+            s.write(tool_call.title) catch return;
+            if (tool_call.kind) |kind| {
+                s.objectField("kind") catch return;
+                s.write(@tagName(kind)) catch return;
+            }
+            if (tool_call.status) |status| {
+                s.objectField("status") catch return;
+                s.write(@tagName(status)) catch return;
+            }
+            inline for (.{ "input", "output", "error_text", "locations", "raw" }) |field_name| {
+                const value = @field(tool_call, field_name);
+                if (value) |text| {
+                    s.objectField(field_name) catch return;
+                    s.write(text) catch return;
+                }
+            }
+            s.endObject() catch return;
+            const payload = writer.toOwnedSlice() catch return;
+            defer allocator.free(payload);
+            turn.appendEvent(allocator, "tool_call", payload);
         },
         .diff => turn.appendEvent(allocator, "diff", "{}"),
     }

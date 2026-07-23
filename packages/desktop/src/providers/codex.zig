@@ -16,6 +16,32 @@ const MAX_WS_MESSAGE_BYTES = 128 * 1024 * 1024;
 const MAX_HTTP_LINE_BYTES = 16 * 1024;
 const MAX_RPC_RETRIES = 4;
 const INTERRUPTIBLE_READ_POLL_MS = 250;
+// Control-plane RPCs (initialize, thread/resume, turn/interrupt, thread/list,
+// ...) answer immediately on a healthy app-server. Total socket silence beyond
+// this window means the socket or the server is wedged (e.g. after a network
+// drop), so fail the call instead of blocking the send thread forever.
+const RPC_IDLE_TIMEOUT_MS: u64 = 30_000;
+// An accepted turn/start emits thread events promptly. Silence after acceptance
+// means the turn is queued behind a wedged turn or the server died; once the
+// turn produces any event, long quiet stretches are legitimate again (model
+// thinking, long tool runs) and no deadline applies.
+const TURN_ACCEPT_IDLE_TIMEOUT_MS: u64 = 30_000;
+// The websocket upgrade targets a local or forwarded port; a wedged server can
+// accept the TCP connection and then never answer the upgrade request.
+const HANDSHAKE_IDLE_TIMEOUT_MS: u64 = 10_000;
+
+/// Controls how long a blocking websocket read may wait and which cancellation
+/// signals it honors between poll intervals.
+const ReadWait = struct {
+    /// In-flight send whose stop callback is polled between reads.
+    request: ?provider_types.SendPromptRequest = null,
+    /// Fail with `error.CodexServerUnresponsive` after this much complete
+    /// socket silence. Null waits indefinitely.
+    idle_timeout_ms: ?u64 = null,
+};
+
+/// Default wait for fast control-plane RPC responses.
+const RPC_WAIT: ReadWait = .{ .idle_timeout_ms = RPC_IDLE_TIMEOUT_MS };
 /// Poll interval while waiting for `codex app-server` after spawn (100ms × attempts).
 const MAX_CONNECT_WAIT_ATTEMPTS = 120;
 const MAX_PROTOCOL_INIT_ATTEMPTS = 8;
@@ -323,11 +349,19 @@ pub const Client = struct {
         }
 
         runtime_log.diagnostic("codex.sendPrompt ensuring thread loaded thread_id_len={d}", .{thread_id.len});
-        try self.ensureThreadLoaded(thread_id);
+        try self.ensureThreadLoaded(thread_id, .{
+            .request = request,
+            .idle_timeout_ms = RPC_IDLE_TIMEOUT_MS,
+        });
 
         runtime_log.diagnostic("codex.sendPrompt starting turn thread_id_len={d}", .{thread_id.len});
         const reply = try self.startTurnAndCollectReply(allocator, thread_id, request);
         errdefer allocator.free(reply);
+        self.emitBackgroundTerminals(thread_id, request) catch |err| {
+            // The endpoint is experimental; a missing/older server must not
+            // turn an otherwise successful conversation turn into a failure.
+            runtime_log.diagnostic("codex background terminal list unavailable: {s}", .{@errorName(err)});
+        };
         runtime_log.diagnostic("codex.sendPrompt completed thread_id_len={d} reply_len={d}", .{ thread_id.len, reply.len });
 
         return .{
@@ -382,7 +416,7 @@ pub const Client = struct {
     ) !provider_types.RunSlashCommandResult {
         const thread_id = request.thread_id orelse return error.MissingThreadId;
         try self.ensureConnected();
-        try self.ensureThreadLoaded(thread_id);
+        try self.ensureThreadLoaded(thread_id, RPC_WAIT);
 
         const args = std.mem.trim(u8, request.args, " \t\r\n");
         if (args.len == 0 or std.mem.eql(u8, args, "status")) {
@@ -424,7 +458,7 @@ pub const Client = struct {
     ) !provider_types.RunSlashCommandResult {
         const thread_id = request.thread_id orelse return error.MissingThreadId;
         try self.ensureConnected();
-        try self.ensureThreadLoaded(thread_id);
+        try self.ensureThreadLoaded(thread_id, RPC_WAIT);
 
         try self.callThreadCompactAndWait(thread_id);
 
@@ -443,7 +477,7 @@ pub const Client = struct {
     ) !provider_types.RunSlashCommandResult {
         const thread_id = request.thread_id orelse return error.MissingThreadId;
         try self.ensureConnected();
-        try self.ensureThreadLoaded(thread_id);
+        try self.ensureThreadLoaded(thread_id, RPC_WAIT);
 
         const review_text = try self.callReviewStartAndWait(allocator, thread_id, request.args);
         defer allocator.free(review_text);
@@ -475,7 +509,7 @@ pub const Client = struct {
             );
         };
         try self.ensureConnected();
-        try self.ensureThreadLoaded(thread_id);
+        try self.ensureThreadLoaded(thread_id, RPC_WAIT);
 
         const output = try self.callShellCommandAndWait(allocator, thread_id, command);
         defer allocator.free(output);
@@ -610,9 +644,49 @@ pub const Client = struct {
         self.allocator.free(payload);
     }
 
+    /// Terminates one retained terminal without interrupting its owning turn.
+    pub fn terminateBackgroundTerminal(self: *Client, thread_id: []const u8, process_id: []const u8) !void {
+        try self.ensureConnected();
+        const payload = try self.callRpcForResultAlloc("thread/backgroundTerminals/terminate", .{
+            .threadId = thread_id,
+            .processId = process_id,
+        });
+        defer self.allocator.free(payload);
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{});
+        defer parsed.deinit();
+        const terminated = getObjectField(parsed.value, "terminated") orelse return error.InvalidBackgroundTerminalResponse;
+        if (terminated != .bool or !terminated.bool) return error.BackgroundTerminalNotTerminated;
+    }
+
+    fn emitBackgroundTerminals(self: *Client, thread_id: []const u8, request: provider_types.SendPromptRequest) !void {
+        const on_stream_event = request.on_stream_event orelse return;
+        var identities: std.Io.Writer.Allocating = .init(self.allocator);
+        defer identities.deinit();
+        try identities.writer.print("Provider thread ID: {s}", .{thread_id});
+        const payload = try self.callRpcForResultAlloc("thread/backgroundTerminals/list", .{ .threadId = thread_id });
+        defer self.allocator.free(payload);
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{});
+        defer parsed.deinit();
+        const data = getObjectField(parsed.value, "data") orelse return error.InvalidBackgroundTerminalResponse;
+        if (data != .array) return error.InvalidBackgroundTerminalResponse;
+        for (data.array.items) |item| {
+            const item_id = getOptionalObjectString(item, "itemId") orelse continue;
+            const process_id = getOptionalObjectString(item, "processId") orelse continue;
+            const command = getOptionalObjectString(item, "command") orelse continue;
+            const cwd = getOptionalObjectString(item, "cwd") orelse "";
+            const body = try std.fmt.allocPrint(self.allocator, "{s}\n\nProvider: codex\nCodex item ID: {s}\nProcess ID: {s}\nProvider thread ID: {s}\nCWD: {s}", .{ command, item_id, process_id, thread_id, cwd });
+            defer self.allocator.free(body);
+            on_stream_event(request.stream_context, .{ .message = .{ .title = "Backgrounded command", .body = body } });
+            try identities.writer.print("\nCodex item ID: {s}", .{item_id});
+        }
+        const marker = try identities.toOwnedSlice();
+        defer self.allocator.free(marker);
+        on_stream_event(request.stream_context, .{ .message = .{ .title = "__verde_codex_background_snapshot", .body = marker } });
+    }
+
     pub fn steerThread(self: *Client, request: provider_types.SteerThreadRequest) !void {
         try self.ensureConnected();
-        try self.ensureThreadLoaded(request.thread_id);
+        try self.ensureThreadLoaded(request.thread_id, RPC_WAIT);
 
         const payload = try self.callTurnSteerForResultAlloc(request);
         defer self.allocator.free(payload);
@@ -822,6 +896,15 @@ pub const Client = struct {
             "KbdInteractiveAuthentication=no",
             "-o",
             "ConnectTimeout=20",
+            // Without keepalives a dropped network leaves the tunnel half-open
+            // forever and every forwarded read blocks silently; detect the dead
+            // link within ~45s so reads fail and reconnect logic can run.
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            "TCPKeepAlive=yes",
             "-o",
             "ExitOnForwardFailure=yes",
             "-L",
@@ -1098,12 +1181,15 @@ pub const Client = struct {
         defer self.allocator.free(payload);
         runtime_log.diagnostic("Codex RPC thread/start id={d} payload_len={d}", .{ id, payload.len });
         try self.writeTextMessage(payload);
-        const result = try self.awaitResultPayloadAlloc(id);
+        const result = try self.awaitResultPayloadAlloc(id, .{
+            .request = request,
+            .idle_timeout_ms = RPC_IDLE_TIMEOUT_MS,
+        });
         runtime_log.diagnostic("Codex RPC thread/start id={d} result_len={d}", .{ id, result.len });
         return result;
     }
 
-    fn ensureThreadLoaded(self: *Client, thread_id: []const u8) !void {
+    fn ensureThreadLoaded(self: *Client, thread_id: []const u8, wait: ReadWait) !void {
         if (self.loaded_threads.contains(thread_id)) return;
 
         const params = .{
@@ -1112,7 +1198,7 @@ pub const Client = struct {
             // potentially very large saved history merely to resume the thread.
             .excludeTurns = true,
         };
-        const payload = try self.callRpcForResultAlloc("thread/resume", params);
+        const payload = try self.callRpcForResultAllocWait("thread/resume", params, wait);
         defer self.allocator.free(payload);
 
         try self.rememberLoadedThread(thread_id);
@@ -1143,9 +1229,18 @@ pub const Client = struct {
         var reply: std.ArrayList(u8) = .empty;
         defer reply.deinit(allocator);
 
+        // True once the accepted turn has produced any message after its
+        // turn/start response; before that, total socket silence can only mean
+        // a dead connection or a turn wedged behind stale app-server state.
+        var saw_turn_activity = false;
+
         while (true) {
-            const message = self.readTextMessageAllocInterruptible(self.allocator, request) catch |err| {
-                if (err == error.CodexTurnInterrupted) {
+            const wait: ReadWait = .{
+                .request = request,
+                .idle_timeout_ms = if (saw_turn_activity) null else TURN_ACCEPT_IDLE_TIMEOUT_MS,
+            };
+            const message = self.readTextMessageAllocInterruptible(self.allocator, wait) catch |err| {
+                if (err == error.CodexTurnInterrupted or err == error.CodexServerUnresponsive) {
                     // The app-server keeps running a turn after its client
                     // disconnects. Do not await this response: cancelling the
                     // in-flight read may have discarded bytes from that stream.
@@ -1158,6 +1253,9 @@ pub const Client = struct {
                 return err;
             };
             defer self.allocator.free(message);
+            // Only messages read after the turn/start response processed in a
+            // prior iteration count as turn activity.
+            if (turn_started) saw_turn_activity = true;
 
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
             defer parsed.deinit();
@@ -1353,10 +1451,14 @@ pub const Client = struct {
     }
 
     fn callRpcForResultAlloc(self: *Client, method: []const u8, params: anytype) ![]u8 {
+        return self.callRpcForResultAllocWait(method, params, RPC_WAIT);
+    }
+
+    fn callRpcForResultAllocWait(self: *Client, method: []const u8, params: anytype, wait: ReadWait) ![]u8 {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
             const id = try self.sendRequest(method, params);
-            const maybe_payload = self.awaitResultPayloadAlloc(id);
+            const maybe_payload = self.awaitResultPayloadAlloc(id, wait);
             if (maybe_payload) |payload| {
                 return payload;
             } else |err| switch (err) {
@@ -1545,9 +1647,9 @@ pub const Client = struct {
         return id;
     }
 
-    fn awaitResultPayloadAlloc(self: *Client, id: u64) ![]u8 {
+    fn awaitResultPayloadAlloc(self: *Client, id: u64, wait: ReadWait) ![]u8 {
         while (true) {
-            const message = try self.readTextMessageAlloc(self.allocator);
+            const message = try self.readTextMessageAllocInterruptible(self.allocator, wait);
             defer self.allocator.free(message);
             runtime_log.diagnostic("Codex RPC await id={d} message_len={d}", .{ id, message.len });
 
@@ -1582,7 +1684,7 @@ pub const Client = struct {
 
     fn awaitTurnSteerResultPayloadAlloc(self: *Client, id: u64) ![]u8 {
         while (true) {
-            const message = try self.readTextMessageAlloc(self.allocator);
+            const message = try self.readTextMessageAllocInterruptible(self.allocator, RPC_WAIT);
             defer self.allocator.free(message);
 
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
@@ -1696,12 +1798,12 @@ pub const Client = struct {
     fn readTextMessageAllocInterruptible(
         self: *Client,
         allocator: std.mem.Allocator,
-        request: provider_types.SendPromptRequest,
+        wait: ReadWait,
     ) ![]u8 {
         const stream = self.stream orelse return error.NotConnected;
 
         while (true) {
-            const frame = try readServerFrameAllocInterruptible(allocator, stream, request);
+            const frame = try readServerFrameAllocInterruptible(allocator, stream, wait);
             errdefer allocator.free(frame.payload);
 
             switch (frame.opcode) {
@@ -1880,7 +1982,12 @@ fn readHttpLineAlloc(allocator: std.mem.Allocator, stream: std.Io.net.Stream) ![
 
     while (true) {
         var byte: [1]u8 = undefined;
-        const read = try streamRead(stream, &byte);
+        // A wedged app-server can accept the TCP connection without ever
+        // answering the upgrade; never block connect (and therefore stop and
+        // resume paths) forever on that.
+        const read = try streamReadInterruptible(stream, &byte, .{
+            .idle_timeout_ms = HANDSHAKE_IDLE_TIMEOUT_MS,
+        });
         if (read == 0) return error.EndOfStream;
 
         if (byte[0] == '\n') break;
@@ -1905,11 +2012,11 @@ fn readExact(stream: std.Io.net.Stream, buffer: []u8) !void {
 fn readExactInterruptible(
     stream: std.Io.net.Stream,
     buffer: []u8,
-    request: provider_types.SendPromptRequest,
+    wait: ReadWait,
 ) !void {
     var index: usize = 0;
     while (index < buffer.len) {
-        const amt = try streamReadInterruptible(stream, buffer[index..], request);
+        const amt = try streamReadInterruptible(stream, buffer[index..], wait);
         if (amt == 0) return error.EndOfStream;
         index += amt;
     }
@@ -1968,15 +2075,19 @@ fn streamRead(stream: std.Io.net.Stream, buffer: []u8) !usize {
     return streamReadWithIo(threaded.io(), stream, buffer);
 }
 
+fn readWaitShouldStop(wait: ReadWait) bool {
+    const request = wait.request orelse return false;
+    const should_stop = request.on_should_stop orelse return false;
+    return should_stop(request.stream_context);
+}
+
 fn streamReadInterruptible(
     stream: std.Io.net.Stream,
     buffer: []u8,
-    request: provider_types.SendPromptRequest,
+    wait: ReadWait,
 ) !usize {
     if (buffer.len == 0) return 0;
-    if (request.on_should_stop) |should_stop| {
-        if (should_stop(request.stream_context)) return error.CodexTurnInterrupted;
-    }
+    if (readWaitShouldStop(wait)) return error.CodexTurnInterrupted;
 
     const Event = union(enum) {
         read: std.Io.net.Stream.Reader.Error!usize,
@@ -1995,13 +2106,18 @@ fn streamReadInterruptible(
         std.Io.Duration.fromMilliseconds(INTERRUPTIBLE_READ_POLL_MS),
         std.Io.Clock.awake,
     });
+    // Idle accounting restarts on every call, so any received byte anywhere in
+    // the message stream resets the deadline.
+    var idle_ms: u64 = 0;
     while (true) {
         switch (try select.await()) {
             .read => |result| return try result,
             .poll => |result| {
                 try result;
-                if (request.on_should_stop) |should_stop| {
-                    if (should_stop(request.stream_context)) return error.CodexTurnInterrupted;
+                if (readWaitShouldStop(wait)) return error.CodexTurnInterrupted;
+                idle_ms += INTERRUPTIBLE_READ_POLL_MS;
+                if (wait.idle_timeout_ms) |limit| {
+                    if (idle_ms >= limit) return error.CodexServerUnresponsive;
                 }
                 try select.concurrent(.poll, std.Io.sleep, .{
                     io,
@@ -2090,10 +2206,10 @@ fn readServerFrameAlloc(allocator: std.mem.Allocator, stream: std.Io.net.Stream)
 fn readServerFrameAllocInterruptible(
     allocator: std.mem.Allocator,
     stream: std.Io.net.Stream,
-    request: provider_types.SendPromptRequest,
+    wait: ReadWait,
 ) !Frame {
     var header: [2]u8 = undefined;
-    try readExactInterruptible(stream, &header, request);
+    try readExactInterruptible(stream, &header, wait);
 
     const opcode: FrameOpcode = @enumFromInt(header[0] & 0x0f);
     const masked = (header[1] & 0x80) != 0;
@@ -2102,12 +2218,12 @@ fn readServerFrameAllocInterruptible(
     const payload_len: usize = switch (len_marker) {
         126 => blk: {
             var buf: [2]u8 = undefined;
-            try readExactInterruptible(stream, &buf, request);
+            try readExactInterruptible(stream, &buf, wait);
             break :blk std.mem.readInt(u16, &buf, .big);
         },
         127 => blk: {
             var buf: [8]u8 = undefined;
-            try readExactInterruptible(stream, &buf, request);
+            try readExactInterruptible(stream, &buf, wait);
             const long = std.mem.readInt(u64, &buf, .big);
             break :blk std.math.cast(usize, long) orelse return error.WebSocketMessageTooLarge;
         },
@@ -2124,7 +2240,7 @@ fn readServerFrameAllocInterruptible(
 
     var mask: [4]u8 = undefined;
     if (masked) {
-        try readExactInterruptible(stream, &mask, request);
+        try readExactInterruptible(stream, &mask, wait);
     }
 
     const payload = allocator.alloc(u8, payload_len) catch |err| {
@@ -2135,7 +2251,7 @@ fn readServerFrameAllocInterruptible(
         return err;
     };
     errdefer allocator.free(payload);
-    try readExactInterruptible(stream, payload, request);
+    try readExactInterruptible(stream, payload, wait);
 
     if (masked) {
         for (payload, 0..) |*byte, i| {
@@ -2770,29 +2886,18 @@ fn extractNotificationDelta(root: std.json.Value) ?[]const u8 {
 }
 
 fn emitNotificationEvent(self: *Client, root: std.json.Value, request: provider_types.SendPromptRequest) !void {
-    _ = self;
     const method = getOptionalObjectString(root, "method") orelse return;
 
     const on_stream_event = request.on_stream_event orelse return;
 
     if (std.mem.eql(u8, method, "item/started") or std.mem.eql(u8, method, "item/completed")) {
-        if (emitItemEvent(root, request.stream_context, on_stream_event)) {
+        if (try emitItemEvent(self.allocator, root, request.stream_context, on_stream_event)) {
             return;
         }
     }
 
     if (std.mem.eql(u8, method, "turn/diff/updated")) {
         if (buildDiffSummary(root, request.stream_context, on_stream_event)) {
-            return;
-        }
-    }
-
-    if (std.mem.eql(u8, method, "item/commandExecution/outputDelta")) {
-        if (extractCommandSummary(root)) |command| {
-            on_stream_event(request.stream_context, .{ .message = .{
-                .title = "Ran command",
-                .body = command,
-            } });
             return;
         }
     }
@@ -2822,36 +2927,100 @@ fn emitNotificationEvent(self: *Client, root: std.json.Value, request: provider_
     }
 }
 
+// Long-running items surface as structured tool-call lifecycle updates
+// (started -> in_progress, completed -> completed/failed) keyed by the Codex
+// item id, so the transcript shows work while it runs instead of staying on
+// "Waiting for streamed output..." until each item finishes. Titles stay empty
+// for execute/think/search kinds so the shared upsert derives the contract
+// authors ("Ran command", "Command failed", "Think", ...) and compact rows.
 fn emitItemEvent(
+    allocator: std.mem.Allocator,
     root: std.json.Value,
     context: ?*anyopaque,
     on_stream_event: *const fn (?*anyopaque, provider_types.StreamEvent) void,
-) bool {
+) !bool {
     const method = getOptionalObjectString(root, "method") orelse return false;
     const params = getObjectField(root, "params") orelse return false;
     const item = getObjectField(params, "item") orelse return false;
     const item_type = getOptionalObjectString(item, "type") orelse return false;
+    const started = std.mem.eql(u8, method, "item/started");
 
     if (std.mem.eql(u8, item_type, "commandExecution")) {
-        if (!std.mem.eql(u8, method, "item/completed")) return true;
         const command = getOptionalObjectString(item, "command") orelse return false;
+        const call_id = getOptionalObjectString(item, "id") orelse "";
+        if (started) {
+            on_stream_event(context, .{ .tool_call = .{
+                .call_id = call_id,
+                .title = "",
+                .kind = .execute,
+                .status = .in_progress,
+                .input = command,
+            } });
+            return true;
+        }
         const status = getOptionalObjectString(item, "status") orelse "completed";
-        on_stream_event(context, .{ .message = .{
-            .title = if (std.mem.eql(u8, status, "failed")) "Command failed" else "Ran command",
-            .body = command,
+        const output = try formatCommandExecutionOutputAlloc(allocator, item);
+        defer if (output) |text| allocator.free(text);
+        on_stream_event(context, .{ .tool_call = .{
+            .call_id = call_id,
+            .title = "",
+            .kind = .execute,
+            .status = toolCallStatusFromCodex(status),
+            .input = command,
+            .output = output,
         } });
         return true;
     }
 
     if (std.mem.eql(u8, item_type, "mcpToolCall")) {
-        if (!std.mem.eql(u8, method, "item/completed")) return true;
-        const status = getOptionalObjectString(item, "status") orelse return false;
-        if (!std.mem.eql(u8, status, "completed") and !std.mem.eql(u8, status, "failed")) return true;
         var label_buf: [512]u8 = undefined;
         const label = formatMcpToolCallLabel(&label_buf, item) orelse return false;
-        on_stream_event(context, .{ .message = .{
-            .title = if (std.mem.eql(u8, status, "failed")) "Command failed" else "Ran command",
-            .body = label,
+        const call_id = getOptionalObjectString(item, "id") orelse "";
+        if (started) {
+            on_stream_event(context, .{ .tool_call = .{
+                .call_id = call_id,
+                .title = "",
+                .kind = .mcp,
+                .status = .in_progress,
+                .input = label,
+            } });
+            return true;
+        }
+        const status = getOptionalObjectString(item, "status") orelse return false;
+        if (!std.mem.eql(u8, status, "completed") and !std.mem.eql(u8, status, "failed")) return true;
+        on_stream_event(context, .{ .tool_call = .{
+            .call_id = call_id,
+            .title = "",
+            .kind = .mcp,
+            .status = toolCallStatusFromCodex(status),
+            .input = label,
+        } });
+        return true;
+    }
+
+    if (std.mem.eql(u8, item_type, "reasoning")) {
+        const call_id = getOptionalObjectString(item, "id") orelse return false;
+        // Reasoning surfaces only as a transient "Thinking" liveness row: no
+        // summary output is attached, so the shared upsert removes the row
+        // again once the terminal status lands.
+        on_stream_event(context, .{ .tool_call = .{
+            .call_id = call_id,
+            .title = "",
+            .kind = .think,
+            .status = if (started) .in_progress else .completed,
+        } });
+        return true;
+    }
+
+    if (std.mem.eql(u8, item_type, "webSearch")) {
+        const call_id = getOptionalObjectString(item, "id") orelse return false;
+        const query = getOptionalObjectString(item, "query") orelse "";
+        on_stream_event(context, .{ .tool_call = .{
+            .call_id = call_id,
+            .title = "",
+            .kind = .search,
+            .status = if (started) .in_progress else .completed,
+            .input = if (query.len > 0) query else null,
         } });
         return true;
     }
@@ -2873,6 +3042,25 @@ fn emitItemEvent(
     }
 
     return false;
+}
+
+fn toolCallStatusFromCodex(status: []const u8) provider_types.ToolCallStatus {
+    if (std.mem.eql(u8, status, "failed")) return .failed;
+    if (std.mem.eql(u8, status, "declined") or std.mem.eql(u8, status, "cancelled")) return .cancelled;
+    return .completed;
+}
+
+/// The command itself travels in the tool-call `input` field; this collects
+/// the remaining execution details for the `output` field.
+fn formatCommandExecutionOutputAlloc(allocator: std.mem.Allocator, item: std.json.Value) !?[]u8 {
+    const output = getOptionalObjectString(item, "aggregatedOutput") orelse "";
+    const cwd = getOptionalObjectString(item, "cwd") orelse "";
+    const exit_code = getOptionalObjectInteger(item, "exitCode");
+    const duration = getOptionalObjectInteger(item, "durationMs");
+    if (output.len == 0 and cwd.len == 0 and exit_code == null and duration == null) return null;
+    return try std.fmt.allocPrint(allocator, "CWD: {s}\nExit code: {d}\nDuration ms: {d}\n\n{s}", .{
+        cwd, exit_code orelse -1, duration orelse -1, output,
+    });
 }
 
 fn formatMcpToolCallLabel(buffer: []u8, item: std.json.Value) ?[]const u8 {
@@ -3470,6 +3658,15 @@ const TestStreamEventCapture = struct {
     message_count: usize = 0,
     title_storage: [128]u8 = undefined,
     body_storage: [1024]u8 = undefined,
+    tool_call_count: usize = 0,
+    tool_call_id: ?[]const u8 = null,
+    tool_kind: ?provider_types.ToolCallKind = null,
+    tool_status: ?provider_types.ToolCallStatus = null,
+    tool_input: ?[]const u8 = null,
+    tool_output: ?[]const u8 = null,
+    tool_call_id_storage: [128]u8 = undefined,
+    tool_input_storage: [1024]u8 = undefined,
+    tool_output_storage: [1024]u8 = undefined,
 
     fn handle(context: ?*anyopaque, event: provider_types.StreamEvent) void {
         const self: *TestStreamEventCapture = @ptrCast(@alignCast(context orelse return));
@@ -3482,6 +3679,28 @@ const TestStreamEventCapture = struct {
                 self.title = self.title_storage[0..title_len];
                 self.body = self.body_storage[0..body_len];
                 self.message_count += 1;
+            },
+            .tool_call => |tool_call| {
+                const id_len = @min(tool_call.call_id.len, self.tool_call_id_storage.len);
+                @memcpy(self.tool_call_id_storage[0..id_len], tool_call.call_id[0..id_len]);
+                self.tool_call_id = self.tool_call_id_storage[0..id_len];
+                self.tool_kind = tool_call.kind;
+                self.tool_status = tool_call.status;
+                if (tool_call.input) |input| {
+                    const input_len = @min(input.len, self.tool_input_storage.len);
+                    @memcpy(self.tool_input_storage[0..input_len], input[0..input_len]);
+                    self.tool_input = self.tool_input_storage[0..input_len];
+                } else {
+                    self.tool_input = null;
+                }
+                if (tool_call.output) |output| {
+                    const output_len = @min(output.len, self.tool_output_storage.len);
+                    @memcpy(self.tool_output_storage[0..output_len], output[0..output_len]);
+                    self.tool_output = self.tool_output_storage[0..output_len];
+                } else {
+                    self.tool_output = null;
+                }
+                self.tool_call_count += 1;
             },
             .diff => {},
         }
@@ -3882,7 +4101,7 @@ test "detectTurnTerminalState matches turn completion status for the started tur
     try std.testing.expectEqualStrings("boom", capture.message.?);
 }
 
-test "command execution emits only its completed lifecycle event" {
+test "command execution emits lifecycle tool call updates" {
     const allocator = std.testing.allocator;
     const started_json =
         \\{
@@ -3901,8 +4120,13 @@ test "command execution emits only its completed lifecycle event" {
     defer started.deinit();
 
     var capture: TestStreamEventCapture = .{};
-    try std.testing.expect(emitItemEvent(started.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expect(try emitItemEvent(allocator, started.value, &capture, TestStreamEventCapture.handle));
     try std.testing.expectEqual(@as(usize, 0), capture.message_count);
+    try std.testing.expectEqual(@as(usize, 1), capture.tool_call_count);
+    try std.testing.expectEqualStrings("command-1", capture.tool_call_id.?);
+    try std.testing.expectEqual(provider_types.ToolCallKind.execute, capture.tool_kind.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.in_progress, capture.tool_status.?);
+    try std.testing.expectEqualStrings("git status", capture.tool_input.?);
 
     const completed_json =
         \\{
@@ -3912,7 +4136,9 @@ test "command execution emits only its completed lifecycle event" {
         \\      "id": "command-1",
         \\      "type": "commandExecution",
         \\      "command": "git status",
-        \\      "status": "completed"
+        \\      "status": "completed",
+        \\      "aggregatedOutput": "clean tree",
+        \\      "exitCode": 0
         \\    }
         \\  }
         \\}
@@ -3920,13 +4146,61 @@ test "command execution emits only its completed lifecycle event" {
     var completed = try std.json.parseFromSlice(std.json.Value, allocator, completed_json, .{});
     defer completed.deinit();
 
-    try std.testing.expect(emitItemEvent(completed.value, &capture, TestStreamEventCapture.handle));
-    try std.testing.expectEqual(@as(usize, 1), capture.message_count);
-    try std.testing.expectEqualStrings("Ran command", capture.title.?);
-    try std.testing.expectEqualStrings("git status", capture.body.?);
+    try std.testing.expect(try emitItemEvent(allocator, completed.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqual(@as(usize, 0), capture.message_count);
+    try std.testing.expectEqual(@as(usize, 2), capture.tool_call_count);
+    try std.testing.expectEqualStrings("command-1", capture.tool_call_id.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.tool_status.?);
+    try std.testing.expectEqualStrings("git status", capture.tool_input.?);
+    try std.testing.expect(std.mem.indexOf(u8, capture.tool_output.?, "clean tree") != null);
 }
 
-test "MCP calls emit one grouped command event on completion" {
+test "reasoning items emit transient think lifecycle tool call updates" {
+    const allocator = std.testing.allocator;
+    const started_json =
+        \\{
+        \\  "method": "item/started",
+        \\  "params": {
+        \\    "item": {
+        \\      "id": "reasoning-1",
+        \\      "type": "reasoning"
+        \\    }
+        \\  }
+        \\}
+    ;
+    var started = try std.json.parseFromSlice(std.json.Value, allocator, started_json, .{});
+    defer started.deinit();
+
+    var capture: TestStreamEventCapture = .{};
+    try std.testing.expect(try emitItemEvent(allocator, started.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqual(@as(usize, 1), capture.tool_call_count);
+    try std.testing.expectEqual(provider_types.ToolCallKind.think, capture.tool_kind.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.in_progress, capture.tool_status.?);
+
+    const completed_json =
+        \\{
+        \\  "method": "item/completed",
+        \\  "params": {
+        \\    "item": {
+        \\      "id": "reasoning-1",
+        \\      "type": "reasoning",
+        \\      "summary": ["**Reviewing layout code**", "Checking zoom handling"]
+        \\    }
+        \\  }
+        \\}
+    ;
+    var completed = try std.json.parseFromSlice(std.json.Value, allocator, completed_json, .{});
+    defer completed.deinit();
+
+    try std.testing.expect(try emitItemEvent(allocator, completed.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqual(@as(usize, 2), capture.tool_call_count);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.tool_status.?);
+    // No summary output travels with the terminal event; the shared upsert
+    // relies on that to drop the transient "Thinking" row.
+    try std.testing.expect(capture.tool_output == null);
+}
+
+test "MCP calls emit lifecycle tool call updates" {
     const allocator = std.testing.allocator;
     const started_json =
         \\{
@@ -3946,8 +4220,12 @@ test "MCP calls emit one grouped command event on completion" {
     defer started.deinit();
 
     var capture: TestStreamEventCapture = .{};
-    try std.testing.expect(emitItemEvent(started.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expect(try emitItemEvent(allocator, started.value, &capture, TestStreamEventCapture.handle));
     try std.testing.expectEqual(@as(usize, 0), capture.message_count);
+    try std.testing.expectEqual(@as(usize, 1), capture.tool_call_count);
+    try std.testing.expectEqual(provider_types.ToolCallKind.mcp, capture.tool_kind.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.in_progress, capture.tool_status.?);
+    try std.testing.expectEqualStrings("verde.capture_browser_screenshot", capture.tool_input.?);
 
     const completed_json =
         \\{
@@ -3966,10 +4244,11 @@ test "MCP calls emit one grouped command event on completion" {
     var completed = try std.json.parseFromSlice(std.json.Value, allocator, completed_json, .{});
     defer completed.deinit();
 
-    try std.testing.expect(emitItemEvent(completed.value, &capture, TestStreamEventCapture.handle));
-    try std.testing.expectEqual(@as(usize, 1), capture.message_count);
-    try std.testing.expectEqualStrings("Ran command", capture.title.?);
-    try std.testing.expectEqualStrings("verde.capture_browser_screenshot", capture.body.?);
+    try std.testing.expect(try emitItemEvent(allocator, completed.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqual(@as(usize, 2), capture.tool_call_count);
+    try std.testing.expectEqualStrings("mcp-1", capture.tool_call_id.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.tool_status.?);
+    try std.testing.expectEqualStrings("verde.capture_browser_screenshot", capture.tool_input.?);
 
     const failed_json =
         \\{
@@ -3988,10 +4267,11 @@ test "MCP calls emit one grouped command event on completion" {
     var failed = try std.json.parseFromSlice(std.json.Value, allocator, failed_json, .{});
     defer failed.deinit();
 
-    try std.testing.expect(emitItemEvent(failed.value, &capture, TestStreamEventCapture.handle));
-    try std.testing.expectEqual(@as(usize, 2), capture.message_count);
-    try std.testing.expectEqualStrings("Command failed", capture.title.?);
-    try std.testing.expectEqualStrings("blender.execute_blender_code", capture.body.?);
+    try std.testing.expect(try emitItemEvent(allocator, failed.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqual(@as(usize, 3), capture.tool_call_count);
+    try std.testing.expectEqualStrings("mcp-2", capture.tool_call_id.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.failed, capture.tool_status.?);
+    try std.testing.expectEqualStrings("blender.execute_blender_code", capture.tool_input.?);
 }
 
 test "isContextCompactionCompleted matches compact item completion" {
@@ -4016,7 +4296,7 @@ test "isContextCompactionCompleted matches compact item completion" {
     try std.testing.expect(!isContextCompactionCompleted(parsed.value, "other-thread"));
 
     var capture: TestStreamEventCapture = .{};
-    try std.testing.expect(emitItemEvent(parsed.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expect(try emitItemEvent(allocator, parsed.value, &capture, TestStreamEventCapture.handle));
     try std.testing.expectEqualStrings("Context compacted", capture.title.?);
     try std.testing.expectEqualStrings(
         "Codex summarized earlier conversation context to make room for the rest of this turn.",

@@ -71,8 +71,32 @@ pub const INIT_SQL: [:0]const u8 =
     \\    image_path text,
     \\    image_mime text,
     \\    image_byte_size integer,
+    \\    tool_call_id text,
+    \\    tool_call_kind integer,
+    \\    tool_call_status integer,
     \\    unique(thread_id, sort_index)
     \\);
+    \\create table if not exists surface_completions (
+    \\    session_id text primary key,
+    \\    workspace_id text not null default '',
+    \\    workspace_path text not null default '',
+    \\    dock_id integer not null default 0,
+    \\    pane_id integer,
+    \\    provider integer,
+    \\    provider_thread_id text,
+    \\    title text not null default '',
+    \\    completed_at_ms integer not null,
+    \\    last_event_title text,
+    \\    last_event_body text
+    \\);
+    \\create index if not exists surface_completions_completed_idx on surface_completions(completed_at_ms);
+    \\create table if not exists chat_completions (
+    \\    workspace_id text not null,
+    \\    local_thread_id text not null,
+    \\    completed_at_ms integer not null,
+    \\    primary key (workspace_id, local_thread_id)
+    \\);
+    \\create index if not exists chat_completions_completed_idx on chat_completions(completed_at_ms);
 ;
 
 pub fn initialize(conn: zqlite.Conn) !void {
@@ -98,6 +122,9 @@ pub fn initialize(conn: zqlite.Conn) !void {
     try ensureColumn(conn, "threads", "local_thread_id", "alter table threads add column local_thread_id text");
     try ensureColumn(conn, "threads", "reasoning_variant", "alter table threads add column reasoning_variant text");
     try ensureColumn(conn, "threads", "tui_dock_id", "alter table threads add column tui_dock_id integer");
+    try ensureColumn(conn, "messages", "tool_call_id", "alter table messages add column tool_call_id text");
+    try ensureColumn(conn, "messages", "tool_call_kind", "alter table messages add column tool_call_kind integer");
+    try ensureColumn(conn, "messages", "tool_call_status", "alter table messages add column tool_call_status integer");
 }
 
 fn ensureColumn(conn: zqlite.Conn, table_name: []const u8, column_name: []const u8, alter_sql: [*:0]const u8) !void {

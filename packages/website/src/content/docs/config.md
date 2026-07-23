@@ -63,6 +63,7 @@ file. It is read on startup and on app refresh.
       "focus_right": "Ctrl+L",
       "pane_previous": "Ctrl+Shift+Tab",
       "pane_next": "Ctrl+Tab",
+      "pane_select": ["Ctrl+1", "Ctrl+2", "Ctrl+3", "Ctrl+4", "Ctrl+5", "Ctrl+6", "Ctrl+7", "Ctrl+8", "Ctrl+9", "Ctrl+0"],
       "previous": "Alt+Up",
       "next": "Alt+Down"
     }
@@ -72,8 +73,10 @@ file. It is read on startup and on app refresh.
 
 Keybinds are loaded on startup and on app refresh. Use a string for one
 shortcut or a string array for multiple shortcuts. Use `null`, an empty string,
-or an empty array to disable a binding. See [Keybinds](/docs/keybinds) for the
-full keybinds reference.
+or an empty array to disable a binding. The `workspace.pane_select` array is
+positional and maps its first shortcut to the first pane shown under the current
+workspace in the sidebar, then continues in order. See [Keybinds](/docs/keybinds)
+for the full keybinds reference.
 
 Most of these options also appear in Settings:
 

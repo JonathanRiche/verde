@@ -52,11 +52,34 @@ pub const PersistedHerdrWorkspaceLink = struct {
     updated_at_ms: i64 = 0,
 };
 
+pub const PersistedSurfaceCompletion = struct {
+    session_id: []const u8,
+    workspace_id: []const u8 = "",
+    workspace_path: []const u8 = "",
+    dock_id: u32 = 0,
+    pane_id: ?u32 = null,
+    provider: ?Provider = null,
+    provider_thread_id: ?[]const u8 = null,
+    title: []const u8 = "",
+    completed_at_ms: i64,
+    last_event_title: ?[]const u8 = null,
+    last_event_body: ?[]const u8 = null,
+};
+
+pub const PersistedChatCompletion = struct {
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    completed_at_ms: i64,
+};
+
 pub const PersistedMessage = struct {
     role: ChatRole,
     author: []const u8,
     body: []const u8,
     image: ?PersistedImageAttachment = null,
+    tool_call_id: ?[]const u8 = null,
+    tool_call_kind: ?ai_harness.ToolCallKind = null,
+    tool_call_status: ?ai_harness.ToolCallStatus = null,
 };
 
 pub const PersistedThread = struct {
@@ -105,6 +128,8 @@ pub const PersistedState = struct {
     selected_project_index: usize = 0,
     sidebar_collapsed: bool = false,
     projects: []const PersistedProject = &.{},
+    surface_completions: []const PersistedSurfaceCompletion = &.{},
+    chat_completions: []const PersistedChatCompletion = &.{},
     provider: ?Provider = null,
     harness: ?Harness = null,
     draft: ?[]const u8 = null,

@@ -4,6 +4,7 @@ const std = @import("std");
 const palette = @import("palette");
 
 const app_state = @import("../state.zig");
+const ai_harness = @import("../harness.zig");
 const profiler = @import("../profiler.zig");
 const platform_runtime = @import("platform_runtime");
 const utils = @import("../utils.zig");
@@ -596,6 +597,7 @@ pub fn handleFocusedTranscriptPaletteWheel(state: *app_state.AppState, wheel_y: 
 fn scrollTranscriptByWheel(state: *app_state.AppState, pane_id: ?app_state.WorkspacePaneId, wheel_y: f32) void {
     if (pane_id) |id| _ = state.focusCurrentProjectWorkspacePane(id);
     state.transcript_focused = true;
+    _ = state.acknowledgeFocusedChatCompletion();
     const current = currentTranscriptScrollY(state, pane_id) orelse state.transcript_palette_scroll_y;
     const delta = -wheel_y * theme.scaledUi(TRANSCRIPT_WHEEL_PIXELS);
     rememberTranscriptScroll(state, pane_id, snapTranscriptScrollY(current + delta, null));
@@ -943,6 +945,7 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
     if (pane_id) |id| _ = state.focusCurrentProjectWorkspacePane(id);
 
     state.transcript_focused = true;
+    _ = state.acknowledgeFocusedChatCompletion();
 
     // Scrollbar drag: thumb click starts a drag; track click (above/below
     // thumb) page-jumps toward the cursor by one viewport.
@@ -978,6 +981,9 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
     }
 
     if (clicks <= 1 and state.consumeCodeCopyButtonClick(x, y)) {
+        return true;
+    }
+    if (clicks <= 1 and state.consumeBackgroundTaskActionClick(x, y)) {
         return true;
     }
     if (clicks <= 1 and state.consumeCardToggleClick(x, y)) {
@@ -2087,7 +2093,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
             const is_last = pi + 1 == pending_count;
             const is_backgrounded = std.mem.eql(u8, event.author, "Backgrounded command");
             if (y + item_h >= column.y and y <= column.y + column.h) {
-                renderCommandEventRow(state, column, y, item_h, event.author, event.body, clip, msg_idx, is_last or is_backgrounded, false);
+                renderCommandEventRow(state, column, y, item_h, event.author, event.body, clip, msg_idx, is_last or is_backgrounded, false, event.tool_call_status);
             }
         } else if (event.role == .system and isDiffSummaryMessage(event.author, event.body)) {
             if (y + item_h >= column.y and y <= column.y + column.h) {
@@ -2108,7 +2114,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
     }
 
     var status_buf: [40]u8 = undefined;
-    const working_label = formatPendingWorkingLabel(&status_buf, send_state.started_at_ms);
+    const working_label = formatPendingWorkingLabel(&status_buf, send_state.started_at_ms, send_state.thinking);
     const stream_text: []const u8 = send_state.partial_text.items;
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
     const stream_plain = stream_text.len > 0;
@@ -2123,7 +2129,7 @@ fn unixTimestampMs() i64 {
     return platform_runtime.unixTimestampMs();
 }
 
-fn formatPendingWorkingLabel(buf: []u8, started_at_ms: i64) []const u8 {
+fn formatPendingWorkingLabel(buf: []u8, started_at_ms: i64, thinking: bool) []const u8 {
     const now_ms = unixTimestampMs();
     const safe_started_at_ms = @max(started_at_ms, 0);
     const elapsed_ms = @max(now_ms - safe_started_at_ms, 0);
@@ -2132,10 +2138,12 @@ fn formatPendingWorkingLabel(buf: []u8, started_at_ms: i64) []const u8 {
     const minutes = (total_seconds / 60) % 60;
     const seconds = total_seconds % 60;
 
+    // Reasoning liveness swaps the verb, keeping the elapsed timer in place.
+    const verb: []const u8 = if (thinking) "Thinking" else "Working";
     if (hours > 0) {
-        return std.fmt.bufPrint(buf, "Working - {d}:{d:0>2}:{d:0>2}", .{ hours, minutes, seconds }) catch "Working - 0:00";
+        return std.fmt.bufPrint(buf, "{s} - {d}:{d:0>2}:{d:0>2}", .{ verb, hours, minutes, seconds }) catch "Working - 0:00";
     }
-    return std.fmt.bufPrint(buf, "Working - {d}:{d:0>2}", .{ minutes, seconds }) catch "Working - 0:00";
+    return std.fmt.bufPrint(buf, "{s} - {d}:{d:0>2}", .{ verb, minutes, seconds }) catch "Working - 0:00";
 }
 
 fn isCommandSystemEvent(author: []const u8) bool {
@@ -2197,10 +2205,28 @@ fn toolCallGroupFailed(entries: anytype, start: usize, end: usize) bool {
     return toolCallGroupFailureCount(entries, start, end) > 0;
 }
 
+fn toolCallEntryStatus(entry: anytype) ?ai_harness.ToolCallStatus {
+    if (@hasField(@TypeOf(entry), "tool_call_status")) return entry.tool_call_status;
+    return null;
+}
+
 fn toolCallGroupFailureCount(entries: anytype, start: usize, end: usize) usize {
     var count: usize = 0;
     for (entries[start..end]) |entry| {
-        if (commandEventFailed(entry.author)) count += 1;
+        const status_failed = if (toolCallEntryStatus(entry)) |status| status == .failed else false;
+        if (status_failed or commandEventFailed(entry.author)) count += 1;
+    }
+    return count;
+}
+
+fn toolCallGroupRunningCount(entries: anytype, start: usize, end: usize, fallback_running: bool) usize {
+    var count: usize = 0;
+    for (entries[start..end], start..) |entry, index| {
+        if (toolCallEntryStatus(entry)) |status| {
+            if (status == .pending or status == .in_progress) count += 1;
+        } else if (fallback_running and index + 1 == end) {
+            count += 1;
+        }
     }
     return count;
 }
@@ -2210,6 +2236,7 @@ test "tool call groups stop before user-required system events" {
         role: app_state.ChatRole,
         author: []const u8,
         body: []const u8,
+        tool_call_status: ?ai_harness.ToolCallStatus = null,
     };
     const entries = [_]Event{
         .{ .role = .system, .author = "Ran command", .body = "git status" },
@@ -2221,6 +2248,24 @@ test "tool call groups stop before user-required system events" {
     try std.testing.expectEqual(@as(usize, 2), toolCallGroupEnd(entries[0..], 0));
     try std.testing.expect(!toolCallGroupFailed(entries[0..], 0, 2));
     try std.testing.expect(toolCallGroupFailed(entries[0..], 3, 4));
+    try std.testing.expectEqual(@as(usize, 1), toolCallGroupFailureCount(entries[0..], 0, entries.len));
+    try std.testing.expectEqual(@as(usize, 1), toolCallGroupRunningCount(entries[0..], 0, 2, true));
+}
+
+test "tool call groups use structured lifecycle status" {
+    const Event = struct {
+        role: app_state.ChatRole = .system,
+        author: []const u8,
+        body: []const u8,
+        tool_call_status: ?ai_harness.ToolCallStatus,
+    };
+    const entries = [_]Event{
+        .{ .author = "Read", .body = "Input", .tool_call_status = .completed },
+        .{ .author = "Edit", .body = "Input", .tool_call_status = .in_progress },
+        .{ .author = "MCP tool", .body = "Error", .tool_call_status = .failed },
+    };
+
+    try std.testing.expectEqual(@as(usize, 1), toolCallGroupRunningCount(entries[0..], 0, entries.len, false));
     try std.testing.expectEqual(@as(usize, 1), toolCallGroupFailureCount(entries[0..], 0, entries.len));
 }
 
@@ -2261,10 +2306,18 @@ fn isCursorToolSystemEvent(author_raw: []const u8, body_raw: []const u8) bool {
         "Shell",
         "Edit",
         "Write",
+        "Delete",
+        "Move",
         "LS",
         "List",
+        "Search",
         "WebFetch",
         "Web Search",
+        "Fetch",
+        "Think",
+        "Thinking",
+        "MCP tool",
+        "Cursor tool",
     };
     for (known_tools) |tool| {
         if (std.ascii.eqlIgnoreCase(author, tool)) return true;
@@ -2312,7 +2365,7 @@ fn isSlashCommandResultMessage(author: []const u8, body_raw: []const u8) bool {
 /// Label shown after `>_` in the compact command row (Codex-native titles preserved; Cursor/shell-like bodies default to "Ran command").
 fn paletteCommandRowDisplayAuthor(original_author: []const u8, body_raw: []const u8) []const u8 {
     if (isCommandSystemEvent(original_author)) return original_author;
-    if (isCursorToolSystemEvent(original_author, body_raw)) return "Ran command";
+    if (isCursorToolSystemEvent(original_author, body_raw)) return original_author;
     if (isCommandLikeShellBody(body_raw)) return "Ran command";
     return original_author;
 }
@@ -2494,7 +2547,7 @@ fn renderTranscriptMessage(state: *app_state.AppState, thread: *const app_state.
         return;
     }
     if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
-        renderCommandEventRow(state, column, y, height, message.author, message.body, clip, message_index, thread.backgroundCommandIsRunning(message.body), false);
+        renderCommandEventRow(state, column, y, height, message.author, message.body, clip, message_index, thread.backgroundCommandIsRunning(message.body), false, message.tool_call_status);
         return;
     }
     if (message.role == .system and isDiffSummaryMessage(message.author, message.body)) {
@@ -3285,10 +3338,7 @@ fn renderDiffPatchLines(
 
 /// Stable key for the command-row expand/collapse state per message index.
 fn commandCardKey(message_index: usize) u64 {
-    var hasher = std.hash.Wyhash.init(0xC0DEC0DEC0DEC0DE);
-    hasher.update(std.mem.asBytes(&message_index));
-    hasher.update("command_card");
-    return hasher.final();
+    return app_state.AppState.commandCardKey(message_index);
 }
 
 fn toolCallGroupHeight(
@@ -3326,11 +3376,13 @@ fn renderToolCallGroup(
     y: f32,
     height: f32,
     clip: palette.Rect,
-    running: bool,
+    fallback_running: bool,
     started_at_ms: ?i64,
 ) void {
     const failed_count = toolCallGroupFailureCount(entries, start, end);
     const failed = failed_count > 0;
+    const running_count = toolCallGroupRunningCount(entries, start, end, fallback_running);
+    const running = running_count > 0;
     const default_expanded = toolCallGroupDefaultExpanded(state, failed);
     const key = toolCallGroupKey(base_message_index + start);
     const expanded = state.isCardExpandedDefault(key, default_expanded);
@@ -3358,7 +3410,6 @@ fn renderToolCallGroup(
     var summary_buf: [128]u8 = undefined;
     const count = end - start;
     const noun = if (count == 1) "tool call" else "tool calls";
-    const running_count: usize = @intFromBool(running);
     const completed_count = count -| failed_count -| running_count;
     const summary = if (running) blk: {
         if (started_at_ms == null) {
@@ -3435,8 +3486,12 @@ fn renderToolCallGroup(
             entry.body,
             clip,
             message_index,
-            running and index + 1 == end,
+            if (toolCallEntryStatus(entry)) |status|
+                status == .pending or status == .in_progress
+            else
+                fallback_running and index + 1 == end,
             true,
+            toolCallEntryStatus(entry),
         );
         child_y += child_h + theme.scaledUi(8.0);
     }
@@ -3453,11 +3508,17 @@ fn renderCommandEventRow(
     message_index: usize,
     running: bool,
     grouped: bool,
+    tool_call_status: ?ai_harness.ToolCallStatus,
 ) void {
+    // Command transcript card, including controls for tracked background tasks.
     const bubble = palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height };
     const rr = if (grouped) theme.scaledUi(8.0) else transcriptBubbleCornerRadius();
-    const failed = commandEventFailed(original_author);
-    const stopped = std.mem.eql(u8, original_author, "Background task stopped");
+    const is_running = if (tool_call_status) |status|
+        status == .pending or status == .in_progress
+    else
+        running;
+    const failed = commandEventFailed(original_author) or (tool_call_status orelse .unknown) == .failed;
+    const stopped = std.mem.eql(u8, original_author, "Background task stopped") or (tool_call_status orelse .unknown) == .cancelled;
     const fill_color = if (grouped) theme.darken(theme.background(), 0.035) else theme.COLOR_PANEL_ALT;
     const resting_border = if (grouped) theme.withAlpha(theme.borderMuted(), 185) else theme.borderMuted();
     queueRoundedShellClipped(
@@ -3488,7 +3549,7 @@ fn renderCommandEventRow(
     const status_color: [4]f32 = blk: {
         if (failed) break :blk theme.COLOR_DIFF_REMOVE;
         if (stopped) break :blk theme.COLOR_YELLOW;
-        if (running) {
+        if (is_running) {
             const t_ns: i128 = profiler.nowNs();
             const period_ns: i128 = 1_400_000_000;
             const phase = @as(f32, @floatFromInt(@mod(t_ns, period_ns))) / @as(f32, @floatFromInt(period_ns));
@@ -3514,13 +3575,36 @@ fn renderCommandEventRow(
     queueCardChevron(state, chev_cx, chev_cy, expanded, paletteColor(theme.COLOR_TEXT_SUBTLE), clip);
 
     const text_x = status_cx + status_dia * 0.5 + theme.scaledUi(10.0);
-    const copy_rect = snapRect(palette.Rect{
-        .x = bubble.x + bubble.w - pad_x - chev_box_w - copy_gap - copy_w,
+    const backgrounded = std.mem.eql(u8, original_author, "Backgrounded command");
+    const action_w = theme.scaledUi(58.0);
+    const action_gap = theme.scaledUi(6.0);
+    const show_output = backgrounded and bubble.w >= theme.scaledUi(330.0);
+    const output_label = if (std.mem.indexOf(u8, body, "\nOutput log:") != null) "Output" else "Details";
+    const show_copy = !backgrounded or !is_running or bubble.w >= theme.scaledUi(210.0);
+    const action_right = bubble.x + bubble.w - pad_x - chev_box_w - copy_gap;
+    const stop_visible = backgrounded and is_running;
+    const stop_rect = snapRect(palette.Rect{
+        .x = action_right - action_w,
         .y = bubble.y + (header_h - copy_h) * 0.5,
+        .w = action_w,
+        .h = copy_h,
+    });
+    const copy_right = if (stop_visible) stop_rect.x - action_gap else action_right;
+    const copy_rect = snapRect(palette.Rect{
+        .x = copy_right - copy_w,
+        .y = stop_rect.y,
         .w = copy_w,
         .h = copy_h,
     });
-    const text_right = copy_rect.x - copy_gap;
+    const output_right = if (show_copy) copy_rect.x - action_gap else if (stop_visible) stop_rect.x - action_gap else action_right;
+    const output_rect = snapRect(palette.Rect{
+        .x = output_right - action_w,
+        .y = stop_rect.y,
+        .w = action_w,
+        .h = copy_h,
+    });
+    const leftmost_action_x = if (show_output) output_rect.x else if (show_copy) copy_rect.x else stop_rect.x;
+    const text_right = leftmost_action_x - copy_gap;
     const text_w = @max(text_right - text_x, theme.scaledUi(40.0));
     const header_text_clip = intersectClipRect(clip, .{
         .x = text_x,
@@ -3530,7 +3614,7 @@ fn renderCommandEventRow(
     });
     const text_color = if (failed) paletteColor(theme.COLOR_DIFF_REMOVE) else paletteColor(theme.COLOR_TEXT_MUTED);
 
-    const copy_hovered = rectContains(copy_rect, state.palette_mouse_x, state.palette_mouse_y);
+    const copy_hovered = show_copy and rectContains(copy_rect, state.palette_mouse_x, state.palette_mouse_y);
     // Match the composer model pill: a quiet translucent resting fill that
     // becomes lighter and more opaque when the pointer enters the control.
     const copy_bg = if (copy_hovered)
@@ -3538,15 +3622,38 @@ fn renderCommandEventRow(
     else
         theme.withAlpha(theme.COLOR_PANEL_MUTED, 86);
     const copy_text_color = if (copy_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
-    queueRoundedClipped(state, copy_rect, paletteColor(copy_bg), theme.scaledUi(5.0), clip);
     const copy_label_h = theme.scaledUi(14.0);
-    queueFixedTextLine(state, .{
-        .x = copy_rect.x + theme.scaledUi(10.0),
-        .y = copy_rect.y + (copy_rect.h - copy_label_h) * 0.5,
-        .w = copy_rect.w - theme.scaledUi(20.0),
-        .h = copy_label_h,
-    }, "Copy", paletteColor(copy_text_color), theme.scaledUi(11.5), clip);
-    state.recordTranscriptCopyHit(copy_rect, body_raw, toolCopyIdentity(message_index, body_raw));
+    const copy_payload = if (backgrounded) blk: {
+        const end = std.mem.indexOf(u8, body, "\n\n") orelse body.len;
+        break :blk std.mem.trim(u8, body[0..end], "\n\r\t ");
+    } else body_raw;
+    if (show_copy) {
+        queueRoundedClipped(state, copy_rect, paletteColor(copy_bg), theme.scaledUi(5.0), clip);
+        queueFixedTextLine(state, .{
+            .x = copy_rect.x + theme.scaledUi(10.0),
+            .y = copy_rect.y + (copy_rect.h - copy_label_h) * 0.5,
+            .w = copy_rect.w - theme.scaledUi(20.0),
+            .h = copy_label_h,
+        }, "Copy", paletteColor(copy_text_color), theme.scaledUi(11.5), clip);
+        state.recordTranscriptCopyHit(copy_rect, copy_payload, toolCopyIdentity(message_index, copy_payload));
+    }
+
+    if (backgrounded) {
+        if (show_output) {
+            queueRoundedClipped(state, output_rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 86)), theme.scaledUi(5.0), clip);
+            queueFixedTextLine(state, .{ .x = output_rect.x + theme.scaledUi(7.0), .y = output_rect.y + theme.scaledUi(6.0), .w = output_rect.w - theme.scaledUi(14.0), .h = theme.scaledUi(14.0) }, output_label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(11.5), clip);
+            if (intersectClipRect(intersectClipRect(output_rect, bubble), clip)) |clipped_output| {
+                state.recordBackgroundTaskActionForMessage(clipped_output, message_index, body_raw, .output);
+            }
+        }
+        if (stop_visible) {
+            queueRoundedClipped(state, stop_rect, paletteColor(theme.withAlpha(theme.COLOR_DIFF_REMOVE, 55)), theme.scaledUi(5.0), clip);
+            queueFixedTextLine(state, .{ .x = stop_rect.x + theme.scaledUi(14.0), .y = stop_rect.y + theme.scaledUi(6.0), .w = stop_rect.w - theme.scaledUi(28.0), .h = theme.scaledUi(14.0) }, "Stop", paletteColor(theme.COLOR_DIFF_REMOVE), theme.scaledUi(11.5), clip);
+            if (intersectClipRect(intersectClipRect(stop_rect, bubble), clip)) |clipped_stop| {
+                state.recordBackgroundTaskActionForMessage(clipped_stop, message_index, body_raw, .stop);
+            }
+        }
+    }
 
     const mono_w = font_size * 0.55;
     const text_y = bubble.y + pad_y + (line_h - font_size * 1.25) * 0.5;
@@ -3586,7 +3693,7 @@ fn renderCommandEventRow(
             .h = font_size * 1.25,
         }), separator, text_color, font_size, header_text_clip);
 
-        const display_body = truncateMonoToWidth(state.allocator, body, body_w, font_size);
+        const display_body = truncateMonoToWidth(state.allocator, firstTextLine(body), body_w, font_size);
         defer if (display_body.allocated) state.allocator.free(display_body.text);
         queueFixedTextLine(state, snapRect(.{
             .x = body_x,
@@ -3838,6 +3945,19 @@ const TruncatedText = struct {
     text: []const u8,
     allocated: bool,
 };
+
+fn firstTextLine(text: []const u8) []const u8 {
+    for (text, 0..) |byte, index| {
+        if (byte == '\n' or byte == '\r') return text[0..index];
+    }
+    return text;
+}
+
+test "command row preview uses only its first text line" {
+    try std.testing.expectEqualStrings("Tool:", firstTextLine("Tool:\nRead File"));
+    try std.testing.expectEqualStrings("Output:", firstTextLine("Output:\r\n{\"success\":true}"));
+    try std.testing.expectEqualStrings("git status", firstTextLine("git status"));
+}
 
 /// Truncates `text` so it fits in `max_width` pixels at `font_size` using the
 /// fixed-mono advance (~0.55em). Appends "…" when truncated. Returns a borrowed
