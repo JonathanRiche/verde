@@ -348,8 +348,9 @@ pub const Client = struct {
         var read_buffer: [16 * 1024]u8 = undefined;
         var reader = child.child.stdout.?.reader(threaded.io(), &read_buffer);
         while (true) {
-            const maybe_line = try reader.interface.takeDelimiter('\n');
+            const maybe_line = try takeBridgeLineAlloc(self.allocator, &reader.interface);
             if (maybe_line == null) break;
+            defer self.allocator.free(maybe_line.?);
             const line = std.mem.trimEnd(u8, maybe_line.?, "\r");
             if (line.len == 0) continue;
             try self.handleBridgeLine(line, stream_request, child.child.stdin, &response);
@@ -471,6 +472,27 @@ pub fn shutdownOwnedServer() void {
     active_process_state.mutex.lock();
     defer active_process_state.mutex.unlock();
     if (active_process_state.child) |child| child.terminateTree();
+}
+
+fn takeBridgeLineAlloc(allocator: std.mem.Allocator, reader: *std.Io.Reader) !?[]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+
+    _ = reader.streamDelimiterLimit(&writer.writer, '\n', .limited(MAX_BRIDGE_LINE_BYTES)) catch |err| switch (err) {
+        error.StreamTooLong => return error.ClaudeMessageTooLarge,
+        else => return err,
+    };
+    const has_bytes = writer.written().len > 0;
+    _ = reader.discardDelimiterInclusive('\n') catch |err| switch (err) {
+        error.EndOfStream => {
+            if (!has_bytes) {
+                writer.deinit();
+                return null;
+            }
+        },
+        else => return err,
+    };
+    return try writer.toOwnedSlice();
 }
 
 fn registerActiveChild(child: *platform_process.OwnedChild) void {
@@ -713,6 +735,26 @@ test "parseRole maps Claude roles" {
     try std.testing.expectEqual(provider_types.MessageRole.assistant, parseRole("assistant"));
     try std.testing.expectEqual(provider_types.MessageRole.system, parseRole("system"));
     try std.testing.expectEqual(provider_types.MessageRole.assistant, parseRole("other"));
+}
+
+test "Claude bridge reader accepts lines larger than its scratch buffer" {
+    const line_len = 20 * 1024;
+    const input = try std.testing.allocator.alloc(u8, line_len + 4);
+    defer std.testing.allocator.free(input);
+    @memset(input[0..line_len], 'x');
+    @memcpy(input[line_len..], "\nok\n");
+
+    var reader = std.Io.Reader.fixed(input);
+    const first = (try takeBridgeLineAlloc(std.testing.allocator, &reader)).?;
+    defer std.testing.allocator.free(first);
+    try std.testing.expectEqual(line_len, first.len);
+    try std.testing.expectEqual(@as(u8, 'x'), first[0]);
+    try std.testing.expectEqual(@as(u8, 'x'), first[first.len - 1]);
+
+    const second = (try takeBridgeLineAlloc(std.testing.allocator, &reader)).?;
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualStrings("ok", second);
+    try std.testing.expectEqual(@as(?[]u8, null), try takeBridgeLineAlloc(std.testing.allocator, &reader));
 }
 
 test "providerSlashCommands exposes Claude usage and compact" {
