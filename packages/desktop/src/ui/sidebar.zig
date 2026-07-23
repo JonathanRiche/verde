@@ -569,7 +569,6 @@ fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) boo
                 .thread_handoff => {
                     if (pi < state.projects.items.len) {
                         for (state.projects.items[pi].workspace_layout.panes.items) |pane| {
-                            if (pane.minimized) continue;
                             switch (pane.ref) {
                                 .chat => |ref| if (ref.thread_index == ti) {
                                     state.beginThreadHandoff(pi, ti, pane.id);
@@ -1137,7 +1136,7 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
         addPaletteHit(avatar_rect, .workspace_avatar, project_index, 0);
         y += avatar + theme.scaledUi(5.0);
 
-        // Composition dots: one per open (non-minimized) pane. The selected
+        // Composition dots: one per open pane. The selected
         // pane uses the active color; status colors temporarily take over when
         // a pane has live work or needs attention.
         renderCollapsedCompositionDots(state, project_index, project, avatar_rect.x + avatar * 0.5, y);
@@ -1301,7 +1300,6 @@ fn collectCollapsedPaneOrder(
     switch (node.*) {
         .leaf => |pane_id| {
             const pane = layout.paneById(pane_id) orelse return;
-            if (pane.minimized) return;
             if (order.total < order.panes.len) order.panes[order.total] = pane;
             order.total += 1;
         },
@@ -1315,7 +1313,6 @@ fn collectCollapsedPaneOrder(
 /// Falls back to the storage order only if the visual split tree is unavailable.
 fn collectCollapsedPaneOrderFallback(layout: *const native_state.WorkspaceLayout, order: anytype) void {
     for (layout.panes.items) |*pane| {
-        if (pane.minimized) continue;
         if (order.total < order.panes.len) order.panes[order.total] = pane;
         order.total += 1;
     }
@@ -1430,11 +1427,10 @@ fn renderOpenPaneRow(
     }
     addPaletteHit(rect, .open_pane, project_index, pane.id);
 
-    const dim = pane.minimized;
     const cy = rect.y + rect.h * 0.5;
     var icon_x = rect.x + theme.scaledUi(SIDEBAR_THREAD_ICON_LEADING_PAD_CSS);
     var title_left = theme.scaledUi(SIDEBAR_THREAD_ICON_LEADING_PAD_CSS + SIDEBAR_THREAD_PROVIDER_GLYPH_CSS + SIDEBAR_THREAD_ICON_TITLE_GAP_CSS);
-    const muted = if (dim) theme.COLOR_TEXT_SUBTLE else theme.COLOR_TEXT_MUTED;
+    const muted = theme.COLOR_TEXT_MUTED;
 
     if (show_workspace_tag) {
         // Workspace-initial chip mirrors the collapsed rail's avatar mark so
@@ -1508,7 +1504,7 @@ fn renderOpenPaneRow(
             if (agent_provider) |prov| {
                 // Neutral/white prompt mark so it contrasts with the provider logo
                 // instead of blending into it (the accent shares the logo's hue).
-                const mark_color = if (dim) theme.COLOR_TEXT_SUBTLE else theme.COLOR_WHITE;
+                const mark_color = theme.COLOR_WHITE;
                 queuePaletteAgentTerminalGlyph(state, prov, icon_x, cy, mark_color, clip);
             } else {
                 queuePaletteTerminalMark(state, icon_x, cy, theme.scaledUi(14.0), muted, clip);
@@ -1545,9 +1541,7 @@ fn renderOpenPaneRow(
     const shown = truncatedThreadTitle(&title_buf, title, title_chars);
 
     const emphasis = focused or hovered;
-    const title_color = if (dim)
-        theme.COLOR_TEXT_SUBTLE
-    else if (running)
+    const title_color = if (running)
         theme.COLOR_GREEN
     else if (emphasis)
         theme.COLOR_WHITE
@@ -1624,7 +1618,6 @@ fn openPaneChatThreadIndex(state: *const runtime.AppState, project_index: usize,
     if (project_index >= state.projects.items.len) return null;
     const project = &state.projects.items[project_index];
     const pane = project.workspace_layout.paneById(pane_id) orelse return null;
-    if (pane.minimized) return null;
     return switch (pane.ref) {
         .chat => |ref| if (ref.thread_index < project.threads.items.len) ref.thread_index else null,
         else => null,

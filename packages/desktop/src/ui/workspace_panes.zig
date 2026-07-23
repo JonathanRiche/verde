@@ -49,8 +49,6 @@ const MAX_WORKSPACE_PANE_HITS = 48;
 const WorkspacePaneAction = enum {
     focus,
     maximize,
-    minimize,
-    restore,
     toggle_split_menu,
     copy_selection,
     paste_into_prompt,
@@ -577,33 +575,21 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
     chat_panel.resetTranscriptHitCache();
     terminal_panel.resetHitCache();
 
-    const minimized_count = state.currentProjectWorkspaceMinimizedPaneCount();
-    const restore_h = if (minimized_count > 0) theme.scaledUi(34.0) else 0.0;
-    const workspace_rect = palette.Rect{
-        .x = rect.x,
-        .y = rect.y,
-        .w = rect.w,
-        .h = @max(rect.h - restore_h, 1.0),
-    };
-
     if (state.currentProjectWorkspaceMaximizedPaneId()) |pane_id| {
-        renderLeaf(state, pane_id, workspace_rect);
-        renderRestoreStrip(state, .{ .x = rect.x, .y = rect.y + workspace_rect.h, .w = rect.w, .h = restore_h }, minimized_count);
-        renderSplitMenuOverlay(state, workspace_rect);
+        renderLeaf(state, pane_id, rect);
+        renderSplitMenuOverlay(state, rect);
         if (!browser_pane_rendered) state.noteBrowserPaneNotRendered();
         return;
     }
     if (state.currentProjectWorkspaceRoot()) |root| {
-        renderNode(state, root, workspace_rect);
-        renderRestoreStrip(state, .{ .x = rect.x, .y = rect.y + workspace_rect.h, .w = rect.w, .h = restore_h }, minimized_count);
-        renderSplitMenuOverlay(state, workspace_rect);
+        renderNode(state, root, rect);
+        renderSplitMenuOverlay(state, rect);
         if (!browser_pane_rendered) state.noteBrowserPaneNotRendered();
         return;
     }
 
-    chat_panel.renderWorkspaceAt(state, workspace_rect);
-    renderRestoreStrip(state, .{ .x = rect.x, .y = rect.y + workspace_rect.h, .w = rect.w, .h = restore_h }, minimized_count);
-    renderSplitMenuOverlay(state, workspace_rect);
+    chat_panel.renderWorkspaceAt(state, rect);
+    renderSplitMenuOverlay(state, rect);
     if (!browser_pane_rendered) state.noteBrowserPaneNotRendered();
 }
 
@@ -675,11 +661,6 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
                 _ = state.toggleCurrentProjectWorkspacePaneMaximized(hit.pane_id);
                 split_menu_open_for = null;
             },
-            .minimize => {
-                _ = state.minimizeCurrentProjectWorkspacePane(hit.pane_id);
-                split_menu_open_for = null;
-            },
-            .restore => _ = state.restoreCurrentProjectWorkspacePane(hit.pane_id),
             .toggle_split_menu => toggleSplitMenu(state, hit),
             .copy_selection => {
                 copyTranscriptSelectionToClipboard(state);
@@ -1425,78 +1406,6 @@ fn copyTranscriptSelectionToClipboard(state: *runtime.AppState) void {
         return;
     };
     state.setSidebarNotice("Copied selection.");
-}
-
-fn renderRestoreStrip(state: *runtime.AppState, rect: palette.Rect, minimized_count: usize) void {
-    if (minimized_count == 0 or rect.h <= 0.0) return;
-    queueRect(state, rect, paletteColor(theme.background()));
-    queueBorder(state, rect, paletteColor(theme.COLOR_PANEL_MUTED), 0.0, theme.scaledUi(1.0));
-
-    var x = rect.x + theme.scaledUi(10.0);
-    const chip_h = @max(rect.h - theme.scaledUi(12.0), theme.scaledUi(20.0));
-    const y = rect.y + (rect.h - chip_h) * 0.5;
-    const mx = state.palette_mouse_x;
-    const my = state.palette_mouse_y;
-    var i: usize = 0;
-    while (i < minimized_count) : (i += 1) {
-        const pane = state.currentProjectWorkspaceMinimizedPaneAt(i) orelse continue;
-        const label = switch (pane.kind) {
-            .chat => "Chat",
-            .terminal => "Terminal",
-            .browser => "Browser",
-        };
-        const chip_w = switch (pane.kind) {
-            .chat => theme.scaledUi(82.0),
-            .terminal => theme.scaledUi(108.0),
-            .browser => theme.scaledUi(104.0),
-        };
-        const chip_rect = palette.Rect{ .x = x, .y = y, .w = chip_w, .h = chip_h };
-        renderRestoreChip(state, chip_rect, label, rectContains(chip_rect, mx, my), rect);
-        appendHit(.{ .pane_id = pane.id, .action = .restore, .rect = chip_rect });
-        x += chip_w + theme.scaledUi(6.0);
-        if (x > rect.x + rect.w - theme.scaledUi(24.0)) break;
-    }
-}
-
-fn renderRestoreChip(state: *runtime.AppState, rect: palette.Rect, label: []const u8, hovered: bool, clip: palette.Rect) void {
-    const bg = if (hovered) theme.lighten(theme.COLOR_PANEL_ALT, 0.08) else theme.COLOR_PANEL_ALT;
-    const border = if (hovered) theme.COLOR_PANEL_MUTED else theme.borderMuted();
-    queueRounded(state, rect, paletteColor(bg), theme.scaledUi(5.0));
-    queueBorder(state, rect, paletteColor(border), theme.scaledUi(5.0), theme.scaledUi(1.0));
-
-    const text_color = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
-    // Up-arrow glyph drawn from two rects so it doesn't depend on font glyph coverage.
-    const arrow_w = theme.scaledUi(8.0);
-    const arrow_h = theme.scaledUi(5.0);
-    const arrow_x = rect.x + theme.scaledUi(10.0);
-    const arrow_cy = rect.y + rect.h * 0.5;
-    // Diagonals approximated with two thin rects forming an inverted V.
-    const stroke = theme.scaledUi(1.5);
-    queueRect(state, .{
-        .x = arrow_x,
-        .y = arrow_cy + arrow_h * 0.5 - stroke,
-        .w = arrow_w * 0.55,
-        .h = stroke,
-    }, paletteColor(text_color));
-    queueRect(state, .{
-        .x = arrow_x + arrow_w * 0.45,
-        .y = arrow_cy + arrow_h * 0.5 - stroke,
-        .w = arrow_w * 0.55,
-        .h = stroke,
-    }, paletteColor(text_color));
-    queueRect(state, .{
-        .x = arrow_x + arrow_w * 0.5 - stroke * 0.5,
-        .y = arrow_cy - arrow_h * 0.5,
-        .w = stroke,
-        .h = arrow_h,
-    }, paletteColor(text_color));
-
-    queueText(state, .{
-        .x = arrow_x + arrow_w + theme.scaledUi(8.0),
-        .y = rect.y + (rect.h - theme.scaledUi(14.0)) * 0.5,
-        .w = @max(rect.w - (arrow_w + theme.scaledUi(28.0)), 1.0),
-        .h = theme.scaledUi(14.0),
-    }, label, paletteColor(text_color), theme.scaledUi(12.0), clip);
 }
 
 fn appendHit(hit: WorkspacePaneHit) void {

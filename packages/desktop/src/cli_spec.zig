@@ -136,9 +136,7 @@ pub const live_capabilities = [_][]const u8{
     "pane.split",
     "pane.resize",
     "pane.move",
-    "pane.minimize",
     "pane.maximize",
-    "pane.restore",
     "pane.close",
     "chat.open",
     "chat.status",
@@ -210,9 +208,7 @@ pub const pane_commands = [_][]const u8{
     "split",
     "resize",
     "move",
-    "minimize",
     "maximize",
-    "restore",
     "close",
 };
 

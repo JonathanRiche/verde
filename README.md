@@ -464,9 +464,7 @@ verde live pane split --pane <pane-id> --kind chat --axis horizontal [--json]
 verde live pane split --pane <pane-id> --kind terminal --axis vertical [--json]
 verde live pane resize --pane <pane-id> --first <pane-id> --second <pane-id> --axis horizontal --ratio 0.6 [--json]
 verde live pane move --pane <pane-id> --direction left|right|up|down [--json]
-verde live pane minimize --pane <pane-id> [--json]
 verde live pane maximize --pane <pane-id> [--json]
-verde live pane restore --pane <pane-id> [--json]
 verde live pane close --pane <pane-id> [--json]
 ```
 
@@ -477,8 +475,7 @@ verde live pane close --pane <pane-id> [--json]
   floating-point value such as `0.6`.
 - `move` swaps the target pane with the adjacent structural pane in the given
   direction, matching the keyboard move action.
-- `minimize`, `maximize`, `restore`, and `close` match the pane header actions
-  in the UI.
+- `maximize` and `close` match the pane actions in the UI.
 
 ### Chat Control
 
@@ -583,7 +580,7 @@ Verde includes embedded terminal panes powered by Ghostty's `libghostty-vt` term
 - Move between workspace panes with `Alt+Arrow` or `Ctrl+H/J/K/L`.
 - Move the focused workspace pane by swapping it with the adjacent pane using `Ctrl+Shift+H/J/K/L`.
 - In a focused chat thread pane, press `Tab` to return keyboard focus to the prompt box.
-- Workspace pane headers can split chat or terminal panes vertically (`C|`, `T|`) or horizontally (`C-`, `T-`), zoom or unzoom a pane, minimize it into the restore strip, or close it.
+- Workspace pane headers can split chat or terminal panes vertically (`C|`, `T|`) or horizontally (`C-`, `T-`), zoom or unzoom a pane, or close it.
 - Drag the divider between workspace panes to resize the split.
 - Right-click inside a terminal pane to create normal shell tabs, launch-profile tabs for Claude, OpenCode, Codex, and Cursor, or new workspace terminal panes around the focused pane.
 - Terminal-internal tabs remain inside the focused terminal pane. Terminal split actions create workspace terminal panes.
@@ -717,7 +714,6 @@ Example config:
       "move_left": "Ctrl+Shift+H",
       "move_right": "Ctrl+Shift+L",
       "toggle_maximize": "CommandOrControl+Alt+M",
-      "minimize": "CommandOrControl+Alt+Minus",
       "close": ["CommandOrControl+W", "Alt+X"],
       "select": [
         "Alt+1",

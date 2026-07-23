@@ -2257,7 +2257,6 @@ const ViewFocusSnapshot = struct {
 pub const WorkspacePane = struct {
     id: WorkspacePaneId,
     ref: WorkspacePaneRef,
-    minimized: bool = false,
 };
 
 pub const WorkspacePanePlacement = struct {
@@ -2279,11 +2278,6 @@ const WorkspacePaneLayoutRect = struct {
     y: f32,
     w: f32,
     h: f32,
-};
-
-pub const WorkspaceMinimizedPane = struct {
-    id: WorkspacePaneId,
-    kind: WorkspacePaneKind,
 };
 
 pub const TerminalDockEntry = struct {
@@ -2711,8 +2705,13 @@ pub const WorkspaceLayout = struct {
                 changed = true;
             }
         }
+        for (self.panes.items) |pane| {
+            if (self.rootContainsPane(pane.id)) continue;
+            try self.ensurePaneInRootSplit(allocator, pane.id, .horizontal, 0.64);
+            changed = true;
+        }
         if (self.focused_pane_id) |pane_id| {
-            if (!self.paneIdVisible(pane_id)) {
+            if (self.paneById(pane_id) == null) {
                 self.focused_pane_id = self.firstVisiblePaneId();
                 changed = true;
             }
@@ -2721,7 +2720,7 @@ pub const WorkspaceLayout = struct {
             changed = changed or self.focused_pane_id != null;
         }
         if (self.maximized_pane_id) |pane_id| {
-            if (!self.paneIdVisible(pane_id)) {
+            if (self.paneById(pane_id) == null) {
                 self.maximized_pane_id = null;
                 changed = true;
             }
@@ -2729,16 +2728,8 @@ pub const WorkspaceLayout = struct {
         return changed;
     }
 
-    fn paneIdVisible(self: *const WorkspaceLayout, pane_id: WorkspacePaneId) bool {
-        const pane = self.paneById(pane_id) orelse return false;
-        return !pane.minimized;
-    }
-
     fn firstVisiblePaneId(self: *const WorkspaceLayout) ?WorkspacePaneId {
-        for (self.panes.items) |pane| {
-            if (!pane.minimized) return pane.id;
-        }
-        return null;
+        return if (self.panes.items.len > 0) self.panes.items[0].id else null;
     }
 
     pub fn paneById(self: *const WorkspaceLayout, pane_id: WorkspacePaneId) ?*const WorkspacePane {
@@ -2757,7 +2748,6 @@ pub const WorkspaceLayout = struct {
 
     fn visibleChatPaneIdForThread(self: *const WorkspaceLayout, thread_index: usize) ?WorkspacePaneId {
         for (self.panes.items) |pane| {
-            if (pane.minimized) continue;
             switch (pane.ref) {
                 .chat => |ref| if (ref.thread_index == thread_index) return pane.id,
                 else => {},
@@ -2769,17 +2759,16 @@ pub const WorkspaceLayout = struct {
     fn retargetPreferredChatPane(self: *WorkspaceLayout, thread_index: usize) ?WorkspacePaneId {
         if (self.focused_pane_id) |focused_pane_id| {
             if (self.paneByIdMutable(focused_pane_id)) |pane| {
-                if (!pane.minimized) switch (pane.ref) {
+                switch (pane.ref) {
                     .chat => |*ref| {
                         ref.thread_index = thread_index;
                         return pane.id;
                     },
                     else => {},
-                };
+                }
             }
         }
         for (self.panes.items) |*pane| {
-            if (pane.minimized) continue;
             switch (pane.ref) {
                 .chat => |*ref| {
                     ref.thread_index = thread_index;
@@ -2793,7 +2782,6 @@ pub const WorkspaceLayout = struct {
 
     fn visibleTerminalPaneIdForDock(self: *const WorkspaceLayout, dock_id: u32) ?WorkspacePaneId {
         for (self.panes.items) |pane| {
-            if (pane.minimized) continue;
             switch (pane.ref) {
                 .terminal => |ref| if (ref.dock_id == dock_id) return pane.id,
                 else => {},
@@ -2819,11 +2807,7 @@ pub const WorkspaceLayout = struct {
     }
 
     fn visiblePaneCount(self: *const WorkspaceLayout) usize {
-        var count: usize = 0;
-        for (self.panes.items) |pane| {
-            if (!pane.minimized) count += 1;
-        }
-        return count;
+        return self.panes.items.len;
     }
 
     fn gridNewPanePlacement(self: *const WorkspaceLayout) ?WorkspacePanePlacement {
@@ -2864,7 +2848,7 @@ pub const WorkspaceLayout = struct {
     ) void {
         switch (node.*) {
             .leaf => |pane_id| {
-                if (!self.paneIdVisible(pane_id) or count.* >= rects.len) return;
+                if (self.paneById(pane_id) == null or count.* >= rects.len) return;
                 rects[count.*] = .{
                     .pane_id = pane_id,
                     .x = rect.x,
@@ -2904,7 +2888,6 @@ pub const WorkspaceLayout = struct {
     fn swapPaneRefs(self: *WorkspaceLayout, first_pane_id: WorkspacePaneId, second_pane_id: WorkspacePaneId) bool {
         const first_index = self.paneIndexById(first_pane_id) orelse return false;
         const second_index = self.paneIndexById(second_pane_id) orelse return false;
-        if (self.panes.items[first_index].minimized or self.panes.items[second_index].minimized) return false;
         const first_ref = self.panes.items[first_index].ref;
         self.panes.items[first_index].ref = self.panes.items[second_index].ref;
         self.panes.items[second_index].ref = first_ref;
@@ -2913,7 +2896,6 @@ pub const WorkspaceLayout = struct {
 
     fn hasVisiblePaneKind(self: *const WorkspaceLayout, kind: WorkspacePaneKind) bool {
         for (self.panes.items) |pane| {
-            if (pane.minimized) continue;
             switch (pane.ref) {
                 .chat => if (kind == .chat) return true,
                 .terminal => if (kind == .terminal) return true,
@@ -2925,7 +2907,6 @@ pub const WorkspaceLayout = struct {
 
     fn visibleBrowserPaneId(self: *const WorkspaceLayout) ?WorkspacePaneId {
         for (self.panes.items) |pane| {
-            if (pane.minimized) continue;
             switch (pane.ref) {
                 .browser => return pane.id,
                 else => {},
@@ -2969,7 +2950,6 @@ pub const WorkspaceLayout = struct {
         for (self.panes.items) |*pane| {
             switch (pane.ref) {
                 .terminal => |ref| if (ref.dock_id == dock_id) {
-                    pane.minimized = false;
                     self.focused_pane_id = pane.id;
                     try self.ensurePaneInRootSplit(allocator, pane.id, .horizontal, 0.64);
                     return pane.id;
@@ -2993,7 +2973,6 @@ pub const WorkspaceLayout = struct {
         for (self.panes.items) |*pane| {
             switch (pane.ref) {
                 .browser => {
-                    pane.minimized = false;
                     self.focused_pane_id = pane.id;
                     try self.ensurePaneInRootSplit(allocator, pane.id, .vertical, 0.58);
                     return pane.id;
@@ -3055,36 +3034,6 @@ pub const WorkspaceLayout = struct {
         self.focused_pane_id = new_pane_id;
     }
 
-    fn minimizePaneKind(self: *WorkspaceLayout, allocator: std.mem.Allocator, kind: WorkspacePaneKind) bool {
-        var changed = false;
-        for (self.panes.items) |*pane| {
-            switch (pane.ref) {
-                .chat => if (kind == .chat and !pane.minimized) {
-                    pane.minimized = true;
-                    changed = true;
-                },
-                .terminal => if (kind == .terminal and !pane.minimized) {
-                    pane.minimized = true;
-                    changed = true;
-                },
-                .browser => if (kind == .browser and !pane.minimized) {
-                    pane.minimized = true;
-                    changed = true;
-                },
-            }
-        }
-        if (changed) {
-            if (self.firstVisiblePaneId()) |pane_id| {
-                self.replaceRootWithLeaf(allocator, pane_id) catch {
-                    self.focused_pane_id = pane_id;
-                };
-            } else {
-                self.focused_pane_id = null;
-            }
-        }
-        return changed;
-    }
-
     fn closePaneKind(self: *WorkspaceLayout, allocator: std.mem.Allocator, kind: WorkspacePaneKind) bool {
         var changed = false;
         var index: usize = 0;
@@ -3106,11 +3055,11 @@ pub const WorkspaceLayout = struct {
 
         if (self.focused_pane_id) |pane_id| {
             const focused = self.paneById(pane_id);
-            if (focused == null or focused.?.minimized) self.focused_pane_id = self.firstVisiblePaneId();
+            if (focused == null) self.focused_pane_id = self.firstVisiblePaneId();
         }
         if (self.maximized_pane_id) |pane_id| {
             const maximized = self.paneById(pane_id);
-            if (maximized == null or maximized.?.minimized) self.maximized_pane_id = null;
+            if (maximized == null) self.maximized_pane_id = null;
         }
         if (self.root == null) {
             if (self.firstVisiblePaneId()) |pane_id| {
@@ -3185,8 +3134,7 @@ pub const WorkspaceLayout = struct {
     fn edgeVisiblePaneId(self: *const WorkspaceLayout, node: *const WorkspaceNode, prefer_second: bool) ?WorkspacePaneId {
         switch (node.*) {
             .leaf => |pane_id| {
-                const pane = self.paneById(pane_id) orelse return null;
-                return if (pane.minimized) null else pane_id;
+                return if (self.paneById(pane_id) != null) pane_id else null;
             },
             .split => |split| {
                 if (prefer_second) {
@@ -3226,8 +3174,6 @@ pub const WorkspaceLayout = struct {
             try stringify.beginObject();
             try stringify.objectField("id");
             try stringify.write(pane.id);
-            try stringify.objectField("minimized");
-            try stringify.write(pane.minimized);
             switch (pane.ref) {
                 .chat => |ref| {
                     try stringify.objectField("kind");
@@ -3308,13 +3254,11 @@ pub const WorkspaceLayout = struct {
             if (pane_value != .object) continue;
             const pane_id: WorkspacePaneId = @intCast(jsonInt(pane_value.object.get("id") orelse .null) orelse continue);
             const kind = jsonString(pane_value.object.get("kind") orelse .null) orelse continue;
-            const minimized = jsonBool(pane_value.object.get("minimized") orelse .null) orelse false;
             if (std.mem.eql(u8, kind, "chat")) {
                 const thread_index: usize = @intCast(jsonInt(pane_value.object.get("thread") orelse .null) orelse 0);
                 try next_layout.panes.append(allocator, .{
                     .id = pane_id,
                     .ref = .{ .chat = .{ .thread_index = thread_index } },
-                    .minimized = minimized,
                 });
             } else if (std.mem.eql(u8, kind, "terminal")) {
                 const dock_id: u32 = @intCast(jsonInt(pane_value.object.get("dock") orelse .null) orelse 0);
@@ -3323,7 +3267,6 @@ pub const WorkspaceLayout = struct {
                 try next_layout.panes.append(allocator, .{
                     .id = pane_id,
                     .ref = .{ .terminal = .{ .dock_id = dock_id, .purpose = purpose } },
-                    .minimized = minimized,
                 });
             } else if (std.mem.eql(u8, kind, "browser")) {
                 var browser_ref: BrowserPaneRef = .{};
@@ -3359,7 +3302,6 @@ pub const WorkspaceLayout = struct {
                 try next_layout.panes.append(allocator, .{
                     .id = pane_id,
                     .ref = .{ .browser = browser_ref },
-                    .minimized = minimized,
                 });
                 browser_ref_owned = false;
             }
@@ -3369,22 +3311,9 @@ pub const WorkspaceLayout = struct {
         if (root_value.object.get("root")) |node_value| {
             next_layout.root = try parseWorkspaceNodeJson(allocator, node_value);
         }
-        if (next_layout.root == null) {
-            if (next_layout.firstVisiblePaneId()) |pane_id| {
-                next_layout.root = try createLeafNode(allocator, pane_id);
-            }
-        }
-        if (next_layout.panes.items.len == 0 or next_layout.root == null) return;
-        if (next_layout.focused_pane_id) |pane_id| {
-            const pane = next_layout.paneById(pane_id);
-            if (pane == null or pane.?.minimized) next_layout.focused_pane_id = next_layout.firstVisiblePaneId();
-        } else {
-            next_layout.focused_pane_id = next_layout.firstVisiblePaneId();
-        }
-        if (next_layout.maximized_pane_id) |pane_id| {
-            const pane = next_layout.paneById(pane_id);
-            if (pane == null or pane.?.minimized) next_layout.maximized_pane_id = null;
-        }
+        if (next_layout.panes.items.len == 0) return;
+        _ = try next_layout.repairVisibleRoot(allocator);
+        if (next_layout.root == null) return;
 
         self.deinit(allocator);
         self.* = next_layout;
@@ -3404,7 +3333,6 @@ pub const WorkspaceLayout = struct {
 
     fn focusFirstVisiblePaneKind(self: *WorkspaceLayout, kind: WorkspacePaneKind) void {
         for (self.panes.items) |pane| {
-            if (pane.minimized) continue;
             switch (pane.ref) {
                 .chat => if (kind == .chat) {
                     self.focused_pane_id = pane.id;
@@ -3473,7 +3401,7 @@ pub const WorkspaceLayout = struct {
     fn pruneRootToVisiblePanes(allocator: std.mem.Allocator, layout: *const WorkspaceLayout, node: *WorkspaceNode) PruneRootResult {
         switch (node.*) {
             .leaf => |pane_id| {
-                if (layout.paneIdVisible(pane_id)) return .{ .node = node, .changed = false };
+                if (layout.paneById(pane_id) != null) return .{ .node = node, .changed = false };
                 allocator.destroy(node);
                 return .{ .node = null, .changed = true };
             },
@@ -6636,7 +6564,6 @@ pub const AppState = struct {
     ) !void {
         const project = &self.projects.items[project_index];
         const pane = project.workspace_layout.paneById(verde_pane_id) orelse return;
-        if (pane.minimized) return;
 
         const descriptor = try self.herdrPaneDescriptor(project_index, pane, default_cwd);
         defer descriptor.deinit(self.allocator);
@@ -6958,7 +6885,6 @@ pub const AppState = struct {
         var layout = &project.workspace_layout;
         if (layout.panes.items.len != 1) return null;
         var pane = &layout.panes.items[0];
-        if (pane.minimized) return null;
         switch (pane.ref) {
             .chat => |chat_ref| {
                 if (chat_ref.thread_index >= project.threads.items.len) return null;
@@ -10549,8 +10475,8 @@ pub const AppState = struct {
         return null;
     }
 
-    /// Selects a workspace and reveals one of its open layout panes, restoring
-    /// it first if minimized and leaving any maximized view.
+    /// Selects a workspace and reveals one of its open layout panes, leaving
+    /// any maximized view.
     pub fn focusWorkspaceOpenPane(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) void {
         self.focusWorkspaceOpenPaneWithZoom(project_index, pane_id, false);
     }
@@ -10607,12 +10533,6 @@ pub const AppState = struct {
             }
         }
         const pane = target orelse return;
-        if (pane.minimized) {
-            pane.minimized = false;
-            layout.ensurePaneInRootSplit(self.allocator, pane_id, .horizontal, 0.64) catch |err| {
-                log.err("failed to restore workspace pane from sidebar: {s}", .{@errorName(err)});
-            };
-        }
         layout.focused_pane_id = pane_id;
         layout.maximized_pane_id = if (preserve_zoom and was_maximized) pane_id else null;
         switch (pane.ref) {
@@ -12078,7 +11998,6 @@ pub const AppState = struct {
         if (self.projects.items.len == 0) return null;
         const layout = &self.projects.items[self.selected_project_index].workspace_layout;
         const pane = layout.focusedPane() orelse return null;
-        if (pane.minimized) return null;
         return switch (pane.ref) {
             .terminal => |ref| ref.dock_id,
             else => null,
@@ -12212,21 +12131,7 @@ pub const AppState = struct {
         }
 
         const layout = &self.projects.items[self.selected_project_index].workspace_layout;
-        const focused_kind = if (layout.focusedPane()) |pane| switch (pane.ref) {
-            .chat => WorkspacePaneKind.chat,
-            .terminal => WorkspacePaneKind.terminal,
-            .browser => WorkspacePaneKind.browser,
-        } else null;
-        const terminal_visible = layout.hasVisiblePaneKind(.terminal);
-        if (terminal_visible and focused_kind == .terminal) {
-            _ = layout.minimizePaneKind(self.allocator, .terminal);
-            dock.visible = false;
-            self.endTerminalResizeDrag();
-            self.terminal_focused = false;
-            self.setSidebarNotice("Terminal hidden.");
-            self.markDirty();
-            return;
-        }
+        const terminal_open = layout.visibleTerminalPaneIdForDock(0) != null;
 
         _ = layout.ensureTerminalPane(self.allocator, 0) catch |err| {
             log.err("failed to open terminal workspace pane: {s}", .{@errorName(err)});
@@ -12235,7 +12140,7 @@ pub const AppState = struct {
         };
         dock.visible = false;
         self.requestTerminalFocus();
-        self.setSidebarNotice("Terminal opened.");
+        self.setSidebarNotice(if (terminal_open) "Terminal focused." else "Terminal opened.");
         self.markDirty();
     }
 
@@ -12514,7 +12419,7 @@ pub const AppState = struct {
         }
 
         if (self.browser_state.controls_visible) {
-            self.hideBrowser();
+            self.closeBrowser();
             return;
         }
 
@@ -12802,8 +12707,7 @@ pub const AppState = struct {
         const wanted = pane_id orelse return;
         if (except_pane_id != null and except_pane_id.? == wanted) return;
         var layout = &self.projects.items[project_index].workspace_layout;
-        const pane = layout.paneById(wanted) orelse return;
-        if (pane.minimized) return;
+        _ = layout.paneById(wanted) orelse return;
         layout.focused_pane_id = wanted;
     }
 
@@ -12841,31 +12745,6 @@ pub const AppState = struct {
         }
         self.ensureCurrentProjectWorkspace();
         self.setSidebarNotice("Browser closed.");
-        self.markDirty();
-    }
-
-    /// Hides the desktop browser control surface and its browser runtime.
-    pub fn hideBrowser(self: *AppState) void {
-        self.browser_state.setControlsVisible(false);
-        self.browser_state.setInspectorEnabled(false);
-        self.browser_state.clearSuppressedEvalResults();
-        self.browser_surface_suspended_for_palette_overlay = false;
-        self.browser_surface_suspended_for_layout = false;
-        self.browser_surface_suspended_for_empty_state = false;
-        self.unfocusBrowserPane();
-        self.browser_address_focused = false;
-        self.browser_inspector_menu_open = false;
-        self.browser_state.controller.hide() catch |err| {
-            log.err("failed to hide browser runtime: {s}", .{@errorName(err)});
-            self.browser_state.status = .failed;
-            self.browser_state.setLastError("Failed to hide browser runtime.") catch {};
-            self.setSidebarNotice("Failed to hide browser.");
-            return;
-        };
-        if (self.projects.items.len > 0) {
-            _ = self.projects.items[self.selected_project_index].workspace_layout.minimizePaneKind(self.allocator, .browser);
-        }
-        self.setSidebarNotice("Browser hidden.");
         self.markDirty();
     }
 
@@ -14429,7 +14308,6 @@ pub const AppState = struct {
 
         const current_thread_index = project.currentThreadIndex();
         for (project.workspace_layout.panes.items) |pane| {
-            if (pane.minimized) continue;
             const thread_index = switch (pane.ref) {
                 .chat => |ref| ref.thread_index,
                 else => continue,
@@ -14885,9 +14763,7 @@ pub const AppState = struct {
         if (self.projects.items.len == 0) return null;
         const layout = &self.projects.items[self.selected_project_index].workspace_layout;
         if (layout.maximized_pane_id) |pane_id| {
-            if (layout.paneById(pane_id)) |pane| {
-                if (!pane.minimized) return layout.root;
-            }
+            if (layout.paneById(pane_id) != null) return layout.root;
         }
         return layout.root;
     }
@@ -14896,8 +14772,7 @@ pub const AppState = struct {
         if (self.projects.items.len == 0) return null;
         const layout = &self.projects.items[self.selected_project_index].workspace_layout;
         const pane_id = layout.maximized_pane_id orelse return null;
-        const pane = layout.paneById(pane_id) orelse return null;
-        if (pane.minimized) return null;
+        _ = layout.paneById(pane_id) orelse return null;
         return pane_id;
     }
 
@@ -14905,7 +14780,6 @@ pub const AppState = struct {
         if (self.projects.items.len == 0) return null;
         const layout = &self.projects.items[self.selected_project_index].workspace_layout;
         const pane = layout.paneById(pane_id) orelse return null;
-        if (pane.minimized) return null;
         return switch (pane.ref) {
             .chat => .chat,
             .terminal => .terminal,
@@ -14917,7 +14791,6 @@ pub const AppState = struct {
         if (self.projects.items.len == 0) return null;
         const layout = &self.projects.items[self.selected_project_index].workspace_layout;
         const pane = layout.paneById(pane_id) orelse return null;
-        if (pane.minimized) return null;
         return switch (pane.ref) {
             .terminal => |ref| ref.dock_id,
             else => null,
@@ -14928,7 +14801,6 @@ pub const AppState = struct {
         if (self.projects.items.len == 0) return null;
         const project = &self.projects.items[self.selected_project_index];
         const pane = project.workspace_layout.paneById(pane_id) orelse return null;
-        if (pane.minimized) return null;
         return switch (pane.ref) {
             .chat => |ref| if (ref.thread_index < project.threads.items.len) ref.thread_index else null,
             else => null,
@@ -15486,8 +15358,7 @@ pub const AppState = struct {
             self.setSidebarNotice("No workspace pane selected.");
             return false;
         };
-        const target = layout.paneById(target_pane_id) orelse return false;
-        if (target.minimized) return false;
+        _ = layout.paneById(target_pane_id) orelse return false;
         const provider_label = agentTuiProviderLabel(process.provider);
 
         const cwd = try self.resolveManagedProcessCwd(project.path, process.cwd);
@@ -15637,8 +15508,7 @@ pub const AppState = struct {
             self.setSidebarNotice("No workspace pane selected.");
             return false;
         };
-        const target = layout.paneById(target_pane_id) orelse return false;
-        if (target.minimized) return false;
+        _ = layout.paneById(target_pane_id) orelse return false;
 
         const dock_id = self.createProjectTerminalDock(project_index) catch |err| {
             log.err("failed to allocate Amp terminal dock: {s}", .{@errorName(err)});
@@ -16275,7 +16145,7 @@ pub const AppState = struct {
         };
         if (thread_index >= project.threads.items.len) return false;
         project.selected_thread_index = thread_index;
-        if (!pane.minimized) project.workspace_layout.focused_pane_id = pane_id;
+        project.workspace_layout.focused_pane_id = pane_id;
         self.terminal_focused = false;
         self.unfocusBrowserPane();
         self.browser_address_focused = false;
@@ -16298,7 +16168,6 @@ pub const AppState = struct {
         if (project_index >= self.projects.items.len) return false;
         var layout = &self.projects.items[project_index].workspace_layout;
         const pane = layout.paneById(pane_id) orelse return false;
-        if (pane.minimized) return false;
         // Composer popovers belong to the live composer pane; leaving them
         // open on a pane that no longer renders them would silently keep
         // eating clicks through the popover routing.
@@ -16400,19 +16269,14 @@ pub const AppState = struct {
         if (source_pane_id == target_pane_id) return false;
 
         var layout = &self.projects.items[self.selected_project_index].workspace_layout;
-        const source = layout.paneByIdMutable(source_pane_id) orelse return false;
-        const target = layout.paneById(target_pane_id) orelse return false;
-        if (source.minimized or target.minimized) return false;
+        _ = layout.paneById(source_pane_id) orelse return false;
+        _ = layout.paneById(target_pane_id) orelse return false;
 
-        // Temporarily hide the source pane so the existing root-prune logic can
-        // collapse its old split before we reuse the same pane id at the drop target.
-        source.minimized = true;
+        // Collapse the source's old split before reusing its pane id at the
+        // drop target.
         if (layout.root) |root_node| {
-            const repaired = WorkspaceLayout.pruneRootToVisiblePanes(self.allocator, layout, root_node);
-            layout.root = repaired.node;
+            layout.root = WorkspaceLayout.removePaneFromTree(self.allocator, root_node, source_pane_id);
         }
-        const source_again = layout.paneByIdMutable(source_pane_id) orelse return false;
-        source_again.minimized = false;
 
         layout.splitPaneWithLeaf(self.allocator, target_pane_id, source_pane_id, axis, new_after) catch |err| {
             log.err("failed to move workspace pane: {s}", .{@errorName(err)});
@@ -16436,7 +16300,6 @@ pub const AppState = struct {
         if (project_index >= self.projects.items.len) return false;
         var layout = &self.projects.items[project_index].workspace_layout;
         const pane = layout.paneById(pane_id) orelse return false;
-        if (pane.minimized) return false;
         runtime_log.diagnostic("pane maximize toggle begin project={d} pane={d} kind={s} currently_maximized={any}", .{
             project_index,
             pane_id,
@@ -16503,16 +16366,6 @@ pub const AppState = struct {
         if (layout.visiblePaneCount() <= 1) {
             self.setSidebarNotice("Cannot close the last workspace pane.");
             return false;
-        }
-        if (layout.paneById(pane_id)) |pane| {
-            switch (pane.ref) {
-                .terminal => |ref| if (self.workspaceAgentTuiHistoryAt(project_index, ref.dock_id) != 0) {
-                    if (!self.minimizeWorkspacePane(project_index, pane_id)) return false;
-                    self.setSidebarNotice("Agent TUI saved to workspace history.");
-                    return true;
-                },
-                else => {},
-            }
         }
         var removed_ref = layout.closePane(self.allocator, pane_id) orelse return false;
         defer deinitWorkspacePaneRef(&removed_ref, self.allocator);
@@ -16662,8 +16515,7 @@ pub const AppState = struct {
         if (project_index >= self.projects.items.len) return false;
         var project = &self.projects.items[project_index];
         var layout = &project.workspace_layout;
-        const target = layout.paneById(pane_id) orelse return false;
-        if (target.minimized) return false;
+        _ = layout.paneById(pane_id) orelse return false;
         const thread_index = project.addThread(self.allocator) catch |err| {
             log.err("failed to create chat thread for workspace pane: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to create a new thread.");
@@ -16703,8 +16555,7 @@ pub const AppState = struct {
         var layout = &project.workspace_layout;
         const target_id = target_pane_id orelse layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse
             return error.TargetPaneNotFound;
-        const target = layout.paneById(target_id) orelse return error.TargetPaneNotFound;
-        if (target.minimized) return error.TargetPaneMinimized;
+        _ = layout.paneById(target_id) orelse return error.TargetPaneNotFound;
 
         const previous_focused_pane_id = layout.focused_pane_id;
         const previous_maximized_pane_id = layout.maximized_pane_id;
@@ -16773,8 +16624,7 @@ pub const AppState = struct {
             pane_id
         else
             layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse pane_id;
-        const target = layout.paneById(target_pane_id) orelse return false;
-        if (target.minimized) return false;
+        _ = layout.paneById(target_pane_id) orelse return false;
         const new_pane_id = layout.createChatPane(self.allocator, thread_index) catch |err| {
             log.err("failed to create dropped chat workspace pane: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to create chat pane.");
@@ -16826,8 +16676,7 @@ pub const AppState = struct {
             self.setSidebarNotice("No workspace pane selected.");
             return null;
         };
-        const target = layout.paneById(target_pane_id) orelse return null;
-        if (target.minimized) return null;
+        _ = layout.paneById(target_pane_id) orelse return null;
 
         const dock_id = self.createCurrentProjectTerminalDock() catch |err| {
             log.err("failed to allocate editor terminal dock: {s}", .{@errorName(err)});
@@ -16921,7 +16770,6 @@ pub const AppState = struct {
         _ = dock.setActiveTabPinnedProvider(self.allocator, @tagName(thread.provider));
 
         pane.ref = .{ .terminal = .{ .dock_id = dock_id } };
-        pane.minimized = false;
         layout.focused_pane_id = pane_id;
         layout.maximized_pane_id = null;
         dock.visible = false;
@@ -16948,7 +16796,6 @@ pub const AppState = struct {
         const pane_id = layout.visibleTerminalPaneIdForDock(dock_id) orelse layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse return;
         const pane = layout.paneByIdMutable(pane_id) orelse return;
         pane.ref = .{ .chat = .{ .thread_index = thread_index } };
-        pane.minimized = false;
         layout.focused_pane_id = pane_id;
         layout.maximized_pane_id = null;
         project.selected_thread_index = thread_index;
@@ -16990,8 +16837,7 @@ pub const AppState = struct {
         if (project_index >= self.projects.items.len) return false;
         var project = &self.projects.items[project_index];
         var layout = &project.workspace_layout;
-        const target = layout.paneById(pane_id) orelse return false;
-        if (target.minimized) return false;
+        _ = layout.paneById(pane_id) orelse return false;
 
         const dock_id = self.createProjectTerminalDock(project_index) catch |err| {
             log.err("failed to allocate terminal dock: {s}", .{@errorName(err)});
@@ -17023,89 +16869,10 @@ pub const AppState = struct {
         return true;
     }
 
-    pub fn minimizeCurrentProjectWorkspacePane(self: *AppState, pane_id: WorkspacePaneId) bool {
-        if (self.projects.items.len == 0) return false;
-        return self.minimizeWorkspacePane(self.selected_project_index, pane_id);
-    }
-
-    pub fn minimizeWorkspacePane(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) bool {
-        if (project_index >= self.projects.items.len) return false;
-        var layout = &self.projects.items[project_index].workspace_layout;
-        if (layout.visiblePaneCount() <= 1) {
-            self.setSidebarNotice("Cannot minimize the last workspace pane.");
-            return false;
-        }
-
-        for (layout.panes.items) |*pane| {
-            if (pane.id != pane_id or pane.minimized) continue;
-            pane.minimized = true;
-            if (layout.maximized_pane_id == pane_id) layout.maximized_pane_id = null;
-            if (layout.firstVisiblePaneId()) |next_id| {
-                layout.replaceRootWithLeaf(self.allocator, next_id) catch {
-                    layout.focused_pane_id = next_id;
-                };
-            }
-            if (self.selected_project_index == project_index and self.focusedWorkspacePaneKind() != .terminal) self.terminal_focused = false;
-            self.setSidebarNotice("Workspace pane minimized.");
-            self.markDirty();
-            return true;
-        }
-        return false;
-    }
-
-    pub fn minimizeFocusedWorkspacePane(self: *AppState) bool {
-        if (self.projects.items.len == 0) return false;
-        const pane_id = self.projects.items[self.selected_project_index].workspace_layout.focused_pane_id orelse return false;
-        return self.minimizeCurrentProjectWorkspacePane(pane_id);
-    }
-
     pub fn toggleFocusedWorkspacePaneMaximized(self: *AppState) bool {
         if (self.projects.items.len == 0) return false;
         const pane_id = self.projects.items[self.selected_project_index].workspace_layout.focused_pane_id orelse return false;
         return self.toggleCurrentProjectWorkspacePaneMaximized(pane_id);
-    }
-
-    pub fn restoreCurrentProjectWorkspacePane(self: *AppState, pane_id: WorkspacePaneId) bool {
-        if (self.projects.items.len == 0) return false;
-        return self.restoreWorkspacePane(self.selected_project_index, pane_id);
-    }
-
-    pub fn restoreWorkspacePane(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) bool {
-        if (project_index >= self.projects.items.len) return false;
-        var layout = &self.projects.items[project_index].workspace_layout;
-        for (layout.panes.items) |*pane| {
-            if (pane.id != pane_id or !pane.minimized) continue;
-            pane.minimized = false;
-            layout.focused_pane_id = pane_id;
-            layout.ensurePaneInRootSplit(self.allocator, pane_id, .horizontal, 0.64) catch |err| {
-                log.err("failed to restore workspace pane: {s}", .{@errorName(err)});
-                return false;
-            };
-            switch (pane.ref) {
-                .chat => {
-                    if (self.selected_project_index == project_index) self.terminal_focused = false;
-                },
-                .terminal => {
-                    if (self.selected_project_index == project_index) self.requestTerminalFocus();
-                },
-                .browser => {
-                    self.applyBrowserPaneSnapshotToRuntime(project_index, pane_id);
-                    if (self.selected_project_index == project_index) {
-                        self.terminal_focused = false;
-                        self.composer_focused = false;
-                    }
-                    self.browser_state.setControlsVisible(true);
-                    self.browser_state.controller.show() catch |err| {
-                        log.warn("failed to restore browser runtime with pane: {s}", .{@errorName(err)});
-                    };
-                    if (self.selected_project_index != project_index) self.noteBrowserPaneNotRendered();
-                },
-            }
-            self.setSidebarNotice("Workspace pane restored.");
-            self.markDirty();
-            return true;
-        }
-        return false;
     }
 
     pub fn resizeCurrentProjectWorkspaceSplit(
@@ -17154,7 +16921,6 @@ pub const AppState = struct {
         if (self.projects.items.len == 0) return;
         var layout = &self.projects.items[self.selected_project_index].workspace_layout;
         for (layout.panes.items) |pane| {
-            if (pane.minimized) continue;
             switch (pane.ref) {
                 .terminal => {
                     layout.focused_pane_id = pane.id;
@@ -17169,7 +16935,6 @@ pub const AppState = struct {
         if (self.projects.items.len == 0) return;
         var layout = &self.projects.items[self.selected_project_index].workspace_layout;
         for (layout.panes.items) |pane| {
-            if (pane.minimized) continue;
             switch (pane.ref) {
                 .terminal => |ref| if (ref.dock_id == dock_id) {
                     layout.focused_pane_id = pane.id;
@@ -17188,37 +16953,6 @@ pub const AppState = struct {
     pub fn currentProjectGridNewPanePlacement(self: *const AppState) ?WorkspacePanePlacement {
         if (self.projects.items.len == 0) return null;
         return self.projects.items[self.selected_project_index].workspace_layout.gridNewPanePlacement();
-    }
-
-    pub fn currentProjectWorkspaceMinimizedPaneCount(self: *const AppState) usize {
-        if (self.projects.items.len == 0) return 0;
-        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
-        var count: usize = 0;
-        for (layout.panes.items) |pane| {
-            if (pane.minimized) count += 1;
-        }
-        return count;
-    }
-
-    pub fn currentProjectWorkspaceMinimizedPaneAt(self: *const AppState, index: usize) ?WorkspaceMinimizedPane {
-        if (self.projects.items.len == 0) return null;
-        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
-        var current: usize = 0;
-        for (layout.panes.items) |pane| {
-            if (!pane.minimized) continue;
-            if (current == index) {
-                return .{
-                    .id = pane.id,
-                    .kind = switch (pane.ref) {
-                        .chat => .chat,
-                        .terminal => .terminal,
-                        .browser => .browser,
-                    },
-                };
-            }
-            current += 1;
-        }
-        return null;
     }
 
     pub fn resetUiDebugFrame(self: *AppState) void {
@@ -20256,7 +19990,7 @@ pub const AppState = struct {
 
     // True when the given chat thread is currently on screen in the focused
     // window: the window holds input focus, its project is selected, and a
-    // non-minimized chat pane (respecting maximize) shows that thread.
+    // visible chat pane (respecting maximize) shows that thread.
     fn isChatThreadVisibleAndFocused(self: *const AppState, project_index: usize, thread_index: usize) bool {
         if (!self.window_input_focus) return false;
         if (project_index != self.selected_project_index) return false;
@@ -20270,7 +20004,6 @@ pub const AppState = struct {
             };
         }
         for (layout.panes.items) |pane| {
-            if (pane.minimized) continue;
             switch (pane.ref) {
                 .chat => |ref| if (ref.thread_index == thread_index) return true,
                 else => {},
@@ -21968,6 +21701,28 @@ test "workspace layout prunes stale root leaves" {
         .split => return error.TestExpectedEqual,
     });
     try std.testing.expectEqual(@as(?WorkspacePaneId, 1), layout.focused_pane_id);
+}
+
+test "workspace layout migrates minimized panes back into the split tree" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const persisted =
+        \\{"v":2,"next":3,"focused":1,"maximized":null,"panes":[
+        \\{"id":1,"minimized":false,"kind":"chat","thread":0},
+        \\{"id":2,"minimized":true,"kind":"terminal","dock":1}
+        \\],"root":{"leaf":1}}
+    ;
+    try layout.applyPersistedWorkspaceJson(allocator, persisted);
+
+    try std.testing.expectEqual(@as(usize, 2), layout.visiblePaneCount());
+    try std.testing.expect(layout.rootContainsPane(1));
+    try std.testing.expect(layout.rootContainsPane(2));
+
+    const rewritten = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(rewritten);
+    try std.testing.expect(std.mem.indexOf(u8, rewritten, "minimized") == null);
 }
 
 test "workspace layout grid placement follows pane hotkey order" {

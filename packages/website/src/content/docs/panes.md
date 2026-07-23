@@ -63,11 +63,10 @@ Resizes are committed to the layout immediately and persist with the workspace.
 Use these when the layout is right but a pane is in the wrong place. Moves are
 non-destructive — every pane keeps its content and provider.
 
-## Zooming and minimizing
+## Zooming and closing
 
 - `Alt+Z` — zoom the focused pane to fill the workspace; press again to restore.
-- Pane header button — minimize the pane into the restore strip; click to bring it back.
-- Pane header button — close the pane (or `Ctrl+W` / `Alt+X`).
+- Pane context menu — close the pane (or `Ctrl+W` / `Alt+X`).
 
 ## The sidebar
 

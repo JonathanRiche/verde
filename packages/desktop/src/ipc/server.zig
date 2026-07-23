@@ -359,32 +359,31 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
     return try okValueResponse(allocator, id_value, .{
         .protocol_version = PROTOCOL_VERSION,
         .commands = &.{
-            "status",                              "capabilities",                         "workspaces",                         "panes",
-            "active",                              "inspect",                              "threads",                            "terminals",
-            "herdr.open",                          "herdr.handoff",                        "herdr.unlink",                       "herdr.status",
-            "surfaces",                            "surface.list",                         "surface.inspect",                    "surface.focus",
-            "surface.clearAttention",              "notification.create",                  "notification.update",                "notification.clear",
-            "processes",                           "workspace.select",                     "workspace.create",                   "workspace.rename",
-            "workspace.close",                     "workspace.reopen",                     "workspace.archive",                  "pane.focus",
-            "pane.split",                          "pane.resize",                          "pane.move",                          "pane.minimize",
-            "pane.maximize",                       "pane.restore",                         "pane.close",                         "chat.open",
-            "chat.status",                         "chat.transcript",                      "chat.draft.set",                     "chat.draft.append",
-            "chat.send",                           "chat.followup",                        "chat.stop",                          "chat.approve",
-            "browser.open",                        "browser.navigate",                     "browser.status",                     "browser.close",
-            "browser.toggle",                      "browser.back",                         "browser.forward",                    "browser.reload",
-            "browser.focus",                       "browser.blur",                         "browser.toolbarHit",                 "browser.selectAllFocused",
-            "browser.copyFocused",                 "browser.cutFocused",                   "browser.pasteTextFocused",           "browser.eval",
-            "browser.postJson",                    "browser.screenshot",                   "browser.inspector.enable",           "browser.inspector.disable",
-            "browser.inspector.toggle",            "browser.inspector.mode",               "browser.inspector.menuOpen",         "browser.inspector.menuClose",
-            "browser.overlay.workspaceMenuOpen",   "browser.overlay.workspaceMenuClose",   "browser.overlay.sidebarMenuOpen",    "browser.overlay.sidebarMenuClose",
-            "browser.overlay.composerMenuOpen",    "browser.overlay.composerMenuClose",    "browser.overlay.workspaceModalOpen", "browser.overlay.workspaceModalClose",
-            "browser.overlay.threadModalOpen",     "browser.overlay.threadModalClose",     "browser.overlay.imageModalOpen",     "browser.overlay.imageModalClose",
-            "browser.overlay.transcriptModalOpen", "browser.overlay.transcriptModalClose", "palette.list",                       "palette.run",
-            "terminal.write",                      "terminal.tail",                        "terminal.screen",                    "process.list",
-            "process.inspect",                     "process.start",                        "process.stop",                       "process.restart",
-            "process.logs",                        "agent.open",                           "stack.status",                       "stack.start",
-            "stack.stop",                          "stack.restart",                        "workspace.processes",                "workspace.checkCommand",
-            "workspace.acquireLease",              "workspace.releaseLease",
+            "status",                             "capabilities",                        "workspaces",                          "panes",
+            "active",                             "inspect",                             "threads",                             "terminals",
+            "herdr.open",                         "herdr.handoff",                       "herdr.unlink",                        "herdr.status",
+            "surfaces",                           "surface.list",                        "surface.inspect",                     "surface.focus",
+            "surface.clearAttention",             "notification.create",                 "notification.update",                 "notification.clear",
+            "processes",                          "workspace.select",                    "workspace.create",                    "workspace.rename",
+            "workspace.close",                    "workspace.reopen",                    "workspace.archive",                   "pane.focus",
+            "pane.split",                         "pane.resize",                         "pane.move",                           "pane.maximize",
+            "pane.close",                         "chat.open",                           "chat.status",                         "chat.transcript",
+            "chat.draft.set",                     "chat.draft.append",                   "chat.send",                           "chat.followup",
+            "chat.stop",                          "chat.approve",                        "browser.open",                        "browser.navigate",
+            "browser.status",                     "browser.close",                       "browser.toggle",                      "browser.back",
+            "browser.forward",                    "browser.reload",                      "browser.focus",                       "browser.blur",
+            "browser.toolbarHit",                 "browser.selectAllFocused",            "browser.copyFocused",                 "browser.cutFocused",
+            "browser.pasteTextFocused",           "browser.eval",                        "browser.postJson",                    "browser.screenshot",
+            "browser.inspector.enable",           "browser.inspector.disable",           "browser.inspector.toggle",            "browser.inspector.mode",
+            "browser.inspector.menuOpen",         "browser.inspector.menuClose",         "browser.overlay.workspaceMenuOpen",   "browser.overlay.workspaceMenuClose",
+            "browser.overlay.sidebarMenuOpen",    "browser.overlay.sidebarMenuClose",    "browser.overlay.composerMenuOpen",    "browser.overlay.composerMenuClose",
+            "browser.overlay.workspaceModalOpen", "browser.overlay.workspaceModalClose", "browser.overlay.threadModalOpen",     "browser.overlay.threadModalClose",
+            "browser.overlay.imageModalOpen",     "browser.overlay.imageModalClose",     "browser.overlay.transcriptModalOpen", "browser.overlay.transcriptModalClose",
+            "palette.list",                       "palette.run",                         "terminal.write",                      "terminal.tail",
+            "terminal.screen",                    "process.list",                        "process.inspect",                     "process.start",
+            "process.stop",                       "process.restart",                     "process.logs",                        "agent.open",
+            "stack.status",                       "stack.start",                         "stack.stop",                          "stack.restart",
+            "workspace.processes",                "workspace.checkCommand",              "workspace.acquireLease",              "workspace.releaseLease",
         },
         .events = &.{},
         .encodings = &.{"json"},
@@ -864,12 +863,8 @@ fn paneCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
         const direction = parsePaneDirection(stringParam(params, "direction") orelse "right") orelse
             return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid pane direction");
         changed = state.moveWorkspacePaneInDirection(target.project_index, target.pane_id, direction);
-    } else if (std.mem.eql(u8, command, "minimize")) {
-        changed = state.minimizeWorkspacePane(target.project_index, target.pane_id);
     } else if (std.mem.eql(u8, command, "maximize")) {
         changed = state.maximizeWorkspacePane(target.project_index, target.pane_id);
-    } else if (std.mem.eql(u8, command, "restore")) {
-        changed = state.restoreWorkspacePane(target.project_index, target.pane_id);
     } else if (std.mem.eql(u8, command, "close")) {
         changed = state.closeWorkspacePane(target.project_index, target.pane_id);
     } else {
@@ -959,7 +954,6 @@ fn chatOpenResponse(allocator: std.mem.Allocator, id_value: std.json.Value, stat
     const result = state.openWorkspaceChat(project_index, provider, model_ref, target_pane_id, axis, focus) catch |err| switch (err) {
         error.ProjectNotFound => return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found"),
         error.TargetPaneNotFound => return try errorResponseAlloc(allocator, id_value, "not_found", "target pane not found"),
-        error.TargetPaneMinimized => return try errorResponseAlloc(allocator, id_value, "rejected", "target pane is minimized"),
         error.InvalidModel => return try errorResponseAlloc(allocator, id_value, "invalid_model", "model is not available for the requested provider"),
         else => return try errorResponseAlloc(allocator, id_value, "internal_error", @errorName(err)),
     };
@@ -1488,8 +1482,6 @@ fn writePane(s: *std.json.Stringify, state: *app_state.AppState, project_index: 
     try s.beginObject();
     try s.objectField("pane_id");
     try s.write(pane.id);
-    try s.objectField("minimized");
-    try s.write(pane.minimized);
     try s.objectField("focused");
     try s.write(project.workspace_layout.focused_pane_id != null and project.workspace_layout.focused_pane_id.? == pane.id);
     try s.objectField("maximized");
@@ -1589,8 +1581,6 @@ fn writeTerminalsArray(s: *std.json.Stringify, state: *app_state.AppState, maybe
             try s.write(pane.id);
             try s.objectField("dock_id");
             try s.write(ref.dock_id);
-            try s.objectField("minimized");
-            try s.write(pane.minimized);
             if (state.projectTerminalDock(project_index, ref.dock_id)) |dock| {
                 try s.objectField("running");
                 try s.write(dock.hasRunningSession());
