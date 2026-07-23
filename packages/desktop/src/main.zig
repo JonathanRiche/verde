@@ -1286,7 +1286,7 @@ fn appNeedsContinuousFrames(state: *AppState) bool {
     return state.isPickerPending() or
         state.transcriptMarkdownSelectionDragging() or
         workspace_panes_ui.isFocusAnimating() or
-        workspace_panes_ui.isCompletionPulseAnimating() or
+        workspace_panes_ui.isPaneStatusAnimating() or
         ui_layout.isSidebarAnimating() or
         state.hasPendingSlashCommand() or
         // Run-config stepper thumbs slide for ~160ms after a selection.
@@ -1301,7 +1301,7 @@ fn appNeedsContinuousFrames(state: *AppState) bool {
 }
 
 fn eventWaitTimeoutMs(state: *AppState) c_int {
-    if (state.isPickerPending() or state.isBrowserVisible() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or workspace_panes_ui.isCompletionPulseAnimating() or ui_layout.isSidebarAnimating() or state.runConfigStepperAnimating() or state.settingsModalAnimating()) {
+    if (state.isPickerPending() or state.isBrowserVisible() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or workspace_panes_ui.isPaneStatusAnimating() or ui_layout.isSidebarAnimating() or state.runConfigStepperAnimating() or state.settingsModalAnimating()) {
         return ACTIVE_WAIT_TIMEOUT_MS;
     }
     // Terminal output only reaches the screen when the loop wakes and polls
