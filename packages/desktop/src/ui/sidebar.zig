@@ -974,9 +974,9 @@ fn renderPaletteSearchTrigger(state: *runtime.AppState, rect: palette.Rect) void
 }
 
 /// Cross-workspace "ACTIVE" cluster at the top of the expanded list: every
-/// working/waiting/error pane outside the selected workspace, tagged with its
-/// workspace initial. This generalizes the collapsed rail's punch-through so
-/// other workspaces' live activity stays visible while their subtrees stay
+/// working/waiting/done/error pane outside the selected workspace, tagged with
+/// its workspace initial. This generalizes the collapsed rail's punch-through
+/// so other workspaces' activity stays visible while their subtrees stay
 /// compact; the selected workspace's own panes render in its group below.
 fn renderAttentionClusterSection(
     state: *runtime.AppState,
@@ -1211,12 +1211,14 @@ fn workspaceInitial(buf: *[1]u8, label: []const u8) []const u8 {
     return buf[0..1];
 }
 
-/// Aggregate attention color for a workspace's panes (error > waiting > working),
-/// or null when nothing needs attention. Used by the collapsed activity dock.
+/// Aggregate attention color for a workspace's panes
+/// (error > waiting > done > working), or null when nothing needs attention.
+/// Used by the collapsed activity dock.
 fn workspaceStatusColor(state: *runtime.AppState, project_index: usize) ?[4]f32 {
     if (project_index >= state.projects.items.len) return null;
     const project = &state.projects.items[project_index];
     var has_waiting = false;
+    var has_done = false;
     var has_working = false;
     for (project.workspace_layout.panes.items) |pane| {
         switch (pane.ref) {
@@ -1225,6 +1227,7 @@ fn workspaceStatusColor(state: *runtime.AppState, project_index: usize) ?[4]f32 
                     switch (surface.status) {
                         .@"error" => return theme.COLOR_DIFF_REMOVE,
                         .waiting => has_waiting = true,
+                        .done => has_done = true,
                         .working => has_working = true,
                         else => {},
                     }
@@ -1237,6 +1240,7 @@ fn workspaceStatusColor(state: *runtime.AppState, project_index: usize) ?[4]f32 
         }
     }
     if (has_waiting) return theme.COLOR_YELLOW;
+    if (has_done) return theme.success();
     if (has_working) return theme.COLOR_GREEN;
     return null;
 }
@@ -1403,7 +1407,7 @@ fn renderOpenPanesSection(
 }
 
 /// Renders one live pane row: provider glyph, truncated title, and a trailing
-/// status column ("Working · m:ss" / "Waiting" / "Failed"). With
+/// status column ("Working · m:ss" / "Waiting" / "Done" / "Failed"). With
 /// `show_workspace_tag` (attention-cluster rows) a small workspace-initial
 /// chip leads the row so cross-workspace rows stay attributable.
 fn renderOpenPaneRow(
@@ -1607,6 +1611,7 @@ fn paneStatusLabelText(buf: []u8, status: ?native_state.SurfaceStatus, running: 
     if (status) |s| {
         return switch (s) {
             .waiting => "Waiting",
+            .done => "Done",
             .@"error" => "Failed",
             else => "",
         };
@@ -1624,10 +1629,10 @@ fn openPaneChatThreadIndex(state: *const runtime.AppState, project_index: usize,
     };
 }
 
-/// True when a pane should punch through to the attention cluster: chat
-/// sends in flight, or terminal surfaces working/waiting/errored (or flagged
-/// for attention/unread by hooks). `done`/idle panes stay hidden so finished
-/// work stops occupying the rail once it has nothing new to report.
+/// True when a pane should punch through to the attention cluster: chat sends
+/// in flight, or terminal surfaces working/waiting/done/errored. A done pane
+/// stays visible until focusing it acknowledges the completion and resets it
+/// to idle.
 fn paneNeedsAttention(
     state: *runtime.AppState,
     project_index: usize,
@@ -1641,11 +1646,11 @@ fn paneNeedsAttention(
         },
         .terminal => |ref| {
             const surface = state.projectTerminalSurface(project_index, ref.dock_id) orelse return false;
-            // Focused panes still need their live pip; only finished/idle states
-            // are suppressed so completion does not leave a static status row.
+            // Done remains visible here until the terminal focus path
+            // acknowledges it by resetting the surface to idle.
             return switch (surface.status) {
-                .working, .waiting, .@"error" => true,
-                .done, .idle => false,
+                .working, .waiting, .done, .@"error" => true,
+                .idle => false,
             };
         },
         .browser => return false,
@@ -1660,7 +1665,7 @@ fn paneStatusColor(status: ?native_state.SurfaceStatus, running: bool) ?[4]f32 {
             .working => theme.COLOR_GREEN,
             .waiting => theme.COLOR_YELLOW,
             .@"error" => theme.COLOR_DIFF_REMOVE,
-            .done => null,
+            .done => theme.success(),
             .idle => if (running) theme.COLOR_GREEN else null,
         };
     }
@@ -2072,4 +2077,10 @@ fn queuePaletteChatBubbleIcon(state: anytype, x: f32, center_y: f32, color: [4]f
         .w = theme.scaledUi(3.0),
         .h = theme.scaledUi(2.5),
     }, palette_color);
+}
+
+test "done pane status uses the themed success treatment" {
+    var label_buf: [24]u8 = undefined;
+    try std.testing.expectEqualStrings("Done", paneStatusLabelText(&label_buf, .done, false, null));
+    try std.testing.expectEqual(theme.success(), paneStatusColor(.done, false).?);
 }
