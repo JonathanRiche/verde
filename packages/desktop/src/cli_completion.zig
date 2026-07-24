@@ -85,6 +85,7 @@ fn writePowerShell(w: *std.Io.Writer) !void {
     try writePowerShellRoute(w, "--direction", &spec.direction_values);
     try writePowerShellRoute(w, "--decision", &spec.decision_values);
     try writePowerShellRoute(w, "--provider", &spec.provider_values);
+    try writePowerShellRoute(w, "--reasoning", &spec.reasoning_values);
     try writePowerShellRoute(w, "--mode", &spec.inspector_mode_values);
     try w.writeAll(
         \\  }
@@ -251,6 +252,8 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.decision_values);
     try w.writeAll("\"\n  local provider_values=\"");
     try writeWords(w, &spec.provider_values);
+    try w.writeAll("\"\n  local reasoning_values=\"");
+    try writeWords(w, &spec.reasoning_values);
     try w.writeAll("\"\n  local inspector_mode_values=\"");
     try writeWords(w, &spec.inspector_mode_values);
     try w.writeAll(
@@ -262,8 +265,9 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    --direction) COMPREPLY=( $(compgen -W "$direction_values" -- "$cur") ); return 0 ;;
         \\    --decision) COMPREPLY=( $(compgen -W "$decision_values" -- "$cur") ); return 0 ;;
         \\    --provider) COMPREPLY=( $(compgen -W "$provider_values" -- "$cur") ); return 0 ;;
+        \\    --reasoning) COMPREPLY=( $(compgen -W "$reasoning_values" -- "$cur") ); return 0 ;;
         \\    --mode) COMPREPLY=( $(compgen -W "$inspector_mode_values" -- "$cur") ); return 0 ;;
-        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--target|--script|--json-payload|--prompt|--call|--name|--model|--lines|--command|--label|--profile|--remote|--cwd|--remote-cwd|--local-dir) return 0 ;;
+        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--target|--script|--json-payload|--prompt|--call|--name|--model|--reasoning-variant|--lines|--command|--label|--profile|--remote|--cwd|--remote-cwd|--local-dir) return 0 ;;
         \\  esac
         \\
         \\  if [[ "$cur" == -* ]]; then
@@ -546,6 +550,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.decision_values);
     try w.writeAll("\"\n  local provider_values=\"");
     try writeWords(w, &spec.provider_values);
+    try w.writeAll("\"\n  local reasoning_values=\"");
+    try writeWords(w, &spec.reasoning_values);
     try w.writeAll("\"\n  local inspector_mode_values=\"");
     try writeWords(w, &spec.inspector_mode_values);
     try w.writeAll(
@@ -557,8 +563,9 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    --direction) compadd -- ${(s: :)direction_values}; return ;;
         \\    --decision) compadd -- ${(s: :)decision_values}; return ;;
         \\    --provider) compadd -- ${(s: :)provider_values}; return ;;
+        \\    --reasoning) compadd -- ${(s: :)reasoning_values}; return ;;
         \\    --mode) compadd -- ${(s: :)inspector_mode_values}; return ;;
-        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--target|--script|--json-payload|--prompt|--call|--name|--model|--lines|--command|--label|--profile|--remote|--cwd|--remote-cwd|--local-dir) return ;;
+        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--target|--script|--json-payload|--prompt|--call|--name|--model|--reasoning-variant|--lines|--command|--label|--profile|--remote|--cwd|--remote-cwd|--local-dir) return ;;
         \\  esac
         \\
         \\  if [[ "$cur" == -* ]]; then
@@ -822,6 +829,8 @@ fn writeFish(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.decision_values);
     try w.writeAll("'\ncomplete -c verde -n '__verde_prev_is --provider' -a '");
     try writeWords(w, &spec.provider_values);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_prev_is --reasoning' -a '");
+    try writeWords(w, &spec.reasoning_values);
     try w.writeAll("'\ncomplete -c verde -n '__verde_prev_is --mode' -a '");
     try writeWords(w, &spec.inspector_mode_values);
     try w.writeAll("'\n");

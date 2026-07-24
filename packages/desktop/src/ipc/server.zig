@@ -931,6 +931,44 @@ fn chatCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
     return try chatStatusResponse(allocator, id_value, state, target.project_index, target.pane_id);
 }
 
+const ParsedChatOpenSettings = struct {
+    reasoning_effort: ?app_state.ReasoningEffort,
+    reasoning_variant: ?[]const u8,
+    fast_mode: ?app_state.FastMode,
+};
+
+fn parseChatOpenSettings(params: std.json.Value) error{
+    InvalidReasoningEffortType,
+    InvalidReasoningEffortValue,
+    InvalidReasoningVariantType,
+    InvalidFastModeType,
+}!ParsedChatOpenSettings {
+    const reasoning_effort_name = stringParam(params, "reasoning_effort");
+    if (paramIsNonNull(params, "reasoning_effort") and reasoning_effort_name == null) {
+        return error.InvalidReasoningEffortType;
+    }
+    const reasoning_effort = if (reasoning_effort_name) |name|
+        std.meta.stringToEnum(app_state.ReasoningEffort, name) orelse return error.InvalidReasoningEffortValue
+    else
+        null;
+    const reasoning_variant = stringParam(params, "reasoning_variant");
+    if (paramIsNonNull(params, "reasoning_variant") and reasoning_variant == null) {
+        return error.InvalidReasoningVariantType;
+    }
+    if (paramIsNonNull(params, "fast_mode") and boolParam(params, "fast_mode") == null) {
+        return error.InvalidFastModeType;
+    }
+    const fast_mode: ?app_state.FastMode = if (boolParam(params, "fast_mode")) |enabled|
+        if (enabled) .on else .off
+    else
+        null;
+    return .{
+        .reasoning_effort = reasoning_effort,
+        .reasoning_variant = reasoning_variant,
+        .fast_mode = fast_mode,
+    };
+}
+
 fn chatOpenResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
     _ = stringParam(params, "workspace_id") orelse
         return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open requires an explicit workspace_id");
@@ -946,6 +984,12 @@ fn chatOpenResponse(allocator: std.mem.Allocator, id_value: std.json.Value, stat
     if (paramIsNonNull(params, "model") and model_ref == null) {
         return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open model must be a string");
     }
+    const creation_settings = parseChatOpenSettings(params) catch |err| switch (err) {
+        error.InvalidReasoningEffortType => return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open reasoning_effort must be a string"),
+        error.InvalidReasoningEffortValue => return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open reasoning_effort must be one of: low, medium, high, xhigh, max"),
+        error.InvalidReasoningVariantType => return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open reasoning_variant must be a string"),
+        error.InvalidFastModeType => return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open fast_mode must be a boolean"),
+    };
     const axis_name = stringParam(params, "axis") orelse "horizontal";
     const axis = parseAxis(axis_name) orelse
         return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid chat.open split axis");
@@ -971,10 +1015,23 @@ fn chatOpenResponse(allocator: std.mem.Allocator, id_value: std.json.Value, stat
         },
     };
 
-    const result = state.openWorkspaceChat(project_index, provider, model_ref, target_pane_id, axis, focus) catch |err| switch (err) {
+    const result = state.openWorkspaceChat(project_index, .{
+        .provider = provider,
+        .model_ref = model_ref,
+        .reasoning_effort = creation_settings.reasoning_effort,
+        .reasoning_variant = creation_settings.reasoning_variant,
+        .fast_mode = creation_settings.fast_mode,
+        .target_pane_id = target_pane_id,
+        .axis = axis,
+        .focus = focus,
+    }) catch |err| switch (err) {
         error.ProjectNotFound => return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found"),
         error.TargetPaneNotFound => return try errorResponseAlloc(allocator, id_value, "not_found", "target pane not found"),
         error.InvalidModel => return try errorResponseAlloc(allocator, id_value, "invalid_model", "model is not available for the requested provider"),
+        error.ConflictingReasoningSettings => return try errorResponseAlloc(allocator, id_value, "unsupported_combination", "reasoning_effort and reasoning_variant cannot both be set"),
+        error.UnsupportedReasoningEffort => return try errorResponseAlloc(allocator, id_value, "unsupported_combination", "reasoning_effort is not supported by the requested provider and model"),
+        error.UnsupportedReasoningVariant => return try errorResponseAlloc(allocator, id_value, "unsupported_combination", "reasoning_variant is not supported by the requested provider and model"),
+        error.UnsupportedFastMode => return try errorResponseAlloc(allocator, id_value, "unsupported_combination", "fast_mode is not supported by the requested provider and model"),
         else => return try errorResponseAlloc(allocator, id_value, "internal_error", @errorName(err)),
     };
     const project = &state.projects.items[project_index];
@@ -986,8 +1043,7 @@ fn chatOpenResponse(allocator: std.mem.Allocator, id_value: std.json.Value, stat
         project_index,
         result,
         thread.local_thread_id,
-        thread.provider,
-        thread.model_ref.?,
+        thread.*,
     );
 }
 
@@ -1623,6 +1679,7 @@ fn writeThreadSummary(s: *std.json.Stringify, thread: app_state.ChatThread, inde
     try s.write(@tagName(thread.provider));
     try s.objectField("model");
     if (thread.model_ref) |model| try s.write(model) else try s.write(null);
+    try writeThreadCreationSettings(s, thread);
     try s.objectField("provider_thread_id");
     if (thread.provider_thread_id) |thread_id| try s.write(thread_id) else try s.write(null);
     try s.objectField("message_count");
@@ -1634,6 +1691,21 @@ fn writeThreadSummary(s: *std.json.Stringify, thread: app_state.ChatThread, inde
     try s.objectField("completed_at_ms");
     if (thread.completion_pending) try s.write(thread.completed_at_ms) else try s.write(null);
     try s.endObject();
+}
+
+fn writeThreadCreationSettings(s: *std.json.Stringify, thread: app_state.ChatThread) !void {
+    try s.objectField("reasoning_effort");
+    if (thread.reasoning_effort) |effort| try s.write(@tagName(effort)) else try s.write(null);
+    try s.objectField("reasoning_variant");
+    if (thread.opencode_reasoning_variant) |variant| try s.write(variant) else try s.write(null);
+    try s.objectField("fast_mode");
+    try s.write(thread.fast_mode == .on);
+    try s.objectField("service_tier");
+    if (thread.provider == .codex) {
+        try s.write(if (thread.fast_mode == .on) "fast" else "default");
+    } else {
+        try s.write(null);
+    }
 }
 
 fn writeTerminalsArray(s: *std.json.Stringify, state: *app_state.AppState, maybe_project_index: ?usize) !void {
@@ -2770,8 +2842,7 @@ fn chatOpenResultResponse(
     workspace_index: usize,
     result: app_state.OpenChatResult,
     thread_id: []const u8,
-    provider: app_state.Provider,
-    model: []const u8,
+    thread: app_state.ChatThread,
 ) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -2790,9 +2861,10 @@ fn chatOpenResultResponse(
     try s.objectField("thread_index");
     try s.write(result.thread_index);
     try s.objectField("provider");
-    try s.write(@tagName(provider));
+    try s.write(@tagName(thread.provider));
     try s.objectField("model");
-    try s.write(model);
+    if (thread.model_ref) |model| try s.write(model) else try s.write(null);
+    try writeThreadCreationSettings(&s, thread);
     try s.objectField("focused");
     try s.write(result.focused);
     try s.endObject();
@@ -3062,6 +3134,12 @@ test "live transcript response budget is bounded before JSON allocation" {
 
 test "chat open response exposes stable identifiers" {
     const allocator = std.testing.allocator;
+    var thread: app_state.ChatThread = undefined;
+    thread.provider = .codex;
+    thread.model_ref = app_state.DEFAULT_CODEX_MODEL;
+    thread.reasoning_effort = .high;
+    thread.opencode_reasoning_variant = null;
+    thread.fast_mode = .off;
     const response = try chatOpenResultResponse(
         allocator,
         .{ .integer = 9 },
@@ -3069,8 +3147,7 @@ test "chat open response exposes stable identifiers" {
         2,
         .{ .pane_id = 7, .thread_index = 3, .focused = true },
         "chat-123",
-        .cursor,
-        "composer-2",
+        thread,
     );
     defer allocator.free(response);
 
@@ -3080,9 +3157,32 @@ test "chat open response exposes stable identifiers" {
     try std.testing.expectEqualStrings("workspace-1", jsonString(result.get("workspace_id").?).?);
     try std.testing.expectEqual(@as(i64, 7), jsonInt(result.get("pane_id").?).?);
     try std.testing.expectEqualStrings("chat-123", jsonString(result.get("thread_id").?).?);
-    try std.testing.expectEqualStrings("cursor", jsonString(result.get("provider").?).?);
-    try std.testing.expectEqualStrings("composer-2", jsonString(result.get("model").?).?);
+    try std.testing.expectEqualStrings("codex", jsonString(result.get("provider").?).?);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", jsonString(result.get("model").?).?);
+    try std.testing.expectEqualStrings("high", jsonString(result.get("reasoning_effort").?).?);
+    try std.testing.expect(!(boolParam(.{ .object = result }, "fast_mode").?));
+    try std.testing.expectEqualStrings("default", jsonString(result.get("service_tier").?).?);
     try std.testing.expect(boolParam(.{ .object = result }, "focused").?);
+}
+
+test "chat open IPC parses typed creation settings without losing false" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"reasoning_effort":"medium","reasoning_variant":null,"fast_mode":false}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+    const settings = try parseChatOpenSettings(parsed.value);
+    try std.testing.expectEqual(app_state.ReasoningEffort.medium, settings.reasoning_effort.?);
+    try std.testing.expect(settings.reasoning_variant == null);
+    try std.testing.expectEqual(app_state.FastMode.off, settings.fast_mode.?);
+
+    var invalid = try std.json.parseFromSlice(std.json.Value, allocator, "{\"reasoning_effort\":\"extreme\"}", .{});
+    defer invalid.deinit();
+    try std.testing.expectError(error.InvalidReasoningEffortValue, parseChatOpenSettings(invalid.value));
 }
 
 test "GUI provider parser excludes terminal-only providers" {

@@ -2168,10 +2168,22 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
             }
         else
             null;
+        const creation_settings = liveChatOpenSettings(argv) catch |err| {
+            switch (err) {
+                error.MissingReasoningEffort => try out.stderr("--reasoning requires a value\n", .{}),
+                error.InvalidReasoningEffort => try out.stderr("invalid --reasoning value; expected one of: low, medium, high, xhigh, max\n", .{}),
+                error.MissingReasoningVariant => try out.stderr("--reasoning-variant requires a value\n", .{}),
+                error.ConflictingFastMode => try out.stderr("--fast and --no-fast cannot be used together\n", .{}),
+            }
+            std.process.exit(2);
+        };
         try sendLiveRequest(allocator, out, io, "chat.open", .{
             .workspace_id = workspace_id,
             .provider = provider,
             .model = args.optionValue(argv, "--model"),
+            .reasoning_effort = creation_settings.reasoning_effort,
+            .reasoning_variant = creation_settings.reasoning_variant,
+            .fast_mode = creation_settings.fast_mode,
             .target_pane_id = target_pane_id,
             .axis = args.optionValue(argv, "--axis") orelse "horizontal",
             .focus = !args.hasFlag(argv, "--no-focus"),
@@ -2223,6 +2235,35 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
     const method = try std.fmt.allocPrint(allocator, "chat.{s}", .{subcommand});
     defer allocator.free(method);
     try sendLiveRequest(allocator, out, io, method, commonPaneParams(argv), json);
+}
+
+const ChatOpenCreationSettings = struct {
+    reasoning_effort: ?[]const u8 = null,
+    reasoning_variant: ?[]const u8 = null,
+    fast_mode: ?bool = null,
+};
+
+fn liveChatOpenSettings(argv: []const []const u8) error{
+    MissingReasoningEffort,
+    InvalidReasoningEffort,
+    MissingReasoningVariant,
+    ConflictingFastMode,
+}!ChatOpenCreationSettings {
+    const reasoning_effort = args.optionValue(argv, "--reasoning");
+    if (args.hasFlag(argv, "--reasoning") and reasoning_effort == null) return error.MissingReasoningEffort;
+    if (reasoning_effort) |value| {
+        if (std.meta.stringToEnum(db_types.ReasoningEffort, value) == null) return error.InvalidReasoningEffort;
+    }
+    const reasoning_variant = args.optionValue(argv, "--reasoning-variant");
+    if (args.hasFlag(argv, "--reasoning-variant") and reasoning_variant == null) return error.MissingReasoningVariant;
+    const fast = args.hasFlag(argv, "--fast");
+    const no_fast = args.hasFlag(argv, "--no-fast");
+    if (fast and no_fast) return error.ConflictingFastMode;
+    return .{
+        .reasoning_effort = reasoning_effort,
+        .reasoning_variant = reasoning_variant,
+        .fast_mode = if (fast) true else if (no_fast) false else null,
+    };
 }
 
 fn handleLiveBrowser(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
@@ -3284,14 +3325,7 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTypedTool(&s, "list_panes", "List chat and terminal panes in a Verde workspace.", &.{
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
     });
-    try writeMcpTypedTool(&s, "open_chat", "Create a native GUI chat pane for a specific provider in an explicitly selected Verde workspace.", &.{
-        .{ .name = "workspace_id", .type_name = "string", .description = "Required workspace id, index, or path. Pass a stable id to avoid desktop-selection dependence.", .required = true },
-        .{ .name = "provider", .type_name = "string", .description = "GUI provider: opencode, codex, claude, or cursor.", .required = true },
-        .{ .name = "model", .type_name = "string", .description = "Optional model id; defaults to the provider's current default." },
-        .{ .name = "target_pane_id", .type_name = "integer", .description = "Optional pane beside which to place the chat; defaults to the workspace's focused pane." },
-        .{ .name = "axis", .type_name = "string", .description = "Optional split axis: horizontal or vertical; defaults to horizontal." },
-        .{ .name = "focus", .type_name = "boolean", .description = "Whether to select the workspace and focus the new chat; defaults to true." },
-    });
+    try writeMcpTypedTool(&s, "open_chat", "Create a native GUI chat pane for a specific provider in an explicitly selected Verde workspace.", &OPEN_CHAT_MCP_INPUTS);
     try writeMcpTool(&s, "list_surfaces", "List registered live terminal control surfaces. Use list_panes for ordinary Verde terminal panes.");
     try writeMcpTool(&s, "inspect_surface", "Inspect one Verde terminal surface.");
     try writeMcpTool(&s, "focus_surface", "Focus a Verde terminal surface.");
@@ -3417,6 +3451,18 @@ const McpToolInput = struct {
     required: bool = false,
 };
 
+const OPEN_CHAT_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "workspace_id", .type_name = "string", .description = "Required workspace id, index, or path. Pass a stable id to avoid desktop-selection dependence.", .required = true },
+    .{ .name = "provider", .type_name = "string", .description = "GUI provider: opencode, codex, claude, or cursor.", .required = true },
+    .{ .name = "model", .type_name = "string", .description = "Optional model id; defaults to the provider's current default." },
+    .{ .name = "reasoning_effort", .type_name = "string", .description = "Optional reasoning effort such as low, medium, or high; validated for the selected provider and model." },
+    .{ .name = "reasoning_variant", .type_name = "string", .description = "Optional provider/model-specific reasoning variant; cannot be combined with reasoning_effort." },
+    .{ .name = "fast_mode", .type_name = "boolean", .description = "Optional explicit Fast setting. Pass false to guarantee Fast is off." },
+    .{ .name = "target_pane_id", .type_name = "integer", .description = "Optional pane beside which to place the chat; defaults to the workspace's focused pane." },
+    .{ .name = "axis", .type_name = "string", .description = "Optional split axis: horizontal or vertical; defaults to horizontal." },
+    .{ .name = "focus", .type_name = "boolean", .description = "Whether to select the workspace and focus the new chat; defaults to true." },
+};
+
 fn writeMcpTypedTool(s: *std.json.Stringify, name: []const u8, description: []const u8, inputs: []const McpToolInput) !void {
     try s.beginObject();
     try s.objectField("name");
@@ -3456,6 +3502,30 @@ fn writeMcpTypedTool(s: *std.json.Stringify, name: []const u8, description: []co
     try s.write(false);
     try s.endObject();
     try s.endObject();
+}
+
+fn mcpOpenChatCreationSettings(arguments: std.json.Value) error{
+    InvalidReasoningEffortType,
+    InvalidReasoningVariantType,
+    InvalidFastModeType,
+}!ChatOpenCreationSettings {
+    const reasoning_effort = mcpArgString(arguments, "reasoning_effort");
+    if (mcpArgIsNonNull(arguments, "reasoning_effort") and reasoning_effort == null) {
+        return error.InvalidReasoningEffortType;
+    }
+    const reasoning_variant = mcpArgString(arguments, "reasoning_variant");
+    if (mcpArgIsNonNull(arguments, "reasoning_variant") and reasoning_variant == null) {
+        return error.InvalidReasoningVariantType;
+    }
+    const fast_mode = mcpArgBool(arguments, "fast_mode");
+    if (mcpArgIsNonNull(arguments, "fast_mode") and fast_mode == null) {
+        return error.InvalidFastModeType;
+    }
+    return .{
+        .reasoning_effort = reasoning_effort,
+        .reasoning_variant = reasoning_variant,
+        .fast_mode = fast_mode,
+    };
 }
 
 fn mcpToolsCall(
@@ -3593,6 +3663,11 @@ fn mcpToolsCall(
             if (mcpArgIsNonNull(arguments, "model") and model == null) {
                 return try mcpError(allocator, out, id_value, -32602, "open_chat model must be a string");
             }
+            const creation_settings = mcpOpenChatCreationSettings(arguments) catch |err| switch (err) {
+                error.InvalidReasoningEffortType => return try mcpError(allocator, out, id_value, -32602, "open_chat reasoning_effort must be a string"),
+                error.InvalidReasoningVariantType => return try mcpError(allocator, out, id_value, -32602, "open_chat reasoning_variant must be a string"),
+                error.InvalidFastModeType => return try mcpError(allocator, out, id_value, -32602, "open_chat fast_mode must be a boolean"),
+            };
             const target_pane_id = mcpArgU32(arguments, "target_pane_id");
             if (mcpArgIsNonNull(arguments, "target_pane_id") and target_pane_id == null) {
                 return try mcpError(allocator, out, id_value, -32602, "open_chat target_pane_id must be a non-negative integer");
@@ -3609,6 +3684,9 @@ fn mcpToolsCall(
                 .workspace_id = workspace_id,
                 .provider = provider,
                 .model = model,
+                .reasoning_effort = creation_settings.reasoning_effort,
+                .reasoning_variant = creation_settings.reasoning_variant,
+                .fast_mode = creation_settings.fast_mode,
                 .target_pane_id = target_pane_id,
                 .axis = axis orelse "horizontal",
                 .focus = focus orelse true,
@@ -4381,6 +4459,8 @@ fn optionConsumesValue(name: []const u8) bool {
         std.mem.eql(u8, name, "--name") or
         std.mem.eql(u8, name, "--provider") or
         std.mem.eql(u8, name, "--model") or
+        std.mem.eql(u8, name, "--reasoning") or
+        std.mem.eql(u8, name, "--reasoning-variant") or
         std.mem.eql(u8, name, "--lines") or
         std.mem.eql(u8, name, "--thread");
 }
@@ -4609,6 +4689,8 @@ fn flagIsBare(name: []const u8) bool {
         std.mem.eql(u8, name, "--json") or
         std.mem.eql(u8, name, "--focused") or
         std.mem.eql(u8, name, "--no-focus") or
+        std.mem.eql(u8, name, "--fast") or
+        std.mem.eql(u8, name, "--no-fast") or
         std.mem.eql(u8, name, "--clear") or
         std.mem.eql(u8, name, "--quiet");
 }
@@ -4625,6 +4707,65 @@ test "provider-aware chat opening is advertised by the live CLI" {
         if (std.mem.eql(u8, capability, "chat.open")) return;
     }
     return error.MissingChatOpenCapability;
+}
+
+test "live chat open parses reasoning and explicit fast mode" {
+    inline for (.{ "low", "medium", "high" }) |effort| {
+        const argv = [_][]const u8{ "chat", "open", "--reasoning", effort, "--no-fast" };
+        const settings = try liveChatOpenSettings(&argv);
+        try std.testing.expectEqualStrings(effort, settings.reasoning_effort.?);
+        try std.testing.expectEqual(false, settings.fast_mode.?);
+    }
+
+    const omitted_argv = [_][]const u8{ "chat", "open" };
+    const omitted = try liveChatOpenSettings(&omitted_argv);
+    try std.testing.expect(omitted.reasoning_effort == null);
+    try std.testing.expect(omitted.reasoning_variant == null);
+    try std.testing.expect(omitted.fast_mode == null);
+
+    const invalid_argv = [_][]const u8{ "chat", "open", "--reasoning", "extreme" };
+    try std.testing.expectError(error.InvalidReasoningEffort, liveChatOpenSettings(&invalid_argv));
+    const missing_argv = [_][]const u8{ "chat", "open", "--reasoning" };
+    try std.testing.expectError(error.MissingReasoningEffort, liveChatOpenSettings(&missing_argv));
+    const conflicting_argv = [_][]const u8{ "chat", "open", "--fast", "--no-fast" };
+    try std.testing.expectError(error.ConflictingFastMode, liveChatOpenSettings(&conflicting_argv));
+}
+
+test "MCP open_chat schema and forwarding expose creation settings" {
+    const expected = [_]struct { name: []const u8, type_name: []const u8 }{
+        .{ .name = "reasoning_effort", .type_name = "string" },
+        .{ .name = "reasoning_variant", .type_name = "string" },
+        .{ .name = "fast_mode", .type_name = "boolean" },
+    };
+    for (expected) |wanted| {
+        var found = false;
+        for (OPEN_CHAT_MCP_INPUTS) |input| {
+            if (!std.mem.eql(u8, input.name, wanted.name)) continue;
+            try std.testing.expectEqualStrings(wanted.type_name, input.type_name);
+            try std.testing.expect(!input.required);
+            found = true;
+            break;
+        }
+        try std.testing.expect(found);
+    }
+
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"reasoning_effort":"high","reasoning_variant":null,"fast_mode":false}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+    const settings = try mcpOpenChatCreationSettings(parsed.value);
+    try std.testing.expectEqualStrings("high", settings.reasoning_effort.?);
+    try std.testing.expect(settings.reasoning_variant == null);
+    try std.testing.expectEqual(false, settings.fast_mode.?);
+
+    var invalid = try std.json.parseFromSlice(std.json.Value, allocator, "{\"fast_mode\":\"false\"}", .{});
+    defer invalid.deinit();
+    try std.testing.expectError(error.InvalidFastModeType, mcpOpenChatCreationSettings(invalid.value));
 }
 
 test "workspace coordination is advertised by the live CLI" {
