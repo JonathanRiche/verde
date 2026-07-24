@@ -12,6 +12,8 @@
 import { marked, type Tokens } from 'marked'
 import type { HighlighterCore } from 'shiki/core'
 
+import { SITE_ORIGIN } from '../../lib/seo'
+
 import quickstartRaw from './quickstart.md?raw'
 import providersRaw from './providers.md?raw'
 import chatRaw from './chat.md?raw'
@@ -113,8 +115,6 @@ docs.sort((a, b) => {
 })
 
 const bySlug = new Map(docs.map((d) => [d.slug, d] as const))
-
-export const SITE_ORIGIN = 'https://verdeai.dev'
 
 export function getAllDocs(): readonly DocEntry[] {
   return docs
@@ -396,4 +396,4 @@ export function getRawMarkdown(slug: string): string | undefined {
   return bySlug.get(slug)?.raw
 }
 
-export { REPO_ROOT }
+export { REPO_ROOT, SITE_ORIGIN }

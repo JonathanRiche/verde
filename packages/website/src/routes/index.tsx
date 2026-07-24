@@ -1,7 +1,13 @@
 import { createFileRoute, getRouteApi } from '@tanstack/solid-router'
-import { For, Show, createSignal, onMount } from 'solid-js'
+import { For, Show, createSignal, onCleanup, onMount } from 'solid-js'
 
 import { availableThemes, displayedTheme, setActiveThemeSlug } from '../lib/site-theme'
+import {
+  HOME_DESCRIPTION,
+  HOME_TITLE,
+  SITE_ORIGIN,
+  SOCIAL_IMAGE_URL,
+} from '../lib/seo'
 import { themeImportCommand, themePackageUrl } from '../lib/theme-package'
 
 const rootRoute = getRouteApi('__root__')
@@ -14,7 +20,23 @@ import ampLogo from '../../../desktop/src/assets/amp-logo.png'
 import verdeLogoMask from '../../../desktop/src/assets/verde_logo_mask.png'
 import CopyButton from '../components/CopyButton'
 
-export const Route = createFileRoute('/')({ component: App })
+export const Route = createFileRoute('/')({
+  head: () => ({
+    meta: [
+      { title: HOME_TITLE },
+      { name: 'description', content: HOME_DESCRIPTION },
+      { property: 'og:type', content: 'website' },
+      { property: 'og:url', content: `${SITE_ORIGIN}/` },
+      { property: 'og:title', content: HOME_TITLE },
+      { property: 'og:description', content: HOME_DESCRIPTION },
+      { name: 'twitter:card', content: 'summary_large_image' },
+      { name: 'twitter:title', content: HOME_TITLE },
+      { name: 'twitter:description', content: HOME_DESCRIPTION },
+    ],
+    links: [{ rel: 'canonical', href: `${SITE_ORIGIN}/` }],
+  }),
+  component: App,
+})
 
 const DEFAULT_INSTALL_COMMAND = 'curl -fsSL https://verdeai.dev/install.sh | sh'
 const WINDOWS_INSTALL_COMMAND = 'irm https://verdeai.dev/install.ps1 | iex'
@@ -184,6 +206,34 @@ const stack = [
   { label: 'Omarchy themes', detail: 'colors.toml auto-detect on Linux' },
 ]
 
+const faqs = [
+  {
+    question: 'What is Verde?',
+    answer:
+      'Verde is a native desktop workspace for AI coding agents. It tiles agent chats, terminal TUIs, shell terminals, and an embedded browser in one project-scoped window.',
+  },
+  {
+    question: 'Which coding agents does Verde support?',
+    answer:
+      'Verde supports Codex, Claude Code, OpenCode, and Cursor in native GUI chat panes or terminal TUI panes. Amp runs in a terminal TUI pane.',
+  },
+  {
+    question: 'Does Verde host models or relay prompts?',
+    answer:
+      'No. Verde runs and talks to provider CLIs installed on your computer. It does not provide hosted inference or route prompts through a Verde relay.',
+  },
+  {
+    question: 'Which operating systems can run Verde?',
+    answer:
+      'Verde provides install paths for Linux, macOS, and Windows x64. Its embedded browser uses WPE WebKit on Linux, WKWebView on macOS, and WebView2 on Windows.',
+  },
+  {
+    question: 'Is Verde free and open source?',
+    answer:
+      'Yes. Verde is MIT-licensed open-source software, and its source code and releases are available on GitHub.',
+  },
+]
+
 /* ───────────────────────── Small render helpers ───────────────────────── */
 
 function CompCell(props: { value: Cell }) {
@@ -211,17 +261,75 @@ function App() {
   const savedSlug = rootRoute.useLoaderData() as () => string | null
   const theme = () => displayedTheme(savedSlug())
 
-  // Fetch every theme capture once the page is interactive so switching
-  // themes is instant instead of flashing a network load.
+  // Warm the alternate theme captures after the critical hero has had time
+  // to load, so instant theme switching does not compete with the page LCP.
   onMount(() => {
-    for (const t of availableThemes) {
-      const img = new Image()
-      img.src = t.shot
-    }
+    const timer = window.setTimeout(() => {
+      for (const t of availableThemes) {
+        if (t.slug === theme().slug) continue
+        const img = new Image()
+        img.src = t.shot
+      }
+    }, 1500)
+    onCleanup(() => window.clearTimeout(timer))
   })
+
+  const homeStructuredData = {
+    '@context': 'https://schema.org',
+    '@graph': [
+      {
+        '@type': 'SoftwareApplication',
+        '@id': `${SITE_ORIGIN}/#software`,
+        name: 'Verde',
+        url: `${SITE_ORIGIN}/`,
+        description: HOME_DESCRIPTION,
+        image: SOCIAL_IMAGE_URL,
+        applicationCategory: 'DeveloperApplication',
+        applicationSubCategory: 'AI coding agent workspace',
+        operatingSystem: ['Linux', 'macOS', 'Windows'],
+        isAccessibleForFree: true,
+        license:
+          'https://github.com/JonathanRiche/verde/blob/master/LICENSE',
+        downloadUrl: 'https://github.com/JonathanRiche/verde/releases',
+        softwareRequirements:
+          'At least one supported provider CLI installed and authenticated',
+        featureList: [
+          'Native and terminal coding-agent panes',
+          'Tiled chat, terminal, and browser workspace',
+          'Local provider CLI integrations',
+          'Scriptable local IPC',
+          'Portable themes',
+        ],
+        offers: {
+          '@type': 'Offer',
+          price: '0',
+          priceCurrency: 'USD',
+          availability: 'https://schema.org/InStock',
+          url: `${SITE_ORIGIN}/#install`,
+        },
+        publisher: { '@id': `${SITE_ORIGIN}/#organization` },
+      },
+      {
+        '@type': 'FAQPage',
+        '@id': `${SITE_ORIGIN}/#faq`,
+        mainEntity: faqs.map((faq) => ({
+          '@type': 'Question',
+          name: faq.question,
+          acceptedAnswer: {
+            '@type': 'Answer',
+            text: faq.answer,
+          },
+        })),
+      },
+    ],
+  }
 
   return (
     <main>
+      <script
+        type="application/ld+json"
+        innerHTML={JSON.stringify(homeStructuredData)}
+      />
       {/* ── Hero ── */}
       <section class="hero">
         <div class="hero-grid-bg" aria-hidden="true" />
@@ -280,6 +388,11 @@ function App() {
               src={theme().shot}
               alt="Verde desktop app with a sidebar of projects and threads, a chat pane, a terminal pane, and an Amp TUI, themed to match the selected Omarchy theme."
               class="app-screenshot"
+              width="2536"
+              height="1030"
+              loading="eager"
+              fetchpriority="high"
+              decoding="async"
             />
           </div>
         </div>
@@ -462,6 +575,10 @@ function App() {
                 src={theme().shot}
                 alt={`Verde desktop app themed by the Omarchy ${theme().name} theme.`}
                 class="theme-screenshot"
+                width="2536"
+                height="1030"
+                loading="lazy"
+                decoding="async"
               />
             </div>
 
@@ -694,8 +811,33 @@ function App() {
         </div>
       </section>
 
+      {/* ── Frequently asked questions ── */}
+      <section id="faq" class="band band-alt">
+        <div class="wrap">
+          <div class="band-header">
+            <p class="tag tag-static">Common questions</p>
+            <h2 class="heading">Verde, in plain language.</h2>
+            <p class="band-body">
+              The short version of how Verde fits into a local AI coding
+              workflow.
+            </p>
+          </div>
+
+          <dl class="faq-grid">
+            <For each={faqs}>
+              {(faq) => (
+                <div class="faq-item">
+                  <dt>{faq.question}</dt>
+                  <dd>{faq.answer}</dd>
+                </div>
+              )}
+            </For>
+          </dl>
+        </div>
+      </section>
+
       {/* ── Install ── */}
-      <section id="install" class="band band-alt">
+      <section id="install" class="band">
         <div class="wrap">
           <div class="band-header band-header--center">
             <p class="tag tag-static">Install</p>
@@ -797,6 +939,9 @@ bash ./scripts/release/install-linux-local.sh
           <div class="footer-cols">
             <div class="footer-col">
               <p class="footer-col-title">Project</p>
+              <a href="/about" class="footer-link">
+                About
+              </a>
               <a href="https://github.com/JonathanRiche/verde" target="_blank" rel="noreferrer" class="footer-link">
                 GitHub
               </a>
