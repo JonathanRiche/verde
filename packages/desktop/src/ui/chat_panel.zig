@@ -38,7 +38,8 @@ const COMPOSER_FOLLOWUP_PIN_Z: i32 = 126;
 /// Height of the pinned follow-up card shown above the composer while a reply
 /// streams and a message is queued/steered. One label line plus two prompt lines.
 const FOLLOWUP_PIN_HEIGHT: f32 = 60.0;
-const APPROVAL_CARD_HEIGHT: f32 = 112.0;
+const BANG_MODE_BANNER_HEIGHT: f32 = 54.0;
+const APPROVAL_CARD_HEIGHT: f32 = 164.0;
 /// File mention search must sit above composer chrome and toolbar menus.
 const COMPOSER_FILE_SEARCH_Z: i32 = 150;
 /// Must match `PaletteComposerPrompt` `pill_padding_x` in `state.zig` so toolbar glyphs align with label insets.
@@ -98,6 +99,10 @@ const DiffLayoutHit = struct {
 const MAX_DIFF_LAYOUT_HITS = 32;
 var diff_layout_hit_count: usize = 0;
 var diff_layout_hits: [MAX_DIFF_LAYOUT_HITS]DiffLayoutHit = [_]DiffLayoutHit{.{}} ** MAX_DIFF_LAYOUT_HITS;
+const MAX_BANG_RETRY_HITS = 64;
+const BangRetryHit = struct { rect: palette.Rect = .{}, command: []const u8 = "" };
+var bang_retry_hit_count: usize = 0;
+var bang_retry_hits: [MAX_BANG_RETRY_HITS]BangRetryHit = [_]BangRetryHit{.{}} ** MAX_BANG_RETRY_HITS;
 
 /// Geometry of the transcript scrollbar from the last paint. Captured during
 /// render so the mouse handlers can do hit-testing without rebuilding the
@@ -177,6 +182,7 @@ pub fn resetTranscriptHitCache() void {
     usage_action_hit_count = 0;
     diff_file_open_hit_count = 0;
     diff_layout_hit_count = 0;
+    bang_retry_hit_count = 0;
 }
 
 pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
@@ -266,6 +272,11 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
         theme.scaledUi(12.0) + @as(f32, @floatFromInt(attachment_rows)) * theme.scaledUi(74.0)
     else
         0.0;
+    const bang_mode = live_composer and state.composerInBangCommandMode();
+    const bang_mode_reserve = if (bang_mode)
+        theme.scaledUi(BANG_MODE_BANNER_HEIGHT) + theme.scaledUi(8.0)
+    else
+        0.0;
 
     // Pin the queued/steered follow-up just above the composer (AMP-TUI style) so
     // every provider gets a visible "this is waiting to send" affordance, not just
@@ -295,7 +306,7 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
         .x = rect.x,
         .y = header.y + header.h,
         .w = rect.w,
-        .h = @max(composer_y - (header.y + header.h) - attachment_reserve - followup_reserve - approval_reserve, theme.scaledUi(120.0)),
+        .h = @max(composer_y - (header.y + header.h) - attachment_reserve - bang_mode_reserve - followup_reserve - approval_reserve, theme.scaledUi(120.0)),
     };
 
     const browser_visible = state.isBrowserVisible() and pane_id == null;
@@ -352,6 +363,15 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
     } else {
         renderInactiveComposer(state, composer_rect);
     }
+    if (bang_mode) {
+        const banner_rect = palette.Rect{
+            .x = composer_rect.x,
+            .y = composer_rect.y - theme.scaledUi(BANG_MODE_BANNER_HEIGHT) - theme.scaledUi(8.0),
+            .w = composer_rect.w,
+            .h = theme.scaledUi(BANG_MODE_BANNER_HEIGHT),
+        };
+        renderBangModeBanner(state, banner_rect);
+    }
 
     // The pin sits above the composer and any draft-image attachments, in the
     // strip reserved by `followup_reserve`. Bottom edge clears the attachments.
@@ -359,7 +379,7 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
         if (followup_pin) |fp| {
             const pin_rect = palette.Rect{
                 .x = composer_rect.x,
-                .y = composer_rect.y - attachment_reserve - theme.scaledUi(FOLLOWUP_PIN_HEIGHT) - theme.scaledUi(8.0),
+                .y = composer_rect.y - bang_mode_reserve - attachment_reserve - theme.scaledUi(FOLLOWUP_PIN_HEIGHT) - theme.scaledUi(8.0),
                 .w = composer_rect.w,
                 .h = theme.scaledUi(FOLLOWUP_PIN_HEIGHT),
             };
@@ -375,7 +395,7 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
     if (pending_approval) |approval| {
         const card_rect = palette.Rect{
             .x = composer_rect.x,
-            .y = composer_rect.y - attachment_reserve - followup_reserve - theme.scaledUi(APPROVAL_CARD_HEIGHT) - theme.scaledUi(8.0),
+            .y = composer_rect.y - bang_mode_reserve - attachment_reserve - followup_reserve - theme.scaledUi(APPROVAL_CARD_HEIGHT) - theme.scaledUi(8.0),
             .w = composer_rect.w,
             .h = theme.scaledUi(APPROVAL_CARD_HEIGHT),
         };
@@ -573,6 +593,7 @@ const TranscriptAction = union(enum) {
     usage,
     diff_file_open: []const u8,
     diff_layout: bool,
+    retry_command: []const u8,
 };
 
 fn transcriptActionAt(x: f32, y: f32) ?TranscriptAction {
@@ -589,6 +610,11 @@ fn transcriptActionAt(x: f32, y: f32) ?TranscriptAction {
     while (index < diff_layout_hit_count) : (index += 1) {
         const hit = diff_layout_hits[index];
         if (rectContains(hit.rect, x, y)) return .{ .diff_layout = hit.split };
+    }
+    index = 0;
+    while (index < bang_retry_hit_count) : (index += 1) {
+        const hit = bang_retry_hits[index];
+        if (rectContains(hit.rect, x, y)) return .{ .retry_command = hit.command };
     }
     return null;
 }
@@ -624,6 +650,21 @@ test "transcript action hit testing preserves usage and diff open actions" {
     const layout = transcriptActionAt(230.0, 234.0) orelse return error.TestExpectedEqual;
     switch (layout) {
         .diff_layout => |split| try std.testing.expect(split),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "transcript action hit testing exposes bang command retry" {
+    resetTranscriptHitCache();
+    defer resetTranscriptHitCache();
+    bang_retry_hits[0] = .{
+        .rect = .{ .x = 20.0, .y = 30.0, .w = 60.0, .h = 24.0 },
+        .command = "zig build test",
+    };
+    bang_retry_hit_count = 1;
+    const action = transcriptActionAt(40.0, 40.0) orelse return error.TestExpectedEqual;
+    switch (action) {
+        .retry_command => |command| try std.testing.expectEqualStrings("zig build test", command),
         else => return error.TestExpectedEqual,
     }
 }
@@ -1057,6 +1098,7 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
                 .usage => _ = state.showCurrentProviderUsage(),
                 .diff_file_open => |path| state.openTranscriptFileReference(path),
                 .diff_layout => |split| state.setDiffLayoutPreference(if (split) .split else .stacked),
+                .retry_command => |command| state.retryBangCommand(command),
             }
             return true;
         }
@@ -1109,7 +1151,7 @@ fn renderApprovalCard(state: *app_state.AppState, rect: palette.Rect, approval: 
     queueRounded(state, rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(12.0));
     queueBorder(state, rect, paletteColor(theme.COLOR_GREEN), theme.scaledUi(12.0), theme.scaledUi(1.0));
     queueText(state, .{ .x = rect.x + pad, .y = rect.y + theme.scaledUi(12.0), .w = rect.w - pad * 2.0, .h = theme.scaledUi(20.0) }, approval.title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), rect);
-    queueText(state, .{ .x = rect.x + pad, .y = rect.y + theme.scaledUi(38.0), .w = @max(rect.w - pad * 2.0 - button_w * 2.0 - gap - theme.scaledUi(16.0), theme.scaledUi(80.0)), .h = theme.scaledUi(44.0) }, approval.body, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), rect);
+    queueText(state, .{ .x = rect.x + pad, .y = rect.y + theme.scaledUi(38.0), .w = rect.w - pad * 2.0, .h = @max(rect.h - button_h - pad * 2.0 - theme.scaledUi(42.0), theme.scaledUi(44.0)) }, approval.body, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), rect);
 
     const deny_rect = palette.Rect{ .x = rect.x + rect.w - pad - button_w * 2.0 - gap, .y = rect.y + rect.h - pad - button_h, .w = button_w, .h = button_h };
     const approve_rect = palette.Rect{ .x = deny_rect.x + button_w + gap, .y = deny_rect.y, .w = button_w, .h = button_h };
@@ -2143,7 +2185,10 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
     }
 
     var status_buf: [40]u8 = undefined;
-    const working_label = formatPendingWorkingLabel(&status_buf, send_state.started_at_ms, send_state.thinking);
+    const working_label = if (send_state.local_command)
+        formatPendingCommandLabel(&status_buf, send_state.started_at_ms)
+    else
+        formatPendingWorkingLabel(&status_buf, send_state.started_at_ms, send_state.thinking);
     const stream_text: []const u8 = send_state.partial_text.items;
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
     const stream_plain = stream_text.len > 0;
@@ -2173,6 +2218,12 @@ fn formatPendingWorkingLabel(buf: []u8, started_at_ms: i64, thinking: bool) []co
         return std.fmt.bufPrint(buf, "{s} - {d}:{d:0>2}:{d:0>2}", .{ verb, hours, minutes, seconds }) catch "Working - 0:00";
     }
     return std.fmt.bufPrint(buf, "{s} - {d}:{d:0>2}", .{ verb, minutes, seconds }) catch "Working - 0:00";
+}
+
+fn formatPendingCommandLabel(buf: []u8, started_at_ms: i64) []const u8 {
+    const elapsed_ms = @max(unixTimestampMs() - @max(started_at_ms, 0), 0);
+    const total_seconds: u64 = @intCast(@divTrunc(elapsed_ms, std.time.ms_per_s));
+    return std.fmt.bufPrint(buf, "Running command - {d}:{d:0>2}", .{ total_seconds / 60, total_seconds % 60 }) catch "Running command";
 }
 
 fn isCommandSystemEvent(author: []const u8) bool {
@@ -4226,6 +4277,9 @@ fn renderCommandEventRow(
 
     const text_x = status_cx + status_dia * 0.5 + theme.scaledUi(10.0);
     const backgrounded = std.mem.eql(u8, original_author, "Backgrounded command");
+    const local_bang = (std.mem.eql(u8, original_author, "Ran command") or std.mem.eql(u8, original_author, "Command failed")) and std.mem.startsWith(u8, body, "$ ");
+    const command_end = std.mem.indexOfScalar(u8, body, '\n') orelse body.len;
+    const retry_command = if (local_bang) std.mem.trim(u8, body[2..command_end], " \t\r") else "";
     const action_w = theme.scaledUi(58.0);
     const action_gap = theme.scaledUi(6.0);
     const show_output = backgrounded and bubble.w >= theme.scaledUi(330.0);
@@ -4246,14 +4300,20 @@ fn renderCommandEventRow(
         .w = copy_w,
         .h = copy_h,
     });
-    const output_right = if (show_copy) copy_rect.x - action_gap else if (stop_visible) stop_rect.x - action_gap else action_right;
+    const retry_rect = snapRect(palette.Rect{
+        .x = (if (show_copy) copy_rect.x else copy_right) - action_gap - action_w,
+        .y = stop_rect.y,
+        .w = action_w,
+        .h = copy_h,
+    });
+    const output_right = if (local_bang) retry_rect.x - action_gap else if (show_copy) copy_rect.x - action_gap else if (stop_visible) stop_rect.x - action_gap else action_right;
     const output_rect = snapRect(palette.Rect{
         .x = output_right - action_w,
         .y = stop_rect.y,
         .w = action_w,
         .h = copy_h,
     });
-    const leftmost_action_x = if (show_output) output_rect.x else if (show_copy) copy_rect.x else stop_rect.x;
+    const leftmost_action_x = if (show_output) output_rect.x else if (local_bang) retry_rect.x else if (show_copy) copy_rect.x else stop_rect.x;
     const text_right = leftmost_action_x - copy_gap;
     const text_w = @max(text_right - text_x, theme.scaledUi(40.0));
     const header_text_clip = intersectClipRect(clip, .{
@@ -4286,6 +4346,21 @@ fn renderCommandEventRow(
             .h = copy_label_h,
         }, "Copy", paletteColor(copy_text_color), theme.scaledUi(11.5), clip);
         state.recordTranscriptCopyHit(copy_rect, copy_payload, toolCopyIdentity(message_index, copy_payload));
+    }
+
+    if (local_bang and retry_command.len > 0) {
+        const retry_hovered = rectContains(retry_rect, state.palette_mouse_x, state.palette_mouse_y);
+        queueRoundedClipped(state, retry_rect, paletteColor(if (retry_hovered) theme.withAlpha(theme.COLOR_GREEN, 72) else theme.withAlpha(theme.COLOR_PANEL_MUTED, 86)), theme.scaledUi(5.0), clip);
+        queueFixedTextLine(state, .{
+            .x = retry_rect.x + theme.scaledUi(8.0),
+            .y = retry_rect.y + (retry_rect.h - copy_label_h) * 0.5,
+            .w = retry_rect.w - theme.scaledUi(16.0),
+            .h = copy_label_h,
+        }, "Retry", paletteColor(if (retry_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(11.5), clip);
+        if (bang_retry_hit_count < bang_retry_hits.len) {
+            bang_retry_hits[bang_retry_hit_count] = .{ .rect = retry_rect, .command = retry_command };
+            bang_retry_hit_count += 1;
+        }
     }
 
     if (backgrounded) {
@@ -5207,6 +5282,10 @@ fn renderComposerDraftImage(state: *app_state.AppState) void {
     const preview_w = @min(max_preview_w, (composer.w - theme.scaledUi(48.0) - gap) * 0.5);
     const per_row: usize = if (composer.w >= theme.scaledUi(700.0)) 2 else 1;
     const start_x = composer.x + theme.scaledUi(24.0);
+    const top_offset = if (state.composerInBangCommandMode())
+        theme.scaledUi(BANG_MODE_BANNER_HEIGHT) + theme.scaledUi(8.0)
+    else
+        0.0;
     const rows = (count + per_row - 1) / per_row;
     var index: usize = 0;
     while (index < count) : (index += 1) {
@@ -5215,12 +5294,57 @@ fn renderComposerDraftImage(state: *app_state.AppState) void {
         const col = index % per_row;
         const preview = palette.Rect{
             .x = start_x + @as(f32, @floatFromInt(col)) * (preview_w + gap),
-            .y = composer.y - @as(f32, @floatFromInt(rows - row)) * (preview_h + gap),
+            .y = composer.y - top_offset - @as(f32, @floatFromInt(rows - row)) * (preview_h + gap),
             .w = preview_w,
             .h = preview_h,
         };
         renderComposerDraftImageChip(state, image.*, index, preview, thumb_max);
     }
+}
+
+// Shell-mode banner above the composer, making local command execution explicit.
+fn renderBangModeBanner(state: *app_state.AppState, rect: palette.Rect) void {
+    const radius = theme.scaledUi(10.0);
+    queuePanel(
+        state,
+        rect,
+        paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 248)),
+        paletteColor(theme.withAlpha(theme.COLOR_GREEN, 185)),
+        radius,
+        @max(theme.scaledUi(1.0), 1.0),
+    );
+
+    const pad = theme.scaledUi(14.0);
+    const title_font = theme.scaledUi(12.5);
+    queueText(state, .{
+        .x = rect.x + pad,
+        .y = rect.y + theme.scaledUi(7.0),
+        .w = @max(rect.w - pad * 2.0 - theme.scaledUi(150.0), theme.scaledUi(80.0)),
+        .h = theme.scaledUi(17.0),
+    }, ">_  SHELL COMMAND", paletteColor(theme.COLOR_GREEN), title_font, rect);
+
+    const escape_hint = "Esc: return to chat";
+    const escape_w = theme.scaledUi(132.0);
+    if (rect.w >= theme.scaledUi(360.0)) {
+        queueText(state, .{
+            .x = rect.x + rect.w - pad - escape_w,
+            .y = rect.y + theme.scaledUi(7.0),
+            .w = escape_w,
+            .h = theme.scaledUi(17.0),
+        }, escape_hint, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(11.5), rect);
+    }
+
+    var detail_buffer: [512]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buffer, "{s}  ·  {s}  ·  everything after ! runs in the shell  ·  !! sends a literal !", .{
+        state.bangCommandShellName(),
+        state.currentWorkspacePath(),
+    }) catch "Everything after ! runs in the shell";
+    queueText(state, .{
+        .x = rect.x + pad,
+        .y = rect.y + theme.scaledUi(29.0),
+        .w = rect.w - pad * 2.0,
+        .h = theme.scaledUi(17.0),
+    }, detail, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(11.5), rect);
 }
 
 fn renderComposerDraftImageChip(state: *app_state.AppState, image: app_state.ChatImageAttachment, index: usize, preview: palette.Rect, thumb_max: f32) void {
