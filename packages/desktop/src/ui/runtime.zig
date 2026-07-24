@@ -16,6 +16,8 @@ pub const WorkspaceNode = native_state.WorkspaceNode;
 pub const WorkspacePaneId = native_state.WorkspacePaneId;
 pub const WorkspacePaneKind = native_state.WorkspacePaneKind;
 pub const WorkspaceSplitAxis = native_state.WorkspaceSplitAxis;
+pub const FloatingPaneGeometry = native_state.FloatingPaneGeometry;
+pub const FloatingQuickPane = native_state.FloatingQuickPane;
 
 pub const ChangedFileEntry = struct {
     path: []const u8,

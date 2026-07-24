@@ -2789,12 +2789,34 @@ pub const WorkspaceNode = union(enum) {
     },
 };
 
+pub const FloatingPaneGeometry = struct {
+    /// Normalized workspace coordinates keep the pane usable across DPI and
+    /// window-size changes. Rendering applies the final minimum-size clamp.
+    x: f32 = 0.18,
+    y: f32 = 0.14,
+    w: f32 = 0.64,
+    h: f32 = 0.68,
+};
+
+pub const FloatingQuickPane = struct {
+    pane_id: WorkspacePaneId,
+    geometry: FloatingPaneGeometry = .{},
+    visible: bool = true,
+    maximized: bool = false,
+    pinned: bool = false,
+    /// Detached quick panes are session-backed leaves that intentionally do
+    /// not participate in the tiled root until Return to Tile is requested.
+    detached: bool = false,
+    return_focus_pane_id: ?WorkspacePaneId = null,
+};
+
 pub const WorkspaceLayout = struct {
     next_pane_id: WorkspacePaneId = 1,
     root: ?*WorkspaceNode = null,
     panes: std.ArrayList(WorkspacePane) = .empty,
     focused_pane_id: ?WorkspacePaneId = null,
     maximized_pane_id: ?WorkspacePaneId = null,
+    quick_pane: ?FloatingQuickPane = null,
 
     fn initDefaultChat(allocator: std.mem.Allocator) !WorkspaceLayout {
         var layout: WorkspaceLayout = .{};
@@ -2829,6 +2851,18 @@ pub const WorkspaceLayout = struct {
 
     fn repairVisibleRoot(self: *WorkspaceLayout, allocator: std.mem.Allocator) !bool {
         var changed = false;
+        // Early floating-pane builds persisted the quick pane inside the tiled
+        // root and rendered it again as an overlay. Migrate that representation
+        // before normal root repair so reopening a workspace cannot recreate
+        // the duplicate pane underneath.
+        if (self.quick_pane) |quick| {
+            if (!quick.detached and self.rootContainsPane(quick.pane_id) and self.visiblePaneCount() > 1) {
+                if (self.root) |root_node| self.root = removePaneFromTree(allocator, root_node, quick.pane_id);
+                self.quick_pane.?.detached = true;
+                self.quick_pane.?.return_focus_pane_id = self.firstVisiblePaneId();
+                changed = true;
+            }
+        }
         if (self.root) |root_node| {
             const repaired = pruneRootToVisiblePanes(allocator, self, root_node);
             self.root = repaired.node;
@@ -2842,6 +2876,9 @@ pub const WorkspaceLayout = struct {
         }
         for (self.panes.items) |pane| {
             if (self.rootContainsPane(pane.id)) continue;
+            if (self.quick_pane) |quick| {
+                if (quick.detached and quick.pane_id == pane.id) continue;
+            }
             try self.ensurePaneInRootSplit(allocator, pane.id, .horizontal, 0.64);
             changed = true;
         }
@@ -2860,11 +2897,18 @@ pub const WorkspaceLayout = struct {
                 changed = true;
             }
         }
+        if (self.quick_pane) |quick| {
+            if (self.paneById(quick.pane_id) == null) {
+                self.quick_pane = null;
+                changed = true;
+            }
+        }
         return changed;
     }
 
     fn firstVisiblePaneId(self: *const WorkspaceLayout) ?WorkspacePaneId {
-        return if (self.panes.items.len > 0) self.panes.items[0].id else null;
+        const root_node = self.root orelse return null;
+        return self.edgeVisiblePaneId(root_node, false);
     }
 
     pub fn paneById(self: *const WorkspaceLayout, pane_id: WorkspacePaneId) ?*const WorkspacePane {
@@ -2883,6 +2927,7 @@ pub const WorkspaceLayout = struct {
 
     fn visibleChatPaneIdForThread(self: *const WorkspaceLayout, thread_index: usize) ?WorkspacePaneId {
         for (self.panes.items) |pane| {
+            if (!self.rootContainsPane(pane.id)) continue;
             switch (pane.ref) {
                 .chat => |ref| if (ref.thread_index == thread_index) return pane.id,
                 else => {},
@@ -2917,6 +2962,7 @@ pub const WorkspaceLayout = struct {
 
     fn visibleTerminalPaneIdForDock(self: *const WorkspaceLayout, dock_id: u32) ?WorkspacePaneId {
         for (self.panes.items) |pane| {
+            if (!self.rootContainsPane(pane.id)) continue;
             switch (pane.ref) {
                 .terminal => |ref| if (ref.dock_id == dock_id) return pane.id,
                 else => {},
@@ -2948,7 +2994,8 @@ pub const WorkspaceLayout = struct {
     }
 
     fn visiblePaneCount(self: *const WorkspaceLayout) usize {
-        return self.panes.items.len;
+        const root_node = self.root orelse return 0;
+        return countWorkspaceNodeLeaves(root_node);
     }
 
     fn gridNewPanePlacement(self: *const WorkspaceLayout) ?WorkspacePanePlacement {
@@ -3037,6 +3084,7 @@ pub const WorkspaceLayout = struct {
 
     fn hasVisiblePaneKind(self: *const WorkspaceLayout, kind: WorkspacePaneKind) bool {
         for (self.panes.items) |pane| {
+            if (!self.rootContainsPane(pane.id)) continue;
             switch (pane.ref) {
                 .chat => if (kind == .chat) return true,
                 .terminal => if (kind == .terminal) return true,
@@ -3044,6 +3092,17 @@ pub const WorkspaceLayout = struct {
             }
         }
         return false;
+    }
+
+    fn hasVisibleQuickPaneKind(self: *const WorkspaceLayout, kind: WorkspacePaneKind) bool {
+        const quick = self.quick_pane orelse return false;
+        if (!quick.visible) return false;
+        const pane = self.paneById(quick.pane_id) orelse return false;
+        return switch (pane.ref) {
+            .chat => kind == .chat,
+            .terminal => kind == .terminal,
+            .browser => kind == .browser,
+        };
     }
 
     fn visibleBrowserPaneId(self: *const WorkspaceLayout) ?WorkspacePaneId {
@@ -3222,6 +3281,9 @@ pub const WorkspaceLayout = struct {
         _ = self.panes.orderedRemove(pane_index);
         if (self.focused_pane_id == pane_id) self.focused_pane_id = self.firstVisiblePaneId();
         if (self.maximized_pane_id == pane_id) self.maximized_pane_id = null;
+        if (self.quick_pane) |quick| {
+            if (quick.pane_id == pane_id) self.quick_pane = null;
+        }
         return removed_ref;
     }
 
@@ -3306,6 +3368,33 @@ pub const WorkspaceLayout = struct {
         try stringify.objectField("maximized");
         if (self.maximized_pane_id) |pane_id| {
             try stringify.write(pane_id);
+        } else {
+            try stringify.write(null);
+        }
+        try stringify.objectField("quick");
+        if (self.quick_pane) |quick| {
+            try stringify.beginObject();
+            try stringify.objectField("pane");
+            try stringify.write(quick.pane_id);
+            try stringify.objectField("x");
+            try stringify.write(quick.geometry.x);
+            try stringify.objectField("y");
+            try stringify.write(quick.geometry.y);
+            try stringify.objectField("w");
+            try stringify.write(quick.geometry.w);
+            try stringify.objectField("h");
+            try stringify.write(quick.geometry.h);
+            try stringify.objectField("visible");
+            try stringify.write(quick.visible);
+            try stringify.objectField("maximized");
+            try stringify.write(quick.maximized);
+            try stringify.objectField("pinned");
+            try stringify.write(quick.pinned);
+            try stringify.objectField("detached");
+            try stringify.write(quick.detached);
+            try stringify.objectField("return_focus");
+            if (quick.return_focus_pane_id) |pane_id| try stringify.write(pane_id) else try stringify.write(null);
+            try stringify.endObject();
         } else {
             try stringify.write(null);
         }
@@ -3398,6 +3487,26 @@ pub const WorkspaceLayout = struct {
         next_layout.next_pane_id = @intCast(jsonInt(root_value.object.get("next") orelse .null) orelse 1);
         next_layout.focused_pane_id = if (jsonInt(root_value.object.get("focused") orelse .null)) |id| @intCast(id) else null;
         next_layout.maximized_pane_id = if (jsonInt(root_value.object.get("maximized") orelse .null)) |id| @intCast(id) else null;
+        if (root_value.object.get("quick")) |quick_value| {
+            if (quick_value == .object) {
+                if (jsonInt(quick_value.object.get("pane") orelse .null)) |pane_id| {
+                    next_layout.quick_pane = .{
+                        .pane_id = @intCast(pane_id),
+                        .geometry = .{
+                            .x = jsonFloat(quick_value.object.get("x") orelse .null) orelse 0.18,
+                            .y = jsonFloat(quick_value.object.get("y") orelse .null) orelse 0.14,
+                            .w = jsonFloat(quick_value.object.get("w") orelse .null) orelse 0.64,
+                            .h = jsonFloat(quick_value.object.get("h") orelse .null) orelse 0.68,
+                        },
+                        .visible = jsonBool(quick_value.object.get("visible") orelse .null) orelse false,
+                        .maximized = jsonBool(quick_value.object.get("maximized") orelse .null) orelse false,
+                        .pinned = jsonBool(quick_value.object.get("pinned") orelse .null) orelse false,
+                        .detached = jsonBool(quick_value.object.get("detached") orelse .null) orelse false,
+                        .return_focus_pane_id = if (jsonInt(quick_value.object.get("return_focus") orelse .null)) |id| @intCast(id) else null,
+                    };
+                }
+            }
+        }
 
         for (panes_value.array.items) |pane_value| {
             if (pane_value != .object) continue;
@@ -3555,6 +3664,13 @@ pub const WorkspaceLayout = struct {
         return switch (node.*) {
             .leaf => |leaf_id| leaf_id == pane_id,
             .split => |split| nodeContainsPane(split.first, pane_id) or nodeContainsPane(split.second, pane_id),
+        };
+    }
+
+    fn countWorkspaceNodeLeaves(node: *const WorkspaceNode) usize {
+        return switch (node.*) {
+            .leaf => 1,
+            .split => |split| countWorkspaceNodeLeaves(split.first) + countWorkspaceNodeLeaves(split.second),
         };
     }
 
@@ -11232,9 +11348,31 @@ pub const AppState = struct {
 
     fn focusWorkspaceOpenPaneWithZoom(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, preserve_zoom: bool) void {
         if (project_index >= self.projects.items.len) return;
+        const previous_project_index = self.selected_project_index;
+        if (preserve_zoom and previous_project_index < self.projects.items.len and previous_project_index != project_index) {
+            const previous_layout = &self.projects.items[previous_project_index].workspace_layout;
+            if (previous_layout.quick_pane) |*quick| quick.visible = false;
+        }
         self.selected_project_index = project_index;
         var project = &self.projects.items[project_index];
         var layout = &project.workspace_layout;
+        if (layout.quick_pane) |*quick| {
+            if (quick.detached and quick.pane_id == pane_id) {
+                quick.visible = true;
+                layout.focused_pane_id = pane_id;
+                self.restorePersistedBrowserPaneAfterProjectSelection(project_index);
+                _ = self.focusWorkspacePane(project_index, pane_id);
+                self.markDirty();
+                return;
+            }
+            // A sidebar selection is explicit navigation away from the quick
+            // pane. Minimize its overlay without destroying the pane/session,
+            // and remember the selected tiled pane for the next toggle-away.
+            if (preserve_zoom and quick.visible) {
+                quick.visible = false;
+                if (layout.rootContainsPane(pane_id)) quick.return_focus_pane_id = pane_id;
+            }
+        }
         const was_maximized = layout.maximized_pane_id != null;
         var target: ?*WorkspacePane = null;
         for (layout.panes.items) |*pane| {
@@ -12794,7 +12932,9 @@ pub const AppState = struct {
     pub fn isTerminalVisible(self: *const AppState) bool {
         if (self.projects.items.len == 0) return false;
         const project = self.currentProject();
-        return project.terminal_dock.visible or project.workspace_layout.hasVisiblePaneKind(.terminal);
+        return project.terminal_dock.visible or
+            project.workspace_layout.hasVisiblePaneKind(.terminal) or
+            project.workspace_layout.hasVisibleQuickPaneKind(.terminal);
     }
 
     pub fn shouldRenderLegacyTerminalDockInChat(self: *const AppState) bool {
@@ -14025,7 +14165,12 @@ pub const AppState = struct {
     }
 
     fn browserBlockedByPaletteOverlay(self: *const AppState) bool {
-        return self.show_project_creator or
+        const quick_blocks_browser = if (self.currentProjectQuickPane()) |quick| blk: {
+            const kind = self.workspacePaneKindById(quick.pane_id);
+            break :blk quick.visible and (kind == null or kind.? != .browser);
+        } else false;
+        return quick_blocks_browser or
+            self.show_project_creator or
             self.show_settings_modal or
             self.handoff_modal_open or
             self.rename_project_index != null or
@@ -15599,6 +15744,187 @@ pub const AppState = struct {
         const pane_id = layout.maximized_pane_id orelse return null;
         _ = layout.paneById(pane_id) orelse return null;
         return pane_id;
+    }
+
+    pub fn currentProjectQuickPane(self: *const AppState) ?FloatingQuickPane {
+        if (self.projects.items.len == 0) return null;
+        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const quick = layout.quick_pane orelse return null;
+        _ = layout.paneById(quick.pane_id) orelse return null;
+        return quick;
+    }
+
+    pub fn floatFocusedWorkspacePane(self: *AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const pane_id = layout.focused_pane_id orelse return false;
+        if (layout.paneById(pane_id) == null) return false;
+        if (layout.quick_pane) |quick| {
+            if (quick.pane_id == pane_id and quick.detached) {
+                layout.quick_pane.?.visible = true;
+                _ = self.focusCurrentProjectWorkspacePane(pane_id);
+                self.markDirty();
+                return true;
+            }
+            if (quick.pane_id != pane_id) {
+                if (!self.returnCurrentProjectQuickPaneToTile()) return false;
+                layout = &self.projects.items[self.selected_project_index].workspace_layout;
+            }
+        }
+        if (!layout.rootContainsPane(pane_id)) {
+            layout.quick_pane = .{ .pane_id = pane_id, .visible = true, .detached = true, .return_focus_pane_id = layout.firstVisiblePaneId() };
+        } else {
+            if (layout.visiblePaneCount() <= 1) {
+                self.setSidebarNotice("Add another tiled pane before floating this one.");
+                return false;
+            }
+            if (layout.root) |root_node| layout.root = WorkspaceLayout.removePaneFromTree(self.allocator, root_node, pane_id);
+            layout.quick_pane = .{
+                .pane_id = pane_id,
+                .detached = true,
+                .return_focus_pane_id = layout.firstVisiblePaneId(),
+            };
+        }
+        self.markDirty();
+        return true;
+    }
+
+    pub fn toggleCurrentProjectQuickPane(self: *AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        if (layout.quick_pane == null) return self.createFloatingQuickTerminal();
+        if (!layout.quick_pane.?.detached and layout.rootContainsPane(layout.quick_pane.?.pane_id)) {
+            if (layout.visiblePaneCount() <= 1) return false;
+            const quick_pane_id = layout.quick_pane.?.pane_id;
+            if (layout.root) |root_node| layout.root = WorkspaceLayout.removePaneFromTree(self.allocator, root_node, quick_pane_id);
+            layout.quick_pane.?.detached = true;
+            layout.quick_pane.?.return_focus_pane_id = layout.firstVisiblePaneId();
+        }
+        layout.quick_pane.?.visible = !layout.quick_pane.?.visible;
+        if (layout.quick_pane.?.visible) {
+            _ = self.focusCurrentProjectWorkspacePane(layout.quick_pane.?.pane_id);
+        } else {
+            self.restoreFocusBehindQuickPane(layout.quick_pane.?);
+        }
+        self.markDirty();
+        return true;
+    }
+
+    fn createFloatingQuickTerminal(self: *AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        const project_index = self.selected_project_index;
+        self.ensureCurrentProjectWorkspace();
+        const return_focus_pane_id = self.projects.items[project_index].workspace_layout.focused_pane_id;
+
+        const dock_id = self.createProjectTerminalDock(project_index) catch |err| {
+            log.err("failed to allocate quick terminal dock: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to create quick terminal.");
+            return false;
+        };
+        self.restartTerminalDockForWorkspace(project_index, dock_id) catch |err| {
+            log.err("failed to start quick terminal dock: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to start quick terminal.");
+            return false;
+        };
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
+        var layout = &self.projects.items[project_index].workspace_layout;
+        const pane_id = layout.createTerminalPane(self.allocator, dock_id) catch |err| {
+            log.err("failed to create floating quick terminal pane: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to create quick terminal.");
+            return false;
+        };
+        layout.quick_pane = .{
+            .pane_id = pane_id,
+            .detached = true,
+            .return_focus_pane_id = return_focus_pane_id,
+        };
+        layout.focused_pane_id = pane_id;
+        dock.visible = false;
+        self.requestTerminalDockFocus(dock_id);
+        self.setSidebarNotice("Quick terminal ready.");
+        self.markDirty();
+        return true;
+    }
+
+    fn restoreFocusBehindQuickPane(self: *AppState, quick: FloatingQuickPane) void {
+        if (quick.return_focus_pane_id) |pane_id| {
+            const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+            if (layout.rootContainsPane(pane_id)) {
+                _ = self.focusCurrentProjectWorkspacePane(pane_id);
+                return;
+            }
+        }
+        self.unfocusBrowserPane();
+        self.terminal_focused = false;
+    }
+
+    pub fn minimizeCurrentProjectQuickPane(self: *AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const quick = if (layout.quick_pane) |*value| value else return false;
+        quick.visible = false;
+        self.restoreFocusBehindQuickPane(quick.*);
+        self.markDirty();
+        return true;
+    }
+
+    pub fn toggleCurrentProjectQuickPaneMaximized(self: *AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const quick = if (layout.quick_pane) |*value| value else return false;
+        quick.visible = true;
+        quick.maximized = !quick.maximized;
+        self.markDirty();
+        return true;
+    }
+
+    pub fn toggleCurrentProjectQuickPanePinned(self: *AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const quick = if (layout.quick_pane) |*value| value else return false;
+        quick.pinned = !quick.pinned;
+        quick.visible = true;
+        self.markDirty();
+        return true;
+    }
+
+    pub fn returnCurrentProjectQuickPaneToTile(self: *AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const quick = layout.quick_pane orelse return false;
+        if (quick.detached) {
+            const target_pane_id = if (quick.return_focus_pane_id) |pane_id|
+                if (layout.rootContainsPane(pane_id)) pane_id else layout.firstVisiblePaneId()
+            else
+                layout.firstVisiblePaneId();
+            if (target_pane_id) |target| {
+                layout.splitPaneWithLeaf(self.allocator, target, quick.pane_id, .horizontal, true) catch |err| {
+                    log.err("failed to return quick pane to tiled layout: {s}", .{@errorName(err)});
+                    self.setSidebarNotice("Failed to tile quick pane.");
+                    return false;
+                };
+            } else {
+                layout.root = WorkspaceLayout.createLeafNode(self.allocator, quick.pane_id) catch return false;
+            }
+        }
+        layout.quick_pane = null;
+        _ = self.focusCurrentProjectWorkspacePane(quick.pane_id);
+        self.markDirty();
+        return true;
+    }
+
+    pub fn setCurrentProjectQuickPaneGeometry(self: *AppState, geometry: FloatingPaneGeometry) void {
+        if (self.projects.items.len == 0) return;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const quick = if (layout.quick_pane) |*value| value else return;
+        quick.geometry = .{
+            .x = std.math.clamp(geometry.x, 0.0, 0.95),
+            .y = std.math.clamp(geometry.y, 0.0, 0.95),
+            .w = std.math.clamp(geometry.w, 0.05, 1.0),
+            .h = std.math.clamp(geometry.h, 0.05, 1.0),
+        };
+        quick.maximized = false;
+        self.markDirty();
     }
 
     pub fn workspacePaneKindById(self: *const AppState, pane_id: WorkspacePaneId) ?WorkspacePaneKind {
@@ -17176,7 +17502,7 @@ pub const AppState = struct {
         if (project_index >= self.projects.items.len) return false;
         var project = &self.projects.items[project_index];
         var layout = &project.workspace_layout;
-        if (layout.visiblePaneCount() <= 1) {
+        if (layout.rootContainsPane(pane_id) and layout.visiblePaneCount() <= 1) {
             self.setSidebarNotice("Cannot close the last workspace pane.");
             return false;
         }
@@ -23210,6 +23536,39 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.maximized_pane_id);
     try std.testing.expect(!state.focusCurrentProjectWorkspacePaneAtSidebarIndex(3));
 
+    layout.quick_pane = .{
+        .pane_id = clicked_terminal_pane_id,
+        .visible = false,
+        .detached = true,
+        .return_focus_pane_id = chat_pane_id,
+    };
+    layout.focused_pane_id = chat_pane_id;
+    layout.maximized_pane_id = chat_pane_id;
+    state.focusWorkspaceOpenPaneFromSidebar(0, clicked_terminal_pane_id);
+    try std.testing.expect(layout.quick_pane.?.visible);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(!layout.rootContainsPane(clicked_terminal_pane_id));
+    try std.testing.expect(state.terminal_focused);
+    try std.testing.expect(state.isTerminalVisible());
+    try std.testing.expect(state.canRouteTerminalInput());
+
+    state.focusWorkspaceOpenPaneFromSidebar(0, chat_pane_id);
+    try std.testing.expect(!layout.quick_pane.?.visible);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.quick_pane.?.return_focus_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(!layout.rootContainsPane(clicked_terminal_pane_id));
+    try std.testing.expect(!state.terminal_focused);
+    try std.testing.expect(!state.canRouteTerminalInput());
+
+    state.focusWorkspaceOpenPaneFromSidebar(0, clicked_terminal_pane_id);
+    try std.testing.expect(layout.quick_pane.?.visible);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.focused_pane_id);
+    try std.testing.expect(state.terminal_focused);
+    try std.testing.expect(state.canRouteTerminalInput());
+    layout.quick_pane = null;
+
     const result = try state.openWorkspaceChat(0, .{
         .provider = .codex,
         .model_ref = DEFAULT_CODEX_MODEL,
@@ -23497,6 +23856,89 @@ test "workspace layout migrates minimized panes back into the split tree" {
     const rewritten = try layout.persistedWorkspaceJson(allocator);
     defer allocator.free(rewritten);
     try std.testing.expect(std.mem.indexOf(u8, rewritten, "minimized") == null);
+}
+
+test "workspace layout persists floating quick pane geometry and state" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    layout.quick_pane = .{
+        .pane_id = 1,
+        .geometry = .{ .x = 0.12, .y = 0.23, .w = 0.54, .h = 0.65 },
+        .visible = false,
+        .maximized = true,
+        .pinned = true,
+    };
+
+    const persisted = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(persisted);
+    var restored = try WorkspaceLayout.initDefaultChat(allocator);
+    defer restored.deinit(allocator);
+    try restored.applyPersistedWorkspaceJson(allocator, persisted);
+
+    const quick = restored.quick_pane orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(WorkspacePaneId, 1), quick.pane_id);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.12), quick.geometry.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.65), quick.geometry.h, 0.0001);
+    try std.testing.expect(!quick.visible);
+    try std.testing.expect(quick.maximized);
+    try std.testing.expect(quick.pinned);
+    try std.testing.expect(restored.rootContainsPane(quick.pane_id));
+}
+
+test "detached quick pane stays out of tiled root across repair and persistence" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    const quick_pane_id = try layout.createTerminalPane(allocator, 7);
+    layout.quick_pane = .{
+        .pane_id = quick_pane_id,
+        .detached = true,
+        .return_focus_pane_id = 1,
+    };
+    layout.focused_pane_id = quick_pane_id;
+    layout.maximized_pane_id = 1;
+
+    _ = try layout.ensureDefaultChat(allocator);
+    try std.testing.expectEqual(@as(usize, 1), layout.visiblePaneCount());
+    try std.testing.expect(!layout.rootContainsPane(quick_pane_id));
+    try std.testing.expect(!layout.hasVisiblePaneKind(.terminal));
+    try std.testing.expect(layout.hasVisibleQuickPaneKind(.terminal));
+    layout.quick_pane.?.visible = false;
+    try std.testing.expect(!layout.hasVisibleQuickPaneKind(.terminal));
+    layout.quick_pane.?.visible = true;
+
+    const persisted = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(persisted);
+    var restored = try WorkspaceLayout.initDefaultChat(allocator);
+    defer restored.deinit(allocator);
+    try restored.applyPersistedWorkspaceJson(allocator, persisted);
+
+    const quick = restored.quick_pane orelse return error.TestExpectedEqual;
+    try std.testing.expect(quick.detached);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), quick.return_focus_pane_id);
+    try std.testing.expect(!restored.rootContainsPane(quick.pane_id));
+    try std.testing.expectEqual(@as(usize, 1), restored.visiblePaneCount());
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), restored.maximized_pane_id);
+}
+
+test "workspace repair migrates duplicated legacy quick pane out of tiled root" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    const persisted =
+        \\{"v":2,"next":3,"focused":2,"maximized":null,
+        \\"quick":{"pane":2,"visible":true,"maximized":false,"pinned":false},
+        \\"panes":[{"id":1,"kind":"chat","thread":0},{"id":2,"kind":"terminal","dock":7}],
+        \\"root":{"split":{"axis":"horizontal","ratio":0.5,"first":{"leaf":1},"second":{"leaf":2}}}}
+    ;
+    try layout.applyPersistedWorkspaceJson(allocator, persisted);
+
+    const quick = layout.quick_pane orelse return error.TestExpectedEqual;
+    try std.testing.expect(quick.detached);
+    try std.testing.expect(!layout.rootContainsPane(quick.pane_id));
+    try std.testing.expect(layout.rootContainsPane(1));
+    try std.testing.expectEqual(@as(usize, 1), layout.visiblePaneCount());
 }
 
 test "workspace layout grid placement follows pane hotkey order" {

@@ -30,6 +30,7 @@ pub const NativeKeyboardAction = enum {
     workspace_split_terminal_vertical,
     workspace_split_terminal_horizontal,
     workspace_toggle_maximize,
+    workspace_toggle_quick_pane,
     workspace_close,
     workspace_close_current,
     workspace_focus_left,
@@ -154,6 +155,7 @@ pub const NativeKeyboardConfig = struct {
     workspace_split_terminal_vertical: []Keybind,
     workspace_split_terminal_horizontal: []Keybind,
     workspace_toggle_maximize: []Keybind,
+    workspace_toggle_quick_pane: []Keybind,
     workspace_close: []Keybind,
     workspace_close_current: []Keybind,
     workspace_focus_left: []Keybind,
@@ -212,6 +214,7 @@ pub const NativeKeyboardConfig = struct {
             .workspace_split_terminal_vertical = try cloneEmptyKeybinds(allocator),
             .workspace_split_terminal_horizontal = try cloneDefaultWorkspaceSplitTerminalHorizontalKeybinds(allocator),
             .workspace_toggle_maximize = try cloneDefaultWorkspaceToggleMaximizeKeybinds(allocator),
+            .workspace_toggle_quick_pane = try cloneDefaultWorkspaceToggleQuickPaneKeybinds(allocator),
             .workspace_close = try cloneDefaultWorkspaceCloseKeybinds(allocator),
             .workspace_close_current = try cloneDefaultWorkspaceCloseCurrentKeybinds(allocator),
             .workspace_focus_left = try cloneDefaultWorkspaceFocusLeftKeybinds(allocator),
@@ -281,6 +284,7 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.workspace_split_terminal_vertical);
         self.allocator.free(self.workspace_split_terminal_horizontal);
         self.allocator.free(self.workspace_toggle_maximize);
+        self.allocator.free(self.workspace_toggle_quick_pane);
         self.allocator.free(self.workspace_close);
         self.allocator.free(self.workspace_close_current);
         self.allocator.free(self.workspace_focus_left);
@@ -366,6 +370,9 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.workspace_toggle_maximize, event)) {
             return .workspace_toggle_maximize;
+        }
+        if (matchesAny(self.workspace_toggle_quick_pane, event)) {
+            return .workspace_toggle_quick_pane;
         }
         if (matchesAny(self.workspace_close, event)) {
             return .workspace_close;
@@ -746,6 +753,12 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(value, "workspace.toggle_maximize")) |bindings| {
                 self.allocator.free(self.workspace_toggle_maximize);
                 self.workspace_toggle_maximize = bindings;
+            }
+        }
+        if (workspace_value.object.get("toggle_quick_pane")) |value| {
+            if (self.parseOverrideValue(value, "workspace.toggle_quick_pane")) |bindings| {
+                self.allocator.free(self.workspace_toggle_quick_pane);
+                self.workspace_toggle_quick_pane = bindings;
             }
         }
         if (workspace_value.object.get("close")) |value| {
@@ -1247,6 +1260,12 @@ fn cloneDefaultWorkspaceGrowDownKeybinds(allocator: std.mem.Allocator) ![]Keybin
 fn cloneDefaultWorkspaceToggleMaximizeKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Alt+Z"),
+    });
+}
+
+fn cloneDefaultWorkspaceToggleQuickPaneKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Ctrl+Alt+T"),
     });
 }
 

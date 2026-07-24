@@ -1489,6 +1489,10 @@ fn renderOpenPaneRow(
     show_workspace_tag: bool,
 ) void {
     const layout = &project.workspace_layout;
+    const quick = if (layout.quick_pane) |value|
+        if (value.pane_id == pane.id) value else null
+    else
+        null;
     const focused = state.selected_project_index == project_index and layout.focused_pane_id == pane.id;
     const hovered = state.palette_mouse_in_workspace and rectContainsPoint(rect, state.palette_mouse_x, state.palette_mouse_y);
     // Accent-tinted fills (not the gray border token) so focus/hover track
@@ -1605,6 +1609,21 @@ fn renderOpenPaneRow(
             globe_icon.queue(state, icon_x + theme.scaledUi(7.0), cy, theme.scaledUi(13.0), paletteColor(muted));
             title = browserPaneTitle(pane);
         },
+    }
+
+    // Small top-right badge on the existing pane glyph: accent while shown and
+    // muted while hidden. Keeping it above the terminal underscore avoids
+    // changing the row's established icon-to-title spacing.
+    if (quick) |quick_state| {
+        const badge_size = theme.scaledUi(8.0);
+        const badge_rect: palette.Rect = .{
+            .x = icon_x + theme.scaledUi(15.0),
+            .y = cy - theme.scaledUi(9.0),
+            .w = badge_size,
+            .h = badge_size,
+        };
+        const badge_color = if (quick_state.visible) theme.COLOR_GREEN else theme.COLOR_TEXT_SUBTLE;
+        queuePaletteIcon(state, badge_rect, NF_FA_WINDOW_RESTORE, badge_size, paletteColor(badge_color), clip);
     }
 
     // Status label computed before truncation so the title only surrenders
@@ -1825,6 +1844,9 @@ const NF_COD_GEAR = "\u{EB51}";
 const NF_COD_TERMINAL = "\u{EA85}";
 const NF_COD_HISTORY = "\u{EA82}";
 const NF_COD_SEARCH = "\u{EA6D}";
+// Font Awesome's overlapping-window mark. It badges floating panes without
+// replacing the pane-kind/provider glyph users already recognize.
+const NF_FA_WINDOW_RESTORE = "\u{F2D2}";
 // Panel-style sidebar toggle (VS Code's layout-sidebar-left): filled left pane
 // while the rail is expanded, hollow "off" variant while collapsed.
 const NF_COD_LAYOUT_SIDEBAR_LEFT = "\u{EBF3}";

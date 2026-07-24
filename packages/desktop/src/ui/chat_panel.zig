@@ -216,7 +216,11 @@ fn chatContentColumn(lane_x: f32, lane_w: f32) struct { x: f32, w: f32 } {
 }
 
 pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: palette.Rect, pane_id: ?app_state.WorkspacePaneId, header_right_reserve: f32) void {
-    const live_composer = paneOwnsActiveChatState(state, pane_id);
+    const blocked_by_quick = if (state.currentProjectQuickPane()) |quick|
+        quick.visible and pane_id != null and pane_id.? != quick.pane_id
+    else
+        false;
+    const live_composer = !blocked_by_quick and paneOwnsActiveChatState(state, pane_id);
     const restore_thread_index = if (pane_id != null and state.projects.items.len > 0)
         state.projects.items[state.selected_project_index].selected_thread_index
     else
@@ -286,7 +290,7 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
     // (`.sent_inline`), since that prompt then appears in the transcript instead.
     const followup_pin = state.pendingFollowupSnapshot() catch null;
     defer if (followup_pin) |fp| state.allocator.free(fp.prompt);
-    const show_followup_pin = if (followup_pin) |fp| fp.state != .sent_inline else false;
+    const show_followup_pin = !blocked_by_quick and if (followup_pin) |fp| fp.state != .sent_inline else false;
     const followup_reserve = if (show_followup_pin)
         theme.scaledUi(FOLLOWUP_PIN_HEIGHT) + theme.scaledUi(10.0)
     else
@@ -358,11 +362,14 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
     // message geometry or GL text that would otherwise overlap the title bar.
     renderHeader(state, header, header_right_reserve, pane_id);
 
-    if (live_composer) {
-        renderComposer(state, composer_rect);
-    } else {
-        renderInactiveComposer(state, composer_rect);
+    if (!blocked_by_quick) {
+        if (live_composer) {
+            renderComposer(state, composer_rect);
+        } else {
+            renderInactiveComposer(state, composer_rect);
+        }
     }
+
     if (bang_mode) {
         const banner_rect = palette.Rect{
             .x = composer_rect.x,

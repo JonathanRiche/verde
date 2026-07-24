@@ -70,6 +70,7 @@ const KeybindRef = enum {
     toggle_terminal,
     workspace_close,
     workspace_toggle_maximize,
+    workspace_toggle_quick_pane,
     workspace_split_chat_vertical,
     workspace_split_chat_horizontal,
     workspace_split_terminal_vertical,
@@ -99,6 +100,12 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "pane.browser", .title = "Toggle Browser Pane", .keywords = "web url", .section = .panes, .keybind = .toggle_browser, .run = runToggleBrowser, .enabled = hasProjects },
     .{ .id = "pane.close", .title = "Close Pane", .section = .panes, .keybind = .workspace_close, .run = runClosePane, .enabled = hasProjects },
     .{ .id = "pane.zoom", .title = "Zoom Pane", .keywords = "maximize restore fullscreen", .section = .panes, .keybind = .workspace_toggle_maximize, .run = runZoomPane, .enabled = hasProjects },
+    .{ .id = "pane.float", .title = "Float Focused Pane", .keywords = "quick scratch overlay", .section = .panes, .run = runFloatPane, .enabled = hasProjects },
+    .{ .id = "pane.quick_toggle", .title = "New or Toggle Quick Terminal", .keywords = "create show hide scratch floating overlay", .section = .panes, .keybind = .workspace_toggle_quick_pane, .run = runToggleQuickPane, .enabled = hasProjects },
+    .{ .id = "pane.quick_maximize", .title = "Maximize or Restore Quick Pane", .keywords = "floating overlay", .section = .panes, .run = runMaximizeQuickPane, .enabled = hasQuickPane },
+    .{ .id = "pane.quick_minimize", .title = "Minimize Quick Pane", .keywords = "hide floating overlay", .section = .panes, .run = runMinimizeQuickPane, .enabled = hasQuickPane },
+    .{ .id = "pane.quick_pin", .title = "Pin or Unpin Quick Pane", .keywords = "floating dim backdrop", .section = .panes, .run = runPinQuickPane, .enabled = hasQuickPane },
+    .{ .id = "pane.quick_tile", .title = "Return Quick Pane to Tile", .keywords = "dock floating", .section = .panes, .run = runTileQuickPane, .enabled = hasQuickPane },
     .{ .id = "workspace.add", .title = "Add Workspace", .keywords = "new project folder directory", .section = .workspaces, .run = runAddWorkspace },
     .{ .id = "workspace.rename", .title = "Rename Workspace", .keywords = "label", .section = .workspaces, .run = runRenameWorkspace, .enabled = hasProjects },
     .{ .id = "workspace.close", .title = "Close Workspace", .keywords = "archive remove project save state", .section = .workspaces, .run = runCloseWorkspace, .enabled = workspaceNotBusy },
@@ -1038,6 +1045,10 @@ fn hasProjects(state: *runtime.AppState) bool {
     return state.projects.items.len > 0;
 }
 
+fn hasQuickPane(state: *runtime.AppState) bool {
+    return state.currentProjectQuickPane() != null;
+}
+
 fn hasFocusedGuiChat(state: *runtime.AppState) bool {
     return focusedGuiThreadIndex(state) != null;
 }
@@ -1230,6 +1241,30 @@ fn runClosePane(state: *runtime.AppState) void {
 
 fn runZoomPane(state: *runtime.AppState) void {
     _ = state.toggleFocusedWorkspacePaneMaximized();
+}
+
+fn runFloatPane(state: *runtime.AppState) void {
+    _ = state.floatFocusedWorkspacePane();
+}
+
+fn runToggleQuickPane(state: *runtime.AppState) void {
+    _ = state.toggleCurrentProjectQuickPane();
+}
+
+fn runMaximizeQuickPane(state: *runtime.AppState) void {
+    _ = state.toggleCurrentProjectQuickPaneMaximized();
+}
+
+fn runMinimizeQuickPane(state: *runtime.AppState) void {
+    _ = state.minimizeCurrentProjectQuickPane();
+}
+
+fn runPinQuickPane(state: *runtime.AppState) void {
+    _ = state.toggleCurrentProjectQuickPanePinned();
+}
+
+fn runTileQuickPane(state: *runtime.AppState) void {
+    _ = state.returnCurrentProjectQuickPaneToTile();
 }
 
 fn runAddWorkspace(state: *runtime.AppState) void {
@@ -1692,6 +1727,7 @@ fn keybindHintFor(state: *runtime.AppState, ref: ?KeybindRef) []const u8 {
         .toggle_terminal => config.toggle_terminal,
         .workspace_close => config.workspace_close,
         .workspace_toggle_maximize => config.workspace_toggle_maximize,
+        .workspace_toggle_quick_pane => config.workspace_toggle_quick_pane,
         .workspace_split_chat_vertical => config.workspace_split_chat_vertical,
         .workspace_split_chat_horizontal => config.workspace_split_chat_horizontal,
         .workspace_split_terminal_vertical => config.workspace_split_terminal_vertical,
