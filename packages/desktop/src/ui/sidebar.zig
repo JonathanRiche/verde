@@ -1753,10 +1753,11 @@ fn browserPaneTitle(pane: *const native_state.WorkspacePane) []const u8 {
         .browser => |browser| browser,
         else => return "Browser",
     };
-    if (ref.title) |title| {
+    const tab = ref.activeTabConst() orelse return "Browser";
+    if (tab.title) |title| {
         if (title.len > 0) return title;
     }
-    const url = ref.url orelse return "Browser";
+    const url = tab.url orelse return "Browser";
     if (url.len == 0) return "Browser";
     return url;
 }

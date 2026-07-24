@@ -1038,7 +1038,8 @@ fn renderZoomControl(
 ) void {
     const control_size = theme.scaledUi(PANE_CHROME_CONTROL_SIZE_CSS);
     const margin = theme.scaledUi(PANE_CHROME_RIGHT_MARGIN_CSS);
-    const split_reserve = if (kind == .chat or kind == .terminal)
+    // Browser owns the far-right close action; keep zoom immediately to its left.
+    const split_reserve = if (kind == .chat or kind == .terminal or kind == .browser)
         theme.scaledUi(PANE_CHROME_CONTROL_SIZE_CSS + PANE_CHROME_CONTROL_GAP_CSS)
     else
         0.0;
@@ -1047,7 +1048,7 @@ fn renderZoomControl(
         .y = switch (kind) {
             .chat => pane_rect.y + @max((header_h - control_size) * 0.5, theme.scaledUi(4.0)),
             .terminal => pane_rect.y + margin,
-            .browser => pane_rect.y + (browser_panel.paneToolbarHeight() - control_size) * 0.5,
+            .browser => pane_rect.y + (browser_panel.paneToolbarActionRowHeight() - control_size) * 0.5,
         },
         .w = control_size,
         .h = control_size,

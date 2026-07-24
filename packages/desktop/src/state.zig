@@ -2209,13 +2209,14 @@ pub const TerminalPanePurpose = enum {
     editor,
 };
 
-pub const BrowserPaneRef = struct {
+pub const BrowserTabRef = struct {
     url: ?[]u8 = null,
     title: ?[]u8 = null,
     history: std.ArrayList([]u8) = .empty,
     history_index: ?usize = null,
+    pinned: bool = false,
 
-    fn deinit(self: *BrowserPaneRef, allocator: std.mem.Allocator) void {
+    fn deinit(self: *BrowserTabRef, allocator: std.mem.Allocator) void {
         if (self.url) |url| allocator.free(url);
         if (self.title) |title| allocator.free(title);
         for (self.history.items) |entry| allocator.free(entry);
@@ -2223,17 +2224,17 @@ pub const BrowserPaneRef = struct {
         self.* = .{};
     }
 
-    fn setUrl(self: *BrowserPaneRef, allocator: std.mem.Allocator, value: ?[]const u8) !void {
+    fn setUrl(self: *BrowserTabRef, allocator: std.mem.Allocator, value: ?[]const u8) !void {
         if (self.url) |url| allocator.free(url);
         self.url = if (value) |slice| try allocator.dupe(u8, slice) else null;
     }
 
-    fn setTitle(self: *BrowserPaneRef, allocator: std.mem.Allocator, value: ?[]const u8) !void {
+    fn setTitle(self: *BrowserTabRef, allocator: std.mem.Allocator, value: ?[]const u8) !void {
         if (self.title) |title| allocator.free(title);
         self.title = if (value) |slice| try allocator.dupe(u8, slice) else null;
     }
 
-    fn recordNavigation(self: *BrowserPaneRef, allocator: std.mem.Allocator, url: []const u8) !void {
+    fn recordNavigation(self: *BrowserTabRef, allocator: std.mem.Allocator, url: []const u8) !void {
         if (self.url) |current| {
             if (std.mem.eql(u8, current, url)) return;
         }
@@ -2258,13 +2259,13 @@ pub const BrowserPaneRef = struct {
         try self.setUrl(allocator, url);
     }
 
-    fn appendHistoryEntry(self: *BrowserPaneRef, allocator: std.mem.Allocator, url: []const u8) !void {
+    fn appendHistoryEntry(self: *BrowserTabRef, allocator: std.mem.Allocator, url: []const u8) !void {
         const owned = try allocator.dupe(u8, url);
         errdefer allocator.free(owned);
         try self.history.append(allocator, owned);
     }
 
-    fn historyTarget(self: *const BrowserPaneRef, delta: i32) ?struct { index: usize, url: []const u8 } {
+    fn historyTarget(self: *const BrowserTabRef, delta: i32) ?struct { index: usize, url: []const u8 } {
         const index = self.history_index orelse return null;
         const target: isize = @as(isize, @intCast(index)) + @as(isize, @intCast(delta));
         if (target < 0) return null;
@@ -2273,6 +2274,54 @@ pub const BrowserPaneRef = struct {
         return .{ .index = target_index, .url = self.history.items[target_index] };
     }
 };
+
+pub const BrowserPaneRef = struct {
+    tabs: std.ArrayList(BrowserTabRef) = .empty,
+    active_tab_index: usize = 0,
+
+    fn deinit(self: *BrowserPaneRef, allocator: std.mem.Allocator) void {
+        for (self.tabs.items) |*tab| tab.deinit(allocator);
+        self.tabs.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn ensureTab(self: *BrowserPaneRef, allocator: std.mem.Allocator) !*BrowserTabRef {
+        if (self.tabs.items.len == 0) try self.tabs.append(allocator, .{});
+        self.active_tab_index = @min(self.active_tab_index, self.tabs.items.len - 1);
+        return &self.tabs.items[self.active_tab_index];
+    }
+
+    fn activeTab(self: *BrowserPaneRef) ?*BrowserTabRef {
+        if (self.tabs.items.len == 0) return null;
+        self.active_tab_index = @min(self.active_tab_index, self.tabs.items.len - 1);
+        return &self.tabs.items[self.active_tab_index];
+    }
+
+    pub fn activeTabConst(self: *const BrowserPaneRef) ?*const BrowserTabRef {
+        if (self.tabs.items.len == 0) return null;
+        return &self.tabs.items[@min(self.active_tab_index, self.tabs.items.len - 1)];
+    }
+};
+
+test "browser pane tabs preserve independent navigation and active state" {
+    const allocator = std.testing.allocator;
+    var pane: BrowserPaneRef = .{};
+    defer pane.deinit(allocator);
+
+    const first = try pane.ensureTab(allocator);
+    try first.recordNavigation(allocator, "https://one.example/");
+    try first.setTitle(allocator, "One");
+    try pane.tabs.append(allocator, .{});
+    pane.active_tab_index = 1;
+    const second = pane.activeTab().?;
+    try second.recordNavigation(allocator, "https://two.example/a");
+    try second.recordNavigation(allocator, "https://two.example/b");
+
+    try std.testing.expectEqual(@as(usize, 2), pane.tabs.items.len);
+    try std.testing.expectEqualStrings("One", pane.tabs.items[0].title.?);
+    try std.testing.expectEqualStrings("https://two.example/b", pane.activeTabConst().?.url.?);
+    try std.testing.expectEqualStrings("https://two.example/a", pane.activeTabConst().?.historyTarget(-1).?.url);
+}
 
 fn deinitWorkspacePaneRef(ref: *WorkspacePaneRef, allocator: std.mem.Allocator) void {
     switch (ref.*) {
@@ -3075,6 +3124,7 @@ pub const WorkspaceLayout = struct {
             .id = pane_id,
             .ref = .{ .browser = .{} },
         });
+        _ = try self.panes.items[self.panes.items.len - 1].ref.browser.ensureTab(allocator);
         self.focused_pane_id = pane_id;
         try self.ensurePaneInRootSplit(allocator, pane_id, .vertical, 0.58);
         return pane_id;
@@ -3282,24 +3332,31 @@ pub const WorkspaceLayout = struct {
                 .browser => |ref| {
                     try stringify.objectField("kind");
                     try stringify.write("browser");
-                    if (ref.url) |url| {
-                        try stringify.objectField("url");
-                        try stringify.write(url);
-                    }
-                    if (ref.title) |title| {
-                        try stringify.objectField("title");
-                        try stringify.write(title);
-                    }
-                    try stringify.objectField("history_index");
-                    if (ref.history_index) |history_index| {
-                        try stringify.write(history_index);
-                    } else {
-                        try stringify.write(null);
-                    }
-                    try stringify.objectField("history");
+                    try stringify.objectField("active_tab");
+                    try stringify.write(ref.active_tab_index);
+                    try stringify.objectField("tabs");
                     try stringify.beginArray();
-                    for (ref.history.items) |entry| {
-                        try stringify.write(entry);
+                    for (ref.tabs.items) |tab| {
+                        try stringify.beginObject();
+                        if (tab.url) |url| {
+                            try stringify.objectField("url");
+                            try stringify.write(url);
+                        }
+                        if (tab.title) |title| {
+                            try stringify.objectField("title");
+                            try stringify.write(title);
+                        }
+                        if (tab.pinned) {
+                            try stringify.objectField("pinned");
+                            try stringify.write(true);
+                        }
+                        try stringify.objectField("history_index");
+                        if (tab.history_index) |history_index| try stringify.write(history_index) else try stringify.write(null);
+                        try stringify.objectField("history");
+                        try stringify.beginArray();
+                        for (tab.history.items) |entry| try stringify.write(entry);
+                        try stringify.endArray();
+                        try stringify.endObject();
                     }
                     try stringify.endArray();
                 },
@@ -3360,32 +3417,48 @@ pub const WorkspaceLayout = struct {
                 var browser_ref: BrowserPaneRef = .{};
                 var browser_ref_owned = true;
                 errdefer if (browser_ref_owned) browser_ref.deinit(allocator);
-                if (jsonString(pane_value.object.get("url") orelse .null)) |url| {
-                    try browser_ref.setUrl(allocator, url);
-                }
-                if (jsonString(pane_value.object.get("title") orelse .null)) |title| {
-                    try browser_ref.setTitle(allocator, title);
-                }
-                if (pane_value.object.get("history")) |history_value| {
-                    if (history_value == .array) {
+                if (pane_value.object.get("tabs")) |tabs_value| {
+                    if (tabs_value == .array) for (tabs_value.array.items) |tab_value| {
+                        if (tab_value != .object) continue;
+                        var tab: BrowserTabRef = .{};
+                        errdefer tab.deinit(allocator);
+                        if (jsonString(tab_value.object.get("url") orelse .null)) |url| try tab.setUrl(allocator, url);
+                        if (jsonString(tab_value.object.get("title") orelse .null)) |title| try tab.setTitle(allocator, title);
+                        if (tab_value.object.get("pinned")) |pinned| tab.pinned = pinned == .bool and pinned.bool;
+                        if (tab_value.object.get("history")) |history_value| if (history_value == .array) {
+                            for (history_value.array.items) |entry_value| {
+                                const entry = jsonString(entry_value) orelse continue;
+                                try tab.appendHistoryEntry(allocator, entry);
+                            }
+                        };
+                        if (jsonInt(tab_value.object.get("history_index") orelse .null)) |history_index| {
+                            if (history_index >= 0 and @as(usize, @intCast(history_index)) < tab.history.items.len) tab.history_index = @intCast(history_index);
+                        }
+                        try browser_ref.tabs.append(allocator, tab);
+                    };
+                    if (jsonInt(pane_value.object.get("active_tab") orelse .null)) |active| {
+                        if (active >= 0) browser_ref.active_tab_index = @intCast(active);
+                    }
+                } else {
+                    // Version 2 workspaces stored one tab directly on the pane.
+                    const tab = try browser_ref.ensureTab(allocator);
+                    if (jsonString(pane_value.object.get("url") orelse .null)) |url| try tab.setUrl(allocator, url);
+                    if (jsonString(pane_value.object.get("title") orelse .null)) |title| try tab.setTitle(allocator, title);
+                    if (pane_value.object.get("history")) |history_value| if (history_value == .array) {
                         for (history_value.array.items) |entry_value| {
                             const entry = jsonString(entry_value) orelse continue;
-                            try browser_ref.appendHistoryEntry(allocator, entry);
+                            try tab.appendHistoryEntry(allocator, entry);
                         }
+                    };
+                    if (jsonInt(pane_value.object.get("history_index") orelse .null)) |history_index| {
+                        if (history_index >= 0 and @as(usize, @intCast(history_index)) < tab.history.items.len) tab.history_index = @intCast(history_index);
                     }
                 }
-                if (jsonInt(pane_value.object.get("history_index") orelse .null)) |history_index| {
-                    if (history_index >= 0 and @as(usize, @intCast(history_index)) < browser_ref.history.items.len) {
-                        browser_ref.history_index = @intCast(history_index);
-                    }
-                } else if (browser_ref.url != null and browser_ref.history.items.len == 0) {
-                    try browser_ref.appendHistoryEntry(allocator, browser_ref.url.?);
-                    browser_ref.history_index = 0;
-                }
-                if (browser_ref.url == null and browser_ref.history.items.len > 0) {
-                    const restore_index = browser_ref.history_index orelse browser_ref.history.items.len - 1;
-                    try browser_ref.setUrl(allocator, browser_ref.history.items[restore_index]);
-                    browser_ref.history_index = restore_index;
+                const active_tab = try browser_ref.ensureTab(allocator);
+                if (active_tab.url == null and active_tab.history.items.len > 0) {
+                    const restore_index = active_tab.history_index orelse active_tab.history.items.len - 1;
+                    try active_tab.setUrl(allocator, active_tab.history.items[restore_index]);
+                    active_tab.history_index = restore_index;
                 }
                 try next_layout.panes.append(allocator, .{
                     .id = pane_id,
@@ -6926,7 +6999,8 @@ pub const AppState = struct {
                 break :blk .{ .provider = .terminal, .presentation = .terminal, .cwd = cwd, .title = title };
             },
             .browser => |browser_ref| blk: {
-                const label = browser_ref.title orelse browser_ref.url orelse "Browser";
+                const tab = browser_ref.activeTabConst();
+                const label = if (tab) |active| active.title orelse active.url orelse "Browser" else "Browser";
                 const title = try std.fmt.allocPrint(self.allocator, "Browser: {s}", .{label});
                 break :blk .{ .provider = .browser, .presentation = .browser_link, .cwd = default_cwd, .title = title };
             },
@@ -13333,7 +13407,8 @@ pub const AppState = struct {
 
     fn browserPaneSnapshotUrl(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) ?[]const u8 {
         const ref = self.browserPaneRefMutable(project_index, pane_id) orelse return null;
-        return ref.url;
+        const tab = ref.activeTab() orelse return null;
+        return tab.url;
     }
 
     // A browser pane can be restored in a workspace that was not selected at
@@ -13355,14 +13430,15 @@ pub const AppState = struct {
 
     fn applyBrowserPaneSnapshotToRuntime(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) void {
         const ref = self.browserPaneRefMutable(project_index, pane_id) orelse return;
-        if (ref.url) |url| {
+        const tab = ref.activeTab() orelse return;
+        if (tab.url) |url| {
             self.browser_state.setCurrentUrl(url) catch |err| {
                 log.warn("failed to restore browser pane URL: {s}", .{@errorName(err)});
             };
             self.browser_state.setAddress(url);
             self.browser_address_cursor = self.browser_state.addressInput().len;
         }
-        if (ref.title) |title| {
+        if (tab.title) |title| {
             self.browser_state.setCurrentTitle(title) catch |err| {
                 log.warn("failed to restore browser pane title: {s}", .{@errorName(err)});
             };
@@ -13371,12 +13447,13 @@ pub const AppState = struct {
 
     fn recordVisibleBrowserPaneNavigation(self: *AppState, url: []const u8) void {
         const ref = self.visibleBrowserPaneRefMutable() orelse return;
+        const tab = ref.activeTab() orelse return;
         if (isBlankBrowserUrl(url)) {
-            if (ref.url) |existing_url| {
+            if (tab.url) |existing_url| {
                 if (!isBlankBrowserUrl(existing_url)) return;
             }
         }
-        ref.recordNavigation(self.allocator, url) catch |err| {
+        tab.recordNavigation(self.allocator, url) catch |err| {
             log.warn("failed to persist browser pane URL history: {s}", .{@errorName(err)});
             return;
         };
@@ -13385,7 +13462,8 @@ pub const AppState = struct {
 
     fn recordVisibleBrowserPaneTitle(self: *AppState, title: []const u8) void {
         const ref = self.visibleBrowserPaneRefMutable() orelse return;
-        ref.setTitle(self.allocator, title) catch |err| {
+        const tab = ref.activeTab() orelse return;
+        tab.setTitle(self.allocator, title) catch |err| {
             log.warn("failed to persist browser pane title: {s}", .{@errorName(err)});
             return;
         };
@@ -13394,9 +13472,10 @@ pub const AppState = struct {
 
     fn navigatePersistedBrowserHistory(self: *AppState, delta: i32) bool {
         const ref = self.visibleBrowserPaneRefMutable() orelse return false;
-        const target = ref.historyTarget(delta) orelse return false;
-        ref.history_index = target.index;
-        ref.setUrl(self.allocator, target.url) catch |err| {
+        const tab = ref.activeTab() orelse return false;
+        const target = tab.historyTarget(delta) orelse return false;
+        tab.history_index = target.index;
+        tab.setUrl(self.allocator, target.url) catch |err| {
             log.warn("failed to update persisted browser history index: {s}", .{@errorName(err)});
             return false;
         };
@@ -14439,6 +14518,11 @@ pub const AppState = struct {
                         continue;
                     }
                     if (inspector_message) {
+                        if (isInspectorDisabledMessage(message)) {
+                            self.browser_state.setInspectorEnabled(false);
+                            self.browser_inspector_menu_open = false;
+                            continue;
+                        }
                         if (isInspectorHoverMessage(message) or
                             isInspectorLifecycleMessage(message) or
                             isInspectorPromptChangedMessage(message))
@@ -15361,6 +15445,10 @@ pub const AppState = struct {
         return std.mem.indexOf(u8, message, "\"type\":\"inspector:enabled\"") != null or
             std.mem.indexOf(u8, message, "\"type\":\"inspector:disabled\"") != null or
             std.mem.indexOf(u8, message, "\"type\":\"inspector:mode-changed\"") != null;
+    }
+
+    fn isInspectorDisabledMessage(message: []const u8) bool {
+        return std.mem.indexOf(u8, message, "\"type\":\"inspector:disabled\"") != null;
     }
 
     fn isInspectorSelectionMessage(message: []const u8) bool {
@@ -19061,6 +19149,88 @@ pub const AppState = struct {
             return;
         };
         self.markDirty();
+    }
+
+    pub fn browserTabCount(self: *AppState) usize {
+        const ref = self.visibleBrowserPaneRefMutable() orelse return 0;
+        return ref.tabs.items.len;
+    }
+
+    pub fn activeBrowserTabIndex(self: *AppState) usize {
+        const ref = self.visibleBrowserPaneRefMutable() orelse return 0;
+        return @min(ref.active_tab_index, ref.tabs.items.len -| 1);
+    }
+
+    pub fn browserTabTitle(self: *AppState, index: usize) []const u8 {
+        const ref = self.visibleBrowserPaneRefMutable() orelse return "New tab";
+        if (index >= ref.tabs.items.len) return "New tab";
+        const tab = &ref.tabs.items[index];
+        return tab.title orelse tab.url orelse "New tab";
+    }
+
+    pub fn browserCanGoBack(self: *AppState) bool {
+        const ref = self.visibleBrowserPaneRefMutable() orelse return false;
+        const tab = ref.activeTab() orelse return false;
+        return (tab.history_index orelse 0) > 0;
+    }
+
+    pub fn browserCanGoForward(self: *AppState) bool {
+        const ref = self.visibleBrowserPaneRefMutable() orelse return false;
+        const tab = ref.activeTab() orelse return false;
+        const index = tab.history_index orelse return false;
+        return index + 1 < tab.history.items.len;
+    }
+
+    pub fn createBrowserTab(self: *AppState) void {
+        const ref = self.visibleBrowserPaneRefMutable() orelse return;
+        ref.tabs.append(self.allocator, .{}) catch |err| {
+            log.warn("failed to create browser tab: {s}", .{@errorName(err)});
+            return;
+        };
+        ref.active_tab_index = ref.tabs.items.len - 1;
+        self.activateBrowserTabRuntime(null, null);
+        self.browser_address_focused = true;
+        self.markDirty();
+    }
+
+    pub fn switchBrowserTab(self: *AppState, index: usize) void {
+        const ref = self.visibleBrowserPaneRefMutable() orelse return;
+        if (index >= ref.tabs.items.len or index == ref.active_tab_index) return;
+        ref.active_tab_index = index;
+        const tab = &ref.tabs.items[index];
+        self.activateBrowserTabRuntime(tab.url, tab.title);
+        self.markDirty();
+    }
+
+    pub fn closeBrowserTab(self: *AppState, index: usize) void {
+        const ref = self.visibleBrowserPaneRefMutable() orelse return;
+        if (index >= ref.tabs.items.len) return;
+        if (ref.tabs.items.len == 1) {
+            ref.tabs.items[0].deinit(self.allocator);
+            ref.tabs.items[0] = .{};
+            ref.active_tab_index = 0;
+        } else {
+            var removed = ref.tabs.orderedRemove(index);
+            removed.deinit(self.allocator);
+            if (ref.active_tab_index >= ref.tabs.items.len) ref.active_tab_index = ref.tabs.items.len - 1 else if (index < ref.active_tab_index) ref.active_tab_index -= 1;
+        }
+        const active = ref.activeTab().?;
+        self.activateBrowserTabRuntime(active.url, active.title);
+        self.markDirty();
+    }
+
+    fn activateBrowserTabRuntime(self: *AppState, url: ?[]const u8, title: ?[]const u8) void {
+        self.browser_state.setCurrentUrl(url) catch {};
+        self.browser_state.setCurrentTitle(title) catch {};
+        self.browser_state.setAddress(url orelse "");
+        self.browser_address_cursor = self.browser_state.addressInput().len;
+        self.browser_address_selection_anchor = null;
+        self.browser_state.status = .opening;
+        self.browser_state.controller.navigate(url orelse "about:blank") catch |err| {
+            log.warn("failed to activate browser tab: {s}", .{@errorName(err)});
+            self.browser_state.status = .failed;
+            self.browser_state.setLastError("Failed to activate browser tab.") catch {};
+        };
     }
 
     pub fn reloadBrowser(self: *AppState) void {
@@ -23081,7 +23251,7 @@ test "sidebar pane selection restores a sibling browser URL snapshot" {
     const chat_pane_id = layout.panes.items[0].id;
     const browser_pane_id = try layout.ensureBrowserPane(allocator);
     const browser_ref = state.browserPaneRefMutable(0, browser_pane_id) orelse return error.TestExpectedEqual;
-    try browser_ref.recordNavigation(allocator, "https://example.com/restored");
+    try browser_ref.activeTab().?.recordNavigation(allocator, "https://example.com/restored");
     layout.focused_pane_id = chat_pane_id;
 
     state.focusWorkspaceOpenPaneFromSidebar(0, chat_pane_id);
@@ -23503,4 +23673,9 @@ fn daemonPayloadStringAlloc(payload_json: []const u8, field: []const u8) ?[]u8 {
     if (parsed.value != .object) return null;
     const value = jsonValueString(parsed.value.object.get(field) orelse .null) orelse return null;
     return std.heap.page_allocator.dupe(u8, value) catch null;
+}
+
+test "inspector disabled lifecycle messages are distinguished from other events" {
+    try std.testing.expect(AppState.isInspectorDisabledMessage("{\"source\":\"verde-inspector\",\"type\":\"inspector:disabled\"}"));
+    try std.testing.expect(!AppState.isInspectorDisabledMessage("{\"source\":\"verde-inspector\",\"type\":\"inspector:enabled\"}"));
 }
