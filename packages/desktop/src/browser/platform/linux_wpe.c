@@ -546,7 +546,8 @@ static void verde_browser_linux_context_menu_items_to_json(
 static char *verde_browser_linux_context_menu_to_json_with_inspector(
     struct verde_browser_linux *browser,
     WebKitContextMenu *menu,
-    gboolean remote_inspector_configured
+    gboolean remote_inspector_configured,
+    const char *link_url
 ) {
     if (browser != NULL) verde_browser_linux_clear_context_items(browser);
     if (menu == NULL) return g_strdup("{\"x\":0,\"y\":0,\"items\":[]}");
@@ -554,18 +555,16 @@ static char *verde_browser_linux_context_menu_to_json_with_inspector(
     gint y = 0;
     verde_browser_linux_context_menu_get_position_compat(menu, &x, &y);
     GString *json = g_string_new(NULL);
-    g_string_append_printf(json, "{\"x\":%d,\"y\":%d,\"items\":[", x, y);
+    g_string_append_printf(json, "{\"x\":%d,\"y\":%d,\"link_url\":", x, y);
+    if (link_url != NULL && link_url[0] != '\0') {
+        verde_browser_linux_json_append_string(json, link_url);
+    } else {
+        g_string_append(json, "null");
+    }
+    g_string_append(json, ",\"items\":[");
     verde_browser_linux_context_menu_items_to_json(browser, menu, json, remote_inspector_configured);
     g_string_append(json, "]}");
     return g_string_free(json, FALSE);
-}
-
-static char *verde_browser_linux_context_menu_to_json(struct verde_browser_linux *browser, WebKitContextMenu *menu) {
-    return verde_browser_linux_context_menu_to_json_with_inspector(
-        browser,
-        menu,
-        verde_browser_linux_remote_inspector_configured()
-    );
 }
 
 #ifdef VERDE_BROWSER_LINUX_TESTING
@@ -619,7 +618,8 @@ char *verde_browser_linux_test_context_menu_payload(unsigned int scenario, int i
     char *payload = verde_browser_linux_context_menu_to_json_with_inspector(
         &browser,
         menu,
-        inspector_configured != 0
+        inspector_configured != 0,
+        NULL
     );
     verde_browser_linux_clear_context_items(&browser);
     g_object_unref(menu);
@@ -1138,12 +1138,17 @@ static void verde_browser_linux_on_web_process_terminated(WebKitWebView *web_vie
 static gboolean verde_browser_linux_on_context_menu(WebKitWebView *web_view, WebKitContextMenu *menu, WebKitHitTestResult *hit_test, gpointer user_data) {
     struct verde_browser_linux *browser = user_data;
     (void)web_view;
-    (void)hit_test;
     if (browser == NULL || menu == NULL) return FALSE;
 
     verde_browser_linux_clear_context_menu(browser, FALSE);
     browser->context_menu = g_object_ref(menu);
-    char *payload = verde_browser_linux_context_menu_to_json(browser, menu);
+    const gchar *link_url = hit_test != NULL ? webkit_hit_test_result_get_link_uri(hit_test) : NULL;
+    char *payload = verde_browser_linux_context_menu_to_json_with_inspector(
+        browser,
+        menu,
+        verde_browser_linux_remote_inspector_configured(),
+        link_url
+    );
     if (verde_browser_linux_frame_log_enabled()) {
         fprintf(stderr, "verde-browser-linux WPE context-menu items=%u\n", browser->context_item_count);
         fflush(stderr);

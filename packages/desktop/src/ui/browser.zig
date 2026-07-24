@@ -24,6 +24,10 @@ const NF_COD_ELLIPSIS = "\u{EA7C}";
 const NF_COD_LOADING = "\u{EB19}";
 const NF_COD_ERROR = "\u{EA87}";
 const NF_COD_PINNED = "\u{EB2B}";
+const NF_COD_LOCK = "\u{EA75}";
+const NF_COD_WARNING = "\u{EA6C}";
+const NF_COD_LINK_EXTERNAL = "\u{EB14}";
+const NF_COD_GLOBE = "\u{EB01}";
 
 const TAB_ROW_HEIGHT: f32 = 36.0;
 const NAV_ROW_HEIGHT: f32 = 44.0;
@@ -38,6 +42,8 @@ const TOOLBAR_FIELD_MIN_WIDTH: f32 = 120.0;
 
 const BrowserContextMenuAction = union(enum) {
     backend_item: app_state.BrowserContextMenuItem,
+    open_link_current,
+    open_link_new_tab,
     close_pane,
 };
 
@@ -60,6 +66,9 @@ const BrowserHitKind = enum {
     new_tab,
     close_tab,
     copy_url,
+    open_external,
+    overflow,
+    security_info,
     close,
 };
 
@@ -68,7 +77,7 @@ const BrowserHit = struct {
     kind: BrowserHitKind,
 };
 
-var palette_hits: [16]BrowserHit = undefined;
+var palette_hits: [24]BrowserHit = undefined;
 var palette_hit_count: usize = 0;
 var palette_toolbar_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 var palette_menu_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
@@ -90,6 +99,30 @@ var tab_drag_source: ?usize = null;
 var tab_drag_target: ?usize = null;
 var tab_drag_start_x: f32 = 0.0;
 var tab_drag_active = false;
+var toolbar_overflow_open = false;
+var palette_overflow_menu_rect: palette.Rect = .{};
+
+const BrowserOverflowAction = union(enum) {
+    select_tab: usize,
+    duplicate_tab,
+    toggle_pin,
+    maximize_pane,
+    toggle_detach,
+    reload,
+    copy_url,
+    open_external,
+    toggle_inspector,
+    close_pane,
+};
+
+const BrowserOverflowHit = struct {
+    rect: palette.Rect,
+    action: BrowserOverflowAction,
+    enabled: bool,
+};
+
+var palette_overflow_hits: [32]BrowserOverflowHit = undefined;
+var palette_overflow_hit_count: usize = 0;
 
 const CLOSE_PANE_MENU_INDEX = std.math.maxInt(u32);
 
@@ -108,6 +141,8 @@ pub fn renderDockAtWithReserve(state: *app_state.AppState, rect: palette.Rect, t
     palette_context_menu_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
     palette_context_menu_panel_count = 0;
     palette_context_menu_hit_count = 0;
+    palette_overflow_menu_rect = .{};
+    palette_overflow_hit_count = 0;
 
     const toolbar_height = theme.scaledUi(TOOLBAR_HEIGHT);
     renderPaneCanvas(state, .{
@@ -118,6 +153,7 @@ pub fn renderDockAtWithReserve(state: *app_state.AppState, rect: palette.Rect, t
     });
     renderToolbar(state, rect, toolbar_right_reserve);
     renderBrowserContextMenu(state);
+    renderToolbarTooltip(state);
 }
 
 /// Returns the height reserved for the browser pane's toolbar chrome.
@@ -141,6 +177,10 @@ pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) void
                 },
                 .close_pane => {
                     state.browser_context_menu_selected_index = CLOSE_PANE_MENU_INDEX;
+                    state.browser_context_menu_active_parent = null;
+                },
+                .open_link_current, .open_link_new_tab => {
+                    state.browser_context_menu_selected_index = null;
                     state.browser_context_menu_active_parent = null;
                 },
             }
@@ -171,6 +211,8 @@ pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) void
 pub fn wantsPointerAt(state: *app_state.AppState, x: f32, y: f32) bool {
     if (!state.isBrowserVisible()) return false;
 
+    if (toolbar_overflow_open and rectContainsPoint(palette_overflow_menu_rect, x, y)) return true;
+
     var index = palette_hit_count;
     while (index > 0) {
         index -= 1;
@@ -182,6 +224,7 @@ pub fn wantsPointerAt(state: *app_state.AppState, x: f32, y: f32) bool {
             .forward => state.browserCanGoForward(),
             .inspect_toggle, .inspect_mode_menu => state.canUseBrowserInspector(),
             .copy_url => state.browserState().current_url != null,
+            .open_external => state.browserState().current_url != null,
             else => true,
         };
     }
@@ -196,6 +239,7 @@ pub fn wantsPointerAt(state: *app_state.AppState, x: f32, y: f32) bool {
         if (browserContextMenuActionAtPoint(x, y)) |action| {
             return switch (action) {
                 .backend_item => |item| item.enabled and !item.separator,
+                .open_link_current, .open_link_new_tab => true,
                 .close_pane => true,
             };
         }
@@ -237,12 +281,26 @@ fn toolbarHitKindByName(name: []const u8) ?BrowserHitKind {
     if (std.mem.eql(u8, name, "close")) return .close;
     if (std.mem.eql(u8, name, "new-tab")) return .new_tab;
     if (std.mem.eql(u8, name, "close-tab")) return .close_tab;
+    if (std.mem.eql(u8, name, "overflow")) return .overflow;
+    if (std.mem.eql(u8, name, "open-external")) return .open_external;
     return null;
 }
 
 pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
     if (!state.isBrowserVisible()) return false;
     palette_mouse_pos = .{ x, y };
+
+    if (toolbar_overflow_open) {
+        if (!down) return rectContainsPoint(palette_overflow_menu_rect, x, y) or rectContainsPoint(palette_toolbar_rect, x, y);
+        if (overflowActionAtPoint(x, y)) |hit| {
+            if (hit.enabled) activateOverflowAction(state, hit.action);
+            toolbar_overflow_open = false;
+            state.noteInteraction();
+            return true;
+        }
+        if (rectContainsPoint(palette_overflow_menu_rect, x, y)) return true;
+        toolbar_overflow_open = false;
+    }
 
     if (state.browser_context_menu_open) {
         if (!down) {
@@ -265,6 +323,8 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
                             _ = state.closeCurrentProjectWorkspacePane(pane_id);
                         }
                     },
+                    .open_link_current => state.openBrowserContextLink(false),
+                    .open_link_new_tab => state.openBrowserContextLink(true),
                 }
             }
             state.noteInteraction();
@@ -367,6 +427,12 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
                 state.closeBrowserTab(state.activeBrowserTabIndex());
             },
             .copy_url => copyCurrentUrl(state),
+            .open_external => state.openCurrentBrowserUrlExternally(),
+            .overflow => {
+                toolbar_overflow_open = !toolbar_overflow_open;
+                state.browser_inspector_menu_open = false;
+            },
+            .security_info => state.setSidebarNotice(browserSecurityNotice(state.browserState().current_url)),
             .close => {
                 blurAddress(state);
                 state.browser_inspector_menu_open = false;
@@ -897,11 +963,19 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
     const close_pane_rect: palette.Rect = .{ .x = row_right - button_size, .y = row_y, .w = button_size, .h = button_size };
     renderCompactIconButton(state, close_pane_rect, NF_COD_CLOSE, rectHovered(close_pane_rect), false);
     addPaletteHit(close_pane_rect, .close);
+    const overflow_rect: palette.Rect = .{
+        .x = close_pane_rect.x - right_reserve - gap - button_size,
+        .y = row_y,
+        .w = button_size,
+        .h = button_size,
+    };
+    renderCompactIconButton(state, overflow_rect, NF_COD_ELLIPSIS, rectHovered(overflow_rect) or toolbar_overflow_open, false);
+    addPaletteHit(overflow_rect, .overflow);
 
     const tabs_x = new_tab_rect.x + new_tab_rect.w + gap;
-    const tabs_right = close_pane_rect.x - right_reserve - gap;
-    const tabs_w = @max(tabs_right - tabs_x, theme.scaledUi(40.0));
-    if (tab_count <= 1) {
+    const tabs_right = overflow_rect.x - gap;
+    const tabs_w = @max(tabs_right - tabs_x, 0.0);
+    if (tabs_w >= theme.scaledUi(40.0) and tab_count <= 1) {
         const tab_rect: palette.Rect = .{
             .x = tabs_x,
             .y = row_y,
@@ -927,11 +1001,15 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
         renderCompactIconButton(state, tab_close_rect, NF_COD_CLOSE, rectHovered(tab_close_rect), false);
         palette_tab_hits[palette_tab_hit_count] = .{ .rect = tab_close_rect, .index = 0, .kind = .close };
         palette_tab_hit_count += 1;
-    } else {
+    } else if (tabs_w >= theme.scaledUi(40.0)) {
         const visible_count = @min(tab_count, palette_tab_hits.len / 2);
         const tab_width = @min(theme.scaledUi(180.0), @max(tabs_w / @as(f32, @floatFromInt(visible_count)), theme.scaledUi(56.0)));
+        const slot_count = @max(@as(usize, 1), @as(usize, @intFromFloat(@floor((tabs_w + gap) / (tab_width + gap)))));
+        const active_index = state.activeBrowserTabIndex();
+        const first_visible = firstVisibleBrowserTabIndex(tab_count, active_index, slot_count);
+        const last_visible = @min(first_visible + slot_count, tab_count);
         var tab_x = tabs_x;
-        for (0..visible_count) |tab_index| {
+        for (first_visible..last_visible) |tab_index| {
             if (palette_tab_hit_count + 2 > palette_tab_hits.len) break;
             if (tab_x + tab_width > tabs_right) break;
             const tab_rect: palette.Rect = .{ .x = tab_x, .y = row_y, .w = tab_width, .h = button_size };
@@ -973,17 +1051,17 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
             }
             tab_x += tab_width + gap;
         }
-        if (visible_count < tab_count or tab_x > tabs_right) {
-            const overflow_rect: palette.Rect = .{ .x = @max(tabs_x, tabs_right - button_size), .y = row_y, .w = button_size, .h = button_size };
-            renderCompactIconButton(state, overflow_rect, NF_COD_ELLIPSIS, rectHovered(overflow_rect), false);
-        }
     }
 
     const nav_y = dock_rect.y + tab_row_height + (theme.scaledUi(NAV_ROW_HEIGHT) - button_size) * 0.5;
     var cursor_x = dock_rect.x + pad_x;
     const show_copy = dock_rect.w >= theme.scaledUi(430.0);
-    const show_inspector = dock_rect.w >= theme.scaledUi(520.0);
-    const trailing_count: f32 = 1.0 + @as(f32, if (show_copy) 1.0 else 0.0) + @as(f32, if (show_inspector) 1.65 else 0.0);
+    const show_external = dock_rect.w >= theme.scaledUi(560.0);
+    const show_inspector = dock_rect.w >= theme.scaledUi(680.0);
+    const trailing_count: f32 = 1.0 +
+        @as(f32, if (show_copy) 1.0 else 0.0) +
+        @as(f32, if (show_external) 1.0 else 0.0) +
+        @as(f32, if (show_inspector) 1.65 else 0.0);
     const address_rect: palette.Rect = .{
         .x = cursor_x + (button_size + gap) * 2.0,
         .y = nav_y,
@@ -997,8 +1075,8 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
     const forward_rect: palette.Rect = .{ .x = cursor_x, .y = nav_y, .w = button_size, .h = button_size };
     renderCompactIconButton(state, forward_rect, NF_COD_ARROW_RIGHT, rectHovered(forward_rect), !state.browserCanGoForward());
     addPaletteHit(forward_rect, .forward);
-    renderPaletteAddressField(state, address_rect);
     addPaletteHit(address_rect, .address);
+    renderPaletteAddressField(state, address_rect);
 
     cursor_x = address_rect.x + address_rect.w + gap;
     const navigate_rect: palette.Rect = .{ .x = cursor_x, .y = nav_y, .w = button_size, .h = button_size };
@@ -1009,6 +1087,12 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
         const copy_rect: palette.Rect = .{ .x = cursor_x, .y = nav_y, .w = button_size, .h = button_size };
         renderCompactIconButton(state, copy_rect, NF_COD_COPY, rectHovered(copy_rect), state.browserState().current_url == null);
         addPaletteHit(copy_rect, .copy_url);
+        cursor_x += button_size + gap;
+    }
+    if (show_external) {
+        const external_rect: palette.Rect = .{ .x = cursor_x, .y = nav_y, .w = button_size, .h = button_size };
+        renderCompactIconButton(state, external_rect, NF_COD_LINK_EXTERNAL, rectHovered(external_rect), state.browserState().current_url == null);
+        addPaletteHit(external_rect, .open_external);
         cursor_x += button_size + gap;
     }
     if (show_inspector) {
@@ -1032,6 +1116,206 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
     } else {
         state.browser_inspector_menu_open = false;
     }
+    if (toolbar_overflow_open) renderToolbarOverflowMenu(state, overflow_rect, show_copy, show_external, show_inspector);
+}
+
+fn firstVisibleBrowserTabIndex(tab_count: usize, active_index: usize, slot_count: usize) usize {
+    if (tab_count == 0 or slot_count >= tab_count) return 0;
+    const centered_start = @min(active_index, tab_count - 1) -| slot_count / 2;
+    return @min(centered_start, tab_count - slot_count);
+}
+
+fn renderToolbarOverflowMenu(
+    state: *app_state.AppState,
+    anchor: palette.Rect,
+    copy_visible: bool,
+    external_visible: bool,
+    inspector_visible: bool,
+) void {
+    const row_h = theme.scaledUi(30.0);
+    const pad = theme.scaledUi(6.0);
+    const menu_w = theme.scaledUi(238.0);
+    const max_tab_rows = @min(state.browserTabCount(), @as(usize, 8));
+    const hidden_action_rows: usize =
+        @as(usize, if (copy_visible) 0 else 1) +
+        @as(usize, if (external_visible) 0 else 1) +
+        @as(usize, if (inspector_visible) 0 else 1);
+    const action_rows: usize = 6 + hidden_action_rows;
+    const row_count = max_tab_rows + action_rows;
+    const menu_h = pad * 2.0 + row_h * @as(f32, @floatFromInt(row_count));
+    const min_x = palette_toolbar_rect.x + theme.scaledUi(4.0);
+    const max_x = palette_toolbar_rect.x + palette_toolbar_rect.w - menu_w - theme.scaledUi(4.0);
+    palette_overflow_menu_rect = .{
+        .x = std.math.clamp(anchor.x + anchor.w - menu_w, min_x, @max(min_x, max_x)),
+        .y = anchor.y + anchor.h + theme.scaledUi(4.0),
+        .w = menu_w,
+        .h = menu_h,
+    };
+    queuePaletteRoundedRect(state, palette_overflow_menu_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(10.0));
+    queuePaletteBorder(state, palette_overflow_menu_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(10.0), theme.scaledUi(1.0));
+
+    var y = palette_overflow_menu_rect.y + pad;
+    for (0..max_tab_rows) |tab_index| {
+        var label_buf = std.mem.zeroes([160]u8);
+        const prefix = if (tab_index == state.activeBrowserTabIndex()) "Current: " else "Tab: ";
+        const label = std.fmt.bufPrint(&label_buf, "{s}{s}", .{ prefix, state.browserTabTitle(tab_index) }) catch state.browserTabTitle(tab_index);
+        renderToolbarOverflowRow(state, .{ .x = palette_overflow_menu_rect.x + pad, .y = y, .w = menu_w - pad * 2.0, .h = row_h }, label, .{ .select_tab = tab_index }, true);
+        y += row_h;
+    }
+
+    renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), "Duplicate active tab", .duplicate_tab, state.browserTabCount() > 0);
+    y += row_h;
+    renderToolbarOverflowRow(
+        state,
+        overflowRowRect(y, row_h, pad, menu_w),
+        if (state.browserTabPinned(state.activeBrowserTabIndex())) "Unpin active tab" else "Pin active tab",
+        .toggle_pin,
+        state.browserTabCount() > 0,
+    );
+    y += row_h;
+    const pane_id = state.currentProjectVisibleBrowserPaneId();
+    const maximized = if (pane_id) |id| state.isCurrentProjectWorkspacePaneMaximized(id) else false;
+    renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), if (maximized) "Restore pane" else "Maximize pane", .maximize_pane, pane_id != null);
+    y += row_h;
+    const detached = browserPaneIsDetached(state);
+    renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), if (detached) "Return pane to layout" else "Float pane", .toggle_detach, pane_id != null);
+    y += row_h;
+    renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), "Reload page", .reload, true);
+    y += row_h;
+    if (!copy_visible) {
+        renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), "Copy URL", .copy_url, state.browserState().current_url != null);
+        y += row_h;
+    }
+    if (!external_visible) {
+        renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), "Open in default browser", .open_external, state.browserState().current_url != null);
+        y += row_h;
+    }
+    if (!inspector_visible) {
+        renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), if (state.isBrowserInspectorEnabled()) "Disable inspector" else "Enable inspector", .toggle_inspector, state.canUseBrowserInspector());
+        y += row_h;
+    }
+    renderToolbarOverflowRow(state, overflowRowRect(y, row_h, pad, menu_w), "Close browser pane", .close_pane, pane_id != null);
+}
+
+fn overflowRowRect(y: f32, row_h: f32, pad: f32, menu_w: f32) palette.Rect {
+    return .{ .x = palette_overflow_menu_rect.x + pad, .y = y, .w = menu_w - pad * 2.0, .h = row_h };
+}
+
+fn renderToolbarOverflowRow(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    label: []const u8,
+    action: BrowserOverflowAction,
+    enabled: bool,
+) void {
+    const hovered = rectHovered(rect);
+    if (hovered and enabled) {
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(6.0));
+    }
+    queuePaletteText(state, .{
+        .x = rect.x + theme.scaledUi(8.0),
+        .y = rect.y + (rect.h - theme.scaledUi(13.0) * 1.25) * 0.5,
+        .w = rect.w - theme.scaledUi(16.0),
+        .h = theme.scaledUi(13.0) * 1.25,
+    }, label, paletteColor(if (enabled) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), rect);
+    if (palette_overflow_hit_count < palette_overflow_hits.len) {
+        palette_overflow_hits[palette_overflow_hit_count] = .{ .rect = rect, .action = action, .enabled = enabled };
+        palette_overflow_hit_count += 1;
+    }
+}
+
+fn overflowActionAtPoint(x: f32, y: f32) ?BrowserOverflowHit {
+    var index = palette_overflow_hit_count;
+    while (index > 0) {
+        index -= 1;
+        const hit = palette_overflow_hits[index];
+        if (rectContainsPoint(hit.rect, x, y)) return hit;
+    }
+    return null;
+}
+
+fn browserPaneIsDetached(state: *app_state.AppState) bool {
+    const pane_id = state.currentProjectVisibleBrowserPaneId() orelse return false;
+    const quick = state.currentProjectQuickPane() orelse return false;
+    return quick.pane_id == pane_id and quick.detached;
+}
+
+fn activateOverflowAction(state: *app_state.AppState, action: BrowserOverflowAction) void {
+    switch (action) {
+        .select_tab => |index| state.switchBrowserTab(index),
+        .duplicate_tab => state.duplicateBrowserTab(state.activeBrowserTabIndex()),
+        .toggle_pin => state.toggleBrowserTabPinned(state.activeBrowserTabIndex()),
+        .maximize_pane => if (state.currentProjectVisibleBrowserPaneId()) |pane_id| {
+            _ = state.toggleCurrentProjectWorkspacePaneMaximized(pane_id);
+        },
+        .toggle_detach => if (browserPaneIsDetached(state)) {
+            _ = state.returnCurrentProjectQuickPaneToTile();
+        } else if (state.currentProjectVisibleBrowserPaneId()) |pane_id| {
+            _ = state.focusCurrentProjectWorkspacePane(pane_id);
+            _ = state.floatFocusedWorkspacePane();
+        },
+        .reload => state.reloadBrowser(),
+        .copy_url => copyCurrentUrl(state),
+        .open_external => state.openCurrentBrowserUrlExternally(),
+        .toggle_inspector => if (state.canUseBrowserInspector()) state.toggleBrowserInspector(),
+        .close_pane => if (state.currentProjectVisibleBrowserPaneId()) |pane_id| {
+            _ = state.closeCurrentProjectWorkspacePane(pane_id);
+        },
+    }
+}
+
+fn renderToolbarTooltip(state: *app_state.AppState) void {
+    if (toolbar_overflow_open or state.browser_inspector_menu_open or state.browser_context_menu_open) return;
+    var index = palette_hit_count;
+    while (index > 0) {
+        index -= 1;
+        const hit = palette_hits[index];
+        if (!rectHovered(hit.rect) or hit.kind == .address) continue;
+        const label = toolbarTooltipLabel(state, hit.kind);
+        const font_size = theme.scaledUi(11.0);
+        const text_w = app_state.paletteUiTextPrefixWidth(label, font_size, label.len);
+        const pad_x = theme.scaledUi(7.0);
+        const tooltip_w = text_w + pad_x * 2.0;
+        const min_x = palette_toolbar_rect.x + theme.scaledUi(4.0);
+        const max_x = palette_toolbar_rect.x + palette_toolbar_rect.w - tooltip_w - theme.scaledUi(4.0);
+        const rect: palette.Rect = .{
+            .x = std.math.clamp(hit.rect.x + hit.rect.w * 0.5 - tooltip_w * 0.5, min_x, @max(min_x, max_x)),
+            .y = palette_toolbar_rect.y + palette_toolbar_rect.h + theme.scaledUi(4.0),
+            .w = tooltip_w,
+            .h = theme.scaledUi(24.0),
+        };
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(5.0));
+        queuePaletteBorder(state, rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(5.0), theme.scaledUi(1.0));
+        queuePaletteText(state, .{
+            .x = rect.x + pad_x,
+            .y = rect.y + (rect.h - font_size * 1.25) * 0.5,
+            .w = rect.w - pad_x * 2.0,
+            .h = font_size * 1.25,
+        }, label, paletteColor(theme.COLOR_TEXT_MUTED), font_size, rect);
+        return;
+    }
+}
+
+fn toolbarTooltipLabel(state: *app_state.AppState, kind: BrowserHitKind) []const u8 {
+    return switch (kind) {
+        .address => "",
+        .back => "Back",
+        .forward => "Forward",
+        .navigate => if (state.browserState().status == .opening) "Loading" else "Reload",
+        .inspect_toggle => if (state.isBrowserInspectorEnabled()) "Disable inspector" else "Enable inspector",
+        .inspect_mode_menu => "Inspector mode",
+        .inspect_mode_point => "Point inspector",
+        .inspect_mode_draw_box => "Box inspector",
+        .inspect_mode_draw_freeform => "Freeform inspector",
+        .setup_dev_server => "Set up development server",
+        .new_tab => "New tab",
+        .close_tab => "Close active tab",
+        .copy_url => "Copy URL",
+        .open_external => "Open in default browser",
+        .overflow => "Browser actions",
+        .security_info => browserSecurityNotice(state.browserState().current_url),
+        .close => "Close browser pane",
+    };
 }
 
 fn renderInspectorModeMenu(state: *app_state.AppState, anchor: palette.Rect, inspector_mode: browser_runtime.InspectorMode) void {
@@ -1080,7 +1364,7 @@ fn renderInspectorModeMenuRow(state: *app_state.AppState, rect: palette.Rect, la
 
 // Renders the root browser context menu plus the active recursive submenu chain.
 fn renderBrowserContextMenu(state: *app_state.AppState) void {
-    if (!state.browser_context_menu_open or state.browser_context_menu_items.items.len == 0) return;
+    if (!state.browser_context_menu_open) return;
     if (state.browser_context_menu_selected_index == null) {
         selectBrowserContextMenuBoundary(state, false);
     }
@@ -1100,6 +1384,7 @@ fn browserContextMenuContentHeight(state: *const app_state.AppState, parent_inde
     const separator_height = theme.scaledUi(9.0);
     const pad = theme.scaledUi(6.0);
     var height = pad * 2.0;
+    if (parent_index == null and state.browserContextMenuHasLink()) height += row_height * 2.0 + separator_height;
     for (state.browser_context_menu_items.items) |item| {
         if (item.parent_index != parent_index) continue;
         height += if (item.separator) separator_height else row_height;
@@ -1150,6 +1435,22 @@ fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32,
     var row_y = panel_rect.y + pad;
     var open_child: ?app_state.BrowserContextMenuItem = null;
     var open_child_y: f32 = 0.0;
+
+    if (parent_index == null and state.browserContextMenuHasLink()) {
+        const current_rect: palette.Rect = .{ .x = panel_rect.x + pad, .y = row_y, .w = panel_rect.w - pad * 2.0, .h = row_height };
+        renderBrowserContextLinkRow(state, current_rect, "Open Link", .open_link_current);
+        row_y += row_height;
+        const new_tab_rect: palette.Rect = .{ .x = panel_rect.x + pad, .y = row_y, .w = panel_rect.w - pad * 2.0, .h = row_height };
+        renderBrowserContextLinkRow(state, new_tab_rect, "Open Link in New Tab", .open_link_new_tab);
+        row_y += row_height;
+        queuePaletteRect(state, snapRect(.{
+            .x = panel_rect.x + pad,
+            .y = row_y + separator_height * 0.5,
+            .w = panel_rect.w - pad * 2.0,
+            .h = theme.scaledUi(1.0),
+        }), paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 180)));
+        row_y += separator_height;
+    }
 
     for (state.browser_context_menu_items.items) |item| {
         if (item.parent_index != parent_index) continue;
@@ -1240,6 +1541,19 @@ fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32,
     }
 }
 
+fn renderBrowserContextLinkRow(state: *app_state.AppState, rect: palette.Rect, label: []const u8, action: BrowserContextMenuAction) void {
+    if (rectHovered(rect)) {
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
+    }
+    queuePaletteText(state, .{
+        .x = rect.x + theme.scaledUi(8.0),
+        .y = rect.y + (rect.h - theme.scaledUi(13.0) * 1.25) * 0.5,
+        .w = rect.w - theme.scaledUi(16.0),
+        .h = theme.scaledUi(13.0) * 1.25,
+    }, label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), rect);
+    addBrowserContextMenuHit(rect, action);
+}
+
 fn addBrowserContextMenuHit(rect: palette.Rect, action: BrowserContextMenuAction) void {
     if (palette_context_menu_hit_count >= palette_context_menu_hits.len) return;
     palette_context_menu_hits[palette_context_menu_hit_count] = .{ .rect = rect, .action = action };
@@ -1263,16 +1577,49 @@ fn browserContextMenuActionAtPoint(x: f32, y: f32) ?BrowserContextMenuAction {
     return null;
 }
 
+const BrowserSecurityState = enum {
+    secure,
+    local,
+    insecure,
+    internal,
+    unknown,
+};
+
+fn browserSecurityState(url: ?[]const u8) BrowserSecurityState {
+    const value = url orelse return .unknown;
+    if (std.mem.startsWith(u8, value, "https://")) return .secure;
+    if (std.mem.startsWith(u8, value, "http://localhost") or
+        std.mem.startsWith(u8, value, "http://127.") or
+        std.mem.startsWith(u8, value, "http://[::1]"))
+    {
+        return .local;
+    }
+    if (std.mem.startsWith(u8, value, "http://")) return .insecure;
+    if (std.mem.startsWith(u8, value, "about:") or std.mem.startsWith(u8, value, "file:")) return .internal;
+    return .unknown;
+}
+
+fn browserSecurityNotice(url: ?[]const u8) []const u8 {
+    return switch (browserSecurityState(url)) {
+        .secure => "Secure HTTPS connection.",
+        .local => "Local development page.",
+        .insecure => "Connection is not encrypted.",
+        .internal => "Browser-internal or local page.",
+        .unknown => "Connection security is unavailable.",
+    };
+}
+
 fn renderPaletteAddressField(state: *app_state.AppState, rect: palette.Rect) void {
     const focused = state.browser_address_focused;
     const address = state.browserState().addressInput();
     const text = if (address.len == 0 and !focused) "https://example.com" else address;
     const font_size = theme.scaledUi(14.0);
     const pad_x = theme.scaledUi(10.0);
+    const security_slot = theme.scaledUi(20.0);
     const text_rect: palette.Rect = .{
-        .x = rect.x + pad_x,
+        .x = rect.x + pad_x + security_slot,
         .y = rect.y + (rect.h - font_size * 1.25) * 0.5,
-        .w = rect.w - pad_x * 2.0,
+        .w = rect.w - pad_x * 2.0 - security_slot,
         .h = font_size * 1.25,
     };
     queuePaletteRoundedRect(
@@ -1284,10 +1631,31 @@ fn renderPaletteAddressField(state: *app_state.AppState, rect: palette.Rect) voi
     queuePaletteBorder(
         state,
         rect,
-        paletteColor(if (focused) theme.accent() else theme.COLOR_PANEL_MUTED),
+        paletteColor(if (state.browserState().status == .failed) theme.danger() else if (focused) theme.accent() else theme.COLOR_PANEL_MUTED),
         theme.scaledUi(8.0),
         theme.scaledUi(1.0),
     );
+
+    const security = browserSecurityState(state.browserState().current_url);
+    const security_rect: palette.Rect = .{
+        .x = rect.x + theme.scaledUi(7.0),
+        .y = rect.y + (rect.h - theme.scaledUi(14.0)) * 0.5,
+        .w = theme.scaledUi(14.0),
+        .h = theme.scaledUi(14.0),
+    };
+    const security_glyph = switch (security) {
+        .secure => NF_COD_LOCK,
+        .insecure => NF_COD_WARNING,
+        .local, .internal, .unknown => NF_COD_GLOBE,
+    };
+    const security_color = switch (security) {
+        .secure => theme.success(),
+        .local => theme.accent(),
+        .insecure => theme.danger(),
+        .internal, .unknown => theme.COLOR_TEXT_MUTED,
+    };
+    queuePaletteIcon(state, security_rect, security_glyph, security_rect.w, paletteColor(security_color));
+    addPaletteHit(security_rect, .security_info);
 
     // Draw selection highlight underneath the text so glyphs read over it.
     if (focused) {
@@ -1435,8 +1803,9 @@ fn addressIndexForClick(address: []const u8, font_size: f32, rel: f32) usize {
 fn cursorForAddressPoint(state: *app_state.AppState, rect: palette.Rect, x: f32) usize {
     const font_size = theme.scaledUi(14.0);
     const pad_x = theme.scaledUi(10.0);
+    const security_slot = theme.scaledUi(20.0);
     const address = state.browserState().addressInput();
-    const rel = @max(x - rect.x - pad_x, 0.0);
+    const rel = @max(x - rect.x - pad_x - security_slot, 0.0);
     return @min(addressIndexForClick(address, font_size, rel), address.len);
 }
 
@@ -1621,4 +1990,19 @@ test "browser context-menu keyboard selection filters rows by level and wraps" {
 
     const child_count = selectableBrowserContextMenuIndexesFromItems(&items, 1, false, &indexes);
     try std.testing.expectEqualSlices(u32, &.{4}, indexes[0..child_count]);
+}
+
+test "narrow tab windows keep the active browser tab visible" {
+    try std.testing.expectEqual(@as(usize, 0), firstVisibleBrowserTabIndex(8, 0, 3));
+    try std.testing.expectEqual(@as(usize, 3), firstVisibleBrowserTabIndex(8, 4, 3));
+    try std.testing.expectEqual(@as(usize, 5), firstVisibleBrowserTabIndex(8, 7, 3));
+    try std.testing.expectEqual(@as(usize, 0), firstVisibleBrowserTabIndex(2, 1, 3));
+}
+
+test "browser security presentation distinguishes remote local and internal URLs" {
+    try std.testing.expectEqual(BrowserSecurityState.secure, browserSecurityState("https://verdeai.dev"));
+    try std.testing.expectEqual(BrowserSecurityState.local, browserSecurityState("http://localhost:3000"));
+    try std.testing.expectEqual(BrowserSecurityState.insecure, browserSecurityState("http://example.com"));
+    try std.testing.expectEqual(BrowserSecurityState.internal, browserSecurityState("about:blank"));
+    try std.testing.expectEqual(BrowserSecurityState.unknown, browserSecurityState(null));
 }

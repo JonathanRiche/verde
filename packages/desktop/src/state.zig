@@ -269,6 +269,7 @@ pub const BrowserContextMenuItem = struct {
 const BrowserContextMenuPayload = struct {
     x: f32 = 0.0,
     y: f32 = 0.0,
+    link_url: ?[]const u8 = null,
     items: []const BrowserContextMenuPayloadItem = &.{},
 };
 
@@ -5436,6 +5437,7 @@ pub const AppState = struct {
     browser_context_menu_anchor_x: f32,
     browser_context_menu_anchor_y: f32,
     browser_context_menu_items: std.ArrayList(BrowserContextMenuItem),
+    browser_context_menu_link_url: ?[]u8,
     browser_context_menu_selected_index: ?u32,
     browser_context_menu_active_parent: ?u32,
     /// Split "Open" header menu (folder / editors); palette workspace chrome only.
@@ -5731,6 +5733,7 @@ pub const AppState = struct {
             .browser_context_menu_anchor_x = 0.0,
             .browser_context_menu_anchor_y = 0.0,
             .browser_context_menu_items = .empty,
+            .browser_context_menu_link_url = null,
             .browser_context_menu_selected_index = null,
             .browser_context_menu_active_parent = null,
             .workspace_header_open_menu_open = false,
@@ -14400,6 +14403,8 @@ pub const AppState = struct {
             self.allocator.free(item.label);
         }
         self.browser_context_menu_items.clearRetainingCapacity();
+        if (self.browser_context_menu_link_url) |url| self.allocator.free(url);
+        self.browser_context_menu_link_url = null;
         self.browser_context_menu_open = false;
         self.browser_context_menu_anchor_x = 0.0;
         self.browser_context_menu_anchor_y = 0.0;
@@ -14475,11 +14480,33 @@ pub const AppState = struct {
         const input_height = @max(self.browser_pane_input_size[1], 1.0);
         self.browser_context_menu_anchor_x = self.browser_pane_min[0] + parsed.value.x * (@max(displayed_width, 1.0) / input_width);
         self.browser_context_menu_anchor_y = self.browser_pane_min[1] + parsed.value.y * (@max(displayed_height, 1.0) / input_height);
+        if (parsed.value.link_url) |url| {
+            self.browser_context_menu_link_url = self.allocator.dupe(u8, url) catch |err| failed: {
+                log.warn("failed to retain browser context-menu link URL: {s}", .{@errorName(err)});
+                break :failed null;
+            };
+        }
 
         self.appendBrowserContextMenuPayloadItems(parsed.value.items, null);
-        self.browser_context_menu_open = self.browser_context_menu_items.items.len > 0;
+        self.browser_context_menu_open = self.browser_context_menu_items.items.len > 0 or self.browser_context_menu_link_url != null;
         self.browser_address_focused = false;
         self.browser_inspector_menu_open = false;
+    }
+
+    pub fn browserContextMenuHasLink(self: *const AppState) bool {
+        return self.browser_context_menu_open and self.browser_context_menu_link_url != null;
+    }
+
+    pub fn openBrowserContextLink(self: *AppState, new_tab: bool) void {
+        const url = self.browser_context_menu_link_url orelse return;
+        const owned = self.allocator.dupe(u8, url) catch return;
+        defer self.allocator.free(owned);
+        self.dismissBrowserContextMenu();
+        if (new_tab) self.createBrowserTab();
+        self.navigateBrowserToUrl(owned) catch |err| {
+            log.warn("failed to open browser context-menu link: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to open link.");
+        };
     }
 
     /// Re-shows the native browser window without changing dock visibility.
@@ -19727,6 +19754,19 @@ pub const AppState = struct {
         self.markDirty();
     }
 
+    pub fn openCurrentBrowserUrlExternally(self: *AppState) void {
+        const url = self.browser_state.current_url orelse {
+            self.setSidebarNotice("No browser URL to open.");
+            return;
+        };
+        utils.openUrlInDefaultBrowser(self.allocator, url) catch |err| {
+            log.warn("failed to open current browser URL externally: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to open URL in the default browser.");
+            return;
+        };
+        self.setSidebarNotice("Opened URL in the default browser.");
+    }
+
     pub fn selectAllBrowserFocusedElement(self: *AppState) void {
         const script =
             \\(function(){
@@ -24278,4 +24318,16 @@ fn daemonPayloadStringAlloc(payload_json: []const u8, field: []const u8) ?[]u8 {
 test "inspector disabled lifecycle messages are distinguished from other events" {
     try std.testing.expect(AppState.isInspectorDisabledMessage("{\"source\":\"verde-inspector\",\"type\":\"inspector:disabled\"}"));
     try std.testing.expect(!AppState.isInspectorDisabledMessage("{\"source\":\"verde-inspector\",\"type\":\"inspector:enabled\"}"));
+}
+
+test "browser context-menu payload retains an optional link disposition target" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        BrowserContextMenuPayload,
+        allocator,
+        "{\"x\":12,\"y\":18,\"link_url\":\"https://example.com/docs\",\"items\":[]}",
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("https://example.com/docs", parsed.value.link_url.?);
 }
