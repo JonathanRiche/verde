@@ -684,7 +684,11 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
         },
         .submitted => {
             if (state.currentThread().isSendPendingForUi()) {
-                state.setSidebarNotice("This thread is still running. Press Tab to queue or steer a follow-up.");
+                if (state.currentThread().provider == .codex) {
+                    state.queueDraftDuringSend();
+                } else {
+                    state.setSidebarNotice("This thread is still running. Press Tab to queue a follow-up.");
+                }
                 return;
             }
             if (state.acceptPrimaryFileSearchResult()) return;
@@ -9185,6 +9189,24 @@ pub const AppState = struct {
     pub fn queueOrSteerDraftDuringSend(self: *AppState) void {
         if (self.projects.items.len == 0) return;
         const thread = self.currentThreadMutable();
+        const kind: FollowupKind = switch (thread.provider) {
+            .codex => .steer,
+            .opencode => .queue,
+            .claude => .queue,
+            .cursor => .queue,
+        };
+        self.storeDraftDuringSend(kind);
+    }
+
+    /// Queues the current composer draft as a new turn after the active reply.
+    /// Codex uses this for Enter while Tab remains the distinct steer action.
+    pub fn queueDraftDuringSend(self: *AppState) void {
+        self.storeDraftDuringSend(.queue);
+    }
+
+    fn storeDraftDuringSend(self: *AppState, kind: FollowupKind) void {
+        if (self.projects.items.len == 0) return;
+        const thread = self.currentThreadMutable();
         if (!thread.isSendPending()) {
             self.setSidebarNotice("This chat is not running.");
             return;
@@ -9195,13 +9217,6 @@ pub const AppState = struct {
             self.setSidebarNotice("Type a message first.");
             return;
         }
-
-        const kind: FollowupKind = switch (thread.provider) {
-            .codex => .steer,
-            .opencode => .queue,
-            .claude => .queue,
-            .cursor => .queue,
-        };
 
         const send_state = thread.send_state;
         send_state.mutex.lock();
@@ -9246,7 +9261,7 @@ pub const AppState = struct {
         const thread = self.currentThread();
         if (!thread.isSendPending()) return null;
         return switch (thread.provider) {
-            .codex => "Tab to steer",
+            .codex => "Enter to queue \u{00B7} Tab to steer",
             .opencode => "Tab to queue",
             .claude => "Tab to queue",
             .cursor => "Tab to queue",
@@ -19100,7 +19115,10 @@ pub const AppState = struct {
         self.composer_focused = true;
         self.setFollowupPinRect(null);
         self.markDirty();
-        self.setSidebarNotice("Editing queued message. Press Tab to queue it again.");
+        self.setSidebarNotice(if (thread.provider == .codex)
+            "Editing follow-up. Press Enter to queue it, or Tab to steer."
+        else
+            "Editing queued message. Press Tab to queue it again.");
     }
 
     pub fn handleComposerDraftImageClearMouseButton(self: *AppState, x: f32, y: f32, down: bool) bool {

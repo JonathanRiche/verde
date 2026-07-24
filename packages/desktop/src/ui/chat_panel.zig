@@ -5390,7 +5390,8 @@ fn renderComposerDraftImageChip(state: *app_state.AppState, image: app_state.Cha
     queueText(state, .{ .x = clear_rect.x + clear_rect.w * 0.34, .y = clear_rect.y + clear_rect.h * 0.10, .w = clear_rect.w * 0.5, .h = clear_rect.h * 0.8 }, "x", paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), clear_rect);
 }
 
-/// While a reply is streaming, show Tab queue/steer hint once the user has typed a non-empty draft (matches `handlePendingThreadFollowupShortcut`).
+/// While a reply is streaming, show the provider's queue/steer shortcuts once
+/// the user has typed a non-empty draft.
 fn renderComposerFollowupHint(state: *app_state.AppState) void {
     if (!state.hasPendingStream()) return;
     const hint = state.pendingFollowupHint() orelse return;
