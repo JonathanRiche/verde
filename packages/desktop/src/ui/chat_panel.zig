@@ -93,7 +93,6 @@ var diff_file_open_hits: [MAX_DIFF_FILE_OPEN_HITS]DiffFileOpenHit = [_]DiffFileO
 
 const DiffLayoutHit = struct {
     rect: palette.Rect = .{},
-    key: u64 = 0,
     split: bool = false,
 };
 const MAX_DIFF_LAYOUT_HITS = 32;
@@ -573,10 +572,7 @@ pub fn transcriptActionWantsPointerAt(x: f32, y: f32) bool {
 const TranscriptAction = union(enum) {
     usage,
     diff_file_open: []const u8,
-    diff_layout: struct {
-        key: u64,
-        split: bool,
-    },
+    diff_layout: bool,
 };
 
 fn transcriptActionAt(x: f32, y: f32) ?TranscriptAction {
@@ -592,10 +588,7 @@ fn transcriptActionAt(x: f32, y: f32) ?TranscriptAction {
     index = 0;
     while (index < diff_layout_hit_count) : (index += 1) {
         const hit = diff_layout_hits[index];
-        if (rectContains(hit.rect, x, y)) return .{ .diff_layout = .{
-            .key = hit.key,
-            .split = hit.split,
-        } };
+        if (rectContains(hit.rect, x, y)) return .{ .diff_layout = hit.split };
     }
     return null;
 }
@@ -625,16 +618,12 @@ test "transcript action hit testing preserves usage and diff open actions" {
 
     diff_layout_hits[0] = .{
         .rect = .{ .x = 200.0, .y = 220.0, .w = 60.0, .h = 28.0 },
-        .key = 42,
         .split = true,
     };
     diff_layout_hit_count = 1;
     const layout = transcriptActionAt(230.0, 234.0) orelse return error.TestExpectedEqual;
     switch (layout) {
-        .diff_layout => |value| {
-            try std.testing.expectEqual(@as(u64, 42), value.key);
-            try std.testing.expect(value.split);
-        },
+        .diff_layout => |split| try std.testing.expect(split),
         else => return error.TestExpectedEqual,
     }
 }
@@ -1067,7 +1056,7 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
             switch (action) {
                 .usage => _ = state.showCurrentProviderUsage(),
                 .diff_file_open => |path| state.openTranscriptFileReference(path),
-                .diff_layout => |layout| state.setCardExpanded(layout.key, layout.split),
+                .diff_layout => |split| state.setDiffLayoutPreference(if (split) .split else .stacked),
             }
             return true;
         }
@@ -3226,22 +3215,13 @@ const DiffLayout = enum {
 
 const DIFF_SPLIT_MIN_WIDTH_CSS: f32 = 620.0;
 
-fn diffLayoutCardKey(message_index: usize) u64 {
-    var hasher = std.hash.Wyhash.init(0xD1FF5A17D1FF5A17);
-    hasher.update(std.mem.asBytes(&message_index));
-    hasher.update("diff_layout");
-    return hasher.final();
-}
-
 fn diffLayoutForWidth(
     state: ?*app_state.AppState,
-    message_index: ?usize,
     width: f32,
 ) DiffLayout {
     if (width < theme.scaledUi(DIFF_SPLIT_MIN_WIDTH_CSS)) return .stacked;
     const app = state orelse return .stacked;
-    const index = message_index orelse return .stacked;
-    return if (app.isCardExpanded(diffLayoutCardKey(index))) .split else .stacked;
+    return if (app.app_config.diff_layout_preference == .split) .split else .stacked;
 }
 
 fn diffSummaryHeight(state: ?*app_state.AppState, message_index: ?usize, body_raw: []const u8, column_width: f32) f32 {
@@ -3255,7 +3235,7 @@ fn diffSummaryHeightForFiles(state: ?*app_state.AppState, message_index: ?usize,
     const summary_h = theme.scaledUi(42.0);
     const file_h = theme.scaledUi(44.0);
     const code_line_h = theme.scaledUi(21.0);
-    const layout = diffLayoutForWidth(state, message_index, column_width);
+    const layout = diffLayoutForWidth(state, column_width);
     var total = outer_pad + summary_h;
     for (files) |file| {
         total += file_h;
@@ -3340,9 +3320,8 @@ fn renderDiffSummaryCard(
     const pad_y = theme.scaledUi(12.0);
     const header_h = theme.scaledUi(42.0);
     const row_h = theme.scaledUi(44.0);
-    const layout_key = diffLayoutCardKey(message_index);
     const can_split = bubble.w >= theme.scaledUi(DIFF_SPLIT_MIN_WIDTH_CSS);
-    const layout = diffLayoutForWidth(state, message_index, bubble.w);
+    const layout = diffLayoutForWidth(state, bubble.w);
 
     // Header: "Changed files - N file(s) +A -D"
     var total_add: i64 = 0;
@@ -3383,7 +3362,7 @@ fn renderDiffSummaryCard(
         .h = theme.scaledUi(20.0),
     }), counts orelse "", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
     if (can_split) {
-        renderDiffLayoutToggle(state, layout_toggle_rect, layout_key, layout, clip);
+        renderDiffLayoutToggle(state, layout_toggle_rect, layout, clip);
     }
 
     // Separator below header
@@ -3506,7 +3485,6 @@ fn renderDiffSummaryCard(
 fn renderDiffLayoutToggle(
     state: *app_state.AppState,
     rect: palette.Rect,
-    key: u64,
     layout: DiffLayout,
     clip: palette.Rect,
 ) void {
@@ -3530,8 +3508,8 @@ fn renderDiffLayoutToggle(
     renderDiffLayoutOption(state, stacked_rect, "Stacked", layout == .stacked, clip);
     renderDiffLayoutOption(state, split_rect, "Split", layout == .split, clip);
     if (diff_layout_hit_count + 2 <= diff_layout_hits.len) {
-        diff_layout_hits[diff_layout_hit_count] = .{ .rect = stacked_rect, .key = key, .split = false };
-        diff_layout_hits[diff_layout_hit_count + 1] = .{ .rect = split_rect, .key = key, .split = true };
+        diff_layout_hits[diff_layout_hit_count] = .{ .rect = stacked_rect, .split = false };
+        diff_layout_hits[diff_layout_hit_count + 1] = .{ .rect = split_rect, .split = true };
         diff_layout_hit_count += 2;
     }
 }

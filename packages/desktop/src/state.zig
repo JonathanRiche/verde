@@ -237,6 +237,7 @@ pub const SettingsDraft = struct {
     open_action: SettingsOpenAction = .folder,
     link_open_target: app_config.LinkOpenTarget = .verde_browser,
     tool_call_group_preference: app_config.ToolCallGroupPreference = .collapsed,
+    diff_layout_preference: app_config.DiffLayoutPreference = .stacked,
     automatic_chat_titles_enabled: bool = true,
     chat_title_provider: app_config.ChatTitleProvider = .codex,
     new_chat_pane_behavior: app_config.NewChatPaneBehavior = .new_pane,
@@ -9797,6 +9798,7 @@ pub const AppState = struct {
             .open_action = settingsOpenActionFromConfig(self.app_config.default_open_action),
             .link_open_target = self.app_config.link_open_target,
             .tool_call_group_preference = self.app_config.tool_call_group_preference,
+            .diff_layout_preference = self.app_config.diff_layout_preference,
             .automatic_chat_titles_enabled = self.app_config.automatic_chat_titles_enabled,
             .chat_title_provider = self.app_config.chat_title_provider,
             .new_chat_pane_behavior = self.app_config.new_chat_pane_behavior,
@@ -9816,6 +9818,7 @@ pub const AppState = struct {
         if (draft.theme_choice != self.app_config.themeChoiceIndex()) return true;
         if (draft.link_open_target != self.app_config.link_open_target) return true;
         if (draft.tool_call_group_preference != self.app_config.tool_call_group_preference) return true;
+        if (draft.diff_layout_preference != self.app_config.diff_layout_preference) return true;
         if (draft.automatic_chat_titles_enabled != self.app_config.automatic_chat_titles_enabled) return true;
         if (draft.chat_title_provider != self.app_config.chat_title_provider) return true;
         if (draft.new_chat_pane_behavior != self.app_config.new_chat_pane_behavior) return true;
@@ -10034,6 +10037,7 @@ pub const AppState = struct {
         self.app_config.terminal_font_size = theme.clampf(self.settings_draft.terminal_font_size, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE);
         self.app_config.link_open_target = self.settings_draft.link_open_target;
         self.app_config.tool_call_group_preference = self.settings_draft.tool_call_group_preference;
+        self.app_config.diff_layout_preference = self.settings_draft.diff_layout_preference;
         self.app_config.automatic_chat_titles_enabled = self.settings_draft.automatic_chat_titles_enabled;
         self.app_config.chat_title_provider = self.settings_draft.chat_title_provider;
         self.app_config.new_chat_pane_behavior = self.settings_draft.new_chat_pane_behavior;
@@ -21437,9 +21441,12 @@ pub const AppState = struct {
         return self.expanded_cards.get(key) orelse default_expanded;
     }
 
-    pub fn setCardExpanded(self: *AppState, key: u64, expanded: bool) void {
-        self.expanded_cards.put(key, expanded) catch |err| {
-            log.warn("failed to store card state: {s}", .{@errorName(err)});
+    pub fn setDiffLayoutPreference(self: *AppState, preference: app_config.DiffLayoutPreference) void {
+        if (self.app_config.diff_layout_preference == preference) return;
+        self.app_config.diff_layout_preference = preference;
+        self.settings_draft.diff_layout_preference = preference;
+        app_config.saveAppConfig(self.allocator, &self.app_config) catch |err| {
+            log.warn("failed to save diff layout preference: {s}", .{@errorName(err)});
         };
         self.markDirty();
     }
