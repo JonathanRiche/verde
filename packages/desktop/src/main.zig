@@ -687,10 +687,14 @@ fn mainInner(init: std.process.Init) !void {
 
 // Resolves the OS mouse cursor each frame: terminal and browser-reported
 // shapes win, then interactive Palette controls, otherwise the default arrow.
-fn syncMouseCursor(state: *const AppState, cache: *SystemCursorCache) void {
+fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
     // Workspace pane chrome overlays chat, terminal, and native browser
     // content, so its pointer affordance must win before content cursors.
     if (!modalHitAtMouse(state) and workspace_panes_ui.wantsPointerAt(state.palette_mouse_x, state.palette_mouse_y)) {
+        applySystemCursor(cache, .pointer);
+        return;
+    }
+    if (!modalHitAtMouse(state) and browser_ui.wantsPointerAt(state, state.palette_mouse_x, state.palette_mouse_y)) {
         applySystemCursor(cache, .pointer);
         return;
     }
@@ -1448,6 +1452,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (native_browser_focused) {
                 state.browser_address_focused = false;
             }
+            if (handleBrowserInspectorEscape(state, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (macosNativeBrowserShouldOwnKeyboard(state)) {
                 syncWindowTextInput(window, state);
                 return true;
@@ -1883,6 +1891,15 @@ fn handleBrowserKeyboardEvent(state: *AppState, event: *const sdl.KeyboardEvent)
         .alt = isKeymodPressed(event.mod, sdl.Keymod.alt),
         .super = isKeymodPressed(event.mod, sdl.Keymod.gui),
     });
+}
+
+fn handleBrowserInspectorEscape(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!state.isBrowserPaneFocused() or !state.isBrowserInspectorEnabled()) return false;
+    if (!event.down or event.repeat) return false;
+    if (event.key != .escape and event.scancode != .escape) return false;
+    state.browser_inspector_menu_open = false;
+    state.disableBrowserInspector(false);
+    return true;
 }
 
 fn handleBrowserClipboardShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {

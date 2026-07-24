@@ -18,9 +18,14 @@ const NF_COD_REFRESH = "\u{EB37}";
 const NF_COD_INSPECT = "\u{EBD1}";
 const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
 const NF_COD_CLOSE = "\u{EA76}";
+const NF_COD_ADD = "\u{EA60}";
+const NF_COD_COPY = "\u{EBCC}";
+const NF_COD_ELLIPSIS = "\u{EA7C}";
 
-const TOOLBAR_HEIGHT: f32 = 52.0;
-const TOOLBAR_BUTTON_SIZE: f32 = 34.0;
+const TAB_ROW_HEIGHT: f32 = 36.0;
+const NAV_ROW_HEIGHT: f32 = 44.0;
+const TOOLBAR_HEIGHT: f32 = TAB_ROW_HEIGHT + NAV_ROW_HEIGHT;
+const TOOLBAR_BUTTON_SIZE: f32 = 30.0;
 const TOOLBAR_BUTTON_RADIUS: f32 = 8.0;
 const TOOLBAR_ICON_SIZE: f32 = 15.0;
 const TOOLBAR_CHEVRON_SIZE: f32 = 11.0;
@@ -49,6 +54,9 @@ const BrowserHitKind = enum {
     inspect_mode_draw_box,
     inspect_mode_draw_freeform,
     setup_dev_server,
+    new_tab,
+    close_tab,
+    copy_url,
     close,
 };
 
@@ -67,6 +75,14 @@ var palette_context_menu_panel_count: usize = 0;
 var palette_context_menu_hits: [128]BrowserContextMenuHit = undefined;
 var palette_context_menu_hit_count: usize = 0;
 var palette_mouse_pos: [2]f32 = .{ -1.0, -1.0 };
+const BrowserTabHitKind = enum { select, close };
+const BrowserTabHit = struct {
+    rect: palette.Rect,
+    index: usize,
+    kind: BrowserTabHitKind,
+};
+var palette_tab_hits: [64]BrowserTabHit = undefined;
+var palette_tab_hit_count: usize = 0;
 
 const CLOSE_PANE_MENU_INDEX = std.math.maxInt(u32);
 
@@ -79,6 +95,7 @@ pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
 pub fn renderDockAtWithReserve(state: *app_state.AppState, rect: palette.Rect, toolbar_right_reserve: f32) void {
     if (!state.isBrowserVisible()) return;
     palette_hit_count = 0;
+    palette_tab_hit_count = 0;
     palette_toolbar_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
     palette_menu_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
     palette_context_menu_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
@@ -99,6 +116,11 @@ pub fn renderDockAtWithReserve(state: *app_state.AppState, rect: palette.Rect, t
 /// Returns the height reserved for the browser pane's toolbar chrome.
 pub fn paneToolbarHeight() f32 {
     return theme.scaledUi(TOOLBAR_HEIGHT);
+}
+
+/// Returns the top toolbar row used by pane-level actions.
+pub fn paneToolbarActionRowHeight() f32 {
+    return theme.scaledUi(TAB_ROW_HEIGHT);
 }
 
 pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) void {
@@ -125,6 +147,42 @@ pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) void
             state.browser_address_cursor = cursorForAddressPoint(state, hit.rect, x);
         }
     }
+}
+
+/// Returns whether the pointer is over an enabled browser chrome action.
+pub fn wantsPointerAt(state: *app_state.AppState, x: f32, y: f32) bool {
+    if (!state.isBrowserVisible()) return false;
+
+    var index = palette_hit_count;
+    while (index > 0) {
+        index -= 1;
+        const hit = palette_hits[index];
+        if (!rectContainsPoint(hit.rect, x, y)) continue;
+        return switch (hit.kind) {
+            .address => false,
+            .back => state.browserCanGoBack(),
+            .forward => state.browserCanGoForward(),
+            .inspect_toggle, .inspect_mode_menu => state.canUseBrowserInspector(),
+            .copy_url => state.browserState().current_url != null,
+            else => true,
+        };
+    }
+
+    index = palette_tab_hit_count;
+    while (index > 0) {
+        index -= 1;
+        if (rectContainsPoint(palette_tab_hits[index].rect, x, y)) return true;
+    }
+
+    if (state.browser_context_menu_open) {
+        if (browserContextMenuActionAtPoint(x, y)) |action| {
+            return switch (action) {
+                .backend_item => |item| item.enabled and !item.separator,
+                .close_pane => true,
+            };
+        }
+    }
+    return false;
 }
 
 fn findHit(kind: BrowserHitKind) ?BrowserHit {
@@ -159,6 +217,8 @@ fn toolbarHitKindByName(name: []const u8) ?BrowserHitKind {
     if (std.mem.eql(u8, name, "inspect-draw-box")) return .inspect_mode_draw_box;
     if (std.mem.eql(u8, name, "inspect-draw-freeform")) return .inspect_mode_draw_freeform;
     if (std.mem.eql(u8, name, "close")) return .close;
+    if (std.mem.eql(u8, name, "new-tab")) return .new_tab;
+    if (std.mem.eql(u8, name, "close-tab")) return .close_tab;
     return null;
 }
 
@@ -271,6 +331,15 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
                 blurAddress(state);
                 state.setupBrowserDevServer();
             },
+            .new_tab => {
+                blurAddress(state);
+                state.createBrowserTab();
+            },
+            .close_tab => {
+                blurAddress(state);
+                state.closeBrowserTab(state.activeBrowserTabIndex());
+            },
+            .copy_url => copyCurrentUrl(state),
             .close => {
                 blurAddress(state);
                 state.browser_inspector_menu_open = false;
@@ -280,6 +349,20 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
                     state.closeBrowser();
                 }
             },
+        }
+        state.noteInteraction();
+        return true;
+    }
+
+    var tab_index = palette_tab_hit_count;
+    while (tab_index > 0) {
+        tab_index -= 1;
+        const hit = palette_tab_hits[tab_index];
+        if (!rectContainsPoint(hit.rect, x, y)) continue;
+        blurAddress(state);
+        switch (hit.kind) {
+            .select => state.switchBrowserTab(hit.index),
+            .close => state.closeBrowserTab(hit.index),
         }
         state.noteInteraction();
         return true;
@@ -506,6 +589,15 @@ fn copyAddressSelection(state: *app_state.AppState) void {
     };
 }
 
+fn copyCurrentUrl(state: *app_state.AppState) void {
+    const url = state.browserState().current_url orelse return;
+    const value = state.allocator.dupeZ(u8, url) catch return;
+    defer state.allocator.free(value);
+    sdl.setClipboardText(value) catch |err| {
+        app_state.log.warn("failed to copy current browser URL: {s}", .{@errorName(err)});
+    };
+}
+
 fn pasteIntoAddress(state: *app_state.AppState) void {
     const text = state.readClipboardTextForPaste() orelse return;
     defer state.allocator.free(text);
@@ -641,6 +733,42 @@ fn renderToolbarIconButton(
     queuePaletteIcon(state, iconRectForButton(rect, icon_size), glyph, icon_size, paletteColor(icon_color));
 }
 
+// Compact toolbar control: quiet at rest, with a precise hover surface.
+fn renderCompactIconButton(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    glyph: []const u8,
+    hovered: bool,
+    disabled: bool,
+) void {
+    if (hovered and !disabled) {
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(5.0));
+    }
+    const color = if (disabled) theme.COLOR_TEXT_SUBTLE else if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
+    const icon_size = theme.scaledUi(13.0);
+    queuePaletteIcon(state, iconRectForButton(rect, icon_size), glyph, icon_size, paletteColor(color));
+}
+
+// Inspector segments retain an accent treatment while the tool is armed.
+fn renderInspectorIconButton(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    glyph: []const u8,
+    hovered: bool,
+    disabled: bool,
+    active: bool,
+) void {
+    if (active and !disabled) {
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.accent(), 92)), theme.scaledUi(5.0));
+        queuePaletteBorder(state, rect, paletteColor(theme.withAlpha(theme.accent(), 180)), theme.scaledUi(5.0), theme.scaledUi(1.0));
+    } else if (hovered and !disabled) {
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(5.0));
+    }
+    const color = if (disabled) theme.COLOR_TEXT_SUBTLE else if (active or hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
+    const icon_size = theme.scaledUi(13.0);
+    queuePaletteIcon(state, iconRectForButton(rect, icon_size), glyph, icon_size, paletteColor(color));
+}
+
 /// Renders the inspector toggle and its mode dropdown as a single split-button
 /// unit: one shared rounded background, a hairline divider, and per-segment
 /// hover pills. This avoids the visual mismatch of two abutting rounded rects.
@@ -695,85 +823,156 @@ fn renderInspectorSplitButton(
 /// Renders the compact browser toolbar with URL entry and primary actions.
 fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_reserve: f32) void {
     const toolbar_height = theme.scaledUi(TOOLBAR_HEIGHT);
+    const tab_row_height = theme.scaledUi(TAB_ROW_HEIGHT);
     const button_size = theme.scaledUi(TOOLBAR_BUTTON_SIZE);
-    const dropdown_width = theme.scaledUi(TOOLBAR_DROPDOWN_WIDTH);
-    const pad_x = theme.scaledUi(10.0);
-    const pad_y = (toolbar_height - button_size) * 0.5;
-    const gap = theme.scaledUi(TOOLBAR_GAP);
-    const avail = @max(dock_rect.w - pad_x * 2.0 - right_reserve, theme.scaledUi(180.0));
-
-    // Layout: [field] [back][fwd][refresh] [inspect|menu] [close]
-    // Five neutral buttons + one split button (= 1.5 button widths) + 5 gaps.
-    const buttons_width = button_size * 5.0 + (button_size + dropdown_width) + gap * 5.0;
-    const field_width = @max(avail - buttons_width, theme.scaledUi(TOOLBAR_FIELD_MIN_WIDTH));
+    const pad_x = theme.scaledUi(8.0);
+    const gap = theme.scaledUi(4.0);
 
     palette_toolbar_rect = .{ .x = dock_rect.x, .y = dock_rect.y, .w = dock_rect.w, .h = toolbar_height };
     queuePaletteRect(state, palette_toolbar_rect, paletteColor(theme.background()));
 
+    // Tab/title row: tabs expand into the available middle while pane chrome
+    // keeps a fixed reserve on the right.
+    const tab_count = state.browserTabCount();
+    const row_y = dock_rect.y + (tab_row_height - button_size) * 0.5;
+    const new_tab_rect: palette.Rect = .{ .x = dock_rect.x + pad_x, .y = row_y, .w = button_size, .h = button_size };
+    renderCompactIconButton(state, new_tab_rect, NF_COD_ADD, rectHovered(new_tab_rect), false);
+    addPaletteHit(new_tab_rect, .new_tab);
+
+    const row_right = dock_rect.x + dock_rect.w - pad_x;
+    const close_pane_rect: palette.Rect = .{ .x = row_right - button_size, .y = row_y, .w = button_size, .h = button_size };
+    renderCompactIconButton(state, close_pane_rect, NF_COD_CLOSE, rectHovered(close_pane_rect), false);
+    addPaletteHit(close_pane_rect, .close);
+
+    const tabs_x = new_tab_rect.x + new_tab_rect.w + gap;
+    const tabs_right = close_pane_rect.x - right_reserve - gap;
+    const tabs_w = @max(tabs_right - tabs_x, theme.scaledUi(40.0));
+    if (tab_count <= 1) {
+        const tab_rect: palette.Rect = .{
+            .x = tabs_x,
+            .y = row_y,
+            .w = @min(tabs_w, theme.scaledUi(190.0)),
+            .h = button_size,
+        };
+        queuePaletteRoundedRect(state, tab_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(6.0));
+        queuePaletteBorder(state, tab_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(6.0), theme.scaledUi(1.0));
+        const tab_close_size = theme.scaledUi(18.0);
+        const tab_close_rect: palette.Rect = .{
+            .x = tab_rect.x + tab_rect.w - tab_close_size - theme.scaledUi(3.0),
+            .y = tab_rect.y + (tab_rect.h - tab_close_size) * 0.5,
+            .w = tab_close_size,
+            .h = tab_close_size,
+        };
+        queuePaletteText(state, .{
+            .x = tab_rect.x + theme.scaledUi(6.0),
+            .y = row_y + theme.scaledUi(6.0),
+            .w = @max(tab_close_rect.x - tab_rect.x - theme.scaledUi(10.0), 1.0),
+            .h = theme.scaledUi(18.0),
+        }, state.browserTabTitle(0), paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), tab_rect);
+        renderCompactIconButton(state, tab_close_rect, NF_COD_CLOSE, rectHovered(tab_close_rect), false);
+        palette_tab_hits[palette_tab_hit_count] = .{ .rect = tab_close_rect, .index = 0, .kind = .close };
+        palette_tab_hit_count += 1;
+    } else {
+        const visible_count = @min(tab_count, palette_tab_hits.len / 2);
+        const tab_width = @min(theme.scaledUi(180.0), @max(tabs_w / @as(f32, @floatFromInt(visible_count)), theme.scaledUi(56.0)));
+        var tab_x = tabs_x;
+        for (0..visible_count) |tab_index| {
+            if (palette_tab_hit_count + 2 > palette_tab_hits.len) break;
+            if (tab_x + tab_width > tabs_right) break;
+            const tab_rect: palette.Rect = .{ .x = tab_x, .y = row_y, .w = tab_width, .h = button_size };
+            const active = tab_index == state.activeBrowserTabIndex();
+            queuePaletteRoundedRect(
+                state,
+                tab_rect,
+                paletteColor(if (active or rectHovered(tab_rect)) theme.COLOR_PANEL_ALT else theme.background()),
+                theme.scaledUi(6.0),
+            );
+            queuePaletteBorder(
+                state,
+                tab_rect,
+                paletteColor(if (active) theme.withAlpha(theme.accent(), 150) else theme.COLOR_PANEL_MUTED),
+                theme.scaledUi(6.0),
+                theme.scaledUi(1.0),
+            );
+            const tab_close_size = theme.scaledUi(18.0);
+            const tab_close_rect: palette.Rect = .{
+                .x = tab_rect.x + tab_rect.w - tab_close_size - theme.scaledUi(3.0),
+                .y = tab_rect.y + (tab_rect.h - tab_close_size) * 0.5,
+                .w = tab_close_size,
+                .h = tab_close_size,
+            };
+            queuePaletteText(state, .{
+                .x = tab_rect.x + theme.scaledUi(8.0),
+                .y = tab_rect.y + theme.scaledUi(6.0),
+                .w = @max(tab_close_rect.x - tab_rect.x - theme.scaledUi(12.0), 1.0),
+                .h = theme.scaledUi(18.0),
+            }, state.browserTabTitle(tab_index), paletteColor(if (tab_index == state.activeBrowserTabIndex()) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), tab_rect);
+            renderCompactIconButton(state, tab_close_rect, NF_COD_CLOSE, rectHovered(tab_close_rect), false);
+            palette_tab_hits[palette_tab_hit_count] = .{ .rect = tab_rect, .index = tab_index, .kind = .select };
+            palette_tab_hit_count += 1;
+            palette_tab_hits[palette_tab_hit_count] = .{ .rect = tab_close_rect, .index = tab_index, .kind = .close };
+            palette_tab_hit_count += 1;
+            tab_x += tab_width + gap;
+        }
+        if (visible_count < tab_count or tab_x > tabs_right) {
+            const overflow_rect: palette.Rect = .{ .x = @max(tabs_x, tabs_right - button_size), .y = row_y, .w = button_size, .h = button_size };
+            renderCompactIconButton(state, overflow_rect, NF_COD_ELLIPSIS, rectHovered(overflow_rect), false);
+        }
+    }
+
+    const nav_y = dock_rect.y + tab_row_height + (theme.scaledUi(NAV_ROW_HEIGHT) - button_size) * 0.5;
+    var cursor_x = dock_rect.x + pad_x;
+    const show_copy = dock_rect.w >= theme.scaledUi(430.0);
+    const show_inspector = dock_rect.w >= theme.scaledUi(520.0);
+    const trailing_count: f32 = 1.0 + @as(f32, if (show_copy) 1.0 else 0.0) + @as(f32, if (show_inspector) 1.65 else 0.0);
     const address_rect: palette.Rect = .{
-        .x = dock_rect.x + pad_x,
-        .y = dock_rect.y + pad_y,
-        .w = field_width,
+        .x = cursor_x + (button_size + gap) * 2.0,
+        .y = nav_y,
+        .w = @max(dock_rect.w - pad_x * 2.0 - (button_size + gap) * (2.0 + trailing_count), theme.scaledUi(48.0)),
         .h = button_size,
     };
+    const back_rect: palette.Rect = .{ .x = cursor_x, .y = nav_y, .w = button_size, .h = button_size };
+    renderCompactIconButton(state, back_rect, NF_COD_ARROW_LEFT, rectHovered(back_rect), !state.browserCanGoBack());
+    addPaletteHit(back_rect, .back);
+    cursor_x += button_size + gap;
+    const forward_rect: palette.Rect = .{ .x = cursor_x, .y = nav_y, .w = button_size, .h = button_size };
+    renderCompactIconButton(state, forward_rect, NF_COD_ARROW_RIGHT, rectHovered(forward_rect), !state.browserCanGoForward());
+    addPaletteHit(forward_rect, .forward);
     renderPaletteAddressField(state, address_rect);
     addPaletteHit(address_rect, .address);
 
-    var cursor_x = address_rect.x + address_rect.w + gap;
-
-    const neutral_base = theme.COLOR_PANEL_ALT;
-    const neutral_icon = theme.COLOR_WHITE;
-
-    const back_rect: palette.Rect = .{ .x = cursor_x, .y = address_rect.y, .w = button_size, .h = button_size };
-    renderToolbarIconButton(state, back_rect, NF_COD_ARROW_LEFT, neutral_base, neutral_icon, rectHovered(back_rect), false);
-    addPaletteHit(back_rect, .back);
-    cursor_x += button_size + gap;
-
-    const forward_rect: palette.Rect = .{ .x = cursor_x, .y = address_rect.y, .w = button_size, .h = button_size };
-    renderToolbarIconButton(state, forward_rect, NF_COD_ARROW_RIGHT, neutral_base, neutral_icon, rectHovered(forward_rect), false);
-    addPaletteHit(forward_rect, .forward);
-    cursor_x += button_size + gap;
-
-    // Refresh / navigate: accent color signals the primary action in the row.
-    const navigate_rect: palette.Rect = .{ .x = cursor_x, .y = address_rect.y, .w = button_size, .h = button_size };
-    renderToolbarIconButton(state, navigate_rect, NF_COD_REFRESH, theme.accent(), theme.foregroundOn(theme.accent()), rectHovered(navigate_rect), false);
+    cursor_x = address_rect.x + address_rect.w + gap;
+    const navigate_rect: palette.Rect = .{ .x = cursor_x, .y = nav_y, .w = button_size, .h = button_size };
+    renderCompactIconButton(state, navigate_rect, NF_COD_REFRESH, rectHovered(navigate_rect), false);
     addPaletteHit(navigate_rect, .navigate);
     cursor_x += button_size + gap;
-
-    const can_use_inspector = state.canUseBrowserInspector();
-    const inspector_active = state.isBrowserInspectorEnabled();
-    const inspector_mode = state.browserInspectorMode();
-    const inspector_base = if (inspector_active) theme.accent() else theme.COLOR_PANEL_ALT;
-    const inspector_icon = if (!can_use_inspector)
-        theme.COLOR_TEXT_SUBTLE
-    else if (inspector_active)
-        theme.foregroundOn(inspector_base)
-    else
-        theme.COLOR_WHITE;
-
-    const inspect_rect: palette.Rect = .{ .x = cursor_x, .y = address_rect.y, .w = button_size, .h = button_size };
-    const inspect_menu_rect: palette.Rect = .{ .x = inspect_rect.x + inspect_rect.w, .y = address_rect.y, .w = dropdown_width, .h = button_size };
-    renderInspectorSplitButton(
-        state,
-        inspect_rect,
-        inspect_menu_rect,
-        inspector_base,
-        inspector_icon,
-        can_use_inspector and rectHovered(inspect_rect),
-        can_use_inspector and rectHovered(inspect_menu_rect),
-        !can_use_inspector,
-    );
-    addPaletteHit(inspect_rect, .inspect_toggle);
-    addPaletteHit(inspect_menu_rect, .inspect_mode_menu);
-    if (!can_use_inspector) state.browser_inspector_menu_open = false;
-    if (state.browser_inspector_menu_open) {
-        renderInspectorModeMenu(state, inspect_menu_rect, inspector_mode);
+    if (show_copy) {
+        const copy_rect: palette.Rect = .{ .x = cursor_x, .y = nav_y, .w = button_size, .h = button_size };
+        renderCompactIconButton(state, copy_rect, NF_COD_COPY, rectHovered(copy_rect), state.browserState().current_url == null);
+        addPaletteHit(copy_rect, .copy_url);
+        cursor_x += button_size + gap;
     }
-    cursor_x = inspect_menu_rect.x + inspect_menu_rect.w + gap;
-
-    const close_rect: palette.Rect = .{ .x = cursor_x, .y = address_rect.y, .w = button_size, .h = button_size };
-    renderToolbarIconButton(state, close_rect, NF_COD_CLOSE, neutral_base, neutral_icon, rectHovered(close_rect), false);
-    addPaletteHit(close_rect, .close);
+    if (show_inspector) {
+        const inspector_active = state.isBrowserInspectorEnabled();
+        const inspect_rect: palette.Rect = .{ .x = cursor_x, .y = nav_y, .w = button_size, .h = button_size };
+        renderInspectorIconButton(state, inspect_rect, NF_COD_INSPECT, rectHovered(inspect_rect), !state.canUseBrowserInspector(), inspector_active);
+        addPaletteHit(inspect_rect, .inspect_toggle);
+        const dropdown_width = theme.scaledUi(20.0);
+        const inspect_menu_rect: palette.Rect = .{
+            .x = inspect_rect.x + inspect_rect.w,
+            .y = nav_y,
+            .w = dropdown_width,
+            .h = button_size,
+        };
+        renderInspectorIconButton(state, inspect_menu_rect, NF_COD_CHEVRON_DOWN, rectHovered(inspect_menu_rect), !state.canUseBrowserInspector(), inspector_active);
+        addPaletteHit(inspect_menu_rect, .inspect_mode_menu);
+        if (!state.canUseBrowserInspector()) state.browser_inspector_menu_open = false;
+        if (state.browser_inspector_menu_open) {
+            renderInspectorModeMenu(state, inspect_menu_rect, state.browserInspectorMode());
+        }
+    } else {
+        state.browser_inspector_menu_open = false;
+    }
 }
 
 fn renderInspectorModeMenu(state: *app_state.AppState, anchor: palette.Rect, inspector_mode: browser_runtime.InspectorMode) void {
@@ -1265,6 +1464,43 @@ fn renderPaneCanvas(state: *app_state.AppState, pane_rect: palette.Rect) void {
     renderPanePlaceholder(state, pane_rect);
 }
 
+fn renderWrappedPaletteText(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    value: []const u8,
+    color: palette.Color,
+    font_size: f32,
+    max_lines: usize,
+) f32 {
+    const line_height = font_size * 1.35;
+    var cursor: usize = 0;
+    var line: usize = 0;
+    while (cursor < value.len and line < max_lines) : (line += 1) {
+        while (cursor < value.len and value[cursor] == ' ') cursor += 1;
+        if (cursor >= value.len) break;
+
+        const line_start = cursor;
+        var line_end = cursor;
+        var scan = cursor;
+        while (scan < value.len) {
+            const word_end = std.mem.findScalarPos(u8, value, scan, ' ') orelse value.len;
+            if (app_state.paletteUiTextPrefixWidth(value[line_start..word_end], font_size, word_end - line_start) > rect.w and line_end > line_start) break;
+            line_end = word_end;
+            scan = word_end;
+            while (scan < value.len and value[scan] == ' ') scan += 1;
+        }
+        if (line_end == line_start) line_end = std.mem.findScalarPos(u8, value, cursor, ' ') orelse value.len;
+        queuePaletteText(state, .{
+            .x = rect.x,
+            .y = rect.y + @as(f32, @floatFromInt(line)) * line_height,
+            .w = rect.w,
+            .h = line_height,
+        }, value[line_start..line_end], color, font_size, rect);
+        cursor = line_end;
+    }
+    return @as(f32, @floatFromInt(line)) * line_height;
+}
+
 // Renders the browser's useful empty/loading region.
 fn renderPanePlaceholder(state: *app_state.AppState, pane_rect: palette.Rect) void {
     const content_width = @min(pane_rect.w - theme.scaledUi(48.0), theme.scaledUi(520.0));
@@ -1273,21 +1509,22 @@ fn renderPanePlaceholder(state: *app_state.AppState, pane_rect: palette.Rect) vo
     const body_size = theme.scaledUi(14.0);
     const button_width = theme.scaledUi(170.0);
     const button_height = theme.scaledUi(38.0);
-    const block_height = theme.scaledUi(146.0);
+    const block_height = theme.scaledUi(180.0);
     const x = pane_rect.x + (pane_rect.w - content_width) * 0.5;
     const y = pane_rect.y + @max((pane_rect.h - block_height) * 0.38, theme.scaledUi(28.0));
 
     queuePaletteText(state, .{ .x = x, .y = y, .w = content_width, .h = title_size * 1.3 }, "Browse and verify", paletteColor(theme.COLOR_WHITE), title_size, pane_rect);
-    queuePaletteText(state, .{
+    const body_y = y + theme.scaledUi(38.0);
+    const body_height = renderWrappedPaletteText(state, .{
         .x = x,
-        .y = y + theme.scaledUi(38.0),
+        .y = body_y,
         .w = content_width,
-        .h = body_size * 2.8,
-    }, "Your agent can browse, interact with, and screenshot pages in this browser. Enter a URL above or start your development server to preview and verify your app.", paletteColor(theme.COLOR_TEXT_MUTED), body_size, pane_rect);
+        .h = body_size * 5.4,
+    }, "Your agent can browse, interact with, and screenshot pages in this browser. Enter a URL above or start your development server to preview and verify your app.", paletteColor(theme.COLOR_TEXT_MUTED), body_size, 4);
 
     const button_rect: palette.Rect = .{
         .x = x,
-        .y = y + theme.scaledUi(96.0),
+        .y = body_y + body_height + theme.scaledUi(18.0),
         .w = button_width,
         .h = button_height,
     };
