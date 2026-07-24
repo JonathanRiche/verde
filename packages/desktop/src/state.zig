@@ -1387,8 +1387,8 @@ const CLAUDE_FULL_EFFORT_VALUES = [_][:0]const u8{ "low", "medium", "high", "xhi
 /// Keep this mirroring the Agent SDK's `supportedModels()` output (labels + ids)
 /// so the picker doesn't flash stale model names while the bridge loads.
 pub const CLAUDE_MODEL_OPTIONS = [_]ModelOption{
-    .{ .label = "Default (Opus 4.8)", .value = DEFAULT_CLAUDE_MODEL, .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
-    .{ .label = "Opus 4.8", .value = "opus[1m]", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
+    .{ .label = "Default (Opus 5)", .value = DEFAULT_CLAUDE_MODEL, .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
+    .{ .label = "Opus 5 (1M context)", .value = "opus[1m]", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
     .{ .label = "Fable", .value = "claude-fable-5[1m]", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
     .{ .label = "Sonnet 5", .value = "sonnet", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
     .{ .label = "Haiku 4.5", .value = "haiku", .reasoning_supported = false },
