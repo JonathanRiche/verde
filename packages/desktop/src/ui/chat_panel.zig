@@ -3303,7 +3303,7 @@ fn diffSummaryHeightForFiles(state: ?*app_state.AppState, message_index: ?usize,
             break :blk app.isCardExpanded(diffFileCardKey(mi, file.path));
         };
         if (expanded) {
-            const line_count = diffPatchDisplayLineCountForLayout(file.patch, layout);
+            const line_count = diffPatchDisplayLineCountForLayout(state, file.patch, layout);
             total += @as(f32, @floatFromInt(line_count)) * code_line_h + theme.scaledUi(20.0);
         }
     }
@@ -3312,21 +3312,31 @@ fn diffSummaryHeightForFiles(state: ?*app_state.AppState, message_index: ?usize,
     return total;
 }
 
-fn diffPatchDisplayLineCountForLayout(patch: []const u8, layout: DiffLayout) usize {
+fn diffPatchDisplayLineCountForLayout(state: ?*app_state.AppState, patch: []const u8, layout: DiffLayout) usize {
     return switch (layout) {
-        .stacked => diffPatchDisplayLineCount(patch),
+        .stacked => diffPatchDisplayLineCount(state, patch),
         .split => blk: {
             if (patch.len == 0) break :blk 2;
+            if (state) |app| {
+                const view = app.transcript_diff_view_cache.split(app.allocator, patch) orelse
+                    break :blk @max(wrappedLineCount(patch, 120), 2);
+                break :blk @max(view.rows.len, 1);
+            }
             var view = zig_dif.buildSideBySidePatchViewWithOptions(std.heap.page_allocator, patch, .{ .context_lines = 4 }) catch
-                break :blk diffPatchDisplayLineCount(patch);
+                break :blk diffPatchDisplayLineCount(null, patch);
             defer view.deinit();
             break :blk @max(view.rows.len, 1);
         },
     };
 }
 
-fn diffPatchDisplayLineCount(patch: []const u8) usize {
+fn diffPatchDisplayLineCount(state: ?*app_state.AppState, patch: []const u8) usize {
     if (patch.len == 0) return 2;
+    if (state) |app| {
+        const view = app.transcript_diff_view_cache.stacked(app.allocator, patch) orelse
+            return @max(wrappedLineCount(patch, 120), 2);
+        return @max(view.lines.len, 1);
+    }
     var view = zig_dif.buildPatchViewWithOptions(std.heap.page_allocator, patch, .{ .context_lines = 4 }) catch
         return @max(wrappedLineCount(patch, 120), 2);
     defer view.deinit();
@@ -3526,7 +3536,7 @@ fn renderDiffSummaryCard(
         if (expanded) {
             const patch_x = bubble.x + pad_x;
             const patch_w = bubble.w - pad_x * 2.0;
-            const line_count = diffPatchDisplayLineCountForLayout(file.patch, layout);
+            const line_count = diffPatchDisplayLineCountForLayout(state, file.patch, layout);
             const patch_h = @as(f32, @floatFromInt(line_count)) * code_line_h;
             renderDiffPatch(state, .{
                 .x = patch_x,
@@ -3671,11 +3681,10 @@ fn renderDiffSplitPatchLines(
         return;
     }
 
-    var view = zig_dif.buildSideBySidePatchViewWithOptions(state.allocator, patch, .{ .context_lines = 4 }) catch {
+    const view = state.transcript_diff_view_cache.split(state.allocator, patch) orelse {
         renderDiffPatchLines(state, rect, patch, font_size, line_h, clip);
         return;
     };
-    defer view.deinit();
 
     queueRoundedShellClipped(
         state,
@@ -3860,11 +3869,10 @@ fn renderDiffPatchLines(
         return;
     }
 
-    var view = zig_dif.buildPatchViewWithOptions(state.allocator, patch, .{ .context_lines = 4 }) catch {
+    const view = state.transcript_diff_view_cache.stacked(state.allocator, patch) orelse {
         renderDiffFallback(state, rect, patch, font_size, line_h, clip);
         return;
     };
-    defer view.deinit();
 
     const number_w = theme.scaledUi(38.0);
     const gutter_w = number_w * 2.0;
@@ -3965,7 +3973,7 @@ fn renderDiffFallback(
     var lines = std.mem.splitScalar(u8, body, '\n');
     var index: usize = 0;
     while (lines.next()) |line| : (index += 1) {
-        if (index >= diffPatchDisplayLineCount(text)) break;
+        if (index >= @max(wrappedLineCount(body, 120), 2)) break;
         const y = rect.y + @as(f32, @floatFromInt(index)) * line_h;
         queueFixedTextLine(state, .{
             .x = rect.x + theme.scaledUi(10.0),
@@ -5877,8 +5885,8 @@ test "split diff layout aligns replacement rows" {
         \\+const extraValue = 3;
         \\ context();
     ;
-    const stacked_lines = diffPatchDisplayLineCountForLayout(patch, .stacked);
-    const split_lines = diffPatchDisplayLineCountForLayout(patch, .split);
+    const stacked_lines = diffPatchDisplayLineCountForLayout(null, patch, .stacked);
+    const split_lines = diffPatchDisplayLineCountForLayout(null, patch, .split);
     try std.testing.expectEqual(@as(usize, 5), stacked_lines);
     try std.testing.expectEqual(@as(usize, 4), split_lines);
 }

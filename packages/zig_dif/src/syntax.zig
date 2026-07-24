@@ -51,10 +51,9 @@ pub fn tokenizeLine(
     language: Language,
     line: []const u8,
 ) std.mem.Allocator.Error![]const Token {
-    if (treeSitterConfigForLanguage(language)) |config| {
-        if (tokenizeTreeSitterLine(allocator, config, line)) |tokens| return tokens;
-    }
-    return tokenizeLineHeuristic(allocator, language, line);
+    var tokenizer: Tokenizer = .init(language);
+    defer tokenizer.deinit();
+    return tokenizer.tokenizeLine(allocator, line);
 }
 
 fn tokenizeLineHeuristic(
@@ -136,6 +135,127 @@ const TreeSitterConfig = struct {
     family: TreeSitterFamily,
 };
 
+const TreeSitterTokenizer = struct {
+    parser: zig_treesitter.Parser,
+    query: zig_treesitter.Query,
+    query_cursor: zig_treesitter.QueryCursor,
+    family: TreeSitterFamily,
+
+    fn init(config: TreeSitterConfig) ?TreeSitterTokenizer {
+        var parser = zig_treesitter.Parser.init() catch return null;
+        if (!parser.setLanguage(config.parser_language)) {
+            parser.deinit();
+            return null;
+        }
+
+        var query = zig_treesitter.Query.init(config.parser_language, config.highlights_query) catch {
+            parser.deinit();
+            return null;
+        };
+
+        const query_cursor = zig_treesitter.QueryCursor.init() catch {
+            query.deinit();
+            parser.deinit();
+            return null;
+        };
+        return .{
+            .parser = parser,
+            .query = query,
+            .query_cursor = query_cursor,
+            .family = config.family,
+        };
+    }
+
+    fn deinit(self: *TreeSitterTokenizer) void {
+        self.query_cursor.deinit();
+        self.query.deinit();
+        self.parser.deinit();
+        self.* = undefined;
+    }
+
+    fn tokenizeLine(self: *TreeSitterTokenizer, allocator: std.mem.Allocator, line: []const u8) ?[]const Token {
+        var tree = self.parser.parseString(line, null) orelse return null;
+        defer tree.deinit();
+
+        self.query_cursor.exec(self.query, tree.rootNode());
+
+        var spans: std.ArrayListUnmanaged(TokenSpan) = .empty;
+        defer spans.deinit(allocator);
+
+        while ((self.query_cursor.nextMatch(allocator) catch return null)) |match| {
+            defer match.deinit(allocator);
+            for (match.captures) |capture| {
+                const capture_name = self.query.captureName(capture.index) orelse continue;
+                const token_kind = classifyTreeSitterCapture(self.family, capture_name, capture.node.utf8Text(line));
+                if (token_kind == .plain) continue;
+
+                const start = @as(usize, @intCast(capture.node.startByte()));
+                const end = @as(usize, @intCast(capture.node.endByte()));
+                if (end <= start or start >= line.len) continue;
+
+                spans.append(allocator, .{
+                    .start = start,
+                    .end = end,
+                    .kind = token_kind,
+                }) catch return null;
+            }
+        }
+
+        std.sort.heap(TokenSpan, spans.items, {}, tokenSpanLessThan);
+
+        var tokens: std.ArrayListUnmanaged(Token) = .empty;
+        errdefer tokens.deinit(allocator);
+        var cursor: usize = 0;
+
+        for (spans.items) |span| {
+            if (span.end <= span.start or span.start >= line.len) continue;
+            const start = @min(span.start, line.len);
+            const end = @min(span.end, line.len);
+            if (end <= cursor) continue;
+            if (start > cursor) {
+                appendToken(&tokens, allocator, .plain, line[cursor..start]) catch return null;
+            }
+            const effective_start = @max(start, cursor);
+            appendToken(&tokens, allocator, span.kind, line[effective_start..end]) catch return null;
+            cursor = end;
+        }
+
+        if (cursor < line.len) {
+            appendToken(&tokens, allocator, .plain, line[cursor..]) catch return null;
+        }
+
+        return tokens.toOwnedSlice(allocator) catch null;
+    }
+};
+
+/// Reuses Tree-sitter parser and query state while tokenizing lines from one file.
+pub const Tokenizer = struct {
+    language: Language,
+    tree_sitter: ?TreeSitterTokenizer,
+
+    pub fn init(language: Language) Tokenizer {
+        return .{
+            .language = language,
+            .tree_sitter = if (treeSitterConfigForLanguage(language)) |config|
+                TreeSitterTokenizer.init(config)
+            else
+                null,
+        };
+    }
+
+    pub fn deinit(self: *Tokenizer) void {
+        if (self.tree_sitter) |*tokenizer| tokenizer.deinit();
+        self.* = undefined;
+    }
+
+    pub fn tokenizeLine(self: *Tokenizer, allocator: std.mem.Allocator, line: []const u8) std.mem.Allocator.Error![]const Token {
+        if (self.tree_sitter) |*tokenizer| {
+            if (tokenizer.tokenizeLine(allocator, line)) |tokens| return tokens;
+        }
+        return tokenizeLineHeuristic(allocator, self.language, line);
+    }
+};
+
 fn treeSitterConfigForLanguage(language: Language) ?TreeSitterConfig {
     return switch (language) {
         .javascript => .{
@@ -165,73 +285,6 @@ fn treeSitterConfigForLanguage(language: Language) ?TreeSitterConfig {
         },
         else => null,
     };
-}
-
-fn tokenizeTreeSitterLine(
-    allocator: std.mem.Allocator,
-    config: TreeSitterConfig,
-    line: []const u8,
-) ?[]const Token {
-    var parser = zig_treesitter.Parser.init() catch return null;
-    defer parser.deinit();
-    if (!parser.setLanguage(config.parser_language)) return null;
-
-    var tree = parser.parseString(line, null) orelse return null;
-    defer tree.deinit();
-
-    var query = zig_treesitter.Query.init(config.parser_language, config.highlights_query) catch return null;
-    defer query.deinit();
-
-    var query_cursor = zig_treesitter.QueryCursor.init() catch return null;
-    defer query_cursor.deinit();
-    query_cursor.exec(query, tree.rootNode());
-
-    var spans: std.ArrayListUnmanaged(TokenSpan) = .empty;
-    defer spans.deinit(allocator);
-
-    while ((query_cursor.nextMatch(allocator) catch return null)) |match| {
-        defer match.deinit(allocator);
-        for (match.captures) |capture| {
-            const capture_name = query.captureName(capture.index) orelse continue;
-            const token_kind = classifyTreeSitterCapture(config.family, capture_name, capture.node.utf8Text(line));
-            if (token_kind == .plain) continue;
-
-            const start = @as(usize, @intCast(capture.node.startByte()));
-            const end = @as(usize, @intCast(capture.node.endByte()));
-            if (end <= start or start >= line.len) continue;
-
-            spans.append(allocator, .{
-                .start = start,
-                .end = end,
-                .kind = token_kind,
-            }) catch return null;
-        }
-    }
-
-    std.sort.heap(TokenSpan, spans.items, {}, tokenSpanLessThan);
-
-    var tokens: std.ArrayListUnmanaged(Token) = .empty;
-    errdefer tokens.deinit(allocator);
-    var cursor: usize = 0;
-
-    for (spans.items) |span| {
-        if (span.end <= span.start or span.start >= line.len) continue;
-        const start = @min(span.start, line.len);
-        const end = @min(span.end, line.len);
-        if (end <= cursor) continue;
-        if (start > cursor) {
-            appendToken(&tokens, allocator, .plain, line[cursor..start]) catch return null;
-        }
-        const effective_start = @max(start, cursor);
-        appendToken(&tokens, allocator, span.kind, line[effective_start..end]) catch return null;
-        cursor = end;
-    }
-
-    if (cursor < line.len) {
-        appendToken(&tokens, allocator, .plain, line[cursor..]) catch return null;
-    }
-
-    return tokens.toOwnedSlice(allocator) catch null;
 }
 
 fn classifyTreeSitterCapture(family: TreeSitterFamily, capture_name: []const u8, text: []const u8) TokenKind {
@@ -598,6 +651,23 @@ test "tokenize typescript line uses tree-sitter highlight captures for functions
     try std.testing.expect(testTokenKindsContain(tokens, .function_name, "reviewCampaign"));
     try std.testing.expect(testTokenKindsContain(tokens, .variable_name, "result"));
     try std.testing.expect(testTokenKindsContain(tokens, .variable_name, "csvPath"));
+}
+
+test "reusable tokenizer preserves tree-sitter captures across lines" {
+    const allocator = std.testing.allocator;
+    var tokenizer: Tokenizer = .init(.typescript);
+    defer tokenizer.deinit();
+    try std.testing.expect(tokenizer.tree_sitter != null);
+
+    const first = try tokenizer.tokenizeLine(allocator, "const output: Result = service.fetch(item.id);");
+    defer allocator.free(first);
+    const second = try tokenizer.tokenizeLine(allocator, "return output.total + 1;");
+    defer allocator.free(second);
+
+    try std.testing.expect(testTokenKindsContain(first, .keyword, "const"));
+    try std.testing.expect(testTokenKindsContain(first, .type_name, "Result"));
+    try std.testing.expect(testTokenKindsContain(second, .keyword, "return"));
+    try std.testing.expect(testTokenKindsContain(second, .property_name, "total"));
 }
 
 test "tokenize typescript line classifies properties and constants" {

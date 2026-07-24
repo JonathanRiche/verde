@@ -1500,7 +1500,7 @@ fn handleOpen(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv
             \\Usage:
             \\  verde open <url> [--project <id|index|path|current|self>] [--json]
             \\
-            \\Opens or moves the singleton browser pane into the target workspace.
+            \\Opens the workspace-local browser pane using Verde's shared browser runtime.
             \\Defaults to the calling Verde terminal workspace when available;
             \\otherwise defaults to the current desktop workspace.
             \\
@@ -3382,19 +3382,27 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
         .{ .name = "name", .type_name = "string", .description = "Configured process name.", .required = true },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current." },
     });
-    try writeMcpTypedTool(&s, "browser_status", "Inspect the embedded browser state, URL, and last action result.", &.{});
-    try writeMcpTypedTool(&s, "open_browser", "Open or move Verde's embedded browser to a URL in a workspace. Defaults to the workspace containing the agent.", &.{
+    try writeMcpTypedTool(&s, "browser_status", "Inspect this workspace's embedded browser state, URL, and last action result.", &.{
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
+    });
+    try writeMcpTypedTool(&s, "open_browser", "Open this workspace's embedded browser at a URL. Defaults to the workspace containing the agent.", &.{
         .{ .name = "url", .type_name = "string", .description = "Optional URL to open." },
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
     });
-    try writeMcpTypedTool(&s, "navigate_browser", "Navigate the open embedded browser to a URL.", &.{
+    try writeMcpTypedTool(&s, "navigate_browser", "Navigate this workspace's open embedded browser to a URL.", &.{
         .{ .name = "url", .type_name = "string", .description = "URL to navigate to.", .required = true },
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
     });
-    try writeMcpTypedTool(&s, "restart_browser", "Destroy and recreate only the embedded browser backend, restoring its current URL.", &.{});
-    try writeMcpTypedTool(&s, "reset_browser", "Destroy and recreate only the embedded browser backend with a fresh blank document.", &.{});
+    try writeMcpTypedTool(&s, "restart_browser", "Recreate the shared browser backend with this workspace's current URL.", &.{
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
+    });
+    try writeMcpTypedTool(&s, "reset_browser", "Reset this workspace's browser to a fresh blank document.", &.{
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
+    });
     try writeMcpTypedTool(&s, "evaluate_browser_js", "Evaluate JavaScript in the embedded browser and return a structured result or serialized exception.", &.{
         .{ .name = "script", .type_name = "string", .description = "JavaScript function body; return the value to serialize.", .required = true },
         .{ .name = "timeout_ms", .type_name = "integer", .description = "Timeout in milliseconds; defaults to 3000 and is capped at 60000." },
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
     });
     try writeMcpTypedTool(&s, "browser_pointer_input", "Send a stateful low-level pointer event using pane-local coordinates.", &.{
         .{ .name = "action", .type_name = "string", .description = "pointerDown, pointerMove, or pointerUp.", .required = true },
@@ -3405,22 +3413,28 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
         .{ .name = "shift", .type_name = "boolean", .description = "Hold Shift." },
         .{ .name = "alt", .type_name = "boolean", .description = "Hold Alt." },
         .{ .name = "super", .type_name = "boolean", .description = "Hold Super/Command." },
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
     });
     try writeMcpTypedTool(&s, "inspect_browser_page", "Read visible page text and interactive elements with reusable CSS selectors.", &.{
         .{ .name = "max_elements", .type_name = "integer", .description = "Maximum interactive elements to return; defaults to 100." },
         .{ .name = "text_limit", .type_name = "integer", .description = "Maximum visible-text characters to return; defaults to 12000." },
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
     });
     try writeMcpTypedTool(&s, "click_browser_element", "Click by CSS selector. Sensitive actions require confirmed=true after user confirmation.", &.{
         .{ .name = "selector", .type_name = "string", .description = "CSS selector for the element to click.", .required = true },
         .{ .name = "confirmed", .type_name = "boolean", .description = "True only after the user confirms a sensitive action." },
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
     });
     try writeMcpTypedTool(&s, "type_browser_text", "Replace text by CSS selector. Password fields and form submission require confirmed=true after user confirmation.", &.{
         .{ .name = "selector", .type_name = "string", .description = "CSS selector for the input or editable element.", .required = true },
         .{ .name = "text", .type_name = "string", .description = "Replacement text to enter.", .required = true },
         .{ .name = "submit", .type_name = "boolean", .description = "Submit the containing form after typing." },
         .{ .name = "confirmed", .type_name = "boolean", .description = "True only after the user confirms password entry or submission." },
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
     });
-    try writeMcpTypedTool(&s, "capture_browser_screenshot", "Capture the visible browser viewport and return a PNG when CPU-frame capture is supported.", &.{});
+    try writeMcpTypedTool(&s, "capture_browser_screenshot", "Capture this workspace's active browser viewport as a PNG when CPU-frame capture is supported.", &.{
+        .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, or path; defaults to the agent's workspace." },
+    });
     try s.endArray();
     try s.endObject();
     try s.endObject();
@@ -3559,7 +3573,7 @@ fn mcpToolsCall(
             mcpArgU32(arguments, "text_limit") orelse 12_000,
         );
         defer allocator.free(script);
-        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, script, 3_000) catch |err| {
+        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, workspace, script, 3_000) catch |err| {
             return try mcpError(allocator, out, id_value, -32000, @errorName(err));
         };
         defer allocator.free(response);
@@ -3570,7 +3584,7 @@ fn mcpToolsCall(
             return try mcpError(allocator, out, id_value, -32602, "click_browser_element requires selector");
         const script = try mcpBrowserClickScriptAlloc(allocator, selector, mcpArgBool(arguments, "confirmed") orelse false);
         defer allocator.free(script);
-        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, script, 3_000) catch |err| {
+        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, workspace, script, 3_000) catch |err| {
             return try mcpError(allocator, out, id_value, -32000, @errorName(err));
         };
         defer allocator.free(response);
@@ -3589,14 +3603,14 @@ fn mcpToolsCall(
             mcpArgBool(arguments, "confirmed") orelse false,
         );
         defer allocator.free(script);
-        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, script, 3_000) catch |err| {
+        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, workspace, script, 3_000) catch |err| {
             return try mcpError(allocator, out, id_value, -32000, @errorName(err));
         };
         defer allocator.free(response);
         return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
     }
     if (std.mem.eql(u8, tool_name, "capture_browser_screenshot")) {
-        const response = sendLiveRequestAlloc(allocator, io, "browser.screenshot", .{}, 1) catch |err| {
+        const response = sendLiveRequestAlloc(allocator, io, "browser.screenshot", .{ .workspace = workspace }, 1) catch |err| {
             return try mcpError(allocator, out, id_value, -32000, @errorName(err));
         };
         defer allocator.free(response);
@@ -3608,6 +3622,7 @@ fn mcpToolsCall(
         const response = mcpBrowserEvalAndWaitAlloc(
             allocator,
             io,
+            workspace,
             script,
             @min(mcpArgU32(arguments, "timeout_ms") orelse 3_000, 60_000),
         ) catch |err| return try mcpError(allocator, out, id_value, -32000, @errorName(err));
@@ -3628,6 +3643,7 @@ fn mcpToolsCall(
         const x = mcpArgF32(arguments, "x") orelse return try mcpError(allocator, out, id_value, -32602, "browser_pointer_input requires x");
         const y = mcpArgF32(arguments, "y") orelse return try mcpError(allocator, out, id_value, -32602, "browser_pointer_input requires y");
         const response = try sendLiveRequestAlloc(allocator, io, method, .{
+            .workspace = workspace,
             .x = x,
             .y = y,
             .button = mcpArgString(arguments, "button") orelse "left",
@@ -3699,7 +3715,7 @@ fn mcpToolsCall(
             break :blk sendLiveRequestAlloc(allocator, io, "panes", .{ .workspace = workspace }, 1);
         }
         if (std.mem.eql(u8, tool_name, "browser_status")) {
-            break :blk sendLiveRequestAlloc(allocator, io, "browser.status", .{}, 1);
+            break :blk sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
         }
         if (std.mem.eql(u8, tool_name, "open_browser")) {
             break :blk sendLiveRequestAlloc(allocator, io, "browser.open", .{
@@ -3709,13 +3725,13 @@ fn mcpToolsCall(
         }
         if (std.mem.eql(u8, tool_name, "navigate_browser")) {
             const url = mcpArgString(arguments, "url") orelse return try mcpError(allocator, out, id_value, -32602, "navigate_browser requires url");
-            break :blk sendLiveRequestAlloc(allocator, io, "browser.navigate", .{ .url = url }, 1);
+            break :blk sendLiveRequestAlloc(allocator, io, "browser.navigate", .{ .workspace = workspace, .url = url }, 1);
         }
         if (std.mem.eql(u8, tool_name, "restart_browser")) {
-            break :blk sendLiveRequestAlloc(allocator, io, "browser.restart", .{}, 1);
+            break :blk sendLiveRequestAlloc(allocator, io, "browser.restart", .{ .workspace = workspace }, 1);
         }
         if (std.mem.eql(u8, tool_name, "reset_browser")) {
-            break :blk sendLiveRequestAlloc(allocator, io, "browser.reset", .{}, 1);
+            break :blk sendLiveRequestAlloc(allocator, io, "browser.reset", .{ .workspace = workspace }, 1);
         }
         if (std.mem.eql(u8, tool_name, "list_surfaces")) {
             break :blk sendLiveRequestAlloc(allocator, io, "surfaces", .{}, 1);
@@ -3819,7 +3835,13 @@ fn mcpToolsCall(
     try mcpToolTextResult(allocator, out, id_value, response, tool_name);
 }
 
-fn mcpBrowserEvalAndWaitAlloc(allocator: std.mem.Allocator, io: std.Io, script_body: []const u8, timeout_ms: u32) ![]u8 {
+fn mcpBrowserEvalAndWaitAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace: ?[]const u8,
+    script_body: []const u8,
+    timeout_ms: u32,
+) ![]u8 {
     const nonce = try std.fmt.allocPrint(allocator, "{d}-{d}", .{ platform_runtime.processId(), platform_runtime.monotonicTimestampNs() });
     defer allocator.free(nonce);
     const start_script = try mcpBrowserStartScriptAlloc(allocator, nonce, script_body);
@@ -3827,18 +3849,18 @@ fn mcpBrowserEvalAndWaitAlloc(allocator: std.mem.Allocator, io: std.Io, script_b
     const poll_script = try mcpBrowserPollScriptAlloc(allocator, nonce);
     defer allocator.free(poll_script);
 
-    const accepted = try sendLiveRequestAlloc(allocator, io, "browser.eval", .{ .script = start_script }, 1);
+    const accepted = try sendLiveRequestAlloc(allocator, io, "browser.eval", .{ .workspace = workspace, .script = start_script }, 1);
     defer allocator.free(accepted);
     if (!liveResponseOk(allocator, accepted)) return try allocator.dupe(u8, accepted);
 
     var attempt: usize = 0;
     const attempts = @max(@as(usize, timeout_ms / 20), 1);
     while (attempt < attempts) : (attempt += 1) {
-        const poll_accepted = try sendLiveRequestAlloc(allocator, io, "browser.eval", .{ .script = poll_script }, 1);
+        const poll_accepted = try sendLiveRequestAlloc(allocator, io, "browser.eval", .{ .workspace = workspace, .script = poll_script }, 1);
         defer allocator.free(poll_accepted);
         if (!liveResponseOk(allocator, poll_accepted)) return try allocator.dupe(u8, poll_accepted);
         try std.Io.sleep(io, .fromMilliseconds(20), .awake);
-        const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{}, 1);
+        const status = try sendLiveRequestAlloc(allocator, io, "browser.status", .{ .workspace = workspace }, 1);
         defer allocator.free(status);
         if (try mcpBrowserActionResultAlloc(allocator, status, nonce)) |result| return result;
     }

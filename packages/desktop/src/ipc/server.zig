@@ -304,7 +304,7 @@ fn writeBrowserStatus(s: *std.json.Stringify, state: *app_state.AppState) !void 
     try s.objectField("status");
     try s.write(browser.statusLabel());
     try s.objectField("visible");
-    try s.write(state.isBrowserVisible());
+    try s.write(state.isBrowserRuntimeActive());
     try s.objectField("suspended");
     try s.write(state.isBrowserSurfaceSuspendedForLayout() or state.isBrowserSurfaceSuspendedForPaletteOverlay() or state.isBrowserSurfaceSuspendedForEmptyState());
     try s.objectField("workspace_index");
@@ -1049,6 +1049,17 @@ fn chatOpenResponse(allocator: std.mem.Allocator, id_value: std.json.Value, stat
 
 fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
     if (std.mem.eql(u8, command, "status")) {
+        if (browserCommandHasProjectRef(params)) {
+            const project_index = browserCommandProjectIndex(state, params) orelse
+                return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+            if (state.browserPaneIdInWorkspace(project_index) == null)
+                return try errorResponseAlloc(allocator, id_value, "rejected", "browser pane is not open in workspace");
+            _ = state.activateBrowserInWorkspace(project_index) catch |err| switch (err) {
+                error.BrowserDisabled => return try errorResponseAlloc(allocator, id_value, "unsupported", "browser runtime is disabled"),
+                error.BrowserNotVisible => return try errorResponseAlloc(allocator, id_value, "rejected", "browser pane is not open in workspace"),
+                else => return try errorResponseAlloc(allocator, id_value, "rejected", @errorName(err)),
+            };
+        }
         return try browserStatusResponse(allocator, id_value, state);
     }
 
@@ -1074,7 +1085,9 @@ fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
     }
 
     if (std.mem.eql(u8, command, "close")) {
-        if (state.isBrowserVisible()) state.closeBrowser();
+        const project_index = browserCommandProjectIndex(state, params) orelse
+            return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+        _ = state.closeBrowserInWorkspace(project_index);
         return try okValueResponse(allocator, id_value, .{ .accepted = true });
     }
 
@@ -1083,8 +1096,15 @@ fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
         return try okValueResponse(allocator, id_value, .{ .accepted = true });
     }
 
-    if (!state.isBrowserVisible()) {
-        return try errorResponseAlloc(allocator, id_value, "rejected", "browser pane is not visible");
+    const project_index = browserCommandProjectIndex(state, params) orelse
+        return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+    _ = state.activateBrowserInWorkspace(project_index) catch |err| switch (err) {
+        error.BrowserNotVisible => return try errorResponseAlloc(allocator, id_value, "rejected", "browser pane is not visible in workspace"),
+        error.BrowserDisabled => return try errorResponseAlloc(allocator, id_value, "unsupported", "browser runtime is disabled"),
+        else => return try errorResponseAlloc(allocator, id_value, "rejected", @errorName(err)),
+    };
+    if (!state.isBrowserRuntimeActive()) {
+        return try errorResponseAlloc(allocator, id_value, "rejected", "browser runtime is not active");
     }
 
     if (std.mem.eql(u8, command, "restart") or std.mem.eql(u8, command, "reset")) {
@@ -1533,6 +1553,32 @@ fn resolveProjectIndex(state: *app_state.AppState, params: std.json.Value) ?usiz
     return state.selected_project_index;
 }
 
+fn browserCommandProjectIndex(state: *app_state.AppState, params: std.json.Value) ?usize {
+    if (state.projects.items.len == 0) return null;
+    const explicit_project_index = if (browserCommandHasProjectRef(params))
+        resolveProjectIndex(state, params) orelse return null
+    else
+        null;
+    return chooseBrowserCommandProjectIndex(
+        state.browserWorkspaceIndex(),
+        state.selected_project_index,
+        explicit_project_index,
+    );
+}
+
+fn chooseBrowserCommandProjectIndex(active_project_index: ?usize, selected_project_index: usize, explicit_project_index: ?usize) usize {
+    return explicit_project_index orelse active_project_index orelse selected_project_index;
+}
+
+fn browserCommandHasProjectRef(params: std.json.Value) bool {
+    if (params != .object) return false;
+    const project_ref = params.object.get("workspace_id") orelse
+        params.object.get("workspace") orelse
+        params.object.get("project") orelse
+        .null;
+    return jsonString(project_ref) != null;
+}
+
 fn resolveClosedProjectIndex(state: *app_state.AppState, params: std.json.Value) ?usize {
     if (state.archived_projects.items.len == 0) return null;
     if (params == .object) {
@@ -1663,7 +1709,7 @@ fn writePane(s: *std.json.Stringify, state: *app_state.AppState, project_index: 
             try s.objectField("kind");
             try s.write("browser");
             try s.objectField("visible");
-            try s.write(state.isBrowserVisible());
+            try s.write(state.isBrowserRuntimeActiveInWorkspace(project_index));
         },
     }
     try s.endObject();
@@ -3130,6 +3176,12 @@ test "live transcript response budget is bounded before JSON allocation" {
     }};
     try std.testing.expect(transcriptFitsLiveResponse(&messages, 1024));
     try std.testing.expect(!transcriptFitsLiveResponse(&messages, 512));
+}
+
+test "browser commands resolve explicit MCP workspace before active runtime owner" {
+    try std.testing.expectEqual(@as(usize, 2), chooseBrowserCommandProjectIndex(0, 1, 2));
+    try std.testing.expectEqual(@as(usize, 0), chooseBrowserCommandProjectIndex(0, 1, null));
+    try std.testing.expectEqual(@as(usize, 1), chooseBrowserCommandProjectIndex(null, 1, null));
 }
 
 test "chat open response exposes stable identifiers" {

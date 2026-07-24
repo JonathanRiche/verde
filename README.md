@@ -382,8 +382,10 @@ verde live palette run --command pane.split_terminal_down [--json]
 `verde open <url>` is shorthand for `verde live browser open --url <url>`.
 When run inside a Verde terminal pane, browser open defaults to that terminal's
 workspace by resolving `VERDE_WORKSPACE_ID`; outside Verde it defaults to the
-currently selected desktop workspace. The browser is a singleton runtime: opening
-it in another workspace moves the browser pane there.
+currently selected desktop workspace. Browser panes and tab history are
+workspace-local. Verde binds them to one shared browser runtime on demand, so
+inactive workspaces retain lightweight snapshots instead of additional WebKit
+processes.
 
 Browser commands route through the same backend-neutral browser contract used by
 the Palette toolbar and inspector. Commands other than `open` and `status`
@@ -400,10 +402,11 @@ verde live browser post-json --json-payload '{"type":"ping"}' [--json]
 ```
 
 - `status` returns browser visibility, suspension, URL, lifecycle status, and
-  the workspace/pane currently hosting the singleton browser.
+  the workspace/pane currently bound to the shared runtime.
 - `open` ensures a browser pane exists in the target workspace and optionally
   navigates it without switching the selected workspace or focusing the URL bar.
-- `navigate` normalizes and loads a URL in the active singleton browser runtime.
+- `navigate` normalizes and loads a URL in the targeted workspace's browser,
+  rebinding the shared runtime first when necessary.
 - `eval` queues JavaScript evaluation in the active browser runtime; inspect
   `verde live status --json` for `browser.last_eval_result`.
 - `screenshot` stores and returns the visible viewport as PNG data when the

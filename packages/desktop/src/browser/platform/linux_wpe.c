@@ -26,6 +26,7 @@
 #define VERDE_BROWSER_LINUX_FRAME_TIMER_LEAD_US 750
 #define VERDE_BROWSER_LINUX_CONTEXT_MENU_ITEM_MAX 96
 #define VERDE_BROWSER_LINUX_FRAME_INTERVAL_SAMPLE_MAX 256
+#define VERDE_BROWSER_LINUX_PROCESS_SWAP_FEATURE "ProcessSwapOnCrossSiteNavigation"
 
 #if WEBKIT_CHECK_VERSION(2, 52, 0)
 #define VERDE_BROWSER_LINUX_HAS_CONTEXT_MENU_DETAILS 1
@@ -139,6 +140,34 @@ struct verde_browser_linux {
 int verde_browser_linux_set_bounds(struct verde_browser_linux *browser, int x, int y, int width, int height);
 
 static gboolean verde_browser_linux_frame_log_enabled(void);
+
+static gboolean verde_browser_linux_disable_process_swapping(WebKitSettings *settings) {
+    if (settings == NULL) return FALSE;
+#if WEBKIT_CHECK_VERSION(2, 42, 0)
+    WebKitFeatureList *features = webkit_settings_get_all_features();
+    if (features == NULL) return FALSE;
+    gboolean disabled = FALSE;
+    const gsize feature_count = webkit_feature_list_get_length(features);
+    for (gsize index = 0; index < feature_count; index += 1) {
+        WebKitFeature *feature = webkit_feature_list_get(features, index);
+        if (feature == NULL || g_strcmp0(webkit_feature_get_identifier(feature), VERDE_BROWSER_LINUX_PROCESS_SWAP_FEATURE) != 0) {
+            continue;
+        }
+        // A legacy FDO exportable owns one nested Wayland compositor
+        // connection. Moving it between cross-site WebProcesses can invalidate
+        // that connection, after which every replacement process aborts while
+        // binding wl_compositor. Keep the shared Verde runtime in one process.
+        webkit_settings_set_feature_enabled(settings, feature, FALSE);
+        disabled = !webkit_settings_get_feature_enabled(settings, feature);
+        break;
+    }
+    webkit_feature_list_unref(features);
+    return disabled;
+#else
+    // Older WPE versions do not expose or enable this process-swapping feature.
+    return TRUE;
+#endif
+}
 
 static gint64 verde_browser_linux_frame_min_interval_us(struct verde_browser_linux *browser, gint64 now_us) {
     (void)now_us;
@@ -646,6 +675,14 @@ int64_t verde_browser_linux_test_frame_interval_us(int visible) {
     struct verde_browser_linux browser = {0};
     browser.visible = visible != 0;
     return verde_browser_linux_frame_min_interval_us(&browser, 0);
+}
+
+int verde_browser_linux_test_disables_process_swapping(void) {
+    WebKitSettings *settings = webkit_settings_new();
+    if (settings == NULL) return 0;
+    const gboolean disabled = verde_browser_linux_disable_process_swapping(settings);
+    g_object_unref(settings);
+    return disabled ? 1 : 0;
 }
 #endif
 
@@ -1286,6 +1323,10 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
     webkit_web_view_set_background_color(browser->web_view, &background);
     WebKitSettings *settings = webkit_web_view_get_settings(browser->web_view);
     webkit_settings_set_enable_developer_extras(settings, TRUE);
+    if (!verde_browser_linux_disable_process_swapping(settings)) {
+        fprintf(stderr, "verde-browser-linux WPE: failed to disable cross-site WebProcess swapping\n");
+        fflush(stderr);
+    }
 
     verde_browser_linux_add_prefer_dark_scheme_script(browser->content_manager);
 

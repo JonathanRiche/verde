@@ -145,6 +145,8 @@ pub fn buildPatchViewWithOptions(
 
     for (document.files) |file| {
         const language = syntax.inferLanguage(file.new_path orelse file.old_path orelse "");
+        var tokenizer: syntax.Tokenizer = .init(language);
+        defer tokenizer.deinit();
         for (file.header_lines) |line| {
             try lines.append(arena, .{
                 .kind = .file_header,
@@ -170,7 +172,7 @@ pub fn buildPatchViewWithOptions(
                     try appendCollapsedFlatContextRun(
                         arena,
                         &lines,
-                        language,
+                        &tokenizer,
                         hunk.lines[run_start..index],
                         old_line,
                         new_line,
@@ -185,7 +187,7 @@ pub fn buildPatchViewWithOptions(
                     continue;
                 }
 
-                const display_line = try buildCodeDisplayLine(arena, language, diff_line, old_line, new_line);
+                const display_line = try buildCodeDisplayLine(arena, &tokenizer, diff_line, old_line, new_line);
                 if (display_line.old_line) |value| max_old_line = @max(max_old_line, value);
                 if (display_line.new_line) |value| max_new_line = @max(max_new_line, value);
                 try lines.append(arena, display_line);
@@ -246,6 +248,9 @@ pub fn buildSideBySidePatchViewWithOptions(
     }
 
     for (document.files) |file| {
+        const language = syntax.inferLanguage(file.new_path orelse file.old_path orelse "");
+        var tokenizer: syntax.Tokenizer = .init(language);
+        defer tokenizer.deinit();
         if (fileDisplayLabel(file)) |label| {
             try rows.append(arena, .{
                 .kind = .file_header,
@@ -253,7 +258,6 @@ pub fn buildSideBySidePatchViewWithOptions(
             });
         }
 
-        const language = syntax.inferLanguage(file.new_path orelse file.old_path orelse "");
         for (file.hunks) |hunk| {
             try rows.append(arena, .{
                 .kind = .hunk_header,
@@ -272,7 +276,7 @@ pub fn buildSideBySidePatchViewWithOptions(
                     try appendCollapsedSideBySideContextRun(
                         arena,
                         &rows,
-                        language,
+                        &tokenizer,
                         hunk.lines[run_start..index],
                         old_line,
                         new_line,
@@ -301,14 +305,14 @@ pub fn buildSideBySidePatchViewWithOptions(
 
                 const deletions = try buildPendingCodeCells(
                     arena,
-                    language,
+                    &tokenizer,
                     .deletion,
                     hunk.lines[deletion_start .. deletion_start + deletion_count],
                     old_line,
                 );
                 const additions = try buildPendingCodeCells(
                     arena,
-                    language,
+                    &tokenizer,
                     .addition,
                     hunk.lines[addition_start .. addition_start + addition_count],
                     new_line,
@@ -440,7 +444,7 @@ fn contextGapLabel(allocator: std.mem.Allocator, skipped_count: usize) std.mem.A
 fn appendCollapsedFlatContextRun(
     allocator: std.mem.Allocator,
     lines: *std.ArrayListUnmanaged(DisplayLine),
-    language: syntax.Language,
+    tokenizer: *syntax.Tokenizer,
     run: []const ast.Line,
     old_line_start: usize,
     new_line_start: usize,
@@ -461,7 +465,7 @@ fn appendCollapsedFlatContextRun(
         try appendFlatContextLine(
             allocator,
             lines,
-            language,
+            tokenizer,
             run[index],
             old_line_start + index,
             new_line_start + index,
@@ -481,7 +485,7 @@ fn appendCollapsedFlatContextRun(
             try appendFlatContextLine(
                 allocator,
                 lines,
-                language,
+                tokenizer,
                 run[index],
                 old_line_start + index,
                 new_line_start + index,
@@ -499,14 +503,14 @@ fn appendCollapsedFlatContextRun(
 fn appendFlatContextLine(
     allocator: std.mem.Allocator,
     lines: *std.ArrayListUnmanaged(DisplayLine),
-    language: syntax.Language,
+    tokenizer: *syntax.Tokenizer,
     diff_line: ast.Line,
     old_line: usize,
     new_line: usize,
     max_old_line: *usize,
     max_new_line: *usize,
 ) std.mem.Allocator.Error!void {
-    const display_line = try buildCodeDisplayLine(allocator, language, diff_line, old_line, new_line);
+    const display_line = try buildCodeDisplayLine(allocator, tokenizer, diff_line, old_line, new_line);
     if (display_line.old_line) |value| max_old_line.* = @max(max_old_line.*, value);
     if (display_line.new_line) |value| max_new_line.* = @max(max_new_line.*, value);
     try lines.append(allocator, display_line);
@@ -521,7 +525,7 @@ fn appendFlatContextLine(
 fn appendCollapsedSideBySideContextRun(
     allocator: std.mem.Allocator,
     rows: *std.ArrayListUnmanaged(SideBySideRow),
-    language: syntax.Language,
+    tokenizer: *syntax.Tokenizer,
     run: []const ast.Line,
     old_line_start: usize,
     new_line_start: usize,
@@ -542,7 +546,7 @@ fn appendCollapsedSideBySideContextRun(
         try appendSideBySideContextLine(
             allocator,
             rows,
-            language,
+            tokenizer,
             run[index],
             old_line_start + index,
             new_line_start + index,
@@ -562,7 +566,7 @@ fn appendCollapsedSideBySideContextRun(
             try appendSideBySideContextLine(
                 allocator,
                 rows,
-                language,
+                tokenizer,
                 run[index],
                 old_line_start + index,
                 new_line_start + index,
@@ -580,14 +584,14 @@ fn appendCollapsedSideBySideContextRun(
 fn appendSideBySideContextLine(
     allocator: std.mem.Allocator,
     rows: *std.ArrayListUnmanaged(SideBySideRow),
-    language: syntax.Language,
+    tokenizer: *syntax.Tokenizer,
     diff_line: ast.Line,
     old_line: usize,
     new_line: usize,
     max_old_line: *usize,
     max_new_line: *usize,
 ) std.mem.Allocator.Error!void {
-    const cell = try buildCodeCell(allocator, language, .context, diff_line, old_line);
+    const cell = try buildCodeCell(allocator, tokenizer, .context, diff_line, old_line);
     const right_cell: SideBySideCell = .{
         .kind = .context,
         .line_number = new_line,
@@ -611,7 +615,7 @@ fn appendSideBySideContextLine(
 
 fn buildPendingCodeCells(
     allocator: std.mem.Allocator,
-    language: syntax.Language,
+    tokenizer: *syntax.Tokenizer,
     kind: DisplayLineKind,
     lines: []const ast.Line,
     start_line_number: usize,
@@ -619,7 +623,7 @@ fn buildPendingCodeCells(
     const cells = try allocator.alloc(PendingCodeCell, lines.len);
     for (lines, 0..) |line, index| {
         cells[index] = .{
-            .cell = try buildCodeCell(allocator, language, kind, line, start_line_number + index),
+            .cell = try buildCodeCell(allocator, tokenizer, kind, line, start_line_number + index),
             .missing_newline = line.missing_newline,
         };
     }
@@ -829,7 +833,7 @@ fn tokenWeight(kind: syntax.TokenKind) i32 {
 
 fn buildCodeDisplayLine(
     allocator: std.mem.Allocator,
-    language: syntax.Language,
+    tokenizer: *syntax.Tokenizer,
     diff_line: ast.Line,
     old_line: usize,
     new_line: usize,
@@ -848,13 +852,13 @@ fn buildCodeDisplayLine(
             .context, .addition => new_line,
             .deletion => null,
         },
-        .tokens = try syntax.tokenizeLine(allocator, language, diff_line.text),
+        .tokens = try tokenizer.tokenizeLine(allocator, diff_line.text),
     };
 }
 
 fn buildCodeCell(
     allocator: std.mem.Allocator,
-    language: syntax.Language,
+    tokenizer: *syntax.Tokenizer,
     kind: DisplayLineKind,
     diff_line: ast.Line,
     line_number: usize,
@@ -863,7 +867,7 @@ fn buildCodeCell(
         .kind = kind,
         .line_number = line_number,
         .text = diff_line.text,
-        .tokens = try syntax.tokenizeLine(allocator, language, diff_line.text),
+        .tokens = try tokenizer.tokenizeLine(allocator, diff_line.text),
     };
 }
 

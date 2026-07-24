@@ -34,6 +34,7 @@ const sessionizer = @import("terminal/sessionizer.zig");
 const terminal = @import("terminal/terminal.zig");
 const theme = @import("ui/theme.zig");
 const text_measure = @import("ui/text_measure.zig");
+const diff_view_cache = @import("ui/diff_view_cache.zig");
 const updater = @import("updater.zig");
 const update_installer = @import("update_installer.zig");
 const utils = @import("utils.zig");
@@ -2385,6 +2386,7 @@ fn deinitWorkspacePaneRef(ref: *WorkspacePaneRef, allocator: std.mem.Allocator) 
 pub const BrowserOpenResult = struct {
     pane_id: WorkspacePaneId,
     workspace_index: usize,
+    /// Retained for live-protocol compatibility; workspace-local panes are no longer moved.
     moved_from_workspace: ?usize,
 };
 
@@ -2434,6 +2436,12 @@ pub const BrowserWorkspaceLocation = struct {
     index: usize,
     pane_id: WorkspacePaneId,
 };
+
+fn browserToggleCloses(controls_visible: bool, runtime_workspace_index: ?usize, selected_project_index: usize) bool {
+    if (!controls_visible) return false;
+    const workspace_index = runtime_workspace_index orelse return true;
+    return workspace_index == selected_project_index;
+}
 
 const ViewFocusSnapshot = struct {
     selected_project_index: usize,
@@ -5402,6 +5410,8 @@ pub const AppState = struct {
     provider_readiness_state: ProviderReadinessState,
     file_search_state: FileSearchState,
     browser_state: browser_runtime.State,
+    /// Workspace whose persisted browser pane currently owns the shared webview runtime.
+    browser_runtime_project_index: ?usize,
     browser_launch_open_delay_frames: u8,
     browser_start_eval_pending: bool,
     browser_pane_min: [2]f32,
@@ -5470,6 +5480,7 @@ pub const AppState = struct {
     transcript_markdown_project_index: ?usize,
     transcript_markdown_thread_index: ?usize,
     transcript_markdown_entries: std.ArrayList(?*TranscriptMarkdownBody),
+    transcript_diff_view_cache: diff_view_cache.Cache,
     transcript_auto_follow_pending: bool,
     scroll_transcript_to_bottom_frames: u8,
     /// Keyboard fine scroll: applied once on next transcript layout (px); cleared after paint.
@@ -5702,6 +5713,7 @@ pub const AppState = struct {
             .provider_readiness_state = .{},
             .file_search_state = .{},
             .browser_state = browser_state,
+            .browser_runtime_project_index = null,
             .browser_launch_open_delay_frames = 0,
             .browser_start_eval_pending = false,
             .browser_pane_min = .{ 0.0, 0.0 },
@@ -5763,6 +5775,7 @@ pub const AppState = struct {
             .transcript_markdown_project_index = null,
             .transcript_markdown_thread_index = null,
             .transcript_markdown_entries = .empty,
+            .transcript_diff_view_cache = .{},
             .transcript_auto_follow_pending = true,
             .scroll_transcript_to_bottom_frames = 8,
             .pending_transcript_scroll_px = 0,
@@ -8849,6 +8862,16 @@ pub const AppState = struct {
             if (s >= insert_at) s += 1;
             self.selected_project_index = s;
         }
+        if (self.browser_runtime_project_index) |runtime_index| {
+            if (runtime_index == from) {
+                self.browser_runtime_project_index = insert_at;
+            } else {
+                var adjusted = runtime_index;
+                if (adjusted > from) adjusted -= 1;
+                if (adjusted >= insert_at) adjusted += 1;
+                self.browser_runtime_project_index = adjusted;
+            }
+        }
 
         self.syncRenameBuffer();
         self.markDirty();
@@ -8869,6 +8892,7 @@ pub const AppState = struct {
         restored_appended = true;
         self.selected_project_index = self.projects.items.len - 1;
         self.ensureCurrentProjectWorkspace();
+        self.restorePersistedBrowserPaneAfterProjectSelection(self.selected_project_index);
         self.syncRenameBuffer();
         self.markDirty();
     }
@@ -8906,6 +8930,12 @@ pub const AppState = struct {
         }
 
         self.cancelThreadImport();
+        const closed_selected_project = self.selected_project_index == index;
+        const closed_active_browser = if (self.browser_runtime_project_index) |runtime_index|
+            runtime_index == index
+        else
+            false;
+        if (closed_active_browser) self.deactivateBrowserRuntime(true);
         var removed = self.projects.orderedRemove(index);
         removed.archived = true;
         removed.terminal_dock.visible = false;
@@ -8923,6 +8953,14 @@ pub const AppState = struct {
             self.selected_project_index = @min(index, self.projects.items.len - 1);
         } else if (self.selected_project_index > index) {
             self.selected_project_index -= 1;
+        }
+        if (!closed_active_browser) {
+            if (self.browser_runtime_project_index) |runtime_index| {
+                if (runtime_index > index) self.browser_runtime_project_index = runtime_index - 1;
+            }
+        }
+        if (self.projects.items.len > 0 and (closed_active_browser or closed_selected_project)) {
+            self.restorePersistedBrowserPaneAfterProjectSelection(self.selected_project_index);
         }
 
         self.rename_project_index = null;
@@ -13373,78 +13411,34 @@ pub const AppState = struct {
             return;
         }
 
-        if (self.browser_state.controls_visible) {
+        const browser_workspace_index = self.browserWorkspaceIndex();
+        if (browserToggleCloses(
+            self.browser_state.controls_visible,
+            browser_workspace_index,
+            self.selected_project_index,
+        )) {
             self.closeBrowser();
             return;
         }
 
         self.ensureCurrentProjectWorkspace();
-        const browser_pane_id = if (self.projects.items.len > 0)
-            self.projects.items[self.selected_project_index].workspace_layout.ensureBrowserPane(self.allocator) catch |err| {
-                log.err("failed to open browser workspace pane: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Failed to open browser pane.");
-                return;
-            }
-        else
-            null;
-        if (self.projects.items.len > 0) {
-            self.projects.items[self.selected_project_index].workspace_layout.maximized_pane_id = null;
-        }
-        if (browser_pane_id) |pane_id| {
-            self.applyBrowserPaneSnapshotToRuntime(self.selected_project_index, pane_id);
-        }
-        const restore_url = if (browser_pane_id) |pane_id|
-            self.browserPaneSnapshotUrl(self.selected_project_index, pane_id)
-        else
-            null;
-
-        self.browser_state.setControlsVisible(true);
-        if (browser_pane_id) |pane_id| _ = self.focusCurrentProjectWorkspacePane(pane_id);
+        if (self.projects.items.len == 0) return;
+        const result = self.openBrowserInWorkspace(self.selected_project_index, null) catch |err| {
+            log.err("failed to activate workspace browser pane: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to open browser pane.");
+            return;
+        };
+        _ = self.focusCurrentProjectWorkspacePane(result.pane_id);
         self.browser_address_focused = true;
         self.browser_address_cursor = self.browser_state.addressInput().len;
         self.unfocusBrowserPane();
         self.terminal_focused = false;
         self.composer_focused = false;
-        self.browser_state.status = .opening;
-        if (restore_url) |url| {
-            if (!isBlankBrowserUrl(url)) {
-                self.navigateBrowserToUrl(url) catch |err| {
-                    log.err("failed to restore browser runtime: {s}", .{@errorName(err)});
-                    self.browser_state.status = .failed;
-                    self.browser_state.setLastError("Failed to restore browser runtime.") catch {};
-                    self.setSidebarNotice("Failed to reopen browser.");
-                    return;
-                };
-                self.blurNativeBrowserForAddressField();
-                self.setSidebarNotice("Browser reopened.");
-                return;
-            }
-        } else if (!self.browser_state.controller.runtimeInitialized() and self.browser_state.current_url != null) {
-            const url = self.browser_state.current_url.?;
-            self.navigateBrowserToUrl(url) catch |err| {
-                log.err("failed to restore browser runtime: {s}", .{@errorName(err)});
-                self.browser_state.status = .failed;
-                self.browser_state.setLastError("Failed to restore browser runtime.") catch {};
-                self.setSidebarNotice("Failed to reopen browser.");
-                return;
-            };
-            self.blurNativeBrowserForAddressField();
-            self.setSidebarNotice("Browser reopened.");
-            return;
-        }
-
-        self.browser_state.controller.show() catch |err| {
-            log.err("failed to show browser runtime: {s}", .{@errorName(err)});
-            self.browser_state.status = .failed;
-            self.browser_state.setLastError("Failed to show browser runtime.") catch {};
-            self.setSidebarNotice("Failed to show browser.");
-            return;
-        };
         self.blurNativeBrowserForAddressField();
-        self.setSidebarNotice("Browser opened.");
+        self.setSidebarNotice("Browser opened in this workspace.");
     }
 
-    /// Ensures the singleton browser pane exists in a workspace without selecting that workspace or stealing keyboard focus.
+    /// Ensures a workspace-local browser pane exists and binds the shared runtime to it.
     pub fn openBrowserInWorkspace(self: *AppState, project_index: usize, url: ?[]const u8) !BrowserOpenResult {
         if (!self.browser_textures_enabled) {
             self.setSidebarNotice("Browser is disabled for the SDL_GPU non-image renderer experiment.");
@@ -13452,6 +13446,8 @@ pub const AppState = struct {
         }
         if (project_index >= self.projects.items.len) return error.WorkspaceNotFound;
 
+        const previous_runtime_workspace = self.browser_runtime_project_index;
+        const switching_workspace = previous_runtime_workspace == null or previous_runtime_workspace.? != project_index;
         const selected_index = self.selected_project_index;
         const selected_focus = if (selected_index < self.projects.items.len)
             self.projects.items[selected_index].workspace_layout.focused_pane_id
@@ -13462,20 +13458,10 @@ pub const AppState = struct {
             break :focused kind == .browser;
         } else false;
 
-        const previous_workspace = self.browserWorkspaceIndex();
-        const moved_from_workspace = if (previous_workspace) |index|
-            if (index != project_index) index else null
-        else
-            null;
-
-        for (self.projects.items, 0..) |*project, index| {
-            if (index == project_index) continue;
-            _ = project.workspace_layout.closePaneKind(self.allocator, .browser);
-        }
-
         var layout = &self.projects.items[project_index].workspace_layout;
         const browser_pane_id = try layout.ensureBrowserPane(self.allocator);
         layout.maximized_pane_id = null;
+        self.browser_runtime_project_index = project_index;
         self.applyBrowserPaneSnapshotToRuntime(project_index, browser_pane_id);
         const restore_url = self.browserPaneSnapshotUrl(project_index, browser_pane_id);
 
@@ -13493,15 +13479,9 @@ pub const AppState = struct {
 
         if (url) |target_url| {
             try self.navigateBrowserToUrl(target_url);
-        } else if (restore_url) |target_url| {
-            if (isBlankBrowserUrl(target_url)) {
-                try self.showBrowserRuntimeForLiveOpen();
-            } else {
-                try self.navigateBrowserToUrl(target_url);
-            }
-        } else if (!self.browser_state.controller.runtimeInitialized() and self.browser_state.current_url != null) {
-            try self.navigateBrowserToUrl(self.browser_state.current_url.?);
-        } else {
+        } else if (switching_workspace or !self.browser_state.controller.runtimeInitialized()) {
+            try self.navigateBrowserToUrl(restore_url orelse "about:blank");
+        } else if (project_index == selected_index or !self.browser_surface_suspended_for_layout) {
             try self.showBrowserRuntimeForLiveOpen();
         }
 
@@ -13517,8 +13497,44 @@ pub const AppState = struct {
         return .{
             .pane_id = browser_pane_id,
             .workspace_index = project_index,
-            .moved_from_workspace = moved_from_workspace,
+            .moved_from_workspace = null,
         };
+    }
+
+    /// Binds the shared browser runtime to an existing browser pane in a workspace.
+    pub fn activateBrowserInWorkspace(self: *AppState, project_index: usize) !BrowserOpenResult {
+        if (project_index >= self.projects.items.len) return error.WorkspaceNotFound;
+        const pane_id = self.projects.items[project_index].workspace_layout.visibleBrowserPaneId() orelse
+            return error.BrowserNotVisible;
+        if (self.browser_state.controls_visible) {
+            if (self.browser_runtime_project_index) |runtime_project_index| {
+                if (runtime_project_index == project_index) {
+                    return .{
+                        .pane_id = pane_id,
+                        .workspace_index = project_index,
+                        .moved_from_workspace = null,
+                    };
+                }
+            }
+        }
+        return self.openBrowserInWorkspace(project_index, null);
+    }
+
+    /// Removes one workspace's browser pane without disturbing browser snapshots in other workspaces.
+    pub fn closeBrowserInWorkspace(self: *AppState, project_index: usize) bool {
+        if (project_index >= self.projects.items.len) return false;
+        const pane_id = self.projects.items[project_index].workspace_layout.visibleBrowserPaneId() orelse return false;
+        if (self.browser_runtime_project_index) |runtime_project_index| {
+            if (runtime_project_index == project_index) {
+                self.closeBrowser();
+                return true;
+            }
+        }
+        var removed_ref = self.projects.items[project_index].workspace_layout.closePane(self.allocator, pane_id) orelse return false;
+        deinitWorkspacePaneRef(&removed_ref, self.allocator);
+        self.setSidebarNotice("Browser closed in workspace.");
+        self.markDirty();
+        return true;
     }
 
     /// Navigates the browser runtime through the same normalization path used by the address field.
@@ -13580,28 +13596,30 @@ pub const AppState = struct {
         if (!try self.browser_state.controller.handleMouse(event)) return error.UnsupportedBrowserCapability;
     }
 
-    /// Returns the workspace currently hosting the singleton browser pane, if any.
+    /// Returns the workspace whose pane currently owns the shared browser runtime.
     pub fn browserWorkspaceLocation(self: *const AppState) ?BrowserWorkspaceLocation {
-        for (self.projects.items, 0..) |project, index| {
-            const pane_id = project.workspace_layout.visibleBrowserPaneId() orelse continue;
-            return .{
-                .index = index,
-                .pane_id = pane_id,
-            };
-        }
-        return null;
+        const index = self.browser_runtime_project_index orelse return null;
+        if (index >= self.projects.items.len) return null;
+        const pane_id = self.projects.items[index].workspace_layout.visibleBrowserPaneId() orelse return null;
+        return .{ .index = index, .pane_id = pane_id };
     }
 
-    /// Returns the workspace currently hosting the singleton browser pane, if any.
+    /// Returns the workspace whose pane currently owns the shared browser runtime.
     pub fn browserWorkspaceIndex(self: *const AppState) ?usize {
         const location = self.browserWorkspaceLocation() orelse return null;
         return location.index;
     }
 
-    /// Returns the visible singleton browser pane id, if any.
+    /// Returns the pane currently bound to the shared browser runtime, if any.
     pub fn browserWorkspacePaneId(self: *const AppState) ?WorkspacePaneId {
         const location = self.browserWorkspaceLocation() orelse return null;
         return location.pane_id;
+    }
+
+    /// Returns a workspace's persisted browser pane independently of runtime ownership.
+    pub fn browserPaneIdInWorkspace(self: *const AppState, project_index: usize) ?WorkspacePaneId {
+        if (project_index >= self.projects.items.len) return null;
+        return self.projects.items[project_index].workspace_layout.visibleBrowserPaneId();
     }
 
     fn browserPaneRefMutable(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) ?*BrowserPaneRef {
@@ -13624,13 +13642,18 @@ pub const AppState = struct {
         return tab.url;
     }
 
-    // A browser pane can be restored in a workspace that was not selected at
-    // launch. Reopen its runtime when that workspace later becomes visible.
+    // Workspace browser panes retain lightweight tab snapshots while inactive.
+    // Rebind the one live runtime when their workspace becomes visible.
     fn restorePersistedBrowserPaneAfterProjectSelection(self: *AppState, project_index: usize) void {
         if (project_index >= self.projects.items.len) return;
-        const pane_id = self.projects.items[project_index].workspace_layout.visibleBrowserPaneId() orelse return;
+        const pane_id = self.projects.items[project_index].workspace_layout.visibleBrowserPaneId() orelse {
+            // Keep the one live page hidden so its DOM state survives while
+            // the selected workspace has no browser pane.
+            self.noteBrowserPaneNotRendered();
+            return;
+        };
         self.applyBrowserPaneSnapshotToRuntime(project_index, pane_id);
-        if (!self.browser_textures_enabled or self.browser_state.controls_visible) return;
+        if (!self.browser_textures_enabled) return;
 
         _ = self.openBrowserInWorkspace(project_index, null) catch |err| {
             log.warn("failed to restore browser pane after workspace selection: {s}", .{@errorName(err)});
@@ -13644,18 +13667,14 @@ pub const AppState = struct {
     fn applyBrowserPaneSnapshotToRuntime(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) void {
         const ref = self.browserPaneRefMutable(project_index, pane_id) orelse return;
         const tab = ref.activeTab() orelse return;
-        if (tab.url) |url| {
-            self.browser_state.setCurrentUrl(url) catch |err| {
-                log.warn("failed to restore browser pane URL: {s}", .{@errorName(err)});
-            };
-            self.browser_state.setAddress(url);
-            self.browser_address_cursor = self.browser_state.addressInput().len;
-        }
-        if (tab.title) |title| {
-            self.browser_state.setCurrentTitle(title) catch |err| {
-                log.warn("failed to restore browser pane title: {s}", .{@errorName(err)});
-            };
-        }
+        self.browser_state.setCurrentUrl(tab.url) catch |err| {
+            log.warn("failed to restore browser pane URL: {s}", .{@errorName(err)});
+        };
+        self.browser_state.setCurrentTitle(tab.title) catch |err| {
+            log.warn("failed to restore browser pane title: {s}", .{@errorName(err)});
+        };
+        self.browser_state.setAddress(tab.url orelse "");
+        self.browser_address_cursor = self.browser_state.addressInput().len;
     }
 
     fn recordVisibleBrowserPaneNavigation(self: *AppState, url: []const u8) void {
@@ -13745,8 +13764,7 @@ pub const AppState = struct {
         };
     }
 
-    /// Closes the browser dock and fully tears the browser runtime down until the next open.
-    pub fn closeBrowser(self: *AppState) void {
+    fn deactivateBrowserRuntime(self: *AppState, shutdown: bool) void {
         self.browser_state.setControlsVisible(false);
         self.browser_state.setInspectorEnabled(false);
         self.browser_state.clearSuppressedEvalResults();
@@ -13758,12 +13776,26 @@ pub const AppState = struct {
         self.browser_cursor_shape = .default;
         self.browser_address_focused = false;
         self.browser_inspector_menu_open = false;
-        self.browser_state.controller.shutdown();
+        if (shutdown) {
+            self.browser_state.controller.shutdown();
+        } else {
+            self.browser_state.controller.hide() catch |err| {
+                log.warn("failed to hide inactive browser runtime: {s}", .{@errorName(err)});
+            };
+            self.suppressNextBrowserClosedEvent();
+        }
         self.browser_state.status = .hidden;
         self.browser_state.setLastError(null) catch {};
-        for (self.projects.items) |*project| {
-            _ = project.workspace_layout.closePaneKind(self.allocator, .browser);
+        self.browser_runtime_project_index = null;
+    }
+
+    /// Closes the active workspace's browser pane and tears down the shared runtime.
+    pub fn closeBrowser(self: *AppState) void {
+        const project_index = self.browser_runtime_project_index orelse self.selected_project_index;
+        if (project_index < self.projects.items.len) {
+            _ = self.projects.items[project_index].workspace_layout.closePaneKind(self.allocator, .browser);
         }
+        self.deactivateBrowserRuntime(true);
         self.ensureCurrentProjectWorkspace();
         self.setSidebarNotice("Browser closed.");
         self.markDirty();
@@ -13771,7 +13803,7 @@ pub const AppState = struct {
 
     /// Temporarily hides the native browser surface while the host SDL window is hidden/minimized.
     pub fn suspendBrowserForHostWindowHidden(self: *AppState) void {
-        if (!self.isBrowserVisible()) return;
+        if (!self.isBrowserRuntimeActive()) return;
         self.unfocusBrowserPane();
         self.browser_address_focused = false;
         self.browser_state.controller.hide() catch |err| {
@@ -13785,7 +13817,9 @@ pub const AppState = struct {
 
     /// Restores a visible browser dock after the host SDL window is shown/restored.
     pub fn resumeBrowserAfterHostWindowShown(self: *AppState) void {
-        if (!self.isBrowserVisible()) return;
+        if (!self.isBrowserRuntimeActive()) return;
+        const runtime_project_index = self.browser_runtime_project_index orelse return;
+        if (runtime_project_index != self.selected_project_index) return;
         if (self.browser_surface_suspended_for_empty_state) return;
         self.browser_state.status = .opening;
         self.browser_state.controller.show() catch |err| {
@@ -13797,9 +13831,21 @@ pub const AppState = struct {
         self.syncBrowserPaneBoundsToBackend();
     }
 
-    /// Reports whether the browser dock is visible in the chat workspace.
+    /// Reports whether the selected workspace owns the active browser runtime.
     pub fn isBrowserVisible(self: *const AppState) bool {
-        return self.browser_state.controls_visible;
+        return self.isBrowserRuntimeActiveInWorkspace(self.selected_project_index);
+    }
+
+    /// Reports whether any workspace currently owns the shared browser runtime.
+    pub fn isBrowserRuntimeActive(self: *const AppState) bool {
+        return self.browser_state.controls_visible and self.browserWorkspaceLocation() != null;
+    }
+
+    /// Reports whether a specific workspace currently owns the shared browser runtime.
+    pub fn isBrowserRuntimeActiveInWorkspace(self: *const AppState, project_index: usize) bool {
+        if (!self.browser_state.controls_visible) return false;
+        const runtime_project_index = self.browser_runtime_project_index orelse return false;
+        return runtime_project_index == project_index and self.browserPaneIdInWorkspace(project_index) != null;
     }
 
     /// Reports whether the current browser runtime can host the bundled page inspector.
@@ -14091,7 +14137,7 @@ pub const AppState = struct {
     }
 
     pub fn noteBrowserPaneNotRendered(self: *AppState) void {
-        if (!self.isBrowserVisible()) return;
+        if (!self.isBrowserRuntimeActive()) return;
         self.browser_pane_hovered = false;
         self.browser_pane_min = .{ 0.0, 0.0 };
         self.browser_pane_max = .{ 0.0, 0.0 };
@@ -14275,6 +14321,18 @@ pub const AppState = struct {
     }
 
     pub fn focusBrowserPane(self: *AppState) void {
+        if (self.projects.items.len > 0) {
+            const selected_layout = &self.projects.items[self.selected_project_index].workspace_layout;
+            const runtime_is_selected = if (self.browser_runtime_project_index) |project_index|
+                project_index == self.selected_project_index
+            else
+                false;
+            if (self.browser_textures_enabled and selected_layout.visibleBrowserPaneId() != null and !runtime_is_selected) {
+                _ = self.activateBrowserInWorkspace(self.selected_project_index) catch |err| {
+                    log.warn("failed to activate focused workspace browser: {s}", .{@errorName(err)});
+                };
+            }
+        }
         self.browser_pane_focused = true;
         self.terminal_focused = false;
         self.composer_focused = false;
@@ -14544,7 +14602,7 @@ pub const AppState = struct {
     /// Captures the current CPU-side browser frame and stores the PNG beside
     /// other browser captures so live-control and MCP callers can reuse it.
     pub fn captureBrowserScreenshot(self: *AppState) !BrowserScreenshotResult {
-        if (!self.isBrowserVisible()) return error.BrowserNotVisible;
+        if (!self.isBrowserRuntimeActive()) return error.BrowserNotVisible;
         const frame = (try self.browser_state.controller.copyFramePixels(self.allocator)) orelse
             return error.BrowserScreenshotUnavailable;
         defer frame.deinit(self.allocator);
@@ -17620,19 +17678,9 @@ pub const AppState = struct {
                 self.setSidebarNotice(if (preserve_agent_history) "Agent TUI closed. Reopen it from History." else "Terminal pane closed.");
             },
             .browser => {
-                self.browser_state.setControlsVisible(false);
-                self.browser_state.setInspectorEnabled(false);
-                self.browser_state.clearSuppressedEvalResults();
-                self.browser_surface_suspended_for_palette_overlay = false;
-                self.browser_surface_suspended_for_layout = false;
-                self.browser_surface_suspended_for_empty_state = false;
-                self.unfocusBrowserPane();
-                self.browser_pane_hovered = false;
-                self.browser_address_focused = false;
-                self.browser_inspector_menu_open = false;
-                self.browser_state.controller.hide() catch |err| {
-                    log.warn("failed to hide browser runtime after closing pane: {s}", .{@errorName(err)});
-                };
+                if (self.browser_runtime_project_index) |runtime_project_index| {
+                    if (runtime_project_index == project_index) self.deactivateBrowserRuntime(true);
+                }
                 self.setSidebarNotice("Browser pane closed.");
             },
         }
@@ -20468,6 +20516,7 @@ pub const AppState = struct {
         self.clearProjects();
         self.clearSurfaces();
         self.transcript_markdown_entries.deinit(self.allocator);
+        self.transcript_diff_view_cache.deinit(self.allocator);
         self.clearBrowserContextMenuLocal();
         self.browser_context_menu_items.deinit(self.allocator);
         self.browser_state.deinit();
@@ -23355,6 +23404,53 @@ test "empty workspace ignores hidden composer and slash input" {
     state.clearCurrentDraftImageAt(0);
 }
 
+test "browser toggle opens another workspace without closing its active browser" {
+    try std.testing.expect(!browserToggleCloses(false, null, 1));
+    try std.testing.expect(browserToggleCloses(true, null, 1));
+    try std.testing.expect(browserToggleCloses(true, 1, 1));
+    try std.testing.expect(!browserToggleCloses(true, 0, 1));
+}
+
+test "shared browser runtime routes state through its workspace owner" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.projects = .empty;
+    state.selected_project_index = 0;
+    state.browser_runtime_project_index = null;
+    defer {
+        for (state.projects.items) |*project| project.deinit(allocator);
+        state.projects.deinit(allocator);
+    }
+
+    var first_project = try Project.init(allocator, "first", "First", "/tmp/first", 0);
+    state.projects.append(allocator, first_project) catch |err| {
+        first_project.deinit(allocator);
+        return err;
+    };
+    var second_project = try Project.init(allocator, "second", "Second", "/tmp/second", 0);
+    state.projects.append(allocator, second_project) catch |err| {
+        second_project.deinit(allocator);
+        return err;
+    };
+
+    const first_pane_id = try state.projects.items[0].workspace_layout.ensureBrowserPane(allocator);
+    const second_pane_id = try state.projects.items[1].workspace_layout.ensureBrowserPane(allocator);
+    try state.browserPaneRefMutable(0, first_pane_id).?.activeTab().?.recordNavigation(allocator, "https://first.example/");
+    try state.browserPaneRefMutable(1, second_pane_id).?.activeTab().?.recordNavigation(allocator, "https://second.example/");
+
+    state.browser_runtime_project_index = 1;
+    try std.testing.expectEqual(@as(usize, 1), state.browserWorkspaceLocation().?.index);
+    try std.testing.expectEqual(second_pane_id, state.browserWorkspacePaneId().?);
+    try std.testing.expectEqualStrings("https://second.example/", state.browserPaneSnapshotUrl(1, second_pane_id).?);
+    try std.testing.expectEqualStrings("https://first.example/", state.browserPaneSnapshotUrl(0, first_pane_id).?);
+
+    state.browser_runtime_project_index = 0;
+    try std.testing.expectEqual(@as(usize, 0), state.browserWorkspaceLocation().?.index);
+    try std.testing.expectEqual(first_pane_id, state.browserWorkspacePaneId().?);
+    try std.testing.expect(state.browserPaneIdInWorkspace(1) != null);
+}
+
 test "completed OpenCode model refresh tolerates zero workspaces" {
     const allocator = std.testing.allocator;
     const page = std.heap.page_allocator;
@@ -23652,6 +23748,7 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     state.surfaces = .empty;
     state.selected_project_index = 0;
     state.browser_state = try browser_runtime.State.init(allocator);
+    state.browser_runtime_project_index = null;
     state.browser_pane_focused = false;
     state.browser_address_focused = true;
     state.terminal_focused = false;
@@ -23777,6 +23874,7 @@ test "sidebar pane selection restores a sibling browser URL snapshot" {
     state.surfaces = .empty;
     state.selected_project_index = 0;
     state.browser_state = try browser_runtime.State.init(allocator);
+    state.browser_runtime_project_index = null;
     state.browser_textures_enabled = false;
     state.browser_pane_focused = false;
     state.browser_address_focused = false;
@@ -23833,6 +23931,7 @@ test "workspace selection restores focused pane keyboard ownership" {
     state.surfaces = .empty;
     state.selected_project_index = 0;
     state.browser_state = try browser_runtime.State.init(allocator);
+    state.browser_runtime_project_index = null;
     state.browser_pane_focused = false;
     state.browser_address_focused = false;
     state.terminal_focused = false;
