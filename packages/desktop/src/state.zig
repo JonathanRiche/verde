@@ -10826,6 +10826,7 @@ pub const AppState = struct {
         const pane = target orelse return;
         layout.focused_pane_id = pane_id;
         layout.maximized_pane_id = if (preserve_zoom and was_maximized) pane_id else null;
+        self.restorePersistedBrowserPaneAfterProjectSelection(project_index);
         switch (pane.ref) {
             .chat => |ref| {
                 self.terminal_focused = false;
@@ -12956,9 +12957,10 @@ pub const AppState = struct {
     // A browser pane can be restored in a workspace that was not selected at
     // launch. Reopen its runtime when that workspace later becomes visible.
     fn restorePersistedBrowserPaneAfterProjectSelection(self: *AppState, project_index: usize) void {
-        if (!self.browser_textures_enabled or self.browser_state.controls_visible) return;
         if (project_index >= self.projects.items.len) return;
-        if (!self.projects.items[project_index].workspace_layout.hasVisiblePaneKind(.browser)) return;
+        const pane_id = self.projects.items[project_index].workspace_layout.visibleBrowserPaneId() orelse return;
+        self.applyBrowserPaneSnapshotToRuntime(project_index, pane_id);
+        if (!self.browser_textures_enabled or self.browser_state.controls_visible) return;
 
         _ = self.openBrowserInWorkspace(project_index, null) catch |err| {
             log.warn("failed to restore browser pane after workspace selection: {s}", .{@errorName(err)});
@@ -22349,6 +22351,49 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.maximized_pane_id);
     try std.testing.expect(!state.focusCurrentProjectWorkspacePaneAtSidebarIndex(3));
+}
+
+test "sidebar pane selection restores a sibling browser URL snapshot" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.projects = .empty;
+    state.surfaces = .empty;
+    state.selected_project_index = 0;
+    state.browser_state = try browser_runtime.State.init(allocator);
+    state.browser_textures_enabled = false;
+    state.browser_pane_focused = false;
+    state.browser_address_focused = false;
+    state.terminal_focused = false;
+    state.composer_focused = true;
+    state.palette_composer.focused = true;
+    state.palette_modal_text_focus = .none;
+    state.dirty = false;
+    state.last_dirty_at_ms = 0;
+    state.last_interaction_at_ms = 0;
+    defer {
+        for (state.projects.items) |*project| project.deinit(allocator);
+        state.projects.deinit(allocator);
+        state.surfaces.deinit(allocator);
+        state.browser_state.deinit();
+    }
+
+    var project = try Project.init(allocator, "test", "Test", "/tmp/test", 0);
+    state.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    const layout = &state.projects.items[0].workspace_layout;
+    const chat_pane_id = layout.panes.items[0].id;
+    const browser_pane_id = try layout.ensureBrowserPane(allocator);
+    const browser_ref = state.browserPaneRefMutable(0, browser_pane_id) orelse return error.TestExpectedEqual;
+    try browser_ref.recordNavigation(allocator, "https://example.com/restored");
+    layout.focused_pane_id = chat_pane_id;
+
+    state.focusWorkspaceOpenPaneFromSidebar(0, chat_pane_id);
+
+    try std.testing.expectEqualStrings("https://example.com/restored", state.browser_state.current_url.?);
+    try std.testing.expectEqualStrings("https://example.com/restored", state.browser_state.addressInput());
 }
 
 test "visible chat is not treated as focused when a sibling pane owns focus" {
