@@ -2287,6 +2287,23 @@ pub const OpenChatResult = struct {
     focused: bool,
 };
 
+pub const OpenChatRequest = struct {
+    provider: Provider,
+    model_ref: ?[]const u8 = null,
+    reasoning_effort: ?ReasoningEffort = null,
+    reasoning_variant: ?[]const u8 = null,
+    fast_mode: ?FastMode = null,
+    target_pane_id: ?WorkspacePaneId = null,
+    axis: WorkspaceSplitAxis = .horizontal,
+    focus: bool = true,
+};
+
+const EffectiveChatSettings = struct {
+    reasoning_effort: ?ReasoningEffort,
+    reasoning_variant: ?[]const u8,
+    fast_mode: FastMode,
+};
+
 pub const BrowserScreenshotResult = struct {
     path: []u8,
     png_bytes: []u8,
@@ -7798,14 +7815,13 @@ pub const AppState = struct {
 
     fn prepareGuiHandoffTarget(self: *AppState, preview: []const u8) !WorkspacePaneId {
         if (self.handoff_use_existing) return self.prepareExistingGuiHandoffTarget(preview);
-        const result = try self.openWorkspaceChat(
-            self.handoff_project_index,
-            self.handoff_target_provider,
-            composerDefaultModelRef(self, self.handoff_target_provider),
-            self.handoff_source_pane_id,
-            .horizontal,
-            true,
-        );
+        const result = try self.openWorkspaceChat(self.handoff_project_index, .{
+            .provider = self.handoff_target_provider,
+            .model_ref = composerDefaultModelRef(self, self.handoff_target_provider),
+            .target_pane_id = self.handoff_source_pane_id,
+            .axis = .horizontal,
+            .focus = true,
+        });
         if (!try self.setWorkspaceChatPaneDraftForProject(self.handoff_project_index, result.pane_id, preview, false)) {
             return error.HandoffDraftUnavailable;
         }
@@ -16841,34 +16857,109 @@ pub const AppState = struct {
     pub fn openWorkspaceChat(
         self: *AppState,
         project_index: usize,
-        provider: Provider,
-        model_ref: ?[]const u8,
-        target_pane_id: ?WorkspacePaneId,
-        axis: WorkspaceSplitAxis,
-        focus: bool,
+        request: OpenChatRequest,
     ) !OpenChatResult {
         if (project_index >= self.projects.items.len) return error.ProjectNotFound;
-        if (model_ref) |requested_model| {
-            if (!self.providerSupportsModel(provider, requested_model)) return error.InvalidModel;
+        if (request.model_ref) |requested_model| {
+            if (!self.providerSupportsModel(request.provider, requested_model)) return error.InvalidModel;
         }
-        const selected_model = model_ref orelse composerDefaultModelRef(self, provider);
+        const selected_model = request.model_ref orelse composerDefaultModelRef(self, request.provider);
+        const settings = try self.resolveChatCreationSettings(request, selected_model);
         const result = try createWorkspaceChatPane(
             &self.projects.items[project_index],
             self.allocator,
-            provider,
+            request.provider,
             selected_model,
-            target_pane_id,
-            axis,
-            focus,
+            settings,
+            request.target_pane_id,
+            request.axis,
+            request.focus,
         );
-        if (focus) {
+        if (request.focus) {
             self.selected_project_index = project_index;
             self.requestComposerFocus();
             self.syncPaletteComposerFromDraft();
             self.syncRenameBuffer();
         }
         self.setSidebarNotice("New chat pane ready.");
+        self.markDirty();
         return result;
+    }
+
+    fn resolveChatCreationSettings(self: *const AppState, request: OpenChatRequest, model_ref: []const u8) !EffectiveChatSettings {
+        if (request.reasoning_effort != null and request.reasoning_variant != null) {
+            return error.ConflictingReasoningSettings;
+        }
+
+        if (request.reasoning_effort) |effort| {
+            const supported = switch (request.provider) {
+                .codex => codexSupportsReasoningEffort(effort),
+                .claude => blk: {
+                    const option = self.modelOptionForProvider(.claude, model_ref) orelse break :blk false;
+                    if (!option.reasoning_supported) break :blk false;
+                    const values = option.claude_effort_values orelse CLAUDE_STANDARD_EFFORT_VALUES[0..];
+                    for (values) |value| {
+                        if (parseReasoningEffort(value)) |available| {
+                            if (available == effort) break :blk true;
+                        }
+                    }
+                    break :blk false;
+                },
+                .opencode, .cursor => false,
+            };
+            if (!supported) return error.UnsupportedReasoningEffort;
+        }
+
+        if (request.reasoning_variant) |variant| {
+            if (variant.len == 0) return error.UnsupportedReasoningVariant;
+            const option = self.modelOptionForProvider(request.provider, model_ref) orelse
+                return error.UnsupportedReasoningVariant;
+            const values = switch (request.provider) {
+                .opencode => option.reasoning_variant_keys,
+                .cursor => option.cursor_reasoning_values,
+                .codex, .claude => null,
+            } orelse return error.UnsupportedReasoningVariant;
+            var supported = false;
+            for (values) |value| {
+                if (std.mem.eql(u8, value, variant)) {
+                    supported = true;
+                    break;
+                }
+            }
+            if (!supported) return error.UnsupportedReasoningVariant;
+        }
+
+        if (request.fast_mode != null) {
+            const supported = switch (request.provider) {
+                .codex => true,
+                .cursor => if (self.modelOptionForProvider(.cursor, model_ref)) |option| option.cursor_fast_supported else false,
+                .opencode, .claude => false,
+            };
+            if (!supported) return error.UnsupportedFastMode;
+        }
+
+        return .{
+            .reasoning_effort = request.reasoning_effort orelse if (request.provider == .codex) DEFAULT_CODEX_REASONING_EFFORT else null,
+            .reasoning_variant = request.reasoning_variant,
+            .fast_mode = request.fast_mode orelse .off,
+        };
+    }
+
+    fn modelOptionForProvider(self: *const AppState, provider: Provider, model_ref: []const u8) ?ModelOption {
+        for (composerModelOptions(self, provider)) |option| {
+            const value = option.value orelse continue;
+            if (std.mem.eql(u8, value, model_ref)) return option;
+        }
+        return null;
+    }
+
+    fn codexSupportsReasoningEffort(effort: ReasoningEffort) bool {
+        for (CODEX_REASONING_OPTIONS) |option| {
+            if (option.value) |value| {
+                if (value == effort) return true;
+            }
+        }
+        return false;
     }
 
     pub fn providerSupportsModel(self: *const AppState, provider: Provider, model_ref: []const u8) bool {
@@ -16916,6 +17007,7 @@ pub const AppState = struct {
         allocator: std.mem.Allocator,
         provider: Provider,
         model_ref: []const u8,
+        settings: EffectiveChatSettings,
         target_pane_id: ?WorkspacePaneId,
         axis: WorkspaceSplitAxis,
         focus: bool,
@@ -16936,7 +17028,12 @@ pub const AppState = struct {
         allocator.free(thread.model_ref.?);
         thread.model_ref = owned_model_ref;
         thread.provider = provider;
-        thread.reasoning_effort = if (provider == .codex) DEFAULT_CODEX_REASONING_EFFORT else null;
+        thread.reasoning_effort = settings.reasoning_effort;
+        thread.opencode_reasoning_variant = if (settings.reasoning_variant) |variant|
+            try allocator.dupeZ(u8, variant)
+        else
+            null;
+        thread.fast_mode = settings.fast_mode;
 
         try project.threads.append(allocator, thread);
         thread_owned = false;
@@ -22240,7 +22337,13 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
     try std.testing.expect(state.providerSupportsModel(.claude, DEFAULT_CLAUDE_MODEL));
     try std.testing.expect(state.providerSupportsModel(.cursor, DEFAULT_CURSOR_MODEL));
 
-    const result = try state.openWorkspaceChat(1, .cursor, "composer-2", 1, .vertical, false);
+    const result = try state.openWorkspaceChat(1, .{
+        .provider = .cursor,
+        .model_ref = "composer-2",
+        .target_pane_id = 1,
+        .axis = .vertical,
+        .focus = false,
+    });
     try std.testing.expectEqual(@as(usize, 0), state.selected_project_index);
     try std.testing.expectEqual(first_thread_count, state.projects.items[0].threads.items.len);
     try std.testing.expectEqual(first_pane_count, state.projects.items[0].workspace_layout.panes.items.len);
@@ -22262,19 +22365,95 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
         .{ .provider = .cursor, .model = DEFAULT_CURSOR_MODEL },
     };
     for (default_cases) |case| {
-        const default_result = try state.openWorkspaceChat(1, case.provider, null, 1, .horizontal, false);
+        const default_result = try state.openWorkspaceChat(1, .{
+            .provider = case.provider,
+            .target_pane_id = 1,
+            .focus = false,
+        });
         const default_thread = &state.projects.items[1].threads.items[default_result.thread_index];
         try std.testing.expectEqual(case.provider, default_thread.provider);
         try std.testing.expectEqualStrings(case.model, default_thread.model_ref.?);
+        if (case.provider == .codex) {
+            try std.testing.expectEqual(DEFAULT_CODEX_REASONING_EFFORT, default_thread.reasoning_effort.?);
+        } else {
+            try std.testing.expect(default_thread.reasoning_effort == null);
+        }
+        try std.testing.expect(default_thread.opencode_reasoning_variant == null);
+        try std.testing.expectEqual(FastMode.off, default_thread.fast_mode);
     }
+
+    const configured_result = try state.openWorkspaceChat(1, .{
+        .provider = .codex,
+        .reasoning_effort = .medium,
+        .fast_mode = .off,
+        .target_pane_id = 1,
+        .focus = false,
+    });
+    const configured_thread = &state.projects.items[1].threads.items[configured_result.thread_index];
+    try std.testing.expectEqual(ReasoningEffort.medium, configured_thread.reasoning_effort.?);
+    try std.testing.expectEqual(FastMode.off, configured_thread.fast_mode);
+    try std.testing.expect(state.dirty);
+
+    const persisted_result = try state.openWorkspaceChat(1, .{
+        .provider = .codex,
+        .reasoning_effort = .high,
+        .fast_mode = .on,
+        .target_pane_id = 1,
+        .focus = false,
+    });
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const persisted = try state.persistedThreadSnapshot(
+        arena.allocator(),
+        &state.projects.items[1].threads.items[persisted_result.thread_index],
+    );
+    try std.testing.expectEqual(ReasoningEffort.high, persisted.reasoning_effort.?);
+    try std.testing.expectEqual(FastMode.on, persisted.fast_mode.?);
+    try std.testing.expect(persisted.reasoning_variant == null);
 
     const thread_count_before_rejection = state.projects.items[1].threads.items.len;
     const pane_count_before_rejection = state.projects.items[1].workspace_layout.panes.items.len;
-    try std.testing.expectError(error.InvalidModel, state.openWorkspaceChat(1, .codex, "composer-2", 1, .horizontal, true));
+    try std.testing.expectError(error.InvalidModel, state.openWorkspaceChat(1, .{
+        .provider = .codex,
+        .model_ref = "composer-2",
+        .target_pane_id = 1,
+    }));
     try std.testing.expectEqual(thread_count_before_rejection, state.projects.items[1].threads.items.len);
     try std.testing.expectEqual(pane_count_before_rejection, state.projects.items[1].workspace_layout.panes.items.len);
 
-    try std.testing.expectError(error.TargetPaneNotFound, state.openWorkspaceChat(1, .codex, null, 999, .horizontal, true));
+    try std.testing.expectError(error.UnsupportedReasoningEffort, state.openWorkspaceChat(1, .{
+        .provider = .codex,
+        .reasoning_effort = .max,
+        .target_pane_id = 1,
+    }));
+    try std.testing.expectError(error.UnsupportedReasoningEffort, state.openWorkspaceChat(1, .{
+        .provider = .opencode,
+        .reasoning_effort = .medium,
+        .target_pane_id = 1,
+    }));
+    try std.testing.expectError(error.UnsupportedReasoningVariant, state.openWorkspaceChat(1, .{
+        .provider = .codex,
+        .reasoning_variant = "high",
+        .target_pane_id = 1,
+    }));
+    try std.testing.expectError(error.ConflictingReasoningSettings, state.openWorkspaceChat(1, .{
+        .provider = .codex,
+        .reasoning_effort = .high,
+        .reasoning_variant = "high",
+        .target_pane_id = 1,
+    }));
+    try std.testing.expectError(error.UnsupportedFastMode, state.openWorkspaceChat(1, .{
+        .provider = .opencode,
+        .fast_mode = .off,
+        .target_pane_id = 1,
+    }));
+    try std.testing.expectEqual(thread_count_before_rejection, state.projects.items[1].threads.items.len);
+    try std.testing.expectEqual(pane_count_before_rejection, state.projects.items[1].workspace_layout.panes.items.len);
+
+    try std.testing.expectError(error.TargetPaneNotFound, state.openWorkspaceChat(1, .{
+        .provider = .codex,
+        .target_pane_id = 999,
+    }));
     try std.testing.expectEqual(thread_count_before_rejection, state.projects.items[1].threads.items.len);
     try std.testing.expectEqual(pane_count_before_rejection, state.projects.items[1].workspace_layout.panes.items.len);
 }
@@ -22295,7 +22474,20 @@ test "provider-aware chat creation focuses requested pane" {
     };
     const previous_pane_count = project.workspace_layout.panes.items.len;
     for (cases) |case| {
-        const result = try AppState.createWorkspaceChatPane(&project, allocator, case.provider, case.model, null, .horizontal, true);
+        const result = try AppState.createWorkspaceChatPane(
+            &project,
+            allocator,
+            case.provider,
+            case.model,
+            .{
+                .reasoning_effort = if (case.provider == .codex) DEFAULT_CODEX_REASONING_EFFORT else null,
+                .reasoning_variant = null,
+                .fast_mode = .off,
+            },
+            null,
+            .horizontal,
+            true,
+        );
         try std.testing.expect(result.focused);
         try std.testing.expectEqual(@as(?WorkspacePaneId, result.pane_id), project.workspace_layout.focused_pane_id);
         try std.testing.expectEqual(result.thread_index, project.selected_thread_index);
@@ -22318,6 +22510,11 @@ test "focused chat creation transfers zoom to the new pane" {
         allocator,
         .codex,
         DEFAULT_CODEX_MODEL,
+        .{
+            .reasoning_effort = DEFAULT_CODEX_REASONING_EFFORT,
+            .reasoning_variant = null,
+            .fast_mode = .off,
+        },
         initial_pane_id,
         .vertical,
         true,
@@ -22331,6 +22528,11 @@ test "focused chat creation transfers zoom to the new pane" {
         allocator,
         .codex,
         DEFAULT_CODEX_MODEL,
+        .{
+            .reasoning_effort = DEFAULT_CODEX_REASONING_EFFORT,
+            .reasoning_variant = null,
+            .fast_mode = .off,
+        },
         zoomed_result.pane_id,
         .horizontal,
         true,
@@ -22411,7 +22613,12 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.maximized_pane_id);
     try std.testing.expect(!state.focusCurrentProjectWorkspacePaneAtSidebarIndex(3));
 
-    const result = try state.openWorkspaceChat(0, .codex, DEFAULT_CODEX_MODEL, chat_pane_id, .vertical, true);
+    const result = try state.openWorkspaceChat(0, .{
+        .provider = .codex,
+        .model_ref = DEFAULT_CODEX_MODEL,
+        .target_pane_id = chat_pane_id,
+        .axis = .vertical,
+    });
     try std.testing.expect(result.focused);
     try std.testing.expectEqual(@as(?WorkspacePaneId, result.pane_id), layout.focused_pane_id);
     try std.testing.expect(state.composer_focused);

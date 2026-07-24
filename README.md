@@ -427,9 +427,10 @@ explicit confirmed retry so the agent client can ask the user first.
 
 The MCP bridge also advertises `open_chat`. It requires `workspace_id` and one
 of the native GUI providers (`opencode`, `codex`, `claude`, or `cursor`), with
-optional `model`, `target_pane_id`, `axis`, and `focus` arguments. This is
-separate from terminal/TUI agent opening and never requires compositor or mouse
-automation.
+optional `model`, `reasoning_effort`, `reasoning_variant`, `fast_mode`,
+`target_pane_id`, `axis`, and `focus` arguments. Passing `fast_mode: false`
+explicitly guarantees Fast is disabled. This is separate from terminal/TUI
+agent opening and never requires compositor or mouse automation.
 
 Workspace command coordination is available through `list_processes`,
 `check_command`, `acquire_lease`, `release_lease`, and `wait_for_process`.
@@ -487,7 +488,7 @@ Chat commands resolve the target pane to its backing chat thread. They use the
 same draft, composer, send, stop, and approval paths as the UI.
 
 ```bash
-verde live chat open --workspace <id|index|path> --provider opencode|codex|claude|cursor [--model <id>] [--pane <pane-id>] [--axis horizontal|vertical] [--no-focus] [--json]
+verde live chat open --workspace <id|index|path> --provider opencode|codex|claude|cursor [--model <id>] [--reasoning low|medium|high|xhigh|max] [--reasoning-variant <id>] [--fast|--no-fast] [--pane <pane-id>] [--axis horizontal|vertical] [--no-focus] [--json]
 verde live chat status --pane <pane-id> [--json]
 verde live chat status --focused [--json]
 verde live chat transcript --pane <pane-id> [--json]
@@ -503,10 +504,12 @@ verde live chat approve --pane <pane-id> --decision deny [--json]
 
 - `open` atomically creates a fresh native GUI thread and chat pane in the
   explicitly supplied workspace. It validates the provider/model combination
-  before changing the workspace, defaults to the provider's current model and
-  the workspace's focused pane, and focuses the new workspace/pane unless
+  and any reasoning or Fast override before creating either object or changing
+  the workspace. It defaults to the provider's current model and the
+  workspace's focused pane, and focuses the new workspace/pane unless
   `--no-focus` is passed. The result includes stable `workspace_id`, `pane_id`,
-  `thread_id`, `provider`, and `model` fields.
+  `thread_id`, `provider`, and `model` fields plus the effective reasoning,
+  Fast, and service-tier settings.
 - `status` returns thread title, provider, model, message count, send state, and
   pending approval status.
 - `transcript` returns persisted messages for the pane's thread.
