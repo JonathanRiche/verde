@@ -1305,7 +1305,7 @@ fn appNeedsContinuousFrames(state: *AppState) bool {
 }
 
 fn eventWaitTimeoutMs(state: *AppState) c_int {
-    if (state.isPickerPending() or state.isBrowserVisible() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or workspace_panes_ui.isPaneStatusAnimating() or ui_layout.isSidebarAnimating() or state.runConfigStepperAnimating() or state.settingsModalAnimating()) {
+    if (state.isPickerPending() or state.isBrowserRuntimeActive() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or workspace_panes_ui.isPaneStatusAnimating() or ui_layout.isSidebarAnimating() or state.runConfigStepperAnimating() or state.settingsModalAnimating()) {
         return ACTIVE_WAIT_TIMEOUT_MS;
     }
     // Terminal output only reaches the screen when the loop wakes and polls
@@ -2597,5 +2597,6 @@ test {
     _ = @import("update_installer.zig");
     _ = @import("updater.zig");
     _ = @import("ui/command_palette.zig");
+    _ = @import("ui/diff_view_cache.zig");
     _ = @import("windows_conpty_compile_test.zig");
 }

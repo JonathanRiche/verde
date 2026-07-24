@@ -40,6 +40,7 @@ extern fn verde_browser_linux_test_active_completion_deadline_us(last_frame_us: 
 extern fn verde_browser_linux_test_active_completion_deadline_with_lead_us(last_frame_us: i64, now_us: i64, production_lead_us: i64) i64;
 extern fn verde_browser_linux_test_updated_production_lead_us(existing_lead_us: i64, dispatched_us: i64, published_us: i64) i64;
 extern fn verde_browser_linux_test_frame_interval_us(visible: c_int) i64;
+extern fn verde_browser_linux_test_disables_process_swapping() c_int;
 
 const Mutex = struct {
     inner: std.atomic.Mutex = .unlocked,
@@ -511,4 +512,8 @@ test "WPE frame pacing uses active cadence while visible and does not postpone o
     try std.testing.expectEqual(@as(i64, 130_000), verde_browser_linux_test_active_completion_deadline_us(100_000, 130_000));
     try std.testing.expectEqual(@as(i64, 2_000), verde_browser_linux_test_updated_production_lead_us(2_000, 100_000, 200_000));
     try std.testing.expectEqual(@as(i64, 2_250), verde_browser_linux_test_updated_production_lead_us(2_000, 100_000, 103_000));
+}
+
+test "WPE helper keeps its legacy exportable backend in one web process" {
+    try std.testing.expectEqual(@as(c_int, 1), verde_browser_linux_test_disables_process_swapping());
 }
