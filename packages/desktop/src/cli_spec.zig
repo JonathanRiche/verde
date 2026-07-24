@@ -243,6 +243,11 @@ pub const browser_commands = [_][]const u8{
     "back",
     "forward",
     "reload",
+    "restart",
+    "reset",
+    "pointer-down",
+    "pointer-move",
+    "pointer-up",
     "focus",
     "blur",
     "toolbar-hit",
@@ -331,6 +336,13 @@ pub const all_flags = [_][]const u8{
     "--json-payload",
     "--mode",
     "--command",
+    "--x",
+    "--y",
+    "--button",
+    "--ctrl",
+    "--shift",
+    "--alt",
+    "--super",
 };
 
 pub const json_flags = [_][]const u8{"--json"};
@@ -362,6 +374,7 @@ pub const chat_send_flags = [_][]const u8{ "--workspace", "--pane", "--focused",
 pub const chat_approve_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--call", "--decision", "--json" };
 pub const terminal_write_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--text", "--json" };
 pub const browser_eval_flags = [_][]const u8{ "--script", "--json" };
+pub const browser_pointer_flags = [_][]const u8{ "--x", "--y", "--button", "--ctrl", "--shift", "--alt", "--super", "--json" };
 pub const browser_open_flags = [_][]const u8{ "--url", "--workspace", "--project", "--json" };
 pub const browser_navigate_flags = [_][]const u8{ "--url", "--json" };
 pub const browser_post_json_flags = [_][]const u8{ "--json-payload", "--json" };

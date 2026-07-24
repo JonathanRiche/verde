@@ -1,5 +1,7 @@
 //! Browser-pane input events translated from SDL before they cross the backend boundary.
 
+const std = @import("std");
+
 /// Enumerates pointer buttons the browser pane cares about.
 pub const MouseButton = enum {
     left,
@@ -8,6 +10,15 @@ pub const MouseButton = enum {
     back,
     forward,
 };
+
+pub fn parseMouseButton(value: []const u8) ?MouseButton {
+    if (std.mem.eql(u8, value, "left")) return .left;
+    if (std.mem.eql(u8, value, "middle")) return .middle;
+    if (std.mem.eql(u8, value, "right")) return .right;
+    if (std.mem.eql(u8, value, "back")) return .back;
+    if (std.mem.eql(u8, value, "forward")) return .forward;
+    return null;
+}
 
 /// Carries normalized pointer input into the browser runtime.
 pub const MouseEvent = struct {
@@ -33,3 +44,13 @@ pub const KeyEvent = struct {
     shift: bool = false,
     super: bool = false,
 };
+
+test "automation mouse buttons parse explicitly" {
+    const testing = std.testing;
+    try testing.expectEqual(MouseButton.left, parseMouseButton("left").?);
+    try testing.expectEqual(MouseButton.middle, parseMouseButton("middle").?);
+    try testing.expectEqual(MouseButton.right, parseMouseButton("right").?);
+    try testing.expectEqual(MouseButton.back, parseMouseButton("back").?);
+    try testing.expectEqual(MouseButton.forward, parseMouseButton("forward").?);
+    try testing.expect(parseMouseButton("primary") == null);
+}

@@ -11,6 +11,7 @@ pub const KeyEvent = @import("input.zig").KeyEvent;
 pub const LinuxWaylandHost = @import("types.zig").LinuxWaylandHost;
 pub const MouseButton = @import("input.zig").MouseButton;
 pub const MouseEvent = @import("input.zig").MouseEvent;
+pub const parseMouseButton = @import("input.zig").parseMouseButton;
 pub const RuntimeKind = @import("types.zig").RuntimeKind;
 pub const RuntimeMode = @import("types.zig").RuntimeMode;
 pub const Session = @import("session.zig").Session;

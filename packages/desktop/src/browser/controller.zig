@@ -338,6 +338,18 @@ pub const Controller = struct {
         };
     }
 
+    /// Reports whether automation can inject stateful pointer events into the page.
+    pub fn supportsLowLevelPointer(self: *const Controller) bool {
+        _ = self;
+        return configuredBackendKind() == .native_webview and builtin.os.tag == .linux;
+    }
+
+    /// Reports whether the configured backend can evaluate JavaScript.
+    pub fn supportsEval(self: *const Controller) bool {
+        _ = self;
+        return configuredBackendKind() == .native_webview;
+    }
+
     /// Returns the active pane session identifier, if one has been created.
     pub fn paneSessionId(self: *const Controller) ?browser_types.SessionId {
         const backend = if (self.backend) |*backend| backend else return null;
