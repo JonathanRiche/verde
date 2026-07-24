@@ -98,6 +98,12 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "pane.split_terminal_down", .title = "Split Terminal Down", .keywords = "hsplit horizontal shell stacked", .section = .panes, .keybind = .workspace_split_terminal_horizontal, .run = runSplitTerminalDown, .enabled = hasProjects },
     .{ .id = "pane.terminal", .title = "Open Terminal Pane", .keywords = "shell console", .section = .panes, .keybind = .toggle_terminal, .run = runOpenTerminal, .enabled = hasProjects },
     .{ .id = "pane.browser", .title = "Toggle Browser Pane", .keywords = "web url", .section = .panes, .keybind = .toggle_browser, .run = runToggleBrowser, .enabled = hasProjects },
+    .{ .id = "browser.tab.new", .title = "Browser: New Tab", .keywords = "web page create", .section = .panes, .run = runNewBrowserTab, .enabled = hasBrowserPane },
+    .{ .id = "browser.tab.duplicate", .title = "Browser: Duplicate Active Tab", .keywords = "web page copy", .section = .panes, .run = runDuplicateBrowserTab, .enabled = hasBrowserTab },
+    .{ .id = "browser.tab.pin", .title = "Browser: Pin or Unpin Active Tab", .keywords = "web page keep", .section = .panes, .run = runToggleBrowserTabPinned, .enabled = hasBrowserTab },
+    .{ .id = "browser.tab.move_left", .title = "Browser: Move Active Tab Left", .keywords = "web page reorder", .section = .panes, .run = runMoveBrowserTabLeft, .enabled = canMoveBrowserTabLeft },
+    .{ .id = "browser.tab.move_right", .title = "Browser: Move Active Tab Right", .keywords = "web page reorder", .section = .panes, .run = runMoveBrowserTabRight, .enabled = canMoveBrowserTabRight },
+    .{ .id = "browser.tab.close", .title = "Browser: Close Active Tab", .keywords = "web page remove", .section = .panes, .run = runCloseBrowserTab, .enabled = hasBrowserTab },
     .{ .id = "pane.close", .title = "Close Pane", .section = .panes, .keybind = .workspace_close, .run = runClosePane, .enabled = hasProjects },
     .{ .id = "pane.zoom", .title = "Zoom Pane", .keywords = "maximize restore fullscreen", .section = .panes, .keybind = .workspace_toggle_maximize, .run = runZoomPane, .enabled = hasProjects },
     .{ .id = "pane.float", .title = "Float Focused Pane", .keywords = "quick scratch overlay", .section = .panes, .run = runFloatPane, .enabled = hasProjects },
@@ -1065,6 +1071,22 @@ fn hasClosedWorkspaces(state: *runtime.AppState) bool {
     return state.archived_projects.items.len > 0;
 }
 
+fn hasBrowserPane(state: *runtime.AppState) bool {
+    return state.currentProjectVisibleBrowserPaneId() != null;
+}
+
+fn hasBrowserTab(state: *runtime.AppState) bool {
+    return hasBrowserPane(state) and state.browserTabCount() > 0;
+}
+
+fn canMoveBrowserTabLeft(state: *runtime.AppState) bool {
+    return hasBrowserTab(state) and state.activeBrowserTabIndex() > 0;
+}
+
+fn canMoveBrowserTabRight(state: *runtime.AppState) bool {
+    return hasBrowserTab(state) and state.activeBrowserTabIndex() + 1 < state.browserTabCount();
+}
+
 fn currentWorkspaceHerdrLinked(state: *runtime.AppState) bool {
     return state.selected_project_index < state.projects.items.len and
         state.projects.items[state.selected_project_index].herdr_link != null;
@@ -1233,6 +1255,32 @@ fn runOpenTerminal(state: *runtime.AppState) void {
 
 fn runToggleBrowser(state: *runtime.AppState) void {
     state.toggleBrowser();
+}
+
+fn runNewBrowserTab(state: *runtime.AppState) void {
+    state.createBrowserTab();
+}
+
+fn runDuplicateBrowserTab(state: *runtime.AppState) void {
+    state.duplicateBrowserTab(state.activeBrowserTabIndex());
+}
+
+fn runToggleBrowserTabPinned(state: *runtime.AppState) void {
+    state.toggleBrowserTabPinned(state.activeBrowserTabIndex());
+}
+
+fn runMoveBrowserTabLeft(state: *runtime.AppState) void {
+    const active = state.activeBrowserTabIndex();
+    if (active > 0) state.moveBrowserTab(active, active - 1);
+}
+
+fn runMoveBrowserTabRight(state: *runtime.AppState) void {
+    const active = state.activeBrowserTabIndex();
+    if (active + 1 < state.browserTabCount()) state.moveBrowserTab(active, active + 1);
+}
+
+fn runCloseBrowserTab(state: *runtime.AppState) void {
+    state.closeBrowserTab(state.activeBrowserTabIndex());
 }
 
 fn runClosePane(state: *runtime.AppState) void {

@@ -21,6 +21,9 @@ const NF_COD_CLOSE = "\u{EA76}";
 const NF_COD_ADD = "\u{EA60}";
 const NF_COD_COPY = "\u{EBCC}";
 const NF_COD_ELLIPSIS = "\u{EA7C}";
+const NF_COD_LOADING = "\u{EB19}";
+const NF_COD_ERROR = "\u{EA87}";
+const NF_COD_PINNED = "\u{EB2B}";
 
 const TAB_ROW_HEIGHT: f32 = 36.0;
 const NAV_ROW_HEIGHT: f32 = 44.0;
@@ -83,6 +86,10 @@ const BrowserTabHit = struct {
 };
 var palette_tab_hits: [64]BrowserTabHit = undefined;
 var palette_tab_hit_count: usize = 0;
+var tab_drag_source: ?usize = null;
+var tab_drag_target: ?usize = null;
+var tab_drag_start_x: f32 = 0.0;
+var tab_drag_active = false;
 
 const CLOSE_PANE_MENU_INDEX = std.math.maxInt(u32);
 
@@ -145,6 +152,17 @@ pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) void
     if (state.browser_address_drag_active and state.browser_address_focused) {
         if (findHit(.address)) |hit| {
             state.browser_address_cursor = cursorForAddressPoint(state, hit.rect, x);
+        }
+    }
+    if (tab_drag_source != null) {
+        if (@abs(x - tab_drag_start_x) >= theme.scaledUi(5.0)) tab_drag_active = true;
+        if (tab_drag_active) {
+            for (palette_tab_hits[0..palette_tab_hit_count]) |hit| {
+                if (hit.kind == .select and rectContainsPoint(hit.rect, x, y)) {
+                    tab_drag_target = hit.index;
+                    break;
+                }
+            }
         }
     }
 }
@@ -265,8 +283,17 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
     }
 
     if (!down) {
+        const dragged = tab_drag_source != null;
+        if (tab_drag_active) {
+            if (tab_drag_source) |from| {
+                if (tab_drag_target) |to| state.moveBrowserTab(from, to);
+            }
+        }
+        tab_drag_source = null;
+        tab_drag_target = null;
+        tab_drag_active = false;
         state.browser_address_drag_active = false;
-        return rectContainsPoint(palette_toolbar_rect, x, y) or
+        return dragged or rectContainsPoint(palette_toolbar_rect, x, y) or
             (state.browser_inspector_menu_open and rectContainsPoint(palette_menu_rect, x, y));
     }
 
@@ -361,7 +388,13 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
         if (!rectContainsPoint(hit.rect, x, y)) continue;
         blurAddress(state);
         switch (hit.kind) {
-            .select => state.switchBrowserTab(hit.index),
+            .select => {
+                tab_drag_source = hit.index;
+                tab_drag_target = hit.index;
+                tab_drag_start_x = x;
+                tab_drag_active = false;
+                state.switchBrowserTab(hit.index);
+            },
             .close => state.closeBrowserTab(hit.index),
         }
         state.noteInteraction();
@@ -749,6 +782,27 @@ fn renderCompactIconButton(
     queuePaletteIcon(state, iconRectForButton(rect, icon_size), glyph, icon_size, paletteColor(color));
 }
 
+fn renderTabIndicator(state: *app_state.AppState, tab_index: usize, tab_rect: palette.Rect) f32 {
+    const indicator = state.browserTabIndicator(tab_index);
+    const pinned = state.browserTabPinned(tab_index);
+    if (indicator == .none and !pinned) return 0.0;
+
+    const rect: palette.Rect = .{
+        .x = tab_rect.x + theme.scaledUi(6.0),
+        .y = tab_rect.y + (tab_rect.h - theme.scaledUi(14.0)) * 0.5,
+        .w = theme.scaledUi(14.0),
+        .h = theme.scaledUi(14.0),
+    };
+    const glyph = switch (indicator) {
+        .loading => NF_COD_LOADING,
+        .failed => NF_COD_ERROR,
+        .none => NF_COD_PINNED,
+    };
+    const color = if (indicator == .failed) theme.danger() else if (indicator == .loading) theme.accent() else theme.COLOR_TEXT_MUTED;
+    queuePaletteIcon(state, rect, glyph, rect.w, paletteColor(color));
+    return rect.w + theme.scaledUi(4.0);
+}
+
 // Inspector segments retain an accent treatment while the tool is armed.
 fn renderInspectorIconButton(
     state: *app_state.AppState,
@@ -863,10 +917,11 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
             .w = tab_close_size,
             .h = tab_close_size,
         };
+        const leading = renderTabIndicator(state, 0, tab_rect);
         queuePaletteText(state, .{
-            .x = tab_rect.x + theme.scaledUi(6.0),
+            .x = tab_rect.x + theme.scaledUi(6.0) + leading,
             .y = row_y + theme.scaledUi(6.0),
-            .w = @max(tab_close_rect.x - tab_rect.x - theme.scaledUi(10.0), 1.0),
+            .w = @max(tab_close_rect.x - tab_rect.x - theme.scaledUi(10.0) - leading, 1.0),
             .h = theme.scaledUi(18.0),
         }, state.browserTabTitle(0), paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), tab_rect);
         renderCompactIconButton(state, tab_close_rect, NF_COD_CLOSE, rectHovered(tab_close_rect), false);
@@ -901,10 +956,11 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
                 .w = tab_close_size,
                 .h = tab_close_size,
             };
+            const leading = renderTabIndicator(state, tab_index, tab_rect);
             queuePaletteText(state, .{
-                .x = tab_rect.x + theme.scaledUi(8.0),
+                .x = tab_rect.x + theme.scaledUi(8.0) + leading,
                 .y = tab_rect.y + theme.scaledUi(6.0),
-                .w = @max(tab_close_rect.x - tab_rect.x - theme.scaledUi(12.0), 1.0),
+                .w = @max(tab_close_rect.x - tab_rect.x - theme.scaledUi(12.0) - leading, 1.0),
                 .h = theme.scaledUi(18.0),
             }, state.browserTabTitle(tab_index), paletteColor(if (tab_index == state.activeBrowserTabIndex()) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), tab_rect);
             renderCompactIconButton(state, tab_close_rect, NF_COD_CLOSE, rectHovered(tab_close_rect), false);
@@ -912,6 +968,9 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
             palette_tab_hit_count += 1;
             palette_tab_hits[palette_tab_hit_count] = .{ .rect = tab_close_rect, .index = tab_index, .kind = .close };
             palette_tab_hit_count += 1;
+            if (tab_drag_active and tab_drag_target == tab_index) {
+                queuePaletteBorder(state, tab_rect, paletteColor(theme.accent()), theme.scaledUi(6.0), theme.scaledUi(2.0));
+            }
             tab_x += tab_width + gap;
         }
         if (visible_count < tab_count or tab_x > tabs_right) {
