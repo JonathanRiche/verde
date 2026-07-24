@@ -474,11 +474,10 @@ fn finishWorkspaceDrag(state: *runtime.AppState, x: f32, y: f32) bool {
         if (drag.project_index < state.projects.items.len) {
             state.noteInteraction();
             const was_selected = state.selected_project_index == drag.project_index;
-            state.selected_project_index = drag.project_index;
+            _ = state.selectProjectAtIndex(drag.project_index);
             if (drag.toggle_project_on_click and was_selected) {
                 state.projects.items[drag.project_index].collapsed = !state.projects.items[drag.project_index].collapsed;
             }
-            state.syncRenameBuffer();
             state.requestTranscriptScrollToBottom();
             state.markDirty();
         }

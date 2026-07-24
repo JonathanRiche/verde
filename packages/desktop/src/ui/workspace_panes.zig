@@ -276,9 +276,6 @@ fn focusPaneInDirectionFromRects(
     const target = best_id orelse return false;
     if (clear_maximized) _ = state.clearCurrentProjectWorkspacePaneMaximized();
     _ = state.focusCurrentProjectWorkspacePane(target);
-    if (state.workspaceChatThreadIndexByPane(target) != null) {
-        _ = state.focusPromptForFocusedChatWorkspacePane();
-    }
     state.markDirty();
     return true;
 }
@@ -431,9 +428,6 @@ pub fn movePaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
     const target = findNeighborId(current_id, cur, dir) orelse return false;
     if (!state.swapCurrentProjectWorkspacePanes(current_id, target)) return false;
     _ = state.focusCurrentProjectWorkspacePane(target);
-    if (state.workspaceChatThreadIndexByPane(target) != null) {
-        _ = state.focusPromptForFocusedChatWorkspacePane();
-    }
     state.markDirty();
     return true;
 }
@@ -870,9 +864,6 @@ fn finishPaneDrag(state: *runtime.AppState, x: f32, y: f32) bool {
         _ = state.moveCurrentProjectWorkspacePaneToPlacement(drag.pane_id, target.pane_id, target.axis, target.new_after);
     } else if (state.swapCurrentProjectWorkspacePanes(drag.pane_id, target.pane_id)) {
         _ = state.focusCurrentProjectWorkspacePane(target.pane_id);
-        if (state.workspaceChatThreadIndexByPane(target.pane_id) != null) {
-            _ = state.focusPromptForFocusedChatWorkspacePane();
-        }
         state.markDirty();
     }
     return true;

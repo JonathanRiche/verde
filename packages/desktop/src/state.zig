@@ -4739,7 +4739,6 @@ pub const AppState = struct {
     sidebar_hidden: bool,
     sidebar_hover_revealed: bool,
     composer_focused: bool,
-    composer_focus_requested: bool,
     composer_input_nonce: u32,
     composer_input_bounds_valid: bool,
     composer_input_min: [2]f32,
@@ -5072,7 +5071,6 @@ pub const AppState = struct {
             .sidebar_hidden = false,
             .sidebar_hover_revealed = false,
             .composer_focused = false,
-            .composer_focus_requested = false,
             .composer_input_nonce = 0,
             .composer_input_bounds_valid = false,
             .composer_input_min = .{ 0.0, 0.0 },
@@ -7275,6 +7273,8 @@ pub const AppState = struct {
         self.selected_project_index = index;
         self.ensureCurrentProjectWorkspace();
         self.restorePersistedBrowserPaneAfterProjectSelection(index);
+        const focused_pane_id = self.projects.items[index].workspace_layout.focused_pane_id;
+        if (focused_pane_id) |pane_id| _ = self.focusWorkspacePane(index, pane_id);
         self.workspace_header_open_menu_open = false;
         self.workspace_header_open_menu_pane_id = null;
         self.sidebar_context_menu_open = false;
@@ -10828,22 +10828,15 @@ pub const AppState = struct {
         layout.maximized_pane_id = if (preserve_zoom and was_maximized) pane_id else null;
         self.restorePersistedBrowserPaneAfterProjectSelection(project_index);
         switch (pane.ref) {
-            .chat => |ref| {
-                self.terminal_focused = false;
-                project.selected_thread_index = ref.thread_index;
-                _ = self.clearChatCompletion(project_index, ref.thread_index);
-                self.requestComposerFocus();
-            },
-            .terminal => |ref| self.requestTerminalDockFocus(ref.dock_id),
+            .chat, .terminal => {},
             .browser => {
-                self.terminal_focused = false;
-                self.composer_focused = false;
                 self.browser_state.setControlsVisible(true);
                 self.browser_state.controller.show() catch |err| {
                     log.warn("failed to show browser pane from sidebar: {s}", .{@errorName(err)});
                 };
             },
         }
+        _ = self.focusWorkspacePane(project_index, pane_id);
         self.markDirty();
     }
 
@@ -12767,12 +12760,12 @@ pub const AppState = struct {
             null;
 
         self.browser_state.setControlsVisible(true);
+        if (browser_pane_id) |pane_id| _ = self.focusCurrentProjectWorkspacePane(pane_id);
         self.browser_address_focused = true;
         self.browser_address_cursor = self.browser_state.addressInput().len;
         self.unfocusBrowserPane();
         self.terminal_focused = false;
         self.composer_focused = false;
-        if (browser_pane_id) |pane_id| _ = self.focusCurrentProjectWorkspacePane(pane_id);
         self.browser_state.status = .opening;
         if (restore_url) |url| {
             if (!isBlankBrowserUrl(url)) {
@@ -16530,10 +16523,8 @@ pub const AppState = struct {
                 }
                 project.last_content_pane_id = pane_id;
                 if (self.selected_project_index == project_index) {
-                    self.terminal_focused = false;
-                    self.unfocusBrowserPane();
-                    self.browser_address_focused = false;
                     self.syncPaletteComposerFromDraft();
+                    self.requestComposerFocus();
                 }
             },
             .terminal => |ref| {
@@ -16541,11 +16532,7 @@ pub const AppState = struct {
                 if (self.selected_project_index == project_index) self.requestTerminalDockFocus(ref.dock_id);
             },
             .browser => {
-                if (self.selected_project_index == project_index) {
-                    self.terminal_focused = false;
-                    self.composer_focused = false;
-                    self.palette_composer.focused = false;
-                }
+                if (self.selected_project_index == project_index) self.focusBrowserPane();
             },
         }
         self.markDirty();
@@ -16657,23 +16644,7 @@ pub const AppState = struct {
         });
         layout.maximized_pane_id = if (layout.maximized_pane_id == pane_id) null else pane_id;
         layout.focused_pane_id = pane_id;
-        switch (pane.ref) {
-            .chat => |ref| {
-                var project = &self.projects.items[project_index];
-                if (ref.thread_index < project.threads.items.len) {
-                    project.selected_thread_index = ref.thread_index;
-                    _ = self.clearChatCompletion(project_index, ref.thread_index);
-                }
-                if (self.selected_project_index == project_index) self.terminal_focused = false;
-            },
-            .terminal => |ref| if (self.selected_project_index == project_index) self.requestTerminalDockFocus(ref.dock_id),
-            .browser => {
-                if (self.selected_project_index == project_index) {
-                    self.terminal_focused = false;
-                    self.composer_focused = false;
-                }
-            },
-        }
+        _ = self.focusWorkspacePane(project_index, pane_id);
         self.markDirty();
         runtime_log.diagnostic("pane maximize toggle done project={d} pane={d} maximized={any}", .{
             project_index,
@@ -16761,6 +16732,11 @@ pub const AppState = struct {
                 layout.replaceRootWithLeaf(self.allocator, next_id) catch {
                     layout.focused_pane_id = next_id;
                 };
+            }
+        }
+        if (self.selected_project_index == project_index) {
+            if (layout.focused_pane_id) |focused_pane_id| {
+                _ = self.focusWorkspacePane(project_index, focused_pane_id);
             }
         }
         self.markDirty();
@@ -17388,9 +17364,11 @@ pub const AppState = struct {
 
     pub fn requestComposerFocus(self: *AppState) void {
         _ = self.acknowledgeFocusedChatCompletion();
-        self.composer_focus_requested = true;
+        self.palette_composer.focused = true;
+        self.composer_focused = true;
         self.terminal_focused = false;
         self.unfocusBrowserPane();
+        self.browser_address_focused = false;
     }
 
     pub fn acknowledgeFocusedChatCompletion(self: *AppState) bool {
@@ -17454,12 +17432,6 @@ pub const AppState = struct {
         if (self.focusedWorkspaceTerminalDockId()) |dock_id| {
             _ = self.clearSurfaceAttentionForDock(self.selected_project_index, dock_id);
         }
-    }
-
-    pub fn consumeComposerFocusRequest(self: *AppState) bool {
-        const requested = self.composer_focus_requested;
-        self.composer_focus_requested = false;
-        return requested;
     }
 
     pub fn draftBuffer(self: *AppState) [:0]u8 {
@@ -22305,15 +22277,22 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     state.browser_address_focused = true;
     state.terminal_focused = false;
     state.composer_focused = true;
+    state.palette_composer = PaletteComposerPrompt.init();
     state.palette_composer.focused = true;
+    state.palette_model_picker = PaletteModelPicker.init(0);
+    state.composer_popover_restore_focus = false;
+    state.run_config_open = false;
     state.palette_modal_text_focus = .none;
     state.dirty = false;
     state.last_dirty_at_ms = 0;
     state.last_interaction_at_ms = 0;
+    @memset(&state.rename_storage, 0);
+    @memset(&state.sidebar_notice_storage, 0);
     defer {
         for (state.projects.items) |*project| project.deinit(allocator);
         state.projects.deinit(allocator);
         state.surfaces.deinit(allocator);
+        state.palette_composer.deinit(allocator);
         state.browser_state.deinit();
     }
 
@@ -22341,9 +22320,15 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(1));
     try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(state.composer_focused);
+    try std.testing.expect(state.palette_composer.focused);
+    try std.testing.expect(!state.terminal_focused);
     try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(-1));
     try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(state.terminal_focused);
+    try std.testing.expect(!state.composer_focused);
+    try std.testing.expect(!state.palette_composer.focused);
     try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(-1));
     try std.testing.expectEqual(@as(?WorkspacePaneId, first_terminal_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, first_terminal_pane_id), layout.maximized_pane_id);
@@ -22351,6 +22336,20 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.maximized_pane_id);
     try std.testing.expect(!state.focusCurrentProjectWorkspacePaneAtSidebarIndex(3));
+
+    const result = try state.openWorkspaceChat(0, .codex, DEFAULT_CODEX_MODEL, chat_pane_id, .vertical, true);
+    try std.testing.expect(result.focused);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, result.pane_id), layout.focused_pane_id);
+    try std.testing.expect(state.composer_focused);
+    try std.testing.expect(state.palette_composer.focused);
+    try std.testing.expect(!state.terminal_focused);
+
+    try std.testing.expect(state.focusCurrentProjectWorkspacePane(clicked_terminal_pane_id));
+    try std.testing.expect(state.closeCurrentProjectWorkspacePane(clicked_terminal_pane_id));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.focused_pane_id);
+    try std.testing.expect(state.composer_focused);
+    try std.testing.expect(state.palette_composer.focused);
+    try std.testing.expect(!state.terminal_focused);
 }
 
 test "sidebar pane selection restores a sibling browser URL snapshot" {
@@ -22366,7 +22365,11 @@ test "sidebar pane selection restores a sibling browser URL snapshot" {
     state.browser_address_focused = false;
     state.terminal_focused = false;
     state.composer_focused = true;
+    state.palette_composer = PaletteComposerPrompt.init();
     state.palette_composer.focused = true;
+    state.palette_model_picker = PaletteModelPicker.init(0);
+    state.composer_popover_restore_focus = false;
+    state.run_config_open = false;
     state.palette_modal_text_focus = .none;
     state.dirty = false;
     state.last_dirty_at_ms = 0;
@@ -22375,6 +22378,7 @@ test "sidebar pane selection restores a sibling browser URL snapshot" {
         for (state.projects.items) |*project| project.deinit(allocator);
         state.projects.deinit(allocator);
         state.surfaces.deinit(allocator);
+        state.palette_composer.deinit(allocator);
         state.browser_state.deinit();
     }
 
@@ -22394,6 +22398,73 @@ test "sidebar pane selection restores a sibling browser URL snapshot" {
 
     try std.testing.expectEqualStrings("https://example.com/restored", state.browser_state.current_url.?);
     try std.testing.expectEqualStrings("https://example.com/restored", state.browser_state.addressInput());
+
+    state.focusWorkspaceOpenPaneFromSidebar(0, browser_pane_id);
+
+    try std.testing.expect(state.browser_pane_focused);
+    try std.testing.expect(!state.browser_address_focused);
+    try std.testing.expect(!state.terminal_focused);
+    try std.testing.expect(!state.composer_focused);
+    try std.testing.expect(!state.palette_composer.focused);
+}
+
+test "workspace selection restores focused pane keyboard ownership" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.projects = .empty;
+    state.surfaces = .empty;
+    state.selected_project_index = 0;
+    state.browser_state = try browser_runtime.State.init(allocator);
+    state.browser_pane_focused = false;
+    state.browser_address_focused = false;
+    state.terminal_focused = false;
+    state.composer_focused = false;
+    state.palette_composer = PaletteComposerPrompt.init();
+    state.palette_model_picker = PaletteModelPicker.init(0);
+    state.composer_popover_restore_focus = false;
+    state.run_config_open = false;
+    state.palette_modal_text_focus = .none;
+    state.workspace_header_open_menu_open = false;
+    state.workspace_header_open_menu_pane_id = null;
+    state.sidebar_context_menu_open = false;
+    state.dirty = false;
+    state.last_dirty_at_ms = 0;
+    state.last_interaction_at_ms = 0;
+    @memset(&state.rename_storage, 0);
+    defer {
+        for (state.projects.items) |*project| project.deinit(allocator);
+        state.projects.deinit(allocator);
+        state.surfaces.deinit(allocator);
+        state.palette_composer.deinit(allocator);
+        state.browser_state.deinit();
+    }
+
+    var chat_project = try Project.init(allocator, "chat", "Chat", "/tmp/chat", 0);
+    state.projects.append(allocator, chat_project) catch |err| {
+        chat_project.deinit(allocator);
+        return err;
+    };
+    var terminal_project = try Project.init(allocator, "terminal", "Terminal", "/tmp/terminal", 0);
+    const terminal_pane_id = try terminal_project.workspace_layout.createTerminalPane(allocator, 9);
+    try terminal_project.workspace_layout.ensurePaneInRootSplit(allocator, terminal_pane_id, .vertical, 0.5);
+    terminal_project.workspace_layout.focused_pane_id = terminal_pane_id;
+    state.projects.append(allocator, terminal_project) catch |err| {
+        terminal_project.deinit(allocator);
+        return err;
+    };
+
+    try std.testing.expect(state.selectProjectAtIndex(1));
+    try std.testing.expectEqual(@as(usize, 1), state.selected_project_index);
+    try std.testing.expect(state.terminal_focused);
+    try std.testing.expect(!state.composer_focused);
+    try std.testing.expect(!state.palette_composer.focused);
+
+    try std.testing.expect(state.selectProjectAtIndex(0));
+    try std.testing.expectEqual(@as(usize, 0), state.selected_project_index);
+    try std.testing.expect(!state.terminal_focused);
+    try std.testing.expect(state.composer_focused);
+    try std.testing.expect(state.palette_composer.focused);
 }
 
 test "visible chat is not treated as focused when a sibling pane owns focus" {
