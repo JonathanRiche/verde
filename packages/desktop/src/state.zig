@@ -12907,6 +12907,41 @@ pub const AppState = struct {
         self.setSidebarNotice("Browser navigation requested.");
     }
 
+    /// Recreates only the embedded browser backend, optionally restoring its URL.
+    pub fn recoverBrowser(self: *AppState, restore_url: bool) !void {
+        const current_url = if (restore_url)
+            if (self.browser_state.current_url) |url| try self.allocator.dupe(u8, url) else null
+        else
+            null;
+        defer if (current_url) |url| self.allocator.free(url);
+
+        self.unfocusBrowserPane();
+        self.clearBrowserContextMenuLocal();
+        self.browser_state.clearSuppressedEvalResults();
+        try self.browser_state.setLastEvalResult(null);
+        try self.browser_state.setLastError(null);
+        self.browser_state.controller.shutdown();
+        self.browser_state.status = .opening;
+
+        if (current_url) |url| {
+            try self.browser_state.controller.navigate(url);
+        } else {
+            try self.browser_state.controller.navigate("about:blank");
+            try self.browser_state.setCurrentUrl("about:blank");
+            self.browser_state.setAddress("about:blank");
+            self.recordVisibleBrowserPaneNavigation("about:blank");
+        }
+        self.browser_state.setControlsVisible(true);
+        self.setSidebarNotice(if (restore_url) "Browser restarted." else "Browser reset.");
+        self.markDirty();
+    }
+
+    /// Injects a pane-local automation pointer event when the backend supports it.
+    pub fn injectBrowserPointer(self: *AppState, event: browser_runtime.MouseEvent) !void {
+        if (!self.browser_state.controller.supportsLowLevelPointer()) return error.UnsupportedBrowserCapability;
+        if (!try self.browser_state.controller.handleMouse(event)) return error.UnsupportedBrowserCapability;
+    }
+
     /// Returns the workspace currently hosting the singleton browser pane, if any.
     pub fn browserWorkspaceLocation(self: *const AppState) ?BrowserWorkspaceLocation {
         for (self.projects.items, 0..) |project, index| {

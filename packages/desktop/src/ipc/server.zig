@@ -282,6 +282,25 @@ fn writeBrowserStatus(s: *std.json.Stringify, state: *app_state.AppState) !void 
     try s.write(@tagName(browser.controller.presentationKind()));
     try s.objectField("runtime_initialized");
     try s.write(browser.controller.runtimeInitialized());
+    try s.objectField("capabilities");
+    try s.beginObject();
+    try s.objectField("restart");
+    try s.write(true);
+    try s.objectField("reset");
+    try s.write(true);
+    try s.objectField("low_level_pointer");
+    try s.write(browser.controller.supportsLowLevelPointer());
+    try s.objectField("javascript_eval");
+    try s.write(browser.controller.supportsEval());
+    try s.objectField("explicit_waits");
+    try s.write(false);
+    try s.objectField("diagnostics");
+    try s.write(false);
+    try s.objectField("viewport_emulation");
+    try s.write(false);
+    try s.objectField("cache_control");
+    try s.write(false);
+    try s.endObject();
     try s.objectField("status");
     try s.write(browser.statusLabel());
     try s.objectField("visible");
@@ -372,7 +391,8 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
             "chat.stop",                          "chat.approve",                        "browser.open",                        "browser.navigate",
             "browser.status",                     "browser.close",                       "browser.toggle",                      "browser.back",
             "browser.forward",                    "browser.reload",                      "browser.focus",                       "browser.blur",
-            "browser.toolbarHit",                 "browser.selectAllFocused",            "browser.copyFocused",                 "browser.cutFocused",
+            "browser.restart",                    "browser.reset",                       "browser.pointerDown",                 "browser.pointerMove",
+            "browser.pointerUp",                  "browser.toolbarHit",                  "browser.selectAllFocused",            "browser.copyFocused",
             "browser.pasteTextFocused",           "browser.eval",                        "browser.postJson",                    "browser.screenshot",
             "browser.inspector.enable",           "browser.inspector.disable",           "browser.inspector.toggle",            "browser.inspector.mode",
             "browser.inspector.menuOpen",         "browser.inspector.menuClose",         "browser.overlay.workspaceMenuOpen",   "browser.overlay.workspaceMenuClose",
@@ -1011,6 +1031,19 @@ fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
         return try errorResponseAlloc(allocator, id_value, "rejected", "browser pane is not visible");
     }
 
+    if (std.mem.eql(u8, command, "restart") or std.mem.eql(u8, command, "reset")) {
+        const restore_url = std.mem.eql(u8, command, "restart");
+        state.recoverBrowser(restore_url) catch |err| {
+            return try errorResponseAlloc(allocator, id_value, "browser_recovery_failed", @errorName(err));
+        };
+        return try okValueResponse(allocator, id_value, .{
+            .accepted = true,
+            .recovery = if (restore_url) "restarted" else "reset",
+            .url = state.browserStateConst().current_url,
+            .load_state = state.browserStateConst().statusLabel(),
+        });
+    }
+
     if (std.mem.eql(u8, command, "navigate")) {
         const url = stringParam(params, "url") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.navigate requires url");
         state.navigateBrowserToUrl(url) catch |err| switch (err) {
@@ -1179,12 +1212,43 @@ fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
     }
 
     if (std.mem.eql(u8, command, "eval")) {
+        if (!state.browserStateConst().controller.supportsEval()) {
+            return try errorResponseAlloc(allocator, id_value, "unsupported", "browser backend does not support JavaScript evaluation");
+        }
         const script = stringParam(params, "script") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.eval requires script");
         if (script.len == 0) return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.eval requires script");
         state.browserState().controller.eval(script) catch |err| {
             return try errorResponseAlloc(allocator, id_value, "browser_eval_failed", @errorName(err));
         };
         return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "pointerDown") or
+        std.mem.eql(u8, command, "pointerMove") or
+        std.mem.eql(u8, command, "pointerUp"))
+    {
+        if (!state.browserStateConst().controller.supportsLowLevelPointer()) {
+            return try errorResponseAlloc(allocator, id_value, "unsupported", "browser backend does not support low-level pointer injection");
+        }
+        const x = floatParam(params, "x") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser pointer input requires x");
+        const y = floatParam(params, "y") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser pointer input requires y");
+        const button = browser_runtime.parseMouseButton(stringParam(params, "button") orelse "left") orelse
+            return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid browser pointer button");
+        const is_move = std.mem.eql(u8, command, "pointerMove");
+        state.injectBrowserPointer(.{
+            .x = x,
+            .y = y,
+            .button = if (is_move) null else button,
+            .pressed = std.mem.eql(u8, command, "pointerDown"),
+            .ctrl = boolParam(params, "ctrl") orelse false,
+            .shift = boolParam(params, "shift") orelse false,
+            .alt = boolParam(params, "alt") orelse false,
+            .super = boolParam(params, "super") orelse false,
+        }) catch |err| switch (err) {
+            error.UnsupportedBrowserCapability => return try errorResponseAlloc(allocator, id_value, "unsupported", "browser backend does not support low-level pointer injection"),
+            else => return try errorResponseAlloc(allocator, id_value, "browser_input_failed", @errorName(err)),
+        };
+        return try okValueResponse(allocator, id_value, .{ .accepted = true, .x = x, .y = y });
     }
 
     if (std.mem.eql(u8, command, "screenshot")) {
