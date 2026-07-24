@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const palette = @import("palette");
+const zig_dif = @import("zig_dif");
 
 const app_state = @import("../state.zig");
 const ai_harness = @import("../harness.zig");
@@ -82,6 +83,23 @@ const MAX_USAGE_ACTION_HITS = 16;
 var usage_action_hit_count: usize = 0;
 var usage_action_hits: [MAX_USAGE_ACTION_HITS]UsageActionHit = [_]UsageActionHit{.{}} ** MAX_USAGE_ACTION_HITS;
 
+const DiffFileOpenHit = struct {
+    rect: palette.Rect = .{},
+    path: []const u8 = "",
+};
+const MAX_DIFF_FILE_OPEN_HITS = 64;
+var diff_file_open_hit_count: usize = 0;
+var diff_file_open_hits: [MAX_DIFF_FILE_OPEN_HITS]DiffFileOpenHit = [_]DiffFileOpenHit{.{}} ** MAX_DIFF_FILE_OPEN_HITS;
+
+const DiffLayoutHit = struct {
+    rect: palette.Rect = .{},
+    key: u64 = 0,
+    split: bool = false,
+};
+const MAX_DIFF_LAYOUT_HITS = 32;
+var diff_layout_hit_count: usize = 0;
+var diff_layout_hits: [MAX_DIFF_LAYOUT_HITS]DiffLayoutHit = [_]DiffLayoutHit{.{}} ** MAX_DIFF_LAYOUT_HITS;
+
 /// Geometry of the transcript scrollbar from the last paint. Captured during
 /// render so the mouse handlers can do hit-testing without rebuilding the
 /// layout themselves. `track` is empty when the column is short enough that
@@ -158,6 +176,8 @@ pub fn renderWorkspace(state: *app_state.AppState, width: f32, height: f32) void
 pub fn resetTranscriptHitCache() void {
     transcript_hit_count = 0;
     usage_action_hit_count = 0;
+    diff_file_open_hit_count = 0;
+    diff_layout_hit_count = 0;
 }
 
 pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
@@ -547,11 +567,76 @@ pub fn pointerOverTranscript(x: f32, y: f32) bool {
 }
 
 pub fn transcriptActionWantsPointerAt(x: f32, y: f32) bool {
+    return transcriptActionAt(x, y) != null;
+}
+
+const TranscriptAction = union(enum) {
+    usage,
+    diff_file_open: []const u8,
+    diff_layout: struct {
+        key: u64,
+        split: bool,
+    },
+};
+
+fn transcriptActionAt(x: f32, y: f32) ?TranscriptAction {
     var index: usize = 0;
     while (index < usage_action_hit_count) : (index += 1) {
-        if (rectContains(usage_action_hits[index].rect, x, y)) return true;
+        if (rectContains(usage_action_hits[index].rect, x, y)) return .usage;
     }
-    return false;
+    index = 0;
+    while (index < diff_file_open_hit_count) : (index += 1) {
+        const hit = diff_file_open_hits[index];
+        if (rectContains(hit.rect, x, y)) return .{ .diff_file_open = hit.path };
+    }
+    index = 0;
+    while (index < diff_layout_hit_count) : (index += 1) {
+        const hit = diff_layout_hits[index];
+        if (rectContains(hit.rect, x, y)) return .{ .diff_layout = .{
+            .key = hit.key,
+            .split = hit.split,
+        } };
+    }
+    return null;
+}
+
+test "transcript action hit testing preserves usage and diff open actions" {
+    resetTranscriptHitCache();
+    defer resetTranscriptHitCache();
+    usage_action_hits[0] = .{ .rect = .{ .x = 10.0, .y = 20.0, .w = 30.0, .h = 40.0 } };
+    usage_action_hit_count = 1;
+    diff_file_open_hits[0] = .{
+        .rect = .{ .x = 100.0, .y = 120.0, .w = 30.0, .h = 20.0 },
+        .path = "src/main.zig",
+    };
+    diff_file_open_hit_count = 1;
+
+    const usage = transcriptActionAt(20.0, 30.0) orelse return error.TestExpectedEqual;
+    switch (usage) {
+        .usage => {},
+        else => return error.TestExpectedEqual,
+    }
+
+    const open = transcriptActionAt(110.0, 130.0) orelse return error.TestExpectedEqual;
+    switch (open) {
+        .diff_file_open => |path| try std.testing.expectEqualStrings("src/main.zig", path),
+        else => return error.TestExpectedEqual,
+    }
+
+    diff_layout_hits[0] = .{
+        .rect = .{ .x = 200.0, .y = 220.0, .w = 60.0, .h = 28.0 },
+        .key = 42,
+        .split = true,
+    };
+    diff_layout_hit_count = 1;
+    const layout = transcriptActionAt(230.0, 234.0) orelse return error.TestExpectedEqual;
+    switch (layout) {
+        .diff_layout => |value| {
+            try std.testing.expectEqual(@as(u64, 42), value.key);
+            try std.testing.expect(value.split);
+        },
+        else => return error.TestExpectedEqual,
+    }
 }
 
 /// True when the mouse rests on either pending-approval action.
@@ -977,10 +1062,16 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
         }
     }
 
-    if (clicks <= 1 and transcriptActionWantsPointerAt(x, y)) {
-        return state.showCurrentProviderUsage();
+    if (clicks <= 1) {
+        if (transcriptActionAt(x, y)) |action| {
+            switch (action) {
+                .usage => _ = state.showCurrentProviderUsage(),
+                .diff_file_open => |path| state.openTranscriptFileReference(path),
+                .diff_layout => |layout| state.setCardExpanded(layout.key, layout.split),
+            }
+            return true;
+        }
     }
-
     if (clicks <= 1 and state.consumeCodeCopyButtonClick(x, y)) {
         return true;
     }
@@ -3040,14 +3131,17 @@ const DiffFileEntry = struct {
 /// (author "Changed files", body framed with PERSISTED_DIFF_MARKER).
 fn isDiffSummaryMessage(author: []const u8, body_raw: []const u8) bool {
     if (!std.mem.eql(u8, author, "Changed files")) return false;
-    return std.mem.startsWith(u8, body_raw, utils.PERSISTED_DIFF_MARKER);
+    return utils.isPersistedDiffBody(body_raw);
 }
 
 /// Iterator over diff file entries packed in the persisted body. Returns null
 /// when the body does not start with `PERSISTED_DIFF_MARKER`.
 fn parseDiffSummary(allocator: std.mem.Allocator, body_raw: []const u8) ?[]DiffFileEntry {
-    if (!std.mem.startsWith(u8, body_raw, utils.PERSISTED_DIFF_MARKER)) return null;
-    var rest = body_raw[utils.PERSISTED_DIFF_MARKER.len..];
+    if (std.mem.startsWith(u8, body_raw, utils.PERSISTED_DIFF_MARKER)) {
+        return parseDiffSummaryV2(allocator, body_raw[utils.PERSISTED_DIFF_MARKER.len..]);
+    }
+    if (!std.mem.startsWith(u8, body_raw, utils.PERSISTED_DIFF_MARKER_V1)) return null;
+    var rest = body_raw[utils.PERSISTED_DIFF_MARKER_V1.len..];
 
     var files: std.ArrayList(DiffFileEntry) = .empty;
     errdefer files.deinit(allocator);
@@ -3078,6 +3172,38 @@ fn parseDiffSummary(allocator: std.mem.Allocator, body_raw: []const u8) ?[]DiffF
     return files.toOwnedSlice(allocator) catch null;
 }
 
+fn parseDiffSummaryV2(allocator: std.mem.Allocator, body: []const u8) ?[]DiffFileEntry {
+    var rest = body;
+    var files: std.ArrayList(DiffFileEntry) = .empty;
+    errdefer files.deinit(allocator);
+
+    while (rest.len > 0) {
+        const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse return null;
+        const header = rest[0..line_end];
+        rest = rest[line_end + 1 ..];
+        if (!std.mem.startsWith(u8, header, "FILE\t")) return null;
+
+        var fields = std.mem.splitScalar(u8, header["FILE\t".len..], '\t');
+        const path_len = std.fmt.parseInt(usize, fields.next() orelse return null, 10) catch return null;
+        const additions = std.fmt.parseInt(i64, fields.next() orelse return null, 10) catch return null;
+        const deletions = std.fmt.parseInt(i64, fields.next() orelse return null, 10) catch return null;
+        const patch_len = std.fmt.parseInt(usize, fields.next() orelse return null, 10) catch return null;
+        if (fields.next() != null or path_len > rest.len or patch_len > rest.len - path_len) return null;
+
+        const path = rest[0..path_len];
+        rest = rest[path_len..];
+        const patch = rest[0..patch_len];
+        rest = rest[patch_len..];
+        files.append(allocator, .{
+            .path = path,
+            .additions = additions,
+            .deletions = deletions,
+            .patch = patch,
+        }) catch return null;
+    }
+    return files.toOwnedSlice(allocator) catch null;
+}
+
 fn diffFileCardKey(message_index: usize, file_path: []const u8) u64 {
     var hasher = std.hash.Wyhash.init(0xD1FFD1FFD1FFD1FF);
     hasher.update(std.mem.asBytes(&message_index));
@@ -3085,38 +3211,88 @@ fn diffFileCardKey(message_index: usize, file_path: []const u8) u64 {
     return hasher.final();
 }
 
+fn diffCopyIdentity(message_index: usize, file_path: []const u8, patch: []const u8) u64 {
+    var hasher = std.hash.Wyhash.init(0xD1FFC0A1D1FFC0A1);
+    hasher.update(std.mem.asBytes(&message_index));
+    hasher.update(file_path);
+    hasher.update(patch);
+    return hasher.final();
+}
+
+const DiffLayout = enum {
+    stacked,
+    split,
+};
+
+const DIFF_SPLIT_MIN_WIDTH_CSS: f32 = 620.0;
+
+fn diffLayoutCardKey(message_index: usize) u64 {
+    var hasher = std.hash.Wyhash.init(0xD1FF5A17D1FF5A17);
+    hasher.update(std.mem.asBytes(&message_index));
+    hasher.update("diff_layout");
+    return hasher.final();
+}
+
+fn diffLayoutForWidth(
+    state: ?*app_state.AppState,
+    message_index: ?usize,
+    width: f32,
+) DiffLayout {
+    if (width < theme.scaledUi(DIFF_SPLIT_MIN_WIDTH_CSS)) return .stacked;
+    const app = state orelse return .stacked;
+    const index = message_index orelse return .stacked;
+    return if (app.isCardExpanded(diffLayoutCardKey(index))) .split else .stacked;
+}
+
 fn diffSummaryHeight(state: ?*app_state.AppState, message_index: ?usize, body_raw: []const u8, column_width: f32) f32 {
-    const files = parseDiffSummary(std.heap.page_allocator, body_raw) orelse return 0.0;
+    const files = parseDiffSummary(std.heap.page_allocator, body_raw) orelse return theme.scaledUi(82.0);
     defer std.heap.page_allocator.free(files);
     return diffSummaryHeightForFiles(state, message_index, files, column_width);
 }
 
 fn diffSummaryHeightForFiles(state: ?*app_state.AppState, message_index: ?usize, files: []const DiffFileEntry, column_width: f32) f32 {
-    const pad_y = theme.scaledUi(10.0);
-    const header_h = theme.scaledUi(34.0);
-    const row_h = theme.scaledUi(30.0);
-    var total: f32 = pad_y + header_h + pad_y;
-    const inner_w = @max(column_width - theme.scaledUi(28.0), theme.scaledUi(80.0));
-    const code_font = theme.scaledUi(13.0);
-    const code_line_h = code_font * 1.32;
-    const code_char_w = code_font * 0.6;
-    const code_inner_w = @max(inner_w - theme.scaledUi(20.0), theme.scaledUi(40.0));
-    const code_cols = @max(@as(usize, @intFromFloat(code_inner_w / code_char_w)), 1);
-    for (files, 0..) |file, idx| {
-        total += row_h;
+    const outer_pad = theme.scaledUi(12.0);
+    const summary_h = theme.scaledUi(42.0);
+    const file_h = theme.scaledUi(44.0);
+    const code_line_h = theme.scaledUi(21.0);
+    const layout = diffLayoutForWidth(state, message_index, column_width);
+    var total = outer_pad + summary_h;
+    for (files) |file| {
+        total += file_h;
         const expanded = blk: {
             const app = state orelse break :blk false;
             const mi = message_index orelse break :blk false;
-            _ = idx;
             break :blk app.isCardExpanded(diffFileCardKey(mi, file.path));
         };
         if (expanded) {
-            const line_count = wrappedLineCount(file.patch, code_cols);
-            total += @as(f32, @floatFromInt(line_count)) * code_line_h + theme.scaledUi(12.0);
+            const line_count = diffPatchDisplayLineCountForLayout(file.patch, layout);
+            total += @as(f32, @floatFromInt(line_count)) * code_line_h + theme.scaledUi(20.0);
         }
     }
-    total += pad_y;
+    if (files.len == 0) total += theme.scaledUi(42.0);
+    total += outer_pad;
     return total;
+}
+
+fn diffPatchDisplayLineCountForLayout(patch: []const u8, layout: DiffLayout) usize {
+    return switch (layout) {
+        .stacked => diffPatchDisplayLineCount(patch),
+        .split => blk: {
+            if (patch.len == 0) break :blk 2;
+            var view = zig_dif.buildSideBySidePatchViewWithOptions(std.heap.page_allocator, patch, .{ .context_lines = 4 }) catch
+                break :blk diffPatchDisplayLineCount(patch);
+            defer view.deinit();
+            break :blk @max(view.rows.len, 1);
+        },
+    };
+}
+
+fn diffPatchDisplayLineCount(patch: []const u8) usize {
+    if (patch.len == 0) return 2;
+    var view = zig_dif.buildPatchViewWithOptions(std.heap.page_allocator, patch, .{ .context_lines = 4 }) catch
+        return @max(wrappedLineCount(patch, 120), 2);
+    defer view.deinit();
+    return @max(view.lines.len, 1);
 }
 
 fn renderDiffSummaryCard(
@@ -3128,7 +3304,30 @@ fn renderDiffSummaryCard(
     clip: palette.Rect,
     message_index: usize,
 ) void {
-    const files = parseDiffSummary(state.allocator, body_raw) orelse return;
+    const files = parseDiffSummary(state.allocator, body_raw) orelse {
+        const bubble = snapRect(palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height });
+        queueRoundedShellClipped(
+            state,
+            bubble,
+            paletteColor(theme.COLOR_PANEL_ALT),
+            paletteColor(theme.COLOR_DIFF_REMOVE),
+            transcriptBubbleCornerRadius(),
+            clip,
+        );
+        queueChromeLabel(state, .{
+            .x = bubble.x + theme.scaledUi(14.0),
+            .y = bubble.y + theme.scaledUi(12.0),
+            .w = bubble.w - theme.scaledUi(28.0),
+            .h = theme.scaledUi(22.0),
+        }, "Diff could not be decoded", paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), clip);
+        queueFixedTextLine(state, .{
+            .x = bubble.x + theme.scaledUi(14.0),
+            .y = bubble.y + theme.scaledUi(40.0),
+            .w = bubble.w - theme.scaledUi(28.0),
+            .h = theme.scaledUi(18.0),
+        }, "The provider payload was incomplete or malformed.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), clip);
+        return;
+    };
     defer state.allocator.free(files);
 
     const bubble = snapRect(palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height });
@@ -3138,9 +3337,12 @@ fn renderDiffSummaryCard(
     queueRoundedShellClipped(state, bubble, paletteColor(bg), paletteColor(border), rr, clip);
 
     const pad_x = theme.scaledUi(14.0);
-    const pad_y = theme.scaledUi(10.0);
-    const header_h = theme.scaledUi(34.0);
-    const row_h = theme.scaledUi(30.0);
+    const pad_y = theme.scaledUi(12.0);
+    const header_h = theme.scaledUi(42.0);
+    const row_h = theme.scaledUi(44.0);
+    const layout_key = diffLayoutCardKey(message_index);
+    const can_split = bubble.w >= theme.scaledUi(DIFF_SPLIT_MIN_WIDTH_CSS);
+    const layout = diffLayoutForWidth(state, message_index, bubble.w);
 
     // Header: "Changed files - N file(s) +A -D"
     var total_add: i64 = 0;
@@ -3152,21 +3354,37 @@ fn renderDiffSummaryCard(
     const header_label = std.fmt.allocPrint(state.allocator, "Changed files — {d} file{s}", .{ files.len, if (files.len == 1) "" else "s" }) catch null;
     defer if (header_label) |t| state.allocator.free(t);
     const header_y = bubble.y + pad_y;
+    const layout_toggle_w = if (can_split) theme.scaledUi(132.0) else 0.0;
+    const layout_toggle_gap = if (can_split) theme.scaledUi(10.0) else 0.0;
+    const header_counts_w = theme.scaledUi(86.0);
+    const layout_toggle_rect = palette.Rect{
+        .x = bubble.x + bubble.w - pad_x - layout_toggle_w,
+        .y = header_y + theme.scaledUi(6.0),
+        .w = layout_toggle_w,
+        .h = theme.scaledUi(28.0),
+    };
+    const counts_x = if (can_split)
+        layout_toggle_rect.x - layout_toggle_gap - header_counts_w
+    else
+        bubble.x + bubble.w - pad_x - header_counts_w;
     queueFixedTextLine(state, snapRect(.{
         .x = bubble.x + pad_x,
-        .y = header_y + theme.scaledUi(6.0),
-        .w = bubble.w - pad_x * 2.0 - theme.scaledUi(120.0),
+        .y = header_y + theme.scaledUi(9.0),
+        .w = @max(counts_x - theme.scaledUi(10.0) - (bubble.x + pad_x), theme.scaledUi(80.0)),
         .h = theme.scaledUi(20.0),
-    }), header_label orelse "Changed files", paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.5), clip);
+    }), header_label orelse "Changed files", paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), clip);
 
     const counts = std.fmt.allocPrint(state.allocator, "+{d}  -{d}", .{ total_add, total_del }) catch null;
     defer if (counts) |t| state.allocator.free(t);
     queueFixedTextLine(state, snapRect(.{
-        .x = bubble.x + bubble.w - pad_x - theme.scaledUi(110.0),
-        .y = header_y + theme.scaledUi(6.0),
-        .w = theme.scaledUi(110.0),
+        .x = counts_x,
+        .y = header_y + theme.scaledUi(9.0),
+        .w = header_counts_w,
         .h = theme.scaledUi(20.0),
-    }), counts orelse "", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), clip);
+    }), counts orelse "", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
+    if (can_split) {
+        renderDiffLayoutToggle(state, layout_toggle_rect, layout_key, layout, clip);
+    }
 
     // Separator below header
     queueRectClipped(state, snapRect(.{
@@ -3177,10 +3395,19 @@ fn renderDiffSummaryCard(
     }), paletteColor(theme.COLOR_PANEL_MUTED), clip);
 
     var row_y = bubble.y + pad_y + header_h;
-    const file_font = theme.scaledUi(13.5);
-    const code_font = theme.scaledUi(13.0);
-    const code_line_h = code_font * 1.32;
-    const code_char_w = code_font * 0.6;
+    const file_font = theme.scaledUi(13.0);
+    const code_font = theme.scaledUi(12.5);
+    const code_line_h = theme.scaledUi(21.0);
+
+    if (files.len == 0) {
+        queueFixedTextLine(state, .{
+            .x = bubble.x + pad_x,
+            .y = row_y + theme.scaledUi(10.0),
+            .w = bubble.w - pad_x * 2.0,
+            .h = theme.scaledUi(20.0),
+        }, "Diff data is empty or could not be restored.", paletteColor(theme.COLOR_TEXT_MUTED), file_font, clip);
+        return;
+    }
 
     for (files) |file| {
         const key = diffFileCardKey(message_index, file.path);
@@ -3188,7 +3415,9 @@ fn renderDiffSummaryCard(
 
         const row_rect = palette.Rect{ .x = bubble.x, .y = row_y, .w = bubble.w, .h = row_h };
 
-        // Hover background (very subtle) — skip for simplicity; just record hit.
+        if (state.palette_mouse_in_workspace and rectContains(row_rect, state.palette_mouse_x, state.palette_mouse_y)) {
+            queueRectClipped(state, row_rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 90)), clip);
+        }
         state.recordCardToggleHit(.{ .rect = row_rect, .key = key, .kind = .diff_file });
 
         // Chevron at left
@@ -3198,8 +3427,13 @@ fn renderDiffSummaryCard(
 
         // Path
         const path_x = chev_x + theme.scaledUi(14.0);
-        const counts_w = theme.scaledUi(110.0);
-        const path_w = @max(bubble.w - pad_x * 2.0 - (path_x - bubble.x) - counts_w, theme.scaledUi(40.0));
+        const action_w = theme.scaledUi(54.0);
+        const action_h = theme.scaledUi(28.0);
+        const action_gap = theme.scaledUi(6.0);
+        const counts_w = theme.scaledUi(92.0);
+        const actions_w = action_w * 2.0 + action_gap;
+        const path_right = bubble.x + bubble.w - pad_x - counts_w - action_gap - actions_w;
+        const path_w = @max(path_right - path_x, theme.scaledUi(40.0));
         const path_display = truncateMonoToWidth(state.allocator, file.path, path_w, file_font);
         defer if (path_display.allocated) state.allocator.free(path_display.text);
         queueFixedTextLine(state, snapRect(.{
@@ -3214,9 +3448,29 @@ fn renderDiffSummaryCard(
         defer if (adds_text) |t| state.allocator.free(t);
         const dels_text = std.fmt.allocPrint(state.allocator, "-{d}", .{file.deletions}) catch null;
         defer if (dels_text) |t| state.allocator.free(t);
-        const counts_right = bubble.x + bubble.w - pad_x;
-        const dels_w = theme.scaledUi(46.0);
-        const adds_w = theme.scaledUi(46.0);
+        const open_rect = palette.Rect{
+            .x = bubble.x + bubble.w - pad_x - action_w,
+            .y = row_y + (row_h - action_h) * 0.5,
+            .w = action_w,
+            .h = action_h,
+        };
+        const copy_rect = palette.Rect{
+            .x = open_rect.x - action_gap - action_w,
+            .y = open_rect.y,
+            .w = action_w,
+            .h = open_rect.h,
+        };
+        renderDiffFileActionButton(state, copy_rect, "Copy", false, clip);
+        renderDiffFileActionButton(state, open_rect, "Open", true, clip);
+        state.recordTranscriptCopyHit(copy_rect, file.patch, diffCopyIdentity(message_index, file.path, file.patch));
+        if (diff_file_open_hit_count < diff_file_open_hits.len) {
+            diff_file_open_hits[diff_file_open_hit_count] = .{ .rect = open_rect, .path = file.path };
+            diff_file_open_hit_count += 1;
+        }
+
+        const counts_right = copy_rect.x - action_gap;
+        const dels_w = counts_w * 0.5;
+        const adds_w = counts_w * 0.5;
         queueFixedTextLine(state, snapRect(.{
             .x = counts_right - dels_w,
             .y = row_y + (row_h - file_font * 1.25) * 0.5,
@@ -3232,14 +3486,319 @@ fn renderDiffSummaryCard(
 
         row_y += row_h;
 
-        if (expanded and file.patch.len > 0) {
-            const patch_inset_x = bubble.x + pad_x + theme.scaledUi(20.0);
-            const patch_w = bubble.w - pad_x * 2.0 - theme.scaledUi(20.0);
-            const cols = @max(@as(usize, @intFromFloat(patch_w / code_char_w)), 1);
-            renderDiffPatchLines(state, .{ .x = patch_inset_x, .y = row_y + theme.scaledUi(4.0), .w = patch_w, .h = bubble.y + bubble.h - row_y }, file.patch, cols, code_font, code_line_h, clip);
-            const line_count = wrappedLineCount(file.patch, cols);
-            row_y += @as(f32, @floatFromInt(line_count)) * code_line_h + theme.scaledUi(12.0);
+        if (expanded) {
+            const patch_x = bubble.x + pad_x;
+            const patch_w = bubble.w - pad_x * 2.0;
+            const line_count = diffPatchDisplayLineCountForLayout(file.patch, layout);
+            const patch_h = @as(f32, @floatFromInt(line_count)) * code_line_h;
+            renderDiffPatch(state, .{
+                .x = patch_x,
+                .y = row_y + theme.scaledUi(8.0),
+                .w = patch_w,
+                .h = patch_h,
+            }, file.patch, code_font, code_line_h, layout, clip);
+            row_y += @as(f32, @floatFromInt(line_count)) * code_line_h + theme.scaledUi(20.0);
         }
+    }
+}
+
+// Renders the stacked/split selector in the diff-card header.
+fn renderDiffLayoutToggle(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    key: u64,
+    layout: DiffLayout,
+    clip: palette.Rect,
+) void {
+    queueRoundedClipped(
+        state,
+        rect,
+        paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 105)),
+        theme.scaledUi(7.0),
+        clip,
+    );
+    const inset = theme.scaledUi(2.0);
+    const inner = palette.Rect{
+        .x = rect.x + inset,
+        .y = rect.y + inset,
+        .w = rect.w - inset * 2.0,
+        .h = rect.h - inset * 2.0,
+    };
+    const half_w = inner.w * 0.5;
+    const stacked_rect = palette.Rect{ .x = inner.x, .y = inner.y, .w = half_w, .h = inner.h };
+    const split_rect = palette.Rect{ .x = inner.x + half_w, .y = inner.y, .w = half_w, .h = inner.h };
+    renderDiffLayoutOption(state, stacked_rect, "Stacked", layout == .stacked, clip);
+    renderDiffLayoutOption(state, split_rect, "Split", layout == .split, clip);
+    if (diff_layout_hit_count + 2 <= diff_layout_hits.len) {
+        diff_layout_hits[diff_layout_hit_count] = .{ .rect = stacked_rect, .key = key, .split = false };
+        diff_layout_hits[diff_layout_hit_count + 1] = .{ .rect = split_rect, .key = key, .split = true };
+        diff_layout_hit_count += 2;
+    }
+}
+
+// Renders one segment of the diff-layout selector.
+fn renderDiffLayoutOption(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    label: []const u8,
+    selected: bool,
+    clip: palette.Rect,
+) void {
+    const hovered = state.palette_mouse_in_workspace and
+        rectContains(rect, state.palette_mouse_x, state.palette_mouse_y);
+    if (selected or hovered) {
+        queueRoundedClipped(
+            state,
+            rect,
+            paletteColor(if (selected)
+                theme.withAlpha(theme.COLOR_PANEL_ALT, 245)
+            else
+                theme.withAlpha(theme.COLOR_PANEL_ALT, 155)),
+            theme.scaledUi(5.0),
+            clip,
+        );
+    }
+    queueCenteredChromeLabel(
+        state,
+        rect,
+        label,
+        paletteColor(if (selected or hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED),
+        theme.scaledUi(10.5),
+        clip,
+    );
+}
+
+// Renders one file-row action in the diff card.
+fn renderDiffFileActionButton(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    label: []const u8,
+    primary: bool,
+    clip: palette.Rect,
+) void {
+    const hovered = state.palette_mouse_in_workspace and
+        rectContains(rect, state.palette_mouse_x, state.palette_mouse_y);
+    const background = if (primary and hovered)
+        theme.withAlpha(theme.COLOR_YELLOW, 42)
+    else if (hovered)
+        theme.withAlpha(theme.COLOR_PANEL_MUTED, 220)
+    else
+        theme.withAlpha(theme.COLOR_PANEL_MUTED, 128);
+    const border = if (primary and hovered)
+        theme.withAlpha(theme.COLOR_YELLOW, 150)
+    else
+        theme.withAlpha(theme.COLOR_TEXT_SUBTLE, if (hovered) 150 else 90);
+    const text = if (primary and hovered)
+        theme.COLOR_YELLOW
+    else if (hovered)
+        theme.COLOR_WHITE
+    else
+        theme.COLOR_TEXT_MUTED;
+    queueRoundedShellClipped(
+        state,
+        rect,
+        paletteColor(background),
+        paletteColor(border),
+        theme.scaledUi(6.0),
+        clip,
+    );
+    queueCenteredChromeLabel(state, rect, label, paletteColor(text), theme.scaledUi(11.5), clip);
+}
+
+// Selects the expanded file's stacked or split patch renderer.
+fn renderDiffPatch(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    patch: []const u8,
+    font_size: f32,
+    line_h: f32,
+    layout: DiffLayout,
+    clip: palette.Rect,
+) void {
+    switch (layout) {
+        .stacked => renderDiffPatchLines(state, rect, patch, font_size, line_h, clip),
+        .split => renderDiffSplitPatchLines(state, rect, patch, font_size, line_h, clip),
+    }
+}
+
+// Renders an aligned old/new patch with independent line-number gutters.
+fn renderDiffSplitPatchLines(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    patch: []const u8,
+    font_size: f32,
+    line_h: f32,
+    clip: palette.Rect,
+) void {
+    if (patch.len == 0) {
+        renderDiffPatchLines(state, rect, patch, font_size, line_h, clip);
+        return;
+    }
+
+    var view = zig_dif.buildSideBySidePatchViewWithOptions(state.allocator, patch, .{ .context_lines = 4 }) catch {
+        renderDiffPatchLines(state, rect, patch, font_size, line_h, clip);
+        return;
+    };
+    defer view.deinit();
+
+    queueRoundedShellClipped(
+        state,
+        rect,
+        paletteColor(theme.md.code_bg),
+        paletteColor(theme.md.code_border),
+        theme.scaledUi(6.0),
+        clip,
+    );
+
+    const divider_w = @max(theme.scaledUi(1.0), 1.0);
+    const half_w = (rect.w - divider_w) * 0.5;
+    const left_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = half_w, .h = rect.h };
+    const right_rect = palette.Rect{ .x = rect.x + half_w + divider_w, .y = rect.y, .w = half_w, .h = rect.h };
+    queueRectClipped(state, .{
+        .x = rect.x + half_w,
+        .y = rect.y,
+        .w = divider_w,
+        .h = rect.h,
+    }, paletteColor(theme.withAlpha(theme.md.code_border, 235)), clip);
+
+    for (view.rows, 0..) |row, index| {
+        const y = rect.y + @as(f32, @floatFromInt(index)) * line_h;
+        if (y > clip.y + clip.h or y + line_h < clip.y) continue;
+        switch (row.kind) {
+            .code => {
+                renderDiffSplitCell(state, .{
+                    .x = left_rect.x,
+                    .y = y,
+                    .w = left_rect.w,
+                    .h = line_h,
+                }, row.left, font_size, clip);
+                renderDiffSplitCell(state, .{
+                    .x = right_rect.x,
+                    .y = y,
+                    .w = right_rect.w,
+                    .h = line_h,
+                }, row.right, font_size, clip);
+            },
+            .hunk_header, .context_gap, .file_header, .prelude, .note => {
+                const row_rect = palette.Rect{ .x = rect.x, .y = y, .w = rect.w, .h = line_h };
+                const fill = switch (row.kind) {
+                    .hunk_header, .context_gap => theme.withAlpha(theme.COLOR_PANEL_MUTED, 155),
+                    .file_header, .prelude => theme.withAlpha(theme.COLOR_PANEL_ALT, 230),
+                    .note => theme.withAlpha(theme.COLOR_YELLOW, 22),
+                    .code => unreachable,
+                };
+                queueRectClipped(state, row_rect, paletteColor(fill), clip);
+                const display_kind: zig_dif.DisplayLineKind = switch (row.kind) {
+                    .hunk_header => .hunk_header,
+                    .context_gap => .context_gap,
+                    .file_header => .file_header,
+                    .prelude => .prelude,
+                    .note => .note,
+                    .code => unreachable,
+                };
+                renderDiffTokens(
+                    state,
+                    rect.x + theme.scaledUi(10.0),
+                    y,
+                    rect.w - theme.scaledUi(20.0),
+                    line_h,
+                    row.tokens,
+                    display_kind,
+                    font_size,
+                    intersectRect(clip, row_rect),
+                );
+            },
+        }
+    }
+}
+
+// Renders one old/new cell, including its blank alignment placeholder.
+fn renderDiffSplitCell(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    maybe_cell: ?zig_dif.SideBySideCell,
+    font_size: f32,
+    clip: palette.Rect,
+) void {
+    const cell = maybe_cell orelse {
+        queueRectClipped(
+            state,
+            rect,
+            paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 155)),
+            clip,
+        );
+        return;
+    };
+
+    const change_color: ?[4]f32 = switch (cell.kind) {
+        .addition => theme.COLOR_DIFF_ADD,
+        .deletion => theme.COLOR_DIFF_REMOVE,
+        else => null,
+    };
+    if (change_color) |color| {
+        queueRectClipped(state, rect, paletteColor(theme.withAlpha(color, 34)), clip);
+        queueRectClipped(state, .{
+            .x = rect.x,
+            .y = rect.y,
+            .w = theme.scaledUi(3.0),
+            .h = rect.h,
+        }, paletteColor(color), clip);
+    }
+
+    const number_w = theme.scaledUi(38.0);
+    const code_pad = theme.scaledUi(9.0);
+    const code_x = rect.x + number_w + code_pad;
+    queueRectClipped(state, .{
+        .x = rect.x + number_w,
+        .y = rect.y,
+        .w = @max(theme.scaledUi(1.0), 1.0),
+        .h = rect.h,
+    }, paletteColor(theme.md.code_border), clip);
+    renderDiffLineNumber(state, rect.x, rect.y, number_w, rect.h, cell.line_number, font_size, clip);
+
+    const code_clip = intersectRect(clip, .{
+        .x = code_x,
+        .y = rect.y,
+        .w = @max(rect.w - number_w - code_pad * 2.0, 1.0),
+        .h = rect.h,
+    });
+    if (change_color) |color| {
+        renderDiffSplitEmphasis(state, code_x, rect.y, rect.h, font_size, cell, color, code_clip);
+    }
+    renderDiffTokens(
+        state,
+        code_x,
+        rect.y,
+        code_clip.w,
+        rect.h,
+        cell.tokens,
+        cell.kind,
+        font_size,
+        code_clip,
+    );
+}
+
+// Renders word-level change emphasis supplied by zig_dif's aligned model.
+fn renderDiffSplitEmphasis(
+    state: *app_state.AppState,
+    code_x: f32,
+    y: f32,
+    line_h: f32,
+    font_size: f32,
+    cell: zig_dif.SideBySideCell,
+    color: [4]f32,
+    clip: palette.Rect,
+) void {
+    for (cell.emphasis_ranges) |range| {
+        if (range.start >= range.end or range.end > cell.text.len) continue;
+        const prefix_w = text_measure.textWidth(.mono, font_size, cell.text[0..range.start]);
+        const range_w = text_measure.textWidth(.mono, font_size, cell.text[range.start..range.end]);
+        queueRoundedClipped(state, .{
+            .x = code_x + prefix_w,
+            .y = y + theme.scaledUi(2.0),
+            .w = @max(range_w, theme.scaledUi(2.0)),
+            .h = @max(line_h - theme.scaledUi(4.0), 1.0),
+        }, paletteColor(theme.withAlpha(color, 72)), theme.scaledUi(2.0), clip);
     }
 }
 
@@ -3247,42 +3806,206 @@ fn renderDiffPatchLines(
     state: *app_state.AppState,
     rect: palette.Rect,
     patch: []const u8,
-    cols: usize,
     font_size: f32,
     line_h: f32,
     clip: palette.Rect,
 ) void {
-    var y = rect.y;
-    var line_start: usize = 0;
-    var i: usize = 0;
-    while (i <= patch.len and y < clip.y + clip.h) : (i += 1) {
-        if (i != patch.len and patch[i] != '\n') continue;
-        const line_end = i;
-        if (line_start == line_end) {
-            y += line_h;
-            line_start = i + 1;
-            continue;
-        }
-        const line = patch[line_start..line_end];
-        const color: [4]f32 = switch (line[0]) {
-            '+' => if (std.mem.startsWith(u8, line, "+++")) [4]f32{ 200.0 / 255.0, 200.0 / 255.0, 200.0 / 255.0, 1.0 } else theme.COLOR_DIFF_ADD,
-            '-' => if (std.mem.startsWith(u8, line, "---")) [4]f32{ 200.0 / 255.0, 200.0 / 255.0, 200.0 / 255.0, 1.0 } else theme.COLOR_DIFF_REMOVE,
-            '@' => [4]f32{ 122.0 / 255.0, 202.0 / 255.0, 255.0 / 255.0, 1.0 },
-            else => theme.COLOR_TEXT_MUTED,
-        };
-        var chunk_start: usize = 0;
-        while (chunk_start < line.len and y < clip.y + clip.h) {
-            const remaining = line.len - chunk_start;
-            const chunk_len = @min(remaining, cols);
-            const chunk = line[chunk_start .. chunk_start + chunk_len];
-            if (y + line_h >= clip.y) {
-                queueFixedTextLine(state, snapRect(.{ .x = rect.x, .y = y, .w = rect.w, .h = line_h }), chunk, paletteColor(color), font_size, clip);
-            }
-            y += line_h;
-            chunk_start += chunk_len;
-        }
-        line_start = i + 1;
+    queueRoundedShellClipped(
+        state,
+        rect,
+        paletteColor(theme.md.code_bg),
+        paletteColor(theme.md.code_border),
+        theme.scaledUi(6.0),
+        clip,
+    );
+
+    if (patch.len == 0) {
+        renderDiffFallback(state, rect, "No textual patch was supplied for this file.", font_size, line_h, clip);
+        return;
     }
+
+    var view = zig_dif.buildPatchViewWithOptions(state.allocator, patch, .{ .context_lines = 4 }) catch {
+        renderDiffFallback(state, rect, patch, font_size, line_h, clip);
+        return;
+    };
+    defer view.deinit();
+
+    const number_w = theme.scaledUi(38.0);
+    const gutter_w = number_w * 2.0;
+    const code_x = rect.x + gutter_w + theme.scaledUi(10.0);
+    const code_clip = intersectRect(clip, .{
+        .x = code_x,
+        .y = rect.y,
+        .w = @max(rect.w - (code_x - rect.x) - theme.scaledUi(6.0), 1.0),
+        .h = rect.h,
+    });
+
+    var hunk_index: usize = 0;
+    for (view.lines, 0..) |line, index| {
+        const y = rect.y + @as(f32, @floatFromInt(index)) * line_h;
+        if (y > clip.y + clip.h or y + line_h < clip.y) continue;
+        const row = palette.Rect{ .x = rect.x, .y = y, .w = rect.w, .h = line_h };
+        const change_color: ?[4]f32 = switch (line.kind) {
+            .addition => theme.COLOR_DIFF_ADD,
+            .deletion => theme.COLOR_DIFF_REMOVE,
+            else => null,
+        };
+        if (change_color) |color| {
+            queueRectClipped(state, row, paletteColor(theme.withAlpha(color, 34)), clip);
+            queueRectClipped(state, .{ .x = row.x, .y = row.y, .w = theme.scaledUi(3.0), .h = row.h }, paletteColor(color), clip);
+        } else if (line.kind == .hunk_header or line.kind == .context_gap) {
+            queueRectClipped(state, row, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 145)), clip);
+        }
+        queueRectClipped(state, .{ .x = rect.x + gutter_w, .y = y, .w = 1.0, .h = line_h }, paletteColor(theme.md.code_border), clip);
+
+        renderDiffLineNumber(state, rect.x, y, number_w, line_h, line.old_line, font_size, clip);
+        renderDiffLineNumber(state, rect.x + number_w, y, number_w, line_h, line.new_line, font_size, clip);
+        renderDiffTokens(state, code_x, y, code_clip.w, line_h, line.tokens, line.kind, font_size, code_clip);
+        if (line.kind == .hunk_header) {
+            if (diffHunkSlice(patch, hunk_index)) |hunk| {
+                const copy_rect = palette.Rect{
+                    .x = rect.x + rect.w - theme.scaledUi(52.0),
+                    .y = y + theme.scaledUi(2.0),
+                    .w = theme.scaledUi(46.0),
+                    .h = line_h - theme.scaledUi(4.0),
+                };
+                const hovered = state.palette_mouse_in_workspace and
+                    rectContains(copy_rect, state.palette_mouse_x, state.palette_mouse_y);
+                queueRoundedClipped(
+                    state,
+                    copy_rect,
+                    paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, if (hovered) 255 else 210)),
+                    theme.scaledUi(4.0),
+                    clip,
+                );
+                queueCenteredChromeLabel(
+                    state,
+                    copy_rect,
+                    "Copy",
+                    paletteColor(if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED),
+                    theme.scaledUi(9.5),
+                    clip,
+                );
+                state.recordTranscriptCopyHit(copy_rect, hunk, toolCopyIdentity(hunk_index, hunk));
+            }
+            hunk_index += 1;
+        }
+    }
+}
+
+fn diffHunkSlice(patch: []const u8, target_index: usize) ?[]const u8 {
+    var found_index: usize = 0;
+    var cursor: usize = 0;
+    while (cursor < patch.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, patch, cursor, '\n') orelse patch.len;
+        const line = patch[cursor..line_end];
+        if (std.mem.startsWith(u8, line, "@@ ")) {
+            if (found_index == target_index) {
+                var end = if (line_end < patch.len) line_end + 1 else line_end;
+                while (end < patch.len) {
+                    const next_end = std.mem.indexOfScalarPos(u8, patch, end, '\n') orelse patch.len;
+                    const next_line = patch[end..next_end];
+                    if (std.mem.startsWith(u8, next_line, "@@ ") or std.mem.startsWith(u8, next_line, "diff --git ")) break;
+                    end = if (next_end < patch.len) next_end + 1 else next_end;
+                }
+                return patch[cursor..end];
+            }
+            found_index += 1;
+        }
+        cursor = if (line_end < patch.len) line_end + 1 else line_end;
+    }
+    return null;
+}
+
+fn renderDiffFallback(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    text: []const u8,
+    font_size: f32,
+    line_h: f32,
+    clip: palette.Rect,
+) void {
+    const body = if (text.len == 0) "Diff unavailable" else text;
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    var index: usize = 0;
+    while (lines.next()) |line| : (index += 1) {
+        if (index >= diffPatchDisplayLineCount(text)) break;
+        const y = rect.y + @as(f32, @floatFromInt(index)) * line_h;
+        queueFixedTextLine(state, .{
+            .x = rect.x + theme.scaledUi(10.0),
+            .y = y,
+            .w = rect.w - theme.scaledUi(16.0),
+            .h = line_h,
+        }, line, paletteColor(theme.COLOR_TEXT_MUTED), font_size, clip);
+    }
+}
+
+fn renderDiffLineNumber(
+    state: *app_state.AppState,
+    x: f32,
+    y: f32,
+    width: f32,
+    line_h: f32,
+    number: ?usize,
+    font_size: f32,
+    clip: palette.Rect,
+) void {
+    var buf: [32]u8 = undefined;
+    const label = if (number) |value| std.fmt.bufPrint(&buf, "{d}", .{value}) catch "" else "";
+    queueFixedTextLine(state, .{
+        .x = x + theme.scaledUi(3.0),
+        .y = y,
+        .w = width - theme.scaledUi(8.0),
+        .h = line_h,
+    }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), font_size * 0.9, clip);
+}
+
+fn renderDiffTokens(
+    state: *app_state.AppState,
+    x: f32,
+    y: f32,
+    width: f32,
+    line_h: f32,
+    tokens: []const zig_dif.Token,
+    line_kind: zig_dif.DisplayLineKind,
+    font_size: f32,
+    clip: palette.Rect,
+) void {
+    var cursor_x = x;
+    for (tokens) |token| {
+        if (cursor_x >= x + width) break;
+        const color = diffTokenColor(token.kind, line_kind);
+        const token_w = text_measure.textWidth(.mono, font_size, token.text);
+        state.palette_overlay_batch.roleText(
+            state.allocator,
+            .{ .x = cursor_x, .y = y, .w = @max(token_w, 1.0), .h = line_h },
+            stableText(state, token.text),
+            paletteColor(color),
+            font_size,
+            .mono,
+            null,
+            clip,
+        ) catch {};
+        cursor_x += token_w;
+    }
+}
+
+fn diffTokenColor(kind: zig_dif.TokenKind, line_kind: zig_dif.DisplayLineKind) [4]f32 {
+    if (line_kind == .hunk_header or line_kind == .context_gap) return theme.md.link;
+    if (line_kind == .file_header or line_kind == .prelude or line_kind == .note) return theme.COLOR_TEXT_MUTED;
+    return switch (kind) {
+        .plain => theme.md.tok_plain,
+        .keyword => theme.md.tok_keyword,
+        .string => theme.md.tok_string,
+        .number => theme.md.tok_number,
+        .comment => theme.md.tok_comment,
+        .type_name => theme.md.tok_type,
+        .function_name => theme.md.tok_function,
+        .property_name => theme.md.tok_property,
+        .variable_name => theme.md.tok_variable,
+        .constant_name => theme.md.tok_constant,
+        .operator, .punctuation => theme.md.tok_punct,
+    };
 }
 
 /// Stable key for the command-row expand/collapse state per message index.
@@ -4945,6 +5668,41 @@ fn queueChromeLabel(state: *app_state.AppState, rect: palette.Rect, value: []con
     ) catch {};
 }
 
+/// Centers a short UI-font label inside a button or badge rectangle.
+fn queueCenteredChromeLabel(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    value: []const u8,
+    color: palette.Color,
+    font_size: f32,
+    clip: ?palette.Rect,
+) void {
+    const label_w = text_measure.textWidth(.ui, font_size, value);
+    const label_h = font_size * 1.4;
+    queueChromeLabel(state, centeredLabelRect(rect, label_w, label_h), value, color, font_size, clip);
+}
+
+fn centeredLabelRect(container: palette.Rect, label_w: f32, label_h: f32) palette.Rect {
+    return .{
+        .x = container.x + @max((container.w - label_w) * 0.5, 0.0),
+        .y = container.y + @max((container.h - label_h) * 0.5, 0.0),
+        .w = @min(label_w, container.w),
+        .h = @min(label_h, container.h),
+    };
+}
+
+test "centered label geometry balances button padding" {
+    const label = centeredLabelRect(
+        .{ .x = 10.0, .y = 20.0, .w = 54.0, .h = 28.0 },
+        24.0,
+        14.0,
+    );
+    try std.testing.expectEqual(@as(f32, 25.0), label.x);
+    try std.testing.expectEqual(@as(f32, 27.0), label.y);
+    try std.testing.expectEqual(@as(f32, 24.0), label.w);
+    try std.testing.expectEqual(@as(f32, 14.0), label.h);
+}
+
 fn queueIconText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
     state.palette_overlay_batch.roleText(state.allocator, rect, stableText(state, value), color, font_size, .icon, null, clip) catch {};
 }
@@ -4957,6 +5715,19 @@ fn rectContains(rect: palette.Rect, x: f32, y: f32) bool {
     return x >= rect.x and y >= rect.y and x <= rect.x + rect.w and y <= rect.y + rect.h;
 }
 
+fn intersectRect(a: palette.Rect, b: palette.Rect) palette.Rect {
+    const x = @max(a.x, b.x);
+    const y = @max(a.y, b.y);
+    const right = @min(a.x + a.w, b.x + b.w);
+    const bottom = @min(a.y + a.h, b.y + b.h);
+    return .{
+        .x = x,
+        .y = y,
+        .w = @max(right - x, 0.0),
+        .h = @max(bottom - y, 0.0),
+    };
+}
+
 fn snapRect(rect: palette.Rect) palette.Rect {
     return .{
         .x = @round(rect.x),
@@ -4964,4 +5735,40 @@ fn snapRect(rect: palette.Rect) palette.Rect {
         .w = @round(rect.w),
         .h = @round(rect.h),
     };
+}
+
+test "diff summary v2 round trips delimiter characters and multiple files" {
+    const body =
+        utils.PERSISTED_DIFF_MARKER ++
+        "FILE\t16\t1\t1\t21\n" ++
+        "src/with\ttab.zig" ++
+        "@@ -1 +1 @@\n-old\n+new" ++
+        "FILE\t10\t2\t0\t0\n" ++
+        "README.md\n";
+    const files = parseDiffSummary(std.testing.allocator, body) orelse return error.TestUnexpectedNull;
+    defer std.testing.allocator.free(files);
+
+    try std.testing.expectEqual(@as(usize, 2), files.len);
+    try std.testing.expectEqualStrings("src/with\ttab.zig", files[0].path);
+    try std.testing.expectEqualStrings("@@ -1 +1 @@\n-old\n+new", files[0].patch);
+    try std.testing.expectEqualStrings("README.md\n", files[1].path);
+}
+
+test "diff summary v2 rejects truncated payloads" {
+    const body = utils.PERSISTED_DIFF_MARKER ++ "FILE\t4\t1\t0\t99\nmain";
+    try std.testing.expect(parseDiffSummary(std.testing.allocator, body) == null);
+}
+
+test "split diff layout aligns replacement rows" {
+    const patch =
+        \\@@ -1,2 +1,3 @@
+        \\-const oldValue = 1;
+        \\+const newValue = 2;
+        \\+const extraValue = 3;
+        \\ context();
+    ;
+    const stacked_lines = diffPatchDisplayLineCountForLayout(patch, .stacked);
+    const split_lines = diffPatchDisplayLineCountForLayout(patch, .split);
+    try std.testing.expectEqual(@as(usize, 5), stacked_lines);
+    try std.testing.expectEqual(@as(usize, 4), split_lines);
 }

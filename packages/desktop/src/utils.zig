@@ -15,7 +15,8 @@ const log = std.log.scoped(.native_utils);
 // Shared runtime constants live here so state and the UI shell can import them
 // without creating a cycle back through `main.zig`.
 pub const CLIPBOARD_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
-pub const PERSISTED_DIFF_MARKER = "EDITORTS_DIFF_V1\n";
+pub const PERSISTED_DIFF_MARKER_V1 = "EDITORTS_DIFF_V1\n";
+pub const PERSISTED_DIFF_MARKER = "VERDE_DIFF_V2\n";
 
 extern fn verde_macos_clipboard_copy_image(out_bytes: *?[*]u8, out_len: *usize, out_mime: *?[*:0]const u8) c_int;
 extern fn free(ptr: ?*anyopaque) void;
@@ -1661,6 +1662,11 @@ fn handleSendStreamEvent(context: ?*anyopaque, event: ai_harness.StreamEvent) vo
         .diff => |diff| {
             flushPendingAssistantTextLocked(send_state, page_alloc);
             mergePendingDiffFilesLocked(page_alloc, &send_state.pending_diff_files, diff.files);
+            upsertPendingDiffSummaryEventLocked(
+                page_alloc,
+                &send_state.pending_events,
+                send_state.pending_diff_files.items,
+            );
             send_state.ui_revision +%= 1;
             loop_wakeup.notify();
         },
@@ -1964,7 +1970,7 @@ pub fn flushPendingAssistantTextLocked(send_state: *app_state.SendState, allocat
     send_state.partial_text.clearRetainingCapacity();
     send_state.ui_revision +%= 1;
 }
-fn mergePendingDiffFilesLocked(
+pub fn mergePendingDiffFilesLocked(
     allocator: std.mem.Allocator,
     target: *std.ArrayListUnmanaged(app_state.PendingDiffFile),
     files: []const ai_harness.StreamDiffFile,
@@ -1983,12 +1989,8 @@ fn upsertPendingDiffFileLocked(
 
         existing.additions = file.additions;
         existing.deletions = file.deletions;
-        if (file.patch) |patch| {
-            if (existing.patch) |existing_patch| {
-                allocator.free(existing_patch);
-            }
-            existing.patch = try allocator.dupe(u8, patch);
-        }
+        if (existing.patch) |existing_patch| allocator.free(existing_patch);
+        existing.patch = if (file.patch) |patch| try allocator.dupe(u8, patch) else null;
         return;
     }
 
@@ -2116,28 +2118,9 @@ pub fn appendPendingDiffSummaryEvent(
 ) void {
     if (files.len == 0) return;
 
-    var body_builder: std.ArrayListUnmanaged(u8) = .empty;
-    defer body_builder.deinit(allocator);
-
-    body_builder.appendSlice(allocator, PERSISTED_DIFF_MARKER) catch return;
-
-    for (files) |file| {
-        const patch = file.patch orelse "";
-        const header = std.fmt.allocPrint(allocator, "FILE\t{s}\t{d}\t{d}\t{d}\n", .{
-            file.path,
-            file.additions,
-            file.deletions,
-            patch.len,
-        }) catch return;
-        defer allocator.free(header);
-        body_builder.appendSlice(allocator, header) catch return;
-        body_builder.appendSlice(allocator, patch) catch return;
-        body_builder.append(allocator, '\n') catch return;
-    }
-
     const owned_title = allocator.dupe(u8, "Changed files") catch return;
     errdefer allocator.free(owned_title);
-    const owned_body = body_builder.toOwnedSlice(allocator) catch {
+    const owned_body = diffSummaryBodyAlloc(allocator, files) catch {
         allocator.free(owned_title);
         return;
     };
@@ -2150,6 +2133,65 @@ pub fn appendPendingDiffSummaryEvent(
         allocator.free(owned_title);
         allocator.free(owned_body);
     };
+}
+
+pub fn upsertPendingDiffSummaryEventLocked(
+    allocator: std.mem.Allocator,
+    events: *std.ArrayListUnmanaged(app_state.PendingTimelineEvent),
+    files: []const app_state.PendingDiffFile,
+) void {
+    if (files.len == 0) return;
+    const body = diffSummaryBodyAlloc(allocator, files) catch return;
+
+    for (events.items) |*event| {
+        if (event.role != .system or !std.mem.eql(u8, event.author, "Changed files")) continue;
+        if (!isPersistedDiffBody(event.body)) continue;
+        allocator.free(event.body);
+        event.body = body;
+        return;
+    }
+
+    const author = allocator.dupe(u8, "Changed files") catch {
+        allocator.free(body);
+        return;
+    };
+    events.append(allocator, .{
+        .role = .system,
+        .author = author,
+        .body = body,
+    }) catch {
+        allocator.free(author);
+        allocator.free(body);
+    };
+}
+
+fn diffSummaryBodyAlloc(
+    allocator: std.mem.Allocator,
+    files: []const app_state.PendingDiffFile,
+) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+    try body.appendSlice(allocator, PERSISTED_DIFF_MARKER);
+
+    for (files) |file| {
+        const patch = file.patch orelse "";
+        const header = try std.fmt.allocPrint(allocator, "FILE\t{d}\t{d}\t{d}\t{d}\n", .{
+            file.path.len,
+            file.additions,
+            file.deletions,
+            patch.len,
+        });
+        defer allocator.free(header);
+        try body.appendSlice(allocator, header);
+        try body.appendSlice(allocator, file.path);
+        try body.appendSlice(allocator, patch);
+    }
+    return body.toOwnedSlice(allocator);
+}
+
+pub fn isPersistedDiffBody(body: []const u8) bool {
+    return std.mem.startsWith(u8, body, PERSISTED_DIFF_MARKER) or
+        std.mem.startsWith(u8, body, PERSISTED_DIFF_MARKER_V1);
 }
 
 /// Downgrades tool calls still marked running once their turn is over.
@@ -2784,7 +2826,7 @@ test "configured editor parsing preserves Windows paths and quoted arguments" {
     try std.testing.expectEqualStrings("two words", parsed.argv.items[2]);
 }
 
-test "upsertPendingDiffFileLocked preserves patch when later updates omit it" {
+test "upsertPendingDiffFileLocked clears stale patch when later snapshot omits it" {
     const allocator = std.testing.allocator;
     var files: std.ArrayListUnmanaged(app_state.PendingDiffFile) = .empty;
     defer freePendingDiffFiles(allocator, &files);
@@ -2803,7 +2845,35 @@ test "upsertPendingDiffFileLocked preserves patch when later updates omit it" {
     });
 
     try std.testing.expectEqual(@as(usize, 1), files.items.len);
-    try std.testing.expectEqualStrings("@@ -1 +1 @@\n-old\n+new\n", files.items[0].patch.?);
+    try std.testing.expect(files.items[0].patch == null);
+}
+
+test "streamed diff becomes a live timeline event and updates in place" {
+    const allocator = std.testing.allocator;
+    var files: std.ArrayListUnmanaged(app_state.PendingDiffFile) = .empty;
+    defer freePendingDiffFiles(allocator, &files);
+    var events: std.ArrayListUnmanaged(app_state.PendingTimelineEvent) = .empty;
+    defer freePendingTimelineEvents(allocator, &events);
+
+    mergePendingDiffFilesLocked(allocator, &files, &.{.{
+        .path = "src/with\ttab.zig",
+        .additions = 1,
+        .deletions = 1,
+        .patch = "@@ -1 +1 @@\n-old\n+new",
+    }});
+    upsertPendingDiffSummaryEventLocked(allocator, &events, files.items);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expect(isPersistedDiffBody(events.items[0].body));
+
+    mergePendingDiffFilesLocked(allocator, &files, &.{.{
+        .path = "src/with\ttab.zig",
+        .additions = 2,
+        .deletions = 1,
+        .patch = "@@ -1 +1,2 @@\n-old\n+new\n+again",
+    }});
+    upsertPendingDiffSummaryEventLocked(allocator, &events, files.items);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "+again") != null);
 }
 
 test "provider failure display identifies Claude and Codex usage limits" {

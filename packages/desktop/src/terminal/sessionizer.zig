@@ -34,7 +34,8 @@ pub const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\verde-sessionizer-";
 // Version 13 transports structured tool-call lifecycle events to the desktop.
 // Version 14 preserves provider-specific tool titles and inferred MCP kinds.
 // Version 15 carries exact Verde MCP method names through Cursor tool results.
-pub const PROTOCOL_VERSION: u32 = 15;
+// Version 16 transports complete diff snapshots instead of empty diff events.
+pub const PROTOCOL_VERSION: u32 = 16;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
@@ -2070,8 +2071,38 @@ fn chatSinkEvent(context: ?*anyopaque, event: harness.StreamEvent) void {
             defer allocator.free(payload);
             turn.appendEvent(allocator, "tool_call", payload);
         },
-        .diff => turn.appendEvent(allocator, "diff", "{}"),
+        .diff => |diff| {
+            const payload = chatDiffPayloadAlloc(allocator, diff.files) catch return;
+            defer allocator.free(payload);
+            turn.appendEvent(allocator, "diff", payload);
+        },
     }
+}
+
+fn chatDiffPayloadAlloc(allocator: std.mem.Allocator, files: []const harness.StreamDiffFile) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    try s.objectField("files");
+    try s.beginArray();
+    for (files) |file| {
+        try s.beginObject();
+        try s.objectField("path");
+        try s.write(file.path);
+        try s.objectField("additions");
+        try s.write(file.additions);
+        try s.objectField("deletions");
+        try s.write(file.deletions);
+        if (file.patch) |patch| {
+            try s.objectField("patch");
+            try s.write(patch);
+        }
+        try s.endObject();
+    }
+    try s.endArray();
+    try s.endObject();
+    return writer.toOwnedSlice();
 }
 
 fn chatSinkFailure(context: ?*anyopaque, message: []const u8) void {
@@ -2680,6 +2711,27 @@ test "Windows pipe rollout rejects legacy daemons" {
     ).?;
     try std.testing.expect(recreated_pipe_status.protocol_version != PROTOCOL_VERSION);
     try std.testing.expect(unflushed_pipe_status.protocol_version != PROTOCOL_VERSION);
+}
+
+test "daemon chat diff payload preserves files and patches" {
+    const payload = try chatDiffPayloadAlloc(std.testing.allocator, &.{.{
+        .path = "src/main.zig",
+        .additions = 2,
+        .deletions = 1,
+        .patch = "@@ -1 +1,2 @@\n-old\n+new\n+again\n",
+    }});
+    defer std.testing.allocator.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const files = parsed.value.object.get("files").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), files.len);
+    try std.testing.expectEqualStrings("src/main.zig", files[0].object.get("path").?.string);
+    try std.testing.expectEqual(@as(i64, 2), files[0].object.get("additions").?.integer);
+    try std.testing.expectEqualStrings(
+        "@@ -1 +1,2 @@\n-old\n+new\n+again\n",
+        files[0].object.get("patch").?.string,
+    );
 }
 
 test "daemon retains chat turns until their result is consumed" {

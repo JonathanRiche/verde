@@ -138,6 +138,53 @@ function commandFromClaudeToolUse(item) {
   return input.command ?? input.cmd ?? null;
 }
 
+function diffFromClaudeToolUse(item) {
+  if (item?.type !== "tool_use") return null;
+  const name = String(item.name ?? "").toLowerCase();
+  const input = item.input && typeof item.input === "object" ? item.input : {};
+  const path = input.file_path ?? input.path;
+  if (typeof path !== "string" || path.length === 0) return null;
+
+  const makePatch = (oldText, newText, created = false) => {
+    const oldLines = oldText.length === 0 ? [] : String(oldText).split("\n");
+    const newLines = newText.length === 0 ? [] : String(newText).split("\n");
+    const header = created
+      ? [`--- /dev/null`, `+++ b/${path}`]
+      : [`--- a/${path}`, `+++ b/${path}`];
+    const oldRange = oldLines.length === 0 ? "0,0" : `1,${oldLines.length}`;
+    const newRange = newLines.length === 0 ? "0,0" : `1,${newLines.length}`;
+    return [
+      ...header,
+      `@@ -${oldRange} +${newRange} @@`,
+      ...oldLines.map((line) => `-${line}`),
+      ...newLines.map((line) => `+${line}`),
+    ].join("\n");
+  };
+
+  if (name === "edit" || name === "str_replace") {
+    const oldText = input.old_string ?? input.old_str;
+    const newText = input.new_string ?? input.new_str;
+    if (typeof oldText !== "string" || typeof newText !== "string") return null;
+    return {
+      path,
+      additions: newText.length === 0 ? 0 : newText.split("\n").length,
+      deletions: oldText.length === 0 ? 0 : oldText.split("\n").length,
+      patch: makePatch(oldText, newText),
+    };
+  }
+  if (name === "write") {
+    const content = input.content;
+    if (typeof content !== "string") return null;
+    return {
+      path,
+      additions: content.length === 0 ? 0 : content.split("\n").length,
+      deletions: 0,
+      patch: makePatch("", content, true),
+    };
+  }
+  return null;
+}
+
 function backgroundCommandMode(command) {
   if (/\bgh\s+run\s+watch\b/.test(command)) return "tracked";
   if (/\b(bun|npm|pnpm|yarn)\s+(run\s+)?(dev|dev:[\w:-]+|start)\b/.test(command)) return "detached";
@@ -321,6 +368,9 @@ function emitClaudeToolEvents(message, commandByToolUseId, query, backgroundStat
   const content = message?.message?.content ?? message?.content;
   if (!Array.isArray(content)) return;
   for (const item of content) {
+    const diff = diffFromClaudeToolUse(item);
+    if (diff) write({ type: "diff_event", files: [diff] });
+
     const rawCommand = commandFromClaudeToolUse(item);
     const command = typeof item?.id === "string" && commandByToolUseId.has(item.id)
       ? commandByToolUseId.get(item.id)

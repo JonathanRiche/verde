@@ -948,9 +948,83 @@ fn handleLiveSessionUpdate(
                 .locations = event.locations,
                 .raw = event.raw,
             } });
+            emitCursorDiffUpdate(update, request.stream_context, on_stream_event);
         }
     }
 }
+
+fn emitCursorDiffUpdate(
+    update: std.json.Value,
+    context: ?*anyopaque,
+    on_stream_event: *const fn (?*anyopaque, provider_types.StreamEvent) void,
+) void {
+    const path = findFirstStringForKeys(update, &.{ "path", "filePath", "relativePath", "file" }) orelse return;
+    const patch = findFirstStringForKeys(update, &.{ "diff", "patch" }) orelse return;
+    if (patch.len == 0) return;
+    const files = [_]provider_types.StreamDiffFile{.{
+        .path = path,
+        .additions = countUnifiedPatchLines(patch, '+'),
+        .deletions = countUnifiedPatchLines(patch, '-'),
+        .patch = patch,
+    }};
+    on_stream_event(context, .{ .diff = .{ .files = &files } });
+}
+
+fn findFirstStringForKeys(value: std.json.Value, keys: []const []const u8) ?[]const u8 {
+    switch (value) {
+        .object => |object| {
+            for (keys) |key| {
+                const candidate = object.get(key) orelse continue;
+                if (candidate == .string and candidate.string.len > 0) return candidate.string;
+            }
+            var fields = object.iterator();
+            while (fields.next()) |field| {
+                if (findFirstStringForKeys(field.value_ptr.*, keys)) |text| return text;
+            }
+        },
+        .array => |array| {
+            for (array.items) |item| {
+                if (findFirstStringForKeys(item, keys)) |text| return text;
+            }
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn countUnifiedPatchLines(patch: []const u8, prefix: u8) i64 {
+    var count: i64 = 0;
+    var lines = std.mem.splitScalar(u8, patch, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0 or line[0] != prefix) continue;
+        if (line.len >= 3 and std.mem.eql(u8, line[0..3], if (prefix == '+') "+++" else "---")) continue;
+        count += 1;
+    }
+    return count;
+}
+
+const TestDiffCapture = struct {
+    count: usize = 0,
+    path: ?[]const u8 = null,
+    patch: ?[]const u8 = null,
+    additions: i64 = 0,
+    deletions: i64 = 0,
+
+    fn handle(context: ?*anyopaque, event: provider_types.StreamEvent) void {
+        const self: *TestDiffCapture = @ptrCast(@alignCast(context orelse return));
+        switch (event) {
+            .diff => |diff| {
+                if (diff.files.len == 0) return;
+                self.count += 1;
+                self.path = diff.files[0].path;
+                self.patch = diff.files[0].patch;
+                self.additions = diff.files[0].additions;
+                self.deletions = diff.files[0].deletions;
+            },
+            else => {},
+        }
+    }
+};
 
 fn handlePermissionRequest(
     allocator: std.mem.Allocator,
@@ -1688,6 +1762,21 @@ test "handleReadSessionUpdate combines consecutive role chunks" {
     try handleReadSessionUpdate(std.testing.allocator, parsed_two.value, &state);
     try std.testing.expectEqual(@as(usize, 1), state.messages.items.len);
     try std.testing.expectEqualStrings("hello", state.messages.items[0].body);
+}
+
+test "Cursor tool updates emit structured diff snapshots" {
+    const payload =
+        \\{"sessionUpdate":"tool_call_update","toolCall":{"input":{"filePath":"src/main.zig"},"output":{"patch":"--- a/src/main.zig\n+++ b/src/main.zig\n@@ -1 +1,2 @@\n-old\n+new\n+again"}}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+
+    var capture: TestDiffCapture = .{};
+    emitCursorDiffUpdate(parsed.value, &capture, TestDiffCapture.handle);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqualStrings("src/main.zig", capture.path.?);
+    try std.testing.expectEqual(@as(i64, 2), capture.additions);
+    try std.testing.expectEqual(@as(i64, 1), capture.deletions);
 }
 
 test "cursorToolEvent preserves status-only ACP lifecycle updates" {

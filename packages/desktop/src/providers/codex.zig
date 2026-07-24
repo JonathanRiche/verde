@@ -3026,10 +3026,26 @@ fn emitItemEvent(
     }
 
     if (std.mem.eql(u8, item_type, "fileChange")) {
-        if (!std.mem.eql(u8, method, "item/completed")) return true;
+        const call_id = getOptionalObjectString(item, "id") orelse "";
+        const status = getOptionalObjectString(item, "status") orelse if (started) "inProgress" else "completed";
+        const changes = getObjectField(item, "changes");
+        const input = if (changes) |value|
+            try buildImportedFileChangeSummaryAlloc(allocator, value)
+        else
+            null;
+        defer if (input) |text| allocator.free(text);
+        on_stream_event(context, .{ .tool_call = .{
+            .call_id = call_id,
+            .title = "",
+            .kind = .edit,
+            .status = if (started) .in_progress else toolCallStatusFromCodex(status),
+            .input = if (input) |text| if (text.len > 0) text else null else null,
+        } });
+        if (started) return true;
         if (buildFileChangeItemSummary(item, context, on_stream_event)) {
             return true;
         }
+        return true;
     }
 
     if (std.mem.eql(u8, item_type, "contextCompaction")) {
@@ -3341,7 +3357,8 @@ fn appendDiffFiles(value: std.json.Value, files: *std.ArrayList(provider_types.S
                     findFirstIntegerByField(value, "removedLines") orelse
                     findFirstIntegerByField(value, "removed") orelse
                     countDiffLines(value, '-');
-                const patch = findFirstStringByField(value, "diff");
+                const patch = findFirstStringByField(value, "diff") orelse
+                    findFirstStringByField(value, "patch");
 
                 appendOrReplaceDiffFile(files, .{
                     .path = path,
@@ -3664,9 +3681,14 @@ const TestStreamEventCapture = struct {
     tool_status: ?provider_types.ToolCallStatus = null,
     tool_input: ?[]const u8 = null,
     tool_output: ?[]const u8 = null,
+    diff_count: usize = 0,
+    diff_path: ?[]const u8 = null,
+    diff_patch: ?[]const u8 = null,
     tool_call_id_storage: [128]u8 = undefined,
     tool_input_storage: [1024]u8 = undefined,
     tool_output_storage: [1024]u8 = undefined,
+    diff_path_storage: [512]u8 = undefined,
+    diff_patch_storage: [2048]u8 = undefined,
 
     fn handle(context: ?*anyopaque, event: provider_types.StreamEvent) void {
         const self: *TestStreamEventCapture = @ptrCast(@alignCast(context orelse return));
@@ -3702,7 +3724,19 @@ const TestStreamEventCapture = struct {
                 }
                 self.tool_call_count += 1;
             },
-            .diff => {},
+            .diff => |diff| {
+                if (diff.files.len == 0) return;
+                const file = diff.files[0];
+                const path_len = @min(file.path.len, self.diff_path_storage.len);
+                @memcpy(self.diff_path_storage[0..path_len], file.path[0..path_len]);
+                self.diff_path = self.diff_path_storage[0..path_len];
+                if (file.patch) |patch| {
+                    const patch_len = @min(patch.len, self.diff_patch_storage.len);
+                    @memcpy(self.diff_patch_storage[0..patch_len], patch[0..patch_len]);
+                    self.diff_patch = self.diff_patch_storage[0..patch_len];
+                }
+                self.diff_count += 1;
+            },
         }
     }
 };
@@ -4153,6 +4187,53 @@ test "command execution emits lifecycle tool call updates" {
     try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.tool_status.?);
     try std.testing.expectEqualStrings("git status", capture.tool_input.?);
     try std.testing.expect(std.mem.indexOf(u8, capture.tool_output.?, "clean tree") != null);
+}
+
+test "turn diff notification emits file snapshots with patch aliases" {
+    const payload =
+        \\{"method":"turn/diff/updated","params":{"files":[{"path":"src/main.zig","patch":"--- a/src/main.zig\n+++ b/src/main.zig\n@@ -1 +1 @@\n-old\n+new"}]}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+
+    var capture: TestStreamEventCapture = .{};
+    try std.testing.expect(buildDiffSummary(parsed.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqual(@as(usize, 1), capture.diff_count);
+    try std.testing.expectEqualStrings("src/main.zig", capture.diff_path.?);
+    try std.testing.expect(std.mem.indexOf(u8, capture.diff_patch.?, "+new") != null);
+}
+
+test "file change items emit edit lifecycle and diff events" {
+    const payload =
+        \\{
+        \\  "method": "item/completed",
+        \\  "params": {
+        \\    "item": {
+        \\      "id": "call_apply_patch_1",
+        \\      "type": "fileChange",
+        \\      "status": "completed",
+        \\      "changes": [{
+        \\        "path": "/work/test.ts",
+        \\        "kind": {"type": "update"},
+        \\        "diff": "@@ -1 +1 @@\n-old\n+new\n"
+        \\      }]
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+
+    var capture: TestStreamEventCapture = .{};
+    try std.testing.expect(try emitItemEvent(std.testing.allocator, parsed.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expectEqual(@as(usize, 1), capture.tool_call_count);
+    try std.testing.expectEqualStrings("call_apply_patch_1", capture.tool_call_id.?);
+    try std.testing.expectEqual(provider_types.ToolCallKind.edit, capture.tool_kind.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.tool_status.?);
+    try std.testing.expect(std.mem.indexOf(u8, capture.tool_input.?, "/work/test.ts") != null);
+    try std.testing.expectEqual(@as(usize, 1), capture.diff_count);
+    try std.testing.expectEqualStrings("/work/test.ts", capture.diff_path.?);
+    try std.testing.expect(std.mem.indexOf(u8, capture.diff_patch.?, "+new") != null);
 }
 
 test "reasoning items emit transient think lifecycle tool call updates" {
