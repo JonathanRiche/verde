@@ -40,6 +40,11 @@ const ZOOM_ICON_FOREGROUND_MIX: f32 = 0.30;
 const ZOOM_BORDER_FOREGROUND_MIX: f32 = 0.60;
 const DONE_PULSE_PERIOD_MS: i64 = 2800;
 const WORKING_PULSE_PERIOD_MS: i64 = 2200;
+const QUICK_PANE_MIN_W_CSS: f32 = 320.0;
+const QUICK_PANE_MIN_H_CSS: f32 = 220.0;
+const QUICK_PANE_MARGIN_CSS: f32 = 12.0;
+const QUICK_PANE_DRAG_H_CSS: f32 = 28.0;
+const QUICK_PANE_RESIZE_GRIP_CSS: f32 = 18.0;
 
 // Font Awesome glyphs bundled in SymbolsNerdFontMono and rendered with Palette's icon role.
 const NF_FA_EXPAND = "\u{F065}";
@@ -68,6 +73,8 @@ const WorkspacePaneAction = enum {
     split_terminal_down,
     close,
     resize_split,
+    move_quick_pane,
+    resize_quick_pane,
 };
 
 const WorkspacePaneHit = struct {
@@ -86,6 +93,15 @@ const WorkspacePaneHitCache = struct {
 
 var hit_cache: WorkspacePaneHitCache = .{};
 var resize_drag: ?WorkspacePaneHit = null;
+const QuickPaneDragKind = enum { move, resize };
+const QuickPaneDrag = struct {
+    kind: QuickPaneDragKind,
+    start_x: f32,
+    start_y: f32,
+    start: runtime.FloatingPaneGeometry,
+    workspace: palette.Rect,
+};
+var quick_pane_drag: ?QuickPaneDrag = null;
 var split_menu_open_for: ?runtime.WorkspacePaneId = null;
 var split_menu_rect: palette.Rect = .{};
 var split_submenu_rect: palette.Rect = .{};
@@ -124,6 +140,7 @@ var last_pane_drop_target: ?ThreadDropTarget = null;
 
 var pane_rect_count: usize = 0;
 var pane_rects: [MAX_WORKSPACE_PANE_RECTS]WorkspacePaneRect = undefined;
+var last_workspace_rect: palette.Rect = .{};
 var browser_pane_rendered: bool = false;
 
 var focus_prev_id: ?runtime.WorkspacePaneId = null;
@@ -497,6 +514,7 @@ fn focusBorderAlpha(pane_id: runtime.WorkspacePaneId) f32 {
 }
 
 pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
+    last_workspace_rect = rect;
     state.ensureCurrentProjectWorkspace();
     state.debug_workspace_visible_pane_count = state.currentProjectWorkspaceVisiblePaneCount();
     tickFocusAnimation(state);
@@ -510,20 +528,67 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
 
     if (state.currentProjectWorkspaceMaximizedPaneId()) |pane_id| {
         renderLeaf(state, pane_id, rect);
-        renderSplitMenuOverlay(state, rect);
-        if (!browser_pane_rendered) state.noteBrowserPaneNotRendered();
-        return;
-    }
-    if (state.currentProjectWorkspaceRoot()) |root| {
+    } else if (state.currentProjectWorkspaceRoot()) |root| {
         renderNode(state, root, rect);
-        renderSplitMenuOverlay(state, rect);
-        if (!browser_pane_rendered) state.noteBrowserPaneNotRendered();
-        return;
+    } else {
+        chat_panel.renderWorkspaceAt(state, rect);
     }
 
-    chat_panel.renderWorkspaceAt(state, rect);
+    renderQuickPane(state, rect);
     renderSplitMenuOverlay(state, rect);
     if (!browser_pane_rendered) state.noteBrowserPaneNotRendered();
+}
+
+// Floating quick-pane overlay above the unchanged tiled workspace.
+fn renderQuickPane(state: *runtime.AppState, workspace_rect: palette.Rect) void {
+    const quick = state.currentProjectQuickPane() orelse return;
+    if (!quick.visible) return;
+    if (!quick.pinned) {
+        queueRect(state, workspace_rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL, 92)));
+    }
+    const rect = quickPaneRect(quick, workspace_rect);
+    queueRect(state, .{
+        .x = rect.x - theme.scaledUi(2.0),
+        .y = rect.y - theme.scaledUi(2.0),
+        .w = rect.w + theme.scaledUi(4.0),
+        .h = rect.h + theme.scaledUi(4.0),
+    }, paletteColor(theme.withAlpha(theme.COLOR_PANEL, 210)));
+    renderLeaf(state, quick.pane_id, rect);
+
+    const drag_h = theme.scaledUi(QUICK_PANE_DRAG_H_CSS);
+    appendHit(.{
+        .pane_id = quick.pane_id,
+        .action = .move_quick_pane,
+        .rect = .{ .x = rect.x, .y = rect.y, .w = @max(0.0, rect.w - theme.scaledUi(112.0)), .h = drag_h },
+    });
+    if (!quick.maximized) {
+        const grip = theme.scaledUi(QUICK_PANE_RESIZE_GRIP_CSS);
+        appendHit(.{
+            .pane_id = quick.pane_id,
+            .action = .resize_quick_pane,
+            .rect = .{ .x = rect.x + rect.w - grip, .y = rect.y + rect.h - grip, .w = grip, .h = grip },
+        });
+        queueBorder(state, rect, paletteColor(theme.accent()), theme.scaledUi(6.0), theme.scaledUi(2.0));
+    }
+}
+
+fn quickPaneRect(quick: runtime.FloatingQuickPane, workspace: palette.Rect) palette.Rect {
+    const margin = theme.scaledUi(QUICK_PANE_MARGIN_CSS);
+    if (quick.maximized) {
+        return .{
+            .x = workspace.x + margin,
+            .y = workspace.y + margin,
+            .w = @max(1.0, workspace.w - margin * 2.0),
+            .h = @max(1.0, workspace.h - margin * 2.0),
+        };
+    }
+    const min_w = @min(theme.scaledUi(QUICK_PANE_MIN_W_CSS), @max(1.0, workspace.w - margin * 2.0));
+    const min_h = @min(theme.scaledUi(QUICK_PANE_MIN_H_CSS), @max(1.0, workspace.h - margin * 2.0));
+    const w = std.math.clamp(workspace.w * quick.geometry.w, min_w, @max(min_w, workspace.w - margin * 2.0));
+    const h = std.math.clamp(workspace.h * quick.geometry.h, min_h, @max(min_h, workspace.h - margin * 2.0));
+    const x = std.math.clamp(workspace.x + workspace.w * quick.geometry.x, workspace.x + margin, workspace.x + workspace.w - w - margin);
+    const y = std.math.clamp(workspace.y + workspace.h * quick.geometry.y, workspace.y + margin, workspace.y + workspace.h - h - margin);
+    return .{ .x = x, .y = y, .w = w, .h = h };
 }
 
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, down: bool, ctrl_down: bool, shift_down: bool) bool {
@@ -570,6 +635,10 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
     }
     if (button != 1) return false;
     if (!down) {
+        if (quick_pane_drag != null) {
+            quick_pane_drag = null;
+            return true;
+        }
         if (pane_drag.pending or pane_drag.active) return finishPaneDrag(state, x, y);
         if (resize_drag != null) {
             resize_drag = null;
@@ -654,6 +723,17 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
                 resize_drag = hit;
                 updateResizeDrag(state, hit, x, y);
             },
+            .move_quick_pane, .resize_quick_pane => {
+                const quick = state.currentProjectQuickPane() orelse return false;
+                quick_pane_drag = .{
+                    .kind = if (hit.action == .move_quick_pane) .move else .resize,
+                    .start_x = x,
+                    .start_y = y,
+                    .start = quick.geometry,
+                    .workspace = last_workspace_rect,
+                };
+                _ = state.focusCurrentProjectWorkspacePane(hit.pane_id);
+            },
         }
         return true;
     }
@@ -678,6 +758,10 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
 /// Handles pane chrome before browser and terminal content can consume its click.
 pub fn handlePaneChromeMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, down: bool) bool {
     if (button != 1) return false;
+    if (!down and quick_pane_drag != null) {
+        quick_pane_drag = null;
+        return true;
+    }
     var i: usize = hit_cache.count;
     while (i > 0) {
         i -= 1;
@@ -689,6 +773,19 @@ pub fn handlePaneChromeMouseButton(state: *runtime.AppState, x: f32, y: f32, but
             },
             .toggle_split_menu => {
                 if (down) toggleSplitMenu(state, hit);
+            },
+            .move_quick_pane, .resize_quick_pane => {
+                if (down) {
+                    const quick = state.currentProjectQuickPane() orelse return false;
+                    quick_pane_drag = .{
+                        .kind = if (hit.action == .move_quick_pane) .move else .resize,
+                        .start_x = x,
+                        .start_y = y,
+                        .start = quick.geometry,
+                        .workspace = last_workspace_rect,
+                    };
+                    _ = state.focusCurrentProjectWorkspacePane(hit.pane_id);
+                }
             },
             else => continue,
         }
@@ -725,6 +822,23 @@ pub fn wantsPointerAt(x: f32, y: f32) bool {
 }
 
 pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32, ctrl_down: bool) bool {
+    if (quick_pane_drag) |drag| {
+        const dx = (x - drag.start_x) / @max(drag.workspace.w, 1.0);
+        const dy = (y - drag.start_y) / @max(drag.workspace.h, 1.0);
+        var geometry = drag.start;
+        switch (drag.kind) {
+            .move => {
+                geometry.x += dx;
+                geometry.y += dy;
+            },
+            .resize => {
+                geometry.w += dx;
+                geometry.h += dy;
+            },
+        }
+        state.setCurrentProjectQuickPaneGeometry(geometry);
+        return true;
+    }
     if (pane_drag.pending or pane_drag.active) {
         if (!ctrl_down) {
             cancelPaneDrag();
@@ -741,8 +855,9 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32, ctrl_d
     // Focus-follows-mouse: hovering into a pane focuses it. Skip while a split
     // menu is open and the cursor is inside that menu so the open pane stays put.
     if (split_menu_open_for != null and (rectContains(split_menu_rect, x, y) or rectContains(split_submenu_rect, x, y))) return false;
-    var i: usize = 0;
-    while (i < pane_rect_count) : (i += 1) {
+    var i: usize = pane_rect_count;
+    while (i > 0) {
+        i -= 1;
         const entry = pane_rects[i];
         if (!rectContains(entry.rect, x, y)) continue;
         if (state.isCurrentProjectWorkspacePaneFocused(entry.pane_id)) return false;
