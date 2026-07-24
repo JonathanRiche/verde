@@ -19,6 +19,8 @@ pub const Control = enum(u8) {
     tool_groups_collapsed,
     tool_groups_expanded,
     tool_groups_remember_last,
+    diff_layout_stacked,
+    diff_layout_split,
     automatic_chat_titles,
     chat_title_provider_dropdown,
     chat_title_model_dropdown,
@@ -121,6 +123,8 @@ const SettingsLayout = struct {
     tool_groups_collapsed: palette.Rect,
     tool_groups_expanded: palette.Rect,
     tool_groups_remember_last: palette.Rect,
+    diff_layout_stacked: palette.Rect,
+    diff_layout_split: palette.Rect,
     chat_card: palette.Rect,
     automatic_chat_titles: palette.Rect,
     chat_title_provider_dropdown: palette.Rect,
@@ -253,7 +257,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const custom_extra: f32 = if (state.settings_draft.open_action == .custom) m.row_h + m.inner_gap else 0.0;
 
     const appearance_h = m.labeledBlockH(2);
-    const transcript_h = m.labeledBlockH(1);
+    const transcript_h = m.card_pad * 2.0 + m.title_h + m.row_gap +
+        m.label_h + m.inner_gap + m.row_h + m.row_gap +
+        m.label_h + m.inner_gap + m.row_h;
     const chat_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h + m.row_gap + m.label_h + m.inner_gap + m.row_h;
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra + m.row_gap + m.label_h + m.inner_gap + m.row_h;
@@ -329,6 +335,10 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const tool_groups_collapsed: palette.Rect = .{ .x = transcript_card.x + m.card_pad, .y = tool_group_y, .w = tool_group_w, .h = m.row_h };
     const tool_groups_expanded: palette.Rect = .{ .x = tool_groups_collapsed.x + tool_group_w + m.inner_gap, .y = tool_group_y, .w = tool_group_w, .h = m.row_h };
     const tool_groups_remember_last: palette.Rect = .{ .x = tool_groups_expanded.x + tool_group_w + m.inner_gap, .y = tool_group_y, .w = tool_group_w, .h = m.row_h };
+    const diff_layout_y = tool_group_y + m.row_h + m.row_gap + m.label_h + m.inner_gap;
+    const diff_layout_w = (content_w - m.card_pad * 2.0) * 0.5;
+    const diff_layout_stacked: palette.Rect = .{ .x = transcript_card.x + m.card_pad, .y = diff_layout_y, .w = diff_layout_w, .h = m.row_h };
+    const diff_layout_split: palette.Rect = .{ .x = diff_layout_stacked.x + diff_layout_w, .y = diff_layout_y, .w = diff_layout_w, .h = m.row_h };
 
     y += transcript_h + m.card_gap;
 
@@ -468,6 +478,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .tool_groups_collapsed = tool_groups_collapsed,
         .tool_groups_expanded = tool_groups_expanded,
         .tool_groups_remember_last = tool_groups_remember_last,
+        .diff_layout_stacked = diff_layout_stacked,
+        .diff_layout_split = diff_layout_split,
         .chat_card = chat_card,
         .automatic_chat_titles = automatic_chat_titles,
         .chat_title_provider_dropdown = chat_title_provider_dropdown,
@@ -652,6 +664,8 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.tool_groups_collapsed, layout.body_clip, .tool_groups_collapsed, queue_hit);
     queueControlHit(state, layout.tool_groups_expanded, layout.body_clip, .tool_groups_expanded, queue_hit);
     queueControlHit(state, layout.tool_groups_remember_last, layout.body_clip, .tool_groups_remember_last, queue_hit);
+    queueControlHit(state, layout.diff_layout_stacked, layout.body_clip, .diff_layout_stacked, queue_hit);
+    queueControlHit(state, layout.diff_layout_split, layout.body_clip, .diff_layout_split, queue_hit);
     queueControlHit(state, layout.automatic_chat_titles, layout.body_clip, .automatic_chat_titles, queue_hit);
     queueControlHit(state, layout.chat_title_provider_dropdown, layout.body_clip, .chat_title_provider_dropdown, queue_hit);
     queueControlHit(state, layout.chat_title_model_dropdown, layout.body_clip, .chat_title_model_dropdown, queue_hit);
@@ -723,6 +737,13 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     drawToggleCell(state, layout.tool_groups_collapsed, "Collapsed", state.settings_draft.tool_call_group_preference == .collapsed, isControlHovered(state, .tool_groups_collapsed), layout.body_clip);
     drawToggleCell(state, layout.tool_groups_expanded, "Expanded", state.settings_draft.tool_call_group_preference == .expanded, isControlHovered(state, .tool_groups_expanded), layout.body_clip);
     drawToggleCell(state, layout.tool_groups_remember_last, "Remember last", state.settings_draft.tool_call_group_preference == .remember_last, isControlHovered(state, .tool_groups_remember_last), layout.body_clip);
+    queueText(state, .{
+        .x = layout.diff_layout_stacked.x,
+        .y = layout.diff_layout_stacked.y - m.inner_gap - m.label_h,
+        .w = layout.diff_layout_stacked.w + layout.diff_layout_split.w,
+        .h = m.label_h,
+    }, "Diff layout", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    drawSegmentedPair(state, layout.diff_layout_stacked, layout.diff_layout_split, "Stacked", "Split", state.settings_draft.diff_layout_preference == .stacked, isControlHovered(state, .diff_layout_stacked), isControlHovered(state, .diff_layout_split), layout.body_clip);
 
     // Chat titles
     drawCardTitle(state, layout.chat_card, "Chat", layout.body_clip);
@@ -1046,6 +1067,8 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .tool_groups_collapsed => state.settings_draft.tool_call_group_preference = .collapsed,
         .tool_groups_expanded => state.settings_draft.tool_call_group_preference = .expanded,
         .tool_groups_remember_last => state.settings_draft.tool_call_group_preference = .remember_last,
+        .diff_layout_stacked => state.settings_draft.diff_layout_preference = .stacked,
+        .diff_layout_split => state.settings_draft.diff_layout_preference = .split,
         .automatic_chat_titles => state.settings_draft.automatic_chat_titles_enabled = !state.settings_draft.automatic_chat_titles_enabled,
         .chat_title_provider_dropdown => {
             state.settings_title_provider_dropdown_open = !state.settings_title_provider_dropdown_open;

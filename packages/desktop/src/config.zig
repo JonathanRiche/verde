@@ -82,6 +82,11 @@ pub const ToolCallGroupPreference = enum {
     remember_last,
 };
 
+pub const DiffLayoutPreference = enum {
+    stacked,
+    split,
+};
+
 pub const NewChatPaneBehavior = enum {
     new_pane,
     replace_pane,
@@ -127,6 +132,7 @@ pub const AppConfig = struct {
     terminal_launch_profiles: []TerminalLaunchProfileConfig = &.{},
     tool_call_group_preference: ToolCallGroupPreference = .collapsed,
     tool_call_groups_last_expanded: bool = false,
+    diff_layout_preference: DiffLayoutPreference = .stacked,
     automatic_chat_titles_enabled: bool = true,
     chat_title_provider: ChatTitleProvider = .codex,
     chat_title_model: ?[]u8 = null,
@@ -467,6 +473,7 @@ fn writeTranscriptSection(allocator: std.mem.Allocator, object: *std.json.Object
     };
     try transcript_object.put(allocator, "tool_call_groups", .{ .string = preference });
     try transcript_object.put(allocator, "tool_call_groups_last_expanded", .{ .bool = config.tool_call_groups_last_expanded });
+    try transcript_object.put(allocator, "diff_layout", .{ .string = @tagName(config.diff_layout_preference) });
 }
 
 fn writeChatSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
@@ -576,6 +583,19 @@ fn applyTranscriptOverrides(config: *AppConfig, transcript_value: std.json.Value
             config.tool_call_groups_last_expanded = last_value.bool;
         } else {
             log.warn("transcript.tool_call_groups_last_expanded must be a boolean when provided", .{});
+        }
+    }
+    if (transcript_value.object.get("diff_layout")) |layout_value| {
+        if (layout_value == .string) {
+            if (std.mem.eql(u8, layout_value.string, "split")) {
+                config.diff_layout_preference = .split;
+            } else if (std.mem.eql(u8, layout_value.string, "stacked")) {
+                config.diff_layout_preference = .stacked;
+            } else {
+                log.warn("transcript.diff_layout must be stacked or split", .{});
+            }
+        } else {
+            log.warn("transcript.diff_layout must be a string when provided", .{});
         }
     }
 }
@@ -1201,6 +1221,17 @@ test "app config accepts tool call group preference" {
 
     try std.testing.expectEqual(ToolCallGroupPreference.remember_last, config.tool_call_group_preference);
     try std.testing.expect(config.tool_call_groups_last_expanded);
+}
+
+test "app config accepts diff layout preference" {
+    var root = try parseTestRoot("{\"transcript\":{\"diff_layout\":\"split\"}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(DiffLayoutPreference.split, config.diff_layout_preference);
 }
 
 test "app config accepts custom open default" {
