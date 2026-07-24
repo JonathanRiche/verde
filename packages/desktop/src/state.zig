@@ -10,6 +10,7 @@ const ai_harness = @import("harness.zig");
 const browser_inspector = @import("browser/inspector.zig");
 const browser_runtime = @import("browser/mod.zig");
 const browser_screenshot = @import("browser/screenshot.zig");
+const bang_commands = @import("bang_commands.zig");
 const chat_threads = @import("chat/threads.zig");
 const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
@@ -676,6 +677,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
     const state = appStateFromContext(context) orelse return;
     switch (event) {
         .text_changed => |text| {
+            state.bang_history_message_index = null;
             state.setDraft(text);
             state.updateFileSearch();
             state.clampSlashCommandPickerSelection();
@@ -686,6 +688,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
                 return;
             }
             if (state.acceptPrimaryFileSearchResult()) return;
+            if (state.handleBangCommandSubmission()) return;
             if (state.handleWorkspaceCommand(state.currentProject().currentDraft())) return;
             if (state.handleProviderSlashCommand(state.currentProject().currentDraft())) return;
             state.sendDraft() catch |err| {
@@ -1891,6 +1894,9 @@ pub const ChatThread = struct {
         freePendingTimelineEvents(std.heap.page_allocator, &self.send_state.pending_events);
         freePendingDiffFiles(std.heap.page_allocator, &self.send_state.pending_diff_files);
         freePendingApproval(std.heap.page_allocator, &self.send_state.pending_approval);
+        if (self.send_state.local_command_text) |value| std.heap.page_allocator.free(value);
+        if (self.send_state.local_command_cwd) |value| std.heap.page_allocator.free(value);
+        if (self.send_state.local_command_shell) |value| std.heap.page_allocator.free(value);
         allocator.destroy(self.send_state);
     }
 
@@ -4605,6 +4611,13 @@ pub const SendState = struct {
     stop_requested: bool = false,
     stop_signal_sent: bool = false,
     worker: ?std.Thread = null,
+    /// Local bang commands reuse the chat's single in-flight lane, but never
+    /// enter an AI provider or acquire a provider thread id.
+    local_command: bool = false,
+    local_command_text: ?[]u8 = null,
+    local_command_cwd: ?[]u8 = null,
+    local_command_shell: ?[]u8 = null,
+    active_local_child: ?*platform_process.OwnedChild = null,
 };
 pub const TitleGenerationStatus = enum {
     idle,
@@ -4664,6 +4677,191 @@ pub const SendResultPayload = struct {
     provider_thread_id: []const u8,
     reply_text: []const u8,
 };
+
+const BangCommandRequest = struct {
+    send_state: *SendState,
+    command: []u8,
+    cwd: []u8,
+    require_confirmation: bool,
+};
+
+const BangPipeReader = struct {
+    send_state: *SendState,
+    file: std.Io.File,
+    label: []const u8,
+};
+
+fn bangPipeReader(context: BangPipeReader) void {
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    var read_buffer: [16 * 1024]u8 = undefined;
+    var reader = context.file.reader(threaded.io(), &read_buffer);
+    var first_chunk = true;
+    while (true) {
+        var chunk_buffer: [4096]u8 = undefined;
+        const count = reader.interface.readSliceShort(&chunk_buffer) catch break;
+        if (count == 0) break;
+        context.send_state.mutex.lock();
+        if (context.send_state.partial_text.items.len < 2 * 1024 * 1024) {
+            if (first_chunk) {
+                context.send_state.partial_text.appendSlice(std.heap.page_allocator, context.label) catch {};
+                first_chunk = false;
+            }
+            context.send_state.partial_text.appendSlice(std.heap.page_allocator, chunk_buffer[0..count]) catch {};
+            context.send_state.ui_revision +%= 1;
+        }
+        context.send_state.mutex.unlock();
+        loop_wakeup.notify();
+    }
+}
+
+fn bangCommandWorker(request: *BangCommandRequest) void {
+    const page_alloc = std.heap.page_allocator;
+    defer {
+        page_alloc.free(request.command);
+        page_alloc.free(request.cwd);
+        page_alloc.destroy(request);
+    }
+    const state = request.send_state;
+
+    if (request.require_confirmation) {
+        state.mutex.lock();
+        while (state.status == .pending and state.approval_decision == null and !state.stop_requested) {
+            state.condition.wait(&state.mutex);
+        }
+        const approved = state.approval_decision == .approve and !state.stop_requested;
+        state.approval_decision = null;
+        state.mutex.unlock();
+        if (!approved) {
+            state.mutex.lock();
+            state.status = .aborted;
+            state.mutex.unlock();
+            loop_wakeup.notify();
+            return;
+        }
+    }
+
+    var threaded: std.Io.Threaded = .init(page_alloc, .{});
+    defer threaded.deinit();
+    const argv = bang_commands.shellArgv(request.command);
+    const child_ptr = page_alloc.create(platform_process.OwnedChild) catch {
+        state.mutex.lock();
+        state.status = .failed;
+        state.error_message = std.fmt.allocPrint(page_alloc, "Could not start command.", .{}) catch null;
+        state.mutex.unlock();
+        loop_wakeup.notify();
+        return;
+    };
+    child_ptr.* = platform_process.spawn(page_alloc, threaded.io(), .{
+        .argv = &argv,
+        .cwd = .{ .path = request.cwd },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch |err| {
+        page_alloc.destroy(child_ptr);
+        state.mutex.lock();
+        state.status = .failed;
+        state.error_message = std.fmt.allocPrint(page_alloc, "Could not start command: {s}", .{@errorName(err)}) catch null;
+        state.mutex.unlock();
+        loop_wakeup.notify();
+        return;
+    };
+
+    state.mutex.lock();
+    state.active_local_child = child_ptr;
+    const stop_before_register = state.stop_requested;
+    state.mutex.unlock();
+    if (stop_before_register) child_ptr.terminateTree();
+
+    const stdout_thread = std.Thread.spawn(.{}, bangPipeReader, .{BangPipeReader{
+        .send_state = state,
+        .file = child_ptr.child.stdout.?,
+        .label = "stdout:\n",
+    }}) catch null;
+    const stderr_thread = std.Thread.spawn(.{}, bangPipeReader, .{BangPipeReader{
+        .send_state = state,
+        .file = child_ptr.child.stderr.?,
+        .label = "\nstderr:\n",
+    }}) catch null;
+    const term = child_ptr.wait(threaded.io()) catch null;
+    if (stdout_thread) |worker| worker.join();
+    if (stderr_thread) |worker| worker.join();
+    child_ptr.child.stdout = null;
+    child_ptr.child.stderr = null;
+
+    state.mutex.lock();
+    state.active_local_child = null;
+    const cancelled = state.stop_requested;
+    const duration_ms = @max(unixTimestampMs() - state.started_at_ms, 0);
+    const output = state.partial_text.items;
+    const exit_code: ?u8 = if (term) |value| switch (value) {
+        .exited => |code| code,
+        else => null,
+    } else null;
+    const status: ai_harness.ToolCallStatus = if (cancelled)
+        .cancelled
+    else if (exit_code != null and exit_code.? == 0)
+        .completed
+    else
+        .failed;
+    const author = if (status == .completed) "Ran command" else "Command failed";
+    var exit_buffer: [16]u8 = undefined;
+    const exit_label = if (exit_code) |code|
+        std.fmt.bufPrint(&exit_buffer, "{d}", .{code}) catch "unknown"
+    else
+        "terminated";
+    const body = std.fmt.allocPrint(page_alloc, "$ {s}\n\nWorkspace: {s}\nShell: {s}\nExit: {s}\nDuration: {d} ms\nStatus: {s}\n\n{s}", .{
+        request.command,
+        request.cwd,
+        bang_commands.shellName(),
+        exit_label,
+        duration_ms,
+        if (cancelled) "cancelled" else "finished",
+        if (output.len > 0) output else "(no output)",
+    }) catch null;
+    if (body) |owned_body| {
+        if (page_alloc.dupe(u8, author)) |owned_author| {
+            if (state.pending_events.items.len > 0) {
+                const event = &state.pending_events.items[0];
+                page_alloc.free(event.author);
+                page_alloc.free(event.body);
+                event.author = owned_author;
+                event.body = owned_body;
+                event.tool_call_status = status;
+            } else {
+                state.pending_events.append(page_alloc, .{
+                    .role = .system,
+                    .author = owned_author,
+                    .body = owned_body,
+                    .tool_call_kind = .execute,
+                    .tool_call_status = status,
+                    .tool_call_title = page_alloc.dupe(u8, request.command) catch null,
+                }) catch {
+                    page_alloc.free(owned_author);
+                    page_alloc.free(owned_body);
+                };
+            }
+        } else |_| {
+            page_alloc.free(owned_body);
+        }
+    }
+    state.partial_text.clearRetainingCapacity();
+    const empty_thread = page_alloc.dupe(u8, "") catch null;
+    const empty_reply = page_alloc.dupe(u8, "") catch null;
+    if (empty_thread != null and empty_reply != null) {
+        state.result = .{ .provider_thread_id = empty_thread.?, .reply_text = empty_reply.? };
+        state.status = if (cancelled) .aborted else .completed;
+    } else {
+        if (empty_thread) |value| page_alloc.free(value);
+        if (empty_reply) |value| page_alloc.free(value);
+        state.status = .failed;
+    }
+    state.ui_revision +%= 1;
+    state.mutex.unlock();
+    page_alloc.destroy(child_ptr);
+    loop_wakeup.notify();
+}
 
 const InitialSendSnapshot = struct {
     message_count: usize,
@@ -4756,6 +4954,7 @@ pub const AppState = struct {
     sidebar_hidden: bool,
     sidebar_hover_revealed: bool,
     composer_focused: bool,
+    bang_history_message_index: ?usize,
     composer_input_nonce: u32,
     composer_input_bounds_valid: bool,
     composer_input_min: [2]f32,
@@ -5088,6 +5287,7 @@ pub const AppState = struct {
             .sidebar_hidden = false,
             .sidebar_hover_revealed = false,
             .composer_focused = false,
+            .bang_history_message_index = null,
             .composer_input_nonce = 0,
             .composer_input_bounds_valid = false,
             .composer_input_min = .{ 0.0, 0.0 },
@@ -8689,6 +8889,117 @@ pub const AppState = struct {
         return .{ .remote_ssh = .{ .host = link.remote_alias, .cwd = remote_cwd } };
     }
 
+    fn handleBangCommandSubmission(self: *AppState) bool {
+        const draft = self.currentDraft();
+        switch (bang_commands.classifySubmission(draft)) {
+            .message => |message| {
+                if (message.ptr == draft.ptr) return false;
+                self.setDraft(message);
+                self.syncPaletteComposerFromDraft();
+                return false;
+            },
+            .command => |command| self.beginBangCommand(command) catch |err| {
+                log.err("failed to begin bang command: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Could not start the workspace command.");
+                return true;
+            },
+        }
+        return true;
+    }
+
+    fn beginBangCommand(self: *AppState, command: []const u8) !void {
+        const thread = self.currentThreadMutable();
+        if (thread.draftImageCount() > 0) {
+            self.setSidebarNotice("Remove image attachments before running a bang command.");
+            return;
+        }
+        if (thread.isSendPending()) {
+            self.setSidebarNotice("This chat already has a running command or provider request.");
+            return;
+        }
+
+        if (!thread.committed) try thread.commitFromPrompt(self.allocator, command);
+        const submitted = try std.fmt.allocPrint(self.allocator, "!{s}", .{command});
+        defer self.allocator.free(submitted);
+        try self.appendMessageToThread(thread, .user, "You", submitted, null, &.{});
+
+        const page_alloc = std.heap.page_allocator;
+        const destructive = bang_commands.looksDestructive(command);
+        const require_confirmation = destructive or thread.access_mode == .supervised;
+        const state = thread.send_state;
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        state.status = .pending;
+        state.started_at_ms = unixTimestampMs();
+        state.result = null;
+        state.error_message = null;
+        state.provider = null;
+        state.local_command = true;
+        state.local_command_text = try page_alloc.dupe(u8, command);
+        state.local_command_cwd = try page_alloc.dupe(u8, self.currentProject().path);
+        state.local_command_shell = try page_alloc.dupe(u8, bang_commands.shellName());
+        state.partial_text.clearRetainingCapacity();
+        freePendingTimelineEventsLocked(page_alloc, &state.pending_events);
+        const preflight_body = try std.fmt.allocPrint(page_alloc, "$ {s}\n\nWorkspace: {s}\nShell: {s}\nWorking directory: {s}\nStatus: waiting to run", .{
+            command,
+            self.currentProject().label,
+            bang_commands.shellName(),
+            self.currentProject().path,
+        });
+        try state.pending_events.append(page_alloc, .{
+            .role = .system,
+            .author = try page_alloc.dupe(u8, "Running command"),
+            .body = preflight_body,
+            .tool_call_kind = .execute,
+            .tool_call_status = .in_progress,
+            .tool_call_title = try page_alloc.dupe(u8, command),
+        });
+        freePendingApprovalLocked(page_alloc, &state.pending_approval);
+        state.approval_decision = null;
+        state.stop_requested = false;
+        state.stop_signal_sent = false;
+        state.ui_revision +%= 1;
+        state.polled_ui_revision = 0;
+        state.polled_working_seconds = -1;
+
+        if (require_confirmation) {
+            const body = try std.fmt.allocPrint(page_alloc, "Command: {s}\nWorkspace: {s}\nShell: {s}\nWorking directory: {s}\nPolicy: {s}", .{
+                command,
+                self.currentProject().label,
+                bang_commands.shellName(),
+                self.currentProject().path,
+                if (destructive) "destructive command; explicit approval required" else "Supervised workspace; approval required",
+            });
+            state.pending_approval = .{
+                .call_id = try page_alloc.dupe(u8, "bang-command"),
+                .title = try page_alloc.dupe(u8, if (destructive) "Confirm destructive command" else "Confirm workspace command"),
+                .body = body,
+            };
+        }
+
+        const request = try page_alloc.create(BangCommandRequest);
+        request.* = .{
+            .send_state = state,
+            .command = try page_alloc.dupe(u8, command),
+            .cwd = try page_alloc.dupe(u8, self.currentProject().path),
+            .require_confirmation = require_confirmation,
+        };
+        state.worker = try std.Thread.spawn(.{}, bangCommandWorker, .{request});
+        self.pending_send_count += 1;
+        self.clearDraft();
+        self.resetComposerInputWidget();
+        self.requestTranscriptScrollToBottom();
+        self.flushDirtyNow();
+        self.setSidebarNotice(if (require_confirmation) "Command is waiting for approval." else "Running workspace command...");
+    }
+
+    pub fn retryBangCommand(self: *AppState, command: []const u8) void {
+        self.beginBangCommand(command) catch |err| {
+            log.err("failed to retry bang command: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Could not retry the workspace command.");
+        };
+    }
+
     pub fn sendDraft(self: *AppState) !void {
         const draft = self.currentDraft();
         const draft_image = self.currentThread().draft_image;
@@ -8789,11 +9100,12 @@ pub const AppState = struct {
         }
 
         send_state.stop_requested = true;
+        if (send_state.active_local_child) |child| child.terminateTree();
         if (send_state.pending_approval != null) {
             send_state.approval_decision = .deny;
             send_state.condition.broadcast();
         }
-        self.setSidebarNotice("Stopping provider reply...");
+        self.setSidebarNotice(if (send_state.local_command) "Stopping command..." else "Stopping provider reply...");
     }
 
     pub fn queueOrSteerDraftDuringSend(self: *AppState) void {
@@ -11860,6 +12172,29 @@ pub const AppState = struct {
 
     pub fn currentThreadDraft(self: *const AppState) []const u8 {
         return self.currentDraft();
+    }
+
+    pub fn composerInBangCommandMode(self: *const AppState) bool {
+        return self.projects.items.len > 0 and bang_commands.isShellMode(self.currentDraft());
+    }
+
+    pub fn bangCommandShellName(_: *const AppState) []const u8 {
+        return bang_commands.shellName();
+    }
+
+    pub fn currentWorkspacePath(self: *const AppState) []const u8 {
+        return if (self.projects.items.len > 0) self.currentProject().path else "";
+    }
+
+    fn escapeBangCommandMode(self: *AppState) bool {
+        if (!self.composerInBangCommandMode()) return false;
+        const escaped = bang_commands.escapedShellDraft(self.currentDraft());
+        self.setDraft(escaped);
+        self.syncPaletteComposerFromDraft();
+        self.bang_history_message_index = null;
+        self.setSidebarNotice("Returned to chat mode. Draft preserved.");
+        self.noteInteraction();
+        return true;
     }
 
     /// Shared provider → logo texture lookup for pickers/pills; returns null
@@ -17642,7 +17977,13 @@ pub const AppState = struct {
         self.palette_composer.setShowFastToggle(false);
         self.palette_composer.setShowAccessToggle(false);
         const hide_placeholder = thread.draftImageCount() > 0;
-        self.palette_composer.setPlaceholder(self.allocator, if (!hide_placeholder) "Ask anything, or use / to show available commands" else " ") catch |err| {
+        const placeholder = if (self.composerInBangCommandMode())
+            "Enter a shell command..."
+        else if (!hide_placeholder)
+            "Ask anything, or use / to show available commands"
+        else
+            " ";
+        self.palette_composer.setPlaceholder(self.allocator, placeholder) catch |err| {
             log.warn("failed to sync palette composer placeholder: {s}", .{@errorName(err)});
         };
         const model_options = composerModelOptions(self, thread.provider);
@@ -18184,6 +18525,7 @@ pub const AppState = struct {
                 self.noteInteraction();
                 return true;
             }
+            if (self.escapeBangCommandMode()) return true;
         }
         if (self.terminal_focused) return false;
         // Ctrl+1..9 selects the picker's shortcut-chip rows. Digits never
@@ -18216,6 +18558,10 @@ pub const AppState = struct {
         }
         if (!self.palette_composer.focused) return false;
         if (self.routeSlashCommandPickerKey(palette_key)) return true;
+        if (self.recallBangCommand(palette_key)) {
+            self.noteInteraction();
+            return true;
+        }
         if (self.handlePaletteComposerNavigationKey(palette_key)) {
             self.noteInteraction();
             return true;
@@ -18229,6 +18575,41 @@ pub const AppState = struct {
             self.noteInteraction();
         }
         return handled;
+    }
+
+    fn recallBangCommand(self: *AppState, key: palette.Key) bool {
+        if (key.primary or key.shift or key.alt) return false;
+        if (key.code != .up and key.code != .down) return false;
+        const draft = self.currentDraft();
+        if (draft.len > 0 and draft[0] != '!') return false;
+        const messages = self.currentThread().messages.items;
+        if (key.code == .up) {
+            var index = self.bang_history_message_index orelse messages.len;
+            while (index > 0) {
+                index -= 1;
+                const body = messages[index].body;
+                if (messages[index].role != .user or body.len < 2 or body[0] != '!' or body[1] == '!') continue;
+                self.setDraft(body);
+                self.syncPaletteComposerFromDraft();
+                self.bang_history_message_index = index;
+                return true;
+            }
+            return false;
+        }
+
+        var index = (self.bang_history_message_index orelse return false) + 1;
+        while (index < messages.len) : (index += 1) {
+            const body = messages[index].body;
+            if (messages[index].role != .user or body.len < 2 or body[0] != '!' or body[1] == '!') continue;
+            self.setDraft(body);
+            self.syncPaletteComposerFromDraft();
+            self.bang_history_message_index = index;
+            return true;
+        }
+        self.bang_history_message_index = null;
+        self.clearDraft();
+        self.syncPaletteComposerFromDraft();
+        return true;
     }
 
     pub fn routePaletteComposerMouseButton(self: *AppState, event: *const sdl.MouseButtonEvent, ui_scale: f32) bool {
@@ -20372,10 +20753,15 @@ pub const AppState = struct {
     }
 
     fn pollThreadSend(self: *AppState, project_index: usize, thread_index: usize, thread: *ChatThread) bool {
-        const daemon_changed = self.pollDaemonChatTurn(thread);
-        self.capturePendingProviderThreadId(thread);
-        self.issuePendingCodexSteer(project_index, thread_index, thread);
-        self.issuePendingThreadStop(project_index, self.projects.items[project_index].path, thread);
+        thread.send_state.mutex.lock();
+        const command_pending = thread.send_state.local_command;
+        thread.send_state.mutex.unlock();
+        const daemon_changed = if (command_pending) false else self.pollDaemonChatTurn(thread);
+        if (!command_pending) {
+            self.capturePendingProviderThreadId(thread);
+            self.issuePendingCodexSteer(project_index, thread_index, thread);
+            self.issuePendingThreadStop(project_index, self.projects.items[project_index].path, thread);
+        }
 
         var completed_result: ?SendResultPayload = null;
         var failed_message: ?[]u8 = null;
@@ -20384,6 +20770,7 @@ pub const AppState = struct {
         var completed_events: std.ArrayListUnmanaged(PendingTimelineEvent) = .empty;
         var completed_diff_files: std.ArrayListUnmanaged(PendingDiffFile) = .empty;
         var completed_daemon_turn_id: ?[]u8 = null;
+        var completed_local_command = false;
         const send_state = thread.send_state;
         var stream_changed = false;
 
@@ -20408,6 +20795,7 @@ pub const AppState = struct {
                 }
             },
             .completed => {
+                completed_local_command = send_state.local_command;
                 had_pending_followup = send_state.pending_followup != null;
                 completed_result = send_state.result;
                 send_state.result = null;
@@ -20437,6 +20825,7 @@ pub const AppState = struct {
                 next_status = .completed;
             },
             .aborted => {
+                completed_local_command = send_state.local_command;
                 had_pending_followup = send_state.pending_followup != null;
                 if (send_state.provisional_provider_thread_id) |thread_id| {
                     std.heap.page_allocator.free(thread_id);
@@ -20464,6 +20853,7 @@ pub const AppState = struct {
                 next_status = .aborted;
             },
             .failed => {
+                completed_local_command = send_state.local_command;
                 failed_message = send_state.error_message;
                 send_state.error_message = null;
                 if (send_state.provisional_provider_thread_id) |thread_id| {
@@ -20501,6 +20891,15 @@ pub const AppState = struct {
             if (project_index < self.projects.items.len) {
                 self.projects.items[project_index].invalidateSidebarThreadCache();
             }
+            send_state.mutex.lock();
+            if (send_state.local_command_text) |value| std.heap.page_allocator.free(value);
+            if (send_state.local_command_cwd) |value| std.heap.page_allocator.free(value);
+            if (send_state.local_command_shell) |value| std.heap.page_allocator.free(value);
+            send_state.local_command_text = null;
+            send_state.local_command_cwd = null;
+            send_state.local_command_shell = null;
+            send_state.local_command = false;
+            send_state.mutex.unlock();
         }
 
         // The turn is over on every terminal path, so no provider can deliver
@@ -20521,11 +20920,17 @@ pub const AppState = struct {
                     self.applyPendingTimelineEvents(thread, &completed_events) catch |err| {
                         log.err("failed to apply timeline events: {s}", .{@errorName(err)});
                     };
-                    self.applySendSuccess(thread, result, should_append_reply_text) catch |err| {
-                        log.err("failed to apply send result: {s}", .{@errorName(err)});
-                        self.setSidebarNotice("Failed to apply provider reply.");
-                    };
-                    self.maybeStartAutomaticTitleGeneration(project_index, thread);
+                    if (!completed_local_command) {
+                        self.applySendSuccess(thread, result, should_append_reply_text) catch |err| {
+                            log.err("failed to apply send result: {s}", .{@errorName(err)});
+                            self.setSidebarNotice("Failed to apply provider reply.");
+                        };
+                        self.maybeStartAutomaticTitleGeneration(project_index, thread);
+                    } else {
+                        thread.touch();
+                        self.markDirty();
+                        self.setSidebarNotice("Workspace command finished.");
+                    }
                     if (project_index == self.selected_project_index and thread_index == self.currentProject().selected_thread_index) {
                         self.requestTranscriptScrollToBottom();
                     }
@@ -20554,7 +20959,11 @@ pub const AppState = struct {
                 self.applyPendingTimelineEvents(thread, &completed_events) catch |err| {
                     log.err("failed to apply aborted timeline events: {s}", .{@errorName(err)});
                 };
-                if (!had_pending_followup) {
+                if (completed_local_command) {
+                    if (completed_events.items.len == 0) {
+                        self.appendMessageToThread(thread, .system, "Command cancelled", "The workspace command was cancelled before it completed.", null, &.{}) catch {};
+                    }
+                } else if (!had_pending_followup) {
                     self.appendMessageToThread(
                         thread,
                         .system,
@@ -20568,7 +20977,7 @@ pub const AppState = struct {
                 }
                 thread.touch();
                 self.markDirty();
-                self.setSidebarNotice("Provider reply stopped.");
+                self.setSidebarNotice(if (completed_local_command) "Workspace command cancelled." else "Provider reply stopped.");
                 self.flushDirtyNow();
                 self.consumeDaemonChatTurn(completed_daemon_turn_id);
             },
@@ -20578,13 +20987,13 @@ pub const AppState = struct {
         if (next_status == .failed) {
             self.clearPendingFollowupAfterFailure(thread);
         }
-        if (next_status == .completed or next_status == .aborted) {
+        if (!completed_local_command and (next_status == .completed or next_status == .aborted)) {
             self.dispatchPendingFollowup(project_index, thread_index, thread);
         }
         // Record a real chat turn completion. Skip when a follow-up is queued
         // (the turn continues immediately) so DONE only appears once the agent
         // truly rests, mirroring the terminal-agent `.done` notification.
-        if (next_status == .completed and !had_pending_followup) {
+        if (!completed_local_command and next_status == .completed and !had_pending_followup) {
             self.noteChatCompletion(project_index, thread_index, thread);
         }
         return next_status != .idle or stream_changed or daemon_changed;
