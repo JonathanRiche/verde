@@ -37,7 +37,8 @@ export const Route = createFileRoute('/docs/$slug')({
         { property: 'og:url', content: url },
         { property: 'og:title', content: `${doc.title} | Verde Docs` },
         { property: 'og:description', content: doc.description },
-        { name: 'twitter:card', content: 'summary' },
+        { property: 'article:section', content: doc.section },
+        { name: 'twitter:card', content: 'summary_large_image' },
         { name: 'twitter:title', content: `${doc.title} | Verde Docs` },
         { name: 'twitter:description', content: doc.description },
       ],
@@ -71,6 +72,7 @@ export const Route = createFileRoute('/docs/$slug')({
             headers: {
               'Content-Type': 'text/markdown; charset=utf-8',
               'Cache-Control': 'public, max-age=300',
+              'X-Robots-Tag': 'noindex, follow',
             },
           })
         }
@@ -78,6 +80,7 @@ export const Route = createFileRoute('/docs/$slug')({
           headers: {
             'Content-Type': 'text/markdown; charset=utf-8',
             'Cache-Control': 'public, max-age=3600',
+            'X-Robots-Tag': 'noindex, follow',
           },
         })
       },
@@ -210,4 +213,3 @@ function DocPage() {
     </main>
   )
 }
-

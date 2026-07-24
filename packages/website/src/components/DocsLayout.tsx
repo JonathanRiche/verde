@@ -192,22 +192,44 @@ export default function DocsLayout(props: DocsLayoutProps): JSX.Element {
         {(doc) => (
           <script
             type="application/ld+json"
-            // JSON-LD BreadcrumbList for SEO — read by Google from the body.
             innerHTML={JSON.stringify({
               '@context': 'https://schema.org',
-              '@type': 'BreadcrumbList',
-              itemListElement: [
-                { '@type': 'ListItem', position: 1, name: 'Docs', item: `${SITE_ORIGIN}/docs` },
+              '@graph': [
                 {
-                  '@type': 'ListItem',
-                  position: 2,
-                  name: SECTION_LABEL[doc().section],
+                  '@type': 'TechArticle',
+                  '@id': `${SITE_ORIGIN}/docs/${doc().slug}#article`,
+                  url: `${SITE_ORIGIN}/docs/${doc().slug}`,
+                  headline: doc().title,
+                  description: doc().description,
+                  articleSection: SECTION_LABEL[doc().section],
+                  inLanguage: 'en',
+                  mainEntityOfPage: `${SITE_ORIGIN}/docs/${doc().slug}`,
+                  isPartOf: { '@id': `${SITE_ORIGIN}/docs#page` },
+                  about: { '@id': `${SITE_ORIGIN}/#software` },
+                  author: { '@id': `${SITE_ORIGIN}/#organization` },
+                  publisher: { '@id': `${SITE_ORIGIN}/#organization` },
                 },
                 {
-                  '@type': 'ListItem',
-                  position: 3,
-                  name: doc().title,
-                  item: `${SITE_ORIGIN}/docs/${doc().slug}`,
+                  '@type': 'BreadcrumbList',
+                  itemListElement: [
+                    {
+                      '@type': 'ListItem',
+                      position: 1,
+                      name: 'Docs',
+                      item: `${SITE_ORIGIN}/docs`,
+                    },
+                    {
+                      '@type': 'ListItem',
+                      position: 2,
+                      name: SECTION_LABEL[doc().section],
+                    },
+                    {
+                      '@type': 'ListItem',
+                      position: 3,
+                      name: doc().title,
+                      item: `${SITE_ORIGIN}/docs/${doc().slug}`,
+                    },
+                  ],
                 },
               ],
             })}

@@ -9,6 +9,7 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as SitemapDotxmlRouteImport } from './routes/sitemap[.]xml'
 import { Route as LlmsDottxtRouteImport } from './routes/llms[.]txt'
 import { Route as LlmsFullDottxtRouteImport } from './routes/llms-full[.]txt'
 import { Route as InstallDotshRouteImport } from './routes/install[.]sh'
@@ -19,6 +20,11 @@ import { Route as DocsIndexRouteImport } from './routes/docs/index'
 import { Route as ThemesSlugRouteImport } from './routes/themes/$slug'
 import { Route as DocsSlugRouteImport } from './routes/docs/$slug'
 
+const SitemapDotxmlRoute = SitemapDotxmlRouteImport.update({
+  id: '/sitemap.xml',
+  path: '/sitemap.xml',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const LlmsDottxtRoute = LlmsDottxtRouteImport.update({
   id: '/llms.txt',
   path: '/llms.txt',
@@ -72,6 +78,7 @@ export interface FileRoutesByFullPath {
   '/install.sh': typeof InstallDotshRoute
   '/llms-full.txt': typeof LlmsFullDottxtRoute
   '/llms.txt': typeof LlmsDottxtRoute
+  '/sitemap.xml': typeof SitemapDotxmlRoute
   '/docs/$slug': typeof DocsSlugRoute
   '/themes/$slug': typeof ThemesSlugRoute
   '/docs/': typeof DocsIndexRoute
@@ -83,6 +90,7 @@ export interface FileRoutesByTo {
   '/install.sh': typeof InstallDotshRoute
   '/llms-full.txt': typeof LlmsFullDottxtRoute
   '/llms.txt': typeof LlmsDottxtRoute
+  '/sitemap.xml': typeof SitemapDotxmlRoute
   '/docs/$slug': typeof DocsSlugRoute
   '/themes/$slug': typeof ThemesSlugRoute
   '/docs': typeof DocsIndexRoute
@@ -95,6 +103,7 @@ export interface FileRoutesById {
   '/install.sh': typeof InstallDotshRoute
   '/llms-full.txt': typeof LlmsFullDottxtRoute
   '/llms.txt': typeof LlmsDottxtRoute
+  '/sitemap.xml': typeof SitemapDotxmlRoute
   '/docs/$slug': typeof DocsSlugRoute
   '/themes/$slug': typeof ThemesSlugRoute
   '/docs/': typeof DocsIndexRoute
@@ -108,6 +117,7 @@ export interface FileRouteTypes {
     | '/install.sh'
     | '/llms-full.txt'
     | '/llms.txt'
+    | '/sitemap.xml'
     | '/docs/$slug'
     | '/themes/$slug'
     | '/docs/'
@@ -119,6 +129,7 @@ export interface FileRouteTypes {
     | '/install.sh'
     | '/llms-full.txt'
     | '/llms.txt'
+    | '/sitemap.xml'
     | '/docs/$slug'
     | '/themes/$slug'
     | '/docs'
@@ -130,6 +141,7 @@ export interface FileRouteTypes {
     | '/install.sh'
     | '/llms-full.txt'
     | '/llms.txt'
+    | '/sitemap.xml'
     | '/docs/$slug'
     | '/themes/$slug'
     | '/docs/'
@@ -142,6 +154,7 @@ export interface RootRouteChildren {
   InstallDotshRoute: typeof InstallDotshRoute
   LlmsFullDottxtRoute: typeof LlmsFullDottxtRoute
   LlmsDottxtRoute: typeof LlmsDottxtRoute
+  SitemapDotxmlRoute: typeof SitemapDotxmlRoute
   DocsSlugRoute: typeof DocsSlugRoute
   ThemesSlugRoute: typeof ThemesSlugRoute
   DocsIndexRoute: typeof DocsIndexRoute
@@ -149,6 +162,13 @@ export interface RootRouteChildren {
 
 declare module '@tanstack/solid-router' {
   interface FileRoutesByPath {
+    '/sitemap.xml': {
+      id: '/sitemap.xml'
+      path: '/sitemap.xml'
+      fullPath: '/sitemap.xml'
+      preLoaderRoute: typeof SitemapDotxmlRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/llms.txt': {
       id: '/llms.txt'
       path: '/llms.txt'
@@ -222,6 +242,7 @@ const rootRouteChildren: RootRouteChildren = {
   InstallDotshRoute: InstallDotshRoute,
   LlmsFullDottxtRoute: LlmsFullDottxtRoute,
   LlmsDottxtRoute: LlmsDottxtRoute,
+  SitemapDotxmlRoute: SitemapDotxmlRoute,
   DocsSlugRoute: DocsSlugRoute,
   ThemesSlugRoute: ThemesSlugRoute,
   DocsIndexRoute: DocsIndexRoute,

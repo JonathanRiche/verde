@@ -16,6 +16,9 @@ export const Route = createFileRoute('/llms.txt')({
             'Content-Type': 'text/plain; charset=utf-8',
             // Agents re-fetch docs occasionally; let CDNs cache for an hour.
             'Cache-Control': 'public, max-age=3600',
+            // Keep the machine-readable mirror crawlable without competing
+            // with the canonical HTML docs in search results.
+            'X-Robots-Tag': 'noindex, follow',
           },
         }),
     },

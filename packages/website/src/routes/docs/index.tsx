@@ -2,27 +2,35 @@ import { createFileRoute, Link } from '@tanstack/solid-router'
 import { For } from 'solid-js'
 
 import DocsLayout from '../../components/DocsLayout'
-import { SITE_ORIGIN, getDocsNav, type DocEntry } from '../../content/docs'
+import {
+  SITE_ORIGIN,
+  getAllDocs,
+  getDocsNav,
+  type DocEntry,
+} from '../../content/docs'
+
+const docsTitle = 'Verde Docs — Install, Providers, CLI & Tiling'
+const docsDescription =
+  'Install Verde, connect coding-agent providers, tile chat, terminal, and browser panes, configure keybinds, and automate the app with the verde CLI.'
 
 export const Route = createFileRoute('/docs/')({
   head: () => ({
     meta: [
-      { title: 'Docs | Verde' },
+      { title: docsTitle },
       {
         name: 'description',
-        content:
-          'Verde documentation — install, provider setup, panes & tiling, keybinds, the verde CLI, configuration, and troubleshooting.',
+        content: docsDescription,
       },
       { property: 'og:type', content: 'website' },
       { property: 'og:url', content: `${SITE_ORIGIN}/docs` },
-      { property: 'og:title', content: 'Docs | Verde' },
+      { property: 'og:title', content: docsTitle },
       {
         property: 'og:description',
-        content:
-          'Verde documentation — install, provider setup, panes & tiling, keybinds, the verde CLI, configuration, and troubleshooting.',
+        content: docsDescription,
       },
-      { name: 'twitter:card', content: 'summary' },
-      { name: 'twitter:title', content: 'Docs | Verde' },
+      { name: 'twitter:card', content: 'summary_large_image' },
+      { name: 'twitter:title', content: docsTitle },
+      { name: 'twitter:description', content: docsDescription },
     ],
     links: [{ rel: 'canonical', href: `${SITE_ORIGIN}/docs` }],
   }),
@@ -49,8 +57,32 @@ function DocCard(props: { entry: DocEntry }) {
 }
 
 function DocsIndex() {
+  const structuredData = {
+    '@context': 'https://schema.org',
+    '@type': 'CollectionPage',
+    '@id': `${SITE_ORIGIN}/docs#page`,
+    url: `${SITE_ORIGIN}/docs`,
+    name: docsTitle,
+    description: docsDescription,
+    inLanguage: 'en',
+    isPartOf: { '@id': `${SITE_ORIGIN}/#website` },
+    mainEntity: {
+      '@type': 'ItemList',
+      itemListElement: getAllDocs().map((doc, index) => ({
+        '@type': 'ListItem',
+        position: index + 1,
+        name: doc.title,
+        url: `${SITE_ORIGIN}/docs/${doc.slug}`,
+      })),
+    },
+  }
+
   return (
     <main class="docs-page">
+      <script
+        type="application/ld+json"
+        innerHTML={JSON.stringify(structuredData)}
+      />
       <DocsLayout>
         <section class="docs-hero">
           <p class="tag tag-static">Documentation</p>

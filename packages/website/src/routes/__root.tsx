@@ -12,6 +12,13 @@ import { HydrationScript } from 'solid-js/web'
 import { Suspense } from 'solid-js'
 
 import Header from '../components/Header'
+import {
+  SITE_NAME,
+  SITE_ORIGIN,
+  SOCIAL_IMAGE_HEIGHT,
+  SOCIAL_IMAGE_URL,
+  SOCIAL_IMAGE_WIDTH,
+} from '../lib/seo'
 import { THEME_COOKIE } from '../lib/site-theme'
 
 /* Read the visitor's saved Omarchy theme pick during SSR so the page paints
@@ -26,41 +33,44 @@ const getSavedThemeSlug = createServerFn({ method: 'GET' }).handler(() => {
 // names that 404 under `vite dev`.
 import '../styles.css'
 
-const siteUrl = 'https://verdeai.dev'
-const title = 'Verde | Desktop workspace for coding agents'
-const description =
-  'Verde is a native desktop workspace for coding agents with local provider CLIs, an embedded browser pane, and a project-scoped terminal dock.'
-
 export const Route = createRootRouteWithContext()({
   head: () => ({
     meta: [
       { charSet: 'utf-8' },
       { name: 'viewport', content: 'width=device-width, initial-scale=1' },
-      { title },
-      { name: 'description', content: description },
       { name: 'theme-color', content: '#0d1213' },
+      { name: 'color-scheme', content: 'dark' },
       { name: 'robots', content: 'index, follow' },
-      { property: 'og:type', content: 'website' },
-      { property: 'og:url', content: siteUrl },
-      { property: 'og:title', content: title },
-      { property: 'og:description', content: description },
-      { property: 'og:image', content: `${siteUrl}/og-image.png` },
+      { property: 'og:image', content: SOCIAL_IMAGE_URL },
+      { property: 'og:image:secure_url', content: SOCIAL_IMAGE_URL },
+      { property: 'og:image:type', content: 'image/png' },
+      { property: 'og:image:width', content: String(SOCIAL_IMAGE_WIDTH) },
+      { property: 'og:image:height', content: String(SOCIAL_IMAGE_HEIGHT) },
       {
         property: 'og:image:alt',
         content:
-          'Verde desktop app with an agent thread, browser pane, and terminal dock.',
+          'Verde, a native tiling workspace showing coding-agent, chat, and terminal panes.',
       },
-      { property: 'og:site_name', content: 'Verde' },
-      { name: 'twitter:card', content: 'summary_large_image' },
-      { name: 'twitter:title', content: title },
-      { name: 'twitter:description', content: description },
-      { name: 'twitter:image', content: `${siteUrl}/og-image.png` },
+      { property: 'og:site_name', content: SITE_NAME },
+      { property: 'og:locale', content: 'en_CA' },
+      { name: 'twitter:image', content: SOCIAL_IMAGE_URL },
+      {
+        name: 'twitter:image:alt',
+        content:
+          'Verde, a native tiling workspace showing coding-agent, chat, and terminal panes.',
+      },
     ],
     links: [
-      { rel: 'canonical', href: siteUrl },
-      { rel: 'icon', type: 'image/png', href: '/verde-logo.png' },
-      { rel: 'apple-touch-icon', href: '/verde-logo.png' },
+      { rel: 'icon', type: 'image/x-icon', href: '/favicon.ico' },
+      { rel: 'icon', type: 'image/png', sizes: '192x192', href: '/logo192.png' },
+      { rel: 'apple-touch-icon', sizes: '192x192', href: '/logo192.png' },
       { rel: 'manifest', href: '/manifest.json' },
+      {
+        rel: 'alternate',
+        type: 'text/plain',
+        title: 'Verde documentation for language models',
+        href: '/llms.txt',
+      },
     ],
   }),
   loader: () => getSavedThemeSlug(),
@@ -68,6 +78,28 @@ export const Route = createRootRouteWithContext()({
 })
 
 function RootComponent() {
+  const entityGraph = {
+    '@context': 'https://schema.org',
+    '@graph': [
+      {
+        '@type': 'WebSite',
+        '@id': `${SITE_ORIGIN}/#website`,
+        url: `${SITE_ORIGIN}/`,
+        name: SITE_NAME,
+        inLanguage: 'en',
+        publisher: { '@id': `${SITE_ORIGIN}/#organization` },
+      },
+      {
+        '@type': 'Organization',
+        '@id': `${SITE_ORIGIN}/#organization`,
+        name: SITE_NAME,
+        url: `${SITE_ORIGIN}/`,
+        logo: `${SITE_ORIGIN}/logo512.png`,
+        sameAs: ['https://github.com/JonathanRiche/verde'],
+      },
+    ],
+  }
+
   return (
     <html lang="en">
       <head>
@@ -80,6 +112,10 @@ function RootComponent() {
           <Outlet />
           <TanStackRouterDevtools />
         </Suspense>
+        <script
+          type="application/ld+json"
+          innerHTML={JSON.stringify(entityGraph)}
+        />
         <Scripts />
       </body>
     </html>

@@ -1980,6 +1980,39 @@ thead .comp-rowhead { background: transparent; }
 .stagger > *:nth-child(7) { animation-delay: 420ms; }
 .stagger > *:nth-child(8) { animation-delay: 490ms; }
 
+/* ── FAQ ── */
+
+.faq-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  margin: 2.25rem 0 0;
+  padding: 1px;
+  border-radius: var(--radius-lg);
+  background: var(--line-soft);
+  overflow: hidden;
+}
+
+.faq-item {
+  min-width: 0;
+  padding: 1.4rem 1.5rem 1.55rem;
+  background: var(--panel-strong);
+}
+
+.faq-item dt {
+  color: var(--text);
+  font-family: var(--font-display);
+  font-size: 1.05rem;
+  line-height: 1.35;
+}
+
+.faq-item dd {
+  margin: 0.7rem 0 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.65;
+}
+
 /* ══════════════════════════════════════
    Responsive
    ══════════════════════════════════════ */
@@ -2026,6 +2059,7 @@ thead .comp-rowhead { background: transparent; }
 
   .provider-grid,
   .feature-grid,
+  .faq-grid,
   .script-grid,
   .install-more {
     grid-template-columns: 1fr;
