@@ -431,6 +431,13 @@ pub const Client = struct {
             parsed.deinit();
             return;
         }
+        if (std.mem.eql(u8, kind, "diff_event")) {
+            if (stream_request) |request| {
+                _ = try emitBridgeDiffEvent(parsed.value, request);
+            }
+            parsed.deinit();
+            return;
+        }
         if (std.mem.eql(u8, kind, "approval_request")) {
             if (stream_request) |request| {
                 if (request.on_approval_request) |on_approval_request| {
@@ -674,6 +681,46 @@ fn getOptionalObjectInt(value: std.json.Value, field: []const u8) ?i64 {
     };
 }
 
+const ClaudeTestDiffCapture = struct {
+    path: ?[]const u8 = null,
+    patch: ?[]const u8 = null,
+    count: usize = 0,
+
+    fn handle(context: ?*anyopaque, event: provider_types.StreamEvent) void {
+        const self: *ClaudeTestDiffCapture = @ptrCast(@alignCast(context orelse return));
+        switch (event) {
+            .diff => |diff| {
+                if (diff.files.len == 0) return;
+                self.path = diff.files[0].path;
+                self.patch = diff.files[0].patch;
+                self.count += 1;
+            },
+            else => {},
+        }
+    }
+};
+
+fn emitBridgeDiffEvent(root: std.json.Value, request: provider_types.SendPromptRequest) !bool {
+    const on_stream_event = request.on_stream_event orelse return false;
+    const files_value = getObjectField(root, "files") orelse return false;
+    if (files_value != .array) return false;
+
+    var files: std.ArrayList(provider_types.StreamDiffFile) = .empty;
+    defer files.deinit(std.heap.page_allocator);
+    for (files_value.array.items) |file| {
+        const path = getOptionalObjectString(file, "path") orelse continue;
+        try files.append(std.heap.page_allocator, .{
+            .path = path,
+            .additions = getOptionalObjectInt(file, "additions") orelse 0,
+            .deletions = getOptionalObjectInt(file, "deletions") orelse 0,
+            .patch = getOptionalObjectString(file, "patch"),
+        });
+    }
+    if (files.items.len == 0) return false;
+    on_stream_event(request.stream_context, .{ .diff = .{ .files = files.items } });
+    return true;
+}
+
 fn dupeOptionalObjectString(allocator: std.mem.Allocator, value: std.json.Value, field: []const u8) !?[]u8 {
     const text = getOptionalObjectString(value, field) orelse return null;
     return try allocator.dupe(u8, text);
@@ -822,6 +869,24 @@ test "BridgeSendPromptRequest serializes multiple images" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"images\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "/tmp/one.png") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "/tmp/two.png") != null);
+}
+
+test "Claude bridge diff events preserve file patches" {
+    const payload =
+        \\{"type":"diff_event","files":[{"path":"src/main.zig","additions":1,"deletions":1,"patch":"@@ -1 +1 @@\n-old\n+new"}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    var capture: ClaudeTestDiffCapture = .{};
+
+    try std.testing.expect(try emitBridgeDiffEvent(parsed.value, .{
+        .prompt = "",
+        .stream_context = &capture,
+        .on_stream_event = ClaudeTestDiffCapture.handle,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqualStrings("src/main.zig", capture.path.?);
+    try std.testing.expect(std.mem.indexOf(u8, capture.patch.?, "+new") != null);
 }
 
 test "Windows provider bridge probes CLI and package-root GUI layouts" {

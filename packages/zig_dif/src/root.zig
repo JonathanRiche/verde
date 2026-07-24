@@ -12,6 +12,7 @@ pub const File = ast.File;
 pub const Hunk = ast.Hunk;
 pub const Line = ast.Line;
 pub const LineKind = ast.LineKind;
+pub const FileChangeKind = ast.FileChangeKind;
 pub const ParseError = parser.ParseError;
 pub const Language = syntax.Language;
 pub const Token = syntax.Token;

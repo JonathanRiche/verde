@@ -13,6 +13,8 @@ pub const ParseError = error{
 const FileBuilder = struct {
     old_path: ?[]const u8 = null,
     new_path: ?[]const u8 = null,
+    change_kind: ast.FileChangeKind = .unknown,
+    is_binary: bool = false,
     header_lines: std.ArrayListUnmanaged([]const u8) = .empty,
     hunks: std.ArrayListUnmanaged(ast.Hunk) = .empty,
 };
@@ -103,13 +105,17 @@ const Parser = struct {
 
     fn recordOldPath(self: *Parser, line: []const u8) ParseError!void {
         try self.ensureFileStarted();
-        self.current_file.?.old_path = parseFileMarkerPath(line["--- ".len..]);
+        const path = parseFileMarkerPath(line["--- ".len..]);
+        self.current_file.?.old_path = path;
+        if (std.mem.eql(u8, path, "/dev/null")) self.current_file.?.change_kind = .added;
         try self.current_file.?.header_lines.append(self.arena, line);
     }
 
     fn recordNewPath(self: *Parser, line: []const u8) ParseError!void {
         try self.ensureFileStarted();
-        self.current_file.?.new_path = parseFileMarkerPath(line["+++ ".len..]);
+        const path = parseFileMarkerPath(line["+++ ".len..]);
+        self.current_file.?.new_path = path;
+        if (std.mem.eql(u8, path, "/dev/null")) self.current_file.?.change_kind = .deleted;
         try self.current_file.?.header_lines.append(self.arena, line);
     }
 
@@ -149,6 +155,7 @@ const Parser = struct {
         if (line.len == 0) return;
 
         if (self.current_file) |*file| {
+            classifyFileMetadata(file, line);
             try file.header_lines.append(self.arena, line);
             return;
         }
@@ -188,6 +195,8 @@ const Parser = struct {
         try self.files.append(self.arena, .{
             .old_path = file.old_path,
             .new_path = file.new_path,
+            .change_kind = if (file.change_kind == .unknown and file.hunks.items.len > 0) .modified else file.change_kind,
+            .is_binary = file.is_binary,
             .header_lines = try file.header_lines.toOwnedSlice(self.arena),
             .hunks = try file.hunks.toOwnedSlice(self.arena),
         });
@@ -228,6 +237,31 @@ fn parseDiffGitPaths(line: []const u8, file: *FileBuilder) void {
 fn parseFileMarkerPath(raw: []const u8) []const u8 {
     const tab_index = std.mem.indexOfScalar(u8, raw, '\t') orelse raw.len;
     return raw[0..tab_index];
+}
+
+fn classifyFileMetadata(file: *FileBuilder, line: []const u8) void {
+    if (std.mem.startsWith(u8, line, "new file mode ")) {
+        file.change_kind = .added;
+        return;
+    }
+    if (std.mem.startsWith(u8, line, "deleted file mode ")) {
+        file.change_kind = .deleted;
+        return;
+    }
+    if (std.mem.startsWith(u8, line, "rename from ")) {
+        file.old_path = line["rename from ".len..];
+        file.change_kind = .renamed;
+        return;
+    }
+    if (std.mem.startsWith(u8, line, "rename to ")) {
+        file.new_path = line["rename to ".len..];
+        file.change_kind = .renamed;
+        return;
+    }
+    if (std.mem.startsWith(u8, line, "Binary files ") or std.mem.eql(u8, line, "GIT binary patch")) {
+        file.change_kind = .binary;
+        file.is_binary = true;
+    }
 }
 
 fn parseHunkHeader(line: []const u8) ParseError!HunkRanges {
@@ -362,6 +396,33 @@ test "parse unified diff trims carriage returns from crlf input" {
 
     try std.testing.expectEqualStrings("diff --git a/src/main.ts b/src/main.ts", document.files[0].header_lines[0]);
     try std.testing.expectEqualStrings("const value = 2;", document.files[0].hunks[0].lines[1].text);
+}
+
+test "parse file change kinds and rename paths" {
+    const input =
+        \\diff --git a/old.txt b/new.txt
+        \\similarity index 100%
+        \\rename from old.txt
+        \\rename to new.txt
+        \\diff --git a/created.txt b/created.txt
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/created.txt
+        \\@@ -0,0 +1 @@
+        \\+hello
+        \\diff --git a/image.png b/image.png
+        \\Binary files a/image.png and b/image.png differ
+    ;
+    var document = try parseUnifiedDiff(std.testing.allocator, input);
+    defer document.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), document.files.len);
+    try std.testing.expectEqual(ast.FileChangeKind.renamed, document.files[0].change_kind);
+    try std.testing.expectEqualStrings("old.txt", document.files[0].old_path.?);
+    try std.testing.expectEqualStrings("new.txt", document.files[0].new_path.?);
+    try std.testing.expectEqual(ast.FileChangeKind.added, document.files[1].change_kind);
+    try std.testing.expectEqual(ast.FileChangeKind.binary, document.files[2].change_kind);
+    try std.testing.expect(document.files[2].is_binary);
 }
 
 test "parse hunk header rejects malformed headers" {

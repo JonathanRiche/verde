@@ -8,6 +8,15 @@ pub const LineKind = enum {
     deletion,
 };
 
+pub const FileChangeKind = enum {
+    unknown,
+    modified,
+    added,
+    deleted,
+    renamed,
+    binary,
+};
+
 pub const Line = struct {
     kind: LineKind,
     text: []const u8,
@@ -26,6 +35,8 @@ pub const Hunk = struct {
 pub const File = struct {
     old_path: ?[]const u8 = null,
     new_path: ?[]const u8 = null,
+    change_kind: FileChangeKind = .unknown,
+    is_binary: bool = false,
     header_lines: []const []const u8,
     hunks: []const Hunk,
 };

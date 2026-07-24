@@ -1144,7 +1144,6 @@ const PersistedThread = db_types.PersistedThread;
 
 // `utils.zig` owns the cross-cutting runtime helpers that are shared with the UI shell.
 const SendWorkerRequest = utils.SendWorkerRequest;
-const appendPendingDiffSummaryEvent = utils.appendPendingDiffSummaryEvent;
 const approvalPolicyForMode = utils.approvalPolicyForMode;
 const captureClipboardImage = utils.captureClipboardImage;
 const extensionForImageMime = utils.extensionForImageMime;
@@ -20166,6 +20165,8 @@ pub const AppState = struct {
             // ever-growing trailing bubble on daemon-owned turns.
             flushPendingAssistantTextLocked(send_state, std.heap.page_allocator);
             try upsertPendingToolCallEvent(std.heap.page_allocator, &send_state.pending_events, update);
+        } else if (std.mem.eql(u8, kind, "diff")) {
+            try applyDaemonDiffEventLocked(send_state, payload_json);
         } else if (std.mem.eql(u8, kind, "thread_id")) {
             if (daemonPayloadStringAlloc(payload_json, "thread_id")) |thread_id| {
                 defer std.heap.page_allocator.free(thread_id);
@@ -20177,6 +20178,39 @@ pub const AppState = struct {
                 try replacePageOwned(&send_state.active_turn_id, turn_id);
             }
         }
+    }
+
+    fn applyDaemonDiffEventLocked(send_state: *SendState, payload_json: []const u8) !void {
+        const allocator = std.heap.page_allocator;
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidDaemonResponse;
+        const files_value = parsed.value.object.get("files") orelse return error.InvalidDaemonResponse;
+        if (files_value != .array) return error.InvalidDaemonResponse;
+
+        var files: std.ArrayList(ai_harness.StreamDiffFile) = .empty;
+        defer files.deinit(allocator);
+        for (files_value.array.items) |file_value| {
+            if (file_value != .object) continue;
+            const path = jsonValueString(file_value.object.get("path") orelse .null) orelse continue;
+            const additions = jsonValueI64(file_value.object.get("additions") orelse .null) orelse 0;
+            const deletions = jsonValueI64(file_value.object.get("deletions") orelse .null) orelse 0;
+            try files.append(allocator, .{
+                .path = path,
+                .additions = additions,
+                .deletions = deletions,
+                .patch = jsonValueString(file_value.object.get("patch") orelse .null),
+            });
+        }
+        if (files.items.len == 0) return;
+
+        flushPendingAssistantTextLocked(send_state, allocator);
+        utils.mergePendingDiffFilesLocked(allocator, &send_state.pending_diff_files, files.items);
+        utils.upsertPendingDiffSummaryEventLocked(
+            allocator,
+            &send_state.pending_events,
+            send_state.pending_diff_files.items,
+        );
     }
 
     fn parseToolCallKind(value: []const u8) ai_harness.ToolCallKind {
@@ -20347,9 +20381,6 @@ pub const AppState = struct {
                     defer std.heap.page_allocator.free(result.reply_text);
                     defer freePendingTimelineEvents(std.heap.page_allocator, &completed_events);
                     defer freePendingDiffFiles(std.heap.page_allocator, &completed_diff_files);
-                    if (thread.provider != .opencode) {
-                        appendPendingDiffSummaryEvent(std.heap.page_allocator, &completed_events, completed_diff_files.items);
-                    }
                     const should_append_reply_text = !pendingTimelineEventsContainAssistant(completed_events.items);
                     self.applyPendingTimelineEvents(thread, &completed_events) catch |err| {
                         log.err("failed to apply timeline events: {s}", .{@errorName(err)});
@@ -20369,9 +20400,6 @@ pub const AppState = struct {
             .failed => {
                 defer freePendingTimelineEvents(std.heap.page_allocator, &completed_events);
                 defer freePendingDiffFiles(std.heap.page_allocator, &completed_diff_files);
-                if (thread.provider != .opencode) {
-                    appendPendingDiffSummaryEvent(std.heap.page_allocator, &completed_events, completed_diff_files.items);
-                }
                 if (failed_message) |message| {
                     defer std.heap.page_allocator.free(message);
                     self.applySendFailure(thread, &completed_events, message) catch |err| {
@@ -20387,9 +20415,6 @@ pub const AppState = struct {
             .aborted => {
                 defer freePendingTimelineEvents(std.heap.page_allocator, &completed_events);
                 defer freePendingDiffFiles(std.heap.page_allocator, &completed_diff_files);
-                if (thread.provider != .opencode) {
-                    appendPendingDiffSummaryEvent(std.heap.page_allocator, &completed_events, completed_diff_files.items);
-                }
                 self.applyPendingTimelineEvents(thread, &completed_events) catch |err| {
                     log.err("failed to apply aborted timeline events: {s}", .{@errorName(err)});
                 };
@@ -21410,6 +21435,13 @@ pub const AppState = struct {
 
     pub fn isCardExpandedDefault(self: *AppState, key: u64, default_expanded: bool) bool {
         return self.expanded_cards.get(key) orelse default_expanded;
+    }
+
+    pub fn setCardExpanded(self: *AppState, key: u64, expanded: bool) void {
+        self.expanded_cards.put(key, expanded) catch |err| {
+            log.warn("failed to store card state: {s}", .{@errorName(err)});
+        };
+        self.markDirty();
     }
 
     /// Hit-tests the most recent frame's card-toggle headers. On hit, flips
@@ -22730,6 +22762,23 @@ test "workspace leases reject conflicts, renew, expire, and enforce ownership" {
     try std.testing.expectEqual(@as(usize, 0), state.activeWorkspaceLeaseCount(0));
 }
 
+test "daemon diff event becomes a persisted live timeline event" {
+    var send_state: SendState = .{};
+    defer freePendingTimelineEvents(std.heap.page_allocator, &send_state.pending_events);
+    defer freePendingDiffFiles(std.heap.page_allocator, &send_state.pending_diff_files);
+
+    try AppState.applyDaemonDiffEventLocked(
+        &send_state,
+        "{\"files\":[{\"path\":\"src/main.zig\",\"additions\":1,\"deletions\":1,\"patch\":\"@@ -1 +1 @@\\n-old\\n+new\\n\"}]}",
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), send_state.pending_diff_files.items.len);
+    try std.testing.expectEqualStrings("src/main.zig", send_state.pending_diff_files.items[0].path);
+    try std.testing.expectEqual(@as(usize, 1), send_state.pending_events.items.len);
+    try std.testing.expect(utils.isPersistedDiffBody(send_state.pending_events.items[0].body));
+    try std.testing.expect(std.mem.indexOf(u8, send_state.pending_events.items[0].body, "+new") != null);
+}
+
 fn unixTimestampSeconds() i64 {
     return @divTrunc(unixTimestampMs(), std.time.ms_per_s);
 }
@@ -22769,6 +22818,14 @@ fn jsonValueU64(value: std.json.Value) ?u64 {
     return switch (value) {
         .integer => |int| if (int >= 0) @intCast(int) else null,
         .number_string => |text| std.fmt.parseInt(u64, text, 10) catch null,
+        else => null,
+    };
+}
+
+fn jsonValueI64(value: std.json.Value) ?i64 {
+    return switch (value) {
+        .integer => |int| int,
+        .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
         else => null,
     };
 }
