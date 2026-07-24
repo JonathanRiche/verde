@@ -2219,6 +2219,8 @@ pub const BrowserTabRef = struct {
     history: std.ArrayList([]u8) = .empty,
     history_index: ?usize = null,
     pinned: bool = false,
+    loading: bool = false,
+    load_failed: bool = false,
 
     fn deinit(self: *BrowserTabRef, allocator: std.mem.Allocator) void {
         if (self.url) |url| allocator.free(url);
@@ -2269,6 +2271,16 @@ pub const BrowserTabRef = struct {
         try self.history.append(allocator, owned);
     }
 
+    fn clone(self: *const BrowserTabRef, allocator: std.mem.Allocator) !BrowserTabRef {
+        var duplicate: BrowserTabRef = .{ .pinned = self.pinned };
+        errdefer duplicate.deinit(allocator);
+        try duplicate.setUrl(allocator, self.url);
+        try duplicate.setTitle(allocator, self.title);
+        for (self.history.items) |entry| try duplicate.appendHistoryEntry(allocator, entry);
+        duplicate.history_index = self.history_index;
+        return duplicate;
+    }
+
     fn historyTarget(self: *const BrowserTabRef, delta: i32) ?struct { index: usize, url: []const u8 } {
         const index = self.history_index orelse return null;
         const target: isize = @as(isize, @intCast(index)) + @as(isize, @intCast(delta));
@@ -2305,6 +2317,21 @@ pub const BrowserPaneRef = struct {
         if (self.tabs.items.len == 0) return null;
         return &self.tabs.items[@min(self.active_tab_index, self.tabs.items.len - 1)];
     }
+
+    fn moveTab(self: *BrowserPaneRef, allocator: std.mem.Allocator, from: usize, to: usize) !void {
+        if (from >= self.tabs.items.len or to >= self.tabs.items.len or from == to) return;
+        const active = self.active_tab_index;
+        const moved = self.tabs.orderedRemove(from);
+        try self.tabs.insert(allocator, to, moved);
+        self.active_tab_index = if (active == from)
+            to
+        else if (from < active and active <= to)
+            active - 1
+        else if (to <= active and active < from)
+            active + 1
+        else
+            active;
+    }
 };
 
 test "browser pane tabs preserve independent navigation and active state" {
@@ -2325,6 +2352,26 @@ test "browser pane tabs preserve independent navigation and active state" {
     try std.testing.expectEqualStrings("One", pane.tabs.items[0].title.?);
     try std.testing.expectEqualStrings("https://two.example/b", pane.activeTabConst().?.url.?);
     try std.testing.expectEqualStrings("https://two.example/a", pane.activeTabConst().?.historyTarget(-1).?.url);
+}
+
+test "browser pane tab clone and reorder preserve ownership and active state" {
+    const allocator = std.testing.allocator;
+    var pane: BrowserPaneRef = .{};
+    defer pane.deinit(allocator);
+
+    const first = try pane.ensureTab(allocator);
+    try first.recordNavigation(allocator, "https://one.example/");
+    try first.setTitle(allocator, "One");
+    var duplicate = try first.clone(allocator);
+    duplicate.pinned = true;
+    try pane.tabs.append(allocator, duplicate);
+    pane.active_tab_index = 1;
+    try pane.moveTab(allocator, 1, 0);
+
+    try std.testing.expectEqual(@as(usize, 0), pane.active_tab_index);
+    try std.testing.expect(pane.tabs.items[0].pinned);
+    try std.testing.expectEqualStrings("One", pane.tabs.items[0].title.?);
+    try std.testing.expectEqualStrings("https://one.example/", pane.tabs.items[0].history.items[0]);
 }
 
 fn deinitWorkspacePaneRef(ref: *WorkspacePaneRef, allocator: std.mem.Allocator) void {
@@ -2374,6 +2421,12 @@ pub const BrowserScreenshotResult = struct {
         allocator.free(self.png_bytes);
         self.* = undefined;
     }
+};
+
+pub const BrowserTabIndicator = enum {
+    none,
+    loading,
+    failed,
 };
 
 pub const BrowserWorkspaceLocation = struct {
@@ -13474,9 +13527,11 @@ pub const AppState = struct {
         defer self.allocator.free(normalized);
 
         self.browser_state.status = .opening;
+        self.setActiveBrowserTabLoadState(true, false);
         self.browser_state.controller.navigate(normalized) catch |err| {
             log.err("failed to navigate browser runtime: {s}", .{@errorName(err)});
             self.browser_state.status = .failed;
+            self.setActiveBrowserTabLoadState(false, true);
             self.browser_state.setLastError("Failed to navigate browser runtime.") catch {};
             self.setSidebarNotice("Browser navigation failed.");
             return error.BrowserNavigationFailed;
@@ -13623,6 +13678,13 @@ pub const AppState = struct {
             return;
         };
         self.markDirty();
+    }
+
+    fn setActiveBrowserTabLoadState(self: *AppState, loading: bool, failed: bool) void {
+        const ref = self.visibleBrowserPaneRefMutable() orelse return;
+        const tab = ref.activeTab() orelse return;
+        tab.loading = loading;
+        tab.load_failed = failed;
     }
 
     fn navigatePersistedBrowserHistory(self: *AppState, delta: i32) bool {
@@ -14645,6 +14707,7 @@ pub const AppState = struct {
                 .navigated => |url| {
                     self.clearBrowserContextMenuLocal();
                     self.browser_state.status = .ready;
+                    self.setActiveBrowserTabLoadState(true, false);
                     self.browser_state.setCurrentUrl(url) catch {};
                     self.browser_state.setAddress(url);
                     self.recordVisibleBrowserPaneNavigation(url);
@@ -14655,6 +14718,7 @@ pub const AppState = struct {
                     self.recordVisibleBrowserPaneTitle(title);
                 },
                 .document_loaded => {
+                    self.setActiveBrowserTabLoadState(false, false);
                     self.reapplyBrowserInspectorAfterLoad();
                     self.runBrowserStartupEvalIfRequested();
                 },
@@ -14723,6 +14787,7 @@ pub const AppState = struct {
                 },
                 .failed => |message| {
                     self.browser_state.status = .failed;
+                    self.setActiveBrowserTabLoadState(false, true);
                     self.browser_state.setLastError(message) catch {};
                     self.setSidebarNotice("Browser runtime reported a failure.");
                 },
@@ -19512,6 +19577,21 @@ pub const AppState = struct {
         return tab.title orelse tab.url orelse "New tab";
     }
 
+    pub fn browserTabPinned(self: *AppState, index: usize) bool {
+        const ref = self.visibleBrowserPaneRefMutable() orelse return false;
+        if (index >= ref.tabs.items.len) return false;
+        return ref.tabs.items[index].pinned;
+    }
+
+    pub fn browserTabIndicator(self: *AppState, index: usize) BrowserTabIndicator {
+        const ref = self.visibleBrowserPaneRefMutable() orelse return .none;
+        if (index >= ref.tabs.items.len) return .none;
+        const tab = &ref.tabs.items[index];
+        if (tab.load_failed) return .failed;
+        if (tab.loading) return .loading;
+        return .none;
+    }
+
     pub fn browserCanGoBack(self: *AppState) bool {
         const ref = self.visibleBrowserPaneRefMutable() orelse return false;
         const tab = ref.activeTab() orelse return false;
@@ -19534,6 +19614,52 @@ pub const AppState = struct {
         ref.active_tab_index = ref.tabs.items.len - 1;
         self.activateBrowserTabRuntime(null, null);
         self.browser_address_focused = true;
+        self.markDirty();
+    }
+
+    pub fn duplicateBrowserTab(self: *AppState, index: usize) void {
+        const ref = self.visibleBrowserPaneRefMutable() orelse return;
+        if (index >= ref.tabs.items.len) return;
+        const duplicate = ref.tabs.items[index].clone(self.allocator) catch |err| {
+            log.warn("failed to duplicate browser tab: {s}", .{@errorName(err)});
+            return;
+        };
+        ref.tabs.insert(self.allocator, index + 1, duplicate) catch |err| {
+            var owned = duplicate;
+            owned.deinit(self.allocator);
+            log.warn("failed to insert duplicated browser tab: {s}", .{@errorName(err)});
+            return;
+        };
+        ref.active_tab_index = index + 1;
+        const active = &ref.tabs.items[ref.active_tab_index];
+        self.activateBrowserTabRuntime(active.url, active.title);
+        self.markDirty();
+    }
+
+    pub fn toggleBrowserTabPinned(self: *AppState, index: usize) void {
+        const ref = self.visibleBrowserPaneRefMutable() orelse return;
+        if (index >= ref.tabs.items.len) return;
+        const was_pinned = ref.tabs.items[index].pinned;
+        var pinned_count: usize = 0;
+        for (ref.tabs.items) |tab| {
+            if (tab.pinned) pinned_count += 1;
+        }
+        ref.tabs.items[index].pinned = !was_pinned;
+        const target = if (was_pinned) pinned_count -| 1 else pinned_count;
+        ref.moveTab(self.allocator, index, @min(target, ref.tabs.items.len - 1)) catch |err| {
+            ref.tabs.items[index].pinned = was_pinned;
+            log.warn("failed to reposition pinned browser tab: {s}", .{@errorName(err)});
+            return;
+        };
+        self.markDirty();
+    }
+
+    pub fn moveBrowserTab(self: *AppState, from: usize, to: usize) void {
+        const ref = self.visibleBrowserPaneRefMutable() orelse return;
+        ref.moveTab(self.allocator, from, to) catch |err| {
+            log.warn("failed to reorder browser tab: {s}", .{@errorName(err)});
+            return;
+        };
         self.markDirty();
     }
 
@@ -19570,16 +19696,30 @@ pub const AppState = struct {
         self.browser_address_cursor = self.browser_state.addressInput().len;
         self.browser_address_selection_anchor = null;
         self.browser_state.status = .opening;
+        if (self.visibleBrowserPaneRefMutable()) |ref| {
+            if (ref.activeTab()) |tab| {
+                tab.loading = true;
+                tab.load_failed = false;
+            }
+        }
         self.browser_state.controller.navigate(url orelse "about:blank") catch |err| {
             log.warn("failed to activate browser tab: {s}", .{@errorName(err)});
             self.browser_state.status = .failed;
             self.browser_state.setLastError("Failed to activate browser tab.") catch {};
+            if (self.visibleBrowserPaneRefMutable()) |ref| {
+                if (ref.activeTab()) |tab| {
+                    tab.loading = false;
+                    tab.load_failed = true;
+                }
+            }
         };
     }
 
     pub fn reloadBrowser(self: *AppState) void {
+        self.setActiveBrowserTabLoadState(true, false);
         self.browser_state.controller.reload() catch |err| {
             log.warn("failed to reload browser: {s}", .{@errorName(err)});
+            self.setActiveBrowserTabLoadState(false, true);
             self.browser_state.setLastError("Failed to reload browser.") catch {};
             return;
         };
