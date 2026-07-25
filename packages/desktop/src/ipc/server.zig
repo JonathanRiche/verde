@@ -1320,9 +1320,11 @@ fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
             .shift = boolParam(params, "shift") orelse false,
             .alt = boolParam(params, "alt") orelse false,
             .super = boolParam(params, "super") orelse false,
-        }) catch |err| switch (err) {
-            error.UnsupportedBrowserCapability => return try errorResponseAlloc(allocator, id_value, "unsupported", "browser backend does not support low-level pointer injection"),
-            else => return try errorResponseAlloc(allocator, id_value, "browser_input_failed", @errorName(err)),
+        }) catch |err| {
+            if (err == error.UnsupportedBrowserCapability) {
+                return try errorResponseAlloc(allocator, id_value, "unsupported", "browser backend does not support low-level pointer injection");
+            }
+            return try errorResponseAlloc(allocator, id_value, "browser_input_failed", @errorName(err));
         };
         return try okValueResponse(allocator, id_value, .{ .accepted = true, .x = x, .y = y });
     }
