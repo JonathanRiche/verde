@@ -2443,6 +2443,32 @@ fn browserToggleCloses(controls_visible: bool, runtime_workspace_index: ?usize, 
     return workspace_index == selected_project_index;
 }
 
+fn browserNavigationUrlIsPersistable(url: []const u8) bool {
+    return std.mem.trim(u8, url, &std.ascii.whitespace).len > 0;
+}
+
+fn browserUrlsHaveSameOrigin(left: []const u8, right: []const u8) bool {
+    if (std.mem.eql(u8, left, right)) return true;
+    const left_uri = std.Uri.parse(left) catch return false;
+    const right_uri = std.Uri.parse(right) catch return false;
+    if (!std.ascii.eqlIgnoreCase(left_uri.scheme, right_uri.scheme)) return false;
+
+    var left_host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    var right_host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    const left_host = left_uri.getHost(&left_host_buffer) catch return false;
+    const right_host = right_uri.getHost(&right_host_buffer) catch return false;
+    if (!std.ascii.eqlIgnoreCase(left_host.bytes, right_host.bytes)) return false;
+
+    return browserUriEffectivePort(left_uri) == browserUriEffectivePort(right_uri);
+}
+
+fn browserUriEffectivePort(uri: std.Uri) ?u16 {
+    if (uri.port) |port| return port;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) return 80;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return 443;
+    return null;
+}
+
 const ViewFocusSnapshot = struct {
     selected_project_index: usize,
     terminal_focused: bool,
@@ -13448,6 +13474,13 @@ pub const AppState = struct {
 
         const previous_runtime_workspace = self.browser_runtime_project_index;
         const switching_workspace = previous_runtime_workspace == null or previous_runtime_workspace.? != project_index;
+        if (switching_workspace and previous_runtime_workspace != null and self.browser_state.controller.runtimeInitialized()) {
+            // WPE's legacy FDO exportable cannot be safely moved through the
+            // site processes retained by one WebKit process pool. Workspace
+            // panes keep their own lightweight snapshots, so recreate the one
+            // shared runtime when ownership moves between workspaces.
+            self.browser_state.controller.shutdown();
+        }
         const selected_index = self.selected_project_index;
         const selected_focus = if (selected_index < self.projects.items.len)
             self.projects.items[selected_index].workspace_layout.focused_pane_id
@@ -13545,6 +13578,7 @@ pub const AppState = struct {
         const normalized = try self.normalizeBrowserUrl(trimmed);
         defer self.allocator.free(normalized);
 
+        self.restartBrowserRuntimeForCrossOriginNavigation(normalized);
         self.browser_state.status = .opening;
         self.setActiveBrowserTabLoadState(true, false);
         self.browser_state.controller.navigate(normalized) catch |err| {
@@ -13678,6 +13712,7 @@ pub const AppState = struct {
     }
 
     fn recordVisibleBrowserPaneNavigation(self: *AppState, url: []const u8) void {
+        if (!browserNavigationUrlIsPersistable(url)) return;
         const ref = self.visibleBrowserPaneRefMutable() orelse return;
         const tab = ref.activeTab() orelse return;
         if (isBlankBrowserUrl(url)) {
@@ -13718,6 +13753,7 @@ pub const AppState = struct {
             log.warn("failed to update persisted browser history index: {s}", .{@errorName(err)});
             return false;
         };
+        self.restartBrowserRuntimeForCrossOriginNavigation(target.url);
         self.browser_state.status = .opening;
         self.browser_state.controller.navigate(target.url) catch |err| {
             log.warn("failed to navigate persisted browser history: {s}", .{@errorName(err)});
@@ -13729,6 +13765,16 @@ pub const AppState = struct {
         self.browser_address_cursor = self.browser_state.addressInput().len;
         self.markDirty();
         return true;
+    }
+
+    fn restartBrowserRuntimeForCrossOriginNavigation(self: *AppState, target_url: []const u8) void {
+        if (!self.browser_state.controller.runtimeInitialized()) return;
+        const current_url = self.browser_state.current_url orelse return;
+        if (browserUrlsHaveSameOrigin(current_url, target_url)) return;
+        // WebKit's WPE port retains site processes while swapping them through
+        // the one legacy FDO exportable. A fresh helper is the only public,
+        // deterministic process-pool boundary available to this backend.
+        self.browser_state.controller.shutdown();
     }
 
     fn showBrowserRuntimeForLiveOpen(self: *AppState) !void {
@@ -14687,6 +14733,7 @@ pub const AppState = struct {
             }
         }
 
+        self.restartBrowserRuntimeForCrossOriginNavigation(normalized);
         self.browser_state.status = .opening;
         self.browser_state.controller.navigate(normalized) catch |err| {
             log.err("failed to navigate browser runtime: {s}", .{@errorName(err)});
@@ -14790,6 +14837,10 @@ pub const AppState = struct {
                     self.setSidebarNotice("Browser window closed.");
                 },
                 .navigated => |url| {
+                    // WPE emits an empty URI while a fresh WebView is being
+                    // initialized. It is not a navigation and must not erase
+                    // the workspace tab snapshot used by live/MCP commands.
+                    if (!browserNavigationUrlIsPersistable(url)) continue;
                     self.clearBrowserContextMenuLocal();
                     self.browser_state.status = .ready;
                     self.setActiveBrowserTabLoadState(true, false);
@@ -19765,6 +19816,7 @@ pub const AppState = struct {
     }
 
     fn activateBrowserTabRuntime(self: *AppState, url: ?[]const u8, title: ?[]const u8) void {
+        self.restartBrowserRuntimeForCrossOriginNavigation(url orelse "about:blank");
         self.browser_state.setCurrentUrl(url) catch {};
         self.browser_state.setCurrentTitle(title) catch {};
         self.browser_state.setAddress(url orelse "");
@@ -23409,6 +23461,22 @@ test "browser toggle opens another workspace without closing its active browser"
     try std.testing.expect(browserToggleCloses(true, null, 1));
     try std.testing.expect(browserToggleCloses(true, 1, 1));
     try std.testing.expect(!browserToggleCloses(true, 0, 1));
+}
+
+test "browser origin comparison preserves same-site runtime only" {
+    try std.testing.expect(browserUrlsHaveSameOrigin("about:blank", "about:blank"));
+    try std.testing.expect(browserUrlsHaveSameOrigin("https://example.com/one", "https://EXAMPLE.com/two"));
+    try std.testing.expect(browserUrlsHaveSameOrigin("https://example.com/", "https://example.com:443/path"));
+    try std.testing.expect(!browserUrlsHaveSameOrigin("http://example.com/", "https://example.com/"));
+    try std.testing.expect(!browserUrlsHaveSameOrigin("https://example.com/", "https://example.org/"));
+    try std.testing.expect(!browserUrlsHaveSameOrigin("https://example.com:8443/", "https://example.com/"));
+}
+
+test "browser navigation persistence rejects empty backend URI events" {
+    try std.testing.expect(!browserNavigationUrlIsPersistable(""));
+    try std.testing.expect(!browserNavigationUrlIsPersistable(" \t\r\n"));
+    try std.testing.expect(browserNavigationUrlIsPersistable("about:blank"));
+    try std.testing.expect(browserNavigationUrlIsPersistable("https://example.com/"));
 }
 
 test "shared browser runtime routes state through its workspace owner" {

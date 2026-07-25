@@ -153,10 +153,7 @@ static gboolean verde_browser_linux_disable_process_swapping(WebKitSettings *set
         if (feature == NULL || g_strcmp0(webkit_feature_get_identifier(feature), VERDE_BROWSER_LINUX_PROCESS_SWAP_FEATURE) != 0) {
             continue;
         }
-        // A legacy FDO exportable owns one nested Wayland compositor
-        // connection. Moving it between cross-site WebProcesses can invalidate
-        // that connection, after which every replacement process aborts while
-        // binding wl_compositor. Keep the shared Verde runtime in one process.
+        // Avoid handing one legacy FDO exportable between site processes.
         webkit_settings_set_feature_enabled(settings, feature, FALSE);
         disabled = !webkit_settings_get_feature_enabled(settings, feature);
         break;
@@ -1314,19 +1311,27 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
     wpe_view_backend_set_target_refresh_rate(browser->view_backend, 60000);
     wpe_view_backend_add_activity_state(browser->view_backend, wpe_view_activity_state_visible | wpe_view_activity_state_in_window);
 
-    browser->webkit_backend = webkit_web_view_backend_new(browser->view_backend, verde_browser_linux_destroy_exportable, browser->exportable);
-    browser->web_view = WEBKIT_WEB_VIEW(webkit_web_view_new(browser->webkit_backend));
-    browser->content_manager = webkit_web_view_get_user_content_manager(browser->web_view);
-    g_object_ref(browser->content_manager);
-
-    WebKitColor background = { 1.0, 1.0, 1.0, 1.0 };
-    webkit_web_view_set_background_color(browser->web_view, &background);
-    WebKitSettings *settings = webkit_web_view_get_settings(browser->web_view);
+    WebKitSettings *settings = webkit_settings_new();
     webkit_settings_set_enable_developer_extras(settings, TRUE);
     if (!verde_browser_linux_disable_process_swapping(settings)) {
         fprintf(stderr, "verde-browser-linux WPE: failed to disable cross-site WebProcess swapping\n");
         fflush(stderr);
     }
+
+    browser->webkit_backend = webkit_web_view_backend_new(browser->view_backend, verde_browser_linux_destroy_exportable, browser->exportable);
+    browser->web_view = WEBKIT_WEB_VIEW(g_object_new(
+        WEBKIT_TYPE_WEB_VIEW,
+        "backend", browser->webkit_backend,
+        "web-context", webkit_web_context_get_default(),
+        "settings", settings,
+        NULL
+    ));
+    g_object_unref(settings);
+    browser->content_manager = webkit_web_view_get_user_content_manager(browser->web_view);
+    g_object_ref(browser->content_manager);
+
+    WebKitColor background = { 1.0, 1.0, 1.0, 1.0 };
+    webkit_web_view_set_background_color(browser->web_view, &background);
 
     verde_browser_linux_add_prefer_dark_scheme_script(browser->content_manager);
 
