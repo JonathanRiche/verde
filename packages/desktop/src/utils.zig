@@ -1,7 +1,9 @@
-const app_state = @import("state.zig");
 const ai_harness = @import("harness.zig");
+const chat_types = @import("state/chat_types.zig");
 const loop_wakeup = @import("loop_wakeup");
 const platform_runtime = @import("platform_runtime");
+const provider_models = @import("state/provider_models.zig");
+const state_ui_types = @import("state/ui_types.zig");
 const windows_integrations = @import("platform/windows/integrations.zig");
 const process_env = @import("process_env.zig");
 const runtime_log = @import("runtime_log.zig");
@@ -38,16 +40,16 @@ pub const OpenFileResult = enum {
     file_manager,
 };
 
-pub fn loadEmbeddedTexture(bytes: []const u8) ?app_state.CachedImageTexture {
+pub fn loadEmbeddedTexture(bytes: []const u8) ?state_ui_types.CachedImageTexture {
     const loaded = stb_image.loadFromMemory(bytes) catch |err| {
-        app_state.log.err("failed to decode embedded logo texture: {s}", .{@errorName(err)});
+        log.err("failed to decode embedded logo texture: {s}", .{@errorName(err)});
         return null;
     };
     defer loaded.deinit();
     return uploadTexture(loaded);
 }
 
-pub fn uploadTexture(loaded: stb_image.LoadedImage) ?app_state.CachedImageTexture {
+pub fn uploadTexture(loaded: stb_image.LoadedImage) ?state_ui_types.CachedImageTexture {
     _ = loaded;
     return null;
 }
@@ -169,7 +171,7 @@ pub fn openUrlInDefaultBrowser(allocator: std.mem.Allocator, url: []const u8) Op
     };
 }
 
-pub fn canOpenProjectEditor(target: app_state.ProjectEditorTarget) bool {
+pub fn canOpenProjectEditor(target: state_ui_types.ProjectEditorTarget) bool {
     return switch (target) {
         .configured => canOpenConfiguredEditor(),
         .cursor => hasCursorLauncher(),
@@ -203,7 +205,7 @@ pub fn executableNameForCommand(command: []const u8) []const u8 {
 pub fn openProjectEditor(
     allocator: std.mem.Allocator,
     project_path: []const u8,
-    target: app_state.ProjectEditorTarget,
+    target: state_ui_types.ProjectEditorTarget,
 ) OpenProjectError!void {
     return switch (target) {
         .configured => {
@@ -251,7 +253,7 @@ pub fn runCustomProjectCommand(
     return spawnDetached(allocator, &.{ "sh", "-lc", command, "verde-open-action", project_path }, project_path);
 }
 
-pub fn pickerWorker(state: *app_state.PickerState, start_path: []u8) void {
+pub fn pickerWorker(state: *state_ui_types.PickerState, start_path: []u8) void {
     defer std.heap.page_allocator.free(start_path);
 
     runtime_log.diagnostic("pickerWorker start path={s}", .{start_path});
@@ -463,7 +465,7 @@ fn runDirectoryPickerCommand(
     return allocator.dupe(u8, trimmed);
 }
 
-pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void {
+pub fn sendWorker(state: *chat_types.SendState, request: *SendWorkerRequest) void {
     const page_alloc = std.heap.page_allocator;
     const request_cwd = request.remote_cwd orelse request.project_path;
     defer {
@@ -558,9 +560,9 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
     }
 }
 pub const SendWorkerRequest = struct {
-    send_state_ptr: *app_state.SendState,
-    provider: app_state.Provider,
-    harness: app_state.Harness,
+    send_state_ptr: *chat_types.SendState,
+    provider: provider_models.Provider,
+    harness: provider_models.Harness,
     project_path: []u8,
     prompt: []u8,
     image_path: ?[]u8,
@@ -568,19 +570,19 @@ pub const SendWorkerRequest = struct {
     provider_thread_id: ?[]u8,
     thread_title: []u8,
     model_ref: ?[]u8,
-    reasoning_effort: ?app_state.ReasoningEffort,
+    reasoning_effort: ?provider_models.ReasoningEffort,
     /// Owned; OpenCode-only. Duplicated from thread `opencode_reasoning_variant`.
     opencode_reasoning_variant: ?[]u8,
     cursor_model_params_json: ?[]u8,
-    fast_mode: app_state.FastMode,
-    access_mode: app_state.AccessMode,
+    fast_mode: provider_models.FastMode,
+    access_mode: provider_models.AccessMode,
     remote_ssh_host: ?[]u8 = null,
     remote_cwd: ?[]u8 = null,
 };
 pub fn runSendWorker(
     allocator: std.mem.Allocator,
     request: *const SendWorkerRequest,
-) !app_state.SendResultPayload {
+) !chat_types.SendResultPayload {
     if (request.harness != .local_cli) {
         return error.UnsupportedHarnessMode;
     }
@@ -1340,7 +1342,7 @@ fn commandExists(name: []const u8) bool {
 
 fn formatSendWorkerError(
     allocator: std.mem.Allocator,
-    provider: app_state.Provider,
+    provider: provider_models.Provider,
     err: anyerror,
 ) ![]u8 {
     return switch (err) {
@@ -1409,7 +1411,7 @@ fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn isProviderUsageLimitFailure(provider: app_state.Provider, message: []const u8) bool {
+fn isProviderUsageLimitFailure(provider: provider_models.Provider, message: []const u8) bool {
     if (provider != .claude and provider != .codex) return false;
     const markers = [_][]const u8{
         "usage limit",
@@ -1427,7 +1429,7 @@ fn isProviderUsageLimitFailure(provider: app_state.Provider, message: []const u8
 }
 
 /// Converts provider failures into stable, actionable transcript text.
-pub fn providerFailureDisplayMessage(provider: app_state.Provider, message: []const u8) []const u8 {
+pub fn providerFailureDisplayMessage(provider: provider_models.Provider, message: []const u8) []const u8 {
     if (!isProviderUsageLimitFailure(provider, message)) return message;
     return switch (provider) {
         .claude => if (asciiContainsIgnoreCase(message, "seven_day_opus") or asciiContainsIgnoreCase(message, "weekly opus"))
@@ -1454,7 +1456,7 @@ pub fn providerFailureDisplayMessage(provider: app_state.Provider, message: []co
 }
 
 /// Identifies a normalized provider usage-limit row for transcript rendering.
-pub fn usageLimitProviderForDisplayMessage(message: []const u8) ?app_state.Provider {
+pub fn usageLimitProviderForDisplayMessage(message: []const u8) ?provider_models.Provider {
     const claude_messages = [_][]const u8{
         CLAUDE_USAGE_LIMIT_MESSAGE,
         CLAUDE_PLAN_LIMIT_MESSAGE,
@@ -1471,7 +1473,7 @@ pub fn usageLimitProviderForDisplayMessage(message: []const u8) ?app_state.Provi
 }
 
 /// Identifies persisted failures written before provider error details were retained.
-pub fn legacyProviderFailureForDisplayMessage(message_raw: []const u8) ?app_state.Provider {
+pub fn legacyProviderFailureForDisplayMessage(message_raw: []const u8) ?provider_models.Provider {
     const message = std.mem.trim(u8, message_raw, &std.ascii.whitespace);
     const claude_messages = [_][]const u8{
         "ClaudeRequestFailed",
@@ -1491,7 +1493,7 @@ pub fn legacyProviderFailureForDisplayMessage(message_raw: []const u8) ?app_stat
 }
 
 /// Returns the provider for any failure row that can offer a `/usage` action.
-pub fn providerFailureActionProvider(message: []const u8) ?app_state.Provider {
+pub fn providerFailureActionProvider(message: []const u8) ?provider_models.Provider {
     return usageLimitProviderForDisplayMessage(message) orelse legacyProviderFailureForDisplayMessage(message);
 }
 
@@ -1520,14 +1522,14 @@ fn shellSingleQuoteEscape(allocator: std.mem.Allocator, value: []const u8) ![]u8
     return escaped.toOwnedSlice(allocator);
 }
 
-pub fn approvalPolicyForMode(_: app_state.Provider, mode: app_state.AccessMode) ?ai_harness.ApprovalPolicy {
+pub fn approvalPolicyForMode(_: provider_models.Provider, mode: provider_models.AccessMode) ?ai_harness.ApprovalPolicy {
     return switch (mode) {
         .full_access => .never,
         .supervised => .on_request,
     };
 }
 
-pub fn serviceTierForMode(provider: app_state.Provider, fast_mode: app_state.FastMode) ?ai_harness.ServiceTier {
+pub fn serviceTierForMode(provider: provider_models.Provider, fast_mode: provider_models.FastMode) ?ai_harness.ServiceTier {
     if (provider != .codex) return null;
     return switch (fast_mode) {
         .on => .fast,
@@ -1535,7 +1537,7 @@ pub fn serviceTierForMode(provider: app_state.Provider, fast_mode: app_state.Fas
     };
 }
 
-pub fn sandboxModeForMode(provider: app_state.Provider, mode: app_state.AccessMode) ?ai_harness.SandboxMode {
+pub fn sandboxModeForMode(provider: provider_models.Provider, mode: provider_models.AccessMode) ?ai_harness.SandboxMode {
     if (provider != .codex and provider != .claude) return null;
     return switch (mode) {
         .full_access => .danger_full_access,
@@ -1543,7 +1545,7 @@ pub fn sandboxModeForMode(provider: app_state.Provider, mode: app_state.AccessMo
     };
 }
 fn handleSendThreadId(context: ?*anyopaque, thread_id: []const u8) void {
-    const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
+    const send_state: *chat_types.SendState = @ptrCast(@alignCast(context orelse return));
     const page_alloc = std.heap.page_allocator;
 
     send_state.mutex.lock();
@@ -1565,7 +1567,7 @@ fn handleSendThreadId(context: ?*anyopaque, thread_id: []const u8) void {
     loop_wakeup.notify();
 }
 fn handleSendTurnId(context: ?*anyopaque, turn_id: []const u8) void {
-    const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
+    const send_state: *chat_types.SendState = @ptrCast(@alignCast(context orelse return));
     const page_alloc = std.heap.page_allocator;
 
     send_state.mutex.lock();
@@ -1587,7 +1589,7 @@ fn handleSendTurnId(context: ?*anyopaque, turn_id: []const u8) void {
     loop_wakeup.notify();
 }
 fn handleSendStreamDelta(context: ?*anyopaque, delta: []const u8) void {
-    const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
+    const send_state: *chat_types.SendState = @ptrCast(@alignCast(context orelse return));
     const page_alloc = std.heap.page_allocator;
 
     send_state.mutex.lock();
@@ -1610,7 +1612,7 @@ fn handleSendStreamDelta(context: ?*anyopaque, delta: []const u8) void {
     loop_wakeup.notify();
 }
 fn handleSendStreamEvent(context: ?*anyopaque, event: ai_harness.StreamEvent) void {
-    const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
+    const send_state: *chat_types.SendState = @ptrCast(@alignCast(context orelse return));
     const page_alloc = std.heap.page_allocator;
 
     send_state.mutex.lock();
@@ -1805,7 +1807,7 @@ fn toolCallFallbackBody(kind: ?ai_harness.ToolCallKind, status: ?ai_harness.Tool
 /// compatibility event because it cannot be correlated safely.
 pub fn upsertPendingToolCallEvent(
     allocator: std.mem.Allocator,
-    events: *std.ArrayListUnmanaged(app_state.PendingTimelineEvent),
+    events: *std.ArrayListUnmanaged(chat_types.PendingTimelineEvent),
     tool_call: ai_harness.ToolCallUpdate,
 ) !void {
     if (tool_call.call_id.len > 0) {
@@ -1921,7 +1923,7 @@ fn dupeOptionalNonEmpty(allocator: std.mem.Allocator, value: []const u8) !?[]u8 
 }
 
 fn handleSendFailure(context: ?*anyopaque, message: []const u8) void {
-    const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
+    const send_state: *chat_types.SendState = @ptrCast(@alignCast(context orelse return));
     const page_alloc = std.heap.page_allocator;
 
     send_state.mutex.lock();
@@ -1936,13 +1938,13 @@ fn handleSendFailure(context: ?*anyopaque, message: []const u8) void {
 }
 
 fn handleSendShouldStop(context: ?*anyopaque) bool {
-    const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return true));
+    const send_state: *chat_types.SendState = @ptrCast(@alignCast(context orelse return true));
     send_state.mutex.lock();
     defer send_state.mutex.unlock();
     return send_state.stop_requested;
 }
 
-pub fn flushPendingAssistantTextLocked(send_state: *app_state.SendState, allocator: std.mem.Allocator) void {
+pub fn flushPendingAssistantTextLocked(send_state: *chat_types.SendState, allocator: std.mem.Allocator) void {
     if (send_state.partial_text.items.len == 0) return;
     const provider = send_state.provider orelse return;
     const trimmed = std.mem.trim(u8, send_state.partial_text.items, &std.ascii.whitespace);
@@ -1972,7 +1974,7 @@ pub fn flushPendingAssistantTextLocked(send_state: *app_state.SendState, allocat
 }
 pub fn mergePendingDiffFilesLocked(
     allocator: std.mem.Allocator,
-    target: *std.ArrayListUnmanaged(app_state.PendingDiffFile),
+    target: *std.ArrayListUnmanaged(chat_types.PendingDiffFile),
     files: []const ai_harness.StreamDiffFile,
 ) void {
     for (files) |file| {
@@ -1981,7 +1983,7 @@ pub fn mergePendingDiffFilesLocked(
 }
 fn upsertPendingDiffFileLocked(
     allocator: std.mem.Allocator,
-    target: *std.ArrayListUnmanaged(app_state.PendingDiffFile),
+    target: *std.ArrayListUnmanaged(chat_types.PendingDiffFile),
     file: ai_harness.StreamDiffFile,
 ) !void {
     for (target.items) |*existing| {
@@ -2002,11 +2004,11 @@ fn upsertPendingDiffFileLocked(
         .expanded = false,
     });
 }
-pub fn providerLabel(provider: app_state.Provider) [:0]const u8 {
+pub fn providerLabel(provider: provider_models.Provider) [:0]const u8 {
     return chat_threads.providerLabel(provider);
 }
 fn handleSendApprovalRequest(context: ?*anyopaque, request: ai_harness.ApprovalRequest) ai_harness.ApprovalDecision {
-    const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return .deny));
+    const send_state: *chat_types.SendState = @ptrCast(@alignCast(context orelse return .deny));
     const page_alloc = std.heap.page_allocator;
 
     const owned_call_id = page_alloc.dupe(u8, request.call_id) catch return .deny;
@@ -2049,7 +2051,7 @@ fn handleSendApprovalRequest(context: ?*anyopaque, request: ai_harness.ApprovalR
     loop_wakeup.notify();
     return decision;
 }
-pub fn freePendingApproval(allocator: std.mem.Allocator, approval: *?app_state.PendingApproval) void {
+pub fn freePendingApproval(allocator: std.mem.Allocator, approval: *?chat_types.PendingApproval) void {
     if (approval.*) |pending| {
         allocator.free(pending.call_id);
         allocator.free(pending.title);
@@ -2057,11 +2059,11 @@ pub fn freePendingApproval(allocator: std.mem.Allocator, approval: *?app_state.P
         approval.* = null;
     }
 }
-pub fn freePendingApprovalLocked(allocator: std.mem.Allocator, approval: *?app_state.PendingApproval) void {
+pub fn freePendingApprovalLocked(allocator: std.mem.Allocator, approval: *?chat_types.PendingApproval) void {
     freePendingApproval(allocator, approval);
 }
 
-fn freePendingTimelineEvent(allocator: std.mem.Allocator, event: app_state.PendingTimelineEvent) void {
+fn freePendingTimelineEvent(allocator: std.mem.Allocator, event: chat_types.PendingTimelineEvent) void {
     allocator.free(event.author);
     allocator.free(event.body);
     if (event.tool_call_id) |call_id| allocator.free(call_id);
@@ -2076,7 +2078,7 @@ fn freePendingTimelineEvent(allocator: std.mem.Allocator, event: app_state.Pendi
 /// Releases owned streamed timeline events copied out of the send worker.
 pub fn freePendingTimelineEvents(
     allocator: std.mem.Allocator,
-    events: *std.ArrayListUnmanaged(app_state.PendingTimelineEvent),
+    events: *std.ArrayListUnmanaged(chat_types.PendingTimelineEvent),
 ) void {
     for (events.items) |event| freePendingTimelineEvent(allocator, event);
     events.deinit(allocator);
@@ -2085,7 +2087,7 @@ pub fn freePendingTimelineEvents(
 
 pub fn freePendingTimelineEventsLocked(
     allocator: std.mem.Allocator,
-    events: *std.ArrayListUnmanaged(app_state.PendingTimelineEvent),
+    events: *std.ArrayListUnmanaged(chat_types.PendingTimelineEvent),
 ) void {
     freePendingTimelineEvents(allocator, events);
 }
@@ -2093,7 +2095,7 @@ pub fn freePendingTimelineEventsLocked(
 /// Releases owned streamed diff entries copied out of the send worker.
 pub fn freePendingDiffFiles(
     allocator: std.mem.Allocator,
-    files: *std.ArrayListUnmanaged(app_state.PendingDiffFile),
+    files: *std.ArrayListUnmanaged(chat_types.PendingDiffFile),
 ) void {
     for (files.items) |file| {
         allocator.free(file.path);
@@ -2105,7 +2107,7 @@ pub fn freePendingDiffFiles(
 
 pub fn freePendingDiffFilesLocked(
     allocator: std.mem.Allocator,
-    files: *std.ArrayListUnmanaged(app_state.PendingDiffFile),
+    files: *std.ArrayListUnmanaged(chat_types.PendingDiffFile),
 ) void {
     freePendingDiffFiles(allocator, files);
 }
@@ -2113,8 +2115,8 @@ pub fn freePendingDiffFilesLocked(
 /// Persists the streamed diff summary as a synthetic system event on completion.
 pub fn appendPendingDiffSummaryEvent(
     allocator: std.mem.Allocator,
-    events: *std.ArrayListUnmanaged(app_state.PendingTimelineEvent),
-    files: []const app_state.PendingDiffFile,
+    events: *std.ArrayListUnmanaged(chat_types.PendingTimelineEvent),
+    files: []const chat_types.PendingDiffFile,
 ) void {
     if (files.len == 0) return;
 
@@ -2137,8 +2139,8 @@ pub fn appendPendingDiffSummaryEvent(
 
 pub fn upsertPendingDiffSummaryEventLocked(
     allocator: std.mem.Allocator,
-    events: *std.ArrayListUnmanaged(app_state.PendingTimelineEvent),
-    files: []const app_state.PendingDiffFile,
+    events: *std.ArrayListUnmanaged(chat_types.PendingTimelineEvent),
+    files: []const chat_types.PendingDiffFile,
 ) void {
     if (files.len == 0) return;
     const body = diffSummaryBodyAlloc(allocator, files) catch return;
@@ -2167,7 +2169,7 @@ pub fn upsertPendingDiffSummaryEventLocked(
 
 fn diffSummaryBodyAlloc(
     allocator: std.mem.Allocator,
-    files: []const app_state.PendingDiffFile,
+    files: []const chat_types.PendingDiffFile,
 ) ![]u8 {
     var body: std.ArrayListUnmanaged(u8) = .empty;
     errdefer body.deinit(allocator);
@@ -2201,7 +2203,7 @@ pub fn isPersistedDiffBody(body: []const u8) bool {
 /// transient liveness feedback and are removed outright instead.
 pub fn cancelLingeringToolCallEvents(
     allocator: std.mem.Allocator,
-    events: *std.ArrayListUnmanaged(app_state.PendingTimelineEvent),
+    events: *std.ArrayListUnmanaged(chat_types.PendingTimelineEvent),
 ) void {
     var index: usize = events.items.len;
     while (index > 0) {
@@ -2223,7 +2225,7 @@ pub fn cancelLingeringToolCallEvents(
     }
 }
 
-pub fn pendingTimelineEventsContainAssistant(events: []const app_state.PendingTimelineEvent) bool {
+pub fn pendingTimelineEventsContainAssistant(events: []const chat_types.PendingTimelineEvent) bool {
     for (events) |event| {
         if (event.role == .assistant) return true;
     }
@@ -2231,7 +2233,7 @@ pub fn pendingTimelineEventsContainAssistant(events: []const app_state.PendingTi
 }
 
 test "structured tool-call updates upsert and merge lifecycle content" {
-    var events: std.ArrayListUnmanaged(app_state.PendingTimelineEvent) = .empty;
+    var events: std.ArrayListUnmanaged(chat_types.PendingTimelineEvent) = .empty;
     defer freePendingTimelineEvents(std.testing.allocator, &events);
 
     try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
@@ -2262,7 +2264,7 @@ test "structured tool-call updates upsert and merge lifecycle content" {
 }
 
 test "tagged MCP completion promotes the specific tool name" {
-    var events: std.ArrayListUnmanaged(app_state.PendingTimelineEvent) = .empty;
+    var events: std.ArrayListUnmanaged(chat_types.PendingTimelineEvent) = .empty;
     defer freePendingTimelineEvents(std.testing.allocator, &events);
 
     try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
@@ -2285,7 +2287,7 @@ test "tagged MCP completion promotes the specific tool name" {
 }
 
 test "lingering running tool calls are cancelled at turn end" {
-    var events: std.ArrayListUnmanaged(app_state.PendingTimelineEvent) = .empty;
+    var events: std.ArrayListUnmanaged(chat_types.PendingTimelineEvent) = .empty;
     defer freePendingTimelineEvents(std.testing.allocator, &events);
 
     try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
@@ -2335,7 +2337,7 @@ test "transient think detection drives the pending thinking indicator" {
 }
 
 test "content-less think rows are transient across their lifecycle" {
-    var events: std.ArrayListUnmanaged(app_state.PendingTimelineEvent) = .empty;
+    var events: std.ArrayListUnmanaged(chat_types.PendingTimelineEvent) = .empty;
     defer freePendingTimelineEvents(std.testing.allocator, &events);
 
     try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
@@ -2800,7 +2802,7 @@ pub fn extensionForImageMime(mime: []const u8) []const u8 {
 }
 
 test "handleSendThreadId stores provisional provider thread id while pending" {
-    var send_state = app_state.SendState{ .status = .pending };
+    var send_state = chat_types.SendState{ .status = .pending };
     defer if (send_state.provisional_provider_thread_id) |thread_id| std.heap.page_allocator.free(thread_id);
 
     handleSendThreadId(&send_state, "ses_123");
@@ -2828,7 +2830,7 @@ test "configured editor parsing preserves Windows paths and quoted arguments" {
 
 test "upsertPendingDiffFileLocked clears stale patch when later snapshot omits it" {
     const allocator = std.testing.allocator;
-    var files: std.ArrayListUnmanaged(app_state.PendingDiffFile) = .empty;
+    var files: std.ArrayListUnmanaged(chat_types.PendingDiffFile) = .empty;
     defer freePendingDiffFiles(allocator, &files);
 
     try upsertPendingDiffFileLocked(allocator, &files, .{
@@ -2850,9 +2852,9 @@ test "upsertPendingDiffFileLocked clears stale patch when later snapshot omits i
 
 test "streamed diff becomes a live timeline event and updates in place" {
     const allocator = std.testing.allocator;
-    var files: std.ArrayListUnmanaged(app_state.PendingDiffFile) = .empty;
+    var files: std.ArrayListUnmanaged(chat_types.PendingDiffFile) = .empty;
     defer freePendingDiffFiles(allocator, &files);
-    var events: std.ArrayListUnmanaged(app_state.PendingTimelineEvent) = .empty;
+    var events: std.ArrayListUnmanaged(chat_types.PendingTimelineEvent) = .empty;
     defer freePendingTimelineEvents(allocator, &events);
 
     mergePendingDiffFilesLocked(allocator, &files, &.{.{
@@ -2893,13 +2895,13 @@ test "provider failure display identifies Claude and Codex usage limits" {
         "Authentication failed",
         providerFailureDisplayMessage(.claude, "Authentication failed"),
     );
-    try std.testing.expectEqual(app_state.Provider.claude, usageLimitProviderForDisplayMessage(CLAUDE_USAGE_LIMIT_MESSAGE).?);
-    try std.testing.expectEqual(app_state.Provider.codex, usageLimitProviderForDisplayMessage(CODEX_USAGE_LIMIT_MESSAGE).?);
+    try std.testing.expectEqual(provider_models.Provider.claude, usageLimitProviderForDisplayMessage(CLAUDE_USAGE_LIMIT_MESSAGE).?);
+    try std.testing.expectEqual(provider_models.Provider.codex, usageLimitProviderForDisplayMessage(CODEX_USAGE_LIMIT_MESSAGE).?);
 }
 
 test "legacy provider failures retain an actionable usage path" {
-    try std.testing.expectEqual(app_state.Provider.claude, providerFailureActionProvider("ClaudeRequestFailed").?);
-    try std.testing.expectEqual(app_state.Provider.codex, providerFailureActionProvider("Provider request failed: CodexTurnFailed").?);
+    try std.testing.expectEqual(provider_models.Provider.claude, providerFailureActionProvider("ClaudeRequestFailed").?);
+    try std.testing.expectEqual(provider_models.Provider.codex, providerFailureActionProvider("Provider request failed: CodexTurnFailed").?);
     try std.testing.expect(std.mem.indexOf(u8, providerFailureActionBody("ClaudeRequestFailed"), "did not save") != null);
     try std.testing.expect(providerFailureActionProvider("Authentication failed") == null);
 }

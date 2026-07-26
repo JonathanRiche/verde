@@ -239,7 +239,7 @@ fn statusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state:
         try s.write(null);
     }
     try s.objectField("pending_send_count");
-    try s.write(state.pending_send_count);
+    try s.write(state.pendingSendCount());
     try s.objectField("focus");
     try writeFocusStatus(&s, state);
     try s.objectField("browser");

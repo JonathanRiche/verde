@@ -495,7 +495,7 @@ fn mainInner(init: std.process.Init) !void {
     defer keyboard.deinit();
     // Reloads swap the config in place through this same pointer, so the
     // palette's accelerator hints stay live across keybind refreshes.
-    state.keyboard_config = &keyboard;
+    state.command_controller.keyboard_config = &keyboard;
 
     log.info("verde main loop starting", .{});
     defer log.info("verde main loop exiting", .{});
@@ -1298,7 +1298,7 @@ fn appNeedsContinuousFrames(state: *AppState) bool {
         // Settings modal fades in/out for ~160ms.
         state.settingsModalAnimating() or
         // Pending turns animate the stop control and transcript activity cue.
-        state.pending_send_count > 0 or
+        state.pendingSendCount() > 0 or
         // Pulsing sidebar status pips need a steady tick or the sine wave
         // gets sampled at the 1Hz "Working" label cadence and looks steppy.
         state.sidebar_pulse_animating;
@@ -1316,7 +1316,7 @@ fn eventWaitTimeoutMs(state: *AppState) c_int {
     if (state.sidebar_pulse_animating) return PIP_PULSE_WAIT_TIMEOUT_MS;
     // Pending turns own visible activity motion as well as the wall-clock
     // "Working" label, so they share the sidebar pip's 30fps cadence.
-    if (state.pending_send_count > 0) return PENDING_SEND_WAIT_TIMEOUT_MS;
+    if (state.pendingSendCount() > 0) return PENDING_SEND_WAIT_TIMEOUT_MS;
     if (state.hasPendingSlashCommand()) return SLASH_COMMAND_ANIMATION_WAIT_TIMEOUT_MS;
     if (state.hasRunningBackgroundTasks()) return BACKGROUND_TASK_WAIT_TIMEOUT_MS;
     return IDLE_WAIT_TIMEOUT_MS;
