@@ -355,7 +355,7 @@ fn focusedCursorReadOnly(state: *runtime.AppState) usize {
         .project_rename => state.project_rename_cursor,
         .thread_import => state.thread_import_cursor,
         .project_import => state.project_import_cursor,
-        .command_palette => state.command_palette_cursor,
+        .command_palette => state.command_controller.cursor,
         .none => 0,
     };
 }
@@ -634,7 +634,7 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
         .thread_import => insertIntoZBuffer(state.threadImportThreadIdBuffer(), &state.thread_import_cursor, text),
         .project_import => insertIntoZBuffer(state.importPathBuffer(), &state.project_import_cursor, text),
         .command_palette => blk: {
-            const inserted = insertIntoZBuffer(state.commandPaletteQueryBuffer(), &state.command_palette_cursor, text);
+            const inserted = insertIntoZBuffer(state.commandPaletteQueryBuffer(), &state.command_controller.cursor, text);
             state.markDirty();
             break :blk inserted;
         },
@@ -653,11 +653,11 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
         state.handoff_modal_open or
         state.show_project_creator or
         state.show_settings_modal or
-        state.command_palette_open;
+        state.command_controller.open;
     if (!has_modal_open) return false;
     // Palette-owned navigation/activation keys; editing keys fall through to
     // the shared modal text path below.
-    if (state.command_palette_open and command_palette.handleKeyDown(state, event)) return true;
+    if (state.command_controller.open and command_palette.handleKeyDown(state, event)) return true;
     if (state.show_settings_modal and settings_modal.handleKeyDown(state, event.key)) return true;
     const primary = (keymodBits(event.mod) & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
     const shift = (keymodBits(event.mod) & sdl.Keymod.shift) != 0;
@@ -772,7 +772,7 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
 }
 
 fn dismissTopModal(state: *runtime.AppState) void {
-    if (state.command_palette_open) {
+    if (state.command_controller.open) {
         state.closeCommandPalette();
         return;
     }
@@ -855,7 +855,7 @@ fn focusedCursor(state: *runtime.AppState) ?*usize {
         .project_rename => &state.project_rename_cursor,
         .thread_import => &state.thread_import_cursor,
         .project_import => &state.project_import_cursor,
-        .command_palette => &state.command_palette_cursor,
+        .command_palette => &state.command_controller.cursor,
         .none => null,
     };
 }

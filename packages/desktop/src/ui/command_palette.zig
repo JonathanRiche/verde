@@ -247,7 +247,7 @@ pub fn registerHits(
     height: f32,
     queueHit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void,
 ) void {
-    if (!state.command_palette_open) return;
+    if (!state.command_controller.open) return;
     computeLayout(state, width, height);
     const scrim: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = width, .h = height };
     queueHit(state, scrim, .modal_dismiss, 0);
@@ -259,7 +259,7 @@ pub fn registerHits(
         if (!rowVisible(row_rects[i])) continue;
         queueHit(state, row_rects[i], .command_palette_row, i);
     }
-    if (state.command_palette_action_menu_open) {
+    if (state.command_controller.action_menu_open) {
         var ai: usize = 0;
         while (ai < action_count) : (ai += 1) {
             queueHit(state, action_rects[ai], .command_palette_action_row, ai);
@@ -269,7 +269,7 @@ pub fn registerHits(
 
 /// Updates the hovered result row from the retained modal hits.
 pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
-    if (!state.command_palette_open) {
+    if (!state.command_controller.open) {
         if (hovered_row != null) {
             hovered_row = null;
             state.markDirty();
@@ -293,7 +293,7 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
 
 /// Routes wheel input to the result list while the palette is open.
 pub fn handleWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y: f32, wheel_y: f32) bool {
-    if (!state.command_palette_open) return false;
+    if (!state.command_controller.open) return false;
     _ = width;
     _ = height;
     if (!rectContainsPoint(modal_rect, x, y)) return true; // swallow: scrim owns the screen
@@ -306,12 +306,12 @@ pub fn handleWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y:
 /// Returns false for keys the shared modal text-editing path should handle
 /// (cursor movement, clipboard, backspace, character input).
 pub fn handleKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) bool {
-    if (!state.command_palette_open) return false;
+    if (!state.command_controller.open) return false;
     const primary = (keymodBits(event.mod) & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
     switch (event.key) {
         .escape => {
-            if (state.command_palette_action_menu_open) {
-                state.command_palette_action_menu_open = false;
+            if (state.command_controller.action_menu_open) {
+                state.command_controller.action_menu_open = false;
             } else {
                 state.closeCommandPalette();
             }
@@ -319,7 +319,7 @@ pub fn handleKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) 
             return true;
         },
         .up => {
-            if (state.command_palette_action_menu_open) {
+            if (state.command_controller.action_menu_open) {
                 moveActionSelection(state, -1);
             } else {
                 moveSelection(state, -1);
@@ -327,7 +327,7 @@ pub fn handleKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) 
             return true;
         },
         .down => {
-            if (state.command_palette_action_menu_open) {
+            if (state.command_controller.action_menu_open) {
                 moveActionSelection(state, 1);
             } else {
                 moveSelection(state, 1);
@@ -339,19 +339,19 @@ pub fn handleKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) 
             return true;
         },
         .@"return", .kp_enter => {
-            if (state.command_palette_action_menu_open) {
-                runActionRow(state, state.command_palette_action_selected);
+            if (state.command_controller.action_menu_open) {
+                runActionRow(state, state.command_controller.action_selected);
             } else {
-                activateRow(state, state.command_palette_selected, primary);
+                activateRow(state, state.command_controller.selected, primary);
             }
             return true;
         },
         .p => {
             // Ctrl+Shift+P while open: scoped → widen to global; global → toggle off.
             if (primary) {
-                if (state.command_palette_scope_project != null) {
-                    state.command_palette_scope_project = null;
-                    state.command_palette_selected = 0;
+                if (state.command_controller.scope_project != null) {
+                    state.command_controller.scope_project = null;
+                    state.command_controller.selected = 0;
                     scroll_y = 0.0;
                     state.markDirty();
                 } else {
@@ -409,14 +409,14 @@ pub fn activateRow(state: *runtime.AppState, row_index: usize, split: bool) void
 /// Runs a row from the Tab action submenu against the selected thread.
 pub fn runActionRow(state: *runtime.AppState, action_index: usize) void {
     if (action_index >= action_count) return;
-    const selected = state.command_palette_selected;
+    const selected = state.command_controller.selected;
     if (selected >= result_count) return;
     const tr = switch (results[selected].ref) {
         .thread => |t| t,
         else => return,
     };
     if (!action_enabled[action_index]) return;
-    state.command_palette_action_menu_open = false;
+    state.command_controller.action_menu_open = false;
     state.noteInteraction();
     switch (action_kinds[action_index]) {
         .open => {
@@ -446,7 +446,7 @@ pub fn runActionRow(state: *runtime.AppState, action_index: usize) void {
         },
         .archive => {
             state.archiveThreadAtIndex(tr.project, tr.thread);
-            state.command_palette_selected = 0;
+            state.command_controller.selected = 0;
             state.markDirty();
         },
     }
@@ -455,7 +455,7 @@ pub fn runActionRow(state: *runtime.AppState, action_index: usize) void {
 /// Renders the palette overlay: scrim, chrome, search field, scope line,
 /// result rows, optional action submenu, footer key hints, and scrollbar.
 pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
-    if (!state.command_palette_open) return;
+    if (!state.command_controller.open) return;
     computeLayout(state, width, height);
 
     // Scrim + modal chrome. The panel fill derives from the dark `background`
@@ -474,7 +474,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     renderScopeLine(state);
     renderRows(state);
     renderFooter(state);
-    if (state.command_palette_action_menu_open) renderActionMenu(state);
+    if (state.command_controller.action_menu_open) renderActionMenu(state);
 
     // Scrollbar on the list region when results overflow.
     if (max_scroll_y > 1.0 and list_rect.h > theme.scaledUi(32.0)) {
@@ -556,19 +556,19 @@ fn rebuildResults(state: *runtime.AppState) void {
     const query = state.commandPaletteQuery();
     const query_changed = query.len != last_query_len or
         !std.mem.eql(u8, last_query[0..last_query_len], query) or
-        !scopeEq(last_scope, state.command_palette_scope_project);
+        !scopeEq(last_scope, state.command_controller.scope_project);
     if (query_changed) {
         const n = @min(query.len, last_query.len);
         @memcpy(last_query[0..n], query[0..n]);
         last_query_len = n;
-        last_scope = state.command_palette_scope_project;
-        state.command_palette_selected = 0;
-        state.command_palette_action_menu_open = false;
+        last_scope = state.command_controller.scope_project;
+        state.command_controller.selected = 0;
+        state.command_controller.action_menu_open = false;
         scroll_y = 0.0;
     }
 
     result_count = 0;
-    if (state.command_palette_scope_project) |pi| {
+    if (state.command_controller.scope_project) |pi| {
         buildScopedHistory(state, pi, query);
     } else if (query.len == 0) {
         buildSuggestions(state);
@@ -879,14 +879,14 @@ fn firstSelectable() ?usize {
 }
 
 fn clampSelection(state: *runtime.AppState) void {
-    if (isSelectable(state.command_palette_selected)) return;
-    state.command_palette_selected = firstSelectable() orelse 0;
+    if (isSelectable(state.command_controller.selected)) return;
+    state.command_controller.selected = firstSelectable() orelse 0;
 }
 
 /// Moves the selected row by `delta`, skipping section headers.
 fn moveSelection(state: *runtime.AppState, delta: i32) void {
     if (result_count == 0) return;
-    var index: i64 = @intCast(state.command_palette_selected);
+    var index: i64 = @intCast(state.command_controller.selected);
     const count: i64 = @intCast(result_count);
     var remaining: usize = result_count;
     while (remaining > 0) : (remaining -= 1) {
@@ -894,8 +894,8 @@ fn moveSelection(state: *runtime.AppState, delta: i32) void {
         if (index < 0) index = count - 1;
         if (index >= count) index = 0;
         if (isSelectable(@intCast(index))) {
-            state.command_palette_selected = @intCast(index);
-            state.command_palette_action_menu_open = false;
+            state.command_controller.selected = @intCast(index);
+            state.command_controller.action_menu_open = false;
             state.markDirty();
             return;
         }
@@ -904,44 +904,44 @@ fn moveSelection(state: *runtime.AppState, delta: i32) void {
 
 fn moveActionSelection(state: *runtime.AppState, delta: i32) void {
     if (action_count == 0) return;
-    var index: i64 = @intCast(state.command_palette_action_selected);
+    var index: i64 = @intCast(state.command_controller.action_selected);
     const count: i64 = @intCast(action_count);
     index += delta;
     if (index < 0) index = count - 1;
     if (index >= count) index = 0;
-    state.command_palette_action_selected = @intCast(index);
+    state.command_controller.action_selected = @intCast(index);
     state.markDirty();
 }
 
 /// Tab on a thread row opens the secondary action submenu; non-thread rows
 /// have a single behavior so Tab is a no-op for them.
 fn toggleActionMenu(state: *runtime.AppState) void {
-    if (state.command_palette_action_menu_open) {
-        state.command_palette_action_menu_open = false;
+    if (state.command_controller.action_menu_open) {
+        state.command_controller.action_menu_open = false;
         state.markDirty();
         return;
     }
-    const selected = state.command_palette_selected;
+    const selected = state.command_controller.selected;
     if (selected >= result_count) return;
     if (results[selected].ref != .thread) return;
-    state.command_palette_action_menu_open = true;
-    state.command_palette_action_selected = 0;
+    state.command_controller.action_menu_open = true;
+    state.command_controller.action_selected = 0;
     state.markDirty();
 }
 
 /// Rebuilds the action submenu rows + geometry for the selected thread row.
 fn computeActionMenuLayout(state: *runtime.AppState) void {
     action_count = 0;
-    if (!state.command_palette_action_menu_open) return;
-    const selected = state.command_palette_selected;
+    if (!state.command_controller.action_menu_open) return;
+    const selected = state.command_controller.selected;
     if (selected >= result_count) {
-        state.command_palette_action_menu_open = false;
+        state.command_controller.action_menu_open = false;
         return;
     }
     const tr = switch (results[selected].ref) {
         .thread => |t| t,
         else => {
-            state.command_palette_action_menu_open = false;
+            state.command_controller.action_menu_open = false;
             return;
         },
     };
@@ -991,7 +991,7 @@ fn appendAction(kind: ThreadAction, label: []const u8, enabled: bool) void {
 
 /// Keeps the keyboard selection inside the list viewport by nudging scroll.
 fn ensureSelectedVisible(state: *runtime.AppState) void {
-    const selected = state.command_palette_selected;
+    const selected = state.command_controller.selected;
     if (selected >= result_count) return;
     const row = row_rects[selected];
     const top = list_rect.y;
@@ -1390,11 +1390,11 @@ fn runOpenAgentTui(state: *runtime.AppState, provider: AgentProvider) void {
 }
 
 fn runHistoryThisWorkspace(state: *runtime.AppState) void {
-    state.command_palette_scope_project = state.selected_project_index;
-    state.command_palette_query_storage[0] = 0;
-    state.command_palette_cursor = 0;
-    state.command_palette_selected = 0;
-    state.command_palette_action_menu_open = false;
+    state.command_controller.scope_project = state.selected_project_index;
+    state.command_controller.query_storage[0] = 0;
+    state.command_controller.cursor = 0;
+    state.command_controller.selected = 0;
+    state.command_controller.action_menu_open = false;
     state.markDirty();
 }
 
@@ -1430,7 +1430,7 @@ fn renderSearchField(state: *runtime.AppState) void {
         state.modal_text_input_rect = input_rect;
         state.modal_text_input_font_size = font_size;
         if (state.modal_text_selection_anchor) |anchor| {
-            const cursor = @min(state.command_palette_cursor, value.len);
+            const cursor = @min(state.command_controller.cursor, value.len);
             const a = @min(anchor, value.len);
             if (a != cursor) {
                 const start = @min(a, cursor);
@@ -1451,7 +1451,7 @@ fn renderSearchField(state: *runtime.AppState) void {
     queueRoleText(state, .{ .x = text_x, .y = text_y, .w = text_w, .h = theme.scaledUi(20.0) }, shown, paletteColor(color), font_size, input_rect);
 
     if (focused) {
-        const clamped_cursor = @min(state.command_palette_cursor, value.len);
+        const clamped_cursor = @min(state.command_controller.cursor, value.len);
         const cursor_x = text_x + runtime.paletteUiTextPrefixWidth(value, font_size, clamped_cursor);
         queueRect(state, .{ .x = cursor_x, .y = text_y, .w = theme.scaledUi(1.0), .h = theme.scaledUi(20.0) }, paletteColor(theme.COLOR_WHITE));
     }
@@ -1461,7 +1461,7 @@ fn renderSearchField(state: *runtime.AppState) void {
 fn renderScopeLine(state: *runtime.AppState) void {
     var buf: [128]u8 = undefined;
     const label = blk: {
-        if (state.command_palette_scope_project) |pi| {
+        if (state.command_controller.scope_project) |pi| {
             if (pi < state.projects.items.len) {
                 break :blk std.fmt.bufPrint(&buf, "{s} - history  (Ctrl+Shift+P for all)", .{state.projects.items[pi].label}) catch "history";
             }
@@ -1516,7 +1516,7 @@ fn renderRows(state: *runtime.AppState) void {
 }
 
 fn renderRowBackground(state: *runtime.AppState, row_index: usize, rect: palette.Rect, row_clip: palette.Rect) void {
-    const selected = state.command_palette_selected == row_index;
+    const selected = state.command_controller.selected == row_index;
     const hovered = hovered_row != null and hovered_row.? == row_index;
     // Clamp the highlight to the viewport so a half-scrolled row's card
     // doesn't poke into the input/footer chrome.
@@ -1539,7 +1539,7 @@ fn renderRowBackground(state: *runtime.AppState, row_index: usize, rect: palette
 fn renderCommandRow(state: *runtime.AppState, row_index: usize, command_index: usize, rect: palette.Rect, row_clip: palette.Rect) void {
     renderRowBackground(state, row_index, rect, row_clip);
     const command = STATIC_COMMANDS[command_index];
-    const emphasis = state.command_palette_selected == row_index;
+    const emphasis = state.command_controller.selected == row_index;
     const font_size = theme.scaledUi(13.5);
     const text_y = rect.y + (rect.h - font_size * 1.3) * 0.5;
 
@@ -1570,7 +1570,7 @@ fn renderThreadRow(state: *runtime.AppState, row_index: usize, tr: ThreadRef, re
     const project = &state.projects.items[tr.project];
     if (tr.thread >= project.threads.items.len) return;
     const thread = &project.threads.items[tr.thread];
-    const emphasis = state.command_palette_selected == row_index;
+    const emphasis = state.command_controller.selected == row_index;
     const font_size = theme.scaledUi(13.5);
     const text_y = rect.y + (rect.h - font_size * 1.3) * 0.5;
 
@@ -1580,7 +1580,7 @@ fn renderThreadRow(state: *runtime.AppState, row_index: usize, tr: ThreadRef, re
     const time_w = theme.scaledUi(56.0);
     const open_w = if (is_open) theme.scaledUi(42.0) else 0.0;
     // Show the owning workspace when results span workspaces (global scope).
-    const show_workspace = state.command_palette_scope_project == null;
+    const show_workspace = state.command_controller.scope_project == null;
     const workspace_w = if (show_workspace) theme.scaledUi(96.0) else 0.0;
     const title_x = rect.x + theme.scaledUi(42.0);
     queueText(state, .{
@@ -1611,7 +1611,7 @@ fn renderAgentTuiRow(state: *runtime.AppState, row_index: usize, tui: AgentTuiRe
     if (tui.project >= state.projects.items.len) return;
     const project = &state.projects.items[tui.project];
     const provider = state.workspaceAgentTuiProvider(tui.project, tui.dock) orelse return;
-    const emphasis = state.command_palette_selected == row_index;
+    const emphasis = state.command_controller.selected == row_index;
     const font_size = theme.scaledUi(13.5);
     const text_y = rect.y + (rect.h - font_size * 1.3) * 0.5;
     sidebar.queuePaletteAgentTuiProviderGlyph(state, provider, rect.x + theme.scaledUi(10.0), rect.y + rect.h * 0.5, row_clip);
@@ -1633,7 +1633,7 @@ fn renderAgentTuiRow(state: *runtime.AppState, row_index: usize, tui: AgentTuiRe
     }
     const status_w = theme.scaledUi(52.0);
     const time_w = theme.scaledUi(56.0);
-    const workspace_w = if (state.command_palette_scope_project == null) theme.scaledUi(96.0) else 0.0;
+    const workspace_w = if (state.command_controller.scope_project == null) theme.scaledUi(96.0) else 0.0;
     const title_x = rect.x + theme.scaledUi(54.0);
     queueText(state, .{
         .x = title_x,
@@ -1650,7 +1650,7 @@ fn renderAgentTuiRow(state: *runtime.AppState, row_index: usize, tui: AgentTuiRe
     queueText(state, .{ .x = right, .y = text_y, .w = time_w, .h = font_size * 1.3 }, relative_time, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
     right -= status_w;
     queueText(state, .{ .x = right, .y = text_y, .w = status_w, .h = font_size * 1.3 }, if (is_open) "open" else "saved", paletteColor(if (is_open) theme.COLOR_GREEN else theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
-    if (state.command_palette_scope_project == null) {
+    if (state.command_controller.scope_project == null) {
         right -= workspace_w;
         queueText(state, .{ .x = right, .y = text_y, .w = workspace_w - theme.scaledUi(8.0), .h = font_size * 1.3 }, project.label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
     }
@@ -1659,7 +1659,7 @@ fn renderAgentTuiRow(state: *runtime.AppState, row_index: usize, tui: AgentTuiRe
 fn renderWorkspaceRow(state: *runtime.AppState, row_index: usize, project_index: usize, rect: palette.Rect, row_clip: palette.Rect) void {
     renderRowBackground(state, row_index, rect, row_clip);
     if (project_index >= state.projects.items.len) return;
-    const emphasis = state.command_palette_selected == row_index;
+    const emphasis = state.command_controller.selected == row_index;
     const font_size = theme.scaledUi(13.5);
     const text_y = rect.y + (rect.h - font_size * 1.3) * 0.5;
     var buf: [96]u8 = undefined;
@@ -1688,7 +1688,7 @@ fn renderWorkspaceRow(state: *runtime.AppState, row_index: usize, project_index:
 fn renderClosedWorkspaceRow(state: *runtime.AppState, row_index: usize, archived_index: usize, rect: palette.Rect, row_clip: palette.Rect) void {
     renderRowBackground(state, row_index, rect, row_clip);
     if (archived_index >= state.archived_projects.items.len) return;
-    const emphasis = state.command_palette_selected == row_index;
+    const emphasis = state.command_controller.selected == row_index;
     const font_size = theme.scaledUi(13.5);
     const text_y = rect.y + (rect.h - font_size * 1.3) * 0.5;
     var buf: [96]u8 = undefined;
@@ -1719,7 +1719,7 @@ fn renderActionMenu(state: *runtime.AppState) void {
     var i: usize = 0;
     while (i < action_count) : (i += 1) {
         const rect = action_rects[i];
-        const selected = state.command_palette_action_selected == i;
+        const selected = state.command_controller.action_selected == i;
         if (selected and action_enabled[i]) {
             queueRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 56)), theme.scaledUi(7.0));
         }
@@ -1765,7 +1765,7 @@ var hint_buf: [32]u8 = undefined;
 /// hints track user rebinds. Returns "" when unbound.
 fn keybindHintFor(state: *runtime.AppState, ref: ?KeybindRef) []const u8 {
     const keybind_ref = ref orelse return "";
-    const config = state.keyboard_config orelse return "";
+    const config = state.command_controller.keyboard_config orelse return "";
     const bindings = switch (keybind_ref) {
         .new_thread => config.new_thread,
         .chat_model_picker => config.chat_model_picker,
@@ -1789,7 +1789,7 @@ fn keybindHintFor(state: *runtime.AppState, ref: ?KeybindRef) []const u8 {
 /// sidebar's search-trigger badge), so the label tracks user rebinds instead
 /// of hardcoding the default. Returns "" when unbound.
 pub fn commandPaletteShortcutHint(state: *runtime.AppState) []const u8 {
-    const config = state.keyboard_config orelse return "";
+    const config = state.command_controller.keyboard_config orelse return "";
     if (config.command_palette.len == 0) return "";
     return formatKeybind(&hint_buf, config.command_palette[0]);
 }
