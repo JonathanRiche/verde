@@ -335,7 +335,7 @@ pub fn renderDockAtForDock(state: *app_state.AppState, rect: palette.Rect, dock_
 }
 
 pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.Rect, dock_id: u32, _: f32) void {
-    if (state.projects.items.len == 0) return;
+    if (state.project_controller.projects.items.len == 0) return;
     hit_cache.dock_id = dock_id;
     var dock = state.currentProjectTerminalDockMutable(dock_id) orelse return;
     // No dock-level pre-resize: renderPane below resizes each pane against
@@ -346,7 +346,7 @@ pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.
     const dock_bg = if (dock.activeRenderState()) |render_state| rgbPaletteColor(render_state.colors.background, 1.0) else paletteColor(theme.background());
     queueRounded(state, rect, dock_bg, 0.0);
     queueBorder(state, rect, paletteColor(theme.COLOR_PANEL_MUTED), 0.0, 1.0);
-    if (state.terminalDockSurfaceAttention(state.selected_project_index, dock_id)) {
+    if (state.terminalDockSurfaceAttention(state.project_controller.selected_index, dock_id)) {
         queueBorder(state, rect, paletteColor(theme.COLOR_YELLOW), 0.0, theme.scaledUi(2.0));
     }
 
@@ -412,7 +412,7 @@ fn terminalPressedMouseButton(buttons: sdl.MouseButtonFlags) ?u8 {
 }
 
 pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, button: u8, down: bool) bool {
-    if (state.projects.items.len == 0) return false;
+    if (state.project_controller.projects.items.len == 0) return false;
     if (button == 1 and !down and pending_link_click.active) return finishPendingLinkClick(state, x, y);
     if (button == 1 and hit_cache.menu_open) {
         if (!down) return true;
@@ -538,7 +538,7 @@ fn rightClickSelectedPane(state: *app_state.AppState, x: f32, y: f32, down: bool
 }
 
 pub fn handlePaletteWheel(state: *app_state.AppState, x: f32, y: f32, wheel_y: f32) bool {
-    if (wheel_y == 0.0 or state.projects.items.len == 0) return false;
+    if (wheel_y == 0.0 or state.project_controller.projects.items.len == 0) return false;
     if (paneAtPoint(x, y)) |target| {
         hit_cache.dock_id = target.dock_id;
         var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
@@ -609,7 +609,7 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
     dock.resizePaneToFit(state.allocator, pane_id, grid_rect.w, grid_rect.h) catch |err| {
         runtime_log.diagnostic("terminal resizePaneToFit failed pane={d} err={s}", .{ pane_id, @errorName(err) });
     };
-    const focused = if (dock.activePaneConst()) |active| active.id == pane_id and state.terminal_focused else false;
+    const focused = if (dock.activePaneConst()) |active| active.id == pane_id and state.terminal_controller.focused else false;
     const render_state = dock.renderStateForPane(pane_id) orelse {
         var status_buf: [192]u8 = undefined;
         queueRect(state, rect, paletteColor(theme.background()));
@@ -959,9 +959,9 @@ fn renderTerminalScrollbar(state: *app_state.AppState, pane_rect: palette.Rect, 
 
 fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palette.Rect) void {
     if (!hit_cache.menu_open) return;
-    const mx = state.palette_mouse_x;
-    const my = state.palette_mouse_y;
-    const mouse_ok = state.palette_mouse_in_workspace;
+    const mx = state.transcript_controller.palette_mouse_x;
+    const my = state.transcript_controller.palette_mouse_y;
+    const mouse_ok = state.transcript_controller.palette_mouse_in_workspace;
 
     var actions: [14]TerminalContextMenuAction = undefined;
     var labels: [14][]const u8 = undefined;
@@ -1121,8 +1121,8 @@ fn performContextMenuAction(state: *app_state.AppState, dock: anytype, action: T
 }
 
 fn workspacePaneIdForDock(state: *const app_state.AppState, dock_id: u32) ?app_state.WorkspacePaneId {
-    if (state.projects.items.len == 0) return null;
-    const layout = &state.projects.items[state.selected_project_index].workspace_layout;
+    if (state.project_controller.projects.items.len == 0) return null;
+    const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
     for (layout.panes.items) |pane| {
         switch (pane.ref) {
             .terminal => |ref| if (ref.dock_id == dock_id) return pane.id,

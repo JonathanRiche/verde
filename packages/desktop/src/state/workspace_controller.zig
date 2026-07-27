@@ -284,8 +284,8 @@ pub fn releaseLease(project: *Project, allocator: std.mem.Allocator, owner: []co
 }
 
 pub fn ensureCurrentProjectWorkspace(self: anytype) void {
-    if (self.projects.items.len == 0) return;
-    const changed = self.projects.items[self.selected_project_index].workspace_layout.ensureDefaultChat(self.allocator) catch |err| {
+    if (self.project_controller.projects.items.len == 0) return;
+    const changed = self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.ensureDefaultChat(self.allocator) catch |err| {
         log.err("failed to initialize workspace panes: {s}", .{@errorName(err)});
         return;
     };
@@ -293,8 +293,8 @@ pub fn ensureCurrentProjectWorkspace(self: anytype) void {
 }
 
 pub fn focusedWorkspacePaneKind(self: anytype) ?WorkspacePaneKind {
-    if (self.projects.items.len == 0) return null;
-    const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    if (self.project_controller.projects.items.len == 0) return null;
+    const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     const pane = layout.focusedPane() orelse return null;
     return switch (pane.ref) {
         .chat => .chat,
@@ -304,33 +304,33 @@ pub fn focusedWorkspacePaneKind(self: anytype) ?WorkspacePaneKind {
 }
 
 pub fn focusedWorkspaceChatPaneId(self: anytype) ?WorkspacePaneId {
-    if (self.projects.items.len == 0) return null;
-    const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    if (self.project_controller.projects.items.len == 0) return null;
+    const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     const pane_id = layout.focused_pane_id orelse return null;
     return if (self.workspaceChatThreadIndexByPane(pane_id) != null) pane_id else null;
 }
 
 pub fn currentProjectHasVisibleWorkspaceTerminalPane(self: anytype) bool {
-    if (self.projects.items.len == 0) return false;
-    return self.projects.items[self.selected_project_index].workspace_layout.hasVisiblePaneKind(.terminal);
+    if (self.project_controller.projects.items.len == 0) return false;
+    return self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.hasVisiblePaneKind(.terminal);
 }
 
 pub fn currentProjectVisibleBrowserPaneId(self: anytype) ?WorkspacePaneId {
-    if (self.projects.items.len == 0) return null;
-    return self.projects.items[self.selected_project_index].workspace_layout.visibleBrowserPaneId();
+    if (self.project_controller.projects.items.len == 0) return null;
+    return self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.visibleBrowserPaneId();
 }
 
 pub fn threadIsOpenInTui(self: anytype, project_index: usize, thread_index: usize) bool {
-    if (project_index >= self.projects.items.len) return false;
-    const project = &self.projects.items[project_index];
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    const project = &self.project_controller.projects.items[project_index];
     if (thread_index >= project.threads.items.len) return false;
     const dock_id = project.threads.items[thread_index].tui_dock_id orelse return false;
     return project.workspace_layout.visibleTerminalPaneIdForDock(dock_id) != null;
 }
 
 pub fn currentProjectWorkspaceRoot(self: anytype) ?*const WorkspaceNode {
-    if (self.projects.items.len == 0) return null;
-    const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    if (self.project_controller.projects.items.len == 0) return null;
+    const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     if (layout.maximized_pane_id) |pane_id| {
         if (layout.paneById(pane_id) != null) return layout.root;
     }
@@ -338,24 +338,24 @@ pub fn currentProjectWorkspaceRoot(self: anytype) ?*const WorkspaceNode {
 }
 
 pub fn currentProjectWorkspaceMaximizedPaneId(self: anytype) ?WorkspacePaneId {
-    if (self.projects.items.len == 0) return null;
-    const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    if (self.project_controller.projects.items.len == 0) return null;
+    const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     const pane_id = layout.maximized_pane_id orelse return null;
     _ = layout.paneById(pane_id) orelse return null;
     return pane_id;
 }
 
 pub fn currentProjectQuickPane(self: anytype) ?FloatingQuickPane {
-    if (self.projects.items.len == 0) return null;
-    const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    if (self.project_controller.projects.items.len == 0) return null;
+    const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     const quick = layout.quick_pane orelse return null;
     _ = layout.paneById(quick.pane_id) orelse return null;
     return quick;
 }
 
 pub fn floatFocusedWorkspacePane(self: anytype) bool {
-    if (self.projects.items.len == 0) return false;
-    var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    if (self.project_controller.projects.items.len == 0) return false;
+    var layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     const pane_id = layout.focused_pane_id orelse return false;
     if (layout.paneById(pane_id) == null) return false;
     if (layout.quick_pane) |quick| {
@@ -367,7 +367,7 @@ pub fn floatFocusedWorkspacePane(self: anytype) bool {
         }
         if (quick.pane_id != pane_id) {
             if (!self.returnCurrentProjectQuickPaneToTile()) return false;
-            layout = &self.projects.items[self.selected_project_index].workspace_layout;
+            layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
         }
     }
     if (!layout.rootContainsPane(pane_id)) {
@@ -389,8 +389,8 @@ pub fn floatFocusedWorkspacePane(self: anytype) bool {
 }
 
 pub fn toggleCurrentProjectQuickPane(self: anytype) bool {
-    if (self.projects.items.len == 0) return false;
-    var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    if (self.project_controller.projects.items.len == 0) return false;
+    var layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     if (layout.quick_pane == null) return self.createFloatingQuickTerminal();
     if (!layout.quick_pane.?.detached and layout.rootContainsPane(layout.quick_pane.?.pane_id)) {
         if (layout.visiblePaneCount() <= 1) return false;
@@ -410,10 +410,10 @@ pub fn toggleCurrentProjectQuickPane(self: anytype) bool {
 }
 
 pub fn createFloatingQuickTerminal(self: anytype) bool {
-    if (self.projects.items.len == 0) return false;
-    const project_index = self.selected_project_index;
+    if (self.project_controller.projects.items.len == 0) return false;
+    const project_index = self.project_controller.selected_index;
     self.ensureCurrentProjectWorkspace();
-    const return_focus_pane_id = self.projects.items[project_index].workspace_layout.focused_pane_id;
+    const return_focus_pane_id = self.project_controller.projects.items[project_index].workspace_layout.focused_pane_id;
 
     const dock_id = self.createProjectTerminalDock(project_index) catch |err| {
         log.err("failed to allocate quick terminal dock: {s}", .{@errorName(err)});
@@ -426,7 +426,7 @@ pub fn createFloatingQuickTerminal(self: anytype) bool {
         return false;
     };
     var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
-    var layout = &self.projects.items[project_index].workspace_layout;
+    var layout = &self.project_controller.projects.items[project_index].workspace_layout;
     const pane_id = layout.createTerminalPane(self.allocator, dock_id) catch |err| {
         log.err("failed to create floating quick terminal pane: {s}", .{@errorName(err)});
         self.setSidebarNotice("Failed to create quick terminal.");
@@ -447,19 +447,19 @@ pub fn createFloatingQuickTerminal(self: anytype) bool {
 
 pub fn restoreFocusBehindQuickPane(self: anytype, quick: FloatingQuickPane) void {
     if (quick.return_focus_pane_id) |pane_id| {
-        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
         if (layout.rootContainsPane(pane_id)) {
             _ = self.focusCurrentProjectWorkspacePane(pane_id);
             return;
         }
     }
     self.unfocusBrowserPane();
-    self.terminal_focused = false;
+    self.terminal_controller.focused = false;
 }
 
 pub fn minimizeCurrentProjectQuickPane(self: anytype) bool {
-    if (self.projects.items.len == 0) return false;
-    var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    if (self.project_controller.projects.items.len == 0) return false;
+    var layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     const quick = if (layout.quick_pane) |*value| value else return false;
     quick.visible = false;
     self.restoreFocusBehindQuickPane(quick.*);
@@ -468,8 +468,8 @@ pub fn minimizeCurrentProjectQuickPane(self: anytype) bool {
 }
 
 pub fn toggleCurrentProjectQuickPaneMaximized(self: anytype) bool {
-    if (self.projects.items.len == 0) return false;
-    var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    if (self.project_controller.projects.items.len == 0) return false;
+    var layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     const quick = if (layout.quick_pane) |*value| value else return false;
     quick.visible = true;
     quick.maximized = !quick.maximized;
@@ -478,8 +478,8 @@ pub fn toggleCurrentProjectQuickPaneMaximized(self: anytype) bool {
 }
 
 pub fn toggleCurrentProjectQuickPanePinned(self: anytype) bool {
-    if (self.projects.items.len == 0) return false;
-    var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    if (self.project_controller.projects.items.len == 0) return false;
+    var layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     const quick = if (layout.quick_pane) |*value| value else return false;
     quick.pinned = !quick.pinned;
     quick.visible = true;
@@ -488,8 +488,8 @@ pub fn toggleCurrentProjectQuickPanePinned(self: anytype) bool {
 }
 
 pub fn returnCurrentProjectQuickPaneToTile(self: anytype) bool {
-    if (self.projects.items.len == 0) return false;
-    var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    if (self.project_controller.projects.items.len == 0) return false;
+    var layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     const quick = layout.quick_pane orelse return false;
     if (quick.detached) {
         const target_pane_id = if (quick.return_focus_pane_id) |pane_id|
@@ -513,8 +513,8 @@ pub fn returnCurrentProjectQuickPaneToTile(self: anytype) bool {
 }
 
 pub fn setCurrentProjectQuickPaneGeometry(self: anytype, geometry: FloatingPaneGeometry) void {
-    if (self.projects.items.len == 0) return;
-    var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    if (self.project_controller.projects.items.len == 0) return;
+    var layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     const quick = if (layout.quick_pane) |*value| value else return;
     quick.geometry = .{
         .x = std.math.clamp(geometry.x, 0.0, 0.95),
@@ -527,8 +527,8 @@ pub fn setCurrentProjectQuickPaneGeometry(self: anytype, geometry: FloatingPaneG
 }
 
 pub fn workspacePaneKindById(self: anytype, pane_id: WorkspacePaneId) ?WorkspacePaneKind {
-    if (self.projects.items.len == 0) return null;
-    const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    if (self.project_controller.projects.items.len == 0) return null;
+    const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     const pane = layout.paneById(pane_id) orelse return null;
     return switch (pane.ref) {
         .chat => .chat,
@@ -538,8 +538,8 @@ pub fn workspacePaneKindById(self: anytype, pane_id: WorkspacePaneId) ?Workspace
 }
 
 pub fn workspaceTerminalDockIdByPane(self: anytype, pane_id: WorkspacePaneId) ?u32 {
-    if (self.projects.items.len == 0) return null;
-    const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    if (self.project_controller.projects.items.len == 0) return null;
+    const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     const pane = layout.paneById(pane_id) orelse return null;
     return switch (pane.ref) {
         .terminal => |ref| ref.dock_id,
@@ -548,8 +548,8 @@ pub fn workspaceTerminalDockIdByPane(self: anytype, pane_id: WorkspacePaneId) ?u
 }
 
 pub fn workspaceChatThreadIndexByPane(self: anytype, pane_id: WorkspacePaneId) ?usize {
-    if (self.projects.items.len == 0) return null;
-    const project = &self.projects.items[self.selected_project_index];
+    if (self.project_controller.projects.items.len == 0) return null;
+    const project = &self.project_controller.projects.items[self.project_controller.selected_index];
     const pane = project.workspace_layout.paneById(pane_id) orelse return null;
     return switch (pane.ref) {
         .chat => |ref| if (ref.thread_index < project.threads.items.len) ref.thread_index else null,
@@ -559,33 +559,33 @@ pub fn workspaceChatThreadIndexByPane(self: anytype, pane_id: WorkspacePaneId) ?
 
 pub fn captureViewFocusSnapshot(self: anytype) ViewFocusSnapshot {
     return .{
-        .selected_project_index = self.selected_project_index,
-        .terminal_focused = self.terminal_focused,
-        .composer_focused = self.composer_focused,
-        .palette_composer_focused = self.palette_composer.focused,
-        .browser_address_focused = self.browser_address_focused,
+        .selected_project_index = self.project_controller.selected_index,
+        .terminal_focused = self.terminal_controller.focused,
+        .composer_focused = self.composer_controller.focused,
+        .palette_composer_focused = self.composer_controller.composer.focused,
+        .browser_address_focused = self.browser_controller.address_focused,
     };
 }
 
 pub fn restoreViewFocusSnapshot(self: anytype, snapshot: ViewFocusSnapshot) void {
-    if (snapshot.selected_project_index < self.projects.items.len) {
-        self.selected_project_index = snapshot.selected_project_index;
-    } else if (self.projects.items.len > 0) {
-        self.selected_project_index = self.projects.items.len - 1;
+    if (snapshot.selected_project_index < self.project_controller.projects.items.len) {
+        self.project_controller.selected_index = snapshot.selected_project_index;
+    } else if (self.project_controller.projects.items.len > 0) {
+        self.project_controller.selected_index = self.project_controller.projects.items.len - 1;
     } else {
-        self.selected_project_index = 0;
+        self.project_controller.selected_index = 0;
     }
-    self.terminal_focused = snapshot.terminal_focused;
-    self.composer_focused = snapshot.composer_focused;
-    self.palette_composer.focused = snapshot.palette_composer_focused;
-    self.browser_address_focused = snapshot.browser_address_focused;
+    self.terminal_controller.focused = snapshot.terminal_focused;
+    self.composer_controller.focused = snapshot.composer_focused;
+    self.composer_controller.composer.focused = snapshot.palette_composer_focused;
+    self.browser_controller.address_focused = snapshot.browser_address_focused;
     self.syncRenameBuffer();
     self.syncPaletteComposerFromDraft();
 }
 
 pub fn setWorkspaceChatPaneDraftForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId, value: []const u8, append: bool) !bool {
-    if (project_index >= self.projects.items.len) return false;
-    var project = &self.projects.items[project_index];
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    var project = &self.project_controller.projects.items[project_index];
     const pane = project.workspace_layout.paneById(pane_id) orelse return false;
     const thread_index = switch (pane.ref) {
         .chat => |ref| ref.thread_index,
@@ -605,8 +605,8 @@ pub fn setWorkspaceChatPaneDraftForProject(self: anytype, project_index: usize, 
         thread.setDraft(value);
     }
     project.selected_thread_index = thread_index;
-    if (self.selected_project_index == project_index) {
-        self.terminal_focused = false;
+    if (self.project_controller.selected_index == project_index) {
+        self.terminal_controller.focused = false;
         self.syncPaletteComposerFromDraft();
     }
     self.markDirty();
@@ -614,15 +614,15 @@ pub fn setWorkspaceChatPaneDraftForProject(self: anytype, project_index: usize, 
 }
 
 pub fn setWorkspaceChatPaneDraft(self: anytype, pane_id: WorkspacePaneId, value: []const u8, append: bool) !bool {
-    if (self.projects.items.len == 0) return false;
-    return self.setWorkspaceChatPaneDraftForProject(self.selected_project_index, pane_id, value, append);
+    if (self.project_controller.projects.items.len == 0) return false;
+    return self.setWorkspaceChatPaneDraftForProject(self.project_controller.selected_index, pane_id, value, append);
 }
 
 pub fn sendWorkspaceChatPanePromptForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId, prompt: ?[]const u8) !bool {
-    if (project_index >= self.projects.items.len) return false;
+    if (project_index >= self.project_controller.projects.items.len) return false;
     const snapshot = self.captureViewFocusSnapshot();
     const restore_view = project_index != snapshot.selected_project_index;
-    if (restore_view) self.selected_project_index = project_index;
+    if (restore_view) self.project_controller.selected_index = project_index;
     defer if (restore_view) self.restoreViewFocusSnapshot(snapshot);
 
     if (prompt) |text| {
@@ -634,15 +634,15 @@ pub fn sendWorkspaceChatPanePromptForProject(self: anytype, project_index: usize
 }
 
 pub fn sendWorkspaceChatPanePrompt(self: anytype, pane_id: WorkspacePaneId, prompt: ?[]const u8) !bool {
-    if (self.projects.items.len == 0) return false;
-    return self.sendWorkspaceChatPanePromptForProject(self.selected_project_index, pane_id, prompt);
+    if (self.project_controller.projects.items.len == 0) return false;
+    return self.sendWorkspaceChatPanePromptForProject(self.project_controller.selected_index, pane_id, prompt);
 }
 
 pub fn followupWorkspaceChatPanePromptForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId, prompt: []const u8) !bool {
-    if (project_index >= self.projects.items.len) return false;
+    if (project_index >= self.project_controller.projects.items.len) return false;
     const snapshot = self.captureViewFocusSnapshot();
     const restore_view = project_index != snapshot.selected_project_index;
-    if (restore_view) self.selected_project_index = project_index;
+    if (restore_view) self.project_controller.selected_index = project_index;
     defer if (restore_view) self.restoreViewFocusSnapshot(snapshot);
 
     if (!try self.setWorkspaceChatPaneDraft(pane_id, prompt, false)) return false;
@@ -651,15 +651,15 @@ pub fn followupWorkspaceChatPanePromptForProject(self: anytype, project_index: u
 }
 
 pub fn followupWorkspaceChatPanePrompt(self: anytype, pane_id: WorkspacePaneId, prompt: []const u8) !bool {
-    if (self.projects.items.len == 0) return false;
-    return self.followupWorkspaceChatPanePromptForProject(self.selected_project_index, pane_id, prompt);
+    if (self.project_controller.projects.items.len == 0) return false;
+    return self.followupWorkspaceChatPanePromptForProject(self.project_controller.selected_index, pane_id, prompt);
 }
 
 pub fn stopWorkspaceChatPaneForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId) bool {
-    if (project_index >= self.projects.items.len) return false;
+    if (project_index >= self.project_controller.projects.items.len) return false;
     const snapshot = self.captureViewFocusSnapshot();
     const restore_view = project_index != snapshot.selected_project_index;
-    if (restore_view) self.selected_project_index = project_index;
+    if (restore_view) self.project_controller.selected_index = project_index;
     defer if (restore_view) self.restoreViewFocusSnapshot(snapshot);
 
     if (!self.selectWorkspaceChatPaneThread(pane_id)) return false;
@@ -668,15 +668,15 @@ pub fn stopWorkspaceChatPaneForProject(self: anytype, project_index: usize, pane
 }
 
 pub fn stopWorkspaceChatPane(self: anytype, pane_id: WorkspacePaneId) bool {
-    if (self.projects.items.len == 0) return false;
-    return self.stopWorkspaceChatPaneForProject(self.selected_project_index, pane_id);
+    if (self.project_controller.projects.items.len == 0) return false;
+    return self.stopWorkspaceChatPaneForProject(self.project_controller.selected_index, pane_id);
 }
 
 pub fn approveWorkspaceChatPaneForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId, decision: ai_harness.ApprovalDecision) bool {
-    if (project_index >= self.projects.items.len) return false;
+    if (project_index >= self.project_controller.projects.items.len) return false;
     const snapshot = self.captureViewFocusSnapshot();
     const restore_view = project_index != snapshot.selected_project_index;
-    if (restore_view) self.selected_project_index = project_index;
+    if (restore_view) self.project_controller.selected_index = project_index;
     defer if (restore_view) self.restoreViewFocusSnapshot(snapshot);
 
     if (!self.selectWorkspaceChatPaneThread(pane_id)) return false;
@@ -685,13 +685,13 @@ pub fn approveWorkspaceChatPaneForProject(self: anytype, project_index: usize, p
 }
 
 pub fn approveWorkspaceChatPane(self: anytype, pane_id: WorkspacePaneId, decision: ai_harness.ApprovalDecision) bool {
-    if (self.projects.items.len == 0) return false;
-    return self.approveWorkspaceChatPaneForProject(self.selected_project_index, pane_id, decision);
+    if (self.project_controller.projects.items.len == 0) return false;
+    return self.approveWorkspaceChatPaneForProject(self.project_controller.selected_index, pane_id, decision);
 }
 
 pub fn writeWorkspaceTerminalPaneForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId, bytes: []const u8) !bool {
-    if (project_index >= self.projects.items.len) return false;
-    var project = &self.projects.items[project_index];
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    var project = &self.project_controller.projects.items[project_index];
     const pane = project.workspace_layout.paneById(pane_id) orelse return false;
     const dock_id = switch (pane.ref) {
         .terminal => |ref| ref.dock_id,
@@ -701,7 +701,7 @@ pub fn writeWorkspaceTerminalPaneForProject(self: anytype, project_index: usize,
     var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
     if (!dock.hasRunningSession()) try self.restartTerminalDockForWorkspace(project_index, dock_id);
     const wrote = try dock.writeInputToActivePane(bytes);
-    if (wrote and project_index == self.selected_project_index and
+    if (wrote and project_index == self.project_controller.selected_index and
         (dock.visible or workspace_pane_visible))
     {
         self.noteTerminalInputActivity();
@@ -710,8 +710,8 @@ pub fn writeWorkspaceTerminalPaneForProject(self: anytype, project_index: usize,
 }
 
 pub fn writeWorkspaceTerminalPane(self: anytype, pane_id: WorkspacePaneId, bytes: []const u8) !bool {
-    if (self.projects.items.len == 0) return false;
-    return self.writeWorkspaceTerminalPaneForProject(self.selected_project_index, pane_id, bytes);
+    if (self.project_controller.projects.items.len == 0) return false;
+    return self.writeWorkspaceTerminalPaneForProject(self.project_controller.selected_index, pane_id, bytes);
 }
 
 /// Pastes text into a terminal pane's running session (bracketed paste),
@@ -719,8 +719,8 @@ pub fn writeWorkspaceTerminalPane(self: anytype, pane_id: WorkspacePaneId, bytes
 /// Unlike the write path this never restarts a dead session: pasting a
 /// prompt into a fresh shell would be wrong.
 pub fn pasteWorkspaceTerminalPaneForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId, text: []const u8) !bool {
-    if (project_index >= self.projects.items.len) return false;
-    var project = &self.projects.items[project_index];
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    var project = &self.project_controller.projects.items[project_index];
     const pane = project.workspace_layout.paneById(pane_id) orelse return false;
     const dock_id = switch (pane.ref) {
         .terminal => |ref| ref.dock_id,
@@ -732,8 +732,8 @@ pub fn pasteWorkspaceTerminalPaneForProject(self: anytype, project_index: usize,
 }
 
 pub fn terminalPaneOutputTailForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId, max_bytes: usize) !?[]u8 {
-    if (project_index >= self.projects.items.len) return null;
-    var project = &self.projects.items[project_index];
+    if (project_index >= self.project_controller.projects.items.len) return null;
+    var project = &self.project_controller.projects.items[project_index];
     const pane = project.workspace_layout.paneById(pane_id) orelse return null;
     const dock_id = switch (pane.ref) {
         .terminal => |ref| ref.dock_id,
@@ -745,13 +745,13 @@ pub fn terminalPaneOutputTailForProject(self: anytype, project_index: usize, pan
 }
 
 pub fn terminalPaneOutputTail(self: anytype, pane_id: WorkspacePaneId, max_bytes: usize) !?[]u8 {
-    if (self.projects.items.len == 0) return null;
-    return self.terminalPaneOutputTailForProject(self.selected_project_index, pane_id, max_bytes);
+    if (self.project_controller.projects.items.len == 0) return null;
+    return self.terminalPaneOutputTailForProject(self.project_controller.selected_index, pane_id, max_bytes);
 }
 
 pub fn terminalPaneScreenTextForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId) !?[]u8 {
-    if (project_index >= self.projects.items.len) return null;
-    var project = &self.projects.items[project_index];
+    if (project_index >= self.project_controller.projects.items.len) return null;
+    var project = &self.project_controller.projects.items[project_index];
     const pane = project.workspace_layout.paneById(pane_id) orelse return null;
     const dock_id = switch (pane.ref) {
         .terminal => |ref| ref.dock_id,
@@ -765,24 +765,24 @@ pub fn terminalPaneScreenTextForProject(self: anytype, project_index: usize, pan
 pub fn pollTerminalDockBeforeRead(self: anytype, project_index: usize, dock_id: u32, dock: *terminal.Dock) !void {
     const changed = try dock.poll(self.allocator);
     try self.drainTerminalDockNotifications(project_index, dock_id, dock);
-    if (changed and project_index == self.selected_project_index) {
-        const project = &self.projects.items[project_index];
+    if (changed and project_index == self.project_controller.selected_index) {
+        const project = &self.project_controller.projects.items[project_index];
         if (dock.visible or project.workspace_layout.hasTerminalDockPane(dock_id)) {
-            self.last_terminal_activity_ms = @intCast(@divTrunc(platform_runtime.monotonicTimestampNs(), std.time.ns_per_ms));
+            self.terminal_controller.last_activity_ms = @intCast(@divTrunc(platform_runtime.monotonicTimestampNs(), std.time.ns_per_ms));
             self.markDirty();
         }
     }
 }
 
 pub fn terminalPaneScreenText(self: anytype, pane_id: WorkspacePaneId) !?[]u8 {
-    if (self.projects.items.len == 0) return null;
-    return self.terminalPaneScreenTextForProject(self.selected_project_index, pane_id);
+    if (self.project_controller.projects.items.len == 0) return null;
+    return self.terminalPaneScreenTextForProject(self.project_controller.selected_index, pane_id);
 }
 
 /// Removes expired workspace leases before reads and mutations.
 pub fn pruneExpiredWorkspaceLeases(self: anytype, project_index: usize) void {
-    if (project_index >= self.projects.items.len) return;
-    pruneExpiredLeases(&self.projects.items[project_index], self.allocator, unixTimestampMs());
+    if (project_index >= self.project_controller.projects.items.len) return;
+    pruneExpiredLeases(&self.project_controller.projects.items[project_index], self.allocator, unixTimestampMs());
 }
 
 pub fn acquireWorkspaceLease(
@@ -794,24 +794,24 @@ pub fn acquireWorkspaceLease(
     ttl_ms: i64,
     force: bool,
 ) !*WorkspaceLease {
-    if (project_index >= self.projects.items.len) return error.ProjectNotFound;
-    return acquireLease(&self.projects.items[project_index], self.allocator, owner, command, resources, ttl_ms, force, unixTimestampMs());
+    if (project_index >= self.project_controller.projects.items.len) return error.ProjectNotFound;
+    return acquireLease(&self.project_controller.projects.items[project_index], self.allocator, owner, command, resources, ttl_ms, force, unixTimestampMs());
 }
 
 pub fn releaseWorkspaceLease(self: anytype, project_index: usize, owner: []const u8, lease_id: ?[]const u8) usize {
-    if (project_index >= self.projects.items.len) return 0;
-    return releaseLease(&self.projects.items[project_index], self.allocator, owner, lease_id, unixTimestampMs());
+    if (project_index >= self.project_controller.projects.items.len) return 0;
+    return releaseLease(&self.project_controller.projects.items[project_index], self.allocator, owner, lease_id, unixTimestampMs());
 }
 
 pub fn activeWorkspaceLeaseCount(self: anytype, project_index: usize) usize {
     self.pruneExpiredWorkspaceLeases(project_index);
-    if (project_index >= self.projects.items.len) return 0;
-    return self.projects.items[project_index].workspace_leases.items.len;
+    if (project_index >= self.project_controller.projects.items.len) return 0;
+    return self.project_controller.projects.items[project_index].workspace_leases.items.len;
 }
 
 pub fn selectWorkspaceChatPaneThread(self: anytype, pane_id: WorkspacePaneId) bool {
-    if (self.projects.items.len == 0) return false;
-    var project = &self.projects.items[self.selected_project_index];
+    if (self.project_controller.projects.items.len == 0) return false;
+    var project = &self.project_controller.projects.items[self.project_controller.selected_index];
     const pane = project.workspace_layout.paneById(pane_id) orelse return false;
     const thread_index = switch (pane.ref) {
         .chat => |ref| ref.thread_index,
@@ -820,28 +820,28 @@ pub fn selectWorkspaceChatPaneThread(self: anytype, pane_id: WorkspacePaneId) bo
     if (thread_index >= project.threads.items.len) return false;
     project.selected_thread_index = thread_index;
     project.workspace_layout.focused_pane_id = pane_id;
-    _ = self.clearChatCompletion(self.selected_project_index, thread_index);
-    self.terminal_focused = false;
+    _ = self.clearChatCompletion(self.project_controller.selected_index, thread_index);
+    self.terminal_controller.focused = false;
     self.unfocusBrowserPane();
-    self.browser_address_focused = false;
+    self.browser_controller.address_focused = false;
     self.syncPaletteComposerFromDraft();
     self.markDirty();
     return true;
 }
 
 pub fn isCurrentProjectWorkspacePaneFocused(self: anytype, pane_id: WorkspacePaneId) bool {
-    if (self.projects.items.len == 0) return false;
-    return self.projects.items[self.selected_project_index].workspace_layout.focused_pane_id == pane_id;
+    if (self.project_controller.projects.items.len == 0) return false;
+    return self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.focused_pane_id == pane_id;
 }
 
 pub fn isCurrentProjectWorkspacePaneMaximized(self: anytype, pane_id: WorkspacePaneId) bool {
-    if (self.projects.items.len == 0) return false;
-    return self.projects.items[self.selected_project_index].workspace_layout.maximized_pane_id == pane_id;
+    if (self.project_controller.projects.items.len == 0) return false;
+    return self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.maximized_pane_id == pane_id;
 }
 
 pub fn focusWorkspacePane(self: anytype, project_index: usize, pane_id: WorkspacePaneId) bool {
-    if (project_index >= self.projects.items.len) return false;
-    var layout = &self.projects.items[project_index].workspace_layout;
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    var layout = &self.project_controller.projects.items[project_index].workspace_layout;
     const pane = layout.paneById(pane_id) orelse return false;
     // Composer popovers belong to the live composer pane; leaving them
     // open on a pane that no longer renders them would silently keep
@@ -851,23 +851,23 @@ pub fn focusWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
     layout.focused_pane_id = pane_id;
     switch (pane.ref) {
         .chat => |ref| {
-            var project = &self.projects.items[project_index];
+            var project = &self.project_controller.projects.items[project_index];
             if (ref.thread_index < project.threads.items.len) {
                 project.selected_thread_index = ref.thread_index;
                 _ = self.clearChatCompletion(project_index, ref.thread_index);
             }
             project.last_content_pane_id = pane_id;
-            if (self.selected_project_index == project_index) {
+            if (self.project_controller.selected_index == project_index) {
                 self.syncPaletteComposerFromDraft();
                 self.requestComposerFocus();
             }
         },
         .terminal => |ref| {
-            self.projects.items[project_index].last_content_pane_id = pane_id;
-            if (self.selected_project_index == project_index) self.requestTerminalDockFocus(ref.dock_id);
+            self.project_controller.projects.items[project_index].last_content_pane_id = pane_id;
+            if (self.project_controller.selected_index == project_index) self.requestTerminalDockFocus(ref.dock_id);
         },
         .browser => {
-            if (self.selected_project_index == project_index) self.focusBrowserPane();
+            if (self.project_controller.selected_index == project_index) self.focusBrowserPane();
         },
     }
     self.markDirty();
@@ -875,13 +875,13 @@ pub fn focusWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
 }
 
 pub fn focusCurrentProjectWorkspacePane(self: anytype, pane_id: WorkspacePaneId) bool {
-    if (self.projects.items.len == 0) return false;
-    return self.focusWorkspacePane(self.selected_project_index, pane_id);
+    if (self.project_controller.projects.items.len == 0) return false;
+    return self.focusWorkspacePane(self.project_controller.selected_index, pane_id);
 }
 
 pub fn focusPromptForFocusedChatWorkspacePane(self: anytype) bool {
-    if (self.projects.items.len == 0) return false;
-    var project = &self.projects.items[self.selected_project_index];
+    if (self.project_controller.projects.items.len == 0) return false;
+    var project = &self.project_controller.projects.items[self.project_controller.selected_index];
     const pane_id = project.workspace_layout.focused_pane_id orelse return false;
     const pane = project.workspace_layout.paneById(pane_id) orelse return false;
     const thread_index = switch (pane.ref) {
@@ -890,21 +890,21 @@ pub fn focusPromptForFocusedChatWorkspacePane(self: anytype) bool {
     };
     if (thread_index >= project.threads.items.len) return false;
     project.selected_thread_index = thread_index;
-    _ = self.clearChatCompletion(self.selected_project_index, thread_index);
+    _ = self.clearChatCompletion(self.project_controller.selected_index, thread_index);
     self.syncPaletteComposerFromDraft();
-    self.palette_composer.focused = true;
-    self.composer_focused = true;
-    self.terminal_focused = false;
+    self.composer_controller.composer.focused = true;
+    self.composer_controller.focused = true;
+    self.terminal_controller.focused = false;
     self.unfocusBrowserPane();
-    self.browser_address_focused = false;
+    self.browser_controller.address_focused = false;
     self.ensurePaletteComposerCursorVisible();
     self.markDirty();
     return true;
 }
 
 pub fn swapCurrentProjectWorkspacePanes(self: anytype, first_pane_id: WorkspacePaneId, second_pane_id: WorkspacePaneId) bool {
-    if (self.projects.items.len == 0) return false;
-    var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    if (self.project_controller.projects.items.len == 0) return false;
+    var layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     if (!layout.swapPaneRefs(first_pane_id, second_pane_id)) return false;
     self.markDirty();
     return true;
@@ -916,12 +916,12 @@ pub fn moveWorkspacePaneInDirection(
     pane_id: WorkspacePaneId,
     direction: WorkspacePaneDirection,
 ) bool {
-    if (project_index >= self.projects.items.len) return false;
-    var layout = &self.projects.items[project_index].workspace_layout;
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    var layout = &self.project_controller.projects.items[project_index].workspace_layout;
     const neighbor_id = layout.neighborPaneId(pane_id, direction) orelse return false;
     if (!layout.swapPaneRefs(pane_id, neighbor_id)) return false;
     layout.focused_pane_id = neighbor_id;
-    if (self.selected_project_index == project_index) {
+    if (self.project_controller.selected_index == project_index) {
         _ = self.focusCurrentProjectWorkspacePane(neighbor_id);
     } else {
         self.markDirty();
@@ -936,10 +936,10 @@ pub fn moveCurrentProjectWorkspacePaneToPlacement(
     axis: WorkspaceSplitAxis,
     new_after: bool,
 ) bool {
-    if (self.projects.items.len == 0) return false;
+    if (self.project_controller.projects.items.len == 0) return false;
     if (source_pane_id == target_pane_id) return false;
 
-    var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    var layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     _ = layout.paneById(source_pane_id) orelse return false;
     _ = layout.paneById(target_pane_id) orelse return false;
 
@@ -963,13 +963,13 @@ pub fn moveCurrentProjectWorkspacePaneToPlacement(
 }
 
 pub fn toggleCurrentProjectWorkspacePaneMaximized(self: anytype, pane_id: WorkspacePaneId) bool {
-    if (self.projects.items.len == 0) return false;
-    return self.toggleWorkspacePaneMaximized(self.selected_project_index, pane_id);
+    if (self.project_controller.projects.items.len == 0) return false;
+    return self.toggleWorkspacePaneMaximized(self.project_controller.selected_index, pane_id);
 }
 
 pub fn toggleWorkspacePaneMaximized(self: anytype, project_index: usize, pane_id: WorkspacePaneId) bool {
-    if (project_index >= self.projects.items.len) return false;
-    var layout = &self.projects.items[project_index].workspace_layout;
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    var layout = &self.project_controller.projects.items[project_index].workspace_layout;
     const pane = layout.paneById(pane_id) orelse return false;
     runtime_log.diagnostic("pane maximize toggle begin project={d} pane={d} kind={s} currently_maximized={any}", .{
         project_index,
@@ -990,20 +990,20 @@ pub fn toggleWorkspacePaneMaximized(self: anytype, project_index: usize, pane_id
 }
 
 pub fn maximizeWorkspacePane(self: anytype, project_index: usize, pane_id: WorkspacePaneId) bool {
-    if (project_index >= self.projects.items.len) return false;
-    const layout = &self.projects.items[project_index].workspace_layout;
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    const layout = &self.project_controller.projects.items[project_index].workspace_layout;
     if (layout.maximized_pane_id == pane_id) return true;
     return self.toggleWorkspacePaneMaximized(project_index, pane_id);
 }
 
 pub fn clearCurrentProjectWorkspacePaneMaximized(self: anytype) bool {
-    if (self.projects.items.len == 0) return false;
-    return self.clearWorkspacePaneMaximized(self.selected_project_index);
+    if (self.project_controller.projects.items.len == 0) return false;
+    return self.clearWorkspacePaneMaximized(self.project_controller.selected_index);
 }
 
 pub fn clearWorkspacePaneMaximized(self: anytype, project_index: usize) bool {
-    if (project_index >= self.projects.items.len) return false;
-    var layout = &self.projects.items[project_index].workspace_layout;
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    var layout = &self.project_controller.projects.items[project_index].workspace_layout;
     if (layout.maximized_pane_id == null) return false;
     layout.maximized_pane_id = null;
     self.markDirty();
@@ -1011,13 +1011,13 @@ pub fn clearWorkspacePaneMaximized(self: anytype, project_index: usize) bool {
 }
 
 pub fn closeCurrentProjectWorkspacePane(self: anytype, pane_id: WorkspacePaneId) bool {
-    if (self.projects.items.len == 0) return false;
-    return self.closeWorkspacePane(self.selected_project_index, pane_id);
+    if (self.project_controller.projects.items.len == 0) return false;
+    return self.closeWorkspacePane(self.project_controller.selected_index, pane_id);
 }
 
 pub fn closeWorkspacePane(self: anytype, project_index: usize, pane_id: WorkspacePaneId) bool {
-    if (project_index >= self.projects.items.len) return false;
-    var project = &self.projects.items[project_index];
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    var project = &self.project_controller.projects.items[project_index];
     var layout = &project.workspace_layout;
     if (layout.rootContainsPane(pane_id) and layout.visiblePaneCount() <= 1) {
         self.setSidebarNotice("Cannot close the last workspace pane.");
@@ -1041,7 +1041,7 @@ pub fn closeWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
             if (preserve_agent_history) {
                 if (project.managedProcessByDockId(ref.dock_id)) |process| process.pane_id = null;
             }
-            if (self.selected_project_index == project_index and !layout.hasVisiblePaneKind(.terminal)) self.terminal_focused = false;
+            if (self.project_controller.selected_index == project_index and !layout.hasVisiblePaneKind(.terminal)) self.terminal_controller.focused = false;
             self.setSidebarNotice(if (preserve_agent_history) "Agent TUI closed. Reopen it from History." else "Terminal pane closed.");
         },
         .browser => {
@@ -1059,7 +1059,7 @@ pub fn closeWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
             };
         }
     }
-    if (self.selected_project_index == project_index) {
+    if (self.project_controller.selected_index == project_index) {
         if (layout.focused_pane_id) |focused_pane_id| {
             _ = self.focusWorkspacePane(project_index, focused_pane_id);
         }
@@ -1069,8 +1069,8 @@ pub fn closeWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
 }
 
 pub fn clearHerdrClosedPaneMetadata(self: anytype, project_index: usize, pane_id: WorkspacePaneId, removed_ref: WorkspacePaneRef) void {
-    if (project_index >= self.projects.items.len) return;
-    var project = &self.projects.items[project_index];
+    if (project_index >= self.project_controller.projects.items.len) return;
+    var project = &self.project_controller.projects.items[project_index];
     if (project.herdr_link) |*link| {
         var changed = link.removePaneLinkForVerdePane(self.allocator, pane_id);
         if (link.attach_pane_id) |attach_pane_id| {
@@ -1097,8 +1097,8 @@ pub fn clearHerdrClosedPaneMetadata(self: anytype, project_index: usize, pane_id
 }
 
 pub fn closeFocusedWorkspacePane(self: anytype) bool {
-    if (self.projects.items.len == 0) return false;
-    const pane_id = self.projects.items[self.selected_project_index].workspace_layout.focused_pane_id orelse return false;
+    if (self.project_controller.projects.items.len == 0) return false;
+    const pane_id = self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.focused_pane_id orelse return false;
     return self.closeCurrentProjectWorkspacePane(pane_id);
 }
 
@@ -1107,8 +1107,8 @@ pub fn splitCurrentProjectWorkspacePaneWithChat(self: anytype, pane_id: Workspac
 }
 
 pub fn splitFocusedWorkspacePaneWithChatAxis(self: anytype, axis: WorkspaceSplitAxis) bool {
-    if (self.projects.items.len == 0) return false;
-    const pane_id = self.projects.items[self.selected_project_index].workspace_layout.focused_pane_id orelse return false;
+    if (self.project_controller.projects.items.len == 0) return false;
+    const pane_id = self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.focused_pane_id orelse return false;
     return self.splitCurrentProjectWorkspacePaneWithChatAxis(pane_id, axis);
 }
 
@@ -1117,8 +1117,8 @@ pub fn splitCurrentProjectWorkspacePaneWithChatAxis(self: anytype, pane_id: Work
 }
 
 pub fn splitCurrentProjectWorkspacePaneWithChatPlacement(self: anytype, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, new_after: bool) bool {
-    if (self.projects.items.len == 0) return false;
-    return self.splitWorkspacePaneWithChatPlacement(self.selected_project_index, pane_id, axis, new_after);
+    if (self.project_controller.projects.items.len == 0) return false;
+    return self.splitWorkspacePaneWithChatPlacement(self.project_controller.selected_index, pane_id, axis, new_after);
 }
 
 pub fn splitWorkspacePaneWithChatAxis(self: anytype, project_index: usize, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis) bool {
@@ -1130,14 +1130,14 @@ pub fn openWorkspaceChat(
     project_index: usize,
     request: OpenChatRequest,
 ) !OpenChatResult {
-    if (project_index >= self.projects.items.len) return error.ProjectNotFound;
+    if (project_index >= self.project_controller.projects.items.len) return error.ProjectNotFound;
     if (request.model_ref) |requested_model| {
         if (!self.providerSupportsModel(request.provider, requested_model)) return error.InvalidModel;
     }
     const selected_model = request.model_ref orelse composerDefaultModelRef(self, request.provider);
     const settings = try self.resolveChatCreationSettings(request, selected_model);
     const result = try createWorkspaceChatPane(
-        &self.projects.items[project_index],
+        &self.project_controller.projects.items[project_index],
         self.allocator,
         request.provider,
         selected_model,
@@ -1147,7 +1147,7 @@ pub fn openWorkspaceChat(
         request.focus,
     );
     if (request.focus) {
-        self.selected_project_index = project_index;
+        self.project_controller.selected_index = project_index;
         self.requestComposerFocus();
         self.syncPaletteComposerFromDraft();
         self.syncRenameBuffer();
@@ -1242,8 +1242,8 @@ pub fn providerSupportsModel(self: anytype, provider: Provider, model_ref: []con
 }
 
 pub fn splitWorkspacePaneWithChatPlacement(self: anytype, project_index: usize, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, new_after: bool) bool {
-    if (project_index >= self.projects.items.len) return false;
-    var project = &self.projects.items[project_index];
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    var project = &self.project_controller.projects.items[project_index];
     var layout = &project.workspace_layout;
     _ = layout.paneById(pane_id) orelse return false;
     const thread_index = project.addThread(self.allocator) catch |err| {
@@ -1263,8 +1263,8 @@ pub fn splitWorkspacePaneWithChatPlacement(self: anytype, project_index: usize, 
     };
     layout.focusCreatedPane(new_pane_id);
     project.selected_thread_index = thread_index;
-    if (self.selected_project_index == project_index) {
-        self.terminal_focused = false;
+    if (self.project_controller.selected_index == project_index) {
+        self.terminal_controller.focused = false;
         self.requestComposerFocus();
         self.syncRenameBuffer();
     }
@@ -1352,8 +1352,8 @@ pub fn splitCurrentProjectWorkspacePaneWithThread(
     axis: WorkspaceSplitAxis,
     new_after: bool,
 ) bool {
-    if (self.projects.items.len == 0) return false;
-    var project = &self.projects.items[self.selected_project_index];
+    if (self.project_controller.projects.items.len == 0) return false;
+    var project = &self.project_controller.projects.items[self.project_controller.selected_index];
     if (thread_index >= project.threads.items.len) return false;
     var layout = &project.workspace_layout;
     const target_pane_id = if (layout.paneById(pane_id) != null)
@@ -1373,7 +1373,7 @@ pub fn splitCurrentProjectWorkspacePaneWithThread(
     };
     layout.focusCreatedPane(new_pane_id);
     project.selected_thread_index = thread_index;
-    self.terminal_focused = false;
+    self.terminal_controller.focused = false;
     self.requestComposerFocus();
     self.syncRenameBuffer();
     self.markDirty();
@@ -1389,24 +1389,24 @@ pub fn splitFocusedWorkspacePaneWithTerminalAxis(self: anytype, axis: WorkspaceS
 }
 
 pub fn splitFocusedWorkspacePaneWithTerminalPlacement(self: anytype, axis: WorkspaceSplitAxis, new_after: bool) bool {
-    if (self.projects.items.len == 0) return false;
-    const pane_id = self.projects.items[self.selected_project_index].workspace_layout.focused_pane_id orelse return false;
+    if (self.project_controller.projects.items.len == 0) return false;
+    const pane_id = self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.focused_pane_id orelse return false;
     return self.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, axis, new_after);
 }
 
 pub fn openTerminalPaneForProjectIndex(self: anytype, project_index: usize) bool {
-    if (project_index >= self.projects.items.len) return false;
-    self.selected_project_index = project_index;
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    self.project_controller.selected_index = project_index;
     self.ensureCurrentProjectWorkspace();
-    const pane_id = self.projects.items[self.selected_project_index].workspace_layout.focused_pane_id orelse return false;
+    const pane_id = self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.focused_pane_id orelse return false;
     return self.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, .horizontal, true);
 }
 
 pub fn openCurrentProjectTerminalPaneForCommand(self: anytype) ?WorkspacePaneId {
-    if (self.projects.items.len == 0) return null;
+    if (self.project_controller.projects.items.len == 0) return null;
     self.ensureCurrentProjectWorkspace();
 
-    var project = &self.projects.items[self.selected_project_index];
+    var project = &self.project_controller.projects.items[self.project_controller.selected_index];
     var layout = &project.workspace_layout;
     const target_pane_id = layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse {
         self.setSidebarNotice("No workspace pane selected.");
@@ -1419,8 +1419,8 @@ pub fn openCurrentProjectTerminalPaneForCommand(self: anytype) ?WorkspacePaneId 
         self.setSidebarNotice("Failed to create terminal dock.");
         return null;
     };
-    project = &self.projects.items[self.selected_project_index];
-    self.restartTerminalDockForWorkspace(self.selected_project_index, dock_id) catch |err| {
+    project = &self.project_controller.projects.items[self.project_controller.selected_index];
+    self.restartTerminalDockForWorkspace(self.project_controller.selected_index, dock_id) catch |err| {
         log.err("failed to start editor terminal dock: {s}", .{@errorName(err)});
         self.setSidebarNotice("Failed to start terminal.");
         return null;
@@ -1445,8 +1445,8 @@ pub fn openCurrentProjectTerminalPaneForCommand(self: anytype) ?WorkspacePaneId 
 }
 
 pub fn openThreadInTui(self: anytype, project_index: usize, thread_index: usize) void {
-    if (project_index >= self.projects.items.len) return;
-    var project = &self.projects.items[project_index];
+    if (project_index >= self.project_controller.projects.items.len) return;
+    var project = &self.project_controller.projects.items[project_index];
     if (thread_index >= project.threads.items.len) return;
     var thread = &project.threads.items[thread_index];
     const provider_thread_id = thread.provider_thread_id orelse {
@@ -1460,10 +1460,10 @@ pub fn openThreadInTui(self: anytype, project_index: usize, thread_index: usize)
     };
     defer self.allocator.free(command);
 
-    self.selected_project_index = project_index;
+    self.project_controller.selected_index = project_index;
     self.ensureCurrentProjectWorkspace();
 
-    project = &self.projects.items[project_index];
+    project = &self.project_controller.projects.items[project_index];
     thread = &project.threads.items[thread_index];
     var layout = &project.workspace_layout;
 
@@ -1492,7 +1492,7 @@ pub fn openThreadInTui(self: anytype, project_index: usize, thread_index: usize)
         return;
     };
 
-    project = &self.projects.items[project_index];
+    project = &self.project_controller.projects.items[project_index];
     thread = &project.threads.items[thread_index];
     layout = &project.workspace_layout;
     thread.tui_dock_id = dock_id;
@@ -1520,14 +1520,14 @@ pub fn openThreadInTui(self: anytype, project_index: usize, thread_index: usize)
 }
 
 pub fn openThreadInChat(self: anytype, project_index: usize, thread_index: usize) void {
-    if (project_index >= self.projects.items.len) return;
-    var project = &self.projects.items[project_index];
+    if (project_index >= self.project_controller.projects.items.len) return;
+    var project = &self.project_controller.projects.items[project_index];
     if (thread_index >= project.threads.items.len) return;
     const dock_id = project.threads.items[thread_index].tui_dock_id orelse return;
 
-    self.selected_project_index = project_index;
+    self.project_controller.selected_index = project_index;
     self.ensureCurrentProjectWorkspace();
-    project = &self.projects.items[project_index];
+    project = &self.project_controller.projects.items[project_index];
     var layout = &project.workspace_layout;
     const pane_id = layout.visibleTerminalPaneIdForDock(dock_id) orelse layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse return;
     const pane = layout.paneByIdMutable(pane_id) orelse return;
@@ -1535,7 +1535,7 @@ pub fn openThreadInChat(self: anytype, project_index: usize, thread_index: usize
     layout.focused_pane_id = pane_id;
     layout.maximized_pane_id = null;
     project.selected_thread_index = thread_index;
-    self.terminal_focused = false;
+    self.terminal_controller.focused = false;
     self.requestComposerFocus();
     self.syncRenameBuffer();
     self.setSidebarNotice("Thread opened in chat.");
@@ -1561,8 +1561,8 @@ pub fn splitCurrentProjectWorkspacePaneWithTerminalAxis(self: anytype, pane_id: 
 }
 
 pub fn splitCurrentProjectWorkspacePaneWithTerminalPlacement(self: anytype, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, new_after: bool) bool {
-    if (self.projects.items.len == 0) return false;
-    return self.splitWorkspacePaneWithTerminalPlacement(self.selected_project_index, pane_id, axis, new_after);
+    if (self.project_controller.projects.items.len == 0) return false;
+    return self.splitWorkspacePaneWithTerminalPlacement(self.project_controller.selected_index, pane_id, axis, new_after);
 }
 
 pub fn splitWorkspacePaneWithTerminalAxis(self: anytype, project_index: usize, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis) bool {
@@ -1570,8 +1570,8 @@ pub fn splitWorkspacePaneWithTerminalAxis(self: anytype, project_index: usize, p
 }
 
 pub fn splitWorkspacePaneWithTerminalPlacement(self: anytype, project_index: usize, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, new_after: bool) bool {
-    if (project_index >= self.projects.items.len) return false;
-    var project = &self.projects.items[project_index];
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    var project = &self.project_controller.projects.items[project_index];
     var layout = &project.workspace_layout;
     _ = layout.paneById(pane_id) orelse return false;
 
@@ -1599,15 +1599,15 @@ pub fn splitWorkspacePaneWithTerminalPlacement(self: anytype, project_index: usi
     };
     layout.focusCreatedPane(new_pane_id);
     dock.visible = false;
-    if (self.selected_project_index == project_index) self.requestTerminalDockFocus(dock_id);
+    if (self.project_controller.selected_index == project_index) self.requestTerminalDockFocus(dock_id);
     self.setSidebarNotice("Terminal pane created.");
     self.markDirty();
     return true;
 }
 
 pub fn toggleFocusedWorkspacePaneMaximized(self: anytype) bool {
-    if (self.projects.items.len == 0) return false;
-    const pane_id = self.projects.items[self.selected_project_index].workspace_layout.focused_pane_id orelse return false;
+    if (self.project_controller.projects.items.len == 0) return false;
+    const pane_id = self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.focused_pane_id orelse return false;
     return self.toggleCurrentProjectWorkspacePaneMaximized(pane_id);
 }
 
@@ -1618,8 +1618,8 @@ pub fn resizeCurrentProjectWorkspaceSplit(
     axis: WorkspaceSplitAxis,
     ratio: f32,
 ) void {
-    if (self.projects.items.len == 0) return;
-    _ = self.resizeWorkspaceSplit(self.selected_project_index, first_pane_id, second_pane_id, axis, ratio);
+    if (self.project_controller.projects.items.len == 0) return;
+    _ = self.resizeWorkspaceSplit(self.project_controller.selected_index, first_pane_id, second_pane_id, axis, ratio);
 }
 
 pub fn resizeWorkspaceSplit(
@@ -1630,8 +1630,8 @@ pub fn resizeWorkspaceSplit(
     axis: WorkspaceSplitAxis,
     ratio: f32,
 ) bool {
-    if (project_index >= self.projects.items.len) return false;
-    var layout = &self.projects.items[project_index].workspace_layout;
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    var layout = &self.project_controller.projects.items[project_index].workspace_layout;
     if (!layout.resizeSplit(first_pane_id, second_pane_id, axis, ratio)) return false;
     self.markDirty();
     return true;
@@ -1644,8 +1644,8 @@ pub fn nudgeCurrentProjectWorkspaceSplit(
     axis: WorkspaceSplitAxis,
     delta: f32,
 ) bool {
-    if (self.projects.items.len == 0) return false;
-    var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    if (self.project_controller.projects.items.len == 0) return false;
+    var layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     if (layout.nudgeSplitRatio(first_pane_id, second_pane_id, axis, delta)) {
         self.markDirty();
         return true;
@@ -1654,8 +1654,8 @@ pub fn nudgeCurrentProjectWorkspaceSplit(
 }
 
 pub fn focusCurrentProjectWorkspaceTerminalPane(self: anytype) void {
-    if (self.projects.items.len == 0) return;
-    var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    if (self.project_controller.projects.items.len == 0) return;
+    var layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     for (layout.panes.items) |pane| {
         switch (pane.ref) {
             .terminal => {
@@ -1668,8 +1668,8 @@ pub fn focusCurrentProjectWorkspaceTerminalPane(self: anytype) void {
 }
 
 pub fn focusCurrentProjectWorkspaceTerminalDock(self: anytype, dock_id: u32) void {
-    if (self.projects.items.len == 0) return;
-    var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    if (self.project_controller.projects.items.len == 0) return;
+    var layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
     for (layout.panes.items) |pane| {
         switch (pane.ref) {
             .terminal => |ref| if (ref.dock_id == dock_id) {
@@ -1682,11 +1682,11 @@ pub fn focusCurrentProjectWorkspaceTerminalDock(self: anytype, dock_id: u32) voi
 }
 
 pub fn currentProjectWorkspaceVisiblePaneCount(self: anytype) usize {
-    if (self.projects.items.len == 0) return 0;
-    return self.projects.items[self.selected_project_index].workspace_layout.visiblePaneCount();
+    if (self.project_controller.projects.items.len == 0) return 0;
+    return self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.visiblePaneCount();
 }
 
 pub fn currentProjectGridNewPanePlacement(self: anytype) ?WorkspacePanePlacement {
-    if (self.projects.items.len == 0) return null;
-    return self.projects.items[self.selected_project_index].workspace_layout.gridNewPanePlacement();
+    if (self.project_controller.projects.items.len == 0) return null;
+    return self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.gridNewPanePlacement();
 }

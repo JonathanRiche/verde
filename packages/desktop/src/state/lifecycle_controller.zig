@@ -1,6 +1,11 @@
 //! Dirty-state debounce and interaction lifecycle tracking.
 
 const std = @import("std");
+const platform_runtime = @import("platform_runtime");
+const persistence = @import("persistence.zig");
+
+const SAVE_DEBOUNCE_MS: i64 = 750;
+const log = std.log.scoped(.native_shell);
 
 pub const State = struct {
     dirty: bool = false,
@@ -26,6 +31,59 @@ pub const State = struct {
         self.dirty = false;
     }
 };
+
+pub fn markDirty(self: anytype) void {
+    const now_ms = platform_runtime.unixTimestampMs();
+    self.lifecycle.noteInteraction(now_ms);
+    self.lifecycle.markDirty(now_ms);
+}
+
+pub fn noteInteraction(self: anytype) void {
+    self.lifecycle.noteInteraction(platform_runtime.unixTimestampMs());
+}
+
+pub fn flushIfDirty(self: anytype) void {
+    const now = platform_runtime.unixTimestampMs();
+    if (!self.lifecycle.shouldFlush(now, SAVE_DEBOUNCE_MS)) return;
+    flushDirtyNow(self);
+}
+
+pub fn flushDirtyBlocking(self: anytype) void {
+    if (!self.lifecycle.dirty) return;
+    var persisted = self.buildPersistedState(self.storage.allocator) catch |err| {
+        log.err("failed to snapshot native state: {s}", .{@errorName(err)});
+        return;
+    };
+    defer persisted.deinit();
+    self.storage.save(persisted.value) catch |err| {
+        log.err("failed to save native state: {s}", .{@errorName(err)});
+        return;
+    };
+    self.lifecycle.clearDirty();
+}
+
+pub fn flushDirtyNow(self: anytype) void {
+    if (!self.lifecycle.dirty) return;
+
+    var persisted = self.buildPersistedState(std.heap.page_allocator) catch |err| {
+        log.err("failed to snapshot native state: {s}", .{@errorName(err)});
+        return;
+    };
+    errdefer persisted.deinit();
+
+    const pref_path = std.heap.page_allocator.dupe(u8, self.storage.pref_path) catch |err| {
+        log.err("failed to prepare async native state save: {s}", .{@errorName(err)});
+        return;
+    };
+    errdefer std.heap.page_allocator.free(pref_path);
+
+    const worker = std.Thread.spawn(.{}, persistence.saveWorker, .{ pref_path, persisted }) catch |err| {
+        log.err("failed to start async native state save: {s}", .{@errorName(err)});
+        return;
+    };
+    worker.detach();
+    self.lifecycle.clearDirty();
+}
 
 test "lifecycle debounce requires both dirty and interaction quiet periods" {
     var state: State = .{};

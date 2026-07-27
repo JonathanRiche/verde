@@ -20,6 +20,7 @@ pub const AgentProvider = enum {
     claude,
     opencode,
     cursor,
+    grok,
     amp,
     other,
 };
@@ -332,6 +333,7 @@ fn parseProvider(raw_value: []const u8) ?AgentProvider {
     if (std.mem.eql(u8, value, "claude")) return .claude;
     if (std.mem.eql(u8, value, "opencode")) return .opencode;
     if (std.mem.eql(u8, value, "cursor")) return .cursor;
+    if (std.mem.eql(u8, value, "grok")) return .grok;
     if (std.mem.eql(u8, value, "amp")) return .amp;
     if (std.mem.eql(u8, value, "other")) return .other;
     return null;
@@ -411,6 +413,24 @@ test "parse amp agent provider" {
     try std.testing.expectEqualStrings("amp", config.processes.items[0].name);
     try std.testing.expectEqual(ProcessKind.agent, config.processes.items[0].kind);
     try std.testing.expectEqual(AgentProvider.amp, config.processes.items[0].provider.?);
+}
+
+test "parse grok agent provider" {
+    const content =
+        \\version: 1
+        \\agents:
+        \\  grok:
+        \\    provider: grok
+        \\    command: "grok --no-auto-update"
+        \\
+    ;
+    var config = try parse(std.testing.allocator, content, "verde.yml");
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), config.processes.items.len);
+    try std.testing.expectEqualStrings("grok", config.processes.items[0].name);
+    try std.testing.expectEqual(ProcessKind.agent, config.processes.items[0].kind);
+    try std.testing.expectEqual(AgentProvider.grok, config.processes.items[0].provider.?);
 }
 
 test "platform commands override legacy command without changing Unix semantics" {

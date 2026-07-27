@@ -10,6 +10,7 @@ const profiler = @import("../runtime/profiler.zig");
 const platform_runtime = @import("platform_runtime");
 const utils = @import("../utils.zig");
 const browser_panel = @import("browser.zig");
+const bang_commands = @import("../workspace/bang_commands.zig");
 const chat_markdown = @import("chat_markdown.zig");
 const colors = @import("colors.zig");
 const composer_pickers = @import("composer_pickers.zig");
@@ -221,19 +222,19 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
     else
         false;
     const live_composer = !blocked_by_quick and paneOwnsActiveChatState(state, pane_id);
-    const restore_thread_index = if (pane_id != null and state.projects.items.len > 0)
-        state.projects.items[state.selected_project_index].selected_thread_index
+    const restore_thread_index = if (pane_id != null and state.project_controller.projects.items.len > 0)
+        state.project_controller.projects.items[state.project_controller.selected_index].selected_thread_index
     else
         null;
     if (pane_id) |id| {
         if (state.workspaceChatThreadIndexByPane(id)) |thread_index| {
-            state.projects.items[state.selected_project_index].selected_thread_index = thread_index;
+            state.project_controller.projects.items[state.project_controller.selected_index].selected_thread_index = thread_index;
         }
     }
     defer {
         if (restore_thread_index) |thread_index| {
-            if (state.projects.items.len > 0 and thread_index < state.projects.items[state.selected_project_index].threads.items.len) {
-                state.projects.items[state.selected_project_index].selected_thread_index = thread_index;
+            if (state.project_controller.projects.items.len > 0 and thread_index < state.project_controller.projects.items[state.project_controller.selected_index].threads.items.len) {
+                state.project_controller.projects.items[state.project_controller.selected_index].selected_thread_index = thread_index;
             }
         }
     }
@@ -244,7 +245,7 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
     }
     if (pane_id == null) transcript_hit_count = 0;
     queueRect(state, rect, paletteColor(theme.background()));
-    if (state.projects.items.len == 0) {
+    if (state.project_controller.projects.items.len == 0) {
         state.workspace_header_open_menu_open = false;
         state.workspace_header_open_menu_pane_id = null;
         renderEmptyProjects(state, rect);
@@ -438,7 +439,7 @@ fn estimateWorkspaceOriginX(state: *app_state.AppState, workspace_width: f32) f3
 
 pub fn handleWorkspaceHeaderPaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool) bool {
     if (!down) return false;
-    if (state.projects.items.len == 0) return false;
+    if (state.project_controller.projects.items.len == 0) return false;
 
     if (workspaceHeaderMenuHit(state)) |menu_hit| {
         if (rectContains(menu_hit.menu_panel_rect, x, y)) {
@@ -534,7 +535,7 @@ pub fn handleWorkspaceHeaderPaletteMouseButton(state: *app_state.AppState, x: f3
 /// show a pointer (hand) cursor. Mirrors the precedence of
 /// `handleWorkspaceHeaderPaletteMouseButton`.
 pub fn workspaceHeaderWantsPointerAt(state: *const app_state.AppState, x: f32, y: f32) bool {
-    if (state.projects.items.len == 0) return false;
+    if (state.project_controller.projects.items.len == 0) return false;
     if (workspaceHeaderMenuHit(state)) |menu_hit| {
         var i: usize = 0;
         while (i < menu_hit.menu_row_count) : (i += 1) {
@@ -719,13 +720,13 @@ pub fn handleFocusedTranscriptPaletteWheel(state: *app_state.AppState, wheel_y: 
 
 fn scrollTranscriptByWheel(state: *app_state.AppState, pane_id: ?app_state.WorkspacePaneId, wheel_y: f32) void {
     if (pane_id) |id| _ = state.focusCurrentProjectWorkspacePane(id);
-    state.transcript_focused = true;
+    state.transcript_controller.focused = true;
     _ = state.acknowledgeFocusedChatCompletion();
-    const current = currentTranscriptScrollY(state, pane_id) orelse state.transcript_palette_scroll_y;
+    const current = currentTranscriptScrollY(state, pane_id) orelse state.transcript_controller.palette_scroll_y;
     const delta = -wheel_y * theme.scaledUi(TRANSCRIPT_WHEEL_PIXELS);
     rememberTranscriptScroll(state, pane_id, snapTranscriptScrollY(current + delta, null));
-    state.transcript_auto_follow_pending = false;
-    state.scroll_transcript_to_bottom_frames = 0;
+    state.transcript_controller.auto_follow_pending = false;
+    state.transcript_controller.scroll_to_bottom_frames = 0;
     state.markDirty();
 }
 
@@ -829,12 +830,12 @@ fn transcriptMarkdownBubbleHit(
     mouse_x: f32,
     mouse_y: f32,
 ) ?TranscriptMarkdownHit {
-    const column = state.transcript_palette_column;
-    const clip = state.transcript_palette_clip;
+    const column = state.transcript_controller.palette_column;
+    const clip = state.transcript_controller.palette_clip;
     if (column.w <= 0 or !rectContains(clip, mouse_x, mouse_y)) return null;
 
     const thread = state.currentThread();
-    const scroll_y = state.transcript_palette_scroll_y;
+    const scroll_y = state.transcript_controller.palette_scroll_y;
     var content_y = column.y - scroll_y;
 
     var msg_idx: usize = 0;
@@ -909,12 +910,12 @@ fn transcriptMarkdownBubbleLinkHit(
     mouse_x: f32,
     mouse_y: f32,
 ) ?TranscriptMarkdownLinkHit {
-    const column = state.transcript_palette_column;
-    const clip = state.transcript_palette_clip;
+    const column = state.transcript_controller.palette_column;
+    const clip = state.transcript_controller.palette_clip;
     if (column.w <= 0 or !rectContains(clip, mouse_x, mouse_y)) return null;
 
     const thread = state.currentThread();
-    const scroll_y = state.transcript_palette_scroll_y;
+    const scroll_y = state.transcript_controller.palette_scroll_y;
     var content_y = column.y - scroll_y;
 
     var msg_idx: usize = 0;
@@ -1012,17 +1013,17 @@ pub fn handleTranscriptPaletteMouseMotion(state: *app_state.AppState) void {
             transcript_scrollbar_track,
             transcript_scrollbar_thumb.h,
             transcript_scrollbar_max_scroll,
-            state.palette_mouse_y,
+            state.transcript_controller.palette_mouse_y,
             transcript_scrollbar_drag_grab_offset,
         );
         rememberTranscriptScroll(state, pane_id, snapTranscriptScrollY(target, transcript_scrollbar_max_scroll));
-        state.transcript_auto_follow_pending = false;
-        state.scroll_transcript_to_bottom_frames = 0;
+        state.transcript_controller.auto_follow_pending = false;
+        state.transcript_controller.scroll_to_bottom_frames = 0;
         state.markDirty();
         return;
     }
     if (!state.transcriptMarkdownSelectionDragging()) return;
-    const hit = transcriptMarkdownBubbleHit(state, state.palette_mouse_x, state.palette_mouse_y) orelse return;
+    const hit = transcriptMarkdownBubbleHit(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) orelse return;
     state.updateTranscriptMarkdownSelection(hit.message_index, hit.point);
 }
 
@@ -1067,7 +1068,7 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
     const pane_id = hit.pane_id;
     if (pane_id) |id| _ = state.focusCurrentProjectWorkspacePane(id);
 
-    state.transcript_focused = true;
+    state.transcript_controller.focused = true;
     _ = state.acknowledgeFocusedChatCompletion();
 
     // Scrollbar drag: thumb click starts a drag; track click (above/below
@@ -1091,8 +1092,8 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
                     hit.thumb.h * 0.5,
                 );
                 rememberTranscriptScroll(state, pane_id, snapTranscriptScrollY(target, hit.max_scroll));
-                state.transcript_auto_follow_pending = false;
-                state.scroll_transcript_to_bottom_frames = 0;
+                state.transcript_controller.auto_follow_pending = false;
+                state.transcript_controller.scroll_to_bottom_frames = 0;
                 state.markDirty();
             }
             return true;
@@ -1130,7 +1131,7 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
             if (webHref(link_hit.href)) |web_href| {
                 state.blurPaletteComposer();
                 state.clearTranscriptMarkdownSelection();
-                state.openTranscriptWebLink(web_href);
+                state.openConfiguredWebLink(web_href);
                 return true;
             }
         }
@@ -1162,8 +1163,8 @@ fn renderApprovalCard(state: *app_state.AppState, rect: palette.Rect, approval: 
 
     const deny_rect = palette.Rect{ .x = rect.x + rect.w - pad - button_w * 2.0 - gap, .y = rect.y + rect.h - pad - button_h, .w = button_w, .h = button_h };
     const approve_rect = palette.Rect{ .x = deny_rect.x + button_w + gap, .y = deny_rect.y, .w = button_w, .h = button_h };
-    const deny_hovered = rectContains(deny_rect, state.palette_mouse_x, state.palette_mouse_y);
-    const approve_hovered = rectContains(approve_rect, state.palette_mouse_x, state.palette_mouse_y);
+    const deny_hovered = rectContains(deny_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+    const approve_hovered = rectContains(approve_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     queueRounded(state, deny_rect, paletteColor(if (deny_hovered) theme.lighten(theme.COLOR_PANEL_MUTED, 0.10) else theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0));
     queueBorder(state, deny_rect, paletteColor(if (deny_hovered) theme.COLOR_TEXT_MUTED else theme.borderMuted()), theme.scaledUi(8.0), theme.scaledUi(1.0));
     queueApprovalButtonLabel(state, deny_rect, "Decline", paletteColor(if (deny_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED));
@@ -1262,7 +1263,7 @@ fn transcriptMarkdownMessageSnapshot(state: *app_state.AppState, message_index: 
     body_inner_w: f32,
     markdown: bool,
 } {
-    const column = state.transcript_palette_column;
+    const column = state.transcript_controller.palette_column;
     if (column.w <= 0.0) return null;
 
     const thread = state.currentThread();
@@ -1517,9 +1518,9 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
         .h = title_line_h,
     }, stableText(state, title_display), paletteColor(theme.COLOR_WHITE), title_font, rect);
 
-    const mx = state.palette_mouse_x;
-    const my = state.palette_mouse_y;
-    const mouse_ok = state.palette_mouse_in_workspace;
+    const mx = state.transcript_controller.palette_mouse_x;
+    const my = state.transcript_controller.palette_mouse_y;
+    const mouse_ok = state.transcript_controller.palette_mouse_in_workspace;
 
     const actions_y = rect.y + @max((rect.h - button_h) * 0.5, theme.scaledUi(4.0));
     const open_combo_x = actions_x;
@@ -1598,7 +1599,7 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
     if (state.canOpenCurrentProjectEditor(.configured)) {
         kinds[count] = .configured_editor;
         enabled[count] = true;
-        labels[count] = if (state.configuredEditorDisplayName()) |name|
+        labels[count] = if (utils.configuredEditorDisplayName()) |name|
             std.fmt.bufPrint(&label_storage[count], "Open in {s}", .{name}) catch "Open in configured editor"
         else
             "Open in configured editor";
@@ -1737,11 +1738,11 @@ fn renderEmptyProjects(state: *app_state.AppState, rect: palette.Rect) void {
 /// transcript clears the latch; scrolling back within ~72px of the bottom turns it on again.
 fn updateTranscriptAutoFollowPalette(state: *app_state.AppState, has_pending_stream: bool, max_scroll: f32, scroll_y: f32) void {
     if (!has_pending_stream) {
-        state.transcript_auto_follow_pending = false;
+        state.transcript_controller.auto_follow_pending = false;
         return;
     }
-    if (state.scroll_transcript_to_bottom_frames > 0 or transcriptScrollNearBottom(scroll_y, max_scroll)) {
-        state.transcript_auto_follow_pending = true;
+    if (state.transcript_controller.scroll_to_bottom_frames > 0 or transcriptScrollNearBottom(scroll_y, max_scroll)) {
+        state.transcript_controller.auto_follow_pending = true;
     }
 }
 
@@ -1798,13 +1799,13 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
     // Clip to full transcript body (same x/w as layout rect) so GL text and bubbles
     // stay below the workspace header when scrolled.
     const clip = rect;
-    state.transcript_palette_column = column;
-    state.transcript_palette_clip = clip;
+    state.transcript_controller.palette_column = column;
+    state.transcript_controller.palette_clip = clip;
 
     const thread = state.currentThread();
 
     if (thread.messages.items.len == 0 and !thread.isSendPendingForUi() and state.currentThreadPendingSlashCommandLabel() == null) {
-        state.transcript_palette_scroll_y = 0.0;
+        state.transcript_controller.palette_scroll_y = 0.0;
         rememberTranscriptScroll(state, pane_id, 0.0);
         appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect });
         queueText(state, .{ .x = column.x, .y = column.y, .w = column.w, .h = theme.scaledUi(30.0) }, "No messages yet", paletteColor(theme.COLOR_WHITE), theme.scaledUi(20.0), clip);
@@ -1819,39 +1820,39 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
     var scroll_y = snapTranscriptScrollY(currentTranscriptScrollY(state, pane_id) orelse max_scroll, max_scroll);
 
     if (paneOwnsActiveChatState(state, pane_id)) {
-        const pi = state.selected_project_index;
+        const pi = state.project_controller.selected_index;
         const ti = state.currentProject().selected_thread_index;
-        if (state.transcript_scroll_pending_track_p != pi or state.transcript_scroll_pending_track_t != ti) {
-            state.pending_transcript_scroll_px = 0;
-            state.pending_transcript_page_steps = 0;
-            state.transcript_scroll_pending_track_p = pi;
-            state.transcript_scroll_pending_track_t = ti;
+        if (state.transcript_controller.scroll_pending_track_project != pi or state.transcript_controller.scroll_pending_track_thread != ti) {
+            state.transcript_controller.pending_scroll_px = 0;
+            state.transcript_controller.pending_page_steps = 0;
+            state.transcript_controller.scroll_pending_track_project = pi;
+            state.transcript_controller.scroll_pending_track_thread = ti;
         }
 
-        if (state.pending_transcript_scroll_px != 0.0) {
-            scroll_y = snapTranscriptScrollY(scroll_y + state.pending_transcript_scroll_px, max_scroll);
-            state.pending_transcript_scroll_px = 0.0;
+        if (state.transcript_controller.pending_scroll_px != 0.0) {
+            scroll_y = snapTranscriptScrollY(scroll_y + state.transcript_controller.pending_scroll_px, max_scroll);
+            state.transcript_controller.pending_scroll_px = 0.0;
         }
-        if (state.pending_transcript_page_steps != 0) {
+        if (state.transcript_controller.pending_page_steps != 0) {
             const page_h = column.h * TRANSCRIPT_PAGE_VIEW_FRAC;
-            scroll_y = snapTranscriptScrollY(scroll_y + @as(f32, @floatFromInt(state.pending_transcript_page_steps)) * page_h, max_scroll);
-            state.pending_transcript_page_steps = 0;
+            scroll_y = snapTranscriptScrollY(scroll_y + @as(f32, @floatFromInt(state.transcript_controller.pending_page_steps)) * page_h, max_scroll);
+            state.transcript_controller.pending_page_steps = 0;
         }
     }
 
     updateTranscriptAutoFollowPalette(state, has_pending_stream, max_scroll, scroll_y);
 
-    if (state.transcript_auto_follow_pending or state.scroll_transcript_to_bottom_frames > 0) {
+    if (state.transcript_controller.auto_follow_pending or state.transcript_controller.scroll_to_bottom_frames > 0) {
         scroll_y = max_scroll;
     }
-    if (state.scroll_transcript_to_bottom_frames > 0) {
-        state.scroll_transcript_to_bottom_frames -= 1;
+    if (state.transcript_controller.scroll_to_bottom_frames > 0) {
+        state.transcript_controller.scroll_to_bottom_frames -= 1;
     }
-    if (state.scroll_transcript_to_bottom_frames == 0 and !has_pending_stream) {
-        state.transcript_auto_follow_pending = false;
+    if (state.transcript_controller.scroll_to_bottom_frames == 0 and !has_pending_stream) {
+        state.transcript_controller.auto_follow_pending = false;
     }
     rememberTranscriptScroll(state, pane_id, scroll_y);
-    state.transcript_palette_scroll_y = scroll_y;
+    state.transcript_controller.palette_scroll_y = scroll_y;
 
     var content_y = column.y - scroll_y;
     var msg_idx: usize = 0;
@@ -2729,7 +2730,7 @@ fn renderProviderFailureActionCard(
         .w = theme.scaledUi(116.0),
         .h = theme.scaledUi(34.0),
     });
-    const hovered = rectContains(button, state.palette_mouse_x, state.palette_mouse_y);
+    const hovered = rectContains(button, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     const button_fill = if (hovered)
         theme.withAlpha(theme.lighten(theme.COLOR_PANEL_ALT, 0.10), 245)
     else
@@ -3318,7 +3319,7 @@ fn diffPatchDisplayLineCountForLayout(state: ?*app_state.AppState, patch: []cons
         .split => blk: {
             if (patch.len == 0) break :blk 2;
             if (state) |app| {
-                const view = app.transcript_diff_view_cache.split(app.allocator, patch) orelse
+                const view = app.transcript_controller.diff_view_cache.split(app.allocator, patch) orelse
                     break :blk @max(wrappedLineCount(patch, 120), 2);
                 break :blk @max(view.rows.len, 1);
             }
@@ -3333,7 +3334,7 @@ fn diffPatchDisplayLineCountForLayout(state: ?*app_state.AppState, patch: []cons
 fn diffPatchDisplayLineCount(state: ?*app_state.AppState, patch: []const u8) usize {
     if (patch.len == 0) return 2;
     if (state) |app| {
-        const view = app.transcript_diff_view_cache.stacked(app.allocator, patch) orelse
+        const view = app.transcript_controller.diff_view_cache.stacked(app.allocator, patch) orelse
             return @max(wrappedLineCount(patch, 120), 2);
         return @max(view.lines.len, 1);
     }
@@ -3462,7 +3463,7 @@ fn renderDiffSummaryCard(
 
         const row_rect = palette.Rect{ .x = bubble.x, .y = row_y, .w = bubble.w, .h = row_h };
 
-        if (state.palette_mouse_in_workspace and rectContains(row_rect, state.palette_mouse_x, state.palette_mouse_y)) {
+        if (state.transcript_controller.palette_mouse_in_workspace and rectContains(row_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) {
             queueRectClipped(state, row_rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 90)), clip);
         }
         state.recordCardToggleHit(.{ .rect = row_rect, .key = key, .kind = .diff_file });
@@ -3590,8 +3591,8 @@ fn renderDiffLayoutOption(
     selected: bool,
     clip: palette.Rect,
 ) void {
-    const hovered = state.palette_mouse_in_workspace and
-        rectContains(rect, state.palette_mouse_x, state.palette_mouse_y);
+    const hovered = state.transcript_controller.palette_mouse_in_workspace and
+        rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     if (selected or hovered) {
         queueRoundedClipped(
             state,
@@ -3622,8 +3623,8 @@ fn renderDiffFileActionButton(
     primary: bool,
     clip: palette.Rect,
 ) void {
-    const hovered = state.palette_mouse_in_workspace and
-        rectContains(rect, state.palette_mouse_x, state.palette_mouse_y);
+    const hovered = state.transcript_controller.palette_mouse_in_workspace and
+        rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     const background = if (primary and hovered)
         theme.withAlpha(theme.COLOR_YELLOW, 42)
     else if (hovered)
@@ -3681,7 +3682,7 @@ fn renderDiffSplitPatchLines(
         return;
     }
 
-    const view = state.transcript_diff_view_cache.split(state.allocator, patch) orelse {
+    const view = state.transcript_controller.diff_view_cache.split(state.allocator, patch) orelse {
         renderDiffPatchLines(state, rect, patch, font_size, line_h, clip);
         return;
     };
@@ -3869,7 +3870,7 @@ fn renderDiffPatchLines(
         return;
     }
 
-    const view = state.transcript_diff_view_cache.stacked(state.allocator, patch) orelse {
+    const view = state.transcript_controller.diff_view_cache.stacked(state.allocator, patch) orelse {
         renderDiffFallback(state, rect, patch, font_size, line_h, clip);
         return;
     };
@@ -3913,8 +3914,8 @@ fn renderDiffPatchLines(
                     .w = theme.scaledUi(46.0),
                     .h = line_h - theme.scaledUi(4.0),
                 };
-                const hovered = state.palette_mouse_in_workspace and
-                    rectContains(copy_rect, state.palette_mouse_x, state.palette_mouse_y);
+                const hovered = state.transcript_controller.palette_mouse_in_workspace and
+                    rectContains(copy_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
                 queueRoundedClipped(
                     state,
                     copy_rect,
@@ -4339,7 +4340,7 @@ fn renderCommandEventRow(
     });
     const text_color = if (failed) paletteColor(theme.COLOR_DIFF_REMOVE) else paletteColor(theme.COLOR_TEXT_MUTED);
 
-    const copy_hovered = show_copy and rectContains(copy_rect, state.palette_mouse_x, state.palette_mouse_y);
+    const copy_hovered = show_copy and rectContains(copy_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     // Match the composer model pill: a quiet translucent resting fill that
     // becomes lighter and more opaque when the pointer enters the control.
     const copy_bg = if (copy_hovered)
@@ -4364,7 +4365,7 @@ fn renderCommandEventRow(
     }
 
     if (local_bang and retry_command.len > 0) {
-        const retry_hovered = rectContains(retry_rect, state.palette_mouse_x, state.palette_mouse_y);
+        const retry_hovered = rectContains(retry_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
         queueRoundedClipped(state, retry_rect, paletteColor(if (retry_hovered) theme.withAlpha(theme.COLOR_GREEN, 72) else theme.withAlpha(theme.COLOR_PANEL_MUTED, 86)), theme.scaledUi(5.0), clip);
         queueFixedTextLine(state, .{
             .x = retry_rect.x + theme.scaledUi(8.0),
@@ -4666,9 +4667,9 @@ fn renderMarkdownBodyView(state: *app_state.AppState, message_index: usize, rect
         ) catch null;
     } else null;
 
-    const mx = state.palette_mouse_x;
-    const my = state.palette_mouse_y;
-    const hovered = state.palette_mouse_in_workspace and rectContains(rect, mx, my) and rectContains(clip, mx, my);
+    const mx = state.transcript_controller.palette_mouse_x;
+    const my = state.transcript_controller.palette_mouse_y;
+    const hovered = state.transcript_controller.palette_mouse_in_workspace and rectContains(rect, mx, my) and rectContains(clip, mx, my);
 
     var context = chat_markdown.PaletteRenderContext{
         .allocator = state.allocator,
@@ -4677,7 +4678,7 @@ fn renderMarkdownBodyView(state: *app_state.AppState, message_index: usize, rect
         .text_arena = &state.palette_frame_text_arena,
         .cursor = rect,
         .available_width = rect.w,
-        .mouse_pos = if (state.palette_mouse_in_workspace) .{ mx, my } else .{ -1.0, -1.0 },
+        .mouse_pos = if (state.transcript_controller.palette_mouse_in_workspace) .{ mx, my } else .{ -1.0, -1.0 },
         .hovered = hovered,
         .clip = clip,
         .code_copy_recorder = state.codeCopyButtonRecorder(),
@@ -4810,7 +4811,7 @@ fn renderComposer(state: *app_state.AppState, rect: palette.Rect) void {
     state.updateFileSearch();
     var composer_batch: palette.RenderBatch = .{};
     defer composer_batch.deinit(state.allocator);
-    state.palette_composer.render(state.allocator, &composer_batch) catch |err| {
+    state.composer_controller.composer.render(state.allocator, &composer_batch) catch |err| {
         app_state.log.warn("failed to render palette composer: {s}", .{@errorName(err)});
     };
     state.palette_overlay_batch.appendStableBatch(state.allocator, state.palette_frame_text_arena.allocator(), &composer_batch) catch |err| {
@@ -4836,7 +4837,7 @@ fn renderInactiveComposer(state: *app_state.AppState, rect: palette.Rect) void {
         @max(theme.scaledUi(1.0), 1.0),
     );
 
-    const draft = state.currentThreadDraft();
+    const draft = state.currentDraft();
     const text = if (draft.len == 0)
         "Ask anything, or use / to show available commands"
     else if (std.mem.findScalar(u8, draft, '\n')) |newline|
@@ -5084,7 +5085,7 @@ fn renderComposerFileSearchResults(state: *app_state.AppState) void {
     file_search_hits = .{};
     if (!state.hasActiveFileSearch()) return;
 
-    const composer = state.palette_composer.bounds();
+    const composer = state.composer_controller.composer.bounds();
     if (composer.w <= theme.scaledUi(160.0)) return;
 
     const results = state.fileSearchResults();
@@ -5126,9 +5127,9 @@ fn renderComposerFileSearchResults(state: *app_state.AppState) void {
         return;
     }
 
-    const mouse_ok = state.palette_mouse_in_workspace;
-    const mx = state.palette_mouse_x;
-    const my = state.palette_mouse_y;
+    const mouse_ok = state.transcript_controller.palette_mouse_in_workspace;
+    const mx = state.transcript_controller.palette_mouse_x;
+    const my = state.transcript_controller.palette_mouse_y;
     const selected_index = state.fileSearchSelectedIndex();
     const first_index = if (selected_index >= visible_rows) selected_index + 1 - visible_rows else 0;
     const end_index = @min(first_index + visible_rows, results.len);
@@ -5187,7 +5188,7 @@ fn renderComposerSlashCommands(state: *app_state.AppState) void {
     const total = state.slashCommandPickerRowCount();
     if (total == 0) return;
 
-    const composer = state.palette_composer.bounds();
+    const composer = state.composer_controller.composer.bounds();
     if (composer.w <= theme.scaledUi(160.0)) return;
 
     const row_height = theme.scaledUi(46.0);
@@ -5219,9 +5220,9 @@ fn renderComposerSlashCommands(state: *app_state.AppState) void {
     const selected = state.slashCommandPickerSelectedIndex();
     const first_index = if (selected >= visible_rows) selected + 1 - visible_rows else 0;
     const end_index = @min(first_index + visible_rows, total);
-    const mouse_ok = state.palette_mouse_in_workspace;
-    const mx = state.palette_mouse_x;
-    const my = state.palette_mouse_y;
+    const mouse_ok = state.transcript_controller.palette_mouse_in_workspace;
+    const mx = state.transcript_controller.palette_mouse_x;
+    const my = state.transcript_controller.palette_mouse_y;
 
     var visible_index: usize = 0;
     var row_index = first_index;
@@ -5284,7 +5285,7 @@ fn renderComposerDraftImage(state: *app_state.AppState) void {
     const previous_z = state.palette_overlay_batch.setZIndex(COMPOSER_DRAFT_IMAGE_Z);
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
 
-    const composer = state.palette_composer.bounds();
+    const composer = state.composer_controller.composer.bounds();
     if (composer.w <= theme.scaledUi(140.0)) {
         state.setComposerDraftImageClearRect(null);
         return;
@@ -5351,7 +5352,7 @@ fn renderBangModeBanner(state: *app_state.AppState, rect: palette.Rect) void {
 
     var detail_buffer: [512]u8 = undefined;
     const detail = std.fmt.bufPrint(&detail_buffer, "{s}  ·  {s}  ·  everything after ! runs in the shell  ·  !! sends a literal !", .{
-        state.bangCommandShellName(),
+        bang_commands.shellName(),
         state.currentWorkspacePath(),
     }) catch "Everything after ! runs in the shell";
     queueText(state, .{
@@ -5410,13 +5411,13 @@ fn renderComposerDraftImageChip(state: *app_state.AppState, image: app_state.Cha
 fn renderComposerFollowupHint(state: *app_state.AppState) void {
     if (!state.hasPendingStream()) return;
     const hint = state.pendingFollowupHint() orelse return;
-    const draft = state.palette_composer.text();
+    const draft = state.composer_controller.composer.text();
     if (std.mem.trim(u8, draft, &std.ascii.whitespace).len == 0) return;
 
     const previous_z = state.palette_overlay_batch.setZIndex(COMPOSER_FOLLOWUP_HINT_Z);
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
 
-    const tr = state.palette_composer.textRect();
+    const tr = state.composer_controller.composer.textRect();
     const clip: palette.Rect = .{ .x = tr.x, .y = tr.y, .w = tr.w, .h = tr.h };
     const pad = theme.scaledUi(7.0);
     const font = theme.scaledUi(13.0);
@@ -5548,9 +5549,9 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
 
     const icon_color = paletteColor(.{ 0.82, 0.85, 0.91, 1.0 });
-    const model_rect = state.palette_composer.modelRect();
-    const fast_rect = state.palette_composer.fastRect();
-    const access_rect = state.palette_composer.accessRect();
+    const model_rect = state.composer_controller.composer.modelRect();
+    const fast_rect = state.composer_controller.composer.fastRect();
+    const access_rect = state.composer_controller.composer.accessRect();
     const icon_size = theme.scaledUi(22.0);
     const provider_slot = theme.scaledUi(COMPOSER_PROVIDER_LOGO_SLOT_CSS);
     // Pad must match the composer's scaled `pill_padding_x` so the logo sits
@@ -5580,8 +5581,8 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
     // word→glyph and glyph→separator gaps stay balanced. Slot order matches
     // `syncPaletteComposerControls`: optional reasoning glyph, then optional
     // speed glyph, then access.
-    if (state.palette_composer.showReasoningToggle()) {
-        const slots = state.palette_composer.reasoningIconSlotRects();
+    if (state.composer_controller.composer.showReasoningToggle()) {
+        const slots = state.composer_controller.composer.reasoningIconSlotRects();
         var slot_index: usize = 0;
         if (state.currentComposerShowsReasoningSegment() and slot_index < slots.count) {
             const cell = slots.rects[slot_index];
@@ -5607,7 +5608,7 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         }
     }
 
-    if (state.palette_composer.showFastToggle()) {
+    if (state.composer_controller.composer.showFastToggle()) {
         const fast_icon_rect = snapIconRectOrigin(palette.Rect{
             .x = fast_rect.x + theme.scaledUi(COMPOSER_TOOLBAR_PILL_PAD_X),
             .y = fast_rect.y + (fast_rect.h - icon_size) * 0.5,
@@ -5623,7 +5624,7 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
 
     // Fast/access consolidated into the run-config popover; the access pill
     // (and its lock glyph) only draws when a host re-enables the toggle.
-    if (state.palette_composer.showAccessToggle()) {
+    if (state.composer_controller.composer.showAccessToggle()) {
         drawAccessIcon(state, snapIconRectOrigin(palette.Rect{
             .x = access_rect.x + theme.scaledUi(COMPOSER_TOOLBAR_PILL_PAD_X),
             .y = access_rect.y + (access_rect.h - icon_size) * 0.5,

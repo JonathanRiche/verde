@@ -168,20 +168,20 @@ pub fn paneToolbarActionRowHeight() f32 {
 
 pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) void {
     palette_mouse_pos = .{ x, y };
-    if (state.browser_context_menu_open) {
+    if (state.browser_controller.context_menu_open) {
         if (browserContextMenuActionAtPoint(x, y)) |action| {
             switch (action) {
                 .backend_item => |item| if (item.enabled and !item.separator) {
-                    state.browser_context_menu_selected_index = item.index;
-                    state.browser_context_menu_active_parent = if (item.submenu) item.index else item.parent_index;
+                    state.browser_controller.context_menu_selected_index = item.index;
+                    state.browser_controller.context_menu_active_parent = if (item.submenu) item.index else item.parent_index;
                 },
                 .close_pane => {
-                    state.browser_context_menu_selected_index = CLOSE_PANE_MENU_INDEX;
-                    state.browser_context_menu_active_parent = null;
+                    state.browser_controller.context_menu_selected_index = CLOSE_PANE_MENU_INDEX;
+                    state.browser_controller.context_menu_active_parent = null;
                 },
                 .open_link_current, .open_link_new_tab => {
-                    state.browser_context_menu_selected_index = null;
-                    state.browser_context_menu_active_parent = null;
+                    state.browser_controller.context_menu_selected_index = null;
+                    state.browser_controller.context_menu_active_parent = null;
                 },
             }
         }
@@ -189,9 +189,9 @@ pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) void
     // Drag-to-extend the URL-bar selection. We re-find the address hit rect
     // each frame (the toolbar may have re-laid out) so the cursor stays
     // accurate even if the field moves under the pointer.
-    if (state.browser_address_drag_active and state.browser_address_focused) {
+    if (state.browser_controller.address_drag_active and state.browser_controller.address_focused) {
         if (findHit(.address)) |hit| {
-            state.browser_address_cursor = cursorForAddressPoint(state, hit.rect, x);
+            state.browser_controller.address_cursor = cursorForAddressPoint(state, hit.rect, x);
         }
     }
     if (tab_drag_source != null) {
@@ -235,7 +235,7 @@ pub fn wantsPointerAt(state: *app_state.AppState, x: f32, y: f32) bool {
         if (rectContainsPoint(palette_tab_hits[index].rect, x, y)) return true;
     }
 
-    if (state.browser_context_menu_open) {
+    if (state.browser_controller.context_menu_open) {
         if (browserContextMenuActionAtPoint(x, y)) |action| {
             return switch (action) {
                 .backend_item => |item| item.enabled and !item.separator,
@@ -302,7 +302,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
         toolbar_overflow_open = false;
     }
 
-    if (state.browser_context_menu_open) {
+    if (state.browser_controller.context_menu_open) {
         if (!down) {
             return browserContextMenuContainsPoint(x, y);
         }
@@ -311,8 +311,8 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
                 switch (action) {
                     .backend_item => |item| {
                         if (item.enabled and !item.separator and item.submenu) {
-                            state.browser_context_menu_selected_index = item.index;
-                            state.browser_context_menu_active_parent = item.index;
+                            state.browser_controller.context_menu_selected_index = item.index;
+                            state.browser_controller.context_menu_active_parent = item.index;
                         } else if (item.enabled and !item.separator) {
                             state.activateBrowserContextMenuItem(item.index);
                         }
@@ -335,7 +335,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
     }
 
     if (down and (rectContainsPoint(palette_toolbar_rect, x, y) or
-        (state.browser_inspector_menu_open and rectContainsPoint(palette_menu_rect, x, y))))
+        (state.browser_controller.inspector_menu_open and rectContainsPoint(palette_menu_rect, x, y))))
     {
         if (state.currentProjectVisibleBrowserPaneId()) |pane_id| {
             _ = state.focusCurrentProjectWorkspacePane(pane_id);
@@ -352,9 +352,9 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
         tab_drag_source = null;
         tab_drag_target = null;
         tab_drag_active = false;
-        state.browser_address_drag_active = false;
+        state.browser_controller.address_drag_active = false;
         return dragged or rectContainsPoint(palette_toolbar_rect, x, y) or
-            (state.browser_inspector_menu_open and rectContainsPoint(palette_menu_rect, x, y));
+            (state.browser_controller.inspector_menu_open and rectContainsPoint(palette_menu_rect, x, y));
     }
 
     var index = palette_hit_count;
@@ -371,44 +371,44 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
                 if (clicks >= 3) {
                     // Triple-click: select the whole URL — single-line field,
                     // no need for a line scan.
-                    state.browser_address_cursor = address.len;
-                    state.browser_address_selection_anchor = 0;
-                    state.browser_address_drag_active = false;
+                    state.browser_controller.address_cursor = address.len;
+                    state.browser_controller.address_selection_anchor = 0;
+                    state.browser_controller.address_drag_active = false;
                 } else if (clicks == 2) {
                     const bounds = wordBoundsAt(address, offset);
-                    state.browser_address_selection_anchor = bounds.start;
-                    state.browser_address_cursor = bounds.end;
-                    state.browser_address_drag_active = false;
+                    state.browser_controller.address_selection_anchor = bounds.start;
+                    state.browser_controller.address_cursor = bounds.end;
+                    state.browser_controller.address_drag_active = false;
                 } else {
-                    state.browser_address_cursor = offset;
-                    state.browser_address_selection_anchor = offset;
-                    state.browser_address_drag_active = true;
+                    state.browser_controller.address_cursor = offset;
+                    state.browser_controller.address_selection_anchor = offset;
+                    state.browser_controller.address_drag_active = true;
                 }
             },
             .back => {
                 blurAddress(state);
-                state.browser_inspector_menu_open = false;
+                state.browser_controller.inspector_menu_open = false;
                 state.navigateBrowserHistory(-1);
             },
             .forward => {
                 blurAddress(state);
-                state.browser_inspector_menu_open = false;
+                state.browser_controller.inspector_menu_open = false;
                 state.navigateBrowserHistory(1);
             },
             .navigate => {
                 blurAddress(state);
-                state.browser_inspector_menu_open = false;
+                state.browser_controller.inspector_menu_open = false;
                 state.navigateOrReloadBrowserFromAddress();
             },
             .inspect_toggle => {
                 blurAddress(state);
-                state.browser_inspector_menu_open = false;
+                state.browser_controller.inspector_menu_open = false;
                 if (state.canUseBrowserInspector()) state.toggleBrowserInspector();
             },
             .inspect_mode_menu => {
                 blurAddress(state);
                 if (state.canUseBrowserInspector()) {
-                    state.browser_inspector_menu_open = !state.browser_inspector_menu_open;
+                    state.browser_controller.inspector_menu_open = !state.browser_controller.inspector_menu_open;
                 }
             },
             .inspect_mode_point => selectInspectorMode(state, .point),
@@ -430,12 +430,12 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
             .open_external => state.openCurrentBrowserUrlExternally(),
             .overflow => {
                 toolbar_overflow_open = !toolbar_overflow_open;
-                state.browser_inspector_menu_open = false;
+                state.browser_controller.inspector_menu_open = false;
             },
             .security_info => state.setSidebarNotice(browserSecurityNotice(state.browserState().current_url)),
             .close => {
                 blurAddress(state);
-                state.browser_inspector_menu_open = false;
+                state.browser_controller.inspector_menu_open = false;
                 if (state.currentProjectVisibleBrowserPaneId()) |pane_id| {
                     _ = state.closeCurrentProjectWorkspacePane(pane_id);
                 } else {
@@ -468,22 +468,22 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
     }
 
     if (rectContainsPoint(palette_toolbar_rect, x, y) or
-        (state.browser_inspector_menu_open and rectContainsPoint(palette_menu_rect, x, y)))
+        (state.browser_controller.inspector_menu_open and rectContainsPoint(palette_menu_rect, x, y)))
     {
         blurAddress(state);
         if (!rectContainsPoint(palette_menu_rect, x, y)) {
-            state.browser_inspector_menu_open = false;
+            state.browser_controller.inspector_menu_open = false;
         }
         return true;
     }
 
     blurAddress(state);
-    state.browser_inspector_menu_open = false;
+    state.browser_controller.inspector_menu_open = false;
     return false;
 }
 
 pub fn handlePaletteTextInput(state: *app_state.AppState, text: []const u8) bool {
-    if (!state.browser_address_focused) return false;
+    if (!state.browser_controller.address_focused) return false;
     _ = deleteAddressSelection(state);
     insertAddressText(state, text);
     state.noteInteraction();
@@ -491,8 +491,8 @@ pub fn handlePaletteTextInput(state: *app_state.AppState, text: []const u8) bool
 }
 
 pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const sdl.KeyboardEvent) bool {
-    if (state.browser_context_menu_open) return handleBrowserContextMenuKeyDown(state, event);
-    if (!state.browser_address_focused) return false;
+    if (state.browser_controller.context_menu_open) return handleBrowserContextMenuKeyDown(state, event);
+    if (!state.browser_controller.address_focused) return false;
     if (!event.down) return true;
 
     const primary = isPrimaryModifierPressed(event.mod);
@@ -505,11 +505,11 @@ pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const sdl.Keyboa
         },
         .escape => blurAddress(state),
         .left => {
-            const target = state.browser_address_cursor -| 1;
+            const target = state.browser_controller.address_cursor -| 1;
             moveAddressCursor(state, target, shift);
         },
         .right => {
-            const target = @min(state.browser_address_cursor + 1, address_len);
+            const target = @min(state.browser_controller.address_cursor + 1, address_len);
             moveAddressCursor(state, target, shift);
         },
         .home => moveAddressCursor(state, 0, shift),
@@ -522,8 +522,8 @@ pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const sdl.Keyboa
         },
         .a => {
             if (primary) {
-                state.browser_address_selection_anchor = 0;
-                state.browser_address_cursor = address_len;
+                state.browser_controller.address_selection_anchor = 0;
+                state.browser_controller.address_cursor = address_len;
             }
         },
         .c => {
@@ -562,7 +562,7 @@ fn handleBrowserContextMenuKeyDown(state: *app_state.AppState, event: *const sdl
 }
 
 fn contextMenuItemByIndex(state: *const app_state.AppState, item_index: u32) ?*const app_state.BrowserContextMenuItem {
-    for (state.browser_context_menu_items.items) |*item| {
+    for (state.browser_controller.context_menu_items.items) |*item| {
         if (item.index == item_index) return item;
     }
     return null;
@@ -570,7 +570,7 @@ fn contextMenuItemByIndex(state: *const app_state.AppState, item_index: u32) ?*c
 
 fn selectableBrowserContextMenuIndexes(state: *const app_state.AppState, parent_index: ?u32, indexes: *[128]u32) usize {
     return selectableBrowserContextMenuIndexesFromItems(
-        state.browser_context_menu_items.items,
+        state.browser_controller.context_menu_items.items,
         parent_index,
         state.currentProjectVisibleBrowserPaneId() != null,
         indexes,
@@ -615,40 +615,40 @@ fn nextBrowserContextMenuSelection(indexes: []const u32, current: ?u32, directio
 
 fn moveBrowserContextMenuSelection(state: *app_state.AppState, direction: i32) void {
     var indexes: [128]u32 = undefined;
-    const count = selectableBrowserContextMenuIndexes(state, state.browser_context_menu_active_parent, &indexes);
+    const count = selectableBrowserContextMenuIndexes(state, state.browser_controller.context_menu_active_parent, &indexes);
     if (count == 0) return;
-    state.browser_context_menu_selected_index = nextBrowserContextMenuSelection(
+    state.browser_controller.context_menu_selected_index = nextBrowserContextMenuSelection(
         indexes[0..count],
-        state.browser_context_menu_selected_index,
+        state.browser_controller.context_menu_selected_index,
         direction,
     );
 }
 
 fn selectBrowserContextMenuBoundary(state: *app_state.AppState, last: bool) void {
     var indexes: [128]u32 = undefined;
-    const count = selectableBrowserContextMenuIndexes(state, state.browser_context_menu_active_parent, &indexes);
+    const count = selectableBrowserContextMenuIndexes(state, state.browser_controller.context_menu_active_parent, &indexes);
     if (count == 0) return;
-    state.browser_context_menu_selected_index = indexes[if (last) count - 1 else 0];
+    state.browser_controller.context_menu_selected_index = indexes[if (last) count - 1 else 0];
 }
 
 fn openSelectedBrowserContextSubmenu(state: *app_state.AppState) void {
-    const selected = state.browser_context_menu_selected_index orelse return;
+    const selected = state.browser_controller.context_menu_selected_index orelse return;
     if (selected == CLOSE_PANE_MENU_INDEX) return;
     const item = contextMenuItemByIndex(state, selected) orelse return;
     if (!item.enabled or !item.submenu) return;
-    state.browser_context_menu_active_parent = item.index;
+    state.browser_controller.context_menu_active_parent = item.index;
     selectBrowserContextMenuBoundary(state, false);
 }
 
 fn closeBrowserContextSubmenu(state: *app_state.AppState) void {
-    const parent_index = state.browser_context_menu_active_parent orelse return;
+    const parent_index = state.browser_controller.context_menu_active_parent orelse return;
     const parent_item = contextMenuItemByIndex(state, parent_index) orelse return;
-    state.browser_context_menu_active_parent = parent_item.parent_index;
-    state.browser_context_menu_selected_index = parent_item.index;
+    state.browser_controller.context_menu_active_parent = parent_item.parent_index;
+    state.browser_controller.context_menu_selected_index = parent_item.index;
 }
 
 fn activateSelectedBrowserContextMenuItem(state: *app_state.AppState) void {
-    const selected = state.browser_context_menu_selected_index orelse return;
+    const selected = state.browser_controller.context_menu_selected_index orelse return;
     if (selected == CLOSE_PANE_MENU_INDEX) {
         state.dismissBrowserContextMenu();
         if (state.currentProjectVisibleBrowserPaneId()) |pane_id| {
@@ -667,13 +667,13 @@ fn activateSelectedBrowserContextMenuItem(state: *app_state.AppState) void {
 
 fn moveAddressCursor(state: *app_state.AppState, target: usize, shift: bool) void {
     if (shift) {
-        if (state.browser_address_selection_anchor == null) {
-            state.browser_address_selection_anchor = state.browser_address_cursor;
+        if (state.browser_controller.address_selection_anchor == null) {
+            state.browser_controller.address_selection_anchor = state.browser_controller.address_cursor;
         }
     } else {
         clearAddressSelection(state);
     }
-    state.browser_address_cursor = target;
+    state.browser_controller.address_cursor = target;
 }
 
 fn copyAddressSelection(state: *app_state.AppState) void {
@@ -1109,12 +1109,12 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect, right_rese
         };
         renderInspectorIconButton(state, inspect_menu_rect, NF_COD_CHEVRON_DOWN, rectHovered(inspect_menu_rect), !state.canUseBrowserInspector(), inspector_active);
         addPaletteHit(inspect_menu_rect, .inspect_mode_menu);
-        if (!state.canUseBrowserInspector()) state.browser_inspector_menu_open = false;
-        if (state.browser_inspector_menu_open) {
+        if (!state.canUseBrowserInspector()) state.browser_controller.inspector_menu_open = false;
+        if (state.browser_controller.inspector_menu_open) {
             renderInspectorModeMenu(state, inspect_menu_rect, state.browserInspectorMode());
         }
     } else {
-        state.browser_inspector_menu_open = false;
+        state.browser_controller.inspector_menu_open = false;
     }
     if (toolbar_overflow_open) renderToolbarOverflowMenu(state, overflow_rect, show_copy, show_external, show_inspector);
 }
@@ -1265,7 +1265,7 @@ fn activateOverflowAction(state: *app_state.AppState, action: BrowserOverflowAct
 }
 
 fn renderToolbarTooltip(state: *app_state.AppState) void {
-    if (toolbar_overflow_open or state.browser_inspector_menu_open or state.browser_context_menu_open) return;
+    if (toolbar_overflow_open or state.browser_controller.inspector_menu_open or state.browser_controller.context_menu_open) return;
     var index = palette_hit_count;
     while (index > 0) {
         index -= 1;
@@ -1364,15 +1364,15 @@ fn renderInspectorModeMenuRow(state: *app_state.AppState, rect: palette.Rect, la
 
 // Renders the root browser context menu plus the active recursive submenu chain.
 fn renderBrowserContextMenu(state: *app_state.AppState) void {
-    if (!state.browser_context_menu_open) return;
-    if (state.browser_context_menu_selected_index == null) {
+    if (!state.browser_controller.context_menu_open) return;
+    if (state.browser_controller.context_menu_selected_index == null) {
         selectBrowserContextMenuBoundary(state, false);
     }
     const root_height = browserContextMenuContentHeight(state, null);
     const root_rect = clampedBrowserContextMenuRect(
         state,
-        state.browser_context_menu_anchor_x,
-        state.browser_context_menu_anchor_y,
+        state.browser_controller.context_menu_anchor_x,
+        state.browser_controller.context_menu_anchor_y,
         root_height,
     );
     palette_context_menu_rect = root_rect;
@@ -1385,7 +1385,7 @@ fn browserContextMenuContentHeight(state: *const app_state.AppState, parent_inde
     const pad = theme.scaledUi(6.0);
     var height = pad * 2.0;
     if (parent_index == null and state.browserContextMenuHasLink()) height += row_height * 2.0 + separator_height;
-    for (state.browser_context_menu_items.items) |item| {
+    for (state.browser_controller.context_menu_items.items) |item| {
         if (item.parent_index != parent_index) continue;
         height += if (item.separator) separator_height else row_height;
     }
@@ -1398,10 +1398,10 @@ fn browserContextMenuContentHeight(state: *const app_state.AppState, parent_inde
 fn clampedBrowserContextMenuRect(state: *const app_state.AppState, desired_x: f32, desired_y: f32, height: f32) palette.Rect {
     const menu_width = theme.scaledUi(260.0);
     const edge = theme.scaledUi(4.0);
-    const min_x = state.browser_pane_min[0] + edge;
-    const min_y = state.browser_pane_min[1] + edge;
-    const max_x = state.browser_pane_max[0] - menu_width - edge;
-    const max_y = state.browser_pane_max[1] - height - edge;
+    const min_x = state.browser_controller.pane_min[0] + edge;
+    const min_y = state.browser_controller.pane_min[1] + edge;
+    const max_x = state.browser_controller.pane_max[0] - menu_width - edge;
+    const max_y = state.browser_controller.pane_max[1] - height - edge;
     return .{
         .x = theme.clampf(desired_x, min_x, @max(min_x, max_x)),
         .y = theme.clampf(desired_y, min_y, @max(min_y, max_y)),
@@ -1411,7 +1411,7 @@ fn clampedBrowserContextMenuRect(state: *const app_state.AppState, desired_x: f3
 }
 
 fn browserContextMenuParentIsOpen(state: *const app_state.AppState, candidate: u32) bool {
-    var current = state.browser_context_menu_active_parent;
+    var current = state.browser_controller.context_menu_active_parent;
     while (current) |item_index| {
         if (item_index == candidate) return true;
         const item = contextMenuItemByIndex(state, item_index) orelse return false;
@@ -1452,7 +1452,7 @@ fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32,
         row_y += separator_height;
     }
 
-    for (state.browser_context_menu_items.items) |item| {
+    for (state.browser_controller.context_menu_items.items) |item| {
         if (item.parent_index != parent_index) continue;
         if (item.separator) {
             queuePaletteRect(state, snapRect(.{
@@ -1471,7 +1471,7 @@ fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32,
             .w = panel_rect.w - pad * 2.0,
             .h = row_height,
         };
-        const selected = state.browser_context_menu_selected_index == item.index;
+        const selected = state.browser_controller.context_menu_selected_index == item.index;
         if (selected or (rectHovered(row_rect) and item.enabled)) {
             queuePaletteRoundedRect(state, row_rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
         }
@@ -1512,7 +1512,7 @@ fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32,
             .w = panel_rect.w - pad * 2.0,
             .h = row_height,
         };
-        if (state.browser_context_menu_selected_index == CLOSE_PANE_MENU_INDEX or rectHovered(close_rect)) {
+        if (state.browser_controller.context_menu_selected_index == CLOSE_PANE_MENU_INDEX or rectHovered(close_rect)) {
             queuePaletteRoundedRect(state, close_rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
         }
         queuePaletteText(state, .{
@@ -1527,7 +1527,7 @@ fn renderBrowserContextMenuPanel(state: *app_state.AppState, parent_index: ?u32,
     if (open_child) |child| {
         const overlap = theme.scaledUi(2.0);
         const right_x = panel_rect.x + panel_rect.w - overlap;
-        const child_x = if (right_x + panel_rect.w <= state.browser_pane_max[0] - theme.scaledUi(4.0))
+        const child_x = if (right_x + panel_rect.w <= state.browser_controller.pane_max[0] - theme.scaledUi(4.0))
             right_x
         else
             panel_rect.x - panel_rect.w + overlap;
@@ -1610,7 +1610,7 @@ fn browserSecurityNotice(url: ?[]const u8) []const u8 {
 }
 
 fn renderPaletteAddressField(state: *app_state.AppState, rect: palette.Rect) void {
-    const focused = state.browser_address_focused;
+    const focused = state.browser_controller.address_focused;
     const address = state.browserState().addressInput();
     const text = if (address.len == 0 and !focused) "https://example.com" else address;
     const font_size = theme.scaledUi(14.0);
@@ -1685,7 +1685,7 @@ fn renderPaletteAddressField(state: *app_state.AppState, rect: palette.Rect) voi
     );
 
     if (focused) {
-        const cursor = @min(state.browser_address_cursor, address.len);
+        const cursor = @min(state.browser_controller.address_cursor, address.len);
         const prefix_w = app_state.paletteUiTextPrefixWidth(address, font_size, cursor);
         const caret_x = text_rect.x + prefix_w;
         queuePaletteRect(state, .{
@@ -1703,15 +1703,15 @@ const SelectionRange = struct { start: usize, end: usize };
 /// selection. The anchor + cursor form the unordered endpoints; this returns
 /// them in order so callers don't have to worry about direction.
 fn addressSelectionRange(state: *app_state.AppState, address: []const u8) ?SelectionRange {
-    const anchor = state.browser_address_selection_anchor orelse return null;
-    const cursor = @min(state.browser_address_cursor, address.len);
+    const anchor = state.browser_controller.address_selection_anchor orelse return null;
+    const cursor = @min(state.browser_controller.address_cursor, address.len);
     const a = @min(anchor, address.len);
     if (a == cursor) return null;
     return .{ .start = @min(a, cursor), .end = @max(a, cursor) };
 }
 
 fn clearAddressSelection(state: *app_state.AppState) void {
-    state.browser_address_selection_anchor = null;
+    state.browser_controller.address_selection_anchor = null;
 }
 
 fn deleteAddressSelection(state: *app_state.AppState) bool {
@@ -1722,7 +1722,7 @@ fn deleteAddressSelection(state: *app_state.AppState) bool {
     const current_len = address.len;
     std.mem.copyForwards(u8, buffer[sel.start .. current_len - (sel.end - sel.start)], buffer[sel.end..current_len]);
     buffer[current_len - (sel.end - sel.start)] = 0;
-    state.browser_address_cursor = sel.start;
+    state.browser_controller.address_cursor = sel.start;
     clearAddressSelection(state);
     return true;
 }
@@ -1759,26 +1759,26 @@ fn rectContainsPoint(rect: palette.Rect, x: f32, y: f32) bool {
 }
 
 fn focusAddress(state: *app_state.AppState) void {
-    state.browser_address_focused = true;
-    state.terminal_focused = false;
-    state.composer_focused = false;
+    state.browser_controller.address_focused = true;
+    state.terminal_controller.focused = false;
+    state.composer_controller.focused = false;
     state.blurPaletteComposer();
     state.unfocusBrowserPane();
-    state.browser_inspector_menu_open = false;
-    state.browser_address_cursor = @min(state.browser_address_cursor, state.browserState().addressInput().len);
+    state.browser_controller.inspector_menu_open = false;
+    state.browser_controller.address_cursor = @min(state.browser_controller.address_cursor, state.browserState().addressInput().len);
 }
 
 fn blurAddress(state: *app_state.AppState) void {
-    state.browser_address_focused = false;
-    state.browser_address_cursor = @min(state.browser_address_cursor, state.browserState().addressInput().len);
-    state.browser_address_drag_active = false;
+    state.browser_controller.address_focused = false;
+    state.browser_controller.address_cursor = @min(state.browser_controller.address_cursor, state.browserState().addressInput().len);
+    state.browser_controller.address_drag_active = false;
     clearAddressSelection(state);
 }
 
 fn selectInspectorMode(state: *app_state.AppState, mode: browser_runtime.InspectorMode) void {
     blurAddress(state);
     state.setBrowserInspectorMode(mode);
-    state.browser_inspector_menu_open = false;
+    state.browser_controller.inspector_menu_open = false;
 }
 
 fn addressIndexForClick(address: []const u8, font_size: f32, rel: f32) usize {
@@ -1814,7 +1814,7 @@ fn insertAddressText(state: *app_state.AppState, text: []const u8) void {
     const browser_state = state.browserState();
     const buffer = browser_state.addressBuffer();
     const current_len = browser_state.addressInput().len;
-    const cursor = @min(state.browser_address_cursor, current_len);
+    const cursor = @min(state.browser_controller.address_cursor, current_len);
     const available = if (buffer.len > current_len) buffer.len - current_len else 0;
     const insert_len = @min(text.len, available);
     if (insert_len == 0) return;
@@ -1822,29 +1822,29 @@ fn insertAddressText(state: *app_state.AppState, text: []const u8) void {
     std.mem.copyBackwards(u8, buffer[cursor + insert_len .. current_len + insert_len], buffer[cursor..current_len]);
     @memcpy(buffer[cursor .. cursor + insert_len], text[0..insert_len]);
     buffer[current_len + insert_len] = 0;
-    state.browser_address_cursor = cursor + insert_len;
+    state.browser_controller.address_cursor = cursor + insert_len;
 }
 
 fn deleteAddressBackward(state: *app_state.AppState) void {
     const browser_state = state.browserState();
     const buffer = browser_state.addressBuffer();
     const current_len = browser_state.addressInput().len;
-    const cursor = @min(state.browser_address_cursor, current_len);
+    const cursor = @min(state.browser_controller.address_cursor, current_len);
     if (cursor == 0) return;
     std.mem.copyForwards(u8, buffer[cursor - 1 .. current_len - 1], buffer[cursor..current_len]);
     buffer[current_len - 1] = 0;
-    state.browser_address_cursor = cursor - 1;
+    state.browser_controller.address_cursor = cursor - 1;
 }
 
 fn deleteAddressForward(state: *app_state.AppState) void {
     const browser_state = state.browserState();
     const buffer = browser_state.addressBuffer();
     const current_len = browser_state.addressInput().len;
-    const cursor = @min(state.browser_address_cursor, current_len);
+    const cursor = @min(state.browser_controller.address_cursor, current_len);
     if (cursor >= current_len) return;
     std.mem.copyForwards(u8, buffer[cursor .. current_len - 1], buffer[cursor + 1 .. current_len]);
     buffer[current_len - 1] = 0;
-    state.browser_address_cursor = cursor;
+    state.browser_controller.address_cursor = cursor;
 }
 
 fn isPrimaryModifierPressed(modifier_state: sdl.Keymod) bool {

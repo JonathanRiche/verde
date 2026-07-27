@@ -178,11 +178,11 @@ fn renderStateTab(state: *runtime.AppState, rect: palette.Rect) void {
     const font_size = theme.scaledUi(13.0);
     y = renderLine(state, rect, y, "legacy capture/focus state: unavailable after debug Palette migration", paletteColor(theme.COLOR_TEXT_MUTED), font_size);
     y += theme.scaledUi(8.0);
-    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "composer_focused: {}", .{state.composer_focused});
-    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "terminal_focused: {}", .{state.terminal_focused});
+    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "composer_focused: {}", .{state.composer_controller.focused});
+    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "terminal_focused: {}", .{state.terminal_controller.focused});
     y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "terminal_visible: {}", .{state.isTerminalVisible()});
-    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "selected_project_index: {d}", .{state.selected_project_index});
-    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "workspace_visible_panes: {d}", .{state.debug_workspace_visible_pane_count});
+    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "selected_project_index: {d}", .{state.project_controller.selected_index});
+    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "workspace_visible_panes: {d}", .{state.terminal_controller.debug_workspace_visible_pane_count});
     if (state.currentProjectWorkspaceMaximizedPaneId()) |pane_id| {
         y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "workspace_maximized_pane: {d}", .{pane_id});
     } else {
@@ -199,7 +199,7 @@ fn renderStateTab(state: *runtime.AppState, rect: palette.Rect) void {
         y = renderLine(state, rect, y, "workspace_terminal_dock_id: <none>", paletteColor(theme.COLOR_WHITE), font_size);
     }
 
-    if (state.projects.items.len > 0) {
+    if (state.project_controller.projects.items.len > 0) {
         y += theme.scaledUi(8.0);
         const dock = state.currentProjectTerminal();
         y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "terminal_running: {}", .{dock.hasRunningSession()});
@@ -209,21 +209,21 @@ fn renderStateTab(state: *runtime.AppState, rect: palette.Rect) void {
     }
 
     y += theme.scaledUi(8.0);
-    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "terminal.window_focused: {}", .{state.debug_terminal_window_focused});
-    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "terminal.hitbox_focused: {}", .{state.debug_terminal_hitbox_focused});
-    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "terminal.hitbox_active: {}", .{state.debug_terminal_hitbox_active});
-    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "terminal.hitbox_clicked: {}", .{state.debug_terminal_hitbox_clicked});
-    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "terminal.focus_requested(frame): {}", .{state.debug_terminal_focus_requested});
+    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "terminal.window_focused: {}", .{state.terminal_controller.debug_window_focused});
+    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "terminal.hitbox_focused: {}", .{state.terminal_controller.debug_hitbox_focused});
+    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "terminal.hitbox_active: {}", .{state.terminal_controller.debug_hitbox_active});
+    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "terminal.hitbox_clicked: {}", .{state.terminal_controller.debug_hitbox_clicked});
+    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "terminal.focus_requested(frame): {}", .{state.terminal_controller.debug_focus_requested});
     y += theme.scaledUi(8.0);
 
-    if (state.debug_last_terminal_scancode) |scancode| {
+    if (state.terminal_controller.debug_last_scancode) |scancode| {
         y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "last_terminal_scancode: {s}", .{@tagName(scancode)});
     } else {
         y = renderLine(state, rect, y, "last_terminal_scancode: <none>", paletteColor(theme.COLOR_WHITE), font_size);
     }
-    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "last_terminal_key_handled: {}", .{state.debug_last_terminal_key_handled});
-    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "last_terminal_text_handled: {}", .{state.debug_last_terminal_text_handled});
-    const last_text = std.mem.sliceTo(&state.debug_last_terminal_text, 0);
+    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "last_terminal_key_handled: {}", .{state.terminal_controller.debug_last_key_handled});
+    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "last_terminal_text_handled: {}", .{state.terminal_controller.debug_last_text_handled});
+    const last_text = std.mem.sliceTo(&state.terminal_controller.debug_last_text, 0);
     _ = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "last_terminal_text: {s}", .{last_text});
 }
 

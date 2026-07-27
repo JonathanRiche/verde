@@ -211,6 +211,35 @@ pub const State = struct {
     }
 };
 
+/// Opens the global or project-scoped command palette and transfers text focus.
+pub fn openCommandPalette(self: anytype, scope_project: ?usize) void {
+    self.command_controller.begin(scope_project);
+    self.modal_text_selection_anchor = null;
+    self.palette_modal_text_focus = .command_palette;
+    self.closeSidebarContextMenu();
+    self.workspace_header_open_menu_open = false;
+    self.workspace_header_open_menu_pane_id = null;
+    self.blurPaletteComposer();
+    self.noteInteraction();
+    self.markDirty();
+}
+
+pub fn closeCommandPalette(self: anytype) void {
+    if (!self.command_controller.open) return;
+    self.command_controller.close();
+    if (self.palette_modal_text_focus == .command_palette) self.palette_modal_text_focus = .none;
+    self.modal_text_selection_anchor = null;
+    self.markDirty();
+}
+
+pub fn commandPaletteQuery(self: anytype) []const u8 {
+    return self.command_controller.query();
+}
+
+pub fn commandPaletteQueryBuffer(self: anytype) [:0]u8 {
+    return self.command_controller.queryBuffer();
+}
+
 test "command state resets scope selection and focus-sensitive action state" {
     var state: State = .{};
     state.query_storage[0] = 'x';

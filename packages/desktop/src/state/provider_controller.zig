@@ -103,6 +103,13 @@ pub const ProviderReadinessState = struct {
     worker: ?std.Thread = null,
 };
 
+pub const State = struct {
+    opencode_model_cache: OpencodeModelCacheState = .{},
+    claude_model_cache: ClaudeModelCacheState = .{},
+    cursor_model_cache: CursorModelCacheState = .{},
+    readiness: ProviderReadinessState = .{},
+};
+
 pub fn providerReadinessWorker(state: *ProviderReadinessState) void {
     const snapshot: ProviderReadinessSnapshot = .{
         .codex = detectProviderReadiness(.codex),
@@ -294,17 +301,17 @@ pub fn startClaudeModelOptionsRefresh(self: anytype) void {
 pub fn startProviderReadinessCheck(self: anytype) void {
     self.pollProviderReadiness();
 
-    self.provider_readiness_state.mutex.lock();
-    defer self.provider_readiness_state.mutex.unlock();
-    if (self.provider_readiness_state.status == .pending) return;
+    self.provider_controller.readiness.mutex.lock();
+    defer self.provider_controller.readiness.mutex.unlock();
+    if (self.provider_controller.readiness.status == .pending) return;
 
-    self.provider_readiness_state.status = .pending;
-    self.provider_readiness_state.snapshot = .{};
-    self.provider_readiness_state.worker = std.Thread.spawn(.{}, providerReadinessWorker, .{
-        &self.provider_readiness_state,
+    self.provider_controller.readiness.status = .pending;
+    self.provider_controller.readiness.snapshot = .{};
+    self.provider_controller.readiness.worker = std.Thread.spawn(.{}, providerReadinessWorker, .{
+        &self.provider_controller.readiness,
     }) catch {
-        self.provider_readiness_state.status = .completed;
-        self.provider_readiness_state.snapshot = .{
+        self.provider_controller.readiness.status = .completed;
+        self.provider_controller.readiness.snapshot = .{
             .codex = .unavailable,
             .opencode = .unavailable,
             .claude = .unavailable,
@@ -326,7 +333,7 @@ pub fn completeMcpOnboarding(self: anytype, enable: bool) void {
             self.markDirty();
             return;
         };
-        self.settings_mcp_summary = summary;
+        self.settings_controller.mcp_summary = summary;
         if (summary.detectedCount() == 0) {
             self.setSidebarNotice("No supported agent providers were detected.");
             self.markDirty();
@@ -350,7 +357,7 @@ pub fn completeMcpOnboarding(self: anytype, enable: bool) void {
         log.warn("failed to persist MCP onboarding choice: {s}", .{@errorName(err)});
         self.setSidebarNotice("MCP choice applied, but could not save Verde settings.");
     };
-    self.mcp_onboarding_visible = false;
+    self.settings_controller.mcp_onboarding_visible = false;
     self.markDirty();
 }
 
@@ -358,42 +365,42 @@ pub fn pollProviderReadiness(self: anytype) void {
     var completed = false;
     var snapshot: ProviderReadinessSnapshot = .{};
 
-    self.provider_readiness_state.mutex.lock();
-    if (self.provider_readiness_state.status == .completed) {
-        snapshot = self.provider_readiness_state.snapshot;
-        self.provider_readiness_state.status = .idle;
+    self.provider_controller.readiness.mutex.lock();
+    if (self.provider_controller.readiness.status == .completed) {
+        snapshot = self.provider_controller.readiness.snapshot;
+        self.provider_controller.readiness.status = .idle;
         completed = true;
     }
-    self.provider_readiness_state.mutex.unlock();
+    self.provider_controller.readiness.mutex.unlock();
     if (!completed) return;
 
     self.finishProviderReadinessThread();
     if (snapshot.hasReadyProvider()) {
-        self.provider_onboarding_visible = false;
-        self.provider_onboarding_dismissed = false;
-    } else if (!self.provider_onboarding_dismissed) {
-        self.provider_onboarding_visible = true;
+        self.settings_controller.provider_onboarding_visible = false;
+        self.settings_controller.provider_onboarding_dismissed = false;
+    } else if (!self.settings_controller.provider_onboarding_dismissed) {
+        self.settings_controller.provider_onboarding_visible = true;
     }
-    self.mcp_onboarding_visible = !self.app_config.mcp_onboarding_completed;
-    if (self.mcp_onboarding_visible) self.blurPaletteComposer();
+    self.settings_controller.mcp_onboarding_visible = !self.app_config.mcp_onboarding_completed;
+    if (self.settings_controller.mcp_onboarding_visible) self.blurPaletteComposer();
     self.markDirty();
 }
 
 pub fn providerReadinessSnapshot(self: anytype) ProviderReadinessSnapshot {
-    self.provider_readiness_state.mutex.lock();
-    defer self.provider_readiness_state.mutex.unlock();
-    return self.provider_readiness_state.snapshot;
+    self.provider_controller.readiness.mutex.lock();
+    defer self.provider_controller.readiness.mutex.unlock();
+    return self.provider_controller.readiness.snapshot;
 }
 
 pub fn dismissProviderOnboarding(self: anytype) void {
-    self.provider_onboarding_visible = false;
-    self.provider_onboarding_dismissed = true;
+    self.settings_controller.provider_onboarding_visible = false;
+    self.settings_controller.provider_onboarding_dismissed = true;
     self.markDirty();
 }
 
 pub fn recheckProviderReadiness(self: anytype) void {
-    self.provider_onboarding_visible = true;
-    self.provider_onboarding_dismissed = false;
+    self.settings_controller.provider_onboarding_visible = true;
+    self.settings_controller.provider_onboarding_dismissed = false;
     self.startProviderReadinessCheck();
 }
 
@@ -409,15 +416,15 @@ pub fn openProviderSetupGuide(self: anytype) void {
 pub fn refreshOpencodeModelOptionsCacheAsync(self: anytype) void {
     self.pollOpencodeModelOptionsCache();
 
-    self.opencode_model_cache_state.mutex.lock();
-    defer self.opencode_model_cache_state.mutex.unlock();
-    if (self.opencode_model_cache_state.status == .pending) return;
+    self.provider_controller.opencode_model_cache.mutex.lock();
+    defer self.provider_controller.opencode_model_cache.mutex.unlock();
+    if (self.provider_controller.opencode_model_cache.status == .pending) return;
 
-    self.opencode_model_cache_state.status = .pending;
-    self.opencode_model_cache_state.worker = std.Thread.spawn(.{}, opencodeModelCacheWorker, .{
-        &self.opencode_model_cache_state,
+    self.provider_controller.opencode_model_cache.status = .pending;
+    self.provider_controller.opencode_model_cache.worker = std.Thread.spawn(.{}, opencodeModelCacheWorker, .{
+        &self.provider_controller.opencode_model_cache,
     }) catch {
-        self.opencode_model_cache_state.status = .idle;
+        self.provider_controller.opencode_model_cache.status = .idle;
         return;
     };
 }
@@ -425,15 +432,15 @@ pub fn refreshOpencodeModelOptionsCacheAsync(self: anytype) void {
 pub fn refreshCursorModelOptionsCacheAsync(self: anytype) void {
     self.pollCursorModelOptionsCache();
 
-    self.cursor_model_cache_state.mutex.lock();
-    defer self.cursor_model_cache_state.mutex.unlock();
-    if (self.cursor_model_cache_state.status == .pending) return;
+    self.provider_controller.cursor_model_cache.mutex.lock();
+    defer self.provider_controller.cursor_model_cache.mutex.unlock();
+    if (self.provider_controller.cursor_model_cache.status == .pending) return;
 
-    self.cursor_model_cache_state.status = .pending;
-    self.cursor_model_cache_state.worker = std.Thread.spawn(.{}, cursorModelCacheWorker, .{
-        &self.cursor_model_cache_state,
+    self.provider_controller.cursor_model_cache.status = .pending;
+    self.provider_controller.cursor_model_cache.worker = std.Thread.spawn(.{}, cursorModelCacheWorker, .{
+        &self.provider_controller.cursor_model_cache,
     }) catch {
-        self.cursor_model_cache_state.status = .idle;
+        self.provider_controller.cursor_model_cache.status = .idle;
         return;
     };
 }
@@ -441,15 +448,15 @@ pub fn refreshCursorModelOptionsCacheAsync(self: anytype) void {
 pub fn refreshClaudeModelOptionsCacheAsync(self: anytype) void {
     self.pollClaudeModelOptionsCache();
 
-    self.claude_model_cache_state.mutex.lock();
-    defer self.claude_model_cache_state.mutex.unlock();
-    if (self.claude_model_cache_state.status == .pending) return;
+    self.provider_controller.claude_model_cache.mutex.lock();
+    defer self.provider_controller.claude_model_cache.mutex.unlock();
+    if (self.provider_controller.claude_model_cache.status == .pending) return;
 
-    self.claude_model_cache_state.status = .pending;
-    self.claude_model_cache_state.worker = std.Thread.spawn(.{}, claudeModelCacheWorker, .{
-        &self.claude_model_cache_state,
+    self.provider_controller.claude_model_cache.status = .pending;
+    self.provider_controller.claude_model_cache.worker = std.Thread.spawn(.{}, claudeModelCacheWorker, .{
+        &self.provider_controller.claude_model_cache,
     }) catch {
-        self.claude_model_cache_state.status = .idle;
+        self.provider_controller.claude_model_cache.status = .idle;
         log.warn("failed to spawn Claude model cache worker", .{});
         return;
     };
@@ -634,7 +641,7 @@ pub fn asciiCaseInsensitiveCompare(a: []const u8, b: []const u8) std.math.Order 
 }
 
 pub fn normalizeCurrentOpencodeThreadModel(self: anytype) void {
-    if (self.projects.items.len == 0) return;
+    if (self.project_controller.projects.items.len == 0) return;
     if (self.opencode_model_options.items.len == 0) return;
 
     const thread = self.currentThreadMutable();
@@ -986,4 +993,106 @@ pub fn saveCursorModelOptionsDiskCache(self: anytype) !void {
     var file = try std.Io.Dir.createFileAbsolute(threaded.io(), path, .{ .truncate = true });
     defer file.close(threaded.io());
     try file.writeStreamingAll(threaded.io(), json);
+}
+
+const ModelCachePoll = struct {
+    status: OpencodeModelCacheStatus = .idle,
+    models: ?[]ai_harness.ModelInfo = null,
+};
+
+fn takeModelCachePoll(cache: anytype) ModelCachePoll {
+    cache.mutex.lock();
+    defer cache.mutex.unlock();
+    return switch (cache.status) {
+        .completed => {
+            const models = cache.models;
+            cache.models = null;
+            cache.status = .idle;
+            return .{ .status = .completed, .models = models };
+        },
+        .failed => {
+            cache.status = .idle;
+            return .{ .status = .failed };
+        },
+        else => .{},
+    };
+}
+
+pub fn pollOpencodeModelOptionsCache(self: anytype) void {
+    const poll = takeModelCachePoll(&self.provider_controller.opencode_model_cache);
+    if (poll.status != .idle) {
+        self.finishOpencodeModelCacheThread();
+    }
+
+    switch (poll.status) {
+        .completed => {
+            const models = poll.models orelse return;
+            defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
+            self.clearOpencodeModelOptions();
+            if (models.len == 0) return;
+            self.populateOpencodeModelOptions(models) catch |err| {
+                log.warn("failed to cache OpenCode configured models: {s}", .{@errorName(err)});
+                self.clearDynamicOpencodeModelOptions();
+                return;
+            };
+            self.normalizeCurrentOpencodeThreadModel();
+        },
+        .failed => {
+            log.warn("failed to refresh OpenCode model cache", .{});
+        },
+        else => {},
+    }
+}
+
+pub fn pollCursorModelOptionsCache(self: anytype) void {
+    const poll = takeModelCachePoll(&self.provider_controller.cursor_model_cache);
+    if (poll.status != .idle) {
+        self.finishCursorModelCacheThread();
+    }
+
+    switch (poll.status) {
+        .completed => {
+            const models = poll.models orelse return;
+            defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
+            self.clearCursorModelOptions();
+            if (models.len == 0) return;
+            self.populateCursorModelOptions(models) catch |err| {
+                log.warn("failed to cache Cursor models: {s}", .{@errorName(err)});
+                self.clearDynamicCursorModelOptions();
+                return;
+            };
+            self.saveCursorModelOptionsDiskCache() catch |err| {
+                log.warn("failed to save Cursor model cache: {s}", .{@errorName(err)});
+            };
+        },
+        .failed => {
+            log.warn("failed to refresh Cursor model cache", .{});
+        },
+        else => {},
+    }
+}
+
+pub fn pollClaudeModelOptionsCache(self: anytype) void {
+    const poll = takeModelCachePoll(&self.provider_controller.claude_model_cache);
+    if (poll.status != .idle) {
+        self.finishClaudeModelCacheThread();
+    }
+
+    switch (poll.status) {
+        .completed => {
+            const models = poll.models orelse return;
+            defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
+            self.clearClaudeModelOptions();
+            if (models.len == 0) return;
+            self.populateClaudeModelOptions(models) catch |err| {
+                log.warn("failed to cache Claude models: {s}", .{@errorName(err)});
+                self.clearDynamicClaudeModelOptions();
+                return;
+            };
+        },
+        .failed => {
+            log.warn("failed to refresh Claude model cache", .{});
+        },
+        else => {},
+    }
 }

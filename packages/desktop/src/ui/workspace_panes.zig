@@ -194,8 +194,8 @@ pub const FocusDirection = enum { left, right, up, down };
 
 pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
     if (pane_rect_count == 0) return false;
-    if (state.projects.items.len == 0) return false;
-    const current_id = state.projects.items[state.selected_project_index].workspace_layout.focused_pane_id orelse return false;
+    if (state.project_controller.projects.items.len == 0) return false;
+    const current_id = state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.focused_pane_id orelse return false;
     const maximized = state.currentProjectWorkspaceMaximizedPaneId() != null;
     if (maximized) {
         if (state.currentProjectWorkspaceRoot()) |root| {
@@ -211,8 +211,8 @@ pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool 
 }
 
 pub fn openFocusedChatPaneContextMenu(state: *runtime.AppState) bool {
-    if (state.projects.items.len == 0) return false;
-    const pane_id = state.projects.items[state.selected_project_index].workspace_layout.focused_pane_id orelse return false;
+    if (state.project_controller.projects.items.len == 0) return false;
+    const pane_id = state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.focused_pane_id orelse return false;
     if (state.workspacePaneKindById(pane_id) != .chat) return false;
     var rect: ?palette.Rect = null;
     var i: usize = 0;
@@ -386,8 +386,8 @@ fn findNeighborId(current_id: runtime.WorkspacePaneId, cur: palette.Rect, dir: F
 
 pub fn growPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
     if (pane_rect_count == 0) return false;
-    if (state.projects.items.len == 0) return false;
-    const current_id = state.projects.items[state.selected_project_index].workspace_layout.focused_pane_id orelse return false;
+    if (state.project_controller.projects.items.len == 0) return false;
+    const current_id = state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.focused_pane_id orelse return false;
 
     var current_rect: ?palette.Rect = null;
     var i: usize = 0;
@@ -429,8 +429,8 @@ pub fn growPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
 
 pub fn movePaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
     if (pane_rect_count == 0) return false;
-    if (state.projects.items.len == 0) return false;
-    const layout = &state.projects.items[state.selected_project_index].workspace_layout;
+    if (state.project_controller.projects.items.len == 0) return false;
+    const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
     const current_id = layout.focused_pane_id orelse return false;
 
     var current_rect: ?palette.Rect = null;
@@ -450,8 +450,8 @@ pub fn movePaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
 }
 
 fn tickFocusAnimation(state: *runtime.AppState) void {
-    if (state.projects.items.len == 0) return;
-    const focused = state.projects.items[state.selected_project_index].workspace_layout.focused_pane_id;
+    if (state.project_controller.projects.items.len == 0) return;
+    const focused = state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.focused_pane_id;
     const same = (focus_curr_id == null and focused == null) or
         (focus_curr_id != null and focused != null and focus_curr_id.? == focused.?);
     if (same) return;
@@ -461,8 +461,8 @@ fn tickFocusAnimation(state: *runtime.AppState) void {
 }
 
 fn paneAgentVisualStatus(state: *const runtime.AppState, pane_id: runtime.WorkspacePaneId) PaneAgentVisualStatus {
-    if (state.projects.items.len == 0 or state.selected_project_index >= state.projects.items.len) return .idle;
-    const project = &state.projects.items[state.selected_project_index];
+    if (state.project_controller.projects.items.len == 0 or state.project_controller.selected_index >= state.project_controller.projects.items.len) return .idle;
+    const project = &state.project_controller.projects.items[state.project_controller.selected_index];
     const pane = project.workspace_layout.paneById(pane_id) orelse return .idle;
     return switch (pane.ref) {
         .chat => |ref| blk: {
@@ -472,7 +472,7 @@ fn paneAgentVisualStatus(state: *const runtime.AppState, pane_id: runtime.Worksp
             break :blk if (thread.isSendPendingForUi()) .working else .idle;
         },
         .terminal => |ref| blk: {
-            const surface = state.projectTerminalSurface(state.selected_project_index, ref.dock_id) orelse break :blk .idle;
+            const surface = state.projectTerminalSurface(state.project_controller.selected_index, ref.dock_id) orelse break :blk .idle;
             break :blk switch (surface.displayStatus()) {
                 .done => .done,
                 .working => .working,
@@ -516,7 +516,7 @@ fn focusBorderAlpha(pane_id: runtime.WorkspacePaneId) f32 {
 pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
     last_workspace_rect = rect;
     state.ensureCurrentProjectWorkspace();
-    state.debug_workspace_visible_pane_count = state.currentProjectWorkspaceVisiblePaneCount();
+    state.terminal_controller.debug_workspace_visible_pane_count = state.currentProjectWorkspaceVisiblePaneCount();
     tickFocusAnimation(state);
     pane_status_animating = false;
     hit_cache.count = 0;
@@ -603,7 +603,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
             _ = state.focusCurrentProjectWorkspacePane(hit.pane_id);
             split_menu_show_paste = false;
             split_menu_kind = .chat_context;
-            if (state.palette_composer.textRect().contains(.{ .x = x, .y = y })) {
+            if (state.composer_controller.composer.textRect().contains(.{ .x = x, .y = y })) {
                 if (state.readClipboardTextForPaste()) |text| {
                     split_menu_show_paste = text.len > 0;
                     state.allocator.free(text);
@@ -621,7 +621,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
             _ = state.focusCurrentProjectWorkspacePane(pane_rect.pane_id);
             split_menu_show_paste = false;
             split_menu_kind = .chat_context;
-            if (state.palette_composer.textRect().contains(.{ .x = x, .y = y })) {
+            if (state.composer_controller.composer.textRect().contains(.{ .x = x, .y = y })) {
                 if (state.readClipboardTextForPaste()) |text| {
                     split_menu_show_paste = text.len > 0;
                     state.allocator.free(text);
@@ -673,13 +673,13 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
                 split_menu_open_for = null;
             },
             .new_chat_thread => {
-                if (state.projects.items.len > 0) state.createThreadForProject(state.selected_project_index);
+                if (state.project_controller.projects.items.len > 0) state.createThreadForProject(state.project_controller.selected_index);
                 split_menu_open_for = null;
             },
             .refresh_chat_thread => {
-                if (state.projects.items.len > 0) {
+                if (state.project_controller.projects.items.len > 0) {
                     const thread_index = state.currentProject().selected_thread_index;
-                    state.syncThreadFromProvider(state.selected_project_index, thread_index);
+                    state.syncThreadFromProvider(state.project_controller.selected_index, thread_index);
                 }
                 split_menu_open_for = null;
             },
@@ -1168,7 +1168,7 @@ fn renderZoomControl(
         .w = control_size,
         .h = control_size,
     };
-    const hovered = state.palette_mouse_in_workspace and rectContains(control_rect, state.palette_mouse_x, state.palette_mouse_y);
+    const hovered = state.transcript_controller.palette_mouse_in_workspace and rectContains(control_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     if (kind == .terminal and !maximized) {
         const hover_rect: palette.Rect = .{
             .x = pane_rect.x + pane_rect.w - theme.scaledUi(TERMINAL_ZOOM_HOVER_WIDTH_CSS),
@@ -1176,7 +1176,7 @@ fn renderZoomControl(
             .w = theme.scaledUi(TERMINAL_ZOOM_HOVER_WIDTH_CSS),
             .h = theme.scaledUi(TERMINAL_ZOOM_HOVER_HEIGHT_CSS),
         };
-        if (!rectContains(hover_rect, state.palette_mouse_x, state.palette_mouse_y)) return;
+        if (!rectContains(hover_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) return;
     }
 
     const previous_z = state.palette_overlay_batch.setZIndex(PANE_ZOOM_CONTROL_Z);
@@ -1213,7 +1213,7 @@ fn renderZoomControl(
             .h = control_size,
         };
         const menu_open_here = if (split_menu_open_for) |id| id == pane_id else false;
-        const split_emphasized = rectContains(split_rect, state.palette_mouse_x, state.palette_mouse_y) or menu_open_here;
+        const split_emphasized = rectContains(split_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or menu_open_here;
         renderSplitTriggerButton(state, split_rect, menu_open_here, split_emphasized, pane_rect);
         appendHit(.{ .pane_id = pane_id, .action = .toggle_split_menu, .rect = split_rect });
         if (menu_open_here and split_menu_kind == .split_button) split_menu_anchor = split_rect;
@@ -1253,7 +1253,7 @@ fn renderPaneOverlay(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId,
         const split_y = header_rect.y + (header_rect.h - split_h) * 0.5;
         const split_rect = palette.Rect{ .x = split_x, .y = split_y, .w = split_w, .h = split_h };
         const split_active = menu_open_here;
-        const split_emphasized = rectContains(split_rect, state.palette_mouse_x, state.palette_mouse_y) or split_active;
+        const split_emphasized = rectContains(split_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or split_active;
         renderSplitTriggerButton(state, split_rect, split_active, split_emphasized, header_rect);
         appendHit(.{ .pane_id = pane_id, .action = .toggle_split_menu, .rect = split_rect });
         if (menu_open_here and split_menu_kind == .split_button) split_menu_anchor = split_rect;
@@ -1373,7 +1373,7 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     if (submenu_y > submenu_max_y) submenu_y = submenu_max_y;
     if (submenu_y < workspace_rect.y + theme.scaledUi(8.0)) submenu_y = workspace_rect.y + theme.scaledUi(8.0);
     const submenu_rect = palette.Rect{ .x = submenu_x, .y = submenu_y, .w = submenu_w, .h = submenu_h };
-    const submenu_visible = rectContains(split_trigger_rect, state.palette_mouse_x, state.palette_mouse_y) or rectContains(submenu_rect, state.palette_mouse_x, state.palette_mouse_y);
+    const submenu_visible = rectContains(split_trigger_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or rectContains(submenu_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     if (submenu_visible) {
         split_submenu_rect = submenu_rect;
         queueRounded(state, submenu_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(10.0));
@@ -1397,7 +1397,7 @@ fn renderContextMenuStaticRow(
     arrow: bool,
 ) palette.Rect {
     const rect = palette.Rect{ .x = menu_rect.x + pad_x, .y = y, .w = w, .h = h };
-    const hovered = rectContains(rect, state.palette_mouse_x, state.palette_mouse_y);
+    const hovered = rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     if (hovered) queueRounded(state, rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
     queueText(state, .{
         .x = rect.x + theme.scaledUi(8.0),
@@ -1428,7 +1428,7 @@ fn renderContextMenuRow(
     h: f32,
 ) f32 {
     const rect = palette.Rect{ .x = menu_rect.x + pad_x, .y = y, .w = w, .h = h };
-    const hovered = rectContains(rect, state.palette_mouse_x, state.palette_mouse_y);
+    const hovered = rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     if (hovered) {
         queueRounded(state, rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
     }
