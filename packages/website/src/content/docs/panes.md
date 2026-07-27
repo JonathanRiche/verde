@@ -155,7 +155,7 @@ verde live panes --project current --json
 `Ctrl+Shift+P` opens the command palette — a single ranked list of threads, panes,
 workspaces, and app commands. `Ctrl+Enter` on a thread result opens it in a
 fresh pane. The palette also carries **Start New … TUI** entries for Codex, Claude,
-OpenCode, Cursor, and Amp, and **Open Current Thread in TUI** entries that
+OpenCode, Cursor, Grok, and Amp, and **Open Current Thread in TUI** entries that
 promote a GUI chat thread into that provider's terminal TUI.
 
 The sidebar's **History · N** row opens the same palette scoped to one

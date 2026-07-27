@@ -39,6 +39,18 @@ During iteration, use focused tests or `zig ast-check` for quick feedback. The d
 
 For live CLI checks, prefer JSON and stable IDs: wait for `verde live status --json`, use `--pane <id>` and `--project current`, inspect both exit status and JSON `ok`, and close test panes. Sending chat messages creates real threads and requires judgment. Discover the CLI through `verde capabilities --json`, `verde live capabilities --json`, or shell completion.
 
+## MCP Process Monitoring And Shared Browser Safety
+
+When a task starts a browser, dev server, build, test server, or another long-running/shared command through Verde/MCP:
+
+- inspect `list_processes`, then use `check_command` before potentially conflicting work;
+- acquire a lease only for the real shared resource—such as `build`, `deps`, `db`, `port:<actual-port>`, or `browser`—rather than for ordinary reads/searches/short focused tests;
+- use Verde tracked process/session facilities where available, inspect their pane/process/log state while running, and do not conceal long-lived work behind `nohup`, `disown`, `setsid`, or a bare `&`;
+- stop only the exact process/session you started, release the lease on completion/failure/cancellation, and report the process/session, resource, and cleanup outcome;
+- never force a conflicting lease, kill another owner's process, or restart Verde without explicit user authority.
+
+The embedded browser is a shared Verde runtime: always target an explicit workspace and do not reset, restart, close, or navigate a browser bound to another active pane/workspace. Clean up only your own browser/test-server session; never use broad `pkill chrome` / `pkill chromium` commands.
+
 ## Desktop UI Invariants
 
 Verde's desktop app is SDL3 + SDL_GPU + Palette, not web UI or ImGui. SDL owns logical window size, drawable pixels, display scale, and events; Palette owns layout and render commands.

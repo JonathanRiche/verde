@@ -135,7 +135,7 @@ provider, model, and transcript; the layout is shared.
 You can also launch any provider's TUI directly inside a terminal pane — useful
 when you want the agent's native UI rather than Verde's chat surface. The
 command palette (`Ctrl+Shift+P`) has a **Start New … TUI** entry for each of
-Codex, Claude, OpenCode, Cursor, and Amp, plus **Open Current Thread in TUI**
+Codex, Claude, OpenCode, Cursor, Grok, and Amp, plus **Open Current Thread in TUI**
 entries that promote a running GUI chat thread into that provider's terminal
 TUI. Right-clicking inside a terminal offers the same launch profiles as tabs.
 
@@ -143,11 +143,14 @@ From the CLI:
 
 ```bash
 verde live agent open --provider codex
+verde live agent open --provider grok
 verde live process restart --name codex
 ```
 
-The first command opens a managed Codex TUI without requiring a `verde.yml`
-entry. The second launches or restarts a Codex agent declared in your
+The first two commands open managed provider TUIs without requiring a
+`verde.yml` entry. Verde detects Grok from `PATH` without running it, offers a
+setup-guide action when it is absent, and launches it with `--no-auto-update`.
+The last command launches or restarts a Codex agent declared in your
 `verde.yml` `agents:` block. See [Configuration & state](/docs/config) for the
 stack schema and the [CLI reference](/docs/cli) for the full command surface.
 
