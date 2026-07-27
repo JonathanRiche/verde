@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const chat_handoff = @import("../chat/handoff.zig");
+const db_types = @import("../db/types.zig");
 const stack_config = @import("../workspace/stack.zig");
 const provider_models = @import("provider_models.zig");
 const workspace_layout = @import("workspace_layout.zig");
@@ -61,10 +62,24 @@ pub fn beginHandoffFromFocusedPane(self: anytype) void {
                 self.setSidebarNotice("The active TUI provider is unknown.");
                 return;
             };
-            beginHandoff(self, project_index, pane_id, null, provider);
+            const chat_provider = chatProviderForSurface(provider) orelse {
+                self.setSidebarNotice("This TUI provider does not support GUI handoff yet.");
+                return;
+            };
+            beginHandoff(self, project_index, pane_id, null, chat_provider);
         },
         .browser => self.setSidebarNotice("Focus a chat or agent TUI before handing off."),
     }
+}
+
+fn chatProviderForSurface(provider: db_types.SurfaceProvider) ?Provider {
+    return switch (provider) {
+        .opencode => .opencode,
+        .codex => .codex,
+        .cursor => .cursor,
+        .claude => .claude,
+        .grok, .amp => null,
+    };
 }
 
 pub fn beginThreadHandoff(self: anytype, project_index: usize, thread_index: usize, pane_id: WorkspacePaneId) void {

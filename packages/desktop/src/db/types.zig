@@ -28,6 +28,17 @@ pub const Provider = enum(u8) {
     claude = 3,
 };
 
+/// Provider identity attached to terminal surface activity. This stays
+/// separate from `Provider`, whose values represent implemented GUI harnesses.
+pub const SurfaceProvider = enum(u8) {
+    opencode = 0,
+    codex = 1,
+    cursor = 2,
+    claude = 3,
+    grok = 4,
+    amp = 5,
+};
+
 pub const Harness = enum(u8) {
     local_cli,
     remote_session,
@@ -58,7 +69,7 @@ pub const PersistedSurfaceCompletion = struct {
     workspace_path: []const u8 = "",
     dock_id: u32 = 0,
     pane_id: ?u32 = null,
-    provider: ?Provider = null,
+    provider: ?SurfaceProvider = null,
     provider_thread_id: ?[]const u8 = null,
     title: []const u8 = "",
     completed_at_ms: i64,

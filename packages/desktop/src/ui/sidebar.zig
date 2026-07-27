@@ -13,6 +13,7 @@ const profiler = @import("../runtime/profiler.zig");
 const platform_runtime = @import("platform_runtime");
 const native_state = @import("../state.zig");
 const Provider = native_state.Provider;
+const SurfaceProvider = native_state.SurfaceProvider;
 
 const log = std.log.scoped(.native_ui_sidebar);
 
@@ -1268,6 +1269,16 @@ fn workspaceInitial(buf: *[1]u8, label: []const u8) []const u8 {
     return buf[0..1];
 }
 
+fn chatSurfaceStatusForUi(thread: *const native_state.ChatThread) native_state.SurfaceStatus {
+    return switch (thread.activityStatusForUi()) {
+        .idle => .idle,
+        .working => .working,
+        .waiting => .waiting,
+        .done => .done,
+        .@"error" => .@"error",
+    };
+}
+
 /// Aggregate attention color for a workspace's panes
 /// (error > waiting > done > working), or null when nothing needs attention.
 /// Used by the collapsed activity dock.
@@ -1293,10 +1304,12 @@ fn workspaceStatusColor(state: *runtime.AppState, project_index: usize) ?[4]f32 
             .chat => |ref| {
                 if (ref.thread_index < project.threads.items.len) {
                     const thread = &project.threads.items[ref.thread_index];
-                    if (thread.completion_pending) {
-                        has_done = true;
-                    } else if (thread.isSendPendingForUi()) {
-                        has_working = true;
+                    switch (chatSurfaceStatusForUi(thread)) {
+                        .@"error" => return theme.COLOR_DIFF_REMOVE,
+                        .waiting => has_waiting = true,
+                        .done => has_done = true,
+                        .working => has_working = true,
+                        .idle => {},
                     }
                 }
             },
@@ -1407,11 +1420,8 @@ fn collapsedPaneIndicator(
         .chat => |ref| {
             if (ref.thread_index < project.threads.items.len) {
                 const thread = &project.threads.items[ref.thread_index];
-                if (thread.completion_pending) {
-                    status = .done;
-                } else {
-                    running = thread.isSendPendingForUi();
-                }
+                status = chatSurfaceStatusForUi(thread);
+                running = status.? == .working;
             }
         },
         .terminal => |ref| {
@@ -1547,11 +1557,8 @@ fn renderOpenPaneRow(
                 const thread = &project.threads.items[ref.thread_index];
                 queuePaletteProviderGlyph(state, thread.provider, icon_x, cy, clip);
                 title = thread.title;
-                if (thread.completion_pending) {
-                    status = .done;
-                } else {
-                    running = thread.isSendPendingForUi();
-                }
+                status = chatSurfaceStatusForUi(thread);
+                running = status.? == .working;
                 if (running) status_started_at_ms = thread.sendStartedAtMsForUi();
             } else {
                 queuePaletteChatBubbleIcon(state, icon_x, cy, muted);
@@ -1735,7 +1742,7 @@ fn paneNeedsAttention(
         .chat => |ref| {
             if (ref.thread_index >= project.threads.items.len) return false;
             const thread = &project.threads.items[ref.thread_index];
-            return thread.completion_pending or thread.isSendPendingForUi();
+            return chatSurfaceStatusForUi(thread) != .idle;
         },
         .terminal => |ref| {
             const surface = state.projectTerminalSurface(project_index, ref.dock_id) orelse return false;
@@ -2025,7 +2032,7 @@ pub fn formatRelativeTime(buffer: []u8, timestamp: i64) []const u8 {
 
 pub fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f32, center_y: f32, clip: palette.Rect) void {
     const image_size = theme.scaledUi(SIDEBAR_THREAD_PROVIDER_GLYPH_CSS);
-    queuePaletteProviderGlyphInRect(state, terminalAgentProviderFromProvider(provider).?, .{
+    queuePaletteProviderGlyphInRect(state, terminalAgentProviderFromChatProvider(provider), .{
         .x = x,
         .y = center_y - image_size * 0.5,
         .w = image_size,
@@ -2055,12 +2062,23 @@ const TerminalAgentProvider = enum {
     amp,
 };
 
-fn terminalAgentProviderFromProvider(provider: ?Provider) ?TerminalAgentProvider {
+fn terminalAgentProviderFromChatProvider(provider: Provider) TerminalAgentProvider {
+    return switch (provider) {
+        .codex => .codex,
+        .opencode => .opencode,
+        .claude => .claude,
+        .cursor => .cursor,
+    };
+}
+
+fn terminalAgentProviderFromProvider(provider: ?SurfaceProvider) ?TerminalAgentProvider {
     return switch (provider orelse return null) {
         .codex => .codex,
         .opencode => .opencode,
         .claude => .claude,
         .cursor => .cursor,
+        .grok => .grok,
+        .amp => .amp,
     };
 }
 

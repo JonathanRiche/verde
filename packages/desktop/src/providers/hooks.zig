@@ -408,6 +408,10 @@ fn cursorGlobalHookRelPathForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
     return if (os_tag == .windows) CURSOR_WINDOWS_GLOBAL_HOOK_REL else CURSOR_GLOBAL_HOOK_REL;
 }
 
+fn grokGlobalHookRelPathForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
+    return if (os_tag == .windows) GROK_WINDOWS_GLOBAL_HOOK_REL else GROK_GLOBAL_HOOK_REL;
+}
+
 fn hookPermissionsForOs(comptime os_tag: std.Target.Os.Tag) std.Io.File.Permissions {
     return if (os_tag == .windows) .default_file else .executable_file;
 }
@@ -536,6 +540,56 @@ fn cursorPowerShellHookScript() []const u8 {
     ;
 }
 
+fn grokPowerShellHookScript() []const u8 {
+    return
+    \\# verde-grok-notify-hook
+    \\if ($env:VERDE -ne '1' -or [string]::IsNullOrWhiteSpace($env:VERDE_SESSION_ID)) { exit 0 }
+    \\$payload = $null
+    \\try {
+    \\  $payloadText = [Console]::In.ReadToEnd()
+    \\  if (-not [string]::IsNullOrWhiteSpace($payloadText)) { $payload = ConvertFrom-Json -InputObject $payloadText }
+    \\} catch {}
+    \\$eventName = if ($null -ne $payload -and $null -ne $payload.hookEventName) { [string]$payload.hookEventName } elseif (-not [string]::IsNullOrWhiteSpace($env:GROK_HOOK_EVENT)) { $env:GROK_HOOK_EVENT } else { '' }
+    \\$status = ''
+    \\$title = ''
+    \\switch ($eventName) {
+    \\  { $_ -in 'session_start', 'SessionStart' } { $status = 'idle'; break }
+    \\  { $_ -in 'user_prompt_submit', 'UserPromptSubmit' } {
+    \\    $status = 'working'
+    \\    if ($null -ne $payload -and $null -ne $payload.prompt) {
+    \\      $title = [regex]::Replace([string]$payload.prompt, '\s+', ' ').Trim()
+    \\      if ($title.Length -gt 72) { $title = $title.Substring(0, 72) }
+    \\    }
+    \\    break
+    \\  }
+    \\  { $_ -in 'pre_tool_use', 'PreToolUse' } { $status = 'working'; break }
+    \\  { $_ -in 'notification', 'Notification' } {
+    \\    $notificationType = if ($null -ne $payload -and $null -ne $payload.notificationType) { [string]$payload.notificationType } else { '' }
+    \\    $message = if ($null -ne $payload -and $null -ne $payload.message) { [string]$payload.message } else { '' }
+    \\    $notification = ($notificationType + ' ' + $message).ToLowerInvariant()
+    \\    if ($notification -notmatch 'permission|approval|confirm|action.required|input.required|user.input|elicitation') { exit 0 }
+    \\    $status = 'waiting'
+    \\    break
+    \\  }
+    \\  { $_ -in 'stop', 'Stop' } {
+    \\    $reason = if ($null -ne $payload -and $null -ne $payload.reason) { [string]$payload.reason } else { '' }
+    \\    $status = if ([string]::IsNullOrWhiteSpace($reason) -or $reason -eq 'end_turn') { 'done' } else { 'idle' }
+    \\    break
+    \\  }
+    \\  { $_ -in 'stop_failure', 'StopFailure' } { $status = 'error'; break }
+    \\  default { exit 0 }
+    \\}
+    \\$cli = if ([string]::IsNullOrWhiteSpace($env:VERDE_CLI)) { 'verde.exe' } else { $env:VERDE_CLI }
+    \\if ($cli.EndsWith(' (deleted)')) { $cli = $cli.Substring(0, $cli.Length - 10) }
+    \\$notifyArgs = @('notify', '--quiet', '--status', $status, '--provider', 'grok')
+    \\if (-not [string]::IsNullOrWhiteSpace($title)) { $notifyArgs += @('--title', $title) }
+    \\# $env:VERDE_LIVE_ENDPOINT is inherited, so the CLI reaches the owning Verde pane.
+    \\try { & $cli @notifyArgs *> $null } catch {}
+    \\exit 0
+    \\
+    ;
+}
+
 // Global (all-projects) Claude hooks live in ~/.claude/settings.json with the
 // hook script at an absolute path so it resolves from any working directory.
 const CLAUDE_GLOBAL_HOOK_REL = ".claude/verde-claude-notify-hook.sh";
@@ -549,11 +603,37 @@ const CURSOR_WINDOWS_GLOBAL_HOOK_REL = ".cursor/hooks/verde-cursor-notify-hook.p
 const CURSOR_GLOBAL_HOOKS_JSON_REL = ".cursor/hooks.json";
 const CURSOR_GLOBAL_HOOK_NEEDLE = "verde-cursor-notify-hook";
 
+// Grok loads every JSON file in ~/.grok/hooks, so Verde owns a standalone file
+// instead of merging into the user's config. Personal hooks do not require the
+// project trust prompt that repository-local Grok hooks do.
+const GROK_GLOBAL_HOOK_REL = "verde-grok-notify-hook.sh";
+const GROK_WINDOWS_GLOBAL_HOOK_REL = "verde-grok-notify-hook.ps1";
+const GROK_GLOBAL_HOOKS_JSON_REL = "hooks/verde-notify.json";
+const GROK_GLOBAL_HOOK_NEEDLE = "verde-grok-notify-hook";
+const GROK_HOOK_EVENTS = [_][]const u8{ "SessionStart", "UserPromptSubmit", "PreToolUse", "Notification", "Stop", "StopFailure" };
+
 const AMP_GLOBAL_PLUGIN_REL = ".config/amp/plugins/verde-notify.ts";
 const AMP_GLOBAL_PLUGIN_NEEDLE = "verde-amp-notify-plugin";
 
 fn homeDirAlloc(allocator: std.mem.Allocator) ![]u8 {
     return platform_paths.userHome(allocator);
+}
+
+fn grokHomeDirAlloc(allocator: std.mem.Allocator) ![]u8 {
+    const environ: std.process.Environ = if (builtin.os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    if (environ.getAlloc(allocator, "GROK_HOME")) |configured| {
+        if (configured.len > 0) return configured;
+        allocator.free(configured);
+    } else |err| switch (err) {
+        error.EnvironmentVariableMissing => {},
+        else => return err,
+    }
+    const home = try homeDirAlloc(allocator);
+    defer allocator.free(home);
+    return std.fs.path.join(allocator, &.{ home, ".grok" });
 }
 
 /// True when our managed hook is present in the global Claude settings.
@@ -785,6 +865,176 @@ pub fn removeCursorGlobalHooks(allocator: std.mem.Allocator) !void {
     defer if (updated) |content| allocator.free(content);
     if (updated) |content| try writeFileAtomic(allocator, io, hooks_path, content, .default_file);
     std.Io.Dir.cwd().deleteFile(io, hook_path) catch {};
+}
+
+/// True when Verde's standalone Grok personal hook is installed.
+pub fn grokGlobalHooksInstalled(allocator: std.mem.Allocator) bool {
+    const grok_home = grokHomeDirAlloc(allocator) catch return false;
+    defer allocator.free(grok_home);
+    return grokGlobalHooksInstalledAt(allocator, grok_home);
+}
+
+fn grokGlobalHooksInstalledAt(allocator: std.mem.Allocator, grok_home: []const u8) bool {
+    const hooks_path = std.fs.path.join(allocator, &.{ grok_home, GROK_GLOBAL_HOOKS_JSON_REL }) catch return false;
+    defer allocator.free(hooks_path);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const content = std.Io.Dir.cwd().readFileAlloc(threaded.io(), hooks_path, allocator, .limited(1024 * 1024)) catch return false;
+    defer allocator.free(content);
+    return std.mem.indexOf(u8, content, GROK_GLOBAL_HOOK_NEEDLE) != null;
+}
+
+/// Installs Grok's personal status hook as an isolated, Verde-owned JSON file.
+pub fn ensureGrokGlobalHooks(allocator: std.mem.Allocator) !void {
+    const grok_home = try grokHomeDirAlloc(allocator);
+    defer allocator.free(grok_home);
+    try ensureGrokGlobalHooksAt(allocator, grok_home);
+}
+
+fn ensureGrokGlobalHooksAt(allocator: std.mem.Allocator, grok_home: []const u8) !void {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const hook_path = try std.fs.path.join(allocator, &.{ grok_home, grokGlobalHookRelPathForOs(builtin.os.tag) });
+    defer allocator.free(hook_path);
+    const hooks_path = try std.fs.path.join(allocator, &.{ grok_home, GROK_GLOBAL_HOOKS_JSON_REL });
+    defer allocator.free(hooks_path);
+
+    try ensureParentDir(io, hook_path);
+    try writeGrokHookScript(allocator, io, hook_path);
+    const hook_command = try hookCommandAllocForOs(allocator, builtin.os.tag, hook_path);
+    defer allocator.free(hook_command);
+    const hooks_json = try grokHooksJsonAlloc(allocator, hook_command);
+    defer allocator.free(hooks_json);
+    try ensureParentDir(io, hooks_path);
+    try writeFileAtomic(allocator, io, hooks_path, hooks_json, .default_file);
+}
+
+/// Removes only Verde's standalone Grok hook files. Idempotent.
+pub fn removeGrokGlobalHooks(allocator: std.mem.Allocator) !void {
+    const grok_home = try grokHomeDirAlloc(allocator);
+    defer allocator.free(grok_home);
+    try removeGrokGlobalHooksAt(allocator, grok_home);
+}
+
+fn removeGrokGlobalHooksAt(allocator: std.mem.Allocator, grok_home: []const u8) !void {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const hook_path = try std.fs.path.join(allocator, &.{ grok_home, grokGlobalHookRelPathForOs(builtin.os.tag) });
+    defer allocator.free(hook_path);
+    const hooks_path = try std.fs.path.join(allocator, &.{ grok_home, GROK_GLOBAL_HOOKS_JSON_REL });
+    defer allocator.free(hooks_path);
+    std.Io.Dir.cwd().deleteFile(io, hooks_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    std.Io.Dir.cwd().deleteFile(io, hook_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn writeGrokHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    const script = if (builtin.os.tag == .windows) grokPowerShellHookScript() else
+        \\#!/bin/sh
+        \\# verde-grok-notify-hook
+        \\[ "${VERDE:-}" = "1" ] || exit 0
+        \\[ -n "${VERDE_SESSION_ID:-}" ] || exit 0
+        \\
+        \\payload="${TMPDIR:-/tmp}/verde-grok-hook.$$"
+        \\cat > "$payload" 2>/dev/null || true
+        \\event="$(sed -n 's/.*"hookEventName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
+        \\[ -n "$event" ] || event="${GROK_HOOK_EVENT:-}"
+        \\
+        \\status=""
+        \\title=""
+        \\case "$event" in
+        \\  session_start|SessionStart) status="idle" ;;
+        \\  user_prompt_submit|UserPromptSubmit)
+        \\    status="working"
+        \\    if command -v jq >/dev/null 2>&1; then
+        \\      title="$(jq -r '.prompt // .userPrompt // empty' "$payload" 2>/dev/null)"
+        \\    else
+        \\      title="$(sed -n 's/.*"prompt"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
+        \\    fi
+        \\    title="$(printf '%s' "$title" | tr '\n\t' '  ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g' | cut -c1-72)"
+        \\    ;;
+        \\  pre_tool_use|PreToolUse) status="working" ;;
+        \\  notification|Notification)
+        \\    if command -v jq >/dev/null 2>&1; then
+        \\      notification="$(jq -r '[(.notificationType // ""), (.message // ""), (.body // ""), (.title // "")] | join(" ") | ascii_downcase' "$payload" 2>/dev/null)"
+        \\    else
+        \\      notification="$(sed -n 's/.*"notificationType"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1 | tr '[:upper:]' '[:lower:]')"
+        \\    fi
+        \\    case "$notification" in
+        \\      *permission*|*approval*|*confirm*|*"action required"*|*action_required*|*action-required*|*"input required"*|*input_required*|*input-required*|*"user input"*|*user_input*|*user-input*|*elicitation*) status="waiting" ;;
+        \\      *) rm -f "$payload"; exit 0 ;;
+        \\    esac
+        \\    ;;
+        \\  stop|Stop)
+        \\    if command -v jq >/dev/null 2>&1; then
+        \\      reason="$(jq -r '.reason // empty' "$payload" 2>/dev/null)"
+        \\    else
+        \\      reason="$(sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
+        \\    fi
+        \\    if [ -z "$reason" ] || [ "$reason" = "end_turn" ]; then status="done"; else status="idle"; fi
+        \\    ;;
+        \\  stop_failure|StopFailure) status="error" ;;
+        \\  *) rm -f "$payload"; exit 0 ;;
+        \\esac
+        \\
+        \\cli="${VERDE_CLI:-verde}"
+        \\case "$cli" in
+        \\  *" (deleted)") cli="${cli% (deleted)}" ;;
+        \\esac
+        \\if ! command -v "$cli" >/dev/null 2>&1; then
+        \\  if [ -x "./zig-out/bin/verde" ]; then cli="./zig-out/bin/verde"; else cli="verde"; fi
+        \\fi
+        \\if [ -n "$title" ]; then
+        \\  "$cli" notify --quiet --status "$status" --title "$title" --provider grok >/dev/null 2>&1 || true
+        \\else
+        \\  "$cli" notify --quiet --status "$status" --provider grok >/dev/null 2>&1 || true
+        \\fi
+        \\rm -f "$payload"
+        \\exit 0
+        \\
+    ;
+    try writeFileAtomic(allocator, io, path, script, hookPermissionsForOs(builtin.os.tag));
+}
+
+fn grokHooksJsonAlloc(allocator: std.mem.Allocator, hook_path: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{ .whitespace = .indent_2 } };
+    try s.beginObject();
+    try s.objectField("hooks");
+    try s.beginObject();
+    for (GROK_HOOK_EVENTS) |event| try writeGrokHookEvent(&s, event, hook_path);
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+fn writeGrokHookEvent(s: *std.json.Stringify, event: []const u8, hook_path: []const u8) !void {
+    try s.objectField(event);
+    try s.beginArray();
+    try s.beginObject();
+    try s.objectField("hooks");
+    try s.beginArray();
+    try s.beginObject();
+    try s.objectField("type");
+    try s.write("command");
+    try s.objectField("command");
+    try s.write(hook_path);
+    try s.objectField("timeout");
+    try s.write(5);
+    try s.endObject();
+    try s.endArray();
+    try s.endObject();
+    try s.endArray();
 }
 
 /// True when our managed Amp plugin is present in the global Amp plugin dir.
@@ -1303,4 +1553,48 @@ test "PowerShell hooks use inherited transport-neutral endpoint and safe invocat
     try std.testing.expect(std.mem.indexOf(u8, cursor_script, "beforeSubmitPrompt") != null);
     try std.testing.expect(std.mem.indexOf(u8, cursor_script, "--provider") != null);
     try std.testing.expect(std.mem.indexOf(u8, cursor_script, "'cursor'") != null);
+
+    const grok_script = grokPowerShellHookScript();
+    try std.testing.expect(std.mem.indexOf(u8, grok_script, "$env:VERDE_LIVE_ENDPOINT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grok_script, "hookEventName") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grok_script, "end_turn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grok_script, "'grok'") != null);
+}
+
+test "Grok hook file registers native lifecycle events" {
+    const hook_path = "/home/test/.grok/verde-grok-notify-hook.sh";
+    const hooks_json = try grokHooksJsonAlloc(std.testing.allocator, hook_path);
+    defer std.testing.allocator.free(hooks_json);
+
+    for (GROK_HOOK_EVENTS) |event| {
+        try std.testing.expect(std.mem.indexOf(u8, hooks_json, event) != null);
+    }
+    try std.testing.expectEqual(GROK_HOOK_EVENTS.len, std.mem.count(u8, hooks_json, hook_path));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const script_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/grok-hook.sh", .{tmp.sub_path});
+    defer std.testing.allocator.free(script_path);
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    try writeGrokHookScript(std.testing.allocator, threaded.io(), script_path);
+    const script = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), script_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(script);
+    try std.testing.expect(std.mem.indexOf(u8, script, "hookEventName") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "stop_failure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "end_turn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "--provider grok") != null);
+}
+
+test "Grok hook install and removal stay inside the provider home" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const grok_home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(grok_home);
+
+    try std.testing.expect(!grokGlobalHooksInstalledAt(std.testing.allocator, grok_home));
+    try ensureGrokGlobalHooksAt(std.testing.allocator, grok_home);
+    try std.testing.expect(grokGlobalHooksInstalledAt(std.testing.allocator, grok_home));
+    try removeGrokGlobalHooksAt(std.testing.allocator, grok_home);
+    try std.testing.expect(!grokGlobalHooksInstalledAt(std.testing.allocator, grok_home));
 }

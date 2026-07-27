@@ -81,6 +81,7 @@ pub const HookKind = enum {
     claude,
     codex,
     cursor,
+    grok,
     amp,
 };
 
@@ -89,6 +90,7 @@ pub fn hookDisplayName(kind: HookKind) []const u8 {
         .claude => "Claude",
         .codex => "Codex",
         .cursor => "Cursor",
+        .grok => "Grok",
         .amp => "Amp",
     };
 }
@@ -98,6 +100,7 @@ pub fn hookFailureNotice(kind: HookKind, installing: bool) []const u8 {
         .claude => if (installing) "Could not install Claude hooks." else "Could not remove Claude hooks.",
         .codex => if (installing) "Could not install Codex hooks." else "Could not remove Codex hooks.",
         .cursor => if (installing) "Could not install Cursor hooks." else "Could not remove Cursor hooks.",
+        .grok => if (installing) "Could not install Grok hooks." else "Could not remove Grok hooks.",
         .amp => if (installing) "Could not install Amp hooks." else "Could not remove Amp hooks.",
     };
 }
@@ -107,6 +110,7 @@ pub fn hookSuccessNotice(kind: HookKind, installed: bool) []const u8 {
         .claude => if (installed) "Enabled global Claude status hooks." else "Disabled global Claude status hooks.",
         .codex => if (installed) "Enabled global Codex status hooks." else "Disabled global Codex status hooks.",
         .cursor => if (installed) "Enabled global Cursor status hooks." else "Disabled global Cursor status hooks.",
+        .grok => if (installed) "Enabled global Grok status hooks." else "Disabled global Grok status hooks.",
         .amp => if (installed) "Enabled global Amp status hooks." else "Disabled global Amp status hooks.",
     };
 }
@@ -124,6 +128,7 @@ pub const State = struct {
     hook_claude_installed: bool = false,
     hook_codex_installed: bool = false,
     hook_cursor_installed: bool = false,
+    hook_grok_installed: bool = false,
     hook_amp_installed: bool = false,
     mcp_summary: provider_mcp.Summary = .{},
     scroll_y: f32 = 0.0,
@@ -162,6 +167,11 @@ pub fn toggleCursorGlobalHooks(self: anytype) void {
     self.toggleProviderGlobalHooks(.cursor, &self.settings_controller.hook_cursor_installed);
 }
 
+/// Installs or removes Grok's user-scoped status hook.
+pub fn toggleGrokGlobalHooks(self: anytype) void {
+    self.toggleProviderGlobalHooks(.grok, &self.settings_controller.hook_grok_installed);
+}
+
 /// Installs or removes the global Amp notify plugin and refreshes the
 /// settings toggle state. Acts immediately (filesystem side effect), like
 /// the Claude/Codex toggles.
@@ -176,12 +186,14 @@ pub fn toggleProviderGlobalHooks(self: anytype, provider: HookKind, installed: *
             .claude => provider_hooks.ensureClaudeGlobalHooks(self.allocator),
             .codex => provider_hooks.ensureCodexGlobalHooks(self.allocator),
             .cursor => provider_hooks.ensureCursorGlobalHooks(self.allocator),
+            .grok => provider_hooks.ensureGrokGlobalHooks(self.allocator),
             .amp => provider_hooks.ensureAmpGlobalHooks(self.allocator),
         }
     else switch (provider) {
         .claude => provider_hooks.removeClaudeGlobalHooks(self.allocator),
         .codex => provider_hooks.removeCodexGlobalHooks(self.allocator),
         .cursor => provider_hooks.removeCursorGlobalHooks(self.allocator),
+        .grok => provider_hooks.removeGrokGlobalHooks(self.allocator),
         .amp => provider_hooks.removeAmpGlobalHooks(self.allocator),
     };
     result catch |err| {
@@ -252,6 +264,7 @@ pub fn openSettingsModal(self: anytype) void {
     self.settings_controller.hook_claude_installed = provider_hooks.claudeGlobalHooksInstalled(self.allocator);
     self.settings_controller.hook_codex_installed = provider_hooks.codexGlobalHooksInstalled(self.allocator);
     self.settings_controller.hook_cursor_installed = provider_hooks.cursorGlobalHooksInstalled(self.allocator);
+    self.settings_controller.hook_grok_installed = provider_hooks.grokGlobalHooksInstalled(self.allocator);
     self.settings_controller.hook_amp_installed = provider_hooks.ampGlobalHooksInstalled(self.allocator);
     self.settings_controller.mcp_summary = provider_mcp.inspect(self.allocator);
     self.settings_controller.scroll_y = 0.0;

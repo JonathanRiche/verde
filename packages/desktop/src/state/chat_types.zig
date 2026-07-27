@@ -279,6 +279,19 @@ pub const ChatThread = struct {
         return self.send_state.status == .pending;
     }
 
+    /// Activity state consumed by provider-neutral pane chrome and the ACTIVE
+    /// cluster. Approval requests are waiting, rather than generic working.
+    pub fn activityStatusForUi(self: *const ChatThread) ChatActivityStatus {
+        if (self.completion_pending) return .done;
+        if (!self.send_state.mutex.tryLock()) return .working;
+        defer self.send_state.mutex.unlock();
+        return switch (self.send_state.status) {
+            .pending => if (self.send_state.pending_approval != null) .waiting else .working,
+            .failed => .@"error",
+            else => .idle,
+        };
+    }
+
     /// Unix ms when the in-flight send began, or null when no send is pending
     /// (or the worker holds the lock this frame — callers fall back to a
     /// time-less label rather than blocking the render thread).
@@ -573,6 +586,14 @@ pub const SendStatus = enum {
     aborted,
     failed,
 };
+
+pub const ChatActivityStatus = enum {
+    idle,
+    working,
+    waiting,
+    done,
+    @"error",
+};
 pub const FollowupKind = enum {
     queue,
     steer,
@@ -738,4 +759,27 @@ fn unixTimestampSeconds() i64 {
 
 fn unixTimestampMs() i64 {
     return platform_runtime.unixTimestampMs();
+}
+
+test "chat activity distinguishes approval waiting from working" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Activity");
+    defer thread.deinit(allocator);
+
+    try std.testing.expectEqual(ChatActivityStatus.idle, thread.activityStatusForUi());
+    thread.send_state.status = .pending;
+    try std.testing.expectEqual(ChatActivityStatus.working, thread.activityStatusForUi());
+
+    thread.send_state.pending_approval = .{
+        .call_id = try std.heap.page_allocator.dupe(u8, "call-1"),
+        .title = try std.heap.page_allocator.dupe(u8, "Approval"),
+        .body = try std.heap.page_allocator.dupe(u8, "Run command?"),
+    };
+    try std.testing.expectEqual(ChatActivityStatus.waiting, thread.activityStatusForUi());
+    freePendingApproval(std.heap.page_allocator, &thread.send_state.pending_approval);
+
+    thread.send_state.status = .failed;
+    try std.testing.expectEqual(ChatActivityStatus.@"error", thread.activityStatusForUi());
+    thread.completion_pending = true;
+    try std.testing.expectEqual(ChatActivityStatus.done, thread.activityStatusForUi());
 }

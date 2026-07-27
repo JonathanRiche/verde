@@ -104,6 +104,7 @@ fn slashCommandMatchesPrefix(name: []const u8, prefix: []const u8) bool {
 pub const SurfaceStatus = surface_controller.SurfaceStatus;
 pub const SurfaceUpdate = surface_controller.SurfaceUpdate;
 pub const SurfaceState = surface_controller.SurfaceState;
+pub const SurfaceProvider = db_types.SurfaceProvider;
 
 pub const PaletteModalAction = enum {
     mcp_onboarding_not_now,
@@ -2788,6 +2789,7 @@ pub const AppState = struct {
     pub const toggleClaudeGlobalHooks = settings_controller.toggleClaudeGlobalHooks;
     pub const toggleCodexGlobalHooks = settings_controller.toggleCodexGlobalHooks;
     pub const toggleCursorGlobalHooks = settings_controller.toggleCursorGlobalHooks;
+    pub const toggleGrokGlobalHooks = settings_controller.toggleGrokGlobalHooks;
     pub const toggleAmpGlobalHooks = settings_controller.toggleAmpGlobalHooks;
     pub const toggleProviderGlobalHooks = settings_controller.toggleProviderGlobalHooks;
     pub const cancelSettingsModal = settings_controller.cancelSettingsModal;
@@ -4656,7 +4658,13 @@ pub const AppState = struct {
             .cursor => provider_hooks.ensureCursorProjectHooks(self.allocator, project_path) catch |err| {
                 log.warn("could not install Cursor project status hooks: {s}", .{@errorName(err)});
             },
-            .opencode, .grok, .amp, .other => {},
+            // Grok project hooks require an explicit folder-trust grant. Its
+            // personal hook is guarded by Verde pane environment variables,
+            // so it remains inert in every other terminal.
+            .grok => provider_hooks.ensureGrokGlobalHooks(self.allocator) catch |err| {
+                log.warn("could not install Grok personal status hooks: {s}", .{@errorName(err)});
+            },
+            .opencode, .amp, .other => {},
         }
     }
 
@@ -4795,13 +4803,14 @@ pub const AppState = struct {
         process.hooks = defaults.hooks;
     }
 
-    fn providerFromStack(provider: ?stack_config.AgentProvider) ?Provider {
+    fn providerFromStack(provider: ?stack_config.AgentProvider) ?SurfaceProvider {
         return switch (provider orelse return null) {
             .codex => .codex,
             .claude => .claude,
             .opencode => .opencode,
             .cursor => .cursor,
-            .grok, .amp => null,
+            .grok => .grok,
+            .amp => .amp,
             .other => null,
         };
     }

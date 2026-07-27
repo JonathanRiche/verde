@@ -50,7 +50,7 @@ pub fn defaultAgentTui(provider: stack_config.AgentProvider) ?DefaultAgentTui {
         .claude => .{ .name = "claude", .command = "claude", .provider = .claude },
         .opencode => .{ .name = "opencode", .command = opencodeTuiCommandForOs(builtin.os.tag), .provider = .opencode },
         .cursor => .{ .name = "cursor", .command = "agent", .provider = .cursor, .notify = true, .hooks = true },
-        .grok => .{ .name = "grok", .command = GROK_TUI_COMMAND, .provider = .grok },
+        .grok => .{ .name = "grok", .command = GROK_TUI_COMMAND, .provider = .grok, .notify = true, .hooks = true },
         .amp => .{ .name = "amp", .command = "amp", .provider = .amp },
         .other => null,
     };
@@ -99,6 +99,8 @@ test "Grok TUI defaults disable auto-update and recognize the process" {
     const defaults = defaultAgentTui(.grok).?;
     try std.testing.expectEqualStrings("grok", defaults.name);
     try std.testing.expectEqualStrings("grok --no-auto-update", defaults.command);
+    try std.testing.expect(defaults.notify);
+    try std.testing.expect(defaults.hooks);
     try std.testing.expect(isKnownDefaultAgentTuiCommand(.grok, "grok"));
     try std.testing.expectEqual(stack_config.AgentProvider.grok, agentTuiProviderFromProcessName("grok").?);
 }
