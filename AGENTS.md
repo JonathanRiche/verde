@@ -55,6 +55,20 @@ For CLI smoke tests from an external shell:
 
 Runtime logs are at `~/.local/share/verde/Native/logs/verde.stderr.log`. Never log clipboard contents; length-only diagnostics are acceptable.
 
+## MCP Process Coordination, Leases, And Shared Browser Safety
+
+Use Verde's process-coordination facilities when an action starts, owns, or may conflict with a shared/long-running resource. The relevant MCP operations are `list_processes`, `check_command`, `acquire_lease`, `release_lease`, and `wait_for_process`.
+
+1. **Inspect before starting.** Use `list_processes` to see configured processes, active terminal commands, GUI agent turns, and background work. Before starting a potentially conflicting command, use `check_command` and declare the actual resource.
+2. **Lease real shared resources.** Acquire a lease before an exclusive build (`build`), dependency mutation (`deps`), database operation (`db`), dev server (`port:<actual-port>`), browser automation/shared browser runtime (`browser`), or another long-running shared command. Do not lease ordinary reads, searches, or short focused tests merely for ceremony.
+3. **Keep work observable.** Start long-lived work through Verde's tracked process/session mechanism when available. Do not hide it behind `nohup`, `disown`, `setsid`, or an untracked bare `&`. Monitor via tracked process/pane/log state rather than guessed PIDs.
+4. **Release cleanly.** Keep a lease only for the work's necessary lifetime; renew it if the owned task outlives its lifetime, then stop the agent-owned process and release the lease on normal completion, failure, or cancellation. Auto-expiry protects crashes but does not replace normal cleanup.
+5. **Respect other owners.** Never force a conflicting lease, kill another owner's process, reuse another owner's port, or restart Verde without explicit user authorization. Report the tracked process/session, resource lease, and cleanup outcome in the handoff.
+
+### Shared Verde browser runtime
+
+The embedded browser is a shared Verde runtime and can be rebound by open/navigate operations. Always target an explicit workspace; do not casually reset, restart, close, or navigate a browser bound to another active pane/workspace. Browser tests must clean up only the exact browser/test-server process or session they started. Never use broad `pkill chrome` / `pkill chromium` commands or otherwise terminate a user, shared, or other-agent browser session.
+
 ## Native Desktop UI
 
 `packages/desktop` is a native Palette application:

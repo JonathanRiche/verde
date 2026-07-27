@@ -538,7 +538,7 @@ verde live process stop --name <name> [--project <id|index|path|current>] [--jso
 verde live process restart --name <name> [--project <id|index|path|current>] [--json]
 verde live process inspect --name <name> [--project <id|index|path|current>] [--json]
 verde live process logs --name <name> [--project <id|index|path|current>] [--json]
-verde live agent open --provider codex [--project <id|index|path|current>] [--json]
+verde live agent open --provider codex|claude|opencode|cursor|grok [--project <id|index|path|current>] [--json]
 verde live stack start [--project <id|index|path|current>] [--json]
 verde live stack stop [--project <id|index|path|current>] [--json]
 verde live stack restart [--project <id|index|path|current>] [--json]
@@ -548,8 +548,9 @@ verde live stack restart [--project <id|index|path|current>] [--json]
   you want to submit a shell command.
 - `process start`, `stop`, and `restart` control entries loaded from
   `verde.yml`.
-- `agent open --provider codex` opens a first-class Codex TUI in the selected
-  workspace without requiring a `verde.yml` entry.
+- `agent open --provider <name>` opens that provider's first-class TUI in the
+  selected workspace without requiring a `verde.yml` entry. Grok launches with
+  `--no-auto-update` so update checks cannot disrupt its managed PTY.
 - `stack start`, `stop`, and `restart` apply the same action to every configured
   process and agent in the selected workspace.
 
@@ -593,7 +594,7 @@ Verde includes embedded terminal panes powered by Ghostty's `libghostty-vt` term
 - In a focused chat thread pane, press `Tab` to return keyboard focus to the prompt box.
 - Workspace pane headers can split chat or terminal panes vertically (`C|`, `T|`) or horizontally (`C-`, `T-`), zoom or unzoom a pane, or close it.
 - Drag the divider between workspace panes to resize the split.
-- Right-click inside a terminal pane to create normal shell tabs, launch-profile tabs for Claude, OpenCode, Codex, and Cursor, or new workspace terminal panes around the focused pane.
+- Right-click inside a terminal pane to create normal shell tabs, configured launch-profile tabs, or new workspace terminal panes around the focused pane.
 - Terminal-internal tabs remain inside the focused terminal pane. Terminal split actions create workspace terminal panes.
 - Per-terminal zoom works with `Ctrl+-` and `Ctrl+=` while the terminal is focused, and the chosen zoom is restored with the terminal layout.
 
@@ -633,6 +634,11 @@ agents:
     notify: true
     mcp: true
     hooks: true
+  grok:
+    provider: grok
+    command: "grok --no-auto-update --continue"
+    cwd: "."
+    revive: attach_or_create
 ```
 
 Use `processes:` for normal long-running commands such as dev servers. Use

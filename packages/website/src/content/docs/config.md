@@ -173,7 +173,7 @@ last-expanded state for the next group. See [Chat, models & runs](/docs/chat).
 Project stack config is loaded from `verde.yml` or `verde.yaml` in the workspace
 root. `processes:` and `agents:` entries both run in terminal docks; agent
 entries may also declare `provider` (`codex`, `claude`, `opencode`, `cursor`,
-`amp`, or `other`), `revive`, `notify`, `mcp`, and `hooks` metadata. New agent
+`grok`, `amp`, or `other`), `revive`, `notify`, `mcp`, and `hooks` metadata. New agent
 metadata defaults to disabled unless explicitly set.
 
 ```yaml
@@ -192,6 +192,11 @@ agents:
     notify: true
     mcp: true
     hooks: true
+  grok:
+    provider: grok
+    command: "grok --no-auto-update --continue"
+    cwd: "."
+    revive: attach_or_create
 ```
 
 Use `processes:` for normal long-running commands such as dev servers. Use
@@ -201,6 +206,10 @@ for the agent and wires Codex hook events into pane/workspace attention. Plain
 `codex` managed commands are launched with `features.hooks=true` when
 `hooks: true` is set, so `PermissionRequest` can mark the surface `waiting` and
 `Stop` can mark it `done`.
+
+Use `grok --no-auto-update` for a fresh Grok session, `--continue` for the most
+recent session in the workspace, or `--resume <session-id-or-title>` for a
+specific session stored by Grok.
 
 Start or restart a configured Codex agent with:
 

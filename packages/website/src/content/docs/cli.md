@@ -224,7 +224,7 @@ verde live process stop --name <name> [--project <id|index|path|current>] [--jso
 verde live process restart --name <name> [--project <id|index|path|current>] [--json]
 verde live process inspect --name <name> [--project <id|index|path|current>] [--json]
 verde live process logs --name <name> [--project <id|index|path|current>] [--json]
-verde live agent open --provider codex [--project <id|index|path|current>] [--json]
+verde live agent open --provider codex|claude|opencode|cursor|grok [--project <id|index|path|current>] [--json]
 verde live stack start [--project <id|index|path|current>] [--json]
 verde live stack stop [--project <id|index|path|current>] [--json]
 verde live stack restart [--project <id|index|path|current>] [--json]
@@ -235,7 +235,9 @@ verde live stack status [--project <id|index|path|current>] [--json]
 - `terminal tail` returns recent terminal output; `screen` returns the current
   visible terminal screen.
 - `process start`, `stop`, and `restart` control entries loaded from `verde.yml`.
-- `agent open --provider codex` opens a first-class Codex TUI in the selected workspace without requiring a `verde.yml` entry.
+- `agent open --provider <name>` opens that provider's first-class TUI in the
+  selected workspace without requiring a `verde.yml` entry. Grok is detected
+  from `PATH` and launched with `--no-auto-update`.
 - `stack start`, `stop`, and `restart` apply the same action to every configured process and agent in the selected workspace.
 
 ## Pane management
