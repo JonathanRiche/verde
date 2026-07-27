@@ -6,10 +6,8 @@ const notifier = @import("../app/notifier.zig");
 const platform_runtime = @import("platform_runtime");
 const terminal = @import("../terminal/terminal.zig");
 const theme = @import("../ui/theme.zig");
-const utils = @import("../utils.zig");
-const provider_models = @import("provider_models.zig");
 
-const Provider = provider_models.Provider;
+const SurfaceProvider = db_types.SurfaceProvider;
 const PersistedSurfaceCompletion = db_types.PersistedSurfaceCompletion;
 const log = std.log.scoped(.native_shell);
 
@@ -36,7 +34,7 @@ pub const SurfaceUpdate = struct {
     workspace_path: ?[]const u8 = null,
     dock_id: ?u32 = null,
     pane_id: ?u32 = null,
-    provider: ?Provider = null,
+    provider: ?SurfaceProvider = null,
     provider_thread_id: ?[]const u8 = null,
     title: ?[]const u8 = null,
     status: ?SurfaceStatus = null,
@@ -54,7 +52,7 @@ pub const SurfaceState = struct {
     workspace_path: []u8 = "",
     dock_id: u32 = 0,
     pane_id: ?u32 = null,
-    provider: ?Provider = null,
+    provider: ?SurfaceProvider = null,
     provider_thread_id: ?[]u8 = null,
     title: []u8 = "",
     status: SurfaceStatus = .idle,
@@ -235,7 +233,7 @@ fn terminalDockForSurface(self: anytype, surface: *const SurfaceState) ?*termina
 // logo/title. Only trust explicit notify metadata: falling back to a
 // workspace chat provider can mislabel one terminal agent as another (for
 // example an Amp pane in a workspace whose first saved chat is Codex).
-fn resolveSurfaceProvider(self: anytype, surface: *const SurfaceState) ?Provider {
+fn resolveSurfaceProvider(self: anytype, surface: *const SurfaceState) ?SurfaceProvider {
     _ = self;
     if (surface.provider) |p| return p;
     return null;
@@ -256,7 +254,7 @@ fn fireCompletionNotification(self: anytype, surface: *const SurfaceState) void 
     const title = if (surface.title.len > 0)
         surface.title
     else if (provider) |p|
-        (std.fmt.bufPrint(&title_buf, "{s} finished", .{utils.providerLabel(p)}) catch "Agent finished")
+        (std.fmt.bufPrint(&title_buf, "{s} finished", .{surfaceProviderLabel(p)}) catch "Agent finished")
     else
         "Agent finished";
 
@@ -271,9 +269,21 @@ fn fireCompletionNotification(self: anytype, surface: *const SurfaceState) void 
         .opencode => .{ .key = "opencode", .png_bytes = OPENCODE_LOGO_BYTES },
         .claude => .{ .key = "claude", .png_bytes = CLAUDE_LOGO_BYTES },
         .cursor => .{ .key = "cursor", .png_bytes = CURSOR_LOGO_BYTES },
+        .grok, .amp => null,
     } else null;
 
     notifier.notifyAgentDone(self.allocator, title, body, icon);
+}
+
+fn surfaceProviderLabel(provider: SurfaceProvider) []const u8 {
+    return switch (provider) {
+        .opencode => "OpenCode",
+        .codex => "Codex",
+        .cursor => "Cursor",
+        .claude => "Claude",
+        .grok => "Grok",
+        .amp => "Amp",
+    };
 }
 
 pub fn clearSurfaceAttentionBySession(self: anytype, session_id: []const u8) bool {

@@ -154,7 +154,9 @@ pub fn isFocusAnimating() bool {
 const PaneAgentVisualStatus = enum {
     idle,
     working,
+    waiting,
     done,
+    @"error",
 };
 
 var pane_status_animating = false;
@@ -468,15 +470,22 @@ fn paneAgentVisualStatus(state: *const runtime.AppState, pane_id: runtime.Worksp
         .chat => |ref| blk: {
             if (ref.thread_index >= project.threads.items.len) break :blk .idle;
             const thread = &project.threads.items[ref.thread_index];
-            if (thread.completion_pending) break :blk .done;
-            break :blk if (thread.isSendPendingForUi()) .working else .idle;
+            break :blk switch (thread.activityStatusForUi()) {
+                .idle => .idle,
+                .working => .working,
+                .waiting => .waiting,
+                .done => .done,
+                .@"error" => .@"error",
+            };
         },
         .terminal => |ref| blk: {
             const surface = state.projectTerminalSurface(state.project_controller.selected_index, ref.dock_id) orelse break :blk .idle;
             break :blk switch (surface.displayStatus()) {
                 .done => .done,
                 .working => .working,
-                else => .idle,
+                .waiting => .waiting,
+                .@"error" => .@"error",
+                .idle => .idle,
             };
         },
         .browser => .idle,
@@ -486,7 +495,7 @@ fn paneAgentVisualStatus(state: *const runtime.AppState, pane_id: runtime.Worksp
 fn paneStatusPulse(status: PaneAgentVisualStatus, timestamp_ms: i64) f32 {
     const period_ms = switch (status) {
         .done => DONE_PULSE_PERIOD_MS,
-        .working => WORKING_PULSE_PERIOD_MS,
+        .working, .waiting, .@"error" => WORKING_PULSE_PERIOD_MS,
         .idle => return 0.0,
     };
     const elapsed: f32 = @floatFromInt(@mod(timestamp_ms, period_ms));
@@ -1112,9 +1121,9 @@ fn renderLeaf(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: 
         renderPaneOverlay(state, pane_id, header_rect);
     }
     renderZoomControl(state, pane_id, kind, rect, header_h, maximized);
-    // Pane status frame. DONE and WORKING intentionally override the ordinary
-    // focus/unfocused and zoom colors so agent state remains legible in tiled
-    // and maximized layouts without tinting the pane's content.
+    // Pane status frame. Live agent states intentionally override the ordinary
+    // focus/unfocused and zoom colors so they remain legible in tiled and
+    // maximized layouts without tinting the pane's content.
     const agent_status = paneAgentVisualStatus(state, pane_id);
     if (agent_status != .idle) {
         pane_status_animating = true;
@@ -1122,9 +1131,11 @@ fn renderLeaf(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: 
         var border_color = switch (agent_status) {
             .done => theme.success(),
             .working => theme.accent(),
+            .waiting => theme.COLOR_YELLOW,
+            .@"error" => theme.COLOR_DIFF_REMOVE,
             .idle => unreachable,
         };
-        const min_alpha: f32 = if (agent_status == .done) 0.72 else 0.52;
+        const min_alpha: f32 = if (agent_status == .done or agent_status == .@"error") 0.72 else 0.52;
         border_color[3] *= min_alpha + (1.0 - min_alpha) * pulse;
         const border_width = theme.scaledUi(if (maximized) STATUS_ZOOM_BORDER_WIDTH_CSS else STATUS_BORDER_WIDTH_CSS);
         queueBorder(state, rect, paletteColor(border_color), 0.0, border_width);

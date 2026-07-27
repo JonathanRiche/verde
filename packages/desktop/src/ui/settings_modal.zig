@@ -37,6 +37,7 @@ pub const Control = enum(u8) {
     hooks_claude,
     hooks_codex,
     hooks_cursor,
+    hooks_grok,
     hooks_amp,
     updates_check,
     updates_download,
@@ -148,6 +149,7 @@ const SettingsLayout = struct {
     hooks_claude: palette.Rect,
     hooks_codex: palette.Rect,
     hooks_cursor: palette.Rect,
+    hooks_grok: palette.Rect,
     hooks_amp: palette.Rect,
     integrations_hint_y: f32,
     updates_card: palette.Rect,
@@ -264,7 +266,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h + m.row_gap + m.label_h + m.inner_gap + m.row_h;
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra + m.row_gap + m.label_h + m.inner_gap + m.row_h;
     // MCP controls and status, followed by the provider status-hook controls.
-    const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap * 2.0 + m.label_h * 4.0 + m.row_h * 5.0 + m.inner_gap * 7.0;
+    const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap * 2.0 + m.label_h * 4.0 + m.row_h * 6.0 + m.inner_gap * 8.0;
     // Same shape as the integrations card: title, field label, one toggle row, hint.
     const notifications_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     // The modal width depends only on the window, so the notes block can be
@@ -422,7 +424,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const hooks_codex: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_codex_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const hooks_cursor_y = hooks_codex_y + m.row_h + m.inner_gap;
     const hooks_cursor: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_cursor_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
-    const hooks_amp_y = hooks_cursor_y + m.row_h + m.inner_gap;
+    const hooks_grok_y = hooks_cursor_y + m.row_h + m.inner_gap;
+    const hooks_grok: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_grok_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
+    const hooks_amp_y = hooks_grok_y + m.row_h + m.inner_gap;
     const hooks_amp: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_amp_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const integrations_hint_y = hooks_amp_y + m.row_h + m.inner_gap;
 
@@ -503,6 +507,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .hooks_claude = hooks_claude,
         .hooks_codex = hooks_codex,
         .hooks_cursor = hooks_cursor,
+        .hooks_grok = hooks_grok,
         .hooks_amp = hooks_amp,
         .integrations_hint_y = integrations_hint_y,
         .updates_card = updates_card,
@@ -682,6 +687,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.hooks_claude, layout.body_clip, .hooks_claude, queue_hit);
     queueControlHit(state, layout.hooks_codex, layout.body_clip, .hooks_codex, queue_hit);
     queueControlHit(state, layout.hooks_cursor, layout.body_clip, .hooks_cursor, queue_hit);
+    queueControlHit(state, layout.hooks_grok, layout.body_clip, .hooks_grok, queue_hit);
     queueControlHit(state, layout.hooks_amp, layout.body_clip, .hooks_amp, queue_hit);
     if (state.settings_controller.update.status != .checking) {
         queueControlHit(state, layout.updates_check, layout.body_clip, .updates_check, queue_hit);
@@ -853,6 +859,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     drawSwitchRow(state, layout.hooks_claude, "Claude", state.settings_controller.hook_claude_installed, isControlHovered(state, .hooks_claude), layout.body_clip);
     drawSwitchRow(state, layout.hooks_codex, "Codex", state.settings_controller.hook_codex_installed, isControlHovered(state, .hooks_codex), layout.body_clip);
     drawSwitchRow(state, layout.hooks_cursor, "Cursor", state.settings_controller.hook_cursor_installed, isControlHovered(state, .hooks_cursor), layout.body_clip);
+    drawSwitchRow(state, layout.hooks_grok, "Grok", state.settings_controller.hook_grok_installed, isControlHovered(state, .hooks_grok), layout.body_clip);
     drawSwitchRow(state, layout.hooks_amp, "Amp", state.settings_controller.hook_amp_installed, isControlHovered(state, .hooks_amp), layout.body_clip);
     queueText(state, .{
         .x = layout.integrations_card.x + m.card_pad,
@@ -1112,6 +1119,10 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         },
         .hooks_cursor => {
             state.toggleCursorGlobalHooks();
+            return;
+        },
+        .hooks_grok => {
+            state.toggleGrokGlobalHooks();
             return;
         },
         .hooks_amp => {

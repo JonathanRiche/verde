@@ -763,7 +763,7 @@ fn notificationUpdateResponse(allocator: std.mem.Allocator, id_value: std.json.V
         .workspace_path = stringParam(params, "workspace_path"),
         .dock_id = u32Param(params, "dock_id") orelse u32Param(params, "dock"),
         .pane_id = u32Param(params, "pane_id") orelse u32Param(params, "pane"),
-        .provider = if (stringParam(params, "provider")) |value| parseProvider(value) else null,
+        .provider = if (stringParam(params, "provider")) |value| parseSurfaceProvider(value) else null,
         .provider_thread_id = stringParam(params, "provider_thread_id"),
         .title = stringParam(params, "label") orelse stringParam(params, "title"),
         .status = status,
@@ -3142,6 +3142,13 @@ fn parseProvider(value: []const u8) ?app_state.Provider {
     return null;
 }
 
+fn parseSurfaceProvider(value: []const u8) ?app_state.SurfaceProvider {
+    inline for (std.meta.fields(app_state.SurfaceProvider)) |field| {
+        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
 fn parseInspectorMode(value: []const u8) ?browser_runtime.InspectorMode {
     if (std.mem.eql(u8, value, "point")) return .point;
     if (std.mem.eql(u8, value, "draw-box") or std.mem.eql(u8, value, "draw_box")) return .draw_box;
@@ -3260,4 +3267,10 @@ test "GUI provider parser excludes terminal-only providers" {
     try std.testing.expectEqual(app_state.Provider.cursor, parseProvider("cursor").?);
     try std.testing.expect(parseProvider("amp") == null);
     try std.testing.expect(parseProvider("other") == null);
+}
+
+test "surface provider parser includes terminal-only providers" {
+    try std.testing.expectEqual(app_state.SurfaceProvider.grok, parseSurfaceProvider("grok").?);
+    try std.testing.expectEqual(app_state.SurfaceProvider.amp, parseSurfaceProvider("amp").?);
+    try std.testing.expect(parseSurfaceProvider("other") == null);
 }

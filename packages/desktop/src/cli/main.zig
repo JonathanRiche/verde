@@ -1567,7 +1567,7 @@ fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, ar
                 .workspace_path = workspace_path orelse "",
                 .dock_id = dock_id orelse 0,
                 .pane_id = pane_id,
-                .provider = if (provider) |value| std.meta.stringToEnum(db_types.Provider, value) else null,
+                .provider = if (provider) |value| std.meta.stringToEnum(db_types.SurfaceProvider, value) else null,
                 .provider_thread_id = getenvSlice("VERDE_PROVIDER_THREAD_ID"),
                 .title = label orelse title orelse "",
                 .completed_at_ms = unixTimestampMs(),
@@ -1636,6 +1636,7 @@ const integration_providers = [_]IntegrationProvider{
     .{ .name = "amp", .hook_state = "global-plugin", .installable = true, .installed = false, .reason = "Amp lifecycle events are supported through a global ~/.config/amp/plugins/verde-notify.ts plugin." },
     .{ .name = "opencode", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
     .{ .name = "cursor", .hook_state = "project-local", .installable = true, .installed = false, .reason = "Cursor Agent uses the same .cursor/hooks.json format in its terminal and desktop UI; Verde status updates require inherited Verde pane identity." },
+    .{ .name = "grok", .hook_state = "global", .installable = true, .installed = false, .reason = "Grok Build personal hooks report lifecycle status from ~/.grok/hooks/verde-notify.json without requiring project trust." },
 };
 
 fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8) !void {
@@ -1644,11 +1645,11 @@ fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []
             \\Usage:
             \\  verde integrations list [--json]
             \\  verde integrations doctor [--json]
-            \\  verde integrations install <claude|codex|amp|opencode|cursor> [--global]
-            \\  verde integrations remove <claude|codex|amp|opencode|cursor> [--global]
-            \\  verde integrations disable <claude|codex|amp|opencode|cursor>
+            \\  verde integrations install <claude|codex|amp|opencode|cursor|grok> [--global]
+            \\  verde integrations remove <claude|codex|amp|opencode|cursor|grok> [--global]
+            \\  verde integrations disable <claude|codex|amp|opencode|cursor|grok>
             \\
-            \\  --global installs Claude/Codex/Cursor hooks in their user config files,
+            \\  --global installs Claude/Codex/Cursor/Grok hooks in their user config files,
             \\  and installs Amp's plugin in ~/.config/amp/plugins for all projects
             \\  (no-op outside Verde panes); otherwise supported hooks are project-local
             \\  where the provider supports that.
@@ -1741,6 +1742,25 @@ fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []
             try out.stdout("verde integrations {s} cursor --global: removed global Cursor hooks from ~/.cursor/hooks.json\n", .{command});
             return;
         }
+        if (global and std.mem.eql(u8, provider.name, "grok")) {
+            provider_hooks.removeGrokGlobalHooks(allocator) catch |err| {
+                try out.stderr("verde integrations {s} grok --global: {s}\n", .{ command, @errorName(err) });
+                std.process.exit(1);
+            };
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = command,
+                    .installed = false,
+                    .changed = true,
+                    .status = "removed",
+                    .scope = "global",
+                });
+                return;
+            }
+            try out.stdout("verde integrations {s} grok --global: removed global Grok hooks from ~/.grok/hooks/verde-notify.json\n", .{command});
+            return;
+        }
         if (global and std.mem.eql(u8, provider.name, "amp")) {
             provider_hooks.removeAmpGlobalHooks(allocator) catch |err| {
                 try out.stderr("verde integrations {s} amp --global: {s}\n", .{ command, @errorName(err) });
@@ -1806,7 +1826,7 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
             .verde_env = std.mem.eql(u8, verde_env, "1"),
             .has_terminal_identity = has_identity,
             .providers = integration_providers[0..],
-            .summary = "Claude/Codex/Cursor hooks and the Amp global plugin are available; other providers currently use generic verde notify, OSC, and MCP paths.",
+            .summary = "Claude/Codex/Cursor/Grok hooks and the Amp global plugin are available; other providers currently use generic verde notify, OSC, and MCP paths.",
         });
         return;
     }
@@ -1814,7 +1834,7 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
         \\Integration doctor:
         \\  VERDE=1: {s}
         \\  terminal identity: {s}
-        \\  hook installers: claude, codex, cursor project-local/global; amp global plugin
+        \\  hook installers: claude, codex, cursor project-local/global; grok global; amp global plugin
         \\  generic paths: verde notify, OSC 777 notify, MCP surface tools
         \\
     , .{
@@ -1977,6 +1997,37 @@ fn installIntegration(allocator: std.mem.Allocator, out: output.Output, json: bo
             return;
         }
         try out.stdout("verde integrations install cursor --global: merged global Cursor hooks into ~/.cursor/hooks.json\n", .{});
+        return;
+    }
+
+    if (std.mem.eql(u8, provider.name, "grok") and global) {
+        provider_hooks.ensureGrokGlobalHooks(allocator) catch |err| {
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = "install",
+                    .installed = false,
+                    .status = "error",
+                    .scope = "global",
+                    .reason = @errorName(err),
+                });
+                return;
+            }
+            try out.stderr("verde integrations install grok --global: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        if (json) {
+            try out.jsonValue(allocator, .{
+                .provider = provider.name,
+                .action = "install",
+                .installed = true,
+                .status = "installed",
+                .scope = "global",
+                .path = "~/.grok/hooks/verde-notify.json",
+            });
+            return;
+        }
+        try out.stdout("verde integrations install grok --global: installed global Grok hooks in ~/.grok/hooks/verde-notify.json\n", .{});
         return;
     }
 
