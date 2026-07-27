@@ -1,10 +1,10 @@
 //! Provider readiness and asynchronous model-discovery controller state.
 
 const std = @import("std");
-const ai_harness = @import("../harness.zig");
-const app_config = @import("../config.zig");
-const process_env = @import("../process_env.zig");
-const provider_mcp = @import("../provider_mcp.zig");
+const ai_harness = @import("../providers/harness.zig");
+const app_config = @import("../app/config.zig");
+const process_env = @import("../platform/env.zig");
+const provider_mcp = @import("../providers/mcp.zig");
 const utils = @import("../utils.zig");
 const chat_types = @import("chat_types.zig");
 const provider_models = @import("provider_models.zig");

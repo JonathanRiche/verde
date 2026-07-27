@@ -2,8 +2,8 @@ const std = @import("std");
 const palette = @import("palette");
 const build_options = @import("build_options");
 
-const profiler = @import("../profiler.zig");
-const runtime_log = @import("../runtime_log.zig");
+const profiler = @import("../runtime/profiler.zig");
+const runtime_log = @import("../runtime/log.zig");
 const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
 

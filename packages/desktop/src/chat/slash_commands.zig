@@ -1,7 +1,7 @@
 //! Parser and shared metadata helpers for GUI chat slash commands.
 
 const std = @import("std");
-const provider_types = @import("provider_types.zig");
+const provider_types = @import("../providers/types.zig");
 
 pub const LocalSlashCommandId = enum(u8) {
     handoff,

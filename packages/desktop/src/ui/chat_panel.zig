@@ -5,8 +5,8 @@ const palette = @import("palette");
 const zig_dif = @import("zig_dif");
 
 const app_state = @import("../state.zig");
-const ai_harness = @import("../harness.zig");
-const profiler = @import("../profiler.zig");
+const ai_harness = @import("../providers/harness.zig");
+const profiler = @import("../runtime/profiler.zig");
 const platform_runtime = @import("platform_runtime");
 const utils = @import("../utils.zig");
 const browser_panel = @import("browser.zig");

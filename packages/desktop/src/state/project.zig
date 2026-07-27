@@ -2,9 +2,9 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const app_config = @import("../config.zig");
+const app_config = @import("../app/config.zig");
 const chat_threads = @import("../chat/threads.zig");
-const stack_config = @import("../stack.zig");
+const stack_config = @import("../workspace/stack.zig");
 const terminal = @import("../terminal/terminal.zig");
 const chat_types = @import("chat_types.zig");
 const herdr_types = @import("herdr_types.zig");

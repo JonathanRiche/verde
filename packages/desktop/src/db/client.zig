@@ -6,7 +6,7 @@ const zqlite = @import("zqlite");
 
 const schema = @import("schema.zig");
 const db_types = @import("types.zig");
-const provider_types = @import("../provider_types.zig");
+const provider_types = @import("../providers/types.zig");
 
 const LoadedState = db_types.LoadedState;
 const PersistedChatCompletion = db_types.PersistedChatCompletion;

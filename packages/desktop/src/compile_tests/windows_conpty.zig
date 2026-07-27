@@ -1,5 +1,5 @@
-const windows_conpty = @import("terminal/platform/windows_conpty.zig");
-const sessionizer = @import("terminal/sessionizer.zig");
+const windows_conpty = @import("../terminal/platform/windows_conpty.zig");
+const sessionizer = @import("../terminal/sessionizer.zig");
 const builtin = @import("builtin");
 const std = @import("std");
 

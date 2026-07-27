@@ -4,11 +4,11 @@ const app_state = @import("../state.zig");
 const browser_runtime = @import("../browser/mod.zig");
 const browser_ui = @import("../ui/browser.zig");
 const command_palette = @import("../ui/command_palette.zig");
-const herdr = @import("../herdr.zig");
+const herdr = @import("../workspace/herdr.zig");
 const platform_ipc = @import("../platform/ipc.zig");
 const live_endpoint = @import("../platform/live_endpoint.zig");
 const platform_runtime = @import("platform_runtime");
-const provider_types = @import("../provider_types.zig");
+const provider_types = @import("../providers/types.zig");
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const SOCKET_NAME = live_endpoint.SOCKET_NAME;

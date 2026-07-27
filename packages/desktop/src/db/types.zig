@@ -1,7 +1,7 @@
 //! Shared storage types for SQLite-backed app persistence.
 
 const std = @import("std");
-const ai_harness = @import("../harness.zig");
+const ai_harness = @import("../providers/harness.zig");
 
 pub const ReasoningEffort = ai_harness.ReasoningEffort;
 

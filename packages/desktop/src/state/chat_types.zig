@@ -1,13 +1,13 @@
 //! Chat transcript, attachment, background-task, and send-state ownership.
 
 const std = @import("std");
-const ai_harness = @import("../harness.zig");
+const ai_harness = @import("../providers/harness.zig");
 const chat_threads = @import("../chat/threads.zig");
 const chat_markdown = @import("../ui/chat_markdown.zig");
 const platform_paths = @import("platform_paths");
 const platform_process = @import("../platform/process.zig");
 const platform_runtime = @import("platform_runtime");
-const runtime_log = @import("../runtime_log.zig");
+const runtime_log = @import("../runtime/log.zig");
 const provider_models = @import("provider_models.zig");
 const state_sync = @import("sync.zig");
 

@@ -1,12 +1,12 @@
 //! Shared AI harness interface for native provider integrations.
 
 const std = @import("std");
-pub const types = @import("provider_types.zig");
-const opencode = @import("providers/opencode.zig");
-const codex = @import("providers/codex.zig");
-const claude = @import("providers/claude.zig");
-const cursor = @import("providers/cursor.zig");
-const runtime_log = @import("runtime_log.zig");
+pub const types = @import("types.zig");
+const opencode = @import("opencode.zig");
+const codex = @import("codex.zig");
+const claude = @import("claude.zig");
+const cursor = @import("cursor.zig");
+const runtime_log = @import("../runtime/log.zig");
 
 pub const Provider = types.Provider;
 pub const ProviderSlashCommandId = types.ProviderSlashCommandId;

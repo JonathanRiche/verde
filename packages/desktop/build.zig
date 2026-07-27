@@ -109,7 +109,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const loop_wakeup_module = b.createModule(.{
-        .root_source_file = b.path("src/loop_wakeup.zig"),
+        .root_source_file = b.path("src/runtime/loop_wakeup.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{

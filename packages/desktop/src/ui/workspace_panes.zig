@@ -13,7 +13,7 @@ const runtime = @import("runtime.zig");
 const browser_panel = @import("browser.zig");
 const chat_panel = @import("chat_panel.zig");
 const colors = @import("colors.zig");
-const profiler = @import("../profiler.zig");
+const profiler = @import("../runtime/profiler.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const theme = @import("theme.zig");
 

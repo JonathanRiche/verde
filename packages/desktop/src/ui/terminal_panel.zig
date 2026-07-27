@@ -9,7 +9,7 @@ const app_state = @import("../state.zig");
 const colors = @import("colors.zig");
 const theme = @import("theme.zig");
 const terminal = @import("../terminal/terminal.zig");
-const runtime_log = @import("../runtime_log.zig");
+const runtime_log = @import("../runtime/log.zig");
 
 const log = std.log.scoped(.terminal_panel);
 

@@ -2,13 +2,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const sdl = @import("zsdl3");
 const ghostty_vt = @import("../vendor/ghostty_vt.zig");
-const keybinds = @import("../keybinds.zig");
-const process_env = @import("../process_env.zig");
+const keybinds = @import("../app/keybinds.zig");
+const process_env = @import("../platform/env.zig");
 const platform_runtime = @import("platform_runtime");
 pub const sessionizer = @import("sessionizer.zig");
-const stb_image = @import("../stb_image.zig");
+const stb_image = @import("../media/stb_image.zig");
 const theme = @import("../ui/theme.zig");
-const runtime_log = @import("../runtime_log.zig");
+const runtime_log = @import("../runtime/log.zig");
 
 const log = std.log.scoped(.native_terminal);
 

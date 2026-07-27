@@ -4,7 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const platform_paths = @import("platform_paths");
-const process_env = @import("process_env.zig");
+const process_env = @import("../platform/env.zig");
 
 pub const PENDING_DIR_NAME = "herdr";
 pub const PENDING_OPEN_FILE_NAME = "pending-open.json";

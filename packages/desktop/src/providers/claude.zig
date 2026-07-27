@@ -5,9 +5,9 @@ const builtin = @import("builtin");
 const provider_diagnostics = @import("diagnostics.zig");
 const platform_process = @import("../platform/process.zig");
 const platform_runtime = @import("platform_runtime");
-const process_env = @import("../process_env.zig");
-const provider_types = @import("../provider_types.zig");
-const runtime_log = @import("../runtime_log.zig");
+const process_env = @import("../platform/env.zig");
+const provider_types = @import("types.zig");
+const runtime_log = @import("../runtime/log.zig");
 
 const MAX_BRIDGE_LINE_BYTES = 8 * 1024 * 1024;
 
