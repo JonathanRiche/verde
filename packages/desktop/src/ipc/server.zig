@@ -229,12 +229,12 @@ fn statusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state:
     try s.objectField("pid");
     try s.write(platform_runtime.processId());
     try s.objectField("workspace_count");
-    try s.write(state.projects.items.len);
+    try s.write(state.project_controller.projects.items.len);
     try s.objectField("selected_workspace_index");
-    try s.write(state.selected_project_index);
+    try s.write(state.project_controller.selected_index);
     try s.objectField("focused_pane_id");
-    if (state.projects.items.len > 0) {
-        if (state.projects.items[state.selected_project_index].workspace_layout.focused_pane_id) |pane_id| try s.write(pane_id) else try s.write(null);
+    if (state.project_controller.projects.items.len > 0) {
+        if (state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.focused_pane_id) |pane_id| try s.write(pane_id) else try s.write(null);
     } else {
         try s.write(null);
     }
@@ -262,11 +262,11 @@ fn writeFocusStatus(s: *std.json.Stringify, state: *app_state.AppState) !void {
     try s.objectField("native_browser_surface_focused");
     try s.write(state.isNativeBrowserSurfaceFocused());
     try s.objectField("browser_address_focused");
-    try s.write(state.browser_address_focused);
+    try s.write(state.browser_controller.address_focused);
     try s.objectField("composer_focused");
-    try s.write(state.composer_focused);
+    try s.write(state.composer_controller.focused);
     try s.objectField("terminal_focused");
-    try s.write(state.terminal_focused);
+    try s.write(state.terminal_controller.focused);
     try s.objectField("palette_modal_text_focus");
     try s.write(state.paletteModalTextFocusName());
     try s.endObject();
@@ -310,13 +310,13 @@ fn writeBrowserStatus(s: *std.json.Stringify, state: *app_state.AppState) !void 
     try s.objectField("workspace_index");
     if (location) |loc| try s.write(loc.index) else try s.write(null);
     try s.objectField("workspace_id");
-    if (location) |loc| try s.write(state.projects.items[loc.index].id) else try s.write(null);
+    if (location) |loc| try s.write(state.project_controller.projects.items[loc.index].id) else try s.write(null);
     try s.objectField("pane_id");
     if (location) |loc| try s.write(loc.pane_id) else try s.write(null);
     try s.objectField("pane_focused");
     try s.write(state.isBrowserPaneFocused());
     try s.objectField("address_focused");
-    try s.write(state.browser_address_focused);
+    try s.write(state.browser_controller.address_focused);
     try s.objectField("url");
     if (browser.current_url) |url| try s.write(url) else try s.write(null);
     try s.objectField("address");
@@ -421,10 +421,10 @@ fn workspacesResponse(allocator: std.mem.Allocator, id_value: std.json.Value, st
     try s.objectField("result");
     try s.beginObject();
     try s.objectField("selected_workspace_index");
-    try s.write(state.selected_project_index);
+    try s.write(state.project_controller.selected_index);
     try s.objectField("workspaces");
     try s.beginArray();
-    for (state.projects.items, 0..) |project, index| {
+    for (state.project_controller.projects.items, 0..) |project, index| {
         try s.beginObject();
         try s.objectField("index");
         try s.write(index);
@@ -445,7 +445,7 @@ fn workspacesResponse(allocator: std.mem.Allocator, id_value: std.json.Value, st
     try s.endArray();
     try s.objectField("closed_workspaces");
     try s.beginArray();
-    for (state.archived_projects.items, 0..) |project, index| {
+    for (state.project_controller.archived_projects.items, 0..) |project, index| {
         try s.beginObject();
         try s.objectField("index");
         try s.write(index);
@@ -487,10 +487,10 @@ fn panesResponseForProject(allocator: std.mem.Allocator, id_value: std.json.Valu
 }
 
 fn activeResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState) ![]u8 {
-    if (state.projects.items.len == 0) return try errorResponseAlloc(allocator, id_value, "not_found", "no workspaces");
-    const project = &state.projects.items[state.selected_project_index];
+    if (state.project_controller.projects.items.len == 0) return try errorResponseAlloc(allocator, id_value, "not_found", "no workspaces");
+    const project = &state.project_controller.projects.items[state.project_controller.selected_index];
     return try okValueResponse(allocator, id_value, .{
-        .workspace_index = state.selected_project_index,
+        .workspace_index = state.project_controller.selected_index,
         .workspace_id = project.id,
         .focused_pane_id = project.workspace_layout.focused_pane_id,
         .maximized_pane_id = project.workspace_layout.maximized_pane_id,
@@ -500,7 +500,7 @@ fn activeResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state:
 fn threadsResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
     const project_index = resolveProjectIndex(state, params) orelse
         return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
-    const project = &state.projects.items[project_index];
+    const project = &state.project_controller.projects.items[project_index];
 
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -605,10 +605,10 @@ fn herdrStatusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
     try s.objectField("result");
     try s.beginObject();
     try s.objectField("workspace_count");
-    try s.write(state.projects.items.len);
+    try s.write(state.project_controller.projects.items.len);
     try s.objectField("links");
     try s.beginArray();
-    for (state.projects.items, 0..) |*project, index| {
+    for (state.project_controller.projects.items, 0..) |*project, index| {
         const link = project.herdr_link orelse continue;
         try writeHerdrStatusLink(&s, state, project, index, link);
     }
@@ -704,7 +704,7 @@ fn surfacesResponse(allocator: std.mem.Allocator, id_value: std.json.Value, stat
     try s.beginObject();
     try s.objectField("surfaces");
     try s.beginArray();
-    for (state.surfaces.items) |*surface| try writeSurface(&s, surface);
+    for (state.surface_controller.surfaces.items) |*surface| try writeSurface(&s, surface);
     try s.endArray();
     try s.endObject();
     try s.endObject();
@@ -737,7 +737,7 @@ fn surfaceFocusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, 
     const pane_id = surface.pane_id orelse return try errorResponseAlloc(allocator, id_value, "not_found", "surface has no pane");
     const project_index = resolveSurfaceProjectIndex(state, surface) orelse
         return try errorResponseAlloc(allocator, id_value, "not_found", "surface workspace not found");
-    state.selected_project_index = project_index;
+    state.project_controller.selected_index = project_index;
     const changed = state.focusCurrentProjectWorkspacePane(pane_id);
     _ = state.clearSurfaceAttentionBySession(session_id);
     return try okValueResponse(allocator, id_value, .{ .session_id = session_id, .workspace_index = project_index, .pane_id = pane_id, .focused = changed });
@@ -1034,7 +1034,7 @@ fn chatOpenResponse(allocator: std.mem.Allocator, id_value: std.json.Value, stat
         error.UnsupportedFastMode => return try errorResponseAlloc(allocator, id_value, "unsupported_combination", "fast_mode is not supported by the requested provider and model"),
         else => return try errorResponseAlloc(allocator, id_value, "internal_error", @errorName(err)),
     };
-    const project = &state.projects.items[project_index];
+    const project = &state.project_controller.projects.items[project_index];
     const thread = &project.threads.items[result.thread_index];
     return try chatOpenResultResponse(
         allocator,
@@ -1077,7 +1077,7 @@ fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
         return try okValueResponse(allocator, id_value, .{
             .accepted = true,
             .workspace_index = result.workspace_index,
-            .workspace_id = state.projects.items[result.workspace_index].id,
+            .workspace_id = state.project_controller.projects.items[result.workspace_index].id,
             .pane_id = result.pane_id,
             .moved_from_workspace = result.moved_from_workspace,
             .url = state.browserStateConst().current_url,
@@ -1488,12 +1488,26 @@ fn agentCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, 
     const project_index = resolveProjectIndex(state, params) orelse return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
     if (std.mem.eql(u8, command, "open")) {
         const provider_name = stringParam(params, "provider") orelse "codex";
-        if (!std.mem.eql(u8, provider_name, "codex")) {
-            return try errorResponseAlloc(allocator, id_value, "unsupported_provider", "agent.open currently supports --provider codex");
+        const provider: app_state.AgentTuiProvider = if (std.mem.eql(u8, provider_name, "codex"))
+            .codex
+        else if (std.mem.eql(u8, provider_name, "claude"))
+            .claude
+        else if (std.mem.eql(u8, provider_name, "opencode"))
+            .opencode
+        else if (std.mem.eql(u8, provider_name, "cursor"))
+            .cursor
+        else if (std.mem.eql(u8, provider_name, "grok"))
+            .grok
+        else
+            return try errorResponseAlloc(allocator, id_value, "unsupported_provider", "agent.open provider must be one of: codex, claude, opencode, cursor, grok");
+        const changed = try state.openAgentTui(project_index, provider);
+        if (!changed) {
+            if (provider == .grok and !app_state.AppState.grokTuiInstalled()) {
+                return try errorResponseAlloc(allocator, id_value, "provider_not_installed", "Grok Build is not installed; see https://docs.x.ai/build/overview#install");
+            }
+            return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
         }
-        const changed = try state.openAgentTui(project_index, .codex);
-        if (!changed) return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
-        return try managedProcessResponse(allocator, id_value, state, project_index, "codex");
+        return try managedProcessResponse(allocator, id_value, state, project_index, @tagName(provider));
     }
     return try errorResponseAlloc(allocator, id_value, "method_not_found", command);
 }
@@ -1527,7 +1541,7 @@ const PaneTarget = struct {
 
 fn resolvePaneTarget(state: *app_state.AppState, params: std.json.Value) ?PaneTarget {
     const project_index = resolveProjectIndex(state, params) orelse return null;
-    const project = &state.projects.items[project_index];
+    const project = &state.project_controller.projects.items[project_index];
     if (boolParam(params, "focused") orelse false) {
         const pane_id = project.workspace_layout.focused_pane_id orelse return null;
         return .{ .project_index = project_index, .pane_id = pane_id };
@@ -1539,31 +1553,31 @@ fn resolvePaneTarget(state: *app_state.AppState, params: std.json.Value) ?PaneTa
 }
 
 fn resolveProjectIndex(state: *app_state.AppState, params: std.json.Value) ?usize {
-    if (state.projects.items.len == 0) return null;
+    if (state.project_controller.projects.items.len == 0) return null;
     if (params == .object) {
         if (jsonString(params.object.get("workspace_id") orelse params.object.get("workspace") orelse params.object.get("project") orelse .null)) |project_ref| {
-            if (std.mem.eql(u8, project_ref, "current")) return state.selected_project_index;
+            if (std.mem.eql(u8, project_ref, "current")) return state.project_controller.selected_index;
             if (std.fmt.parseInt(usize, project_ref, 10)) |index| {
-                if (index < state.projects.items.len) return index;
+                if (index < state.project_controller.projects.items.len) return index;
             } else |_| {}
-            for (state.projects.items, 0..) |project, index| {
+            for (state.project_controller.projects.items, 0..) |project, index| {
                 if (std.mem.eql(u8, project.id, project_ref) or std.mem.eql(u8, project.path, project_ref)) return index;
             }
             return null;
         }
     }
-    return state.selected_project_index;
+    return state.project_controller.selected_index;
 }
 
 fn browserCommandProjectIndex(state: *app_state.AppState, params: std.json.Value) ?usize {
-    if (state.projects.items.len == 0) return null;
+    if (state.project_controller.projects.items.len == 0) return null;
     const explicit_project_index = if (browserCommandHasProjectRef(params))
         resolveProjectIndex(state, params) orelse return null
     else
         null;
     return chooseBrowserCommandProjectIndex(
         state.browserWorkspaceIndex(),
-        state.selected_project_index,
+        state.project_controller.selected_index,
         explicit_project_index,
     );
 }
@@ -1582,20 +1596,20 @@ fn browserCommandHasProjectRef(params: std.json.Value) bool {
 }
 
 fn resolveClosedProjectIndex(state: *app_state.AppState, params: std.json.Value) ?usize {
-    if (state.archived_projects.items.len == 0) return null;
+    if (state.project_controller.archived_projects.items.len == 0) return null;
     if (params == .object) {
         if (jsonString(params.object.get("workspace") orelse params.object.get("project") orelse .null)) |project_ref| {
-            if (std.mem.eql(u8, project_ref, "last") or std.mem.eql(u8, project_ref, "current")) return state.archived_projects.items.len - 1;
+            if (std.mem.eql(u8, project_ref, "last") or std.mem.eql(u8, project_ref, "current")) return state.project_controller.archived_projects.items.len - 1;
             if (std.fmt.parseInt(usize, project_ref, 10)) |index| {
-                if (index < state.archived_projects.items.len) return index;
+                if (index < state.project_controller.archived_projects.items.len) return index;
             } else |_| {}
-            for (state.archived_projects.items, 0..) |project, index| {
+            for (state.project_controller.archived_projects.items, 0..) |project, index| {
                 if (std.mem.eql(u8, project.id, project_ref) or std.mem.eql(u8, project.path, project_ref) or std.mem.eql(u8, project.label, project_ref)) return index;
             }
             return null;
         }
     }
-    return state.archived_projects.items.len - 1;
+    return state.project_controller.archived_projects.items.len - 1;
 }
 
 fn resolveProjectIndexNullable(state: *app_state.AppState, params: std.json.Value) ?usize {
@@ -1608,25 +1622,25 @@ fn resolveProjectIndexNullable(state: *app_state.AppState, params: std.json.Valu
 }
 
 fn targetIsChat(state: *app_state.AppState, target: PaneTarget) bool {
-    const pane = state.projects.items[target.project_index].workspace_layout.paneById(target.pane_id) orelse return false;
+    const pane = state.project_controller.projects.items[target.project_index].workspace_layout.paneById(target.pane_id) orelse return false;
     return pane.ref == .chat;
 }
 
 fn targetIsTerminal(state: *app_state.AppState, target: PaneTarget) bool {
-    const pane = state.projects.items[target.project_index].workspace_layout.paneById(target.pane_id) orelse return false;
+    const pane = state.project_controller.projects.items[target.project_index].workspace_layout.paneById(target.pane_id) orelse return false;
     return pane.ref == .terminal;
 }
 
 fn writeSelectedProjectPanes(s: *std.json.Stringify, state: *app_state.AppState) !void {
-    if (state.projects.items.len == 0) {
+    if (state.project_controller.projects.items.len == 0) {
         try s.write(null);
         return;
     }
-    try writeProjectPanes(s, state, state.selected_project_index);
+    try writeProjectPanes(s, state, state.project_controller.selected_index);
 }
 
 fn writeProjectPanes(s: *std.json.Stringify, state: *app_state.AppState, project_index: usize) !void {
-    const project = &state.projects.items[project_index];
+    const project = &state.project_controller.projects.items[project_index];
     try s.beginObject();
     try s.objectField("workspace_index");
     try s.write(project_index);
@@ -1646,7 +1660,7 @@ fn writeProjectPanes(s: *std.json.Stringify, state: *app_state.AppState, project
 }
 
 fn writePane(s: *std.json.Stringify, state: *app_state.AppState, project_index: usize, pane: app_state.WorkspacePane) !void {
-    const project = &state.projects.items[project_index];
+    const project = &state.project_controller.projects.items[project_index];
     try s.beginObject();
     try s.objectField("pane_id");
     try s.write(pane.id);
@@ -1758,7 +1772,7 @@ fn writeThreadCreationSettings(s: *std.json.Stringify, thread: app_state.ChatThr
 
 fn writeTerminalsArray(s: *std.json.Stringify, state: *app_state.AppState, maybe_project_index: ?usize) !void {
     try s.beginArray();
-    for (state.projects.items, 0..) |project, project_index| {
+    for (state.project_controller.projects.items, 0..) |project, project_index| {
         if (maybe_project_index) |wanted| {
             if (wanted != project_index) continue;
         }
@@ -1809,12 +1823,12 @@ fn writeTerminalsArray(s: *std.json.Stringify, state: *app_state.AppState, maybe
 fn workspaceProcessesResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
     const project_index = resolveProjectIndexNullable(state, params);
     if (project_index) |index| {
-        if (index >= state.projects.items.len) return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+        if (index >= state.project_controller.projects.items.len) return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
         if (try refreshStackConfigOrError(allocator, id_value, state, index)) |response| return response;
         state.pruneExpiredWorkspaceLeases(index);
     } else {
         var index: usize = 0;
-        while (index < state.projects.items.len) : (index += 1) {
+        while (index < state.project_controller.projects.items.len) : (index += 1) {
             if (try refreshStackConfigOrError(allocator, id_value, state, index)) |response| return response;
             state.pruneExpiredWorkspaceLeases(index);
         }
@@ -1839,7 +1853,7 @@ fn workspaceProcessesResponse(allocator: std.mem.Allocator, id_value: std.json.V
 
 fn writeWorkspaceProcessesArray(s: *std.json.Stringify, state: *app_state.AppState, maybe_project_index: ?usize) !void {
     try s.beginArray();
-    for (state.projects.items, 0..) |*project, project_index| {
+    for (state.project_controller.projects.items, 0..) |*project, project_index| {
         if (maybe_project_index) |wanted| if (wanted != project_index) continue;
         state.refreshManagedProcessStatuses(project_index);
         for (project.managed_processes.items) |*process| try writeManagedProcess(s, state, project_index, process);
@@ -1882,7 +1896,7 @@ fn writeTerminalWorkspaceProcess(
     const identity = snapshot.process_group orelse snapshot.pid orelse 0;
     const process_id = try std.fmt.allocPrint(state.allocator, "term:{s}:{d}", .{ session_id, identity });
     defer state.allocator.free(process_id);
-    const project = &state.projects.items[project_index];
+    const project = &state.project_controller.projects.items[project_index];
     const surface = state.surfaceBySessionIdConst(session_id);
 
     try s.beginObject();
@@ -2096,7 +2110,7 @@ fn writeWorkspaceResources(s: *std.json.Stringify, explicit: anytype, command: [
 
 fn writeWorkspaceLeasesArray(s: *std.json.Stringify, state: *app_state.AppState, maybe_project_index: ?usize) !void {
     try s.beginArray();
-    for (state.projects.items, 0..) |*project, project_index| {
+    for (state.project_controller.projects.items, 0..) |*project, project_index| {
         if (maybe_project_index) |wanted| if (wanted != project_index) continue;
         for (project.workspace_leases.items) |*lease| {
             try s.beginObject();
@@ -2187,7 +2201,7 @@ fn workspaceCheckCommandResponse(
     try s.objectField("workspace_index");
     try s.write(project_index);
     try s.objectField("workspace_id");
-    try s.write(state.projects.items[project_index].id);
+    try s.write(state.project_controller.projects.items[project_index].id);
     try s.objectField("command");
     try s.write(command);
     try s.objectField("classification");
@@ -2246,7 +2260,7 @@ fn workspaceAcquireLeaseResponse(allocator: std.mem.Allocator, id_value: std.jso
         .acquired = true,
         .forced = force,
         .workspace_index = project_index,
-        .workspace_id = state.projects.items[project_index].id,
+        .workspace_id = state.project_controller.projects.items[project_index].id,
         .lease_id = lease.id,
         .owner = lease.owner,
         .command = lease.command,
@@ -2266,7 +2280,7 @@ fn workspaceReleaseLeaseResponse(allocator: std.mem.Allocator, id_value: std.jso
     return try okValueResponse(allocator, id_value, .{
         .released = released,
         .workspace_index = project_index,
-        .workspace_id = state.projects.items[project_index].id,
+        .workspace_id = state.project_controller.projects.items[project_index].id,
         .lease_id = lease_id,
         .owner = owner,
     });
@@ -2280,7 +2294,7 @@ fn writeWorkspaceConflicts(
     request_resources: []const []const u8,
 ) !usize {
     var count: usize = 0;
-    const project = &state.projects.items[project_index];
+    const project = &state.project_controller.projects.items[project_index];
     try s.beginArray();
     for (project.managed_processes.items) |*process| {
         if (!managedProcessStatusActive(process.status)) continue;
@@ -2409,7 +2423,7 @@ fn writeTerminalWorkspaceConflict(
         .owner = session_id,
         .owner_kind = if (state.surfaceBySessionIdConst(session_id) != null) "agent" else "terminal",
         .session_id = session_id,
-        .pane_id = workspacePaneIdForDock(&state.projects.items[project_index], dock_id),
+        .pane_id = workspacePaneIdForDock(&state.project_controller.projects.items[project_index], dock_id),
         .command = command,
         .status = "running",
         .started_at_ms = snapshot.started_at_ms,
@@ -2473,8 +2487,8 @@ fn firstWorkspaceResourceOverlap(left: anytype, right: anytype) ?[]const u8 {
 }
 
 fn workspaceProcessConflictCount(state: *app_state.AppState, project_index: usize, owner: []const u8, resources: []const []const u8) usize {
-    if (project_index >= state.projects.items.len) return 0;
-    const project = &state.projects.items[project_index];
+    if (project_index >= state.project_controller.projects.items.len) return 0;
+    const project = &state.project_controller.projects.items[project_index];
     var count: usize = 0;
     for (project.managed_processes.items) |*process| {
         if (!managedProcessStatusActive(process.status)) continue;
@@ -2523,8 +2537,8 @@ fn notifyForcedWorkspaceConflictOwners(
     command: []const u8,
     resources: []const []const u8,
 ) void {
-    if (project_index >= state.projects.items.len) return;
-    const project = &state.projects.items[project_index];
+    if (project_index >= state.project_controller.projects.items.len) return;
+    const project = &state.project_controller.projects.items[project_index];
     for (project.terminal_docks.items) |*entry| {
         notifyForcedWorkspaceDockOwner(state, &entry.dock, request_owner, command, resources);
     }
@@ -2553,11 +2567,11 @@ fn notifyForcedWorkspaceDockOwner(
 fn managedProcessesResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
     const project_index = resolveProjectIndexNullable(state, params);
     if (project_index) |index| {
-        if (index >= state.projects.items.len) return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+        if (index >= state.project_controller.projects.items.len) return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
         if (try refreshStackConfigOrError(allocator, id_value, state, index)) |response| return response;
     } else {
         var index: usize = 0;
-        while (index < state.projects.items.len) : (index += 1) {
+        while (index < state.project_controller.projects.items.len) : (index += 1) {
             if (try refreshStackConfigOrError(allocator, id_value, state, index)) |response| return response;
         }
     }
@@ -2576,7 +2590,7 @@ fn managedProcessesResponse(allocator: std.mem.Allocator, id_value: std.json.Val
 }
 
 fn managedProcessesResponseForProject(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, project_index: usize) ![]u8 {
-    if (project_index >= state.projects.items.len) return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+    if (project_index >= state.project_controller.projects.items.len) return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
     state.refreshManagedProcessStatuses(project_index);
 
     var writer: std.Io.Writer.Allocating = .init(allocator);
@@ -2588,9 +2602,9 @@ fn managedProcessesResponseForProject(allocator: std.mem.Allocator, id_value: st
     try s.objectField("workspace_index");
     try s.write(project_index);
     try s.objectField("workspace_id");
-    try s.write(state.projects.items[project_index].id);
+    try s.write(state.project_controller.projects.items[project_index].id);
     try s.objectField("stack_config_error");
-    if (state.projects.items[project_index].stack_config_error) |message| try s.write(message) else try s.write(null);
+    if (state.project_controller.projects.items[project_index].stack_config_error) |message| try s.write(message) else try s.write(null);
     try s.objectField("processes");
     try writeManagedProcessesArray(&s, state, project_index);
     try s.endObject();
@@ -2599,9 +2613,9 @@ fn managedProcessesResponseForProject(allocator: std.mem.Allocator, id_value: st
 }
 
 fn managedProcessResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, project_index: usize, name: []const u8) ![]u8 {
-    if (project_index >= state.projects.items.len) return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+    if (project_index >= state.project_controller.projects.items.len) return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
     state.refreshManagedProcessStatuses(project_index);
-    const project = &state.projects.items[project_index];
+    const project = &state.project_controller.projects.items[project_index];
     const process = project.managedProcessByName(name) orelse
         return try errorResponseAlloc(allocator, id_value, "not_found", "process not found");
 
@@ -2617,7 +2631,7 @@ fn managedProcessResponse(allocator: std.mem.Allocator, id_value: std.json.Value
 
 fn writeManagedProcessesArray(s: *std.json.Stringify, state: *app_state.AppState, maybe_project_index: ?usize) !void {
     try s.beginArray();
-    for (state.projects.items, 0..) |*project, project_index| {
+    for (state.project_controller.projects.items, 0..) |*project, project_index| {
         if (maybe_project_index) |wanted| {
             if (wanted != project_index) continue;
         }
@@ -2631,7 +2645,7 @@ fn writeManagedProcessesArray(s: *std.json.Stringify, state: *app_state.AppState
 }
 
 fn writeManagedProcess(s: *std.json.Stringify, state: *app_state.AppState, project_index: usize, process: *const app_state.ManagedProcess) !void {
-    const project = &state.projects.items[project_index];
+    const project = &state.project_controller.projects.items[project_index];
     const process_id = try std.fmt.allocPrint(state.allocator, "proc:{s}:{s}", .{ project.id, process.name });
     defer state.allocator.free(process_id);
     const dock = if (process.dock_id) |dock_id| state.projectTerminalDock(project_index, dock_id) else null;
@@ -2756,8 +2770,8 @@ fn refreshStackConfigOrError(allocator: std.mem.Allocator, id_value: std.json.Va
 }
 
 fn stackConfigErrorMessage(state: *app_state.AppState, project_index: usize, err: anyerror) []const u8 {
-    if (project_index < state.projects.items.len) {
-        if (state.projects.items[project_index].stack_config_error) |message| return message;
+    if (project_index < state.project_controller.projects.items.len) {
+        if (state.project_controller.projects.items[project_index].stack_config_error) |message| return message;
     }
     return @errorName(err);
 }
@@ -2845,7 +2859,7 @@ fn surfaceResultResponse(allocator: std.mem.Allocator, id_value: std.json.Value,
 }
 
 fn resolveSurfaceProjectIndex(state: *const app_state.AppState, surface: *const app_state.SurfaceState) ?usize {
-    for (state.projects.items, 0..) |project, index| {
+    for (state.project_controller.projects.items, 0..) |project, index| {
         if (surface.workspace_id.len > 0 and std.mem.eql(u8, surface.workspace_id, project.id)) return index;
         if (surface.workspace_path.len > 0 and std.mem.eql(u8, surface.workspace_path, project.path)) return index;
     }
@@ -2853,7 +2867,7 @@ fn resolveSurfaceProjectIndex(state: *const app_state.AppState, surface: *const 
 }
 
 fn chatStatusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, project_index: usize, pane_id: app_state.WorkspacePaneId) ![]u8 {
-    const project = &state.projects.items[project_index];
+    const project = &state.project_controller.projects.items[project_index];
     const pane = project.workspace_layout.paneById(pane_id) orelse return try errorResponseAlloc(allocator, id_value, "not_found", "pane not found");
     const ref = switch (pane.ref) {
         .chat => |chat_ref| chat_ref,
@@ -2921,7 +2935,7 @@ fn chatOpenResultResponse(
 }
 
 fn chatTranscriptResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, project_index: usize, pane_id: app_state.WorkspacePaneId) ![]u8 {
-    const project = &state.projects.items[project_index];
+    const project = &state.project_controller.projects.items[project_index];
     const pane = project.workspace_layout.paneById(pane_id) orelse return try errorResponseAlloc(allocator, id_value, "not_found", "pane not found");
     const ref = switch (pane.ref) {
         .chat => |chat_ref| chat_ref,
@@ -2987,7 +3001,7 @@ fn transcriptFitsLiveResponse(messages: []const app_state.ChatMessage, max_bytes
 }
 
 fn inspectPaneResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, project_index: usize, pane_id: app_state.WorkspacePaneId) ![]u8 {
-    const project = &state.projects.items[project_index];
+    const project = &state.project_controller.projects.items[project_index];
     const pane = project.workspace_layout.paneById(pane_id) orelse return try errorResponseAlloc(allocator, id_value, "not_found", "pane not found");
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();

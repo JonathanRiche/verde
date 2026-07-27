@@ -21,9 +21,9 @@ pub fn render(state: *AppState) void {
 fn renderModelPicker(state: *AppState) void {
     // Syncing rebuilds the entry list; skip the work entirely while closed
     // (openPaletteModelPicker syncs before opening).
-    if (!state.palette_model_picker.isOpen()) return;
+    if (!state.composer_controller.model_picker.isOpen()) return;
     state.syncPaletteModelPicker();
-    state.palette_model_picker.render(state.allocator, &state.palette_overlay_batch) catch |err| {
+    state.composer_controller.model_picker.render(state.allocator, &state.palette_overlay_batch) catch |err| {
         log.warn("failed to render composer model picker: {s}", .{@errorName(err)});
     };
 }
@@ -43,7 +43,7 @@ fn runConfigRowTitle(layout: AppState.RunConfigLayout, index: usize) []const u8 
 // Renders the run-configuration popover above the composer run pill: a panel
 // of stepped controls consolidating reasoning effort, speed, and access.
 fn renderRunConfigPopover(state: *AppState) void {
-    if (!state.run_config_open) return;
+    if (!state.composer_controller.run_config_open) return;
     state.syncRunConfigSteppers();
     state.tickRunConfigSteppers();
     const layout = state.layoutRunConfigPopover();
@@ -68,7 +68,7 @@ fn renderRunConfigPopover(state: *AppState) void {
     var index: usize = 0;
     while (index < layout.row_count) : (index += 1) {
         const title_rect = layout.title_rects[index];
-        const focused = index == state.run_config_focused_row;
+        const focused = index == state.composer_controller.run_config_focused_row;
         // The focused row title brightens so keyboard users can tell which
         // stepper left/right arrows will adjust.
         const title_color = if (focused) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
@@ -84,7 +84,7 @@ fn renderRunConfigPopover(state: *AppState) void {
             null,
             layout.panel,
         ) catch {};
-        const stepper = &state.run_steppers[@intFromEnum(layout.row_kinds[index])];
+        const stepper = &state.composer_controller.run_steppers[@intFromEnum(layout.row_kinds[index])];
         stepper.render(state.allocator, batch) catch |err| {
             log.warn("failed to render run config stepper: {s}", .{@errorName(err)});
         };

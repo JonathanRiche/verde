@@ -120,6 +120,8 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "workspace.claude_tui", .title = "Start New Claude TUI", .keywords = "agent terminal workspace fresh anthropic claude code", .section = .workspaces, .run = runOpenClaudeTui, .enabled = hasProjects },
     .{ .id = "workspace.opencode_tui", .title = "Start New OpenCode TUI", .keywords = "agent terminal workspace fresh opencode", .section = .workspaces, .run = runOpenOpencodeTui, .enabled = hasProjects },
     .{ .id = "workspace.cursor_tui", .title = "Start New Cursor TUI", .keywords = "agent terminal workspace fresh cursor agent", .section = .workspaces, .run = runOpenCursorTui, .enabled = hasProjects },
+    .{ .id = "workspace.grok_tui", .title = "Start New Grok TUI", .keywords = "agent terminal workspace fresh xai grok build", .section = .workspaces, .run = runOpenGrokTui, .enabled = hasProjectsAndGrok },
+    .{ .id = "app.grok_setup", .title = "Set Up Grok Build", .keywords = "install xai agent provider tui", .section = .app, .run = runGrokSetup, .enabled = grokSetupNeeded },
     .{ .id = "workspace.amp_tui", .title = "Start New Amp TUI", .keywords = "agent terminal workspace fresh amp sourcegraph", .section = .workspaces, .run = runOpenAmpTui, .enabled = hasProjects },
     .{ .id = "workspace.herdr_handoff", .title = "Handoff Workspace to Herdr", .keywords = "runtime local terminal tui phone", .section = .workspaces, .run = runHerdrHandoffWorkspace, .enabled = hasProjects },
     .{ .id = "workspace.herdr_handoff_remote", .title = "Handoff Workspace to Remote Herdr", .keywords = "remote profile ssh tailscale runtime terminal tui phone", .section = .workspaces, .run = runHerdrRemoteHandoffWorkspace, .enabled = hasProjects },
@@ -392,8 +394,8 @@ pub fn activateRow(state: *runtime.AppState, row_index: usize, split: bool) void
         },
         .workspace => |pi| {
             state.closeCommandPalette();
-            if (pi < state.projects.items.len) {
-                state.selected_project_index = pi;
+            if (pi < state.project_controller.projects.items.len) {
+                state.project_controller.selected_index = pi;
                 state.ensureCurrentProjectWorkspace();
                 state.syncRenameBuffer();
                 state.markDirty();
@@ -583,7 +585,7 @@ fn rebuildResults(state: *runtime.AppState) void {
 fn buildSuggestions(state: *runtime.AppState) void {
     var recent: [8]struct { ref: ThreadRef, at: i64 } = undefined;
     var recent_count: usize = 0;
-    for (state.projects.items, 0..) |*project, pi| {
+    for (state.project_controller.projects.items, 0..) |*project, pi| {
         for (project.threads.items, 0..) |*thread, ti| {
             if (!thread.committed or thread.archived) continue;
             const at = thread.last_activity_at;
@@ -607,16 +609,16 @@ fn buildSuggestions(state: *runtime.AppState) void {
         if (!command.enabled(state)) continue;
         appendResult(.{ .command = ci });
     }
-    if (state.projects.items.len > 1) {
+    if (state.project_controller.projects.items.len > 1) {
         appendResult(.{ .header = "WORKSPACES" });
-        for (state.projects.items, 0..) |_, pi| {
-            if (pi == state.selected_project_index) continue;
+        for (state.project_controller.projects.items, 0..) |_, pi| {
+            if (pi == state.project_controller.selected_index) continue;
             appendResult(.{ .workspace = pi });
         }
     }
-    if (state.archived_projects.items.len > 0) {
+    if (state.project_controller.archived_projects.items.len > 0) {
         appendResult(.{ .header = "CLOSED WORKSPACES" });
-        var remaining = state.archived_projects.items.len;
+        var remaining = state.project_controller.archived_projects.items.len;
         while (remaining > 0) {
             remaining -= 1;
             appendResult(.{ .closed_workspace = remaining });
@@ -627,8 +629,8 @@ fn buildSuggestions(state: *runtime.AppState) void {
 /// Sidebar "History" scope: one workspace's agent TUIs and committed threads,
 /// recency bucketed when browsing and filtered when searching.
 fn buildScopedHistory(state: *runtime.AppState, project_index: usize, query: []const u8) void {
-    if (project_index >= state.projects.items.len) return;
-    const project = &state.projects.items[project_index];
+    if (project_index >= state.project_controller.projects.items.len) return;
+    const project = &state.project_controller.projects.items[project_index];
     var entries: [MAX_CANDIDATES]HistoryEntry = undefined;
     var entry_count: usize = 0;
 
@@ -699,10 +701,10 @@ fn buildRanked(state: *runtime.AppState, query: []const u8) void {
         }
     }
     const now = unixTimestampSeconds();
-    for (state.projects.items, 0..) |*project, pi| {
+    for (state.project_controller.projects.items, 0..) |*project, pi| {
         const label_score = fuzzyScore(project.label, query);
         if (label_score) |score| {
-            if (pi != state.selected_project_index) {
+            if (pi != state.project_controller.selected_index) {
                 appendCandidate(&candidates, &candidate_count, .{ .ref = .{ .workspace = pi }, .score = score + 25 });
             }
         }
@@ -730,7 +732,7 @@ fn buildRanked(state: *runtime.AppState, query: []const u8) void {
             });
         }
     }
-    for (state.archived_projects.items, 0..) |*project, ai| {
+    for (state.project_controller.archived_projects.items, 0..) |*project, ai| {
         const label_score = fuzzyScore(project.label, query);
         const path_score = fuzzyScore(project.path, query);
         const action_score = maxOptional(
@@ -798,6 +800,7 @@ fn agentTuiSearchLabel(provider: AgentProvider) []const u8 {
         .claude => "Claude TUI",
         .opencode => "OpenCode TUI",
         .cursor => "Cursor TUI",
+        .grok => "Grok TUI",
         .amp => "Amp TUI",
         .other => "Agent TUI",
     };
@@ -945,8 +948,8 @@ fn computeActionMenuLayout(state: *runtime.AppState) void {
             return;
         },
     };
-    if (tr.project >= state.projects.items.len) return;
-    const project = &state.projects.items[tr.project];
+    if (tr.project >= state.project_controller.projects.items.len) return;
+    const project = &state.project_controller.projects.items[tr.project];
     if (tr.thread >= project.threads.items.len) return;
     const thread = &project.threads.items[tr.thread];
     const pending = thread.isSendPendingForUi();
@@ -1021,12 +1024,12 @@ fn threadOpenPaneId(project: *const native_state.Project, thread_index: usize) ?
 /// Enter semantics for a thread result: focus its pane when already open,
 /// otherwise reuse a visible chat pane (replace). `split` forces a new pane.
 fn openThread(state: *runtime.AppState, tr: ThreadRef, split: bool) void {
-    if (tr.project >= state.projects.items.len) return;
+    if (tr.project >= state.project_controller.projects.items.len) return;
     if (split) {
         state.openThreadInWorkspaceSplit(tr.project, tr.thread);
         return;
     }
-    const project = &state.projects.items[tr.project];
+    const project = &state.project_controller.projects.items[tr.project];
     if (threadOpenPaneId(project, tr.thread)) |pane_id| {
         state.focusWorkspaceOpenPane(tr.project, pane_id);
         state.markDirty();
@@ -1048,7 +1051,15 @@ fn alwaysEnabled(_: *runtime.AppState) bool {
 }
 
 fn hasProjects(state: *runtime.AppState) bool {
-    return state.projects.items.len > 0;
+    return state.project_controller.projects.items.len > 0;
+}
+
+fn hasProjectsAndGrok(state: *runtime.AppState) bool {
+    return hasProjects(state) and native_state.AppState.grokTuiInstalled();
+}
+
+fn grokSetupNeeded(_: *runtime.AppState) bool {
+    return !native_state.AppState.grokTuiInstalled();
 }
 
 fn hasQuickPane(state: *runtime.AppState) bool {
@@ -1060,15 +1071,15 @@ fn hasFocusedGuiChat(state: *runtime.AppState) bool {
 }
 
 fn workspaceNotBusy(state: *runtime.AppState) bool {
-    if (state.selected_project_index >= state.projects.items.len) return false;
-    for (state.projects.items[state.selected_project_index].threads.items) |*thread| {
+    if (state.project_controller.selected_index >= state.project_controller.projects.items.len) return false;
+    for (state.project_controller.projects.items[state.project_controller.selected_index].threads.items) |*thread| {
         if (thread.isSendPendingForUi()) return false;
     }
     return true;
 }
 
 fn hasClosedWorkspaces(state: *runtime.AppState) bool {
-    return state.archived_projects.items.len > 0;
+    return state.project_controller.archived_projects.items.len > 0;
 }
 
 fn hasBrowserPane(state: *runtime.AppState) bool {
@@ -1088,27 +1099,27 @@ fn canMoveBrowserTabRight(state: *runtime.AppState) bool {
 }
 
 fn currentWorkspaceHerdrLinked(state: *runtime.AppState) bool {
-    return state.selected_project_index < state.projects.items.len and
-        state.projects.items[state.selected_project_index].herdr_link != null;
+    return state.project_controller.selected_index < state.project_controller.projects.items.len and
+        state.project_controller.projects.items[state.project_controller.selected_index].herdr_link != null;
 }
 
 fn currentWorkspaceHasHerdrAttachTerminal(state: *runtime.AppState) bool {
     if (!currentWorkspaceHerdrLinked(state)) return false;
-    const link = state.projects.items[state.selected_project_index].herdr_link.?;
+    const link = state.project_controller.projects.items[state.project_controller.selected_index].herdr_link.?;
     return link.attach_dock_id != null;
 }
 
 fn currentThreadNotPending(state: *runtime.AppState) bool {
-    if (state.selected_project_index >= state.projects.items.len) return false;
-    const project = &state.projects.items[state.selected_project_index];
+    if (state.project_controller.selected_index >= state.project_controller.projects.items.len) return false;
+    const project = &state.project_controller.projects.items[state.project_controller.selected_index];
     if (project.selected_thread_index >= project.threads.items.len) return false;
     const thread = &project.threads.items[project.selected_thread_index];
     return thread.committed and !thread.isSendPendingForUi();
 }
 
 fn currentThreadCommitted(state: *runtime.AppState) bool {
-    if (state.selected_project_index >= state.projects.items.len) return false;
-    const project = &state.projects.items[state.selected_project_index];
+    if (state.project_controller.selected_index >= state.project_controller.projects.items.len) return false;
+    const project = &state.project_controller.projects.items[state.project_controller.selected_index];
     if (project.selected_thread_index >= project.threads.items.len) return false;
     return project.threads.items[project.selected_thread_index].committed;
 }
@@ -1118,18 +1129,18 @@ fn canRegenerateChatTitle(state: *runtime.AppState) bool {
 }
 
 fn canSyncCurrentThread(state: *runtime.AppState) bool {
-    if (state.selected_project_index >= state.projects.items.len) return false;
+    if (state.project_controller.selected_index >= state.project_controller.projects.items.len) return false;
     const thread_index = focusedGuiThreadIndex(state) orelse return false;
-    const project = &state.projects.items[state.selected_project_index];
+    const project = &state.project_controller.projects.items[state.project_controller.selected_index];
     if (thread_index >= project.threads.items.len) return false;
     const thread = &project.threads.items[thread_index];
     return thread.provider_thread_id != null and !thread.isSendPendingForUi();
 }
 
 fn canOpenFocusedThreadInTui(state: *runtime.AppState) bool {
-    if (state.selected_project_index >= state.projects.items.len) return false;
+    if (state.project_controller.selected_index >= state.project_controller.projects.items.len) return false;
     const thread_index = focusedGuiThreadIndex(state) orelse return false;
-    const project = &state.projects.items[state.selected_project_index];
+    const project = &state.project_controller.projects.items[state.project_controller.selected_index];
     if (thread_index >= project.threads.items.len) return false;
     const thread = &project.threads.items[thread_index];
     return thread.provider_thread_id != null;
@@ -1145,8 +1156,8 @@ fn canOpenFocusedNonCodexThreadInTui(state: *runtime.AppState) bool {
 }
 
 fn canHandoffFocusedPane(state: *runtime.AppState) bool {
-    if (state.selected_project_index >= state.projects.items.len) return false;
-    const project = &state.projects.items[state.selected_project_index];
+    if (state.project_controller.selected_index >= state.project_controller.projects.items.len) return false;
+    const project = &state.project_controller.projects.items[state.project_controller.selected_index];
     const pane_id = project.workspace_layout.focused_pane_id orelse return false;
     return switch (state.workspacePaneKindById(pane_id) orelse return false) {
         .chat => blk: {
@@ -1155,7 +1166,7 @@ fn canHandoffFocusedPane(state: *runtime.AppState) bool {
         },
         .terminal => blk: {
             const dock_id = state.workspaceTerminalDockIdByPane(pane_id) orelse break :blk false;
-            break :blk state.projectTerminalSurface(state.selected_project_index, dock_id) != null;
+            break :blk state.projectTerminalSurface(state.project_controller.selected_index, dock_id) != null;
         },
         .browser => false,
     };
@@ -1164,13 +1175,15 @@ fn canHandoffFocusedPane(state: *runtime.AppState) bool {
 fn disabledNoticeForCommand(state: *runtime.AppState, id: []const u8) []const u8 {
     if (std.mem.eql(u8, id, "thread.open_current_codex_tui") or std.mem.eql(u8, id, "thread.open_current_tui")) {
         const thread_index = focusedGuiThreadIndex(state) orelse return "Focus a GUI chat pane before opening a thread in TUI.";
-        if (state.selected_project_index >= state.projects.items.len) return "No workspace selected.";
-        const project = &state.projects.items[state.selected_project_index];
+        if (state.project_controller.selected_index >= state.project_controller.projects.items.len) return "No workspace selected.";
+        const project = &state.project_controller.projects.items[state.project_controller.selected_index];
         if (thread_index >= project.threads.items.len) return "Focused chat thread is unavailable.";
         const thread = &project.threads.items[thread_index];
         if (thread.provider_thread_id == null) return "Thread has no provider session id yet.";
     }
     if (std.mem.eql(u8, id, "workspace.reopen")) return "No closed workspaces to reopen.";
+    if (std.mem.eql(u8, id, "workspace.grok_tui")) return "Grok Build is not installed. Run “Set Up Grok Build” first.";
+    if (std.mem.eql(u8, id, "app.grok_setup")) return "Grok Build is already installed.";
     if (std.mem.eql(u8, id, "workspace.herdr_focus_terminal")) return "Current workspace is not linked to Herdr.";
     if (std.mem.eql(u8, id, "workspace.herdr_unlink")) return "Current workspace is already running locally.";
     return "Command is unavailable right now.";
@@ -1182,16 +1195,16 @@ fn focusedGuiThreadIndex(state: *runtime.AppState) ?usize {
 }
 
 fn focusedGuiThreadProvider(state: *runtime.AppState) ?Provider {
-    if (state.selected_project_index >= state.projects.items.len) return null;
+    if (state.project_controller.selected_index >= state.project_controller.projects.items.len) return null;
     const thread_index = focusedGuiThreadIndex(state) orelse return null;
-    const project = &state.projects.items[state.selected_project_index];
+    const project = &state.project_controller.projects.items[state.project_controller.selected_index];
     if (thread_index >= project.threads.items.len) return null;
     return project.threads.items[thread_index].provider;
 }
 
 fn runNewChat(state: *runtime.AppState) void {
-    if (state.projects.items.len == 0) return;
-    state.createThreadForProject(@min(state.selected_project_index, state.projects.items.len - 1));
+    if (state.project_controller.projects.items.len == 0) return;
+    state.createThreadForProject(@min(state.project_controller.selected_index, state.project_controller.projects.items.len - 1));
 }
 
 fn runChooseChatModel(state: *runtime.AppState) void {
@@ -1204,7 +1217,7 @@ fn runChatRunConfig(state: *runtime.AppState) void {
 
 fn runSyncCurrentThread(state: *runtime.AppState) void {
     const thread_index = focusedGuiThreadIndex(state) orelse return;
-    state.syncThreadFromProvider(state.selected_project_index, thread_index);
+    state.syncThreadFromProvider(state.project_controller.selected_index, thread_index);
 }
 
 fn runHandoffCurrent(state: *runtime.AppState) void {
@@ -1213,24 +1226,24 @@ fn runHandoffCurrent(state: *runtime.AppState) void {
 
 fn runOpenCurrentThreadInTui(state: *runtime.AppState) void {
     const thread_index = focusedGuiThreadIndex(state) orelse return;
-    state.openThreadInTui(state.selected_project_index, thread_index);
+    state.openThreadInTui(state.project_controller.selected_index, thread_index);
 }
 
 fn runArchiveCurrentThread(state: *runtime.AppState) void {
-    const project = &state.projects.items[state.selected_project_index];
-    state.archiveThreadAtIndex(state.selected_project_index, project.selected_thread_index);
+    const project = &state.project_controller.projects.items[state.project_controller.selected_index];
+    state.archiveThreadAtIndex(state.project_controller.selected_index, project.selected_thread_index);
 }
 
 fn runImportCodex(state: *runtime.AppState) void {
-    state.beginThreadImport(state.selected_project_index, .codex);
+    state.beginThreadImport(state.project_controller.selected_index, .codex);
 }
 
 fn runImportOpencode(state: *runtime.AppState) void {
-    state.beginThreadImport(state.selected_project_index, .opencode);
+    state.beginThreadImport(state.project_controller.selected_index, .opencode);
 }
 
 fn runImportClaude(state: *runtime.AppState) void {
-    state.beginThreadImport(state.selected_project_index, .claude);
+    state.beginThreadImport(state.project_controller.selected_index, .claude);
 }
 
 fn runSplitChatRight(state: *runtime.AppState) void {
@@ -1250,7 +1263,7 @@ fn runSplitTerminalDown(state: *runtime.AppState) void {
 }
 
 fn runOpenTerminal(state: *runtime.AppState) void {
-    _ = state.openTerminalPaneForProjectIndex(state.selected_project_index);
+    _ = state.openTerminalPaneForProjectIndex(state.project_controller.selected_index);
 }
 
 fn runToggleBrowser(state: *runtime.AppState) void {
@@ -1316,7 +1329,7 @@ fn runTileQuickPane(state: *runtime.AppState) void {
 }
 
 fn runAddWorkspace(state: *runtime.AppState) void {
-    state.show_project_creator = true;
+    state.project_controller.show_creator = true;
     state.setSidebarCollapsed(false);
     state.clearImportPath();
     state.project_import_cursor = 0;
@@ -1326,7 +1339,7 @@ fn runAddWorkspace(state: *runtime.AppState) void {
 }
 
 fn runRenameWorkspace(state: *runtime.AppState) void {
-    state.beginProjectRename(state.selected_project_index);
+    state.beginProjectRename(state.project_controller.selected_index);
 }
 
 fn runRenameCurrentChat(state: *runtime.AppState) void {
@@ -1338,7 +1351,7 @@ fn runRegenerateChatTitle(state: *runtime.AppState) void {
 }
 
 fn runCloseWorkspace(state: *runtime.AppState) void {
-    state.closeProjectAtIndex(state.selected_project_index);
+    state.closeProjectAtIndex(state.project_controller.selected_index);
 }
 
 fn runReopenWorkspace(state: *runtime.AppState) void {
@@ -1361,36 +1374,44 @@ fn runOpenCursorTui(state: *runtime.AppState) void {
     runOpenAgentTui(state, .cursor);
 }
 
+fn runOpenGrokTui(state: *runtime.AppState) void {
+    runOpenAgentTui(state, .grok);
+}
+
+fn runGrokSetup(state: *runtime.AppState) void {
+    state.openGrokSetupGuide();
+}
+
 fn runOpenAmpTui(state: *runtime.AppState) void {
     runOpenAgentTui(state, .amp);
 }
 
 fn runHerdrHandoffWorkspace(state: *runtime.AppState) void {
-    state.handoffProjectToLocalHerdrFromUi(state.selected_project_index);
+    state.handoffProjectToLocalHerdrFromUi(state.project_controller.selected_index);
 }
 
 fn runHerdrRemoteHandoffWorkspace(state: *runtime.AppState) void {
-    state.beginHerdrProfilePicker(state.selected_project_index);
+    state.beginHerdrProfilePicker(state.project_controller.selected_index);
 }
 
 fn runFocusHerdrTerminal(state: *runtime.AppState) void {
-    _ = state.focusProjectHerdrAttachTerminal(state.selected_project_index);
+    _ = state.focusProjectHerdrAttachTerminal(state.project_controller.selected_index);
 }
 
 fn runUnlinkHerdrWorkspace(state: *runtime.AppState) void {
-    state.unlinkProjectHerdrFromUi(state.selected_project_index);
+    state.unlinkProjectHerdrFromUi(state.project_controller.selected_index);
 }
 
 fn runOpenAgentTui(state: *runtime.AppState, provider: AgentProvider) void {
     if (workspace_panes.gridNewPanePlacement(state)) |placement| {
-        _ = state.openAgentTuiAtPlacement(state.selected_project_index, provider, placement.pane_id, placement.axis, placement.new_after) catch false;
+        _ = state.openAgentTuiAtPlacement(state.project_controller.selected_index, provider, placement.pane_id, placement.axis, placement.new_after) catch false;
         return;
     }
-    _ = state.openAgentTuiAtPlacement(state.selected_project_index, provider, null, .horizontal, true) catch false;
+    _ = state.openAgentTuiAtPlacement(state.project_controller.selected_index, provider, null, .horizontal, true) catch false;
 }
 
 fn runHistoryThisWorkspace(state: *runtime.AppState) void {
-    state.command_controller.scope_project = state.selected_project_index;
+    state.command_controller.scope_project = state.project_controller.selected_index;
     state.command_controller.query_storage[0] = 0;
     state.command_controller.cursor = 0;
     state.command_controller.selected = 0;
@@ -1462,8 +1483,8 @@ fn renderScopeLine(state: *runtime.AppState) void {
     var buf: [128]u8 = undefined;
     const label = blk: {
         if (state.command_controller.scope_project) |pi| {
-            if (pi < state.projects.items.len) {
-                break :blk std.fmt.bufPrint(&buf, "{s} - history  (Ctrl+Shift+P for all)", .{state.projects.items[pi].label}) catch "history";
+            if (pi < state.project_controller.projects.items.len) {
+                break :blk std.fmt.bufPrint(&buf, "{s} - history  (Ctrl+Shift+P for all)", .{state.project_controller.projects.items[pi].label}) catch "history";
             }
         }
         break :blk "All workspaces";
@@ -1566,8 +1587,8 @@ fn renderCommandRow(state: *runtime.AppState, row_index: usize, command_index: u
 
 fn renderThreadRow(state: *runtime.AppState, row_index: usize, tr: ThreadRef, rect: palette.Rect, row_clip: palette.Rect) void {
     renderRowBackground(state, row_index, rect, row_clip);
-    if (tr.project >= state.projects.items.len) return;
-    const project = &state.projects.items[tr.project];
+    if (tr.project >= state.project_controller.projects.items.len) return;
+    const project = &state.project_controller.projects.items[tr.project];
     if (tr.thread >= project.threads.items.len) return;
     const thread = &project.threads.items[tr.thread];
     const emphasis = state.command_controller.selected == row_index;
@@ -1608,8 +1629,8 @@ fn renderThreadRow(state: *runtime.AppState, row_index: usize, tr: ThreadRef, re
 // History row for a saved agent TUI terminal session.
 fn renderAgentTuiRow(state: *runtime.AppState, row_index: usize, tui: AgentTuiRef, rect: palette.Rect, row_clip: palette.Rect) void {
     renderRowBackground(state, row_index, rect, row_clip);
-    if (tui.project >= state.projects.items.len) return;
-    const project = &state.projects.items[tui.project];
+    if (tui.project >= state.project_controller.projects.items.len) return;
+    const project = &state.project_controller.projects.items[tui.project];
     const provider = state.workspaceAgentTuiProvider(tui.project, tui.dock) orelse return;
     const emphasis = state.command_controller.selected == row_index;
     const font_size = theme.scaledUi(13.5);
@@ -1658,12 +1679,12 @@ fn renderAgentTuiRow(state: *runtime.AppState, row_index: usize, tui: AgentTuiRe
 
 fn renderWorkspaceRow(state: *runtime.AppState, row_index: usize, project_index: usize, rect: palette.Rect, row_clip: palette.Rect) void {
     renderRowBackground(state, row_index, rect, row_clip);
-    if (project_index >= state.projects.items.len) return;
+    if (project_index >= state.project_controller.projects.items.len) return;
     const emphasis = state.command_controller.selected == row_index;
     const font_size = theme.scaledUi(13.5);
     const text_y = rect.y + (rect.h - font_size * 1.3) * 0.5;
     var buf: [96]u8 = undefined;
-    const label = std.fmt.bufPrint(&buf, "Switch to {s}", .{state.projects.items[project_index].label}) catch "Switch workspace";
+    const label = std.fmt.bufPrint(&buf, "Switch to {s}", .{state.project_controller.projects.items[project_index].label}) catch "Switch workspace";
     queueText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = text_y, .w = theme.scaledUi(16.0), .h = font_size * 1.3 }, ">", paletteColor(theme.COLOR_GREEN), font_size, row_clip);
     const hint_w = theme.scaledUi(64.0);
     queueText(state, .{
@@ -1687,12 +1708,12 @@ fn renderWorkspaceRow(state: *runtime.AppState, row_index: usize, project_index:
 
 fn renderClosedWorkspaceRow(state: *runtime.AppState, row_index: usize, archived_index: usize, rect: palette.Rect, row_clip: palette.Rect) void {
     renderRowBackground(state, row_index, rect, row_clip);
-    if (archived_index >= state.archived_projects.items.len) return;
+    if (archived_index >= state.project_controller.archived_projects.items.len) return;
     const emphasis = state.command_controller.selected == row_index;
     const font_size = theme.scaledUi(13.5);
     const text_y = rect.y + (rect.h - font_size * 1.3) * 0.5;
     var buf: [96]u8 = undefined;
-    const label = std.fmt.bufPrint(&buf, "Reopen {s}", .{state.archived_projects.items[archived_index].label}) catch "Reopen workspace";
+    const label = std.fmt.bufPrint(&buf, "Reopen {s}", .{state.project_controller.archived_projects.items[archived_index].label}) catch "Reopen workspace";
     queueText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = text_y, .w = theme.scaledUi(16.0), .h = font_size * 1.3 }, ">", paletteColor(theme.COLOR_GREEN), font_size, row_clip);
     queueText(state, .{
         .x = rect.x + theme.scaledUi(34.0),

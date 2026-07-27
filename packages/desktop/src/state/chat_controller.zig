@@ -119,7 +119,7 @@ fn ensureJsonRpcOk(allocator: std.mem.Allocator, response: []const u8) !void {
     _ = try jsonRpcResult(parsed.value);
 }
 
-fn initialSendStartFailureMessage(_: anyerror) []const u8 {
+pub fn initialSendStartFailureMessage(_: anyerror) []const u8 {
     return "Verde could not start this message. Your draft and attachments are still in the composer; try Send again.";
 }
 
@@ -166,7 +166,7 @@ fn daemonPayloadStringAlloc(payload_json: []const u8, field: []const u8) ?[]u8 {
     return std.heap.page_allocator.dupe(u8, value) catch null;
 }
 
-fn backgroundTaskForEventBody(thread: *ChatThread, body: []const u8) ?*BackgroundTask {
+pub fn backgroundTaskForEventBody(thread: *ChatThread, body: []const u8) ?*BackgroundTask {
     const task_id = ChatThread.backgroundTaskMetadataValue(body, "Verde task ID:");
     const item_id = ChatThread.backgroundTaskMetadataValue(body, "Codex item ID:");
     const process_id = ChatThread.backgroundTaskMetadataValue(body, "Process ID:");
@@ -516,8 +516,8 @@ pub fn providerExecutionTargetForProjectThread(
     thread: *const ChatThread,
     image_count: usize,
 ) ?ProviderExecutionTarget {
-    if (project_index >= self.projects.items.len) return null;
-    const project = &self.projects.items[project_index];
+    if (project_index >= self.project_controller.projects.items.len) return null;
+    const project = &self.project_controller.projects.items[project_index];
     const link = project.herdr_link orelse return .{ .local = project.path };
 
     if (link.remote_alias.len == 0) {
@@ -666,7 +666,7 @@ pub fn sendDraft(self: anytype) !void {
         return;
     }
     const execution_target = self.providerExecutionTargetForProjectThread(
-        self.selected_project_index,
+        self.project_controller.selected_index,
         self.currentThread(),
         draft_image_count,
     ) orelse return;
@@ -711,7 +711,7 @@ pub fn sendDraft(self: anytype) !void {
     // so a fast app quit can still reattach the daemon-owned reply to a
     // known local chat thread.
     self.flushDirtyBlocking();
-    self.beginSendForThreadWithReadyDaemon(self.selected_project_index, thread, draft, execution_target) catch |err| {
+    self.beginSendForThreadWithReadyDaemon(self.project_controller.selected_index, thread, draft, execution_target) catch |err| {
         if (err == error.DaemonRequestFailed) {
             // A daemon JSON-RPC error is a confirmed rejection, so removing
             // the staged user row is safe and leaves the draft retryable.
@@ -739,7 +739,7 @@ pub fn sendDraft(self: anytype) !void {
 }
 
 pub fn abortCurrentThreadSend(self: anytype) void {
-    if (self.projects.items.len == 0) return;
+    if (self.project_controller.projects.items.len == 0) return;
     const send_state = self.currentThread().send_state;
     send_state.mutex.lock();
     defer send_state.mutex.unlock();
@@ -764,7 +764,7 @@ pub fn abortCurrentThreadSend(self: anytype) void {
 }
 
 pub fn queueOrSteerDraftDuringSend(self: anytype) void {
-    if (self.projects.items.len == 0) return;
+    if (self.project_controller.projects.items.len == 0) return;
     const thread = self.currentThreadMutable();
     const kind: FollowupKind = switch (thread.provider) {
         .codex => .steer,
@@ -782,7 +782,7 @@ pub fn queueDraftDuringSend(self: anytype) void {
 }
 
 pub fn storeDraftDuringSend(self: anytype, kind: FollowupKind) void {
-    if (self.projects.items.len == 0) return;
+    if (self.project_controller.projects.items.len == 0) return;
     const thread = self.currentThreadMutable();
     if (!thread.isSendPending()) {
         self.setSidebarNotice("This chat is not running.");
@@ -820,7 +820,7 @@ pub fn storeDraftDuringSend(self: anytype, kind: FollowupKind) void {
 }
 
 pub fn pendingFollowupSnapshot(self: anytype) !?PendingFollowup {
-    if (self.projects.items.len == 0) return null;
+    if (self.project_controller.projects.items.len == 0) return null;
     const send_state = self.currentThread().send_state;
     send_state.mutex.lock();
     defer send_state.mutex.unlock();
@@ -834,7 +834,7 @@ pub fn pendingFollowupSnapshot(self: anytype) !?PendingFollowup {
 }
 
 pub fn pendingFollowupHint(self: anytype) ?[:0]const u8 {
-    if (self.projects.items.len == 0) return null;
+    if (self.project_controller.projects.items.len == 0) return null;
     const thread = self.currentThread();
     if (!thread.isSendPending()) return null;
     return switch (thread.provider) {
@@ -998,7 +998,7 @@ pub fn beginSendForThreadWithReadyDaemon(
 ) !void {
     const page_alloc = std.heap.page_allocator;
     const execution_cwd = execution_target.cwd();
-    const turn_id = try std.fmt.allocPrint(page_alloc, "gui:{s}:{s}:{d}", .{ self.projects.items[project_index].id, thread.local_thread_id, unixTimestampMs() });
+    const turn_id = try std.fmt.allocPrint(page_alloc, "gui:{s}:{s}:{d}", .{ self.project_controller.projects.items[project_index].id, thread.local_thread_id, unixTimestampMs() });
     errdefer page_alloc.free(turn_id);
     const cursor_model_params_json = if (thread.provider == .cursor) try self.cursorModelParamsJsonAlloc(page_alloc, thread) else null;
     defer if (cursor_model_params_json) |params| page_alloc.free(params);
@@ -1079,11 +1079,11 @@ pub fn beginSendForThreadWithReadyDaemon(
 
 pub fn beginSendDraft(self: anytype, prompt: []const u8) !void {
     const execution_target = self.providerExecutionTargetForProjectThread(
-        self.selected_project_index,
+        self.project_controller.selected_index,
         self.currentThread(),
         self.currentThread().draftImageCount(),
     ) orelse return;
-    return self.beginSendForThread(self.selected_project_index, self.currentThreadMutable(), prompt, execution_target);
+    return self.beginSendForThread(self.project_controller.selected_index, self.currentThreadMutable(), prompt, execution_target);
 }
 
 pub fn ensureSessionDaemon(self: anytype) !void {
@@ -1111,11 +1111,11 @@ pub fn startDaemonChatTurn(
 
     return sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.start", .{
         .turn_id = turn_id,
-        .workspace_id = self.projects.items[project_index].id,
+        .workspace_id = self.project_controller.projects.items[project_index].id,
         .local_thread_id = thread.local_thread_id,
         .provider = @tagName(harnessProviderForDbProvider(thread.provider)),
         .harness = @tagName(thread.harness),
-        .project_path = self.projects.items[project_index].path,
+        .project_path = self.project_controller.projects.items[project_index].path,
         .prompt = prompt,
         .image_paths = image_paths.items,
         .provider_thread_id = if (thread.provider_thread_id) |thread_id| thread_id else null,
@@ -1207,7 +1207,7 @@ pub fn restoreDaemonChatTurnsOnLaunch(self: anytype) void {
 }
 
 pub fn threadByLocalId(self: anytype, workspace_id: []const u8, local_thread_id: []const u8) ?*ChatThread {
-    for (self.projects.items) |*project| {
+    for (self.project_controller.projects.items) |*project| {
         if (!std.mem.eql(u8, project.id, workspace_id)) continue;
         for (project.threads.items) |*thread| {
             if (std.mem.eql(u8, thread.local_thread_id, local_thread_id)) return thread;
@@ -1220,7 +1220,7 @@ pub fn pollSend(self: anytype) bool {
     var changed = self.pollTitleGenerations();
     if (!self.chat_controller.hasPending()) return changed;
 
-    for (self.projects.items, 0..) |*project, project_index| {
+    for (self.project_controller.projects.items, 0..) |*project, project_index| {
         for (project.threads.items, 0..) |*thread, thread_index| {
             changed = self.pollThreadSend(project_index, thread_index, thread) or changed;
         }
@@ -1230,7 +1230,7 @@ pub fn pollSend(self: anytype) bool {
 
 pub fn pollTitleGenerations(self: anytype) bool {
     var changed = false;
-    for (self.projects.items) |*project| {
+    for (self.project_controller.projects.items) |*project| {
         for (project.threads.items) |*thread| {
             changed = self.pollThreadTitleGeneration(project, thread) or changed;
         }
@@ -1238,7 +1238,7 @@ pub fn pollTitleGenerations(self: anytype) bool {
             changed = self.pollThreadTitleGeneration(project, thread) or changed;
         }
     }
-    for (self.archived_projects.items) |*project| {
+    for (self.project_controller.archived_projects.items) |*project| {
         for (project.threads.items) |*thread| {
             changed = self.pollThreadTitleGeneration(project, thread) or changed;
         }
@@ -1335,7 +1335,7 @@ pub fn boundedUtf8Prefix(value: []const u8, max_len: usize) []const u8 {
 }
 
 pub fn startTitleGeneration(self: anytype, project_index: usize, thread: *ChatThread, manual: bool) !void {
-    if (project_index >= self.projects.items.len) return error.ProjectNotFound;
+    if (project_index >= self.project_controller.projects.items.len) return error.ProjectNotFound;
     const exchange = openingExchange(thread) orelse return error.OpeningExchangeUnavailable;
     const user_text = if (std.mem.trim(u8, exchange.user.body, &std.ascii.whitespace).len > 0)
         boundedUtf8Prefix(exchange.user.body, 4096)
@@ -1356,7 +1356,7 @@ pub fn startTitleGeneration(self: anytype, project_index: usize, thread: *ChatTh
         \\</assistant>
     , .{ user_text, assistant_text });
     errdefer page_alloc.free(prompt);
-    const project_path = try page_alloc.dupe(u8, self.projects.items[project_index].path);
+    const project_path = try page_alloc.dupe(u8, self.project_controller.projects.items[project_index].path);
     errdefer page_alloc.free(project_path);
     const model_ref = try page_alloc.dupe(u8, self.app_config.chatTitleModel());
     errdefer page_alloc.free(model_ref);
@@ -1403,15 +1403,15 @@ pub fn maybeStartAutomaticTitleGeneration(self: anytype, project_index: usize, t
 }
 
 pub fn canRegenerateCurrentThreadTitle(self: anytype) bool {
-    if (self.selected_project_index >= self.projects.items.len) return false;
-    const project = &self.projects.items[self.selected_project_index];
+    if (self.project_controller.selected_index >= self.project_controller.projects.items.len) return false;
+    const project = &self.project_controller.projects.items[self.project_controller.selected_index];
     if (project.selected_thread_index >= project.threads.items.len) return false;
-    return self.canRegenerateThreadTitle(self.selected_project_index, project.selected_thread_index);
+    return self.canRegenerateThreadTitle(self.project_controller.selected_index, project.selected_thread_index);
 }
 
 pub fn canRegenerateThreadTitle(self: anytype, project_index: usize, thread_index: usize) bool {
-    if (project_index >= self.projects.items.len) return false;
-    const project = &self.projects.items[project_index];
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    const project = &self.project_controller.projects.items[project_index];
     if (thread_index >= project.threads.items.len) return false;
     const thread = &project.threads.items[thread_index];
     return openingExchange(thread) != null and
@@ -1420,10 +1420,10 @@ pub fn canRegenerateThreadTitle(self: anytype, project_index: usize, thread_inde
 }
 
 pub fn regenerateCurrentThreadTitle(self: anytype) void {
-    if (self.selected_project_index >= self.projects.items.len) return;
-    const project = &self.projects.items[self.selected_project_index];
+    if (self.project_controller.selected_index >= self.project_controller.projects.items.len) return;
+    const project = &self.project_controller.projects.items[self.project_controller.selected_index];
     if (project.selected_thread_index >= project.threads.items.len) return;
-    self.regenerateThreadTitleAtIndex(self.selected_project_index, project.selected_thread_index);
+    self.regenerateThreadTitleAtIndex(self.project_controller.selected_index, project.selected_thread_index);
 }
 
 pub fn regenerateThreadTitleAtIndex(self: anytype, project_index: usize, thread_index: usize) void {
@@ -1432,7 +1432,7 @@ pub fn regenerateThreadTitleAtIndex(self: anytype, project_index: usize, thread_
         self.setSidebarNotice("A completed opening exchange is required to generate a title.");
         return;
     }
-    const thread = &self.projects.items[project_index].threads.items[thread_index];
+    const thread = &self.project_controller.projects.items[project_index].threads.items[thread_index];
     self.startTitleGeneration(project_index, thread, true) catch |err| {
         log.warn("failed to start chat title regeneration: {s}", .{@errorName(err)});
         self.setSidebarNotice("Could not start chat title generation.");
@@ -1505,8 +1505,8 @@ pub fn pollSlashCommand(self: anytype) bool {
 }
 
 pub fn currentThreadPendingSlashCommand(self: anytype) ?PendingSlashCommandDetails {
-    if (self.projects.items.len == 0) return null;
-    const project_index = self.selected_project_index;
+    if (self.project_controller.projects.items.len == 0) return null;
+    const project_index = self.project_controller.selected_index;
     const thread_index = self.currentProject().selected_thread_index;
 
     self.slash_command_state.mutex.lock();
@@ -1565,8 +1565,8 @@ pub fn applySlashCommandResult(
         return;
     }
 
-    if (project_index < self.projects.items.len and thread_index < self.projects.items[project_index].threads.items.len) {
-        const thread = &self.projects.items[project_index].threads.items[thread_index];
+    if (project_index < self.project_controller.projects.items.len and thread_index < self.project_controller.projects.items[project_index].threads.items.len) {
+        const thread = &self.project_controller.projects.items[project_index].threads.items[thread_index];
         if (result.thread_id) |provider_thread_id| {
             const changed = thread.provider_thread_id == null or !std.mem.eql(u8, thread.provider_thread_id.?, provider_thread_id);
             if (changed) {
@@ -1587,7 +1587,7 @@ pub fn applySlashCommandResult(
             self.appendMessageToThread(thread, .system, title, body, null, &.{}) catch |err| {
                 log.warn("failed to append slash command result: {s}", .{@errorName(err)});
             };
-            if (project_index == self.selected_project_index and thread_index == self.currentProject().selected_thread_index) {
+            if (project_index == self.project_controller.selected_index and thread_index == self.currentProject().selected_thread_index) {
                 self.requestTranscriptScrollToBottom();
             }
         }
@@ -1602,7 +1602,7 @@ pub fn applySlashCommandResult(
 }
 
 pub fn hasRunningBackgroundTasks(self: anytype) bool {
-    for (self.projects.items) |project| {
+    for (self.project_controller.projects.items) |project| {
         for (project.threads.items) |thread| {
             if (threadHasRunningBackgroundTasks(&thread)) return true;
         }
@@ -1622,7 +1622,7 @@ pub fn threadHasRunningBackgroundTasks(thread: *const ChatThread) bool {
 
 pub fn pollBackgroundTasks(self: anytype) bool {
     var changed = false;
-    for (self.projects.items, 0..) |*project, project_index| {
+    for (self.project_controller.projects.items, 0..) |*project, project_index| {
         for (project.threads.items, 0..) |*thread, thread_index| {
             changed = self.pollThreadBackgroundTasks(project_index, thread_index, thread) or changed;
         }
@@ -1665,10 +1665,10 @@ pub fn pollThreadBackgroundTasks(self: anytype, project_index: usize, thread_ind
             log.warn("failed to append background task completion: {s}", .{@errorName(err)});
             continue;
         };
-        if (project_index < self.projects.items.len) {
-            self.projects.items[project_index].invalidateSidebarThreadCache();
+        if (project_index < self.project_controller.projects.items.len) {
+            self.project_controller.projects.items[project_index].invalidateSidebarThreadCache();
         }
-        if (project_index == self.selected_project_index and thread_index != null and thread_index.? == self.currentProject().selected_thread_index) {
+        if (project_index == self.project_controller.selected_index and thread_index != null and thread_index.? == self.currentProject().selected_thread_index) {
             self.requestTranscriptScrollToBottom();
         }
         changed = true;
@@ -1917,7 +1917,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
     if (!command_pending) {
         self.capturePendingProviderThreadId(thread);
         self.issuePendingCodexSteer(project_index, thread_index, thread);
-        self.issuePendingThreadStop(project_index, self.projects.items[project_index].path, thread);
+        self.issuePendingThreadStop(project_index, self.project_controller.projects.items[project_index].path, thread);
     }
 
     var completed_result: ?SendResultPayload = null;
@@ -2045,8 +2045,8 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
     if (next_status != .idle) {
         self.chat_controller.finishSend();
         thread.finishSendThread();
-        if (project_index < self.projects.items.len) {
-            self.projects.items[project_index].invalidateSidebarThreadCache();
+        if (project_index < self.project_controller.projects.items.len) {
+            self.project_controller.projects.items[project_index].invalidateSidebarThreadCache();
         }
         send_state.mutex.lock();
         if (send_state.local_command_text) |value| std.heap.page_allocator.free(value);
@@ -2088,7 +2088,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
                     self.markDirty();
                     self.setSidebarNotice("Workspace command finished.");
                 }
-                if (project_index == self.selected_project_index and thread_index == self.currentProject().selected_thread_index) {
+                if (project_index == self.project_controller.selected_index and thread_index == self.currentProject().selected_thread_index) {
                     self.requestTranscriptScrollToBottom();
                 }
                 self.flushDirtyNow();
@@ -2164,8 +2164,8 @@ pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usi
         _ = self.clearChatCompletion(project_index, thread_index);
         return;
     }
-    if (project_index >= self.projects.items.len) return;
-    const project = &self.projects.items[project_index];
+    if (project_index >= self.project_controller.projects.items.len) return;
+    const project = &self.project_controller.projects.items[project_index];
     const completed_at_ms = unixTimestampMs();
     thread.completion_pending = true;
     thread.completed_at_ms = completed_at_ms;
@@ -2205,9 +2205,9 @@ pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usi
 // Merely being visible beside a terminal/browser pane must still queue DONE.
 pub fn isChatThreadFocused(self: anytype, project_index: usize, thread_index: usize) bool {
     if (!self.window_input_focus) return false;
-    if (project_index != self.selected_project_index) return false;
-    if (project_index >= self.projects.items.len) return false;
-    const layout = &self.projects.items[project_index].workspace_layout;
+    if (project_index != self.project_controller.selected_index) return false;
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    const layout = &self.project_controller.projects.items[project_index].workspace_layout;
     const focused_pane_id = layout.focused_pane_id orelse return false;
     if (layout.maximized_pane_id) |max_id| {
         if (max_id != focused_pane_id) return false;
@@ -2398,7 +2398,7 @@ pub fn issuePendingCodexSteer(
         }
     }
     send_state.mutex.unlock();
-    if (project_index == self.selected_project_index and thread_index == self.currentProject().selected_thread_index) {
+    if (project_index == self.project_controller.selected_index and thread_index == self.currentProject().selected_thread_index) {
         self.requestTranscriptScrollToBottom();
     }
     self.setSidebarNotice("Codex steer sent. Waiting for the current turn to update.");
@@ -2434,7 +2434,7 @@ pub fn dispatchPendingFollowup(self: anytype, project_index: usize, thread_index
         self.setSidebarNotice("Failed to send the pending follow-up.");
         return;
     };
-    if (project_index == self.selected_project_index and thread_index == self.currentProject().selected_thread_index) {
+    if (project_index == self.project_controller.selected_index and thread_index == self.currentProject().selected_thread_index) {
         self.requestTranscriptScrollToBottom();
     }
     self.setSidebarNotice(switch (followup.kind) {
@@ -2497,13 +2497,13 @@ pub fn finishSlashCommandThread(self: anytype) void {
 }
 
 pub fn finishOpencodeModelCacheThread(self: anytype) void {
-    self.opencode_model_cache_state.mutex.lock();
-    const maybe_worker = self.opencode_model_cache_state.worker;
-    self.opencode_model_cache_state.worker = null;
-    const maybe_models = self.opencode_model_cache_state.models;
-    self.opencode_model_cache_state.models = null;
-    self.opencode_model_cache_state.status = .idle;
-    self.opencode_model_cache_state.mutex.unlock();
+    self.provider_controller.opencode_model_cache.mutex.lock();
+    const maybe_worker = self.provider_controller.opencode_model_cache.worker;
+    self.provider_controller.opencode_model_cache.worker = null;
+    const maybe_models = self.provider_controller.opencode_model_cache.models;
+    self.provider_controller.opencode_model_cache.models = null;
+    self.provider_controller.opencode_model_cache.status = .idle;
+    self.provider_controller.opencode_model_cache.mutex.unlock();
 
     if (maybe_worker) |worker| {
         worker.join();
@@ -2514,13 +2514,13 @@ pub fn finishOpencodeModelCacheThread(self: anytype) void {
 }
 
 pub fn finishClaudeModelCacheThread(self: anytype) void {
-    self.claude_model_cache_state.mutex.lock();
-    const maybe_worker = self.claude_model_cache_state.worker;
-    self.claude_model_cache_state.worker = null;
-    const maybe_models = self.claude_model_cache_state.models;
-    self.claude_model_cache_state.models = null;
-    self.claude_model_cache_state.status = .idle;
-    self.claude_model_cache_state.mutex.unlock();
+    self.provider_controller.claude_model_cache.mutex.lock();
+    const maybe_worker = self.provider_controller.claude_model_cache.worker;
+    self.provider_controller.claude_model_cache.worker = null;
+    const maybe_models = self.provider_controller.claude_model_cache.models;
+    self.provider_controller.claude_model_cache.models = null;
+    self.provider_controller.claude_model_cache.status = .idle;
+    self.provider_controller.claude_model_cache.mutex.unlock();
 
     if (maybe_worker) |worker| {
         worker.join();
@@ -2531,13 +2531,13 @@ pub fn finishClaudeModelCacheThread(self: anytype) void {
 }
 
 pub fn finishCursorModelCacheThread(self: anytype) void {
-    self.cursor_model_cache_state.mutex.lock();
-    const maybe_worker = self.cursor_model_cache_state.worker;
-    self.cursor_model_cache_state.worker = null;
-    const maybe_models = self.cursor_model_cache_state.models;
-    self.cursor_model_cache_state.models = null;
-    self.cursor_model_cache_state.status = .idle;
-    self.cursor_model_cache_state.mutex.unlock();
+    self.provider_controller.cursor_model_cache.mutex.lock();
+    const maybe_worker = self.provider_controller.cursor_model_cache.worker;
+    self.provider_controller.cursor_model_cache.worker = null;
+    const maybe_models = self.provider_controller.cursor_model_cache.models;
+    self.provider_controller.cursor_model_cache.models = null;
+    self.provider_controller.cursor_model_cache.status = .idle;
+    self.provider_controller.cursor_model_cache.mutex.unlock();
 
     if (maybe_worker) |worker| {
         worker.join();
@@ -2548,16 +2548,16 @@ pub fn finishCursorModelCacheThread(self: anytype) void {
 }
 
 pub fn finishProviderReadinessThread(self: anytype) void {
-    self.provider_readiness_state.mutex.lock();
-    const maybe_worker = self.provider_readiness_state.worker;
-    self.provider_readiness_state.worker = null;
-    self.provider_readiness_state.mutex.unlock();
+    self.provider_controller.readiness.mutex.lock();
+    const maybe_worker = self.provider_controller.readiness.worker;
+    self.provider_controller.readiness.worker = null;
+    self.provider_controller.readiness.mutex.unlock();
 
     if (maybe_worker) |worker| worker.join();
 }
 
 pub fn finishAllSendThreads(self: anytype) void {
-    for (self.projects.items) |*project| {
+    for (self.project_controller.projects.items) |*project| {
         for (project.threads.items) |*thread| {
             thread.finishSendThread();
         }
@@ -2565,7 +2565,7 @@ pub fn finishAllSendThreads(self: anytype) void {
             thread.finishSendThread();
         }
     }
-    for (self.archived_projects.items) |*project| {
+    for (self.project_controller.archived_projects.items) |*project| {
         for (project.threads.items) |*thread| {
             thread.finishSendThread();
         }
@@ -2576,11 +2576,11 @@ pub fn finishAllSendThreads(self: anytype) void {
 }
 
 pub fn finishAllTitleGenerationThreads(self: anytype) void {
-    for (self.projects.items) |*project| {
+    for (self.project_controller.projects.items) |*project| {
         for (project.threads.items) |*thread| thread.finishTitleGenerationThread();
         for (project.archived_threads.items) |*thread| thread.finishTitleGenerationThread();
     }
-    for (self.archived_projects.items) |*project| {
+    for (self.project_controller.archived_projects.items) |*project| {
         for (project.threads.items) |*thread| thread.finishTitleGenerationThread();
         for (project.archived_threads.items) |*thread| thread.finishTitleGenerationThread();
     }
@@ -2615,13 +2615,13 @@ pub fn prepareThreadSendForShutdown(self: anytype, project_path: []const u8, thr
 }
 
 pub fn hasPendingStream(self: anytype) bool {
-    if (self.projects.items.len == 0) return false;
+    if (self.project_controller.projects.items.len == 0) return false;
     return self.currentThread().isSendPendingForUi();
 }
 
 pub fn hasAnyPendingSends(self: anytype) bool {
     if (self.chat_controller.hasPending()) return true;
-    for (self.projects.items) |*project| {
+    for (self.project_controller.projects.items) |*project| {
         for (project.threads.items) |*thread| {
             if (thread.isSendPendingForUi()) return true;
         }
@@ -2629,7 +2629,7 @@ pub fn hasAnyPendingSends(self: anytype) bool {
             if (thread.isSendPendingForUi()) return true;
         }
     }
-    for (self.archived_projects.items) |*project| {
+    for (self.project_controller.archived_projects.items) |*project| {
         for (project.threads.items) |*thread| {
             if (thread.isSendPendingForUi()) return true;
         }
@@ -2651,7 +2651,7 @@ pub fn isPickerPending(self: anytype) bool {
 }
 
 pub fn pendingApprovalSnapshot(self: anytype) !?PendingApproval {
-    if (self.projects.items.len == 0) return null;
+    if (self.project_controller.projects.items.len == 0) return null;
     const send_state = self.currentThread().send_state;
     send_state.mutex.lock();
     defer send_state.mutex.unlock();
@@ -2666,7 +2666,7 @@ pub fn pendingApprovalSnapshot(self: anytype) !?PendingApproval {
 }
 
 pub fn resolvePendingApproval(self: anytype, decision: ai_harness.ApprovalDecision) void {
-    if (self.projects.items.len == 0) return;
+    if (self.project_controller.projects.items.len == 0) return;
     const send_state = self.currentThread().send_state;
     send_state.mutex.lock();
     const daemon_turn_id = if (send_state.daemon_owned and send_state.daemon_turn_id != null)
@@ -2709,7 +2709,6 @@ pub fn applySendSuccess(self: anytype, thread: *ChatThread, result: SendResultPa
     if (std.mem.trim(u8, result.reply_text, &std.ascii.whitespace).len > 0 and thread.messages.items.len > 0) {
         const last_message = thread.messages.items[thread.messages.items.len - 1];
         if (last_message.role != .assistant or !std.mem.eql(u8, last_message.body, result.reply_text)) {
-            self.trimThreadMessages(thread, 1);
             try thread.messages.append(self.allocator, .{
                 .role = .assistant,
                 .author = try self.dupeZ(chat_threads.providerLabel(thread.provider)),
@@ -2718,7 +2717,6 @@ pub fn applySendSuccess(self: anytype, thread: *ChatThread, result: SendResultPa
             });
         }
     } else if (std.mem.trim(u8, result.reply_text, &std.ascii.whitespace).len > 0) {
-        self.trimThreadMessages(thread, 1);
         try thread.messages.append(self.allocator, .{
             .role = .assistant,
             .author = try self.dupeZ(chat_threads.providerLabel(thread.provider)),
@@ -2733,7 +2731,6 @@ pub fn applySendSuccess(self: anytype, thread: *ChatThread, result: SendResultPa
 
 pub fn applyPendingTimelineEvents(self: anytype, thread: *ChatThread, events: *std.ArrayListUnmanaged(PendingTimelineEvent)) !void {
     if (events.items.len == 0) return;
-    self.trimThreadMessages(thread, events.items.len);
     for (events.items) |event| {
         if (std.mem.eql(u8, event.author, "__verde_codex_background_snapshot")) {
             try self.reconcileCodexBackgroundSnapshot(thread, event.body);
@@ -2797,7 +2794,6 @@ pub fn applySendFailure(
     events: *std.ArrayListUnmanaged(PendingTimelineEvent),
     failure_message: []const u8,
 ) !void {
-    self.trimThreadMessages(thread, events.items.len + 1);
     for (events.items) |event| {
         if (std.mem.eql(u8, event.author, "__verde_codex_background_snapshot")) continue;
         try thread.messages.append(self.allocator, .{

@@ -267,7 +267,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .collapse => state.setSidebarCollapsed(true),
             .expand => state.setSidebarCollapsed(false),
             .add_workspace => {
-                state.show_project_creator = true;
+                state.project_controller.show_creator = true;
                 state.setSidebarCollapsed(false);
                 state.clearImportPath();
                 state.project_import_cursor = 0;
@@ -276,10 +276,10 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                 state.markDirty();
             },
             .new_thread => {
-                if (state.projects.items.len > 0) state.createThreadForProject(@min(hit.project_index, state.projects.items.len - 1));
+                if (state.project_controller.projects.items.len > 0) state.createThreadForProject(@min(hit.project_index, state.project_controller.projects.items.len - 1));
             },
             .new_terminal => {
-                if (hit.project_index < state.projects.items.len) _ = state.openTerminalPaneForProjectIndex(hit.project_index);
+                if (hit.project_index < state.project_controller.projects.items.len) _ = state.openTerminalPaneForProjectIndex(hit.project_index);
             },
             .workspace_row => {
                 startWorkspaceDrag(state, hit.project_index, x, y, true);
@@ -291,7 +291,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                 startWorkspaceDrag(state, hit.project_index, x, y, false);
             },
             .history => {
-                if (hit.project_index < state.projects.items.len) {
+                if (hit.project_index < state.project_controller.projects.items.len) {
                     state.openCommandPalette(hit.project_index);
                 }
             },
@@ -442,7 +442,7 @@ fn computeWorkspaceDropTarget(y: f32) void {
 }
 
 fn startWorkspaceDrag(state: *runtime.AppState, project_index: usize, x: f32, y: f32, toggle_project_on_click: bool) void {
-    if (project_index >= state.projects.items.len) return;
+    if (project_index >= state.project_controller.projects.items.len) return;
     // Begin a pending drag; release without movement is treated as the normal
     // click behavior for that control, while movement past the threshold
     // promotes to a workspace reorder drag.
@@ -471,12 +471,12 @@ fn finishWorkspaceDrag(state: *runtime.AppState, x: f32, y: f32) bool {
         // click selects the workspace (which auto-expands its subtree in the
         // expanded rail); only a click on the already-selected row toggles the
         // manual collapse flag, so selecting never immediately re-hides panes.
-        if (drag.project_index < state.projects.items.len) {
+        if (drag.project_index < state.project_controller.projects.items.len) {
             state.noteInteraction();
-            const was_selected = state.selected_project_index == drag.project_index;
+            const was_selected = state.project_controller.selected_index == drag.project_index;
             _ = state.selectProjectAtIndex(drag.project_index);
             if (drag.toggle_project_on_click and was_selected) {
-                state.projects.items[drag.project_index].collapsed = !state.projects.items[drag.project_index].collapsed;
+                state.project_controller.projects.items[drag.project_index].collapsed = !state.project_controller.projects.items[drag.project_index].collapsed;
             }
             state.requestTranscriptScrollToBottom();
             state.markDirty();
@@ -493,7 +493,7 @@ fn finishWorkspaceDrag(state: *runtime.AppState, x: f32, y: f32) bool {
 
 fn renderWorkspaceDragOverlay(state: *runtime.AppState) void {
     if (!workspace_drag.active) return;
-    if (workspace_drag.project_index >= state.projects.items.len) return;
+    if (workspace_drag.project_index >= state.project_controller.projects.items.len) return;
 
     const previous_z = state.palette_overlay_batch.setZIndex(THREAD_DRAG_FLOATING_Z);
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
@@ -509,7 +509,7 @@ fn renderWorkspaceDragOverlay(state: *runtime.AppState) void {
         }, paletteColor(theme.COLOR_GREEN), line_h * 0.5);
     }
 
-    const project = &state.projects.items[workspace_drag.project_index];
+    const project = &state.project_controller.projects.items[workspace_drag.project_index];
     const w = theme.scaledUi(200.0);
     const h = theme.scaledUi(30.0);
     const rect: palette.Rect = .{
@@ -548,7 +548,7 @@ fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) boo
             state.noteInteraction();
             switch (action) {
                 .workspace_new_chat => {
-                    if (pi < state.projects.items.len) state.createThreadForProject(pi);
+                    if (pi < state.project_controller.projects.items.len) state.createThreadForProject(pi);
                 },
                 .workspace_open_codex_tui => _ = state.openAgentTui(pi, .codex) catch false,
                 .workspace_open_terminal => _ = state.openTerminalPaneForProjectIndex(pi),
@@ -567,8 +567,8 @@ fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) boo
                 .thread_regenerate_title => state.regenerateThreadTitleAtIndex(pi, ti),
                 .thread_sync => state.syncThreadFromProvider(pi, ti),
                 .thread_handoff => {
-                    if (pi < state.projects.items.len) {
-                        for (state.projects.items[pi].workspace_layout.panes.items) |pane| {
+                    if (pi < state.project_controller.projects.items.len) {
+                        for (state.project_controller.projects.items[pi].workspace_layout.panes.items) |pane| {
                             switch (pane.ref) {
                                 .chat => |ref| if (ref.thread_index == ti) {
                                     state.beginThreadHandoff(pi, ti, pane.id);
@@ -624,26 +624,26 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
         .none => return,
         .project => {
             const pi = state.sidebar_context_menu_project_index;
-            const herdr_link = if (pi < state.projects.items.len) state.projects.items[pi].herdr_link else null;
+            const herdr_link = if (pi < state.project_controller.projects.items.len) state.project_controller.projects.items[pi].herdr_link else null;
             appendSidebarContextMenuRow(.workspace_new_chat, true, "Start a new chat");
-            appendSidebarContextMenuRow(.workspace_open_codex_tui, pi < state.projects.items.len, "Open Codex TUI");
-            appendSidebarContextMenuRow(.workspace_open_terminal, pi < state.projects.items.len, "Open terminal");
+            appendSidebarContextMenuRow(.workspace_open_codex_tui, pi < state.project_controller.projects.items.len, "Open Codex TUI");
+            appendSidebarContextMenuRow(.workspace_open_terminal, pi < state.project_controller.projects.items.len, "Open terminal");
             if (herdr_link) |link| {
-                appendSidebarContextMenuRow(.workspace_herdr_focus_terminal, pi < state.projects.items.len, if (link.attach_dock_id != null) "Focus Herdr terminal" else "Open Herdr terminal");
-                appendSidebarContextMenuRow(.workspace_herdr_handoff, pi < state.projects.items.len, "Refresh Herdr handoff");
-                appendSidebarContextMenuRow(.workspace_herdr_handoff_remote, pi < state.projects.items.len, "Handoff to remote Herdr");
-                appendSidebarContextMenuRow(.workspace_herdr_unlink, pi < state.projects.items.len, "Run locally (unlink Herdr)");
+                appendSidebarContextMenuRow(.workspace_herdr_focus_terminal, pi < state.project_controller.projects.items.len, if (link.attach_dock_id != null) "Focus Herdr terminal" else "Open Herdr terminal");
+                appendSidebarContextMenuRow(.workspace_herdr_handoff, pi < state.project_controller.projects.items.len, "Refresh Herdr handoff");
+                appendSidebarContextMenuRow(.workspace_herdr_handoff_remote, pi < state.project_controller.projects.items.len, "Handoff to remote Herdr");
+                appendSidebarContextMenuRow(.workspace_herdr_unlink, pi < state.project_controller.projects.items.len, "Run locally (unlink Herdr)");
             } else {
-                appendSidebarContextMenuRow(.workspace_herdr_handoff, pi < state.projects.items.len, "Handoff to Herdr");
-                appendSidebarContextMenuRow(.workspace_herdr_handoff_remote, pi < state.projects.items.len, "Handoff to remote Herdr");
+                appendSidebarContextMenuRow(.workspace_herdr_handoff, pi < state.project_controller.projects.items.len, "Handoff to Herdr");
+                appendSidebarContextMenuRow(.workspace_herdr_handoff_remote, pi < state.project_controller.projects.items.len, "Handoff to remote Herdr");
             }
             appendSidebarContextMenuRow(.workspace_rename, true, "Rename workspace");
             appendSidebarContextMenuRow(.workspace_import_codex, true, "Import Codex thread");
             appendSidebarContextMenuRow(.workspace_import_opencode, true, "Import OpenCode thread");
             appendSidebarContextMenuRow(.workspace_import_claude, true, "Import Claude thread");
             var busy = false;
-            if (pi < state.projects.items.len) {
-                for (state.projects.items[pi].threads.items) |*th| {
+            if (pi < state.project_controller.projects.items.len) {
+                for (state.project_controller.projects.items[pi].threads.items) |*th| {
                     if (th.isSendPendingForUi()) {
                         busy = true;
                         break;
@@ -654,8 +654,8 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
         },
         .project_new_thread => {
             const pi = state.sidebar_context_menu_project_index;
-            appendSidebarContextMenuRow(.workspace_new_chat, pi < state.projects.items.len, "Start a new chat");
-            appendSidebarContextMenuRow(.workspace_open_codex_tui, pi < state.projects.items.len, "Open Codex TUI");
+            appendSidebarContextMenuRow(.workspace_new_chat, pi < state.project_controller.projects.items.len, "Start a new chat");
+            appendSidebarContextMenuRow(.workspace_open_codex_tui, pi < state.project_controller.projects.items.len, "Open Codex TUI");
         },
         .thread => {
             const pi = state.sidebar_context_menu_project_index;
@@ -665,8 +665,8 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
             var can_archive = true;
             var provider: Provider = .opencode;
             var in_tui = false;
-            if (pi < state.projects.items.len) {
-                const proj = state.projects.items[pi];
+            if (pi < state.project_controller.projects.items.len) {
+                const proj = state.project_controller.projects.items[pi];
                 if (ti < proj.threads.items.len) {
                     const th = proj.threads.items[ti];
                     can_sync = th.provider_thread_id != null and !th.isSendPendingForUi();
@@ -706,9 +706,9 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
     queuePaletteRoundedRect(state, sidebar_menu_panel_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(12.0));
     queuePaletteBorder(state, sidebar_menu_panel_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(12.0), theme.scaledUi(1.0));
 
-    const mx = state.palette_mouse_x;
-    const my = state.palette_mouse_y;
-    const mouse_ok = state.palette_mouse_in_workspace;
+    const mx = state.transcript_controller.palette_mouse_x;
+    const my = state.transcript_controller.palette_mouse_y;
+    const mouse_ok = state.transcript_controller.palette_mouse_in_workspace;
 
     var ry = menu_y + menu_pad;
     var ri: usize = 0;
@@ -782,9 +782,9 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     y = renderAttentionClusterSection(state, x, rail_w, list_clip, clip, y);
 
     var project_index: usize = 0;
-    while (project_index < state.projects.items.len) : (project_index += 1) {
-        const project = &state.projects.items[project_index];
-        const selected = state.selected_project_index == project_index;
+    while (project_index < state.project_controller.projects.items.len) : (project_index += 1) {
+        const project = &state.project_controller.projects.items[project_index];
+        const selected = state.project_controller.selected_index == project_index;
         // Only the selected workspace expands. Other workspaces stay one
         // header row tall — their live panes surface through the cluster
         // above — so the tree never buries the active workspace under idle
@@ -995,8 +995,8 @@ fn renderAttentionClusterSection(
     var row_count: usize = 0;
 
     var project_index: usize = 0;
-    while (project_index < state.projects.items.len) : (project_index += 1) {
-        const project = &state.projects.items[project_index];
+    while (project_index < state.project_controller.projects.items.len) : (project_index += 1) {
+        const project = &state.project_controller.projects.items[project_index];
         for (project.workspace_layout.panes.items) |*pane| {
             if (!paneNeedsAttention(state, project_index, project, pane)) continue;
             if (row_count >= rows.len) continue;
@@ -1017,7 +1017,7 @@ fn renderAttentionClusterSection(
     y += theme.scaledUi(20.0);
 
     for (rows[0..row_count]) |row| {
-        const project = &state.projects.items[row.project_index];
+        const project = &state.project_controller.projects.items[row.project_index];
         const row_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w, .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS) };
         if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, row.project_index, project, row.pane, row_rect, clip, true);
         y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
@@ -1049,8 +1049,8 @@ fn paneCompletionTime(
 ) ?i64 {
     return switch (pane.ref) {
         .chat => |ref| blk: {
-            if (project_index >= state.projects.items.len) break :blk null;
-            const project = &state.projects.items[project_index];
+            if (project_index >= state.project_controller.projects.items.len) break :blk null;
+            const project = &state.project_controller.projects.items[project_index];
             if (ref.thread_index >= project.threads.items.len) break :blk null;
             const thread = &project.threads.items[ref.thread_index];
             break :blk if (thread.completion_pending) thread.completed_at_ms else null;
@@ -1108,11 +1108,11 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
     y += theme.scaledUi(34.0);
     const new_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
     renderPaletteSidebarActionIcon(state, new_rect, NF_COD_EDIT, null, rect);
-    addPaletteHit(new_rect, .new_thread, state.selected_project_index, 0);
+    addPaletteHit(new_rect, .new_thread, state.project_controller.selected_index, 0);
     y += theme.scaledUi(34.0);
     const terminal_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
     renderPaletteSidebarActionIcon(state, terminal_rect, NF_COD_TERMINAL, null, rect);
-    addPaletteHit(terminal_rect, .new_terminal, state.selected_project_index, 0);
+    addPaletteHit(terminal_rect, .new_terminal, state.project_controller.selected_index, 0);
     y += theme.scaledUi(34.0);
     // Palette trigger parity with the expanded rail's search pill, so the
     // collapsed rail keeps a visible route to search/history too.
@@ -1130,12 +1130,12 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
     const avatar = theme.scaledUi(36.0);
     const dock_bottom = rect.y + rect.h - theme.scaledUi(48.0);
     var project_index: usize = 0;
-    while (project_index < state.projects.items.len) : (project_index += 1) {
+    while (project_index < state.project_controller.projects.items.len) : (project_index += 1) {
         if (y + avatar > dock_bottom) break; // keep the rail tidy; expand to see the rest
-        const project = &state.projects.items[project_index];
-        const selected = state.selected_project_index == project_index;
+        const project = &state.project_controller.projects.items[project_index];
+        const selected = state.project_controller.selected_index == project_index;
         const avatar_rect: palette.Rect = .{ .x = x, .y = y, .w = avatar, .h = avatar };
-        const hovered = state.palette_mouse_in_workspace and rectContainsPoint(avatar_rect, state.palette_mouse_x, state.palette_mouse_y);
+        const hovered = state.transcript_controller.palette_mouse_in_workspace and rectContainsPoint(avatar_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
 
         // The active workspace reads as a bold filled chip in the theme accent —
         // mirroring (and amplifying) the green filled folder of the expanded
@@ -1208,7 +1208,7 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
 /// panel-left codicon (filled while expanded, hollow while collapsed) with the
 /// same hover treatment as the settings button, replacing the old "<"/">" text.
 fn renderPaletteSidebarToggle(state: *runtime.AppState, rect: palette.Rect, expanded: bool) void {
-    const hovered = state.palette_mouse_in_workspace and rectContainsPoint(rect, state.palette_mouse_x, state.palette_mouse_y);
+    const hovered = state.transcript_controller.palette_mouse_in_workspace and rectContainsPoint(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     if (hovered) {
         queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 56)), theme.scaledUi(8.0));
     }
@@ -1226,7 +1226,7 @@ fn renderPaletteSidebarToggle(state: *runtime.AppState, rect: palette.Rect, expa
 
 /// Renders add/edit actions with the same themed geometry as the sidebar toggle.
 fn renderPaletteSidebarActionIcon(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8, hover_override: ?bool, clip: ?palette.Rect) void {
-    const hovered = hover_override orelse (state.palette_mouse_in_workspace and rectContainsPoint(rect, state.palette_mouse_x, state.palette_mouse_y));
+    const hovered = hover_override orelse (state.transcript_controller.palette_mouse_in_workspace and rectContainsPoint(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y));
     if (hovered) {
         queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 56)), theme.scaledUi(8.0));
     }
@@ -1242,7 +1242,7 @@ fn renderPaletteSidebarActionIcon(state: *runtime.AppState, rect: palette.Rect, 
 
 /// Renders the sidebar settings gear button used by both expanded and collapsed rails.
 fn renderPaletteSettingsButton(state: *runtime.AppState, rect: palette.Rect, clip: ?palette.Rect) void {
-    const settings_hover = state.palette_mouse_in_workspace and rectContainsPoint(rect, state.palette_mouse_x, state.palette_mouse_y);
+    const settings_hover = state.transcript_controller.palette_mouse_in_workspace and rectContainsPoint(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     if (settings_hover) {
         queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 56)), theme.scaledUi(8.0));
     }
@@ -1272,8 +1272,8 @@ fn workspaceInitial(buf: *[1]u8, label: []const u8) []const u8 {
 /// (error > waiting > done > working), or null when nothing needs attention.
 /// Used by the collapsed activity dock.
 fn workspaceStatusColor(state: *runtime.AppState, project_index: usize) ?[4]f32 {
-    if (project_index >= state.projects.items.len) return null;
-    const project = &state.projects.items[project_index];
+    if (project_index >= state.project_controller.projects.items.len) return null;
+    const project = &state.project_controller.projects.items[project_index];
     var has_waiting = false;
     var has_done = false;
     var has_working = false;
@@ -1333,7 +1333,7 @@ fn renderCollapsedCompositionDots(
     var index: usize = 0;
     while (index < shown) : (index += 1) {
         const pane = order.panes[index];
-        const selected_pane = state.selected_project_index == project_index and
+        const selected_pane = state.project_controller.selected_index == project_index and
             layout.focused_pane_id != null and
             layout.focused_pane_id.? == pane.id;
         const indicator = collapsedPaneIndicator(state, project_index, project, pane, selected_pane);
@@ -1493,8 +1493,8 @@ fn renderOpenPaneRow(
         if (value.pane_id == pane.id) value else null
     else
         null;
-    const focused = state.selected_project_index == project_index and layout.focused_pane_id == pane.id;
-    const hovered = state.palette_mouse_in_workspace and rectContainsPoint(rect, state.palette_mouse_x, state.palette_mouse_y);
+    const focused = state.project_controller.selected_index == project_index and layout.focused_pane_id == pane.id;
+    const hovered = state.transcript_controller.palette_mouse_in_workspace and rectContainsPoint(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     // Accent-tinted fills (not the gray border token) so focus/hover track
     // the active theme; alphas follow the command palette's selection washes.
     if (focused) {
@@ -1712,8 +1712,8 @@ fn paneStatusLabelText(buf: []u8, status: ?native_state.SurfaceStatus, running: 
 }
 
 fn openPaneChatThreadIndex(state: *const runtime.AppState, project_index: usize, pane_id: native_state.WorkspacePaneId) ?usize {
-    if (project_index >= state.projects.items.len) return null;
-    const project = &state.projects.items[project_index];
+    if (project_index >= state.project_controller.projects.items.len) return null;
+    const project = &state.project_controller.projects.items[project_index];
     const pane = project.workspace_layout.paneById(pane_id) orelse return null;
     return switch (pane.ref) {
         .chat => |ref| if (ref.thread_index < project.threads.items.len) ref.thread_index else null,
@@ -2039,6 +2039,7 @@ pub fn queuePaletteAgentTuiProviderGlyph(state: *runtime.AppState, provider: nat
         .opencode => .opencode,
         .claude => .claude,
         .cursor => .cursor,
+        .grok => .grok,
         .amp => .amp,
         .other => return,
     };
@@ -2050,6 +2051,7 @@ const TerminalAgentProvider = enum {
     opencode,
     claude,
     cursor,
+    grok,
     amp,
 };
 
@@ -2069,6 +2071,7 @@ fn queuePaletteProviderGlyphInRect(state: *runtime.AppState, provider: TerminalA
         .opencode => state.opencode_logo_texture,
         .claude => state.claude_logo_texture,
         .cursor => state.cursor_logo_texture,
+        .grok => null,
         .amp => state.amp_logo_texture,
     };
     if (texture) |cached| {
@@ -2082,6 +2085,7 @@ fn queuePaletteProviderGlyphInRect(state: *runtime.AppState, provider: TerminalA
         .opencode => "O",
         .claude => "Cl",
         .cursor => "Cu",
+        .grok => "G",
         .amp => "A",
     };
     const font_size = @min(theme.scaledUi(11.0), box.h);
@@ -2102,6 +2106,7 @@ fn providerFromComm(comm: []const u8) ?TerminalAgentProvider {
     if (std.mem.eql(u8, comm, "opencode")) return .opencode;
     if (std.mem.startsWith(u8, comm, "cursor")) return .cursor;
     if (std.mem.eql(u8, comm, "agent")) return .cursor;
+    if (std.mem.eql(u8, comm, "grok")) return .grok;
     if (std.mem.eql(u8, comm, "amp")) return .amp;
     return null;
 }

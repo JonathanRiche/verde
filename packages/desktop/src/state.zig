@@ -14,11 +14,9 @@ const bang_commands = @import("workspace/bang_commands.zig");
 const chat_threads = @import("chat/threads.zig");
 const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
-const fff = @import("workspace/file_search.zig");
 const herdr = @import("workspace/herdr.zig");
 const keybinds = @import("app/keybinds.zig");
 const loop_wakeup = @import("loop_wakeup");
-const notifier = @import("app/notifier.zig");
 const platform_paths = @import("platform_paths");
 const platform_runtime = @import("platform_runtime");
 const platform_process = @import("platform/process.zig");
@@ -34,9 +32,6 @@ const sessionizer = @import("terminal/sessionizer.zig");
 const terminal = @import("terminal/terminal.zig");
 const theme = @import("ui/theme.zig");
 const text_measure = @import("ui/text_measure.zig");
-const diff_view_cache = @import("ui/diff_view_cache.zig");
-const updater = @import("app/updater.zig");
-const update_installer = @import("app/update_installer.zig");
 const utils = @import("utils.zig");
 const browser_pane = @import("state/browser_pane.zig");
 const workspace_layout = @import("state/workspace_layout.zig");
@@ -49,14 +44,21 @@ const project_state = @import("state/project.zig");
 const state_storage = @import("state/storage.zig");
 const persistence = @import("state/persistence.zig");
 const command_controller = @import("state/command_controller.zig");
+const composer_controller = @import("state/composer_controller.zig");
 const browser_controller = @import("state/browser_controller.zig");
 const workspace_controller = @import("state/workspace_controller.zig");
 const lifecycle_controller = @import("state/lifecycle_controller.zig");
 const chat_controller = @import("state/chat_controller.zig");
 const provider_controller = @import("state/provider_controller.zig");
+const project_controller = @import("state/project_controller.zig");
+const file_search_controller = @import("state/file_search_controller.zig");
+const herdr_controller = @import("state/herdr_controller.zig");
+const handoff_controller = @import("state/handoff_controller.zig");
+const settings_controller = @import("state/settings_controller.zig");
+const surface_controller = @import("state/surface_controller.zig");
+const terminal_controller = @import("state/terminal_controller.zig");
+const transcript_controller = @import("state/transcript_controller.zig");
 
-/// Arrow-key line step for transcript scroll (scaled px per key repeat).
-const TRANSCRIPT_KEYBOARD_LINE_PX: f32 = 29.0;
 const STACK_CONFIG_REFRESH_MS: i64 = 2000;
 const BACKGROUND_TASK_POLL_MS: i64 = 1000;
 const MANAGED_PROCESS_BASE_RESTART_BACKOFF_MS: i64 = 1000;
@@ -77,28 +79,12 @@ pub const Provider = provider_models.Provider;
 pub const AgentTuiProvider = stack_config.AgentProvider;
 pub const Harness = provider_models.Harness;
 
-const CHAT_TITLE_PROVIDER_OPTIONS = [_]app_config.ChatTitleProvider{
-    .codex,
-    .claude,
-    .cursor,
-    .opencode,
-};
-
 fn harnessProviderForDbProvider(provider: Provider) ai_harness.Provider {
     return switch (provider) {
         .opencode => .opencode,
         .codex => .codex,
         .claude => .claude,
         .cursor => .cursor,
-    };
-}
-
-fn dbProviderForChatTitleProvider(provider: app_config.ChatTitleProvider) Provider {
-    return switch (provider) {
-        .codex => .codex,
-        .claude => .claude,
-        .cursor => .cursor,
-        .opencode => .opencode,
     };
 }
 
@@ -115,75 +101,9 @@ fn slashCommandMatchesPrefix(name: []const u8, prefix: []const u8) bool {
     return std.mem.startsWith(u8, name, prefix);
 }
 
-pub const SurfaceStatus = enum {
-    idle,
-    working,
-    waiting,
-    done,
-    @"error",
-};
-
-pub const SurfaceUpdate = struct {
-    session_id: []const u8,
-    workspace_id: ?[]const u8 = null,
-    workspace_path: ?[]const u8 = null,
-    dock_id: ?u32 = null,
-    pane_id: ?u32 = null,
-    provider: ?Provider = null,
-    provider_thread_id: ?[]const u8 = null,
-    title: ?[]const u8 = null,
-    status: ?SurfaceStatus = null,
-    progress: ?f32 = null,
-    attention: ?bool = null,
-    unread_increment: u32 = 0,
-    last_event_title: ?[]const u8 = null,
-    last_event_body: ?[]const u8 = null,
-    clear: bool = false,
-};
-
-pub const SurfaceState = struct {
-    session_id: []u8,
-    workspace_id: []u8 = "",
-    workspace_path: []u8 = "",
-    dock_id: u32 = 0,
-    pane_id: ?u32 = null,
-    provider: ?Provider = null,
-    provider_thread_id: ?[]u8 = null,
-    title: []u8 = "",
-    status: SurfaceStatus = .idle,
-    /// Unix ms when `status` last changed value; 0 while unknown. Drives the
-    /// sidebar's elapsed "Working · m:ss" label for terminal panes.
-    status_changed_at_ms: i64 = 0,
-    /// A completion remains pending until the user focuses this pane or clears
-    /// it through the CLI/MCP surface controls. It is persisted independently
-    /// from the live status so a later working update cannot erase the notice.
-    completion_pending: bool = false,
-    completed_at_ms: i64 = 0,
-    progress: ?f32 = null,
-    attention: bool = false,
-    unread_count: u32 = 0,
-    last_event_title: ?[]u8 = null,
-    last_event_body: ?[]u8 = null,
-    last_event_at_ms: i64 = 0,
-
-    pub fn displayStatus(self: *const SurfaceState) SurfaceStatus {
-        return if (self.completion_pending) .done else self.status;
-    }
-
-    pub fn deinit(self: *SurfaceState, allocator: std.mem.Allocator) void {
-        allocator.free(self.session_id);
-        allocator.free(self.workspace_id);
-        allocator.free(self.workspace_path);
-        allocator.free(self.title);
-        if (self.provider_thread_id) |value| allocator.free(value);
-        if (self.last_event_title) |value| allocator.free(value);
-        if (self.last_event_body) |value| allocator.free(value);
-        self.* = undefined;
-    }
-};
-
-/// Settings modal fade in/out duration.
-const SETTINGS_MODAL_FADE_MS: f32 = 160.0;
+pub const SurfaceStatus = surface_controller.SurfaceStatus;
+pub const SurfaceUpdate = surface_controller.SurfaceUpdate;
+pub const SurfaceState = surface_controller.SurfaceState;
 
 pub const PaletteModalAction = enum {
     mcp_onboarding_not_now,
@@ -238,30 +158,8 @@ pub const PaletteModalAction = enum {
     command_palette_action_row,
 };
 
-pub const SettingsOpenAction = enum {
-    folder,
-    editor,
-    cursor,
-    vscode,
-    zed,
-    custom,
-};
-
-pub const SettingsDraft = struct {
-    font_size: f32 = theme.DEFAULT_FONT_SIZE,
-    terminal_font_size: f32 = app_config.DEFAULT_TERMINAL_FONT_SIZE,
-    theme_source: theme.ThemeSource = .omarchy,
-    theme_choice: usize = 1,
-    open_action: SettingsOpenAction = .folder,
-    link_open_target: app_config.LinkOpenTarget = .verde_browser,
-    tool_call_group_preference: app_config.ToolCallGroupPreference = .collapsed,
-    diff_layout_preference: app_config.DiffLayoutPreference = .stacked,
-    automatic_chat_titles_enabled: bool = true,
-    chat_title_provider: app_config.ChatTitleProvider = .codex,
-    new_chat_pane_behavior: app_config.NewChatPaneBehavior = .new_pane,
-    check_for_updates_automatically: bool = true,
-    notifications_enabled: bool = true,
-};
+pub const SettingsOpenAction = settings_controller.OpenAction;
+pub const SettingsDraft = settings_controller.Draft;
 
 pub const PaletteModalHit = struct {
     rect: palette.Rect,
@@ -650,7 +548,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
     const state = appStateFromContext(context) orelse return;
     switch (event) {
         .text_changed => |text| {
-            state.bang_history_message_index = null;
+            state.composer_controller.bang_history_message_index = null;
             state.setDraft(text);
             state.updateFileSearch();
             state.clampSlashCommandPickerSelection();
@@ -670,7 +568,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
             if (state.handleProviderSlashCommand(state.currentProject().currentDraft())) return;
             state.sendDraft() catch |err| {
                 log.err("failed to send draft: {s}", .{@errorName(err)});
-                state.setSidebarNotice(initialSendStartFailureMessage(err));
+                state.setSidebarNotice(chat_controller.initialSendStartFailureMessage(err));
             };
         },
         .model_changed => |index| {
@@ -740,9 +638,9 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
             if (state.currentThread().isSendPendingForUi()) state.abortCurrentThreadSend();
         },
         .focus_changed => |focused| {
-            state.composer_focused = focused;
+            state.composer_controller.focused = focused;
             if (focused) {
-                state.terminal_focused = false;
+                state.terminal_controller.focused = false;
                 state.unfocusBrowserPane();
             }
         },
@@ -767,8 +665,8 @@ pub const ModelPickerEntry = struct {
 };
 
 fn modelPickerEntryAt(state: *const AppState, index: usize) ?ModelPickerEntry {
-    if (index >= state.model_picker_entries.items.len) return null;
-    return state.model_picker_entries.items[index];
+    if (index >= state.composer_controller.model_picker_entries.items.len) return null;
+    return state.composer_controller.model_picker_entries.items[index];
 }
 
 fn modelPickerOptionAt(state: *const AppState, index: usize) ?ModelOption {
@@ -1097,18 +995,17 @@ pub const IMAGE_MODAL_ID: [:0]const u8 = "AttachmentPreviewModal";
 pub const THREAD_IMPORT_MODAL_ID: [:0]const u8 = "ThreadImportModal";
 pub const TRANSCRIPT_SELECTION_MODAL_ID: [:0]const u8 = "TranscriptSelectionModal";
 pub const VERDE_LOGO_BYTES = @embedFile("assets/verde_logo_mask.png");
-pub const OPENCODE_LOGO_BYTES = @embedFile("assets/opencode-logo-dark.png");
-pub const CODEX_LOGO_BYTES = @embedFile("assets/OpenAI-white-monoblossom.png");
-pub const CLAUDE_LOGO_BYTES = @embedFile("assets/claude-logo.png");
+pub const OPENCODE_LOGO_BYTES = surface_controller.OPENCODE_LOGO_BYTES;
+pub const CODEX_LOGO_BYTES = surface_controller.CODEX_LOGO_BYTES;
+pub const CLAUDE_LOGO_BYTES = surface_controller.CLAUDE_LOGO_BYTES;
 pub const AMP_LOGO_BYTES = @embedFile("assets/amp-logo.png");
 pub const THREAD_EDIT_BYTES = @embedFile("assets/thread_edit.png");
-pub const CURSOR_LOGO_BYTES = @embedFile("assets/editor_logos/cursor.png");
+pub const CURSOR_LOGO_BYTES = surface_controller.CURSOR_LOGO_BYTES;
 pub const EMACS_LOGO_BYTES = @embedFile("assets/editor_logos/emacs.png");
 pub const NEOVIM_LOGO_BYTES = @embedFile("assets/editor_logos/neovim.png");
 pub const VSCODE_LOGO_BYTES = @embedFile("assets/editor_logos/vscode.png");
 pub const ZED_LOGO_BYTES = @embedFile("assets/editor_logos/zed.png");
 
-const LoadedPersistedState = db_types.LoadedState;
 const PersistedChatCompletion = db_types.PersistedChatCompletion;
 const PersistedImageAttachment = db_types.PersistedImageAttachment;
 const PersistedHerdrWorkspaceLink = db_types.PersistedHerdrWorkspaceLink;
@@ -1155,15 +1052,8 @@ const AccessModeOption = provider_models.AccessModeOption;
 const TranscriptMarkdownBody = chat_types.TranscriptMarkdownBody;
 const TranscriptHeightEntry = chat_types.TranscriptHeightEntry;
 
-pub const TranscriptMarkdownSelectionPoint = struct {
-    message_index: usize,
-    point: chat_markdown.SelectionPoint,
-};
-
-pub const TranscriptMarkdownSelection = struct {
-    anchor: TranscriptMarkdownSelectionPoint,
-    focus: TranscriptMarkdownSelectionPoint,
-};
+pub const TranscriptMarkdownSelectionPoint = transcript_controller.MarkdownSelectionPoint;
+pub const TranscriptMarkdownSelection = transcript_controller.MarkdownSelection;
 
 pub const OPENCODE_MODEL_OPTIONS = provider_models.OPENCODE_MODEL_OPTIONS;
 pub const CODEX_MODEL_OPTIONS = provider_models.CODEX_MODEL_OPTIONS;
@@ -1210,23 +1100,8 @@ const SlashCommandState = command_controller.SlashCommandState;
 pub const PendingSlashCommandDetails = command_controller.PendingSlashCommandDetails;
 const SlashCommandWorkerRequest = command_controller.SlashCommandWorkerRequest;
 
-const FileSearchToken = struct {
-    at_start: usize,
-    query_start: usize,
-    end: usize,
-};
-
-pub const FileSearchResult = struct {
-    path: []u8,
-    relative_path: []u8,
-    file_name: []u8,
-
-    fn deinit(self: FileSearchResult, allocator: std.mem.Allocator) void {
-        allocator.free(self.path);
-        allocator.free(self.relative_path);
-        allocator.free(self.file_name);
-    }
-};
+const FileSearchToken = file_search_controller.Token;
+pub const FileSearchResult = file_search_controller.Result;
 
 pub const ImportThreadSummary = struct {
     id: [:0]const u8,
@@ -1238,79 +1113,7 @@ pub const ImportThreadSummary = struct {
     }
 };
 
-pub const HerdrProfileSummary = struct {
-    name: [:0]const u8,
-    ssh_target: [:0]const u8,
-    session: [:0]const u8,
-    remote_cwd: ?[:0]const u8 = null,
-    local_dir: ?[:0]const u8 = null,
-
-    fn deinit(self: HerdrProfileSummary, allocator: std.mem.Allocator) void {
-        allocator.free(self.name);
-        allocator.free(self.ssh_target);
-        allocator.free(self.session);
-        if (self.remote_cwd) |value| allocator.free(value);
-        if (self.local_dir) |value| allocator.free(value);
-    }
-};
-
-const FileSearchState = struct {
-    finder: ?fff.Finder = null,
-    project_path: ?[]u8 = null,
-    last_query: ?[]u8 = null,
-    token: ?FileSearchToken = null,
-    results: std.ArrayList(FileSearchResult) = .empty,
-    total_matched: usize = 0,
-    total_files: usize = 0,
-    visible: bool = false,
-    selected_index: usize = 0,
-    ensure_selection_visible: bool = false,
-
-    fn clearResults(self: *FileSearchState, allocator: std.mem.Allocator) void {
-        for (self.results.items) |item| item.deinit(allocator);
-        self.results.clearRetainingCapacity();
-        self.total_matched = 0;
-        self.total_files = 0;
-        self.selected_index = 0;
-        self.ensure_selection_visible = false;
-    }
-
-    fn setResults(self: *FileSearchState, allocator: std.mem.Allocator, search_results: *fff.SearchResults) !void {
-        self.clearResults(allocator);
-        try self.results.ensureTotalCapacity(allocator, search_results.items.len);
-        var appended: usize = 0;
-        errdefer {
-            for (self.results.items[0..appended]) |item| item.deinit(allocator);
-            self.results.clearRetainingCapacity();
-        }
-        for (search_results.items) |item| {
-            self.results.appendAssumeCapacity(.{
-                .path = try allocator.dupe(u8, item.path),
-                .relative_path = try allocator.dupe(u8, item.relative_path),
-                .file_name = try allocator.dupe(u8, item.file_name),
-            });
-            appended += 1;
-        }
-        self.total_matched = search_results.total_matched;
-        self.total_files = search_results.total_files;
-        self.selected_index = 0;
-        self.ensure_selection_visible = true;
-    }
-
-    fn clearQuery(self: *FileSearchState, allocator: std.mem.Allocator) void {
-        if (self.last_query) |query| allocator.free(query);
-        self.last_query = null;
-    }
-
-    fn deinit(self: *FileSearchState, allocator: std.mem.Allocator) void {
-        self.clearResults(allocator);
-        self.results.deinit(allocator);
-        self.clearQuery(allocator);
-        if (self.project_path) |project_path| allocator.free(project_path);
-        if (self.finder) |*finder| finder.deinit();
-        self.* = .{};
-    }
-};
+pub const HerdrProfileSummary = herdr_controller.ProfileSummary;
 
 pub const TextureBackend = state_ui_types.TextureBackend;
 pub const CachedImageTexture = state_ui_types.CachedImageTexture;
@@ -1351,72 +1154,11 @@ pub const inferredWorkspaceResource = workspace_controller.inferredWorkspaceReso
 pub const workspaceResourcesOverlap = workspace_controller.workspaceResourcesOverlap;
 const appendOwnedString = workspace_controller.appendOwnedString;
 
-const DefaultAgentTui = struct {
-    name: []const u8,
-    command: []const u8,
-    provider: stack_config.AgentProvider,
-    notify: bool = false,
-    mcp: bool = false,
-    hooks: bool = false,
-};
-
-const OPENCODE_TUI_COMMAND =
-    \\candidate=$(find "$HOME/.npm/_npx" -path '*/node_modules/opencode-linux-x64*/bin/opencode' -type f -perm -111 2>/dev/null | sort | tail -n 1)
-    \\if [ -n "$candidate" ]; then exec "$candidate"; fi
-    \\exec opencode
-;
-fn opencodeTuiCommandForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
-    // The npx cache fallback is Unix-specific. Windows executable discovery
-    // already honors PATHEXT, including the common opencode.cmd shim.
-    return if (os_tag == .windows) "opencode" else OPENCODE_TUI_COMMAND;
-}
-
-fn defaultAgentTui(provider: stack_config.AgentProvider) ?DefaultAgentTui {
-    return switch (provider) {
-        .codex => .{ .name = "codex", .command = "codex", .provider = .codex, .notify = true, .mcp = true, .hooks = true },
-        .claude => .{ .name = "claude", .command = "claude", .provider = .claude },
-        .opencode => .{ .name = "opencode", .command = opencodeTuiCommandForOs(builtin.os.tag), .provider = .opencode },
-        .cursor => .{ .name = "cursor", .command = "agent", .provider = .cursor, .notify = true, .hooks = true },
-        .amp => .{ .name = "amp", .command = "amp", .provider = .amp },
-        .other => null,
-    };
-}
-
-fn isKnownDefaultAgentTuiCommand(provider: stack_config.AgentProvider, command: []const u8) bool {
-    return switch (provider) {
-        .codex => std.mem.eql(u8, command, "codex"),
-        .claude => std.mem.eql(u8, command, "claude"),
-        .opencode => std.mem.eql(u8, command, "opencode") or std.mem.eql(u8, command, OPENCODE_TUI_COMMAND),
-        .cursor => std.mem.eql(u8, command, "agent"),
-        .amp => std.mem.eql(u8, command, "amp"),
-        .other => false,
-    };
-}
-
-fn agentTuiProviderLabel(provider: ?stack_config.AgentProvider) []const u8 {
-    return switch (provider orelse return "Agent") {
-        .codex => "Codex",
-        .claude => "Claude",
-        .opencode => "OpenCode",
-        .cursor => "Cursor",
-        .amp => "Amp",
-        .other => "Agent",
-    };
-}
-
-fn supportedAgentTuiProviderFromName(name: []const u8) ?stack_config.AgentProvider {
-    const provider = std.meta.stringToEnum(stack_config.AgentProvider, name) orelse return null;
-    return if (defaultAgentTui(provider) != null) provider else null;
-}
-
-fn agentTuiProviderFromProcessName(name: []const u8) ?stack_config.AgentProvider {
-    if (std.mem.eql(u8, name, "codex")) return .codex;
-    if (std.mem.eql(u8, name, "claude")) return .claude;
-    if (std.mem.eql(u8, name, "opencode")) return .opencode;
-    if (std.mem.eql(u8, name, "agent") or std.mem.startsWith(u8, name, "cursor")) return .cursor;
-    if (std.mem.eql(u8, name, "amp")) return .amp;
-    return null;
-}
+const DefaultAgentTui = terminal_controller.DefaultAgentTui;
+const OPENCODE_TUI_COMMAND = terminal_controller.OPENCODE_TUI_COMMAND;
+const defaultAgentTui = terminal_controller.defaultAgentTui;
+const isKnownDefaultAgentTuiCommand = terminal_controller.isKnownDefaultAgentTuiCommand;
+const agentTuiProviderLabel = terminal_controller.agentTuiProviderLabel;
 
 pub const WorkspaceSplitAxis = workspace_layout.WorkspaceSplitAxis;
 pub const WorkspacePaneDirection = workspace_layout.WorkspacePaneDirection;
@@ -1431,156 +1173,17 @@ pub const HerdrPaneProvider = herdr_types.HerdrPaneProvider;
 const ProviderExecutionTarget = herdr_types.ProviderExecutionTarget;
 pub const HerdrPaneLink = herdr_types.HerdrPaneLink;
 pub const HerdrWorkspaceLink = herdr_types.HerdrWorkspaceLink;
-
-fn herdrPaneProviderForThreadProvider(provider: Provider) HerdrPaneProvider {
-    return switch (provider) {
-        .codex => .codex,
-        .claude => .claude,
-        .opencode => .opencode,
-        .cursor => .cursor,
-    };
-}
-
-fn herdrAgentCommandForProvider(allocator: std.mem.Allocator, provider: HerdrPaneProvider, thread_id: ?[]const u8) !?[]u8 {
-    if (thread_id) |id| {
-        return switch (provider) {
-            .codex => try std.fmt.allocPrint(allocator, "codex resume {s}", .{id}),
-            .claude => try std.fmt.allocPrint(allocator, "claude --resume {s}", .{id}),
-            .opencode => if (std.mem.startsWith(u8, id, "ses"))
-                try std.fmt.allocPrint(allocator, "{s} --session {s}", .{ OPENCODE_TUI_COMMAND, id })
-            else
-                try allocator.dupe(u8, OPENCODE_TUI_COMMAND),
-            .cursor => try std.fmt.allocPrint(allocator, "agent --resume {s}", .{id}),
-            .terminal, .browser, .unknown => null,
-        };
-    }
-
-    const command: ?[]const u8 = switch (provider) {
-        .codex => "codex",
-        .claude => "claude",
-        .opencode => OPENCODE_TUI_COMMAND,
-        .cursor => "agent",
-        .terminal, .browser, .unknown => null,
-    };
-    return if (command) |value| try allocator.dupe(u8, value) else null;
-}
-
-fn parseHerdrJsonStringAlloc(allocator: std.mem.Allocator, json: []const u8, key: []const u8) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
-    defer parsed.deinit();
-    const value = herdr.findJsonString(parsed.value, key) orelse return error.InvalidHerdrResponse;
-    return try allocator.dupe(u8, value);
-}
-
-pub const HerdrOpenResult = struct {
-    workspace_index: usize,
-    workspace_id: []const u8,
-    workspace_path: []const u8,
-    created: bool,
-    restored: bool,
-    remote: []const u8,
-    session: []const u8,
-    herdr_workspace: []const u8,
-    herdr_pane: ?[]const u8,
-    terminal_dock_id: ?u32,
-    terminal_pane_id: ?WorkspacePaneId,
-};
-
-pub const HerdrHandoffWorkspaceResult = struct {
-    workspace_index: usize,
-    workspace_id: []const u8,
-    label: []const u8,
-    path: []const u8,
-    remote: []const u8,
-    session: []const u8,
-    herdr_workspace: []const u8,
-    herdr_tab: ?[]const u8,
-    created: bool,
-    pane_count: usize,
-};
-
-pub const HerdrHandoffResult = struct {
-    dry_run: bool,
-    workspace_count: usize,
-    workspaces: []HerdrHandoffWorkspaceResult,
-
-    pub fn deinit(self: HerdrHandoffResult, allocator: std.mem.Allocator) void {
-        if (self.workspaces.len > 0) allocator.free(self.workspaces);
-    }
-};
-
-pub const HerdrUnlinkPreviousLink = struct {
-    remote: []const u8,
-    session: []const u8,
-    herdr_workspace: []const u8,
-    remote_cwd: ?[]const u8 = null,
-    herdr_pane: ?[]const u8 = null,
-    terminal_dock_id: ?u32 = null,
-    terminal_pane_id: ?WorkspacePaneId = null,
-    pane_links_len: usize = 0,
-    updated_at_ms: i64 = 0,
-
-    fn init(allocator: std.mem.Allocator, link: HerdrWorkspaceLink) !HerdrUnlinkPreviousLink {
-        const remote = try allocator.dupe(u8, link.remote_alias);
-        errdefer allocator.free(remote);
-        const session = try allocator.dupe(u8, link.session_name);
-        errdefer allocator.free(session);
-        const workspace = try allocator.dupe(u8, link.workspace_id);
-        errdefer allocator.free(workspace);
-        const remote_cwd = if (link.remote_cwd) |value| try allocator.dupe(u8, value) else null;
-        errdefer if (remote_cwd) |value| allocator.free(value);
-        const herdr_pane = if (link.last_pane_id) |value| try allocator.dupe(u8, value) else null;
-        errdefer if (herdr_pane) |value| allocator.free(value);
-        return .{
-            .remote = remote,
-            .session = session,
-            .herdr_workspace = workspace,
-            .remote_cwd = remote_cwd,
-            .herdr_pane = herdr_pane,
-            .terminal_dock_id = link.attach_dock_id,
-            .terminal_pane_id = link.attach_pane_id,
-            .pane_links_len = link.pane_links.items.len,
-            .updated_at_ms = link.updated_at_ms,
-        };
-    }
-
-    fn deinit(self: HerdrUnlinkPreviousLink, allocator: std.mem.Allocator) void {
-        allocator.free(self.remote);
-        allocator.free(self.session);
-        allocator.free(self.herdr_workspace);
-        if (self.remote_cwd) |value| allocator.free(value);
-        if (self.herdr_pane) |value| allocator.free(value);
-    }
-};
-
-pub const HerdrUnlinkWorkspaceResult = struct {
-    workspace_index: usize,
-    workspace_id: []const u8,
-    label: []const u8,
-    path: []const u8,
-    unlinked: bool,
-    previous: ?HerdrUnlinkPreviousLink = null,
-
-    fn deinit(self: HerdrUnlinkWorkspaceResult, allocator: std.mem.Allocator) void {
-        if (self.previous) |previous| previous.deinit(allocator);
-    }
-};
-
-pub const HerdrUnlinkResult = struct {
-    workspace_count: usize,
-    workspaces: []HerdrUnlinkWorkspaceResult,
-
-    pub fn deinit(self: HerdrUnlinkResult, allocator: std.mem.Allocator) void {
-        for (self.workspaces) |workspace| workspace.deinit(allocator);
-        if (self.workspaces.len > 0) allocator.free(self.workspaces);
-    }
-};
+pub const HerdrOpenResult = herdr_controller.HerdrOpenResult;
+pub const HerdrHandoffWorkspaceResult = herdr_controller.HerdrHandoffWorkspaceResult;
+pub const HerdrHandoffResult = herdr_controller.HerdrHandoffResult;
+pub const HerdrUnlinkPreviousLink = herdr_controller.HerdrUnlinkPreviousLink;
+pub const HerdrUnlinkWorkspaceResult = herdr_controller.HerdrUnlinkWorkspaceResult;
+pub const HerdrUnlinkResult = herdr_controller.HerdrUnlinkResult;
+const herdrUiFailureMessage = herdr_controller.herdrUiFailureMessage;
 
 pub const Project = project_state.Project;
 
 pub const Storage = state_storage.Storage;
-
-const savePersistedStateWorker = persistence.saveWorker;
 
 pub const SendStatus = chat_types.SendStatus;
 pub const FollowupKind = chat_types.FollowupKind;
@@ -1614,87 +1217,33 @@ pub const SidebarContextMenuKind = enum {
     thread,
 };
 
-pub const HandoffTargetSurface = enum {
-    gui_chat,
-    tui,
-};
+const ComposerControllerState = composer_controller.State(
+    PaletteComposerPrompt,
+    PaletteModelPicker,
+    ModelPickerEntry,
+    PaletteRunStepper,
+    RunStepperContext,
+);
+
+pub const HandoffTargetSurface = handoff_controller.TargetSurface;
 
 pub const AppState = struct {
     pub const DRAFT_CAPACITY = chat_types.DRAFT_CAPACITY;
-    const SAVE_DEBOUNCE_MS: i64 = 750;
-
-    const UpdateInstallerTerminalStatus = enum {
-        running,
-        succeeded,
-        failed,
-    };
-
-    const UpdateInstallerTerminal = struct {
-        project_index: usize,
-        dock_id: u32,
-        status: UpdateInstallerTerminalStatus = .running,
-    };
 
     allocator: std.mem.Allocator,
     storage: *const Storage,
-    projects: std.ArrayList(Project),
-    archived_projects: std.ArrayList(Project),
-    surfaces: std.ArrayList(SurfaceState),
-    selected_project_index: usize,
-    next_project_number: usize,
+    project_controller: project_controller.State,
+    surface_controller: surface_controller.State,
     import_path_storage: [DRAFT_CAPACITY:0]u8,
     rename_storage: [256:0]u8,
     sidebar_notice_storage: [256:0]u8,
     import_thread_id_storage: [256:0]u8,
     import_notice_storage: [256:0]u8,
-    herdr_profile_notice_storage: [256:0]u8,
+    herdr_controller: herdr_controller.State,
     sidebar_collapsed: bool,
     sidebar_hidden: bool,
     sidebar_hover_revealed: bool,
-    composer_focused: bool,
-    bang_history_message_index: ?usize,
-    composer_input_nonce: u32,
-    composer_input_bounds_valid: bool,
-    composer_input_min: [2]f32,
-    composer_input_max: [2]f32,
-    composer_send_bounds_valid: bool,
-    composer_send_min: [2]f32,
-    composer_send_max: [2]f32,
-    composer_send_pressed: bool,
-    composer_send_hovered: bool,
-    composer_draft_image_clear_valid: bool,
-    composer_draft_image_clear_rect: palette.Rect,
-    composer_draft_image_clear_index: usize,
-    composer_draft_image_clear_count: usize,
-    composer_draft_image_clear_rects: [16]palette.Rect,
-    composer_draft_image_clear_indices: [16]usize,
-    /// Hit rect of the pinned queued/steered follow-up card (above the composer).
-    /// Double-clicking it pulls the queued prompt back into the composer to edit.
-    followup_pin_valid: bool,
-    followup_pin_rect: palette.Rect,
-    composer_overlay_scroll_y: f32,
-    composer_overlay_follow_cursor: bool,
-    composer_overlay_last_cursor_pos: usize,
-    composer_overlay_last_draft_len: usize,
-    composer_toolbar_overlay_valid: bool,
-    composer_toolbar_model_rect: palette.Rect,
-    composer_toolbar_reasoning_rect: palette.Rect,
-    composer_toolbar_fast_rect: palette.Rect,
-    composer_toolbar_access_rect: palette.Rect,
-    palette_composer: PaletteComposerPrompt,
-    palette_model_picker: PaletteModelPicker,
-    model_picker_entries: std.ArrayList(ModelPickerEntry),
-    run_config_open: bool,
-    /// Restores the prompt caret after a keyboard-opened composer popover
-    /// closes. Mouse-opened popovers leave focus where the click placed it.
-    composer_popover_restore_focus: bool,
-    /// Index into the currently visible run-config rows for keyboard focus.
-    run_config_focused_row: usize,
-    /// Monotonic-ms timestamp of the last stepper animation tick; drives the
-    /// run-config thumb slide (see `tickRunConfigSteppers`).
-    run_config_last_tick_ms: i64,
-    run_steppers: [3]PaletteRunStepper,
-    run_stepper_contexts: [3]RunStepperContext,
+    composer_controller: ComposerControllerState,
     palette_overlay_batch: palette.RenderBatch,
     palette_frame_text: std.ArrayList(u8),
     palette_frame_text_arena: std.heap.ArenaAllocator,
@@ -1727,26 +1276,11 @@ pub const AppState = struct {
     /// Font size used to paint the focused modal input, matched for caret
     /// hit-testing on the same `.ui` font role.
     modal_text_input_font_size: f32,
-    terminal_focused: bool,
-    terminal_resize_drag_active: bool,
-    terminal_resize_drag_origin_height: f32,
+    terminal_controller: terminal_controller.State,
     // Whether the OS window currently holds input focus. Updated from SDL
     // window focus events; used to gate chat-completion notifications so we
     // don't notify about a turn the user is actively watching.
     window_input_focus: bool,
-    debug_terminal_window_focused: bool,
-    debug_terminal_hitbox_focused: bool,
-    debug_terminal_hitbox_active: bool,
-    debug_terminal_hitbox_clicked: bool,
-    debug_terminal_focus_requested: bool,
-    debug_last_terminal_key_handled: bool,
-    debug_last_terminal_text_handled: bool,
-    debug_last_terminal_scancode: ?sdl.Scancode,
-    debug_last_terminal_text: [32:0]u8,
-    debug_workspace_visible_pane_count: usize,
-    composer_picker_provider: ?Provider,
-    composer_slash_selected: usize,
-    composer_locked_model_picker_open: bool,
     opencode_model_options: std.ArrayList(ModelOption),
     claude_model_options: std.ArrayList(ModelOption),
     cursor_model_options: std.ArrayList(ModelOption),
@@ -1773,105 +1307,25 @@ pub const AppState = struct {
     /// Row index in `thread_import_threads` under the cursor (import modal list).
     thread_import_hover_index: ?usize,
     thread_import_threads: std.ArrayList(ImportThreadSummary),
-    /// Cross-provider handoff wizard. The preview is provider-neutral and is
-    /// only placed into the target input; the user still reviews and sends it.
-    handoff_modal_open: bool,
-    handoff_project_index: usize,
-    handoff_source_pane_id: WorkspacePaneId,
-    handoff_source_thread_index: ?usize,
-    handoff_source_provider: Provider,
-    handoff_target_surface: HandoffTargetSurface,
-    handoff_target_provider: Provider,
-    handoff_use_existing: bool,
-    handoff_target_thread_index: ?usize,
-    handoff_context_mode: chat_handoff.ContextMode,
-    handoff_preview: ?[:0]u8,
-    herdr_profile_picker_project_index: ?usize,
-    herdr_profile_selected_index: ?usize,
-    /// Row index in `herdr_profile_summaries` under the cursor (profile picker modal).
-    herdr_profile_hover_index: ?usize,
-    herdr_profile_summaries: std.ArrayList(HerdrProfileSummary),
+    handoff_controller: handoff_controller.State,
     /// Command palette (Ctrl+Shift+P overlay). `ui/command_palette.zig` owns result
     /// building and rendering; these are the cross-cutting bits the input
     /// router and keybind dispatch need.
     command_controller: command_controller.State,
-    show_project_creator: bool,
-    mcp_onboarding_visible: bool,
-    provider_onboarding_visible: bool,
-    provider_onboarding_dismissed: bool,
-    show_settings_modal: bool,
-    /// Settings modal fade: 0 hidden → 1 shown. Ticked once per rendered
-    /// frame from the modal's render path; finishing the fade-out is what
-    /// actually clears `show_settings_modal`.
-    settings_modal_anim_progress: f32,
-    settings_modal_anim_last_ms: i64,
-    settings_modal_closing: bool,
-    settings_draft: SettingsDraft,
-    settings_chat_title_model: ?[]u8,
-    settings_hook_claude_installed: bool,
-    settings_hook_codex_installed: bool,
-    settings_hook_cursor_installed: bool,
-    settings_hook_amp_installed: bool,
-    settings_mcp_summary: provider_mcp.Summary,
-    settings_scroll_y: f32,
-    settings_hover_control: ?u8,
-    settings_close_hovered: bool,
-    settings_theme_dropdown_open: bool,
-    settings_theme_hover_index: ?usize,
-    settings_theme_menu_scroll: usize,
-    settings_title_provider_dropdown_open: bool,
-    settings_title_model_dropdown_open: bool,
-    settings_title_menu_hover_index: ?usize,
-    settings_title_model_menu_scroll: usize,
-    settings_update_notes_expanded: bool,
-    update_state: updater.State,
-    update_installer_started: bool,
-    update_installer_terminal: ?UpdateInstallerTerminal,
-    update_exit_requested: bool,
+    settings_controller: settings_controller.State,
     app_config_file_mtime: i128,
     app_config_runtime_sync_pending: bool,
     project_directory_browse_requested: bool,
     project_directory_picker_create_parent: bool,
     picker_state: PickerState,
     slash_command_state: SlashCommandState,
-    opencode_model_cache_state: OpencodeModelCacheState,
-    claude_model_cache_state: ClaudeModelCacheState,
-    cursor_model_cache_state: CursorModelCacheState,
-    provider_readiness_state: ProviderReadinessState,
-    file_search_state: FileSearchState,
-    browser_state: browser_runtime.State,
+    provider_controller: provider_controller.State,
+    file_search_controller: file_search_controller.State,
     browser_controller: browser_controller.State,
-    browser_pane_min: [2]f32,
-    browser_pane_max: [2]f32,
-    browser_pane_input_size: [2]f32,
-    browser_pane_hovered: bool,
-    browser_cursor_shape: browser_runtime.CursorShape,
-    app_window_screen_origin: [2]i32,
-    app_window_display_scale: f32,
-    browser_surface_suspended_for_palette_overlay: bool,
-    browser_surface_suspended_for_layout: bool,
-    browser_surface_suspended_for_empty_state: bool,
-    browser_clipboard_copy_pending: bool,
     /// Palette sidebar thread row under the cursor (hover highlight).
     sidebar_thread_hover: ?SidebarThreadHover,
     sidebar_project_hover: ?usize,
     sidebar_new_thread_hover: ?usize,
-    browser_pane_focused: bool,
-    browser_address_focused: bool,
-    browser_address_cursor: usize,
-    /// Selection anchor for the URL bar. When equal to `browser_address_cursor`
-    /// (or null) there is no active selection.
-    browser_address_selection_anchor: ?usize,
-    /// True while the user is dragging to extend the URL-bar selection.
-    browser_address_drag_active: bool,
-    browser_inspector_menu_open: bool,
-    browser_context_menu_open: bool,
-    browser_context_menu_anchor_x: f32,
-    browser_context_menu_anchor_y: f32,
-    browser_context_menu_items: std.ArrayList(BrowserContextMenuItem),
-    browser_context_menu_link_url: ?[]u8,
-    browser_context_menu_selected_index: ?u32,
-    browser_context_menu_active_parent: ?u32,
     /// Split "Open" header menu (folder / editors); palette workspace chrome only.
     workspace_header_open_menu_open: bool,
     workspace_header_open_menu_pane_id: ?WorkspacePaneId,
@@ -1881,35 +1335,7 @@ pub const AppState = struct {
     sidebar_context_menu_thread_index: usize,
     sidebar_context_menu_anchor_x: f32,
     sidebar_context_menu_anchor_y: f32,
-    transcript_focused: bool,
-    transcript_selection_modal_requested: bool,
-    transcript_project_index: ?usize,
-    transcript_thread_index: ?usize,
-    transcript_selection_text: ?[:0]u8,
-    transcript_markdown_selection_project_index: ?usize,
-    transcript_markdown_selection_thread_index: ?usize,
-    transcript_markdown_selection_anchor: ?TranscriptMarkdownSelectionPoint,
-    transcript_markdown_selection_focus: ?TranscriptMarkdownSelectionPoint,
-    transcript_markdown_selection_dragging: bool,
-    /// Last pointer position in palette framebuffer space (updated from workspace mouse motion).
-    palette_mouse_x: f32,
-    palette_mouse_y: f32,
-    palette_mouse_in_workspace: bool,
-    /// Cached transcript layout from the last `chat_panel` paint (used for hit-testing between frames).
-    transcript_palette_column: palette.Rect,
-    transcript_palette_scroll_y: f32,
-    transcript_palette_clip: palette.Rect,
-    transcript_markdown_project_index: ?usize,
-    transcript_markdown_thread_index: ?usize,
-    transcript_markdown_entries: std.ArrayList(?*TranscriptMarkdownBody),
-    transcript_diff_view_cache: diff_view_cache.Cache,
-    transcript_auto_follow_pending: bool,
-    scroll_transcript_to_bottom_frames: u8,
-    /// Keyboard fine scroll: applied once on next transcript layout (px); cleared after paint.
-    pending_transcript_scroll_px: f32,
-    pending_transcript_page_steps: i16,
-    transcript_scroll_pending_track_p: usize,
-    transcript_scroll_pending_track_t: usize,
+    transcript_controller: transcript_controller.State,
     lifecycle: lifecycle_controller.State,
     chat_controller: chat_controller.State,
     /// Set by the sidebar render pass whenever it draws a pulsing status pip
@@ -1917,15 +1343,6 @@ pub const AppState = struct {
     /// previous frame's value to keep a ~30fps animation tick going (the loop
     /// otherwise sleeps and the pulse would step at the 1Hz label cadence).
     sidebar_pulse_animating: bool,
-    /// Monotonic ms timestamp of the last visible terminal input or output.
-    /// Input starts the fast-poll window before ConPTY has produced its echo,
-    /// avoiding a cold keystroke falling back to the idle wake cadence.
-    last_terminal_activity_ms: i64,
-    /// Caps synchronous daemon-tail RPCs when SDL delivers a burst of input or
-    /// mouse events. A terminal input can explicitly bypass the cap once so
-    /// the first output check still happens in the same event-loop iteration.
-    last_terminal_poll_ms: i64,
-    terminal_poll_requested: bool,
     /// Wall-clock ms deadline for ignoring Linux close requests immediately
     /// after a successful xdg-open/gio launch. Some file managers briefly send
     /// a focused SDL close event back to Verde even though the user only opened
@@ -1945,63 +1362,24 @@ pub const AppState = struct {
 
     pub fn init(allocator: std.mem.Allocator, storage: *const Storage, initial_config: app_config.AppConfig, options: InitOptions) !AppState {
         terminal.configureGhosttySystem();
-        var browser_state = try browser_runtime.State.init(allocator);
-        errdefer browser_state.deinit();
+        var browser_controller_state = try browser_controller.State.init(allocator);
+        errdefer browser_controller_state.deinit(allocator);
 
         var state: AppState = .{
             .allocator = allocator,
             .storage = storage,
-            .projects = .empty,
-            .archived_projects = .empty,
-            .surfaces = .empty,
-            .selected_project_index = 0,
-            .next_project_number = 4,
+            .project_controller = .{},
+            .surface_controller = .{},
             .import_path_storage = std.mem.zeroes([DRAFT_CAPACITY:0]u8),
             .rename_storage = std.mem.zeroes([256:0]u8),
             .sidebar_notice_storage = std.mem.zeroes([256:0]u8),
             .import_thread_id_storage = std.mem.zeroes([256:0]u8),
             .import_notice_storage = std.mem.zeroes([256:0]u8),
-            .herdr_profile_notice_storage = std.mem.zeroes([256:0]u8),
+            .herdr_controller = .{},
             .sidebar_collapsed = false,
             .sidebar_hidden = false,
             .sidebar_hover_revealed = false,
-            .composer_focused = false,
-            .bang_history_message_index = null,
-            .composer_input_nonce = 0,
-            .composer_input_bounds_valid = false,
-            .composer_input_min = .{ 0.0, 0.0 },
-            .composer_input_max = .{ 0.0, 0.0 },
-            .composer_send_bounds_valid = false,
-            .composer_send_min = .{ 0.0, 0.0 },
-            .composer_send_max = .{ 0.0, 0.0 },
-            .composer_send_pressed = false,
-            .composer_send_hovered = false,
-            .composer_draft_image_clear_valid = false,
-            .composer_draft_image_clear_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
-            .composer_draft_image_clear_index = 0,
-            .composer_draft_image_clear_count = 0,
-            .composer_draft_image_clear_rects = [_]palette.Rect{.{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 }} ** 16,
-            .composer_draft_image_clear_indices = [_]usize{0} ** 16,
-            .followup_pin_valid = false,
-            .followup_pin_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
-            .composer_overlay_scroll_y = 0.0,
-            .composer_overlay_follow_cursor = true,
-            .composer_overlay_last_cursor_pos = 0,
-            .composer_overlay_last_draft_len = 0,
-            .composer_toolbar_overlay_valid = false,
-            .composer_toolbar_model_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
-            .composer_toolbar_reasoning_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
-            .composer_toolbar_fast_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
-            .composer_toolbar_access_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
-            .palette_composer = PaletteComposerPrompt.init(),
-            .palette_model_picker = PaletteModelPicker.init(0),
-            .model_picker_entries = .empty,
-            .run_config_open = false,
-            .composer_popover_restore_focus = false,
-            .run_config_focused_row = 0,
-            .run_config_last_tick_ms = 0,
-            .run_steppers = .{ PaletteRunStepper.init(0), PaletteRunStepper.init(2), PaletteRunStepper.init(2) },
-            .run_stepper_contexts = .{ .{}, .{}, .{} },
+            .composer_controller = ComposerControllerState.init(),
             .palette_overlay_batch = .{},
             .palette_frame_text = .empty,
             .palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator),
@@ -2026,23 +1404,8 @@ pub const AppState = struct {
             .modal_text_drag_active = false,
             .modal_text_input_rect = .{},
             .modal_text_input_font_size = 0.0,
-            .terminal_focused = false,
-            .terminal_resize_drag_active = false,
-            .terminal_resize_drag_origin_height = 0.0,
+            .terminal_controller = .{},
             .window_input_focus = true,
-            .debug_terminal_window_focused = false,
-            .debug_terminal_hitbox_focused = false,
-            .debug_terminal_hitbox_active = false,
-            .debug_terminal_hitbox_clicked = false,
-            .debug_terminal_focus_requested = false,
-            .debug_last_terminal_key_handled = false,
-            .debug_last_terminal_text_handled = false,
-            .debug_last_terminal_scancode = null,
-            .debug_last_terminal_text = std.mem.zeroes([32:0]u8),
-            .debug_workspace_visible_pane_count = 0,
-            .composer_picker_provider = null,
-            .composer_slash_selected = 0,
-            .composer_locked_model_picker_open = false,
             .opencode_model_options = .empty,
             .claude_model_options = .empty,
             .cursor_model_options = .empty,
@@ -2068,92 +1431,21 @@ pub const AppState = struct {
             .thread_import_selected_index = null,
             .thread_import_hover_index = null,
             .thread_import_threads = .empty,
-            .handoff_modal_open = false,
-            .handoff_project_index = 0,
-            .handoff_source_pane_id = 0,
-            .handoff_source_thread_index = null,
-            .handoff_source_provider = .codex,
-            .handoff_target_surface = .gui_chat,
-            .handoff_target_provider = .claude,
-            .handoff_use_existing = false,
-            .handoff_target_thread_index = null,
-            .handoff_context_mode = .summary,
-            .handoff_preview = null,
-            .herdr_profile_picker_project_index = null,
-            .herdr_profile_selected_index = null,
-            .herdr_profile_hover_index = null,
-            .herdr_profile_summaries = .empty,
+            .handoff_controller = .{},
             .command_controller = .{},
-            .show_project_creator = false,
-            .mcp_onboarding_visible = false,
-            .provider_onboarding_visible = false,
-            .provider_onboarding_dismissed = false,
-            .show_settings_modal = false,
-            .settings_modal_anim_progress = 0.0,
-            .settings_modal_anim_last_ms = 0,
-            .settings_modal_closing = false,
-            .settings_draft = .{},
-            .settings_chat_title_model = null,
-            .settings_hook_claude_installed = false,
-            .settings_hook_codex_installed = false,
-            .settings_hook_cursor_installed = false,
-            .settings_hook_amp_installed = false,
-            .settings_mcp_summary = .{},
-            .settings_scroll_y = 0.0,
-            .settings_hover_control = null,
-            .settings_close_hovered = false,
-            .settings_theme_dropdown_open = false,
-            .settings_theme_hover_index = null,
-            .settings_theme_menu_scroll = 0,
-            .settings_title_provider_dropdown_open = false,
-            .settings_title_model_dropdown_open = false,
-            .settings_title_menu_hover_index = null,
-            .settings_title_model_menu_scroll = 0,
-            .settings_update_notes_expanded = false,
-            .update_state = .{},
-            .update_installer_started = false,
-            .update_installer_terminal = null,
-            .update_exit_requested = false,
+            .settings_controller = .{},
             .app_config_file_mtime = -1,
             .app_config_runtime_sync_pending = false,
             .project_directory_browse_requested = false,
             .project_directory_picker_create_parent = false,
             .picker_state = .{},
             .slash_command_state = .{},
-            .opencode_model_cache_state = .{},
-            .claude_model_cache_state = .{},
-            .cursor_model_cache_state = .{},
-            .provider_readiness_state = .{},
-            .file_search_state = .{},
-            .browser_state = browser_state,
-            .browser_controller = .{},
-            .browser_pane_min = .{ 0.0, 0.0 },
-            .browser_pane_max = .{ 0.0, 0.0 },
-            .browser_pane_input_size = .{ 0.0, 0.0 },
-            .browser_pane_hovered = false,
-            .browser_cursor_shape = .default,
-            .app_window_screen_origin = .{ 0, 0 },
-            .app_window_display_scale = 1.0,
-            .browser_surface_suspended_for_palette_overlay = false,
-            .browser_surface_suspended_for_layout = false,
-            .browser_surface_suspended_for_empty_state = false,
-            .browser_clipboard_copy_pending = false,
+            .provider_controller = .{},
+            .file_search_controller = .{},
+            .browser_controller = browser_controller_state,
             .sidebar_thread_hover = null,
             .sidebar_project_hover = null,
             .sidebar_new_thread_hover = null,
-            .browser_pane_focused = false,
-            .browser_address_focused = false,
-            .browser_address_cursor = 0,
-            .browser_address_selection_anchor = null,
-            .browser_address_drag_active = false,
-            .browser_inspector_menu_open = false,
-            .browser_context_menu_open = false,
-            .browser_context_menu_anchor_x = 0.0,
-            .browser_context_menu_anchor_y = 0.0,
-            .browser_context_menu_items = .empty,
-            .browser_context_menu_link_url = null,
-            .browser_context_menu_selected_index = null,
-            .browser_context_menu_active_parent = null,
             .workspace_header_open_menu_open = false,
             .workspace_header_open_menu_pane_id = null,
             .sidebar_context_menu_open = false,
@@ -2162,41 +1454,13 @@ pub const AppState = struct {
             .sidebar_context_menu_thread_index = 0,
             .sidebar_context_menu_anchor_x = 0.0,
             .sidebar_context_menu_anchor_y = 0.0,
-            .transcript_focused = false,
-            .transcript_selection_modal_requested = false,
-            .transcript_project_index = null,
-            .transcript_thread_index = null,
-            .transcript_selection_text = null,
-            .transcript_markdown_selection_project_index = null,
-            .transcript_markdown_selection_thread_index = null,
-            .transcript_markdown_selection_anchor = null,
-            .transcript_markdown_selection_focus = null,
-            .transcript_markdown_selection_dragging = false,
-            .palette_mouse_x = 0.0,
-            .palette_mouse_y = 0.0,
-            .palette_mouse_in_workspace = false,
-            .transcript_palette_column = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-            .transcript_palette_scroll_y = 0.0,
-            .transcript_palette_clip = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-            .transcript_markdown_project_index = null,
-            .transcript_markdown_thread_index = null,
-            .transcript_markdown_entries = .empty,
-            .transcript_diff_view_cache = .{},
-            .transcript_auto_follow_pending = true,
-            .scroll_transcript_to_bottom_frames = 8,
-            .pending_transcript_scroll_px = 0,
-            .pending_transcript_page_steps = 0,
-            .transcript_scroll_pending_track_p = std.math.maxInt(usize),
-            .transcript_scroll_pending_track_t = std.math.maxInt(usize),
+            .transcript_controller = .{},
             .lifecycle = .{},
             .chat_controller = .{},
             .sidebar_pulse_animating = false,
-            .last_terminal_activity_ms = 0,
-            .last_terminal_poll_ms = 0,
-            .terminal_poll_requested = false,
             .external_open_close_suppress_until_ms = 0,
         };
-        state.palette_composer.setCallbacks(.{});
+        state.composer_controller.composer.setCallbacks(.{});
 
         if (try storage.load(allocator)) |persisted_value| {
             var persisted = persisted_value;
@@ -2224,7 +1488,7 @@ pub const AppState = struct {
             state.zed_logo_texture = state.loadEmbeddedTexture(ZED_LOGO_BYTES);
         }
         if (state.app_config.mcp_integration_enabled) {
-            state.settings_mcp_summary = provider_mcp.install(state.allocator) catch |err| blk: {
+            state.settings_controller.mcp_summary = provider_mcp.install(state.allocator) catch |err| blk: {
                 log.warn("failed to refresh enabled provider MCP registrations: {s}", .{@errorName(err)});
                 break :blk provider_mcp.inspect(state.allocator);
             };
@@ -2332,7 +1596,7 @@ pub const AppState = struct {
         }
         var project = try Project.init(self.allocator, id, label, path, unread_count);
         project.applyDefaultTerminalFontSize(self.app_config.terminal_font_size);
-        try self.projects.append(self.allocator, project);
+        try self.project_controller.projects.append(self.allocator, project);
         self.markDirty();
         return .created;
     }
@@ -2348,10 +1612,10 @@ pub const AppState = struct {
 
         const label = utils.projectLabelFromPath(resolved);
         const add_result = try self.addProject(label, resolved, 0);
-        const index = self.projects.items.len - 1;
-        self.selected_project_index = index;
+        const index = self.project_controller.projects.items.len - 1;
+        self.project_controller.selected_index = index;
         self.syncRenameBuffer();
-        self.show_project_creator = false;
+        self.project_controller.show_creator = false;
         self.palette_modal_text_focus = .none;
         self.setSidebarNotice(if (add_result == .restored) "Workspace reopened." else "Workspace imported.");
         self.markDirty();
@@ -2393,842 +1657,7 @@ pub const AppState = struct {
         try self.importProjectFromInput();
     }
 
-    pub fn consumePendingHerdrOpenRequest(self: *AppState) !bool {
-        var threaded: std.Io.Threaded = .init(self.allocator, .{});
-        defer threaded.deinit();
-        var loaded = try herdr.readPendingOpen(self.allocator, threaded.io(), self.storage.pref_path) orelse return false;
-        defer loaded.deinit();
-        herdr.deletePendingOpen(self.allocator, threaded.io(), self.storage.pref_path);
-        _ = try self.openOrCreateHerdrWorkspace(loaded.value);
-        return true;
-    }
-
-    pub fn openOrCreateHerdrWorkspace(self: *AppState, request: herdr.OpenRequest) !HerdrOpenResult {
-        try herdr.validateOpenRequest(request);
-        const remote_alias = herdr.remoteAlias(request);
-        var created = false;
-        var restored = false;
-
-        const project_index = if (self.findHerdrProjectIndex(request)) |index| index else blk: {
-            const local_dir = try self.resolveHerdrLocalProjectDir(request);
-            defer self.allocator.free(local_dir);
-            if (self.findProjectIndexByPath(local_dir)) |index| {
-                break :blk index;
-            }
-            const result = try self.createProjectFromPath(local_dir);
-            created = !result.restored;
-            restored = result.restored;
-            break :blk result.index;
-        };
-
-        self.selected_project_index = project_index;
-        self.ensureCurrentProjectWorkspace();
-        const local_dir_for_link = self.projects.items[project_index].path;
-        try self.replaceProjectHerdrLink(project_index, request, local_dir_for_link, null, null);
-        self.syncRenameBuffer();
-        self.setSidebarNotice(if (remote_alias.len > 0) "Remote Herdr workspace opened." else "Herdr workspace opened.");
-        self.markDirty();
-
-        const project = &self.projects.items[project_index];
-        const link = project.herdr_link;
-        return .{
-            .workspace_index = project_index,
-            .workspace_id = project.id,
-            .workspace_path = project.path,
-            .created = created,
-            .restored = restored,
-            .remote = remote_alias,
-            .session = request.session,
-            .herdr_workspace = request.herdr_workspace,
-            .herdr_pane = request.pane,
-            .terminal_dock_id = if (link) |value| value.attach_dock_id else null,
-            .terminal_pane_id = if (link) |value| value.attach_pane_id else null,
-        };
-    }
-
-    pub fn handoffHerdrWorkspaces(self: *AppState, result_allocator: std.mem.Allocator, request: herdr.HandoffRequest) !HerdrHandoffResult {
-        try herdr.validateHandoffRequest(request);
-        if (self.projects.items.len == 0) return .{ .dry_run = request.dry_run, .workspace_count = 0, .workspaces = &.{} };
-
-        var results: std.ArrayList(HerdrHandoffWorkspaceResult) = .empty;
-        errdefer results.deinit(result_allocator);
-
-        if (request.all or request.workspace == null) {
-            for (self.projects.items, 0..) |_, project_index| {
-                try results.append(result_allocator, try self.handoffProjectToHerdr(project_index, request));
-            }
-        } else {
-            const project_index = self.herdrHandoffProjectIndex(request.workspace.?) orelse return error.NoProjectSelected;
-            try results.append(result_allocator, try self.handoffProjectToHerdr(project_index, request));
-        }
-
-        if (!request.dry_run) {
-            self.setSidebarNotice("Handed Verde workspace layout to Herdr.");
-            self.markDirty();
-        }
-
-        const owned = try results.toOwnedSlice(result_allocator);
-        return .{
-            .dry_run = request.dry_run,
-            .workspace_count = owned.len,
-            .workspaces = owned,
-        };
-    }
-
-    pub fn unlinkHerdrWorkspaces(self: *AppState, result_allocator: std.mem.Allocator, request: herdr.UnlinkRequest) !HerdrUnlinkResult {
-        try herdr.validateUnlinkRequest(request);
-        if (self.projects.items.len == 0) return .{ .workspace_count = 0, .workspaces = &.{} };
-
-        var results: std.ArrayList(HerdrUnlinkWorkspaceResult) = .empty;
-        errdefer {
-            for (results.items) |workspace| workspace.deinit(result_allocator);
-            results.deinit(result_allocator);
-        }
-
-        if (request.all) {
-            for (self.projects.items, 0..) |project, project_index| {
-                if (project.herdr_link == null) continue;
-                try self.appendHerdrUnlinkResult(result_allocator, &results, project_index);
-            }
-        } else {
-            const selector = request.workspace orelse "current";
-            const project_index = self.herdrHandoffProjectIndex(selector) orelse return error.NoProjectSelected;
-            try self.appendHerdrUnlinkResult(result_allocator, &results, project_index);
-        }
-
-        var unlinked_count: usize = 0;
-        for (results.items) |result| {
-            if (result.unlinked) unlinked_count += 1;
-        }
-        if (unlinked_count > 0) {
-            self.setSidebarNotice(if (unlinked_count == 1) "Herdr link removed; workspace now runs locally." else "Herdr links removed; workspaces now run locally.");
-            self.markDirty();
-        }
-
-        const owned = try results.toOwnedSlice(result_allocator);
-        return .{
-            .workspace_count = owned.len,
-            .workspaces = owned,
-        };
-    }
-
-    pub fn handoffProjectToLocalHerdrFromUi(self: *AppState, project_index: usize) void {
-        if (project_index >= self.projects.items.len) {
-            self.setSidebarNotice("Workspace not found.");
-            return;
-        }
-        const request: herdr.HandoffRequest = .{
-            .session = if (self.projects.items[project_index].herdr_link) |link| link.session_name else "default",
-            .workspace = self.projects.items[project_index].id,
-            .all = false,
-        };
-        var result = self.handoffHerdrWorkspaces(self.allocator, request) catch |err| {
-            self.setSidebarNotice(herdrUiFailureMessage(err));
-            return;
-        };
-        defer result.deinit(self.allocator);
-        self.setSidebarNotice("Workspace handed off to Herdr.");
-    }
-
-    pub fn unlinkProjectHerdrFromUi(self: *AppState, project_index: usize) void {
-        if (project_index >= self.projects.items.len) {
-            self.setSidebarNotice("Workspace not found.");
-            return;
-        }
-        const request: herdr.UnlinkRequest = .{
-            .workspace = self.projects.items[project_index].id,
-            .all = false,
-        };
-        var result = self.unlinkHerdrWorkspaces(self.allocator, request) catch |err| {
-            self.setSidebarNotice(herdrUiFailureMessage(err));
-            return;
-        };
-        defer result.deinit(self.allocator);
-        if (result.workspace_count == 0 or (result.workspaces.len > 0 and !result.workspaces[0].unlinked)) {
-            self.setSidebarNotice("Workspace is already running locally.");
-        }
-    }
-
-    pub fn focusProjectHerdrAttachTerminal(self: *AppState, project_index: usize) bool {
-        if (project_index >= self.projects.items.len) return false;
-        var project = &self.projects.items[project_index];
-        const link = project.herdr_link orelse {
-            self.setSidebarNotice("Workspace is not linked to Herdr.");
-            return false;
-        };
-        const dock_id = link.attach_dock_id orelse {
-            return self.openLinkedHerdrWorkspaceTerminalFromUi(project_index);
-        };
-        const pane_id = link.attach_pane_id orelse project.workspace_layout.visibleTerminalPaneIdForDock(dock_id) orelse {
-            return self.openLinkedHerdrWorkspaceTerminalFromUi(project_index);
-        };
-        if (project.workspace_layout.paneById(pane_id) == null) {
-            return self.openLinkedHerdrWorkspaceTerminalFromUi(project_index);
-        }
-        self.selected_project_index = project_index;
-        self.ensureCurrentProjectWorkspace();
-        project = &self.projects.items[project_index];
-        project.workspace_layout.focused_pane_id = pane_id;
-        project.workspace_layout.maximized_pane_id = null;
-        self.requestTerminalDockFocus(dock_id);
-        self.syncRenameBuffer();
-        self.markDirty();
-        return true;
-    }
-
-    fn appendHerdrUnlinkResult(
-        self: *AppState,
-        result_allocator: std.mem.Allocator,
-        results: *std.ArrayList(HerdrUnlinkWorkspaceResult),
-        project_index: usize,
-    ) !void {
-        var result = try self.snapshotHerdrUnlinkResult(result_allocator, project_index);
-        var result_owned = true;
-        errdefer if (result_owned) result.deinit(result_allocator);
-        try results.append(result_allocator, result);
-        result_owned = false;
-        if (result.unlinked) self.clearProjectHerdrLink(project_index);
-    }
-
-    fn snapshotHerdrUnlinkResult(self: *AppState, result_allocator: std.mem.Allocator, project_index: usize) !HerdrUnlinkWorkspaceResult {
-        if (project_index >= self.projects.items.len) return error.NoProjectSelected;
-        const project = &self.projects.items[project_index];
-        const previous = if (project.herdr_link) |link| try HerdrUnlinkPreviousLink.init(result_allocator, link) else null;
-        errdefer if (previous) |value| value.deinit(result_allocator);
-        return .{
-            .workspace_index = project_index,
-            .workspace_id = project.id,
-            .label = project.label,
-            .path = project.path,
-            .unlinked = previous != null,
-            .previous = previous,
-        };
-    }
-
-    fn clearProjectHerdrLink(self: *AppState, project_index: usize) void {
-        var project = &self.projects.items[project_index];
-        if (project.herdr_link) |*link| {
-            link.deinit(self.allocator);
-            project.herdr_link = null;
-        }
-    }
-
-    fn openLinkedHerdrWorkspaceTerminalFromUi(self: *AppState, project_index: usize) bool {
-        if (project_index >= self.projects.items.len) return false;
-        const project = &self.projects.items[project_index];
-        const link = project.herdr_link orelse {
-            self.setSidebarNotice("Workspace is not linked to Herdr.");
-            return false;
-        };
-        const request: herdr.OpenRequest = .{
-            .session = link.session_name,
-            .herdr_workspace = link.workspace_id,
-            .remote = if (link.remote_alias.len > 0) link.remote_alias else null,
-            .cwd = if (link.remote_alias.len == 0) project.path else null,
-            .remote_cwd = link.remote_cwd,
-            .local_dir = project.path,
-            .pane = link.last_pane_id,
-        };
-        const attach = self.ensureHerdrAttachTerminal(project_index, request) catch |err| {
-            self.setSidebarNotice(herdrUiFailureMessage(err));
-            return false;
-        };
-        self.replaceProjectHerdrLink(project_index, request, project.path, attach.dock_id, attach.pane_id) catch |err| {
-            self.setSidebarNotice(herdrUiFailureMessage(err));
-            return false;
-        };
-        self.syncRenameBuffer();
-        self.setSidebarNotice("Herdr terminal opened.");
-        self.markDirty();
-        return true;
-    }
-
-    fn herdrUiFailureMessage(err: anyerror) []const u8 {
-        return switch (err) {
-            error.HerdrCommandFailed => "Herdr command failed. Check Herdr is installed/running.",
-            error.InvalidHerdrResponse => "Herdr returned an unexpected response.",
-            error.NoProjectSelected => "Workspace not found.",
-            error.MissingHerdrSession => "Herdr session name is required.",
-            else => "Herdr action failed.",
-        };
-    }
-
-    fn handoffProjectToHerdr(self: *AppState, project_index: usize, request: herdr.HandoffRequest) !HerdrHandoffWorkspaceResult {
-        if (project_index >= self.projects.items.len) return error.NoProjectSelected;
-        var project = &self.projects.items[project_index];
-        const existing_link = project.herdr_link;
-        const remote_alias = request.remote orelse if (existing_link) |link| link.remote_alias else "";
-        const session_name = if (existing_link) |link| link.session_name else request.session;
-        var default_remote_cwd: ?[]u8 = null;
-        defer if (default_remote_cwd) |cwd| self.allocator.free(cwd);
-        const remote_cwd = if (remote_alias.len > 0) blk: {
-            if (request.remote_cwd) |cwd| break :blk cwd;
-            if (existing_link) |link| {
-                if (link.remote_cwd) |cwd| {
-                    // Earlier builds used the local project path as the
-                    // implicit remote cwd. Treat that as unset so existing
-                    // links migrate to Verde's remote workspace area.
-                    if (!std.mem.eql(u8, cwd, project.path)) break :blk cwd;
-                }
-            }
-            default_remote_cwd = try herdr.defaultRemoteCwd(self.allocator, project.label, project.id);
-            break :blk default_remote_cwd.?;
-        } else null;
-        const herdr_cwd = remote_cwd orelse project.path;
-
-        if (request.dry_run) {
-            const workspace_id = if (existing_link) |link| link.workspace_id else "(new)";
-            return .{
-                .workspace_index = project_index,
-                .workspace_id = project.id,
-                .label = project.label,
-                .path = project.path,
-                .remote = remote_alias,
-                .session = session_name,
-                .herdr_workspace = workspace_id,
-                .herdr_tab = null,
-                .created = existing_link == null,
-                .pane_count = project.workspace_layout.visiblePaneCount(),
-            };
-        }
-
-        const target: herdr.CliTarget = .{
-            .session = session_name,
-            .remote = if (remote_alias.len > 0) remote_alias else null,
-        };
-        if (remote_alias.len > 0) try self.ensureHerdrRemoteCwd(target, herdr_cwd);
-        var workspace = if (existing_link) |link|
-            try self.createHerdrMirrorTab(target, link.workspace_id, project.label, herdr_cwd)
-        else
-            try self.createHerdrWorkspace(target, project.label, herdr_cwd);
-        defer workspace.deinit(self.allocator);
-
-        var next_links: std.ArrayList(HerdrPaneLink) = .empty;
-        var next_links_owned = true;
-        errdefer if (next_links_owned) {
-            for (next_links.items) |*pane_link| pane_link.deinit(self.allocator);
-            next_links.deinit(self.allocator);
-        };
-
-        if (project.workspace_layout.root) |root_node| {
-            try self.mirrorHerdrNode(project_index, target, root_node, workspace.root_pane_id, workspace.tab_id, herdr_cwd, &next_links);
-        }
-
-        const open_request: herdr.OpenRequest = .{
-            .session = session_name,
-            .herdr_workspace = workspace.workspace_id,
-            .remote = if (remote_alias.len > 0) remote_alias else null,
-            .cwd = if (remote_alias.len == 0) project.path else null,
-            .remote_cwd = remote_cwd,
-            .local_dir = project.path,
-            .pane = workspace.root_pane_id,
-        };
-        try self.replaceProjectHerdrLink(project_index, open_request, project.path, null, null);
-        project = &self.projects.items[project_index];
-        if (project.herdr_link) |*link| {
-            link.replacePaneLinks(self.allocator, &next_links);
-            next_links_owned = false;
-        }
-        const final_link = project.herdr_link.?;
-
-        return .{
-            .workspace_index = project_index,
-            .workspace_id = project.id,
-            .label = project.label,
-            .path = project.path,
-            .remote = final_link.remote_alias,
-            .session = final_link.session_name,
-            .herdr_workspace = final_link.workspace_id,
-            .herdr_tab = null,
-            .created = workspace.created,
-            .pane_count = final_link.pane_links.items.len,
-        };
-    }
-
-    const HerdrWorkspaceBootstrap = struct {
-        workspace_id: []u8,
-        tab_id: ?[]u8 = null,
-        root_pane_id: []u8,
-        created: bool,
-
-        fn deinit(self: *HerdrWorkspaceBootstrap, allocator: std.mem.Allocator) void {
-            allocator.free(self.workspace_id);
-            if (self.tab_id) |tab_id| allocator.free(tab_id);
-            allocator.free(self.root_pane_id);
-        }
-    };
-
-    fn createHerdrWorkspace(self: *AppState, target: herdr.CliTarget, label: []const u8, cwd: []const u8) !HerdrWorkspaceBootstrap {
-        const cli_args = [_][]const u8{ "workspace", "create", "--cwd", cwd, "--label", label, "--no-focus" };
-        const result = try self.runHerdrCli(target, &cli_args);
-        defer self.freeHerdrRunResult(result);
-        try self.ensureHerdrCliSuccess(result, "workspace create");
-        return .{
-            .workspace_id = try parseHerdrJsonStringAlloc(self.allocator, result.stdout, "workspace_id"),
-            .tab_id = try parseHerdrJsonStringAlloc(self.allocator, result.stdout, "tab_id"),
-            .root_pane_id = try parseHerdrJsonStringAlloc(self.allocator, result.stdout, "pane_id"),
-            .created = true,
-        };
-    }
-
-    fn createHerdrMirrorTab(self: *AppState, target: herdr.CliTarget, workspace_id: []const u8, label: []const u8, cwd: []const u8) !HerdrWorkspaceBootstrap {
-        const tab_label = try std.fmt.allocPrint(self.allocator, "Verde: {s}", .{label});
-        defer self.allocator.free(tab_label);
-        const cli_args = [_][]const u8{ "tab", "create", "--workspace", workspace_id, "--cwd", cwd, "--label", tab_label, "--no-focus" };
-        const result = try self.runHerdrCli(target, &cli_args);
-        defer self.freeHerdrRunResult(result);
-        try self.ensureHerdrCliSuccess(result, "tab create");
-        return .{
-            .workspace_id = try self.allocator.dupe(u8, workspace_id),
-            .tab_id = try parseHerdrJsonStringAlloc(self.allocator, result.stdout, "tab_id"),
-            .root_pane_id = try parseHerdrJsonStringAlloc(self.allocator, result.stdout, "pane_id"),
-            .created = false,
-        };
-    }
-
-    fn mirrorHerdrNode(
-        self: *AppState,
-        project_index: usize,
-        target: herdr.CliTarget,
-        node: *const WorkspaceNode,
-        herdr_pane_id: []const u8,
-        herdr_tab_id: ?[]const u8,
-        cwd: []const u8,
-        links: *std.ArrayList(HerdrPaneLink),
-    ) !void {
-        switch (node.*) {
-            .leaf => |verde_pane_id| try self.configureHerdrPaneForVerdePane(project_index, target, verde_pane_id, herdr_tab_id, herdr_pane_id, cwd, links),
-            .split => |split| {
-                const ratio_text = try std.fmt.allocPrint(self.allocator, "{d}", .{std.math.clamp(split.ratio, 0.05, 0.95)});
-                defer self.allocator.free(ratio_text);
-                const direction = switch (split.axis) {
-                    .vertical => "right",
-                    .horizontal => "down",
-                };
-                const cli_args = [_][]const u8{ "pane", "split", herdr_pane_id, "--direction", direction, "--ratio", ratio_text, "--cwd", cwd, "--no-focus" };
-                const result = try self.runHerdrCli(target, &cli_args);
-                defer self.freeHerdrRunResult(result);
-                try self.ensureHerdrCliSuccess(result, "pane split");
-                const second_pane_id = try parseHerdrJsonStringAlloc(self.allocator, result.stdout, "pane_id");
-                defer self.allocator.free(second_pane_id);
-                try self.mirrorHerdrNode(project_index, target, split.first, herdr_pane_id, herdr_tab_id, cwd, links);
-                try self.mirrorHerdrNode(project_index, target, split.second, second_pane_id, herdr_tab_id, cwd, links);
-            },
-        }
-    }
-
-    fn configureHerdrPaneForVerdePane(
-        self: *AppState,
-        project_index: usize,
-        target: herdr.CliTarget,
-        verde_pane_id: WorkspacePaneId,
-        herdr_tab_id: ?[]const u8,
-        herdr_pane_id: []const u8,
-        default_cwd: []const u8,
-        links: *std.ArrayList(HerdrPaneLink),
-    ) !void {
-        const project = &self.projects.items[project_index];
-        const pane = project.workspace_layout.paneById(verde_pane_id) orelse return;
-
-        const descriptor = try self.herdrPaneDescriptor(project_index, pane, default_cwd);
-        defer descriptor.deinit(self.allocator);
-        var link = try HerdrPaneLink.init(
-            self.allocator,
-            verde_pane_id,
-            herdr_tab_id,
-            herdr_pane_id,
-            descriptor.provider,
-            descriptor.presentation,
-            descriptor.provider_thread_id,
-            null,
-            descriptor.cwd,
-            descriptor.title,
-        );
-        errdefer link.deinit(self.allocator);
-        try links.append(self.allocator, link);
-
-        try self.renameHerdrPane(target, herdr_pane_id, descriptor.title);
-        if (descriptor.command) |command| try self.runHerdrPaneCommand(target, herdr_pane_id, command);
-    }
-
-    const HerdrPaneDescriptor = struct {
-        provider: HerdrPaneProvider,
-        presentation: HerdrPanePresentation,
-        provider_thread_id: ?[]const u8 = null,
-        cwd: []const u8,
-        title: []u8,
-        command: ?[]u8 = null,
-
-        fn deinit(self: HerdrPaneDescriptor, allocator: std.mem.Allocator) void {
-            allocator.free(self.title);
-            if (self.command) |command| allocator.free(command);
-        }
-    };
-
-    fn herdrPaneDescriptor(self: *AppState, project_index: usize, pane: *const WorkspacePane, default_cwd: []const u8) !HerdrPaneDescriptor {
-        const project = &self.projects.items[project_index];
-        return switch (pane.ref) {
-            .chat => |chat_ref| blk: {
-                const maybe_thread = if (chat_ref.thread_index < project.threads.items.len) &project.threads.items[chat_ref.thread_index] else null;
-                const provider = if (maybe_thread) |thread| herdrPaneProviderForThreadProvider(thread.provider) else .unknown;
-                const thread_title = if (maybe_thread) |thread| thread.title else "Chat";
-                const title = try std.fmt.allocPrint(self.allocator, "{s} GUI", .{thread_title});
-                errdefer self.allocator.free(title);
-                const provider_thread_id = if (maybe_thread) |thread| thread.provider_thread_id else null;
-                const command = try herdrAgentCommandForProvider(self.allocator, provider, provider_thread_id);
-                break :blk .{
-                    .provider = provider,
-                    .presentation = .gui_chat,
-                    .provider_thread_id = provider_thread_id,
-                    .cwd = default_cwd,
-                    .title = title,
-                    .command = command,
-                };
-            },
-            .terminal => |terminal_ref| blk: {
-                const dock = self.projectTerminalDock(project_index, terminal_ref.dock_id);
-                const cwd = if (dock) |value| value.cwd orelse default_cwd else default_cwd;
-                const title = try std.fmt.allocPrint(self.allocator, "Terminal {d}", .{terminal_ref.dock_id});
-                break :blk .{ .provider = .terminal, .presentation = .terminal, .cwd = cwd, .title = title };
-            },
-            .browser => |browser_ref| blk: {
-                const tab = browser_ref.activeTabConst();
-                const label = if (tab) |active| active.title orelse active.url orelse "Browser" else "Browser";
-                const title = try std.fmt.allocPrint(self.allocator, "Browser: {s}", .{label});
-                break :blk .{ .provider = .browser, .presentation = .browser_link, .cwd = default_cwd, .title = title };
-            },
-        };
-    }
-
-    fn herdrHandoffProjectIndex(self: *const AppState, selector: []const u8) ?usize {
-        if (std.mem.eql(u8, selector, "current")) return self.selected_project_index;
-        if (std.fmt.parseInt(usize, selector, 10)) |index| {
-            if (index < self.projects.items.len) return index;
-        } else |_| {}
-        for (self.projects.items, 0..) |project, index| {
-            if (std.mem.eql(u8, project.id, selector) or
-                self.projectPathMatches(project.path, selector) or
-                std.mem.eql(u8, project.label, selector)) return index;
-        }
-        return null;
-    }
-
-    fn runHerdrCli(self: *AppState, target: herdr.CliTarget, cli_args: []const []const u8) !std.process.RunResult {
-        var threaded: std.Io.Threaded = .init(self.allocator, .{});
-        defer threaded.deinit();
-        return try herdr.runCli(self.allocator, threaded.io(), target, cli_args, 512 * 1024);
-    }
-
-    fn ensureHerdrRemoteCwd(self: *AppState, target: herdr.CliTarget, cwd: []const u8) !void {
-        const remote = target.remote orelse return;
-        const command = try herdr.remoteMkdirCommandLineAlloc(self.allocator, cwd);
-        defer self.allocator.free(command);
-        var threaded: std.Io.Threaded = .init(self.allocator, .{});
-        defer threaded.deinit();
-        const result = try herdr.runRemoteShell(self.allocator, threaded.io(), remote, .{ .bytes = command }, 64 * 1024);
-        defer self.freeHerdrRunResult(result);
-        try self.ensureHerdrCliSuccess(result, "remote mkdir");
-    }
-
-    fn remoteCwdForWorkspaceCwd(self: *AppState, project: *const Project, cwd: []const u8) ![]u8 {
-        const link = project.herdr_link orelse return error.WorkspaceNotRemote;
-        const base = link.remote_cwd orelse return error.MissingRemoteCwd;
-        const trimmed = std.mem.trim(u8, cwd, &std.ascii.whitespace);
-        if (trimmed.len == 0 or std.mem.eql(u8, trimmed, ".") or std.mem.eql(u8, trimmed, project.path)) {
-            return try self.allocator.dupe(u8, base);
-        }
-        if (std.mem.startsWith(u8, trimmed, project.path) and trimmed.len > project.path.len and trimmed[project.path.len] == std.fs.path.sep) {
-            return try std.fs.path.join(self.allocator, &.{ base, trimmed[project.path.len + 1 ..] });
-        }
-        if (std.fs.path.isAbsolute(trimmed)) return try self.allocator.dupe(u8, trimmed);
-        return try std.fs.path.join(self.allocator, &.{ base, trimmed });
-    }
-
-    fn commandArgsForTerminalProfile(profile: terminal.TerminalLaunchProfile) ?[]const []const u8 {
-        if (profile.command.len > 0) return profile.command;
-        return switch (profile.kind) {
-            .shell => null,
-            .claude => &.{"claude"},
-            .opencode => &.{"opencode"},
-            .codex => &.{"codex"},
-            .cursor => &.{"cursor"},
-            .custom => &.{},
-        };
-    }
-
-    fn remoteTerminalLabel(link: HerdrWorkspaceLink, profile: terminal.TerminalLaunchProfile, buffer: []u8) []const u8 {
-        const label = std.mem.trim(u8, profile.label, &std.ascii.whitespace);
-        if (label.len > 0) return label;
-        return std.fmt.bufPrint(buffer, "Remote {s}", .{link.remote_alias}) catch "Remote terminal";
-    }
-
-    fn remoteCommandForTerminalProfile(
-        self: *AppState,
-        project: *const Project,
-        profile: terminal.TerminalLaunchProfile,
-        cwd: []const u8,
-    ) ![]u8 {
-        const link = project.herdr_link orelse return error.WorkspaceNotRemote;
-        if (link.remote_alias.len == 0) return error.WorkspaceNotRemote;
-        const remote_cwd = try self.remoteCwdForWorkspaceCwd(project, cwd);
-        defer self.allocator.free(remote_cwd);
-        if (commandArgsForTerminalProfile(profile)) |args| {
-            return try herdr.remoteExecCommandLineAlloc(self.allocator, remote_cwd, args);
-        }
-        return try herdr.remoteLoginShellCommandLineAlloc(self.allocator, remote_cwd);
-    }
-
-    fn restartTerminalDockForWorkspaceProfile(
-        self: *AppState,
-        project_index: usize,
-        dock_id: u32,
-        cwd: []const u8,
-        profile: terminal.TerminalLaunchProfile,
-    ) !void {
-        if (project_index >= self.projects.items.len) return error.NoProjectSelected;
-        const project = &self.projects.items[project_index];
-        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
-        if (project.herdr_link) |link| {
-            if (link.remote_alias.len > 0) {
-                const remote_command = try self.remoteCommandForTerminalProfile(project, profile, cwd);
-                defer self.allocator.free(remote_command);
-                var label_buf: [160]u8 = undefined;
-                const label = remoteTerminalLabel(link, profile, &label_buf);
-                const command_args = [_][]const u8{ "ssh", "-tt", link.remote_alias, remote_command };
-                try dock.restartWithProfilePersistent(self.allocator, project.path, .{
-                    .kind = .custom,
-                    .label = label,
-                    .command = &command_args,
-                }, self.storage.pref_path, dock_id);
-                return;
-            }
-        }
-        try dock.restartWithProfilePersistent(self.allocator, cwd, profile, self.storage.pref_path, dock_id);
-    }
-
-    pub fn restartTerminalDockForWorkspace(self: *AppState, project_index: usize, dock_id: u32) !void {
-        if (project_index >= self.projects.items.len) return error.NoProjectSelected;
-        const project = &self.projects.items[project_index];
-        try self.restartTerminalDockForWorkspaceProfile(project_index, dock_id, project.path, .{});
-    }
-
-    fn createTerminalTabForWorkspaceProfile(
-        self: *AppState,
-        project_index: usize,
-        dock_id: u32,
-        profile: terminal.TerminalLaunchProfile,
-    ) !void {
-        if (project_index >= self.projects.items.len) return error.NoProjectSelected;
-        const project = &self.projects.items[project_index];
-        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
-        if (project.herdr_link) |link| {
-            if (link.remote_alias.len > 0) {
-                const cwd = dock.cwd orelse project.path;
-                const remote_command = try self.remoteCommandForTerminalProfile(project, profile, cwd);
-                defer self.allocator.free(remote_command);
-                var label_buf: [160]u8 = undefined;
-                const label = remoteTerminalLabel(link, profile, &label_buf);
-                const command_args = [_][]const u8{ "ssh", "-tt", link.remote_alias, remote_command };
-                try dock.createTabWithProfile(self.allocator, .{
-                    .kind = .custom,
-                    .label = label,
-                    .command = &command_args,
-                });
-                return;
-            }
-        }
-        if (profile.kind == .shell and profile.label.len == 0 and profile.command.len == 0) {
-            try dock.createTab(self.allocator);
-        } else {
-            try dock.createTabWithProfile(self.allocator, profile);
-        }
-    }
-
-    fn freeHerdrRunResult(self: *AppState, result: std.process.RunResult) void {
-        self.allocator.free(result.stdout);
-        self.allocator.free(result.stderr);
-    }
-
-    fn ensureHerdrCliSuccess(self: *AppState, result: std.process.RunResult, action: []const u8) !void {
-        _ = self;
-        switch (result.term) {
-            .exited => |code| if (code == 0) return,
-            else => {},
-        }
-        log.warn("Herdr CLI {s} failed stderr_len={d}", .{ action, result.stderr.len });
-        return error.HerdrCommandFailed;
-    }
-
-    fn renameHerdrPane(self: *AppState, target: herdr.CliTarget, pane_id: []const u8, title: []const u8) !void {
-        const cli_args = [_][]const u8{ "pane", "rename", pane_id, title };
-        const result = try self.runHerdrCli(target, &cli_args);
-        defer self.freeHerdrRunResult(result);
-        try self.ensureHerdrCliSuccess(result, "pane rename");
-    }
-
-    fn runHerdrPaneCommand(self: *AppState, target: herdr.CliTarget, pane_id: []const u8, command: []const u8) !void {
-        const cli_args = [_][]const u8{ "pane", "run", pane_id, command };
-        const result = try self.runHerdrCli(target, &cli_args);
-        defer self.freeHerdrRunResult(result);
-        try self.ensureHerdrCliSuccess(result, "pane run");
-    }
-
-    const HerdrAttachPane = struct {
-        dock_id: u32,
-        pane_id: WorkspacePaneId,
-    };
-
-    fn ensureHerdrAttachTerminal(self: *AppState, project_index: usize, request: herdr.OpenRequest) !HerdrAttachPane {
-        if (project_index >= self.projects.items.len) return error.NoProjectSelected;
-        var project = &self.projects.items[project_index];
-        if (project.herdr_link) |link| {
-            if (link.attach_dock_id) |dock_id| {
-                if (self.projectTerminalDockMutable(project_index, dock_id)) |dock| {
-                    const pane_id = link.attach_pane_id orelse project.workspace_layout.visibleTerminalPaneIdForDock(dock_id);
-                    if (pane_id) |id| {
-                        if (project.workspace_layout.paneById(id) != null) {
-                            if (!dock.hasRunningSession()) try self.restartHerdrAttachDock(project_index, dock_id, request);
-                            project = &self.projects.items[project_index];
-                            project.workspace_layout.focused_pane_id = id;
-                            project.workspace_layout.maximized_pane_id = null;
-                            self.requestTerminalDockFocus(dock_id);
-                            return .{ .dock_id = dock_id, .pane_id = id };
-                        }
-                    }
-                }
-            }
-        }
-
-        const dock_id = try self.createProjectTerminalDock(project_index);
-        try self.restartHerdrAttachDock(project_index, dock_id, request);
-        if (self.replaceOnlyDraftChatPaneWithTerminal(project_index, dock_id)) |pane_id| {
-            self.requestTerminalDockFocus(dock_id);
-            return .{ .dock_id = dock_id, .pane_id = pane_id };
-        }
-
-        project = &self.projects.items[project_index];
-        const pane_id = try project.workspace_layout.ensureTerminalPane(self.allocator, dock_id);
-        project.workspace_layout.focusCreatedPane(pane_id);
-        self.requestTerminalDockFocus(dock_id);
-        return .{ .dock_id = dock_id, .pane_id = pane_id };
-    }
-
-    fn restartHerdrAttachDock(self: *AppState, project_index: usize, dock_id: u32, request: herdr.OpenRequest) !void {
-        const project = &self.projects.items[project_index];
-        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
-        const remote_alias = herdr.remoteAlias(request);
-        const label = if (remote_alias.len > 0)
-            try std.fmt.allocPrint(self.allocator, "Herdr {s}@{s}", .{ request.session, remote_alias })
-        else
-            try std.fmt.allocPrint(self.allocator, "Herdr {s}", .{request.session});
-        defer self.allocator.free(label);
-
-        if (remote_alias.len > 0) {
-            const remote_command = try herdr.remoteHerdrCommandLineAlloc(self.allocator, request.session, &.{});
-            defer self.allocator.free(remote_command);
-            // Herdr's ratatui frontend opens the remote TTY directly; without
-            // forced allocation it can panic with ENXIO even though Verde's
-            // local side is already a PTY.
-            const command_args = [_][]const u8{ "ssh", "-tt", remote_alias, remote_command };
-            try dock.restartWithProfilePersistent(self.allocator, project.path, .{
-                .kind = .custom,
-                .label = label,
-                .command = &command_args,
-            }, self.storage.pref_path, dock_id);
-        } else {
-            const command_args = [_][]const u8{ "herdr", "--session", request.session };
-            try dock.restartWithProfilePersistent(self.allocator, project.path, .{
-                .kind = .custom,
-                .label = label,
-                .command = &command_args,
-            }, self.storage.pref_path, dock_id);
-        }
-        dock.visible = false;
-    }
-
-    fn replaceOnlyDraftChatPaneWithTerminal(self: *AppState, project_index: usize, dock_id: u32) ?WorkspacePaneId {
-        var project = &self.projects.items[project_index];
-        var layout = &project.workspace_layout;
-        if (layout.panes.items.len != 1) return null;
-        var pane = &layout.panes.items[0];
-        switch (pane.ref) {
-            .chat => |chat_ref| {
-                if (chat_ref.thread_index >= project.threads.items.len) return null;
-                const thread = &project.threads.items[chat_ref.thread_index];
-                if (thread.committed or thread.messages.items.len > 0 or thread.currentDraft().len > 0) return null;
-                deinitWorkspacePaneRef(&pane.ref, self.allocator);
-                pane.ref = .{ .terminal = .{ .dock_id = dock_id } };
-                layout.focusCreatedPane(pane.id);
-                return pane.id;
-            },
-            else => return null,
-        }
-    }
-
-    fn replaceProjectHerdrLink(
-        self: *AppState,
-        project_index: usize,
-        request: herdr.OpenRequest,
-        local_dir: []const u8,
-        attach_dock_id: ?u32,
-        attach_pane_id: ?WorkspacePaneId,
-    ) !void {
-        var project = &self.projects.items[project_index];
-        const existing_dock_id = attach_dock_id orelse if (project.herdr_link) |link| link.attach_dock_id else null;
-        const existing_pane_id = attach_pane_id orelse if (project.herdr_link) |link| link.attach_pane_id else null;
-        var next = try HerdrWorkspaceLink.init(
-            self.allocator,
-            herdr.remoteAlias(request),
-            request.session,
-            request.herdr_workspace,
-            local_dir,
-            request.remote_cwd,
-            request.pane,
-            existing_dock_id,
-            existing_pane_id,
-        );
-        errdefer next.deinit(self.allocator);
-        if (project.herdr_link) |*old| {
-            // `verde herdr open` is often a focus/pickup operation; preserve
-            // pane presentation metadata so returning from Herdr still knows
-            // which panes should come back as GUI chat versus terminal/TUI.
-            if (herdrLinkMatchesRequest(old.*, request)) {
-                next.pane_links = old.pane_links;
-                old.pane_links = .empty;
-            }
-            old.deinit(self.allocator);
-        }
-        project.herdr_link = next;
-    }
-
-    fn findHerdrProjectIndex(self: *const AppState, request: herdr.OpenRequest) ?usize {
-        for (self.projects.items, 0..) |project, index| {
-            const link = project.herdr_link orelse continue;
-            if (herdrLinkMatchesRequest(link, request)) return index;
-        }
-        return null;
-    }
-
-    fn herdrLinkMatchesRequest(link: HerdrWorkspaceLink, request: herdr.OpenRequest) bool {
-        return std.mem.eql(u8, link.remote_alias, herdr.remoteAlias(request)) and
-            std.mem.eql(u8, link.session_name, request.session) and
-            std.mem.eql(u8, link.workspace_id, request.herdr_workspace);
-    }
-
-    fn resolveHerdrLocalProjectDir(self: *AppState, request: herdr.OpenRequest) ![]u8 {
-        if (request.local_dir) |local_dir| return try self.ensureDirectoryPath(local_dir);
-        if (herdr.remoteAlias(request).len > 0) {
-            const default_dir = try herdr.defaultLocalDir(self.allocator, self.storage.pref_path, request);
-            defer self.allocator.free(default_dir);
-            return try self.ensureDirectoryPath(default_dir);
-        }
-        if (request.cwd) |cwd| return try self.resolveProjectPath(cwd);
-        const default_dir = try herdr.defaultLocalDir(self.allocator, self.storage.pref_path, request);
-        defer self.allocator.free(default_dir);
-        return try self.ensureDirectoryPath(default_dir);
-    }
-
-    fn ensureDirectoryPath(self: *AppState, raw_path: []const u8) ![]u8 {
+    pub fn ensureDirectoryPath(self: *AppState, raw_path: []const u8) ![]u8 {
         const absolute = try self.absolutePathForCreate(raw_path);
         defer self.allocator.free(absolute);
         var threaded: std.Io.Threaded = .init(self.allocator, .{});
@@ -3262,8 +1691,6 @@ pub const AppState = struct {
         image: ?*const ChatImageAttachment,
         extra_images: []const ChatImageAttachment,
     ) !void {
-        self.trimThreadMessages(thread, 1);
-
         const copied_extra = try self.allocator.alloc(ChatImageAttachment, extra_images.len);
         errdefer self.allocator.free(copied_extra);
         for (extra_images, 0..) |attachment, index| {
@@ -3282,10 +1709,6 @@ pub const AppState = struct {
         });
         thread.touch();
         self.markDirty();
-    }
-
-    fn appendMessage(self: *AppState, role: ChatRole, author: []const u8, body: []const u8, image: ?*const ChatImageAttachment) !void {
-        return self.appendMessageToThread(self.currentThreadMutable(), role, author, body, image, &.{});
     }
 
     pub fn appendInitialSendFailure(self: *AppState, thread: *ChatThread, message: []const u8) void {
@@ -3317,7 +1740,7 @@ pub const AppState = struct {
     }
 
     pub fn cancelProjectImport(self: *AppState) void {
-        self.show_project_creator = false;
+        self.project_controller.show_creator = false;
         self.clearImportPath();
         self.project_import_cursor = 0;
         if (self.palette_modal_text_focus == .project_import) {
@@ -3333,8 +1756,8 @@ pub const AppState = struct {
     }
 
     pub fn browseForProjectDirectory(self: *AppState) void {
-        runtime_log.diagnostic("browseForWorkspaceDirectory entry show_project_creator={} draft_len={d}", .{ self.show_project_creator, self.importDirectoryDraft().len });
-        log.info("browseForWorkspaceDirectory entry show_project_creator={} draft_len={d}", .{ self.show_project_creator, self.importDirectoryDraft().len });
+        runtime_log.diagnostic("browseForWorkspaceDirectory entry show_project_creator={} draft_len={d}", .{ self.project_controller.show_creator, self.importDirectoryDraft().len });
+        log.info("browseForWorkspaceDirectory entry show_project_creator={} draft_len={d}", .{ self.project_controller.show_creator, self.importDirectoryDraft().len });
         const target_path = self.defaultExplorerPath() catch |err| {
             runtime_log.diagnostic("browseForWorkspaceDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
             log.warn("browseForWorkspaceDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
@@ -3397,31 +1820,31 @@ pub const AppState = struct {
     }
 
     fn renameSelectedProject(self: *AppState) void {
-        if (self.projects.items.len == 0) return;
-        self.renameProjectAtIndex(self.selected_project_index, self.renameInput()) catch |err| switch (err) {
+        if (self.project_controller.projects.items.len == 0) return;
+        self.renameProjectAtIndex(self.project_controller.selected_index, self.renameInput()) catch |err| switch (err) {
             error.EmptyProjectName => self.setSidebarNotice("Workspace name cannot be empty."),
             else => self.setSidebarNotice("Rename failed."),
         };
     }
 
     pub fn renameProjectAtIndex(self: *AppState, index: usize, label: []const u8) !void {
-        if (index >= self.projects.items.len) return error.ProjectNotFound;
+        if (index >= self.project_controller.projects.items.len) return error.ProjectNotFound;
         const trimmed = std.mem.trim(u8, label, &std.ascii.whitespace);
         if (trimmed.len == 0) return error.EmptyProjectName;
 
-        const project = &self.projects.items[index];
+        const project = &self.project_controller.projects.items[index];
         const copied = try self.allocator.dupeZ(u8, trimmed);
         self.allocator.free(project.label);
         project.label = copied;
-        if (self.selected_project_index == index) self.syncRenameBuffer();
+        if (self.project_controller.selected_index == index) self.syncRenameBuffer();
         self.setSidebarNotice("Workspace renamed.");
         self.markDirty();
     }
 
     pub fn beginProjectRename(self: *AppState, index: usize) void {
-        if (index >= self.projects.items.len) return;
-        if (self.show_project_creator) self.cancelProjectImport();
-        self.selected_project_index = index;
+        if (index >= self.project_controller.projects.items.len) return;
+        if (self.project_controller.show_creator) self.cancelProjectImport();
+        self.project_controller.selected_index = index;
         self.rename_project_index = index;
         self.rename_thread_index = null;
         self.syncRenameBuffer();
@@ -3431,18 +1854,18 @@ pub const AppState = struct {
     }
 
     pub fn beginCurrentThreadRename(self: *AppState) void {
-        if (self.selected_project_index >= self.projects.items.len) return;
-        const project = &self.projects.items[self.selected_project_index];
+        if (self.project_controller.selected_index >= self.project_controller.projects.items.len) return;
+        const project = &self.project_controller.projects.items[self.project_controller.selected_index];
         if (project.selected_thread_index >= project.threads.items.len) return;
-        self.beginThreadRename(self.selected_project_index, project.selected_thread_index);
+        self.beginThreadRename(self.project_controller.selected_index, project.selected_thread_index);
     }
 
     pub fn beginThreadRename(self: *AppState, project_index: usize, thread_index: usize) void {
-        if (project_index >= self.projects.items.len) return;
-        const project = &self.projects.items[project_index];
+        if (project_index >= self.project_controller.projects.items.len) return;
+        const project = &self.project_controller.projects.items[project_index];
         if (thread_index >= project.threads.items.len) return;
-        if (self.show_project_creator) self.cancelProjectImport();
-        self.selected_project_index = project_index;
+        if (self.project_controller.show_creator) self.cancelProjectImport();
+        self.project_controller.selected_index = project_index;
         project.selected_thread_index = thread_index;
         self.rename_project_index = project_index;
         self.rename_thread_index = thread_index;
@@ -3453,11 +1876,11 @@ pub const AppState = struct {
     }
 
     pub fn selectProjectAtIndex(self: *AppState, index: usize) bool {
-        if (index >= self.projects.items.len) return false;
-        self.selected_project_index = index;
+        if (index >= self.project_controller.projects.items.len) return false;
+        self.project_controller.selected_index = index;
         self.ensureCurrentProjectWorkspace();
         self.restorePersistedBrowserPaneAfterProjectSelection(index);
-        const focused_pane_id = self.projects.items[index].workspace_layout.focused_pane_id;
+        const focused_pane_id = self.project_controller.projects.items[index].workspace_layout.focused_pane_id;
         if (focused_pane_id) |pane_id| _ = self.focusWorkspacePane(index, pane_id);
         self.workspace_header_open_menu_open = false;
         self.workspace_header_open_menu_pane_id = null;
@@ -3468,18 +1891,18 @@ pub const AppState = struct {
     }
 
     pub fn selectAdjacentProject(self: *AppState, direction: isize) bool {
-        if (self.projects.items.len == 0 or direction == 0) return false;
-        const len: isize = @intCast(self.projects.items.len);
-        const current: isize = @intCast(self.selected_project_index);
+        if (self.project_controller.projects.items.len == 0 or direction == 0) return false;
+        const len: isize = @intCast(self.project_controller.projects.items.len);
+        const current: isize = @intCast(self.project_controller.selected_index);
         const next: usize = @intCast(@mod(current + direction, len));
         return self.selectProjectAtIndex(next);
     }
 
     pub fn beginThreadImport(self: *AppState, index: usize, provider: Provider) void {
-        if (index >= self.projects.items.len) return;
-        if (self.show_project_creator) self.cancelProjectImport();
-        if (self.herdr_profile_picker_project_index != null) self.cancelHerdrProfilePicker();
-        self.selected_project_index = index;
+        if (index >= self.project_controller.projects.items.len) return;
+        if (self.project_controller.show_creator) self.cancelProjectImport();
+        if (self.herdr_controller.picker_project_index != null) self.cancelHerdrProfilePicker();
+        self.project_controller.selected_index = index;
         self.rename_project_index = null;
         self.rename_thread_index = null;
         self.thread_import_provider = provider;
@@ -3494,15 +1917,15 @@ pub const AppState = struct {
     }
 
     pub fn beginHerdrProfilePicker(self: *AppState, index: usize) void {
-        if (index >= self.projects.items.len) return;
-        if (self.show_project_creator) self.cancelProjectImport();
+        if (index >= self.project_controller.projects.items.len) return;
+        if (self.project_controller.show_creator) self.cancelProjectImport();
         if (self.thread_import_provider != null) self.cancelThreadImport();
-        self.selected_project_index = index;
+        self.project_controller.selected_index = index;
         self.rename_project_index = null;
         self.rename_thread_index = null;
-        self.herdr_profile_picker_project_index = index;
-        self.herdr_profile_selected_index = null;
-        self.herdr_profile_hover_index = null;
+        self.herdr_controller.picker_project_index = index;
+        self.herdr_controller.selected_index = null;
+        self.herdr_controller.hover_index = null;
         self.palette_modal_text_focus = .none;
         self.setHerdrProfileNotice("");
         self.clearHerdrProfileSummaries();
@@ -3510,9 +1933,9 @@ pub const AppState = struct {
     }
 
     pub fn cancelHerdrProfilePicker(self: *AppState) void {
-        self.herdr_profile_picker_project_index = null;
-        self.herdr_profile_selected_index = null;
-        self.herdr_profile_hover_index = null;
+        self.herdr_controller.picker_project_index = null;
+        self.herdr_controller.selected_index = null;
+        self.herdr_controller.hover_index = null;
         self.palette_modal_text_focus = .none;
         self.setHerdrProfileNotice("");
         self.clearHerdrProfileSummaries();
@@ -3520,7 +1943,7 @@ pub const AppState = struct {
     }
 
     pub fn refreshHerdrProfileList(self: *AppState) void {
-        if (self.herdr_profile_picker_project_index == null) return;
+        if (self.herdr_controller.picker_project_index == null) return;
         self.clearHerdrProfileSummaries();
 
         var threaded: std.Io.Threaded = .init(self.allocator, .{});
@@ -3538,16 +1961,16 @@ pub const AppState = struct {
                 return;
             };
             errdefer summary.deinit(self.allocator);
-            self.herdr_profile_summaries.append(self.allocator, summary) catch {
+            self.herdr_controller.summaries.append(self.allocator, summary) catch {
                 self.setHerdrProfileNotice("Could not store Herdr profile list.");
                 return;
             };
         }
 
-        if (self.herdr_profile_summaries.items.len == 0) {
+        if (self.herdr_controller.summaries.items.len == 0) {
             self.setHerdrProfileNotice("No Herdr profiles configured. Use `verde herdr profiles add` first.");
         } else {
-            self.herdr_profile_selected_index = 0;
+            self.herdr_controller.selected_index = 0;
             self.setHerdrProfileNotice("Choose a remote profile for this workspace.");
         }
         self.markDirty();
@@ -3574,25 +1997,25 @@ pub const AppState = struct {
     }
 
     pub fn selectHerdrProfile(self: *AppState, index: usize) void {
-        if (index >= self.herdr_profile_summaries.items.len) return;
-        self.herdr_profile_selected_index = index;
+        if (index >= self.herdr_controller.summaries.items.len) return;
+        self.herdr_controller.selected_index = index;
         self.markDirty();
     }
 
     pub fn handoffProjectToSelectedHerdrProfile(self: *AppState) void {
-        const project_index = self.herdr_profile_picker_project_index orelse return;
-        const profile_index = self.herdr_profile_selected_index orelse {
+        const project_index = self.herdr_controller.picker_project_index orelse return;
+        const profile_index = self.herdr_controller.selected_index orelse {
             self.setHerdrProfileNotice("Select a Herdr profile first.");
             return;
         };
-        if (project_index >= self.projects.items.len or profile_index >= self.herdr_profile_summaries.items.len) return;
-        const profile = self.herdr_profile_summaries.items[profile_index];
+        if (project_index >= self.project_controller.projects.items.len or profile_index >= self.herdr_controller.summaries.items.len) return;
+        const profile = self.herdr_controller.summaries.items[profile_index];
         self.handoffProjectToRemoteHerdrProfile(project_index, profile);
     }
 
     fn handoffProjectToRemoteHerdrProfile(self: *AppState, project_index: usize, profile: HerdrProfileSummary) void {
-        if (project_index >= self.projects.items.len) return;
-        const project = &self.projects.items[project_index];
+        if (project_index >= self.project_controller.projects.items.len) return;
+        const project = &self.project_controller.projects.items[project_index];
         var default_remote_cwd: ?[]u8 = null;
         defer if (default_remote_cwd) |cwd| self.allocator.free(cwd);
         const remote_cwd = profile.remote_cwd orelse blk: {
@@ -3648,14 +2071,14 @@ pub const AppState = struct {
     pub fn refreshThreadImportList(self: *AppState) void {
         const provider = self.thread_import_provider orelse return;
         const project_index = self.thread_import_project_index orelse return;
-        if (project_index >= self.projects.items.len) {
+        if (project_index >= self.project_controller.projects.items.len) {
             self.cancelThreadImport();
             return;
         }
 
         self.clearThreadImportThreads();
 
-        const project = &self.projects.items[project_index];
+        const project = &self.project_controller.projects.items[project_index];
         const provider_config = switch (provider) {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
@@ -3746,512 +2169,15 @@ pub const AppState = struct {
         return null;
     }
 
-    /// Opens the command palette overlay. `scope_project` restricts results to
-    /// one workspace's thread history (the sidebar "History" entry point);
-    /// `null` is the global Ctrl+Shift+P scope (commands + threads everywhere).
-    pub fn openCommandPalette(self: *AppState, scope_project: ?usize) void {
-        self.command_controller.begin(scope_project);
-        self.modal_text_selection_anchor = null;
-        self.palette_modal_text_focus = .command_palette;
-        self.closeSidebarContextMenu();
-        self.workspace_header_open_menu_open = false;
-        self.workspace_header_open_menu_pane_id = null;
-        self.blurPaletteComposer();
-        self.noteInteraction();
-        self.markDirty();
-    }
-
-    pub fn closeCommandPalette(self: *AppState) void {
-        if (!self.command_controller.open) return;
-        self.command_controller.close();
-        if (self.palette_modal_text_focus == .command_palette) self.palette_modal_text_focus = .none;
-        self.modal_text_selection_anchor = null;
-        self.markDirty();
-    }
-
-    /// Opens the handoff wizard for the currently focused GUI chat or tracked
-    /// agent TUI. No provider request is made until the prepared target draft
-    /// is reviewed and submitted by the user.
-    pub fn beginHandoffFromFocusedPane(self: *AppState) void {
-        if (self.projects.items.len == 0) return;
-        const project_index = self.selected_project_index;
-        const project = &self.projects.items[project_index];
-        const pane_id = project.workspace_layout.focused_pane_id orelse {
-            self.setSidebarNotice("Focus a chat or agent TUI before handing off.");
-            return;
-        };
-        const pane = project.workspace_layout.paneById(pane_id) orelse return;
-        switch (pane.ref) {
-            .chat => |ref| self.beginThreadHandoff(project_index, ref.thread_index, pane_id),
-            .terminal => |ref| {
-                const surface = self.projectTerminalSurface(project_index, ref.dock_id) orelse {
-                    self.setSidebarNotice("This terminal is not a tracked agent TUI.");
-                    return;
-                };
-                const provider = surface.provider orelse {
-                    self.setSidebarNotice("The active TUI provider is unknown.");
-                    return;
-                };
-                self.beginHandoff(project_index, pane_id, null, provider);
-            },
-            .browser => self.setSidebarNotice("Focus a chat or agent TUI before handing off."),
-        }
-    }
-
-    pub fn beginThreadHandoff(self: *AppState, project_index: usize, thread_index: usize, pane_id: WorkspacePaneId) void {
-        if (project_index >= self.projects.items.len) return;
-        const project = &self.projects.items[project_index];
-        if (thread_index >= project.threads.items.len) return;
-        self.beginHandoff(project_index, pane_id, thread_index, project.threads.items[thread_index].provider);
-    }
-
-    fn beginHandoff(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, thread_index: ?usize, provider: Provider) void {
-        self.cancelHandoff();
-        self.handoff_modal_open = true;
-        self.handoff_project_index = project_index;
-        self.handoff_source_pane_id = pane_id;
-        self.handoff_source_thread_index = thread_index;
-        self.handoff_source_provider = provider;
-        self.handoff_target_surface = .gui_chat;
-        self.handoff_target_provider = switch (provider) {
-            .codex => .claude,
-            .opencode, .claude, .cursor => .codex,
-        };
-        self.handoff_use_existing = false;
-        self.handoff_target_thread_index = self.firstCompatibleHandoffTargetThread();
-        self.handoff_context_mode = .summary;
-        self.handoff_preview = self.buildHandoffPreviewAlloc() catch |err| {
-            log.warn("failed to build handoff preview: {s}", .{@errorName(err)});
-            self.setSidebarNotice("Failed to collect the handoff context.");
-            self.handoff_modal_open = false;
-            return;
-        };
-        self.closeSidebarContextMenu();
-        self.blurPaletteComposer();
-        self.markDirty();
-    }
-
-    pub fn cancelHandoff(self: *AppState) void {
-        self.handoff_modal_open = false;
-        if (self.handoff_preview) |preview| {
-            self.allocator.free(preview);
-            self.handoff_preview = null;
-        }
-        self.markDirty();
-    }
-
-    pub fn setHandoffTargetSurface(self: *AppState, surface: HandoffTargetSurface) void {
-        self.handoff_target_surface = surface;
-        self.validateHandoffExistingTarget();
-        self.markDirty();
-    }
-
-    pub fn setHandoffTargetProvider(self: *AppState, provider: Provider) void {
-        self.handoff_target_provider = provider;
-        self.handoff_target_thread_index = self.firstCompatibleHandoffTargetThread();
-        if (self.handoff_target_thread_index == null) self.handoff_use_existing = false;
-        self.markDirty();
-    }
-
-    pub fn setHandoffUseExisting(self: *AppState, use_existing: bool) void {
-        if (use_existing) {
-            self.validateHandoffExistingTarget();
-            if (self.handoff_target_thread_index == null) {
-                self.setSidebarNotice("No compatible target thread is available for this provider.");
-                return;
-            }
-        }
-        self.handoff_use_existing = use_existing;
-        self.markDirty();
-    }
-
-    pub fn cycleHandoffExistingTarget(self: *AppState) void {
-        if (self.handoff_project_index >= self.projects.items.len) return;
-        const project = &self.projects.items[self.handoff_project_index];
-        const current = self.handoff_target_thread_index orelse 0;
-        var offset: usize = 1;
-        while (offset <= project.threads.items.len) : (offset += 1) {
-            const index = (current + offset) % project.threads.items.len;
-            if (!self.isCompatibleHandoffTargetThread(index)) continue;
-            self.handoff_target_thread_index = index;
-            self.handoff_use_existing = true;
-            self.markDirty();
-            return;
-        }
-    }
-
-    pub fn handoffExistingTargetLabel(self: *const AppState) []const u8 {
-        if (self.handoff_project_index >= self.projects.items.len) return "No compatible thread";
-        const index = self.handoff_target_thread_index orelse return "No compatible thread";
-        const project = &self.projects.items[self.handoff_project_index];
-        if (index >= project.threads.items.len) return "No compatible thread";
-        return project.threads.items[index].title;
-    }
-
-    fn validateHandoffExistingTarget(self: *AppState) void {
-        if (self.handoff_target_thread_index) |index| {
-            if (self.isCompatibleHandoffTargetThread(index)) return;
-        }
-        self.handoff_target_thread_index = self.firstCompatibleHandoffTargetThread();
-        if (self.handoff_target_thread_index == null) self.handoff_use_existing = false;
-    }
-
-    fn firstCompatibleHandoffTargetThread(self: *const AppState) ?usize {
-        if (self.handoff_project_index >= self.projects.items.len) return null;
-        const project = &self.projects.items[self.handoff_project_index];
-        var best: ?usize = null;
-        for (project.threads.items, 0..) |_, index| {
-            if (!self.isCompatibleHandoffTargetThread(index)) continue;
-            if (best == null or project.threads.items[index].last_activity_at > project.threads.items[best.?].last_activity_at) best = index;
-        }
-        return best;
-    }
-
-    fn isCompatibleHandoffTargetThread(self: *const AppState, index: usize) bool {
-        if (self.handoff_project_index >= self.projects.items.len) return false;
-        const project = &self.projects.items[self.handoff_project_index];
-        if (index >= project.threads.items.len or self.handoff_source_thread_index == index) return false;
-        const thread = &project.threads.items[index];
-        return thread.committed and !thread.archived and thread.provider == self.handoff_target_provider and
-            thread.provider_thread_id != null and !thread.isSendPendingForUi();
-    }
-
-    pub fn setHandoffContextMode(self: *AppState, mode: chat_handoff.ContextMode) void {
-        if (self.handoff_context_mode == mode) return;
-        self.handoff_context_mode = mode;
-        const preview = self.buildHandoffPreviewAlloc() catch |err| {
-            log.warn("failed to rebuild handoff preview: {s}", .{@errorName(err)});
-            self.setSidebarNotice("Failed to refresh the handoff preview.");
-            return;
-        };
-        if (self.handoff_preview) |old| self.allocator.free(old);
-        self.handoff_preview = preview;
-        self.markDirty();
-    }
-
-    pub fn handoffPreviewText(self: *const AppState) []const u8 {
-        return if (self.handoff_preview) |preview| preview else "";
-    }
-
-    pub fn handoffTargetModelLabel(self: *const AppState) []const u8 {
-        if (self.handoff_use_existing) {
-            if (self.handoff_target_thread_index) |index| {
-                if (self.handoff_project_index < self.projects.items.len) {
-                    const project = &self.projects.items[self.handoff_project_index];
-                    if (index < project.threads.items.len) return project.threads.items[index].model_ref orelse "Provider default";
-                }
-            }
-        }
-        return composerDefaultModelRef(self, self.handoff_target_provider);
-    }
-
-    /// Creates the target and fills its input with the preview. It deliberately
-    /// does not submit the prompt, preserving the required review/edit step.
-    pub fn prepareHandoffTarget(self: *AppState) void {
-        if (!self.handoff_modal_open) return;
-        const preview = self.handoff_preview orelse return;
-        if (self.handoff_project_index >= self.projects.items.len) {
-            self.cancelHandoff();
-            return;
-        }
-
-        const target_pane_id = switch (self.handoff_target_surface) {
-            .gui_chat => self.prepareGuiHandoffTarget(preview) catch |err| {
-                log.warn("failed to prepare GUI handoff target: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Failed to create the handoff chat.");
-                return;
-            },
-            .tui => self.prepareTuiHandoffTarget(preview) catch |err| {
-                log.warn("failed to prepare TUI handoff target: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Failed to create the handoff TUI.");
-                return;
-            },
-        };
-        self.recordHandoffLink(target_pane_id);
-        self.cancelHandoff();
-        self.setSidebarNotice("Handoff prepared. Review and edit it before sending.");
-        self.markDirty();
-    }
-
-    fn prepareGuiHandoffTarget(self: *AppState, preview: []const u8) !WorkspacePaneId {
-        if (self.handoff_use_existing) return self.prepareExistingGuiHandoffTarget(preview);
-        const result = try self.openWorkspaceChat(self.handoff_project_index, .{
-            .provider = self.handoff_target_provider,
-            .model_ref = composerDefaultModelRef(self, self.handoff_target_provider),
-            .target_pane_id = self.handoff_source_pane_id,
-            .axis = .horizontal,
-            .focus = true,
-        });
-        if (!try self.setWorkspaceChatPaneDraftForProject(self.handoff_project_index, result.pane_id, preview, false)) {
-            return error.HandoffDraftUnavailable;
-        }
-        return result.pane_id;
-    }
-
-    fn prepareExistingGuiHandoffTarget(self: *AppState, preview: []const u8) !WorkspacePaneId {
-        const thread_index = self.handoff_target_thread_index orelse return error.HandoffTargetUnavailable;
-        if (!self.isCompatibleHandoffTargetThread(thread_index)) return error.HandoffTargetUnavailable;
-        self.selected_project_index = self.handoff_project_index;
-        var project = &self.projects.items[self.handoff_project_index];
-        var pane_id = project.workspace_layout.visibleChatPaneIdForThread(thread_index);
-        if (pane_id == null) {
-            if (!self.splitCurrentProjectWorkspacePaneWithThread(self.handoff_source_pane_id, thread_index, .horizontal, true)) {
-                return error.HandoffTargetUnavailable;
-            }
-            project = &self.projects.items[self.handoff_project_index];
-            pane_id = project.workspace_layout.visibleChatPaneIdForThread(thread_index);
-        }
-        const resolved_pane_id = pane_id orelse return error.HandoffTargetUnavailable;
-        self.focusWorkspaceOpenPane(self.handoff_project_index, resolved_pane_id);
-        if (!try self.setWorkspaceChatPaneDraftForProject(self.handoff_project_index, resolved_pane_id, preview, false)) {
-            return error.HandoffDraftUnavailable;
-        }
-        return resolved_pane_id;
-    }
-
-    fn prepareTuiHandoffTarget(self: *AppState, preview: []const u8) !WorkspacePaneId {
-        if (self.handoff_use_existing) return self.prepareExistingTuiHandoffTarget(preview);
-        const provider: stack_config.AgentProvider = switch (self.handoff_target_provider) {
-            .codex => .codex,
-            .opencode => .opencode,
-            .claude => .claude,
-            .cursor => .cursor,
-        };
-        if (!try self.openAgentTuiAtPlacement(
-            self.handoff_project_index,
-            provider,
-            self.handoff_source_pane_id,
-            .horizontal,
-            true,
-        )) return error.HandoffTuiUnavailable;
-        const project = &self.projects.items[self.handoff_project_index];
-        const pane_id = project.workspace_layout.focused_pane_id orelse return error.HandoffTuiUnavailable;
-        if (!try self.pasteWorkspaceTerminalPaneForProject(self.handoff_project_index, pane_id, preview)) {
-            return error.HandoffTuiUnavailable;
-        }
-        return pane_id;
-    }
-
-    fn prepareExistingTuiHandoffTarget(self: *AppState, preview: []const u8) !WorkspacePaneId {
-        const thread_index = self.handoff_target_thread_index orelse return error.HandoffTargetUnavailable;
-        if (!self.isCompatibleHandoffTargetThread(thread_index)) return error.HandoffTargetUnavailable;
-        self.selected_project_index = self.handoff_project_index;
-        var project = &self.projects.items[self.handoff_project_index];
-        if (project.workspace_layout.visibleChatPaneIdForThread(thread_index) == null and
-            !self.splitCurrentProjectWorkspacePaneWithThread(self.handoff_source_pane_id, thread_index, .horizontal, true))
-        {
-            return error.HandoffTargetUnavailable;
-        }
-        self.openThreadInTui(self.handoff_project_index, thread_index);
-        project = &self.projects.items[self.handoff_project_index];
-        const dock_id = project.threads.items[thread_index].tui_dock_id orelse return error.HandoffTargetUnavailable;
-        const pane_id = project.workspace_layout.visibleTerminalPaneIdForDock(dock_id) orelse return error.HandoffTargetUnavailable;
-        if (!try self.pasteWorkspaceTerminalPaneForProject(self.handoff_project_index, pane_id, preview)) return error.HandoffTuiUnavailable;
-        return pane_id;
-    }
-
-    fn recordHandoffLink(self: *AppState, target_pane_id: WorkspacePaneId) void {
-        const source_thread_index = self.handoff_source_thread_index orelse return;
-        if (self.handoff_project_index >= self.projects.items.len) return;
-        var project = &self.projects.items[self.handoff_project_index];
-        if (source_thread_index >= project.threads.items.len) return;
-        const target_thread_index: ?usize = if (self.handoff_use_existing)
-            self.handoff_target_thread_index
-        else switch (self.handoff_target_surface) {
-            .gui_chat => project.workspace_layout.paneById(target_pane_id).?.ref.chat.thread_index,
-            .tui => null,
-        };
-        var body_buf: [512]u8 = undefined;
-        const body = if (target_thread_index) |index|
-            std.fmt.bufPrint(&body_buf, "Source pane {d} handed off to GUI pane {d} (Verde thread {s}, provider {s}).", .{
-                self.handoff_source_pane_id,
-                target_pane_id,
-                project.threads.items[index].local_thread_id,
-                @tagName(self.handoff_target_provider),
-            }) catch "Chat handed off to another GUI pane."
-        else
-            std.fmt.bufPrint(&body_buf, "Source pane {d} handed off to TUI pane {d} (provider {s}).", .{
-                self.handoff_source_pane_id,
-                target_pane_id,
-                @tagName(self.handoff_target_provider),
-            }) catch "Chat handed off to a TUI pane.";
-        self.appendMessageToThread(&project.threads.items[source_thread_index], .system, "Handoff prepared", body, null, &.{}) catch {};
-        if (target_thread_index) |index| {
-            project = &self.projects.items[self.handoff_project_index];
-            var reverse_buf: [512]u8 = undefined;
-            const reverse = std.fmt.bufPrint(&reverse_buf, "Prepared from source pane {d} (Verde thread {s}, provider {s}).", .{
-                self.handoff_source_pane_id,
-                project.threads.items[source_thread_index].local_thread_id,
-                @tagName(self.handoff_source_provider),
-            }) catch "Prepared from another Verde chat.";
-            self.appendMessageToThread(&project.threads.items[index], .system, "Handoff source", reverse, null, &.{}) catch {};
-        }
-    }
-
-    fn buildHandoffPreviewAlloc(self: *AppState) ![:0]u8 {
-        if (self.handoff_project_index >= self.projects.items.len) return error.ProjectNotFound;
-        const project = &self.projects.items[self.handoff_project_index];
-        const pane = project.workspace_layout.paneById(self.handoff_source_pane_id) orelse return error.TargetPaneNotFound;
-
-        var message_views: []chat_handoff.MessageView = &.{};
-        defer if (message_views.len > 0) self.allocator.free(message_views);
-        var attachment_views: []chat_handoff.AttachmentView = &.{};
-        defer if (attachment_views.len > 0) self.allocator.free(attachment_views);
-        var terminal_history: ?[]u8 = null;
-        defer if (terminal_history) |history| self.allocator.free(history);
-        var verde_thread_id: ?[]const u8 = null;
-        var verde_session_id: ?[]const u8 = null;
-        var provider_thread_id: ?[]const u8 = null;
-        var title: []const u8 = "Agent TUI";
-        var source_surface: chat_handoff.Surface = .tui;
-
-        if (self.handoff_source_thread_index) |thread_index| {
-            if (thread_index >= project.threads.items.len) return error.ThreadNotFound;
-            const thread = &project.threads.items[thread_index];
-            message_views = try self.allocator.alloc(chat_handoff.MessageView, thread.messages.items.len);
-            var attachment_count: usize = 0;
-            for (thread.messages.items) |message| {
-                if (message.image != null) attachment_count += 1;
-                attachment_count += message.extra_images.len;
-            }
-            attachment_views = try self.allocator.alloc(chat_handoff.AttachmentView, attachment_count);
-            var attachment_index: usize = 0;
-            for (thread.messages.items, 0..) |message, index| {
-                message_views[index] = .{
-                    .role = switch (message.role) {
-                        .user => .user,
-                        .assistant => .assistant,
-                        .system => .system,
-                    },
-                    .author = message.author,
-                    .body = message.body,
-                };
-                if (message.image) |image| {
-                    attachment_views[attachment_index] = .{ .file_name = image.file_name, .mime = image.mime, .byte_size = image.byte_size };
-                    attachment_index += 1;
-                }
-                for (message.extra_images) |image| {
-                    attachment_views[attachment_index] = .{ .file_name = image.file_name, .mime = image.mime, .byte_size = image.byte_size };
-                    attachment_index += 1;
-                }
-            }
-            verde_thread_id = thread.local_thread_id;
-            provider_thread_id = thread.provider_thread_id;
-            title = thread.title;
-            source_surface = .gui_chat;
-        } else {
-            const dock_id = switch (pane.ref) {
-                .terminal => |ref| ref.dock_id,
-                else => return error.TargetPaneNotFound,
-            };
-            const surface = self.projectTerminalSurface(self.handoff_project_index, dock_id);
-            if (surface) |value| {
-                verde_session_id = value.session_id;
-                provider_thread_id = value.provider_thread_id;
-                if (value.title.len > 0) title = value.title;
-            }
-            terminal_history = try self.terminalPaneScreenTextForProject(self.handoff_project_index, self.handoff_source_pane_id);
-        }
-
-        const git_context = try self.collectHandoffGitContextAlloc(project.path);
-        defer self.allocator.free(git_context);
-        const process_context = try self.collectHandoffProcessContextAlloc(self.handoff_project_index);
-        defer self.allocator.free(process_context);
-
-        return try chat_handoff.buildAlloc(self.allocator, .{
-            .workspace_id = project.id,
-            .workspace_label = project.label,
-            .workspace_path = project.path,
-            .pane_id = self.handoff_source_pane_id,
-            .source_surface = source_surface,
-            .source_provider = @tagName(self.handoff_source_provider),
-            .verde_session_id = verde_session_id,
-            .verde_thread_index = self.handoff_source_thread_index,
-            .verde_thread_id = verde_thread_id,
-            .provider_thread_id = provider_thread_id,
-            .title = title,
-            .messages = message_views,
-            .attachments = attachment_views,
-            .terminal_history = terminal_history orelse "",
-            .git_context = git_context,
-            .process_context = process_context,
-            .context_mode = self.handoff_context_mode,
-        });
-    }
-
-    fn collectHandoffGitContextAlloc(self: *AppState, project_path: []const u8) ![]u8 {
-        var output: std.ArrayList(u8) = .empty;
-        defer output.deinit(self.allocator);
-        var threaded: std.Io.Threaded = .init(self.allocator, .{});
-        defer threaded.deinit();
-        const commands = [_][]const []const u8{
-            &.{ "git", "status", "--short", "--branch" },
-            &.{ "git", "diff", "--stat" },
-            &.{ "git", "diff", "--no-ext-diff", "--" },
-        };
-        for (commands) |argv| {
-            const result = std.process.run(self.allocator, threaded.io(), .{
-                .argv = argv,
-                .cwd = .{ .path = project_path },
-                .stdout_limit = .limited(24 * 1024),
-                .stderr_limit = .limited(4 * 1024),
-            }) catch continue;
-            defer self.allocator.free(result.stdout);
-            defer self.allocator.free(result.stderr);
-            switch (result.term) {
-                .exited => |code| if (code == 0) try output.appendSlice(self.allocator, result.stdout),
-                else => {},
-            }
-            if (output.items.len > 24 * 1024) break;
-        }
-        if (output.items.len == 0) try output.appendSlice(self.allocator, "Git state unavailable or this workspace is not a Git repository.\n");
-        return try self.allocator.dupe(u8, output.items);
-    }
-
-    fn collectHandoffProcessContextAlloc(self: *AppState, project_index: usize) ![]u8 {
-        var output: std.ArrayList(u8) = .empty;
-        defer output.deinit(self.allocator);
-        const project = &self.projects.items[project_index];
-        for (project.managed_processes.items) |process| {
-            if (process.status != .running and process.status != .starting and process.status != .restarting) continue;
-            const line = try std.fmt.allocPrint(self.allocator, "- {s}: {s} ({s})\n", .{ process.name, process.command, @tagName(process.status) });
-            defer self.allocator.free(line);
-            try output.appendSlice(self.allocator, line);
-        }
-        const dock_id = switch (project.workspace_layout.paneById(self.handoff_source_pane_id).?.ref) {
-            .terminal => |ref| ref.dock_id,
-            else => null,
-        };
-        if (dock_id) |id| {
-            if (self.projectTerminalDock(project_index, id)) |dock| {
-                if (dock.activeRuntimeProcessSnapshot()) |snapshot| {
-                    const line = try std.fmt.allocPrint(self.allocator, "- Active pane process: pid={?d}, foreground={}, running={}\n", .{ snapshot.pid, snapshot.foreground, snapshot.running });
-                    defer self.allocator.free(line);
-                    try output.appendSlice(self.allocator, line);
-                }
-            }
-        }
-        if (output.items.len == 0) try output.appendSlice(self.allocator, "No active managed processes were reported.\n");
-        return try self.allocator.dupe(u8, output.items);
-    }
-
-    pub fn commandPaletteQuery(self: *const AppState) []const u8 {
-        return self.command_controller.query();
-    }
-
-    pub fn commandPaletteQueryBuffer(self: *AppState) [:0]u8 {
-        return self.command_controller.queryBuffer();
-    }
-
     /// Opens a thread in a brand-new chat pane split off the focused pane,
     /// preserving the existing layout. This is the command palette's
     /// Ctrl+Enter / "Open in New Pane" path; plain Enter goes through
     /// `selectThreadForProject` (reuse a visible chat pane) instead.
     pub fn openThreadInWorkspaceSplit(self: *AppState, project_index: usize, thread_index: usize) void {
-        if (project_index >= self.projects.items.len) return;
-        var project = &self.projects.items[project_index];
+        if (project_index >= self.project_controller.projects.items.len) return;
+        var project = &self.project_controller.projects.items[project_index];
         if (thread_index >= project.threads.items.len) return;
-        self.selected_project_index = project_index;
+        self.project_controller.selected_index = project_index;
         var layout = &project.workspace_layout;
         const new_pane_id = layout.createChatPane(self.allocator, thread_index) catch |err| {
             log.err("failed to create chat pane for palette split: {s}", .{@errorName(err)});
@@ -4271,7 +2197,7 @@ pub const AppState = struct {
         }
         layout.focusCreatedPane(new_pane_id);
         project.selected_thread_index = thread_index;
-        self.terminal_focused = false;
+        self.terminal_controller.focused = false;
         self.requestComposerFocus();
         self.syncRenameBuffer();
         self.requestTranscriptScrollToBottom();
@@ -4289,13 +2215,13 @@ pub const AppState = struct {
     }
 
     pub fn herdrProfileNotice(self: *const AppState) []const u8 {
-        return std.mem.sliceTo(self.herdr_profile_notice_storage[0..], 0);
+        return std.mem.sliceTo(self.herdr_controller.notice_storage[0..], 0);
     }
 
     pub fn setHerdrProfileNotice(self: *AppState, value: []const u8) void {
-        @memset(&self.herdr_profile_notice_storage, 0);
-        const len = @min(value.len, self.herdr_profile_notice_storage.len - 1);
-        @memcpy(self.herdr_profile_notice_storage[0..len], value[0..len]);
+        @memset(&self.herdr_controller.notice_storage, 0);
+        const len = @min(value.len, self.herdr_controller.notice_storage.len - 1);
+        @memcpy(self.herdr_controller.notice_storage[0..len], value[0..len]);
     }
 
     pub fn selectThreadImport(self: *AppState, index: usize) void {
@@ -4310,7 +2236,7 @@ pub const AppState = struct {
     pub fn importSelectedThread(self: *AppState) void {
         const provider = self.thread_import_provider orelse return;
         const project_index = self.thread_import_project_index orelse return;
-        if (project_index >= self.projects.items.len) {
+        if (project_index >= self.project_controller.projects.items.len) {
             self.cancelThreadImport();
             return;
         }
@@ -4322,8 +2248,8 @@ pub const AppState = struct {
         }
 
         if (self.findThreadIndexByProviderThreadId(project_index, provider, trimmed_id)) |thread_index| {
-            self.selected_project_index = project_index;
-            self.projects.items[project_index].selected_thread_index = thread_index;
+            self.project_controller.selected_index = project_index;
+            self.project_controller.projects.items[project_index].selected_thread_index = thread_index;
             self.requestComposerFocus();
             self.requestTranscriptScrollToBottom();
             self.setSidebarNotice(duplicateThreadNotice(provider));
@@ -4331,7 +2257,7 @@ pub const AppState = struct {
             return;
         }
 
-        const project = &self.projects.items[project_index];
+        const project = &self.project_controller.projects.items[project_index];
         const provider_config = switch (provider) {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
@@ -4396,13 +2322,13 @@ pub const AppState = struct {
             return;
         };
 
-        self.projects.items[project_index].threads.append(self.allocator, imported) catch {
+        self.project_controller.projects.items[project_index].threads.append(self.allocator, imported) catch {
             self.setThreadImportNotice(failedAddImportedThreadNotice(provider));
             return;
         };
-        self.projects.items[project_index].invalidateSidebarThreadCache();
-        self.selected_project_index = project_index;
-        self.projects.items[project_index].selected_thread_index = self.projects.items[project_index].threads.items.len - 1;
+        self.project_controller.projects.items[project_index].invalidateSidebarThreadCache();
+        self.project_controller.selected_index = project_index;
+        self.project_controller.projects.items[project_index].selected_thread_index = self.project_controller.projects.items[project_index].threads.items.len - 1;
         self.requestComposerFocus();
         self.requestTranscriptScrollToBottom();
         self.markDirty();
@@ -4411,12 +2337,12 @@ pub const AppState = struct {
     }
 
     pub fn syncThreadFromProvider(self: *AppState, project_index: usize, thread_index: usize) void {
-        if (project_index >= self.projects.items.len) {
+        if (project_index >= self.project_controller.projects.items.len) {
             self.setSidebarNotice("Workspace not found.");
             return;
         }
 
-        const project = &self.projects.items[project_index];
+        const project = &self.project_controller.projects.items[project_index];
         if (thread_index >= project.threads.items.len) {
             self.setSidebarNotice("Thread not found.");
             return;
@@ -4475,8 +2401,8 @@ pub const AppState = struct {
             return;
         };
 
-        self.selected_project_index = project_index;
-        self.projects.items[project_index].selected_thread_index = thread_index;
+        self.project_controller.selected_index = project_index;
+        self.project_controller.projects.items[project_index].selected_thread_index = thread_index;
         self.requestComposerFocus();
         self.syncRenameBuffer();
         self.requestTranscriptScrollToBottom();
@@ -4486,8 +2412,8 @@ pub const AppState = struct {
 
     pub fn finishProjectRename(self: *AppState) void {
         if (self.rename_project_index) |index| {
-            if (index < self.projects.items.len) {
-                self.selected_project_index = index;
+            if (index < self.project_controller.projects.items.len) {
+                self.project_controller.selected_index = index;
                 if (self.rename_thread_index) |thread_index| {
                     self.renameThreadAtIndex(index, thread_index, self.renameInput()) catch |err| switch (err) {
                         error.EmptyThreadTitle => self.setSidebarNotice("Chat title cannot be empty."),
@@ -4511,8 +2437,8 @@ pub const AppState = struct {
     }
 
     pub fn renameThreadAtIndex(self: *AppState, project_index: usize, thread_index: usize, title: []const u8) !void {
-        if (project_index >= self.projects.items.len) return error.ProjectNotFound;
-        const project = &self.projects.items[project_index];
+        if (project_index >= self.project_controller.projects.items.len) return error.ProjectNotFound;
+        const project = &self.project_controller.projects.items[project_index];
         if (thread_index >= project.threads.items.len) return error.ThreadNotFound;
         const trimmed = std.mem.trim(u8, title, &std.ascii.whitespace);
         if (trimmed.len == 0) return error.EmptyThreadTitle;
@@ -4533,7 +2459,7 @@ pub const AppState = struct {
     /// `projects.items.len` to drop at the end). Keeps `selected_project_index`
     /// pointing at the same logical workspace and persists the new order.
     pub fn moveProject(self: *AppState, from: usize, before: usize) void {
-        const len = self.projects.items.len;
+        const len = self.project_controller.projects.items.len;
         if (from >= len) return;
 
         var insert_at = before;
@@ -4541,23 +2467,23 @@ pub const AppState = struct {
         if (insert_at >= len) insert_at = len - 1;
         if (insert_at == from) return;
 
-        const sel_is_from = self.selected_project_index == from;
-        const moved = self.projects.orderedRemove(from);
-        self.projects.insert(self.allocator, insert_at, moved) catch {
+        const sel_is_from = self.project_controller.selected_index == from;
+        const moved = self.project_controller.projects.orderedRemove(from);
+        self.project_controller.projects.insert(self.allocator, insert_at, moved) catch {
             // Best effort: restore near the original slot so we never drop it.
-            self.projects.insert(self.allocator, from, moved) catch {
-                self.projects.append(self.allocator, moved) catch {};
+            self.project_controller.projects.insert(self.allocator, from, moved) catch {
+                self.project_controller.projects.append(self.allocator, moved) catch {};
             };
             return;
         };
 
         if (sel_is_from) {
-            self.selected_project_index = insert_at;
+            self.project_controller.selected_index = insert_at;
         } else {
-            var s = self.selected_project_index;
+            var s = self.project_controller.selected_index;
             if (s > from) s -= 1;
             if (s >= insert_at) s += 1;
-            self.selected_project_index = s;
+            self.project_controller.selected_index = s;
         }
         self.browser_controller.projectMoved(from, insert_at);
 
@@ -4566,8 +2492,8 @@ pub const AppState = struct {
     }
 
     fn restoreClosedProject(self: *AppState, archived_index: usize, unread_count: u8) !void {
-        if (archived_index >= self.archived_projects.items.len) return error.ProjectNotFound;
-        var restored = self.archived_projects.orderedRemove(archived_index);
+        if (archived_index >= self.project_controller.archived_projects.items.len) return error.ProjectNotFound;
+        var restored = self.project_controller.archived_projects.orderedRemove(archived_index);
         var restored_appended = false;
         errdefer if (!restored_appended) restored.deinit(self.allocator);
         restored.archived = false;
@@ -4576,11 +2502,11 @@ pub const AppState = struct {
             _ = try restored.addThread(self.allocator);
         }
         try restored.normalize(self.allocator, self.app_config.terminal_font_size);
-        try self.projects.append(self.allocator, restored);
+        try self.project_controller.projects.append(self.allocator, restored);
         restored_appended = true;
-        self.selected_project_index = self.projects.items.len - 1;
+        self.project_controller.selected_index = self.project_controller.projects.items.len - 1;
         self.ensureCurrentProjectWorkspace();
-        self.restorePersistedBrowserPaneAfterProjectSelection(self.selected_project_index);
+        self.restorePersistedBrowserPaneAfterProjectSelection(self.project_controller.selected_index);
         self.syncRenameBuffer();
         self.markDirty();
     }
@@ -4595,11 +2521,11 @@ pub const AppState = struct {
     }
 
     pub fn reopenLastClosedProject(self: *AppState) bool {
-        if (self.archived_projects.items.len == 0) {
+        if (self.project_controller.archived_projects.items.len == 0) {
             self.setSidebarNotice("No closed workspaces to reopen.");
             return false;
         }
-        return self.reopenClosedProjectAtIndex(self.archived_projects.items.len - 1);
+        return self.reopenClosedProjectAtIndex(self.project_controller.archived_projects.items.len - 1);
     }
 
     pub fn closeProjectAtIndex(self: *AppState, index: usize) void {
@@ -4607,44 +2533,44 @@ pub const AppState = struct {
     }
 
     pub fn closeProjectAtIndexResult(self: *AppState, index: usize) bool {
-        if (index >= self.projects.items.len) return false;
+        if (index >= self.project_controller.projects.items.len) return false;
         if (self.projectHasPendingSend(index)) {
             self.setSidebarNotice("Finish this workspace's running provider requests before closing it.");
             return false;
         }
-        if (projectHasRunningBackgroundTasks(&self.projects.items[index])) {
+        if (projectHasRunningBackgroundTasks(&self.project_controller.projects.items[index])) {
             self.setSidebarNotice("Stop this workspace's background tasks before closing it.");
             return false;
         }
 
         self.cancelThreadImport();
-        const closed_selected_project = self.selected_project_index == index;
+        const closed_selected_project = self.project_controller.selected_index == index;
         const closed_active_browser = if (self.browser_controller.runtime_project_index) |runtime_index|
             runtime_index == index
         else
             false;
         if (closed_active_browser) self.deactivateBrowserRuntime(true);
-        var removed = self.projects.orderedRemove(index);
+        var removed = self.project_controller.projects.orderedRemove(index);
         removed.archived = true;
         removed.terminal_dock.visible = false;
         removed.terminateWorkspaceSessions();
-        self.archived_projects.append(self.allocator, removed) catch |err| {
+        self.project_controller.archived_projects.append(self.allocator, removed) catch |err| {
             var failed = removed;
             failed.deinit(self.allocator);
             self.setSidebarNotice(@errorName(err));
             return false;
         };
 
-        if (self.projects.items.len == 0) {
-            self.selected_project_index = 0;
-        } else if (self.selected_project_index == index) {
-            self.selected_project_index = @min(index, self.projects.items.len - 1);
-        } else if (self.selected_project_index > index) {
-            self.selected_project_index -= 1;
+        if (self.project_controller.projects.items.len == 0) {
+            self.project_controller.selected_index = 0;
+        } else if (self.project_controller.selected_index == index) {
+            self.project_controller.selected_index = @min(index, self.project_controller.projects.items.len - 1);
+        } else if (self.project_controller.selected_index > index) {
+            self.project_controller.selected_index -= 1;
         }
         if (!closed_active_browser) _ = self.browser_controller.projectRemoved(index);
-        if (self.projects.items.len > 0 and (closed_active_browser or closed_selected_project)) {
-            self.restorePersistedBrowserPaneAfterProjectSelection(self.selected_project_index);
+        if (self.project_controller.projects.items.len > 0 and (closed_active_browser or closed_selected_project)) {
+            self.restorePersistedBrowserPaneAfterProjectSelection(self.project_controller.selected_index);
         }
 
         self.rename_project_index = null;
@@ -4655,22 +2581,9 @@ pub const AppState = struct {
         return true;
     }
 
-    pub fn archiveProjectAtIndex(self: *AppState, index: usize) void {
-        self.closeProjectAtIndex(index);
-    }
-
-    pub fn archiveProjectAtIndexResult(self: *AppState, index: usize) bool {
-        return self.closeProjectAtIndexResult(index);
-    }
-
-    fn archiveSelectedProject(self: *AppState) void {
-        if (self.projects.items.len == 0) return;
-        _ = self.closeProjectAtIndexResult(self.selected_project_index);
-    }
-
     fn projectHasPendingSend(self: *const AppState, index: usize) bool {
-        if (index >= self.projects.items.len) return false;
-        for (self.projects.items[index].threads.items) |*thread| {
+        if (index >= self.project_controller.projects.items.len) return false;
+        for (self.project_controller.projects.items[index].threads.items) |*thread| {
             if (thread.isSendPending()) {
                 return true;
             }
@@ -4685,12 +2598,12 @@ pub const AppState = struct {
     }
 
     pub fn archiveThreadAtIndex(self: *AppState, project_index: usize, thread_index: usize) void {
-        if (project_index >= self.projects.items.len) {
+        if (project_index >= self.project_controller.projects.items.len) {
             self.setSidebarNotice("Workspace not found.");
             return;
         }
 
-        const project = &self.projects.items[project_index];
+        const project = &self.project_controller.projects.items[project_index];
         if (thread_index >= project.threads.items.len) {
             self.setSidebarNotice("Thread not found.");
             return;
@@ -4736,7 +2649,7 @@ pub const AppState = struct {
             project.selected_thread_index = project.threads.items.len - 1;
         }
 
-        self.selected_project_index = project_index;
+        self.project_controller.selected_index = project_index;
         self.syncRenameBuffer();
         self.requestTranscriptScrollToBottom();
         self.markDirty();
@@ -4744,10 +2657,10 @@ pub const AppState = struct {
     }
 
     pub fn createThreadForProject(self: *AppState, index: usize) void {
-        if (index >= self.projects.items.len) return;
+        if (index >= self.project_controller.projects.items.len) return;
         if (self.app_config.new_chat_pane_behavior == .new_pane) {
-            self.selected_project_index = index;
-            var layout = &self.projects.items[index].workspace_layout;
+            self.project_controller.selected_index = index;
+            var layout = &self.project_controller.projects.items[index].workspace_layout;
             _ = layout.ensureDefaultChat(self.allocator) catch |err| {
                 log.err("failed to prepare workspace for new chat pane: {s}", .{@errorName(err)});
                 self.setSidebarNotice("Failed to prepare the workspace.");
@@ -4765,12 +2678,12 @@ pub const AppState = struct {
             return;
         }
 
-        var project = &self.projects.items[index];
+        var project = &self.project_controller.projects.items[index];
         const thread_index = project.addThread(self.allocator) catch {
             self.setSidebarNotice("Failed to create a new thread.");
             return;
         };
-        self.selected_project_index = index;
+        self.project_controller.selected_index = index;
         self.focusProjectThreadInWorkspace(index, thread_index) catch |err| {
             log.err("failed to focus new thread workspace pane: {s}", .{@errorName(err)});
         };
@@ -4781,10 +2694,10 @@ pub const AppState = struct {
     }
 
     pub fn selectThreadForProject(self: *AppState, project_index: usize, thread_index: usize) void {
-        if (project_index >= self.projects.items.len) return;
-        const project = &self.projects.items[project_index];
+        if (project_index >= self.project_controller.projects.items.len) return;
+        const project = &self.project_controller.projects.items[project_index];
         if (thread_index >= project.threads.items.len) return;
-        self.selected_project_index = project_index;
+        self.project_controller.selected_index = project_index;
         project.selected_thread_index = thread_index;
         self.focusProjectThreadInWorkspace(project_index, thread_index) catch |err| {
             log.err("failed to focus selected thread workspace pane: {s}", .{@errorName(err)});
@@ -4796,8 +2709,8 @@ pub const AppState = struct {
     }
 
     fn focusProjectThreadInWorkspace(self: *AppState, project_index: usize, thread_index: usize) !void {
-        if (project_index >= self.projects.items.len) return;
-        var project = &self.projects.items[project_index];
+        if (project_index >= self.project_controller.projects.items.len) return;
+        var project = &self.project_controller.projects.items[project_index];
         if (thread_index >= project.threads.items.len) return;
         var layout = &project.workspace_layout;
         _ = try layout.ensureDefaultChat(self.allocator);
@@ -4824,7 +2737,7 @@ pub const AppState = struct {
             layout.maximized_pane_id = null;
         }
         project.selected_thread_index = thread_index;
-        self.terminal_focused = false;
+        self.terminal_controller.focused = false;
     }
 
     pub const providerExecutionTargetForProjectThread = chat_controller.providerExecutionTargetForProjectThread;
@@ -4852,387 +2765,137 @@ pub const AppState = struct {
     pub const consumeDaemonChatTurn = chat_controller.consumeDaemonChatTurn;
     pub const restoreDaemonChatTurnsOnLaunch = chat_controller.restoreDaemonChatTurnsOnLaunch;
     pub const threadByLocalId = chat_controller.threadByLocalId;
+    pub const applyPersisted = persistence.applyPersisted;
+    pub const restorePersistedSurfaceCompletions = persistence.restorePersistedSurfaceCompletions;
+    pub const restorePersistedChatCompletions = persistence.restorePersistedChatCompletions;
+    pub const buildPersistedState = persistence.buildPersistedState;
+    pub const applyPersistedTerminalDocksJson = persistence.applyPersistedTerminalDocksJson;
+    pub const seedDefaultState = persistence.seedDefaultState;
+    pub const clearSurfaces = surface_controller.clearSurfaces;
+    pub const surfaceBySessionId = surface_controller.surfaceBySessionId;
+    pub const surfaceBySessionIdConst = surface_controller.surfaceBySessionIdConst;
+    pub const updateSurface = surface_controller.updateSurface;
+    pub const clearSurfaceAttentionBySession = surface_controller.clearSurfaceAttentionBySession;
+    pub const clearSurfaceAttentionForDock = surface_controller.clearSurfaceAttentionForDock;
+    pub const terminalDockSurfaceAttention = surface_controller.terminalDockSurfaceAttention;
+    pub const isFocusedTerminalSurface = surface_controller.isFocusedTerminalSurface;
+    pub const projectTerminalSurface = surface_controller.projectTerminalSurface;
+    pub const replaceAppConfig = settings_controller.replaceAppConfig;
+    pub const syncSettingsDraftFromConfig = settings_controller.syncSettingsDraftFromConfig;
+    pub const isSettingsDraftDirty = settings_controller.isSettingsDraftDirty;
+    pub const openSettingsModal = settings_controller.openSettingsModal;
+    pub const toggleGlobalMcpIntegration = settings_controller.toggleGlobalMcpIntegration;
+    pub const toggleClaudeGlobalHooks = settings_controller.toggleClaudeGlobalHooks;
+    pub const toggleCodexGlobalHooks = settings_controller.toggleCodexGlobalHooks;
+    pub const toggleCursorGlobalHooks = settings_controller.toggleCursorGlobalHooks;
+    pub const toggleAmpGlobalHooks = settings_controller.toggleAmpGlobalHooks;
+    pub const toggleProviderGlobalHooks = settings_controller.toggleProviderGlobalHooks;
+    pub const cancelSettingsModal = settings_controller.cancelSettingsModal;
+    pub const saveSettingsModal = settings_controller.saveSettingsModal;
+    pub const applyTerminalFontSizesFromConfig = settings_controller.applyTerminalFontSizesFromConfig;
+    pub const reloadAppConfigFromDisk = settings_controller.reloadAppConfigFromDisk;
+    pub const tickSettingsModalAnimation = settings_controller.tickSettingsModalAnimation;
+    pub const settingsModalAnimating = settings_controller.settingsModalAnimating;
+    pub const settingsThemeChoiceCount = settings_controller.settingsThemeChoiceCount;
+    pub const settingsThemeChoiceLabel = settings_controller.settingsThemeChoiceLabel;
+    pub const selectSettingsThemeChoice = settings_controller.selectSettingsThemeChoice;
+    pub const settingsChatTitleProviderCount = settings_controller.settingsChatTitleProviderCount;
+    pub const settingsChatTitleProviderSelectedIndex = settings_controller.settingsChatTitleProviderSelectedIndex;
+    pub const settingsChatTitleProviderLabel = settings_controller.settingsChatTitleProviderLabel;
+    pub const settingsChatTitleModelCount = settings_controller.settingsChatTitleModelCount;
+    pub const settingsChatTitleModelLabel = settings_controller.settingsChatTitleModelLabel;
+    pub const settingsChatTitleModelSelectedIndex = settings_controller.settingsChatTitleModelSelectedIndex;
+    pub const settingsChatTitleModelSelectedLabel = settings_controller.settingsChatTitleModelSelectedLabel;
+    pub const selectSettingsChatTitleProvider = settings_controller.selectSettingsChatTitleProvider;
+    pub const selectSettingsChatTitleModel = settings_controller.selectSettingsChatTitleModel;
+    pub const settingsChatTitleModelRef = settings_controller.settingsChatTitleModelRef;
+    pub const startUpdateCheck = settings_controller.startUpdateCheck;
+    pub const startAutomaticUpdateCheck = settings_controller.startAutomaticUpdateCheck;
+    pub const pollUpdateCheck = settings_controller.pollUpdateCheck;
+    pub const installAvailableUpdate = settings_controller.installAvailableUpdate;
+    pub const updateInstallerButtonEnabled = settings_controller.updateInstallerButtonEnabled;
+    pub const updateInstallerButtonLabel = settings_controller.updateInstallerButtonLabel;
+    pub const pollUpdateInstallerTerminal = settings_controller.pollUpdateInstallerTerminal;
+    pub const isUpdateInstallerTerminal = settings_controller.isUpdateInstallerTerminal;
+    pub const consumeUpdateExitRequest = settings_controller.consumeUpdateExitRequest;
+    pub const currentProjectTerminal = terminal_controller.currentProjectTerminal;
+    pub const currentProjectTerminalMutable = terminal_controller.currentProjectTerminalMutable;
+    pub const currentProjectTerminalDock = terminal_controller.currentProjectTerminalDock;
+    pub const currentProjectTerminalDockMutable = terminal_controller.currentProjectTerminalDockMutable;
+    pub const projectTerminalDock = terminal_controller.projectTerminalDock;
+    pub const projectTerminalDockMutable = terminal_controller.projectTerminalDockMutable;
+    pub const workspaceAgentTuiProvider = terminal_controller.workspaceAgentTuiProvider;
+    pub const workspaceAgentTuiHistoryAt = terminal_controller.workspaceAgentTuiHistoryAt;
+    pub const openWorkspaceAgentTuiHistory = terminal_controller.openWorkspaceAgentTuiHistory;
+    pub const focusedWorkspaceTerminalDockId = terminal_controller.focusedWorkspaceTerminalDockId;
+    pub const createCurrentProjectTerminalTab = terminal_controller.createCurrentProjectTerminalTab;
+    pub const createProjectTerminalDock = terminal_controller.createProjectTerminalDock;
+    pub const createCurrentProjectTerminalDock = terminal_controller.createCurrentProjectTerminalDock;
+    pub const isTerminalVisible = terminal_controller.isTerminalVisible;
+    pub const shouldRenderLegacyTerminalDockInChat = terminal_controller.shouldRenderLegacyTerminalDockInChat;
+    pub const toggleCurrentProjectTerminal = terminal_controller.toggleCurrentProjectTerminal;
+    pub const terminalActivityBurstActive = terminal_controller.terminalActivityBurstActive;
+    pub const noteTerminalInputActivity = terminal_controller.noteTerminalInputActivity;
+    pub const pollTerminals = terminal_controller.pollTerminals;
+    pub const drainTerminalDockNotifications = terminal_controller.drainTerminalDockNotifications;
+    pub const handleTerminalKeyDown = terminal_controller.handleTerminalKeyDown;
+    pub const handleTerminalTextInput = terminal_controller.handleTerminalTextInput;
+    pub const requestTerminalFocus = terminal_controller.requestTerminalFocus;
+    pub const requestTerminalDockFocus = terminal_controller.requestTerminalDockFocus;
+    pub const beginHandoffFromFocusedPane = handoff_controller.beginHandoffFromFocusedPane;
+    pub const beginThreadHandoff = handoff_controller.beginThreadHandoff;
+    pub const cancelHandoff = handoff_controller.cancelHandoff;
+    pub const setHandoffTargetSurface = handoff_controller.setHandoffTargetSurface;
+    pub const setHandoffTargetProvider = handoff_controller.setHandoffTargetProvider;
+    pub const setHandoffUseExisting = handoff_controller.setHandoffUseExisting;
+    pub const cycleHandoffExistingTarget = handoff_controller.cycleHandoffExistingTarget;
+    pub const handoffExistingTargetLabel = handoff_controller.handoffExistingTargetLabel;
+    pub const setHandoffContextMode = handoff_controller.setHandoffContextMode;
+    pub const handoffPreviewText = handoff_controller.handoffPreviewText;
+    pub const handoffTargetModelLabel = handoff_controller.handoffTargetModelLabel;
+    pub const prepareHandoffTarget = handoff_controller.prepareHandoffTarget;
+    pub const openCommandPalette = command_controller.openCommandPalette;
+    pub const closeCommandPalette = command_controller.closeCommandPalette;
+    pub const commandPaletteQuery = command_controller.commandPaletteQuery;
+    pub const commandPaletteQueryBuffer = command_controller.commandPaletteQueryBuffer;
+    pub const flushIfDirty = lifecycle_controller.flushIfDirty;
+    pub const flushDirtyBlocking = lifecycle_controller.flushDirtyBlocking;
+    pub const flushDirtyNow = lifecycle_controller.flushDirtyNow;
+    pub const currentThreadMutable = transcript_controller.currentThreadMutable;
+    pub const rememberCurrentTranscriptScroll = transcript_controller.rememberCurrentTranscriptScroll;
+    pub const rememberWorkspaceChatTranscriptScroll = transcript_controller.rememberWorkspaceChatTranscriptScroll;
+    pub const currentTranscriptScrollY = transcript_controller.currentTranscriptScrollY;
+    pub const workspaceChatTranscriptScrollY = transcript_controller.workspaceChatTranscriptScrollY;
+    pub const acknowledgeFocusedChatCompletion = transcript_controller.acknowledgeFocusedChatCompletion;
+    pub const acknowledgeFocusedPaneCompletion = transcript_controller.acknowledgeFocusedPaneCompletion;
+    pub const clearChatCompletion = transcript_controller.clearChatCompletion;
+    pub const requestComposerFocus = composer_controller.requestComposerFocus;
+    pub const consumePendingHerdrOpenRequest = herdr_controller.consumePendingHerdrOpenRequest;
+    pub const openOrCreateHerdrWorkspace = herdr_controller.openOrCreateHerdrWorkspace;
+    pub const handoffHerdrWorkspaces = herdr_controller.handoffHerdrWorkspaces;
+    pub const unlinkHerdrWorkspaces = herdr_controller.unlinkHerdrWorkspaces;
+    pub const handoffProjectToLocalHerdrFromUi = herdr_controller.handoffProjectToLocalHerdrFromUi;
+    pub const unlinkProjectHerdrFromUi = herdr_controller.unlinkProjectHerdrFromUi;
+    pub const focusProjectHerdrAttachTerminal = herdr_controller.focusProjectHerdrAttachTerminal;
+    pub const restartTerminalDockForWorkspace = herdr_controller.restartTerminalDockForWorkspace;
+    pub const restartTerminalDockForWorkspaceProfile = herdr_controller.restartTerminalDockForWorkspaceProfile;
+    pub const createTerminalTabForWorkspaceProfile = herdr_controller.createTerminalTabForWorkspaceProfile;
 
-    fn applyPersisted(self: *AppState, persisted: PersistedState) !void {
-        self.sidebar_collapsed = persisted.sidebar_collapsed;
-        if (persisted.projects.len == 0) {
-            try self.restorePersistedSurfaceCompletions(persisted.surface_completions);
-            self.selected_project_index = 0;
-            self.next_project_number = 1;
-            self.syncRenameBuffer();
-            self.lifecycle.dirty = false;
-            return;
-        }
-
-        for (persisted.projects, 0..) |project, index| {
-            const project_id = if (project.id) |persisted_id|
-                try self.allocator.dupe(u8, persisted_id)
-            else
-                try self.deriveProjectId(project.path);
-            defer self.allocator.free(project_id);
-
-            var loaded = try Project.init(self.allocator, project_id, project.label, project.path, project.unread_count);
-            loaded.archived = project.archived;
-            loaded.collapsed = project.collapsed orelse false;
-            loaded.thread_list_expanded = project.thread_list_expanded orelse false;
-            if (project.herdr_link) |link| {
-                loaded.herdr_link = try HerdrWorkspaceLink.initFromPersisted(self.allocator, link);
-            }
-            if (project.terminal_height) |height| {
-                loaded.terminal_dock.preferred_height = terminal.clampPreferredHeight(height);
-            }
-            loaded.applyDefaultTerminalFontSize(self.app_config.terminal_font_size);
-            if (project.terminal_layout_json) |layout_json| {
-                loaded.terminal_dock.applyPersistedLayoutJson(self.allocator, layout_json) catch |err| {
-                    log.warn("failed to restore terminal layout: {s}", .{@errorName(err)});
-                };
-            }
-            if (project.workspace_layout_json) |layout_json| {
-                loaded.workspace_layout.applyPersistedWorkspaceJson(self.allocator, layout_json) catch |err| {
-                    log.warn("failed to restore workspace layout: {s}", .{@errorName(err)});
-                };
-            }
-            if (project.terminal_docks_json) |docks_json| {
-                self.applyPersistedTerminalDocksJson(&loaded, docks_json) catch |err| {
-                    log.warn("failed to restore terminal docks: {s}", .{@errorName(err)});
-                };
-            }
-            for (loaded.threads.items) |*thread| {
-                thread.deinit(self.allocator);
-            }
-            loaded.threads.clearRetainingCapacity();
-
-            if (project.threads) |threads| {
-                for (threads) |persisted_thread| {
-                    var thread = try ChatThread.init(self.allocator, persisted_thread.title);
-                    thread.archived = persisted_thread.archived;
-                    thread.committed = persisted_thread.committed;
-                    if (persisted_thread.local_thread_id) |local_thread_id| {
-                        self.allocator.free(thread.local_thread_id);
-                        thread.local_thread_id = try self.allocator.dupeZ(u8, local_thread_id);
-                    }
-                    thread.last_activity_at = persisted_thread.last_activity_at orelse 0;
-                    thread.provider_thread_id = if (persisted_thread.provider_thread_id) |thread_id|
-                        try self.allocator.dupeZ(u8, thread_id)
-                    else
-                        null;
-                    if (thread.model_ref) |model_ref| {
-                        self.allocator.free(model_ref);
-                    }
-                    thread.model_ref = if (persisted_thread.model_ref) |model_ref|
-                        try self.allocator.dupeZ(u8, model_ref)
-                    else
-                        null;
-                    thread.reasoning_effort = persisted_thread.reasoning_effort;
-                    if (thread.opencode_reasoning_variant) |v| self.allocator.free(v);
-                    thread.opencode_reasoning_variant = if (persisted_thread.reasoning_variant) |rv|
-                        try self.allocator.dupeZ(u8, rv)
-                    else
-                        null;
-                    thread.fast_mode = persisted_thread.fast_mode orelse .off;
-                    thread.access_mode = persisted_thread.access_mode orelse .full_access;
-                    thread.provider = persisted_thread.provider;
-                    thread.harness = persisted_thread.harness;
-                    thread.tui_dock_id = persisted_thread.tui_dock_id;
-                    thread.setDraft(persisted_thread.draft);
-                    if (persisted_thread.draft_image) |image| {
-                        try thread.setDraftImage(self.allocator, image.path, image.mime, image.byte_size);
-                    }
-                    for (persisted_thread.messages) |message| {
-                        try thread.messages.append(self.allocator, .{
-                            .role = message.role,
-                            .author = try self.dupeZ(message.author),
-                            .body = try self.dupeZ(message.body),
-                            .image = if (message.image) |image|
-                                try ChatImageAttachment.init(self.allocator, image.path, image.mime, image.byte_size)
-                            else
-                                null,
-                            .tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id),
-                            .tool_call_kind = message.tool_call_kind,
-                            .tool_call_status = message.tool_call_status,
-                        });
-                    }
-                    thread.rebuildBackgroundTasksFromMessages(self.allocator);
-                    if (thread.last_activity_at == 0 and thread.messages.items.len > 0) {
-                        thread.touch();
-                    }
-                    if (thread.archived) {
-                        try loaded.archived_threads.append(self.allocator, thread);
-                    } else {
-                        try loaded.threads.append(self.allocator, thread);
-                    }
-                }
-                if (!loaded.archived and loaded.threads.items.len == 0) {
-                    _ = try loaded.addThread(self.allocator);
-                }
-                if (loaded.threads.items.len == 0) {
-                    loaded.selected_thread_index = 0;
-                } else {
-                    loaded.selected_thread_index = @min(project.selected_thread_index, loaded.threads.items.len - 1);
-                }
-            } else {
-                var thread = try ChatThread.init(self.allocator, "New thread");
-                thread.archived = project.archived;
-                thread.committed = project.messages.len > 0;
-                thread.last_activity_at = 0;
-                thread.provider = project.provider;
-                thread.harness = project.harness;
-                thread.setDraft(project.draft);
-                for (project.messages) |message| {
-                    try thread.messages.append(self.allocator, .{
-                        .role = message.role,
-                        .author = try self.dupeZ(message.author),
-                        .body = try self.dupeZ(message.body),
-                        .image = if (message.image) |image|
-                            try ChatImageAttachment.init(self.allocator, image.path, image.mime, image.byte_size)
-                        else
-                            null,
-                        .tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id),
-                        .tool_call_kind = message.tool_call_kind,
-                        .tool_call_status = message.tool_call_status,
-                    });
-                }
-                thread.rebuildBackgroundTasksFromMessages(self.allocator);
-                if (thread.archived) {
-                    try loaded.archived_threads.append(self.allocator, thread);
-                } else {
-                    try loaded.threads.append(self.allocator, thread);
-                    loaded.selected_thread_index = 0;
-                }
-            }
-
-            if (!loaded.archived and index == 0 and project.messages.len == 0 and project.threads == null and persisted.messages != null) {
-                var fallback_thread = loaded.currentThreadMutable();
-                fallback_thread.provider = persisted.provider orelse fallback_thread.provider;
-                fallback_thread.harness = persisted.harness orelse fallback_thread.harness;
-                if (persisted.draft) |draft| fallback_thread.setDraft(draft);
-                for (persisted.messages.?) |message| {
-                    try fallback_thread.messages.append(self.allocator, .{
-                        .role = message.role,
-                        .author = try self.dupeZ(message.author),
-                        .body = try self.dupeZ(message.body),
-                        .image = if (message.image) |image|
-                            try ChatImageAttachment.init(self.allocator, image.path, image.mime, image.byte_size)
-                        else
-                            null,
-                        .tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id),
-                        .tool_call_kind = message.tool_call_kind,
-                        .tool_call_status = message.tool_call_status,
-                    });
-                }
-                fallback_thread.rebuildBackgroundTasksFromMessages(self.allocator);
-            }
-
-            try loaded.normalize(self.allocator, self.app_config.terminal_font_size);
-
-            if (loaded.archived) {
-                try self.archived_projects.append(self.allocator, loaded);
-            } else {
-                try self.projects.append(self.allocator, loaded);
-            }
-        }
-
-        if (self.projects.items.len == 0) {
-            self.selected_project_index = 0;
-        } else {
-            self.selected_project_index = @min(persisted.selected_project_index, self.projects.items.len - 1);
-        }
-        self.next_project_number = self.projects.items.len + self.archived_projects.items.len + 1;
-        try self.restorePersistedSurfaceCompletions(persisted.surface_completions);
-        self.restorePersistedChatCompletions(persisted.chat_completions);
-        self.syncRenameBuffer();
-        self.requestTranscriptScrollToBottom();
-        self.lifecycle.dirty = false;
-    }
-
-    fn restorePersistedSurfaceCompletions(self: *AppState, completions: []const PersistedSurfaceCompletion) !void {
-        // Reload mirrors the durable ledger exactly without discarding live
-        // working/waiting state that may already have arrived this process.
-        for (self.surfaces.items) |*surface| {
-            if (!surface.completion_pending) continue;
-            surface.completion_pending = false;
-            surface.completed_at_ms = 0;
-            if (surface.status == .done) surface.status = .idle;
-        }
-
-        for (completions) |completion| {
-            const surface = self.surfaceBySessionId(completion.session_id);
-            if (surface == null) {
-                try self.surfaces.append(self.allocator, .{
-                    .session_id = try self.allocator.dupe(u8, completion.session_id),
-                    .workspace_id = try self.allocator.dupe(u8, completion.workspace_id),
-                    .workspace_path = try self.allocator.dupe(u8, completion.workspace_path),
-                    .dock_id = completion.dock_id,
-                    .pane_id = completion.pane_id,
-                    .provider = completion.provider,
-                    .provider_thread_id = if (completion.provider_thread_id) |value| try self.allocator.dupe(u8, value) else null,
-                    .title = try self.allocator.dupe(u8, completion.title),
-                    .status = .done,
-                    .status_changed_at_ms = completion.completed_at_ms,
-                    .completion_pending = true,
-                    .completed_at_ms = completion.completed_at_ms,
-                    .last_event_title = if (completion.last_event_title) |value| try self.allocator.dupe(u8, value) else null,
-                    .last_event_body = if (completion.last_event_body) |value| try self.allocator.dupe(u8, value) else null,
-                    .last_event_at_ms = completion.completed_at_ms,
-                });
-                continue;
-            }
-
-            var restored = surface.?;
-            try replaceOwnedSlice(self.allocator, &restored.workspace_id, completion.workspace_id);
-            try replaceOwnedSlice(self.allocator, &restored.workspace_path, completion.workspace_path);
-            restored.dock_id = completion.dock_id;
-            restored.pane_id = completion.pane_id;
-            restored.provider = completion.provider;
-            try replaceOwnedOptionalSlice(self.allocator, &restored.provider_thread_id, completion.provider_thread_id);
-            try replaceOwnedSlice(self.allocator, &restored.title, completion.title);
-            try replaceOwnedOptionalSlice(self.allocator, &restored.last_event_title, completion.last_event_title);
-            try replaceOwnedOptionalSlice(self.allocator, &restored.last_event_body, completion.last_event_body);
-            if (restored.status == .idle) {
-                restored.status = .done;
-                restored.status_changed_at_ms = completion.completed_at_ms;
-            }
-            restored.completion_pending = true;
-            restored.completed_at_ms = completion.completed_at_ms;
-            restored.last_event_at_ms = completion.completed_at_ms;
-        }
-    }
-
-    fn restorePersistedChatCompletions(self: *AppState, completions: []const PersistedChatCompletion) void {
-        for (self.projects.items) |*project| {
-            clearProjectChatCompletionFlags(project);
-            restoreProjectChatCompletions(project, completions);
-        }
-        for (self.archived_projects.items) |*project| {
-            clearProjectChatCompletionFlags(project);
-            restoreProjectChatCompletions(project, completions);
-        }
-    }
-
-    fn clearProjectChatCompletionFlags(project: *Project) void {
-        for (project.threads.items) |*thread| {
-            thread.completion_pending = false;
-            thread.completed_at_ms = 0;
-        }
-        for (project.archived_threads.items) |*thread| {
-            thread.completion_pending = false;
-            thread.completed_at_ms = 0;
-        }
-    }
-
-    fn restoreProjectChatCompletions(project: *Project, completions: []const PersistedChatCompletion) void {
-        for (completions) |completion| {
-            if (!std.mem.eql(u8, project.id, completion.workspace_id)) continue;
-            for (project.threads.items) |*thread| {
-                if (!std.mem.eql(u8, thread.local_thread_id, completion.local_thread_id)) continue;
-                thread.completion_pending = true;
-                thread.completed_at_ms = completion.completed_at_ms;
-                break;
-            }
-            for (project.archived_threads.items) |*thread| {
-                if (!std.mem.eql(u8, thread.local_thread_id, completion.local_thread_id)) continue;
-                thread.completion_pending = true;
-                thread.completed_at_ms = completion.completed_at_ms;
-                break;
-            }
-        }
-    }
-
-    fn buildPersistedState(self: *const AppState, backing_allocator: std.mem.Allocator) !LoadedPersistedState {
-        return persistence.buildSnapshot(.{
-            .projects = self.projects.items,
-            .archived_projects = self.archived_projects.items,
-            .selected_project_index = self.selected_project_index,
-            .sidebar_collapsed = self.sidebar_collapsed,
-        }, backing_allocator);
-    }
-
-    fn persistedThreadSnapshot(_: *const AppState, allocator: std.mem.Allocator, thread: *const ChatThread) !PersistedThread {
-        return persistence.threadSnapshot(allocator, thread);
-    }
-
-    fn applyPersistedTerminalDocksJson(self: *AppState, project: *Project, json: []const u8) !void {
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, json, .{});
-        defer parsed.deinit();
-        if (parsed.value != .array) return;
-        for (parsed.value.array.items) |entry_value| {
-            if (entry_value != .object) continue;
-            const dock_id: u32 = @intCast(appJsonInt(entry_value.object.get("id") orelse .null) orelse continue);
-            if (dock_id == 0) continue;
-            var entry = project.terminalDockEntryById(dock_id);
-            if (entry == null) {
-                var dock = try terminal.Dock.init(self.allocator);
-                dock.setDefaultFontSize(self.app_config.terminal_font_size);
-                errdefer dock.deinit(self.allocator);
-                try project.terminal_docks.append(self.allocator, .{ .id = dock_id, .dock = dock });
-                entry = &project.terminal_docks.items[project.terminal_docks.items.len - 1];
-            }
-            if (entry_value.object.get("layout")) |layout_value| {
-                if (appJsonString(layout_value)) |layout_json| {
-                    entry.?.dock.applyPersistedLayoutJson(self.allocator, layout_json) catch |err| {
-                        log.warn("failed to restore terminal dock {d} layout: {s}", .{ dock_id, @errorName(err) });
-                    };
-                }
-            }
-            if (project.next_terminal_dock_id <= dock_id) project.next_terminal_dock_id = dock_id + 1;
-        }
-    }
-
-    fn appJsonString(value: std.json.Value) ?[]const u8 {
-        return switch (value) {
-            .string => |s| s,
-            else => null,
-        };
-    }
-
-    fn appJsonInt(value: std.json.Value) ?i64 {
-        return switch (value) {
-            .integer => |i| i,
-            .float => |f| @intFromFloat(f),
-            else => null,
-        };
-    }
-
-    fn seedDefaultState(self: *AppState) !void {
-        self.selected_project_index = 0;
-        self.next_project_number = 1;
-        self.syncRenameBuffer();
-        self.requestTranscriptScrollToBottom();
-        self.lifecycle.dirty = false;
-    }
-
-    pub fn currentProject(self: *const AppState) *const Project {
-        return &self.projects.items[self.selected_project_index];
-    }
-
-    pub fn currentProjectMutable(self: *AppState) *Project {
-        return &self.projects.items[self.selected_project_index];
-    }
+    pub const currentProject = project_controller.currentProject;
+    pub const currentProjectMutable = project_controller.currentProjectMutable;
 
     pub fn canOpenCurrentProjectDirectory(self: *const AppState) bool {
-        return self.projects.items.len > 0 and utils.canOpenProjectDirectory();
+        return self.project_controller.projects.items.len > 0 and utils.canOpenProjectDirectory();
     }
 
     pub fn canOpenCurrentProjectEditor(self: *const AppState, target: ProjectEditorTarget) bool {
-        if (self.projects.items.len == 0) return false;
+        if (self.project_controller.projects.items.len == 0) return false;
         if (target == .configured and utils.configuredEditorIsNeovim()) return true;
         return utils.canOpenProjectEditor(target);
     }
 
-    pub fn configuredEditorDisplayName(self: *const AppState) ?[]const u8 {
-        _ = self;
-        return utils.configuredEditorDisplayName();
-    }
-
-    pub fn defaultOpenButtonLabel(self: *const AppState) []const u8 {
-        return switch (self.app_config.default_open_action) {
-            .custom => |custom| custom.label,
-            else => "Open",
-        };
-    }
-
     pub fn canRunDefaultOpenAction(self: *const AppState) bool {
-        if (self.projects.items.len == 0) return false;
+        if (self.project_controller.projects.items.len == 0) return false;
         return switch (self.app_config.default_open_action) {
             .folder => self.canOpenCurrentProjectDirectory(),
             .editor => self.canOpenCurrentProjectEditor(.configured),
@@ -5270,7 +2933,7 @@ pub const AppState = struct {
     }
 
     pub fn runDefaultOpenAction(self: *AppState) void {
-        if (self.projects.items.len == 0) {
+        if (self.project_controller.projects.items.len == 0) {
             self.setSidebarNotice("No workspace selected.");
             return;
         }
@@ -5293,980 +2956,13 @@ pub const AppState = struct {
         return true;
     }
 
-    pub fn replaceAppConfig(self: *AppState, next_config: app_config.AppConfig) void {
-        self.app_config.deinit(self.allocator);
-        self.app_config = next_config;
-    }
-
-    pub fn syncSettingsDraftFromConfig(self: *AppState) void {
-        self.settings_draft = .{
-            .font_size = self.app_config.font_size,
-            .terminal_font_size = self.app_config.terminal_font_size,
-            .theme_source = self.app_config.theme_config.source,
-            .theme_choice = self.app_config.themeChoiceIndex(),
-            .open_action = settingsOpenActionFromConfig(self.app_config.default_open_action),
-            .link_open_target = self.app_config.link_open_target,
-            .tool_call_group_preference = self.app_config.tool_call_group_preference,
-            .diff_layout_preference = self.app_config.diff_layout_preference,
-            .automatic_chat_titles_enabled = self.app_config.automatic_chat_titles_enabled,
-            .chat_title_provider = self.app_config.chat_title_provider,
-            .new_chat_pane_behavior = self.app_config.new_chat_pane_behavior,
-            .check_for_updates_automatically = self.app_config.check_for_updates_automatically,
-            .notifications_enabled = self.app_config.notifications_enabled,
-        };
-        self.replaceSettingsChatTitleModel(self.app_config.chatTitleModel()) catch {
-            if (self.settings_chat_title_model) |model| self.allocator.free(model);
-            self.settings_chat_title_model = null;
-        };
-    }
-
-    pub fn isSettingsDraftDirty(self: *const AppState) bool {
-        const draft = self.settings_draft;
-        if (draft.font_size != self.app_config.font_size) return true;
-        if (draft.terminal_font_size != self.app_config.terminal_font_size) return true;
-        if (draft.theme_choice != self.app_config.themeChoiceIndex()) return true;
-        if (draft.link_open_target != self.app_config.link_open_target) return true;
-        if (draft.tool_call_group_preference != self.app_config.tool_call_group_preference) return true;
-        if (draft.diff_layout_preference != self.app_config.diff_layout_preference) return true;
-        if (draft.automatic_chat_titles_enabled != self.app_config.automatic_chat_titles_enabled) return true;
-        if (draft.chat_title_provider != self.app_config.chat_title_provider) return true;
-        if (draft.new_chat_pane_behavior != self.app_config.new_chat_pane_behavior) return true;
-        if (!std.mem.eql(u8, self.settingsChatTitleModelRef(), self.app_config.chatTitleModel())) return true;
-        if (draft.check_for_updates_automatically != self.app_config.check_for_updates_automatically) return true;
-        if (draft.notifications_enabled != self.app_config.notifications_enabled) return true;
-        return draft.open_action != settingsOpenActionFromConfig(self.app_config.default_open_action);
-    }
-
-    pub fn openSettingsModal(self: *AppState) void {
-        self.closeSidebarContextMenu();
-        self.workspace_header_open_menu_open = false;
-        self.workspace_header_open_menu_pane_id = null;
-        self.browser_inspector_menu_open = false;
-        self.syncSettingsDraftFromConfig();
-        self.settings_hook_claude_installed = provider_hooks.claudeGlobalHooksInstalled(self.allocator);
-        self.settings_hook_codex_installed = provider_hooks.codexGlobalHooksInstalled(self.allocator);
-        self.settings_hook_cursor_installed = provider_hooks.cursorGlobalHooksInstalled(self.allocator);
-        self.settings_hook_amp_installed = provider_hooks.ampGlobalHooksInstalled(self.allocator);
-        self.settings_mcp_summary = provider_mcp.inspect(self.allocator);
-        self.settings_scroll_y = 0.0;
-        self.settings_hover_control = null;
-        self.settings_close_hovered = false;
-        self.settings_theme_dropdown_open = false;
-        self.settings_theme_hover_index = null;
-        self.settings_theme_menu_scroll = 0;
-        self.settings_title_provider_dropdown_open = false;
-        self.settings_title_model_dropdown_open = false;
-        self.settings_title_menu_hover_index = null;
-        self.settings_title_model_menu_scroll = 0;
-        self.settings_update_notes_expanded = false;
-        self.settings_modal_closing = false;
-        self.settings_modal_anim_progress = 0.0;
-        self.settings_modal_anim_last_ms = 0;
-        self.show_settings_modal = true;
-        if (self.app_config.check_for_updates_automatically and self.update_state.status == .idle) {
-            self.update_state.start();
-        }
-        self.palette_modal_text_focus = .none;
-        self.blurPaletteComposer();
-        self.noteInteraction();
-        self.markDirty();
-    }
-
-    /// Installs or removes Verde's user-scoped MCP registration across all
-    /// detected providers. Existing non-Verde entries are never overwritten.
-    pub fn toggleGlobalMcpIntegration(self: *AppState) void {
-        if (self.app_config.mcp_integration_enabled or self.settings_mcp_summary.installedCount() > 0) {
-            self.settings_mcp_summary = provider_mcp.uninstall(self.allocator) catch |err| {
-                log.warn("failed to remove provider MCP registrations: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Could not remove all Verde MCP registrations.");
-                self.markDirty();
-                return;
-            };
-            self.app_config.mcp_integration_enabled = self.settings_mcp_summary.installedCount() > 0 or self.settings_mcp_summary.failedCount() > 0;
-            if (self.settings_mcp_summary.failedCount() > 0) {
-                self.setSidebarNotice("Removed Verde MCP where possible; some provider configs could not be updated.");
-            } else {
-                self.setSidebarNotice("Disabled Verde MCP tools in agent providers.");
-            }
-        } else {
-            const summary = provider_mcp.install(self.allocator) catch |err| {
-                log.warn("failed to install provider MCP registrations: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Could not enable Verde MCP tools.");
-                self.markDirty();
-                return;
-            };
-            self.settings_mcp_summary = summary;
-            if (summary.detectedCount() == 0) {
-                self.setSidebarNotice("No supported agent providers were detected.");
-                self.markDirty();
-                return;
-            }
-            self.app_config.mcp_integration_enabled = summary.installedCount() > 0;
-            if (summary.failedCount() > 0) {
-                self.setSidebarNotice("Enabled Verde MCP where possible; some provider configs could not be updated.");
-            } else if (summary.conflictCount() > 0) {
-                self.setSidebarNotice("Enabled Verde MCP where possible; existing entries were preserved.");
-            } else {
-                self.setSidebarNotice("Enabled Verde MCP tools in detected providers.");
-            }
-        }
-        self.app_config.mcp_onboarding_completed = true;
-        app_config.saveAppConfig(self.allocator, &self.app_config) catch |err| {
-            log.warn("failed to persist MCP integration preference: {s}", .{@errorName(err)});
-            self.setSidebarNotice("MCP change applied, but could not save Verde settings.");
-        };
-        self.markDirty();
-    }
-
-    /// Installs or removes the global Claude notify hooks and refreshes the
-    /// settings toggle state. Acts immediately (filesystem side effect).
-    pub fn toggleClaudeGlobalHooks(self: *AppState) void {
-        if (self.settings_hook_claude_installed) {
-            provider_hooks.removeClaudeGlobalHooks(self.allocator) catch |err| {
-                log.warn("failed to remove global Claude hooks: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Could not remove Claude hooks.");
-                self.markDirty();
-                return;
-            };
-            self.settings_hook_claude_installed = false;
-            self.setSidebarNotice("Disabled global Claude status hooks.");
-        } else {
-            provider_hooks.ensureClaudeGlobalHooks(self.allocator) catch |err| {
-                log.warn("failed to install global Claude hooks: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Could not install Claude hooks.");
-                self.markDirty();
-                return;
-            };
-            self.settings_hook_claude_installed = true;
-            self.setSidebarNotice("Enabled global Claude status hooks.");
-        }
-        self.markDirty();
-    }
-
-    /// Installs or removes the global Codex notify hooks and refreshes the
-    /// settings toggle state. Merges into ~/.codex/hooks.json, preserving any
-    /// user-owned hooks. Acts immediately (filesystem side effect).
-    pub fn toggleCodexGlobalHooks(self: *AppState) void {
-        if (self.settings_hook_codex_installed) {
-            provider_hooks.removeCodexGlobalHooks(self.allocator) catch |err| {
-                log.warn("failed to remove global Codex hooks: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Could not remove Codex hooks.");
-                self.markDirty();
-                return;
-            };
-            self.settings_hook_codex_installed = false;
-            self.setSidebarNotice("Disabled global Codex status hooks.");
-        } else {
-            provider_hooks.ensureCodexGlobalHooks(self.allocator) catch |err| {
-                log.warn("failed to install global Codex hooks: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Could not install Codex hooks.");
-                self.markDirty();
-                return;
-            };
-            self.settings_hook_codex_installed = true;
-            self.setSidebarNotice("Enabled global Codex status hooks.");
-        }
-        self.markDirty();
-    }
-
-    /// Installs or removes Cursor's user-scoped hooks. Cursor consumes the same
-    /// hook file in its terminal agent and desktop Agent UI.
-    pub fn toggleCursorGlobalHooks(self: *AppState) void {
-        if (self.settings_hook_cursor_installed) {
-            provider_hooks.removeCursorGlobalHooks(self.allocator) catch |err| {
-                log.warn("failed to remove global Cursor hooks: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Could not remove Cursor hooks.");
-                self.markDirty();
-                return;
-            };
-            self.settings_hook_cursor_installed = false;
-            self.setSidebarNotice("Disabled global Cursor status hooks.");
-        } else {
-            provider_hooks.ensureCursorGlobalHooks(self.allocator) catch |err| {
-                log.warn("failed to install global Cursor hooks: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Could not install Cursor hooks.");
-                self.markDirty();
-                return;
-            };
-            self.settings_hook_cursor_installed = true;
-            self.setSidebarNotice("Enabled global Cursor status hooks.");
-        }
-        self.markDirty();
-    }
-
-    /// Installs or removes the global Amp notify plugin and refreshes the
-    /// settings toggle state. Acts immediately (filesystem side effect), like
-    /// the Claude/Codex toggles.
-    pub fn toggleAmpGlobalHooks(self: *AppState) void {
-        if (self.settings_hook_amp_installed) {
-            provider_hooks.removeAmpGlobalHooks(self.allocator) catch |err| {
-                log.warn("failed to remove global Amp hooks: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Could not remove Amp hooks.");
-                self.markDirty();
-                return;
-            };
-            self.settings_hook_amp_installed = false;
-            self.setSidebarNotice("Disabled global Amp status hooks.");
-        } else {
-            provider_hooks.ensureAmpGlobalHooks(self.allocator) catch |err| {
-                log.warn("failed to install global Amp hooks: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Could not install Amp hooks.");
-                self.markDirty();
-                return;
-            };
-            self.settings_hook_amp_installed = true;
-            self.setSidebarNotice("Enabled global Amp status hooks.");
-        }
-        self.markDirty();
-    }
-
-    pub fn cancelSettingsModal(self: *AppState) void {
-        if (self.settings_modal_closing) return;
-        self.beginSettingsModalClose();
-        self.settings_hover_control = null;
-        self.settings_close_hovered = false;
-        self.settings_theme_dropdown_open = false;
-        self.settings_theme_hover_index = null;
-        self.settings_title_provider_dropdown_open = false;
-        self.settings_title_model_dropdown_open = false;
-        self.settings_title_menu_hover_index = null;
-        self.syncSettingsDraftFromConfig();
-        self.palette_modal_text_focus = .none;
-        self.markDirty();
-    }
-
-    pub fn saveSettingsModal(self: *AppState) !void {
-        runtime_log.diagnostic("settings save begin theme={s} font={d:.2} terminal_font={d:.2}", .{
-            @tagName(self.settings_draft.theme_source),
-            self.settings_draft.font_size,
-            self.settings_draft.terminal_font_size,
-        });
-        try self.app_config.selectThemeChoice(self.allocator, self.settings_draft.theme_choice);
-        self.app_config.font_size = theme.clampf(self.settings_draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE);
-        self.app_config.terminal_font_size = theme.clampf(self.settings_draft.terminal_font_size, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE);
-        self.app_config.link_open_target = self.settings_draft.link_open_target;
-        self.app_config.tool_call_group_preference = self.settings_draft.tool_call_group_preference;
-        self.app_config.diff_layout_preference = self.settings_draft.diff_layout_preference;
-        self.app_config.automatic_chat_titles_enabled = self.settings_draft.automatic_chat_titles_enabled;
-        self.app_config.chat_title_provider = self.settings_draft.chat_title_provider;
-        self.app_config.new_chat_pane_behavior = self.settings_draft.new_chat_pane_behavior;
-        try self.app_config.setChatTitleModel(self.allocator, self.settingsChatTitleModelRef());
-        const previous_auto_update_check = self.app_config.check_for_updates_automatically;
-        errdefer self.app_config.check_for_updates_automatically = previous_auto_update_check;
-        self.app_config.check_for_updates_automatically = self.settings_draft.check_for_updates_automatically;
-        self.app_config.notifications_enabled = self.settings_draft.notifications_enabled;
-        try self.applySettingsDraftOpenAction();
-
-        try app_config.saveAppConfig(self.allocator, &self.app_config);
-        self.app_config_file_mtime = app_config.configFileMtime(self.allocator) catch self.app_config_file_mtime;
-        self.applyTerminalFontSizesFromConfig();
-        self.app_config_runtime_sync_pending = true;
-        self.beginSettingsModalClose();
-        self.settings_hover_control = null;
-        self.settings_close_hovered = false;
-        self.settings_theme_dropdown_open = false;
-        self.settings_theme_hover_index = null;
-        self.settings_title_provider_dropdown_open = false;
-        self.settings_title_model_dropdown_open = false;
-        self.settings_title_menu_hover_index = null;
-        self.palette_modal_text_focus = .none;
-        self.markDirty();
-        runtime_log.diagnostic("settings save done", .{});
-    }
-
-    pub fn applyTerminalFontSizesFromConfig(self: *AppState) void {
-        for (self.projects.items) |*project| {
-            project.applyDefaultTerminalFontSize(self.app_config.terminal_font_size);
-        }
-    }
-
-    pub fn reloadAppConfigFromDisk(self: *AppState) !void {
-        const next_config = try app_config.loadAppConfig(self.allocator);
-        self.replaceAppConfig(next_config);
-        self.applyTerminalFontSizesFromConfig();
-        if (self.show_settings_modal) self.syncSettingsDraftFromConfig();
-    }
-
-    pub fn isSettingsModalOpen(self: *const AppState) bool {
-        return self.show_settings_modal;
-    }
-
-    /// Starts the settings modal fade-out; the modal stays visible (input
-    /// blocked) until the fade completes in `tickSettingsModalAnimation`.
-    fn beginSettingsModalClose(self: *AppState) void {
-        if (!self.show_settings_modal) return;
-        self.settings_modal_closing = true;
-        self.settings_modal_anim_last_ms = 0;
-    }
-
-    /// Advances the settings modal fade toward shown/hidden; called once per
-    /// rendered frame while the modal is visible.
-    pub fn tickSettingsModalAnimation(self: *AppState) void {
-        if (!self.show_settings_modal) return;
-        const now = monotonicMs();
-        const last = self.settings_modal_anim_last_ms;
-        self.settings_modal_anim_last_ms = now;
-        // First tick after open/close starts the clock without jumping.
-        if (last == 0 or now <= last) return;
-        // Clamp so a stalled frame advances the fade instead of skipping it.
-        const elapsed: f32 = @floatFromInt(@min(now - last, 100));
-        const step = elapsed / SETTINGS_MODAL_FADE_MS;
-        if (self.settings_modal_closing) {
-            self.settings_modal_anim_progress -= step;
-            if (self.settings_modal_anim_progress <= 0.0) {
-                self.settings_modal_anim_progress = 0.0;
-                self.settings_modal_closing = false;
-                self.show_settings_modal = false;
-            }
-        } else if (self.settings_modal_anim_progress < 1.0) {
-            self.settings_modal_anim_progress = @min(self.settings_modal_anim_progress + step, 1.0);
-        }
-    }
-
-    /// True while the settings modal fade needs frames pumped.
-    pub fn settingsModalAnimating(self: *const AppState) bool {
-        return self.show_settings_modal and (self.settings_modal_closing or self.settings_modal_anim_progress < 1.0);
-    }
-
-    pub fn settingsThemeChoiceCount(self: *const AppState) usize {
-        return self.app_config.installed_themes.len + 2;
-    }
-
-    pub fn settingsThemeChoiceLabel(self: *const AppState, choice_index: usize) []const u8 {
-        if (choice_index == 0) return "Verde";
-        if (choice_index == 1) return "Omarchy";
-        const installed_index = choice_index - 2;
-        if (installed_index >= self.app_config.installed_themes.len) return "Unknown theme";
-        return self.app_config.installed_themes[installed_index].name;
-    }
-
-    pub fn selectSettingsThemeChoice(self: *AppState, choice_index: usize) void {
-        if (choice_index >= self.settingsThemeChoiceCount()) return;
-        if (choice_index == self.settings_draft.theme_choice) {
-            self.settings_theme_dropdown_open = false;
-            self.settings_theme_hover_index = null;
-            self.markDirty();
-            return;
-        }
-        self.settings_draft.theme_choice = choice_index;
-        if (choice_index == 0) {
-            self.settings_draft.theme_source = .default;
-        } else if (choice_index == 1) {
-            self.settings_draft.theme_source = .omarchy;
-        } else {
-            const installed = self.app_config.installed_themes[choice_index - 2];
-            self.settings_draft.theme_source = installed.theme_config.source;
-            if (installed.font_size) |value| self.settings_draft.font_size = value;
-            if (installed.terminal_font_size) |value| self.settings_draft.terminal_font_size = value;
-        }
-        self.settings_theme_dropdown_open = false;
-        self.settings_theme_hover_index = null;
-        self.markDirty();
-    }
-
-    pub fn settingsChatTitleProviderCount(self: *const AppState) usize {
-        _ = self;
-        return CHAT_TITLE_PROVIDER_OPTIONS.len;
-    }
-
-    pub fn settingsChatTitleProviderSelectedIndex(self: *const AppState) usize {
-        for (CHAT_TITLE_PROVIDER_OPTIONS, 0..) |provider, index| {
-            if (provider == self.settings_draft.chat_title_provider) return index;
-        }
-        return 0;
-    }
-
-    pub fn settingsChatTitleProviderLabel(self: *const AppState, option_index: usize) []const u8 {
-        _ = self;
-        if (option_index >= CHAT_TITLE_PROVIDER_OPTIONS.len) return "Unknown provider";
-        return switch (CHAT_TITLE_PROVIDER_OPTIONS[option_index]) {
-            .codex => "Codex / ChatGPT",
-            .claude => "Claude",
-            .cursor => "Cursor",
-            .opencode => "OpenCode",
-        };
-    }
-
-    pub fn settingsChatTitleModelCount(self: *const AppState) usize {
-        return self.settingsChatTitleModelOptions().len;
-    }
-
-    pub fn settingsChatTitleModelLabel(self: *const AppState, option_index: usize) []const u8 {
-        const options = self.settingsChatTitleModelOptions();
-        if (option_index >= options.len) return "Unknown model";
-        if (self.settings_draft.chat_title_provider == .codex) {
-            if (options[option_index].value) |value| {
-                if (std.mem.eql(u8, value, app_config.DEFAULT_CHAT_TITLE_MODEL)) return "GPT-5.6 Luna (default)";
-            }
-        }
-        return options[option_index].label;
-    }
-
-    pub fn settingsChatTitleModelSelectedIndex(self: *const AppState) ?usize {
-        const selected = self.settingsChatTitleModelRef();
-        for (self.settingsChatTitleModelOptions(), 0..) |option, index| {
-            const value = option.value orelse continue;
-            if (std.mem.eql(u8, value, selected)) return index;
-        }
-        return null;
-    }
-
-    pub fn settingsChatTitleModelSelectedLabel(self: *const AppState) []const u8 {
-        if (self.settingsChatTitleModelSelectedIndex()) |index| return self.settingsChatTitleModelLabel(index);
-        return self.settingsChatTitleModelRef();
-    }
-
-    pub fn selectSettingsChatTitleProvider(self: *AppState, option_index: usize) void {
-        if (option_index >= CHAT_TITLE_PROVIDER_OPTIONS.len) return;
-        const provider = CHAT_TITLE_PROVIDER_OPTIONS[option_index];
-        if (provider != self.settings_draft.chat_title_provider) {
-            const model_ref = self.defaultChatTitleModelRef(provider);
-            self.replaceSettingsChatTitleModel(model_ref) catch return;
-            self.settings_draft.chat_title_provider = provider;
-            switch (provider) {
-                .codex => {},
-                .claude => self.startClaudeModelOptionsRefresh(),
-                .cursor => self.startCursorModelOptionsRefresh(),
-                .opencode => self.startOpencodeModelOptionsRefresh(),
-            }
-        }
-        self.settings_title_provider_dropdown_open = false;
-        self.settings_title_menu_hover_index = null;
-        self.settings_title_model_menu_scroll = 0;
-        self.markDirty();
-    }
-
-    pub fn selectSettingsChatTitleModel(self: *AppState, option_index: usize) void {
-        const options = self.settingsChatTitleModelOptions();
-        if (option_index >= options.len) return;
-        const model_ref = options[option_index].value orelse return;
-        self.replaceSettingsChatTitleModel(model_ref) catch return;
-        self.settings_title_model_dropdown_open = false;
-        self.settings_title_menu_hover_index = null;
-        self.markDirty();
-    }
-
-    pub fn settingsChatTitleModelRef(self: *const AppState) []const u8 {
-        return self.settings_chat_title_model orelse self.defaultChatTitleModelRef(self.settings_draft.chat_title_provider);
-    }
-
-    fn settingsChatTitleModelOptions(self: *const AppState) []const ModelOption {
-        return composerModelOptions(self, dbProviderForChatTitleProvider(self.settings_draft.chat_title_provider));
-    }
-
-    fn defaultChatTitleModelRef(self: *const AppState, provider: app_config.ChatTitleProvider) []const u8 {
-        if (provider == .codex) return app_config.DEFAULT_CHAT_TITLE_MODEL;
-        return composerDefaultModelRef(self, dbProviderForChatTitleProvider(provider));
-    }
-
-    fn replaceSettingsChatTitleModel(self: *AppState, model_ref: []const u8) !void {
-        const owned_model = try self.allocator.dupe(u8, model_ref);
-        if (self.settings_chat_title_model) |previous| self.allocator.free(previous);
-        self.settings_chat_title_model = owned_model;
-    }
-
-    pub fn startUpdateCheck(self: *AppState) void {
-        self.update_state.start();
-        self.markDirty();
-    }
-
-    pub fn startAutomaticUpdateCheck(self: *AppState) void {
-        if (self.app_config.check_for_updates_automatically) self.startUpdateCheck();
-    }
-
-    pub fn pollUpdateCheck(self: *AppState) void {
-        const previous = self.update_state.status;
-        self.update_state.poll();
-        if (self.update_state.status != previous) self.markDirty();
-    }
-
-    pub fn installAvailableUpdate(self: *AppState) void {
-        if (self.update_installer_started) {
-            _ = self.focusUpdateInstallerTerminal();
-            return;
-        }
-        const launch = update_installer.launch(self.allocator) catch |err| {
-            log.warn("failed to launch update installer: {s}", .{@errorName(err)});
-            const url = self.update_state.downloadUrl() orelse updater.State.releasesUrl();
-            utils.openUrlInDefaultBrowser(self.allocator, url) catch {
-                self.setSidebarNotice("Could not start the installer or open the release download.");
-                return;
-            };
-            self.setSidebarNotice("Could not start the installer; opened the release download instead.");
-            return;
-        };
-        if (launch == .aur_helper_missing) {
-            self.setSidebarNotice("Verde is AUR-managed, but yay or paru was not found.");
-            self.markDirty();
-            return;
-        }
-        if (update_installer.aurCommand(launch) != null) {
-            self.startAurUpdateTerminal(launch) catch |err| {
-                log.warn("failed to open AUR update terminal: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Could not open the AUR updater terminal.");
-                self.markDirty();
-            };
-            return;
-        }
-        self.update_installer_started = true;
-        self.update_exit_requested = launch == .started_and_exit_required;
-        self.setSidebarNotice(if (self.update_exit_requested)
-            "Restarting to install the Verde update…"
-        else
-            "Verde update installer started. Restart Verde when it completes.");
-        self.markDirty();
-    }
-
-    pub fn updateInstallerButtonEnabled(self: *const AppState) bool {
-        if (self.update_state.status != .update_available) return false;
-        return !self.update_installer_started or self.update_installer_terminal != null;
-    }
-
-    pub fn updateInstallerButtonLabel(self: *const AppState) []const u8 {
-        if (self.update_installer_terminal) |update_terminal| {
-            return switch (update_terminal.status) {
-                .running => "Updating — view terminal",
-                .succeeded => "Installed — restart Verde",
-                .failed => "Update failed — view terminal",
-            };
-        }
-        if (self.update_installer_started) return "Installer started";
-        if (self.update_state.status == .update_available) return "Install update";
-        return "No update available";
-    }
-
-    fn startAurUpdateTerminal(self: *AppState, launch: update_installer.Launch) !void {
-        const command = update_installer.aurCommand(launch) orelse return error.InvalidAurLaunch;
-        if (self.projects.items.len == 0) return error.NoProjectSelected;
-        self.ensureCurrentProjectWorkspace();
-
-        const project_index = self.selected_project_index;
-        const dock_id = try self.createProjectTerminalDock(project_index);
-        errdefer _ = self.projects.items[project_index].removeTerminalDockById(self.allocator, dock_id);
-        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
-        const project_path = self.projects.items[project_index].path;
-        try dock.restartWithProfilePersistent(self.allocator, project_path, .{
-            .kind = .custom,
-            .label = "Update Verde",
-            .command = command,
-        }, self.storage.pref_path, dock_id);
-
-        var layout = &self.projects.items[project_index].workspace_layout;
-        const pane_id = try layout.ensureTerminalPane(self.allocator, dock_id);
-        const pane = layout.paneByIdMutable(pane_id) orelse return error.TerminalPaneUnavailable;
-        switch (pane.ref) {
-            .terminal => |*terminal_ref| terminal_ref.purpose = .editor,
-            else => return error.TerminalPaneUnavailable,
-        }
-        layout.focusCreatedPane(pane_id);
-        dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
-        dock.visible = false;
-
-        self.update_installer_started = true;
-        self.update_installer_terminal = .{
-            .project_index = project_index,
-            .dock_id = dock_id,
-        };
-        self.cancelSettingsModal();
-        self.requestTerminalDockFocus(dock_id);
-        self.setSidebarNotice("AUR updater opened in a terminal. Complete any password prompt there.");
-        self.noteTerminalInputActivity();
-        self.markDirty();
-    }
-
-    fn focusUpdateInstallerTerminal(self: *AppState) bool {
-        const update_terminal = self.update_installer_terminal orelse return false;
-        if (update_terminal.project_index >= self.projects.items.len) return false;
-        if (self.projectTerminalDock(update_terminal.project_index, update_terminal.dock_id) == null) return false;
-        self.selected_project_index = update_terminal.project_index;
-        self.ensureCurrentProjectWorkspace();
-        var layout = &self.projects.items[update_terminal.project_index].workspace_layout;
-        _ = layout.ensureTerminalPane(self.allocator, update_terminal.dock_id) catch return false;
-        layout.maximized_pane_id = null;
-        self.cancelSettingsModal();
-        self.requestTerminalDockFocus(update_terminal.dock_id);
-        self.markDirty();
-        return true;
-    }
-
-    fn pollUpdateInstallerTerminal(self: *AppState) bool {
-        const update_terminal = self.update_installer_terminal orelse return false;
-        if (update_terminal.status != .running) return false;
-        const dock = self.projectTerminalDock(update_terminal.project_index, update_terminal.dock_id) orelse {
-            self.update_installer_terminal.?.status = .failed;
-            self.setSidebarNotice("The AUR updater terminal was closed before it finished.");
-            self.markDirty();
-            return true;
-        };
-        const snapshot = dock.activeSessionSnapshot() orelse return false;
-        if (snapshot.running) return false;
-        if (snapshot.exit_code == null and snapshot.signal == null) return false;
-        const succeeded = snapshot.exit_code != null and snapshot.exit_code.? == 0;
-        self.update_installer_terminal.?.status = if (succeeded) .succeeded else .failed;
-        self.setSidebarNotice(if (succeeded)
-            "Verde was updated. Restart Verde to use the new version."
-        else
-            "The AUR update failed. Review the updater terminal for details.");
-        self.markDirty();
-        return true;
-    }
-
-    fn isUpdateInstallerTerminal(self: *const AppState, project_index: usize, dock_id: u32) bool {
-        const update_terminal = self.update_installer_terminal orelse return false;
-        return update_terminal.project_index == project_index and update_terminal.dock_id == dock_id;
-    }
-
-    pub fn consumeUpdateExitRequest(self: *AppState) bool {
-        if (!self.update_exit_requested) return false;
-        self.update_exit_requested = false;
-        return true;
-    }
-
-    fn applySettingsDraftOpenAction(self: *AppState) !void {
-        if (self.settings_draft.open_action == .custom) return;
-
-        const next: app_config.DefaultOpenAction = switch (self.settings_draft.open_action) {
-            .folder => .folder,
-            .editor => .editor,
-            .cursor => .cursor,
-            .vscode => .vscode,
-            .zed => .zed,
-            .custom => unreachable,
-        };
-        const next_tag = std.meta.activeTag(next);
-        if (std.meta.activeTag(self.app_config.default_open_action) == next_tag) return;
-        self.app_config.default_open_action.deinit(self.allocator);
-        self.app_config.default_open_action = next;
-    }
-
-    fn settingsOpenActionFromConfig(action: app_config.DefaultOpenAction) SettingsOpenAction {
-        return switch (action) {
-            .folder => .folder,
-            .editor => .editor,
-            .cursor => .cursor,
-            .vscode => .vscode,
-            .zed => .zed,
-            .custom => .custom,
-        };
-    }
-
     pub fn rethemeTerminalSessions(self: *AppState) !void {
-        for (self.projects.items) |*project| {
+        for (self.project_controller.projects.items) |*project| {
             try project.terminal_dock.rethemeSessions(self.allocator);
             for (project.terminal_docks.items) |*entry| {
                 try entry.dock.rethemeSessions(self.allocator);
             }
         }
-    }
-
-    pub fn clearSurfaces(self: *AppState) void {
-        for (self.surfaces.items) |*surface| surface.deinit(self.allocator);
-        self.surfaces.clearRetainingCapacity();
-    }
-
-    pub fn surfaceBySessionId(self: *AppState, session_id: []const u8) ?*SurfaceState {
-        for (self.surfaces.items) |*surface| {
-            if (std.mem.eql(u8, surface.session_id, session_id)) return surface;
-        }
-        return null;
-    }
-
-    pub fn surfaceBySessionIdConst(self: *const AppState, session_id: []const u8) ?*const SurfaceState {
-        for (self.surfaces.items) |*surface| {
-            if (std.mem.eql(u8, surface.session_id, session_id)) return surface;
-        }
-        return null;
-    }
-
-    pub fn updateSurface(self: *AppState, update: SurfaceUpdate) !*SurfaceState {
-        var surface = self.surfaceBySessionId(update.session_id);
-        if (surface == null) {
-            try self.surfaces.append(self.allocator, .{
-                .session_id = try self.allocator.dupe(u8, update.session_id),
-                .workspace_id = try self.allocator.dupe(u8, update.workspace_id orelse ""),
-                .workspace_path = try self.allocator.dupe(u8, update.workspace_path orelse ""),
-                .dock_id = update.dock_id orelse 0,
-                .pane_id = update.pane_id,
-                .title = try self.allocator.dupe(u8, update.title orelse ""),
-            });
-            surface = &self.surfaces.items[self.surfaces.items.len - 1];
-        }
-        var s = surface.?;
-        var completion_became_pending = false;
-        if (update.workspace_id) |value| try replaceOwnedSlice(self.allocator, &s.workspace_id, value);
-        if (update.workspace_path) |value| try replaceOwnedSlice(self.allocator, &s.workspace_path, value);
-        if (update.dock_id) |value| s.dock_id = value;
-        if (update.pane_id) |value| s.pane_id = value;
-        if (update.provider) |value| {
-            s.provider = value;
-            // Pin the provider on the terminal tab so the sidebar can draw the
-            // logo after a restart, before the agent process revives.
-            if (self.terminalDockForSurface(s)) |dock| {
-                _ = dock.setActiveTabPinnedProvider(self.allocator, @tagName(value));
-            }
-        }
-        if (update.provider_thread_id) |value| try replaceOwnedOptionalSlice(self.allocator, &s.provider_thread_id, value);
-        if (update.title) |value| {
-            try replaceOwnedSlice(self.allocator, &s.title, value);
-            // Pin the title on the terminal tab so it survives Codex's
-            // folder-name OSC and remains available beyond the completion
-            // ledger's acknowledgement lifetime.
-            if (value.len > 0) {
-                if (self.terminalDockForSurface(s)) |dock| {
-                    _ = dock.setActiveTabPinnedTitle(self.allocator, value);
-                    // Codex and Cursor provide titles on their prompt-submit
-                    // hooks, making this authoritative first-turn activity even
-                    // when the prompt was submitted without a local Enter event.
-                    if (s.provider != null) {
-                        _ = dock.noteActiveTabAgentHistory(unixTimestampMs());
-                    }
-                }
-            }
-        }
-        if (update.clear) {
-            if (s.completion_pending or s.status == .done) {
-                _ = try self.storage.client.clearSurfaceCompletion(s.session_id);
-            }
-            if (s.status != .idle) s.status_changed_at_ms = unixTimestampMs();
-            s.status = .idle;
-            s.completion_pending = false;
-            s.completed_at_ms = 0;
-            s.progress = null;
-            s.attention = false;
-            s.unread_count = 0;
-            try replaceOwnedOptionalSlice(self.allocator, &s.last_event_title, null);
-            try replaceOwnedOptionalSlice(self.allocator, &s.last_event_body, null);
-            _ = self.clearTerminalNotificationBySession(update.session_id);
-        } else {
-            if (update.status) |value| {
-                const now_ms = unixTimestampMs();
-                if (value != s.status) s.status_changed_at_ms = now_ms;
-                s.status = value;
-                if (value == .done and !s.completion_pending) {
-                    s.completion_pending = true;
-                    s.completed_at_ms = now_ms;
-                    completion_became_pending = true;
-                }
-            }
-            if (update.progress) |value| s.progress = theme.clampf(value, 0.0, 1.0);
-            if (update.attention) |value| s.attention = value;
-            if (update.unread_increment > 0) s.unread_count +|= update.unread_increment;
-            if (update.last_event_title) |value| {
-                try replaceOwnedOptionalSlice(self.allocator, &s.last_event_title, value);
-                s.last_event_at_ms = unixTimestampMs();
-            }
-            if (update.last_event_body) |value| {
-                try replaceOwnedOptionalSlice(self.allocator, &s.last_event_body, value);
-                s.last_event_at_ms = unixTimestampMs();
-            }
-            if (s.completion_pending) {
-                try self.storage.client.upsertSurfaceCompletion(persistedSurfaceCompletion(s));
-            }
-        }
-        // Notify on the completion edge. Runs on the main thread (live commands
-        // are drained from the main loop), so spawning the notifier here is safe.
-        if (!update.clear and self.app_config.notifications_enabled and completion_became_pending) {
-            self.fireCompletionNotification(s);
-        }
-        self.markDirty();
-        return s;
-    }
-
-    fn persistedSurfaceCompletion(surface: *const SurfaceState) PersistedSurfaceCompletion {
-        return .{
-            .session_id = surface.session_id,
-            .workspace_id = surface.workspace_id,
-            .workspace_path = surface.workspace_path,
-            .dock_id = surface.dock_id,
-            .pane_id = surface.pane_id,
-            .provider = surface.provider,
-            .provider_thread_id = surface.provider_thread_id,
-            .title = surface.title,
-            .completed_at_ms = surface.completed_at_ms,
-            .last_event_title = surface.last_event_title,
-            .last_event_body = surface.last_event_body,
-        };
-    }
-
-    // Resolves the terminal dock that owns a surface (by workspace + dock id),
-    // so notify-provided metadata can be pinned onto its tab. Live surface
-    // state is in memory; the unacknowledged completion edge and pinned tab
-    // metadata persist independently across restarts.
-    fn terminalDockForSurface(self: *AppState, surface: *const SurfaceState) ?*terminal.Dock {
-        for (self.projects.items, 0..) |*project, idx| {
-            const owns = std.mem.eql(u8, surface.workspace_id, project.id) or
-                self.projectPathMatches(surface.workspace_path, project.path);
-            if (!owns) continue;
-            return self.projectTerminalDockMutable(idx, surface.dock_id);
-        }
-        return null;
-    }
-
-    // Resolves which agent provider a surface belongs to, for the notification
-    // logo/title. Only trust explicit notify metadata: falling back to a
-    // workspace chat provider can mislabel one terminal agent as another (for
-    // example an Amp pane in a workspace whose first saved chat is Codex).
-    fn resolveSurfaceProvider(self: *const AppState, surface: *const SurfaceState) ?Provider {
-        _ = self;
-        if (surface.provider) |p| return p;
-        return null;
-    }
-
-    // Builds a human-readable title/body from the surface and hands off to the
-    // cross-platform notifier. Title prefers the surface's own label, then the
-    // provider name; the body names the workspace directory so multiple agents
-    // stay distinguishable. The provider also selects the notification logo.
-    fn fireCompletionNotification(self: *AppState, surface: *const SurfaceState) void {
-        const provider = self.resolveSurfaceProvider(surface);
-        const dir = if (surface.workspace_path.len > 0)
-            std.fs.path.basename(surface.workspace_path)
-        else
-            "";
-
-        var title_buf: [128]u8 = undefined;
-        const title = if (surface.title.len > 0)
-            surface.title
-        else if (provider) |p|
-            (std.fmt.bufPrint(&title_buf, "{s} finished", .{utils.providerLabel(p)}) catch "Agent finished")
-        else
-            "Agent finished";
-
-        var body_buf: [256]u8 = undefined;
-        const body = if (dir.len > 0)
-            (std.fmt.bufPrint(&body_buf, "Completed in {s}", .{dir}) catch "Task completed")
-        else
-            "Task completed";
-
-        const icon: ?notifier.Icon = if (provider) |p| switch (p) {
-            .codex => .{ .key = "codex", .png_bytes = CODEX_LOGO_BYTES },
-            .opencode => .{ .key = "opencode", .png_bytes = OPENCODE_LOGO_BYTES },
-            .claude => .{ .key = "claude", .png_bytes = CLAUDE_LOGO_BYTES },
-            .cursor => .{ .key = "cursor", .png_bytes = CURSOR_LOGO_BYTES },
-        } else null;
-
-        notifier.notifyAgentDone(self.allocator, title, body, icon);
-    }
-
-    pub fn clearSurfaceAttentionBySession(self: *AppState, session_id: []const u8) bool {
-        for (self.surfaces.items, 0..) |*surface, index| {
-            if (std.mem.eql(u8, surface.session_id, session_id)) {
-                return self.clearSurfaceAttentionAtIndex(index);
-            }
-        }
-        return self.clearTerminalNotificationBySession(session_id);
-    }
-
-    pub fn clearSurfaceAttentionForDock(self: *AppState, project_index: usize, dock_id: u32) bool {
-        if (project_index >= self.projects.items.len) return false;
-        var changed = false;
-        var surface_index: usize = 0;
-        while (surface_index < self.surfaces.items.len) : (surface_index += 1) {
-            const surface = &self.surfaces.items[surface_index];
-            if (surface.dock_id != dock_id or !self.surfaceBelongsToProject(surface, project_index)) continue;
-            if (self.clearSurfaceAttentionAtIndex(surface_index)) changed = true;
-        }
-        return changed;
-    }
-
-    fn clearSurfaceAttentionAtIndex(self: *AppState, surface_index: usize) bool {
-        if (surface_index >= self.surfaces.items.len) return false;
-        const terminal_changed = self.clearTerminalNotificationBySession(self.surfaces.items[surface_index].session_id);
-        const surface = &self.surfaces.items[surface_index];
-        // Focusing the pane acknowledges a finished turn, so clear the "done"
-        // indicator — it shouldn't re-appear in the sidebar once you've come
-        // back and looked. Genuine waiting/error states persist (you still need
-        // to act on them).
-        const done_ack = surface.completion_pending or surface.status == .done;
-        if (!surface.attention and surface.unread_count == 0 and !done_ack) return terminal_changed;
-        if (done_ack) {
-            _ = self.storage.client.clearSurfaceCompletion(surface.session_id) catch |err| {
-                log.err("failed to persist surface completion acknowledgement: {s}", .{@errorName(err)});
-                return terminal_changed;
-            };
-        }
-        surface.attention = false;
-        surface.unread_count = 0;
-        if (done_ack) {
-            surface.completion_pending = false;
-            surface.completed_at_ms = 0;
-            if (surface.status == .done) surface.status = .idle;
-        }
-        self.markDirty();
-        return true;
-    }
-
-    fn surfaceBelongsToProject(self: *const AppState, surface: *const SurfaceState, project_index: usize) bool {
-        if (project_index >= self.projects.items.len) return false;
-        const project = &self.projects.items[project_index];
-        return std.mem.eql(u8, surface.workspace_id, project.id) or
-            self.projectPathMatches(surface.workspace_path, project.path);
-    }
-
-    fn clearTerminalNotificationBySession(self: *AppState, session_id: []const u8) bool {
-        var changed = false;
-        for (self.projects.items) |*project| {
-            if (project.terminal_dock.clearNotificationForSession(session_id)) changed = true;
-            for (project.terminal_docks.items) |*entry| {
-                if (entry.dock.clearNotificationForSession(session_id)) changed = true;
-            }
-        }
-        return changed;
-    }
-
-    pub fn terminalDockSurfaceAttention(self: *const AppState, project_index: usize, dock_id: u32) bool {
-        if (project_index >= self.projects.items.len) return false;
-        const surface = self.projectTerminalSurface(project_index, dock_id) orelse return false;
-        return surface.completion_pending or surface.attention or surface.unread_count > 0 or surface.status == .waiting or surface.status == .@"error";
-    }
-
-    pub fn projectSurfaceAttention(self: *const AppState, project_index: usize) bool {
-        if (project_index >= self.projects.items.len) return false;
-        const project = &self.projects.items[project_index];
-        for (self.surfaces.items) |*surface| {
-            if (std.mem.eql(u8, surface.workspace_id, project.id) or self.projectPathMatches(surface.workspace_path, project.path)) {
-                if (!project.workspace_layout.hasTerminalDockPane(surface.dock_id)) continue;
-                // The pane you're actively in shouldn't raise a background alert.
-                if (self.isFocusedTerminalSurface(project_index, surface.dock_id)) continue;
-                if (surface.completion_pending or surface.attention or surface.unread_count > 0 or surface.status == .waiting or surface.status == .@"error") return true;
-            }
-        }
-        return false;
-    }
-
-    /// True when (project_index, dock_id) is the terminal pane the user is
-    /// currently focused in — used to suppress its own sidebar status/attention
-    /// indicators (you're already looking at it).
-    pub fn isFocusedTerminalSurface(self: *const AppState, project_index: usize, dock_id: u32) bool {
-        if (!self.terminal_focused) return false;
-        if (project_index != self.selected_project_index) return false;
-        if (project_index >= self.projects.items.len) return false;
-        const layout = &self.projects.items[project_index].workspace_layout;
-        const pane_id = layout.focused_pane_id orelse return false;
-        const pane = layout.paneById(pane_id) orelse return false;
-        return switch (pane.ref) {
-            .terminal => |ref| ref.dock_id == dock_id,
-            else => false,
-        };
-    }
-
-    /// Returns the terminal surface (if any) bound to a given dock within a
-    /// workspace, so the sidebar can render per-pane agent status.
-    pub fn projectTerminalSurface(self: *const AppState, project_index: usize, dock_id: u32) ?*const SurfaceState {
-        if (project_index >= self.projects.items.len) return null;
-        const project = &self.projects.items[project_index];
-        const active_session_id = if (self.projectTerminalDock(project_index, dock_id)) |dock| dock.activeSessionId() else null;
-        var fallback: ?*const SurfaceState = null;
-        for (self.surfaces.items) |*surface| {
-            if (surface.dock_id != dock_id) continue;
-            if (std.mem.eql(u8, surface.workspace_id, project.id) or self.projectPathMatches(surface.workspace_path, project.path)) {
-                if (surface.completion_pending) return surface;
-                if (active_session_id) |session_id| {
-                    if (std.mem.eql(u8, surface.session_id, session_id)) return surface;
-                }
-                fallback = surface;
-            }
-        }
-        return fallback;
     }
 
     /// Selects a workspace and reveals one of its open layout panes, leaving
@@ -6282,9 +2978,9 @@ pub const AppState = struct {
 
     /// Focuses a pane by its zero-based position in the current workspace's sidebar list.
     pub fn focusCurrentProjectWorkspacePaneAtSidebarIndex(self: *AppState, pane_index: usize) bool {
-        if (self.projects.items.len == 0) return false;
-        const project_index = self.selected_project_index;
-        const layout = &self.projects.items[project_index].workspace_layout;
+        if (self.project_controller.projects.items.len == 0) return false;
+        const project_index = self.project_controller.selected_index;
+        const layout = &self.project_controller.projects.items[project_index].workspace_layout;
         if (pane_index >= layout.panes.items.len) return false;
 
         self.focusWorkspaceOpenPaneFromSidebar(project_index, layout.panes.items[pane_index].id);
@@ -6293,9 +2989,9 @@ pub const AppState = struct {
 
     /// Cycles through the current workspace's panes in their sidebar list order.
     pub fn focusCurrentProjectWorkspacePaneInSidebarOrder(self: *AppState, delta: i32) bool {
-        if (self.projects.items.len == 0 or delta == 0) return false;
-        const project_index = self.selected_project_index;
-        const layout = &self.projects.items[project_index].workspace_layout;
+        if (self.project_controller.projects.items.len == 0 or delta == 0) return false;
+        const project_index = self.project_controller.selected_index;
+        const layout = &self.project_controller.projects.items[project_index].workspace_layout;
         if (layout.panes.items.len == 0) return false;
 
         var current_index: ?usize = null;
@@ -6323,14 +3019,14 @@ pub const AppState = struct {
     }
 
     fn focusWorkspaceOpenPaneWithZoom(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, preserve_zoom: bool) void {
-        if (project_index >= self.projects.items.len) return;
-        const previous_project_index = self.selected_project_index;
-        if (preserve_zoom and previous_project_index < self.projects.items.len and previous_project_index != project_index) {
-            const previous_layout = &self.projects.items[previous_project_index].workspace_layout;
+        if (project_index >= self.project_controller.projects.items.len) return;
+        const previous_project_index = self.project_controller.selected_index;
+        if (preserve_zoom and previous_project_index < self.project_controller.projects.items.len and previous_project_index != project_index) {
+            const previous_layout = &self.project_controller.projects.items[previous_project_index].workspace_layout;
             if (previous_layout.quick_pane) |*quick| quick.visible = false;
         }
-        self.selected_project_index = project_index;
-        var project = &self.projects.items[project_index];
+        self.project_controller.selected_index = project_index;
+        var project = &self.project_controller.projects.items[project_index];
         var layout = &project.workspace_layout;
         if (layout.quick_pane) |*quick| {
             if (quick.detached and quick.pane_id == pane_id) {
@@ -6364,26 +3060,14 @@ pub const AppState = struct {
         switch (pane.ref) {
             .chat, .terminal => {},
             .browser => {
-                self.browser_state.setControlsVisible(true);
-                self.browser_state.controller.show() catch |err| {
+                self.browser_controller.runtime.setControlsVisible(true);
+                self.browser_controller.runtime.controller.show() catch |err| {
                     log.warn("failed to show browser pane from sidebar: {s}", .{@errorName(err)});
                 };
             },
         }
         _ = self.focusWorkspacePane(project_index, pane_id);
         self.markDirty();
-    }
-
-    fn replaceOwnedSlice(allocator: std.mem.Allocator, dest: *[]u8, value: []const u8) !void {
-        const next = try allocator.dupe(u8, value);
-        allocator.free(dest.*);
-        dest.* = next;
-    }
-
-    fn replaceOwnedOptionalSlice(allocator: std.mem.Allocator, dest: *?[]u8, value: ?[]const u8) !void {
-        const next = if (value) |v| try allocator.dupe(u8, v) else null;
-        if (dest.*) |old| allocator.free(old);
-        dest.* = next;
     }
 
     pub fn hasCustomTerminalLaunchProfile(self: *const AppState) bool {
@@ -6429,7 +3113,7 @@ pub const AppState = struct {
     }
 
     pub fn openCurrentProjectDirectory(self: *AppState) void {
-        if (self.projects.items.len == 0) {
+        if (self.project_controller.projects.items.len == 0) {
             self.setSidebarNotice("No workspace selected.");
             return;
         }
@@ -6446,7 +3130,7 @@ pub const AppState = struct {
     }
 
     pub fn openCurrentProjectEditor(self: *AppState, target: ProjectEditorTarget) void {
-        if (self.projects.items.len == 0) {
+        if (self.project_controller.projects.items.len == 0) {
             self.setSidebarNotice("No workspace selected.");
             return;
         }
@@ -6528,10 +3212,6 @@ pub const AppState = struct {
         }
     }
 
-    pub fn openTranscriptWebLink(self: *AppState, href: []const u8) void {
-        self.openConfiguredWebLink(href);
-    }
-
     pub fn openConfiguredWebLink(self: *AppState, href: []const u8) void {
         const trimmed = std.mem.trim(u8, href, &std.ascii.whitespace);
         if (trimmed.len == 0) {
@@ -6549,12 +3229,12 @@ pub const AppState = struct {
             return;
         }
 
-        if (self.projects.items.len == 0) {
+        if (self.project_controller.projects.items.len == 0) {
             self.setSidebarNotice("No workspace selected.");
             return;
         }
 
-        _ = self.openBrowserInWorkspace(self.selected_project_index, trimmed) catch |err| switch (err) {
+        _ = self.openBrowserInWorkspace(self.project_controller.selected_index, trimmed) catch |err| switch (err) {
             error.WorkspaceNotFound => self.setSidebarNotice("No workspace selected."),
             error.BrowserDisabled => self.setSidebarNotice("Browser is disabled."),
             error.EmptyBrowserUrl => self.setSidebarNotice("No web link selected."),
@@ -6580,7 +3260,7 @@ pub const AppState = struct {
     }
 
     pub fn attachClipboardImageToCurrentDraft(self: *AppState) bool {
-        if (self.projects.items.len == 0) return false;
+        if (self.project_controller.projects.items.len == 0) return false;
         const capture = captureClipboardImage(self.allocator) catch |err| {
             log.err("failed to capture clipboard image: {s}", .{@errorName(err)});
             runtime_log.diagnostic("clipboard image capture failed: {s}", .{@errorName(err)});
@@ -6618,11 +3298,11 @@ pub const AppState = struct {
     }
 
     pub fn pasteClipboardTextIntoPaletteComposer(self: *AppState) bool {
-        if (self.projects.items.len == 0) return false;
-        if (self.isBrowserPaneFocused() or self.browser_address_focused or self.palette_modal_text_focus != .none) {
+        if (self.project_controller.projects.items.len == 0) return false;
+        if (self.isBrowserPaneFocused() or self.browser_controller.address_focused or self.palette_modal_text_focus != .none) {
             runtime_log.diagnostic(
                 "palette paste blocked browser_focused={} address_focused={} modal_focus={s}",
-                .{ self.isBrowserPaneFocused(), self.browser_address_focused, @tagName(self.palette_modal_text_focus) },
+                .{ self.isBrowserPaneFocused(), self.browser_controller.address_focused, @tagName(self.palette_modal_text_focus) },
             );
             return false;
         }
@@ -6665,9 +3345,9 @@ pub const AppState = struct {
     }
 
     fn paletteComposerSelectionByteLen(self: *const AppState) usize {
-        const anchor = self.palette_composer.selection_anchor orelse return 0;
-        const focus = self.palette_composer.selection_focus orelse return 0;
-        const text_len = self.palette_composer.text().len;
+        const anchor = self.composer_controller.composer.selection_anchor orelse return 0;
+        const focus = self.composer_controller.composer.selection_focus orelse return 0;
+        const text_len = self.composer_controller.composer.text().len;
         const start = @min(@min(anchor, focus), text_len);
         const end = @min(@max(anchor, focus), text_len);
         return end - start;
@@ -6685,7 +3365,7 @@ pub const AppState = struct {
 
     fn clampPaletteComposerInsertText(self: *AppState, text: []const u8) []const u8 {
         const max_len = DRAFT_CAPACITY - 1;
-        const current_len = self.palette_composer.text().len;
+        const current_len = self.composer_controller.composer.text().len;
         const selected_len = self.paletteComposerSelectionByteLen();
         const retained_len = current_len - selected_len;
         if (retained_len >= max_len) return "";
@@ -6696,9 +3376,9 @@ pub const AppState = struct {
 
     fn insertTextIntoPaletteComposer(self: *AppState, text: []const u8) bool {
         if (text.len == 0) return false;
-        self.palette_composer.focused = true;
-        self.composer_focused = true;
-        self.terminal_focused = false;
+        self.composer_controller.composer.focused = true;
+        self.composer_controller.focused = true;
+        self.terminal_controller.focused = false;
         self.unfocusBrowserPane();
         const insert_text = self.clampPaletteComposerInsertText(text);
         if (insert_text.len == 0) {
@@ -6706,7 +3386,7 @@ pub const AppState = struct {
             return true;
         }
         if (insert_text.len < text.len) self.setSidebarNotice("Pasted text was truncated to fit the prompt");
-        const handled = self.palette_composer.handleInput(self.allocator, .{ .text = insert_text }) catch |err| {
+        const handled = self.composer_controller.composer.handleInput(self.allocator, .{ .text = insert_text }) catch |err| {
             log.warn("palette composer paste failed: {s}", .{@errorName(err)});
             return false;
         };
@@ -6717,12 +3397,8 @@ pub const AppState = struct {
         return handled;
     }
 
-    pub fn clearCurrentDraftImage(self: *AppState) void {
-        self.clearCurrentDraftImageAt(0);
-    }
-
     pub fn clearCurrentDraftImageAt(self: *AppState, index: usize) void {
-        if (self.projects.items.len == 0) return;
+        if (self.project_controller.projects.items.len == 0) return;
         const thread = self.currentThreadMutable();
         if (thread.draftImageAt(index)) |image| {
             var threaded = std.Io.Threaded.init_single_threaded;
@@ -6739,28 +3415,14 @@ pub const AppState = struct {
         self.markDirty();
     }
 
-    pub fn trimThreadMessages(self: *AppState, thread: *ChatThread, incoming_count: usize) void {
-        _ = self;
-        _ = thread;
-        _ = incoming_count;
-    }
-
-    fn clearThreadMessages(self: *AppState, thread: *ChatThread) void {
-        while (thread.messages.items.len > 0) {
-            self.releaseMessage(thread.messages.pop().?);
-        }
-        thread.clearTranscriptMarkdownEntries(self.allocator);
-        thread.clearTranscriptHeightEntries();
-    }
-
     fn replaceThreadWithImportedSnapshot(
         self: *AppState,
         project_index: usize,
         thread_index: usize,
         imported_thread: ai_harness.ReadThreadResult,
     ) !void {
-        if (project_index >= self.projects.items.len) return error.ProjectNotFound;
-        const project = &self.projects.items[project_index];
+        if (project_index >= self.project_controller.projects.items.len) return error.ProjectNotFound;
+        const project = &self.project_controller.projects.items[project_index];
         if (thread_index >= project.threads.items.len) return error.ThreadNotFound;
 
         const existing = &project.threads.items[thread_index];
@@ -6770,7 +3432,7 @@ pub const AppState = struct {
         var previous = existing.*;
         existing.* = refreshed;
         previous.deinit(self.allocator);
-        self.projects.items[project_index].invalidateSidebarThreadCache();
+        self.project_controller.projects.items[project_index].invalidateSidebarThreadCache();
     }
 
     fn buildImportedThread(
@@ -6986,113 +3648,34 @@ pub const AppState = struct {
         }
     }
 
-    pub fn openCurrentTranscriptSelectionModal(self: *AppState) void {
-        if (self.projects.items.len == 0) return;
-        const next_text = self.buildCurrentTranscriptSelectionText() catch return;
-        if (self.transcript_selection_text) |existing| {
-            self.allocator.free(existing);
-        }
-        self.transcript_selection_text = next_text;
-        self.transcript_selection_modal_requested = true;
-    }
-
-    pub fn closeTranscriptSelectionModal(self: *AppState) void {
-        self.transcript_selection_modal_requested = false;
-        if (self.transcript_selection_text) |text| {
-            self.allocator.free(text);
-            self.transcript_selection_text = null;
-        }
-    }
-
-    pub fn transcriptSelectionBuffer(self: *AppState) ?[:0]u8 {
-        return self.transcript_selection_text;
-    }
-
-    pub fn consumeTranscriptSelectionModalRequest(self: *AppState) bool {
-        const requested = self.transcript_selection_modal_requested;
-        self.transcript_selection_modal_requested = false;
-        return requested;
-    }
-
-    pub fn isTranscriptFocused(self: *const AppState) bool {
-        return self.transcript_focused and !self.composer_focused and !self.terminal_focused and !self.browser_pane_focused;
-    }
-
-    fn ensureTranscriptMarkdownSelectionCurrent(self: *AppState) void {
-        if (self.projects.items.len == 0) {
-            self.clearTranscriptMarkdownSelection();
-            return;
-        }
-
-        const project_index = self.selected_project_index;
-        const thread_index = self.currentProject().selected_thread_index;
-        if (self.transcript_markdown_selection_project_index == project_index and
-            self.transcript_markdown_selection_thread_index == thread_index)
-        {
-            return;
-        }
-
-        self.clearTranscriptMarkdownSelection();
-    }
-
-    pub fn transcriptMarkdownSelection(self: *AppState) ?TranscriptMarkdownSelection {
-        self.ensureTranscriptMarkdownSelectionCurrent();
-        const anchor = self.transcript_markdown_selection_anchor orelse return null;
-        const focus = self.transcript_markdown_selection_focus orelse return null;
-        return .{
-            .anchor = anchor,
-            .focus = focus,
-        };
-    }
-
-    pub fn transcriptMarkdownSelectionDragging(self: *AppState) bool {
-        self.ensureTranscriptMarkdownSelectionCurrent();
-        return self.transcript_markdown_selection_dragging;
-    }
-
-    pub fn transcriptMarkdownSelectionActive(self: *AppState) bool {
-        self.ensureTranscriptMarkdownSelectionCurrent();
-        return self.transcript_markdown_selection_anchor != null and
-            self.transcript_markdown_selection_focus != null;
-    }
-
-    pub fn beginTranscriptMarkdownSelection(self: *AppState, message_index: usize, point: chat_markdown.SelectionPoint) void {
-        if (self.projects.items.len == 0) return;
-        const selection_point: TranscriptMarkdownSelectionPoint = .{
-            .message_index = message_index,
-            .point = point,
-        };
-        self.transcript_markdown_selection_project_index = self.selected_project_index;
-        self.transcript_markdown_selection_thread_index = self.currentProject().selected_thread_index;
-        self.transcript_markdown_selection_anchor = selection_point;
-        self.transcript_markdown_selection_focus = selection_point;
-        self.transcript_markdown_selection_dragging = true;
-    }
-
-    pub fn updateTranscriptMarkdownSelection(self: *AppState, message_index: usize, point: chat_markdown.SelectionPoint) void {
-        self.ensureTranscriptMarkdownSelectionCurrent();
-        if (self.transcript_markdown_selection_anchor == null) return;
-        self.transcript_markdown_selection_focus = .{
-            .message_index = message_index,
-            .point = point,
-        };
-    }
-
-    pub fn endTranscriptMarkdownSelection(self: *AppState) void {
-        self.transcript_markdown_selection_dragging = false;
-    }
-
-    pub fn notePaletteWorkspaceMouseMotion(self: *AppState, x: f32, y: f32) void {
-        self.palette_mouse_x = x;
-        self.palette_mouse_y = y;
-        self.palette_mouse_in_workspace = true;
-    }
+    pub const closeTranscriptSelectionModal = transcript_controller.closeTranscriptSelectionModal;
+    pub const transcriptSelectionBuffer = transcript_controller.transcriptSelectionBuffer;
+    pub const consumeTranscriptSelectionModalRequest = transcript_controller.consumeTranscriptSelectionModalRequest;
+    pub const isTranscriptFocused = transcript_controller.isTranscriptFocused;
+    pub const ensureTranscriptMarkdownSelectionCurrent = transcript_controller.ensureTranscriptMarkdownSelectionCurrent;
+    pub const transcriptMarkdownSelection = transcript_controller.transcriptMarkdownSelection;
+    pub const transcriptMarkdownSelectionDragging = transcript_controller.transcriptMarkdownSelectionDragging;
+    pub const transcriptMarkdownSelectionActive = transcript_controller.transcriptMarkdownSelectionActive;
+    pub const beginTranscriptMarkdownSelection = transcript_controller.beginTranscriptMarkdownSelection;
+    pub const updateTranscriptMarkdownSelection = transcript_controller.updateTranscriptMarkdownSelection;
+    pub const endTranscriptMarkdownSelection = transcript_controller.endTranscriptMarkdownSelection;
+    pub const notePaletteWorkspaceMouseMotion = transcript_controller.notePaletteWorkspaceMouseMotion;
+    pub const selectAllTranscriptMarkdownSelection = transcript_controller.selectAllTranscriptMarkdownSelection;
+    pub const clearTranscriptMarkdownSelection = transcript_controller.clearTranscriptMarkdownSelection;
+    pub const transcriptMarkdownBodyView = transcript_controller.transcriptMarkdownBodyView;
+    pub const cachedTranscriptMessageHeight = transcript_controller.cachedTranscriptMessageHeight;
+    pub const putTranscriptMessageHeight = transcript_controller.putTranscriptMessageHeight;
+    pub const ensureTranscriptMarkdownEntries = transcript_controller.ensureTranscriptMarkdownEntries;
+    pub const clearTranscriptMarkdownEntries = transcript_controller.clearTranscriptMarkdownEntries;
+    pub const transcriptMarkdownBodyEntry = transcript_controller.transcriptMarkdownBodyEntry;
+    pub const createTranscriptMarkdownBody = transcript_controller.createTranscriptMarkdownBody;
+    pub const buildCurrentTranscriptSelectionText = transcript_controller.buildCurrentTranscriptSelectionText;
 
     pub fn blurPaletteComposer(self: *AppState) void {
-        self.palette_composer.focused = false;
-        self.palette_composer.active_menu = null;
-        self.palette_composer.hovered_menu_index = null;
-        self.composer_focused = false;
+        self.composer_controller.composer.focused = false;
+        self.composer_controller.composer.active_menu = null;
+        self.composer_controller.composer.hovered_menu_index = null;
+        self.composer_controller.focused = false;
     }
 
     pub fn closeSidebarContextMenu(self: *AppState) void {
@@ -7100,219 +3683,6 @@ pub const AppState = struct {
         self.sidebar_context_menu_open = false;
         self.sidebar_context_menu_kind = .none;
         self.markDirty();
-    }
-
-    pub fn selectAllTranscriptMarkdownSelection(
-        self: *AppState,
-        first_message_index: usize,
-        first: chat_markdown.SelectionPoint,
-        last_message_index: usize,
-        last: chat_markdown.SelectionPoint,
-    ) void {
-        if (self.projects.items.len == 0) return;
-        self.transcript_markdown_selection_project_index = self.selected_project_index;
-        self.transcript_markdown_selection_thread_index = self.currentProject().selected_thread_index;
-        self.transcript_markdown_selection_anchor = .{
-            .message_index = first_message_index,
-            .point = first,
-        };
-        self.transcript_markdown_selection_focus = .{
-            .message_index = last_message_index,
-            .point = last,
-        };
-        self.transcript_markdown_selection_dragging = false;
-    }
-
-    pub fn clearTranscriptMarkdownSelection(self: *AppState) void {
-        self.transcript_markdown_selection_project_index = null;
-        self.transcript_markdown_selection_thread_index = null;
-        self.transcript_markdown_selection_anchor = null;
-        self.transcript_markdown_selection_focus = null;
-        self.transcript_markdown_selection_dragging = false;
-    }
-
-    pub fn transcriptMarkdownBodyView(self: *AppState, message_index: usize, body: []const u8) ?*const chat_markdown.BodyView {
-        const entry = self.transcriptMarkdownBodyEntry(message_index, body) orelse return null;
-        return &entry.view;
-    }
-
-    pub fn cachedTranscriptMessageHeight(
-        self: *AppState,
-        message_index: usize,
-        width: f32,
-        body: []const u8,
-        role: ChatRole,
-        author: []const u8,
-        assistant_plain_layout: bool,
-        image_present: bool,
-    ) ?f32 {
-        const thread = self.currentThreadMutable();
-        thread.ensureTranscriptHeightEntries(self.allocator);
-        if (message_index >= thread.transcript_height_entries.items.len) return null;
-
-        const entry = thread.transcript_height_entries.items[message_index];
-        if (!entry.valid) return null;
-        if (entry.role != role) return null;
-        if (entry.assistant_plain_layout != assistant_plain_layout) return null;
-        if (@abs(entry.width - width) > 0.5) return null;
-        if (entry.body_hash != std.hash.Wyhash.hash(0, body)) return null;
-        if (entry.author_hash != std.hash.Wyhash.hash(0, author)) return null;
-        if (entry.image_present != image_present) return null;
-        return entry.height;
-    }
-
-    pub fn putTranscriptMessageHeight(
-        self: *AppState,
-        message_index: usize,
-        width: f32,
-        body: []const u8,
-        role: ChatRole,
-        author: []const u8,
-        assistant_plain_layout: bool,
-        image_present: bool,
-        height: f32,
-    ) void {
-        if (height <= 0.0) return;
-        const thread = self.currentThreadMutable();
-        thread.ensureTranscriptHeightEntries(self.allocator);
-        if (message_index >= thread.transcript_height_entries.items.len) return;
-
-        thread.transcript_height_entries.items[message_index] = .{
-            .valid = true,
-            .role = role,
-            .assistant_plain_layout = assistant_plain_layout,
-            .width = width,
-            .body_hash = std.hash.Wyhash.hash(0, body),
-            .author_hash = std.hash.Wyhash.hash(0, author),
-            .image_present = image_present,
-            .height = height,
-        };
-    }
-
-    fn ensureTranscriptMarkdownEntries(self: *AppState) void {
-        if (self.projects.items.len == 0) {
-            self.clearTranscriptMarkdownEntries();
-            return;
-        }
-
-        const project_index = self.selected_project_index;
-        const thread_index = self.currentProject().selected_thread_index;
-        const message_count = self.currentThread().messages.items.len;
-        if (self.transcript_markdown_project_index == project_index and
-            self.transcript_markdown_thread_index == thread_index and
-            self.transcript_markdown_entries.items.len == message_count)
-        {
-            return;
-        }
-
-        self.clearTranscriptMarkdownEntries();
-        self.transcript_markdown_entries.appendNTimes(self.allocator, null, message_count) catch return;
-        self.transcript_markdown_project_index = project_index;
-        self.transcript_markdown_thread_index = thread_index;
-    }
-
-    fn clearTranscriptMarkdownEntries(self: *AppState) void {
-        for (self.transcript_markdown_entries.items) |entry| {
-            if (entry) |owned| owned.deinit(self.allocator);
-        }
-        self.transcript_markdown_entries.clearRetainingCapacity();
-        self.transcript_markdown_project_index = null;
-        self.transcript_markdown_thread_index = null;
-    }
-
-    fn transcriptMarkdownBodyEntry(self: *AppState, message_index: usize, body: []const u8) ?*TranscriptMarkdownBody {
-        if (body.len == 0) return null;
-        const thread = self.currentThreadMutable();
-        thread.ensureTranscriptMarkdownEntries(self.allocator);
-        if (message_index >= thread.transcript_markdown_entries.items.len) return null;
-
-        if (thread.transcript_markdown_entries.items[message_index]) |entry| {
-            if (!std.mem.eql(u8, entry.owned_body, body)) {
-                entry.deinit(self.allocator);
-                thread.transcript_markdown_entries.items[message_index] = null;
-            } else {
-                return entry;
-            }
-        }
-
-        const created = self.createTranscriptMarkdownBody(body) catch return null;
-        thread.transcript_markdown_entries.items[message_index] = created;
-        return created;
-    }
-
-    fn createTranscriptMarkdownBody(self: *AppState, body: []const u8) !*TranscriptMarkdownBody {
-        const entry = try self.allocator.create(TranscriptMarkdownBody);
-        errdefer self.allocator.destroy(entry);
-
-        entry.owned_body = try self.allocator.dupe(u8, body);
-        errdefer self.allocator.free(entry.owned_body);
-
-        entry.view = try chat_markdown.buildBodyView(self.allocator, entry.owned_body);
-        errdefer entry.view.deinit(self.allocator);
-
-        return entry;
-    }
-
-    pub fn prewarmThreadTranscriptMarkdown(self: *AppState, project_index: usize, thread_index: usize, max_entries: usize) void {
-        if (max_entries == 0 or project_index >= self.projects.items.len) return;
-        const project = &self.projects.items[project_index];
-        if (thread_index >= project.threads.items.len) return;
-
-        const thread = &project.threads.items[thread_index];
-        thread.ensureTranscriptMarkdownEntries(self.allocator);
-
-        var warmed: usize = 0;
-        for (thread.messages.items, 0..) |message, message_index| {
-            if (warmed >= max_entries) break;
-            if (message.body.len == 0 or message_index >= thread.transcript_markdown_entries.items.len) continue;
-
-            if (thread.transcript_markdown_entries.items[message_index]) |entry| {
-                if (std.mem.eql(u8, entry.owned_body, message.body)) {
-                    warmed += 1;
-                    continue;
-                }
-                entry.deinit(self.allocator);
-                thread.transcript_markdown_entries.items[message_index] = null;
-            }
-
-            const created = self.createTranscriptMarkdownBody(message.body) catch return;
-            thread.transcript_markdown_entries.items[message_index] = created;
-            warmed += 1;
-        }
-    }
-
-    fn buildCurrentTranscriptSelectionText(self: *AppState) ![:0]u8 {
-        var buffer = std.ArrayList(u8).empty;
-        defer buffer.deinit(self.allocator);
-
-        const thread = self.currentThread();
-        for (thread.messages.items, 0..) |message, index| {
-            if (index > 0) {
-                try buffer.appendSlice(self.allocator, "\n\n");
-            }
-            try buffer.appendSlice(self.allocator, message.author);
-
-            if (message.image) |image| {
-                const image_label = try std.fmt.allocPrint(self.allocator, "\n[Image: {s}]", .{image.file_name});
-                defer self.allocator.free(image_label);
-                try buffer.appendSlice(self.allocator, image_label);
-            }
-            for (message.extra_images) |image| {
-                const image_label = try std.fmt.allocPrint(self.allocator, "\n[Image: {s}]", .{image.file_name});
-                defer self.allocator.free(image_label);
-                try buffer.appendSlice(self.allocator, image_label);
-            }
-            if (message.body.len > 0) {
-                try buffer.append(self.allocator, '\n');
-                try buffer.appendSlice(self.allocator, message.body);
-            }
-        }
-
-        if (buffer.items.len == 0) {
-            try buffer.appendSlice(self.allocator, "No messages yet.");
-        }
-
-        return try self.allocator.dupeZ(u8, buffer.items);
     }
 
     fn writeClipboardImageToStorage(self: *AppState, mime: []const u8, bytes: []const u8) ![]u8 {
@@ -7373,20 +3743,12 @@ pub const AppState = struct {
         return self.currentProject().currentDraft();
     }
 
-    pub fn currentThreadDraft(self: *const AppState) []const u8 {
-        return self.currentDraft();
-    }
-
     pub fn composerInBangCommandMode(self: *const AppState) bool {
-        return self.projects.items.len > 0 and bang_commands.isShellMode(self.currentDraft());
-    }
-
-    pub fn bangCommandShellName(_: *const AppState) []const u8 {
-        return bang_commands.shellName();
+        return self.project_controller.projects.items.len > 0 and bang_commands.isShellMode(self.currentDraft());
     }
 
     pub fn currentWorkspacePath(self: *const AppState) []const u8 {
-        return if (self.projects.items.len > 0) self.currentProject().path else "";
+        return if (self.project_controller.projects.items.len > 0) self.currentProject().path else "";
     }
 
     fn escapeBangCommandMode(self: *AppState) bool {
@@ -7394,7 +3756,7 @@ pub const AppState = struct {
         const escaped = bang_commands.escapedShellDraft(self.currentDraft());
         self.setDraft(escaped);
         self.syncPaletteComposerFromDraft();
-        self.bang_history_message_index = null;
+        self.composer_controller.bang_history_message_index = null;
         self.setSidebarNotice("Returned to chat mode. Draft preserved.");
         self.noteInteraction();
         return true;
@@ -7531,18 +3893,18 @@ pub const AppState = struct {
     }
 
     pub fn slashCommandPickerActive(self: *const AppState) bool {
-        if (self.projects.items.len == 0) return false;
+        if (self.project_controller.projects.items.len == 0) return false;
         return slashCommandPrefix(self.currentDraft()) != null;
     }
 
     pub fn slashCommandPickerSelectedIndex(self: *const AppState) usize {
         const count = self.slashCommandPickerRowCount();
         if (count == 0) return 0;
-        return @min(self.composer_slash_selected, count - 1);
+        return @min(self.composer_controller.slash_selected, count - 1);
     }
 
     pub fn slashCommandPickerRowCount(self: *const AppState) usize {
-        if (self.projects.items.len == 0) return 0;
+        if (self.project_controller.projects.items.len == 0) return 0;
         var count: usize = 0;
         const prefix = slashCommandPrefix(self.currentDraft()) orelse return 0;
         for (slash_commands.LOCAL_COMMANDS) |command| {
@@ -7556,7 +3918,7 @@ pub const AppState = struct {
     }
 
     pub fn slashCommandPickerRow(self: *const AppState, index: usize) ?SlashPickerRow {
-        if (self.projects.items.len == 0) return null;
+        if (self.project_controller.projects.items.len == 0) return null;
         const prefix = slashCommandPrefix(self.currentDraft()) orelse return null;
         var current: usize = 0;
         for (slash_commands.LOCAL_COMMANDS) |command| {
@@ -7596,7 +3958,7 @@ pub const AppState = struct {
     pub fn selectSlashCommandPickerRow(self: *AppState, index: usize) bool {
         const count = self.slashCommandPickerRowCount();
         if (count == 0 or index >= count) return false;
-        self.composer_slash_selected = index;
+        self.composer_controller.slash_selected = index;
         self.noteInteraction();
         self.markDirty();
         return true;
@@ -7605,7 +3967,7 @@ pub const AppState = struct {
     pub fn activateSlashCommandPickerSelection(self: *AppState) bool {
         const count = self.slashCommandPickerRowCount();
         if (count == 0) return false;
-        const index = @min(self.composer_slash_selected, count - 1);
+        const index = @min(self.composer_controller.slash_selected, count - 1);
         const row = self.slashCommandPickerRow(index) orelse return false;
         if (row.disabled) {
             if (row.requires_thread and self.currentThread().provider_thread_id == null) {
@@ -7629,7 +3991,7 @@ pub const AppState = struct {
             self.setDraft(row.name);
             self.appendSlashCommandInsertionSpace();
             self.syncPaletteComposerFromDraft();
-            self.palette_composer.cursor = self.palette_composer.text().len;
+            self.composer_controller.composer.cursor = self.composer_controller.composer.text().len;
             self.requestComposerFocus();
             self.noteInteraction();
             return true;
@@ -7647,7 +4009,7 @@ pub const AppState = struct {
         self.setDraft(row.name);
         self.appendSlashCommandInsertionSpace();
         self.syncPaletteComposerFromDraft();
-        self.palette_composer.cursor = self.palette_composer.text().len;
+        self.composer_controller.composer.cursor = self.composer_controller.composer.text().len;
         self.requestComposerFocus();
         self.noteInteraction();
         return true;
@@ -7656,7 +4018,7 @@ pub const AppState = struct {
     /// Runs the focused Claude or Codex thread's `/usage` command without
     /// replacing a draft the user may already be composing.
     pub fn showCurrentProviderUsage(self: *AppState) bool {
-        if (self.projects.items.len == 0) return false;
+        if (self.project_controller.projects.items.len == 0) return false;
         if (self.hasPendingSlashCommand()) {
             self.setSidebarNotice("A slash command is already running.");
             return true;
@@ -7700,7 +4062,7 @@ pub const AppState = struct {
         if (!self.slashCommandPickerActive()) return false;
         self.clearDraft();
         self.syncPaletteComposerFromDraft();
-        self.composer_slash_selected = 0;
+        self.composer_controller.slash_selected = 0;
         self.noteInteraction();
         return true;
     }
@@ -7708,215 +4070,14 @@ pub const AppState = struct {
     pub fn clampSlashCommandPickerSelection(self: *AppState) void {
         const count = self.slashCommandPickerRowCount();
         if (count == 0) {
-            self.composer_slash_selected = 0;
+            self.composer_controller.slash_selected = 0;
             return;
         }
-        if (self.composer_slash_selected >= count) self.composer_slash_selected = count - 1;
+        if (self.composer_controller.slash_selected >= count) self.composer_controller.slash_selected = count - 1;
     }
 
     pub fn currentThread(self: *const AppState) *const ChatThread {
         return self.currentProject().currentThread();
-    }
-
-    pub fn currentProjectTerminal(self: *const AppState) *const terminal.Dock {
-        if (self.focusedWorkspaceTerminalDockId()) |dock_id| {
-            if (self.currentProjectTerminalDock(dock_id)) |dock| return dock;
-        }
-        return &self.currentProject().terminal_dock;
-    }
-
-    pub fn currentProjectTerminalMutable(self: *AppState) *terminal.Dock {
-        if (self.focusedWorkspaceTerminalDockId()) |dock_id| {
-            if (self.currentProjectTerminalDockMutable(dock_id)) |dock| return dock;
-        }
-        return &self.currentProjectMutable().terminal_dock;
-    }
-
-    pub fn currentProjectTerminalDock(self: *const AppState, dock_id: u32) ?*const terminal.Dock {
-        if (self.projects.items.len == 0) return null;
-        const project = self.currentProject();
-        if (dock_id == 0) return &project.terminal_dock;
-        for (project.terminal_docks.items) |*entry| {
-            if (entry.id == dock_id) return &entry.dock;
-        }
-        return null;
-    }
-
-    pub fn currentProjectTerminalDockMutable(self: *AppState, dock_id: u32) ?*terminal.Dock {
-        if (self.projects.items.len == 0) return null;
-        var project = self.currentProjectMutable();
-        if (dock_id == 0) return &project.terminal_dock;
-        for (project.terminal_docks.items) |*entry| {
-            if (entry.id == dock_id) return &entry.dock;
-        }
-        return null;
-    }
-
-    pub fn projectTerminalDock(self: *const AppState, project_index: usize, dock_id: u32) ?*const terminal.Dock {
-        if (project_index >= self.projects.items.len) return null;
-        const project = &self.projects.items[project_index];
-        if (dock_id == 0) return &project.terminal_dock;
-        for (project.terminal_docks.items) |*entry| {
-            if (entry.id == dock_id) return &entry.dock;
-        }
-        return null;
-    }
-
-    pub fn projectTerminalDockMutable(self: *AppState, project_index: usize, dock_id: u32) ?*terminal.Dock {
-        if (project_index >= self.projects.items.len) return null;
-        var project = &self.projects.items[project_index];
-        if (dock_id == 0) return &project.terminal_dock;
-        for (project.terminal_docks.items) |*entry| {
-            if (entry.id == dock_id) return &entry.dock;
-        }
-        return null;
-    }
-
-    /// Returns the supported agent provider explicitly associated with a TUI
-    /// dock. Generic terminals are deliberately not inferred from their live
-    /// foreground process, so they never become workspace history entries.
-    pub fn workspaceAgentTuiProvider(self: *const AppState, project_index: usize, dock_id: u32) ?AgentTuiProvider {
-        if (project_index >= self.projects.items.len) return null;
-        if (self.projectTerminalDock(project_index, dock_id)) |dock| {
-            if (dock.activeTabPinnedProvider()) |name| {
-                if (supportedAgentTuiProviderFromName(name)) |provider| return provider;
-            }
-        }
-        const project = &self.projects.items[project_index];
-        for (project.managed_processes.items) |process| {
-            if (process.kind != .agent or process.dock_id != dock_id) continue;
-            const provider = process.provider orelse continue;
-            if (defaultAgentTui(provider) != null) return provider;
-        }
-        if (self.projectTerminalDock(project_index, dock_id)) |dock| {
-            var process_name_buf: [96]u8 = undefined;
-            if (dock.activeForegroundProcessName(&process_name_buf)) |name| {
-                if (agentTuiProviderFromProcessName(name)) |provider| return provider;
-            }
-        }
-        return null;
-    }
-
-    pub fn workspaceAgentTuiHistoryAt(self: *AppState, project_index: usize, dock_id: u32) i64 {
-        const provider = self.workspaceAgentTuiProvider(project_index, dock_id) orelse return 0;
-        const dock_snapshot = self.projectTerminalDock(project_index, dock_id) orelse return 0;
-        const existing = dock_snapshot.activeTabAgentHistoryAt();
-        if (existing != 0) return existing;
-
-        // Prompt-submit hooks persist a title for Codex and Cursor. Use it to
-        // migrate panes whose first turn happened before history enrollment.
-        if (provider == .codex or provider == .cursor) {
-            if (dock_snapshot.activeTabPinnedTitle()) |title| {
-                if (title.len > 0) {
-                    const activity_at = unixTimestampMs();
-                    const dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return 0;
-                    if (dock.noteActiveTabAgentHistory(activity_at)) self.markDirty();
-                    return activity_at;
-                }
-            }
-        }
-
-        // Amp panes created before TUI history had no persisted provider marker.
-        // Foreground-process detection is their only identity after restart, so
-        // enroll them when first encountered. Newly created panes are pinned and
-        // still wait for their first submitted prompt below.
-        if (provider != .amp) return 0;
-        if (dock_snapshot.activeTabPinnedProvider() == null) {
-            const activity_at = unixTimestampMs();
-            const dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return 0;
-            if (dock.noteActiveTabAgentHistory(activity_at)) self.markDirty();
-            return activity_at;
-        }
-
-        // Programmatic Amp submissions do not pass through terminal key input.
-        // The lifecycle plugin distinguishes startup (`idle`) from a real call.
-        const surface = self.projectTerminalSurface(project_index, dock_id) orelse return 0;
-        if (surface.status == .idle or surface.status_changed_at_ms == 0) return 0;
-        const activity_at = surface.status_changed_at_ms;
-        const dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return 0;
-        if (dock.noteActiveTabAgentHistory(activity_at)) self.markDirty();
-        return activity_at;
-    }
-
-    /// Recreates a workspace pane around a saved agent TUI dock. The dock and
-    /// its session outlive pane closure, so this reattaches instead of starting
-    /// a second provider process.
-    pub fn openWorkspaceAgentTuiHistory(self: *AppState, project_index: usize, dock_id: u32) bool {
-        if (project_index >= self.projects.items.len) return false;
-        if (self.workspaceAgentTuiHistoryAt(project_index, dock_id) == 0) return false;
-        if (self.projectTerminalDock(project_index, dock_id) == null) return false;
-
-        self.selected_project_index = project_index;
-        self.ensureCurrentProjectWorkspace();
-        var project = &self.projects.items[project_index];
-        const pane_id = project.workspace_layout.ensureTerminalPane(self.allocator, dock_id) catch {
-            self.setSidebarNotice("Failed to reopen agent TUI.");
-            return false;
-        };
-        project.workspace_layout.maximized_pane_id = null;
-        if (project.managedProcessByDockId(dock_id)) |process| process.pane_id = pane_id;
-        if (self.projectTerminalDock(project_index, dock_id)) |dock| {
-            if (dock.activeSessionId()) |session_id| {
-                if (self.surfaceBySessionId(session_id)) |surface| surface.pane_id = pane_id;
-            }
-        }
-        self.requestTerminalDockFocus(dock_id);
-        self.setSidebarNotice("Agent TUI reopened from history.");
-        self.markDirty();
-        return true;
-    }
-
-    pub fn focusedWorkspaceTerminalDockId(self: *const AppState) ?u32 {
-        if (self.projects.items.len == 0) return null;
-        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
-        const pane = layout.focusedPane() orelse return null;
-        return switch (pane.ref) {
-            .terminal => |ref| ref.dock_id,
-            else => null,
-        };
-    }
-
-    pub fn createCurrentProjectTerminalTab(self: *AppState, dock_id: u32, profile: terminal.TerminalLaunchProfile) bool {
-        if (self.projects.items.len == 0) return false;
-        self.createTerminalTabForWorkspaceProfile(self.selected_project_index, dock_id, profile) catch |err| {
-            log.warn("failed to create workspace terminal tab: {s}", .{@errorName(err)});
-            self.setSidebarNotice("Failed to create terminal tab.");
-            return false;
-        };
-        self.requestTerminalDockFocus(dock_id);
-        self.markDirty();
-        return true;
-    }
-
-    pub fn createProjectTerminalDock(self: *AppState, project_index: usize) !u32 {
-        if (project_index >= self.projects.items.len) return error.NoProjectSelected;
-        var project = &self.projects.items[project_index];
-        const dock_id = project.next_terminal_dock_id;
-        project.next_terminal_dock_id += 1;
-        var dock = try terminal.Dock.init(self.allocator);
-        dock.setDefaultFontSize(self.app_config.terminal_font_size);
-        errdefer dock.deinit(self.allocator);
-        try project.terminal_docks.append(self.allocator, .{ .id = dock_id, .dock = dock });
-        return dock_id;
-    }
-
-    pub fn createCurrentProjectTerminalDock(self: *AppState) !u32 {
-        if (self.projects.items.len == 0) return error.NoProjectSelected;
-        return self.createProjectTerminalDock(self.selected_project_index);
-    }
-
-    pub fn isTerminalVisible(self: *const AppState) bool {
-        if (self.projects.items.len == 0) return false;
-        const project = self.currentProject();
-        return project.terminal_dock.visible or
-            project.workspace_layout.hasVisiblePaneKind(.terminal) or
-            project.workspace_layout.hasVisibleQuickPaneKind(.terminal);
-    }
-
-    pub fn shouldRenderLegacyTerminalDockInChat(self: *const AppState) bool {
-        if (self.projects.items.len == 0) return false;
-        const project = self.currentProject();
-        return project.terminal_dock.visible and !project.workspace_layout.hasVisiblePaneKind(.terminal);
     }
 
     pub fn isSidebarCollapsed(self: *const AppState) bool {
@@ -7959,264 +4120,14 @@ pub const AppState = struct {
         self.markDirty();
     }
 
-    pub fn terminalPanelHeight(self: *const AppState, available_height: f32) f32 {
-        if (self.projects.items.len == 0) return 0.0;
-        return self.currentProjectTerminal().effectiveHeight(available_height);
-    }
-
-    pub fn setCurrentProjectTerminalHeight(self: *AppState, available_height: f32, height: f32) void {
-        if (self.projects.items.len == 0) return;
-        if (self.currentProjectTerminalMutable().setPreferredHeight(available_height, height)) {
-            self.markDirty();
-        }
-    }
-
-    pub fn beginTerminalResizeDrag(self: *AppState, available_height: f32) void {
-        if (!self.isTerminalVisible()) return;
-        self.terminal_resize_drag_active = true;
-        self.terminal_resize_drag_origin_height = self.terminalPanelHeight(available_height);
-        self.noteInteraction();
-    }
-
-    pub fn updateTerminalResizeDrag(self: *AppState, available_height: f32, drag_delta_y: f32) void {
-        if (!self.terminal_resize_drag_active or !self.isTerminalVisible()) return;
-        self.setCurrentProjectTerminalHeight(available_height, self.terminal_resize_drag_origin_height - drag_delta_y);
-    }
-
-    pub fn endTerminalResizeDrag(self: *AppState) void {
-        self.terminal_resize_drag_active = false;
-        self.terminal_resize_drag_origin_height = 0.0;
-    }
-
-    pub fn toggleCurrentProjectTerminal(self: *AppState) void {
-        if (self.projects.items.len == 0) {
-            self.setSidebarNotice("No workspace selected.");
-            return;
-        }
-
-        self.ensureCurrentProjectWorkspace();
-        var dock = self.currentProjectTerminalMutable();
-        if (!dock.hasRunningSession()) {
-            self.restartTerminalDockForWorkspace(self.selected_project_index, 0) catch |err| {
-                log.err("failed to start terminal dock: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Failed to start terminal.");
-                return;
-            };
-        }
-
-        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
-        const terminal_open = layout.visibleTerminalPaneIdForDock(0) != null;
-
-        const pane_id = layout.ensureTerminalPane(self.allocator, 0) catch |err| {
-            log.err("failed to open terminal workspace pane: {s}", .{@errorName(err)});
-            self.setSidebarNotice("Failed to open terminal pane.");
-            return;
-        };
-        if (!terminal_open) layout.focusCreatedPane(pane_id);
-        dock.visible = false;
-        self.requestTerminalFocus();
-        self.setSidebarNotice(if (terminal_open) "Terminal focused." else "Terminal opened.");
-        self.markDirty();
-    }
-
-    pub fn toggleCurrentProjectTerminalLegacy(self: *AppState) void {
-        if (self.projects.items.len == 0) {
-            self.setSidebarNotice("No workspace selected.");
-            return;
-        }
-
-        var dock = self.currentProjectTerminalMutable();
-        if (!dock.visible) {
-            self.restartTerminalDockForWorkspace(self.selected_project_index, 0) catch |err| {
-                log.err("failed to start terminal dock: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Failed to start terminal.");
-                return;
-            };
-        }
-
-        const is_visible = dock.toggle();
-        if (!is_visible) self.endTerminalResizeDrag();
-        if (is_visible) {
-            self.requestTerminalFocus();
-        } else {
-            self.terminal_focused = false;
-        }
-        self.setSidebarNotice(if (is_visible) "Terminal opened." else "Terminal hidden.");
-    }
-
-    // Visible terminal activity within this window keeps the main loop polling
-    // at display rate. Input counts because its first same-loop tail can race
-    // ConPTY's asynchronous writer and otherwise miss the echo before sleeping.
-    const TERMINAL_ACTIVITY_BURST_WINDOW_MS: i64 = 250;
-    const TERMINAL_POLL_INTERVAL_MS: i64 = 16;
-
-    fn monotonicMs() i64 {
-        return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
-    }
-
-    /// True while a visible terminal recently accepted input or produced
-    /// output; the main loop uses this to render the next echo/chunk promptly.
-    pub fn terminalActivityBurstActive(self: *const AppState) bool {
-        if (self.last_terminal_activity_ms == 0) return false;
-        return monotonicMs() - self.last_terminal_activity_ms < TERMINAL_ACTIVITY_BURST_WINDOW_MS;
-    }
-
-    /// Starts a short active-poll window after accepted terminal input. The
-    /// forced poll preserves the immediate post-event check while the cadence
-    /// guard prevents high-rate SDL events from opening one pipe RPC each.
-    pub fn noteTerminalInputActivity(self: *AppState) void {
-        self.last_terminal_activity_ms = monotonicMs();
-        self.terminal_poll_requested = true;
-    }
-
-    pub fn pollTerminals(self: *AppState) bool {
-        var visible_changed = false;
-        const now_ms = monotonicMs();
-        if (!self.terminal_poll_requested and
-            self.last_terminal_poll_ms != 0 and
-            now_ms - self.last_terminal_poll_ms < TERMINAL_POLL_INTERVAL_MS)
-        {
-            return false;
-        }
-        self.terminal_poll_requested = false;
-        self.last_terminal_poll_ms = now_ms;
-        for (self.projects.items, 0..) |*project, project_index| {
-            const project_selected = project_index == self.selected_project_index;
-            const base_visible = project.terminal_dock.visible or project.workspace_layout.hasTerminalDockPane(0);
-            if (!project_selected) {
-                self.pollManagedProcesses(project_index);
-                continue;
-            }
-            if (project_selected and base_visible and !project.terminal_dock.hasRunningSession() and project.terminal_dock.reserveAutoRestart(now_ms)) {
-                const start_result = if (project.terminal_dock.hasRestorableSession())
-                    project.terminal_dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, 0)
-                else
-                    self.restartTerminalDockForWorkspace(project_index, 0);
-                start_result catch |err| {
-                    log.err("failed to start visible terminal session: {s}", .{@errorName(err)});
-                    if (project_index == self.selected_project_index) self.setSidebarNotice("Terminal session failed.");
-                };
-                if (project_index == self.selected_project_index) {
-                    visible_changed = true;
-                }
-            }
-            if (base_visible or project.terminal_dock.hasRunningSession()) {
-                const changed = project.terminal_dock.poll(self.allocator) catch |err| blk: {
-                    log.err("failed to poll terminal session: {s}", .{@errorName(err)});
-                    if (project_index == self.selected_project_index and base_visible) {
-                        self.setSidebarNotice("Terminal session failed.");
-                    }
-                    break :blk false;
-                };
-                if (project.terminal_dock.consumeWorkspaceChange()) self.markDirty();
-                self.drainTerminalDockNotifications(project_index, 0, &project.terminal_dock) catch |err| {
-                    log.warn("failed to apply terminal notification: {s}", .{@errorName(err)});
-                };
-                if (changed and project_index == self.selected_project_index and base_visible) visible_changed = true;
-            }
-            var exited_editor_dock_id: ?u32 = null;
-            for (project.terminal_docks.items) |*entry| {
-                const dock_visible = entry.dock.visible or project.workspace_layout.hasTerminalDockPane(entry.id);
-                const managed_process_explicitly_stopped = if (project.managedProcessByDockId(entry.id)) |process|
-                    process.explicit_stop
-                else
-                    false;
-                if (dock_visible and !entry.dock.hasRunningSession() and project.workspace_layout.hasEditorTerminalDockPane(entry.id)) {
-                    exited_editor_dock_id = entry.id;
-                    break;
-                }
-                if (project_selected and dock_visible and !managed_process_explicitly_stopped and !entry.dock.hasRunningSession() and entry.dock.reserveAutoRestart(now_ms)) {
-                    const start_result = if (entry.dock.hasRestorableSession())
-                        entry.dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, entry.id)
-                    else
-                        self.restartTerminalDockForWorkspace(project_index, entry.id);
-                    start_result catch |err| {
-                        log.err("failed to start visible terminal dock {d}: {s}", .{ entry.id, @errorName(err) });
-                        if (project_index == self.selected_project_index) self.setSidebarNotice("Terminal session failed.");
-                    };
-                    if (project_index == self.selected_project_index) {
-                        visible_changed = true;
-                    }
-                }
-                if (!dock_visible and !entry.dock.hasRunningSession()) continue;
-                const changed = entry.dock.poll(self.allocator) catch |err| blk: {
-                    log.err("failed to poll terminal dock {d}: {s}", .{ entry.id, @errorName(err) });
-                    if (project_index == self.selected_project_index and dock_visible) {
-                        self.setSidebarNotice("Terminal session failed.");
-                    }
-                    break :blk false;
-                };
-                if (entry.dock.consumeWorkspaceChange()) self.markDirty();
-                self.drainTerminalDockNotifications(project_index, entry.id, &entry.dock) catch |err| {
-                    log.warn("failed to apply terminal dock notification: {s}", .{@errorName(err)});
-                };
-                if (changed and project_index == self.selected_project_index and dock_visible) visible_changed = true;
-            }
-            if (exited_editor_dock_id) |dock_id| {
-                if (self.closeExitedEditorTerminalPane(project_index, dock_id) and project_index == self.selected_project_index) {
-                    visible_changed = true;
-                }
-            }
-            self.pollManagedProcesses(project_index);
-        }
-        visible_changed = self.pollUpdateInstallerTerminal() or visible_changed;
-        if (visible_changed) self.last_terminal_activity_ms = monotonicMs();
-        return visible_changed;
-    }
-
-    fn closeExitedEditorTerminalPane(self: *AppState, project_index: usize, dock_id: u32) bool {
-        // The updater is an interactive one-shot command whose final output
-        // must remain visible instead of being auto-closed like editor tasks.
-        if (self.isUpdateInstallerTerminal(project_index, dock_id)) return false;
-        if (project_index >= self.projects.items.len) return false;
-        var project = &self.projects.items[project_index];
-        var layout = &project.workspace_layout;
-        const pane_id = layout.visibleTerminalPaneIdForDock(dock_id) orelse return false;
-        const pane = layout.paneById(pane_id) orelse return false;
-        const terminal_ref = switch (pane.ref) {
-            .terminal => |ref| ref,
-            else => return false,
-        };
-        if (terminal_ref.purpose != .editor) return false;
-        if (layout.visiblePaneCount() <= 1) return false;
-
-        if (project.terminalDockEntryById(dock_id)) |entry| {
-            entry.dock.terminateAllSessions();
-            _ = project.removeTerminalDockById(self.allocator, dock_id);
-        }
-        var removed_ref = layout.closePane(self.allocator, pane_id) orelse return false;
-        defer deinitWorkspacePaneRef(&removed_ref, self.allocator);
-        if (self.selected_project_index == project_index and !layout.hasVisiblePaneKind(.terminal)) self.terminal_focused = false;
-        self.setSidebarNotice("Editor pane closed.");
-        self.markDirty();
-        return true;
-    }
-
-    pub fn drainTerminalDockNotifications(self: *AppState, project_index: usize, dock_id: u32, dock: *terminal.Dock) !void {
-        if (project_index >= self.projects.items.len) return;
-        const event = dock.takeActiveNotification() orelse return;
-        const project = &self.projects.items[project_index];
-        _ = try self.updateSurface(.{
-            .session_id = event.session_id,
-            .workspace_id = project.id,
-            .workspace_path = project.path,
-            .dock_id = dock_id,
-            .pane_id = event.pane_id,
-            .attention = event.attention,
-            .unread_increment = 1,
-            .last_event_title = if (event.title.len > 0) event.title else "Terminal",
-            .last_event_body = event.body,
-        });
-    }
-
     /// Returns mutable browser UI/runtime state for desktop control surfaces.
     pub fn browserState(self: *AppState) *browser_runtime.State {
-        return &self.browser_state;
+        return &self.browser_controller.runtime;
     }
 
     /// Returns read-only browser UI/runtime state for desktop rendering.
     pub fn browserStateConst(self: *const AppState) *const browser_runtime.State {
-        return &self.browser_state;
+        return &self.browser_controller.runtime;
     }
 
     /// Supplies the native SDL window handle that platform webviews attach under.
@@ -8360,66 +4271,27 @@ pub const AppState = struct {
     pub const isInspectorSelectionMessage = browser_controller.isInspectorSelectionMessage;
     pub const isInspectorPromptSubmittedMessage = browser_controller.isInspectorPromptSubmittedMessage;
     pub const isInspectorPromptChangedMessage = browser_controller.isInspectorPromptChangedMessage;
-
-    pub fn hasVisibleTerminalSessions(self: *const AppState) bool {
-        for (self.projects.items) |*project| {
-            if ((project.terminal_dock.visible or project.workspace_layout.hasVisiblePaneKind(.terminal)) and project.terminal_dock.hasRunningSession()) return true;
-            if (project.workspace_layout.hasVisiblePaneKind(.terminal)) {
-                for (project.terminal_docks.items) |*entry| {
-                    if (entry.dock.hasRunningSession()) return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    pub fn handleTerminalKeyDown(
-        self: *AppState,
-        keyboard: *const keybinds.NativeKeyboardConfig,
-        event: *const sdl.KeyboardEvent,
-    ) bool {
-        if (!self.canRouteTerminalInput()) return false;
-        const dock_id = self.terminalInputDockId() orelse return false;
-        if (keyboard.terminalActionForEvent(event)) |action| {
-            switch (action) {
-                .new_tab => return self.createCurrentProjectTerminalTab(dock_id, .{}),
-                .split_up => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.horizontal, false),
-                .split_down => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.horizontal, true),
-                .split_left => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.vertical, false),
-                .split_right => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.vertical, true),
-                else => {},
-            }
-        }
-        const is_agent_tui = self.workspaceAgentTuiProvider(self.selected_project_index, dock_id) != null;
-        var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
-        const handled = dock.handleKeyDown(self.allocator, keyboard, event);
-        if (handled and is_agent_tui and (event.key == .@"return" or event.key == .kp_enter)) {
-            if (dock.noteActiveTabAgentHistory(unixTimestampMs())) self.markDirty();
-        }
-        if (dock.consumeWorkspaceChange()) self.markDirty();
-        if (handled) self.noteTerminalInputActivity();
-        return handled;
-    }
-
-    pub fn handleTerminalTextInput(self: *AppState, text: [*c]const u8) bool {
-        if (!self.canRouteTerminalInput()) return false;
-        const dock_id = self.terminalInputDockId() orelse return false;
-        var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
-        const handled = dock.handleTextInput(std.mem.sliceTo(text, 0));
-        if (handled) self.noteTerminalInputActivity();
-        return handled;
-    }
-
-    fn canRouteTerminalInput(self: *const AppState) bool {
-        if (!self.terminal_focused or !self.isTerminalVisible()) return false;
-        if (self.shouldRenderLegacyTerminalDockInChat()) return true;
-        return self.focusedWorkspacePaneKind() == .terminal;
-    }
-
-    fn terminalInputDockId(self: *const AppState) ?u32 {
-        if (self.shouldRenderLegacyTerminalDockInChat()) return 0;
-        return self.focusedWorkspaceTerminalDockId();
-    }
+    pub const navigateBrowserHistory = browser_controller.navigateBrowserHistory;
+    pub const browserTabCount = browser_controller.browserTabCount;
+    pub const activeBrowserTabIndex = browser_controller.activeBrowserTabIndex;
+    pub const browserTabTitle = browser_controller.browserTabTitle;
+    pub const browserTabPinned = browser_controller.browserTabPinned;
+    pub const browserTabIndicator = browser_controller.browserTabIndicator;
+    pub const browserCanGoBack = browser_controller.browserCanGoBack;
+    pub const browserCanGoForward = browser_controller.browserCanGoForward;
+    pub const createBrowserTab = browser_controller.createBrowserTab;
+    pub const duplicateBrowserTab = browser_controller.duplicateBrowserTab;
+    pub const toggleBrowserTabPinned = browser_controller.toggleBrowserTabPinned;
+    pub const moveBrowserTab = browser_controller.moveBrowserTab;
+    pub const switchBrowserTab = browser_controller.switchBrowserTab;
+    pub const closeBrowserTab = browser_controller.closeBrowserTab;
+    pub const activateBrowserTabRuntime = browser_controller.activateBrowserTabRuntime;
+    pub const reloadBrowser = browser_controller.reloadBrowser;
+    pub const openCurrentBrowserUrlExternally = browser_controller.openCurrentBrowserUrlExternally;
+    pub const selectAllBrowserFocusedElement = browser_controller.selectAllBrowserFocusedElement;
+    pub const pasteBrowserTextIntoFocusedElement = browser_controller.pasteBrowserTextIntoFocusedElement;
+    pub const copyBrowserFocusedSelection = browser_controller.copyBrowserFocusedSelection;
+    pub const copyBrowserEvalResultToClipboard = browser_controller.copyBrowserEvalResultToClipboard;
 
     pub const ensureCurrentProjectWorkspace = workspace_controller.ensureCurrentProjectWorkspace;
     pub const focusedWorkspacePaneKind = workspace_controller.focusedWorkspacePaneKind;
@@ -8468,8 +4340,8 @@ pub const AppState = struct {
     pub const activeWorkspaceLeaseCount = workspace_controller.activeWorkspaceLeaseCount;
 
     pub fn refreshProjectStackConfig(self: *AppState, project_index: usize) !void {
-        if (project_index >= self.projects.items.len) return;
-        var project = &self.projects.items[project_index];
+        if (project_index >= self.project_controller.projects.items.len) return;
+        var project = &self.project_controller.projects.items[project_index];
         project.last_stack_config_refresh_ms = unixTimestampMs();
         const maybe_loaded = stack_config.loadFromProject(self.allocator, project.path) catch |err| {
             project.setStackConfigError(self.allocator, @errorName(err));
@@ -8514,8 +4386,8 @@ pub const AppState = struct {
     }
 
     pub fn refreshManagedProcessStatuses(self: *AppState, project_index: usize) void {
-        if (project_index >= self.projects.items.len) return;
-        const project = &self.projects.items[project_index];
+        if (project_index >= self.project_controller.projects.items.len) return;
+        const project = &self.project_controller.projects.items[project_index];
         for (project.managed_processes.items) |*process| {
             const dock_id = process.dock_id orelse continue;
             const dock = self.projectTerminalDock(project_index, dock_id) orelse {
@@ -8557,9 +4429,9 @@ pub const AppState = struct {
     }
 
     pub fn pollManagedProcesses(self: *AppState, project_index: usize) void {
-        if (project_index >= self.projects.items.len) return;
+        if (project_index >= self.project_controller.projects.items.len) return;
         const now = unixTimestampMs();
-        if (now - self.projects.items[project_index].last_stack_config_refresh_ms >= STACK_CONFIG_REFRESH_MS) {
+        if (now - self.project_controller.projects.items[project_index].last_stack_config_refresh_ms >= STACK_CONFIG_REFRESH_MS) {
             self.refreshProjectStackConfig(project_index) catch |err| {
                 log.warn("failed to refresh verde stack config: {s}", .{@errorName(err)});
             };
@@ -8573,7 +4445,7 @@ pub const AppState = struct {
             restart_names.deinit(self.allocator);
         }
 
-        for (self.projects.items[project_index].managed_processes.items) |*process| {
+        for (self.project_controller.projects.items[project_index].managed_processes.items) |*process| {
             if (process.explicit_stop) continue;
             if (process.watch.items.len > 0 and process.status == .running) {
                 self.pollManagedProcessWatch(project_index, process, now);
@@ -8596,7 +4468,7 @@ pub const AppState = struct {
         }
 
         for (restart_names.items) |name| {
-            if (self.projects.items[project_index].managedProcessByName(name)) |process| {
+            if (self.project_controller.projects.items[project_index].managedProcessByName(name)) |process| {
                 process.restart_count += 1;
                 process.status = .restarting;
             }
@@ -8609,17 +4481,17 @@ pub const AppState = struct {
 
     pub fn startManagedProcess(self: *AppState, project_index: usize, name: []const u8) !bool {
         try self.refreshProjectStackConfig(project_index);
-        if (project_index >= self.projects.items.len) return false;
-        self.selected_project_index = project_index;
-        var project = &self.projects.items[project_index];
+        if (project_index >= self.project_controller.projects.items.len) return false;
+        self.project_controller.selected_index = project_index;
+        var project = &self.project_controller.projects.items[project_index];
         const process = project.managedProcessByName(name) orelse return false;
         return try self.startManagedProcessDirect(project_index, process);
     }
 
     fn startManagedProcessDirect(self: *AppState, project_index: usize, process: *ManagedProcess) !bool {
-        if (project_index >= self.projects.items.len) return false;
-        self.selected_project_index = project_index;
-        var project = &self.projects.items[project_index];
+        if (project_index >= self.project_controller.projects.items.len) return false;
+        self.project_controller.selected_index = project_index;
+        var project = &self.project_controller.projects.items[project_index];
         const dock_id = if (process.dock_id) |saved_dock_id|
             if (project.terminalDockEntryById(saved_dock_id) != null)
                 saved_dock_id
@@ -8688,11 +4560,11 @@ pub const AppState = struct {
         axis: WorkspaceSplitAxis,
         new_after: bool,
     ) !bool {
-        if (project_index >= self.projects.items.len) return false;
-        self.selected_project_index = project_index;
+        if (project_index >= self.project_controller.projects.items.len) return false;
+        self.project_controller.selected_index = project_index;
         self.ensureCurrentProjectWorkspace();
 
-        var project = &self.projects.items[project_index];
+        var project = &self.project_controller.projects.items[project_index];
         var layout = &project.workspace_layout;
         const target_pane_id = requested_pane_id orelse layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse {
             self.setSidebarNotice("No workspace pane selected.");
@@ -8711,7 +4583,7 @@ pub const AppState = struct {
             self.setSidebarNotice(std.fmt.bufPrint(&notice_buf, "Failed to create {s} TUI terminal.", .{provider_label}) catch "Failed to create TUI terminal.");
             return false;
         };
-        project = &self.projects.items[project_index];
+        project = &self.project_controller.projects.items[project_index];
         var launch = try self.managedProcessLaunchArgs(process);
         defer launch.deinit(self.allocator);
         try self.restartTerminalDockForWorkspaceProfile(project_index, dock_id, cwd, .{
@@ -8784,12 +4656,27 @@ pub const AppState = struct {
             .cursor => provider_hooks.ensureCursorProjectHooks(self.allocator, project_path) catch |err| {
                 log.warn("could not install Cursor project status hooks: {s}", .{@errorName(err)});
             },
-            .opencode, .amp, .other => {},
+            .opencode, .grok, .amp, .other => {},
         }
     }
 
     pub fn openAgentTui(self: *AppState, project_index: usize, provider: stack_config.AgentProvider) !bool {
         return self.openAgentTuiAtPlacement(project_index, provider, null, .horizontal, true);
+    }
+
+    pub fn grokTuiInstalled() bool {
+        // Provider probing must stay side-effect free: resolving PATH is enough
+        // to drive the setup state without starting Grok or touching auth.
+        return process_env.commandExists("grok");
+    }
+
+    pub fn openGrokSetupGuide(self: *AppState) void {
+        utils.openUrlInDefaultBrowser(self.allocator, "https://docs.x.ai/build/overview#install") catch |err| {
+            log.warn("failed to open Grok Build setup guide: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Could not open the Grok Build setup guide.");
+            return;
+        };
+        self.setSidebarNotice("Opened the Grok Build setup guide.");
     }
 
     pub fn openAgentTuiAtPlacement(
@@ -8803,10 +4690,14 @@ pub const AppState = struct {
         if (provider == .amp) {
             return try self.openAmpTuiInShellPane(project_index, requested_pane_id, axis, new_after);
         }
+        if (provider == .grok and !grokTuiInstalled()) {
+            self.setSidebarNotice("Grok Build is not installed. Run “Set Up Grok Build” from the command palette.");
+            return false;
+        }
         const defaults = defaultAgentTui(provider) orelse return false;
-        if (project_index >= self.projects.items.len) return false;
-        self.selected_project_index = project_index;
-        var project = &self.projects.items[project_index];
+        if (project_index >= self.project_controller.projects.items.len) return false;
+        self.project_controller.selected_index = project_index;
+        var project = &self.project_controller.projects.items[project_index];
         const name = defaults.name;
         if (project.managedProcessByName(name) == null) {
             var process: ManagedProcess = .{
@@ -8838,11 +4729,11 @@ pub const AppState = struct {
         axis: WorkspaceSplitAxis,
         new_after: bool,
     ) !bool {
-        if (project_index >= self.projects.items.len) return false;
-        self.selected_project_index = project_index;
+        if (project_index >= self.project_controller.projects.items.len) return false;
+        self.project_controller.selected_index = project_index;
         self.ensureCurrentProjectWorkspace();
 
-        var project = &self.projects.items[project_index];
+        var project = &self.project_controller.projects.items[project_index];
         var layout = &project.workspace_layout;
         const target_pane_id = requested_pane_id orelse layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse {
             self.setSidebarNotice("No workspace pane selected.");
@@ -8855,7 +4746,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to create Amp TUI terminal.");
             return false;
         };
-        project = &self.projects.items[project_index];
+        project = &self.project_controller.projects.items[project_index];
         self.restartTerminalDockForWorkspace(project_index, dock_id) catch |err| {
             log.err("failed to start Amp terminal dock: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to start Amp TUI terminal.");
@@ -8910,7 +4801,7 @@ pub const AppState = struct {
             .claude => .claude,
             .opencode => .opencode,
             .cursor => .cursor,
-            .amp => null,
+            .grok, .amp => null,
             .other => null,
         };
     }
@@ -9012,8 +4903,8 @@ pub const AppState = struct {
 
     pub fn stopManagedProcess(self: *AppState, project_index: usize, name: []const u8) !bool {
         try self.refreshProjectStackConfig(project_index);
-        if (project_index >= self.projects.items.len) return false;
-        var project = &self.projects.items[project_index];
+        if (project_index >= self.project_controller.projects.items.len) return false;
+        var project = &self.project_controller.projects.items[project_index];
         var process = project.managedProcessByName(name) orelse return false;
         process.explicit_stop = true;
         process.status = .stopping;
@@ -9032,8 +4923,8 @@ pub const AppState = struct {
 
     pub fn restartManagedProcess(self: *AppState, project_index: usize, name: []const u8) !bool {
         try self.refreshProjectStackConfig(project_index);
-        if (project_index >= self.projects.items.len) return false;
-        if (self.projects.items[project_index].managedProcessByName(name)) |process| {
+        if (project_index >= self.project_controller.projects.items.len) return false;
+        if (self.project_controller.projects.items[project_index].managedProcessByName(name)) |process| {
             process.restart_count += 1;
             process.status = .restarting;
         }
@@ -9043,14 +4934,14 @@ pub const AppState = struct {
 
     pub fn startProjectStack(self: *AppState, project_index: usize) !usize {
         try self.refreshProjectStackConfig(project_index);
-        if (project_index >= self.projects.items.len) return 0;
+        if (project_index >= self.project_controller.projects.items.len) return 0;
         var started: usize = 0;
         var names: std.ArrayList([]u8) = .empty;
         defer {
             for (names.items) |name| self.allocator.free(name);
             names.deinit(self.allocator);
         }
-        for (self.projects.items[project_index].managed_processes.items) |process| {
+        for (self.project_controller.projects.items[project_index].managed_processes.items) |process| {
             try names.append(self.allocator, try self.allocator.dupe(u8, process.name));
         }
         for (names.items) |name| {
@@ -9061,14 +4952,14 @@ pub const AppState = struct {
 
     pub fn stopProjectStack(self: *AppState, project_index: usize) !usize {
         try self.refreshProjectStackConfig(project_index);
-        if (project_index >= self.projects.items.len) return 0;
+        if (project_index >= self.project_controller.projects.items.len) return 0;
         var stopped: usize = 0;
         var names: std.ArrayList([]u8) = .empty;
         defer {
             for (names.items) |name| self.allocator.free(name);
             names.deinit(self.allocator);
         }
-        for (self.projects.items[project_index].managed_processes.items) |process| {
+        for (self.project_controller.projects.items[project_index].managed_processes.items) |process| {
             try names.append(self.allocator, try self.allocator.dupe(u8, process.name));
         }
         for (names.items) |name| {
@@ -9084,8 +4975,8 @@ pub const AppState = struct {
 
     pub fn managedProcessLogs(self: *AppState, project_index: usize, name: []const u8, max_bytes: usize) !?[]u8 {
         try self.refreshProjectStackConfig(project_index);
-        if (project_index >= self.projects.items.len) return null;
-        const project = &self.projects.items[project_index];
+        if (project_index >= self.project_controller.projects.items.len) return null;
+        const project = &self.project_controller.projects.items[project_index];
         const process = project.managedProcessByName(name) orelse return null;
         const dock_id = process.dock_id orelse return null;
         const dock = self.projectTerminalDock(project_index, dock_id) orelse return null;
@@ -9094,23 +4985,23 @@ pub const AppState = struct {
 
     pub fn managedProcessByNameConst(self: *AppState, project_index: usize, name: []const u8) !?*ManagedProcess {
         try self.refreshProjectStackConfig(project_index);
-        if (project_index >= self.projects.items.len) return null;
-        return self.projects.items[project_index].managedProcessByName(name);
+        if (project_index >= self.project_controller.projects.items.len) return null;
+        return self.project_controller.projects.items[project_index].managedProcessByName(name);
     }
 
     pub fn focusManagedProcessTerminal(self: *AppState, project_index: usize, name: []const u8) !bool {
         try self.refreshProjectStackConfig(project_index);
-        if (project_index >= self.projects.items.len) return false;
-        self.selected_project_index = project_index;
-        const process = self.projects.items[project_index].managedProcessByName(name) orelse return false;
+        if (project_index >= self.project_controller.projects.items.len) return false;
+        self.project_controller.selected_index = project_index;
+        const process = self.project_controller.projects.items[project_index].managedProcessByName(name) orelse return false;
         if (process.pane_id) |pane_id| {
             _ = self.focusCurrentProjectWorkspacePane(pane_id);
             if (process.dock_id) |dock_id| self.requestTerminalDockFocus(dock_id);
             return true;
         }
         if (process.dock_id) |dock_id| {
-            process.pane_id = try self.projects.items[project_index].workspace_layout.ensureTerminalPane(self.allocator, dock_id);
-            self.projects.items[project_index].workspace_layout.focusCreatedPane(process.pane_id.?);
+            process.pane_id = try self.project_controller.projects.items[project_index].workspace_layout.ensureTerminalPane(self.allocator, dock_id);
+            self.project_controller.projects.items[project_index].workspace_layout.focusCreatedPane(process.pane_id.?);
             _ = self.focusCurrentProjectWorkspacePane(process.pane_id.?);
             self.requestTerminalDockFocus(dock_id);
             self.markDirty();
@@ -9139,7 +5030,7 @@ pub const AppState = struct {
             self.setSidebarNotice(if (std.mem.eql(u8, root, "/stack")) "Usage: /stack start|stop|restart|status" else "Usage: /process start|stop|restart|focus|crashed <name>");
             return true;
         };
-        const project_index = self.selected_project_index;
+        const project_index = self.project_controller.selected_index;
         if (std.mem.eql(u8, root, "/stack")) {
             if (std.mem.eql(u8, action, "status")) {
                 self.refreshProjectStackConfig(project_index) catch |err| {
@@ -9147,7 +5038,7 @@ pub const AppState = struct {
                     return true;
                 };
                 self.refreshManagedProcessStatuses(project_index);
-                const count: usize = self.projects.items[project_index].managed_processes.items.len;
+                const count: usize = self.project_controller.projects.items[project_index].managed_processes.items.len;
                 self.clearDraft();
                 self.syncPaletteComposerFromDraft();
                 var buffer: [96]u8 = undefined;
@@ -9182,7 +5073,7 @@ pub const AppState = struct {
             };
             self.refreshManagedProcessStatuses(project_index);
             var crashed: usize = 0;
-            for (self.projects.items[project_index].managed_processes.items) |process| {
+            for (self.project_controller.projects.items[project_index].managed_processes.items) |process| {
                 if (process.status == .crashed) crashed += 1;
             }
             self.clearDraft();
@@ -9292,7 +5183,7 @@ pub const AppState = struct {
         raw_text: []const u8,
     ) !void {
         const page_alloc = std.heap.page_allocator;
-        const project_index = self.selected_project_index;
+        const project_index = self.project_controller.selected_index;
         const thread_index = self.currentProject().selected_thread_index;
         const project = self.currentProject();
         const thread = self.currentThread();
@@ -9384,7 +5275,7 @@ pub const AppState = struct {
     fn pollManagedProcessWatch(self: *AppState, project_index: usize, process: *ManagedProcess, now: i64) void {
         if (now - process.last_watch_scan_ms < MANAGED_PROCESS_WATCH_SCAN_MS) return;
         process.last_watch_scan_ms = now;
-        const project = &self.projects.items[project_index];
+        const project = &self.project_controller.projects.items[project_index];
         const signature = self.scanManagedProcessWatchSignature(project.path, process.watch.items) catch |err| {
             process.watch_error_count += 1;
             log.warn("failed to scan watch patterns for managed process name_len={d}: {s}", .{ process.name.len, @errorName(err) });
@@ -9529,152 +5420,26 @@ pub const AppState = struct {
     pub const currentProjectGridNewPanePlacement = workspace_controller.currentProjectGridNewPanePlacement;
 
     pub fn resetUiDebugFrame(self: *AppState) void {
-        self.debug_terminal_window_focused = false;
-        self.debug_terminal_hitbox_focused = false;
-        self.debug_terminal_hitbox_active = false;
-        self.debug_terminal_hitbox_clicked = false;
-        self.debug_terminal_focus_requested = false;
-        self.browser_pane_hovered = false;
-        self.transcript_focused = false;
-        self.debug_workspace_visible_pane_count = 0;
-    }
-
-    pub fn noteTerminalViewportDebug(
-        self: *AppState,
-        window_focused: bool,
-        hitbox_focused: bool,
-        hitbox_active: bool,
-        hitbox_clicked: bool,
-        focus_requested: bool,
-    ) void {
-        self.debug_terminal_window_focused = window_focused;
-        self.debug_terminal_hitbox_focused = hitbox_focused;
-        self.debug_terminal_hitbox_active = hitbox_active;
-        self.debug_terminal_hitbox_clicked = hitbox_clicked;
-        self.debug_terminal_focus_requested = focus_requested;
+        self.terminal_controller.debug_window_focused = false;
+        self.terminal_controller.debug_hitbox_focused = false;
+        self.terminal_controller.debug_hitbox_active = false;
+        self.terminal_controller.debug_hitbox_clicked = false;
+        self.terminal_controller.debug_focus_requested = false;
+        self.browser_controller.pane_hovered = false;
+        self.transcript_controller.focused = false;
+        self.terminal_controller.debug_workspace_visible_pane_count = 0;
     }
 
     pub fn noteTerminalKeyRouting(self: *AppState, event: *const sdl.KeyboardEvent, handled: bool) void {
-        self.debug_last_terminal_scancode = event.scancode;
-        self.debug_last_terminal_key_handled = handled;
+        self.terminal_controller.debug_last_scancode = event.scancode;
+        self.terminal_controller.debug_last_key_handled = handled;
     }
 
     pub fn noteTerminalTextRouting(self: *AppState, text: []const u8, handled: bool) void {
-        self.debug_last_terminal_text_handled = handled;
-        @memset(&self.debug_last_terminal_text, 0);
-        const len = @min(text.len, self.debug_last_terminal_text.len - 1);
-        @memcpy(self.debug_last_terminal_text[0..len], text[0..len]);
-    }
-
-    pub fn currentThreadMutable(self: *AppState) *ChatThread {
-        return self.currentProjectMutable().currentThreadMutable();
-    }
-
-    pub fn rememberCurrentTranscriptScroll(self: *AppState, scroll_y: f32) void {
-        const thread = self.currentThreadMutable();
-        thread.transcript_scroll_valid = true;
-        thread.transcript_scroll_y = @max(scroll_y, 0.0);
-    }
-
-    pub fn rememberWorkspaceChatTranscriptScroll(self: *AppState, pane_id: WorkspacePaneId, scroll_y: f32) void {
-        if (self.projects.items.len == 0) return;
-        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
-        const pane = layout.paneByIdMutable(pane_id) orelse return;
-        switch (pane.ref) {
-            .chat => |*ref| {
-                ref.transcript_scroll_valid = true;
-                ref.transcript_scroll_y = @max(scroll_y, 0.0);
-            },
-            else => {},
-        }
-    }
-
-    pub fn currentTranscriptScrollY(self: *const AppState) ?f32 {
-        const thread = self.currentThread();
-        if (!thread.transcript_scroll_valid) return null;
-        return thread.transcript_scroll_y;
-    }
-
-    pub fn workspaceChatTranscriptScrollY(self: *const AppState, pane_id: WorkspacePaneId) ?f32 {
-        if (self.projects.items.len == 0) return null;
-        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
-        const pane = layout.paneById(pane_id) orelse return null;
-        return switch (pane.ref) {
-            .chat => |ref| if (ref.transcript_scroll_valid) ref.transcript_scroll_y else null,
-            else => null,
-        };
-    }
-
-    pub fn requestComposerFocus(self: *AppState) void {
-        _ = self.acknowledgeFocusedChatCompletion();
-        self.palette_composer.focused = true;
-        self.composer_focused = true;
-        self.terminal_focused = false;
-        self.unfocusBrowserPane();
-        self.browser_address_focused = false;
-    }
-
-    pub fn acknowledgeFocusedChatCompletion(self: *AppState) bool {
-        if (self.projects.items.len == 0) return false;
-        const project = &self.projects.items[self.selected_project_index];
-        const pane_id = project.workspace_layout.focused_pane_id orelse return false;
-        const pane = project.workspace_layout.paneById(pane_id) orelse return false;
-        const thread_index = switch (pane.ref) {
-            .chat => |ref| ref.thread_index,
-            else => return false,
-        };
-        return self.clearChatCompletion(self.selected_project_index, thread_index);
-    }
-
-    pub fn acknowledgeFocusedPaneCompletion(self: *AppState) bool {
-        if (self.projects.items.len == 0) return false;
-        const project_index = self.selected_project_index;
-        const project = &self.projects.items[project_index];
-        const pane_id = project.workspace_layout.focused_pane_id orelse return false;
-        const pane = project.workspace_layout.paneById(pane_id) orelse return false;
-        return switch (pane.ref) {
-            .chat => |ref| self.clearChatCompletion(project_index, ref.thread_index),
-            .terminal => |ref| self.clearSurfaceAttentionForDock(project_index, ref.dock_id),
-            .browser => false,
-        };
-    }
-
-    pub fn clearChatCompletion(self: *AppState, project_index: usize, thread_index: usize) bool {
-        if (project_index >= self.projects.items.len) return false;
-        const project = &self.projects.items[project_index];
-        if (thread_index >= project.threads.items.len) return false;
-        const thread = &project.threads.items[thread_index];
-        if (!thread.completion_pending) return false;
-        _ = self.storage.client.clearChatCompletion(project.id, thread.local_thread_id) catch |err| {
-            log.err("failed to persist chat completion acknowledgement: {s}", .{@errorName(err)});
-            return false;
-        };
-        thread.completion_pending = false;
-        thread.completed_at_ms = 0;
-        self.markDirty();
-        return true;
-    }
-
-    pub fn requestTerminalFocus(self: *AppState) void {
-        self.focusCurrentProjectWorkspaceTerminalPane();
-        self.finishTerminalFocusRequest();
-    }
-
-    pub fn requestTerminalDockFocus(self: *AppState, dock_id: u32) void {
-        self.focusCurrentProjectWorkspaceTerminalDock(dock_id);
-        self.finishTerminalFocusRequest();
-    }
-
-    fn finishTerminalFocusRequest(self: *AppState) void {
-        self.terminal_focused = true;
-        self.composer_focused = false;
-        self.palette_composer.focused = false;
-        self.unfocusBrowserPane();
-        self.browser_address_focused = false;
-        self.palette_modal_text_focus = .none;
-        if (self.focusedWorkspaceTerminalDockId()) |dock_id| {
-            _ = self.clearSurfaceAttentionForDock(self.selected_project_index, dock_id);
-        }
+        self.terminal_controller.debug_last_text_handled = handled;
+        @memset(&self.terminal_controller.debug_last_text, 0);
+        const len = @min(text.len, self.terminal_controller.debug_last_text.len - 1);
+        @memcpy(self.terminal_controller.debug_last_text[0..len], text[0..len]);
     }
 
     pub fn draftBuffer(self: *AppState) [:0]u8 {
@@ -9682,27 +5447,27 @@ pub const AppState = struct {
     }
 
     pub fn syncPaletteComposerFromDraft(self: *AppState) void {
-        if (self.projects.items.len == 0) return;
+        if (self.project_controller.projects.items.len == 0) return;
         const draft = self.currentDraft();
-        if (std.mem.eql(u8, self.palette_composer.text(), draft)) return;
-        const callbacks = self.palette_composer.callbacks;
-        self.palette_composer.setCallbacks(.{});
-        defer self.palette_composer.setCallbacks(callbacks);
-        self.palette_composer.setText(self.allocator, draft) catch |err| {
+        if (std.mem.eql(u8, self.composer_controller.composer.text(), draft)) return;
+        const callbacks = self.composer_controller.composer.callbacks;
+        self.composer_controller.composer.setCallbacks(.{});
+        defer self.composer_controller.composer.setCallbacks(callbacks);
+        self.composer_controller.composer.setText(self.allocator, draft) catch |err| {
             log.warn("failed to sync palette composer draft: {s}", .{@errorName(err)});
         };
     }
 
     pub fn syncDraftFromPaletteComposer(self: *AppState) void {
-        if (self.projects.items.len == 0) return;
-        const text = self.palette_composer.text();
+        if (self.project_controller.projects.items.len == 0) return;
+        const text = self.composer_controller.composer.text();
         if (std.mem.eql(u8, self.currentDraft(), text)) return;
         self.setDraft(text);
     }
 
     pub fn setPaletteComposerBounds(self: *AppState, input_min: [2]f32, input_max: [2]f32) void {
         self.setComposerInputBounds(input_min, input_max);
-        self.palette_composer.setBounds(.{
+        self.composer_controller.composer.setBounds(.{
             .x = input_min[0],
             .y = input_min[1],
             .w = @max(input_max[0] - input_min[0], 0.0),
@@ -9712,23 +5477,23 @@ pub const AppState = struct {
 
     /// Cleared at the start of each workspace paint; see `syncComposerToolbarOverlayHitRects`.
     pub fn invalidateComposerToolbarOverlayHitRects(self: *AppState) void {
-        self.composer_toolbar_overlay_valid = false;
+        self.composer_controller.toolbar_overlay_valid = false;
     }
 
     /// Hit targets for `routePaletteComposerToolbarOverlayClick` (cascade on new threads, synthetic
     /// toolbar clicks when the overlay batch sits above the composer's own hit testing).
     pub fn syncComposerToolbarOverlayHitRects(self: *AppState) void {
-        self.composer_toolbar_model_rect = self.palette_composer.modelRect();
-        self.composer_toolbar_reasoning_rect = self.palette_composer.reasoningRect();
-        self.composer_toolbar_fast_rect = self.palette_composer.fastRect();
-        self.composer_toolbar_access_rect = self.palette_composer.accessRect();
-        self.composer_toolbar_overlay_valid = true;
+        self.composer_controller.toolbar_model_rect = self.composer_controller.composer.modelRect();
+        self.composer_controller.toolbar_reasoning_rect = self.composer_controller.composer.reasoningRect();
+        self.composer_controller.toolbar_fast_rect = self.composer_controller.composer.fastRect();
+        self.composer_controller.toolbar_access_rect = self.composer_controller.composer.accessRect();
+        self.composer_controller.toolbar_overlay_valid = true;
     }
 
     pub fn syncPaletteComposerControls(self: *AppState) void {
-        if (self.projects.items.len == 0) return;
-        self.palette_composer.setCallbacks(.{ .context = self, .on_event = paletteComposerPromptEvent, .get_clipboard = paletteComposerGetClipboard });
-        self.palette_composer.setStyle(paletteComposerStyle());
+        if (self.project_controller.projects.items.len == 0) return;
+        self.composer_controller.composer.setCallbacks(.{ .context = self, .on_event = paletteComposerPromptEvent, .get_clipboard = paletteComposerGetClipboard });
+        self.composer_controller.composer.setStyle(paletteComposerStyle());
         // Composer font sizes are CSS units in the comptime config but the
         // runtime metrics need to be the actual pixel size, otherwise the
         // placeholder + selectors render at fixed pixel sizes while everything
@@ -9737,18 +5502,18 @@ pub const AppState = struct {
         // otherwise pills keep CSS-sized padding/icon cells while their labels
         // and the host-drawn glyphs grow — icons end up on top of the text on
         // HiDPI displays (and worst in narrow split panes).
-        self.palette_composer.setUiScale(theme.uiScaleFactor());
-        self.palette_composer.setFontMetrics(paletteComposerTextFontMetrics(theme.scaledUi(PALETTE_COMPOSER_FONT_SIZE)));
-        self.palette_composer.setToolbarFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE)));
-        self.palette_composer.setIconFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(PALETTE_COMPOSER_ICON_FONT_SIZE)));
+        self.composer_controller.composer.setUiScale(theme.uiScaleFactor());
+        self.composer_controller.composer.setFontMetrics(paletteComposerTextFontMetrics(theme.scaledUi(PALETTE_COMPOSER_FONT_SIZE)));
+        self.composer_controller.composer.setToolbarFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE)));
+        self.composer_controller.composer.setIconFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(PALETTE_COMPOSER_ICON_FONT_SIZE)));
         const thread = self.currentThread();
         // Model + run pills open host popovers (rich picker / run-config
         // panel); fast and access moved into the run-config popover, so their
         // dedicated pills stay hidden.
-        self.palette_composer.setExternalModelMenu(true);
-        self.palette_composer.setExternalReasoningMenu(true);
-        self.palette_composer.setShowFastToggle(false);
-        self.palette_composer.setShowAccessToggle(false);
+        self.composer_controller.composer.setExternalModelMenu(true);
+        self.composer_controller.composer.setExternalReasoningMenu(true);
+        self.composer_controller.composer.setShowFastToggle(false);
+        self.composer_controller.composer.setShowAccessToggle(false);
         const hide_placeholder = thread.draftImageCount() > 0;
         const placeholder = if (self.composerInBangCommandMode())
             "Enter a shell command..."
@@ -9756,11 +5521,11 @@ pub const AppState = struct {
             "Ask anything, or use / to show available commands"
         else
             " ";
-        self.palette_composer.setPlaceholder(self.allocator, placeholder) catch |err| {
+        self.composer_controller.composer.setPlaceholder(self.allocator, placeholder) catch |err| {
             log.warn("failed to sync palette composer placeholder: {s}", .{@errorName(err)});
         };
         const model_options = composerModelOptions(self, thread.provider);
-        self.palette_composer.setModelOptions(self, model_options.len, paletteModelLabel);
+        self.composer_controller.composer.setModelOptions(self, model_options.len, paletteModelLabel);
         self.refreshOpencodeReasoningMenu(thread) catch |err| {
             log.warn("failed to refresh OpenCode reasoning menu: {s}", .{@errorName(err)});
             self.clearOpencodeReasoningMenu();
@@ -9770,14 +5535,14 @@ pub const AppState = struct {
         // Its option list stays un-synced on purpose — the built-in dropdown
         // is disabled via setExternalReasoningMenu and the run-config steppers
         // own the reasoning data instead.
-        self.palette_composer.setShowReasoningToggle(true);
-        self.palette_composer.model_index = self.composerModelIndex(thread.provider, thread.model_ref);
+        self.composer_controller.composer.setShowReasoningToggle(true);
+        self.composer_controller.composer.model_index = self.composerModelIndex(thread.provider, thread.model_ref);
         const send_pending = thread.isSendPendingForUi();
-        self.palette_composer.setSendState(if (send_pending) .stop else .send);
-        self.palette_composer.setStopPulseFactor(if (send_pending) theme.activityPulse(profiler.nowNs()) else 1.0);
-        if (self.palette_composer.model_index) |index| {
+        self.composer_controller.composer.setSendState(if (send_pending) .stop else .send);
+        self.composer_controller.composer.setStopPulseFactor(if (send_pending) theme.activityPulse(profiler.nowNs()) else 1.0);
+        if (self.composer_controller.composer.model_index) |index| {
             if (index < model_options.len) {
-                self.palette_composer.setModelLabel(self.allocator, std.mem.sliceTo(model_options[index].label, 0)) catch |err| {
+                self.composer_controller.composer.setModelLabel(self.allocator, std.mem.sliceTo(model_options[index].label, 0)) catch |err| {
                     log.warn("failed to sync palette composer model label: {s}", .{@errorName(err)});
                 };
             }
@@ -9786,7 +5551,7 @@ pub const AppState = struct {
         // fixed segments; overflow degrades to a truncated summary.
         var summary_buf: [192]u8 = undefined;
         const run_summary = self.composerRunSummaryParts(&summary_buf);
-        self.palette_composer.setReasoningLabel(self.allocator, run_summary.text) catch |err| {
+        self.composer_controller.composer.setReasoningLabel(self.allocator, run_summary.text) catch |err| {
             log.warn("failed to sync palette composer run summary label: {s}", .{@errorName(err)});
         };
         // Host-drawn state glyphs sit inside the run pill label after the
@@ -9805,11 +5570,11 @@ pub const AppState = struct {
         }
         run_slots[run_slot_count] = .{ .byte_offset = run_summary.access_offset, .width = COMPOSER_RUN_PILL_ICON_CELL };
         run_slot_count += 1;
-        self.palette_composer.setReasoningIconSlots(run_slots[0..run_slot_count]);
-        if (self.run_config_open) self.syncRunConfigSteppers();
+        self.composer_controller.composer.setReasoningIconSlots(run_slots[0..run_slot_count]);
+        if (self.composer_controller.run_config_open) self.syncRunConfigSteppers();
     }
 
-    /// `composerRunSummary` text plus the byte offsets of the speed and access
+    /// Run-config summary text plus the byte offsets of the speed and access
     /// segments, so `syncPaletteComposerControls` can pin each host-drawn state
     /// glyph beside the word it describes on the run pill. Offsets point at the
     /// end of each segment: the glyph trails its word so it cannot read as
@@ -9849,39 +5614,35 @@ pub const AppState = struct {
         return result;
     }
 
-    pub fn composerRunSummary(self: *const AppState, buf: []u8) []const u8 {
-        return self.composerRunSummaryParts(buf).text;
-    }
-
     pub fn syncPaletteModelPicker(self: *AppState) void {
-        self.palette_model_picker.setCallbacks(.{
+        self.composer_controller.model_picker.setCallbacks(.{
             .context = self,
             .on_event = paletteModelPickerEvent,
             // Ctrl+V pastes into the embedded search field while open.
             .get_clipboard = paletteComposerGetClipboard,
         });
-        self.palette_model_picker.setStyle(paletteModelPickerStyle());
-        self.palette_model_picker.setUiScale(theme.uiScaleFactor());
-        self.palette_model_picker.setFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(15.5)));
+        self.composer_controller.model_picker.setStyle(paletteModelPickerStyle());
+        self.composer_controller.model_picker.setUiScale(theme.uiScaleFactor());
+        self.composer_controller.model_picker.setFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(15.5)));
         self.rebuildModelPickerEntries() catch |err| {
             log.warn("failed to rebuild model picker entries: {s}", .{@errorName(err)});
         };
-        self.palette_model_picker.setItemCount(self.model_picker_entries.items.len);
-        self.palette_model_picker.setSelectedItem(self.currentModelPickerSelection());
+        self.composer_controller.model_picker.setItemCount(self.composer_controller.model_picker_entries.items.len);
+        self.composer_controller.model_picker.setSelectedItem(self.currentModelPickerSelection());
         self.setPaletteModelPickerBoundsFromToolbar();
     }
 
     fn appendModelPickerEntries(self: *AppState, provider: Provider) !void {
         const options = composerModelOptions(self, provider);
         for (options, 0..) |_, option_index| {
-            try self.model_picker_entries.append(self.allocator, .{ .provider = provider, .option_index = option_index });
+            try self.composer_controller.model_picker_entries.append(self.allocator, .{ .provider = provider, .option_index = option_index });
         }
     }
 
     fn rebuildModelPickerEntries(self: *AppState) !void {
-        const previous = try self.allocator.dupe(ModelPickerEntry, self.model_picker_entries.items);
+        const previous = try self.allocator.dupe(ModelPickerEntry, self.composer_controller.model_picker_entries.items);
         defer self.allocator.free(previous);
-        self.model_picker_entries.clearRetainingCapacity();
+        self.composer_controller.model_picker_entries.clearRetainingCapacity();
         if (self.currentThreadAllowsProviderChoice()) {
             for (COMPOSER_PROVIDER_OPTIONS) |candidate| try self.appendModelPickerEntries(candidate);
         } else {
@@ -9890,22 +5651,22 @@ pub const AppState = struct {
         // The rebuilt slice is the change signal: comparing it against the
         // previous entries catches provider switches, async option refreshes,
         // and reorders without a separate fingerprint to keep in sync.
-        var changed = previous.len != self.model_picker_entries.items.len;
+        var changed = previous.len != self.composer_controller.model_picker_entries.items.len;
         if (!changed) {
-            for (previous, self.model_picker_entries.items) |old, new| {
+            for (previous, self.composer_controller.model_picker_entries.items) |old, new| {
                 if (old.provider != new.provider or old.option_index != new.option_index) {
                     changed = true;
                     break;
                 }
             }
         }
-        if (changed) self.palette_model_picker.invalidateItems();
+        if (changed) self.composer_controller.model_picker.invalidateItems();
     }
 
     /// Funnels every model-picker input through one catch-log path so mouse,
     /// keyboard, and text routing stay behaviorally identical.
     fn modelPickerInput(self: *AppState, input: palette.RichPickerInput) bool {
-        const handled = self.palette_model_picker.handleInput(self.allocator, input) catch |err| blk: {
+        const handled = self.composer_controller.model_picker.handleInput(self.allocator, input) catch |err| blk: {
             log.warn("model picker input failed: {s}", .{@errorName(err)});
             break :blk false;
         };
@@ -9916,25 +5677,25 @@ pub const AppState = struct {
     fn currentModelPickerSelection(self: *const AppState) ?usize {
         const thread = self.currentThread();
         const option_index = self.composerModelIndex(thread.provider, thread.model_ref) orelse return null;
-        for (self.model_picker_entries.items, 0..) |entry, index| {
+        for (self.composer_controller.model_picker_entries.items, 0..) |entry, index| {
             if (entry.provider == thread.provider and entry.option_index == option_index) return index;
         }
         return null;
     }
 
     pub fn setPaletteModelPickerBoundsFromToolbar(self: *AppState) void {
-        const anchor = self.composer_toolbar_model_rect;
+        const anchor = self.composer_controller.toolbar_model_rect;
         if (anchor.w <= 0.0 or anchor.h <= 0.0) return;
         const picker_width = (COMPOSER_MODEL_PICKER_WIDTH + COMPOSER_MODEL_PICKER_RAIL_WIDTH) * theme.uiScaleFactor();
-        const min_x = if (self.composer_input_bounds_valid) self.composer_input_min[0] else anchor.x;
-        const max_x = if (self.composer_input_bounds_valid) self.composer_input_max[0] else anchor.x + picker_width;
+        const min_x = if (self.composer_controller.input_bounds_valid) self.composer_controller.input_min[0] else anchor.x;
+        const max_x = if (self.composer_controller.input_bounds_valid) self.composer_controller.input_max[0] else anchor.x + picker_width;
         const viewport_top: f32 = theme.scaledUi(8.0);
-        const viewport_bottom = if (self.composer_input_bounds_valid)
-            self.composer_input_max[1]
+        const viewport_bottom = if (self.composer_controller.input_bounds_valid)
+            self.composer_controller.input_max[1]
         else
             anchor.y + anchor.h;
-        self.palette_model_picker.setAnchorRect(anchor);
-        self.palette_model_picker.setViewportRect(.{
+        self.composer_controller.model_picker.setAnchorRect(anchor);
+        self.composer_controller.model_picker.setViewportRect(.{
             .x = min_x,
             .y = viewport_top,
             .w = @max(max_x - min_x, picker_width),
@@ -9943,8 +5704,8 @@ pub const AppState = struct {
     }
 
     pub fn openPaletteModelPicker(self: *AppState) void {
-        if (self.projects.items.len == 0) return;
-        self.composer_popover_restore_focus = false;
+        if (self.project_controller.projects.items.len == 0) return;
+        self.composer_controller.popover_restore_focus = false;
         if (self.opencode_model_options.items.len == 0) {
             self.refreshOpencodeModelOptionsCacheAsync();
         }
@@ -9955,41 +5716,41 @@ pub const AppState = struct {
             self.refreshCursorModelOptionsCacheAsync();
         }
         self.closeRunConfigPopover();
-        self.palette_composer.active_menu = null;
-        self.palette_composer.hovered_menu_index = null;
+        self.composer_controller.composer.active_menu = null;
+        self.composer_controller.composer.hovered_menu_index = null;
         self.syncPaletteModelPicker();
-        _ = self.palette_model_picker.handleInput(self.allocator, .open) catch |err| blk: {
+        _ = self.composer_controller.model_picker.handleInput(self.allocator, .open) catch |err| blk: {
             log.warn("failed to open model picker: {s}", .{@errorName(err)});
             break :blk false;
         };
-        self.palette_composer.focused = false;
-        self.composer_focused = false;
+        self.composer_controller.composer.focused = false;
+        self.composer_controller.focused = false;
         // The popover owns typing (search) and arrows while open.
-        self.terminal_focused = false;
+        self.terminal_controller.focused = false;
         self.noteInteraction();
     }
 
     pub fn closePaletteModelPicker(self: *AppState) void {
-        self.composer_popover_restore_focus = false;
-        if (!self.palette_model_picker.isOpen()) return;
-        _ = self.palette_model_picker.handleInput(self.allocator, .close) catch |err| blk: {
+        self.composer_controller.popover_restore_focus = false;
+        if (!self.composer_controller.model_picker.isOpen()) return;
+        _ = self.composer_controller.model_picker.handleInput(self.allocator, .close) catch |err| blk: {
             log.warn("failed to close model picker: {s}", .{@errorName(err)});
             break :blk false;
         };
     }
 
     pub fn togglePaletteModelPickerFromShortcut(self: *AppState) void {
-        const restore_focus = self.composer_popover_restore_focus or
-            self.palette_composer.focused or self.composer_focused;
-        if (self.palette_model_picker.isOpen()) {
+        const restore_focus = self.composer_controller.popover_restore_focus or
+            self.composer_controller.composer.focused or self.composer_controller.focused;
+        if (self.composer_controller.model_picker.isOpen()) {
             self.closePaletteModelPicker();
             if (restore_focus) self.requestComposerFocus();
             self.noteInteraction();
             return;
         }
         self.openPaletteModelPicker();
-        if (self.palette_model_picker.isOpen()) {
-            self.composer_popover_restore_focus = restore_focus;
+        if (self.composer_controller.model_picker.isOpen()) {
+            self.composer_controller.popover_restore_focus = restore_focus;
         }
     }
 
@@ -10027,20 +5788,20 @@ pub const AppState = struct {
     pub fn syncRunConfigSteppers(self: *AppState) void {
         const thread = self.currentThread();
         const style = paletteRunStepperStyle();
-        for (&self.run_steppers, 0..) |*stepper, index| {
-            self.run_stepper_contexts[index] = .{ .state = self, .kind = @enumFromInt(@as(u8, @intCast(index))) };
-            stepper.setCallbacks(.{ .context = &self.run_stepper_contexts[index], .on_event = paletteRunStepperEvent });
+        for (&self.composer_controller.run_steppers, 0..) |*stepper, index| {
+            self.composer_controller.run_stepper_contexts[index] = .{ .state = self, .kind = @enumFromInt(@as(u8, @intCast(index))) };
+            stepper.setCallbacks(.{ .context = &self.composer_controller.run_stepper_contexts[index], .on_event = paletteRunStepperEvent });
             stepper.setStyle(style);
             stepper.setUiScale(theme.uiScaleFactor());
             stepper.setFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(13.0)));
         }
-        const reasoning = &self.run_steppers[@intFromEnum(RunConfigRowKind.reasoning)];
+        const reasoning = &self.composer_controller.run_steppers[@intFromEnum(RunConfigRowKind.reasoning)];
         reasoning.setStepCount(if (thread.provider == .codex) CODEX_REASONING_OPTIONS.len else self.opencode_reasoning_menu.items.len);
         reasoning.setSelected(composerReasoningIndexForThread(self, thread));
-        const speed = &self.run_steppers[@intFromEnum(RunConfigRowKind.speed)];
+        const speed = &self.composer_controller.run_steppers[@intFromEnum(RunConfigRowKind.speed)];
         speed.setStepCount(RUN_SPEED_STEP_LABELS.len);
         speed.setSelected(if (thread.fast_mode == .on) 1 else 0);
-        const access = &self.run_steppers[@intFromEnum(RunConfigRowKind.access)];
+        const access = &self.composer_controller.run_steppers[@intFromEnum(RunConfigRowKind.access)];
         access.setStepCount(RUN_ACCESS_STEP_LABELS.len);
         access.setSelected(if (thread.access_mode == .full_access) 1 else 0);
     }
@@ -10048,7 +5809,7 @@ pub const AppState = struct {
     /// True when the mouse rests on a clickable Palette control so the main
     /// loop can show a pointer (hand) cursor.
     pub fn pointerCursorWanted(self: *const AppState) bool {
-        const point: palette.draw.Vec2 = .{ .x = self.palette_mouse_x, .y = self.palette_mouse_y };
+        const point: palette.draw.Vec2 = .{ .x = self.transcript_controller.palette_mouse_x, .y = self.transcript_controller.palette_mouse_y };
         for (self.palette_modal_hits.items) |hit| {
             const interactive = switch (hit.action) {
                 .mcp_onboarding_not_now,
@@ -10107,9 +5868,9 @@ pub const AppState = struct {
             if (interactive and hit.rect.contains(point)) return true;
         }
         if (self.palette_modal_hits.items.len > 0) return false;
-        if (self.projects.items.len == 0) return false;
-        if (self.palette_model_picker.wantsPointerAt(point)) return true;
-        if (!self.show_settings_modal) {
+        if (self.project_controller.projects.items.len == 0) return false;
+        if (self.composer_controller.model_picker.wantsPointerAt(point)) return true;
+        if (!self.settings_controller.modal_visible) {
             for (self.card_toggle_hits.items) |hit| {
                 if (hit.rect.contains(point)) return true;
             }
@@ -10117,17 +5878,17 @@ pub const AppState = struct {
                 if (hit.rect.contains(point)) return true;
             }
         }
-        if (self.run_config_open) {
+        if (self.composer_controller.run_config_open) {
             var kinds: [3]RunConfigRowKind = undefined;
             const count = self.runConfigVisibleRows(&kinds);
             var index: usize = 0;
             while (index < count) : (index += 1) {
-                if (self.run_steppers[@intFromEnum(kinds[index])].wantsPointerAt(point)) return true;
+                if (self.composer_controller.run_steppers[@intFromEnum(kinds[index])].wantsPointerAt(point)) return true;
             }
         }
         // The overlay-valid flag guarantees the composer toolbar was laid
         // out this frame, so its hit rects are trustworthy.
-        if (self.composer_toolbar_overlay_valid and self.palette_composer.hitTest(point) != null) return true;
+        if (self.composer_controller.toolbar_overlay_valid and self.composer_controller.composer.hitTest(point) != null) return true;
         return false;
     }
 
@@ -10135,19 +5896,19 @@ pub const AppState = struct {
     /// time; called once per rendered frame while the popover is open.
     pub fn tickRunConfigSteppers(self: *AppState) void {
         const now = monotonicMs();
-        defer self.run_config_last_tick_ms = now;
-        if (self.run_config_last_tick_ms == 0 or now <= self.run_config_last_tick_ms) return;
+        defer self.composer_controller.run_config_last_tick_ms = now;
+        if (self.composer_controller.run_config_last_tick_ms == 0 or now <= self.composer_controller.run_config_last_tick_ms) return;
         // Clamp so a long gap between frames (popover just reopened, app
         // stalled) advances the slide instead of teleporting past it.
-        const elapsed: u32 = @intCast(@min(now - self.run_config_last_tick_ms, 100));
-        for (&self.run_steppers) |*stepper| stepper.tick(elapsed);
+        const elapsed: u32 = @intCast(@min(now - self.composer_controller.run_config_last_tick_ms, 100));
+        for (&self.composer_controller.run_steppers) |*stepper| stepper.tick(elapsed);
     }
 
     /// True while a stepper thumb is mid-slide; keeps the main loop pumping
     /// frames for the ~160ms animation window.
     pub fn runConfigStepperAnimating(self: *const AppState) bool {
-        if (!self.run_config_open) return false;
-        for (&self.run_steppers) |*stepper| {
+        if (!self.composer_controller.run_config_open) return false;
+        for (&self.composer_controller.run_steppers) |*stepper| {
             if (stepper.isAnimating()) return true;
         }
         return false;
@@ -10172,8 +5933,8 @@ pub const AppState = struct {
             .row_count = 0,
         };
         layout.row_count = self.runConfigVisibleRows(&layout.row_kinds);
-        const anchor = self.composer_toolbar_reasoning_rect;
-        const composer = self.palette_composer.bounds();
+        const anchor = self.composer_controller.toolbar_reasoning_rect;
+        const composer = self.composer_controller.composer.bounds();
         const pad = theme.scaledUi(14.0);
         const title_h = theme.scaledUi(16.0);
         const title_gap = theme.scaledUi(6.0);
@@ -10183,7 +5944,7 @@ pub const AppState = struct {
         var height = pad * 2.0;
         var index: usize = 0;
         while (index < layout.row_count) : (index += 1) {
-            height += title_h + title_gap + self.run_steppers[@intFromEnum(layout.row_kinds[index])].requiredHeight();
+            height += title_h + title_gap + self.composer_controller.run_steppers[@intFromEnum(layout.row_kinds[index])].requiredHeight();
             if (index + 1 < layout.row_count) height += row_gap;
         }
 
@@ -10196,7 +5957,7 @@ pub const AppState = struct {
         var cursor_y = y + pad;
         index = 0;
         while (index < layout.row_count) : (index += 1) {
-            const stepper = &self.run_steppers[@intFromEnum(layout.row_kinds[index])];
+            const stepper = &self.composer_controller.run_steppers[@intFromEnum(layout.row_kinds[index])];
             layout.title_rects[index] = .{ .x = x + pad, .y = cursor_y, .w = @max(width - pad * 2.0, 0.0), .h = title_h };
             cursor_y += title_h + title_gap;
             stepper.setBounds(.{ .x = x + pad, .y = cursor_y, .w = @max(width - pad * 2.0, 0.0), .h = stepper.requiredHeight() });
@@ -10206,29 +5967,29 @@ pub const AppState = struct {
     }
 
     pub fn openRunConfigPopover(self: *AppState) void {
-        if (self.projects.items.len == 0) return;
-        self.composer_popover_restore_focus = false;
+        if (self.project_controller.projects.items.len == 0) return;
+        self.composer_controller.popover_restore_focus = false;
         self.closePaletteModelPicker();
-        self.palette_composer.active_menu = null;
-        self.palette_composer.hovered_menu_index = null;
+        self.composer_controller.composer.active_menu = null;
+        self.composer_controller.composer.hovered_menu_index = null;
         self.syncRunConfigSteppers();
-        self.run_config_open = true;
-        self.run_config_focused_row = 0;
+        self.composer_controller.run_config_open = true;
+        self.composer_controller.run_config_focused_row = 0;
         _ = self.layoutRunConfigPopover();
-        self.palette_composer.focused = false;
-        self.composer_focused = false;
+        self.composer_controller.composer.focused = false;
+        self.composer_controller.focused = false;
         // Arrow keys steer the popover's steppers while it is open.
-        self.terminal_focused = false;
+        self.terminal_controller.focused = false;
         self.noteInteraction();
     }
 
     pub fn closeRunConfigPopover(self: *AppState) void {
-        self.composer_popover_restore_focus = false;
-        self.run_config_open = false;
+        self.composer_controller.popover_restore_focus = false;
+        self.composer_controller.run_config_open = false;
     }
 
     pub fn toggleRunConfigPopover(self: *AppState) void {
-        if (self.run_config_open) {
+        if (self.composer_controller.run_config_open) {
             self.closeRunConfigPopover();
         } else {
             self.openRunConfigPopover();
@@ -10236,45 +5997,45 @@ pub const AppState = struct {
     }
 
     pub fn toggleRunConfigPopoverFromShortcut(self: *AppState) void {
-        const restore_focus = self.composer_popover_restore_focus or
-            self.palette_composer.focused or self.composer_focused;
-        if (self.run_config_open) {
+        const restore_focus = self.composer_controller.popover_restore_focus or
+            self.composer_controller.composer.focused or self.composer_controller.focused;
+        if (self.composer_controller.run_config_open) {
             self.closeRunConfigPopover();
             if (restore_focus) self.requestComposerFocus();
             self.noteInteraction();
             return;
         }
         self.openRunConfigPopover();
-        if (self.run_config_open) self.composer_popover_restore_focus = restore_focus;
+        if (self.composer_controller.run_config_open) self.composer_controller.popover_restore_focus = restore_focus;
     }
 
     fn closeRunConfigPopoverFromKeyboard(self: *AppState) void {
-        const restore_focus = self.composer_popover_restore_focus;
+        const restore_focus = self.composer_controller.popover_restore_focus;
         self.closeRunConfigPopover();
         if (restore_focus) self.requestComposerFocus();
     }
 
     fn restoreComposerAfterShortcutPopover(self: *AppState) void {
-        const restore_focus = self.composer_popover_restore_focus;
-        self.composer_popover_restore_focus = false;
+        const restore_focus = self.composer_controller.popover_restore_focus;
+        self.composer_controller.popover_restore_focus = false;
         if (restore_focus) self.requestComposerFocus();
     }
 
     pub fn routePaletteComposerTextInput(self: *AppState, text: []const u8) bool {
-        if (self.projects.items.len == 0) return false;
-        if (self.palette_model_picker.isOpen()) {
-            const handled = self.palette_model_picker.handleInput(self.allocator, .{ .text = text }) catch |err| blk: {
+        if (self.project_controller.projects.items.len == 0) return false;
+        if (self.composer_controller.model_picker.isOpen()) {
+            const handled = self.composer_controller.model_picker.handleInput(self.allocator, .{ .text = text }) catch |err| blk: {
                 log.warn("model picker text input failed: {s}", .{@errorName(err)});
                 break :blk false;
             };
             if (handled) self.noteInteraction();
             return handled;
         }
-        if (self.terminal_focused) return false;
-        if (!self.palette_composer.focused) return false;
+        if (self.terminal_controller.focused) return false;
+        if (!self.composer_controller.composer.focused) return false;
         const insert_text = self.clampPaletteComposerInsertText(text);
         if (insert_text.len == 0) return true;
-        const handled = self.palette_composer.handleInput(self.allocator, .{ .text = insert_text }) catch |err| {
+        const handled = self.composer_controller.composer.handleInput(self.allocator, .{ .text = insert_text }) catch |err| {
             log.warn("palette composer text input failed: {s}", .{@errorName(err)});
             return false;
         };
@@ -10286,28 +6047,28 @@ pub const AppState = struct {
     }
 
     pub fn routePaletteComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
-        if (self.projects.items.len == 0) return false;
+        if (self.project_controller.projects.items.len == 0) return false;
         // Escape never survives `paletteComposerKeyFromSdl`, so close the
         // composer popovers from the raw SDL event before the conversion.
         if (event.key == .escape or event.scancode == .escape) {
-            if (self.palette_model_picker.isOpen()) {
+            if (self.composer_controller.model_picker.isOpen()) {
                 return self.routePaletteModelPickerKey(.{ .code = .escape });
             }
-            if (self.run_config_open) {
+            if (self.composer_controller.run_config_open) {
                 self.closeRunConfigPopoverFromKeyboard();
                 self.noteInteraction();
                 return true;
             }
             if (self.escapeBangCommandMode()) return true;
         }
-        if (self.terminal_focused) return false;
+        if (self.terminal_controller.focused) return false;
         // Ctrl+1..9 selects the picker's shortcut-chip rows. Digits never
         // survive `paletteComposerKeyFromSdl`, so read the raw SDL key.
-        if (self.palette_model_picker.isOpen()) {
+        if (self.composer_controller.model_picker.isOpen()) {
             const key_value = @intFromEnum(event.key);
             const ctrl_held = (keymodBits(event.mod) & sdl.Keymod.ctrl) != 0;
             if (ctrl_held and key_value >= '1' and key_value <= '9') {
-                const handled = self.palette_model_picker.selectVisibleOrdinal(self.allocator, @intCast(key_value - '1')) catch |err| blk: {
+                const handled = self.composer_controller.model_picker.selectVisibleOrdinal(self.allocator, @intCast(key_value - '1')) catch |err| blk: {
                     log.warn("model picker shortcut select failed: {s}", .{@errorName(err)});
                     break :blk false;
                 };
@@ -10316,7 +6077,7 @@ pub const AppState = struct {
             }
         }
         const palette_key = paletteComposerKeyFromSdl(event) orelse return false;
-        if (self.palette_model_picker.isOpen()) {
+        if (self.composer_controller.model_picker.isOpen()) {
             // The picker owns typing while open: navigation keys move the
             // highlight, everything else edits the embedded search field.
             return self.routePaletteModelPickerKey(palette_key);
@@ -10325,11 +6086,11 @@ pub const AppState = struct {
         if (palette_key.primary and palette_key.code == .v) {
             runtime_log.diagnostic(
                 "palette composer received primary-v focused={} draft_len={d}",
-                .{ self.palette_composer.focused, self.currentDraft().len },
+                .{ self.composer_controller.composer.focused, self.currentDraft().len },
             );
             return self.pasteClipboardTextIntoPaletteComposer();
         }
-        if (!self.palette_composer.focused) return false;
+        if (!self.composer_controller.composer.focused) return false;
         if (self.routeSlashCommandPickerKey(palette_key)) return true;
         if (self.recallBangCommand(palette_key)) {
             self.noteInteraction();
@@ -10339,7 +6100,7 @@ pub const AppState = struct {
             self.noteInteraction();
             return true;
         }
-        const handled = self.palette_composer.handleInput(self.allocator, .{ .key = palette_key }) catch |err| {
+        const handled = self.composer_controller.composer.handleInput(self.allocator, .{ .key = palette_key }) catch |err| {
             log.warn("palette composer key input failed: {s}", .{@errorName(err)});
             return false;
         };
@@ -10357,39 +6118,39 @@ pub const AppState = struct {
         if (draft.len > 0 and draft[0] != '!') return false;
         const messages = self.currentThread().messages.items;
         if (key.code == .up) {
-            var index = self.bang_history_message_index orelse messages.len;
+            var index = self.composer_controller.bang_history_message_index orelse messages.len;
             while (index > 0) {
                 index -= 1;
                 const body = messages[index].body;
                 if (messages[index].role != .user or body.len < 2 or body[0] != '!' or body[1] == '!') continue;
                 self.setDraft(body);
                 self.syncPaletteComposerFromDraft();
-                self.bang_history_message_index = index;
+                self.composer_controller.bang_history_message_index = index;
                 return true;
             }
             return false;
         }
 
-        var index = (self.bang_history_message_index orelse return false) + 1;
+        var index = (self.composer_controller.bang_history_message_index orelse return false) + 1;
         while (index < messages.len) : (index += 1) {
             const body = messages[index].body;
             if (messages[index].role != .user or body.len < 2 or body[0] != '!' or body[1] == '!') continue;
             self.setDraft(body);
             self.syncPaletteComposerFromDraft();
-            self.bang_history_message_index = index;
+            self.composer_controller.bang_history_message_index = index;
             return true;
         }
-        self.bang_history_message_index = null;
+        self.composer_controller.bang_history_message_index = null;
         self.clearDraft();
         self.syncPaletteComposerFromDraft();
         return true;
     }
 
     pub fn routePaletteComposerMouseButton(self: *AppState, event: *const sdl.MouseButtonEvent, ui_scale: f32) bool {
-        if (self.projects.items.len == 0) return false;
+        if (self.project_controller.projects.items.len == 0) return false;
         if (event.button != 1) return false;
         const point = paletteMousePoint(event.x, event.y, ui_scale);
-        if (event.down and event.clicks >= 2 and self.palette_composer.textRect().contains(point)) {
+        if (event.down and event.clicks >= 2 and self.composer_controller.composer.textRect().contains(point)) {
             return self.routePaletteComposerMultiClick(point, event.clicks);
         }
         if (event.down and self.routePaletteComposerToolbarOverlayClick(point)) return true;
@@ -10397,29 +6158,29 @@ pub const AppState = struct {
             .{ .mouse_down = point }
         else
             .{ .mouse_up = point };
-        const was_focused = self.palette_composer.focused;
-        const handled = self.palette_composer.handleInput(self.allocator, input) catch |err| {
+        const was_focused = self.composer_controller.composer.focused;
+        const handled = self.composer_controller.composer.handleInput(self.allocator, input) catch |err| {
             log.warn("palette composer mouse input failed: {s}", .{@errorName(err)});
             return false;
         };
-        self.composer_focused = self.palette_composer.focused;
-        if (self.composer_focused) {
-            self.terminal_focused = false;
+        self.composer_controller.focused = self.composer_controller.composer.focused;
+        if (self.composer_controller.focused) {
+            self.terminal_controller.focused = false;
             self.unfocusBrowserPane();
         }
-        return handled or was_focused != self.palette_composer.focused;
+        return handled or was_focused != self.composer_controller.composer.focused;
     }
 
     fn routePaletteComposerToolbarOverlayClick(self: *AppState, point: palette.draw.Vec2) bool {
-        if (!self.composer_toolbar_overlay_valid) return false;
+        if (!self.composer_controller.toolbar_overlay_valid) return false;
         // Model and run pills open host-owned popovers (rich picker /
         // run-config panel); the composer's built-in dropdowns stay disabled
         // via `setExternalModelMenu` / `setExternalReasoningMenu`.
-        if (self.composer_toolbar_model_rect.contains(point)) {
+        if (self.composer_controller.toolbar_model_rect.contains(point)) {
             self.openPaletteModelPicker();
             return true;
         }
-        if (self.composer_toolbar_reasoning_rect.contains(point) and self.palette_composer.showReasoningToggle()) {
+        if (self.composer_controller.toolbar_reasoning_rect.contains(point) and self.composer_controller.composer.showReasoningToggle()) {
             self.toggleRunConfigPopover();
             return true;
         }
@@ -10427,13 +6188,13 @@ pub const AppState = struct {
     }
 
     pub fn routePaletteComposerMouseMotion(self: *AppState, event: *const sdl.MouseMotionEvent, ui_scale: f32) bool {
-        if (self.projects.items.len == 0) return false;
+        if (self.project_controller.projects.items.len == 0) return false;
         const point = paletteMousePoint(event.x, event.y, ui_scale);
         const input: palette.ComposerPromptInput = if (event.state.left != 0)
             .{ .mouse_drag = point }
         else
             .{ .mouse_move = point };
-        const handled = self.palette_composer.handleInput(self.allocator, input) catch |err| {
+        const handled = self.composer_controller.composer.handleInput(self.allocator, input) catch |err| {
             log.warn("palette composer mouse motion failed: {s}", .{@errorName(err)});
             return false;
         };
@@ -10445,8 +6206,8 @@ pub const AppState = struct {
     }
 
     pub fn routePaletteComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent, ui_scale: f32) bool {
-        if (self.projects.items.len == 0) return false;
-        const handled = self.palette_composer.handleInput(self.allocator, .{
+        if (self.project_controller.projects.items.len == 0) return false;
+        const handled = self.composer_controller.composer.handleInput(self.allocator, .{
             .mouse_wheel = .{ .point = paletteMousePoint(event.mouse_x, event.mouse_y, ui_scale), .y = event.y },
         }) catch |err| {
             log.warn("palette composer wheel failed: {s}", .{@errorName(err)});
@@ -10460,7 +6221,7 @@ pub const AppState = struct {
     /// panes at overlay z, so main.zig routes their pointer input ahead of
     /// the pane/transcript handlers via these entry points.
     pub fn routeComposerPopoverMouseButton(self: *AppState, event: *const sdl.MouseButtonEvent, ui_scale: f32) bool {
-        if (self.projects.items.len == 0) return false;
+        if (self.project_controller.projects.items.len == 0) return false;
         if (event.button != 1) return false;
         const point = paletteMousePoint(event.x, event.y, ui_scale);
         if (self.routePaletteModelPickerMouseButton(point, event.down, event.clicks)) return true;
@@ -10468,41 +6229,41 @@ pub const AppState = struct {
     }
 
     pub fn routeComposerPopoverMouseMotion(self: *AppState, event: *const sdl.MouseMotionEvent, ui_scale: f32) bool {
-        if (self.projects.items.len == 0) return false;
+        if (self.project_controller.projects.items.len == 0) return false;
         const point = paletteMousePoint(event.x, event.y, ui_scale);
         if (self.routePaletteModelPickerMouseMove(point, event.state.left != 0)) return true;
         return self.routeRunConfigMouseMove(point);
     }
 
     pub fn routeComposerPopoverWheel(self: *AppState, event: *const sdl.MouseWheelEvent, ui_scale: f32) bool {
-        if (self.projects.items.len == 0) return false;
+        if (self.project_controller.projects.items.len == 0) return false;
         const point = paletteMousePoint(event.mouse_x, event.mouse_y, ui_scale);
         if (self.routePaletteModelPickerWheel(point, event.y)) return true;
         return self.routeRunConfigWheel(point);
     }
 
     fn routePaletteModelPickerKey(self: *AppState, key: palette.Key) bool {
-        if (!self.palette_model_picker.isOpen()) return false;
+        if (!self.composer_controller.model_picker.isOpen()) return false;
         return self.modelPickerInput(.{ .key = key });
     }
 
     fn routeRunConfigKey(self: *AppState, key: palette.Key) bool {
-        if (!self.run_config_open) return false;
+        if (!self.composer_controller.run_config_open) return false;
         var kinds: [3]RunConfigRowKind = undefined;
         const count = self.runConfigVisibleRows(&kinds);
         if (count == 0) {
             self.closeRunConfigPopoverFromKeyboard();
             return true;
         }
-        if (self.run_config_focused_row >= count) self.run_config_focused_row = count - 1;
+        if (self.composer_controller.run_config_focused_row >= count) self.composer_controller.run_config_focused_row = count - 1;
         switch (key.code) {
             .up => {
-                self.run_config_focused_row = (self.run_config_focused_row + count - 1) % count;
+                self.composer_controller.run_config_focused_row = (self.composer_controller.run_config_focused_row + count - 1) % count;
                 self.noteInteraction();
                 return true;
             },
             .down => {
-                self.run_config_focused_row = (self.run_config_focused_row + 1) % count;
+                self.composer_controller.run_config_focused_row = (self.composer_controller.run_config_focused_row + 1) % count;
                 self.noteInteraction();
                 return true;
             },
@@ -10513,7 +6274,7 @@ pub const AppState = struct {
             },
             .left, .right, .home, .end => {
                 _ = self.layoutRunConfigPopover();
-                const stepper = &self.run_steppers[@intFromEnum(kinds[self.run_config_focused_row])];
+                const stepper = &self.composer_controller.run_steppers[@intFromEnum(kinds[self.composer_controller.run_config_focused_row])];
                 const handled = stepper.handleInput(.{ .key = key });
                 if (handled) self.noteInteraction();
                 return true;
@@ -10531,13 +6292,13 @@ pub const AppState = struct {
         }
         switch (key.code) {
             .up => {
-                self.composer_slash_selected = if (self.composer_slash_selected == 0) count - 1 else self.composer_slash_selected - 1;
+                self.composer_controller.slash_selected = if (self.composer_controller.slash_selected == 0) count - 1 else self.composer_controller.slash_selected - 1;
                 self.noteInteraction();
                 self.markDirty();
                 return true;
             },
             .down => {
-                self.composer_slash_selected = (self.composer_slash_selected + 1) % count;
+                self.composer_controller.slash_selected = (self.composer_controller.slash_selected + 1) % count;
                 self.noteInteraction();
                 self.markDirty();
                 return true;
@@ -10549,10 +6310,10 @@ pub const AppState = struct {
     }
 
     fn routePaletteModelPickerMouseButton(self: *AppState, point: palette.draw.Vec2, down: bool, clicks: u8) bool {
-        if (!self.palette_model_picker.isOpen()) return false;
+        if (!self.composer_controller.model_picker.isOpen()) return false;
         // Clicking the run pill swaps popovers in one click: dismiss the
         // picker and let the toolbar overlay handler open the run config.
-        if (down and self.composer_toolbar_overlay_valid and self.composer_toolbar_reasoning_rect.contains(point)) {
+        if (down and self.composer_controller.toolbar_overlay_valid and self.composer_controller.toolbar_reasoning_rect.contains(point)) {
             self.closePaletteModelPicker();
             return false;
         }
@@ -10564,7 +6325,7 @@ pub const AppState = struct {
     }
 
     fn routePaletteModelPickerMouseMove(self: *AppState, point: palette.draw.Vec2, dragging: bool) bool {
-        if (!self.palette_model_picker.isOpen()) return false;
+        if (!self.composer_controller.model_picker.isOpen()) return false;
         return self.modelPickerInput(if (dragging)
             .{ .mouse_drag = point }
         else
@@ -10572,19 +6333,19 @@ pub const AppState = struct {
     }
 
     fn routePaletteModelPickerWheel(self: *AppState, point: palette.draw.Vec2, y: f32) bool {
-        if (!self.palette_model_picker.isOpen()) return false;
+        if (!self.composer_controller.model_picker.isOpen()) return false;
         return self.modelPickerInput(.{ .mouse_wheel = .{ .point = point, .y = y } });
     }
 
     fn routeRunConfigMouseButton(self: *AppState, point: palette.draw.Vec2, down: bool) bool {
-        if (!self.run_config_open) return false;
+        if (!self.composer_controller.run_config_open) return false;
         if (!down) return false;
         const layout = self.layoutRunConfigPopover();
         var index: usize = 0;
         while (index < layout.row_count) : (index += 1) {
-            const stepper = &self.run_steppers[@intFromEnum(layout.row_kinds[index])];
+            const stepper = &self.composer_controller.run_steppers[@intFromEnum(layout.row_kinds[index])];
             if (stepper.handleInput(.{ .mouse_down = point })) {
-                self.run_config_focused_row = index;
+                self.composer_controller.run_config_focused_row = index;
                 self.noteInteraction();
                 return true;
             }
@@ -10596,42 +6357,42 @@ pub const AppState = struct {
         // so the toolbar overlay handler opens the model picker. Any other
         // outside click is swallowed so the press does not also activate
         // whatever sits underneath the popover.
-        if (self.composer_toolbar_overlay_valid and self.composer_toolbar_model_rect.contains(point)) return false;
+        if (self.composer_controller.toolbar_overlay_valid and self.composer_controller.toolbar_model_rect.contains(point)) return false;
         return true;
     }
 
     fn routeRunConfigMouseMove(self: *AppState, point: palette.draw.Vec2) bool {
-        if (!self.run_config_open) return false;
+        if (!self.composer_controller.run_config_open) return false;
         const layout = self.layoutRunConfigPopover();
         var hovered = false;
         var index: usize = 0;
         while (index < layout.row_count) : (index += 1) {
-            const stepper = &self.run_steppers[@intFromEnum(layout.row_kinds[index])];
+            const stepper = &self.composer_controller.run_steppers[@intFromEnum(layout.row_kinds[index])];
             if (stepper.handleInput(.{ .mouse_move = point })) hovered = true;
         }
         return hovered or layout.panel.contains(point);
     }
 
     fn routeRunConfigWheel(self: *AppState, point: palette.draw.Vec2) bool {
-        if (!self.run_config_open) return false;
+        if (!self.composer_controller.run_config_open) return false;
         const layout = self.layoutRunConfigPopover();
         return layout.panel.contains(point);
     }
 
     fn handlePaletteComposerNavigationKey(self: *AppState, key: palette.Key) bool {
         if (key.primary and key.code == .a) {
-            self.palette_composer.selection_anchor = 0;
-            self.palette_composer.selection_focus = self.palette_composer.text().len;
-            self.palette_composer.cursor = self.palette_composer.text().len;
+            self.composer_controller.composer.selection_anchor = 0;
+            self.composer_controller.composer.selection_focus = self.composer_controller.composer.text().len;
+            self.composer_controller.composer.cursor = self.composer_controller.composer.text().len;
             self.ensurePaletteComposerCursorVisible();
             return true;
         }
 
         if (key.code != .up and key.code != .down) return false;
-        const text = self.palette_composer.text();
+        const text = self.composer_controller.composer.text();
         const metrics = paletteComposerTextFontMetrics(theme.scaledUi(PALETTE_COMPOSER_FONT_SIZE));
-        const text_rect = self.palette_composer.textRect();
-        const cell = palette.TextLayout.visualCellForOffset(text, self.palette_composer.cursor, metrics, text_rect.w, true);
+        const text_rect = self.composer_controller.composer.textRect();
+        const cell = palette.TextLayout.visualCellForOffset(text, self.composer_controller.composer.cursor, metrics, text_rect.w, true);
         const target_row = switch (key.code) {
             .up => if (cell.row == 0) 0 else cell.row - 1,
             .down => cell.row + 1,
@@ -10643,24 +6404,24 @@ pub const AppState = struct {
     }
 
     fn routePaletteComposerMultiClick(self: *AppState, point: palette.draw.Vec2, clicks: u8) bool {
-        _ = self.palette_composer.handleInput(self.allocator, .{ .mouse_down = point }) catch |err| {
+        _ = self.composer_controller.composer.handleInput(self.allocator, .{ .mouse_down = point }) catch |err| {
             log.warn("palette composer mouse input failed: {s}", .{@errorName(err)});
             return false;
         };
-        const text = self.palette_composer.text();
-        const offset = self.palette_composer.cursor;
+        const text = self.composer_controller.composer.text();
+        const offset = self.composer_controller.composer.cursor;
         const range = if (clicks >= 3) blk: {
             const start = palette.input_selection.lineStart(text, offset);
             var end = palette.input_selection.lineEnd(text, offset);
             if (end < text.len) end += 1;
             break :blk palette.input_selection.Range{ .start = start, .end = end };
         } else palette.input_selection.wordRangeAt(text, offset);
-        self.palette_composer.selection_anchor = range.start;
-        self.palette_composer.selection_focus = range.end;
-        self.palette_composer.cursor = range.end;
-        self.palette_composer.dragging_selection = false;
-        self.composer_focused = true;
-        self.terminal_focused = false;
+        self.composer_controller.composer.selection_anchor = range.start;
+        self.composer_controller.composer.selection_focus = range.end;
+        self.composer_controller.composer.cursor = range.end;
+        self.composer_controller.composer.dragging_selection = false;
+        self.composer_controller.focused = true;
+        self.terminal_controller.focused = false;
         self.unfocusBrowserPane();
         self.ensurePaletteComposerCursorVisible();
         self.noteInteraction();
@@ -10668,33 +6429,33 @@ pub const AppState = struct {
     }
 
     fn movePaletteComposerCursor(self: *AppState, next: usize, extend_selection: bool) void {
-        const old = self.palette_composer.cursor;
-        self.palette_composer.cursor = @min(next, self.palette_composer.text().len);
+        const old = self.composer_controller.composer.cursor;
+        self.composer_controller.composer.cursor = @min(next, self.composer_controller.composer.text().len);
         if (extend_selection) {
-            if (self.palette_composer.selection_anchor == null) self.palette_composer.selection_anchor = old;
-            self.palette_composer.selection_focus = self.palette_composer.cursor;
+            if (self.composer_controller.composer.selection_anchor == null) self.composer_controller.composer.selection_anchor = old;
+            self.composer_controller.composer.selection_focus = self.composer_controller.composer.cursor;
         } else {
-            self.palette_composer.selection_anchor = null;
-            self.palette_composer.selection_focus = null;
+            self.composer_controller.composer.selection_anchor = null;
+            self.composer_controller.composer.selection_focus = null;
         }
         self.ensurePaletteComposerCursorVisible();
     }
 
     pub fn ensurePaletteComposerCursorVisible(self: *AppState) void {
-        const text_rect = self.palette_composer.textRect();
-        const cursor = self.palette_composer.cursorRect();
+        const text_rect = self.composer_controller.composer.textRect();
+        const cursor = self.composer_controller.composer.cursorRect();
         const bottom = text_rect.y + text_rect.h;
         if (cursor.y < text_rect.y) {
-            self.palette_composer.setScrollY(self.palette_composer.scrollY() - (text_rect.y - cursor.y));
+            self.composer_controller.composer.setScrollY(self.composer_controller.composer.scrollY() - (text_rect.y - cursor.y));
         } else if (cursor.y + cursor.h > bottom) {
-            self.palette_composer.setScrollY(self.palette_composer.scrollY() + cursor.y + cursor.h - bottom);
+            self.composer_controller.composer.setScrollY(self.composer_controller.composer.scrollY() + cursor.y + cursor.h - bottom);
         }
     }
 
     pub fn setComposerInputBounds(self: *AppState, input_min: [2]f32, input_max: [2]f32) void {
-        self.composer_input_bounds_valid = true;
-        self.composer_input_min = input_min;
-        self.composer_input_max = input_max;
+        self.composer_controller.input_bounds_valid = true;
+        self.composer_controller.input_min = input_min;
+        self.composer_controller.input_max = input_max;
     }
 
     pub fn setComposerDraftImageClearRect(self: *AppState, rect: ?palette.Rect) void {
@@ -10703,20 +6464,20 @@ pub const AppState = struct {
 
     pub fn setComposerDraftImageClearRectAt(self: *AppState, rect: ?palette.Rect, index: usize) void {
         if (rect) |value| {
-            self.composer_draft_image_clear_valid = true;
-            self.composer_draft_image_clear_rect = value;
-            self.composer_draft_image_clear_index = index;
-            if (self.composer_draft_image_clear_count < self.composer_draft_image_clear_rects.len) {
-                const slot = self.composer_draft_image_clear_count;
-                self.composer_draft_image_clear_rects[slot] = value;
-                self.composer_draft_image_clear_indices[slot] = index;
-                self.composer_draft_image_clear_count += 1;
+            self.composer_controller.draft_image_clear_valid = true;
+            self.composer_controller.draft_image_clear_rect = value;
+            self.composer_controller.draft_image_clear_index = index;
+            if (self.composer_controller.draft_image_clear_count < self.composer_controller.draft_image_clear_rects.len) {
+                const slot = self.composer_controller.draft_image_clear_count;
+                self.composer_controller.draft_image_clear_rects[slot] = value;
+                self.composer_controller.draft_image_clear_indices[slot] = index;
+                self.composer_controller.draft_image_clear_count += 1;
             }
         } else {
-            self.composer_draft_image_clear_valid = false;
-            self.composer_draft_image_clear_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
-            self.composer_draft_image_clear_index = 0;
-            self.composer_draft_image_clear_count = 0;
+            self.composer_controller.draft_image_clear_valid = false;
+            self.composer_controller.draft_image_clear_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
+            self.composer_controller.draft_image_clear_index = 0;
+            self.composer_controller.draft_image_clear_count = 0;
         }
     }
 
@@ -10724,11 +6485,11 @@ pub const AppState = struct {
     /// Called from the chat workspace render so mouse routing can target the pin.
     pub fn setFollowupPinRect(self: *AppState, rect: ?palette.Rect) void {
         if (rect) |value| {
-            self.followup_pin_valid = true;
-            self.followup_pin_rect = value;
+            self.composer_controller.followup_pin_valid = true;
+            self.composer_controller.followup_pin_rect = value;
         } else {
-            self.followup_pin_valid = false;
-            self.followup_pin_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
+            self.composer_controller.followup_pin_valid = false;
+            self.composer_controller.followup_pin_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
         }
     }
 
@@ -10736,8 +6497,8 @@ pub const AppState = struct {
     /// pulls the queued prompt back into the composer for editing; a single click
     /// is swallowed so it does not fall through to the composer/transcript.
     pub fn handleFollowupPinMouseButton(self: *AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
-        if (!self.followup_pin_valid) return false;
-        const rect = self.followup_pin_rect;
+        if (!self.composer_controller.followup_pin_valid) return false;
+        const rect = self.composer_controller.followup_pin_rect;
         if (x < rect.x or y < rect.y or x > rect.x + rect.w or y > rect.y + rect.h) return false;
         if (down and clicks >= 2) self.editPendingFollowup();
         return true;
@@ -10748,7 +6509,7 @@ pub const AppState = struct {
     /// user re-queues with Tab or sends normally. Refuses to clobber an in-progress
     /// draft, and ignores Codex steering already accepted inline (`.sent_inline`).
     pub fn editPendingFollowup(self: *AppState) void {
-        if (self.projects.items.len == 0) return;
+        if (self.project_controller.projects.items.len == 0) return;
         const thread = self.currentThreadMutable();
         const send_state = thread.send_state;
 
@@ -10781,8 +6542,8 @@ pub const AppState = struct {
 
         self.setDraft(prompt_copy);
         self.resetComposerInputWidget();
-        self.palette_composer.focused = true;
-        self.composer_focused = true;
+        self.composer_controller.composer.focused = true;
+        self.composer_controller.focused = true;
         self.setFollowupPinRect(null);
         self.markDirty();
         self.setSidebarNotice(if (thread.provider == .codex)
@@ -10792,15 +6553,15 @@ pub const AppState = struct {
     }
 
     pub fn handleComposerDraftImageClearMouseButton(self: *AppState, x: f32, y: f32, down: bool) bool {
-        if (self.projects.items.len == 0) return false;
-        if (!self.composer_draft_image_clear_valid) return false;
-        var i: usize = self.composer_draft_image_clear_count;
+        if (self.project_controller.projects.items.len == 0) return false;
+        if (!self.composer_controller.draft_image_clear_valid) return false;
+        var i: usize = self.composer_controller.draft_image_clear_count;
         while (i > 0) {
             i -= 1;
-            const rect = self.composer_draft_image_clear_rects[i];
+            const rect = self.composer_controller.draft_image_clear_rects[i];
             if (x < rect.x or y < rect.y or x > rect.x + rect.w or y > rect.y + rect.h) continue;
             if (!down) {
-                self.clearCurrentDraftImageAt(self.composer_draft_image_clear_indices[i]);
+                self.clearCurrentDraftImageAt(self.composer_controller.draft_image_clear_indices[i]);
             }
             return true;
         }
@@ -10823,374 +6584,6 @@ pub const AppState = struct {
         }
         thread.fast_mode = .off;
         self.markDirty();
-    }
-
-    pub fn navigateBrowserHistory(self: *AppState, delta: i32) void {
-        if (self.navigatePersistedBrowserHistory(delta)) return;
-        const result = if (delta < 0)
-            self.browser_state.controller.goBack()
-        else
-            self.browser_state.controller.goForward();
-        result catch |err| {
-            log.warn("failed to navigate browser history: {s}", .{@errorName(err)});
-            self.browser_state.setLastError("Failed to navigate browser history.") catch {};
-            return;
-        };
-        self.markDirty();
-    }
-
-    pub fn browserTabCount(self: *AppState) usize {
-        const ref = self.visibleBrowserPaneRefMutable() orelse return 0;
-        return ref.tabs.items.len;
-    }
-
-    pub fn activeBrowserTabIndex(self: *AppState) usize {
-        const ref = self.visibleBrowserPaneRefMutable() orelse return 0;
-        return @min(ref.active_tab_index, ref.tabs.items.len -| 1);
-    }
-
-    pub fn browserTabTitle(self: *AppState, index: usize) []const u8 {
-        const ref = self.visibleBrowserPaneRefMutable() orelse return "New tab";
-        if (index >= ref.tabs.items.len) return "New tab";
-        const tab = &ref.tabs.items[index];
-        return tab.title orelse tab.url orelse "New tab";
-    }
-
-    pub fn browserTabPinned(self: *AppState, index: usize) bool {
-        const ref = self.visibleBrowserPaneRefMutable() orelse return false;
-        if (index >= ref.tabs.items.len) return false;
-        return ref.tabs.items[index].pinned;
-    }
-
-    pub fn browserTabIndicator(self: *AppState, index: usize) BrowserTabIndicator {
-        const ref = self.visibleBrowserPaneRefMutable() orelse return .none;
-        if (index >= ref.tabs.items.len) return .none;
-        const tab = &ref.tabs.items[index];
-        if (tab.load_failed) return .failed;
-        if (tab.loading) return .loading;
-        return .none;
-    }
-
-    pub fn browserCanGoBack(self: *AppState) bool {
-        const ref = self.visibleBrowserPaneRefMutable() orelse return false;
-        const tab = ref.activeTab() orelse return false;
-        return (tab.history_index orelse 0) > 0;
-    }
-
-    pub fn browserCanGoForward(self: *AppState) bool {
-        const ref = self.visibleBrowserPaneRefMutable() orelse return false;
-        const tab = ref.activeTab() orelse return false;
-        const index = tab.history_index orelse return false;
-        return index + 1 < tab.history.items.len;
-    }
-
-    pub fn createBrowserTab(self: *AppState) void {
-        const ref = self.visibleBrowserPaneRefMutable() orelse return;
-        ref.tabs.append(self.allocator, .{}) catch |err| {
-            log.warn("failed to create browser tab: {s}", .{@errorName(err)});
-            return;
-        };
-        ref.active_tab_index = ref.tabs.items.len - 1;
-        self.activateBrowserTabRuntime(null, null);
-        self.browser_address_focused = true;
-        self.markDirty();
-    }
-
-    pub fn duplicateBrowserTab(self: *AppState, index: usize) void {
-        const ref = self.visibleBrowserPaneRefMutable() orelse return;
-        if (index >= ref.tabs.items.len) return;
-        const duplicate = ref.tabs.items[index].clone(self.allocator) catch |err| {
-            log.warn("failed to duplicate browser tab: {s}", .{@errorName(err)});
-            return;
-        };
-        ref.tabs.insert(self.allocator, index + 1, duplicate) catch |err| {
-            var owned = duplicate;
-            owned.deinit(self.allocator);
-            log.warn("failed to insert duplicated browser tab: {s}", .{@errorName(err)});
-            return;
-        };
-        ref.active_tab_index = index + 1;
-        const active = &ref.tabs.items[ref.active_tab_index];
-        self.activateBrowserTabRuntime(active.url, active.title);
-        self.markDirty();
-    }
-
-    pub fn toggleBrowserTabPinned(self: *AppState, index: usize) void {
-        const ref = self.visibleBrowserPaneRefMutable() orelse return;
-        if (index >= ref.tabs.items.len) return;
-        const was_pinned = ref.tabs.items[index].pinned;
-        var pinned_count: usize = 0;
-        for (ref.tabs.items) |tab| {
-            if (tab.pinned) pinned_count += 1;
-        }
-        ref.tabs.items[index].pinned = !was_pinned;
-        const target = if (was_pinned) pinned_count -| 1 else pinned_count;
-        ref.moveTab(self.allocator, index, @min(target, ref.tabs.items.len - 1)) catch |err| {
-            ref.tabs.items[index].pinned = was_pinned;
-            log.warn("failed to reposition pinned browser tab: {s}", .{@errorName(err)});
-            return;
-        };
-        self.markDirty();
-    }
-
-    pub fn moveBrowserTab(self: *AppState, from: usize, to: usize) void {
-        const ref = self.visibleBrowserPaneRefMutable() orelse return;
-        ref.moveTab(self.allocator, from, to) catch |err| {
-            log.warn("failed to reorder browser tab: {s}", .{@errorName(err)});
-            return;
-        };
-        self.markDirty();
-    }
-
-    pub fn switchBrowserTab(self: *AppState, index: usize) void {
-        const ref = self.visibleBrowserPaneRefMutable() orelse return;
-        if (index >= ref.tabs.items.len or index == ref.active_tab_index) return;
-        ref.active_tab_index = index;
-        const tab = &ref.tabs.items[index];
-        self.activateBrowserTabRuntime(tab.url, tab.title);
-        self.markDirty();
-    }
-
-    pub fn closeBrowserTab(self: *AppState, index: usize) void {
-        const ref = self.visibleBrowserPaneRefMutable() orelse return;
-        if (index >= ref.tabs.items.len) return;
-        if (ref.tabs.items.len == 1) {
-            ref.tabs.items[0].deinit(self.allocator);
-            ref.tabs.items[0] = .{};
-            ref.active_tab_index = 0;
-        } else {
-            var removed = ref.tabs.orderedRemove(index);
-            removed.deinit(self.allocator);
-            if (ref.active_tab_index >= ref.tabs.items.len) ref.active_tab_index = ref.tabs.items.len - 1 else if (index < ref.active_tab_index) ref.active_tab_index -= 1;
-        }
-        const active = ref.activeTab().?;
-        self.activateBrowserTabRuntime(active.url, active.title);
-        self.markDirty();
-    }
-
-    fn activateBrowserTabRuntime(self: *AppState, url: ?[]const u8, title: ?[]const u8) void {
-        self.restartBrowserRuntimeForCrossOriginNavigation(url orelse "about:blank");
-        self.browser_state.setCurrentUrl(url) catch {};
-        self.browser_state.setCurrentTitle(title) catch {};
-        self.browser_state.setAddress(url orelse "");
-        self.browser_address_cursor = self.browser_state.addressInput().len;
-        self.browser_address_selection_anchor = null;
-        self.browser_state.status = .opening;
-        if (self.visibleBrowserPaneRefMutable()) |ref| {
-            if (ref.activeTab()) |tab| {
-                tab.loading = true;
-                tab.load_failed = false;
-            }
-        }
-        self.browser_state.controller.navigate(url orelse "about:blank") catch |err| {
-            log.warn("failed to activate browser tab: {s}", .{@errorName(err)});
-            self.browser_state.status = .failed;
-            self.browser_state.setLastError("Failed to activate browser tab.") catch {};
-            if (self.visibleBrowserPaneRefMutable()) |ref| {
-                if (ref.activeTab()) |tab| {
-                    tab.loading = false;
-                    tab.load_failed = true;
-                }
-            }
-        };
-    }
-
-    pub fn reloadBrowser(self: *AppState) void {
-        self.setActiveBrowserTabLoadState(true, false);
-        self.browser_state.controller.reload() catch |err| {
-            log.warn("failed to reload browser: {s}", .{@errorName(err)});
-            self.setActiveBrowserTabLoadState(false, true);
-            self.browser_state.setLastError("Failed to reload browser.") catch {};
-            return;
-        };
-        self.setSidebarNotice("Browser reload requested.");
-        self.markDirty();
-    }
-
-    pub fn openCurrentBrowserUrlExternally(self: *AppState) void {
-        const url = self.browser_state.current_url orelse {
-            self.setSidebarNotice("No browser URL to open.");
-            return;
-        };
-        utils.openUrlInDefaultBrowser(self.allocator, url) catch |err| {
-            log.warn("failed to open current browser URL externally: {s}", .{@errorName(err)});
-            self.setSidebarNotice("Failed to open URL in the default browser.");
-            return;
-        };
-        self.setSidebarNotice("Opened URL in the default browser.");
-    }
-
-    pub fn selectAllBrowserFocusedElement(self: *AppState) void {
-        const script =
-            \\(function(){
-            \\  let el=window.__verdeInputTarget;
-            \\  if(el&&!el.isConnected)el=null;
-            \\  const resolve=(node)=>{
-            \\    if(!node)return null;
-            \\    if(node.isContentEditable||node instanceof HTMLInputElement||node instanceof HTMLTextAreaElement)return node;
-            \\    return (node.closest&&node.closest('input,textarea,[contenteditable="true"]'))||null;
-            \\  };
-            \\  el=resolve(el)||resolve(document.activeElement);
-            \\  if(!el)return false;
-            \\  window.__verdeInputTarget=el;
-            \\  if(el.focus)el.focus({preventScroll:true});
-            \\  if(el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement){
-            \\    if(el.setSelectionRange)el.setSelectionRange(0,el.value.length);
-            \\    return true;
-            \\  }
-            \\  if(el.isContentEditable){
-            \\    const range=document.createRange();
-            \\    range.selectNodeContents(el);
-            \\    const selection=window.getSelection();
-            \\    if(!selection)return false;
-            \\    selection.removeAllRanges();
-            \\    selection.addRange(range);
-            \\    return true;
-            \\  }
-            \\  return false;
-            \\})()
-        ;
-        self.browser_state.expectSuppressedEvalResult();
-        self.browser_state.controller.eval(script) catch |err| {
-            log.warn("failed to select browser focused element text: {s}", .{@errorName(err)});
-            return;
-        };
-        self.markDirty();
-    }
-
-    pub fn pasteBrowserTextIntoFocusedElement(self: *AppState, text: []const u8) void {
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        var stringify: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
-        stringify.write(text) catch |err| {
-            log.warn("failed to encode browser paste text: {s}", .{@errorName(err)});
-            return;
-        };
-        const encoded = out.written();
-        const script = std.fmt.allocPrint(self.allocator,
-            \\(function(){{
-            \\  const text={s};
-            \\  let el=window.__verdeInputTarget;
-            \\  if(el&&!el.isConnected)el=null;
-            \\  const resolve=(node)=>{{
-            \\    if(!node)return null;
-            \\    if(node.isContentEditable||node instanceof HTMLInputElement||node instanceof HTMLTextAreaElement)return node;
-            \\    return (node.closest&&node.closest('input,textarea,[contenteditable="true"]'))||null;
-            \\  }};
-            \\  el=resolve(el)||resolve(document.activeElement);
-            \\  if(!el)return false;
-            \\  window.__verdeInputTarget=el;
-            \\  if(el.focus)el.focus({{preventScroll:true}});
-            \\  if(el.isContentEditable){{
-            \\    document.execCommand('insertText',false,text);
-            \\    return true;
-            \\  }}
-            \\  if(el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement){{
-            \\    const start=el.selectionStart??el.value.length;
-            \\    const end=el.selectionEnd??el.value.length;
-            \\    el.value=el.value.slice(0,start)+text+el.value.slice(end);
-            \\    const next=start+text.length;
-            \\    if(el.setSelectionRange)el.setSelectionRange(next,next);
-            \\    el.dispatchEvent(new InputEvent('input',{{bubbles:true,data:text,inputType:'insertFromPaste'}}));
-            \\    return true;
-            \\  }}
-            \\  return false;
-            \\}})()
-        , .{encoded}) catch |err| {
-            log.warn("failed to build browser paste script: {s}", .{@errorName(err)});
-            return;
-        };
-        defer self.allocator.free(script);
-        self.browser_state.expectSuppressedEvalResult();
-        self.browser_state.controller.eval(script) catch |err| {
-            log.warn("failed to paste browser text: {s}", .{@errorName(err)});
-            return;
-        };
-        self.markDirty();
-    }
-
-    pub fn copyBrowserFocusedSelection(self: *AppState, cut: bool) void {
-        const script = if (cut)
-            \\(function(){
-            \\  const post=(text)=>{
-            \\    const payload=JSON.stringify({source:'verde-browser-clipboard',text:String(text||''),cut:true});
-            \\    if(window.__VERDE_BROWSER_IPC__&&typeof window.__VERDE_BROWSER_IPC__.postMessage==='function'){window.__VERDE_BROWSER_IPC__.postMessage(payload);return;}
-            \\    if(window.verde&&typeof window.verde.postMessage==='function'){window.verde.postMessage(payload);return;}
-            \\    if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.verde){window.webkit.messageHandlers.verde.postMessage(payload);}
-            \\  };
-            \\  let el=window.__verdeInputTarget;
-            \\  if(el&&!el.isConnected)el=null;
-            \\  const resolve=(node)=>{
-            \\    if(!node)return null;
-            \\    if(node.isContentEditable||node instanceof HTMLInputElement||node instanceof HTMLTextAreaElement)return node;
-            \\    return (node.closest&&node.closest('input,textarea,[contenteditable="true"]'))||null;
-            \\  };
-            \\  el=resolve(el)||resolve(document.activeElement);
-            \\  let text='';
-            \\  if(el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement){
-            \\    const start=el.selectionStart??0;
-            \\    const end=el.selectionEnd??0;
-            \\    text=el.value.slice(start,end);
-            \\    if(text.length>0){
-            \\      el.value=el.value.slice(0,start)+el.value.slice(end);
-            \\      if(el.setSelectionRange)el.setSelectionRange(start,start);
-            \\      el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteByCut'}));
-            \\    }
-            \\  }else{
-            \\    text=String(window.getSelection?.()||'');
-            \\    if(text.length>0&&el&&el.isContentEditable){document.execCommand('delete',false);}
-            \\  }
-            \\  window.__verdeClipboardSelection=text;
-            \\  post(text);
-            \\  return text.length>0;
-            \\})()
-        else
-            \\(function(){
-            \\  const post=(text)=>{
-            \\    const payload=JSON.stringify({source:'verde-browser-clipboard',text:String(text||''),cut:false});
-            \\    if(window.__VERDE_BROWSER_IPC__&&typeof window.__VERDE_BROWSER_IPC__.postMessage==='function'){window.__VERDE_BROWSER_IPC__.postMessage(payload);return;}
-            \\    if(window.verde&&typeof window.verde.postMessage==='function'){window.verde.postMessage(payload);return;}
-            \\    if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.verde){window.webkit.messageHandlers.verde.postMessage(payload);}
-            \\  };
-            \\  let el=window.__verdeInputTarget;
-            \\  if(el&&!el.isConnected)el=null;
-            \\  const resolve=(node)=>{
-            \\    if(!node)return null;
-            \\    if(node.isContentEditable||node instanceof HTMLInputElement||node instanceof HTMLTextAreaElement)return node;
-            \\    return (node.closest&&node.closest('input,textarea,[contenteditable="true"]'))||null;
-            \\  };
-            \\  el=resolve(el)||resolve(document.activeElement);
-            \\  let text='';
-            \\  if(el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement){
-            \\    text=el.value.slice(el.selectionStart??0,el.selectionEnd??0);
-            \\  }else{
-            \\    text=String(window.getSelection?.()||'');
-            \\  }
-            \\  window.__verdeClipboardSelection=text;
-            \\  post(text);
-            \\  return text.length>0;
-            \\})()
-        ;
-        self.browser_state.expectSuppressedEvalResult();
-        self.browser_state.controller.eval(script) catch |err| {
-            log.warn("failed to capture browser focused selection: {s}", .{@errorName(err)});
-            return;
-        };
-        self.markDirty();
-    }
-
-    pub fn copyBrowserEvalResultToClipboard(self: *AppState, result: []const u8) void {
-        if (result.len == 0) return;
-        const z = self.allocator.dupeZ(u8, result) catch |err| {
-            log.warn("failed to copy browser selection: {s}", .{@errorName(err)});
-            return;
-        };
-        defer self.allocator.free(z);
-        sdl.setClipboardText(z) catch |err| {
-            log.warn("failed to set browser selection clipboard text: {s}", .{@errorName(err)});
-            return;
-        };
-        self.setSidebarNotice("Browser selection copied.");
     }
 
     fn setCurrentThreadModelRef(self: *AppState, value: ?[:0]const u8) void {
@@ -11270,47 +6663,16 @@ pub const AppState = struct {
         return if (rows.len > 0) 0 else null;
     }
 
-    fn composerFastModeIndex(value: FastMode) ?usize {
-        for (CODEX_FAST_MODE_OPTIONS, 0..) |option, index| {
-            if (option.value == value) return index;
-        }
-        return null;
-    }
-
-    fn composerAccessModeIndex(value: AccessMode) ?usize {
-        for (CODEX_ACCESS_MODE_OPTIONS, 0..) |option, index| {
-            if (option.value == value) return index;
-        }
-        return null;
-    }
-
     pub fn handleComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent) bool {
-        if (self.projects.items.len == 0) return false;
-        if (!self.composer_input_bounds_valid) return false;
-        if (event.mouse_x < self.composer_input_min[0] or event.mouse_x > self.composer_input_max[0]) return false;
-        if (event.mouse_y < self.composer_input_min[1] or event.mouse_y > self.composer_input_max[1]) return false;
+        if (self.project_controller.projects.items.len == 0) return false;
+        if (!self.composer_controller.input_bounds_valid) return false;
+        if (event.mouse_x < self.composer_controller.input_min[0] or event.mouse_x > self.composer_controller.input_max[0]) return false;
+        if (event.mouse_y < self.composer_controller.input_min[1] or event.mouse_y > self.composer_controller.input_max[1]) return false;
 
-        self.composer_overlay_scroll_y = @max(0.0, self.composer_overlay_scroll_y - event.y * 48.0);
-        self.composer_overlay_follow_cursor = false;
+        self.composer_controller.overlay_scroll_y = @max(0.0, self.composer_controller.overlay_scroll_y - event.y * 48.0);
+        self.composer_controller.overlay_follow_cursor = false;
         self.noteInteraction();
         return true;
-    }
-
-    pub fn composerOverlayScrollY(self: *const AppState) f32 {
-        return self.composer_overlay_scroll_y;
-    }
-
-    pub fn setComposerOverlayScrollY(self: *AppState, value: f32) void {
-        self.composer_overlay_scroll_y = @max(value, 0.0);
-    }
-
-    pub fn shouldComposerOverlayFollowCursor(self: *AppState, cursor_pos: usize, draft_len: usize) bool {
-        if (cursor_pos != self.composer_overlay_last_cursor_pos or draft_len != self.composer_overlay_last_draft_len) {
-            self.composer_overlay_follow_cursor = true;
-        }
-        self.composer_overlay_last_cursor_pos = cursor_pos;
-        self.composer_overlay_last_draft_len = draft_len;
-        return self.composer_overlay_follow_cursor;
     }
 
     pub fn setDraft(self: *AppState, value: []const u8) void {
@@ -11324,179 +6686,35 @@ pub const AppState = struct {
     }
 
     pub fn resetComposerInputWidget(self: *AppState) void {
-        self.composer_input_nonce +%= 1;
-        self.composer_overlay_scroll_y = 0.0;
-        self.composer_overlay_follow_cursor = true;
-        self.composer_overlay_last_cursor_pos = 0;
-        self.composer_overlay_last_draft_len = 0;
-        const callbacks = self.palette_composer.callbacks;
-        self.palette_composer.setCallbacks(.{});
-        defer self.palette_composer.setCallbacks(callbacks);
-        self.palette_composer.setText(self.allocator, self.currentDraft()) catch |err| {
+        self.composer_controller.input_nonce +%= 1;
+        self.composer_controller.overlay_scroll_y = 0.0;
+        self.composer_controller.overlay_follow_cursor = true;
+        self.composer_controller.overlay_last_cursor_pos = 0;
+        self.composer_controller.overlay_last_draft_len = 0;
+        const callbacks = self.composer_controller.composer.callbacks;
+        self.composer_controller.composer.setCallbacks(.{});
+        defer self.composer_controller.composer.setCallbacks(callbacks);
+        self.composer_controller.composer.setText(self.allocator, self.currentDraft()) catch |err| {
             log.warn("failed to reset palette composer draft: {s}", .{@errorName(err)});
         };
     }
 
-    pub fn updateFileSearch(self: *AppState) void {
-        if (self.projects.items.len == 0) {
-            self.clearFileSearch();
-            return;
-        }
+    pub const updateFileSearch = file_search_controller.updateFileSearch;
+    pub const hasActiveFileSearch = file_search_controller.hasActiveFileSearch;
+    pub const fileSearchResults = file_search_controller.fileSearchResults;
+    pub const fileSearchIsScanning = file_search_controller.fileSearchIsScanning;
+    pub const fileSearchSelectedIndex = file_search_controller.fileSearchSelectedIndex;
+    pub const moveFileSearchSelection = file_search_controller.moveFileSearchSelection;
+    pub const acceptPrimaryFileSearchResult = file_search_controller.acceptPrimaryFileSearchResult;
+    pub const selectFileSearchResult = file_search_controller.selectFileSearchResult;
+    pub const ensureFileSearchFinder = file_search_controller.ensureFileSearchFinder;
+    pub const clearFileSearch = file_search_controller.clearFileSearch;
 
-        const draft = self.currentDraft();
-        const token = trailingFileSearchToken(draft) orelse {
-            self.clearFileSearch();
-            return;
-        };
-
-        const project_path = self.currentProject().path;
-        self.ensureFileSearchFinder(project_path) catch {
-            self.clearFileSearch();
-            self.setSidebarNotice("Failed to initialize file search.");
-            return;
-        };
-
-        self.file_search_state.visible = true;
-        self.file_search_state.token = token;
-
-        const query = draft[token.query_start..token.end];
-        const query_changed = self.file_search_state.last_query == null or
-            !std.mem.eql(u8, self.file_search_state.last_query.?, query);
-        if (!query_changed) return;
-
-        self.file_search_state.clearQuery(self.allocator);
-        self.file_search_state.last_query = self.allocator.dupe(u8, query) catch {
-            self.clearFileSearch();
-            return;
-        };
-
-        var search_results = self.file_search_state.finder.?.search(self.allocator, query, 8) catch {
-            self.file_search_state.clearResults(self.allocator);
-            self.setSidebarNotice("File search failed.");
-            return;
-        };
-        defer search_results.deinit(self.allocator);
-
-        self.file_search_state.setResults(self.allocator, &search_results) catch {
-            self.file_search_state.clearResults(self.allocator);
-            self.setSidebarNotice("Failed to update file search results.");
-        };
-    }
-
-    pub fn hasActiveFileSearch(self: *const AppState) bool {
-        return self.file_search_state.visible;
-    }
-
-    pub fn fileSearchResults(self: *const AppState) []const FileSearchResult {
-        return self.file_search_state.results.items;
-    }
-
-    pub fn fileSearchIsScanning(self: *const AppState) bool {
-        if (self.file_search_state.finder) |*finder| {
-            return finder.isScanning();
-        }
-        return false;
-    }
-
-    pub fn fileSearchSelectedIndex(self: *const AppState) usize {
-        if (self.file_search_state.results.items.len == 0) return 0;
-        return @min(self.file_search_state.selected_index, self.file_search_state.results.items.len - 1);
-    }
-
-    pub fn moveFileSearchSelection(self: *AppState, delta: i32) bool {
-        if (!self.file_search_state.visible) return false;
-        const count = self.file_search_state.results.items.len;
-        if (count == 0) return false;
-
-        const current: i32 = @intCast(self.fileSearchSelectedIndex());
-        const max_index: i32 = @intCast(count - 1);
-        const next = std.math.clamp(current + delta, 0, max_index);
-        if (next == current) return true;
-        self.file_search_state.selected_index = @intCast(next);
-        self.file_search_state.ensure_selection_visible = true;
-        return true;
-    }
-
-    pub fn consumeFileSearchEnsureSelectionVisible(self: *AppState) bool {
-        const should_scroll = self.file_search_state.ensure_selection_visible;
-        self.file_search_state.ensure_selection_visible = false;
-        return should_scroll;
-    }
-
-    pub fn acceptPrimaryFileSearchResult(self: *AppState) bool {
-        return self.selectFileSearchResult(self.fileSearchSelectedIndex());
-    }
-
-    pub fn selectFileSearchResult(self: *AppState, index: usize) bool {
-        if (!self.file_search_state.visible) return false;
-        const token = self.file_search_state.token orelse return false;
-        if (index >= self.file_search_state.results.items.len) return false;
-
-        const draft = self.currentDraft();
-        const choice = self.file_search_state.results.items[index];
-        const replacement = std.fmt.allocPrint(self.allocator, "@{s} ", .{choice.relative_path}) catch return false;
-        defer self.allocator.free(replacement);
-
-        const next_draft = std.fmt.allocPrint(
-            self.allocator,
-            "{s}{s}{s}",
-            .{
-                draft[0..token.at_start],
-                replacement,
-                draft[token.end..],
-            },
-        ) catch return false;
-        defer self.allocator.free(next_draft);
-
-        self.setDraft(next_draft);
-        if (self.file_search_state.last_query) |query| {
-            if (self.file_search_state.finder) |*finder| {
-                finder.trackQuery(self.allocator, query, choice.path);
-            }
-        }
-        self.clearFileSearch();
-        return true;
-    }
-
-    pub fn markDirty(self: *AppState) void {
-        const now_ms = unixTimestampMs();
-        self.lifecycle.noteInteraction(now_ms);
-        self.lifecycle.markDirty(now_ms);
-    }
-
-    pub fn noteInteraction(self: *AppState) void {
-        self.lifecycle.noteInteraction(unixTimestampMs());
-    }
-
-    pub fn requestTranscriptScrollToBottom(self: *AppState) void {
-        if (self.projects.items.len == 0) return;
-        // Drop any saved offset so the next transcript layout uses the fresh tail height
-        // (e.g. right after appending the user message and starting a stream).
-        self.currentThreadMutable().transcript_scroll_valid = false;
-        self.transcript_auto_follow_pending = true;
-        self.scroll_transcript_to_bottom_frames = 8;
-        self.pending_transcript_scroll_px = 0;
-        self.pending_transcript_page_steps = 0;
-    }
-
-    pub fn requestTranscriptLineScroll(self: *AppState, delta: i16) void {
-        if (delta == 0) return;
-        self.noteInteraction();
-        self.transcript_auto_follow_pending = false;
-        self.scroll_transcript_to_bottom_frames = 0;
-        self.pending_transcript_scroll_px += @as(f32, @floatFromInt(delta)) * theme.scaledUi(TRANSCRIPT_KEYBOARD_LINE_PX);
-        self.markDirty();
-    }
-
-    pub fn requestTranscriptPageScroll(self: *AppState, delta: i16) void {
-        if (delta == 0) return;
-        self.noteInteraction();
-        self.transcript_auto_follow_pending = false;
-        self.scroll_transcript_to_bottom_frames = 0;
-        const next = @as(i32, self.pending_transcript_page_steps) + @as(i32, delta);
-        self.pending_transcript_page_steps = @intCast(std.math.clamp(next, -12, 12));
-        self.markDirty();
-    }
+    pub const markDirty = lifecycle_controller.markDirty;
+    pub const noteInteraction = lifecycle_controller.noteInteraction;
+    pub const requestTranscriptScrollToBottom = transcript_controller.requestTranscriptScrollToBottom;
+    pub const requestTranscriptLineScroll = transcript_controller.requestTranscriptLineScroll;
+    pub const requestTranscriptPageScroll = transcript_controller.requestTranscriptPageScroll;
 
     pub fn importDirectoryDraft(self: *const AppState) []const u8 {
         return std.mem.sliceTo(self.import_path_storage[0..], 0);
@@ -11526,12 +6744,8 @@ pub const AppState = struct {
         self.setImportPath(with_sep);
     }
 
-    fn renameInput(self: *const AppState) []const u8 {
+    pub fn renameInput(self: *const AppState) []const u8 {
         return std.mem.sliceTo(self.rename_storage[0..], 0);
-    }
-
-    pub fn renameInputPublic(self: *const AppState) []const u8 {
-        return self.renameInput();
     }
 
     pub fn renameBuffer(self: *AppState) [:0]u8 {
@@ -11539,7 +6753,7 @@ pub const AppState = struct {
     }
 
     pub fn syncRenameBuffer(self: *AppState) void {
-        if (self.projects.items.len == 0) {
+        if (self.project_controller.projects.items.len == 0) {
             self.rename_storage[0] = 0;
             return;
         }
@@ -11576,108 +6790,16 @@ pub const AppState = struct {
     }
 
     fn clearHerdrProfileSummaries(self: *AppState) void {
-        for (self.herdr_profile_summaries.items) |profile| {
+        for (self.herdr_controller.summaries.items) |profile| {
             profile.deinit(self.allocator);
         }
-        self.herdr_profile_summaries.clearRetainingCapacity();
-        self.herdr_profile_selected_index = null;
-        self.herdr_profile_hover_index = null;
-    }
-
-    pub fn flushIfDirty(self: *AppState) void {
-        const now = unixTimestampMs();
-        if (!self.lifecycle.shouldFlush(now, SAVE_DEBOUNCE_MS)) return;
-        self.flushDirtyNow();
-    }
-
-    pub fn flushDirtyBlocking(self: *AppState) void {
-        if (!self.lifecycle.dirty) return;
-        var persisted = self.buildPersistedState(self.storage.allocator) catch |err| {
-            log.err("failed to snapshot native state: {s}", .{@errorName(err)});
-            return;
-        };
-        defer persisted.deinit();
-        self.storage.save(persisted.value) catch |err| {
-            log.err("failed to save native state: {s}", .{@errorName(err)});
-            return;
-        };
-        self.lifecycle.clearDirty();
-    }
-
-    pub fn flushDirtyNow(self: *AppState) void {
-        if (!self.lifecycle.dirty) return;
-
-        var persisted = self.buildPersistedState(std.heap.page_allocator) catch |err| {
-            log.err("failed to snapshot native state: {s}", .{@errorName(err)});
-            return;
-        };
-        errdefer persisted.deinit();
-
-        const pref_path = std.heap.page_allocator.dupe(u8, self.storage.pref_path) catch |err| {
-            log.err("failed to prepare async native state save: {s}", .{@errorName(err)});
-            return;
-        };
-        errdefer std.heap.page_allocator.free(pref_path);
-
-        const worker = std.Thread.spawn(.{}, savePersistedStateWorker, .{ pref_path, persisted }) catch |err| {
-            log.err("failed to start async native state save: {s}", .{@errorName(err)});
-            return;
-        };
-        worker.detach();
-        self.lifecycle.clearDirty();
-    }
-
-    pub fn reloadFromStorage(self: *AppState) !void {
-        _ = self.pollSend();
-        if (self.hasAnyPendingSends()) {
-            self.setSidebarNotice("Finish running provider requests before refreshing from disk.");
-            return;
-        }
-        self.flushDirtyBlocking();
-        self.clearProjects();
-
-        if (try self.storage.load(self.allocator)) |persisted_value| {
-            var persisted = persisted_value;
-            defer persisted.deinit();
-            try self.applyPersisted(persisted.value);
-        } else {
-            try self.seedDefaultState();
-        }
-        self.refreshOpencodeModelOptionsCacheAsync();
-        self.refreshCursorModelOptionsCacheAsync();
-
-        self.setSidebarNotice("App refreshed from disk.");
-        self.requestTranscriptScrollToBottom();
+        self.herdr_controller.summaries.clearRetainingCapacity();
+        self.herdr_controller.selected_index = null;
+        self.herdr_controller.hover_index = null;
     }
 
     pub fn dupeZ(self: *AppState, value: []const u8) ![:0]const u8 {
         return try self.allocator.dupeZ(u8, value);
-    }
-
-    fn ensureFileSearchFinder(self: *AppState, project_path: []const u8) !void {
-        if (self.file_search_state.project_path) |active_path| {
-            if (std.mem.eql(u8, active_path, project_path)) return;
-
-            self.allocator.free(active_path);
-            self.file_search_state.project_path = null;
-        }
-
-        if (self.file_search_state.finder) |*finder| {
-            finder.deinit();
-            self.file_search_state.finder = null;
-        }
-
-        self.file_search_state.finder = try fff.Finder.init(self.allocator, self.storage.pref_path, project_path);
-        self.file_search_state.project_path = try self.allocator.dupe(u8, project_path);
-        self.file_search_state.clearQuery(self.allocator);
-    }
-
-    fn clearFileSearch(self: *AppState) void {
-        self.file_search_state.visible = false;
-        self.file_search_state.token = null;
-        self.file_search_state.ensure_selection_visible = false;
-        self.file_search_state.clearQuery(self.allocator);
-        self.file_search_state.clearResults(self.allocator);
     }
 
     pub fn deinit(self: *AppState) void {
@@ -11697,7 +6819,7 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit cursor model cache finished", .{});
         self.finishProviderReadinessThread();
         runtime_log.diagnostic("AppState.deinit provider readiness finished", .{});
-        self.update_state.deinit();
+        self.settings_controller.update.deinit();
         runtime_log.diagnostic("AppState.deinit updater finished", .{});
         self.finishAllSendThreads();
         runtime_log.diagnostic("AppState.deinit send threads finished", .{});
@@ -11709,8 +6831,8 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit provider processes shutdown", .{});
         self.flushDirtyBlocking();
         runtime_log.diagnostic("AppState.deinit dirty state flushed", .{});
-        self.file_search_state.deinit(self.allocator);
-        self.palette_composer.deinit(self.allocator);
+        self.file_search_controller.deinit(self.allocator);
+        self.composer_controller.composer.deinit(self.allocator);
         self.palette_overlay_batch.deinit(self.allocator);
         self.palette_frame_text.deinit(self.allocator);
         self.palette_frame_text_arena.deinit();
@@ -11722,16 +6844,14 @@ pub const AppState = struct {
         self.closeTranscriptSelectionModal();
         self.clearProjects();
         self.clearSurfaces();
-        self.transcript_markdown_entries.deinit(self.allocator);
-        self.transcript_diff_view_cache.deinit(self.allocator);
-        self.clearBrowserContextMenuLocal();
-        self.browser_context_menu_items.deinit(self.allocator);
-        self.browser_state.deinit();
+        self.transcript_controller.markdown_entries.deinit(self.allocator);
+        self.transcript_controller.diff_view_cache.deinit(self.allocator);
+        self.browser_controller.deinit(self.allocator);
         self.releaseAllImageTextures();
         self.thread_import_threads.deinit(self.allocator);
-        if (self.handoff_preview) |preview| self.allocator.free(preview);
+        if (self.handoff_controller.preview) |preview| self.allocator.free(preview);
         self.clearHerdrProfileSummaries();
-        self.herdr_profile_summaries.deinit(self.allocator);
+        self.herdr_controller.summaries.deinit(self.allocator);
         self.clearOpencodeModelOptions();
         self.clearClaudeModelOptions();
         self.clearCursorModelOptions();
@@ -11739,17 +6859,17 @@ pub const AppState = struct {
         self.opencode_model_options.deinit(self.allocator);
         self.claude_model_options.deinit(self.allocator);
         self.cursor_model_options.deinit(self.allocator);
-        if (self.settings_chat_title_model) |model| self.allocator.free(model);
+        if (self.settings_controller.chat_title_model) |model| self.allocator.free(model);
         self.app_config.deinit(self.allocator);
-        self.projects.deinit(self.allocator);
-        self.archived_projects.deinit(self.allocator);
-        self.surfaces.deinit(self.allocator);
+        self.project_controller.projects.deinit(self.allocator);
+        self.project_controller.archived_projects.deinit(self.allocator);
+        self.surface_controller.surfaces.deinit(self.allocator);
         shutdown_watchdog_deinit_complete.store(true, .release);
         runtime_log.diagnostic("AppState.deinit complete", .{});
     }
 
     fn preparePendingSendsForShutdown(self: *AppState) void {
-        for (self.projects.items) |*project| {
+        for (self.project_controller.projects.items) |*project| {
             for (project.threads.items) |*thread| {
                 self.prepareThreadSendForShutdown(project.path, thread);
             }
@@ -11757,7 +6877,7 @@ pub const AppState = struct {
                 self.prepareThreadSendForShutdown(project.path, thread);
             }
         }
-        for (self.archived_projects.items) |*project| {
+        for (self.project_controller.archived_projects.items) |*project| {
             for (project.threads.items) |*thread| {
                 self.prepareThreadSendForShutdown(project.path, thread);
             }
@@ -11808,7 +6928,7 @@ pub const AppState = struct {
             .selected => {
                 if (picked_path) |path| {
                     defer std.heap.page_allocator.free(path);
-                    if (self.show_project_creator) {
+                    if (self.project_controller.show_creator) {
                         if (create_parent) {
                             self.setImportPathWithTrailingSeparator(path) catch |err| {
                                 log.warn("failed to stage selected parent folder: {s}", .{@errorName(err)});
@@ -11838,138 +6958,9 @@ pub const AppState = struct {
         }
     }
 
-    pub fn pollOpencodeModelOptionsCache(self: *AppState) void {
-        var loaded_models: ?[]ai_harness.ModelInfo = null;
-        var next_status: OpencodeModelCacheStatus = .idle;
-
-        self.opencode_model_cache_state.mutex.lock();
-        switch (self.opencode_model_cache_state.status) {
-            .completed => {
-                loaded_models = self.opencode_model_cache_state.models;
-                self.opencode_model_cache_state.models = null;
-                self.opencode_model_cache_state.status = .idle;
-                next_status = .completed;
-            },
-            .failed => {
-                self.opencode_model_cache_state.status = .idle;
-                next_status = .failed;
-            },
-            else => {},
-        }
-        self.opencode_model_cache_state.mutex.unlock();
-
-        if (next_status != .idle) {
-            self.finishOpencodeModelCacheThread();
-        }
-
-        switch (next_status) {
-            .completed => {
-                const models = loaded_models orelse return;
-                defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
-                self.clearOpencodeModelOptions();
-                if (models.len == 0) return;
-                self.populateOpencodeModelOptions(models) catch |err| {
-                    log.warn("failed to cache OpenCode configured models: {s}", .{@errorName(err)});
-                    self.clearDynamicOpencodeModelOptions();
-                    return;
-                };
-                self.normalizeCurrentOpencodeThreadModel();
-            },
-            .failed => {
-                log.warn("failed to refresh OpenCode model cache", .{});
-            },
-            else => {},
-        }
-    }
-
-    pub fn pollCursorModelOptionsCache(self: *AppState) void {
-        var loaded_models: ?[]ai_harness.ModelInfo = null;
-        var next_status: CursorModelCacheStatus = .idle;
-
-        self.cursor_model_cache_state.mutex.lock();
-        switch (self.cursor_model_cache_state.status) {
-            .completed => {
-                loaded_models = self.cursor_model_cache_state.models;
-                self.cursor_model_cache_state.models = null;
-                self.cursor_model_cache_state.status = .idle;
-                next_status = .completed;
-            },
-            .failed => {
-                self.cursor_model_cache_state.status = .idle;
-                next_status = .failed;
-            },
-            else => {},
-        }
-        self.cursor_model_cache_state.mutex.unlock();
-
-        if (next_status != .idle) {
-            self.finishCursorModelCacheThread();
-        }
-
-        switch (next_status) {
-            .completed => {
-                const models = loaded_models orelse return;
-                defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
-                self.clearCursorModelOptions();
-                if (models.len == 0) return;
-                self.populateCursorModelOptions(models) catch |err| {
-                    log.warn("failed to cache Cursor models: {s}", .{@errorName(err)});
-                    self.clearDynamicCursorModelOptions();
-                    return;
-                };
-                self.saveCursorModelOptionsDiskCache() catch |err| {
-                    log.warn("failed to save Cursor model cache: {s}", .{@errorName(err)});
-                };
-            },
-            .failed => {
-                log.warn("failed to refresh Cursor model cache", .{});
-            },
-            else => {},
-        }
-    }
-
-    pub fn pollClaudeModelOptionsCache(self: *AppState) void {
-        var loaded_models: ?[]ai_harness.ModelInfo = null;
-        var next_status: ClaudeModelCacheStatus = .idle;
-
-        self.claude_model_cache_state.mutex.lock();
-        switch (self.claude_model_cache_state.status) {
-            .completed => {
-                loaded_models = self.claude_model_cache_state.models;
-                self.claude_model_cache_state.models = null;
-                self.claude_model_cache_state.status = .idle;
-                next_status = .completed;
-            },
-            .failed => {
-                self.claude_model_cache_state.status = .idle;
-                next_status = .failed;
-            },
-            else => {},
-        }
-        self.claude_model_cache_state.mutex.unlock();
-
-        if (next_status != .idle) {
-            self.finishClaudeModelCacheThread();
-        }
-
-        switch (next_status) {
-            .completed => {
-                const models = loaded_models orelse return;
-                defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
-                self.clearClaudeModelOptions();
-                if (models.len == 0) return;
-                self.populateClaudeModelOptions(models) catch |err| {
-                    log.warn("failed to cache Claude models: {s}", .{@errorName(err)});
-                    self.clearDynamicClaudeModelOptions();
-                    return;
-                };
-            },
-            .failed => {
-                log.warn("failed to refresh Claude model cache", .{});
-            },
-            else => {},
-        }
-    }
+    pub const pollOpencodeModelOptionsCache = provider_controller.pollOpencodeModelOptionsCache;
+    pub const pollCursorModelOptionsCache = provider_controller.pollCursorModelOptionsCache;
+    pub const pollClaudeModelOptionsCache = provider_controller.pollClaudeModelOptionsCache;
 
     pub const pollSend = chat_controller.pollSend;
     pub const pollTitleGenerations = chat_controller.pollTitleGenerations;
@@ -12028,7 +7019,7 @@ pub const AppState = struct {
     pub const reconcileCodexBackgroundSnapshot = chat_controller.reconcileCodexBackgroundSnapshot;
     pub const applySendFailure = chat_controller.applySendFailure;
 
-    fn resolveProjectPath(self: *AppState, raw_path: []const u8) ![]u8 {
+    pub fn resolveProjectPath(self: *AppState, raw_path: []const u8) ![]u8 {
         const expanded = try platform_paths.expandUserPath(self.allocator, raw_path);
         defer self.allocator.free(expanded);
 
@@ -12044,27 +7035,27 @@ pub const AppState = struct {
         return resolved;
     }
 
-    fn findProjectIndexByPath(self: *const AppState, path: []const u8) ?usize {
-        for (self.projects.items, 0..) |project, index| {
+    pub fn findProjectIndexByPath(self: *const AppState, path: []const u8) ?usize {
+        for (self.project_controller.projects.items, 0..) |project, index| {
             if (self.projectPathMatches(project.path, path)) return index;
         }
         return null;
     }
 
     fn findArchivedProjectIndexByPath(self: *const AppState, path: []const u8) ?usize {
-        for (self.archived_projects.items, 0..) |project, index| {
+        for (self.project_controller.archived_projects.items, 0..) |project, index| {
             if (self.projectPathMatches(project.path, path)) return index;
         }
         return null;
     }
 
-    fn projectPathMatches(self: *const AppState, left: []const u8, right: []const u8) bool {
+    pub fn projectPathMatches(self: *const AppState, left: []const u8, right: []const u8) bool {
         return platform_paths.projectPathsEqual(self.allocator, left, right) catch std.mem.eql(u8, left, right);
     }
 
     fn findThreadIndexByProviderThreadId(self: *const AppState, project_index: usize, provider: Provider, thread_id: []const u8) ?usize {
-        if (project_index >= self.projects.items.len) return null;
-        const project = &self.projects.items[project_index];
+        if (project_index >= self.project_controller.projects.items.len) return null;
+        const project = &self.project_controller.projects.items[project_index];
         for (project.threads.items, 0..) |thread, index| {
             if (thread.provider != provider) continue;
             const existing_id = thread.provider_thread_id orelse continue;
@@ -12073,21 +7064,12 @@ pub const AppState = struct {
         return null;
     }
 
-    fn deriveProjectId(self: *AppState, path: []const u8) ![]u8 {
+    pub fn deriveProjectId(self: *AppState, path: []const u8) ![]u8 {
         const comparison_key = try platform_paths.projectComparisonKeyAllocForOs(self.allocator, builtin.os.tag, path);
         defer self.allocator.free(comparison_key);
         var hasher = std.hash.Wyhash.init(0);
         hasher.update(comparison_key);
         return std.fmt.allocPrint(self.allocator, "{x}", .{hasher.final()});
-    }
-
-    fn persistedImageSnapshot(allocator: std.mem.Allocator, image: ?ChatImageAttachment) !?PersistedImageAttachment {
-        const attachment = image orelse return null;
-        return .{
-            .path = try allocator.dupe(u8, attachment.path),
-            .mime = try allocator.dupe(u8, attachment.mime),
-            .byte_size = attachment.byte_size,
-        };
     }
 
     fn dupeOptionalSlice(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
@@ -12099,30 +7081,30 @@ pub const AppState = struct {
         self.cancelThreadImport();
         self.clearFileSearch();
         self.clearOpencodeModelOptions();
-        if (self.file_search_state.finder) |*finder| {
+        if (self.file_search_controller.finder) |*finder| {
             finder.deinit();
-            self.file_search_state.finder = null;
+            self.file_search_controller.finder = null;
         }
-        if (self.file_search_state.project_path) |project_path| {
+        if (self.file_search_controller.project_path) |project_path| {
             self.allocator.free(project_path);
-            self.file_search_state.project_path = null;
+            self.file_search_controller.project_path = null;
         }
         self.clearImageTextureCache();
         self.closeImageModal();
         self.closeTranscriptSelectionModal();
         self.clearTranscriptMarkdownSelection();
         self.clearTranscriptMarkdownEntries();
-        for (self.projects.items) |*project| {
+        for (self.project_controller.projects.items) |*project| {
             project.deinit(self.allocator);
         }
-        self.projects.clearRetainingCapacity();
-        for (self.archived_projects.items) |*project| {
+        self.project_controller.projects.clearRetainingCapacity();
+        for (self.project_controller.archived_projects.items) |*project| {
             project.deinit(self.allocator);
         }
-        self.archived_projects.clearRetainingCapacity();
-        self.selected_project_index = 0;
-        self.next_project_number = 1;
-        self.show_project_creator = false;
+        self.project_controller.archived_projects.clearRetainingCapacity();
+        self.project_controller.selected_index = 0;
+        self.project_controller.next_project_number = 1;
+        self.project_controller.show_creator = false;
         self.clearImportPath();
         self.rename_storage[0] = 0;
         self.lifecycle.dirty = false;
@@ -12133,7 +7115,7 @@ pub const AppState = struct {
             return self.resolveProjectPath(std.mem.trim(u8, self.importDirectoryDraft(), &std.ascii.whitespace));
         }
 
-        if (self.projects.items.len > 0) {
+        if (self.project_controller.projects.items.len > 0) {
             if (self.resolveProjectPath(self.currentProject().path)) |resolved| {
                 return resolved;
             } else |_| {}
@@ -12180,9 +7162,9 @@ pub const AppState = struct {
 
     pub fn recordBackgroundTaskActionForMessage(self: *AppState, rect: palette.Rect, message_index: usize, body: []const u8, action: BackgroundTaskAction) void {
         if (rect.w < 2 or rect.h < 2) return;
-        for (self.projects.items, 0..) |*project, project_index| for (project.threads.items, 0..) |*thread, thread_index| {
+        for (self.project_controller.projects.items, 0..) |*project, project_index| for (project.threads.items, 0..) |*thread, thread_index| {
             if (message_index >= thread.messages.items.len or !std.mem.eql(u8, thread.messages.items[message_index].body, body)) continue;
-            const task = backgroundTaskForEventBody(thread, body) orelse continue;
+            const task = chat_controller.backgroundTaskForEventBody(thread, body) orelse continue;
             const task_index = (@intFromPtr(task) - @intFromPtr(thread.background_tasks.items.ptr)) / @sizeOf(BackgroundTask);
             self.recordBackgroundTaskActionHit(.{ .rect = rect, .project_index = project_index, .thread_index = thread_index, .task_index = task_index, .message_index = message_index, .action = action });
             return;
@@ -12192,14 +7174,14 @@ pub const AppState = struct {
     pub fn consumeBackgroundTaskActionClick(self: *AppState, x: f32, y: f32) bool {
         for (self.background_task_action_hits.items) |hit| {
             if (x < hit.rect.x or x > hit.rect.x + hit.rect.w or y < hit.rect.y or y > hit.rect.y + hit.rect.h) continue;
-            if (hit.project_index >= self.projects.items.len) return true;
-            var project = &self.projects.items[hit.project_index];
+            if (hit.project_index >= self.project_controller.projects.items.len) return true;
+            var project = &self.project_controller.projects.items[hit.project_index];
             if (hit.thread_index >= project.threads.items.len) return true;
             const thread = &project.threads.items[hit.thread_index];
             if (hit.message_index >= thread.messages.items.len) return true;
             if (hit.task_index >= thread.background_tasks.items.len) return true;
             const task = &thread.background_tasks.items[hit.task_index];
-            if (backgroundTaskForEventBody(thread, thread.messages.items[hit.message_index].body) != task) {
+            if (chat_controller.backgroundTaskForEventBody(thread, thread.messages.items[hit.message_index].body) != task) {
                 self.setSidebarNotice("Background task is no longer available.");
                 return true;
             }
@@ -12210,27 +7192,6 @@ pub const AppState = struct {
             return true;
         }
         return false;
-    }
-
-    fn backgroundTaskForEventBody(thread: *ChatThread, body: []const u8) ?*BackgroundTask {
-        const task_id = ChatThread.backgroundTaskMetadataValue(body, "Verde task ID:");
-        const item_id = ChatThread.backgroundTaskMetadataValue(body, "Codex item ID:");
-        const process_id = ChatThread.backgroundTaskMetadataValue(body, "Process ID:");
-        for (thread.background_tasks.items) |*task| {
-            if (task_id != null and task.task_id != null and std.mem.eql(u8, task_id.?, task.task_id.?)) return task;
-            if (item_id != null and task.item_id != null and std.mem.eql(u8, item_id.?, task.item_id.?) and
-                sameOptionalIdentity(task.provider_thread_id, ChatThread.backgroundTaskMetadataValue(body, "Provider thread ID:"))) return task;
-            if (item_id == null and task.item_id == null and process_id != null and task.process_id != null and
-                std.mem.eql(u8, process_id.?, task.process_id.?) and sameOptionalIdentity(task.provider_thread_id, ChatThread.backgroundTaskMetadataValue(body, "Provider thread ID:"))) return task;
-            if (task_id == null and item_id == null and process_id == null and
-                std.mem.eql(u8, ChatThread.backgroundCommandFromEventBody(body), task.command)) return task;
-        }
-        return null;
-    }
-
-    fn sameOptionalIdentity(a: ?[:0]const u8, b: ?[]const u8) bool {
-        if (a == null or b == null) return false;
-        return std.mem.eql(u8, a.?, b.?);
     }
 
     fn stopBackgroundTask(self: *AppState, project_index: usize, thread: *ChatThread, task: *BackgroundTask) void {
@@ -12303,7 +7264,7 @@ pub const AppState = struct {
             return;
         };
         defer self.allocator.free(command);
-        self.selected_project_index = project_index;
+        self.project_controller.selected_index = project_index;
         const pane_id = self.openCurrentProjectTerminalPaneForCommand() orelse return;
         _ = self.writeWorkspaceTerminalPane(pane_id, command) catch {
             self.setSidebarNotice("Failed to open background task output.");
@@ -12343,7 +7304,7 @@ pub const AppState = struct {
     pub fn setDiffLayoutPreference(self: *AppState, preference: app_config.DiffLayoutPreference) void {
         if (self.app_config.diff_layout_preference == preference) return;
         self.app_config.diff_layout_preference = preference;
-        self.settings_draft.diff_layout_preference = preference;
+        self.settings_controller.draft.diff_layout_preference = preference;
         app_config.saveAppConfig(self.allocator, &self.app_config) catch |err| {
             log.warn("failed to save diff layout preference: {s}", .{@errorName(err)});
         };
@@ -12650,27 +7611,10 @@ fn projectEditorOpenedNotice(target: ProjectEditorTarget) []const u8 {
     };
 }
 
-fn trailingFileSearchToken(draft: []const u8) ?FileSearchToken {
-    if (draft.len == 0) return null;
-    if (std.ascii.isWhitespace(draft[draft.len - 1])) return null;
-
-    var token_start = draft.len;
-    while (token_start > 0 and !std.ascii.isWhitespace(draft[token_start - 1])) {
-        token_start -= 1;
-    }
-
-    if (draft[token_start] != '@') return null;
-    return .{
-        .at_start = token_start,
-        .query_start = token_start + 1,
-        .end = draft.len,
-    };
-}
-
 test "empty workspace ignores hidden composer and slash input" {
     var state: AppState = undefined;
-    state.projects = .empty;
-    state.selected_project_index = 0;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
 
     try std.testing.expect(!state.slashCommandPickerActive());
     try std.testing.expectEqual(@as(usize, 0), state.slashCommandPickerRowCount());
@@ -12725,27 +7669,27 @@ test "shared browser runtime routes state through its workspace owner" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
     state.allocator = allocator;
-    state.projects = .empty;
-    state.selected_project_index = 0;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
     state.browser_controller.runtime_project_index = null;
     defer {
-        for (state.projects.items) |*project| project.deinit(allocator);
-        state.projects.deinit(allocator);
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
     }
 
     var first_project = try Project.init(allocator, "first", "First", "/tmp/first", 0);
-    state.projects.append(allocator, first_project) catch |err| {
+    state.project_controller.projects.append(allocator, first_project) catch |err| {
         first_project.deinit(allocator);
         return err;
     };
     var second_project = try Project.init(allocator, "second", "Second", "/tmp/second", 0);
-    state.projects.append(allocator, second_project) catch |err| {
+    state.project_controller.projects.append(allocator, second_project) catch |err| {
         second_project.deinit(allocator);
         return err;
     };
 
-    const first_pane_id = try state.projects.items[0].workspace_layout.ensureBrowserPane(allocator);
-    const second_pane_id = try state.projects.items[1].workspace_layout.ensureBrowserPane(allocator);
+    const first_pane_id = try state.project_controller.projects.items[0].workspace_layout.ensureBrowserPane(allocator);
+    const second_pane_id = try state.project_controller.projects.items[1].workspace_layout.ensureBrowserPane(allocator);
     try state.browserPaneRefMutable(0, first_pane_id).?.activeTab().?.recordNavigation(allocator, "https://first.example/");
     try state.browserPaneRefMutable(1, second_pane_id).?.activeTab().?.recordNavigation(allocator, "https://second.example/");
 
@@ -12775,11 +7719,11 @@ test "completed OpenCode model refresh tolerates zero workspaces" {
 
     var state: AppState = undefined;
     state.allocator = allocator;
-    state.projects = .empty;
-    state.selected_project_index = 0;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
     state.opencode_model_options = .empty;
     state.opencode_reasoning_menu = .empty;
-    state.opencode_model_cache_state = .{
+    state.provider_controller.opencode_model_cache = .{
         .status = .completed,
         .models = models,
     };
@@ -12791,7 +7735,7 @@ test "completed OpenCode model refresh tolerates zero workspaces" {
 
     state.pollOpencodeModelOptionsCache();
 
-    try std.testing.expectEqual(@as(usize, 0), state.projects.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.project_controller.projects.items.len);
     try std.testing.expect(state.opencode_model_options.items.len > 0);
 }
 
@@ -12810,8 +7754,8 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
     state.allocator = allocator;
-    state.projects = .empty;
-    state.selected_project_index = 0;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
     state.opencode_model_options = .empty;
     state.claude_model_options = .empty;
     state.cursor_model_options = .empty;
@@ -12820,26 +7764,26 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
     state.lifecycle.last_interaction_at_ms = 0;
     @memset(&state.sidebar_notice_storage, 0);
     defer {
-        for (state.projects.items) |*project| project.deinit(allocator);
-        state.projects.deinit(allocator);
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
     }
 
     var first = try Project.init(allocator, "first", "First", "/tmp/first", 0);
-    state.projects.append(allocator, first) catch |err| {
+    state.project_controller.projects.append(allocator, first) catch |err| {
         first.deinit(allocator);
         return err;
     };
     var second = try Project.init(allocator, "second", "Second", "/tmp/second", 0);
-    state.projects.append(allocator, second) catch |err| {
+    state.project_controller.projects.append(allocator, second) catch |err| {
         second.deinit(allocator);
         return err;
     };
 
-    const first_thread_count = state.projects.items[0].threads.items.len;
-    const first_pane_count = state.projects.items[0].workspace_layout.panes.items.len;
-    const second_thread_count = state.projects.items[1].threads.items.len;
-    const second_pane_count = state.projects.items[1].workspace_layout.panes.items.len;
-    const second_focused_pane = state.projects.items[1].workspace_layout.focused_pane_id;
+    const first_thread_count = state.project_controller.projects.items[0].threads.items.len;
+    const first_pane_count = state.project_controller.projects.items[0].workspace_layout.panes.items.len;
+    const second_thread_count = state.project_controller.projects.items[1].threads.items.len;
+    const second_pane_count = state.project_controller.projects.items[1].workspace_layout.panes.items.len;
+    const second_focused_pane = state.project_controller.projects.items[1].workspace_layout.focused_pane_id;
 
     try std.testing.expect(state.providerSupportsModel(.opencode, DEFAULT_OPENCODE_MODEL));
     try std.testing.expect(state.providerSupportsModel(.codex, DEFAULT_CODEX_MODEL));
@@ -12853,14 +7797,14 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
         .axis = .vertical,
         .focus = false,
     });
-    try std.testing.expectEqual(@as(usize, 0), state.selected_project_index);
-    try std.testing.expectEqual(first_thread_count, state.projects.items[0].threads.items.len);
-    try std.testing.expectEqual(first_pane_count, state.projects.items[0].workspace_layout.panes.items.len);
-    try std.testing.expectEqual(second_thread_count + 1, state.projects.items[1].threads.items.len);
-    try std.testing.expectEqual(second_pane_count + 1, state.projects.items[1].workspace_layout.panes.items.len);
-    try std.testing.expectEqual(second_focused_pane, state.projects.items[1].workspace_layout.focused_pane_id);
+    try std.testing.expectEqual(@as(usize, 0), state.project_controller.selected_index);
+    try std.testing.expectEqual(first_thread_count, state.project_controller.projects.items[0].threads.items.len);
+    try std.testing.expectEqual(first_pane_count, state.project_controller.projects.items[0].workspace_layout.panes.items.len);
+    try std.testing.expectEqual(second_thread_count + 1, state.project_controller.projects.items[1].threads.items.len);
+    try std.testing.expectEqual(second_pane_count + 1, state.project_controller.projects.items[1].workspace_layout.panes.items.len);
+    try std.testing.expectEqual(second_focused_pane, state.project_controller.projects.items[1].workspace_layout.focused_pane_id);
     try std.testing.expect(!result.focused);
-    const thread = &state.projects.items[1].threads.items[result.thread_index];
+    const thread = &state.project_controller.projects.items[1].threads.items[result.thread_index];
     try std.testing.expectEqual(Provider.cursor, thread.provider);
     try std.testing.expectEqualStrings("composer-2", thread.model_ref.?);
 
@@ -12879,7 +7823,7 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
             .target_pane_id = 1,
             .focus = false,
         });
-        const default_thread = &state.projects.items[1].threads.items[default_result.thread_index];
+        const default_thread = &state.project_controller.projects.items[1].threads.items[default_result.thread_index];
         try std.testing.expectEqual(case.provider, default_thread.provider);
         try std.testing.expectEqualStrings(case.model, default_thread.model_ref.?);
         if (case.provider == .codex) {
@@ -12898,7 +7842,7 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
         .target_pane_id = 1,
         .focus = false,
     });
-    const configured_thread = &state.projects.items[1].threads.items[configured_result.thread_index];
+    const configured_thread = &state.project_controller.projects.items[1].threads.items[configured_result.thread_index];
     try std.testing.expectEqual(ReasoningEffort.medium, configured_thread.reasoning_effort.?);
     try std.testing.expectEqual(FastMode.off, configured_thread.fast_mode);
     try std.testing.expect(state.lifecycle.dirty);
@@ -12912,23 +7856,23 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
     });
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const persisted = try state.persistedThreadSnapshot(
+    const persisted = try persistence.threadSnapshot(
         arena.allocator(),
-        &state.projects.items[1].threads.items[persisted_result.thread_index],
+        &state.project_controller.projects.items[1].threads.items[persisted_result.thread_index],
     );
     try std.testing.expectEqual(ReasoningEffort.high, persisted.reasoning_effort.?);
     try std.testing.expectEqual(FastMode.on, persisted.fast_mode.?);
     try std.testing.expect(persisted.reasoning_variant == null);
 
-    const thread_count_before_rejection = state.projects.items[1].threads.items.len;
-    const pane_count_before_rejection = state.projects.items[1].workspace_layout.panes.items.len;
+    const thread_count_before_rejection = state.project_controller.projects.items[1].threads.items.len;
+    const pane_count_before_rejection = state.project_controller.projects.items[1].workspace_layout.panes.items.len;
     try std.testing.expectError(error.InvalidModel, state.openWorkspaceChat(1, .{
         .provider = .codex,
         .model_ref = "composer-2",
         .target_pane_id = 1,
     }));
-    try std.testing.expectEqual(thread_count_before_rejection, state.projects.items[1].threads.items.len);
-    try std.testing.expectEqual(pane_count_before_rejection, state.projects.items[1].workspace_layout.panes.items.len);
+    try std.testing.expectEqual(thread_count_before_rejection, state.project_controller.projects.items[1].threads.items.len);
+    try std.testing.expectEqual(pane_count_before_rejection, state.project_controller.projects.items[1].workspace_layout.panes.items.len);
 
     try std.testing.expectError(error.UnsupportedReasoningEffort, state.openWorkspaceChat(1, .{
         .provider = .codex,
@@ -12956,15 +7900,15 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
         .fast_mode = .off,
         .target_pane_id = 1,
     }));
-    try std.testing.expectEqual(thread_count_before_rejection, state.projects.items[1].threads.items.len);
-    try std.testing.expectEqual(pane_count_before_rejection, state.projects.items[1].workspace_layout.panes.items.len);
+    try std.testing.expectEqual(thread_count_before_rejection, state.project_controller.projects.items[1].threads.items.len);
+    try std.testing.expectEqual(pane_count_before_rejection, state.project_controller.projects.items[1].workspace_layout.panes.items.len);
 
     try std.testing.expectError(error.TargetPaneNotFound, state.openWorkspaceChat(1, .{
         .provider = .codex,
         .target_pane_id = 999,
     }));
-    try std.testing.expectEqual(thread_count_before_rejection, state.projects.items[1].threads.items.len);
-    try std.testing.expectEqual(pane_count_before_rejection, state.projects.items[1].workspace_layout.panes.items.len);
+    try std.testing.expectEqual(thread_count_before_rejection, state.project_controller.projects.items[1].threads.items.len);
+    try std.testing.expectEqual(pane_count_before_rejection, state.project_controller.projects.items[1].workspace_layout.panes.items.len);
 }
 
 test "provider-aware chat creation focuses requested pane" {
@@ -13054,20 +7998,20 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
     state.allocator = allocator;
-    state.projects = .empty;
-    state.surfaces = .empty;
-    state.selected_project_index = 0;
-    state.browser_state = try browser_runtime.State.init(allocator);
+    state.project_controller.projects = .empty;
+    state.surface_controller.surfaces = .empty;
+    state.project_controller.selected_index = 0;
+    state.browser_controller.runtime = try browser_runtime.State.init(allocator);
     state.browser_controller.runtime_project_index = null;
-    state.browser_pane_focused = false;
-    state.browser_address_focused = true;
-    state.terminal_focused = false;
-    state.composer_focused = true;
-    state.palette_composer = PaletteComposerPrompt.init();
-    state.palette_composer.focused = true;
-    state.palette_model_picker = PaletteModelPicker.init(0);
-    state.composer_popover_restore_focus = false;
-    state.run_config_open = false;
+    state.browser_controller.pane_focused = false;
+    state.browser_controller.address_focused = true;
+    state.terminal_controller.focused = false;
+    state.composer_controller.focused = true;
+    state.composer_controller.composer = PaletteComposerPrompt.init();
+    state.composer_controller.composer.focused = true;
+    state.composer_controller.model_picker = PaletteModelPicker.init(0);
+    state.composer_controller.popover_restore_focus = false;
+    state.composer_controller.run_config_open = false;
     state.palette_modal_text_focus = .none;
     state.lifecycle.dirty = false;
     state.lifecycle.last_dirty_at_ms = 0;
@@ -13075,19 +8019,19 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     @memset(&state.rename_storage, 0);
     @memset(&state.sidebar_notice_storage, 0);
     defer {
-        for (state.projects.items) |*project| project.deinit(allocator);
-        state.projects.deinit(allocator);
-        state.surfaces.deinit(allocator);
-        state.palette_composer.deinit(allocator);
-        state.browser_state.deinit();
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.surface_controller.surfaces.deinit(allocator);
+        state.composer_controller.composer.deinit(allocator);
+        state.browser_controller.deinit(allocator);
     }
 
     var project = try Project.init(allocator, "test", "Test", "/tmp/test", 0);
-    state.projects.append(allocator, project) catch |err| {
+    state.project_controller.projects.append(allocator, project) catch |err| {
         project.deinit(allocator);
         return err;
     };
-    const layout = &state.projects.items[0].workspace_layout;
+    const layout = &state.project_controller.projects.items[0].workspace_layout;
     const chat_pane_id = layout.panes.items[0].id;
     const first_terminal_pane_id = try layout.createTerminalPane(allocator, 1);
     const clicked_terminal_pane_id = try layout.createTerminalPane(allocator, 2);
@@ -13098,23 +8042,23 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
 
     try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.maximized_pane_id);
-    try std.testing.expect(state.terminal_focused);
-    try std.testing.expect(!state.composer_focused);
-    try std.testing.expect(!state.palette_composer.focused);
-    try std.testing.expect(!state.browser_address_focused);
+    try std.testing.expect(state.terminal_controller.focused);
+    try std.testing.expect(!state.composer_controller.focused);
+    try std.testing.expect(!state.composer_controller.composer.focused);
+    try std.testing.expect(!state.browser_controller.address_focused);
 
     try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(1));
     try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.maximized_pane_id);
-    try std.testing.expect(state.composer_focused);
-    try std.testing.expect(state.palette_composer.focused);
-    try std.testing.expect(!state.terminal_focused);
+    try std.testing.expect(state.composer_controller.focused);
+    try std.testing.expect(state.composer_controller.composer.focused);
+    try std.testing.expect(!state.terminal_controller.focused);
     try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(-1));
     try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.maximized_pane_id);
-    try std.testing.expect(state.terminal_focused);
-    try std.testing.expect(!state.composer_focused);
-    try std.testing.expect(!state.palette_composer.focused);
+    try std.testing.expect(state.terminal_controller.focused);
+    try std.testing.expect(!state.composer_controller.focused);
+    try std.testing.expect(!state.composer_controller.composer.focused);
     try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(-1));
     try std.testing.expectEqual(@as(?WorkspacePaneId, first_terminal_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, first_terminal_pane_id), layout.maximized_pane_id);
@@ -13136,7 +8080,7 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.maximized_pane_id);
     try std.testing.expect(!layout.rootContainsPane(clicked_terminal_pane_id));
-    try std.testing.expect(state.terminal_focused);
+    try std.testing.expect(state.terminal_controller.focused);
     try std.testing.expect(state.isTerminalVisible());
     try std.testing.expect(state.canRouteTerminalInput());
 
@@ -13146,13 +8090,13 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.maximized_pane_id);
     try std.testing.expect(!layout.rootContainsPane(clicked_terminal_pane_id));
-    try std.testing.expect(!state.terminal_focused);
+    try std.testing.expect(!state.terminal_controller.focused);
     try std.testing.expect(!state.canRouteTerminalInput());
 
     state.focusWorkspaceOpenPaneFromSidebar(0, clicked_terminal_pane_id);
     try std.testing.expect(layout.quick_pane.?.visible);
     try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.focused_pane_id);
-    try std.testing.expect(state.terminal_focused);
+    try std.testing.expect(state.terminal_controller.focused);
     try std.testing.expect(state.canRouteTerminalInput());
     layout.quick_pane = null;
 
@@ -13164,55 +8108,55 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     });
     try std.testing.expect(result.focused);
     try std.testing.expectEqual(@as(?WorkspacePaneId, result.pane_id), layout.focused_pane_id);
-    try std.testing.expect(state.composer_focused);
-    try std.testing.expect(state.palette_composer.focused);
-    try std.testing.expect(!state.terminal_focused);
+    try std.testing.expect(state.composer_controller.focused);
+    try std.testing.expect(state.composer_controller.composer.focused);
+    try std.testing.expect(!state.terminal_controller.focused);
 
     try std.testing.expect(state.focusCurrentProjectWorkspacePane(clicked_terminal_pane_id));
     try std.testing.expect(state.closeCurrentProjectWorkspacePane(clicked_terminal_pane_id));
     try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.focused_pane_id);
-    try std.testing.expect(state.composer_focused);
-    try std.testing.expect(state.palette_composer.focused);
-    try std.testing.expect(!state.terminal_focused);
+    try std.testing.expect(state.composer_controller.focused);
+    try std.testing.expect(state.composer_controller.composer.focused);
+    try std.testing.expect(!state.terminal_controller.focused);
 }
 
 test "sidebar pane selection restores a sibling browser URL snapshot" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
     state.allocator = allocator;
-    state.projects = .empty;
-    state.surfaces = .empty;
-    state.selected_project_index = 0;
-    state.browser_state = try browser_runtime.State.init(allocator);
+    state.project_controller.projects = .empty;
+    state.surface_controller.surfaces = .empty;
+    state.project_controller.selected_index = 0;
+    state.browser_controller.runtime = try browser_runtime.State.init(allocator);
     state.browser_controller.runtime_project_index = null;
     state.browser_textures_enabled = false;
-    state.browser_pane_focused = false;
-    state.browser_address_focused = false;
-    state.terminal_focused = false;
-    state.composer_focused = true;
-    state.palette_composer = PaletteComposerPrompt.init();
-    state.palette_composer.focused = true;
-    state.palette_model_picker = PaletteModelPicker.init(0);
-    state.composer_popover_restore_focus = false;
-    state.run_config_open = false;
+    state.browser_controller.pane_focused = false;
+    state.browser_controller.address_focused = false;
+    state.terminal_controller.focused = false;
+    state.composer_controller.focused = true;
+    state.composer_controller.composer = PaletteComposerPrompt.init();
+    state.composer_controller.composer.focused = true;
+    state.composer_controller.model_picker = PaletteModelPicker.init(0);
+    state.composer_controller.popover_restore_focus = false;
+    state.composer_controller.run_config_open = false;
     state.palette_modal_text_focus = .none;
     state.lifecycle.dirty = false;
     state.lifecycle.last_dirty_at_ms = 0;
     state.lifecycle.last_interaction_at_ms = 0;
     defer {
-        for (state.projects.items) |*project| project.deinit(allocator);
-        state.projects.deinit(allocator);
-        state.surfaces.deinit(allocator);
-        state.palette_composer.deinit(allocator);
-        state.browser_state.deinit();
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.surface_controller.surfaces.deinit(allocator);
+        state.composer_controller.composer.deinit(allocator);
+        state.browser_controller.deinit(allocator);
     }
 
     var project = try Project.init(allocator, "test", "Test", "/tmp/test", 0);
-    state.projects.append(allocator, project) catch |err| {
+    state.project_controller.projects.append(allocator, project) catch |err| {
         project.deinit(allocator);
         return err;
     };
-    const layout = &state.projects.items[0].workspace_layout;
+    const layout = &state.project_controller.projects.items[0].workspace_layout;
     const chat_pane_id = layout.panes.items[0].id;
     const browser_pane_id = try layout.ensureBrowserPane(allocator);
     const browser_ref = state.browserPaneRefMutable(0, browser_pane_id) orelse return error.TestExpectedEqual;
@@ -13221,35 +8165,35 @@ test "sidebar pane selection restores a sibling browser URL snapshot" {
 
     state.focusWorkspaceOpenPaneFromSidebar(0, chat_pane_id);
 
-    try std.testing.expectEqualStrings("https://example.com/restored", state.browser_state.current_url.?);
-    try std.testing.expectEqualStrings("https://example.com/restored", state.browser_state.addressInput());
+    try std.testing.expectEqualStrings("https://example.com/restored", state.browser_controller.runtime.current_url.?);
+    try std.testing.expectEqualStrings("https://example.com/restored", state.browser_controller.runtime.addressInput());
 
     state.focusWorkspaceOpenPaneFromSidebar(0, browser_pane_id);
 
-    try std.testing.expect(state.browser_pane_focused);
-    try std.testing.expect(!state.browser_address_focused);
-    try std.testing.expect(!state.terminal_focused);
-    try std.testing.expect(!state.composer_focused);
-    try std.testing.expect(!state.palette_composer.focused);
+    try std.testing.expect(state.browser_controller.pane_focused);
+    try std.testing.expect(!state.browser_controller.address_focused);
+    try std.testing.expect(!state.terminal_controller.focused);
+    try std.testing.expect(!state.composer_controller.focused);
+    try std.testing.expect(!state.composer_controller.composer.focused);
 }
 
 test "workspace selection restores focused pane keyboard ownership" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
     state.allocator = allocator;
-    state.projects = .empty;
-    state.surfaces = .empty;
-    state.selected_project_index = 0;
-    state.browser_state = try browser_runtime.State.init(allocator);
+    state.project_controller.projects = .empty;
+    state.surface_controller.surfaces = .empty;
+    state.project_controller.selected_index = 0;
+    state.browser_controller.runtime = try browser_runtime.State.init(allocator);
     state.browser_controller.runtime_project_index = null;
-    state.browser_pane_focused = false;
-    state.browser_address_focused = false;
-    state.terminal_focused = false;
-    state.composer_focused = false;
-    state.palette_composer = PaletteComposerPrompt.init();
-    state.palette_model_picker = PaletteModelPicker.init(0);
-    state.composer_popover_restore_focus = false;
-    state.run_config_open = false;
+    state.browser_controller.pane_focused = false;
+    state.browser_controller.address_focused = false;
+    state.terminal_controller.focused = false;
+    state.composer_controller.focused = false;
+    state.composer_controller.composer = PaletteComposerPrompt.init();
+    state.composer_controller.model_picker = PaletteModelPicker.init(0);
+    state.composer_controller.popover_restore_focus = false;
+    state.composer_controller.run_config_open = false;
     state.palette_modal_text_focus = .none;
     state.workspace_header_open_menu_open = false;
     state.workspace_header_open_menu_pane_id = null;
@@ -13259,15 +8203,15 @@ test "workspace selection restores focused pane keyboard ownership" {
     state.lifecycle.last_interaction_at_ms = 0;
     @memset(&state.rename_storage, 0);
     defer {
-        for (state.projects.items) |*project| project.deinit(allocator);
-        state.projects.deinit(allocator);
-        state.surfaces.deinit(allocator);
-        state.palette_composer.deinit(allocator);
-        state.browser_state.deinit();
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.surface_controller.surfaces.deinit(allocator);
+        state.composer_controller.composer.deinit(allocator);
+        state.browser_controller.deinit(allocator);
     }
 
     var chat_project = try Project.init(allocator, "chat", "Chat", "/tmp/chat", 0);
-    state.projects.append(allocator, chat_project) catch |err| {
+    state.project_controller.projects.append(allocator, chat_project) catch |err| {
         chat_project.deinit(allocator);
         return err;
     };
@@ -13275,43 +8219,43 @@ test "workspace selection restores focused pane keyboard ownership" {
     const terminal_pane_id = try terminal_project.workspace_layout.createTerminalPane(allocator, 9);
     try terminal_project.workspace_layout.ensurePaneInRootSplit(allocator, terminal_pane_id, .vertical, 0.5);
     terminal_project.workspace_layout.focused_pane_id = terminal_pane_id;
-    state.projects.append(allocator, terminal_project) catch |err| {
+    state.project_controller.projects.append(allocator, terminal_project) catch |err| {
         terminal_project.deinit(allocator);
         return err;
     };
 
     try std.testing.expect(state.selectProjectAtIndex(1));
-    try std.testing.expectEqual(@as(usize, 1), state.selected_project_index);
-    try std.testing.expect(state.terminal_focused);
-    try std.testing.expect(!state.composer_focused);
-    try std.testing.expect(!state.palette_composer.focused);
+    try std.testing.expectEqual(@as(usize, 1), state.project_controller.selected_index);
+    try std.testing.expect(state.terminal_controller.focused);
+    try std.testing.expect(!state.composer_controller.focused);
+    try std.testing.expect(!state.composer_controller.composer.focused);
 
     try std.testing.expect(state.selectProjectAtIndex(0));
-    try std.testing.expectEqual(@as(usize, 0), state.selected_project_index);
-    try std.testing.expect(!state.terminal_focused);
-    try std.testing.expect(state.composer_focused);
-    try std.testing.expect(state.palette_composer.focused);
+    try std.testing.expectEqual(@as(usize, 0), state.project_controller.selected_index);
+    try std.testing.expect(!state.terminal_controller.focused);
+    try std.testing.expect(state.composer_controller.focused);
+    try std.testing.expect(state.composer_controller.composer.focused);
 }
 
 test "visible chat is not treated as focused when a sibling pane owns focus" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
     state.allocator = allocator;
-    state.projects = .empty;
-    state.selected_project_index = 0;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
     state.window_input_focus = true;
     defer {
-        for (state.projects.items) |*project| project.deinit(allocator);
-        state.projects.deinit(allocator);
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
     }
 
     var project = try Project.init(allocator, "test", "Test", "/tmp/test", 0);
-    state.projects.append(allocator, project) catch |err| {
+    state.project_controller.projects.append(allocator, project) catch |err| {
         project.deinit(allocator);
         return err;
     };
 
-    const layout = &state.projects.items[0].workspace_layout;
+    const layout = &state.project_controller.projects.items[0].workspace_layout;
     const chat_pane_id = layout.panes.items[0].id;
     const terminal_pane_id = try layout.createTerminalPane(allocator, 1);
     layout.focused_pane_id = terminal_pane_id;
@@ -13433,14 +8377,14 @@ test "workspace leases reject conflicts, renew, expire, and enforce ownership" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
     state.allocator = allocator;
-    state.projects = .empty;
+    state.project_controller.projects = .empty;
     defer {
-        for (state.projects.items) |*project| project.deinit(allocator);
-        state.projects.deinit(allocator);
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
     }
 
     var project = try Project.init(allocator, "lease-test", "Lease test", "/tmp/lease-test", 0);
-    state.projects.append(allocator, project) catch |err| {
+    state.project_controller.projects.append(allocator, project) catch |err| {
         project.deinit(allocator);
         return err;
     };
@@ -13483,68 +8427,12 @@ fn unixTimestampSeconds() i64 {
     return @divTrunc(unixTimestampMs(), std.time.ms_per_s);
 }
 
+fn monotonicMs() i64 {
+    return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
+}
+
 fn unixTimestampMs() i64 {
     return platform_runtime.unixTimestampMs();
-}
-
-fn ensureJsonRpcOk(allocator: std.mem.Allocator, response: []const u8) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
-    defer parsed.deinit();
-    _ = try jsonRpcResult(parsed.value);
-}
-
-fn initialSendStartFailureMessage(_: anyerror) []const u8 {
-    return "Verde could not start this message. Your draft and attachments are still in the composer; try Send again.";
-}
-
-fn ambiguousInitialSendFailureMessage() []const u8 {
-    return "Verde could not confirm that the provider request started. Your submitted message is preserved above; copy it before retrying.";
-}
-
-fn jsonRpcResult(value: std.json.Value) !std.json.Value {
-    if (value != .object) return error.InvalidDaemonResponse;
-    if (value.object.get("error")) |_| return error.DaemonRequestFailed;
-    return value.object.get("result") orelse return error.InvalidDaemonResponse;
-}
-
-fn jsonValueString(value: std.json.Value) ?[]const u8 {
-    return switch (value) {
-        .string => |text| text,
-        else => null,
-    };
-}
-
-fn jsonValueU64(value: std.json.Value) ?u64 {
-    return switch (value) {
-        .integer => |int| if (int >= 0) @intCast(int) else null,
-        .number_string => |text| std.fmt.parseInt(u64, text, 10) catch null,
-        else => null,
-    };
-}
-
-fn jsonValueI64(value: std.json.Value) ?i64 {
-    return switch (value) {
-        .integer => |int| int,
-        .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
-        else => null,
-    };
-}
-
-fn replacePageOwned(slot: *?[]u8, value: []const u8) !void {
-    if (slot.*) |existing| {
-        if (std.mem.eql(u8, existing, value)) return;
-    }
-    const next = try std.heap.page_allocator.dupe(u8, value);
-    if (slot.*) |existing| std.heap.page_allocator.free(existing);
-    slot.* = next;
-}
-
-fn daemonPayloadStringAlloc(payload_json: []const u8, field: []const u8) ?[]u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, payload_json, .{}) catch return null;
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const value = jsonValueString(parsed.value.object.get(field) orelse .null) orelse return null;
-    return std.heap.page_allocator.dupe(u8, value) catch null;
 }
 
 test "inspector disabled lifecycle messages are distinguished from other events" {

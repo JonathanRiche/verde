@@ -690,11 +690,11 @@ fn mainInner(init: std.process.Init) !void {
 fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
     // Workspace pane chrome overlays chat, terminal, and native browser
     // content, so its pointer affordance must win before content cursors.
-    if (!modalHitAtMouse(state) and workspace_panes_ui.wantsPointerAt(state.palette_mouse_x, state.palette_mouse_y)) {
+    if (!modalHitAtMouse(state) and workspace_panes_ui.wantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) {
         applySystemCursor(cache, .pointer);
         return;
     }
-    if (!modalHitAtMouse(state) and browser_ui.wantsPointerAt(state, state.palette_mouse_x, state.palette_mouse_y)) {
+    if (!modalHitAtMouse(state) and browser_ui.wantsPointerAt(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) {
         applySystemCursor(cache, .pointer);
         return;
     }
@@ -706,8 +706,8 @@ fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
     }
     // The settings modal covers the workspace behind a scrim, so shapes from
     // occluded terminal panes must not win while it is open.
-    if (!state.show_settings_modal) {
-        if (terminal_panel_ui.mouseShapeAtPoint(state, state.palette_mouse_x, state.palette_mouse_y)) |shape| {
+    if (!state.settings_controller.modal_visible) {
+        if (terminal_panel_ui.mouseShapeAtPoint(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) |shape| {
             applySystemCursor(cache, if (shape == .pointer) .pointer else .default);
             return;
         }
@@ -717,7 +717,7 @@ fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
         return;
     }
     if (!modalHitAtMouse(state)) {
-        if (state.browserCursorShapeAtPoint(state.palette_mouse_x, state.palette_mouse_y)) |shape| {
+        if (state.browserCursorShapeAtPoint(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) |shape| {
             applyBrowserCursor(cache, shape);
             return;
         }
@@ -726,10 +726,10 @@ fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
     // before the sidebar and workspace headers in event routing, so any modal
     // hit under the mouse must also suppress their pointer affordance.
     if (!modalHitAtMouse(state) and
-        (sidebar_ui.wantsPointerAt(state, state.palette_mouse_x, state.palette_mouse_y) or
-            chat_panel_ui.workspaceHeaderWantsPointerAt(state, state.palette_mouse_x, state.palette_mouse_y) or
-            chat_panel_ui.approvalActionWantsPointerAt(state.palette_mouse_x, state.palette_mouse_y) or
-            chat_panel_ui.transcriptActionWantsPointerAt(state.palette_mouse_x, state.palette_mouse_y)))
+        (sidebar_ui.wantsPointerAt(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
+            chat_panel_ui.workspaceHeaderWantsPointerAt(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
+            chat_panel_ui.approvalActionWantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
+            chat_panel_ui.transcriptActionWantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)))
     {
         applySystemCursor(cache, .pointer);
         return;
@@ -793,7 +793,7 @@ test "browser cursor shapes map to cached SDL system cursor families" {
 // True when any retained modal hit rect (scrim or control) covers the current
 // mouse position; mirrors ui_layout.handlePaletteMouseButton's precedence.
 fn modalHitAtMouse(state: *const AppState) bool {
-    const point: palette.draw.Vec2 = .{ .x = state.palette_mouse_x, .y = state.palette_mouse_y };
+    const point: palette.draw.Vec2 = .{ .x = state.transcript_controller.palette_mouse_x, .y = state.transcript_controller.palette_mouse_y };
     for (state.palette_modal_hits.items) |hit| {
         if (hit.rect.contains(point)) return true;
     }
@@ -1282,7 +1282,7 @@ fn openHotkeyWorkspacePane(state: *AppState, kind: HotkeyPaneKind, fallback_axis
 // The new-thread policy and pane placement are shared with the sidebar pencil
 // action so both entry points honor the same setting.
 fn openHotkeyWorkspaceChatThread(state: *AppState) bool {
-    state.createThreadForProject(state.selected_project_index);
+    state.createThreadForProject(state.project_controller.selected_index);
     return true;
 }
 
@@ -1376,7 +1376,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     return true;
                 }
             }
-            if (state.terminal_focused and terminalOwnedShortcut(&event.key)) {
+            if (state.terminal_controller.focused and terminalOwnedShortcut(&event.key)) {
                 const terminal_key_handled = state.handleTerminalKeyDown(keyboard, &event.key);
                 state.noteTerminalKeyRouting(&event.key, terminal_key_handled);
                 if (terminal_key_handled) {
@@ -1389,8 +1389,8 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 // Browser URL bar, modal text inputs, and the model picker's
                 // search field handle their own paste further down the chain.
                 // Don't intercept here when one of them owns focus.
-                if (!state.browser_address_focused and state.palette_modal_text_focus == .none and
-                    !state.palette_model_picker.isOpen())
+                if (!state.browser_controller.address_focused and state.palette_modal_text_focus == .none and
+                    !state.composer_controller.model_picker.isOpen())
                 {
                     if (state.attachClipboardImageToCurrentDraft()) return true;
                     if (state.pasteClipboardTextIntoPaletteComposer()) return true;
@@ -1424,7 +1424,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (!state.palette_composer.focused and keyboard.workspaceFocusPromptForEvent(&event.key)) {
+            if (!state.composer_controller.composer.focused and keyboard.workspaceFocusPromptForEvent(&event.key)) {
                 if (state.focusPromptForFocusedChatWorkspacePane()) {
                     syncWindowTextInput(window, state);
                     return true;
@@ -1450,7 +1450,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
             const native_browser_focused = state.isNativeBrowserSurfaceFocused();
             if (native_browser_focused) {
-                state.browser_address_focused = false;
+                state.browser_controller.address_focused = false;
             }
             if (handleBrowserInspectorEscape(state, &event.key)) {
                 syncWindowTextInput(window, state);
@@ -1473,7 +1473,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (handleBrowserClipboardShortcut(state, &event.key)) {
                 return true;
             }
-            if (native_browser_focused and !state.palette_composer.focused) {
+            if (native_browser_focused and !state.composer_controller.composer.focused) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -1539,7 +1539,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 );
             }
             if (state.isNativeBrowserSurfaceFocused()) {
-                state.browser_address_focused = false;
+                state.browser_controller.address_focused = false;
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -1564,7 +1564,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
             const native_browser_focused = state.isNativeBrowserSurfaceFocused();
             if (native_browser_focused) {
-                state.browser_address_focused = false;
+                state.browser_controller.address_focused = false;
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -1860,12 +1860,12 @@ fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
         }
         return;
     }
-    const needs_sdl_text_input = state.terminal_focused or
-        state.palette_composer.focused or
+    const needs_sdl_text_input = state.terminal_controller.focused or
+        state.composer_controller.composer.focused or
         // The model picker's embedded search field consumes typed characters
         // while the popover is open.
-        state.palette_model_picker.isOpen() or
-        state.browser_address_focused or
+        state.composer_controller.model_picker.isOpen() or
+        state.browser_controller.address_focused or
         state.palette_modal_text_focus != .none or
         (state.isBrowserPaneFocused() and !macosNativeBrowserShouldOwnKeyboard(state));
     if (!needs_sdl_text_input) {
@@ -1897,7 +1897,7 @@ fn handleBrowserInspectorEscape(state: *AppState, event: *const sdl.KeyboardEven
     if (!state.isBrowserPaneFocused() or !state.isBrowserInspectorEnabled()) return false;
     if (!event.down or event.repeat) return false;
     if (event.key != .escape and event.scancode != .escape) return false;
-    state.browser_inspector_menu_open = false;
+    state.browser_controller.inspector_menu_open = false;
     state.disableBrowserInspector(false);
     return true;
 }
@@ -2017,8 +2017,8 @@ fn keymodBits(modifier_state: sdl.Keymod) u16 {
 }
 
 fn shouldPasteClipboardImage(state: *const AppState, event: *const sdl.KeyboardEvent) bool {
-    if (state.isBrowserPaneFocused() or state.browser_address_focused or state.palette_modal_text_focus != .none) return false;
-    if (state.terminal_focused) return false;
+    if (state.isBrowserPaneFocused() or state.browser_controller.address_focused or state.palette_modal_text_focus != .none) return false;
+    if (state.terminal_controller.focused) return false;
     if (!event.down or event.repeat) return false;
     if (event.scancode != .v and event.key != .v) return false;
     return isPrimaryModifierPressed(event.mod);
@@ -2056,17 +2056,17 @@ fn logPasteShortcutEvent(state: *const AppState, event: *const sdl.KeyboardEvent
             event.repeat,
             mod_bits,
             matched,
-            state.composer_focused,
-            state.palette_composer.focused,
+            state.composer_controller.focused,
+            state.composer_controller.composer.focused,
             state.isBrowserPaneFocused(),
-            state.browser_address_focused,
+            state.browser_controller.address_focused,
             @tagName(state.palette_modal_text_focus),
         },
     );
 }
 
 fn handleFileSearchNavigation(state: *AppState, event: *const sdl.KeyboardEvent) bool {
-    if (!state.composer_focused) return false;
+    if (!state.composer_controller.focused) return false;
     if (!state.hasActiveFileSearch()) return false;
     if (!event.down or event.repeat) return false;
 
@@ -2080,7 +2080,7 @@ fn handleFileSearchNavigation(state: *AppState, event: *const sdl.KeyboardEvent)
 }
 
 fn handleFileSearchAccept(state: *AppState, event: *const sdl.KeyboardEvent) bool {
-    if (!state.composer_focused) return false;
+    if (!state.composer_controller.focused) return false;
     if (!state.hasActiveFileSearch()) return false;
     if (!event.down or event.repeat) return false;
     if (isKeymodPressed(event.mod, sdl.Keymod.ctrl) or
@@ -2097,7 +2097,7 @@ fn handleFileSearchAccept(state: *AppState, event: *const sdl.KeyboardEvent) boo
 }
 
 fn handlePendingThreadFollowupShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
-    if (!state.composer_focused) return false;
+    if (!state.composer_controller.focused) return false;
     if (!state.hasPendingStream()) return false;
     if (!event.down or event.repeat) return false;
     if (event.scancode != .tab) return false;
@@ -2134,7 +2134,7 @@ fn handleGuiChatShortcut(
     event: *const sdl.KeyboardEvent,
 ) bool {
     const action = keyboard.chatActionForEvent(event) orelse return false;
-    if (state.terminal_focused or state.isBrowserPaneFocused() or state.browser_address_focused) return false;
+    if (state.terminal_controller.focused or state.isBrowserPaneFocused() or state.browser_controller.address_focused) return false;
     if (state.focusedWorkspacePaneKind() != .chat and state.focusedWorkspaceChatPaneId() == null) return false;
     switch (action) {
         .model_picker => state.togglePaletteModelPickerFromShortcut(),
@@ -2144,7 +2144,7 @@ fn handleGuiChatShortcut(
 }
 
 fn handleComposerFocusShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
-    if (state.composer_focused) return false;
+    if (state.composer_controller.focused) return false;
     if (!state.isTranscriptFocused()) return false;
     if (!event.down or event.repeat) return false;
     if (event.scancode != .tab) return false;
@@ -2161,10 +2161,10 @@ fn handleComposerFocusShortcut(state: *AppState, event: *const sdl.KeyboardEvent
 }
 
 fn handleComposerBlurShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
-    if (!state.composer_focused) return false;
+    if (!state.composer_controller.focused) return false;
     if (state.focusedWorkspaceChatPaneId() == null) return false;
-    if (state.terminal_focused) return false;
-    if (state.isBrowserPaneFocused() or state.browser_address_focused) return false;
+    if (state.terminal_controller.focused) return false;
+    if (state.isBrowserPaneFocused() or state.browser_controller.address_focused) return false;
     if (state.palette_modal_text_focus != .none) return false;
     if (!event.down or event.repeat) return false;
     if (event.scancode != .escape and event.key != .escape) return false;
@@ -2186,12 +2186,12 @@ fn handleTranscriptMarkdownSelectAllShortcut(state: *AppState, event: *const sdl
     const key_is_a = event.key == .a or event.scancode == .a;
     if (!key_is_a) return false;
     if (!isPrimaryModifierPressed(event.mod)) return false;
-    if (state.composer_focused) return false;
-    if (state.terminal_focused) return false;
+    if (state.composer_controller.focused) return false;
+    if (state.terminal_controller.focused) return false;
     if (state.isBrowserPaneFocused()) return false;
-    const over_transcript = state.palette_mouse_in_workspace and
-        chat_panel_ui.pointerOverTranscript(state.palette_mouse_x, state.palette_mouse_y);
-    if (!state.transcript_focused and !state.transcriptMarkdownSelectionActive() and !over_transcript) {
+    const over_transcript = state.transcript_controller.palette_mouse_in_workspace and
+        chat_panel_ui.pointerOverTranscript(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+    if (!state.transcript_controller.focused and !state.transcriptMarkdownSelectionActive() and !over_transcript) {
         return false;
     }
     if (!chat_panel_ui.selectAllTranscriptMarkdownInThread(state)) return false;
@@ -2203,8 +2203,8 @@ fn handleTranscriptMarkdownCopyShortcut(state: *AppState, event: *const sdl.Keyb
     if (!event.down or event.repeat) return false;
     if (event.key != .c) return false;
     if (!isPrimaryModifierPressed(event.mod)) return false;
-    if (state.composer_focused) return false;
-    if (state.terminal_focused) return false;
+    if (state.composer_controller.focused) return false;
+    if (state.terminal_controller.focused) return false;
     if (state.isBrowserPaneFocused()) return false;
     if (!state.transcriptMarkdownSelectionActive()) return false;
 
@@ -2272,7 +2272,7 @@ fn handleKeyboardAction(
         .workspace_toggle_maximize => _ = state.toggleFocusedWorkspacePaneMaximized(),
         .workspace_toggle_quick_pane => _ = state.toggleCurrentProjectQuickPane(),
         .workspace_close => _ = state.closeFocusedWorkspacePane(),
-        .workspace_close_current => if (state.selected_project_index < state.projects.items.len) state.closeProjectAtIndex(state.selected_project_index),
+        .workspace_close_current => if (state.project_controller.selected_index < state.project_controller.projects.items.len) state.closeProjectAtIndex(state.project_controller.selected_index),
         .workspace_focus_left => _ = workspace_panes_ui.focusPaneInDirection(state, .left),
         .workspace_focus_right => _ = workspace_panes_ui.focusPaneInDirection(state, .right),
         .workspace_focus_up => _ = workspace_panes_ui.focusPaneInDirection(state, .up),
@@ -2353,7 +2353,7 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
         }
     }
     if (builtin.os.tag == .macos) {
-        _ = state.browser_state.controller.hide() catch {};
+        _ = state.browser_controller.runtime.controller.hide() catch {};
         verde_macos_host_window_order_out(nativeBrowserHostWindow(window));
         _ = SDL_HideWindow(window);
     }
@@ -2372,8 +2372,8 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
                 window_flags.hidden,
                 window_flags.minimized,
                 window_flags.occluded,
-                state.selected_project_index,
-                if (state.projects.items.len > state.selected_project_index) state.currentProject().workspace_layout.focused_pane_id else null,
+                state.project_controller.selected_index,
+                if (state.project_controller.projects.items.len > state.project_controller.selected_index) state.currentProject().workspace_layout.focused_pane_id else null,
             },
         );
         if (state.shouldSuppressExternalOpenCloseRequest(now_ms)) {
@@ -2415,7 +2415,7 @@ fn macosHostWindowRequestedClose(window: *sdl.Window, state: *AppState) bool {
     if (builtin.os.tag != .macos) return false;
     const host_window = nativeBrowserHostWindow(window);
     if (!verde_macos_host_window_should_close(host_window)) return false;
-    _ = state.browser_state.controller.hide() catch {};
+    _ = state.browser_controller.runtime.controller.hide() catch {};
     verde_macos_host_window_order_out(host_window);
     _ = SDL_HideWindow(window);
     runtime_log.diagnostic("shutdown requested by macOS close button monitor", .{});
@@ -2471,8 +2471,8 @@ fn macosNativeBrowserShouldOwnKeyboard(state: *AppState) bool {
     if (builtin.os.tag != .macos) return false;
     if (!state.isBrowserVisible() or !state.isBrowserPaneFocused()) return false;
     if (!state.browserPaneUsesNativeKeyboardSurface()) return false;
-    if (state.palette_composer.focused or state.composer_focused) return false;
-    if (state.browser_address_focused or state.palette_modal_text_focus != .none) return false;
+    if (state.composer_controller.composer.focused or state.composer_controller.focused) return false;
+    if (state.browser_controller.address_focused or state.palette_modal_text_focus != .none) return false;
     return true;
 }
 
@@ -2486,7 +2486,7 @@ fn macosBrowserClickWillFocusNativeSurface(state: *const AppState, x: f32, y: f3
 
 fn handleFontSizeShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
     if (!event.down or event.repeat) return false;
-    if (state.terminal_focused) return false;
+    if (state.terminal_controller.focused) return false;
     if (!isPrimaryModifierPressed(event.mod)) return false;
     const delta: f32 = switch (event.key) {
         .plus, .kp_plus, .equals => 1.0,
@@ -2511,10 +2511,10 @@ fn handleFontSizeShortcut(state: *AppState, event: *const sdl.KeyboardEvent) boo
 }
 
 fn canHandleTranscriptScrollAction(state: *const AppState) bool {
-    if (state.projects.items.len == 0) return false;
+    if (state.project_controller.projects.items.len == 0) return false;
     if (state.isBrowserPaneFocused()) return false;
-    if (state.terminal_focused) return false;
-    return !state.composer_focused and state.palette_modal_text_focus == .none;
+    if (state.terminal_controller.focused) return false;
+    return !state.composer_controller.focused and state.palette_modal_text_focus == .none;
 }
 
 fn applyAppConfigRuntime(state: *AppState) void {
@@ -2539,7 +2539,7 @@ fn applyAppConfigRuntime(state: *AppState) void {
     };
     // An armed browser inspector carries theme colors into the page; re-arm
     // so its overlay picks up the refreshed palette.
-    if (state.browser_state.inspectorEnabled() and state.canUseBrowserInspector() and state.isBrowserVisible()) {
+    if (state.browser_controller.runtime.inspectorEnabled() and state.canUseBrowserInspector() and state.isBrowserVisible()) {
         state.enableBrowserInspector(false);
     }
     state.markDirty();
