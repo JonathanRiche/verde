@@ -1,7 +1,7 @@
 //! Content-safe diagnostics shared by provider integrations.
 
 const std = @import("std");
-const runtime_log = @import("../runtime_log.zig");
+const runtime_log = @import("../runtime/log.zig");
 
 /// Stable provider failure categories suitable for persisted diagnostics.
 pub const ErrorCategory = enum {

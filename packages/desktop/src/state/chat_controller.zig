@@ -1,13 +1,13 @@
 //! Cross-thread send accounting and approval state transitions.
 
 const std = @import("std");
-const ai_harness = @import("../harness.zig");
-const app_config = @import("../config.zig");
-const bang_commands = @import("../bang_commands.zig");
+const ai_harness = @import("../providers/harness.zig");
+const app_config = @import("../app/config.zig");
+const bang_commands = @import("../workspace/bang_commands.zig");
 const chat_threads = @import("../chat/threads.zig");
 const db_client = @import("../db/client.zig");
-const notifier = @import("../notifier.zig");
-const runtime_log = @import("../runtime_log.zig");
+const notifier = @import("../app/notifier.zig");
+const runtime_log = @import("../runtime/log.zig");
 const sessionizer = @import("../terminal/sessionizer.zig");
 const send_runner = @import("../chat/send_runner.zig");
 const loop_wakeup = @import("loop_wakeup");

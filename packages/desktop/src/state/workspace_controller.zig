@@ -2,9 +2,9 @@
 
 const std = @import("std");
 const project_state = @import("project.zig");
-const ai_harness = @import("../harness.zig");
+const ai_harness = @import("../providers/harness.zig");
 const chat_threads = @import("../chat/threads.zig");
-const runtime_log = @import("../runtime_log.zig");
+const runtime_log = @import("../runtime/log.zig");
 const terminal = @import("../terminal/terminal.zig");
 const chat_types = @import("chat_types.zig");
 const provider_models = @import("provider_models.zig");

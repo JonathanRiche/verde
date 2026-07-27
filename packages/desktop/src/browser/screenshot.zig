@@ -210,7 +210,7 @@ test "encodeFrameCropPng round-trips through the stb decoder" {
 
     try std.testing.expect(std.mem.eql(u8, png[0..8], &PNG_SIGNATURE));
 
-    const stb = @import("../stb_image.zig");
+    const stb = @import("../media/stb_image.zig");
     const decoded = try stb.loadFromMemory(png);
     defer decoded.deinit();
     try std.testing.expectEqual(@as(c_int, 2), decoded.width);

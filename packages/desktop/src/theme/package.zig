@@ -2,8 +2,8 @@
 
 const std = @import("std");
 
-const app_config = @import("config.zig");
-const theme = @import("ui/theme.zig");
+const app_config = @import("../app/config.zig");
+const theme = @import("../ui/theme.zig");
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_THEME_BYTES: usize = 256 * 1024;

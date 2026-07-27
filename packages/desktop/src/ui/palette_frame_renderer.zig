@@ -5,7 +5,7 @@ const sdl = @import("zsdl3");
 
 const app_state = @import("../state.zig");
 const browser_texture = @import("../browser/texture.zig");
-const stb_image = @import("../stb_image.zig");
+const stb_image = @import("../media/stb_image.zig");
 const text_measure = @import("text_measure.zig");
 const theme = @import("theme.zig");
 

@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const output = @import("cli_output.zig");
-const spec = @import("cli_spec.zig");
+const output = @import("output.zig");
+const spec = @import("spec.zig");
 
 pub fn print(allocator: std.mem.Allocator, out: output.Output, shell: []const u8) !bool {
     var writer: std.Io.Writer.Allocating = .init(allocator);

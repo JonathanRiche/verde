@@ -4,10 +4,10 @@ const std = @import("std");
 const provider_diagnostics = @import("diagnostics.zig");
 const platform_process = @import("../platform/process.zig");
 const platform_runtime = @import("platform_runtime");
-const provider_mcp = @import("../provider_mcp.zig");
-const process_env = @import("../process_env.zig");
-const provider_types = @import("../provider_types.zig");
-const runtime_log = @import("../runtime_log.zig");
+const provider_mcp = @import("mcp.zig");
+const process_env = @import("../platform/env.zig");
+const provider_types = @import("types.zig");
+const runtime_log = @import("../runtime/log.zig");
 
 const DEFAULT_EXECUTABLE = "agent";
 const FALLBACK_EXECUTABLE = "cursor-agent";

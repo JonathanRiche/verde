@@ -6,11 +6,11 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const harness = @import("../harness.zig");
+const harness = @import("../providers/harness.zig");
 const platform_ipc = @import("../platform/ipc.zig");
 const platform_live_endpoint = @import("../platform/live_endpoint.zig");
 const platform_runtime = @import("platform_runtime");
-const process_env = @import("../process_env.zig");
+const process_env = @import("../platform/env.zig");
 const send_runner = @import("../chat/send_runner.zig");
 const windows_conpty = @import("platform/windows_conpty.zig");
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

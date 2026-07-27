@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const platform_paths = @import("platform_paths");
-const theme = @import("./ui/theme.zig");
+const theme = @import("../ui/theme.zig");
 
 const log = std.log.scoped(.native_config);
 pub const MIN_FONT_SIZE: f32 = 10.0;

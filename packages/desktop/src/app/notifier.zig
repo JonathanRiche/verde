@@ -14,7 +14,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const platform_paths = @import("platform_paths");
-const process_env = @import("process_env.zig");
+const process_env = @import("../platform/env.zig");
 
 const log = std.log.scoped(.native_notifier);
 

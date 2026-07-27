@@ -11,7 +11,7 @@ const runtime = @import("runtime.zig");
 const debug_window = @import("debug.zig");
 const settings_modal = @import("settings_modal.zig");
 const command_palette = @import("command_palette.zig");
-const profiler = @import("../profiler.zig");
+const profiler = @import("../runtime/profiler.zig");
 
 const RootLayout = struct {
     sidebar: palette.Rect,

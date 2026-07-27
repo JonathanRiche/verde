@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const process_env = @import("../../process_env.zig");
+const process_env = @import("../../platform/env.zig");
 
 const windows = std.os.windows;
 const log = std.log.scoped(.windows_conpty);

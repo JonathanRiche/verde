@@ -1,10 +1,10 @@
 //! Command-palette query, selection, scope, and action-menu state.
 
 const std = @import("std");
-const keybinds = @import("../keybinds.zig");
-const ai_harness = @import("../harness.zig");
+const keybinds = @import("../app/keybinds.zig");
+const ai_harness = @import("../providers/harness.zig");
 const loop_wakeup = @import("loop_wakeup");
-const runtime_log = @import("../runtime_log.zig");
+const runtime_log = @import("../runtime/log.zig");
 const provider_models = @import("provider_models.zig");
 const state_sync = @import("sync.zig");
 

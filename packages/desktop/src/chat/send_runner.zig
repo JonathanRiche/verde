@@ -1,7 +1,7 @@
 //! UI-independent provider send runner used by daemon-owned chat turns.
 
 const std = @import("std");
-const harness = @import("../harness.zig");
+const harness = @import("../providers/harness.zig");
 
 const log = std.log.scoped(.chat_send_runner);
 
