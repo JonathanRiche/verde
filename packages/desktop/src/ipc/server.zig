@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const app_state = @import("../state.zig");
 const browser_runtime = @import("../browser/mod.zig");
@@ -9,6 +10,7 @@ const platform_ipc = @import("../platform/ipc.zig");
 const live_endpoint = @import("../platform/live_endpoint.zig");
 const platform_runtime = @import("platform_runtime");
 const provider_types = @import("../providers/types.zig");
+const terminal = @import("../terminal/terminal.zig");
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const SOCKET_NAME = live_endpoint.SOCKET_NAME;
@@ -399,11 +401,12 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
             "browser.overlay.sidebarMenuOpen",    "browser.overlay.sidebarMenuClose",    "browser.overlay.composerMenuOpen",    "browser.overlay.composerMenuClose",
             "browser.overlay.workspaceModalOpen", "browser.overlay.workspaceModalClose", "browser.overlay.threadModalOpen",     "browser.overlay.threadModalClose",
             "browser.overlay.imageModalOpen",     "browser.overlay.imageModalClose",     "browser.overlay.transcriptModalOpen", "browser.overlay.transcriptModalClose",
-            "palette.list",                       "palette.run",                         "terminal.write",                      "terminal.tail",
-            "terminal.screen",                    "process.list",                        "process.inspect",                     "process.start",
-            "process.stop",                       "process.restart",                     "process.logs",                        "agent.open",
-            "stack.status",                       "stack.start",                         "stack.stop",                          "stack.restart",
-            "workspace.processes",                "workspace.checkCommand",              "workspace.acquireLease",              "workspace.releaseLease",
+            "palette.list",                       "palette.run",                         "terminal.write",                      "terminal.key",
+            "terminal.tail",                      "terminal.screen",                     "process.list",                        "process.inspect",
+            "process.start",                      "process.stop",                        "process.restart",                     "process.logs",
+            "agent.open",                         "stack.status",                        "stack.start",                         "stack.stop",
+            "stack.restart",                      "workspace.processes",                 "workspace.checkCommand",              "workspace.acquireLease",
+            "workspace.releaseLease",
         },
         .events = &.{},
         .encodings = &.{"json"},
@@ -1408,6 +1411,29 @@ fn terminalCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Valu
         if (!try state.writeWorkspaceTerminalPaneForProject(target.project_index, target.pane_id, text)) return try errorResponseAlloc(allocator, id_value, "rejected", "terminal write did not apply");
         return try inspectPaneResponse(allocator, id_value, state, target.project_index, target.pane_id);
     }
+    if (std.mem.eql(u8, command, "key")) {
+        const chord = terminalKeyChordParam(params) catch |err| return switch (err) {
+            error.MissingKey => try errorResponseAlloc(allocator, id_value, "invalid_key", "terminal.key requires exactly one of key or chord"),
+            error.ConflictingKeySpec => try errorResponseAlloc(allocator, id_value, "invalid_key", "terminal.key accepts key plus modifiers or chord, not both"),
+            error.InvalidModifier => try errorResponseAlloc(allocator, id_value, "invalid_key", "terminal.key modifiers must be booleans"),
+            error.InvalidKey => try errorResponseAlloc(allocator, id_value, "invalid_key", "unsupported terminal key or chord"),
+        };
+        if (!try state.writeWorkspaceTerminalKeyForProject(target.project_index, target.pane_id, chord)) {
+            return try errorResponseAlloc(allocator, id_value, "rejected", "terminal key did not apply");
+        }
+        return try okValueResponse(allocator, id_value, .{
+            .accepted = true,
+            .workspace_index = target.project_index,
+            .pane_id = target.pane_id,
+            .key = chord.key.text(),
+            .modifiers = .{
+                .ctrl = chord.modifiers.ctrl,
+                .alt = chord.modifiers.alt,
+                .shift = chord.modifiers.shift,
+                .super = chord.modifiers.super,
+            },
+        });
+    }
     if (std.mem.eql(u8, command, "tail")) {
         const max_bytes = @as(usize, @intCast((intParam(params, "lines") orelse 200) * 240));
         const output = (try state.terminalPaneOutputTailForProject(target.project_index, target.pane_id, max_bytes)) orelse
@@ -1431,6 +1457,41 @@ fn terminalCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Valu
         });
     }
     return try errorResponseAlloc(allocator, id_value, "method_not_found", command);
+}
+
+const TerminalKeyParamError = error{
+    MissingKey,
+    ConflictingKeySpec,
+    InvalidModifier,
+    InvalidKey,
+};
+
+fn terminalKeyChordParam(params: std.json.Value) TerminalKeyParamError!terminal.TerminalKeyChord {
+    const chord_value = stringParam(params, "chord");
+    const key_value = stringParam(params, "key");
+    if ((paramIsNonNull(params, "chord") and chord_value == null) or
+        (paramIsNonNull(params, "key") and key_value == null))
+    {
+        return error.InvalidKey;
+    }
+
+    var modifiers: terminal.TerminalKeyModifiers = .{};
+    inline for (.{ "ctrl", "alt", "shift", "super" }) |name| {
+        if (paramIsNonNull(params, name)) {
+            const value = boolParam(params, name) orelse return error.InvalidModifier;
+            @field(modifiers, name) = value;
+        }
+    }
+
+    if (chord_value) |value| {
+        if (key_value != null or @as(u4, @bitCast(modifiers)) != 0) return error.ConflictingKeySpec;
+        return terminal.TerminalKeyChord.parse(value) catch return error.InvalidKey;
+    }
+    const key_text = key_value orelse return error.MissingKey;
+    return .{
+        .key = terminal.TerminalKey.parse(key_text) orelse return error.InvalidKey,
+        .modifiers = modifiers,
+    };
 }
 
 fn processCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
@@ -3273,4 +3334,142 @@ test "surface provider parser includes terminal-only providers" {
     try std.testing.expectEqual(app_state.SurfaceProvider.grok, parseSurfaceProvider("grok").?);
     try std.testing.expectEqual(app_state.SurfaceProvider.amp, parseSurfaceProvider("amp").?);
     try std.testing.expect(parseSurfaceProvider("other") == null);
+}
+
+test "terminal key command routes to a runnable target without changing focus" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var state: app_state.AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.terminal_controller.focused = false;
+    state.window_input_focus = true;
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+
+    var first = try app_state.Project.init(allocator, "first", "First", "/tmp/first", 0);
+    state.project_controller.projects.append(allocator, first) catch |err| {
+        first.deinit(allocator);
+        return err;
+    };
+    var second = try app_state.Project.init(allocator, "second", "Second", "/tmp/second", 0);
+    const terminal_pane_id = try second.workspace_layout.createTerminalPane(allocator, 7);
+    var target_dock = try terminal.Dock.init(allocator);
+    errdefer target_dock.deinit(allocator);
+    try target_dock.restartWithProfile(allocator, "/tmp", .{
+        .kind = .custom,
+        .label = "terminal-key-target",
+        .command = &.{"/bin/cat"},
+    });
+    target_dock.focus_requested = false;
+    try second.terminal_docks.append(allocator, .{ .id = 7, .dock = target_dock });
+    state.project_controller.projects.append(allocator, second) catch |err| {
+        second.deinit(allocator);
+        return err;
+    };
+
+    const selected_workspace_before = state.project_controller.selected_index;
+    const first_focus_before = state.project_controller.projects.items[0].workspace_layout.focused_pane_id;
+    const second_focus_before = state.project_controller.projects.items[1].workspace_layout.focused_pane_id;
+    const terminal_focus_before = state.terminal_controller.focused;
+    const window_focus_before = state.window_input_focus;
+    const terminal_params_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"workspace\":\"second\",\"pane\":{d},\"key\":\"x\"}}",
+        .{terminal_pane_id},
+    );
+    defer allocator.free(terminal_params_json);
+    var terminal_params = try std.json.parseFromSlice(std.json.Value, allocator, terminal_params_json, .{});
+    defer terminal_params.deinit();
+    const response = try terminalCommandResponse(allocator, .{ .integer = 1 }, &state, terminal_params.value, "key");
+    defer allocator.free(response);
+    var parsed_response = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed_response.deinit();
+    const result = parsed_response.value.object.get("result").?.object;
+    try std.testing.expect(boolParam(.{ .object = result }, "accepted").?);
+    try std.testing.expectEqual(@as(i64, 1), intParam(.{ .object = result }, "workspace_index").?);
+    try std.testing.expectEqual(@as(i64, @intCast(terminal_pane_id)), intParam(.{ .object = result }, "pane_id").?);
+
+    var routed_to_target = false;
+    for (0..40) |_| {
+        const dock = &state.project_controller.projects.items[1].terminalDockEntryById(7).?.dock;
+        _ = try dock.poll(allocator);
+        const output = (try dock.activeOutputTailAlloc(allocator, 256)) orelse {
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(25), .awake);
+            continue;
+        };
+        defer allocator.free(output);
+        if (std.mem.indexOfScalar(u8, output, 'x') != null) {
+            routed_to_target = true;
+            break;
+        }
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(25), .awake);
+    }
+    try std.testing.expect(routed_to_target);
+    try std.testing.expectEqual(selected_workspace_before, state.project_controller.selected_index);
+    try std.testing.expectEqual(first_focus_before, state.project_controller.projects.items[0].workspace_layout.focused_pane_id);
+    try std.testing.expectEqual(second_focus_before, state.project_controller.projects.items[1].workspace_layout.focused_pane_id);
+    try std.testing.expectEqual(terminal_focus_before, state.terminal_controller.focused);
+    try std.testing.expectEqual(window_focus_before, state.window_input_focus);
+    try std.testing.expect(!state.project_controller.projects.items[1].terminalDockEntryById(7).?.dock.focus_requested);
+}
+
+test "terminal key command rejects non-terminal targets and invalid keys" {
+    const allocator = std.testing.allocator;
+    var state: app_state.AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+
+    var first = try app_state.Project.init(allocator, "first", "First", "/tmp/first", 0);
+    state.project_controller.projects.append(allocator, first) catch |err| {
+        first.deinit(allocator);
+        return err;
+    };
+    var second = try app_state.Project.init(allocator, "second", "Second", "/tmp/second", 0);
+    const terminal_pane_id = try second.workspace_layout.createTerminalPane(allocator, 7);
+    state.project_controller.projects.append(allocator, second) catch |err| {
+        second.deinit(allocator);
+        return err;
+    };
+
+    const chat_pane_id = state.project_controller.projects.items[0].workspace_layout.focused_pane_id orelse
+        return error.MissingChatTarget;
+    const chat_params_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"workspace\":\"first\",\"pane\":{d},\"key\":\"enter\"}}",
+        .{chat_pane_id},
+    );
+    defer allocator.free(chat_params_json);
+    var chat_params = try std.json.parseFromSlice(std.json.Value, allocator, chat_params_json, .{});
+    defer chat_params.deinit();
+    const non_terminal_response = try terminalCommandResponse(allocator, .{ .integer = 2 }, &state, chat_params.value, "key");
+    defer allocator.free(non_terminal_response);
+    var parsed_non_terminal = try std.json.parseFromSlice(std.json.Value, allocator, non_terminal_response, .{});
+    defer parsed_non_terminal.deinit();
+    const non_terminal_error = parsed_non_terminal.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings("invalid_target", jsonString(non_terminal_error.get("code").?).?);
+
+    const invalid_params_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"workspace\":\"second\",\"pane\":{d},\"chord\":\"ctrl+raw-sequence\"}}",
+        .{terminal_pane_id},
+    );
+    defer allocator.free(invalid_params_json);
+    var invalid_params = try std.json.parseFromSlice(std.json.Value, allocator, invalid_params_json, .{});
+    defer invalid_params.deinit();
+    const invalid_key_response = try terminalCommandResponse(allocator, .{ .integer = 3 }, &state, invalid_params.value, "key");
+    defer allocator.free(invalid_key_response);
+    var parsed_invalid_key = try std.json.parseFromSlice(std.json.Value, allocator, invalid_key_response, .{});
+    defer parsed_invalid_key.deinit();
+    const invalid_key_error = parsed_invalid_key.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings("invalid_key", jsonString(invalid_key_error.get("code").?).?);
 }

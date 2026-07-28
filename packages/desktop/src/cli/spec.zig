@@ -188,6 +188,7 @@ pub const live_capabilities = [_][]const u8{
     "palette.list",
     "palette.run",
     "terminal.write",
+    "terminal.key",
     "terminal.tail",
     "terminal.screen",
     "process.list",
@@ -280,7 +281,7 @@ pub const browser_commands = [_][]const u8{
     "transcript-modal-close",
 };
 
-pub const terminal_commands = [_][]const u8{ "write", "tail", "screen" };
+pub const terminal_commands = [_][]const u8{ "write", "key", "submit", "tail", "screen" };
 pub const palette_commands = [_][]const u8{ "list", "run" };
 pub const process_commands = [_][]const u8{ "list", "inspect", "start", "stop", "restart", "logs" };
 pub const agent_commands = [_][]const u8{"open"};
@@ -307,6 +308,8 @@ pub const all_flags = [_][]const u8{
     "--path",
     "--url",
     "--text",
+    "--key",
+    "--chord",
     "--target",
     "--title",
     "--body",
@@ -390,6 +393,7 @@ pub const chat_draft_flags = [_][]const u8{ "--workspace", "--pane", "--focused"
 pub const chat_send_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--prompt", "--text", "--json" };
 pub const chat_approve_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--call", "--decision", "--json" };
 pub const terminal_write_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--text", "--json" };
+pub const terminal_key_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--key", "--chord", "--ctrl", "--alt", "--shift", "--super", "--json" };
 pub const browser_eval_flags = [_][]const u8{ "--script", "--json" };
 pub const browser_pointer_flags = [_][]const u8{ "--x", "--y", "--button", "--ctrl", "--shift", "--alt", "--super", "--json" };
 pub const browser_open_flags = [_][]const u8{ "--url", "--workspace", "--project", "--json" };
@@ -410,6 +414,70 @@ pub const decision_values = [_][]const u8{ "approve", "deny" };
 pub const provider_values = [_][]const u8{ "opencode", "codex", "claude", "cursor" };
 pub const reasoning_values = [_][]const u8{ "low", "medium", "high", "xhigh", "max" };
 pub const inspector_mode_values = [_][]const u8{ "point", "draw-box", "draw-freeform" };
+pub const terminal_key_values = [_][]const u8{
+    "enter",
+    "escape",
+    "tab",
+    "up",
+    "down",
+    "left",
+    "right",
+    "home",
+    "end",
+    "pageup",
+    "pagedown",
+    "backspace",
+    "delete",
+    "space",
+    "f1",
+    "f2",
+    "f3",
+    "f4",
+    "f5",
+    "f6",
+    "f7",
+    "f8",
+    "f9",
+    "f10",
+    "f11",
+    "f12",
+    "a",
+    "b",
+    "c",
+    "d",
+    "e",
+    "f",
+    "g",
+    "h",
+    "i",
+    "j",
+    "k",
+    "l",
+    "m",
+    "n",
+    "o",
+    "p",
+    "q",
+    "r",
+    "s",
+    "t",
+    "u",
+    "v",
+    "w",
+    "x",
+    "y",
+    "z",
+    "0",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+};
 
 pub fn shellSupported(name: []const u8) bool {
     for (shells) |shell| {

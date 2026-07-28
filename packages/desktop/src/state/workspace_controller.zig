@@ -714,6 +714,32 @@ pub fn writeWorkspaceTerminalPane(self: anytype, pane_id: WorkspacePaneId, bytes
     return self.writeWorkspaceTerminalPaneForProject(self.project_controller.selected_index, pane_id, bytes);
 }
 
+/// Sends one atomic key chord directly to a workspace terminal pane without
+/// changing desktop or workspace focus.
+pub fn writeWorkspaceTerminalKeyForProject(
+    self: anytype,
+    project_index: usize,
+    pane_id: WorkspacePaneId,
+    chord: terminal.TerminalKeyChord,
+) !bool {
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    var project = &self.project_controller.projects.items[project_index];
+    const pane = project.workspace_layout.paneById(pane_id) orelse return false;
+    const dock_id = switch (pane.ref) {
+        .terminal => |ref| ref.dock_id,
+        else => return false,
+    };
+    const workspace_pane_visible = project.workspace_layout.hasTerminalDockPane(dock_id);
+    var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
+    const wrote = try dock.writeKeyToActivePane(chord);
+    if (wrote and project_index == self.project_controller.selected_index and
+        (dock.visible or workspace_pane_visible))
+    {
+        self.noteTerminalInputActivity();
+    }
+    return wrote;
+}
+
 /// Pastes text into a terminal pane's running session (bracketed paste),
 /// so agent TUIs receive it as filled-in input rather than executed lines.
 /// Unlike the write path this never restarts a dead session: pasting a
