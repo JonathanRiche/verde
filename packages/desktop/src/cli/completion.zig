@@ -87,6 +87,7 @@ fn writePowerShell(w: *std.Io.Writer) !void {
     try writePowerShellRoute(w, "--provider", &spec.provider_values);
     try writePowerShellRoute(w, "--reasoning", &spec.reasoning_values);
     try writePowerShellRoute(w, "--mode", &spec.inspector_mode_values);
+    try writePowerShellRoute(w, "--key", &spec.terminal_key_values);
     try w.writeAll(
         \\  }
         \\  $elements = @($commandAst.CommandElements | ForEach-Object { $_.Extent.Text })
@@ -236,6 +237,8 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.palette_run_flags);
     try w.writeAll("\"\n  local terminal_write_flags=\"");
     try writeWords(w, &spec.terminal_write_flags);
+    try w.writeAll("\"\n  local terminal_key_flags=\"");
+    try writeWords(w, &spec.terminal_key_flags);
     try w.writeAll("\"\n  local terminal_tail_flags=\"");
     try writeWords(w, &spec.terminal_tail_flags);
     try w.writeAll("\"\n  local process_flags=\"");
@@ -256,6 +259,8 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.reasoning_values);
     try w.writeAll("\"\n  local inspector_mode_values=\"");
     try writeWords(w, &spec.inspector_mode_values);
+    try w.writeAll("\"\n  local terminal_key_values=\"");
+    try writeWords(w, &spec.terminal_key_values);
     try w.writeAll(
         \\"
         \\
@@ -267,7 +272,8 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    --provider) COMPREPLY=( $(compgen -W "$provider_values" -- "$cur") ); return 0 ;;
         \\    --reasoning) COMPREPLY=( $(compgen -W "$reasoning_values" -- "$cur") ); return 0 ;;
         \\    --mode) COMPREPLY=( $(compgen -W "$inspector_mode_values" -- "$cur") ); return 0 ;;
-        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--target|--script|--json-payload|--prompt|--call|--name|--model|--reasoning-variant|--lines|--command|--label|--profile|--remote|--cwd|--remote-cwd|--local-dir) return 0 ;;
+        \\    --key) COMPREPLY=( $(compgen -W "$terminal_key_values" -- "$cur") ); return 0 ;;
+        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--key|--chord|--target|--script|--json-payload|--prompt|--call|--name|--model|--reasoning-variant|--lines|--command|--label|--profile|--remote|--cwd|--remote-cwd|--local-dir) return 0 ;;
         \\  esac
         \\
         \\  if [[ "$cur" == -* ]]; then
@@ -377,6 +383,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\          terminal)
         \\            case "$third" in
         \\              write) COMPREPLY=( $(compgen -W "$terminal_write_flags" -- "$cur") ) ;;
+        \\              key) COMPREPLY=( $(compgen -W "$terminal_key_flags" -- "$cur") ) ;;
         \\              tail) COMPREPLY=( $(compgen -W "$terminal_tail_flags" -- "$cur") ) ;;
         \\              *) COMPREPLY=( $(compgen -W "$pane_flags" -- "$cur") ) ;;
         \\            esac
@@ -534,6 +541,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.palette_run_flags);
     try w.writeAll("\"\n  local terminal_write_flags=\"");
     try writeWords(w, &spec.terminal_write_flags);
+    try w.writeAll("\"\n  local terminal_key_flags=\"");
+    try writeWords(w, &spec.terminal_key_flags);
     try w.writeAll("\"\n  local terminal_tail_flags=\"");
     try writeWords(w, &spec.terminal_tail_flags);
     try w.writeAll("\"\n  local process_flags=\"");
@@ -554,6 +563,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.reasoning_values);
     try w.writeAll("\"\n  local inspector_mode_values=\"");
     try writeWords(w, &spec.inspector_mode_values);
+    try w.writeAll("\"\n  local terminal_key_values=\"");
+    try writeWords(w, &spec.terminal_key_values);
     try w.writeAll(
         \\"
         \\
@@ -565,7 +576,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    --provider) compadd -- ${(s: :)provider_values}; return ;;
         \\    --reasoning) compadd -- ${(s: :)reasoning_values}; return ;;
         \\    --mode) compadd -- ${(s: :)inspector_mode_values}; return ;;
-        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--target|--script|--json-payload|--prompt|--call|--name|--model|--reasoning-variant|--lines|--command|--label|--profile|--remote|--cwd|--remote-cwd|--local-dir) return ;;
+        \\    --key) compadd -- ${(s: :)terminal_key_values}; return ;;
+        \\    --workspace|--herdr-workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--key|--chord|--target|--script|--json-payload|--prompt|--call|--name|--model|--reasoning-variant|--lines|--command|--label|--profile|--remote|--cwd|--remote-cwd|--local-dir) return ;;
         \\  esac
         \\
         \\  if [[ "$cur" == -* ]]; then
@@ -675,6 +687,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\          terminal)
         \\            case "$third" in
         \\              write) compadd -- ${(s: :)terminal_write_flags} ;;
+        \\              key) compadd -- ${(s: :)terminal_key_flags} ;;
         \\              tail) compadd -- ${(s: :)terminal_tail_flags} ;;
         \\              *) compadd -- ${(s: :)pane_flags} ;;
         \\            esac
@@ -806,6 +819,12 @@ fn writeFish(w: *std.Io.Writer) !void {
         \\complete -c verde -l path -r -d 'Workspace path'
         \\complete -c verde -l url -r -d 'Browser URL'
         \\complete -c verde -l text -r -d 'Text argument'
+        \\complete -c verde -l key -r -d 'Validated terminal key'
+        \\complete -c verde -l chord -r -d 'Validated atomic terminal chord'
+        \\complete -c verde -l ctrl -d 'Hold Control'
+        \\complete -c verde -l alt -d 'Hold Alt or Option'
+        \\complete -c verde -l shift -d 'Hold Shift'
+        \\complete -c verde -l super -d 'Hold Super or Command'
         \\complete -c verde -l target -r -d 'Browser toolbar target'
         \\complete -c verde -l prompt -r -d 'Prompt text'
         \\complete -c verde -l call -r -d 'Approval call id'
@@ -833,5 +852,7 @@ fn writeFish(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.reasoning_values);
     try w.writeAll("'\ncomplete -c verde -n '__verde_prev_is --mode' -a '");
     try writeWords(w, &spec.inspector_mode_values);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_prev_is --key' -a '");
+    try writeWords(w, &spec.terminal_key_values);
     try w.writeAll("'\n");
 }

@@ -16,6 +16,135 @@ pub const DEFAULT_DOCK_HEIGHT: f32 = 136.0;
 pub const MIN_DOCK_HEIGHT: f32 = 96.0;
 pub const MAX_DOCK_HEIGHT: f32 = 900.0;
 
+pub const TerminalKey = enum {
+    enter,
+    escape,
+    tab,
+    up,
+    down,
+    left,
+    right,
+    home,
+    end,
+    pageup,
+    pagedown,
+    backspace,
+    delete,
+    space,
+    f1,
+    f2,
+    f3,
+    f4,
+    f5,
+    f6,
+    f7,
+    f8,
+    f9,
+    f10,
+    f11,
+    f12,
+    a,
+    b,
+    c,
+    d,
+    e,
+    f,
+    g,
+    h,
+    i,
+    j,
+    k,
+    l,
+    m,
+    n,
+    o,
+    p,
+    q,
+    r,
+    s,
+    t,
+    u,
+    v,
+    w,
+    x,
+    y,
+    z,
+    @"0",
+    @"1",
+    @"2",
+    @"3",
+    @"4",
+    @"5",
+    @"6",
+    @"7",
+    @"8",
+    @"9",
+
+    pub fn parse(value: []const u8) ?TerminalKey {
+        inline for (std.meta.fields(TerminalKey)) |field| {
+            if (std.ascii.eqlIgnoreCase(value, field.name)) return @enumFromInt(field.value);
+        }
+        return null;
+    }
+
+    pub fn text(self: TerminalKey) []const u8 {
+        return @tagName(self);
+    }
+};
+
+pub const TerminalKeyModifiers = packed struct(u4) {
+    ctrl: bool = false,
+    alt: bool = false,
+    shift: bool = false,
+    super: bool = false,
+};
+
+pub const TerminalKeyChord = struct {
+    key: TerminalKey,
+    modifiers: TerminalKeyModifiers = .{},
+
+    pub const ParseError = error{
+        EmptyChord,
+        EmptyComponent,
+        DuplicateModifier,
+        MultipleKeys,
+        MissingKey,
+        UnsupportedKey,
+    };
+
+    pub fn parse(value: []const u8) ParseError!TerminalKeyChord {
+        if (value.len == 0) return error.EmptyChord;
+        var result: TerminalKeyChord = undefined;
+        result.modifiers = .{};
+        var parsed_key: ?TerminalKey = null;
+        var parts = std.mem.splitScalar(u8, value, '+');
+        while (parts.next()) |part| {
+            if (part.len == 0) return error.EmptyComponent;
+            if (std.ascii.eqlIgnoreCase(part, "ctrl") or std.ascii.eqlIgnoreCase(part, "control")) {
+                if (result.modifiers.ctrl) return error.DuplicateModifier;
+                result.modifiers.ctrl = true;
+            } else if (std.ascii.eqlIgnoreCase(part, "alt") or std.ascii.eqlIgnoreCase(part, "option")) {
+                if (result.modifiers.alt) return error.DuplicateModifier;
+                result.modifiers.alt = true;
+            } else if (std.ascii.eqlIgnoreCase(part, "shift")) {
+                if (result.modifiers.shift) return error.DuplicateModifier;
+                result.modifiers.shift = true;
+            } else if (std.ascii.eqlIgnoreCase(part, "super") or
+                std.ascii.eqlIgnoreCase(part, "cmd") or
+                std.ascii.eqlIgnoreCase(part, "command"))
+            {
+                if (result.modifiers.super) return error.DuplicateModifier;
+                result.modifiers.super = true;
+            } else {
+                if (parsed_key != null) return error.MultipleKeys;
+                parsed_key = TerminalKey.parse(part) orelse return error.UnsupportedKey;
+            }
+        }
+        result.key = parsed_key orelse return error.MissingKey;
+        return result;
+    }
+};
+
 const SESSION_SUPPORTED = builtin.os.tag == .linux or builtin.os.tag == .macos or builtin.os.tag == .windows;
 const LOCAL_PTY_SUPPORTED = builtin.os.tag != .windows;
 const LocalPtyFd = if (builtin.os.tag == .windows) c_int else std.posix.fd_t;
@@ -744,6 +873,13 @@ pub const Dock = struct {
         const pane = self.activePane() orelse return false;
         const session = pane.session orelse return false;
         return try session.writeInput(bytes);
+    }
+
+    /// Sends one validated atomic key chord to the active session in this dock.
+    pub fn writeKeyToActivePane(self: *Dock, chord: TerminalKeyChord) !bool {
+        const pane = self.activePane() orelse return false;
+        const session = pane.session orelse return false;
+        return try session.writeKey(chord);
     }
 
     /// Pastes host-provided text into the active pane's running session,
@@ -1968,6 +2104,10 @@ const UnsupportedSession = struct {
         return false;
     }
 
+    pub fn writeKey(_: *UnsupportedSession, _: TerminalKeyChord) !bool {
+        return false;
+    }
+
     pub fn pasteText(_: *UnsupportedSession, _: std.mem.Allocator, _: []const u8) !bool {
         return false;
     }
@@ -2507,6 +2647,20 @@ const UnixSession = struct {
     pub fn writeInput(self: *UnixSession, bytes: []const u8) !bool {
         if (!self.running or bytes.len == 0) return false;
         return try self.writeRawInput(bytes);
+    }
+
+    pub fn writeKey(self: *UnixSession, chord: TerminalKeyChord) !bool {
+        if (!self.running) return false;
+        var buffer: [128]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try encodeTerminalKeyChord(
+            &writer,
+            chord,
+            ghostty_vt.input.KeyEncodeOptions.fromTerminal(&self.terminal),
+        );
+        const encoded = writer.buffered();
+        if (encoded.len == 0) return false;
+        return try self.writeRawInput(encoded);
     }
 
     pub fn terminate(self: *UnixSession) bool {
@@ -3814,6 +3968,150 @@ fn terminalPasteUnsafeByte(byte: u8) bool {
     };
 }
 
+fn encodeTerminalKeyChord(
+    writer: *std.Io.Writer,
+    chord: TerminalKeyChord,
+    options: ghostty_vt.input.KeyEncodeOptions,
+) !void {
+    var utf8_buffer: [1]u8 = undefined;
+    const key_event = terminalKeyEvent(chord, &utf8_buffer);
+    try ghostty_vt.input.encodeKey(writer, key_event, options);
+}
+
+fn terminalKeyEvent(chord: TerminalKeyChord, utf8_buffer: *[1]u8) ghostty_vt.input.KeyEvent {
+    const codepoint = terminalKeyCodepoint(chord.key);
+    var utf8: []const u8 = "";
+    if (codepoint) |value| {
+        var byte: u8 = @intCast(value);
+        if (chord.modifiers.shift and byte >= 'a' and byte <= 'z') byte = std.ascii.toUpper(byte);
+        utf8_buffer[0] = byte;
+        utf8 = utf8_buffer[0..1];
+    }
+    return .{
+        .action = .press,
+        .key = terminalKeyToGhostty(chord.key),
+        .mods = .{
+            .ctrl = chord.modifiers.ctrl,
+            .alt = chord.modifiers.alt,
+            .shift = chord.modifiers.shift,
+            .super = chord.modifiers.super,
+        },
+        .consumed_mods = .{},
+        .utf8 = utf8,
+        .unshifted_codepoint = codepoint orelse 0,
+    };
+}
+
+fn terminalKeyCodepoint(key: TerminalKey) ?u21 {
+    return switch (key) {
+        .space => ' ',
+        .a => 'a',
+        .b => 'b',
+        .c => 'c',
+        .d => 'd',
+        .e => 'e',
+        .f => 'f',
+        .g => 'g',
+        .h => 'h',
+        .i => 'i',
+        .j => 'j',
+        .k => 'k',
+        .l => 'l',
+        .m => 'm',
+        .n => 'n',
+        .o => 'o',
+        .p => 'p',
+        .q => 'q',
+        .r => 'r',
+        .s => 's',
+        .t => 't',
+        .u => 'u',
+        .v => 'v',
+        .w => 'w',
+        .x => 'x',
+        .y => 'y',
+        .z => 'z',
+        .@"0" => '0',
+        .@"1" => '1',
+        .@"2" => '2',
+        .@"3" => '3',
+        .@"4" => '4',
+        .@"5" => '5',
+        .@"6" => '6',
+        .@"7" => '7',
+        .@"8" => '8',
+        .@"9" => '9',
+        else => null,
+    };
+}
+
+fn terminalKeyToGhostty(key: TerminalKey) ghostty_vt.input.Key {
+    return switch (key) {
+        .enter => .enter,
+        .escape => .escape,
+        .tab => .tab,
+        .up => .arrow_up,
+        .down => .arrow_down,
+        .left => .arrow_left,
+        .right => .arrow_right,
+        .home => .home,
+        .end => .end,
+        .pageup => .page_up,
+        .pagedown => .page_down,
+        .backspace => .backspace,
+        .delete => .delete,
+        .space => .space,
+        .f1 => .f1,
+        .f2 => .f2,
+        .f3 => .f3,
+        .f4 => .f4,
+        .f5 => .f5,
+        .f6 => .f6,
+        .f7 => .f7,
+        .f8 => .f8,
+        .f9 => .f9,
+        .f10 => .f10,
+        .f11 => .f11,
+        .f12 => .f12,
+        .a => .key_a,
+        .b => .key_b,
+        .c => .key_c,
+        .d => .key_d,
+        .e => .key_e,
+        .f => .key_f,
+        .g => .key_g,
+        .h => .key_h,
+        .i => .key_i,
+        .j => .key_j,
+        .k => .key_k,
+        .l => .key_l,
+        .m => .key_m,
+        .n => .key_n,
+        .o => .key_o,
+        .p => .key_p,
+        .q => .key_q,
+        .r => .key_r,
+        .s => .key_s,
+        .t => .key_t,
+        .u => .key_u,
+        .v => .key_v,
+        .w => .key_w,
+        .x => .key_x,
+        .y => .key_y,
+        .z => .key_z,
+        .@"0" => .digit_0,
+        .@"1" => .digit_1,
+        .@"2" => .digit_2,
+        .@"3" => .digit_3,
+        .@"4" => .digit_4,
+        .@"5" => .digit_5,
+        .@"6" => .digit_6,
+        .@"7" => .digit_7,
+        .@"8" => .digit_8,
+        .@"9" => .digit_9,
+    };
+}
+
 fn daemonCommandForProfile(allocator: std.mem.Allocator, profile: TerminalLaunchProfile) ![][]const u8 {
     if (profile.command.len > 0) {
         const command = try allocator.alloc([]const u8, profile.command.len);
@@ -4491,6 +4789,85 @@ fn freeCommand(allocator: std.mem.Allocator, command: [][:0]u8) void {
 
 fn clampf(value: f32, min_value: f32, max_value: f32) f32 {
     return @max(min_value, @min(value, max_value));
+}
+
+test "terminal key chords validate the allowlisted vocabulary" {
+    const submit = try TerminalKeyChord.parse("enter");
+    try std.testing.expectEqual(TerminalKey.enter, submit.key);
+    try std.testing.expectEqual(@as(u4, 0), @as(u4, @bitCast(submit.modifiers)));
+
+    const reverse_tab = try TerminalKeyChord.parse("shift+tab");
+    try std.testing.expectEqual(TerminalKey.tab, reverse_tab.key);
+    try std.testing.expect(reverse_tab.modifiers.shift);
+
+    const cancel = try TerminalKeyChord.parse("ctrl+c");
+    try std.testing.expectEqual(TerminalKey.c, cancel.key);
+    try std.testing.expect(cancel.modifiers.ctrl);
+
+    const modified_function = try TerminalKeyChord.parse("super+alt+f12");
+    try std.testing.expectEqual(TerminalKey.f12, modified_function.key);
+    try std.testing.expect(modified_function.modifiers.super);
+    try std.testing.expect(modified_function.modifiers.alt);
+
+    try std.testing.expectError(error.UnsupportedKey, TerminalKeyChord.parse("ctrl+raw-sequence"));
+    try std.testing.expectError(error.DuplicateModifier, TerminalKeyChord.parse("ctrl+ctrl+c"));
+    try std.testing.expectError(error.MultipleKeys, TerminalKeyChord.parse("enter+tab"));
+    try std.testing.expectError(error.MissingKey, TerminalKeyChord.parse("ctrl+alt"));
+}
+
+test "terminal key encoding uses terminal protocol options" {
+    var buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try encodeTerminalKeyChord(&writer, try TerminalKeyChord.parse("enter"), .default);
+    try std.testing.expectEqualStrings("\r", writer.buffered());
+
+    writer = std.Io.Writer.fixed(&buffer);
+    try encodeTerminalKeyChord(&writer, try TerminalKeyChord.parse("shift+tab"), .default);
+    try std.testing.expectEqualStrings("\x1b[Z", writer.buffered());
+
+    writer = std.Io.Writer.fixed(&buffer);
+    try encodeTerminalKeyChord(&writer, try TerminalKeyChord.parse("ctrl+c"), .default);
+    try std.testing.expectEqualStrings("\x03", writer.buffered());
+
+    writer = std.Io.Writer.fixed(&buffer);
+    try encodeTerminalKeyChord(&writer, try TerminalKeyChord.parse("alt+enter"), .default);
+    try std.testing.expectEqualStrings("\x1b\r", writer.buffered());
+}
+
+test "terminal key encoding follows negotiated terminal input modes" {
+    const allocator = std.testing.allocator;
+    var terminal = try ghostty_vt.Terminal.init(allocator, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer terminal.deinit(allocator);
+    var stream = terminal.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("\x1b[?1h");
+    const application_cursor = ghostty_vt.input.KeyEncodeOptions.fromTerminal(&terminal);
+    try std.testing.expect(application_cursor.cursor_key_application);
+
+    var buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try encodeTerminalKeyChord(&writer, try TerminalKeyChord.parse("up"), application_cursor);
+    try std.testing.expectEqualStrings("\x1bOA", writer.buffered());
+
+    writer = std.Io.Writer.fixed(&buffer);
+    try encodeTerminalKeyChord(&writer, try TerminalKeyChord.parse("ctrl+f1"), application_cursor);
+    try std.testing.expectEqualStrings("\x1b[1;5P", writer.buffered());
+
+    writer = std.Io.Writer.fixed(&buffer);
+    try encodeTerminalKeyChord(&writer, try TerminalKeyChord.parse("f5"), application_cursor);
+    try std.testing.expectEqualStrings("\x1b[15~", writer.buffered());
+
+    stream.nextSlice("\x1b[=1;1u");
+    const kitty_disambiguate = ghostty_vt.input.KeyEncodeOptions.fromTerminal(&terminal);
+    try std.testing.expect(kitty_disambiguate.kitty_flags.disambiguate);
+
+    writer = std.Io.Writer.fixed(&buffer);
+    try encodeTerminalKeyChord(&writer, try TerminalKeyChord.parse("shift+enter"), kitty_disambiguate);
+    try std.testing.expectEqualStrings("\x1b[13;2u", writer.buffered());
 }
 
 test "focus adjacent pane uses split direction" {

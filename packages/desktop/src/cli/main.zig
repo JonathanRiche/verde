@@ -196,9 +196,17 @@ fn printHelp(out: output.Output) !void {
         \\  chat open|status|transcript|send|followup|stop|approve|draft ...
         \\  browser open|navigate|status|close|toggle|back|forward|reload|eval|screenshot|post-json|inspector-* ...
         \\  palette list|run ...
-        \\  terminal write|tail|screen --pane <id> ...
+        \\  terminal write|key|submit|tail|screen --pane <id> ...
         \\  process list|inspect|start|stop|restart|logs ...
         \\  stack status|start|stop|restart ...
+        \\
+        \\Terminal input:
+        \\  terminal write --workspace <id> --pane <id> --text <text>     Existing raw write; restarts stopped sessions
+        \\  terminal key --workspace <id> --pane <id> --key <name> [--ctrl|--alt|--shift|--super]
+        \\  terminal key --workspace <id> --pane <id> --chord <mods+key>
+        \\  terminal submit --workspace <id> --pane <id>                 Atomic Enter alias
+        \\  Key names: enter, escape, tab, up/down/left/right, home/end, pageup/pagedown, backspace/delete,
+        \\             space, f1-f12, a-z, 0-9
         \\
         \\Completion shells:
         \\  bash
@@ -325,7 +333,7 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
         \\  integrations: list, doctor, install, remove, disable
         \\  theme: import, validate, export, reset
         \\  session: list, inspect, new, attach, write, tail, screen, kill, cleanup
-        \\  live: status, workspaces, panes, pane control, chat control, terminal/process/agent control
+        \\  live: status, workspaces, panes, pane control, chat control, terminal text/key/process/agent control
         \\  completion: bash, zsh, fish, powershell
         \\  encodings: json, jsonl
         \\  terminal binary frames: no
@@ -2579,6 +2587,29 @@ fn handleLiveTerminal(allocator: std.mem.Allocator, out: output.Output, io: std.
         }, json);
         return;
     }
+    if (std.mem.eql(u8, subcommand, "key")) {
+        try sendLiveRequest(allocator, out, io, "terminal.key", .{
+            .workspace = workspaceOption(argv),
+            .pane = try paneOption(out, argv),
+            .focused = args.hasFlag(argv, "--focused"),
+            .key = args.optionValue(argv, "--key") orelse trailingFreeArg(argv, 2),
+            .chord = args.optionValue(argv, "--chord"),
+            .ctrl = args.hasFlag(argv, "--ctrl"),
+            .alt = args.hasFlag(argv, "--alt"),
+            .shift = args.hasFlag(argv, "--shift"),
+            .super = args.hasFlag(argv, "--super"),
+        }, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "submit")) {
+        try sendLiveRequest(allocator, out, io, "terminal.key", .{
+            .workspace = workspaceOption(argv),
+            .pane = try paneOption(out, argv),
+            .focused = args.hasFlag(argv, "--focused"),
+            .key = "enter",
+        }, json);
+        return;
+    }
     if (std.mem.eql(u8, subcommand, "tail")) {
         try sendLiveRequest(allocator, out, io, "terminal.tail", .{
             .workspace = workspaceOption(argv),
@@ -3383,6 +3414,7 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTool(&s, "read_surface_screen", "Read the current screen text for a terminal surface pane.");
     try writeMcpTool(&s, "tail_surface_output", "Read recent terminal output for a surface pane.");
     try writeMcpTool(&s, "write_surface_text", "Write text to a terminal surface pane.");
+    try writeMcpTypedTool(&s, "send_terminal_key", "Send one validated atomic key chord to a terminal pane without changing desktop focus.", &TERMINAL_KEY_MCP_INPUTS);
     try writeMcpTool(&s, "notify_surface", "Update terminal surface status or notification text.");
     try writeMcpTool(&s, "clear_surface_attention", "Clear terminal surface attention.");
     try writeMcpTypedTool(&s, "list_processes", "List tracked workspace commands, agents, terminal processes, background tasks, and active leases.", &.{
@@ -3512,6 +3544,7 @@ const McpToolInput = struct {
     name: []const u8,
     type_name: []const u8,
     items_type_name: ?[]const u8 = null,
+    enum_values: ?[]const []const u8 = null,
     description: []const u8,
     required: bool = false,
 };
@@ -3526,6 +3559,17 @@ const OPEN_CHAT_MCP_INPUTS = [_]McpToolInput{
     .{ .name = "target_pane_id", .type_name = "integer", .description = "Optional pane beside which to place the chat; defaults to the workspace's focused pane." },
     .{ .name = "axis", .type_name = "string", .description = "Optional split axis: horizontal or vertical; defaults to horizontal." },
     .{ .name = "focus", .type_name = "boolean", .description = "Whether to select the workspace and focus the new chat; defaults to true." },
+};
+
+const TERMINAL_KEY_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the agent's workspace." },
+    .{ .name = "pane_id", .type_name = "integer", .description = "Target terminal workspace pane id.", .required = true },
+    .{ .name = "key", .type_name = "string", .enum_values = &spec.terminal_key_values, .description = "Named key. Use either key plus modifier booleans or chord." },
+    .{ .name = "chord", .type_name = "string", .description = "Atomic chord such as shift+tab or ctrl+x. Use instead of key and modifier fields." },
+    .{ .name = "ctrl", .type_name = "boolean", .description = "Hold Control for key." },
+    .{ .name = "alt", .type_name = "boolean", .description = "Hold Alt/Option for key." },
+    .{ .name = "shift", .type_name = "boolean", .description = "Hold Shift for key." },
+    .{ .name = "super", .type_name = "boolean", .description = "Hold Super/Command for key." },
 };
 
 fn writeMcpTypedTool(s: *std.json.Stringify, name: []const u8, description: []const u8, inputs: []const McpToolInput) !void {
@@ -3551,6 +3595,10 @@ fn writeMcpTypedTool(s: *std.json.Stringify, name: []const u8, description: []co
             try s.objectField("type");
             try s.write(items_type_name);
             try s.endObject();
+        }
+        if (input.enum_values) |enum_values| {
+            try s.objectField("enum");
+            try s.write(enum_values);
         }
         try s.objectField("description");
         try s.write(input.description);
@@ -3807,6 +3855,37 @@ fn mcpToolsCall(
             const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "write_surface_text requires pane_id");
             const text = mcpArgString(arguments, "text") orelse return try mcpError(allocator, out, id_value, -32602, "write_surface_text requires text");
             break :blk sendLiveRequestAlloc(allocator, io, "terminal.write", .{ .workspace = workspace, .pane = pane, .text = text }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "send_terminal_key")) {
+            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "send_terminal_key requires pane_id");
+            const key = mcpArgString(arguments, "key");
+            const chord = mcpArgString(arguments, "chord");
+            if ((mcpArgIsNonNull(arguments, "key") and key == null) or
+                (mcpArgIsNonNull(arguments, "chord") and chord == null))
+            {
+                return try mcpError(allocator, out, id_value, -32602, "send_terminal_key key and chord must be strings");
+            }
+            const ctrl = mcpArgBool(arguments, "ctrl");
+            const alt = mcpArgBool(arguments, "alt");
+            const shift = mcpArgBool(arguments, "shift");
+            const super = mcpArgBool(arguments, "super");
+            if ((mcpArgIsNonNull(arguments, "ctrl") and ctrl == null) or
+                (mcpArgIsNonNull(arguments, "alt") and alt == null) or
+                (mcpArgIsNonNull(arguments, "shift") and shift == null) or
+                (mcpArgIsNonNull(arguments, "super") and super == null))
+            {
+                return try mcpError(allocator, out, id_value, -32602, "send_terminal_key modifiers must be booleans");
+            }
+            break :blk sendLiveRequestAlloc(allocator, io, "terminal.key", .{
+                .workspace = workspace,
+                .pane = pane,
+                .key = key,
+                .chord = chord,
+                .ctrl = ctrl orelse false,
+                .alt = alt orelse false,
+                .shift = shift orelse false,
+                .super = super orelse false,
+            }, 1);
         }
         if (std.mem.eql(u8, tool_name, "notify_surface")) {
             const session = session_id orelse return try mcpError(allocator, out, id_value, -32602, "notify_surface requires session_id");
@@ -4509,6 +4588,8 @@ fn optionConsumesValue(name: []const u8) bool {
         std.mem.eql(u8, name, "--path") or
         std.mem.eql(u8, name, "--url") or
         std.mem.eql(u8, name, "--text") or
+        std.mem.eql(u8, name, "--key") or
+        std.mem.eql(u8, name, "--chord") or
         std.mem.eql(u8, name, "--target") or
         std.mem.eql(u8, name, "--title") or
         std.mem.eql(u8, name, "--body") or
@@ -4764,6 +4845,10 @@ fn flagIsBare(name: []const u8) bool {
         std.mem.eql(u8, name, "--no-focus") or
         std.mem.eql(u8, name, "--fast") or
         std.mem.eql(u8, name, "--no-fast") or
+        std.mem.eql(u8, name, "--ctrl") or
+        std.mem.eql(u8, name, "--alt") or
+        std.mem.eql(u8, name, "--shift") or
+        std.mem.eql(u8, name, "--super") or
         std.mem.eql(u8, name, "--clear") or
         std.mem.eql(u8, name, "--quiet");
 }
@@ -4857,6 +4942,36 @@ test "workspace coordination is advertised by the live CLI" {
         }
         try std.testing.expect(found);
     }
+}
+
+test "terminal key control is advertised by CLI and MCP schemas" {
+    var capability_found = false;
+    for (spec.live_capabilities) |capability| {
+        if (std.mem.eql(u8, capability, "terminal.key")) capability_found = true;
+    }
+    try std.testing.expect(capability_found);
+
+    var key_command_found = false;
+    var submit_command_found = false;
+    for (spec.terminal_commands) |command| {
+        if (std.mem.eql(u8, command, "key")) key_command_found = true;
+        if (std.mem.eql(u8, command, "submit")) submit_command_found = true;
+    }
+    try std.testing.expect(key_command_found);
+    try std.testing.expect(submit_command_found);
+
+    var key_input_found = false;
+    var chord_input_found = false;
+    for (TERMINAL_KEY_MCP_INPUTS) |input| {
+        if (std.mem.eql(u8, input.name, "key")) {
+            key_input_found = true;
+            try std.testing.expect(input.enum_values != null);
+            try std.testing.expect(input.enum_values.?.len >= 62);
+        }
+        if (std.mem.eql(u8, input.name, "chord")) chord_input_found = true;
+    }
+    try std.testing.expect(key_input_found);
+    try std.testing.expect(chord_input_found);
 }
 
 test "workspace process polling distinguishes active completion and replacement" {

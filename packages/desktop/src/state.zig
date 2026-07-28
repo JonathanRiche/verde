@@ -4330,6 +4330,7 @@ pub const AppState = struct {
     pub const approveWorkspaceChatPane = workspace_controller.approveWorkspaceChatPane;
     pub const writeWorkspaceTerminalPaneForProject = workspace_controller.writeWorkspaceTerminalPaneForProject;
     pub const writeWorkspaceTerminalPane = workspace_controller.writeWorkspaceTerminalPane;
+    pub const writeWorkspaceTerminalKeyForProject = workspace_controller.writeWorkspaceTerminalKeyForProject;
     pub const pasteWorkspaceTerminalPaneForProject = workspace_controller.pasteWorkspaceTerminalPaneForProject;
     pub const terminalPaneOutputTailForProject = workspace_controller.terminalPaneOutputTailForProject;
     pub const terminalPaneOutputTail = workspace_controller.terminalPaneOutputTail;
