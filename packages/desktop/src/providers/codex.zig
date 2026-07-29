@@ -658,6 +658,14 @@ pub const Client = struct {
         if (terminated != .bool or !terminated.bool) return error.BackgroundTerminalNotTerminated;
     }
 
+    /// Reports whether one retained terminal is still present in the provider.
+    pub fn backgroundTerminalIsRunning(self: *Client, thread_id: []const u8, process_id: []const u8) !bool {
+        try self.ensureConnected();
+        const payload = try self.callRpcForResultAlloc("thread/backgroundTerminals/list", .{ .threadId = thread_id });
+        defer self.allocator.free(payload);
+        return backgroundTerminalListContainsProcess(self.allocator, payload, process_id);
+    }
+
     fn emitBackgroundTerminals(self: *Client, thread_id: []const u8, request: provider_types.SendPromptRequest) !void {
         const on_stream_event = request.on_stream_event orelse return;
         var identities: std.Io.Writer.Allocating = .init(self.allocator);
@@ -2321,6 +2329,18 @@ fn getOptionalObjectBool(value: std.json.Value, field: []const u8) ?bool {
         .bool => |flag| flag,
         else => null,
     };
+}
+
+fn backgroundTerminalListContainsProcess(allocator: std.mem.Allocator, payload: []const u8, process_id: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const data = getObjectField(parsed.value, "data") orelse return error.InvalidBackgroundTerminalResponse;
+    if (data != .array) return error.InvalidBackgroundTerminalResponse;
+    for (data.array.items) |item| {
+        const candidate = getOptionalObjectString(item, "processId") orelse continue;
+        if (std.mem.eql(u8, candidate, process_id)) return true;
+    }
+    return false;
 }
 
 fn isContextCompactionCompleted(root: std.json.Value, thread_id: []const u8) bool {
@@ -4455,4 +4475,17 @@ test "extractShellOutputDelta and completion parse shell notifications" {
     defer completed.deinit();
     try std.testing.expect(isShellCommandCompleted(completed.value, "thread-123"));
     try std.testing.expect(!isShellCommandCompleted(completed.value, "other-thread"));
+}
+
+test "background terminal list matches the exact provider process" {
+    const payload =
+        \\{
+        \\  "data": [
+        \\    { "processId": "123", "command": "sleep 10" },
+        \\    { "processId": "456", "command": "mise run build" }
+        \\  ]
+        \\}
+    ;
+    try std.testing.expect(try backgroundTerminalListContainsProcess(std.testing.allocator, payload, "456"));
+    try std.testing.expect(!try backgroundTerminalListContainsProcess(std.testing.allocator, payload, "45"));
 }

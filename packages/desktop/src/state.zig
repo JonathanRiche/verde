@@ -6836,6 +6836,8 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit cursor model cache finished", .{});
         self.finishProviderReadinessThread();
         runtime_log.diagnostic("AppState.deinit provider readiness finished", .{});
+        self.deinitBackgroundTaskPoller();
+        runtime_log.diagnostic("AppState.deinit background task poller finished", .{});
         self.settings_controller.update.deinit();
         runtime_log.diagnostic("AppState.deinit updater finished", .{});
         self.finishAllSendThreads();
@@ -6999,6 +7001,7 @@ pub const AppState = struct {
     pub const threadHasRunningBackgroundTasks = chat_controller.threadHasRunningBackgroundTasks;
     pub const pollBackgroundTasks = chat_controller.pollBackgroundTasks;
     pub const pollThreadBackgroundTasks = chat_controller.pollThreadBackgroundTasks;
+    pub const deinitBackgroundTaskPoller = chat_controller.deinitBackgroundTaskPoller;
     pub const backgroundTaskCompletionBodyAlloc = chat_controller.backgroundTaskCompletionBodyAlloc;
     pub const readBackgroundTaskPid = chat_controller.readBackgroundTaskPid;
     pub const backgroundTaskProcessIsAlive = chat_controller.backgroundTaskProcessIsAlive;

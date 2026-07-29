@@ -557,7 +557,9 @@ fn grokPowerShellHookScript() []const u8 {
     \\  { $_ -in 'user_prompt_submit', 'UserPromptSubmit' } {
     \\    $status = 'working'
     \\    if ($null -ne $payload -and $null -ne $payload.prompt) {
-    \\      $title = [regex]::Replace([string]$payload.prompt, '\s+', ' ').Trim()
+    \\      $title = [regex]::Replace([string]$payload.prompt, '^\s*<user_query>\s*', '', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    \\      $title = [regex]::Replace($title, '\s*</user_query>\s*$', '', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    \\      $title = [regex]::Replace($title, '\s+', ' ').Trim()
     \\      if ($title.Length -gt 72) { $title = $title.Substring(0, 72) }
     \\    }
     \\    break
@@ -960,7 +962,7 @@ fn writeGrokHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const u
         \\    else
         \\      title="$(sed -n 's/.*"prompt"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
         \\    fi
-        \\    title="$(printf '%s' "$title" | tr '\n\t' '  ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g' | cut -c1-72)"
+        \\    title="$(printf '%s' "$title" | tr '\n\t' '  ' | sed -e 's/^[[:space:]]*<user_query>[[:space:]]*//' -e 's/[[:space:]]*<\/user_query>[[:space:]]*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g' | cut -c1-72)"
         \\    ;;
         \\  pre_tool_use|PreToolUse) status="working" ;;
         \\  notification|Notification)
@@ -1558,6 +1560,8 @@ test "PowerShell hooks use inherited transport-neutral endpoint and safe invocat
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "$env:VERDE_LIVE_ENDPOINT") != null);
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "hookEventName") != null);
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "end_turn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grok_script, "<user_query>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grok_script, "</user_query>") != null);
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "'grok'") != null);
 }
 
@@ -1583,6 +1587,8 @@ test "Grok hook file registers native lifecycle events" {
     try std.testing.expect(std.mem.indexOf(u8, script, "hookEventName") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "stop_failure") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "end_turn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "<user_query>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "<\\/user_query>") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "--provider grok") != null);
 }
 
