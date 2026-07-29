@@ -544,6 +544,37 @@ fn grokPowerShellHookScript() []const u8 {
     return
     \\# verde-grok-notify-hook
     \\if ($env:VERDE -ne '1' -or [string]::IsNullOrWhiteSpace($env:VERDE_SESSION_ID)) { exit 0 }
+    \\$cli = if ([string]::IsNullOrWhiteSpace($env:VERDE_CLI)) { 'verde.exe' } else { $env:VERDE_CLI }
+    \\if ($cli.EndsWith(' (deleted)')) { $cli = $cli.Substring(0, $cli.Length - 10) }
+    \\if (-not [string]::IsNullOrWhiteSpace($env:VERDE_GROK_TITLE_SESSION_ID)) {
+    \\  $sessionId = $env:VERDE_GROK_TITLE_SESSION_ID
+    \\  if ($sessionId -notmatch '^[A-Za-z0-9-]+$') { exit 0 }
+    \\  $status = if ([string]::IsNullOrWhiteSpace($env:VERDE_GROK_TITLE_STATUS)) { 'done' } else { $env:VERDE_GROK_TITLE_STATUS }
+    \\  $userHome = [Environment]::GetFolderPath('UserProfile')
+    \\  $grokHome = if ([string]::IsNullOrWhiteSpace($env:GROK_HOME)) { Join-Path $userHome '.grok' } else { $env:GROK_HOME }
+    \\  $sessionsRoot = Join-Path $grokHome 'sessions'
+    \\  $title = ''
+    \\  for ($attempt = 0; $attempt -lt 20 -and [string]::IsNullOrWhiteSpace($title); $attempt++) {
+    \\    $summaryPath = Get-ChildItem -LiteralPath $sessionsRoot -Directory -ErrorAction SilentlyContinue |
+    \\      ForEach-Object { Join-Path $_.FullName (Join-Path $sessionId 'summary.json') } |
+    \\      Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+    \\      Select-Object -First 1
+    \\    if (-not [string]::IsNullOrWhiteSpace($summaryPath)) {
+    \\      try {
+    \\        $summary = Get-Content -LiteralPath $summaryPath -Raw -ErrorAction Stop | ConvertFrom-Json
+    \\        if ($null -ne $summary.generated_title) { $title = [string]$summary.generated_title }
+    \\        elseif ($null -ne $summary.session_summary) { $title = [string]$summary.session_summary }
+    \\      } catch {}
+    \\    }
+    \\    if ([string]::IsNullOrWhiteSpace($title)) { Start-Sleep -Milliseconds 50 }
+    \\  }
+    \\  if (-not [string]::IsNullOrWhiteSpace($title)) {
+    \\    $title = [regex]::Replace($title, '\s+', ' ').Trim()
+    \\    if ($title.Length -gt 72) { $title = $title.Substring(0, 72) }
+    \\    try { & $cli notify --quiet --status $status --title $title --provider grok *> $null } catch {}
+    \\  }
+    \\  exit 0
+    \\}
     \\$payload = $null
     \\try {
     \\  $payloadText = [Console]::In.ReadToEnd()
@@ -576,13 +607,22 @@ fn grokPowerShellHookScript() []const u8 {
     \\  { $_ -in 'stop', 'Stop' } {
     \\    $reason = if ($null -ne $payload -and $null -ne $payload.reason) { [string]$payload.reason } else { '' }
     \\    $status = if ([string]::IsNullOrWhiteSpace($reason) -or $reason -eq 'end_turn') { 'done' } else { 'idle' }
+    \\    $sessionId = if ($null -ne $payload -and $null -ne $payload.sessionId) { [string]$payload.sessionId } else { '' }
+    \\    if ($sessionId -match '^[A-Za-z0-9-]+$' -and -not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+    \\      $env:VERDE_GROK_TITLE_SESSION_ID = $sessionId
+    \\      $env:VERDE_GROK_TITLE_STATUS = $status
+    \\      $quotedScriptPath = '"' + $PSCommandPath + '"'
+    \\      try {
+    \\        Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $quotedScriptPath) -WindowStyle Hidden | Out-Null
+    \\      } catch {}
+    \\      Remove-Item Env:VERDE_GROK_TITLE_SESSION_ID -ErrorAction SilentlyContinue
+    \\      Remove-Item Env:VERDE_GROK_TITLE_STATUS -ErrorAction SilentlyContinue
+    \\    }
     \\    break
     \\  }
     \\  { $_ -in 'stop_failure', 'StopFailure' } { $status = 'error'; break }
     \\  default { exit 0 }
     \\}
-    \\$cli = if ([string]::IsNullOrWhiteSpace($env:VERDE_CLI)) { 'verde.exe' } else { $env:VERDE_CLI }
-    \\if ($cli.EndsWith(' (deleted)')) { $cli = $cli.Substring(0, $cli.Length - 10) }
     \\$notifyArgs = @('notify', '--quiet', '--status', $status, '--provider', 'grok')
     \\if (-not [string]::IsNullOrWhiteSpace($title)) { $notifyArgs += @('--title', $title) }
     \\# $env:VERDE_LIVE_ENDPOINT is inherited, so the CLI reaches the owning Verde pane.
@@ -946,6 +986,44 @@ fn writeGrokHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const u
         \\[ "${VERDE:-}" = "1" ] || exit 0
         \\[ -n "${VERDE_SESSION_ID:-}" ] || exit 0
         \\
+        \\cli="${VERDE_CLI:-verde}"
+        \\case "$cli" in
+        \\  *" (deleted)") cli="${cli% (deleted)}" ;;
+        \\esac
+        \\if ! command -v "$cli" >/dev/null 2>&1; then
+        \\  if [ -x "./zig-out/bin/verde" ]; then cli="./zig-out/bin/verde"; else cli="verde"; fi
+        \\fi
+        \\
+        \\if [ -n "${VERDE_GROK_TITLE_SESSION_ID:-}" ]; then
+        \\  session_id="$VERDE_GROK_TITLE_SESSION_ID"
+        \\  case "$session_id" in *[!A-Za-z0-9-]*) exit 0 ;; esac
+        \\  status="${VERDE_GROK_TITLE_STATUS:-done}"
+        \\  grok_home="${GROK_HOME:-${HOME:-}/.grok}"
+        \\  attempts=0
+        \\  title=""
+        \\  while [ "$attempts" -lt 20 ] && [ -z "$title" ]; do
+        \\    summary_path=""
+        \\    for candidate in "$grok_home"/sessions/*/"$session_id"/summary.json; do
+        \\      if [ -f "$candidate" ]; then summary_path="$candidate"; break; fi
+        \\    done
+        \\    if [ -n "$summary_path" ]; then
+        \\      if command -v jq >/dev/null 2>&1; then
+        \\        title="$(jq -r '.generated_title // .session_summary // empty' "$summary_path" 2>/dev/null)"
+        \\      else
+        \\        title="$(sed -n 's/.*"generated_title"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$summary_path" | head -n 1)"
+        \\        [ -n "$title" ] || title="$(sed -n 's/.*"session_summary"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$summary_path" | head -n 1)"
+        \\      fi
+        \\    fi
+        \\    attempts=$((attempts + 1))
+        \\    if [ -z "$title" ] && [ "$attempts" -lt 20 ]; then sleep 0.05; fi
+        \\  done
+        \\  if [ -n "$title" ]; then
+        \\    title="$(printf '%s' "$title" | tr '\n\t' '  ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g' | cut -c1-72)"
+        \\    "$cli" notify --quiet --status "$status" --title "$title" --provider grok >/dev/null 2>&1 || true
+        \\  fi
+        \\  exit 0
+        \\fi
+        \\
         \\payload="${TMPDIR:-/tmp}/verde-grok-hook.$$"
         \\cat > "$payload" 2>/dev/null || true
         \\event="$(sed -n 's/.*"hookEventName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
@@ -983,18 +1061,20 @@ fn writeGrokHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const u
         \\      reason="$(sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
         \\    fi
         \\    if [ -z "$reason" ] || [ "$reason" = "end_turn" ]; then status="done"; else status="idle"; fi
+        \\    if command -v jq >/dev/null 2>&1; then
+        \\      session_id="$(jq -r '.sessionId // empty' "$payload" 2>/dev/null)"
+        \\    else
+        \\      session_id="$(sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
+        \\    fi
+        \\    case "$session_id" in
+        \\      ""|*[!A-Za-z0-9-]*) ;;
+        \\      *) VERDE_GROK_TITLE_SESSION_ID="$session_id" VERDE_GROK_TITLE_STATUS="$status" "$0" </dev/null >/dev/null 2>&1 & ;;
+        \\    esac
         \\    ;;
         \\  stop_failure|StopFailure) status="error" ;;
         \\  *) rm -f "$payload"; exit 0 ;;
         \\esac
         \\
-        \\cli="${VERDE_CLI:-verde}"
-        \\case "$cli" in
-        \\  *" (deleted)") cli="${cli% (deleted)}" ;;
-        \\esac
-        \\if ! command -v "$cli" >/dev/null 2>&1; then
-        \\  if [ -x "./zig-out/bin/verde" ]; then cli="./zig-out/bin/verde"; else cli="verde"; fi
-        \\fi
         \\if [ -n "$title" ]; then
         \\  "$cli" notify --quiet --status "$status" --title "$title" --provider grok >/dev/null 2>&1 || true
         \\else
@@ -1562,6 +1642,9 @@ test "PowerShell hooks use inherited transport-neutral endpoint and safe invocat
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "end_turn") != null);
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "<user_query>") != null);
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "</user_query>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grok_script, "generated_title") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grok_script, "VERDE_GROK_TITLE_SESSION_ID") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grok_script, "Start-Process") != null);
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "'grok'") != null);
 }
 
@@ -1589,7 +1672,23 @@ test "Grok hook file registers native lifecycle events" {
     try std.testing.expect(std.mem.indexOf(u8, script, "end_turn") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "<user_query>") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "<\\/user_query>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "generated_title") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "VERDE_GROK_TITLE_SESSION_ID") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "\"$0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "--provider grok") != null);
+    if (builtin.os.tag != .windows) {
+        const syntax = try std.process.run(std.testing.allocator, threaded.io(), .{
+            .argv = &.{ "sh", "-n", script_path },
+            .stdout_limit = .limited(1024),
+            .stderr_limit = .limited(8 * 1024),
+        });
+        defer std.testing.allocator.free(syntax.stdout);
+        defer std.testing.allocator.free(syntax.stderr);
+        switch (syntax.term) {
+            .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+            else => return error.UnexpectedHookSyntaxCheckTermination,
+        }
+    }
 }
 
 test "Grok hook install and removal stay inside the provider home" {
