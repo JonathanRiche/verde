@@ -95,6 +95,7 @@ fn composerDefaultModelRef(self: anytype, provider: Provider) [:0]const u8 {
 
 const Project = project_state.Project;
 const WorkspaceLease = project_state.WorkspaceLease;
+const TerminalProcessFinish = project_state.TerminalProcessFinish;
 
 pub const CommandClass = enum {
     other,
@@ -281,6 +282,10 @@ pub fn releaseLease(project: *Project, allocator: std.mem.Allocator, owner: []co
         if (lease_id != null) break;
     }
     return released;
+}
+
+pub fn releaseLeasesForExactOwner(project: *Project, allocator: std.mem.Allocator, owner: []const u8, now_ms: i64) usize {
+    return releaseLease(project, allocator, owner, null, now_ms);
 }
 
 pub fn ensureCurrentProjectWorkspace(self: anytype) void {
@@ -585,7 +590,7 @@ pub fn restoreViewFocusSnapshot(self: anytype, snapshot: ViewFocusSnapshot) void
 
 pub fn setWorkspaceChatPaneDraftForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId, value: []const u8, append: bool) !bool {
     if (project_index >= self.project_controller.projects.items.len) return false;
-    var project = &self.project_controller.projects.items[project_index];
+    const project = &self.project_controller.projects.items[project_index];
     const pane = project.workspace_layout.paneById(pane_id) orelse return false;
     const thread_index = switch (pane.ref) {
         .chat => |ref| ref.thread_index,
@@ -790,6 +795,7 @@ pub fn terminalPaneScreenTextForProject(self: anytype, project_index: usize, pan
 
 pub fn pollTerminalDockBeforeRead(self: anytype, project_index: usize, dock_id: u32, dock: *terminal.Dock) !void {
     const changed = try dock.poll(self.allocator);
+    self.syncTerminalDockProcessLifecycle(project_index, dock_id, dock, null);
     try self.drainTerminalDockNotifications(project_index, dock_id, dock);
     if (changed and project_index == self.project_controller.selected_index) {
         const project = &self.project_controller.projects.items[project_index];
@@ -800,9 +806,182 @@ pub fn pollTerminalDockBeforeRead(self: anytype, project_index: usize, dock_id: 
     }
 }
 
+pub fn pollWorkspaceTerminalProcessLifecycles(self: anytype, project_index: usize) void {
+    if (project_index >= self.project_controller.projects.items.len) return;
+    self.pollPendingTerminalSessionTeardowns(project_index);
+    var project = &self.project_controller.projects.items[project_index];
+    self.pollTerminalDockBeforeRead(project_index, 0, &project.terminal_dock) catch |err| {
+        log.warn("failed to poll base terminal lifecycle: {s}", .{@errorName(err)});
+    };
+    for (project.terminal_docks.items) |*entry| {
+        self.pollTerminalDockBeforeRead(project_index, entry.id, &entry.dock) catch |err| {
+            log.warn("failed to poll terminal lifecycle dock={d}: {s}", .{ entry.id, @errorName(err) });
+        };
+    }
+}
+
 pub fn terminalPaneScreenText(self: anytype, pane_id: WorkspacePaneId) !?[]u8 {
     if (self.project_controller.projects.items.len == 0) return null;
     return self.terminalPaneScreenTextForProject(self.project_controller.selected_index, pane_id);
+}
+
+pub fn syncTerminalDockProcessLifecycle(
+    self: anytype,
+    project_index: usize,
+    dock_id: u32,
+    dock: *terminal.Dock,
+    pane_id_override: ?WorkspacePaneId,
+) void {
+    if (project_index >= self.project_controller.projects.items.len) return;
+    const now_ms = unixTimestampMs();
+    var project = &self.project_controller.projects.items[project_index];
+    project.pruneTerminalProcessOutcomes(self.allocator, now_ms);
+
+    if (!adoptTerminalSessionTeardowns(project, self.allocator, dock)) {
+        log.warn("failed to retain pending terminal teardown ownership", .{});
+    }
+    self.pollPendingTerminalSessionTeardowns(project_index);
+
+    const lifecycle_snapshots = dock.sessionLifecycleSnapshotsAlloc(self.allocator) catch return;
+    defer self.allocator.free(lifecycle_snapshots);
+    const session_id = dock.activeSessionId();
+    const runtime_process = dock.activeRuntimeProcessSnapshot();
+    const session = dock.activeSessionSnapshot();
+    if (session_id) |active_session_id| {
+        if (runtime_process) |snapshot| {
+            if (snapshot.running and project.managedProcessByDockId(dock_id) == null) {
+                var label_buffer: [96]u8 = undefined;
+                const command = dock.activeForegroundProcessName(&label_buffer) orelse dock.activeProcessLabel(&label_buffer);
+                const identity = snapshot.process_group orelse snapshot.pid orelse 0;
+                const surface = self.surfaceBySessionIdConst(active_session_id);
+                const provider = if (surface) |owner_surface|
+                    if (owner_surface.provider) |value| @tagName(value) else null
+                else
+                    null;
+                const transition_finish: TerminalProcessFinish = if (session) |session_snapshot|
+                    if (session_snapshot.confirmed_exit)
+                        .{ .exit_code = session_snapshot.exit_code, .signal = session_snapshot.signal }
+                    else
+                        .{ .foreground_completed = true }
+                else
+                    .{ .foreground_completed = true };
+                project.observeTerminalProcess(self.allocator, .{
+                    .process_identity = identity,
+                    .session_id = active_session_id,
+                    .command = command,
+                    .cwd = dock.cwd orelse project.path,
+                    .pid = snapshot.pid,
+                    .process_group = snapshot.process_group,
+                    .started_at_ms = snapshot.started_at_ms,
+                    .observed_at_ms = now_ms,
+                    .dock_id = dock_id,
+                    .pane_id = pane_id_override orelse workspacePaneIdForTerminalDock(project, dock_id),
+                    .owner_kind = if (surface != null and surface.?.provider != null) "agent" else "terminal",
+                    .owner_title = if (surface) |owner_surface| owner_surface.title else command,
+                    .provider = provider,
+                }, transition_finish) catch |err| {
+                    log.warn("failed to track terminal process outcome: {s}", .{@errorName(err)});
+                };
+            }
+        }
+
+        const session_running = if (session) |snapshot| snapshot.running else false;
+        const confirmed_exit = if (session) |snapshot| snapshot.confirmed_exit else false;
+        if (runtime_process == null or !runtime_process.?.running) {
+            if (session_running or confirmed_exit) {
+                _ = project.finishTerminalProcess(self.allocator, active_session_id, .{
+                    .exit_code = if (session) |snapshot| snapshot.exit_code else null,
+                    .signal = if (session) |snapshot| snapshot.signal else null,
+                    .foreground_completed = session_running,
+                }, now_ms) catch |err| {
+                    log.warn("failed to retain terminal process outcome: {s}", .{@errorName(err)});
+                };
+            }
+            if (!session_running and confirmed_exit) {
+                _ = releaseLeasesForExactOwner(project, self.allocator, active_session_id, now_ms);
+            }
+        }
+    }
+
+    for (lifecycle_snapshots) |lifecycle| {
+        if (session_id != null and std.mem.eql(u8, session_id.?, lifecycle.session_id)) continue;
+        if (lifecycle.snapshot.running or !lifecycle.snapshot.confirmed_exit) continue;
+        _ = project.finishTerminalProcess(self.allocator, lifecycle.session_id, .{
+            .exit_code = lifecycle.snapshot.exit_code,
+            .signal = lifecycle.snapshot.signal,
+        }, now_ms) catch |err| {
+            log.warn("failed to retain terminal process outcome: {s}", .{@errorName(err)});
+        };
+        _ = releaseLeasesForExactOwner(project, self.allocator, lifecycle.session_id, now_ms);
+    }
+}
+
+pub fn pollPendingTerminalSessionTeardowns(self: anytype, project_index: usize) void {
+    if (project_index >= self.project_controller.projects.items.len) return;
+    const now_ms = unixTimestampMs();
+    var project = &self.project_controller.projects.items[project_index];
+    var index: usize = 0;
+    while (index < project.pending_terminal_teardowns.items.len) {
+        var teardown = &project.pending_terminal_teardowns.items[index];
+        const completion = teardown.poll(self.allocator) catch |err| {
+            log.warn("failed to poll pending terminal teardown: {s}", .{@errorName(err)});
+            index += 1;
+            continue;
+        } orelse {
+            index += 1;
+            continue;
+        };
+        if (teardown.sessionId()) |session_id| {
+            _ = project.finishTerminalProcess(self.allocator, session_id, .{
+                .exit_code = completion.exit_code,
+                .signal = completion.signal,
+                .cancellation_reason = completion.cancellation_reason,
+            }, now_ms) catch |err| {
+                log.warn("failed to retain terminal teardown outcome: {s}", .{@errorName(err)});
+            };
+            _ = releaseLeasesForExactOwner(project, self.allocator, session_id, now_ms);
+        }
+        var removed = project.pending_terminal_teardowns.orderedRemove(index);
+        removed.deinit(self.allocator);
+    }
+}
+
+pub fn finishTerminalSessionsForTeardown(
+    self: anytype,
+    project_index: usize,
+    dock: *terminal.Dock,
+    reason: terminal.SessionTeardownReason,
+) bool {
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    dock.queueAllSessionTeardowns(self.allocator, reason) catch |err| {
+        log.warn("failed to queue terminal teardown ownership: {s}", .{@errorName(err)});
+        return false;
+    };
+    const project = &self.project_controller.projects.items[project_index];
+    if (!adoptTerminalSessionTeardowns(project, self.allocator, dock)) {
+        log.warn("failed to retain queued terminal teardown ownership", .{});
+        return false;
+    }
+    self.pollPendingTerminalSessionTeardowns(project_index);
+    return true;
+}
+
+fn adoptTerminalSessionTeardowns(project: *Project, allocator: std.mem.Allocator, dock: *terminal.Dock) bool {
+    project.pending_terminal_teardowns.ensureUnusedCapacity(allocator, dock.pendingSessionTeardownCount()) catch return false;
+    while (dock.takeSessionTeardown()) |teardown| {
+        project.pending_terminal_teardowns.appendAssumeCapacity(teardown);
+    }
+    return true;
+}
+
+fn workspacePaneIdForTerminalDock(project: *const Project, dock_id: u32) ?WorkspacePaneId {
+    for (project.workspace_layout.panes.items) |pane| {
+        switch (pane.ref) {
+            .terminal => |ref| if (ref.dock_id == dock_id) return pane.id,
+            else => {},
+        }
+    }
+    return null;
 }
 
 /// Removes expired workspace leases before reads and mutations.
@@ -827,6 +1006,11 @@ pub fn acquireWorkspaceLease(
 pub fn releaseWorkspaceLease(self: anytype, project_index: usize, owner: []const u8, lease_id: ?[]const u8) usize {
     if (project_index >= self.project_controller.projects.items.len) return 0;
     return releaseLease(&self.project_controller.projects.items[project_index], self.allocator, owner, lease_id, unixTimestampMs());
+}
+
+pub fn releaseWorkspaceLeasesForTerminalOwner(self: anytype, project_index: usize, owner: []const u8) usize {
+    if (project_index >= self.project_controller.projects.items.len) return 0;
+    return releaseLeasesForExactOwner(&self.project_controller.projects.items[project_index], self.allocator, owner, unixTimestampMs());
 }
 
 pub fn activeWorkspaceLeaseCount(self: anytype, project_index: usize) usize {
@@ -1055,13 +1239,15 @@ pub fn closeWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
         .chat => self.setSidebarNotice("Chat pane closed."),
         .terminal => |ref| {
             const preserve_agent_history = self.workspaceAgentTuiHistoryAt(project_index, ref.dock_id) != 0;
-            if (!layout.hasTerminalDockPane(ref.dock_id) and !preserve_agent_history) {
+            if (!layout.hasTerminalDockPane(ref.dock_id)) {
                 if (ref.dock_id == 0) {
-                    project.terminal_dock.terminateAllSessions();
+                    self.syncTerminalDockProcessLifecycle(project_index, ref.dock_id, &project.terminal_dock, pane_id);
+                    _ = self.finishTerminalSessionsForTeardown(project_index, &project.terminal_dock, .pane_closed);
                     project.terminal_dock.visible = false;
                 } else if (project.terminalDockEntryById(ref.dock_id)) |entry| {
-                    entry.dock.terminateAllSessions();
-                    _ = project.removeTerminalDockById(self.allocator, ref.dock_id);
+                    self.syncTerminalDockProcessLifecycle(project_index, ref.dock_id, &entry.dock, pane_id);
+                    const teardown_owned = self.finishTerminalSessionsForTeardown(project_index, &entry.dock, .pane_closed);
+                    if (!preserve_agent_history and teardown_owned) _ = project.removeTerminalDockById(self.allocator, ref.dock_id);
                 }
             }
             if (preserve_agent_history) {

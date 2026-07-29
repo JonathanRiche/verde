@@ -261,8 +261,64 @@ pub const TerminalRevivePolicy = sessionizer.RevivePolicy;
 
 pub const SessionSnapshot = struct {
     running: bool,
+    confirmed_exit: bool = false,
     exit_code: ?u32 = null,
     signal: ?u32 = null,
+};
+
+pub const SessionLifecycleSnapshot = struct {
+    session_id: []const u8,
+    snapshot: SessionSnapshot,
+};
+
+pub const SessionTeardownReason = enum {
+    tab_closed,
+    pane_closed,
+    restarted,
+
+    pub fn description(self: SessionTeardownReason) []const u8 {
+        return switch (self) {
+            .tab_closed => "terminal tab closed",
+            .pane_closed => "terminal pane closed",
+            .restarted => "terminal restarted",
+        };
+    }
+};
+
+pub const SessionTeardown = struct {
+    session: *Session,
+    persisted_session_id: ?[]u8,
+    reason: SessionTeardownReason,
+    cancellation_initiated: bool = false,
+
+    pub fn sessionId(self: *const SessionTeardown) ?[]const u8 {
+        return preferredTeardownSessionId(self.session.sessionId(), self.persisted_session_id);
+    }
+
+    pub fn poll(self: *SessionTeardown, allocator: std.mem.Allocator) !?SessionTeardownCompletion {
+        var snapshot = self.session.snapshot();
+        if (resolveSessionTeardown(snapshot, self.cancellation_initiated, self.reason)) |completion| return completion;
+        _ = try self.session.poll(allocator);
+        snapshot = self.session.snapshot();
+        if (resolveSessionTeardown(snapshot, self.cancellation_initiated, self.reason)) |completion| return completion;
+        if (!self.cancellation_initiated and sessionTeardownNeedsTermination(snapshot)) {
+            self.cancellation_initiated = self.session.terminate();
+            snapshot = self.session.snapshot();
+        }
+        return resolveSessionTeardown(snapshot, self.cancellation_initiated, self.reason);
+    }
+
+    pub fn deinit(self: *SessionTeardown, allocator: std.mem.Allocator) void {
+        self.session.deinit(allocator);
+        allocator.destroy(self.session);
+        if (self.persisted_session_id) |session_id| allocator.free(session_id);
+    }
+};
+
+pub const SessionTeardownCompletion = struct {
+    exit_code: ?u32,
+    signal: ?u32,
+    cancellation_reason: ?[]const u8,
 };
 
 pub const RuntimeProcessSnapshot = struct {
@@ -497,6 +553,7 @@ pub const Dock = struct {
     orphan_prune_done: bool = false,
     launch_profile: TerminalLaunchProfile = .{},
     auto_restart_backoff: AutoRestartBackoff = .{},
+    pending_session_teardowns: std.ArrayList(SessionTeardown) = .empty,
 
     pub fn init(_: std.mem.Allocator) !Dock {
         return .{};
@@ -519,6 +576,8 @@ pub const Dock = struct {
             tab.deinit(allocator);
         }
         self.tabs.deinit(allocator);
+        for (self.pending_session_teardowns.items) |*teardown| teardown.deinit(allocator);
+        self.pending_session_teardowns.deinit(allocator);
     }
 
     pub fn toggle(self: *Dock) bool {
@@ -637,7 +696,7 @@ pub const Dock = struct {
                 self.pref_path = try allocator.dupe(u8, path);
             }
         }
-        for (self.tabs.items) |*tab| terminatePaneNodeSessions(tab.root);
+        for (self.tabs.items) |*tab| try self.queuePaneSessionTeardowns(allocator, tab.root, .restarted);
         self.clearTabs(allocator);
 
         const previous_profile = self.launch_profile;
@@ -1047,6 +1106,29 @@ pub const Dock = struct {
         return pane.session_id;
     }
 
+    pub fn sessionLifecycleSnapshotsAlloc(self: *const Dock, allocator: std.mem.Allocator) ![]const SessionLifecycleSnapshot {
+        var snapshots: std.ArrayList(SessionLifecycleSnapshot) = .empty;
+        errdefer snapshots.deinit(allocator);
+        for (self.tabs.items) |*tab| try collectPaneSessionLifecycleSnapshots(allocator, tab.root, &snapshots);
+        return try snapshots.toOwnedSlice(allocator);
+    }
+
+    pub fn takeSessionTeardown(self: *Dock) ?SessionTeardown {
+        if (self.pending_session_teardowns.items.len == 0) return null;
+        return self.pending_session_teardowns.orderedRemove(0);
+    }
+
+    pub fn pendingSessionTeardownCount(self: *const Dock) usize {
+        return self.pending_session_teardowns.items.len;
+    }
+
+    pub fn queueAllSessionTeardowns(self: *Dock, allocator: std.mem.Allocator, reason: SessionTeardownReason) !void {
+        var session_count: usize = 0;
+        for (self.tabs.items) |*tab| session_count += countPaneNodeSessions(tab.root);
+        try self.pending_session_teardowns.ensureUnusedCapacity(allocator, session_count);
+        for (self.tabs.items) |*tab| detachPaneNodeSessions(self, tab.root, reason);
+    }
+
     pub fn takeActiveNotification(self: *Dock) ?NotificationEvent {
         const pane = self.activePane() orelse return null;
         const session = pane.session orelse return null;
@@ -1102,8 +1184,8 @@ pub const Dock = struct {
 
     pub fn closeTab(self: *Dock, allocator: std.mem.Allocator, index: usize) !void {
         if (index >= self.tabs.items.len) return;
+        try self.queuePaneSessionTeardowns(allocator, self.tabs.items[index].root, .tab_closed);
         var removed = self.tabs.orderedRemove(index);
-        terminatePaneNodeSessions(removed.root);
         removed.deinit(allocator);
         if (self.tabs.items.len == 0) {
             try self.tabs.append(allocator, try self.buildSinglePaneTab(allocator));
@@ -1142,7 +1224,7 @@ pub const Dock = struct {
         const tab = self.activeTab() orelse return;
         if (isSinglePaneTree(tab.root)) return;
         if (findPaneLeaf(tab.root, tab.active_pane_id)) |leaf| {
-            if (leaf.session) |session| _ = session.terminate();
+            try self.queuePaneLeafSessionTeardown(allocator, leaf, .pane_closed);
         }
         try removePaneFromTree(allocator, &tab.root, tab.active_pane_id);
         if (findPaneLeaf(tab.root, tab.active_pane_id) == null) {
@@ -1392,6 +1474,27 @@ pub const Dock = struct {
         self.rename_tab_id = null;
     }
 
+    fn queuePaneSessionTeardowns(
+        self: *Dock,
+        allocator: std.mem.Allocator,
+        node: *PaneNode,
+        reason: SessionTeardownReason,
+    ) !void {
+        try self.pending_session_teardowns.ensureUnusedCapacity(allocator, countPaneNodeSessions(node));
+        detachPaneNodeSessions(self, node, reason);
+    }
+
+    fn queuePaneLeafSessionTeardown(
+        self: *Dock,
+        allocator: std.mem.Allocator,
+        leaf: *PaneLeaf,
+        reason: SessionTeardownReason,
+    ) !void {
+        if (leaf.session == null) return;
+        try self.pending_session_teardowns.ensureUnusedCapacity(allocator, 1);
+        detachPaneLeafSession(self, leaf, reason);
+    }
+
     fn buildSinglePaneTab(self: *Dock, allocator: std.mem.Allocator) !Tab {
         const tab = try self.buildSinglePaneTabWithoutSession(allocator);
         try self.ensureSessionsInNode(allocator, tab.root);
@@ -1601,14 +1704,90 @@ fn terminatePaneNodeSessions(node: *PaneNode) void {
     }
 }
 
+fn countPaneNodeSessions(node: *const PaneNode) usize {
+    return switch (node.*) {
+        .leaf => |leaf| @intFromBool(leaf.session != null),
+        .split => |split| countPaneNodeSessions(split.first) + countPaneNodeSessions(split.second),
+    };
+}
+
+fn detachPaneNodeSessions(dock: *Dock, node: *PaneNode, reason: SessionTeardownReason) void {
+    switch (node.*) {
+        .leaf => |*leaf| detachPaneLeafSession(dock, leaf, reason),
+        .split => |*split| {
+            detachPaneNodeSessions(dock, split.first, reason);
+            detachPaneNodeSessions(dock, split.second, reason);
+        },
+    }
+}
+
+fn detachPaneLeafSession(dock: *Dock, leaf: *PaneLeaf, reason: SessionTeardownReason) void {
+    const session = leaf.session orelse return;
+    var teardown: SessionTeardown = .{
+        .session = session,
+        .persisted_session_id = leaf.session_id,
+        .reason = reason,
+    };
+    const snapshot = session.snapshot();
+    if (sessionTeardownNeedsTermination(snapshot)) {
+        teardown.cancellation_initiated = session.terminate();
+    }
+    dock.pending_session_teardowns.appendAssumeCapacity(teardown);
+    leaf.session = null;
+    leaf.session_id = null;
+}
+
+pub fn preferredTeardownSessionId(live_session_id: ?[]const u8, persisted_session_id: ?[]const u8) ?[]const u8 {
+    return live_session_id orelse persisted_session_id;
+}
+
+fn sessionTeardownNeedsTermination(snapshot: SessionSnapshot) bool {
+    return snapshot.running and !snapshot.confirmed_exit;
+}
+
+fn resolveSessionTeardown(
+    snapshot: SessionSnapshot,
+    cancellation_initiated: bool,
+    reason: SessionTeardownReason,
+) ?SessionTeardownCompletion {
+    if (!snapshot.confirmed_exit) return null;
+    return .{
+        .exit_code = snapshot.exit_code,
+        .signal = snapshot.signal,
+        .cancellation_reason = if (cancellation_initiated) reason.description() else null,
+    };
+}
+
 fn collectPaneSessionIds(allocator: std.mem.Allocator, node: *PaneNode, session_ids: *std.ArrayList([]const u8)) !void {
     switch (node.*) {
         .leaf => |*leaf| {
-            if (leaf.session_id) |session_id| try session_ids.append(allocator, session_id);
+            const session_id = preferredTeardownSessionId(
+                if (leaf.session) |session| session.sessionId() else null,
+                leaf.session_id,
+            );
+            if (session_id) |value| try session_ids.append(allocator, value);
         },
         .split => |*split| {
             try collectPaneSessionIds(allocator, split.first, session_ids);
             try collectPaneSessionIds(allocator, split.second, session_ids);
+        },
+    }
+}
+
+fn collectPaneSessionLifecycleSnapshots(
+    allocator: std.mem.Allocator,
+    node: *PaneNode,
+    snapshots: *std.ArrayList(SessionLifecycleSnapshot),
+) !void {
+    switch (node.*) {
+        .leaf => |*leaf| {
+            const session = leaf.session orelse return;
+            const session_id = session.sessionId() orelse leaf.session_id orelse return;
+            try snapshots.append(allocator, .{ .session_id = session_id, .snapshot = session.snapshot() });
+        },
+        .split => |*split| {
+            try collectPaneSessionLifecycleSnapshots(allocator, split.first, snapshots);
+            try collectPaneSessionLifecycleSnapshots(allocator, split.second, snapshots);
         },
     }
 }
@@ -2178,6 +2357,7 @@ const UnixSession = struct {
     cell_height: u32,
     running: bool = true,
     exit_status: ?u32 = null,
+    daemon_exit_status: ?u32 = null,
     daemon_state: DaemonState = .attached,
     launch_kind: TerminalLaunchKind = .shell,
     launch_label: []u8,
@@ -2617,15 +2797,16 @@ const UnixSession = struct {
 
     pub fn snapshot(self: *const UnixSession) SessionSnapshot {
         if (self.running) return .{ .running = true };
-        const status = self.exit_status orelse return .{ .running = false };
-        if (builtin.os.tag == .windows) return .{ .running = false, .exit_code = status };
+        const status = self.exit_status orelse self.daemon_exit_status orelse
+            return .{ .running = false, .confirmed_exit = self.daemon_state == .missing };
+        if (builtin.os.tag == .windows) return .{ .running = false, .confirmed_exit = true, .exit_code = status };
         if (std.c.W.IFEXITED(status)) {
-            return .{ .running = false, .exit_code = @intCast(std.c.W.EXITSTATUS(status)) };
+            return .{ .running = false, .confirmed_exit = true, .exit_code = @intCast(std.c.W.EXITSTATUS(status)) };
         }
         if (std.c.W.IFSIGNALED(status)) {
-            return .{ .running = false, .signal = @intFromEnum(std.c.W.TERMSIG(status)) };
+            return .{ .running = false, .confirmed_exit = true, .signal = @intFromEnum(std.c.W.TERMSIG(status)) };
         }
-        return .{ .running = false };
+        return .{ .running = false, .confirmed_exit = true };
     }
 
     pub fn runtimeProcessSnapshot(self: *const UnixSession) RuntimeProcessSnapshot {
@@ -3181,6 +3362,10 @@ const UnixSession = struct {
         const suppress_replay_responses = initial_attach_replay;
         const shell_pid = jsonUsize(result.object.get("pid") orelse .null);
         const foreground_process_group = jsonUsize(result.object.get("foreground_process_group") orelse .null);
+        self.daemon_exit_status = if (jsonUsize(result.object.get("exit_status") orelse .null)) |status|
+            std.math.cast(u32, status)
+        else
+            null;
         const next_offset = jsonUsize(result.object.get("next_offset") orelse .null) orelse self.remote_output_offset;
         self.daemon_shell_pid = shell_pid;
         self.daemon_foreground_process_group = foreground_process_group;
@@ -3338,6 +3523,7 @@ const UnixSession = struct {
         const session_id = self.session_id orelse return error.MissingSessionId;
         const response = try sessionizer.requestAlloc(std.heap.smp_allocator, pref_path, "session.kill", .{ .id = session_id }, 1);
         defer std.heap.smp_allocator.free(response);
+        try ensureSessionResponseOk(std.heap.smp_allocator, response);
     }
 
     fn writeRawInput(self: *UnixSession, bytes: []const u8) !bool {
@@ -5009,6 +5195,72 @@ test "session ensure releases a stopped non-null session" {
     try std.testing.expect(prepareSessionSlotForCreate(FakeSession, allocator, &slot));
     try std.testing.expectEqual(@as(?*FakeSession, null), slot);
     try std.testing.expectEqual(@as(usize, 1), deinit_count);
+}
+
+test "closing a restored tab without a live session does not claim teardown ownership" {
+    const allocator = std.testing.allocator;
+    var dock = try Dock.init(allocator);
+    defer dock.deinit(allocator);
+
+    const first_session_id = try allocator.dupe(u8, "session-a");
+    const first_node = allocator.create(PaneNode) catch |err| {
+        allocator.free(first_session_id);
+        return err;
+    };
+    first_node.* = .{ .leaf = .{ .id = 1, .session_id = first_session_id } };
+    dock.tabs.append(allocator, .{ .id = 1, .root = first_node, .active_pane_id = 1 }) catch |err| {
+        deinitPaneNode(first_node, allocator);
+        return err;
+    };
+
+    const second_session_id = try allocator.dupe(u8, "session-b");
+    const second_node = allocator.create(PaneNode) catch |err| {
+        allocator.free(second_session_id);
+        return err;
+    };
+    second_node.* = .{ .leaf = .{ .id = 2, .session_id = second_session_id } };
+    dock.tabs.append(allocator, .{ .id = 2, .root = second_node, .active_pane_id = 2 }) catch |err| {
+        deinitPaneNode(second_node, allocator);
+        return err;
+    };
+
+    try dock.closeTab(allocator, 0);
+    try std.testing.expect(dock.takeSessionTeardown() == null);
+    try std.testing.expect(dock.takeSessionTeardown() == null);
+    try std.testing.expectEqual(@as(usize, 1), dock.tabs.items.len);
+    try std.testing.expectEqualStrings("session-b", dock.tabs.items[0].root.leaf.session_id.?);
+}
+
+test "terminal teardown survives daemon unavailability or termination failure until confirmed" {
+    try std.testing.expect(sessionTeardownNeedsTermination(.{ .running = true }));
+    try std.testing.expect(resolveSessionTeardown(
+        .{ .running = false, .confirmed_exit = false },
+        true,
+        .pane_closed,
+    ) == null);
+    try std.testing.expect(resolveSessionTeardown(
+        .{ .running = true },
+        false,
+        .pane_closed,
+    ) == null);
+    try std.testing.expect(sessionTeardownNeedsTermination(.{ .running = true, .confirmed_exit = false }));
+
+    const exited = resolveSessionTeardown(
+        .{ .running = false, .confirmed_exit = true, .exit_code = 17 },
+        false,
+        .pane_closed,
+    ).?;
+    try std.testing.expectEqual(@as(?u32, 17), exited.exit_code);
+    try std.testing.expectEqual(@as(?u32, null), exited.signal);
+    try std.testing.expect(exited.cancellation_reason == null);
+
+    const cancelled = resolveSessionTeardown(
+        .{ .running = false, .confirmed_exit = true, .signal = 15 },
+        true,
+        .restarted,
+    ).?;
+    try std.testing.expectEqual(@as(?u32, 15), cancelled.signal);
+    try std.testing.expectEqualStrings("terminal restarted", cancelled.cancellation_reason.?);
 }
 
 test "automatic terminal restart uses capped exponential backoff" {

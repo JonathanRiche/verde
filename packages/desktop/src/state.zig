@@ -1148,6 +1148,8 @@ pub const TerminalDockEntry = project_state.TerminalDockEntry;
 pub const ManagedProcessStatus = project_state.ManagedProcessStatus;
 pub const ManagedProcess = project_state.ManagedProcess;
 pub const WorkspaceLease = project_state.WorkspaceLease;
+pub const TerminalProcessOutcome = project_state.TerminalProcessOutcome;
+pub const TerminalProcessOutcomeStatus = project_state.TerminalProcessOutcomeStatus;
 
 pub const CommandClass = workspace_controller.CommandClass;
 pub const classifyWorkspaceCommand = workspace_controller.classifyWorkspaceCommand;
@@ -4336,10 +4338,15 @@ pub const AppState = struct {
     pub const terminalPaneOutputTail = workspace_controller.terminalPaneOutputTail;
     pub const terminalPaneScreenTextForProject = workspace_controller.terminalPaneScreenTextForProject;
     pub const pollTerminalDockBeforeRead = workspace_controller.pollTerminalDockBeforeRead;
+    pub const pollWorkspaceTerminalProcessLifecycles = workspace_controller.pollWorkspaceTerminalProcessLifecycles;
+    pub const pollPendingTerminalSessionTeardowns = workspace_controller.pollPendingTerminalSessionTeardowns;
+    pub const syncTerminalDockProcessLifecycle = workspace_controller.syncTerminalDockProcessLifecycle;
+    pub const finishTerminalSessionsForTeardown = workspace_controller.finishTerminalSessionsForTeardown;
     pub const terminalPaneScreenText = workspace_controller.terminalPaneScreenText;
     pub const pruneExpiredWorkspaceLeases = workspace_controller.pruneExpiredWorkspaceLeases;
     pub const acquireWorkspaceLease = workspace_controller.acquireWorkspaceLease;
     pub const releaseWorkspaceLease = workspace_controller.releaseWorkspaceLease;
+    pub const releaseWorkspaceLeasesForTerminalOwner = workspace_controller.releaseWorkspaceLeasesForTerminalOwner;
     pub const activeWorkspaceLeaseCount = workspace_controller.activeWorkspaceLeaseCount;
 
     pub fn refreshProjectStackConfig(self: *AppState, project_index: usize) !void {
@@ -8414,6 +8421,71 @@ test "workspace leases reject conflicts, renew, expire, and enforce ownership" {
     const expiring = try state.acquireWorkspaceLease(0, "agent-a", "mise run build", &resources, 60_000, false);
     expiring.expires_at_ms = 0;
     try std.testing.expectEqual(@as(usize, 0), state.activeWorkspaceLeaseCount(0));
+}
+
+test "terminal teardown releases leases for only the exact session owner" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+
+    var project = try Project.init(allocator, "lease-owner-test", "Lease owner test", "/tmp/lease-owner-test", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+
+    const build = [_][]const u8{"build"};
+    const dependencies = [_][]const u8{"deps"};
+    const database = [_][]const u8{"db"};
+    _ = try state.acquireWorkspaceLease(0, "verde:workspace:dock:4:pane:1", "mise run build", &build, 60_000, false);
+    _ = try state.acquireWorkspaceLease(0, "verde:workspace:dock:4:pane:1", "pnpm install", &dependencies, 60_000, false);
+    _ = try state.acquireWorkspaceLease(0, "verde:workspace:dock:4:pane:10", "rails db:migrate", &database, 60_000, false);
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        state.releaseWorkspaceLeasesForTerminalOwner(0, "verde:workspace:dock:4:pane:1"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), state.activeWorkspaceLeaseCount(0));
+    try std.testing.expectEqualStrings(
+        "verde:workspace:dock:4:pane:10",
+        state.project_controller.projects.items[0].workspace_leases.items[0].owner,
+    );
+}
+
+test "terminal teardown prefers the revived live session owner" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+
+    var project = try Project.init(allocator, "lease-revive-test", "Lease revive test", "/tmp/lease-revive-test", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+
+    const build = [_][]const u8{"build"};
+    const dependencies = [_][]const u8{"deps"};
+    _ = try state.acquireWorkspaceLease(0, "persisted-session", "old build", &build, 60_000, false);
+    _ = try state.acquireWorkspaceLease(0, "live-session", "live dependencies", &dependencies, 60_000, false);
+
+    const owner = terminal.preferredTeardownSessionId("live-session", "persisted-session").?;
+    try std.testing.expectEqualStrings("live-session", owner);
+    try std.testing.expectEqual(@as(usize, 1), state.releaseWorkspaceLeasesForTerminalOwner(0, owner));
+    try std.testing.expectEqual(@as(usize, 1), state.activeWorkspaceLeaseCount(0));
+    try std.testing.expectEqualStrings(
+        "persisted-session",
+        state.project_controller.projects.items[0].workspace_leases.items[0].owner,
+    );
 }
 
 test "daemon diff event becomes a persisted live timeline event" {

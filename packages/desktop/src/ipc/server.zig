@@ -1886,11 +1886,13 @@ fn workspaceProcessesResponse(allocator: std.mem.Allocator, id_value: std.json.V
     if (project_index) |index| {
         if (index >= state.project_controller.projects.items.len) return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
         if (try refreshStackConfigOrError(allocator, id_value, state, index)) |response| return response;
+        state.pollWorkspaceTerminalProcessLifecycles(index);
         state.pruneExpiredWorkspaceLeases(index);
     } else {
         var index: usize = 0;
         while (index < state.project_controller.projects.items.len) : (index += 1) {
             if (try refreshStackConfigOrError(allocator, id_value, state, index)) |response| return response;
+            state.pollWorkspaceTerminalProcessLifecycles(index);
             state.pruneExpiredWorkspaceLeases(index);
         }
     }
@@ -1924,6 +1926,11 @@ fn writeWorkspaceProcessesArray(s: *std.json.Stringify, state: *app_state.AppSta
             try writeTerminalWorkspaceProcess(s, state, project_index, entry.id, &entry.dock);
         }
         try writeTerminalWorkspaceProcess(s, state, project_index, 0, &project.terminal_dock);
+        project.pruneTerminalProcessOutcomes(state.allocator, platform_runtime.unixTimestampMs());
+        for (project.terminal_process_outcomes.items) |*outcome| {
+            if (managedProcessUsesDock(project, outcome.dock_id)) continue;
+            try writeTerminalWorkspaceOutcome(s, project_index, project, outcome);
+        }
 
         for (project.threads.items, 0..) |*thread, thread_index| {
             try writeGuiAgentWorkspaceProcess(s, project, project_index, thread, thread_index);
@@ -1951,18 +1958,17 @@ fn writeTerminalWorkspaceProcess(
     dock: anytype,
 ) !void {
     const snapshot = dock.activeRuntimeProcessSnapshot() orelse return;
+    if (!snapshot.running) return;
     const session_id = dock.activeSessionId() orelse return;
+    const project = &state.project_controller.projects.items[project_index];
+    const tracked = project.terminalProcessActiveForSession(session_id) orelse return;
     var label_buffer: [96]u8 = undefined;
     const command = dock.activeForegroundProcessName(&label_buffer) orelse dock.activeProcessLabel(&label_buffer);
-    const identity = snapshot.process_group orelse snapshot.pid orelse 0;
-    const process_id = try std.fmt.allocPrint(state.allocator, "term:{s}:{d}", .{ session_id, identity });
-    defer state.allocator.free(process_id);
-    const project = &state.project_controller.projects.items[project_index];
     const surface = state.surfaceBySessionIdConst(session_id);
 
     try s.beginObject();
     try s.objectField("id");
-    try s.write(process_id);
+    try s.write(tracked.process_id);
     try s.objectField("source");
     try s.write("terminal");
     try s.objectField("workspace_index");
@@ -1976,7 +1982,7 @@ fn writeTerminalWorkspaceProcess(
     try s.objectField("cwd");
     if (dock.cwd) |cwd| try s.write(cwd) else try s.write(project.path);
     try s.objectField("status");
-    try s.write(if (snapshot.running) "running" else "stopped");
+    try s.write("running");
     try s.objectField("classification");
     try s.write(@tagName(app_state.classifyWorkspaceCommand(command)));
     try s.objectField("resources");
@@ -2007,6 +2013,70 @@ fn writeTerminalWorkspaceProcess(
     } else try s.write(null);
     try s.objectField("cancel_method");
     try s.write("terminal.write Ctrl-C or close the pane");
+    try s.endObject();
+    try s.endObject();
+}
+
+fn writeTerminalWorkspaceOutcome(
+    s: *std.json.Stringify,
+    project_index: usize,
+    project: *const app_state.Project,
+    outcome: *const app_state.TerminalProcessOutcome,
+) !void {
+    try s.beginObject();
+    try s.objectField("id");
+    try s.write(outcome.process_id);
+    try s.objectField("source");
+    try s.write("terminal");
+    try s.objectField("workspace_index");
+    try s.write(project_index);
+    try s.objectField("workspace_id");
+    try s.write(project.id);
+    try s.objectField("name");
+    try s.write(outcome.command);
+    try s.objectField("command");
+    try s.write(outcome.command);
+    try s.objectField("cwd");
+    try s.write(outcome.cwd);
+    try s.objectField("status");
+    try s.write(@tagName(outcome.status));
+    try s.objectField("classification");
+    try s.write(@tagName(app_state.classifyWorkspaceCommand(outcome.command)));
+    try s.objectField("resources");
+    try s.beginArray();
+    try s.endArray();
+    try s.objectField("pid");
+    if (outcome.pid) |pid| try s.write(pid) else try s.write(null);
+    try s.objectField("process_group");
+    if (outcome.process_group) |process_group| try s.write(process_group) else try s.write(null);
+    try s.objectField("started_at_ms");
+    try s.write(outcome.started_at_ms);
+    try s.objectField("finished_at_ms");
+    try s.write(outcome.finished_at_ms);
+    try s.objectField("exit_code");
+    if (outcome.exit_code) |exit_code| try s.write(exit_code) else try s.write(null);
+    try s.objectField("signal");
+    if (outcome.signal) |signal| try s.write(signal) else try s.write(null);
+    try s.objectField("cancellation_reason");
+    if (outcome.cancellation_reason) |reason| try s.write(reason) else try s.write(null);
+    try s.objectField("dock_id");
+    try s.write(outcome.dock_id);
+    try s.objectField("pane_id");
+    if (outcome.pane_id) |pane_id| try s.write(pane_id) else try s.write(null);
+    try s.objectField("owner");
+    try s.beginObject();
+    try s.objectField("id");
+    try s.write(outcome.session_id);
+    try s.objectField("kind");
+    try s.write(outcome.owner_kind);
+    try s.objectField("session_id");
+    try s.write(outcome.session_id);
+    try s.objectField("title");
+    try s.write(outcome.owner_title);
+    try s.objectField("provider");
+    if (outcome.provider) |provider| try s.write(provider) else try s.write(null);
+    try s.objectField("cancel_method");
+    try s.write("none (process finished)");
     try s.endObject();
     try s.endObject();
 }
@@ -2251,6 +2321,7 @@ fn workspaceCheckCommandResponse(
     if (command.len == 0 and resource_request.len == 0) {
         return try errorResponseAlloc(allocator, id_value, "invalid_request", "workspace.checkCommand requires command or resources");
     }
+    state.pollWorkspaceTerminalProcessLifecycles(project_index);
     state.pruneExpiredWorkspaceLeases(project_index);
 
     var writer: std.Io.Writer.Allocating = .init(allocator);
@@ -2307,6 +2378,7 @@ fn workspaceAcquireLeaseResponse(allocator: std.mem.Allocator, id_value: std.jso
     const force = boolParam(params, "force") orelse false;
     const ttl_ms = std.math.clamp(intParam(params, "ttl_ms") orelse 120_000, 1_000, 3_600_000);
 
+    state.pollWorkspaceTerminalProcessLifecycles(project_index);
     if (!force and workspaceProcessConflictCount(state, project_index, owner, resources.items()) > 0) {
         return try workspaceCheckCommandResponse(allocator, id_value, state, params, true);
     }
@@ -2470,21 +2542,21 @@ fn writeTerminalWorkspaceConflict(
     const snapshot = dock.activeRuntimeProcessSnapshot() orelse return 0;
     if (!snapshot.running) return 0;
     const session_id = dock.activeSessionId() orelse return 0;
+    const project = &state.project_controller.projects.items[project_index];
+    const tracked = project.terminalProcessActiveForSession(session_id) orelse return 0;
     if (std.mem.eql(u8, request_owner, session_id)) return 0;
     var label_buffer: [96]u8 = undefined;
     const command = dock.activeForegroundProcessName(&label_buffer) orelse dock.activeProcessLabel(&label_buffer);
     const resource = conflictingWorkspaceResource(request_resources, &.{}, command) orelse return 0;
-    const process_id = try std.fmt.allocPrint(state.allocator, "term:{s}:{d}", .{ session_id, snapshot.process_group orelse snapshot.pid orelse 0 });
-    defer state.allocator.free(process_id);
     try writeWorkspaceConflict(s, .{
         .kind = "process",
         .source = "terminal",
         .resource = resource,
-        .id = process_id,
+        .id = tracked.process_id,
         .owner = session_id,
         .owner_kind = if (state.surfaceBySessionIdConst(session_id) != null) "agent" else "terminal",
         .session_id = session_id,
-        .pane_id = workspacePaneIdForDock(&state.project_controller.projects.items[project_index], dock_id),
+        .pane_id = workspacePaneIdForDock(project, dock_id),
         .command = command,
         .status = "running",
         .started_at_ms = snapshot.started_at_ms,
@@ -3334,6 +3406,51 @@ test "surface provider parser includes terminal-only providers" {
     try std.testing.expectEqual(app_state.SurfaceProvider.grok, parseSurfaceProvider("grok").?);
     try std.testing.expectEqual(app_state.SurfaceProvider.amp, parseSurfaceProvider("amp").?);
     try std.testing.expect(parseSurfaceProvider("other") == null);
+}
+
+test "terminal active to retained final serialization preserves the exact wait identity" {
+    const allocator = std.testing.allocator;
+    var project = try app_state.Project.init(allocator, "workspace-1", "Workspace", "/tmp/workspace-1", 0);
+    defer project.deinit(allocator);
+    try project.observeTerminalProcess(allocator, .{
+        .process_identity = 42,
+        .session_id = "session-1",
+        .command = "mise run build",
+        .cwd = "/tmp/workspace-1",
+        .pid = 41,
+        .process_group = 42,
+        .started_at_ms = 100,
+        .observed_at_ms = 150,
+        .dock_id = 7,
+        .pane_id = 9,
+        .owner_kind = "agent",
+        .owner_title = "Build agent",
+        .provider = "codex",
+    }, .{ .foreground_completed = true });
+    const active_id = try allocator.dupe(u8, project.terminalProcessActiveForSession("session-1").?.process_id);
+    defer allocator.free(active_id);
+    try std.testing.expect(try project.finishTerminalProcess(allocator, "session-1", .{ .exit_code = 2 }, 200));
+    try std.testing.expect(project.terminalProcessActiveForSession("session-1") == null);
+    try std.testing.expectEqualStrings(active_id, project.terminal_process_outcomes.items[0].process_id);
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginArray();
+    try writeTerminalWorkspaceOutcome(&s, 0, &project, &project.terminal_process_outcomes.items[0]);
+    try s.endArray();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, writer.written(), .{});
+    defer parsed.deinit();
+    const result = parsed.value.array.items[0].object;
+    try std.testing.expectEqualStrings(active_id, jsonString(result.get("id").?).?);
+    try std.testing.expectEqualStrings("failed", jsonString(result.get("status").?).?);
+    try std.testing.expectEqual(@as(i64, 200), jsonInt(result.get("finished_at_ms").?).?);
+    try std.testing.expectEqual(@as(i64, 2), jsonInt(result.get("exit_code").?).?);
+    try std.testing.expectEqual(@as(usize, 0), result.get("resources").?.array.items.len);
+    const owner = result.get("owner").?.object;
+    try std.testing.expectEqualStrings("session-1", jsonString(owner.get("id").?).?);
+    try std.testing.expectEqualStrings("codex", jsonString(owner.get("provider").?).?);
 }
 
 test "terminal key command routes to a runnable target without changing focus" {
