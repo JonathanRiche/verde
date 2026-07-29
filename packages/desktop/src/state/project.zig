@@ -204,6 +204,131 @@ pub const WorkspaceLease = struct {
     }
 };
 
+pub const TERMINAL_PROCESS_OUTCOME_MAX: usize = 32;
+pub const TERMINAL_PROCESS_OUTCOME_TTL_MS: i64 = 15 * std.time.ms_per_min;
+
+pub const TerminalProcessOutcomeStatus = enum {
+    completed,
+    failed,
+    cancelled,
+    crashed,
+};
+
+pub const TerminalProcessObservation = struct {
+    process_identity: u32,
+    session_id: []const u8,
+    command: []const u8,
+    cwd: []const u8,
+    pid: ?u32 = null,
+    process_group: ?u32 = null,
+    started_at_ms: i64,
+    observed_at_ms: i64,
+    dock_id: u32,
+    pane_id: ?WorkspacePaneId = null,
+    owner_kind: []const u8,
+    owner_title: []const u8,
+    provider: ?[]const u8 = null,
+};
+
+pub const TerminalProcessFinish = struct {
+    exit_code: ?u32 = null,
+    signal: ?u32 = null,
+    cancellation_reason: ?[]const u8 = null,
+    foreground_completed: bool = false,
+};
+
+pub const TrackedTerminalProcess = struct {
+    process_id: []u8,
+    process_identity: u32,
+    session_id: []u8,
+    command: []u8,
+    cwd: []u8,
+    pid: ?u32,
+    process_group: ?u32,
+    started_at_ms: i64,
+    dock_id: u32,
+    pane_id: ?WorkspacePaneId,
+    owner_kind: []u8,
+    owner_title: []u8,
+    provider: ?[]u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        process_id: []u8,
+        observation: TerminalProcessObservation,
+    ) !TrackedTerminalProcess {
+        errdefer allocator.free(process_id);
+        const session_id = try allocator.dupe(u8, observation.session_id);
+        errdefer allocator.free(session_id);
+        const command = try allocator.dupe(u8, observation.command);
+        errdefer allocator.free(command);
+        const cwd = try allocator.dupe(u8, observation.cwd);
+        errdefer allocator.free(cwd);
+        const owner_kind = try allocator.dupe(u8, observation.owner_kind);
+        errdefer allocator.free(owner_kind);
+        const owner_title = try allocator.dupe(u8, observation.owner_title);
+        errdefer allocator.free(owner_title);
+        const provider = if (observation.provider) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (provider) |value| allocator.free(value);
+        return .{
+            .process_id = process_id,
+            .process_identity = observation.process_identity,
+            .session_id = session_id,
+            .command = command,
+            .cwd = cwd,
+            .pid = observation.pid,
+            .process_group = observation.process_group,
+            .started_at_ms = observation.started_at_ms,
+            .dock_id = observation.dock_id,
+            .pane_id = observation.pane_id,
+            .owner_kind = owner_kind,
+            .owner_title = owner_title,
+            .provider = provider,
+        };
+    }
+
+    fn deinit(self: *TrackedTerminalProcess, allocator: std.mem.Allocator) void {
+        allocator.free(self.process_id);
+        allocator.free(self.session_id);
+        allocator.free(self.command);
+        allocator.free(self.cwd);
+        allocator.free(self.owner_kind);
+        allocator.free(self.owner_title);
+        if (self.provider) |value| allocator.free(value);
+    }
+};
+
+pub const TerminalProcessOutcome = struct {
+    process_id: []u8,
+    session_id: []u8,
+    command: []u8,
+    cwd: []u8,
+    pid: ?u32,
+    process_group: ?u32,
+    started_at_ms: i64,
+    finished_at_ms: i64,
+    dock_id: u32,
+    pane_id: ?WorkspacePaneId,
+    owner_kind: []u8,
+    owner_title: []u8,
+    provider: ?[]u8,
+    status: TerminalProcessOutcomeStatus,
+    exit_code: ?u32,
+    signal: ?u32,
+    cancellation_reason: ?[]u8,
+
+    fn deinit(self: *TerminalProcessOutcome, allocator: std.mem.Allocator) void {
+        allocator.free(self.process_id);
+        allocator.free(self.session_id);
+        allocator.free(self.command);
+        allocator.free(self.cwd);
+        allocator.free(self.owner_kind);
+        allocator.free(self.owner_title);
+        if (self.provider) |value| allocator.free(value);
+        if (self.cancellation_reason) |value| allocator.free(value);
+    }
+};
+
 pub const Project = struct {
     id: [:0]const u8,
     label: [:0]const u8,
@@ -217,6 +342,10 @@ pub const Project = struct {
     terminal_docks: std.ArrayList(TerminalDockEntry) = .empty,
     managed_processes: std.ArrayList(ManagedProcess) = .empty,
     workspace_leases: std.ArrayList(WorkspaceLease) = .empty,
+    tracked_terminal_processes: std.ArrayList(TrackedTerminalProcess) = .empty,
+    terminal_process_outcomes: std.ArrayList(TerminalProcessOutcome) = .empty,
+    pending_terminal_teardowns: std.ArrayList(terminal.SessionTeardown) = .empty,
+    next_terminal_process_id: u64 = 1,
     next_workspace_lease_id: u64 = 1,
     last_stack_config_refresh_ms: i64 = 0,
     stack_config_error: ?[]u8 = null,
@@ -249,6 +378,10 @@ pub const Project = struct {
             .terminal_docks = .empty,
             .managed_processes = .empty,
             .workspace_leases = .empty,
+            .tracked_terminal_processes = .empty,
+            .terminal_process_outcomes = .empty,
+            .pending_terminal_teardowns = .empty,
+            .next_terminal_process_id = 1,
             .next_workspace_lease_id = 1,
             .last_stack_config_refresh_ms = 0,
             .stack_config_error = null,
@@ -434,6 +567,103 @@ pub const Project = struct {
         return false;
     }
 
+    pub fn observeTerminalProcess(
+        self: *Project,
+        allocator: std.mem.Allocator,
+        observation: TerminalProcessObservation,
+        replaced_finish: TerminalProcessFinish,
+    ) !void {
+        for (self.tracked_terminal_processes.items, 0..) |tracked, index| {
+            if (!std.mem.eql(u8, tracked.session_id, observation.session_id)) continue;
+            if (tracked.process_identity == observation.process_identity) return;
+            try self.finishTrackedTerminalProcess(allocator, index, replaced_finish, observation.observed_at_ms);
+            break;
+        }
+        const process_id = try std.fmt.allocPrint(
+            allocator,
+            "term:{s}:{d}",
+            .{ observation.session_id, self.next_terminal_process_id },
+        );
+        self.next_terminal_process_id +%= 1;
+        if (self.next_terminal_process_id == 0) self.next_terminal_process_id = 1;
+        var tracked = try TrackedTerminalProcess.init(allocator, process_id, observation);
+        errdefer tracked.deinit(allocator);
+        try self.tracked_terminal_processes.append(allocator, tracked);
+    }
+
+    pub fn terminalProcessActiveForSession(self: *const Project, session_id: []const u8) ?*const TrackedTerminalProcess {
+        for (self.tracked_terminal_processes.items) |*tracked| {
+            if (std.mem.eql(u8, tracked.session_id, session_id)) return tracked;
+        }
+        return null;
+    }
+
+    pub fn finishTerminalProcess(
+        self: *Project,
+        allocator: std.mem.Allocator,
+        session_id: []const u8,
+        finish: TerminalProcessFinish,
+        finished_at_ms: i64,
+    ) !bool {
+        for (self.tracked_terminal_processes.items, 0..) |tracked, index| {
+            if (!std.mem.eql(u8, tracked.session_id, session_id)) continue;
+            try self.finishTrackedTerminalProcess(allocator, index, finish, finished_at_ms);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn pruneTerminalProcessOutcomes(self: *Project, allocator: std.mem.Allocator, now_ms: i64) void {
+        var index: usize = 0;
+        while (index < self.terminal_process_outcomes.items.len) {
+            const outcome = &self.terminal_process_outcomes.items[index];
+            if (now_ms < outcome.finished_at_ms or now_ms - outcome.finished_at_ms <= TERMINAL_PROCESS_OUTCOME_TTL_MS) {
+                index += 1;
+                continue;
+            }
+            var removed = self.terminal_process_outcomes.orderedRemove(index);
+            removed.deinit(allocator);
+        }
+    }
+
+    fn finishTrackedTerminalProcess(
+        self: *Project,
+        allocator: std.mem.Allocator,
+        tracked_index: usize,
+        finish: TerminalProcessFinish,
+        finished_at_ms: i64,
+    ) !void {
+        self.pruneTerminalProcessOutcomes(allocator, finished_at_ms);
+        while (self.terminal_process_outcomes.items.len >= TERMINAL_PROCESS_OUTCOME_MAX) {
+            var removed = self.terminal_process_outcomes.orderedRemove(0);
+            removed.deinit(allocator);
+        }
+
+        var tracked = self.tracked_terminal_processes.orderedRemove(tracked_index);
+        errdefer tracked.deinit(allocator);
+        const cancellation_reason = if (finish.cancellation_reason) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (cancellation_reason) |value| allocator.free(value);
+        try self.terminal_process_outcomes.append(allocator, .{
+            .process_id = tracked.process_id,
+            .session_id = tracked.session_id,
+            .command = tracked.command,
+            .cwd = tracked.cwd,
+            .pid = tracked.pid,
+            .process_group = tracked.process_group,
+            .started_at_ms = tracked.started_at_ms,
+            .finished_at_ms = finished_at_ms,
+            .dock_id = tracked.dock_id,
+            .pane_id = tracked.pane_id,
+            .owner_kind = tracked.owner_kind,
+            .owner_title = tracked.owner_title,
+            .provider = tracked.provider,
+            .status = terminalProcessOutcomeStatus(finish),
+            .exit_code = finish.exit_code,
+            .signal = finish.signal,
+            .cancellation_reason = cancellation_reason,
+        });
+    }
+
     pub fn committedThreadCount(self: *const Project) usize {
         var count: usize = 0;
         for (self.threads.items) |thread| {
@@ -454,6 +684,12 @@ pub const Project = struct {
         self.managed_processes.deinit(allocator);
         for (self.workspace_leases.items) |*lease| lease.deinit(allocator);
         self.workspace_leases.deinit(allocator);
+        for (self.tracked_terminal_processes.items) |*process| process.deinit(allocator);
+        self.tracked_terminal_processes.deinit(allocator);
+        for (self.terminal_process_outcomes.items) |*outcome| outcome.deinit(allocator);
+        self.terminal_process_outcomes.deinit(allocator);
+        for (self.pending_terminal_teardowns.items) |*teardown| teardown.deinit(allocator);
+        self.pending_terminal_teardowns.deinit(allocator);
         if (self.stack_config_error) |message| allocator.free(message);
         self.workspace_layout.deinit(allocator);
         for (self.threads.items) |*thread| {
@@ -525,8 +761,164 @@ pub const Project = struct {
     }
 };
 
+fn terminalProcessOutcomeStatus(finish: TerminalProcessFinish) TerminalProcessOutcomeStatus {
+    if (finish.cancellation_reason != null) return .cancelled;
+    if (finish.exit_code) |exit_code| return if (exit_code == 0) .completed else .failed;
+    if (finish.signal != null) return .crashed;
+    return if (finish.foreground_completed) .completed else .crashed;
+}
+
 fn appendOwnedString(allocator: std.mem.Allocator, list: *std.ArrayList([]u8), value: []const u8) !void {
     const owned = try allocator.dupe(u8, value);
     errdefer allocator.free(owned);
     try list.append(allocator, owned);
+}
+
+test "terminal process outcomes classify exits once" {
+    const allocator = std.testing.allocator;
+    var project = try Project.init(allocator, "terminal-results", "Terminal results", "/tmp/terminal-results", 0);
+    defer project.deinit(allocator);
+
+    const cases = [_]struct {
+        session_id: []const u8,
+        finish: TerminalProcessFinish,
+        expected_status: TerminalProcessOutcomeStatus,
+    }{
+        .{ .session_id = "session-clean", .finish = .{ .exit_code = 0 }, .expected_status = .completed },
+        .{ .session_id = "session-failed", .finish = .{ .exit_code = 17 }, .expected_status = .failed },
+        .{ .session_id = "session-signal", .finish = .{ .signal = 9 }, .expected_status = .crashed },
+        .{
+            .session_id = "session-cancelled",
+            .finish = .{ .signal = 15, .cancellation_reason = "pane closed" },
+            .expected_status = .cancelled,
+        },
+    };
+
+    for (cases, 0..) |case, index| {
+        try project.observeTerminalProcess(allocator, .{
+            .process_identity = @intCast(index + 10),
+            .session_id = case.session_id,
+            .command = "codex",
+            .cwd = "/tmp/terminal-results",
+            .pid = @intCast(index + 10),
+            .process_group = @intCast(index + 10),
+            .started_at_ms = @intCast(100 + index),
+            .observed_at_ms = @intCast(150 + index),
+            .dock_id = @intCast(index + 1),
+            .pane_id = @intCast(index + 20),
+            .owner_kind = "agent",
+            .owner_title = "Codex",
+            .provider = "codex",
+        }, .{ .foreground_completed = true });
+        try std.testing.expect(try project.finishTerminalProcess(allocator, case.session_id, case.finish, @intCast(200 + index)));
+        try std.testing.expect(!(try project.finishTerminalProcess(allocator, case.session_id, case.finish, @intCast(300 + index))));
+        try std.testing.expectEqual(case.expected_status, project.terminal_process_outcomes.items[index].status);
+    }
+
+    try std.testing.expectEqual(@as(usize, cases.len), project.terminal_process_outcomes.items.len);
+    try std.testing.expectEqual(@as(?u32, 17), project.terminal_process_outcomes.items[1].exit_code);
+    try std.testing.expectEqual(@as(?u32, 9), project.terminal_process_outcomes.items[2].signal);
+    try std.testing.expectEqualStrings("pane closed", project.terminal_process_outcomes.items[3].cancellation_reason.?);
+}
+
+test "terminal process outcome retention starts at final observation and evicts oldest results" {
+    const allocator = std.testing.allocator;
+    var project = try Project.init(allocator, "terminal-retention", "Terminal retention", "/tmp/terminal-retention", 0);
+    defer project.deinit(allocator);
+
+    for (0..TERMINAL_PROCESS_OUTCOME_MAX + 1) |index| {
+        const session_id = try std.fmt.allocPrint(allocator, "session-{d}", .{index});
+        defer allocator.free(session_id);
+        const observed_at_ms: i64 = TERMINAL_PROCESS_OUTCOME_TTL_MS * 2 + @as(i64, @intCast(index));
+        try project.observeTerminalProcess(allocator, .{
+            .process_identity = @intCast(index + 1),
+            .session_id = session_id,
+            .command = "mise run build",
+            .cwd = "/tmp/terminal-retention",
+            .pid = @intCast(index + 1),
+            .started_at_ms = 1,
+            .observed_at_ms = observed_at_ms,
+            .dock_id = @intCast(index + 1),
+            .owner_kind = "terminal",
+            .owner_title = "mise run build",
+        }, .{ .foreground_completed = true });
+        try std.testing.expect(try project.finishTerminalProcess(allocator, session_id, .{ .exit_code = 0 }, observed_at_ms));
+    }
+
+    try std.testing.expectEqual(@as(usize, TERMINAL_PROCESS_OUTCOME_MAX), project.terminal_process_outcomes.items.len);
+    try std.testing.expectEqualStrings("session-1", project.terminal_process_outcomes.items[0].session_id);
+
+    const oldest_finished_at = project.terminal_process_outcomes.items[0].finished_at_ms;
+    project.pruneTerminalProcessOutcomes(allocator, oldest_finished_at + TERMINAL_PROCESS_OUTCOME_TTL_MS);
+    try std.testing.expectEqual(@as(usize, TERMINAL_PROCESS_OUTCOME_MAX), project.terminal_process_outcomes.items.len);
+    project.pruneTerminalProcessOutcomes(allocator, oldest_finished_at + TERMINAL_PROCESS_OUTCOME_TTL_MS + 1);
+    try std.testing.expectEqual(@as(usize, TERMINAL_PROCESS_OUTCOME_MAX - 1), project.terminal_process_outcomes.items.len);
+    const newest_finished_at = project.terminal_process_outcomes.items[project.terminal_process_outcomes.items.len - 1].finished_at_ms;
+    project.pruneTerminalProcessOutcomes(allocator, newest_finished_at + TERMINAL_PROCESS_OUTCOME_TTL_MS + 1);
+    try std.testing.expectEqual(@as(usize, 0), project.terminal_process_outcomes.items.len);
+}
+
+test "terminal process identity transitions preserve failures and never reuse record ids" {
+    const allocator = std.testing.allocator;
+    var project = try Project.init(allocator, "terminal-identity", "Terminal identity", "/tmp/terminal-identity", 0);
+    defer project.deinit(allocator);
+
+    try project.observeTerminalProcess(allocator, .{
+        .process_identity = 42,
+        .session_id = "session-identity",
+        .command = "first",
+        .cwd = "/tmp/terminal-identity",
+        .pid = 42,
+        .process_group = 42,
+        .started_at_ms = 1,
+        .observed_at_ms = 1_000,
+        .dock_id = 3,
+        .owner_kind = "terminal",
+        .owner_title = "first",
+    }, .{ .foreground_completed = true });
+    const first_id = try allocator.dupe(u8, project.terminalProcessActiveForSession("session-identity").?.process_id);
+    defer allocator.free(first_id);
+
+    try project.observeTerminalProcess(allocator, .{
+        .process_identity = 43,
+        .session_id = "session-identity",
+        .command = "second",
+        .cwd = "/tmp/terminal-identity",
+        .pid = 43,
+        .process_group = 43,
+        .started_at_ms = 1,
+        .observed_at_ms = 2_000,
+        .dock_id = 3,
+        .owner_kind = "terminal",
+        .owner_title = "second",
+    }, .{ .exit_code = 17 });
+    try std.testing.expectEqual(TerminalProcessOutcomeStatus.failed, project.terminal_process_outcomes.items[0].status);
+    try std.testing.expectEqual(@as(?u32, 17), project.terminal_process_outcomes.items[0].exit_code);
+
+    try project.observeTerminalProcess(allocator, .{
+        .process_identity = 42,
+        .session_id = "session-identity",
+        .command = "third",
+        .cwd = "/tmp/terminal-identity",
+        .pid = 42,
+        .process_group = 42,
+        .started_at_ms = 1,
+        .observed_at_ms = 3_000,
+        .dock_id = 3,
+        .owner_kind = "terminal",
+        .owner_title = "third",
+    }, .{ .foreground_completed = true });
+    const third_id = project.terminalProcessActiveForSession("session-identity").?.process_id;
+    try std.testing.expect(!std.mem.eql(u8, first_id, third_id));
+
+    try std.testing.expect(try project.finishTerminalProcess(allocator, "session-identity", .{ .signal = 9 }, 4_000));
+    try std.testing.expectEqual(TerminalProcessOutcomeStatus.crashed, project.terminal_process_outcomes.items[2].status);
+    try std.testing.expectEqual(@as(?u32, 9), project.terminal_process_outcomes.items[2].signal);
+    try std.testing.expectEqualStrings(third_id, project.terminal_process_outcomes.items[2].process_id);
+
+    for (project.terminal_process_outcomes.items, 0..) |outcome, index| {
+        for (project.terminal_process_outcomes.items[index + 1 ..]) |other| {
+            try std.testing.expect(!std.mem.eql(u8, outcome.process_id, other.process_id));
+        }
+    }
 }

@@ -381,6 +381,7 @@ pub fn pollTerminals(self: anytype) bool {
     self.terminal_controller.poll_requested = false;
     self.terminal_controller.last_poll_ms = now_ms;
     for (self.project_controller.projects.items, 0..) |*project, project_index| {
+        self.pollPendingTerminalSessionTeardowns(project_index);
         const project_selected = project_index == self.project_controller.selected_index;
         const base_visible = project.terminal_dock.visible or project.workspace_layout.hasTerminalDockPane(0);
         if (!project_selected) {
@@ -408,6 +409,7 @@ pub fn pollTerminals(self: anytype) bool {
                 }
                 break :blk false;
             };
+            self.syncTerminalDockProcessLifecycle(project_index, 0, &project.terminal_dock, null);
             if (project.terminal_dock.consumeWorkspaceChange()) self.markDirty();
             self.drainTerminalDockNotifications(project_index, 0, &project.terminal_dock) catch |err| {
                 log.warn("failed to apply terminal notification: {s}", .{@errorName(err)});
@@ -446,6 +448,7 @@ pub fn pollTerminals(self: anytype) bool {
                 }
                 break :blk false;
             };
+            self.syncTerminalDockProcessLifecycle(project_index, entry.id, &entry.dock, null);
             if (entry.dock.consumeWorkspaceChange()) self.markDirty();
             self.drainTerminalDockNotifications(project_index, entry.id, &entry.dock) catch |err| {
                 log.warn("failed to apply terminal dock notification: {s}", .{@errorName(err)});
@@ -481,8 +484,10 @@ fn closeExitedEditorTerminalPane(self: anytype, project_index: usize, dock_id: u
     if (layout.visiblePaneCount() <= 1) return false;
 
     if (project.terminalDockEntryById(dock_id)) |entry| {
-        entry.dock.terminateAllSessions();
-        _ = project.removeTerminalDockById(self.allocator, dock_id);
+        self.syncTerminalDockProcessLifecycle(project_index, dock_id, &entry.dock, pane_id);
+        if (self.finishTerminalSessionsForTeardown(project_index, &entry.dock, .pane_closed)) {
+            _ = project.removeTerminalDockById(self.allocator, dock_id);
+        }
     }
     var removed_ref = layout.closePane(self.allocator, pane_id) orelse return false;
     defer deinitWorkspacePaneRef(&removed_ref, self.allocator);

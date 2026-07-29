@@ -1425,6 +1425,7 @@ pub const Daemon = struct {
         return try okValueResponse(self.allocator, id_value, .{
             .id = session.session_id,
             .running = session.running,
+            .exit_status = session.exit_status,
             .pid = session.child_pid,
             .foreground_process_group = session.foregroundProcessGroup(),
             .text = text,
