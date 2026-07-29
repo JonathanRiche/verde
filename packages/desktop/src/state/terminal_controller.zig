@@ -462,6 +462,7 @@ pub fn pollTerminals(self: anytype) bool {
         }
         self.pollManagedProcesses(project_index);
     }
+    self.pollArchivedTerminalSessionTeardowns();
     visible_changed = self.pollUpdateInstallerTerminal() or visible_changed;
     if (visible_changed) self.terminal_controller.last_activity_ms = monotonicMs();
     return visible_changed;
