@@ -1926,6 +1926,10 @@ fn writeWorkspaceProcessesArray(s: *std.json.Stringify, state: *app_state.AppSta
             try writeTerminalWorkspaceProcess(s, state, project_index, entry.id, &entry.dock);
         }
         try writeTerminalWorkspaceProcess(s, state, project_index, 0, &project.terminal_dock);
+        for (project.tracked_terminal_processes.items) |*tracked| {
+            if (tracked.missing_since_ms == null or managedProcessUsesDock(project, tracked.dock_id)) continue;
+            try writePendingTerminalWorkspaceProcess(s, project_index, project, tracked);
+        }
         project.pruneTerminalProcessOutcomes(state.allocator, platform_runtime.unixTimestampMs());
         for (project.terminal_process_outcomes.items) |*outcome| {
             if (managedProcessUsesDock(project, outcome.dock_id)) continue;
@@ -2011,6 +2015,62 @@ fn writeTerminalWorkspaceProcess(
     if (surface) |owner_surface| {
         if (owner_surface.provider) |provider| try s.write(@tagName(provider)) else try s.write(null);
     } else try s.write(null);
+    try s.objectField("cancel_method");
+    try s.write("terminal.write Ctrl-C or close the pane");
+    try s.endObject();
+    try s.endObject();
+}
+
+fn writePendingTerminalWorkspaceProcess(
+    s: *std.json.Stringify,
+    project_index: usize,
+    project: *const app_state.Project,
+    tracked: *const app_state.TrackedTerminalProcess,
+) !void {
+    try s.beginObject();
+    try s.objectField("id");
+    try s.write(tracked.process_id);
+    try s.objectField("source");
+    try s.write("terminal");
+    try s.objectField("workspace_index");
+    try s.write(project_index);
+    try s.objectField("workspace_id");
+    try s.write(project.id);
+    try s.objectField("name");
+    try s.write(tracked.command);
+    try s.objectField("command");
+    try s.write(tracked.command);
+    try s.objectField("cwd");
+    try s.write(tracked.cwd);
+    try s.objectField("status");
+    try s.write("stopping");
+    try s.objectField("classification");
+    try s.write(@tagName(app_state.classifyWorkspaceCommand(tracked.command)));
+    try s.objectField("resources");
+    try s.beginArray();
+    try s.endArray();
+    try s.objectField("pid");
+    if (tracked.pid) |pid| try s.write(pid) else try s.write(null);
+    try s.objectField("process_group");
+    if (tracked.process_group) |process_group| try s.write(process_group) else try s.write(null);
+    try s.objectField("started_at_ms");
+    try s.write(tracked.started_at_ms);
+    try s.objectField("dock_id");
+    try s.write(tracked.dock_id);
+    try s.objectField("pane_id");
+    if (tracked.pane_id) |pane_id| try s.write(pane_id) else try s.write(null);
+    try s.objectField("owner");
+    try s.beginObject();
+    try s.objectField("id");
+    try s.write(tracked.session_id);
+    try s.objectField("kind");
+    try s.write(tracked.owner_kind);
+    try s.objectField("session_id");
+    try s.write(tracked.session_id);
+    try s.objectField("title");
+    try s.write(tracked.owner_title);
+    try s.objectField("provider");
+    if (tracked.provider) |provider| try s.write(provider) else try s.write(null);
     try s.objectField("cancel_method");
     try s.write("terminal.write Ctrl-C or close the pane");
     try s.endObject();
@@ -3408,39 +3468,479 @@ test "surface provider parser includes terminal-only providers" {
     try std.testing.expect(parseSurfaceProvider("other") == null);
 }
 
-test "terminal active to retained final serialization preserves the exact wait identity" {
+test "terminal lifecycle reaches workspace processes with the exact final wait identity" {
     const allocator = std.testing.allocator;
-    var project = try app_state.Project.init(allocator, "workspace-1", "Workspace", "/tmp/workspace-1", 0);
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    var state: app_state.AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.surface_controller = .{};
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.surface_controller.surfaces.deinit(allocator);
+    }
+
+    var project = try app_state.Project.init(allocator, "workspace-1", "Workspace", "/tmp", 0);
+    try project.terminal_dock.restartWithProfile(allocator, project.path, .{});
+    try terminal.lifecycle_testing.assignActiveSessionId(&project.terminal_dock, allocator, "workspace-failure-session");
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    try std.testing.expect(try state.project_controller.projects.items[0].terminal_dock.writeInputToActivePane(
+        "sleep 2; exit 17\n",
+    ));
+
+    var active_id: ?[]u8 = null;
+    var attempts: usize = 0;
+    while (attempts < 300 and active_id == null) : (attempts += 1) {
+        const dock = &state.project_controller.projects.items[0].terminal_dock;
+        _ = try dock.poll(allocator);
+        state.syncTerminalDockProcessLifecycle(0, 0, dock, null);
+        if (state.project_controller.projects.items[0].tracked_terminal_processes.items.len > 0) {
+            active_id = try allocator.dupe(u8, state.project_controller.projects.items[0].tracked_terminal_processes.items[0].process_id);
+        } else {
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+        }
+    }
+    const process_id = active_id orelse return error.MissingActiveTerminalProcess;
+    defer allocator.free(process_id);
+    const active_response = try workspaceProcessesTestResponseAlloc(allocator, &state, 0);
+    defer allocator.free(active_response);
+
+    attempts = 0;
+    while (attempts < 400 and state.project_controller.projects.items[0].terminal_process_outcomes.items.len == 0) : (attempts += 1) {
+        const dock = &state.project_controller.projects.items[0].terminal_dock;
+        _ = try dock.poll(allocator);
+        state.syncTerminalDockProcessLifecycle(0, 0, dock, null);
+        if (state.project_controller.projects.items[0].terminal_process_outcomes.items.len == 0) {
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+        }
+    }
+    try std.testing.expect(state.project_controller.projects.items[0].terminalProcessActiveForSession(
+        state.project_controller.projects.items[0].terminal_process_outcomes.items[0].session_id,
+    ) == null);
+    try std.testing.expectEqualStrings(process_id, state.project_controller.projects.items[0].terminal_process_outcomes.items[0].process_id);
+    {
+        const dock = &state.project_controller.projects.items[0].terminal_dock;
+        try dock.closeTab(allocator, 0);
+        state.syncTerminalDockProcessLifecycle(0, 0, dock, null);
+        state.pollPendingTerminalSessionTeardowns(0);
+    }
+    try std.testing.expectEqual(@as(usize, 1), state.project_controller.projects.items[0].terminal_process_outcomes.items.len);
+    try std.testing.expectEqual(app_state.TerminalProcessOutcomeStatus.failed, state.project_controller.projects.items[0].terminal_process_outcomes.items[0].status);
+    try std.testing.expectEqual(@as(?u32, 17), state.project_controller.projects.items[0].terminal_process_outcomes.items[0].exit_code);
+
+    const final_response = try workspaceProcessesTestResponseAlloc(allocator, &state, 0);
+    defer allocator.free(final_response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, final_response, .{});
+    defer parsed.deinit();
+    const processes = workspaceProcessesFromResponse(parsed.value) orelse return error.MissingWorkspaceProcesses;
+    const result = workspaceProcessObjectById(processes, process_id) orelse return error.MissingRetainedTerminalProcess;
+    try std.testing.expectEqualStrings("failed", jsonString(result.get("status").?).?);
+    try std.testing.expectEqual(@as(i64, 17), jsonInt(result.get("exit_code").?).?);
+    const wait_responses = [_][]const u8{ active_response, final_response };
+    var wait_transport: TestWorkspaceProcessesTransport = .{ .responses = &wait_responses };
+    const wait_result = try @import("../cli/main.zig").waitForWorkspaceProcessWithTransportAlloc(
+        allocator,
+        std.testing.io,
+        null,
+        process_id,
+        1_000,
+        .{ .context = &wait_transport, .request = TestWorkspaceProcessesTransport.request },
+        0,
+    );
+    defer allocator.free(wait_result);
+    var wait_parsed = try std.json.parseFromSlice(std.json.Value, allocator, wait_result, .{});
+    defer wait_parsed.deinit();
+    try std.testing.expectEqualStrings("completed", jsonString(wait_parsed.value.object.get("outcome").?).?);
+    const waited_process = wait_parsed.value.object.get("process").?.object;
+    try std.testing.expectEqualStrings(process_id, jsonString(waited_process.get("id").?).?);
+    try std.testing.expectEqualStrings("failed", jsonString(waited_process.get("status").?).?);
+}
+
+test "stopped unconfirmed terminal remains waitable through disappearance grace" {
+    const allocator = std.testing.allocator;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    var state: app_state.AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.surface_controller = .{};
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.surface_controller.surfaces.deinit(allocator);
+    }
+
+    var project = try app_state.Project.init(allocator, "workspace-grace", "Workspace grace", "/tmp", 0);
+    try project.terminal_dock.restartWithProfile(allocator, project.path, .{});
+    try terminal.lifecycle_testing.assignActiveSessionId(&project.terminal_dock, allocator, "session-grace");
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    const dock = &state.project_controller.projects.items[0].terminal_dock;
+    try std.testing.expect(try dock.writeInputToActivePane("sleep 30\n"));
+
+    var active_id: ?[]u8 = null;
+    var attempts: usize = 0;
+    while (attempts < 300 and active_id == null) : (attempts += 1) {
+        _ = try dock.poll(allocator);
+        state.syncTerminalDockProcessLifecycle(0, 0, dock, null);
+        if (state.project_controller.projects.items[0].terminalProcessActiveForSession("session-grace")) |tracked| {
+            active_id = try allocator.dupe(u8, tracked.process_id);
+        } else {
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+        }
+    }
+    const process_id = active_id orelse return error.MissingActiveTerminalProcess;
+    defer allocator.free(process_id);
+
+    const resources = [_][]const u8{"build"};
+    _ = try state.acquireWorkspaceLease(0, "session-grace", "mise run build", &resources, 60_000, false);
+    try terminal.lifecycle_testing.simulateActiveDaemonUnavailable(dock, false);
+    defer terminal.lifecycle_testing.restoreActiveLocal(dock);
+    state.syncTerminalDockProcessLifecycle(0, 0, dock, null);
+
+    const tracked = state.project_controller.projects.items[0].terminalProcessActiveForSession("session-grace") orelse
+        return error.MissingStoppingTerminalProcess;
+    try std.testing.expectEqualStrings(process_id, tracked.process_id);
+    try std.testing.expect(tracked.missing_since_ms != null);
+    try std.testing.expectEqual(@as(usize, 1), state.activeWorkspaceLeaseCount(0));
+    try std.testing.expectEqualStrings(
+        "session-grace",
+        state.project_controller.projects.items[0].workspace_leases.items[0].owner,
+    );
+
+    const pending_response = try workspaceProcessesTestResponseAlloc(allocator, &state, 0);
+    defer allocator.free(pending_response);
+    var pending = try std.json.parseFromSlice(std.json.Value, allocator, pending_response, .{});
+    defer pending.deinit();
+    const pending_processes = workspaceProcessesFromResponse(pending.value) orelse return error.MissingWorkspaceProcesses;
+    const pending_process = workspaceProcessObjectById(pending_processes, process_id) orelse return error.MissingPendingTerminalProcess;
+    try std.testing.expectEqualStrings("stopping", jsonString(pending_process.get("status").?).?);
+    try std.testing.expectEqual(
+        @import("../cli/main.zig").WorkspaceProcessPollOutcome.active,
+        @import("../cli/main.zig").workspaceProcessPoll(pending.value, process_id).outcome,
+    );
+
+    try std.Io.sleep(
+        std.testing.io,
+        .fromMilliseconds(@intCast(app_state.TERMINAL_PROCESS_EXIT_GRACE_MS + 20)),
+        .awake,
+    );
+    state.syncTerminalDockProcessLifecycle(0, 0, dock, null);
+    try std.testing.expect(
+        state.project_controller.projects.items[0].terminalProcessActiveForSession("session-grace") == null,
+    );
+    try std.testing.expectEqual(@as(usize, 1), state.activeWorkspaceLeaseCount(0));
+
+    const final_response = try workspaceProcessesTestResponseAlloc(allocator, &state, 0);
+    defer allocator.free(final_response);
+    var final = try std.json.parseFromSlice(std.json.Value, allocator, final_response, .{});
+    defer final.deinit();
+    const final_processes = workspaceProcessesFromResponse(final.value) orelse return error.MissingWorkspaceProcesses;
+    const final_process = workspaceProcessObjectById(final_processes, process_id) orelse return error.MissingRetainedTerminalProcess;
+    try std.testing.expectEqualStrings("unknown", jsonString(final_process.get("status").?).?);
+    try std.testing.expectEqual(
+        @import("../cli/main.zig").WorkspaceProcessPollOutcome.completed,
+        @import("../cli/main.zig").workspaceProcessPoll(final.value, process_id).outcome,
+    );
+
+    const wait_responses = [_][]const u8{ pending_response, final_response };
+    var wait_transport: TestWorkspaceProcessesTransport = .{ .responses = &wait_responses };
+    const wait_result = try @import("../cli/main.zig").waitForWorkspaceProcessWithTransportAlloc(
+        allocator,
+        std.testing.io,
+        null,
+        process_id,
+        1_000,
+        .{ .context = &wait_transport, .request = TestWorkspaceProcessesTransport.request },
+        0,
+    );
+    defer allocator.free(wait_result);
+    var wait_parsed = try std.json.parseFromSlice(std.json.Value, allocator, wait_result, .{});
+    defer wait_parsed.deinit();
+    try std.testing.expectEqualStrings("completed", jsonString(wait_parsed.value.object.get("outcome").?).?);
+    const waited_process = wait_parsed.value.object.get("process").?.object;
+    try std.testing.expectEqualStrings(process_id, jsonString(waited_process.get("id").?).?);
+    try std.testing.expectEqualStrings("unknown", jsonString(waited_process.get("status").?).?);
+}
+
+test "terminal lifecycle preserves an observed signal in workspace processes" {
+    const allocator = std.testing.allocator;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    var state: app_state.AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.surface_controller = .{};
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.surface_controller.surfaces.deinit(allocator);
+    }
+
+    var project = try app_state.Project.init(allocator, "workspace-signal", "Workspace signal", "/tmp", 0);
+    try project.terminal_dock.restartWithProfile(allocator, project.path, .{
+        .kind = .custom,
+        .label = "signaled lifecycle",
+        .command = &.{ "/bin/sh", "-c", "sleep 0.3; kill -TERM $$" },
+    });
+    try terminal.lifecycle_testing.assignActiveSessionId(&project.terminal_dock, allocator, "workspace-signal-session");
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+
+    var process_id: ?[]u8 = null;
+    var attempts: usize = 0;
+    while (attempts < 100 and process_id == null) : (attempts += 1) {
+        const dock = &state.project_controller.projects.items[0].terminal_dock;
+        _ = try dock.poll(allocator);
+        state.syncTerminalDockProcessLifecycle(0, 0, dock, null);
+        if (state.project_controller.projects.items[0].tracked_terminal_processes.items.len > 0) {
+            process_id = try allocator.dupe(u8, state.project_controller.projects.items[0].tracked_terminal_processes.items[0].process_id);
+        } else {
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+        }
+    }
+    const active_id = process_id orelse return error.MissingActiveTerminalProcess;
+    defer allocator.free(active_id);
+
+    attempts = 0;
+    while (attempts < 150 and state.project_controller.projects.items[0].terminal_process_outcomes.items.len == 0) : (attempts += 1) {
+        const dock = &state.project_controller.projects.items[0].terminal_dock;
+        _ = try dock.poll(allocator);
+        state.syncTerminalDockProcessLifecycle(0, 0, dock, null);
+        if (state.project_controller.projects.items[0].terminal_process_outcomes.items.len == 0) {
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+        }
+    }
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try writeWorkspaceProcessesTestResponse(&s, &state, 0);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, writer.written(), .{});
+    defer parsed.deinit();
+    const processes = workspaceProcessesFromResponse(parsed.value) orelse return error.MissingWorkspaceProcesses;
+    const result = workspaceProcessObjectById(processes, active_id) orelse return error.MissingRetainedTerminalProcess;
+    try std.testing.expectEqualStrings("crashed", jsonString(result.get("status").?).?);
+    try std.testing.expectEqual(@as(i64, 15), jsonInt(result.get("signal").?).?);
+    const wait_poll = @import("../cli/main.zig").workspaceProcessPoll(parsed.value, active_id);
+    try std.testing.expectEqual(@import("../cli/main.zig").WorkspaceProcessPollOutcome.completed, wait_poll.outcome);
+}
+
+test "terminal duplicate generations remain unambiguous and unknown exits never report success" {
+    const allocator = std.testing.allocator;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    var state: app_state.AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.surface_controller = .{};
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.surface_controller.surfaces.deinit(allocator);
+    }
+
+    var project = try app_state.Project.init(allocator, "workspace-shell", "Workspace shell", "/tmp", 0);
+    try project.terminal_dock.restartWithProfile(allocator, project.path, .{});
+    try terminal.lifecycle_testing.assignActiveSessionId(&project.terminal_dock, allocator, "workspace-shell-session");
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+
+    var generation_ids: [2][]u8 = undefined;
+    var generation_count: usize = 0;
+    var second_generation_active_response: ?[]u8 = null;
+    defer for (generation_ids[0..generation_count]) |id| allocator.free(id);
+    defer if (second_generation_active_response) |response| allocator.free(response);
+    while (generation_count < generation_ids.len) : (generation_count += 1) {
+        const dock = &state.project_controller.projects.items[0].terminal_dock;
+        try std.testing.expect(try dock.writeInputToActivePane("sleep 0.3; false\n"));
+        var attempts: usize = 0;
+        while (attempts < 100) : (attempts += 1) {
+            _ = try dock.poll(allocator);
+            state.syncTerminalDockProcessLifecycle(0, 0, dock, null);
+            if (state.project_controller.projects.items[0].tracked_terminal_processes.items.len > 0) break;
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+        }
+        if (state.project_controller.projects.items[0].tracked_terminal_processes.items.len == 0) {
+            return error.MissingActiveTerminalProcess;
+        }
+        const active = state.project_controller.projects.items[0].tracked_terminal_processes.items[0];
+        generation_ids[generation_count] = try allocator.dupe(u8, active.process_id);
+        if (generation_count == 1) {
+            second_generation_active_response = try workspaceProcessesTestResponseAlloc(allocator, &state, 0);
+        }
+
+        attempts = 0;
+        while (attempts < 150 and state.project_controller.projects.items[0].terminalProcessActiveForSession(active.session_id) != null) : (attempts += 1) {
+            _ = try dock.poll(allocator);
+            state.syncTerminalDockProcessLifecycle(0, 0, dock, null);
+            if (state.project_controller.projects.items[0].terminalProcessActiveForSession(active.session_id) != null) {
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+            }
+        }
+    }
+    try std.testing.expect(!std.mem.eql(u8, generation_ids[0], generation_ids[1]));
+
+    const final_response = try workspaceProcessesTestResponseAlloc(allocator, &state, 0);
+    defer allocator.free(final_response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, final_response, .{});
+    defer parsed.deinit();
+    const processes = workspaceProcessesFromResponse(parsed.value) orelse return error.MissingWorkspaceProcesses;
+    for (generation_ids) |process_id| {
+        const result = workspaceProcessObjectById(processes, process_id) orelse return error.MissingRetainedTerminalProcess;
+        try std.testing.expectEqualStrings("unknown", jsonString(result.get("status").?).?);
+        try std.testing.expect(result.get("exit_code").? == .null);
+        try std.testing.expect(result.get("signal").? == .null);
+    }
+    const active_response = second_generation_active_response orelse return error.MissingActiveWorkspaceProcesses;
+    const old_generation_responses = [_][]const u8{active_response};
+    var old_generation_transport: TestWorkspaceProcessesTransport = .{ .responses = &old_generation_responses };
+    const old_generation_wait = try @import("../cli/main.zig").waitForWorkspaceProcessWithTransportAlloc(
+        allocator,
+        std.testing.io,
+        null,
+        generation_ids[0],
+        1_000,
+        .{ .context = &old_generation_transport, .request = TestWorkspaceProcessesTransport.request },
+        0,
+    );
+    defer allocator.free(old_generation_wait);
+    var old_wait_parsed = try std.json.parseFromSlice(std.json.Value, allocator, old_generation_wait, .{});
+    defer old_wait_parsed.deinit();
+    try std.testing.expectEqualStrings("completed", jsonString(old_wait_parsed.value.object.get("outcome").?).?);
+    try std.testing.expectEqualStrings(
+        generation_ids[0],
+        jsonString(old_wait_parsed.value.object.get("process").?.object.get("id").?).?,
+    );
+
+    const current_generation_responses = [_][]const u8{ active_response, final_response };
+    var current_generation_transport: TestWorkspaceProcessesTransport = .{ .responses = &current_generation_responses };
+    const current_generation_wait = try @import("../cli/main.zig").waitForWorkspaceProcessWithTransportAlloc(
+        allocator,
+        std.testing.io,
+        null,
+        generation_ids[1],
+        1_000,
+        .{ .context = &current_generation_transport, .request = TestWorkspaceProcessesTransport.request },
+        0,
+    );
+    defer allocator.free(current_generation_wait);
+    var current_wait_parsed = try std.json.parseFromSlice(std.json.Value, allocator, current_generation_wait, .{});
+    defer current_wait_parsed.deinit();
+    try std.testing.expectEqualStrings("completed", jsonString(current_wait_parsed.value.object.get("outcome").?).?);
+    try std.testing.expectEqualStrings(
+        generation_ids[1],
+        jsonString(current_wait_parsed.value.object.get("process").?.object.get("id").?).?,
+    );
+    const separator = std.mem.lastIndexOfScalar(u8, generation_ids[0], ':') orelse return error.InvalidTerminalProcessId;
+    const replaced_id = try std.fmt.allocPrint(allocator, "{s}0", .{generation_ids[0][0 .. separator + 1]});
+    defer allocator.free(replaced_id);
+    const replaced_poll = @import("../cli/main.zig").workspaceProcessPoll(parsed.value, replaced_id);
+    try std.testing.expectEqual(@import("../cli/main.zig").WorkspaceProcessPollOutcome.replaced, replaced_poll.outcome);
+}
+
+fn writeWorkspaceProcessesTestResponse(
+    s: *std.json.Stringify,
+    state: *app_state.AppState,
+    project_index: usize,
+) !void {
+    try s.beginObject();
+    try s.objectField("ok");
+    try s.write(true);
+    try s.objectField("result");
+    try s.beginObject();
+    try s.objectField("processes");
+    try writeWorkspaceProcessesArray(s, state, project_index);
+    try s.endObject();
+    try s.endObject();
+}
+
+fn workspaceProcessesTestResponseAlloc(
+    allocator: std.mem.Allocator,
+    state: *app_state.AppState,
+    project_index: usize,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try writeWorkspaceProcessesTestResponse(&s, state, project_index);
+    return writer.toOwnedSlice();
+}
+
+const TestWorkspaceProcessesTransport = struct {
+    responses: []const []const u8,
+    next_index: usize = 0,
+
+    fn request(
+        raw_context: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: std.Io,
+        _: ?[]const u8,
+    ) ![]u8 {
+        const self: *TestWorkspaceProcessesTransport = @ptrCast(@alignCast(raw_context));
+        if (self.next_index >= self.responses.len) return error.MissingWorkspaceProcessesResponse;
+        const response = self.responses[self.next_index];
+        self.next_index += 1;
+        return allocator.dupe(u8, response);
+    }
+};
+
+fn workspaceProcessesFromResponse(root: std.json.Value) ?std.json.Value {
+    if (root != .object) return null;
+    const result = root.object.get("result") orelse return null;
+    if (result != .object) return null;
+    return result.object.get("processes");
+}
+
+fn workspaceProcessObjectById(processes: std.json.Value, process_id: []const u8) ?std.json.ObjectMap {
+    if (processes != .array) return null;
+    for (processes.array.items) |process| {
+        if (process != .object) continue;
+        const candidate = jsonString(process.object.get("id") orelse .null) orelse continue;
+        if (std.mem.eql(u8, candidate, process_id)) return process.object;
+    }
+    return null;
+}
+
+test "terminal retained outcome serialization preserves owner fields" {
+    const allocator = std.testing.allocator;
+    var project = try app_state.Project.init(allocator, "workspace-owner", "Workspace owner", "/tmp/workspace-owner", 0);
     defer project.deinit(allocator);
     try project.observeTerminalProcess(allocator, .{
         .process_identity = 42,
         .session_id = "session-1",
         .command = "mise run build",
-        .cwd = "/tmp/workspace-1",
-        .pid = 41,
-        .process_group = 42,
+        .cwd = "/tmp/workspace-owner",
         .started_at_ms = 100,
         .observed_at_ms = 150,
         .dock_id = 7,
-        .pane_id = 9,
         .owner_kind = "agent",
         .owner_title = "Build agent",
         .provider = "codex",
-    }, .{ .foreground_completed = true });
+    }, .{});
     const active_id = try allocator.dupe(u8, project.terminalProcessActiveForSession("session-1").?.process_id);
     defer allocator.free(active_id);
     try std.testing.expect(try project.finishTerminalProcess(allocator, "session-1", .{ .exit_code = 2 }, 200));
-    try std.testing.expect(project.terminalProcessActiveForSession("session-1") == null);
-    try std.testing.expectEqualStrings(active_id, project.terminal_process_outcomes.items[0].process_id);
 
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    defer writer.deinit();
-    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
-    try s.beginArray();
-    try writeTerminalWorkspaceOutcome(&s, 0, &project, &project.terminal_process_outcomes.items[0]);
-    try s.endArray();
+    var outcome_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer outcome_writer.deinit();
+    var outcome_s: std.json.Stringify = .{ .writer = &outcome_writer.writer, .options = .{} };
+    try outcome_s.beginArray();
+    try writeTerminalWorkspaceOutcome(&outcome_s, 0, &project, &project.terminal_process_outcomes.items[0]);
+    try outcome_s.endArray();
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, writer.written(), .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, outcome_writer.written(), .{});
     defer parsed.deinit();
     const result = parsed.value.array.items[0].object;
     try std.testing.expectEqualStrings(active_id, jsonString(result.get("id").?).?);

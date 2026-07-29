@@ -275,12 +275,16 @@ pub const SessionTeardownReason = enum {
     tab_closed,
     pane_closed,
     restarted,
+    tui_reopened,
+    workspace_closed,
 
     pub fn description(self: SessionTeardownReason) []const u8 {
         return switch (self) {
             .tab_closed => "terminal tab closed",
             .pane_closed => "terminal pane closed",
             .restarted => "terminal restarted",
+            .tui_reopened => "agent TUI reopened",
+            .workspace_closed => "workspace closed",
         };
     }
 };
@@ -954,10 +958,6 @@ pub const Dock = struct {
         const pane = self.activePane() orelse return false;
         const session = pane.session orelse return false;
         return session.terminate();
-    }
-
-    pub fn terminateAllSessions(self: *Dock) void {
-        for (self.tabs.items) |*tab| terminatePaneNodeSessions(tab.root);
     }
 
     pub fn activeSessionSnapshot(self: *const Dock) ?SessionSnapshot {
@@ -1692,18 +1692,6 @@ fn deinitPaneNode(node: *PaneNode, allocator: std.mem.Allocator) void {
     }
 }
 
-fn terminatePaneNodeSessions(node: *PaneNode) void {
-    switch (node.*) {
-        .leaf => |*leaf| {
-            if (leaf.session) |session| _ = session.terminate();
-        },
-        .split => |*split| {
-            terminatePaneNodeSessions(split.first);
-            terminatePaneNodeSessions(split.second);
-        },
-    }
-}
-
 fn countPaneNodeSessions(node: *const PaneNode) usize {
     return switch (node.*) {
         .leaf => |leaf| @intFromBool(leaf.session != null),
@@ -1757,6 +1745,63 @@ fn resolveSessionTeardown(
         .cancellation_reason = if (cancellation_initiated) reason.description() else null,
     };
 }
+
+pub const lifecycle_testing = if (builtin.is_test and SESSION_SUPPORTED) struct {
+    pub fn assignActiveSessionId(dock: *Dock, allocator: std.mem.Allocator, session_id: []const u8) !void {
+        const leaf = dock.activePane() orelse return error.MissingTerminalPane;
+        const session = leaf.session orelse return error.MissingTerminalSession;
+        if (session.session_id) |existing| allocator.free(existing);
+        session.session_id = try allocator.dupe(u8, session_id);
+        if (leaf.session_id) |existing| allocator.free(existing);
+        leaf.session_id = try allocator.dupe(u8, session_id);
+    }
+
+    pub fn simulateActiveDaemonUnavailable(dock: *Dock, running: bool) !void {
+        const leaf = dock.activePane() orelse return error.MissingTerminalPane;
+        const session = leaf.session orelse return error.MissingTerminalSession;
+        session.backend = .daemon;
+        session.daemon_state = .unavailable;
+        session.running = running;
+    }
+
+    pub fn restoreActiveLocal(dock: *Dock) void {
+        const leaf = dock.activePane() orelse return;
+        const session = leaf.session orelse return;
+        session.backend = .local;
+        session.daemon_state = .attached;
+        session.test_daemon_kill_response = null;
+        session.running = true;
+    }
+
+    pub fn simulateActiveDaemonKillResponse(dock: *Dock, response: []const u8) !void {
+        const leaf = dock.activePane() orelse return error.MissingTerminalPane;
+        const session = leaf.session orelse return error.MissingTerminalSession;
+        session.backend = .daemon;
+        session.daemon_state = .attached;
+        session.running = true;
+        session.test_daemon_kill_response = response;
+    }
+
+    pub fn signalTeardownForConfirmedExit(teardown: *SessionTeardown) void {
+        teardown.session.backend = .local;
+        teardown.session.daemon_state = .attached;
+        teardown.session.test_daemon_kill_response = null;
+        teardown.session.running = true;
+        std.posix.kill(teardown.session.child_pid, std.posix.SIG.TERM) catch {};
+    }
+
+    pub fn pollTeardownSession(teardown: *SessionTeardown, allocator: std.mem.Allocator) !SessionSnapshot {
+        _ = try teardown.session.poll(allocator);
+        return teardown.session.snapshot();
+    }
+
+    pub fn restoreTeardownLocal(teardown: *SessionTeardown) void {
+        teardown.session.backend = .local;
+        teardown.session.daemon_state = .attached;
+        teardown.session.test_daemon_kill_response = null;
+        teardown.session.running = true;
+    }
+} else struct {};
 
 fn collectPaneSessionIds(allocator: std.mem.Allocator, node: *PaneNode, session_ids: *std.ArrayList([]const u8)) !void {
     switch (node.*) {
@@ -2389,6 +2434,7 @@ const UnixSession = struct {
     /// where a desync (visible SGR params like `5;174m`, stray `\e`) manifests.
     parser_log_enabled: bool = false,
     parser_log_prev_tail_had_esc: bool = false,
+    test_daemon_kill_response: if (builtin.is_test) ?[]const u8 else void = if (builtin.is_test) null else {},
     pending_notification_attention: bool = false,
     pending_notification_title: [128]u8 = undefined,
     pending_notification_title_len: usize = 0,
@@ -2798,7 +2844,7 @@ const UnixSession = struct {
     pub fn snapshot(self: *const UnixSession) SessionSnapshot {
         if (self.running) return .{ .running = true };
         const status = self.exit_status orelse self.daemon_exit_status orelse
-            return .{ .running = false, .confirmed_exit = self.daemon_state == .missing };
+            return .{ .running = false };
         if (builtin.os.tag == .windows) return .{ .running = false, .confirmed_exit = true, .exit_code = status };
         if (std.c.W.IFEXITED(status)) {
             return .{ .running = false, .confirmed_exit = true, .exit_code = @intCast(std.c.W.EXITSTATUS(status)) };
@@ -3519,11 +3565,16 @@ const UnixSession = struct {
     }
 
     fn killDaemon(self: *UnixSession) !void {
+        if (comptime builtin.is_test) {
+            if (self.test_daemon_kill_response) |response| {
+                return ensureSessionKillSignaled(std.heap.smp_allocator, response);
+            }
+        }
         const pref_path = self.pref_path orelse return error.MissingSessionPrefPath;
         const session_id = self.session_id orelse return error.MissingSessionId;
         const response = try sessionizer.requestAlloc(std.heap.smp_allocator, pref_path, "session.kill", .{ .id = session_id }, 1);
         defer std.heap.smp_allocator.free(response);
-        try ensureSessionResponseOk(std.heap.smp_allocator, response);
+        try ensureSessionKillSignaled(std.heap.smp_allocator, response);
     }
 
     fn writeRawInput(self: *UnixSession, bytes: []const u8) !bool {
@@ -4331,6 +4382,18 @@ fn ensureSessionResponseOk(allocator: std.mem.Allocator, response: []const u8) !
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidSessionResponse;
     if (parsed.value.object.get("error")) |_| return error.SessionRequestFailed;
+}
+
+fn ensureSessionKillSignaled(allocator: std.mem.Allocator, response: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSessionResponse;
+    if (parsed.value.object.get("error")) |_| return error.SessionRequestFailed;
+    const result = parsed.value.object.get("result") orelse return error.InvalidSessionResponse;
+    if (result != .object) return error.InvalidSessionResponse;
+    const accepted = jsonBool(result.object.get("accepted") orelse .null) orelse false;
+    const signaled = jsonBool(result.object.get("signaled") orelse .null) orelse false;
+    if (!accepted or !signaled) return error.SessionTerminationNotSignaled;
 }
 
 fn sessionResultStringAlloc(allocator: std.mem.Allocator, response: []const u8, field: []const u8) ![]u8 {
@@ -5261,6 +5324,114 @@ test "terminal teardown survives daemon unavailability or termination failure un
     ).?;
     try std.testing.expectEqual(@as(?u32, 15), cancelled.signal);
     try std.testing.expectEqualStrings("terminal restarted", cancelled.cancellation_reason.?);
+}
+
+test "daemon kill response requires an accepted signal" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.SessionTerminationNotSignaled,
+        ensureSessionKillSignaled(allocator, "{\"result\":{\"accepted\":true,\"signaled\":false}}"),
+    );
+    try ensureSessionKillSignaled(allocator, "{\"result\":{\"accepted\":true,\"signaled\":true}}");
+    try std.testing.expectError(
+        error.SessionRequestFailed,
+        ensureSessionKillSignaled(allocator, "{\"error\":{\"code\":\"not_found\"}}"),
+    );
+}
+
+test "unsignaled daemon kill response keeps a real teardown pending until observed exit" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var dock = try Dock.init(allocator);
+    defer dock.deinit(allocator);
+    try dock.restartWithProfile(allocator, "/tmp", .{
+        .kind = .custom,
+        .label = "unsignaled daemon teardown",
+        .command = &.{ "/bin/sh", "-c", "sleep 30" },
+    });
+    try lifecycle_testing.assignActiveSessionId(&dock, allocator, "unsignaled-daemon-session");
+    try lifecycle_testing.simulateActiveDaemonKillResponse(
+        &dock,
+        "{\"result\":{\"accepted\":true,\"signaled\":false}}",
+    );
+
+    try dock.closeTab(allocator, 0);
+    var teardown = dock.takeSessionTeardown() orelse return error.MissingSessionTeardown;
+    defer teardown.deinit(allocator);
+    defer lifecycle_testing.restoreTeardownLocal(&teardown);
+    if (teardown.cancellation_initiated) return error.UnexpectedCancellationInitiation;
+    if ((try teardown.poll(allocator)) != null) return error.UnexpectedEarlyTeardownCompletion;
+
+    lifecycle_testing.signalTeardownForConfirmedExit(&teardown);
+    var attempts: usize = 0;
+    var snapshot: SessionSnapshot = .{ .running = true };
+    while (attempts < 100 and !snapshot.confirmed_exit) : (attempts += 1) {
+        snapshot = try lifecycle_testing.pollTeardownSession(&teardown, allocator);
+        if (!snapshot.confirmed_exit) try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+    }
+    if (!snapshot.confirmed_exit) return error.UnconfirmedTerminalExit;
+    const completion = try teardown.poll(allocator);
+    const result = completion orelse return error.UnconfirmedTerminalExit;
+    if (result.signal != @as(?u32, @intFromEnum(std.posix.SIG.TERM))) return error.UnexpectedTerminalSignal;
+    if (result.cancellation_reason != null) return error.UnexpectedCancellationReason;
+}
+
+test "real teardown keeps unavailable live identity and preserves an already exited result" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var unavailable_dock = try Dock.init(allocator);
+    defer unavailable_dock.deinit(allocator);
+    try unavailable_dock.restartWithProfile(allocator, "/tmp", .{
+        .kind = .custom,
+        .label = "unavailable teardown",
+        .command = &.{ "/bin/sh", "-c", "sleep 30" },
+    });
+    try lifecycle_testing.assignActiveSessionId(&unavailable_dock, allocator, "live-unavailable-session");
+    const unavailable_leaf = unavailable_dock.activePane() orelse return error.MissingTerminalPane;
+    const live_session_id = try allocator.dupe(u8, unavailable_leaf.session.?.sessionId() orelse return error.MissingSessionId);
+    defer allocator.free(live_session_id);
+    if (unavailable_leaf.session_id) |stored| allocator.free(stored);
+    unavailable_leaf.session_id = try allocator.dupe(u8, "stale-persisted-session");
+    unavailable_leaf.session.?.backend = .daemon;
+    unavailable_leaf.session.?.daemon_state = .unavailable;
+    unavailable_leaf.session.?.running = false;
+
+    try unavailable_dock.closeTab(allocator, 0);
+    var unavailable = unavailable_dock.takeSessionTeardown() orelse return error.MissingSessionTeardown;
+    defer {
+        unavailable.session.backend = .local;
+        unavailable.session.daemon_state = .attached;
+        unavailable.session.running = true;
+        unavailable.deinit(allocator);
+    }
+    try std.testing.expectEqualStrings(live_session_id, unavailable.sessionId().?);
+    try std.testing.expect((try unavailable.poll(allocator)) == null);
+    try std.testing.expect(!unavailable.cancellation_initiated);
+    unavailable.session.daemon_state = .missing;
+    try std.testing.expect(!unavailable.session.snapshot().confirmed_exit);
+    try std.testing.expect((try unavailable.poll(allocator)) == null);
+
+    var exited_dock = try Dock.init(allocator);
+    defer exited_dock.deinit(allocator);
+    try exited_dock.restartWithProfile(allocator, "/tmp", .{
+        .kind = .custom,
+        .label = "already exited teardown",
+        .command = &.{ "/bin/sh", "-c", "exit 17" },
+    });
+    try lifecycle_testing.assignActiveSessionId(&exited_dock, allocator, "already-exited-session");
+    var attempts: usize = 0;
+    while (attempts < 100 and !(exited_dock.activeSessionSnapshot() orelse SessionSnapshot{ .running = false }).confirmed_exit) : (attempts += 1) {
+        _ = try exited_dock.poll(allocator);
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+    }
+    try std.testing.expect((exited_dock.activeSessionSnapshot() orelse return error.MissingSessionSnapshot).confirmed_exit);
+    try exited_dock.closeTab(allocator, 0);
+    var exited = exited_dock.takeSessionTeardown() orelse return error.MissingSessionTeardown;
+    defer exited.deinit(allocator);
+    const completion = (try exited.poll(allocator)) orelse return error.UnconfirmedTerminalExit;
+    try std.testing.expectEqual(@as(?u32, 17), completion.exit_code);
+    try std.testing.expect(completion.cancellation_reason == null);
 }
 
 test "automatic terminal restart uses capped exponential backoff" {

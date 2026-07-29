@@ -4093,9 +4093,35 @@ fn mcpWaitForWorkspaceProcessAlloc(
     process_id: []const u8,
     timeout_ms: u32,
 ) ![]u8 {
+    var live_context: u8 = 0;
+    return waitForWorkspaceProcessWithTransportAlloc(
+        allocator,
+        io,
+        workspace,
+        process_id,
+        timeout_ms,
+        .{ .context = &live_context, .request = liveWorkspaceProcessesRequest },
+        500,
+    );
+}
+
+pub const WorkspaceProcessesTransport = struct {
+    context: *anyopaque,
+    request: *const fn (*anyopaque, std.mem.Allocator, std.Io, ?[]const u8) anyerror![]u8,
+};
+
+pub fn waitForWorkspaceProcessWithTransportAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace: ?[]const u8,
+    process_id: []const u8,
+    timeout_ms: u32,
+    transport: WorkspaceProcessesTransport,
+    poll_interval_ms: u32,
+) ![]u8 {
     const started_ns = platform_runtime.monotonicTimestampNs();
     while (true) {
-        const response = try sendLiveRequestAlloc(allocator, io, "workspace.processes", .{ .workspace = workspace }, 1);
+        const response = try transport.request(transport.context, allocator, io, workspace);
         defer allocator.free(response);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
         defer parsed.deinit();
@@ -4109,12 +4135,23 @@ fn mcpWaitForWorkspaceProcessAlloc(
             return try workspaceProcessWaitResultAlloc(allocator, process_id, "timed_out", true, elapsed_ms, poll.snapshot);
         }
         const remaining_ms: u64 = timeout_ms - elapsed_ms;
-        try std.Io.sleep(io, .fromMilliseconds(@min(remaining_ms, 500)), .awake);
+        try std.Io.sleep(io, .fromMilliseconds(@min(remaining_ms, poll_interval_ms)), .awake);
     }
 }
 
-const WorkspaceProcessPoll = struct {
-    outcome: enum { active, completed, replaced, gone },
+fn liveWorkspaceProcessesRequest(
+    _: *anyopaque,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace: ?[]const u8,
+) ![]u8 {
+    return sendLiveRequestAlloc(allocator, io, "workspace.processes", .{ .workspace = workspace }, 1);
+}
+
+pub const WorkspaceProcessPollOutcome = enum { active, completed, replaced, gone };
+
+pub const WorkspaceProcessPoll = struct {
+    outcome: WorkspaceProcessPollOutcome,
     snapshot: ?std.json.Value = null,
 };
 
@@ -4123,7 +4160,7 @@ fn workspaceProcessResponseOk(root: std.json.Value) bool {
     return jsonBool(root.object.get("ok") orelse .null) orelse false;
 }
 
-fn workspaceProcessPoll(root: std.json.Value, process_id: []const u8) WorkspaceProcessPoll {
+pub fn workspaceProcessPoll(root: std.json.Value, process_id: []const u8) WorkspaceProcessPoll {
     if (root != .object) return .{ .outcome = .gone };
     const result = root.object.get("result") orelse return .{ .outcome = .gone };
     if (result != .object) return .{ .outcome = .gone };
@@ -4991,6 +5028,50 @@ test "workspace process polling distinguishes active completion and replacement"
     var rejected = try std.json.parseFromSlice(std.json.Value, allocator, "{\"ok\":false,\"error\":{\"code\":\"invalid_stack_config\"}}", .{});
     defer rejected.deinit();
     try std.testing.expect(!workspaceProcessResponseOk(rejected.value));
+}
+
+test "workspace process wait uses its transport until the exact id is final" {
+    const allocator = std.testing.allocator;
+    const Transport = struct {
+        responses: []const []const u8,
+        next_index: usize = 0,
+
+        fn request(
+            raw_context: *anyopaque,
+            response_allocator: std.mem.Allocator,
+            _: std.Io,
+            _: ?[]const u8,
+        ) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw_context));
+            if (self.next_index >= self.responses.len) return error.MissingResponse;
+            const response = self.responses[self.next_index];
+            self.next_index += 1;
+            return response_allocator.dupe(u8, response);
+        }
+    };
+    const responses = [_][]const u8{
+        "{\"ok\":true,\"result\":{\"processes\":[{\"id\":\"term:session:42\",\"status\":\"running\"}]}}",
+        "{\"ok\":true,\"result\":{\"processes\":[{\"id\":\"term:session:42\",\"status\":\"failed\",\"exit_code\":17},{\"id\":\"term:session:43\",\"status\":\"running\"}]}}",
+    };
+    var transport: Transport = .{ .responses = &responses };
+    const result = try waitForWorkspaceProcessWithTransportAlloc(
+        allocator,
+        std.testing.io,
+        null,
+        "term:session:42",
+        1_000,
+        .{ .context = &transport, .request = Transport.request },
+        0,
+    );
+    defer allocator.free(result);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("completed", jsonString(parsed.value.object.get("outcome").?).?);
+    try std.testing.expectEqualStrings(
+        "term:session:42",
+        jsonString(parsed.value.object.get("process").?.object.get("id").?).?,
+    );
+    try std.testing.expectEqual(@as(usize, 2), transport.next_index);
 }
 
 test "Windows attach console handler catches only interrupt controls" {

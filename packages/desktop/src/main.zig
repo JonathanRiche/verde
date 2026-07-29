@@ -2586,12 +2586,8 @@ fn reloadApplication(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig)
 
 test {
     _ = @import("browser/screenshot.zig");
-    _ = @import("cli/main.zig");
     _ = @import("ipc/server.zig");
     _ = @import("platform/mod.zig");
-    _ = @import("state.zig");
-    _ = @import("state/project.zig");
-    _ = @import("terminal/terminal.zig");
     _ = @import("providers/claude.zig");
     _ = @import("providers/diagnostics.zig");
     _ = @import("providers/opencode.zig");

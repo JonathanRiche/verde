@@ -862,9 +862,9 @@ pub fn syncTerminalDockProcessLifecycle(
                     if (session_snapshot.confirmed_exit)
                         .{ .exit_code = session_snapshot.exit_code, .signal = session_snapshot.signal }
                     else
-                        .{ .foreground_completed = true }
+                        .{}
                 else
-                    .{ .foreground_completed = true };
+                    .{};
                 project.observeTerminalProcess(self.allocator, .{
                     .process_identity = identity,
                     .session_id = active_session_id,
@@ -887,18 +887,24 @@ pub fn syncTerminalDockProcessLifecycle(
 
         const session_running = if (session) |snapshot| snapshot.running else false;
         const confirmed_exit = if (session) |snapshot| snapshot.confirmed_exit else false;
-        if (runtime_process == null or !runtime_process.?.running) {
-            if (session_running or confirmed_exit) {
+        if (confirmed_exit) {
+            _ = project.finishTerminalProcess(self.allocator, active_session_id, .{
+                .exit_code = if (session) |snapshot| snapshot.exit_code else null,
+                .signal = if (session) |snapshot| snapshot.signal else null,
+            }, now_ms) catch |err| {
+                log.warn("failed to retain terminal process outcome: {s}", .{@errorName(err)});
+            };
+            if (!session_running) {
+                _ = releaseLeasesForExactOwner(project, self.allocator, active_session_id, now_ms);
+            }
+        } else if (runtime_process == null or !runtime_process.?.running) {
+            if (project.terminalProcessMissingReady(active_session_id, now_ms)) {
                 _ = project.finishTerminalProcess(self.allocator, active_session_id, .{
-                    .exit_code = if (session) |snapshot| snapshot.exit_code else null,
-                    .signal = if (session) |snapshot| snapshot.signal else null,
-                    .foreground_completed = session_running,
+                    .exit_code = null,
+                    .signal = null,
                 }, now_ms) catch |err| {
                     log.warn("failed to retain terminal process outcome: {s}", .{@errorName(err)});
                 };
-            }
-            if (!session_running and confirmed_exit) {
-                _ = releaseLeasesForExactOwner(project, self.allocator, active_session_id, now_ms);
             }
         }
     }
@@ -918,8 +924,17 @@ pub fn syncTerminalDockProcessLifecycle(
 
 pub fn pollPendingTerminalSessionTeardowns(self: anytype, project_index: usize) void {
     if (project_index >= self.project_controller.projects.items.len) return;
+    pollProjectTerminalSessionTeardowns(self, &self.project_controller.projects.items[project_index]);
+}
+
+pub fn pollArchivedTerminalSessionTeardowns(self: anytype) void {
+    for (self.project_controller.archived_projects.items) |*project| {
+        pollProjectTerminalSessionTeardowns(self, project);
+    }
+}
+
+fn pollProjectTerminalSessionTeardowns(self: anytype, project: *Project) void {
     const now_ms = unixTimestampMs();
-    var project = &self.project_controller.projects.items[project_index];
     var index: usize = 0;
     while (index < project.pending_terminal_teardowns.items.len) {
         var teardown = &project.pending_terminal_teardowns.items[index];
@@ -938,6 +953,8 @@ pub fn pollPendingTerminalSessionTeardowns(self: anytype, project_index: usize) 
                 .cancellation_reason = completion.cancellation_reason,
             }, now_ms) catch |err| {
                 log.warn("failed to retain terminal teardown outcome: {s}", .{@errorName(err)});
+                index += 1;
+                continue;
             };
             _ = releaseLeasesForExactOwner(project, self.allocator, session_id, now_ms);
         }
@@ -962,7 +979,34 @@ pub fn finishTerminalSessionsForTeardown(
         log.warn("failed to retain queued terminal teardown ownership", .{});
         return false;
     }
-    self.pollPendingTerminalSessionTeardowns(project_index);
+    return true;
+}
+
+pub fn prepareProjectTerminalSessionsForTeardown(
+    self: anytype,
+    project_index: usize,
+    reason: terminal.SessionTeardownReason,
+) bool {
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    {
+        const dock = &self.project_controller.projects.items[project_index].terminal_dock;
+        self.syncTerminalDockProcessLifecycle(project_index, 0, dock, null);
+        if (!self.finishTerminalSessionsForTeardown(project_index, dock, reason)) return false;
+    }
+
+    var dock_index: usize = 0;
+    while (dock_index < self.project_controller.projects.items[project_index].terminal_docks.items.len) : (dock_index += 1) {
+        const entry = &self.project_controller.projects.items[project_index].terminal_docks.items[dock_index];
+        self.syncTerminalDockProcessLifecycle(project_index, entry.id, &entry.dock, null);
+        if (!self.finishTerminalSessionsForTeardown(project_index, &entry.dock, reason)) return false;
+    }
+
+    for (self.project_controller.projects.items[project_index].managed_processes.items) |*process| {
+        process.status = .stopped;
+        process.explicit_stop = true;
+        process.next_restart_ms = 0;
+        process.pending_watch_restart_ms = 0;
+    }
     return true;
 }
 
@@ -1694,7 +1738,11 @@ pub fn openThreadInTui(self: anytype, project_index: usize, thread_index: usize)
 
     if (previous_dock_id) |dock_id| {
         if (self.currentProjectTerminalDockMutable(dock_id)) |old_dock| {
-            old_dock.terminateAllSessions();
+            self.syncTerminalDockProcessLifecycle(project_index, dock_id, old_dock, pane_id);
+            if (!self.finishTerminalSessionsForTeardown(project_index, old_dock, .tui_reopened)) {
+                self.setSidebarNotice("Failed to retain previous TUI lifecycle.");
+                return;
+            }
         }
     }
 

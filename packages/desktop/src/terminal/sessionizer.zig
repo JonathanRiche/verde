@@ -651,7 +651,6 @@ const PosixPtyBackend = if (builtin.os.tag == .windows) struct {} else struct {
     fn terminate(self: *Self) bool {
         if (!self.running) return false;
         if (!self.signalTermination()) return false;
-        self.running = false;
         _ = self.captureExitStatus();
         return true;
     }
@@ -886,7 +885,6 @@ const PtySession = struct {
         // Windows may still own descendants in the ConPTY job after the direct
         // shell exits, so let the backend decide whether termination applies.
         if (!self.backend.terminate()) return false;
-        self.running = false;
         _ = self.captureExitStatus();
         return true;
     }
@@ -1001,8 +999,13 @@ const PtySession = struct {
         // A ConPTY pipe can fail independently of its hosted process. Keep the
         // process handle/waitpid as the sole liveness authority and report pipe
         // health separately so a degraded stream cannot create duplicate PTYs.
-        self.running = self.backend.isRunning();
-        self.exit_status = self.backend.exitStatus();
+        if (builtin.os.tag == .windows) {
+            self.exit_status = self.backend.exitStatus();
+            self.running = self.exit_status == null;
+        } else {
+            self.running = self.backend.isRunning();
+            self.exit_status = self.backend.exitStatus();
+        }
         return was_running and !self.running;
     }
 };
@@ -1439,10 +1442,9 @@ pub const Daemon = struct {
         if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
         const wanted_id = jsonString(params.object.get("id") orelse .null) orelse
             return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing id");
-        for (self.sessions.items, 0..) |session, index| {
+        for (self.sessions.items) |session| {
             if (!std.mem.eql(u8, session.session_id, wanted_id)) continue;
             const signaled = session.terminate();
-            self.removeAt(index);
             return try okValueResponse(self.allocator, id_value, .{ .accepted = true, .signaled = signaled });
         }
         return try errorResponseAlloc(self.allocator, id_value, "not_found", wanted_id);
@@ -2639,6 +2641,11 @@ test "session create reuses running session and replaces stopped session" {
     try std.testing.expectEqual(@as(usize, 1), daemon.sessions.items[0].attach_clients.items.len);
 
     try std.testing.expect(initial.terminate());
+    var attempts: usize = 0;
+    while (attempts < 100 and initial.running) : (attempts += 1) {
+        try initial.poll(allocator);
+        if (initial.running) try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+    }
     try std.testing.expect(!initial.running);
 
     const replacement_response = try daemon.handleRequest(request);
@@ -2647,6 +2654,60 @@ test "session create reuses running session and replaces stopped session" {
     try std.testing.expectEqual(@as(usize, 1), daemon.sessions.items.len);
     try std.testing.expect(daemon.sessions.items[0].running);
     try std.testing.expectEqual(@as(usize, 0), daemon.sessions.items[0].attach_clients.items.len);
+}
+
+test "daemon kill response retains the session until termination is observed" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    const create_request =
+        \\{"jsonrpc":"2.0","id":1,"method":"session.create","params":{"id":"test-kill-confirmation","cwd":".","command":["/bin/cat"],"pref_path":"/tmp"}}
+    ;
+    const create_response = try daemon.handleRequest(create_request);
+    defer allocator.free(create_response);
+    try std.testing.expect(try testSessionCreateResponseWasCreated(allocator, create_response));
+    const session = daemon.sessions.items[0];
+    const child_pid = session.backend.child_pid;
+    const master_fd = session.backend.master_fd;
+    defer session.backend.child_pid = child_pid;
+    defer session.backend.master_fd = master_fd;
+
+    session.backend.child_pid = std.math.maxInt(std.posix.pid_t);
+    session.backend.master_fd = -1;
+    const unsignaled_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"session.kill","params":{"id":"test-kill-confirmation"}}
+    );
+    defer allocator.free(unsignaled_response);
+    var unsignaled = try std.json.parseFromSlice(std.json.Value, allocator, unsignaled_response, .{});
+    defer unsignaled.deinit();
+    const unsignaled_result = unsignaled.value.object.get("result").?.object;
+    try std.testing.expect(jsonBool(unsignaled_result.get("accepted") orelse .null).?);
+    try std.testing.expect(!jsonBool(unsignaled_result.get("signaled") orelse .null).?);
+    try std.testing.expectEqual(@as(usize, 1), daemon.sessions.items.len);
+    try std.testing.expect(session.running);
+
+    session.backend.child_pid = child_pid;
+    session.backend.master_fd = master_fd;
+    const signaled_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"session.kill","params":{"id":"test-kill-confirmation"}}
+    );
+    defer allocator.free(signaled_response);
+    var signaled = try std.json.parseFromSlice(std.json.Value, allocator, signaled_response, .{});
+    defer signaled.deinit();
+    const signaled_result = signaled.value.object.get("result").?.object;
+    try std.testing.expect(jsonBool(signaled_result.get("accepted") orelse .null).?);
+    try std.testing.expect(jsonBool(signaled_result.get("signaled") orelse .null).?);
+    try std.testing.expectEqual(@as(usize, 1), daemon.sessions.items.len);
+
+    var attempts: usize = 0;
+    while (attempts < 100 and session.running) : (attempts += 1) {
+        try session.poll(allocator);
+        if (session.running) try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+    }
+    try std.testing.expect(!session.running);
+    try std.testing.expect(session.exit_status != null);
 }
 
 test "stable session id sanitizes project id" {

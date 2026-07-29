@@ -1148,8 +1148,10 @@ pub const TerminalDockEntry = project_state.TerminalDockEntry;
 pub const ManagedProcessStatus = project_state.ManagedProcessStatus;
 pub const ManagedProcess = project_state.ManagedProcess;
 pub const WorkspaceLease = project_state.WorkspaceLease;
+pub const TrackedTerminalProcess = project_state.TrackedTerminalProcess;
 pub const TerminalProcessOutcome = project_state.TerminalProcessOutcome;
 pub const TerminalProcessOutcomeStatus = project_state.TerminalProcessOutcomeStatus;
+pub const TERMINAL_PROCESS_EXIT_GRACE_MS = project_state.TERMINAL_PROCESS_EXIT_GRACE_MS;
 
 pub const CommandClass = workspace_controller.CommandClass;
 pub const classifyWorkspaceCommand = workspace_controller.classifyWorkspaceCommand;
@@ -2553,16 +2555,18 @@ pub const AppState = struct {
         else
             false;
         if (closed_active_browser) self.deactivateBrowserRuntime(true);
-        var removed = self.project_controller.projects.orderedRemove(index);
-        removed.archived = true;
-        removed.terminal_dock.visible = false;
-        removed.terminateWorkspaceSessions();
-        self.project_controller.archived_projects.append(self.allocator, removed) catch |err| {
-            var failed = removed;
-            failed.deinit(self.allocator);
+        self.project_controller.archived_projects.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.setSidebarNotice(@errorName(err));
             return false;
         };
+        if (!self.prepareProjectTerminalSessionsForTeardown(index, .workspace_closed)) {
+            self.setSidebarNotice("Failed to retain workspace terminal lifecycle.");
+            return false;
+        }
+        var removed = self.project_controller.projects.orderedRemove(index);
+        removed.archived = true;
+        removed.terminal_dock.visible = false;
+        self.project_controller.archived_projects.appendAssumeCapacity(removed);
 
         if (self.project_controller.projects.items.len == 0) {
             self.project_controller.selected_index = 0;
@@ -4340,8 +4344,10 @@ pub const AppState = struct {
     pub const pollTerminalDockBeforeRead = workspace_controller.pollTerminalDockBeforeRead;
     pub const pollWorkspaceTerminalProcessLifecycles = workspace_controller.pollWorkspaceTerminalProcessLifecycles;
     pub const pollPendingTerminalSessionTeardowns = workspace_controller.pollPendingTerminalSessionTeardowns;
+    pub const pollArchivedTerminalSessionTeardowns = workspace_controller.pollArchivedTerminalSessionTeardowns;
     pub const syncTerminalDockProcessLifecycle = workspace_controller.syncTerminalDockProcessLifecycle;
     pub const finishTerminalSessionsForTeardown = workspace_controller.finishTerminalSessionsForTeardown;
+    pub const prepareProjectTerminalSessionsForTeardown = workspace_controller.prepareProjectTerminalSessionsForTeardown;
     pub const terminalPaneScreenText = workspace_controller.terminalPaneScreenText;
     pub const pruneExpiredWorkspaceLeases = workspace_controller.pruneExpiredWorkspaceLeases;
     pub const acquireWorkspaceLease = workspace_controller.acquireWorkspaceLease;
@@ -8489,6 +8495,287 @@ test "terminal teardown prefers the revived live session owner" {
         "persisted-session",
         state.project_controller.projects.items[0].workspace_leases.items[0].owner,
     );
+}
+
+test "active TUI replacement retains teardown ownership until confirmed exit" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.surface_controller = .{};
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.surface_controller.surfaces.deinit(allocator);
+    }
+
+    var project = try Project.init(allocator, "replace-tui", "Replace TUI", "/tmp/replace-tui", 0);
+    try project.terminal_dock.restartWithProfile(allocator, project.path, .{
+        .kind = .custom,
+        .label = "old TUI",
+        .command = &.{ "/bin/sh", "-c", "sleep 30" },
+    });
+    try terminal.lifecycle_testing.assignActiveSessionId(&project.terminal_dock, allocator, "replace-tui-session");
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    const dock = &state.project_controller.projects.items[0].terminal_dock;
+    _ = try dock.poll(allocator);
+    state.syncTerminalDockProcessLifecycle(0, 0, dock, null);
+    const live_session_id = try allocator.dupe(u8, dock.activeSessionId() orelse return error.MissingSessionId);
+    defer allocator.free(live_session_id);
+    const build = [_][]const u8{"build"};
+    _ = try state.acquireWorkspaceLease(0, live_session_id, "mise run build", &build, 60_000, false);
+
+    try std.testing.expect(state.finishTerminalSessionsForTeardown(0, dock, .tui_reopened));
+    try std.testing.expectEqual(@as(usize, 1), state.project_controller.projects.items[0].pending_terminal_teardowns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.activeWorkspaceLeaseCount(0));
+
+    var attempts: usize = 0;
+    while (attempts < 100 and state.project_controller.projects.items[0].pending_terminal_teardowns.items.len > 0) : (attempts += 1) {
+        state.pollPendingTerminalSessionTeardowns(0);
+        if (state.project_controller.projects.items[0].pending_terminal_teardowns.items.len > 0) {
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+        }
+    }
+    const retained = &state.project_controller.projects.items[0];
+    try std.testing.expectEqual(@as(usize, 0), retained.pending_terminal_teardowns.items.len);
+    try std.testing.expectEqual(@as(usize, 0), retained.workspace_leases.items.len);
+    try std.testing.expectEqual(@as(usize, 1), retained.terminal_process_outcomes.items.len);
+    try std.testing.expectEqual(TerminalProcessOutcomeStatus.cancelled, retained.terminal_process_outcomes.items[0].status);
+    try std.testing.expectEqualStrings("agent TUI reopened", retained.terminal_process_outcomes.items[0].cancellation_reason.?);
+}
+
+test "pending teardown retries outcome retention before releasing its exact-owner lease" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.surface_controller = .{};
+    defer {
+        state.allocator = allocator;
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.surface_controller.surfaces.deinit(allocator);
+    }
+
+    var project = try Project.init(allocator, "teardown-atomic", "Teardown atomic", "/tmp/teardown-atomic", 0);
+    try project.terminal_dock.restartWithProfile(allocator, project.path, .{
+        .kind = .custom,
+        .label = "teardown atomic",
+        .command = &.{ "/bin/sh", "-c", "sleep 30" },
+    });
+    try terminal.lifecycle_testing.assignActiveSessionId(&project.terminal_dock, allocator, "teardown-atomic-session");
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    const dock = &state.project_controller.projects.items[0].terminal_dock;
+    _ = try dock.poll(allocator);
+    state.syncTerminalDockProcessLifecycle(0, 0, dock, null);
+    const session_id = try allocator.dupe(u8, dock.activeSessionId() orelse return error.MissingSessionId);
+    defer allocator.free(session_id);
+    const process_id = try allocator.dupe(
+        u8,
+        state.project_controller.projects.items[0].terminalProcessActiveForSession(session_id).?.process_id,
+    );
+    defer allocator.free(process_id);
+    const build = [_][]const u8{"build"};
+    _ = try state.acquireWorkspaceLease(0, session_id, "mise run build", &build, 60_000, false);
+    try std.testing.expect(state.finishTerminalSessionsForTeardown(0, dock, .pane_closed));
+
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const completion = try state.project_controller.projects.items[0].pending_terminal_teardowns.items[0].poll(allocator);
+        if (completion != null) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+    }
+    try std.testing.expect((try state.project_controller.projects.items[0].pending_terminal_teardowns.items[0].poll(allocator)) != null);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    state.allocator = failing.allocator();
+    state.pollPendingTerminalSessionTeardowns(0);
+    state.allocator = allocator;
+
+    const retained = &state.project_controller.projects.items[0];
+    try std.testing.expectEqual(@as(usize, 1), retained.pending_terminal_teardowns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), retained.workspace_leases.items.len);
+    try std.testing.expectEqualStrings(session_id, retained.workspace_leases.items[0].owner);
+    try std.testing.expectEqualStrings(process_id, retained.terminalProcessActiveForSession(session_id).?.process_id);
+    try std.testing.expectEqual(@as(usize, 0), retained.terminal_process_outcomes.items.len);
+
+    state.pollPendingTerminalSessionTeardowns(0);
+    try std.testing.expectEqual(@as(usize, 0), retained.pending_terminal_teardowns.items.len);
+    try std.testing.expectEqual(@as(usize, 0), retained.workspace_leases.items.len);
+    try std.testing.expectEqual(@as(usize, 1), retained.terminal_process_outcomes.items.len);
+    try std.testing.expectEqualStrings(process_id, retained.terminal_process_outcomes.items[0].process_id);
+}
+
+test "daemon teardown failures retain exact-owner leases at the state boundary" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.surface_controller = .{};
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.surface_controller.surfaces.deinit(allocator);
+    }
+
+    const cases = [_]struct {
+        id: []const u8,
+        running: bool,
+        resource: []const u8,
+    }{
+        .{ .id = "daemon-unsignaled", .running = true, .resource = "build" },
+        .{ .id = "daemon-unavailable", .running = false, .resource = "deps" },
+    };
+    for (cases, 0..) |case, project_index| {
+        var project = try Project.init(allocator, case.id, case.id, "/tmp/daemon-boundary", 0);
+        try project.terminal_dock.restartWithProfile(allocator, project.path, .{
+            .kind = .custom,
+            .label = case.id,
+            .command = &.{ "/bin/sh", "-c", "sleep 30" },
+        });
+        try terminal.lifecycle_testing.assignActiveSessionId(&project.terminal_dock, allocator, case.id);
+        state.project_controller.projects.append(allocator, project) catch |err| {
+            project.deinit(allocator);
+            return err;
+        };
+        const dock = &state.project_controller.projects.items[project_index].terminal_dock;
+        _ = try dock.poll(allocator);
+        state.syncTerminalDockProcessLifecycle(project_index, 0, dock, null);
+        const session_id = try allocator.dupe(u8, dock.activeSessionId() orelse return error.MissingSessionId);
+        defer allocator.free(session_id);
+        const resources = [_][]const u8{case.resource};
+        _ = try state.acquireWorkspaceLease(project_index, session_id, case.id, &resources, 60_000, false);
+
+        if (case.running) {
+            try terminal.lifecycle_testing.simulateActiveDaemonKillResponse(
+                dock,
+                "{\"result\":{\"accepted\":true,\"signaled\":false}}",
+            );
+        } else {
+            try terminal.lifecycle_testing.simulateActiveDaemonUnavailable(dock, false);
+        }
+        try std.testing.expect(state.finishTerminalSessionsForTeardown(project_index, dock, .pane_closed));
+        defer {
+            const pending = &state.project_controller.projects.items[project_index].pending_terminal_teardowns;
+            if (pending.items.len > 0) terminal.lifecycle_testing.restoreTeardownLocal(&pending.items[0]);
+        }
+        state.pollPendingTerminalSessionTeardowns(project_index);
+
+        const retained = &state.project_controller.projects.items[project_index];
+        try std.testing.expectEqual(@as(usize, 1), retained.pending_terminal_teardowns.items.len);
+        try std.testing.expect(!retained.pending_terminal_teardowns.items[0].cancellation_initiated);
+        try std.testing.expectEqual(@as(usize, 1), retained.workspace_leases.items.len);
+        try std.testing.expectEqualStrings(session_id, retained.workspace_leases.items[0].owner);
+        try std.testing.expect(retained.terminalProcessActiveForSession(session_id) != null);
+        try std.testing.expectEqual(@as(usize, 0), retained.terminal_process_outcomes.items.len);
+
+        if (case.running) {
+            terminal.lifecycle_testing.signalTeardownForConfirmedExit(&retained.pending_terminal_teardowns.items[0]);
+            var attempts: usize = 0;
+            var snapshot: terminal.SessionSnapshot = .{ .running = true };
+            while (attempts < 100 and !snapshot.confirmed_exit) : (attempts += 1) {
+                snapshot = try terminal.lifecycle_testing.pollTeardownSession(
+                    &retained.pending_terminal_teardowns.items[0],
+                    allocator,
+                );
+                if (!snapshot.confirmed_exit) {
+                    try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+                }
+            }
+            try std.testing.expect(snapshot.confirmed_exit);
+            state.pollPendingTerminalSessionTeardowns(project_index);
+            try std.testing.expectEqual(@as(usize, 0), retained.pending_terminal_teardowns.items.len);
+            try std.testing.expectEqual(@as(usize, 0), retained.workspace_leases.items.len);
+            try std.testing.expect(retained.terminalProcessActiveForSession(session_id) == null);
+            try std.testing.expectEqual(@as(usize, 1), retained.terminal_process_outcomes.items.len);
+            try std.testing.expectEqual(TerminalProcessOutcomeStatus.crashed, retained.terminal_process_outcomes.items[0].status);
+            try std.testing.expect(retained.terminal_process_outcomes.items[0].cancellation_reason == null);
+        }
+    }
+}
+
+test "workspace archive retains active terminal teardown until archived polling confirms exit" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.archived_projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.surface_controller = .{};
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        for (state.project_controller.archived_projects.items) |*project| {
+            project.deinit(allocator);
+        }
+        state.project_controller.archived_projects.deinit(allocator);
+        state.surface_controller.surfaces.deinit(allocator);
+    }
+
+    var project = try Project.init(allocator, "archive-terminal", "Archive terminal", "/tmp/archive-terminal", 0);
+    try project.terminal_dock.restartWithProfile(allocator, project.path, .{
+        .kind = .custom,
+        .label = "archive terminal",
+        .command = &.{ "/bin/sh", "-c", "sleep 30" },
+    });
+    try terminal.lifecycle_testing.assignActiveSessionId(&project.terminal_dock, allocator, "archive-terminal-session");
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    const dock = &state.project_controller.projects.items[0].terminal_dock;
+    _ = try dock.poll(allocator);
+    state.syncTerminalDockProcessLifecycle(0, 0, dock, null);
+    const live_session_id = try allocator.dupe(u8, dock.activeSessionId() orelse return error.MissingSessionId);
+    defer allocator.free(live_session_id);
+    const leaf = dock.activePane() orelse return error.MissingTerminalPane;
+    if (leaf.session_id) |stored| allocator.free(stored);
+    leaf.session_id = try allocator.dupe(u8, "stale-persisted-session");
+    const build = [_][]const u8{"build"};
+    const dependencies = [_][]const u8{"deps"};
+    _ = try state.acquireWorkspaceLease(0, live_session_id, "mise run build", &build, 60_000, false);
+    _ = try state.acquireWorkspaceLease(0, "stale-persisted-session", "bun install", &dependencies, 60_000, false);
+
+    try std.testing.expect(state.prepareProjectTerminalSessionsForTeardown(0, .workspace_closed));
+    try std.testing.expectEqual(@as(usize, 1), state.project_controller.projects.items[0].pending_terminal_teardowns.items.len);
+    try std.testing.expectEqual(@as(usize, 2), state.activeWorkspaceLeaseCount(0));
+
+    var archived = state.project_controller.projects.orderedRemove(0);
+    archived.archived = true;
+    try state.project_controller.archived_projects.append(allocator, archived);
+    try std.testing.expectEqual(@as(usize, 1), state.project_controller.archived_projects.items[0].pending_terminal_teardowns.items.len);
+    try std.testing.expectEqual(@as(usize, 2), state.project_controller.archived_projects.items[0].workspace_leases.items.len);
+
+    try std.testing.expectEqualStrings(
+        live_session_id,
+        state.project_controller.archived_projects.items[0].pending_terminal_teardowns.items[0].sessionId().?,
+    );
+    var attempts: usize = 0;
+    while (attempts < 100 and state.project_controller.archived_projects.items[0].pending_terminal_teardowns.items.len > 0) : (attempts += 1) {
+        state.pollArchivedTerminalSessionTeardowns();
+        if (state.project_controller.archived_projects.items[0].pending_terminal_teardowns.items.len > 0) {
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+        }
+    }
+    const archived_project = &state.project_controller.archived_projects.items[0];
+    try std.testing.expectEqual(@as(usize, 0), archived_project.pending_terminal_teardowns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), archived_project.workspace_leases.items.len);
+    try std.testing.expectEqualStrings("stale-persisted-session", archived_project.workspace_leases.items[0].owner);
+    try std.testing.expectEqual(@as(usize, 1), archived_project.terminal_process_outcomes.items.len);
+    try std.testing.expectEqual(TerminalProcessOutcomeStatus.cancelled, archived_project.terminal_process_outcomes.items[0].status);
 }
 
 test "daemon diff event becomes a persisted live timeline event" {
