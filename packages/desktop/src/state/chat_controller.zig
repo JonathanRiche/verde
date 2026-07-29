@@ -56,6 +56,7 @@ const upsertPendingToolCallEvent = utils.upsertPendingToolCallEvent;
 const slashCommandFallbackName = command_controller.slashCommandFallbackName;
 const pendingTimelineEventsContainAssistant = utils.pendingTimelineEventsContainAssistant;
 const BACKGROUND_TASK_POLL_MS: i64 = 1000;
+const CODEX_BACKGROUND_TASK_POLL_MS: i64 = 2000;
 const OPENCODE_LOGO_BYTES = @embedFile("../assets/opencode-logo-dark.png");
 const CODEX_LOGO_BYTES = @embedFile("../assets/OpenAI-white-monoblossom.png");
 const CLAUDE_LOGO_BYTES = @embedFile("../assets/claude-logo.png");
@@ -425,6 +426,7 @@ fn finishTitleGenerationFailure(state: *TitleGenerationState, message: []const u
 
 pub const State = struct {
     pending_send_count: usize = 0,
+    codex_background_poll: CodexBackgroundPollState = .{},
 
     pub fn beginSend(self: *State) void {
         self.pending_send_count += 1;
@@ -438,6 +440,60 @@ pub const State = struct {
         return self.pending_send_count > 0;
     }
 };
+
+const CodexBackgroundPollStatus = enum {
+    idle,
+    pending,
+    completed,
+};
+
+const CodexBackgroundPollRequest = struct {
+    local_thread_id: []u8,
+    provider_thread_id: []u8,
+    process_id: []u8,
+    cwd: []u8,
+    remote_host: ?[]u8,
+
+    fn deinit(self: *CodexBackgroundPollRequest) void {
+        const allocator = std.heap.page_allocator;
+        allocator.free(self.local_thread_id);
+        allocator.free(self.provider_thread_id);
+        allocator.free(self.process_id);
+        allocator.free(self.cwd);
+        if (self.remote_host) |value| allocator.free(value);
+        allocator.destroy(self);
+    }
+};
+
+const CodexBackgroundPollState = struct {
+    mutex: std.Io.Mutex = .init,
+    worker: ?std.Thread = null,
+    request: ?*CodexBackgroundPollRequest = null,
+    status: CodexBackgroundPollStatus = .idle,
+    running: ?bool = null,
+};
+
+fn codexBackgroundPollWorker(state: *CodexBackgroundPollState, request: *const CodexBackgroundPollRequest) void {
+    const allocator = std.heap.page_allocator;
+    const config: ai_harness.ProviderConfig = .{ .codex = .{
+        .cwd = request.cwd,
+        .launch_on_connect = false,
+        .remote_ssh = if (request.remote_host) |host| .{ .host = host, .cwd = request.cwd } else null,
+    } };
+    var running: ?bool = null;
+    if (ai_harness.connect(allocator, config)) |client_value| {
+        var client = client_value;
+        defer client.deinit();
+        running = client.backgroundTerminalIsRunning(request.provider_thread_id, request.process_id) catch null;
+    } else |_| {}
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    state.mutex.lockUncancelable(io);
+    state.running = running;
+    state.status = .completed;
+    state.mutex.unlock(io);
+    loop_wakeup.notify();
+}
 
 pub fn resolveApprovalLocked(send_state: *SendState, decision: ai_harness.ApprovalDecision) bool {
     if (send_state.pending_approval == null) return false;
@@ -1621,7 +1677,7 @@ pub fn threadHasRunningBackgroundTasks(thread: *const ChatThread) bool {
 }
 
 pub fn pollBackgroundTasks(self: anytype) bool {
-    var changed = false;
+    var changed = finishCodexBackgroundPoll(self);
     for (self.project_controller.projects.items, 0..) |*project, project_index| {
         for (project.threads.items, 0..) |*thread, thread_index| {
             changed = self.pollThreadBackgroundTasks(project_index, thread_index, thread) or changed;
@@ -1630,7 +1686,168 @@ pub fn pollBackgroundTasks(self: anytype) bool {
             changed = self.pollThreadBackgroundTasks(project_index, null, thread) or changed;
         }
     }
+    startCodexBackgroundPoll(self);
     return changed;
+}
+
+fn startCodexBackgroundPoll(self: anytype) void {
+    const poll = &self.chat_controller.codex_background_poll;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    poll.mutex.lockUncancelable(io);
+    const busy = poll.status != .idle or poll.worker != null;
+    poll.mutex.unlock(io);
+    if (busy) return;
+
+    const now_ms = unixTimestampMs();
+    for (self.project_controller.projects.items, 0..) |*project, project_index| {
+        for (project.threads.items) |*thread| {
+            if (startCodexBackgroundPollForThread(self, poll, project_index, thread, now_ms)) return;
+        }
+        for (project.archived_threads.items) |*thread| {
+            if (startCodexBackgroundPollForThread(self, poll, project_index, thread, now_ms)) return;
+        }
+    }
+}
+
+fn startCodexBackgroundPollForThread(
+    self: anytype,
+    poll: *CodexBackgroundPollState,
+    project_index: usize,
+    thread: *ChatThread,
+    now_ms: i64,
+) bool {
+    for (thread.background_tasks.items) |*task| {
+        if (task.status != .running or task.provider != .codex) continue;
+        if (task.provider_thread_id == null or task.process_id == null) continue;
+        if (task.last_poll_ms != 0 and now_ms - task.last_poll_ms < CODEX_BACKGROUND_TASK_POLL_MS) continue;
+        const target = self.providerExecutionTargetForProjectThread(project_index, thread, 0) orelse return false;
+        task.last_poll_ms = now_ms;
+
+        const allocator = std.heap.page_allocator;
+        const request = allocator.create(CodexBackgroundPollRequest) catch return false;
+        request.* = .{
+            .local_thread_id = allocator.dupe(u8, thread.local_thread_id) catch {
+                allocator.destroy(request);
+                return false;
+            },
+            .provider_thread_id = undefined,
+            .process_id = undefined,
+            .cwd = undefined,
+            .remote_host = null,
+        };
+        request.provider_thread_id = allocator.dupe(u8, task.provider_thread_id.?) catch {
+            allocator.free(request.local_thread_id);
+            allocator.destroy(request);
+            return false;
+        };
+        request.process_id = allocator.dupe(u8, task.process_id.?) catch {
+            allocator.free(request.provider_thread_id);
+            allocator.free(request.local_thread_id);
+            allocator.destroy(request);
+            return false;
+        };
+        request.cwd = allocator.dupe(u8, target.cwd()) catch {
+            allocator.free(request.process_id);
+            allocator.free(request.provider_thread_id);
+            allocator.free(request.local_thread_id);
+            allocator.destroy(request);
+            return false;
+        };
+        request.remote_host = if (target.remoteHost()) |host| allocator.dupe(u8, host) catch {
+            request.deinit();
+            return false;
+        } else null;
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        poll.mutex.lockUncancelable(io);
+        poll.request = request;
+        poll.running = null;
+        poll.status = .pending;
+        poll.worker = std.Thread.spawn(.{}, codexBackgroundPollWorker, .{ poll, request }) catch {
+            poll.request = null;
+            poll.status = .idle;
+            poll.mutex.unlock(io);
+            request.deinit();
+            return false;
+        };
+        poll.mutex.unlock(io);
+        return true;
+    }
+    return false;
+}
+
+fn finishCodexBackgroundPoll(self: anytype) bool {
+    const poll = &self.chat_controller.codex_background_poll;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    poll.mutex.lockUncancelable(io);
+    if (poll.status != .completed) {
+        poll.mutex.unlock(io);
+        return false;
+    }
+    const running = poll.running;
+    const request = poll.request.?;
+    const worker = poll.worker.?;
+    poll.worker = null;
+    poll.request = null;
+    poll.running = null;
+    poll.status = .idle;
+    poll.mutex.unlock(io);
+    worker.join();
+    defer request.deinit();
+    if (running == null or running.?) return false;
+    return completeCodexBackgroundTask(self, request);
+}
+
+fn completeCodexBackgroundTask(self: anytype, request: *const CodexBackgroundPollRequest) bool {
+    for (self.project_controller.projects.items, 0..) |*project, project_index| {
+        for (project.threads.items, 0..) |*thread, thread_index| {
+            if (!std.mem.eql(u8, thread.local_thread_id, request.local_thread_id)) continue;
+            return completeCodexBackgroundTaskInThread(self, project_index, thread_index, thread, request);
+        }
+        for (project.archived_threads.items) |*thread| {
+            if (!std.mem.eql(u8, thread.local_thread_id, request.local_thread_id)) continue;
+            return completeCodexBackgroundTaskInThread(self, project_index, null, thread, request);
+        }
+    }
+    return false;
+}
+
+fn completeCodexBackgroundTaskInThread(
+    self: anytype,
+    project_index: usize,
+    thread_index: ?usize,
+    thread: *ChatThread,
+    request: *const CodexBackgroundPollRequest,
+) bool {
+    for (thread.background_tasks.items) |*task| {
+        if (task.status != .running or task.provider_thread_id == null or task.process_id == null) continue;
+        if (!std.mem.eql(u8, task.provider_thread_id.?, request.provider_thread_id) or
+            !std.mem.eql(u8, task.process_id.?, request.process_id)) continue;
+        task.status = .completed;
+        task.updated_at_ms = unixTimestampMs();
+        const body = backgroundTaskCompletionBodyAlloc(self.allocator, task) catch return false;
+        defer self.allocator.free(body);
+        self.appendMessageToThread(thread, .system, "Background task completed", body, null, &.{}) catch return false;
+        self.project_controller.projects.items[project_index].invalidateSidebarThreadCache();
+        if (project_index == self.project_controller.selected_index and thread_index != null and
+            thread_index.? == self.currentProject().selected_thread_index)
+        {
+            self.requestTranscriptScrollToBottom();
+        }
+        return true;
+    }
+    return false;
+}
+
+pub fn deinitBackgroundTaskPoller(self: anytype) void {
+    const poll = &self.chat_controller.codex_background_poll;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    poll.mutex.lockUncancelable(io);
+    const worker = poll.worker;
+    poll.mutex.unlock(io);
+    if (worker) |thread| thread.join();
+    if (poll.request) |request| request.deinit();
+    poll.* = .{};
 }
 
 pub fn pollThreadBackgroundTasks(self: anytype, project_index: usize, thread_index: ?usize, thread: *ChatThread) bool {

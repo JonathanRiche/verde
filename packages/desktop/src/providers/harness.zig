@@ -139,6 +139,13 @@ pub const ProviderClient = union(Provider) {
         };
     }
 
+    pub fn backgroundTerminalIsRunning(self: *ProviderClient, thread_id: []const u8, process_id: []const u8) !bool {
+        return switch (self.*) {
+            .codex => |*client| client.backgroundTerminalIsRunning(thread_id, process_id),
+            else => error.UnsupportedOperation,
+        };
+    }
+
     pub fn steerThread(self: *ProviderClient, request: SteerThreadRequest) !void {
         return switch (self.*) {
             .opencode => |*client| client.steerThread(request),
