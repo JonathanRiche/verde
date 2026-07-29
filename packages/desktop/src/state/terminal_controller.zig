@@ -574,7 +574,7 @@ fn finishTerminalFocusRequest(self: anytype) void {
     }
 }
 
-fn canRouteTerminalInput(self: anytype) bool {
+pub fn canRouteTerminalInput(self: anytype) bool {
     if (!self.terminal_controller.focused or !self.isTerminalVisible()) return false;
     if (self.shouldRenderLegacyTerminalDockInChat()) return true;
     return self.focusedWorkspacePaneKind() == .terminal;
