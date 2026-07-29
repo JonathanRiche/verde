@@ -258,7 +258,10 @@ pub const State = struct {
 };
 
 test "browser runtime ownership follows workspace moves and removals" {
-    var state: State = .{ .runtime_project_index = 2 };
+    var state = try State.init(std.testing.allocator);
+    defer state.deinit(std.testing.allocator);
+    state.runtime_project_index = 2;
+
     state.projectMoved(0, 2);
     try std.testing.expectEqual(@as(?usize, 1), state.runtime_project_index);
 

@@ -2846,6 +2846,7 @@ pub const AppState = struct {
     pub const noteTerminalInputActivity = terminal_controller.noteTerminalInputActivity;
     pub const pollTerminals = terminal_controller.pollTerminals;
     pub const drainTerminalDockNotifications = terminal_controller.drainTerminalDockNotifications;
+    pub const canRouteTerminalInput = terminal_controller.canRouteTerminalInput;
     pub const handleTerminalKeyDown = terminal_controller.handleTerminalKeyDown;
     pub const handleTerminalTextInput = terminal_controller.handleTerminalTextInput;
     pub const requestTerminalFocus = terminal_controller.requestTerminalFocus;
