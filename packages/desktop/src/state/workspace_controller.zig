@@ -832,6 +832,27 @@ pub fn syncTerminalDockProcessLifecycle(
     dock: *terminal.Dock,
     pane_id_override: ?WorkspacePaneId,
 ) void {
+    syncTerminalDockProcessLifecycleInner(self, project_index, dock_id, dock, pane_id_override, true);
+}
+
+pub fn syncTerminalDockProcessLifecycleAfterTeardownPoll(
+    self: anytype,
+    project_index: usize,
+    dock_id: u32,
+    dock: *terminal.Dock,
+    pane_id_override: ?WorkspacePaneId,
+) void {
+    syncTerminalDockProcessLifecycleInner(self, project_index, dock_id, dock, pane_id_override, false);
+}
+
+fn syncTerminalDockProcessLifecycleInner(
+    self: anytype,
+    project_index: usize,
+    dock_id: u32,
+    dock: *terminal.Dock,
+    pane_id_override: ?WorkspacePaneId,
+    poll_pending_teardowns: bool,
+) void {
     if (project_index >= self.project_controller.projects.items.len) return;
     const now_ms = unixTimestampMs();
     var project = &self.project_controller.projects.items[project_index];
@@ -840,7 +861,7 @@ pub fn syncTerminalDockProcessLifecycle(
     if (!adoptTerminalSessionTeardowns(project, self.allocator, dock)) {
         log.warn("failed to retain pending terminal teardown ownership", .{});
     }
-    self.pollPendingTerminalSessionTeardowns(project_index);
+    if (poll_pending_teardowns) self.pollPendingTerminalSessionTeardowns(project_index);
 
     const lifecycle_snapshots = dock.sessionLifecycleSnapshotsAlloc(self.allocator) catch return;
     defer self.allocator.free(lifecycle_snapshots);

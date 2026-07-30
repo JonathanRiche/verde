@@ -182,7 +182,34 @@ pub fn requestAlloc(
     params: anytype,
     request_id: u64,
 ) ![]u8 {
-    const result = try requestWithPeerAlloc(allocator, pref_path, method, params, request_id);
+    return requestAllocMaxResponse(
+        allocator,
+        pref_path,
+        method,
+        params,
+        request_id,
+        SESSIONIZER_MAX_MESSAGE_BYTES,
+    );
+}
+
+/// Sends one daemon request while bounding the response scratch allocation.
+pub fn requestAllocMaxResponse(
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    method: []const u8,
+    params: anytype,
+    request_id: u64,
+    max_response_bytes: usize,
+) ![]u8 {
+    std.debug.assert(max_response_bytes > 0 and max_response_bytes <= SESSIONIZER_MAX_MESSAGE_BYTES);
+    const result = try requestWithPeerAlloc(
+        allocator,
+        pref_path,
+        method,
+        params,
+        request_id,
+        max_response_bytes,
+    );
     return result.response;
 }
 
@@ -197,6 +224,7 @@ fn requestWithPeerAlloc(
     method: []const u8,
     params: anytype,
     request_id: u64,
+    max_response_bytes: usize,
 ) !RequestResult {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
@@ -220,7 +248,7 @@ fn requestWithPeerAlloc(
     if (builtin.os.tag == .windows) {
         const result = try platform_ipc.requestWithPeerAlloc(allocator, socket_path, request_json, .{
             .max_message_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
-            .max_response_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
+            .max_response_bytes = max_response_bytes,
             .timeout_ms = SESSIONIZER_REQUEST_TIMEOUT_MS,
         });
         return .{
@@ -239,7 +267,7 @@ fn requestWithPeerAlloc(
     try writer.interface.writeByte('\n');
     try writer.interface.flush();
 
-    const read_buffer = try allocator.alloc(u8, 8 * 1024 * 1024);
+    const read_buffer = try allocator.alloc(u8, max_response_bytes);
     defer allocator.free(read_buffer);
     var reader = stream.reader(io, read_buffer);
     const line = try reader.interface.takeDelimiter('\n') orelse return error.ConnectionAborted;
@@ -265,7 +293,7 @@ pub fn ensureDaemon(allocator: std.mem.Allocator, pref_path: []const u8, exe_pat
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
 
-    if (requestWithPeerAlloc(allocator, pref_path, "status", .{}, 0)) |result| {
+    if (requestWithPeerAlloc(allocator, pref_path, "status", .{}, 0, SESSIONIZER_MAX_MESSAGE_BYTES)) |result| {
         defer allocator.free(result.response);
         if (parseDaemonStatus(allocator, result.response)) |status| {
             if (status.protocol_version == PROTOCOL_VERSION) return;

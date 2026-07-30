@@ -4347,6 +4347,7 @@ pub const AppState = struct {
     pub const pollPendingTerminalSessionTeardowns = workspace_controller.pollPendingTerminalSessionTeardowns;
     pub const pollArchivedTerminalSessionTeardowns = workspace_controller.pollArchivedTerminalSessionTeardowns;
     pub const syncTerminalDockProcessLifecycle = workspace_controller.syncTerminalDockProcessLifecycle;
+    pub const syncTerminalDockProcessLifecycleAfterTeardownPoll = workspace_controller.syncTerminalDockProcessLifecycleAfterTeardownPoll;
     pub const finishTerminalSessionsForTeardown = workspace_controller.finishTerminalSessionsForTeardown;
     pub const prepareProjectTerminalSessionsForTeardown = workspace_controller.prepareProjectTerminalSessionsForTeardown;
     pub const terminalPaneScreenText = workspace_controller.terminalPaneScreenText;
