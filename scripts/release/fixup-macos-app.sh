@@ -35,6 +35,7 @@ find_cmd() {
 INSTALL_NAME_TOOL="$(find_cmd install_name_tool llvm-install-name-tool || true)"
 OTOOL="$(find_cmd otool llvm-otool || true)"
 CODESIGN="$(find_cmd codesign codesign || true)"
+CODE_SIGN_IDENTITY="${VERDE_CODESIGN_IDENTITY:--}"
 
 if [[ -z "$INSTALL_NAME_TOOL" ]]; then
   echo "install_name_tool or llvm-install-name-tool is required" >&2
@@ -239,12 +240,20 @@ normalize_sdl3_framework() {
 }
 
 sign_app_bundle() {
+  local sign_args=(--force --sign "$CODE_SIGN_IDENTITY")
+  if [[ "$CODE_SIGN_IDENTITY" != "-" ]]; then
+    sign_args+=(--options runtime)
+    if [[ "$CODE_SIGN_IDENTITY" == "Developer ID Application:"* ]]; then
+      sign_args+=(--timestamp)
+    fi
+  fi
+
   while IFS= read -r -d '' binary; do
     if [[ "$binary" == "$MACOS_DIR/verde" ]]; then
       continue
     fi
 
-    "$CODESIGN" --force --sign - "$binary" >/dev/null
+    "$CODESIGN" "${sign_args[@]}" "$binary" >/dev/null
   done < <(
     find "$MACOS_DIR" -type f -print0 |
       while IFS= read -r -d '' candidate; do
@@ -254,11 +263,18 @@ sign_app_bundle() {
       done
   )
 
-  "$CODESIGN" --force --sign - "$MACOS_DIR/verde" >/dev/null
+  "$CODESIGN" "${sign_args[@]}" "$MACOS_DIR/verde" >/dev/null
 
-  "$CODESIGN" --force --sign - "$APP_DIR" >/dev/null
+  "$CODESIGN" "${sign_args[@]}" "$APP_DIR" >/dev/null
   if ! "$CODESIGN" --verify --strict --verbose=2 "$APP_DIR"; then
-    echo "warning: ad-hoc app signature verification failed during packaging" >&2
+    echo "warning: app signature verification failed during packaging" >&2
+  fi
+
+  if [[ "$CODE_SIGN_IDENTITY" == "-" ]]; then
+    echo "warning: Verde is ad-hoc signed; macOS privacy grants may be requested again after every rebuild" >&2
+    echo "warning: set VERDE_CODESIGN_IDENTITY to a stable Apple Development or Developer ID Application identity" >&2
+  else
+    echo "Signed Verde with identity: $CODE_SIGN_IDENTITY"
   fi
 }
 
