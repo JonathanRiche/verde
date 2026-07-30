@@ -37,9 +37,9 @@ command for your distribution. You can let it install them by setting
 
 ## Authenticate a provider
 
-Verde does not host a model. It drives the coding-agent CLIs already installed on
-your machine, so install and authenticate at least one provider before launching
-the app:
+Verde does not host a model. It drives the coding-agent CLIs already installed
+on your machine, so install and authenticate a GUI provider or install a
+terminal-only provider before launching the app:
 
 | Provider    | Setup                                                                              |
 | ----------- | ---------------------------------------------------------------------------------- |
@@ -47,6 +47,7 @@ the app:
 | Claude Code | Install [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and Node.js, ensure `node` is on `PATH`, then log in. |
 | OpenCode    | Install [OpenCode](https://github.com/anomalyco/opencode); ensure `opencode` is on `PATH`. |
 | Cursor      | Install the [Cursor CLI](https://cursor.com/docs/cli/installation), ensure `agent` is on `PATH`, run `agent login`. `CURSOR_API_KEY` is also supported for headless environments. |
+| Grok        | Install [Grok Build](https://docs.x.ai/build/overview#install); ensure `grok` is on `PATH`. Grok runs as a terminal TUI — launch it from the command palette. |
 | Amp         | Install [Amp](https://ampcode.com); ensure `amp` is on `PATH`. Amp runs as a terminal TUI rather than a chat pane — launch it from the command palette. |
 
 See [Provider setup](/docs/providers) for the full per-provider notes.
@@ -109,9 +110,10 @@ screenshot support and delivery behavior.
 ## Split a terminal
 
 Press `Ctrl+Shift+T` to split a terminal pane next to the focused workspace pane.
-Right-click inside a terminal to spawn shell tabs or agent launch-profile tabs
-(Claude, OpenCode, Codex, Cursor, Amp). Per-terminal zoom (`Ctrl+-` / `Ctrl+=`)
-and the full layout persist across launches.
+Right-click inside a terminal for configured custom launch profiles and pane
+actions. Launch built-in provider TUIs from `Ctrl+Shift+P` or
+`verde live agent open --provider <name>`. Per-terminal zoom (`Ctrl+-` /
+`Ctrl+=`) and the full layout persist across launches.
 
 ## Move around
 

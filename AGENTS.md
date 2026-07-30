@@ -65,6 +65,17 @@ Use Verde's process-coordination facilities when an action starts, owns, or may 
 4. **Release cleanly.** Keep a lease only for the work's necessary lifetime; renew it if the owned task outlives its lifetime, then stop the agent-owned process and release the lease on normal completion, failure, or cancellation. Auto-expiry protects crashes but does not replace normal cleanup.
 5. **Respect other owners.** Never force a conflicting lease, kill another owner's process, reuse another owner's port, or restart Verde without explicit user authorization. Report the tracked process/session, resource lease, and cleanup outcome in the handoff.
 
+`wait_for_process` returning `completed` means the tracked record reached a
+final state, not necessarily that the command succeeded. Inspect the returned
+`process.status`, `exit_code`, `signal`, and `cancellation_reason`. Terminal
+final records are retained in memory for 15 minutes, up to 32 per workspace.
+
+For pane-targeted terminal automation, prefer `send_terminal_key` for one
+validated key or chord. It does not change focus or restart stopped sessions.
+`terminal.write` is raw input, can restart a stopped session, and can execute
+existing input when it includes a carriage return. Use a stable pane id and
+inspect the target before sending Enter or another consequential key.
+
 ### Shared Verde browser runtime
 
 The embedded browser is a shared Verde runtime and can be rebound by open/navigate operations. Always target an explicit workspace; do not casually reset, restart, close, or navigate a browser bound to another active pane/workspace. Browser tests must clean up only the exact browser/test-server process or session they started. Never use broad `pkill chrome` / `pkill chromium` commands or otherwise terminate a user, shared, or other-agent browser session.

@@ -8,9 +8,9 @@ slug: keybinds
 
 ## Default keybinds
 
-These are the defaults, read from `packages/desktop/src/keybinds.zig`. Override
-any of them under `keybinds` in your Verde config — see [Remapping](#remapping)
-below.
+These are the defaults, read from
+`packages/desktop/src/app/keybinds.zig`. Override any of them under `keybinds`
+in your Verde config — see [Remapping](#remapping) below.
 
 ### App
 

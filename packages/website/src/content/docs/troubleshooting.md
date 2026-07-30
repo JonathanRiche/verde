@@ -50,7 +50,8 @@ needed**, run the provider's login command outside Verde and retry. A timed-out
 or failed probe appears as **Could not verify** and should be checked against
 the runtime log.
 
-Amp never appears on this screen because it is a terminal-only provider.
+Grok and Amp never appear on this screen because they are terminal-only
+providers.
 
 ## Linux browser runtime missing
 

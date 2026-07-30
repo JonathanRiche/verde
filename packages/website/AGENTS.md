@@ -40,12 +40,14 @@ Before handing off website changes, run `bun test` and `bun run build`.
 Keep product claims synchronized with the desktop implementation. Useful
 sources of truth include:
 
-- Providers and models: `packages/desktop/src/provider_types.zig` and provider
+- Providers and models: `packages/desktop/src/providers/types.zig`,
+  `packages/desktop/src/state/provider_models.zig`, and provider
   implementations under `packages/desktop/src/providers`.
-- Keybinds: `packages/desktop/src/keybinds.zig`.
+- Keybinds: `packages/desktop/src/app/keybinds.zig`.
 - Command palette and slash commands: `packages/desktop/src/ui/command_palette.zig`
-  and `packages/desktop/src/slash_commands.zig`.
-- CLI: `packages/desktop/src/cli_spec.zig` and `packages/desktop/src/cli.zig`.
+  and `packages/desktop/src/chat/slash_commands.zig`.
+- CLI: `packages/desktop/src/cli/spec.zig` and
+  `packages/desktop/src/cli/main.zig`.
 - Browser and Design Mode: `packages/desktop/src/ui/browser.zig` and the browser
   backend implementations.
 

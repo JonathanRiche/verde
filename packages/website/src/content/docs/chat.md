@@ -19,9 +19,9 @@ screen reports one of these states for each provider:
 - **Could not verify** — the readiness check failed or timed out.
 
 After installing or signing in, choose **Check again**. **Not now** dismisses
-the screen without changing provider configuration. Amp is not listed because
-it runs as a terminal TUI rather than a native chat provider. See
-[Provider setup](/docs/providers) for the exact install and login commands.
+the screen without changing provider configuration. Grok and Amp are not
+listed because they run as terminal TUIs rather than native chat providers.
+See [Provider setup](/docs/providers) for the exact install and login commands.
 
 ## Choose a provider and model
 

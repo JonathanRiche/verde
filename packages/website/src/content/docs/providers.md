@@ -1,6 +1,6 @@
 ---
 title: Provider setup
-description: How Verde talks to local coding-agent CLIs, plus per-provider setup and troubleshooting notes for Codex, Claude Code, OpenCode, Cursor, and Amp.
+description: How Verde talks to local coding-agent CLIs, plus per-provider setup and troubleshooting notes for Codex, Claude Code, OpenCode, Cursor, Grok, and Amp.
 section: Get started
 order: 2
 slug: providers
@@ -23,6 +23,7 @@ machine, and supports each agent in one or both of two modes:
 | Claude Code | ✓        | ✓            | Anthropic's Claude Agent SDK against the local runtime          |
 | OpenCode    | ✓        | ✓            | Drives the `opencode` CLI; starts `opencode serve` on demand    |
 | Cursor      | ✓        | ✓            | Speaks to the Cursor CLI ACP server (`agent acp`)               |
+| Grok        | –        | ✓            | TUI-only — launches Grok Build in a terminal pane               |
 | Amp         | –        | ✓            | TUI-only — launches the `amp` CLI in a terminal pane            |
 
 All of them run against the project directory you imported into Verde. Tokens,
@@ -37,9 +38,10 @@ authentication. Install or sign in using the instructions below, then choose
 **Check again**. **Open setup guide** returns to this page and **Not now**
 dismisses the screen.
 
-Amp is excluded from this check because it is TUI-only. A GUI provider can
-also become unavailable later—for example, after credentials expire—in which
-case sending shows an explicit error instead of dropping the prompt.
+Grok and Amp are excluded from this check because they are TUI-only. A GUI
+provider can also become unavailable later—for example, after credentials
+expire—in which case sending shows an explicit error instead of dropping the
+prompt.
 
 ## Codex
 
@@ -92,6 +94,36 @@ Cursor models that advertise fast-mode support show **Default** and **Fast**
 under the **Run** pill. The row is hidden for Cursor models without that
 capability.
 
+## Grok Build
+
+Install Grok Build using its
+[official setup guide](https://docs.x.ai/build/overview#install) and make sure
+`grok` is on the `PATH` inherited by Verde. Grok is **TUI-only**: it does not
+appear in the chat composer's provider switcher. If Verde cannot find it, open
+`Ctrl+Shift+P` and run **Set Up Grok Build**. Once installed, use **Start New
+Grok TUI** or:
+
+```bash
+verde live agent open --provider grok
+```
+
+Verde checks `PATH` without running Grok and launches managed sessions with
+`grok --no-auto-update` so an update check cannot disrupt the PTY. A managed
+launch also attempts to install Verde's isolated personal status hook. You can
+manage it explicitly in **Settings → Status pip hooks** or from the CLI:
+
+```bash
+verde integrations install grok --global
+verde integrations remove grok --global
+```
+
+The hook lives at `$GROK_HOME/hooks/verde-notify.json`, defaulting to
+`~/.grok/hooks/verde-notify.json`, and remains inert unless Grok inherited a
+Verde terminal identity. It reports idle, working, waiting, done, and error
+activity to the pane and sidebar. After a session completes, Verde also
+best-effort synchronizes Grok's generated session title when its summary file
+becomes available.
+
 ## Amp
 
 Install [Amp](https://ampcode.com) and make sure `amp` is on your `PATH`. Amp
@@ -137,7 +169,8 @@ when you want the agent's native UI rather than Verde's chat surface. The
 command palette (`Ctrl+Shift+P`) has a **Start New … TUI** entry for each of
 Codex, Claude, OpenCode, Cursor, Grok, and Amp, plus **Open Current Thread in TUI**
 entries that promote a running GUI chat thread into that provider's terminal
-TUI. Right-clicking inside a terminal offers the same launch profiles as tabs.
+TUI. Right-clicking inside a terminal offers configured custom launch profiles
+and pane actions; use the palette or CLI for built-in provider TUI actions.
 
 From the CLI:
 

@@ -63,10 +63,10 @@ function About() {
         </h2>
         <p class="band-body">
           Codex, Claude Code, OpenCode, and Cursor can run in Verde's native
-          chat interface or in their own terminal TUI. Amp runs as a terminal
-          TUI. Beside them, you can tile shell terminals and a native embedded
-          browser, persist the layout, and control the running app through its
-          local CLI.
+          chat interface or in their own terminal TUI. Grok Build and Amp run
+          as terminal TUIs. Beside them, you can tile shell terminals and a
+          native embedded browser, persist the layout, and control the running
+          app through its local CLI.
         </p>
         <p style={{ 'margin-top': '2rem' }}>
           <a href="/docs/quickstart" class="btn btn-primary">

@@ -216,6 +216,9 @@ write through the same active PTY input path as the UI.
 ```bash
 verde live terminal write --pane <pane-id> --text $'cargo test\r' [--json]
 verde live terminal write --focused --text $'printf "ok\\n"\r' [--json]
+verde live terminal key --pane <pane-id> --key enter [--json]
+verde live terminal key --pane <pane-id> --chord ctrl+c [--json]
+verde live terminal submit --pane <pane-id> [--json]
 verde live terminal tail --pane <pane-id> [--lines <count>] [--json]
 verde live terminal screen --pane <pane-id> [--lines <count>] [--json]
 verde live process list [--project <id|index|path|current>] [--json]
@@ -231,7 +234,18 @@ verde live stack restart [--project <id|index|path|current>] [--json]
 verde live stack status [--project <id|index|path|current>] [--json]
 ```
 
-- `terminal write` sends text to the active terminal tab/pane. Include `\r` when you want to submit a shell command.
+- `terminal write` sends raw text to the active terminal tab/pane. Include `\r`
+  when you want to submit a shell command. A stopped session is restarted
+  before the write.
+- `terminal key` sends one validated atomic key chord without changing desktop
+  focus. Use `--key` with `--ctrl`, `--alt`, `--shift`, or `--super`, or pass a
+  chord such as `ctrl+c`. `terminal submit` is an atomic Enter alias.
+- Supported keys are Enter, Escape, Tab, arrows, Home/End, PageUp/PageDown,
+  Backspace/Delete, Space, F1-F12, letters, and digits. Arbitrary escape
+  sequences are rejected.
+- Key actions do not restart stopped or missing sessions. They can still submit
+  or interrupt work, so automation should resolve an explicit pane id and
+  inspect the target before sending Enter or another consequential key.
 - `terminal tail` returns recent terminal output; `screen` returns the current
   visible terminal screen.
 - `process start`, `stop`, and `restart` control entries loaded from `verde.yml`.
@@ -288,6 +302,33 @@ actions correlate asynchronous webview evaluation results before returning to
 the agent. Potentially sensitive clicks, password entry, and form submission
 require an explicit confirmed retry so the agent client can ask the user first.
 
+`send_terminal_key` exposes the same atomic terminal-key path to MCP clients. It
+requires `pane_id`, accepts an optional workspace selector, and takes either a
+named key plus modifier booleans or a chord. It preserves desktop focus and
+does not restart a stopped session.
+
+### Process coordination and retained outcomes
+
+The MCP bridge exposes `list_processes`, `check_command`, `acquire_lease`,
+`release_lease`, and `wait_for_process` for shared workspace coordination.
+`list_processes` combines configured processes, active terminal commands, GUI
+agent turns, background tasks, and active leases.
+
+Terminal commands keep the same stable process id as they move from active to
+final. Final records are retained in memory for 15 minutes, up to 32 per
+workspace, and report status `completed`, `failed`, `cancelled`, `crashed`, or
+`unknown`. When available they also include `finished_at_ms`, `exit_code`,
+`signal`, `cancellation_reason`, and ownership details. Retained records do not
+survive an app restart.
+
+`wait_for_process` waits up to 300 seconds by default, with a 900-second cap.
+Its tracking outcome is `completed`, `replaced`, `gone`, or `timed_out`.
+`completed` means a final record for that id was found; it does not mean the
+command exited successfully. Inspect the returned `process.status` and exit
+fields. A disappearing terminal command remains observable as `stopping`
+during a short finalization grace period so waiters do not receive a premature
+`gone`.
+
 ## Provider integrations
 
 Provider hooks are optional add-ons that let agent CLIs drive Verde's sidebar
@@ -297,14 +338,21 @@ login/auth behavior.
 ```bash
 verde integrations list [--json]
 verde integrations doctor [--json]
-verde integrations install <claude|codex|amp|opencode|cursor> [--global]
-verde integrations remove <claude|codex|amp|opencode|cursor> [--global]
-verde integrations disable <claude|codex|amp|opencode|cursor>
+verde integrations install <claude|codex|amp|opencode|cursor|grok> [--global]
+verde integrations remove <claude|codex|amp|opencode|cursor|grok> [--global]
+verde integrations disable <claude|codex|amp|opencode|cursor|grok>
 ```
 
 - **Claude / Codex** hooks are project-local (`.claude/settings.local.json` / `.codex/hooks.json`); `--global` installs them in `~/.claude/settings.json` / `~/.codex/hooks.json` instead.
+- **Cursor** supports project-local `.cursor/hooks.json` and a `--global`
+  installer at `~/.cursor/hooks.json`. Verde merges its entries without
+  replacing unrelated hooks.
+- **Grok** uses an isolated personal hook at
+  `$GROK_HOME/hooks/verde-notify.json`, defaulting to
+  `~/.grok/hooks/verde-notify.json`; install or remove it with `--global`.
 - **Amp** uses a global lifecycle plugin at `~/.config/amp/plugins/verde-notify.ts` (install with `--global`). The plugin is a no-op outside Verde panes.
-- **OpenCode / Cursor** have no stable hook installer yet; `list` and `doctor` report them as unsupported.
+- **OpenCode** has no stable managed hook installer yet; `list` and `doctor`
+  report it as unsupported.
 
 ## Remote workspaces (Herdr)
 
