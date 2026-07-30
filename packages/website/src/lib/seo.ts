@@ -3,7 +3,7 @@ export const SITE_NAME = 'Verde'
 export const HOME_TITLE =
   'Verde — Native Desktop Workspace for AI Coding Agents'
 export const HOME_DESCRIPTION =
-  'Run Codex, Claude Code, OpenCode, Cursor, and Amp side by side in a native, local-first tiling workspace with chat, terminal, and browser panes.'
+  'Run Codex, Claude Code, OpenCode, and Cursor in native chat or terminal panes, with Grok Build and Amp terminal TUIs, in one local-first tiling workspace.'
 export const SOCIAL_IMAGE_PATH = '/og-image-v2.png'
 export const SOCIAL_IMAGE_URL = `${SITE_ORIGIN}${SOCIAL_IMAGE_PATH}`
 export const SOCIAL_IMAGE_WIDTH = 1730

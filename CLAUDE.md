@@ -49,6 +49,17 @@ When a task starts a browser, dev server, build, test server, or another long-ru
 - stop only the exact process/session you started, release the lease on completion/failure/cancellation, and report the process/session, resource, and cleanup outcome;
 - never force a conflicting lease, kill another owner's process, or restart Verde without explicit user authority.
 
+`wait_for_process` returning `completed` means the tracked record is final, not
+necessarily successful. Inspect `process.status`, `exit_code`, `signal`, and
+`cancellation_reason`; terminal final records remain in memory for 15 minutes,
+up to 32 per workspace.
+
+For pane-targeted terminal automation, use `send_terminal_key` for a validated
+atomic key or chord. It preserves focus and does not restart stopped sessions.
+Raw `terminal.write` can restart a session and can execute existing input when
+it contains a carriage return, so use a stable pane id and inspect the target
+before sending a consequential key.
+
 The embedded browser is a shared Verde runtime: always target an explicit workspace and do not reset, restart, close, or navigate a browser bound to another active pane/workspace. Clean up only your own browser/test-server session; never use broad `pkill chrome` / `pkill chromium` commands.
 
 ## Desktop UI Invariants

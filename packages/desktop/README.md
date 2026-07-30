@@ -11,6 +11,8 @@ This package contains Verde's standalone Zig desktop app. It uses SDL3, SDL_GPU,
   - Claude Code: Claude Code installed and logged in locally; Verde talks to it through Anthropic's Claude Agent SDK
   - OpenCode: `opencode` on your `PATH`
   - Cursor: Cursor CLI `agent` on your `PATH` and `agent login`, or `CURSOR_API_KEY` for headless environments
+  - Grok Build: `grok` on your `PATH` for its terminal TUI
+  - Amp: `amp` on your `PATH` for its terminal TUI
 
 ## Development
 
@@ -183,14 +185,16 @@ Custom actions run through `sh -lc` with the selected project as the working dir
 ## Key Files
 
 - [`src/main.zig`](src/main.zig): app entrypoint, window/UI shell, provider controls
-- [`src/state.zig`](src/state.zig): app state, persistence, projects, threads
-- [`src/harness.zig`](src/harness.zig): provider-neutral interface
+- [`src/state.zig`](src/state.zig): app-state facade and cross-controller wiring
+- [`src/state/`](src/state): focused workspace, terminal, chat, provider, and persistence controllers
+- [`src/providers/harness.zig`](src/providers/harness.zig): provider-neutral interface
 - [`src/providers/codex.zig`](src/providers/codex.zig): Codex integration
 - [`src/providers/opencode.zig`](src/providers/opencode.zig): OpenCode integration
 - [`src/providers/claude.zig`](src/providers/claude.zig): Claude Code integration
 - [`src/providers/cursor.zig`](src/providers/cursor.zig): Cursor integration
-- [`src/config.zig`](src/config.zig): user config loading
-- [`src/keybinds.zig`](src/keybinds.zig): keyboard shortcut parsing and overrides
+- [`src/app/config.zig`](src/app/config.zig): user config loading
+- [`src/app/keybinds.zig`](src/app/keybinds.zig): keyboard shortcut parsing and overrides
+- [`src/cli/`](src/cli): CLI help, specification, completion, and live-control routing
 
 ## Dependencies
 

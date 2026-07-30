@@ -1,6 +1,6 @@
 # verde
 
-`verde` is a tiling desktop workspace for AI coding agents. It runs Codex, Claude Code, OpenCode, and Cursor side by side in one native window — tile chat, terminal, and browser panes with vim-style keybinds, jump anywhere from a `Ctrl+Shift+P` command palette, and drive long-running project processes from chat. Verde talks to the provider CLIs already installed on your machine; there is no hosted relay, so your tokens, transcripts, and project files stay local.
+`verde` is a tiling desktop workspace for AI coding agents. It runs Codex, Claude Code, OpenCode, and Cursor as native chat or terminal panes, with Grok Build and Amp available as terminal TUIs — tile chat, terminal, and browser panes with vim-style keybinds, jump anywhere from a `Ctrl+Shift+P` command palette, and drive long-running project processes from chat. Verde talks to the provider CLIs already installed on your machine; there is no hosted relay, so your tokens, transcripts, and project files stay local.
 
 The desktop app lives in [`packages/desktop/`](packages/desktop). Verde's UI is built with [`palette`](packages/palette), our own Zig GUI framework package for native UI primitives and render-batch driven desktop rendering.
 
@@ -9,7 +9,7 @@ The desktop app lives in [`packages/desktop/`](packages/desktop). Verde's UI is 
 
 ## Features
 
-- **Every agent, one window.** Run Codex, Claude Code, OpenCode, and Cursor as tiled chat threads side by side.
+- **Every agent, one window.** Run Codex, Claude Code, OpenCode, and Cursor as tiled chat threads or terminal TUIs, alongside Grok Build and Amp TUIs.
 - **A real tiling workspace.** Split chat, terminal, and browser panes, then rearrange, resize, zoom, and persist layouts with vim-style keybinds.
 - **Command palette (`Ctrl+Shift+P`).** A launcher that ranks chat threads, open panes, workspaces, and app commands in one searchable list.
 - **Embedded browser pane.** A native webview (WPE WebKit on Linux, WKWebView on macOS, WebView2 on Windows) tiled next to your agent.
@@ -29,6 +29,8 @@ Verde talks to provider runtimes on your machine rather than bundling its own ho
 - Claude Code: install [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and log in on your machine. Verde uses Anthropic's Claude Agent SDK to talk to the local Claude Code runtime.
 - OpenCode: install [OpenCode](https://github.com/anomalyco/opencode) and make sure `opencode` is on your `PATH`.
 - Cursor: install the [Cursor CLI](https://cursor.com/docs/cli/installation), make sure `agent` is on your `PATH`, and run `agent login`. `CURSOR_API_KEY` is also supported for headless environments.
+- Grok Build: follow the [Grok Build setup guide](https://docs.x.ai/build/overview#install) and make sure `grok` is on your `PATH`. Grok runs in a terminal TUI.
+- Amp: install [Amp](https://ampcode.com) and make sure `amp` is on your `PATH`. Amp runs in a terminal TUI.
 
 ## Install
 
@@ -351,10 +353,13 @@ verde integrations doctor
 verde integrations install codex
 verde integrations install claude
 verde integrations install cursor
+verde integrations install grok --global
 ```
 
 `verde integrations` reports hook support without touching provider auth.
 Codex, Claude, and Cursor support project-local and `--global` hook installers.
+Grok uses an isolated personal hook under `$GROK_HOME` (or `~/.grok`) and
+therefore requires `--global`.
 Cursor's `.cursor/hooks.json` format is shared by Cursor Agent's terminal and
 desktop Agent UIs; Verde status updates remain a no-op unless that Cursor
 session inherited a Verde pane identity. On Windows the generated scripts use
@@ -458,6 +463,15 @@ clients can declare explicit resources such as `build`, `deps`, `db`, or
 `port:3000`; leases expire automatically so a crashed owner cannot permanently
 block the workspace.
 
+Terminal process records keep the same stable id when they transition from
+active to final. Final records are retained in memory for 15 minutes, up to 32
+per workspace, with status `completed`, `failed`, `cancelled`, `crashed`, or
+`unknown` plus exit, signal, cancellation, ownership, and timing details when
+known. `wait_for_process` reports the tracking outcome (`completed`,
+`replaced`, `gone`, or `timed_out`); a `completed` wait outcome only means the
+final record was found, so callers must inspect `process.status` and its exit
+fields to determine success. Retained outcomes do not survive an app restart.
+
 ### Workspace Control
 
 Workspace commands mutate the project rail and return the updated workspace
@@ -547,6 +561,9 @@ write through the same active PTY input path as the UI.
 ```bash
 verde live terminal write --pane <pane-id> --text $'cargo test\r' [--json]
 verde live terminal write --focused --text $'printf "ok\\n"\r' [--json]
+verde live terminal key --pane <pane-id> --key enter [--json]
+verde live terminal key --pane <pane-id> --chord ctrl+c [--json]
+verde live terminal submit --pane <pane-id> [--json]
 verde live process list [--project <id|index|path|current>] [--json]
 verde live process start --name <name> [--project <id|index|path|current>] [--json]
 verde live process stop --name <name> [--project <id|index|path|current>] [--json]
@@ -560,7 +577,17 @@ verde live stack restart [--project <id|index|path|current>] [--json]
 ```
 
 - `terminal write` sends text to the active terminal tab/pane. Include `\r` when
-  you want to submit a shell command.
+  you want to submit a shell command. This is a raw-input path and restarts a
+  stopped session before writing.
+- `terminal key` sends one validated atomic chord to the active session without
+  changing desktop focus. Use `--key` with `--ctrl`, `--alt`, `--shift`, or
+  `--super`, or pass a chord such as `ctrl+c`. `terminal submit` is an atomic
+  Enter alias. Supported keys are Enter, Escape, Tab, arrows, Home/End,
+  PageUp/PageDown, Backspace/Delete, Space, F1-F12, letters, and digits.
+- Key actions reject arbitrary escape sequences and stopped or missing
+  sessions; they do not restart them. They can still submit or interrupt work,
+  so automation should resolve an explicit pane id and inspect the target
+  before sending Enter or another consequential key.
 - `process start`, `stop`, and `restart` control entries loaded from
   `verde.yml`.
 - `agent open --provider <name>` opens that provider's first-class TUI in the

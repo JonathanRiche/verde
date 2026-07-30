@@ -72,8 +72,8 @@ function FeatureIcon(props: { name: string }) {
 
 // Two integration modes: 'gui' = native Verde chat pane over the provider's
 // protocol; 'tui' = the agent's own TUI launched in an embedded Ghostty
-// terminal pane. Source of truth: provider_types.zig (GUI) and stack.zig's
-// AgentProvider (TUI).
+// terminal pane. Source of truth: providers/types.zig and
+// state/provider_models.zig (GUI), and workspace/stack.zig (TUI).
 const providers = [
   {
     name: 'Codex',
@@ -215,7 +215,7 @@ const faqs = [
   {
     question: 'Which coding agents does Verde support?',
     answer:
-      'Verde supports Codex, Claude Code, OpenCode, and Cursor in native GUI chat panes or terminal TUI panes. Amp runs in a terminal TUI pane.',
+      'Verde supports Codex, Claude Code, OpenCode, and Cursor in native GUI chat panes or terminal TUI panes. Grok Build and Amp run in terminal TUI panes.',
   },
   {
     question: 'Does Verde host models or relay prompts?',
@@ -346,11 +346,11 @@ function App() {
               <span class="display-accent">One tiling window.</span>
             </h1>
             <p class="lead">
-              Verde runs Codex, Claude Code, OpenCode, Cursor, and Amp side by
-              side in one native desktop app — as native chat panes or as each
-              agent's own TUI in an embedded terminal. Tile chat, terminal, and
-              browser panes with vim keybinds. No hosted relay — Verde just
-              talks to the CLIs already on your machine.
+              Verde runs Codex, Claude Code, OpenCode, and Cursor as native
+              chat or terminal panes, with Grok Build and Amp terminal TUIs in
+              the same native desktop app. Tile chat, terminal, and browser
+              panes with vim keybinds. No hosted relay — Verde just talks to
+              the CLIs already on your machine.
             </p>
 
             <div class="hero-actions">
@@ -401,7 +401,7 @@ function App() {
       {/* ── Provider strip ── */}
       <section id="providers" class="providers-band">
         <div class="wrap">
-          <p class="strip-eyebrow">Five agents, one workspace — GUI chat or native TUI</p>
+          <p class="strip-eyebrow">Coding agents, one workspace — GUI chat or native TUI</p>
           <div class="provider-grid stagger">
             <For each={providers}>
               {(p) => (
@@ -425,11 +425,12 @@ function App() {
             </For>
           </div>
           <p class="providers-note">
-            Every agent can run as its own TUI inside an embedded Ghostty
-            terminal pane; four of them also drive Verde's native chat panes.
-            Either way, Verde doesn't host a model or run inference — it drives
-            the provider CLIs already installed on your machine, so your tokens,
-            transcripts, and project files never leave it.
+            Codex, Claude Code, OpenCode, and Cursor can run inside an embedded
+            Ghostty terminal pane or drive Verde's native chat panes. Grok Build
+            and Amp run as terminal TUIs. Either way, Verde doesn't host a model
+            or run inference — it drives the provider CLIs already installed on
+            your machine, so your tokens, transcripts, and project files never
+            leave it.
           </p>
         </div>
       </section>
@@ -871,7 +872,8 @@ function App() {
               Windows installs without administrator access and creates a Start
               Menu shortcut. Then install and authenticate at least one provider CLI —{' '}
               <code>codex login</code>, Claude Code, <code>opencode</code>,{' '}
-              <code>agent login</code> for Cursor, or <code>amp</code>.
+              <code>agent login</code> for Cursor, <code>grok</code>, or{' '}
+              <code>amp</code>.
             </p>
           </article>
 
