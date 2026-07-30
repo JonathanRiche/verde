@@ -14,7 +14,7 @@ pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-5.6-sol";
 pub const DEFAULT_CODEX_REASONING_EFFORT: ReasoningEffort = .low;
 pub const DEFAULT_OPENCODE_MODEL: [:0]const u8 = "opencode/gpt-5.4";
 pub const DEFAULT_CLAUDE_MODEL: [:0]const u8 = "default";
-pub const DEFAULT_CURSOR_MODEL: [:0]const u8 = "composer-2";
+pub const DEFAULT_CURSOR_MODEL: [:0]const u8 = "composer-2.5";
 
 pub const ModelOption = struct {
     label: [:0]const u8,
@@ -25,7 +25,7 @@ pub const ModelOption = struct {
     reasoning_variant_keys: ?[][:0]const u8 = null,
     cursor_fast_supported: bool = false,
     cursor_reasoning_param_id: ?[:0]const u8 = null,
-    cursor_reasoning_values: ?[][:0]const u8 = null,
+    cursor_reasoning_values: ?[]const [:0]const u8 = null,
     cursor_reasoning_requires_thinking: bool = false,
     claude_effort_values: ?[]const [:0]const u8 = null,
 };
@@ -46,11 +46,14 @@ pub const PersistedCursorModelOption = struct {
 };
 
 pub fn persistedCursorModelCacheNeedsRefresh(options: []const PersistedCursorModelOption) bool {
-    for (options) |option| {
+    for (options, 0..) |option, index| {
         if (std.mem.eql(u8, option.value, "composer-2.5-fast") or
             std.mem.eql(u8, option.value, "composer-2-fast"))
         {
             return true;
+        }
+        for (options[index + 1 ..]) |other| {
+            if (std.mem.eql(u8, option.value, other.value)) return true;
         }
     }
     return false;
@@ -128,14 +131,28 @@ pub const CODEX_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "GPT-5.2", .value = "gpt-5.2" },
 };
 
+const CURSOR_GROK_EFFORT_VALUES = [_][:0]const u8{ "low", "medium", "high" };
+const CURSOR_GPT_FULL_EFFORT_VALUES = [_][:0]const u8{ "none", "low", "medium", "high", "xhigh", "max" };
+const CURSOR_GPT_55_EFFORT_VALUES = [_][:0]const u8{ "none", "low", "medium", "high", "extra-high" };
+const CURSOR_GPT_54_EFFORT_VALUES = [_][:0]const u8{ "low", "medium", "high", "xhigh" };
+const CURSOR_CLAUDE_EFFORT_VALUES = [_][:0]const u8{ "low", "medium", "high", "xhigh", "max" };
+
 pub const CURSOR_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "Auto", .value = "auto" },
-    .{ .label = "Composer 2.5", .value = "composer-2.5", .cursor_fast_supported = true },
-    .{ .label = "Composer 2", .value = DEFAULT_CURSOR_MODEL, .cursor_fast_supported = true },
-    .{ .label = "GPT-5.5", .value = "gpt-5.5-medium", .cursor_fast_supported = true },
-    .{ .label = "GPT-5.4", .value = "gpt-5.4-medium", .cursor_fast_supported = true },
-    .{ .label = "Claude Opus 4.7", .value = "claude-opus-4-7" },
-    .{ .label = "Claude Sonnet 4.5", .value = "claude-sonnet-4-5" },
+    .{ .label = "Composer 2.5", .value = DEFAULT_CURSOR_MODEL, .cursor_fast_supported = true },
+    .{ .label = "Cursor Grok 4.5", .value = "cursor-grok-4.5-high", .cursor_fast_supported = true, .cursor_reasoning_param_id = "effort", .cursor_reasoning_values = CURSOR_GROK_EFFORT_VALUES[0..] },
+    .{ .label = "Opus 4.8 Thinking", .value = "claude-opus-4-8-thinking-high", .cursor_fast_supported = true, .cursor_reasoning_param_id = "effort", .cursor_reasoning_values = CURSOR_CLAUDE_EFFORT_VALUES[0..] },
+    .{ .label = "GPT-5.6 Sol", .value = "gpt-5.6-sol-medium", .cursor_fast_supported = true, .cursor_reasoning_param_id = "effort", .cursor_reasoning_values = CURSOR_GPT_FULL_EFFORT_VALUES[0..] },
+    .{ .label = "GPT-5.5", .value = "gpt-5.5-medium", .cursor_fast_supported = true, .cursor_reasoning_param_id = "effort", .cursor_reasoning_values = CURSOR_GPT_55_EFFORT_VALUES[0..] },
+    .{ .label = "Fable 5 Thinking", .value = "claude-fable-5-thinking-high", .cursor_reasoning_param_id = "effort", .cursor_reasoning_values = CURSOR_CLAUDE_EFFORT_VALUES[0..] },
+    .{ .label = "Sonnet 5 Thinking", .value = "claude-sonnet-5-thinking-high", .cursor_reasoning_param_id = "effort", .cursor_reasoning_values = CURSOR_CLAUDE_EFFORT_VALUES[0..] },
+    .{ .label = "GPT-5.6 Terra", .value = "gpt-5.6-terra-medium", .cursor_fast_supported = true, .cursor_reasoning_param_id = "effort", .cursor_reasoning_values = CURSOR_GPT_FULL_EFFORT_VALUES[0..] },
+    .{ .label = "GPT-5.6 Luna", .value = "gpt-5.6-luna-medium", .cursor_fast_supported = true, .cursor_reasoning_param_id = "effort", .cursor_reasoning_values = CURSOR_GPT_FULL_EFFORT_VALUES[0..] },
+    .{ .label = "GPT-5.4", .value = "gpt-5.4-medium", .cursor_fast_supported = true, .cursor_reasoning_param_id = "effort", .cursor_reasoning_values = CURSOR_GPT_54_EFFORT_VALUES[0..] },
+    .{ .label = "Gemini 3.1 Pro", .value = "gemini-3.1-pro" },
+    .{ .label = "Gemini 3.5 Flash", .value = "gemini-3.5-flash" },
+    .{ .label = "Kimi K3", .value = "kimi-k3" },
+    .{ .label = "GLM 5.2", .value = "glm-5.2-high" },
 };
 
 /// Conservative fallback when a dynamic model row does not report its effort tiers.
@@ -171,3 +188,11 @@ pub const CODEX_ACCESS_MODE_OPTIONS = [_]AccessModeOption{
     .{ .label = "Full access", .value = .full_access },
     .{ .label = "Supervised", .value = .supervised },
 };
+
+test "persisted Cursor model cache refreshes duplicate model ids" {
+    const options = [_]PersistedCursorModelOption{
+        .{ .label = "GPT-5.6 Sol", .value = "gpt-5.6-sol-medium" },
+        .{ .label = "GPT-5.6 Sol Fast", .value = "gpt-5.6-sol-medium", .fast_supported = true },
+    };
+    try std.testing.expect(persistedCursorModelCacheNeedsRefresh(&options));
+}

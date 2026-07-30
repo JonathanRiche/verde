@@ -7822,7 +7822,7 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
 
     const result = try state.openWorkspaceChat(1, .{
         .provider = .cursor,
-        .model_ref = "composer-2",
+        .model_ref = DEFAULT_CURSOR_MODEL,
         .target_pane_id = 1,
         .axis = .vertical,
         .focus = false,
@@ -7836,7 +7836,7 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
     try std.testing.expect(!result.focused);
     const thread = &state.project_controller.projects.items[1].threads.items[result.thread_index];
     try std.testing.expectEqual(Provider.cursor, thread.provider);
-    try std.testing.expectEqualStrings("composer-2", thread.model_ref.?);
+    try std.testing.expectEqualStrings(DEFAULT_CURSOR_MODEL, thread.model_ref.?);
 
     const default_cases = [_]struct {
         provider: Provider,

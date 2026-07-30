@@ -478,6 +478,9 @@ fn mainInner(init: std.process.Init) !void {
         log.info("consumed pending Herdr open request", .{});
     }
     state.startProviderReadinessCheck();
+    // Keep the persisted Cursor picker responsive at launch, then replace it
+    // with the model set reported by the installed, authenticated Cursor CLI.
+    state.startCursorModelOptionsRefresh();
     state.startAutomaticUpdateCheck();
     var live_server: ?live_ipc.LiveServer = live_ipc.LiveServer.init(allocator, storage.pref_path) catch |err| blk: {
         log.warn("failed to initialize live-control server: {s}", .{@errorName(err)});
