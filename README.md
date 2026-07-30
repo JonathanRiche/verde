@@ -144,6 +144,21 @@ bash ./scripts/release/install-linux-local.sh
 ./scripts/release/install-macos-local.sh
 ```
 
+macOS builds are ad-hoc signed unless `VERDE_CODESIGN_IDENTITY` is set. Ad-hoc
+signatures change their designated requirement whenever the executable changes,
+so macOS can ask for previously granted privacy permissions again after a
+rebuild. Developers with an Apple Development identity can keep one stable
+privacy identity across local builds:
+
+```bash
+security find-identity -v -p codesigning
+VERDE_CODESIGN_IDENTITY='Apple Development: Name (TEAMID)' mise run build
+```
+
+Public macOS artifacts should use a `Developer ID Application` identity and be
+notarized. The packaging scripts apply the hardened runtime and a secure
+timestamp automatically when that identity is supplied.
+
 Source builds use the native webview backend by default.
 
 The native browser runtime targets the host platform webview stack: WPE WebKit on
