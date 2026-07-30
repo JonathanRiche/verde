@@ -11,7 +11,7 @@ const runtime_log = @import("../runtime/log.zig");
 
 const DEFAULT_EXECUTABLE = "agent";
 const FALLBACK_EXECUTABLE = "cursor-agent";
-const DEFAULT_MODEL = "composer-2";
+const DEFAULT_MODEL = "composer-2.5";
 const MAX_ACP_LINE_BYTES = 16 * 1024 * 1024;
 const MAX_CURSOR_OUTPUT_BYTES = 8 * 1024 * 1024;
 const MCP_TOOL_NAME_FIELD = "_verdeMcpTool";
@@ -116,7 +116,7 @@ pub const Client = struct {
     }
 
     pub fn listThreads(self: *Client, allocator: std.mem.Allocator) ![]provider_types.ChatThreadSummary {
-        var acp = try self.spawnAcp(allocator, null);
+        var acp = try self.spawnAcp(allocator, null, false);
         defer acp.deinit();
 
         var state: ListThreadsState = .{};
@@ -145,26 +145,26 @@ pub const Client = struct {
         var env_map = try self.cursorEnvMap(allocator);
         defer env_map.deinit();
 
-        const executable = self.resolveExecutable(allocator, &env_map) catch return staticModelsAlloc(allocator);
+        const executable = try self.resolveExecutable(allocator, &env_map);
         defer allocator.free(executable);
 
         var threaded: std.Io.Threaded = .init(allocator, .{});
         defer threaded.deinit();
-        const result = std.process.run(allocator, threaded.io(), .{
+        const result = try std.process.run(allocator, threaded.io(), .{
             .argv = &.{ executable, "models" },
             .cwd = if (self.config.cwd) |path| .{ .path = path } else .inherit,
             .environ_map = &env_map,
             .stdout_limit = .limited(MAX_CURSOR_OUTPUT_BYTES),
             .stderr_limit = .limited(512 * 1024),
-        }) catch return staticModelsAlloc(allocator);
+        });
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
 
         switch (result.term) {
-            .exited => |code| if (code != 0) return staticModelsAlloc(allocator),
-            else => return staticModelsAlloc(allocator),
+            .exited => |code| if (code != 0) return error.CursorModelDiscoveryFailed,
+            else => return error.CursorModelDiscoveryFailed,
         }
-        return parseModelsTextAlloc(allocator, result.stdout) catch staticModelsAlloc(allocator);
+        return parseModelsTextAlloc(allocator, result.stdout);
     }
 
     pub fn readThread(
@@ -172,7 +172,7 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         thread_id: []const u8,
     ) !provider_types.ReadThreadResult {
-        var acp = try self.spawnAcp(allocator, null);
+        var acp = try self.spawnAcp(allocator, null, false);
         defer acp.deinit();
 
         const cwd = try self.cwdAbsoluteAlloc(allocator);
@@ -219,7 +219,10 @@ pub const Client = struct {
         const model_arg = try cursorModelArgAlloc(allocator, request.model orelse self.config.model orelse DEFAULT_MODEL, request.cursor_model_params_json);
         defer if (model_arg) |arg| allocator.free(arg);
 
-        var acp = try self.spawnAcp(allocator, model_arg);
+        // Cursor can issue multiple permission requests concurrently. In Full
+        // Access, launch its native Run Everything mode so those tools do not
+        // deadlock behind ACP's single pending approval exchange.
+        var acp = try self.spawnAcp(allocator, model_arg, shouldAutoApprovePermission(request));
         defer acp.deinit();
 
         const cwd = try self.cwdAbsoluteAllocForRequest(allocator, request);
@@ -320,7 +323,7 @@ pub const Client = struct {
         return resolveCursorExecutableAlloc(allocator, env_map, self.config.executable);
     }
 
-    fn spawnAcp(self: *Client, allocator: std.mem.Allocator, model_arg: ?[]const u8) !AcpProcess {
+    fn spawnAcp(self: *Client, allocator: std.mem.Allocator, model_arg: ?[]const u8, force_commands: bool) !AcpProcess {
         var env_map = try self.cursorEnvMap(allocator);
         errdefer env_map.deinit();
         const executable = try self.resolveExecutable(allocator, &env_map);
@@ -328,10 +331,17 @@ pub const Client = struct {
 
         var threaded: std.Io.Threaded = .init(allocator, .{});
         errdefer threaded.deinit();
+        const argv_with_model_and_force = [_][]const u8{ executable, "--force", "--model", model_arg orelse "", "acp" };
         const argv_with_model = [_][]const u8{ executable, "--model", model_arg orelse "", "acp" };
+        const argv_with_force = [_][]const u8{ executable, "--force", "acp" };
         const argv_default = [_][]const u8{ executable, "acp" };
         var child = try platform_process.spawn(allocator, threaded.io(), .{
-            .argv = if (model_arg != null) argv_with_model[0..] else argv_default[0..],
+            .argv = if (model_arg != null)
+                if (force_commands) argv_with_model_and_force[0..] else argv_with_model[0..]
+            else if (force_commands)
+                argv_with_force[0..]
+            else
+                argv_default[0..],
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .inherit,
@@ -1413,7 +1423,7 @@ fn parseModelsTextAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]pr
         if (id.len == 0 or name.len == 0) continue;
         try raw_models.append(allocator, .{ .id = id, .name = name });
     }
-    if (raw_models.items.len == 0) return staticModelsAlloc(allocator);
+    if (raw_models.items.len == 0) return error.CursorModelsUnavailable;
 
     var models: std.ArrayList(provider_types.ModelInfo) = .empty;
     errdefer {
@@ -1432,14 +1442,12 @@ fn parseModelsTextAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]pr
 
     for (raw_models.items, 0..) |raw, index| {
         if (consumed[index]) continue;
-        if (stripFastSuffix(raw.id)) |base_id| {
-            if (rawModelIndex(raw_models.items, base_id) != null) {
-                _ = try appendCursorModelByBaseId(allocator, raw_models.items, consumed, &models, base_id);
-                continue;
-            }
+        const base_id = stripFastSuffix(raw.id) orelse raw.id;
+        if (reasoningGroupBaseId(raw_models.items, base_id)) |reasoning_base_id| {
+            try appendCursorReasoningModel(allocator, raw_models.items, consumed, &models, reasoning_base_id);
+            continue;
         }
-        try appendModel(allocator, &models, raw.id, raw.name, false);
-        consumed[index] = true;
+        _ = try appendCursorModelByBaseId(allocator, raw_models.items, consumed, &models, base_id);
     }
     return models.toOwnedSlice(allocator);
 }
@@ -1486,21 +1494,132 @@ fn stripFastSuffix(id: []const u8) ?[]const u8 {
     return if (std.mem.endsWith(u8, id, "-fast")) id[0 .. id.len - "-fast".len] else null;
 }
 
-fn staticModelsAlloc(allocator: std.mem.Allocator) ![]provider_types.ModelInfo {
-    var models: std.ArrayList(provider_types.ModelInfo) = .empty;
-    errdefer {
-        for (models.items) |model| model.deinit(allocator);
-        models.deinit(allocator);
+const CURSOR_REASONING_VALUES = [_][]const u8{ "none", "low", "medium", "high", "xhigh", "extra-high", "max" };
+
+const CursorReasoningSuffix = struct {
+    base_id: []const u8,
+    value: []const u8,
+};
+
+fn stripReasoningSuffix(id: []const u8) ?CursorReasoningSuffix {
+    if (std.mem.endsWith(u8, id, "-extra-high")) {
+        return .{ .base_id = id[0 .. id.len - "-extra-high".len], .value = "extra-high" };
+    }
+    for (CURSOR_REASONING_VALUES) |value| {
+        if (std.mem.eql(u8, value, "extra-high")) continue;
+        if (id.len <= value.len + 1) continue;
+        const suffix_start = id.len - value.len;
+        if (id[suffix_start - 1] != '-' or !std.mem.eql(u8, id[suffix_start..], value)) continue;
+        return .{ .base_id = id[0 .. suffix_start - 1], .value = value };
+    }
+    return null;
+}
+
+fn reasoningGroupBaseId(raw_models: []const RawCursorModel, id: []const u8) ?[]const u8 {
+    const candidate = if (stripReasoningSuffix(id)) |suffix| suffix.base_id else id;
+    var seen_variants: [CURSOR_REASONING_VALUES.len]bool = @splat(false);
+    var has_base = false;
+    for (raw_models) |raw| {
+        const normalized = stripFastSuffix(raw.id) orelse raw.id;
+        if (std.mem.eql(u8, normalized, candidate)) {
+            has_base = true;
+            continue;
+        }
+        const suffix = stripReasoningSuffix(normalized) orelse continue;
+        if (!std.mem.eql(u8, suffix.base_id, candidate)) continue;
+        for (CURSOR_REASONING_VALUES, 0..) |value, index| {
+            if (std.mem.eql(u8, suffix.value, value)) seen_variants[index] = true;
+        }
+    }
+    var variant_count: usize = if (has_base) 1 else 0;
+    for (seen_variants) |seen| {
+        if (seen) variant_count += 1;
+    }
+    return if (variant_count >= 2) candidate else null;
+}
+
+fn appendCursorReasoningModel(
+    allocator: std.mem.Allocator,
+    raw_models: []const RawCursorModel,
+    consumed: []bool,
+    models: *std.ArrayList(provider_types.ModelInfo),
+    base_id: []const u8,
+) !void {
+    var values: [CURSOR_REASONING_VALUES.len][]const u8 = undefined;
+    var values_len: usize = 0;
+    const default_index: ?usize = rawModelIndex(raw_models, base_id);
+    var first_variant_index: ?usize = null;
+    var clean_name_index: ?usize = null;
+    var medium_index: ?usize = null;
+    var high_index: ?usize = null;
+    var fast_supported = false;
+
+    for (CURSOR_REASONING_VALUES) |value| {
+        const variant_id = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ base_id, value });
+        defer allocator.free(variant_id);
+        if (rawModelIndex(raw_models, variant_id)) |index| {
+            if (first_variant_index == null) first_variant_index = index;
+            values[values_len] = value;
+            values_len += 1;
+            if (clean_name_index == null and !modelNameEndsWithReasoningValue(raw_models[index].name, value)) clean_name_index = index;
+            if (std.mem.eql(u8, value, "medium")) medium_index = index;
+            if (std.mem.eql(u8, value, "high")) high_index = index;
+        } else if (std.mem.eql(u8, value, "medium") and default_index != null) {
+            values[values_len] = value;
+            values_len += 1;
+        }
     }
 
-    try appendModel(allocator, &models, "auto", "Auto", false);
-    try appendModel(allocator, &models, "composer-2.5", "Composer 2.5", true);
-    try appendModel(allocator, &models, "composer-2", "Composer 2", true);
-    try appendModel(allocator, &models, "gpt-5.5-medium", "GPT-5.5", true);
-    try appendModel(allocator, &models, "gpt-5.4-medium", "GPT-5.4", true);
-    try appendModel(allocator, &models, "claude-opus-4-7-thinking-xhigh", "Claude Opus 4.7 Thinking", true);
-    try appendModel(allocator, &models, "claude-sonnet-4-6", "Claude Sonnet 4.6", false);
-    return models.toOwnedSlice(allocator);
+    for (raw_models) |raw| {
+        if (stripFastSuffix(raw.id)) |normalized| {
+            if (std.mem.eql(u8, normalized, base_id)) fast_supported = true;
+            if (stripReasoningSuffix(normalized)) |suffix| {
+                if (std.mem.eql(u8, suffix.base_id, base_id)) fast_supported = true;
+            }
+        }
+    }
+
+    const selected_index = default_index orelse clean_name_index orelse medium_index orelse high_index orelse first_variant_index orelse unreachable;
+    const selected = raw_models[selected_index];
+    try appendReasoningModel(
+        allocator,
+        models,
+        selected.id,
+        selected.name,
+        fast_supported,
+        values[0..values_len],
+    );
+
+    for (raw_models, 0..) |raw, index| {
+        const normalized = stripFastSuffix(raw.id) orelse raw.id;
+        if (std.mem.eql(u8, normalized, base_id)) {
+            consumed[index] = true;
+            continue;
+        }
+        const suffix = stripReasoningSuffix(normalized) orelse continue;
+        if (std.mem.eql(u8, suffix.base_id, base_id)) consumed[index] = true;
+    }
+}
+
+fn modelNameEndsWithReasoningValue(name: []const u8, value: []const u8) bool {
+    const label = if (std.mem.eql(u8, value, "xhigh") or std.mem.eql(u8, value, "extra-high"))
+        "Extra High"
+    else if (std.mem.eql(u8, value, "none"))
+        "None"
+    else if (std.mem.eql(u8, value, "low"))
+        "Low"
+    else if (std.mem.eql(u8, value, "medium"))
+        "Medium"
+    else if (std.mem.eql(u8, value, "high"))
+        "High"
+    else if (std.mem.eql(u8, value, "max"))
+        "Max"
+    else
+        return false;
+    var stem = name;
+    if (std.mem.endsWith(u8, stem, " (NO ZDR)")) stem = stem[0 .. stem.len - " (NO ZDR)".len];
+    if (std.mem.endsWith(u8, stem, " Thinking")) stem = stem[0 .. stem.len - " Thinking".len];
+    return std.mem.endsWith(u8, stem, label);
 }
 
 fn appendModel(
@@ -1516,6 +1635,46 @@ fn appendModel(
         .model_id = try allocator.dupe(u8, id),
         .model_name = try allocator.dupe(u8, name),
         .cursor_fast_supported = fast_supported,
+    });
+}
+
+fn appendReasoningModel(
+    allocator: std.mem.Allocator,
+    models: *std.ArrayList(provider_types.ModelInfo),
+    id: []const u8,
+    name: []const u8,
+    fast_supported: bool,
+    reasoning_values: []const []const u8,
+) !void {
+    const provider_id = try allocator.dupe(u8, "cursor");
+    errdefer allocator.free(provider_id);
+    const provider_name = try allocator.dupe(u8, "Cursor");
+    errdefer allocator.free(provider_name);
+    const model_id = try allocator.dupe(u8, id);
+    errdefer allocator.free(model_id);
+    const model_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(model_name);
+    const param_id = try allocator.dupe(u8, "effort");
+    errdefer allocator.free(param_id);
+    const values = try allocator.alloc([:0]const u8, reasoning_values.len);
+    var initialized_len: usize = 0;
+    errdefer {
+        for (values[0..initialized_len]) |value| allocator.free(value);
+        allocator.free(values);
+    }
+    for (reasoning_values, 0..) |value, index| {
+        values[index] = try allocator.dupeZ(u8, value);
+        initialized_len += 1;
+    }
+
+    try models.append(allocator, .{
+        .provider_id = provider_id,
+        .provider_name = provider_name,
+        .model_id = model_id,
+        .model_name = model_name,
+        .cursor_fast_supported = fast_supported,
+        .cursor_reasoning_param_id = param_id,
+        .cursor_reasoning_values = values,
     });
 }
 
@@ -1540,9 +1699,11 @@ fn cursorModelArgAlloc(allocator: std.mem.Allocator, model: []const u8, params_j
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, model);
+    const model_reasoning = stripReasoningSuffix(model);
+    try out.appendSlice(allocator, if (reasoning != null and model_reasoning != null) model_reasoning.?.base_id else model);
     if (reasoning) |value| {
-        if (!std.mem.eql(u8, value, "medium") and std.mem.indexOf(u8, model, value) == null) {
+        const keep_unsuffixed_medium = model_reasoning == null and std.mem.eql(u8, value, "medium");
+        if (!keep_unsuffixed_medium) {
             try out.append(allocator, '-');
             try out.appendSlice(allocator, value);
         }
@@ -1986,13 +2147,34 @@ test "cursorModelArgAlloc folds legacy SDK params into CLI model id" {
     try std.testing.expectEqualStrings("gpt-5.5-high-fast", arg.?);
 }
 
+test "cursorModelArgAlloc replaces a flattened Cursor effort suffix" {
+    const params =
+        \\[{"id":"effort","value":"low"},{"id":"fast","value":"true"}]
+    ;
+    const arg = try cursorModelArgAlloc(std.testing.allocator, "cursor-grok-4.5-high", params);
+    defer std.testing.allocator.free(arg.?);
+    try std.testing.expectEqualStrings("cursor-grok-4.5-low-fast", arg.?);
+}
+
+test "cursorModelArgAlloc replaces Kimi max with the selected effort" {
+    const params =
+        \\[{"id":"effort","value":"high"}]
+    ;
+    const arg = try cursorModelArgAlloc(std.testing.allocator, "kimi-k3-max", params);
+    defer std.testing.allocator.free(arg.?);
+    try std.testing.expectEqualStrings("kimi-k3-high", arg.?);
+}
+
 test "parseModelsTextAlloc reads Cursor CLI model output" {
     const output =
         \\Available models
         \\
         \\composer-2-fast - Composer 2 Fast
         \\composer-2 - Composer 2 (current)
+        \\gpt-5.3-codex-low - Codex 5.3 Low
         \\gpt-5.3-codex - Codex 5.3
+        \\gpt-5.3-codex-fast - Codex 5.3 Fast
+        \\gpt-5.3-codex-high - Codex 5.3 High
         \\composer-2.5 - Composer 2.5
         \\composer-2.5-fast - Composer 2.5 Fast (default)
         \\
@@ -2005,4 +2187,32 @@ test "parseModelsTextAlloc reads Cursor CLI model output" {
     try std.testing.expectEqualStrings("composer-2", models[1].model_id);
     try std.testing.expect(models[1].cursor_fast_supported);
     try std.testing.expectEqualStrings("gpt-5.3-codex", models[2].model_id);
+    try std.testing.expect(models[2].cursor_fast_supported);
+    try std.testing.expectEqualStrings("effort", models[2].cursor_reasoning_param_id.?);
+    try std.testing.expectEqual(@as(usize, 3), models[2].cursor_reasoning_values.?.len);
+    try std.testing.expectEqualStrings("low", models[2].cursor_reasoning_values.?[0]);
+    try std.testing.expectEqualStrings("medium", models[2].cursor_reasoning_values.?[1]);
+    try std.testing.expectEqualStrings("high", models[2].cursor_reasoning_values.?[2]);
+}
+
+test "parseModelsTextAlloc groups Grok effort rows without an unsuffixed model" {
+    const output =
+        \\Available models
+        \\cursor-grok-4.5-high - Cursor Grok 4.5
+        \\cursor-grok-4.5-high-fast - Cursor Grok 4.5 Fast
+        \\cursor-grok-4.5-low - Cursor Grok 4.5 Low
+        \\cursor-grok-4.5-low-fast - Cursor Grok 4.5 Low Fast
+        \\cursor-grok-4.5-medium - Cursor Grok 4.5 Medium
+        \\cursor-grok-4.5-medium-fast - Cursor Grok 4.5 Medium Fast
+    ;
+    const models = try parseModelsTextAlloc(std.testing.allocator, output);
+    defer provider_types.freeModelInfos(std.testing.allocator, models);
+    try std.testing.expectEqual(@as(usize, 1), models.len);
+    try std.testing.expectEqualStrings("cursor-grok-4.5-high", models[0].model_id);
+    try std.testing.expectEqualStrings("Cursor Grok 4.5", models[0].model_name);
+    try std.testing.expect(models[0].cursor_fast_supported);
+    try std.testing.expectEqual(@as(usize, 3), models[0].cursor_reasoning_values.?.len);
+    try std.testing.expectEqualStrings("low", models[0].cursor_reasoning_values.?[0]);
+    try std.testing.expectEqualStrings("medium", models[0].cursor_reasoning_values.?[1]);
+    try std.testing.expectEqualStrings("high", models[0].cursor_reasoning_values.?[2]);
 }
