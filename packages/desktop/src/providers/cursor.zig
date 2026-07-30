@@ -552,6 +552,14 @@ fn handleSendPromptLine(
     defer parsed.deinit();
     try failIfJsonRpcError(parsed.value);
 
+    // ACP server requests have their own JSON-RPC id sequence. Handle them
+    // before matching response ids so a permission request cannot collide
+    // with one of Verde's initialize/session/prompt request ids.
+    if (isMethod(parsed.value, "session/request_permission")) {
+        try handlePermissionRequest(allocator, parsed.value, request, stdin);
+        return .continue_reading;
+    }
+
     if (responseId(parsed.value)) |id| {
         if (id == 1) {
             state.capabilities = parseCapabilities(parsed.value);
@@ -567,10 +575,6 @@ fn handleSendPromptLine(
         if (id == 3) return .prompt_done;
     }
 
-    if (isMethod(parsed.value, "session/request_permission")) {
-        try handlePermissionRequest(allocator, parsed.value, request, stdin);
-        return .continue_reading;
-    }
     if (isMethod(parsed.value, "session/update")) {
         // Cursor replays session history while loading an existing session.
         // Only updates emitted after this turn's prompt was submitted are live.
@@ -1037,7 +1041,9 @@ fn handlePermissionRequest(
     const title = getOptionalObjectString(params, "title") orelse "Cursor permission request";
     const body = permissionBody(params);
     const call_id = getOptionalObjectString(params, "toolCallId") orelse getOptionalObjectString(params, "permissionId") orelse "cursor-tool";
-    const decision = if (request.on_approval_request) |on_approval_request|
+    const decision: provider_types.ApprovalDecision = if (shouldAutoApprovePermission(request))
+        .approve
+    else if (request.on_approval_request) |on_approval_request|
         on_approval_request(request.stream_context, .{
             .call_id = call_id,
             .title = title,
@@ -1051,6 +1057,10 @@ fn handlePermissionRequest(
         defer allocator.free(response);
         try writeJsonLineToFile(allocator, file, response);
     }
+}
+
+fn shouldAutoApprovePermission(request: provider_types.SendPromptRequest) bool {
+    return (request.approval_policy orelse .on_request) == .never;
 }
 
 fn permissionOptionId(params: std.json.Value, decision: provider_types.ApprovalDecision) []const u8 {
@@ -1910,6 +1920,35 @@ test "handleSendPromptLine ignores session history replay before prompt submissi
         try handleSendPromptLine(std.testing.allocator, line, request, &state, null),
     );
     try std.testing.expectEqualStrings("replayed history", state.reply.items);
+}
+
+test "handleSendPromptLine handles permission request id collision before prompt response" {
+    var state: SendPromptState = .{};
+    defer state.deinit(std.testing.allocator);
+    const request = provider_types.SendPromptRequest{
+        .thread_id = "existing-session",
+        .prompt = "continue",
+        .approval_policy = .never,
+    };
+    const line =
+        \\{"jsonrpc":"2.0","id":3,"method":"session/request_permission","params":{"toolCallId":"tool-3","options":[{"optionId":"reject-once"},{"optionId":"allow-once"}]}}
+    ;
+
+    try std.testing.expectEqual(
+        SendLineAction.continue_reading,
+        try handleSendPromptLine(std.testing.allocator, line, request, &state, null),
+    );
+}
+
+test "Cursor Full Access auto-approves permission requests" {
+    try std.testing.expect(shouldAutoApprovePermission(.{
+        .prompt = "continue",
+        .approval_policy = .never,
+    }));
+    try std.testing.expect(!shouldAutoApprovePermission(.{
+        .prompt = "continue",
+        .approval_policy = .on_request,
+    }));
 }
 
 test "makePermissionResponseAlloc writes selected ACP option id" {
