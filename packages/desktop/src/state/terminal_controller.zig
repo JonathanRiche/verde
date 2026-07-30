@@ -409,7 +409,7 @@ pub fn pollTerminals(self: anytype) bool {
                 }
                 break :blk false;
             };
-            self.syncTerminalDockProcessLifecycle(project_index, 0, &project.terminal_dock, null);
+            self.syncTerminalDockProcessLifecycleAfterTeardownPoll(project_index, 0, &project.terminal_dock, null);
             if (project.terminal_dock.consumeWorkspaceChange()) self.markDirty();
             self.drainTerminalDockNotifications(project_index, 0, &project.terminal_dock) catch |err| {
                 log.warn("failed to apply terminal notification: {s}", .{@errorName(err)});
@@ -448,7 +448,7 @@ pub fn pollTerminals(self: anytype) bool {
                 }
                 break :blk false;
             };
-            self.syncTerminalDockProcessLifecycle(project_index, entry.id, &entry.dock, null);
+            self.syncTerminalDockProcessLifecycleAfterTeardownPoll(project_index, entry.id, &entry.dock, null);
             if (entry.dock.consumeWorkspaceChange()) self.markDirty();
             self.drainTerminalDockNotifications(project_index, entry.id, &entry.dock) catch |err| {
                 log.warn("failed to apply terminal dock notification: {s}", .{@errorName(err)});

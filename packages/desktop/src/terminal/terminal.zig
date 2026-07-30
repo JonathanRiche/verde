@@ -166,6 +166,9 @@ const KEY_SCROLL_LINES: isize = 3;
 const OUTPUT_RING_CAPACITY: usize = 256 * 1024;
 const DAEMON_REPLAY_MAX_BYTES: usize = 512 * 1024;
 const DAEMON_ATTACH_REPLAY_MAX_BYTES: usize = 8 * 1024;
+// JSON may encode one terminal byte as a six-byte \u00XX escape. Keep enough
+// headroom for worst-case text plus the fixed session metadata.
+const DAEMON_TAIL_RESPONSE_OVERHEAD_BYTES: usize = 64 * 1024;
 // Match Ghostty's app default so normal high-resolution PNGs do not exceed
 // libghostty-vt's intentionally conservative 10 MB embedder default.
 const KITTY_IMAGE_STORAGE_LIMIT: usize = 320 * 1000 * 1000;
@@ -302,9 +305,22 @@ pub const SessionTeardown = struct {
     pub fn poll(self: *SessionTeardown, allocator: std.mem.Allocator) !?SessionTeardownCompletion {
         var snapshot = self.session.snapshot();
         if (resolveSessionTeardown(snapshot, self.cancellation_initiated, self.reason)) |completion| return completion;
+        if (self.session.teardownSessionMissing()) return .{
+            .exit_code = null,
+            .signal = null,
+            .cancellation_reason = null,
+        };
         _ = try self.session.poll(allocator);
         snapshot = self.session.snapshot();
         if (resolveSessionTeardown(snapshot, self.cancellation_initiated, self.reason)) |completion| return completion;
+        // A daemon "missing" response is definitive for this detached
+        // session. Keeping it pending cannot recover the terminal and would
+        // tail the absent session every frame forever.
+        if (self.session.teardownSessionMissing()) return .{
+            .exit_code = null,
+            .signal = null,
+            .cancellation_reason = null,
+        };
         if (!self.cancellation_initiated and sessionTeardownNeedsTermination(snapshot)) {
             self.cancellation_initiated = self.session.terminate();
             snapshot = self.session.snapshot();
@@ -2320,6 +2336,10 @@ const UnsupportedSession = struct {
         return .{ .running = false };
     }
 
+    fn teardownSessionMissing(_: *const UnsupportedSession) bool {
+        return false;
+    }
+
     pub fn runtimeProcessSnapshot(_: *const UnsupportedSession) RuntimeProcessSnapshot {
         return .{ .running = false, .foreground = false, .launch_kind = .shell };
     }
@@ -2855,6 +2875,10 @@ const UnixSession = struct {
         return .{ .running = false, .confirmed_exit = true };
     }
 
+    fn teardownSessionMissing(self: *const UnixSession) bool {
+        return self.backend == .daemon and self.daemon_state == .missing;
+    }
+
     pub fn runtimeProcessSnapshot(self: *const UnixSession) RuntimeProcessSnapshot {
         const process_group = self.foregroundProcessGroup();
         const root_pid: ?usize = switch (self.backend) {
@@ -3360,12 +3384,20 @@ const UnixSession = struct {
         const session_id = self.session_id orelse return false;
         const initial_attach_replay = self.suppress_next_daemon_replay and self.remote_output_offset == 0;
         const max_replay_bytes = if (initial_attach_replay) DAEMON_ATTACH_REPLAY_MAX_BYTES else DAEMON_REPLAY_MAX_BYTES;
-        const response = sessionizer.requestAlloc(allocator, pref_path, "session.tail", .{
-            .id = session_id,
-            .attach_id = self.attach_id orelse "",
-            .offset = self.remote_output_offset,
-            .max_bytes = max_replay_bytes,
-        }, 1) catch |err| {
+        const max_response_bytes = max_replay_bytes * 6 + DAEMON_TAIL_RESPONSE_OVERHEAD_BYTES;
+        const response = sessionizer.requestAllocMaxResponse(
+            allocator,
+            pref_path,
+            "session.tail",
+            .{
+                .id = session_id,
+                .attach_id = self.attach_id orelse "",
+                .offset = self.remote_output_offset,
+                .max_bytes = max_replay_bytes,
+            },
+            1,
+            max_response_bytes,
+        ) catch |err| {
             // Tolerate transient IPC failures: flipping running=false makes
             // pollTerminals revive the session, and the revive's bounded
             // replay garbles TUI panes. ~120 consecutive misses ≈ a couple of
@@ -5376,7 +5408,7 @@ test "unsignaled daemon kill response keeps a real teardown pending until observ
     if (result.cancellation_reason != null) return error.UnexpectedCancellationReason;
 }
 
-test "real teardown keeps unavailable live identity and preserves an already exited result" {
+test "real teardown keeps unavailable live identity, completes missing, and preserves exit" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
@@ -5410,7 +5442,10 @@ test "real teardown keeps unavailable live identity and preserves an already exi
     try std.testing.expect(!unavailable.cancellation_initiated);
     unavailable.session.daemon_state = .missing;
     try std.testing.expect(!unavailable.session.snapshot().confirmed_exit);
-    try std.testing.expect((try unavailable.poll(allocator)) == null);
+    const missing = (try unavailable.poll(allocator)) orelse return error.MissingTeardownCompletion;
+    try std.testing.expectEqual(@as(?u32, null), missing.exit_code);
+    try std.testing.expectEqual(@as(?u32, null), missing.signal);
+    try std.testing.expect(missing.cancellation_reason == null);
 
     var exited_dock = try Dock.init(allocator);
     defer exited_dock.deinit(allocator);
