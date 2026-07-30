@@ -41,6 +41,8 @@ pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
 const DAEMON_POLL_READ_BUDGET: usize = 64 * 1024;
 const SESSIONIZER_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum response capacity accepted by the sessionizer protocol.
+pub const MAX_RESPONSE_BYTES: usize = SESSIONIZER_MAX_MESSAGE_BYTES;
 const SESSIONIZER_REQUEST_TIMEOUT_MS: u32 = 5000;
 const ATTACH_STALE_MS: i64 = 60 * std.time.ms_per_s;
 const IDLE_EXIT_MS: i64 = 30 * std.time.ms_per_s;
@@ -209,6 +211,31 @@ pub fn requestAllocMaxResponse(
         params,
         request_id,
         max_response_bytes,
+        null,
+    );
+    return result.response;
+}
+
+/// Sends one daemon request using caller-owned response scratch space.
+///
+/// The returned response remains allocator-owned.
+pub fn requestAllocUsingBuffer(
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    method: []const u8,
+    params: anytype,
+    request_id: u64,
+    response_buffer: []u8,
+) ![]u8 {
+    std.debug.assert(response_buffer.len > 0 and response_buffer.len <= SESSIONIZER_MAX_MESSAGE_BYTES);
+    const result = try requestWithPeerAlloc(
+        allocator,
+        pref_path,
+        method,
+        params,
+        request_id,
+        response_buffer.len,
+        response_buffer,
     );
     return result.response;
 }
@@ -225,6 +252,7 @@ fn requestWithPeerAlloc(
     params: anytype,
     request_id: u64,
     max_response_bytes: usize,
+    response_buffer: ?[]u8,
 ) !RequestResult {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
@@ -267,8 +295,8 @@ fn requestWithPeerAlloc(
     try writer.interface.writeByte('\n');
     try writer.interface.flush();
 
-    const read_buffer = try allocator.alloc(u8, max_response_bytes);
-    defer allocator.free(read_buffer);
+    const read_buffer = response_buffer orelse try allocator.alloc(u8, max_response_bytes);
+    defer if (response_buffer == null) allocator.free(read_buffer);
     var reader = stream.reader(io, read_buffer);
     const line = try reader.interface.takeDelimiter('\n') orelse return error.ConnectionAborted;
     return .{ .response = try allocator.dupe(u8, std.mem.trim(u8, line, "\r")) };
@@ -293,7 +321,7 @@ pub fn ensureDaemon(allocator: std.mem.Allocator, pref_path: []const u8, exe_pat
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
 
-    if (requestWithPeerAlloc(allocator, pref_path, "status", .{}, 0, SESSIONIZER_MAX_MESSAGE_BYTES)) |result| {
+    if (requestWithPeerAlloc(allocator, pref_path, "status", .{}, 0, SESSIONIZER_MAX_MESSAGE_BYTES, null)) |result| {
         defer allocator.free(result.response);
         if (parseDaemonStatus(allocator, result.response)) |status| {
             if (status.protocol_version == PROTOCOL_VERSION) return;
