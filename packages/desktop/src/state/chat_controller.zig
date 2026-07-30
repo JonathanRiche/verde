@@ -427,6 +427,13 @@ fn finishTitleGenerationFailure(state: *TitleGenerationState, message: []const u
 pub const State = struct {
     pending_send_count: usize = 0,
     codex_background_poll: CodexBackgroundPollState = .{},
+    daemon_tail_response_buffer: ?[]u8 = null,
+
+    /// Releases chat-controller-owned polling scratch space.
+    pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
+        if (self.daemon_tail_response_buffer) |buffer| allocator.free(buffer);
+        self.daemon_tail_response_buffer = null;
+    }
 
     pub fn beginSend(self: *State) void {
         self.pending_send_count += 1;
@@ -439,7 +446,25 @@ pub const State = struct {
     pub fn hasPending(self: State) bool {
         return self.pending_send_count > 0;
     }
+
+    fn daemonTailResponseBuffer(self: *State, allocator: std.mem.Allocator) ![]u8 {
+        if (self.daemon_tail_response_buffer) |buffer| return buffer;
+        const buffer = try allocator.alloc(u8, sessionizer.MAX_RESPONSE_BYTES);
+        self.daemon_tail_response_buffer = buffer;
+        return buffer;
+    }
 };
+
+test "daemon chat tail response buffer is reused" {
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+
+    const first = try state.daemonTailResponseBuffer(std.testing.allocator);
+    const second = try state.daemonTailResponseBuffer(std.testing.allocator);
+
+    try std.testing.expectEqual(sessionizer.MAX_RESPONSE_BYTES, first.len);
+    try std.testing.expectEqual(@intFromPtr(first.ptr), @intFromPtr(second.ptr));
+}
 
 const CodexBackgroundPollStatus = enum {
     idle,
@@ -1938,10 +1963,21 @@ pub fn pollDaemonChatTurn(self: anytype, thread: *ChatThread) bool {
     const owned_turn_id = turn_id orelse return false;
     defer page_alloc.free(owned_turn_id);
 
-    const response = sessionizer.requestAlloc(page_alloc, self.storage.pref_path, "chat.turn.tail", .{
-        .turn_id = owned_turn_id,
-        .after_seq = after_seq,
-    }, 2) catch |err| {
+    const response_buffer = self.chat_controller.daemonTailResponseBuffer(self.allocator) catch |err| {
+        log.warn("failed to allocate daemon chat tail buffer: {s}", .{@errorName(err)});
+        return false;
+    };
+    const response = sessionizer.requestAllocUsingBuffer(
+        page_alloc,
+        self.storage.pref_path,
+        "chat.turn.tail",
+        .{
+            .turn_id = owned_turn_id,
+            .after_seq = after_seq,
+        },
+        2,
+        response_buffer,
+    ) catch |err| {
         log.warn("failed to tail daemon chat turn: {s}", .{@errorName(err)});
         return false;
     };

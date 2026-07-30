@@ -6854,6 +6854,8 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit title generation threads finished", .{});
         _ = self.pollSend();
         runtime_log.diagnostic("AppState.deinit sends polled", .{});
+        self.chat_controller.deinit(self.allocator);
+        runtime_log.diagnostic("AppState.deinit chat controller finished", .{});
         ai_harness.shutdownOwnedProviderProcesses();
         runtime_log.diagnostic("AppState.deinit provider processes shutdown", .{});
         self.flushDirtyBlocking();
