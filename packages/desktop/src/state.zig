@@ -482,7 +482,7 @@ fn paletteComposerKeyFromSdl(event: *const sdl.KeyboardEvent) ?palette.Key {
     const mod_bits = keymodBits(event.mod);
     const keyboard_state = sdl.getKeyboardState();
     const ctrl_down = keyboard_state[@intFromEnum(sdl.Scancode.lctrl)] or keyboard_state[@intFromEnum(sdl.Scancode.rctrl)];
-    const primary = (mod_bits & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0 or ctrl_down;
+    const primary = paletteComposerPrimaryModifier(mod_bits, ctrl_down);
     const shift = (mod_bits & sdl.Keymod.shift) != 0;
     const alt = (mod_bits & sdl.Keymod.alt) != 0;
     const code: palette.Key.Code = switch (event.key) {
@@ -506,6 +506,10 @@ fn paletteComposerKeyFromSdl(event: *const sdl.KeyboardEvent) ?palette.Key {
         else => return null,
     };
     return .{ .code = code, .shift = shift, .primary = primary or (code == .enter and !shift), .alt = alt };
+}
+
+fn paletteComposerPrimaryModifier(mod_bits: u16, ctrl_down: bool) bool {
+    return (mod_bits & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0 or ctrl_down;
 }
 
 fn keymodBits(modifier_state: sdl.Keymod) u16 {
@@ -656,6 +660,17 @@ fn paletteComposerGetClipboard(context: ?*anyopaque, allocator: std.mem.Allocato
     _ = allocator;
     const state = appStateFromContext(context) orelse return null;
     return state.readClipboardTextForPaste();
+}
+
+fn paletteComposerSetClipboard(context: ?*anyopaque, text: []const u8) bool {
+    const state = appStateFromContext(context) orelse return false;
+    const terminated = state.allocator.dupeZ(u8, text) catch return false;
+    defer state.allocator.free(terminated);
+    sdl.setClipboardText(terminated) catch |err| {
+        log.warn("failed to copy composer selection: {s}", .{@errorName(err)});
+        return false;
+    };
+    return true;
 }
 
 /// One row of the composer model picker: a concrete model under a provider
@@ -5517,7 +5532,12 @@ pub const AppState = struct {
 
     pub fn syncPaletteComposerControls(self: *AppState) void {
         if (self.project_controller.projects.items.len == 0) return;
-        self.composer_controller.composer.setCallbacks(.{ .context = self, .on_event = paletteComposerPromptEvent, .get_clipboard = paletteComposerGetClipboard });
+        self.composer_controller.composer.setCallbacks(.{
+            .context = self,
+            .on_event = paletteComposerPromptEvent,
+            .set_clipboard = paletteComposerSetClipboard,
+            .get_clipboard = paletteComposerGetClipboard,
+        });
         self.composer_controller.composer.setStyle(paletteComposerStyle());
         // Composer font sizes are CSS units in the comptime config but the
         // runtime metrics need to be the actual pixel size, otherwise the
@@ -7670,6 +7690,15 @@ test "empty workspace ignores hidden composer and slash input" {
     state.openPaletteModelPicker();
     state.openRunConfigPopover();
     state.clearCurrentDraftImageAt(0);
+}
+
+test "composer primary modifier accepts control and command without shortcut fallthrough" {
+    try std.testing.expect(paletteComposerPrimaryModifier(sdl.Keymod.lctrl, false));
+    try std.testing.expect(paletteComposerPrimaryModifier(sdl.Keymod.rctrl, false));
+    try std.testing.expect(paletteComposerPrimaryModifier(sdl.Keymod.lgui, false));
+    try std.testing.expect(paletteComposerPrimaryModifier(sdl.Keymod.rgui, false));
+    try std.testing.expect(paletteComposerPrimaryModifier(0, true));
+    try std.testing.expect(!paletteComposerPrimaryModifier(sdl.Keymod.alt | sdl.Keymod.shift, false));
 }
 
 test "browser toggle opens another workspace without closing its active browser" {

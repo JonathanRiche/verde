@@ -120,12 +120,14 @@ var transcript_scrollbar_drag_pane_id: ?app_state.WorkspacePaneId = null;
 
 const ApprovalHitCache = struct {
     pane_id: ?app_state.WorkspacePaneId = null,
+    copy_rect: palette.Rect = .{},
     approve_rect: palette.Rect = .{},
     deny_rect: palette.Rect = .{},
 };
 var approval_hits: ApprovalHitCache = .{};
 
 const ApprovalAction = enum {
+    copy,
     approve,
     deny,
 };
@@ -593,6 +595,16 @@ pub fn pointerOverTranscript(x: f32, y: f32) bool {
     return findTranscriptHit(x, y) != null;
 }
 
+/// Readable transcript bodies advertise native text selection. Clickable
+/// links and controls are resolved earlier by the main cursor-precedence path.
+pub fn transcriptTextWantsIBeamAt(state: *app_state.AppState, x: f32, y: f32) bool {
+    return transcriptMarkdownBubbleHit(state, x, y) != null;
+}
+
+pub fn transcriptLinkWantsPointerAt(state: *app_state.AppState, x: f32, y: f32) bool {
+    return transcriptMarkdownBubbleLinkHit(state, x, y) != null;
+}
+
 pub fn transcriptActionWantsPointerAt(x: f32, y: f32) bool {
     return transcriptActionAt(x, y) != null;
 }
@@ -689,10 +701,14 @@ pub fn handleApprovalPaletteMouseButton(state: *app_state.AppState, x: f32, y: f
     if (!down) return true;
 
     if (approval_hits.pane_id) |id| _ = state.focusCurrentProjectWorkspacePane(id);
-    state.resolvePendingApproval(switch (action) {
-        .approve => .approve,
-        .deny => .deny,
-    });
+    switch (action) {
+        .copy => {
+            _ = state.consumeCodeCopyButtonClick(x, y);
+            return true;
+        },
+        .approve => state.resolvePendingApproval(.approve),
+        .deny => state.resolvePendingApproval(.deny),
+    }
     approval_hits = .{};
     state.noteInteraction();
     return true;
@@ -735,43 +751,113 @@ const TranscriptMarkdownHit = struct {
     point: chat_markdown.SelectionPoint,
 };
 
+const TranscriptSelectableBodyKind = enum {
+    markdown,
+    plain,
+};
+
 const TranscriptMarkdownLinkHit = struct {
     href: []const u8,
 };
 
-fn assistantTranscriptMarkdownHit(
+fn transcriptSelectableBodyKind(
+    role: app_state.ChatRole,
+    author: []const u8,
+    body: []const u8,
+    muted_body: bool,
+    assistant_plain_layout: bool,
+) ?TranscriptSelectableBodyKind {
+    if (role == .system) {
+        if (isSlashCommandResultMessage(author, body)) return .markdown;
+        if (shouldRenderPaletteCommandRow(author, body) or
+            isDiffSummaryMessage(author, body) or
+            isUsageSummaryMessage(author, body) or
+            utils.providerFailureActionProvider(body) != null)
+        {
+            return null;
+        }
+        return .plain;
+    }
+    if (role == .assistant and !muted_body and !assistant_plain_layout) return .markdown;
+    return .plain;
+}
+
+fn transcriptSelectableBodyRect(
+    column: palette.Rect,
+    y: f32,
+    height: f32,
+    role: app_state.ChatRole,
+    author: []const u8,
+    body: []const u8,
+) ?palette.Rect {
+    if (role == .system and isSlashCommandResultMessage(author, body)) {
+        const pad = theme.scaledUi(16.0);
+        const body_y = y + pad + theme.scaledUi(46.0) + theme.scaledUi(12.0);
+        return .{
+            .x = column.x + pad,
+            .y = body_y,
+            .w = column.w - pad * 2.0,
+            .h = @max(y + height - body_y - pad, theme.scaledUi(1.0)),
+        };
+    }
+    if (role == .system and (shouldRenderPaletteCommandRow(author, body) or
+        isDiffSummaryMessage(author, body) or
+        isUsageSummaryMessage(author, body) or
+        utils.providerFailureActionProvider(body) != null))
+    {
+        return null;
+    }
+    const bubble_width = if (role == .user) column.w * 0.62 else column.w;
+    const bubble_x = if (role == .user) column.x + column.w - bubble_width else column.x;
+    return .{
+        .x = bubble_x + theme.scaledUi(14.0),
+        .y = y + theme.scaledUi(34.0),
+        .w = bubble_width - theme.scaledUi(28.0),
+        .h = height - theme.scaledUi(42.0),
+    };
+}
+
+fn buildTranscriptSelectableBodyView(
+    allocator: std.mem.Allocator,
+    kind: TranscriptSelectableBodyKind,
+    body: []const u8,
+    streaming: bool,
+) !chat_markdown.BodyView {
+    return switch (kind) {
+        .markdown => if (streaming)
+            chat_markdown.buildBodyViewStreaming(allocator, body)
+        else
+            chat_markdown.buildBodyView(allocator, body),
+        .plain => chat_markdown.buildPlainBodyView(allocator, body),
+    };
+}
+
+fn transcriptSelectableBodyHit(
     state: *app_state.AppState,
     column: palette.Rect,
     y: f32,
     height: f32,
     role: app_state.ChatRole,
+    author: []const u8,
     body_raw: []const u8,
     muted_body: bool,
     assistant_plain_layout: bool,
+    streaming: bool,
     message_index: usize,
     mouse_x: f32,
     mouse_y: f32,
 ) ?TranscriptMarkdownHit {
-    if (!(role == .assistant and !muted_body and !assistant_plain_layout)) return null;
-    const bubble_width = if (role == .user) column.w * 0.62 else column.w;
-    const bubble_x = if (role == .user) column.x + column.w - bubble_width else column.x;
-    const bubble = palette.Rect{ .x = bubble_x, .y = y, .w = bubble_width, .h = height };
-
-    const body_rect = palette.Rect{
-        .x = bubble.x + theme.scaledUi(14.0),
-        .y = bubble.y + theme.scaledUi(34.0),
-        .w = bubble.w - theme.scaledUi(28.0),
-        .h = bubble.h - theme.scaledUi(42.0),
-    };
+    const kind = transcriptSelectableBodyKind(role, author, body_raw, muted_body, assistant_plain_layout) orelse return null;
+    const body_rect = transcriptSelectableBodyRect(column, y, height, role, author, body_raw) orelse return null;
     if (!rectContains(body_rect, mouse_x, mouse_y)) return null;
 
     const body_text = std.mem.trim(u8, body_raw, "\n\r\t ");
-    var view = chat_markdown.buildBodyView(state.allocator, body_text) catch return null;
+    var view = buildTranscriptSelectableBodyView(state.allocator, kind, body_text, streaming) catch return null;
     defer view.deinit(state.allocator);
     const pt = chat_markdown.hitTestSelectablePaletteBody(
         state.allocator,
         view,
-        transcriptMarkdownOptions(),
+        transcriptSelectableOptions(kind),
         body_rect,
         body_rect.w,
         mouse_x,
@@ -787,6 +873,7 @@ fn assistantTranscriptMarkdownLinkHit(
     y: f32,
     height: f32,
     role: app_state.ChatRole,
+    author: []const u8,
     body_raw: []const u8,
     muted_body: bool,
     assistant_plain_layout: bool,
@@ -794,17 +881,9 @@ fn assistantTranscriptMarkdownLinkHit(
     mouse_x: f32,
     mouse_y: f32,
 ) ?TranscriptMarkdownLinkHit {
-    if (!(role == .assistant and !muted_body and !assistant_plain_layout)) return null;
-    const bubble_width = if (role == .user) column.w * 0.62 else column.w;
-    const bubble_x = if (role == .user) column.x + column.w - bubble_width else column.x;
-    const bubble = palette.Rect{ .x = bubble_x, .y = y, .w = bubble_width, .h = height };
-
-    const body_rect = palette.Rect{
-        .x = bubble.x + theme.scaledUi(14.0),
-        .y = bubble.y + theme.scaledUi(34.0),
-        .w = bubble.w - theme.scaledUi(28.0),
-        .h = bubble.h - theme.scaledUi(42.0),
-    };
+    const kind = transcriptSelectableBodyKind(role, author, body_raw, muted_body, assistant_plain_layout) orelse return null;
+    if (kind != .markdown) return null;
+    const body_rect = transcriptSelectableBodyRect(column, y, height, role, author, body_raw) orelse return null;
     if (!rectContains(body_rect, mouse_x, mouse_y)) return null;
 
     const body_text = std.mem.trim(u8, body_raw, "\n\r\t ");
@@ -857,7 +936,7 @@ fn transcriptMarkdownBubbleHit(
             msg_idx += 1;
             continue;
         }
-        if (assistantTranscriptMarkdownHit(state, column, content_y, item_h, message.role, message.body, false, false, msg_idx, mouse_x, mouse_y)) |hit| {
+        if (transcriptSelectableBodyHit(state, column, content_y, item_h, message.role, message.author, message.body, false, false, false, msg_idx, mouse_x, mouse_y)) |hit| {
             return hit;
         }
         content_y += item_h + theme.scaledUi(12.0);
@@ -890,7 +969,7 @@ fn transcriptMarkdownBubbleHit(
             pi += 1;
             continue;
         }
-        if (assistantTranscriptMarkdownHit(state, column, content_y, item_h, event.role, event.body, false, false, pending_msg_idx, mouse_x, mouse_y)) |hit| {
+        if (transcriptSelectableBodyHit(state, column, content_y, item_h, event.role, event.author, event.body, false, false, false, pending_msg_idx, mouse_x, mouse_y)) |hit| {
             return hit;
         }
         content_y += item_h + theme.scaledUi(12.0);
@@ -902,7 +981,7 @@ fn transcriptMarkdownBubbleHit(
     const stream_plain = stream_text.len > 0;
     const assistant_h = transcriptMessageHeightStream(null, null, body, .assistant, column.w, "", stream_plain, stream_text.len > 0);
     const stream_idx = base_idx + send_state.pending_events.items.len;
-    return assistantTranscriptMarkdownHit(state, column, content_y, assistant_h, .assistant, body, stream_text.len == 0, stream_plain, stream_idx, mouse_x, mouse_y);
+    return transcriptSelectableBodyHit(state, column, content_y, assistant_h, .assistant, "", body, stream_text.len == 0, stream_plain, true, stream_idx, mouse_x, mouse_y);
 }
 
 fn transcriptMarkdownBubbleLinkHit(
@@ -937,7 +1016,7 @@ fn transcriptMarkdownBubbleLinkHit(
             msg_idx += 1;
             continue;
         }
-        if (assistantTranscriptMarkdownLinkHit(state, column, content_y, item_h, message.role, message.body, false, false, false, mouse_x, mouse_y)) |hit| {
+        if (assistantTranscriptMarkdownLinkHit(state, column, content_y, item_h, message.role, message.author, message.body, false, false, false, mouse_x, mouse_y)) |hit| {
             return hit;
         }
         content_y += item_h + theme.scaledUi(12.0);
@@ -968,7 +1047,7 @@ fn transcriptMarkdownBubbleLinkHit(
             pi += 1;
             continue;
         }
-        if (assistantTranscriptMarkdownLinkHit(state, column, content_y, item_h, event.role, event.body, false, false, false, mouse_x, mouse_y)) |hit| {
+        if (assistantTranscriptMarkdownLinkHit(state, column, content_y, item_h, event.role, event.author, event.body, false, false, false, mouse_x, mouse_y)) |hit| {
             return hit;
         }
         content_y += item_h + theme.scaledUi(12.0);
@@ -979,7 +1058,7 @@ fn transcriptMarkdownBubbleLinkHit(
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
     const stream_plain = stream_text.len > 0;
     const assistant_h = transcriptMessageHeightStream(null, null, body, .assistant, column.w, "", stream_plain, stream_text.len > 0);
-    return assistantTranscriptMarkdownLinkHit(state, column, content_y, assistant_h, .assistant, body, stream_text.len == 0, stream_plain, true, mouse_x, mouse_y);
+    return assistantTranscriptMarkdownLinkHit(state, column, content_y, assistant_h, .assistant, "", body, stream_text.len == 0, stream_plain, true, mouse_x, mouse_y);
 }
 
 fn localFileHref(href: []const u8) ?[]const u8 {
@@ -1030,9 +1109,9 @@ pub fn handleTranscriptPaletteMouseMotion(state: *app_state.AppState) void {
 fn applyTranscriptMarkdownMulticlick(state: *app_state.AppState, hit: TranscriptMarkdownHit, clicks: usize) void {
     if (clicks < 2) return;
     const snap = transcriptMarkdownMessageSnapshot(state, hit.message_index) orelse return;
-    var view = chat_markdown.buildBodyView(state.allocator, snap.body_trim) catch return;
+    var view = buildTranscriptSelectableBodyView(state.allocator, snap.kind, snap.body_trim, snap.streaming) catch return;
     defer view.deinit(state.allocator);
-    const md = transcriptMarkdownOptions();
+    const md = transcriptSelectableOptions(snap.kind);
     const range = chat_markdown.selectionRangeForClickCount(
         state.allocator,
         view,
@@ -1163,17 +1242,24 @@ fn renderApprovalCard(state: *app_state.AppState, rect: palette.Rect, approval: 
 
     const deny_rect = palette.Rect{ .x = rect.x + rect.w - pad - button_w * 2.0 - gap, .y = rect.y + rect.h - pad - button_h, .w = button_w, .h = button_h };
     const approve_rect = palette.Rect{ .x = deny_rect.x + button_w + gap, .y = deny_rect.y, .w = button_w, .h = button_h };
+    const copy_rect = palette.Rect{ .x = deny_rect.x - gap - theme.scaledUi(72.0), .y = deny_rect.y, .w = theme.scaledUi(72.0), .h = button_h };
+    const copy_hovered = rectContains(copy_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     const deny_hovered = rectContains(deny_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     const approve_hovered = rectContains(approve_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+    queueRounded(state, copy_rect, paletteColor(if (copy_hovered) theme.lighten(theme.COLOR_PANEL_MUTED, 0.10) else theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0));
+    queueBorder(state, copy_rect, paletteColor(if (copy_hovered) theme.COLOR_TEXT_MUTED else theme.borderMuted()), theme.scaledUi(8.0), theme.scaledUi(1.0));
+    queueApprovalButtonLabel(state, copy_rect, "Copy", paletteColor(if (copy_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED));
+    state.recordTranscriptCopyHit(copy_rect, approval.body, toolCopyIdentity(@intFromPtr(approval.body.ptr), approval.body));
     queueRounded(state, deny_rect, paletteColor(if (deny_hovered) theme.lighten(theme.COLOR_PANEL_MUTED, 0.10) else theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0));
     queueBorder(state, deny_rect, paletteColor(if (deny_hovered) theme.COLOR_TEXT_MUTED else theme.borderMuted()), theme.scaledUi(8.0), theme.scaledUi(1.0));
     queueApprovalButtonLabel(state, deny_rect, "Decline", paletteColor(if (deny_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED));
     queueRounded(state, approve_rect, paletteColor(if (approve_hovered) theme.lighten(theme.COLOR_GREEN, 0.08) else theme.COLOR_GREEN), theme.scaledUi(8.0));
     queueApprovalButtonLabel(state, approve_rect, "Allow", paletteColor(theme.COLOR_WHITE));
-    approval_hits = .{ .pane_id = pane_id, .approve_rect = approve_rect, .deny_rect = deny_rect };
+    approval_hits = .{ .pane_id = pane_id, .copy_rect = copy_rect, .approve_rect = approve_rect, .deny_rect = deny_rect };
 }
 
 fn approvalActionAt(x: f32, y: f32) ?ApprovalAction {
+    if (rectContains(approval_hits.copy_rect, x, y)) return .copy;
     if (rectContains(approval_hits.approve_rect, x, y)) return .approve;
     if (rectContains(approval_hits.deny_rect, x, y)) return .deny;
     return null;
@@ -1183,13 +1269,27 @@ test "approval actions use their rendered button rectangles" {
     const previous = approval_hits;
     defer approval_hits = previous;
     approval_hits = .{
+        .copy_rect = .{ .x = 212.0, .y = 40.0, .w = 64.0, .h = 36.0 },
         .approve_rect = .{ .x = 120.0, .y = 40.0, .w = 80.0, .h = 36.0 },
         .deny_rect = .{ .x = 28.0, .y = 40.0, .w = 80.0, .h = 36.0 },
     };
 
+    try std.testing.expectEqual(ApprovalAction.copy, approvalActionAt(244.0, 58.0).?);
     try std.testing.expectEqual(ApprovalAction.approve, approvalActionAt(160.0, 58.0).?);
     try std.testing.expectEqual(ApprovalAction.deny, approvalActionAt(68.0, 58.0).?);
     try std.testing.expect(approvalActionAt(114.0, 58.0) == null);
+}
+
+test "transcript body selection includes user assistant and ordinary system text" {
+    try std.testing.expectEqual(TranscriptSelectableBodyKind.plain, transcriptSelectableBodyKind(.user, "You", "literal *prompt*", false, false).?);
+    try std.testing.expectEqual(TranscriptSelectableBodyKind.markdown, transcriptSelectableBodyKind(.assistant, "Assistant", "**answer**", false, false).?);
+    try std.testing.expectEqual(TranscriptSelectableBodyKind.plain, transcriptSelectableBodyKind(.system, "Notice", "Connection restored", false, false).?);
+    try std.testing.expectEqual(TranscriptSelectableBodyKind.plain, transcriptSelectableBodyKind(.assistant, "Assistant", "stream tail", false, true).?);
+}
+
+test "bounded transcript controls stay outside drag selection" {
+    try std.testing.expect(transcriptSelectableBodyKind(.system, "Ran command", "Command:\nzig build", false, false) == null);
+    try std.testing.expect(transcriptSelectableBodyKind(.system, "Changed files", utils.PERSISTED_DIFF_MARKER, false, false) == null);
 }
 
 fn queueApprovalButtonLabel(state: *app_state.AppState, rect: palette.Rect, label: []const u8, color: palette.Color) void {
@@ -1204,7 +1304,7 @@ fn queueApprovalButtonLabel(state: *app_state.AppState, rect: palette.Rect, labe
     }, label, color, font_size, rect);
 }
 
-/// Selects all assistant markdown in the current thread (persisted messages, pending timeline, and stream tail when present).
+/// Selects every directly selectable transcript body in the current thread.
 pub fn selectAllTranscriptMarkdownInThread(state: *app_state.AppState) bool {
     var list = std.ArrayList(usize).empty;
     defer list.deinit(state.allocator);
@@ -1239,9 +1339,9 @@ pub fn selectAllTranscriptMarkdownInThread(state: *app_state.AppState) bool {
     const last_msg = list.items[list.items.len - 1];
     const last_snap = transcriptMarkdownMessageSnapshot(state, last_msg) orelse return false;
 
-    var last_view = chat_markdown.buildBodyView(state.allocator, last_snap.body_trim) catch return false;
+    var last_view = buildTranscriptSelectableBodyView(state.allocator, last_snap.kind, last_snap.body_trim, last_snap.streaming) catch return false;
     defer last_view.deinit(state.allocator);
-    const md = transcriptMarkdownOptions();
+    const md = transcriptSelectableOptions(last_snap.kind);
     const last_pt = chat_markdown.lastSelectablePointInBody(
         state.allocator,
         last_view,
@@ -1261,7 +1361,8 @@ pub fn selectAllTranscriptMarkdownInThread(state: *app_state.AppState) bool {
 fn transcriptMarkdownMessageSnapshot(state: *app_state.AppState, message_index: usize) ?struct {
     body_trim: []const u8,
     body_inner_w: f32,
-    markdown: bool,
+    kind: TranscriptSelectableBodyKind,
+    streaming: bool,
 } {
     const column = state.transcript_controller.palette_column;
     if (column.w <= 0.0) return null;
@@ -1271,12 +1372,10 @@ fn transcriptMarkdownMessageSnapshot(state: *app_state.AppState, message_index: 
     if (message_index < n) {
         const m = thread.messages.items[message_index];
         if (m.role == .system and shouldHideCursorLifecycleSystemEvent(m.author, m.body)) return null;
-        if (m.role == .system and shouldRenderPaletteCommandRow(m.author, m.body)) return null;
-        if (m.role != .assistant) return null;
+        const kind = transcriptSelectableBodyKind(m.role, m.author, m.body, false, false) orelse return null;
         const body_trim = std.mem.trim(u8, m.body, "\n\r\t ");
-        const bubble_w = column.w;
-        const inner = @max(bubble_w - theme.scaledUi(28.0), theme.scaledUi(80.0));
-        return .{ .body_trim = body_trim, .body_inner_w = inner, .markdown = true };
+        const body_rect = transcriptSelectableBodyRect(column, 0.0, 100000.0, m.role, m.author, m.body) orelse return null;
+        return .{ .body_trim = body_trim, .body_inner_w = @max(body_rect.w, theme.scaledUi(80.0)), .kind = kind, .streaming = false };
     }
 
     const send_state = thread.send_state;
@@ -1287,12 +1386,10 @@ fn transcriptMarkdownMessageSnapshot(state: *app_state.AppState, message_index: 
     if (pi < send_state.pending_events.items.len) {
         const ev = send_state.pending_events.items[pi];
         if (ev.role == .system and shouldHideCursorLifecycleSystemEvent(ev.author, ev.body)) return null;
-        if (ev.role == .system and shouldRenderPaletteCommandRow(ev.author, ev.body)) return null;
-        if (ev.role != .assistant) return null;
+        const kind = transcriptSelectableBodyKind(ev.role, ev.author, ev.body, false, false) orelse return null;
         const body_trim = std.mem.trim(u8, ev.body, "\n\r\t ");
-        const bubble_w = column.w;
-        const inner = @max(bubble_w - theme.scaledUi(28.0), theme.scaledUi(80.0));
-        return .{ .body_trim = body_trim, .body_inner_w = inner, .markdown = true };
+        const body_rect = transcriptSelectableBodyRect(column, 0.0, 100000.0, ev.role, ev.author, ev.body) orelse return null;
+        return .{ .body_trim = body_trim, .body_inner_w = @max(body_rect.w, theme.scaledUi(80.0)), .kind = kind, .streaming = false };
     }
     if (pi != send_state.pending_events.items.len) return null;
 
@@ -1300,7 +1397,12 @@ fn transcriptMarkdownMessageSnapshot(state: *app_state.AppState, message_index: 
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
     const body_trim = std.mem.trim(u8, body, "\n\r\t ");
     const inner = @max(column.w - theme.scaledUi(28.0), theme.scaledUi(80.0));
-    return .{ .body_trim = body_trim, .body_inner_w = inner, .markdown = true };
+    return .{
+        .body_trim = body_trim,
+        .body_inner_w = inner,
+        .kind = .plain,
+        .streaming = stream_text.len > 0,
+    };
 }
 
 pub fn transcriptMarkdownSelectionPlainText(state: *app_state.AppState) std.mem.Allocator.Error!?[]u8 {
@@ -1319,9 +1421,7 @@ pub fn transcriptMarkdownSelectionPlainText(state: *app_state.AppState) std.mem.
     var mi = o.start_msg;
     while (mi <= o.end_msg) : (mi += 1) {
         const snap = transcriptMarkdownMessageSnapshot(state, mi) orelse continue;
-        if (!snap.markdown) continue;
-
-        var view = try chat_markdown.buildBodyView(state.allocator, snap.body_trim);
+        var view = try buildTranscriptSelectableBodyView(state.allocator, snap.kind, snap.body_trim, snap.streaming);
         defer view.deinit(state.allocator);
 
         const local = try chat_markdown.localMarkdownSelectionRangeForMessage(
@@ -1333,7 +1433,7 @@ pub fn transcriptMarkdownSelectionPlainText(state: *app_state.AppState) std.mem.
             mi,
             view,
             snap.body_inner_w,
-            transcriptMarkdownOptions(),
+            transcriptSelectableOptions(snap.kind),
         ) orelse continue;
 
         var scratch_batch = palette.RenderBatch{};
@@ -1355,7 +1455,7 @@ pub fn transcriptMarkdownSelectionPlainText(state: *app_state.AppState) std.mem.
             &ctx,
             state.allocator,
             view,
-            transcriptMarkdownOptions(),
+            transcriptSelectableOptions(snap.kind),
             local,
             true,
         );
@@ -2598,9 +2698,13 @@ fn transcriptMessageHeightStream(
         const measured = chat_markdown.measureBodyHeight(view, body_inner_width, markdownOptions(font_size));
         return theme.scaledUi(46.0) + measured;
     }
-    const chars_per_line = @max(@as(usize, @intFromFloat(body_inner_width / (font_size * 0.52))), 1);
-    const line_count = wrappedLineCount(body, chars_per_line);
-    return theme.scaledUi(46.0) + @as(f32, @floatFromInt(line_count)) * font_size * 1.38;
+    var plain_view = chat_markdown.buildPlainBodyView(std.heap.page_allocator, body) catch {
+        const chars_per_line = @max(@as(usize, @intFromFloat(body_inner_width / (font_size * 0.52))), 1);
+        const line_count = wrappedLineCount(body, chars_per_line);
+        return theme.scaledUi(46.0) + @as(f32, @floatFromInt(line_count)) * font_size * 1.38;
+    };
+    defer plain_view.deinit(std.heap.page_allocator);
+    return theme.scaledUi(46.0) + chat_markdown.measureBodyHeight(plain_view, body_inner_width, transcriptPlainTextOptions(theme.COLOR_WHITE));
 }
 
 /// Corner radius for transcript bubbles (user / assistant / system) and shell command rows.
@@ -2643,12 +2747,12 @@ fn renderTranscriptMessage(state: *app_state.AppState, thread: *const app_state.
         return;
     }
     if (message.role == .system and isUsageSummaryMessage(message.author, message.body)) {
-        renderUsageSummaryCard(state, column, y, height, message.body, clip);
+        renderUsageSummaryCard(state, column, y, height, message.body, clip, message_index);
         return;
     }
     if (message.role == .system) {
         if (utils.providerFailureActionProvider(message.body)) |provider| {
-            renderProviderFailureActionCard(state, column, y, height, provider, message.body, clip);
+            renderProviderFailureActionCard(state, column, y, height, provider, message.body, clip, message_index);
             return;
         }
     }
@@ -2686,6 +2790,7 @@ fn renderProviderFailureActionCard(
     provider: app_state.Provider,
     body_raw: []const u8,
     clip: palette.Rect,
+    message_index: usize,
 ) void {
     const bubble = snapRect(palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height });
     queueRoundedShellClipped(
@@ -2750,6 +2855,15 @@ fn renderProviderFailureActionCard(
         .h = theme.scaledUi(18.0),
     }, "View usage", paletteColor(if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
     if (intersectClipRect(clip, button)) |visible_button| recordUsageActionHit(visible_button);
+
+    const copy_button = snapRect(.{
+        .x = button.x + button.w + theme.scaledUi(8.0),
+        .y = button.y,
+        .w = theme.scaledUi(66.0),
+        .h = button.h,
+    });
+    renderDiffFileActionButton(state, copy_button, "Copy", false, clip);
+    state.recordTranscriptCopyHit(copy_button, body, toolCopyIdentity(message_index, body));
 }
 
 fn renderTranscriptImages(state: *app_state.AppState, column: palette.Rect, y: f32, height: f32, message: app_state.ChatMessage, clip: palette.Rect) void {
@@ -2924,7 +3038,7 @@ fn usageSummaryTitle(body_raw: []const u8) []const u8 {
 }
 
 /// Renders a provider `/usage` transcript row as a structured status card.
-fn renderUsageSummaryCard(state: *app_state.AppState, column: palette.Rect, y: f32, height: f32, body_raw: []const u8, clip: palette.Rect) void {
+fn renderUsageSummaryCard(state: *app_state.AppState, column: palette.Rect, y: f32, height: f32, body_raw: []const u8, clip: palette.Rect, message_index: usize) void {
     const data = parseUsageSummary(body_raw);
     const bubble = snapRect(palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height });
     const rr = transcriptBubbleCornerRadius();
@@ -2935,6 +3049,14 @@ fn renderUsageSummaryCard(state: *app_state.AppState, column: palette.Rect, y: f
     const header_h = theme.scaledUi(54.0);
     var cursor_y = bubble.y + pad;
     renderUsageHeader(state, bubble, cursor_y, header_h, usageSummaryTitle(body_raw), clip);
+    const copy_rect = snapRect(palette.Rect{
+        .x = bubble.x + bubble.w - pad - theme.scaledUi(66.0),
+        .y = bubble.y + pad + theme.scaledUi(3.0),
+        .w = theme.scaledUi(66.0),
+        .h = theme.scaledUi(24.0),
+    });
+    renderDiffFileActionButton(state, copy_rect, "Copy", false, clip);
+    state.recordTranscriptCopyHit(copy_rect, std.mem.trim(u8, body_raw, "\n\r\t "), toolCopyIdentity(message_index, body_raw));
     cursor_y += header_h;
 
     if (data.limit_count > 0) {
@@ -4608,11 +4730,17 @@ fn renderTranscriptBubbleFromParts(
         .h = bubble.h - theme.scaledUi(42.0),
     };
     const body_text = std.mem.trim(u8, body_raw, "\n\r\t ");
-    const body_color = if (muted_body) paletteColor(theme.COLOR_TEXT_MUTED) else paletteColor(theme.COLOR_WHITE);
     if (role == .assistant and !muted_body and !assistant_plain_layout) {
         renderMarkdownBody(state, message_index, body_rect, body_text, clip, streaming);
     } else {
-        renderWrappedBody(state, body_rect, body_text, body_color, theme.scaledUi(TRANSCRIPT_MARKDOWN_FONT_SIZE), clip);
+        renderPlainSelectableBody(
+            state,
+            message_index,
+            body_rect,
+            body_text,
+            if (muted_body) theme.COLOR_TEXT_MUTED else theme.COLOR_WHITE,
+            clip,
+        );
     }
 }
 
@@ -4627,6 +4755,23 @@ fn markdownOptions(font_size: f32) chat_markdown.RenderOptions {
 
 fn transcriptMarkdownOptions() chat_markdown.RenderOptions {
     return markdownOptions(theme.scaledUi(TRANSCRIPT_MARKDOWN_FONT_SIZE));
+}
+
+fn transcriptSelectableOptions(kind: TranscriptSelectableBodyKind) chat_markdown.RenderOptions {
+    return switch (kind) {
+        .markdown => transcriptMarkdownOptions(),
+        .plain => transcriptPlainTextOptions(theme.COLOR_WHITE),
+    };
+}
+
+fn transcriptPlainTextOptions(color: [4]f32) chat_markdown.RenderOptions {
+    const font_size = theme.scaledUi(TRANSCRIPT_MARKDOWN_FONT_SIZE);
+    return .{
+        .base_font_size = font_size,
+        .line_height = font_size * 1.38,
+        .glyph_width = font_size * 0.52,
+        .text_color = color,
+    };
 }
 
 fn renderMarkdownBody(state: *app_state.AppState, message_index: usize, rect: palette.Rect, body: []const u8, clip: palette.Rect, streaming: bool) void {
@@ -4652,7 +4797,28 @@ fn renderMarkdownBody(state: *app_state.AppState, message_index: usize, rect: pa
 }
 
 fn renderMarkdownBodyView(state: *app_state.AppState, message_index: usize, rect: palette.Rect, view: chat_markdown.BodyView, clip: palette.Rect) void {
-    const md_opts = transcriptMarkdownOptions();
+    renderSelectableBodyView(state, message_index, rect, view, clip, transcriptMarkdownOptions(), true);
+}
+
+fn renderPlainSelectableBody(state: *app_state.AppState, message_index: usize, rect: palette.Rect, body: []const u8, color: [4]f32, clip: palette.Rect) void {
+    if (body.len == 0) return;
+    var view = chat_markdown.buildPlainBodyView(state.allocator, body) catch {
+        renderWrappedBody(state, rect, body, paletteColor(color), theme.scaledUi(TRANSCRIPT_MARKDOWN_FONT_SIZE), clip);
+        return;
+    };
+    defer view.deinit(state.allocator);
+    renderSelectableBodyView(state, message_index, rect, view, clip, transcriptPlainTextOptions(color), false);
+}
+
+fn renderSelectableBodyView(
+    state: *app_state.AppState,
+    message_index: usize,
+    rect: palette.Rect,
+    view: chat_markdown.BodyView,
+    clip: palette.Rect,
+    options: chat_markdown.RenderOptions,
+    code_copy: bool,
+) void {
     const local_sel: ?chat_markdown.SelectionRange = if (state.transcriptMarkdownSelection()) |s| blk: {
         break :blk chat_markdown.localMarkdownSelectionRangeForMessage(
             state.allocator,
@@ -4663,7 +4829,7 @@ fn renderMarkdownBodyView(state: *app_state.AppState, message_index: usize, rect
             message_index,
             view,
             rect.w,
-            md_opts,
+            options,
         ) catch null;
     } else null;
 
@@ -4681,13 +4847,13 @@ fn renderMarkdownBodyView(state: *app_state.AppState, message_index: usize, rect
         .mouse_pos = if (state.transcript_controller.palette_mouse_in_workspace) .{ mx, my } else .{ -1.0, -1.0 },
         .hovered = hovered,
         .clip = clip,
-        .code_copy_recorder = state.codeCopyButtonRecorder(),
+        .code_copy_recorder = if (code_copy) state.codeCopyButtonRecorder() else null,
     };
     var sel_out = chat_markdown.renderSelectablePaletteBody(
         &context,
         state.allocator,
         view,
-        md_opts,
+        options,
         local_sel,
         false,
     );
