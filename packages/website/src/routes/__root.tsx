@@ -61,9 +61,10 @@ export const Route = createRootRouteWithContext()({
       },
     ],
     links: [
-      { rel: 'icon', type: 'image/x-icon', href: '/favicon.ico' },
-      { rel: 'icon', type: 'image/png', sizes: '192x192', href: '/logo192.png' },
-      { rel: 'apple-touch-icon', sizes: '192x192', href: '/logo192.png' },
+      { rel: 'icon', href: '/favicon.ico', sizes: 'any' },
+      { rel: 'icon', type: 'image/png', sizes: '32x32', href: '/icon-32.png' },
+      { rel: 'icon', type: 'image/png', sizes: '192x192', href: '/icon-192.png' },
+      { rel: 'apple-touch-icon', sizes: '180x180', href: '/apple-touch-icon.png' },
       { rel: 'manifest', href: '/manifest.json' },
       {
         rel: 'alternate',
