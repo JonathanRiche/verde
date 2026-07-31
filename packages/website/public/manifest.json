@@ -4,20 +4,22 @@
   "description": "Native desktop workspace for coding agents with local provider CLIs, browser, and terminal.",
   "icons": [
     {
-      "src": "verde-logo.png",
+      "src": "/icon-32.png",
       "type": "image/png",
-      "sizes": "105x122",
+      "sizes": "32x32",
       "purpose": "any"
     },
     {
-      "src": "logo192.png",
+      "src": "/icon-192.png",
       "type": "image/png",
-      "sizes": "192x192"
+      "sizes": "192x192",
+      "purpose": "any"
     },
     {
-      "src": "logo512.png",
+      "src": "/icon-512.png",
       "type": "image/png",
-      "sizes": "512x512"
+      "sizes": "512x512",
+      "purpose": "any"
     }
   ],
   "start_url": "/",
