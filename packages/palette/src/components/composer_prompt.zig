@@ -280,10 +280,11 @@ pub const ComposerPromptEvent = union(enum) {
 pub const ComposerPromptCallbacks = struct {
     context: ?*anyopaque = null,
     on_event: ?*const fn (context: ?*anyopaque, event: ComposerPromptEvent) void = null,
+    set_clipboard: ?*const fn (context: ?*anyopaque, text: []const u8) bool = null,
     get_clipboard: ?*const fn (context: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 = null,
 
     fn clipboardProvider(self: ComposerPromptCallbacks) clipboard {
-        return .{ .context = self.context, .get = self.get_clipboard };
+        return .{ .context = self.context, .set = self.set_clipboard, .get = self.get_clipboard };
     }
 };
 
@@ -1125,6 +1126,21 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 }
             }
             if (!self.focused and key.code != .escape) return false;
+            if (key.primary and key.code == .a) {
+                self.selection_anchor = 0;
+                self.selection_focus = self.buffer.items.len;
+                self.cursor = self.buffer.items.len;
+                self.ensureCursorVisible();
+                return true;
+            }
+            if (key.primary and key.code == .c) {
+                _ = self.copySelection();
+                return true;
+            }
+            if (key.primary and key.code == .x) {
+                _ = try self.cutSelection(allocator);
+                return true;
+            }
             switch (key.code) {
                 .escape => {
                     self.active_menu = null;
@@ -1278,6 +1294,17 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             defer allocator.free(clipboard_text);
             if (clipboard_text.len == 0) return false;
             try self.replaceSelection(allocator, clipboard_text);
+            return true;
+        }
+
+        fn copySelection(self: *Component) bool {
+            const range = self.selection() orelse return false;
+            return self.callbacks.clipboardProvider().write(self.buffer.items[range.start..range.end]);
+        }
+
+        fn cutSelection(self: *Component, allocator: std.mem.Allocator) !bool {
+            if (!self.copySelection()) return false;
+            try self.replaceSelection(allocator, "");
             return true;
         }
 
@@ -1915,6 +1942,7 @@ const ComposerProbe = struct {
     fast_changed: usize = 0,
     access_changed: usize = 0,
     send_clicked: usize = 0,
+    clipboard: std.ArrayList(u8) = .empty,
 };
 
 fn probeComposerEvent(context: ?*anyopaque, event: ComposerPromptEvent) void {
@@ -1928,6 +1956,18 @@ fn probeComposerEvent(context: ?*anyopaque, event: ComposerPromptEvent) void {
         .send_clicked => probe.send_clicked += 1,
         else => {},
     }
+}
+
+fn probeSetClipboard(context: ?*anyopaque, text: []const u8) bool {
+    const probe: *ComposerProbe = @ptrCast(@alignCast(context orelse return false));
+    probe.clipboard.clearRetainingCapacity();
+    probe.clipboard.appendSlice(std.testing.allocator, text) catch return false;
+    return true;
+}
+
+fn probeGetClipboard(context: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 {
+    const probe: *ComposerProbe = @ptrCast(@alignCast(context orelse return null));
+    return allocator.dupe(u8, probe.clipboard.items) catch null;
 }
 
 fn testModelOption(_: ?*anyopaque, index: usize) []const u8 {
@@ -1969,6 +2009,34 @@ test "composer prompt owns text options toggles and send input" {
     try std.testing.expectEqual(@as(usize, 1), probe.model_changed);
     try std.testing.expectEqual(@as(usize, 1), probe.fast_changed);
     try std.testing.expectEqual(@as(usize, 1), probe.access_changed);
+}
+
+test "composer prompt copy and cut stay owned by the focused editor" {
+    const Prompt = ComposerPrompt(.{});
+    var prompt = Prompt.init();
+    defer prompt.deinit(std.testing.allocator);
+    var probe: ComposerProbe = .{};
+    defer probe.clipboard.deinit(std.testing.allocator);
+    prompt.setCallbacks(.{
+        .context = &probe,
+        .set_clipboard = probeSetClipboard,
+        .get_clipboard = probeGetClipboard,
+    });
+    try prompt.setText(std.testing.allocator, "copy this text");
+    prompt.focused = true;
+    prompt.selection_anchor = 0;
+    prompt.selection_focus = 4;
+
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .key = .{ .code = .c, .primary = true } }));
+    try std.testing.expectEqualStrings("copy", probe.clipboard.items);
+    try std.testing.expectEqualStrings("copy this text", prompt.text());
+
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .key = .{ .code = .x, .primary = true } }));
+    try std.testing.expectEqualStrings(" this text", prompt.text());
+
+    prompt.selection_anchor = null;
+    prompt.selection_focus = null;
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .key = .{ .code = .c, .primary = true } }));
 }
 
 fn manyModelOption(_: ?*anyopaque, index: usize) []const u8 {

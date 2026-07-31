@@ -732,9 +732,25 @@ fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
         (sidebar_ui.wantsPointerAt(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
             chat_panel_ui.workspaceHeaderWantsPointerAt(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
             chat_panel_ui.approvalActionWantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
-            chat_panel_ui.transcriptActionWantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)))
+            chat_panel_ui.transcriptActionWantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y) or
+            chat_panel_ui.transcriptLinkWantsPointerAt(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)))
     {
         applySystemCursor(cache, .pointer);
+        return;
+    }
+    if (!modalHitAtMouse(state) and state.composer_controller.composer.textRect().contains(.{
+        .x = state.transcript_controller.palette_mouse_x,
+        .y = state.transcript_controller.palette_mouse_y,
+    })) {
+        applySystemCursor(cache, .text);
+        return;
+    }
+    if (!modalHitAtMouse(state) and chat_panel_ui.transcriptTextWantsIBeamAt(
+        state,
+        state.transcript_controller.palette_mouse_x,
+        state.transcript_controller.palette_mouse_y,
+    )) {
+        applySystemCursor(cache, .text);
         return;
     }
     applySystemCursor(cache, .default);

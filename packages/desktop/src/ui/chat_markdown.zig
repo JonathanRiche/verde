@@ -92,6 +92,7 @@ pub const RenderOptions = struct {
     base_font_size: f32 = 24.0,
     line_height: ?f32 = null,
     glyph_width: ?f32 = null,
+    text_color: ?[4]f32 = null,
     heading_font: ?*anyopaque = null,
     heading_font_size: ?f32 = null,
     bold_font: ?*anyopaque = null,
@@ -330,13 +331,13 @@ pub const BodyView = struct {
     const Self = @This();
 
     source: []const u8,
-    document: zig_markdown.Document,
+    document: ?zig_markdown.Document,
     blocks: []BlockView,
 
     pub fn deinit(self: *Self, allocator: Allocator) void {
         deinitBlockViews(allocator, self.blocks);
         allocator.free(self.blocks);
-        self.document.deinit(allocator);
+        if (self.document) |*document| document.deinit(allocator);
         self.* = undefined;
     }
 
@@ -393,6 +394,39 @@ pub fn buildBodyView(allocator: Allocator, source: []const u8) !BodyView {
 /// streaming-reply body — committed messages should use `buildBodyView`.
 pub fn buildBodyViewStreaming(allocator: Allocator, source: []const u8) !BodyView {
     return buildBodyViewImpl(allocator, source, true);
+}
+
+/// Builds a selectable body that preserves the source literally instead of
+/// interpreting Markdown syntax. Used for user, system, and transient plain
+/// transcript rows so selection shares the Markdown geometry/copy machinery
+/// without changing the text users see.
+pub fn buildPlainBodyView(allocator: Allocator, source: []const u8) Allocator.Error!BodyView {
+    var text_builder: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer text_builder.deinit(allocator);
+    var runs: std.ArrayListUnmanaged(InlineRunView) = .empty;
+    errdefer runs.deinit(allocator);
+
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try runs.append(allocator, .{ .line_break = .hard });
+        first = false;
+        try appendStyledText(allocator, &text_builder, &runs, std.mem.trimEnd(u8, line, "\r"), .{}, null);
+    }
+
+    const text = try text_builder.toOwnedSlice(allocator);
+    errdefer allocator.free(text);
+    const owned_runs = try runs.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_runs);
+    const blocks = try allocator.alloc(BlockView, 1);
+    blocks[0] = .{ .text = .{
+        .span = .{ .start_line = 0, .end_line = 0, .start_byte = 0, .end_byte = source.len },
+        .text = text,
+        .runs = owned_runs,
+        .style = .paragraph,
+    } };
+
+    return .{ .source = source, .document = null, .blocks = blocks };
 }
 
 fn buildBodyViewImpl(allocator: Allocator, source: []const u8, streaming: bool) !BodyView {
@@ -2030,7 +2064,8 @@ fn renderPaletteTextBlockLayout(
             const role = markdownFontRole(step.block_style, step.inline_style);
             const py = ctx.start[1] + step.y + inlineBaselineYOffset(step.block_style, role, draw_font_size, ctx.options);
 
-            const color = paletteColor(inlineTextColor(textBlockColor(step.block_style), step.inline_style));
+            const base_color = ctx.options.text_color orelse textBlockColor(step.block_style);
+            const color = paletteColor(inlineTextColor(base_color, step.inline_style));
             const clip = ctx.palette_context.clip;
             const byte_start = subsliceByteOffset(ctx.block_text, step.text);
             const byte_end = byte_start + step.text.len;
@@ -3380,7 +3415,8 @@ fn renderPaletteStyledChunk(
     width: f32,
     line_height: f32,
 ) void {
-    const color = inlineTextColor(textBlockColor(block_style), inline_style);
+    const base_color = options.text_color orelse textBlockColor(block_style);
+    const color = inlineTextColor(base_color, inline_style);
     const draw_font_size = fontSizeForSpecWithOptions(font_spec, options);
     const role = markdownFontRole(block_style, inline_style);
     const y = position[1] + inlineBaselineYOffset(block_style, role, draw_font_size, options);
@@ -4088,4 +4124,48 @@ test "triple click selection expands to the full raw line" {
 
     try std.testing.expectEqual(@as(usize, 0), selection.anchor.column);
     try std.testing.expectEqual(@as(usize, countColumns(line)), selection.focus.column);
+}
+
+fn expectWholeBodyCopy(source: []const u8, plain: bool, expected: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var body = if (plain)
+        try buildPlainBodyView(allocator, source)
+    else
+        try buildBodyView(allocator, source);
+    defer body.deinit(allocator);
+
+    const options: RenderOptions = .{ .base_font_size = 16.0, .line_height = 22.0 };
+    const last = try lastSelectablePointInBody(allocator, body, 600.0, options);
+    var batch: palette.RenderBatch = .{};
+    defer batch.deinit(allocator);
+    var frame_text: std.ArrayList(u8) = .empty;
+    defer frame_text.deinit(allocator);
+    var text_arena = std.heap.ArenaAllocator.init(allocator);
+    defer text_arena.deinit();
+    var context: PaletteRenderContext = .{
+        .allocator = allocator,
+        .batch = &batch,
+        .frame_text = &frame_text,
+        .text_arena = &text_arena,
+        .cursor = .{ .x = 0.0, .y = 0.0, .w = 600.0, .h = 400.0 },
+        .available_width = 600.0,
+    };
+    var output = renderSelectablePaletteBody(
+        &context,
+        allocator,
+        body,
+        options,
+        .{ .anchor = .{ .line_index = 0, .column = 0 }, .focus = last },
+        true,
+    );
+    defer output.deinit(allocator);
+    try std.testing.expectEqualStrings(expected, std.mem.sliceTo(output.copied_text.?, 0));
+}
+
+test "assistant markdown selection copies rendered text" {
+    try expectWholeBodyCopy("Selectable **assistant** text.", false, "Selectable assistant text.");
+}
+
+test "plain transcript selection preserves user and system text literally" {
+    try expectWholeBodyCopy("User *literal* text\nSystem notice", true, "User *literal* text\nSystem notice");
 }
