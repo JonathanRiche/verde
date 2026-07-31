@@ -576,6 +576,7 @@ fn handleSendPromptLine(
             return .continue_reading;
         }
         if (id == 2) {
+            if (state.prompt_submitted) return .continue_reading;
             if (state.session_id == null) {
                 const session_id = parseSessionId(parsed.value) orelse request.thread_id orelse return error.CursorAcpFailed;
                 state.session_id = try allocator.dupe(u8, session_id);
@@ -854,6 +855,9 @@ fn writeJsonLineToFile(allocator: std.mem.Allocator, file: std.Io.File, line: []
 }
 
 fn responseId(value: std.json.Value) ?i64 {
+    // ACP server requests use their own id sequence, which can collide with
+    // Verde's request ids. Only JSON-RPC responses are eligible here.
+    if (getObjectField(value, "method") != null) return null;
     return getOptionalObjectInteger(value, "id");
 }
 
@@ -2099,6 +2103,35 @@ test "handleSendPromptLine handles permission request id collision before prompt
         SendLineAction.continue_reading,
         try handleSendPromptLine(std.testing.allocator, line, request, &state, null),
     );
+}
+
+test "handleSendPromptLine ignores non-permission ACP server request id collisions" {
+    var state: SendPromptState = .{
+        .capabilities = .{ .image = true },
+        .prompt_submitted = true,
+    };
+    defer state.deinit(std.testing.allocator);
+    const request = provider_types.SendPromptRequest{
+        .thread_id = "existing-session",
+        .prompt = "continue",
+    };
+    const initialize_collision =
+        \\{"jsonrpc":"2.0","id":1,"method":"fs/read_text_file","params":{"path":"/tmp/example"}}
+    ;
+    const session_collision =
+        \\{"jsonrpc":"2.0","id":2,"method":"terminal/wait_for_exit","params":{"terminalId":"terminal-1"}}
+    ;
+
+    try std.testing.expectEqual(
+        SendLineAction.continue_reading,
+        try handleSendPromptLine(std.testing.allocator, initialize_collision, request, &state, null),
+    );
+    try std.testing.expect(state.capabilities.image);
+    try std.testing.expectEqual(
+        SendLineAction.continue_reading,
+        try handleSendPromptLine(std.testing.allocator, session_collision, request, &state, null),
+    );
+    try std.testing.expect(state.session_id == null);
 }
 
 test "Cursor Full Access auto-approves permission requests" {
