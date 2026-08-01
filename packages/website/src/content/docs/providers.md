@@ -23,7 +23,7 @@ machine, and supports each agent in one or both of two modes:
 | Claude Code | ✓        | ✓            | Anthropic's Claude Agent SDK against the local runtime          |
 | OpenCode    | ✓        | ✓            | Drives the `opencode` CLI; starts `opencode serve` on demand    |
 | Cursor      | ✓        | ✓            | Speaks to the Cursor CLI ACP server (`agent acp`)               |
-| Grok        | –        | ✓            | TUI-only — launches Grok Build in a terminal pane               |
+| Grok Build  | –        | ✓            | TUI-only — launches the `grok` CLI in a terminal pane           |
 | Amp         | –        | ✓            | TUI-only — launches the `amp` CLI in a terminal pane            |
 
 All of them run against the project directory you imported into Verde. Tokens,

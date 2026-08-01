@@ -46,6 +46,21 @@ Most AI coding tools pick a lane: a chat sidebar, a terminal CLI, or a hosted we
 
 ✓ full · ~ partial · – not really
 
+### Supported agents
+
+| Agent | GUI chat | Terminal TUI | How Verde talks to it |
+| --- | :---: | :---: | --- |
+| **Codex** | ✓ | ✓ | Local `codex` CLI + `codex app-server` |
+| **Claude Code** | ✓ | ✓ | Claude Agent SDK against your installed Claude Code |
+| **OpenCode** | ✓ | ✓ | Local `opencode` CLI + `opencode serve` |
+| **Cursor** | ✓ | ✓ | Cursor CLI ACP (`agent acp`) |
+| **Grok Build** | – | ✓ | Local `grok` CLI in an embedded Ghostty pane |
+| **Amp** | – | ✓ | Local `amp` CLI in an embedded Ghostty pane |
+
+Verde does not host models or relay prompts. Install the provider CLIs you care about; Verde drives them on your machine.
+
+→ Setup notes: [Provider docs](https://verdeai.dev/docs/providers)
+
 ---
 
 ## Install
@@ -87,7 +102,7 @@ Verde does **not** ship a model. Install and authenticate at least one provider 
 | **Claude Code** | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) + Node on `PATH` → log in |
 | **OpenCode** | [OpenCode](https://github.com/anomalyco/opencode) on `PATH` |
 | **Cursor** | [Cursor CLI](https://cursor.com/docs/cli/installation) → `agent login` (or `CURSOR_API_KEY`) |
-| **Grok Build** | [Grok](https://docs.x.ai/build/overview#install) on `PATH` · terminal TUI |
+| **Grok Build** | [Grok Build](https://docs.x.ai/build/overview#install) → `grok` on `PATH` · terminal TUI (palette → **Start New Grok TUI**) |
 | **Amp** | [Amp](https://ampcode.com) on `PATH` · terminal TUI |
 
 Then:
