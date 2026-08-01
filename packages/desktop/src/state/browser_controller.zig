@@ -590,15 +590,20 @@ pub fn browserPaneSnapshotUrl(self: anytype, project_index: usize, pane_id: Work
 // Rebind the one live runtime when their workspace becomes visible.
 pub fn restorePersistedBrowserPaneAfterProjectSelection(self: anytype, project_index: usize) void {
     if (project_index >= self.project_controller.projects.items.len) return;
-    const pane_id = self.project_controller.projects.items[project_index].workspace_layout.visibleBrowserPaneId() orelse {
+    const layout = &self.project_controller.projects.items[project_index].workspace_layout;
+    const pane_id = layout.visibleBrowserPaneId() orelse {
         // Keep the one live page hidden so its DOM state survives while
         // the selected workspace has no browser pane.
         self.noteBrowserPaneNotRendered();
         return;
     };
+    const maximized_pane_id = layout.maximized_pane_id;
     self.applyBrowserPaneSnapshotToRuntime(project_index, pane_id);
     if (!self.browser_textures_enabled) return;
 
+    // Rebinding an existing browser runtime is workspace restoration, not an
+    // explicit browser-open action, so it must not change the pane zoom state.
+    defer layout.maximized_pane_id = maximized_pane_id;
     _ = self.openBrowserInWorkspace(project_index, null) catch |err| {
         log.warn("failed to restore browser pane after workspace selection: {s}", .{@errorName(err)});
         self.browser_controller.runtime.status = .failed;
