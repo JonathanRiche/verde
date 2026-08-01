@@ -33,9 +33,9 @@ Right-click a terminal tab to rename or close it. If `terminal.profiles` is
 configured in `verde.json`, the first custom launch profile also appears in
 the terminal context menu.
 
-Use `Ctrl+Alt+T` for a new shell tab. Launch Codex, Claude, OpenCode, Cursor, or
-Amp TUIs from the command palette; the built-in agent launchers are not entries
-in the terminal right-click menu.
+Use `Ctrl+Alt+T` for a new shell tab. Launch Codex, Claude, OpenCode, Cursor,
+Grok, or Amp TUIs from the command palette; the built-in agent launchers are not
+entries in the terminal right-click menu.
 
 Terminal-internal tabs live inside the focused terminal pane. Workspace split
 actions create new workspace panes in the tiling tree, not new tabs inside a

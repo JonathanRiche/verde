@@ -17,6 +17,7 @@ import claudeLogo from '../../../desktop/src/assets/claude-logo.png'
 import opencodeLogo from '../../../desktop/src/assets/opencode-logo-dark.png'
 import cursorLogo from '../../../desktop/src/assets/editor_logos/cursor.png'
 import ampLogo from '../../../desktop/src/assets/amp-logo.png'
+import grokLogo from '../../../desktop/src/assets/grok-logo.png'
 import verdeLogoMask from '../../../desktop/src/assets/verde_logo_mask.png'
 import CopyButton from '../components/CopyButton'
 
@@ -98,6 +99,12 @@ const providers = [
     logo: cursorLogo,
     modes: ['gui', 'tui'],
     blurb: 'Speaks to the Cursor CLI ACP server (agent acp) on your machine.',
+  },
+  {
+    name: 'Grok Build',
+    logo: grokLogo,
+    modes: ['tui'],
+    blurb: 'Launches the grok CLI as a terminal TUI, with personal hooks for live status pips.',
   },
   {
     name: 'Amp',
