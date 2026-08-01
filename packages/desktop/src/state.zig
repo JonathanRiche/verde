@@ -8236,6 +8236,56 @@ test "sidebar pane selection restores a sibling browser URL snapshot" {
     try std.testing.expect(!state.composer_controller.composer.focused);
 }
 
+test "sidebar and pane cycling preserve zoom while rebinding a browser runtime" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.surface_controller.surfaces = .empty;
+    state.project_controller.selected_index = 0;
+    state.browser_controller = try browser_controller.State.init(allocator);
+    state.browser_textures_enabled = true;
+    state.terminal_controller.focused = false;
+    state.composer_controller.focused = true;
+    state.composer_controller.composer = PaletteComposerPrompt.init();
+    state.composer_controller.model_picker = PaletteModelPicker.init(0);
+    state.composer_controller.popover_restore_focus = false;
+    state.composer_controller.run_config_open = false;
+    state.palette_modal_text_focus = .none;
+    state.lifecycle.dirty = false;
+    state.lifecycle.last_dirty_at_ms = 0;
+    state.lifecycle.last_interaction_at_ms = 0;
+    @memset(&state.sidebar_notice_storage, 0);
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.surface_controller.surfaces.deinit(allocator);
+        state.composer_controller.composer.deinit(allocator);
+        state.browser_controller.deinit(allocator);
+    }
+    if (state.browser_controller.runtime.controller.runtimeKind() != .stub) return error.SkipZigTest;
+
+    var project = try Project.init(allocator, "test", "Test", "/tmp/test", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    const layout = &state.project_controller.projects.items[0].workspace_layout;
+    const chat_pane_id = layout.panes.items[0].id;
+    const terminal_pane_id = try layout.createTerminalPane(allocator, 1);
+    _ = try layout.ensureBrowserPane(allocator);
+    layout.focused_pane_id = terminal_pane_id;
+    layout.maximized_pane_id = terminal_pane_id;
+
+    state.focusWorkspaceOpenPaneFromSidebar(0, chat_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.maximized_pane_id);
+
+    try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(1));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, terminal_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, terminal_pane_id), layout.maximized_pane_id);
+}
+
 test "workspace selection restores focused pane keyboard ownership" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
