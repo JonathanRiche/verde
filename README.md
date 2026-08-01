@@ -17,11 +17,11 @@
 </p>
 
 <p align="center">
-  <img src="assets/green_verde.png" alt="Verde tiling workspace with chat, Codex TUI, and shell panes" width="100%" />
+  <img src="assets/themes/verde.png" alt="Verde tiling workspace — Codex GUI chat, Claude Code TUI, Amp, and shell in one window" width="100%" />
 </p>
 
 <p align="center">
-  <em>Codex, Claude Code, OpenCode, Cursor — GUI chat or terminal TUI — tiled next to shell and browser. No hosted relay.</em>
+  <em>Codex GUI + Claude Code TUI + Amp, tiled with shell — every agent local, no hosted relay.</em>
 </p>
 
 ---
@@ -111,7 +111,7 @@ If no GUI provider is ready, Verde shows a **Connect an AI provider** screen so 
 ## Features
 
 <p align="center">
-  <img src="assets/ristretto_verde.png" alt="Verde Ristretto theme — multi-pane agent workspace" width="100%" />
+  <img src="assets/themes/ristretto.png" alt="Same multi-agent layout under the Ristretto theme" width="100%" />
 </p>
 
 ### Tiling workspace, not a chat box
@@ -164,19 +164,25 @@ verde open http://localhost:3000
 
 ### Themes that match your rig
 
-On Omarchy, Verde follows the active `colors.toml` automatically. Everywhere else, import portable themes:
+On Omarchy, Verde follows the active `colors.toml` automatically. Everywhere else, import portable themes from the site:
 
 ```bash
-verde theme import https://verdeai.dev/themes/verde.json
+verde theme import https://verdeai.dev/themes/tokyo-night.json
 ```
 
 <p align="center">
-  <img src="assets/theme-verde.png" alt="Verde default theme" width="48%" />
-  <img src="assets/theme-tokyo-night.png" alt="Tokyo Night theme" width="48%" />
+  <img src="assets/themes/tokyo-night.png" alt="Tokyo Night" width="32%" />
+  <img src="assets/themes/catppuccin.png" alt="Catppuccin" width="32%" />
+  <img src="assets/themes/gruvbox.png" alt="Gruvbox" width="32%" />
+</p>
+<p align="center">
+  <img src="assets/themes/kanagawa.png" alt="Kanagawa" width="32%" />
+  <img src="assets/themes/osaka-jade.png" alt="Osaka Jade" width="32%" />
+  <img src="assets/themes/matte-black.png" alt="Matte Black" width="32%" />
 </p>
 
 <p align="center">
-  <em>Same app, different skins — more palettes on <a href="https://verdeai.dev/">verdeai.dev</a>.</em>
+  <em>Same workspace, different skins — try them live on <a href="https://verdeai.dev/">verdeai.dev</a> (also Catppuccin Latte, Ristretto, Verde default).</em>
 </p>
 
 ---
