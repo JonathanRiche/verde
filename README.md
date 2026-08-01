@@ -17,11 +17,11 @@
 </p>
 
 <p align="center">
-  <img src="assets/themes/verde.png" alt="Verde tiling workspace — Codex GUI chat, Claude Code TUI, Amp, and shell in one window" width="100%" />
+  <img src="assets/themes/verde.png" alt="Verde tiling workspace — Codex GUI chat, Claude Code TUI, Amp, Grok Build, and shell in one window" width="100%" />
 </p>
 
 <p align="center">
-  <em>Codex GUI + Claude Code TUI + Amp, tiled with shell — every agent local, no hosted relay.</em>
+  <em>Codex GUI + Claude Code TUI + Amp + Grok Build — tiled with shell. Every agent local, no hosted relay.</em>
 </p>
 
 ---
