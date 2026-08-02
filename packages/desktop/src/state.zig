@@ -1028,7 +1028,7 @@ const PersistedHerdrWorkspaceLink = db_types.PersistedHerdrWorkspaceLink;
 const PersistedMessage = db_types.PersistedMessage;
 const PersistedProject = db_types.PersistedProject;
 const PersistedState = db_types.PersistedState;
-const PersistedSurfaceCompletion = db_types.PersistedSurfaceCompletion;
+const PersistedSurfaceState = db_types.PersistedSurfaceState;
 const PersistedThread = db_types.PersistedThread;
 
 // `utils.zig` owns the cross-cutting runtime helpers that are shared with the UI shell.
@@ -2788,7 +2788,7 @@ pub const AppState = struct {
     pub const restoreDaemonChatTurnsOnLaunch = chat_controller.restoreDaemonChatTurnsOnLaunch;
     pub const threadByLocalId = chat_controller.threadByLocalId;
     pub const applyPersisted = persistence.applyPersisted;
-    pub const restorePersistedSurfaceCompletions = persistence.restorePersistedSurfaceCompletions;
+    pub const restorePersistedSurfaceStates = persistence.restorePersistedSurfaceStates;
     pub const restorePersistedChatCompletions = persistence.restorePersistedChatCompletions;
     pub const buildPersistedState = persistence.buildPersistedState;
     pub const applyPersistedTerminalDocksJson = persistence.applyPersistedTerminalDocksJson;

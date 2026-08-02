@@ -15,7 +15,7 @@ const PersistedImageAttachment = db_types.PersistedImageAttachment;
 const PersistedMessage = db_types.PersistedMessage;
 const PersistedProject = db_types.PersistedProject;
 const PersistedState = db_types.PersistedState;
-const PersistedSurfaceCompletion = db_types.PersistedSurfaceCompletion;
+const PersistedSurfaceState = db_types.PersistedSurfaceState;
 const PersistedThread = db_types.PersistedThread;
 
 pub const STATE_DB_NAME = "state.sqlite";
@@ -115,35 +115,38 @@ pub const Client = struct {
         if (workspace_rows.err) |err| return err;
 
         loaded.value.projects = try workspaces.toOwnedSlice(arena);
-        loaded.value.surface_completions = try self.loadSurfaceCompletions(arena);
+        loaded.value.surface_states = try self.loadSurfaceStates(arena);
         loaded.value.chat_completions = try self.loadChatCompletions(arena);
         return loaded;
     }
 
-    pub fn upsertSurfaceCompletion(self: *const Self, completion: PersistedSurfaceCompletion) !void {
+    pub fn upsertSurfaceState(self: *const Self, surface: PersistedSurfaceState) !void {
         try self.conn.exec(
-            "insert into surface_completions (session_id, workspace_id, workspace_path, dock_id, pane_id, provider, provider_thread_id, title, completed_at_ms, last_event_title, last_event_body) " ++
-                "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) " ++
+            "insert into surface_completions (session_id, workspace_id, workspace_path, dock_id, pane_id, provider, provider_thread_id, title, status, status_changed_at_ms, completed_at_ms, last_event_title, last_event_body) " ++
+                "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) " ++
                 "on conflict(session_id) do update set workspace_id = excluded.workspace_id, workspace_path = excluded.workspace_path, dock_id = excluded.dock_id, " ++
                 "pane_id = excluded.pane_id, provider = excluded.provider, provider_thread_id = excluded.provider_thread_id, title = excluded.title, " ++
-                "completed_at_ms = excluded.completed_at_ms, last_event_title = excluded.last_event_title, last_event_body = excluded.last_event_body",
+                "status = excluded.status, status_changed_at_ms = excluded.status_changed_at_ms, completed_at_ms = excluded.completed_at_ms, " ++
+                "last_event_title = excluded.last_event_title, last_event_body = excluded.last_event_body",
             .{
-                completion.session_id,
-                completion.workspace_id,
-                completion.workspace_path,
-                @as(i64, @intCast(completion.dock_id)),
-                if (completion.pane_id) |pane_id| @as(i64, @intCast(pane_id)) else null,
-                encodeOptionalEnum(completion.provider),
-                completion.provider_thread_id,
-                completion.title,
-                completion.completed_at_ms,
-                completion.last_event_title,
-                completion.last_event_body,
+                surface.session_id,
+                surface.workspace_id,
+                surface.workspace_path,
+                @as(i64, @intCast(surface.dock_id)),
+                if (surface.pane_id) |pane_id| @as(i64, @intCast(pane_id)) else null,
+                encodeOptionalEnum(surface.provider),
+                surface.provider_thread_id,
+                surface.title,
+                @as(i64, @intFromEnum(surface.status)),
+                surface.status_changed_at_ms,
+                surface.completed_at_ms,
+                surface.last_event_title,
+                surface.last_event_body,
             },
         );
     }
 
-    pub fn clearSurfaceCompletion(self: *const Self, session_id: []const u8) !bool {
+    pub fn clearSurfaceState(self: *const Self, session_id: []const u8) !bool {
         try self.conn.exec("delete from surface_completions where session_id = ?1", .{session_id});
         return self.conn.changes() > 0;
     }
@@ -222,19 +225,22 @@ pub const Client = struct {
         try self.conn.commit();
     }
 
-    fn loadSurfaceCompletions(self: *const Self, allocator: std.mem.Allocator) ![]const PersistedSurfaceCompletion {
-        var completions: std.ArrayList(PersistedSurfaceCompletion) = .empty;
-        defer completions.deinit(allocator);
+    fn loadSurfaceStates(self: *const Self, allocator: std.mem.Allocator) ![]const PersistedSurfaceState {
+        var surfaces: std.ArrayList(PersistedSurfaceState) = .empty;
+        defer surfaces.deinit(allocator);
 
         var rows = try self.conn.rows(
-            "select session_id, workspace_id, workspace_path, dock_id, pane_id, provider, provider_thread_id, title, completed_at_ms, last_event_title, last_event_body " ++
-                "from surface_completions order by completed_at_ms, session_id",
+            "select session_id, workspace_id, workspace_path, dock_id, pane_id, provider, provider_thread_id, title, status, status_changed_at_ms, completed_at_ms, last_event_title, last_event_body " ++
+                "from surface_completions order by status_changed_at_ms, session_id",
             .{},
         );
         defer rows.deinit();
 
         while (rows.next()) |row| {
-            try completions.append(allocator, .{
+            const status = decodeEnumOr(db_types.SurfaceStatus, row.int(8), .done);
+            const completed_at_ms = row.int(10);
+            const stored_changed_at_ms = row.int(9);
+            try surfaces.append(allocator, .{
                 .session_id = try allocator.dupe(u8, row.text(0)),
                 .workspace_id = try allocator.dupe(u8, row.text(1)),
                 .workspace_path = try allocator.dupe(u8, row.text(2)),
@@ -243,13 +249,17 @@ pub const Client = struct {
                 .provider = decodeOptionalEnum(db_types.SurfaceProvider, row.nullableInt(5)),
                 .provider_thread_id = try dupeOptionalText(allocator, row.nullableText(6)),
                 .title = try allocator.dupe(u8, row.text(7)),
-                .completed_at_ms = row.int(8),
-                .last_event_title = try dupeOptionalText(allocator, row.nullableText(9)),
-                .last_event_body = try dupeOptionalText(allocator, row.nullableText(10)),
+                .status = status,
+                // Existing completion rows predate this column. Their
+                // completion timestamp is the authoritative change time.
+                .status_changed_at_ms = if (stored_changed_at_ms != 0) stored_changed_at_ms else completed_at_ms,
+                .completed_at_ms = completed_at_ms,
+                .last_event_title = try dupeOptionalText(allocator, row.nullableText(11)),
+                .last_event_body = try dupeOptionalText(allocator, row.nullableText(12)),
             });
         }
         if (rows.err) |err| return err;
-        return try completions.toOwnedSlice(allocator);
+        return try surfaces.toOwnedSlice(allocator);
     }
 
     fn loadChatCompletions(self: *const Self, allocator: std.mem.Allocator) ![]const PersistedChatCompletion {
@@ -521,7 +531,7 @@ fn testDirPathAlloc(dir: std.Io.Dir, allocator: std.mem.Allocator) ![]u8 {
     return allocator.dupe(u8, buffer[0..len]);
 }
 
-test "surface completions survive state saves and clear explicitly" {
+test "terminal surface states survive state saves and clear explicitly" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -532,7 +542,7 @@ test "surface completions survive state saves and clear explicitly" {
     defer client.deinit();
 
     try client.save(.{});
-    try client.upsertSurfaceCompletion(.{
+    try client.upsertSurfaceState(.{
         .session_id = "session-later",
         .workspace_id = "workspace-2",
         .workspace_path = "/tmp/two",
@@ -540,9 +550,10 @@ test "surface completions survive state saves and clear explicitly" {
         .pane_id = 12,
         .provider = .cursor,
         .title = "Later",
-        .completed_at_ms = 200,
+        .status = .working,
+        .status_changed_at_ms = 200,
     });
-    try client.upsertSurfaceCompletion(.{
+    try client.upsertSurfaceState(.{
         .session_id = "session-first",
         .workspace_id = "workspace-1",
         .workspace_path = "/tmp/one",
@@ -550,20 +561,24 @@ test "surface completions survive state saves and clear explicitly" {
         .pane_id = 11,
         .provider = .codex,
         .title = "First",
+        .status = .done,
+        .status_changed_at_ms = 100,
         .completed_at_ms = 100,
     });
 
-    // Ordinary app-state snapshots must not erase the independent completion
-    // ledger, including when another process writes the ledger between saves.
+    // Ordinary app-state snapshots must not erase the independent surface
+    // ledger, including when another process writes it between saves.
     try client.save(.{ .sidebar_collapsed = true });
 
     var loaded = (try client.load(testing.allocator)).?;
     defer loaded.deinit();
-    try testing.expectEqual(@as(usize, 2), loaded.value.surface_completions.len);
-    try testing.expectEqualStrings("session-first", loaded.value.surface_completions[0].session_id);
-    try testing.expectEqualStrings("session-later", loaded.value.surface_completions[1].session_id);
-    try testing.expect(try client.clearSurfaceCompletion("session-first"));
-    try testing.expect(!try client.clearSurfaceCompletion("session-first"));
+    try testing.expectEqual(@as(usize, 2), loaded.value.surface_states.len);
+    try testing.expectEqualStrings("session-first", loaded.value.surface_states[0].session_id);
+    try testing.expectEqual(db_types.SurfaceStatus.done, loaded.value.surface_states[0].status);
+    try testing.expectEqualStrings("session-later", loaded.value.surface_states[1].session_id);
+    try testing.expectEqual(db_types.SurfaceStatus.working, loaded.value.surface_states[1].status);
+    try testing.expect(try client.clearSurfaceState("session-first"));
+    try testing.expect(!try client.clearSurfaceState("session-first"));
 }
 
 test "chat completions survive state saves and clear explicitly" {

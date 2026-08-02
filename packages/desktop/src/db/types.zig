@@ -39,6 +39,14 @@ pub const SurfaceProvider = enum(u8) {
     amp = 5,
 };
 
+pub const SurfaceStatus = enum(u8) {
+    idle,
+    working,
+    waiting,
+    done,
+    @"error",
+};
+
 pub const Harness = enum(u8) {
     local_cli,
     remote_session,
@@ -63,7 +71,7 @@ pub const PersistedHerdrWorkspaceLink = struct {
     updated_at_ms: i64 = 0,
 };
 
-pub const PersistedSurfaceCompletion = struct {
+pub const PersistedSurfaceState = struct {
     session_id: []const u8,
     workspace_id: []const u8 = "",
     workspace_path: []const u8 = "",
@@ -72,7 +80,9 @@ pub const PersistedSurfaceCompletion = struct {
     provider: ?SurfaceProvider = null,
     provider_thread_id: ?[]const u8 = null,
     title: []const u8 = "",
-    completed_at_ms: i64,
+    status: SurfaceStatus,
+    status_changed_at_ms: i64,
+    completed_at_ms: i64 = 0,
     last_event_title: ?[]const u8 = null,
     last_event_body: ?[]const u8 = null,
 };
@@ -139,7 +149,7 @@ pub const PersistedState = struct {
     selected_project_index: usize = 0,
     sidebar_collapsed: bool = false,
     projects: []const PersistedProject = &.{},
-    surface_completions: []const PersistedSurfaceCompletion = &.{},
+    surface_states: []const PersistedSurfaceState = &.{},
     chat_completions: []const PersistedChatCompletion = &.{},
     provider: ?Provider = null,
     harness: ?Harness = null,
