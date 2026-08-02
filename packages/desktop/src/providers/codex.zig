@@ -2917,13 +2917,13 @@ fn emitNotificationEvent(self: *Client, root: std.json.Value, request: provider_
     }
 
     if (std.mem.eql(u8, method, "turn/diff/updated")) {
-        if (buildDiffSummary(root, request.stream_context, on_stream_event)) {
+        if (buildDiffSummary(root, .turn_snapshot, request.stream_context, on_stream_event)) {
             return;
         }
     }
 
     if (std.mem.eql(u8, method, "item/fileChange/outputDelta")) {
-        if (buildDiffSummary(root, request.stream_context, on_stream_event)) {
+        if (buildDiffSummary(root, .incremental, request.stream_context, on_stream_event)) {
             return;
         }
     }
@@ -3335,6 +3335,7 @@ fn respondServerError(request_id: std.json.Value, self: *Client, code: i64, mess
 
 fn buildDiffSummary(
     root: std.json.Value,
+    scope: provider_types.StreamDiffScope,
     context: ?*anyopaque,
     on_stream_event: *const fn (?*anyopaque, provider_types.StreamEvent) void,
 ) bool {
@@ -3345,6 +3346,7 @@ fn buildDiffSummary(
     if (!appendDiffFiles(params, &files)) return false;
     on_stream_event(context, .{ .diff = .{
         .files = files.items,
+        .scope = scope,
     } });
     return true;
 }
@@ -3704,6 +3706,7 @@ const TestStreamEventCapture = struct {
     diff_count: usize = 0,
     diff_path: ?[]const u8 = null,
     diff_patch: ?[]const u8 = null,
+    diff_scope: ?provider_types.StreamDiffScope = null,
     tool_call_id_storage: [128]u8 = undefined,
     tool_input_storage: [1024]u8 = undefined,
     tool_output_storage: [1024]u8 = undefined,
@@ -3746,6 +3749,7 @@ const TestStreamEventCapture = struct {
             },
             .diff => |diff| {
                 if (diff.files.len == 0) return;
+                self.diff_scope = diff.scope;
                 const file = diff.files[0];
                 const path_len = @min(file.path.len, self.diff_path_storage.len);
                 @memcpy(self.diff_path_storage[0..path_len], file.path[0..path_len]);
@@ -4217,8 +4221,9 @@ test "turn diff notification emits file snapshots with patch aliases" {
     defer parsed.deinit();
 
     var capture: TestStreamEventCapture = .{};
-    try std.testing.expect(buildDiffSummary(parsed.value, &capture, TestStreamEventCapture.handle));
+    try std.testing.expect(buildDiffSummary(parsed.value, .turn_snapshot, &capture, TestStreamEventCapture.handle));
     try std.testing.expectEqual(@as(usize, 1), capture.diff_count);
+    try std.testing.expectEqual(provider_types.StreamDiffScope.turn_snapshot, capture.diff_scope.?);
     try std.testing.expectEqualStrings("src/main.zig", capture.diff_path.?);
     try std.testing.expect(std.mem.indexOf(u8, capture.diff_patch.?, "+new") != null);
 }

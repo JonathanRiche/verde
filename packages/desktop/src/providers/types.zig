@@ -167,6 +167,18 @@ pub const StreamDiffFile = struct {
     patch: ?[]const u8 = null,
 };
 
+/// Identifies whether a streamed patch is one edit or the current whole-turn state.
+pub const StreamDiffScope = enum(u8) {
+    incremental,
+    turn_snapshot,
+};
+
+/// File changes emitted during a provider turn.
+pub const StreamDiffUpdate = struct {
+    files: []const StreamDiffFile,
+    scope: StreamDiffScope = .incremental,
+};
+
 pub const ToolCallKind = enum(u8) {
     read,
     edit,
@@ -212,9 +224,7 @@ pub const StreamEvent = union(enum) {
         body: []const u8,
     },
     tool_call: ToolCallUpdate,
-    diff: struct {
-        files: []const StreamDiffFile,
-    },
+    diff: StreamDiffUpdate,
 };
 
 pub const SendPromptRequest = struct {

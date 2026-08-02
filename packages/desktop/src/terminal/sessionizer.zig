@@ -2131,18 +2131,24 @@ fn chatSinkEvent(context: ?*anyopaque, event: harness.StreamEvent) void {
             turn.appendEvent(allocator, "tool_call", payload);
         },
         .diff => |diff| {
-            const payload = chatDiffPayloadAlloc(allocator, diff.files) catch return;
+            const payload = chatDiffPayloadAlloc(allocator, diff.files, diff.scope) catch return;
             defer allocator.free(payload);
             turn.appendEvent(allocator, "diff", payload);
         },
     }
 }
 
-fn chatDiffPayloadAlloc(allocator: std.mem.Allocator, files: []const harness.StreamDiffFile) ![]u8 {
+fn chatDiffPayloadAlloc(
+    allocator: std.mem.Allocator,
+    files: []const harness.StreamDiffFile,
+    scope: harness.StreamDiffScope,
+) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     defer writer.deinit();
     var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
     try s.beginObject();
+    try s.objectField("scope");
+    try s.write(@tagName(scope));
     try s.objectField("files");
     try s.beginArray();
     for (files) |file| {
@@ -2837,11 +2843,12 @@ test "daemon chat diff payload preserves files and patches" {
         .additions = 2,
         .deletions = 1,
         .patch = "@@ -1 +1,2 @@\n-old\n+new\n+again\n",
-    }});
+    }}, .turn_snapshot);
     defer std.testing.allocator.free(payload);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
     defer parsed.deinit();
+    try std.testing.expectEqualStrings("turn_snapshot", parsed.value.object.get("scope").?.string);
     const files = parsed.value.object.get("files").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), files.len);
     try std.testing.expectEqualStrings("src/main.zig", files[0].object.get("path").?.string);
