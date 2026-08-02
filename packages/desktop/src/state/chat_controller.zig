@@ -57,6 +57,7 @@ const slashCommandFallbackName = command_controller.slashCommandFallbackName;
 const pendingTimelineEventsContainAssistant = utils.pendingTimelineEventsContainAssistant;
 const BACKGROUND_TASK_POLL_MS: i64 = 1000;
 const CODEX_BACKGROUND_TASK_POLL_MS: i64 = 2000;
+const CODEX_BACKGROUND_TASK_POLL_MAX_MS: i64 = 60_000;
 const OPENCODE_LOGO_BYTES = @embedFile("../assets/opencode-logo-dark.png");
 const CODEX_LOGO_BYTES = @embedFile("../assets/OpenAI-white-monoblossom.png");
 const CLAUDE_LOGO_BYTES = @embedFile("../assets/claude-logo.png");
@@ -1745,7 +1746,8 @@ fn startCodexBackgroundPollForThread(
     for (thread.background_tasks.items) |*task| {
         if (task.status != .running or task.provider != .codex) continue;
         if (task.provider_thread_id == null or task.process_id == null) continue;
-        if (task.last_poll_ms != 0 and now_ms - task.last_poll_ms < CODEX_BACKGROUND_TASK_POLL_MS) continue;
+        const poll_interval_ms = codexBackgroundTaskPollIntervalMs(task.poll_failure_count);
+        if (task.last_poll_ms != 0 and now_ms - task.last_poll_ms < poll_interval_ms) continue;
         const target = self.providerExecutionTargetForProjectThread(project_index, thread, 0) orelse return false;
         task.last_poll_ms = now_ms;
 
@@ -1820,8 +1822,56 @@ fn finishCodexBackgroundPoll(self: anytype) bool {
     poll.mutex.unlock(io);
     worker.join();
     defer request.deinit();
-    if (running == null or running.?) return false;
+    const task = codexBackgroundTaskForPollRequest(self, request);
+    if (running == null) {
+        if (task) |entry| {
+            entry.poll_failure_count = std.math.add(u8, entry.poll_failure_count, 1) catch std.math.maxInt(u8);
+        }
+        return false;
+    }
+    if (task) |entry| entry.poll_failure_count = 0;
+    if (running.?) return false;
     return completeCodexBackgroundTask(self, request);
+}
+
+fn codexBackgroundTaskPollIntervalMs(failure_count: u8) i64 {
+    return switch (@min(failure_count, 5)) {
+        0 => CODEX_BACKGROUND_TASK_POLL_MS,
+        1 => 4_000,
+        2 => 8_000,
+        3 => 16_000,
+        4 => 32_000,
+        else => CODEX_BACKGROUND_TASK_POLL_MAX_MS,
+    };
+}
+
+test "Codex background polling backs off after repeated provider failures" {
+    try std.testing.expectEqual(@as(i64, 2_000), codexBackgroundTaskPollIntervalMs(0));
+    try std.testing.expectEqual(@as(i64, 8_000), codexBackgroundTaskPollIntervalMs(2));
+    try std.testing.expectEqual(@as(i64, 60_000), codexBackgroundTaskPollIntervalMs(5));
+    try std.testing.expectEqual(@as(i64, 60_000), codexBackgroundTaskPollIntervalMs(std.math.maxInt(u8)));
+}
+
+fn codexBackgroundTaskForPollRequest(self: anytype, request: *const CodexBackgroundPollRequest) ?*BackgroundTask {
+    for (self.project_controller.projects.items) |*project| {
+        for (project.threads.items) |*thread| {
+            if (codexBackgroundTaskForPollRequestInThread(thread, request)) |task| return task;
+        }
+        for (project.archived_threads.items) |*thread| {
+            if (codexBackgroundTaskForPollRequestInThread(thread, request)) |task| return task;
+        }
+    }
+    return null;
+}
+
+fn codexBackgroundTaskForPollRequestInThread(thread: *ChatThread, request: *const CodexBackgroundPollRequest) ?*BackgroundTask {
+    if (!std.mem.eql(u8, thread.local_thread_id, request.local_thread_id)) return null;
+    for (thread.background_tasks.items) |*task| {
+        if (task.provider_thread_id == null or task.process_id == null) continue;
+        if (std.mem.eql(u8, task.provider_thread_id.?, request.provider_thread_id) and
+            std.mem.eql(u8, task.process_id.?, request.process_id)) return task;
+    }
+    return null;
 }
 
 fn completeCodexBackgroundTask(self: anytype, request: *const CodexBackgroundPollRequest) bool {
