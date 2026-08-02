@@ -4387,6 +4387,8 @@ fn renderToolCallGroup(
     const failed = failed_count > 0;
     const running_count = toolCallGroupRunningCount(entries, start, end, fallback_running);
     const running = running_count > 0;
+    const count = end - start;
+    const completed_count = count -| failed_count -| running_count;
     const default_expanded = toolCallGroupDefaultExpanded(state, failed);
     const key = toolCallGroupKey(base_message_index + start);
     const expanded = state.isCardExpandedDefault(key, default_expanded);
@@ -4395,7 +4397,9 @@ fn renderToolCallGroup(
         state,
         bubble,
         paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 235)),
-        paletteColor(if (failed) theme.COLOR_DIFF_REMOVE else if (running) theme.COLOR_GREEN else theme.borderMuted()),
+        // A failed child is identified by the status dot and its own row; the
+        // group shell stays neutral so one failure does not tint every call.
+        paletteColor(if (running and !failed) theme.COLOR_GREEN else theme.borderMuted()),
         transcriptBubbleCornerRadius(),
         clip,
     );
@@ -4403,18 +4407,30 @@ fn renderToolCallGroup(
     const header_h = theme.scaledUi(48.0);
     const pad_x = theme.scaledUi(14.0);
     const status_dia = theme.scaledUi(9.0);
-    const status_color = if (failed) theme.COLOR_DIFF_REMOVE else if (running) theme.COLOR_GREEN else theme.COLOR_TEXT_MUTED;
-    queueRoundedClipped(state, .{
+    const status_rect: palette.Rect = .{
         .x = bubble.x + pad_x,
         .y = bubble.y + (header_h - status_dia) * 0.5,
         .w = status_dia,
         .h = status_dia,
-    }, paletteColor(status_color), status_dia * 0.5, clip);
+    };
+    const normal_status_color = if (running) theme.COLOR_GREEN else theme.COLOR_TEXT_MUTED;
+    const mixed_result = failed and completed_count > 0;
+    const status_color = if (failed and !mixed_result) theme.COLOR_DIFF_REMOVE else normal_status_color;
+    queueRoundedClipped(state, status_rect, paletteColor(status_color), status_dia * 0.5, clip);
+    if (mixed_result) {
+        const failed_half: palette.Rect = .{
+            .x = status_rect.x + status_rect.w * 0.5,
+            .y = status_rect.y,
+            .w = status_rect.w * 0.5,
+            .h = status_rect.h,
+        };
+        if (intersectClipRect(clip, failed_half)) |failed_clip| {
+            queueRoundedClipped(state, status_rect, paletteColor(theme.COLOR_DIFF_REMOVE), status_dia * 0.5, failed_clip);
+        }
+    }
 
     var summary_buf: [128]u8 = undefined;
-    const count = end - start;
     const noun = if (count == 1) "tool call" else "tool calls";
-    const completed_count = count -| failed_count -| running_count;
     const summary = if (running) blk: {
         if (started_at_ms == null) {
             if (failed_count > 0) {
