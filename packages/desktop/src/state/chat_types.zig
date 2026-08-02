@@ -47,6 +47,13 @@ pub const TranscriptHeightEntry = struct {
     height: f32 = 0.0,
 };
 
+pub const TranscriptLayoutItem = struct {
+    message_index: usize,
+    group_end: usize,
+    top: f32,
+    height: f32,
+};
+
 pub const ChatMessage = struct {
     role: ChatRole,
     author: [:0]const u8,
@@ -104,6 +111,7 @@ pub const BackgroundTask = struct {
     started_at_ms: i64 = 0,
     updated_at_ms: i64 = 0,
     last_poll_ms: i64 = 0,
+    poll_failure_count: u8 = 0,
 
     pub fn deinit(self: BackgroundTask, allocator: std.mem.Allocator) void {
         allocator.free(self.command);
@@ -141,6 +149,13 @@ pub const ChatThread = struct {
     title_generation_state: *TitleGenerationState,
     transcript_markdown_entries: std.ArrayList(?*TranscriptMarkdownBody),
     transcript_height_entries: std.ArrayList(TranscriptHeightEntry),
+    transcript_layout_items: std.ArrayList(TranscriptLayoutItem),
+    transcript_layout_width: f32 = 0.0,
+    transcript_layout_scale: f32 = 0.0,
+    transcript_layout_variant_hash: u64 = 0,
+    transcript_layout_message_count: usize = 0,
+    transcript_layout_committed_height: f32 = 0.0,
+    transcript_layout_valid: bool = false,
     transcript_scroll_valid: bool = false,
     transcript_scroll_y: f32 = 0.0,
     draft_image: ?ChatImageAttachment = null,
@@ -177,6 +192,7 @@ pub const ChatThread = struct {
             .title_generation_state = title_generation_state,
             .transcript_markdown_entries = .empty,
             .transcript_height_entries = .empty,
+            .transcript_layout_items = .empty,
             .transcript_scroll_valid = false,
             .transcript_scroll_y = 0.0,
             .draft_image = null,
@@ -558,6 +574,7 @@ pub const ChatThread = struct {
         self.clearTranscriptMarkdownEntries(allocator);
         self.transcript_markdown_entries.deinit(allocator);
         self.transcript_height_entries.deinit(allocator);
+        self.transcript_layout_items.deinit(allocator);
         allocator.free(self.title);
         allocator.free(self.local_thread_id);
         if (self.provider_thread_id) |thread_id| allocator.free(thread_id);

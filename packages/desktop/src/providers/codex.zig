@@ -647,6 +647,7 @@ pub const Client = struct {
     /// Terminates one retained terminal without interrupting its owning turn.
     pub fn terminateBackgroundTerminal(self: *Client, thread_id: []const u8, process_id: []const u8) !void {
         try self.ensureConnected();
+        try self.ensureThreadLoaded(thread_id, RPC_WAIT);
         const payload = try self.callRpcForResultAlloc("thread/backgroundTerminals/terminate", .{
             .threadId = thread_id,
             .processId = process_id,
@@ -661,6 +662,9 @@ pub const Client = struct {
     /// Reports whether one retained terminal is still present in the provider.
     pub fn backgroundTerminalIsRunning(self: *Client, thread_id: []const u8, process_id: []const u8) !bool {
         try self.ensureConnected();
+        // Polling uses a fresh app-server connection. Thread-scoped RPCs are
+        // rejected until that connection resumes the persisted thread.
+        try self.ensureThreadLoaded(thread_id, RPC_WAIT);
         const payload = try self.callRpcForResultAlloc("thread/backgroundTerminals/list", .{ .threadId = thread_id });
         defer self.allocator.free(payload);
         return backgroundTerminalListContainsProcess(self.allocator, payload, process_id);
