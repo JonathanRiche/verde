@@ -1554,6 +1554,29 @@ fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, ar
     const body = args.optionValue(argv, "--body");
     const status = args.optionValue(argv, "--status");
     const label = args.optionValue(argv, "--label");
+    const persisted_status = if (status) |value| std.meta.stringToEnum(db_types.SurfaceStatus, value) else null;
+    var persistence_error: ?anyerror = null;
+    if (clear or persisted_status != null) {
+        const changed_at_ms = unixTimestampMs();
+        const status_value: db_types.SurfaceStatus = persisted_status orelse .idle;
+        persistSurfaceState(allocator, .{
+            .session_id = session_id,
+            .workspace_id = workspace_id orelse "",
+            .workspace_path = workspace_path orelse "",
+            .dock_id = dock_id orelse 0,
+            .pane_id = pane_id,
+            .provider = if (provider) |value| std.meta.stringToEnum(db_types.SurfaceProvider, value) else null,
+            .provider_thread_id = getenvSlice("VERDE_PROVIDER_THREAD_ID"),
+            .title = label orelse title orelse "",
+            .status = status_value,
+            .status_changed_at_ms = changed_at_ms,
+            .completed_at_ms = if (status_value == .done) changed_at_ms else 0,
+            .last_event_title = title orelse label,
+            .last_event_body = body,
+        }, clear or status_value == .idle) catch |err| {
+            persistence_error = err;
+        };
+    }
     const response = sendLiveRequestAlloc(allocator, io, method, .{
         .session_id = session_id,
         .workspace_id = workspace_id,
@@ -1568,25 +1591,13 @@ fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, ar
         .label = label,
         .attention = if (args.hasFlag(argv, "--attention")) true else null,
     }, 1) catch |err| {
-        if (clear or (status != null and std.mem.eql(u8, status.?, "done"))) {
-            persistOfflineSurfaceCompletion(allocator, .{
-                .session_id = session_id,
-                .workspace_id = workspace_id orelse "",
-                .workspace_path = workspace_path orelse "",
-                .dock_id = dock_id orelse 0,
-                .pane_id = pane_id,
-                .provider = if (provider) |value| std.meta.stringToEnum(db_types.SurfaceProvider, value) else null,
-                .provider_thread_id = getenvSlice("VERDE_PROVIDER_THREAD_ID"),
-                .title = label orelse title orelse "",
-                .completed_at_ms = unixTimestampMs(),
-                .last_event_title = title orelse label,
-                .last_event_body = body,
-            }, clear) catch |persist_err| {
+        if (clear or persisted_status != null) {
+            if (persistence_error) |persist_err| {
                 if (!args.hasFlag(argv, "--quiet")) {
-                    try out.stderr("verde notify: app unavailable ({s}); failed to persist completion ({s})\n", .{ @errorName(err), @errorName(persist_err) });
+                    try out.stderr("verde notify: app unavailable ({s}); failed to persist surface state ({s})\n", .{ @errorName(err), @errorName(persist_err) });
                 }
                 return;
-            };
+            }
             if (args.hasFlag(argv, "--json")) {
                 try out.jsonValue(allocator, .{
                     .ok = true,
@@ -1596,9 +1607,9 @@ fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, ar
                 });
             } else if (!args.hasFlag(argv, "--quiet")) {
                 if (clear) {
-                    try out.stdout("Completion cleared.\n", .{});
+                    try out.stdout("Surface state cleared.\n", .{});
                 } else {
-                    try out.stdout("Completion saved for Verde.\n", .{});
+                    try out.stdout("Surface state saved for Verde.\n", .{});
                 }
             }
             return;
@@ -1607,6 +1618,11 @@ fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, ar
         return;
     };
     defer allocator.free(response);
+    if (persistence_error) |err| {
+        if (!args.hasFlag(argv, "--quiet")) {
+            try out.stderr("verde notify: live update delivered; failed to persist surface state ({s})\n", .{@errorName(err)});
+        }
+    }
     if (args.hasFlag(argv, "--json")) {
         try out.stdout("{s}\n", .{response});
     } else if (!args.hasFlag(argv, "--quiet")) {
@@ -1614,9 +1630,9 @@ fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, ar
     }
 }
 
-fn persistOfflineSurfaceCompletion(
+fn persistSurfaceState(
     allocator: std.mem.Allocator,
-    record: db_types.PersistedSurfaceCompletion,
+    record: db_types.PersistedSurfaceState,
     clear: bool,
 ) !void {
     const pref_path = try prefPath(allocator);
@@ -1624,9 +1640,9 @@ fn persistOfflineSurfaceCompletion(
     var client = try db_client.Client.init(allocator, pref_path);
     defer client.deinit();
     if (clear) {
-        _ = try client.clearSurfaceCompletion(record.session_id);
+        _ = try client.clearSurfaceState(record.session_id);
     } else {
-        try client.upsertSurfaceCompletion(record);
+        try client.upsertSurfaceState(record);
     }
 }
 

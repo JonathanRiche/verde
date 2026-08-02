@@ -8,7 +8,7 @@ const terminal = @import("../terminal/terminal.zig");
 const theme = @import("../ui/theme.zig");
 
 const SurfaceProvider = db_types.SurfaceProvider;
-const PersistedSurfaceCompletion = db_types.PersistedSurfaceCompletion;
+const PersistedSurfaceState = db_types.PersistedSurfaceState;
 const log = std.log.scoped(.native_shell);
 
 pub const OPENCODE_LOGO_BYTES = @embedFile("../assets/opencode-logo-dark.png");
@@ -20,13 +20,7 @@ fn unixTimestampMs() i64 {
     return platform_runtime.unixTimestampMs();
 }
 
-pub const SurfaceStatus = enum {
-    idle,
-    working,
-    waiting,
-    done,
-    @"error",
-};
+pub const SurfaceStatus = db_types.SurfaceStatus;
 
 pub const SurfaceUpdate = struct {
     session_id: []const u8,
@@ -151,9 +145,7 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
         }
     }
     if (update.clear) {
-        if (s.completion_pending or s.status == .done) {
-            _ = try self.storage.client.clearSurfaceCompletion(s.session_id);
-        }
+        _ = try self.storage.client.clearSurfaceState(s.session_id);
         if (s.status != .idle) s.status_changed_at_ms = unixTimestampMs();
         s.status = .idle;
         s.completion_pending = false;
@@ -173,6 +165,12 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
                 s.completion_pending = true;
                 s.completed_at_ms = now_ms;
                 completion_became_pending = true;
+            } else if (value != .done) {
+                // A new active/idle state supersedes any older completion.
+                // Otherwise displayStatus() would keep showing Done while the
+                // reattached TUI is already working again.
+                s.completion_pending = false;
+                s.completed_at_ms = 0;
             }
         }
         if (update.progress) |value| s.progress = theme.clampf(value, 0.0, 1.0);
@@ -186,8 +184,12 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
             try replaceOwnedOptionalSlice(self.allocator, &s.last_event_body, value);
             s.last_event_at_ms = unixTimestampMs();
         }
-        if (s.completion_pending) {
-            try self.storage.client.upsertSurfaceCompletion(persistedSurfaceCompletion(s));
+        if (s.status == .idle) {
+            if (update.status != null) _ = try self.storage.client.clearSurfaceState(s.session_id);
+        } else {
+            // Every non-idle hook state is durable. This is also the offline
+            // handoff point used to restore a daemon-owned TUI after restart.
+            try self.storage.client.upsertSurfaceState(persistedSurfaceState(s));
         }
     }
     // Notify on the completion edge. Runs on the main thread (live commands
@@ -199,7 +201,7 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
     return s;
 }
 
-fn persistedSurfaceCompletion(surface: *const SurfaceState) PersistedSurfaceCompletion {
+fn persistedSurfaceState(surface: *const SurfaceState) PersistedSurfaceState {
     return .{
         .session_id = surface.session_id,
         .workspace_id = surface.workspace_id,
@@ -209,6 +211,8 @@ fn persistedSurfaceCompletion(surface: *const SurfaceState) PersistedSurfaceComp
         .provider = surface.provider,
         .provider_thread_id = surface.provider_thread_id,
         .title = surface.title,
+        .status = surface.status,
+        .status_changed_at_ms = surface.status_changed_at_ms,
         .completed_at_ms = surface.completed_at_ms,
         .last_event_title = surface.last_event_title,
         .last_event_body = surface.last_event_body,
@@ -216,9 +220,8 @@ fn persistedSurfaceCompletion(surface: *const SurfaceState) PersistedSurfaceComp
 }
 
 // Resolves the terminal dock that owns a surface (by workspace + dock id),
-// so notify-provided metadata can be pinned onto its tab. Live surface
-// state is in memory; the unacknowledged completion edge and pinned tab
-// metadata persist independently across restarts.
+// so notify-provided metadata can be pinned onto its tab. Pinned tab metadata
+// and the latest non-idle surface state persist independently across restarts.
 fn terminalDockForSurface(self: anytype, surface: *const SurfaceState) ?*terminal.Dock {
     for (self.project_controller.projects.items, 0..) |*project, idx| {
         const owns = std.mem.eql(u8, surface.workspace_id, project.id) or
@@ -318,8 +321,8 @@ fn clearSurfaceAttentionAtIndex(self: anytype, surface_index: usize) bool {
     const done_ack = surface.completion_pending or surface.status == .done;
     if (!surface.attention and surface.unread_count == 0 and !done_ack) return terminal_changed;
     if (done_ack) {
-        _ = self.storage.client.clearSurfaceCompletion(surface.session_id) catch |err| {
-            log.err("failed to persist surface completion acknowledgement: {s}", .{@errorName(err)});
+        _ = self.storage.client.clearSurfaceState(surface.session_id) catch |err| {
+            log.err("failed to persist surface acknowledgement: {s}", .{@errorName(err)});
             return terminal_changed;
         };
     }

@@ -11,7 +11,7 @@ const project_state = @import("project.zig");
 const log = std.log.scoped(.native_shell);
 const LoadedPersistedState = db_types.LoadedState;
 const PersistedState = db_types.PersistedState;
-const PersistedSurfaceCompletion = db_types.PersistedSurfaceCompletion;
+const PersistedSurfaceState = db_types.PersistedSurfaceState;
 const PersistedChatCompletion = db_types.PersistedChatCompletion;
 const PersistedImageAttachment = db_types.PersistedImageAttachment;
 const PersistedMessage = db_types.PersistedMessage;
@@ -268,7 +268,7 @@ pub fn saveWorker(pref_path: []u8, loaded_state: LoadedPersistedState) void {
 pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
     self.sidebar_collapsed = persisted.sidebar_collapsed;
     if (persisted.projects.len == 0) {
-        try self.restorePersistedSurfaceCompletions(persisted.surface_completions);
+        try self.restorePersistedSurfaceStates(persisted.surface_states);
         self.project_controller.selected_index = 0;
         self.project_controller.next_project_number = 1;
         self.syncRenameBuffer();
@@ -450,63 +450,56 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
         self.project_controller.selected_index = @min(persisted.selected_project_index, self.project_controller.projects.items.len - 1);
     }
     self.project_controller.next_project_number = self.project_controller.projects.items.len + self.project_controller.archived_projects.items.len + 1;
-    try self.restorePersistedSurfaceCompletions(persisted.surface_completions);
+    try self.restorePersistedSurfaceStates(persisted.surface_states);
     self.restorePersistedChatCompletions(persisted.chat_completions);
     self.syncRenameBuffer();
     self.requestTranscriptScrollToBottom();
     self.lifecycle.dirty = false;
 }
 
-pub fn restorePersistedSurfaceCompletions(self: anytype, completions: []const PersistedSurfaceCompletion) !void {
-    // Reload mirrors the durable ledger exactly without discarding live
-    // working/waiting state that may already have arrived this process.
-    for (self.surface_controller.surfaces.items) |*surface| {
-        if (!surface.completion_pending) continue;
-        surface.completion_pending = false;
-        surface.completed_at_ms = 0;
-        if (surface.status == .done) surface.status = .idle;
-    }
-
-    for (completions) |completion| {
-        const surface = self.surfaceBySessionId(completion.session_id);
+pub fn restorePersistedSurfaceStates(self: anytype, persisted_surfaces: []const PersistedSurfaceState) !void {
+    // Hook events can arrive while the async app-state load is still in
+    // flight. Only let the durable snapshot replace an in-memory state when
+    // it is at least as recent as the live event.
+    for (persisted_surfaces) |persisted| {
+        const surface = self.surfaceBySessionId(persisted.session_id);
         if (surface == null) {
             try self.surface_controller.surfaces.append(self.allocator, .{
-                .session_id = try self.allocator.dupe(u8, completion.session_id),
-                .workspace_id = try self.allocator.dupe(u8, completion.workspace_id),
-                .workspace_path = try self.allocator.dupe(u8, completion.workspace_path),
-                .dock_id = completion.dock_id,
-                .pane_id = completion.pane_id,
-                .provider = completion.provider,
-                .provider_thread_id = if (completion.provider_thread_id) |value| try self.allocator.dupe(u8, value) else null,
-                .title = try self.allocator.dupe(u8, completion.title),
-                .status = .done,
-                .status_changed_at_ms = completion.completed_at_ms,
-                .completion_pending = true,
-                .completed_at_ms = completion.completed_at_ms,
-                .last_event_title = if (completion.last_event_title) |value| try self.allocator.dupe(u8, value) else null,
-                .last_event_body = if (completion.last_event_body) |value| try self.allocator.dupe(u8, value) else null,
-                .last_event_at_ms = completion.completed_at_ms,
+                .session_id = try self.allocator.dupe(u8, persisted.session_id),
+                .workspace_id = try self.allocator.dupe(u8, persisted.workspace_id),
+                .workspace_path = try self.allocator.dupe(u8, persisted.workspace_path),
+                .dock_id = persisted.dock_id,
+                .pane_id = persisted.pane_id,
+                .provider = persisted.provider,
+                .provider_thread_id = if (persisted.provider_thread_id) |value| try self.allocator.dupe(u8, value) else null,
+                .title = try self.allocator.dupe(u8, persisted.title),
+                .status = persisted.status,
+                .status_changed_at_ms = persisted.status_changed_at_ms,
+                .completion_pending = persisted.status == .done,
+                .completed_at_ms = if (persisted.status == .done) persisted.completed_at_ms else 0,
+                .last_event_title = if (persisted.last_event_title) |value| try self.allocator.dupe(u8, value) else null,
+                .last_event_body = if (persisted.last_event_body) |value| try self.allocator.dupe(u8, value) else null,
+                .last_event_at_ms = persisted.status_changed_at_ms,
             });
             continue;
         }
 
         var restored = surface.?;
-        try replaceOwnedSlice(self.allocator, &restored.workspace_id, completion.workspace_id);
-        try replaceOwnedSlice(self.allocator, &restored.workspace_path, completion.workspace_path);
-        restored.dock_id = completion.dock_id;
-        restored.pane_id = completion.pane_id;
-        restored.provider = completion.provider;
-        try replaceOwnedOptionalSlice(self.allocator, &restored.provider_thread_id, completion.provider_thread_id);
-        try replaceOwnedSlice(self.allocator, &restored.title, completion.title);
-        try replaceOwnedOptionalSlice(self.allocator, &restored.last_event_title, completion.last_event_title);
-        try replaceOwnedOptionalSlice(self.allocator, &restored.last_event_body, completion.last_event_body);
-        if (restored.status == .idle) {
-            restored.status = .done;
-            restored.status_changed_at_ms = completion.completed_at_ms;
-        }
-        restored.completion_pending = true;
-        restored.completed_at_ms = completion.completed_at_ms;
-        restored.last_event_at_ms = completion.completed_at_ms;
+        if (restored.status_changed_at_ms > persisted.status_changed_at_ms) continue;
+        try replaceOwnedSlice(self.allocator, &restored.workspace_id, persisted.workspace_id);
+        try replaceOwnedSlice(self.allocator, &restored.workspace_path, persisted.workspace_path);
+        restored.dock_id = persisted.dock_id;
+        restored.pane_id = persisted.pane_id;
+        restored.provider = persisted.provider;
+        try replaceOwnedOptionalSlice(self.allocator, &restored.provider_thread_id, persisted.provider_thread_id);
+        try replaceOwnedSlice(self.allocator, &restored.title, persisted.title);
+        try replaceOwnedOptionalSlice(self.allocator, &restored.last_event_title, persisted.last_event_title);
+        try replaceOwnedOptionalSlice(self.allocator, &restored.last_event_body, persisted.last_event_body);
+        restored.status = persisted.status;
+        restored.status_changed_at_ms = persisted.status_changed_at_ms;
+        restored.completion_pending = persisted.status == .done;
+        restored.completed_at_ms = if (persisted.status == .done) persisted.completed_at_ms else 0;
+        restored.last_event_at_ms = persisted.status_changed_at_ms;
     }
 }
 

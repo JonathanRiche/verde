@@ -85,6 +85,8 @@ pub const INIT_SQL: [:0]const u8 =
     \\    provider integer,
     \\    provider_thread_id text,
     \\    title text not null default '',
+    \\    status integer not null default 3,
+    \\    status_changed_at_ms integer not null default 0,
     \\    completed_at_ms integer not null,
     \\    last_event_title text,
     \\    last_event_body text
@@ -125,6 +127,10 @@ pub fn initialize(conn: zqlite.Conn) !void {
     try ensureColumn(conn, "messages", "tool_call_id", "alter table messages add column tool_call_id text");
     try ensureColumn(conn, "messages", "tool_call_kind", "alter table messages add column tool_call_kind integer");
     try ensureColumn(conn, "messages", "tool_call_status", "alter table messages add column tool_call_status integer");
+    // Keep the legacy table name so existing unacknowledged completions migrate
+    // in place; it now stores the latest non-idle terminal surface state.
+    try ensureColumn(conn, "surface_completions", "status", "alter table surface_completions add column status integer not null default 3");
+    try ensureColumn(conn, "surface_completions", "status_changed_at_ms", "alter table surface_completions add column status_changed_at_ms integer not null default 0");
 }
 
 fn ensureColumn(conn: zqlite.Conn, table_name: []const u8, column_name: []const u8, alter_sql: [*:0]const u8) !void {
