@@ -1842,8 +1842,13 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (sidebar_ui.handlePaletteWheel(event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
                 return true;
             }
-            // Terminal panes route wheel input by the event coordinates, so let
-            // them claim scroll before chat/composer hit caches can consume it.
+            // The browser owns an explicit pane rectangle, while terminal,
+            // transcript, and composer hit caches may retain overlapping data
+            // from an earlier layout. Let the visible browser claim its region
+            // before those pane-local caches consume the wheel event.
+            if (state.handleBrowserMouse(browserMouseWheelEvent(&event.wheel))) {
+                return true;
+            }
             if (terminal_panel_ui.handlePaletteWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
                 return true;
             }
@@ -1854,9 +1859,6 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (state.handleComposerWheel(&event.wheel)) {
-                return true;
-            }
-            if (state.handleBrowserMouse(browserMouseWheelEvent(&event.wheel))) {
                 return true;
             }
             if (chat_panel_ui.handleFocusedTranscriptPaletteWheel(state, event.wheel.y)) {
