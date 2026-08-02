@@ -1695,10 +1695,10 @@ fn isGenericMcpToolTitle(title: []const u8) bool {
 }
 
 fn toolCallDisplayAuthor(tool_call: ai_harness.ToolCallUpdate) []const u8 {
-    const title = std.mem.trim(u8, tool_call.title, &std.ascii.whitespace);
-    if ((tool_call.kind orelse .other) == .mcp and title.len > 0 and !isGenericMcpToolTitle(title)) {
-        return title;
-    }
+    // MCP method names belong in the card body. Keeping the stable author
+    // makes every provider use the structured command-card renderer instead
+    // of treating provider-specific method names as ordinary system bubbles.
+    if ((tool_call.kind orelse .other) == .mcp) return "MCP tool";
     return toolCallDefaultTitle(tool_call);
 }
 
@@ -1727,8 +1727,14 @@ fn toolCallBodyAlloc(allocator: std.mem.Allocator, tool_call: ai_harness.ToolCal
         const value = field.value orelse continue;
         const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
         if (trimmed.len == 0) continue;
+        const pretty_json = if ((tool_call.kind orelse .other) == .mcp)
+            try prettyJsonContainerAlloc(allocator, trimmed)
+        else
+            null;
+        defer if (pretty_json) |owned| allocator.free(owned);
+        const display_value = pretty_json orelse trimmed;
         if (wrote) try writer.writer.writeAll("\n\n");
-        try writer.writer.print("{s}:\n{s}", .{ field.label, trimmed });
+        try writer.writer.print("{s}:\n{s}", .{ field.label, display_value });
         wrote = true;
     }
     if (!wrote) {
@@ -1743,6 +1749,23 @@ fn toolCallBodyAlloc(allocator: std.mem.Allocator, tool_call: ai_harness.ToolCal
         }
         try writer.writer.print("Raw event:\n{s}", .{trimmed});
     }
+    return try writer.toOwnedSlice();
+}
+
+fn prettyJsonContainerAlloc(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+    if (text.len < 2 or (text[0] != '{' and text[0] != '[')) return null;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object and parsed.value != .array) return null;
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var stringify: std.json.Stringify = .{
+        .writer = &writer.writer,
+        .options = .{ .whitespace = .indent_2 },
+    };
+    try stringify.write(parsed.value);
     return try writer.toOwnedSlice();
 }
 
@@ -2294,7 +2317,7 @@ test "structured tool-call updates upsert and merge lifecycle content" {
     try std.testing.expect(std.mem.indexOf(u8, event.body, "Updated 3 lines") != null);
 }
 
-test "tagged MCP completion promotes the specific tool name" {
+test "tagged MCP completion keeps the method inside a structured MCP card" {
     var events: std.ArrayListUnmanaged(chat_types.PendingTimelineEvent) = .empty;
     defer freePendingTimelineEvents(std.testing.allocator, &events);
 
@@ -2313,8 +2336,48 @@ test "tagged MCP completion promotes the specific tool name" {
     });
 
     try std.testing.expectEqual(@as(usize, 1), events.items.len);
-    try std.testing.expectEqualStrings("MCP: navigate_browser", events.items[0].author);
-    try std.testing.expectEqualStrings("Output:\n{\"success\":true}", events.items[0].body);
+    try std.testing.expectEqualStrings("MCP tool", events.items[0].author);
+    try std.testing.expectEqualStrings(
+        "Tool:\nMCP: navigate_browser\n\nOutput:\n{\n  \"success\": true\n}",
+        events.items[0].body,
+    );
+}
+
+test "provider MCP method titles cannot bypass the structured card renderer" {
+    var events: std.ArrayListUnmanaged(chat_types.PendingTimelineEvent) = .empty;
+    defer freePendingTimelineEvents(std.testing.allocator, &events);
+
+    try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
+        .call_id = "toolu-1",
+        .title = "verde.list_panes",
+        .kind = .mcp,
+        .status = .completed,
+        .input = "{}",
+        .output = "{\"ok\":true}",
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqualStrings("MCP tool", events.items[0].author);
+    try std.testing.expectEqualStrings(
+        "Tool:\nverde.list_panes\n\nInput:\n{}\n\nOutput:\n{\n  \"ok\": true\n}",
+        events.items[0].body,
+    );
+}
+
+test "MCP card JSON formatting preserves arrays and invalid text" {
+    const pretty = (try prettyJsonContainerAlloc(
+        std.testing.allocator,
+        "[{\"name\":\"verde\",\"active\":true}]",
+    )).?;
+    defer std.testing.allocator.free(pretty);
+    try std.testing.expectEqualStrings(
+        "[\n  {\n    \"name\": \"verde\",\n    \"active\": true\n  }\n]",
+        pretty,
+    );
+    try std.testing.expect((try prettyJsonContainerAlloc(
+        std.testing.allocator,
+        "{not json}",
+    )) == null);
 }
 
 test "lingering running tool calls are cancelled at turn end" {
