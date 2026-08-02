@@ -628,6 +628,9 @@ pub const SendState = struct {
     thinking: bool = false,
     pending_events: std.ArrayListUnmanaged(PendingTimelineEvent) = .empty,
     pending_diff_files: std.ArrayListUnmanaged(PendingDiffFile) = .empty,
+    /// Once present, a cumulative turn snapshot owns the changed-files card;
+    /// later per-edit lifecycle deltas must not replace it.
+    pending_diff_has_turn_snapshot: bool = false,
     pending_approval: ?PendingApproval = null,
     ui_revision: u64 = 0,
     polled_ui_revision: u64 = 0,

@@ -1144,6 +1144,7 @@ pub fn beginSendForThreadWithReadyDaemon(
     send_state.partial_text.clearRetainingCapacity();
     freePendingTimelineEventsLocked(page_alloc, &send_state.pending_events);
     freePendingDiffFilesLocked(page_alloc, &send_state.pending_diff_files);
+    send_state.pending_diff_has_turn_snapshot = false;
     freePendingApprovalLocked(page_alloc, &send_state.pending_approval);
     send_state.ui_revision = 1;
     send_state.polled_ui_revision = 0;
@@ -2132,12 +2133,15 @@ pub fn applyDaemonDiffEventLocked(send_state: *SendState, payload_json: []const 
     if (files.items.len == 0) return;
 
     flushPendingAssistantTextLocked(send_state, allocator);
-    utils.mergePendingDiffFilesLocked(allocator, &send_state.pending_diff_files, files.items);
-    utils.upsertPendingDiffSummaryEventLocked(
-        allocator,
-        &send_state.pending_events,
-        send_state.pending_diff_files.items,
-    );
+    const scope_text = jsonValueString(parsed.value.object.get("scope") orelse .null) orelse "incremental";
+    const scope: ai_harness.StreamDiffScope = if (std.mem.eql(u8, scope_text, "turn_snapshot"))
+        .turn_snapshot
+    else
+        .incremental;
+    utils.applyPendingDiffUpdateLocked(allocator, send_state, .{
+        .files = files.items,
+        .scope = scope,
+    });
 }
 
 pub fn parseToolCallKind(value: []const u8) ai_harness.ToolCallKind {
@@ -2222,6 +2226,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             send_state.pending_events = .empty;
             completed_diff_files = send_state.pending_diff_files;
             send_state.pending_diff_files = .empty;
+            send_state.pending_diff_has_turn_snapshot = false;
             freePendingApprovalLocked(std.heap.page_allocator, &send_state.pending_approval);
             send_state.approval_decision = null;
             send_state.provider = null;
@@ -2250,6 +2255,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             send_state.pending_events = .empty;
             completed_diff_files = send_state.pending_diff_files;
             send_state.pending_diff_files = .empty;
+            send_state.pending_diff_has_turn_snapshot = false;
             freePendingApprovalLocked(std.heap.page_allocator, &send_state.pending_approval);
             send_state.approval_decision = null;
             send_state.provider = null;
@@ -2279,6 +2285,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             send_state.pending_events = .empty;
             completed_diff_files = send_state.pending_diff_files;
             send_state.pending_diff_files = .empty;
+            send_state.pending_diff_has_turn_snapshot = false;
             freePendingApprovalLocked(std.heap.page_allocator, &send_state.pending_approval);
             send_state.approval_decision = null;
             send_state.provider = null;

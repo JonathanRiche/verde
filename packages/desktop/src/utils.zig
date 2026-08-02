@@ -1663,12 +1663,7 @@ fn handleSendStreamEvent(context: ?*anyopaque, event: ai_harness.StreamEvent) vo
         },
         .diff => |diff| {
             flushPendingAssistantTextLocked(send_state, page_alloc);
-            mergePendingDiffFilesLocked(page_alloc, &send_state.pending_diff_files, diff.files);
-            upsertPendingDiffSummaryEventLocked(
-                page_alloc,
-                &send_state.pending_events,
-                send_state.pending_diff_files.items,
-            );
+            applyPendingDiffUpdateLocked(page_alloc, send_state, diff);
             send_state.ui_revision +%= 1;
             loop_wakeup.notify();
         },
@@ -1980,6 +1975,42 @@ pub fn mergePendingDiffFilesLocked(
     for (files) |file| {
         if (upsertPendingDiffFileLocked(allocator, target, file)) |_| {} else |_| return;
     }
+}
+
+/// Applies provider diff updates without allowing an individual edit to
+/// overwrite a later authoritative snapshot of the whole turn.
+pub fn applyPendingDiffUpdateLocked(
+    allocator: std.mem.Allocator,
+    send_state: *chat_types.SendState,
+    diff: ai_harness.StreamDiffUpdate,
+) void {
+    switch (diff.scope) {
+        .incremental => {
+            if (send_state.pending_diff_has_turn_snapshot) return;
+            mergePendingDiffFilesLocked(allocator, &send_state.pending_diff_files, diff.files);
+        },
+        .turn_snapshot => {
+            replacePendingDiffFilesLocked(allocator, &send_state.pending_diff_files, diff.files) catch return;
+            send_state.pending_diff_has_turn_snapshot = true;
+        },
+    }
+    upsertPendingDiffSummaryEventLocked(
+        allocator,
+        &send_state.pending_events,
+        send_state.pending_diff_files.items,
+    );
+}
+
+fn replacePendingDiffFilesLocked(
+    allocator: std.mem.Allocator,
+    target: *std.ArrayListUnmanaged(chat_types.PendingDiffFile),
+    files: []const ai_harness.StreamDiffFile,
+) !void {
+    var replacement: std.ArrayListUnmanaged(chat_types.PendingDiffFile) = .empty;
+    errdefer freePendingDiffFiles(allocator, &replacement);
+    for (files) |file| try upsertPendingDiffFileLocked(allocator, &replacement, file);
+    freePendingDiffFiles(allocator, target);
+    target.* = replacement;
 }
 fn upsertPendingDiffFileLocked(
     allocator: std.mem.Allocator,
@@ -2876,6 +2907,48 @@ test "streamed diff becomes a live timeline event and updates in place" {
     upsertPendingDiffSummaryEventLocked(allocator, &events, files.items);
     try std.testing.expectEqual(@as(usize, 1), events.items.len);
     try std.testing.expect(std.mem.indexOf(u8, events.items[0].body, "+again") != null);
+}
+
+test "turn diff snapshot cannot be overwritten by a later individual edit" {
+    const allocator = std.testing.allocator;
+    var send_state: chat_types.SendState = .{ .status = .pending };
+    defer freePendingDiffFiles(allocator, &send_state.pending_diff_files);
+    defer freePendingTimelineEvents(allocator, &send_state.pending_events);
+
+    applyPendingDiffUpdateLocked(allocator, &send_state, .{
+        .files = &.{.{
+            .path = "src/workspace_layout.zig",
+            .additions = 30,
+            .deletions = 2,
+            .patch = "first edit",
+        }},
+    });
+    applyPendingDiffUpdateLocked(allocator, &send_state, .{
+        .scope = .turn_snapshot,
+        .files = &.{.{
+            .path = "src/workspace_layout.zig",
+            .additions = 80,
+            .deletions = 2,
+            .patch = "cumulative turn patch",
+        }},
+    });
+    applyPendingDiffUpdateLocked(allocator, &send_state, .{
+        .files = &.{.{
+            .path = "src/workspace_layout.zig",
+            .additions = 50,
+            .deletions = 0,
+            .patch = "second edit only",
+        }},
+    });
+
+    try std.testing.expect(send_state.pending_diff_has_turn_snapshot);
+    try std.testing.expectEqual(@as(usize, 1), send_state.pending_diff_files.items.len);
+    const file = send_state.pending_diff_files.items[0];
+    try std.testing.expectEqual(@as(i64, 80), file.additions);
+    try std.testing.expectEqual(@as(i64, 2), file.deletions);
+    try std.testing.expectEqualStrings("cumulative turn patch", file.patch.?);
+    try std.testing.expectEqual(@as(usize, 1), send_state.pending_events.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, send_state.pending_events.items[0].body, "cumulative turn patch") != null);
 }
 
 test "provider failure display identifies Claude and Codex usage limits" {
