@@ -1613,7 +1613,11 @@ fn renderOpenPaneRow(
             title = stripLeadingTitleSymbols(title);
         },
         .browser => {
-            globe_icon.queue(state, icon_x + theme.scaledUi(7.0), cy, theme.scaledUi(13.0), paletteColor(muted));
+            // Center in the shared provider glyph slot so the smaller globe
+            // lines up with chat/provider icons rather than hugging the left.
+            const globe_size = theme.scaledUi(13.0);
+            const slot = theme.scaledUi(SIDEBAR_THREAD_PROVIDER_GLYPH_CSS);
+            globe_icon.queue(state, icon_x + slot * 0.5, cy, globe_size, paletteColor(muted));
             title = browserPaneTitle(pane);
         },
     }
