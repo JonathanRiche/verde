@@ -7,6 +7,7 @@
 #include <glib-object.h>
 #include <glib.h>
 #include <jsc/jsc.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +55,31 @@ enum verde_browser_linux_modifier_bits {
     VERDE_BROWSER_LINUX_MOD_ALT = 1 << 2,
     VERDE_BROWSER_LINUX_MOD_SUPER = 1 << 3,
 };
+
+static gboolean verde_browser_linux_wheel_delta_is_integral(double value) {
+    double integral = 0.0;
+    return fabs(modf(value, &integral)) < 0.000001;
+}
+
+static enum wpe_input_axis_event_type verde_browser_linux_wheel_event_type(double delta_x, double delta_y) {
+    if (verde_browser_linux_wheel_delta_is_integral(delta_x) && verde_browser_linux_wheel_delta_is_integral(delta_y)) {
+        return wpe_input_axis_event_type_motion;
+    }
+    return wpe_input_axis_event_type_motion_smooth;
+}
+
+static double verde_browser_linux_wheel_delta_scale(enum wpe_input_axis_event_type event_type) {
+    return event_type == wpe_input_axis_event_type_motion ? 120.0 : 96.0;
+}
+
+static uint32_t verde_browser_linux_wheel_axis(double delta_x, double delta_y) {
+    return fabs(delta_y) >= fabs(delta_x) ? 0u : 1u;
+}
+
+static int32_t verde_browser_linux_wheel_value(double delta_x, double delta_y, double delta_scale) {
+    const double axis_delta = verde_browser_linux_wheel_axis(delta_x, delta_y) == 0u ? delta_y : delta_x;
+    return (int32_t)(axis_delta * delta_scale);
+}
 
 struct verde_browser_linux_event {
     int kind;
@@ -680,6 +706,23 @@ int verde_browser_linux_test_disables_process_swapping(void) {
     const gboolean disabled = verde_browser_linux_disable_process_swapping(settings);
     g_object_unref(settings);
     return disabled ? 1 : 0;
+}
+
+int verde_browser_linux_test_wheel_event_is_smooth(double delta_x, double delta_y) {
+    return verde_browser_linux_wheel_event_type(delta_x, delta_y) == wpe_input_axis_event_type_motion_smooth;
+}
+
+double verde_browser_linux_test_wheel_delta_scale(double delta_x, double delta_y) {
+    return verde_browser_linux_wheel_delta_scale(verde_browser_linux_wheel_event_type(delta_x, delta_y));
+}
+
+unsigned int verde_browser_linux_test_wheel_axis(double delta_x, double delta_y) {
+    return verde_browser_linux_wheel_axis(delta_x, delta_y);
+}
+
+int32_t verde_browser_linux_test_wheel_value(double delta_x, double delta_y) {
+    const enum wpe_input_axis_event_type event_type = verde_browser_linux_wheel_event_type(delta_x, delta_y);
+    return verde_browser_linux_wheel_value(delta_x, delta_y, verde_browser_linux_wheel_delta_scale(event_type));
 }
 #endif
 
@@ -1669,20 +1712,20 @@ int verde_browser_linux_mouse_button(struct verde_browser_linux *browser, double
 int verde_browser_linux_mouse_wheel(struct verde_browser_linux *browser, double x, double y, double delta_x, double delta_y, unsigned int modifiers) {
     if (browser == NULL) return 0;
     verde_browser_linux_mark_active(browser);
-    struct wpe_input_axis_2d_event event = {
-        .base = {
-            .type = wpe_input_axis_event_type_motion_smooth | wpe_input_axis_event_type_mask_2d,
-            .time = verde_browser_linux_now_ms(),
-            .x = (int)x,
-            .y = (int)y,
-            .axis = 0,
-            .value = 0,
-            .modifiers = verde_browser_linux_encode_modifiers(modifiers) | browser->pointer_modifiers,
-        },
-        .x_axis = delta_x * 96.0,
-        .y_axis = delta_y * 96.0,
+    const enum wpe_input_axis_event_type event_type = verde_browser_linux_wheel_event_type(delta_x, delta_y);
+    const double delta_scale = verde_browser_linux_wheel_delta_scale(event_type);
+    // WPE 2D events duplicate the legacy value into an orthogonal DOM delta,
+    // which makes horizontal carousels cancel otherwise vertical page scroll.
+    struct wpe_input_axis_event event = {
+        .type = event_type,
+        .time = verde_browser_linux_now_ms(),
+        .x = (int)x,
+        .y = (int)y,
+        .axis = verde_browser_linux_wheel_axis(delta_x, delta_y),
+        .value = verde_browser_linux_wheel_value(delta_x, delta_y, delta_scale),
+        .modifiers = verde_browser_linux_encode_modifiers(modifiers) | browser->pointer_modifiers,
     };
-    wpe_view_backend_dispatch_axis_event(browser->view_backend, &event.base);
+    wpe_view_backend_dispatch_axis_event(browser->view_backend, &event);
     return 1;
 }
 
