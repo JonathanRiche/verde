@@ -79,8 +79,12 @@ fn persistedProjectSnapshot(allocator: std.mem.Allocator, project: *const Projec
     const workspace_layout_json = try project.workspace_layout.persistedWorkspaceJson(allocator);
     errdefer allocator.free(workspace_layout_json);
 
-    for (project.threads.items) |thread| {
-        if (!project.archived and !thread.committed) continue;
+    const retained_thread_index = lastRetainedActiveThreadIndex(project);
+    for (project.threads.items, 0..) |thread, thread_index| {
+        // Workspace panes and the selected thread persist raw array indexes.
+        // Retaining a contiguous prefix keeps those indexes stable while still
+        // dropping abandoned trailing drafts that nothing references.
+        if (!project.archived and (retained_thread_index == null or thread_index > retained_thread_index.?)) continue;
         try threads.append(allocator, try threadSnapshot(allocator, &thread));
     }
     for (project.archived_threads.items) |thread| {
@@ -103,6 +107,63 @@ fn persistedProjectSnapshot(allocator: std.mem.Allocator, project: *const Projec
         .herdr_link = if (project.herdr_link) |*link| try link.toPersisted(allocator) else null,
         .threads = try threads.toOwnedSlice(allocator),
     };
+}
+
+fn lastRetainedActiveThreadIndex(project: *const Project) ?usize {
+    if (project.threads.items.len == 0) return null;
+
+    var retained: ?usize = null;
+    for (project.threads.items, 0..) |thread, thread_index| {
+        if (thread.committed) retained = if (retained) |current| @max(current, thread_index) else thread_index;
+    }
+
+    if (project.selected_thread_index < project.threads.items.len) {
+        retained = if (retained) |current| @max(current, project.selected_thread_index) else project.selected_thread_index;
+    }
+    for (project.workspace_layout.panes.items) |pane| {
+        const thread_index = switch (pane.ref) {
+            .chat => |ref| ref.thread_index,
+            else => continue,
+        };
+        if (thread_index >= project.threads.items.len) continue;
+        retained = if (retained) |current| @max(current, thread_index) else thread_index;
+    }
+    return retained;
+}
+
+test "snapshot retains pane-backed draft threads without shifting indexes" {
+    const allocator = std.testing.allocator;
+    var projects: [1]Project = .{try Project.init(allocator, "workspace-id", "Workspace", "/tmp/workspace", 0)};
+    defer projects[0].deinit(allocator);
+    const project = &projects[0];
+
+    project.threads.items[0].committed = true;
+
+    const first_draft_index = try project.addThread(allocator);
+    const first_draft_pane = try project.workspace_layout.createChatPane(allocator, first_draft_index);
+    try project.workspace_layout.splitPaneWithLeaf(allocator, 1, first_draft_pane, .vertical, true);
+
+    const second_draft_index = try project.addThread(allocator);
+    project.threads.items[second_draft_index].setDraft("unfinished prompt");
+    const second_draft_pane = try project.workspace_layout.createChatPane(allocator, second_draft_index);
+    try project.workspace_layout.splitPaneWithLeaf(allocator, first_draft_pane, second_draft_pane, .horizontal, true);
+
+    _ = try project.addThread(allocator);
+    project.selected_thread_index = second_draft_index;
+
+    var snapshot = try buildSnapshot(.{
+        .projects = projects[0..],
+        .archived_projects = &.{},
+        .selected_project_index = 0,
+        .sidebar_collapsed = false,
+    }, allocator);
+    defer snapshot.deinit();
+
+    const persisted_project = snapshot.value.projects[0];
+    const persisted_threads = persisted_project.threads.?;
+    try std.testing.expectEqual(@as(usize, 3), persisted_threads.len);
+    try std.testing.expectEqualStrings("unfinished prompt", persisted_threads[second_draft_index].draft);
+    try std.testing.expect(std.mem.indexOf(u8, persisted_project.workspace_layout_json.?, "\"thread\":2") != null);
 }
 
 fn persistedTerminalDocksJson(allocator: std.mem.Allocator, project: *const Project) !?[]u8 {
