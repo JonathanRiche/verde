@@ -584,12 +584,16 @@ pub const Controller = struct {
         if (self.child_pid != null) {
             self.sendCommand(.{ .kind = .quit }) catch {};
             self.closeChildStdin();
+            // WebKit descendants can inherit the helper's protocol stdout and
+            // keep the reader blocked after the helper exits. Bound the whole
+            // process group before joining the reader so teardown cannot wedge
+            // Verde's UI thread.
+            self.terminateChild();
         }
         if (self.reader_thread) |thread| {
             thread.join();
             self.reader_thread = null;
         }
-        self.terminateChild();
         if (self.current_url) |url| self.allocator.free(url);
         self.wayland_subsurface.deinit();
         self.frame_buffer.deinit(self.allocator);
@@ -678,7 +682,6 @@ pub const Controller = struct {
             .scale = self.pane_scale,
             .screen_x = self.pane_screen_x,
             .screen_y = self.pane_screen_y,
-            .payload = self.current_url orelse "about:blank",
         });
     }
 
@@ -952,14 +955,12 @@ pub const Controller = struct {
         const helper_path = try browserHelperPath(self.allocator);
         defer self.allocator.free(helper_path);
 
-        var stdin_pipe: [2]std.posix.fd_t = undefined;
-        if (std.c.pipe(&stdin_pipe) != 0) return error.Unexpected;
+        const stdin_pipe = try createProtocolPipe();
         errdefer {
             _ = std.c.close(stdin_pipe[0]);
             _ = std.c.close(stdin_pipe[1]);
         }
-        var stdout_pipe: [2]std.posix.fd_t = undefined;
-        if (std.c.pipe(&stdout_pipe) != 0) return error.Unexpected;
+        const stdout_pipe = try createProtocolPipe();
         errdefer {
             _ = std.c.close(stdout_pipe[0]);
             _ = std.c.close(stdout_pipe[1]);
@@ -1070,13 +1071,15 @@ pub const Controller = struct {
     fn terminateChild(self: *Controller) void {
         const child_pid = self.child_pid orelse return;
         const child_process_group = self.child_process_group orelse child_pid;
-        if (!waitForChildExit(child_pid, 250)) {
-            std.posix.kill(-child_process_group, std.posix.SIG.TERM) catch {};
-            if (!waitForChildExit(child_pid, 250)) {
-                std.posix.kill(-child_process_group, std.posix.SIG.KILL) catch {};
-                _ = waitForChildExit(child_pid, 250);
-            }
+        var child_reaped = waitForChildExit(child_pid, 250);
+        std.posix.kill(-child_process_group, std.posix.SIG.TERM) catch {};
+        if (child_reaped) {
+            sleepMillis(250);
+        } else {
+            child_reaped = waitForChildExit(child_pid, 250);
         }
+        std.posix.kill(-child_process_group, std.posix.SIG.KILL) catch {};
+        if (!child_reaped) _ = waitForChildExit(child_pid, 250);
         self.child_pid = null;
         self.child_process_group = null;
     }
@@ -1089,6 +1092,29 @@ fn visibleHelperEnabled() bool {
     const session_type = if (std.c.getenv("XDG_SESSION_TYPE")) |value_ptr| std.mem.span(value_ptr) else null;
     const gdk_backend = if (std.c.getenv("GDK_BACKEND")) |value_ptr| std.mem.span(value_ptr) else null;
     return visibleHelperEnabledFromValues(override_value, unsafe_wayland, session_type, gdk_backend);
+}
+
+fn createProtocolPipe() ![2]std.posix.fd_t {
+    // Provider processes can launch concurrently with the browser helper. Set
+    // CLOEXEC atomically so an unrelated exec cannot retain the write end and
+    // prevent the reader thread from ever observing EOF during browser teardown.
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe2(&pipe_fds, .{ .CLOEXEC = true }) != 0) return error.Unexpected;
+    return pipe_fds;
+}
+
+test "browser helper protocol pipes close across unrelated execs" {
+    const pipe_fds = try createProtocolPipe();
+    defer {
+        _ = std.c.close(pipe_fds[0]);
+        _ = std.c.close(pipe_fds[1]);
+    }
+
+    for (pipe_fds) |fd| {
+        const flags = std.c.fcntl(fd, std.c.F.GETFD);
+        try std.testing.expect(flags >= 0);
+        try std.testing.expect(flags & std.c.FD_CLOEXEC != 0);
+    }
 }
 
 fn commandWakesFrame(kind: ipc.CommandKind) bool {

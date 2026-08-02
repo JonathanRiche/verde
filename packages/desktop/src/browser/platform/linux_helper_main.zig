@@ -109,6 +109,13 @@ pub fn main(init: std.process.Init) !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     const allocator = gpa_state.allocator();
 
+    // The desktop waits for EOF on this protocol pipe. WebKit subprocesses
+    // must not inherit it or they can keep Verde's reader blocked after this
+    // helper exits.
+    if (std.c.fcntl(std.c.STDOUT_FILENO, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC)) < 0) {
+        return error.Unexpected;
+    }
+
     const browser = verde_browser_linux_create() orelse return error.BrowserUnavailable;
     defer verde_browser_linux_destroy(browser);
 

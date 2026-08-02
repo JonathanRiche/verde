@@ -53,6 +53,7 @@ pub const State = struct {
     inspector_enabled: bool = false,
     inspector_mode: InspectorMode = .point,
     suppressed_eval_results: u8 = 0,
+    suppressed_closed_events: u8 = 0,
     status: Status = .hidden,
     address_storage: [ADDRESS_CAPACITY:0]u8 = std.mem.zeroes([ADDRESS_CAPACITY:0]u8),
     script_storage: [SCRIPT_CAPACITY:0]u8 = std.mem.zeroes([SCRIPT_CAPACITY:0]u8),
@@ -154,6 +155,18 @@ pub const State = struct {
     /// Clears any pending internal eval suppressions when the browser lifetime resets.
     pub fn clearSuppressedEvalResults(self: *State) void {
         self.suppressed_eval_results = 0;
+    }
+
+    /// Suppresses one forthcoming close event caused by intentionally hiding this session.
+    pub fn suppressNextClosedEvent(self: *State) void {
+        self.suppressed_closed_events = std.math.add(u8, self.suppressed_closed_events, 1) catch std.math.maxInt(u8);
+    }
+
+    /// Consumes one intentional close event associated with this browser session.
+    pub fn consumeSuppressedClosedEvent(self: *State) bool {
+        if (self.suppressed_closed_events == 0) return false;
+        self.suppressed_closed_events -= 1;
+        return true;
     }
 
     /// Replaces the editable URL field with a new value.

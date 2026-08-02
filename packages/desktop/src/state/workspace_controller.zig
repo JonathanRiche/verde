@@ -1322,9 +1322,11 @@ pub fn closeWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
             self.setSidebarNotice(if (preserve_agent_history) "Agent TUI closed. Reopen it from History." else "Terminal pane closed.");
         },
         .browser => {
-            if (self.browser_controller.runtime_project_index) |runtime_project_index| {
-                if (runtime_project_index == project_index) self.deactivateBrowserRuntime(true);
-            }
+            const removed_runtime_owner = if (self.browser_controller.runtime_project_index) |runtime_project_index|
+                runtime_project_index == project_index
+            else
+                false;
+            self.reconcileBrowserRuntimeAfterPaneRemoval(project_index, removed_runtime_owner);
             self.setSidebarNotice("Browser pane closed.");
         },
     }

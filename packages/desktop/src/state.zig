@@ -2569,7 +2569,6 @@ pub const AppState = struct {
             runtime_index == index
         else
             false;
-        if (closed_active_browser) self.deactivateBrowserRuntime(true);
         self.project_controller.archived_projects.ensureUnusedCapacity(self.allocator, 1) catch |err| {
             self.setSidebarNotice(@errorName(err));
             return false;
@@ -2582,6 +2581,7 @@ pub const AppState = struct {
         removed.archived = true;
         removed.terminal_dock.visible = false;
         self.project_controller.archived_projects.appendAssumeCapacity(removed);
+        self.reconcileBrowserRuntimeAfterPaneRemoval(index, closed_active_browser);
 
         if (self.project_controller.projects.items.len == 0) {
             self.project_controller.selected_index = 0;
@@ -2590,7 +2590,7 @@ pub const AppState = struct {
         } else if (self.project_controller.selected_index > index) {
             self.project_controller.selected_index -= 1;
         }
-        if (!closed_active_browser) _ = self.browser_controller.projectRemoved(index);
+        _ = self.browser_controller.projectRemoved(index);
         if (self.project_controller.projects.items.len > 0 and (closed_active_browser or closed_selected_project)) {
             self.restorePersistedBrowserPaneAfterProjectSelection(self.project_controller.selected_index);
         }
@@ -4185,6 +4185,8 @@ pub const AppState = struct {
     pub const workspacePaneKind = browser_controller.workspacePaneKind;
     pub const blurNativeBrowserForAddressField = browser_controller.blurNativeBrowserForAddressField;
     pub const deactivateBrowserRuntime = browser_controller.deactivateBrowserRuntime;
+    pub const hasWorkspaceBrowserPane = browser_controller.hasWorkspaceBrowserPane;
+    pub const reconcileBrowserRuntimeAfterPaneRemoval = browser_controller.reconcileBrowserRuntimeAfterPaneRemoval;
     pub const closeBrowser = browser_controller.closeBrowser;
     pub const suspendBrowserForHostWindowHidden = browser_controller.suspendBrowserForHostWindowHidden;
     pub const resumeBrowserAfterHostWindowShown = browser_controller.resumeBrowserAfterHostWindowShown;
@@ -7762,6 +7764,36 @@ test "shared browser runtime routes state through its workspace owner" {
     try std.testing.expectEqual(@as(usize, 0), state.browserWorkspaceLocation().?.index);
     try std.testing.expectEqual(first_pane_id, state.browserWorkspacePaneId().?);
     try std.testing.expect(state.browserPaneIdInWorkspace(1) != null);
+}
+
+test "browser runtime remains needed until the final workspace browser pane closes" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+
+    var first_project = try Project.init(allocator, "first", "First", "/tmp/first", 0);
+    _ = try first_project.workspace_layout.ensureBrowserPane(allocator);
+    state.project_controller.projects.append(allocator, first_project) catch |err| {
+        first_project.deinit(allocator);
+        return err;
+    };
+    var second_project = try Project.init(allocator, "second", "Second", "/tmp/second", 0);
+    _ = try second_project.workspace_layout.ensureBrowserPane(allocator);
+    state.project_controller.projects.append(allocator, second_project) catch |err| {
+        second_project.deinit(allocator);
+        return err;
+    };
+
+    try std.testing.expect(state.hasWorkspaceBrowserPane());
+    try std.testing.expect(state.project_controller.projects.items[0].workspace_layout.closePaneKind(allocator, .browser));
+    try std.testing.expect(state.hasWorkspaceBrowserPane());
+    try std.testing.expect(state.project_controller.projects.items[1].workspace_layout.closePaneKind(allocator, .browser));
+    try std.testing.expect(!state.hasWorkspaceBrowserPane());
 }
 
 test "completed OpenCode model refresh tolerates zero workspaces" {
