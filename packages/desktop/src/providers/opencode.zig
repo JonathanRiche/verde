@@ -1883,6 +1883,19 @@ fn eventTargetsSession(value: std.json.Value, session_id: []const u8) bool {
 }
 
 fn handleMessagePartUpdated(context: *EventStreamContext, properties: std.json.Value) !void {
+    const part = getObjectField(properties, "part") orelse return;
+    const part_type = getOptionalObjectString(part, "type") orelse return;
+    if (std.mem.eql(u8, part_type, "tool")) {
+        if (!eventTargetsSession(part, context.session_id) and !eventTargetsSession(properties, context.session_id)) return;
+        if (context.baseline_assistant_id) |baseline_id| {
+            if (getOptionalObjectString(part, "messageID")) |message_id| {
+                if (std.mem.eql(u8, message_id, baseline_id)) return;
+            }
+        }
+        _ = try emitOpenCodeToolPart(context.allocator, part, context.request);
+        return;
+    }
+
     const part_id = visibleTextPartId(properties, context.session_id) orelse return;
 
     context.mutex.lock();
@@ -1891,6 +1904,55 @@ fn handleMessagePartUpdated(context: *EventStreamContext, properties: std.json.V
     const owned_part_id = try context.allocator.dupe(u8, part_id);
     errdefer context.allocator.free(owned_part_id);
     try context.visible_text_part_ids.append(context.allocator, owned_part_id);
+}
+
+fn openCodeToolKind(tool_name: []const u8) provider_types.ToolCallKind {
+    if (std.mem.eql(u8, tool_name, "bash") or std.mem.eql(u8, tool_name, "shell")) return .execute;
+    if (std.mem.eql(u8, tool_name, "read")) return .read;
+    if (std.mem.eql(u8, tool_name, "edit") or std.mem.eql(u8, tool_name, "write") or std.mem.eql(u8, tool_name, "patch")) return .edit;
+    if (std.mem.eql(u8, tool_name, "grep") or std.mem.eql(u8, tool_name, "glob") or std.mem.eql(u8, tool_name, "list")) return .search;
+    if (std.mem.eql(u8, tool_name, "webfetch") or std.mem.eql(u8, tool_name, "websearch")) return .fetch;
+
+    // OpenCode flattens MCP method names for some servers (for example,
+    // `verde:list_processes` arrives as `verde_list_processes`). Treat tools
+    // outside its built-in set as MCP calls so those methods remain visible.
+    return .mcp;
+}
+
+fn openCodeToolStatus(status: []const u8) provider_types.ToolCallStatus {
+    if (std.mem.eql(u8, status, "pending")) return .pending;
+    if (std.mem.eql(u8, status, "running")) return .in_progress;
+    if (std.mem.eql(u8, status, "completed")) return .completed;
+    if (std.mem.eql(u8, status, "error")) return .failed;
+    return .unknown;
+}
+
+fn emitOpenCodeToolPart(
+    allocator: std.mem.Allocator,
+    part: std.json.Value,
+    request: provider_types.SendPromptRequest,
+) !bool {
+    const on_stream_event = request.on_stream_event orelse return false;
+    const tool_name = getOptionalObjectString(part, "tool") orelse return false;
+    const call_id = getOptionalObjectString(part, "callID") orelse getOptionalObjectString(part, "id") orelse return false;
+    const state = getObjectField(part, "state") orelse return false;
+    const status_text = getOptionalObjectString(state, "status") orelse return false;
+    const input = if (getObjectField(state, "input")) |value|
+        try stringifyAlloc(allocator, value)
+    else
+        null;
+    defer if (input) |value| allocator.free(value);
+
+    on_stream_event(request.stream_context, .{ .tool_call = .{
+        .call_id = call_id,
+        .title = tool_name,
+        .kind = openCodeToolKind(tool_name),
+        .status = openCodeToolStatus(status_text),
+        .input = input,
+        .output = getOptionalObjectString(state, "output"),
+        .error_text = getOptionalObjectString(state, "error"),
+    } });
+    return true;
 }
 
 fn visibleTextPartId(properties: std.json.Value, session_id: []const u8) ?[]const u8 {
@@ -2369,6 +2431,75 @@ fn parseModelRef(model_ref: []const u8) struct { []const u8, []const u8 } {
     }
 
     return .{ "opencode", model_ref };
+}
+
+const OpenCodeTestToolCapture = struct {
+    call_id: ?[]const u8 = null,
+    title: ?[]const u8 = null,
+    kind: ?provider_types.ToolCallKind = null,
+    status: ?provider_types.ToolCallStatus = null,
+    output: ?[]const u8 = null,
+    input_buffer: [256]u8 = undefined,
+    input_len: usize = 0,
+    count: usize = 0,
+
+    fn handle(context: ?*anyopaque, event: provider_types.StreamEvent) void {
+        const self: *OpenCodeTestToolCapture = @ptrCast(@alignCast(context orelse return));
+        switch (event) {
+            .tool_call => |tool_call| {
+                self.call_id = tool_call.call_id;
+                self.title = tool_call.title;
+                self.kind = tool_call.kind;
+                self.status = tool_call.status;
+                self.output = tool_call.output;
+                if (tool_call.input) |input| {
+                    self.input_len = @min(input.len, self.input_buffer.len);
+                    @memcpy(self.input_buffer[0..self.input_len], input[0..self.input_len]);
+                }
+                self.count += 1;
+            },
+            else => {},
+        }
+    }
+};
+
+test "OpenCode tool parts preserve MCP input and output" {
+    const payload =
+        \\{"id":"part-1","sessionID":"session-1","messageID":"assistant-1","type":"tool","callID":"call-1","tool":"verde:list_processes","state":{"status":"completed","input":{"workspace":"current"},"output":"{\"ok\":true}"}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    var capture: OpenCodeTestToolCapture = .{};
+
+    try std.testing.expect(try emitOpenCodeToolPart(std.testing.allocator, parsed.value, .{
+        .prompt = "",
+        .stream_context = &capture,
+        .on_stream_event = OpenCodeTestToolCapture.handle,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqualStrings("call-1", capture.call_id.?);
+    try std.testing.expectEqualStrings("verde:list_processes", capture.title.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.status.?);
+    try std.testing.expectEqualStrings("{\"workspace\":\"current\"}", capture.input_buffer[0..capture.input_len]);
+    try std.testing.expectEqualStrings("{\"ok\":true}", capture.output.?);
+}
+
+test "OpenCode tool parts classify shell commands" {
+    const payload =
+        \\{"id":"part-1","sessionID":"session-1","messageID":"assistant-1","type":"tool","callID":"bash-1","tool":"bash","state":{"status":"completed","input":{"command":"git status --short"},"output":"clean"}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    var capture: OpenCodeTestToolCapture = .{};
+
+    try std.testing.expect(try emitOpenCodeToolPart(std.testing.allocator, parsed.value, .{
+        .prompt = "",
+        .stream_context = &capture,
+        .on_stream_event = OpenCodeTestToolCapture.handle,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(provider_types.ToolCallKind.execute, capture.kind.?);
+    try std.testing.expectEqualStrings("bash", capture.title.?);
 }
 
 test "extractAssistantTextAlloc joins text parts" {

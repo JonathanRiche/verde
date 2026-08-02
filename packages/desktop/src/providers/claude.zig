@@ -431,6 +431,13 @@ pub const Client = struct {
             parsed.deinit();
             return;
         }
+        if (std.mem.eql(u8, kind, "tool_call_event")) {
+            if (stream_request) |request| {
+                _ = emitBridgeToolCallEvent(parsed.value, request);
+            }
+            parsed.deinit();
+            return;
+        }
         if (std.mem.eql(u8, kind, "diff_event")) {
             if (stream_request) |request| {
                 _ = try emitBridgeDiffEvent(parsed.value, request);
@@ -681,6 +688,37 @@ fn getOptionalObjectInt(value: std.json.Value, field: []const u8) ?i64 {
     };
 }
 
+fn bridgeToolCallKind(value: []const u8) provider_types.ToolCallKind {
+    if (std.mem.eql(u8, value, "mcp")) return .mcp;
+    return .other;
+}
+
+fn bridgeToolCallStatus(value: []const u8) provider_types.ToolCallStatus {
+    if (std.mem.eql(u8, value, "pending")) return .pending;
+    if (std.mem.eql(u8, value, "in_progress")) return .in_progress;
+    if (std.mem.eql(u8, value, "completed")) return .completed;
+    if (std.mem.eql(u8, value, "failed")) return .failed;
+    if (std.mem.eql(u8, value, "cancelled")) return .cancelled;
+    return .unknown;
+}
+
+fn emitBridgeToolCallEvent(root: std.json.Value, request: provider_types.SendPromptRequest) bool {
+    const on_stream_event = request.on_stream_event orelse return false;
+    const call_id = getOptionalObjectString(root, "call_id") orelse return false;
+    const kind = getOptionalObjectString(root, "kind");
+    const status = getOptionalObjectString(root, "status");
+    on_stream_event(request.stream_context, .{ .tool_call = .{
+        .call_id = call_id,
+        .title = getOptionalObjectString(root, "title") orelse "",
+        .kind = if (kind) |value| bridgeToolCallKind(value) else null,
+        .status = if (status) |value| bridgeToolCallStatus(value) else null,
+        .input = getOptionalObjectString(root, "input"),
+        .output = getOptionalObjectString(root, "output"),
+        .error_text = getOptionalObjectString(root, "error_text"),
+    } });
+    return true;
+}
+
 const ClaudeTestDiffCapture = struct {
     path: ?[]const u8 = null,
     patch: ?[]const u8 = null,
@@ -693,6 +731,32 @@ const ClaudeTestDiffCapture = struct {
                 if (diff.files.len == 0) return;
                 self.path = diff.files[0].path;
                 self.patch = diff.files[0].patch;
+                self.count += 1;
+            },
+            else => {},
+        }
+    }
+};
+
+const ClaudeTestToolCapture = struct {
+    call_id: ?[]const u8 = null,
+    title: ?[]const u8 = null,
+    kind: ?provider_types.ToolCallKind = null,
+    status: ?provider_types.ToolCallStatus = null,
+    input: ?[]const u8 = null,
+    output: ?[]const u8 = null,
+    count: usize = 0,
+
+    fn handle(context: ?*anyopaque, event: provider_types.StreamEvent) void {
+        const self: *ClaudeTestToolCapture = @ptrCast(@alignCast(context orelse return));
+        switch (event) {
+            .tool_call => |tool_call| {
+                self.call_id = tool_call.call_id;
+                self.title = tool_call.title;
+                self.kind = tool_call.kind;
+                self.status = tool_call.status;
+                self.input = tool_call.input;
+                self.output = tool_call.output;
                 self.count += 1;
             },
             else => {},
@@ -887,6 +951,28 @@ test "Claude bridge diff events preserve file patches" {
     try std.testing.expectEqual(@as(usize, 1), capture.count);
     try std.testing.expectEqualStrings("src/main.zig", capture.path.?);
     try std.testing.expect(std.mem.indexOf(u8, capture.patch.?, "+new") != null);
+}
+
+test "Claude bridge MCP events preserve input and output" {
+    const payload =
+        \\{"type":"tool_call_event","call_id":"tool-1","title":"verde.list_processes","kind":"mcp","status":"completed","input":"{\"workspace\":\"current\"}","output":"{\"ok\":true}"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    var capture: ClaudeTestToolCapture = .{};
+
+    try std.testing.expect(emitBridgeToolCallEvent(parsed.value, .{
+        .prompt = "",
+        .stream_context = &capture,
+        .on_stream_event = ClaudeTestToolCapture.handle,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqualStrings("tool-1", capture.call_id.?);
+    try std.testing.expectEqualStrings("verde.list_processes", capture.title.?);
+    try std.testing.expectEqual(provider_types.ToolCallKind.mcp, capture.kind.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.status.?);
+    try std.testing.expectEqualStrings("{\"workspace\":\"current\"}", capture.input.?);
+    try std.testing.expectEqualStrings("{\"ok\":true}", capture.output.?);
 }
 
 test "Windows provider bridge probes CLI and package-root GUI layouts" {

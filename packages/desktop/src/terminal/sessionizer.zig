@@ -35,7 +35,8 @@ pub const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\verde-sessionizer-";
 // Version 14 preserves provider-specific tool titles and inferred MCP kinds.
 // Version 15 carries exact Verde MCP method names through Cursor tool results.
 // Version 16 transports complete diff snapshots instead of empty diff events.
-pub const PROTOCOL_VERSION: u32 = 16;
+// Version 17 transports MCP tool outputs from every daemon-owned GUI provider.
+pub const PROTOCOL_VERSION: u32 = 17;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;

@@ -1241,6 +1241,7 @@ pub const Client = struct {
         // turn/start response; before that, total socket silence can only mean
         // a dead connection or a turn wedged behind stale app-server state.
         var saw_turn_activity = false;
+        var saw_mcp_tool_call = false;
 
         while (true) {
             const wait: ReadWait = .{
@@ -1296,6 +1297,8 @@ pub const Client = struct {
                 }
             }
 
+            saw_mcp_tool_call = saw_mcp_tool_call or isMcpToolCallNotification(root);
+
             try emitNotificationEvent(self, root, request);
 
             if (try appendNotificationDelta(root, allocator, &reply)) {
@@ -1319,7 +1322,40 @@ pub const Client = struct {
             }
         }
 
+        // Fast MCP completion notifications may carry the terminal status
+        // before app-server attaches the persisted result. Hydrate only this
+        // turn's items before the UI commits its pending tool cards.
+        if (saw_mcp_tool_call) {
+            self.emitHydratedMcpToolOutputs(thread_id, started_turn_id, request) catch |err| {
+                runtime_log.diagnostic("failed to hydrate Codex MCP outputs: {s}", .{@errorName(err)});
+            };
+        }
+
         return reply.toOwnedSlice(allocator);
+    }
+
+    fn emitHydratedMcpToolOutputs(
+        self: *Client,
+        thread_id: []const u8,
+        turn_id: ?[]const u8,
+        request: provider_types.SendPromptRequest,
+    ) !void {
+        const on_stream_event = request.on_stream_event orelse return;
+        const payload = try self.callRpcForResultAlloc("thread/read", .{
+            .threadId = thread_id,
+            .includeTurns = true,
+        });
+        defer self.allocator.free(payload);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{});
+        defer parsed.deinit();
+        _ = try emitHydratedMcpToolOutputsFromThreadValue(
+            self.allocator,
+            parsed.value,
+            turn_id,
+            request.stream_context,
+            on_stream_event,
+        );
     }
 
     fn sendTurnStartRequest(
@@ -2992,31 +3028,8 @@ fn emitItemEvent(
         return true;
     }
 
-    if (std.mem.eql(u8, item_type, "mcpToolCall")) {
-        var label_buf: [512]u8 = undefined;
-        const label = formatMcpToolCallLabel(&label_buf, item) orelse return false;
-        const call_id = getOptionalObjectString(item, "id") orelse "";
-        if (started) {
-            on_stream_event(context, .{ .tool_call = .{
-                .call_id = call_id,
-                .title = "",
-                .kind = .mcp,
-                .status = .in_progress,
-                .input = label,
-            } });
-            return true;
-        }
-        const status = getOptionalObjectString(item, "status") orelse return false;
-        if (!std.mem.eql(u8, status, "completed") and !std.mem.eql(u8, status, "failed")) return true;
-        on_stream_event(context, .{ .tool_call = .{
-            .call_id = call_id,
-            .title = "",
-            .kind = .mcp,
-            .status = toolCallStatusFromCodex(status),
-            .input = label,
-        } });
-        return true;
-    }
+    if (std.mem.eql(u8, item_type, "mcpToolCall"))
+        return emitMcpToolCallItem(allocator, item, started, context, on_stream_event);
 
     if (std.mem.eql(u8, item_type, "reasoning")) {
         const call_id = getOptionalObjectString(item, "id") orelse return false;
@@ -3080,6 +3093,90 @@ fn emitItemEvent(
     return false;
 }
 
+fn emitMcpToolCallItem(
+    allocator: std.mem.Allocator,
+    item: std.json.Value,
+    started: bool,
+    context: ?*anyopaque,
+    on_stream_event: *const fn (?*anyopaque, provider_types.StreamEvent) void,
+) !bool {
+    var label_buf: [512]u8 = undefined;
+    const label = formatMcpToolCallLabel(&label_buf, item) orelse return false;
+    const call_id = getOptionalObjectString(item, "id") orelse "";
+    if (started) {
+        on_stream_event(context, .{ .tool_call = .{
+            .call_id = call_id,
+            .title = "",
+            .kind = .mcp,
+            .status = .in_progress,
+            .input = label,
+        } });
+        return true;
+    }
+
+    const status = getOptionalObjectString(item, "status") orelse return false;
+    if (!std.mem.eql(u8, status, "completed") and !std.mem.eql(u8, status, "failed")) return true;
+    const output = try formatMcpToolCallOutputAlloc(allocator, item);
+    defer if (output) |text| allocator.free(text);
+    const error_text = if (getObjectField(item, "error")) |error_value|
+        getOptionalObjectString(error_value, "message")
+    else
+        null;
+    on_stream_event(context, .{ .tool_call = .{
+        .call_id = call_id,
+        .title = "",
+        .kind = .mcp,
+        .status = toolCallStatusFromCodex(status),
+        .input = label,
+        .output = output,
+        .error_text = error_text,
+    } });
+    return true;
+}
+
+fn emitHydratedMcpToolOutputsFromThreadValue(
+    allocator: std.mem.Allocator,
+    root: std.json.Value,
+    turn_id: ?[]const u8,
+    context: ?*anyopaque,
+    on_stream_event: *const fn (?*anyopaque, provider_types.StreamEvent) void,
+) !usize {
+    const thread = getObjectField(root, "thread") orelse return 0;
+    const turns = getObjectField(thread, "turns") orelse return 0;
+    if (turns != .array or turns.array.items.len == 0) return 0;
+
+    var selected_turn: std.json.Value = turns.array.items[turns.array.items.len - 1];
+    if (turn_id) |expected_id| {
+        for (turns.array.items) |turn| {
+            const candidate_id = getOptionalObjectString(turn, "id") orelse continue;
+            if (std.mem.eql(u8, candidate_id, expected_id)) {
+                selected_turn = turn;
+                break;
+            }
+        }
+    }
+
+    const items = getObjectField(selected_turn, "items") orelse return 0;
+    if (items != .array) return 0;
+
+    var emitted: usize = 0;
+    for (items.array.items) |item| {
+        const item_type = getOptionalObjectString(item, "type") orelse continue;
+        if (!std.mem.eql(u8, item_type, "mcpToolCall")) continue;
+        if (try emitMcpToolCallItem(allocator, item, false, context, on_stream_event)) emitted += 1;
+    }
+    return emitted;
+}
+
+fn isMcpToolCallNotification(root: std.json.Value) bool {
+    const method = getOptionalObjectString(root, "method") orelse return false;
+    if (!std.mem.eql(u8, method, "item/started") and !std.mem.eql(u8, method, "item/completed")) return false;
+    const params = getObjectField(root, "params") orelse return false;
+    const item = getObjectField(params, "item") orelse return false;
+    const item_type = getOptionalObjectString(item, "type") orelse return false;
+    return std.mem.eql(u8, item_type, "mcpToolCall");
+}
+
 fn toolCallStatusFromCodex(status: []const u8) provider_types.ToolCallStatus {
     if (std.mem.eql(u8, status, "failed")) return .failed;
     if (std.mem.eql(u8, status, "declined") or std.mem.eql(u8, status, "cancelled")) return .cancelled;
@@ -3103,6 +3200,34 @@ fn formatMcpToolCallLabel(buffer: []u8, item: std.json.Value) ?[]const u8 {
     const server = getOptionalObjectString(item, "server") orelse return null;
     const tool = getOptionalObjectString(item, "tool") orelse return null;
     return std.fmt.bufPrint(buffer, "{s}.{s}", .{ server, tool }) catch tool;
+}
+
+/// Extracts readable MCP text results while retaining structured-only data.
+fn formatMcpToolCallOutputAlloc(allocator: std.mem.Allocator, item: std.json.Value) !?[]u8 {
+    const result = getObjectField(item, "result") orelse return null;
+    if (result == .null) return null;
+
+    if (getObjectField(result, "content")) |content| {
+        if (content == .array) {
+            var writer: std.Io.Writer.Allocating = .init(allocator);
+            errdefer writer.deinit();
+            var wrote = false;
+            for (content.array.items) |content_item| {
+                const text = getOptionalObjectString(content_item, "text") orelse continue;
+                if (text.len == 0) continue;
+                if (wrote) try writer.writer.writeAll("\n");
+                try writer.writer.writeAll(text);
+                wrote = true;
+            }
+            if (wrote) return try writer.toOwnedSlice();
+            writer.deinit();
+        }
+    }
+
+    if (getObjectField(result, "structuredContent")) |structured| {
+        if (structured != .null) return try stringifyAlloc(allocator, structured);
+    }
+    return try stringifyAlloc(allocator, result);
 }
 
 fn handleCommandApprovalRequest(self: *Client, root: std.json.Value, request_id: std.json.Value, request: provider_types.SendPromptRequest) !void {
@@ -4342,7 +4467,12 @@ test "MCP calls emit lifecycle tool call updates" {
         \\      "type": "mcpToolCall",
         \\      "server": "verde",
         \\      "tool": "capture_browser_screenshot",
-        \\      "status": "completed"
+        \\      "status": "completed",
+        \\      "result": {
+        \\        "content": [
+        \\          { "type": "text", "text": "{\"ok\":true,\"items\":[1,2]}" }
+        \\        ]
+        \\      }
         \\    }
         \\  }
         \\}
@@ -4355,6 +4485,7 @@ test "MCP calls emit lifecycle tool call updates" {
     try std.testing.expectEqualStrings("mcp-1", capture.tool_call_id.?);
     try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.tool_status.?);
     try std.testing.expectEqualStrings("verde.capture_browser_screenshot", capture.tool_input.?);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"items\":[1,2]}", capture.tool_output.?);
 
     const failed_json =
         \\{
@@ -4378,6 +4509,46 @@ test "MCP calls emit lifecycle tool call updates" {
     try std.testing.expectEqualStrings("mcp-2", capture.tool_call_id.?);
     try std.testing.expectEqual(provider_types.ToolCallStatus.failed, capture.tool_status.?);
     try std.testing.expectEqualStrings("blender.execute_blender_code", capture.tool_input.?);
+}
+
+test "hydrated Codex turn items backfill MCP output" {
+    const payload =
+        \\{
+        \\  "thread": {
+        \\    "id": "thread-1",
+        \\    "turns": [{
+        \\      "id": "turn-1",
+        \\      "items": [{
+        \\        "id": "mcp-1",
+        \\        "type": "mcpToolCall",
+        \\        "server": "verde",
+        \\        "tool": "list_workspaces",
+        \\        "status": "completed",
+        \\        "arguments": {},
+        \\        "result": {
+        \\          "content": [{"type":"text","text":"{\"ok\":true}"}],
+        \\          "structuredContent": null
+        \\        }
+        \\      }]
+        \\    }]
+        \\  }
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    var capture: TestStreamEventCapture = .{};
+
+    try std.testing.expectEqual(@as(usize, 1), try emitHydratedMcpToolOutputsFromThreadValue(
+        std.testing.allocator,
+        parsed.value,
+        "turn-1",
+        &capture,
+        TestStreamEventCapture.handle,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), capture.tool_call_count);
+    try std.testing.expectEqualStrings("mcp-1", capture.tool_call_id.?);
+    try std.testing.expectEqual(provider_types.ToolCallStatus.completed, capture.tool_status.?);
+    try std.testing.expectEqualStrings("{\"ok\":true}", capture.tool_output.?);
 }
 
 test "isContextCompactionCompleted matches compact item completion" {

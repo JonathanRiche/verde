@@ -2486,6 +2486,13 @@ fn isCursorToolSystemEvent(author_raw: []const u8, body_raw: []const u8) bool {
         return false;
     }
 
+    // Older provider builds persisted the provider-specific MCP method as the
+    // author. Recognize the shared structured body so those rows still render
+    // as bounded tool cards after an upgrade.
+    inline for (.{ "Tool:\n", "Input:\n", "Output:\n", "Error:\n", "Locations:\n" }) |prefix| {
+        if (std.mem.startsWith(u8, body, prefix)) return true;
+    }
+
     const known_tools = [_][]const u8{
         "Read",
         "Read File",
@@ -2513,6 +2520,17 @@ fn isCursorToolSystemEvent(author_raw: []const u8, body_raw: []const u8) bool {
     if (std.mem.indexOf(u8, body, "{\"command\"") != null) return true;
     if (std.mem.endsWith(u8, body, ": {}")) return true;
     return false;
+}
+
+test "provider-specific MCP authors still render as structured tool cards" {
+    try std.testing.expect(isCursorToolSystemEvent(
+        "verde.list_panes",
+        "Input:\n{}\n\nOutput:\n{\"ok\":true}",
+    ));
+    try std.testing.expect(!isCursorToolSystemEvent(
+        "System",
+        "Output:\nordinary system message",
+    ));
 }
 
 fn shouldHideCursorLifecycleSystemEvent(author: []const u8, body_raw: []const u8) bool {
@@ -2564,6 +2582,7 @@ fn transcriptCommandEventHeight(
     author: []const u8,
     body_raw: []const u8,
     column_width: f32,
+    tool_call_status: ?ai_harness.ToolCallStatus,
 ) f32 {
     const pad_x = theme.scaledUi(14.0);
     const pad_y = theme.scaledUi(9.0);
@@ -2574,7 +2593,8 @@ fn transcriptCommandEventHeight(
     const expanded = blk: {
         const app = state orelse break :blk false;
         const idx = message_index orelse break :blk false;
-        break :blk app.isCardExpandedDefault(commandCardKey(idx), commandEventFailed(author));
+        const failed = commandEventFailed(author) or (tool_call_status orelse .unknown) == .failed;
+        break :blk app.isCardExpandedDefault(commandCardKey(idx), failed);
     };
     if (!expanded) return header_h;
 
@@ -2660,7 +2680,7 @@ fn transcriptMessageHeightStream(
         return slashCommandResultHeight(state, message_index, body_raw, column_width);
     }
     if (role == .system and shouldRenderPaletteCommandRow(message_author, body_raw)) {
-        return transcriptCommandEventHeight(state, message_index, message_author, body_raw, column_width);
+        return transcriptCommandEventHeight(state, message_index, message_author, body_raw, column_width, null);
     }
     if (role == .system and isDiffSummaryMessage(message_author, body_raw)) {
         return diffSummaryHeight(state, message_index, body_raw, column_width);
@@ -4198,7 +4218,7 @@ fn toolCallGroupHeight(
     const child_width = @max(column_width - inset * 2.0, theme.scaledUi(80.0));
     var height = header_h + theme.scaledUi(8.0);
     for (entries[start..end], start..) |entry, index| {
-        height += transcriptCommandEventHeight(state, base_message_index + index, entry.author, entry.body, child_width);
+        height += transcriptCommandEventHeight(state, base_message_index + index, entry.author, entry.body, child_width, toolCallEntryStatus(entry));
         height += theme.scaledUi(8.0);
     }
     return height + theme.scaledUi(2.0);
@@ -4315,7 +4335,7 @@ fn renderToolCallGroup(
     var child_y = y + header_h + theme.scaledUi(8.0);
     for (entries[start..end], start..) |entry, index| {
         const message_index = base_message_index + index;
-        const child_h = transcriptCommandEventHeight(state, message_index, entry.author, entry.body, child_column.w);
+        const child_h = transcriptCommandEventHeight(state, message_index, entry.author, entry.body, child_column.w, toolCallEntryStatus(entry));
         renderCommandEventRow(
             state,
             child_column,
