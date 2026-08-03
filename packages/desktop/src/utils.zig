@@ -40,6 +40,48 @@ pub const OpenFileResult = enum {
     file_manager,
 };
 
+pub const FileLocation = struct {
+    line: ?usize = null,
+    column: ?usize = null,
+};
+
+pub const FileReference = struct {
+    path: []const u8,
+    location: FileLocation = .{},
+};
+
+/// Separates the conventional `:line` or `:line:column` suffix from a file path.
+pub fn parseFileReference(value: []const u8) FileReference {
+    const final_colon = std.mem.findScalarLast(u8, value, ':') orelse return .{ .path = value };
+    if (final_colon == 0) return .{ .path = value };
+
+    const final_number = parsePositiveDecimal(value[final_colon + 1 ..]) orelse return .{ .path = value };
+    const before_final = value[0..final_colon];
+    if (std.mem.findScalarLast(u8, before_final, ':')) |line_colon| {
+        if (line_colon > 0) {
+            if (parsePositiveDecimal(before_final[line_colon + 1 ..])) |line| {
+                return .{
+                    .path = before_final[0..line_colon],
+                    .location = .{ .line = line, .column = final_number },
+                };
+            }
+        }
+    }
+
+    // Do not interpret a Windows drive-relative path such as `C:12` as a line reference.
+    if (final_colon == 1 and std.ascii.isAlphabetic(value[0])) return .{ .path = value };
+    return .{ .path = before_final, .location = .{ .line = final_number } };
+}
+
+fn parsePositiveDecimal(value: []const u8) ?usize {
+    if (value.len == 0) return null;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte)) return null;
+    }
+    const parsed = std.fmt.parseInt(usize, value, 10) catch return null;
+    return if (parsed > 0) parsed else null;
+}
+
 pub fn loadEmbeddedTexture(bytes: []const u8) ?state_ui_types.CachedImageTexture {
     const loaded = stb_image.loadFromMemory(bytes) catch |err| {
         log.err("failed to decode embedded logo texture: {s}", .{@errorName(err)});
@@ -198,6 +240,26 @@ pub fn configuredEditorTerminalCommandAlloc(allocator: std.mem.Allocator) !?[]u8
     return try std.fmt.allocPrint(allocator, "exec ${s}\n", .{editor.name});
 }
 
+pub fn configuredNeovimFileCommandAlloc(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    location: FileLocation,
+) !?[]u8 {
+    const editor = preferredEditorEnv() orelse return null;
+    const executable = commandExecutableName(editor.value);
+    if (!std.ascii.eqlIgnoreCase(executable, "nvim")) return null;
+
+    const escaped_path = try shellSingleQuoteEscape(allocator, file_path);
+    defer allocator.free(escaped_path);
+    const location_arg = try vimLocationArgumentAlloc(allocator, executable, location);
+    defer if (location_arg) |arg| allocator.free(arg);
+
+    return if (location_arg) |arg|
+        try std.fmt.allocPrint(allocator, "exec ${s} '{s}' -- '{s}'\n", .{ editor.name, arg, escaped_path })
+    else
+        try std.fmt.allocPrint(allocator, "exec ${s} -- '{s}'\n", .{ editor.name, escaped_path });
+}
+
 pub fn executableNameForCommand(command: []const u8) []const u8 {
     return commandExecutableName(command);
 }
@@ -221,12 +283,13 @@ pub fn openProjectEditor(
 pub fn openFilePreferEditor(
     allocator: std.mem.Allocator,
     file_path: []const u8,
+    location: FileLocation,
 ) OpenProjectError!OpenFileResult {
     const parent_dir = std.fs.path.dirname(file_path) orelse file_path;
 
     if (preferredEditorEnv()) |editor| {
         if (canOpenConfiguredEditor()) {
-            try openConfiguredEditorPath(allocator, editor, parent_dir, file_path);
+            try openConfiguredEditorPath(allocator, editor, parent_dir, file_path, location);
             return .editor;
         }
     }
@@ -843,7 +906,7 @@ fn openConfiguredEditor(
     project_path: []const u8,
 ) OpenProjectError!void {
     if (builtin.os.tag == .windows) {
-        return openConfiguredEditorWindows(allocator, editor.value, project_path, project_path, isTerminalEditorCommand(editor.value));
+        return openConfiguredEditorWindows(allocator, editor.value, project_path, project_path, isTerminalEditorCommand(editor.value), null);
     }
     const script = try std.fmt.allocPrint(allocator, "exec ${s} \"$1\"", .{editor.name});
     defer allocator.free(script);
@@ -859,6 +922,7 @@ fn openConfiguredEditorPath(
     editor: PreferredEditorEnv,
     working_dir: []const u8,
     path: []const u8,
+    location: FileLocation,
 ) OpenProjectError!void {
     const executable = commandExecutableName(editor.value);
     if (std.ascii.eqlIgnoreCase(executable, "cursor")) {
@@ -871,8 +935,11 @@ fn openConfiguredEditorPath(
         return openZedPath(allocator, working_dir, path);
     }
 
+    const location_arg = try vimLocationArgumentAlloc(allocator, executable, location);
+    defer if (location_arg) |arg| allocator.free(arg);
+
     if (builtin.os.tag == .windows) {
-        return openConfiguredEditorWindows(allocator, editor.value, working_dir, path, isTerminalEditorCommand(editor.value));
+        return openConfiguredEditorWindows(allocator, editor.value, working_dir, path, isTerminalEditorCommand(editor.value), location_arg);
     }
 
     const script = try std.fmt.allocPrint(allocator, "exec ${s} \"$1\"", .{editor.name});
@@ -881,7 +948,10 @@ fn openConfiguredEditorPath(
     if (isTerminalEditorCommand(editor.value)) {
         const escaped_path = try shellSingleQuoteEscape(allocator, path);
         defer allocator.free(escaped_path);
-        const terminal_script = try std.fmt.allocPrint(allocator, "exec ${s} '{s}'", .{ editor.name, escaped_path });
+        const terminal_script = if (location_arg) |arg|
+            try std.fmt.allocPrint(allocator, "exec ${s} '{s}' -- '{s}'", .{ editor.name, arg, escaped_path })
+        else
+            try std.fmt.allocPrint(allocator, "exec ${s} -- '{s}'", .{ editor.name, escaped_path });
         defer allocator.free(terminal_script);
         return launchConfiguredEditorInTerminal(allocator, working_dir, terminal_script);
     }
@@ -913,6 +983,24 @@ fn isTerminalEditorCommand(command: []const u8) bool {
         std.mem.eql(u8, executable, "kak") or
         std.mem.eql(u8, executable, "kakoune") or
         std.mem.eql(u8, executable, "micro");
+}
+
+fn vimLocationArgumentAlloc(
+    allocator: std.mem.Allocator,
+    executable: []const u8,
+    location: FileLocation,
+) std.mem.Allocator.Error!?[]u8 {
+    const line = location.line orelse return null;
+    const is_vim = std.ascii.eqlIgnoreCase(executable, "nvim") or
+        std.ascii.eqlIgnoreCase(executable, "vim") or
+        std.ascii.eqlIgnoreCase(executable, "vi") or
+        std.ascii.eqlIgnoreCase(executable, "view");
+    if (!is_vim) return null;
+
+    if (location.column) |column| {
+        return try std.fmt.allocPrint(allocator, "+call cursor({d},{d})", .{ line, column });
+    }
+    return try std.fmt.allocPrint(allocator, "+{d}", .{line});
 }
 
 fn commandExecutableName(command: []const u8) []const u8 {
@@ -1004,9 +1092,17 @@ fn openConfiguredEditorWindows(
     working_dir: []const u8,
     target: []const u8,
     terminal: bool,
+    location_arg: ?[]const u8,
 ) OpenProjectError!void {
     var parsed = parseConfiguredCommand(allocator, command) catch return error.LauncherUnavailable;
     defer parsed.deinit(allocator);
+    if (location_arg) |arg| {
+        const arg_copy = try allocator.dupe(u8, arg);
+        parsed.argv.append(allocator, arg_copy) catch |err| {
+            allocator.free(arg_copy);
+            return err;
+        };
+    }
     const target_copy = try allocator.dupe(u8, target);
     errdefer allocator.free(target_copy);
     try parsed.argv.append(allocator, target_copy);
@@ -2920,6 +3016,42 @@ test "configured editor parsing preserves Windows paths and quoted arguments" {
     try std.testing.expectEqualStrings("C:\\Program Files\\Editor\\editor.exe", parsed.argv.items[0]);
     try std.testing.expectEqualStrings("--reuse-window", parsed.argv.items[1]);
     try std.testing.expectEqualStrings("two words", parsed.argv.items[2]);
+}
+
+test "file references separate line and column suffixes from paths" {
+    const absolute = parseFileReference("/workspace/src/main.zig:42");
+    try std.testing.expectEqualStrings("/workspace/src/main.zig", absolute.path);
+    try std.testing.expectEqual(@as(?usize, 42), absolute.location.line);
+    try std.testing.expectEqual(@as(?usize, null), absolute.location.column);
+
+    const relative = parseFileReference("src/main.zig:42:7");
+    try std.testing.expectEqualStrings("src/main.zig", relative.path);
+    try std.testing.expectEqual(@as(?usize, 42), relative.location.line);
+    try std.testing.expectEqual(@as(?usize, 7), relative.location.column);
+
+    const windows = parseFileReference("C:\\workspace\\main.zig:9");
+    try std.testing.expectEqualStrings("C:\\workspace\\main.zig", windows.path);
+    try std.testing.expectEqual(@as(?usize, 9), windows.location.line);
+
+    const drive_relative = parseFileReference("C:12");
+    try std.testing.expectEqualStrings("C:12", drive_relative.path);
+    try std.testing.expectEqual(@as(?usize, null), drive_relative.location.line);
+
+    const literal = parseFileReference("notes/release:v2");
+    try std.testing.expectEqualStrings("notes/release:v2", literal.path);
+    try std.testing.expectEqual(@as(?usize, null), literal.location.line);
+}
+
+test "Neovim location arguments preserve line and column" {
+    const allocator = std.testing.allocator;
+    const line_arg = (try vimLocationArgumentAlloc(allocator, "nvim", .{ .line = 986 })).?;
+    defer allocator.free(line_arg);
+    try std.testing.expectEqualStrings("+986", line_arg);
+
+    const column_arg = (try vimLocationArgumentAlloc(allocator, "nvim", .{ .line = 531, .column = 8 })).?;
+    defer allocator.free(column_arg);
+    try std.testing.expectEqualStrings("+call cursor(531,8)", column_arg);
+    try std.testing.expect((try vimLocationArgumentAlloc(allocator, "nano", .{ .line = 12 })) == null);
 }
 
 test "upsertPendingDiffFileLocked clears stale patch when later snapshot omits it" {
