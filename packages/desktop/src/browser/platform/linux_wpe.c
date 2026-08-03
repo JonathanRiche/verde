@@ -27,6 +27,7 @@
 #define VERDE_BROWSER_LINUX_FRAME_TIMER_LEAD_US 750
 #define VERDE_BROWSER_LINUX_CONTEXT_MENU_ITEM_MAX 96
 #define VERDE_BROWSER_LINUX_FRAME_INTERVAL_SAMPLE_MAX 256
+#define VERDE_BROWSER_LINUX_ASYNC_OVERFLOW_SCROLLING_FEATURE "AsyncOverflowScrolling"
 #define VERDE_BROWSER_LINUX_PROCESS_SWAP_FEATURE "ProcessSwapOnCrossSiteNavigation"
 
 #if WEBKIT_CHECK_VERSION(2, 52, 0)
@@ -117,6 +118,13 @@ struct verde_browser_linux {
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC gl_egl_image_target_texture_2d;
     unsigned char *rgba_scratch;
     size_t rgba_scratch_len;
+    unsigned char *deferred_bgra;
+    size_t deferred_bgra_len;
+    guint32 deferred_frame_width;
+    guint32 deferred_frame_height;
+    size_t deferred_frame_byte_len;
+    gint64 deferred_frame_exported_at_us;
+    gboolean deferred_frame_ready;
 
     unsigned char *frame_slots[VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT];
     gboolean frame_slots_ready[VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT];
@@ -143,6 +151,7 @@ struct verde_browser_linux {
 
     guint64 metric_exported_frames;
     guint64 metric_delayed_exports;
+    guint64 metric_deferred_exports;
     guint64 metric_dropped_exports;
     guint64 metric_published_frames;
     guint64 metric_frame_complete_scheduled;
@@ -167,27 +176,49 @@ int verde_browser_linux_set_bounds(struct verde_browser_linux *browser, int x, i
 
 static gboolean verde_browser_linux_frame_log_enabled(void);
 
-static gboolean verde_browser_linux_disable_process_swapping(WebKitSettings *settings) {
+static gboolean verde_browser_linux_set_feature_enabled(WebKitSettings *settings, const char *identifier, gboolean enabled) {
     if (settings == NULL) return FALSE;
 #if WEBKIT_CHECK_VERSION(2, 42, 0)
     WebKitFeatureList *features = webkit_settings_get_all_features();
     if (features == NULL) return FALSE;
-    gboolean disabled = FALSE;
+    gboolean updated = FALSE;
     const gsize feature_count = webkit_feature_list_get_length(features);
     for (gsize index = 0; index < feature_count; index += 1) {
         WebKitFeature *feature = webkit_feature_list_get(features, index);
-        if (feature == NULL || g_strcmp0(webkit_feature_get_identifier(feature), VERDE_BROWSER_LINUX_PROCESS_SWAP_FEATURE) != 0) {
+        if (feature == NULL || g_strcmp0(webkit_feature_get_identifier(feature), identifier) != 0) {
             continue;
         }
-        // Avoid handing one legacy FDO exportable between site processes.
-        webkit_settings_set_feature_enabled(settings, feature, FALSE);
-        disabled = !webkit_settings_get_feature_enabled(settings, feature);
+        webkit_settings_set_feature_enabled(settings, feature, enabled);
+        updated = webkit_settings_get_feature_enabled(settings, feature) == enabled;
         break;
     }
     webkit_feature_list_unref(features);
-    return disabled;
+    return updated;
+#else
+    (void)identifier;
+    (void)enabled;
+    return FALSE;
+#endif
+}
+
+static gboolean verde_browser_linux_disable_process_swapping(WebKitSettings *settings) {
+#if WEBKIT_CHECK_VERSION(2, 42, 0)
+    // Avoid handing one legacy FDO exportable between site processes.
+    return verde_browser_linux_set_feature_enabled(settings, VERDE_BROWSER_LINUX_PROCESS_SWAP_FEATURE, FALSE);
 #else
     // Older WPE versions do not expose or enable this process-swapping feature.
+    (void)settings;
+    return TRUE;
+#endif
+}
+
+static gboolean verde_browser_linux_disable_async_overflow_scrolling(WebKitSettings *settings) {
+#if WEBKIT_CHECK_VERSION(2, 42, 0)
+    // WebKit's asynchronous overflow layers are misplaced in legacy FDO
+    // offscreen frames; keep overflow scrolling on the main rendering path.
+    return verde_browser_linux_set_feature_enabled(settings, VERDE_BROWSER_LINUX_ASYNC_OVERFLOW_SCROLLING_FEATURE, FALSE);
+#else
+    (void)settings;
     return TRUE;
 #endif
 }
@@ -708,6 +739,14 @@ int verde_browser_linux_test_disables_process_swapping(void) {
     return disabled ? 1 : 0;
 }
 
+int verde_browser_linux_test_disables_async_overflow_scrolling(void) {
+    WebKitSettings *settings = webkit_settings_new();
+    if (settings == NULL) return 0;
+    const gboolean disabled = verde_browser_linux_disable_async_overflow_scrolling(settings);
+    g_object_unref(settings);
+    return disabled ? 1 : 0;
+}
+
 int verde_browser_linux_test_wheel_event_is_smooth(double delta_x, double delta_y) {
     return verde_browser_linux_wheel_event_type(delta_x, delta_y) == wpe_input_axis_event_type_motion_smooth;
 }
@@ -768,6 +807,7 @@ static void verde_browser_linux_maybe_log_frame_metrics(struct verde_browser_lin
         "verde-browser-linux WPE metrics exported=%" G_GUINT64_FORMAT
         " published=%" G_GUINT64_FORMAT
         " delayed=%" G_GUINT64_FORMAT
+        " deferred=%" G_GUINT64_FORMAT
         " dropped=%" G_GUINT64_FORMAT
         " complete_scheduled=%" G_GUINT64_FORMAT
         " complete_fired=%" G_GUINT64_FORMAT
@@ -782,6 +822,7 @@ static void verde_browser_linux_maybe_log_frame_metrics(struct verde_browser_lin
         browser->metric_exported_frames,
         browser->metric_published_frames,
         browser->metric_delayed_exports,
+        browser->metric_deferred_exports,
         browser->metric_dropped_exports,
         browser->metric_frame_complete_scheduled,
         browser->metric_frame_complete_fired,
@@ -795,44 +836,6 @@ static void verde_browser_linux_maybe_log_frame_metrics(struct verde_browser_lin
         verde_browser_linux_percentile_us(sorted, sample_count, 99));
     fflush(stderr);
     browser->metric_export_interval_count = 0;
-}
-
-static gboolean verde_browser_linux_prefer_dark_scheme_enabled(void) {
-    const char *value = getenv("VERDE_BROWSER_LINUX_WPE_PREFER_DARK");
-    if (value == NULL || value[0] == '\0') return TRUE;
-    return g_ascii_strcasecmp(value, "0") != 0 &&
-        g_ascii_strcasecmp(value, "false") != 0 &&
-        g_ascii_strcasecmp(value, "off") != 0 &&
-        g_ascii_strcasecmp(value, "light") != 0;
-}
-
-static void verde_browser_linux_add_prefer_dark_scheme_script(WebKitUserContentManager *manager) {
-    if (manager == NULL || !verde_browser_linux_prefer_dark_scheme_enabled()) return;
-    WebKitUserScript *scheme_script = webkit_user_script_new(
-        "(function(){"
-        "document.documentElement.style.colorScheme='dark';"
-        "document.documentElement.setAttribute('data-theme','dark');"
-        "document.documentElement.classList.add('dark');"
-        "const originalMatchMedia=window.matchMedia&&window.matchMedia.bind(window);"
-        "if(originalMatchMedia){"
-        "window.matchMedia=function(query){"
-        "const result=originalMatchMedia(query);"
-        "const text=String(query);"
-        "if(text.indexOf('prefers-color-scheme')!==-1){"
-        "const wantsDark=text.indexOf('dark')!==-1;"
-        "try{Object.defineProperty(result,'matches',{value:wantsDark,configurable:true});}catch(e){}"
-        "}"
-        "return result;"
-        "};"
-        "}"
-        "})();",
-        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
-        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
-        NULL,
-        NULL
-    );
-    webkit_user_content_manager_add_script(manager, scheme_script);
-    webkit_user_script_unref(scheme_script);
 }
 
 static guint32 verde_browser_linux_now_ms(void) {
@@ -951,6 +954,7 @@ static void verde_browser_linux_deinit_egl(struct verde_browser_linux *browser) 
 
 enum verde_browser_linux_frame_export_result {
     VERDE_BROWSER_LINUX_FRAME_EXPORT_OK,
+    VERDE_BROWSER_LINUX_FRAME_EXPORT_DEFERRED,
     VERDE_BROWSER_LINUX_FRAME_EXPORT_DROPPED,
     VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED,
 };
@@ -1010,6 +1014,55 @@ static void verde_browser_linux_publish_frame_slot(
     browser->metric_published_frames += 1;
 }
 
+static unsigned char *verde_browser_linux_prepare_deferred_frame(
+    struct verde_browser_linux *browser,
+    size_t byte_len
+) {
+    if (browser->deferred_bgra_len < byte_len) {
+        unsigned char *next = g_realloc(browser->deferred_bgra, byte_len);
+        if (next == NULL) return NULL;
+        browser->deferred_bgra = next;
+        browser->deferred_bgra_len = byte_len;
+    }
+    return browser->deferred_bgra;
+}
+
+static void verde_browser_linux_retain_deferred_frame(
+    struct verde_browser_linux *browser,
+    guint32 width,
+    guint32 height,
+    size_t byte_len,
+    gint64 exported_at_us
+) {
+    browser->deferred_frame_width = width;
+    browser->deferred_frame_height = height;
+    browser->deferred_frame_byte_len = byte_len;
+    browser->deferred_frame_exported_at_us = exported_at_us;
+    browser->deferred_frame_ready = TRUE;
+    browser->metric_deferred_exports += 1;
+}
+
+static gboolean verde_browser_linux_publish_deferred_frame(
+    struct verde_browser_linux *browser,
+    guint frame_slot
+) {
+    if (!browser->deferred_frame_ready || browser->deferred_bgra == NULL) return FALSE;
+    if (!browser->frame_slots_ready[frame_slot] || browser->frame_slots[frame_slot] == NULL) return FALSE;
+    if (browser->deferred_frame_byte_len > VERDE_BROWSER_LINUX_FRAME_BYTES_MAX) return FALSE;
+
+    memcpy(browser->frame_slots[frame_slot], browser->deferred_bgra, browser->deferred_frame_byte_len);
+    browser->deferred_frame_ready = FALSE;
+    verde_browser_linux_publish_frame_slot(
+        browser,
+        (gint)frame_slot,
+        browser->deferred_frame_width,
+        browser->deferred_frame_height,
+        browser->deferred_frame_byte_len,
+        browser->deferred_frame_exported_at_us
+    );
+    return TRUE;
+}
+
 static enum verde_browser_linux_frame_export_result verde_browser_linux_export_egl_image(
     struct verde_browser_linux *browser,
     struct wpe_fdo_egl_exported_image *image,
@@ -1021,8 +1074,7 @@ static enum verde_browser_linux_frame_export_result verde_browser_linux_export_e
     const size_t byte_len = (size_t)width * (size_t)height * 4u;
     if (width == 0 || height == 0 || byte_len > VERDE_BROWSER_LINUX_FRAME_BYTES_MAX) return VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
     const gint frame_slot = verde_browser_linux_acquire_frame_slot(browser, byte_len);
-    if (frame_slot == -2) return VERDE_BROWSER_LINUX_FRAME_EXPORT_DROPPED;
-    if (frame_slot < 0) return VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
+    if (frame_slot < 0 && frame_slot != -2) return VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
 
     if (!eglMakeCurrent(browser->egl_display, browser->egl_surface, browser->egl_surface, browser->egl_context)) return VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
     glBindTexture(GL_TEXTURE_2D, browser->texture);
@@ -1032,11 +1084,14 @@ static enum verde_browser_linux_frame_export_result verde_browser_linux_export_e
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
     glViewport(0, 0, (GLsizei)width, (GLsizei)height);
 
-    unsigned char *bgra = browser->frame_slots[frame_slot];
+    unsigned char *bgra = frame_slot == -2
+        ? verde_browser_linux_prepare_deferred_frame(browser, byte_len)
+        : browser->frame_slots[frame_slot];
+    if (bgra == NULL) return VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED;
     gboolean read_directly = FALSE;
     // SDL_GPU exposes no portable external EGLImage/dmabuf texture import API.
-    // Reading BGRA directly into the acknowledged shared slot is therefore the
-    // supported zero-intermediate-copy path; retain RGBA+swizzle as a fallback.
+    // Reading BGRA directly into the shared slot or retained frame buffer is
+    // therefore the supported path; retain RGBA+swizzle as a fallback.
     if (browser->supports_bgra_read) {
         while (glGetError() != GL_NO_ERROR) {}
         glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, bgra);
@@ -1062,6 +1117,14 @@ static enum verde_browser_linux_frame_export_result verde_browser_linux_export_e
         }
     }
 
+    if (frame_slot == -2) {
+        verde_browser_linux_retain_deferred_frame(browser, width, height, byte_len, exported_at_us);
+        browser->frame_import_failure_reported = FALSE;
+        return VERDE_BROWSER_LINUX_FRAME_EXPORT_DEFERRED;
+    }
+
+    // A newly published frame is newer than any retained contention frame.
+    browser->deferred_frame_ready = FALSE;
     verde_browser_linux_publish_frame_slot(browser, frame_slot, width, height, byte_len, exported_at_us);
     browser->frame_import_failure_reported = FALSE;
     return VERDE_BROWSER_LINUX_FRAME_EXPORT_OK;
@@ -1107,7 +1170,7 @@ static void verde_browser_linux_export_fdo_egl_image(void *data, struct wpe_fdo_
         min_interval_us,
         browser->frame_production_lead_us
     ));
-    if (result != VERDE_BROWSER_LINUX_FRAME_EXPORT_OK) {
+    if (result == VERDE_BROWSER_LINUX_FRAME_EXPORT_DROPPED) {
         browser->metric_dropped_exports += 1;
     }
     if (result == VERDE_BROWSER_LINUX_FRAME_EXPORT_FAILED) {
@@ -1356,6 +1419,10 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
 
     WebKitSettings *settings = webkit_settings_new();
     webkit_settings_set_enable_developer_extras(settings, TRUE);
+    if (!verde_browser_linux_disable_async_overflow_scrolling(settings)) {
+        fprintf(stderr, "verde-browser-linux WPE: failed to disable asynchronous overflow scrolling\n");
+        fflush(stderr);
+    }
     if (!verde_browser_linux_disable_process_swapping(settings)) {
         fprintf(stderr, "verde-browser-linux WPE: failed to disable cross-site WebProcess swapping\n");
         fflush(stderr);
@@ -1375,8 +1442,6 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
 
     WebKitColor background = { 1.0, 1.0, 1.0, 1.0 };
     webkit_web_view_set_background_color(browser->web_view, &background);
-
-    verde_browser_linux_add_prefer_dark_scheme_script(browser->content_manager);
 
     WebKitUserScript *bridge_script = webkit_user_script_new(
         "(function(){"
@@ -1501,6 +1566,7 @@ void verde_browser_linux_destroy(struct verde_browser_linux *browser) {
     if (browser->webkit_backend != NULL) g_object_unref(browser->webkit_backend);
     g_free(browser->cursor_shape);
     g_free(browser->rgba_scratch);
+    g_free(browser->deferred_bgra);
     verde_browser_linux_deinit_egl(browser);
     verde_browser_linux_unmap_frame_slots(browser);
     g_queue_free(browser->events);
@@ -1670,7 +1736,36 @@ int verde_browser_linux_release_frame_slot(struct verde_browser_linux *browser, 
     browser->frame_slots_owned[slot] = FALSE;
     browser->frame_slot_sequences[slot] = 0;
     browser->metric_slot_releases += 1;
+    (void)verde_browser_linux_publish_deferred_frame(browser, slot);
     return 1;
+}
+
+int verde_browser_linux_test_deferred_frame_publishes_on_release(void) {
+    struct verde_browser_linux browser = {0};
+    unsigned char slot_pixels[4] = {0};
+    unsigned char deferred_pixels[4] = {11, 22, 33, 44};
+
+    browser.frame_slots[1] = slot_pixels;
+    browser.frame_slots_ready[1] = TRUE;
+    browser.frame_slots_owned[1] = TRUE;
+    browser.frame_slot_sequences[1] = 7;
+    browser.frame_next_sequence = 7;
+    browser.deferred_bgra = deferred_pixels;
+    browser.deferred_bgra_len = sizeof(deferred_pixels);
+    browser.deferred_frame_width = 1;
+    browser.deferred_frame_height = 1;
+    browser.deferred_frame_byte_len = sizeof(deferred_pixels);
+    browser.deferred_frame_exported_at_us = 123;
+    browser.deferred_frame_ready = TRUE;
+
+    if (!verde_browser_linux_release_frame_slot(&browser, 1, 7)) return 0;
+    return browser.frame_dirty &&
+        browser.frame_ready_slot == 1 &&
+        browser.frame_ready_sequence == 8 &&
+        browser.frame_slots_owned[1] &&
+        browser.frame_slot_sequences[1] == 8 &&
+        !browser.deferred_frame_ready &&
+        memcmp(slot_pixels, deferred_pixels, sizeof(slot_pixels)) == 0;
 }
 
 int verde_browser_linux_mouse_move(struct verde_browser_linux *browser, double x, double y, unsigned int modifiers) {
