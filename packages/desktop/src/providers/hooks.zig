@@ -1167,7 +1167,16 @@ pub fn removeAmpGlobalHooks(allocator: std.mem.Allocator) !void {
 fn writeAmpPlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
     const plugin =
         \\// verde-amp-notify-plugin
-        \\import type { PluginAPI } from '@ampcode/plugin';
+        \\import type { PluginAPI, Subscription, ThreadState } from '@ampcode/plugin';
+        \\
+        \\type ThreadWatch = {
+        \\  active: boolean;
+        \\  pending: Promise<void>;
+        \\  revision: number;
+        \\  subscription: Subscription | null;
+        \\};
+        \\
+        \\const threadWatches = new Map<string, ThreadWatch>();
         \\
         \\function inVerdePane(): boolean {
         \\  return process.env.VERDE === '1' && Boolean(process.env.VERDE_SESSION_ID);
@@ -1191,19 +1200,59 @@ fn writeAmpPlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !v
         \\  }
         \\}
         \\
+        \\function queueThreadState(amp: PluginAPI, threadId: string, watch: ThreadWatch, state: ThreadState): void {
+        \\  watch.pending = watch.pending.then(async () => {
+        \\    if (threadWatches.get(threadId) !== watch) return;
+        \\
+        \\    let status: 'idle' | 'working' | 'done' | 'waiting' | 'error';
+        \\    switch (state) {
+        \\      case 'running':
+        \\        watch.active = true;
+        \\        status = 'working';
+        \\        break;
+        \\      case 'awaiting-approval':
+        \\        watch.active = true;
+        \\        status = 'waiting';
+        \\        break;
+        \\      case 'error':
+        \\        watch.active = true;
+        \\        status = 'error';
+        \\        break;
+        \\      case 'idle':
+        \\        status = watch.active ? 'done' : 'idle';
+        \\        watch.active = false;
+        \\        break;
+        \\    }
+        \\    await notify(amp, amp.$, status);
+        \\  });
+        \\}
+        \\
         \\export default function (amp: PluginAPI) {
         \\  amp.logger.log('Verde notify plugin initialized');
         \\
-        \\  amp.on('session.start', async (_event, ctx) => {
-        \\    await notify(amp, ctx.$, 'idle');
+        \\  amp.on('session.start', async (event, ctx) => {
+        \\    const threadId = event.thread.id;
+        \\    threadWatches.get(threadId)?.subscription?.unsubscribe();
+        \\    const watch: ThreadWatch = {
+        \\      active: false,
+        \\      pending: Promise.resolve(),
+        \\      revision: 0,
+        \\      subscription: null,
+        \\    };
+        \\    threadWatches.set(threadId, watch);
+        \\    watch.subscription = ctx.thread.state.subscribe((state) => {
+        \\      watch.revision += 1;
+        \\      queueThreadState(amp, threadId, watch, state);
+        \\    });
+        \\    const state = await ctx.thread.state.get();
+        \\    if (threadWatches.get(threadId) === watch && watch.revision === 0) {
+        \\      queueThreadState(amp, threadId, watch, state);
+        \\    }
         \\  });
         \\
-        \\  amp.on('agent.start', async (_event, ctx) => {
-        \\    await notify(amp, ctx.$, 'working');
-        \\  });
-        \\
-        \\  amp.on('agent.end', async (event, ctx) => {
-        \\    await notify(amp, ctx.$, event?.status === 'error' ? 'error' : 'done');
+        \\  amp.onDispose(() => {
+        \\    for (const watch of threadWatches.values()) watch.subscription?.unsubscribe();
+        \\    threadWatches.clear();
         \\  });
         \\}
         \\
@@ -1702,4 +1751,25 @@ test "Grok hook install and removal stay inside the provider home" {
     try std.testing.expect(grokGlobalHooksInstalledAt(std.testing.allocator, grok_home));
     try removeGrokGlobalHooksAt(std.testing.allocator, grok_home);
     try std.testing.expect(!grokGlobalHooksInstalledAt(std.testing.allocator, grok_home));
+}
+
+test "Amp plugin follows thread state across automatic retries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const plugin_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/verde-notify.ts", .{tmp.sub_path});
+    defer std.testing.allocator.free(plugin_path);
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    try writeAmpPlugin(std.testing.allocator, threaded.io(), plugin_path);
+    const plugin = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), plugin_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(plugin);
+
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "ctx.thread.state.subscribe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "case 'running':") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "case 'awaiting-approval':") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "case 'error':") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "case 'idle':") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "threadWatches.get(threadId) === watch && watch.revision === 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "amp.on('agent.end'") == null);
 }
