@@ -41,6 +41,8 @@ extern fn verde_browser_linux_test_active_completion_deadline_with_lead_us(last_
 extern fn verde_browser_linux_test_updated_production_lead_us(existing_lead_us: i64, dispatched_us: i64, published_us: i64) i64;
 extern fn verde_browser_linux_test_frame_interval_us(visible: c_int) i64;
 extern fn verde_browser_linux_test_disables_process_swapping() c_int;
+extern fn verde_browser_linux_test_disables_async_overflow_scrolling() c_int;
+extern fn verde_browser_linux_test_deferred_frame_publishes_on_release() c_int;
 extern fn verde_browser_linux_test_wheel_event_is_smooth(delta_x: f64, delta_y: f64) c_int;
 extern fn verde_browser_linux_test_wheel_delta_scale(delta_x: f64, delta_y: f64) f64;
 extern fn verde_browser_linux_test_wheel_axis(delta_x: f64, delta_y: f64) c_uint;
@@ -527,6 +529,14 @@ test "WPE frame pacing uses active cadence while visible and does not postpone o
 
 test "WPE helper keeps its legacy exportable backend in one web process" {
     try std.testing.expectEqual(@as(c_int, 1), verde_browser_linux_test_disables_process_swapping());
+}
+
+test "WPE helper keeps overflow scrolling on the correctly rendered main path" {
+    try std.testing.expectEqual(@as(c_int, 1), verde_browser_linux_test_disables_async_overflow_scrolling());
+}
+
+test "WPE publishes the newest deferred frame when a shared slot is released" {
+    try std.testing.expectEqual(@as(c_int, 1), verde_browser_linux_test_deferred_frame_publishes_on_release());
 }
 
 test "WPE wheel input keeps discrete steps separate from smooth deltas" {
