@@ -105,6 +105,13 @@ const MAX_BANG_RETRY_HITS = 64;
 const BangRetryHit = struct { rect: palette.Rect = .{}, command: []const u8 = "" };
 var bang_retry_hit_count: usize = 0;
 var bang_retry_hits: [MAX_BANG_RETRY_HITS]BangRetryHit = [_]BangRetryHit{.{}} ** MAX_BANG_RETRY_HITS;
+const MAX_TRANSCRIPT_IMAGE_HITS = 64;
+const TranscriptImageHit = struct {
+    rect: palette.Rect = .{},
+    path: [:0]const u8 = "",
+};
+var transcript_image_hit_count: usize = 0;
+var transcript_image_hits: [MAX_TRANSCRIPT_IMAGE_HITS]TranscriptImageHit = [_]TranscriptImageHit{.{}} ** MAX_TRANSCRIPT_IMAGE_HITS;
 
 /// Geometry of the transcript scrollbar from the last paint. Captured during
 /// render so the mouse handlers can do hit-testing without rebuilding the
@@ -187,6 +194,7 @@ pub fn resetTranscriptHitCache() void {
     diff_file_open_hit_count = 0;
     diff_layout_hit_count = 0;
     bang_retry_hit_count = 0;
+    transcript_image_hit_count = 0;
 }
 
 pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
@@ -615,6 +623,7 @@ const TranscriptAction = union(enum) {
     diff_file_open: []const u8,
     diff_layout: bool,
     retry_command: []const u8,
+    image_open: [:0]const u8,
 };
 
 fn transcriptActionAt(x: f32, y: f32) ?TranscriptAction {
@@ -636,6 +645,11 @@ fn transcriptActionAt(x: f32, y: f32) ?TranscriptAction {
     while (index < bang_retry_hit_count) : (index += 1) {
         const hit = bang_retry_hits[index];
         if (rectContains(hit.rect, x, y)) return .{ .retry_command = hit.command };
+    }
+    index = 0;
+    while (index < transcript_image_hit_count) : (index += 1) {
+        const hit = transcript_image_hits[index];
+        if (rectContains(hit.rect, x, y)) return .{ .image_open = hit.path };
     }
     return null;
 }
@@ -671,6 +685,17 @@ test "transcript action hit testing preserves usage and diff open actions" {
     const layout = transcriptActionAt(230.0, 234.0) orelse return error.TestExpectedEqual;
     switch (layout) {
         .diff_layout => |split| try std.testing.expect(split),
+        else => return error.TestExpectedEqual,
+    }
+
+    transcript_image_hits[0] = .{
+        .rect = .{ .x = 300.0, .y = 320.0, .w = 80.0, .h = 60.0 },
+        .path = "/tmp/chat-image.png",
+    };
+    transcript_image_hit_count = 1;
+    const image = transcriptActionAt(340.0, 350.0) orelse return error.TestExpectedEqual;
+    switch (image) {
+        .image_open => |path| try std.testing.expectEqualStrings("/tmp/chat-image.png", path),
         else => return error.TestExpectedEqual,
     }
 }
@@ -1187,6 +1212,7 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
                 .diff_file_open => |path| state.openTranscriptFileReference(path),
                 .diff_layout => |split| state.setDiffLayoutPreference(if (split) .split else .stacked),
                 .retry_command => |command| state.retryBangCommand(command),
+                .image_open => |path| state.openImageModal(path),
             }
             return true;
         }
@@ -3031,6 +3057,7 @@ fn renderProviderFailureActionCard(
     state.recordTranscriptCopyHit(copy_button, body, toolCopyIdentity(message_index, body));
 }
 
+// Renders clickable attachment previews beneath a committed chat message.
 fn renderTranscriptImages(state: *app_state.AppState, column: palette.Rect, y: f32, height: f32, message: app_state.ChatMessage, clip: palette.Rect) void {
     const count = transcriptImageCount(message);
     if (count == 0) return;
@@ -3052,6 +3079,12 @@ fn renderTranscriptImages(state: *app_state.AppState, column: palette.Rect, y: f
             .w = inner_w,
             .h = thumb_h,
         };
+        if (intersectClipRect(clip, frame)) |visible_frame| {
+            if (transcript_image_hit_count < transcript_image_hits.len) {
+                transcript_image_hits[transcript_image_hit_count] = .{ .rect = visible_frame, .path = image.path };
+                transcript_image_hit_count += 1;
+            }
+        }
         queueRoundedShellClipped(
             state,
             frame,

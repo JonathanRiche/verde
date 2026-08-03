@@ -1659,6 +1659,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (event.button.button == 1 and !event.button.down and state.palette_modal_pointer_captured) {
                 state.palette_modal_pointer_captured = false;
                 state.modal_text_drag_active = false;
+                state.endImageModalPan();
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -1824,6 +1825,16 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (ui_layout.handleSettingsModalWheel(
+                state,
+                @floatFromInt(input_fb_w),
+                @floatFromInt(input_fb_h),
+                event.wheel.mouse_x,
+                event.wheel.mouse_y,
+                event.wheel.y,
+            )) {
+                return true;
+            }
+            if (ui_layout.handleImageModalWheel(
                 state,
                 @floatFromInt(input_fb_w),
                 @floatFromInt(input_fb_h),
