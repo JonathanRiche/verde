@@ -1,6 +1,7 @@
 //! Linux browser backend implemented as an offscreen WPE WebKit helper process.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const browser_input = @import("../input.zig");
 const browser_queue = @import("../queue.zig");
 const browser_texture = @import("../texture.zig");
@@ -1104,6 +1105,7 @@ fn createProtocolPipe() ![2]std.posix.fd_t {
 }
 
 test "browser helper protocol pipes close across unrelated execs" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const pipe_fds = try createProtocolPipe();
     defer {
         _ = std.c.close(pipe_fds[0]);
