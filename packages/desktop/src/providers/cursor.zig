@@ -966,7 +966,7 @@ fn handleLiveSessionUpdate(
                 .locations = event.locations,
                 .raw = event.raw,
             } });
-            emitCursorDiffUpdate(allocator, update, request.stream_context, on_stream_event);
+            emitCursorDiffUpdate(allocator, update, event.output, request.stream_context, on_stream_event);
         }
     }
 }
@@ -974,21 +974,21 @@ fn handleLiveSessionUpdate(
 fn emitCursorDiffUpdate(
     allocator: std.mem.Allocator,
     update: std.json.Value,
+    serialized_output: ?[]const u8,
     context: ?*anyopaque,
     on_stream_event: *const fn (?*anyopaque, provider_types.StreamEvent) void,
 ) void {
     if (findCursorTextDiff(update)) |diff| {
-        const patch = cursorTextDiffPatchAlloc(allocator, diff) catch return;
-        defer allocator.free(patch);
-        if (patch.len == 0) return;
-        const files = [_]provider_types.StreamDiffFile{.{
-            .path = diff.path,
-            .additions = countUnifiedPatchLines(patch, '+'),
-            .deletions = countUnifiedPatchLines(patch, '-'),
-            .patch = patch,
-        }};
-        on_stream_event(context, .{ .diff = .{ .files = &files } });
-        return;
+        if (emitCursorTextDiffUpdate(allocator, diff, context, on_stream_event)) return;
+    }
+    if (serialized_output) |output| {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, output, .{}) catch null;
+        if (parsed) |*owned| {
+            defer owned.deinit();
+            if (findCursorTextDiff(owned.value)) |diff| {
+                if (emitCursorTextDiffUpdate(allocator, diff, context, on_stream_event)) return;
+            }
+        }
     }
 
     const path = findFirstStringForKeys(update, &.{ "path", "filePath", "relativePath", "file" }) orelse return;
@@ -1001,6 +1001,25 @@ fn emitCursorDiffUpdate(
         .patch = patch,
     }};
     on_stream_event(context, .{ .diff = .{ .files = &files } });
+}
+
+fn emitCursorTextDiffUpdate(
+    allocator: std.mem.Allocator,
+    diff: CursorTextDiff,
+    context: ?*anyopaque,
+    on_stream_event: *const fn (?*anyopaque, provider_types.StreamEvent) void,
+) bool {
+    const patch = cursorTextDiffPatchAlloc(allocator, diff) catch return false;
+    defer allocator.free(patch);
+    if (patch.len == 0) return false;
+    const files = [_]provider_types.StreamDiffFile{.{
+        .path = diff.path,
+        .additions = countUnifiedPatchLines(patch, '+'),
+        .deletions = countUnifiedPatchLines(patch, '-'),
+        .patch = patch,
+    }};
+    on_stream_event(context, .{ .diff = .{ .files = &files } });
+    return true;
 }
 
 const CursorTextDiff = struct {
@@ -2082,7 +2101,7 @@ test "Cursor tool updates emit structured diff snapshots" {
     defer parsed.deinit();
 
     var capture: TestDiffCapture = .{};
-    emitCursorDiffUpdate(std.testing.allocator, parsed.value, &capture, TestDiffCapture.handle);
+    emitCursorDiffUpdate(std.testing.allocator, parsed.value, null, &capture, TestDiffCapture.handle);
     try std.testing.expectEqual(@as(usize, 1), capture.count);
     try std.testing.expectEqualStrings("src/main.zig", capture.path.?);
     try std.testing.expectEqual(@as(i64, 2), capture.additions);
@@ -2097,7 +2116,7 @@ test "Cursor ACP text diff content emits a compact structured patch" {
     defer parsed.deinit();
 
     var capture: TestDiffCapture = .{};
-    emitCursorDiffUpdate(std.testing.allocator, parsed.value, &capture, TestDiffCapture.handle);
+    emitCursorDiffUpdate(std.testing.allocator, parsed.value, null, &capture, TestDiffCapture.handle);
     try std.testing.expectEqual(@as(usize, 1), capture.count);
     try std.testing.expectEqualStrings("src/main.zig", capture.path.?);
     try std.testing.expectEqual(@as(i64, 1), capture.additions);
@@ -2122,11 +2141,30 @@ test "Cursor ACP text diff content preserves new-file semantics" {
     defer parsed.deinit();
 
     var capture: TestDiffCapture = .{};
-    emitCursorDiffUpdate(std.testing.allocator, parsed.value, &capture, TestDiffCapture.handle);
+    emitCursorDiffUpdate(std.testing.allocator, parsed.value, null, &capture, TestDiffCapture.handle);
     try std.testing.expectEqual(@as(usize, 1), capture.count);
     try std.testing.expectEqual(@as(i64, 1), capture.additions);
     try std.testing.expectEqual(@as(i64, 0), capture.deletions);
     try std.testing.expect(std.mem.startsWith(u8, capture.patch.?, "--- /dev/null\n+++ b/src/new.zig\n"));
+}
+
+test "Cursor serialized tool output emits a structured text diff" {
+    const payload =
+        \\{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"completed"}
+    ;
+    const output =
+        \\[{"type":"diff","path":"tmp/temp.txt","oldText":"before\n","newText":"before\nafter\n"}]
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+
+    var capture: TestDiffCapture = .{};
+    emitCursorDiffUpdate(std.testing.allocator, parsed.value, output, &capture, TestDiffCapture.handle);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqualStrings("tmp/temp.txt", capture.path.?);
+    try std.testing.expectEqual(@as(i64, 1), capture.additions);
+    try std.testing.expectEqual(@as(i64, 0), capture.deletions);
+    try std.testing.expect(std.mem.indexOf(u8, capture.patch.?, "+after\n") != null);
 }
 
 test "cursorToolEvent preserves status-only ACP lifecycle updates" {
