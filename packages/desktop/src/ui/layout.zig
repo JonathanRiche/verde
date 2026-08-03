@@ -37,6 +37,18 @@ pub fn handleSettingsModalWheel(state: *runtime.AppState, width: f32, height: f3
     return settings_modal.handleWheel(state, width, height, x, y, wheel_y);
 }
 
+/// Zooms the attachment preview while the pointer is over its canvas.
+pub fn handleImageModalWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y: f32, wheel_y: f32) bool {
+    if (state.modal_image_path == null) return false;
+    if (!pointInRect(x, y, imageModalCanvasRect(width, height))) return false;
+    if (wheel_y > 0.0) {
+        state.adjustImageModalZoom(1);
+    } else if (wheel_y < 0.0) {
+        state.adjustImageModalZoom(-1);
+    }
+    return true;
+}
+
 /// Rebuilds palette modal hit targets from the current window size **before** SDL input is
 /// processed. `renderRoot` runs after `processEvents`, so hits must not depend on that order.
 pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32) void {
@@ -496,6 +508,9 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .provider_onboarding_recheck => state.recheckProviderReadiness(),
             .provider_onboarding_open_guide => state.openProviderSetupGuide(),
             .image_close => state.closeImageModal(),
+            .image_zoom_out => state.adjustImageModalZoom(-1),
+            .image_zoom_in => state.adjustImageModalZoom(1),
+            .image_pan_canvas => state.beginImageModalPan(x, y),
             .project_rename_cancel => state.cancelProjectRename(),
             .project_rename_submit => state.finishProjectRename(),
             .transcript_close => state.closeTranscriptSelectionModal(),
@@ -607,7 +622,8 @@ fn focusModalInput(state: *runtime.AppState, focus: runtime.PaletteModalTextFocu
 }
 
 /// Routes modal pointer motion and reports whether the workspace is occluded.
-pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, _: f32) bool {
+pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) bool {
+    if (state.updateImageModalPan(x, y)) return true;
     if (state.modal_text_drag_active and state.palette_modal_text_focus != .none) {
         const value = focusedValue(state);
         const rect = state.modal_text_input_rect;
@@ -892,6 +908,35 @@ fn registerImageModalHits(state: *runtime.AppState, width: f32, height: f32) voi
     const close_size: f32 = 28.0;
     const close_rect: palette.Rect = .{ .x = content.x + content.w - close_size, .y = content.y, .w = close_size, .h = close_size };
     queueModalHit(state, close_rect, .image_close, 0);
+    const zoom_gap = theme.scaledUi(6.0);
+    const zoom_label_w = theme.scaledUi(54.0);
+    const zoom_out_rect: palette.Rect = .{
+        .x = close_rect.x - 12.0 - close_size * 2.0 - zoom_label_w - zoom_gap * 2.0,
+        .y = content.y,
+        .w = close_size,
+        .h = close_size,
+    };
+    const zoom_in_rect: palette.Rect = .{
+        .x = zoom_out_rect.x + close_size + zoom_gap + zoom_label_w + zoom_gap,
+        .y = content.y,
+        .w = close_size,
+        .h = close_size,
+    };
+    queueModalHit(state, zoom_out_rect, .image_zoom_out, 0);
+    queueModalHit(state, zoom_in_rect, .image_zoom_in, 0);
+    if (state.modal_image_zoom > 1.0) {
+        queueModalHit(state, imageModalCanvasRect(width, height), .image_pan_canvas, 0);
+    }
+}
+
+fn imageModalCanvasRect(width: f32, height: f32) palette.Rect {
+    const modal_padding_x: f32 = 22.0;
+    const modal_padding_y: f32 = 20.0;
+    const modal_width = @min(width * 0.78, 980.0);
+    const modal_height = @min(height * 0.82, 760.0);
+    const modal: palette.Rect = .{ .x = (width - modal_width) * 0.5, .y = (height - modal_height) * 0.5, .w = modal_width, .h = modal_height };
+    const content: palette.Rect = .{ .x = modal.x + modal_padding_x, .y = modal.y + modal_padding_y, .w = modal.w - modal_padding_x * 2.0, .h = modal.h - modal_padding_y * 2.0 };
+    return .{ .x = content.x, .y = content.y + theme.scaledUi(62.0), .w = content.w, .h = content.h - theme.scaledUi(62.0) };
 }
 
 fn registerTranscriptSelectionModalHits(state: *runtime.AppState, width: f32, height: f32) void {
@@ -1269,13 +1314,46 @@ fn renderImageModal(state: *runtime.AppState, width: f32, height: f32) void {
     const close_size: f32 = 28.0;
     const header_gap: f32 = 12.0;
     const content: palette.Rect = .{ .x = modal.x + modal_padding_x, .y = modal.y + modal_padding_y, .w = modal.w - modal_padding_x * 2.0, .h = modal.h - modal_padding_y * 2.0 };
-    const header_text_width = @max(content.w - close_size - header_gap, 160.0);
     const close_rect: palette.Rect = .{ .x = content.x + content.w - close_size, .y = content.y, .w = close_size, .h = close_size };
+    const zoom_gap = theme.scaledUi(6.0);
+    const zoom_label_w = theme.scaledUi(54.0);
+    const zoom_out_rect: palette.Rect = .{
+        .x = close_rect.x - header_gap - close_size * 2.0 - zoom_label_w - zoom_gap * 2.0,
+        .y = content.y,
+        .w = close_size,
+        .h = close_size,
+    };
+    const zoom_label_rect: palette.Rect = .{
+        .x = zoom_out_rect.x + close_size + zoom_gap,
+        .y = content.y,
+        .w = zoom_label_w,
+        .h = close_size,
+    };
+    const zoom_in_rect: palette.Rect = .{
+        .x = zoom_label_rect.x + zoom_label_w + zoom_gap,
+        .y = content.y,
+        .w = close_size,
+        .h = close_size,
+    };
+    const header_text_width = @max(zoom_out_rect.x - content.x - header_gap, 160.0);
     drawActionButton(state, close_rect, "x", theme.withAlpha(theme.COLOR_PANEL_MUTED, 220));
+    drawActionButton(state, zoom_out_rect, "-", theme.withAlpha(theme.COLOR_PANEL_MUTED, 220));
+    drawActionButton(state, zoom_in_rect, "+", theme.withAlpha(theme.COLOR_PANEL_MUTED, 220));
+    var zoom_label_buf: [16]u8 = undefined;
+    const zoom_percent: i32 = @intFromFloat(state.modal_image_zoom * 100.0);
+    const zoom_label = std.fmt.bufPrint(&zoom_label_buf, "{d}%", .{zoom_percent}) catch "100%";
+    const zoom_font_size = theme.scaledUi(13.0);
+    const zoom_label_text_w = @as(f32, @floatFromInt(zoom_label.len)) * zoom_font_size * 0.52;
+    queuePaletteText(state, .{
+        .x = zoom_label_rect.x + @max((zoom_label_rect.w - zoom_label_text_w) * 0.5, 0.0),
+        .y = zoom_label_rect.y + (zoom_label_rect.h - zoom_font_size * 1.25) * 0.5,
+        .w = @min(zoom_label_text_w, zoom_label_rect.w),
+        .h = zoom_font_size * 1.25,
+    }, zoom_label, paletteColor(theme.COLOR_TEXT_MUTED), zoom_font_size, modal);
     queuePaletteText(state, .{ .x = content.x, .y = content.y, .w = header_text_width, .h = theme.scaledUi(22.0) }, std.fs.path.basename(modal_path), paletteColor(theme.COLOR_WHITE), theme.scaledUi(16.0), modal);
     queuePaletteText(state, .{ .x = content.x, .y = content.y + theme.scaledUi(24.0), .w = header_text_width, .h = theme.scaledUi(20.0) }, modal_path, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), modal);
 
-    const canvas: palette.Rect = .{ .x = content.x, .y = content.y + theme.scaledUi(62.0), .w = content.w, .h = content.h - theme.scaledUi(62.0) };
+    const canvas = imageModalCanvasRect(width, height);
     queuePaletteRoundedRect(state, canvas, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(10.0));
     queuePaletteBorder(state, canvas, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(10.0), theme.scaledUi(1.0));
     const image_max_w = @max(canvas.w - theme.scaledUi(32.0), 80.0);
@@ -1283,9 +1361,19 @@ fn renderImageModal(state: *runtime.AppState, width: f32, height: f32) void {
 
     if (texture) |cached| {
         const dims = runtime.scaledImageSize(cached.width, cached.height, image_max_w, image_max_h);
+        const zoomed_w = dims[0] * state.modal_image_zoom;
+        const zoomed_h = dims[1] * state.modal_image_zoom;
+        const max_pan_x = @max((zoomed_w - canvas.w) * 0.5, 0.0);
+        const max_pan_y = @max((zoomed_h - canvas.h) * 0.5, 0.0);
+        state.clampImageModalPan(max_pan_x, max_pan_y);
         state.palette_overlay_batch.image(
             state.allocator,
-            .{ .x = canvas.x + (canvas.w - dims[0]) * 0.5, .y = canvas.y + (canvas.h - dims[1]) * 0.5, .w = dims[0], .h = dims[1] },
+            .{
+                .x = canvas.x + (canvas.w - zoomed_w) * 0.5 + state.modal_image_pan_x,
+                .y = canvas.y + (canvas.h - zoomed_h) * 0.5 + state.modal_image_pan_y,
+                .w = zoomed_w,
+                .h = zoomed_h,
+            },
             palette.TextureId.init(cached.texture_id),
             .{ .x = 0.0, .y = 0.0, .w = 1.0, .h = 1.0 },
             paletteColor(theme.COLOR_WHITE),

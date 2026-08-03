@@ -113,6 +113,9 @@ pub const PaletteModalAction = enum {
     provider_onboarding_recheck,
     provider_onboarding_open_guide,
     image_close,
+    image_zoom_out,
+    image_zoom_in,
+    image_pan_canvas,
     project_rename_cancel,
     project_rename_submit,
     transcript_close,
@@ -1318,6 +1321,12 @@ pub const AppState = struct {
     vscode_logo_texture: ?CachedImageTexture,
     zed_logo_texture: ?CachedImageTexture,
     modal_image_path: ?[:0]const u8,
+    modal_image_zoom: f32,
+    modal_image_pan_x: f32,
+    modal_image_pan_y: f32,
+    modal_image_pan_drag_active: bool,
+    modal_image_pan_last_x: f32,
+    modal_image_pan_last_y: f32,
     app_config: app_config.AppConfig,
     rename_project_index: ?usize,
     rename_thread_index: ?usize,
@@ -1443,6 +1452,12 @@ pub const AppState = struct {
             .vscode_logo_texture = null,
             .zed_logo_texture = null,
             .modal_image_path = null,
+            .modal_image_zoom = 1.0,
+            .modal_image_pan_x = 0.0,
+            .modal_image_pan_y = 0.0,
+            .modal_image_pan_drag_active = false,
+            .modal_image_pan_last_x = 0.0,
+            .modal_image_pan_last_y = 0.0,
             .app_config = initial_config,
             .rename_project_index = null,
             .rename_thread_index = null,
@@ -3680,18 +3695,74 @@ pub const AppState = struct {
     pub fn openImageModal(self: *AppState, path: [:0]const u8) void {
         if (self.modal_image_path) |existing| {
             if (std.mem.eql(u8, existing, path)) {
+                self.modal_image_zoom = 1.0;
+                self.resetImageModalPan();
                 return;
             }
             self.allocator.free(existing);
         }
         self.modal_image_path = self.allocator.dupeZ(u8, path) catch return;
+        self.modal_image_zoom = 1.0;
+        self.resetImageModalPan();
+    }
+
+    /// Changes the open attachment preview zoom in fixed 25% steps.
+    pub fn adjustImageModalZoom(self: *AppState, steps: i8) void {
+        if (self.modal_image_path == null or steps == 0) return;
+        const next = self.modal_image_zoom + @as(f32, @floatFromInt(steps)) * 0.25;
+        self.modal_image_zoom = @max(0.5, @min(next, 4.0));
+        if (self.modal_image_zoom <= 1.0) self.resetImageModalPan();
+        self.markDirty();
+    }
+
+    /// Starts direct manipulation of a zoomed attachment preview.
+    pub fn beginImageModalPan(self: *AppState, x: f32, y: f32) void {
+        if (self.modal_image_path == null or self.modal_image_zoom <= 1.0) return;
+        self.modal_image_pan_drag_active = true;
+        self.modal_image_pan_last_x = x;
+        self.modal_image_pan_last_y = y;
+    }
+
+    /// Applies pointer movement to the open attachment preview.
+    pub fn updateImageModalPan(self: *AppState, x: f32, y: f32) bool {
+        if (!self.modal_image_pan_drag_active) return false;
+        const delta_x = x - self.modal_image_pan_last_x;
+        const delta_y = y - self.modal_image_pan_last_y;
+        self.modal_image_pan_last_x = x;
+        self.modal_image_pan_last_y = y;
+        if (delta_x == 0.0 and delta_y == 0.0) return true;
+        self.modal_image_pan_x += delta_x;
+        self.modal_image_pan_y += delta_y;
+        self.markDirty();
+        return true;
+    }
+
+    /// Ends direct manipulation of the attachment preview.
+    pub fn endImageModalPan(self: *AppState) void {
+        self.modal_image_pan_drag_active = false;
+    }
+
+    /// Keeps the preview positioned over its canvas without exposing empty space.
+    pub fn clampImageModalPan(self: *AppState, max_x: f32, max_y: f32) void {
+        self.modal_image_pan_x = std.math.clamp(self.modal_image_pan_x, -max_x, max_x);
+        self.modal_image_pan_y = std.math.clamp(self.modal_image_pan_y, -max_y, max_y);
     }
 
     pub fn closeImageModal(self: *AppState) void {
         if (self.modal_image_path) |path| {
             self.allocator.free(path);
             self.modal_image_path = null;
+            self.modal_image_zoom = 1.0;
+            self.resetImageModalPan();
         }
+    }
+
+    fn resetImageModalPan(self: *AppState) void {
+        self.modal_image_pan_x = 0.0;
+        self.modal_image_pan_y = 0.0;
+        self.modal_image_pan_drag_active = false;
+        self.modal_image_pan_last_x = 0.0;
+        self.modal_image_pan_last_y = 0.0;
     }
 
     pub const closeTranscriptSelectionModal = transcript_controller.closeTranscriptSelectionModal;
@@ -5887,6 +5958,9 @@ pub const AppState = struct {
                 .provider_onboarding_recheck,
                 .provider_onboarding_open_guide,
                 .image_close,
+                .image_zoom_out,
+                .image_zoom_in,
+                .image_pan_canvas,
                 .project_rename_cancel,
                 .project_rename_submit,
                 .transcript_close,
