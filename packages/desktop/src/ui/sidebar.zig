@@ -1574,21 +1574,19 @@ fn renderOpenPaneRow(
                     if (s.status_changed_at_ms > 0) status_started_at_ms = s.status_changed_at_ms;
                 }
             }
-            // Detect a running agent (Claude/Codex/Amp/etc.) from the surface
-            // provider or the foreground process name, and draw a split
-            // provider+terminal glyph for it; otherwise a plain terminal glyph.
-            var agent_provider: ?TerminalAgentProvider = if (surface) |s| terminalAgentProviderFromProvider(s.provider) else null;
-            if (agent_provider == null) {
-                if (state.projectTerminalDock(project_index, ref.dock_id)) |dock| {
-                    // Live foreground process when running, else the provider
-                    // pinned by the notify hook (persisted across restarts,
-                    // available before the agent process is revived).
-                    if (dock.activeForegroundProcessName(&comm_buf)) |comm| agent_provider = providerFromComm(comm);
-                    if (agent_provider == null) {
-                        if (dock.activeTabPinnedProvider()) |name| agent_provider = std.meta.stringToEnum(TerminalAgentProvider, name);
-                    }
-                }
+            // Prefer the live process over retained surface metadata so an
+            // already-stale hook claim cannot mask the agent actually running.
+            var foreground_process: ?[]const u8 = null;
+            var pinned_provider: ?[]const u8 = null;
+            if (state.projectTerminalDock(project_index, ref.dock_id)) |dock| {
+                foreground_process = dock.activeForegroundProcessName(&comm_buf);
+                pinned_provider = dock.activeTabPinnedProvider();
             }
+            const agent_provider = terminalAgentProviderForMetadata(
+                if (surface) |s| s.provider else null,
+                foreground_process,
+                pinned_provider,
+            );
             if (agent_provider) |prov| {
                 // Neutral/white prompt mark so it contrasts with the provider logo
                 // instead of blending into it (the accent shares the logo's hue).
@@ -2086,6 +2084,19 @@ fn terminalAgentProviderFromProvider(provider: ?SurfaceProvider) ?TerminalAgentP
     };
 }
 
+fn terminalAgentProviderForMetadata(
+    surface_provider: ?SurfaceProvider,
+    foreground_process: ?[]const u8,
+    pinned_provider: ?[]const u8,
+) ?TerminalAgentProvider {
+    if (foreground_process) |comm| {
+        if (providerFromComm(comm)) |provider| return provider;
+    }
+    if (terminalAgentProviderFromProvider(surface_provider)) |provider| return provider;
+    if (pinned_provider) |name| return std.meta.stringToEnum(TerminalAgentProvider, name);
+    return null;
+}
+
 /// Draws a provider logo (or letter fallback) fitted within `box`.
 fn queuePaletteProviderGlyphInRect(state: *runtime.AppState, provider: TerminalAgentProvider, box: palette.Rect, clip: ?palette.Rect) void {
     const texture = switch (provider) {
@@ -2198,6 +2209,13 @@ test "done pane status uses the themed success treatment" {
     var label_buf: [24]u8 = undefined;
     try std.testing.expectEqualStrings("Done", paneStatusLabelText(&label_buf, .done, false, null));
     try std.testing.expectEqual(theme.success(), paneStatusColor(.done, false).?);
+}
+
+test "live Amp process wins over stale Cursor terminal metadata" {
+    try std.testing.expectEqual(
+        TerminalAgentProvider.amp,
+        terminalAgentProviderForMetadata(.cursor, "amp", "cursor").?,
+    );
 }
 
 test "ACTIVE rows put durable completions first in finish order" {

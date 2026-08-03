@@ -119,11 +119,19 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
     if (update.dock_id) |value| s.dock_id = value;
     if (update.pane_id) |value| s.pane_id = value;
     if (update.provider) |value| {
+        const dock = terminalDockForSurface(self, s);
+        const pinned_provider = if (dock) |surface_dock| surface_dock.activeTabPinnedProvider() else null;
+        if (!surfaceProviderClaimMatchesPin(value, pinned_provider)) {
+            // Ignore the whole hook event: its status and title belong to the
+            // nested agent too, not only its provider logo.
+            log.debug("ignored {s} surface event for terminal pinned to {s}", .{ @tagName(value), pinned_provider.? });
+            return s;
+        }
         s.provider = value;
         // Pin the provider on the terminal tab so the sidebar can draw the
         // logo after a restart, before the agent process revives.
-        if (terminalDockForSurface(self, s)) |dock| {
-            _ = dock.setActiveTabPinnedProvider(self.allocator, @tagName(value));
+        if (dock) |surface_dock| {
+            _ = surface_dock.setActiveTabPinnedProvider(self.allocator, @tagName(value));
         }
     }
     if (update.provider_thread_id) |value| try replaceOwnedOptionalSlice(self.allocator, &s.provider_thread_id, value);
@@ -230,6 +238,13 @@ fn terminalDockForSurface(self: anytype, surface: *const SurfaceState) ?*termina
         return self.projectTerminalDockMutable(idx, surface.dock_id);
     }
     return null;
+}
+
+// Provider hooks inherit terminal environment variables into child commands.
+// A nested agent must not claim the parent agent's explicitly pinned surface.
+fn surfaceProviderClaimMatchesPin(provider: SurfaceProvider, pinned_provider: ?[]const u8) bool {
+    const pinned = pinned_provider orelse return true;
+    return std.mem.eql(u8, pinned, @tagName(provider));
 }
 
 // Resolves which agent provider a surface belongs to, for the notification
@@ -407,4 +422,10 @@ fn replaceOwnedOptionalSlice(allocator: std.mem.Allocator, dest: *?[]u8, value: 
     const next = if (value) |v| try allocator.dupe(u8, v) else null;
     if (dest.*) |old| allocator.free(old);
     dest.* = next;
+}
+
+test "nested provider cannot claim a terminal pinned to another agent" {
+    try std.testing.expect(surfaceProviderClaimMatchesPin(.cursor, null));
+    try std.testing.expect(surfaceProviderClaimMatchesPin(.cursor, "cursor"));
+    try std.testing.expect(!surfaceProviderClaimMatchesPin(.cursor, "amp"));
 }
