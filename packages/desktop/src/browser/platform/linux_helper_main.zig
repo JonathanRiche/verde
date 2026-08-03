@@ -447,6 +447,7 @@ fn encodeModifierMask(command: ipc.Command) c_uint {
 const TestContextMenuPayload = struct {
     x: f32 = 0,
     y: f32 = 0,
+    link_url: ?[]const u8 = null,
     items: []const TestContextMenuItem = &.{},
 };
 

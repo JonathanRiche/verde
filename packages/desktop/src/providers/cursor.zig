@@ -2019,7 +2019,8 @@ test "makeInitializeRequestAlloc writes ACP initialize JSON-RPC" {
     defer std.testing.allocator.free(json);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(i64, 42), responseId(parsed.value).?);
+    try std.testing.expectEqual(@as(i64, 42), getOptionalObjectInteger(parsed.value, "id").?);
+    try std.testing.expect(responseId(parsed.value) == null);
     try std.testing.expectEqualStrings("initialize", getOptionalObjectString(parsed.value, "method").?);
 }
 
