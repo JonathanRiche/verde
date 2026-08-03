@@ -1881,7 +1881,7 @@ fn renderPaneCanvas(state: *app_state.AppState, pane_rect: palette.Rect) void {
                 snapRect(pane_rect),
                 palette.TextureId.init(pane_texture.texture_id),
                 .{ .x = 0.0, .y = 0.0, .w = 1.0, .h = 1.0 },
-                paletteColor(theme.COLOR_WHITE),
+                browserTextureTint(),
                 null,
             ) catch {};
             return;
@@ -1890,6 +1890,11 @@ fn renderPaneCanvas(state: *app_state.AppState, pane_rect: palette.Rect) void {
 
     // Fall back to the full pane bounds while the browser frame has not arrived yet.
     renderPanePlaceholder(state, pane_rect);
+}
+
+fn browserTextureTint() palette.Color {
+    // Browser frames are already composited; a theme color would recolor the page.
+    return palette.Color.white;
 }
 
 fn renderWrappedPaletteText(
@@ -2005,4 +2010,12 @@ test "browser security presentation distinguishes remote local and internal URLs
     try std.testing.expectEqual(BrowserSecurityState.insecure, browserSecurityState("http://example.com"));
     try std.testing.expectEqual(BrowserSecurityState.internal, browserSecurityState("about:blank"));
     try std.testing.expectEqual(BrowserSecurityState.unknown, browserSecurityState(null));
+}
+
+test "browser texture tint remains color neutral" {
+    const tint = browserTextureTint();
+    try std.testing.expectEqual(@as(f32, 1.0), tint.r);
+    try std.testing.expectEqual(@as(f32, 1.0), tint.g);
+    try std.testing.expectEqual(@as(f32, 1.0), tint.b);
+    try std.testing.expectEqual(@as(f32, 1.0), tint.a);
 }
