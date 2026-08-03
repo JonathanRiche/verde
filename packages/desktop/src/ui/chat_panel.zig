@@ -4414,18 +4414,28 @@ fn renderToolCallGroup(
         .h = status_dia,
     };
     const normal_status_color = if (running) theme.COLOR_GREEN else theme.COLOR_TEXT_MUTED;
-    const mixed_result = failed and completed_count > 0;
-    const status_color = if (failed and !mixed_result) theme.COLOR_DIFF_REMOVE else normal_status_color;
+    const partial_failure = failed_count > 0 and failed_count < count;
+    const status_color = if (failed and !partial_failure) theme.COLOR_DIFF_REMOVE else normal_status_color;
     queueRoundedClipped(state, status_rect, paletteColor(status_color), status_dia * 0.5, clip);
-    if (mixed_result) {
-        const failed_half: palette.Rect = .{
-            .x = status_rect.x + status_rect.w * 0.5,
-            .y = status_rect.y,
-            .w = status_rect.w * 0.5,
-            .h = status_rect.h,
-        };
-        if (intersectClipRect(clip, failed_half)) |failed_clip| {
-            queueRoundedClipped(state, status_rect, paletteColor(theme.COLOR_DIFF_REMOVE), status_dia * 0.5, failed_clip);
+    if (partial_failure) {
+        const center: palette.draw.Vec2 = .{ .x = status_rect.x + status_rect.w * 0.5, .y = status_rect.y + status_rect.h * 0.5 };
+        const radius = status_dia * 0.5;
+        const failed_ratio = @as(f32, @floatFromInt(failed_count)) / @as(f32, @floatFromInt(count));
+        const sweep = std.math.tau * failed_ratio;
+        const segment_angle = std.math.tau / 24.0;
+        var angle: f32 = -std.math.pi / 2.0;
+        const end_angle = angle + sweep;
+        while (angle < end_angle) {
+            const next_angle = @min(angle + segment_angle, end_angle);
+            queueTriangleClipped(
+                state,
+                center,
+                .{ .x = center.x + std.math.cos(angle) * radius, .y = center.y + std.math.sin(angle) * radius },
+                .{ .x = center.x + std.math.cos(next_angle) * radius, .y = center.y + std.math.sin(next_angle) * radius },
+                paletteColor(theme.COLOR_DIFF_REMOVE),
+                clip,
+            );
+            angle = next_angle;
         }
     }
 
