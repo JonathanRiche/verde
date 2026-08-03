@@ -28,6 +28,7 @@ pub const MouseEvent = struct {
     pressed: bool = false,
     wheel_x: f32 = 0.0,
     wheel_y: f32 = 0.0,
+    wheel_multiplier: f32 = 1.0,
     ctrl: bool = false,
     shift: bool = false,
     alt: bool = false,

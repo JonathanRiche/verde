@@ -36,6 +36,7 @@ pub const Command = struct {
     y: f32 = 0.0,
     wheel_x: f32 = 0.0,
     wheel_y: f32 = 0.0,
+    wheel_multiplier: f32 = 1.0,
     screen_x: i32 = 0,
     screen_y: i32 = 0,
     button: u8 = 0,

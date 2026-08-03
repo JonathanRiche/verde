@@ -129,6 +129,7 @@ pub const AppConfig = struct {
     installed_themes: []InstalledTheme = &.{},
     default_open_action: DefaultOpenAction = .folder,
     link_open_target: LinkOpenTarget = .verde_browser,
+    browser_fast_scrolling_enabled: bool = true,
     file_links_in_neovim_pane: bool = false,
     terminal_launch_profiles: []TerminalLaunchProfileConfig = &.{},
     tool_call_group_preference: ToolCallGroupPreference = .collapsed,
@@ -312,6 +313,7 @@ pub fn saveAppConfig(allocator: std.mem.Allocator, config: *const AppConfig) !vo
     try writeThemeSection(tree_allocator, &root.object, config);
     try writeInstalledThemesSection(tree_allocator, &root.object, config);
     try writeOpenSection(tree_allocator, &root.object, config);
+    try writeBrowserSection(tree_allocator, &root.object, config);
     try writeTerminalSection(tree_allocator, &root.object, config);
     try writeTranscriptSection(tree_allocator, &root.object, config);
     try writeChatSection(tree_allocator, &root.object, config);
@@ -446,6 +448,11 @@ fn writeOpenSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, c
     try open_object.put(allocator, "file_links_in_neovim_pane", .{ .bool = config.file_links_in_neovim_pane });
 }
 
+fn writeBrowserSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
+    const browser_object = try objectSection(allocator, object, "browser");
+    try browser_object.put(allocator, "fast_scrolling", .{ .bool = config.browser_fast_scrolling_enabled });
+}
+
 fn writeTerminalSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
     const terminal_object = try objectSection(allocator, object, "terminal");
 
@@ -539,6 +546,9 @@ fn applyAppOverrides(allocator: std.mem.Allocator, config: *AppConfig, root: std
     if (root.object.get("open")) |open_value| {
         applyOpenOverrides(allocator, config, open_value);
     }
+    if (root.object.get("browser")) |browser_value| {
+        applyBrowserOverrides(config, browser_value);
+    }
     if (root.object.get("terminal")) |terminal_value| {
         applyTerminalOverrides(allocator, config, terminal_value);
     }
@@ -560,6 +570,20 @@ fn applyAppOverrides(allocator: std.mem.Allocator, config: *AppConfig, root: std
     }
     if (root.object.get("integrations")) |integrations_value| {
         applyIntegrationsOverrides(config, integrations_value);
+    }
+}
+
+fn applyBrowserOverrides(config: *AppConfig, browser_value: std.json.Value) void {
+    if (browser_value != .object) {
+        log.warn("browser must be an object when provided", .{});
+        return;
+    }
+    if (browser_value.object.get("fast_scrolling")) |enabled_value| {
+        if (enabled_value == .bool) {
+            config.browser_fast_scrolling_enabled = enabled_value.bool;
+        } else {
+            log.warn("browser.fast_scrolling must be a boolean when provided", .{});
+        }
     }
 }
 
@@ -1172,6 +1196,18 @@ test "app config accepts link open target" {
     applyAppOverrides(std.testing.allocator, &config, root.value);
 
     try std.testing.expectEqual(LinkOpenTarget.system_browser, config.link_open_target);
+}
+
+test "app config defaults to fast browser scrolling and accepts override" {
+    var root = try parseTestRoot("{\"browser\":{\"fast_scrolling\":false}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expect(config.browser_fast_scrolling_enabled);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expect(!config.browser_fast_scrolling_enabled);
 }
 
 test "app config accepts workspace Neovim file link preference" {

@@ -26,7 +26,7 @@ extern fn verde_browser_linux_focus(browser: ?*RawBrowser) c_int;
 extern fn verde_browser_linux_blur(browser: ?*RawBrowser) c_int;
 extern fn verde_browser_linux_mouse_move(browser: ?*RawBrowser, x: f64, y: f64, modifiers: c_uint) c_int;
 extern fn verde_browser_linux_mouse_button(browser: ?*RawBrowser, x: f64, y: f64, button: c_uint, down: c_int, modifiers: c_uint) c_int;
-extern fn verde_browser_linux_mouse_wheel(browser: ?*RawBrowser, x: f64, y: f64, delta_x: f64, delta_y: f64, modifiers: c_uint) c_int;
+extern fn verde_browser_linux_mouse_wheel(browser: ?*RawBrowser, x: f64, y: f64, delta_x: f64, delta_y: f64, wheel_multiplier: f64, modifiers: c_uint) c_int;
 extern fn verde_browser_linux_key_input(browser: ?*RawBrowser, key_code: c_uint, down: c_int, modifiers: c_uint) c_int;
 extern fn verde_browser_linux_text_input(browser: ?*RawBrowser, text: [*:0]const u8, modifiers: c_uint) c_int;
 extern fn verde_browser_linux_context_menu_activate(browser: ?*RawBrowser, index: c_uint) c_int;
@@ -44,9 +44,9 @@ extern fn verde_browser_linux_test_disables_process_swapping() c_int;
 extern fn verde_browser_linux_test_disables_async_overflow_scrolling() c_int;
 extern fn verde_browser_linux_test_deferred_frame_publishes_on_release() c_int;
 extern fn verde_browser_linux_test_wheel_event_is_smooth(delta_x: f64, delta_y: f64) c_int;
-extern fn verde_browser_linux_test_wheel_delta_scale(delta_x: f64, delta_y: f64) f64;
+extern fn verde_browser_linux_test_wheel_delta_scale(delta_x: f64, delta_y: f64, wheel_multiplier: f64) f64;
 extern fn verde_browser_linux_test_wheel_axis(delta_x: f64, delta_y: f64) c_uint;
-extern fn verde_browser_linux_test_wheel_value(delta_x: f64, delta_y: f64) i32;
+extern fn verde_browser_linux_test_wheel_value(delta_x: f64, delta_y: f64, wheel_multiplier: f64) i32;
 
 const Mutex = struct {
     inner: std.atomic.Mutex = .unlocked,
@@ -203,6 +203,7 @@ fn stdinReaderMain(context: *ReaderContext) !void {
             .y = parsed.value.y,
             .wheel_x = parsed.value.wheel_x,
             .wheel_y = parsed.value.wheel_y,
+            .wheel_multiplier = parsed.value.wheel_multiplier,
             .screen_x = parsed.value.screen_x,
             .screen_y = parsed.value.screen_y,
             .button = parsed.value.button,
@@ -313,6 +314,7 @@ fn applyCommand(allocator: std.mem.Allocator, browser: *RawBrowser, command: ipc
             command.y,
             command.wheel_x,
             command.wheel_y,
+            command.wheel_multiplier,
             encodeModifierMask(command),
         ),
         .key_input => _ = verde_browser_linux_key_input(
@@ -542,11 +544,11 @@ test "WPE publishes the newest deferred frame when a shared slot is released" {
 
 test "WPE wheel input keeps discrete steps separate from smooth deltas" {
     try std.testing.expectEqual(@as(c_int, 0), verde_browser_linux_test_wheel_event_is_smooth(0.0, -1.0));
-    try std.testing.expectEqual(@as(f64, 120.0), verde_browser_linux_test_wheel_delta_scale(0.0, -1.0));
+    try std.testing.expectEqual(@as(f64, 120.0), verde_browser_linux_test_wheel_delta_scale(0.0, -1.0, 1.0));
     try std.testing.expectEqual(@as(c_uint, 0), verde_browser_linux_test_wheel_axis(0.0, -1.0));
-    try std.testing.expectEqual(@as(i32, -120), verde_browser_linux_test_wheel_value(0.0, -1.0));
+    try std.testing.expectEqual(@as(i32, -120), verde_browser_linux_test_wheel_value(0.0, -1.0, 1.0));
     try std.testing.expectEqual(@as(c_int, 1), verde_browser_linux_test_wheel_event_is_smooth(0.0, -0.25));
-    try std.testing.expectEqual(@as(f64, 96.0), verde_browser_linux_test_wheel_delta_scale(0.0, -0.25));
+    try std.testing.expectEqual(@as(f64, 144.0), verde_browser_linux_test_wheel_delta_scale(0.0, -0.25, 1.5));
     try std.testing.expectEqual(@as(c_uint, 1), verde_browser_linux_test_wheel_axis(1.0, 0.0));
-    try std.testing.expectEqual(@as(i32, 120), verde_browser_linux_test_wheel_value(1.0, 0.0));
+    try std.testing.expectEqual(@as(i32, 180), verde_browser_linux_test_wheel_value(1.0, 0.0, 1.5));
 }

@@ -56,6 +56,7 @@ pub const Draft = struct {
     theme_choice: usize = 1,
     open_action: OpenAction = .folder,
     link_open_target: app_config.LinkOpenTarget = .verde_browser,
+    browser_fast_scrolling_enabled: bool = true,
     file_links_in_neovim_pane: bool = false,
     tool_call_group_preference: app_config.ToolCallGroupPreference = .collapsed,
     diff_layout_preference: app_config.DiffLayoutPreference = .stacked,
@@ -225,6 +226,7 @@ pub fn syncSettingsDraftFromConfig(self: anytype) void {
         .theme_choice = self.app_config.themeChoiceIndex(),
         .open_action = settingsOpenActionFromConfig(self.app_config.default_open_action),
         .link_open_target = self.app_config.link_open_target,
+        .browser_fast_scrolling_enabled = self.app_config.browser_fast_scrolling_enabled,
         .file_links_in_neovim_pane = self.app_config.file_links_in_neovim_pane,
         .tool_call_group_preference = self.app_config.tool_call_group_preference,
         .diff_layout_preference = self.app_config.diff_layout_preference,
@@ -246,6 +248,7 @@ pub fn isSettingsDraftDirty(self: anytype) bool {
     if (draft.terminal_font_size != self.app_config.terminal_font_size) return true;
     if (draft.theme_choice != self.app_config.themeChoiceIndex()) return true;
     if (draft.link_open_target != self.app_config.link_open_target) return true;
+    if (draft.browser_fast_scrolling_enabled != self.app_config.browser_fast_scrolling_enabled) return true;
     if (draft.file_links_in_neovim_pane != self.app_config.file_links_in_neovim_pane) return true;
     if (draft.tool_call_group_preference != self.app_config.tool_call_group_preference) return true;
     if (draft.diff_layout_preference != self.app_config.diff_layout_preference) return true;
@@ -365,6 +368,7 @@ pub fn saveSettingsModal(self: anytype) !void {
     self.app_config.font_size = theme.clampf(self.settings_controller.draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE);
     self.app_config.terminal_font_size = theme.clampf(self.settings_controller.draft.terminal_font_size, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE);
     self.app_config.link_open_target = self.settings_controller.draft.link_open_target;
+    self.app_config.browser_fast_scrolling_enabled = self.settings_controller.draft.browser_fast_scrolling_enabled;
     self.app_config.file_links_in_neovim_pane = self.settings_controller.draft.file_links_in_neovim_pane;
     self.app_config.tool_call_group_preference = self.settings_controller.draft.tool_call_group_preference;
     self.app_config.diff_layout_preference = self.settings_controller.draft.diff_layout_preference;

@@ -1516,6 +1516,7 @@ pub fn handleBrowserMouse(self: anytype, event: browser_runtime.MouseEvent) bool
     const input_height = @max(self.browser_controller.pane_input_size[1], 1.0);
     pane_event.x = (event.x - self.browser_controller.pane_min[0]) * (input_width / @max(displayed_width, 1.0));
     pane_event.y = (event.y - self.browser_controller.pane_min[1]) * (input_height / @max(displayed_height, 1.0));
+    pane_event.wheel_multiplier = browserWheelMultiplier(self.app_config.browser_fast_scrolling_enabled);
 
     const handled = self.browser_controller.runtime.controller.handleMouse(pane_event) catch |err| {
         log.warn("failed to forward browser mouse input: {s}", .{@errorName(err)});
@@ -1530,6 +1531,10 @@ pub fn handleBrowserMouse(self: anytype, event: browser_runtime.MouseEvent) bool
         .native_child_view, .native_wayland_surface => true,
         .helper_window, .snapshot_texture, .offscreen_texture, .stub => false,
     };
+}
+
+fn browserWheelMultiplier(fast_scrolling_enabled: bool) f32 {
+    return if (fast_scrolling_enabled) 1.5 else 1.0;
 }
 
 /// Forwards browser-pane keyboard and text input when the pane owns focus.
@@ -3224,4 +3229,9 @@ pub fn isInspectorPromptSubmittedMessage(message: []const u8) bool {
 
 pub fn isInspectorPromptChangedMessage(message: []const u8) bool {
     return std.mem.indexOf(u8, message, "\"type\":\"prompt:changed\"") != null;
+}
+
+test "browser fast scrolling uses a separate wheel multiplier" {
+    try std.testing.expectEqual(@as(f32, 1.0), browserWheelMultiplier(false));
+    try std.testing.expectEqual(@as(f32, 1.5), browserWheelMultiplier(true));
 }

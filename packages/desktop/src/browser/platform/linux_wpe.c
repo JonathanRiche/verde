@@ -69,8 +69,9 @@ static enum wpe_input_axis_event_type verde_browser_linux_wheel_event_type(doubl
     return wpe_input_axis_event_type_motion_smooth;
 }
 
-static double verde_browser_linux_wheel_delta_scale(enum wpe_input_axis_event_type event_type) {
-    return event_type == wpe_input_axis_event_type_motion ? 120.0 : 96.0;
+static double verde_browser_linux_wheel_delta_scale(enum wpe_input_axis_event_type event_type, double wheel_multiplier) {
+    const double base_scale = event_type == wpe_input_axis_event_type_motion ? 120.0 : 96.0;
+    return base_scale * wheel_multiplier;
 }
 
 static uint32_t verde_browser_linux_wheel_axis(double delta_x, double delta_y) {
@@ -751,17 +752,17 @@ int verde_browser_linux_test_wheel_event_is_smooth(double delta_x, double delta_
     return verde_browser_linux_wheel_event_type(delta_x, delta_y) == wpe_input_axis_event_type_motion_smooth;
 }
 
-double verde_browser_linux_test_wheel_delta_scale(double delta_x, double delta_y) {
-    return verde_browser_linux_wheel_delta_scale(verde_browser_linux_wheel_event_type(delta_x, delta_y));
+double verde_browser_linux_test_wheel_delta_scale(double delta_x, double delta_y, double wheel_multiplier) {
+    return verde_browser_linux_wheel_delta_scale(verde_browser_linux_wheel_event_type(delta_x, delta_y), wheel_multiplier);
 }
 
 unsigned int verde_browser_linux_test_wheel_axis(double delta_x, double delta_y) {
     return verde_browser_linux_wheel_axis(delta_x, delta_y);
 }
 
-int32_t verde_browser_linux_test_wheel_value(double delta_x, double delta_y) {
+int32_t verde_browser_linux_test_wheel_value(double delta_x, double delta_y, double wheel_multiplier) {
     const enum wpe_input_axis_event_type event_type = verde_browser_linux_wheel_event_type(delta_x, delta_y);
-    return verde_browser_linux_wheel_value(delta_x, delta_y, verde_browser_linux_wheel_delta_scale(event_type));
+    return verde_browser_linux_wheel_value(delta_x, delta_y, verde_browser_linux_wheel_delta_scale(event_type, wheel_multiplier));
 }
 #endif
 
@@ -1804,11 +1805,11 @@ int verde_browser_linux_mouse_button(struct verde_browser_linux *browser, double
     return 1;
 }
 
-int verde_browser_linux_mouse_wheel(struct verde_browser_linux *browser, double x, double y, double delta_x, double delta_y, unsigned int modifiers) {
+int verde_browser_linux_mouse_wheel(struct verde_browser_linux *browser, double x, double y, double delta_x, double delta_y, double wheel_multiplier, unsigned int modifiers) {
     if (browser == NULL) return 0;
     verde_browser_linux_mark_active(browser);
     const enum wpe_input_axis_event_type event_type = verde_browser_linux_wheel_event_type(delta_x, delta_y);
-    const double delta_scale = verde_browser_linux_wheel_delta_scale(event_type);
+    const double delta_scale = verde_browser_linux_wheel_delta_scale(event_type, wheel_multiplier);
     // WPE 2D events duplicate the legacy value into an orthogonal DOM delta,
     // which makes horizontal carousels cancel otherwise vertical page scroll.
     struct wpe_input_axis_event event = {

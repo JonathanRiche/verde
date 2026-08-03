@@ -825,6 +825,7 @@ pub const Controller = struct {
                 .y = event.y,
                 .wheel_x = event.wheel_x,
                 .wheel_y = event.wheel_y,
+                .wheel_multiplier = event.wheel_multiplier,
                 .ctrl = event.ctrl,
                 .shift = event.shift,
                 .alt = event.alt,
