@@ -34,6 +34,7 @@ pub const Control = enum(u8) {
     file_links_neovim_pane,
     links_verde_browser,
     links_system_browser,
+    browser_fast_scrolling,
     mcp_tools,
     hooks_claude,
     hooks_codex,
@@ -138,6 +139,9 @@ const SettingsLayout = struct {
     terminal_hint_y: f32,
     links_verde_browser: palette.Rect,
     links_system_browser: palette.Rect,
+    browser_card: palette.Rect,
+    browser_fast_scrolling: palette.Rect,
+    browser_hint_y: f32,
     workspace_card: palette.Rect,
     open_cells: [OPEN_CHOICES.len]palette.Rect,
     custom_open: ?palette.Rect = null,
@@ -267,6 +271,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         m.label_h + m.inner_gap + m.row_h;
     const chat_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h + m.row_gap + m.label_h + m.inner_gap + m.row_h;
+    const browser_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra +
         m.row_gap + m.label_h + m.inner_gap + m.row_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
@@ -282,7 +287,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     // (preview or expanded), and the show-more / release-page links row.
     const updates_h = m.card_pad * 2.0 + m.title_h + m.inner_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + updates_notes_h + m.inner_gap + m.label_h;
 
-    const body_h = appearance_h + m.card_gap + transcript_h + m.card_gap + chat_h + m.card_gap + terminal_h + m.card_gap + workspace_h + m.card_gap + integrations_h + m.card_gap + updates_h + m.card_gap + notifications_h;
+    const body_h = appearance_h + m.card_gap + transcript_h + m.card_gap + chat_h + m.card_gap + terminal_h + m.card_gap + browser_h + m.card_gap + workspace_h + m.card_gap + integrations_h + m.card_gap + updates_h + m.card_gap + notifications_h;
     const modal_h = m.header_h + m.modal_pad + body_h + m.modal_pad + m.footer_h;
     const modal = layoutModal(width, height, modal_h);
 
@@ -384,6 +389,13 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const links_system_browser: palette.Rect = .{ .x = links_verde_browser.x + link_cell_w, .y = link_row_y, .w = link_cell_w, .h = m.row_h };
 
     y += terminal_h + m.card_gap;
+
+    const browser_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = browser_h };
+    const browser_fast_scrolling_y = browser_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
+    const browser_fast_scrolling: palette.Rect = .{ .x = browser_card.x + m.card_pad, .y = browser_fast_scrolling_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
+    const browser_hint_y = browser_fast_scrolling_y + m.row_h + m.inner_gap;
+
+    y += browser_h + m.card_gap;
 
     const workspace_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = workspace_h };
     const open_y = workspace_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
@@ -504,6 +516,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .terminal_hint_y = terminal_hint_y,
         .links_verde_browser = links_verde_browser,
         .links_system_browser = links_system_browser,
+        .browser_card = browser_card,
+        .browser_fast_scrolling = browser_fast_scrolling,
+        .browser_hint_y = browser_hint_y,
         .workspace_card = workspace_card,
         .open_cells = open_cells,
         .custom_open = custom_open,
@@ -689,6 +704,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.terminal_font_inc, layout.body_clip, .terminal_font_inc, queue_hit);
     queueControlHit(state, layout.links_verde_browser, layout.body_clip, .links_verde_browser, queue_hit);
     queueControlHit(state, layout.links_system_browser, layout.body_clip, .links_system_browser, queue_hit);
+    queueControlHit(state, layout.browser_fast_scrolling, layout.body_clip, .browser_fast_scrolling, queue_hit);
     for (OPEN_CHOICES, 0..) |choice, index| {
         queueControlHit(state, layout.open_cells[index], layout.body_clip, choice.control, queue_hit);
     }
@@ -738,6 +754,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     drawCard(state, layout.transcript_card, layout.body_clip);
     drawCard(state, layout.chat_card, layout.body_clip);
     drawCard(state, layout.terminal_card, layout.body_clip);
+    drawCard(state, layout.browser_card, layout.body_clip);
     drawCard(state, layout.workspace_card, layout.body_clip);
     drawCard(state, layout.integrations_card, layout.body_clip);
     drawCard(state, layout.updates_card, layout.body_clip);
@@ -807,6 +824,17 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .h = m.label_h,
     }, "Terminal link clicks", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
     drawSegmentedPair(state, layout.links_verde_browser, layout.links_system_browser, "Verde browser", "Default browser", state.settings_controller.draft.link_open_target == .verde_browser, isControlHovered(state, .links_verde_browser), isControlHovered(state, .links_system_browser), layout.body_clip);
+
+    // Browser
+    drawCardTitle(state, layout.browser_card, "Browser", layout.body_clip);
+    drawFieldLabel(state, layout.browser_card, m, "Scrolling", layout.body_clip);
+    drawSwitchRow(state, layout.browser_fast_scrolling, "Faster page scrolling (1.5x)", state.settings_controller.draft.browser_fast_scrolling_enabled, isControlHovered(state, .browser_fast_scrolling), layout.body_clip);
+    queueText(state, .{
+        .x = layout.browser_card.x + m.card_pad,
+        .y = layout.browser_hint_y,
+        .w = layout.browser_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, "Turn off to use Verde's standard embedded-browser speed", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
 
     // Workspace
     drawCardTitle(state, layout.workspace_card, "Workspace", layout.body_clip);
@@ -1130,6 +1158,7 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .file_links_neovim_pane => state.settings_controller.draft.file_links_in_neovim_pane = !state.settings_controller.draft.file_links_in_neovim_pane,
         .links_verde_browser => state.settings_controller.draft.link_open_target = .verde_browser,
         .links_system_browser => state.settings_controller.draft.link_open_target = .system_browser,
+        .browser_fast_scrolling => state.settings_controller.draft.browser_fast_scrolling_enabled = !state.settings_controller.draft.browser_fast_scrolling_enabled,
         // Acts immediately (filesystem side effect), independent of Save/Cancel.
         .mcp_tools => {
             state.toggleGlobalMcpIntegration();

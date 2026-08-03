@@ -4169,3 +4169,18 @@ test "assistant markdown selection copies rendered text" {
 test "plain transcript selection preserves user and system text literally" {
     try expectWholeBodyCopy("User *literal* text\nSystem notice", true, "User *literal* text\nSystem notice");
 }
+
+test "unicode arrows survive markdown flatten for chat prose" {
+    // Agents often write path edges as →/⇒ in chat. Keep them as real Unicode
+    // so the prose font-fallback chain can render them (Noto Sans lacks the
+    // Arrows block; measurement goes through the coverage path for non-ASCII).
+    const allocator = std.testing.allocator;
+    const source = "WPE → SDL_GPU and A ⇒ B with ➜ dingbat";
+    var body = try buildBodyView(allocator, source);
+    defer body.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), body.blockCount());
+    switch (body.blockAt(0)) {
+        .text => |text| try std.testing.expectEqualStrings(source, text.text),
+        else => unreachable,
+    }
+}

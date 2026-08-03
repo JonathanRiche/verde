@@ -38,11 +38,34 @@ pub fn clear() void {
 
 pub fn textWidth(role: palette.FontRole, font_size: f32, text: []const u8) f32 {
     if (text.len == 0) return 0.0;
+    // Non-ASCII may need symbol fallbacks (→ etc. live outside Noto Sans).
+    // The GPU path's sized fonts register those faces, so advances match
+    // the glyphs that are actually drawn. Raw-base-face measurement alone
+    // substitutes .notdef / wrong widths and makes arrows look gappy or
+    // tofu-like next to surrounding prose. ASCII stays on the cheap path
+    // because chat markdown wrap calls this per word.
+    if (textNeedsCoverageMeasure(text)) {
+        if (gpu_renderer) |renderer| {
+            if (renderer.measureTextOffset(text, font_size, text.len, role)) |width| {
+                return width;
+            } else |_| {}
+        }
+    }
     const render_size = font_size * GPU_TEXT_FONT_SCALE;
     if (fonts) |configured| {
         return palette.sdl.ttfMeasureText(fontForRole(configured, role), text, render_size) catch estimatedTextWidth(render_size, text);
     }
     return estimatedTextWidth(render_size, text);
+}
+
+/// True when `text` may contain codepoints outside the primary UI/prose
+/// faces (arrows, dingbats, emoji, CJK, …) that need SDL_ttf symbol
+/// fallbacks for correct advance widths.
+fn textNeedsCoverageMeasure(text: []const u8) bool {
+    for (text) |byte| {
+        if (byte >= 0x80) return true;
+    }
+    return false;
 }
 
 pub fn fontAscent(role: palette.FontRole, font_size: f32) f32 {

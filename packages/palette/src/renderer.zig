@@ -1231,15 +1231,23 @@ pub const Renderer = struct {
     // sized copies at the same render size because SDL_ttf renders fallback
     // glyphs at the fallback font's own size; TTF_CloseFont unregisters
     // both directions, so clearFontCache stays order-independent.
+    //
+    // Order prefers JetBrains Mono Nerd (`mono_symbols`) first: Noto Sans
+    // Symbols' Arrows (→←) sit as short mid-line bars in a tall em-box and
+    // read as low dashes/underscores next to Noto Sans prose. JetBrains'
+    // arrows fill letter height, so path edges like `Browser → Scrolling`
+    // stay on the text baseline. Noto Symbols 2 / Symbols / emoji still
+    // cover dingbats and emoji-styled markers JetBrains omits (➤, ✻, ✨).
     fn addCoverageFallbackFonts(self: *Renderer, font: *c.TTF_Font, font_size: f32, role: ?draw.FontRole) error{ OutOfMemory, SdlTtfTextFailed }!void {
         const wants_fallback = if (role) |font_role| switch (font_role) {
             .ui, .ui_bold, .prose, .prose_bold, .prose_italic, .prose_bold_italic => true,
             else => false,
         } else true;
         if (!wants_fallback) return;
-        const fallback_roles = [_]draw.FontRole{ .symbols, .symbols_alt, .emoji };
+        const fallback_roles = [_]draw.FontRole{ .mono_symbols, .symbols, .symbols_alt, .emoji };
         for (fallback_roles) |fallback_role| {
             const loaded = switch (fallback_role) {
+                .mono_symbols => self.mono_symbols_font != null,
                 .symbols => self.symbols_font != null,
                 .symbols_alt => self.symbols_alt_font != null,
                 .emoji => self.emoji_font != null,
