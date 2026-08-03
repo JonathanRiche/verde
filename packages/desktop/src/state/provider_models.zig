@@ -123,12 +123,7 @@ pub const CODEX_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "GPT-5.5", .value = "gpt-5.5" },
     .{ .label = "GPT-5.6 Terra", .value = "gpt-5.6-terra" },
     .{ .label = "GPT-5.6 Luna", .value = "gpt-5.6-luna" },
-    .{ .label = "GPT-5.4", .value = "gpt-5.4" },
-    .{ .label = "GPT-5.4 Mini", .value = "gpt-5.4-mini" },
-    .{ .label = "GPT-5.3 Codex", .value = "gpt-5.3-codex" },
     .{ .label = "GPT-5.3 Codex Spark", .value = "gpt-5.3-codex-spark" },
-    .{ .label = "GPT-5.2 Codex", .value = "gpt-5.2-codex" },
-    .{ .label = "GPT-5.2", .value = "gpt-5.2" },
 };
 
 const CURSOR_GROK_EFFORT_VALUES = [_][:0]const u8{ "low", "medium", "high" };
@@ -188,6 +183,15 @@ pub const CODEX_ACCESS_MODE_OPTIONS = [_]AccessModeOption{
     .{ .label = "Full access", .value = .full_access },
     .{ .label = "Supervised", .value = .supervised },
 };
+
+test "Codex model options omit unsupported subscription models" {
+    try std.testing.expectEqual(@as(usize, 5), CODEX_MODEL_OPTIONS.len);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", CODEX_MODEL_OPTIONS[0].value.?);
+    try std.testing.expectEqualStrings("gpt-5.5", CODEX_MODEL_OPTIONS[1].value.?);
+    try std.testing.expectEqualStrings("gpt-5.6-terra", CODEX_MODEL_OPTIONS[2].value.?);
+    try std.testing.expectEqualStrings("gpt-5.6-luna", CODEX_MODEL_OPTIONS[3].value.?);
+    try std.testing.expectEqualStrings("gpt-5.3-codex-spark", CODEX_MODEL_OPTIONS[4].value.?);
+}
 
 test "persisted Cursor model cache refreshes duplicate model ids" {
     const options = [_]PersistedCursorModelOption{
