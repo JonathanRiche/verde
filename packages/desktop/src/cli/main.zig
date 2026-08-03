@@ -4086,10 +4086,11 @@ fn mcpBrowserTypeScriptAlloc(allocator: std.mem.Allocator, selector: []const u8,
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
     try writer.writer.writeAll("const selector=");
-    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
-    try s.write(selector);
+    var selector_stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try selector_stringify.write(selector);
     try writer.writer.writeAll(";const text=");
-    try s.write(text);
+    var text_stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try text_stringify.write(text);
     try writer.writer.writeAll(";const el=document.querySelector(selector);if(!el)throw new Error('No element matches selector');const isField=el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement||el.isContentEditable;if(!isField)throw new Error('Element is not an editable field');const sensitive=(el instanceof HTMLInputElement&&el.type==='password')||");
     try writer.writer.writeAll(if (submit) "true" else "false");
     try writer.writer.writeAll(";if(sensitive&&!");
@@ -4650,6 +4651,8 @@ fn optionConsumesValue(name: []const u8) bool {
         std.mem.eql(u8, name, "--progress") or
         std.mem.eql(u8, name, "--label") or
         std.mem.eql(u8, name, "--session") or
+        std.mem.eql(u8, name, "--ssh-target") or
+        std.mem.eql(u8, name, "--profile") or
         std.mem.eql(u8, name, "--remote") or
         std.mem.eql(u8, name, "--cwd") or
         std.mem.eql(u8, name, "--remote-cwd") or
@@ -4669,6 +4672,9 @@ fn optionConsumesValue(name: []const u8) bool {
         std.mem.eql(u8, name, "--reasoning") or
         std.mem.eql(u8, name, "--reasoning-variant") or
         std.mem.eql(u8, name, "--lines") or
+        std.mem.eql(u8, name, "--x") or
+        std.mem.eql(u8, name, "--y") or
+        std.mem.eql(u8, name, "--button") or
         std.mem.eql(u8, name, "--thread");
 }
 
@@ -4902,6 +4908,8 @@ fn flagIsBare(name: []const u8) bool {
         std.mem.eql(u8, name, "--alt") or
         std.mem.eql(u8, name, "--shift") or
         std.mem.eql(u8, name, "--super") or
+        std.mem.eql(u8, name, "--all") or
+        std.mem.eql(u8, name, "--dry-run") or
         std.mem.eql(u8, name, "--clear") or
         std.mem.eql(u8, name, "--quiet");
 }
