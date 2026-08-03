@@ -31,6 +31,7 @@ pub const Control = enum(u8) {
     open_cursor,
     open_vscode,
     open_zed,
+    file_links_neovim_pane,
     links_verde_browser,
     links_system_browser,
     mcp_tools,
@@ -142,6 +143,8 @@ const SettingsLayout = struct {
     custom_open: ?palette.Rect = null,
     new_chat_new_pane: palette.Rect,
     new_chat_replace_pane: palette.Rect,
+    file_links_neovim_pane: palette.Rect,
+    file_links_hint_y: f32,
     integrations_card: palette.Rect,
     mcp_tools: palette.Rect,
     mcp_hint_y: f32,
@@ -264,7 +267,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         m.label_h + m.inner_gap + m.row_h;
     const chat_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h + m.row_gap + m.label_h + m.inner_gap + m.row_h;
-    const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra + m.row_gap + m.label_h + m.inner_gap + m.row_h;
+    const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra +
+        m.row_gap + m.label_h + m.inner_gap + m.row_h +
+        m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     // MCP controls and status, followed by the provider status-hook controls.
     const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap * 2.0 + m.label_h * 4.0 + m.row_h * 6.0 + m.inner_gap * 8.0;
     // Same shape as the integrations card: title, field label, one toggle row, hint.
@@ -410,6 +415,10 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const new_chat_cell_w = (content_w - m.card_pad * 2.0) * 0.5;
     const new_chat_new_pane: palette.Rect = .{ .x = open_x, .y = new_chat_y, .w = new_chat_cell_w, .h = m.row_h };
     const new_chat_replace_pane: palette.Rect = .{ .x = new_chat_new_pane.x + new_chat_cell_w, .y = new_chat_y, .w = new_chat_cell_w, .h = m.row_h };
+    const file_links_label_y = new_chat_y + m.row_h + m.row_gap;
+    const file_links_y = file_links_label_y + m.label_h + m.inner_gap;
+    const file_links_neovim_pane: palette.Rect = .{ .x = open_x, .y = file_links_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
+    const file_links_hint_y = file_links_y + m.row_h + m.inner_gap;
 
     y += workspace_h + m.card_gap;
 
@@ -500,6 +509,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .custom_open = custom_open,
         .new_chat_new_pane = new_chat_new_pane,
         .new_chat_replace_pane = new_chat_replace_pane,
+        .file_links_neovim_pane = file_links_neovim_pane,
+        .file_links_hint_y = file_links_hint_y,
         .integrations_card = integrations_card,
         .mcp_tools = mcp_tools,
         .mcp_hint_y = mcp_hint_y,
@@ -683,6 +694,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     }
     queueControlHit(state, layout.new_chat_new_pane, layout.body_clip, .new_chat_new_pane, queue_hit);
     queueControlHit(state, layout.new_chat_replace_pane, layout.body_clip, .new_chat_replace_pane, queue_hit);
+    queueControlHit(state, layout.file_links_neovim_pane, layout.body_clip, .file_links_neovim_pane, queue_hit);
     queueControlHit(state, layout.mcp_tools, layout.body_clip, .mcp_tools, queue_hit);
     queueControlHit(state, layout.hooks_claude, layout.body_clip, .hooks_claude, queue_hit);
     queueControlHit(state, layout.hooks_codex, layout.body_clip, .hooks_codex, queue_hit);
@@ -829,6 +841,19 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         isControlHovered(state, .new_chat_replace_pane),
         layout.body_clip,
     );
+    queueText(state, .{
+        .x = layout.file_links_neovim_pane.x,
+        .y = layout.file_links_neovim_pane.y - m.inner_gap - m.label_h,
+        .w = layout.file_links_neovim_pane.w,
+        .h = m.label_h,
+    }, "Transcript file links", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    drawSwitchRow(state, layout.file_links_neovim_pane, "Open in workspace Neovim pane", state.settings_controller.draft.file_links_in_neovim_pane, isControlHovered(state, .file_links_neovim_pane), layout.body_clip);
+    queueText(state, .{
+        .x = layout.file_links_neovim_pane.x,
+        .y = layout.file_links_hint_y,
+        .w = layout.file_links_neovim_pane.w,
+        .h = m.label_h,
+    }, "Used only when Neovim is the configured editor; otherwise uses the default file action", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
 
     // Agent integrations
     drawCardTitle(state, layout.integrations_card, "Agent integrations", layout.body_clip);
@@ -1102,6 +1127,7 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .open_cursor => state.settings_controller.draft.open_action = .cursor,
         .open_vscode => state.settings_controller.draft.open_action = .vscode,
         .open_zed => state.settings_controller.draft.open_action = .zed,
+        .file_links_neovim_pane => state.settings_controller.draft.file_links_in_neovim_pane = !state.settings_controller.draft.file_links_in_neovim_pane,
         .links_verde_browser => state.settings_controller.draft.link_open_target = .verde_browser,
         .links_system_browser => state.settings_controller.draft.link_open_target = .system_browser,
         // Acts immediately (filesystem side effect), independent of Save/Cancel.

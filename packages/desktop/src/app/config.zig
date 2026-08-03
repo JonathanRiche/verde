@@ -129,6 +129,7 @@ pub const AppConfig = struct {
     installed_themes: []InstalledTheme = &.{},
     default_open_action: DefaultOpenAction = .folder,
     link_open_target: LinkOpenTarget = .verde_browser,
+    file_links_in_neovim_pane: bool = false,
     terminal_launch_profiles: []TerminalLaunchProfileConfig = &.{},
     tool_call_group_preference: ToolCallGroupPreference = .collapsed,
     tool_call_groups_last_expanded: bool = false,
@@ -442,6 +443,7 @@ fn writeOpenSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, c
         .system_browser => "system_browser",
     } };
     try open_object.put(allocator, "links", links_value);
+    try open_object.put(allocator, "file_links_in_neovim_pane", .{ .bool = config.file_links_in_neovim_pane });
 }
 
 fn writeTerminalSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
@@ -878,6 +880,13 @@ fn applyOpenOverrides(allocator: std.mem.Allocator, config: *AppConfig, open_val
             config.link_open_target = target;
         }
     }
+    if (open_value.object.get("file_links_in_neovim_pane")) |pane_value| {
+        if (pane_value == .bool) {
+            config.file_links_in_neovim_pane = pane_value.bool;
+        } else {
+            log.warn("open.file_links_in_neovim_pane must be a boolean when provided", .{});
+        }
+    }
 }
 
 fn parseLinkOpenTarget(value: std.json.Value) ?LinkOpenTarget {
@@ -1163,6 +1172,18 @@ test "app config accepts link open target" {
     applyAppOverrides(std.testing.allocator, &config, root.value);
 
     try std.testing.expectEqual(LinkOpenTarget.system_browser, config.link_open_target);
+}
+
+test "app config accepts workspace Neovim file link preference" {
+    var root = try parseTestRoot("{\"open\":{\"file_links_in_neovim_pane\":true}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expect(!config.file_links_in_neovim_pane);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expect(config.file_links_in_neovim_pane);
 }
 
 test "app config accepts automatic update check preference" {

@@ -3208,15 +3208,16 @@ pub const AppState = struct {
             self.setSidebarNotice("No file reference selected.");
             return;
         }
+        const reference = utils.parseFileReference(normalized);
 
-        const resolved_path = if (std.fs.path.isAbsolute(normalized)) resolved: {
-            break :resolved self.allocator.dupe(u8, normalized) catch |err| {
+        const resolved_path = if (std.fs.path.isAbsolute(reference.path)) resolved: {
+            break :resolved self.allocator.dupe(u8, reference.path) catch |err| {
                 log.warn("failed to copy transcript file reference: {s}", .{@errorName(err)});
                 self.setSidebarNotice("Failed to open file reference.");
                 return;
             };
         } else resolved: {
-            break :resolved std.fs.path.join(self.allocator, &.{ self.currentProject().path, normalized }) catch |err| {
+            break :resolved std.fs.path.join(self.allocator, &.{ self.currentProject().path, reference.path }) catch |err| {
                 log.warn("failed to resolve transcript file reference: {s}", .{@errorName(err)});
                 self.setSidebarNotice("Failed to open file reference.");
                 return;
@@ -3224,7 +3225,11 @@ pub const AppState = struct {
         };
         defer self.allocator.free(resolved_path);
 
-        const result = utils.openFilePreferEditor(self.allocator, resolved_path) catch |err| {
+        if (self.app_config.file_links_in_neovim_pane and utils.configuredEditorIsNeovim()) {
+            if (self.openTranscriptFileReferenceInNeovimPane(resolved_path, reference.location)) return;
+        }
+
+        const result = utils.openFilePreferEditor(self.allocator, resolved_path, reference.location) catch |err| {
             log.warn("failed to open transcript file reference: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to open file reference.");
             return;
@@ -3234,6 +3239,23 @@ pub const AppState = struct {
             .editor => self.setSidebarNotice("Opened file in editor."),
             .file_manager => self.setSidebarNotice("Opened containing folder."),
         }
+    }
+
+    fn openTranscriptFileReferenceInNeovimPane(self: *AppState, file_path: []const u8, location: utils.FileLocation) bool {
+        const command = utils.configuredNeovimFileCommandAlloc(self.allocator, file_path, location) catch |err| {
+            log.warn("failed to build workspace Neovim file command: {s}", .{@errorName(err)});
+            return false;
+        } orelse return false;
+        defer self.allocator.free(command);
+
+        const pane_id = self.openCurrentProjectTerminalPaneForCommand() orelse return false;
+        _ = self.writeWorkspaceTerminalPane(pane_id, command) catch |err| {
+            log.warn("failed to write workspace Neovim file command: {s}", .{@errorName(err)});
+            return false;
+        };
+        self.setSidebarNotice("Opened file in workspace Neovim pane.");
+        self.markDirty();
+        return true;
     }
 
     pub fn openConfiguredWebLink(self: *AppState, href: []const u8) void {
