@@ -966,16 +966,31 @@ fn handleLiveSessionUpdate(
                 .locations = event.locations,
                 .raw = event.raw,
             } });
-            emitCursorDiffUpdate(update, request.stream_context, on_stream_event);
+            emitCursorDiffUpdate(allocator, update, request.stream_context, on_stream_event);
         }
     }
 }
 
 fn emitCursorDiffUpdate(
+    allocator: std.mem.Allocator,
     update: std.json.Value,
     context: ?*anyopaque,
     on_stream_event: *const fn (?*anyopaque, provider_types.StreamEvent) void,
 ) void {
+    if (findCursorTextDiff(update)) |diff| {
+        const patch = cursorTextDiffPatchAlloc(allocator, diff) catch return;
+        defer allocator.free(patch);
+        if (patch.len == 0) return;
+        const files = [_]provider_types.StreamDiffFile{.{
+            .path = diff.path,
+            .additions = countUnifiedPatchLines(patch, '+'),
+            .deletions = countUnifiedPatchLines(patch, '-'),
+            .patch = patch,
+        }};
+        on_stream_event(context, .{ .diff = .{ .files = &files } });
+        return;
+    }
+
     const path = findFirstStringForKeys(update, &.{ "path", "filePath", "relativePath", "file" }) orelse return;
     const patch = findFirstStringForKeys(update, &.{ "diff", "patch" }) orelse return;
     if (patch.len == 0) return;
@@ -986,6 +1001,120 @@ fn emitCursorDiffUpdate(
         .patch = patch,
     }};
     on_stream_event(context, .{ .diff = .{ .files = &files } });
+}
+
+const CursorTextDiff = struct {
+    path: []const u8,
+    old_text: []const u8,
+    new_text: []const u8,
+    created: bool,
+};
+
+fn findCursorTextDiff(value: std.json.Value) ?CursorTextDiff {
+    switch (value) {
+        .object => |object| {
+            const content_type = getOptionalObjectString(value, "type") orelse "";
+            if (std.mem.eql(u8, content_type, "diff")) {
+                const path = getOptionalObjectString(value, "path") orelse return null;
+                const old_value = object.get("oldText") orelse return null;
+                const new_value = object.get("newText") orelse return null;
+                const old_text: []const u8 = switch (old_value) {
+                    .string => |text| text,
+                    .null => "",
+                    else => return null,
+                };
+                const new_text: []const u8 = switch (new_value) {
+                    .string => |text| text,
+                    else => return null,
+                };
+                return .{
+                    .path = path,
+                    .old_text = old_text,
+                    .new_text = new_text,
+                    .created = old_value == .null,
+                };
+            }
+
+            var fields = object.iterator();
+            while (fields.next()) |field| {
+                if (findCursorTextDiff(field.value_ptr.*)) |diff| return diff;
+            }
+        },
+        .array => |array| {
+            for (array.items) |item| {
+                if (findCursorTextDiff(item)) |diff| return diff;
+            }
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn cursorTextDiffPatchAlloc(allocator: std.mem.Allocator, diff: CursorTextDiff) ![]u8 {
+    if (std.mem.eql(u8, diff.old_text, diff.new_text)) return allocator.dupe(u8, "");
+
+    var old_lines: std.ArrayList([]const u8) = .empty;
+    defer old_lines.deinit(allocator);
+    try appendTextLines(allocator, &old_lines, diff.old_text);
+    var new_lines: std.ArrayList([]const u8) = .empty;
+    defer new_lines.deinit(allocator);
+    try appendTextLines(allocator, &new_lines, diff.new_text);
+
+    const common_len = @min(old_lines.items.len, new_lines.items.len);
+    var prefix_len: usize = 0;
+    while (prefix_len < common_len and std.mem.eql(u8, old_lines.items[prefix_len], new_lines.items[prefix_len])) {
+        prefix_len += 1;
+    }
+
+    var suffix_len: usize = 0;
+    while (suffix_len < common_len - prefix_len and
+        std.mem.eql(
+            u8,
+            old_lines.items[old_lines.items.len - suffix_len - 1],
+            new_lines.items[new_lines.items.len - suffix_len - 1],
+        ))
+    {
+        suffix_len += 1;
+    }
+
+    const context_lines: usize = 3;
+    const context_start = prefix_len - @min(prefix_len, context_lines);
+    const trailing_context = @min(suffix_len, context_lines);
+    const old_change_end = old_lines.items.len - suffix_len;
+    const new_change_end = new_lines.items.len - suffix_len;
+    const old_hunk_end = old_change_end + trailing_context;
+    const new_hunk_end = new_change_end + trailing_context;
+    const old_count = old_hunk_end - context_start;
+    const new_count = new_hunk_end - context_start;
+    const old_start = if (old_count == 0) @as(usize, 0) else context_start + 1;
+    const new_start = if (new_count == 0) @as(usize, 0) else context_start + 1;
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    if (diff.created) {
+        try writer.writer.print("--- /dev/null\n+++ b/{s}\n", .{diff.path});
+    } else {
+        try writer.writer.print("--- a/{s}\n+++ b/{s}\n", .{ diff.path, diff.path });
+    }
+    try writer.writer.print("@@ -{d},{d} +{d},{d} @@\n", .{ old_start, old_count, new_start, new_count });
+
+    for (old_lines.items[context_start..prefix_len]) |line| try writer.writer.print(" {s}\n", .{line});
+    for (old_lines.items[prefix_len..old_change_end]) |line| try writer.writer.print("-{s}\n", .{line});
+    for (new_lines.items[prefix_len..new_change_end]) |line| try writer.writer.print("+{s}\n", .{line});
+    for (old_lines.items[old_change_end..old_hunk_end]) |line| try writer.writer.print(" {s}\n", .{line});
+    return writer.toOwnedSlice();
+}
+
+fn appendTextLines(
+    allocator: std.mem.Allocator,
+    lines: *std.ArrayList([]const u8),
+    text: []const u8,
+) !void {
+    if (text.len == 0) return;
+    var iterator = std.mem.splitScalar(u8, text, '\n');
+    while (iterator.next()) |line| try lines.append(allocator, line);
+    // A trailing newline terminates the last line; it does not start another.
+    if (text[text.len - 1] == '\n') lines.items.len -= 1;
 }
 
 fn findFirstStringForKeys(value: std.json.Value, keys: []const []const u8) ?[]const u8 {
@@ -1025,6 +1154,7 @@ const TestDiffCapture = struct {
     count: usize = 0,
     path: ?[]const u8 = null,
     patch: ?[]const u8 = null,
+    patch_storage: [4096]u8 = undefined,
     additions: i64 = 0,
     deletions: i64 = 0,
 
@@ -1035,7 +1165,12 @@ const TestDiffCapture = struct {
                 if (diff.files.len == 0) return;
                 self.count += 1;
                 self.path = diff.files[0].path;
-                self.patch = diff.files[0].patch;
+                if (diff.files[0].patch) |patch| {
+                    if (patch.len <= self.patch_storage.len) {
+                        @memcpy(self.patch_storage[0..patch.len], patch);
+                        self.patch = self.patch_storage[0..patch.len];
+                    }
+                }
                 self.additions = diff.files[0].additions;
                 self.deletions = diff.files[0].deletions;
             },
@@ -1947,11 +2082,51 @@ test "Cursor tool updates emit structured diff snapshots" {
     defer parsed.deinit();
 
     var capture: TestDiffCapture = .{};
-    emitCursorDiffUpdate(parsed.value, &capture, TestDiffCapture.handle);
+    emitCursorDiffUpdate(std.testing.allocator, parsed.value, &capture, TestDiffCapture.handle);
     try std.testing.expectEqual(@as(usize, 1), capture.count);
     try std.testing.expectEqualStrings("src/main.zig", capture.path.?);
     try std.testing.expectEqual(@as(i64, 2), capture.additions);
     try std.testing.expectEqual(@as(i64, 1), capture.deletions);
+}
+
+test "Cursor ACP text diff content emits a compact structured patch" {
+    const payload =
+        \\{"sessionUpdate":"tool_call_update","toolCallId":"call-1","title":"Edit File","kind":"edit","status":"completed","content":[{"type":"diff","path":"src/main.zig","oldText":"const a = 1;\nconst b = 2;\nconst c = 3;\n","newText":"const a = 1;\nconst b = 4;\nconst c = 3;\n"}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+
+    var capture: TestDiffCapture = .{};
+    emitCursorDiffUpdate(std.testing.allocator, parsed.value, &capture, TestDiffCapture.handle);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqualStrings("src/main.zig", capture.path.?);
+    try std.testing.expectEqual(@as(i64, 1), capture.additions);
+    try std.testing.expectEqual(@as(i64, 1), capture.deletions);
+    try std.testing.expectEqualStrings(
+        "--- a/src/main.zig\n" ++
+            "+++ b/src/main.zig\n" ++
+            "@@ -1,3 +1,3 @@\n" ++
+            " const a = 1;\n" ++
+            "-const b = 2;\n" ++
+            "+const b = 4;\n" ++
+            " const c = 3;\n",
+        capture.patch.?,
+    );
+}
+
+test "Cursor ACP text diff content preserves new-file semantics" {
+    const payload =
+        \\{"sessionUpdate":"tool_call_update","content":[{"type":"diff","path":"src/new.zig","oldText":null,"newText":"const created = true;\n"}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+
+    var capture: TestDiffCapture = .{};
+    emitCursorDiffUpdate(std.testing.allocator, parsed.value, &capture, TestDiffCapture.handle);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(@as(i64, 1), capture.additions);
+    try std.testing.expectEqual(@as(i64, 0), capture.deletions);
+    try std.testing.expect(std.mem.startsWith(u8, capture.patch.?, "--- /dev/null\n+++ b/src/new.zig\n"));
 }
 
 test "cursorToolEvent preserves status-only ACP lifecycle updates" {
