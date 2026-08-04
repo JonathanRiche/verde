@@ -26,6 +26,7 @@ pub const INIT_SQL: [:0]const u8 =
     \\    terminal_docks_json text,
     \\    workspace_layout_json text,
     \\    selected_thread_index integer not null default 0,
+    \\    companion_thread_local_id text,
     \\    herdr_remote_alias text,
     \\    herdr_session_name text,
     \\    herdr_workspace_id text,
@@ -110,6 +111,7 @@ pub fn initialize(conn: zqlite.Conn) !void {
     try ensureColumn(conn, "workspaces", "terminal_layout_json", "alter table workspaces add column terminal_layout_json text");
     try ensureColumn(conn, "workspaces", "terminal_docks_json", "alter table workspaces add column terminal_docks_json text");
     try ensureColumn(conn, "workspaces", "workspace_layout_json", "alter table workspaces add column workspace_layout_json text");
+    try ensureColumn(conn, "workspaces", "companion_thread_local_id", "alter table workspaces add column companion_thread_local_id text");
     try ensureColumn(conn, "workspaces", "herdr_remote_alias", "alter table workspaces add column herdr_remote_alias text");
     try ensureColumn(conn, "workspaces", "herdr_session_name", "alter table workspaces add column herdr_session_name text");
     try ensureColumn(conn, "workspaces", "herdr_workspace_id", "alter table workspaces add column herdr_workspace_id text");

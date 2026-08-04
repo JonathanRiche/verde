@@ -104,6 +104,7 @@ fn persistedProjectSnapshot(allocator: std.mem.Allocator, project: *const Projec
         .terminal_docks_json = terminal_docks_json,
         .workspace_layout_json = workspace_layout_json,
         .selected_thread_index = if (project.threads.items.len == 0) 0 else @min(project.selected_thread_index, project.threads.items.len - 1),
+        .companion_thread_local_id = try dupeOptionalSlice(allocator, project.companion_thread_local_id),
         .herdr_link = if (project.herdr_link) |*link| try link.toPersisted(allocator) else null,
         .threads = try threads.toOwnedSlice(allocator),
     };
@@ -127,6 +128,13 @@ fn lastRetainedActiveThreadIndex(project: *const Project) ?usize {
         };
         if (thread_index >= project.threads.items.len) continue;
         retained = if (retained) |current| @max(current, thread_index) else thread_index;
+    }
+    if (project.companion_thread_local_id) |local_id| {
+        for (project.threads.items, 0..) |thread, thread_index| {
+            if (!std.mem.eql(u8, thread.local_thread_id, local_id)) continue;
+            retained = if (retained) |current| @max(current, thread_index) else thread_index;
+            break;
+        }
     }
     return retained;
 }
@@ -164,6 +172,30 @@ test "snapshot retains pane-backed draft threads without shifting indexes" {
     try std.testing.expectEqual(@as(usize, 3), persisted_threads.len);
     try std.testing.expectEqualStrings("unfinished prompt", persisted_threads[second_draft_index].draft);
     try std.testing.expect(std.mem.indexOf(u8, persisted_project.workspace_layout_json.?, "\"thread\":2") != null);
+}
+
+test "snapshot retains pane-less Companion identity and stable thread indexes" {
+    const allocator = std.testing.allocator;
+    var projects: [1]Project = .{try Project.init(allocator, "workspace-id", "Workspace", "/tmp/workspace", 0)};
+    defer projects[0].deinit(allocator);
+    const project = &projects[0];
+    project.threads.items[0].committed = true;
+    const selected_before = project.selected_thread_index;
+    const companion = try project.ensureCompanionThread(allocator);
+
+    var snapshot = try buildSnapshot(.{
+        .projects = &projects,
+        .archived_projects = &.{},
+        .selected_project_index = 0,
+        .sidebar_collapsed = false,
+    }, allocator);
+    defer snapshot.deinit();
+
+    const persisted = snapshot.value.projects[0];
+    try std.testing.expectEqualStrings(companion.local_thread_id, persisted.companion_thread_local_id.?);
+    try std.testing.expectEqual(@as(usize, 2), persisted.threads.?.len);
+    try std.testing.expectEqual(selected_before, persisted.selected_thread_index);
+    try std.testing.expectEqualStrings(companion.local_thread_id, persisted.threads.?[1].local_thread_id.?);
 }
 
 fn persistedTerminalDocksJson(allocator: std.mem.Allocator, project: *const Project) !?[]u8 {
@@ -266,6 +298,7 @@ pub fn saveWorker(pref_path: []u8, loaded_state: LoadedPersistedState) void {
 }
 
 pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
+    var cleaned_legacy_companion = false;
     self.sidebar_collapsed = persisted.sidebar_collapsed;
     if (persisted.projects.len == 0) {
         try self.restorePersistedSurfaceStates(persisted.surface_states);
@@ -284,6 +317,9 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
         defer self.allocator.free(project_id);
 
         var loaded = try Project.init(self.allocator, project_id, project.label, project.path, project.unread_count);
+        if (project.companion_thread_local_id) |local_id| {
+            loaded.companion_thread_local_id = try self.allocator.dupeZ(u8, local_id);
+        }
         loaded.archived = project.archived;
         loaded.collapsed = project.collapsed orelse false;
         loaded.thread_list_expanded = project.thread_list_expanded orelse false;
@@ -435,6 +471,7 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
             fallback_thread.rebuildBackgroundTasksFromMessages(self.allocator);
         }
 
+        cleaned_legacy_companion = loaded.cleanupPristineLegacyCompanion(self.allocator) or cleaned_legacy_companion;
         try loaded.normalize(self.allocator, self.app_config.terminal_font_size);
 
         if (loaded.archived) {
@@ -454,7 +491,7 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
     self.restorePersistedChatCompletions(persisted.chat_completions);
     self.syncRenameBuffer();
     self.requestTranscriptScrollToBottom();
-    self.lifecycle.dirty = false;
+    self.lifecycle.dirty = cleaned_legacy_companion;
 }
 
 pub fn restorePersistedSurfaceStates(self: anytype, persisted_surfaces: []const PersistedSurfaceState) !void {

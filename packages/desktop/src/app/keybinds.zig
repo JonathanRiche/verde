@@ -13,6 +13,7 @@ pub const NativeKeyboardAction = enum {
     open_editor,
     new_thread,
     command_palette,
+    companion,
     toggle_sidebar,
     toggle_sidebar_hidden,
     toggle_browser,
@@ -123,6 +124,7 @@ pub const NativeKeyboardConfig = struct {
     open_editor: []Keybind,
     new_thread: []Keybind,
     command_palette: []Keybind,
+    companion: []Keybind,
     toggle_sidebar: []Keybind,
     toggle_sidebar_hidden: []Keybind,
     toggle_browser: []Keybind,
@@ -182,6 +184,7 @@ pub const NativeKeyboardConfig = struct {
             .open_editor = try cloneDefaultOpenEditorKeybinds(allocator),
             .new_thread = try cloneDefaultNewThreadKeybinds(allocator),
             .command_palette = try cloneDefaultCommandPaletteKeybinds(allocator),
+            .companion = try cloneDefaultCompanionKeybinds(allocator),
             .toggle_sidebar = try cloneDefaultSidebarKeybinds(allocator),
             .toggle_sidebar_hidden = try cloneDefaultSidebarHiddenKeybinds(allocator),
             .toggle_browser = try cloneDefaultBrowserKeybinds(allocator),
@@ -252,6 +255,7 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.open_editor);
         self.allocator.free(self.new_thread);
         self.allocator.free(self.command_palette);
+        self.allocator.free(self.companion);
         self.allocator.free(self.toggle_sidebar);
         self.allocator.free(self.toggle_sidebar_hidden);
         self.allocator.free(self.toggle_browser);
@@ -319,6 +323,9 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.command_palette, event)) {
             return .command_palette;
+        }
+        if (matchesAny(self.companion, event)) {
+            return .companion;
         }
         if (matchesAny(self.toggle_sidebar, event)) {
             return .toggle_sidebar;
@@ -549,6 +556,12 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(palette_value, "command_palette")) |bindings| {
                 self.allocator.free(self.command_palette);
                 self.command_palette = bindings;
+            }
+        }
+        if (keybinds_value.object.get("companion")) |companion_value| {
+            if (self.parseOverrideValue(companion_value, "companion")) |bindings| {
+                self.allocator.free(self.companion);
+                self.companion = bindings;
             }
         }
         if (keybinds_value.object.get("sidebar")) |sidebar_value| {
@@ -1003,6 +1016,12 @@ fn cloneDefaultWorkspaceCloseCurrentKeybinds(allocator: std.mem.Allocator) ![]Ke
 fn cloneDefaultCommandPaletteKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("CommandOrControl+Shift+P"),
+    });
+}
+
+fn cloneDefaultCompanionKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Ctrl+Shift+Space"),
     });
 }
 
@@ -1505,6 +1524,32 @@ test "array parsing deduplicates repeated bindings" {
 
     try std.testing.expectEqual(@as(usize, 1), config.refresh.len);
     try std.testing.expectEqual(sdl.Keycode.f5, config.refresh[0].key);
+}
+
+test "Companion keybind defaults overrides disables and deduplicates" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.companion.len);
+    try std.testing.expect(config.companion[0].ctrl);
+    try std.testing.expect(config.companion[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.space, config.companion[0].key);
+
+    var overridden = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"companion": ["Alt+C", "alt+c"]}}
+    , .{});
+    defer overridden.deinit();
+    config.applyOverrides(overridden.value);
+    try std.testing.expectEqual(@as(usize, 1), config.companion.len);
+    try std.testing.expect(config.companion[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.c, config.companion[0].key);
+
+    var disabled = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"companion": null}}
+    , .{});
+    defer disabled.deinit();
+    config.applyOverrides(disabled.value);
+    try std.testing.expectEqual(@as(usize, 0), config.companion.len);
 }
 
 test "open keybind override accepts a single accelerator" {

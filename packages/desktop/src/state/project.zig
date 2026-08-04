@@ -355,6 +355,7 @@ pub const Project = struct {
     workspace_layout: WorkspaceLayout,
     threads: std.ArrayList(ChatThread),
     archived_threads: std.ArrayList(ChatThread),
+    companion_thread_local_id: ?[:0]const u8 = null,
     selected_thread_index: usize = 0,
     /// Last chat or terminal workspace pane the user focused; used to default
     /// the inspector design-mode "Send to" target (not persisted).
@@ -391,6 +392,7 @@ pub const Project = struct {
             .workspace_layout = try WorkspaceLayout.initDefaultChat(allocator),
             .threads = .empty,
             .archived_threads = .empty,
+            .companion_thread_local_id = null,
             .selected_thread_index = 0,
             .sidebar_thread_indices = .empty,
             .sidebar_committed_thread_count = 0,
@@ -453,6 +455,85 @@ pub const Project = struct {
         try self.threads.append(allocator, thread);
         self.selected_thread_index = self.threads.items.len - 1;
         return self.selected_thread_index;
+    }
+
+    /// Resolves or creates the one pane-less Companion thread without changing
+    /// the selected thread or workspace layout.
+    pub fn ensureCompanionThread(self: *Project, allocator: std.mem.Allocator) !*ChatThread {
+        if (self.companion_thread_local_id) |local_id| {
+            for (self.threads.items) |*thread| {
+                if (std.mem.eql(u8, thread.local_thread_id, local_id)) return thread;
+            }
+            allocator.free(local_id);
+            self.companion_thread_local_id = null;
+        }
+
+        var thread = try ChatThread.init(allocator, "Companion");
+        errdefer thread.deinit(allocator);
+        const local_id = try allocator.dupeZ(u8, thread.local_thread_id);
+        errdefer allocator.free(local_id);
+        try self.threads.append(allocator, thread);
+        const appended = &self.threads.items[self.threads.items.len - 1];
+        self.companion_thread_local_id = local_id;
+        return appended;
+    }
+
+    pub fn isCompanionThread(self: *const Project, thread: *const ChatThread) bool {
+        const local_id = self.companion_thread_local_id orelse return false;
+        return std.mem.eql(u8, local_id, thread.local_thread_id);
+    }
+
+    /// Removes the eager-created Companion rows produced by the phase-two
+    /// prototype, but only when no durable or live owner can observe them.
+    pub fn cleanupPristineLegacyCompanion(self: *Project, allocator: std.mem.Allocator) bool {
+        const local_id = self.companion_thread_local_id orelse return false;
+        const thread_index = for (self.threads.items, 0..) |thread, index| {
+            if (std.mem.eql(u8, thread.local_thread_id, local_id)) break index;
+        } else return false;
+        const thread = &self.threads.items[thread_index];
+        if (thread.committed or thread.messages.items.len != 0 or thread.provider_thread_id != null or
+            thread.currentDraft().len != 0 or thread.draftImageCount() != 0 or thread.background_tasks.items.len != 0 or
+            thread.completion_pending or self.selected_thread_index == thread_index)
+        {
+            return false;
+        }
+        for (self.workspace_layout.panes.items) |pane| switch (pane.ref) {
+            .chat => |ref| if (ref.thread_index == thread_index) return false,
+            else => {},
+        };
+        const send_state = thread.send_state;
+        send_state.mutex.lock();
+        const pristine_send = send_state.status == .idle and send_state.provisional_provider_thread_id == null and
+            send_state.active_turn_id == null and send_state.daemon_turn_id == null and !send_state.daemon_owned and
+            send_state.daemon_last_seq == 0 and send_state.result == null and send_state.error_message == null and
+            send_state.control_error_message == null and send_state.provider == null and send_state.partial_text.items.len == 0 and
+            !send_state.thinking and send_state.pending_events.items.len == 0 and send_state.pending_diff_files.items.len == 0 and
+            !send_state.pending_diff_has_turn_snapshot and send_state.pending_approval == null and send_state.approval_decision == null and
+            send_state.pending_followup == null and !send_state.pending_followup_signal_sent and !send_state.stop_requested and
+            !send_state.stop_signal_sent and send_state.worker == null and !send_state.local_command and send_state.local_command_text == null and
+            send_state.local_command_cwd == null and send_state.local_command_shell == null and send_state.active_local_child == null;
+        send_state.mutex.unlock();
+        if (!pristine_send) return false;
+
+        allocator.free(self.companion_thread_local_id.?);
+        self.companion_thread_local_id = null;
+        var removed = self.threads.orderedRemove(thread_index);
+        removed.deinit(allocator);
+        for (self.workspace_layout.panes.items) |*pane| switch (pane.ref) {
+            .chat => |*ref| if (ref.thread_index > thread_index) {
+                ref.thread_index -= 1;
+            },
+            else => {},
+        };
+        if (thread_index < self.selected_thread_index) {
+            self.selected_thread_index -= 1;
+        } else if (self.threads.items.len == 0) {
+            self.selected_thread_index = 0;
+        } else if (self.selected_thread_index >= self.threads.items.len) {
+            self.selected_thread_index = self.threads.items.len - 1;
+        }
+        self.invalidateSidebarThreadCache();
+        return true;
     }
 
     pub fn normalize(self: *Project, allocator: std.mem.Allocator, default_terminal_font_size: f32) !void {
@@ -697,7 +778,7 @@ pub const Project = struct {
     pub fn committedThreadCount(self: *const Project) usize {
         var count: usize = 0;
         for (self.threads.items) |thread| {
-            if (thread.committed) count += 1;
+            if (thread.committed and !self.isCompanionThread(&thread)) count += 1;
         }
         return count;
     }
@@ -730,6 +811,7 @@ pub const Project = struct {
             thread.deinit(allocator);
         }
         self.archived_threads.deinit(allocator);
+        if (self.companion_thread_local_id) |local_id| allocator.free(local_id);
         self.sidebar_thread_indices.deinit(allocator);
     }
 
@@ -740,7 +822,7 @@ pub const Project = struct {
         self.sidebar_committed_thread_count = 0;
 
         for (self.threads.items, 0..) |thread, index| {
-            if (!thread.committed) continue;
+            if (!thread.committed or self.isCompanionThread(&thread)) continue;
             self.sidebar_committed_thread_count += 1;
             self.sidebar_thread_indices.append(allocator, index) catch {
                 self.sidebar_thread_cache_dirty = true;
@@ -1023,4 +1105,203 @@ test "terminal process identity transitions preserve failures and never reuse re
             try std.testing.expect(!std.mem.eql(u8, outcome.process_id, other.process_id));
         }
     }
+}
+
+test "Companion ensure is pane-less stable and replaces stale identity" {
+    const allocator = std.testing.allocator;
+    var project = try Project.init(allocator, "companion", "Companion", "/tmp/companion", 0);
+    defer project.deinit(allocator);
+    const selected_before = project.selected_thread_index;
+    const pane_count_before = project.workspace_layout.panes.items.len;
+    const focused_pane_before = project.workspace_layout.focused_pane_id;
+    try std.testing.expect(project.companion_thread_local_id == null);
+
+    const first = try project.ensureCompanionThread(allocator);
+    const first_id = try allocator.dupe(u8, first.local_thread_id);
+    defer allocator.free(first_id);
+    const count_after_first = project.threads.items.len;
+    const repeated = try project.ensureCompanionThread(allocator);
+    try std.testing.expectEqualStrings(first_id, repeated.local_thread_id);
+    try std.testing.expectEqual(count_after_first, project.threads.items.len);
+    try std.testing.expectEqual(selected_before, project.selected_thread_index);
+    try std.testing.expectEqual(pane_count_before, project.workspace_layout.panes.items.len);
+    try std.testing.expectEqual(focused_pane_before, project.workspace_layout.focused_pane_id);
+    try std.testing.expect(project.isCompanionThread(repeated));
+
+    allocator.free(project.companion_thread_local_id.?);
+    project.companion_thread_local_id = try allocator.dupeZ(u8, "missing-companion");
+    const replacement = try project.ensureCompanionThread(allocator);
+    try std.testing.expect(!std.mem.eql(u8, first_id, replacement.local_thread_id));
+    try std.testing.expectEqual(count_after_first + 1, project.threads.items.len);
+    try std.testing.expectEqual(selected_before, project.selected_thread_index);
+    try std.testing.expectEqual(pane_count_before, project.workspace_layout.panes.items.len);
+}
+
+test "committed Companion is absent from sidebar cache" {
+    const allocator = std.testing.allocator;
+    var project = try Project.init(allocator, "companion-sidebar", "Companion", "/tmp/companion-sidebar", 0);
+    defer project.deinit(allocator);
+    project.threads.items[0].committed = true;
+    const companion = try project.ensureCompanionThread(allocator);
+    companion.committed = true;
+    project.invalidateSidebarThreadCache();
+
+    try std.testing.expectEqual(@as(usize, 1), project.committedThreadCount());
+    try std.testing.expectEqual(@as(usize, 1), project.committedThreadCountCached(allocator));
+    const indices = project.sortedCommittedThreadIndices(allocator);
+    try std.testing.expectEqual(@as(usize, 1), indices.len);
+    try std.testing.expect(!project.isCompanionThread(&project.threads.items[indices[0]]));
+}
+
+test "legacy pristine Companion cleanup repairs non-last indexes" {
+    const allocator = std.testing.allocator;
+    var project = try Project.init(allocator, "legacy", "Legacy", "/tmp/legacy", 0);
+    defer project.deinit(allocator);
+    const companion = try project.ensureCompanionThread(allocator);
+    const companion_id = try allocator.dupe(u8, companion.local_thread_id);
+    defer allocator.free(companion_id);
+    _ = try project.addThread(allocator);
+    const later_pane = try project.workspace_layout.createChatPane(allocator, 2);
+    try project.workspace_layout.ensurePaneInRootSplit(allocator, later_pane, .vertical, 0.5);
+    project.selected_thread_index = 2;
+
+    try std.testing.expect(project.cleanupPristineLegacyCompanion(allocator));
+    try std.testing.expect(project.companion_thread_local_id == null);
+    try std.testing.expectEqual(@as(usize, 2), project.threads.items.len);
+    try std.testing.expectEqual(@as(usize, 1), project.selected_thread_index);
+    try std.testing.expectEqual(@as(usize, 1), project.workspace_layout.paneById(later_pane).?.ref.chat.thread_index);
+    for (project.threads.items) |thread| try std.testing.expect(!std.mem.eql(u8, companion_id, thread.local_thread_id));
+}
+
+test "legacy Companion cleanup preserves every non-pristine owner" {
+    const allocator = std.testing.allocator;
+    var project = try Project.init(allocator, "legacy-owned", "Legacy", "/tmp/legacy-owned", 0);
+    defer project.deinit(allocator);
+    const companion = try project.ensureCompanionThread(allocator);
+    companion.setDraft("keep me");
+    try std.testing.expect(!project.cleanupPristineLegacyCompanion(allocator));
+    companion.clearDraft();
+    try companion.setDraftImage(allocator, "/tmp/image.png", "image/png", 1);
+    try std.testing.expect(!project.cleanupPristineLegacyCompanion(allocator));
+    companion.clearDraftImage(allocator);
+    companion.provider_thread_id = try allocator.dupeZ(u8, "provider-thread");
+    try std.testing.expect(!project.cleanupPristineLegacyCompanion(allocator));
+    allocator.free(companion.provider_thread_id.?);
+    companion.provider_thread_id = null;
+    companion.send_state.status = .pending;
+    try std.testing.expect(!project.cleanupPristineLegacyCompanion(allocator));
+    companion.send_state.status = .idle;
+    _ = try project.workspace_layout.createChatPane(allocator, 1);
+    try std.testing.expect(!project.cleanupPristineLegacyCompanion(allocator));
+    try std.testing.expectEqualStrings(companion.local_thread_id, project.companion_thread_local_id.?);
+}
+
+test "legacy Companion cleanup rejects all send-owned presentation and action state" {
+    const allocator = std.testing.allocator;
+    const Owner = enum {
+        result,
+        provider_error,
+        control_error,
+        provider,
+        provisional_identity,
+        active_turn,
+        daemon_turn,
+        daemon_sequence,
+        partial,
+        thinking,
+        event,
+        diff,
+        diff_snapshot,
+        approval,
+        decision,
+        followup,
+        followup_signal,
+        stop_request,
+        stop_signal,
+        local_command,
+        local_text,
+        local_cwd,
+        local_shell,
+    };
+
+    for (std.enums.values(Owner)) |owner| {
+        var project = try Project.init(allocator, "legacy-send-owner", "Legacy", "/tmp/legacy-send-owner", 0);
+        errdefer project.deinit(allocator);
+        const companion = try project.ensureCompanionThread(allocator);
+        const send_state = companion.send_state;
+        switch (owner) {
+            .result => send_state.result = .{
+                .provider_thread_id = try std.heap.page_allocator.dupe(u8, "provider"),
+                .reply_text = try std.heap.page_allocator.dupe(u8, "reply"),
+            },
+            .provider_error => send_state.error_message = try std.heap.page_allocator.dupe(u8, "provider failed"),
+            .control_error => send_state.control_error_message = try std.heap.page_allocator.dupe(u8, "action failed"),
+            .provider => send_state.provider = .codex,
+            .provisional_identity => send_state.provisional_provider_thread_id = try std.heap.page_allocator.dupe(u8, "provisional"),
+            .active_turn => send_state.active_turn_id = try std.heap.page_allocator.dupe(u8, "active"),
+            .daemon_turn => send_state.daemon_turn_id = try std.heap.page_allocator.dupe(u8, "daemon"),
+            .daemon_sequence => send_state.daemon_last_seq = 1,
+            .partial => try send_state.partial_text.appendSlice(std.heap.page_allocator, "partial"),
+            .thinking => send_state.thinking = true,
+            .event => try send_state.pending_events.append(std.heap.page_allocator, .{
+                .role = .system,
+                .author = try std.heap.page_allocator.dupe(u8, "Event"),
+                .body = try std.heap.page_allocator.dupe(u8, "body"),
+            }),
+            .diff => try send_state.pending_diff_files.append(std.heap.page_allocator, .{
+                .path = try std.heap.page_allocator.dupe(u8, "file.zig"),
+                .additions = 1,
+                .deletions = 0,
+            }),
+            .diff_snapshot => send_state.pending_diff_has_turn_snapshot = true,
+            .approval => send_state.pending_approval = .{
+                .call_id = try std.heap.page_allocator.dupe(u8, "call"),
+                .title = try std.heap.page_allocator.dupe(u8, "Approve"),
+                .body = try std.heap.page_allocator.dupe(u8, "body"),
+            },
+            .decision => send_state.approval_decision = .approve,
+            .followup => send_state.pending_followup = .{
+                .kind = .queue,
+                .prompt = try std.heap.page_allocator.dupe(u8, "next"),
+            },
+            .followup_signal => send_state.pending_followup_signal_sent = true,
+            .stop_request => send_state.stop_requested = true,
+            .stop_signal => send_state.stop_signal_sent = true,
+            .local_command => send_state.local_command = true,
+            .local_text => send_state.local_command_text = try std.heap.page_allocator.dupe(u8, "echo ok"),
+            .local_cwd => send_state.local_command_cwd = try std.heap.page_allocator.dupe(u8, "/tmp"),
+            .local_shell => send_state.local_command_shell = try std.heap.page_allocator.dupe(u8, "/bin/sh"),
+        }
+        try std.testing.expect(!project.cleanupPristineLegacyCompanion(allocator));
+        try std.testing.expect(project.companion_thread_local_id != null);
+        project.deinit(allocator);
+    }
+}
+
+test "legacy Companion cleanup rejects selection and stale identity and is idempotent" {
+    const allocator = std.testing.allocator;
+    var project = try Project.init(allocator, "legacy-edge", "Legacy", "/tmp/legacy-edge", 0);
+    defer project.deinit(allocator);
+    _ = try project.ensureCompanionThread(allocator);
+    project.selected_thread_index = 1;
+    try std.testing.expect(!project.cleanupPristineLegacyCompanion(allocator));
+
+    project.selected_thread_index = 0;
+    try std.testing.expect(project.cleanupPristineLegacyCompanion(allocator));
+    try std.testing.expect(!project.cleanupPristineLegacyCompanion(allocator));
+
+    project.companion_thread_local_id = try allocator.dupeZ(u8, "stale-designation");
+    try std.testing.expect(!project.cleanupPristineLegacyCompanion(allocator));
+
+    allocator.free(project.companion_thread_local_id.?);
+    var archived = try ChatThread.init(allocator, "Archived Companion");
+    archived.archived = true;
+    const archived_id = try allocator.dupeZ(u8, archived.local_thread_id);
+    project.archived_threads.append(allocator, archived) catch |err| {
+        allocator.free(archived_id);
+        archived.deinit(allocator);
+        return err;
+    };
+    project.companion_thread_local_id = archived_id;
+    try std.testing.expect(!project.cleanupPristineLegacyCompanion(allocator));
 }

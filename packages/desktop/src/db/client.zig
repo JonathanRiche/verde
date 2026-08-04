@@ -74,7 +74,7 @@ pub const Client = struct {
         defer workspaces.deinit(arena);
 
         var workspace_rows = try self.conn.rows(
-            "select id, workspace_id, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, " ++
+            "select id, workspace_id, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, companion_thread_local_id, " ++
                 "herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms " ++
                 "from workspaces order by sort_index",
             .{},
@@ -96,18 +96,19 @@ pub const Client = struct {
                 .terminal_docks_json = try dupeOptionalText(arena, workspace_row.nullableText(10)),
                 .workspace_layout_json = try dupeOptionalText(arena, workspace_row.nullableText(11)),
                 .selected_thread_index = @intCast(workspace_row.int(12)),
+                .companion_thread_local_id = try dupeOptionalText(arena, workspace_row.nullableText(13)),
                 .herdr_link = try loadOptionalHerdrLink(
                     arena,
-                    workspace_row.nullableText(13),
                     workspace_row.nullableText(14),
                     workspace_row.nullableText(15),
                     workspace_row.nullableText(16),
                     workspace_row.nullableText(17),
                     workspace_row.nullableText(18),
-                    workspace_row.nullableInt(19),
+                    workspace_row.nullableText(19),
                     workspace_row.nullableInt(20),
-                    workspace_row.nullableText(21),
-                    workspace_row.nullableInt(22),
+                    workspace_row.nullableInt(21),
+                    workspace_row.nullableText(22),
+                    workspace_row.nullableInt(23),
                 ),
                 .threads = try self.loadThreads(arena, workspace_id),
             });
@@ -189,9 +190,9 @@ pub const Client = struct {
         for (state.projects, 0..) |project, project_index| {
             const herdr_link = project.herdr_link;
             try self.conn.exec(
-                "insert into workspaces (workspace_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, " ++
+                "insert into workspaces (workspace_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, companion_thread_local_id, " ++
                     "herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms) " ++
-                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                 .{
                     project.id orelse project.path,
                     @as(i64, @intCast(project_index)),
@@ -206,6 +207,7 @@ pub const Client = struct {
                     project.terminal_docks_json,
                     project.workspace_layout_json,
                     @as(i64, @intCast(project.selected_thread_index)),
+                    project.companion_thread_local_id,
                     if (herdr_link) |link| link.remote_alias else null,
                     if (herdr_link) |link| link.session_name else null,
                     if (herdr_link) |link| link.workspace_id else null,
@@ -722,6 +724,7 @@ test "save and load preserve archived projects and threads" {
                 .label = "Active Workspace",
                 .path = "/tmp/project-active",
                 .selected_thread_index = 0,
+                .companion_thread_local_id = "companion-local",
                 .threads = &.{
                     .{
                         .title = "Visible thread",
@@ -735,15 +738,15 @@ test "save and load preserve archived projects and threads" {
                         }},
                     },
                     .{
-                        .title = "Archived thread",
-                        .archived = true,
+                        .title = "Companion",
                         .committed = true,
+                        .local_thread_id = "companion-local",
                         .provider = .codex,
                         .draft = "",
                         .messages = &.{.{
                             .role = .user,
                             .author = "You",
-                            .body = "archived-thread",
+                            .body = "companion-thread",
                         }},
                     },
                 },
@@ -779,7 +782,8 @@ test "save and load preserve archived projects and threads" {
     try testing.expect(!loaded.?.value.projects[0].archived);
     try testing.expectEqual(@as(usize, 2), loaded.?.value.projects[0].threads.?.len);
     try testing.expect(!loaded.?.value.projects[0].threads.?[0].archived);
-    try testing.expect(loaded.?.value.projects[0].threads.?[1].archived);
+    try testing.expectEqualStrings("companion-local", loaded.?.value.projects[0].companion_thread_local_id.?);
+    try testing.expectEqualStrings("companion-local", loaded.?.value.projects[0].threads.?[1].local_thread_id.?);
     try testing.expect(loaded.?.value.projects[1].archived);
     try testing.expectEqual(@as(usize, 1), loaded.?.value.projects[1].threads.?.len);
     try testing.expect(loaded.?.value.projects[1].threads.?[0].archived);

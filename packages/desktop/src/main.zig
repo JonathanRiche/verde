@@ -41,6 +41,7 @@ comptime {
 }
 
 const native_state = @import("state.zig");
+const companion_controller = @import("state/companion_controller.zig");
 const AppState = native_state.AppState;
 const Storage = native_state.Storage;
 
@@ -691,6 +692,14 @@ fn mainInner(init: std.process.Init) !void {
 // Resolves the OS mouse cursor each frame: terminal and browser-reported
 // shapes win, then interactive Palette controls, otherwise the default arrow.
 fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
+    const mouse_x = state.transcript_controller.palette_mouse_x;
+    const mouse_y = state.transcript_controller.palette_mouse_y;
+    if (!modalHitAtMouse(state)) {
+        if (ui_layout.companionHitAt(state, mouse_x, mouse_y)) |action| {
+            applySystemCursor(cache, systemCursorForCompanionAction(action));
+            return;
+        }
+    }
     // Workspace pane chrome overlays chat, terminal, and native browser
     // content, so its pointer affordance must win before content cursors.
     if (!modalHitAtMouse(state) and workspace_panes_ui.wantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) {
@@ -756,6 +765,17 @@ fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
     applySystemCursor(cache, .default);
 }
 
+fn systemCursorForCompanionAction(action: companion_controller.HitAction) sdl.SystemCursor {
+    return switch (action) {
+        .open, .collapse, .run_tab, .activity_tab, .approve, .deny => .pointer,
+        .panel, .body => .default,
+    };
+}
+
+fn routeCompanionWheel(state: *AppState, x: f32, y: f32, wheel_y: f32) bool {
+    return ui_layout.handleCompanionWheel(state, x, y, wheel_y);
+}
+
 fn applyBrowserCursor(cache: *SystemCursorCache, shape: browser_runtime.CursorShape) void {
     if (shape == .hidden) {
         if (sdl.cursorVisible()) sdl.hideCursor() catch {};
@@ -807,6 +827,37 @@ test "browser cursor shapes map to cached SDL system cursor families" {
     try std.testing.expectEqual(sdl.SystemCursor.ne_resize, systemCursorForBrowserShape(.ne_resize));
     try std.testing.expectEqual(sdl.SystemCursor.not_allowed, systemCursorForBrowserShape(.no_drop));
     try std.testing.expectEqual(sdl.SystemCursor.default, systemCursorForBrowserShape(.custom));
+}
+
+test "production Companion cursor and wheel routing preserves direct ownership" {
+    const interactive = [_]companion_controller.HitAction{ .open, .collapse, .run_tab, .activity_tab, .approve, .deny };
+    for (interactive) |action| try std.testing.expectEqual(sdl.SystemCursor.pointer, systemCursorForCompanionAction(action));
+    try std.testing.expectEqual(sdl.SystemCursor.default, systemCursorForCompanionAction(.panel));
+    try std.testing.expectEqual(sdl.SystemCursor.default, systemCursorForCompanionAction(.body));
+
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.companion_controller = companion_controller.init();
+    state.companion_controller.show();
+    state.companion_composer = native_state.CompanionComposerPrompt.init();
+    state.companion_composer.setBounds(.{ .x = 200.0, .y = 200.0, .w = 100.0, .h = 100.0 });
+    state.lifecycle = .{};
+    defer state.companion_composer.deinit(allocator);
+    var frame: companion_controller.Frame = .{};
+    frame.activity_count = 10;
+    state.companion_controller.setFrame(frame);
+    state.companion_controller.selectTab(.activity);
+    state.companion_controller.addHit(.{ .x = 0.0, .y = 0.0, .w = 100.0, .h = 100.0 }, .panel);
+    state.companion_controller.addHit(.{ .x = 0.0, .y = 0.0, .w = 100.0, .h = 100.0 }, .body);
+
+    try std.testing.expect(routeCompanionWheel(&state, 50.0, 50.0, -1.0));
+    try std.testing.expectEqual(@as(f32, 32.0), state.companion_controller.activity_scroll_y);
+    try std.testing.expectEqual(@as(f32, 574.0), state.companion_controller.activity_max_scroll);
+    try std.testing.expect(!state.companion_controller.activity_follow_tail);
+    const unchanged_offset = state.companion_controller.activity_scroll_y;
+    try std.testing.expect(!routeCompanionWheel(&state, 150.0, 150.0, -1.0));
+    try std.testing.expectEqual(unchanged_offset, state.companion_controller.activity_scroll_y);
 }
 
 // True when any retained modal hit rect (scrim or control) covers the current
@@ -1364,6 +1415,8 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
         },
         .window_focus_lost => {
             state.window_input_focus = false;
+            ui_layout.resetCompanionInputCaptures(state);
+            state.blurCompanionComposer();
         },
         .key_down => {
             if (browserInputDebugEnabled()) {
@@ -1372,11 +1425,35 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     .{ @intFromEnum(event.key.key), @intFromEnum(event.key.scancode), state.isBrowserPaneFocused(), state.isBrowserVisible() },
                 );
             }
+            if (event.key.key == .escape and ui_layout.companionOwnsEscapeKey(state)) {
+                _ = ui_layout.handleCompanionEscapeKey(state, true);
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (terminal_panel_ui.handlePaletteKeyDown(state, &event.key)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
             const action = keyboard.actionForEvent(&event.key);
+            // True modals own keys before the persistent Companion, while the
+            // Companion visibility controls remain global across pane focus.
+            if (ui_layout.handlePaletteKeyDown(state, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (event.key.key == .escape and ui_layout.handleCompanionEscapeKey(state, true)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (action == .companion) {
+                handleKeyboardAction(state, keyboard, .companion);
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (state.routeCompanionComposerKeyDown(&event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (keyboard.workspacePaneSelectIndexForEvent(&event.key)) |pane_ordinal| {
                 if (state.focusCurrentProjectWorkspacePaneAtSidebarIndex(pane_ordinal)) {
                     syncWindowTextInput(window, state);
@@ -1414,10 +1491,6 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     if (state.attachClipboardImageToCurrentDraft()) return true;
                     if (state.pasteClipboardTextIntoPaletteComposer()) return true;
                 }
-            }
-            if (ui_layout.handlePaletteKeyDown(state, &event.key)) {
-                syncWindowTextInput(window, state);
-                return true;
             }
             // The command palette must open from anywhere — including while
             // the composer or a terminal owns focus — so it dispatches before
@@ -1557,6 +1630,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     .{ @intFromEnum(event.key.key), @intFromEnum(event.key.scancode), state.isBrowserPaneFocused(), state.isBrowserVisible() },
                 );
             }
+            if (event.key.key == .escape and ui_layout.handleCompanionEscapeKey(state, false)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (state.isNativeBrowserSurfaceFocused()) {
                 state.browser_controller.address_focused = false;
                 syncWindowTextInput(window, state);
@@ -1574,6 +1651,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             const text_input = std.mem.sliceTo(event.text.text, 0);
             if (suppressDuplicateMacosTextInput(text_input, event.text.timestamp)) return true;
             if (ui_layout.handlePaletteTextInput(state, text_input)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (state.routeCompanionComposerTextInput(text_input)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -1629,6 +1710,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (state.palette_modal_pointer_captured or modal_owns_motion) {
                 return true;
             }
+            if (ui_layout.handleCompanionMouseMotion(state, event.motion.x, event.motion.y, event.motion.state.left != 0)) {
+                return true;
+            }
             // Composer popovers (model picker / run config) draw above the
             // panes, so their hover/drag routing must win over transcript and
             // pane motion handlers below.
@@ -1656,6 +1740,11 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             _ = state.handleBrowserMouse(browserMouseMotionEvent(&event.motion));
         },
         .mouse_button_down, .mouse_button_up => {
+            if (!event.button.down and ui_layout.companionOwnsPointerRelease(state, event.button.button)) {
+                _ = ui_layout.handleCompanionMouseButton(state, event.button.x, event.button.y, event.button.button, false, event.button.clicks);
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (event.button.button == 1 and !event.button.down and state.palette_modal_pointer_captured) {
                 state.palette_modal_pointer_captured = false;
                 state.modal_text_drag_active = false;
@@ -1678,6 +1767,11 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (ui_layout.handleCompanionMouseButton(state, event.button.x, event.button.y, event.button.button, event.button.down, event.button.clicks)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (event.button.button == 1 and event.button.down) state.blurCompanionComposer();
             // Composer popovers overlay the panes; clicks on (or dismissing)
             // them must not fall through to workspace/transcript handlers.
             if (state.routeComposerPopoverMouseButton(&event.button, ui_scale)) {
@@ -1845,6 +1939,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (ui_layout.hasPaletteModal(state)) return true;
+            if (routeCompanionWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
+                return true;
+            }
             // Composer popovers overlay the panes; scrolling their lists must
             // win over sidebar/terminal/transcript wheel handlers below.
             if (state.routeComposerPopoverWheel(&event.wheel, ui_scale)) {
@@ -1894,6 +1991,7 @@ fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
     }
     const needs_sdl_text_input = state.terminal_controller.focused or
         state.composer_controller.composer.focused or
+        state.companion_composer.focused or
         // The model picker's embedded search field consumes typed characters
         // while the popover is open.
         state.composer_controller.model_picker.isOpen() or
@@ -2277,6 +2375,7 @@ fn handleKeyboardAction(
         .open_editor => state.openCurrentProjectEditor(.configured),
         .new_thread => _ = openHotkeyWorkspaceChatThread(state),
         .command_palette => state.openCommandPalette(null),
+        .companion => state.toggleCompanion(),
         .toggle_sidebar => state.toggleSidebarCollapsed(),
         .toggle_sidebar_hidden => state.toggleSidebarHidden(),
         .toggle_browser => state.toggleBrowser(),
@@ -2629,6 +2728,7 @@ test {
     _ = @import("app/update_installer.zig");
     _ = @import("app/updater.zig");
     _ = @import("ui/command_palette.zig");
+    _ = @import("ui/companion.zig");
     _ = @import("ui/diff_view_cache.zig");
     _ = @import("compile_tests/windows_conpty.zig");
 }

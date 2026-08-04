@@ -137,6 +137,7 @@ pub const PersistedProject = struct {
     terminal_docks_json: ?[]const u8 = null,
     workspace_layout_json: ?[]const u8 = null,
     selected_thread_index: usize = 0,
+    companion_thread_local_id: ?[]const u8 = null,
     herdr_link: ?PersistedHerdrWorkspaceLink = null,
     threads: ?[]const PersistedThread = null,
     provider: Provider = .opencode,

@@ -45,6 +45,7 @@ const state_storage = @import("state/storage.zig");
 const persistence = @import("state/persistence.zig");
 const command_controller = @import("state/command_controller.zig");
 const composer_controller = @import("state/composer_controller.zig");
+const companion_controller = @import("state/companion_controller.zig");
 const browser_controller = @import("state/browser_controller.zig");
 const workspace_controller = @import("state/workspace_controller.zig");
 const lifecycle_controller = @import("state/lifecycle_controller.zig");
@@ -257,6 +258,36 @@ fn paletteComposerStyle() PaletteComposerPrompt.Style {
     };
 }
 
+fn companionComposerStyle() CompanionComposerPrompt.Style {
+    const chrome = theme.companionChrome();
+    return .{
+        .background_color = paletteColor(chrome.surface),
+        .border_color = paletteColor(chrome.border),
+        .focus_border_color = paletteColor(chrome.accent),
+        .focus_border_width = 1.0,
+        .control_background_color = paletteColor(theme.withAlpha(chrome.controls, 0)),
+        .control_hover_color = paletteColor(theme.withAlpha(chrome.controls, 70)),
+        .separator_color = paletteColor(chrome.hairline),
+        .send_color = paletteColor(chrome.accent),
+        .send_hover_color = paletteColor(chrome.accent_hi),
+        .send_foreground_color = paletteColor(chrome.accent_fg),
+        .stop_button_color = paletteColor(chrome.warning),
+        .stop_button_hover_color = paletteColor(theme.lighten(chrome.warning, 0.08)),
+        .stop_foreground_color = paletteColor(chrome.warning_fg),
+        .text_color = paletteColor(chrome.text),
+        .placeholder_color = paletteColor(theme.withAlpha(chrome.text_subtle, 220)),
+        .icon_color = paletteColor(chrome.text_muted),
+        .cursor_color = paletteColor(chrome.text),
+        .selection_color = paletteColor(chrome.selection),
+        .scrollbar_track_color = paletteColor(theme.withAlpha(chrome.controls, 110)),
+        .scrollbar_thumb_color = paletteColor(theme.withAlpha(chrome.text_muted, 200)),
+        .menu_background_color = paletteColor(chrome.surface_deep),
+        .menu_border_color = paletteColor(chrome.menu_border),
+        .menu_selected_color = paletteColor(chrome.menu_selected),
+        .menu_hover_color = paletteColor(chrome.menu_hover),
+    };
+}
+
 pub const PaletteComposerPrompt = palette.composerPrompt(.{
     // Geometry retuned for the 15pt toolbar / 16pt body fonts. Earlier numbers
     // assumed ~24pt pills and looked over-padded after the type-scale change.
@@ -340,6 +371,58 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .send_icon = "",
     // codicon-debug-stop
     .stop_icon = "\u{EAD7}",
+    .z_index = 120,
+});
+
+/// The Companion uses the shared Palette composer behavior with the accepted
+/// compact steering geometry from its sidecar footer.
+pub const CompanionComposerPrompt = palette.composerPrompt(.{
+    .padding_x = 11.0,
+    .padding_y = 9.0,
+    .toolbar_height = 27.0,
+    .toolbar_gap = 6.0,
+    .control_gap = 6.0,
+    .pill_padding_x = 8.0,
+    .pill_icon_gap = 6.0,
+    .pill_chevron_gap = 0.0,
+    .model_min_width = 126.0,
+    .model_max_width = 126.0,
+    .corner_radius = 14.0,
+    .border_width = 1.0,
+    .background_color = paletteColor(theme.companionChromeFor(theme.default_colors).surface),
+    .border_color = paletteColor(theme.companionChromeFor(theme.default_colors).border),
+    .focus_border_color = paletteColor(theme.default_colors.accent),
+    .focus_border_width = 1.0,
+    .bold_font_role = .mono,
+    .control_background_color = paletteColor(theme.withAlpha(theme.default_colors.border_muted, 0)),
+    .control_hover_color = paletteColor(theme.withAlpha(theme.default_colors.border_muted, 70)),
+    .separator_color = paletteColor(theme.companionChromeFor(theme.default_colors).hairline),
+    .menu_background_color = paletteColor(theme.companionChromeFor(theme.default_colors).surface_deep),
+    .menu_border_color = paletteColor(theme.companionChromeFor(theme.default_colors).menu_border),
+    .menu_selected_color = paletteColor(theme.withAlpha(theme.default_colors.border, 218)),
+    .menu_hover_color = paletteColor(theme.companionChromeFor(theme.default_colors).menu_hover),
+    .send_color = paletteColor(theme.default_colors.accent),
+    .send_hover_color = paletteColor(theme.companionChromeFor(theme.default_colors).accent_hi),
+    .send_foreground_color = paletteColor(theme.companionChromeFor(theme.default_colors).accent_fg),
+    .stop_button_color = paletteColor(theme.default_colors.warning),
+    .stop_button_hover_color = paletteColor(theme.lighten(theme.default_colors.warning, 0.08)),
+    .stop_foreground_color = paletteColor(theme.companionChromeFor(theme.default_colors).warning_fg),
+    .text_color = paletteColor(theme.default_colors.text),
+    .icon_color = paletteColor(theme.default_colors.text_muted),
+    .cursor_color = paletteColor(theme.default_colors.text),
+    .selection_color = paletteColor(theme.companionChromeFor(theme.default_colors).selection),
+    .scrollbar_track_color = paletteColor(theme.withAlpha(theme.default_colors.border_muted, 110)),
+    .scrollbar_thumb_color = paletteColor(theme.withAlpha(theme.default_colors.text_muted, 200)),
+    .placeholder_color = paletteColor(theme.withAlpha(theme.default_colors.text_subtle, 220)),
+    .font_size = 12.5,
+    .toolbar_font_size = 10.5,
+    .icon_font_size = 12.0,
+    .placeholder = "Steer the run…",
+    .model_icon = "",
+    .model_label = "Workspace · verde",
+    .chevron_icon = "",
+    .send_icon = "↑",
+    .stop_icon = "■",
     .z_index = 120,
 });
 
@@ -657,6 +740,74 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
         .model_clicked => state.openPaletteModelPicker(),
         .reasoning_clicked => state.toggleRunConfigPopover(),
     }
+}
+
+fn companionComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromptEvent) void {
+    const state = appStateFromContext(context) orelse return;
+    const project = state.currentProjectMutable();
+    switch (event) {
+        .text_changed => |text| {
+            const local_id = project.companion_thread_local_id orelse return;
+            const thread = state.threadByLocalId(project.id, local_id) orelse return;
+            thread.setDraft(text);
+            state.markDirty();
+        },
+        .submitted => |text| submitCompanionPrompt(state, project, text),
+        .send_clicked => {
+            const local_id = project.companion_thread_local_id orelse return;
+            const thread = state.threadByLocalId(project.id, local_id) orelse return;
+            if (thread.isSendPendingForUi()) {
+                const stopped = state.abortThreadByLocalId(project.id, local_id);
+                state.companion_controller.ui_error = if (stopped) null else "Companion thread is no longer available.";
+            }
+        },
+        .focus_changed => |focused| {
+            if (focused) {
+                state.blurPaletteComposer();
+                state.terminal_controller.focused = false;
+                state.unfocusBrowserPane();
+            }
+        },
+        else => {},
+    }
+}
+
+fn submitCompanionPrompt(state: anytype, project: *Project, text: []const u8) void {
+    var temporary_thread: ?ChatThread = null;
+    defer if (temporary_thread) |*thread| thread.deinit(state.allocator);
+    const preflight_thread = existing: {
+        if (project.companion_thread_local_id) |local_id| {
+            if (state.threadByLocalId(project.id, local_id)) |thread| break :existing thread;
+        }
+        temporary_thread = ChatThread.init(state.allocator, "Companion") catch |err| {
+            log.err("failed to prepare Companion send: {s}", .{@errorName(err)});
+            return;
+        };
+        break :existing &temporary_thread.?;
+    };
+    const preflight_ok = state.preflightThreadPrompt(
+        state.project_controller.selected_index,
+        preflight_thread,
+        text,
+        &.{},
+    ) catch |err| {
+        log.err("Companion send preflight failed: {s}", .{@errorName(err)});
+        state.companion_controller.ui_error = "Companion provider is not ready.";
+        return;
+    };
+    if (!preflight_ok) return;
+    const thread = state.ensureCurrentCompanionThread() catch |err| {
+        log.err("failed to create Companion thread for send: {s}", .{@errorName(err)});
+        state.companion_controller.ui_error = "Could not create Companion thread.";
+        return;
+    };
+    const workspace_id = state.currentProject().id;
+    const sent = state.sendThreadPrompt(workspace_id, thread.local_thread_id, text, &.{}) catch |err| {
+        log.err("failed to send Companion prompt: {s}", .{@errorName(err)});
+        state.companion_controller.ui_error = "Could not send Companion prompt.";
+        return;
+    };
+    state.companion_controller.ui_error = if (sent) null else "Companion thread is no longer available.";
 }
 
 fn paletteComposerGetClipboard(context: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 {
@@ -1267,6 +1418,8 @@ pub const AppState = struct {
     sidebar_hidden: bool,
     sidebar_hover_revealed: bool,
     composer_controller: ComposerControllerState,
+    companion_controller: companion_controller,
+    companion_composer: CompanionComposerPrompt,
     palette_overlay_batch: palette.RenderBatch,
     palette_frame_text: std.ArrayList(u8),
     palette_frame_text_arena: std.heap.ArenaAllocator,
@@ -1409,6 +1562,8 @@ pub const AppState = struct {
             .sidebar_hidden = false,
             .sidebar_hover_revealed = false,
             .composer_controller = ComposerControllerState.init(),
+            .companion_controller = companion_controller.init(),
+            .companion_composer = CompanionComposerPrompt.init(),
             .palette_overlay_batch = .{},
             .palette_frame_text = .empty,
             .palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator),
@@ -1912,6 +2067,7 @@ pub const AppState = struct {
 
     pub fn selectProjectAtIndex(self: *AppState, index: usize) bool {
         if (index >= self.project_controller.projects.items.len) return false;
+        self.blurCompanionComposer();
         self.project_controller.selected_index = index;
         self.ensureCurrentProjectWorkspace();
         self.restorePersistedBrowserPaneAfterProjectSelection(index);
@@ -2646,6 +2802,11 @@ pub const AppState = struct {
             return;
         }
 
+        if (project.isCompanionThread(&project.threads.items[thread_index])) {
+            self.setSidebarNotice("The Companion thread cannot be archived.");
+            return;
+        }
+
         if (project.threads.items[thread_index].isSendPending()) {
             self.setSidebarNotice("Finish this thread's provider request before archiving.");
             return;
@@ -2782,7 +2943,11 @@ pub const AppState = struct {
     pub const beginBangCommand = chat_controller.beginBangCommand;
     pub const retryBangCommand = chat_controller.retryBangCommand;
     pub const sendDraft = chat_controller.sendDraft;
+    pub const preflightThreadPrompt = chat_controller.preflightThreadPrompt;
+    pub const sendThreadPrompt = chat_controller.sendThreadPrompt;
+    pub const sendThreadDraft = chat_controller.sendThreadDraft;
     pub const abortCurrentThreadSend = chat_controller.abortCurrentThreadSend;
+    pub const abortThreadByLocalId = chat_controller.abortThreadByLocalId;
     pub const queueOrSteerDraftDuringSend = chat_controller.queueOrSteerDraftDuringSend;
     pub const queueDraftDuringSend = chat_controller.queueDraftDuringSend;
     pub const storeDraftDuringSend = chat_controller.storeDraftDuringSend;
@@ -2802,6 +2967,8 @@ pub const AppState = struct {
     pub const consumeDaemonChatTurn = chat_controller.consumeDaemonChatTurn;
     pub const restoreDaemonChatTurnsOnLaunch = chat_controller.restoreDaemonChatTurnsOnLaunch;
     pub const threadByLocalId = chat_controller.threadByLocalId;
+    pub const projectThreadIndexByLocalId = chat_controller.projectThreadIndexByLocalId;
+    pub const resolveThreadApprovalByLocalId = chat_controller.resolveThreadApprovalByLocalId;
     pub const applyPersisted = persistence.applyPersisted;
     pub const restorePersistedSurfaceStates = persistence.restorePersistedSurfaceStates;
     pub const restorePersistedChatCompletions = persistence.restorePersistedChatCompletions;
@@ -3789,9 +3956,7 @@ pub const AppState = struct {
     pub const buildCurrentTranscriptSelectionText = transcript_controller.buildCurrentTranscriptSelectionText;
 
     pub fn blurPaletteComposer(self: *AppState) void {
-        self.composer_controller.composer.focused = false;
-        self.composer_controller.composer.active_menu = null;
-        self.composer_controller.composer.hovered_menu_index = null;
+        _ = self.composer_controller.composer.handleInput(self.allocator, .{ .focus = false }) catch {};
         self.composer_controller.focused = false;
     }
 
@@ -5593,6 +5758,361 @@ pub const AppState = struct {
         };
     }
 
+    fn companionOperationStatus(status: ?ai_harness.ToolCallStatus) ?companion_controller.OperationStatus {
+        return switch (status orelse .unknown) {
+            .pending => .pending,
+            .in_progress => .in_progress,
+            .completed => .completed,
+            .failed => .failed,
+            .cancelled => .cancelled,
+            .unknown => null,
+        };
+    }
+
+    fn companionToolTitle(author: []const u8, kind: ?ai_harness.ToolCallKind, status: ?ai_harness.ToolCallStatus) []const u8 {
+        if ((kind orelse .other) != .execute) return author;
+        return if ((status orelse .unknown) == .failed) "Command failed" else "Ran command";
+    }
+
+    fn appendCompanionTool(
+        frame: *companion_controller.Frame,
+        identity: []const u8,
+        author: []const u8,
+        body: []const u8,
+        kind: ?ai_harness.ToolCallKind,
+        status: ?ai_harness.ToolCallStatus,
+        sequence: i64,
+    ) void {
+        const mapped_status = companionOperationStatus(status) orelse return;
+        const title = companionToolTitle(author, kind, status);
+        var operation: companion_controller.Operation = .{ .status = mapped_status, .sequence = sequence };
+        if (!operation.identity.setIdentity("tool", &.{identity})) return;
+        operation.title.set(title);
+        operation.detail.set(body);
+        frame.upsertOperation(operation);
+        var activity: companion_controller.ActivityItem = .{
+            .kind = .tool,
+            .status = mapped_status,
+            .sequence = sequence,
+        };
+        activity.identity = operation.identity;
+        activity.author.set(title);
+        activity.body.set(body);
+        frame.appendActivity(activity);
+    }
+
+    fn appendCompanionActivity(
+        frame: *companion_controller.Frame,
+        identity: []const u8,
+        author: []const u8,
+        body: []const u8,
+        kind: companion_controller.ActivityKind,
+        sequence: i64,
+    ) void {
+        var item: companion_controller.ActivityItem = .{ .kind = kind, .sequence = sequence };
+        item.identity.set(identity);
+        item.author.set(author);
+        item.body.set(body);
+        frame.appendActivity(item);
+    }
+
+    fn projectCompanionTranscript(frame: *companion_controller.Frame, thread: *const ChatThread) void {
+        for (thread.messages.items, 0..) |message, index| {
+            const sequence: i64 = @intCast(index);
+            if (message.role == .user and frame.objective.slice().len == 0) frame.objective.set(message.body);
+            frame.latest_body.set(message.body);
+            if (message.role == .system and
+                (std.mem.eql(u8, message.author, "Send failed") or std.mem.eql(u8, message.author, "Command failed")))
+            {
+                frame.has_failure = true;
+            }
+            if (message.tool_call_id) |call_id| {
+                appendCompanionTool(frame, call_id, message.author, message.body, message.tool_call_kind, message.tool_call_status, sequence);
+                continue;
+            }
+            const kind: companion_controller.ActivityKind = switch (message.role) {
+                .user => .user,
+                .assistant => .assistant,
+                .system => .system,
+            };
+            const author = switch (message.role) {
+                .user => "You",
+                .assistant => "Sprout",
+                .system => message.author,
+            };
+            appendCompanionActivity(frame, "", author, message.body, kind, sequence);
+        }
+    }
+
+    fn projectCompanionPending(frame: *companion_controller.Frame, send_state: *const SendState) void {
+        const base_sequence: i64 = 1_000_000;
+        for (send_state.pending_events.items, 0..) |event, index| {
+            const sequence = base_sequence + @as(i64, @intCast(index));
+            if (event.tool_call_id) |call_id| {
+                appendCompanionTool(frame, call_id, event.author, event.body, event.tool_call_kind, event.tool_call_status, sequence);
+            } else {
+                const kind: companion_controller.ActivityKind = switch (event.role) {
+                    .user => .user,
+                    .assistant => .assistant,
+                    .system => .system,
+                };
+                const author = switch (event.role) {
+                    .user => "You",
+                    .assistant => "Sprout",
+                    .system => event.author,
+                };
+                appendCompanionActivity(frame, "", author, event.body, kind, sequence);
+            }
+            frame.event_author.set(event.author);
+            frame.event_body.set(event.body);
+        }
+        frame.partial_text.set(send_state.partial_text.items);
+        if (send_state.partial_text.items.len > 0) {
+            appendCompanionActivity(frame, "streaming", "Sprout", send_state.partial_text.items, .streaming, base_sequence + @as(i64, @intCast(send_state.pending_events.items.len)));
+        }
+    }
+
+    fn companionTaskStatus(status: BackgroundTaskStatus) companion_controller.OperationStatus {
+        return switch (status) {
+            .running => .in_progress,
+            .completed => .completed,
+            .failed => .failed,
+            .stopped => .cancelled,
+        };
+    }
+
+    fn companionOutcomeStatus(status: TerminalProcessOutcomeStatus) companion_controller.OperationStatus {
+        return switch (status) {
+            .completed => .completed,
+            .cancelled => .cancelled,
+            .failed, .crashed, .unknown => .failed,
+        };
+    }
+
+    fn setCompanionProcessIdentity(identity: *companion_controller.PresentationText, task: *const BackgroundTask) bool {
+        if (task.task_id) |task_id| return identity.setIdentity("process:task", &.{task_id});
+        if (task.provider_thread_id) |provider_thread_id| {
+            if (task.item_id) |item_id| return identity.setIdentity("process:item", &.{ provider_thread_id, item_id });
+            if (task.process_id) |process_id| return identity.setIdentity("process:process", &.{ provider_thread_id, process_id });
+        }
+        if (task.item_id == null and task.process_id == null) return identity.setIdentity("process:command", &.{task.command});
+        return false;
+    }
+
+    fn projectCompanionProcesses(frame: *companion_controller.Frame, project: *const Project, thread: *const ChatThread) void {
+        for (thread.background_tasks.items) |task| {
+            var status = companionTaskStatus(task.status);
+            var sequence = if (task.updated_at_ms != 0) task.updated_at_ms else task.started_at_ms;
+            if (task.process_id) |process_id| {
+                for (project.terminal_process_outcomes.items) |outcome| {
+                    if (!std.mem.eql(u8, outcome.process_id, process_id)) continue;
+                    status = companionOutcomeStatus(outcome.status);
+                    sequence = outcome.finished_at_ms;
+                    break;
+                }
+            }
+            const title = if (status == .failed) "Command failed" else "Ran command";
+            var operation: companion_controller.Operation = .{ .status = status, .sequence = sequence, .process = true };
+            if (!setCompanionProcessIdentity(&operation.identity, &task)) continue;
+            operation.title.set(title);
+            operation.detail.set(task.command);
+            frame.upsertOperation(operation);
+            var activity: companion_controller.ActivityItem = .{ .kind = .process, .status = status, .sequence = sequence };
+            activity.identity = operation.identity;
+            activity.author.set(title);
+            activity.body.set(task.command);
+            frame.appendActivity(activity);
+        }
+        frame.sortActivity();
+    }
+
+    fn resetCompanionNoThreadPresentation(self: *AppState) void {
+        self.companion_controller.ui_error = null;
+        self.companion_controller.setFrame(.{});
+        self.companion_controller.clearHits();
+    }
+
+    pub fn syncCompanionProjection(self: *AppState) void {
+        if (self.project_controller.projects.items.len == 0) return self.resetCompanionNoThreadPresentation();
+        const project = self.currentProjectMutable();
+        const local_id = project.companion_thread_local_id orelse {
+            self.resetCompanionNoThreadPresentation();
+            return;
+        };
+        const thread = self.threadByLocalId(project.id, local_id) orelse {
+            self.resetCompanionNoThreadPresentation();
+            return;
+        };
+        const owner_changed = !std.mem.eql(u8, self.companion_controller.presentation.workspace_id.slice(), project.id) or
+            !std.mem.eql(u8, self.companion_controller.presentation.thread_id.slice(), thread.local_thread_id);
+        if (owner_changed) {
+            var owner_frame: companion_controller.Frame = .{ .has_thread = true };
+            owner_frame.workspace_id.set(project.id);
+            owner_frame.thread_id.set(thread.local_thread_id);
+            self.companion_controller.setFrame(owner_frame);
+            self.companion_controller.clearHits();
+        }
+        const send_state = thread.send_state;
+        if (!send_state.mutex.tryLock()) return;
+        defer send_state.mutex.unlock();
+
+        var frame: companion_controller.Frame = .{ .has_thread = true };
+        frame.workspace_id.set(project.id);
+        frame.thread_id.set(thread.local_thread_id);
+        frame.working = send_state.status == .pending;
+        projectCompanionTranscript(&frame, thread);
+        projectCompanionPending(&frame, send_state);
+        projectCompanionProcesses(&frame, project, thread);
+        frame.has_approval = send_state.status == .pending and send_state.pending_approval != null and send_state.approval_decision == null;
+        if (frame.has_approval) {
+            frame.approval_identity.set(send_state.pending_approval.?.call_id);
+            frame.approval_title.set(send_state.pending_approval.?.title);
+            frame.approval_body.set(send_state.pending_approval.?.body);
+        }
+        if (send_state.error_message) |message| frame.provider_error.set(message);
+        if (send_state.control_error_message) |message| frame.control_error.set(message);
+        if (self.companion_controller.ui_error) |message| frame.ui_error.set(message);
+        frame.has_failure = frame.has_failure or send_state.status == .failed or
+            frame.provider_error.slice().len > 0 or frame.control_error.slice().len > 0 or frame.ui_error.slice().len > 0;
+        frame.sortOperations();
+        self.companion_controller.setFrame(frame);
+    }
+
+    pub fn syncCompanionComposer(self: *AppState, rect: palette.Rect) void {
+        if (self.project_controller.projects.items.len == 0) return;
+        const project = self.currentProjectMutable();
+        const thread = if (project.companion_thread_local_id) |local_id| self.threadByLocalId(project.id, local_id) else null;
+        if (thread) |value| {
+            if (!std.mem.eql(u8, self.companion_composer.text(), value.currentDraft())) {
+                const callbacks = self.companion_composer.callbacks;
+                self.companion_composer.setCallbacks(.{});
+                self.companion_composer.setText(self.allocator, value.currentDraft()) catch {};
+                self.companion_composer.setCallbacks(callbacks);
+            }
+        }
+        self.companion_composer.setCallbacks(.{
+            .context = self,
+            .on_event = companionComposerPromptEvent,
+            .set_clipboard = paletteComposerSetClipboard,
+            .get_clipboard = paletteComposerGetClipboard,
+        });
+        self.companion_composer.setStyle(companionComposerStyle());
+        const companion_scale = theme.displayScaleFactor();
+        self.companion_composer.setUiScale(companion_scale);
+        self.companion_composer.setFontMetrics(paletteComposerTextFontMetrics(12.5 * companion_scale));
+        self.companion_composer.setToolbarFontMetrics(paletteEstimatedFontMetrics(10.5 * companion_scale));
+        self.companion_composer.setIconFontMetrics(paletteEstimatedFontMetrics(12.0 * companion_scale));
+        self.companion_composer.setBounds(rect);
+        self.companion_composer.setExternalModelMenu(true);
+        self.companion_composer.setExternalReasoningMenu(true);
+        self.companion_composer.setShowReasoningToggle(false);
+        self.companion_composer.setShowFastToggle(false);
+        self.companion_composer.setShowAccessToggle(false);
+        self.companion_composer.setModelLabel(self.allocator, "Workspace · verde") catch {};
+        self.companion_composer.setSendState(if (thread) |value| if (value.isSendPendingForUi()) .stop else .send else .send);
+        self.companion_composer.setPlaceholder(self.allocator, "Steer the run…") catch {};
+    }
+
+    pub fn routeCompanionComposerTextInput(self: *AppState, text: []const u8) bool {
+        if (self.companion_controller.visibility != .sidecar_open or !self.companion_composer.focused) return false;
+        const insert_text = self.clampPaletteComposerInsertText(text);
+        if (insert_text.len == 0) return true;
+        return self.companion_composer.handleInput(self.allocator, .{ .text = insert_text }) catch false;
+    }
+
+    pub fn routeCompanionComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
+        if (self.companion_controller.visibility != .sidecar_open or !self.companion_composer.focused) return false;
+        const key = paletteComposerKeyFromSdl(event) orelse return false;
+        if (key.primary and key.code == .v) {
+            const clipboard = paletteComposerGetClipboard(self, self.allocator) orelse return true;
+            defer self.allocator.free(clipboard);
+            return self.companion_composer.handleInput(self.allocator, .{ .text = clipboard }) catch false;
+        }
+        return self.companion_composer.handleInput(self.allocator, .{ .key = key }) catch false;
+    }
+
+    pub fn routeCompanionComposerMouseButton(self: *AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
+        if (self.companion_controller.visibility != .sidecar_open) return false;
+        const point: palette.draw.Vec2 = .{ .x = x, .y = y };
+        if (down and clicks >= 2 and self.companion_composer.textRect().contains(point)) {
+            _ = self.companion_composer.handleInput(self.allocator, .{ .mouse_down = point }) catch return false;
+            const text = self.companion_composer.text();
+            const offset = self.companion_composer.cursor;
+            const range = if (clicks >= 3) blk: {
+                const start = palette.input_selection.lineStart(text, offset);
+                var end = palette.input_selection.lineEnd(text, offset);
+                if (end < text.len) end += 1;
+                break :blk palette.input_selection.Range{ .start = start, .end = end };
+            } else palette.input_selection.wordRangeAt(text, offset);
+            self.companion_composer.selection_anchor = range.start;
+            self.companion_composer.selection_focus = range.end;
+            self.companion_composer.cursor = range.end;
+            self.companion_composer.dragging_selection = false;
+            return true;
+        }
+        const input: palette.ComposerPromptInput = if (down) .{ .mouse_down = point } else .{ .mouse_up = point };
+        return self.companion_composer.handleInput(self.allocator, input) catch false;
+    }
+
+    pub fn routeCompanionComposerMouseMotion(self: *AppState, x: f32, y: f32, dragging: bool) bool {
+        if (self.companion_controller.visibility != .sidecar_open) return false;
+        const point: palette.draw.Vec2 = .{ .x = x, .y = y };
+        const input: palette.ComposerPromptInput = if (dragging) .{ .mouse_drag = point } else .{ .mouse_move = point };
+        return self.companion_composer.handleInput(self.allocator, input) catch false;
+    }
+
+    pub fn routeCompanionComposerWheel(self: *AppState, x: f32, y: f32, wheel_y: f32) bool {
+        if (self.companion_controller.visibility != .sidecar_open) return false;
+        return self.companion_composer.handleInput(self.allocator, .{
+            .mouse_wheel = .{ .point = .{ .x = x, .y = y }, .y = wheel_y },
+        }) catch false;
+    }
+
+    pub fn blurCompanionComposer(self: *AppState) void {
+        _ = self.companion_composer.handleInput(self.allocator, .{ .focus = false }) catch {};
+    }
+
+    pub fn resolveCurrentCompanionApproval(self: *AppState, decision: ai_harness.ApprovalDecision) bool {
+        if (self.project_controller.projects.items.len == 0) return false;
+        const project = self.currentProject();
+        const local_id = project.companion_thread_local_id orelse return false;
+        const frame = &self.companion_controller.presentation;
+        if (!frame.has_approval or !std.mem.eql(u8, frame.workspace_id.slice(), project.id) or
+            !std.mem.eql(u8, frame.thread_id.slice(), local_id)) return false;
+        return self.resolveThreadApprovalByLocalId(project.id, local_id, decision);
+    }
+
+    pub fn ensureCurrentCompanionThread(self: *AppState) !*ChatThread {
+        if (self.project_controller.projects.items.len == 0) return error.WorkspaceNotFound;
+        const project = self.currentProjectMutable();
+        const had_valid_identity = valid: {
+            const local_id = project.companion_thread_local_id orelse break :valid false;
+            for (project.threads.items) |*candidate| {
+                if (std.mem.eql(u8, candidate.local_thread_id, local_id)) break :valid true;
+            }
+            break :valid false;
+        };
+        const thread = try project.ensureCompanionThread(self.allocator);
+        if (!had_valid_identity) {
+            self.markDirty();
+            self.flushDirtyBlocking();
+        }
+        return thread;
+    }
+
+    pub fn openCompanion(self: *AppState) void {
+        self.companion_controller.show();
+    }
+
+    pub fn toggleCompanion(self: *AppState) void {
+        if (self.companion_controller.visibility == .collapsed_chip) {
+            self.openCompanion();
+            return;
+        }
+        self.companion_controller.collapse();
+        self.blurCompanionComposer();
+    }
+
     pub fn syncDraftFromPaletteComposer(self: *AppState) void {
         if (self.project_controller.projects.items.len == 0) return;
         const text = self.composer_controller.composer.text();
@@ -6980,6 +7500,7 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit dirty state flushed", .{});
         self.file_search_controller.deinit(self.allocator);
         self.composer_controller.composer.deinit(self.allocator);
+        self.companion_composer.deinit(self.allocator);
         self.palette_overlay_batch.deinit(self.allocator);
         self.palette_frame_text.deinit(self.allocator);
         self.palette_frame_text_arena.deinit();
@@ -8432,6 +8953,8 @@ test "workspace selection restores focused pane keyboard ownership" {
     state.terminal_controller.focused = false;
     state.composer_controller.focused = false;
     state.composer_controller.composer = PaletteComposerPrompt.init();
+    state.companion_composer = CompanionComposerPrompt.init();
+    state.companion_controller = companion_controller.init();
     state.composer_controller.model_picker = PaletteModelPicker.init(0);
     state.composer_controller.popover_restore_focus = false;
     state.composer_controller.run_config_open = false;
@@ -8448,6 +8971,7 @@ test "workspace selection restores focused pane keyboard ownership" {
         state.project_controller.projects.deinit(allocator);
         state.surface_controller.surfaces.deinit(allocator);
         state.composer_controller.composer.deinit(allocator);
+        state.companion_composer.deinit(allocator);
         state.browser_controller.deinit(allocator);
     }
 
@@ -8465,17 +8989,380 @@ test "workspace selection restores focused pane keyboard ownership" {
         return err;
     };
 
+    state.companion_composer.focused = true;
+    state.companion_composer.selection_anchor = 0;
+    state.companion_composer.selection_focus = 1;
+    state.companion_composer.dragging_selection = true;
     try std.testing.expect(state.selectProjectAtIndex(1));
     try std.testing.expectEqual(@as(usize, 1), state.project_controller.selected_index);
     try std.testing.expect(state.terminal_controller.focused);
     try std.testing.expect(!state.composer_controller.focused);
     try std.testing.expect(!state.composer_controller.composer.focused);
+    try std.testing.expect(!state.companion_composer.focused);
+    try std.testing.expect(state.companion_composer.selection_anchor == null);
+    try std.testing.expect(state.companion_composer.selection_focus == null);
+    try std.testing.expect(!state.companion_composer.dragging_selection);
 
     try std.testing.expect(state.selectProjectAtIndex(0));
     try std.testing.expectEqual(@as(usize, 0), state.project_controller.selected_index);
     try std.testing.expect(!state.terminal_controller.focused);
     try std.testing.expect(state.composer_controller.focused);
     try std.testing.expect(state.composer_controller.composer.focused);
+}
+
+test "opening Companion is lazy and leaves workspace ownership and persistence untouched" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.companion_controller = companion_controller.init();
+    state.companion_composer = CompanionComposerPrompt.init();
+    state.lifecycle.dirty = false;
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.companion_composer.deinit(allocator);
+    }
+    var project = try Project.init(allocator, "lazy-companion", "Lazy", "/tmp/lazy-companion", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    const thread_count = state.currentProject().threads.items.len;
+    const pane_count = state.currentProject().workspace_layout.panes.items.len;
+    const selected_thread = state.currentProject().selected_thread_index;
+    const focused_pane = state.currentProject().workspace_layout.focused_pane_id;
+
+    state.openCompanion();
+    try std.testing.expectEqual(companion_controller.Visibility.sidecar_open, state.companion_controller.visibility);
+    try std.testing.expect(state.currentProject().companion_thread_local_id == null);
+    try std.testing.expectEqual(thread_count, state.currentProject().threads.items.len);
+    try std.testing.expectEqual(pane_count, state.currentProject().workspace_layout.panes.items.len);
+    try std.testing.expectEqual(selected_thread, state.currentProject().selected_thread_index);
+    try std.testing.expectEqual(focused_pane, state.currentProject().workspace_layout.focused_pane_id);
+    try std.testing.expect(!state.lifecycle.dirty);
+
+    state.companion_controller.collapse();
+    state.toggleCompanion();
+    try std.testing.expect(state.currentProject().companion_thread_local_id == null);
+    try std.testing.expectEqual(thread_count, state.currentProject().threads.items.len);
+    try std.testing.expect(!state.lifecycle.dirty);
+
+    state.companion_controller.ui_error = "stale";
+    state.companion_controller.presentation.control_error.set("stale action");
+    state.syncCompanionProjection();
+    try std.testing.expect(state.companion_controller.ui_error == null);
+    try std.testing.expect(!state.companion_controller.presentation.has_thread);
+    try std.testing.expectEqual(@as(usize, 0), state.companion_controller.presentation.control_error.slice().len);
+    try std.testing.expectEqualStrings("Ready", state.companion_controller.status_text);
+
+    state.currentProjectMutable().companion_thread_local_id = try allocator.dupeZ(u8, "stale-companion");
+    state.companion_controller.ui_error = "old UI error";
+    state.companion_controller.presentation.provider_error.set("old provider error");
+    state.syncCompanionProjection();
+    try std.testing.expect(state.companion_controller.ui_error == null);
+    try std.testing.expectEqual(@as(usize, 0), state.companion_controller.presentation.provider_error.slice().len);
+    try std.testing.expectEqualStrings("Ready", state.companion_controller.status_text);
+
+    _ = try state.currentProjectMutable().ensureCompanionThread(allocator);
+    state.syncCompanionProjection();
+    try std.testing.expect(state.companion_controller.ui_error == null);
+    try std.testing.expect(state.companion_controller.presentation.has_thread);
+    try std.testing.expectEqual(@as(usize, 0), state.companion_controller.presentation.provider_error.slice().len);
+    try std.testing.expectEqual(@as(usize, 0), state.companion_controller.presentation.control_error.slice().len);
+}
+
+test "Companion frame projects transcript pending streaming lifecycle errors and process owner eviction" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.companion_controller = companion_controller.init();
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+    var project = try Project.init(allocator, "companion-frame", "Frame", "/tmp/companion-frame", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    const owned_project = &state.project_controller.projects.items[0];
+    const pane_count = owned_project.workspace_layout.panes.items.len;
+    const thread = try owned_project.ensureCompanionThread(allocator);
+    try std.testing.expectEqual(pane_count, owned_project.workspace_layout.panes.items.len);
+    try thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "User"),
+        .body = try allocator.dupeZ(u8, "Ship the focused change"),
+    });
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "Ran command"),
+        .body = try allocator.dupeZ(u8, "zig test"),
+        .tool_call_id = try allocator.dupe(u8, "call-1"),
+        .tool_call_kind = .execute,
+        .tool_call_status = .pending,
+    });
+    const send_state = thread.send_state;
+    send_state.status = .pending;
+    try send_state.pending_events.append(std.heap.page_allocator, .{
+        .role = .system,
+        .author = try std.heap.page_allocator.dupe(u8, "Ran command"),
+        .body = try std.heap.page_allocator.dupe(u8, "zig test --summary all"),
+        .tool_call_id = try std.heap.page_allocator.dupe(u8, "call-1"),
+        .tool_call_kind = .execute,
+        .tool_call_status = .in_progress,
+    });
+    try send_state.partial_text.appendSlice(std.heap.page_allocator, "Streaming response");
+    send_state.pending_approval = .{
+        .call_id = try std.heap.page_allocator.dupe(u8, "approval-1"),
+        .title = try std.heap.page_allocator.dupe(u8, "Run command"),
+        .body = try std.heap.page_allocator.dupe(u8, "Allow this command?"),
+    };
+    send_state.control_error_message = try std.heap.page_allocator.dupe(u8, "Control failed");
+
+    state.syncCompanionProjection();
+    var frame = &state.companion_controller.presentation;
+    try std.testing.expectEqualStrings("Ship the focused change", frame.objective.slice());
+    try std.testing.expectEqual(@as(usize, 1), frame.operation_count);
+    try std.testing.expectEqual(companion_controller.OperationStatus.in_progress, frame.operations[0].status);
+    try std.testing.expectEqualStrings("tool:6:call-1", frame.operations[0].identity.slice());
+    try std.testing.expectEqualStrings("Ran command", frame.operations[0].title.slice());
+    try std.testing.expect(frame.has_approval);
+    try std.testing.expectEqualStrings("approval-1", frame.approval_identity.slice());
+    try std.testing.expectEqualStrings("Control failed", frame.control_error.slice());
+    try std.testing.expect(frame.has_failure);
+    try std.testing.expectEqual(companion_controller.ActivityKind.streaming, frame.activity[frame.activity_count - 1].kind);
+
+    send_state.pending_events.items[0].tool_call_status = .completed;
+    state.syncCompanionProjection();
+    frame = &state.companion_controller.presentation;
+    try std.testing.expectEqual(@as(usize, 1), frame.operation_count);
+    try std.testing.expectEqual(companion_controller.OperationStatus.completed, frame.operations[0].status);
+    try std.testing.expectEqual(@as(usize, 1), frame.recentCount());
+
+    send_state.pending_events.items[0].tool_call_status = .failed;
+    state.syncCompanionProjection();
+    frame = &state.companion_controller.presentation;
+    try std.testing.expectEqual(companion_controller.OperationStatus.failed, frame.operations[0].status);
+    try std.testing.expectEqualStrings("Command failed", frame.operations[0].title.slice());
+
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "bun test"),
+        .task_id = try allocator.dupeZ(u8, "task-1"),
+        .status = .running,
+        .started_at_ms = 50,
+        .updated_at_ms = 50,
+    });
+    state.syncCompanionProjection();
+    try std.testing.expectEqual(@as(usize, 2), state.companion_controller.presentation.operation_count);
+    var removed = thread.background_tasks.orderedRemove(0);
+    removed.deinit(allocator);
+    state.syncCompanionProjection();
+    try std.testing.expectEqual(@as(usize, 1), state.companion_controller.presentation.operation_count);
+}
+
+test "Companion production projection rejects lossy identities and preserves owner hierarchy" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.companion_controller = companion_controller.init();
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+    var project = try Project.init(allocator, "identity-frame", "Identity", "/tmp/identity-frame", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    const thread = try state.project_controller.projects.items[0].ensureCompanionThread(allocator);
+    const nul_id = [_]u8{ 'b', 0, 'a', 'd' };
+    const overlong_id = [_]u8{'x'} ** 600;
+    const call_ids = [_][]const u8{ "", &nul_id, &overlong_id, "shared" };
+    for (call_ids) |call_id| {
+        try thread.messages.append(allocator, .{
+            .role = .system,
+            .author = try allocator.dupeZ(u8, "Ran command"),
+            .body = try allocator.dupeZ(u8, "identity probe"),
+            .tool_call_id = try allocator.dupe(u8, call_id),
+            .tool_call_kind = .execute,
+            .tool_call_status = .in_progress,
+        });
+    }
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "task command"),
+        .task_id = try allocator.dupeZ(u8, "shared"),
+        .status = .running,
+    });
+    for ([_][]const u8{ "provider-a", "provider-b" }) |provider_thread_id| {
+        try thread.background_tasks.append(allocator, .{
+            .command = try allocator.dupeZ(u8, "item command"),
+            .item_id = try allocator.dupeZ(u8, "item-1"),
+            .provider_thread_id = try allocator.dupeZ(u8, provider_thread_id),
+            .status = .running,
+        });
+    }
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "colon-pair-left"),
+        .item_id = try allocator.dupeZ(u8, "c"),
+        .provider_thread_id = try allocator.dupeZ(u8, "a:b"),
+        .status = .running,
+    });
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "colon-pair-right"),
+        .item_id = try allocator.dupeZ(u8, "b:c"),
+        .provider_thread_id = try allocator.dupeZ(u8, "a"),
+        .status = .running,
+    });
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "process command"),
+        .process_id = try allocator.dupeZ(u8, "process-1"),
+        .provider_thread_id = try allocator.dupeZ(u8, "provider-a"),
+        .status = .running,
+    });
+    try thread.background_tasks.append(allocator, .{ .command = try allocator.dupeZ(u8, "legacy-first"), .status = .running });
+    try thread.background_tasks.append(allocator, .{ .command = try allocator.dupeZ(u8, "legacy-survivor"), .status = .running });
+
+    state.syncCompanionProjection();
+    const frame = &state.companion_controller.presentation;
+    try std.testing.expectEqual(@as(usize, 9), frame.operation_count);
+    try std.testing.expectEqual(@as(usize, 9), frame.activity_count);
+    var tool_identity: ?companion_controller.PresentationText = null;
+    var process_task_identity: ?companion_controller.PresentationText = null;
+    var provider_a_identity: ?companion_controller.PresentationText = null;
+    var provider_b_identity: ?companion_controller.PresentationText = null;
+    var colon_left_identity: ?companion_controller.PresentationText = null;
+    var colon_right_identity: ?companion_controller.PresentationText = null;
+    var survivor_identity: ?companion_controller.PresentationText = null;
+    for (frame.operations[0..frame.operation_count]) |operation| {
+        if (std.mem.eql(u8, operation.detail.slice(), "identity probe")) tool_identity = operation.identity;
+        if (std.mem.eql(u8, operation.detail.slice(), "task command")) process_task_identity = operation.identity;
+        if (std.mem.eql(u8, operation.detail.slice(), "item command")) {
+            if (std.mem.indexOf(u8, operation.identity.slice(), "provider-a") != null) provider_a_identity = operation.identity;
+            if (std.mem.indexOf(u8, operation.identity.slice(), "provider-b") != null) provider_b_identity = operation.identity;
+        }
+        if (std.mem.eql(u8, operation.detail.slice(), "colon-pair-left")) colon_left_identity = operation.identity;
+        if (std.mem.eql(u8, operation.detail.slice(), "colon-pair-right")) colon_right_identity = operation.identity;
+        if (std.mem.eql(u8, operation.detail.slice(), "legacy-survivor")) survivor_identity = operation.identity;
+    }
+    try std.testing.expectEqualStrings("tool:6:shared", tool_identity.?.slice());
+    try std.testing.expectEqualStrings("process:task:6:shared", process_task_identity.?.slice());
+    try std.testing.expect(!std.mem.eql(u8, tool_identity.?.slice(), process_task_identity.?.slice()));
+    try std.testing.expect(!std.mem.eql(u8, provider_a_identity.?.slice(), provider_b_identity.?.slice()));
+    try std.testing.expectEqualStrings("process:item:3:a:b:1:c", colon_left_identity.?.slice());
+    try std.testing.expectEqualStrings("process:item:1:a:3:b:c", colon_right_identity.?.slice());
+    try std.testing.expect(!std.mem.eql(u8, colon_left_identity.?.slice(), colon_right_identity.?.slice()));
+    var saved_survivor: companion_controller.PresentationText = .{};
+    saved_survivor.set(survivor_identity.?.slice());
+
+    var removed = thread.background_tasks.orderedRemove(6);
+    removed.deinit(allocator);
+    state.syncCompanionProjection();
+    var shifted_survivor: ?companion_controller.PresentationText = null;
+    for (state.companion_controller.presentation.operations[0..state.companion_controller.presentation.operation_count]) |operation| {
+        if (std.mem.eql(u8, operation.detail.slice(), "legacy-survivor")) shifted_survivor = operation.identity;
+    }
+    try std.testing.expectEqualStrings(saved_survivor.slice(), shifted_survivor.?.slice());
+}
+
+test "Companion submitted seam preflights before first persistence and reuses identity" {
+    const allocator = std.testing.allocator;
+    const Outcome = enum { reject, started };
+    const FakeState = struct {
+        allocator: std.mem.Allocator,
+        project: *Project,
+        project_controller: struct { selected_index: usize = 0 } = .{},
+        companion_controller: @TypeOf(companion_controller.init()) = companion_controller.init(),
+        preflight_outcome: Outcome = .reject,
+        send_outcome: Outcome = .started,
+        preflight_calls: usize = 0,
+        ensure_calls: usize = 0,
+        persistence_writes: usize = 0,
+        send_calls: usize = 0,
+        first_preflight_had_identity: bool = false,
+
+        pub fn currentProject(self: *const @This()) *const Project {
+            return self.project;
+        }
+
+        pub fn threadByLocalId(self: *@This(), workspace_id: []const u8, local_id: []const u8) ?*ChatThread {
+            if (!std.mem.eql(u8, self.project.id, workspace_id)) return null;
+            for (self.project.threads.items) |*thread| {
+                if (std.mem.eql(u8, thread.local_thread_id, local_id)) return thread;
+            }
+            return null;
+        }
+
+        pub fn preflightThreadPrompt(self: *@This(), _: usize, _: *const ChatThread, _: []const u8, _: []const ChatImageAttachment) !bool {
+            if (self.preflight_calls == 0) self.first_preflight_had_identity = self.project.companion_thread_local_id != null;
+            self.preflight_calls += 1;
+            return switch (self.preflight_outcome) {
+                .reject => false,
+                .started => true,
+            };
+        }
+
+        pub fn ensureCurrentCompanionThread(self: *@This()) !*ChatThread {
+            self.ensure_calls += 1;
+            const had_identity = self.project.companion_thread_local_id != null;
+            const thread = try self.project.ensureCompanionThread(self.allocator);
+            if (!had_identity) self.persistence_writes += 1;
+            return thread;
+        }
+
+        pub fn sendThreadPrompt(self: *@This(), _: []const u8, _: []const u8, _: []const u8, _: []const ChatImageAttachment) !bool {
+            self.send_calls += 1;
+            return switch (self.send_outcome) {
+                .reject => false,
+                .started => true,
+            };
+        }
+    };
+
+    var project = try Project.init(allocator, "submitted-seam", "Submitted", "/tmp/submitted-seam", 0);
+    defer project.deinit(allocator);
+    const initial_threads = project.threads.items.len;
+    const initial_panes = project.workspace_layout.panes.items.len;
+    const initial_selection = project.selected_thread_index;
+    var fake: FakeState = .{ .allocator = allocator, .project = &project };
+
+    submitCompanionPrompt(&fake, &project, "   \n");
+    try std.testing.expect(project.companion_thread_local_id == null);
+    try std.testing.expectEqual(initial_threads, project.threads.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fake.ensure_calls);
+    try std.testing.expect(!fake.first_preflight_had_identity);
+
+    fake.preflight_outcome = .reject;
+    submitCompanionPrompt(&fake, &project, "valid");
+    try std.testing.expect(project.companion_thread_local_id == null);
+    try std.testing.expectEqual(@as(usize, 0), fake.persistence_writes);
+
+    fake.preflight_outcome = .started;
+    fake.send_outcome = .started;
+    submitCompanionPrompt(&fake, &project, "first real send");
+    const companion_id = try allocator.dupe(u8, project.companion_thread_local_id.?);
+    defer allocator.free(companion_id);
+    try std.testing.expectEqual(initial_threads + 1, project.threads.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.persistence_writes);
+    try std.testing.expectEqual(initial_panes, project.workspace_layout.panes.items.len);
+    try std.testing.expectEqual(initial_selection, project.selected_thread_index);
+
+    submitCompanionPrompt(&fake, &project, "repeat send");
+    try std.testing.expectEqualStrings(companion_id, project.companion_thread_local_id.?);
+    try std.testing.expectEqual(initial_threads + 1, project.threads.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.persistence_writes);
+
+    fake.send_outcome = .reject;
+    submitCompanionPrompt(&fake, &project, "post-persist failure");
+    try std.testing.expectEqualStrings(companion_id, project.companion_thread_local_id.?);
+    try std.testing.expectEqual(initial_threads + 1, project.threads.items.len);
+    try std.testing.expect(fake.companion_controller.ui_error != null);
 }
 
 test "visible chat is not treated as focused when a sibling pane owns focus" {

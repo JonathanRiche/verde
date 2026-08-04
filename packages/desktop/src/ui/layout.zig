@@ -11,6 +11,8 @@ const runtime = @import("runtime.zig");
 const debug_window = @import("debug.zig");
 const settings_modal = @import("settings_modal.zig");
 const command_palette = @import("command_palette.zig");
+const companion = @import("companion.zig");
+const companion_controller = @import("../state/companion_controller.zig");
 const profiler = @import("../runtime/profiler.zig");
 
 const RootLayout = struct {
@@ -21,6 +23,8 @@ const RootLayout = struct {
 const SIDEBAR_ANIM_DURATION_MS: i64 = 180;
 /// Above composer overlays (150), pane menus (180), and model cascade (1400).
 const PALETTE_MODAL_Z: i32 = 2000;
+/// Persistent root overlay below true modal ownership and above pane content.
+const COMPANION_Z: i32 = 1550;
 
 var sidebar_anim_width: f32 = -1.0;
 var sidebar_anim_x: f32 = 0.0;
@@ -52,6 +56,7 @@ pub fn handleImageModalWheel(state: *runtime.AppState, width: f32, height: f32, 
 /// Rebuilds palette modal hit targets from the current window size **before** SDL input is
 /// processed. `renderRoot` runs after `processEvents`, so hits must not depend on that order.
 pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32) void {
+    companion.refreshHits(state, width, height);
     state.palette_modal_hits.clearRetainingCapacity();
     registerProviderOnboardingHits(state, width, height);
     registerMcpOnboardingHits(state, width, height);
@@ -74,6 +79,42 @@ pub fn updateCommandPaletteHover(state: *runtime.AppState, x: f32, y: f32) void 
 /// Routes wheel input to the command palette result list when it is open.
 pub fn handleCommandPaletteWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y: f32, wheel_y: f32) bool {
     return command_palette.handleWheel(state, width, height, x, y, wheel_y);
+}
+
+/// Routes pointer buttons to the visible Companion surface only.
+pub fn handleCompanionMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, down: bool, clicks: u8) bool {
+    return companion.handleMouseButton(state, x, y, button, down, clicks);
+}
+
+/// Routes pointer motion to the visible Companion surface only.
+pub fn handleCompanionMouseMotion(state: *runtime.AppState, x: f32, y: f32, dragging: bool) bool {
+    return companion.handleMouseMotion(state, x, y, dragging);
+}
+
+/// Routes wheel input to the sidecar without occluding outside content.
+pub fn handleCompanionWheel(state: *runtime.AppState, x: f32, y: f32, wheel_y: f32) bool {
+    return companion.handleWheel(state, x, y, wheel_y);
+}
+
+/// Owns a Companion Escape sequence through its matching key-up.
+pub fn handleCompanionEscapeKey(state: *runtime.AppState, down: bool) bool {
+    return companion.handleEscapeKey(state, down);
+}
+
+pub fn companionOwnsEscapeKey(state: *const runtime.AppState) bool {
+    return companion.ownsEscapeKey(state);
+}
+
+pub fn companionOwnsPointerRelease(state: *const runtime.AppState, button: u8) bool {
+    return companion.ownsPointerRelease(state, button);
+}
+
+pub fn resetCompanionInputCaptures(state: *runtime.AppState) void {
+    companion.resetInputCaptures(state);
+}
+
+pub fn companionHitAt(state: *const runtime.AppState, x: f32, y: f32) ?companion_controller.HitAction {
+    return companion.hitAt(state, x, y);
 }
 
 /// Updates import-modal thread list hover using hits from `refreshPaletteModalHits`.
@@ -155,6 +196,9 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     }
     workspace_panes.renderPaneDragPreview(state);
     sidebar.renderFloatingDragPreview(state);
+    const companion_z = state.palette_overlay_batch.setZIndex(COMPANION_Z);
+    companion.render(state, width, height);
+    state.palette_overlay_batch.restoreZIndex(companion_z);
     const modal_z = state.palette_overlay_batch.setZIndex(PALETTE_MODAL_Z);
     defer state.palette_overlay_batch.restoreZIndex(modal_z);
     renderImageModal(state, width, height);

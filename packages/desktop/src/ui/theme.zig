@@ -60,6 +60,140 @@ pub const ThemeConfig = struct {
 
 pub const default_colors: ThemeColors = .{};
 
+/// Stateless Companion chrome derived from the active theme. Character paint
+/// has its own derivation; this type owns only panel and control presentation.
+pub const CompanionChrome = struct {
+    surface: [4]f32,
+    surface_deep: [4]f32,
+    hairline: [4]f32,
+    text: [4]f32,
+    text_muted: [4]f32,
+    text_subtle: [4]f32,
+    border: [4]f32,
+    menu_border: [4]f32,
+    controls: [4]f32,
+    accent: [4]f32,
+    accent_hi: [4]f32,
+    accent_fg: [4]f32,
+    identity_fg: [4]f32,
+    ready_fill: [4]f32,
+    warning: [4]f32,
+    warning_fg: [4]f32,
+    danger: [4]f32,
+    approval_card: [4]f32,
+    approval_border: [4]f32,
+    approval_title: [4]f32,
+    approval_body: [4]f32,
+    failure_card: [4]f32,
+    failure_border: [4]f32,
+    failure_fg: [4]f32,
+    selection: [4]f32,
+    menu_selected: [4]f32,
+    menu_hover: [4]f32,
+};
+
+pub fn companionChrome() CompanionChrome {
+    return companionChromeFor(current_colors);
+}
+
+pub fn companionChromeFor(active: ThemeColors) CompanionChrome {
+    const surface = mix(active.background, active.text, 0.045);
+    const surface_deep = mix(active.background, active.text, 0.025);
+    const hairline = mix(active.background, active.text, 0.12);
+    const pole_light = if (relativeLuma(active.text) >= relativeLuma(active.background)) active.text else active.background;
+    const accent_hi = mix(active.accent, pole_light, 0.28);
+
+    const guarded_border = guardedRole(active.border, active.border_muted, active.text_subtle, surface, active.text, active.background, 0.10);
+    const menu_border = guardedRole(active.border_muted, active.text_subtle, active.border, surface_deep, active.text, active.background, 0.10);
+
+    const ready_fill = withAlpha(active.accent, 26);
+    const ready_composite = compositeOver(ready_fill, surface_deep);
+    var identity_fg = accent_hi;
+    if (lumaDistance(identity_fg, ready_composite) < 0.22) {
+        identity_fg = mix(active.text, active.accent, 0.35);
+        if (lumaDistance(identity_fg, ready_composite) < 0.22) identity_fg = active.text;
+        if (lumaDistance(identity_fg, ready_composite) < 0.22) identity_fg = betterPole(ready_composite, active.text, active.background);
+    }
+
+    const approval_card = withAlpha(active.warning, 26);
+    const approval_composite = compositeOver(approval_card, surface);
+    var approval_title = active.warning;
+    if (lumaDistance(approval_title, approval_composite) < 0.30) {
+        approval_title = mix(active.warning, active.text, 0.40);
+        if (lumaDistance(approval_title, approval_composite) < 0.30) approval_title = betterPole(approval_composite, active.text, active.background);
+    }
+    var approval_body = mix(active.text, active.warning, 0.35);
+    if (lumaDistance(approval_body, approval_composite) < 0.30) {
+        approval_body = foregroundOnFor(approval_composite, active.text, active.background);
+        if (lumaDistance(approval_body, approval_composite) < 0.30) approval_body = betterPole(approval_composite, active.text, active.background);
+    }
+
+    const failure_card = withAlpha(active.diff_remove, 18);
+    const failure_composite = compositeOver(failure_card, surface);
+    var failure_fg = active.diff_remove;
+    if (lumaDistance(failure_fg, failure_composite) < 0.30) {
+        failure_fg = mix(active.diff_remove, active.text, 0.30);
+        if (lumaDistance(failure_fg, failure_composite) < 0.30) failure_fg = betterPole(failure_composite, active.text, active.background);
+    }
+
+    var selection_color = withAlpha(active.accent, 140);
+    if (lumaDistance(active.text, compositeOver(selection_color, surface)) < 0.30) selection_color = withAlpha(active.accent, 90);
+
+    return .{
+        .surface = surface,
+        .surface_deep = surface_deep,
+        .hairline = hairline,
+        .text = active.text,
+        .text_muted = active.text_muted,
+        .text_subtle = active.text_subtle,
+        .border = guarded_border,
+        .menu_border = menu_border,
+        .controls = active.border_muted,
+        .accent = active.accent,
+        .accent_hi = accent_hi,
+        .accent_fg = foregroundOnFor(active.accent, active.text, active.background),
+        .identity_fg = identity_fg,
+        .ready_fill = ready_fill,
+        .warning = active.warning,
+        .warning_fg = foregroundOnFor(active.warning, active.text, active.background),
+        .danger = active.diff_remove,
+        .approval_card = approval_card,
+        .approval_border = withAlpha(active.warning, 115),
+        .approval_title = approval_title,
+        .approval_body = approval_body,
+        .failure_card = failure_card,
+        .failure_border = withAlpha(active.diff_remove, 90),
+        .failure_fg = failure_fg,
+        .selection = selection_color,
+        .menu_selected = withAlpha(active.border, 218),
+        .menu_hover = mix(surface_deep, active.text, 0.06),
+    };
+}
+
+fn lumaDistance(left: [4]f32, right: [4]f32) f32 {
+    return @abs(relativeLuma(left) - relativeLuma(right));
+}
+
+fn compositeOver(foreground: [4]f32, backing: [4]f32) [4]f32 {
+    return mix(backing, .{ foreground[0], foreground[1], foreground[2], 1.0 }, foreground[3]);
+}
+
+fn foregroundOnFor(fill: [4]f32, text: [4]f32, backing: [4]f32) [4]f32 {
+    return betterPole(fill, text, backing);
+}
+
+fn betterPole(fill: [4]f32, text: [4]f32, backing: [4]f32) [4]f32 {
+    return if (lumaDistance(fill, text) >= lumaDistance(fill, backing)) text else backing;
+}
+
+fn guardedRole(first: [4]f32, second: [4]f32, third: [4]f32, backing: [4]f32, text: [4]f32, background_color: [4]f32, threshold: f32) [4]f32 {
+    var result = first;
+    if (lumaDistance(result, backing) < threshold) result = second;
+    if (lumaDistance(result, backing) < threshold) result = third;
+    if (lumaDistance(result, backing) < threshold) result = betterPole(backing, text, background_color);
+    return result;
+}
+
 pub var current_colors: ThemeColors = default_colors;
 
 pub var COLOR_GREEN = default_colors.accent;
@@ -272,6 +406,13 @@ pub fn uiScaleFactor() f32 {
     // Configured UI font size acts as whole-UI zoom on top of the display
     // scale; DEFAULT_FONT_SIZE keeps the factor at 1.0 for the default config.
     return current_ui_scale * (current_font_size / DEFAULT_FONT_SIZE);
+}
+
+/// Physical pixels per logical UI unit before configured font zoom. Companion
+/// uses prototype-fixed logical geometry while the rest of Verde may opt into
+/// the combined font-size-aware `uiScaleFactor`.
+pub fn displayScaleFactor() f32 {
+    return current_ui_scale;
 }
 
 pub fn scaledUi(value: f32) f32 {
