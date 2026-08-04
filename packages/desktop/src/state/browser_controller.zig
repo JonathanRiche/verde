@@ -126,6 +126,12 @@ pub const BrowserTabIndicator = enum {
     failed,
 };
 
+const PaletteSurfaceTransition = enum {
+    none,
+    hide,
+    restore,
+};
+
 pub const BrowserWorkspaceLocation = struct {
     index: usize,
     pane_id: WorkspacePaneId,
@@ -1328,8 +1334,8 @@ pub fn restoreBrowserSurfaceForRenderedLayout(self: anytype) void {
 
 pub fn syncBrowserSurfaceOcclusion(self: anytype) bool {
     const blocked = self.browserBlockedByPaletteOverlay();
-    if (blocked) {
-        if (!self.browser_controller.surface_suspended_for_palette_overlay) {
+    switch (paletteSurfaceTransition(blocked, self.browser_controller.surface_suspended_for_palette_overlay)) {
+        .hide => {
             self.browser_controller.runtime.controller.hide() catch |err| {
                 log.warn("failed to hide browser runtime for palette overlay: {s}", .{@errorName(err)});
                 self.browser_controller.runtime.status = .failed;
@@ -1339,27 +1345,31 @@ pub fn syncBrowserSurfaceOcclusion(self: anytype) bool {
             self.suppressNextBrowserClosedEvent();
             self.browser_controller.surface_suspended_for_palette_overlay = true;
             self.unfocusBrowserPane();
-        }
-        return true;
-    }
-
-    if (self.browser_controller.surface_suspended_for_palette_overlay) {
-        self.browser_controller.surface_suspended_for_palette_overlay = false;
-        if (self.browser_controller.surface_suspended_for_empty_state) return false;
-        self.browser_controller.runtime.status = .opening;
-        self.browser_controller.runtime.controller.show() catch |err| {
-            log.warn("failed to restore browser runtime after palette overlay: {s}", .{@errorName(err)});
-            self.browser_controller.runtime.status = .failed;
-            self.browser_controller.runtime.setLastError("Failed to restore browser runtime after Palette overlay.") catch {};
-            return false;
-        };
-        if (!self.browser_controller.pane_focused) {
-            self.browser_controller.runtime.controller.blur() catch |err| {
-                log.warn("failed to clear restored native browser focus: {s}", .{@errorName(err)});
+        },
+        .restore => {
+            self.browser_controller.surface_suspended_for_palette_overlay = false;
+            if (self.browser_controller.surface_suspended_for_empty_state) return false;
+            self.browser_controller.runtime.status = .opening;
+            self.browser_controller.runtime.controller.show() catch |err| {
+                log.warn("failed to restore browser runtime after palette overlay: {s}", .{@errorName(err)});
+                self.browser_controller.runtime.status = .failed;
+                self.browser_controller.runtime.setLastError("Failed to restore browser runtime after Palette overlay.") catch {};
+                return false;
             };
-        }
+            if (!self.browser_controller.pane_focused) {
+                self.browser_controller.runtime.controller.blur() catch |err| {
+                    log.warn("failed to clear restored native browser focus: {s}", .{@errorName(err)});
+                };
+            }
+        },
+        .none => {},
     }
-    return false;
+    return blocked;
+}
+
+fn paletteSurfaceTransition(blocked: bool, suspended: bool) PaletteSurfaceTransition {
+    if (blocked) return if (suspended) .none else .hide;
+    return if (suspended) .restore else .none;
 }
 
 pub fn browserBlockedByPaletteOverlay(self: anytype) bool {
@@ -1368,6 +1378,7 @@ pub fn browserBlockedByPaletteOverlay(self: anytype) bool {
         break :blk quick.visible and (kind == null or kind.? != .browser);
     } else false;
     return quick_blocks_browser or
+        companionSidecarBlocksBrowser(self.companion_controller.visibility == .sidecar_open) or
         self.project_controller.show_creator or
         self.settings_controller.modal_visible or
         self.handoff_controller.modal_open or
@@ -1383,6 +1394,25 @@ pub fn browserBlockedByPaletteOverlay(self: anytype) bool {
         self.composer_controller.composer.active_menu != null or
         self.composer_controller.model_picker.isOpen() or
         self.composer_controller.run_config_open;
+}
+
+fn companionSidecarBlocksBrowser(sidecar_open: bool) bool {
+    return sidecar_open;
+}
+
+test "Companion sidecar drives the existing browser surface hide restore lifecycle" {
+    try std.testing.expect(!companionSidecarBlocksBrowser(false));
+    try std.testing.expect(companionSidecarBlocksBrowser(true));
+    try std.testing.expectEqual(PaletteSurfaceTransition.none, paletteSurfaceTransition(false, false));
+    // Opening a sidecar hides one native child surface exactly once.
+    try std.testing.expectEqual(PaletteSurfaceTransition.hide, paletteSurfaceTransition(true, false));
+    try std.testing.expectEqual(PaletteSurfaceTransition.none, paletteSurfaceTransition(true, true));
+    // Collapse restores it; an offscreen texture has no suspended child and
+    // therefore requires no surface lifecycle operation.
+    try std.testing.expectEqual(PaletteSurfaceTransition.restore, paletteSurfaceTransition(false, true));
+    try std.testing.expectEqual(PaletteSurfaceTransition.none, paletteSurfaceTransition(false, false));
+    // A true modal keeps the same surface hidden after Companion collapses.
+    try std.testing.expectEqual(PaletteSurfaceTransition.none, paletteSurfaceTransition(true, true));
 }
 
 pub fn suppressNextBrowserClosedEvent(self: anytype) void {

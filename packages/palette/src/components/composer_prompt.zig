@@ -1432,9 +1432,16 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         }
 
         fn setFocused(self: *Component, focused: bool) void {
-            if (self.focused == focused) return;
+            const changed = self.focused != focused;
             self.focused = focused;
-            self.emit(.{ .focus_changed = focused });
+            if (!focused) {
+                self.selection_anchor = null;
+                self.selection_focus = null;
+                self.dragging_selection = false;
+                self.active_menu = null;
+                self.hovered_menu_index = null;
+            }
+            if (changed) self.emit(.{ .focus_changed = focused });
         }
 
         pub fn cursorRect(self: *const Component) draw.Rect {
@@ -2265,4 +2272,36 @@ test "composer prompt selects and replaces text" {
         if (command.kind == .selection) selection_count += 1;
     }
     try std.testing.expect(selection_count > 0);
+}
+
+test "composer prompt blur clears selection drag and menus" {
+    const Prompt = ComposerPrompt(.{ .width = 320, .height = 150 });
+    var prompt = Prompt.init();
+    defer prompt.deinit(std.testing.allocator);
+    prompt.focused = true;
+    prompt.selection_anchor = 1;
+    prompt.selection_focus = 2;
+    prompt.dragging_selection = true;
+    prompt.active_menu = .model;
+    prompt.hovered_menu_index = 0;
+
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .focus = false }));
+    try std.testing.expect(!prompt.focused);
+    try std.testing.expect(prompt.selection_anchor == null);
+    try std.testing.expect(prompt.selection_focus == null);
+    try std.testing.expect(!prompt.dragging_selection);
+    try std.testing.expect(prompt.active_menu == null);
+    try std.testing.expect(prompt.hovered_menu_index == null);
+
+    prompt.selection_anchor = 3;
+    prompt.selection_focus = 4;
+    prompt.dragging_selection = true;
+    prompt.active_menu = .reasoning;
+    prompt.hovered_menu_index = 1;
+    try std.testing.expect(!try prompt.handleInput(std.testing.allocator, .{ .focus = false }));
+    try std.testing.expect(prompt.selection_anchor == null);
+    try std.testing.expect(prompt.selection_focus == null);
+    try std.testing.expect(!prompt.dragging_selection);
+    try std.testing.expect(prompt.active_menu == null);
+    try std.testing.expect(prompt.hovered_menu_index == null);
 }

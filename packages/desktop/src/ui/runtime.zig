@@ -5,7 +5,10 @@ const utils = @import("../utils.zig");
 
 pub const AppState = native_state.AppState;
 pub const ChatImageAttachment = native_state.ChatImageAttachment;
+pub const ChatThread = native_state.ChatThread;
 pub const ChatRole = native_state.ChatRole;
+pub const PendingApproval = native_state.PendingApproval;
+pub const Project = native_state.Project;
 pub const PaletteModalAction = native_state.PaletteModalAction;
 pub const PaletteModalHit = native_state.PaletteModalHit;
 pub const PaletteModalTextFocus = native_state.PaletteModalTextFocus;

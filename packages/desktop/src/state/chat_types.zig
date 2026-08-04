@@ -72,9 +72,13 @@ pub const ChatImageAttachment = struct {
     byte_size: usize,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8, mime: []const u8, byte_size: usize) !ChatImageAttachment {
+        const owned_path = try allocator.dupeZ(u8, path);
+        errdefer allocator.free(owned_path);
+        const owned_file_name = try allocator.dupeZ(u8, std.fs.path.basename(path));
+        errdefer allocator.free(owned_file_name);
         return .{
-            .path = try allocator.dupeZ(u8, path),
-            .file_name = try allocator.dupeZ(u8, std.fs.path.basename(path)),
+            .path = owned_path,
+            .file_name = owned_file_name,
             .mime = try allocator.dupeZ(u8, mime),
             .byte_size = byte_size,
         };
@@ -302,7 +306,7 @@ pub const ChatThread = struct {
         if (!self.send_state.mutex.tryLock()) return .working;
         defer self.send_state.mutex.unlock();
         return switch (self.send_state.status) {
-            .pending => if (self.send_state.pending_approval != null) .waiting else .working,
+            .pending => if (self.send_state.pending_approval != null and self.send_state.approval_decision == null) .waiting else .working,
             .failed => .@"error",
             else => .idle,
         };
@@ -538,6 +542,10 @@ pub const ChatThread = struct {
             std.heap.page_allocator.free(message);
             self.send_state.error_message = null;
         }
+        if (self.send_state.control_error_message) |message| {
+            std.heap.page_allocator.free(message);
+            self.send_state.control_error_message = null;
+        }
         if (self.send_state.provisional_provider_thread_id) |thread_id| {
             std.heap.page_allocator.free(thread_id);
             self.send_state.provisional_provider_thread_id = null;
@@ -632,6 +640,9 @@ pub const SendState = struct {
     started_at_ms: i64 = 0,
     result: ?SendResultPayload = null,
     error_message: ?[]u8 = null,
+    /// Transient failure to transfer an approval/stop action to its owner.
+    /// Kept separate from provider terminal failure state.
+    control_error_message: ?[]u8 = null,
     provider: ?Provider = null,
     provisional_provider_thread_id: ?[]u8 = null,
     active_turn_id: ?[]u8 = null,
