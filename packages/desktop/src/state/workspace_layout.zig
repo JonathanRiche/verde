@@ -119,6 +119,12 @@ pub const WorkspaceLayout = struct {
     focused_pane_id: ?WorkspacePaneId = null,
     maximized_pane_id: ?WorkspacePaneId = null,
     quick_pane: ?FloatingQuickPane = null,
+    /// Logical workspace pixels. The target is persisted; the current value
+    /// eases toward it while the scrolling layout is visible.
+    scroll_offset_x: f32 = 0.0,
+    scroll_target_x: f32 = 0.0,
+    scroll_revealed_pane_id: ?WorkspacePaneId = null,
+    scroll_animation_last_ms: i64 = 0,
 
     pub fn initDefaultChat(allocator: std.mem.Allocator) !WorkspaceLayout {
         var layout: WorkspaceLayout = .{};
@@ -298,6 +304,24 @@ pub const WorkspaceLayout = struct {
     pub fn visiblePaneCount(self: *const WorkspaceLayout) usize {
         const root_node = self.root orelse return 0;
         return countWorkspaceNodeLeaves(root_node);
+    }
+
+    /// Returns the adjacent tiled pane in the same order as the expanded
+    /// sidebar, excluding detached panes that are not part of the root.
+    pub fn adjacentTiledPaneIdInSidebarOrder(self: *const WorkspaceLayout, pane_id: WorkspacePaneId, direction: WorkspacePaneDirection) ?WorkspacePaneId {
+        if (!self.rootContainsPane(pane_id)) return null;
+        if (direction == .up or direction == .down) return null;
+
+        var previous: ?WorkspacePaneId = null;
+        var matched = false;
+        for (self.panes.items) |pane| {
+            if (!self.rootContainsPane(pane.id)) continue;
+            if (direction == .left and pane.id == pane_id) return previous;
+            if (matched) return pane.id;
+            if (pane.id == pane_id) matched = true;
+            previous = pane.id;
+        }
+        return null;
     }
 
     pub fn gridNewPanePlacement(self: *const WorkspaceLayout) ?WorkspacePanePlacement {
@@ -701,6 +725,8 @@ pub const WorkspaceLayout = struct {
         } else {
             try stringify.write(null);
         }
+        try stringify.objectField("scroll_x");
+        try stringify.write(self.scroll_target_x);
         try stringify.objectField("quick");
         if (self.quick_pane) |quick| {
             try stringify.beginObject();
@@ -817,6 +843,8 @@ pub const WorkspaceLayout = struct {
         next_layout.next_pane_id = @intCast(jsonInt(root_value.object.get("next") orelse .null) orelse 1);
         next_layout.focused_pane_id = if (jsonInt(root_value.object.get("focused") orelse .null)) |id| @intCast(id) else null;
         next_layout.maximized_pane_id = if (jsonInt(root_value.object.get("maximized") orelse .null)) |id| @intCast(id) else null;
+        next_layout.scroll_target_x = @max(0.0, jsonFloat(root_value.object.get("scroll_x") orelse .null) orelse 0.0);
+        next_layout.scroll_offset_x = next_layout.scroll_target_x;
         if (root_value.object.get("quick")) |quick_value| {
             if (quick_value == .object) {
                 if (jsonInt(quick_value.object.get("pane") orelse .null)) |pane_id| {
@@ -1384,6 +1412,48 @@ test "workspace layout grid placement follows pane hotkey order" {
     try std.testing.expectEqual(pane2, placement.pane_id);
     try std.testing.expectEqual(WorkspaceSplitAxis.horizontal, placement.axis);
     try std.testing.expect(placement.new_after);
+}
+
+test "workspace sidebar order provides horizontal scrolling neighbors" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const second_pane_id = try layout.createTerminalPane(allocator, 10);
+    try layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
+    const middle_pane_id = try layout.createTerminalPane(allocator, 11);
+    try layout.splitPaneWithLeaf(allocator, 1, middle_pane_id, .horizontal, true);
+
+    // Splitting pane 1 again makes root order 1,3,2 while sidebar/storage
+    // order remains 1,2,3. Scrolling follows the latter.
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.adjacentTiledPaneIdInSidebarOrder(1, .left));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.adjacentTiledPaneIdInSidebarOrder(1, .right));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), layout.adjacentTiledPaneIdInSidebarOrder(second_pane_id, .left));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, middle_pane_id), layout.adjacentTiledPaneIdInSidebarOrder(second_pane_id, .right));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.adjacentTiledPaneIdInSidebarOrder(middle_pane_id, .left));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.adjacentTiledPaneIdInSidebarOrder(middle_pane_id, .right));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.adjacentTiledPaneIdInSidebarOrder(middle_pane_id, .up));
+}
+
+test "workspace layout persists the scrolling target" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    layout.scroll_offset_x = 48.0;
+    layout.scroll_target_x = 173.5;
+    layout.scroll_revealed_pane_id = 1;
+    layout.scroll_animation_last_ms = 900;
+
+    const persisted = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(persisted);
+    var restored = try WorkspaceLayout.initDefaultChat(allocator);
+    defer restored.deinit(allocator);
+    try restored.applyPersistedWorkspaceJson(allocator, persisted);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 173.5), restored.scroll_target_x, 0.0001);
+    try std.testing.expectApproxEqAbs(restored.scroll_target_x, restored.scroll_offset_x, 0.0001);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), restored.scroll_revealed_pane_id);
+    try std.testing.expectEqual(@as(i64, 0), restored.scroll_animation_last_ms);
 }
 
 test "closing a maximized pane transfers zoom in sidebar order" {

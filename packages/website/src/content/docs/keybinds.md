@@ -45,8 +45,8 @@ zoomed pane without restoring the split layout.
 
 | Combo    | Action                          |
 | -------- | ------------------------------- |
-| `Ctrl+H` | Focus the pane to the left  |
-| `Ctrl+L` | Focus the pane to the right |
+| `Ctrl+H` or `Ctrl+Left` | Focus the pane or scrolling column to the left  |
+| `Ctrl+L` or `Ctrl+Right` | Focus the pane or scrolling column to the right |
 | `Ctrl+K` | Focus the pane above        |
 | `Ctrl+J` | Focus the pane below        |
 

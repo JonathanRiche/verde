@@ -52,6 +52,8 @@ pub const OpenAction = enum {
 pub const Draft = struct {
     font_size: f32 = theme.DEFAULT_FONT_SIZE,
     terminal_font_size: f32 = app_config.DEFAULT_TERMINAL_FONT_SIZE,
+    workspace_pane_gap: f32 = app_config.DEFAULT_WORKSPACE_PANE_GAP,
+    workspace_panes_per_view: u8 = app_config.DEFAULT_WORKSPACE_PANES_PER_VIEW,
     theme_source: theme.ThemeSource = .omarchy,
     theme_choice: usize = 1,
     open_action: OpenAction = .folder,
@@ -222,6 +224,8 @@ pub fn syncSettingsDraftFromConfig(self: anytype) void {
     self.settings_controller.draft = .{
         .font_size = self.app_config.font_size,
         .terminal_font_size = self.app_config.terminal_font_size,
+        .workspace_pane_gap = self.app_config.workspace_pane_gap,
+        .workspace_panes_per_view = self.app_config.workspace_panes_per_view,
         .theme_source = self.app_config.theme_config.source,
         .theme_choice = self.app_config.themeChoiceIndex(),
         .open_action = settingsOpenActionFromConfig(self.app_config.default_open_action),
@@ -246,6 +250,8 @@ pub fn isSettingsDraftDirty(self: anytype) bool {
     const draft = self.settings_controller.draft;
     if (draft.font_size != self.app_config.font_size) return true;
     if (draft.terminal_font_size != self.app_config.terminal_font_size) return true;
+    if (draft.workspace_pane_gap != self.app_config.workspace_pane_gap) return true;
+    if (draft.workspace_panes_per_view != self.app_config.workspace_panes_per_view) return true;
     if (draft.theme_choice != self.app_config.themeChoiceIndex()) return true;
     if (draft.link_open_target != self.app_config.link_open_target) return true;
     if (draft.browser_fast_scrolling_enabled != self.app_config.browser_fast_scrolling_enabled) return true;
@@ -367,6 +373,8 @@ pub fn saveSettingsModal(self: anytype) !void {
     try self.app_config.selectThemeChoice(self.allocator, self.settings_controller.draft.theme_choice);
     self.app_config.font_size = theme.clampf(self.settings_controller.draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE);
     self.app_config.terminal_font_size = theme.clampf(self.settings_controller.draft.terminal_font_size, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE);
+    self.app_config.workspace_pane_gap = theme.clampf(self.settings_controller.draft.workspace_pane_gap, app_config.MIN_WORKSPACE_PANE_GAP, app_config.MAX_WORKSPACE_PANE_GAP);
+    self.app_config.workspace_panes_per_view = std.math.clamp(self.settings_controller.draft.workspace_panes_per_view, app_config.MIN_WORKSPACE_PANES_PER_VIEW, app_config.MAX_WORKSPACE_PANES_PER_VIEW);
     self.app_config.link_open_target = self.settings_controller.draft.link_open_target;
     self.app_config.browser_fast_scrolling_enabled = self.settings_controller.draft.browser_fast_scrolling_enabled;
     self.app_config.file_links_in_neovim_pane = self.settings_controller.draft.file_links_in_neovim_pane;
