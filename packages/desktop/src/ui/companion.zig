@@ -2176,6 +2176,81 @@ test "public Companion render leads with the answer and suppresses metadata-only
     try expectNoTextCommandContaining(&state.palette_overlay_batch, "Duration ms: 4");
 }
 
+test "public Companion render clears stale failure posture while failed evidence remains" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller = .{};
+    state.companion_controller = controller.init();
+    state.companion_composer = @TypeOf(state.companion_composer).init();
+    state.palette_overlay_batch = .{};
+    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.companion_composer.deinit(allocator);
+        state.palette_overlay_batch.deinit(allocator);
+        state.palette_frame_text_arena.deinit();
+    }
+    var project = try runtime.Project.init(allocator, "posture", "Posture", "/tmp/posture", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+
+    // Newer successful turn: global posture is clean even though an older
+    // failed operation remains retained as evidence.
+    var success_frame: controller.Frame = .{ .has_thread = true };
+    success_frame.workspace_id.set("posture");
+    success_frame.thread_id.set("pane-less-posture");
+    success_frame.objective.set("i meant read teh readme.md and use read tools");
+    success_frame.answer.set("The first heading is **Verde**.");
+    var old_failure: controller.Operation = .{ .status = .failed, .sequence = 1 };
+    old_failure.identity.set("tool:old-failure");
+    old_failure.title.set("Command failed");
+    old_failure.detail.set("Command:\n/usr/bin/bash -lc \"sed -n '1,12p' redme.md\"\n\nOutput:\nCWD: /tmp\nExit code: 2");
+    success_frame.upsertOperation(old_failure);
+    state.companion_controller.setFrame(success_frame);
+
+    // Collapsed chip: no stale "failed" detail and no danger accent.
+    try std.testing.expectEqual(ChipDetail.none, chipVisual(&state.companion_controller).detail);
+    try std.testing.expect(!chipVisual(&state.companion_controller).uses_danger);
+    render(&state, 1360.0, 860.0);
+    try expectNoTextCommand(&state.palette_overlay_batch, "failed");
+
+    // Expanded header: ready, not needs-attention, while the failed card
+    // stays red in Recent and the successful answer leads Run.
+    state.companion_controller.show();
+    const geometry = computeGeometryForState(1360.0, 860.0, 1.0, &state.companion_controller);
+    state.palette_overlay_batch.clear();
+    render(&state, 1360.0, 860.0);
+    try expectClippedTextCommand(&state.palette_overlay_batch, "ready", geometry.header);
+    try expectNoTextCommand(&state.palette_overlay_batch, "needs attention");
+    try expectClippedTextCommand(&state.palette_overlay_batch, "FAILED", geometry.body);
+    try expectClippedTextCommand(&state.palette_overlay_batch, "The first heading is **Verde**.", geometry.body);
+
+    // A genuinely current failure still reads globally red in the header and
+    // on the collapsed chip.
+    var failed_frame: controller.Frame = .{ .has_thread = true, .has_failure = true, .answer_failed = true };
+    failed_frame.workspace_id.set("posture");
+    failed_frame.thread_id.set("pane-less-posture");
+    failed_frame.objective.set("i meant read teh readme.md and use read tools");
+    failed_frame.provider_error.set("Send failed: provider exited");
+    failed_frame.upsertOperation(old_failure);
+    state.companion_controller.setFrame(failed_frame);
+    state.palette_overlay_batch.clear();
+    render(&state, 1360.0, 860.0);
+    try expectClippedTextCommand(&state.palette_overlay_batch, "needs attention", geometry.header);
+    try expectClippedTextCommand(&state.palette_overlay_batch, "The run failed before replying.", geometry.body);
+    state.companion_controller.collapse();
+    const chip_geometry = computeGeometryForState(1360.0, 860.0, 1.0, &state.companion_controller);
+    state.palette_overlay_batch.clear();
+    render(&state, 1360.0, 860.0);
+    try expectClippedTextCommand(&state.palette_overlay_batch, "failed", chip_geometry.chip);
+}
+
 test "meaningful result preview skips only the fixed metadata preamble" {
     try std.testing.expect(meaningfulResultPreview("CWD: /home/x\nExit code: 0\nDuration ms: 3") == null);
     try std.testing.expectEqualStrings("real output\nsecond line", meaningfulResultPreview("CWD: /home/x\nExit code: 0\nDuration ms: 3\n\nreal output\nsecond line").?);

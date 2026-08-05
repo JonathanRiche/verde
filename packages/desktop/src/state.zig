@@ -5828,6 +5828,11 @@ pub const AppState = struct {
                     // A meaningful user prompt starts a new turn, so the prior
                     // assistant answer must not present as this turn's result.
                     frame.answer.set("");
+                    // The newer objective also supersedes older failure
+                    // posture: failed operations stay as red evidence, but
+                    // they no longer poison the global chip/header state.
+                    // Current-turn failures re-assert during sync.
+                    frame.has_failure = false;
                 }
             }
             if (message.role == .assistant) {
@@ -5882,6 +5887,9 @@ pub const AppState = struct {
                     if (trimmed.len > 0) {
                         frame.objective.set(trimmed);
                         frame.answer.set("");
+                        // In-flight prompts clear stale failure posture
+                        // immediately, before the first delta arrives.
+                        frame.has_failure = false;
                     }
                 }
                 if (event.role == .assistant) {
@@ -9256,6 +9264,102 @@ test "Companion frame projects transcript pending streaming lifecycle errors and
     try std.testing.expectEqualStrings("Committed: hotfix shipped", frame.answer.slice());
     try std.testing.expect(!frame.answer_failed);
     try std.testing.expect(!frame.working);
+}
+
+test "Companion projection scopes global failure posture to the current turn" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.companion_controller = companion_controller.init();
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+    var project = try Project.init(allocator, "failure-scope", "Failure scope", "/tmp/failure-scope", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    const thread = try state.project_controller.projects.items[0].ensureCompanionThread(allocator);
+    try thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "User"),
+        .body = try allocator.dupeZ(u8, "read the readme"),
+    });
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "Command failed"),
+        .body = try allocator.dupeZ(u8, "Command:\n/usr/bin/bash -lc \"sed -n '1,12p' redme.md\"\n\nOutput:\nCWD: /tmp\nExit code: 2"),
+        .tool_call_id = try allocator.dupe(u8, "call-old-failure"),
+        .tool_call_kind = .execute,
+        .tool_call_status = .failed,
+    });
+    const send_state = thread.send_state;
+
+    // Latest turn failed and no newer objective exists: posture stays red.
+    state.syncCompanionProjection();
+    var frame = &state.companion_controller.presentation;
+    try std.testing.expect(frame.has_failure);
+    try std.testing.expect(state.companion_controller.has_failure);
+    try std.testing.expectEqualStrings("Needs attention", state.companion_controller.status_text);
+    try std.testing.expectEqual(companion_controller.OperationStatus.failed, frame.operations[0].status);
+
+    // A newer meaningful objective clears the stale posture to working
+    // immediately, before the first delta.
+    send_state.status = .pending;
+    try send_state.pending_events.append(std.heap.page_allocator, .{
+        .role = .user,
+        .author = try std.heap.page_allocator.dupe(u8, "You"),
+        .body = try std.heap.page_allocator.dupe(u8, "i meant read teh readme.md and use read tools"),
+    });
+    state.syncCompanionProjection();
+    frame = &state.companion_controller.presentation;
+    try std.testing.expect(!frame.has_failure);
+    try std.testing.expect(!state.companion_controller.has_failure);
+    try std.testing.expect(frame.working);
+    try std.testing.expectEqualStrings("Working", state.companion_controller.status_text);
+    // The failed operation remains as red evidence in the same snapshot.
+    try std.testing.expectEqual(companion_controller.OperationStatus.failed, frame.operations[0].status);
+
+    // Completing the newer turn successfully yields Ready globally while the
+    // historical failed operation stays retained.
+    send_state.pending_events.clearRetainingCapacity();
+    send_state.status = .idle;
+    try thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "User"),
+        .body = try allocator.dupeZ(u8, "i meant read teh readme.md and use read tools"),
+    });
+    try thread.messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Sprout"),
+        .body = try allocator.dupeZ(u8, "The first heading is **Verde**."),
+    });
+    state.syncCompanionProjection();
+    frame = &state.companion_controller.presentation;
+    try std.testing.expect(!frame.has_failure);
+    try std.testing.expect(!state.companion_controller.has_failure);
+    try std.testing.expect(!frame.answer_failed);
+    try std.testing.expectEqualStrings("Ready", state.companion_controller.status_text);
+    try std.testing.expectEqualStrings("The first heading is **Verde**.", frame.answer.slice());
+    try std.testing.expectEqual(companion_controller.OperationStatus.failed, frame.operations[0].status);
+    try std.testing.expectEqual(@as(usize, 1), frame.recentCount());
+
+    // Current control and send failures still turn the posture red.
+    send_state.control_error_message = try std.heap.page_allocator.dupe(u8, "Approval decision failed");
+    state.syncCompanionProjection();
+    try std.testing.expect(state.companion_controller.presentation.has_failure);
+    try std.testing.expectEqualStrings("Needs attention", state.companion_controller.status_text);
+    send_state.control_error_message = null;
+    send_state.status = .failed;
+    send_state.error_message = try std.heap.page_allocator.dupe(u8, "Send failed: provider exited");
+    state.syncCompanionProjection();
+    frame = &state.companion_controller.presentation;
+    try std.testing.expect(frame.has_failure);
+    try std.testing.expect(frame.answer_failed);
+    try std.testing.expect(state.companion_controller.has_failure);
 }
 
 test "Companion production projection rejects lossy identities and preserves owner hierarchy" {
