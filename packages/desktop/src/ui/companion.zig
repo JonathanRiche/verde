@@ -2,10 +2,16 @@
 
 const std = @import("std");
 const palette = @import("palette");
+const app_config = @import("../app/config.zig");
 const controller = @import("../state/companion_controller.zig");
 const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
 const text_measure = @import("text_measure.zig");
+
+// Keep settings_modal tests on the registered root suite without editing main.zig.
+test {
+    _ = @import("settings_modal.zig");
+}
 
 const log = std.log.scoped(.companion_ui);
 
@@ -265,12 +271,15 @@ fn registerHits(state: *controller, geometry: Geometry, show_approval: bool) voi
 fn renderChip(state: *runtime.AppState, geometry: Geometry) void {
     const scale = companionScale();
     const chrome = theme.companionChrome();
+    const character = activeCompanionCharacter(state);
     appendChipChrome(state.allocator, &state.palette_overlay_batch, geometry, scale) catch |err| log.warn("failed to queue chip chrome: {s}", .{@errorName(err)});
     if (geometry.chip.w < 103.0 * scale or geometry.chip.h < 36.0 * scale) return;
-    if (geometry.chip_character.w > 0.0 and geometry.chip_character.h > 0.0) renderSprout(state, geometry.chip_character, state.companion_controller.visualState());
+    if (geometry.chip_character.w > 0.0 and geometry.chip_character.h > 0.0) {
+        renderCompanionCharacter(state, fullCharacterRect(geometry.chip_character, character, scale), state.companion_controller.visualState(), character, .full);
+    }
     var x = geometry.chip.x + 54.0 * scale;
     const center_y = geometry.chip.y + 10.0 * scale;
-    queueText(state, .{ .x = x, .y = center_y, .w = 42.0 * scale, .h = 17.0 * scale }, "Sprout", color(chrome.text), 12.0 * scale, geometry.chip);
+    queueText(state, .{ .x = x, .y = center_y, .w = 42.0 * scale, .h = 17.0 * scale }, companionCharacterName(character), color(chrome.text), 12.0 * scale, geometry.chip);
     x += 46.0 * scale;
     const visual = chipVisual(&state.companion_controller);
     if (visual.detail == .working) {
@@ -314,11 +323,12 @@ fn renderSidecar(state: *runtime.AppState, geometry: Geometry) void {
 fn renderHeader(state: *runtime.AppState, geometry: Geometry) void {
     const scale = companionScale();
     const chrome = theme.companionChrome();
+    const character = activeCompanionCharacter(state);
     if (geometry.header.w < 120.0 * scale or geometry.header.h < 44.0 * scale) return;
-    const sprout_rect: palette.Rect = .{ .x = geometry.header.x + 12.0 * scale, .y = geometry.header.y + 6.5 * scale, .w = 29.0 * scale, .h = 31.0 * scale };
-    renderSprout(state, sprout_rect, state.companion_controller.visualState());
-    const title_x = sprout_rect.x + 38.0 * scale;
-    queueBoldText(state, .{ .x = title_x, .y = geometry.header.y + 11.0 * scale, .w = 48.0 * scale, .h = 18.0 * scale }, "Sprout", color(chrome.text), 13.0 * scale, geometry.header);
+    const portrait = compactCharacterRect(geometry.header, character, scale);
+    renderCompanionCharacter(state, portrait, state.companion_controller.visualState(), character, .compact);
+    const title_x = portrait.x + 38.0 * scale;
+    queueBoldText(state, .{ .x = title_x, .y = geometry.header.y + 11.0 * scale, .w = 48.0 * scale, .h = 18.0 * scale }, companionCharacterName(character), color(chrome.text), 13.0 * scale, geometry.header);
     const status = headerStatus(state);
     queueMonoText(state, .{ .x = title_x + 52.0 * scale, .y = geometry.header.y + 13.0 * scale, .w = @max(geometry.close_button.x - title_x - 57.0 * scale, 0.0), .h = 16.0 * scale }, status, color(chrome.text_subtle), 10.5 * scale, geometry.header);
     // The collapse affordance fills with the header surface it sits on: border
@@ -773,9 +783,7 @@ fn operationStatusColor(chrome: theme.CompanionChrome, status: controller.Operat
     };
 }
 
-// Active theme inputs shared by character-specific palette derivations. Moss
-// and Vireo may consume this seam later; their derivations are intentionally
-// absent until their visual contracts exist.
+// Active theme inputs shared by character-specific palette derivations.
 const CharacterTheme = struct {
     background: [4]f32,
     text: [4]f32,
@@ -786,6 +794,74 @@ const CharacterTheme = struct {
     warning: [4]f32,
     danger: [4]f32,
 };
+
+const CharacterPresentation = enum { full, compact };
+
+fn activeCompanionCharacter(state: *const runtime.AppState) app_config.CompanionCharacter {
+    return state.app_config.companion_character;
+}
+
+fn companionCharacterName(character: app_config.CompanionCharacter) []const u8 {
+    return switch (character) {
+        .sprout => "Sprout",
+        .moss => "Moss",
+        .vireo => "Vireo",
+    };
+}
+
+fn fullCharacterSize(character: app_config.CompanionCharacter) struct { w: f32, h: f32 } {
+    return switch (character) {
+        .sprout => .{ .w = 46.0, .h = 48.0 },
+        .moss => .{ .w = 46.0, .h = 46.0 },
+        .vireo => .{ .w = 46.0, .h = 42.0 },
+    };
+}
+
+fn compactCharacterSize(character: app_config.CompanionCharacter) struct { w: f32, h: f32 } {
+    return switch (character) {
+        .sprout => .{ .w = 29.0, .h = 31.0 },
+        .moss => .{ .w = 29.0, .h = 30.0 },
+        .vireo => .{ .w = 29.0, .h = 27.0 },
+    };
+}
+
+fn fullCharacterRect(slot: palette.Rect, character: app_config.CompanionCharacter, scale: f32) palette.Rect {
+    const size = fullCharacterSize(character);
+    const w = @min(size.w * scale, slot.w);
+    const h = @min(size.h * scale, slot.h);
+    return .{
+        .x = slot.x + @max((slot.w - w) * 0.5, 0.0),
+        .y = slot.y + @max(slot.h - h, 0.0),
+        .w = w,
+        .h = h,
+    };
+}
+
+fn compactCharacterRect(header: palette.Rect, character: app_config.CompanionCharacter, scale: f32) palette.Rect {
+    const size = compactCharacterSize(character);
+    return .{
+        .x = header.x + 12.0 * scale,
+        .y = header.y + 6.5 * scale,
+        .w = size.w * scale,
+        .h = size.h * scale,
+    };
+}
+
+fn renderCompanionCharacter(
+    state: *runtime.AppState,
+    rect: palette.Rect,
+    visual: controller.VisualState,
+    character: app_config.CompanionCharacter,
+    presentation: CharacterPresentation,
+) void {
+    _ = presentation;
+    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+    switch (character) {
+        .sprout => renderSprout(state, rect, visual),
+        .moss => renderMoss(state, rect, visual),
+        .vireo => renderVireo(state, rect, visual),
+    }
+}
 
 const SproutPalette = struct {
     pole_light: [4]f32,
@@ -978,6 +1054,238 @@ fn sproutLeafPoints(rect: palette.Rect, droop: f32) [4]palette.draw.Vec2 {
         .{ .x = rect.x + 45.0 * s, .y = rect.y + 14.0 * s + droop },
         .{ .x = rect.x + 23.0 * s, .y = rect.y + 16.0 * s + droop },
     };
+}
+
+const MossPalette = struct {
+    body: [4]f32,
+    body_depth: [4]f32,
+    outline: [4]f32,
+    moss_deep: [4]f32,
+    moss_mid: [4]f32,
+    moss_lit: [4]f32,
+    port: [4]f32,
+    port_ring: [4]f32,
+    pupil: [4]f32,
+    seam: [4]f32,
+    flower: [4]f32,
+    flower_core: [4]f32,
+    paused_lid: [4]f32,
+    char_surface: [4]f32,
+    warning: [4]f32,
+    warning_foreground: [4]f32,
+    danger: [4]f32,
+};
+
+const VireoPalette = struct {
+    body_back: [4]f32,
+    body_breast: [4]f32,
+    wing: [4]f32,
+    wingtip: [4]f32,
+    tail: [4]f32,
+    head: [4]f32,
+    crown: [4]f32,
+    brow: [4]f32,
+    eyeline: [4]f32,
+    eye: [4]f32,
+    pupil: [4]f32,
+    beak: [4]f32,
+    leg: [4]f32,
+    outline: [4]f32,
+    paused_lid: [4]f32,
+    char_surface: [4]f32,
+    warning: [4]f32,
+    warning_foreground: [4]f32,
+    danger: [4]f32,
+};
+
+fn deriveMossPalette(active: CharacterTheme) MossPalette {
+    const text_is_lighter = characterLuma(active.text) >= characterLuma(active.background);
+    const pole_light = if (text_is_lighter) active.text else active.background;
+    const pole_dark = if (text_is_lighter) active.background else active.text;
+    const surface_deep = theme.mix(active.background, pole_dark, 0.18);
+    const panel = theme.mix(active.background, active.panel_muted, 0.55);
+    const bronze = theme.mix(active.panel_muted, theme.mix(active.accent, active.warning, 0.30), 0.16);
+    var outline = theme.mix(active.border, theme.mix(active.accent, active.warning, 0.30), 0.22);
+    const char_surface = theme.lighten(active.background, 0.035);
+    if (lumaDistance(outline, bronze) < 0.10) {
+        outline = active.border;
+        if (lumaDistance(outline, bronze) < 0.10) outline = active.text_subtle;
+    }
+    const moss_deep = theme.mix(active.accent, surface_deep, 0.28);
+    const moss_mid = theme.mix(active.accent, panel, 0.12);
+    const moss_lit = theme.mix(theme.mix(active.accent, pole_light, 0.28), active.accent, 0.42);
+    return .{
+        .body = bronze,
+        .body_depth = theme.withAlpha(pole_dark, 34),
+        .outline = outline,
+        .moss_deep = moss_deep,
+        .moss_mid = moss_mid,
+        .moss_lit = moss_lit,
+        .port = theme.mix(active.warning, surface_deep, 0.94),
+        .port_ring = theme.mix(surface_deep, active.warning, 0.28),
+        .pupil = theme.mix(active.warning, pole_light, 0.22),
+        .seam = theme.mix(surface_deep, active.warning, 0.20),
+        .flower = theme.mix(pole_light, active.warning, 0.18),
+        .flower_core = active.warning,
+        .paused_lid = theme.mix(surface_deep, active.warning, 0.35),
+        .char_surface = char_surface,
+        .warning = active.warning,
+        .warning_foreground = characterForegroundOn(active.warning, active.text, active.background),
+        .danger = active.danger,
+    };
+}
+
+fn deriveVireoPalette(active: CharacterTheme) VireoPalette {
+    const text_is_lighter = characterLuma(active.text) >= characterLuma(active.background);
+    const pole_light = if (text_is_lighter) active.text else active.background;
+    const pole_dark = if (text_is_lighter) active.background else active.text;
+    const panel = theme.mix(active.background, active.panel_muted, 0.42);
+    const olive = theme.mix(theme.mix(active.accent, active.warning, 0.45), panel, 0.42);
+    const breast = theme.mix(pole_light, active.accent, 0.12);
+    var outline = theme.mix(active.border, active.accent, 0.35);
+    const char_surface = theme.lighten(active.background, 0.035);
+    if (lumaDistance(outline, olive) < 0.10) {
+        outline = active.border;
+        if (lumaDistance(outline, olive) < 0.10) outline = active.text_subtle;
+    }
+    return .{
+        .body_back = olive,
+        .body_breast = breast,
+        .wing = theme.mix(theme.mix(active.accent, active.warning, 0.45), panel, 0.40),
+        .wingtip = theme.mix(theme.mix(active.accent, active.warning, 0.45), active.panel_muted, 0.65),
+        .tail = theme.mix(theme.mix(active.accent, active.warning, 0.45), panel, 0.48),
+        .head = theme.mix(olive, panel, 0.18),
+        .crown = theme.mix(active.panel_muted, pole_dark, 0.26),
+        .brow = theme.mix(pole_light, active.accent, 0.20),
+        .eyeline = theme.mix(pole_dark, active.warning, 0.28),
+        .eye = theme.mix(active.danger, pole_light, 0.12),
+        .pupil = theme.mix(active.background, pole_dark, 0.35),
+        .beak = theme.mix(pole_dark, active.panel_muted, 0.22),
+        .leg = theme.mix(active.panel_muted, pole_dark, 0.30),
+        .outline = outline,
+        .paused_lid = theme.mix(theme.mix(active.background, pole_dark, 0.35), active.danger, 0.30),
+        .char_surface = char_surface,
+        .warning = active.warning,
+        .warning_foreground = characterForegroundOn(active.warning, active.text, active.background),
+        .danger = active.danger,
+    };
+}
+
+// Static Moss guardian bust; pose shifts ports, head tilt, and the shared failure badge.
+fn renderMoss(state: *runtime.AppState, rect: palette.Rect, visual: controller.VisualState) void {
+    const s = rect.w / 46.0;
+    const moss = deriveMossPalette(activeCharacterTheme());
+    const approval_tilt = if (visual.pose == .approval) 1.2 * s else 0.0;
+    const paused_drop = if (visual.pose == .paused) 1.0 * s else 0.0;
+
+    // Broad shoulder mound and resting hands.
+    const torso: palette.Rect = .{ .x = rect.x, .y = rect.y + 26.0 * s, .w = 46.0 * s, .h = 20.0 * s };
+    queueRoundedRect(state, offsetRect(torso, 0.0, 2.0 * s), color(moss.body_depth), 10.0 * s);
+    queueCharacterPanel(state, torso, color(moss.body), color(moss.outline), 10.0 * s, 1.0 * s);
+    queueRoundedRect(state, .{ .x = torso.x + 3.0 * s, .y = torso.y + torso.h - 3.0 * s, .w = 9.0 * s, .h = 6.0 * s }, color(moss.body), 4.0 * s);
+    queueRoundedRect(state, .{ .x = torso.x + torso.w - 12.0 * s, .y = torso.y + torso.h - 3.0 * s, .w = 9.0 * s, .h = 6.0 * s }, color(moss.body), 4.0 * s);
+
+    // Shoulder moss carpet with irregular clumps.
+    const cap: palette.Rect = .{ .x = rect.x + 2.0 * s, .y = rect.y + 20.0 * s + paused_drop, .w = 42.0 * s, .h = 11.0 * s };
+    queueRoundedRect(state, cap, color(moss.moss_mid), 6.0 * s);
+    queueRoundedRect(state, .{ .x = cap.x + 4.0 * s, .y = cap.y + 1.0 * s, .w = 10.0 * s, .h = 7.0 * s }, color(moss.moss_lit), 4.0 * s);
+    queueRoundedRect(state, .{ .x = cap.x + 18.0 * s, .y = cap.y - 1.0 * s, .w = 12.0 * s, .h = 8.0 * s }, color(moss.moss_deep), 5.0 * s);
+    queueRoundedRect(state, .{ .x = cap.x + 30.0 * s, .y = cap.y + 2.0 * s, .w = 9.0 * s, .h = 7.0 * s }, color(moss.moss_lit), 4.0 * s);
+    queueRoundedRect(state, .{ .x = cap.x + 5.0 * s, .y = cap.y + 6.0 * s, .w = 7.0 * s, .h = 6.0 * s }, color(moss.moss_mid), 3.5 * s);
+    queueRoundedRect(state, .{ .x = cap.x + 29.0 * s, .y = cap.y + 6.0 * s, .w = 9.0 * s, .h = 8.0 * s }, color(moss.moss_deep), 4.0 * s);
+
+    // Sprig and tiny flower from the shoulder carpet.
+    queueRoundedRect(state, .{ .x = rect.x + 8.0 * s, .y = rect.y + 12.0 * s + paused_drop, .w = 1.5 * s, .h = 8.0 * s }, color(moss.moss_deep), 0.8 * s);
+    queueRoundedRect(state, .{ .x = rect.x + 4.5 * s, .y = rect.y + 12.0 * s + paused_drop, .w = 5.0 * s, .h = 3.5 * s }, color(moss.moss_lit), 1.8 * s);
+    queueRoundedRect(state, .{ .x = rect.x + 8.5 * s, .y = rect.y + 13.5 * s + paused_drop, .w = 4.0 * s, .h = 3.0 * s }, color(moss.moss_mid), 1.5 * s);
+    queueRoundedRect(state, .{ .x = rect.x + 36.0 * s, .y = rect.y + 15.0 * s + paused_drop, .w = 4.0 * s, .h = 4.0 * s }, color(moss.flower), 2.0 * s);
+    queueRoundedRect(state, .{ .x = rect.x + 37.0 * s, .y = rect.y + 16.0 * s + paused_drop, .w = 2.0 * s, .h = 2.0 * s }, color(moss.flower_core), 1.0 * s);
+
+    // Egg-shaped head with neck, crown moss, ports, and mouth slot.
+    const head_x = rect.x + 14.0 * s + approval_tilt;
+    const head_y = rect.y + 1.0 * s + paused_drop;
+    const neck: palette.Rect = .{ .x = head_x + 6.0 * s, .y = head_y + 17.0 * s, .w = 5.0 * s, .h = 8.0 * s };
+    queueRoundedRect(state, neck, color(moss.body), 2.0 * s);
+    const head: palette.Rect = .{ .x = head_x, .y = head_y, .w = 17.0 * s, .h = 20.0 * s };
+    queueRoundedRect(state, offsetRect(head, 0.0, 2.0 * s), color(moss.body_depth), 8.5 * s);
+    queueCharacterPanel(state, head, color(moss.body), color(moss.outline), 8.5 * s, 1.0 * s);
+    queueRoundedRect(state, .{ .x = head.x - 3.0 * s, .y = head.y - 2.0 * s, .w = 19.0 * s, .h = 8.0 * s }, color(moss.moss_mid), 4.0 * s);
+    queueRoundedRect(state, .{ .x = head.x - 1.0 * s, .y = head.y - 1.0 * s, .w = 7.0 * s, .h = 5.0 * s }, color(moss.moss_lit), 2.5 * s);
+    queueRoundedRect(state, .{ .x = head.x + 11.0 * s, .y = head.y + 1.0 * s, .w = 6.0 * s, .h = 7.0 * s }, color(moss.moss_deep), 3.0 * s);
+
+    const eye_y = head.y + 6.0 * s;
+    const gaze = if (visual.pose == .approval) 1.5 * s else 0.0;
+    inline for (.{ head.x + 3.0 * s, head.x + 9.0 * s }) |eye_x| {
+        if (visual.pose == .paused) {
+            queueRoundedRect(state, .{ .x = eye_x, .y = eye_y + 2.0 * s, .w = 5.5 * s, .h = 2.0 * s }, color(moss.paused_lid), 1.0 * s);
+        } else {
+            const eye: palette.Rect = .{ .x = eye_x, .y = eye_y, .w = 5.5 * s, .h = 5.5 * s };
+            queueCharacterPanel(state, eye, color(moss.port), color(moss.port_ring), 2.75 * s, 1.0 * s);
+            queueRoundedRect(state, .{ .x = eye.x + 1.8 * s + gaze, .y = eye.y + 1.8 * s, .w = 2.0 * s, .h = 2.0 * s }, color(moss.pupil), 1.0 * s);
+        }
+    }
+    queueRoundedRect(state, .{ .x = head.x + 6.0 * s, .y = head.y + 14.5 * s, .w = 5.0 * s, .h = 2.0 * s }, color(moss.seam), 1.0 * s);
+
+    if (visual.show_failure) {
+        queueRoundedRect(state, .{ .x = rect.x - 4.0 * s, .y = rect.y - 2.0 * s, .w = 11.0 * s, .h = 11.0 * s }, color(moss.char_surface), 5.5 * s);
+        queueRoundedRect(state, .{ .x = rect.x - 2.0 * s, .y = rect.y, .w = 7.0 * s, .h = 7.0 * s }, color(moss.danger), 3.5 * s);
+    }
+}
+
+// Static Vireo side-profile songbird; pose shifts head/tail and the shared failure badge.
+fn renderVireo(state: *runtime.AppState, rect: palette.Rect, visual: controller.VisualState) void {
+    const s = rect.w / 46.0;
+    const vireo = deriveVireoPalette(activeCharacterTheme());
+    const approval_tilt = if (visual.pose == .approval) 1.4 * s else 0.0;
+    const paused_drop = if (visual.pose == .paused) 2.0 * s else 0.0;
+    const tail_droop = if (visual.pose == .paused) 2.0 * s else 0.0;
+
+    // Tail swept back off the perch, then slender body, legs, and wing.
+    const tail: palette.Rect = .{
+        .x = rect.x - 9.0 * s,
+        .y = rect.y + 23.0 * s + tail_droop,
+        .w = 21.0 * s,
+        .h = 5.0 * s,
+    };
+    queueRoundedRect(state, tail, color(vireo.tail), 2.5 * s);
+
+    const body: palette.Rect = .{ .x = rect.x + 5.0 * s, .y = rect.y + 17.0 * s, .w = 33.0 * s, .h = 18.0 * s };
+    queueRoundedRect(state, offsetRect(body, 0.0, 2.0 * s), color(theme.withAlpha(vireo.outline, 40)), 9.0 * s);
+    queueCharacterPanel(state, body, color(vireo.body_back), color(vireo.outline), 9.0 * s, 1.0 * s);
+    queueRoundedRect(state, .{ .x = body.x + 10.0 * s, .y = body.y + 8.0 * s, .w = 20.0 * s, .h = 9.0 * s }, color(vireo.body_breast), 5.0 * s);
+    queueRoundedRect(state, .{ .x = body.x + 13.0 * s, .y = body.y + body.h - 1.0 * s, .w = 1.8 * s, .h = 8.0 * s }, color(vireo.leg), 0.9 * s);
+    queueRoundedRect(state, .{ .x = body.x + body.w - 13.8 * s, .y = body.y + body.h - 1.0 * s, .w = 1.8 * s, .h = 8.0 * s }, color(vireo.leg), 0.9 * s);
+
+    const wing: palette.Rect = .{ .x = body.x + 1.0 * s, .y = body.y + 2.5 * s, .w = 21.0 * s, .h = 10.0 * s };
+    queueRoundedRect(state, wing, color(vireo.wing), 5.0 * s);
+    queueRoundedRect(state, .{ .x = wing.x - 2.0 * s, .y = wing.y + 5.0 * s, .w = 10.0 * s, .h = 4.5 * s }, color(vireo.wingtip), 2.2 * s);
+
+    // Profile head with crown, supercilium, red eye, and pointed beak.
+    const head: palette.Rect = .{
+        .x = rect.x + 22.0 * s + approval_tilt,
+        .y = rect.y + 1.0 * s + paused_drop,
+        .w = 24.0 * s,
+        .h = 16.0 * s,
+    };
+    queueCharacterPanel(state, head, color(vireo.head), color(vireo.outline), 7.0 * s, 1.0 * s);
+    queueRoundedRect(state, .{ .x = head.x + 2.0 * s, .y = head.y, .w = 18.0 * s, .h = 6.0 * s }, color(vireo.crown), 4.0 * s);
+    queueRoundedRect(state, .{ .x = head.x + 5.5 * s, .y = head.y + 4.2 * s, .w = 17.0 * s, .h = 2.0 * s }, color(vireo.brow), 1.0 * s);
+    queueRoundedRect(state, .{ .x = head.x + 6.0 * s, .y = head.y + 6.5 * s, .w = 15.0 * s, .h = 1.4 * s }, color(vireo.eyeline), 0.7 * s);
+
+    const eye: palette.Rect = .{ .x = head.x + 14.5 * s, .y = head.y + 6.7 * s, .w = 5.5 * s, .h = if (visual.pose == .paused) 2.5 * s else 5.5 * s };
+    if (visual.pose == .paused) {
+        queueRoundedRect(state, eye, color(vireo.paused_lid), 1.2 * s);
+    } else {
+        const gaze = if (visual.pose == .approval) 1.2 * s else 0.0;
+        queueCharacterPanel(state, eye, color(vireo.eye), color(vireo.brow), 2.75 * s, 1.0 * s);
+        queueRoundedRect(state, .{ .x = eye.x + 1.6 * s + gaze, .y = eye.y + 1.6 * s, .w = 2.2 * s, .h = 2.2 * s }, color(vireo.pupil), 1.1 * s);
+    }
+    queueRoundedRect(state, .{ .x = head.x + head.w - 3.0 * s, .y = head.y + 7.0 * s, .w = 10.0 * s, .h = 3.0 * s }, color(vireo.beak), 1.5 * s);
+
+    if (visual.show_failure) {
+        queueRoundedRect(state, .{ .x = rect.x - 4.0 * s, .y = rect.y - 2.0 * s, .w = 11.0 * s, .h = 11.0 * s }, color(vireo.char_surface), 5.5 * s);
+        queueRoundedRect(state, .{ .x = rect.x - 2.0 * s, .y = rect.y, .w = 7.0 * s, .h = 7.0 * s }, color(vireo.danger), 3.5 * s);
+    }
 }
 
 fn bodyHitRect(hits: []const controller.Hit) palette.Rect {
@@ -1549,6 +1857,7 @@ test "production collapsed and expanded overlays stay inside the window" {
         theme.applyTheme(fixture[2]);
         var state: runtime.AppState = undefined;
         state.allocator = allocator;
+        state.app_config = .{};
         state.project_controller = .{};
         state.companion_controller = controller.init();
         state.companion_controller.applyFixture(.idle);
@@ -1618,6 +1927,7 @@ test "captured scale public render emits a visible complete Companion composer" 
 
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
+    state.app_config = .{};
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_controller.applyFixture(.idle);
@@ -1767,6 +2077,7 @@ test "public Companion render retains Frame-backed Run and Activity text" {
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
+    state.app_config = .{};
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_controller.show();
@@ -1858,6 +2169,7 @@ test "public Companion render bounds raw multiline Run and Activity dumps" {
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
+    state.app_config = .{};
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_controller.show();
@@ -1921,6 +2233,7 @@ test "public Companion render surfaces streaming final empty and failed Sprout a
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
+    state.app_config = .{};
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_controller.show();
@@ -2004,6 +2317,7 @@ test "public Companion render leads with the answer and suppresses metadata-only
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
+    state.app_config = .{};
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_controller.show();
@@ -2071,6 +2385,7 @@ test "public Companion render clears stale failure posture while failed evidence
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
+    state.app_config = .{};
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_composer = @TypeOf(state.companion_composer).init();
@@ -2251,6 +2566,7 @@ test "public Companion render repaints active chrome without reconstructing stat
 
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
+    state.app_config = .{};
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_composer = @TypeOf(state.companion_composer).init();
@@ -2703,6 +3019,7 @@ test "production hit refresh follows one approval projection snapshot" {
     const allocator = std.testing.allocator;
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
+    state.app_config = .{};
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
     state.companion_controller = controller.init();
@@ -2756,6 +3073,7 @@ test "production hit refresh clears cross-owner approval under contention and re
     const allocator = std.testing.allocator;
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
+    state.app_config = .{};
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
     state.companion_controller = controller.init();
@@ -2841,6 +3159,7 @@ test "companion chrome draws no border-only commands outside the shared composer
         theme.applyTheme(scale);
         var state: runtime.AppState = undefined;
         state.allocator = allocator;
+        state.app_config = .{};
         state.project_controller = .{};
         state.companion_controller = controller.init();
         state.companion_composer = @TypeOf(state.companion_composer).init();
@@ -2910,6 +3229,7 @@ test "expanded sidecar chrome snaps to device pixels at a fractional scale" {
     theme.applyTheme(1.25);
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
+    state.app_config = .{};
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_controller.applyFixture(.idle);
@@ -2956,4 +3276,211 @@ test "expanded sidecar chrome snaps to device pixels at a fractional scale" {
         }
     }
     try std.testing.expect(saw_outer and saw_inner and saw_divider);
+}
+
+test "saved companion character changes chip and header labels and render batches" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.0);
+    theme.current_colors = theme.default_colors;
+
+    var state: runtime.AppState = undefined;
+    state.allocator = allocator;
+    state.app_config = .{};
+    state.project_controller = .{};
+    state.companion_controller = controller.init();
+    state.companion_controller.applyFixture(.idle);
+    state.companion_composer = @TypeOf(state.companion_composer).init();
+    state.palette_overlay_batch = .{};
+    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.companion_composer.deinit(allocator);
+        state.palette_overlay_batch.deinit(allocator);
+        state.palette_frame_text_arena.deinit();
+    }
+    var project = try runtime.Project.init(allocator, "character-switch", "Character", "/tmp/character-switch", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+
+    const characters = [_]app_config.CompanionCharacter{ .sprout, .moss, .vireo };
+    const names = [_][]const u8{ "Sprout", "Moss", "Vireo" };
+    var collapsed_counts: [3]usize = undefined;
+    var expanded_counts: [3]usize = undefined;
+
+    inline for (characters, 0..) |character, index| {
+        state.app_config.companion_character = character;
+        state.companion_controller.collapse();
+        state.palette_overlay_batch.clear();
+        _ = state.palette_frame_text_arena.reset(.retain_capacity);
+        render(&state, 1360.0, 860.0);
+        collapsed_counts[index] = state.palette_overlay_batch.commands.items.len;
+        try expectBatchText(&state.palette_overlay_batch, names[index]);
+        if (index > 0) try std.testing.expect(collapsed_counts[index] != collapsed_counts[0] or !std.mem.eql(u8, names[index], names[0]));
+
+        state.companion_controller.show();
+        state.palette_overlay_batch.clear();
+        _ = state.palette_frame_text_arena.reset(.retain_capacity);
+        render(&state, 1360.0, 860.0);
+        expanded_counts[index] = state.palette_overlay_batch.commands.items.len;
+        try expectBatchText(&state.palette_overlay_batch, names[index]);
+    }
+
+    try std.testing.expect(collapsed_counts[0] != collapsed_counts[1] or collapsed_counts[1] != collapsed_counts[2]);
+    try std.testing.expect(expanded_counts[0] != expanded_counts[1] or expanded_counts[1] != expanded_counts[2]);
+}
+
+test "companion characters produce distinct collapsed and expanded batches at 1.0 and 1.25 scales" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    theme.current_colors = theme.default_colors;
+
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25) }) |scale| {
+        theme.applyTheme(scale);
+        var state: runtime.AppState = undefined;
+        state.allocator = allocator;
+        state.app_config = .{};
+        state.project_controller = .{};
+        state.companion_controller = controller.init();
+        state.companion_controller.applyFixture(.idle);
+        state.companion_composer = @TypeOf(state.companion_composer).init();
+        state.palette_overlay_batch = .{};
+        state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+        defer {
+            for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+            state.project_controller.projects.deinit(allocator);
+            state.companion_composer.deinit(allocator);
+            state.palette_overlay_batch.deinit(allocator);
+            state.palette_frame_text_arena.deinit();
+        }
+        var project = try runtime.Project.init(allocator, "scale-chars", "Scale", "/tmp/scale-chars", 0);
+        state.project_controller.projects.append(allocator, project) catch |err| {
+            project.deinit(allocator);
+            return err;
+        };
+
+        var collapsed: [3]usize = undefined;
+        var expanded: [3]usize = undefined;
+        inline for (.{ app_config.CompanionCharacter.sprout, .moss, .vireo }, 0..) |character, index| {
+            state.app_config.companion_character = character;
+            state.companion_controller.collapse();
+            state.palette_overlay_batch.clear();
+            render(&state, 1360.0 * scale, 860.0 * scale);
+            collapsed[index] = state.palette_overlay_batch.commands.items.len;
+            try std.testing.expect(collapsed[index] > 0);
+
+            state.companion_controller.show();
+            state.palette_overlay_batch.clear();
+            render(&state, 1360.0 * scale, 860.0 * scale);
+            expanded[index] = state.palette_overlay_batch.commands.items.len;
+            try std.testing.expect(expanded[index] > collapsed[index]);
+        }
+        try std.testing.expect(collapsed[0] != collapsed[1] or collapsed[1] != collapsed[2]);
+        try std.testing.expect(expanded[0] != expanded[1] or expanded[1] != expanded[2]);
+    }
+}
+
+test "compact and full character bounds cover chip and header hit targets" {
+    const geometry = computeGeometry(1360.0, 860.0, 1.0);
+    inline for (.{ app_config.CompanionCharacter.sprout, .moss, .vireo }) |character| {
+        const full = fullCharacterRect(geometry.chip_character, character, 1.0);
+        const size = fullCharacterSize(character);
+        try std.testing.expectApproxEqAbs(size.w, full.w, 0.001);
+        try std.testing.expectApproxEqAbs(size.h, full.h, 0.001);
+        try std.testing.expect(pointInRect(geometry.chip_hit, full.x + full.w * 0.5, full.y + full.h * 0.5));
+
+        const compact = compactCharacterRect(geometry.header, character, 1.0);
+        const compact_size = compactCharacterSize(character);
+        try std.testing.expectApproxEqAbs(compact_size.w, compact.w, 0.001);
+        try std.testing.expectApproxEqAbs(compact_size.h, compact.h, 0.001);
+        try std.testing.expect(pointInRect(geometry.header, compact.x + 1.0, compact.y + 1.0));
+    }
+}
+
+test "moss and vireo apply approval paused and failed semantic treatments" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.0);
+    theme.current_colors = theme.default_colors;
+    const chrome = theme.companionChrome();
+
+    inline for (.{ app_config.CompanionCharacter.moss, .vireo }) |character| {
+        var state: runtime.AppState = undefined;
+        state.allocator = allocator;
+        state.app_config = .{ .companion_character = character };
+        state.project_controller = .{};
+        state.companion_controller = controller.init();
+        state.companion_composer = @TypeOf(state.companion_composer).init();
+        state.palette_overlay_batch = .{};
+        state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+        defer {
+            for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+            state.project_controller.projects.deinit(allocator);
+            state.companion_composer.deinit(allocator);
+            state.palette_overlay_batch.deinit(allocator);
+            state.palette_frame_text_arena.deinit();
+        }
+        var project = try runtime.Project.init(allocator, "pose-chars", "Pose", "/tmp/pose-chars", 0);
+        state.project_controller.projects.append(allocator, project) catch |err| {
+            project.deinit(allocator);
+            return err;
+        };
+
+        state.companion_controller.applyFixture(.needs_approval);
+        state.companion_controller.collapse();
+        state.palette_overlay_batch.clear();
+        render(&state, 1360.0, 860.0);
+        try expectBatchColor(&state.palette_overlay_batch, .rect, chrome.warning);
+
+        state.companion_controller.applyFixture(.paused);
+        state.palette_overlay_batch.clear();
+        render(&state, 1360.0, 860.0);
+        try std.testing.expect(state.palette_overlay_batch.commands.items.len > 0);
+
+        state.companion_controller.applyFixture(.failed);
+        state.palette_overlay_batch.clear();
+        render(&state, 1360.0, 860.0);
+        try expectBatchColor(&state.palette_overlay_batch, .rect, chrome.danger);
+        try expectBatchColor(&state.palette_overlay_batch, .rect, theme.danger());
+    }
+}
+
+test "moss and vireo palettes adapt under default and contrasting themes" {
+    const default_theme = characterThemeFromColors(theme.default_colors);
+    var contrast = theme.default_colors;
+    contrast.background = testRgb(0xf2, 0xee, 0xdf);
+    contrast.text = testRgb(0x24, 0x34, 0x30);
+    contrast.text_subtle = testRgb(0x72, 0x80, 0x7b);
+    contrast.accent = testRgb(0x1c, 0x82, 0x79);
+    contrast.border = testRgb(0x69, 0x8e, 0x87);
+    contrast.panel_muted = testRgb(0xb8, 0xc4, 0xbe);
+    contrast.warning = testRgb(0xb5, 0x70, 0x18);
+    contrast.diff_remove = testRgb(0xc8, 0x40, 0x56);
+    const contrast_theme = characterThemeFromColors(contrast);
+
+    const moss_default = deriveMossPalette(default_theme);
+    const moss_contrast = deriveMossPalette(contrast_theme);
+    try std.testing.expect(!colorsEqual(moss_default.moss_mid, moss_contrast.moss_mid));
+    try std.testing.expect(!colorsEqual(moss_default.body, moss_contrast.body));
+    try std.testing.expectEqual(default_theme.warning, moss_default.warning);
+    try std.testing.expectEqual(default_theme.danger, moss_default.danger);
+    try std.testing.expectEqual(contrast_theme.warning, moss_contrast.warning);
+    try std.testing.expectEqual(contrast_theme.danger, moss_contrast.danger);
+
+    const vireo_default = deriveVireoPalette(default_theme);
+    const vireo_contrast = deriveVireoPalette(contrast_theme);
+    try std.testing.expect(!colorsEqual(vireo_default.body_back, vireo_contrast.body_back));
+    try std.testing.expect(!colorsEqual(vireo_default.eye, vireo_contrast.eye));
+    try std.testing.expectEqual(default_theme.danger, vireo_default.danger);
+    try std.testing.expectEqual(contrast_theme.danger, vireo_contrast.danger);
+}
+
+fn expectBatchText(batch: *const palette.RenderBatch, expected: []const u8) !void {
+    for (batch.commands.items) |command| {
+        if (command.kind == .text and std.mem.eql(u8, command.text, expected)) return;
+    }
+    return error.MissingExpectedText;
 }
