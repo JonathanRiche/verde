@@ -36,6 +36,19 @@ pub const ChatTitleProvider = enum {
     }
 };
 
+pub const CompanionCharacter = enum {
+    sprout,
+    moss,
+    vireo,
+
+    pub fn parse(value: []const u8) ?CompanionCharacter {
+        if (std.ascii.eqlIgnoreCase(value, "sprout")) return .sprout;
+        if (std.ascii.eqlIgnoreCase(value, "moss")) return .moss;
+        if (std.ascii.eqlIgnoreCase(value, "vireo")) return .vireo;
+        return null;
+    }
+};
+
 pub const CustomOpenAction = struct {
     label: []u8,
     action: []u8,
@@ -162,6 +175,7 @@ pub const AppConfig = struct {
     workspace_scroll_direction: WorkspaceScrollDirection = .horizontal,
     workspace_scroll_mode: WorkspaceScrollMode = .automatic,
     workspace_scroll_threshold: u8 = DEFAULT_WORKSPACE_SCROLL_THRESHOLD,
+    companion_character: CompanionCharacter = .sprout,
     theme_config: theme.ThemeConfig = .{},
     active_theme: ?[]u8 = null,
     installed_themes: []InstalledTheme = &.{},
@@ -401,6 +415,7 @@ fn writeUiSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, con
     try ui_object.put(allocator, "workspace_scroll_direction", .{ .string = @tagName(config.workspace_scroll_direction) });
     try ui_object.put(allocator, "workspace_scroll_mode", .{ .string = @tagName(config.workspace_scroll_mode) });
     try ui_object.put(allocator, "workspace_scroll_threshold", .{ .integer = config.workspace_scroll_threshold });
+    try ui_object.put(allocator, "companion_character", .{ .string = @tagName(config.companion_character) });
 }
 
 fn writeThemeSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
@@ -966,6 +981,17 @@ fn applyUiOverrides(config: *AppConfig, ui_value: std.json.Value) void {
             else => log.warn("ui.workspace_scroll_threshold must be an integer when provided", .{}),
         }
     }
+    if (ui_value.object.get("companion_character")) |character_value| {
+        if (character_value != .string) {
+            config.companion_character = .sprout;
+            log.warn("ui.companion_character must be a string when provided", .{});
+        } else if (CompanionCharacter.parse(character_value.string)) |character| {
+            config.companion_character = character;
+        } else {
+            config.companion_character = .sprout;
+            log.warn("ui.companion_character must be sprout, moss, or vireo", .{});
+        }
+    }
 }
 
 fn applyOpenOverrides(allocator: std.mem.Allocator, config: *AppConfig, open_value: std.json.Value) void {
@@ -1317,6 +1343,81 @@ test "app config ignores unsupported workspace scrolling policy overrides" {
 
     try std.testing.expectEqual(WorkspaceScrollMode.automatic, config.workspace_scroll_mode);
     try std.testing.expectEqual(DEFAULT_WORKSPACE_SCROLL_THRESHOLD, config.workspace_scroll_threshold);
+}
+
+test "app config defaults missing companion character to Sprout" {
+    var root = try parseTestRoot("{\"ui\":{\"font_size\":22}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(CompanionCharacter.sprout, config.companion_character);
+}
+
+test "app config accepts every companion character" {
+    const cases = [_]struct {
+        json: []const u8,
+        expected: CompanionCharacter,
+    }{
+        .{ .json = "{\"ui\":{\"companion_character\":\"sprout\"}}", .expected = .sprout },
+        .{ .json = "{\"ui\":{\"companion_character\":\"moss\"}}", .expected = .moss },
+        .{ .json = "{\"ui\":{\"companion_character\":\"vireo\"}}", .expected = .vireo },
+        .{ .json = "{\"ui\":{\"companion_character\":\"MoSs\"}}", .expected = .moss },
+    };
+
+    for (cases) |case| {
+        var root = try parseTestRoot(case.json);
+        defer root.deinit();
+        var config: AppConfig = .{};
+        defer config.deinit(std.testing.allocator);
+        applyAppOverrides(std.testing.allocator, &config, root.value);
+        try std.testing.expectEqual(case.expected, config.companion_character);
+    }
+}
+
+test "app config falls back to Sprout for invalid companion characters" {
+    var invalid_string = try parseTestRoot("{\"ui\":{\"companion_character\":\"fern\"}}");
+    defer invalid_string.deinit();
+    var invalid_type = try parseTestRoot("{\"ui\":{\"companion_character\":7}}");
+    defer invalid_type.deinit();
+
+    var config: AppConfig = .{ .companion_character = .moss };
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, invalid_string.value);
+    try std.testing.expectEqual(CompanionCharacter.sprout, config.companion_character);
+
+    config.companion_character = .vireo;
+    applyAppOverrides(std.testing.allocator, &config, invalid_type.value);
+    try std.testing.expectEqual(CompanionCharacter.sprout, config.companion_character);
+}
+
+test "app config companion character save round trip preserves unknown keys" {
+    var root = try parseTestRoot(
+        \\{
+        \\  "plugin_owned": { "keep": true },
+        \\  "ui": { "plugin_value": "keep", "companion_character": "sprout" }
+        \\}
+    );
+    defer root.deinit();
+
+    const config: AppConfig = .{ .companion_character = .vireo };
+    try writeUiSection(root.arena.allocator(), &root.value.object, &config);
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, root.value, .{});
+    defer std.testing.allocator.free(encoded);
+
+    var saved = try parseTestRoot(encoded);
+    defer saved.deinit();
+    try std.testing.expect(saved.value.object.get("plugin_owned").?.object.get("keep").?.bool);
+    const saved_ui = saved.value.object.get("ui").?.object;
+    try std.testing.expectEqualStrings("keep", saved_ui.get("plugin_value").?.string);
+    try std.testing.expectEqualStrings("vireo", saved_ui.get("companion_character").?.string);
+
+    var loaded: AppConfig = .{};
+    defer loaded.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &loaded, saved.value);
+    try std.testing.expectEqual(CompanionCharacter.vireo, loaded.companion_character);
 }
 
 test "app config accepts theme source and color overrides" {

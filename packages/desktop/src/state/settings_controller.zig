@@ -58,6 +58,7 @@ pub const Draft = struct {
     workspace_scroll_override_enabled: bool = false,
     workspace_scroll_mode: app_config.WorkspaceScrollMode = .automatic,
     workspace_scroll_threshold: u8 = app_config.DEFAULT_WORKSPACE_SCROLL_THRESHOLD,
+    companion_character: app_config.CompanionCharacter = .sprout,
     theme_source: theme.ThemeSource = .omarchy,
     theme_choice: usize = 1,
     open_action: OpenAction = .folder,
@@ -142,6 +143,8 @@ pub const State = struct {
     scroll_y: f32 = 0.0,
     hover_control: ?u8 = null,
     close_hovered: bool = false,
+    companion_character_dropdown_open: bool = false,
+    companion_character_hover_index: ?usize = null,
     theme_dropdown_open: bool = false,
     theme_hover_index: ?usize = null,
     theme_menu_scroll: usize = 0,
@@ -224,6 +227,18 @@ pub fn replaceAppConfig(self: anytype, next_config: app_config.AppConfig) void {
     self.app_config = next_config;
 }
 
+fn syncCompanionCharacterDraft(settings: *State, config: *const app_config.AppConfig) void {
+    settings.draft.companion_character = config.companion_character;
+}
+
+fn isCompanionCharacterDraftDirty(settings: *const State, config: *const app_config.AppConfig) bool {
+    return settings.draft.companion_character != config.companion_character;
+}
+
+fn applyCompanionCharacterDraft(settings: *const State, config: *app_config.AppConfig) void {
+    config.companion_character = settings.draft.companion_character;
+}
+
 pub fn syncSettingsDraftFromConfig(self: anytype) void {
     var workspace_scroll_override_enabled = false;
     var workspace_scroll_mode = self.app_config.workspace_scroll_mode;
@@ -257,6 +272,7 @@ pub fn syncSettingsDraftFromConfig(self: anytype) void {
         .check_for_updates_automatically = self.app_config.check_for_updates_automatically,
         .notifications_enabled = self.app_config.notifications_enabled,
     };
+    syncCompanionCharacterDraft(&self.settings_controller, &self.app_config);
     replaceSettingsChatTitleModel(self, self.app_config.chatTitleModel()) catch {
         if (self.settings_controller.chat_title_model) |model| self.allocator.free(model);
         self.settings_controller.chat_title_model = null;
@@ -282,6 +298,7 @@ pub fn isSettingsDraftDirty(self: anytype) bool {
     if (draft.workspace_scroll_override_enabled != workspace_scroll_override_enabled) return true;
     if (draft.workspace_scroll_mode != workspace_scroll_mode) return true;
     if (draft.workspace_scroll_threshold != workspace_scroll_threshold) return true;
+    if (isCompanionCharacterDraftDirty(&self.settings_controller, &self.app_config)) return true;
     if (draft.theme_choice != self.app_config.themeChoiceIndex()) return true;
     if (draft.link_open_target != self.app_config.link_open_target) return true;
     if (draft.browser_fast_scrolling_enabled != self.app_config.browser_fast_scrolling_enabled) return true;
@@ -312,6 +329,8 @@ pub fn openSettingsModal(self: anytype) void {
     self.settings_controller.scroll_y = 0.0;
     self.settings_controller.hover_control = null;
     self.settings_controller.close_hovered = false;
+    self.settings_controller.companion_character_dropdown_open = false;
+    self.settings_controller.companion_character_hover_index = null;
     self.settings_controller.theme_dropdown_open = false;
     self.settings_controller.theme_hover_index = null;
     self.settings_controller.theme_menu_scroll = 0;
@@ -384,6 +403,8 @@ pub fn cancelSettingsModal(self: anytype) void {
     beginSettingsModalClose(self);
     self.settings_controller.hover_control = null;
     self.settings_controller.close_hovered = false;
+    self.settings_controller.companion_character_dropdown_open = false;
+    self.settings_controller.companion_character_hover_index = null;
     self.settings_controller.theme_dropdown_open = false;
     self.settings_controller.theme_hover_index = null;
     self.settings_controller.title_provider_dropdown_open = false;
@@ -406,6 +427,7 @@ pub fn saveSettingsModal(self: anytype) !void {
     self.app_config.workspace_pane_gap = theme.clampf(self.settings_controller.draft.workspace_pane_gap, app_config.MIN_WORKSPACE_PANE_GAP, app_config.MAX_WORKSPACE_PANE_GAP);
     self.app_config.workspace_panes_per_view = std.math.clamp(self.settings_controller.draft.workspace_panes_per_view, app_config.MIN_WORKSPACE_PANES_PER_VIEW, app_config.MAX_WORKSPACE_PANES_PER_VIEW);
     self.app_config.workspace_scroll_direction = self.settings_controller.draft.workspace_scroll_direction;
+    applyCompanionCharacterDraft(&self.settings_controller, &self.app_config);
     const has_selected_workspace = self.project_controller.selected_index < self.project_controller.projects.items.len;
     const use_workspace_scroll_override = self.settings_controller.draft.workspace_scroll_override_enabled and has_selected_workspace;
     const workspace_scroll_threshold = std.math.clamp(self.settings_controller.draft.workspace_scroll_threshold, app_config.MIN_WORKSPACE_SCROLL_THRESHOLD, app_config.MAX_WORKSPACE_SCROLL_THRESHOLD);
@@ -445,6 +467,8 @@ pub fn saveSettingsModal(self: anytype) !void {
     beginSettingsModalClose(self);
     self.settings_controller.hover_control = null;
     self.settings_controller.close_hovered = false;
+    self.settings_controller.companion_character_dropdown_open = false;
+    self.settings_controller.companion_character_hover_index = null;
     self.settings_controller.theme_dropdown_open = false;
     self.settings_controller.theme_hover_index = null;
     self.settings_controller.title_provider_dropdown_open = false;
@@ -857,4 +881,25 @@ fn settingsOpenActionFromConfig(action: app_config.DefaultOpenAction) OpenAction
         .zed => .zed,
         .custom => .custom,
     };
+}
+
+test "companion character draft sync dirty and save semantics" {
+    var settings: State = .{};
+    var config: app_config.AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(app_config.CompanionCharacter.sprout, settings.draft.companion_character);
+    try std.testing.expect(!settings.companion_character_dropdown_open);
+    try std.testing.expect(settings.companion_character_hover_index == null);
+
+    config.companion_character = .moss;
+    syncCompanionCharacterDraft(&settings, &config);
+    try std.testing.expectEqual(app_config.CompanionCharacter.moss, settings.draft.companion_character);
+    try std.testing.expect(!isCompanionCharacterDraftDirty(&settings, &config));
+
+    settings.draft.companion_character = .vireo;
+    try std.testing.expect(isCompanionCharacterDraftDirty(&settings, &config));
+    applyCompanionCharacterDraft(&settings, &config);
+    try std.testing.expectEqual(app_config.CompanionCharacter.vireo, config.companion_character);
+    try std.testing.expect(!isCompanionCharacterDraftDirty(&settings, &config));
 }
