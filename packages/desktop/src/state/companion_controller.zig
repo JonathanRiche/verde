@@ -178,6 +178,12 @@ pub const Frame = struct {
     has_failure: bool = false,
     working: bool = false,
     objective: PresentationText = .{},
+    // Current-turn assistant answer for the latest meaningful objective. A
+    // newer user prompt clears it so a stale reply never presents as current.
+    answer: PresentationText = .{},
+    // True only when the current turn itself failed — never for historical
+    // transcript failures — so the Result region reports the real outcome.
+    answer_failed: bool = false,
     latest_body: PresentationText = .{},
     partial_text: PresentationText = .{},
     event_author: PresentationText = .{},
