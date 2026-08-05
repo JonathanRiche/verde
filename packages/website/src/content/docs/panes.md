@@ -58,7 +58,9 @@ reaches two tiled panes, keeping the same order shown in the sidebar. **Settings
 scrolling layout with **Always**, or retain the split tree with **Disabled**.
 **Activation threshold** changes the automatic trigger from 1–64 panes.
 The command palette also exposes **Scrolling Layout: Automatic**, **Always**,
-and **Disabled** for immediate policy changes without opening Settings.
+and **Disabled** for immediate policy changes without opening Settings. Use
+**Previous Pane** and **Next Pane** there to move through panes in sidebar order;
+the displayed shortcut follows the selected scroll direction.
 
 **Scroll direction** chooses a horizontal strip (the default) or vertical
 strip. **Panes per view** controls how many panes fit along that axis (1–6,
