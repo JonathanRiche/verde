@@ -747,10 +747,10 @@ fn companionComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPro
     const project = state.currentProjectMutable();
     switch (event) {
         .text_changed => |text| {
-            const local_id = project.companion_thread_local_id orelse return;
-            const thread = state.threadByLocalId(project.id, local_id) orelse return;
-            thread.setDraft(text);
-            state.markDirty();
+            canonicalizeCompanionTextChange(state, text) catch |err| {
+                log.err("failed to create Companion thread for draft: {s}", .{@errorName(err)});
+                state.companion_controller.ui_error = "Could not save Companion draft.";
+            };
         },
         .submitted => |text| submitCompanionPrompt(state, project, text),
         .send_clicked => {
@@ -770,6 +770,19 @@ fn companionComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPro
         },
         else => {},
     }
+}
+
+fn canonicalizeCompanionTextChange(state: anytype, text: []const u8) !void {
+    const project = state.currentProjectMutable();
+    const thread = existing: {
+        if (project.companion_thread_local_id) |local_id| {
+            if (state.threadByLocalId(project.id, local_id)) |value| break :existing value;
+        }
+        if (text.len == 0) return;
+        break :existing try state.ensureCurrentCompanionThread();
+    };
+    thread.setDraft(text);
+    state.markDirty();
 }
 
 fn submitCompanionPrompt(state: anytype, project: *Project, text: []const u8) void {
@@ -801,13 +814,54 @@ fn submitCompanionPrompt(state: anytype, project: *Project, text: []const u8) vo
         state.companion_controller.ui_error = "Could not create Companion thread.";
         return;
     };
-    const workspace_id = state.currentProject().id;
-    const sent = state.sendThreadPrompt(workspace_id, thread.local_thread_id, text, &.{}) catch |err| {
+    const workspace_id = state.allocator.dupe(u8, state.currentProject().id) catch |err| {
+        log.err("failed to capture Companion workspace identity: {s}", .{@errorName(err)});
+        state.companion_controller.ui_error = "Could not send Companion prompt.";
+        return;
+    };
+    defer state.allocator.free(workspace_id);
+    const local_thread_id = state.allocator.dupe(u8, thread.local_thread_id) catch |err| {
+        log.err("failed to capture Companion thread identity: {s}", .{@errorName(err)});
+        state.companion_controller.ui_error = "Could not send Companion prompt.";
+        return;
+    };
+    defer state.allocator.free(local_thread_id);
+    defer projectCompanionDraftForOwner(state, workspace_id, local_thread_id);
+
+    const sent = sendCompanionThreadDraft(state, workspace_id, local_thread_id, text) catch |err| {
         log.err("failed to send Companion prompt: {s}", .{@errorName(err)});
         state.companion_controller.ui_error = "Could not send Companion prompt.";
         return;
     };
     state.companion_controller.ui_error = if (sent) null else "Companion thread is no longer available.";
+}
+
+fn sendCompanionThreadDraft(state: anytype, workspace_id: []const u8, local_thread_id: []const u8, text: []const u8) !bool {
+    const resolved = state.projectThreadIndexByLocalId(workspace_id, local_thread_id) orelse return false;
+    if (resolved.project_index != state.project_controller.selected_index) return false;
+    const project = state.currentProject();
+    const current_local_id = project.companion_thread_local_id orelse return false;
+    if (!std.mem.eql(u8, project.id, workspace_id) or !std.mem.eql(u8, current_local_id, local_thread_id)) return false;
+    const thread = state.threadByLocalId(workspace_id, local_thread_id) orelse return false;
+    thread.setDraft(text);
+    state.markDirty();
+    return state.sendThreadDraftWithUiPolicy(resolved.project_index, resolved.thread_index, false);
+}
+
+fn projectCompanionDraftForOwner(state: anytype, workspace_id: []const u8, local_thread_id: []const u8) void {
+    const resolved = state.projectThreadIndexByLocalId(workspace_id, local_thread_id) orelse return;
+    if (resolved.project_index != state.project_controller.selected_index) return;
+    const project = state.currentProject();
+    const current_local_id = project.companion_thread_local_id orelse return;
+    if (!std.mem.eql(u8, project.id, workspace_id) or !std.mem.eql(u8, current_local_id, local_thread_id)) return;
+    const thread = state.threadByLocalId(workspace_id, local_thread_id) orelse return;
+    if (std.mem.eql(u8, state.companion_composer.text(), thread.currentDraft())) return;
+    const callbacks = state.companion_composer.callbacks;
+    state.companion_composer.setCallbacks(.{});
+    defer state.companion_composer.setCallbacks(callbacks);
+    state.companion_composer.setText(state.allocator, thread.currentDraft()) catch |err| {
+        log.warn("failed to project Companion draft after send: {s}", .{@errorName(err)});
+    };
 }
 
 fn paletteComposerGetClipboard(context: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 {
@@ -3621,6 +3675,19 @@ pub const AppState = struct {
         return text[0..utf8PrefixLen(text, available)];
     }
 
+    fn clampCompanionComposerInsertText(self: *AppState, text: []const u8) []const u8 {
+        const max_len = DRAFT_CAPACITY - 1;
+        const current_len = self.companion_composer.text().len;
+        const anchor = self.companion_composer.selection_anchor orelse self.companion_composer.cursor;
+        const focus = self.companion_composer.selection_focus orelse self.companion_composer.cursor;
+        const selected_len = @min(@max(anchor, focus), current_len) - @min(@min(anchor, focus), current_len);
+        const retained_len = current_len - selected_len;
+        if (retained_len >= max_len) return "";
+        const available = max_len - retained_len;
+        if (text.len <= available) return text;
+        return text[0..utf8PrefixLen(text, available)];
+    }
+
     fn insertTextIntoPaletteComposer(self: *AppState, text: []const u8) bool {
         if (text.len == 0) return false;
         self.composer_controller.composer.focused = true;
@@ -6160,13 +6227,12 @@ pub const AppState = struct {
         if (self.project_controller.projects.items.len == 0) return;
         const project = self.currentProjectMutable();
         const thread = if (project.companion_thread_local_id) |local_id| self.threadByLocalId(project.id, local_id) else null;
-        if (thread) |value| {
-            if (!std.mem.eql(u8, self.companion_composer.text(), value.currentDraft())) {
-                const callbacks = self.companion_composer.callbacks;
-                self.companion_composer.setCallbacks(.{});
-                self.companion_composer.setText(self.allocator, value.currentDraft()) catch {};
-                self.companion_composer.setCallbacks(callbacks);
-            }
+        const canonical_draft = if (thread) |value| value.currentDraft() else "";
+        if (!std.mem.eql(u8, self.companion_composer.text(), canonical_draft)) {
+            const callbacks = self.companion_composer.callbacks;
+            self.companion_composer.setCallbacks(.{});
+            self.companion_composer.setText(self.allocator, canonical_draft) catch {};
+            self.companion_composer.setCallbacks(callbacks);
         }
         self.companion_composer.setCallbacks(.{
             .context = self,
@@ -6193,7 +6259,7 @@ pub const AppState = struct {
 
     pub fn routeCompanionComposerTextInput(self: *AppState, text: []const u8) bool {
         if (self.companion_controller.visibility != .sidecar_open or !self.companion_composer.focused) return false;
-        const insert_text = self.clampPaletteComposerInsertText(text);
+        const insert_text = self.clampCompanionComposerInsertText(text);
         if (insert_text.len == 0) return true;
         return self.companion_composer.handleInput(self.allocator, .{ .text = insert_text }) catch false;
     }
@@ -9411,6 +9477,93 @@ test "opening Companion is lazy and leaves workspace ownership and persistence u
     try std.testing.expectEqual(@as(usize, 0), state.companion_controller.presentation.control_error.slice().len);
 }
 
+test "Companion shared draft follows exact workspace owner without lazy stale text" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.companion_controller = companion_controller.init();
+    state.companion_controller.show();
+    state.companion_composer = CompanionComposerPrompt.init();
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.companion_composer.deinit(allocator);
+    }
+    var project_a = try Project.init(allocator, "draft-a", "Draft A", "/tmp/draft-a", 0);
+    const a_thread = try project_a.ensureCompanionThread(allocator);
+    a_thread.setDraft("workspace A draft");
+    state.project_controller.projects.append(allocator, project_a) catch |err| {
+        project_a.deinit(allocator);
+        return err;
+    };
+    var project_b = try Project.init(allocator, "draft-b", "Draft B", "/tmp/draft-b", 0);
+    state.project_controller.projects.append(allocator, project_b) catch |err| {
+        project_b.deinit(allocator);
+        return err;
+    };
+    const b_thread_count = state.project_controller.projects.items[1].threads.items.len;
+    const b_pane_count = state.project_controller.projects.items[1].workspace_layout.panes.items.len;
+    const b_selection = state.project_controller.projects.items[1].selected_thread_index;
+
+    state.syncCompanionComposer(.{ .x = 10.0, .y = 20.0, .w = 320.0, .h = 92.0 });
+    try std.testing.expectEqualStrings("workspace A draft", state.companion_composer.text());
+    state.project_controller.selected_index = 1;
+    state.syncCompanionComposer(.{ .x = 10.0, .y = 20.0, .w = 320.0, .h = 92.0 });
+    try std.testing.expectEqualStrings("", state.companion_composer.text());
+    try std.testing.expect(state.currentProject().companion_thread_local_id == null);
+    try std.testing.expectEqual(b_thread_count, state.currentProject().threads.items.len);
+    try std.testing.expectEqual(b_pane_count, state.currentProject().workspace_layout.panes.items.len);
+    try std.testing.expectEqual(b_selection, state.currentProject().selected_thread_index);
+
+    const DraftState = struct {
+        allocator: std.mem.Allocator,
+        project: *Project,
+        project_controller: struct { selected_index: usize = 1 } = .{},
+        ensure_calls: usize = 0,
+        dirty_calls: usize = 0,
+
+        pub fn currentProjectMutable(self: *@This()) *Project {
+            return self.project;
+        }
+
+        pub fn threadByLocalId(self: *@This(), workspace_id: []const u8, local_id: []const u8) ?*ChatThread {
+            if (!std.mem.eql(u8, self.project.id, workspace_id)) return null;
+            for (self.project.threads.items) |*thread| if (std.mem.eql(u8, thread.local_thread_id, local_id)) return thread;
+            return null;
+        }
+
+        pub fn ensureCurrentCompanionThread(self: *@This()) !*ChatThread {
+            self.ensure_calls += 1;
+            return self.project.ensureCompanionThread(self.allocator);
+        }
+
+        pub fn markDirty(self: *@This()) void {
+            self.dirty_calls += 1;
+        }
+    };
+    var draft_state: DraftState = .{ .allocator = allocator, .project = &state.project_controller.projects.items[1] };
+    try canonicalizeCompanionTextChange(&draft_state, "");
+    try std.testing.expectEqual(@as(usize, 0), draft_state.ensure_calls);
+    try canonicalizeCompanionTextChange(&draft_state, "workspace B draft");
+    try std.testing.expectEqual(@as(usize, 1), draft_state.ensure_calls);
+    try std.testing.expectEqual(@as(usize, 1), draft_state.dirty_calls);
+    try std.testing.expectEqualStrings("workspace B draft", draft_state.project.threads.items[b_thread_count].currentDraft());
+    try std.testing.expectEqual(b_pane_count, draft_state.project.workspace_layout.panes.items.len);
+    try std.testing.expectEqual(b_selection, draft_state.project.selected_thread_index);
+
+    state.syncCompanionComposer(.{ .x = 10.0, .y = 20.0, .w = 320.0, .h = 92.0 });
+    try std.testing.expectEqualStrings("workspace B draft", state.companion_composer.text());
+    state.project_controller.selected_index = 0;
+    state.syncCompanionComposer(.{ .x = 10.0, .y = 20.0, .w = 320.0, .h = 92.0 });
+    try std.testing.expectEqualStrings("workspace A draft", state.companion_composer.text());
+    try std.testing.expectEqualStrings("workspace A draft", state.threadByLocalId(
+        state.project_controller.projects.items[0].id,
+        state.project_controller.projects.items[0].companion_thread_local_id.?,
+    ).?.currentDraft());
+}
+
 test "Companion frame projects transcript pending streaming lifecycle errors and process owner eviction" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
@@ -9905,18 +10058,21 @@ test "Companion operation snapshots expose only exact live owner actions" {
 
 test "Companion submitted seam preflights before first persistence and reuses identity" {
     const allocator = std.testing.allocator;
-    const Outcome = enum { reject, started };
+    const Outcome = enum { reject, started, persistence_failure, ambiguous_failure };
     const FakeState = struct {
         allocator: std.mem.Allocator,
         project: *Project,
         project_controller: struct { selected_index: usize = 0 } = .{},
         companion_controller: @TypeOf(companion_controller.init()) = companion_controller.init(),
+        companion_composer: CompanionComposerPrompt = CompanionComposerPrompt.init(),
         preflight_outcome: Outcome = .reject,
         send_outcome: Outcome = .started,
         preflight_calls: usize = 0,
         ensure_calls: usize = 0,
         persistence_writes: usize = 0,
         send_calls: usize = 0,
+        user_sends: usize = 0,
+        dirty_calls: usize = 0,
         first_preflight_had_identity: bool = false,
 
         pub fn currentProject(self: *const @This()) *const Project {
@@ -9934,9 +10090,12 @@ test "Companion submitted seam preflights before first persistence and reuses id
         pub fn preflightThreadPrompt(self: *@This(), _: usize, _: *const ChatThread, _: []const u8, _: []const ChatImageAttachment) !bool {
             if (self.preflight_calls == 0) self.first_preflight_had_identity = self.project.companion_thread_local_id != null;
             self.preflight_calls += 1;
+            if (self.project.companion_thread_local_id) |local_id| {
+                if (self.threadByLocalId(self.project.id, local_id)) |thread| if (thread.isSendPendingForUi()) return false;
+            }
             return switch (self.preflight_outcome) {
                 .reject => false,
-                .started => true,
+                else => true,
             };
         }
 
@@ -9948,11 +10107,37 @@ test "Companion submitted seam preflights before first persistence and reuses id
             return thread;
         }
 
-        pub fn sendThreadPrompt(self: *@This(), _: []const u8, _: []const u8, _: []const u8, _: []const ChatImageAttachment) !bool {
+        pub fn projectThreadIndexByLocalId(self: *@This(), workspace_id: []const u8, local_id: []const u8) ?chat_controller.ProjectThreadIndex {
+            if (!std.mem.eql(u8, self.project.id, workspace_id)) return null;
+            for (self.project.threads.items, 0..) |*thread, index| {
+                if (std.mem.eql(u8, thread.local_thread_id, local_id)) return .{ .project_index = 0, .thread_index = index };
+            }
+            return null;
+        }
+
+        pub fn markDirty(self: *@This()) void {
+            self.dirty_calls += 1;
+        }
+
+        pub fn sendThreadDraftWithUiPolicy(self: *@This(), project_index: usize, thread_index: usize, update_selected_ui: bool) !bool {
+            try std.testing.expectEqual(@as(usize, 0), project_index);
+            try std.testing.expect(!update_selected_ui);
             self.send_calls += 1;
+            const thread = &self.project.threads.items[thread_index];
             return switch (self.send_outcome) {
                 .reject => false,
-                .started => true,
+                .started => accepted: {
+                    self.user_sends += 1;
+                    thread.clearDraft();
+                    thread.send_state.status = .pending;
+                    break :accepted true;
+                },
+                .persistence_failure => error.Busy,
+                .ambiguous_failure => ambiguous: {
+                    self.user_sends += 1;
+                    thread.clearDraft();
+                    break :ambiguous error.DaemonUnavailable;
+                },
             };
         }
     };
@@ -9963,6 +10148,7 @@ test "Companion submitted seam preflights before first persistence and reuses id
     const initial_panes = project.workspace_layout.panes.items.len;
     const initial_selection = project.selected_thread_index;
     var fake: FakeState = .{ .allocator = allocator, .project = &project };
+    defer fake.companion_composer.deinit(allocator);
 
     submitCompanionPrompt(&fake, &project, "   \n");
     try std.testing.expect(project.companion_thread_local_id == null);
@@ -9977,6 +10163,8 @@ test "Companion submitted seam preflights before first persistence and reuses id
 
     fake.preflight_outcome = .started;
     fake.send_outcome = .started;
+    try fake.companion_composer.setText(allocator, "first real send");
+    fake.companion_composer.focused = true;
     submitCompanionPrompt(&fake, &project, "first real send");
     const companion_id = try allocator.dupe(u8, project.companion_thread_local_id.?);
     defer allocator.free(companion_id);
@@ -9984,17 +10172,111 @@ test "Companion submitted seam preflights before first persistence and reuses id
     try std.testing.expectEqual(@as(usize, 1), fake.persistence_writes);
     try std.testing.expectEqual(initial_panes, project.workspace_layout.panes.items.len);
     try std.testing.expectEqual(initial_selection, project.selected_thread_index);
+    const companion_thread = fake.threadByLocalId(project.id, companion_id).?;
+    try std.testing.expectEqualStrings("", companion_thread.currentDraft());
+    try std.testing.expectEqualStrings("", fake.companion_composer.text());
+    try std.testing.expect(fake.companion_composer.focused);
+    try std.testing.expectEqual(@as(usize, 1), fake.user_sends);
 
     submitCompanionPrompt(&fake, &project, "repeat send");
     try std.testing.expectEqualStrings(companion_id, project.companion_thread_local_id.?);
     try std.testing.expectEqual(initial_threads + 1, project.threads.items.len);
     try std.testing.expectEqual(@as(usize, 1), fake.persistence_writes);
+    try std.testing.expectEqual(@as(usize, 1), fake.user_sends);
 
+    companion_thread.send_state.status = .idle;
     fake.send_outcome = .reject;
+    try fake.companion_composer.setText(allocator, "post-persist failure");
     submitCompanionPrompt(&fake, &project, "post-persist failure");
     try std.testing.expectEqualStrings(companion_id, project.companion_thread_local_id.?);
     try std.testing.expectEqual(initial_threads + 1, project.threads.items.len);
     try std.testing.expect(fake.companion_controller.ui_error != null);
+    try std.testing.expectEqualStrings("post-persist failure", companion_thread.currentDraft());
+    try std.testing.expectEqualStrings("post-persist failure", fake.companion_composer.text());
+    try std.testing.expect(fake.companion_composer.focused);
+
+    fake.send_outcome = .persistence_failure;
+    try fake.companion_composer.setText(allocator, "retry after persistence");
+    try std.testing.expectError(error.Busy, sendCompanionThreadDraft(&fake, project.id, companion_id, "retry after persistence"));
+    projectCompanionDraftForOwner(&fake, project.id, companion_id);
+    try std.testing.expectEqualStrings("retry after persistence", companion_thread.currentDraft());
+    try std.testing.expectEqualStrings("retry after persistence", fake.companion_composer.text());
+
+    fake.send_outcome = .ambiguous_failure;
+    try fake.companion_composer.setText(allocator, "ambiguously accepted");
+    try std.testing.expectError(error.DaemonUnavailable, sendCompanionThreadDraft(&fake, project.id, companion_id, "ambiguously accepted"));
+    projectCompanionDraftForOwner(&fake, project.id, companion_id);
+    try std.testing.expectEqualStrings("", companion_thread.currentDraft());
+    try std.testing.expectEqualStrings("", fake.companion_composer.text());
+    try std.testing.expectEqual(@as(usize, 2), fake.user_sends);
+}
+
+test "Companion post-send draft projection rejects a replaced workspace owner" {
+    const allocator = std.testing.allocator;
+    const FakeState = struct {
+        allocator: std.mem.Allocator,
+        projects: [2]*Project,
+        project_controller: struct { selected_index: usize = 0 } = .{},
+        companion_composer: CompanionComposerPrompt = CompanionComposerPrompt.init(),
+        addressed_sends: usize = 0,
+
+        pub fn currentProject(self: *const @This()) *const Project {
+            return self.projects[self.project_controller.selected_index];
+        }
+
+        pub fn threadByLocalId(self: *@This(), workspace_id: []const u8, local_id: []const u8) ?*ChatThread {
+            for (self.projects) |project| {
+                if (!std.mem.eql(u8, project.id, workspace_id)) continue;
+                for (project.threads.items) |*thread| if (std.mem.eql(u8, thread.local_thread_id, local_id)) return thread;
+            }
+            return null;
+        }
+
+        pub fn projectThreadIndexByLocalId(self: *@This(), workspace_id: []const u8, local_id: []const u8) ?chat_controller.ProjectThreadIndex {
+            for (self.projects, 0..) |project, project_index| {
+                if (!std.mem.eql(u8, project.id, workspace_id)) continue;
+                for (project.threads.items, 0..) |*thread, thread_index| {
+                    if (std.mem.eql(u8, thread.local_thread_id, local_id)) return .{ .project_index = project_index, .thread_index = thread_index };
+                }
+            }
+            return null;
+        }
+
+        pub fn markDirty(_: *@This()) void {}
+
+        pub fn sendThreadDraftWithUiPolicy(self: *@This(), project_index: usize, thread_index: usize, update_selected_ui: bool) !bool {
+            try std.testing.expectEqual(@as(usize, 0), project_index);
+            try std.testing.expect(!update_selected_ui);
+            self.addressed_sends += 1;
+            self.projects[project_index].threads.items[thread_index].clearDraft();
+            self.project_controller.selected_index = 1;
+            return true;
+        }
+    };
+
+    var owner = try Project.init(allocator, "draft-owner", "Owner", "/tmp/draft-owner", 0);
+    defer owner.deinit(allocator);
+    const owner_thread = try owner.ensureCompanionThread(allocator);
+    var replacement = try Project.init(allocator, "draft-replacement", "Replacement", "/tmp/draft-replacement", 0);
+    defer replacement.deinit(allocator);
+    const replacement_thread = try replacement.ensureCompanionThread(allocator);
+    replacement_thread.setDraft("replacement draft");
+
+    var fake: FakeState = .{ .allocator = allocator, .projects = .{ &owner, &replacement } };
+    defer fake.companion_composer.deinit(allocator);
+    try fake.companion_composer.setText(allocator, "owner prompt");
+    const workspace_id = try allocator.dupe(u8, owner.id);
+    defer allocator.free(workspace_id);
+    const local_thread_id = try allocator.dupe(u8, owner_thread.local_thread_id);
+    defer allocator.free(local_thread_id);
+
+    try std.testing.expect(try sendCompanionThreadDraft(&fake, workspace_id, local_thread_id, "owner prompt"));
+    projectCompanionDraftForOwner(&fake, workspace_id, local_thread_id);
+    try std.testing.expectEqual(@as(usize, 1), fake.addressed_sends);
+    try std.testing.expectEqual(@as(usize, 1), fake.project_controller.selected_index);
+    try std.testing.expectEqualStrings("", owner_thread.currentDraft());
+    try std.testing.expectEqualStrings("replacement draft", replacement_thread.currentDraft());
+    try std.testing.expectEqualStrings("owner prompt", fake.companion_composer.text());
 }
 
 test "visible chat is not treated as focused when a sibling pane owns focus" {

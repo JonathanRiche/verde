@@ -37,6 +37,7 @@ const MissionControlGeometry = struct {
     header: palette.Rect,
     close_button: palette.Rect,
     body: palette.Rect,
+    footer: palette.Rect,
     summary: palette.Rect,
     operations: palette.Rect,
     inspector: palette.Rect,
@@ -49,7 +50,9 @@ pub fn refreshHits(state: *runtime.AppState, width: f32, height: f32) void {
     state.companion_controller.frame_width = width;
     state.companion_controller.frame_height = height;
     if (state.companion_controller.mission_control_open) {
-        prepareAndRegisterMissionControlHits(&state.companion_controller, computeMissionControlGeometry(width, height, companionScale()));
+        const geometry = computeMissionControlGeometry(width, height, companionScale());
+        state.syncCompanionComposer(composerRect(geometry.footer));
+        prepareAndRegisterMissionControlHits(&state.companion_controller, geometry);
     } else {
         const geometry = computeGeometryForState(width, height, companionScale(), &state.companion_controller);
         prepareAndRegisterHits(&state.companion_controller, geometry);
@@ -109,7 +112,7 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
         }
         state.markDirty();
     }
-    if (button == 1 and state.companion_controller.visibility == .sidecar_open and !state.companion_controller.mission_control_open and
+    if (button == 1 and state.companion_controller.visibility == .sidecar_open and
         (result.action == null or result.action.? == .panel))
     {
         _ = state.routeCompanionComposerMouseButton(x, y, down, clicks);
@@ -120,7 +123,7 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
 /// Prevents underlying hover routing only inside the chip or sidecar.
 pub fn handleMouseMotion(state: *runtime.AppState, x: f32, y: f32, dragging: bool) bool {
     const owned = state.companion_controller.hasPointerCapture() or state.companion_controller.hitAt(x, y) != null;
-    if (owned and !state.companion_controller.mission_control_open) _ = state.routeCompanionComposerMouseMotion(x, y, dragging);
+    if (owned) _ = state.routeCompanionComposerMouseMotion(x, y, dragging);
     return owned;
 }
 
@@ -128,6 +131,7 @@ pub fn handleMouseMotion(state: *runtime.AppState, x: f32, y: f32, dragging: boo
 pub fn handleWheel(state: *runtime.AppState, x: f32, y: f32, wheel_y: f32) bool {
     const action = state.companion_controller.hitAt(x, y) orelse return false;
     if (state.companion_controller.mission_control_open) {
+        if (pointInRect(state.companion_composer.bounds(), x, y) and state.routeCompanionComposerWheel(x, y, wheel_y)) return true;
         if (wheel_y != 0.0) scrollMissionControlAt(state, x, y, -wheel_y * companionScaled(32.0));
         _ = action;
         return true;
@@ -273,7 +277,10 @@ fn computeMissionControlGeometry(width: f32, height: f32, scale: f32) MissionCon
     const window: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = @max(width, 0.0), .h = @max(height, 0.0) };
     const header_h = @min(48.0 * scale, window.h);
     const header: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = window.w, .h = header_h };
-    const body: palette.Rect = .{ .x = 0.0, .y = header_h, .w = window.w, .h = @max(window.h - header_h, 0.0) };
+    const remaining_h = @max(window.h - header_h, 0.0);
+    const footer_h = @min(116.0 * scale, remaining_h);
+    const body: palette.Rect = .{ .x = 0.0, .y = header_h, .w = window.w, .h = @max(remaining_h - footer_h, 0.0) };
+    const footer: palette.Rect = .{ .x = 0.0, .y = body.y + body.h, .w = window.w, .h = footer_h };
     const close_size = @min(28.0 * scale, @max(header_h - 12.0 * scale, 0.0));
     const close_button: palette.Rect = .{
         .x = @max(window.w - 16.0 * scale - close_size, 0.0),
@@ -300,6 +307,7 @@ fn computeMissionControlGeometry(width: f32, height: f32, scale: f32) MissionCon
         .header = header,
         .close_button = close_button,
         .body = body,
+        .footer = footer,
         .summary = content,
         .operations = content,
         .inspector = content,
@@ -320,6 +328,7 @@ fn computeMissionControlGeometry(width: f32, height: f32, scale: f32) MissionCon
             .header = header,
             .close_button = close_button,
             .body = body,
+            .footer = footer,
             .summary = .{ .x = left.x, .y = left.y, .w = left.w, .h = @min(summary_h, left.h) },
             .operations = .{ .x = left.x, .y = left.y + @min(summary_h, left.h) + gap, .w = left.w, .h = @max(left.h - @min(summary_h, left.h) - gap, 0.0) },
             .inspector = right,
@@ -334,6 +343,7 @@ fn computeMissionControlGeometry(width: f32, height: f32, scale: f32) MissionCon
         .header = header,
         .close_button = close_button,
         .body = body,
+        .footer = footer,
         .summary = .{ .x = content.x, .y = content.y, .w = left_w, .h = content.h },
         .operations = .{ .x = content.x + left_w + gap, .y = content.y, .w = center_w, .h = content.h },
         .inspector = .{ .x = content.x + left_w + gap + center_w + gap, .y = content.y, .w = right_w, .h = content.h },
@@ -611,17 +621,18 @@ fn renderMissionControl(state: *runtime.AppState, geometry: MissionControlGeomet
     renderMissionControlHeader(state, geometry);
     if (geometry.mode == .narrow) {
         renderMissionControlNarrowBody(state, geometry);
-        return;
+    } else {
+        inline for (.{ geometry.summary, geometry.operations, geometry.inspector }) |column| {
+            queuePanel(state, column, color(chrome.surface_deep), color(chrome.border), companionScaled(10.0), companionScaled(1.0));
+        }
+        var summary_y = geometry.summary.y - state.companion_controller.mission_control_summary_scroll_y;
+        renderMissionControlSummary(state, geometry.summary, &summary_y);
+        var operations_y = geometry.operations.y - state.companion_controller.mission_control_operations_scroll_y;
+        renderMissionControlOperations(state, geometry.operations, &operations_y);
+        var inspector_y = geometry.inspector.y - state.companion_controller.mission_control_inspector_scroll_y;
+        renderMissionControlInspector(state, geometry.inspector, &inspector_y);
     }
-    inline for (.{ geometry.summary, geometry.operations, geometry.inspector }) |column| {
-        queuePanel(state, column, color(chrome.surface_deep), color(chrome.border), companionScaled(10.0), companionScaled(1.0));
-    }
-    var summary_y = geometry.summary.y - state.companion_controller.mission_control_summary_scroll_y;
-    renderMissionControlSummary(state, geometry.summary, &summary_y);
-    var operations_y = geometry.operations.y - state.companion_controller.mission_control_operations_scroll_y;
-    renderMissionControlOperations(state, geometry.operations, &operations_y);
-    var inspector_y = geometry.inspector.y - state.companion_controller.mission_control_inspector_scroll_y;
-    renderMissionControlInspector(state, geometry.inspector, &inspector_y);
+    renderComposerFooter(state, geometry.footer, true);
 }
 
 // Mission Control identity, exact Frame summary, and close-only header region.
@@ -931,14 +942,20 @@ fn renderBody(state: *runtime.AppState, geometry: Geometry) void {
 
 // Sidecar shared Companion composer region.
 fn renderFooter(state: *runtime.AppState, geometry: Geometry) void {
+    renderComposerFooter(state, geometry.footer, false);
+}
+
+// Shared Companion composer footer used by the sidecar and Mission Control.
+fn renderComposerFooter(state: *runtime.AppState, footer: palette.Rect, fill_background: bool) void {
     const chrome = theme.companionChrome();
-    const composer = composerRect(geometry.footer);
+    const composer = composerRect(footer);
     if (composer.w <= 0.0 or composer.h <= 0.0) return;
     // The sidecar panel fill backs the footer; repainting it full-width would
     // erase the side borders and square off the bottom rounded corners. The
     // divider is inset past the panel stroke for the same reason.
+    if (fill_background) queueRect(state, footer, color(surface()));
     const divider_inset = snappedStroke(companionScaled(1.0));
-    queueRect(state, .{ .x = geometry.footer.x + divider_inset, .y = geometry.footer.y, .w = @max(geometry.footer.w - divider_inset * 2.0, 0.0), .h = companionScaled(1.0) }, color(hairline()));
+    queueRect(state, .{ .x = footer.x + divider_inset, .y = footer.y, .w = @max(footer.w - divider_inset * 2.0, 0.0), .h = companionScaled(1.0) }, color(hairline()));
     state.syncCompanionComposer(composer);
     // The shared composer defaults to the chat layer. Companion is rendered
     // above panes, so inherit the active overlay layer or panes cover every
@@ -4660,11 +4677,17 @@ test "Mission Control responsive geometry stays bounded across required viewport
     for (cases) |case| {
         const geometry = computeMissionControlGeometry(case.width, case.height, case.scale);
         try std.testing.expectEqual(case.mode, geometry.mode);
-        inline for (.{ geometry.header, geometry.close_button, geometry.body, geometry.summary, geometry.operations, geometry.inspector }) |rect| {
+        inline for (.{ geometry.header, geometry.close_button, geometry.body, geometry.footer, geometry.summary, geometry.operations, geometry.inspector }) |rect| {
             try std.testing.expect(rect.w >= 0.0 and rect.h >= 0.0);
             try std.testing.expect(rectFitsWindow(rect, geometry.window.w, geometry.window.h));
         }
         try std.testing.expectApproxEqAbs(@min(48.0 * case.scale, case.height), geometry.header.h, 0.001);
+        try std.testing.expectApproxEqAbs(geometry.body.y + geometry.body.h, geometry.footer.y, 0.001);
+        try std.testing.expectApproxEqAbs(geometry.window.h, geometry.footer.y + geometry.footer.h, 0.001);
+        const composer = composerRectAtScale(geometry.footer, case.scale);
+        try std.testing.expect(composer.w > 0.0 and composer.h > 0.0);
+        try std.testing.expect(rectFitsWindow(composer, geometry.window.w, geometry.window.h));
+        try std.testing.expect(geometry.summary.y + geometry.summary.h <= geometry.footer.y);
         if (geometry.mode == .wide) {
             try std.testing.expect(geometry.summary.w >= 220.0 * case.scale and geometry.summary.w <= 280.0 * case.scale);
             try std.testing.expect(geometry.inspector.w >= 260.0 * case.scale and geometry.inspector.w <= 320.0 * case.scale);
@@ -4697,6 +4720,8 @@ test "Mission Control render and hits share one bounded Frame and exact referenc
         project.deinit(allocator);
         return err;
     };
+    const companion_thread = try state.project_controller.projects.items[0].ensureCompanionThread(allocator);
+    companion_thread.setDraft("shared Mission Control draft");
 
     var frame: controller.Frame = .{ .has_thread = true, .working = true, .has_approval = true };
     try std.testing.expect(frame.setOwner("mission-frame", "thread:mission"));
@@ -4728,8 +4753,14 @@ test "Mission Control render and hits share one bounded Frame and exact referenc
     }
     frame.sortOperations();
     state.companion_controller.setFrame(frame);
-    state.companion_controller.openMissionControl();
+    state.companion_controller.show();
     const immutable_frame = state.companion_controller.presentation;
+    render(&state, 1280.0, 720.0);
+    const shared_buffer = state.companion_composer.text().ptr;
+    try std.testing.expectEqualStrings("shared Mission Control draft", state.companion_composer.text());
+    state.palette_overlay_batch.clear();
+    _ = state.palette_frame_text_arena.reset(.retain_capacity);
+    state.companion_controller.openMissionControl();
     const selected = state.companion_controller.selected_operation.?;
     const geometry = computeMissionControlGeometry(1600.0, 4000.0, 1.0);
     prepareAndRegisterMissionControlHits(&state.companion_controller, geometry);
@@ -4758,6 +4789,9 @@ test "Mission Control render and hits share one bounded Frame and exact referenc
     try std.testing.expectEqual(@as(usize, 1), follow_count);
 
     render(&state, 1600.0, 1000.0);
+    try std.testing.expectEqual(shared_buffer, state.companion_composer.text().ptr);
+    try std.testing.expectEqualStrings("shared Mission Control draft", state.companion_composer.text());
+    try std.testing.expectEqual(composerRect(computeMissionControlGeometry(1600.0, 1000.0, 1.0).footer), state.companion_composer.bounds());
     inline for (.{
         "Mission Control",
         "Keep the current owner in charge",
@@ -4829,6 +4863,8 @@ test "Mission Control routes independent and narrow direct scroll without sideca
     state.allocator = std.testing.allocator;
     state.lifecycle = .{};
     state.companion_controller = controller.init();
+    state.companion_composer = @TypeOf(state.companion_composer).init();
+    defer state.companion_composer.deinit(std.testing.allocator);
     state.companion_controller.setFrame(frame);
     state.companion_controller.openMissionControl();
     state.companion_controller.body_scroll_y = 17.0;
@@ -4836,6 +4872,7 @@ test "Mission Control routes independent and narrow direct scroll without sideca
     state.companion_controller.frame_height = 520.0;
     const laptop = computeMissionControlGeometry(900.0, 520.0, 1.0);
     try std.testing.expectEqual(MissionControlMode.laptop, laptop.mode);
+    state.companion_composer.setBounds(composerRectAtScale(laptop.footer, 1.0));
     prepareAndRegisterMissionControlHits(&state.companion_controller, laptop);
     try std.testing.expect(handleWheel(&state, laptop.summary.x + 2.0, laptop.summary.y + 2.0, -1.0));
     try std.testing.expect(state.companion_controller.mission_control_summary_scroll_y > 0.0);
@@ -4845,6 +4882,13 @@ test "Mission Control routes independent and narrow direct scroll without sideca
     try std.testing.expect(handleWheel(&state, laptop.inspector.x + 2.0, laptop.inspector.y + 2.0, -1.0));
     try std.testing.expect(state.companion_controller.mission_control_inspector_scroll_y > 0.0);
     try std.testing.expectEqual(@as(f32, 17.0), state.companion_controller.body_scroll_y);
+    const summary_before_composer = state.companion_controller.mission_control_summary_scroll_y;
+    const operations_before_composer = state.companion_controller.mission_control_operations_scroll_y;
+    const inspector_before_composer = state.companion_controller.mission_control_inspector_scroll_y;
+    try std.testing.expect(handleWheel(&state, laptop.footer.x + laptop.footer.w * 0.5, laptop.footer.y + laptop.footer.h * 0.5, -1.0));
+    try std.testing.expectEqual(summary_before_composer, state.companion_controller.mission_control_summary_scroll_y);
+    try std.testing.expectEqual(operations_before_composer, state.companion_controller.mission_control_operations_scroll_y);
+    try std.testing.expectEqual(inspector_before_composer, state.companion_controller.mission_control_inspector_scroll_y);
 
     state.companion_controller.frame_width = 700.0;
     state.companion_controller.frame_height = 500.0;
@@ -4930,6 +4974,23 @@ test "public Mission Control entry preserves workspace state and stale actions r
     try std.testing.expect(handleMouseButton(&state, entry_rect.x + 2.0, entry_rect.y + 2.0, 1, false, 1));
     try std.testing.expect(state.companion_controller.mission_control_open);
     try std.testing.expect(!state.companion_composer.focused);
+    const mission_geometry = computeMissionControlGeometry(1280.0, 720.0, 1.0);
+    try std.testing.expectEqual(composerRectAtScale(mission_geometry.footer, 1.0), state.companion_composer.bounds());
+    const text_rect = state.companion_composer.textRect();
+    try std.testing.expect(handleMouseButton(&state, text_rect.x + 2.0, text_rect.y + 2.0, 1, true, 1));
+    try std.testing.expect(handleMouseButton(&state, text_rect.x + 2.0, text_rect.y + 2.0, 1, false, 1));
+    try std.testing.expect(state.companion_composer.focused);
+    try std.testing.expect(state.routeCompanionComposerTextInput("mission draft"));
+    try std.testing.expectEqualStrings("mission draft", state.companion_composer.text());
+    try std.testing.expectEqualStrings("mission draft", thread_a.currentDraft());
+    try std.testing.expect(handleEscapeKey(&state, true));
+    try std.testing.expect(!state.companion_controller.mission_control_open);
+    try std.testing.expectEqual(controller.Visibility.sidecar_open, state.companion_controller.visibility);
+    try std.testing.expectEqualStrings("mission draft", thread_a.currentDraft());
+    try std.testing.expect(handleEscapeKey(&state, false));
+    state.companion_controller.openMissionControl();
+    refreshHits(&state, 1280.0, 720.0);
+    try std.testing.expectEqualStrings("mission draft", state.companion_composer.text());
     try std.testing.expectEqual(project_index_before, state.project_controller.selected_index);
     try std.testing.expectEqual(selected_thread_before, state.project_controller.projects.items[0].selected_thread_index);
     try std.testing.expectEqual(pane_count_before, state.project_controller.projects.items[0].workspace_layout.panes.items.len);
