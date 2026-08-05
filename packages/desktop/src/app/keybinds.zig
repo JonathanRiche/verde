@@ -1875,6 +1875,59 @@ test "workspace pane cycling keybinds are configurable" {
     try std.testing.expectEqual(sdl.Keycode.n, config.workspace_pane_next[0].key);
 }
 
+test "scrolling workspace keybinds are configurable" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"workspace": {
+        \\  "focus_left": "Alt+H", "focus_right": "Alt+L",
+        \\  "focus_up": "Alt+K", "focus_down": "Alt+J",
+        \\  "move_left": "Alt+Shift+H", "move_right": "Alt+Shift+L",
+        \\  "move_up": "Alt+Shift+K", "move_down": "Alt+Shift+J",
+        \\  "pane_previous": "Alt+P", "pane_next": "Alt+N",
+        \\  "pane_select": ["Alt+1", "Alt+2"]
+        \\}}}
+    , .{});
+    defer parsed.deinit();
+
+    config.applyOverrides(parsed.value);
+
+    const overridden = [_][]const Keybind{
+        config.workspace_focus_left,
+        config.workspace_focus_right,
+        config.workspace_focus_up,
+        config.workspace_focus_down,
+        config.workspace_move_left,
+        config.workspace_move_right,
+        config.workspace_move_up,
+        config.workspace_move_down,
+        config.workspace_pane_previous,
+        config.workspace_pane_next,
+    };
+    for (overridden) |bindings| {
+        try std.testing.expectEqual(@as(usize, 1), bindings.len);
+        try std.testing.expect(bindings[0].alt);
+        try std.testing.expect(!bindings[0].ctrl);
+    }
+    try std.testing.expectEqual(sdl.Keycode.h, config.workspace_focus_left[0].key);
+    try std.testing.expectEqual(sdl.Keycode.l, config.workspace_focus_right[0].key);
+    try std.testing.expectEqual(sdl.Keycode.k, config.workspace_focus_up[0].key);
+    try std.testing.expectEqual(sdl.Keycode.j, config.workspace_focus_down[0].key);
+    try std.testing.expect(config.workspace_move_left[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.h, config.workspace_move_left[0].key);
+    try std.testing.expectEqual(sdl.Keycode.l, config.workspace_move_right[0].key);
+    try std.testing.expectEqual(sdl.Keycode.k, config.workspace_move_up[0].key);
+    try std.testing.expectEqual(sdl.Keycode.j, config.workspace_move_down[0].key);
+    try std.testing.expectEqual(sdl.Keycode.p, config.workspace_pane_previous[0].key);
+    try std.testing.expectEqual(sdl.Keycode.n, config.workspace_pane_next[0].key);
+    try std.testing.expectEqual(@as(usize, 2), config.workspace_pane_select.len);
+    try std.testing.expect(config.workspace_pane_select[0].alt);
+    try std.testing.expect(!config.workspace_pane_select[0].ctrl);
+    try std.testing.expectEqual(sdl.Keycode.@"1", config.workspace_pane_select[0].key);
+    try std.testing.expectEqual(sdl.Keycode.@"2", config.workspace_pane_select[1].key);
+}
+
 test "default workspace prompt and move keybinds are configurable actions" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
