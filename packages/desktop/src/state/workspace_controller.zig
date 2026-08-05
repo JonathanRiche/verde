@@ -62,6 +62,17 @@ const EffectiveChatSettings = struct {
     fast_mode: FastMode,
 };
 
+const WorkspaceViewportSnapshot = struct {
+    offset_x: f32,
+    target_x: f32,
+    offset_y: f32,
+    target_y: f32,
+    revealed_pane_id: ?WorkspacePaneId,
+    leading_pane_id: ?WorkspacePaneId,
+    animation_last_ms: i64,
+    axis_vertical: bool,
+};
+
 pub const ViewFocusSnapshot = struct {
     selected_project_index: usize,
     terminal_focused: bool,
@@ -1586,6 +1597,16 @@ pub fn createWorkspaceChatPane(
     const previous_focused_pane_id = layout.focused_pane_id;
     const previous_maximized_pane_id = layout.maximized_pane_id;
     const previous_thread_index = project.selected_thread_index;
+    const previous_viewport: WorkspaceViewportSnapshot = .{
+        .offset_x = layout.scroll_offset_x,
+        .target_x = layout.scroll_target_x,
+        .offset_y = layout.scroll_offset_y,
+        .target_y = layout.scroll_target_y,
+        .revealed_pane_id = layout.scroll_revealed_pane_id,
+        .leading_pane_id = layout.scroll_leading_pane_id,
+        .animation_last_ms = layout.scroll_animation_last_ms,
+        .axis_vertical = layout.scroll_axis_vertical,
+    };
 
     var thread = try ChatThread.init(allocator, "New thread");
     var thread_owned = true;
@@ -1633,6 +1654,14 @@ pub fn createWorkspaceChatPane(
     } else {
         layout.focused_pane_id = previous_focused_pane_id;
         layout.maximized_pane_id = previous_maximized_pane_id;
+        layout.scroll_offset_x = previous_viewport.offset_x;
+        layout.scroll_target_x = previous_viewport.target_x;
+        layout.scroll_offset_y = previous_viewport.offset_y;
+        layout.scroll_target_y = previous_viewport.target_y;
+        layout.scroll_revealed_pane_id = previous_viewport.revealed_pane_id;
+        layout.scroll_leading_pane_id = previous_viewport.leading_pane_id;
+        layout.scroll_animation_last_ms = previous_viewport.animation_last_ms;
+        layout.scroll_axis_vertical = previous_viewport.axis_vertical;
         project.selected_thread_index = previous_thread_index;
     }
     return .{
@@ -2030,4 +2059,47 @@ test "addressed chat send does not change the visible workspace selection" {
     try std.testing.expectEqual(@as(usize, 0), state.project_controller.selected_index);
     try std.testing.expectEqual(selected_thread_before, state.project_controller.projects.items[0].selected_thread_index);
     try std.testing.expectEqual(focused_pane_before, state.project_controller.projects.items[0].workspace_layout.focused_pane_id);
+}
+
+test "background chat creation preserves the scrolling viewport" {
+    const allocator = std.testing.allocator;
+    var project = try Project.init(allocator, "background-open", "Background", "/tmp/background-open", 0);
+    defer project.deinit(allocator);
+
+    const layout = &project.workspace_layout;
+    const focused_pane_id = layout.focused_pane_id orelse return error.MissingChatPane;
+    layout.scroll_offset_x = 120.0;
+    layout.scroll_target_x = 180.0;
+    layout.scroll_offset_y = 24.0;
+    layout.scroll_target_y = 48.0;
+    layout.scroll_revealed_pane_id = focused_pane_id;
+    layout.scroll_leading_pane_id = focused_pane_id;
+    layout.scroll_animation_last_ms = 456;
+    layout.scroll_axis_vertical = true;
+
+    const result = try createWorkspaceChatPane(
+        &project,
+        allocator,
+        .codex,
+        DEFAULT_CODEX_MODEL,
+        .{
+            .reasoning_effort = DEFAULT_CODEX_REASONING_EFFORT,
+            .reasoning_variant = null,
+            .fast_mode = .off,
+        },
+        focused_pane_id,
+        .horizontal,
+        false,
+    );
+
+    try std.testing.expect(!result.focused);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, focused_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(f32, 120.0), layout.scroll_offset_x);
+    try std.testing.expectEqual(@as(f32, 180.0), layout.scroll_target_x);
+    try std.testing.expectEqual(@as(f32, 24.0), layout.scroll_offset_y);
+    try std.testing.expectEqual(@as(f32, 48.0), layout.scroll_target_y);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, focused_pane_id), layout.scroll_revealed_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, focused_pane_id), layout.scroll_leading_pane_id);
+    try std.testing.expectEqual(@as(i64, 456), layout.scroll_animation_last_ms);
+    try std.testing.expect(layout.scroll_axis_vertical);
 }
