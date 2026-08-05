@@ -1316,6 +1316,11 @@ pub const WorkspacePanePlacement = workspace_layout.WorkspacePanePlacement;
 pub const TerminalDockEntry = project_state.TerminalDockEntry;
 pub const ManagedProcessStatus = project_state.ManagedProcessStatus;
 pub const ManagedProcess = project_state.ManagedProcess;
+
+const ManagedProcessFocusPolicy = enum {
+    focus,
+    preserve,
+};
 pub const WorkspaceLease = project_state.WorkspaceLease;
 pub const TrackedTerminalProcess = project_state.TrackedTerminalProcess;
 pub const TerminalProcessOutcome = project_state.TerminalProcessOutcome;
@@ -4769,7 +4774,9 @@ pub const AppState = struct {
                 process.restart_count += 1;
                 process.status = .restarting;
             }
-            _ = self.startManagedProcess(project_index, name) catch |err| {
+            // Polling runs for every workspace. A background restart must not
+            // redirect keyboard input away from the pane the user is editing.
+            _ = self.startManagedProcessWithFocus(project_index, name, .preserve) catch |err| {
                 log.warn("failed to auto-restart managed process {s}: {s}", .{ name, @errorName(err) });
                 continue;
             };
@@ -4777,17 +4784,21 @@ pub const AppState = struct {
     }
 
     pub fn startManagedProcess(self: *AppState, project_index: usize, name: []const u8) !bool {
-        try self.refreshProjectStackConfig(project_index);
-        if (project_index >= self.project_controller.projects.items.len) return false;
-        self.project_controller.selected_index = project_index;
-        var project = &self.project_controller.projects.items[project_index];
-        const process = project.managedProcessByName(name) orelse return false;
-        return try self.startManagedProcessDirect(project_index, process);
+        return try self.startManagedProcessWithFocus(project_index, name, .focus);
     }
 
-    fn startManagedProcessDirect(self: *AppState, project_index: usize, process: *ManagedProcess) !bool {
+    fn startManagedProcessWithFocus(self: *AppState, project_index: usize, name: []const u8, focus_policy: ManagedProcessFocusPolicy) !bool {
+        try self.refreshProjectStackConfig(project_index);
         if (project_index >= self.project_controller.projects.items.len) return false;
-        self.project_controller.selected_index = project_index;
+        if (focus_policy == .focus) self.project_controller.selected_index = project_index;
+        var project = &self.project_controller.projects.items[project_index];
+        const process = project.managedProcessByName(name) orelse return false;
+        return try self.startManagedProcessDirect(project_index, process, focus_policy);
+    }
+
+    fn startManagedProcessDirect(self: *AppState, project_index: usize, process: *ManagedProcess, focus_policy: ManagedProcessFocusPolicy) !bool {
+        if (project_index >= self.project_controller.projects.items.len) return false;
+        if (focus_policy == .focus) self.project_controller.selected_index = project_index;
         var project = &self.project_controller.projects.items[project_index];
         const dock_id = if (process.dock_id) |saved_dock_id|
             if (project.terminalDockEntryById(saved_dock_id) != null)
@@ -4820,8 +4831,14 @@ pub const AppState = struct {
         process.next_restart_ms = 0;
         process.pending_watch_restart_ms = 0;
         process.explicit_stop = false;
+        const previous_focused_pane_id = project.workspace_layout.focused_pane_id;
         const terminal_pane_open = project.workspace_layout.visibleTerminalPaneIdForDock(dock_id) != null;
         process.pane_id = try project.workspace_layout.ensureTerminalPane(self.allocator, dock_id);
+        if (focus_policy == .preserve) {
+            // ensureTerminalPane focuses even an existing terminal pane. Put
+            // the visual owner back so zoom and text routing remain aligned.
+            project.workspace_layout.focused_pane_id = previous_focused_pane_id;
+        }
         if (process.kind == .agent and process.notify) {
             if (dock.activeSessionId()) |session_id| {
                 _ = try self.updateSurface(.{
@@ -4839,12 +4856,14 @@ pub const AppState = struct {
                 });
             }
         }
-        if (terminal_pane_open) {
-            project.workspace_layout.maximized_pane_id = null;
-        } else {
-            project.workspace_layout.focusCreatedPane(process.pane_id.?);
+        if (focus_policy == .focus) {
+            if (terminal_pane_open) {
+                project.workspace_layout.maximized_pane_id = null;
+            } else {
+                project.workspace_layout.focusCreatedPane(process.pane_id.?);
+            }
+            self.requestTerminalDockFocus(dock_id);
         }
-        self.requestTerminalDockFocus(dock_id);
         self.markDirty();
         return true;
     }
