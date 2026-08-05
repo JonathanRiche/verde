@@ -16,6 +16,9 @@ pub const MAX_WORKSPACE_PANE_GAP: f32 = 64.0;
 pub const DEFAULT_WORKSPACE_PANES_PER_VIEW: u8 = 2;
 pub const MIN_WORKSPACE_PANES_PER_VIEW: u8 = 1;
 pub const MAX_WORKSPACE_PANES_PER_VIEW: u8 = 6;
+pub const DEFAULT_WORKSPACE_SCROLL_THRESHOLD: u8 = 2;
+pub const MIN_WORKSPACE_SCROLL_THRESHOLD: u8 = 1;
+pub const MAX_WORKSPACE_SCROLL_THRESHOLD: u8 = 64;
 pub const DEFAULT_CHAT_TITLE_MODEL = "gpt-5.6-luna";
 
 pub const ChatTitleProvider = enum {
@@ -109,6 +112,19 @@ pub const WorkspaceScrollDirection = enum {
     }
 };
 
+pub const WorkspaceScrollMode = enum {
+    automatic,
+    always,
+    disabled,
+
+    pub fn parse(value: []const u8) ?WorkspaceScrollMode {
+        if (std.ascii.eqlIgnoreCase(value, "automatic")) return .automatic;
+        if (std.ascii.eqlIgnoreCase(value, "always")) return .always;
+        if (std.ascii.eqlIgnoreCase(value, "disabled")) return .disabled;
+        return null;
+    }
+};
+
 pub const TerminalLaunchProfileConfig = struct {
     label: []u8,
     command: []const []u8,
@@ -144,6 +160,8 @@ pub const AppConfig = struct {
     workspace_pane_gap: f32 = DEFAULT_WORKSPACE_PANE_GAP,
     workspace_panes_per_view: u8 = DEFAULT_WORKSPACE_PANES_PER_VIEW,
     workspace_scroll_direction: WorkspaceScrollDirection = .horizontal,
+    workspace_scroll_mode: WorkspaceScrollMode = .automatic,
+    workspace_scroll_threshold: u8 = DEFAULT_WORKSPACE_SCROLL_THRESHOLD,
     theme_config: theme.ThemeConfig = .{},
     active_theme: ?[]u8 = null,
     installed_themes: []InstalledTheme = &.{},
@@ -381,6 +399,8 @@ fn writeUiSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, con
     try ui_object.put(allocator, "workspace_pane_gap", .{ .float = config.workspace_pane_gap });
     try ui_object.put(allocator, "workspace_panes_per_view", .{ .integer = config.workspace_panes_per_view });
     try ui_object.put(allocator, "workspace_scroll_direction", .{ .string = @tagName(config.workspace_scroll_direction) });
+    try ui_object.put(allocator, "workspace_scroll_mode", .{ .string = @tagName(config.workspace_scroll_mode) });
+    try ui_object.put(allocator, "workspace_scroll_threshold", .{ .integer = config.workspace_scroll_threshold });
 }
 
 fn writeThemeSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
@@ -931,6 +951,21 @@ fn applyUiOverrides(config: *AppConfig, ui_value: std.json.Value) void {
             log.warn("ignoring unsupported ui.workspace_scroll_direction", .{});
         }
     }
+    if (ui_value.object.get("workspace_scroll_mode")) |mode_value| {
+        if (mode_value != .string) {
+            log.warn("ui.workspace_scroll_mode must be a string when provided", .{});
+        } else if (WorkspaceScrollMode.parse(mode_value.string)) |mode| {
+            config.workspace_scroll_mode = mode;
+        } else {
+            log.warn("ignoring unsupported ui.workspace_scroll_mode", .{});
+        }
+    }
+    if (ui_value.object.get("workspace_scroll_threshold")) |threshold_value| {
+        switch (threshold_value) {
+            .integer => |value| applyWorkspaceScrollThreshold(config, value),
+            else => log.warn("ui.workspace_scroll_threshold must be an integer when provided", .{}),
+        }
+    }
 }
 
 fn applyOpenOverrides(allocator: std.mem.Allocator, config: *AppConfig, open_value: std.json.Value) void {
@@ -1164,6 +1199,14 @@ fn applyWorkspacePanesPerView(config: *AppConfig, value: i64) void {
     config.workspace_panes_per_view = @intCast(value);
 }
 
+fn applyWorkspaceScrollThreshold(config: *AppConfig, value: i64) void {
+    if (value < MIN_WORKSPACE_SCROLL_THRESHOLD or value > MAX_WORKSPACE_SCROLL_THRESHOLD) {
+        log.warn("ignoring ui.workspace_scroll_threshold outside supported range {d}-{d}", .{ MIN_WORKSPACE_SCROLL_THRESHOLD, MAX_WORKSPACE_SCROLL_THRESHOLD });
+        return;
+    }
+    config.workspace_scroll_threshold = @intCast(value);
+}
+
 test "app config accepts ui.font_size override" {
     var root = try parseTestRoot("{\"ui\":{\"font_size\":22}}");
     defer root.deinit();
@@ -1250,6 +1293,30 @@ test "app config ignores unsupported ui.workspace_scroll_direction" {
     applyAppOverrides(std.testing.allocator, &config, root.value);
 
     try std.testing.expectEqual(WorkspaceScrollDirection.horizontal, config.workspace_scroll_direction);
+}
+
+test "app config accepts workspace scrolling policy overrides" {
+    var root = try parseTestRoot("{\"ui\":{\"workspace_scroll_mode\":\"always\",\"workspace_scroll_threshold\":8}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(WorkspaceScrollMode.always, config.workspace_scroll_mode);
+    try std.testing.expectEqual(@as(u8, 8), config.workspace_scroll_threshold);
+}
+
+test "app config ignores unsupported workspace scrolling policy overrides" {
+    var root = try parseTestRoot("{\"ui\":{\"workspace_scroll_mode\":\"sometimes\",\"workspace_scroll_threshold\":0}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(WorkspaceScrollMode.automatic, config.workspace_scroll_mode);
+    try std.testing.expectEqual(DEFAULT_WORKSPACE_SCROLL_THRESHOLD, config.workspace_scroll_threshold);
 }
 
 test "app config accepts theme source and color overrides" {

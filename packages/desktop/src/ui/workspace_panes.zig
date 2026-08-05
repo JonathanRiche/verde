@@ -46,7 +46,6 @@ const QUICK_PANE_MIN_H_CSS: f32 = 220.0;
 const QUICK_PANE_MARGIN_CSS: f32 = 12.0;
 const QUICK_PANE_DRAG_H_CSS: f32 = 28.0;
 const QUICK_PANE_RESIZE_GRIP_CSS: f32 = 18.0;
-const SCROLLING_LAYOUT_PANE_THRESHOLD: usize = 2;
 const SCROLLING_WHEEL_STEP_CSS: f32 = 72.0;
 const SCROLLING_ANIMATION_DURATION_MS: i64 = 150;
 const SCROLLING_ANIMATION_MAX_STEP_MS: i64 = 50;
@@ -187,7 +186,7 @@ pub fn handlePaletteWheel(state: *runtime.AppState, x: f32, y: f32, wheel_x: f32
     if (!rectContains(last_workspace_rect, x, y)) return false;
     if (state.project_controller.projects.items.len == 0) return false;
     const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
-    if (!scrollingLayoutActive(layout)) return false;
+    if (!scrollingLayoutActive(state, layout)) return false;
 
     const delta = scrollingWheelDelta(state.app_config.workspace_scroll_direction, wheel_x, wheel_y, ctrl_held) orelse return false;
     const target: *f32 = switch (state.app_config.workspace_scroll_direction) {
@@ -271,7 +270,7 @@ pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool 
         return state.clearCurrentProjectWorkspacePaneMaximized();
     }
 
-    if (scrollingLayoutActive(layout)) {
+    if (scrollingLayoutActive(state, layout)) {
         const direction = scrollingPaneDirection(state.app_config.workspace_scroll_direction, dir) orelse return false;
         const target = layout.adjacentTiledPaneIdInSidebarOrder(current_id, direction) orelse return false;
         return state.focusCurrentProjectWorkspacePane(target);
@@ -458,7 +457,7 @@ pub fn growPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
     if (pane_rect_count == 0) return false;
     if (state.project_controller.projects.items.len == 0) return false;
     const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
-    if (scrollingLayoutActive(layout)) return false;
+    if (scrollingLayoutActive(state, layout)) return false;
     const current_id = layout.focused_pane_id orelse return false;
 
     var current_rect: ?palette.Rect = null;
@@ -505,7 +504,7 @@ pub fn movePaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
     const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
     const current_id = layout.focused_pane_id orelse return false;
 
-    if (scrollingLayoutActive(layout)) {
+    if (scrollingLayoutActive(state, layout)) {
         const direction = scrollingPaneDirection(state.app_config.workspace_scroll_direction, dir) orelse return false;
         const target = layout.adjacentTiledPaneIdInSidebarOrder(current_id, direction) orelse return false;
         if (!state.swapCurrentProjectWorkspacePanes(current_id, target)) return false;
@@ -619,7 +618,7 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
         renderLeaf(state, pane_id, rect);
     } else if (state.currentProjectWorkspaceRoot()) |root| {
         const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
-        if (scrollingLayoutActive(layout)) {
+        if (scrollingLayoutActive(state, layout)) {
             renderScrollingStrip(state, layout, rect);
         } else {
             renderNode(state, root, rect);
@@ -1115,8 +1114,22 @@ fn threadDropTargetForPane(pane_id: runtime.WorkspacePaneId, rect: palette.Rect,
     return .{ .pane_id = pane_id, .axis = .horizontal, .new_after = after, .preview = preview };
 }
 
-fn scrollingLayoutActive(layout: *const runtime.WorkspaceLayout) bool {
-    return layout.maximized_pane_id == null and layout.visiblePaneCount() >= SCROLLING_LAYOUT_PANE_THRESHOLD;
+fn scrollingLayoutActive(state: *const runtime.AppState, layout: *const runtime.WorkspaceLayout) bool {
+    return scrollingLayoutEnabled(
+        state.app_config.workspace_scroll_mode,
+        state.app_config.workspace_scroll_threshold,
+        layout.visiblePaneCount(),
+        layout.maximized_pane_id != null,
+    );
+}
+
+fn scrollingLayoutEnabled(mode: app_config.WorkspaceScrollMode, threshold: u8, visible_pane_count: usize, maximized: bool) bool {
+    if (maximized or visible_pane_count == 0) return false;
+    return switch (mode) {
+        .automatic => visible_pane_count >= @as(usize, threshold),
+        .always => true,
+        .disabled => false,
+    };
 }
 
 // Configurable-axis workspace strip with focus-aware reveal and clipping.
@@ -1827,6 +1840,15 @@ test "scrolling pane extent fits the configured panes per view" {
         const count_f: f32 = @floatFromInt(count);
         try std.testing.expectApproxEqAbs(viewport_extent, pane_extent * count_f + gap * (count_f - 1.0), 0.001);
     }
+}
+
+test "scrolling layout policy supports automatic always and disabled modes" {
+    try std.testing.expect(!scrollingLayoutEnabled(.automatic, 4, 3, false));
+    try std.testing.expect(scrollingLayoutEnabled(.automatic, 4, 4, false));
+    try std.testing.expect(scrollingLayoutEnabled(.always, 64, 1, false));
+    try std.testing.expect(!scrollingLayoutEnabled(.disabled, 1, 8, false));
+    try std.testing.expect(!scrollingLayoutEnabled(.always, 1, 0, false));
+    try std.testing.expect(!scrollingLayoutEnabled(.always, 1, 4, true));
 }
 
 test "scrolling focus direction follows the configured axis" {

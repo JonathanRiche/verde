@@ -19,6 +19,11 @@ pub const Control = enum(u8) {
     workspace_pane_gap_inc,
     workspace_panes_per_view_dec,
     workspace_panes_per_view_inc,
+    workspace_scroll_mode_automatic,
+    workspace_scroll_mode_always,
+    workspace_scroll_mode_disabled,
+    workspace_scroll_threshold_dec,
+    workspace_scroll_threshold_inc,
     workspace_scroll_horizontal,
     workspace_scroll_vertical,
     theme_dropdown,
@@ -161,6 +166,13 @@ const SettingsLayout = struct {
     workspace_panes_per_view_dec: palette.Rect,
     workspace_panes_per_view_inc: palette.Rect,
     workspace_panes_per_view_hint_y: f32,
+    workspace_scroll_mode_automatic: palette.Rect,
+    workspace_scroll_mode_always: palette.Rect,
+    workspace_scroll_mode_disabled: palette.Rect,
+    workspace_scroll_mode_hint_y: f32,
+    workspace_scroll_threshold_dec: palette.Rect,
+    workspace_scroll_threshold_inc: palette.Rect,
+    workspace_scroll_threshold_hint_y: f32,
     workspace_scroll_horizontal: palette.Rect,
     workspace_scroll_vertical: palette.Rect,
     workspace_scroll_direction_hint_y: f32,
@@ -290,6 +302,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra +
         m.row_gap + m.label_h + m.inner_gap + m.row_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h +
+        m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h +
+        m.row_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
@@ -449,7 +463,17 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const file_links_y = file_links_label_y + m.label_h + m.inner_gap;
     const file_links_neovim_pane: palette.Rect = .{ .x = open_x, .y = file_links_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const file_links_hint_y = file_links_y + m.row_h + m.inner_gap;
-    const workspace_pane_gap_y = file_links_hint_y + m.label_h + m.row_gap;
+    const workspace_scroll_mode_label_y = file_links_hint_y + m.label_h + m.row_gap;
+    const workspace_scroll_mode_y = workspace_scroll_mode_label_y + m.label_h + m.inner_gap;
+    const workspace_scroll_mode_w = (content_w - m.card_pad * 2.0) / 3.0;
+    const workspace_scroll_mode_automatic: palette.Rect = .{ .x = open_x, .y = workspace_scroll_mode_y, .w = workspace_scroll_mode_w, .h = m.row_h };
+    const workspace_scroll_mode_always: palette.Rect = .{ .x = workspace_scroll_mode_automatic.x + workspace_scroll_mode_w, .y = workspace_scroll_mode_y, .w = workspace_scroll_mode_w, .h = m.row_h };
+    const workspace_scroll_mode_disabled: palette.Rect = .{ .x = workspace_scroll_mode_always.x + workspace_scroll_mode_w, .y = workspace_scroll_mode_y, .w = workspace_scroll_mode_w, .h = m.row_h };
+    const workspace_scroll_mode_hint_y = workspace_scroll_mode_y + m.row_h + m.inner_gap;
+    const workspace_scroll_threshold_y = workspace_scroll_mode_hint_y + m.label_h + m.row_gap;
+    const workspace_scroll_threshold_stepper = stepperRects(workspace_card, m.card_pad, workspace_scroll_threshold_y, m);
+    const workspace_scroll_threshold_hint_y = workspace_scroll_threshold_y + m.row_h + m.inner_gap;
+    const workspace_pane_gap_y = workspace_scroll_threshold_hint_y + m.label_h + m.row_gap;
     const workspace_pane_gap_stepper = stepperRects(workspace_card, m.card_pad, workspace_pane_gap_y, m);
     const workspace_pane_gap_hint_y = workspace_pane_gap_y + m.row_h + m.inner_gap;
     const workspace_panes_per_view_y = workspace_pane_gap_hint_y + m.label_h + m.row_gap;
@@ -562,6 +586,13 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .workspace_panes_per_view_dec = workspace_panes_per_view_stepper.dec,
         .workspace_panes_per_view_inc = workspace_panes_per_view_stepper.inc,
         .workspace_panes_per_view_hint_y = workspace_panes_per_view_hint_y,
+        .workspace_scroll_mode_automatic = workspace_scroll_mode_automatic,
+        .workspace_scroll_mode_always = workspace_scroll_mode_always,
+        .workspace_scroll_mode_disabled = workspace_scroll_mode_disabled,
+        .workspace_scroll_mode_hint_y = workspace_scroll_mode_hint_y,
+        .workspace_scroll_threshold_dec = workspace_scroll_threshold_stepper.dec,
+        .workspace_scroll_threshold_inc = workspace_scroll_threshold_stepper.inc,
+        .workspace_scroll_threshold_hint_y = workspace_scroll_threshold_hint_y,
         .workspace_scroll_horizontal = workspace_scroll_horizontal,
         .workspace_scroll_vertical = workspace_scroll_vertical,
         .workspace_scroll_direction_hint_y = workspace_scroll_direction_hint_y,
@@ -750,6 +781,11 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.new_chat_new_pane, layout.body_clip, .new_chat_new_pane, queue_hit);
     queueControlHit(state, layout.new_chat_replace_pane, layout.body_clip, .new_chat_replace_pane, queue_hit);
     queueControlHit(state, layout.file_links_neovim_pane, layout.body_clip, .file_links_neovim_pane, queue_hit);
+    queueControlHit(state, layout.workspace_scroll_mode_automatic, layout.body_clip, .workspace_scroll_mode_automatic, queue_hit);
+    queueControlHit(state, layout.workspace_scroll_mode_always, layout.body_clip, .workspace_scroll_mode_always, queue_hit);
+    queueControlHit(state, layout.workspace_scroll_mode_disabled, layout.body_clip, .workspace_scroll_mode_disabled, queue_hit);
+    queueControlHit(state, layout.workspace_scroll_threshold_dec, layout.body_clip, .workspace_scroll_threshold_dec, queue_hit);
+    queueControlHit(state, layout.workspace_scroll_threshold_inc, layout.body_clip, .workspace_scroll_threshold_inc, queue_hit);
     queueControlHit(state, layout.workspace_pane_gap_dec, layout.body_clip, .workspace_pane_gap_dec, queue_hit);
     queueControlHit(state, layout.workspace_pane_gap_inc, layout.body_clip, .workspace_pane_gap_inc, queue_hit);
     queueControlHit(state, layout.workspace_panes_per_view_dec, layout.body_clip, .workspace_panes_per_view_dec, queue_hit);
@@ -927,6 +963,39 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .w = layout.file_links_neovim_pane.w,
         .h = m.label_h,
     }, "Used only when Neovim is the configured editor; otherwise uses the default file action", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+    queueText(state, .{
+        .x = layout.workspace_scroll_mode_automatic.x,
+        .y = layout.workspace_scroll_mode_automatic.y - m.inner_gap - m.label_h,
+        .w = layout.workspace_scroll_mode_automatic.w + layout.workspace_scroll_mode_always.w + layout.workspace_scroll_mode_disabled.w,
+        .h = m.label_h,
+    }, "Scrolling layout", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    drawSegmentedTriple(
+        state,
+        layout.workspace_scroll_mode_automatic,
+        layout.workspace_scroll_mode_always,
+        layout.workspace_scroll_mode_disabled,
+        .{ "Automatic", "Always", "Disabled" },
+        @intFromEnum(state.settings_controller.draft.workspace_scroll_mode),
+        .{
+            isControlHovered(state, .workspace_scroll_mode_automatic),
+            isControlHovered(state, .workspace_scroll_mode_always),
+            isControlHovered(state, .workspace_scroll_mode_disabled),
+        },
+        layout.body_clip,
+    );
+    queueText(state, .{
+        .x = layout.workspace_card.x + m.card_pad,
+        .y = layout.workspace_scroll_mode_hint_y,
+        .w = layout.workspace_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, "Automatic uses the threshold; Always pins scrolling; Disabled keeps tiled layout", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+    drawStepperRow(state, layout.workspace_card, m, layout.workspace_scroll_threshold_dec.y, "Activation threshold", @floatFromInt(state.settings_controller.draft.workspace_scroll_threshold), @floatFromInt(app_config.MIN_WORKSPACE_SCROLL_THRESHOLD), @floatFromInt(app_config.MAX_WORKSPACE_SCROLL_THRESHOLD), .workspace_scroll_threshold_dec, .workspace_scroll_threshold_inc, layout.workspace_scroll_threshold_dec, layout.workspace_scroll_threshold_inc, layout.body_clip);
+    queueText(state, .{
+        .x = layout.workspace_card.x + m.card_pad,
+        .y = layout.workspace_scroll_threshold_hint_y,
+        .w = layout.workspace_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, "In Automatic mode, scrolling starts when the workspace reaches this pane count", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
     drawStepperRow(state, layout.workspace_card, m, layout.workspace_pane_gap_dec.y, "Pane spacing (px)", state.settings_controller.draft.workspace_pane_gap, app_config.MIN_WORKSPACE_PANE_GAP, app_config.MAX_WORKSPACE_PANE_GAP, .workspace_pane_gap_dec, .workspace_pane_gap_inc, layout.workspace_pane_gap_dec, layout.workspace_pane_gap_inc, layout.body_clip);
     queueText(state, .{
         .x = layout.workspace_card.x + m.card_pad,
@@ -1194,6 +1263,15 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         },
         .workspace_panes_per_view_inc => {
             if (state.settings_controller.draft.workspace_panes_per_view < app_config.MAX_WORKSPACE_PANES_PER_VIEW) state.settings_controller.draft.workspace_panes_per_view += 1;
+        },
+        .workspace_scroll_mode_automatic => state.settings_controller.draft.workspace_scroll_mode = .automatic,
+        .workspace_scroll_mode_always => state.settings_controller.draft.workspace_scroll_mode = .always,
+        .workspace_scroll_mode_disabled => state.settings_controller.draft.workspace_scroll_mode = .disabled,
+        .workspace_scroll_threshold_dec => {
+            if (state.settings_controller.draft.workspace_scroll_threshold > app_config.MIN_WORKSPACE_SCROLL_THRESHOLD) state.settings_controller.draft.workspace_scroll_threshold -= 1;
+        },
+        .workspace_scroll_threshold_inc => {
+            if (state.settings_controller.draft.workspace_scroll_threshold < app_config.MAX_WORKSPACE_SCROLL_THRESHOLD) state.settings_controller.draft.workspace_scroll_threshold += 1;
         },
         .workspace_scroll_horizontal => state.settings_controller.draft.workspace_scroll_direction = .horizontal,
         .workspace_scroll_vertical => state.settings_controller.draft.workspace_scroll_direction = .vertical,
@@ -1835,6 +1913,37 @@ fn drawSegmentedPair(
     const right_color = if (!left_selected or right_hovered) theme.COLOR_WHITE else textLabel();
     queueCenteredText(state, left, left_label, paletteColor(left_color), theme.scaledUi(13.0), clip);
     queueCenteredText(state, right, right_label, paletteColor(right_color), theme.scaledUi(13.0), clip);
+}
+
+// Three-option exclusive choice rendered as one segmented control.
+fn drawSegmentedTriple(
+    state: *runtime.AppState,
+    first: palette.Rect,
+    second: palette.Rect,
+    third: palette.Rect,
+    labels: [3][]const u8,
+    selected_index: usize,
+    hovered: [3]bool,
+    clip: palette.Rect,
+) void {
+    const segments = [3]palette.Rect{ first, second, third };
+    const container: palette.Rect = .{ .x = first.x, .y = first.y, .w = first.w + second.w + third.w, .h = first.h };
+    queueRoundedRectClipped(state, container, paletteColor(controlSurface()), radiusSm(), clip);
+    queueBorderClipped(state, container, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 26)), radiusSm(), theme.scaledUi(1.0), clip);
+
+    for (segments, 0..) |segment, index| {
+        if (hovered[index] and index != selected_index) {
+            queueRoundedRectClipped(state, segment, paletteColor(controlHoverSurface()), radiusSm(), clip);
+        }
+    }
+    const selected = segments[@min(selected_index, segments.len - 1)];
+    queueRoundedRectClipped(state, selected, paletteColor(theme.withAlpha(theme.accent(), 44)), radiusSm(), clip);
+    queueBorderClipped(state, selected, paletteColor(theme.withAlpha(theme.accent(), 150)), radiusSm(), theme.scaledUi(1.0), clip);
+
+    for (segments, labels, 0..) |segment, label, index| {
+        const color = if (index == selected_index or hovered[index]) theme.COLOR_WHITE else textLabel();
+        queueCenteredText(state, segment, label, paletteColor(color), theme.scaledUi(13.0), clip);
+    }
 }
 
 const ButtonStyle = enum { primary, secondary, disabled };

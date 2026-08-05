@@ -112,6 +112,9 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "pane.quick_minimize", .title = "Minimize Quick Pane", .keywords = "hide floating overlay", .section = .panes, .run = runMinimizeQuickPane, .enabled = hasQuickPane },
     .{ .id = "pane.quick_pin", .title = "Pin or Unpin Quick Pane", .keywords = "floating dim backdrop", .section = .panes, .run = runPinQuickPane, .enabled = hasQuickPane },
     .{ .id = "pane.quick_tile", .title = "Return Quick Pane to Tile", .keywords = "dock floating", .section = .panes, .run = runTileQuickPane, .enabled = hasQuickPane },
+    .{ .id = "workspace.scrolling_automatic", .title = "Scrolling Layout: Automatic", .keywords = "niri panes mode threshold tiled", .section = .workspaces, .run = runScrollingAutomatic },
+    .{ .id = "workspace.scrolling_always", .title = "Scrolling Layout: Always", .keywords = "niri panes mode pin enable", .section = .workspaces, .run = runScrollingAlways },
+    .{ .id = "workspace.scrolling_disabled", .title = "Scrolling Layout: Disabled", .keywords = "niri panes mode tiled off disable", .section = .workspaces, .run = runScrollingDisabled },
     .{ .id = "workspace.add", .title = "Add Workspace", .keywords = "new project folder directory", .section = .workspaces, .run = runAddWorkspace },
     .{ .id = "workspace.rename", .title = "Rename Workspace", .keywords = "label", .section = .workspaces, .run = runRenameWorkspace, .enabled = hasProjects },
     .{ .id = "workspace.close", .title = "Close Workspace", .keywords = "archive remove project save state", .section = .workspaces, .run = runCloseWorkspace, .enabled = workspaceNotBusy },
@@ -1328,6 +1331,18 @@ fn runTileQuickPane(state: *runtime.AppState) void {
     _ = state.returnCurrentProjectQuickPaneToTile();
 }
 
+fn runScrollingAutomatic(state: *runtime.AppState) void {
+    state.setWorkspaceScrollMode(.automatic);
+}
+
+fn runScrollingAlways(state: *runtime.AppState) void {
+    state.setWorkspaceScrollMode(.always);
+}
+
+fn runScrollingDisabled(state: *runtime.AppState) void {
+    state.setWorkspaceScrollMode(.disabled);
+}
+
 fn runAddWorkspace(state: *runtime.AppState) void {
     state.project_controller.show_creator = true;
     state.setSidebarCollapsed(false);
@@ -1936,6 +1951,24 @@ fn queueRoleText(state: *runtime.AppState, rect: palette.Rect, value: []const u8
     ) catch |err| {
         log.warn("failed to queue palette role text: {s}", .{@errorName(err)});
     };
+}
+
+test "static commands expose scrolling layout quick toggles" {
+    const expected_ids = [_][]const u8{
+        "workspace.scrolling_automatic",
+        "workspace.scrolling_always",
+        "workspace.scrolling_disabled",
+    };
+    for (expected_ids) |expected_id| {
+        var found = false;
+        for (STATIC_COMMANDS) |command| {
+            if (std.mem.eql(u8, command.id, expected_id)) {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
 }
 
 test "fuzzyScore ranks substring above subsequence and rejects non-matches" {

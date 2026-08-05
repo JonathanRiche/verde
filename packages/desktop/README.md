@@ -104,7 +104,7 @@ App state is stored through SDL's pref path in `state.sqlite`. User config is lo
 
 On Omarchy systems, Palette UI colors are loaded from Omarchy-compatible `colors.toml` files. Set `VERDE_OMARCHY_COLORS` to a specific file for testing, use the active Omarchy theme at `$XDG_CONFIG_HOME/omarchy/current/theme/colors.toml`, or place a theme at `$XDG_CONFIG_HOME/omarchy/themes/verde/colors.toml` / `~/.config/omarchy/themes/verde/colors.toml`. Verde maps `background`, `foreground`, `accent`, `selection_background`, and `color0` through `color8` into semantic UI tokens and keeps built-in fallbacks for missing keys. `theme.colors` in `verde.json` can override those tokens; omit `theme.theme` to keep Omarchy auto-detection, or set it to `"default"` to start from Verde's built-in colors.
 
-Config supports UI and terminal font size, scrolling-pane spacing, keybind overrides, and the default action behind the main `Open` button plus `Alt+O`.
+Config supports UI and terminal font size, scrolling-pane activation and spacing, keybind overrides, and the default action behind the main `Open` button plus `Alt+O`.
 
 ```json
 {
@@ -119,7 +119,9 @@ Config supports UI and terminal font size, scrolling-pane spacing, keybind overr
     "font_size": 20,
     "workspace_pane_gap": 12,
     "workspace_panes_per_view": 2,
-    "workspace_scroll_direction": "horizontal"
+    "workspace_scroll_direction": "horizontal",
+    "workspace_scroll_mode": "automatic",
+    "workspace_scroll_threshold": 2
   },
   "terminal": {
     "font_size": 18

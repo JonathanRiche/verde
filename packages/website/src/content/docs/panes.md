@@ -52,14 +52,21 @@ terminal.
 - `Alt+1 … Alt+9, Alt+0` — jump between workspaces by sidebar order.
 - `Alt+↑ / Alt+↓` — cycle to the previous / next workspace.
 
-With two or more tiled panes, Verde presents panes as a scrolling strip in the
-same order shown in the sidebar. **Settings → Workspace → Scroll direction**
-chooses a horizontal strip (the default) or vertical strip. **Panes per view**
-controls how many panes fit along that axis (1–6, default 2), and **Pane
-spacing** controls their gap. Focus movement smoothly reveals the next hidden
-pane, while manual strip scrolling can leave focus off-screen. Horizontal and
-vertical positions are restored independently per workspace; zoom temporarily
-fills the workspace without changing either saved position.
+By default, Verde automatically switches to a scrolling strip when a workspace
+reaches two tiled panes, keeping the same order shown in the sidebar. **Settings
+→ Workspace → Scrolling layout** can keep that automatic behavior, pin the
+scrolling layout with **Always**, or retain the split tree with **Disabled**.
+**Activation threshold** changes the automatic trigger from 1–64 panes.
+The command palette also exposes **Scrolling Layout: Automatic**, **Always**,
+and **Disabled** for immediate policy changes without opening Settings.
+
+**Scroll direction** chooses a horizontal strip (the default) or vertical
+strip. **Panes per view** controls how many panes fit along that axis (1–6,
+default 2), and **Pane spacing** controls their gap. Focus movement smoothly
+reveals the next hidden pane, while manual strip scrolling can leave focus
+off-screen. Horizontal and vertical positions are restored independently per
+workspace; zoom temporarily fills the workspace without changing either saved
+position or the selected scrolling policy.
 
 ## Resizing
 
