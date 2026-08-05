@@ -799,7 +799,7 @@ fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
 
 fn systemCursorForCompanionAction(action: companion_controller.HitAction) sdl.SystemCursor {
     return switch (action) {
-        .open, .collapse, .run_tab, .activity_tab, .approve, .deny => .pointer,
+        .open, .collapse, .run_tab, .activity_tab, .approve, .deny, .operation_select, .operation_stop, .operation_follow_log => .pointer,
         .panel, .body => .default,
     };
 }
@@ -862,7 +862,7 @@ test "browser cursor shapes map to cached SDL system cursor families" {
 }
 
 test "production Companion cursor and wheel routing preserves direct ownership" {
-    const interactive = [_]companion_controller.HitAction{ .open, .collapse, .run_tab, .activity_tab, .approve, .deny };
+    const interactive = [_]companion_controller.HitAction{ .open, .collapse, .run_tab, .activity_tab, .approve, .deny, .operation_select, .operation_stop, .operation_follow_log };
     for (interactive) |action| try std.testing.expectEqual(sdl.SystemCursor.pointer, systemCursorForCompanionAction(action));
     try std.testing.expectEqual(sdl.SystemCursor.default, systemCursorForCompanionAction(.panel));
     try std.testing.expectEqual(sdl.SystemCursor.default, systemCursorForCompanionAction(.body));
