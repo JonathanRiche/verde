@@ -972,6 +972,23 @@ test "thread-addressed prompt staging is transactional and alias safe" {
     try std.testing.expectEqualStrings("/tmp/prior.png", thread.draft_image.?.path);
 }
 
+test "thread-addressed prompt snapshot restores an existing user draft" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Visible chat");
+    defer thread.deinit(allocator);
+    thread.setDraft("still typing");
+    try thread.setDraftImage(allocator, "/tmp/user-draft.png", "image/png", 17);
+
+    var snapshot = try ThreadDraftSnapshot.init(allocator, &thread);
+    defer snapshot.deinit(allocator);
+    try stageThreadPrompt(allocator, &thread, "background prompt", &.{});
+    snapshot.restore(allocator, &thread);
+
+    try std.testing.expectEqualStrings("still typing", thread.currentDraft());
+    try std.testing.expectEqual(@as(usize, 1), thread.draftImageCount());
+    try std.testing.expectEqualStrings("/tmp/user-draft.png", thread.draft_image.?.path);
+}
+
 test "prospective prompt preflight rejects before thread staging" {
     const allocator = std.testing.allocator;
     const FakeState = struct {
@@ -1313,10 +1330,44 @@ pub fn sendThreadPrompt(
     const resolved = self.projectThreadIndexByLocalId(workspace_id, local_thread_id) orelse return false;
     const thread = &self.project_controller.projects.items[resolved.project_index].threads.items[resolved.thread_index];
     if (!try self.preflightThreadPrompt(resolved.project_index, thread, prompt, images)) return false;
+    var previous_draft = try ThreadDraftSnapshot.init(self.allocator, thread);
+    defer previous_draft.deinit(self.allocator);
+    defer previous_draft.restore(self.allocator, thread);
     try stageThreadPrompt(self.allocator, thread, prompt, images);
     self.markDirty();
-    return try self.sendThreadDraft(resolved.project_index, resolved.thread_index);
+    return try sendThreadDraftWithUiPolicy(self, resolved.project_index, resolved.thread_index, false);
 }
+
+const ThreadDraftSnapshot = struct {
+    storage: [chat_types.DRAFT_CAPACITY:0]u8,
+    images: std.ArrayList(ChatImageAttachment) = .empty,
+
+    fn init(allocator: std.mem.Allocator, thread: *const ChatThread) !ThreadDraftSnapshot {
+        var snapshot: ThreadDraftSnapshot = .{ .storage = thread.draft_storage };
+        errdefer snapshot.deinit(allocator);
+        try snapshot.images.ensureTotalCapacity(allocator, thread.draftImageCount());
+        if (thread.draft_image) |image| {
+            snapshot.images.appendAssumeCapacity(try ChatImageAttachment.init(allocator, image.path, image.mime, image.byte_size));
+        }
+        for (thread.draft_extra_images.items) |image| {
+            snapshot.images.appendAssumeCapacity(try ChatImageAttachment.init(allocator, image.path, image.mime, image.byte_size));
+        }
+        return snapshot;
+    }
+
+    fn restore(self: *ThreadDraftSnapshot, allocator: std.mem.Allocator, thread: *ChatThread) void {
+        thread.clearDraftImage(allocator);
+        thread.draft_storage = self.storage;
+        if (self.images.items.len == 0) return;
+        thread.draft_image = self.images.orderedRemove(0);
+        std.mem.swap(std.ArrayList(ChatImageAttachment), &thread.draft_extra_images, &self.images);
+    }
+
+    fn deinit(self: *ThreadDraftSnapshot, allocator: std.mem.Allocator) void {
+        for (self.images.items) |*image| image.deinit(allocator);
+        self.images.deinit(allocator);
+    }
+};
 
 fn stageThreadPrompt(allocator: std.mem.Allocator, thread: *ChatThread, prompt: []const u8, images: []const ChatImageAttachment) !void {
     var staged_images: std.ArrayList(ChatImageAttachment) = .empty;
@@ -1341,10 +1392,15 @@ fn stageThreadPrompt(allocator: std.mem.Allocator, thread: *ChatThread, prompt: 
 }
 
 pub fn sendThreadDraft(self: anytype, project_index: usize, thread_index: usize) !bool {
+    return sendThreadDraftWithUiPolicy(self, project_index, thread_index, true);
+}
+
+/// Sends one thread's staged draft while optionally updating the selected composer and scroll position.
+pub fn sendThreadDraftWithUiPolicy(self: anytype, project_index: usize, thread_index: usize, update_selected_ui: bool) !bool {
     if (project_index >= self.project_controller.projects.items.len) return error.WorkspaceNotFound;
     const project = &self.project_controller.projects.items[project_index];
     if (thread_index >= project.threads.items.len) return error.ThreadNotFound;
-    const selected_target = project_index == self.project_controller.selected_index and thread_index == project.currentThreadIndex();
+    const selected_target = update_selected_ui and project_index == self.project_controller.selected_index and thread_index == project.currentThreadIndex();
     const thread = &project.threads.items[thread_index];
     const draft = thread.currentDraft();
     const draft_image = thread.draft_image;
@@ -1502,6 +1558,36 @@ pub fn queueOrSteerDraftDuringSend(self: anytype) void {
         .cursor => .queue,
     };
     self.storeDraftDuringSend(kind);
+}
+
+/// Stores a follow-up for an explicitly addressed thread without selecting it in the desktop UI.
+pub fn storeThreadFollowupPrompt(self: anytype, project_index: usize, thread_index: usize, prompt: []const u8) bool {
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    const project = &self.project_controller.projects.items[project_index];
+    if (thread_index >= project.threads.items.len) return false;
+    const thread = &project.threads.items[thread_index];
+    if (!thread.isSendPending()) return false;
+    if (std.mem.trim(u8, prompt, &std.ascii.whitespace).len == 0) return false;
+
+    const kind: FollowupKind = switch (thread.provider) {
+        .codex => .steer,
+        .opencode, .claude, .cursor => .queue,
+    };
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+
+    const owned_prompt = self.allocator.dupe(u8, prompt) catch return false;
+    freePendingFollowup(self.allocator, &send_state.pending_followup);
+    send_state.pending_followup_signal_sent = false;
+    send_state.pending_followup = .{
+        .kind = kind,
+        .state = .pending,
+        .prompt = owned_prompt,
+    };
+    send_state.ui_revision +%= 1;
+    self.markDirty();
+    return true;
 }
 
 /// Queues the current composer draft as a new turn after the active reply.

@@ -13,6 +13,7 @@ const platform_runtime = @import("platform_runtime");
 const log = std.log.scoped(.native_shell);
 
 const ChatThread = chat_types.ChatThread;
+const ChatImageAttachment = chat_types.ChatImageAttachment;
 const Provider = provider_models.Provider;
 const ReasoningEffort = provider_models.ReasoningEffort;
 const FastMode = provider_models.FastMode;
@@ -625,17 +626,16 @@ pub fn setWorkspaceChatPaneDraft(self: anytype, pane_id: WorkspacePaneId, value:
 
 pub fn sendWorkspaceChatPanePromptForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId, prompt: ?[]const u8) !bool {
     if (project_index >= self.project_controller.projects.items.len) return false;
-    const snapshot = self.captureViewFocusSnapshot();
-    const restore_view = project_index != snapshot.selected_project_index;
-    if (restore_view) self.project_controller.selected_index = project_index;
-    defer if (restore_view) self.restoreViewFocusSnapshot(snapshot);
-
-    if (prompt) |text| {
-        if (!try self.setWorkspaceChatPaneDraft(pane_id, text, false)) return false;
-    } else if (!self.selectWorkspaceChatPaneThread(pane_id)) return false;
-
-    try self.sendDraft();
-    return true;
+    const project = &self.project_controller.projects.items[project_index];
+    const pane = project.workspace_layout.paneById(pane_id) orelse return false;
+    const thread_index = switch (pane.ref) {
+        .chat => |ref| ref.thread_index,
+        else => return false,
+    };
+    if (thread_index >= project.threads.items.len) return false;
+    const thread = &project.threads.items[thread_index];
+    if (prompt) |text| return try self.sendThreadPrompt(project.id, thread.local_thread_id, text, &.{});
+    return try self.sendThreadDraft(project_index, thread_index);
 }
 
 pub fn sendWorkspaceChatPanePrompt(self: anytype, pane_id: WorkspacePaneId, prompt: ?[]const u8) !bool {
@@ -645,14 +645,13 @@ pub fn sendWorkspaceChatPanePrompt(self: anytype, pane_id: WorkspacePaneId, prom
 
 pub fn followupWorkspaceChatPanePromptForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId, prompt: []const u8) !bool {
     if (project_index >= self.project_controller.projects.items.len) return false;
-    const snapshot = self.captureViewFocusSnapshot();
-    const restore_view = project_index != snapshot.selected_project_index;
-    if (restore_view) self.project_controller.selected_index = project_index;
-    defer if (restore_view) self.restoreViewFocusSnapshot(snapshot);
-
-    if (!try self.setWorkspaceChatPaneDraft(pane_id, prompt, false)) return false;
-    self.queueOrSteerDraftDuringSend();
-    return true;
+    const project = &self.project_controller.projects.items[project_index];
+    const pane = project.workspace_layout.paneById(pane_id) orelse return false;
+    const thread_index = switch (pane.ref) {
+        .chat => |ref| ref.thread_index,
+        else => return false,
+    };
+    return self.storeThreadFollowupPrompt(project_index, thread_index, prompt);
 }
 
 pub fn followupWorkspaceChatPanePrompt(self: anytype, pane_id: WorkspacePaneId, prompt: []const u8) !bool {
@@ -662,14 +661,14 @@ pub fn followupWorkspaceChatPanePrompt(self: anytype, pane_id: WorkspacePaneId, 
 
 pub fn stopWorkspaceChatPaneForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId) bool {
     if (project_index >= self.project_controller.projects.items.len) return false;
-    const snapshot = self.captureViewFocusSnapshot();
-    const restore_view = project_index != snapshot.selected_project_index;
-    if (restore_view) self.project_controller.selected_index = project_index;
-    defer if (restore_view) self.restoreViewFocusSnapshot(snapshot);
-
-    if (!self.selectWorkspaceChatPaneThread(pane_id)) return false;
-    self.abortCurrentThreadSend();
-    return true;
+    const project = &self.project_controller.projects.items[project_index];
+    const pane = project.workspace_layout.paneById(pane_id) orelse return false;
+    const thread_index = switch (pane.ref) {
+        .chat => |ref| ref.thread_index,
+        else => return false,
+    };
+    if (thread_index >= project.threads.items.len) return false;
+    return self.abortThreadByLocalId(project.id, project.threads.items[thread_index].local_thread_id);
 }
 
 pub fn stopWorkspaceChatPane(self: anytype, pane_id: WorkspacePaneId) bool {
@@ -679,14 +678,14 @@ pub fn stopWorkspaceChatPane(self: anytype, pane_id: WorkspacePaneId) bool {
 
 pub fn approveWorkspaceChatPaneForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId, decision: ai_harness.ApprovalDecision) bool {
     if (project_index >= self.project_controller.projects.items.len) return false;
-    const snapshot = self.captureViewFocusSnapshot();
-    const restore_view = project_index != snapshot.selected_project_index;
-    if (restore_view) self.project_controller.selected_index = project_index;
-    defer if (restore_view) self.restoreViewFocusSnapshot(snapshot);
-
-    if (!self.selectWorkspaceChatPaneThread(pane_id)) return false;
-    self.resolvePendingApproval(decision);
-    return true;
+    const project = &self.project_controller.projects.items[project_index];
+    const pane = project.workspace_layout.paneById(pane_id) orelse return false;
+    const thread_index = switch (pane.ref) {
+        .chat => |ref| ref.thread_index,
+        else => return false,
+    };
+    if (thread_index >= project.threads.items.len) return false;
+    return self.resolveThreadApprovalByLocalId(project.id, project.threads.items[thread_index].local_thread_id, decision);
 }
 
 pub fn approveWorkspaceChatPane(self: anytype, pane_id: WorkspacePaneId, decision: ai_harness.ApprovalDecision) bool {
@@ -1976,4 +1975,44 @@ pub fn currentProjectWorkspaceVisiblePaneCount(self: anytype) usize {
 pub fn currentProjectGridNewPanePlacement(self: anytype) ?WorkspacePanePlacement {
     if (self.project_controller.projects.items.len == 0) return null;
     return self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.gridNewPanePlacement();
+}
+
+test "addressed chat send does not change the visible workspace selection" {
+    const allocator = std.testing.allocator;
+    const FakeState = struct {
+        project_controller: struct {
+            projects: std.ArrayList(Project) = .empty,
+            selected_index: usize = 0,
+        } = .{},
+        send_calls: usize = 0,
+
+        pub fn sendThreadPrompt(self: *@This(), _: []const u8, _: []const u8, _: []const u8, _: []const ChatImageAttachment) !bool {
+            self.send_calls += 1;
+            return true;
+        }
+
+        pub fn sendThreadDraft(_: *@This(), _: usize, _: usize) !bool {
+            return true;
+        }
+    };
+
+    var state: FakeState = .{};
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+    var project = try Project.init(allocator, "background-send", "Background", "/tmp/background-send", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    const selected_thread_before = state.project_controller.projects.items[0].selected_thread_index;
+    const focused_pane_before = state.project_controller.projects.items[0].workspace_layout.focused_pane_id;
+    const target_pane_id = focused_pane_before orelse return error.MissingChatPane;
+
+    try std.testing.expect(try sendWorkspaceChatPanePromptForProject(&state, 0, target_pane_id, "background prompt"));
+    try std.testing.expectEqual(@as(usize, 1), state.send_calls);
+    try std.testing.expectEqual(@as(usize, 0), state.project_controller.selected_index);
+    try std.testing.expectEqual(selected_thread_before, state.project_controller.projects.items[0].selected_thread_index);
+    try std.testing.expectEqual(focused_pane_before, state.project_controller.projects.items[0].workspace_layout.focused_pane_id);
 }

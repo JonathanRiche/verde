@@ -3423,10 +3423,9 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTypedTool(&s, "list_panes", "List chat and terminal panes in a Verde workspace.", &.{
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
     });
-    try writeMcpTypedTool(&s, "open_chat", "Create a native GUI chat pane for a specific provider in an explicitly selected Verde workspace.", &OPEN_CHAT_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "open_chat", "Create a native GUI chat pane in an explicitly selected Verde workspace without changing the user's visible workspace or focus.", &OPEN_CHAT_MCP_INPUTS);
     try writeMcpTool(&s, "list_surfaces", "List registered live terminal control surfaces. Use list_panes for ordinary Verde terminal panes.");
     try writeMcpTool(&s, "inspect_surface", "Inspect one Verde terminal surface.");
-    try writeMcpTool(&s, "focus_surface", "Focus a Verde terminal surface.");
     try writeMcpTool(&s, "read_surface_screen", "Read the current screen text for a terminal surface pane.");
     try writeMcpTool(&s, "tail_surface_output", "Read recent terminal output for a surface pane.");
     try writeMcpTool(&s, "write_surface_text", "Write text to a terminal surface pane.");
@@ -3574,7 +3573,6 @@ const OPEN_CHAT_MCP_INPUTS = [_]McpToolInput{
     .{ .name = "fast_mode", .type_name = "boolean", .description = "Optional explicit Fast setting. Pass false to guarantee Fast is off." },
     .{ .name = "target_pane_id", .type_name = "integer", .description = "Optional pane beside which to place the chat; defaults to the workspace's focused pane." },
     .{ .name = "axis", .type_name = "string", .description = "Optional split axis: horizontal or vertical; defaults to horizontal." },
-    .{ .name = "focus", .type_name = "boolean", .description = "Whether to select the workspace and focus the new chat; defaults to true." },
 };
 
 const TERMINAL_KEY_MCP_INPUTS = [_]McpToolInput{
@@ -3807,10 +3805,6 @@ fn mcpToolsCall(
             if (mcpArgIsNonNull(arguments, "axis") and axis == null) {
                 return try mcpError(allocator, out, id_value, -32602, "open_chat axis must be a string");
             }
-            const focus = mcpArgBool(arguments, "focus");
-            if (mcpArgIsNonNull(arguments, "focus") and focus == null) {
-                return try mcpError(allocator, out, id_value, -32602, "open_chat focus must be a boolean");
-            }
             break :blk sendLiveRequestAlloc(allocator, io, "chat.open", .{
                 .workspace_id = workspace_id,
                 .provider = provider,
@@ -3820,7 +3814,7 @@ fn mcpToolsCall(
                 .fast_mode = creation_settings.fast_mode,
                 .target_pane_id = target_pane_id,
                 .axis = axis orelse "horizontal",
-                .focus = focus orelse true,
+                .focus = false,
             }, 1);
         }
         if (std.mem.eql(u8, tool_name, "list_workspaces")) {
@@ -3854,10 +3848,6 @@ fn mcpToolsCall(
         if (std.mem.eql(u8, tool_name, "inspect_surface")) {
             const session = session_id orelse return try mcpError(allocator, out, id_value, -32602, "inspect_surface requires session_id");
             break :blk sendLiveRequestAlloc(allocator, io, "surface.inspect", .{ .session_id = session }, 1);
-        }
-        if (std.mem.eql(u8, tool_name, "focus_surface")) {
-            const session = session_id orelse return try mcpError(allocator, out, id_value, -32602, "focus_surface requires session_id");
-            break :blk sendLiveRequestAlloc(allocator, io, "surface.focus", .{ .session_id = session }, 1);
         }
         if (std.mem.eql(u8, tool_name, "read_surface_screen")) {
             const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "read_surface_screen requires pane_id");
@@ -4966,6 +4956,9 @@ test "MCP open_chat schema and forwarding expose creation settings" {
             break;
         }
         try std.testing.expect(found);
+    }
+    for (OPEN_CHAT_MCP_INPUTS) |input| {
+        try std.testing.expect(!std.mem.eql(u8, input.name, "focus"));
     }
 
     const allocator = std.testing.allocator;
