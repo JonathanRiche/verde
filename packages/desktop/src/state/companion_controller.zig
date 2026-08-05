@@ -46,16 +46,21 @@ pub const HitAction = enum {
     activity_tab,
     approve,
     deny,
+    operation_select,
+    operation_stop,
+    operation_follow_log,
 };
 
 pub const Hit = struct {
     rect: palette.Rect,
     action: HitAction,
+    reference: ?OperationReference = null,
 };
 
 pub const PointerButtonResult = struct {
     consumed: bool = false,
     action: ?HitAction = null,
+    reference: ?OperationReference = null,
 };
 
 const PRESENTATION_TEXT_CAPACITY = 512;
@@ -285,6 +290,12 @@ pub const OperationReference = struct {
     category: OperationCategory,
     target: OperationTarget,
     actions: SupportedActions,
+
+    pub fn eql(self: *const OperationReference, other: *const OperationReference) bool {
+        return self.owner.eql(&other.owner) and self.identity.eql(&other.identity) and
+            self.category == other.category and std.meta.eql(self.target, other.target) and
+            std.meta.eql(self.actions, other.actions);
+    }
 };
 
 pub const OperationStatus = enum {
@@ -386,13 +397,18 @@ pub const Frame = struct {
     }
 
     pub fn containsReference(self: *const Frame, reference: *const OperationReference) bool {
-        if (!self.owner.eql(&reference.owner)) return false;
+        return self.operationForReference(reference) != null;
+    }
+
+    pub fn operationForReference(self: *const Frame, reference: *const OperationReference) ?*const Operation {
+        if (!self.owner.eql(&reference.owner)) return null;
         for (self.operations[0..self.operation_count]) |*operation| {
             if (!std.mem.eql(u8, operation.identity.slice(), reference.identity.slice())) continue;
-            return operation.category == reference.category and std.meta.eql(operation.target, reference.target) and
-                std.meta.eql(operation.actions, reference.actions);
+            if (operation.category != reference.category or !std.meta.eql(operation.target, reference.target) or
+                !std.meta.eql(operation.actions, reference.actions)) return null;
+            return operation;
         }
-        return false;
+        return null;
     }
 
     pub fn upsertOperation(self: *Frame, operation: Operation) void {
@@ -500,10 +516,11 @@ operation_count: usize = 3,
 approval_count: usize = 1,
 ui_error: ?[]const u8 = null,
 presentation: Presentation = .{},
+selected_operation: ?OperationReference = null,
 selected_tab: Tab = .run,
 frame_width: f32 = 0.0,
 frame_height: f32 = 0.0,
-hits: [10]Hit = undefined,
+hits: [80]Hit = undefined,
 hit_count: usize = 0,
 body_scroll_y: f32 = 0.0,
 activity_scroll_y: f32 = 0.0,
@@ -558,12 +575,13 @@ pub fn handlePointerButton(self: *Self, x: f32, y: f32, button: u8, down: bool) 
         return .{ .consumed = self.hitAt(x, y) != null };
     }
 
-    const action = self.hitAt(x, y) orelse return .{};
+    const hit = self.hitEntryAt(x, y) orelse return .{};
     if (self.pointer_captured_buttons[button]) return .{ .consumed = true };
     self.pointer_captured_buttons[button] = true;
     return .{
         .consumed = true,
-        .action = if (button == 1) action else null,
+        .action = if (button == 1) hit.action else null,
+        .reference = if (button == 1) hit.reference else null,
     };
 }
 
@@ -633,7 +651,10 @@ pub fn applyProjection(self: *Self, phase: RunPhase, needs_approval: bool, has_f
 }
 
 pub fn setFrame(self: *Self, frame: Frame) void {
-    const identity_changed = !std.mem.eql(u8, self.presentation.workspace_id.slice(), frame.workspace_id.slice()) or
+    const exact_owner_changed = self.presentation.owner.valid != frame.owner.valid or
+        (self.presentation.owner.valid and !self.presentation.owner.eql(&frame.owner));
+    const identity_changed = exact_owner_changed or
+        !std.mem.eql(u8, self.presentation.workspace_id.slice(), frame.workspace_id.slice()) or
         !std.mem.eql(u8, self.presentation.thread_id.slice(), frame.thread_id.slice());
     if (identity_changed) {
         self.selected_tab = .run;
@@ -642,8 +663,12 @@ pub fn setFrame(self: *Self, frame: Frame) void {
         self.activity_max_scroll = 0.0;
         self.activity_content_count = 0;
         self.activity_follow_tail = true;
+        self.selected_operation = null;
     }
     self.presentation = frame;
+    if (self.selected_operation) |*reference| {
+        if (!self.presentation.containsReference(reference)) self.selected_operation = null;
+    }
     self.applyProjection(
         if (frame.working) .working else .idle,
         frame.has_approval,
@@ -654,6 +679,29 @@ pub fn setFrame(self: *Self, frame: Frame) void {
 
 pub fn selectTab(self: *Self, tab: Tab) void {
     self.selected_tab = tab;
+}
+
+pub fn toggleOperationSelection(self: *Self, reference: OperationReference) void {
+    if (!reference.actions.inspect or !self.presentation.containsReference(&reference)) return;
+    if (self.selected_operation) |*selected| {
+        if (selected.eql(&reference)) {
+            self.selected_operation = null;
+            return;
+        }
+    }
+    self.selected_operation = reference;
+}
+
+pub fn selectedOperation(self: *const Self) ?*const Operation {
+    if (self.selected_operation) |*reference| return self.presentation.operationForReference(reference);
+    return null;
+}
+
+pub fn operationSelected(self: *const Self, reference: *const OperationReference) bool {
+    if (self.selected_operation) |*selected| {
+        return selected.eql(reference) and self.presentation.containsReference(selected);
+    }
+    return false;
 }
 
 pub fn currentScrollY(self: *const Self) f32 {
@@ -703,12 +751,24 @@ pub fn addHit(self: *Self, rect: palette.Rect, action: HitAction) void {
     self.hit_count += 1;
 }
 
+pub fn addOperationHit(self: *Self, rect: palette.Rect, action: HitAction, reference: OperationReference) void {
+    std.debug.assert(action == .operation_select or action == .operation_stop or action == .operation_follow_log);
+    std.debug.assert(self.hit_count < self.hits.len);
+    self.hits[self.hit_count] = .{ .rect = rect, .action = action, .reference = reference };
+    self.hit_count += 1;
+}
+
 pub fn hitAt(self: *const Self, x: f32, y: f32) ?HitAction {
+    const hit = self.hitEntryAt(x, y) orelse return null;
+    return hit.action;
+}
+
+fn hitEntryAt(self: *const Self, x: f32, y: f32) ?Hit {
     var index = self.hit_count;
     while (index > 0) {
         index -= 1;
         const hit = self.hits[index];
-        if (pointInRect(hit.rect, x, y)) return hit.action;
+        if (pointInRect(hit.rect, x, y)) return hit;
     }
     return null;
 }
@@ -825,6 +885,83 @@ test "evicted operation references cannot match a later bounded frame" {
         frame.upsertOperation(testOperation(identity, .completed, @intCast(index)));
     }
     try std.testing.expect(!frame.containsReference(&oldest));
+}
+
+test "operation selection toggles exactly and survives only matching frame ownership" {
+    var frame: Frame = .{ .has_thread = true };
+    try std.testing.expect(frame.setOwner("workspace:one", "thread:one"));
+    var call_id: ExactText = .{};
+    try std.testing.expect(call_id.set("call:with:colons"));
+    var operation = testOperation("operation:one", .in_progress, 1);
+    operation.target = .{ .tool_call = call_id };
+    operation.actions = .{ .inspect = true, .stop = true };
+    frame.upsertOperation(operation);
+
+    var state = Self.init();
+    state.setFrame(frame);
+    const reference = frame.operationReference(0).?;
+    state.toggleOperationSelection(reference);
+    try std.testing.expect(state.operationSelected(&reference));
+    state.selectTab(.activity);
+    state.collapse();
+    state.show();
+    state.setFrame(frame);
+    try std.testing.expect(state.operationSelected(&reference));
+    try std.testing.expectEqual(Tab.activity, state.selected_tab);
+
+    state.toggleOperationSelection(reference);
+    try std.testing.expect(state.selected_operation == null);
+    state.toggleOperationSelection(reference);
+    frame.operations[0].inspector.output.set("new display-only output");
+    state.setFrame(frame);
+    try std.testing.expect(state.operationSelected(&reference));
+
+    frame.operations[0].actions.follow_log = true;
+    state.setFrame(frame);
+    try std.testing.expect(state.selected_operation == null);
+    const changed_actions = frame.operationReference(0).?;
+    state.toggleOperationSelection(changed_actions);
+    frame.operations[0].target = .none;
+    state.setFrame(frame);
+    try std.testing.expect(state.selected_operation == null);
+
+    frame.operations[0].target = .{ .tool_call = call_id };
+    state.setFrame(frame);
+    const restored = frame.operationReference(0).?;
+    state.toggleOperationSelection(restored);
+    var evicted = frame;
+    evicted.operation_count = 0;
+    state.setFrame(evicted);
+    try std.testing.expect(state.selected_operation == null);
+
+    state.setFrame(frame);
+    state.toggleOperationSelection(restored);
+    var replacement: Frame = .{ .has_thread = true };
+    try std.testing.expect(replacement.setOwner("workspace:two", "thread:two"));
+    replacement.upsertOperation(frame.operations[0]);
+    state.setFrame(replacement);
+    try std.testing.expect(state.selected_operation == null);
+    try std.testing.expectEqual(Tab.run, state.selected_tab);
+}
+
+test "operation hit owns its copied reference after source frame replacement" {
+    var frame: Frame = .{};
+    try std.testing.expect(frame.setOwner("workspace", "thread"));
+    var call_id: ExactText = .{};
+    try std.testing.expect(call_id.set("call:one"));
+    var operation = testOperation("operation:one", .in_progress, 1);
+    operation.target = .{ .tool_call = call_id };
+    frame.upsertOperation(operation);
+    const reference = frame.operationReference(0).?;
+
+    var state = Self.init();
+    state.setFrame(frame);
+    state.addOperationHit(.{ .x = 10.0, .y = 10.0, .w = 20.0, .h = 20.0 }, .operation_select, reference);
+    frame = .{};
+    const pressed = state.handlePointerButton(15.0, 15.0, 1, true);
+    try std.testing.expectEqual(HitAction.operation_select, pressed.action.?);
+    try std.testing.expect(pressed.reference.?.eql(&reference));
+    try std.testing.expectEqualStrings("operation:one", pressed.reference.?.identity.slice());
 }
 
 test "bounded operations prioritize active and activity retains newest chronology" {

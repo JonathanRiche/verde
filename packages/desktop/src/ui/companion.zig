@@ -35,7 +35,7 @@ pub fn refreshHits(state: *runtime.AppState, width: f32, height: f32) void {
     state.companion_controller.frame_width = width;
     state.companion_controller.frame_height = height;
     const geometry = computeGeometryForState(width, height, companionScale(), &state.companion_controller);
-    registerHits(&state.companion_controller, geometry, state.companion_controller.presentation.has_approval);
+    prepareAndRegisterHits(&state.companion_controller, geometry);
 }
 
 /// Routes pointer buttons only when the visible Companion surface is hit.
@@ -65,7 +65,24 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
                     companionScale(),
                     &state.companion_controller,
                 );
-                registerHits(&state.companion_controller, geometry, state.companion_controller.presentation.has_approval);
+                prepareAndRegisterHits(&state.companion_controller, geometry);
+            },
+            .operation_select => if (result.reference) |reference| {
+                state.companion_controller.toggleOperationSelection(reference);
+                const geometry = computeGeometryForState(
+                    state.companion_controller.frame_width,
+                    state.companion_controller.frame_height,
+                    companionScale(),
+                    &state.companion_controller,
+                );
+                prepareAndRegisterHits(&state.companion_controller, geometry);
+            },
+            .operation_stop, .operation_follow_log => if (result.reference) |reference| {
+                _ = state.dispatchCompanionOperationAction(
+                    reference,
+                    if (action == .operation_stop) .stop else .follow_log,
+                );
+                refreshHits(state, state.companion_controller.frame_width, state.companion_controller.frame_height);
             },
             .panel, .body => {},
         }
@@ -90,12 +107,13 @@ pub fn handleMouseMotion(state: *runtime.AppState, x: f32, y: f32, dragging: boo
 pub fn handleWheel(state: *runtime.AppState, x: f32, y: f32, wheel_y: f32) bool {
     const action = state.companion_controller.hitAt(x, y) orelse return false;
     if (state.routeCompanionComposerWheel(x, y, wheel_y)) return true;
-    if (action == .body and wheel_y != 0.0) {
-        const body_rect = bodyHitRect(state.companion_controller.hits[1..state.companion_controller.hit_count]);
+    const body_rect = bodyHitRect(state.companion_controller.hits[0..state.companion_controller.hit_count]);
+    if (pointInRect(body_rect, x, y) and wheel_y != 0.0) {
         const max_scroll = @max(bodyContentHeight(&state.companion_controller, body_rect.w) - body_rect.h, 0.0);
         state.companion_controller.scrollCurrent(-wheel_y * companionScaled(32.0), max_scroll);
         state.markDirty();
     }
+    _ = action;
     return true;
 }
 
@@ -247,6 +265,15 @@ fn chipVisual(state: *const controller) ChipVisual {
     };
 }
 
+fn prepareAndRegisterHits(state: *controller, geometry: Geometry) void {
+    const max_scroll = @max(bodyContentHeight(state, geometry.body.w) - geometry.body.h, 0.0);
+    if (state.selected_tab == .activity)
+        state.updateActivityExtent(max_scroll)
+    else
+        state.body_scroll_y = std.math.clamp(state.body_scroll_y, 0.0, max_scroll);
+    registerHits(state, geometry, state.presentation.has_approval);
+}
+
 fn registerHits(state: *controller, geometry: Geometry, show_approval: bool) void {
     state.clearHits();
     switch (state.visibility) {
@@ -262,9 +289,69 @@ fn registerHits(state: *controller, geometry: Geometry, show_approval: bool) voi
                 state.addHit(buttons[0], .deny);
                 state.addHit(buttons[1], .approve);
             }
+            registerOperationHits(state, geometry.body);
             state.addHit(geometry.close_button, .collapse);
         },
     }
+}
+
+fn registerOperationHits(state: *controller, body: palette.Rect) void {
+    var y = body.y + companionScaled(12.0) - state.currentScrollY();
+    if (state.selected_tab == .activity) {
+        for (state.presentation.activity[0..state.presentation.activity_count]) |*item| {
+            const reference = activityOperationReference(&state.presentation, item);
+            if (reference) |value| registerOperationCardHits(state, body, &y, value, companionScaled(58.0), companionScaled(65.0));
+            if (reference == null) y += companionScaled(65.0);
+        }
+        return;
+    }
+
+    const frame = &state.presentation;
+    if (frame.has_approval) y += companionScaled(130.0);
+    y += resultCardHeight(frame, body.w);
+    const counts = frame.activeCounts();
+    if (counts.working + counts.pending > 0) {
+        y += companionScaled(27.0);
+        for (0..frame.operation_count) |index| {
+            if (!frame.operations[index].active()) continue;
+            if (frame.operationReference(index)) |reference|
+                registerOperationCardHits(state, body, &y, reference, companionScaled(72.0), companionScaled(79.0))
+            else
+                y += companionScaled(79.0);
+        }
+    }
+    if (frame.recentCount() > 0) {
+        y += companionScaled(27.0);
+        var shown: usize = 0;
+        for (0..frame.operation_count) |index| {
+            if (frame.operations[index].active() or shown == 5) continue;
+            if (frame.operationReference(index)) |reference|
+                registerOperationCardHits(state, body, &y, reference, companionScaled(72.0), companionScaled(79.0))
+            else
+                y += companionScaled(79.0);
+            shown += 1;
+        }
+    }
+}
+
+fn registerOperationCardHits(
+    state: *controller,
+    body: palette.Rect,
+    y: *f32,
+    reference: controller.OperationReference,
+    card_height: f32,
+    card_advance: f32,
+) void {
+    const card: palette.Rect = .{ .x = body.x + companionScaled(12.0), .y = y.*, .w = @max(body.w - companionScaled(24.0), 0.0), .h = card_height };
+    if (reference.actions.inspect) if (intersectRects(card, body)) |hit_rect| state.addOperationHit(hit_rect, .operation_select, reference);
+    y.* += card_advance;
+    if (!state.operationSelected(&reference)) return;
+    const operation = state.presentation.operationForReference(&reference) orelse return;
+    const inspector: palette.Rect = .{ .x = card.x, .y = y.*, .w = card.w, .h = inspectorHeight(operation) };
+    const controls = inspectorControlRects(inspector, reference.actions);
+    if (controls.stop) |rect| if (intersectRects(rect, body)) |hit_rect| state.addOperationHit(hit_rect, .operation_stop, reference);
+    if (controls.follow_log) |rect| if (intersectRects(rect, body)) |hit_rect| state.addOperationHit(hit_rect, .operation_follow_log, reference);
+    y.* += inspector.h + companionScaled(7.0);
 }
 
 // Collapsed Companion chip region.
@@ -493,7 +580,14 @@ fn bodyContentHeight(state: *const controller, body_width: f32) f32 {
     if (state.selected_tab == .activity) {
         if (frame.activity_count == 0) return inset + companionScaled(64.0);
         const working_extra: f32 = if (frame.working) companionScaled(28.0) else 0.0;
-        return inset + @as(f32, @floatFromInt(frame.activity_count)) * companionScaled(65.0) + working_extra;
+        var inspector_extra: f32 = 0.0;
+        for (frame.activity[0..frame.activity_count]) |*item| {
+            const reference = activityOperationReference(frame, item) orelse continue;
+            if (!state.operationSelected(&reference)) continue;
+            const operation = frame.operationForReference(&reference) orelse continue;
+            inspector_extra += inspectorHeight(operation) + companionScaled(7.0);
+        }
+        return inset + @as(f32, @floatFromInt(frame.activity_count)) * companionScaled(65.0) + inspector_extra + working_extra;
     }
     var height = inset;
     if (frame.has_approval) height += companionScaled(130.0);
@@ -503,6 +597,27 @@ fn bodyContentHeight(state: *const controller, body_width: f32) f32 {
     if (active_total > 0) height += companionScaled(27.0 + 79.0 * @as(f32, @floatFromInt(active_total)));
     const recent = frame.recentCount();
     if (recent > 0) height += companionScaled(27.0 + 79.0 * @as(f32, @floatFromInt(@min(recent, 5))));
+    if (state.selected_operation) |*reference| {
+        if (state.operationSelected(reference)) {
+            var visible = false;
+            var recent_shown: usize = 0;
+            for (0..frame.operation_count) |index| {
+                const operation = &frame.operations[index];
+                if (!operation.active() and recent_shown == 5) continue;
+                if (!operation.active()) recent_shown += 1;
+                const candidate = frame.operationReference(index) orelse continue;
+                if (candidate.eql(reference)) {
+                    visible = true;
+                    break;
+                }
+            }
+            if (visible) {
+                if (frame.operationForReference(reference)) |operation| {
+                    height += inspectorHeight(operation) + companionScaled(7.0);
+                }
+            }
+        }
+    }
     if (active_total == 0 and recent == 0 and !resultCardVisible(frame)) height += companionScaled(79.0);
     if (frame.provider_error.slice().len > 0) height += companionScaled(79.0);
     if (frame.control_error.slice().len > 0) height += companionScaled(79.0);
@@ -538,7 +653,7 @@ fn renderRunBody(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
         for (0..frame.operation_count) |index| {
             const operation = &frame.operations[index];
             if (!operation.active()) continue;
-            renderFrameOperationCard(state, clip, y, operation);
+            renderFrameOperationCard(state, clip, y, operation, frame.operationReference(index));
         }
     }
     const recent_total = frame.recentCount();
@@ -549,19 +664,19 @@ fn renderRunBody(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
         for (0..frame.operation_count) |index| {
             const operation = &frame.operations[index];
             if (operation.active() or shown == 5) continue;
-            renderFrameOperationCard(state, clip, y, operation);
+            renderFrameOperationCard(state, clip, y, operation, frame.operationReference(index));
             shown += 1;
         }
     }
     if (active_total == 0 and recent_total == 0 and !resultCardVisible(frame)) {
         if (frame.latest_body.slice().len > 0)
-            renderOperationCard(state, clip, y, "Latest activity", frame.latest_body.slice(), .completed, false)
+            renderOperationCard(state, clip, y, "Latest activity", frame.latest_body.slice(), .completed, false, false)
         else
             renderEmptyBody(state, clip, y, "Nothing running", "Send an instruction below to start.");
     }
-    if (frame.provider_error.slice().len > 0) renderOperationCard(state, clip, y, "Send failed", frame.provider_error.slice(), .failed, false);
-    if (frame.control_error.slice().len > 0) renderOperationCard(state, clip, y, "Action failed", frame.control_error.slice(), .failed, false);
-    if (frame.ui_error.slice().len > 0) renderOperationCard(state, clip, y, "Sprout error", frame.ui_error.slice(), .failed, false);
+    if (frame.provider_error.slice().len > 0) renderOperationCard(state, clip, y, "Send failed", frame.provider_error.slice(), .failed, false, false);
+    if (frame.control_error.slice().len > 0) renderOperationCard(state, clip, y, "Action failed", frame.control_error.slice(), .failed, false, false);
+    if (frame.ui_error.slice().len > 0) renderOperationCard(state, clip, y, "Sprout error", frame.ui_error.slice(), .failed, false, false);
 }
 
 // True when the Run tab owes the user a Result region: a run in flight, a
@@ -629,7 +744,14 @@ fn renderActivityBody(state: *runtime.AppState, clip: palette.Rect, y: *f32) voi
             renderEmptyBody(state, clip, y, "No activity yet", "Events from this run will appear here.");
         return;
     }
-    for (0..frame.activity_count) |index| renderActivityRow(state, clip, y, &frame.activity[index]);
+    for (0..frame.activity_count) |index| {
+        const item = &frame.activity[index];
+        const reference = activityOperationReference(frame, item);
+        renderActivityRow(state, clip, y, item, if (reference) |value| state.companion_controller.operationSelected(&value) else false);
+        if (reference) |value| if (state.companion_controller.operationSelected(&value)) {
+            if (frame.operationForReference(&value)) |operation| renderOperationInspector(state, clip, y, operation, value);
+        };
+    }
     // A live run keeps a visible pulse at the tail so the newest row is never
     // mistaken for the final word.
     if (frame.working) {
@@ -641,13 +763,13 @@ fn renderActivityBody(state: *runtime.AppState, clip: palette.Rect, y: *f32) voi
 
 // One bounded Activity row: kind-colored stripe, author, optional state label,
 // and a single-line body so raw command dumps cannot overflow the card.
-fn renderActivityRow(state: *runtime.AppState, clip: palette.Rect, y: *f32, item: *const controller.ActivityItem) void {
+fn renderActivityRow(state: *runtime.AppState, clip: palette.Rect, y: *f32, item: *const controller.ActivityItem, selected: bool) void {
     const chrome = theme.companionChrome();
     const failed = item.status == .failed;
     const accent = activityAccent(chrome, item);
     const card: palette.Rect = .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = @max(clip.w - companionScaled(24.0), 0.0), .h = companionScaled(58.0) };
     const card_fill = if (failed) opaqueOver(surface(), chrome.failure_card) else chrome.surface_deep;
-    const card_stroke = opaqueOver(card_fill, if (failed) chrome.failure_border else chrome.hairline);
+    const card_stroke = opaqueOver(card_fill, if (selected) chrome.accent else if (failed) chrome.failure_border else chrome.hairline);
     queuePanelClipped(state, card, color(card_fill), color(card_stroke), companionScaled(9.0), companionScaled(1.0), clip);
     queueRoundedRectClipped(state, .{ .x = card.x, .y = card.y, .w = companionScaled(3.0), .h = card.h }, color(accent), companionScaled(1.5), clip);
     const status_w = companionScaled(52.0);
@@ -713,8 +835,10 @@ fn renderApproval(state: *runtime.AppState, body: palette.Rect, y: *f32, title: 
 
 // One Frame-backed operation in the Run region. These are real tracked
 // executions, so a completed card may truthfully state its completion.
-fn renderFrameOperationCard(state: *runtime.AppState, clip: palette.Rect, y: *f32, operation: *const controller.Operation) void {
-    renderOperationCard(state, clip, y, operation.title.slice(), operation.detail.slice(), operation.status, true);
+fn renderFrameOperationCard(state: *runtime.AppState, clip: palette.Rect, y: *f32, operation: *const controller.Operation, reference: ?controller.OperationReference) void {
+    const selected = if (reference) |value| state.companion_controller.operationSelected(&value) else false;
+    renderOperationCard(state, clip, y, operation.title.slice(), operation.detail.slice(), operation.status, true, selected);
+    if (selected) renderOperationInspector(state, clip, y, operation, reference.?);
 }
 
 // One owner-derived operation card in the scrollable Run region. Raw bodies
@@ -722,14 +846,14 @@ fn renderFrameOperationCard(state: *runtime.AppState, clip: palette.Rect, y: *f3
 // a bounded single-line command preview plus a single-line result preview.
 // completion_note allows "Completed successfully" only for cards whose status
 // reflects a real tracked execution, never for generic transcript reuse.
-fn renderOperationCard(state: *runtime.AppState, clip: palette.Rect, y: *f32, title: []const u8, detail: []const u8, status: controller.OperationStatus, completion_note: bool) void {
+fn renderOperationCard(state: *runtime.AppState, clip: palette.Rect, y: *f32, title: []const u8, detail: []const u8, status: controller.OperationStatus, completion_note: bool, selected: bool) void {
     const scale = companionScale();
     const chrome = theme.companionChrome();
     const failed = status == .failed;
     const indicator = operationStatusColor(chrome, status);
     const card: palette.Rect = .{ .x = clip.x + 12.0 * scale, .y = y.*, .w = @max(clip.w - 24.0 * scale, 0.0), .h = 72.0 * scale };
     const card_fill = if (failed) opaqueOver(surface(), chrome.failure_card) else chrome.surface_deep;
-    const card_stroke = opaqueOver(card_fill, if (failed) chrome.failure_border else chrome.hairline);
+    const card_stroke = opaqueOver(card_fill, if (selected) chrome.accent else if (failed) chrome.failure_border else chrome.hairline);
     queuePanelClipped(state, card, color(card_fill), color(card_stroke), 10.0 * scale, 1.0 * scale, clip);
     const avatar: palette.Rect = .{ .x = card.x + 11.0 * scale, .y = card.y + 10.0 * scale, .w = 27.0 * scale, .h = 27.0 * scale };
     queuePanelClipped(state, avatar, color(chrome.surface_deep), color(chrome.border), 7.0 * scale, 1.0 * scale, clip);
@@ -761,6 +885,154 @@ fn renderOperationCard(state: *runtime.AppState, clip: palette.Rect, y: *f32, ti
     }
     queueBoldText(state, .{ .x = card.x + card.w - 54.0 * scale, .y = card.y + 10.0 * scale, .w = 45.0 * scale, .h = 18.0 * scale }, operationStatusLabel(status), color(indicator), 9.5 * scale, clip);
     y.* += card.h + 7.0 * scale;
+}
+
+const InspectorControls = struct {
+    stop: ?palette.Rect = null,
+    follow_log: ?palette.Rect = null,
+};
+
+fn activityOperationReference(frame: *const controller.Frame, item: *const controller.ActivityItem) ?controller.OperationReference {
+    if (item.kind != .tool and item.kind != .process) return null;
+    const identity = item.identity.slice();
+    if (identity.len == 0) return null;
+    for (frame.operations[0..frame.operation_count], 0..) |*operation, index| {
+        if (!std.mem.eql(u8, operation.identity.slice(), identity)) continue;
+        return frame.operationReference(index);
+    }
+    return null;
+}
+
+fn inspectorHeight(operation: *const controller.Operation) f32 {
+    const row_count = inspectorMetadataRowCount(operation) + @as(usize, if (inspectorOutput(operation) != null) 1 else 0);
+    const controls: f32 = if (operation.actions.stop or operation.actions.follow_log) companionScaled(34.0) else 0.0;
+    return companionScaled(36.0 + 19.0 * @as(f32, @floatFromInt(row_count))) + controls;
+}
+
+fn inspectorMetadataRowCount(operation: *const controller.Operation) usize {
+    const inspector = &operation.inspector;
+    var count: usize = 0;
+    inline for (.{
+        inspector.owner.slice(),
+        inspector.workspace.slice(),
+        inspector.action.slice(),
+        inspector.target.slice(),
+        inspector.provider.slice(),
+        inspector.cwd.slice(),
+        inspector.state.slice(),
+        inspector.wait_reason.slice(),
+        inspector.failure_reason.slice(),
+        inspector.locations.slice(),
+    }) |value| if (value.len > 0) {
+        count += 1;
+    };
+    for (inspector.files[0..@min(inspector.file_count, inspector.files.len)]) |*value| if (value.slice().len > 0) {
+        count += 1;
+    };
+    for (inspector.resources[0..@min(inspector.resource_count, inspector.resources.len)]) |*value| if (value.slice().len > 0) {
+        count += 1;
+    };
+    if (inspector.started_at_ms != null) count += 1;
+    if (inspector.updated_at_ms != null) count += 1;
+    if (inspector.elapsed_ms != null) count += 1;
+    return count;
+}
+
+fn inspectorOutput(operation: *const controller.Operation) ?[]const u8 {
+    const output = std.mem.trim(u8, operation.inspector.output.slice(), " \t\r\n");
+    return if (output.len > 0) output else null;
+}
+
+fn inspectorControlRects(rect: palette.Rect, actions: controller.SupportedActions) InspectorControls {
+    const count: usize = @as(usize, @intFromBool(actions.stop)) + @as(usize, @intFromBool(actions.follow_log));
+    if (count == 0) return .{};
+    const inset = companionScaled(10.0);
+    const gap = companionScaled(7.0);
+    const total_w = @max(rect.w - inset * 2.0, 0.0);
+    const button_w = if (count == 2) @max((total_w - gap) * 0.5, 0.0) else total_w;
+    const y = rect.y + rect.h - companionScaled(30.0);
+    var x = rect.x + inset;
+    var result: InspectorControls = .{};
+    if (actions.stop) {
+        result.stop = .{ .x = x, .y = y, .w = button_w, .h = companionScaled(24.0) };
+        x += button_w + gap;
+    }
+    if (actions.follow_log) result.follow_log = .{ .x = x, .y = y, .w = button_w, .h = companionScaled(24.0) };
+    return result;
+}
+
+// Inline operation inspector region beneath its selected Run or Activity row.
+fn renderOperationInspector(
+    state: *runtime.AppState,
+    clip: palette.Rect,
+    y: *f32,
+    operation: *const controller.Operation,
+    reference: controller.OperationReference,
+) void {
+    const chrome = theme.companionChrome();
+    const rect: palette.Rect = .{
+        .x = clip.x + companionScaled(12.0),
+        .y = y.*,
+        .w = @max(clip.w - companionScaled(24.0), 0.0),
+        .h = inspectorHeight(operation),
+    };
+    queuePanelClipped(state, rect, color(chrome.surface_deep), color(chrome.accent), companionScaled(9.0), companionScaled(1.0), clip);
+    queueRoundedRectClipped(state, .{ .x = rect.x, .y = rect.y, .w = companionScaled(3.0), .h = rect.h }, color(chrome.accent), companionScaled(1.5), clip);
+    const title = if (operation.title.slice().len > 0) operation.title.slice() else "Operation details";
+    queueBoldText(state, .{ .x = rect.x + companionScaled(11.0), .y = rect.y + companionScaled(8.0), .w = @max(rect.w - companionScaled(86.0), 0.0), .h = companionScaled(16.0) }, title, color(chrome.text), companionScaled(11.0), clip);
+    queueBoldText(state, .{ .x = rect.x + @max(rect.w - companionScaled(67.0), 0.0), .y = rect.y + companionScaled(8.0), .w = companionScaled(56.0), .h = companionScaled(16.0) }, operationStatusLabel(operation.status), color(operationStatusColor(chrome, operation.status)), companionScaled(9.0), clip);
+
+    var row_y = rect.y + companionScaled(29.0);
+    if (inspectorOutput(operation)) |value| renderInspectorRow(state, clip, rect, &row_y, "Output", value);
+    const inspector = &operation.inspector;
+    renderInspectorRowIfPresent(state, clip, rect, &row_y, "Owner", inspector.owner.slice());
+    renderInspectorRowIfPresent(state, clip, rect, &row_y, "Workspace", inspector.workspace.slice());
+    renderInspectorRowIfPresent(state, clip, rect, &row_y, "Action", inspector.action.slice());
+    renderInspectorRowIfPresent(state, clip, rect, &row_y, "Target", inspector.target.slice());
+    renderInspectorRowIfPresent(state, clip, rect, &row_y, "Provider", inspector.provider.slice());
+    renderInspectorRowIfPresent(state, clip, rect, &row_y, "Cwd", inspector.cwd.slice());
+    renderInspectorRowIfPresent(state, clip, rect, &row_y, "State", inspector.state.slice());
+    renderInspectorRowIfPresent(state, clip, rect, &row_y, "Waiting", inspector.wait_reason.slice());
+    renderInspectorRowIfPresent(state, clip, rect, &row_y, "Failure", inspector.failure_reason.slice());
+    renderInspectorRowIfPresent(state, clip, rect, &row_y, "Locations", inspector.locations.slice());
+    var file_label = true;
+    for (inspector.files[0..@min(inspector.file_count, inspector.files.len)]) |*value| if (value.slice().len > 0) {
+        renderInspectorRow(state, clip, rect, &row_y, if (file_label) "Files" else "", value.slice());
+        file_label = false;
+    };
+    var resource_label = true;
+    for (inspector.resources[0..@min(inspector.resource_count, inspector.resources.len)]) |*value| if (value.slice().len > 0) {
+        renderInspectorRow(state, clip, rect, &row_y, if (resource_label) "Resources" else "", value.slice());
+        resource_label = false;
+    };
+    if (inspector.started_at_ms) |value| renderInspectorRow(state, clip, rect, &row_y, "Started", framePrint(state, "{d} ms", .{value}));
+    if (inspector.updated_at_ms) |value| renderInspectorRow(state, clip, rect, &row_y, "Updated", framePrint(state, "{d} ms", .{value}));
+    if (inspector.elapsed_ms) |value| renderInspectorRow(state, clip, rect, &row_y, "Elapsed", framePrint(state, "{d} ms", .{value}));
+
+    const controls = inspectorControlRects(rect, reference.actions);
+    if (controls.stop) |button| renderInspectorButton(state, clip, button, "Stop");
+    if (controls.follow_log) |button| renderInspectorButton(state, clip, button, "Follow log");
+    y.* += rect.h + companionScaled(7.0);
+}
+
+fn renderInspectorRowIfPresent(state: *runtime.AppState, clip: palette.Rect, card: palette.Rect, y: *f32, label: []const u8, value: []const u8) void {
+    if (value.len > 0) renderInspectorRow(state, clip, card, y, label, value);
+}
+
+fn renderInspectorRow(state: *runtime.AppState, clip: palette.Rect, card: palette.Rect, y: *f32, label: []const u8, value: []const u8) void {
+    const chrome = theme.companionChrome();
+    const label_w = companionScaled(70.0);
+    queueBoldText(state, .{ .x = card.x + companionScaled(11.0), .y = y.*, .w = label_w, .h = companionScaled(15.0) }, label, color(chrome.text_subtle), companionScaled(9.0), clip);
+    const value_x = card.x + companionScaled(11.0) + label_w;
+    const value_w = @max(card.x + card.w - companionScaled(11.0) - value_x, 0.0);
+    queueText(state, .{ .x = value_x, .y = y.*, .w = value_w, .h = companionScaled(15.0) }, truncatedText(state, .ui, companionScaled(10.0), value_w, singleLineText(state, value)), color(chrome.text), companionScaled(10.0), clip);
+    y.* += companionScaled(19.0);
+}
+
+fn renderInspectorButton(state: *runtime.AppState, clip: palette.Rect, rect: palette.Rect, label: []const u8) void {
+    const chrome = theme.companionChrome();
+    queuePanelClipped(state, rect, color(chrome.surface), color(chrome.border), companionScaled(7.0), companionScaled(1.0), clip);
+    queueCenteredText(state, rect, label, color(chrome.text), companionScaled(10.0), .ui_bold, clip);
 }
 
 fn operationStatusLabel(status: controller.OperationStatus) []const u8 {
@@ -3537,6 +3809,327 @@ fn expectBatchText(batch: *const palette.RenderBatch, expected: []const u8) !voi
         if (command.kind == .text and std.mem.eql(u8, command.text, expected)) return;
     }
     return error.MissingExpectedText;
+}
+
+test "exact Run and matching Activity operation hits share one reference" {
+    var frame: controller.Frame = .{ .has_thread = true, .working = true };
+    try std.testing.expect(frame.setOwner("workspace:inspector", "thread:inspector"));
+    var task_id: controller.ExactText = .{};
+    try std.testing.expect(task_id.set("task:one"));
+    var command: controller.ExactText = .{};
+    try std.testing.expect(command.set("run exact task"));
+    var target: controller.BackgroundTarget = .{ .identity = .{ .task_id = task_id }, .command = command };
+    try std.testing.expect(target.log_path.set("/tmp/exact-task.log"));
+    var operation: controller.Operation = .{
+        .category = .background_task,
+        .status = .in_progress,
+        .target = .{ .background_task = target },
+        .actions = .{ .inspect = true, .stop = true, .follow_log = true },
+    };
+    operation.identity.set("operation:one");
+    operation.title.set("Run exact operation");
+    frame.upsertOperation(operation);
+    var matching: controller.ActivityItem = .{ .kind = .tool, .status = .in_progress, .sequence = 1 };
+    matching.identity.set("operation:one");
+    matching.author.set("Tool");
+    matching.body.set("exact activity");
+    frame.appendActivity(matching);
+    var unrelated: controller.ActivityItem = .{ .kind = .process, .status = .in_progress, .sequence = 2 };
+    unrelated.identity.set("operation:other");
+    unrelated.author.set("Process");
+    unrelated.body.set("unrelated activity");
+    frame.appendActivity(unrelated);
+
+    var state = controller.init();
+    state.show();
+    state.setFrame(frame);
+    const reference = frame.operationReference(0).?;
+    const geometry = computeGeometryForState(1000.0, 820.0, 1.0, &state);
+    prepareAndRegisterHits(&state, geometry);
+    var run_selects: usize = 0;
+    for (state.hits[0..state.hit_count]) |hit| if (hit.action == .operation_select) {
+        run_selects += 1;
+        try std.testing.expect(hit.reference.?.eql(&reference));
+    };
+    try std.testing.expectEqual(@as(usize, 1), run_selects);
+
+    state.toggleOperationSelection(reference);
+    const run_height = bodyContentHeight(&state, geometry.body.w);
+    prepareAndRegisterHits(&state, geometry);
+    var stop_hits: usize = 0;
+    var follow_hits: usize = 0;
+    for (state.hits[0..state.hit_count]) |hit| switch (hit.action) {
+        .operation_stop => {
+            stop_hits += 1;
+            try std.testing.expect(hit.reference.?.eql(&reference));
+        },
+        .operation_follow_log => {
+            follow_hits += 1;
+            try std.testing.expect(hit.reference.?.eql(&reference));
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), stop_hits);
+    try std.testing.expectEqual(@as(usize, 1), follow_hits);
+    try std.testing.expect(run_height > companionScaled(24.0 + 27.0 + 79.0));
+
+    state.selectTab(.activity);
+    prepareAndRegisterHits(&state, geometry);
+    var activity_selects: usize = 0;
+    stop_hits = 0;
+    follow_hits = 0;
+    for (state.hits[0..state.hit_count]) |hit| switch (hit.action) {
+        .operation_select => {
+            activity_selects += 1;
+            try std.testing.expect(hit.reference.?.eql(&reference));
+        },
+        .operation_stop => stop_hits += 1,
+        .operation_follow_log => follow_hits += 1,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), activity_selects);
+    try std.testing.expectEqual(@as(usize, 1), stop_hits);
+    try std.testing.expectEqual(@as(usize, 1), follow_hits);
+    try std.testing.expect(state.operationSelected(&reference));
+
+    var inspect_only = frame;
+    inspect_only.operations[0].actions = .{ .inspect = true, .reveal = true, .redirect = true };
+    state.setFrame(inspect_only);
+    const inspect_reference = inspect_only.operationReference(0).?;
+    state.toggleOperationSelection(inspect_reference);
+    state.selectTab(.run);
+    prepareAndRegisterHits(&state, geometry);
+    for (state.hits[0..state.hit_count]) |hit| {
+        try std.testing.expect(hit.action != .operation_stop);
+        try std.testing.expect(hit.action != .operation_follow_log);
+    }
+}
+
+test "selected inspector renders exact output and omits empty process output" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25) }) |scale| {
+        theme.applyTheme(scale);
+        var state: runtime.AppState = undefined;
+        state.allocator = allocator;
+        state.app_config = .{};
+        state.project_controller = .{};
+        state.companion_controller = controller.init();
+        state.lifecycle = .{};
+        state.companion_controller.show();
+        state.companion_composer = @TypeOf(state.companion_composer).init();
+        state.palette_overlay_batch = .{};
+        state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+        defer {
+            for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+            state.project_controller.projects.deinit(allocator);
+            state.companion_composer.deinit(allocator);
+            state.palette_overlay_batch.deinit(allocator);
+            state.palette_frame_text_arena.deinit();
+        }
+        var project = try runtime.Project.init(allocator, "inspector", "Inspector", "/tmp/inspector", 0);
+        state.project_controller.projects.append(allocator, project) catch |err| {
+            project.deinit(allocator);
+            return err;
+        };
+
+        var frame: controller.Frame = .{ .has_thread = true, .working = true };
+        try std.testing.expect(frame.setOwner("inspector", "thread:one"));
+        var call_id: controller.ExactText = .{};
+        try std.testing.expect(call_id.set("call:one"));
+        var operation: controller.Operation = .{ .status = .in_progress, .target = .{ .tool_call = call_id } };
+        operation.identity.set("operation:one");
+        operation.title.set("Inspect operation");
+        operation.inspector.output.set("structured output");
+        operation.inspector.owner.set("exact owner");
+        operation.inspector.workspace.set("exact workspace");
+        operation.inspector.action.set("exact action");
+        operation.inspector.target.set("exact target");
+        operation.inspector.provider.set("exact provider");
+        operation.inspector.cwd.set("/tmp/exact cwd");
+        operation.inspector.state.set("running");
+        operation.inspector.wait_reason.set("waiting reason");
+        operation.inspector.failure_reason.set("failure reason");
+        operation.inspector.locations.set("line 7");
+        operation.inspector.input.set("unsupported input row");
+        operation.inspector.raw.set("unsupported raw row");
+        operation.inspector.files[0].set("exact-file.zig");
+        operation.inspector.file_count = 1;
+        operation.inspector.resources[0].set("lease:build");
+        operation.inspector.resource_count = 1;
+        operation.inspector.started_at_ms = 10;
+        operation.inspector.updated_at_ms = 20;
+        operation.inspector.elapsed_ms = 30;
+        frame.upsertOperation(operation);
+        state.companion_controller.setFrame(frame);
+        const reference = frame.operationReference(0).?;
+        state.companion_controller.toggleOperationSelection(reference);
+
+        render(&state, 1500.0, 1200.0);
+        inline for (.{
+            "Inspect operation",
+            "RUNNING",
+            "Output",
+            "structured output",
+            "Owner",
+            "exact owner",
+            "Workspace",
+            "exact workspace",
+            "Action",
+            "exact action",
+            "Target",
+            "exact target",
+            "Provider",
+            "exact provider",
+            "Cwd",
+            "/tmp/exact cwd",
+            "State",
+            "running",
+            "Waiting",
+            "waiting reason",
+            "Failure",
+            "failure reason",
+            "Locations",
+            "line 7",
+            "Files",
+            "exact-file.zig",
+            "Resources",
+            "lease:build",
+            "Started",
+            "10 ms",
+            "Updated",
+            "20 ms",
+            "Elapsed",
+            "30 ms",
+        }) |expected| try expectBatchText(&state.palette_overlay_batch, expected);
+        try expectNoTextCommand(&state.palette_overlay_batch, "unsupported input row");
+        try expectNoTextCommand(&state.palette_overlay_batch, "unsupported raw row");
+        try expectInspectorBackedTextCommand(&state.palette_overlay_batch, "structured output", &state.companion_controller.presentation.operations[0].inspector.output);
+        var saw_selected_card = false;
+        const accent = color(theme.companionChrome().accent);
+        for (state.palette_overlay_batch.commands.items) |command| {
+            if (command.kind == .rect and sameColor(command.color, accent) and
+                @abs(command.rect.h - companionScaled(72.0)) <= companionScaled(2.0))
+            {
+                saw_selected_card = true;
+            }
+        }
+        try std.testing.expect(saw_selected_card);
+
+        var provider_thread_id: controller.ExactText = .{};
+        try std.testing.expect(provider_thread_id.set("provider:thread"));
+        var process_id: controller.ExactText = .{};
+        try std.testing.expect(process_id.set("process:one"));
+        var command: controller.ExactText = .{};
+        try std.testing.expect(command.set("process-command"));
+        var process_target: controller.BackgroundTarget = .{
+            .identity = .{ .process = .{
+                .provider_thread_id = provider_thread_id,
+                .process_id = process_id,
+            } },
+            .command = command,
+            .provider_owned = true,
+        };
+        try std.testing.expect(process_target.provider_thread_id.set("provider:thread"));
+        try std.testing.expect(process_target.process_id.set("process:one"));
+        var process_operation: controller.Operation = .{
+            .category = .background_task,
+            .target = .{ .background_task = process_target },
+            .actions = .{ .inspect = true, .stop = true },
+            .status = .in_progress,
+            .process = true,
+        };
+        process_operation.identity.set("background:process:one");
+        process_operation.title.set("Process operation");
+        process_operation.detail.set("process-command");
+        process_operation.inspector.action.set("Run process");
+        process_operation.inspector.target.set("process:one");
+        process_operation.inspector.state.set("running");
+
+        frame.operation_count = 0;
+        frame.upsertOperation(process_operation);
+        state.companion_controller.setFrame(frame);
+        const process_reference = frame.operationReference(0).?;
+        state.companion_controller.toggleOperationSelection(process_reference);
+        const empty_height = inspectorHeight(&state.companion_controller.presentation.operations[0]);
+        const empty_content_height = bodyContentHeight(&state.companion_controller, 404.0 * scale);
+
+        var frame_with_output = frame;
+        frame_with_output.operations[0].inspector.output.set("real process output");
+        state.companion_controller.setFrame(frame_with_output);
+        try std.testing.expectApproxEqAbs(
+            empty_height + companionScaled(19.0),
+            inspectorHeight(&state.companion_controller.presentation.operations[0]),
+            0.001,
+        );
+        try std.testing.expectApproxEqAbs(
+            empty_content_height + companionScaled(19.0),
+            bodyContentHeight(&state.companion_controller, 404.0 * scale),
+            0.001,
+        );
+
+        state.companion_controller.setFrame(frame);
+        try std.testing.expect(state.companion_controller.operationSelected(&process_reference));
+        const viewport_width = 1500.0;
+        const viewport_height = 500.0 * scale;
+        const geometry = computeGeometryForState(viewport_width, viewport_height, scale, &state.companion_controller);
+        prepareAndRegisterHits(&state.companion_controller, geometry);
+        const max_scroll = bodyContentHeight(&state.companion_controller, geometry.body.w) - geometry.body.h;
+        try std.testing.expect(max_scroll > 0.0);
+        try std.testing.expect(handleWheel(
+            &state,
+            geometry.body.x + companionScaled(4.0),
+            geometry.body.y + companionScaled(4.0),
+            -4.0,
+        ));
+        try std.testing.expectApproxEqAbs(companionScaled(128.0), state.companion_controller.body_scroll_y, 0.001);
+        prepareAndRegisterHits(&state.companion_controller, geometry);
+
+        const inspector_rect: palette.Rect = .{
+            .x = geometry.body.x + companionScaled(12.0),
+            .y = geometry.body.y + companionScaled(12.0) - state.companion_controller.body_scroll_y +
+                resultCardHeight(&state.companion_controller.presentation, geometry.body.w) + companionScaled(27.0 + 79.0),
+            .w = @max(geometry.body.w - companionScaled(24.0), 0.0),
+            .h = empty_height,
+        };
+        const expected_stop = intersectRects(inspectorControlRects(inspector_rect, process_reference.actions).stop.?, geometry.body).?;
+        var saw_stop_hit = false;
+        for (state.companion_controller.hits[0..state.companion_controller.hit_count]) |hit| {
+            if (hit.action != .operation_stop) continue;
+            saw_stop_hit = true;
+            try std.testing.expect(hit.reference.?.eql(&process_reference));
+            try std.testing.expect(rectEqual(expected_stop, hit.rect));
+            try std.testing.expect(intersectRects(hit.rect, geometry.body) != null);
+        }
+        try std.testing.expect(saw_stop_hit);
+
+        state.palette_overlay_batch.clear();
+        _ = state.palette_frame_text_arena.reset(.retain_capacity);
+        render(&state, viewport_width, viewport_height);
+        try expectNoTextCommand(&state.palette_overlay_batch, "Output");
+        try expectNoTextCommand(&state.palette_overlay_batch, "No detail yet.");
+        try std.testing.expectEqual(@as(usize, 1), textCommandCount(&state.palette_overlay_batch, "process-command"));
+    }
+}
+
+fn textCommandCount(batch: *const palette.RenderBatch, expected: []const u8) usize {
+    var count: usize = 0;
+    for (batch.commands.items) |command| {
+        if (command.kind == .text and std.mem.eql(u8, command.text, expected)) count += 1;
+    }
+    return count;
+}
+
+fn expectInspectorBackedTextCommand(batch: *const palette.RenderBatch, expected: []const u8, backing: *const controller.InspectorText) !void {
+    for (batch.commands.items) |command| {
+        if (command.kind != .text or !std.mem.eql(u8, command.text, expected)) continue;
+        const text_start = @intFromPtr(command.text.ptr);
+        const storage_start = @intFromPtr(&backing.storage[0]);
+        if (text_start < storage_start) return error.TextStartsBeforeInspectorStorage;
+        if (text_start + command.text.len > storage_start + backing.storage.len) return error.TextEndsAfterInspectorStorage;
+        return;
+    }
+    return error.MissingExpectedInspectorText;
 }
 
 test "Vireo brow arcs instead of a flat bar and pupil rests viewer-left" {
