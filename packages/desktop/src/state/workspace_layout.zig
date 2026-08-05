@@ -539,7 +539,7 @@ pub const WorkspaceLayout = struct {
 
         const pane_id = self.next_pane_id;
         self.next_pane_id += 1;
-        try self.panes.append(allocator, .{
+        try self.insertPaneAfterFocus(allocator, .{
             .id = pane_id,
             .ref = .{ .terminal = .{ .dock_id = dock_id } },
         });
@@ -562,11 +562,12 @@ pub const WorkspaceLayout = struct {
 
         const pane_id = self.next_pane_id;
         self.next_pane_id += 1;
-        try self.panes.append(allocator, .{
+        try self.insertPaneAfterFocus(allocator, .{
             .id = pane_id,
             .ref = .{ .browser = .{} },
         });
-        _ = try self.panes.items[self.panes.items.len - 1].ref.browser.ensureTab(allocator);
+        const pane = self.paneByIdMutable(pane_id) orelse return error.BrowserPaneNotFound;
+        _ = try pane.ref.browser.ensureTab(allocator);
         self.focused_pane_id = pane_id;
         try self.ensurePaneInRootSplit(allocator, pane_id, .vertical, 0.58);
         return pane_id;
@@ -579,7 +580,7 @@ pub const WorkspaceLayout = struct {
     pub fn createTerminalPaneWithPurpose(self: *WorkspaceLayout, allocator: std.mem.Allocator, dock_id: u32, purpose: TerminalPanePurpose) !WorkspacePaneId {
         const pane_id = self.next_pane_id;
         self.next_pane_id += 1;
-        try self.panes.append(allocator, .{
+        try self.insertPaneAfterFocus(allocator, .{
             .id = pane_id,
             .ref = .{ .terminal = .{ .dock_id = dock_id, .purpose = purpose } },
         });
@@ -589,11 +590,20 @@ pub const WorkspaceLayout = struct {
     pub fn createChatPane(self: *WorkspaceLayout, allocator: std.mem.Allocator, thread_index: usize) !WorkspacePaneId {
         const pane_id = self.next_pane_id;
         self.next_pane_id += 1;
-        try self.panes.append(allocator, .{
+        try self.insertPaneAfterFocus(allocator, .{
             .id = pane_id,
             .ref = .{ .chat = .{ .thread_index = thread_index } },
         });
         return pane_id;
+    }
+
+    fn insertPaneAfterFocus(self: *WorkspaceLayout, allocator: std.mem.Allocator, pane: WorkspacePane) !void {
+        const insert_index = if (self.focused_pane_id) |focused_pane_id|
+            if (self.paneIndexById(focused_pane_id)) |focused_index| focused_index + 1 else self.panes.items.len
+        else
+            self.panes.items.len;
+        try self.panes.insert(allocator, insert_index, pane);
+        self.scroll_revealed_pane_id = null;
     }
 
     pub fn splitPaneWithLeaf(
@@ -1342,6 +1352,13 @@ pub const WorkspaceLayout = struct {
     }
 };
 
+fn expectPaneOrder(layout: *const WorkspaceLayout, expected: []const WorkspacePaneId) !void {
+    try std.testing.expectEqual(expected.len, layout.panes.items.len);
+    for (expected, layout.panes.items) |expected_id, pane| {
+        try std.testing.expectEqual(expected_id, pane.id);
+    }
+}
+
 test "workspace layout prunes stale root leaves" {
     const allocator = std.testing.allocator;
     var layout = try WorkspaceLayout.initDefaultChat(allocator);
@@ -1591,6 +1608,29 @@ test "workspace panes can be reordered by sidebar insertion slot" {
     try std.testing.expectEqual(second_pane_id, layout.panes.items[1].id);
     try std.testing.expectEqual(third_pane_id, layout.panes.items[2].id);
     try std.testing.expect(!layout.movePaneBefore(second_pane_id, 2));
+}
+
+test "new workspace panes are inserted immediately after focus" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const trailing_terminal_id = try layout.createTerminalPane(allocator, 10);
+    layout.focused_pane_id = 1;
+    const chat_id = try layout.createChatPane(allocator, 1);
+    try expectPaneOrder(&layout, &.{ 1, chat_id, trailing_terminal_id });
+
+    layout.focused_pane_id = 1;
+    const browser_id = try layout.ensureBrowserPane(allocator);
+    try expectPaneOrder(&layout, &.{ 1, browser_id, chat_id, trailing_terminal_id });
+
+    layout.focused_pane_id = chat_id;
+    const editor_terminal_id = try layout.createTerminalPaneWithPurpose(allocator, 11, .editor);
+    try expectPaneOrder(&layout, &.{ 1, browser_id, chat_id, editor_terminal_id, trailing_terminal_id });
+
+    layout.focused_pane_id = 9999;
+    const fallback_terminal_id = try layout.createTerminalPane(allocator, 12);
+    try std.testing.expectEqual(fallback_terminal_id, layout.panes.items[layout.panes.items.len - 1].id);
 }
 
 test "workspace layout persists the scrolling target" {
