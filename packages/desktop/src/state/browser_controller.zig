@@ -1378,7 +1378,10 @@ pub fn browserBlockedByPaletteOverlay(self: anytype) bool {
         break :blk quick.visible and (kind == null or kind.? != .browser);
     } else false;
     return quick_blocks_browser or
-        companionSidecarBlocksBrowser(self.companion_controller.visibility == .sidecar_open) or
+        companionSidecarBlocksBrowser(
+            self.isCompanionEnabled(),
+            self.companion_controller.visibility == .sidecar_open,
+        ) or
         self.project_controller.show_creator or
         self.settings_controller.modal_visible or
         self.handoff_controller.modal_open or
@@ -1396,23 +1399,36 @@ pub fn browserBlockedByPaletteOverlay(self: anytype) bool {
         self.composer_controller.run_config_open;
 }
 
-fn companionSidecarBlocksBrowser(sidecar_open: bool) bool {
-    return sidecar_open;
+fn companionSidecarBlocksBrowser(companion_enabled: bool, sidecar_open: bool) bool {
+    return companion_enabled and sidecar_open;
 }
 
 test "Companion sidecar drives the existing browser surface hide restore lifecycle" {
-    try std.testing.expect(!companionSidecarBlocksBrowser(false));
-    try std.testing.expect(companionSidecarBlocksBrowser(true));
+    const retained_sidecar_open = true;
+    const disabled_blocked = companionSidecarBlocksBrowser(false, retained_sidecar_open);
+    try std.testing.expect(!disabled_blocked);
+    try std.testing.expectEqual(
+        PaletteSurfaceTransition.restore,
+        paletteSurfaceTransition(disabled_blocked, true),
+    );
+
+    const enabled_blocked = companionSidecarBlocksBrowser(true, retained_sidecar_open);
+    try std.testing.expect(enabled_blocked);
     try std.testing.expectEqual(PaletteSurfaceTransition.none, paletteSurfaceTransition(false, false));
     // Opening a sidecar hides one native child surface exactly once.
-    try std.testing.expectEqual(PaletteSurfaceTransition.hide, paletteSurfaceTransition(true, false));
-    try std.testing.expectEqual(PaletteSurfaceTransition.none, paletteSurfaceTransition(true, true));
+    try std.testing.expectEqual(PaletteSurfaceTransition.hide, paletteSurfaceTransition(enabled_blocked, false));
+    try std.testing.expectEqual(PaletteSurfaceTransition.none, paletteSurfaceTransition(enabled_blocked, true));
     // Collapse restores it; an offscreen texture has no suspended child and
     // therefore requires no surface lifecycle operation.
     try std.testing.expectEqual(PaletteSurfaceTransition.restore, paletteSurfaceTransition(false, true));
     try std.testing.expectEqual(PaletteSurfaceTransition.none, paletteSurfaceTransition(false, false));
-    // A true modal keeps the same surface hidden after Companion collapses.
-    try std.testing.expectEqual(PaletteSurfaceTransition.none, paletteSurfaceTransition(true, true));
+    // A true modal keeps the same surface hidden after Companion is disabled.
+    const unrelated_palette_overlay_blocked = disabled_blocked or true;
+    try std.testing.expectEqual(
+        PaletteSurfaceTransition.none,
+        paletteSurfaceTransition(unrelated_palette_overlay_blocked, true),
+    );
+    try std.testing.expect(retained_sidecar_open);
 }
 
 pub fn suppressNextBrowserClosedEvent(self: anytype) void {
