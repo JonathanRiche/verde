@@ -5782,13 +5782,34 @@ pub const AppState = struct {
         kind: ?ai_harness.ToolCallKind,
         status: ?ai_harness.ToolCallStatus,
         sequence: i64,
+        live_event: ?*const PendingTimelineEvent,
     ) void {
+        if (!frame.owner.valid) return;
         const mapped_status = companionOperationStatus(status) orelse return;
         const title = companionToolTitle(author, kind, status);
-        var operation: companion_controller.Operation = .{ .status = mapped_status, .sequence = sequence };
+        var target: companion_controller.ExactText = .{};
+        if (!target.set(identity)) return;
+        var operation: companion_controller.Operation = .{
+            .category = .provider_tool,
+            .target = .{ .tool_call = target },
+            .status = mapped_status,
+            .sequence = sequence,
+        };
         if (!operation.identity.setIdentity("tool", &.{identity})) return;
         operation.title.set(title);
         operation.detail.set(body);
+        operation.inspector.owner.set(author);
+        operation.inspector.workspace.set(frame.owner.workspace_id.slice());
+        operation.inspector.action.set(title);
+        operation.inspector.target.set(identity);
+        operation.inspector.state.set(@tagName(mapped_status));
+        if (live_event) |event| {
+            if (event.tool_call_input) |value| operation.inspector.input.set(value);
+            if (event.tool_call_output) |value| operation.inspector.output.set(value);
+            if (event.tool_call_error) |value| operation.inspector.failure_reason.set(value);
+            if (event.tool_call_locations) |value| operation.inspector.locations.set(value);
+            if (event.tool_call_raw) |value| operation.inspector.raw.set(value);
+        }
         frame.upsertOperation(operation);
         var activity: companion_controller.ActivityItem = .{
             .kind = .tool,
@@ -5846,7 +5867,7 @@ pub const AppState = struct {
                 frame.has_failure = true;
             }
             if (message.tool_call_id) |call_id| {
-                appendCompanionTool(frame, call_id, message.author, message.body, message.tool_call_kind, message.tool_call_status, sequence);
+                appendCompanionTool(frame, call_id, message.author, message.body, message.tool_call_kind, message.tool_call_status, sequence, null);
                 continue;
             }
             const kind: companion_controller.ActivityKind = switch (message.role) {
@@ -5868,7 +5889,7 @@ pub const AppState = struct {
         for (send_state.pending_events.items, 0..) |event, index| {
             const sequence = base_sequence + @as(i64, @intCast(index));
             if (event.tool_call_id) |call_id| {
-                appendCompanionTool(frame, call_id, event.author, event.body, event.tool_call_kind, event.tool_call_status, sequence);
+                appendCompanionTool(frame, call_id, event.author, event.body, event.tool_call_kind, event.tool_call_status, sequence, &event);
             } else {
                 const kind: companion_controller.ActivityKind = switch (event.role) {
                     .user => .user,
@@ -5927,17 +5948,81 @@ pub const AppState = struct {
         };
     }
 
-    fn setCompanionProcessIdentity(identity: *companion_controller.PresentationText, task: *const BackgroundTask) bool {
-        if (task.task_id) |task_id| return identity.setIdentity("process:task", &.{task_id});
-        if (task.provider_thread_id) |provider_thread_id| {
-            if (task.item_id) |item_id| return identity.setIdentity("process:item", &.{ provider_thread_id, item_id });
-            if (task.process_id) |process_id| return identity.setIdentity("process:process", &.{ provider_thread_id, process_id });
+    fn setCompanionProcessTarget(operation: *companion_controller.Operation, task: *const BackgroundTask) bool {
+        var target: companion_controller.BackgroundTarget = undefined;
+        target.command = .{};
+        target.task_id = .{};
+        target.item_id = .{};
+        target.process_id = .{};
+        target.provider_thread_id = .{};
+        target.pid_path = .{};
+        target.log_path = .{};
+        target.pid = task.pid;
+        target.pid_verified = task.pid_verified;
+        target.provider_owned = task.provider == .codex or task.process_id != null;
+        if (!target.command.set(task.command) or
+            !target.task_id.set(if (task.task_id) |value| value else null) or
+            !target.item_id.set(if (task.item_id) |value| value else null) or
+            !target.process_id.set(if (task.process_id) |value| value else null) or
+            !target.provider_thread_id.set(if (task.provider_thread_id) |value| value else null) or
+            !target.pid_path.set(if (task.pid_path) |value| value else null) or
+            !target.log_path.set(if (task.log_path) |value| value else null)) return false;
+
+        if (task.task_id) |task_id| {
+            var exact: companion_controller.ExactText = .{};
+            if (!exact.set(task_id) or !operation.identity.setIdentity("process:task", &.{task_id})) return false;
+            target.identity = .{ .task_id = exact };
+        } else if (task.provider_thread_id) |provider_thread_id| {
+            if (task.item_id) |item_id| {
+                var exact_thread: companion_controller.ExactText = .{};
+                var exact_item: companion_controller.ExactText = .{};
+                if (!exact_thread.set(provider_thread_id) or !exact_item.set(item_id) or
+                    !operation.identity.setIdentity("process:item", &.{ provider_thread_id, item_id })) return false;
+                target.identity = .{ .item = .{ .provider_thread_id = exact_thread, .item_id = exact_item } };
+            } else if (task.process_id) |process_id| {
+                var exact_thread: companion_controller.ExactText = .{};
+                var exact_process: companion_controller.ExactText = .{};
+                if (!exact_thread.set(provider_thread_id) or !exact_process.set(process_id) or
+                    !operation.identity.setIdentity("process:process", &.{ provider_thread_id, process_id })) return false;
+                target.identity = .{ .process = .{ .provider_thread_id = exact_thread, .process_id = exact_process } };
+            } else return false;
+        } else if (task.item_id == null and task.process_id == null) {
+            if (!operation.identity.setIdentity("process:command", &.{task.command})) return false;
+            target.identity = .{ .command = target.command };
+        } else return false;
+
+        operation.target = .{ .background_task = target };
+        return true;
+    }
+
+    fn setCompanionProcessInspector(
+        operation: *companion_controller.Operation,
+        frame: *const companion_controller.Frame,
+        thread: *const ChatThread,
+        task: *const BackgroundTask,
+    ) void {
+        operation.inspector.owner.set(thread.title);
+        operation.inspector.workspace.set(frame.owner.workspace_id.slice());
+        operation.inspector.action.set(task.command);
+        const target = &operation.target.background_task;
+        switch (target.identity) {
+            .task_id => |value| operation.inspector.target.set(value.slice()),
+            .item => |value| operation.inspector.target.set(value.item_id.slice()),
+            .process => |value| operation.inspector.target.set(value.process_id.slice()),
+            .command => |value| operation.inspector.target.set(value.slice()),
         }
-        if (task.item_id == null and task.process_id == null) return identity.setIdentity("process:command", &.{task.command});
-        return false;
+        if (task.provider) |provider| operation.inspector.provider.set(@tagName(provider));
+        if (task.cwd) |value| operation.inspector.cwd.set(value);
+        operation.inspector.state.set(@tagName(operation.status));
+        if (task.started_at_ms != 0) operation.inspector.started_at_ms = task.started_at_ms;
+        if (task.updated_at_ms != 0) operation.inspector.updated_at_ms = task.updated_at_ms;
+        if (task.started_at_ms != 0 and task.updated_at_ms >= task.started_at_ms) {
+            operation.inspector.elapsed_ms = task.updated_at_ms - task.started_at_ms;
+        }
     }
 
     fn projectCompanionProcesses(frame: *companion_controller.Frame, project: *const Project, thread: *const ChatThread) void {
+        if (!frame.owner.valid) return;
         for (thread.background_tasks.items) |task| {
             var status = companionTaskStatus(task.status);
             var sequence = if (task.updated_at_ms != 0) task.updated_at_ms else task.started_at_ms;
@@ -5950,10 +6035,27 @@ pub const AppState = struct {
                 }
             }
             const title = if (status == .failed) "Command failed" else "Ran command";
-            var operation: companion_controller.Operation = .{ .status = status, .sequence = sequence, .process = true };
-            if (!setCompanionProcessIdentity(&operation.identity, &task)) continue;
+            var operation: companion_controller.Operation = .{
+                .category = .background_task,
+                .status = status,
+                .sequence = sequence,
+                .process = true,
+            };
+            if (!setCompanionProcessTarget(&operation, &task)) continue;
             operation.title.set(title);
             operation.detail.set(task.command);
+            setCompanionProcessInspector(&operation, frame, thread, &task);
+            const target = &operation.target.background_task;
+            const command_only = std.meta.activeTag(target.identity) == .command;
+            if (!command_only and task.status == .running and !task.stop_requested) {
+                operation.actions.stop = if (target.provider_owned)
+                    target.provider_thread_id.present and target.process_id.present
+                else
+                    target.pid_verified and (target.pid != null or target.pid_path.present);
+                operation.actions.follow_log = target.log_path.present;
+            } else if (!command_only) {
+                operation.actions.follow_log = target.log_path.present;
+            }
             frame.upsertOperation(operation);
             var activity: companion_controller.ActivityItem = .{ .kind = .process, .status = status, .sequence = sequence };
             activity.identity = operation.identity;
@@ -5985,8 +6087,7 @@ pub const AppState = struct {
             !std.mem.eql(u8, self.companion_controller.presentation.thread_id.slice(), thread.local_thread_id);
         if (owner_changed) {
             var owner_frame: companion_controller.Frame = .{ .has_thread = true };
-            owner_frame.workspace_id.set(project.id);
-            owner_frame.thread_id.set(thread.local_thread_id);
+            _ = owner_frame.setOwner(project.id, thread.local_thread_id);
             self.companion_controller.setFrame(owner_frame);
             self.companion_controller.clearHits();
         }
@@ -5995,8 +6096,7 @@ pub const AppState = struct {
         defer send_state.mutex.unlock();
 
         var frame: companion_controller.Frame = .{ .has_thread = true };
-        frame.workspace_id.set(project.id);
-        frame.thread_id.set(thread.local_thread_id);
+        _ = frame.setOwner(project.id, thread.local_thread_id);
         frame.working = send_state.status == .pending;
         projectCompanionTranscript(&frame, thread);
         projectCompanionPending(&frame, send_state);
@@ -7896,7 +7996,7 @@ pub const AppState = struct {
                 return true;
             }
             switch (hit.action) {
-                .stop => self.stopBackgroundTask(hit.project_index, thread, task),
+                .stop => _ = self.stopBackgroundTask(hit.project_index, thread, task),
                 .output => self.openBackgroundTaskOutput(hit.project_index, task, hit.message_index),
             }
             return true;
@@ -7904,18 +8004,18 @@ pub const AppState = struct {
         return false;
     }
 
-    fn stopBackgroundTask(self: *AppState, project_index: usize, thread: *ChatThread, task: *BackgroundTask) void {
-        if (task.status != .running or task.stop_requested) return;
+    fn stopBackgroundTask(self: *AppState, project_index: usize, thread: *ChatThread, task: *BackgroundTask) bool {
+        if (task.status != .running or task.stop_requested) return false;
         if (task.provider == .codex or task.process_id != null) {
             const thread_id = task.provider_thread_id orelse {
                 self.setSidebarNotice("Codex background task is missing its thread ID.");
-                return;
+                return false;
             };
             const process_id = task.process_id orelse {
                 self.setSidebarNotice("Codex background task is missing its process ID.");
-                return;
+                return false;
             };
-            const target = self.providerExecutionTargetForProjectThread(project_index, thread, 0) orelse return;
+            const target = self.providerExecutionTargetForProjectThread(project_index, thread, 0) orelse return false;
             const config: ai_harness.ProviderConfig = .{ .codex = .{
                 .cwd = target.cwd(),
                 .launch_on_connect = false,
@@ -7924,41 +8024,141 @@ pub const AppState = struct {
             var client = ai_harness.connect(self.allocator, config) catch |err| {
                 log.warn("failed to connect for background task stop: {s}", .{@errorName(err)});
                 self.setSidebarNotice("Failed to connect to Codex to stop the background task.");
-                return;
+                return false;
             };
             defer client.deinit();
             client.terminateBackgroundTerminal(thread_id, process_id) catch |err| {
                 log.warn("failed to stop Codex background task: {s}", .{@errorName(err)});
                 self.setSidebarNotice("Codex could not stop the background task.");
-                return;
+                return false;
             };
             task.stop_requested = true;
             task.status = .stopped;
-            const body = backgroundTaskCompletionBodyAlloc(self.allocator, task) catch return;
+            const body = backgroundTaskCompletionBodyAlloc(self.allocator, task) catch return false;
             defer self.allocator.free(body);
-            self.appendMessageToThread(thread, .system, "Background task stopped", body, null, &.{}) catch return;
+            self.appendMessageToThread(thread, .system, "Background task stopped", body, null, &.{}) catch return false;
             self.markDirty();
-            return;
+            return true;
         }
         if (!task.pid_verified) {
             self.setSidebarNotice("Cannot safely stop this restored PID; wait for a new live task event.");
-            return;
+            return false;
         }
         const pid = task.pid orelse if (task.pid_path) |path| readBackgroundTaskPid(self.allocator, path) else null;
         const resolved_pid = pid orelse {
             self.setSidebarNotice("Background task PID is not available yet.");
-            return;
+            return false;
         };
         platform_process.terminateProcessIdTree(resolved_pid) catch |err| {
             log.warn("failed to stop background process tree: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to request background task termination.");
-            return;
+            return false;
         };
         task.pid = resolved_pid;
         task.stop_requested = true;
         task.last_poll_ms = 0;
         self.setSidebarNotice("Stopping background task...");
         self.markDirty();
+        return true;
+    }
+
+    const ResolvedCompanionBackgroundTask = struct {
+        project_index: usize,
+        thread_index: usize,
+        task_index: usize,
+    };
+
+    fn resolveCompanionBackgroundTask(
+        self: *AppState,
+        reference: *const companion_controller.OperationReference,
+        action: companion_controller.OperationAction,
+    ) ?ResolvedCompanionBackgroundTask {
+        if (self.project_controller.projects.items.len == 0 or
+            self.project_controller.selected_index >= self.project_controller.projects.items.len) return null;
+        const selected_project = &self.project_controller.projects.items[self.project_controller.selected_index];
+        if (!reference.owner.valid or !std.mem.eql(u8, selected_project.id, reference.owner.workspace_id.slice())) return null;
+        if (!self.companion_controller.presentation.containsReference(reference)) return null;
+        const supported = switch (action) {
+            .stop => reference.actions.stop,
+            .follow_log => reference.actions.follow_log,
+        };
+        if (!supported or reference.category != .background_task or std.meta.activeTag(reference.target) != .background_task) return null;
+
+        const resolved = self.projectThreadIndexByLocalId(
+            reference.owner.workspace_id.slice(),
+            reference.owner.local_thread_id.slice(),
+        ) orelse return null;
+        if (resolved.project_index != self.project_controller.selected_index) return null;
+        const project = &self.project_controller.projects.items[resolved.project_index];
+        const companion_local_id = project.companion_thread_local_id orelse return null;
+        if (!std.mem.eql(u8, companion_local_id, reference.owner.local_thread_id.slice())) return null;
+        const thread = &project.threads.items[resolved.thread_index];
+        const expected = &reference.target.background_task;
+        var matched_index: ?usize = null;
+        for (thread.background_tasks.items, 0..) |*task, task_index| {
+            var current: companion_controller.Operation = .{ .category = .background_task };
+            if (!setCompanionProcessTarget(&current, task)) continue;
+            if (!std.meta.eql(current.target.background_task, expected.*)) continue;
+            if (matched_index != null) return null;
+            matched_index = task_index;
+        }
+        const task_index = matched_index orelse return null;
+        const task = &thread.background_tasks.items[task_index];
+        switch (action) {
+            .stop => {
+                if (task.status != .running or task.stop_requested) return null;
+                const provider_owned = task.provider == .codex or task.process_id != null;
+                if (provider_owned) {
+                    if (task.provider_thread_id == null or task.process_id == null) return null;
+                } else if (!task.pid_verified or (task.pid == null and task.pid_path == null)) return null;
+            },
+            .follow_log => if (task.log_path == null) return null,
+        }
+        return .{
+            .project_index = resolved.project_index,
+            .thread_index = resolved.thread_index,
+            .task_index = task_index,
+        };
+    }
+
+    fn rejectCompanionOperationAction(self: *AppState, message: []const u8) bool {
+        self.companion_controller.ui_error = message;
+        self.companion_controller.presentation.ui_error.set(message);
+        self.companion_controller.presentation.has_failure = true;
+        return false;
+    }
+
+    /// Revalidates immutable frame routing against the current Companion owner
+    /// and background-task record immediately before invoking its sole owner.
+    pub fn dispatchCompanionOperationAction(
+        self: *AppState,
+        reference: companion_controller.OperationReference,
+        action: companion_controller.OperationAction,
+    ) bool {
+        const resolved = self.resolveCompanionBackgroundTask(&reference, action) orelse
+            return self.rejectCompanionOperationAction("This Companion operation is no longer available.");
+        const project = &self.project_controller.projects.items[resolved.project_index];
+        const thread = &project.threads.items[resolved.thread_index];
+        const task = &thread.background_tasks.items[resolved.task_index];
+        const succeeded = switch (action) {
+            .stop => self.stopBackgroundTask(resolved.project_index, thread, task),
+            .follow_log => self.followCompanionBackgroundTaskLog(task),
+        };
+        if (!succeeded) return self.rejectCompanionOperationAction("The Companion operation owner rejected this action.");
+        self.companion_controller.ui_error = null;
+        self.companion_controller.presentation.ui_error.set("");
+        return true;
+    }
+
+    fn followCompanionBackgroundTaskLog(self: *AppState, task: *const BackgroundTask) bool {
+        const log_path = task.log_path orelse return false;
+        const command = backgroundLogFollowCommandAlloc(self.allocator, log_path) catch return false;
+        defer self.allocator.free(command);
+        const pane_id = self.openCurrentProjectTerminalPaneForCommand() orelse return false;
+        const wrote = self.writeWorkspaceTerminalPane(pane_id, command) catch return false;
+        if (!wrote) return false;
+        self.markDirty();
+        return true;
     }
 
     fn openBackgroundTaskOutput(self: *AppState, project_index: usize, task: *BackgroundTask, message_index: usize) void {
@@ -9466,6 +9666,144 @@ test "Companion production projection rejects lossy identities and preserves own
         if (std.mem.eql(u8, operation.detail.slice(), "legacy-survivor")) shifted_survivor = operation.identity;
     }
     try std.testing.expectEqualStrings(saved_survivor.slice(), shifted_survivor.?.slice());
+}
+
+test "Companion operation snapshots expose only exact live owner actions" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.companion_controller = companion_controller.init();
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+    var project = try Project.init(allocator, "operation-owner", "Operation owner", "/tmp/operation-owner", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    const thread = try state.project_controller.projects.items[0].ensureCompanionThread(allocator);
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "Ran command"),
+        .body = try allocator.dupeZ(u8, "historical reduced body"),
+        .tool_call_id = try allocator.dupe(u8, "historical:call"),
+        .tool_call_kind = .execute,
+        .tool_call_status = .completed,
+    });
+    try thread.send_state.pending_events.append(std.heap.page_allocator, .{
+        .role = .system,
+        .author = try std.heap.page_allocator.dupe(u8, "Ran command"),
+        .body = try std.heap.page_allocator.dupe(u8, "live body"),
+        .tool_call_id = try std.heap.page_allocator.dupe(u8, "live:call"),
+        .tool_call_kind = .execute,
+        .tool_call_status = .in_progress,
+        .tool_call_input = try std.heap.page_allocator.dupe(u8, "{\"cmd\":\"mise run build\"}"),
+        .tool_call_output = try std.heap.page_allocator.dupe(u8, "building"),
+        .tool_call_error = try std.heap.page_allocator.dupe(u8, "not a final failure"),
+        .tool_call_locations = try std.heap.page_allocator.dupe(u8, "packages/desktop/src/state.zig"),
+        .tool_call_raw = try std.heap.page_allocator.dupe(u8, "{\"resource\":\"build\"}"),
+    });
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "provider command"),
+        .task_id = try allocator.dupeZ(u8, "provider:task"),
+        .process_id = try allocator.dupeZ(u8, "process:one"),
+        .provider_thread_id = try allocator.dupeZ(u8, "provider:thread"),
+        .provider = .codex,
+        .log_path = try allocator.dupeZ(u8, "/tmp/provider:task.log"),
+        .status = .running,
+        .started_at_ms = 100,
+        .updated_at_ms = 140,
+    });
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "local command"),
+        .task_id = try allocator.dupeZ(u8, "local:task"),
+        .pid = 4242,
+        .pid_verified = true,
+        .log_path = try allocator.dupeZ(u8, "/tmp/local.log"),
+        .status = .running,
+    });
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "restored command"),
+        .task_id = try allocator.dupeZ(u8, "restored:task"),
+        .pid = 4343,
+        .pid_verified = false,
+        .status = .running,
+    });
+    try thread.background_tasks.append(allocator, .{ .command = try allocator.dupeZ(u8, "duplicate command"), .status = .running });
+    try thread.background_tasks.append(allocator, .{ .command = try allocator.dupeZ(u8, "duplicate command"), .status = .running });
+
+    state.syncCompanionProjection();
+    const frame = &state.companion_controller.presentation;
+    try std.testing.expect(frame.owner.valid);
+    var historical_index: ?usize = null;
+    var live_index: ?usize = null;
+    var provider_index: ?usize = null;
+    var local_index: ?usize = null;
+    var restored_index: ?usize = null;
+    var command_index: ?usize = null;
+    for (frame.operations[0..frame.operation_count], 0..) |operation, index| {
+        if (std.mem.eql(u8, operation.detail.slice(), "historical reduced body")) historical_index = index;
+        if (std.mem.eql(u8, operation.detail.slice(), "live body")) live_index = index;
+        if (std.mem.eql(u8, operation.detail.slice(), "provider command")) provider_index = index;
+        if (std.mem.eql(u8, operation.detail.slice(), "local command")) local_index = index;
+        if (std.mem.eql(u8, operation.detail.slice(), "restored command")) restored_index = index;
+        if (std.mem.eql(u8, operation.detail.slice(), "duplicate command")) command_index = index;
+    }
+
+    const historical = &frame.operations[historical_index.?];
+    try std.testing.expectEqual(companion_controller.OperationCategory.provider_tool, historical.category);
+    try std.testing.expectEqual(@as(usize, 0), historical.inspector.input.slice().len);
+    try std.testing.expectEqual(@as(usize, 0), historical.inspector.locations.slice().len);
+    try std.testing.expect(historical.actions.inspect and !historical.actions.stop and !historical.actions.follow_log);
+    const live = &frame.operations[live_index.?];
+    try std.testing.expectEqualStrings("{\"cmd\":\"mise run build\"}", live.inspector.input.slice());
+    try std.testing.expectEqualStrings("building", live.inspector.output.slice());
+    try std.testing.expectEqualStrings("packages/desktop/src/state.zig", live.inspector.locations.slice());
+    try std.testing.expectEqual(@as(usize, 0), live.inspector.file_count);
+    try std.testing.expectEqual(@as(usize, 0), live.inspector.resource_count);
+    try std.testing.expect(!live.actions.reveal and !live.actions.redirect);
+
+    const provider_operation = &frame.operations[provider_index.?];
+    try std.testing.expect(provider_operation.actions.stop and provider_operation.actions.follow_log);
+    try std.testing.expectEqual(@as(?i64, 40), provider_operation.inspector.elapsed_ms);
+    const provider_reference = frame.operationReference(provider_index.?).?;
+    const provider_target = &provider_reference.target.background_task;
+    try std.testing.expectEqualStrings("provider:thread", provider_target.provider_thread_id.slice().?);
+    try std.testing.expectEqualStrings("process:one", provider_target.process_id.slice().?);
+    try std.testing.expect(state.resolveCompanionBackgroundTask(&provider_reference, .stop) != null);
+    try std.testing.expect(state.resolveCompanionBackgroundTask(&provider_reference, .follow_log) != null);
+
+    const local_operation = &frame.operations[local_index.?];
+    try std.testing.expect(local_operation.actions.stop and local_operation.actions.follow_log);
+    const local_reference = frame.operationReference(local_index.?).?;
+    try std.testing.expectEqual(@as(?u32, 4242), local_reference.target.background_task.pid);
+    try std.testing.expect(state.resolveCompanionBackgroundTask(&local_reference, .stop) != null);
+    const restored_operation = &frame.operations[restored_index.?];
+    try std.testing.expect(!restored_operation.actions.stop and !restored_operation.actions.follow_log);
+    const command_operation = &frame.operations[command_index.?];
+    try std.testing.expect(std.meta.activeTag(command_operation.target.background_task.identity) == .command);
+    try std.testing.expect(command_operation.actions.inspect and !command_operation.actions.stop and !command_operation.actions.follow_log);
+
+    const old_process_id = thread.background_tasks.items[0].process_id.?;
+    thread.background_tasks.items[0].process_id = try allocator.dupeZ(u8, "replacement:process");
+    allocator.free(old_process_id);
+    try std.testing.expect(state.resolveCompanionBackgroundTask(&provider_reference, .stop) == null);
+
+    var other = try Project.init(allocator, "other-workspace", "Other", "/tmp/other-workspace", 0);
+    state.project_controller.projects.append(allocator, other) catch |err| {
+        other.deinit(allocator);
+        return err;
+    };
+    state.project_controller.selected_index = 1;
+    const focused_before = if (state.project_controller.projects.items[1].workspace_layout.focusedPane()) |pane| pane.id else null;
+    try std.testing.expect(!state.dispatchCompanionOperationAction(local_reference, .stop));
+    try std.testing.expectEqual(@as(usize, 1), state.project_controller.selected_index);
+    const focused_after = if (state.project_controller.projects.items[1].workspace_layout.focusedPane()) |pane| pane.id else null;
+    try std.testing.expectEqual(focused_before, focused_after);
+    try std.testing.expect(state.companion_controller.presentation.ui_error.slice().len > 0);
 }
 
 test "Companion submitted seam preflights before first persistence and reuses identity" {
