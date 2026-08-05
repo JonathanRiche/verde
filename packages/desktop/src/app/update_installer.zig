@@ -5,6 +5,11 @@ const builtin = @import("builtin");
 const platform_runtime = @import("platform_runtime");
 const process_env = @import("../platform/env.zig");
 
+// Waits for the exiting app (format arg: pid), bounded so a stalled quit
+// cannot leave the detached installer looping forever.
+const WAIT_FOR_PID_TEMPLATE =
+    "i=0; while kill -0 {d} 2>/dev/null && [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done; ";
+
 pub const Launch = enum {
     started,
     started_and_exit_required,
@@ -21,26 +26,47 @@ pub fn aurCommand(launch_result: Launch) ?[]const []const u8 {
     };
 }
 
-/// Starts the official Verde installer. Windows waits for the caller to exit
-/// before replacing its locked executable, then launches the updated app.
+/// Starts the official Verde installer. Every scripted path (Windows, macOS,
+/// non-AUR Linux) waits for the caller to exit before replacing the in-use
+/// binary/bundle, then relaunches the updated app, so they report
+/// `.started_and_exit_required`. AUR installs run interactively in a
+/// terminal pane instead, so the app must stay alive for those.
 pub fn launch(allocator: std.mem.Allocator) !Launch {
     return switch (builtin.os.tag) {
         .linux => {
             if (try detectLinuxAurLaunch(allocator)) |launch_result| return launch_result;
-            try spawnDetached(allocator, &.{
-                "sh",
-                "-c",
-                "curl -fsSL https://verdeai.dev/install.sh | sh",
-            });
-            return .started;
+            // Quit before installing so the relaunch actually runs the new
+            // binary; install.sh puts it at $VERDE_INSTALL_PREFIX/bin/verde
+            // (default ~/.local). The helper inherits our env, so Wayland
+            // session variables survive into the relaunched app.
+            const command = try std.fmt.allocPrint(
+                allocator,
+                WAIT_FOR_PID_TEMPLATE ++
+                    "curl -fsSL https://verdeai.dev/install.sh | sh || exit 1; " ++
+                    "exec \"${{VERDE_INSTALL_PREFIX:-$HOME/.local}}/bin/verde\"",
+                .{platform_runtime.processId()},
+            );
+            defer allocator.free(command);
+            try spawnDetached(allocator, &.{ "sh", "-c", command });
+            return .started_and_exit_required;
         },
         .macos => {
-            try spawnDetached(allocator, &.{
-                "sh",
-                "-c",
-                "curl -fsSL https://verdeai.dev/install.sh | sh",
-            });
-            return .started;
+            // install.sh replaces Verde.app in place, so the running bundle must
+            // quit first; the helper waits for this pid (bounded, in case quit
+            // stalls), installs, then relaunches from the same directory-preference
+            // order install.sh uses to pick MACOS_APP_DIR.
+            const command = try std.fmt.allocPrint(
+                allocator,
+                WAIT_FOR_PID_TEMPLATE ++
+                    "curl -fsSL https://verdeai.dev/install.sh | sh || exit 1; " ++
+                    "if [ -d \"$HOME/Applications/Verde.app\" ]; then exec open \"$HOME/Applications/Verde.app\"; fi; " ++
+                    "if [ -d /Applications/Verde.app ]; then exec open /Applications/Verde.app; fi; " ++
+                    "exec open -a Verde",
+                .{platform_runtime.processId()},
+            );
+            defer allocator.free(command);
+            try spawnDetached(allocator, &.{ "sh", "-c", command });
+            return .started_and_exit_required;
         },
         .windows => {
             const command = try std.fmt.allocPrint(
