@@ -78,6 +78,10 @@ position or the selected scrolling policy.
 
 - `Alt+Shift+← ↑ ↓ →` — grow the focused pane in that direction.
 - Drag the divider between two workspace panes to resize the split manually.
+- In scrolling layout, drag a pane's trailing edge to resize all columns within
+  a 240–1600 px range. The custom width persists for that workspace; run
+  **Reset Scrolling Column Width** from the command palette to return to
+  **Panes per view** sizing.
 
 Resizes are committed to the layout immediately and persist with the workspace.
 
