@@ -62,6 +62,14 @@ pub fn flushDirtyBlocking(self: anytype) void {
     self.lifecycle.clearDirty();
 }
 
+pub fn persistThreadBlocking(self: anytype, project_index: usize, thread_index: usize) !void {
+    const project = &self.project_controller.projects.items[project_index];
+    var arena = std.heap.ArenaAllocator.init(self.storage.allocator);
+    defer arena.deinit();
+    const snapshot = try persistence.threadSnapshot(arena.allocator(), &project.threads.items[thread_index]);
+    try self.storage.saveThread(project.id, thread_index, snapshot);
+}
+
 pub fn flushDirtyNow(self: anytype) void {
     if (!self.lifecycle.dirty) return;
 

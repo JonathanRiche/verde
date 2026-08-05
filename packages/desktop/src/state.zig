@@ -1219,7 +1219,7 @@ pub const ReasoningOption = provider_models.ReasoningOption;
 const FastModeOption = provider_models.FastModeOption;
 const AccessModeOption = provider_models.AccessModeOption;
 
-const TranscriptMarkdownBody = chat_types.TranscriptMarkdownBody;
+pub const TranscriptMarkdownBody = chat_types.TranscriptMarkdownBody;
 const TranscriptHeightEntry = chat_types.TranscriptHeightEntry;
 
 pub const TranscriptMarkdownSelectionPoint = transcript_controller.MarkdownSelectionPoint;
@@ -3072,6 +3072,7 @@ pub const AppState = struct {
     pub const commandPaletteQueryBuffer = command_controller.commandPaletteQueryBuffer;
     pub const flushIfDirty = lifecycle_controller.flushIfDirty;
     pub const flushDirtyBlocking = lifecycle_controller.flushDirtyBlocking;
+    pub const persistThreadBlocking = lifecycle_controller.persistThreadBlocking;
     pub const flushDirtyNow = lifecycle_controller.flushDirtyNow;
     pub const currentThreadMutable = transcript_controller.currentThreadMutable;
     pub const rememberCurrentTranscriptScroll = transcript_controller.rememberCurrentTranscriptScroll;
@@ -3947,6 +3948,7 @@ pub const AppState = struct {
     pub const isTranscriptFocused = transcript_controller.isTranscriptFocused;
     pub const ensureTranscriptMarkdownSelectionCurrent = transcript_controller.ensureTranscriptMarkdownSelectionCurrent;
     pub const transcriptMarkdownSelection = transcript_controller.transcriptMarkdownSelection;
+    pub const peekTranscriptMarkdownSelection = transcript_controller.peekTranscriptMarkdownSelection;
     pub const transcriptMarkdownSelectionDragging = transcript_controller.transcriptMarkdownSelectionDragging;
     pub const transcriptMarkdownSelectionActive = transcript_controller.transcriptMarkdownSelectionActive;
     pub const beginTranscriptMarkdownSelection = transcript_controller.beginTranscriptMarkdownSelection;
@@ -3956,11 +3958,13 @@ pub const AppState = struct {
     pub const selectAllTranscriptMarkdownSelection = transcript_controller.selectAllTranscriptMarkdownSelection;
     pub const clearTranscriptMarkdownSelection = transcript_controller.clearTranscriptMarkdownSelection;
     pub const transcriptMarkdownBodyView = transcript_controller.transcriptMarkdownBodyView;
+    pub const transcriptPlainBodyView = transcript_controller.transcriptPlainBodyView;
     pub const cachedTranscriptMessageHeight = transcript_controller.cachedTranscriptMessageHeight;
     pub const putTranscriptMessageHeight = transcript_controller.putTranscriptMessageHeight;
     pub const ensureTranscriptMarkdownEntries = transcript_controller.ensureTranscriptMarkdownEntries;
     pub const clearTranscriptMarkdownEntries = transcript_controller.clearTranscriptMarkdownEntries;
     pub const transcriptMarkdownBodyEntry = transcript_controller.transcriptMarkdownBodyEntry;
+    pub const transcriptPlainBodyEntry = transcript_controller.transcriptPlainBodyEntry;
     pub const createTranscriptMarkdownBody = transcript_controller.createTranscriptMarkdownBody;
     pub const buildCurrentTranscriptSelectionText = transcript_controller.buildCurrentTranscriptSelectionText;
 
@@ -7673,6 +7677,7 @@ pub const AppState = struct {
         self.card_toggle_hits.deinit(self.allocator);
         self.background_task_action_hits.deinit(self.allocator);
         self.expanded_cards.deinit();
+        self.terminal_controller.deinit(self.allocator);
         self.closeTranscriptSelectionModal();
         self.clearProjects();
         self.clearSurfaces();

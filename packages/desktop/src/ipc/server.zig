@@ -6,6 +6,7 @@ const browser_runtime = @import("../browser/mod.zig");
 const browser_ui = @import("../ui/browser.zig");
 const command_palette = @import("../ui/command_palette.zig");
 const herdr = @import("../workspace/herdr.zig");
+const loop_wakeup = @import("loop_wakeup");
 const platform_ipc = @import("../platform/ipc.zig");
 const live_endpoint = @import("../platform/live_endpoint.zig");
 const platform_runtime = @import("platform_runtime");
@@ -17,25 +18,31 @@ pub const SOCKET_NAME = live_endpoint.SOCKET_NAME;
 const LIVE_MAX_RESPONSE_BYTES = platform_ipc.DEFAULT_MAX_RESPONSE_BYTES;
 
 const Mutex = struct {
-    inner: std.atomic.Mutex = .unlocked,
+    inner: std.Io.Mutex = .init,
 
     fn lock(self: *Mutex) void {
-        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+        var threaded = std.Io.Threaded.init_single_threaded;
+        self.inner.lockUncancelable(threaded.io());
     }
 
     fn unlock(self: *Mutex) void {
-        self.inner.unlock();
+        var threaded = std.Io.Threaded.init_single_threaded;
+        self.inner.unlock(threaded.io());
     }
 };
 
 const Condition = struct {
-    fn wait(_: *Condition, mutex: *Mutex) void {
-        mutex.unlock();
-        std.atomic.spinLoopHint();
-        mutex.lock();
+    inner: std.Io.Condition = .init,
+
+    fn wait(self: *Condition, mutex: *Mutex) void {
+        var threaded = std.Io.Threaded.init_single_threaded;
+        self.inner.waitUncancelable(threaded.io(), &mutex.inner);
     }
 
-    fn broadcast(_: *Condition) void {}
+    fn broadcast(self: *Condition) void {
+        var threaded = std.Io.Threaded.init_single_threaded;
+        self.inner.broadcast(threaded.io());
+    }
 };
 
 const Command = struct {
@@ -135,6 +142,7 @@ pub const LiveServer = struct {
             self.allocator.destroy(command);
             return err;
         };
+        loop_wakeup.notify();
         self.condition.broadcast();
         while (!command.done and !self.shutdown) self.condition.wait(&self.mutex);
         if (self.shutdown and !command.done) {

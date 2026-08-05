@@ -15,6 +15,9 @@ const deinitWorkspacePaneRef = workspace_layout.deinitWorkspacePaneRef;
 
 const ACTIVITY_BURST_WINDOW_MS: i64 = 250;
 const POLL_INTERVAL_MS: i64 = 16;
+// Process watch/config/restart maintenance is human-paced and already uses
+// 1-2 second inner cadences. Keep it off the display-rate terminal tail path.
+const MANAGED_PROCESS_POLL_INTERVAL_MS: i64 = 250;
 
 fn monotonicMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
@@ -22,6 +25,30 @@ fn monotonicMs() i64 {
 
 fn unixTimestampMs() i64 {
     return platform_runtime.unixTimestampMs();
+}
+
+fn daemonBatchRetryDelayMs(err: anyerror) i64 {
+    return if (err == error.UnsupportedDaemonBatch) 5_000 else 250;
+}
+
+fn managedProcessPollDue(last_poll_ms: i64, now_ms: i64) bool {
+    return last_poll_ms == 0 or
+        now_ms < last_poll_ms or
+        now_ms - last_poll_ms >= MANAGED_PROCESS_POLL_INTERVAL_MS;
+}
+
+test "terminal daemon batch fallback is bounded without changing poll cadence" {
+    try std.testing.expectEqual(@as(i64, 5_000), daemonBatchRetryDelayMs(error.UnsupportedDaemonBatch));
+    try std.testing.expectEqual(@as(i64, 250), daemonBatchRetryDelayMs(error.InvalidSessionResponse));
+    try std.testing.expectEqual(@as(i64, 16), POLL_INTERVAL_MS);
+}
+
+test "managed process maintenance is decoupled from terminal tail cadence" {
+    try std.testing.expect(managedProcessPollDue(0, 100));
+    try std.testing.expect(!managedProcessPollDue(100, 349));
+    try std.testing.expect(managedProcessPollDue(100, 350));
+    try std.testing.expect(managedProcessPollDue(500, 10));
+    try std.testing.expectEqual(@as(i64, 16), POLL_INTERVAL_MS);
 }
 
 pub const DefaultAgentTui = struct {
@@ -119,7 +146,14 @@ pub const State = struct {
     debug_workspace_visible_pane_count: usize = 0,
     last_activity_ms: i64 = 0,
     last_poll_ms: i64 = 0,
+    last_managed_process_poll_ms: i64 = 0,
     poll_requested: bool = false,
+    daemon_batch_retry_at_ms: i64 = 0,
+    daemon_poll_batch: terminal.DaemonPollBatch = .{},
+
+    pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
+        self.daemon_poll_batch.deinit(allocator);
+    }
 };
 
 pub fn currentProjectTerminal(self: anytype) *const terminal.Dock {
@@ -380,12 +414,44 @@ pub fn pollTerminals(self: anytype) bool {
     }
     self.terminal_controller.poll_requested = false;
     self.terminal_controller.last_poll_ms = now_ms;
+    const poll_managed_processes = managedProcessPollDue(
+        self.terminal_controller.last_managed_process_poll_ms,
+        now_ms,
+    );
+    if (poll_managed_processes) self.terminal_controller.last_managed_process_poll_ms = now_ms;
+
+    const daemon_batch = &self.terminal_controller.daemon_poll_batch;
+    daemon_batch.reset();
+    defer daemon_batch.reset();
+    if (self.project_controller.selected_index < self.project_controller.projects.items.len) {
+        const selected_project = &self.project_controller.projects.items[self.project_controller.selected_index];
+        const base_visible = selected_project.terminal_dock.visible or selected_project.workspace_layout.hasTerminalDockPane(0);
+        if (base_visible or selected_project.terminal_dock.hasRunningSession()) {
+            selected_project.terminal_dock.appendDaemonPollSessions(self.allocator, daemon_batch) catch |err| {
+                log.debug("failed to collect terminal daemon batch: {s}", .{@errorName(err)});
+            };
+        }
+        for (selected_project.terminal_docks.items) |*entry| {
+            const dock_visible = entry.dock.visible or selected_project.workspace_layout.hasTerminalDockPane(entry.id);
+            if (!dock_visible and !entry.dock.hasRunningSession()) continue;
+            entry.dock.appendDaemonPollSessions(self.allocator, daemon_batch) catch |err| {
+                log.debug("failed to collect terminal dock daemon batch: {s}", .{@errorName(err)});
+            };
+        }
+        if (now_ms >= self.terminal_controller.daemon_batch_retry_at_ms) {
+            daemon_batch.prefetch(self.allocator, self.storage.pref_path) catch |err| {
+                // Per-session polling below is the compatibility and failure fallback.
+                self.terminal_controller.daemon_batch_retry_at_ms = now_ms + daemonBatchRetryDelayMs(err);
+                log.debug("terminal daemon batch unavailable: {s}", .{@errorName(err)});
+            };
+        }
+    }
     for (self.project_controller.projects.items, 0..) |*project, project_index| {
         self.pollPendingTerminalSessionTeardowns(project_index);
         const project_selected = project_index == self.project_controller.selected_index;
         const base_visible = project.terminal_dock.visible or project.workspace_layout.hasTerminalDockPane(0);
         if (!project_selected) {
-            self.pollManagedProcesses(project_index);
+            if (poll_managed_processes) self.pollManagedProcesses(project_index);
             continue;
         }
         if (project_selected and base_visible and !project.terminal_dock.hasRunningSession() and project.terminal_dock.reserveAutoRestart(now_ms)) {
@@ -460,7 +526,7 @@ pub fn pollTerminals(self: anytype) bool {
                 visible_changed = true;
             }
         }
-        self.pollManagedProcesses(project_index);
+        if (poll_managed_processes) self.pollManagedProcesses(project_index);
     }
     self.pollArchivedTerminalSessionTeardowns();
     visible_changed = self.pollUpdateInstallerTerminal() or visible_changed;

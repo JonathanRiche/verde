@@ -105,6 +105,7 @@ pub const Method = enum {
     @"session.write",
     @"session.resize",
     @"session.tail",
+    @"session.tail.batch",
     @"session.screen",
     @"session.kill",
     @"session.cleanup",
@@ -123,10 +124,16 @@ pub const METHOD_NAMES = [_][]const u8{
     "session.write",
     "session.resize",
     "session.tail",
+    "session.tail.batch",
     "session.screen",
     "session.kill",
     "session.cleanup",
 };
+
+test "session tail batching is an additive daemon method" {
+    try std.testing.expectEqualStrings("session.tail", METHOD_NAMES[7]);
+    try std.testing.expectEqualStrings("session.tail.batch", METHOD_NAMES[8]);
+}
 
 pub fn stableSessionId(
     allocator: std.mem.Allocator,
@@ -1270,6 +1277,7 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, "session.write")) return try self.writeResponse(id_value, params);
         if (std.mem.eql(u8, method, "session.resize")) return try self.resizeResponse(id_value, params);
         if (std.mem.eql(u8, method, "session.tail")) return try self.tailResponse(id_value, params, false);
+        if (std.mem.eql(u8, method, "session.tail.batch")) return try self.tailBatchResponse(id_value, params);
         if (std.mem.eql(u8, method, "session.screen")) return try self.tailResponse(id_value, params, true);
         if (std.mem.eql(u8, method, "session.kill")) return try self.killResponse(id_value, params);
         if (std.mem.eql(u8, method, "session.cleanup")) return try self.cleanupResponse(id_value);
@@ -1471,6 +1479,51 @@ pub const Daemon = struct {
     fn tailResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value, screen: bool) ![]u8 {
         const session = try self.requiredSession(id_value, params);
         if (params != .object) unreachable;
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer writer.deinit();
+        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try self.writeTailResult(&s, session, params, screen);
+        try s.endObject();
+        return try writer.toOwnedSlice();
+    }
+
+    fn tailBatchResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        if (params != .object) return error.InvalidParams;
+        const requests = params.object.get("requests") orelse return error.InvalidParams;
+        if (requests != .array) return error.InvalidParams;
+
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer writer.deinit();
+        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try s.beginObject();
+        try s.objectField("responses");
+        try s.beginArray();
+        for (requests.array.items) |request| {
+            try s.beginObject();
+            const session = if (request == .object)
+                if (jsonString(request.object.get("id") orelse .null)) |session_id| self.find(session_id) else null
+            else
+                null;
+            if (session) |found| {
+                try s.objectField("result");
+                try self.writeTailResult(&s, found, request, false);
+            } else {
+                try s.objectField("error");
+                try s.write("not_found");
+            }
+            try s.endObject();
+        }
+        try s.endArray();
+        try s.endObject();
+        try s.endObject();
+        return try writer.toOwnedSlice();
+    }
+
+    fn writeTailResult(self: *Daemon, s: *std.json.Stringify, session: *PtySession, params: std.json.Value, screen: bool) !void {
         touchAttachFromParams(session, params);
         try session.poll(self.allocator);
         const lines = jsonU32(params.object.get("lines") orelse .null) orelse if (screen) DEFAULT_ROWS else 80;
@@ -1483,7 +1536,7 @@ pub const Daemon = struct {
         const text = try self.allocator.dupe(u8, session.output_ring.items[text_range.start..text_range.end]);
         defer self.allocator.free(text);
         const ring_start = session.ringStart();
-        return try okValueResponse(self.allocator, id_value, .{
+        try s.write(.{
             .id = session.session_id,
             .running = session.running,
             .exit_status = session.exit_status,
