@@ -12,10 +12,11 @@ Each Verde window is one workspace tied to an imported project. Inside a
 workspace you get a tiling tree of panes — chat threads, terminals, and a
 browser pane — that share the main area. The sidebar on the left lists projects
 and threads; the main area is the tiling surface; the terminal dock is a
-terminal pane living in the same tree as chat and browser panes.
+terminal pane living in the same tree as chat and browser panes. A detached
+quick or companion pane is an overlay and stays fixed above that surface.
 
-There is no floating-window layer. Everything is tiled, and the layout
-persists across launches.
+Tiled panes, the scrolling strip, and detached overlay geometry persist across
+launches.
 
 ## Splitting panes
 
@@ -68,11 +69,18 @@ shortcut follows the selected scroll direction.
 
 **Scroll direction** chooses a horizontal strip (the default) or vertical
 strip. **Panes per view** controls how many panes fit along that axis (1–6,
-default 2), and **Pane spacing** controls their gap. Focus movement smoothly
-reveals the next hidden pane, while manual strip scrolling can leave focus
-off-screen. Horizontal and vertical positions are restored independently per
-workspace; zoom temporarily fills the workspace without changing either saved
-position or the selected scrolling policy.
+default 2), and **Pane spacing** controls their gap. Manual wheel or touchpad
+scrolling is intentionally free-form, so the strip can stop with part of a pane
+visible like Niri. Focus movement from the keyboard, command palette, or
+sidebar instead scrolls just far enough to reveal the complete focused pane.
+Horizontal and vertical positions are restored independently per workspace;
+zoom temporarily fills the workspace without changing either saved position
+or the selected scrolling policy.
+
+In scrolling mode, every tiled workspace pane becomes one column (or row) in
+sidebar order. Existing nested split geometry is flattened for the strip;
+browser tabs remain inside their single browser pane, and detached quick or
+companion panes remain fixed overlays rather than joining the strip.
 
 ## Resizing
 

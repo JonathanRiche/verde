@@ -1421,6 +1421,48 @@ test "detached quick pane stays out of tiled root across repair and persistence"
     try std.testing.expectEqual(@as(?WorkspacePaneId, 1), restored.maximized_pane_id);
 }
 
+test "browser tabs and a detached quick pane each keep their scrolling column contract" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const browser_pane_id = try layout.ensureBrowserPane(allocator);
+    const browser_pane_ref = layout.paneByIdMutable(browser_pane_id) orelse return error.TestExpectedEqual;
+    const browser = switch (browser_pane_ref.ref) {
+        .browser => |*ref| ref,
+        else => return error.TestExpectedEqual,
+    };
+    try browser.tabs.append(allocator, .{});
+    try browser.tabs.append(allocator, .{});
+
+    const quick_pane_id = try layout.createTerminalPane(allocator, 7);
+    layout.quick_pane = .{
+        .pane_id = quick_pane_id,
+        .detached = true,
+        .return_focus_pane_id = browser_pane_id,
+    };
+
+    try std.testing.expectEqual(@as(usize, 3), browser.tabs.items.len);
+    try std.testing.expectEqual(@as(usize, 2), layout.visiblePaneCount());
+    try std.testing.expect(!layout.rootContainsPane(quick_pane_id));
+
+    const persisted = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(persisted);
+    var restored = try WorkspaceLayout.initDefaultChat(allocator);
+    defer restored.deinit(allocator);
+    try restored.applyPersistedWorkspaceJson(allocator, persisted);
+
+    const restored_browser_pane_ref = restored.paneByIdMutable(browser_pane_id) orelse return error.TestExpectedEqual;
+    const restored_browser = switch (restored_browser_pane_ref.ref) {
+        .browser => |*ref| ref,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expectEqual(@as(usize, 3), restored_browser.tabs.items.len);
+    try std.testing.expectEqual(@as(usize, 2), restored.visiblePaneCount());
+    try std.testing.expect(restored.quick_pane.?.detached);
+    try std.testing.expect(!restored.rootContainsPane(restored.quick_pane.?.pane_id));
+}
+
 test "workspace repair migrates duplicated legacy quick pane out of tiled root" {
     const allocator = std.testing.allocator;
     var layout = try WorkspaceLayout.initDefaultChat(allocator);
