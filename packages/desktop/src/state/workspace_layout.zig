@@ -123,8 +123,11 @@ pub const WorkspaceLayout = struct {
     /// eases toward it while the scrolling layout is visible.
     scroll_offset_x: f32 = 0.0,
     scroll_target_x: f32 = 0.0,
+    scroll_offset_y: f32 = 0.0,
+    scroll_target_y: f32 = 0.0,
     scroll_revealed_pane_id: ?WorkspacePaneId = null,
     scroll_animation_last_ms: i64 = 0,
+    scroll_axis_vertical: bool = false,
 
     pub fn initDefaultChat(allocator: std.mem.Allocator) !WorkspaceLayout {
         var layout: WorkspaceLayout = .{};
@@ -310,13 +313,13 @@ pub const WorkspaceLayout = struct {
     /// sidebar, excluding detached panes that are not part of the root.
     pub fn adjacentTiledPaneIdInSidebarOrder(self: *const WorkspaceLayout, pane_id: WorkspacePaneId, direction: WorkspacePaneDirection) ?WorkspacePaneId {
         if (!self.rootContainsPane(pane_id)) return null;
-        if (direction == .up or direction == .down) return null;
+        const backwards = direction == .left or direction == .up;
 
         var previous: ?WorkspacePaneId = null;
         var matched = false;
         for (self.panes.items) |pane| {
             if (!self.rootContainsPane(pane.id)) continue;
-            if (direction == .left and pane.id == pane_id) return previous;
+            if (backwards and pane.id == pane_id) return previous;
             if (matched) return pane.id;
             if (pane.id == pane_id) matched = true;
             previous = pane.id;
@@ -727,6 +730,8 @@ pub const WorkspaceLayout = struct {
         }
         try stringify.objectField("scroll_x");
         try stringify.write(self.scroll_target_x);
+        try stringify.objectField("scroll_y");
+        try stringify.write(self.scroll_target_y);
         try stringify.objectField("quick");
         if (self.quick_pane) |quick| {
             try stringify.beginObject();
@@ -845,6 +850,8 @@ pub const WorkspaceLayout = struct {
         next_layout.maximized_pane_id = if (jsonInt(root_value.object.get("maximized") orelse .null)) |id| @intCast(id) else null;
         next_layout.scroll_target_x = @max(0.0, jsonFloat(root_value.object.get("scroll_x") orelse .null) orelse 0.0);
         next_layout.scroll_offset_x = next_layout.scroll_target_x;
+        next_layout.scroll_target_y = @max(0.0, jsonFloat(root_value.object.get("scroll_y") orelse .null) orelse 0.0);
+        next_layout.scroll_offset_y = next_layout.scroll_target_y;
         if (root_value.object.get("quick")) |quick_value| {
             if (quick_value == .object) {
                 if (jsonInt(quick_value.object.get("pane") orelse .null)) |pane_id| {
@@ -1414,7 +1421,7 @@ test "workspace layout grid placement follows pane hotkey order" {
     try std.testing.expect(placement.new_after);
 }
 
-test "workspace sidebar order provides horizontal scrolling neighbors" {
+test "workspace sidebar order provides scrolling neighbors on either axis" {
     const allocator = std.testing.allocator;
     var layout = try WorkspaceLayout.initDefaultChat(allocator);
     defer layout.deinit(allocator);
@@ -1432,7 +1439,8 @@ test "workspace sidebar order provides horizontal scrolling neighbors" {
     try std.testing.expectEqual(@as(?WorkspacePaneId, middle_pane_id), layout.adjacentTiledPaneIdInSidebarOrder(second_pane_id, .right));
     try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.adjacentTiledPaneIdInSidebarOrder(middle_pane_id, .left));
     try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.adjacentTiledPaneIdInSidebarOrder(middle_pane_id, .right));
-    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.adjacentTiledPaneIdInSidebarOrder(middle_pane_id, .up));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), layout.adjacentTiledPaneIdInSidebarOrder(second_pane_id, .up));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, middle_pane_id), layout.adjacentTiledPaneIdInSidebarOrder(second_pane_id, .down));
 }
 
 test "workspace layout persists the scrolling target" {
@@ -1441,6 +1449,8 @@ test "workspace layout persists the scrolling target" {
     defer layout.deinit(allocator);
     layout.scroll_offset_x = 48.0;
     layout.scroll_target_x = 173.5;
+    layout.scroll_offset_y = 24.0;
+    layout.scroll_target_y = 96.25;
     layout.scroll_revealed_pane_id = 1;
     layout.scroll_animation_last_ms = 900;
 
@@ -1452,6 +1462,8 @@ test "workspace layout persists the scrolling target" {
 
     try std.testing.expectApproxEqAbs(@as(f32, 173.5), restored.scroll_target_x, 0.0001);
     try std.testing.expectApproxEqAbs(restored.scroll_target_x, restored.scroll_offset_x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 96.25), restored.scroll_target_y, 0.0001);
+    try std.testing.expectApproxEqAbs(restored.scroll_target_y, restored.scroll_offset_y, 0.0001);
     try std.testing.expectEqual(@as(?WorkspacePaneId, null), restored.scroll_revealed_pane_id);
     try std.testing.expectEqual(@as(i64, 0), restored.scroll_animation_last_ms);
 }

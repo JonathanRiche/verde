@@ -9,6 +9,7 @@ const chat_markdown = @import("../ui/chat_markdown.zig");
 const theme = @import("../ui/theme.zig");
 const workspace_layout = @import("workspace_layout.zig");
 
+const TranscriptBodyKind = chat_types.TranscriptBodyKind;
 const TranscriptMarkdownBody = chat_types.TranscriptMarkdownBody;
 const ChatRole = provider_models.ChatRole;
 const WorkspacePaneId = workspace_layout.WorkspacePaneId;
@@ -176,7 +177,12 @@ pub fn clearTranscriptMarkdownSelection(self: anytype) void {
 }
 
 pub fn transcriptMarkdownBodyView(self: anytype, message_index: usize, body: []const u8) ?*const chat_markdown.BodyView {
-    const entry = self.transcriptMarkdownBodyEntry(message_index, body) orelse return null;
+    const entry = transcriptBodyEntry(self, message_index, body, .markdown) orelse return null;
+    return &entry.view;
+}
+
+pub fn transcriptPlainBodyView(self: anytype, message_index: usize, body: []const u8) ?*const chat_markdown.BodyView {
+    const entry = transcriptBodyEntry(self, message_index, body, .plain) orelse return null;
     return &entry.view;
 }
 
@@ -264,14 +270,14 @@ pub fn clearTranscriptMarkdownEntries(self: anytype) void {
     self.transcript_controller.markdown_thread_index = null;
 }
 
-pub fn transcriptMarkdownBodyEntry(self: anytype, message_index: usize, body: []const u8) ?*TranscriptMarkdownBody {
+pub fn transcriptBodyEntry(self: anytype, message_index: usize, body: []const u8, kind: TranscriptBodyKind) ?*TranscriptMarkdownBody {
     if (body.len == 0) return null;
     const thread = self.currentThreadMutable();
     thread.ensureTranscriptMarkdownEntries(self.allocator);
     if (message_index >= thread.transcript_markdown_entries.items.len) return null;
 
     if (thread.transcript_markdown_entries.items[message_index]) |entry| {
-        if (!std.mem.eql(u8, entry.owned_body, body)) {
+        if (entry.kind != kind or !std.mem.eql(u8, entry.owned_body, body)) {
             entry.deinit(self.allocator);
             thread.transcript_markdown_entries.items[message_index] = null;
         } else {
@@ -279,22 +285,51 @@ pub fn transcriptMarkdownBodyEntry(self: anytype, message_index: usize, body: []
         }
     }
 
-    const created = self.createTranscriptMarkdownBody(body) catch return null;
+    const created = createTranscriptBody(self, body, kind) catch return null;
     thread.transcript_markdown_entries.items[message_index] = created;
     return created;
 }
 
-pub fn createTranscriptMarkdownBody(self: anytype, body: []const u8) !*TranscriptMarkdownBody {
+pub fn transcriptMarkdownBodyEntry(self: anytype, message_index: usize, body: []const u8) ?*TranscriptMarkdownBody {
+    return transcriptBodyEntry(self, message_index, body, .markdown);
+}
+
+pub fn createTranscriptBody(self: anytype, body: []const u8, kind: TranscriptBodyKind) !*TranscriptMarkdownBody {
     const entry = try self.allocator.create(TranscriptMarkdownBody);
     errdefer self.allocator.destroy(entry);
 
     entry.owned_body = try self.allocator.dupe(u8, body);
     errdefer self.allocator.free(entry.owned_body);
 
-    entry.view = try chat_markdown.buildBodyView(self.allocator, entry.owned_body);
+    entry.kind = kind;
+    entry.view = try buildTranscriptBodyView(self.allocator, entry.owned_body, kind);
     errdefer entry.view.deinit(self.allocator);
 
     return entry;
+}
+
+pub fn createTranscriptMarkdownBody(self: anytype, body: []const u8) !*TranscriptMarkdownBody {
+    return createTranscriptBody(self, body, .markdown);
+}
+
+fn buildTranscriptBodyView(allocator: std.mem.Allocator, body: []const u8, kind: TranscriptBodyKind) !chat_markdown.BodyView {
+    return switch (kind) {
+        .markdown => chat_markdown.buildBodyView(allocator, body),
+        .plain => chat_markdown.buildPlainBodyView(allocator, body),
+    };
+}
+
+test "transcript body cache preserves markdown and literal plain parsing" {
+    const source = "**bold**";
+    var markdown = try buildTranscriptBodyView(std.testing.allocator, source, .markdown);
+    defer markdown.deinit(std.testing.allocator);
+    var plain = try buildTranscriptBodyView(std.testing.allocator, source, .plain);
+    defer plain.deinit(std.testing.allocator);
+
+    try std.testing.expect(markdown.document != null);
+    try std.testing.expect(plain.document == null);
+    try std.testing.expectEqual(@as(usize, 1), plain.blockCount());
+    try std.testing.expectEqualStrings(source, plain.blockAt(0).text.text);
 }
 
 pub fn buildCurrentTranscriptSelectionText(self: anytype) ![:0]u8 {

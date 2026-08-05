@@ -98,6 +98,17 @@ pub const NewChatPaneBehavior = enum {
     replace_pane,
 };
 
+pub const WorkspaceScrollDirection = enum {
+    horizontal,
+    vertical,
+
+    pub fn parse(value: []const u8) ?WorkspaceScrollDirection {
+        if (std.ascii.eqlIgnoreCase(value, "horizontal")) return .horizontal;
+        if (std.ascii.eqlIgnoreCase(value, "vertical")) return .vertical;
+        return null;
+    }
+};
+
 pub const TerminalLaunchProfileConfig = struct {
     label: []u8,
     command: []const []u8,
@@ -132,6 +143,7 @@ pub const AppConfig = struct {
     terminal_font_size: f32 = DEFAULT_TERMINAL_FONT_SIZE,
     workspace_pane_gap: f32 = DEFAULT_WORKSPACE_PANE_GAP,
     workspace_panes_per_view: u8 = DEFAULT_WORKSPACE_PANES_PER_VIEW,
+    workspace_scroll_direction: WorkspaceScrollDirection = .horizontal,
     theme_config: theme.ThemeConfig = .{},
     active_theme: ?[]u8 = null,
     installed_themes: []InstalledTheme = &.{},
@@ -368,6 +380,7 @@ fn writeUiSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, con
     try ui_object.put(allocator, "font_size", .{ .float = config.font_size });
     try ui_object.put(allocator, "workspace_pane_gap", .{ .float = config.workspace_pane_gap });
     try ui_object.put(allocator, "workspace_panes_per_view", .{ .integer = config.workspace_panes_per_view });
+    try ui_object.put(allocator, "workspace_scroll_direction", .{ .string = @tagName(config.workspace_scroll_direction) });
 }
 
 fn writeThemeSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
@@ -909,6 +922,15 @@ fn applyUiOverrides(config: *AppConfig, ui_value: std.json.Value) void {
             else => log.warn("ui.workspace_panes_per_view must be an integer when provided", .{}),
         }
     }
+    if (ui_value.object.get("workspace_scroll_direction")) |direction_value| {
+        if (direction_value != .string) {
+            log.warn("ui.workspace_scroll_direction must be a string when provided", .{});
+        } else if (WorkspaceScrollDirection.parse(direction_value.string)) |direction| {
+            config.workspace_scroll_direction = direction;
+        } else {
+            log.warn("ignoring unsupported ui.workspace_scroll_direction", .{});
+        }
+    }
 }
 
 fn applyOpenOverrides(allocator: std.mem.Allocator, config: *AppConfig, open_value: std.json.Value) void {
@@ -1206,6 +1228,28 @@ test "app config ignores out-of-range ui.workspace_panes_per_view" {
     applyAppOverrides(std.testing.allocator, &config, root.value);
 
     try std.testing.expectEqual(DEFAULT_WORKSPACE_PANES_PER_VIEW, config.workspace_panes_per_view);
+}
+
+test "app config accepts ui.workspace_scroll_direction override" {
+    var root = try parseTestRoot("{\"ui\":{\"workspace_scroll_direction\":\"vertical\"}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(WorkspaceScrollDirection.vertical, config.workspace_scroll_direction);
+}
+
+test "app config ignores unsupported ui.workspace_scroll_direction" {
+    var root = try parseTestRoot("{\"ui\":{\"workspace_scroll_direction\":\"diagonal\"}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(WorkspaceScrollDirection.horizontal, config.workspace_scroll_direction);
 }
 
 test "app config accepts theme source and color overrides" {

@@ -117,8 +117,8 @@ actions. Launch built-in provider TUIs from `Ctrl+Shift+P` or
 
 ## Move around
 
-- `Ctrl+H / J / K / L` — move focus across panes, vim-style (`Ctrl+Left / Right` also moves across columns)
-- Horizontal touchpad or wheel gestures — pan the scrolling column strip
+- `Ctrl+H / J / K / L` — move focus across panes, vim-style (`Ctrl+Arrow` also works)
+- Horizontal touchpad/wheel, or `Ctrl`+vertical wheel in vertical mode — pan the scrolling pane strip
 - `Ctrl+Shift+H / J / K / L` — swap the focused pane with its neighbor (rearrange the tiling)
 - `Alt+Shift+← ↑ ↓ →` — resize the focused pane
 - `Alt+Z` — zoom the focused pane to fill the workspace; press again to restore

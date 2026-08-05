@@ -5026,6 +5026,13 @@ fn renderMarkdownBodyView(state: *app_state.AppState, message_index: usize, rect
 
 fn renderPlainSelectableBody(state: *app_state.AppState, message_index: usize, rect: palette.Rect, body: []const u8, color: [4]f32, clip: palette.Rect) void {
     if (body.len == 0) return;
+    // Committed rows are immutable between transcript mutations. Reuse their
+    // parsed selectable geometry; pending stream indices intentionally miss
+    // this cache and continue rebuilding from their latest body immediately.
+    if (state.transcriptPlainBodyView(message_index, body)) |view| {
+        renderSelectableBodyView(state, message_index, rect, view.*, clip, transcriptPlainTextOptions(color), false);
+        return;
+    }
     var view = chat_markdown.buildPlainBodyView(state.allocator, body) catch {
         renderWrappedBody(state, rect, body, paletteColor(color), theme.scaledUi(TRANSCRIPT_MARKDOWN_FONT_SIZE), clip);
         return;

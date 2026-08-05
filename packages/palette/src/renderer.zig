@@ -174,6 +174,7 @@ pub const Renderer = struct {
     unsupported_image_commands: usize = 0,
     last_frame_stats: FrameStats = .{},
     pending_upload_stats: FrameStats = .{},
+    frame_scratch: FrameScratch = .{},
 
     /// Creates the SDL_GPU device. Pass SPIR-V shaders for Vulkan and MSL or
     /// metallib shaders for Metal to create a drawable pipeline.
@@ -222,6 +223,7 @@ pub const Renderer = struct {
             self.font_cache.deinit();
             c.SDL_DestroyGPUDevice(device);
         }
+        self.frame_scratch.deinit();
         self.* = undefined;
     }
 
@@ -318,10 +320,10 @@ pub const Renderer = struct {
     /// intentionally tracked, not discarded; they require an atlas texture path.
     pub fn prepareBatch(self: *Renderer, allocator: std.mem.Allocator, command_buffer: *c.SDL_GPUCommandBuffer, batch: *const draw.RenderBatch, solid_indices_after_cmd: []u32, stats: *FrameStats) !void {
         std.debug.assert(solid_indices_after_cmd.len == batch.commands.items.len);
-        var mesh: Mesh = .{};
-        defer mesh.deinit(allocator);
+        const mesh = &self.frame_scratch.solid_mesh;
+        mesh.clear();
         const build_start = nowNs();
-        try buildMesh(allocator, batch, &mesh, solid_indices_after_cmd);
+        try buildMesh(std.heap.smp_allocator, batch, mesh, solid_indices_after_cmd);
         stats.batch_build_ns +|= elapsedNs(build_start);
 
         self.command_counts = CommandCounts.fromBatch(batch);
@@ -348,20 +350,12 @@ pub const Renderer = struct {
         }
 
         var stats = self.beginFrameStats();
+        const command_ends = try self.frame_scratch.begin(batch.commands.items.len);
         const command_buffer = c.SDL_AcquireGPUCommandBuffer(device) orelse return error.SdlGpuCommandBufferFailed;
         try self.flushPendingTextureUploads(command_buffer, &stats);
-        const cmd_n = batch.commands.items.len;
-        const solid_ends = try allocator.alloc(u32, cmd_n);
-        defer allocator.free(solid_ends);
-        const image_draw_ends = try allocator.alloc(u32, cmd_n);
-        defer allocator.free(image_draw_ends);
-        const text_draw_ends = try allocator.alloc(u32, cmd_n);
-        defer allocator.free(text_draw_ends);
-        try self.prepareBatch(allocator, command_buffer, batch, solid_ends, &stats);
-        var image_frame = try self.prepareImageFrame(allocator, command_buffer, batch, image_draw_ends, &stats);
-        defer image_frame.deinit(allocator);
-        var text_frame = try self.prepareTextFrame(allocator, command_buffer, batch, text_draw_ends, &stats);
-        defer text_frame.deinit(allocator);
+        try self.prepareBatch(allocator, command_buffer, batch, command_ends.solid, &stats);
+        const image_frame = try self.prepareImageFrame(allocator, command_buffer, batch, command_ends.image, &stats);
+        const text_frame = try self.prepareTextFrame(allocator, command_buffer, batch, command_ends.text, &stats);
 
         var swapchain_texture: ?*c.SDL_GPUTexture = null;
         var width: u32 = 0;
@@ -388,11 +382,11 @@ pub const Renderer = struct {
             self.renderBatchInterleaved(
                 pass,
                 batch,
-                solid_ends,
-                &image_frame,
-                image_draw_ends,
-                &text_frame,
-                text_draw_ends,
+                command_ends.solid,
+                image_frame,
+                command_ends.image,
+                text_frame,
+                command_ends.text,
                 @floatFromInt(height),
             );
             c.SDL_EndGPURenderPass(pass);
@@ -878,9 +872,9 @@ pub const Renderer = struct {
         }
     }
 
-    fn prepareImageFrame(self: *Renderer, allocator: std.mem.Allocator, command_buffer: *c.SDL_GPUCommandBuffer, batch: *const draw.RenderBatch, image_draws_after_cmd: []u32, stats: *FrameStats) !ImageFrame {
-        var frame: ImageFrame = .{};
-        errdefer frame.deinit(allocator);
+    fn prepareImageFrame(self: *Renderer, allocator: std.mem.Allocator, command_buffer: *c.SDL_GPUCommandBuffer, batch: *const draw.RenderBatch, image_draws_after_cmd: []u32, stats: *FrameStats) !*const ImageFrame {
+        const frame = &self.frame_scratch.image_frame;
+        frame.clear();
         std.debug.assert(image_draws_after_cmd.len == batch.commands.items.len);
         if (self.image_pipeline == null or self.sampler == null) {
             @memset(image_draws_after_cmd, 0);
@@ -888,8 +882,8 @@ pub const Renderer = struct {
         }
 
         const prepare_start = nowNs();
-        try frame.mesh.vertices.ensureUnusedCapacity(allocator, batch.commands.items.len * 4);
-        try frame.mesh.indices.ensureUnusedCapacity(allocator, batch.commands.items.len * 6);
+        try frame.mesh.vertices.ensureUnusedCapacity(std.heap.smp_allocator, batch.commands.items.len * 4);
+        try frame.mesh.indices.ensureUnusedCapacity(std.heap.smp_allocator, batch.commands.items.len * 6);
         for (batch.commands.items, 0..) |command, cmd_i| {
             if (command.kind == .image and command.texture.valid() and command.color.a > 0.0) {
                 const texture = self.textures.get(@intCast(command.texture.value)) orelse {
@@ -898,10 +892,10 @@ pub const Renderer = struct {
                     continue;
                 };
                 const first_index: u32 = @intCast(frame.mesh.indices.items.len);
-                try appendQuad(&frame.mesh, allocator, command.rect, command.uv, command.color);
+                try appendQuad(&frame.mesh, std.heap.smp_allocator, command.rect, command.uv, command.color);
                 const index_count: u32 = @intCast(frame.mesh.indices.items.len - first_index);
                 if (index_count > 0) {
-                    try frame.draws.append(allocator, .{
+                    try frame.draws.append(std.heap.smp_allocator, .{
                         .texture = texture.texture,
                         .first_index = first_index,
                         .index_count = index_count,
@@ -923,9 +917,9 @@ pub const Renderer = struct {
         return frame;
     }
 
-    fn prepareTextFrame(self: *Renderer, allocator: std.mem.Allocator, command_buffer: *c.SDL_GPUCommandBuffer, batch: *const draw.RenderBatch, text_draws_after_cmd: []u32, stats: *FrameStats) !TextFrame {
-        var frame: TextFrame = .{};
-        errdefer frame.deinit(allocator);
+    fn prepareTextFrame(self: *Renderer, allocator: std.mem.Allocator, command_buffer: *c.SDL_GPUCommandBuffer, batch: *const draw.RenderBatch, text_draws_after_cmd: []u32, stats: *FrameStats) !*const TextFrame {
+        const frame = &self.frame_scratch.text_frame;
+        frame.clear();
         std.debug.assert(text_draws_after_cmd.len == batch.commands.items.len);
         if (!self.supportsGpuText()) {
             @memset(text_draws_after_cmd, 0);
@@ -934,7 +928,7 @@ pub const Renderer = struct {
         const prepare_start = nowNs();
         for (batch.commands.items, 0..) |command, cmd_i| {
             if (command.kind == .text and command.text.len > 0 and command.color.a > 0.0) {
-                try self.appendTextCommand(allocator, &frame, command);
+                try self.appendTextCommand(std.heap.smp_allocator, frame, command);
             }
             text_draws_after_cmd[cmd_i] = @intCast(frame.draws.items.len);
         }
@@ -1444,6 +1438,11 @@ const ImageFrame = struct {
     mesh: Mesh = .{},
     draws: std.ArrayList(ImageDraw) = .empty,
 
+    fn clear(self: *ImageFrame) void {
+        self.mesh.clear();
+        self.draws.clearRetainingCapacity();
+    }
+
     fn deinit(self: *ImageFrame, allocator: std.mem.Allocator) void {
         self.mesh.deinit(allocator);
         self.draws.deinit(allocator);
@@ -1463,10 +1462,53 @@ const TextFrame = struct {
     indices: std.ArrayList(u32) = .empty,
     draws: std.ArrayList(TextDraw) = .empty,
 
+    fn clear(self: *TextFrame) void {
+        self.vertices.clearRetainingCapacity();
+        self.indices.clearRetainingCapacity();
+        self.draws.clearRetainingCapacity();
+    }
+
     fn deinit(self: *TextFrame, allocator: std.mem.Allocator) void {
         self.vertices.deinit(allocator);
         self.indices.deinit(allocator);
         self.draws.deinit(allocator);
+    }
+};
+
+const FrameCommandEnds = struct {
+    solid: []u32,
+    image: []u32,
+    text: []u32,
+};
+
+// Frame preparation is a steady display-rate workload. Retaining these large
+// CPU-side arrays removes allocator churn without retaining any rendered state:
+// every used length is reset and rebuilt before the next GPU submission.
+const FrameScratch = struct {
+    command_ends: std.ArrayList(u32) = .empty,
+    solid_mesh: Mesh = .{},
+    image_frame: ImageFrame = .{},
+    text_frame: TextFrame = .{},
+
+    fn begin(self: *FrameScratch, command_count: usize) !FrameCommandEnds {
+        const total_count = std.math.mul(usize, command_count, 3) catch return error.CommandCountOverflow;
+        try self.command_ends.resize(std.heap.smp_allocator, total_count);
+        self.solid_mesh.clear();
+        self.image_frame.clear();
+        self.text_frame.clear();
+        return .{
+            .solid = self.command_ends.items[0..command_count],
+            .image = self.command_ends.items[command_count .. command_count * 2],
+            .text = self.command_ends.items[command_count * 2 .. command_count * 3],
+        };
+    }
+
+    fn deinit(self: *FrameScratch) void {
+        self.command_ends.deinit(std.heap.smp_allocator);
+        self.solid_mesh.deinit(std.heap.smp_allocator);
+        self.image_frame.deinit(std.heap.smp_allocator);
+        self.text_frame.deinit(std.heap.smp_allocator);
+        self.* = undefined;
     }
 };
 
@@ -2361,6 +2403,25 @@ pub const ShaderSource = struct {
         };
     }
 };
+
+test "renderer frame scratch resets lengths while retaining capacity" {
+    var scratch: FrameScratch = .{};
+    defer scratch.deinit();
+
+    const first = try scratch.begin(8);
+    try std.testing.expectEqual(@as(usize, 8), first.solid.len);
+    try std.testing.expectEqual(@as(usize, 8), first.image.len);
+    try std.testing.expectEqual(@as(usize, 8), first.text.len);
+    try scratch.text_frame.indices.append(std.heap.smp_allocator, 7);
+    const retained_capacity = scratch.command_ends.capacity;
+
+    const second = try scratch.begin(3);
+    try std.testing.expectEqual(@as(usize, 3), second.solid.len);
+    try std.testing.expectEqual(@as(usize, 3), second.image.len);
+    try std.testing.expectEqual(@as(usize, 3), second.text.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.text_frame.indices.items.len);
+    try std.testing.expectEqual(retained_capacity, scratch.command_ends.capacity);
+}
 
 test "renderer builds indexed quads from commands" {
     var batch: draw.RenderBatch = .{};

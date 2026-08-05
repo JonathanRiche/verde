@@ -19,6 +19,8 @@ pub const Control = enum(u8) {
     workspace_pane_gap_inc,
     workspace_panes_per_view_dec,
     workspace_panes_per_view_inc,
+    workspace_scroll_horizontal,
+    workspace_scroll_vertical,
     theme_dropdown,
     tool_groups_collapsed,
     tool_groups_expanded,
@@ -159,6 +161,9 @@ const SettingsLayout = struct {
     workspace_panes_per_view_dec: palette.Rect,
     workspace_panes_per_view_inc: palette.Rect,
     workspace_panes_per_view_hint_y: f32,
+    workspace_scroll_horizontal: palette.Rect,
+    workspace_scroll_vertical: palette.Rect,
+    workspace_scroll_direction_hint_y: f32,
     integrations_card: palette.Rect,
     mcp_tools: palette.Rect,
     mcp_hint_y: f32,
@@ -286,7 +291,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         m.row_gap + m.label_h + m.inner_gap + m.row_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.row_h + m.inner_gap + m.label_h +
-        m.row_gap + m.row_h + m.inner_gap + m.label_h;
+        m.row_gap + m.row_h + m.inner_gap + m.label_h +
+        m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     // MCP controls and status, followed by the provider status-hook controls.
     const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap * 2.0 + m.label_h * 4.0 + m.row_h * 6.0 + m.inner_gap * 8.0;
     // Same shape as the integrations card: title, field label, one toggle row, hint.
@@ -449,6 +455,12 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const workspace_panes_per_view_y = workspace_pane_gap_hint_y + m.label_h + m.row_gap;
     const workspace_panes_per_view_stepper = stepperRects(workspace_card, m.card_pad, workspace_panes_per_view_y, m);
     const workspace_panes_per_view_hint_y = workspace_panes_per_view_y + m.row_h + m.inner_gap;
+    const workspace_scroll_direction_label_y = workspace_panes_per_view_hint_y + m.label_h + m.row_gap;
+    const workspace_scroll_direction_y = workspace_scroll_direction_label_y + m.label_h + m.inner_gap;
+    const workspace_scroll_direction_w = (content_w - m.card_pad * 2.0) * 0.5;
+    const workspace_scroll_horizontal: palette.Rect = .{ .x = open_x, .y = workspace_scroll_direction_y, .w = workspace_scroll_direction_w, .h = m.row_h };
+    const workspace_scroll_vertical: palette.Rect = .{ .x = workspace_scroll_horizontal.x + workspace_scroll_direction_w, .y = workspace_scroll_direction_y, .w = workspace_scroll_direction_w, .h = m.row_h };
+    const workspace_scroll_direction_hint_y = workspace_scroll_direction_y + m.row_h + m.inner_gap;
 
     y += workspace_h + m.card_gap;
 
@@ -550,6 +562,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .workspace_panes_per_view_dec = workspace_panes_per_view_stepper.dec,
         .workspace_panes_per_view_inc = workspace_panes_per_view_stepper.inc,
         .workspace_panes_per_view_hint_y = workspace_panes_per_view_hint_y,
+        .workspace_scroll_horizontal = workspace_scroll_horizontal,
+        .workspace_scroll_vertical = workspace_scroll_vertical,
+        .workspace_scroll_direction_hint_y = workspace_scroll_direction_hint_y,
         .integrations_card = integrations_card,
         .mcp_tools = mcp_tools,
         .mcp_hint_y = mcp_hint_y,
@@ -739,6 +754,8 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.workspace_pane_gap_inc, layout.body_clip, .workspace_pane_gap_inc, queue_hit);
     queueControlHit(state, layout.workspace_panes_per_view_dec, layout.body_clip, .workspace_panes_per_view_dec, queue_hit);
     queueControlHit(state, layout.workspace_panes_per_view_inc, layout.body_clip, .workspace_panes_per_view_inc, queue_hit);
+    queueControlHit(state, layout.workspace_scroll_horizontal, layout.body_clip, .workspace_scroll_horizontal, queue_hit);
+    queueControlHit(state, layout.workspace_scroll_vertical, layout.body_clip, .workspace_scroll_vertical, queue_hit);
     queueControlHit(state, layout.mcp_tools, layout.body_clip, .mcp_tools, queue_hit);
     queueControlHit(state, layout.hooks_claude, layout.body_clip, .hooks_claude, queue_hit);
     queueControlHit(state, layout.hooks_codex, layout.body_clip, .hooks_codex, queue_hit);
@@ -916,14 +933,27 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .y = layout.workspace_pane_gap_hint_y,
         .w = layout.workspace_card.w - m.card_pad * 2.0,
         .h = m.label_h,
-    }, "Horizontal space between scrolling panes; zoom stays edge-to-edge", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+    }, "Space between scrolling panes; zoom stays edge-to-edge", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
     drawStepperRow(state, layout.workspace_card, m, layout.workspace_panes_per_view_dec.y, "Panes per view", @floatFromInt(state.settings_controller.draft.workspace_panes_per_view), @floatFromInt(app_config.MIN_WORKSPACE_PANES_PER_VIEW), @floatFromInt(app_config.MAX_WORKSPACE_PANES_PER_VIEW), .workspace_panes_per_view_dec, .workspace_panes_per_view_inc, layout.workspace_panes_per_view_dec, layout.workspace_panes_per_view_inc, layout.body_clip);
     queueText(state, .{
         .x = layout.workspace_card.x + m.card_pad,
         .y = layout.workspace_panes_per_view_hint_y,
         .w = layout.workspace_card.w - m.card_pad * 2.0,
         .h = m.label_h,
-    }, "Sets how many scrolling columns fit across the workspace", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+    }, "Sets how many scrolling panes fit along the selected direction", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+    queueText(state, .{
+        .x = layout.workspace_scroll_horizontal.x,
+        .y = layout.workspace_scroll_horizontal.y - m.inner_gap - m.label_h,
+        .w = layout.workspace_scroll_horizontal.w + layout.workspace_scroll_vertical.w,
+        .h = m.label_h,
+    }, "Scroll direction", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    drawSegmentedPair(state, layout.workspace_scroll_horizontal, layout.workspace_scroll_vertical, "Horizontal", "Vertical", state.settings_controller.draft.workspace_scroll_direction == .horizontal, isControlHovered(state, .workspace_scroll_horizontal), isControlHovered(state, .workspace_scroll_vertical), layout.body_clip);
+    queueText(state, .{
+        .x = layout.workspace_card.x + m.card_pad,
+        .y = layout.workspace_scroll_direction_hint_y,
+        .w = layout.workspace_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, "Vertical keeps normal pane scrolling; hold Ctrl and use the wheel to pan panes", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
 
     // Agent integrations
     drawCardTitle(state, layout.integrations_card, "Agent integrations", layout.body_clip);
@@ -1165,6 +1195,8 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .workspace_panes_per_view_inc => {
             if (state.settings_controller.draft.workspace_panes_per_view < app_config.MAX_WORKSPACE_PANES_PER_VIEW) state.settings_controller.draft.workspace_panes_per_view += 1;
         },
+        .workspace_scroll_horizontal => state.settings_controller.draft.workspace_scroll_direction = .horizontal,
+        .workspace_scroll_vertical => state.settings_controller.draft.workspace_scroll_direction = .vertical,
         .theme_dropdown => {
             state.settings_controller.theme_dropdown_open = !state.settings_controller.theme_dropdown_open;
             if (state.settings_controller.theme_dropdown_open) {
