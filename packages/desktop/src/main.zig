@@ -1506,7 +1506,11 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     syncWindowTextInput(window, state);
                     return true;
                 }
-                if (event.key.key == .escape) _ = ui_layout.handleCompanionEscapeKey(state, true);
+                if (event.key.key == .escape) {
+                    _ = ui_layout.handleCompanionEscapeKey(state, true);
+                } else if (state.companion_composer.focused) {
+                    _ = state.routeCompanionComposerKeyDown(&event.key);
+                }
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -1739,6 +1743,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (state.companion_controller.mission_control_open) {
+                if (state.companion_composer.focused) _ = state.routeCompanionComposerTextInput(text_input);
                 syncWindowTextInput(window, state);
                 return true;
             }
