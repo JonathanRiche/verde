@@ -298,10 +298,11 @@ fn renderSidecar(state: *runtime.AppState, geometry: Geometry) void {
     const scale = companionScale();
     const chrome = theme.companionChrome();
     queueRect(state, geometry.window, color(theme.scrim(0.22)));
-    appendRoundedFillMesh(state.allocator, &state.palette_overlay_batch, expandedOffsetRect(geometry.sidecar, 8.0 * scale, 18.0 * scale), color(theme.scrim(0.16)), 18.0 * scale, geometry.window) catch |err| log.warn("failed to queue broad sidecar shadow: {s}", .{@errorName(err)});
-    appendRoundedFillMesh(state.allocator, &state.palette_overlay_batch, offsetRect(geometry.sidecar, 0.0, 4.0 * scale), color(theme.scrim(0.24)), 14.0 * scale, geometry.window) catch |err| log.warn("failed to queue near sidecar shadow: {s}", .{@errorName(err)});
-    queueRoundedRect(state, geometry.sidecar, color(surface()), 12.0 * scale);
-    queueBorder(state, geometry.sidecar, color(chrome.border), 12.0 * scale, 1.0 * scale);
+    // Soft shadows render as anti-aliased SDF fills clipped to the window; the
+    // old triangle-fan meshes had no edge AA and read as faceted arcs.
+    queueRoundedRectClipped(state, expandedOffsetRect(geometry.sidecar, 8.0 * scale, 18.0 * scale), color(theme.scrim(0.16)), 18.0 * scale, geometry.window);
+    queueRoundedRectClipped(state, offsetRect(geometry.sidecar, 0.0, 4.0 * scale), color(theme.scrim(0.24)), 14.0 * scale, geometry.window);
+    queuePanel(state, geometry.sidecar, color(surface()), color(chrome.border), 12.0 * scale, 1.0 * scale);
     renderHeader(state, geometry);
     renderObjective(state, geometry);
     renderTabs(state, geometry);
@@ -320,10 +321,15 @@ fn renderHeader(state: *runtime.AppState, geometry: Geometry) void {
     queueBoldText(state, .{ .x = title_x, .y = geometry.header.y + 11.0 * scale, .w = 48.0 * scale, .h = 18.0 * scale }, "Sprout", color(chrome.text), 13.0 * scale, geometry.header);
     const status = headerStatus(state);
     queueMonoText(state, .{ .x = title_x + 52.0 * scale, .y = geometry.header.y + 13.0 * scale, .w = @max(geometry.close_button.x - title_x - 57.0 * scale, 0.0), .h = 16.0 * scale }, status, color(chrome.text_subtle), 10.5 * scale, geometry.header);
-    queueRoundedRect(state, geometry.close_button, color(theme.withAlpha(surface(), 0)), 6.0 * scale);
-    queueBorder(state, geometry.close_button, color(hairline()), 6.0 * scale, 1.0 * scale);
+    // The collapse affordance fills with the header surface it sits on: border
+    // commands without a real fill halo white at every anti-aliased corner
+    // because the SDF shader composites border fringes toward the fill color.
+    queuePanel(state, geometry.close_button, color(surface()), color(hairline()), 6.0 * scale, 1.0 * scale);
     queueCenteredText(state, geometry.close_button, "−", color(chrome.text_muted), 12.0 * scale, .mono, geometry.close_button);
-    queueRect(state, .{ .x = geometry.header.x, .y = geometry.header.y + geometry.header.h - 1.0 * scale, .w = geometry.header.w, .h = 1.0 * scale }, color(hairline()));
+    // The divider stops short of the sidecar stroke so it cannot notch the
+    // panel's side borders.
+    const divider_inset = snappedStroke(1.0 * scale);
+    queueRect(state, .{ .x = geometry.header.x + divider_inset, .y = geometry.header.y + geometry.header.h - 1.0 * scale, .w = @max(geometry.header.w - divider_inset * 2.0, 0.0), .h = 1.0 * scale }, color(hairline()));
 }
 
 // Sidecar objective summary region.
@@ -332,8 +338,7 @@ fn renderObjective(state: *runtime.AppState, geometry: Geometry) void {
     const chrome = theme.companionChrome();
     if (geometry.objective.w < 180.0 * scale or geometry.objective.h < 70.0 * scale) return;
     const card: palette.Rect = .{ .x = geometry.objective.x + 12.0 * scale, .y = geometry.objective.y + 10.0 * scale, .w = @max(geometry.objective.w - 24.0 * scale, 0.0), .h = @max(geometry.objective.h - 10.0 * scale, 0.0) };
-    queueRoundedRect(state, card, color(surfaceDeep()), 10.0 * scale);
-    queueBorder(state, card, color(hairline()), 10.0 * scale, 1.0 * scale);
+    queuePanel(state, card, color(surfaceDeep()), color(hairline()), 10.0 * scale, 1.0 * scale);
     const content_w = @max(card.w - 102.0 * scale, 0.0);
     queueBoldText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 10.0 * scale, .w = content_w, .h = 14.0 * scale }, "OBJECTIVE", color(chrome.text_subtle), 10.0 * scale, card);
     const presentation = &state.companion_controller.presentation;
@@ -388,8 +393,7 @@ fn renderTabs(state: *runtime.AppState, geometry: Geometry) void {
     const chrome = theme.companionChrome();
     if (geometry.tabs.w < 150.0 * scale or geometry.tabs.h < 35.0 * scale) return;
     const track: palette.Rect = .{ .x = geometry.tabs.x + 12.0 * scale, .y = geometry.tabs.y + 10.0 * scale, .w = @max(geometry.tabs.w - 24.0 * scale, 0.0), .h = @max(geometry.tabs.h - 10.0 * scale, 0.0) };
-    queueRoundedRect(state, track, color(chrome.surface_deep), 8.0 * scale);
-    queueBorder(state, track, color(chrome.border), 8.0 * scale, 1.0 * scale);
+    queuePanel(state, track, color(chrome.surface_deep), color(chrome.border), 8.0 * scale, 1.0 * scale);
     const inner: palette.Rect = .{ .x = track.x + 3.0 * scale, .y = track.y + 3.0 * scale, .w = @max(track.w - 6.0 * scale, 0.0), .h = @max(track.h - 6.0 * scale, 0.0) };
     // Only Run and Activity are real, hit-registered views; unsupported
     // sections are omitted rather than rendered as decorative tabs.
@@ -406,7 +410,8 @@ fn renderTabs(state: *runtime.AppState, geometry: Geometry) void {
 // Scrollable Companion activity region.
 fn renderBody(state: *runtime.AppState, geometry: Geometry) void {
     if (geometry.body.w <= 0.0 or geometry.body.h <= 0.0) return;
-    queueRect(state, geometry.body, color(surface()));
+    // The sidecar panel fill already backs this region; a full-width repaint
+    // here would overpaint the panel's side borders and rounded corners.
     const max_scroll = @max(bodyContentHeight(&state.companion_controller, geometry.body.w) - geometry.body.h, 0.0);
     if (state.companion_controller.selected_tab == .activity) state.companion_controller.updateActivityExtent(max_scroll);
     const inset = companionScaled(12.0);
@@ -422,8 +427,11 @@ fn renderFooter(state: *runtime.AppState, geometry: Geometry) void {
     const chrome = theme.companionChrome();
     const composer = composerRect(geometry.footer);
     if (composer.w <= 0.0 or composer.h <= 0.0) return;
-    queueRect(state, geometry.footer, color(surface()));
-    queueRect(state, .{ .x = geometry.footer.x, .y = geometry.footer.y, .w = geometry.footer.w, .h = companionScaled(1.0) }, color(hairline()));
+    // The sidecar panel fill backs the footer; repainting it full-width would
+    // erase the side borders and square off the bottom rounded corners. The
+    // divider is inset past the panel stroke for the same reason.
+    const divider_inset = snappedStroke(companionScaled(1.0));
+    queueRect(state, .{ .x = geometry.footer.x + divider_inset, .y = geometry.footer.y, .w = @max(geometry.footer.w - divider_inset * 2.0, 0.0), .h = companionScaled(1.0) }, color(hairline()));
     state.syncCompanionComposer(composer);
     // The shared composer defaults to the chat layer. Companion is rendered
     // above panes, so inherit the active overlay layer or panes cover every
@@ -579,8 +587,9 @@ fn renderResultCard(state: *runtime.AppState, clip: palette.Rect, y: *f32) void 
     const wrapped = wrapResultText(answer, text_w);
     const line_count: f32 = @floatFromInt(@max(wrapped.count, 1));
     const card: palette.Rect = .{ .x = clip.x + 12.0 * scale, .y = y.*, .w = card_w, .h = 42.0 * scale + line_count * 17.0 * scale };
-    queueRoundedRectClipped(state, card, color(if (failed) chrome.failure_card else chrome.surface_deep), 10.0 * scale, clip);
-    queueBorderClipped(state, card, color(if (failed) chrome.failure_border else chrome.hairline), 10.0 * scale, 1.0 * scale, clip);
+    const card_fill = if (failed) opaqueOver(surface(), chrome.failure_card) else chrome.surface_deep;
+    const card_stroke = opaqueOver(card_fill, if (failed) chrome.failure_border else chrome.hairline);
+    queuePanelClipped(state, card, color(card_fill), color(card_stroke), 10.0 * scale, 1.0 * scale, clip);
     const stripe = if (failed) chrome.danger else if (frame.working) chrome.accent_hi else chrome.identity_fg;
     queueRoundedRectClipped(state, .{ .x = card.x, .y = card.y, .w = 3.0 * scale, .h = card.h }, color(stripe), 1.5 * scale, clip);
     const verdict_w = 62.0 * scale;
@@ -627,8 +636,9 @@ fn renderActivityRow(state: *runtime.AppState, clip: palette.Rect, y: *f32, item
     const failed = item.status == .failed;
     const accent = activityAccent(chrome, item);
     const card: palette.Rect = .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = @max(clip.w - companionScaled(24.0), 0.0), .h = companionScaled(58.0) };
-    queueRoundedRectClipped(state, card, color(if (failed) chrome.failure_card else chrome.surface_deep), companionScaled(9.0), clip);
-    queueBorderClipped(state, card, color(if (failed) chrome.failure_border else chrome.hairline), companionScaled(9.0), companionScaled(1.0), clip);
+    const card_fill = if (failed) opaqueOver(surface(), chrome.failure_card) else chrome.surface_deep;
+    const card_stroke = opaqueOver(card_fill, if (failed) chrome.failure_border else chrome.hairline);
+    queuePanelClipped(state, card, color(card_fill), color(card_stroke), companionScaled(9.0), companionScaled(1.0), clip);
     queueRoundedRectClipped(state, .{ .x = card.x, .y = card.y, .w = companionScaled(3.0), .h = card.h }, color(accent), companionScaled(1.5), clip);
     const status_w = companionScaled(52.0);
     const author_w = if (item.status != null) @max(card.w - companionScaled(22.0) - status_w, 0.0) else @max(card.w - companionScaled(22.0), 0.0);
@@ -676,15 +686,15 @@ fn renderApproval(state: *runtime.AppState, body: palette.Rect, y: *f32, title: 
     const scale = companionScale();
     const chrome = theme.companionChrome();
     const card: palette.Rect = .{ .x = body.x + 12.0 * scale, .y = y.*, .w = @max(body.w - 24.0 * scale, 0.0), .h = 116.0 * scale };
-    queueRoundedRectClipped(state, card, color(chrome.approval_card), 10.0 * scale, body);
-    queueBorderClipped(state, card, color(chrome.approval_border), 10.0 * scale, 1.0 * scale, body);
+    const card_fill = opaqueOver(surface(), chrome.approval_card);
+    const card_stroke = opaqueOver(card_fill, chrome.approval_border);
+    queuePanelClipped(state, card, color(card_fill), color(card_stroke), 10.0 * scale, 1.0 * scale, body);
     queueRoundedRectClipped(state, .{ .x = card.x, .y = card.y, .w = 3.0 * scale, .h = card.h }, color(chrome.warning), 1.5 * scale, body);
     queueText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 10.0 * scale, .w = 16.0 * scale, .h = 18.0 * scale }, "◆", color(chrome.warning), 11.0 * scale, body);
     queueBoldText(state, .{ .x = card.x + 31.0 * scale, .y = card.y + 9.0 * scale, .w = @max(card.w - 43.0 * scale, 0.0), .h = 18.0 * scale }, if (title.len > 0) title else "Permission required", color(chrome.approval_title), 12.0 * scale, body);
     queueText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 34.0 * scale, .w = @max(card.w - 24.0 * scale, 0.0), .h = 34.0 * scale }, if (detail.len > 0) detail else "Sprout is waiting for your decision before continuing.", color(chrome.approval_body), 12.0 * scale, body);
     const buttons = approvalButtonRects(body, state.companion_controller.currentScrollY());
-    queueRoundedRectClipped(state, buttons[0], color(surfaceDeep()), 8.0 * scale, body);
-    queueBorderClipped(state, buttons[0], color(chrome.border), 8.0 * scale, 1.0 * scale, body);
+    queuePanelClipped(state, buttons[0], color(surfaceDeep()), color(chrome.border), 8.0 * scale, 1.0 * scale, body);
     queueRoundedRectClipped(state, buttons[1], color(chrome.accent), 8.0 * scale, body);
     queueCenteredText(state, buttons[0], "Cancel action", color(chrome.text_muted), 11.5 * scale, .ui_bold, body);
     queueCenteredText(state, buttons[1], "Allow once", color(chrome.accent_fg), 11.5 * scale, .ui_bold, body);
@@ -708,11 +718,11 @@ fn renderOperationCard(state: *runtime.AppState, clip: palette.Rect, y: *f32, ti
     const failed = status == .failed;
     const indicator = operationStatusColor(chrome, status);
     const card: palette.Rect = .{ .x = clip.x + 12.0 * scale, .y = y.*, .w = @max(clip.w - 24.0 * scale, 0.0), .h = 72.0 * scale };
-    queueRoundedRectClipped(state, card, color(if (failed) chrome.failure_card else chrome.surface_deep), 10.0 * scale, clip);
-    queueBorderClipped(state, card, color(if (failed) chrome.failure_border else chrome.hairline), 10.0 * scale, 1.0 * scale, clip);
+    const card_fill = if (failed) opaqueOver(surface(), chrome.failure_card) else chrome.surface_deep;
+    const card_stroke = opaqueOver(card_fill, if (failed) chrome.failure_border else chrome.hairline);
+    queuePanelClipped(state, card, color(card_fill), color(card_stroke), 10.0 * scale, 1.0 * scale, clip);
     const avatar: palette.Rect = .{ .x = card.x + 11.0 * scale, .y = card.y + 10.0 * scale, .w = 27.0 * scale, .h = 27.0 * scale };
-    queueRoundedRectClipped(state, avatar, color(chrome.surface_deep), 7.0 * scale, clip);
-    queueBorderClipped(state, avatar, color(chrome.border), 7.0 * scale, 1.0 * scale, clip);
+    queuePanelClipped(state, avatar, color(chrome.surface_deep), color(chrome.border), 7.0 * scale, 1.0 * scale, clip);
     queueCenteredText(state, avatar, if (failed) "!" else "S", color(if (failed) chrome.failure_fg else chrome.identity_fg), 10.0 * scale, .mono, clip);
     const title_w = @max(card.w - 118.0 * scale, 0.0);
     queueBoldText(state, .{ .x = card.x + 48.0 * scale, .y = card.y + 9.0 * scale, .w = title_w, .h = 18.0 * scale }, truncatedText(state, .ui_bold, 12.0 * scale, title_w, singleLineText(state, title)), color(if (failed) chrome.failure_fg else chrome.text), 12.0 * scale, clip);
@@ -732,8 +742,10 @@ fn renderOperationCard(state: *runtime.AppState, clip: palette.Rect, y: *f32, ti
         queueText(state, .{ .x = card.x + 48.0 * scale, .y = card.y + 47.0 * scale, .w = line_w, .h = 15.0 * scale }, "Completed successfully", color(chrome.text_muted), 10.0 * scale, clip);
     }
     if (status == .pending) {
+        // Pending renders as a ring: an indicator-colored underlay whose core
+        // is refilled with the card color, so no border-only command is needed.
         const ring: palette.Rect = .{ .x = card.x + card.w - 65.0 * scale, .y = card.y + 15.0 * scale, .w = 7.0 * scale, .h = 7.0 * scale };
-        queueBorderClipped(state, ring, color(indicator), 3.5 * scale, 1.0 * scale, clip);
+        queuePanelClipped(state, ring, color(card_fill), color(indicator), 3.5 * scale, 1.0 * scale, clip);
     } else {
         queueRoundedRectClipped(state, .{ .x = card.x + card.w - 65.0 * scale, .y = card.y + 15.0 * scale, .w = 7.0 * scale, .h = 7.0 * scale }, color(indicator), 3.5 * scale, clip);
     }
@@ -921,18 +933,16 @@ fn renderSprout(state: *runtime.AppState, rect: palette.Rect, visual: controller
     // Small torso and two 7×4 perch feet beneath the oversized head.
     const torso: palette.Rect = .{ .x = rect.x + 12.0 * s, .y = rect.y + 35.0 * s, .w = 22.0 * s, .h = 13.0 * s };
     queueRoundedRect(state, offsetRect(torso, 0.0, 3.0 * s), color(sprout.torso_depth), 6.0 * s);
-    queueRoundedRect(state, torso, color(torso_fill), 6.0 * s);
-    queueBorder(state, torso, color(sprout.outline), 6.0 * s, 1.0 * s);
+    queueCharacterPanel(state, torso, color(torso_fill), color(sprout.outline), 6.0 * s, 1.0 * s);
     queueRoundedRect(state, .{ .x = torso.x + 0.5 * s, .y = torso.y + torso.h - 2.0 * s, .w = 7.0 * s, .h = 4.0 * s }, color(sprout.feet), 2.0 * s);
     queueRoundedRect(state, .{ .x = torso.x + torso.w - 7.5 * s, .y = torso.y + torso.h - 2.0 * s, .w = 7.0 * s, .h = 4.0 * s }, color(sprout.feet), 2.0 * s);
 
     // The 36×27 hatchling head has no backing disc.
     const face: palette.Rect = .{ .x = rect.x + 5.0 * s, .y = rect.y + 12.0 * s, .w = 36.0 * s, .h = 27.0 * s };
     queueRoundedRect(state, offsetRect(face, 0.0, 3.0 * s), color(sprout.head_depth), 13.0 * s);
-    queueRoundedRect(state, face, color(head_fill), 13.0 * s);
+    queueCharacterPanel(state, face, color(head_fill), color(sprout.outline), 13.0 * s, 1.0 * s);
     const head_rim: palette.Rect = .{ .x = face.x + 5.0 * s, .y = face.y + 3.0 * s, .w = face.w - 10.0 * s, .h = 2.0 * s };
     queueRoundedRectClipped(state, head_rim, color(sprout.highlight), 1.0 * s, face);
-    queueBorder(state, face, color(sprout.outline), 13.0 * s, 1.0 * s);
 
     const eye_y = face.y + 7.0 * s;
     inline for (.{ face.x + 8.0 * s, face.x + 19.5 * s }) |eye_x| {
@@ -940,8 +950,7 @@ fn renderSprout(state: *runtime.AppState, rect: palette.Rect, visual: controller
             queueRoundedRect(state, .{ .x = eye_x, .y = eye_y + 4.0 * s, .w = 8.5 * s, .h = 2.0 * s }, color(sprout.paused_lid), 1.0 * s);
         } else {
             const eye: palette.Rect = .{ .x = eye_x, .y = eye_y, .w = 8.5 * s, .h = 9.0 * s };
-            queueRoundedRect(state, eye, color(theme.mix(sprout.iris_top, sprout.iris_bottom, 0.5)), 4.25 * s);
-            queueBorder(state, eye, color(sprout.eye_ring), 4.25 * s, 1.0 * s);
+            queueCharacterPanel(state, eye, color(theme.mix(sprout.iris_top, sprout.iris_bottom, 0.5)), color(sprout.eye_ring), 4.25 * s, 1.0 * s);
             const gaze = if (visual.pose == .approval) 2.0 * s else 0.0;
             queueRoundedRect(state, .{ .x = eye.x + 2.5 * s + gaze, .y = eye.y + 3.0 * s, .w = 3.5 * s, .h = 4.0 * s }, color(sprout.eye_ring), 1.7 * s);
             queueRoundedRect(state, .{ .x = eye.x + 1.7 * s, .y = eye.y + 1.4 * s, .w = 3.0 * s, .h = 3.0 * s }, color(sprout.catchlight_primary), 1.5 * s);
@@ -1229,175 +1238,23 @@ fn rectFitsWindow(rect: palette.Rect, width: f32, height: f32) bool {
     return rect.w > 0.0 and rect.h > 0.0 and rect.x >= 0.0 and rect.y >= 0.0 and rect.x + rect.w <= width and rect.y + rect.h <= height;
 }
 
+// Collapsed chip chrome. The chip sits flush with the right window edge, so
+// both the shadow and the panel extend past that edge by the corner radius and
+// clip to the window: the visible right edge stays square while the left
+// corners stay round, all through the anti-aliased SDF rect path (the old
+// triangle-fan rail had no edge AA and read as faceted arcs).
 fn appendChipChrome(allocator: std.mem.Allocator, batch: *palette.RenderBatch, geometry: Geometry, scale: f32) !void {
     if (geometry.chip.w < 2.0 * scale or geometry.chip.h < 2.0 * scale) return;
+    const radius = @min(10.0 * scale, @min(geometry.chip.h * 0.5, geometry.chip.w));
     const shadow = offsetRect(geometry.chip, 0.0, 8.0 * scale);
     if (rectFitsWindow(shadow, geometry.window.w, geometry.window.h)) {
-        try appendLeftRoundedFill(allocator, batch, shadow, color(theme.scrim(0.20)), 10.0 * scale);
+        try batch.roundedRectClipped(allocator, extendedRight(shadow, radius), color(theme.scrim(0.20)), radius, geometry.window);
     }
-    try appendLeftRoundedRail(allocator, batch, geometry.chip, color(surface()), color(theme.companionChrome().border), 10.0 * scale, 1.0 * scale);
+    try appendPanel(allocator, batch, extendedRight(geometry.chip, radius), color(surface()), color(theme.companionChrome().border), radius, 1.0 * scale, geometry.window, true);
 }
 
-fn appendLeftRoundedFill(allocator: std.mem.Allocator, batch: *palette.RenderBatch, rect: palette.Rect, fill: palette.Color, radius: f32) !void {
-    if (rect.w <= 0.0 or rect.h <= 0.0) return;
-    const r = @min(radius, @min(rect.h * 0.5, rect.w));
-    try appendQuadCropped(allocator, batch, .{ .x = rect.x + r, .y = rect.y, .w = rect.w - r, .h = rect.h }, fill, null);
-    try appendQuadCropped(allocator, batch, .{ .x = rect.x, .y = rect.y + r, .w = r, .h = rect.h - r * 2.0 }, fill, null);
-    try appendQuarterFan(allocator, batch, .{ .x = rect.x + r, .y = rect.y + r }, r, std.math.pi, std.math.pi * 1.5, fill, null);
-    try appendQuarterFan(allocator, batch, .{ .x = rect.x + r, .y = rect.y + rect.h - r }, r, std.math.pi * 0.5, std.math.pi, fill, null);
-}
-
-fn appendLeftRoundedRail(
-    allocator: std.mem.Allocator,
-    batch: *palette.RenderBatch,
-    rect: palette.Rect,
-    fill: palette.Color,
-    border: palette.Color,
-    radius: f32,
-    border_width: f32,
-) !void {
-    if (rect.w <= 0.0 or rect.h <= 0.0) return;
-    const r = @min(radius, @min(rect.h * 0.5, rect.w));
-    try appendLeftRoundedFill(allocator, batch, rect, fill, r);
-    const line_h = @min(border_width, rect.h);
-    try appendQuadCropped(allocator, batch, .{ .x = rect.x + r, .y = rect.y, .w = rect.w - r, .h = line_h }, border, null);
-    try appendQuadCropped(allocator, batch, .{ .x = rect.x + r, .y = rect.y + rect.h - line_h, .w = rect.w - r, .h = line_h }, border, null);
-    try appendQuadCropped(allocator, batch, .{ .x = rect.x, .y = rect.y + r, .w = line_h, .h = rect.h - r * 2.0 }, border, null);
-    try appendQuarterRing(allocator, batch, .{ .x = rect.x + r, .y = rect.y + r }, r, @max(r - line_h, 0.0), std.math.pi, std.math.pi * 1.5, border);
-    try appendQuarterRing(allocator, batch, .{ .x = rect.x + r, .y = rect.y + rect.h - r }, r, @max(r - line_h, 0.0), std.math.pi * 0.5, std.math.pi, border);
-}
-
-const ARC_SEGMENTS = 8;
-
-fn appendRoundedFillMesh(allocator: std.mem.Allocator, batch: *palette.RenderBatch, rect: palette.Rect, fill: palette.Color, radius: f32, crop: palette.Rect) !void {
-    if (rect.w <= 0.0 or rect.h <= 0.0) return;
-    const r = @min(radius, @min(rect.w, rect.h) * 0.5);
-    try appendQuadCropped(allocator, batch, .{ .x = rect.x + r, .y = rect.y, .w = rect.w - r * 2.0, .h = rect.h }, fill, crop);
-    try appendQuadCropped(allocator, batch, .{ .x = rect.x, .y = rect.y + r, .w = r, .h = rect.h - r * 2.0 }, fill, crop);
-    try appendQuadCropped(allocator, batch, .{ .x = rect.x + rect.w - r, .y = rect.y + r, .w = r, .h = rect.h - r * 2.0 }, fill, crop);
-    try appendQuarterFan(allocator, batch, .{ .x = rect.x + r, .y = rect.y + r }, r, std.math.pi, std.math.pi * 1.5, fill, crop);
-    try appendQuarterFan(allocator, batch, .{ .x = rect.x + rect.w - r, .y = rect.y + r }, r, std.math.pi * 1.5, std.math.pi * 2.0, fill, crop);
-    try appendQuarterFan(allocator, batch, .{ .x = rect.x + r, .y = rect.y + rect.h - r }, r, std.math.pi * 0.5, std.math.pi, fill, crop);
-    try appendQuarterFan(allocator, batch, .{ .x = rect.x + rect.w - r, .y = rect.y + rect.h - r }, r, 0.0, std.math.pi * 0.5, fill, crop);
-}
-
-fn appendQuarterFan(allocator: std.mem.Allocator, batch: *palette.RenderBatch, center: palette.draw.Vec2, radius: f32, start_angle: f32, end_angle: f32, fill: palette.Color, crop: ?palette.Rect) !void {
-    if (radius <= 0.0) return;
-    var index: usize = 0;
-    while (index < ARC_SEGMENTS) : (index += 1) {
-        const t0: f32 = @as(f32, @floatFromInt(index)) / ARC_SEGMENTS;
-        const t1: f32 = @as(f32, @floatFromInt(index + 1)) / ARC_SEGMENTS;
-        try appendTriangleCropped(allocator, batch, center, arcPoint(center, radius, start_angle + (end_angle - start_angle) * t0), arcPoint(center, radius, start_angle + (end_angle - start_angle) * t1), fill, crop);
-    }
-}
-
-fn appendQuarterRing(allocator: std.mem.Allocator, batch: *palette.RenderBatch, center: palette.draw.Vec2, outer_radius: f32, inner_radius: f32, start_angle: f32, end_angle: f32, fill: palette.Color) !void {
-    var index: usize = 0;
-    while (index < ARC_SEGMENTS) : (index += 1) {
-        const t0: f32 = @as(f32, @floatFromInt(index)) / ARC_SEGMENTS;
-        const t1: f32 = @as(f32, @floatFromInt(index + 1)) / ARC_SEGMENTS;
-        const a0 = start_angle + (end_angle - start_angle) * t0;
-        const a1 = start_angle + (end_angle - start_angle) * t1;
-        const outer0 = arcPoint(center, outer_radius, a0);
-        const outer1 = arcPoint(center, outer_radius, a1);
-        const inner0 = arcPoint(center, inner_radius, a0);
-        const inner1 = arcPoint(center, inner_radius, a1);
-        try batch.triangle(allocator, outer0, outer1, inner1, fill);
-        try batch.triangle(allocator, outer0, inner1, inner0, fill);
-    }
-}
-
-fn arcPoint(center: palette.draw.Vec2, radius: f32, angle: f32) palette.draw.Vec2 {
-    return .{ .x = center.x + @cos(angle) * radius, .y = center.y + @sin(angle) * radius };
-}
-
-fn appendQuadCropped(allocator: std.mem.Allocator, batch: *palette.RenderBatch, rect: palette.Rect, fill: palette.Color, crop: ?palette.Rect) !void {
-    if (rect.w <= 0.0 or rect.h <= 0.0) return;
-    const top_left: palette.draw.Vec2 = .{ .x = rect.x, .y = rect.y };
-    const top_right: palette.draw.Vec2 = .{ .x = rect.x + rect.w, .y = rect.y };
-    const bottom_right: palette.draw.Vec2 = .{ .x = rect.x + rect.w, .y = rect.y + rect.h };
-    const bottom_left: palette.draw.Vec2 = .{ .x = rect.x, .y = rect.y + rect.h };
-    try appendTriangleCropped(allocator, batch, top_left, top_right, bottom_right, fill, crop);
-    try appendTriangleCropped(allocator, batch, top_left, bottom_right, bottom_left, fill, crop);
-}
-
-const ClipEdge = enum { left, right, top, bottom };
-
-fn appendTriangleCropped(allocator: std.mem.Allocator, batch: *palette.RenderBatch, p0: palette.draw.Vec2, p1: palette.draw.Vec2, p2: palette.draw.Vec2, fill: palette.Color, crop: ?palette.Rect) !void {
-    if (crop == null) {
-        if (triangleArea2(p0, p1, p2) != 0.0) try batch.triangle(allocator, p0, p1, p2, fill);
-        return;
-    }
-    const bounds = crop.?;
-    var polygon: [8]palette.draw.Vec2 = undefined;
-    polygon[0] = p0;
-    polygon[1] = p1;
-    polygon[2] = p2;
-    var count: usize = 3;
-    var scratch: [8]palette.draw.Vec2 = undefined;
-    inline for (.{
-        .{ ClipEdge.left, bounds.x },
-        .{ ClipEdge.right, bounds.x + bounds.w },
-        .{ ClipEdge.top, bounds.y },
-        .{ ClipEdge.bottom, bounds.y + bounds.h },
-    }) |edge| {
-        count = clipPolygonEdge(polygon[0..count], &scratch, edge[0], edge[1]);
-        if (count == 0) return;
-        polygon = scratch;
-    }
-    var index: usize = 1;
-    while (index + 1 < count) : (index += 1) {
-        if (triangleArea2(polygon[0], polygon[index], polygon[index + 1]) != 0.0) {
-            try batch.triangle(allocator, polygon[0], polygon[index], polygon[index + 1], fill);
-        }
-    }
-}
-
-fn clipPolygonEdge(input: []const palette.draw.Vec2, output: *[8]palette.draw.Vec2, edge: ClipEdge, bound: f32) usize {
-    if (input.len == 0) return 0;
-    var count: usize = 0;
-    var previous = input[input.len - 1];
-    var previous_inside = pointInsideEdge(previous, edge, bound);
-    for (input) |current| {
-        const current_inside = pointInsideEdge(current, edge, bound);
-        if (current_inside != previous_inside) {
-            output[count] = edgeIntersection(previous, current, edge, bound);
-            count += 1;
-        }
-        if (current_inside) {
-            output[count] = current;
-            count += 1;
-        }
-        previous = current;
-        previous_inside = current_inside;
-    }
-    return count;
-}
-
-fn pointInsideEdge(point: palette.draw.Vec2, edge: ClipEdge, bound: f32) bool {
-    return switch (edge) {
-        .left => point.x >= bound,
-        .right => point.x <= bound,
-        .top => point.y >= bound,
-        .bottom => point.y <= bound,
-    };
-}
-
-fn edgeIntersection(from: palette.draw.Vec2, to: palette.draw.Vec2, edge: ClipEdge, bound: f32) palette.draw.Vec2 {
-    return switch (edge) {
-        .left, .right => blk: {
-            const t = (bound - from.x) / (to.x - from.x);
-            break :blk .{ .x = bound, .y = from.y + (to.y - from.y) * t };
-        },
-        .top, .bottom => blk: {
-            const t = (bound - from.y) / (to.y - from.y);
-            break :blk .{ .x = from.x + (to.x - from.x) * t, .y = bound };
-        },
-    };
-}
-
-fn triangleArea2(a: palette.draw.Vec2, b: palette.draw.Vec2, c: palette.draw.Vec2) f32 {
-    return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+fn extendedRight(rect: palette.Rect, amount: f32) palette.Rect {
+    return .{ .x = rect.x, .y = rect.y, .w = rect.w + amount, .h = rect.h };
 }
 
 fn color(value: [4]f32) palette.Color {
@@ -1405,7 +1262,7 @@ fn color(value: [4]f32) palette.Color {
 }
 
 fn queueRect(state: *runtime.AppState, rect: palette.Rect, fill: palette.Color) void {
-    state.palette_overlay_batch.rect(state.allocator, nonNegativeRect(rect), fill) catch |err| log.warn("failed to queue rect: {s}", .{@errorName(err)});
+    state.palette_overlay_batch.rect(state.allocator, snappedRect(nonNegativeRect(rect)), fill) catch |err| log.warn("failed to queue rect: {s}", .{@errorName(err)});
 }
 
 fn queueRoundedRect(state: *runtime.AppState, rect: palette.Rect, fill: palette.Color, radius: f32) void {
@@ -1416,12 +1273,66 @@ fn queueRoundedRectClipped(state: *runtime.AppState, rect: palette.Rect, fill: p
     state.palette_overlay_batch.roundedRectClipped(state.allocator, nonNegativeRect(rect), fill, radius, nonNegativeRect(clip)) catch |err| log.warn("failed to queue clipped rect: {s}", .{@errorName(err)});
 }
 
-fn queueBorderClipped(state: *runtime.AppState, rect: palette.Rect, stroke: palette.Color, radius: f32, width: f32, clip: palette.Rect) void {
-    state.palette_overlay_batch.rectBorderClipped(state.allocator, nonNegativeRect(rect), stroke, radius, width, nonNegativeRect(clip)) catch |err| log.warn("failed to queue clipped border: {s}", .{@errorName(err)});
+// Bordered chrome primitive. Palette border-only commands carry a
+// transparent-white fill, and the SDF shader composites every anti-aliased
+// border fringe toward that fill color, so bare strokes halo white along all
+// corner arcs. Panels instead draw the stroke as a filled underlay with the
+// fill inset by the stroke width — two plain fills with correct edge AA.
+// Chrome panels snap edges and stroke to whole device pixels so fractional
+// display scales cannot smear one-pixel borders across two pixel rows;
+// character art passes snap=false to keep its sub-pixel geometry.
+fn appendPanel(allocator: std.mem.Allocator, batch: *palette.RenderBatch, rect_in: palette.Rect, fill: palette.Color, stroke: palette.Color, radius_in: f32, width_in: f32, clip_in: ?palette.Rect, snap: bool) !void {
+    const rect = if (snap) snappedRect(nonNegativeRect(rect_in)) else nonNegativeRect(rect_in);
+    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+    const width = @min(if (snap) snappedStroke(width_in) else width_in, @min(rect.w, rect.h) * 0.5);
+    const radius = @min(radius_in, @min(rect.w, rect.h) * 0.5);
+    const inner: palette.Rect = .{ .x = rect.x + width, .y = rect.y + width, .w = @max(rect.w - width * 2.0, 0.0), .h = @max(rect.h - width * 2.0, 0.0) };
+    const inner_radius = @max(radius - width, 0.0);
+    if (clip_in) |clip_value| {
+        const clip = if (snap) snappedRect(nonNegativeRect(clip_value)) else nonNegativeRect(clip_value);
+        if (clip.w <= 0.0 or clip.h <= 0.0) return;
+        try batch.roundedRectClipped(allocator, rect, stroke, radius, clip);
+        if (inner.w > 0.0 and inner.h > 0.0) try batch.roundedRectClipped(allocator, inner, fill, inner_radius, clip);
+    } else {
+        try batch.roundedRect(allocator, rect, stroke, radius);
+        if (inner.w > 0.0 and inner.h > 0.0) try batch.roundedRect(allocator, inner, fill, inner_radius);
+    }
 }
 
-fn queueBorder(state: *runtime.AppState, rect: palette.Rect, stroke: palette.Color, radius: f32, width: f32) void {
-    state.palette_overlay_batch.rectBorder(state.allocator, nonNegativeRect(rect), stroke, radius, width) catch |err| log.warn("failed to queue border: {s}", .{@errorName(err)});
+fn queuePanel(state: *runtime.AppState, rect: palette.Rect, fill: palette.Color, stroke: palette.Color, radius: f32, width: f32) void {
+    appendPanel(state.allocator, &state.palette_overlay_batch, rect, fill, stroke, radius, width, null, true) catch |err| log.warn("failed to queue panel: {s}", .{@errorName(err)});
+}
+
+fn queuePanelClipped(state: *runtime.AppState, rect: palette.Rect, fill: palette.Color, stroke: palette.Color, radius: f32, width: f32, clip: palette.Rect) void {
+    appendPanel(state.allocator, &state.palette_overlay_batch, rect, fill, stroke, radius, width, clip, true) catch |err| log.warn("failed to queue clipped panel: {s}", .{@errorName(err)});
+}
+
+// Sprout is drawn at fractional character units, so its panels stay unsnapped:
+// rounding a sub-pixel-scaled feature would visibly distort the character, and
+// SDF AA renders the fractional edges smoothly.
+fn queueCharacterPanel(state: *runtime.AppState, rect: palette.Rect, fill: palette.Color, stroke: palette.Color, radius: f32, width: f32) void {
+    appendPanel(state.allocator, &state.palette_overlay_batch, rect, fill, stroke, radius, width, null, false) catch |err| log.warn("failed to queue character panel: {s}", .{@errorName(err)});
+}
+
+// Translucent theme washes assumed painter-order compositing over the surface
+// beneath them; panels draw the stroke below the fill, so each layer is
+// pre-flattened to its equivalent opaque color. Visual output is unchanged and
+// warning/danger hues are preserved exactly.
+fn opaqueOver(backdrop: [4]f32, layer: [4]f32) [4]f32 {
+    return theme.mix(backdrop, .{ layer[0], layer[1], layer[2], 1.0 }, layer[3]);
+}
+
+// Edges snap independently (rather than snapping width and height) so
+// adjacent chrome stays gap-free when fractional display scales produce
+// non-integral coordinates.
+fn snappedRect(rect: palette.Rect) palette.Rect {
+    const x = @round(rect.x);
+    const y = @round(rect.y);
+    return .{ .x = x, .y = y, .w = @max(@round(rect.x + rect.w) - x, 0.0), .h = @max(@round(rect.y + rect.h) - y, 0.0) };
+}
+
+fn snappedStroke(width: f32) f32 {
+    return @max(@round(width), 1.0);
 }
 
 fn queueText(state: *runtime.AppState, rect: palette.Rect, value: []const u8, fill: palette.Color, font_size: f32, clip: palette.Rect) void {
@@ -1505,18 +1416,6 @@ fn expectBatchInsideWindow(batch: *const palette.RenderBatch, window: palette.Re
     }
 }
 
-fn triangleMinX(command: palette.draw.Command) f32 {
-    return @min(command.p0.x, @min(command.p1.x, command.p2.x));
-}
-
-fn triangleMaxX(command: palette.draw.Command) f32 {
-    return @max(command.p0.x, @max(command.p1.x, command.p2.x));
-}
-
-fn triangleArea(command: palette.draw.Command) f32 {
-    return @abs(triangleArea2(command.p0, command.p1, command.p2)) * 0.5;
-}
-
 fn sameColor(a: palette.Color, b: palette.Color) bool {
     return a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a;
 }
@@ -1559,35 +1458,31 @@ test "sidecar geometry stays in bounds at normal narrow and short sizes" {
     try std.testing.expectEqual(@as(f32, 374.0), computeGeometry(390.0, 760.0, 1.0).sidecar.w);
 }
 
-test "chip chrome commands have a square open right edge and stay in extreme bounds" {
+test "chip chrome renders clipped SDF panels with a square open right edge" {
     const allocator = std.testing.allocator;
     const normal = computeGeometry(1360.0, 860.0, 1.0);
     var normal_batch: palette.RenderBatch = .{};
     defer normal_batch.deinit(allocator);
     try appendChipChrome(allocator, &normal_batch, normal, 1.0);
-    const right = normal.chip.x + normal.chip.w;
+    try std.testing.expectEqual(@as(usize, 3), normal_batch.commands.items.len);
     const border = color(theme.companionChrome().border);
-    var saw_square_fill = false;
-    var saw_top_border = false;
-    var saw_bottom_border = false;
+    const fill = color(surface());
+    var saw_underlay = false;
+    var saw_fill = false;
     for (normal_batch.commands.items) |command| {
-        try std.testing.expectEqual(palette.draw.CommandKind.triangle, command.kind);
-        try std.testing.expect(command.clip == null);
-        if (triangleMaxX(command) == right) {
-            if (sameColor(command.color, border)) {
-                const top = @max(command.p0.y, @max(command.p1.y, command.p2.y)) <= normal.chip.y + 1.0;
-                const bottom = @min(command.p0.y, @min(command.p1.y, command.p2.y)) >= normal.chip.y + normal.chip.h - 1.0;
-                try std.testing.expect(top or bottom);
-                saw_top_border = saw_top_border or top;
-                saw_bottom_border = saw_bottom_border or bottom;
-            } else {
-                saw_square_fill = true;
-            }
-        }
+        try std.testing.expectEqual(palette.draw.CommandKind.rect, command.kind);
+        // Border-only commands halo white at corner arcs; chip chrome must be
+        // fill-only panel commands.
+        try std.testing.expect(command.border_color == null);
+        // Every chip rect extends past the flush right window edge and clips
+        // to the window, keeping the visible right edge square.
+        const clip = command.clip orelse return error.MissingChipClip;
+        try std.testing.expect(rectEqual(clip, normal.window));
+        try std.testing.expect(command.rect.x + command.rect.w > normal.window.w);
+        if (sameColor(command.color, border)) saw_underlay = true;
+        if (sameColor(command.color, fill)) saw_fill = true;
     }
-    try std.testing.expect(saw_square_fill);
-    try std.testing.expect(saw_top_border);
-    try std.testing.expect(saw_bottom_border);
+    try std.testing.expect(saw_underlay and saw_fill);
 
     inline for (.{
         .{ @as(f32, 40.0), @as(f32, 30.0), @as(f32, 3.0) },
@@ -1605,43 +1500,37 @@ test "chip chrome commands have a square open right edge and stay in extreme bou
     }
 }
 
-test "chip rail cap and body are disjoint at integer and fractional scales" {
+test "chip chrome snaps panel edges and stroke to device pixels at fractional scales" {
     const allocator = std.testing.allocator;
+    const border = color(theme.companionChrome().border);
+    const fill = color(surface());
     inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5) }) |scale| {
         const geometry = computeGeometry(1360.0, 860.0, scale);
-        const radius = 10.0 * scale;
-        const seam = geometry.chip.x + radius;
-        var fill_batch: palette.RenderBatch = .{};
-        defer fill_batch.deinit(allocator);
-        var translucent: palette.RenderBatch = .{};
-        defer translucent.deinit(allocator);
-        try appendLeftRoundedFill(allocator, &fill_batch, geometry.chip, color(surface()), radius);
-        try appendLeftRoundedFill(allocator, &translucent, geometry.chip, color(theme.scrim(0.20)), radius);
-        try std.testing.expectEqual(fill_batch.commands.items.len, translucent.commands.items.len);
-
-        var area: f32 = 0.0;
-        var arc_vertex_count: usize = 0;
-        for (fill_batch.commands.items, translucent.commands.items) |opaque_triangle, shadow_triangle| {
-            try std.testing.expectEqual(palette.draw.CommandKind.triangle, opaque_triangle.kind);
-            try std.testing.expectEqual(opaque_triangle.p0, shadow_triangle.p0);
-            try std.testing.expectEqual(opaque_triangle.p1, shadow_triangle.p1);
-            try std.testing.expectEqual(opaque_triangle.p2, shadow_triangle.p2);
-            const on_left = triangleMaxX(opaque_triangle) <= seam;
-            const on_right = triangleMinX(opaque_triangle) >= seam;
-            try std.testing.expect(on_left or on_right);
-            area += triangleArea(opaque_triangle);
-            inline for (.{ opaque_triangle.p0, opaque_triangle.p1, opaque_triangle.p2 }) |point| {
-                if (point.x <= seam and point.y <= geometry.chip.y + radius) {
-                    const dx = point.x - seam;
-                    const dy = point.y - (geometry.chip.y + radius);
-                    if (@abs(@sqrt(dx * dx + dy * dy) - radius) < 0.001) arc_vertex_count += 1;
-                }
-            }
+        var batch: palette.RenderBatch = .{};
+        defer batch.deinit(allocator);
+        try appendChipChrome(allocator, &batch, geometry, scale);
+        var underlay: ?palette.draw.Command = null;
+        var body: ?palette.draw.Command = null;
+        for (batch.commands.items) |command| {
+            if (sameColor(command.color, border)) underlay = command;
+            if (sameColor(command.color, fill)) body = command;
         }
-        const sector_area = @as(f32, ARC_SEGMENTS) * 0.5 * radius * radius * @sin((std.math.pi * 0.5) / @as(f32, ARC_SEGMENTS));
-        const expected_area = (geometry.chip.w - radius) * geometry.chip.h + radius * (geometry.chip.h - radius * 2.0) + sector_area * 2.0;
-        try std.testing.expectApproxEqAbs(expected_area, area, 0.02 * scale);
-        try std.testing.expect(arc_vertex_count >= ARC_SEGMENTS * 2);
+        const outer = underlay orelse return error.MissingChipUnderlay;
+        const inner = body orelse return error.MissingChipFill;
+        // Chrome edges land on whole device pixels at every scale…
+        inline for (.{ outer, inner }) |command| {
+            try std.testing.expectEqual(@round(command.rect.x), command.rect.x);
+            try std.testing.expectEqual(@round(command.rect.y), command.rect.y);
+            try std.testing.expectEqual(@round(command.rect.w), command.rect.w);
+            try std.testing.expectEqual(@round(command.rect.h), command.rect.h);
+        }
+        // …and the fill sits inside the underlay by a whole-pixel stroke, so
+        // the visible border is a continuous ring of constant thickness.
+        const stroke = inner.rect.x - outer.rect.x;
+        try std.testing.expectEqual(@round(stroke), stroke);
+        try std.testing.expect(stroke >= 1.0);
+        try std.testing.expectEqual(outer.rect.y + stroke, inner.rect.y);
+        try std.testing.expectEqual(outer.rect.h - stroke * 2.0, inner.rect.h);
     }
 }
 
@@ -2386,7 +2275,7 @@ test "public Companion render repaints active chrome without reconstructing stat
     theme.current_colors = first;
     const first_chrome = theme.companionChrome();
     render(&state, 1360.0, 860.0);
-    try expectBatchColor(&state.palette_overlay_batch, .triangle, first_chrome.surface);
+    try expectBatchColor(&state.palette_overlay_batch, .rect, first_chrome.surface);
     state.palette_overlay_batch.clear();
     state.companion_controller.show();
     render(&state, 1360.0, 860.0);
@@ -2400,7 +2289,7 @@ test "public Companion render repaints active chrome without reconstructing stat
     state.palette_overlay_batch.clear();
     state.companion_controller.collapse();
     render(&state, 1360.0, 860.0);
-    try expectBatchColor(&state.palette_overlay_batch, .triangle, second_chrome.surface);
+    try expectBatchColor(&state.palette_overlay_batch, .rect, second_chrome.surface);
     state.palette_overlay_batch.clear();
     state.companion_controller.show();
     render(&state, 1360.0, 860.0);
@@ -2686,25 +2575,29 @@ fn expectExpandedChrome(state: *runtime.AppState, geometry: Geometry, chrome: th
     const tabs_track: palette.Rect = .{ .x = geometry.tabs.x + 12.0, .y = geometry.tabs.y + 10.0, .w = geometry.tabs.w - 24.0, .h = geometry.tabs.h - 10.0 };
     const tabs_inner: palette.Rect = .{ .x = tabs_track.x + 3.0, .y = tabs_track.y + 3.0, .w = tabs_track.w - 6.0, .h = tabs_track.h - 6.0 };
     const run_pill: palette.Rect = .{ .x = tabs_inner.x, .y = tabs_inner.y, .w = tabs_inner.w / 2.0, .h = tabs_inner.h };
+    const card_fill = if (failed) opaqueOver(chrome.surface, chrome.failure_card) else chrome.surface_deep;
+    var saw_panel_border = false;
     var saw_panel = false;
     var saw_tabs = false;
     var saw_run = false;
     var saw_card = false;
-    var saw_footer = false;
+    var saw_footer_divider = false;
     var saw_scrim = false;
     var saw_broad_shadow = false;
     var saw_near_shadow = false;
     for (state.palette_overlay_batch.commands.items) |command| {
-        if (command.kind == .rect and rectEqual(command.rect, geometry.sidecar) and sameColor(command.color, color(chrome.surface))) saw_panel = true;
-        if (command.kind == .rect and rectEqual(command.rect, tabs_track) and sameColor(command.color, color(chrome.surface_deep))) saw_tabs = true;
-        if (command.kind == .rect and rectEqual(command.rect, run_pill) and sameColor(command.color, color(chrome.surface))) saw_run = true;
-        if (command.kind == .rect and command.rect.x == geometry.body.x + 12.0 and command.rect.w == geometry.body.w - 24.0 and command.rect.h == 72.0 and sameColor(command.color, color(if (failed) chrome.failure_card else chrome.surface_deep))) saw_card = true;
-        if (command.kind == .rect and rectEqual(command.rect, geometry.footer) and sameColor(command.color, color(chrome.surface))) saw_footer = true;
-        if (command.kind == .rect and rectEqual(command.rect, geometry.window) and sameColor(command.color, color(theme.scrim(0.22)))) saw_scrim = true;
-        if (command.kind == .triangle and sameColor(command.color, color(theme.scrim(0.16)))) saw_broad_shadow = true;
-        if (command.kind == .triangle and sameColor(command.color, color(theme.scrim(0.24)))) saw_near_shadow = true;
+        if (command.kind != .rect) continue;
+        if (rectEqual(command.rect, geometry.sidecar) and sameColor(command.color, color(chrome.border))) saw_panel_border = true;
+        if (rectEqual(command.rect, insetRect(geometry.sidecar, 1.0)) and sameColor(command.color, color(chrome.surface))) saw_panel = true;
+        if (rectEqual(command.rect, insetRect(tabs_track, 1.0)) and sameColor(command.color, color(chrome.surface_deep))) saw_tabs = true;
+        if (rectEqual(command.rect, run_pill) and sameColor(command.color, color(chrome.surface))) saw_run = true;
+        if (command.rect.x == geometry.body.x + 13.0 and command.rect.w == geometry.body.w - 26.0 and command.rect.h == 70.0 and sameColor(command.color, color(card_fill))) saw_card = true;
+        if (command.rect.y == geometry.footer.y and command.rect.h == 1.0 and command.rect.x >= geometry.footer.x + 1.0 and command.rect.x + command.rect.w <= geometry.footer.x + geometry.footer.w - 1.0 and sameColor(command.color, color(chrome.hairline))) saw_footer_divider = true;
+        if (rectEqual(command.rect, geometry.window) and sameColor(command.color, color(theme.scrim(0.22)))) saw_scrim = true;
+        if (sameColor(command.color, color(theme.scrim(0.16)))) saw_broad_shadow = true;
+        if (sameColor(command.color, color(theme.scrim(0.24)))) saw_near_shadow = true;
     }
-    try std.testing.expect(saw_panel and saw_tabs and saw_run and saw_card and saw_footer);
+    try std.testing.expect(saw_panel_border and saw_panel and saw_tabs and saw_run and saw_card and saw_footer_divider);
     try std.testing.expect(saw_scrim and saw_broad_shadow and saw_near_shadow);
     try std.testing.expect(state.companion_composer.style.focus_border_color != null);
     try std.testing.expect(sameColor(state.companion_composer.style.focus_border_color.?, color(chrome.accent)));
@@ -2717,6 +2610,10 @@ fn expectExpandedChrome(state: *runtime.AppState, geometry: Geometry, chrome: th
 
 fn rectEqual(left: palette.Rect, right: palette.Rect) bool {
     return left.x == right.x and left.y == right.y and left.w == right.w and left.h == right.h;
+}
+
+fn insetRect(rect: palette.Rect, amount: f32) palette.Rect {
+    return .{ .x = rect.x + amount, .y = rect.y + amount, .w = @max(rect.w - amount * 2.0, 0.0), .h = @max(rect.h - amount * 2.0, 0.0) };
 }
 
 test "prototype geometry fixes chip rail sidecar chrome and composer footer" {
@@ -2919,4 +2816,144 @@ test "production hit refresh clears cross-owner approval under contention and re
     try std.testing.expectEqualDeep(owner_b_frame, state.companion_controller.presentation);
     try std.testing.expectEqual(owner_b_hit_count, state.companion_controller.hit_count);
     thread_b.send_state.mutex.unlock();
+}
+
+// Only the shared composer inside the footer may emit Palette border
+// commands; all companion-authored chrome must land as filled panel commands.
+fn expectNoBorderOnlyChrome(state: *runtime.AppState, width: f32, height: f32) !void {
+    const geometry = computeGeometryForState(width, height, companionScale(), &state.companion_controller);
+    for (state.palette_overlay_batch.commands.items) |command| {
+        if (command.border_color == null) continue;
+        try std.testing.expect(command.rect.x >= geometry.footer.x);
+        try std.testing.expect(command.rect.y >= geometry.footer.y);
+    }
+}
+
+// Regression for the white-fringe defect behind the "chopped borders"
+// screenshot: Palette border-only commands carry a transparent-white fill and
+// the SDF shader composites every anti-aliased border fringe toward that
+// fill, so bare strokes halo white along all corner arcs. Every bordered
+// companion path must therefore render as filled panel underlays.
+test "companion chrome draws no border-only commands outside the shared composer" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25) }) |scale| {
+        theme.applyTheme(scale);
+        var state: runtime.AppState = undefined;
+        state.allocator = allocator;
+        state.project_controller = .{};
+        state.companion_controller = controller.init();
+        state.companion_composer = @TypeOf(state.companion_composer).init();
+        state.palette_overlay_batch = .{};
+        state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+        defer {
+            for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+            state.project_controller.projects.deinit(allocator);
+            state.companion_composer.deinit(allocator);
+            state.palette_overlay_batch.deinit(allocator);
+            state.palette_frame_text_arena.deinit();
+        }
+        var project = try runtime.Project.init(allocator, "border-free", "Borders", "/tmp/border-free", 0);
+        state.project_controller.projects.append(allocator, project) catch |err| {
+            project.deinit(allocator);
+            return err;
+        };
+        // One rich frame reaches every bordered path at once: result card,
+        // completed/pending/failed operation cards with avatars and the
+        // pending status ring, plus the approval card and its buttons.
+        var frame: controller.Frame = .{ .has_thread = true, .has_approval = true };
+        frame.workspace_id.set("border-free");
+        frame.thread_id.set("pane-less-border-free");
+        frame.objective.set("Exercise every bordered chrome path");
+        frame.answer.set("A reply that renders the result card.");
+        frame.approval_identity.set("approval-borders");
+        frame.approval_title.set("Permission required");
+        frame.approval_body.set("Approve?");
+        var completed: controller.Operation = .{ .status = .completed, .sequence = 1 };
+        completed.identity.set("op-completed");
+        completed.title.set("MCP tool");
+        completed.detail.set("verde.list_panes");
+        frame.upsertOperation(completed);
+        var pending: controller.Operation = .{ .status = .pending, .sequence = 2 };
+        pending.identity.set("op-pending");
+        pending.title.set("Queued step");
+        pending.detail.set("waiting");
+        frame.upsertOperation(pending);
+        var failed_op: controller.Operation = .{ .status = .failed, .sequence = 3 };
+        failed_op.identity.set("op-failed");
+        failed_op.title.set("Command failed");
+        failed_op.detail.set("exit 1");
+        frame.upsertOperation(failed_op);
+        state.companion_controller.setFrame(frame);
+
+        render(&state, 2536.0, 1030.0);
+        try expectNoBorderOnlyChrome(&state, 2536.0, 1030.0);
+
+        state.palette_overlay_batch.clear();
+        state.companion_controller.show();
+        render(&state, 2536.0, 1030.0);
+        try expectNoBorderOnlyChrome(&state, 2536.0, 1030.0);
+
+        state.companion_controller.selectTab(.activity);
+        state.palette_overlay_batch.clear();
+        render(&state, 2536.0, 1030.0);
+        try expectNoBorderOnlyChrome(&state, 2536.0, 1030.0);
+    }
+}
+
+// Regression: fractional display scales produce non-integral chrome geometry.
+// Panels must land on whole device pixels with the dividers inset inside the
+// side borders, so the sidecar outline reads as one continuous crisp ring.
+test "expanded sidecar chrome snaps to device pixels at a fractional scale" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.25);
+    var state: runtime.AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller = .{};
+    state.companion_controller = controller.init();
+    state.companion_controller.applyFixture(.idle);
+    state.companion_controller.show();
+    state.companion_composer = @TypeOf(state.companion_composer).init();
+    state.palette_overlay_batch = .{};
+    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.companion_composer.deinit(allocator);
+        state.palette_overlay_batch.deinit(allocator);
+        state.palette_frame_text_arena.deinit();
+    }
+    var project = try runtime.Project.init(allocator, "snap-scale", "Snap", "/tmp/snap-scale", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+
+    render(&state, 1360.0, 860.0);
+    const chrome = theme.companionChrome();
+    const geometry = computeGeometryForState(1360.0, 860.0, 1.25, &state.companion_controller);
+    const outer = snappedRect(geometry.sidecar);
+    // The raw geometry really is fractional at this scale, so the assertions
+    // below prove snapping rather than restating integral inputs.
+    try std.testing.expect(geometry.sidecar.x != outer.x or geometry.sidecar.y != outer.y);
+    var saw_outer = false;
+    var saw_inner = false;
+    var saw_divider = false;
+    for (state.palette_overlay_batch.commands.items) |command| {
+        if (command.kind != .rect) continue;
+        if (rectEqual(command.rect, outer) and sameColor(command.color, color(chrome.border))) saw_outer = true;
+        if (rectEqual(command.rect, insetRect(outer, 1.0)) and sameColor(command.color, color(chrome.surface))) saw_inner = true;
+        // Hairline dividers are the wide short strips; they must be integral
+        // and stay strictly between the panel's side borders.
+        if (sameColor(command.color, color(chrome.hairline)) and command.rect.w >= outer.w - 4.0 and command.rect.h <= 2.0) {
+            try std.testing.expectEqual(@round(command.rect.x), command.rect.x);
+            try std.testing.expectEqual(@round(command.rect.y), command.rect.y);
+            try std.testing.expectEqual(@round(command.rect.w), command.rect.w);
+            try std.testing.expect(command.rect.x >= outer.x + 1.0);
+            try std.testing.expect(command.rect.x + command.rect.w <= outer.x + outer.w - 1.0);
+            saw_divider = true;
+        }
+    }
+    try std.testing.expect(saw_outer and saw_inner and saw_divider);
 }
