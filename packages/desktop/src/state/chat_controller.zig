@@ -3993,7 +3993,7 @@ pub fn applyPendingTimelineEvents(self: anytype, thread: *ChatThread, events: *s
             try self.reconcileCodexBackgroundSnapshot(thread, event.body);
             continue;
         }
-        const known_background = std.mem.eql(u8, event.author, "Backgrounded command") and backgroundTaskForEventBody(thread, event.body) != null;
+        const known_background = ChatThread.isBackgroundCommandEvent(event.author) and backgroundTaskForEventBody(thread, event.body) != null;
         if (known_background) {
             try thread.noteBackgroundTaskEvent(self.allocator, event.author, event.body);
             if (backgroundTaskForEventBody(thread, event.body)) |task| task.pid_verified = task.task_id != null;
@@ -4012,7 +4012,7 @@ pub fn applyPendingTimelineEvents(self: anytype, thread: *ChatThread, events: *s
             thread.noteBackgroundTaskEvent(self.allocator, event.author, event.body) catch |err| {
                 log.warn("failed to record background task event: {s}", .{@errorName(err)});
             };
-            if (std.mem.eql(u8, event.author, "Backgrounded command")) {
+            if (ChatThread.isBackgroundCommandEvent(event.author)) {
                 if (backgroundTaskForEventBody(thread, event.body)) |task| task.pid_verified = task.task_id != null;
             }
         }
@@ -4066,7 +4066,7 @@ pub fn applySendFailure(
             thread.noteBackgroundTaskEvent(self.allocator, event.author, event.body) catch |err| {
                 log.warn("failed to record background task event: {s}", .{@errorName(err)});
             };
-            if (std.mem.eql(u8, event.author, "Backgrounded command")) {
+            if (ChatThread.isBackgroundCommandEvent(event.author)) {
                 if (backgroundTaskForEventBody(thread, event.body)) |task| task.pid_verified = task.task_id != null;
             }
         }

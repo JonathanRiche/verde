@@ -124,6 +124,16 @@ async function buildClaudePrompt(request) {
   return lines.join("\n");
 }
 
+async function* claudePromptStream(prompt, input_done) {
+  yield {
+    type: "user",
+    session_id: "",
+    message: { role: "user", content: [{ type: "text", text: prompt }] },
+    parent_tool_use_id: null,
+  };
+  await input_done;
+}
+
 function emitClaudeSdkMessage(message) {
   const role = claudeRoleFromSdkMessage(message);
   const text = textFromContent(message?.message?.content ?? message?.content);
@@ -359,21 +369,27 @@ function emitClaudeTaskNotification(message, commandByToolUseId, backgroundState
   return true;
 }
 
-function commandShouldTrackUntilNotification(command) {
-  return backgroundCommandMode(command) === "tracked";
+function commandShouldTrackUntilNotification(command, item) {
+  const mode = backgroundCommandMode(command);
+  if (mode === "detached") return false;
+  return mode === "tracked" || item?.input?.run_in_background === true;
 }
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function scheduleBackgroundTask(query, toolUseId, command, backgroundState) {
-  if (!toolUseId || typeof query?.backgroundTasks !== "function") return;
+function scheduleBackgroundTask(query, toolUseId, command, backgroundState, alreadyBackgrounded) {
+  if (!toolUseId) return;
   if (backgroundState.scheduledToolUseIds.has(toolUseId)) return;
   backgroundState.scheduledToolUseIds.add(toolUseId);
-  backgroundState.sawTracked = true;
   backgroundState.trackedToolUseIds.add(toolUseId);
-  write({ type: "stream_event", title: "Backgrounded command", body: command });
+  write({ type: "stream_event", title: "Background command", body: command });
+  if (alreadyBackgrounded) return;
+  if (typeof query?.backgroundTasks !== "function") {
+    backgroundState.trackedToolUseIds.delete(toolUseId);
+    return;
+  }
 
   const task = (async () => {
     let lastError = null;
@@ -390,6 +406,7 @@ function scheduleBackgroundTask(query, toolUseId, command, backgroundState) {
     if (lastError) {
       write({ type: "stream_event", title: "Failed to background command", body: lastError?.message ?? String(lastError) });
     }
+    backgroundState.trackedToolUseIds.delete(toolUseId);
   })();
   backgroundState.pendingBackgrounds.push(task);
 }
@@ -408,8 +425,8 @@ function emitClaudeToolEvents(message, commandByToolUseId, mcpByToolUseId, query
     if (typeof command === "string" && command.length > 0) {
       if (typeof item.id === "string") commandByToolUseId.set(item.id, command);
       write({ type: "stream_event", title: "Ran command", body: command });
-      if (commandShouldTrackUntilNotification(command)) {
-        scheduleBackgroundTask(query, item.id, command, backgroundState);
+      if (commandShouldTrackUntilNotification(command, item)) {
+        scheduleBackgroundTask(query, item.id, command, backgroundState, item?.input?.run_in_background === true);
       }
       continue;
     }
@@ -450,6 +467,7 @@ function emitClaudeToolEvents(message, commandByToolUseId, mcpByToolUseId, query
     if (item?.type === "tool_result" && item.is_error === true) {
       const failedCommand = commandByToolUseId.get(item.tool_use_id);
       if (failedCommand) {
+        backgroundState.trackedToolUseIds.delete(item.tool_use_id);
         write({ type: "stream_event", title: "Command failed", body: failedCommand });
       }
     }
@@ -471,7 +489,7 @@ function buildVerdeClaudeHooks() {
         const taskId = randomTaskId();
         write({
           type: "stream_event",
-          title: "Backgrounded command",
+          title: "Background command",
           body: backgroundTaskBody(command, detachedTaskSummary(taskId)),
         });
 
@@ -966,16 +984,21 @@ async function handleClaudeSendPrompt(sdk, request) {
     if (typeof data === "string" && data.length > 0) stderrChunks.push(data);
   };
 
+  let finishInput;
+  const inputDone = new Promise((resolve) => {
+    finishInput = resolve;
+  });
   const query = sdk.query({
-    prompt: await buildClaudePrompt(request),
+    // A string prompt makes the SDK close stdin after Claude's first result,
+    // which stops any background tasks before their completion notification.
+    prompt: claudePromptStream(await buildClaudePrompt(request), inputDone),
     options,
   });
 
   try {
     let sessionId = request.thread_id ?? null;
     let reply = "";
-    const backgroundState = { trackedToolUseIds: new Set(), scheduledToolUseIds: new Set(), sawTracked: false, pendingBackgrounds: [] };
-    let sawResult = false;
+    const backgroundState = { trackedToolUseIds: new Set(), scheduledToolUseIds: new Set(), pendingBackgrounds: [] };
     for await (const message of query) {
       const rateLimitFailure = claudeRejectedRateLimitMessage(message);
       if (rateLimitFailure) throw new Error(rateLimitFailure);
@@ -995,16 +1018,12 @@ async function handleClaudeSendPrompt(sdk, request) {
           await Promise.allSettled(backgroundState.pendingBackgrounds);
           backgroundState.pendingBackgrounds.length = 0;
         }
-        sawResult = true;
-        if (backgroundState.sawTracked && backgroundState.trackedToolUseIds.size === 0 && typeof query?.close === "function") {
-          query.close();
-        }
+        if (backgroundState.trackedToolUseIds.size === 0) finishInput();
         continue;
       }
-      const emittedTaskNotification = emitClaudeTaskNotification(message, commandByToolUseId, backgroundState);
-      if (emittedTaskNotification && sawResult && backgroundState.trackedToolUseIds.size === 0 && typeof query?.close === "function") {
-        query.close();
-      }
+      // Claude auto-continues after background task notifications. Keep the
+      // query open so it can inspect the result and finish the turn itself.
+      emitClaudeTaskNotification(message, commandByToolUseId, backgroundState);
       emitClaudeSdkMessage(message);
       emitClaudeToolEvents(message, commandByToolUseId, mcpByToolUseId, query, backgroundState);
       const delta = textFromContent(message?.message?.content ?? message?.content);
@@ -1019,6 +1038,7 @@ async function handleClaudeSendPrompt(sdk, request) {
 
     write({ type: "result", thread_id: sessionId, reply_text: reply });
   } catch (err) {
+    finishInput();
     const stderr = stderrChunks.join("").trim();
     if (stderr) throw new Error(`${err?.message ?? String(err)}\n${stderr}`);
     throw err;

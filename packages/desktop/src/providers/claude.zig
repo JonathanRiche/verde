@@ -1012,3 +1012,11 @@ test "Windows detached bridge source uses PowerShell temp paths and tree cleanup
     try std.testing.expect(std.mem.indexOf(u8, source, "Stop-Process") == null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "Write-Output"));
 }
+
+test "Claude bridge keeps explicitly backgrounded tools alive for auto continuation" {
+    const source = @embedFile("provider_bridge.ts");
+    try std.testing.expect(std.mem.indexOf(u8, source, "item?.input?.run_in_background === true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "if (alreadyBackgrounded) return;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "prompt: claudePromptStream(await buildClaudePrompt(request), inputDone)") != null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source, "query.close()"));
+}

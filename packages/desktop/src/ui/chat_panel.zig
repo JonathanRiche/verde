@@ -2490,7 +2490,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
         const item_h = transcriptMessageHeight(state, msg_idx, event.body, event.role, column.w, event.author, false);
         if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
             const is_last = pi + 1 == pending_count;
-            const is_backgrounded = std.mem.eql(u8, event.author, "Backgrounded command");
+            const is_backgrounded = chat_types.ChatThread.isBackgroundCommandEvent(event.author);
             if (y + item_h >= column.y and y <= column.y + column.h) {
                 renderCommandEventRow(state, column, y, item_h, event.author, event.body, clip, msg_idx, is_last or is_backgrounded, false, event.tool_call_status);
             }
@@ -2557,7 +2557,7 @@ fn formatPendingCommandLabel(buf: []u8, started_at_ms: i64) []const u8 {
 fn isCommandSystemEvent(author: []const u8) bool {
     return std.mem.eql(u8, author, "Ran command") or
         std.mem.eql(u8, author, "Command failed") or
-        std.mem.eql(u8, author, "Backgrounded command") or
+        chat_types.ChatThread.isBackgroundCommandEvent(author) or
         std.mem.eql(u8, author, "Background task completed") or
         std.mem.eql(u8, author, "Background task failed") or
         std.mem.eql(u8, author, "Background task stopped") or
@@ -4687,7 +4687,7 @@ fn renderCommandEventRow(
     queueCardChevron(state, chev_cx, chev_cy, expanded, paletteColor(theme.COLOR_TEXT_SUBTLE), clip);
 
     const text_x = status_cx + status_dia * 0.5 + theme.scaledUi(10.0);
-    const backgrounded = std.mem.eql(u8, original_author, "Backgrounded command");
+    const backgrounded = chat_types.ChatThread.isBackgroundCommandEvent(original_author);
     const local_bang = (std.mem.eql(u8, original_author, "Ran command") or std.mem.eql(u8, original_author, "Command failed")) and std.mem.startsWith(u8, body, "$ ");
     const command_end = std.mem.indexOfScalar(u8, body, '\n') orelse body.len;
     const retry_command = if (local_bang) std.mem.trim(u8, body[2..command_end], " \t\r") else "";

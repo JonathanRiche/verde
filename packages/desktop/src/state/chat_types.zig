@@ -422,8 +422,13 @@ pub const ChatThread = struct {
         return body;
     }
 
+    pub fn isBackgroundCommandEvent(author: []const u8) bool {
+        return std.mem.eql(u8, author, "Background command") or
+            std.mem.eql(u8, author, "Backgrounded command");
+    }
+
     pub fn backgroundTaskStatusForEvent(author: []const u8) ?BackgroundTaskStatus {
-        if (std.mem.eql(u8, author, "Backgrounded command")) return .running;
+        if (isBackgroundCommandEvent(author)) return .running;
         if (std.mem.eql(u8, author, "Background task completed")) return .completed;
         if (std.mem.eql(u8, author, "Background task failed")) return .failed;
         if (std.mem.eql(u8, author, "Background task stopped")) return .stopped;
@@ -835,4 +840,9 @@ test "chat activity distinguishes approval waiting from working" {
     try std.testing.expectEqual(ChatActivityStatus.@"error", thread.activityStatusForUi());
     thread.completion_pending = true;
     try std.testing.expectEqual(ChatActivityStatus.done, thread.activityStatusForUi());
+}
+
+test "background command events accept current and legacy labels" {
+    try std.testing.expectEqual(BackgroundTaskStatus.running, ChatThread.backgroundTaskStatusForEvent("Background command").?);
+    try std.testing.expectEqual(BackgroundTaskStatus.running, ChatThread.backgroundTaskStatusForEvent("Backgrounded command").?);
 }
