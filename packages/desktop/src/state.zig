@@ -3473,17 +3473,25 @@ pub const AppState = struct {
             return;
         }
 
-        _ = self.openBrowserInWorkspace(self.project_controller.selected_index, trimmed) catch |err| switch (err) {
-            error.WorkspaceNotFound => self.setSidebarNotice("No workspace selected."),
-            error.BrowserDisabled => self.setSidebarNotice("Browser is disabled."),
-            error.EmptyBrowserUrl => self.setSidebarNotice("No web link selected."),
-            error.BrowserNavigationFailed => self.setSidebarNotice("Failed to open web link."),
-            error.BrowserOpenFailed => self.setSidebarNotice("Failed to open browser."),
-            else => {
-                log.warn("failed to open transcript web link: {s}", .{@errorName(err)});
-                self.setSidebarNotice("Failed to open web link.");
-            },
+        const project_index = self.project_controller.selected_index;
+        const result = self.openBrowserInWorkspace(project_index, trimmed) catch |err| {
+            switch (err) {
+                error.WorkspaceNotFound => self.setSidebarNotice("No workspace selected."),
+                error.BrowserDisabled => self.setSidebarNotice("Browser is disabled."),
+                error.EmptyBrowserUrl => self.setSidebarNotice("No web link selected."),
+                error.BrowserNavigationFailed => self.setSidebarNotice("Failed to open web link."),
+                error.BrowserOpenFailed => self.setSidebarNotice("Failed to open browser."),
+                else => {
+                    log.warn("failed to open transcript web link: {s}", .{@errorName(err)});
+                    self.setSidebarNotice("Failed to open web link.");
+                },
+            }
+            return;
         };
+        // A rendered Markdown/chat link is explicit user navigation. The
+        // lower-level browser API preserves focus for background callers, so
+        // claim and reveal the browser pane only at this UI-owned boundary.
+        self.focusWorkspaceOpenPane(project_index, result.pane_id);
     }
 
     fn runCustomOpenAction(self: *AppState, custom: app_config.CustomOpenAction) void {
@@ -9163,6 +9171,59 @@ test "sidebar pane selection restores a sibling browser URL snapshot" {
     try std.testing.expect(!state.terminal_controller.focused);
     try std.testing.expect(!state.composer_controller.focused);
     try std.testing.expect(!state.composer_controller.composer.focused);
+}
+
+test "configured chat web links focus and reveal the Verde browser pane" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.app_config = .{};
+    state.project_controller.projects = .empty;
+    state.surface_controller = .{};
+    state.project_controller.selected_index = 0;
+    state.browser_controller = try browser_controller.State.init(allocator);
+    state.browser_controller.runtime_project_index = null;
+    state.browser_textures_enabled = true;
+    state.browser_controller.pane_focused = false;
+    state.browser_controller.address_focused = false;
+    state.terminal_controller.focused = false;
+    state.composer_controller.focused = true;
+    state.composer_controller.composer = PaletteComposerPrompt.init();
+    state.composer_controller.composer.focused = true;
+    state.composer_controller.model_picker = PaletteModelPicker.init(0);
+    state.composer_controller.popover_restore_focus = false;
+    state.composer_controller.run_config_open = false;
+    state.palette_modal_text_focus = .none;
+    state.lifecycle.dirty = false;
+    state.lifecycle.last_dirty_at_ms = 0;
+    state.lifecycle.last_interaction_at_ms = 0;
+    @memset(&state.sidebar_notice_storage, 0);
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.surface_controller.surfaces.deinit(allocator);
+        state.composer_controller.composer.deinit(allocator);
+        state.browser_controller.deinit(allocator);
+    }
+    if (state.browser_controller.runtime.controller.runtimeKind() != .stub) return error.SkipZigTest;
+
+    var project = try Project.init(allocator, "test", "Test", "/tmp/test", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    const layout = &state.project_controller.projects.items[0].workspace_layout;
+    const chat_pane_id = layout.focused_pane_id orelse return error.TestExpectedEqual;
+
+    state.openConfiguredWebLink("https://example.com/docs");
+
+    const browser_pane_id = layout.visibleBrowserPaneId() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(?WorkspacePaneId, browser_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, browser_pane_id), layout.scroll_leading_pane_id);
+    try std.testing.expectEqual(chat_pane_id, layout.panes.items[0].id);
+    try std.testing.expectEqual(browser_pane_id, layout.panes.items[1].id);
+    try std.testing.expect(state.browser_controller.pane_focused);
+    try std.testing.expectEqualStrings("https://example.com/docs", state.browser_controller.runtime.addressInput());
 }
 
 test "sidebar and pane cycling preserve zoom while rebinding a browser runtime" {
