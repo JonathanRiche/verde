@@ -96,8 +96,9 @@ Most of these options also appear in Settings:
   set the automatic activation threshold (1–64 panes), choose horizontal or
   vertical scrolling, control how many panes fit in one view and their gap,
   set the default open action for project files and folders, and choose whether
-  new chats create panes or replace an existing chat pane. Pane gaps are
-  omitted while zoomed.
+  new chats create panes or replace an existing chat pane. Mode and threshold
+  can inherit these global values or be overridden for the currently selected
+  workspace. Pane gaps are omitted while zoomed.
 - **Agent integrations** — status-pip hooks for supported provider CLIs.
 - **Updates** — check now, install an available release, and automatic checks.
 - **Notifications** — enable or disable desktop notifications.

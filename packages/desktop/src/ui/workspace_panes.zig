@@ -1116,8 +1116,8 @@ fn threadDropTargetForPane(pane_id: runtime.WorkspacePaneId, rect: palette.Rect,
 
 fn scrollingLayoutActive(state: *const runtime.AppState, layout: *const runtime.WorkspaceLayout) bool {
     return scrollingLayoutEnabled(
-        state.app_config.workspace_scroll_mode,
-        state.app_config.workspace_scroll_threshold,
+        layout.effectiveScrollMode(state.app_config.workspace_scroll_mode),
+        layout.effectiveScrollThreshold(state.app_config.workspace_scroll_threshold),
         layout.visiblePaneCount(),
         layout.maximized_pane_id != null,
     );
@@ -1849,6 +1849,18 @@ test "scrolling layout policy supports automatic always and disabled modes" {
     try std.testing.expect(!scrollingLayoutEnabled(.disabled, 1, 8, false));
     try std.testing.expect(!scrollingLayoutEnabled(.always, 1, 0, false));
     try std.testing.expect(!scrollingLayoutEnabled(.always, 1, 4, true));
+}
+
+test "scrolling layout automatic mode covers configured threshold matrix" {
+    const thresholds = [_]u8{ 1, 2, 4, 8 };
+    for (thresholds) |threshold| {
+        if (threshold > 1) {
+            try std.testing.expect(!scrollingLayoutEnabled(.automatic, threshold, @as(usize, threshold - 1), false));
+        }
+        try std.testing.expect(scrollingLayoutEnabled(.automatic, threshold, @as(usize, threshold), false));
+        try std.testing.expect(scrollingLayoutEnabled(.automatic, threshold, @as(usize, threshold) + 1, false));
+    }
+    try std.testing.expect(!scrollingLayoutEnabled(.disabled, 1, 64, false));
 }
 
 test "scrolling focus direction follows the configured axis" {

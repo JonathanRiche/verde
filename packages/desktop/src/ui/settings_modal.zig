@@ -19,6 +19,8 @@ pub const Control = enum(u8) {
     workspace_pane_gap_inc,
     workspace_panes_per_view_dec,
     workspace_panes_per_view_inc,
+    workspace_scroll_use_global,
+    workspace_scroll_override,
     workspace_scroll_mode_automatic,
     workspace_scroll_mode_always,
     workspace_scroll_mode_disabled,
@@ -166,6 +168,9 @@ const SettingsLayout = struct {
     workspace_panes_per_view_dec: palette.Rect,
     workspace_panes_per_view_inc: palette.Rect,
     workspace_panes_per_view_hint_y: f32,
+    workspace_scroll_use_global: palette.Rect,
+    workspace_scroll_override: palette.Rect,
+    workspace_scroll_scope_hint_y: f32,
     workspace_scroll_mode_automatic: palette.Rect,
     workspace_scroll_mode_always: palette.Rect,
     workspace_scroll_mode_disabled: palette.Rect,
@@ -301,6 +306,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const browser_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra +
         m.row_gap + m.label_h + m.inner_gap + m.row_h +
+        m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.row_h + m.inner_gap + m.label_h +
@@ -463,7 +469,13 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const file_links_y = file_links_label_y + m.label_h + m.inner_gap;
     const file_links_neovim_pane: palette.Rect = .{ .x = open_x, .y = file_links_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const file_links_hint_y = file_links_y + m.row_h + m.inner_gap;
-    const workspace_scroll_mode_label_y = file_links_hint_y + m.label_h + m.row_gap;
+    const workspace_scroll_scope_label_y = file_links_hint_y + m.label_h + m.row_gap;
+    const workspace_scroll_scope_y = workspace_scroll_scope_label_y + m.label_h + m.inner_gap;
+    const workspace_scroll_scope_w = (content_w - m.card_pad * 2.0) * 0.5;
+    const workspace_scroll_use_global: palette.Rect = .{ .x = open_x, .y = workspace_scroll_scope_y, .w = workspace_scroll_scope_w, .h = m.row_h };
+    const workspace_scroll_override: palette.Rect = .{ .x = workspace_scroll_use_global.x + workspace_scroll_scope_w, .y = workspace_scroll_scope_y, .w = workspace_scroll_scope_w, .h = m.row_h };
+    const workspace_scroll_scope_hint_y = workspace_scroll_scope_y + m.row_h + m.inner_gap;
+    const workspace_scroll_mode_label_y = workspace_scroll_scope_hint_y + m.label_h + m.row_gap;
     const workspace_scroll_mode_y = workspace_scroll_mode_label_y + m.label_h + m.inner_gap;
     const workspace_scroll_mode_w = (content_w - m.card_pad * 2.0) / 3.0;
     const workspace_scroll_mode_automatic: palette.Rect = .{ .x = open_x, .y = workspace_scroll_mode_y, .w = workspace_scroll_mode_w, .h = m.row_h };
@@ -586,6 +598,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .workspace_panes_per_view_dec = workspace_panes_per_view_stepper.dec,
         .workspace_panes_per_view_inc = workspace_panes_per_view_stepper.inc,
         .workspace_panes_per_view_hint_y = workspace_panes_per_view_hint_y,
+        .workspace_scroll_use_global = workspace_scroll_use_global,
+        .workspace_scroll_override = workspace_scroll_override,
+        .workspace_scroll_scope_hint_y = workspace_scroll_scope_hint_y,
         .workspace_scroll_mode_automatic = workspace_scroll_mode_automatic,
         .workspace_scroll_mode_always = workspace_scroll_mode_always,
         .workspace_scroll_mode_disabled = workspace_scroll_mode_disabled,
@@ -781,6 +796,8 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.new_chat_new_pane, layout.body_clip, .new_chat_new_pane, queue_hit);
     queueControlHit(state, layout.new_chat_replace_pane, layout.body_clip, .new_chat_replace_pane, queue_hit);
     queueControlHit(state, layout.file_links_neovim_pane, layout.body_clip, .file_links_neovim_pane, queue_hit);
+    queueControlHit(state, layout.workspace_scroll_use_global, layout.body_clip, .workspace_scroll_use_global, queue_hit);
+    queueControlHit(state, layout.workspace_scroll_override, layout.body_clip, .workspace_scroll_override, queue_hit);
     queueControlHit(state, layout.workspace_scroll_mode_automatic, layout.body_clip, .workspace_scroll_mode_automatic, queue_hit);
     queueControlHit(state, layout.workspace_scroll_mode_always, layout.body_clip, .workspace_scroll_mode_always, queue_hit);
     queueControlHit(state, layout.workspace_scroll_mode_disabled, layout.body_clip, .workspace_scroll_mode_disabled, queue_hit);
@@ -963,6 +980,29 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .w = layout.file_links_neovim_pane.w,
         .h = m.label_h,
     }, "Used only when Neovim is the configured editor; otherwise uses the default file action", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+    queueText(state, .{
+        .x = layout.workspace_scroll_use_global.x,
+        .y = layout.workspace_scroll_use_global.y - m.inner_gap - m.label_h,
+        .w = layout.workspace_scroll_use_global.w + layout.workspace_scroll_override.w,
+        .h = m.label_h,
+    }, "Scrolling settings scope", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    drawSegmentedPair(
+        state,
+        layout.workspace_scroll_use_global,
+        layout.workspace_scroll_override,
+        "Use global",
+        "Override workspace",
+        !state.settings_controller.draft.workspace_scroll_override_enabled,
+        isControlHovered(state, .workspace_scroll_use_global),
+        isControlHovered(state, .workspace_scroll_override),
+        layout.body_clip,
+    );
+    queueText(state, .{
+        .x = layout.workspace_card.x + m.card_pad,
+        .y = layout.workspace_scroll_scope_hint_y,
+        .w = layout.workspace_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, "Override scopes mode and threshold to the currently selected workspace", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
     queueText(state, .{
         .x = layout.workspace_scroll_mode_automatic.x,
         .y = layout.workspace_scroll_mode_automatic.y - m.inner_gap - m.label_h,
@@ -1264,6 +1304,12 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .workspace_panes_per_view_inc => {
             if (state.settings_controller.draft.workspace_panes_per_view < app_config.MAX_WORKSPACE_PANES_PER_VIEW) state.settings_controller.draft.workspace_panes_per_view += 1;
         },
+        .workspace_scroll_use_global => {
+            state.settings_controller.draft.workspace_scroll_override_enabled = false;
+            state.settings_controller.draft.workspace_scroll_mode = state.app_config.workspace_scroll_mode;
+            state.settings_controller.draft.workspace_scroll_threshold = state.app_config.workspace_scroll_threshold;
+        },
+        .workspace_scroll_override => state.settings_controller.draft.workspace_scroll_override_enabled = true,
         .workspace_scroll_mode_automatic => state.settings_controller.draft.workspace_scroll_mode = .automatic,
         .workspace_scroll_mode_always => state.settings_controller.draft.workspace_scroll_mode = .always,
         .workspace_scroll_mode_disabled => state.settings_controller.draft.workspace_scroll_mode = .disabled,

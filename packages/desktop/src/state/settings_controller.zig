@@ -55,6 +55,7 @@ pub const Draft = struct {
     workspace_pane_gap: f32 = app_config.DEFAULT_WORKSPACE_PANE_GAP,
     workspace_panes_per_view: u8 = app_config.DEFAULT_WORKSPACE_PANES_PER_VIEW,
     workspace_scroll_direction: app_config.WorkspaceScrollDirection = .horizontal,
+    workspace_scroll_override_enabled: bool = false,
     workspace_scroll_mode: app_config.WorkspaceScrollMode = .automatic,
     workspace_scroll_threshold: u8 = app_config.DEFAULT_WORKSPACE_SCROLL_THRESHOLD,
     theme_source: theme.ThemeSource = .omarchy,
@@ -224,14 +225,24 @@ pub fn replaceAppConfig(self: anytype, next_config: app_config.AppConfig) void {
 }
 
 pub fn syncSettingsDraftFromConfig(self: anytype) void {
+    var workspace_scroll_override_enabled = false;
+    var workspace_scroll_mode = self.app_config.workspace_scroll_mode;
+    var workspace_scroll_threshold = self.app_config.workspace_scroll_threshold;
+    if (self.project_controller.selected_index < self.project_controller.projects.items.len) {
+        const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
+        workspace_scroll_override_enabled = layout.hasScrollOverride();
+        workspace_scroll_mode = layout.effectiveScrollMode(workspace_scroll_mode);
+        workspace_scroll_threshold = layout.effectiveScrollThreshold(workspace_scroll_threshold);
+    }
     self.settings_controller.draft = .{
         .font_size = self.app_config.font_size,
         .terminal_font_size = self.app_config.terminal_font_size,
         .workspace_pane_gap = self.app_config.workspace_pane_gap,
         .workspace_panes_per_view = self.app_config.workspace_panes_per_view,
         .workspace_scroll_direction = self.app_config.workspace_scroll_direction,
-        .workspace_scroll_mode = self.app_config.workspace_scroll_mode,
-        .workspace_scroll_threshold = self.app_config.workspace_scroll_threshold,
+        .workspace_scroll_override_enabled = workspace_scroll_override_enabled,
+        .workspace_scroll_mode = workspace_scroll_mode,
+        .workspace_scroll_threshold = workspace_scroll_threshold,
         .theme_source = self.app_config.theme_config.source,
         .theme_choice = self.app_config.themeChoiceIndex(),
         .open_action = settingsOpenActionFromConfig(self.app_config.default_open_action),
@@ -259,8 +270,18 @@ pub fn isSettingsDraftDirty(self: anytype) bool {
     if (draft.workspace_pane_gap != self.app_config.workspace_pane_gap) return true;
     if (draft.workspace_panes_per_view != self.app_config.workspace_panes_per_view) return true;
     if (draft.workspace_scroll_direction != self.app_config.workspace_scroll_direction) return true;
-    if (draft.workspace_scroll_mode != self.app_config.workspace_scroll_mode) return true;
-    if (draft.workspace_scroll_threshold != self.app_config.workspace_scroll_threshold) return true;
+    var workspace_scroll_override_enabled = false;
+    var workspace_scroll_mode = self.app_config.workspace_scroll_mode;
+    var workspace_scroll_threshold = self.app_config.workspace_scroll_threshold;
+    if (self.project_controller.selected_index < self.project_controller.projects.items.len) {
+        const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
+        workspace_scroll_override_enabled = layout.hasScrollOverride();
+        workspace_scroll_mode = layout.effectiveScrollMode(workspace_scroll_mode);
+        workspace_scroll_threshold = layout.effectiveScrollThreshold(workspace_scroll_threshold);
+    }
+    if (draft.workspace_scroll_override_enabled != workspace_scroll_override_enabled) return true;
+    if (draft.workspace_scroll_mode != workspace_scroll_mode) return true;
+    if (draft.workspace_scroll_threshold != workspace_scroll_threshold) return true;
     if (draft.theme_choice != self.app_config.themeChoiceIndex()) return true;
     if (draft.link_open_target != self.app_config.link_open_target) return true;
     if (draft.browser_fast_scrolling_enabled != self.app_config.browser_fast_scrolling_enabled) return true;
@@ -385,8 +406,13 @@ pub fn saveSettingsModal(self: anytype) !void {
     self.app_config.workspace_pane_gap = theme.clampf(self.settings_controller.draft.workspace_pane_gap, app_config.MIN_WORKSPACE_PANE_GAP, app_config.MAX_WORKSPACE_PANE_GAP);
     self.app_config.workspace_panes_per_view = std.math.clamp(self.settings_controller.draft.workspace_panes_per_view, app_config.MIN_WORKSPACE_PANES_PER_VIEW, app_config.MAX_WORKSPACE_PANES_PER_VIEW);
     self.app_config.workspace_scroll_direction = self.settings_controller.draft.workspace_scroll_direction;
-    self.app_config.workspace_scroll_mode = self.settings_controller.draft.workspace_scroll_mode;
-    self.app_config.workspace_scroll_threshold = std.math.clamp(self.settings_controller.draft.workspace_scroll_threshold, app_config.MIN_WORKSPACE_SCROLL_THRESHOLD, app_config.MAX_WORKSPACE_SCROLL_THRESHOLD);
+    const has_selected_workspace = self.project_controller.selected_index < self.project_controller.projects.items.len;
+    const use_workspace_scroll_override = self.settings_controller.draft.workspace_scroll_override_enabled and has_selected_workspace;
+    const workspace_scroll_threshold = std.math.clamp(self.settings_controller.draft.workspace_scroll_threshold, app_config.MIN_WORKSPACE_SCROLL_THRESHOLD, app_config.MAX_WORKSPACE_SCROLL_THRESHOLD);
+    if (!use_workspace_scroll_override) {
+        self.app_config.workspace_scroll_mode = self.settings_controller.draft.workspace_scroll_mode;
+        self.app_config.workspace_scroll_threshold = workspace_scroll_threshold;
+    }
     self.app_config.link_open_target = self.settings_controller.draft.link_open_target;
     self.app_config.browser_fast_scrolling_enabled = self.settings_controller.draft.browser_fast_scrolling_enabled;
     self.app_config.file_links_in_neovim_pane = self.settings_controller.draft.file_links_in_neovim_pane;
@@ -404,6 +430,16 @@ pub fn saveSettingsModal(self: anytype) !void {
 
     try app_config.saveAppConfig(self.allocator, &self.app_config);
     self.app_config_file_mtime = app_config.configFileMtime(self.allocator) catch self.app_config_file_mtime;
+    if (has_selected_workspace) {
+        const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
+        if (use_workspace_scroll_override) {
+            layout.scroll_mode_override = self.settings_controller.draft.workspace_scroll_mode;
+            layout.scroll_threshold_override = workspace_scroll_threshold;
+        } else {
+            layout.scroll_mode_override = null;
+            layout.scroll_threshold_override = null;
+        }
+    }
     self.applyTerminalFontSizesFromConfig();
     self.app_config_runtime_sync_pending = true;
     beginSettingsModalClose(self);
@@ -419,21 +455,23 @@ pub fn saveSettingsModal(self: anytype) !void {
     runtime_log.diagnostic("settings save done", .{});
 }
 
-pub fn setWorkspaceScrollMode(self: anytype, mode: app_config.WorkspaceScrollMode) void {
-    self.app_config.workspace_scroll_mode = mode;
-    self.settings_controller.draft.workspace_scroll_mode = mode;
-    app_config.saveAppConfig(self.allocator, &self.app_config) catch |err| {
-        log.warn("failed to persist workspace scrolling mode: {s}", .{@errorName(err)});
-        self.setSidebarNotice("Scrolling layout changed, but could not save Verde settings.");
-        self.markDirty();
-        return;
-    };
-    self.app_config_file_mtime = app_config.configFileMtime(self.allocator) catch self.app_config_file_mtime;
-    self.setSidebarNotice(switch (mode) {
-        .automatic => "Scrolling layout set to Automatic.",
-        .always => "Scrolling layout pinned on.",
-        .disabled => "Scrolling layout disabled; using tiled panes.",
-    });
+pub fn setWorkspaceScrollMode(self: anytype, mode: ?app_config.WorkspaceScrollMode) void {
+    if (self.project_controller.selected_index >= self.project_controller.projects.items.len) return;
+    const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
+    layout.scroll_mode_override = mode;
+    if (mode == null) {
+        layout.scroll_threshold_override = null;
+    } else if (layout.scroll_threshold_override == null) {
+        layout.scroll_threshold_override = self.app_config.workspace_scroll_threshold;
+    }
+    self.settings_controller.draft.workspace_scroll_override_enabled = mode != null;
+    self.settings_controller.draft.workspace_scroll_mode = mode orelse self.app_config.workspace_scroll_mode;
+    self.settings_controller.draft.workspace_scroll_threshold = layout.effectiveScrollThreshold(self.app_config.workspace_scroll_threshold);
+    self.setSidebarNotice(if (mode) |workspace_mode| switch (workspace_mode) {
+        .automatic => "Workspace scrolling set to Automatic.",
+        .always => "Workspace scrolling pinned on.",
+        .disabled => "Workspace scrolling disabled; using tiled panes.",
+    } else "Workspace scrolling now uses the global settings.");
     self.markDirty();
 }
 

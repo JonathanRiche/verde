@@ -117,9 +117,10 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "pane.quick_minimize", .title = "Minimize Quick Pane", .keywords = "hide floating overlay", .section = .panes, .run = runMinimizeQuickPane, .enabled = hasQuickPane },
     .{ .id = "pane.quick_pin", .title = "Pin or Unpin Quick Pane", .keywords = "floating dim backdrop", .section = .panes, .run = runPinQuickPane, .enabled = hasQuickPane },
     .{ .id = "pane.quick_tile", .title = "Return Quick Pane to Tile", .keywords = "dock floating", .section = .panes, .run = runTileQuickPane, .enabled = hasQuickPane },
-    .{ .id = "workspace.scrolling_automatic", .title = "Scrolling Layout: Automatic", .keywords = "niri panes mode threshold tiled", .section = .workspaces, .run = runScrollingAutomatic },
-    .{ .id = "workspace.scrolling_always", .title = "Scrolling Layout: Always", .keywords = "niri panes mode pin enable", .section = .workspaces, .run = runScrollingAlways },
-    .{ .id = "workspace.scrolling_disabled", .title = "Scrolling Layout: Disabled", .keywords = "niri panes mode tiled off disable", .section = .workspaces, .run = runScrollingDisabled },
+    .{ .id = "workspace.scrolling_use_global", .title = "Scrolling Layout: Use Global Default", .keywords = "niri panes mode inherit reset", .section = .workspaces, .run = runScrollingUseGlobal, .enabled = hasProjects },
+    .{ .id = "workspace.scrolling_automatic", .title = "Scrolling Layout: Automatic", .keywords = "niri panes mode threshold tiled", .section = .workspaces, .run = runScrollingAutomatic, .enabled = hasProjects },
+    .{ .id = "workspace.scrolling_always", .title = "Scrolling Layout: Always", .keywords = "niri panes mode pin enable", .section = .workspaces, .run = runScrollingAlways, .enabled = hasProjects },
+    .{ .id = "workspace.scrolling_disabled", .title = "Scrolling Layout: Disabled", .keywords = "niri panes mode tiled off disable", .section = .workspaces, .run = runScrollingDisabled, .enabled = hasProjects },
     .{ .id = "workspace.add", .title = "Add Workspace", .keywords = "new project folder directory", .section = .workspaces, .run = runAddWorkspace },
     .{ .id = "workspace.rename", .title = "Rename Workspace", .keywords = "label", .section = .workspaces, .run = runRenameWorkspace, .enabled = hasProjects },
     .{ .id = "workspace.close", .title = "Close Workspace", .keywords = "archive remove project save state", .section = .workspaces, .run = runCloseWorkspace, .enabled = workspaceNotBusy },
@@ -1386,6 +1387,10 @@ fn runScrollingDisabled(state: *runtime.AppState) void {
     state.setWorkspaceScrollMode(.disabled);
 }
 
+fn runScrollingUseGlobal(state: *runtime.AppState) void {
+    state.setWorkspaceScrollMode(null);
+}
+
 fn runAddWorkspace(state: *runtime.AppState) void {
     state.project_controller.show_creator = true;
     state.setSidebarCollapsed(false);
@@ -2008,6 +2013,7 @@ test "static commands expose scrolling layout controls" {
     const expected_ids = [_][]const u8{
         "pane.previous",
         "pane.next",
+        "workspace.scrolling_use_global",
         "workspace.scrolling_automatic",
         "workspace.scrolling_always",
         "workspace.scrolling_disabled",
