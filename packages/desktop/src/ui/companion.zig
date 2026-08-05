@@ -85,8 +85,8 @@ pub fn handleWheel(state: *runtime.AppState, x: f32, y: f32, wheel_y: f32) bool 
     const action = state.companion_controller.hitAt(x, y) orelse return false;
     if (state.routeCompanionComposerWheel(x, y, wheel_y)) return true;
     if (action == .body and wheel_y != 0.0) {
-        const body_height = bodyHitRect(state.companion_controller.hits[1..state.companion_controller.hit_count]);
-        const max_scroll = @max(bodyContentHeight(&state.companion_controller) - body_height, 0.0);
+        const body_rect = bodyHitRect(state.companion_controller.hits[1..state.companion_controller.hit_count]);
+        const max_scroll = @max(bodyContentHeight(&state.companion_controller, body_rect.w) - body_rect.h, 0.0);
         state.companion_controller.scrollCurrent(-wheel_y * companionScaled(32.0), max_scroll);
         state.markDirty();
     }
@@ -360,9 +360,26 @@ fn renderObjective(state: *runtime.AppState, geometry: Geometry) void {
     queueText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 49.0 * scale, .w = content_w, .h = 17.0 * scale }, detail, color(chrome.text_subtle), 11.5 * scale, card);
     const status_rect: palette.Rect = .{ .x = card.x + @max(card.w - 82.0 * scale, 0.0), .y = card.y + 11.0 * scale, .w = @min(70.0 * scale, card.w), .h = 22.0 * scale };
     const paused = state.companion_controller.run_phase == .paused;
-    const status_color = if (paused) chrome.warning else chrome.identity_fg;
-    queueRoundedRect(state, status_rect, color(if (paused) chrome.approval_card else chrome.ready_fill), 6.0 * scale);
-    queueCenteredText(state, status_rect, if (paused) "PAUSED" else if (state.companion_controller.run_phase == .working) "WORKING" else "READY", color(status_color), 10.0 * scale, .ui_bold, status_rect);
+    const working = state.companion_controller.run_phase == .working;
+    const answered = std.mem.trim(u8, presentation.answer.slice(), " \t\r\n").len > 0;
+    // The badge states the run's real outcome, not controller posture: DONE
+    // and FAILED appear only once a turn actually resolved that way.
+    const verdict = if (paused)
+        "PAUSED"
+    else if (working)
+        "WORKING"
+    else if (presentation.answer_failed)
+        "FAILED"
+    else if (answered)
+        "DONE"
+    else if (presentation.has_failure)
+        "FAILED"
+    else
+        "READY";
+    const badge_failed = !paused and !working and (presentation.answer_failed or (!answered and presentation.has_failure));
+    const status_color = if (paused) chrome.warning else if (badge_failed) chrome.danger else chrome.identity_fg;
+    queueRoundedRect(state, status_rect, color(if (paused) chrome.approval_card else if (badge_failed) chrome.failure_card else chrome.ready_fill), 6.0 * scale);
+    queueCenteredText(state, status_rect, verdict, color(status_color), 10.0 * scale, .ui_bold, status_rect);
 }
 
 // Sidecar static section tabs region.
@@ -390,7 +407,7 @@ fn renderTabs(state: *runtime.AppState, geometry: Geometry) void {
 fn renderBody(state: *runtime.AppState, geometry: Geometry) void {
     if (geometry.body.w <= 0.0 or geometry.body.h <= 0.0) return;
     queueRect(state, geometry.body, color(surface()));
-    const max_scroll = @max(bodyContentHeight(&state.companion_controller) - geometry.body.h, 0.0);
+    const max_scroll = @max(bodyContentHeight(&state.companion_controller, geometry.body.w) - geometry.body.h, 0.0);
     if (state.companion_controller.selected_tab == .activity) state.companion_controller.updateActivityExtent(max_scroll);
     const inset = companionScaled(12.0);
     var y = geometry.body.y + inset - state.companion_controller.currentScrollY();
@@ -452,7 +469,7 @@ fn tabRects(tabs: palette.Rect) [2]palette.Rect {
     };
 }
 
-fn bodyContentHeight(state: *const controller) f32 {
+fn bodyContentHeight(state: *const controller, body_width: f32) f32 {
     const frame = &state.presentation;
     const inset = companionScaled(24.0);
     if (state.selected_tab == .activity) {
@@ -462,12 +479,13 @@ fn bodyContentHeight(state: *const controller) f32 {
     }
     var height = inset;
     if (frame.has_approval) height += companionScaled(130.0);
+    height += resultCardHeight(frame, body_width);
     const active = frame.activeCounts();
     const active_total = active.working + active.pending;
     if (active_total > 0) height += companionScaled(27.0 + 79.0 * @as(f32, @floatFromInt(active_total)));
     const recent = frame.recentCount();
     if (recent > 0) height += companionScaled(27.0 + 79.0 * @as(f32, @floatFromInt(@min(recent, 5))));
-    if (active_total == 0 and recent == 0) height += companionScaled(79.0);
+    if (active_total == 0 and recent == 0 and !resultCardVisible(frame)) height += companionScaled(79.0);
     if (frame.provider_error.slice().len > 0) height += companionScaled(79.0);
     if (frame.control_error.slice().len > 0) height += companionScaled(79.0);
     if (frame.ui_error.slice().len > 0) height += companionScaled(79.0);
@@ -491,6 +509,9 @@ fn renderEmptyBody(state: *runtime.AppState, clip: palette.Rect, y: *f32, title:
 fn renderRunBody(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
     const frame = &state.companion_controller.presentation;
     if (frame.has_approval) renderApproval(state, clip, y, frame.approval_title.slice(), frame.approval_body.slice());
+    // The answer leads and operations follow as supporting evidence: the user
+    // reads what Sprout says without opening Activity.
+    renderResultCard(state, clip, y);
     const counts = frame.activeCounts();
     const active_total = counts.working + counts.pending;
     if (active_total > 0) {
@@ -514,15 +535,70 @@ fn renderRunBody(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
             shown += 1;
         }
     }
-    if (active_total == 0 and recent_total == 0) {
+    if (active_total == 0 and recent_total == 0 and !resultCardVisible(frame)) {
         if (frame.latest_body.slice().len > 0)
-            renderOperationCard(state, clip, y, "Latest activity", frame.latest_body.slice(), .completed)
+            renderOperationCard(state, clip, y, "Latest activity", frame.latest_body.slice(), .completed, false)
         else
             renderEmptyBody(state, clip, y, "Nothing running", "Send an instruction below to start.");
     }
-    if (frame.provider_error.slice().len > 0) renderOperationCard(state, clip, y, "Send failed", frame.provider_error.slice(), .failed);
-    if (frame.control_error.slice().len > 0) renderOperationCard(state, clip, y, "Action failed", frame.control_error.slice(), .failed);
-    if (frame.ui_error.slice().len > 0) renderOperationCard(state, clip, y, "Sprout error", frame.ui_error.slice(), .failed);
+    if (frame.provider_error.slice().len > 0) renderOperationCard(state, clip, y, "Send failed", frame.provider_error.slice(), .failed, false);
+    if (frame.control_error.slice().len > 0) renderOperationCard(state, clip, y, "Action failed", frame.control_error.slice(), .failed, false);
+    if (frame.ui_error.slice().len > 0) renderOperationCard(state, clip, y, "Sprout error", frame.ui_error.slice(), .failed, false);
+}
+
+// True when the Run tab owes the user a Result region: a run in flight, a
+// current-turn answer, or a current-turn failure.
+fn resultCardVisible(frame: *const controller.Frame) bool {
+    if (frame.working or frame.answer_failed) return true;
+    return std.mem.trim(u8, frame.answer.slice(), " \t\r\n").len > 0;
+}
+
+// Height the Result card occupies; shared with scroll extents so the direct
+// non-inertial scroll math matches the rendered layout exactly.
+fn resultCardHeight(frame: *const controller.Frame, body_width: f32) f32 {
+    if (!resultCardVisible(frame)) return 0.0;
+    const text_w = @max(body_width - companionScaled(48.0), 0.0);
+    const wrapped = wrapResultText(std.mem.trim(u8, frame.answer.slice(), " \t\r\n"), text_w);
+    const line_count: f32 = @floatFromInt(@max(wrapped.count, 1));
+    return companionScaled(42.0) + line_count * companionScaled(17.0) + companionScaled(10.0);
+}
+
+// Prominent Result region at the top of Run: Sprout's streaming or final
+// answer for the current objective, readable without opening Activity. States
+// are truthful — WORKING while the run streams, DONE only for a real reply,
+// FAILED only when this turn itself failed.
+fn renderResultCard(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
+    const frame = &state.companion_controller.presentation;
+    if (!resultCardVisible(frame)) return;
+    const scale = companionScale();
+    const chrome = theme.companionChrome();
+    const failed = frame.answer_failed and !frame.working;
+    const answer = std.mem.trim(u8, frame.answer.slice(), " \t\r\n");
+    const card_w = @max(clip.w - 24.0 * scale, 0.0);
+    const text_w = @max(card_w - 24.0 * scale, 0.0);
+    const wrapped = wrapResultText(answer, text_w);
+    const line_count: f32 = @floatFromInt(@max(wrapped.count, 1));
+    const card: palette.Rect = .{ .x = clip.x + 12.0 * scale, .y = y.*, .w = card_w, .h = 42.0 * scale + line_count * 17.0 * scale };
+    queueRoundedRectClipped(state, card, color(if (failed) chrome.failure_card else chrome.surface_deep), 10.0 * scale, clip);
+    queueBorderClipped(state, card, color(if (failed) chrome.failure_border else chrome.hairline), 10.0 * scale, 1.0 * scale, clip);
+    const stripe = if (failed) chrome.danger else if (frame.working) chrome.accent_hi else chrome.identity_fg;
+    queueRoundedRectClipped(state, .{ .x = card.x, .y = card.y, .w = 3.0 * scale, .h = card.h }, color(stripe), 1.5 * scale, clip);
+    const verdict_w = 62.0 * scale;
+    queueBoldText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 10.0 * scale, .w = @max(card.w - verdict_w - 24.0 * scale, 0.0), .h = 15.0 * scale }, "SPROUT SAYS", color(chrome.text_subtle), 10.0 * scale, clip);
+    const verdict = if (frame.working) "WORKING" else if (failed) "FAILED" else "DONE";
+    const verdict_color = if (frame.working) chrome.accent else if (failed) chrome.danger else chrome.identity_fg;
+    queueBoldText(state, .{ .x = card.x + @max(card.w - verdict_w - 12.0 * scale, 0.0), .y = card.y + 10.0 * scale, .w = verdict_w, .h = 15.0 * scale }, verdict, color(verdict_color), 9.5 * scale, clip);
+    if (wrapped.count == 0) {
+        // Truthful empty states: the run is live but has streamed nothing
+        // yet, or it died before producing any reply at all.
+        const placeholder = if (frame.working) "Working — no reply yet." else "The run failed before replying.";
+        queueText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 30.0 * scale, .w = text_w, .h = 16.0 * scale }, placeholder, color(if (failed) chrome.failure_fg else chrome.text_subtle), RESULT_FONT_SIZE * scale, clip);
+    } else for (wrapped.lines[0..wrapped.count], 0..) |line, index| {
+        const last = index + 1 == wrapped.count;
+        const value = if (last and wrapped.truncated) framePrint(state, "{s}…", .{line}) else line;
+        queueText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 30.0 * scale + @as(f32, @floatFromInt(index)) * 17.0 * scale, .w = text_w, .h = 16.0 * scale }, value, color(if (failed) chrome.failure_fg else chrome.text), RESULT_FONT_SIZE * scale, clip);
+    }
+    y.* += card.h + 10.0 * scale;
 }
 
 fn renderActivityBody(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
@@ -615,15 +691,18 @@ fn renderApproval(state: *runtime.AppState, body: palette.Rect, y: *f32, title: 
     y.* += card.h + 14.0 * scale;
 }
 
-// One Frame-backed operation in the Run region.
+// One Frame-backed operation in the Run region. These are real tracked
+// executions, so a completed card may truthfully state its completion.
 fn renderFrameOperationCard(state: *runtime.AppState, clip: palette.Rect, y: *f32, operation: *const controller.Operation) void {
-    renderOperationCard(state, clip, y, operation.title.slice(), operation.detail.slice(), operation.status);
+    renderOperationCard(state, clip, y, operation.title.slice(), operation.detail.slice(), operation.status, true);
 }
 
 // One owner-derived operation card in the scrollable Run region. Raw bodies
 // arrive as multi-line "Command:/Input: … Output: …" dumps, so the card shows
 // a bounded single-line command preview plus a single-line result preview.
-fn renderOperationCard(state: *runtime.AppState, clip: palette.Rect, y: *f32, title: []const u8, detail: []const u8, status: controller.OperationStatus) void {
+// completion_note allows "Completed successfully" only for cards whose status
+// reflects a real tracked execution, never for generic transcript reuse.
+fn renderOperationCard(state: *runtime.AppState, clip: palette.Rect, y: *f32, title: []const u8, detail: []const u8, status: controller.OperationStatus, completion_note: bool) void {
     const scale = companionScale();
     const chrome = theme.companionChrome();
     const failed = status == .failed;
@@ -640,8 +719,17 @@ fn renderOperationCard(state: *runtime.AppState, clip: palette.Rect, y: *f32, ti
     const preview = operationPreview(detail);
     const line_w = @max(card.w - 60.0 * scale, 0.0);
     queueMonoText(state, .{ .x = card.x + 48.0 * scale, .y = card.y + 29.0 * scale, .w = line_w, .h = 15.0 * scale }, truncatedText(state, .mono, 10.0 * scale, line_w, singleLineText(state, preview.detail)), color(if (failed) chrome.failure_fg else chrome.text_subtle), 10.0 * scale, clip);
-    if (preview.result) |result| {
+    // Successful cards show real output or a truthful completion note, never
+    // a CWD/ExitCode/Duration metadata dump; failure and stop cards keep
+    // their full previews because that detail is diagnostic.
+    const result_preview: ?[]const u8 = if (preview.result) |result|
+        (if (status == .completed) meaningfulResultPreview(result) else result)
+    else
+        null;
+    if (result_preview) |result| {
         queueText(state, .{ .x = card.x + 48.0 * scale, .y = card.y + 47.0 * scale, .w = line_w, .h = 15.0 * scale }, truncatedText(state, .ui, 10.0 * scale, line_w, singleLineText(state, result)), color(if (failed) chrome.failure_fg else chrome.text_muted), 10.0 * scale, clip);
+    } else if (completion_note and status == .completed) {
+        queueText(state, .{ .x = card.x + 48.0 * scale, .y = card.y + 47.0 * scale, .w = line_w, .h = 15.0 * scale }, "Completed successfully", color(chrome.text_muted), 10.0 * scale, clip);
     }
     if (status == .pending) {
         const ring: palette.Rect = .{ .x = card.x + card.w - 65.0 * scale, .y = card.y + 15.0 * scale, .w = 7.0 * scale, .h = 7.0 * scale };
@@ -883,9 +971,9 @@ fn sproutLeafPoints(rect: palette.Rect, droop: f32) [4]palette.draw.Vec2 {
     };
 }
 
-fn bodyHitRect(hits: []const controller.Hit) f32 {
-    for (hits) |hit| if (hit.action == .body) return hit.rect.h;
-    return 0.0;
+fn bodyHitRect(hits: []const controller.Hit) palette.Rect {
+    for (hits) |hit| if (hit.action == .body) return hit.rect;
+    return .{};
 }
 
 // Header status states the run posture in words; counts appear only when
@@ -937,6 +1025,92 @@ fn operationPreview(body: []const u8) OperationPreview {
         }
     }
     return .{ .detail = detail, .result = result };
+}
+
+// Successful provider tool output opens with a fixed metadata preamble
+// ("CWD:", "Exit code:", "Duration ms:" — see codex.zig formatToolResult).
+// Skipping exactly those labeled lines surfaces the first real output as a
+// subslice; null means the output carried nothing beyond metadata. This is a
+// fixed-label skip, not a heuristic summary, so execution is never misstated.
+fn meaningfulResultPreview(result: []const u8) ?[]const u8 {
+    var rest = result;
+    while (rest.len > 0) {
+        const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        const line = std.mem.trim(u8, rest[0..line_end], " \t\r");
+        const metadata_only = line.len == 0 or
+            std.mem.startsWith(u8, line, "CWD:") or
+            std.mem.startsWith(u8, line, "Exit code:") or
+            std.mem.startsWith(u8, line, "Duration ms:");
+        if (!metadata_only) return std.mem.trim(u8, rest, " \t\r\n");
+        if (line_end == rest.len) break;
+        rest = rest[line_end + 1 ..];
+    }
+    return null;
+}
+
+// The Result region shows the whole current answer, so it wraps by measured
+// width instead of truncating to one row; output stays bounded.
+const MAX_RESULT_LINES: usize = 6;
+const RESULT_FONT_SIZE: f32 = 11.5;
+
+const ResultLines = struct {
+    lines: [MAX_RESULT_LINES][]const u8 = [_][]const u8{""} ** MAX_RESULT_LINES,
+    count: usize = 0,
+    truncated: bool = false,
+};
+
+// Measured greedy wrap for the Result region. Every line is a subslice of the
+// input, so Frame-backed storage keeps owning the queued text; embedded
+// newlines force breaks and output is bounded to MAX_RESULT_LINES.
+fn wrapResultText(text: []const u8, max_width: f32) ResultLines {
+    var wrapped: ResultLines = .{};
+    if (max_width <= 0.0) return wrapped;
+    var paragraphs = std.mem.splitScalar(u8, text, '\n');
+    while (paragraphs.next()) |paragraph| {
+        var remaining = std.mem.trim(u8, paragraph, " \t\r");
+        while (remaining.len > 0) {
+            if (wrapped.count == MAX_RESULT_LINES) {
+                wrapped.truncated = true;
+                return wrapped;
+            }
+            const break_index = measuredLineBreak(remaining, max_width);
+            wrapped.lines[wrapped.count] = std.mem.trimEnd(u8, remaining[0..break_index], " \t");
+            wrapped.count += 1;
+            remaining = std.mem.trimStart(u8, remaining[break_index..], " \t");
+        }
+    }
+    return wrapped;
+}
+
+// Longest measured prefix of one line that fits max_width: prefer the last
+// space so words stay whole, and fall back to one whole codepoint so the
+// wrap always advances. Every probe goes through shared text metrics.
+fn measuredLineBreak(text: []const u8, max_width: f32) usize {
+    const font_size = companionScaled(RESULT_FONT_SIZE);
+    if (text_measure.textWidth(.ui, font_size, text) <= max_width) return text.len;
+    var low: usize = 0;
+    var high: usize = text.len - 1;
+    var best: usize = 0;
+    while (low <= high) {
+        const mid = low + (high - low) / 2;
+        const candidate = utf8FloorIndex(text, mid);
+        if (text_measure.textWidth(.ui, font_size, text[0..candidate]) <= max_width) {
+            best = @max(best, candidate);
+            low = mid + 1;
+        } else {
+            if (mid == 0) break;
+            high = mid - 1;
+        }
+    }
+    if (best == 0) {
+        var first: usize = 1;
+        while (first < text.len and (text[first] & 0xC0) == 0x80) first += 1;
+        return first;
+    }
+    if (std.mem.lastIndexOfScalar(u8, text[0..best], ' ')) |space_index| {
+        if (space_index > 0) return space_index;
+    }
+    return best;
 }
 
 // Raw transcript bodies may hold multi-line dumps; Companion rows are
@@ -1850,6 +2024,176 @@ test "public Companion render bounds raw multiline Run and Activity dumps" {
     try expectBoundedBodyText(&state.palette_overlay_batch, "line one line two line three", geometry.body);
     try expectClippedTextCommand(&state.palette_overlay_batch, "DONE", geometry.body);
     try expectClippedTextCommand(&state.palette_overlay_batch, "Sprout is working…", geometry.body);
+}
+
+test "public Companion render surfaces streaming final empty and failed Sprout answers in Run" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller = .{};
+    state.companion_controller = controller.init();
+    state.companion_controller.show();
+    state.companion_composer = @TypeOf(state.companion_composer).init();
+    state.palette_overlay_batch = .{};
+    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.companion_composer.deinit(allocator);
+        state.palette_overlay_batch.deinit(allocator);
+        state.palette_frame_text_arena.deinit();
+    }
+    var project = try runtime.Project.init(allocator, "answer", "Answer", "/tmp/answer", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+
+    // Dynamically populated, non-literal answer text proves Frame-backed
+    // lifetime rather than static-string survival.
+    var answer_buffer: [96]u8 = undefined;
+    const answer_body = try std.fmt.bufPrint(&answer_buffer, "# {s} — native workspace shell", .{"Verde"});
+    var frame: controller.Frame = .{ .has_thread = true, .working = true };
+    frame.workspace_id.set("answer");
+    frame.thread_id.set("pane-less-answer");
+    frame.objective.set("Read README.md and report its first heading");
+    frame.answer.set(answer_body);
+    @memset(&answer_buffer, 0);
+    state.companion_controller.setFrame(frame);
+    const geometry = computeGeometryForState(1360.0, 860.0, 1.0, &state.companion_controller);
+
+    // Streaming: the in-progress answer is visible and labeled WORKING.
+    render(&state, 1360.0, 860.0);
+    try expectFrameBackedTextCommand(&state.palette_overlay_batch, "# Verde — native workspace shell", &state.companion_controller.presentation.answer, geometry.body);
+    try expectClippedTextCommand(&state.palette_overlay_batch, "SPROUT SAYS", geometry.body);
+    try expectBoundedBodyText(&state.palette_overlay_batch, "WORKING", geometry.body);
+
+    // Completion keeps the final answer visible and labels it DONE.
+    var done_frame = state.companion_controller.presentation;
+    done_frame.working = false;
+    state.companion_controller.setFrame(done_frame);
+    state.palette_overlay_batch.clear();
+    render(&state, 1360.0, 860.0);
+    try expectFrameBackedTextCommand(&state.palette_overlay_batch, "# Verde — native workspace shell", &state.companion_controller.presentation.answer, geometry.body);
+    try expectBoundedBodyText(&state.palette_overlay_batch, "DONE", geometry.body);
+
+    // A new turn before the first delta shows a truthful placeholder, not the
+    // old answer.
+    var pending_frame: controller.Frame = .{ .has_thread = true, .working = true };
+    pending_frame.workspace_id.set("answer");
+    pending_frame.thread_id.set("pane-less-answer");
+    pending_frame.objective.set("Now summarize CONTRIBUTING.md");
+    state.companion_controller.setFrame(pending_frame);
+    state.palette_overlay_batch.clear();
+    render(&state, 1360.0, 860.0);
+    try expectClippedTextCommand(&state.palette_overlay_batch, "Working — no reply yet.", geometry.body);
+    try expectNoTextCommand(&state.palette_overlay_batch, "# Verde — native workspace shell");
+
+    // A failed turn reports FAILED without inventing an answer, while the
+    // provider and control errors stay visible as cards.
+    var failed_frame: controller.Frame = .{ .has_thread = true, .answer_failed = true, .has_failure = true };
+    failed_frame.workspace_id.set("answer");
+    failed_frame.thread_id.set("pane-less-answer");
+    failed_frame.objective.set("Now summarize CONTRIBUTING.md");
+    failed_frame.provider_error.set("Send failed: provider exited");
+    failed_frame.control_error.set("Approval decision failed");
+    state.companion_controller.setFrame(failed_frame);
+    state.palette_overlay_batch.clear();
+    render(&state, 1360.0, 860.0);
+    try expectClippedTextCommand(&state.palette_overlay_batch, "The run failed before replying.", geometry.body);
+    try expectBoundedBodyText(&state.palette_overlay_batch, "FAILED", geometry.body);
+    try expectBoundedBodyText(&state.palette_overlay_batch, "provider exited", geometry.body);
+    try expectClippedTextCommand(&state.palette_overlay_batch, "Action failed", geometry.body);
+    try expectNoTextCommand(&state.palette_overlay_batch, "DONE");
+}
+
+test "public Companion render leads with the answer and suppresses metadata-only success detail" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller = .{};
+    state.companion_controller = controller.init();
+    state.companion_controller.show();
+    state.companion_composer = @TypeOf(state.companion_composer).init();
+    state.palette_overlay_batch = .{};
+    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.companion_composer.deinit(allocator);
+        state.palette_overlay_batch.deinit(allocator);
+        state.palette_frame_text_arena.deinit();
+    }
+    var project = try runtime.Project.init(allocator, "evidence", "Evidence", "/tmp/evidence", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+
+    const metadata_dump = "Command:\n/usr/bin/bash -lc \"sed -n '1,12p' README.md\"\n\nOutput:\nCWD: /home/rtg/development/verde\nExit code: 0\nDuration ms: 0";
+    const output_dump = "Command:\n/usr/bin/bash -lc 'cat VERSION'\n\nOutput:\nCWD: /home/rtg/development/verde\nExit code: 0\nDuration ms: 4\n\n0.4.2-dev";
+    const failed_dump = "Command:\n/usr/bin/bash -lc 'zig build'\n\nOutput:\nCWD: /tmp\nExit code: 1\nDuration ms: 12";
+    var answer_buffer: [64]u8 = undefined;
+    const answer_body = try std.fmt.bufPrint(&answer_buffer, "The first heading is {s}", .{"# Verde"});
+    var frame: controller.Frame = .{ .has_thread = true };
+    frame.workspace_id.set("evidence");
+    frame.thread_id.set("pane-less-evidence");
+    frame.objective.set("Read README.md and report its first heading");
+    frame.answer.set(answer_body);
+    @memset(&answer_buffer, 0);
+    var metadata_op: controller.Operation = .{ .status = .completed, .sequence = 1 };
+    metadata_op.identity.set("tool:metadata");
+    metadata_op.title.set("Ran command");
+    metadata_op.detail.set(metadata_dump);
+    frame.upsertOperation(metadata_op);
+    var output_op: controller.Operation = .{ .status = .completed, .sequence = 2 };
+    output_op.identity.set("tool:output");
+    output_op.title.set("Ran command");
+    output_op.detail.set(output_dump);
+    frame.upsertOperation(output_op);
+    var failed_op: controller.Operation = .{ .status = .failed, .sequence = 3 };
+    failed_op.identity.set("tool:failed");
+    failed_op.title.set("Command failed");
+    failed_op.detail.set(failed_dump);
+    frame.upsertOperation(failed_op);
+    state.companion_controller.setFrame(frame);
+    const geometry = computeGeometryForState(1360.0, 860.0, 1.0, &state.companion_controller);
+
+    render(&state, 1360.0, 860.0);
+    // The completed README-like answer is queued in Run, above the evidence.
+    try expectFrameBackedTextCommand(&state.palette_overlay_batch, "The first heading is # Verde", &state.companion_controller.presentation.answer, geometry.body);
+    try std.testing.expect(try textCommandY(&state.palette_overlay_batch, "SPROUT SAYS") < try textCommandY(&state.palette_overlay_batch, "RECENT"));
+    // Metadata-only success reads as a truthful completion, real output and
+    // failure diagnostics survive, and successful metadata never renders.
+    try expectClippedTextCommand(&state.palette_overlay_batch, "Completed successfully", geometry.body);
+    try expectBoundedBodyText(&state.palette_overlay_batch, "0.4.2-dev", geometry.body);
+    try expectBoundedBodyText(&state.palette_overlay_batch, "Exit code: 1", geometry.body);
+    try expectNoTextCommandContaining(&state.palette_overlay_batch, "Duration ms: 0");
+    try expectNoTextCommandContaining(&state.palette_overlay_batch, "Duration ms: 4");
+}
+
+test "meaningful result preview skips only the fixed metadata preamble" {
+    try std.testing.expect(meaningfulResultPreview("CWD: /home/x\nExit code: 0\nDuration ms: 3") == null);
+    try std.testing.expectEqualStrings("real output\nsecond line", meaningfulResultPreview("CWD: /home/x\nExit code: 0\nDuration ms: 3\n\nreal output\nsecond line").?);
+    try std.testing.expectEqualStrings("Duration measured in weeks", meaningfulResultPreview("Duration measured in weeks").?);
+    try std.testing.expect(meaningfulResultPreview("   \n\t\n") == null);
+}
+
+fn expectNoTextCommandContaining(batch: *const palette.RenderBatch, forbidden: []const u8) !void {
+    for (batch.commands.items) |command| {
+        if (command.kind == .text and std.mem.indexOf(u8, command.text, forbidden) != null) return error.UnexpectedTextCommand;
+    }
+}
+
+fn textCommandY(batch: *const palette.RenderBatch, needle: []const u8) !f32 {
+    for (batch.commands.items) |command| {
+        if (command.kind == .text and std.mem.eql(u8, command.text, needle)) return command.rect.y;
+    }
+    return error.MissingExpectedText;
 }
 
 fn expectNoMultilineText(batch: *const palette.RenderBatch) !void {

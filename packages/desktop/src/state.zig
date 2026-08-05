@@ -5823,7 +5823,16 @@ pub const AppState = struct {
             // instruction, not the first prompt of the thread.
             if (message.role == .user) {
                 const trimmed = std.mem.trim(u8, message.body, " \t\r\n");
-                if (trimmed.len > 0) frame.objective.set(trimmed);
+                if (trimmed.len > 0) {
+                    frame.objective.set(trimmed);
+                    // A meaningful user prompt starts a new turn, so the prior
+                    // assistant answer must not present as this turn's result.
+                    frame.answer.set("");
+                }
+            }
+            if (message.role == .assistant) {
+                const trimmed = std.mem.trim(u8, message.body, " \t\r\n");
+                if (trimmed.len > 0) frame.answer.set(trimmed);
             }
             frame.latest_body.set(message.body);
             if (message.role == .system and
@@ -5870,7 +5879,14 @@ pub const AppState = struct {
                 // it never lags one turn behind the transcript.
                 if (event.role == .user) {
                     const trimmed = std.mem.trim(u8, event.body, " \t\r\n");
-                    if (trimmed.len > 0) frame.objective.set(trimmed);
+                    if (trimmed.len > 0) {
+                        frame.objective.set(trimmed);
+                        frame.answer.set("");
+                    }
+                }
+                if (event.role == .assistant) {
+                    const trimmed = std.mem.trim(u8, event.body, " \t\r\n");
+                    if (trimmed.len > 0) frame.answer.set(trimmed);
                 }
                 appendCompanionActivity(frame, "", author, event.body, kind, sequence);
             }
@@ -5879,6 +5895,9 @@ pub const AppState = struct {
         }
         frame.partial_text.set(send_state.partial_text.items);
         if (send_state.partial_text.items.len > 0) {
+            // Streaming deltas are this turn's answer-in-progress, so the
+            // Result region updates live rather than after completion.
+            frame.answer.set(send_state.partial_text.items);
             appendCompanionActivity(frame, "streaming", "Sprout", send_state.partial_text.items, .streaming, base_sequence + @as(i64, @intCast(send_state.pending_events.items.len)));
         }
     }
@@ -5982,6 +6001,9 @@ pub const AppState = struct {
         }
         if (send_state.error_message) |message| frame.provider_error.set(message);
         if (send_state.control_error_message) |message| frame.control_error.set(message);
+        // answer_failed reports only the current turn's outcome; historical
+        // transcript failures stay out of the Result region's verdict.
+        frame.answer_failed = send_state.status == .failed or frame.provider_error.slice().len > 0;
         if (self.companion_controller.ui_error) |message| frame.ui_error.set(message);
         frame.has_failure = frame.has_failure or send_state.status == .failed or
             frame.provider_error.slice().len > 0 or frame.control_error.slice().len > 0 or frame.ui_error.slice().len > 0;
@@ -9158,7 +9180,11 @@ test "Companion frame projects transcript pending streaming lifecycle errors and
     try std.testing.expectEqualStrings("Control failed", frame.control_error.slice());
     try std.testing.expect(frame.has_failure);
     try std.testing.expectEqual(companion_controller.ActivityKind.streaming, frame.activity[frame.activity_count - 1].kind);
+    // Streaming partial text is this turn's answer-in-progress.
+    try std.testing.expectEqualStrings("Streaming response", frame.answer.slice());
+    try std.testing.expect(!frame.answer_failed);
 
+    send_state.partial_text.clearRetainingCapacity();
     try send_state.pending_events.append(std.heap.page_allocator, .{
         .role = .user,
         .author = try std.heap.page_allocator.dupe(u8, "You"),
@@ -9171,6 +9197,19 @@ test "Companion frame projects transcript pending streaming lifecycle errors and
     try std.testing.expectEqual(companion_controller.OperationStatus.completed, frame.operations[0].status);
     try std.testing.expectEqual(@as(usize, 1), frame.recentCount());
     try std.testing.expectEqualStrings("Actually, ship the hotfix first", frame.objective.slice());
+    // A new meaningful objective clears the previous turn's answer.
+    try std.testing.expectEqual(@as(usize, 0), frame.answer.slice().len);
+
+    try send_state.pending_events.append(std.heap.page_allocator, .{
+        .role = .assistant,
+        .author = try std.heap.page_allocator.dupe(u8, "Sprout"),
+        .body = try std.heap.page_allocator.dupe(u8, "First heading: # Verde"),
+    });
+    state.syncCompanionProjection();
+    frame = &state.companion_controller.presentation;
+    // The assistant reply to the current objective becomes the visible answer.
+    try std.testing.expectEqualStrings("First heading: # Verde", frame.answer.slice());
+    try std.testing.expect(!frame.answer_failed);
 
     send_state.pending_events.items[0].tool_call_status = .failed;
     state.syncCompanionProjection();
@@ -9191,6 +9230,32 @@ test "Companion frame projects transcript pending streaming lifecycle errors and
     removed.deinit(allocator);
     state.syncCompanionProjection();
     try std.testing.expectEqual(@as(usize, 1), state.companion_controller.presentation.operation_count);
+
+    // A failed turn reports answer_failed while keeping whatever partial
+    // answer already streamed; nothing is fabricated.
+    send_state.status = .failed;
+    send_state.error_message = try std.heap.page_allocator.dupe(u8, "Send failed: provider exited");
+    state.syncCompanionProjection();
+    frame = &state.companion_controller.presentation;
+    try std.testing.expect(frame.answer_failed);
+    try std.testing.expect(frame.has_failure);
+    try std.testing.expectEqualStrings("First heading: # Verde", frame.answer.slice());
+
+    // Committed transcript replies persist as the answer after the turn ends,
+    // and answer_failed resets once the send state recovers.
+    send_state.pending_events.clearRetainingCapacity();
+    send_state.status = .idle;
+    send_state.error_message = null;
+    try thread.messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Sprout"),
+        .body = try allocator.dupeZ(u8, "Committed: hotfix shipped"),
+    });
+    state.syncCompanionProjection();
+    frame = &state.companion_controller.presentation;
+    try std.testing.expectEqualStrings("Committed: hotfix shipped", frame.answer.slice());
+    try std.testing.expect(!frame.answer_failed);
+    try std.testing.expect(!frame.working);
 }
 
 test "Companion production projection rejects lossy identities and preserves owner hierarchy" {
