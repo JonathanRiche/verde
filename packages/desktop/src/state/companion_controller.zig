@@ -40,6 +40,8 @@ pub const VisualState = struct {
 pub const HitAction = enum {
     open,
     collapse,
+    mission_control_open,
+    mission_control_close,
     panel,
     body,
     run_tab,
@@ -507,6 +509,13 @@ pub const Presentation = Frame;
 
 pub const Tab = enum { run, activity };
 
+pub const MissionControlScrollRegion = enum {
+    summary,
+    operations,
+    inspector,
+    body,
+};
+
 visibility: Visibility = .collapsed_chip,
 run_phase: RunPhase = .working,
 needs_approval: bool = true,
@@ -518,6 +527,7 @@ ui_error: ?[]const u8 = null,
 presentation: Presentation = .{},
 selected_operation: ?OperationReference = null,
 selected_tab: Tab = .run,
+mission_control_open: bool = false,
 frame_width: f32 = 0.0,
 frame_height: f32 = 0.0,
 hits: [80]Hit = undefined,
@@ -527,6 +537,10 @@ activity_scroll_y: f32 = 0.0,
 activity_max_scroll: f32 = 0.0,
 activity_content_count: usize = 0,
 activity_follow_tail: bool = true,
+mission_control_summary_scroll_y: f32 = 0.0,
+mission_control_operations_scroll_y: f32 = 0.0,
+mission_control_inspector_scroll_y: f32 = 0.0,
+mission_control_body_scroll_y: f32 = 0.0,
 pointer_captured_buttons: [256]bool = [_]bool{false} ** 256,
 escape_key_captured: bool = false,
 
@@ -535,10 +549,10 @@ pub fn init() Self {
 }
 
 pub fn toggle(self: *Self) void {
-    self.visibility = switch (self.visibility) {
-        .collapsed_chip => .sidecar_open,
-        .sidecar_open => .collapsed_chip,
-    };
+    switch (self.visibility) {
+        .collapsed_chip => self.show(),
+        .sidecar_open => self.collapse(),
+    }
 }
 
 pub fn show(self: *Self) void {
@@ -546,7 +560,19 @@ pub fn show(self: *Self) void {
 }
 
 pub fn collapse(self: *Self) void {
+    self.mission_control_open = false;
     self.visibility = .collapsed_chip;
+}
+
+pub fn openMissionControl(self: *Self) void {
+    self.visibility = .sidecar_open;
+    self.mission_control_open = true;
+    if (self.selected_operation == null) self.selectMissionControlDefault();
+}
+
+pub fn closeMissionControl(self: *Self) void {
+    self.mission_control_open = false;
+    self.visibility = .sidecar_open;
 }
 
 pub fn handleEscapeKey(self: *Self, down: bool) bool {
@@ -556,6 +582,11 @@ pub fn handleEscapeKey(self: *Self, down: bool) bool {
         return true;
     }
     if (self.escape_key_captured) return true;
+    if (self.mission_control_open) {
+        self.escape_key_captured = true;
+        self.closeMissionControl();
+        return true;
+    }
     if (self.visibility != .sidecar_open) return false;
     self.escape_key_captured = true;
     self.collapse();
@@ -664,10 +695,14 @@ pub fn setFrame(self: *Self, frame: Frame) void {
         self.activity_content_count = 0;
         self.activity_follow_tail = true;
         self.selected_operation = null;
+        self.resetMissionControlScroll();
     }
     self.presentation = frame;
     if (self.selected_operation) |*reference| {
-        if (!self.presentation.containsReference(reference)) self.selected_operation = null;
+        if (!self.presentation.containsReference(reference)) {
+            self.selected_operation = null;
+            self.mission_control_inspector_scroll_y = 0.0;
+        }
     }
     self.applyProjection(
         if (frame.working) .working else .idle,
@@ -686,10 +721,12 @@ pub fn toggleOperationSelection(self: *Self, reference: OperationReference) void
     if (self.selected_operation) |*selected| {
         if (selected.eql(&reference)) {
             self.selected_operation = null;
+            self.mission_control_inspector_scroll_y = 0.0;
             return;
         }
     }
     self.selected_operation = reference;
+    self.mission_control_inspector_scroll_y = 0.0;
 }
 
 pub fn selectedOperation(self: *const Self) ?*const Operation {
@@ -729,6 +766,16 @@ pub fn updateActivityExtent(self: *Self, max_scroll: f32) void {
     self.activity_follow_tail = was_at_tail and max_scroll - self.activity_scroll_y <= 2.0;
     self.activity_max_scroll = max_scroll;
     self.activity_content_count = self.presentation.activity_count;
+}
+
+pub fn scrollMissionControl(self: *Self, region: MissionControlScrollRegion, delta: f32, max_scroll: f32) void {
+    const offset = switch (region) {
+        .summary => &self.mission_control_summary_scroll_y,
+        .operations => &self.mission_control_operations_scroll_y,
+        .inspector => &self.mission_control_inspector_scroll_y,
+        .body => &self.mission_control_body_scroll_y,
+    };
+    offset.* = std.math.clamp(offset.* + delta, 0.0, @max(max_scroll, 0.0));
 }
 
 pub fn clearHits(self: *Self) void {
@@ -788,6 +835,34 @@ fn setSemantic(
     self.status_text = status_text;
     self.operation_count = operation_count;
     self.approval_count = approval_count;
+}
+
+fn selectMissionControlDefault(self: *Self) void {
+    for (0..self.presentation.operation_count) |index| {
+        const operation = &self.presentation.operations[index];
+        if (!operation.active()) continue;
+        const reference = self.presentation.operationReference(index) orelse continue;
+        if (!reference.actions.inspect) continue;
+        self.selected_operation = reference;
+        self.mission_control_inspector_scroll_y = 0.0;
+        return;
+    }
+    for (0..self.presentation.operation_count) |index| {
+        const operation = &self.presentation.operations[index];
+        if (operation.active()) continue;
+        const reference = self.presentation.operationReference(index) orelse continue;
+        if (!reference.actions.inspect) continue;
+        self.selected_operation = reference;
+        self.mission_control_inspector_scroll_y = 0.0;
+        return;
+    }
+}
+
+fn resetMissionControlScroll(self: *Self) void {
+    self.mission_control_summary_scroll_y = 0.0;
+    self.mission_control_operations_scroll_y = 0.0;
+    self.mission_control_inspector_scroll_y = 0.0;
+    self.mission_control_body_scroll_y = 0.0;
 }
 
 fn pointInRect(rect: palette.Rect, x: f32, y: f32) bool {
@@ -942,6 +1017,98 @@ test "operation selection toggles exactly and survives only matching frame owner
     state.setFrame(replacement);
     try std.testing.expect(state.selected_operation == null);
     try std.testing.expectEqual(Tab.run, state.selected_tab);
+}
+
+test "Mission Control lifecycle preserves work and valid owner-local view state" {
+    var frame: Frame = .{ .has_thread = true, .working = true };
+    try std.testing.expect(frame.setOwner("workspace", "thread"));
+    frame.upsertOperation(testOperation("recent", .completed, 1));
+    frame.upsertOperation(testOperation("active", .in_progress, 2));
+    frame.sortOperations();
+
+    var state = Self.init();
+    state.setFrame(frame);
+    const presentation_before = state.presentation;
+    state.show();
+    state.openMissionControl();
+    try std.testing.expect(state.mission_control_open);
+    try std.testing.expectEqual(Visibility.sidecar_open, state.visibility);
+    try std.testing.expectEqualStrings("active", state.selected_operation.?.identity.slice());
+    try std.testing.expectEqualDeep(presentation_before, state.presentation);
+
+    state.mission_control_summary_scroll_y = 11.0;
+    state.mission_control_operations_scroll_y = 22.0;
+    state.mission_control_inspector_scroll_y = 33.0;
+    state.closeMissionControl();
+    state.openMissionControl();
+    try std.testing.expectEqual(@as(f32, 11.0), state.mission_control_summary_scroll_y);
+    try std.testing.expectEqual(@as(f32, 22.0), state.mission_control_operations_scroll_y);
+    try std.testing.expectEqual(@as(f32, 33.0), state.mission_control_inspector_scroll_y);
+    try std.testing.expectEqualStrings("active", state.selected_operation.?.identity.slice());
+
+    try std.testing.expect(state.handleEscapeKey(true));
+    try std.testing.expect(!state.mission_control_open);
+    try std.testing.expectEqual(Visibility.sidecar_open, state.visibility);
+    try std.testing.expect(state.handleEscapeKey(false));
+    state.openMissionControl();
+    state.collapse();
+    try std.testing.expect(!state.mission_control_open);
+    try std.testing.expectEqual(Visibility.collapsed_chip, state.visibility);
+    try std.testing.expectEqualDeep(presentation_before, state.presentation);
+}
+
+test "Mission Control selection and scroll reset only at exact invalidation boundaries" {
+    var frame: Frame = .{ .has_thread = true };
+    try std.testing.expect(frame.setOwner("workspace-a", "thread-a"));
+    var operation = testOperation("operation", .in_progress, 1);
+    operation.actions = .{ .inspect = true, .stop = true };
+    frame.upsertOperation(operation);
+
+    var state = Self.init();
+    state.setFrame(frame);
+    state.openMissionControl();
+    const reference = frame.operationReference(0).?;
+    state.mission_control_summary_scroll_y = 10.0;
+    state.mission_control_operations_scroll_y = 20.0;
+    state.mission_control_inspector_scroll_y = 30.0;
+    state.mission_control_body_scroll_y = 40.0;
+
+    state.toggleOperationSelection(reference);
+    try std.testing.expect(state.selected_operation == null);
+    try std.testing.expectEqual(@as(f32, 0.0), state.mission_control_inspector_scroll_y);
+    try std.testing.expectEqual(@as(f32, 10.0), state.mission_control_summary_scroll_y);
+    try std.testing.expectEqual(@as(f32, 20.0), state.mission_control_operations_scroll_y);
+    try std.testing.expectEqual(@as(f32, 40.0), state.mission_control_body_scroll_y);
+
+    state.toggleOperationSelection(reference);
+    state.mission_control_inspector_scroll_y = 18.0;
+    var evicted = frame;
+    evicted.operation_count = 0;
+    state.setFrame(evicted);
+    try std.testing.expect(state.selected_operation == null);
+    try std.testing.expectEqual(@as(f32, 0.0), state.mission_control_inspector_scroll_y);
+    try std.testing.expectEqual(@as(f32, 10.0), state.mission_control_summary_scroll_y);
+
+    var replacement = frame;
+    try std.testing.expect(replacement.setOwner("workspace-b", "thread-b"));
+    state.setFrame(replacement);
+    try std.testing.expectEqual(@as(f32, 0.0), state.mission_control_summary_scroll_y);
+    try std.testing.expectEqual(@as(f32, 0.0), state.mission_control_operations_scroll_y);
+    try std.testing.expectEqual(@as(f32, 0.0), state.mission_control_body_scroll_y);
+}
+
+test "Mission Control direct scroll regions clamp independently" {
+    var state = Self.init();
+    state.scrollMissionControl(.summary, 40.0, 100.0);
+    state.scrollMissionControl(.operations, 50.0, 100.0);
+    state.scrollMissionControl(.inspector, 60.0, 100.0);
+    state.scrollMissionControl(.body, 70.0, 100.0);
+    state.scrollMissionControl(.summary, -15.0, 100.0);
+    state.scrollMissionControl(.operations, 500.0, 80.0);
+    try std.testing.expectEqual(@as(f32, 25.0), state.mission_control_summary_scroll_y);
+    try std.testing.expectEqual(@as(f32, 80.0), state.mission_control_operations_scroll_y);
+    try std.testing.expectEqual(@as(f32, 60.0), state.mission_control_inspector_scroll_y);
+    try std.testing.expectEqual(@as(f32, 70.0), state.mission_control_body_scroll_y);
 }
 
 test "operation hit owns its copied reference after source frame replacement" {
