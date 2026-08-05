@@ -175,6 +175,7 @@ pub const AppConfig = struct {
     workspace_scroll_direction: WorkspaceScrollDirection = .horizontal,
     workspace_scroll_mode: WorkspaceScrollMode = .automatic,
     workspace_scroll_threshold: u8 = DEFAULT_WORKSPACE_SCROLL_THRESHOLD,
+    companion_enabled: bool = false,
     companion_character: CompanionCharacter = .sprout,
     theme_config: theme.ThemeConfig = .{},
     active_theme: ?[]u8 = null,
@@ -415,6 +416,7 @@ fn writeUiSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, con
     try ui_object.put(allocator, "workspace_scroll_direction", .{ .string = @tagName(config.workspace_scroll_direction) });
     try ui_object.put(allocator, "workspace_scroll_mode", .{ .string = @tagName(config.workspace_scroll_mode) });
     try ui_object.put(allocator, "workspace_scroll_threshold", .{ .integer = config.workspace_scroll_threshold });
+    try ui_object.put(allocator, "companion_enabled", .{ .bool = config.companion_enabled });
     try ui_object.put(allocator, "companion_character", .{ .string = @tagName(config.companion_character) });
 }
 
@@ -981,6 +983,14 @@ fn applyUiOverrides(config: *AppConfig, ui_value: std.json.Value) void {
             else => log.warn("ui.workspace_scroll_threshold must be an integer when provided", .{}),
         }
     }
+    if (ui_value.object.get("companion_enabled")) |enabled_value| {
+        if (enabled_value == .bool) {
+            config.companion_enabled = enabled_value.bool;
+        } else {
+            config.companion_enabled = false;
+            log.warn("ui.companion_enabled must be a boolean when provided", .{});
+        }
+    }
     if (ui_value.object.get("companion_character")) |character_value| {
         if (character_value != .string) {
             config.companion_character = .sprout;
@@ -1354,6 +1364,47 @@ test "app config defaults missing companion character to Sprout" {
     applyAppOverrides(std.testing.allocator, &config, root.value);
 
     try std.testing.expectEqual(CompanionCharacter.sprout, config.companion_character);
+}
+
+test "app config defaults missing or invalid Companion availability to disabled" {
+    var missing = try parseTestRoot("{\"ui\":{\"font_size\":22}}");
+    defer missing.deinit();
+    var invalid = try parseTestRoot("{\"ui\":{\"companion_enabled\":\"yes\"}}");
+    defer invalid.deinit();
+
+    var missing_config: AppConfig = .{};
+    defer missing_config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &missing_config, missing.value);
+    try std.testing.expect(!missing_config.companion_enabled);
+
+    var invalid_config: AppConfig = .{ .companion_enabled = true };
+    defer invalid_config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &invalid_config, invalid.value);
+    try std.testing.expect(!invalid_config.companion_enabled);
+}
+
+test "app config Companion availability round trips both explicit values" {
+    for ([_]bool{ true, false }) |enabled| {
+        var root = try parseTestRoot("{\"plugin_owned\":true,\"ui\":{\"plugin_value\":\"keep\"}}");
+        defer root.deinit();
+
+        const config: AppConfig = .{ .companion_enabled = enabled };
+        try writeUiSection(root.arena.allocator(), &root.value.object, &config);
+        const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, root.value, .{});
+        defer std.testing.allocator.free(encoded);
+
+        var saved = try parseTestRoot(encoded);
+        defer saved.deinit();
+        try std.testing.expect(saved.value.object.get("plugin_owned").?.bool);
+        const saved_ui = saved.value.object.get("ui").?.object;
+        try std.testing.expectEqualStrings("keep", saved_ui.get("plugin_value").?.string);
+        try std.testing.expectEqual(enabled, saved_ui.get("companion_enabled").?.bool);
+
+        var loaded: AppConfig = .{};
+        defer loaded.deinit(std.testing.allocator);
+        applyAppOverrides(std.testing.allocator, &loaded, saved.value);
+        try std.testing.expectEqual(enabled, loaded.companion_enabled);
+    }
 }
 
 test "app config accepts every companion character" {

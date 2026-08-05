@@ -46,6 +46,10 @@ const MissionControlGeometry = struct {
 
 /// Rebuilds Companion-only hits before SDL events are routed.
 pub fn refreshHits(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!state.isCompanionEnabled()) {
+        state.reconcileCompanionAvailability();
+        return;
+    }
     state.syncCompanionProjection();
     state.companion_controller.frame_width = width;
     state.companion_controller.frame_height = height;
@@ -61,6 +65,7 @@ pub fn refreshHits(state: *runtime.AppState, width: f32, height: f32) void {
 
 /// Routes pointer buttons only when the visible Companion surface is hit.
 pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, down: bool, clicks: u8) bool {
+    if (!state.isCompanionEnabled()) return false;
     const result = state.companion_controller.handlePointerButton(x, y, button, down);
     if (!result.consumed) return false;
     if (result.action) |action| {
@@ -122,6 +127,7 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
 
 /// Prevents underlying hover routing only inside the chip or sidecar.
 pub fn handleMouseMotion(state: *runtime.AppState, x: f32, y: f32, dragging: bool) bool {
+    if (!state.isCompanionEnabled()) return false;
     const owned = state.companion_controller.hasPointerCapture() or state.companion_controller.hitAt(x, y) != null;
     if (owned) _ = state.routeCompanionComposerMouseMotion(x, y, dragging);
     return owned;
@@ -129,6 +135,7 @@ pub fn handleMouseMotion(state: *runtime.AppState, x: f32, y: f32, dragging: boo
 
 /// Scrolls the sidecar body directly; panel chrome consumes without scrolling.
 pub fn handleWheel(state: *runtime.AppState, x: f32, y: f32, wheel_y: f32) bool {
+    if (!state.isCompanionEnabled()) return false;
     const action = state.companion_controller.hitAt(x, y) orelse return false;
     if (state.companion_controller.mission_control_open) {
         if (pointInRect(state.companion_composer.bounds(), x, y) and state.routeCompanionComposerWheel(x, y, wheel_y)) return true;
@@ -149,6 +156,7 @@ pub fn handleWheel(state: *runtime.AppState, x: f32, y: f32, wheel_y: f32) bool 
 
 /// Owns one physical Escape sequence and collapses only on its first key-down.
 pub fn handleEscapeKey(state: *runtime.AppState, down: bool) bool {
+    if (!state.isCompanionEnabled()) return false;
     if (!state.companion_controller.handleEscapeKey(down)) return false;
     if (down) state.blurCompanionComposer();
     state.markDirty();
@@ -156,11 +164,11 @@ pub fn handleEscapeKey(state: *runtime.AppState, down: bool) bool {
 }
 
 pub fn ownsEscapeKey(state: *const runtime.AppState) bool {
-    return state.companion_controller.ownsEscapeKey();
+    return state.isCompanionEnabled() and state.companion_controller.ownsEscapeKey();
 }
 
 pub fn ownsPointerRelease(state: *const runtime.AppState, button: u8) bool {
-    return state.companion_controller.ownsPointerRelease(button);
+    return state.isCompanionEnabled() and state.companion_controller.ownsPointerRelease(button);
 }
 
 pub fn resetInputCaptures(state: *runtime.AppState) void {
@@ -168,11 +176,13 @@ pub fn resetInputCaptures(state: *runtime.AppState) void {
 }
 
 pub fn hitAt(state: *const runtime.AppState, x: f32, y: f32) ?controller.HitAction {
+    if (!state.isCompanionEnabled()) return null;
     return state.companion_controller.hitAt(x, y);
 }
 
 /// Renders the persistent Companion surface above panes and below true modals.
 pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!state.isCompanionEnabled()) return;
     if (state.companion_controller.mission_control_open) {
         renderMissionControl(state, computeMissionControlGeometry(width, height, companionScale()));
         return;
@@ -2659,7 +2669,7 @@ test "production collapsed and expanded overlays stay inside the window" {
         theme.applyTheme(fixture[2]);
         var state: runtime.AppState = undefined;
         state.allocator = allocator;
-        state.app_config = .{};
+        state.app_config = .{ .companion_enabled = true };
         state.project_controller = .{};
         state.companion_controller = controller.init();
         state.companion_controller.applyFixture(.idle);
@@ -2729,7 +2739,7 @@ test "captured scale public render emits a visible complete Companion composer" 
 
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
-    state.app_config = .{};
+    state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_controller.applyFixture(.idle);
@@ -2879,7 +2889,7 @@ test "public Companion render retains Frame-backed Run and Activity text" {
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
-    state.app_config = .{};
+    state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_controller.show();
@@ -2971,7 +2981,7 @@ test "public Companion render bounds raw multiline Run and Activity dumps" {
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
-    state.app_config = .{};
+    state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_controller.show();
@@ -3035,7 +3045,7 @@ test "public Companion render surfaces streaming final empty and failed Sprout a
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
-    state.app_config = .{};
+    state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_controller.show();
@@ -3119,7 +3129,7 @@ test "public Companion Result heading follows the active character" {
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
-    state.app_config = .{};
+    state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_controller.show();
@@ -3172,7 +3182,7 @@ test "public Companion render leads with the answer and suppresses metadata-only
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
-    state.app_config = .{};
+    state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_controller.show();
@@ -3240,7 +3250,7 @@ test "public Companion render clears stale failure posture while failed evidence
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
-    state.app_config = .{};
+    state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_composer = @TypeOf(state.companion_composer).init();
@@ -3421,7 +3431,7 @@ test "public Companion render repaints active chrome without reconstructing stat
 
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
-    state.app_config = .{};
+    state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_composer = @TypeOf(state.companion_composer).init();
@@ -3874,7 +3884,7 @@ test "production hit refresh follows one approval projection snapshot" {
     const allocator = std.testing.allocator;
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
-    state.app_config = .{};
+    state.app_config = .{ .companion_enabled = true };
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
     state.companion_controller = controller.init();
@@ -3928,7 +3938,7 @@ test "production hit refresh clears cross-owner approval under contention and re
     const allocator = std.testing.allocator;
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
-    state.app_config = .{};
+    state.app_config = .{ .companion_enabled = true };
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
     state.companion_controller = controller.init();
@@ -4014,7 +4024,7 @@ test "companion chrome draws no border-only commands outside the shared composer
         theme.applyTheme(scale);
         var state: runtime.AppState = undefined;
         state.allocator = allocator;
-        state.app_config = .{};
+        state.app_config = .{ .companion_enabled = true };
         state.project_controller = .{};
         state.companion_controller = controller.init();
         state.companion_composer = @TypeOf(state.companion_composer).init();
@@ -4084,7 +4094,7 @@ test "expanded sidecar chrome snaps to device pixels at a fractional scale" {
     theme.applyTheme(1.25);
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
-    state.app_config = .{};
+    state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_controller.applyFixture(.idle);
@@ -4141,7 +4151,7 @@ test "saved companion character changes chip and header labels and render batche
 
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
-    state.app_config = .{};
+    state.app_config = .{ .companion_enabled = true };
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_controller.applyFixture(.idle);
@@ -4197,7 +4207,7 @@ test "companion characters produce distinct collapsed and expanded batches at 1.
         theme.applyTheme(scale);
         var state: runtime.AppState = undefined;
         state.allocator = allocator;
-        state.app_config = .{};
+        state.app_config = .{ .companion_enabled = true };
         state.project_controller = .{};
         state.companion_controller = controller.init();
         state.companion_controller.applyFixture(.idle);
@@ -4265,7 +4275,7 @@ test "moss and vireo apply approval paused and failed semantic treatments" {
     inline for (.{ app_config.CompanionCharacter.moss, .vireo }) |character| {
         var state: runtime.AppState = undefined;
         state.allocator = allocator;
-        state.app_config = .{ .companion_character = character };
+        state.app_config = .{ .companion_enabled = true, .companion_character = character };
         state.project_controller = .{};
         state.companion_controller = controller.init();
         state.companion_composer = @TypeOf(state.companion_composer).init();
@@ -4441,7 +4451,7 @@ test "selected inspector renders exact output and omits empty process output" {
         theme.applyTheme(scale);
         var state: runtime.AppState = undefined;
         state.allocator = allocator;
-        state.app_config = .{};
+        state.app_config = .{ .companion_enabled = true };
         state.project_controller = .{};
         state.companion_controller = controller.init();
         state.lifecycle = .{};
@@ -4702,7 +4712,7 @@ test "Mission Control render and hits share one bounded Frame and exact referenc
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
-    state.app_config = .{ .companion_character = .moss };
+    state.app_config = .{ .companion_enabled = true, .companion_character = .moss };
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_composer = @TypeOf(state.companion_composer).init();
@@ -4910,7 +4920,7 @@ test "public Mission Control entry preserves workspace state and stale actions r
     theme.applyTheme(1.0);
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
-    state.app_config = .{ .companion_character = .vireo };
+    state.app_config = .{ .companion_enabled = true, .companion_character = .vireo };
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_controller.show();
@@ -5061,7 +5071,7 @@ test "Vireo render emits arched brow strokes and viewer-left pupil at fractional
 
     var state: runtime.AppState = undefined;
     state.allocator = allocator;
-    state.app_config = .{ .companion_character = .vireo };
+    state.app_config = .{ .companion_enabled = true, .companion_character = .vireo };
     state.project_controller = .{};
     state.companion_controller = controller.init();
     state.companion_controller.applyFixture(.idle);
@@ -5118,4 +5128,125 @@ test "Vireo render emits arched brow strokes and viewer-left pupil at fractional
     try std.testing.expect(saw_pupil);
     try std.testing.expect(saw_brow_segment);
     try std.testing.expect(expected_pupil.x + expected_pupil.w * 0.5 < eye.x + eye.w * 0.5);
+}
+
+test "disabled Companion removes only presentation routing and re-enables exact lazy workspace state" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.0);
+
+    var state: runtime.AppState = undefined;
+    state.allocator = allocator;
+    state.app_config = .{ .companion_enabled = false, .companion_character = .moss };
+    state.project_controller = .{};
+    state.companion_controller = controller.init();
+    state.companion_controller.show();
+    state.companion_controller.openMissionControl();
+    state.companion_controller.presentation.answer.set("current result");
+    state.companion_composer = @TypeOf(state.companion_composer).init();
+    state.companion_composer.setBounds(.{ .x = 10.0, .y = 10.0, .w = 240.0, .h = 90.0 });
+    try state.companion_composer.setText(allocator, "composer draft");
+    state.companion_composer.focused = true;
+    state.palette_overlay_batch = .{};
+    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+    state.lifecycle = .{};
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.companion_composer.deinit(allocator);
+        state.palette_overlay_batch.deinit(allocator);
+        state.palette_frame_text_arena.deinit();
+    }
+
+    var project_a = try runtime.Project.init(allocator, "disabled-a", "Disabled A", "/tmp/disabled-a", 0);
+    const companion_thread = try project_a.ensureCompanionThread(allocator);
+    companion_thread.setDraft("preserved draft");
+    try companion_thread.messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Sprout"),
+        .body = try allocator.dupeZ(u8, "preserved history"),
+    });
+    companion_thread.send_state.status = .pending;
+    try companion_thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "preserved process"),
+        .status = .running,
+    });
+    state.project_controller.projects.append(allocator, project_a) catch |err| {
+        project_a.deinit(allocator);
+        return err;
+    };
+    var project_b = try runtime.Project.init(allocator, "disabled-b", "Disabled B", "/tmp/disabled-b", 0);
+    state.project_controller.projects.append(allocator, project_b) catch |err| {
+        project_b.deinit(allocator);
+        return err;
+    };
+    state.project_controller.selected_index = 0;
+
+    const owner_id = state.project_controller.projects.items[0].companion_thread_local_id.?;
+    const owner_thread = state.threadByLocalId("disabled-a", owner_id).?;
+    const thread_count = state.project_controller.projects.items[0].threads.items.len;
+    const pane_count = state.project_controller.projects.items[0].workspace_layout.panes.items.len;
+    const selected_thread = state.project_controller.projects.items[0].selected_thread_index;
+    const focused_pane = state.project_controller.projects.items[0].workspace_layout.focused_pane_id;
+    state.companion_controller.addHit(.{ .x = 0.0, .y = 0.0, .w = 100.0, .h = 100.0 }, .panel);
+    _ = state.companion_controller.handlePointerButton(20.0, 20.0, 1, true);
+
+    refreshHits(&state, 1280.0, 720.0);
+    try std.testing.expect(!state.companion_controller.mission_control_open);
+    try std.testing.expectEqual(controller.Visibility.sidecar_open, state.companion_controller.visibility);
+    try std.testing.expectEqual(@as(usize, 0), state.companion_controller.hit_count);
+    try std.testing.expect(!state.companion_controller.hasPointerCapture());
+    try std.testing.expect(!state.companion_composer.focused);
+    try std.testing.expectEqualStrings("current result", state.companion_controller.presentation.answer.slice());
+
+    state.palette_overlay_batch.clear();
+    render(&state, 1280.0, 720.0);
+    try std.testing.expectEqual(@as(usize, 0), state.palette_overlay_batch.commands.items.len);
+    try std.testing.expect(hitAt(&state, 20.0, 20.0) == null);
+    try std.testing.expect(!handleMouseButton(&state, 20.0, 20.0, 1, true, 1));
+    try std.testing.expect(!handleMouseMotion(&state, 20.0, 20.0, true));
+    try std.testing.expect(!handleWheel(&state, 20.0, 20.0, -1.0));
+    try std.testing.expect(!handleEscapeKey(&state, true));
+    try std.testing.expect(!ownsEscapeKey(&state));
+    try std.testing.expect(!ownsPointerRelease(&state, 1));
+    try std.testing.expect(!state.routeCompanionComposerTextInput("blocked"));
+    const key_event: @import("zsdl3").KeyboardEvent = std.mem.zeroes(@import("zsdl3").KeyboardEvent);
+    try std.testing.expect(!state.routeCompanionComposerKeyDown(&key_event));
+    try std.testing.expect(!state.routeCompanionComposerMouseButton(20.0, 20.0, true, 1));
+    try std.testing.expect(!state.routeCompanionComposerMouseMotion(20.0, 20.0, true));
+    try std.testing.expect(!state.routeCompanionComposerWheel(20.0, 20.0, -1.0));
+
+    try std.testing.expectEqualStrings(owner_id, state.project_controller.projects.items[0].companion_thread_local_id.?);
+    try std.testing.expectEqual(thread_count, state.project_controller.projects.items[0].threads.items.len);
+    try std.testing.expectEqual(pane_count, state.project_controller.projects.items[0].workspace_layout.panes.items.len);
+    try std.testing.expectEqual(selected_thread, state.project_controller.projects.items[0].selected_thread_index);
+    try std.testing.expectEqual(focused_pane, state.project_controller.projects.items[0].workspace_layout.focused_pane_id);
+    try std.testing.expectEqualStrings("preserved draft", owner_thread.currentDraft());
+    try std.testing.expectEqual(@as(usize, 1), owner_thread.messages.items.len);
+    try std.testing.expectEqualStrings("preserved history", owner_thread.messages.items[0].body);
+    try std.testing.expectEqual(@as(usize, 1), owner_thread.background_tasks.items.len);
+    try std.testing.expect(!owner_thread.background_tasks.items[0].stop_requested);
+    try std.testing.expectEqual(@as(@TypeOf(owner_thread.send_state.status), .pending), owner_thread.send_state.status);
+    try std.testing.expectEqual(app_config.CompanionCharacter.moss, state.app_config.companion_character);
+
+    state.app_config.companion_enabled = true;
+    state.project_controller.selected_index = 1;
+    try std.testing.expect(state.isCompanionEnabled());
+    const lazy_thread_count = state.project_controller.projects.items[1].threads.items.len;
+    const lazy_pane_count = state.project_controller.projects.items[1].workspace_layout.panes.items.len;
+    state.openCompanion();
+    refreshHits(&state, 1280.0, 720.0);
+    try std.testing.expect(state.project_controller.projects.items[1].companion_thread_local_id == null);
+    try std.testing.expectEqual(lazy_thread_count, state.project_controller.projects.items[1].threads.items.len);
+    try std.testing.expectEqual(lazy_pane_count, state.project_controller.projects.items[1].workspace_layout.panes.items.len);
+
+    state.project_controller.selected_index = 0;
+    try std.testing.expect(state.isCompanionEnabled());
+    refreshHits(&state, 1280.0, 720.0);
+    try std.testing.expect(state.companion_controller.hit_count > 0);
+    try std.testing.expectEqualStrings(owner_id, state.project_controller.projects.items[0].companion_thread_local_id.?);
+    try std.testing.expectEqualStrings("preserved draft", owner_thread.currentDraft());
+    try std.testing.expectEqual(@as(usize, 1), owner_thread.messages.items.len);
+    try std.testing.expectEqual(@as(@TypeOf(owner_thread.send_state.status), .pending), owner_thread.send_state.status);
+    try std.testing.expect(!owner_thread.background_tasks.items[0].stop_requested);
 }

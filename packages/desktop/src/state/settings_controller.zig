@@ -58,6 +58,7 @@ pub const Draft = struct {
     workspace_scroll_override_enabled: bool = false,
     workspace_scroll_mode: app_config.WorkspaceScrollMode = .automatic,
     workspace_scroll_threshold: u8 = app_config.DEFAULT_WORKSPACE_SCROLL_THRESHOLD,
+    companion_enabled: bool = false,
     companion_character: app_config.CompanionCharacter = .sprout,
     theme_source: theme.ThemeSource = .omarchy,
     theme_choice: usize = 1,
@@ -225,6 +226,7 @@ pub fn toggleProviderGlobalHooks(self: anytype, provider: HookKind, installed: *
 pub fn replaceAppConfig(self: anytype, next_config: app_config.AppConfig) void {
     self.app_config.deinit(self.allocator);
     self.app_config = next_config;
+    self.reconcileCompanionAvailability();
 }
 
 fn syncCompanionCharacterDraft(settings: *State, config: *const app_config.AppConfig) void {
@@ -258,6 +260,7 @@ pub fn syncSettingsDraftFromConfig(self: anytype) void {
         .workspace_scroll_override_enabled = workspace_scroll_override_enabled,
         .workspace_scroll_mode = workspace_scroll_mode,
         .workspace_scroll_threshold = workspace_scroll_threshold,
+        .companion_enabled = self.app_config.companion_enabled,
         .theme_source = self.app_config.theme_config.source,
         .theme_choice = self.app_config.themeChoiceIndex(),
         .open_action = settingsOpenActionFromConfig(self.app_config.default_open_action),
@@ -298,6 +301,7 @@ pub fn isSettingsDraftDirty(self: anytype) bool {
     if (draft.workspace_scroll_override_enabled != workspace_scroll_override_enabled) return true;
     if (draft.workspace_scroll_mode != workspace_scroll_mode) return true;
     if (draft.workspace_scroll_threshold != workspace_scroll_threshold) return true;
+    if (draft.companion_enabled != self.app_config.companion_enabled) return true;
     if (isCompanionCharacterDraftDirty(&self.settings_controller, &self.app_config)) return true;
     if (draft.theme_choice != self.app_config.themeChoiceIndex()) return true;
     if (draft.link_open_target != self.app_config.link_open_target) return true;
@@ -427,6 +431,8 @@ pub fn saveSettingsModal(self: anytype) !void {
     self.app_config.workspace_pane_gap = theme.clampf(self.settings_controller.draft.workspace_pane_gap, app_config.MIN_WORKSPACE_PANE_GAP, app_config.MAX_WORKSPACE_PANE_GAP);
     self.app_config.workspace_panes_per_view = std.math.clamp(self.settings_controller.draft.workspace_panes_per_view, app_config.MIN_WORKSPACE_PANES_PER_VIEW, app_config.MAX_WORKSPACE_PANES_PER_VIEW);
     self.app_config.workspace_scroll_direction = self.settings_controller.draft.workspace_scroll_direction;
+    self.app_config.companion_enabled = self.settings_controller.draft.companion_enabled;
+    self.reconcileCompanionAvailability();
     applyCompanionCharacterDraft(&self.settings_controller, &self.app_config);
     const has_selected_workspace = self.project_controller.selected_index < self.project_controller.projects.items.len;
     const use_workspace_scroll_override = self.settings_controller.draft.workspace_scroll_override_enabled and has_selected_workspace;

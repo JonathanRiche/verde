@@ -6223,6 +6223,20 @@ pub const AppState = struct {
         self.companion_controller.setFrame(frame);
     }
 
+    pub fn isCompanionEnabled(self: *const AppState) bool {
+        return self.app_config.companion_enabled;
+    }
+
+    /// Removes only disabled Companion presentation ownership. The pane-less
+    /// thread and all provider/process state remain owned by their normal seams.
+    pub fn reconcileCompanionAvailability(self: *AppState) void {
+        if (self.isCompanionEnabled()) return;
+        if (self.companion_controller.mission_control_open) self.companion_controller.closeMissionControl();
+        self.companion_controller.clearHits();
+        self.companion_controller.resetInputCaptures();
+        self.blurCompanionComposer();
+    }
+
     pub fn syncCompanionComposer(self: *AppState, rect: palette.Rect) void {
         if (self.project_controller.projects.items.len == 0) return;
         const project = self.currentProjectMutable();
@@ -6258,14 +6272,14 @@ pub const AppState = struct {
     }
 
     pub fn routeCompanionComposerTextInput(self: *AppState, text: []const u8) bool {
-        if (self.companion_controller.visibility != .sidecar_open or !self.companion_composer.focused) return false;
+        if (!self.isCompanionEnabled() or self.companion_controller.visibility != .sidecar_open or !self.companion_composer.focused) return false;
         const insert_text = self.clampCompanionComposerInsertText(text);
         if (insert_text.len == 0) return true;
         return self.companion_composer.handleInput(self.allocator, .{ .text = insert_text }) catch false;
     }
 
     pub fn routeCompanionComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
-        if (self.companion_controller.visibility != .sidecar_open or !self.companion_composer.focused) return false;
+        if (!self.isCompanionEnabled() or self.companion_controller.visibility != .sidecar_open or !self.companion_composer.focused) return false;
         const key = paletteComposerKeyFromSdl(event) orelse return false;
         if (key.primary and key.code == .v) {
             const clipboard = paletteComposerGetClipboard(self, self.allocator) orelse return true;
@@ -6276,7 +6290,7 @@ pub const AppState = struct {
     }
 
     pub fn routeCompanionComposerMouseButton(self: *AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
-        if (self.companion_controller.visibility != .sidecar_open) return false;
+        if (!self.isCompanionEnabled() or self.companion_controller.visibility != .sidecar_open) return false;
         const point: palette.draw.Vec2 = .{ .x = x, .y = y };
         if (down and clicks >= 2 and self.companion_composer.textRect().contains(point)) {
             _ = self.companion_composer.handleInput(self.allocator, .{ .mouse_down = point }) catch return false;
@@ -6299,14 +6313,14 @@ pub const AppState = struct {
     }
 
     pub fn routeCompanionComposerMouseMotion(self: *AppState, x: f32, y: f32, dragging: bool) bool {
-        if (self.companion_controller.visibility != .sidecar_open) return false;
+        if (!self.isCompanionEnabled() or self.companion_controller.visibility != .sidecar_open) return false;
         const point: palette.draw.Vec2 = .{ .x = x, .y = y };
         const input: palette.ComposerPromptInput = if (dragging) .{ .mouse_drag = point } else .{ .mouse_move = point };
         return self.companion_composer.handleInput(self.allocator, input) catch false;
     }
 
     pub fn routeCompanionComposerWheel(self: *AppState, x: f32, y: f32, wheel_y: f32) bool {
-        if (self.companion_controller.visibility != .sidecar_open) return false;
+        if (!self.isCompanionEnabled() or self.companion_controller.visibility != .sidecar_open) return false;
         return self.companion_composer.handleInput(self.allocator, .{
             .mouse_wheel = .{ .point = .{ .x = x, .y = y }, .y = wheel_y },
         }) catch false;
@@ -6345,10 +6359,12 @@ pub const AppState = struct {
     }
 
     pub fn openCompanion(self: *AppState) void {
+        if (!self.isCompanionEnabled()) return;
         self.companion_controller.show();
     }
 
     pub fn toggleCompanion(self: *AppState) void {
+        if (!self.isCompanionEnabled()) return;
         if (self.companion_controller.visibility == .collapsed_chip) {
             self.openCompanion();
             return;
@@ -9418,6 +9434,7 @@ test "opening Companion is lazy and leaves workspace ownership and persistence u
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
     state.allocator = allocator;
+    state.app_config = .{ .companion_enabled = true };
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
     state.companion_controller = companion_controller.init();

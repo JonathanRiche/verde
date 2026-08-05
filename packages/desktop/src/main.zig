@@ -878,6 +878,7 @@ test "production Companion cursor and wheel routing preserves direct ownership" 
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
     state.allocator = allocator;
+    state.app_config = .{ .companion_enabled = true };
     state.companion_controller = companion_controller.init();
     state.companion_controller.show();
     state.companion_composer = native_state.CompanionComposerPrompt.init();
@@ -1499,7 +1500,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (state.companion_controller.mission_control_open) {
+            if (state.isCompanionEnabled() and state.companion_controller.mission_control_open) {
                 // True Palette modals remain above Mission Control. Otherwise
                 // the full-window overlay owns keys before pane/browser input.
                 if (ui_layout.handlePaletteKeyDown(state, &event.key)) {
@@ -1518,7 +1519,8 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
-            const action = keyboard.actionForEvent(&event.key);
+            const raw_action = keyboard.actionForEvent(&event.key);
+            const action = if (raw_action == .companion and !state.isCompanionEnabled()) null else raw_action;
             // True modals own keys before the persistent Companion, while the
             // Companion visibility controls remain global across pane focus.
             if (ui_layout.handlePaletteKeyDown(state, &event.key)) {
@@ -1718,7 +1720,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (state.companion_controller.mission_control_open) {
+            if (state.isCompanionEnabled() and state.companion_controller.mission_control_open) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -1742,7 +1744,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (state.companion_controller.mission_control_open) {
+            if (state.isCompanionEnabled() and state.companion_controller.mission_control_open) {
                 if (state.companion_composer.focused) _ = state.routeCompanionComposerTextInput(text_input);
                 syncWindowTextInput(window, state);
                 return true;
@@ -2094,7 +2096,7 @@ fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
     }
     const needs_sdl_text_input = state.terminal_controller.focused or
         state.composer_controller.composer.focused or
-        state.companion_composer.focused or
+        (state.isCompanionEnabled() and state.companion_composer.focused) or
         // The model picker's embedded search field consumes typed characters
         // while the popover is open.
         state.composer_controller.model_picker.isOpen() or
@@ -2822,6 +2824,7 @@ test {
     _ = @import("browser/screenshot.zig");
     _ = @import("ipc/server.zig");
     _ = @import("platform/mod.zig");
+    _ = @import("state/browser_controller.zig");
     _ = @import("providers/claude.zig");
     _ = @import("providers/diagnostics.zig");
     _ = @import("providers/opencode.zig");

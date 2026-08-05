@@ -49,6 +49,7 @@ pub const Control = enum(u8) {
     links_verde_browser,
     links_system_browser,
     browser_fast_scrolling,
+    companion_toggle,
     mcp_tools,
     hooks_claude,
     hooks_codex,
@@ -160,6 +161,9 @@ const SettingsLayout = struct {
     browser_card: palette.Rect,
     browser_fast_scrolling: palette.Rect,
     browser_hint_y: f32,
+    experimental_card: palette.Rect,
+    companion_toggle: palette.Rect,
+    companion_hint_y: f32,
     workspace_card: palette.Rect,
     open_cells: [OPEN_CHOICES.len]palette.Rect,
     custom_open: ?palette.Rect = null,
@@ -313,6 +317,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const chat_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h + m.row_gap + m.label_h + m.inner_gap + m.row_h;
     const browser_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
+    const experimental_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h;
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra +
         m.row_gap + m.label_h + m.inner_gap + m.row_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h +
@@ -334,7 +339,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     // (preview or expanded), and the show-more / release-page links row.
     const updates_h = m.card_pad * 2.0 + m.title_h + m.inner_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + updates_notes_h + m.inner_gap + m.label_h;
 
-    const body_h = appearance_h + m.card_gap + transcript_h + m.card_gap + chat_h + m.card_gap + terminal_h + m.card_gap + browser_h + m.card_gap + workspace_h + m.card_gap + integrations_h + m.card_gap + updates_h + m.card_gap + notifications_h;
+    const body_h = appearance_h + m.card_gap + transcript_h + m.card_gap + chat_h + m.card_gap + terminal_h + m.card_gap + browser_h + m.card_gap + experimental_h + m.card_gap + workspace_h + m.card_gap + integrations_h + m.card_gap + updates_h + m.card_gap + notifications_h;
     const modal_h = m.header_h + m.modal_pad + body_h + m.modal_pad + m.footer_h;
     const modal = layoutModal(width, height, modal_h);
 
@@ -451,6 +456,13 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const browser_hint_y = browser_fast_scrolling_y + m.row_h + m.inner_gap;
 
     y += browser_h + m.card_gap;
+
+    const experimental_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = experimental_h };
+    const companion_toggle_y = experimental_card.y + m.card_pad + m.title_h + m.row_gap;
+    const companion_toggle: palette.Rect = .{ .x = experimental_card.x + m.card_pad, .y = companion_toggle_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
+    const companion_hint_y = companion_toggle_y + m.row_h + m.inner_gap;
+
+    y += experimental_h + m.card_gap;
 
     const workspace_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = workspace_h };
     const open_y = workspace_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
@@ -604,6 +616,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .browser_card = browser_card,
         .browser_fast_scrolling = browser_fast_scrolling,
         .browser_hint_y = browser_hint_y,
+        .experimental_card = experimental_card,
+        .companion_toggle = companion_toggle,
+        .companion_hint_y = companion_hint_y,
         .workspace_card = workspace_card,
         .open_cells = open_cells,
         .custom_open = custom_open,
@@ -849,6 +864,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.links_verde_browser, layout.body_clip, .links_verde_browser, queue_hit);
     queueControlHit(state, layout.links_system_browser, layout.body_clip, .links_system_browser, queue_hit);
     queueControlHit(state, layout.browser_fast_scrolling, layout.body_clip, .browser_fast_scrolling, queue_hit);
+    queueControlHit(state, layout.companion_toggle, layout.body_clip, .companion_toggle, queue_hit);
     for (OPEN_CHOICES, 0..) |choice, index| {
         queueControlHit(state, layout.open_cells[index], layout.body_clip, choice.control, queue_hit);
     }
@@ -913,6 +929,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     drawCard(state, layout.chat_card, layout.body_clip);
     drawCard(state, layout.terminal_card, layout.body_clip);
     drawCard(state, layout.browser_card, layout.body_clip);
+    drawCard(state, layout.experimental_card, layout.body_clip);
     drawCard(state, layout.workspace_card, layout.body_clip);
     drawCard(state, layout.integrations_card, layout.body_clip);
     drawCard(state, layout.updates_card, layout.body_clip);
@@ -1000,6 +1017,16 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .w = layout.browser_card.w - m.card_pad * 2.0,
         .h = m.label_h,
     }, "Turn off to use Verde's standard embedded-browser speed", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+
+    // Experimental features
+    drawCardTitle(state, layout.experimental_card, "Experimental features", layout.body_clip);
+    drawCompanionExperimentalRow(state, layout.companion_toggle, state.settings_controller.draft.companion_enabled, isControlHovered(state, .companion_toggle), layout.body_clip);
+    queueText(state, .{
+        .x = layout.experimental_card.x + m.card_pad,
+        .y = layout.companion_hint_y,
+        .w = layout.experimental_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, "Enables the Companion sidecar and Mission Control", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
 
     // Workspace
     drawCardTitle(state, layout.workspace_card, "Workspace", layout.body_clip);
@@ -1460,6 +1487,7 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .links_verde_browser => state.settings_controller.draft.link_open_target = .verde_browser,
         .links_system_browser => state.settings_controller.draft.link_open_target = .system_browser,
         .browser_fast_scrolling => state.settings_controller.draft.browser_fast_scrolling_enabled = !state.settings_controller.draft.browser_fast_scrolling_enabled,
+        .companion_toggle => state.settings_controller.draft.companion_enabled = !state.settings_controller.draft.companion_enabled,
         // Acts immediately (filesystem side effect), independent of Save/Cancel.
         .mcp_tools => {
             state.toggleGlobalMcpIntegration();
@@ -2134,6 +2162,26 @@ fn drawSwitchRow(state: *runtime.AppState, rect: palette.Rect, label: []const u8
     queueRoundedRectClipped(state, .{ .x = knob_x, .y = track.y + knob_pad, .w = knob, .h = knob }, paletteColor(knob_color), knob * 0.5, clip);
 }
 
+// Experimental Companion row with semantic active-theme badge copy.
+fn drawCompanionExperimentalRow(state: *runtime.AppState, rect: palette.Rect, on: bool, hovered: bool, clip: palette.Rect) void {
+    drawSwitchRow(state, rect, "Companion", on, hovered, clip);
+    const label_font_size = theme.scaledUi(13.0);
+    const badge_font_size = theme.scaledUi(10.5);
+    const badge_h = theme.scaledUi(19.0);
+    const badge_pad_x = theme.scaledUi(7.0);
+    const label_w = text_measure.textWidth(.ui, label_font_size, "Companion");
+    const badge_text_w = text_measure.textWidth(.ui, badge_font_size, "Experimental");
+    const badge: palette.Rect = .{
+        .x = rect.x + theme.scaledUi(10.0) + label_w + theme.scaledUi(9.0),
+        .y = rect.y + (rect.h - badge_h) * 0.5,
+        .w = badge_text_w + badge_pad_x * 2.0,
+        .h = badge_h,
+    };
+    queueRoundedRectClipped(state, badge, paletteColor(theme.withAlpha(theme.accent(), 34)), badge_h * 0.5, clip);
+    queueBorderClipped(state, badge, paletteColor(theme.withAlpha(theme.accent(), 130)), badge_h * 0.5, theme.scaledUi(1.0), clip);
+    queueCenteredText(state, badge, "Experimental", paletteColor(theme.accent()), badge_font_size, clip);
+}
+
 // Two-option exclusive choice rendered as one segmented control.
 fn drawSegmentedPair(
     state: *runtime.AppState,
@@ -2599,4 +2647,62 @@ test "companion character option order is Sprout Moss Vireo" {
     try std.testing.expectEqual(app_config.CompanionCharacter.sprout, COMPANION_CHARACTER_OPTIONS[0]);
     try std.testing.expectEqual(app_config.CompanionCharacter.moss, COMPANION_CHARACTER_OPTIONS[1]);
     try std.testing.expectEqual(app_config.CompanionCharacter.vireo, COMPANION_CHARACTER_OPTIONS[2]);
+}
+
+test "Companion experimental setting renders one themed immutable toggle row" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.0);
+
+    var state = testSettingsState(allocator);
+    defer deinitTestSettingsState(&state, allocator);
+
+    const width: f32 = 1200.0;
+    const height: f32 = 900.0;
+    const initial_layout = computeLayout(&state, width, height);
+    state.settings_controller.scroll_y = theme.clampf(
+        initial_layout.companion_toggle.y - initial_layout.body_clip.y - theme.scaledUi(48.0),
+        0.0,
+        initial_layout.max_scroll_y,
+    );
+    const layout = computeLayout(&state, width, height);
+    try std.testing.expect(layout.companion_toggle.w > 0.0);
+    try std.testing.expect(layout.companion_toggle.y > layout.browser_card.y + layout.browser_card.h);
+    try std.testing.expect(!state.settings_controller.draft.companion_enabled);
+
+    registerHits(&state, width, height, captureSettingsHit);
+    var companion_hit_count: usize = 0;
+    for (state.palette_modal_hits.items) |hit| {
+        if (hit.action == .settings_control and hit.index == @intFromEnum(Control.companion_toggle)) {
+            companion_hit_count += 1;
+            try std.testing.expect(rectContains(hit.rect, layout.companion_toggle.x + 1.0, layout.companion_toggle.y + 1.0));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), companion_hit_count);
+
+    applyControl(&state, @intFromEnum(Control.companion_toggle));
+    try std.testing.expect(state.settings_controller.draft.companion_enabled);
+    try std.testing.expect(state.isSettingsDraftDirty());
+    applyControl(&state, @intFromEnum(Control.companion_toggle));
+    try std.testing.expect(!state.settings_controller.draft.companion_enabled);
+    try std.testing.expect(!state.isSettingsDraftDirty());
+
+    state.palette_overlay_batch.clear();
+    _ = state.palette_frame_text_arena.reset(.retain_capacity);
+    render(&state, width, height);
+    var saw_companion = false;
+    var saw_badge = false;
+    var saw_copy = false;
+    for (state.palette_overlay_batch.commands.items) |command| {
+        if (command.kind != .text) continue;
+        if (std.mem.eql(u8, command.text, "Companion")) saw_companion = true;
+        if (std.mem.eql(u8, command.text, "Experimental")) {
+            saw_badge = true;
+            try std.testing.expectEqual(paletteColor(theme.accent()), command.color);
+        }
+        if (std.mem.eql(u8, command.text, "Enables the Companion sidecar and Mission Control")) saw_copy = true;
+    }
+    try std.testing.expect(saw_companion);
+    try std.testing.expect(saw_badge);
+    try std.testing.expect(saw_copy);
 }
