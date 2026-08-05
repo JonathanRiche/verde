@@ -139,7 +139,11 @@ pub const WorkspaceLayout = struct {
     /// restart without requiring a database schema change.
     scroll_mode_override: ?app_config.WorkspaceScrollMode = null,
     scroll_threshold_override: ?u8 = null,
+    /// The absolute extent remains for backwards compatibility and for the
+    /// resize affordance's custom-width state. New resizes also persist a
+    /// viewport-relative stride ratio so the layout follows display-size changes.
     scroll_pane_extent_override: ?f32 = null,
+    scroll_pane_extent_ratio_override: ?f32 = null,
 
     pub fn initDefaultChat(allocator: std.mem.Allocator) !WorkspaceLayout {
         var layout: WorkspaceLayout = .{};
@@ -772,6 +776,10 @@ pub const WorkspaceLayout = struct {
         if (self.scroll_pane_extent_override) |pane_extent| {
             try stringify.objectField("scroll_pane_extent");
             try stringify.write(pane_extent);
+            if (self.scroll_pane_extent_ratio_override) |pane_extent_ratio| {
+                try stringify.objectField("scroll_pane_extent_ratio");
+                try stringify.write(pane_extent_ratio);
+            }
         }
         try stringify.objectField("quick");
         if (self.quick_pane) |quick| {
@@ -904,6 +912,9 @@ pub const WorkspaceLayout = struct {
         if (jsonFloat(root_value.object.get("scroll_pane_extent") orelse .null)) |pane_extent| {
             if (pane_extent >= MIN_SCROLL_PANE_EXTENT_CSS and pane_extent <= MAX_SCROLL_PANE_EXTENT_CSS) {
                 next_layout.scroll_pane_extent_override = pane_extent;
+                if (jsonFloat(root_value.object.get("scroll_pane_extent_ratio") orelse .null)) |pane_extent_ratio| {
+                    if (pane_extent_ratio > 0.0) next_layout.scroll_pane_extent_ratio_override = pane_extent_ratio;
+                }
             }
         }
         if (root_value.object.get("quick")) |quick_value| {
@@ -1574,6 +1585,7 @@ test "workspace layout persists scrolling policy overrides" {
     layout.scroll_mode_override = .always;
     layout.scroll_threshold_override = 8;
     layout.scroll_pane_extent_override = 720.0;
+    layout.scroll_pane_extent_ratio_override = 0.45;
 
     const persisted = try layout.persistedWorkspaceJson(allocator);
     defer allocator.free(persisted);
@@ -1585,6 +1597,7 @@ test "workspace layout persists scrolling policy overrides" {
     try std.testing.expectEqual(app_config.WorkspaceScrollMode.always, restored.effectiveScrollMode(.automatic));
     try std.testing.expectEqual(@as(u8, 8), restored.effectiveScrollThreshold(2));
     try std.testing.expectApproxEqAbs(@as(f32, 720.0), restored.scroll_pane_extent_override.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.45), restored.scroll_pane_extent_ratio_override.?, 0.0001);
 }
 
 test "workspace layout ignores invalid scrolling policy overrides" {
@@ -1592,7 +1605,7 @@ test "workspace layout ignores invalid scrolling policy overrides" {
     var layout = try WorkspaceLayout.initDefaultChat(allocator);
     defer layout.deinit(allocator);
     const persisted =
-        \\{"v":2,"next":2,"focused":1,"maximized":null,"scroll_mode":"sometimes","scroll_threshold":0,"scroll_pane_extent":20,
+        \\{"v":2,"next":2,"focused":1,"maximized":null,"scroll_mode":"sometimes","scroll_threshold":0,"scroll_pane_extent":20,"scroll_pane_extent_ratio":0,
         \\"panes":[{"id":1,"kind":"chat","thread":0}],"root":{"leaf":1}}
     ;
     try layout.applyPersistedWorkspaceJson(allocator, persisted);
@@ -1601,6 +1614,7 @@ test "workspace layout ignores invalid scrolling policy overrides" {
     try std.testing.expectEqual(app_config.WorkspaceScrollMode.disabled, layout.effectiveScrollMode(.disabled));
     try std.testing.expectEqual(@as(u8, 4), layout.effectiveScrollThreshold(4));
     try std.testing.expectEqual(@as(?f32, null), layout.scroll_pane_extent_override);
+    try std.testing.expectEqual(@as(?f32, null), layout.scroll_pane_extent_ratio_override);
 }
 
 test "closing a maximized pane transfers zoom in sidebar order" {

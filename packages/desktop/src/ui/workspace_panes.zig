@@ -1192,10 +1192,14 @@ fn renderScrollingStrip(
 
     const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
     const viewport_extent = if (vertical) workspace.h else workspace.w;
-    const pane_extent = if (layout.scroll_pane_extent_override) |override_css|
-        theme.scaledUi(theme.clampf(override_css, workspace_layout.MIN_SCROLL_PANE_EXTENT_CSS, workspace_layout.MAX_SCROLL_PANE_EXTENT_CSS))
-    else
-        scrollingPaneExtent(viewport_extent, gap, state.app_config.workspace_panes_per_view);
+    const pane_extent = responsiveScrollingPaneExtent(
+        viewport_extent,
+        gap,
+        state.app_config.workspace_panes_per_view,
+        layout.scroll_pane_extent_override,
+        layout.scroll_pane_extent_ratio_override,
+        theme.uiScaleFactor(),
+    );
     const pane_count = layout.visiblePaneCount();
     const max_offset = scrollingMaxOffset(viewport_extent, pane_extent, gap, pane_count);
     const offset: *f32 = if (vertical) &layout.scroll_offset_y else &layout.scroll_offset_x;
@@ -1429,6 +1433,29 @@ fn scrollingPaneExtent(viewport_extent: f32, gap: f32, panes_per_view: u8) f32 {
     return @max((viewport_extent - gap * (count - 1.0)) / count, 1.0);
 }
 
+fn responsiveScrollingPaneExtent(
+    viewport_extent: f32,
+    gap: f32,
+    panes_per_view: u8,
+    override_css: ?f32,
+    override_ratio: ?f32,
+    ui_scale: f32,
+) f32 {
+    const default_extent = scrollingPaneExtent(viewport_extent, gap, panes_per_view);
+    const custom_css = override_css orelse return default_extent;
+    const scale = @max(ui_scale, 0.001);
+    const minimum = workspace_layout.MIN_SCROLL_PANE_EXTENT_CSS * scale;
+    const maximum = workspace_layout.MAX_SCROLL_PANE_EXTENT_CSS * scale;
+    if (override_ratio) |ratio| {
+        return theme.clampf((viewport_extent + gap) * ratio - gap, minimum, maximum);
+    }
+
+    // Widths saved before viewport-relative persistence must not strand a
+    // laptop at a lower density than its configured panes-per-view value.
+    const legacy_extent = theme.clampf(custom_css * scale, minimum, maximum);
+    return @min(legacy_extent, default_extent);
+}
+
 fn scrollingMaxOffset(viewport_extent: f32, pane_extent: f32, gap: f32, pane_count: usize) f32 {
     if (pane_count == 0) return 0.0;
     const count: f32 = @floatFromInt(pane_count);
@@ -1443,6 +1470,10 @@ fn scrollingPaneExtentFromDrag(position: f32, scroll_offset: f32, gap: f32, pane
     const preceding_gaps = gap * @as(f32, @floatFromInt(pane_index));
     const pane_extent = (position + scroll_offset - preceding_gaps) / pane_number;
     return pane_extent / @max(ui_scale, 0.001);
+}
+
+fn scrollingPaneExtentRatio(pane_extent: f32, viewport_extent: f32, gap: f32) f32 {
+    return (pane_extent + gap) / @max(viewport_extent + gap, 1.0);
 }
 
 fn revealedScrollTarget(current: f32, viewport_w: f32, column_w: f32, gap: f32, pane_index: usize, max_offset: f32) f32 {
@@ -1605,6 +1636,12 @@ fn updateResizeDrag(state: *runtime.AppState, hit: WorkspacePaneHit, x: f32, y: 
             pane_extent_css,
             workspace_layout.MIN_SCROLL_PANE_EXTENT_CSS,
             workspace_layout.MAX_SCROLL_PANE_EXTENT_CSS,
+        );
+        const viewport_extent = if (hit.axis == .vertical) hit.split_rect.w else hit.split_rect.h;
+        layout.scroll_pane_extent_ratio_override = scrollingPaneExtentRatio(
+            layout.scroll_pane_extent_override.? * theme.uiScaleFactor(),
+            viewport_extent,
+            theme.scaledUi(state.app_config.workspace_pane_gap),
         );
         state.markDirty();
         return;
@@ -2094,6 +2131,26 @@ test "scrolling pane extent fits the configured panes per view" {
             try std.testing.expectApproxEqAbs(viewport_extent, pane_extent * count_f + gap * (count_f - 1.0), 0.001);
         }
     }
+}
+
+test "custom scrolling pane extent follows viewport changes" {
+    const gap: f32 = 12.0;
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 994.0),
+        responsiveScrollingPaneExtent(2000.0, gap, 2, 1200.0, null, 1.0),
+        0.0001,
+    );
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 994.0),
+        responsiveScrollingPaneExtent(2000.0, gap, 2, 994.0, 0.5, 1.0),
+        0.0001,
+    );
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 494.0),
+        responsiveScrollingPaneExtent(1000.0, gap, 2, 994.0, 0.5, 1.0),
+        0.0001,
+    );
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), scrollingPaneExtentRatio(994.0, 2000.0, gap), 0.0001);
 }
 
 test "scrolling range keeps the final pane available at the leading edge" {
