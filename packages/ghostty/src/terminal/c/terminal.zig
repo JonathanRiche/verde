@@ -265,6 +265,7 @@ fn new_(
     handler.effects = .{
         .write_pty = &Effects.writePtyTrampoline,
         .bell = &Effects.bellTrampoline,
+        .clipboard = null,
         .color_scheme = &Effects.colorSchemeTrampoline,
         .device_attributes = &Effects.deviceAttributesTrampoline,
         .enquiry = &Effects.enquiryTrampoline,

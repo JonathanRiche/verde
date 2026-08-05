@@ -193,6 +193,16 @@ fn decodeTerminalPng(allocator: std.mem.Allocator, bytes: []const u8) ghostty_vt
         .data = try allocator.dupe(u8, loaded.pixels[0..byte_len]),
     };
 }
+
+fn decodeOsc52ClipboardAlloc(allocator: std.mem.Allocator, encoded: []const u8) ![:0]u8 {
+    const decoder = std.base64.standard.Decoder;
+    const decoded_len = try decoder.calcSizeForSlice(encoded);
+    const decoded = try allocator.allocSentinel(u8, decoded_len, 0);
+    errdefer allocator.free(decoded);
+    try decoder.decode(decoded, encoded);
+    return decoded;
+}
+
 // Consecutive tail failures tolerated before declaring the daemon gone.
 // ~2 seconds at display rate; see daemon_poll_failures for why one miss
 // must not trigger a revive.
@@ -2669,6 +2679,7 @@ const UnixSession = struct {
             };
             self.stream = self.terminal.vtStream();
             self.stream.handler.effects.write_pty = &UnixSession.streamWritePty;
+            self.stream.handler.effects.clipboard = &UnixSession.streamClipboard;
             self.stream.handler.effects.device_attributes = &UnixSession.streamDeviceAttributes;
             self.stream.handler.effects.size = &UnixSession.streamSize;
             self.stream.handler.effects.xtversion = &UnixSession.streamXtVersion;
@@ -2712,6 +2723,7 @@ const UnixSession = struct {
         };
         self.stream = self.terminal.vtStream();
         self.stream.handler.effects.write_pty = &UnixSession.streamWritePty;
+        self.stream.handler.effects.clipboard = &UnixSession.streamClipboard;
         self.stream.handler.effects.device_attributes = &UnixSession.streamDeviceAttributes;
         self.stream.handler.effects.size = &UnixSession.streamSize;
         self.stream.handler.effects.xtversion = &UnixSession.streamXtVersion;
@@ -3952,6 +3964,19 @@ const UnixSession = struct {
         if (session.suppress_pty_responses) return;
         _ = session.writeRawInput(std.mem.sliceTo(data, 0)) catch |err| {
             log.warn("failed to write terminal response to PTY: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn streamClipboard(handler: *TerminalHandler, _: u8, data: []const u8) void {
+        if (std.mem.eql(u8, data, "?")) return;
+        const allocator = handler.terminal.gpa();
+        const clipboard_text = decodeOsc52ClipboardAlloc(allocator, data) catch |err| {
+            log.warn("ignored invalid OSC 52 clipboard payload: {s}", .{@errorName(err)});
+            return;
+        };
+        defer allocator.free(clipboard_text);
+        sdl.setClipboardText(clipboard_text) catch |err| {
+            log.warn("failed to set OSC 52 clipboard text: {s}", .{@errorName(err)});
         };
     }
 
@@ -5238,6 +5263,17 @@ fn freeCommand(allocator: std.mem.Allocator, command: [][:0]u8) void {
 
 fn clampf(value: f32, min_value: f32, max_value: f32) f32 {
     return @max(min_value, @min(value, max_value));
+}
+
+test "OSC 52 clipboard decoder accepts UTF-8 text and rejects invalid base64" {
+    const decoded = try decodeOsc52ClipboardAlloc(std.testing.allocator, "c2VsZWN0ZWQgdGV4dCDinJM=");
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("selected text ✓", decoded);
+
+    try std.testing.expectError(
+        error.InvalidCharacter,
+        decodeOsc52ClipboardAlloc(std.testing.allocator, "!!!!"),
+    );
 }
 
 test "terminal key chords validate the allowlisted vocabulary" {
