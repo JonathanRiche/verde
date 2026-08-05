@@ -616,6 +616,11 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                     state.settings_controller.theme_hover_index = null;
                     state.markDirty();
                 }
+                if (state.settings_controller.companion_character_dropdown_open) {
+                    state.settings_controller.companion_character_dropdown_open = false;
+                    state.settings_controller.companion_character_hover_index = null;
+                    state.markDirty();
+                }
                 if (state.settings_controller.title_provider_dropdown_open or state.settings_controller.title_model_dropdown_open) {
                     state.settings_controller.title_provider_dropdown_open = false;
                     state.settings_controller.title_model_dropdown_open = false;

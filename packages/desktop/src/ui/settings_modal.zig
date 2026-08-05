@@ -29,6 +29,7 @@ pub const Control = enum(u8) {
     workspace_scroll_horizontal,
     workspace_scroll_vertical,
     theme_dropdown,
+    companion_character_dropdown,
     tool_groups_collapsed,
     tool_groups_expanded,
     tool_groups_remember_last,
@@ -77,6 +78,8 @@ const OPEN_CHOICES = [_]OpenChoice{
 
 const THEME_MENU_MAX_ROWS: usize = 6;
 const TITLE_MENU_MAX_ROWS: usize = 6;
+const COMPANION_CHARACTER_OPTIONS = [_]app_config.CompanionCharacter{ .sprout, .moss, .vireo };
+const COMPANION_CHARACTER_LABELS = [_][]const u8{ "Sprout", "Moss", "Vireo" };
 const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
 const NF_COD_CHEVRON_UP = "\u{EAB7}";
 
@@ -133,6 +136,8 @@ const SettingsLayout = struct {
     save: palette.Rect,
     appearance_card: palette.Rect,
     theme_dropdown: palette.Rect,
+    companion_character_label_y: f32,
+    companion_character_dropdown: palette.Rect,
     ui_font_dec: palette.Rect,
     ui_font_inc: palette.Rect,
     transcript_card: palette.Rect,
@@ -297,7 +302,11 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const open_grid_h = @as(f32, @floatFromInt(open_rows)) * m.row_h + @as(f32, @floatFromInt(open_rows - 1)) * m.inner_gap;
     const custom_extra: f32 = if (state.settings_controller.draft.open_action == .custom) m.row_h + m.inner_gap else 0.0;
 
-    const appearance_h = m.labeledBlockH(2);
+    // Theme dropdown, Default companion dropdown, then UI font stepper.
+    const appearance_h = m.card_pad * 2.0 + m.title_h + m.row_gap +
+        m.label_h + m.inner_gap + m.row_h + m.row_gap +
+        m.label_h + m.inner_gap + m.row_h + m.row_gap +
+        m.row_h;
     const transcript_h = m.card_pad * 2.0 + m.title_h + m.row_gap +
         m.label_h + m.inner_gap + m.row_h + m.row_gap +
         m.label_h + m.inner_gap + m.row_h;
@@ -374,7 +383,15 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const theme_row_y = appearance_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
     const theme_x = appearance_card.x + m.card_pad;
     const theme_dropdown: palette.Rect = .{ .x = theme_x, .y = theme_row_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
-    const ui_font_y = theme_row_y + m.row_h + m.row_gap;
+    const companion_character_label_y = theme_row_y + m.row_h + m.row_gap;
+    const companion_row_y = companion_character_label_y + m.label_h + m.inner_gap;
+    const companion_character_dropdown: palette.Rect = .{
+        .x = theme_x,
+        .y = companion_row_y,
+        .w = content_w - m.card_pad * 2.0,
+        .h = m.row_h,
+    };
+    const ui_font_y = companion_row_y + m.row_h + m.row_gap;
     const ui_stepper = stepperRects(appearance_card, m.card_pad, ui_font_y, m);
 
     y += appearance_h + m.card_gap;
@@ -563,6 +580,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .save = save,
         .appearance_card = appearance_card,
         .theme_dropdown = theme_dropdown,
+        .companion_character_label_y = companion_character_label_y,
+        .companion_character_dropdown = companion_character_dropdown,
         .ui_font_dec = ui_stepper.dec,
         .ui_font_inc = ui_stepper.inc,
         .transcript_card = transcript_card,
@@ -689,6 +708,30 @@ fn themeOptionRect(state: *const runtime.AppState, layout: SettingsLayout, visib
     };
 }
 
+fn companionCharacterCount() usize {
+    return COMPANION_CHARACTER_OPTIONS.len;
+}
+
+fn companionCharacterLabel(choice_index: usize) []const u8 {
+    if (choice_index >= COMPANION_CHARACTER_LABELS.len) return "Unknown companion";
+    return COMPANION_CHARACTER_LABELS[choice_index];
+}
+
+fn companionCharacterIndex(character: app_config.CompanionCharacter) usize {
+    inline for (COMPANION_CHARACTER_OPTIONS, 0..) |option, index| {
+        if (option == character) return index;
+    }
+    return 0;
+}
+
+fn companionCharacterMenuRect(layout: SettingsLayout) palette.Rect {
+    return dropdownMenuRect(layout.companion_character_dropdown, companionCharacterCount());
+}
+
+fn companionCharacterOptionRect(layout: SettingsLayout, choice_index: usize) palette.Rect {
+    return dropdownOptionRect(companionCharacterMenuRect(layout), choice_index);
+}
+
 fn registerThemeOptionHits(
     state: *runtime.AppState,
     layout: SettingsLayout,
@@ -699,6 +742,21 @@ fn registerThemeOptionHits(
     for (0..themeMenuVisibleCount(state)) |visible_index| {
         const rect = intersectRect(themeOptionRect(state, layout, visible_index), layout.body_clip) orelse continue;
         queue_hit(state, rect, .settings_theme_option, state.settings_controller.theme_menu_scroll + visible_index);
+    }
+}
+
+fn registerCompanionCharacterOptionHits(
+    state: *runtime.AppState,
+    layout: SettingsLayout,
+    queue_hit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void,
+) void {
+    if (!state.settings_controller.companion_character_dropdown_open) return;
+    // Fixed Sprout/Moss/Vireo list — reuse the theme option action channel with
+    // the choice index; applyThemeOption is only invoked when the theme menu
+    // is open, so companion selection routes through applyCompanionCharacterOption.
+    for (0..companionCharacterCount()) |choice_index| {
+        const rect = intersectRect(companionCharacterOptionRect(layout, choice_index), layout.body_clip) orelse continue;
+        queue_hit(state, rect, .settings_theme_option, choice_index);
     }
 }
 
@@ -775,6 +833,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queue_hit(state, layout.cancel, .settings_cancel, 0);
     queue_hit(state, layout.save, .settings_save, 0);
     queueControlHit(state, layout.theme_dropdown, layout.body_clip, .theme_dropdown, queue_hit);
+    queueControlHit(state, layout.companion_character_dropdown, layout.body_clip, .companion_character_dropdown, queue_hit);
     queueControlHit(state, layout.ui_font_dec, layout.body_clip, .ui_font_dec, queue_hit);
     queueControlHit(state, layout.ui_font_inc, layout.body_clip, .ui_font_inc, queue_hit);
     queueControlHit(state, layout.tool_groups_collapsed, layout.body_clip, .tool_groups_collapsed, queue_hit);
@@ -828,6 +887,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.updates_release_page, layout.body_clip, .updates_release_page, queue_hit);
     queueControlHit(state, layout.notifications_toggle, layout.body_clip, .notifications_toggle, queue_hit);
     registerThemeOptionHits(state, layout, queue_hit);
+    registerCompanionCharacterOptionHits(state, layout, queue_hit);
     registerTitleOptionHits(state, layout, queue_hit);
 }
 
@@ -862,6 +922,13 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     drawCardTitle(state, layout.appearance_card, "Appearance", layout.body_clip);
     drawFieldLabel(state, layout.appearance_card, m, "Theme", layout.body_clip);
     drawThemeDropdown(state, layout);
+    queueText(state, .{
+        .x = layout.appearance_card.x + m.card_pad,
+        .y = layout.companion_character_label_y,
+        .w = layout.appearance_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, "Default companion", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    drawCompanionCharacterDropdown(state, layout);
     drawStepperRow(state, layout.appearance_card, m, layout.ui_font_dec.y, "UI font size", state.settings_controller.draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE, .ui_font_dec, .ui_font_inc, layout.ui_font_dec, layout.ui_font_inc, layout.body_clip);
 
     // Transcript
@@ -1183,6 +1250,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
 
     drawBodyScrollbar(state, layout);
     drawThemeDropdownMenu(state, layout);
+    drawCompanionCharacterDropdownMenu(state, layout);
     drawChatTitleDropdownMenu(state, layout, true);
     drawChatTitleDropdownMenu(state, layout, false);
     drawFooterBar(state, layout, dirty);
@@ -1209,6 +1277,8 @@ pub fn handleWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y:
         }
         return true;
     }
+    // Fixed three-row companion menu: consume wheel so the body does not scroll under it.
+    if (state.settings_controller.companion_character_dropdown_open and rectContains(companionCharacterMenuRect(layout), x, y)) return true;
     if (state.settings_controller.title_provider_dropdown_open and rectContains(titleProviderMenuRect(state, layout), x, y)) return true;
     if (state.settings_controller.title_model_dropdown_open and rectContains(titleModelMenuRect(state, layout), x, y)) {
         const max_scroll = titleModelMenuMaxScroll(state);
@@ -1239,10 +1309,11 @@ pub fn handleWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y:
 /// Updates settings-modal hover using hits from `refreshPaletteModalHits`.
 pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
     if (!state.settings_controller.modal_visible) {
-        if (state.settings_controller.hover_control != null or state.settings_controller.close_hovered or state.settings_controller.theme_hover_index != null or state.settings_controller.title_menu_hover_index != null) {
+        if (state.settings_controller.hover_control != null or state.settings_controller.close_hovered or state.settings_controller.theme_hover_index != null or state.settings_controller.companion_character_hover_index != null or state.settings_controller.title_menu_hover_index != null) {
             state.settings_controller.hover_control = null;
             state.settings_controller.close_hovered = false;
             state.settings_controller.theme_hover_index = null;
+            state.settings_controller.companion_character_hover_index = null;
             state.settings_controller.title_menu_hover_index = null;
             state.markDirty();
         }
@@ -1251,6 +1322,7 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
 
     var new_hover: ?u8 = null;
     var theme_hover: ?usize = null;
+    var companion_hover: ?usize = null;
     var title_hover: ?usize = null;
     var close_hovered = false;
     var i = state.palette_modal_hits.items.len;
@@ -1262,7 +1334,11 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
             continue;
         }
         if (hit.action == .settings_theme_option and rectContains(hit.rect, x, y)) {
-            theme_hover = hit.index;
+            if (state.settings_controller.companion_character_dropdown_open) {
+                companion_hover = hit.index;
+            } else {
+                theme_hover = hit.index;
+            }
             break;
         }
         if ((hit.action == .settings_title_provider_option or hit.action == .settings_title_model_option) and rectContains(hit.rect, x, y)) {
@@ -1275,10 +1351,11 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
         break;
     }
 
-    if (state.settings_controller.hover_control == new_hover and state.settings_controller.close_hovered == close_hovered and state.settings_controller.theme_hover_index == theme_hover and state.settings_controller.title_menu_hover_index == title_hover) return;
+    if (state.settings_controller.hover_control == new_hover and state.settings_controller.close_hovered == close_hovered and state.settings_controller.theme_hover_index == theme_hover and state.settings_controller.companion_character_hover_index == companion_hover and state.settings_controller.title_menu_hover_index == title_hover) return;
     state.settings_controller.hover_control = new_hover;
     state.settings_controller.close_hovered = close_hovered;
     state.settings_controller.theme_hover_index = theme_hover;
+    state.settings_controller.companion_character_hover_index = companion_hover;
     state.settings_controller.title_menu_hover_index = title_hover;
     state.markDirty();
 }
@@ -1289,6 +1366,10 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
     if (control != .theme_dropdown) {
         state.settings_controller.theme_dropdown_open = false;
         state.settings_controller.theme_hover_index = null;
+    }
+    if (control != .companion_character_dropdown) {
+        state.settings_controller.companion_character_dropdown_open = false;
+        state.settings_controller.companion_character_hover_index = null;
     }
     if (control != .chat_title_provider_dropdown) state.settings_controller.title_provider_dropdown_open = false;
     if (control != .chat_title_model_dropdown) state.settings_controller.title_model_dropdown_open = false;
@@ -1326,10 +1407,22 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .theme_dropdown => {
             state.settings_controller.theme_dropdown_open = !state.settings_controller.theme_dropdown_open;
             if (state.settings_controller.theme_dropdown_open) {
+                state.settings_controller.companion_character_dropdown_open = false;
+                state.settings_controller.companion_character_hover_index = null;
                 state.settings_controller.theme_hover_index = state.settings_controller.draft.theme_choice;
                 ensureThemeChoiceVisible(state, state.settings_controller.draft.theme_choice);
             } else {
                 state.settings_controller.theme_hover_index = null;
+            }
+        },
+        .companion_character_dropdown => {
+            state.settings_controller.companion_character_dropdown_open = !state.settings_controller.companion_character_dropdown_open;
+            if (state.settings_controller.companion_character_dropdown_open) {
+                state.settings_controller.theme_dropdown_open = false;
+                state.settings_controller.theme_hover_index = null;
+                state.settings_controller.companion_character_hover_index = companionCharacterIndex(state.settings_controller.draft.companion_character);
+            } else {
+                state.settings_controller.companion_character_hover_index = null;
             }
         },
         .tool_groups_collapsed => state.settings_controller.draft.tool_call_group_preference = .collapsed,
@@ -1414,9 +1507,29 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
     state.markDirty();
 }
 
-/// Selects a built-in or installed theme from the open settings dropdown.
+/// Selects a built-in or installed theme, or a Default companion choice when that menu owns the hit channel.
 pub fn applyThemeOption(state: *runtime.AppState, choice_index: usize) void {
+    if (state.settings_controller.companion_character_dropdown_open) {
+        applyCompanionCharacterOption(state, choice_index);
+        return;
+    }
     state.selectSettingsThemeChoice(choice_index);
+}
+
+/// Selects the Default companion draft option; Save applies it to app_config.
+pub fn applyCompanionCharacterOption(state: *runtime.AppState, choice_index: usize) void {
+    if (choice_index >= companionCharacterCount()) return;
+    const character = COMPANION_CHARACTER_OPTIONS[choice_index];
+    if (character == state.settings_controller.draft.companion_character) {
+        state.settings_controller.companion_character_dropdown_open = false;
+        state.settings_controller.companion_character_hover_index = null;
+        state.markDirty();
+        return;
+    }
+    state.settings_controller.draft.companion_character = character;
+    state.settings_controller.companion_character_dropdown_open = false;
+    state.settings_controller.companion_character_hover_index = null;
+    state.markDirty();
 }
 
 pub fn applyChatTitleProviderOption(state: *runtime.AppState, option_index: usize) void {
@@ -1431,6 +1544,7 @@ pub fn applyChatTitleModelOption(state: *runtime.AppState, option_index: usize) 
 pub fn handleKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
     if (!state.settings_controller.modal_visible) return false;
     if (state.settings_controller.theme_dropdown_open) return handleThemeKeyDown(state, key);
+    if (state.settings_controller.companion_character_dropdown_open) return handleCompanionCharacterKeyDown(state, key);
     if (state.settings_controller.title_provider_dropdown_open) return handleTitleProviderKeyDown(state, key);
     if (state.settings_controller.title_model_dropdown_open) return handleTitleModelKeyDown(state, key);
     return false;
@@ -1459,6 +1573,32 @@ fn handleThemeKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
     };
     state.settings_controller.theme_hover_index = next;
     ensureThemeChoiceVisible(state, next);
+    state.markDirty();
+    return true;
+}
+
+fn handleCompanionCharacterKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
+    const count = companionCharacterCount();
+    if (count == 0) return false;
+    const current = state.settings_controller.companion_character_hover_index orelse companionCharacterIndex(state.settings_controller.draft.companion_character);
+    const next = switch (key) {
+        .up => current -| 1,
+        .down => @min(current + 1, count - 1),
+        .home => 0,
+        .end => count - 1,
+        .escape => {
+            state.settings_controller.companion_character_dropdown_open = false;
+            state.settings_controller.companion_character_hover_index = null;
+            state.markDirty();
+            return true;
+        },
+        .@"return", .kp_enter => {
+            applyCompanionCharacterOption(state, current);
+            return true;
+        },
+        else => return false,
+    };
+    state.settings_controller.companion_character_hover_index = next;
     state.markDirty();
     return true;
 }
@@ -1732,6 +1872,69 @@ fn drawThemeDropdown(state: *runtime.AppState, layout: SettingsLayout) void {
         .w = chevron_size,
         .h = chevron_size,
     }, if (state.settings_controller.theme_dropdown_open) NF_COD_CHEVRON_UP else NF_COD_CHEVRON_DOWN, paletteColor(textLabel()), chevron_size, layout.body_clip);
+}
+
+// Appearance Default companion selector control.
+fn drawCompanionCharacterDropdown(state: *runtime.AppState, layout: SettingsLayout) void {
+    const rect = layout.companion_character_dropdown;
+    const hovered = isControlHovered(state, .companion_character_dropdown);
+    const background = if (state.settings_controller.companion_character_dropdown_open)
+        theme.withAlpha(theme.accent(), 34)
+    else if (hovered)
+        controlHoverSurface()
+    else
+        controlSurface();
+    queueRoundedRectClipped(state, rect, paletteColor(background), radiusSm(), layout.body_clip);
+    queueBorderClipped(state, rect, paletteColor(if (state.settings_controller.companion_character_dropdown_open) theme.withAlpha(theme.accent(), 150) else theme.withAlpha(theme.COLOR_WHITE, 24)), radiusSm(), theme.scaledUi(1.0), layout.body_clip);
+
+    const selected = companionCharacterIndex(state.settings_controller.draft.companion_character);
+    queueText(state, .{
+        .x = rect.x + theme.scaledUi(10.0),
+        .y = rect.y + (rect.h - theme.scaledUi(15.0)) * 0.5,
+        .w = rect.w - theme.scaledUi(38.0),
+        .h = theme.scaledUi(15.0),
+    }, companionCharacterLabel(selected), paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), layout.body_clip);
+    const chevron_size = theme.scaledUi(14.0);
+    queueIconText(state, .{
+        .x = rect.x + rect.w - theme.scaledUi(18.0),
+        .y = rect.y + (rect.h - chevron_size) * 0.5,
+        .w = chevron_size,
+        .h = chevron_size,
+    }, if (state.settings_controller.companion_character_dropdown_open) NF_COD_CHEVRON_UP else NF_COD_CHEVRON_DOWN, paletteColor(textLabel()), chevron_size, layout.body_clip);
+}
+
+// Appearance Default companion selector popup rows.
+fn drawCompanionCharacterDropdownMenu(state: *runtime.AppState, layout: SettingsLayout) void {
+    if (!state.settings_controller.companion_character_dropdown_open) return;
+    const menu = companionCharacterMenuRect(layout);
+    queueRoundedRectClipped(state, menu, paletteColor(raisedSurface(0.14)), radiusSm(), layout.body_clip);
+    queueBorderClipped(state, menu, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 34)), radiusSm(), theme.scaledUi(1.0), layout.body_clip);
+
+    const selected = companionCharacterIndex(state.settings_controller.draft.companion_character);
+    for (0..companionCharacterCount()) |choice_index| {
+        const row = companionCharacterOptionRect(layout, choice_index);
+        const is_selected = choice_index == selected;
+        const hovered = state.settings_controller.companion_character_hover_index == choice_index;
+        if (is_selected or hovered) {
+            const fill = if (is_selected) theme.withAlpha(theme.accent(), 38) else controlHoverSurface();
+            queueRoundedRectClipped(state, row, paletteColor(fill), theme.scaledUi(4.0), layout.body_clip);
+        }
+
+        const dot_size = theme.scaledUi(6.0);
+        const dot_color = if (is_selected) theme.accent() else theme.withAlpha(theme.COLOR_TEXT_MUTED, 110);
+        queueRoundedRectClipped(state, .{
+            .x = row.x + theme.scaledUi(10.0),
+            .y = row.y + (row.h - dot_size) * 0.5,
+            .w = dot_size,
+            .h = dot_size,
+        }, paletteColor(dot_color), dot_size * 0.5, layout.body_clip);
+        queueText(state, .{
+            .x = row.x + theme.scaledUi(25.0),
+            .y = row.y + (row.h - theme.scaledUi(15.0)) * 0.5,
+            .w = row.w - theme.scaledUi(42.0),
+            .h = theme.scaledUi(15.0),
+        }, companionCharacterLabel(choice_index), paletteColor(if (is_selected or hovered) theme.COLOR_WHITE else textLabel()), theme.scaledUi(13.0), layout.body_clip);
+    }
 }
 
 // Appearance theme selector popup rows.
@@ -2249,4 +2452,151 @@ fn intersectRect(a: palette.Rect, b: palette.Rect) ?palette.Rect {
 
 fn paletteColor(value: [4]f32) palette.Color {
     return .{ .r = value[0], .g = value[1], .b = value[2], .a = value[3] * current_fade_alpha };
+}
+
+fn testSettingsState(allocator: std.mem.Allocator) runtime.AppState {
+    var state: runtime.AppState = undefined;
+    state.allocator = allocator;
+    state.app_config = .{};
+    state.settings_controller = .{};
+    state.project_controller = .{};
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.lifecycle = .{};
+    state.palette_modal_text_focus = .none;
+    state.palette_overlay_batch = .{};
+    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+    state.palette_modal_hits = .empty;
+    state.settings_controller.modal_visible = true;
+    state.settings_controller.modal_anim_progress = 1.0;
+    state.settings_controller.draft = .{};
+    state.settings_controller.draft.theme_choice = state.app_config.themeChoiceIndex();
+    state.settings_controller.draft.companion_character = state.app_config.companion_character;
+    return state;
+}
+
+fn deinitTestSettingsState(state: *runtime.AppState, allocator: std.mem.Allocator) void {
+    state.palette_overlay_batch.deinit(allocator);
+    state.palette_frame_text_arena.deinit();
+    state.palette_modal_hits.deinit(allocator);
+    state.app_config.deinit(allocator);
+}
+
+fn captureSettingsHit(
+    state: *runtime.AppState,
+    rect: palette.Rect,
+    action: runtime.PaletteModalAction,
+    index: usize,
+) void {
+    state.palette_modal_hits.append(state.allocator, .{
+        .rect = rect,
+        .action = action,
+        .index = index,
+    }) catch {};
+}
+
+test "default companion dropdown render hits keyboard draft save and cancel seams" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.0);
+
+    var state = testSettingsState(allocator);
+    defer deinitTestSettingsState(&state, allocator);
+
+    const width: f32 = 1200.0;
+    const height: f32 = 900.0;
+    const layout = computeLayout(&state, width, height);
+    try std.testing.expect(layout.companion_character_dropdown.w > 0.0);
+    try std.testing.expect(layout.companion_character_dropdown.h > 0.0);
+    try std.testing.expect(layout.companion_character_dropdown.y > layout.theme_dropdown.y);
+
+    state.palette_modal_hits.clearRetainingCapacity();
+    registerHits(&state, width, height, captureSettingsHit);
+    var saw_dropdown = false;
+    for (state.palette_modal_hits.items) |hit| {
+        if (hit.action == .settings_control and hit.index == @intFromEnum(Control.companion_character_dropdown)) {
+            saw_dropdown = true;
+            try std.testing.expect(rectContains(hit.rect, layout.companion_character_dropdown.x + 1.0, layout.companion_character_dropdown.y + 1.0));
+        }
+    }
+    try std.testing.expect(saw_dropdown);
+
+    applyControl(&state, @intFromEnum(Control.companion_character_dropdown));
+    try std.testing.expect(state.settings_controller.companion_character_dropdown_open);
+    try std.testing.expectEqual(@as(?usize, 0), state.settings_controller.companion_character_hover_index);
+
+    state.palette_modal_hits.clearRetainingCapacity();
+    registerHits(&state, width, height, captureSettingsHit);
+    var option_hits: usize = 0;
+    for (state.palette_modal_hits.items) |hit| {
+        if (hit.action == .settings_theme_option) option_hits += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), option_hits);
+
+    try std.testing.expect(handleKeyDown(&state, .down));
+    try std.testing.expectEqual(@as(?usize, 1), state.settings_controller.companion_character_hover_index);
+    try std.testing.expect(handleKeyDown(&state, .@"return"));
+    try std.testing.expectEqual(app_config.CompanionCharacter.moss, state.settings_controller.draft.companion_character);
+    try std.testing.expect(!state.settings_controller.companion_character_dropdown_open);
+    try std.testing.expectEqual(app_config.CompanionCharacter.sprout, state.app_config.companion_character);
+    try std.testing.expect(state.isSettingsDraftDirty());
+
+    // Save seam: apply draft companion character immediately like the committed save path.
+    state.app_config.companion_character = state.settings_controller.draft.companion_character;
+    try std.testing.expectEqual(app_config.CompanionCharacter.moss, state.app_config.companion_character);
+    try std.testing.expect(!state.isSettingsDraftDirty());
+
+    applyControl(&state, @intFromEnum(Control.companion_character_dropdown));
+    try std.testing.expect(handleKeyDown(&state, .down));
+    try std.testing.expect(handleKeyDown(&state, .down));
+    try std.testing.expect(handleKeyDown(&state, .@"return"));
+    try std.testing.expectEqual(app_config.CompanionCharacter.vireo, state.settings_controller.draft.companion_character);
+    try std.testing.expect(state.isSettingsDraftDirty());
+
+    // Cancel seam: discard draft back to the authoritative saved character.
+    state.settings_controller.draft.companion_character = state.app_config.companion_character;
+    state.settings_controller.companion_character_dropdown_open = false;
+    state.settings_controller.companion_character_hover_index = null;
+    try std.testing.expectEqual(app_config.CompanionCharacter.moss, state.settings_controller.draft.companion_character);
+    try std.testing.expect(!state.isSettingsDraftDirty());
+
+    applyControl(&state, @intFromEnum(Control.companion_character_dropdown));
+    try std.testing.expect(handleKeyDown(&state, .escape));
+    try std.testing.expect(!state.settings_controller.companion_character_dropdown_open);
+
+    state.palette_overlay_batch.clear();
+    _ = state.palette_frame_text_arena.reset(.retain_capacity);
+    state.settings_controller.draft.companion_character = .vireo;
+    state.settings_controller.companion_character_dropdown_open = true;
+    render(&state, width, height);
+    var saw_default_label = false;
+    var saw_vireo = false;
+    var saw_moss_option = false;
+    for (state.palette_overlay_batch.commands.items) |command| {
+        if (command.kind != .text) continue;
+        if (std.mem.eql(u8, command.text, "Default companion")) saw_default_label = true;
+        if (std.mem.eql(u8, command.text, "Vireo")) saw_vireo = true;
+        if (std.mem.eql(u8, command.text, "Moss")) saw_moss_option = true;
+    }
+    try std.testing.expect(saw_default_label);
+    try std.testing.expect(saw_vireo);
+    try std.testing.expect(saw_moss_option);
+
+    // Mutual exclusivity with Theme follows Theme conventions.
+    applyControl(&state, @intFromEnum(Control.theme_dropdown));
+    try std.testing.expect(state.settings_controller.theme_dropdown_open);
+    try std.testing.expect(!state.settings_controller.companion_character_dropdown_open);
+    applyControl(&state, @intFromEnum(Control.companion_character_dropdown));
+    try std.testing.expect(state.settings_controller.companion_character_dropdown_open);
+    try std.testing.expect(!state.settings_controller.theme_dropdown_open);
+}
+
+test "companion character option order is Sprout Moss Vireo" {
+    try std.testing.expectEqual(@as(usize, 3), companionCharacterCount());
+    try std.testing.expectEqualStrings("Sprout", companionCharacterLabel(0));
+    try std.testing.expectEqualStrings("Moss", companionCharacterLabel(1));
+    try std.testing.expectEqualStrings("Vireo", companionCharacterLabel(2));
+    try std.testing.expectEqual(app_config.CompanionCharacter.sprout, COMPANION_CHARACTER_OPTIONS[0]);
+    try std.testing.expectEqual(app_config.CompanionCharacter.moss, COMPANION_CHARACTER_OPTIONS[1]);
+    try std.testing.expectEqual(app_config.CompanionCharacter.vireo, COMPANION_CHARACTER_OPTIONS[2]);
 }
