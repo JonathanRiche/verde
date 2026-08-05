@@ -240,18 +240,21 @@ const DaemonTailBatchRequest = struct {
     max_bytes: usize,
 };
 
-/// Coalesces same-frame daemon tails without changing terminal poll cadence.
+/// Coalesces same-frame daemon tails and reuses the request connection without
+/// changing terminal poll cadence.
 pub const DaemonPollBatch = struct {
     sessions: std.ArrayList(*Session) = .empty,
     requests: std.ArrayList(DaemonTailBatchRequest) = .empty,
     response_scratch: std.ArrayList(u8) = .empty,
     last_response: std.ArrayList(u8) = .empty,
+    connection: sessionizer.ReusableRequestConnection = .{},
 
     pub fn deinit(self: *DaemonPollBatch, allocator: std.mem.Allocator) void {
         self.sessions.deinit(allocator);
         self.requests.deinit(allocator);
         self.response_scratch.deinit(allocator);
         self.last_response.deinit(allocator);
+        self.connection.deinit();
     }
 
     pub fn reset(self: *DaemonPollBatch) void {
@@ -260,7 +263,7 @@ pub const DaemonPollBatch = struct {
     }
 
     pub fn prefetch(self: *DaemonPollBatch, allocator: std.mem.Allocator, pref_path: []const u8) !void {
-        if (!SESSION_SUPPORTED or self.sessions.items.len < 2) return;
+        if (!SESSION_SUPPORTED or self.sessions.items.len == 0) return;
 
         self.requests.clearRetainingCapacity();
         try self.requests.ensureTotalCapacity(allocator, self.sessions.items.len);
@@ -273,29 +276,18 @@ pub const DaemonPollBatch = struct {
                 .max_bytes = if (initial_attach_replay) DAEMON_ATTACH_REPLAY_MAX_BYTES else DAEMON_REPLAY_MAX_BYTES,
             });
         }
-        if (self.requests.items.len < 2) return;
+        if (self.requests.items.len == 0) return;
 
-        const response = if (builtin.os.tag == .windows)
-            try sessionizer.requestAllocMaxResponse(
-                allocator,
-                pref_path,
-                "session.tail.batch",
-                .{ .requests = self.requests.items },
-                1,
-                sessionizer.MAX_RESPONSE_BYTES,
-            )
-        else blk: {
-            try self.response_scratch.ensureTotalCapacity(allocator, sessionizer.MAX_RESPONSE_BYTES);
-            self.response_scratch.items.len = sessionizer.MAX_RESPONSE_BYTES;
-            break :blk try sessionizer.requestAllocUsingBuffer(
-                allocator,
-                pref_path,
-                "session.tail.batch",
-                .{ .requests = self.requests.items },
-                1,
-                self.response_scratch.items,
-            );
-        };
+        try self.response_scratch.ensureTotalCapacity(allocator, sessionizer.MAX_RESPONSE_BYTES);
+        self.response_scratch.items.len = sessionizer.MAX_RESPONSE_BYTES;
+        const response = try self.connection.requestAllocUsingBuffer(
+            allocator,
+            pref_path,
+            "session.tail.batch",
+            .{ .requests = self.requests.items },
+            1,
+            self.response_scratch.items,
+        );
         defer allocator.free(response);
         if (cachedDaemonResponseMatches(&self.last_response, response) and
             daemonSessionsCanReuseResponse(self.sessions.items[0..self.requests.items.len]))
