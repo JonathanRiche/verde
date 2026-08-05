@@ -133,6 +133,10 @@ fn ambiguousInitialSendFailureMessage() []const u8 {
     return "Verde could not confirm that the provider request started. Your submitted message is preserved above; copy it before retrying.";
 }
 
+fn persistenceContention(err: anyerror) bool {
+    return err == error.Busy or err == error.BusyRecovery or err == error.BusySnapshot or err == error.BusyTimeout;
+}
+
 fn jsonRpcResult(value: std.json.Value) !std.json.Value {
     if (value != .object) return error.InvalidDaemonResponse;
     if (value.object.get("error")) |_| return error.DaemonRequestFailed;
@@ -1031,6 +1035,108 @@ test "prospective prompt preflight rejects before thread staging" {
     try std.testing.expectEqual(@as(usize, 0), prospective.messages.items.len);
 }
 
+test "persistence contention keeps one retryable draft and starts one addressed turn" {
+    const allocator = std.testing.allocator;
+    const FakeState = struct {
+        allocator: std.mem.Allocator,
+        project_controller: struct {
+            projects: std.ArrayList(Project) = .empty,
+            selected_index: usize = 0,
+        } = .{},
+        persist_calls: usize = 0,
+        provider_handoffs: usize = 0,
+        failure_rows: usize = 0,
+        flushes: usize = 0,
+
+        pub fn providerExecutionTargetForProjectThread(_: *@This(), _: usize, _: *const ChatThread, _: usize) ?ProviderExecutionTarget {
+            return .{ .local = "/tmp" };
+        }
+
+        pub fn ensureSessionDaemon(_: *@This()) !void {}
+
+        pub fn appendMessageToThread(
+            self: *@This(),
+            thread: *ChatThread,
+            role: provider_models.ChatRole,
+            author: []const u8,
+            body: []const u8,
+            _: ?*const ChatImageAttachment,
+            _: []const ChatImageAttachment,
+        ) !void {
+            try thread.messages.append(self.allocator, .{
+                .role = role,
+                .author = try self.allocator.dupeZ(u8, author),
+                .body = try self.allocator.dupeZ(u8, body),
+                .extra_images = try self.allocator.alloc(ChatImageAttachment, 0),
+            });
+            thread.touch();
+        }
+
+        pub fn releaseMessage(self: *@This(), message: ChatMessage) void {
+            self.allocator.free(message.author);
+            self.allocator.free(message.body);
+            self.allocator.free(message.extra_images);
+        }
+
+        pub fn persistThreadBlocking(self: *@This(), _: usize, _: usize) !void {
+            self.persist_calls += 1;
+            if (self.persist_calls == 1) return error.Busy;
+        }
+
+        pub fn beginSendForThreadWithReadyDaemon(
+            self: *@This(),
+            _: usize,
+            _: *ChatThread,
+            prompt: []const u8,
+            _: ProviderExecutionTarget,
+        ) !void {
+            try std.testing.expectEqualStrings("retryable prompt", prompt);
+            self.provider_handoffs += 1;
+        }
+
+        pub fn appendInitialSendFailure(self: *@This(), _: *ChatThread, _: []const u8) void {
+            self.failure_rows += 1;
+        }
+
+        pub fn requestTranscriptScrollToBottom(_: *@This()) void {}
+        pub fn resetComposerInputWidget(_: *@This()) void {}
+        pub fn setSidebarNotice(_: *@This(), _: []const u8) void {}
+        pub fn flushDirtyBlocking(self: *@This()) void {
+            self.flushes += 1;
+        }
+    };
+
+    var state: FakeState = .{ .allocator = allocator };
+    var project = try Project.init(allocator, "busy-send", "Busy send", "/tmp/busy-send", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    defer {
+        for (state.project_controller.projects.items) |*owned| owned.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+    const thread = &state.project_controller.projects.items[0].threads.items[0];
+    thread.setDraft("retryable prompt");
+
+    try std.testing.expectError(error.Busy, sendThreadDraft(&state, 0, 0));
+    try std.testing.expectEqual(@as(usize, 0), state.provider_handoffs);
+    try std.testing.expectEqual(@as(usize, 0), state.failure_rows);
+    try std.testing.expectEqual(@as(usize, 0), state.flushes);
+    try std.testing.expectEqualStrings("retryable prompt", thread.currentDraft());
+    try std.testing.expectEqual(@as(usize, 0), thread.messages.items.len);
+    try std.testing.expect(!thread.committed);
+
+    try std.testing.expect(try sendThreadDraft(&state, 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), state.provider_handoffs);
+    try std.testing.expectEqual(@as(usize, 0), state.failure_rows);
+    try std.testing.expectEqualStrings("", thread.currentDraft());
+    try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
+    try std.testing.expectEqualStrings("retryable prompt", thread.messages.items[0].body);
+    try std.testing.expect(!try sendThreadDraft(&state, 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), state.provider_handoffs);
+}
+
 pub fn providerExecutionTargetForProjectThread(
     self: anytype,
     project_index: usize,
@@ -1300,6 +1406,13 @@ pub fn sendThreadDraft(self: anytype, project_index: usize, thread_index: usize)
             self.flushDirtyBlocking();
         } else {
             snapshot.restore(self, thread);
+            if (persistenceContention(err)) {
+                // No provider handoff occurred. Keep the exact draft retryable
+                // and do not manufacture a failed transcript row for storage
+                // ownership contention.
+                project.invalidateSidebarThreadCache();
+                return err;
+            }
             self.appendInitialSendFailure(thread, initialSendStartFailureMessage(err));
             project.invalidateSidebarThreadCache();
             if (selected_target) self.requestTranscriptScrollToBottom();

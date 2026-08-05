@@ -18,6 +18,24 @@ const PersistedState = db_types.PersistedState;
 const PersistedSurfaceState = db_types.PersistedSurfaceState;
 const PersistedThread = db_types.PersistedThread;
 
+// Full-state autosaves use a detached connection while focused saves and
+// completion ledgers use the UI-owned connection. SQLite serializes writers,
+// so serialize Verde's in-process owners before entering SQLite rather than
+// allowing a legitimate send to exhaust the busy timeout behind an autosave.
+const InProcessWriteMutex = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *InProcessWriteMutex) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *InProcessWriteMutex) void {
+        self.inner.unlock();
+    }
+};
+
+var in_process_write_mutex: InProcessWriteMutex = .{};
+
 pub const STATE_DB_NAME = "state.sqlite";
 
 pub const Client = struct {
@@ -39,6 +57,8 @@ pub const Client = struct {
         const conn = try zqlite.open(path, flags);
         errdefer conn.close();
 
+        in_process_write_mutex.lock();
+        defer in_process_write_mutex.unlock();
         try schema.initialize(conn);
         return .{
             .allocator = allocator,
@@ -122,6 +142,8 @@ pub const Client = struct {
     }
 
     pub fn upsertSurfaceState(self: *const Self, surface: PersistedSurfaceState) !void {
+        in_process_write_mutex.lock();
+        defer in_process_write_mutex.unlock();
         try self.conn.exec(
             "insert into surface_completions (session_id, workspace_id, workspace_path, dock_id, pane_id, provider, provider_thread_id, title, status, status_changed_at_ms, completed_at_ms, last_event_title, last_event_body) " ++
                 "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) " ++
@@ -148,11 +170,15 @@ pub const Client = struct {
     }
 
     pub fn clearSurfaceState(self: *const Self, session_id: []const u8) !bool {
+        in_process_write_mutex.lock();
+        defer in_process_write_mutex.unlock();
         try self.conn.exec("delete from surface_completions where session_id = ?1", .{session_id});
         return self.conn.changes() > 0;
     }
 
     pub fn upsertChatCompletion(self: *const Self, completion: PersistedChatCompletion) !void {
+        in_process_write_mutex.lock();
+        defer in_process_write_mutex.unlock();
         try self.conn.exec(
             "insert into chat_completions (workspace_id, local_thread_id, completed_at_ms) values (?1, ?2, ?3) " ++
                 "on conflict(workspace_id, local_thread_id) do update set completed_at_ms = excluded.completed_at_ms",
@@ -161,6 +187,8 @@ pub const Client = struct {
     }
 
     pub fn clearChatCompletion(self: *const Self, workspace_id: []const u8, local_thread_id: []const u8) !bool {
+        in_process_write_mutex.lock();
+        defer in_process_write_mutex.unlock();
         try self.conn.exec(
             "delete from chat_completions where workspace_id = ?1 and local_thread_id = ?2",
             .{ workspace_id, local_thread_id },
@@ -169,6 +197,8 @@ pub const Client = struct {
     }
 
     pub fn save(self: *const Self, state: PersistedState) !void {
+        in_process_write_mutex.lock();
+        defer in_process_write_mutex.unlock();
         try self.conn.transaction();
         errdefer self.conn.rollback();
 
@@ -229,6 +259,8 @@ pub const Client = struct {
 
     /// Persist one chat thread without rewriting unrelated transcript history.
     pub fn saveThread(self: *const Self, workspace_id: []const u8, thread_index: usize, thread: PersistedThread) !void {
+        in_process_write_mutex.lock();
+        defer in_process_write_mutex.unlock();
         var workspace_row = (try self.conn.row(
             "select id from workspaces where workspace_id = ?1",
             .{workspace_id},
