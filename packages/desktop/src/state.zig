@@ -2997,6 +2997,7 @@ pub const AppState = struct {
     pub const toggleProviderGlobalHooks = settings_controller.toggleProviderGlobalHooks;
     pub const cancelSettingsModal = settings_controller.cancelSettingsModal;
     pub const saveSettingsModal = settings_controller.saveSettingsModal;
+    pub const setWorkspaceScrollMode = settings_controller.setWorkspaceScrollMode;
     pub const applyTerminalFontSizesFromConfig = settings_controller.applyTerminalFontSizesFromConfig;
     pub const reloadAppConfigFromDisk = settings_controller.reloadAppConfigFromDisk;
     pub const tickSettingsModalAnimation = settings_controller.tickSettingsModalAnimation;

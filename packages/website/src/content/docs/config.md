@@ -29,7 +29,9 @@ file. It is read on startup and on app refresh.
     "font_size": 20,
     "workspace_pane_gap": 12,
     "workspace_panes_per_view": 2,
-    "workspace_scroll_direction": "horizontal"
+    "workspace_scroll_direction": "horizontal",
+    "workspace_scroll_mode": "automatic",
+    "workspace_scroll_threshold": 2
   },
   "open": {
     "default": "folder",
@@ -90,10 +92,12 @@ Most of these options also appear in Settings:
   exchange and choose the provider and model used for titles.
 - **Terminal** — font size, launch profiles, and whether terminal link clicks
   open in Verde's browser pane or the system browser.
-- **Workspace** — horizontal or vertical pane scrolling, how many panes fit in
-  one view, their gap, the default open action for project files and folders,
-  and whether new chats create panes or replace an existing chat pane. Pane
-  gaps are omitted while zoomed.
+- **Workspace** — choose `automatic`, `always`, or `disabled` scrolling layout,
+  set the automatic activation threshold (1–64 panes), choose horizontal or
+  vertical scrolling, control how many panes fit in one view and their gap,
+  set the default open action for project files and folders, and choose whether
+  new chats create panes or replace an existing chat pane. Pane gaps are
+  omitted while zoomed.
 - **Agent integrations** — status-pip hooks for supported provider CLIs.
 - **Updates** — check now, install an available release, and automatic checks.
 - **Notifications** — enable or disable desktop notifications.

@@ -117,6 +117,10 @@ actions. Launch built-in provider TUIs from `Ctrl+Shift+P` or
 
 ## Move around
 
+Workspaces automatically enter scrolling layout at two panes. Change the
+threshold under **Settings → Workspace**, or switch between **Automatic**,
+**Always**, and **Disabled** directly from the command palette.
+
 - `Ctrl+H / J / K / L` — move focus across panes, vim-style (`Ctrl+Arrow` also works)
 - Horizontal touchpad/wheel, or `Ctrl`+vertical wheel in vertical mode — pan the scrolling pane strip
 - `Ctrl+Shift+H / J / K / L` — swap the focused pane with its neighbor (rearrange the tiling)
