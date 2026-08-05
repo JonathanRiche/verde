@@ -3011,17 +3011,19 @@ pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usi
 
     if (!self.app_config.notifications_enabled) return;
 
-    const title = if (thread.title.len > 0)
+    // The pane-less Companion thread cannot be revealed by focusing a chat
+    // pane, so its completion copy must name the next action explicitly.
+    const is_companion = project.isCompanionThread(thread);
+    const title = if (is_companion)
+        "Sprout"
+    else if (thread.title.len > 0)
         thread.title
     else
         utils.providerLabel(thread.provider);
 
     const dir = if (project.path.len > 0) std.fs.path.basename(project.path) else "";
     var body_buf: [256]u8 = undefined;
-    const body = if (dir.len > 0)
-        (std.fmt.bufPrint(&body_buf, "Reply ready in {s}", .{dir}) catch "Reply ready")
-    else
-        "Reply ready";
+    const body = completionNoticeBody(is_companion, dir, &body_buf);
 
     const icon: notifier.Icon = switch (thread.provider) {
         .codex => .{ .key = "codex", .png_bytes = CODEX_LOGO_BYTES },
@@ -3030,6 +3032,35 @@ pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usi
         .cursor => .{ .key = "cursor", .png_bytes = CURSOR_LOGO_BYTES },
     };
     notifier.notifyAgentDone(self.allocator, title, body, icon);
+}
+
+/// Completion toast copy. Companion completions direct the user to the Sprout
+/// panel because no chat pane exists to focus; ordinary threads keep the
+/// established "Reply ready" wording.
+pub fn completionNoticeBody(is_companion: bool, dir: []const u8, buf: []u8) []const u8 {
+    if (is_companion) {
+        if (dir.len > 0) {
+            return std.fmt.bufPrint(buf, "Sprout finished in {s}. Open the Sprout panel to review the result.", .{dir}) catch
+                "Sprout finished. Open the Sprout panel to review the result.";
+        }
+        return "Sprout finished. Open the Sprout panel to review the result.";
+    }
+    if (dir.len > 0) return std.fmt.bufPrint(buf, "Reply ready in {s}", .{dir}) catch "Reply ready";
+    return "Reply ready";
+}
+
+test "completion notice directs Companion completions to the Sprout panel" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("Reply ready in verde", completionNoticeBody(false, "verde", &buf));
+    try std.testing.expectEqualStrings("Reply ready", completionNoticeBody(false, "", &buf));
+    try std.testing.expectEqualStrings(
+        "Sprout finished in verde. Open the Sprout panel to review the result.",
+        completionNoticeBody(true, "verde", &buf),
+    );
+    try std.testing.expectEqualStrings(
+        "Sprout finished. Open the Sprout panel to review the result.",
+        completionNoticeBody(true, "", &buf),
+    );
 }
 
 // True only when the exact chat pane owns focus in the focused window.

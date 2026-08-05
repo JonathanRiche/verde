@@ -5819,7 +5819,12 @@ pub const AppState = struct {
     fn projectCompanionTranscript(frame: *companion_controller.Frame, thread: *const ChatThread) void {
         for (thread.messages.items, 0..) |message, index| {
             const sequence: i64 = @intCast(index);
-            if (message.role == .user and frame.objective.slice().len == 0) frame.objective.set(message.body);
+            // The Objective mirrors the user's most recent meaningful
+            // instruction, not the first prompt of the thread.
+            if (message.role == .user) {
+                const trimmed = std.mem.trim(u8, message.body, " \t\r\n");
+                if (trimmed.len > 0) frame.objective.set(trimmed);
+            }
             frame.latest_body.set(message.body);
             if (message.role == .system and
                 (std.mem.eql(u8, message.author, "Send failed") or std.mem.eql(u8, message.author, "Command failed")))
@@ -5861,6 +5866,12 @@ pub const AppState = struct {
                     .assistant => "Sprout",
                     .system => event.author,
                 };
+                // In-flight user prompts advance the Objective immediately so
+                // it never lags one turn behind the transcript.
+                if (event.role == .user) {
+                    const trimmed = std.mem.trim(u8, event.body, " \t\r\n");
+                    if (trimmed.len > 0) frame.objective.set(trimmed);
+                }
                 appendCompanionActivity(frame, "", author, event.body, kind, sequence);
             }
             frame.event_author.set(event.author);
@@ -9106,6 +9117,16 @@ test "Companion frame projects transcript pending streaming lifecycle errors and
         .tool_call_kind = .execute,
         .tool_call_status = .pending,
     });
+    try thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "User"),
+        .body = try allocator.dupeZ(u8, "Then verify the release build"),
+    });
+    try thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "User"),
+        .body = try allocator.dupeZ(u8, "   \n"),
+    });
     const send_state = thread.send_state;
     send_state.status = .pending;
     try send_state.pending_events.append(std.heap.page_allocator, .{
@@ -9126,7 +9147,8 @@ test "Companion frame projects transcript pending streaming lifecycle errors and
 
     state.syncCompanionProjection();
     var frame = &state.companion_controller.presentation;
-    try std.testing.expectEqualStrings("Ship the focused change", frame.objective.slice());
+    // Latest meaningful user prompt wins; whitespace-only prompts never clobber.
+    try std.testing.expectEqualStrings("Then verify the release build", frame.objective.slice());
     try std.testing.expectEqual(@as(usize, 1), frame.operation_count);
     try std.testing.expectEqual(companion_controller.OperationStatus.in_progress, frame.operations[0].status);
     try std.testing.expectEqualStrings("tool:6:call-1", frame.operations[0].identity.slice());
@@ -9137,12 +9159,18 @@ test "Companion frame projects transcript pending streaming lifecycle errors and
     try std.testing.expect(frame.has_failure);
     try std.testing.expectEqual(companion_controller.ActivityKind.streaming, frame.activity[frame.activity_count - 1].kind);
 
+    try send_state.pending_events.append(std.heap.page_allocator, .{
+        .role = .user,
+        .author = try std.heap.page_allocator.dupe(u8, "You"),
+        .body = try std.heap.page_allocator.dupe(u8, "Actually, ship the hotfix first"),
+    });
     send_state.pending_events.items[0].tool_call_status = .completed;
     state.syncCompanionProjection();
     frame = &state.companion_controller.presentation;
     try std.testing.expectEqual(@as(usize, 1), frame.operation_count);
     try std.testing.expectEqual(companion_controller.OperationStatus.completed, frame.operations[0].status);
     try std.testing.expectEqual(@as(usize, 1), frame.recentCount());
+    try std.testing.expectEqualStrings("Actually, ship the hotfix first", frame.objective.slice());
 
     send_state.pending_events.items[0].tool_call_status = .failed;
     state.syncCompanionProjection();

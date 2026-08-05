@@ -337,8 +337,25 @@ fn renderObjective(state: *runtime.AppState, geometry: Geometry) void {
     const content_w = @max(card.w - 102.0 * scale, 0.0);
     queueBoldText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 10.0 * scale, .w = content_w, .h = 14.0 * scale }, "OBJECTIVE", color(chrome.text_subtle), 10.0 * scale, card);
     const presentation = &state.companion_controller.presentation;
-    const title = if (presentation.objective.slice().len > 0) presentation.objective.slice() else "No active objective";
-    const detail = if (presentation.has_thread) "Steer the current run below." else "Start a run from this workspace.";
+    const objective = singleLineText(state, presentation.objective.slice());
+    const title = if (objective.len > 0)
+        truncatedText(state, .ui_bold, 13.0 * scale, content_w, objective)
+    else
+        "No active objective";
+    // The subtitle states the run's real posture so the Objective card reads
+    // as current status, not a static caption.
+    const detail = if (!presentation.has_thread)
+        "Start a run from this workspace."
+    else if (presentation.has_approval)
+        "Waiting on your approval below."
+    else if (state.companion_controller.run_phase == .working)
+        "Sprout is working on this now."
+    else if (presentation.has_failure)
+        "The last run needs attention."
+    else if (objective.len > 0)
+        "Done. Send the next instruction below."
+    else
+        "Send an instruction below to start.";
     queueBoldText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 29.0 * scale, .w = content_w, .h = 18.0 * scale }, title, color(chrome.text), 13.0 * scale, card);
     queueText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 49.0 * scale, .w = content_w, .h = 17.0 * scale }, detail, color(chrome.text_subtle), 11.5 * scale, card);
     const status_rect: palette.Rect = .{ .x = card.x + @max(card.w - 82.0 * scale, 0.0), .y = card.y + 11.0 * scale, .w = @min(70.0 * scale, card.w), .h = 22.0 * scale };
@@ -357,12 +374,13 @@ fn renderTabs(state: *runtime.AppState, geometry: Geometry) void {
     queueRoundedRect(state, track, color(chrome.surface_deep), 8.0 * scale);
     queueBorder(state, track, color(chrome.border), 8.0 * scale, 1.0 * scale);
     const inner: palette.Rect = .{ .x = track.x + 3.0 * scale, .y = track.y + 3.0 * scale, .w = @max(track.w - 6.0 * scale, 0.0), .h = @max(track.h - 6.0 * scale, 0.0) };
-    const tab_w = inner.w / 3.0;
+    // Only Run and Activity are real, hit-registered views; unsupported
+    // sections are omitted rather than rendered as decorative tabs.
+    const tab_w = inner.w / 2.0;
     const selected_index: f32 = if (state.companion_controller.selected_tab == .run) 0.0 else 1.0;
     queueRoundedRect(state, .{ .x = inner.x + tab_w * selected_index, .y = inner.y, .w = tab_w, .h = inner.h }, color(chrome.surface), 6.0 * scale);
     queueCenteredText(state, .{ .x = inner.x, .y = inner.y, .w = tab_w, .h = inner.h }, "Run", color(if (state.companion_controller.selected_tab == .run) chrome.text else chrome.text_subtle), 11.5 * scale, .ui_bold, inner);
     queueCenteredText(state, .{ .x = inner.x + tab_w, .y = inner.y, .w = tab_w, .h = inner.h }, "Activity", color(if (state.companion_controller.selected_tab == .activity) chrome.text else chrome.text_subtle), 11.5 * scale, .ui_bold, inner);
-    queueCenteredText(state, .{ .x = inner.x + tab_w * 2.0, .y = inner.y, .w = tab_w, .h = inner.h }, "Scope", color(chrome.text_subtle), 11.5 * scale, .ui_bold, inner);
     if (state.companion_controller.needs_approval) {
         queueRoundedRect(state, .{ .x = inner.x + tab_w - 18.0 * scale, .y = inner.y + (inner.h - 6.0 * scale) * 0.5, .w = 6.0 * scale, .h = 6.0 * scale }, color(chrome.warning), 3.0 * scale);
     }
@@ -427,7 +445,7 @@ fn tabRects(tabs: palette.Rect) [2]palette.Rect {
         .w = @max(track.w - 6.0 * scale, 0.0),
         .h = @max(track.h - 6.0 * scale, 0.0),
     };
-    const tab_w = inner.w / 3.0;
+    const tab_w = inner.w / 2.0;
     return .{
         .{ .x = inner.x, .y = inner.y, .w = tab_w, .h = inner.h },
         .{ .x = inner.x + tab_w, .y = inner.y, .w = tab_w, .h = inner.h },
@@ -439,7 +457,8 @@ fn bodyContentHeight(state: *const controller) f32 {
     const inset = companionScaled(24.0);
     if (state.selected_tab == .activity) {
         if (frame.activity_count == 0) return inset + companionScaled(64.0);
-        return inset + @as(f32, @floatFromInt(frame.activity_count)) * companionScaled(65.0);
+        const working_extra: f32 = if (frame.working) companionScaled(28.0) else 0.0;
+        return inset + @as(f32, @floatFromInt(frame.activity_count)) * companionScaled(65.0) + working_extra;
     }
     var height = inset;
     if (frame.has_approval) height += companionScaled(130.0);
@@ -509,21 +528,59 @@ fn renderRunBody(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
 fn renderActivityBody(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
     const frame = &state.companion_controller.presentation;
     if (frame.activity_count == 0) {
-        renderEmptyBody(state, clip, y, "No activity yet", "Events from this run will appear here.");
+        if (frame.working)
+            renderEmptyBody(state, clip, y, "Sprout is working…", "Activity will appear here as the run progresses.")
+        else
+            renderEmptyBody(state, clip, y, "No activity yet", "Events from this run will appear here.");
         return;
     }
     for (0..frame.activity_count) |index| renderActivityRow(state, clip, y, &frame.activity[index]);
+    // A live run keeps a visible pulse at the tail so the newest row is never
+    // mistaken for the final word.
+    if (frame.working) {
+        const chrome = theme.companionChrome();
+        queueText(state, .{ .x = clip.x + companionScaled(24.0), .y = y.*, .w = @max(clip.w - companionScaled(36.0), 0.0), .h = companionScaled(16.0) }, "Sprout is working…", color(chrome.text_subtle), companionScaled(10.5), clip);
+        y.* += companionScaled(28.0);
+    }
 }
 
+// One bounded Activity row: kind-colored stripe, author, optional state label,
+// and a single-line body so raw command dumps cannot overflow the card.
 fn renderActivityRow(state: *runtime.AppState, clip: palette.Rect, y: *f32, item: *const controller.ActivityItem) void {
     const chrome = theme.companionChrome();
     const failed = item.status == .failed;
+    const accent = activityAccent(chrome, item);
     const card: palette.Rect = .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = @max(clip.w - companionScaled(24.0), 0.0), .h = companionScaled(58.0) };
     queueRoundedRectClipped(state, card, color(if (failed) chrome.failure_card else chrome.surface_deep), companionScaled(9.0), clip);
     queueBorderClipped(state, card, color(if (failed) chrome.failure_border else chrome.hairline), companionScaled(9.0), companionScaled(1.0), clip);
-    queueBoldText(state, .{ .x = card.x + companionScaled(11.0), .y = card.y + companionScaled(8.0), .w = @max(card.w - companionScaled(22.0), 0.0), .h = companionScaled(17.0) }, item.author.slice(), color(if (failed) chrome.failure_fg else chrome.text), companionScaled(11.5), clip);
-    queueText(state, .{ .x = card.x + companionScaled(11.0), .y = card.y + companionScaled(29.0), .w = @max(card.w - companionScaled(22.0), 0.0), .h = companionScaled(18.0) }, item.body.slice(), color(if (failed) chrome.failure_fg else chrome.text_subtle), companionScaled(10.5), clip);
+    queueRoundedRectClipped(state, .{ .x = card.x, .y = card.y, .w = companionScaled(3.0), .h = card.h }, color(accent), companionScaled(1.5), clip);
+    const status_w = companionScaled(52.0);
+    const author_w = if (item.status != null) @max(card.w - companionScaled(22.0) - status_w, 0.0) else @max(card.w - companionScaled(22.0), 0.0);
+    queueBoldText(state, .{ .x = card.x + companionScaled(11.0), .y = card.y + companionScaled(8.0), .w = author_w, .h = companionScaled(17.0) }, item.author.slice(), color(if (failed) chrome.failure_fg else chrome.text), companionScaled(11.5), clip);
+    if (item.status) |status| {
+        queueBoldText(state, .{ .x = card.x + @max(card.w - status_w - companionScaled(11.0), 0.0), .y = card.y + companionScaled(9.0), .w = status_w, .h = companionScaled(15.0) }, operationStatusLabel(status), color(operationStatusColor(chrome, status)), companionScaled(9.0), clip);
+    }
+    // Tool and process rows carry command dumps; show the command preview
+    // rather than the raw Input/Output text.
+    const raw_body = switch (item.kind) {
+        .tool, .process => operationPreview(item.body.slice()).detail,
+        else => item.body.slice(),
+    };
+    const body_w = @max(card.w - companionScaled(22.0), 0.0);
+    const body = truncatedText(state, .ui, companionScaled(10.5), body_w, singleLineText(state, raw_body));
+    queueText(state, .{ .x = card.x + companionScaled(11.0), .y = card.y + companionScaled(29.0), .w = body_w, .h = companionScaled(18.0) }, body, color(if (failed) chrome.failure_fg else chrome.text_subtle), companionScaled(10.5), clip);
     y.* += companionScaled(65.0);
+}
+
+fn activityAccent(chrome: theme.CompanionChrome, item: *const controller.ActivityItem) [4]f32 {
+    if (item.status) |status| return operationStatusColor(chrome, status);
+    return switch (item.kind) {
+        .user => chrome.accent,
+        .assistant => chrome.identity_fg,
+        .streaming => chrome.accent_hi,
+        .system => chrome.text_muted,
+        .tool, .process => chrome.text_subtle,
+    };
 }
 
 fn approvalButtonRects(body: palette.Rect, scroll_y: f32) [2]palette.Rect {
@@ -563,25 +620,14 @@ fn renderFrameOperationCard(state: *runtime.AppState, clip: palette.Rect, y: *f3
     renderOperationCard(state, clip, y, operation.title.slice(), operation.detail.slice(), operation.status);
 }
 
-// One owner-derived operation card in the scrollable Run region.
+// One owner-derived operation card in the scrollable Run region. Raw bodies
+// arrive as multi-line "Command:/Input: … Output: …" dumps, so the card shows
+// a bounded single-line command preview plus a single-line result preview.
 fn renderOperationCard(state: *runtime.AppState, clip: palette.Rect, y: *f32, title: []const u8, detail: []const u8, status: controller.OperationStatus) void {
     const scale = companionScale();
     const chrome = theme.companionChrome();
     const failed = status == .failed;
-    const indicator = switch (status) {
-        .in_progress => chrome.accent,
-        .pending => chrome.text_subtle,
-        .completed => chrome.identity_fg,
-        .failed => chrome.danger,
-        .cancelled => chrome.text_muted,
-    };
-    const status_text = switch (status) {
-        .in_progress => "RUNNING",
-        .pending => "PENDING",
-        .completed => "Done",
-        .failed => "FAILED",
-        .cancelled => "Stopped",
-    };
+    const indicator = operationStatusColor(chrome, status);
     const card: palette.Rect = .{ .x = clip.x + 12.0 * scale, .y = y.*, .w = @max(clip.w - 24.0 * scale, 0.0), .h = 72.0 * scale };
     queueRoundedRectClipped(state, card, color(if (failed) chrome.failure_card else chrome.surface_deep), 10.0 * scale, clip);
     queueBorderClipped(state, card, color(if (failed) chrome.failure_border else chrome.hairline), 10.0 * scale, 1.0 * scale, clip);
@@ -589,16 +635,42 @@ fn renderOperationCard(state: *runtime.AppState, clip: palette.Rect, y: *f32, ti
     queueRoundedRectClipped(state, avatar, color(chrome.surface_deep), 7.0 * scale, clip);
     queueBorderClipped(state, avatar, color(chrome.border), 7.0 * scale, 1.0 * scale, clip);
     queueCenteredText(state, avatar, if (failed) "!" else "S", color(if (failed) chrome.failure_fg else chrome.identity_fg), 10.0 * scale, .mono, clip);
-    queueBoldText(state, .{ .x = card.x + 48.0 * scale, .y = card.y + 9.0 * scale, .w = @max(card.w - 118.0 * scale, 0.0), .h = 18.0 * scale }, title, color(if (failed) chrome.failure_fg else chrome.text), 12.0 * scale, clip);
-    queueMonoText(state, .{ .x = card.x + 48.0 * scale, .y = card.y + 29.0 * scale, .w = @max(card.w - 60.0 * scale, 0.0), .h = 15.0 * scale }, detail, color(if (failed) chrome.failure_fg else chrome.text_subtle), 10.0 * scale, clip);
+    const title_w = @max(card.w - 118.0 * scale, 0.0);
+    queueBoldText(state, .{ .x = card.x + 48.0 * scale, .y = card.y + 9.0 * scale, .w = title_w, .h = 18.0 * scale }, truncatedText(state, .ui_bold, 12.0 * scale, title_w, singleLineText(state, title)), color(if (failed) chrome.failure_fg else chrome.text), 12.0 * scale, clip);
+    const preview = operationPreview(detail);
+    const line_w = @max(card.w - 60.0 * scale, 0.0);
+    queueMonoText(state, .{ .x = card.x + 48.0 * scale, .y = card.y + 29.0 * scale, .w = line_w, .h = 15.0 * scale }, truncatedText(state, .mono, 10.0 * scale, line_w, singleLineText(state, preview.detail)), color(if (failed) chrome.failure_fg else chrome.text_subtle), 10.0 * scale, clip);
+    if (preview.result) |result| {
+        queueText(state, .{ .x = card.x + 48.0 * scale, .y = card.y + 47.0 * scale, .w = line_w, .h = 15.0 * scale }, truncatedText(state, .ui, 10.0 * scale, line_w, singleLineText(state, result)), color(if (failed) chrome.failure_fg else chrome.text_muted), 10.0 * scale, clip);
+    }
     if (status == .pending) {
         const ring: palette.Rect = .{ .x = card.x + card.w - 65.0 * scale, .y = card.y + 15.0 * scale, .w = 7.0 * scale, .h = 7.0 * scale };
         queueBorderClipped(state, ring, color(indicator), 3.5 * scale, 1.0 * scale, clip);
     } else {
         queueRoundedRectClipped(state, .{ .x = card.x + card.w - 65.0 * scale, .y = card.y + 15.0 * scale, .w = 7.0 * scale, .h = 7.0 * scale }, color(indicator), 3.5 * scale, clip);
     }
-    queueBoldText(state, .{ .x = card.x + card.w - 54.0 * scale, .y = card.y + 10.0 * scale, .w = 45.0 * scale, .h = 18.0 * scale }, status_text, color(indicator), 9.5 * scale, clip);
+    queueBoldText(state, .{ .x = card.x + card.w - 54.0 * scale, .y = card.y + 10.0 * scale, .w = 45.0 * scale, .h = 18.0 * scale }, operationStatusLabel(status), color(indicator), 9.5 * scale, clip);
     y.* += card.h + 7.0 * scale;
+}
+
+fn operationStatusLabel(status: controller.OperationStatus) []const u8 {
+    return switch (status) {
+        .in_progress => "RUNNING",
+        .pending => "PENDING",
+        .completed => "DONE",
+        .failed => "FAILED",
+        .cancelled => "STOPPED",
+    };
+}
+
+fn operationStatusColor(chrome: theme.CompanionChrome, status: controller.OperationStatus) [4]f32 {
+    return switch (status) {
+        .in_progress => chrome.accent,
+        .pending => chrome.text_subtle,
+        .completed => chrome.identity_fg,
+        .failed => chrome.danger,
+        .cancelled => chrome.text_muted,
+    };
 }
 
 // Active theme inputs shared by character-specific palette derivations. Moss
@@ -816,13 +888,123 @@ fn bodyHitRect(hits: []const controller.Hit) f32 {
     return 0.0;
 }
 
+// Header status states the run posture in words; counts appear only when
+// they carry information, so an idle Companion never reads "0 active".
 fn headerStatus(state: *runtime.AppState) []const u8 {
-    const active_count: usize = if (state.companion_controller.run_phase == .working) state.companion_controller.operation_count else 0;
-    return framePrint(state, "{d} active · {d} approval", .{ active_count, state.companion_controller.approval_count });
+    const companion = &state.companion_controller;
+    if (companion.needs_approval) return "approval needed";
+    if (companion.has_failure) return "needs attention";
+    if (companion.run_phase == .paused) return "paused";
+    if (companion.run_phase == .working) {
+        const counts = companion.presentation.activeCounts();
+        const active = counts.working + counts.pending;
+        if (active > 0) return framePrint(state, "working · {d} ops", .{active});
+        return "working";
+    }
+    return "ready";
 }
 
 fn framePrint(state: *runtime.AppState, comptime format: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(state.palette_frame_text_arena.allocator(), format, args) catch "";
+}
+
+const OperationPreview = struct {
+    detail: []const u8,
+    result: ?[]const u8,
+};
+
+// Splits provider "Command:/Input: … Output: …" transcript bodies into a
+// command preview and a result preview. Pure presentation: stored content,
+// identity, and status are untouched, and unknown shapes fall back whole.
+fn operationPreview(body: []const u8) OperationPreview {
+    var detail = body;
+    var result: ?[]const u8 = null;
+    if (std.mem.indexOf(u8, body, "Output:")) |output_index| {
+        const head = std.mem.trim(u8, body[0..output_index], " \t\r\n");
+        const tail = std.mem.trim(u8, body[output_index + "Output:".len ..], " \t\r\n");
+        if (head.len > 0) {
+            detail = head;
+            if (tail.len > 0) result = tail;
+        } else if (tail.len > 0) {
+            detail = tail;
+        }
+    }
+    inline for (.{ "Command:", "Input:" }) |label| {
+        if (std.mem.startsWith(u8, detail, label)) {
+            const stripped = std.mem.trimStart(u8, detail[label.len..], " \t\r\n");
+            if (stripped.len > 0) detail = stripped;
+            break;
+        }
+    }
+    return .{ .detail = detail, .result = result };
+}
+
+// Raw transcript bodies may hold multi-line dumps; Companion rows are
+// single-line summaries, so collapse whitespace runs before layout. Clean
+// text returns the original slice so Frame-backed lifetimes are preserved.
+fn singleLineText(state: *runtime.AppState, text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    var needs_copy = false;
+    for (trimmed, 0..) |byte, index| {
+        if (byte == '\n' or byte == '\r' or byte == '\t' or
+            (byte == ' ' and index + 1 < trimmed.len and trimmed[index + 1] == ' '))
+        {
+            needs_copy = true;
+            break;
+        }
+    }
+    if (!needs_copy) return trimmed;
+    const buffer = state.palette_frame_text_arena.allocator().alloc(u8, trimmed.len) catch return trimmed;
+    var length: usize = 0;
+    var pending_space = false;
+    for (trimmed) |byte| {
+        if (byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r') {
+            pending_space = length > 0;
+            continue;
+        }
+        if (pending_space) {
+            buffer[length] = ' ';
+            length += 1;
+            pending_space = false;
+        }
+        buffer[length] = byte;
+        length += 1;
+    }
+    return buffer[0..length];
+}
+
+// Measured single-line truncation: binary-search the widest UTF-8-safe prefix
+// that fits beside an ellipsis. Guessed character widths are banned, so every
+// probe goes through the shared text metrics.
+fn truncatedText(state: *runtime.AppState, role: palette.FontRole, font_size: f32, max_width: f32, text: []const u8) []const u8 {
+    if (text.len == 0 or max_width <= 0.0) return text;
+    if (text_measure.textWidth(role, font_size, text) <= max_width) return text;
+    const ellipsis = "…";
+    const ellipsis_width = text_measure.textWidth(role, font_size, ellipsis);
+    var low: usize = 0;
+    var high: usize = text.len - 1;
+    var best: usize = 0;
+    while (low <= high) {
+        const mid = low + (high - low) / 2;
+        const candidate = utf8FloorIndex(text, mid);
+        if (text_measure.textWidth(role, font_size, text[0..candidate]) + ellipsis_width <= max_width) {
+            best = @max(best, candidate);
+            low = mid + 1;
+        } else {
+            if (mid == 0) break;
+            high = mid - 1;
+        }
+    }
+    if (best == 0) return ellipsis;
+    return framePrint(state, "{s}{s}", .{ text[0..best], ellipsis });
+}
+
+// Steps an index back to the nearest UTF-8 sequence start so truncation never
+// splits a codepoint.
+fn utf8FloorIndex(text: []const u8, index: usize) usize {
+    var floor = index;
+    while (floor > 0 and (text[floor] & 0xC0) == 0x80) floor -= 1;
+    return floor;
 }
 
 fn companionScale() f32 {
@@ -1430,7 +1612,7 @@ test "captured scale public render emits a visible complete Companion composer" 
     var saw_head_rim = false;
     const tabs_track: palette.Rect = .{ .x = geometry.tabs.x + 12.0 * scale, .y = geometry.tabs.y + 10.0 * scale, .w = geometry.tabs.w - 24.0 * scale, .h = geometry.tabs.h - 10.0 * scale };
     const tabs_inner: palette.Rect = .{ .x = tabs_track.x + 3.0 * scale, .y = tabs_track.y + 3.0 * scale, .w = tabs_track.w - 6.0 * scale, .h = tabs_track.h - 6.0 * scale };
-    const run_pill: palette.Rect = .{ .x = tabs_inner.x, .y = tabs_inner.y, .w = tabs_inner.w / 3.0, .h = tabs_inner.h };
+    const run_pill: palette.Rect = .{ .x = tabs_inner.x, .y = tabs_inner.y, .w = tabs_inner.w / 2.0, .h = tabs_inner.h };
     const header_sprout: palette.Rect = .{ .x = geometry.header.x + 12.0 * scale, .y = geometry.header.y + 6.5 * scale, .w = 29.0 * scale, .h = 31.0 * scale };
     const sprout_scale = header_sprout.w / 46.0;
     const sprout_face: palette.Rect = .{ .x = header_sprout.x + 5.0 * sprout_scale, .y = header_sprout.y + 12.0 * sprout_scale, .w = 36.0 * sprout_scale, .h = 27.0 * sprout_scale };
@@ -1587,6 +1769,113 @@ test "public Companion render retains Frame-backed Run and Activity text" {
     try expectFrameBackedTextCommand(&state.palette_overlay_batch, "Sprout", &state.companion_controller.presentation.activity[1].author, geometry.body);
     try expectFrameBackedTextCommand(&state.palette_overlay_batch, "Heading: Verde", &state.companion_controller.presentation.activity[1].body, geometry.body);
     try std.testing.expectEqualDeep(immutable_frame, state.companion_controller.presentation);
+}
+
+test "operation preview splits command dumps without altering unknown shapes" {
+    const split = operationPreview("Command:\n/usr/bin/bash -lc 'zig build'\n\nOutput:\nBuild passed\nAll steps ok");
+    try std.testing.expectEqualStrings("/usr/bin/bash -lc 'zig build'", split.detail);
+    try std.testing.expectEqualStrings("Build passed\nAll steps ok", split.result.?);
+
+    const input_form = operationPreview("Input: rg --files\nOutput: file.zig");
+    try std.testing.expectEqualStrings("rg --files", input_form.detail);
+    try std.testing.expectEqualStrings("file.zig", input_form.result.?);
+
+    const output_only = operationPreview("Output:\njust results");
+    try std.testing.expectEqualStrings("just results", output_only.detail);
+    try std.testing.expect(output_only.result == null);
+
+    const plain = operationPreview("Captured first heading");
+    try std.testing.expectEqualStrings("Captured first heading", plain.detail);
+    try std.testing.expect(plain.result == null);
+}
+
+test "public Companion render bounds raw multiline Run and Activity dumps" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller = .{};
+    state.companion_controller = controller.init();
+    state.companion_controller.show();
+    state.companion_composer = @TypeOf(state.companion_composer).init();
+    state.palette_overlay_batch = .{};
+    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.companion_composer.deinit(allocator);
+        state.palette_overlay_batch.deinit(allocator);
+        state.palette_frame_text_arena.deinit();
+    }
+    var project = try runtime.Project.init(allocator, "bounded", "Bounded", "/tmp/bounded", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+
+    const raw_dump = "Command:\n/usr/bin/bash -lc 'find . -maxdepth 2 -type d | sort'\n\nOutput:\n" ++ ("worktree-path-entry\n" ** 24);
+    var frame: controller.Frame = .{ .has_thread = true, .working = true };
+    frame.workspace_id.set("bounded");
+    frame.thread_id.set("pane-less-bounded");
+    var operation: controller.Operation = .{ .status = .completed, .sequence = 1 };
+    operation.identity.set("tool:bounded");
+    operation.title.set("Ran command");
+    operation.detail.set(raw_dump);
+    frame.upsertOperation(operation);
+    var tool_row: controller.ActivityItem = .{ .kind = .tool, .status = .completed, .sequence = 2 };
+    tool_row.identity.set("tool:bounded");
+    tool_row.author.set("Ran command");
+    tool_row.body.set(raw_dump);
+    frame.appendActivity(tool_row);
+    var user_row: controller.ActivityItem = .{ .kind = .user, .sequence = 3 };
+    user_row.author.set("You");
+    user_row.body.set("line one\nline two\nline three");
+    frame.appendActivity(user_row);
+    state.companion_controller.setFrame(frame);
+    const geometry = computeGeometryForState(1360.0, 860.0, 1.0, &state.companion_controller);
+
+    render(&state, 1360.0, 860.0);
+    try expectNoMultilineText(&state.palette_overlay_batch);
+    try expectNoTextCommand(&state.palette_overlay_batch, "Scope");
+    try expectBoundedBodyText(&state.palette_overlay_batch, "find . -maxdepth", geometry.body);
+    try expectBoundedBodyText(&state.palette_overlay_batch, "worktree-path-entry", geometry.body);
+    try expectClippedTextCommand(&state.palette_overlay_batch, "DONE", geometry.body);
+
+    state.palette_overlay_batch.clear();
+    state.companion_controller.selectTab(.activity);
+    render(&state, 1360.0, 860.0);
+    try expectNoMultilineText(&state.palette_overlay_batch);
+    try expectBoundedBodyText(&state.palette_overlay_batch, "find . -maxdepth", geometry.body);
+    try expectBoundedBodyText(&state.palette_overlay_batch, "line one line two line three", geometry.body);
+    try expectClippedTextCommand(&state.palette_overlay_batch, "DONE", geometry.body);
+    try expectClippedTextCommand(&state.palette_overlay_batch, "Sprout is working…", geometry.body);
+}
+
+fn expectNoMultilineText(batch: *const palette.RenderBatch) !void {
+    for (batch.commands.items) |command| {
+        if (command.kind != .text) continue;
+        try std.testing.expect(std.mem.indexOfScalar(u8, command.text, '\n') == null);
+    }
+}
+
+fn expectNoTextCommand(batch: *const palette.RenderBatch, forbidden: []const u8) !void {
+    for (batch.commands.items) |command| {
+        if (command.kind == .text and std.mem.eql(u8, command.text, forbidden)) return error.UnexpectedTextCommand;
+    }
+}
+
+fn expectBoundedBodyText(batch: *const palette.RenderBatch, needle: []const u8, clip: palette.Rect) !void {
+    for (batch.commands.items) |command| {
+        if (command.kind != .text or std.mem.indexOf(u8, command.text, needle) == null) continue;
+        const command_clip = command.clip orelse continue;
+        if (!rectEqual(command_clip, clip)) continue;
+        try expectTextCommandInsideClip(command, clip);
+        const role = command.font_role orelse return error.MissingTextRole;
+        try std.testing.expect(text_measure.textWidth(role, command.font_size, command.text) <= command.rect.w + 0.5);
+        return;
+    }
+    return error.MissingBoundedBodyText;
 }
 
 fn expectClippedTextCommand(batch: *const palette.RenderBatch, expected: []const u8, clip: palette.Rect) !void {
@@ -1977,7 +2266,7 @@ fn expectBatchColor(batch: *const palette.RenderBatch, kind: palette.draw.Comman
 fn expectExpandedChrome(state: *runtime.AppState, geometry: Geometry, chrome: theme.CompanionChrome, failed: bool) !void {
     const tabs_track: palette.Rect = .{ .x = geometry.tabs.x + 12.0, .y = geometry.tabs.y + 10.0, .w = geometry.tabs.w - 24.0, .h = geometry.tabs.h - 10.0 };
     const tabs_inner: palette.Rect = .{ .x = tabs_track.x + 3.0, .y = tabs_track.y + 3.0, .w = tabs_track.w - 6.0, .h = tabs_track.h - 6.0 };
-    const run_pill: palette.Rect = .{ .x = tabs_inner.x, .y = tabs_inner.y, .w = tabs_inner.w / 3.0, .h = tabs_inner.h };
+    const run_pill: palette.Rect = .{ .x = tabs_inner.x, .y = tabs_inner.y, .w = tabs_inner.w / 2.0, .h = tabs_inner.h };
     var saw_panel = false;
     var saw_tabs = false;
     var saw_run = false;
