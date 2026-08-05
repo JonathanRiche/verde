@@ -1544,8 +1544,11 @@ pub fn handleBrowserMouse(self: anytype, event: browser_runtime.MouseEvent) bool
     const displayed_height = self.browser_controller.pane_max[1] - self.browser_controller.pane_min[1];
     const input_width = @max(self.browser_controller.pane_input_size[0], 1.0);
     const input_height = @max(self.browser_controller.pane_input_size[1], 1.0);
-    pane_event.x = (event.x - self.browser_controller.pane_min[0]) * (input_width / @max(displayed_width, 1.0));
-    pane_event.y = (event.y - self.browser_controller.pane_min[1]) * (input_height / @max(displayed_height, 1.0));
+    const presentation = self.browser_controller.runtime.controller.presentationKind();
+    const runtime = self.browser_controller.runtime.controller.runtimeKind();
+    const uses_scaled_wpe_texture = runtime == .native_webview and presentation == .offscreen_texture and self.browserPaneDeviceScale() > 1.0;
+    pane_event.x = browserPointerCoordinate(event.x - self.browser_controller.pane_min[0], displayed_width, input_width, uses_scaled_wpe_texture);
+    pane_event.y = browserPointerCoordinate(event.y - self.browser_controller.pane_min[1], displayed_height, input_height, uses_scaled_wpe_texture);
     pane_event.wheel_multiplier = browserWheelMultiplier(self.app_config.browser_fast_scrolling_enabled);
 
     const handled = self.browser_controller.runtime.controller.handleMouse(pane_event) catch |err| {
@@ -1561,6 +1564,13 @@ pub fn handleBrowserMouse(self: anytype, event: browser_runtime.MouseEvent) bool
         .native_child_view, .native_wayland_surface => true,
         .helper_window, .snapshot_texture, .offscreen_texture, .stub => false,
     };
+}
+
+fn browserPointerCoordinate(local: f32, displayed_extent: f32, input_extent: f32, uses_scaled_wpe_texture: bool) f32 {
+    // WPE consumes physical pointer coordinates and applies its configured
+    // device scale internally. Other backends expect their declared input size.
+    if (uses_scaled_wpe_texture) return local;
+    return local * (@max(input_extent, 1.0) / @max(displayed_extent, 1.0));
 }
 
 fn browserWheelMultiplier(fast_scrolling_enabled: bool) f32 {
@@ -3264,4 +3274,9 @@ pub fn isInspectorPromptChangedMessage(message: []const u8) bool {
 test "browser fast scrolling uses a separate wheel multiplier" {
     try std.testing.expectEqual(@as(f32, 1.0), browserWheelMultiplier(false));
     try std.testing.expectEqual(@as(f32, 1.5), browserWheelMultiplier(true));
+}
+
+test "scaled WPE pointer coordinates stay in physical pane space" {
+    try std.testing.expectEqual(@as(f32, 600.0), browserPointerCoordinate(600.0, 1000.0, 600.0, true));
+    try std.testing.expectEqual(@as(f32, 360.0), browserPointerCoordinate(600.0, 1000.0, 600.0, false));
 }
