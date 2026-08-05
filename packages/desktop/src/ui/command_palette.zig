@@ -192,7 +192,8 @@ var last_scope: ?usize = null;
 
 /// Action submenu geometry (Tab on a thread row).
 const MAX_ACTIONS: usize = 6;
-const ThreadAction = enum { open, open_split, open_tui, sync, handoff, archive };
+const ThreadAction = enum { open_new, replace, open_tui, sync, handoff, archive };
+const ThreadOpenIntent = enum { new_pane, replace };
 var action_rects: [MAX_ACTIONS]palette.Rect = undefined;
 var action_kinds: [MAX_ACTIONS]ThreadAction = undefined;
 var action_labels: [MAX_ACTIONS][]const u8 = undefined;
@@ -377,9 +378,9 @@ pub fn handleKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) 
     }
 }
 
-/// Default activation for a result row (click or Enter). `split` is the
-/// Ctrl+Enter "open in new pane" variant for thread rows.
-pub fn activateRow(state: *runtime.AppState, row_index: usize, split: bool) void {
+/// Default activation for a result row (click or Enter). The primary modifier
+/// reverses thread activation to replace/reuse a chat pane.
+pub fn activateRow(state: *runtime.AppState, row_index: usize, replace: bool) void {
     if (row_index >= result_count) return;
     state.noteInteraction();
     switch (results[row_index].ref) {
@@ -396,7 +397,7 @@ pub fn activateRow(state: *runtime.AppState, row_index: usize, split: bool) void
         },
         .thread => |tr| {
             state.closeCommandPalette();
-            openThread(state, tr, split);
+            openThread(state, tr, threadOpenIntentForActivation(replace));
         },
         .agent_tui => |tui| {
             state.closeCommandPalette();
@@ -431,13 +432,13 @@ pub fn runActionRow(state: *runtime.AppState, action_index: usize) void {
     state.command_controller.action_menu_open = false;
     state.noteInteraction();
     switch (action_kinds[action_index]) {
-        .open => {
+        .open_new => {
             state.closeCommandPalette();
-            openThread(state, tr, false);
+            openThread(state, tr, .new_pane);
         },
-        .open_split => {
+        .replace => {
             state.closeCommandPalette();
-            openThread(state, tr, true);
+            openThread(state, tr, .replace);
         },
         .open_tui => {
             state.closeCommandPalette();
@@ -453,7 +454,9 @@ pub fn runActionRow(state: *runtime.AppState, action_index: usize) void {
         },
         .handoff => {
             state.closeCommandPalette();
-            openThread(state, tr, false);
+            // Handoff depends on the selected thread becoming the current
+            // chat owner; preserve its existing replace/reuse behavior.
+            openThread(state, tr, .replace);
             state.beginHandoffFromFocusedPane();
         },
         .archive => {
@@ -966,8 +969,8 @@ fn computeActionMenuLayout(state: *runtime.AppState) void {
     const can_sync = thread.provider_thread_id != null and !pending;
     const in_tui = state.threadIsOpenInTui(tr.project, tr.thread);
 
-    appendAction(.open, "Open", true);
-    appendAction(.open_split, "Open in New Pane", true);
+    appendAction(.open_new, "Open in New Pane", true);
+    appendAction(.replace, "Replace Current Pane", true);
     appendAction(.open_tui, if (in_tui) "Open as Chat" else "Open in TUI", in_tui or can_sync);
     appendAction(.sync, "Sync Thread", can_sync);
     appendAction(.handoff, "Handoff to Another Agent", !pending);
@@ -1031,11 +1034,15 @@ fn threadOpenPaneId(project: *const native_state.Project, thread_index: usize) ?
     return null;
 }
 
-/// Enter semantics for a thread result: focus its pane when already open,
-/// otherwise reuse a visible chat pane (replace). `split` forces a new pane.
-fn openThread(state: *runtime.AppState, tr: ThreadRef, split: bool) void {
+fn threadOpenIntentForActivation(replace: bool) ThreadOpenIntent {
+    return if (replace) .replace else .new_pane;
+}
+
+/// Enter opens a new pane; Ctrl/Cmd+Enter retains the former replace/reuse
+/// behavior, including focusing an existing pane for the selected thread.
+fn openThread(state: *runtime.AppState, tr: ThreadRef, intent: ThreadOpenIntent) void {
     if (tr.project >= state.project_controller.projects.items.len) return;
-    if (split) {
+    if (intent == .new_pane) {
         state.openThreadInWorkspaceSplit(tr.project, tr.thread);
         return;
     }
@@ -1850,7 +1857,7 @@ fn renderFooter(state: *runtime.AppState) void {
         .y = y,
         .w = modal_rect.w - theme.scaledUi(PAD_CSS) * 2.0,
         .h = font_size * 1.4,
-    }, "Enter Open    Ctrl+Enter New Pane    Tab Actions    Esc Close", paletteColor(theme.COLOR_TEXT_SUBTLE), font_size, modal_rect);
+    }, "Enter New Pane    Ctrl+Enter Replace    Tab Actions    Esc Close", paletteColor(theme.COLOR_TEXT_SUBTLE), font_size, modal_rect);
 }
 
 // ---------------------------------------------------------------------------
@@ -2050,6 +2057,11 @@ test "pane traversal commands follow the configured scrolling axis" {
     try std.testing.expectEqual(runtime.WorkspacePaneDirection.right, paneTraversalDirection(.horizontal, false));
     try std.testing.expectEqual(runtime.WorkspacePaneDirection.up, paneTraversalDirection(.vertical, true));
     try std.testing.expectEqual(runtime.WorkspacePaneDirection.down, paneTraversalDirection(.vertical, false));
+}
+
+test "thread activation defaults to new pane and modifier selects replace" {
+    try std.testing.expectEqual(ThreadOpenIntent.new_pane, threadOpenIntentForActivation(false));
+    try std.testing.expectEqual(ThreadOpenIntent.replace, threadOpenIntentForActivation(true));
 }
 
 test "fuzzyScore ranks substring above subsequence and rejects non-matches" {

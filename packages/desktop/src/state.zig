@@ -2366,9 +2366,8 @@ pub const AppState = struct {
     }
 
     /// Opens a thread in a brand-new chat pane split off the focused pane,
-    /// preserving the existing layout. This is the command palette's
-    /// Ctrl+Enter / "Open in New Pane" path; plain Enter goes through
-    /// `selectThreadForProject` (reuse a visible chat pane) instead.
+    /// preserving the existing layout. This is the command palette's default
+    /// Enter path; Ctrl+Enter uses `selectThreadForProject` to replace/reuse.
     pub fn openThreadInWorkspaceSplit(self: *AppState, project_index: usize, thread_index: usize) void {
         if (project_index >= self.project_controller.projects.items.len) return;
         var project = &self.project_controller.projects.items[project_index];
