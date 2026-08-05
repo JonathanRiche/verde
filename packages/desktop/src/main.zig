@@ -740,6 +740,12 @@ fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
             return;
         }
     }
+    if (!modalHitAtMouse(state)) {
+        if (sidebar_ui.systemCursorAt(mouse_x, mouse_y)) |cursor| {
+            applySystemCursor(cache, cursor);
+            return;
+        }
+    }
     if (!modalHitAtMouse(state) and browser_ui.wantsPointerAt(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) {
         applySystemCursor(cache, .pointer);
         return;

@@ -64,6 +64,9 @@ const SidebarHitKind = enum {
     workspace_row,
     workspace_avatar,
     open_pane,
+    /// Live pane row in its owning workspace subtree; supports click focus
+    /// and drag reordering in addition to the open-pane actions.
+    open_pane_reorder,
     /// Per-workspace history action icon; opens the command palette scoped to
     /// that workspace's saved threads.
     history,
@@ -138,6 +141,23 @@ var workspace_drop_before: usize = 0;
 var workspace_drop_line_y: f32 = 0.0;
 var workspace_drop_valid: bool = false;
 
+const PaneRowDragState = struct {
+    pending: bool = false,
+    active: bool = false,
+    project_index: usize = 0,
+    pane_id: native_state.WorkspacePaneId = 0,
+    start_x: f32 = 0.0,
+    start_y: f32 = 0.0,
+    x: f32 = 0.0,
+    y: f32 = 0.0,
+};
+
+var pane_row_drag: PaneRowDragState = .{};
+/// Drop slot in the owning layout's persisted pane array.
+var pane_drop_before: usize = 0;
+var pane_drop_line_rect: palette.Rect = .{};
+var pane_drop_valid: bool = false;
+
 /// Renders the sidebar with Palette-owned drawing and retained hit regions.
 pub fn renderPalette(state: *runtime.AppState, rect: palette.Rect) void {
     palette_sidebar_rect = rect;
@@ -187,6 +207,16 @@ pub fn wantsPointerAt(state: *const runtime.AppState, x: f32, y: f32) bool {
     return false;
 }
 
+/// Captured pane-row drags keep a move/grab cursor until mouse release, even
+/// after the pointer leaves the sidebar. SDL's system cursor set exposes
+/// `move` as the platform-native grab equivalent.
+pub fn systemCursorAt(x: f32, y: f32) ?sdl.SystemCursor {
+    _ = x;
+    _ = y;
+    if (pane_row_drag.pending or pane_row_drag.active) return .move;
+    return null;
+}
+
 pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
     if (state.isSidebarHidden()) {
         const reveal = x <= theme.scaledUi(HIDDEN_SIDEBAR_EDGE_REVEAL_CSS) or rectContainsPoint(palette_sidebar_rect, x, y);
@@ -194,6 +224,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
     }
 
     updateWorkspaceDrag(state, x, y);
+    updatePaneRowDrag(state, x, y);
 
     var new_project_hover: ?usize = null;
     var new_new_thread_hover: ?usize = null;
@@ -248,6 +279,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
 
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
     if (!down) {
+        if (pane_row_drag.pending or pane_row_drag.active) return finishPaneRowDrag(state, x, y);
         if (workspace_drag.pending or workspace_drag.active) return finishWorkspaceDrag(state, x, y);
         return rectContainsPoint(palette_sidebar_rect, x, y) or (state.sidebar_context_menu_open and rectContainsPoint(sidebar_menu_panel_rect, x, y));
     }
@@ -287,6 +319,9 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             },
             .open_pane => {
                 state.focusWorkspaceOpenPaneFromSidebar(hit.project_index, @intCast(hit.thread_index));
+            },
+            .open_pane_reorder => {
+                startPaneRowDrag(state, hit.project_index, @intCast(hit.thread_index), x, y);
             },
             .workspace_avatar => {
                 startWorkspaceDrag(state, hit.project_index, x, y, false);
@@ -354,7 +389,7 @@ pub fn handlePaletteSecondaryMouseButton(state: *runtime.AppState, x: f32, y: f3
                 state.markDirty();
                 return true;
             },
-            .open_pane => {
+            .open_pane, .open_pane_reorder => {
                 if (openPaneChatThreadIndex(state, hit.project_index, @intCast(hit.thread_index))) |thread_index| {
                     state.workspace_header_open_menu_open = false;
                     state.sidebar_context_menu_anchor_x = x;
@@ -377,18 +412,99 @@ pub fn handlePaletteSecondaryMouseButton(state: *runtime.AppState, x: f32, y: f3
 
 pub fn renderFloatingDragPreview(state: *runtime.AppState) void {
     renderWorkspaceDragOverlay(state);
+    renderPaneRowDragOverlay(state);
 }
 
 pub fn hasActiveThreadDrag() bool {
-    return workspace_drag.pending or workspace_drag.active;
+    return workspace_drag.pending or workspace_drag.active or pane_row_drag.pending or pane_row_drag.active;
 }
 
 pub fn finishThreadDragIfMouseReleased(state: *runtime.AppState, x: f32, y: f32, buttons: sdl.MouseButtonFlags) bool {
+    if (pane_row_drag.pending or pane_row_drag.active) {
+        if (buttons.left != 0) return false;
+        return finishPaneRowDrag(state, x, y);
+    }
     if (workspace_drag.pending or workspace_drag.active) {
         if (buttons.left != 0) return false;
         return finishWorkspaceDrag(state, x, y);
     }
     return false;
+}
+
+fn updatePaneRowDrag(state: *runtime.AppState, x: f32, y: f32) void {
+    if (!pane_row_drag.pending and !pane_row_drag.active) return;
+    pane_row_drag.x = x;
+    pane_row_drag.y = y;
+    if (pane_row_drag.pending) {
+        const dx = x - pane_row_drag.start_x;
+        const dy = y - pane_row_drag.start_y;
+        const threshold = theme.scaledUi(THREAD_DRAG_THRESHOLD_CSS);
+        if (dx * dx + dy * dy >= threshold * threshold) {
+            pane_row_drag.pending = false;
+            pane_row_drag.active = true;
+        }
+    }
+    if (pane_row_drag.active) computePaneDropTarget(state, y);
+    state.markDirty();
+}
+
+/// Finds the insertion slot among the visible rows of the dragged pane's
+/// owning workspace. Attention-cluster duplicates are deliberately excluded.
+fn computePaneDropTarget(state: *const runtime.AppState, y: f32) void {
+    pane_drop_valid = false;
+    if (pane_row_drag.project_index >= state.project_controller.projects.items.len) return;
+    const layout = &state.project_controller.projects.items[pane_row_drag.project_index].workspace_layout;
+    var index: usize = 0;
+    while (index < palette_hit_count) : (index += 1) {
+        const hit = palette_hits[index];
+        if (hit.kind != .open_pane_reorder or hit.project_index != pane_row_drag.project_index) continue;
+        const r = hit.rect;
+        const row_index = layout.paneIndexById(@intCast(hit.thread_index)) orelse continue;
+        pane_drop_line_rect = .{ .x = r.x, .y = r.y, .w = r.w, .h = theme.scaledUi(2.0) };
+        if (y < r.y + r.h * 0.5) {
+            pane_drop_before = row_index;
+            pane_drop_valid = true;
+            return;
+        }
+        pane_drop_before = row_index + 1;
+        pane_drop_line_rect.y = r.y + r.h;
+        pane_drop_valid = true;
+    }
+}
+
+fn startPaneRowDrag(state: *runtime.AppState, project_index: usize, pane_id: native_state.WorkspacePaneId, x: f32, y: f32) void {
+    if (project_index >= state.project_controller.projects.items.len) return;
+    const layout = &state.project_controller.projects.items[project_index].workspace_layout;
+    _ = layout.paneById(pane_id) orelse return;
+    pane_drop_valid = false;
+    pane_row_drag = .{
+        .pending = true,
+        .project_index = project_index,
+        .pane_id = pane_id,
+        .start_x = x,
+        .start_y = y,
+        .x = x,
+        .y = y,
+    };
+    _ = sdl.captureMouse(true);
+    state.markDirty();
+}
+
+fn finishPaneRowDrag(state: *runtime.AppState, x: f32, y: f32) bool {
+    _ = x;
+    _ = y;
+    const drag = pane_row_drag;
+    pane_row_drag = .{};
+    _ = sdl.captureMouse(false);
+
+    if (!drag.active) {
+        state.focusWorkspaceOpenPaneFromSidebar(drag.project_index, drag.pane_id);
+    } else if (pane_drop_valid) {
+        _ = state.moveWorkspacePaneInSidebarOrder(drag.project_index, drag.pane_id, pane_drop_before);
+    }
+    pane_drop_valid = false;
+    state.markDirty();
+    return true;
 }
 
 fn updateWorkspaceDrag(state: *runtime.AppState, x: f32, y: f32) void {
@@ -528,6 +644,60 @@ fn renderWorkspaceDragOverlay(state: *runtime.AppState) void {
         .w = rect.w - theme.scaledUi(20.0),
         .h = font * 1.25,
     }, project.label, paletteColor(theme.COLOR_WHITE), font, rect);
+}
+
+// Renders the pane-row insertion marker and floating drag preview.
+fn renderPaneRowDragOverlay(state: *runtime.AppState) void {
+    if (!pane_row_drag.active) return;
+    if (pane_row_drag.project_index >= state.project_controller.projects.items.len) return;
+    const project = &state.project_controller.projects.items[pane_row_drag.project_index];
+    const pane = project.workspace_layout.paneById(pane_row_drag.pane_id) orelse return;
+
+    const previous_z = state.palette_overlay_batch.setZIndex(THREAD_DRAG_FLOATING_Z);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
+
+    if (pane_drop_valid) {
+        queuePaletteRoundedRect(state, .{
+            .x = pane_drop_line_rect.x,
+            .y = pane_drop_line_rect.y - pane_drop_line_rect.h * 0.5,
+            .w = pane_drop_line_rect.w,
+            .h = pane_drop_line_rect.h,
+        }, paletteColor(theme.COLOR_GREEN), pane_drop_line_rect.h * 0.5);
+    }
+
+    const w = theme.scaledUi(200.0);
+    const h = theme.scaledUi(30.0);
+    const rect: palette.Rect = .{
+        .x = pane_row_drag.x + theme.scaledUi(12.0),
+        .y = pane_row_drag.y + theme.scaledUi(8.0),
+        .w = w,
+        .h = h,
+    };
+    queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 232)), theme.scaledUi(8.0));
+    queuePaletteBorder(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 180)), theme.scaledUi(8.0), theme.scaledUi(1.0));
+    const font = theme.scaledUi(13.5);
+    queuePaletteText(state, .{
+        .x = rect.x + theme.scaledUi(12.0),
+        .y = rect.y + (rect.h - font * 1.25) * 0.5,
+        .w = rect.w - theme.scaledUi(20.0),
+        .h = font * 1.25,
+    }, paneDragLabel(state, pane_row_drag.project_index, project, pane), paletteColor(theme.COLOR_WHITE), font, rect);
+}
+
+fn paneDragLabel(
+    state: *const runtime.AppState,
+    project_index: usize,
+    project: *const native_state.Project,
+    pane: *const native_state.WorkspacePane,
+) []const u8 {
+    return switch (pane.ref) {
+        .chat => |ref| if (ref.thread_index < project.threads.items.len) project.threads.items[ref.thread_index].title else "Chat",
+        .terminal => |ref| if (state.projectTerminalSurface(project_index, ref.dock_id)) |surface|
+            if (surface.title.len > 0) surface.title else "Terminal"
+        else
+            "Terminal",
+        .browser => browserPaneTitle(pane),
+    };
 }
 
 fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) bool {
@@ -1512,7 +1682,7 @@ fn renderOpenPaneRow(
     } else if (hovered) {
         queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.withAlpha(theme.COLOR_GREEN, 48)), theme.scaledUi(7.0));
     }
-    addPaletteHit(rect, .open_pane, project_index, pane.id);
+    addPaletteHit(rect, if (show_workspace_tag) .open_pane else .open_pane_reorder, project_index, pane.id);
 
     const cy = rect.y + rect.h * 0.5;
     var icon_x = rect.x + theme.scaledUi(SIDEBAR_THREAD_ICON_LEADING_PAD_CSS);
@@ -1807,6 +1977,19 @@ fn addPaletteHit(rect: palette.Rect, kind: SidebarHitKind, project_index: usize,
 
 fn rectContainsPoint(rect: palette.Rect, x: f32, y: f32) bool {
     return x >= rect.x and y >= rect.y and x <= rect.x + rect.w and y <= rect.y + rect.h;
+}
+
+test "pane row drag owns move cursor from press through active drag" {
+    const previous_drag = pane_row_drag;
+    defer pane_row_drag = previous_drag;
+
+    pane_row_drag = .{};
+    try std.testing.expectEqual(@as(?sdl.SystemCursor, null), systemCursorAt(0, 0));
+    pane_row_drag.pending = true;
+    try std.testing.expectEqual(@as(?sdl.SystemCursor, .move), systemCursorAt(0, 0));
+    pane_row_drag.pending = false;
+    pane_row_drag.active = true;
+    try std.testing.expectEqual(@as(?sdl.SystemCursor, .move), systemCursorAt(0, 0));
 }
 
 fn queuePaletteRoundedRect(state: *runtime.AppState, rect: palette.Rect, color: palette.Color, radius: f32) void {
