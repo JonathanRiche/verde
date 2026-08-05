@@ -98,7 +98,9 @@ Most of these options also appear in Settings:
   set the default open action for project files and folders, and choose whether
   new chats create panes or replace an existing chat pane. Mode and threshold
   can inherit these global values or be overridden for the currently selected
-  workspace. Pane gaps are omitted while zoomed.
+  workspace. Drag-resized column widths are also saved per workspace and take
+  precedence over panes-per-view sizing until reset. Pane gaps are omitted
+  while zoomed.
 - **Agent integrations** — status-pip hooks for supported provider CLIs.
 - **Updates** — check now, install an available release, and automatic checks.
 - **Notifications** — enable or disable desktop notifications.

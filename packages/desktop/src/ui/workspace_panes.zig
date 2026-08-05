@@ -10,6 +10,7 @@ const palette = @import("palette");
 const sdl = @import("zsdl3");
 
 const app_config = @import("../app/config.zig");
+const workspace_layout = @import("../state/workspace_layout.zig");
 const runtime = @import("runtime.zig");
 const browser_panel = @import("browser.zig");
 const chat_panel = @import("chat_panel.zig");
@@ -78,6 +79,7 @@ const WorkspacePaneAction = enum {
     split_terminal_down,
     close,
     resize_split,
+    resize_scrolling_column,
     move_quick_pane,
     resize_quick_pane,
 };
@@ -89,6 +91,8 @@ const WorkspacePaneHit = struct {
     axis: runtime.WorkspaceSplitAxis = .horizontal,
     rect: palette.Rect = .{},
     split_rect: palette.Rect = .{},
+    pane_index: usize = 0,
+    scroll_offset: f32 = 0.0,
 };
 
 const WorkspacePaneHitCache = struct {
@@ -812,7 +816,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
                 _ = state.closeCurrentProjectWorkspacePane(hit.pane_id);
                 split_menu_open_for = null;
             },
-            .resize_split => {
+            .resize_split, .resize_scrolling_column => {
                 resize_drag = hit;
                 updateResizeDrag(state, hit, x, y);
             },
@@ -1148,7 +1152,10 @@ fn renderScrollingStrip(
 
     const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
     const viewport_extent = if (vertical) workspace.h else workspace.w;
-    const pane_extent = scrollingPaneExtent(viewport_extent, gap, state.app_config.workspace_panes_per_view);
+    const pane_extent = if (layout.scroll_pane_extent_override) |override_css|
+        theme.scaledUi(theme.clampf(override_css, workspace_layout.MIN_SCROLL_PANE_EXTENT_CSS, workspace_layout.MAX_SCROLL_PANE_EXTENT_CSS))
+    else
+        scrollingPaneExtent(viewport_extent, gap, state.app_config.workspace_panes_per_view);
     const pane_count = layout.visiblePaneCount();
     const total_extent = pane_extent * @as(f32, @floatFromInt(pane_count)) + gap * @as(f32, @floatFromInt(pane_count - 1));
     const max_offset = @max(0.0, total_extent - viewport_extent);
@@ -1211,6 +1218,20 @@ fn renderScrollingPane(
         .vertical => .{ .x = workspace.x, .y = rect.y + rect.h, .w = workspace.w, .h = gap },
     };
     if (intersectRects(gutter, workspace) != null) queueRect(state, gutter, paletteColor(theme.background()));
+    const grip_extent = theme.scaledUi(10.0);
+    const grip: palette.Rect = switch (direction) {
+        .horizontal => .{ .x = rect.x + rect.w - grip_extent * 0.5, .y = workspace.y, .w = grip_extent, .h = workspace.h },
+        .vertical => .{ .x = workspace.x, .y = rect.y + rect.h - grip_extent * 0.5, .w = workspace.w, .h = grip_extent },
+    };
+    if (intersectRects(grip, workspace) != null) appendHit(.{
+        .pane_id = pane_id,
+        .action = .resize_scrolling_column,
+        .axis = if (direction == .horizontal) .vertical else .horizontal,
+        .rect = grip,
+        .split_rect = workspace,
+        .pane_index = pane_index,
+        .scroll_offset = offset,
+    });
 }
 
 fn paneIndexInSidebarOrder(layout: *const runtime.WorkspaceLayout, pane_id: runtime.WorkspacePaneId) ?usize {
@@ -1226,6 +1247,13 @@ fn paneIndexInSidebarOrder(layout: *const runtime.WorkspaceLayout, pane_id: runt
 fn scrollingPaneExtent(viewport_extent: f32, gap: f32, panes_per_view: u8) f32 {
     const count: f32 = @floatFromInt(@max(panes_per_view, 1));
     return @max((viewport_extent - gap * (count - 1.0)) / count, 1.0);
+}
+
+fn scrollingPaneExtentFromDrag(position: f32, scroll_offset: f32, gap: f32, pane_index: usize, ui_scale: f32) f32 {
+    const pane_number: f32 = @floatFromInt(pane_index + 1);
+    const preceding_gaps = gap * @as(f32, @floatFromInt(pane_index));
+    const pane_extent = (position + scroll_offset - preceding_gaps) / pane_number;
+    return pane_extent / @max(ui_scale, 0.001);
 }
 
 fn revealedScrollTarget(current: f32, viewport_w: f32, column_w: f32, gap: f32, pane_index: usize, max_offset: f32) f32 {
@@ -1281,6 +1309,8 @@ fn clipWorkspaceBatch(state: *runtime.AppState, command_start: usize, text_run_s
 }
 
 fn clipWorkspaceHitCaches(workspace: palette.Rect) void {
+    chat_panel.clipTranscriptHitCache(workspace);
+
     var write_index: usize = 0;
     for (hit_cache.hits[0..hit_cache.count]) |hit| {
         var clipped = hit;
@@ -1366,6 +1396,25 @@ fn firstPaneId(node: *const runtime.WorkspaceNode) ?runtime.WorkspacePaneId {
 }
 
 fn updateResizeDrag(state: *runtime.AppState, hit: WorkspacePaneHit, x: f32, y: f32) void {
+    if (hit.action == .resize_scrolling_column) {
+        if (state.project_controller.selected_index >= state.project_controller.projects.items.len) return;
+        const position = if (hit.axis == .vertical) x - hit.split_rect.x else y - hit.split_rect.y;
+        const pane_extent_css = scrollingPaneExtentFromDrag(
+            position,
+            hit.scroll_offset,
+            theme.scaledUi(state.app_config.workspace_pane_gap),
+            hit.pane_index,
+            theme.uiScaleFactor(),
+        );
+        const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
+        layout.scroll_pane_extent_override = theme.clampf(
+            pane_extent_css,
+            workspace_layout.MIN_SCROLL_PANE_EXTENT_CSS,
+            workspace_layout.MAX_SCROLL_PANE_EXTENT_CSS,
+        );
+        state.markDirty();
+        return;
+    }
     const ratio = if (hit.axis == .vertical)
         (x - hit.split_rect.x) / @max(hit.split_rect.w, 1.0)
     else
@@ -1840,6 +1889,13 @@ test "scrolling pane extent fits the configured panes per view" {
         const count_f: f32 = @floatFromInt(count);
         try std.testing.expectApproxEqAbs(viewport_extent, pane_extent * count_f + gap * (count_f - 1.0), 0.001);
     }
+}
+
+test "scrolling column drag resolves width across pane index offset and scale" {
+    try std.testing.expectApproxEqAbs(@as(f32, 500.0), scrollingPaneExtentFromDrag(500.0, 0.0, 12.0, 0, 1.0), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 500.0), scrollingPaneExtentFromDrag(1012.0, 0.0, 12.0, 1, 1.0), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 500.0), scrollingPaneExtentFromDrag(812.0, 200.0, 12.0, 1, 1.0), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 500.0), scrollingPaneExtentFromDrag(1000.0, 0.0, 24.0, 0, 2.0), 0.0001);
 }
 
 test "scrolling layout policy supports automatic always and disabled modes" {
