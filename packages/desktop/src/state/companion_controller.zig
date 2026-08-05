@@ -59,8 +59,11 @@ pub const PointerButtonResult = struct {
 };
 
 const PRESENTATION_TEXT_CAPACITY = 512;
+const INSPECTOR_TEXT_CAPACITY = 160;
 pub const MAX_OPERATIONS: usize = 32;
 pub const MAX_ACTIVITY: usize = 64;
+pub const MAX_INSPECTOR_FILES: usize = 4;
+pub const MAX_INSPECTOR_RESOURCES: usize = 4;
 
 pub const PresentationText = struct {
     storage: [PRESENTATION_TEXT_CAPACITY:0]u8 = std.mem.zeroes([PRESENTATION_TEXT_CAPACITY:0]u8),
@@ -126,6 +129,164 @@ pub const PresentationText = struct {
     }
 };
 
+/// Value-owned routing text. Unlike presentation text, assignment is all or
+/// nothing so a rendered frame can never route through a truncated key.
+pub const ExactText = struct {
+    storage: [PRESENTATION_TEXT_CAPACITY:0]u8 = std.mem.zeroes([PRESENTATION_TEXT_CAPACITY:0]u8),
+
+    pub fn set(self: *ExactText, value: []const u8) bool {
+        if (value.len == 0 or value.len >= self.storage.len or std.mem.indexOfScalar(u8, value, 0) != null) return false;
+        var replacement: ExactText = .{};
+        @memcpy(replacement.storage[0..value.len], value);
+        replacement.storage[value.len] = 0;
+        self.* = replacement;
+        return true;
+    }
+
+    pub fn slice(self: *const ExactText) []const u8 {
+        return std.mem.sliceTo(self.storage[0..], 0);
+    }
+
+    pub fn eql(self: *const ExactText, other: *const ExactText) bool {
+        return std.mem.eql(u8, self.slice(), other.slice());
+    }
+};
+
+pub const OptionalExactText = struct {
+    present: bool = false,
+    value: ExactText = .{},
+
+    pub fn set(self: *OptionalExactText, value: ?[]const u8) bool {
+        const raw = value orelse {
+            self.* = .{};
+            return true;
+        };
+        var replacement: OptionalExactText = .{ .present = true };
+        if (!replacement.value.set(raw)) return false;
+        self.* = replacement;
+        return true;
+    }
+
+    pub fn slice(self: *const OptionalExactText) ?[]const u8 {
+        return if (self.present) self.value.slice() else null;
+    }
+};
+
+pub const OperationOwner = struct {
+    workspace_id: ExactText = .{},
+    local_thread_id: ExactText = .{},
+    valid: bool = false,
+
+    pub fn set(self: *OperationOwner, workspace_id: []const u8, local_thread_id: []const u8) bool {
+        var replacement: OperationOwner = .{};
+        if (!replacement.workspace_id.set(workspace_id) or !replacement.local_thread_id.set(local_thread_id)) return false;
+        replacement.valid = true;
+        self.* = replacement;
+        return true;
+    }
+
+    pub fn eql(self: *const OperationOwner, other: *const OperationOwner) bool {
+        return self.valid and other.valid and self.workspace_id.eql(&other.workspace_id) and
+            self.local_thread_id.eql(&other.local_thread_id);
+    }
+};
+
+pub const OperationCategory = enum {
+    provider_tool,
+    background_task,
+};
+
+pub const BackgroundIdentity = union(enum) {
+    task_id: ExactText,
+    item: struct {
+        provider_thread_id: ExactText,
+        item_id: ExactText,
+    },
+    process: struct {
+        provider_thread_id: ExactText,
+        process_id: ExactText,
+    },
+    command: ExactText,
+};
+
+pub const BackgroundTarget = struct {
+    identity: BackgroundIdentity,
+    command: ExactText,
+    task_id: OptionalExactText = .{},
+    item_id: OptionalExactText = .{},
+    process_id: OptionalExactText = .{},
+    provider_thread_id: OptionalExactText = .{},
+    pid_path: OptionalExactText = .{},
+    log_path: OptionalExactText = .{},
+    pid: ?u32 = null,
+    pid_verified: bool = false,
+    provider_owned: bool = false,
+};
+
+pub const OperationTarget = union(enum) {
+    none,
+    tool_call: ExactText,
+    background_task: BackgroundTarget,
+};
+
+pub const SupportedActions = packed struct {
+    inspect: bool = true,
+    stop: bool = false,
+    follow_log: bool = false,
+    reveal: bool = false,
+    redirect: bool = false,
+};
+
+pub const InspectorText = struct {
+    storage: [INSPECTOR_TEXT_CAPACITY:0]u8 = std.mem.zeroes([INSPECTOR_TEXT_CAPACITY:0]u8),
+
+    pub fn set(self: *InspectorText, value: []const u8) void {
+        const len = @min(value.len, self.storage.len - 1);
+        @memcpy(self.storage[0..len], value[0..len]);
+        self.storage[len] = 0;
+    }
+
+    pub fn slice(self: *const InspectorText) []const u8 {
+        return std.mem.sliceTo(self.storage[0..], 0);
+    }
+};
+
+pub const Inspector = struct {
+    owner: InspectorText = .{},
+    workspace: InspectorText = .{},
+    action: InspectorText = .{},
+    target: InspectorText = .{},
+    provider: InspectorText = .{},
+    cwd: InspectorText = .{},
+    state: InspectorText = .{},
+    wait_reason: InspectorText = .{},
+    failure_reason: InspectorText = .{},
+    input: InspectorText = .{},
+    output: InspectorText = .{},
+    locations: InspectorText = .{},
+    raw: InspectorText = .{},
+    files: [MAX_INSPECTOR_FILES]InspectorText = [_]InspectorText{.{}} ** MAX_INSPECTOR_FILES,
+    file_count: usize = 0,
+    resources: [MAX_INSPECTOR_RESOURCES]InspectorText = [_]InspectorText{.{}} ** MAX_INSPECTOR_RESOURCES,
+    resource_count: usize = 0,
+    started_at_ms: ?i64 = null,
+    updated_at_ms: ?i64 = null,
+    elapsed_ms: ?i64 = null,
+};
+
+pub const OperationAction = enum {
+    stop,
+    follow_log,
+};
+
+pub const OperationReference = struct {
+    owner: OperationOwner,
+    identity: ExactText,
+    category: OperationCategory,
+    target: OperationTarget,
+    actions: SupportedActions,
+};
+
 pub const OperationStatus = enum {
     pending,
     in_progress,
@@ -138,6 +299,10 @@ pub const Operation = struct {
     identity: PresentationText = .{},
     title: PresentationText = .{},
     detail: PresentationText = .{},
+    category: OperationCategory = .provider_tool,
+    target: OperationTarget = .none,
+    inspector: Inspector = .{},
+    actions: SupportedActions = .{},
     status: OperationStatus = .pending,
     sequence: i64 = 0,
     process: bool = false,
@@ -173,6 +338,7 @@ pub const ActiveCounts = struct {
 pub const Frame = struct {
     workspace_id: PresentationText = .{},
     thread_id: PresentationText = .{},
+    owner: OperationOwner = .{},
     has_thread: bool = false,
     has_approval: bool = false,
     has_failure: bool = false,
@@ -198,6 +364,36 @@ pub const Frame = struct {
     operation_count: usize = 0,
     activity: [MAX_ACTIVITY]ActivityItem = [_]ActivityItem{.{}} ** MAX_ACTIVITY,
     activity_count: usize = 0,
+
+    pub fn setOwner(self: *Frame, workspace_id: []const u8, local_thread_id: []const u8) bool {
+        self.workspace_id.set(workspace_id);
+        self.thread_id.set(local_thread_id);
+        return self.owner.set(workspace_id, local_thread_id);
+    }
+
+    pub fn operationReference(self: *const Frame, index: usize) ?OperationReference {
+        if (!self.owner.valid or index >= self.operation_count) return null;
+        const operation = &self.operations[index];
+        var identity: ExactText = .{};
+        if (!identity.set(operation.identity.slice())) return null;
+        return .{
+            .owner = self.owner,
+            .identity = identity,
+            .category = operation.category,
+            .target = operation.target,
+            .actions = operation.actions,
+        };
+    }
+
+    pub fn containsReference(self: *const Frame, reference: *const OperationReference) bool {
+        if (!self.owner.eql(&reference.owner)) return false;
+        for (self.operations[0..self.operation_count]) |*operation| {
+            if (!std.mem.eql(u8, operation.identity.slice(), reference.identity.slice())) continue;
+            return operation.category == reference.category and std.meta.eql(operation.target, reference.target) and
+                std.meta.eql(operation.actions, reference.actions);
+        }
+        return false;
+    }
 
     pub fn upsertOperation(self: *Frame, operation: Operation) void {
         const identity = operation.identity.slice();
@@ -575,6 +771,60 @@ test "operation identity upserts across lifecycle and moves from Active to Recen
     try std.testing.expectEqual(OperationStatus.completed, frame.operations[0].status);
     try std.testing.expectEqual(@as(usize, 0), frame.activeCounts().working + frame.activeCounts().pending);
     try std.testing.expectEqual(@as(usize, 1), frame.recentCount());
+}
+
+test "exact routing text rejects empty NUL and overflow without truncating" {
+    var exact: ExactText = .{};
+    try std.testing.expect(exact.set("owner:thread:with:colons"));
+    const preserved = exact;
+    try std.testing.expect(!exact.set(""));
+    try std.testing.expect(exact.eql(&preserved));
+    const nul = [_]u8{ 'a', 0, 'b' };
+    try std.testing.expect(!exact.set(&nul));
+    try std.testing.expect(exact.eql(&preserved));
+    const overflow = [_]u8{'x'} ** PRESENTATION_TEXT_CAPACITY;
+    try std.testing.expect(!exact.set(&overflow));
+    try std.testing.expect(exact.eql(&preserved));
+
+    const long = [_]u8{'l'} ** (PRESENTATION_TEXT_CAPACITY - 1);
+    try std.testing.expect(exact.set(&long));
+    try std.testing.expectEqualSlices(u8, &long, exact.slice());
+}
+
+test "operation reference retains target metadata through lifecycle copies" {
+    var frame: Frame = .{};
+    try std.testing.expect(frame.setOwner("workspace:one", "thread:one"));
+    var call_id: ExactText = .{};
+    try std.testing.expect(call_id.set("call:one"));
+    var operation = testOperation("tool:8:call:one", .pending, 1);
+    operation.category = .provider_tool;
+    operation.target = .{ .tool_call = call_id };
+    operation.inspector.input.set("structured input");
+    frame.upsertOperation(operation);
+    operation.status = .completed;
+    operation.inspector.output.set("structured output");
+    frame.upsertOperation(operation);
+
+    const reference = frame.operationReference(0).?;
+    var copied = frame;
+    frame.owner = .{};
+    operation.inspector.output.set("mutated source");
+    try std.testing.expect(copied.containsReference(&reference));
+    try std.testing.expectEqualStrings("structured output", copied.operations[0].inspector.output.slice());
+    try std.testing.expectEqualStrings("call:one", copied.operations[0].target.tool_call.slice());
+}
+
+test "evicted operation references cannot match a later bounded frame" {
+    var frame: Frame = .{};
+    try std.testing.expect(frame.setOwner("workspace", "thread"));
+    frame.upsertOperation(testOperation("oldest", .completed, 0));
+    const oldest = frame.operationReference(0).?;
+    var id_buffer: [32]u8 = undefined;
+    for (1..MAX_OPERATIONS + 2) |index| {
+        const identity = std.fmt.bufPrint(&id_buffer, "new-{d}", .{index}) catch unreachable;
+        frame.upsertOperation(testOperation(identity, .completed, @intCast(index)));
+    }
+    try std.testing.expect(!frame.containsReference(&oldest));
 }
 
 test "bounded operations prioritize active and activity retains newest chronology" {
