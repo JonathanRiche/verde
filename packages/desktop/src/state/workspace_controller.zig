@@ -1188,6 +1188,19 @@ pub fn swapCurrentProjectWorkspacePanes(self: anytype, first_pane_id: WorkspaceP
     return true;
 }
 
+pub fn moveWorkspacePaneInSidebarOrder(
+    self: anytype,
+    project_index: usize,
+    pane_id: WorkspacePaneId,
+    before_index: usize,
+) bool {
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    var layout = &self.project_controller.projects.items[project_index].workspace_layout;
+    if (!layout.movePaneBefore(pane_id, before_index)) return false;
+    self.markDirty();
+    return true;
+}
+
 pub fn moveWorkspacePaneInDirection(
     self: anytype,
     project_index: usize,

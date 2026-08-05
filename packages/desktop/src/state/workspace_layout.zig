@@ -435,6 +435,23 @@ pub const WorkspaceLayout = struct {
         return null;
     }
 
+    /// Moves a pane in the persisted sidebar order. `before_index` is a slot
+    /// in the original array and may equal `panes.len` to move to the end.
+    pub fn movePaneBefore(self: *WorkspaceLayout, pane_id: WorkspacePaneId, before_index: usize) bool {
+        const pane_count = self.panes.items.len;
+        if (pane_count < 2) return false;
+        const source_index = self.paneIndexById(pane_id) orelse return false;
+
+        var destination_index = @min(before_index, pane_count);
+        if (destination_index > source_index) destination_index -= 1;
+        if (destination_index == source_index) return false;
+
+        const pane = self.panes.orderedRemove(source_index);
+        self.panes.insertAssumeCapacity(destination_index, pane);
+        self.scroll_revealed_pane_id = null;
+        return true;
+    }
+
     pub fn swapPaneRefs(self: *WorkspaceLayout, first_pane_id: WorkspacePaneId, second_pane_id: WorkspacePaneId) bool {
         const first_index = self.paneIndexById(first_pane_id) orelse return false;
         const second_index = self.paneIndexById(second_pane_id) orelse return false;
@@ -1548,6 +1565,32 @@ test "workspace sidebar order provides scrolling neighbors on either axis" {
     try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.adjacentTiledPaneIdInSidebarOrder(middle_pane_id, .right));
     try std.testing.expectEqual(@as(?WorkspacePaneId, 1), layout.adjacentTiledPaneIdInSidebarOrder(second_pane_id, .up));
     try std.testing.expectEqual(@as(?WorkspacePaneId, middle_pane_id), layout.adjacentTiledPaneIdInSidebarOrder(second_pane_id, .down));
+}
+
+test "workspace panes can be reordered by sidebar insertion slot" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const second_pane_id = try layout.createTerminalPane(allocator, 10);
+    try layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
+    const third_pane_id = try layout.createTerminalPane(allocator, 11);
+    try layout.splitPaneWithLeaf(allocator, second_pane_id, third_pane_id, .vertical, true);
+    layout.focused_pane_id = second_pane_id;
+    layout.scroll_revealed_pane_id = second_pane_id;
+
+    try std.testing.expect(layout.movePaneBefore(third_pane_id, 0));
+    try std.testing.expectEqual(third_pane_id, layout.panes.items[0].id);
+    try std.testing.expectEqual(@as(WorkspacePaneId, 1), layout.panes.items[1].id);
+    try std.testing.expectEqual(second_pane_id, layout.panes.items[2].id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.scroll_revealed_pane_id);
+
+    try std.testing.expect(layout.movePaneBefore(third_pane_id, layout.panes.items.len));
+    try std.testing.expectEqual(@as(WorkspacePaneId, 1), layout.panes.items[0].id);
+    try std.testing.expectEqual(second_pane_id, layout.panes.items[1].id);
+    try std.testing.expectEqual(third_pane_id, layout.panes.items[2].id);
+    try std.testing.expect(!layout.movePaneBefore(second_pane_id, 2));
 }
 
 test "workspace layout persists the scrolling target" {

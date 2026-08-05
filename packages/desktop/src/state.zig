@@ -5703,6 +5703,7 @@ pub const AppState = struct {
     pub const focusCurrentProjectWorkspacePane = workspace_controller.focusCurrentProjectWorkspacePane;
     pub const focusPromptForFocusedChatWorkspacePane = workspace_controller.focusPromptForFocusedChatWorkspacePane;
     pub const swapCurrentProjectWorkspacePanes = workspace_controller.swapCurrentProjectWorkspacePanes;
+    pub const moveWorkspacePaneInSidebarOrder = workspace_controller.moveWorkspacePaneInSidebarOrder;
     pub const moveWorkspacePaneInDirection = workspace_controller.moveWorkspacePaneInDirection;
     pub const moveCurrentProjectWorkspacePaneToPlacement = workspace_controller.moveCurrentProjectWorkspacePaneToPlacement;
     pub const toggleCurrentProjectWorkspacePaneMaximized = workspace_controller.toggleCurrentProjectWorkspacePaneMaximized;
