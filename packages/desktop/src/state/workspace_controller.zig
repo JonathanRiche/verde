@@ -1118,6 +1118,10 @@ pub fn focusWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
     if (project_index >= self.project_controller.projects.items.len) return false;
     var layout = &self.project_controller.projects.items[project_index].workspace_layout;
     const pane = layout.paneById(pane_id) orelse return false;
+    // Ordinary focus movement uses the strip's minimal-reveal behavior. A
+    // direct navigation path may request leading-edge placement after this
+    // method completes.
+    layout.scroll_leading_pane_id = null;
     // Composer popovers belong to the live composer pane; leaving them
     // open on a pane that no longer renders them would silently keep
     // eating clicks through the popover routing.

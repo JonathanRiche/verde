@@ -71,8 +71,10 @@ shortcut follows the selected scroll direction.
 strip. **Panes per view** controls how many panes fit along that axis (1–6,
 default 2), and **Pane spacing** controls their gap. Manual wheel or touchpad
 scrolling is intentionally free-form, so the strip can stop with part of a pane
-visible like Niri. Focus movement from the keyboard, command palette, or
-sidebar instead scrolls just far enough to reveal the complete focused pane.
+visible like Niri. Adjacent focus movement scrolls just far enough to reveal
+the complete focused pane. Direct jumps from the sidebar, command palette, or
+numbered pane shortcut place the selected pane at the strip's leading edge
+(left in horizontal mode, top in vertical mode), including the final pane.
 Horizontal and vertical positions are restored independently per workspace;
 zoom temporarily fills the workspace without changing either saved position
 or the selected scrolling policy.

@@ -1170,16 +1170,20 @@ fn renderScrollingStrip(
     if (layout.focused_pane_id) |focused_id| {
         if (layout.rootContainsPane(focused_id) and layout.scroll_revealed_pane_id != focused_id) {
             if (paneIndexInSidebarOrder(layout, focused_id)) |focused_index| {
-                const next_target = revealedScrollTarget(
-                    target.*,
-                    viewport_extent,
-                    pane_extent,
-                    gap,
-                    focused_index,
-                    max_offset,
-                );
+                const next_target = if (layout.scroll_leading_pane_id == focused_id)
+                    leadingScrollTarget(pane_extent, gap, focused_index, max_offset)
+                else
+                    revealedScrollTarget(
+                        target.*,
+                        viewport_extent,
+                        pane_extent,
+                        gap,
+                        focused_index,
+                        max_offset,
+                    );
                 setScrollingTarget(state, target, &layout.scroll_animation_last_ms, next_target);
             }
+            layout.scroll_leading_pane_id = null;
             layout.scroll_revealed_pane_id = focused_id;
         }
     }
@@ -1216,7 +1220,7 @@ fn renderScrollingPane(
         .vertical => .{ .x = workspace.x, .y = workspace.y + origin, .w = workspace.w, .h = pane_extent },
     };
     if (intersectRects(rect, workspace) == null) return;
-    renderLeaf(state, pane_id, rect);
+    renderLeafWithin(state, pane_id, rect, workspace);
     const gutter: palette.Rect = switch (direction) {
         .horizontal => .{ .x = rect.x + rect.w, .y = workspace.y, .w = gap, .h = workspace.h },
         .vertical => .{ .x = workspace.x, .y = rect.y + rect.h, .w = workspace.w, .h = gap },
@@ -1257,7 +1261,9 @@ fn scrollingMaxOffset(viewport_extent: f32, pane_extent: f32, gap: f32, pane_cou
     if (pane_count == 0) return 0.0;
     const count: f32 = @floatFromInt(pane_count);
     const total_extent = pane_extent * count + gap * (count - 1.0);
-    return @max(0.0, total_extent - viewport_extent);
+    const ordinary_max = @max(0.0, total_extent - viewport_extent);
+    const final_pane_origin = (count - 1.0) * (pane_extent + gap);
+    return @max(ordinary_max, final_pane_origin);
 }
 
 fn scrollingPaneExtentFromDrag(position: f32, scroll_offset: f32, gap: f32, pane_index: usize, ui_scale: f32) f32 {
@@ -1277,6 +1283,11 @@ fn revealedScrollTarget(current: f32, viewport_w: f32, column_w: f32, gap: f32, 
         target = column_right - viewport_w;
     }
     return std.math.clamp(target, 0.0, max_offset);
+}
+
+fn leadingScrollTarget(column_w: f32, gap: f32, pane_index: usize, max_offset: f32) f32 {
+    const column_left = @as(f32, @floatFromInt(pane_index)) * (column_w + gap);
+    return std.math.clamp(column_left, 0.0, max_offset);
 }
 
 fn setScrollingTarget(state: *runtime.AppState, current_target: *f32, animation_last_ms: *i64, target: f32) void {
@@ -1434,6 +1445,12 @@ fn updateResizeDrag(state: *runtime.AppState, hit: WorkspacePaneHit, x: f32, y: 
 }
 
 fn renderLeaf(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: palette.Rect) void {
+    renderLeafWithin(state, pane_id, rect, null);
+}
+
+fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: palette.Rect, viewport_clip: ?palette.Rect) void {
+    // Workspace pane contents. Scrolling panes pass the visible workspace so
+    // expensive renderers can avoid emitting commands that will be clipped.
     const kind = state.workspacePaneKindById(pane_id) orelse return;
     if (pane_rect_count < pane_rects.len) {
         pane_rects[pane_rect_count] = .{ .pane_id = pane_id, .rect = rect };
@@ -1450,7 +1467,11 @@ fn renderLeaf(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: 
         .chat => chat_panel.renderWorkspaceAtForPaneWithReserve(state, rect, pane_id, reserve),
         .terminal => {
             const dock_id = state.workspaceTerminalDockIdByPane(pane_id) orelse 0;
-            terminal_panel.renderDockAtForDockWithReserve(state, rect, dock_id, reserve);
+            if (viewport_clip) |clip| {
+                terminal_panel.renderDockAtForDockWithin(state, rect, dock_id, reserve, clip);
+            } else {
+                terminal_panel.renderDockAtForDockWithReserve(state, rect, dock_id, reserve);
+            }
         },
         .browser => {
             browser_pane_rendered = true;
@@ -1903,21 +1924,32 @@ test "scrolling pane extent fits the configured panes per view" {
     }
 }
 
-test "scrolling offsets clamp when the viewport grows" {
+test "scrolling range keeps the final pane available at the leading edge" {
     const pane_extent: f32 = 500.0;
     const gap: f32 = 12.0;
     const pane_count: usize = 4;
-    try std.testing.expectApproxEqAbs(@as(f32, 1136.0), scrollingMaxOffset(900.0, pane_extent, gap, pane_count), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1676.0), scrollingMaxOffset(360.0, pane_extent, gap, pane_count), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1536.0), scrollingMaxOffset(900.0, pane_extent, gap, pane_count), 0.0001);
 
-    var offset: f32 = 947.5;
-    var target: f32 = 947.5;
-    clampScrollingOffsets(&offset, &target, scrollingMaxOffset(1200.0, pane_extent, gap, pane_count));
-    try std.testing.expectApproxEqAbs(@as(f32, 836.0), offset, 0.0001);
+    var offset: f32 = 1600.0;
+    var target: f32 = 1676.0;
+    clampScrollingOffsets(&offset, &target, scrollingMaxOffset(900.0, pane_extent, gap, pane_count));
+    try std.testing.expectApproxEqAbs(@as(f32, 1536.0), offset, 0.0001);
     try std.testing.expectApproxEqAbs(offset, target, 0.0001);
 
-    clampScrollingOffsets(&offset, &target, scrollingMaxOffset(2200.0, pane_extent, gap, pane_count));
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), offset, 0.0001);
+    clampScrollingOffsets(&offset, &target, scrollingMaxOffset(900.0, pane_extent, gap, 2));
+    try std.testing.expectApproxEqAbs(@as(f32, 512.0), offset, 0.0001);
     try std.testing.expectApproxEqAbs(offset, target, 0.0001);
+}
+
+test "direct pane reveal anchors its leading edge" {
+    const pane_extent: f32 = 500.0;
+    const gap: f32 = 12.0;
+    const max_offset = scrollingMaxOffset(1000.0, pane_extent, gap, 4);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), leadingScrollTarget(pane_extent, gap, 0, max_offset), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1024.0), leadingScrollTarget(pane_extent, gap, 2, max_offset), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1536.0), leadingScrollTarget(pane_extent, gap, 3, max_offset), 0.0001);
 }
 
 test "scrolling column drag resolves width across pane index offset and scale" {
