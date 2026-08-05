@@ -233,6 +233,137 @@ extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 const Session = if (SESSION_SUPPORTED) UnixSession else UnsupportedSession;
 pub const MIN_SPLIT_RATIO: f32 = 0.12;
 
+const DaemonTailBatchRequest = struct {
+    id: []const u8,
+    attach_id: []const u8,
+    offset: usize,
+    max_bytes: usize,
+};
+
+/// Coalesces same-frame daemon tails without changing terminal poll cadence.
+pub const DaemonPollBatch = struct {
+    sessions: std.ArrayList(*Session) = .empty,
+    requests: std.ArrayList(DaemonTailBatchRequest) = .empty,
+    response_scratch: std.ArrayList(u8) = .empty,
+    last_response: std.ArrayList(u8) = .empty,
+
+    pub fn deinit(self: *DaemonPollBatch, allocator: std.mem.Allocator) void {
+        self.sessions.deinit(allocator);
+        self.requests.deinit(allocator);
+        self.response_scratch.deinit(allocator);
+        self.last_response.deinit(allocator);
+    }
+
+    pub fn reset(self: *DaemonPollBatch) void {
+        self.sessions.clearRetainingCapacity();
+        self.requests.clearRetainingCapacity();
+    }
+
+    pub fn prefetch(self: *DaemonPollBatch, allocator: std.mem.Allocator, pref_path: []const u8) !void {
+        if (!SESSION_SUPPORTED or self.sessions.items.len < 2) return;
+
+        self.requests.clearRetainingCapacity();
+        try self.requests.ensureTotalCapacity(allocator, self.sessions.items.len);
+        for (self.sessions.items) |session| {
+            const initial_attach_replay = session.suppress_next_daemon_replay and session.remote_output_offset == 0;
+            self.requests.appendAssumeCapacity(.{
+                .id = session.session_id orelse continue,
+                .attach_id = session.attach_id orelse "",
+                .offset = session.remote_output_offset,
+                .max_bytes = if (initial_attach_replay) DAEMON_ATTACH_REPLAY_MAX_BYTES else DAEMON_REPLAY_MAX_BYTES,
+            });
+        }
+        if (self.requests.items.len < 2) return;
+
+        const response = if (builtin.os.tag == .windows)
+            try sessionizer.requestAllocMaxResponse(
+                allocator,
+                pref_path,
+                "session.tail.batch",
+                .{ .requests = self.requests.items },
+                1,
+                sessionizer.MAX_RESPONSE_BYTES,
+            )
+        else blk: {
+            try self.response_scratch.ensureTotalCapacity(allocator, sessionizer.MAX_RESPONSE_BYTES);
+            self.response_scratch.items.len = sessionizer.MAX_RESPONSE_BYTES;
+            break :blk try sessionizer.requestAllocUsingBuffer(
+                allocator,
+                pref_path,
+                "session.tail.batch",
+                .{ .requests = self.requests.items },
+                1,
+                self.response_scratch.items,
+            );
+        };
+        defer allocator.free(response);
+        if (cachedDaemonResponseMatches(&self.last_response, response) and
+            daemonSessionsCanReuseResponse(self.sessions.items[0..self.requests.items.len]))
+        {
+            for (self.sessions.items[0..self.requests.items.len]) |session| {
+                session.daemon_poll_failures = 0;
+                session.daemon_prefetched_changed = false;
+                session.daemon_prefetched = true;
+            }
+            return;
+        }
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidSessionResponse;
+        if (parsed.value.object.get("error")) |error_value| {
+            if (error_value == .object) {
+                const code = jsonString(error_value.object.get("code") orelse .null) orelse "";
+                if (std.mem.eql(u8, code, "method_not_found")) return error.UnsupportedDaemonBatch;
+            }
+            return error.InvalidSessionResponse;
+        }
+        const result = parsed.value.object.get("result") orelse return error.InvalidSessionResponse;
+        if (result != .object) return error.InvalidSessionResponse;
+        const responses = result.object.get("responses") orelse return error.InvalidSessionResponse;
+        if (responses != .array or responses.array.items.len != self.requests.items.len) return error.InvalidSessionResponse;
+
+        for (self.sessions.items[0..self.requests.items.len], responses.array.items) |session, item| {
+            const initial_attach_replay = session.suppress_next_daemon_replay and session.remote_output_offset == 0;
+            session.daemon_prefetched_changed = try session.applyDaemonTailResponseValue(allocator, item, initial_attach_replay);
+            session.daemon_prefetched = true;
+        }
+        if (daemonSessionsCanReuseResponse(self.sessions.items[0..self.requests.items.len])) {
+            rememberDaemonResponse(&self.last_response, allocator, response);
+        } else {
+            self.last_response.clearRetainingCapacity();
+        }
+    }
+};
+
+fn cachedDaemonResponseMatches(cached: *const std.ArrayList(u8), response: []const u8) bool {
+    return cached.items.len > 0 and std.mem.eql(u8, cached.items, response);
+}
+
+fn rememberDaemonResponse(cached: *std.ArrayList(u8), allocator: std.mem.Allocator, response: []const u8) void {
+    cached.clearRetainingCapacity();
+    cached.appendSlice(allocator, response) catch cached.clearRetainingCapacity();
+}
+
+fn daemonSessionsCanReuseResponse(sessions: []const *Session) bool {
+    for (sessions) |session| {
+        if (session.daemon_state != .attached or session.suppress_next_daemon_replay) return false;
+    }
+    return true;
+}
+
+test "daemon response cache only reuses an identical successful payload" {
+    var cached: std.ArrayList(u8) = .empty;
+    defer cached.deinit(std.testing.allocator);
+
+    try std.testing.expect(!cachedDaemonResponseMatches(&cached, "quiet"));
+    rememberDaemonResponse(&cached, std.testing.allocator, "quiet");
+    try std.testing.expect(cachedDaemonResponseMatches(&cached, "quiet"));
+    try std.testing.expect(!cachedDaemonResponseMatches(&cached, "changed"));
+
+    rememberDaemonResponse(&cached, std.testing.allocator, "changed");
+    try std.testing.expectEqualStrings("changed", cached.items);
+}
+
 pub const SplitAxis = enum(u8) {
     horizontal,
     vertical,
@@ -741,6 +872,11 @@ pub const Dock = struct {
         self.auto_restart_backoff.observeHealth(now_ms, self.hasRunningSession());
         if (terminal_modes_changed) self.workspace_changed = true;
         return changed;
+    }
+
+    pub fn appendDaemonPollSessions(self: *Dock, allocator: std.mem.Allocator, batch: *DaemonPollBatch) !void {
+        if (!SESSION_SUPPORTED) return;
+        for (self.tabs.items) |*tab| try appendDaemonPollSessionsFromNode(tab.root, allocator, batch);
     }
 
     /// Records an externally-provided title (e.g. from a Codex notify hook,
@@ -1927,6 +2063,20 @@ fn pollPaneNode(node: *PaneNode, allocator: std.mem.Allocator, terminal_modes_ch
     }
 }
 
+fn appendDaemonPollSessionsFromNode(node: *PaneNode, allocator: std.mem.Allocator, batch: *DaemonPollBatch) !void {
+    switch (node.*) {
+        .leaf => |*leaf| {
+            const session = leaf.session orelse return;
+            if (session.backend != .daemon or session.defer_daemon_replay_until_resize or session.session_id == null) return;
+            try batch.sessions.append(allocator, session);
+        },
+        .split => |*split| {
+            try appendDaemonPollSessionsFromNode(split.first, allocator, batch);
+            try appendDaemonPollSessionsFromNode(split.second, allocator, batch);
+        },
+    }
+}
+
 fn rethemePaneNode(node: *PaneNode, allocator: std.mem.Allocator) !void {
     switch (node.*) {
         .leaf => |*leaf| {
@@ -2442,6 +2592,9 @@ const UnixSession = struct {
     /// replay cannot reconstruct a full TUI frame — the pane comes back as a
     /// garbled mix of partial frames. Only give up after a sustained outage.
     daemon_poll_failures: u32 = 0,
+    daemon_prefetched: bool = false,
+    daemon_prefetched_changed: bool = false,
+    last_daemon_tail_response: std.ArrayList(u8) = .empty,
     /// Set when this session attached to an already-running daemon PTY (app
     /// restart or revive). Cleared after the first sized resize kicks the
     /// foreground TUI to repaint, since the bounded replay alone cannot
@@ -2595,6 +2748,7 @@ const UnixSession = struct {
         if (self.attach_id) |attach_id| allocator.free(attach_id);
         if (self.pref_path) |pref_path| allocator.free(pref_path);
         self.output_ring.deinit(allocator);
+        self.last_daemon_tail_response.deinit(allocator);
     }
 
     pub fn sessionId(self: *const UnixSession) ?[]const u8 {
@@ -2622,7 +2776,10 @@ const UnixSession = struct {
     pub fn poll(self: *UnixSession, allocator: std.mem.Allocator) !bool {
         const changed = switch (self.backend) {
             .local => if (LOCAL_PTY_SUPPORTED) try self.drainOutput(allocator) else false,
-            .daemon => try self.drainDaemonOutput(allocator),
+            .daemon => if (self.daemon_prefetched) blk: {
+                self.daemon_prefetched = false;
+                break :blk self.daemon_prefetched_changed;
+            } else try self.drainDaemonOutput(allocator),
         };
         const exited = self.captureExitStatus();
         if (changed or exited) {
@@ -3416,6 +3573,14 @@ const UnixSession = struct {
         };
         defer allocator.free(response);
 
+        if (!initial_attach_replay and
+            self.daemon_state == .attached and
+            cachedDaemonResponseMatches(&self.last_daemon_tail_response, response))
+        {
+            self.daemon_poll_failures = 0;
+            return false;
+        }
+
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch |err| {
             // A malformed response (e.g. a ring slice that cuts a UTF-8
             // sequence) would otherwise recur identically every frame and
@@ -3427,14 +3592,25 @@ const UnixSession = struct {
             return err;
         };
         defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidSessionResponse;
-        if (parsed.value.object.get("error")) |_| {
+        const changed = try self.applyDaemonTailResponseValue(allocator, parsed.value, initial_attach_replay);
+        if (!initial_attach_replay and self.daemon_state == .attached) {
+            rememberDaemonResponse(&self.last_daemon_tail_response, allocator, response);
+        } else {
+            self.last_daemon_tail_response.clearRetainingCapacity();
+        }
+        return changed;
+    }
+
+    fn applyDaemonTailResponseValue(self: *UnixSession, allocator: std.mem.Allocator, response: std.json.Value, initial_attach_replay: bool) !bool {
+        const session_id = self.session_id orelse return false;
+        if (response != .object) return error.InvalidSessionResponse;
+        if (response.object.get("error")) |_| {
             runtime_log.diagnostic("terminal daemon tail rejected session_len={d} marking missing", .{session_id.len});
             self.daemon_state = .missing;
             self.running = false;
             return false;
         }
-        const result = parsed.value.object.get("result") orelse return error.InvalidSessionResponse;
+        const result = response.object.get("result") orelse return error.InvalidSessionResponse;
         if (result != .object) return error.InvalidSessionResponse;
         const text = jsonString(result.object.get("text") orelse .null) orelse "";
         const suppress_replay_responses = initial_attach_replay;

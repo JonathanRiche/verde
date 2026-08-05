@@ -1291,8 +1291,24 @@ pub fn sendThreadDraft(self: anytype, project_index: usize, thread_index: usize)
     project.invalidateSidebarThreadCache();
     // Persist the user turn before handing provider execution to the daemon,
     // so a fast app quit can still reattach the daemon-owned reply to a
-    // known local chat thread.
-    self.flushDirtyBlocking();
+    // known local chat thread. Only this thread changed here; rewriting every
+    // historical transcript can otherwise block the UI for seconds.
+    const persist_started_at_ms = monotonicMs();
+    self.persistThreadBlocking(project_index, thread_index) catch |err| {
+        if (err == error.WorkspaceNotFound) {
+            // A newly-created workspace may not have a database row yet.
+            self.flushDirtyBlocking();
+        } else {
+            snapshot.restore(self, thread);
+            self.appendInitialSendFailure(thread, initialSendStartFailureMessage(err));
+            project.invalidateSidebarThreadCache();
+            if (selected_target) self.requestTranscriptScrollToBottom();
+            self.flushDirtyBlocking();
+            return err;
+        }
+    };
+    const persist_elapsed_ms = monotonicMs() - persist_started_at_ms;
+    const daemon_start_at_ms = monotonicMs();
     self.beginSendForThreadWithReadyDaemon(project_index, thread, draft, execution_target) catch |err| {
         if (err == error.DaemonRequestFailed) {
             // A daemon JSON-RPC error is a confirmed rejection, so removing
@@ -1313,6 +1329,11 @@ pub fn sendThreadDraft(self: anytype, project_index: usize, thread_index: usize)
         self.flushDirtyBlocking();
         return err;
     };
+    runtime_log.diagnostic("chat submit accepted persist_ms={d} daemon_start_ms={d} thread_messages={d}", .{
+        persist_elapsed_ms,
+        monotonicMs() - daemon_start_at_ms,
+        thread.messages.items.len,
+    });
     thread.clearDraft();
     thread.clearDraftImage(self.allocator);
     if (selected_target) {

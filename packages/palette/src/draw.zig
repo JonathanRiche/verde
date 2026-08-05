@@ -208,6 +208,47 @@ pub const RenderBatch = struct {
         self.refreshTextRunSlices();
     }
 
+    /// Appends a translated batch while borrowing its stable text storage.
+    /// The source must outlive consumption of this batch by the renderer.
+    pub fn appendTranslatedBatch(
+        self: *RenderBatch,
+        allocator: std.mem.Allocator,
+        source: *const RenderBatch,
+        translation: Vec2,
+        clip: ?Rect,
+    ) !void {
+        std.debug.assert(self != source);
+        try self.commands.ensureUnusedCapacity(allocator, source.commands.items.len);
+        try self.text_runs.ensureUnusedCapacity(allocator, source.text_runs.items.len);
+        self.refreshTextRunSlices();
+
+        for (source.commands.items) |command| {
+            if (!translatedCommandVisible(command, translation, clip)) continue;
+            var next = command;
+            next.rect = translatedRect(next.rect, translation);
+            next.p0 = translatedPoint(next.p0, translation);
+            next.p1 = translatedPoint(next.p1, translation);
+            next.p2 = translatedPoint(next.p2, translation);
+            next.clip = translatedClip(next.clip, translation, clip);
+
+            if (command.text_run_count > 0) {
+                const start = self.text_runs.items.len;
+                for (command.text_runs) |run| {
+                    var next_run = run;
+                    next_run.x += translation.x;
+                    next_run.y += translation.y;
+                    next_run.clip = translatedClip(next_run.clip, translation, clip);
+                    self.text_runs.appendAssumeCapacity(next_run);
+                }
+                next.text_run_start = start;
+                next.text_run_count = command.text_run_count;
+                next.text_runs = self.text_runs.items[start .. start + command.text_run_count];
+            }
+            try self.appendCommandPreservingZ(allocator, next);
+        }
+        self.refreshTextRunSlices();
+    }
+
     pub fn setZIndex(self: *RenderBatch, z_index: i32) i32 {
         const previous = self.current_z_index;
         self.current_z_index = z_index;
@@ -456,6 +497,40 @@ pub const RenderBatch = struct {
     }
 };
 
+fn translatedPoint(point: Vec2, translation: Vec2) Vec2 {
+    return .{ .x = point.x + translation.x, .y = point.y + translation.y };
+}
+
+fn translatedRect(rect: Rect, translation: Vec2) Rect {
+    return .{ .x = rect.x + translation.x, .y = rect.y + translation.y, .w = rect.w, .h = rect.h };
+}
+
+fn translatedClip(existing: ?Rect, translation: Vec2, bounds: ?Rect) ?Rect {
+    const moved = if (existing) |rect| translatedRect(rect, translation) else null;
+    const target = bounds orelse return moved;
+    const rect = moved orelse return target;
+    const x0 = @max(rect.x, target.x);
+    const y0 = @max(rect.y, target.y);
+    const x1 = @min(rect.x + rect.w, target.x + target.w);
+    const y1 = @min(rect.y + rect.h, target.y + target.h);
+    if (x1 <= x0 or y1 <= y0) return .{ .x = target.x, .y = target.y, .w = 0.0, .h = 0.0 };
+    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+}
+
+fn translatedCommandVisible(command: Command, translation: Vec2, clip: ?Rect) bool {
+    const target = clip orelse return true;
+    const local_bounds: Rect = if (command.kind == .triangle) blk: {
+        const x0 = @min(command.p0.x, @min(command.p1.x, command.p2.x));
+        const y0 = @min(command.p0.y, @min(command.p1.y, command.p2.y));
+        const x1 = @max(command.p0.x, @max(command.p1.x, command.p2.x));
+        const y1 = @max(command.p0.y, @max(command.p1.y, command.p2.y));
+        break :blk .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+    } else command.rect;
+    const bounds = translatedRect(local_bounds, translation);
+    return bounds.x + bounds.w > target.x and bounds.x < target.x + target.w and
+        bounds.y + bounds.h > target.y and bounds.y < target.y + target.h;
+}
+
 test "rect contains points inside bounds" {
     const rect_value: Rect = .{ .x = 10, .y = 20, .w = 30, .h = 40 };
     try std.testing.expect(rect_value.contains(.{ .x = 10, .y = 20 }));
@@ -490,6 +565,37 @@ test "commands are stably sorted by z-index" {
     try std.testing.expectEqual(@as(f32, 1), batch.commands.items[1].rect.x);
     try std.testing.expectEqual(@as(f32, 5), batch.commands.items[2].rect.x);
     try std.testing.expectEqual(@as(f32, 10), batch.commands.items[3].rect.x);
+}
+
+test "translated batch moves geometry and intersects clips without copying text" {
+    var source: RenderBatch = .{};
+    defer source.deinit(std.testing.allocator);
+    const text = "stable";
+    try source.textRuns(std.testing.allocator, .{ .x = 2, .y = 3, .w = 40, .h = 12 }, text, &.{.{
+        .text = text,
+        .byte_end = text.len,
+        .x = 2,
+        .y = 3,
+        .clip = .{ .x = 0, .y = 0, .w = 50, .h = 30 },
+    }}, Color.white, 12, .{ .x = 0, .y = 0, .w = 50, .h = 30 }, 15, 7);
+    try source.rect(std.testing.allocator, .{ .x = 80, .y = 80, .w = 10, .h = 10 }, Color.black);
+
+    var destination: RenderBatch = .{};
+    defer destination.deinit(std.testing.allocator);
+    try destination.appendTranslatedBatch(std.testing.allocator, &source, .{ .x = 100, .y = 20 }, .{ .x = 110, .y = 25, .w = 30, .h = 20 });
+
+    const command = destination.commands.items[0];
+    try std.testing.expectEqual(@as(usize, 1), destination.commands.items.len);
+    try std.testing.expectEqual(@as(f32, 102), command.rect.x);
+    try std.testing.expectEqual(@as(f32, 23), command.rect.y);
+    try std.testing.expectEqualStrings(text, command.text);
+    try std.testing.expectEqual(@intFromPtr(text.ptr), @intFromPtr(command.text.ptr));
+    try std.testing.expectEqual(@as(f32, 102), command.text_runs[0].x);
+    try std.testing.expectEqual(@as(f32, 23), command.text_runs[0].y);
+    try std.testing.expectEqual(@as(f32, 110), command.clip.?.x);
+    try std.testing.expectEqual(@as(f32, 25), command.clip.?.y);
+    try std.testing.expectEqual(@as(f32, 30), command.clip.?.w);
+    try std.testing.expectEqual(@as(f32, 20), command.clip.?.h);
 }
 
 test "panel command carries renderer-neutral shape style" {

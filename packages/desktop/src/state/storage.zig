@@ -10,6 +10,7 @@ const APP_NAME: [:0]const u8 = "Native";
 pub const LEGACY_STATE_FILE_NAME = "state.json";
 const LoadedPersistedState = db_types.LoadedState;
 const PersistedState = db_types.PersistedState;
+const PersistedThread = db_types.PersistedThread;
 
 pub const Storage = struct {
     allocator: std.mem.Allocator,
@@ -74,5 +75,9 @@ pub const Storage = struct {
 
     pub fn save(self: *const Storage, state: PersistedState) !void {
         try self.client.save(state);
+    }
+
+    pub fn saveThread(self: *const Storage, workspace_id: []const u8, thread_index: usize, thread: PersistedThread) !void {
+        try self.client.saveThread(workspace_id, thread_index, thread);
     }
 };

@@ -63,13 +63,13 @@ const TRANSCRIPT_WHEEL_PIXELS: f32 = 96.0;
 const TRANSCRIPT_PAGE_VIEW_FRAC: f32 = 0.88;
 const TOOL_OUTPUT_COLLAPSED_LINES: usize = 18;
 
-var transcript_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-var transcript_pane_id: ?app_state.WorkspacePaneId = null;
-
 const MAX_TRANSCRIPT_HITS = 16;
 const TranscriptHit = struct {
     pane_id: ?app_state.WorkspacePaneId = null,
     rect: palette.Rect = .{},
+    column: palette.Rect = .{},
+    clip: palette.Rect = .{},
+    scroll_y: f32 = 0.0,
     track: palette.Rect = .{},
     thumb: palette.Rect = .{},
     max_scroll: f32 = 0.0,
@@ -195,6 +195,22 @@ pub fn resetTranscriptHitCache() void {
     diff_layout_hit_count = 0;
     bang_retry_hit_count = 0;
     transcript_image_hit_count = 0;
+}
+
+/// Keeps scrolling-strip input geometry inside the same viewport as rendering.
+pub fn clipTranscriptHitCache(bounds: palette.Rect) void {
+    var write_index: usize = 0;
+    for (transcript_hits[0..transcript_hit_count]) |hit| {
+        var clipped = hit;
+        clipped.rect = intersectRect(hit.rect, bounds);
+        clipped.clip = intersectRect(hit.clip, bounds);
+        clipped.track = intersectRect(hit.track, bounds);
+        clipped.thumb = intersectRect(hit.thumb, bounds);
+        if (clipped.rect.w <= 0.0 or clipped.rect.h <= 0.0) continue;
+        transcript_hits[write_index] = clipped;
+        write_index += 1;
+    }
+    transcript_hit_count = write_index;
 }
 
 pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
@@ -935,12 +951,14 @@ fn transcriptMarkdownBubbleHit(
     mouse_x: f32,
     mouse_y: f32,
 ) ?TranscriptMarkdownHit {
-    const column = state.transcript_controller.palette_column;
-    const clip = state.transcript_controller.palette_clip;
+    const transcript_hit = findTranscriptHit(mouse_x, mouse_y) orelse return null;
+    activateTranscriptHitGeometry(state, transcript_hit);
+    const column = transcript_hit.column;
+    const clip = transcript_hit.clip;
     if (column.w <= 0 or !rectContains(clip, mouse_x, mouse_y)) return null;
 
     const thread = state.currentThread();
-    const scroll_y = state.transcript_controller.palette_scroll_y;
+    const scroll_y = transcript_hit.scroll_y;
     var content_y = column.y - scroll_y;
 
     var msg_idx: usize = 0;
@@ -1015,12 +1033,14 @@ fn transcriptMarkdownBubbleLinkHit(
     mouse_x: f32,
     mouse_y: f32,
 ) ?TranscriptMarkdownLinkHit {
-    const column = state.transcript_controller.palette_column;
-    const clip = state.transcript_controller.palette_clip;
+    const transcript_hit = findTranscriptHit(mouse_x, mouse_y) orelse return null;
+    activateTranscriptHitGeometry(state, transcript_hit);
+    const column = transcript_hit.column;
+    const clip = transcript_hit.clip;
     if (column.w <= 0 or !rectContains(clip, mouse_x, mouse_y)) return null;
 
     const thread = state.currentThread();
-    const scroll_y = state.transcript_controller.palette_scroll_y;
+    const scroll_y = transcript_hit.scroll_y;
     var content_y = column.y - scroll_y;
 
     var msg_idx: usize = 0;
@@ -1898,16 +1918,13 @@ fn findTranscriptHit(x: f32, y: f32) ?TranscriptHit {
         const hit = transcript_hits[i];
         if (rectContains(hit.rect, x, y)) return hit;
     }
-    if (rectContains(transcript_rect, x, y)) {
-        return .{
-            .pane_id = transcript_pane_id,
-            .rect = transcript_rect,
-            .track = transcript_scrollbar_track,
-            .thumb = transcript_scrollbar_thumb,
-            .max_scroll = transcript_scrollbar_max_scroll,
-        };
-    }
     return null;
+}
+
+fn activateTranscriptHitGeometry(state: *app_state.AppState, hit: TranscriptHit) void {
+    state.transcript_controller.palette_column = hit.column;
+    state.transcript_controller.palette_clip = hit.clip;
+    state.transcript_controller.palette_scroll_y = hit.scroll_y;
 }
 
 fn appendTranscriptHit(hit: TranscriptHit) void {
@@ -1916,9 +1933,38 @@ fn appendTranscriptHit(hit: TranscriptHit) void {
     transcript_hit_count += 1;
 }
 
+test "transcript hit geometry remains pane-local through scrolling clips" {
+    resetTranscriptHitCache();
+    defer resetTranscriptHitCache();
+    appendTranscriptHit(.{
+        .pane_id = 11,
+        .rect = .{ .x = 10.0, .y = 20.0, .w = 300.0, .h = 240.0 },
+        .column = .{ .x = 30.0, .y = 48.0, .w = 260.0, .h = 190.0 },
+        .clip = .{ .x = 10.0, .y = 20.0, .w = 300.0, .h = 240.0 },
+        .scroll_y = 72.0,
+    });
+    appendTranscriptHit(.{
+        .pane_id = 12,
+        .rect = .{ .x = 10.0, .y = 280.0, .w = 300.0, .h = 240.0 },
+        .column = .{ .x = 30.0, .y = 308.0, .w = 260.0, .h = 190.0 },
+        .clip = .{ .x = 10.0, .y = 280.0, .w = 300.0, .h = 240.0 },
+        .scroll_y = 144.0,
+    });
+
+    const first = findTranscriptHit(100.0, 100.0).?;
+    try std.testing.expectEqual(@as(?app_state.WorkspacePaneId, 11), first.pane_id);
+    try std.testing.expectEqual(@as(f32, 48.0), first.column.y);
+    try std.testing.expectEqual(@as(f32, 72.0), first.scroll_y);
+
+    clipTranscriptHitCache(.{ .x = 0.0, .y = 60.0, .w = 400.0, .h = 200.0 });
+    try std.testing.expectEqual(@as(usize, 1), transcript_hit_count);
+    const clipped = findTranscriptHit(100.0, 100.0).?;
+    try std.testing.expectEqual(@as(f32, 48.0), clipped.column.y);
+    try std.testing.expectEqual(@as(f32, 60.0), clipped.clip.y);
+    try std.testing.expect(findTranscriptHit(100.0, 300.0) == null);
+}
+
 fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?app_state.WorkspacePaneId) void {
-    transcript_rect = rect;
-    transcript_pane_id = pane_id;
     // Bubble column comes from the same shared formula as the composer card so
     // transcript content and the prompt box stay width-aligned at every size.
     const content_column = chatContentColumn(rect.x, rect.w);
@@ -1926,15 +1972,18 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
     // Clip to full transcript body (same x/w as layout rect) so GL text and bubbles
     // stay below the workspace header when scrolled.
     const clip = rect;
-    state.transcript_controller.palette_column = column;
-    state.transcript_controller.palette_clip = clip;
+    const active_geometry = paneOwnsActiveChatState(state, pane_id);
+    if (active_geometry) {
+        state.transcript_controller.palette_column = column;
+        state.transcript_controller.palette_clip = clip;
+    }
 
     const thread = state.currentThread();
 
     if (thread.messages.items.len == 0 and !thread.isSendPendingForUi() and state.currentThreadPendingSlashCommandLabel() == null) {
-        state.transcript_controller.palette_scroll_y = 0.0;
+        if (active_geometry) state.transcript_controller.palette_scroll_y = 0.0;
         rememberTranscriptScroll(state, pane_id, 0.0);
-        appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect });
+        appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect, .column = column, .clip = clip });
         queueText(state, .{ .x = column.x, .y = column.y, .w = column.w, .h = theme.scaledUi(30.0) }, "No messages yet", paletteColor(theme.COLOR_WHITE), theme.scaledUi(20.0), clip);
         queueText(state, .{ .x = column.x, .y = column.y + theme.scaledUi(32.0), .w = column.w, .h = theme.scaledUi(26.0) }, "Choose a provider, type a prompt below, and start the first chat for this directory.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), clip);
         return;
@@ -1979,7 +2028,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
         state.transcript_controller.auto_follow_pending = false;
     }
     rememberTranscriptScroll(state, pane_id, scroll_y);
-    state.transcript_controller.palette_scroll_y = scroll_y;
+    if (active_geometry) state.transcript_controller.palette_scroll_y = scroll_y;
 
     var content_y = renderCommittedTranscript(state, thread, column, scroll_y, clip);
 
@@ -1996,12 +2045,12 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
         transcript_scrollbar_track = track;
         transcript_scrollbar_thumb = thumb_rect;
         transcript_scrollbar_max_scroll = max_scroll;
-        appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect, .track = track, .thumb = thumb_rect, .max_scroll = max_scroll });
+        appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect, .column = column, .clip = clip, .scroll_y = scroll_y, .track = track, .thumb = thumb_rect, .max_scroll = max_scroll });
     } else {
         transcript_scrollbar_track = .{};
         transcript_scrollbar_thumb = .{};
         transcript_scrollbar_max_scroll = 0.0;
-        appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect });
+        appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect, .column = column, .clip = clip, .scroll_y = scroll_y });
     }
 }
 
@@ -5003,8 +5052,8 @@ fn renderMarkdownBody(state: *app_state.AppState, message_index: usize, rect: pa
     // Cached path only applies to committed (non-streaming) messages — the
     // stream body changes per frame so the cache key would invalidate anyway.
     if (!streaming) {
-        if (state.transcriptMarkdownBodyView(message_index, body)) |view| {
-            renderMarkdownBodyView(state, message_index, rect, view.*, clip);
+        if (state.transcriptMarkdownBodyEntry(message_index, body)) |entry| {
+            renderSelectableBodyEntry(state, message_index, rect, entry, clip, transcriptMarkdownOptions(), true);
             return;
         }
     }
@@ -5029,8 +5078,8 @@ fn renderPlainSelectableBody(state: *app_state.AppState, message_index: usize, r
     // Committed rows are immutable between transcript mutations. Reuse their
     // parsed selectable geometry; pending stream indices intentionally miss
     // this cache and continue rebuilding from their latest body immediately.
-    if (state.transcriptPlainBodyView(message_index, body)) |view| {
-        renderSelectableBodyView(state, message_index, rect, view.*, clip, transcriptPlainTextOptions(color), false);
+    if (state.transcriptPlainBodyEntry(message_index, body)) |entry| {
+        renderSelectableBodyEntry(state, message_index, rect, entry, clip, transcriptPlainTextOptions(color), false);
         return;
     }
     var view = chat_markdown.buildPlainBodyView(state.allocator, body) catch {
@@ -5050,7 +5099,7 @@ fn renderSelectableBodyView(
     options: chat_markdown.RenderOptions,
     code_copy: bool,
 ) void {
-    const local_sel: ?chat_markdown.SelectionRange = if (state.transcriptMarkdownSelection()) |s| blk: {
+    const local_sel: ?chat_markdown.SelectionRange = if (state.peekTranscriptMarkdownSelection()) |s| blk: {
         break :blk chat_markdown.localMarkdownSelectionRangeForMessage(
             state.allocator,
             s.anchor.message_index,
@@ -5089,6 +5138,157 @@ fn renderSelectableBodyView(
         false,
     );
     defer sel_out.deinit(state.allocator);
+}
+
+fn renderSelectableBodyEntry(
+    state: *app_state.AppState,
+    message_index: usize,
+    rect: palette.Rect,
+    entry: *app_state.TranscriptMarkdownBody,
+    clip: palette.Rect,
+    options: chat_markdown.RenderOptions,
+    code_copy: bool,
+) void {
+    if (transcriptBodyRenderCacheEligible(state, message_index, entry.view, code_copy) and
+        replayTranscriptBodyRenderCache(state, rect, entry, clip, options))
+    {
+        return;
+    }
+    renderSelectableBodyView(state, message_index, rect, entry.view, clip, options, code_copy);
+}
+
+fn transcriptBodyRenderCacheEligible(state: *app_state.AppState, message_index: usize, view: chat_markdown.BodyView, code_copy: bool) bool {
+    if (state.peekTranscriptMarkdownSelection()) |selection| {
+        if (transcriptMessageIntersectsSelection(message_index, selection)) return false;
+    }
+    return !code_copy or !transcriptBodyViewHasFencedCode(view);
+}
+
+fn transcriptMessageIntersectsSelection(message_index: usize, selection: app_state.TranscriptMarkdownSelection) bool {
+    const first = @min(selection.anchor.message_index, selection.focus.message_index);
+    const last = @max(selection.anchor.message_index, selection.focus.message_index);
+    return message_index >= first and message_index <= last;
+}
+
+fn transcriptBodyViewHasFencedCode(view: chat_markdown.BodyView) bool {
+    for (view.blocks) |block| {
+        if (block.kind() == .fenced_code) return true;
+    }
+    return false;
+}
+
+fn replayTranscriptBodyRenderCache(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    entry: *app_state.TranscriptMarkdownBody,
+    clip: palette.Rect,
+    options: chat_markdown.RenderOptions,
+) bool {
+    const key: chat_types.TranscriptRenderCacheKey = .{
+        .width = rect.w,
+        .height = rect.h,
+        .ui_scale = theme.uiScaleFactor(),
+        .style_hash = transcriptBodyRenderStyleHash(entry.kind, options),
+    };
+
+    if (entry.render_cache_key == null or !transcriptRenderCacheKeysEqual(entry.render_cache_key.?, key)) {
+        entry.render_cache.clear();
+        entry.render_cache_frame_text.clearRetainingCapacity();
+        _ = entry.render_cache_text_arena.reset(.retain_capacity);
+
+        var context: chat_markdown.PaletteRenderContext = .{
+            .allocator = state.allocator,
+            .batch = &entry.render_cache,
+            .frame_text = &entry.render_cache_frame_text,
+            .text_arena = &entry.render_cache_text_arena,
+            .cursor = .{ .x = 0.0, .y = 0.0, .w = rect.w, .h = rect.h },
+            .available_width = rect.w,
+            .mouse_pos = .{ -1.0, -1.0 },
+            .hovered = false,
+            .clip = null,
+            .code_copy_recorder = null,
+        };
+        var output = chat_markdown.renderSelectablePaletteBody(
+            &context,
+            state.allocator,
+            entry.view,
+            options,
+            null,
+            false,
+        );
+        output.deinit(state.allocator);
+        entry.render_cache_key = key;
+    }
+
+    state.palette_overlay_batch.appendTranslatedBatch(
+        state.allocator,
+        &entry.render_cache,
+        .{ .x = rect.x, .y = rect.y },
+        clip,
+    ) catch return false;
+    return true;
+}
+
+fn transcriptRenderCacheKeysEqual(a: chat_types.TranscriptRenderCacheKey, b: chat_types.TranscriptRenderCacheKey) bool {
+    return @abs(a.width - b.width) <= 0.01 and
+        @abs(a.height - b.height) <= 0.01 and
+        @abs(a.ui_scale - b.ui_scale) <= 0.001 and
+        a.style_hash == b.style_hash;
+}
+
+fn transcriptBodyRenderStyleHash(kind: chat_types.TranscriptBodyKind, options: chat_markdown.RenderOptions) u64 {
+    var hasher = std.hash.Wyhash.init(0x87A6_41D9_10B3_E52C);
+    const kind_value: u8 = @intFromEnum(kind);
+    hasher.update(std.mem.asBytes(&kind_value));
+    hasher.update(std.mem.asBytes(&theme.current_colors));
+    hasher.update(std.mem.asBytes(&options.base_font_size));
+    hashOptionalFloat(&hasher, options.heading_font_size);
+    hashOptionalFloat(&hasher, options.line_height);
+    hashOptionalFloat(&hasher, options.glyph_width);
+    hashOptionalFloat(&hasher, options.code_font_size);
+    if (options.text_color) |color| hasher.update(std.mem.asBytes(&color));
+    return hasher.final();
+}
+
+fn hashOptionalFloat(hasher: *std.hash.Wyhash, value: ?f32) void {
+    const present: u8 = if (value == null) 0 else 1;
+    hasher.update(std.mem.asBytes(&present));
+    if (value) |number| hasher.update(std.mem.asBytes(&number));
+}
+
+test "transcript render cache key ignores pane translation and viewport clipping" {
+    const base: chat_types.TranscriptRenderCacheKey = .{
+        .width = 640,
+        .height = 220,
+        .ui_scale = 1.25,
+        .style_hash = 42,
+    };
+    var moved = base;
+    try std.testing.expect(transcriptRenderCacheKeysEqual(base, moved));
+    moved.width += 1;
+    try std.testing.expect(!transcriptRenderCacheKeysEqual(base, moved));
+}
+
+test "transcript render cache excludes fenced code copy controls" {
+    var prose = try chat_markdown.buildBodyView(std.testing.allocator, "A paragraph with **formatting**.");
+    defer prose.deinit(std.testing.allocator);
+    try std.testing.expect(!transcriptBodyViewHasFencedCode(prose));
+
+    var code = try chat_markdown.buildBodyView(std.testing.allocator, "```zig\nconst value = 1;\n```");
+    defer code.deinit(std.testing.allocator);
+    try std.testing.expect(transcriptBodyViewHasFencedCode(code));
+}
+
+test "transcript render cache only invalidates selected messages" {
+    const selection: app_state.TranscriptMarkdownSelection = .{
+        .anchor = .{ .message_index = 7, .point = .{ .line_index = 0, .column = 2 } },
+        .focus = .{ .message_index = 5, .point = .{ .line_index = 1, .column = 4 } },
+    };
+    try std.testing.expect(!transcriptMessageIntersectsSelection(4, selection));
+    try std.testing.expect(transcriptMessageIntersectsSelection(5, selection));
+    try std.testing.expect(transcriptMessageIntersectsSelection(6, selection));
+    try std.testing.expect(transcriptMessageIntersectsSelection(7, selection));
+    try std.testing.expect(!transcriptMessageIntersectsSelection(8, selection));
 }
 
 const TruncatedText = struct {

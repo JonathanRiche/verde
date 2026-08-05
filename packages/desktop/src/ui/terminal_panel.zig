@@ -83,6 +83,34 @@ const CachedDrawCommand = union(enum) {
     },
 };
 
+const TerminalRowDrawCache = struct {
+    active: bool = false,
+    origin: palette.Rect = .{},
+    arena: ?std.heap.ArenaAllocator = null,
+    commands: std.ArrayList(CachedDrawCommand) = .empty,
+
+    fn beginRebuild(self: *TerminalRowDrawCache, allocator: std.mem.Allocator, origin: palette.Rect) void {
+        self.active = true;
+        self.origin = origin;
+        if (self.arena == null) self.arena = std.heap.ArenaAllocator.init(allocator);
+        _ = self.arena.?.reset(.retain_capacity);
+        self.commands.clearRetainingCapacity();
+    }
+
+    fn append(self: *TerminalRowDrawCache, allocator: std.mem.Allocator, command: CachedDrawCommand) void {
+        self.commands.append(allocator, command) catch {
+            self.active = false;
+        };
+    }
+
+    fn stableText(self: *TerminalRowDrawCache, value: []const u8) []const u8 {
+        if (self.arena) |*arena| {
+            return arena.allocator().dupe(u8, value) catch "";
+        }
+        return "";
+    }
+};
+
 const TerminalPaneDrawCache = struct {
     active: bool = false,
     dock_id: u32 = 0,
@@ -99,29 +127,43 @@ const TerminalPaneDrawCache = struct {
     cursor_x: u16 = 0,
     cursor_y: u16 = 0,
     cursor_visible: bool = false,
-    arena: ?std.heap.ArenaAllocator = null,
-    commands: std.ArrayList(CachedDrawCommand) = .empty,
+    row_start: usize = 0,
+    visible_rows: usize = 0,
+    selection_dynamic: bool = false,
+    row_caches: std.ArrayList(TerminalRowDrawCache) = .empty,
 
     fn matches(self: *const TerminalPaneDrawCache, dock_id: u32, pane_id: u32) bool {
         return self.active and self.dock_id == dock_id and self.pane_id == pane_id;
     }
 
-    fn validFor(self: *const TerminalPaneDrawCache, render_state: *const ghostty_vt.RenderState, rect: palette.Rect, font_scale: f32) bool {
-        const cursor_x: u16 = if (render_state.cursor.viewport) |c| @intCast(c.x) else 0;
-        const cursor_y: u16 = if (render_state.cursor.viewport) |c| @intCast(c.y) else 0;
+    fn geometryValidFor(self: *const TerminalPaneDrawCache, render_state: *const ghostty_vt.RenderState, rect: palette.Rect, font_scale: f32, row_start: usize, visible_rows: usize, selection_dynamic: bool) bool {
         return self.active and
             rectSizeEql(self.rect, rect) and
             self.rows == render_state.rows and
             self.cols == render_state.cols and
             self.font_scale == font_scale and
             self.screen == render_state.screen and
-            self.cursor_x == cursor_x and
-            self.cursor_y == cursor_y and
-            self.cursor_visible == render_state.cursor.visible and
-            render_state.dirty == .false;
+            self.row_start == row_start and
+            self.visible_rows == visible_rows and
+            self.selection_dynamic == selection_dynamic;
     }
 
-    fn beginRebuild(self: *TerminalPaneDrawCache, allocator: std.mem.Allocator, dock_id: u32, pane_id: u32, render_state: *const ghostty_vt.RenderState, rect: palette.Rect, font_scale: f32) void {
+    fn prepareRows(self: *TerminalPaneDrawCache, allocator: std.mem.Allocator, visible_rows: usize, reset_all: bool) bool {
+        const old_len = self.row_caches.items.len;
+        if (old_len < visible_rows) {
+            self.row_caches.resize(allocator, visible_rows) catch {
+                self.active = false;
+                return false;
+            };
+            for (self.row_caches.items[old_len..]) |*row_cache| row_cache.* = .{};
+        }
+        if (reset_all) {
+            for (self.row_caches.items[0..visible_rows]) |*row_cache| row_cache.active = false;
+        }
+        return true;
+    }
+
+    fn noteRendered(self: *TerminalPaneDrawCache, dock_id: u32, pane_id: u32, render_state: *const ghostty_vt.RenderState, rect: palette.Rect, font_scale: f32, row_start: usize, visible_rows: usize, selection_dynamic: bool) void {
         self.active = true;
         self.dock_id = dock_id;
         self.pane_id = pane_id;
@@ -133,22 +175,9 @@ const TerminalPaneDrawCache = struct {
         self.cursor_x = if (render_state.cursor.viewport) |c| @intCast(c.x) else 0;
         self.cursor_y = if (render_state.cursor.viewport) |c| @intCast(c.y) else 0;
         self.cursor_visible = render_state.cursor.visible;
-        if (self.arena == null) self.arena = std.heap.ArenaAllocator.init(allocator);
-        _ = self.arena.?.reset(.retain_capacity);
-        self.commands.clearRetainingCapacity();
-    }
-
-    fn append(self: *TerminalPaneDrawCache, allocator: std.mem.Allocator, command: CachedDrawCommand) void {
-        self.commands.append(allocator, command) catch {
-            self.active = false;
-        };
-    }
-
-    fn stableText(self: *TerminalPaneDrawCache, value: []const u8) []const u8 {
-        if (self.arena) |*arena| {
-            return arena.allocator().dupe(u8, value) catch "";
-        }
-        return "";
+        self.row_start = row_start;
+        self.visible_rows = visible_rows;
+        self.selection_dynamic = selection_dynamic;
     }
 };
 
@@ -167,6 +196,7 @@ const TerminalDrawCache = struct {
         }
         const entry = &self.entries[self.next_recycle];
         self.next_recycle = (self.next_recycle + 1) % self.entries.len;
+        entry.active = false;
         return entry;
     }
 };
@@ -314,7 +344,7 @@ var selection_state: TerminalSelection = .{};
 var pending_link_click: PendingLinkClick = .{};
 var draw_cache: TerminalDrawCache = .{};
 var image_texture_cache: TerminalImageTextureCache = .{};
-var active_capture: ?*TerminalPaneDrawCache = null;
+var active_capture: ?*TerminalRowDrawCache = null;
 var terminal_layout_log_enabled: ?bool = null;
 
 pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
@@ -335,6 +365,12 @@ pub fn renderDockAtForDock(state: *app_state.AppState, rect: palette.Rect, dock_
 }
 
 pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.Rect, dock_id: u32, _: f32) void {
+    renderDockAtForDockWithin(state, rect, dock_id, 0.0, rect);
+}
+
+pub fn renderDockAtForDockWithin(state: *app_state.AppState, rect: palette.Rect, dock_id: u32, _: f32, viewport_clip: palette.Rect) void {
+    // Terminal dock. The viewport clip lets scrolling workspaces cull cached
+    // cell commands before they enter the frame batch.
     if (state.project_controller.projects.items.len == 0) return;
     hit_cache.dock_id = dock_id;
     var dock = state.currentProjectTerminalDockMutable(dock_id) orelse return;
@@ -351,7 +387,7 @@ pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.
     }
 
     if (dock.activeTab()) |tab| {
-        renderPaneNode(state, dock, tab.root, rect);
+        renderPaneNode(state, dock, tab.root, rect, viewport_clip);
     } else {
         renderStatus(state, rect, "Starting shell...");
     }
@@ -570,26 +606,26 @@ fn renderTabs(state: *app_state.AppState, dock: anytype, header: palette.Rect) v
     }
 }
 
-fn renderPaneNode(state: *app_state.AppState, dock: anytype, node: anytype, rect: palette.Rect) void {
+fn renderPaneNode(state: *app_state.AppState, dock: anytype, node: anytype, rect: palette.Rect, viewport_clip: palette.Rect) void {
     switch (node.*) {
-        .leaf => |leaf| renderPane(state, dock, leaf.id, rect),
+        .leaf => |leaf| renderPane(state, dock, leaf.id, rect, viewport_clip),
         .split => |split| {
             if (split.axis == .vertical) {
                 const split_x = rect.x + rect.w * split.ratio;
-                renderPaneNode(state, dock, split.first, .{ .x = rect.x, .y = rect.y, .w = split_x - rect.x, .h = rect.h });
-                renderPaneNode(state, dock, split.second, .{ .x = split_x, .y = rect.y, .w = rect.x + rect.w - split_x, .h = rect.h });
+                renderPaneNode(state, dock, split.first, .{ .x = rect.x, .y = rect.y, .w = split_x - rect.x, .h = rect.h }, viewport_clip);
+                renderPaneNode(state, dock, split.second, .{ .x = split_x, .y = rect.y, .w = rect.x + rect.w - split_x, .h = rect.h }, viewport_clip);
                 queueRect(state, .{ .x = split_x - theme.scaledUi(0.5), .y = rect.y, .w = theme.scaledUi(1.0), .h = rect.h }, paletteColor(theme.COLOR_PANEL_MUTED));
             } else {
                 const split_y = rect.y + rect.h * split.ratio;
-                renderPaneNode(state, dock, split.first, .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = split_y - rect.y });
-                renderPaneNode(state, dock, split.second, .{ .x = rect.x, .y = split_y, .w = rect.w, .h = rect.y + rect.h - split_y });
+                renderPaneNode(state, dock, split.first, .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = split_y - rect.y }, viewport_clip);
+                renderPaneNode(state, dock, split.second, .{ .x = rect.x, .y = split_y, .w = rect.w, .h = rect.y + rect.h - split_y }, viewport_clip);
                 queueRect(state, .{ .x = rect.x, .y = split_y - theme.scaledUi(0.5), .w = rect.w, .h = theme.scaledUi(1.0) }, paletteColor(theme.COLOR_PANEL_MUTED));
             }
         },
     }
 }
 
-fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: palette.Rect) void {
+fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: palette.Rect, viewport_clip: palette.Rect) void {
     // `rect` is the full pane bounds; `grid_rect` is inset horizontally so
     // cell output gets breathing room without pulling the focus border or
     // mouse hit envelope inward (the focus border should hug the dock edge
@@ -616,7 +652,7 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
         renderStatus(state, rect, dock.statusText(&status_buf));
         return;
     };
-    renderViewport(state, pane_id, render_state, dock.terminalForPane(pane_id), grid_rect, dock.font_scale);
+    renderViewport(state, pane_id, render_state, dock.terminalForPane(pane_id), grid_rect, dock.font_scale, viewport_clip);
     if (dock.scrollbarForPane(pane_id)) |scrollbar| {
         renderTerminalScrollbar(state, rect, grid_rect, scrollbar);
     }
@@ -624,7 +660,7 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
     if (focused) queueBorder(state, rect, paletteColor(theme.accent()), 0.0, theme.scaledUi(1.0));
 }
 
-fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const ghostty_vt.RenderState, terminal_model: ?*ghostty_vt.Terminal, rect: palette.Rect, font_scale: f32) void {
+fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const ghostty_vt.RenderState, terminal_model: ?*ghostty_vt.Terminal, rect: palette.Rect, font_scale: f32, viewport_clip: palette.Rect) void {
     if (render_state.rows == 0 or render_state.cols == 0) return;
     if (terminal_model) |model| {
         if (model.screens.active.kitty_images.dirty) {
@@ -634,24 +670,6 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
     const dock_id = hit_cache.dock_id;
     const cache = draw_cache.entryFor(dock_id, pane_id);
     const selection_dynamic = selectionAffectsPane(dock_id, pane_id);
-    // Diagnostic: VERDE_TERMINAL_DISABLE_DRAW_CACHE=1 forces every frame to
-    // rebuild. Used to isolate cache-invalidation bugs (e.g. zoom-then-scroll
-    // showing narrow-cell ghost rows from a pre-resize cached frame) from
-    // upstream Ghostty reflow issues. If the artifact vanishes with this set,
-    // the cache key is missing something it should depend on.
-    if (!selection_dynamic and !drawCacheBypassEnabled() and cache.validFor(render_state, rect, font_scale)) {
-        replayCachedViewport(state, cache, rect);
-        if (terminal_model) |model| {
-            renderTerminalImages(state, model, rect, rect, terminalRenderCellSize(terminal.CELL_PIXEL_WIDTH, font_scale), terminalRenderCellSize(terminal.CELL_PIXEL_HEIGHT, font_scale));
-            model.screens.active.kitty_images.dirty = false;
-        }
-        return;
-    }
-
-    cache.beginRebuild(state.allocator, dock_id, pane_id, render_state, rect, font_scale);
-    active_capture = cache;
-    defer active_capture = null;
-
     const cols_f = @as(f32, @floatFromInt(render_state.cols));
     const rows_f = @as(f32, @floatFromInt(render_state.rows));
     const cell_w = terminalRenderCellSize(terminal.CELL_PIXEL_WIDTH, font_scale);
@@ -666,103 +684,155 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
     const font_size = terminalFontSizeForCell(cell_w, cell_h);
     const text_y_offset = @max((cell_h - font_size) * 0.34, 0.0);
 
-    queueRect(state, rect, rgbPaletteColor(render_state.colors.background, 1.0));
     const row_data = render_state.row_data.slice();
     const row_cells = row_data.items(.cells);
     const row_selections = row_data.items(.selection);
+    const row_dirties = row_data.items(.dirty);
     const visible_rows = @min(row_cells.len, @as(usize, @intFromFloat(@ceil(rect.h / cell_h))));
     const visible_cols = @min(@as(usize, render_state.cols), @as(usize, @intFromFloat(@ceil(rect.w / cell_w))));
     const row_start = visibleRowStart(render_state, visible_rows);
+    const geometry_valid = cache.geometryValidFor(render_state, rect, font_scale, row_start, visible_rows, selection_dynamic);
+    const cursor_x: u16 = if (render_state.cursor.viewport) |cursor| @intCast(cursor.x) else 0;
+    const cursor_y: u16 = if (render_state.cursor.viewport) |cursor| @intCast(cursor.y) else 0;
+    const cursor_changed = !geometry_valid or
+        cache.cursor_x != cursor_x or
+        cache.cursor_y != cursor_y or
+        cache.cursor_visible != render_state.cursor.visible;
+    const cache_ready = cache.prepareRows(state.allocator, visible_rows, !geometry_valid);
+    const rebuild_all = !cache_ready or
+        !geometry_valid or
+        render_state.dirty == .full or
+        selection_dynamic or
+        drawCacheBypassEnabled();
+
+    // Terminal viewport background. Rows below are independently cached so a
+    // one-line TUI update does not rebuild every visible terminal cell.
+    queueRect(state, rect, rgbPaletteColor(render_state.colors.background, 1.0));
 
     for (0..visible_rows) |visual_y| {
         const model_y = row_start + visual_y;
-        const cells = row_cells[model_y];
-        const selection = row_selections[model_y];
-        const cells_slice = cells.slice();
-        const raw_cells = cells_slice.items(.raw);
-        const row_styles = cells_slice.items(.style);
-        const row_graphemes = cells_slice.items(.grapheme);
         const row_y = grid_rect.y + @as(f32, @floatFromInt(visual_y)) * cell_h;
         if (row_y >= rect.y + rect.h) break;
-        const url_ranges = terminalUrlCellRanges(state.allocator, cells) catch TerminalUrlCellRanges{};
-
-        const row_visible_cols = @min(raw_cells.len, visible_cols);
-        for (raw_cells[0..row_visible_cols], 0..) |raw_cell, x| {
-            const span = @as(f32, @floatFromInt(cellWidthCells(raw_cell)));
-            const cell_rect = terminalCellRect(grid_rect, cell_w, cell_h, x, visual_y, span);
-            if (cell_rect.x >= rect.x + rect.w) break;
-            const cell_style = styleForCell(raw_cell, row_styles, x);
-            var bg = cell_style.bg(&raw_cell, &render_state.colors.palette) orelse render_state.colors.background;
-            var fg = cell_style.fg(.{ .default = render_state.colors.foreground, .palette = &render_state.colors.palette, .bold = .bright });
-
-            // Apply the SGR inverse (reverse-video) attribute. ghostty's
-            // Style.bg/fg deliberately return the raw colors; swapping for
-            // `flags.inverse` is the renderer's job. Both values are already
-            // resolved to concrete defaults above, so a plain swap is correct.
-            // This also restores app-drawn cursors (e.g. Claude Code / Ink),
-            // which paint the caret cell as inverse video rather than relying
-            // on the hardware (DECTCEM) cursor handled below.
-            if (cell_style.flags.inverse) {
-                const swap = bg;
-                bg = fg;
-                fg = swap;
-            }
-
-            if (selection) |range| {
-                if (x >= range[0] and x <= range[1]) bg = blendRgb(bg, render_state.colors.foreground, 0.22);
-            }
-            if (selectionCoversCell(hit_cache.dock_id, pane_id, x, model_y)) {
-                bg = blendRgb(bg, render_state.colors.foreground, 0.32);
-            }
-            if (render_state.cursor.viewport) |cursor| {
-                if (cursor.x == x and cursor.y == model_y and render_state.cursor.visible) {
-                    if (render_state.cursor.visual_style == .block) {
-                        const cursor_fill = render_state.colors.cursor orelse render_state.colors.foreground;
-                        bg = blendRgb(bg, cursor_fill, 0.62);
-                        fg = render_state.colors.background;
-                    } else {
-                        drawCursor(state, render_state, cell_rect, rect);
-                    }
-                }
-            }
-
-            if (!rgbEql(bg, render_state.colors.background) or rawCellNeedsFill(raw_cell)) {
-                queueClippedRect(state, cell_rect, rgbPaletteColor(bg, 1.0), rect);
-            }
-            if (!raw_cell.hasText() or raw_cell.wide == .spacer_tail) continue;
-            if (raw_cell.codepoint() == ghostty_vt.kitty.graphics.unicode.placeholder) continue;
-            var text_buf: [128]u8 = undefined;
-            const text = cellText(raw_cell, graphemesForCell(raw_cell, row_graphemes, x), &text_buf) orelse continue;
-            const glyph_kind = terminalGlyphKind(raw_cell.codepoint());
-            if (glyph_kind == .powerline) {
-                queuePowerlineGlyph(state, cell_rect, raw_cell.codepoint(), rgbPaletteColor(fg, foregroundAlpha(cell_style)), rect);
-                continue;
-            }
-            if (queueTerminalCellGeometry(state, cell_rect, raw_cell.codepoint(), rgbPaletteColor(fg, foregroundAlpha(cell_style)), rect)) {
-                continue;
-            }
-            // Codepoints that fall through to the proportional fallback faces
-            // (Noto Sans Symbols / Symbols 2 / Emoji) have their baseline
-            // metrics expressed for proportional layout — the visible glyph
-            // sits noticeably lower in the em-box than mono glyphs at the
-            // same y. Lift them so they line up with adjacent mono text.
-            const glyph_y_offset = text_y_offset - cell_h * glyphBaselineLiftFraction(raw_cell.codepoint());
-            const text_rect = terminalTextRect(cell_rect, glyph_y_offset, glyph_kind);
-            const draw_font_size = terminalTextFontSize(font_size, glyph_kind);
-            queueTerminalText(state, .{
-                .x = text_rect.x,
-                .y = text_rect.y,
-                .w = text_rect.w,
-                .h = text_rect.h,
-            }, text, rgbPaletteColor(fg, foregroundAlpha(cell_style)), draw_font_size, intersectRect(if (glyph_kind != .text or glyphNeedsRelaxedClip(raw_cell.codepoint())) rect else cell_rect, rect), glyph_kind);
-            if (url_ranges.covers(x)) {
-                drawTerminalLinkUnderline(state, cell_rect, rgbPaletteColor(fg, foregroundAlpha(cell_style)), rect);
-            }
+        const cursor_row_changed = cursor_changed and
+            ((cache.cursor_visible and cache.cursor_y == model_y) or
+                (render_state.cursor.visible and cursor_y == model_y));
+        const row_cache = if (cache_ready) &cache.row_caches.items[visual_y] else null;
+        const rebuild_row = terminalRowNeedsRebuild(
+            rebuild_all,
+            row_cache != null and row_cache.?.active,
+            render_state.dirty == .partial and row_dirties[model_y],
+            cursor_row_changed,
+        );
+        if (!rebuild_row) {
+            replayCachedRow(state, row_cache.?, rect, viewport_clip);
+            continue;
         }
+
+        if (row_cache) |cached_row| {
+            cached_row.beginRebuild(state.allocator, rect);
+            active_capture = cached_row;
+        }
+        renderViewportRow(
+            state,
+            pane_id,
+            render_state,
+            rect,
+            grid_rect,
+            row_cells[model_y],
+            row_selections[model_y],
+            model_y,
+            visual_y,
+            visible_cols,
+            cell_w,
+            cell_h,
+            font_size,
+            text_y_offset,
+        );
+        active_capture = null;
+    }
+    if (cache_ready) {
+        cache.noteRendered(dock_id, pane_id, render_state, rect, font_scale, row_start, visible_rows, selection_dynamic);
     }
     if (terminal_model) |model| {
         renderTerminalImages(state, model, grid_rect, rect, cell_w, cell_h);
         model.screens.active.kitty_images.dirty = false;
+    }
+}
+
+fn terminalRowNeedsRebuild(rebuild_all: bool, cache_active: bool, row_dirty: bool, cursor_row_changed: bool) bool {
+    return rebuild_all or !cache_active or row_dirty or cursor_row_changed;
+}
+
+fn renderViewportRow(
+    state: *app_state.AppState,
+    pane_id: u32,
+    render_state: *const ghostty_vt.RenderState,
+    rect: palette.Rect,
+    grid_rect: palette.Rect,
+    cells: anytype,
+    selection: anytype,
+    model_y: usize,
+    visual_y: usize,
+    visible_cols: usize,
+    cell_w: f32,
+    cell_h: f32,
+    font_size: f32,
+    text_y_offset: f32,
+) void {
+    // One terminal grid row. Only dirty/cursor-affected rows reach this path.
+    const cells_slice = cells.slice();
+    const raw_cells = cells_slice.items(.raw);
+    const row_styles = cells_slice.items(.style);
+    const row_graphemes = cells_slice.items(.grapheme);
+    const url_ranges = terminalUrlCellRanges(state.allocator, cells) catch TerminalUrlCellRanges{};
+    const row_visible_cols = @min(raw_cells.len, visible_cols);
+    for (raw_cells[0..row_visible_cols], 0..) |raw_cell, x| {
+        const span = @as(f32, @floatFromInt(cellWidthCells(raw_cell)));
+        const cell_rect = terminalCellRect(grid_rect, cell_w, cell_h, x, visual_y, span);
+        if (cell_rect.x >= rect.x + rect.w) break;
+        const cell_style = styleForCell(raw_cell, row_styles, x);
+        var bg = cell_style.bg(&raw_cell, &render_state.colors.palette) orelse render_state.colors.background;
+        var fg = cell_style.fg(.{ .default = render_state.colors.foreground, .palette = &render_state.colors.palette, .bold = .bright });
+        if (cell_style.flags.inverse) {
+            const swap = bg;
+            bg = fg;
+            fg = swap;
+        }
+        if (selection) |range| {
+            if (x >= range[0] and x <= range[1]) bg = blendRgb(bg, render_state.colors.foreground, 0.22);
+        }
+        if (selectionCoversCell(hit_cache.dock_id, pane_id, x, model_y)) {
+            bg = blendRgb(bg, render_state.colors.foreground, 0.32);
+        }
+        if (render_state.cursor.viewport) |cursor| {
+            if (cursor.x == x and cursor.y == model_y and render_state.cursor.visible) {
+                if (render_state.cursor.visual_style == .block) {
+                    const cursor_fill = render_state.colors.cursor orelse render_state.colors.foreground;
+                    bg = blendRgb(bg, cursor_fill, 0.62);
+                    fg = render_state.colors.background;
+                } else {
+                    drawCursor(state, render_state, cell_rect, rect);
+                }
+            }
+        }
+        if (!rgbEql(bg, render_state.colors.background) or rawCellNeedsFill(raw_cell)) {
+            queueClippedRect(state, cell_rect, rgbPaletteColor(bg, 1.0), rect);
+        }
+        if (!raw_cell.hasText() or raw_cell.wide == .spacer_tail) continue;
+        if (raw_cell.codepoint() == ghostty_vt.kitty.graphics.unicode.placeholder) continue;
+        var text_buf: [128]u8 = undefined;
+        const text = cellText(raw_cell, graphemesForCell(raw_cell, row_graphemes, x), &text_buf) orelse continue;
+        const glyph_kind = terminalGlyphKind(raw_cell.codepoint());
+        if (glyph_kind == .powerline) {
+            queuePowerlineGlyph(state, cell_rect, raw_cell.codepoint(), rgbPaletteColor(fg, foregroundAlpha(cell_style)), rect);
+            continue;
+        }
+        if (queueTerminalCellGeometry(state, cell_rect, raw_cell.codepoint(), rgbPaletteColor(fg, foregroundAlpha(cell_style)), rect)) continue;
+        const glyph_y_offset = text_y_offset - cell_h * glyphBaselineLiftFraction(raw_cell.codepoint());
+        const text_rect = terminalTextRect(cell_rect, glyph_y_offset, glyph_kind);
+        const draw_font_size = terminalTextFontSize(font_size, glyph_kind);
+        queueTerminalText(state, text_rect, text, rgbPaletteColor(fg, foregroundAlpha(cell_style)), draw_font_size, intersectRect(if (glyph_kind != .text or glyphNeedsRelaxedClip(raw_cell.codepoint())) rect else cell_rect, rect), glyph_kind);
+        if (url_ranges.covers(x)) drawTerminalLinkUnderline(state, cell_rect, rgbPaletteColor(fg, foregroundAlpha(cell_style)), rect);
     }
 }
 
@@ -775,19 +845,46 @@ fn renderStatus(state: *app_state.AppState, rect: palette.Rect, label: []const u
     }, label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), rect);
 }
 
-fn replayCachedViewport(state: *app_state.AppState, cache: *const TerminalPaneDrawCache, rect: palette.Rect) void {
+fn replayCachedRow(state: *app_state.AppState, cache: *const TerminalRowDrawCache, rect: palette.Rect, viewport_clip: palette.Rect) void {
     const offset: palette.draw.Vec2 = .{
-        .x = rect.x - cache.rect.x,
-        .y = rect.y - cache.rect.y,
+        .x = rect.x - cache.origin.x,
+        .y = rect.y - cache.origin.y,
     };
     for (cache.commands.items) |command| {
-        switch (translatedCachedDrawCommand(command, offset)) {
+        const translated = translatedCachedDrawCommand(command, offset);
+        if (!cachedDrawCommandIntersects(translated, viewport_clip)) continue;
+        switch (translated) {
             .rect => |cmd| queueClippedRect(state, cmd.rect, cmd.color, cmd.clip),
             .border => |cmd| queueBorder(state, cmd.rect, cmd.color, cmd.radius, cmd.width),
             .triangle => |cmd| queueTriangle(state, cmd.p0, cmd.p1, cmd.p2, cmd.color, cmd.clip),
             .terminal_text => |cmd| queueTerminalText(state, cmd.rect, cmd.value, cmd.color, cmd.font_size, cmd.clip, cmd.glyph_kind),
         }
     }
+}
+
+fn cachedDrawCommandIntersects(command: CachedDrawCommand, viewport_clip: palette.Rect) bool {
+    const bounds: palette.Rect = switch (command) {
+        .rect => |cmd| cmd.rect,
+        .border => |cmd| cmd.rect,
+        .triangle => |cmd| triangleBounds(cmd.p0, cmd.p1, cmd.p2),
+        .terminal_text => |cmd| cmd.rect,
+    };
+    const command_clip: ?palette.Rect = switch (command) {
+        .rect => |cmd| cmd.clip,
+        .border => null,
+        .triangle => |cmd| cmd.clip,
+        .terminal_text => |cmd| cmd.clip,
+    };
+    const visible = intersectRect(bounds, viewport_clip) orelse return false;
+    return if (command_clip) |clip| intersectRect(visible, clip) != null else true;
+}
+
+fn triangleBounds(p0: palette.draw.Vec2, p1: palette.draw.Vec2, p2: palette.draw.Vec2) palette.Rect {
+    const x0 = @min(p0.x, @min(p1.x, p2.x));
+    const y0 = @min(p0.y, @min(p1.y, p2.y));
+    const x1 = @max(p0.x, @max(p1.x, p2.x));
+    const y1 = @max(p0.y, @max(p1.y, p2.y));
+    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
 }
 
 fn translatedCachedDrawCommand(command: CachedDrawCommand, offset: palette.draw.Vec2) CachedDrawCommand {
@@ -2273,7 +2370,29 @@ test "terminal draw cache translates every cached command" {
     }
 }
 
-test "terminal draw cache validity allows translation but rejects geometry and content changes" {
+test "terminal draw cache culls commands outside the scrolling viewport" {
+    const color: palette.Color = .{ .r = 0.1, .g = 0.2, .b = 0.3, .a = 1.0 };
+    const viewport: palette.Rect = .{ .x = 100.0, .y = 50.0, .w = 200.0, .h = 120.0 };
+
+    try std.testing.expect(cachedDrawCommandIntersects(.{ .rect = .{
+        .rect = .{ .x = 90.0, .y = 60.0, .w = 20.0, .h = 20.0 },
+        .color = color,
+    } }, viewport));
+    try std.testing.expect(!cachedDrawCommandIntersects(.{ .terminal_text = .{
+        .rect = .{ .x = 20.0, .y = 60.0, .w = 40.0, .h = 20.0 },
+        .value = "offscreen",
+        .color = color,
+        .font_size = 14.0,
+        .glyph_kind = .text,
+    } }, viewport));
+    try std.testing.expect(!cachedDrawCommandIntersects(.{ .rect = .{
+        .rect = .{ .x = 120.0, .y = 60.0, .w = 20.0, .h = 20.0 },
+        .color = color,
+        .clip = .{ .x = 0.0, .y = 0.0, .w = 50.0, .h = 50.0 },
+    } }, viewport));
+}
+
+test "terminal row cache geometry allows translation and partial dirtiness" {
     var render_state: ghostty_vt.RenderState = .empty;
     render_state.rows = 24;
     render_state.cols = 80;
@@ -2285,12 +2404,22 @@ test "terminal draw cache validity allows translation but rejects geometry and c
         .font_scale = 1.0,
         .screen = .primary,
         .cursor_visible = true,
+        .visible_rows = 24,
     };
 
-    try std.testing.expect(cache.validFor(&render_state, .{ .x = -220.0, .y = 80.0, .w = 800.0, .h = 600.0 }, 1.0));
-    try std.testing.expect(!cache.validFor(&render_state, .{ .x = -220.0, .y = 80.0, .w = 799.0, .h = 600.0 }, 1.0));
-    try std.testing.expect(!cache.validFor(&render_state, .{ .x = -220.0, .y = 80.0, .w = 800.0, .h = 600.0 }, 1.1));
+    try std.testing.expect(cache.geometryValidFor(&render_state, .{ .x = -220.0, .y = 80.0, .w = 800.0, .h = 600.0 }, 1.0, 0, 24, false));
+    try std.testing.expect(!cache.geometryValidFor(&render_state, .{ .x = -220.0, .y = 80.0, .w = 799.0, .h = 600.0 }, 1.0, 0, 24, false));
+    try std.testing.expect(!cache.geometryValidFor(&render_state, .{ .x = -220.0, .y = 80.0, .w = 800.0, .h = 600.0 }, 1.1, 0, 24, false));
 
-    render_state.dirty = .true;
-    try std.testing.expect(!cache.validFor(&render_state, .{ .x = -220.0, .y = 80.0, .w = 800.0, .h = 600.0 }, 1.0));
+    render_state.dirty = .partial;
+    try std.testing.expect(cache.geometryValidFor(&render_state, .{ .x = -220.0, .y = 80.0, .w = 800.0, .h = 600.0 }, 1.0, 0, 24, false));
+    try std.testing.expect(!cache.geometryValidFor(&render_state, .{ .x = -220.0, .y = 80.0, .w = 800.0, .h = 600.0 }, 1.0, 0, 24, true));
+}
+
+test "terminal row cache rebuilds only changed or cursor-affected rows" {
+    try std.testing.expect(!terminalRowNeedsRebuild(false, true, false, false));
+    try std.testing.expect(terminalRowNeedsRebuild(false, true, true, false));
+    try std.testing.expect(terminalRowNeedsRebuild(false, true, false, true));
+    try std.testing.expect(terminalRowNeedsRebuild(false, false, false, false));
+    try std.testing.expect(terminalRowNeedsRebuild(true, true, false, false));
 }

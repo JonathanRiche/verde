@@ -1,6 +1,7 @@
 //! Chat transcript, attachment, background-task, and send-state ownership.
 
 const std = @import("std");
+const palette = @import("palette");
 const ai_harness = @import("../providers/harness.zig");
 const chat_threads = @import("../chat/threads.zig");
 const chat_markdown = @import("../ui/chat_markdown.zig");
@@ -30,12 +31,26 @@ pub const TranscriptBodyKind = enum {
     plain,
 };
 
+pub const TranscriptRenderCacheKey = struct {
+    width: f32,
+    height: f32,
+    ui_scale: f32,
+    style_hash: u64,
+};
+
 pub const TranscriptMarkdownBody = struct {
     owned_body: []u8,
     kind: TranscriptBodyKind,
     view: chat_markdown.BodyView,
+    render_cache: palette.RenderBatch,
+    render_cache_frame_text: std.ArrayList(u8),
+    render_cache_text_arena: std.heap.ArenaAllocator,
+    render_cache_key: ?TranscriptRenderCacheKey = null,
 
     pub fn deinit(self: *TranscriptMarkdownBody, allocator: std.mem.Allocator) void {
+        self.render_cache.deinit(allocator);
+        self.render_cache_frame_text.deinit(allocator);
+        self.render_cache_text_arena.deinit();
         self.view.deinit(allocator);
         allocator.free(self.owned_body);
         allocator.destroy(self);

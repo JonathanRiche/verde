@@ -227,6 +227,25 @@ pub const Client = struct {
         try self.conn.commit();
     }
 
+    /// Persist one chat thread without rewriting unrelated transcript history.
+    pub fn saveThread(self: *const Self, workspace_id: []const u8, thread_index: usize, thread: PersistedThread) !void {
+        var workspace_row = (try self.conn.row(
+            "select id from workspaces where workspace_id = ?1",
+            .{workspace_id},
+        )) orelse return error.WorkspaceNotFound;
+        defer workspace_row.deinit();
+        const workspace_row_id = workspace_row.int(0);
+
+        try self.conn.transaction();
+        errdefer self.conn.rollback();
+        try self.conn.exec(
+            "delete from threads where workspace_id = ?1 and sort_index = ?2",
+            .{ workspace_row_id, @as(i64, @intCast(thread_index)) },
+        );
+        try self.saveThreadAtIndex(workspace_row_id, thread_index, thread);
+        try self.conn.commit();
+    }
+
     fn loadSurfaceStates(self: *const Self, allocator: std.mem.Allocator) ![]const PersistedSurfaceState {
         var surfaces: std.ArrayList(PersistedSurfaceState) = .empty;
         defer surfaces.deinit(allocator);
@@ -395,36 +414,40 @@ pub const Client = struct {
 
     fn saveThreads(self: *const Self, project_id: i64, threads: []const PersistedThread) !void {
         for (threads, 0..) |thread, thread_index| {
-            const draft_image = thread.draft_image;
-            try self.conn.exec(
-                "insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size) " ++
-                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
-                .{
-                    project_id,
-                    @as(i64, @intCast(thread_index)),
-                    thread.title,
-                    boolToInt(thread.archived),
-                    boolToInt(thread.committed),
-                    thread.local_thread_id,
-                    thread.last_activity_at,
-                    thread.provider_thread_id,
-                    thread.model_ref,
-                    encodeOptionalEnum(thread.reasoning_effort),
-                    thread.reasoning_variant,
-                    encodeOptionalEnum(thread.fast_mode),
-                    encodeOptionalEnum(thread.access_mode),
-                    @as(i64, @intFromEnum(thread.provider)),
-                    @as(i64, @intFromEnum(thread.harness)),
-                    if (thread.tui_dock_id) |dock_id| @as(i64, @intCast(dock_id)) else null,
-                    thread.draft,
-                    if (draft_image) |image| image.path else null,
-                    if (draft_image) |image| image.mime else null,
-                    if (draft_image) |image| @as(i64, @intCast(image.byte_size)) else null,
-                },
-            );
-            const thread_row_id = self.conn.lastInsertedRowId();
-            try self.saveMessages(thread_row_id, thread.messages);
+            try self.saveThreadAtIndex(project_id, thread_index, thread);
         }
+    }
+
+    fn saveThreadAtIndex(self: *const Self, project_id: i64, thread_index: usize, thread: PersistedThread) !void {
+        const draft_image = thread.draft_image;
+        try self.conn.exec(
+            "insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size) " ++
+                "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            .{
+                project_id,
+                @as(i64, @intCast(thread_index)),
+                thread.title,
+                boolToInt(thread.archived),
+                boolToInt(thread.committed),
+                thread.local_thread_id,
+                thread.last_activity_at,
+                thread.provider_thread_id,
+                thread.model_ref,
+                encodeOptionalEnum(thread.reasoning_effort),
+                thread.reasoning_variant,
+                encodeOptionalEnum(thread.fast_mode),
+                encodeOptionalEnum(thread.access_mode),
+                @as(i64, @intFromEnum(thread.provider)),
+                @as(i64, @intFromEnum(thread.harness)),
+                if (thread.tui_dock_id) |dock_id| @as(i64, @intCast(dock_id)) else null,
+                thread.draft,
+                if (draft_image) |image| image.path else null,
+                if (draft_image) |image| image.mime else null,
+                if (draft_image) |image| @as(i64, @intCast(image.byte_size)) else null,
+            },
+        );
+        const thread_row_id = self.conn.lastInsertedRowId();
+        try self.saveMessages(thread_row_id, thread.messages);
     }
 
     fn saveMessages(self: *const Self, thread_id: i64, messages: []const PersistedMessage) !void {
@@ -614,6 +637,56 @@ test "chat completions survive state saves and clear explicitly" {
     try testing.expectEqualStrings("chat-later", loaded.value.chat_completions[1].local_thread_id);
     try testing.expect(try client.clearChatCompletion("workspace-1", "chat-first"));
     try testing.expect(!try client.clearChatCompletion("workspace-1", "chat-first"));
+}
+
+test "single-thread save preserves unrelated transcript history" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+
+    var client = try Client.init(testing.allocator, pref_path);
+    defer client.deinit();
+
+    try client.save(.{ .projects = &.{.{
+        .id = "workspace-1",
+        .label = "Workspace",
+        .path = "/tmp/workspace",
+        .threads = &.{
+            .{
+                .title = "Unrelated",
+                .local_thread_id = "thread-1",
+                .provider = .codex,
+                .messages = &.{.{ .role = .user, .author = "You", .body = "keep me" }},
+            },
+            .{
+                .title = "Target",
+                .local_thread_id = "thread-2",
+                .provider = .codex,
+                .messages = &.{.{ .role = .user, .author = "You", .body = "old" }},
+            },
+        },
+    }} });
+
+    try client.saveThread("workspace-1", 1, .{
+        .title = "Target updated",
+        .local_thread_id = "thread-2",
+        .provider = .codex,
+        .messages = &.{
+            .{ .role = .user, .author = "You", .body = "old" },
+            .{ .role = .user, .author = "You", .body = "new prompt" },
+        },
+    });
+
+    var loaded = (try client.load(testing.allocator)).?;
+    defer loaded.deinit();
+    const threads = loaded.value.projects[0].threads.?;
+    try testing.expectEqual(@as(usize, 2), threads.len);
+    try testing.expectEqualStrings("keep me", threads[0].messages[0].body);
+    try testing.expectEqualStrings("Target updated", threads[1].title);
+    try testing.expectEqual(@as(usize, 2), threads[1].messages.len);
+    try testing.expectEqualStrings("new prompt", threads[1].messages[1].body);
 }
 
 test "save clears orphaned threads left behind by manual db edits" {

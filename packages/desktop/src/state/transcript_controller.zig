@@ -96,12 +96,23 @@ pub fn ensureTranscriptMarkdownSelectionCurrent(self: anytype) void {
 
 pub fn transcriptMarkdownSelection(self: anytype) ?MarkdownSelection {
     self.ensureTranscriptMarkdownSelectionCurrent();
-    const anchor = self.transcript_controller.markdown_selection_anchor orelse return null;
-    const focus = self.transcript_controller.markdown_selection_focus orelse return null;
-    return .{
-        .anchor = anchor,
-        .focus = focus,
-    };
+    if (self.project_controller.projects.items.len == 0) return null;
+    return markdownSelectionForContext(
+        &self.transcript_controller,
+        self.project_controller.selected_index,
+        self.currentProject().selected_thread_index,
+    );
+}
+
+/// Returns the selection for the temporarily active render context without
+/// clearing a selection owned by another scrolling workspace pane.
+pub fn peekTranscriptMarkdownSelection(self: anytype) ?MarkdownSelection {
+    if (self.project_controller.projects.items.len == 0) return null;
+    return markdownSelectionForContext(
+        &self.transcript_controller,
+        self.project_controller.selected_index,
+        self.currentProject().selected_thread_index,
+    );
 }
 
 pub fn transcriptMarkdownSelectionDragging(self: anytype) bool {
@@ -174,6 +185,33 @@ pub fn clearTranscriptMarkdownSelection(self: anytype) void {
     self.transcript_controller.markdown_selection_anchor = null;
     self.transcript_controller.markdown_selection_focus = null;
     self.transcript_controller.markdown_selection_dragging = false;
+}
+
+fn markdownSelectionForContext(controller: *const State, project_index: usize, thread_index: usize) ?MarkdownSelection {
+    if (controller.markdown_selection_project_index != project_index or
+        controller.markdown_selection_thread_index != thread_index)
+    {
+        return null;
+    }
+    const anchor = controller.markdown_selection_anchor orelse return null;
+    const focus = controller.markdown_selection_focus orelse return null;
+    return .{ .anchor = anchor, .focus = focus };
+}
+
+test "render context lookup preserves another pane selection" {
+    const controller: State = .{
+        .markdown_selection_project_index = 2,
+        .markdown_selection_thread_index = 4,
+        .markdown_selection_anchor = .{ .message_index = 1, .point = .{ .line_index = 0, .column = 2 } },
+        .markdown_selection_focus = .{ .message_index = 3, .point = .{ .line_index = 1, .column = 5 } },
+        .markdown_selection_dragging = true,
+    };
+
+    try std.testing.expect(markdownSelectionForContext(&controller, 2, 4) != null);
+    try std.testing.expect(markdownSelectionForContext(&controller, 2, 5) == null);
+    try std.testing.expect(controller.markdown_selection_anchor != null);
+    try std.testing.expect(controller.markdown_selection_focus != null);
+    try std.testing.expect(controller.markdown_selection_dragging);
 }
 
 pub fn transcriptMarkdownBodyView(self: anytype, message_index: usize, body: []const u8) ?*const chat_markdown.BodyView {
@@ -294,16 +332,27 @@ pub fn transcriptMarkdownBodyEntry(self: anytype, message_index: usize, body: []
     return transcriptBodyEntry(self, message_index, body, .markdown);
 }
 
+pub fn transcriptPlainBodyEntry(self: anytype, message_index: usize, body: []const u8) ?*TranscriptMarkdownBody {
+    return transcriptBodyEntry(self, message_index, body, .plain);
+}
+
 pub fn createTranscriptBody(self: anytype, body: []const u8, kind: TranscriptBodyKind) !*TranscriptMarkdownBody {
     const entry = try self.allocator.create(TranscriptMarkdownBody);
     errdefer self.allocator.destroy(entry);
 
-    entry.owned_body = try self.allocator.dupe(u8, body);
-    errdefer self.allocator.free(entry.owned_body);
+    const owned_body = try self.allocator.dupe(u8, body);
+    errdefer self.allocator.free(owned_body);
+    var view = try buildTranscriptBodyView(self.allocator, owned_body, kind);
+    errdefer view.deinit(self.allocator);
 
-    entry.kind = kind;
-    entry.view = try buildTranscriptBodyView(self.allocator, entry.owned_body, kind);
-    errdefer entry.view.deinit(self.allocator);
+    entry.* = .{
+        .owned_body = owned_body,
+        .kind = kind,
+        .view = view,
+        .render_cache = .{},
+        .render_cache_frame_text = .empty,
+        .render_cache_text_arena = std.heap.ArenaAllocator.init(self.allocator),
+    };
 
     return entry;
 }
