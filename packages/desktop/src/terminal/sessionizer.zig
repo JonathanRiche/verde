@@ -249,6 +249,95 @@ pub fn requestAllocUsingBuffer(
     return result.response;
 }
 
+/// Keeps the Unix session-daemon socket open across repeated requests. Older
+/// daemons close after one response; that is detected once and falls back to
+/// the existing one-request connection without changing request semantics.
+pub const ReusableRequestConnection = struct {
+    stream: ?std.Io.net.Stream = null,
+    reuse_confirmed: bool = false,
+    reuse_disabled: bool = false,
+
+    pub fn deinit(self: *ReusableRequestConnection) void {
+        self.closeStream();
+        self.* = .{};
+    }
+
+    pub fn requestAllocUsingBuffer(
+        self: *ReusableRequestConnection,
+        allocator: std.mem.Allocator,
+        pref_path: []const u8,
+        method: []const u8,
+        params: anytype,
+        request_id: u64,
+        response_buffer: []u8,
+    ) ![]u8 {
+        if (builtin.os.tag == .windows) {
+            const result = try requestWithPeerAlloc(
+                allocator,
+                pref_path,
+                method,
+                params,
+                request_id,
+                response_buffer.len,
+                response_buffer,
+            );
+            return result.response;
+        }
+
+        const request_json = try requestJsonAlloc(allocator, method, params, request_id);
+        defer allocator.free(request_json);
+        if (self.reuse_disabled) {
+            return requestJsonOnNewUnixStreamAlloc(allocator, pref_path, request_json, response_buffer) catch |err| {
+                // A daemon replacement should get a fresh capability probe.
+                self.reuse_disabled = false;
+                return err;
+            };
+        }
+
+        const reused_stream = self.stream != null;
+        if (self.stream == null) self.stream = try connectUnixStream(allocator, pref_path);
+        const response = requestJsonOnUnixStreamAlloc(allocator, self.stream.?, request_json, response_buffer) catch |err| {
+            self.closeStream();
+            switch (reuseFailureAction(reused_stream, self.reuse_confirmed)) {
+                .return_error => return err,
+                .disable_and_retry => {
+                    self.reuse_disabled = true;
+                    return requestJsonOnNewUnixStreamAlloc(allocator, pref_path, request_json, response_buffer);
+                },
+                .reconnect => {
+                    self.stream = try connectUnixStream(allocator, pref_path);
+                    return requestJsonOnUnixStreamAlloc(allocator, self.stream.?, request_json, response_buffer);
+                },
+            }
+        };
+        if (reused_stream) self.reuse_confirmed = true;
+        return response;
+    }
+
+    fn closeStream(self: *ReusableRequestConnection) void {
+        if (self.stream) |stream| stream.close(std.Io.Threaded.global_single_threaded.io());
+        self.stream = null;
+        self.reuse_confirmed = false;
+    }
+};
+
+const ReuseFailureAction = enum {
+    return_error,
+    disable_and_retry,
+    reconnect,
+};
+
+fn reuseFailureAction(reused_stream: bool, reuse_confirmed: bool) ReuseFailureAction {
+    if (!reused_stream) return .return_error;
+    return if (reuse_confirmed) .reconnect else .disable_and_retry;
+}
+
+test "reusable daemon connection distinguishes old servers from dropped confirmed connections" {
+    try std.testing.expectEqual(ReuseFailureAction.return_error, reuseFailureAction(false, false));
+    try std.testing.expectEqual(ReuseFailureAction.disable_and_retry, reuseFailureAction(true, false));
+    try std.testing.expectEqual(ReuseFailureAction.reconnect, reuseFailureAction(true, true));
+}
+
 const RequestResult = struct {
     response: []u8,
     authenticated_server_process_id: ?u32 = null,
@@ -263,23 +352,9 @@ fn requestWithPeerAlloc(
     max_response_bytes: usize,
     response_buffer: ?[]u8,
 ) !RequestResult {
-    var threaded = std.Io.Threaded.init_single_threaded;
-    const io = threaded.io();
     const socket_path = try socketPath(allocator, pref_path);
     defer allocator.free(socket_path);
-
-    var request_writer: std.Io.Writer.Allocating = .init(allocator);
-    errdefer request_writer.deinit();
-    var s: std.json.Stringify = .{ .writer = &request_writer.writer, .options = .{} };
-    try s.beginObject();
-    try s.objectField("id");
-    try s.write(request_id);
-    try s.objectField("method");
-    try s.write(method);
-    try s.objectField("params");
-    try s.write(params);
-    try s.endObject();
-    const request_json = try request_writer.toOwnedSlice();
+    const request_json = try requestJsonAlloc(allocator, method, params, request_id);
     defer allocator.free(request_json);
 
     if (builtin.os.tag == .windows) {
@@ -294,9 +369,58 @@ fn requestWithPeerAlloc(
         };
     }
 
+    const stream = try connectUnixStreamAtPath(socket_path);
+    defer stream.close(std.Io.Threaded.global_single_threaded.io());
+
+    const read_buffer = response_buffer orelse try allocator.alloc(u8, max_response_bytes);
+    defer if (response_buffer == null) allocator.free(read_buffer);
+    return .{ .response = try requestJsonOnUnixStreamAlloc(allocator, stream, request_json, read_buffer) };
+}
+
+fn requestJsonAlloc(allocator: std.mem.Allocator, method: []const u8, params: anytype, request_id: u64) ![]u8 {
+    var request_writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer request_writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &request_writer.writer, .options = .{} };
+    try s.beginObject();
+    try s.objectField("id");
+    try s.write(request_id);
+    try s.objectField("method");
+    try s.write(method);
+    try s.objectField("params");
+    try s.write(params);
+    try s.endObject();
+    return request_writer.toOwnedSlice();
+}
+
+fn connectUnixStream(allocator: std.mem.Allocator, pref_path: []const u8) !std.Io.net.Stream {
+    const socket_path = try socketPath(allocator, pref_path);
+    defer allocator.free(socket_path);
+    return connectUnixStreamAtPath(socket_path);
+}
+
+fn connectUnixStreamAtPath(socket_path: []const u8) !std.Io.net.Stream {
     const address = try std.Io.net.UnixAddress.init(socket_path);
-    const stream = try address.connect(io);
-    defer stream.close(io);
+    return address.connect(std.Io.Threaded.global_single_threaded.io());
+}
+
+fn requestJsonOnNewUnixStreamAlloc(
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    request_json: []const u8,
+    response_buffer: []u8,
+) ![]u8 {
+    const stream = try connectUnixStream(allocator, pref_path);
+    defer stream.close(std.Io.Threaded.global_single_threaded.io());
+    return requestJsonOnUnixStreamAlloc(allocator, stream, request_json, response_buffer);
+}
+
+fn requestJsonOnUnixStreamAlloc(
+    allocator: std.mem.Allocator,
+    stream: std.Io.net.Stream,
+    request_json: []const u8,
+    response_buffer: []u8,
+) ![]u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
 
     var write_buffer: [64 * 1024]u8 = undefined;
     var writer = stream.writer(io, &write_buffer);
@@ -304,11 +428,9 @@ fn requestWithPeerAlloc(
     try writer.interface.writeByte('\n');
     try writer.interface.flush();
 
-    const read_buffer = response_buffer orelse try allocator.alloc(u8, max_response_bytes);
-    defer if (response_buffer == null) allocator.free(read_buffer);
-    var reader = stream.reader(io, read_buffer);
+    var reader = stream.reader(io, response_buffer);
     const line = try reader.interface.takeDelimiter('\n') orelse return error.ConnectionAborted;
-    return .{ .response = try allocator.dupe(u8, std.mem.trim(u8, line, "\r")) };
+    return allocator.dupe(u8, std.mem.trim(u8, line, "\r"));
 }
 const DaemonStatus = struct {
     protocol_version: u32,
@@ -1732,7 +1854,12 @@ fn runUnixDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
             error.ConnectionAborted => continue,
             else => return err,
         };
-        handleClient(&daemon, io, stream);
+        const client_thread = std.Thread.spawn(.{}, handleClientThread, .{ &daemon, stream }) catch |err| {
+            log.warn("failed to start session daemon client worker: {s}", .{@errorName(err)});
+            handleClient(&daemon, io, stream);
+            continue;
+        };
+        client_thread.detach();
     }
 }
 
@@ -1816,27 +1943,43 @@ fn drainSessionsThread(context: DrainThreadContext) void {
     }
 }
 
+fn handleClientThread(daemon: *Daemon, stream: std.Io.net.Stream) void {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    handleClient(daemon, threaded.io(), stream);
+}
+
 fn handleClient(daemon: *Daemon, io: std.Io, stream: std.Io.net.Stream) void {
     defer stream.close(io);
     var read_buffer: [64 * 1024]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
-    const line = reader.interface.takeDelimiter('\n') catch return orelse return;
-
-    var locked = true;
-    lockDaemon(daemon);
-    const response_json = daemon.handleRequest(std.mem.trim(u8, line, "\r")) catch |err| blk: {
-        daemon.mutex.unlock();
-        locked = false;
-        break :blk errorResponseAlloc(daemon.allocator, .null, "internal_error", @errorName(err)) catch return;
-    };
-    if (locked) daemon.mutex.unlock();
-    defer daemon.allocator.free(response_json);
-
     var write_buffer: [64 * 1024]u8 = undefined;
     var writer = stream.writer(io, &write_buffer);
-    writer.interface.writeAll(response_json) catch return;
-    writer.interface.writeByte('\n') catch return;
-    writer.interface.flush() catch return;
+    while (true) {
+        const line = reader.interface.takeDelimiter('\n') catch return orelse return;
+
+        var locked = true;
+        lockDaemon(daemon);
+        const response_json = daemon.handleRequest(std.mem.trim(u8, line, "\r")) catch |err| blk: {
+            daemon.mutex.unlock();
+            locked = false;
+            break :blk errorResponseAlloc(daemon.allocator, .null, "internal_error", @errorName(err)) catch return;
+        };
+        if (locked) daemon.mutex.unlock();
+
+        writer.interface.writeAll(response_json) catch {
+            daemon.allocator.free(response_json);
+            return;
+        };
+        writer.interface.writeByte('\n') catch {
+            daemon.allocator.free(response_json);
+            return;
+        };
+        writer.interface.flush() catch {
+            daemon.allocator.free(response_json);
+            return;
+        };
+        daemon.allocator.free(response_json);
+    }
 }
 
 fn lockDaemon(daemon: *Daemon) void {
