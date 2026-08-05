@@ -1614,14 +1614,16 @@ pub fn createWorkspaceChatPane(
     const previous_next_pane_id = layout.next_pane_id;
     errdefer layout.next_pane_id = previous_next_pane_id;
     const new_pane_id = try layout.createChatPane(allocator, thread_index);
-    var pane_appended = true;
-    errdefer if (pane_appended) {
-        var removed_ref = layout.panes.pop().?.ref;
-        deinitWorkspacePaneRef(&removed_ref, allocator);
+    var pane_inserted = true;
+    errdefer if (pane_inserted) {
+        if (layout.closePane(allocator, new_pane_id)) |removed| {
+            var removed_ref = removed;
+            deinitWorkspacePaneRef(&removed_ref, allocator);
+        }
     };
 
     try layout.splitPaneWithLeaf(allocator, target_id, new_pane_id, axis, true);
-    pane_appended = false;
+    pane_inserted = false;
     thread_appended = false;
 
     if (focus) {
