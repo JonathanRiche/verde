@@ -1232,6 +1232,60 @@ fn renderMoss(state: *runtime.AppState, rect: palette.Rect, visual: controller.V
     }
 }
 
+// Curved white supercilium in head-local units: rear low, mid peak, front soft drop —
+// the prototype CSS arc (border-radius brow), not a flat bar.
+fn vireoBrowArcPoints(head: palette.Rect, s: f32) [4]palette.draw.Vec2 {
+    return .{
+        .{ .x = head.x + 5.5 * s, .y = head.y + 5.8 * s },
+        .{ .x = head.x + 10.2 * s, .y = head.y + 3.6 * s },
+        .{ .x = head.x + 16.0 * s, .y = head.y + 3.3 * s },
+        .{ .x = head.x + 22.5 * s, .y = head.y + 4.9 * s },
+    };
+}
+
+// Dark eye-line tracks the same arc a little below the brow ridge.
+fn vireoEyelineArcPoints(head: palette.Rect, s: f32) [4]palette.draw.Vec2 {
+    return .{
+        .{ .x = head.x + 6.0 * s, .y = head.y + 7.2 * s },
+        .{ .x = head.x + 10.6 * s, .y = head.y + 5.4 * s },
+        .{ .x = head.x + 16.2 * s, .y = head.y + 5.2 * s },
+        .{ .x = head.x + 21.8 * s, .y = head.y + 6.6 * s },
+    };
+}
+
+/// Profile faces right. Resting pupil sits viewer-left (toward the user/camera);
+/// approval nudges slightly toward the badge without flipping to a look-away.
+fn vireoPupilOffset(pose: controller.Pose, s: f32) struct { x: f32, y: f32 } {
+    // Eye is 5.5 design units with a 2.2 pupil; geometric center offset is ~1.65.
+    const rest_x = 0.55 * s;
+    const rest_y = 1.55 * s;
+    return switch (pose) {
+        .approval => .{ .x = rest_x + 0.85 * s, .y = rest_y + 0.45 * s },
+        else => .{ .x = rest_x, .y = rest_y },
+    };
+}
+
+fn vireoPupilRect(eye: palette.Rect, pose: controller.Pose, s: f32) palette.Rect {
+    const offset = vireoPupilOffset(pose, s);
+    return .{
+        .x = eye.x + offset.x,
+        .y = eye.y + offset.y,
+        .w = 2.2 * s,
+        .h = 2.2 * s,
+    };
+}
+
+fn queueVireoArc(state: *runtime.AppState, points: [4]palette.draw.Vec2, width: f32, fill: palette.Color) void {
+    queueLine(state, points[0], points[1], width, fill);
+    queueLine(state, points[1], points[2], width, fill);
+    queueLine(state, points[2], points[3], width, fill);
+    // Soft end caps so the stroke reads as a continuous ridge, not three hard joins.
+    const cap = width * 0.55;
+    inline for (.{ points[0], points[3] }) |tip| {
+        queueRoundedRect(state, .{ .x = tip.x - cap, .y = tip.y - cap, .w = cap * 2.0, .h = cap * 2.0 }, fill, cap);
+    }
+}
+
 // Static Vireo side-profile songbird; pose shifts head/tail and the shared failure badge.
 fn renderVireo(state: *runtime.AppState, rect: palette.Rect, visual: controller.VisualState) void {
     const s = rect.w / 46.0;
@@ -1260,7 +1314,7 @@ fn renderVireo(state: *runtime.AppState, rect: palette.Rect, visual: controller.
     queueRoundedRect(state, wing, color(vireo.wing), 5.0 * s);
     queueRoundedRect(state, .{ .x = wing.x - 2.0 * s, .y = wing.y + 5.0 * s, .w = 10.0 * s, .h = 4.5 * s }, color(vireo.wingtip), 2.2 * s);
 
-    // Profile head with crown, supercilium, red eye, and pointed beak.
+    // Profile head with crown, arched supercilium, red eye, and pointed beak.
     const head: palette.Rect = .{
         .x = rect.x + 22.0 * s + approval_tilt,
         .y = rect.y + 1.0 * s + paused_drop,
@@ -1269,16 +1323,16 @@ fn renderVireo(state: *runtime.AppState, rect: palette.Rect, visual: controller.
     };
     queueCharacterPanel(state, head, color(vireo.head), color(vireo.outline), 7.0 * s, 1.0 * s);
     queueRoundedRect(state, .{ .x = head.x + 2.0 * s, .y = head.y, .w = 18.0 * s, .h = 6.0 * s }, color(vireo.crown), 4.0 * s);
-    queueRoundedRect(state, .{ .x = head.x + 5.5 * s, .y = head.y + 4.2 * s, .w = 17.0 * s, .h = 2.0 * s }, color(vireo.brow), 1.0 * s);
-    queueRoundedRect(state, .{ .x = head.x + 6.0 * s, .y = head.y + 6.5 * s, .w = 15.0 * s, .h = 1.4 * s }, color(vireo.eyeline), 0.7 * s);
+    queueVireoArc(state, vireoBrowArcPoints(head, s), 1.55 * s, color(vireo.brow));
+    queueVireoArc(state, vireoEyelineArcPoints(head, s), 1.15 * s, color(vireo.eyeline));
 
     const eye: palette.Rect = .{ .x = head.x + 14.5 * s, .y = head.y + 6.7 * s, .w = 5.5 * s, .h = if (visual.pose == .paused) 2.5 * s else 5.5 * s };
     if (visual.pose == .paused) {
         queueRoundedRect(state, eye, color(vireo.paused_lid), 1.2 * s);
     } else {
-        const gaze = if (visual.pose == .approval) 1.2 * s else 0.0;
         queueCharacterPanel(state, eye, color(vireo.eye), color(vireo.brow), 2.75 * s, 1.0 * s);
-        queueRoundedRect(state, .{ .x = eye.x + 1.6 * s + gaze, .y = eye.y + 1.6 * s, .w = 2.2 * s, .h = 2.2 * s }, color(vireo.pupil), 1.1 * s);
+        const pupil = vireoPupilRect(eye, visual.pose, s);
+        queueRoundedRect(state, pupil, color(vireo.pupil), 1.1 * s);
     }
     queueRoundedRect(state, .{ .x = head.x + head.w - 3.0 * s, .y = head.y + 7.0 * s, .w = 10.0 * s, .h = 3.0 * s }, color(vireo.beak), 1.5 * s);
 
@@ -3483,4 +3537,100 @@ fn expectBatchText(batch: *const palette.RenderBatch, expected: []const u8) !voi
         if (command.kind == .text and std.mem.eql(u8, command.text, expected)) return;
     }
     return error.MissingExpectedText;
+}
+
+test "Vireo brow arcs instead of a flat bar and pupil rests viewer-left" {
+    inline for (.{ @as(f32, 1.0), @as(f32, 1.25) }) |scale| {
+        // Design-space scale matches renderVireo: head is 24 units of a 46-wide portrait.
+        const unit = scale;
+        const head: palette.Rect = .{ .x = 100.0 * unit, .y = 40.0 * unit, .w = 24.0 * unit, .h = 16.0 * unit };
+        const brow = vireoBrowArcPoints(head, unit);
+        // Midpoints rise above the ends — the prototype arched supercilium, not a flat ridge.
+        try std.testing.expect(brow[1].y < brow[0].y);
+        try std.testing.expect(brow[2].y < brow[3].y);
+        try std.testing.expect(brow[1].y < brow[0].y - 1.2 * unit);
+        try std.testing.expect(brow[2].x > brow[1].x);
+        // Front of the arc is still lower than the peak so it reads as an eyebrow, not a straight slash.
+        try std.testing.expect(brow[3].y > brow[2].y);
+
+        const eye: palette.Rect = .{ .x = head.x + 14.5 * unit, .y = head.y + 6.7 * unit, .w = 5.5 * unit, .h = 5.5 * unit };
+        const pupil = vireoPupilRect(eye, .idle, unit);
+        const eye_center_x = eye.x + eye.w * 0.5;
+        const pupil_center_x = pupil.x + pupil.w * 0.5;
+        // Profile faces right; viewer-left sits left of the eye center (toward the user).
+        try std.testing.expect(pupil_center_x < eye_center_x - 0.4 * unit);
+
+        const approval = vireoPupilRect(eye, .approval, unit);
+        const approval_center_x = approval.x + approval.w * 0.5;
+        try std.testing.expect(approval_center_x > pupil_center_x);
+        // Approval may ease toward the badge but must not flip into a hard look-away past center.
+        try std.testing.expect(approval_center_x <= eye_center_x + 0.15 * unit);
+    }
+}
+
+test "Vireo render emits arched brow strokes and viewer-left pupil at fractional scale" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.25);
+    theme.current_colors = theme.default_colors;
+
+    var state: runtime.AppState = undefined;
+    state.allocator = allocator;
+    state.app_config = .{ .companion_character = .vireo };
+    state.project_controller = .{};
+    state.companion_controller = controller.init();
+    state.companion_controller.applyFixture(.idle);
+    state.companion_composer = @TypeOf(state.companion_composer).init();
+    state.palette_overlay_batch = .{};
+    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.companion_composer.deinit(allocator);
+        state.palette_overlay_batch.deinit(allocator);
+        state.palette_frame_text_arena.deinit();
+    }
+    var project = try runtime.Project.init(allocator, "vireo-gaze", "Vireo", "/tmp/vireo-gaze", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+
+    state.companion_controller.collapse();
+    render(&state, 1360.0 * 1.25, 860.0 * 1.25);
+    const geometry = computeGeometryForState(1360.0 * 1.25, 860.0 * 1.25, 1.25, &state.companion_controller);
+    const full = fullCharacterRect(geometry.chip_character, .vireo, 1.25);
+    const s = full.w / 46.0;
+    const head: palette.Rect = .{
+        .x = full.x + 22.0 * s,
+        .y = full.y + 1.0 * s,
+        .w = 24.0 * s,
+        .h = 16.0 * s,
+    };
+    const eye: palette.Rect = .{ .x = head.x + 14.5 * s, .y = head.y + 6.7 * s, .w = 5.5 * s, .h = 5.5 * s };
+    const expected_pupil = vireoPupilRect(eye, .idle, s);
+    const brow = vireoBrowArcPoints(head, s);
+    const paint = deriveVireoPalette(activeCharacterTheme());
+
+    var saw_pupil = false;
+    var saw_brow_segment = false;
+    for (state.palette_overlay_batch.commands.items) |command| {
+        if (command.kind == .rect and rectEqual(command.rect, expected_pupil) and sameColor(command.color, color(paint.pupil))) {
+            saw_pupil = true;
+        }
+        // Arc segments are triangle-fans from queueLine; any brow-colored triangle
+        // whose points sit near the arched brow path proves the ridge is stroked.
+        if (command.kind == .triangle and sameColor(command.color, color(paint.brow))) {
+            const mid_x = (command.p0.x + command.p1.x + command.p2.x) / 3.0;
+            const mid_y = (command.p0.y + command.p1.y + command.p2.y) / 3.0;
+            if (mid_x >= brow[0].x - 2.0 * s and mid_x <= brow[3].x + 2.0 * s and
+                mid_y >= brow[2].y - 3.0 * s and mid_y <= brow[0].y + 3.0 * s)
+            {
+                saw_brow_segment = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_pupil);
+    try std.testing.expect(saw_brow_segment);
+    try std.testing.expect(expected_pupil.x + expected_pupil.w * 0.5 < eye.x + eye.w * 0.5);
 }
