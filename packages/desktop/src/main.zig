@@ -17,6 +17,7 @@ const loop_wakeup = @import("loop_wakeup");
 const keybinds = @import("app/keybinds.zig");
 const platform_runtime = @import("platform_runtime");
 const windows_integrations = @import("platform/windows/integrations.zig");
+const loop_pacing = @import("runtime/loop_pacing.zig");
 const profiler = @import("runtime/profiler.zig");
 const runtime_log = @import("runtime/log.zig");
 const stb_image = @import("media/stb_image.zig");
@@ -89,6 +90,9 @@ const SLASH_COMMAND_ANIMATION_WAIT_TIMEOUT_MS: c_int = 33;
 // Detached shell tasks only need coarse liveness checks. A 1s wake keeps
 // completion rows prompt without turning idle background work into animation.
 const BACKGROUND_TASK_WAIT_TIMEOUT_MS: c_int = 1000;
+// External config edits are human-paced. Four checks per second keep reloads
+// effectively immediate without opening and statting the file on every frame.
+const APP_CONFIG_POLL_INTERVAL_MS: i64 = 250;
 const MOUSE_MOTION_RENDER_INTERVAL_MS: i64 = 33;
 const MACOS_CMD_W_CLOSE_SUPPRESS_MS: i64 = 750;
 // Some Wayland compositors can emit a burst of SDL close requests while a
@@ -511,6 +515,9 @@ fn mainInner(init: std.process.Init) !void {
     var last_frame_profile_log_ms: i64 = 0;
     var last_framebuffer_width: c_int = 0;
     var last_framebuffer_height: c_int = 0;
+    var render_pacer: loop_pacing.FramePacer = .{};
+    var app_config_poll_cadence: loop_pacing.Cadence = .{};
+    var pending_wake_sequence: ?u64 = null;
     while (running) {
         if (macosHostWindowRequestedClose(window, &state)) {
             running = false;
@@ -524,7 +531,7 @@ fn mainInner(init: std.process.Init) !void {
         var input_fb_h: c_int = 0;
         getWindowSizeInPixels(window, &input_fb_w, &input_fb_h);
         ui_layout.refreshPaletteModalHits(&state, @floatFromInt(input_fb_w), @floatFromInt(input_fb_h));
-        running = processEvents(window, &state, &keyboard, ui_scale, &event_flags, &frame_sample, &event_wait_ns);
+        running = processEvents(window, &state, &keyboard, ui_scale, &event_flags, &frame_sample, &event_wait_ns, &render_pacer);
         frame_sample.waited_ns = event_wait_ns;
         recordSpan(&frame_sample, .poll_picker, struct {
             fn run(app_state: *AppState) void {
@@ -576,7 +583,13 @@ fn mainInner(init: std.process.Init) !void {
             }
         }.run, .{ &state, &terminal_needs_render });
         syncMouseCursor(&state, &cursor_cache);
-        pollAppConfigFileChanges(&state);
+        if (app_config_poll_cadence.shouldRun(monotonicMs(), APP_CONFIG_POLL_INTERVAL_MS)) {
+            recordSpan(&frame_sample, .poll_config, struct {
+                fn run(app_state: *AppState) void {
+                    pollAppConfigFileChanges(app_state);
+                }
+            }.run, .{&state});
+        }
         if (state.app_config_runtime_sync_pending) {
             state.app_config_runtime_sync_pending = false;
             applyAppConfigRuntime(&state);
@@ -607,10 +620,21 @@ fn mainInner(init: std.process.Init) !void {
             last_framebuffer_height = observed_fb_height;
         }
 
-        const continuous_frames = appNeedsContinuousFrames(&state);
+        if (event_flags.loop_wakeup_sequence) |sequence| {
+            pending_wake_sequence = sequence;
+            render_pacer.requestWakeRender();
+        }
+        const now_ms = monotonicMs();
+        const continuous_interval_ms = continuousFrameIntervalMs(&state);
+        const continuous_frames = continuous_interval_ms != 0;
+        const continuous_frame_due = continuous_frames and render_pacer.continuousFrameDue(now_ms, continuous_interval_ms);
+        const wake_frame_due = render_pacer.wakeRenderDue(now_ms, ACTIVE_WAIT_TIMEOUT_MS);
         const event_needs_render = event_flags.has_non_mouse_motion or
             shouldRenderMouseMotion(event_flags.has_mouse_motion, continuous_frames, &last_mouse_motion_render_ms);
-        needs_render = needs_render or send_needs_render or background_tasks_need_render or browser_needs_render or terminal_needs_render or event_needs_render or framebuffer_size_changed or continuous_frames;
+        // A wake-driven send change is covered by the display-rate wake frame.
+        // Non-wake polling changes still render immediately.
+        const immediate_send_render = send_needs_render and event_flags.loop_wakeup_sequence == null;
+        needs_render = needs_render or immediate_send_render or background_tasks_need_render or browser_needs_render or terminal_needs_render or event_needs_render or framebuffer_size_changed or continuous_frame_due or wake_frame_due;
         if (!needs_render) {
             profiler.recordFrame(frame_sample);
             maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
@@ -680,7 +704,15 @@ fn mainInner(init: std.process.Init) !void {
                 submitted.* = true;
             }
         }.run, .{ &palette_renderer, &state, allocator, fb_width, fb_height, &frame_submitted });
-        if (frame_submitted) state.noteBrowserFramePresented();
+        if (frame_submitted) {
+            state.noteBrowserFramePresented();
+            render_pacer.noteRendered(monotonicMs());
+        }
+        if (pending_wake_sequence) |sequence| {
+            loop_wakeup.finish(sequence);
+            pending_wake_sequence = null;
+            render_pacer.clearWakeRender();
+        }
         const swap_start = profiler.nowNs();
         frame_sample.add(.swap_window, profiler.elapsedNs(swap_start));
         frame_sample.rendered = true;
@@ -1011,10 +1043,15 @@ fn installBundledFont(
 const EventFlags = struct {
     has_mouse_motion: bool = false,
     has_non_mouse_motion: bool = false,
+    loop_wakeup_sequence: ?u64 = null,
 };
 
 fn frameProfileLoggingEnabled() bool {
     return std.c.getenv("VERDE_FRAME_PROFILE_LOG") != null;
+}
+
+fn monotonicMs() i64 {
+    return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
 }
 
 fn maybeLogFrameProfile(enabled: bool, last_log_ms: *i64, palette_renderer: *const palette_frame_renderer.Renderer) void {
@@ -1025,9 +1062,9 @@ fn maybeLogFrameProfile(enabled: bool, last_log_ms: *i64, palette_renderer: *con
 
     const snapshot = profiler.snapshot();
     if (snapshot.count == 0) return;
-    const sections = recentRenderedSectionStats();
+    const sections = recentSectionStats();
     runtime_log.diagnostic(
-        "frame-profile backend={s} samples={d} avg_ms={d:.2} max_ms={d:.2} slow={d} hitch={d} latest_ms={d:.2} rendered={d} render_root_avg_ms={d:.2} draw_backend_avg_ms={d:.2} poll_terminals_avg_ms={d:.2}",
+        "frame-profile backend={s} samples={d} avg_ms={d:.2} max_ms={d:.2} slow={d} hitch={d} latest_ms={d:.2} rendered={d} render_root_avg_ms={d:.2} draw_backend_avg_ms={d:.2} poll_send_avg_ms={d:.2} poll_terminals_avg_ms={d:.2} poll_config_avg_ms={d:.2}",
         .{
             @tagName(palette_renderer.activeBackend()),
             snapshot.count,
@@ -1039,7 +1076,9 @@ fn maybeLogFrameProfile(enabled: bool, last_log_ms: *i64, palette_renderer: *con
             sections.rendered_count,
             profiler.nsToMs(sections.render_root_avg_ns),
             profiler.nsToMs(sections.draw_backend_avg_ns),
+            profiler.nsToMs(sections.poll_send_avg_ns),
             profiler.nsToMs(sections.poll_terminals_avg_ns),
+            profiler.nsToMs(sections.poll_config_avg_ns),
         },
     );
     if (palette_renderer.lastSdlGpuFrameStats()) |stats| {
@@ -1047,37 +1086,47 @@ fn maybeLogFrameProfile(enabled: bool, last_log_ms: *i64, palette_renderer: *con
     }
 }
 
-const RenderedSectionStats = struct {
+const SectionStats = struct {
     rendered_count: usize = 0,
     render_root_avg_ns: u64 = 0,
     draw_backend_avg_ns: u64 = 0,
+    poll_send_avg_ns: u64 = 0,
     poll_terminals_avg_ns: u64 = 0,
+    poll_config_avg_ns: u64 = 0,
 };
 
-fn recentRenderedSectionStats() RenderedSectionStats {
+fn recentSectionStats() SectionStats {
     const count = profiler.frameCount();
     if (count == 0) return .{};
 
+    var sampled_count: usize = 0;
     var rendered_count: usize = 0;
     var render_root_sum: u128 = 0;
     var draw_backend_sum: u128 = 0;
+    var poll_send_sum: u128 = 0;
     var poll_terminals_sum: u128 = 0;
+    var poll_config_sum: u128 = 0;
 
     var index: usize = 0;
     while (index < count) : (index += 1) {
         const frame = profiler.frameAt(index) orelse continue;
+        sampled_count += 1;
+        poll_send_sum += frame.sectionNs(.poll_send);
+        poll_terminals_sum += frame.sectionNs(.poll_terminals);
+        poll_config_sum += frame.sectionNs(.poll_config);
         if (!frame.rendered) continue;
         rendered_count += 1;
         render_root_sum += frame.sectionNs(.render_root);
         draw_backend_sum += frame.sectionNs(.draw_backend);
-        poll_terminals_sum += frame.sectionNs(.poll_terminals);
     }
-    if (rendered_count == 0) return .{};
+    if (sampled_count == 0) return .{};
     return .{
         .rendered_count = rendered_count,
-        .render_root_avg_ns = @intCast(render_root_sum / rendered_count),
-        .draw_backend_avg_ns = @intCast(draw_backend_sum / rendered_count),
-        .poll_terminals_avg_ns = @intCast(poll_terminals_sum / rendered_count),
+        .render_root_avg_ns = if (rendered_count > 0) @intCast(render_root_sum / rendered_count) else 0,
+        .draw_backend_avg_ns = if (rendered_count > 0) @intCast(draw_backend_sum / rendered_count) else 0,
+        .poll_send_avg_ns = @intCast(poll_send_sum / sampled_count),
+        .poll_terminals_avg_ns = @intCast(poll_terminals_sum / sampled_count),
+        .poll_config_avg_ns = @intCast(poll_config_sum / sampled_count),
     };
 }
 
@@ -1254,13 +1303,14 @@ fn processEvents(
     event_flags: *EventFlags,
     frame_sample: *profiler.FrameSample,
     waited_ns: *u64,
+    render_pacer: *const loop_pacing.FramePacer,
 ) bool {
     event_flags.* = .{};
     var event: sdl.Event = undefined;
 
     if (!sdl.pollEvent(&event)) {
         const wait_start = profiler.nowNs();
-        if (!SDL_WaitEventTimeout(&event, eventWaitTimeoutMs(state))) {
+        if (!SDL_WaitEventTimeout(&event, eventWaitTimeoutMs(state, render_pacer))) {
             waited_ns.* +|= profiler.elapsedNs(wait_start);
             return true;
         }
@@ -1281,6 +1331,10 @@ fn processEvents(
 }
 
 fn noteEventForRender(event: *const sdl.Event, flags: *EventFlags) void {
+    if (loop_wakeup.consume(event)) |sequence| {
+        flags.loop_wakeup_sequence = sequence;
+        return;
+    }
     if (event.type == .mouse_motion and noMouseButtonsPressed(event.motion.state)) {
         flags.has_mouse_motion = true;
         return;
@@ -1309,8 +1363,8 @@ fn processOneEvent(
     frame_sample: *profiler.FrameSample,
 ) bool {
     // Cross-thread wake events carry no payload; noteEventForRender already
-    // flagged them as render-worthy, so just clear the coalescing flag.
-    if (loop_wakeup.consume(event)) return true;
+    // captured their update sequence for display-rate coalescing.
+    if (loop_wakeup.isWakeEvent(event)) return true;
     const start = profiler.nowNs();
     normalizeMouseEventCoordinates(window, event);
     switch (event.type) {
@@ -1356,29 +1410,35 @@ fn openHotkeyWorkspaceChatThread(state: *AppState) bool {
     return true;
 }
 
-fn appNeedsContinuousFrames(state: *AppState) bool {
+fn activeContinuousFrames(state: *AppState) bool {
     return state.isPickerPending() or
         state.transcriptMarkdownSelectionDragging() or
         workspace_panes_ui.isFocusAnimating() or
         workspace_panes_ui.isScrollAnimating() or
         workspace_panes_ui.isPaneStatusAnimating() or
         ui_layout.isSidebarAnimating() or
-        state.hasPendingSlashCommand() or
         // Run-config stepper thumbs slide for ~160ms after a selection.
         state.runConfigStepperAnimating() or
         // Settings modal fades in/out for ~160ms.
-        state.settingsModalAnimating() or
-        // Pending turns animate the stop control and transcript activity cue.
-        state.pendingSendCount() > 0 or
-        // Pulsing sidebar status pips need a steady tick or the sine wave
-        // gets sampled at the 1Hz "Working" label cadence and looks steppy.
-        state.sidebar_pulse_animating;
+        state.settingsModalAnimating();
 }
 
-fn eventWaitTimeoutMs(state: *AppState) c_int {
-    if (state.isPickerPending() or state.isBrowserRuntimeActive() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or workspace_panes_ui.isScrollAnimating() or workspace_panes_ui.isPaneStatusAnimating() or ui_layout.isSidebarAnimating() or state.runConfigStepperAnimating() or state.settingsModalAnimating()) {
-        return ACTIVE_WAIT_TIMEOUT_MS;
+fn continuousFrameIntervalMs(state: *AppState) i64 {
+    if (activeContinuousFrames(state)) return ACTIVE_WAIT_TIMEOUT_MS;
+    // These long-lived indicators retain their existing smooth ~30fps tier.
+    if (state.sidebar_pulse_animating or state.pendingSendCount() > 0 or state.hasPendingSlashCommand()) {
+        return PIP_PULSE_WAIT_TIMEOUT_MS;
     }
+    return 0;
+}
+
+fn eventWaitTimeoutMs(state: *AppState, render_pacer: *const loop_pacing.FramePacer) c_int {
+    const base_timeout_ms = eventWaitBaseTimeoutMs(state);
+    return render_pacer.nextWaitTimeoutMs(monotonicMs(), base_timeout_ms, ACTIVE_WAIT_TIMEOUT_MS);
+}
+
+fn eventWaitBaseTimeoutMs(state: *AppState) c_int {
+    if (activeContinuousFrames(state) or state.isBrowserRuntimeActive()) return ACTIVE_WAIT_TIMEOUT_MS;
     // Terminal output only reaches the screen when the loop wakes and polls
     // (daemon sessions tail over an RPC; there is no fd to push a wake from).
     // Recent input starts the same display-rate window before ConPTY has an
@@ -1957,6 +2017,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 event.wheel.mouse_y,
                 event.wheel.x,
                 event.wheel.y,
+                isCtrlPressed() or isKeymodPressed(SDL_GetModState(), sdl.Keymod.ctrl),
             )) {
                 return true;
             }

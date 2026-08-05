@@ -43,19 +43,23 @@ terminal.
 
 ## Moving focus
 
-- `Ctrl+H / J / K / L` — focus the pane to the left / down / up / right (vim-style); `Ctrl+Left / Right` also moves across scrolling columns.
-- Horizontal touchpad or wheel gestures pan the column strip independently of focus.
+- `Ctrl+H / J / K / L` — focus the pane to the left / down / up / right
+  (vim-style); `Ctrl+Arrow` provides the same four directions.
+- Horizontal touchpad/wheel gestures pan a horizontal strip independently of
+  focus. In vertical mode, hold `Ctrl` while using the vertical wheel so normal
+  terminal and transcript scrolling remains available.
 - `Tab` — while focused inside a chat thread pane, return focus to the prompt box.
 - `Alt+1 … Alt+9, Alt+0` — jump between workspaces by sidebar order.
 - `Alt+↑ / Alt+↓` — cycle to the previous / next workspace.
 
-With two or more tiled panes, Verde presents panes as readable horizontal
-columns in the same order shown in the sidebar. **Settings → Workspace → Panes
-per view** controls how many columns fit across the workspace (1–6, default 2),
-and **Pane spacing** controls their gap. Focus movement smoothly reveals only
-the hidden part of the next column, while manual horizontal scrolling can
-leave focus off-screen. The column position is restored per workspace; zoom
-temporarily fills the workspace without changing that saved position.
+With two or more tiled panes, Verde presents panes as a scrolling strip in the
+same order shown in the sidebar. **Settings → Workspace → Scroll direction**
+chooses a horizontal strip (the default) or vertical strip. **Panes per view**
+controls how many panes fit along that axis (1–6, default 2), and **Pane
+spacing** controls their gap. Focus movement smoothly reveals the next hidden
+pane, while manual strip scrolling can leave focus off-screen. Horizontal and
+vertical positions are restored independently per workspace; zoom temporarily
+fills the workspace without changing either saved position.
 
 ## Resizing
 

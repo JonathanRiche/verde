@@ -78,7 +78,7 @@ The desktop shell includes embedded terminal panes powered by Ghostty's `libghos
 - Open the command palette with `Ctrl+Shift+P` to search threads, jump to panes, switch workspaces, or run an app command.
 - Create a terminal pane with `CommandOrControl+Shift+T`.
 - Move between workspace panes with `Alt+Arrow` or `Ctrl+H/J/K/L`; `Ctrl+Left/Right` also moves across columns.
-- With two or more tiled panes, horizontal touchpad/wheel gestures pan the persisted per-workspace column strip.
+- With two or more tiled panes, use horizontal touchpad/wheel gestures for a horizontal strip, or `Ctrl`+vertical wheel for a vertical strip; each axis persists per workspace.
 - It starts in the selected project's directory.
 - `Ctrl+-` and `Ctrl+=` adjust only the terminal font scale while the terminal is focused.
 
@@ -118,7 +118,8 @@ Config supports UI and terminal font size, scrolling-pane spacing, keybind overr
   "ui": {
     "font_size": 20,
     "workspace_pane_gap": 12,
-    "workspace_panes_per_view": 2
+    "workspace_panes_per_view": 2,
+    "workspace_scroll_direction": "horizontal"
   },
   "terminal": {
     "font_size": 18

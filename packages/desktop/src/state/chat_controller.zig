@@ -59,6 +59,9 @@ const pendingTimelineEventsContainAssistant = utils.pendingTimelineEventsContain
 const BACKGROUND_TASK_POLL_MS: i64 = 1000;
 const CODEX_BACKGROUND_TASK_POLL_MS: i64 = 2000;
 const CODEX_BACKGROUND_TASK_POLL_MAX_MS: i64 = 60_000;
+// Daemon tailing is synchronous IPC. Bounding it to Verde's active frame tier
+// preserves every display opportunity while avoiding duplicate RPCs in event bursts.
+const DAEMON_CHAT_POLL_INTERVAL_MS: i64 = 16;
 const OPENCODE_LOGO_BYTES = @embedFile("../assets/opencode-logo-dark.png");
 const CODEX_LOGO_BYTES = @embedFile("../assets/OpenAI-white-monoblossom.png");
 const CLAUDE_LOGO_BYTES = @embedFile("../assets/claude-logo.png");
@@ -377,6 +380,10 @@ pub fn bangCommandWorker(request: *BangCommandRequest) void {
 
 fn unixTimestampMs() i64 {
     return platform_runtime.unixTimestampMs();
+}
+
+fn monotonicMs() i64 {
+    return @intCast(@divTrunc(platform_runtime.monotonicTimestampNs(), std.time.ns_per_ms));
 }
 
 pub fn titleGenerationWorker(request: *TitleGenerationRequest) void {
@@ -1646,6 +1653,7 @@ pub fn beginSendForThreadWithReadyDaemon(
     }
     send_state.daemon_turn_id = turn_id;
     send_state.daemon_last_seq = 0;
+    send_state.daemon_last_poll_ms = -1;
     send_state.daemon_owned = true;
     send_state.thinking = false;
     send_state.partial_text.clearRetainingCapacity();
@@ -1780,6 +1788,7 @@ pub fn restoreDaemonChatTurnsOnLaunch(self: anytype) void {
             send_state.provider = thread.provider;
             send_state.daemon_turn_id = std.heap.page_allocator.dupe(u8, turn_id) catch null;
             send_state.daemon_last_seq = 0;
+            send_state.daemon_last_poll_ms = -1;
             send_state.daemon_owned = send_state.daemon_turn_id != null;
             send_state.ui_revision +%= 1;
             if (std.mem.eql(u8, status, "completed") or std.mem.eql(u8, status, "failed") or std.mem.eql(u8, status, "aborted")) {
@@ -2523,8 +2532,12 @@ pub fn backgroundTaskProcessIsAlive(pid: u32) bool {
 pub fn pollDaemonChatTurn(self: anytype, thread: *ChatThread) bool {
     const page_alloc = std.heap.page_allocator;
     const send_state = thread.send_state;
+    const now_ms = monotonicMs();
     send_state.mutex.lock();
-    const turn_id = if (send_state.status == .pending and send_state.daemon_owned and send_state.daemon_turn_id != null)
+    const active = send_state.status == .pending and send_state.daemon_owned and send_state.daemon_turn_id != null;
+    const poll_due = active and daemonChatPollDue(send_state.daemon_last_poll_ms, now_ms);
+    if (poll_due) send_state.daemon_last_poll_ms = now_ms;
+    const turn_id = if (poll_due)
         page_alloc.dupe(u8, send_state.daemon_turn_id.?) catch null
     else
         null;
@@ -2557,6 +2570,17 @@ pub fn pollDaemonChatTurn(self: anytype, thread: *ChatThread) bool {
         log.warn("failed to apply daemon chat turn tail: {s}", .{@errorName(err)});
         return false;
     };
+}
+
+fn daemonChatPollDue(last_poll_ms: i64, now_ms: i64) bool {
+    return last_poll_ms < 0 or now_ms < last_poll_ms or now_ms - last_poll_ms >= DAEMON_CHAT_POLL_INTERVAL_MS;
+}
+
+test "daemon chat tail polling keeps the active display cadence" {
+    try std.testing.expect(daemonChatPollDue(-1, 100));
+    try std.testing.expect(!daemonChatPollDue(100, 115));
+    try std.testing.expect(daemonChatPollDue(100, 116));
+    try std.testing.expect(daemonChatPollDue(100, 10));
 }
 
 pub fn applyDaemonChatTurnTail(self: anytype, thread: *ChatThread, response: []const u8) !bool {
@@ -2806,6 +2830,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             send_state.daemon_turn_id = null;
             send_state.daemon_owned = false;
             send_state.daemon_last_seq = 0;
+            send_state.daemon_last_poll_ms = -1;
             send_state.status = .idle;
             next_status = .completed;
         },
@@ -2835,6 +2860,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             send_state.daemon_turn_id = null;
             send_state.daemon_owned = false;
             send_state.daemon_last_seq = 0;
+            send_state.daemon_last_poll_ms = -1;
             send_state.status = .idle;
             next_status = .aborted;
         },
@@ -2865,6 +2891,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             send_state.daemon_turn_id = null;
             send_state.daemon_owned = false;
             send_state.daemon_last_seq = 0;
+            send_state.daemon_last_poll_ms = -1;
             send_state.status = .idle;
             next_status = .failed;
         },

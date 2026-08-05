@@ -25,8 +25,14 @@ const Condition = state_sync.Condition;
 
 pub const DRAFT_CAPACITY = 64 * 1024;
 
+pub const TranscriptBodyKind = enum {
+    markdown,
+    plain,
+};
+
 pub const TranscriptMarkdownBody = struct {
     owned_body: []u8,
+    kind: TranscriptBodyKind,
     view: chat_markdown.BodyView,
 
     pub fn deinit(self: *TranscriptMarkdownBody, allocator: std.mem.Allocator) void {
@@ -648,6 +654,7 @@ pub const SendState = struct {
     active_turn_id: ?[]u8 = null,
     daemon_turn_id: ?[]u8 = null,
     daemon_last_seq: u64 = 0,
+    daemon_last_poll_ms: i64 = -1,
     daemon_owned: bool = false,
     partial_text: std.ArrayListUnmanaged(u8) = .empty,
     /// True while the provider reports an active content-less reasoning item.

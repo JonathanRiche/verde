@@ -9,6 +9,7 @@ const std = @import("std");
 const palette = @import("palette");
 const sdl = @import("zsdl3");
 
+const app_config = @import("../app/config.zig");
 const runtime = @import("runtime.zig");
 const browser_panel = @import("browser.zig");
 const chat_panel = @import("chat_panel.zig");
@@ -148,7 +149,7 @@ var pane_rects: [MAX_WORKSPACE_PANE_RECTS]WorkspacePaneRect = undefined;
 var last_workspace_rect: palette.Rect = .{};
 var browser_pane_rendered: bool = false;
 var scrolling_layout_rendered: bool = false;
-var scrolling_max_offset_x: f32 = 0.0;
+var scrolling_max_offset: f32 = 0.0;
 var scrolling_animating: bool = false;
 
 var focus_prev_id: ?runtime.WorkspacePaneId = null;
@@ -181,25 +182,37 @@ pub fn hasActivePaneDrag() bool {
     return pane_drag.pending or pane_drag.active;
 }
 
-pub fn handlePaletteWheel(state: *runtime.AppState, x: f32, y: f32, wheel_x: f32, wheel_y: f32) bool {
-    if (!scrolling_layout_rendered or @abs(wheel_x) < 0.01 or @abs(wheel_x) < @abs(wheel_y)) return false;
+pub fn handlePaletteWheel(state: *runtime.AppState, x: f32, y: f32, wheel_x: f32, wheel_y: f32, ctrl_held: bool) bool {
+    if (!scrolling_layout_rendered) return false;
     if (!rectContains(last_workspace_rect, x, y)) return false;
     if (state.project_controller.projects.items.len == 0) return false;
     const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
     if (!scrollingLayoutActive(layout)) return false;
 
+    const delta = scrollingWheelDelta(state.app_config.workspace_scroll_direction, wheel_x, wheel_y, ctrl_held) orelse return false;
+    const target: *f32 = switch (state.app_config.workspace_scroll_direction) {
+        .horizontal => &layout.scroll_target_x,
+        .vertical => &layout.scroll_target_y,
+    };
     const next_target = std.math.clamp(
-        layout.scroll_target_x + wheel_x * theme.scaledUi(SCROLLING_WHEEL_STEP_CSS),
+        target.* + delta * theme.scaledUi(SCROLLING_WHEEL_STEP_CSS),
         0.0,
-        scrolling_max_offset_x,
+        scrolling_max_offset,
     );
-    if (@abs(next_target - layout.scroll_target_x) > 0.001) {
-        layout.scroll_target_x = next_target;
+    if (@abs(next_target - target.*) > 0.001) {
+        target.* = next_target;
         layout.scroll_animation_last_ms = nowMs();
         state.markDirty();
     }
     layout.scroll_revealed_pane_id = layout.focused_pane_id;
     return true;
+}
+
+fn scrollingWheelDelta(direction: app_config.WorkspaceScrollDirection, wheel_x: f32, wheel_y: f32, ctrl_held: bool) ?f32 {
+    return switch (direction) {
+        .horizontal => if (@abs(wheel_x) >= 0.01 and @abs(wheel_x) >= @abs(wheel_y)) wheel_x else null,
+        .vertical => if (ctrl_held and @abs(wheel_y) >= 0.01 and @abs(wheel_y) >= @abs(wheel_x)) -wheel_y else null,
+    };
 }
 
 // Placement for a hotkey-opened pane while auto-building the 2x2 grid.
@@ -227,6 +240,21 @@ pub fn gridNewPanePlacement(state: *runtime.AppState) ?GridPlacement {
 
 pub const FocusDirection = enum { left, right, up, down };
 
+fn scrollingPaneDirection(scroll_direction: app_config.WorkspaceScrollDirection, focus_direction: FocusDirection) ?runtime.WorkspacePaneDirection {
+    return switch (scroll_direction) {
+        .horizontal => switch (focus_direction) {
+            .left => .left,
+            .right => .right,
+            .up, .down => null,
+        },
+        .vertical => switch (focus_direction) {
+            .up => .up,
+            .down => .down,
+            .left, .right => null,
+        },
+    };
+}
+
 pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
     if (pane_rect_count == 0) return false;
     if (state.project_controller.projects.items.len == 0) return false;
@@ -244,11 +272,7 @@ pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool 
     }
 
     if (scrollingLayoutActive(layout)) {
-        const direction: runtime.WorkspacePaneDirection = switch (dir) {
-            .left => .left,
-            .right => .right,
-            .up, .down => return false,
-        };
+        const direction = scrollingPaneDirection(state.app_config.workspace_scroll_direction, dir) orelse return false;
         const target = layout.adjacentTiledPaneIdInSidebarOrder(current_id, direction) orelse return false;
         return state.focusCurrentProjectWorkspacePane(target);
     }
@@ -482,11 +506,7 @@ pub fn movePaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
     const current_id = layout.focused_pane_id orelse return false;
 
     if (scrollingLayoutActive(layout)) {
-        const direction: runtime.WorkspacePaneDirection = switch (dir) {
-            .left => .left,
-            .right => .right,
-            .up, .down => return false,
-        };
+        const direction = scrollingPaneDirection(state.app_config.workspace_scroll_direction, dir) orelse return false;
         const target = layout.adjacentTiledPaneIdInSidebarOrder(current_id, direction) orelse return false;
         if (!state.swapCurrentProjectWorkspacePanes(current_id, target)) return false;
         return state.focusCurrentProjectWorkspacePane(target);
@@ -586,7 +606,7 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
     tickFocusAnimation(state);
     pane_status_animating = false;
     scrolling_layout_rendered = false;
-    scrolling_max_offset_x = 0.0;
+    scrolling_max_offset = 0.0;
     scrolling_animating = false;
     hit_cache.count = 0;
     pane_rect_count = 0;
@@ -600,7 +620,7 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
     } else if (state.currentProjectWorkspaceRoot()) |root| {
         const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
         if (scrollingLayoutActive(layout)) {
-            renderScrollingColumns(state, layout, rect);
+            renderScrollingStrip(state, layout, rect);
         } else {
             renderNode(state, root, rect);
         }
@@ -1099,46 +1119,57 @@ fn scrollingLayoutActive(layout: *const runtime.WorkspaceLayout) bool {
     return layout.maximized_pane_id == null and layout.visiblePaneCount() >= SCROLLING_LAYOUT_PANE_THRESHOLD;
 }
 
-// Horizontally scrolling workspace strip with focus-aware reveal and clipping.
-fn renderScrollingColumns(
+// Configurable-axis workspace strip with focus-aware reveal and clipping.
+fn renderScrollingStrip(
     state: *runtime.AppState,
     layout: *runtime.WorkspaceLayout,
     workspace: palette.Rect,
 ) void {
+    const direction = state.app_config.workspace_scroll_direction;
+    const vertical = direction == .vertical;
+    if (layout.scroll_axis_vertical != vertical) {
+        layout.scroll_axis_vertical = vertical;
+        layout.scroll_revealed_pane_id = null;
+        layout.scroll_animation_last_ms = 0;
+    }
+
     const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
-    const column_w = scrollingColumnWidth(workspace.w, gap, state.app_config.workspace_panes_per_view);
+    const viewport_extent = if (vertical) workspace.h else workspace.w;
+    const pane_extent = scrollingPaneExtent(viewport_extent, gap, state.app_config.workspace_panes_per_view);
     const pane_count = layout.visiblePaneCount();
-    const total_w = column_w * @as(f32, @floatFromInt(pane_count)) + gap * @as(f32, @floatFromInt(pane_count - 1));
-    const max_offset = @max(0.0, total_w - workspace.w);
-    clampScrollingOffsets(layout, max_offset);
+    const total_extent = pane_extent * @as(f32, @floatFromInt(pane_count)) + gap * @as(f32, @floatFromInt(pane_count - 1));
+    const max_offset = @max(0.0, total_extent - viewport_extent);
+    const offset: *f32 = if (vertical) &layout.scroll_offset_y else &layout.scroll_offset_x;
+    const target: *f32 = if (vertical) &layout.scroll_target_y else &layout.scroll_target_x;
+    clampScrollingOffsets(offset, target, max_offset);
 
     if (layout.focused_pane_id) |focused_id| {
         if (layout.rootContainsPane(focused_id) and layout.scroll_revealed_pane_id != focused_id) {
             if (paneIndexInSidebarOrder(layout, focused_id)) |focused_index| {
                 const next_target = revealedScrollTarget(
-                    layout.scroll_target_x,
-                    workspace.w,
-                    column_w,
+                    target.*,
+                    viewport_extent,
+                    pane_extent,
                     gap,
                     focused_index,
                     max_offset,
                 );
-                setScrollingTarget(state, layout, next_target);
+                setScrollingTarget(state, target, &layout.scroll_animation_last_ms, next_target);
             }
             layout.scroll_revealed_pane_id = focused_id;
         }
     }
 
-    tickScrollingAnimation(layout);
+    tickScrollingAnimation(offset, target.*, &layout.scroll_animation_last_ms);
     scrolling_layout_rendered = true;
-    scrolling_max_offset_x = max_offset;
+    scrolling_max_offset = max_offset;
 
     const command_start = state.palette_overlay_batch.commands.items.len;
     const text_run_start = state.palette_overlay_batch.text_runs.items.len;
     var pane_index: usize = 0;
     for (layout.panes.items) |pane| {
         if (!layout.rootContainsPane(pane.id)) continue;
-        renderScrollingPane(state, pane.id, workspace, column_w, gap, layout.scroll_offset_x, pane_index);
+        renderScrollingPane(state, pane.id, workspace, direction, pane_extent, gap, offset.*, pane_index);
         pane_index += 1;
     }
     clipWorkspaceBatch(state, command_start, text_run_start, workspace);
@@ -1149,29 +1180,24 @@ fn renderScrollingPane(
     state: *runtime.AppState,
     pane_id: runtime.WorkspacePaneId,
     workspace: palette.Rect,
-    column_w: f32,
+    direction: app_config.WorkspaceScrollDirection,
+    pane_extent: f32,
     gap: f32,
-    offset_x: f32,
+    offset: f32,
     pane_index: usize,
 ) void {
-    const step = column_w + gap;
-    const rect: palette.Rect = .{
-        .x = workspace.x + @as(f32, @floatFromInt(pane_index)) * step - offset_x,
-        .y = workspace.y,
-        .w = column_w,
-        .h = workspace.h,
+    const origin = @as(f32, @floatFromInt(pane_index)) * (pane_extent + gap) - offset;
+    const rect: palette.Rect = switch (direction) {
+        .horizontal => .{ .x = workspace.x + origin, .y = workspace.y, .w = pane_extent, .h = workspace.h },
+        .vertical => .{ .x = workspace.x, .y = workspace.y + origin, .w = workspace.w, .h = pane_extent },
     };
-    if (rect.x + rect.w <= workspace.x or rect.x >= workspace.x + workspace.w) return;
+    if (intersectRects(rect, workspace) == null) return;
     renderLeaf(state, pane_id, rect);
-    const gutter_x = rect.x + rect.w;
-    if (gutter_x < workspace.x + workspace.w and gutter_x + gap > workspace.x) {
-        queueRect(state, .{
-            .x = gutter_x,
-            .y = workspace.y,
-            .w = gap,
-            .h = workspace.h,
-        }, paletteColor(theme.background()));
-    }
+    const gutter: palette.Rect = switch (direction) {
+        .horizontal => .{ .x = rect.x + rect.w, .y = workspace.y, .w = gap, .h = workspace.h },
+        .vertical => .{ .x = workspace.x, .y = rect.y + rect.h, .w = workspace.w, .h = gap },
+    };
+    if (intersectRects(gutter, workspace) != null) queueRect(state, gutter, paletteColor(theme.background()));
 }
 
 fn paneIndexInSidebarOrder(layout: *const runtime.WorkspaceLayout, pane_id: runtime.WorkspacePaneId) ?usize {
@@ -1184,9 +1210,9 @@ fn paneIndexInSidebarOrder(layout: *const runtime.WorkspaceLayout, pane_id: runt
     return null;
 }
 
-fn scrollingColumnWidth(viewport_w: f32, gap: f32, panes_per_view: u8) f32 {
+fn scrollingPaneExtent(viewport_extent: f32, gap: f32, panes_per_view: u8) f32 {
     const count: f32 = @floatFromInt(@max(panes_per_view, 1));
-    return @max((viewport_w - gap * (count - 1.0)) / count, 1.0);
+    return @max((viewport_extent - gap * (count - 1.0)) / count, 1.0);
 }
 
 fn revealedScrollTarget(current: f32, viewport_w: f32, column_w: f32, gap: f32, pane_index: usize, max_offset: f32) f32 {
@@ -1201,26 +1227,26 @@ fn revealedScrollTarget(current: f32, viewport_w: f32, column_w: f32, gap: f32, 
     return std.math.clamp(target, 0.0, max_offset);
 }
 
-fn setScrollingTarget(state: *runtime.AppState, layout: *runtime.WorkspaceLayout, target: f32) void {
-    if (@abs(target - layout.scroll_target_x) <= 0.001) return;
-    layout.scroll_target_x = target;
-    layout.scroll_animation_last_ms = nowMs();
+fn setScrollingTarget(state: *runtime.AppState, current_target: *f32, animation_last_ms: *i64, target: f32) void {
+    if (@abs(target - current_target.*) <= 0.001) return;
+    current_target.* = target;
+    animation_last_ms.* = nowMs();
     state.markDirty();
 }
 
-fn clampScrollingOffsets(layout: *runtime.WorkspaceLayout, max_offset: f32) void {
-    layout.scroll_target_x = std.math.clamp(layout.scroll_target_x, 0.0, max_offset);
-    layout.scroll_offset_x = std.math.clamp(layout.scroll_offset_x, 0.0, max_offset);
+fn clampScrollingOffsets(offset: *f32, target: *f32, max_offset: f32) void {
+    target.* = std.math.clamp(target.*, 0.0, max_offset);
+    offset.* = std.math.clamp(offset.*, 0.0, max_offset);
 }
 
-fn tickScrollingAnimation(layout: *runtime.WorkspaceLayout) void {
+fn tickScrollingAnimation(offset: *f32, target: f32, animation_last_ms: *i64) void {
     const timestamp = nowMs();
-    if (layout.scroll_animation_last_ms == 0) layout.scroll_animation_last_ms = timestamp;
-    const elapsed_ms = std.math.clamp(timestamp - layout.scroll_animation_last_ms, 0, SCROLLING_ANIMATION_MAX_STEP_MS);
-    layout.scroll_animation_last_ms = timestamp;
-    layout.scroll_offset_x = advanceScrollOffset(layout.scroll_offset_x, layout.scroll_target_x, elapsed_ms);
-    if (@abs(layout.scroll_target_x - layout.scroll_offset_x) <= SCROLLING_ANIMATION_EPSILON) {
-        layout.scroll_offset_x = layout.scroll_target_x;
+    if (animation_last_ms.* == 0) animation_last_ms.* = timestamp;
+    const elapsed_ms = std.math.clamp(timestamp - animation_last_ms.*, 0, SCROLLING_ANIMATION_MAX_STEP_MS);
+    animation_last_ms.* = timestamp;
+    offset.* = advanceScrollOffset(offset.*, target, elapsed_ms);
+    if (@abs(target - offset.*) <= SCROLLING_ANIMATION_EPSILON) {
+        offset.* = target;
     } else {
         scrolling_animating = true;
     }
@@ -1793,14 +1819,30 @@ test "scrolling focus reveal moves only enough to expose the column" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), revealedScrollTarget(max_offset, viewport_w, column_w, gap, 0, max_offset), 0.0001);
 }
 
-test "scrolling column width fits the configured panes per view" {
-    const viewport_w: f32 = 1000.0;
+test "scrolling pane extent fits the configured panes per view" {
+    const viewport_extent: f32 = 1000.0;
     const gap: f32 = 12.0;
     inline for (.{ @as(u8, 1), @as(u8, 2), @as(u8, 3), @as(u8, 6) }) |count| {
-        const column_w = scrollingColumnWidth(viewport_w, gap, count);
+        const pane_extent = scrollingPaneExtent(viewport_extent, gap, count);
         const count_f: f32 = @floatFromInt(count);
-        try std.testing.expectApproxEqAbs(viewport_w, column_w * count_f + gap * (count_f - 1.0), 0.001);
+        try std.testing.expectApproxEqAbs(viewport_extent, pane_extent * count_f + gap * (count_f - 1.0), 0.001);
     }
+}
+
+test "scrolling focus direction follows the configured axis" {
+    try std.testing.expectEqual(runtime.WorkspacePaneDirection.left, scrollingPaneDirection(.horizontal, .left).?);
+    try std.testing.expectEqual(runtime.WorkspacePaneDirection.right, scrollingPaneDirection(.horizontal, .right).?);
+    try std.testing.expect(scrollingPaneDirection(.horizontal, .down) == null);
+    try std.testing.expectEqual(runtime.WorkspacePaneDirection.up, scrollingPaneDirection(.vertical, .up).?);
+    try std.testing.expectEqual(runtime.WorkspacePaneDirection.down, scrollingPaneDirection(.vertical, .down).?);
+    try std.testing.expect(scrollingPaneDirection(.vertical, .right) == null);
+}
+
+test "scrolling wheel routing preserves ordinary vertical pane scrolling" {
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), scrollingWheelDelta(.horizontal, 2.0, 0.5, false).?, 0.0001);
+    try std.testing.expect(scrollingWheelDelta(.horizontal, 0.2, 1.0, false) == null);
+    try std.testing.expect(scrollingWheelDelta(.vertical, 0.0, -2.0, false) == null);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), scrollingWheelDelta(.vertical, 0.0, -2.0, true).?, 0.0001);
 }
 
 test "scrolling animation advances without overshooting" {

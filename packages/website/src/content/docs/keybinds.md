@@ -45,10 +45,10 @@ zoomed pane without restoring the split layout.
 
 | Combo    | Action                          |
 | -------- | ------------------------------- |
-| `Ctrl+H` or `Ctrl+Left` | Focus the pane or scrolling column to the left  |
-| `Ctrl+L` or `Ctrl+Right` | Focus the pane or scrolling column to the right |
-| `Ctrl+K` | Focus the pane above        |
-| `Ctrl+J` | Focus the pane below        |
+| `Ctrl+H` or `Ctrl+Left` | Focus the pane or horizontal strip item to the left  |
+| `Ctrl+L` or `Ctrl+Right` | Focus the pane or horizontal strip item to the right |
+| `Ctrl+K` or `Ctrl+Up` | Focus the pane or vertical strip item above |
+| `Ctrl+J` or `Ctrl+Down` | Focus the pane or vertical strip item below |
 
 `Alt+arrow` combos are no longer focus aliases — `Alt+↑` / `Alt+↓` now cycle
 between workspaces (see the sidebar table above).

@@ -1176,12 +1176,14 @@ fn cloneDefaultWorkspaceFocusRightKeybinds(allocator: std.mem.Allocator) ![]Keyb
 fn cloneDefaultWorkspaceFocusUpKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Ctrl+K"),
+        try parseDefaultAccelerator("Ctrl+Up"),
     });
 }
 
 fn cloneDefaultWorkspaceFocusDownKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Ctrl+J"),
+        try parseDefaultAccelerator("Ctrl+Down"),
     });
 }
 
@@ -1794,7 +1796,7 @@ test "default workspace close current uses ctrl shift w" {
     try std.testing.expectEqual(sdl.Keycode.w, config.workspace_close_current[0].key);
 }
 
-test "default workspace focus supports ctrl hjkl and horizontal arrows" {
+test "default workspace focus supports ctrl hjkl and arrows" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
@@ -1804,13 +1806,17 @@ test "default workspace focus supports ctrl hjkl and horizontal arrows" {
     try std.testing.expect(config.workspace_focus_left[1].ctrl);
     try std.testing.expectEqual(sdl.Keycode.left, config.workspace_focus_left[1].key);
 
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_focus_down.len);
+    try std.testing.expectEqual(@as(usize, 2), config.workspace_focus_down.len);
     try std.testing.expect(config.workspace_focus_down[0].ctrl);
     try std.testing.expectEqual(sdl.Keycode.j, config.workspace_focus_down[0].key);
+    try std.testing.expect(config.workspace_focus_down[1].ctrl);
+    try std.testing.expectEqual(sdl.Keycode.down, config.workspace_focus_down[1].key);
 
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_focus_up.len);
+    try std.testing.expectEqual(@as(usize, 2), config.workspace_focus_up.len);
     try std.testing.expect(config.workspace_focus_up[0].ctrl);
     try std.testing.expectEqual(sdl.Keycode.k, config.workspace_focus_up[0].key);
+    try std.testing.expect(config.workspace_focus_up[1].ctrl);
+    try std.testing.expectEqual(sdl.Keycode.up, config.workspace_focus_up[1].key);
 
     try std.testing.expectEqual(@as(usize, 2), config.workspace_focus_right.len);
     try std.testing.expect(config.workspace_focus_right[0].ctrl);
