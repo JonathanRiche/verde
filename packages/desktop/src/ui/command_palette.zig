@@ -1519,8 +1519,9 @@ fn renderSearchField(state: *runtime.AppState) void {
     queueBorder(state, input_rect, paletteColor(border), theme.scaledUi(7.0), theme.scaledUi(1.0));
 
     const font_size = theme.scaledUi(14.0);
+    const line_height = font_size * 1.25;
     const text_x = input_rect.x + theme.scaledUi(10.0);
-    const text_y = input_rect.y + (input_rect.h - theme.scaledUi(20.0)) * 0.5;
+    const text_y = input_rect.y + (input_rect.h - line_height) * 0.5;
     const text_w = input_rect.w - theme.scaledUi(20.0);
 
     if (focused) {
@@ -1537,7 +1538,7 @@ fn renderSearchField(state: *runtime.AppState) void {
                 const clamped_x0 = @max(x0, text_x);
                 const clamped_x1 = @min(x1, text_x + text_w);
                 if (clamped_x1 > clamped_x0) {
-                    queueRect(state, .{ .x = clamped_x0, .y = text_y, .w = clamped_x1 - clamped_x0, .h = theme.scaledUi(20.0) }, paletteColor(theme.withAlpha(theme.selection(), 200)));
+                    queueRect(state, .{ .x = clamped_x0, .y = text_y, .w = clamped_x1 - clamped_x0, .h = line_height }, paletteColor(theme.withAlpha(theme.selection(), 200)));
                 }
             }
         }
@@ -1545,12 +1546,12 @@ fn renderSearchField(state: *runtime.AppState) void {
 
     const shown = if (value.len > 0) value else "Search threads and commands...";
     const color = if (value.len > 0) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE;
-    queueRoleText(state, .{ .x = text_x, .y = text_y, .w = text_w, .h = theme.scaledUi(20.0) }, shown, paletteColor(color), font_size, input_rect);
+    queueRoleText(state, .{ .x = text_x, .y = text_y, .w = text_w, .h = line_height }, shown, paletteColor(color), font_size, input_rect);
 
     if (focused) {
         const clamped_cursor = @min(state.command_controller.cursor, value.len);
         const cursor_x = text_x + runtime.paletteUiTextPrefixWidth(value, font_size, clamped_cursor);
-        queueRect(state, .{ .x = cursor_x, .y = text_y, .w = theme.scaledUi(1.0), .h = theme.scaledUi(20.0) }, paletteColor(theme.COLOR_WHITE));
+        queueRect(state, .{ .x = cursor_x, .y = text_y, .w = theme.scaledUi(1.0), .h = line_height }, paletteColor(theme.COLOR_WHITE));
     }
 }
 
