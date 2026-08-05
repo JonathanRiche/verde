@@ -718,7 +718,8 @@ fn renderResultCard(state: *runtime.AppState, clip: palette.Rect, y: *f32) void 
     const stripe = if (failed) chrome.danger else if (frame.working) chrome.accent_hi else chrome.identity_fg;
     queueRoundedRectClipped(state, .{ .x = card.x, .y = card.y, .w = 3.0 * scale, .h = card.h }, color(stripe), 1.5 * scale, clip);
     const verdict_w = 62.0 * scale;
-    queueBoldText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 10.0 * scale, .w = @max(card.w - verdict_w - 24.0 * scale, 0.0), .h = 15.0 * scale }, "SPROUT SAYS", color(chrome.text_subtle), 10.0 * scale, clip);
+    const heading = companionCharacterResultHeading(activeCompanionCharacter(state));
+    queueBoldText(state, .{ .x = card.x + 12.0 * scale, .y = card.y + 10.0 * scale, .w = @max(card.w - verdict_w - 24.0 * scale, 0.0), .h = 15.0 * scale }, heading, color(chrome.text_subtle), 10.0 * scale, clip);
     const verdict = if (frame.working) "WORKING" else if (failed) "FAILED" else "DONE";
     const verdict_color = if (frame.working) chrome.accent else if (failed) chrome.danger else chrome.identity_fg;
     queueBoldText(state, .{ .x = card.x + @max(card.w - verdict_w - 12.0 * scale, 0.0), .y = card.y + 10.0 * scale, .w = verdict_w, .h = 15.0 * scale }, verdict, color(verdict_color), 9.5 * scale, clip);
@@ -1078,6 +1079,14 @@ fn companionCharacterName(character: app_config.CompanionCharacter) []const u8 {
         .sprout => "Sprout",
         .moss => "Moss",
         .vireo => "Vireo",
+    };
+}
+
+fn companionCharacterResultHeading(character: app_config.CompanionCharacter) []const u8 {
+    return switch (character) {
+        .sprout => "SPROUT SAYS",
+        .moss => "MOSS SAYS",
+        .vireo => "VIREO SAYS",
     };
 }
 
@@ -2635,6 +2644,59 @@ test "public Companion render surfaces streaming final empty and failed Sprout a
     try expectBoundedBodyText(&state.palette_overlay_batch, "provider exited", geometry.body);
     try expectClippedTextCommand(&state.palette_overlay_batch, "Action failed", geometry.body);
     try expectNoTextCommand(&state.palette_overlay_batch, "DONE");
+}
+
+test "public Companion Result heading follows the active character" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    state.allocator = allocator;
+    state.app_config = .{};
+    state.project_controller = .{};
+    state.companion_controller = controller.init();
+    state.companion_controller.show();
+    state.companion_composer = @TypeOf(state.companion_composer).init();
+    state.palette_overlay_batch = .{};
+    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.companion_composer.deinit(allocator);
+        state.palette_overlay_batch.deinit(allocator);
+        state.palette_frame_text_arena.deinit();
+    }
+    var project = try runtime.Project.init(allocator, "result-character", "Result character", "/tmp/result-character", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+
+    var frame: controller.Frame = .{ .has_thread = true };
+    frame.workspace_id.set("result-character");
+    frame.thread_id.set("pane-less-result-character");
+    frame.answer.set("Character-aware result");
+    state.companion_controller.setFrame(frame);
+    const geometry = computeGeometryForState(1360.0, 860.0, 1.0, &state.companion_controller);
+    const cases = [_]struct {
+        character: app_config.CompanionCharacter,
+        heading: []const u8,
+    }{
+        .{ .character = .sprout, .heading = "SPROUT SAYS" },
+        .{ .character = .moss, .heading = "MOSS SAYS" },
+        .{ .character = .vireo, .heading = "VIREO SAYS" },
+    };
+
+    inline for (cases) |case| {
+        state.app_config.companion_character = case.character;
+        state.palette_overlay_batch.clear();
+        _ = state.palette_frame_text_arena.reset(.retain_capacity);
+        render(&state, 1360.0, 860.0);
+        try expectClippedTextCommand(&state.palette_overlay_batch, case.heading, geometry.body);
+        inline for (cases) |other| {
+            if (other.character != case.character) try expectNoTextCommand(&state.palette_overlay_batch, other.heading);
+        }
+    }
 }
 
 test "public Companion render leads with the answer and suppresses metadata-only success detail" {
