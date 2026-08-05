@@ -3175,12 +3175,12 @@ pub const AppState = struct {
     /// Selects a workspace and reveals one of its open layout panes, leaving
     /// any maximized view.
     pub fn focusWorkspaceOpenPane(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) void {
-        self.focusWorkspaceOpenPaneWithZoom(project_index, pane_id, false);
+        self.focusWorkspaceOpenPaneWithZoom(project_index, pane_id, false, true);
     }
 
     /// Selects a pane from the sidebar while keeping a maximized workspace maximized.
     pub fn focusWorkspaceOpenPaneFromSidebar(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) void {
-        self.focusWorkspaceOpenPaneWithZoom(project_index, pane_id, true);
+        self.focusWorkspaceOpenPaneWithZoom(project_index, pane_id, true, true);
     }
 
     /// Focuses a pane by its zero-based position in the current workspace's sidebar list.
@@ -3222,10 +3222,12 @@ pub const AppState = struct {
             layout.panes.items.len - 1
         else
             0;
-        return self.focusCurrentProjectWorkspacePaneAtSidebarIndex(target_index);
+        const target_pane_id = layout.panes.items[target_index].id;
+        self.focusWorkspaceOpenPaneWithZoom(project_index, target_pane_id, true, false);
+        return true;
     }
 
-    fn focusWorkspaceOpenPaneWithZoom(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, preserve_zoom: bool) void {
+    fn focusWorkspaceOpenPaneWithZoom(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, preserve_zoom: bool, leading_reveal: bool) void {
         if (project_index >= self.project_controller.projects.items.len) return;
         const previous_project_index = self.project_controller.selected_index;
         if (preserve_zoom and previous_project_index < self.project_controller.projects.items.len and previous_project_index != project_index) {
@@ -3274,6 +3276,7 @@ pub const AppState = struct {
             },
         }
         _ = self.focusWorkspacePane(project_index, pane_id);
+        if (leading_reveal) layout.requestLeadingScrollReveal(pane_id);
         self.markDirty();
     }
 
@@ -8986,6 +8989,12 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     const chat_pane_id = layout.panes.items[0].id;
     const first_terminal_pane_id = try layout.createTerminalPane(allocator, 1);
     const clicked_terminal_pane_id = try layout.createTerminalPane(allocator, 2);
+
+    state.focusWorkspaceOpenPaneFromSidebar(0, chat_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.scroll_leading_pane_id);
+    try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(1));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.scroll_leading_pane_id);
+
     layout.focused_pane_id = first_terminal_pane_id;
     layout.maximized_pane_id = first_terminal_pane_id;
 

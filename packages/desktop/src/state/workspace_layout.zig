@@ -129,6 +129,9 @@ pub const WorkspaceLayout = struct {
     scroll_offset_y: f32 = 0.0,
     scroll_target_y: f32 = 0.0,
     scroll_revealed_pane_id: ?WorkspacePaneId = null,
+    /// A transient direct-navigation request. Rendering consumes it after
+    /// placing the selected pane at the strip's leading edge.
+    scroll_leading_pane_id: ?WorkspacePaneId = null,
     scroll_animation_last_ms: i64 = 0,
     scroll_axis_vertical: bool = false,
     /// Null values inherit the global app configuration. Both fields are
@@ -328,6 +331,11 @@ pub const WorkspaceLayout = struct {
 
     pub fn hasScrollOverride(self: *const WorkspaceLayout) bool {
         return self.scroll_mode_override != null or self.scroll_threshold_override != null;
+    }
+
+    pub fn requestLeadingScrollReveal(self: *WorkspaceLayout, pane_id: WorkspacePaneId) void {
+        self.scroll_leading_pane_id = if (self.rootContainsPane(pane_id)) pane_id else null;
+        self.scroll_revealed_pane_id = null;
     }
 
     /// Returns the adjacent tiled pane in the same order as the expanded
@@ -1539,8 +1547,10 @@ test "workspace layout persists the scrolling target" {
     layout.scroll_target_x = 173.5;
     layout.scroll_offset_y = 24.0;
     layout.scroll_target_y = 96.25;
-    layout.scroll_revealed_pane_id = 1;
+    layout.requestLeadingScrollReveal(1);
     layout.scroll_animation_last_ms = 900;
+
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), layout.scroll_leading_pane_id);
 
     const persisted = try layout.persistedWorkspaceJson(allocator);
     defer allocator.free(persisted);
@@ -1553,6 +1563,7 @@ test "workspace layout persists the scrolling target" {
     try std.testing.expectApproxEqAbs(@as(f32, 96.25), restored.scroll_target_y, 0.0001);
     try std.testing.expectApproxEqAbs(restored.scroll_target_y, restored.scroll_offset_y, 0.0001);
     try std.testing.expectEqual(@as(?WorkspacePaneId, null), restored.scroll_revealed_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), restored.scroll_leading_pane_id);
     try std.testing.expectEqual(@as(i64, 0), restored.scroll_animation_last_ms);
 }
 
