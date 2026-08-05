@@ -688,7 +688,7 @@ pub const Client = struct {
             const cwd = getOptionalObjectString(item, "cwd") orelse "";
             const body = try std.fmt.allocPrint(self.allocator, "{s}\n\nProvider: codex\nCodex item ID: {s}\nProcess ID: {s}\nProvider thread ID: {s}\nCWD: {s}", .{ command, item_id, process_id, thread_id, cwd });
             defer self.allocator.free(body);
-            on_stream_event(request.stream_context, .{ .message = .{ .title = "Backgrounded command", .body = body } });
+            on_stream_event(request.stream_context, .{ .message = .{ .title = "Background command", .body = body } });
             try identities.writer.print("\nCodex item ID: {s}", .{item_id});
         }
         const marker = try identities.toOwnedSlice();
