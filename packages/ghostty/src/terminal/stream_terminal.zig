@@ -55,6 +55,10 @@ pub const Handler = struct {
         /// Called when the bell is rung (BEL).
         bell: ?*const fn (*Handler) void,
 
+        /// Called for OSC 52 clipboard operations. The base64 payload is only
+        /// valid for the duration of the callback.
+        clipboard: ?*const fn (*Handler, u8, []const u8) void,
+
         /// Called in response to a color scheme DSR query (CSI ? 996 n).
         /// Returns the current color scheme. Return null to silently
         /// ignore the query.
@@ -91,6 +95,7 @@ pub const Handler = struct {
         /// effects beyond that.
         pub const readonly: Effects = .{
             .bell = null,
+            .clipboard = null,
             .color_scheme = null,
             .device_attributes = null,
             .enquiry = null,
@@ -245,6 +250,7 @@ pub const Handler = struct {
 
             // Effect-based handlers
             .bell => self.bell(),
+            .clipboard_contents => self.clipboard(value.kind, value.data),
             .device_attributes => self.reportDeviceAttributes(value),
             .device_status => self.deviceStatus(value.request),
             .enquiry => self.reportEnquiry(),
@@ -266,7 +272,6 @@ pub const Handler = struct {
             .report_pwd,
             .show_desktop_notification,
             .progress_report,
-            .clipboard_contents,
             .title_push,
             .title_pop,
             => {},
@@ -281,6 +286,11 @@ pub const Handler = struct {
     fn bell(self: *Handler) void {
         const func = self.effects.bell orelse return;
         func(self);
+    }
+
+    fn clipboard(self: *Handler, kind: u8, data: []const u8) void {
+        const func = self.effects.clipboard orelse return;
+        func(self, kind, data);
     }
 
     fn reportDeviceAttributes(self: *Handler, req: device_attributes.Req) void {
@@ -1378,6 +1388,36 @@ test "bell effect callback" {
         s.nextSlice("\x07\x07");
         try testing.expectEqual(@as(usize, 3), S.bell_count);
     }
+}
+
+test "OSC 52 clipboard effect callback" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var kind: u8 = 0;
+        var data: [32]u8 = undefined;
+        var data_len: usize = 0;
+
+        fn clipboard(_: *Handler, value_kind: u8, value_data: []const u8) void {
+            kind = value_kind;
+            data_len = value_data.len;
+            @memcpy(data[0..data_len], value_data);
+        }
+    };
+    S.kind = 0;
+    S.data_len = 0;
+
+    var handler: Handler = .init(&t);
+    handler.effects.clipboard = &S.clipboard;
+
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    s.nextSlice("\x1b]52;c;c2VsZWN0ZWQg");
+    s.nextSlice("dGV4dA==\x1b\\");
+    try testing.expectEqual(@as(u8, 'c'), S.kind);
+    try testing.expectEqualStrings("c2VsZWN0ZWQgdGV4dA==", S.data[0..S.data_len]);
 }
 
 test "request mode DECRQM with write_pty callback" {

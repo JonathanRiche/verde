@@ -54,6 +54,20 @@ const TerminalGlyphKind = enum {
     powerline,
 };
 
+const BoxLineStyle = enum(u2) {
+    none,
+    light,
+    heavy,
+    double,
+};
+
+const BoxLines = packed struct(u8) {
+    up: BoxLineStyle = .none,
+    right: BoxLineStyle = .none,
+    down: BoxLineStyle = .none,
+    left: BoxLineStyle = .none,
+};
+
 const CachedDrawCommand = union(enum) {
     rect: struct {
         rect: palette.Rect,
@@ -65,6 +79,7 @@ const CachedDrawCommand = union(enum) {
         color: palette.Color,
         radius: f32,
         width: f32,
+        clip: ?palette.Rect = null,
     },
     triangle: struct {
         p0: palette.draw.Vec2,
@@ -855,7 +870,7 @@ fn replayCachedRow(state: *app_state.AppState, cache: *const TerminalRowDrawCach
         if (!cachedDrawCommandIntersects(translated, viewport_clip)) continue;
         switch (translated) {
             .rect => |cmd| queueClippedRect(state, cmd.rect, cmd.color, cmd.clip),
-            .border => |cmd| queueBorder(state, cmd.rect, cmd.color, cmd.radius, cmd.width),
+            .border => |cmd| queueClippedBorder(state, cmd.rect, cmd.color, cmd.radius, cmd.width, cmd.clip),
             .triangle => |cmd| queueTriangle(state, cmd.p0, cmd.p1, cmd.p2, cmd.color, cmd.clip),
             .terminal_text => |cmd| queueTerminalText(state, cmd.rect, cmd.value, cmd.color, cmd.font_size, cmd.clip, cmd.glyph_kind),
         }
@@ -871,7 +886,7 @@ fn cachedDrawCommandIntersects(command: CachedDrawCommand, viewport_clip: palett
     };
     const command_clip: ?palette.Rect = switch (command) {
         .rect => |cmd| cmd.clip,
-        .border => null,
+        .border => |cmd| cmd.clip,
         .triangle => |cmd| cmd.clip,
         .terminal_text => |cmd| cmd.clip,
     };
@@ -899,6 +914,7 @@ fn translatedCachedDrawCommand(command: CachedDrawCommand, offset: palette.draw.
             .color = cmd.color,
             .radius = cmd.radius,
             .width = cmd.width,
+            .clip = translatedOptionalRect(cmd.clip, offset),
         } },
         .triangle => |cmd| .{ .triangle = .{
             .p0 = translatedPoint(cmd.p0, offset),
@@ -1974,10 +1990,18 @@ fn queueRounded(state: *app_state.AppState, rect: palette.Rect, color: palette.C
 }
 
 fn queueBorder(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, radius: f32, width: f32) void {
+    queueClippedBorder(state, rect, color, radius, width, null);
+}
+
+fn queueClippedBorder(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, radius: f32, width: f32, clip: ?palette.Rect) void {
     if (active_capture) |cache| {
-        cache.append(state.allocator, .{ .border = .{ .rect = rect, .color = color, .radius = radius, .width = width } });
+        cache.append(state.allocator, .{ .border = .{ .rect = rect, .color = color, .radius = radius, .width = width, .clip = clip } });
     }
-    state.palette_overlay_batch.rectBorder(state.allocator, rect, color, radius, width) catch {};
+    if (clip) |clip_rect| {
+        state.palette_overlay_batch.rectBorderClipped(state.allocator, rect, color, radius, width, clip_rect) catch {};
+    } else {
+        state.palette_overlay_batch.rectBorder(state.allocator, rect, color, radius, width) catch {};
+    }
 }
 
 fn queueText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
@@ -2124,53 +2148,307 @@ fn queueBlockElement(state: *app_state.AppState, rect: palette.Rect, cp: u21, co
 
 fn queueBoxDrawing(state: *app_state.AppState, rect: palette.Rect, cp: u21, color: palette.Color, clip: ?palette.Rect) bool {
     if (cp < 0x2500 or cp > 0x257f) return false;
-    const stroke = @max(@round(@min(rect.w, rect.h) * 0.105), 1.0);
-    const cx = rect.x + rect.w * 0.5 - stroke * 0.5;
-    const cy = rect.y + rect.h * 0.5 - stroke * 0.5;
+    const light_stroke = @max(@round(@min(rect.w, rect.h) * 0.105), 1.0);
     switch (cp) {
-        0x2500, 0x2501, 0x2504, 0x2505, 0x2508, 0x2509, 0x254c, 0x254d => queueClippedRect(state, .{ .x = rect.x, .y = cy, .w = rect.w, .h = stroke }, color, clip),
-        0x2502, 0x2503, 0x2506, 0x2507, 0x250a, 0x250b, 0x254e, 0x254f => queueClippedRect(state, .{ .x = cx, .y = rect.y, .w = stroke, .h = rect.h }, color, clip),
-        0x250c...0x250f, 0x256d => {
-            queueClippedRect(state, .{ .x = cx, .y = cy, .w = stroke, .h = rect.h * 0.5 + stroke * 0.5 }, color, clip);
-            queueClippedRect(state, .{ .x = cx, .y = cy, .w = rect.w * 0.5 + stroke * 0.5, .h = stroke }, color, clip);
-        },
-        0x2510...0x2513, 0x256e => {
-            queueClippedRect(state, .{ .x = cx, .y = cy, .w = stroke, .h = rect.h * 0.5 + stroke * 0.5 }, color, clip);
-            queueClippedRect(state, .{ .x = rect.x, .y = cy, .w = rect.w * 0.5 + stroke * 0.5, .h = stroke }, color, clip);
-        },
-        0x2514...0x2517, 0x2570 => {
-            queueClippedRect(state, .{ .x = cx, .y = rect.y, .w = stroke, .h = rect.h * 0.5 + stroke * 0.5 }, color, clip);
-            queueClippedRect(state, .{ .x = cx, .y = cy, .w = rect.w * 0.5 + stroke * 0.5, .h = stroke }, color, clip);
-        },
-        0x2518...0x251b, 0x256f => {
-            queueClippedRect(state, .{ .x = cx, .y = rect.y, .w = stroke, .h = rect.h * 0.5 + stroke * 0.5 }, color, clip);
-            queueClippedRect(state, .{ .x = rect.x, .y = cy, .w = rect.w * 0.5 + stroke * 0.5, .h = stroke }, color, clip);
-        },
-        0x251c...0x254b => {
-            queueClippedRect(state, .{ .x = cx, .y = rect.y, .w = stroke, .h = rect.h }, color, clip);
-            queueClippedRect(state, .{ .x = rect.x, .y = cy, .w = rect.w, .h = stroke }, color, clip);
-        },
+        0x2504 => queueBoxDashes(state, rect, color, clip, true, 3, .light, @max(4.0, light_stroke)),
+        0x2505 => queueBoxDashes(state, rect, color, clip, true, 3, .heavy, @max(4.0, light_stroke)),
+        0x2506 => queueBoxDashes(state, rect, color, clip, false, 3, .light, @max(4.0, light_stroke)),
+        0x2507 => queueBoxDashes(state, rect, color, clip, false, 3, .heavy, @max(4.0, light_stroke)),
+        0x2508 => queueBoxDashes(state, rect, color, clip, true, 4, .light, @max(4.0, light_stroke)),
+        0x2509 => queueBoxDashes(state, rect, color, clip, true, 4, .heavy, @max(4.0, light_stroke)),
+        0x250a => queueBoxDashes(state, rect, color, clip, false, 4, .light, @max(4.0, light_stroke)),
+        0x250b => queueBoxDashes(state, rect, color, clip, false, 4, .heavy, @max(4.0, light_stroke)),
+        0x254c => queueBoxDashes(state, rect, color, clip, true, 2, .light, light_stroke),
+        0x254d => queueBoxDashes(state, rect, color, clip, true, 2, .heavy, light_stroke * 2.0),
+        0x254e => queueBoxDashes(state, rect, color, clip, false, 2, .light, light_stroke * 2.0),
+        0x254f => queueBoxDashes(state, rect, color, clip, false, 2, .heavy, light_stroke * 2.0),
+        0x256d...0x2570 => queueRoundedBoxCorner(state, rect, cp, color, clip, light_stroke),
         0x2571 => queueDiagonalGlyph(state, rect, color, clip, true),
         0x2572 => queueDiagonalGlyph(state, rect, color, clip, false),
         0x2573 => {
             queueDiagonalGlyph(state, rect, color, clip, true);
             queueDiagonalGlyph(state, rect, color, clip, false);
         },
-        0x2574 => queueClippedRect(state, .{ .x = rect.x, .y = cy, .w = rect.w * 0.5, .h = stroke }, color, clip),
-        0x2575 => queueClippedRect(state, .{ .x = cx, .y = rect.y, .w = stroke, .h = rect.h * 0.5 }, color, clip),
-        0x2576 => queueClippedRect(state, .{ .x = rect.x + rect.w * 0.5, .y = cy, .w = rect.w * 0.5, .h = stroke }, color, clip),
-        0x2577 => queueClippedRect(state, .{ .x = cx, .y = rect.y + rect.h * 0.5, .w = stroke, .h = rect.h * 0.5 }, color, clip),
-        0x2578 => queueClippedRect(state, .{ .x = rect.x, .y = cy, .w = rect.w * 0.5, .h = stroke * 1.4 }, color, clip),
-        0x2579 => queueClippedRect(state, .{ .x = cx, .y = rect.y, .w = stroke * 1.4, .h = rect.h * 0.5 }, color, clip),
-        0x257a => queueClippedRect(state, .{ .x = rect.x + rect.w * 0.5, .y = cy, .w = rect.w * 0.5, .h = stroke * 1.4 }, color, clip),
-        0x257b => queueClippedRect(state, .{ .x = cx, .y = rect.y + rect.h * 0.5, .w = stroke * 1.4, .h = rect.h * 0.5 }, color, clip),
-        0x257c...0x257f => {
-            queueClippedRect(state, .{ .x = rect.x, .y = cy, .w = rect.w, .h = stroke }, color, clip);
-            queueClippedRect(state, .{ .x = cx, .y = rect.y, .w = stroke, .h = rect.h }, color, clip);
-        },
-        else => return false,
+        else => queueBoxLines(state, rect, boxLinesForCodepoint(cp) orelse return false, color, clip, light_stroke),
     }
     return true;
+}
+
+fn roundedBoxCornerLines(cp: u21) ?BoxLines {
+    return switch (cp) {
+        0x256d => .{ .right = .light, .down = .light },
+        0x256e => .{ .down = .light, .left = .light },
+        0x256f => .{ .up = .light, .left = .light },
+        0x2570 => .{ .up = .light, .right = .light },
+        else => null,
+    };
+}
+
+fn boxLinesForCodepoint(cp: u21) ?BoxLines {
+    return switch (cp) {
+        0x2500 => .{ .left = .light, .right = .light },
+        0x2501 => .{ .left = .heavy, .right = .heavy },
+        0x2502 => .{ .up = .light, .down = .light },
+        0x2503 => .{ .up = .heavy, .down = .heavy },
+        0x250c => .{ .down = .light, .right = .light },
+        0x250d => .{ .down = .light, .right = .heavy },
+        0x250e => .{ .down = .heavy, .right = .light },
+        0x250f => .{ .down = .heavy, .right = .heavy },
+        0x2510 => .{ .down = .light, .left = .light },
+        0x2511 => .{ .down = .light, .left = .heavy },
+        0x2512 => .{ .down = .heavy, .left = .light },
+        0x2513 => .{ .down = .heavy, .left = .heavy },
+        0x2514 => .{ .up = .light, .right = .light },
+        0x2515 => .{ .up = .light, .right = .heavy },
+        0x2516 => .{ .up = .heavy, .right = .light },
+        0x2517 => .{ .up = .heavy, .right = .heavy },
+        0x2518 => .{ .up = .light, .left = .light },
+        0x2519 => .{ .up = .light, .left = .heavy },
+        0x251a => .{ .up = .heavy, .left = .light },
+        0x251b => .{ .up = .heavy, .left = .heavy },
+        0x251c => .{ .up = .light, .right = .light, .down = .light },
+        0x251d => .{ .up = .light, .right = .heavy, .down = .light },
+        0x251e => .{ .up = .heavy, .right = .light, .down = .light },
+        0x251f => .{ .up = .light, .right = .light, .down = .heavy },
+        0x2520 => .{ .up = .heavy, .right = .light, .down = .heavy },
+        0x2521 => .{ .up = .heavy, .right = .heavy, .down = .light },
+        0x2522 => .{ .up = .light, .right = .heavy, .down = .heavy },
+        0x2523 => .{ .up = .heavy, .right = .heavy, .down = .heavy },
+        0x2524 => .{ .up = .light, .down = .light, .left = .light },
+        0x2525 => .{ .up = .light, .down = .light, .left = .heavy },
+        0x2526 => .{ .up = .heavy, .down = .light, .left = .light },
+        0x2527 => .{ .up = .light, .down = .heavy, .left = .light },
+        0x2528 => .{ .up = .heavy, .down = .heavy, .left = .light },
+        0x2529 => .{ .up = .heavy, .down = .light, .left = .heavy },
+        0x252a => .{ .up = .light, .down = .heavy, .left = .heavy },
+        0x252b => .{ .up = .heavy, .down = .heavy, .left = .heavy },
+        0x252c => .{ .right = .light, .down = .light, .left = .light },
+        0x252d => .{ .right = .light, .down = .light, .left = .heavy },
+        0x252e => .{ .right = .heavy, .down = .light, .left = .light },
+        0x252f => .{ .right = .heavy, .down = .light, .left = .heavy },
+        0x2530 => .{ .right = .light, .down = .heavy, .left = .light },
+        0x2531 => .{ .right = .light, .down = .heavy, .left = .heavy },
+        0x2532 => .{ .right = .heavy, .down = .heavy, .left = .light },
+        0x2533 => .{ .right = .heavy, .down = .heavy, .left = .heavy },
+        0x2534 => .{ .up = .light, .right = .light, .left = .light },
+        0x2535 => .{ .up = .light, .right = .light, .left = .heavy },
+        0x2536 => .{ .up = .light, .right = .heavy, .left = .light },
+        0x2537 => .{ .up = .light, .right = .heavy, .left = .heavy },
+        0x2538 => .{ .up = .heavy, .right = .light, .left = .light },
+        0x2539 => .{ .up = .heavy, .right = .light, .left = .heavy },
+        0x253a => .{ .up = .heavy, .right = .heavy, .left = .light },
+        0x253b => .{ .up = .heavy, .right = .heavy, .left = .heavy },
+        0x253c => .{ .up = .light, .right = .light, .down = .light, .left = .light },
+        0x253d => .{ .up = .light, .right = .light, .down = .light, .left = .heavy },
+        0x253e => .{ .up = .light, .right = .heavy, .down = .light, .left = .light },
+        0x253f => .{ .up = .light, .right = .heavy, .down = .light, .left = .heavy },
+        0x2540 => .{ .up = .heavy, .right = .light, .down = .light, .left = .light },
+        0x2541 => .{ .up = .light, .right = .light, .down = .heavy, .left = .light },
+        0x2542 => .{ .up = .heavy, .right = .light, .down = .heavy, .left = .light },
+        0x2543 => .{ .up = .heavy, .right = .light, .down = .light, .left = .heavy },
+        0x2544 => .{ .up = .heavy, .right = .heavy, .down = .light, .left = .light },
+        0x2545 => .{ .up = .light, .right = .light, .down = .heavy, .left = .heavy },
+        0x2546 => .{ .up = .light, .right = .heavy, .down = .heavy, .left = .light },
+        0x2547 => .{ .up = .heavy, .right = .heavy, .down = .light, .left = .heavy },
+        0x2548 => .{ .up = .light, .right = .heavy, .down = .heavy, .left = .heavy },
+        0x2549 => .{ .up = .heavy, .right = .light, .down = .heavy, .left = .heavy },
+        0x254a => .{ .up = .heavy, .right = .heavy, .down = .heavy, .left = .light },
+        0x254b => .{ .up = .heavy, .right = .heavy, .down = .heavy, .left = .heavy },
+        0x2550 => .{ .right = .double, .left = .double },
+        0x2551 => .{ .up = .double, .down = .double },
+        0x2552 => .{ .right = .double, .down = .light },
+        0x2553 => .{ .right = .light, .down = .double },
+        0x2554 => .{ .right = .double, .down = .double },
+        0x2555 => .{ .down = .light, .left = .double },
+        0x2556 => .{ .down = .double, .left = .light },
+        0x2557 => .{ .down = .double, .left = .double },
+        0x2558 => .{ .up = .light, .right = .double },
+        0x2559 => .{ .up = .double, .right = .light },
+        0x255a => .{ .up = .double, .right = .double },
+        0x255b => .{ .up = .light, .left = .double },
+        0x255c => .{ .up = .double, .left = .light },
+        0x255d => .{ .up = .double, .left = .double },
+        0x255e => .{ .up = .light, .right = .double, .down = .light },
+        0x255f => .{ .up = .double, .right = .light, .down = .double },
+        0x2560 => .{ .up = .double, .right = .double, .down = .double },
+        0x2561 => .{ .up = .light, .down = .light, .left = .double },
+        0x2562 => .{ .up = .double, .down = .double, .left = .light },
+        0x2563 => .{ .up = .double, .down = .double, .left = .double },
+        0x2564 => .{ .right = .double, .down = .light, .left = .double },
+        0x2565 => .{ .right = .light, .down = .double, .left = .light },
+        0x2566 => .{ .right = .double, .down = .double, .left = .double },
+        0x2567 => .{ .up = .light, .right = .double, .left = .double },
+        0x2568 => .{ .up = .double, .right = .light, .left = .light },
+        0x2569 => .{ .up = .double, .right = .double, .left = .double },
+        0x256a => .{ .up = .light, .right = .double, .down = .light, .left = .double },
+        0x256b => .{ .up = .double, .right = .light, .down = .double, .left = .light },
+        0x256c => .{ .up = .double, .right = .double, .down = .double, .left = .double },
+        0x2574 => .{ .left = .light },
+        0x2575 => .{ .up = .light },
+        0x2576 => .{ .right = .light },
+        0x2577 => .{ .down = .light },
+        0x2578 => .{ .left = .heavy },
+        0x2579 => .{ .up = .heavy },
+        0x257a => .{ .right = .heavy },
+        0x257b => .{ .down = .heavy },
+        0x257c => .{ .right = .heavy, .left = .light },
+        0x257d => .{ .up = .light, .down = .heavy },
+        0x257e => .{ .right = .light, .left = .heavy },
+        0x257f => .{ .up = .heavy, .down = .light },
+        else => null,
+    };
+}
+
+// Box-drawing cells use Ghostty's per-edge join rules so tee and mixed-weight glyphs preserve their direction.
+fn queueBoxLines(state: *app_state.AppState, rect: palette.Rect, lines: BoxLines, color: palette.Color, clip: ?palette.Rect, light_stroke: f32) void {
+    const heavy_stroke = light_stroke * 2.0;
+    const h_light_top = rect.y + @floor((rect.h - light_stroke) * 0.5);
+    const h_light_bottom = h_light_top + light_stroke;
+    const h_heavy_top = rect.y + @floor((rect.h - heavy_stroke) * 0.5);
+    const h_heavy_bottom = h_heavy_top + heavy_stroke;
+    const h_double_top = h_light_top - light_stroke;
+    const h_double_bottom = h_light_bottom + light_stroke;
+    const v_light_left = rect.x + @floor((rect.w - light_stroke) * 0.5);
+    const v_light_right = v_light_left + light_stroke;
+    const v_heavy_left = rect.x + @floor((rect.w - heavy_stroke) * 0.5);
+    const v_heavy_right = v_heavy_left + heavy_stroke;
+    const v_double_left = v_light_left - light_stroke;
+    const v_double_right = v_light_right + light_stroke;
+
+    const up_bottom = if (lines.left == .heavy or lines.right == .heavy)
+        h_heavy_bottom
+    else if (lines.left != lines.right or lines.down == lines.up)
+        if (lines.left == .double or lines.right == .double) h_double_bottom else h_light_bottom
+    else if (lines.left == .none and lines.right == .none)
+        h_light_bottom
+    else
+        h_light_top;
+    const down_top = if (lines.left == .heavy or lines.right == .heavy)
+        h_heavy_top
+    else if (lines.left != lines.right or lines.up == lines.down)
+        if (lines.left == .double or lines.right == .double) h_double_top else h_light_top
+    else if (lines.left == .none and lines.right == .none)
+        h_light_top
+    else
+        h_light_bottom;
+    const left_right = if (lines.up == .heavy or lines.down == .heavy)
+        v_heavy_right
+    else if (lines.up != lines.down or lines.left == lines.right)
+        if (lines.up == .double or lines.down == .double) v_double_right else v_light_right
+    else if (lines.up == .none and lines.down == .none)
+        v_light_right
+    else
+        v_light_left;
+    const right_left = if (lines.up == .heavy or lines.down == .heavy)
+        v_heavy_left
+    else if (lines.up != lines.down or lines.right == lines.left)
+        if (lines.up == .double or lines.down == .double) v_double_left else v_light_left
+    else if (lines.up == .none and lines.down == .none)
+        v_light_left
+    else
+        v_light_right;
+
+    switch (lines.up) {
+        .none => {},
+        .light => queueClippedRect(state, .{ .x = v_light_left, .y = rect.y, .w = light_stroke, .h = up_bottom - rect.y }, color, clip),
+        .heavy => queueClippedRect(state, .{ .x = v_heavy_left, .y = rect.y, .w = heavy_stroke, .h = up_bottom - rect.y }, color, clip),
+        .double => {
+            const left_bottom = if (lines.left == .double) h_light_top else up_bottom;
+            const right_bottom = if (lines.right == .double) h_light_top else up_bottom;
+            queueClippedRect(state, .{ .x = v_double_left, .y = rect.y, .w = light_stroke, .h = left_bottom - rect.y }, color, clip);
+            queueClippedRect(state, .{ .x = v_light_right, .y = rect.y, .w = light_stroke, .h = right_bottom - rect.y }, color, clip);
+        },
+    }
+    switch (lines.right) {
+        .none => {},
+        .light => queueClippedRect(state, .{ .x = right_left, .y = h_light_top, .w = rect.x + rect.w - right_left, .h = light_stroke }, color, clip),
+        .heavy => queueClippedRect(state, .{ .x = right_left, .y = h_heavy_top, .w = rect.x + rect.w - right_left, .h = heavy_stroke }, color, clip),
+        .double => {
+            const top_left = if (lines.up == .double) v_light_right else right_left;
+            const bottom_left = if (lines.down == .double) v_light_right else right_left;
+            queueClippedRect(state, .{ .x = top_left, .y = h_double_top, .w = rect.x + rect.w - top_left, .h = light_stroke }, color, clip);
+            queueClippedRect(state, .{ .x = bottom_left, .y = h_light_bottom, .w = rect.x + rect.w - bottom_left, .h = light_stroke }, color, clip);
+        },
+    }
+    switch (lines.down) {
+        .none => {},
+        .light => queueClippedRect(state, .{ .x = v_light_left, .y = down_top, .w = light_stroke, .h = rect.y + rect.h - down_top }, color, clip),
+        .heavy => queueClippedRect(state, .{ .x = v_heavy_left, .y = down_top, .w = heavy_stroke, .h = rect.y + rect.h - down_top }, color, clip),
+        .double => {
+            const left_top = if (lines.left == .double) h_light_bottom else down_top;
+            const right_top = if (lines.right == .double) h_light_bottom else down_top;
+            queueClippedRect(state, .{ .x = v_double_left, .y = left_top, .w = light_stroke, .h = rect.y + rect.h - left_top }, color, clip);
+            queueClippedRect(state, .{ .x = v_light_right, .y = right_top, .w = light_stroke, .h = rect.y + rect.h - right_top }, color, clip);
+        },
+    }
+    switch (lines.left) {
+        .none => {},
+        .light => queueClippedRect(state, .{ .x = rect.x, .y = h_light_top, .w = left_right - rect.x, .h = light_stroke }, color, clip),
+        .heavy => queueClippedRect(state, .{ .x = rect.x, .y = h_heavy_top, .w = left_right - rect.x, .h = heavy_stroke }, color, clip),
+        .double => {
+            const top_right = if (lines.up == .double) v_light_left else left_right;
+            const bottom_right = if (lines.down == .double) v_light_left else left_right;
+            queueClippedRect(state, .{ .x = rect.x, .y = h_double_top, .w = top_right - rect.x, .h = light_stroke }, color, clip);
+            queueClippedRect(state, .{ .x = rect.x, .y = h_light_bottom, .w = bottom_right - rect.x, .h = light_stroke }, color, clip);
+        },
+    }
+}
+
+// Dashed box-drawing cells preserve their Unicode dash count and weight.
+fn queueBoxDashes(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, clip: ?palette.Rect, horizontal: bool, count: u8, style: BoxLineStyle, desired_gap: f32) void {
+    const stroke = if (style == .heavy) @max(@round(@min(rect.w, rect.h) * 0.105), 1.0) * 2.0 else @max(@round(@min(rect.w, rect.h) * 0.105), 1.0);
+    const span = if (horizontal) rect.w else rect.h;
+    const count_f: f32 = @floatFromInt(count);
+    if (span < count_f * 2.0) {
+        const lines: BoxLines = if (horizontal) .{ .left = style, .right = style } else .{ .up = style, .down = style };
+        const light_stroke: f32 = if (style == .heavy) stroke / 2.0 else stroke;
+        queueBoxLines(state, rect, lines, color, clip, light_stroke);
+        return;
+    }
+    const gap = @floor(@min(desired_gap, span / (2.0 * count_f)));
+    const total_dash = span - gap * count_f;
+    const dash = @floor(total_dash / count_f);
+    var extra = total_dash - dash * count_f;
+    var pos = if (horizontal) @floor(gap * 0.5) else 0.0;
+    for (0..count) |_| {
+        const extra_dash: f32 = if (extra >= 1.0) 1.0 else 0.0;
+        const length = dash + extra_dash;
+        extra = @max(extra - 1.0, 0.0);
+        if (horizontal) {
+            queueClippedRect(state, .{ .x = rect.x + pos, .y = rect.y + @floor((rect.h - stroke) * 0.5), .w = length, .h = stroke }, color, clip);
+        } else {
+            queueClippedRect(state, .{ .x = rect.x + @floor((rect.w - stroke) * 0.5), .y = rect.y + pos, .w = stroke, .h = length }, color, clip);
+        }
+        pos += length + gap;
+    }
+}
+
+// Rounded box corners are quarter-circle borders with straight tails to the cell edges.
+fn queueRoundedBoxCorner(state: *app_state.AppState, rect: palette.Rect, cp: u21, color: palette.Color, clip: ?palette.Rect, stroke: f32) void {
+    const lines = roundedBoxCornerLines(cp) orelse unreachable;
+    const center_x = rect.x + @floor((rect.w - stroke) * 0.5) + stroke * 0.5;
+    const center_y = rect.y + @floor((rect.h - stroke) * 0.5) + stroke * 0.5;
+    const radius = @min(rect.w, rect.h) * 0.5;
+    const circle: palette.Rect = .{ .x = center_x - radius, .y = center_y - radius, .w = radius * 2.0, .h = radius * 2.0 };
+    const quadrant: palette.Rect = .{
+        .x = if (lines.right != .none) center_x else center_x - radius,
+        .y = if (lines.down != .none) center_y else center_y - radius,
+        .w = radius,
+        .h = radius,
+    };
+    const cell_clip = intersectRect(rect, quadrant) orelse return;
+    if (clip) |outer_clip| {
+        if (intersectRect(cell_clip, outer_clip)) |arc_clip| queueClippedBorder(state, circle, color, radius, stroke, arc_clip);
+    } else {
+        queueClippedBorder(state, circle, color, radius, stroke, cell_clip);
+    }
+
+    const center_left = center_x - stroke * 0.5;
+    const center_top = center_y - stroke * 0.5;
+    if (lines.up != .none) queueClippedRect(state, .{ .x = center_left, .y = rect.y, .w = stroke, .h = center_y - radius - rect.y + stroke }, color, clip);
+    if (lines.right != .none) queueClippedRect(state, .{ .x = center_x + radius - stroke, .y = center_top, .w = rect.x + rect.w - (center_x + radius) + stroke, .h = stroke }, color, clip);
+    if (lines.down != .none) queueClippedRect(state, .{ .x = center_left, .y = center_y + radius - stroke, .w = stroke, .h = rect.y + rect.h - (center_y + radius) + stroke }, color, clip);
+    if (lines.left != .none) queueClippedRect(state, .{ .x = rect.x, .y = center_top, .w = center_x - radius - rect.x + stroke, .h = stroke }, color, clip);
 }
 
 fn queueDiagonalGlyph(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, clip: ?palette.Rect, rising: bool) void {
@@ -2300,6 +2578,34 @@ fn terminalGlyphKind(cp: u21) TerminalGlyphKind {
     };
 }
 
+test "box drawing mappings preserve tee directions and line styles" {
+    try std.testing.expectEqual(BoxLines{ .up = .light, .right = .light, .left = .light }, boxLinesForCodepoint(0x2534).?); // ┴
+    try std.testing.expectEqual(BoxLines{ .right = .light, .down = .light, .left = .light }, boxLinesForCodepoint(0x252c).?); // ┬
+    try std.testing.expectEqual(BoxLines{ .up = .light, .right = .light, .down = .light }, boxLinesForCodepoint(0x251c).?); // ├
+    try std.testing.expectEqual(BoxLines{ .up = .light, .down = .light, .left = .light }, boxLinesForCodepoint(0x2524).?); // ┤
+    try std.testing.expectEqual(BoxLines{ .up = .light, .right = .light, .down = .light, .left = .light }, boxLinesForCodepoint(0x253c).?); // ┼
+    try std.testing.expectEqual(BoxLines{ .up = .heavy, .right = .light, .down = .light }, boxLinesForCodepoint(0x251e).?); // ┞
+    try std.testing.expectEqual(BoxLines{ .up = .double, .right = .double, .down = .double, .left = .double }, boxLinesForCodepoint(0x256c).?); // ╬
+}
+
+test "box drawing mappings cover every non-specialized codepoint" {
+    var cp: u21 = 0x2500;
+    while (cp <= 0x257f) : (cp += 1) {
+        const specialized = switch (cp) {
+            0x2504...0x250b, 0x254c...0x254f, 0x256d...0x2573 => true,
+            else => false,
+        };
+        try std.testing.expect(specialized or boxLinesForCodepoint(cp) != null);
+    }
+}
+
+test "rounded box drawing mappings preserve corner directions" {
+    try std.testing.expectEqual(BoxLines{ .right = .light, .down = .light }, roundedBoxCornerLines(0x256d).?); // ╭
+    try std.testing.expectEqual(BoxLines{ .down = .light, .left = .light }, roundedBoxCornerLines(0x256e).?); // ╮
+    try std.testing.expectEqual(BoxLines{ .up = .light, .left = .light }, roundedBoxCornerLines(0x256f).?); // ╯
+    try std.testing.expectEqual(BoxLines{ .up = .light, .right = .light }, roundedBoxCornerLines(0x2570).?); // ╰
+}
+
 test "terminal draw cache translates every cached command" {
     const color: palette.Color = .{ .r = 0.1, .g = 0.2, .b = 0.3, .a = 0.4 };
     const offset: palette.draw.Vec2 = .{ .x = -125.0, .y = 18.0 };
@@ -2324,12 +2630,14 @@ test "terminal draw cache translates every cached command" {
         .color = color,
         .radius = 4.0,
         .width = 2.0,
+        .clip = clip,
     } }, offset);
     switch (border_command) {
         .border => |cmd| {
             try std.testing.expectEqual(palette.Rect{ .x = -105.0, .y = 48.0, .w = 50.0, .h = 60.0 }, cmd.rect);
             try std.testing.expectEqual(@as(f32, 4.0), cmd.radius);
             try std.testing.expectEqual(@as(f32, 2.0), cmd.width);
+            try std.testing.expectEqual(@as(?palette.Rect, .{ .x = -115.0, .y = 38.0, .w = 300.0, .h = 200.0 }), cmd.clip);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -2388,6 +2696,13 @@ test "terminal draw cache culls commands outside the scrolling viewport" {
     try std.testing.expect(!cachedDrawCommandIntersects(.{ .rect = .{
         .rect = .{ .x = 120.0, .y = 60.0, .w = 20.0, .h = 20.0 },
         .color = color,
+        .clip = .{ .x = 0.0, .y = 0.0, .w = 50.0, .h = 50.0 },
+    } }, viewport));
+    try std.testing.expect(!cachedDrawCommandIntersects(.{ .border = .{
+        .rect = .{ .x = 120.0, .y = 60.0, .w = 20.0, .h = 20.0 },
+        .color = color,
+        .radius = 10.0,
+        .width = 1.0,
         .clip = .{ .x = 0.0, .y = 0.0, .w = 50.0, .h = 50.0 },
     } }, viewport));
 }
