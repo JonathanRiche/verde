@@ -22,6 +22,7 @@ pub const Geometry = struct {
     chip_hit: palette.Rect,
     sidecar: palette.Rect,
     header: palette.Rect,
+    mission_control_button: palette.Rect,
     close_button: palette.Rect,
     objective: palette.Rect,
     tabs: palette.Rect,
@@ -29,13 +30,30 @@ pub const Geometry = struct {
     footer: palette.Rect,
 };
 
+const MissionControlMode = enum { wide, laptop, narrow };
+
+const MissionControlGeometry = struct {
+    window: palette.Rect,
+    header: palette.Rect,
+    close_button: palette.Rect,
+    body: palette.Rect,
+    summary: palette.Rect,
+    operations: palette.Rect,
+    inspector: palette.Rect,
+    mode: MissionControlMode,
+};
+
 /// Rebuilds Companion-only hits before SDL events are routed.
 pub fn refreshHits(state: *runtime.AppState, width: f32, height: f32) void {
     state.syncCompanionProjection();
     state.companion_controller.frame_width = width;
     state.companion_controller.frame_height = height;
-    const geometry = computeGeometryForState(width, height, companionScale(), &state.companion_controller);
-    prepareAndRegisterHits(&state.companion_controller, geometry);
+    if (state.companion_controller.mission_control_open) {
+        prepareAndRegisterMissionControlHits(&state.companion_controller, computeMissionControlGeometry(width, height, companionScale()));
+    } else {
+        const geometry = computeGeometryForState(width, height, companionScale(), &state.companion_controller);
+        prepareAndRegisterHits(&state.companion_controller, geometry);
+    }
 }
 
 /// Routes pointer buttons only when the visible Companion surface is hit.
@@ -48,6 +66,15 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
             .collapse => {
                 state.companion_controller.collapse();
                 state.blurCompanionComposer();
+            },
+            .mission_control_open => {
+                state.companion_controller.openMissionControl();
+                state.blurCompanionComposer();
+                refreshHits(state, state.companion_controller.frame_width, state.companion_controller.frame_height);
+            },
+            .mission_control_close => {
+                state.companion_controller.closeMissionControl();
+                refreshHits(state, state.companion_controller.frame_width, state.companion_controller.frame_height);
             },
             .approve, .deny => {
                 const resolved = if (action == .approve)
@@ -69,13 +96,7 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
             },
             .operation_select => if (result.reference) |reference| {
                 state.companion_controller.toggleOperationSelection(reference);
-                const geometry = computeGeometryForState(
-                    state.companion_controller.frame_width,
-                    state.companion_controller.frame_height,
-                    companionScale(),
-                    &state.companion_controller,
-                );
-                prepareAndRegisterHits(&state.companion_controller, geometry);
+                refreshHits(state, state.companion_controller.frame_width, state.companion_controller.frame_height);
             },
             .operation_stop, .operation_follow_log => if (result.reference) |reference| {
                 _ = state.dispatchCompanionOperationAction(
@@ -88,7 +109,7 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
         }
         state.markDirty();
     }
-    if (button == 1 and state.companion_controller.visibility == .sidecar_open and
+    if (button == 1 and state.companion_controller.visibility == .sidecar_open and !state.companion_controller.mission_control_open and
         (result.action == null or result.action.? == .panel))
     {
         _ = state.routeCompanionComposerMouseButton(x, y, down, clicks);
@@ -99,13 +120,18 @@ pub fn handleMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, d
 /// Prevents underlying hover routing only inside the chip or sidecar.
 pub fn handleMouseMotion(state: *runtime.AppState, x: f32, y: f32, dragging: bool) bool {
     const owned = state.companion_controller.hasPointerCapture() or state.companion_controller.hitAt(x, y) != null;
-    if (owned) _ = state.routeCompanionComposerMouseMotion(x, y, dragging);
+    if (owned and !state.companion_controller.mission_control_open) _ = state.routeCompanionComposerMouseMotion(x, y, dragging);
     return owned;
 }
 
 /// Scrolls the sidecar body directly; panel chrome consumes without scrolling.
 pub fn handleWheel(state: *runtime.AppState, x: f32, y: f32, wheel_y: f32) bool {
     const action = state.companion_controller.hitAt(x, y) orelse return false;
+    if (state.companion_controller.mission_control_open) {
+        if (wheel_y != 0.0) scrollMissionControlAt(state, x, y, -wheel_y * companionScaled(32.0));
+        _ = action;
+        return true;
+    }
     if (state.routeCompanionComposerWheel(x, y, wheel_y)) return true;
     const body_rect = bodyHitRect(state.companion_controller.hits[0..state.companion_controller.hit_count]);
     if (pointInRect(body_rect, x, y) and wheel_y != 0.0) {
@@ -143,6 +169,10 @@ pub fn hitAt(state: *const runtime.AppState, x: f32, y: f32) ?controller.HitActi
 
 /// Renders the persistent Companion surface above panes and below true modals.
 pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
+    if (state.companion_controller.mission_control_open) {
+        renderMissionControl(state, computeMissionControlGeometry(width, height, companionScale()));
+        return;
+    }
     const geometry = computeGeometryForState(width, height, companionScale(), &state.companion_controller);
     switch (state.companion_controller.visibility) {
         .collapsed_chip => renderChip(state, geometry),
@@ -209,6 +239,19 @@ fn computeGeometryForState(width: f32, height: f32, scale: f32, state: *const co
     const close_y_inset = @min(scaled(8.0, scale), header_h);
     const close_width = @min(scaled(27.0, scale), @max(sidecar.w - close_x_inset, 0.0));
     const close_height = @min(scaled(27.0, scale), @max(header_h - close_y_inset, 0.0));
+    const close_button: palette.Rect = .{
+        .x = sidecar.x + @max(sidecar.w - close_x_inset - close_width, 0.0),
+        .y = sidecar.y + close_y_inset,
+        .w = close_width,
+        .h = close_height,
+    };
+    const mission_control_width = @min(scaled(124.0, scale), @max(close_button.x - sidecar.x - scaled(124.0, scale), 0.0));
+    const mission_control_button: palette.Rect = .{
+        .x = close_button.x - scaled(7.0, scale) - mission_control_width,
+        .y = close_button.y,
+        .w = mission_control_width,
+        .h = close_button.h,
+    };
 
     return .{
         .window = .{ .x = 0.0, .y = 0.0, .w = window_width, .h = window_height },
@@ -217,16 +260,84 @@ fn computeGeometryForState(width: f32, height: f32, scale: f32, state: *const co
         .chip_hit = unionRects(chip, character),
         .sidecar = sidecar,
         .header = .{ .x = sidecar.x, .y = sidecar.y, .w = sidecar.w, .h = header_h },
-        .close_button = .{
-            .x = sidecar.x + @max(sidecar.w - close_x_inset - close_width, 0.0),
-            .y = sidecar.y + close_y_inset,
-            .w = close_width,
-            .h = close_height,
-        },
+        .mission_control_button = mission_control_button,
+        .close_button = close_button,
         .objective = .{ .x = sidecar.x, .y = sidecar.y + header_h, .w = sidecar.w, .h = objective_h },
         .tabs = .{ .x = sidecar.x, .y = sidecar.y + header_h + objective_h, .w = sidecar.w, .h = tabs_h },
         .body = .{ .x = sidecar.x, .y = sidecar.y + header_h + objective_h + tabs_h, .w = sidecar.w, .h = body_h },
         .footer = .{ .x = sidecar.x, .y = sidecar.y + sidecar.h - footer_h, .w = sidecar.w, .h = footer_h },
+    };
+}
+
+fn computeMissionControlGeometry(width: f32, height: f32, scale: f32) MissionControlGeometry {
+    const window: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = @max(width, 0.0), .h = @max(height, 0.0) };
+    const header_h = @min(48.0 * scale, window.h);
+    const header: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = window.w, .h = header_h };
+    const body: palette.Rect = .{ .x = 0.0, .y = header_h, .w = window.w, .h = @max(window.h - header_h, 0.0) };
+    const close_size = @min(28.0 * scale, @max(header_h - 12.0 * scale, 0.0));
+    const close_button: palette.Rect = .{
+        .x = @max(window.w - 16.0 * scale - close_size, 0.0),
+        .y = @max((header_h - close_size) * 0.5, 0.0),
+        .w = close_size,
+        .h = close_size,
+    };
+    const mode: MissionControlMode = if (window.w < 720.0 * scale or window.h < 520.0 * scale)
+        .narrow
+    else if (window.w < 960.0 * scale)
+        .laptop
+    else
+        .wide;
+    const padding = 16.0 * scale;
+    const gap = 12.0 * scale;
+    const content: palette.Rect = .{
+        .x = padding,
+        .y = body.y + padding,
+        .w = @max(body.w - padding * 2.0, 0.0),
+        .h = @max(body.h - padding * 2.0, 0.0),
+    };
+    if (mode == .narrow) return .{
+        .window = window,
+        .header = header,
+        .close_button = close_button,
+        .body = body,
+        .summary = content,
+        .operations = content,
+        .inspector = content,
+        .mode = mode,
+    };
+    if (mode == .laptop) {
+        const left_w = std.math.clamp(content.w * 0.34, 200.0 * scale, @max(content.w - 260.0 * scale - gap, 200.0 * scale));
+        const left: palette.Rect = .{ .x = content.x, .y = content.y, .w = @min(left_w, content.w), .h = content.h };
+        const right: palette.Rect = .{
+            .x = left.x + left.w + gap,
+            .y = content.y,
+            .w = @max(content.x + content.w - left.x - left.w - gap, 0.0),
+            .h = content.h,
+        };
+        const summary_h = std.math.clamp((left.h - gap) * 0.42, 160.0 * scale, @max(left.h - gap - 140.0 * scale, 160.0 * scale));
+        return .{
+            .window = window,
+            .header = header,
+            .close_button = close_button,
+            .body = body,
+            .summary = .{ .x = left.x, .y = left.y, .w = left.w, .h = @min(summary_h, left.h) },
+            .operations = .{ .x = left.x, .y = left.y + @min(summary_h, left.h) + gap, .w = left.w, .h = @max(left.h - @min(summary_h, left.h) - gap, 0.0) },
+            .inspector = right,
+            .mode = mode,
+        };
+    }
+    const left_w = std.math.clamp(content.w * 0.2, 220.0 * scale, 280.0 * scale);
+    const right_w = std.math.clamp(content.w * 0.24, 260.0 * scale, 320.0 * scale);
+    const center_w = @max(content.w - left_w - right_w - gap * 2.0, 0.0);
+    return .{
+        .window = window,
+        .header = header,
+        .close_button = close_button,
+        .body = body,
+        .summary = .{ .x = content.x, .y = content.y, .w = left_w, .h = content.h },
+        .operations = .{ .x = content.x + left_w + gap, .y = content.y, .w = center_w, .h = content.h },
+        .inspector = .{ .x = content.x + left_w + gap + center_w + gap, .y = content.y, .w = right_w, .h = content.h },
+        .mode = mode,
     };
 }
 
@@ -290,6 +401,7 @@ fn registerHits(state: *controller, geometry: Geometry, show_approval: bool) voi
                 state.addHit(buttons[1], .approve);
             }
             registerOperationHits(state, geometry.body);
+            if (geometry.mission_control_button.w >= companionScaled(92.0)) state.addHit(geometry.mission_control_button, .mission_control_open);
             state.addHit(geometry.close_button, .collapse);
         },
     }
@@ -342,16 +454,309 @@ fn registerOperationCardHits(
     card_height: f32,
     card_advance: f32,
 ) void {
-    const card: palette.Rect = .{ .x = body.x + companionScaled(12.0), .y = y.*, .w = @max(body.w - companionScaled(24.0), 0.0), .h = card_height };
+    const card = operationCardRect(body, y.*, card_height);
     if (reference.actions.inspect) if (intersectRects(card, body)) |hit_rect| state.addOperationHit(hit_rect, .operation_select, reference);
     y.* += card_advance;
     if (!state.operationSelected(&reference)) return;
     const operation = state.presentation.operationForReference(&reference) orelse return;
-    const inspector: palette.Rect = .{ .x = card.x, .y = y.*, .w = card.w, .h = inspectorHeight(operation) };
+    const inspector = operationInspectorRect(body, y.*, operation);
     const controls = inspectorControlRects(inspector, reference.actions);
     if (controls.stop) |rect| if (intersectRects(rect, body)) |hit_rect| state.addOperationHit(hit_rect, .operation_stop, reference);
     if (controls.follow_log) |rect| if (intersectRects(rect, body)) |hit_rect| state.addOperationHit(hit_rect, .operation_follow_log, reference);
     y.* += inspector.h + companionScaled(7.0);
+}
+
+fn operationCardRect(clip: palette.Rect, y: f32, height: f32) palette.Rect {
+    return .{ .x = clip.x + companionScaled(12.0), .y = y, .w = @max(clip.w - companionScaled(24.0), 0.0), .h = height };
+}
+
+fn operationInspectorRect(clip: palette.Rect, y: f32, operation: *const controller.Operation) palette.Rect {
+    return .{
+        .x = clip.x + companionScaled(12.0),
+        .y = y,
+        .w = @max(clip.w - companionScaled(24.0), 0.0),
+        .h = inspectorHeight(operation),
+    };
+}
+
+fn missionControlSummaryHeight(frame: *const controller.Frame, width: f32) f32 {
+    var height = companionScaled(100.0);
+    if (frame.has_failure) height += companionScaled(24.0);
+    if (resultCardVisible(frame)) height += missionControlResultHeight(frame, width) + companionScaled(12.0);
+    return height + companionScaled(86.0);
+}
+
+fn missionControlResultHeight(frame: *const controller.Frame, width: f32) f32 {
+    const text_w = @max(width - companionScaled(46.0), 0.0);
+    const wrapped = wrapResultText(std.mem.trim(u8, frame.answer.slice(), " \t\r\n"), text_w);
+    const line_count: f32 = @floatFromInt(@max(@min(wrapped.count, 4), 1));
+    return companionScaled(42.0) + line_count * companionScaled(17.0);
+}
+
+fn missionControlOperationsHeight(frame: *const controller.Frame) f32 {
+    const counts = frame.activeCounts();
+    const active_total = counts.working + counts.pending;
+    const recent_total = @min(frame.recentCount(), 5);
+    if (active_total == 0 and recent_total == 0) return companionScaled(76.0);
+    var height = companionScaled(12.0);
+    if (active_total > 0) height += companionScaled(27.0 + 79.0 * @as(f32, @floatFromInt(active_total)));
+    if (recent_total > 0) height += companionScaled(27.0 + 79.0 * @as(f32, @floatFromInt(recent_total)));
+    return height;
+}
+
+fn missionControlInspectorHeight(state: *const controller) f32 {
+    const operation = state.selectedOperation() orelse return companionScaled(76.0);
+    return companionScaled(12.0) + missionInspectorHeight(operation) + companionScaled(7.0);
+}
+
+fn missionControlNarrowHeight(state: *const controller, width: f32) f32 {
+    return missionControlSummaryHeight(&state.presentation, width) + missionControlOperationsHeight(&state.presentation) +
+        missionControlInspectorHeight(state) + companionScaled(24.0);
+}
+
+fn prepareAndRegisterMissionControlHits(state: *controller, geometry: MissionControlGeometry) void {
+    if (geometry.mode == .narrow) {
+        const max_scroll = @max(missionControlNarrowHeight(state, geometry.summary.w) - geometry.summary.h, 0.0);
+        state.scrollMissionControl(.body, 0.0, max_scroll);
+    } else {
+        state.scrollMissionControl(.summary, 0.0, @max(missionControlSummaryHeight(&state.presentation, geometry.summary.w) - geometry.summary.h, 0.0));
+        state.scrollMissionControl(.operations, 0.0, @max(missionControlOperationsHeight(&state.presentation) - geometry.operations.h, 0.0));
+        state.scrollMissionControl(.inspector, 0.0, @max(missionControlInspectorHeight(state) - geometry.inspector.h, 0.0));
+    }
+    state.clearHits();
+    state.addHit(geometry.window, .panel);
+    registerMissionControlOperationHits(state, geometry);
+    state.addHit(geometry.close_button, .mission_control_close);
+}
+
+fn registerMissionControlOperationHits(state: *controller, geometry: MissionControlGeometry) void {
+    const clip = if (geometry.mode == .narrow) geometry.summary else geometry.operations;
+    const operations_origin = if (geometry.mode == .narrow)
+        geometry.summary.y - state.mission_control_body_scroll_y + missionControlSummaryHeight(&state.presentation, geometry.summary.w) + companionScaled(12.0)
+    else
+        geometry.operations.y - state.mission_control_operations_scroll_y;
+    var y = operations_origin + companionScaled(12.0);
+    const frame = &state.presentation;
+    const counts = frame.activeCounts();
+    if (counts.working + counts.pending > 0) {
+        y += companionScaled(27.0);
+        for (0..frame.operation_count) |index| {
+            if (!frame.operations[index].active()) continue;
+            registerMissionControlCardHit(state, clip, &y, frame.operationReference(index));
+        }
+    }
+    if (frame.recentCount() > 0) {
+        y += companionScaled(27.0);
+        var shown: usize = 0;
+        for (0..frame.operation_count) |index| {
+            if (frame.operations[index].active() or shown == 5) continue;
+            registerMissionControlCardHit(state, clip, &y, frame.operationReference(index));
+            shown += 1;
+        }
+    }
+
+    const reference = state.selected_operation orelse return;
+    const operation = frame.operationForReference(&reference) orelse return;
+    const inspector_clip = if (geometry.mode == .narrow) geometry.summary else geometry.inspector;
+    const inspector_origin = if (geometry.mode == .narrow)
+        operations_origin + missionControlOperationsHeight(frame) + companionScaled(12.0)
+    else
+        geometry.inspector.y - state.mission_control_inspector_scroll_y;
+    const inspector = missionOperationInspectorRect(inspector_clip, inspector_origin + companionScaled(12.0), operation);
+    const controls = inspectorControlRects(inspector, reference.actions);
+    if (controls.stop) |rect| if (intersectRects(rect, inspector_clip)) |hit_rect| state.addOperationHit(hit_rect, .operation_stop, reference);
+    if (controls.follow_log) |rect| if (intersectRects(rect, inspector_clip)) |hit_rect| state.addOperationHit(hit_rect, .operation_follow_log, reference);
+}
+
+fn registerMissionControlCardHit(state: *controller, clip: palette.Rect, y: *f32, reference: ?controller.OperationReference) void {
+    const card = operationCardRect(clip, y.*, companionScaled(72.0));
+    if (reference) |value| if (value.actions.inspect) if (intersectRects(card, clip)) |hit_rect| {
+        state.addOperationHit(hit_rect, .operation_select, value);
+    };
+    y.* += companionScaled(79.0);
+}
+
+fn scrollMissionControlAt(state: *runtime.AppState, x: f32, y: f32, delta: f32) void {
+    const geometry = computeMissionControlGeometry(state.companion_controller.frame_width, state.companion_controller.frame_height, companionScale());
+    if (geometry.mode == .narrow) {
+        if (pointInRect(geometry.body, x, y)) {
+            const max_scroll = @max(missionControlNarrowHeight(&state.companion_controller, geometry.summary.w) - geometry.summary.h, 0.0);
+            state.companion_controller.scrollMissionControl(.body, delta, max_scroll);
+            state.markDirty();
+        }
+        return;
+    }
+    const region: controller.MissionControlScrollRegion = if (pointInRect(geometry.summary, x, y))
+        .summary
+    else if (pointInRect(geometry.operations, x, y))
+        .operations
+    else if (pointInRect(geometry.inspector, x, y))
+        .inspector
+    else
+        return;
+    const max_scroll = switch (region) {
+        .summary => @max(missionControlSummaryHeight(&state.companion_controller.presentation, geometry.summary.w) - geometry.summary.h, 0.0),
+        .operations => @max(missionControlOperationsHeight(&state.companion_controller.presentation) - geometry.operations.h, 0.0),
+        .inspector => @max(missionControlInspectorHeight(&state.companion_controller) - geometry.inspector.h, 0.0),
+        .body => unreachable,
+    };
+    state.companion_controller.scrollMissionControl(region, delta, max_scroll);
+    state.markDirty();
+}
+
+// Full-window Mission Control region above workspace panes and below true modals.
+fn renderMissionControl(state: *runtime.AppState, geometry: MissionControlGeometry) void {
+    const chrome = theme.companionChrome();
+    queueRect(state, geometry.window, color(surface()));
+    renderMissionControlHeader(state, geometry);
+    if (geometry.mode == .narrow) {
+        renderMissionControlNarrowBody(state, geometry);
+        return;
+    }
+    inline for (.{ geometry.summary, geometry.operations, geometry.inspector }) |column| {
+        queuePanel(state, column, color(chrome.surface_deep), color(chrome.border), companionScaled(10.0), companionScaled(1.0));
+    }
+    var summary_y = geometry.summary.y - state.companion_controller.mission_control_summary_scroll_y;
+    renderMissionControlSummary(state, geometry.summary, &summary_y);
+    var operations_y = geometry.operations.y - state.companion_controller.mission_control_operations_scroll_y;
+    renderMissionControlOperations(state, geometry.operations, &operations_y);
+    var inspector_y = geometry.inspector.y - state.companion_controller.mission_control_inspector_scroll_y;
+    renderMissionControlInspector(state, geometry.inspector, &inspector_y);
+}
+
+// Mission Control identity, exact Frame summary, and close-only header region.
+fn renderMissionControlHeader(state: *runtime.AppState, geometry: MissionControlGeometry) void {
+    const chrome = theme.companionChrome();
+    const character = activeCompanionCharacter(state);
+    queueRect(state, geometry.header, color(chrome.surface_deep));
+    const portrait = compactCharacterRect(geometry.header, character, companionScale());
+    renderCompanionCharacter(state, portrait, state.companion_controller.visualState(), character, .compact);
+    const title_x = portrait.x + companionScaled(39.0);
+    queueBoldText(state, .{ .x = title_x, .y = geometry.header.y + companionScaled(10.0), .w = companionScaled(116.0), .h = companionScaled(19.0) }, "Mission Control", color(chrome.text), companionScaled(13.0), geometry.header);
+    const frame = &state.companion_controller.presentation;
+    const counts = frame.activeCounts();
+    const summary = if (frame.has_failure)
+        "Needs attention"
+    else if (frame.working or counts.working + counts.pending > 0)
+        framePrint(state, "{d} working · {d} pending", .{ counts.working, counts.pending })
+    else if (std.mem.trim(u8, frame.answer.slice(), " \t\r\n").len > 0 or frame.recentCount() > 0)
+        "Done"
+    else
+        "Ready";
+    queueMonoText(state, .{ .x = title_x + companionScaled(124.0), .y = geometry.header.y + companionScaled(13.0), .w = @max(geometry.close_button.x - title_x - companionScaled(136.0), 0.0), .h = companionScaled(16.0) }, summary, color(if (frame.has_failure) chrome.danger else chrome.text_subtle), companionScaled(10.5), geometry.header);
+    queuePanel(state, geometry.close_button, color(chrome.surface), color(chrome.border), companionScaled(6.0), companionScaled(1.0));
+    queueCenteredText(state, geometry.close_button, "×", color(chrome.text_muted), companionScaled(12.0), .ui_bold, geometry.close_button);
+    queueRect(state, .{ .x = 0.0, .y = geometry.header.y + geometry.header.h - companionScaled(1.0), .w = geometry.header.w, .h = companionScaled(1.0) }, color(chrome.hairline));
+}
+
+// Narrow Mission Control body region with one direct vertical scroll owner.
+fn renderMissionControlNarrowBody(state: *runtime.AppState, geometry: MissionControlGeometry) void {
+    const chrome = theme.companionChrome();
+    const column = geometry.summary;
+    queuePanel(state, column, color(chrome.surface_deep), color(chrome.border), companionScaled(10.0), companionScaled(1.0));
+    var y = column.y - state.companion_controller.mission_control_body_scroll_y;
+    renderMissionControlSummary(state, column, &y);
+    y += companionScaled(12.0);
+    renderMissionControlOperations(state, column, &y);
+    y += companionScaled(12.0);
+    renderMissionControlInspector(state, column, &y);
+}
+
+// Mission Control objective, truthful result, and fixed ownership boundaries region.
+fn renderMissionControlSummary(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
+    const chrome = theme.companionChrome();
+    const frame = &state.companion_controller.presentation;
+    y.* += companionScaled(12.0);
+    queueBoldText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = @max(clip.w - companionScaled(24.0), 0.0), .h = companionScaled(15.0) }, "OBJECTIVE", color(chrome.text_subtle), companionScaled(9.5), clip);
+    y.* += companionScaled(20.0);
+    const objective = std.mem.trim(u8, frame.objective.slice(), " \t\r\n");
+    const objective_w = @max(clip.w - companionScaled(24.0), 0.0);
+    queueBoldText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = objective_w, .h = companionScaled(18.0) }, truncatedText(state, .ui_bold, companionScaled(12.0), objective_w, singleLineText(state, if (objective.len > 0) objective else "No active objective")), color(chrome.text), companionScaled(12.0), clip);
+    y.* += companionScaled(24.0);
+    if (frame.workspace_id.slice().len > 0) {
+        queueBoldText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = companionScaled(66.0), .h = companionScaled(15.0) }, "Workspace", color(chrome.text_subtle), companionScaled(9.0), clip);
+        queueText(state, .{ .x = clip.x + companionScaled(78.0), .y = y.*, .w = @max(clip.w - companionScaled(90.0), 0.0), .h = companionScaled(15.0) }, truncatedText(state, .ui, companionScaled(10.0), @max(clip.w - companionScaled(90.0), 0.0), frame.workspace_id.slice()), color(chrome.text), companionScaled(10.0), clip);
+    }
+    y.* += companionScaled(20.0);
+    const counts = frame.activeCounts();
+    queueMonoText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = @max(clip.w - companionScaled(24.0), 0.0), .h = companionScaled(15.0) }, framePrint(state, "{d} working · {d} pending", .{ counts.working, counts.pending }), color(chrome.text_subtle), companionScaled(9.5), clip);
+    y.* += companionScaled(24.0);
+    if (frame.has_failure) {
+        queueBoldText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = @max(clip.w - companionScaled(24.0), 0.0), .h = companionScaled(16.0) }, "NEEDS ATTENTION", color(chrome.danger), companionScaled(10.0), clip);
+        y.* += companionScaled(24.0);
+    }
+    if (resultCardVisible(frame)) renderMissionControlResult(state, clip, y);
+    queueBoldText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = @max(clip.w - companionScaled(24.0), 0.0), .h = companionScaled(15.0) }, "BOUNDARIES", color(chrome.text_subtle), companionScaled(9.5), clip);
+    y.* += companionScaled(21.0);
+    queueText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = @max(clip.w - companionScaled(24.0), 0.0), .h = companionScaled(16.0) }, "Closing this view never stops work.", color(chrome.text), companionScaled(10.0), clip);
+    y.* += companionScaled(19.0);
+    queueText(state, .{ .x = clip.x + companionScaled(12.0), .y = y.*, .w = @max(clip.w - companionScaled(24.0), 0.0), .h = companionScaled(32.0) }, "Stopping one operation never touches processes owned by another task.", color(chrome.text), companionScaled(10.0), clip);
+    y.* += companionScaled(46.0);
+}
+
+fn renderMissionControlResult(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
+    const frame = &state.companion_controller.presentation;
+    const chrome = theme.companionChrome();
+    const rect = operationCardRect(clip, y.*, missionControlResultHeight(frame, clip.w));
+    const failed = frame.answer_failed and !frame.working;
+    queuePanelClipped(state, rect, color(if (failed) chrome.failure_card else chrome.surface), color(if (failed) chrome.failure_border else chrome.hairline), companionScaled(9.0), companionScaled(1.0), clip);
+    queueBoldText(state, .{ .x = rect.x + companionScaled(11.0), .y = rect.y + companionScaled(9.0), .w = @max(rect.w - companionScaled(90.0), 0.0), .h = companionScaled(15.0) }, companionCharacterResultHeading(activeCompanionCharacter(state)), color(chrome.text_subtle), companionScaled(9.5), clip);
+    const verdict = if (frame.working) "WORKING" else if (failed) "FAILED" else "DONE";
+    queueBoldText(state, .{ .x = rect.x + @max(rect.w - companionScaled(70.0), 0.0), .y = rect.y + companionScaled(9.0), .w = companionScaled(58.0), .h = companionScaled(15.0) }, verdict, color(if (failed) chrome.danger else if (frame.working) chrome.accent else chrome.identity_fg), companionScaled(9.0), clip);
+    const answer = std.mem.trim(u8, frame.answer.slice(), " \t\r\n");
+    const wrapped = wrapResultText(answer, @max(rect.w - companionScaled(22.0), 0.0));
+    if (wrapped.count == 0) {
+        queueText(state, .{ .x = rect.x + companionScaled(11.0), .y = rect.y + companionScaled(30.0), .w = @max(rect.w - companionScaled(22.0), 0.0), .h = companionScaled(16.0) }, if (frame.working) "Working — no reply yet." else "The run failed before replying.", color(if (failed) chrome.failure_fg else chrome.text_subtle), companionScaled(10.0), clip);
+    } else for (wrapped.lines[0..@min(wrapped.count, 4)], 0..) |line, index| {
+        const last = index + 1 == @min(wrapped.count, 4);
+        const value = if (last and (wrapped.truncated or wrapped.count > 4)) framePrint(state, "{s}…", .{line}) else line;
+        queueText(state, .{ .x = rect.x + companionScaled(11.0), .y = rect.y + companionScaled(30.0 + 17.0 * @as(f32, @floatFromInt(index))), .w = @max(rect.w - companionScaled(22.0), 0.0), .h = companionScaled(16.0) }, value, color(if (failed) chrome.failure_fg else chrome.text), companionScaled(10.0), clip);
+    }
+    y.* += rect.h + companionScaled(12.0);
+}
+
+// Mission Control active and bounded recent operation cards region.
+fn renderMissionControlOperations(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
+    const frame = &state.companion_controller.presentation;
+    y.* += companionScaled(12.0);
+    const counts = frame.activeCounts();
+    const active_total = counts.working + counts.pending;
+    if (active_total > 0) {
+        renderSectionHeader(state, clip, y, "ACTIVE OPERATIONS", framePrint(state, "{d}", .{active_total}));
+        for (0..frame.operation_count) |index| {
+            const operation = &frame.operations[index];
+            if (!operation.active()) continue;
+            const reference = frame.operationReference(index);
+            renderOperationCard(state, clip, y, operation.title.slice(), operation.detail.slice(), operation.status, true, if (reference) |value| state.companion_controller.operationSelected(&value) else false);
+        }
+    }
+    const recent_total = frame.recentCount();
+    if (recent_total > 0) {
+        renderSectionHeader(state, clip, y, "RECENT", framePrint(state, "{d}", .{recent_total}));
+        var shown: usize = 0;
+        for (0..frame.operation_count) |index| {
+            const operation = &frame.operations[index];
+            if (operation.active() or shown == 5) continue;
+            const reference = frame.operationReference(index);
+            renderOperationCard(state, clip, y, operation.title.slice(), operation.detail.slice(), operation.status, true, if (reference) |value| state.companion_controller.operationSelected(&value) else false);
+            shown += 1;
+        }
+    }
+    if (active_total == 0 and recent_total == 0) renderEmptyBody(state, clip, y, "No operations", "The current Companion frame has no operations.");
+}
+
+// Mission Control exact selected-operation inspector region.
+fn renderMissionControlInspector(state: *runtime.AppState, clip: palette.Rect, y: *f32) void {
+    y.* += companionScaled(12.0);
+    const reference = state.companion_controller.selected_operation orelse {
+        renderEmptyBody(state, clip, y, "Select an operation", "Details for the selected operation appear here.");
+        return;
+    };
+    const operation = state.companion_controller.presentation.operationForReference(&reference) orelse {
+        renderEmptyBody(state, clip, y, "Select an operation", "Details for the selected operation appear here.");
+        return;
+    };
+    renderMissionOperationInspector(state, clip, y, operation, reference);
 }
 
 // Collapsed Companion chip region.
@@ -417,7 +822,12 @@ fn renderHeader(state: *runtime.AppState, geometry: Geometry) void {
     const title_x = portrait.x + 38.0 * scale;
     queueBoldText(state, .{ .x = title_x, .y = geometry.header.y + 11.0 * scale, .w = 48.0 * scale, .h = 18.0 * scale }, companionCharacterName(character), color(chrome.text), 13.0 * scale, geometry.header);
     const status = headerStatus(state);
-    queueMonoText(state, .{ .x = title_x + 52.0 * scale, .y = geometry.header.y + 13.0 * scale, .w = @max(geometry.close_button.x - title_x - 57.0 * scale, 0.0), .h = 16.0 * scale }, status, color(chrome.text_subtle), 10.5 * scale, geometry.header);
+    queueMonoText(state, .{ .x = title_x + 52.0 * scale, .y = geometry.header.y + 13.0 * scale, .w = @max(geometry.mission_control_button.x - title_x - 57.0 * scale, 0.0), .h = 16.0 * scale }, status, color(chrome.text_subtle), 10.5 * scale, geometry.header);
+    if (geometry.mission_control_button.w >= 92.0 * scale) {
+        queuePanel(state, geometry.mission_control_button, color(chrome.surface_deep), color(chrome.border), 6.0 * scale, 1.0 * scale);
+        queueText(state, .{ .x = geometry.mission_control_button.x + 8.0 * scale, .y = geometry.mission_control_button.y + 6.0 * scale, .w = 13.0 * scale, .h = 15.0 * scale }, "▦", color(chrome.accent), 10.0 * scale, geometry.mission_control_button);
+        queueBoldText(state, .{ .x = geometry.mission_control_button.x + 24.0 * scale, .y = geometry.mission_control_button.y + 5.0 * scale, .w = @max(geometry.mission_control_button.w - 30.0 * scale, 0.0), .h = 16.0 * scale }, "Mission Control", color(chrome.text), 9.5 * scale, geometry.mission_control_button);
+    }
     // The collapse affordance fills with the header surface it sits on: border
     // commands without a real fill halo white at every anti-aliased corner
     // because the SDF shader composites border fringes toward the fill color.
@@ -852,7 +1262,7 @@ fn renderOperationCard(state: *runtime.AppState, clip: palette.Rect, y: *f32, ti
     const chrome = theme.companionChrome();
     const failed = status == .failed;
     const indicator = operationStatusColor(chrome, status);
-    const card: palette.Rect = .{ .x = clip.x + 12.0 * scale, .y = y.*, .w = @max(clip.w - 24.0 * scale, 0.0), .h = 72.0 * scale };
+    const card = operationCardRect(clip, y.*, 72.0 * scale);
     const card_fill = if (failed) opaqueOver(surface(), chrome.failure_card) else chrome.surface_deep;
     const card_stroke = opaqueOver(card_fill, if (selected) chrome.accent else if (failed) chrome.failure_border else chrome.hairline);
     queuePanelClipped(state, card, color(card_fill), color(card_stroke), 10.0 * scale, 1.0 * scale, clip);
@@ -905,7 +1315,16 @@ fn activityOperationReference(frame: *const controller.Frame, item: *const contr
 }
 
 fn inspectorHeight(operation: *const controller.Operation) f32 {
-    const row_count = inspectorMetadataRowCount(operation) + @as(usize, if (inspectorOutput(operation) != null) 1 else 0);
+    return operationInspectorHeight(operation, false);
+}
+
+fn missionInspectorHeight(operation: *const controller.Operation) f32 {
+    return operationInspectorHeight(operation, true);
+}
+
+fn operationInspectorHeight(operation: *const controller.Operation, include_detail: bool) f32 {
+    const row_count = inspectorMetadataRowCount(operation) + @as(usize, if (inspectorOutput(operation) != null) 1 else 0) +
+        @as(usize, if (include_detail and inspectorDetail(operation) != null) 1 else 0);
     const controls: f32 = if (operation.actions.stop or operation.actions.follow_log) companionScaled(34.0) else 0.0;
     return companionScaled(36.0 + 19.0 * @as(f32, @floatFromInt(row_count))) + controls;
 }
@@ -944,6 +1363,20 @@ fn inspectorOutput(operation: *const controller.Operation) ?[]const u8 {
     return if (output.len > 0) output else null;
 }
 
+fn inspectorDetail(operation: *const controller.Operation) ?[]const u8 {
+    const detail = std.mem.trim(u8, operation.detail.slice(), " \t\r\n");
+    return if (detail.len > 0) detail else null;
+}
+
+fn missionOperationInspectorRect(clip: palette.Rect, y: f32, operation: *const controller.Operation) palette.Rect {
+    return .{
+        .x = clip.x + companionScaled(12.0),
+        .y = y,
+        .w = @max(clip.w - companionScaled(24.0), 0.0),
+        .h = missionInspectorHeight(operation),
+    };
+}
+
 fn inspectorControlRects(rect: palette.Rect, actions: controller.SupportedActions) InspectorControls {
     const count: usize = @as(usize, @intFromBool(actions.stop)) + @as(usize, @intFromBool(actions.follow_log));
     if (count == 0) return .{};
@@ -970,13 +1403,29 @@ fn renderOperationInspector(
     operation: *const controller.Operation,
     reference: controller.OperationReference,
 ) void {
+    renderOperationInspectorContents(state, clip, y, operation, reference, false);
+}
+
+fn renderMissionOperationInspector(
+    state: *runtime.AppState,
+    clip: palette.Rect,
+    y: *f32,
+    operation: *const controller.Operation,
+    reference: controller.OperationReference,
+) void {
+    renderOperationInspectorContents(state, clip, y, operation, reference, true);
+}
+
+fn renderOperationInspectorContents(
+    state: *runtime.AppState,
+    clip: palette.Rect,
+    y: *f32,
+    operation: *const controller.Operation,
+    reference: controller.OperationReference,
+    include_detail: bool,
+) void {
     const chrome = theme.companionChrome();
-    const rect: palette.Rect = .{
-        .x = clip.x + companionScaled(12.0),
-        .y = y.*,
-        .w = @max(clip.w - companionScaled(24.0), 0.0),
-        .h = inspectorHeight(operation),
-    };
+    const rect = if (include_detail) missionOperationInspectorRect(clip, y.*, operation) else operationInspectorRect(clip, y.*, operation);
     queuePanelClipped(state, rect, color(chrome.surface_deep), color(chrome.accent), companionScaled(9.0), companionScaled(1.0), clip);
     queueRoundedRectClipped(state, .{ .x = rect.x, .y = rect.y, .w = companionScaled(3.0), .h = rect.h }, color(chrome.accent), companionScaled(1.5), clip);
     const title = if (operation.title.slice().len > 0) operation.title.slice() else "Operation details";
@@ -985,6 +1434,7 @@ fn renderOperationInspector(
 
     var row_y = rect.y + companionScaled(29.0);
     if (inspectorOutput(operation)) |value| renderInspectorRow(state, clip, rect, &row_y, "Output", value);
+    if (include_detail) if (inspectorDetail(operation)) |value| renderInspectorRow(state, clip, rect, &row_y, "Detail", value);
     const inspector = &operation.inspector;
     renderInspectorRowIfPresent(state, clip, rect, &row_y, "Owner", inspector.owner.slice());
     renderInspectorRowIfPresent(state, clip, rect, &row_y, "Workspace", inspector.workspace.slice());
@@ -3391,14 +3841,14 @@ test "dedicated hits include Sprout overflow and preserve outside pass through" 
 
     state.show();
     registerHits(&state, geometry, false);
-    try std.testing.expectEqual(@as(usize, 5), state.hit_count);
+    try std.testing.expectEqual(@as(usize, 6), state.hit_count);
     try std.testing.expect(state.hitAt(geometry.sidecar.x + 2.0, geometry.sidecar.y + geometry.header.h + 2.0) == .panel);
     try std.testing.expect(state.hitAt(geometry.body.x + 2.0, geometry.body.y + 2.0) == .body);
     try std.testing.expect(state.hitAt(10.0, 10.0) == null);
     try std.testing.expect(!pointInRect(geometry.sidecar, 10.0, 10.0));
 
     registerHits(&state, geometry, true);
-    try std.testing.expectEqual(@as(usize, 7), state.hit_count);
+    try std.testing.expectEqual(@as(usize, 8), state.hit_count);
     const buttons = approvalButtonRects(geometry.body, state.currentScrollY());
     try std.testing.expect(state.hitAt(buttons[1].x + 1.0, buttons[1].y + 1.0) == .approve);
 }
@@ -3424,7 +3874,7 @@ test "production hit refresh follows one approval projection snapshot" {
     };
 
     refreshHits(&state, 900.0, 700.0);
-    try std.testing.expectEqual(@as(usize, 5), state.companion_controller.hit_count);
+    try std.testing.expectEqual(@as(usize, 6), state.companion_controller.hit_count);
 
     thread.send_state.status = .pending;
     thread.send_state.pending_approval = .{
@@ -3433,16 +3883,16 @@ test "production hit refresh follows one approval projection snapshot" {
         .body = try std.heap.page_allocator.dupe(u8, "Proceed?"),
     };
     refreshHits(&state, 900.0, 700.0);
-    try std.testing.expectEqual(@as(usize, 7), state.companion_controller.hit_count);
+    try std.testing.expectEqual(@as(usize, 8), state.companion_controller.hit_count);
 
     thread.send_state.approval_decision = .approve;
     refreshHits(&state, 900.0, 700.0);
-    try std.testing.expectEqual(@as(usize, 5), state.companion_controller.hit_count);
+    try std.testing.expectEqual(@as(usize, 6), state.companion_controller.hit_count);
 
     thread.send_state.approval_decision = null;
     thread.send_state.control_error_message = try std.heap.page_allocator.dupe(u8, "rejected");
     refreshHits(&state, 900.0, 700.0);
-    try std.testing.expectEqual(@as(usize, 7), state.companion_controller.hit_count);
+    try std.testing.expectEqual(@as(usize, 8), state.companion_controller.hit_count);
     try std.testing.expect(state.companion_controller.has_failure);
 
     const stale_title = state.companion_controller.presentation.approval_title;
@@ -3450,11 +3900,11 @@ test "production hit refresh follows one approval projection snapshot" {
     thread.send_state.approval_decision = .approve;
     refreshHits(&state, 900.0, 700.0);
     try std.testing.expectEqualStrings(stale_title.slice(), state.companion_controller.presentation.approval_title.slice());
-    try std.testing.expectEqual(@as(usize, 7), state.companion_controller.hit_count);
+    try std.testing.expectEqual(@as(usize, 8), state.companion_controller.hit_count);
     thread.send_state.mutex.unlock();
 
     refreshHits(&state, 900.0, 700.0);
-    try std.testing.expectEqual(@as(usize, 5), state.companion_controller.hit_count);
+    try std.testing.expectEqual(@as(usize, 6), state.companion_controller.hit_count);
 }
 
 test "production hit refresh clears cross-owner approval under contention and retains same owner frame" {
@@ -3491,7 +3941,7 @@ test "production hit refresh clears cross-owner approval under contention and re
     };
     refreshHits(&state, 900.0, 700.0);
     try std.testing.expectEqualStrings("owner-a", state.companion_controller.presentation.workspace_id.slice());
-    try std.testing.expectEqual(@as(usize, 7), state.companion_controller.hit_count);
+    try std.testing.expectEqual(@as(usize, 8), state.companion_controller.hit_count);
 
     state.companion_controller.selectTab(.activity);
     state.companion_controller.activity_scroll_y = 40.0;
@@ -3505,7 +3955,7 @@ test "production hit refresh clears cross-owner approval under contention and re
     try std.testing.expect(!state.companion_controller.presentation.has_approval);
     try std.testing.expectEqual(controller.Tab.run, state.companion_controller.selected_tab);
     try std.testing.expectEqual(@as(f32, 0.0), state.companion_controller.activity_scroll_y);
-    try std.testing.expectEqual(@as(usize, 5), state.companion_controller.hit_count);
+    try std.testing.expectEqual(@as(usize, 6), state.companion_controller.hit_count);
     thread_b.send_state.mutex.unlock();
 
     thread_b.send_state.status = .pending;
@@ -4192,6 +4642,325 @@ fn expectInspectorBackedTextCommand(batch: *const palette.RenderBatch, expected:
         return;
     }
     return error.MissingExpectedInspectorText;
+}
+
+test "Mission Control responsive geometry stays bounded across required viewports" {
+    const cases = [_]struct {
+        width: f32,
+        height: f32,
+        scale: f32,
+        mode: MissionControlMode,
+    }{
+        .{ .width = 1600.0, .height = 1000.0, .scale = 1.0, .mode = .wide },
+        .{ .width = 1280.0, .height = 720.0, .scale = 1.0, .mode = .wide },
+        .{ .width = 900.0, .height = 720.0, .scale = 1.0, .mode = .laptop },
+        .{ .width = 1000.0, .height = 500.0, .scale = 1.0, .mode = .narrow },
+        .{ .width = 2000.0, .height = 1250.0, .scale = 1.25, .mode = .wide },
+    };
+    for (cases) |case| {
+        const geometry = computeMissionControlGeometry(case.width, case.height, case.scale);
+        try std.testing.expectEqual(case.mode, geometry.mode);
+        inline for (.{ geometry.header, geometry.close_button, geometry.body, geometry.summary, geometry.operations, geometry.inspector }) |rect| {
+            try std.testing.expect(rect.w >= 0.0 and rect.h >= 0.0);
+            try std.testing.expect(rectFitsWindow(rect, geometry.window.w, geometry.window.h));
+        }
+        try std.testing.expectApproxEqAbs(@min(48.0 * case.scale, case.height), geometry.header.h, 0.001);
+        if (geometry.mode == .wide) {
+            try std.testing.expect(geometry.summary.w >= 220.0 * case.scale and geometry.summary.w <= 280.0 * case.scale);
+            try std.testing.expect(geometry.inspector.w >= 260.0 * case.scale and geometry.inspector.w <= 320.0 * case.scale);
+            try std.testing.expect(geometry.operations.w > 0.0);
+        }
+    }
+}
+
+test "Mission Control render and hits share one bounded Frame and exact references" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    state.allocator = allocator;
+    state.app_config = .{ .companion_character = .moss };
+    state.project_controller = .{};
+    state.companion_controller = controller.init();
+    state.companion_composer = @TypeOf(state.companion_composer).init();
+    state.palette_overlay_batch = .{};
+    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.companion_composer.deinit(allocator);
+        state.palette_overlay_batch.deinit(allocator);
+        state.palette_frame_text_arena.deinit();
+    }
+    var project = try runtime.Project.init(allocator, "mission-frame", "Mission", "/tmp/mission-frame", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+
+    var frame: controller.Frame = .{ .has_thread = true, .working = true, .has_approval = true };
+    try std.testing.expect(frame.setOwner("mission-frame", "thread:mission"));
+    frame.objective.set("Keep the current owner in charge");
+    frame.answer.set("Exact frame result");
+    var id_buffer: [48]u8 = undefined;
+    for (0..controller.MAX_OPERATIONS) |index| {
+        var operation: controller.Operation = .{
+            .status = if (index < controller.MAX_OPERATIONS - 5) .in_progress else .completed,
+            .sequence = @intCast(index),
+        };
+        operation.identity.set(try std.fmt.bufPrint(&id_buffer, "mission-operation-{d}", .{index}));
+        operation.title.set(if (index == 0) "Exact selected operation" else "Bounded operation");
+        operation.detail.set(if (index == 0) "exact operation detail" else "bounded detail");
+        if (index == 0) {
+            var task_id: controller.ExactText = .{};
+            try std.testing.expect(task_id.set("task:mission"));
+            var command: controller.ExactText = .{};
+            try std.testing.expect(command.set("exact operation detail"));
+            var target: controller.BackgroundTarget = .{ .identity = .{ .task_id = task_id }, .command = command };
+            try std.testing.expect(target.log_path.set("/tmp/mission.log"));
+            operation.category = .background_task;
+            operation.target = .{ .background_task = target };
+            operation.actions = .{ .inspect = true, .stop = true, .follow_log = true };
+            operation.inspector.output.set("exact inspector output");
+            operation.inspector.owner.set("exact owner");
+        }
+        frame.upsertOperation(operation);
+    }
+    frame.sortOperations();
+    state.companion_controller.setFrame(frame);
+    state.companion_controller.openMissionControl();
+    const immutable_frame = state.companion_controller.presentation;
+    const selected = state.companion_controller.selected_operation.?;
+    const geometry = computeMissionControlGeometry(1600.0, 4000.0, 1.0);
+    prepareAndRegisterMissionControlHits(&state.companion_controller, geometry);
+    try std.testing.expect(state.companion_controller.hit_count <= state.companion_controller.hits.len);
+    var select_count: usize = 0;
+    var stop_count: usize = 0;
+    var follow_count: usize = 0;
+    for (state.companion_controller.hits[0..state.companion_controller.hit_count]) |hit| switch (hit.action) {
+        .operation_select => {
+            select_count += 1;
+            try std.testing.expect(state.companion_controller.presentation.containsReference(&hit.reference.?));
+        },
+        .operation_stop => {
+            stop_count += 1;
+            try std.testing.expect(hit.reference.?.eql(&selected));
+        },
+        .operation_follow_log => {
+            follow_count += 1;
+            try std.testing.expect(hit.reference.?.eql(&selected));
+        },
+        .approve, .deny => return error.MissionControlExposedApproval,
+        else => {},
+    };
+    try std.testing.expectEqual(controller.MAX_OPERATIONS, select_count);
+    try std.testing.expectEqual(@as(usize, 1), stop_count);
+    try std.testing.expectEqual(@as(usize, 1), follow_count);
+
+    render(&state, 1600.0, 1000.0);
+    inline for (.{
+        "Mission Control",
+        "Keep the current owner in charge",
+        "MOSS SAYS",
+        "ACTIVE OPERATIONS",
+        "RECENT",
+        "Exact selected operation",
+        "Output",
+        "exact inspector output",
+        "Detail",
+        "exact operation detail",
+        "BOUNDARIES",
+    }) |expected| try expectBatchText(&state.palette_overlay_batch, expected);
+    try std.testing.expectEqualDeep(immutable_frame, state.companion_controller.presentation);
+
+    var inspect_only = frame;
+    inspect_only.operations[0].actions = .{ .inspect = true };
+    state.companion_controller.setFrame(inspect_only);
+    state.companion_controller.openMissionControl();
+    prepareAndRegisterMissionControlHits(&state.companion_controller, geometry);
+    for (state.companion_controller.hits[0..state.companion_controller.hit_count]) |hit| {
+        try std.testing.expect(hit.action != .operation_stop);
+        try std.testing.expect(hit.action != .operation_follow_log);
+        try std.testing.expect(hit.action != .approve and hit.action != .deny);
+    }
+}
+
+test "Mission Control routes independent and narrow direct scroll without sidecar cross-talk" {
+    var frame: controller.Frame = .{ .has_thread = true, .working = true, .has_failure = true };
+    try std.testing.expect(frame.setOwner("scroll-workspace", "scroll-thread"));
+    frame.objective.set("Exercise every direct scroll owner");
+    frame.answer.set("One two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty.");
+    var id_buffer: [32]u8 = undefined;
+    for (0..12) |index| {
+        var operation: controller.Operation = .{ .status = .in_progress, .sequence = @intCast(index) };
+        operation.identity.set(try std.fmt.bufPrint(&id_buffer, "scroll-{d}", .{index}));
+        operation.title.set("Scrollable operation");
+        operation.detail.set("scrollable detail");
+        if (index == 0) {
+            operation.actions = .{ .inspect = true, .stop = true, .follow_log = true };
+            operation.inspector.output.set("scroll output");
+            operation.inspector.owner.set("owner");
+            operation.inspector.workspace.set("workspace");
+            operation.inspector.action.set("action");
+            operation.inspector.target.set("target");
+            operation.inspector.provider.set("provider");
+            operation.inspector.cwd.set("/tmp");
+            operation.inspector.state.set("running");
+            operation.inspector.wait_reason.set("waiting");
+            operation.inspector.failure_reason.set("failure");
+            operation.inspector.locations.set("location");
+            for (0..controller.MAX_INSPECTOR_FILES) |file_index| {
+                operation.inspector.files[file_index].set("file.zig");
+            }
+            operation.inspector.file_count = controller.MAX_INSPECTOR_FILES;
+            for (0..controller.MAX_INSPECTOR_RESOURCES) |resource_index| {
+                operation.inspector.resources[resource_index].set("lease:resource");
+            }
+            operation.inspector.resource_count = controller.MAX_INSPECTOR_RESOURCES;
+            operation.inspector.started_at_ms = 1;
+            operation.inspector.updated_at_ms = 2;
+            operation.inspector.elapsed_ms = 1;
+        }
+        frame.upsertOperation(operation);
+    }
+    frame.sortOperations();
+
+    var state: runtime.AppState = undefined;
+    state.allocator = std.testing.allocator;
+    state.lifecycle = .{};
+    state.companion_controller = controller.init();
+    state.companion_controller.setFrame(frame);
+    state.companion_controller.openMissionControl();
+    state.companion_controller.body_scroll_y = 17.0;
+    state.companion_controller.frame_width = 900.0;
+    state.companion_controller.frame_height = 520.0;
+    const laptop = computeMissionControlGeometry(900.0, 520.0, 1.0);
+    try std.testing.expectEqual(MissionControlMode.laptop, laptop.mode);
+    prepareAndRegisterMissionControlHits(&state.companion_controller, laptop);
+    try std.testing.expect(handleWheel(&state, laptop.summary.x + 2.0, laptop.summary.y + 2.0, -1.0));
+    try std.testing.expect(state.companion_controller.mission_control_summary_scroll_y > 0.0);
+    try std.testing.expectEqual(@as(f32, 0.0), state.companion_controller.mission_control_operations_scroll_y);
+    try std.testing.expect(handleWheel(&state, laptop.operations.x + 2.0, laptop.operations.y + 2.0, -1.0));
+    try std.testing.expect(state.companion_controller.mission_control_operations_scroll_y > 0.0);
+    try std.testing.expect(handleWheel(&state, laptop.inspector.x + 2.0, laptop.inspector.y + 2.0, -1.0));
+    try std.testing.expect(state.companion_controller.mission_control_inspector_scroll_y > 0.0);
+    try std.testing.expectEqual(@as(f32, 17.0), state.companion_controller.body_scroll_y);
+
+    state.companion_controller.frame_width = 700.0;
+    state.companion_controller.frame_height = 500.0;
+    const narrow = computeMissionControlGeometry(700.0, 500.0, 1.0);
+    try std.testing.expectEqual(MissionControlMode.narrow, narrow.mode);
+    prepareAndRegisterMissionControlHits(&state.companion_controller, narrow);
+    const summary_before = state.companion_controller.mission_control_summary_scroll_y;
+    const operations_before = state.companion_controller.mission_control_operations_scroll_y;
+    try std.testing.expect(handleWheel(&state, narrow.body.x + narrow.body.w * 0.5, narrow.body.y + 2.0, -1.0));
+    try std.testing.expect(state.companion_controller.mission_control_body_scroll_y > 0.0);
+    try std.testing.expectEqual(summary_before, state.companion_controller.mission_control_summary_scroll_y);
+    try std.testing.expectEqual(operations_before, state.companion_controller.mission_control_operations_scroll_y);
+    try std.testing.expectEqual(@as(f32, 17.0), state.companion_controller.body_scroll_y);
+}
+
+test "public Mission Control entry preserves workspace state and stale actions reject visibly" {
+    const allocator = std.testing.allocator;
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.0);
+    var state: runtime.AppState = undefined;
+    state.allocator = allocator;
+    state.app_config = .{ .companion_character = .vireo };
+    state.project_controller = .{};
+    state.companion_controller = controller.init();
+    state.companion_controller.show();
+    state.companion_composer = @TypeOf(state.companion_composer).init();
+    state.palette_overlay_batch = .{};
+    state.palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator);
+    state.lifecycle = .{};
+    state.sidebar_collapsed = false;
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.companion_composer.deinit(allocator);
+        state.palette_overlay_batch.deinit(allocator);
+        state.palette_frame_text_arena.deinit();
+    }
+    var project_a = try runtime.Project.init(allocator, "mission-a", "Mission A", "/tmp/mission-a", 0);
+    _ = try project_a.ensureCompanionThread(allocator);
+    state.project_controller.projects.append(allocator, project_a) catch |err| {
+        project_a.deinit(allocator);
+        return err;
+    };
+    var project_b = try runtime.Project.init(allocator, "mission-b", "Mission B", "/tmp/mission-b", 0);
+    _ = try project_b.ensureCompanionThread(allocator);
+    state.project_controller.projects.append(allocator, project_b) catch |err| {
+        project_b.deinit(allocator);
+        return err;
+    };
+    const thread_a = state.threadByLocalId("mission-a", state.project_controller.projects.items[0].companion_thread_local_id.?).?;
+    thread_a.send_state.status = .pending;
+    thread_a.send_state.pending_approval = .{
+        .call_id = try std.heap.page_allocator.dupe(u8, "approval-without-mission-hit"),
+        .title = try std.heap.page_allocator.dupe(u8, "Approval remains elsewhere"),
+        .body = try std.heap.page_allocator.dupe(u8, "No Mission Control action"),
+    };
+    try thread_a.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "mission command"),
+        .task_id = try allocator.dupeZ(u8, "mission-task"),
+        .log_path = try allocator.dupeZ(u8, "/tmp/mission-task.log"),
+        .pid = 424_242,
+        .pid_verified = true,
+        .status = .running,
+    });
+
+    const project_index_before = state.project_controller.selected_index;
+    const selected_thread_before = state.project_controller.projects.items[0].selected_thread_index;
+    const pane_count_before = state.project_controller.projects.items[0].workspace_layout.panes.items.len;
+    const focused_pane_before = state.project_controller.projects.items[0].workspace_layout.focused_pane_id;
+    const dock_count_before = state.project_controller.projects.items[0].terminal_docks.items.len;
+    const sidebar_before = state.sidebar_collapsed;
+    const send_status_before = thread_a.send_state.status;
+    const stop_before = thread_a.background_tasks.items[0].stop_requested;
+    state.companion_composer.focused = true;
+
+    refreshHits(&state, 1280.0, 720.0);
+    var entry: ?palette.Rect = null;
+    for (state.companion_controller.hits[0..state.companion_controller.hit_count]) |hit| if (hit.action == .mission_control_open) {
+        entry = hit.rect;
+    };
+    const entry_rect = entry orelse return error.MissingMissionControlEntry;
+    try std.testing.expect(handleMouseButton(&state, entry_rect.x + 2.0, entry_rect.y + 2.0, 1, true, 1));
+    try std.testing.expect(handleMouseButton(&state, entry_rect.x + 2.0, entry_rect.y + 2.0, 1, false, 1));
+    try std.testing.expect(state.companion_controller.mission_control_open);
+    try std.testing.expect(!state.companion_composer.focused);
+    try std.testing.expectEqual(project_index_before, state.project_controller.selected_index);
+    try std.testing.expectEqual(selected_thread_before, state.project_controller.projects.items[0].selected_thread_index);
+    try std.testing.expectEqual(pane_count_before, state.project_controller.projects.items[0].workspace_layout.panes.items.len);
+    try std.testing.expectEqual(focused_pane_before, state.project_controller.projects.items[0].workspace_layout.focused_pane_id);
+    try std.testing.expectEqual(dock_count_before, state.project_controller.projects.items[0].terminal_docks.items.len);
+    try std.testing.expectEqual(sidebar_before, state.sidebar_collapsed);
+    try std.testing.expectEqual(send_status_before, thread_a.send_state.status);
+    try std.testing.expectEqual(stop_before, thread_a.background_tasks.items[0].stop_requested);
+
+    var stale_stop: ?controller.Hit = null;
+    for (state.companion_controller.hits[0..state.companion_controller.hit_count]) |hit| switch (hit.action) {
+        .operation_stop => stale_stop = hit,
+        .approve, .deny => return error.MissionControlExposedApproval,
+        else => {},
+    };
+    const stale = stale_stop orelse return error.MissingMissionControlStop;
+    const stale_reference = stale.reference.?;
+    try std.testing.expect(state.companion_controller.presentation.containsReference(&stale_reference));
+    render(&state, 1280.0, 720.0);
+    try expectBatchText(&state.palette_overlay_batch, "VIREO SAYS");
+
+    state.project_controller.selected_index = 1;
+    const b_panes_before = state.project_controller.projects.items[1].workspace_layout.panes.items.len;
+    const b_focus_before = state.project_controller.projects.items[1].workspace_layout.focused_pane_id;
+    try std.testing.expect(handleMouseButton(&state, stale.rect.x + 1.0, stale.rect.y + 1.0, 1, true, 1));
+    try std.testing.expect(handleMouseButton(&state, stale.rect.x + 1.0, stale.rect.y + 1.0, 1, false, 1));
+    try std.testing.expectEqual(@as(usize, 1), state.project_controller.selected_index);
+    try std.testing.expectEqual(b_panes_before, state.project_controller.projects.items[1].workspace_layout.panes.items.len);
+    try std.testing.expectEqual(b_focus_before, state.project_controller.projects.items[1].workspace_layout.focused_pane_id);
+    try std.testing.expect(!thread_a.background_tasks.items[0].stop_requested);
+    try std.testing.expectEqualStrings("This Companion operation is no longer available.", state.companion_controller.presentation.ui_error.slice());
 }
 
 test "Vireo brow arcs instead of a flat bar and pupil rests viewer-left" {

@@ -801,7 +801,7 @@ fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
 
 fn systemCursorForCompanionAction(action: companion_controller.HitAction) sdl.SystemCursor {
     return switch (action) {
-        .open, .collapse, .run_tab, .activity_tab, .approve, .deny, .operation_select, .operation_stop, .operation_follow_log => .pointer,
+        .open, .collapse, .mission_control_open, .mission_control_close, .run_tab, .activity_tab, .approve, .deny, .operation_select, .operation_stop, .operation_follow_log => .pointer,
         .panel, .body => .default,
     };
 }
@@ -864,7 +864,7 @@ test "browser cursor shapes map to cached SDL system cursor families" {
 }
 
 test "production Companion cursor and wheel routing preserves direct ownership" {
-    const interactive = [_]companion_controller.HitAction{ .open, .collapse, .run_tab, .activity_tab, .approve, .deny, .operation_select, .operation_stop, .operation_follow_log };
+    const interactive = [_]companion_controller.HitAction{ .open, .collapse, .mission_control_open, .mission_control_close, .run_tab, .activity_tab, .approve, .deny, .operation_select, .operation_stop, .operation_follow_log };
     for (interactive) |action| try std.testing.expectEqual(sdl.SystemCursor.pointer, systemCursorForCompanionAction(action));
     try std.testing.expectEqual(sdl.SystemCursor.default, systemCursorForCompanionAction(.panel));
     try std.testing.expectEqual(sdl.SystemCursor.default, systemCursorForCompanionAction(.body));
@@ -1493,6 +1493,17 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (state.companion_controller.mission_control_open) {
+                // True Palette modals remain above Mission Control. Otherwise
+                // the full-window overlay owns keys before pane/browser input.
+                if (ui_layout.handlePaletteKeyDown(state, &event.key)) {
+                    syncWindowTextInput(window, state);
+                    return true;
+                }
+                if (event.key.key == .escape) _ = ui_layout.handleCompanionEscapeKey(state, true);
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (terminal_panel_ui.handlePaletteKeyDown(state, &event.key)) {
                 syncWindowTextInput(window, state);
                 return true;
@@ -1697,6 +1708,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (state.companion_controller.mission_control_open) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (state.isNativeBrowserSurfaceFocused()) {
                 state.browser_controller.address_focused = false;
                 syncWindowTextInput(window, state);
@@ -1714,6 +1729,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             const text_input = std.mem.sliceTo(event.text.text, 0);
             if (suppressDuplicateMacosTextInput(text_input, event.text.timestamp)) return true;
             if (ui_layout.handlePaletteTextInput(state, text_input)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (state.companion_controller.mission_control_open) {
                 syncWindowTextInput(window, state);
                 return true;
             }
