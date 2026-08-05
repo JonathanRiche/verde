@@ -10,6 +10,12 @@ pub const MAX_FONT_SIZE: f32 = 32.0;
 pub const DEFAULT_TERMINAL_FONT_SIZE: f32 = 18.0;
 pub const MIN_TERMINAL_FONT_SIZE: f32 = 13.5;
 pub const MAX_TERMINAL_FONT_SIZE: f32 = 60.0;
+pub const DEFAULT_WORKSPACE_PANE_GAP: f32 = 12.0;
+pub const MIN_WORKSPACE_PANE_GAP: f32 = 0.0;
+pub const MAX_WORKSPACE_PANE_GAP: f32 = 64.0;
+pub const DEFAULT_WORKSPACE_PANES_PER_VIEW: u8 = 2;
+pub const MIN_WORKSPACE_PANES_PER_VIEW: u8 = 1;
+pub const MAX_WORKSPACE_PANES_PER_VIEW: u8 = 6;
 pub const DEFAULT_CHAT_TITLE_MODEL = "gpt-5.6-luna";
 
 pub const ChatTitleProvider = enum {
@@ -124,6 +130,8 @@ pub const InstalledTheme = struct {
 pub const AppConfig = struct {
     font_size: f32 = theme.DEFAULT_FONT_SIZE,
     terminal_font_size: f32 = DEFAULT_TERMINAL_FONT_SIZE,
+    workspace_pane_gap: f32 = DEFAULT_WORKSPACE_PANE_GAP,
+    workspace_panes_per_view: u8 = DEFAULT_WORKSPACE_PANES_PER_VIEW,
     theme_config: theme.ThemeConfig = .{},
     active_theme: ?[]u8 = null,
     installed_themes: []InstalledTheme = &.{},
@@ -358,6 +366,8 @@ fn objectSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key:
 fn writeUiSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
     const ui_object = try objectSection(allocator, object, "ui");
     try ui_object.put(allocator, "font_size", .{ .float = config.font_size });
+    try ui_object.put(allocator, "workspace_pane_gap", .{ .float = config.workspace_pane_gap });
+    try ui_object.put(allocator, "workspace_panes_per_view", .{ .integer = config.workspace_panes_per_view });
 }
 
 fn writeThemeSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
@@ -879,11 +889,25 @@ fn applyUiOverrides(config: *AppConfig, ui_value: std.json.Value) void {
         return;
     }
 
-    const font_size_value = ui_value.object.get("font_size") orelse return;
-    switch (font_size_value) {
-        .integer => |value| applyFontSize(config, @floatFromInt(value)),
-        .float => |value| applyFontSize(config, @floatCast(value)),
-        else => log.warn("ui.font_size must be a number when provided", .{}),
+    if (ui_value.object.get("font_size")) |font_size_value| {
+        switch (font_size_value) {
+            .integer => |value| applyFontSize(config, @floatFromInt(value)),
+            .float => |value| applyFontSize(config, @floatCast(value)),
+            else => log.warn("ui.font_size must be a number when provided", .{}),
+        }
+    }
+    if (ui_value.object.get("workspace_pane_gap")) |gap_value| {
+        switch (gap_value) {
+            .integer => |value| applyWorkspacePaneGap(config, @floatFromInt(value)),
+            .float => |value| applyWorkspacePaneGap(config, @floatCast(value)),
+            else => log.warn("ui.workspace_pane_gap must be a number when provided", .{}),
+        }
+    }
+    if (ui_value.object.get("workspace_panes_per_view")) |count_value| {
+        switch (count_value) {
+            .integer => |value| applyWorkspacePanesPerView(config, value),
+            else => log.warn("ui.workspace_panes_per_view must be an integer when provided", .{}),
+        }
     }
 }
 
@@ -1097,6 +1121,27 @@ fn applyFontSize(config: *AppConfig, value: f32) void {
     config.font_size = value;
 }
 
+fn applyWorkspacePaneGap(config: *AppConfig, value: f32) void {
+    if (!std.math.isFinite(value)) {
+        log.warn("ignoring non-finite ui.workspace_pane_gap override", .{});
+        return;
+    }
+    if (value < MIN_WORKSPACE_PANE_GAP or value > MAX_WORKSPACE_PANE_GAP) {
+        log.warn("ignoring ui.workspace_pane_gap outside supported range {d:.1}-{d:.1}", .{ MIN_WORKSPACE_PANE_GAP, MAX_WORKSPACE_PANE_GAP });
+        return;
+    }
+
+    config.workspace_pane_gap = value;
+}
+
+fn applyWorkspacePanesPerView(config: *AppConfig, value: i64) void {
+    if (value < MIN_WORKSPACE_PANES_PER_VIEW or value > MAX_WORKSPACE_PANES_PER_VIEW) {
+        log.warn("ignoring ui.workspace_panes_per_view outside supported range {d}-{d}", .{ MIN_WORKSPACE_PANES_PER_VIEW, MAX_WORKSPACE_PANES_PER_VIEW });
+        return;
+    }
+    config.workspace_panes_per_view = @intCast(value);
+}
+
 test "app config accepts ui.font_size override" {
     var root = try parseTestRoot("{\"ui\":{\"font_size\":22}}");
     defer root.deinit();
@@ -1117,6 +1162,50 @@ test "app config ignores out-of-range ui.font_size" {
     applyAppOverrides(std.testing.allocator, &config, root.value);
 
     try std.testing.expectEqual(theme.DEFAULT_FONT_SIZE, config.font_size);
+}
+
+test "app config accepts ui.workspace_pane_gap override" {
+    var root = try parseTestRoot("{\"ui\":{\"workspace_pane_gap\":24}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(@as(f32, 24.0), config.workspace_pane_gap);
+}
+
+test "app config ignores out-of-range ui.workspace_pane_gap" {
+    var root = try parseTestRoot("{\"ui\":{\"workspace_pane_gap\":65}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(DEFAULT_WORKSPACE_PANE_GAP, config.workspace_pane_gap);
+}
+
+test "app config accepts ui.workspace_panes_per_view override" {
+    var root = try parseTestRoot("{\"ui\":{\"workspace_panes_per_view\":3}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(@as(u8, 3), config.workspace_panes_per_view);
+}
+
+test "app config ignores out-of-range ui.workspace_panes_per_view" {
+    var root = try parseTestRoot("{\"ui\":{\"workspace_panes_per_view\":7}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(DEFAULT_WORKSPACE_PANES_PER_VIEW, config.workspace_panes_per_view);
 }
 
 test "app config accepts theme source and color overrides" {

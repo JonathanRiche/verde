@@ -1162,12 +1162,14 @@ fn cloneDefaultTerminalFocusRightKeybinds(allocator: std.mem.Allocator) ![]Keybi
 fn cloneDefaultWorkspaceFocusLeftKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Ctrl+H"),
+        try parseDefaultAccelerator("Ctrl+Left"),
     });
 }
 
 fn cloneDefaultWorkspaceFocusRightKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Ctrl+L"),
+        try parseDefaultAccelerator("Ctrl+Right"),
     });
 }
 
@@ -1792,13 +1794,15 @@ test "default workspace close current uses ctrl shift w" {
     try std.testing.expectEqual(sdl.Keycode.w, config.workspace_close_current[0].key);
 }
 
-test "default workspace focus supports ctrl hjkl without alt arrows" {
+test "default workspace focus supports ctrl hjkl and horizontal arrows" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_focus_left.len);
+    try std.testing.expectEqual(@as(usize, 2), config.workspace_focus_left.len);
     try std.testing.expect(config.workspace_focus_left[0].ctrl);
     try std.testing.expectEqual(sdl.Keycode.h, config.workspace_focus_left[0].key);
+    try std.testing.expect(config.workspace_focus_left[1].ctrl);
+    try std.testing.expectEqual(sdl.Keycode.left, config.workspace_focus_left[1].key);
 
     try std.testing.expectEqual(@as(usize, 1), config.workspace_focus_down.len);
     try std.testing.expect(config.workspace_focus_down[0].ctrl);
@@ -1808,9 +1812,11 @@ test "default workspace focus supports ctrl hjkl without alt arrows" {
     try std.testing.expect(config.workspace_focus_up[0].ctrl);
     try std.testing.expectEqual(sdl.Keycode.k, config.workspace_focus_up[0].key);
 
-    try std.testing.expectEqual(@as(usize, 1), config.workspace_focus_right.len);
+    try std.testing.expectEqual(@as(usize, 2), config.workspace_focus_right.len);
     try std.testing.expect(config.workspace_focus_right[0].ctrl);
     try std.testing.expectEqual(sdl.Keycode.l, config.workspace_focus_right[0].key);
+    try std.testing.expect(config.workspace_focus_right[1].ctrl);
+    try std.testing.expectEqual(sdl.Keycode.right, config.workspace_focus_right[1].key);
 }
 
 test "default workspace traversal uses alt up and down" {

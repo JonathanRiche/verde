@@ -110,7 +110,7 @@ const TerminalPaneDrawCache = struct {
         const cursor_x: u16 = if (render_state.cursor.viewport) |c| @intCast(c.x) else 0;
         const cursor_y: u16 = if (render_state.cursor.viewport) |c| @intCast(c.y) else 0;
         return self.active and
-            rectEql(self.rect, rect) and
+            rectSizeEql(self.rect, rect) and
             self.rows == render_state.rows and
             self.cols == render_state.cols and
             self.font_scale == font_scale and
@@ -640,7 +640,7 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
     // upstream Ghostty reflow issues. If the artifact vanishes with this set,
     // the cache key is missing something it should depend on.
     if (!selection_dynamic and !drawCacheBypassEnabled() and cache.validFor(render_state, rect, font_scale)) {
-        replayCachedViewport(state, cache);
+        replayCachedViewport(state, cache, rect);
         if (terminal_model) |model| {
             renderTerminalImages(state, model, rect, rect, terminalRenderCellSize(terminal.CELL_PIXEL_WIDTH, font_scale), terminalRenderCellSize(terminal.CELL_PIXEL_HEIGHT, font_scale));
             model.screens.active.kitty_images.dirty = false;
@@ -775,15 +775,62 @@ fn renderStatus(state: *app_state.AppState, rect: palette.Rect, label: []const u
     }, label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), rect);
 }
 
-fn replayCachedViewport(state: *app_state.AppState, cache: *const TerminalPaneDrawCache) void {
+fn replayCachedViewport(state: *app_state.AppState, cache: *const TerminalPaneDrawCache, rect: palette.Rect) void {
+    const offset: palette.draw.Vec2 = .{
+        .x = rect.x - cache.rect.x,
+        .y = rect.y - cache.rect.y,
+    };
     for (cache.commands.items) |command| {
-        switch (command) {
+        switch (translatedCachedDrawCommand(command, offset)) {
             .rect => |cmd| queueClippedRect(state, cmd.rect, cmd.color, cmd.clip),
             .border => |cmd| queueBorder(state, cmd.rect, cmd.color, cmd.radius, cmd.width),
             .triangle => |cmd| queueTriangle(state, cmd.p0, cmd.p1, cmd.p2, cmd.color, cmd.clip),
             .terminal_text => |cmd| queueTerminalText(state, cmd.rect, cmd.value, cmd.color, cmd.font_size, cmd.clip, cmd.glyph_kind),
         }
     }
+}
+
+fn translatedCachedDrawCommand(command: CachedDrawCommand, offset: palette.draw.Vec2) CachedDrawCommand {
+    return switch (command) {
+        .rect => |cmd| .{ .rect = .{
+            .rect = translatedRect(cmd.rect, offset),
+            .color = cmd.color,
+            .clip = translatedOptionalRect(cmd.clip, offset),
+        } },
+        .border => |cmd| .{ .border = .{
+            .rect = translatedRect(cmd.rect, offset),
+            .color = cmd.color,
+            .radius = cmd.radius,
+            .width = cmd.width,
+        } },
+        .triangle => |cmd| .{ .triangle = .{
+            .p0 = translatedPoint(cmd.p0, offset),
+            .p1 = translatedPoint(cmd.p1, offset),
+            .p2 = translatedPoint(cmd.p2, offset),
+            .color = cmd.color,
+            .clip = translatedOptionalRect(cmd.clip, offset),
+        } },
+        .terminal_text => |cmd| .{ .terminal_text = .{
+            .rect = translatedRect(cmd.rect, offset),
+            .value = cmd.value,
+            .color = cmd.color,
+            .font_size = cmd.font_size,
+            .clip = translatedOptionalRect(cmd.clip, offset),
+            .glyph_kind = cmd.glyph_kind,
+        } },
+    };
+}
+
+fn translatedRect(rect: palette.Rect, offset: palette.draw.Vec2) palette.Rect {
+    return .{ .x = rect.x + offset.x, .y = rect.y + offset.y, .w = rect.w, .h = rect.h };
+}
+
+fn translatedOptionalRect(rect: ?palette.Rect, offset: palette.draw.Vec2) ?palette.Rect {
+    return translatedRect(rect orelse return null, offset);
+}
+
+fn translatedPoint(point: palette.draw.Vec2, offset: palette.draw.Vec2) palette.draw.Vec2 {
+    return .{ .x = point.x + offset.x, .y = point.y + offset.y };
 }
 
 /// Renders Kitty image placements stored by Ghostty VT into the terminal grid.
@@ -1657,8 +1704,8 @@ fn rgbEql(a: ghostty_vt.color.RGB, b: ghostty_vt.color.RGB) bool {
     return a.r == b.r and a.g == b.g and a.b == b.b;
 }
 
-fn rectEql(a: palette.Rect, b: palette.Rect) bool {
-    return a.x == b.x and a.y == b.y and a.w == b.w and a.h == b.h;
+fn rectSizeEql(a: palette.Rect, b: palette.Rect) bool {
+    return a.w == b.w and a.h == b.h;
 }
 
 fn blendRgb(a: ghostty_vt.color.RGB, b: ghostty_vt.color.RGB, amount: f32) ghostty_vt.color.RGB {
@@ -2154,4 +2201,96 @@ fn terminalGlyphKind(cp: u21) TerminalGlyphKind {
         => .powerline,
         else => .text,
     };
+}
+
+test "terminal draw cache translates every cached command" {
+    const color: palette.Color = .{ .r = 0.1, .g = 0.2, .b = 0.3, .a = 0.4 };
+    const offset: palette.draw.Vec2 = .{ .x = -125.0, .y = 18.0 };
+    const clip: palette.Rect = .{ .x = 10.0, .y = 20.0, .w = 300.0, .h = 200.0 };
+
+    const rect_command = translatedCachedDrawCommand(.{ .rect = .{
+        .rect = .{ .x = 12.0, .y = 24.0, .w = 30.0, .h = 40.0 },
+        .color = color,
+        .clip = clip,
+    } }, offset);
+    switch (rect_command) {
+        .rect => |cmd| {
+            try std.testing.expectEqual(palette.Rect{ .x = -113.0, .y = 42.0, .w = 30.0, .h = 40.0 }, cmd.rect);
+            try std.testing.expectEqual(@as(?palette.Rect, .{ .x = -115.0, .y = 38.0, .w = 300.0, .h = 200.0 }), cmd.clip);
+            try std.testing.expectEqual(color, cmd.color);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const border_command = translatedCachedDrawCommand(.{ .border = .{
+        .rect = .{ .x = 20.0, .y = 30.0, .w = 50.0, .h = 60.0 },
+        .color = color,
+        .radius = 4.0,
+        .width = 2.0,
+    } }, offset);
+    switch (border_command) {
+        .border => |cmd| {
+            try std.testing.expectEqual(palette.Rect{ .x = -105.0, .y = 48.0, .w = 50.0, .h = 60.0 }, cmd.rect);
+            try std.testing.expectEqual(@as(f32, 4.0), cmd.radius);
+            try std.testing.expectEqual(@as(f32, 2.0), cmd.width);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const triangle_command = translatedCachedDrawCommand(.{ .triangle = .{
+        .p0 = .{ .x = 1.0, .y = 2.0 },
+        .p1 = .{ .x = 3.0, .y = 4.0 },
+        .p2 = .{ .x = 5.0, .y = 6.0 },
+        .color = color,
+        .clip = clip,
+    } }, offset);
+    switch (triangle_command) {
+        .triangle => |cmd| {
+            try std.testing.expectEqual(palette.draw.Vec2{ .x = -124.0, .y = 20.0 }, cmd.p0);
+            try std.testing.expectEqual(palette.draw.Vec2{ .x = -122.0, .y = 22.0 }, cmd.p1);
+            try std.testing.expectEqual(palette.draw.Vec2{ .x = -120.0, .y = 24.0 }, cmd.p2);
+            try std.testing.expectEqual(@as(?palette.Rect, .{ .x = -115.0, .y = 38.0, .w = 300.0, .h = 200.0 }), cmd.clip);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const text_command = translatedCachedDrawCommand(.{ .terminal_text = .{
+        .rect = .{ .x = 15.0, .y = 25.0, .w = 80.0, .h = 20.0 },
+        .value = "translated",
+        .color = color,
+        .font_size = 14.0,
+        .clip = clip,
+        .glyph_kind = .icon,
+    } }, offset);
+    switch (text_command) {
+        .terminal_text => |cmd| {
+            try std.testing.expectEqual(palette.Rect{ .x = -110.0, .y = 43.0, .w = 80.0, .h = 20.0 }, cmd.rect);
+            try std.testing.expectEqualStrings("translated", cmd.value);
+            try std.testing.expectEqual(@as(f32, 14.0), cmd.font_size);
+            try std.testing.expectEqual(TerminalGlyphKind.icon, cmd.glyph_kind);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "terminal draw cache validity allows translation but rejects geometry and content changes" {
+    var render_state: ghostty_vt.RenderState = .empty;
+    render_state.rows = 24;
+    render_state.cols = 80;
+    const cache: TerminalPaneDrawCache = .{
+        .active = true,
+        .rect = .{ .x = 100.0, .y = 50.0, .w = 800.0, .h = 600.0 },
+        .rows = 24,
+        .cols = 80,
+        .font_scale = 1.0,
+        .screen = .primary,
+        .cursor_visible = true,
+    };
+
+    try std.testing.expect(cache.validFor(&render_state, .{ .x = -220.0, .y = 80.0, .w = 800.0, .h = 600.0 }, 1.0));
+    try std.testing.expect(!cache.validFor(&render_state, .{ .x = -220.0, .y = 80.0, .w = 799.0, .h = 600.0 }, 1.0));
+    try std.testing.expect(!cache.validFor(&render_state, .{ .x = -220.0, .y = 80.0, .w = 800.0, .h = 600.0 }, 1.1));
+
+    render_state.dirty = .true;
+    try std.testing.expect(!cache.validFor(&render_state, .{ .x = -220.0, .y = 80.0, .w = 800.0, .h = 600.0 }, 1.0));
 }

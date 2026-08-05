@@ -1360,6 +1360,7 @@ fn appNeedsContinuousFrames(state: *AppState) bool {
     return state.isPickerPending() or
         state.transcriptMarkdownSelectionDragging() or
         workspace_panes_ui.isFocusAnimating() or
+        workspace_panes_ui.isScrollAnimating() or
         workspace_panes_ui.isPaneStatusAnimating() or
         ui_layout.isSidebarAnimating() or
         state.hasPendingSlashCommand() or
@@ -1375,7 +1376,7 @@ fn appNeedsContinuousFrames(state: *AppState) bool {
 }
 
 fn eventWaitTimeoutMs(state: *AppState) c_int {
-    if (state.isPickerPending() or state.isBrowserRuntimeActive() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or workspace_panes_ui.isPaneStatusAnimating() or ui_layout.isSidebarAnimating() or state.runConfigStepperAnimating() or state.settingsModalAnimating()) {
+    if (state.isPickerPending() or state.isBrowserRuntimeActive() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or workspace_panes_ui.isScrollAnimating() or workspace_panes_ui.isPaneStatusAnimating() or ui_layout.isSidebarAnimating() or state.runConfigStepperAnimating() or state.settingsModalAnimating()) {
         return ACTIVE_WAIT_TIMEOUT_MS;
     }
     // Terminal output only reaches the screen when the loop wakes and polls
@@ -1948,6 +1949,15 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (sidebar_ui.handlePaletteWheel(event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
+                return true;
+            }
+            if (workspace_panes_ui.handlePaletteWheel(
+                state,
+                event.wheel.mouse_x,
+                event.wheel.mouse_y,
+                event.wheel.x,
+                event.wheel.y,
+            )) {
                 return true;
             }
             // The browser owns an explicit pane rectangle, while terminal,
