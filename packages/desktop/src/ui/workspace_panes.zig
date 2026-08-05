@@ -940,19 +940,25 @@ fn toggleSplitMenu(state: *runtime.AppState, hit: WorkspacePaneHit) void {
     }
 }
 
-/// True when the mouse rests on interactive workspace pane chrome.
-pub fn wantsPointerAt(x: f32, y: f32) bool {
+/// Returns the system cursor for interactive workspace pane chrome.
+pub fn systemCursorAt(x: f32, y: f32) ?sdl.SystemCursor {
+    if (resize_drag) |hit| return resizeSystemCursor(hit.axis);
     var i: usize = hit_cache.count;
     while (i > 0) {
         i -= 1;
         const hit = hit_cache.hits[i];
         if (!rectContains(hit.rect, x, y)) continue;
         return switch (hit.action) {
-            .focus, .resize_split => false,
-            else => true,
+            .focus => null,
+            .resize_split, .resize_scrolling_column => resizeSystemCursor(hit.axis),
+            else => .pointer,
         };
     }
-    return false;
+    return null;
+}
+
+fn resizeSystemCursor(axis: runtime.WorkspaceSplitAxis) sdl.SystemCursor {
+    return if (axis == .vertical) .ew_resize else .ns_resize;
 }
 
 pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32, ctrl_down: bool) bool {
@@ -2151,6 +2157,11 @@ test "custom scrolling pane extent follows viewport changes" {
         0.0001,
     );
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), scrollingPaneExtentRatio(994.0, 2000.0, gap), 0.0001);
+}
+
+test "pane resize cursor follows the divider axis" {
+    try std.testing.expectEqual(sdl.SystemCursor.ew_resize, resizeSystemCursor(.vertical));
+    try std.testing.expectEqual(sdl.SystemCursor.ns_resize, resizeSystemCursor(.horizontal));
 }
 
 test "scrolling range keeps the final pane available at the leading edge" {

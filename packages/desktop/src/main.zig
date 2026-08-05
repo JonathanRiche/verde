@@ -734,9 +734,11 @@ fn syncMouseCursor(state: *AppState, cache: *SystemCursorCache) void {
     }
     // Workspace pane chrome overlays chat, terminal, and native browser
     // content, so its pointer affordance must win before content cursors.
-    if (!modalHitAtMouse(state) and workspace_panes_ui.wantsPointerAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) {
-        applySystemCursor(cache, .pointer);
-        return;
+    if (!modalHitAtMouse(state)) {
+        if (workspace_panes_ui.systemCursorAt(state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) |cursor| {
+            applySystemCursor(cache, cursor);
+            return;
+        }
     }
     if (!modalHitAtMouse(state) and browser_ui.wantsPointerAt(state, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) {
         applySystemCursor(cache, .pointer);
