@@ -16,6 +16,7 @@ const runtime = @import("runtime.zig");
 const sidebar = @import("sidebar.zig");
 const workspace_panes = @import("workspace_panes.zig");
 const native_state = @import("../state.zig");
+const app_config = @import("../app/config.zig");
 const keybinds = @import("../app/keybinds.zig");
 const platform_runtime = @import("platform_runtime");
 const Provider = native_state.Provider;
@@ -75,6 +76,8 @@ const KeybindRef = enum {
     workspace_split_chat_horizontal,
     workspace_split_terminal_vertical,
     workspace_split_terminal_horizontal,
+    workspace_previous_pane,
+    workspace_next_pane,
 };
 
 /// Static command table — add a row here to add a palette entry.
@@ -106,6 +109,8 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "browser.tab.close", .title = "Browser: Close Active Tab", .keywords = "web page remove", .section = .panes, .run = runCloseBrowserTab, .enabled = hasBrowserTab },
     .{ .id = "pane.close", .title = "Close Pane", .section = .panes, .keybind = .workspace_close, .run = runClosePane, .enabled = hasProjects },
     .{ .id = "pane.zoom", .title = "Zoom Pane", .keywords = "maximize restore fullscreen", .section = .panes, .keybind = .workspace_toggle_maximize, .run = runZoomPane, .enabled = hasProjects },
+    .{ .id = "pane.previous", .title = "Previous Pane", .keywords = "niri scroll focus left up back", .section = .panes, .keybind = .workspace_previous_pane, .run = runPreviousPane, .enabled = canFocusPreviousPane },
+    .{ .id = "pane.next", .title = "Next Pane", .keywords = "niri scroll focus right down forward", .section = .panes, .keybind = .workspace_next_pane, .run = runNextPane, .enabled = canFocusNextPane },
     .{ .id = "pane.float", .title = "Float Focused Pane", .keywords = "quick scratch overlay", .section = .panes, .run = runFloatPane, .enabled = hasProjects },
     .{ .id = "pane.quick_toggle", .title = "New or Toggle Quick Terminal", .keywords = "create show hide scratch floating overlay", .section = .panes, .keybind = .workspace_toggle_quick_pane, .run = runToggleQuickPane, .enabled = hasProjects },
     .{ .id = "pane.quick_maximize", .title = "Maximize or Restore Quick Pane", .keywords = "floating overlay", .section = .panes, .run = runMaximizeQuickPane, .enabled = hasQuickPane },
@@ -1057,6 +1062,24 @@ fn hasProjects(state: *runtime.AppState) bool {
     return state.project_controller.projects.items.len > 0;
 }
 
+fn adjacentPaneForCommand(state: *runtime.AppState, previous: bool) ?runtime.WorkspacePaneId {
+    if (state.project_controller.selected_index >= state.project_controller.projects.items.len) return null;
+    const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
+    const focused_pane_id = layout.focused_pane_id orelse return null;
+    return layout.adjacentTiledPaneIdInSidebarOrder(
+        focused_pane_id,
+        paneTraversalDirection(state.app_config.workspace_scroll_direction, previous),
+    );
+}
+
+fn canFocusPreviousPane(state: *runtime.AppState) bool {
+    return adjacentPaneForCommand(state, true) != null;
+}
+
+fn canFocusNextPane(state: *runtime.AppState) bool {
+    return adjacentPaneForCommand(state, false) != null;
+}
+
 fn hasProjectsAndGrok(state: *runtime.AppState) bool {
     return hasProjects(state) and native_state.AppState.grokTuiInstalled();
 }
@@ -1305,6 +1328,26 @@ fn runClosePane(state: *runtime.AppState) void {
 
 fn runZoomPane(state: *runtime.AppState) void {
     _ = state.toggleFocusedWorkspacePaneMaximized();
+}
+
+fn runPreviousPane(state: *runtime.AppState) void {
+    focusAdjacentPane(state, true);
+}
+
+fn runNextPane(state: *runtime.AppState) void {
+    focusAdjacentPane(state, false);
+}
+
+fn focusAdjacentPane(state: *runtime.AppState, previous: bool) void {
+    const pane_id = adjacentPaneForCommand(state, previous) orelse return;
+    _ = state.focusCurrentProjectWorkspacePane(pane_id);
+}
+
+fn paneTraversalDirection(scroll_direction: app_config.WorkspaceScrollDirection, previous: bool) runtime.WorkspacePaneDirection {
+    return switch (scroll_direction) {
+        .horizontal => if (previous) .left else .right,
+        .vertical => if (previous) .up else .down,
+    };
 }
 
 fn runFloatPane(state: *runtime.AppState) void {
@@ -1816,6 +1859,14 @@ fn keybindHintFor(state: *runtime.AppState, ref: ?KeybindRef) []const u8 {
         .workspace_split_chat_horizontal => config.workspace_split_chat_horizontal,
         .workspace_split_terminal_vertical => config.workspace_split_terminal_vertical,
         .workspace_split_terminal_horizontal => config.workspace_split_terminal_horizontal,
+        .workspace_previous_pane => switch (state.app_config.workspace_scroll_direction) {
+            .horizontal => config.workspace_focus_left,
+            .vertical => config.workspace_focus_up,
+        },
+        .workspace_next_pane => switch (state.app_config.workspace_scroll_direction) {
+            .horizontal => config.workspace_focus_right,
+            .vertical => config.workspace_focus_down,
+        },
     };
     if (bindings.len == 0) return "";
     return formatKeybind(&hint_buf, bindings[0]);
@@ -1953,8 +2004,10 @@ fn queueRoleText(state: *runtime.AppState, rect: palette.Rect, value: []const u8
     };
 }
 
-test "static commands expose scrolling layout quick toggles" {
+test "static commands expose scrolling layout controls" {
     const expected_ids = [_][]const u8{
+        "pane.previous",
+        "pane.next",
         "workspace.scrolling_automatic",
         "workspace.scrolling_always",
         "workspace.scrolling_disabled",
@@ -1969,6 +2022,13 @@ test "static commands expose scrolling layout quick toggles" {
         }
         try std.testing.expect(found);
     }
+}
+
+test "pane traversal commands follow the configured scrolling axis" {
+    try std.testing.expectEqual(runtime.WorkspacePaneDirection.left, paneTraversalDirection(.horizontal, true));
+    try std.testing.expectEqual(runtime.WorkspacePaneDirection.right, paneTraversalDirection(.horizontal, false));
+    try std.testing.expectEqual(runtime.WorkspacePaneDirection.up, paneTraversalDirection(.vertical, true));
+    try std.testing.expectEqual(runtime.WorkspacePaneDirection.down, paneTraversalDirection(.vertical, false));
 }
 
 test "fuzzyScore ranks substring above subsequence and rejects non-matches" {
