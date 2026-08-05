@@ -51,10 +51,19 @@ const SCROLLING_WHEEL_STEP_CSS: f32 = 72.0;
 const SCROLLING_ANIMATION_DURATION_MS: i64 = 150;
 const SCROLLING_ANIMATION_MAX_STEP_MS: i64 = 50;
 const SCROLLING_ANIMATION_EPSILON: f32 = 0.5;
+const SCROLLING_EDGE_BUTTON_THICKNESS_CSS: f32 = 32.0;
+const SCROLLING_EDGE_BUTTON_LENGTH_CSS: f32 = 64.0;
+const SCROLLING_EDGE_BUTTON_INSET_CSS: f32 = 6.0;
+const SCROLLING_EDGE_HOVER_PAD_CSS: f32 = 14.0;
+const SCROLLING_EDGE_CONTROL_Z: i32 = 170;
 
 // Font Awesome glyphs bundled in SymbolsNerdFontMono and rendered with Palette's icon role.
 const NF_FA_EXPAND = "\u{F065}";
 const NF_FA_COMPRESS = "\u{F066}";
+const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
+const NF_COD_CHEVRON_LEFT = "\u{EAB5}";
+const NF_COD_CHEVRON_RIGHT = "\u{EAB6}";
+const NF_COD_CHEVRON_UP = "\u{EAB7}";
 
 fn nowMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
@@ -80,9 +89,13 @@ const WorkspacePaneAction = enum {
     close,
     resize_split,
     resize_scrolling_column,
+    scrolling_previous,
+    scrolling_next,
     move_quick_pane,
     resize_quick_pane,
 };
+
+const ScrollingEdgeDirection = enum { previous, next };
 
 const WorkspacePaneHit = struct {
     pane_id: runtime.WorkspacePaneId = 0,
@@ -154,6 +167,9 @@ var browser_pane_rendered: bool = false;
 var scrolling_layout_rendered: bool = false;
 var scrolling_max_offset: f32 = 0.0;
 var scrolling_animating: bool = false;
+var scrolling_previous_proximity: ?palette.Rect = null;
+var scrolling_next_proximity: ?palette.Rect = null;
+var scrolling_edge_pressed: ?ScrollingEdgeDirection = null;
 
 var focus_prev_id: ?runtime.WorkspacePaneId = null;
 var focus_curr_id: ?runtime.WorkspacePaneId = null;
@@ -616,6 +632,8 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
     scrolling_layout_rendered = false;
     scrolling_max_offset = 0.0;
     scrolling_animating = false;
+    scrolling_previous_proximity = null;
+    scrolling_next_proximity = null;
     hit_cache.count = 0;
     pane_rect_count = 0;
     browser_pane_rendered = false;
@@ -825,6 +843,8 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
                 resize_drag = hit;
                 updateResizeDrag(state, hit, x, y);
             },
+            .scrolling_previous => focusScrollingEdgePane(state, .previous),
+            .scrolling_next => focusScrollingEdgePane(state, .next),
             .move_quick_pane, .resize_quick_pane => {
                 const quick = state.currentProjectQuickPane() orelse return false;
                 quick_pane_drag = .{
@@ -860,6 +880,11 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
 /// Handles pane chrome before browser and terminal content can consume its click.
 pub fn handlePaneChromeMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, down: bool) bool {
     if (button != 1) return false;
+    if (!down and scrolling_edge_pressed != null) {
+        scrolling_edge_pressed = null;
+        return true;
+    }
+    if (down) scrolling_edge_pressed = null;
     if (!down and quick_pane_drag != null) {
         quick_pane_drag = null;
         return true;
@@ -875,6 +900,13 @@ pub fn handlePaneChromeMouseButton(state: *runtime.AppState, x: f32, y: f32, but
             },
             .toggle_split_menu => {
                 if (down) toggleSplitMenu(state, hit);
+            },
+            .scrolling_previous, .scrolling_next => {
+                if (down) {
+                    const direction: ScrollingEdgeDirection = if (hit.action == .scrolling_previous) .previous else .next;
+                    scrolling_edge_pressed = direction;
+                    focusScrollingEdgePane(state, direction);
+                }
             },
             .move_quick_pane, .resize_quick_pane => {
                 if (down) {
@@ -954,6 +986,9 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32, ctrl_d
         updateResizeDrag(state, hit, x, y);
         return true;
     }
+    // The edge affordance owns hover intent so a partially visible pane below
+    // it cannot focus first and make the subsequent click skip two panes.
+    if (scrollingEdgeProximityContains(x, y)) return false;
     // Focus-follows-mouse: hovering into a pane focuses it. Skip while a split
     // menu is open and the cursor is inside that menu so the open pane stays put.
     if (split_menu_open_for != null and (rectContains(split_menu_rect, x, y) or rectContains(split_submenu_rect, x, y))) return false;
@@ -1202,6 +1237,143 @@ fn renderScrollingStrip(
     }
     clipWorkspaceBatch(state, command_start, text_run_start, workspace);
     clipWorkspaceHitCaches(workspace);
+    renderScrollingEdgeNavigation(state, layout, workspace, direction, pane_count);
+}
+
+const ScrollingEdgeAvailability = struct {
+    previous: bool,
+    next: bool,
+};
+
+const ScrollingEdgeRects = struct {
+    button: palette.Rect,
+    proximity: palette.Rect,
+};
+
+fn scrollingEdgeAvailability(focused_index: ?usize, pane_count: usize) ScrollingEdgeAvailability {
+    const index = focused_index orelse return .{ .previous = false, .next = false };
+    if (index >= pane_count) return .{ .previous = false, .next = false };
+    return .{
+        .previous = index > 0,
+        .next = index + 1 < pane_count,
+    };
+}
+
+fn scrollingEdgeRects(
+    workspace: palette.Rect,
+    direction: app_config.WorkspaceScrollDirection,
+    edge: ScrollingEdgeDirection,
+    thickness: f32,
+    length: f32,
+    inset: f32,
+    hover_pad: f32,
+) ScrollingEdgeRects {
+    const previous = edge == .previous;
+    const axis_extent = if (direction == .horizontal) workspace.w else workspace.h;
+    const safe_inset = @min(inset, @max((axis_extent - thickness) * 0.5, 0.0));
+    const button: palette.Rect = switch (direction) {
+        .horizontal => .{
+            .x = if (previous) workspace.x + safe_inset else workspace.x + workspace.w - thickness - safe_inset,
+            .y = workspace.y + (workspace.h - length) * 0.5,
+            .w = thickness,
+            .h = length,
+        },
+        .vertical => .{
+            .x = workspace.x + (workspace.w - length) * 0.5,
+            .y = if (previous) workspace.y + safe_inset else workspace.y + workspace.h - thickness - safe_inset,
+            .w = length,
+            .h = thickness,
+        },
+    };
+    const expanded: palette.Rect = .{
+        .x = button.x - hover_pad,
+        .y = button.y - hover_pad,
+        .w = button.w + hover_pad * 2.0,
+        .h = button.h + hover_pad * 2.0,
+    };
+    return .{
+        .button = button,
+        .proximity = intersectRects(expanded, workspace) orelse button,
+    };
+}
+
+// Hover-only previous/next controls along the scrolling workspace edge.
+fn renderScrollingEdgeNavigation(
+    state: *runtime.AppState,
+    layout: *const runtime.WorkspaceLayout,
+    workspace: palette.Rect,
+    direction: app_config.WorkspaceScrollDirection,
+    pane_count: usize,
+) void {
+    if (pane_drag.pending or pane_drag.active or resize_drag != null or quick_pane_drag != null or split_menu_open_for != null) return;
+    if (state.currentProjectQuickPane()) |quick| if (quick.visible) return;
+
+    const focused_index = if (layout.focused_pane_id) |pane_id| paneIndexInSidebarOrder(layout, pane_id) else null;
+    const available = scrollingEdgeAvailability(focused_index, pane_count);
+    if (!available.previous and !available.next) return;
+
+    const thickness = @min(theme.scaledUi(SCROLLING_EDGE_BUTTON_THICKNESS_CSS), if (direction == .horizontal) workspace.w else workspace.h);
+    const length = @min(theme.scaledUi(SCROLLING_EDGE_BUTTON_LENGTH_CSS), if (direction == .horizontal) workspace.h else workspace.w);
+    const inset = theme.scaledUi(SCROLLING_EDGE_BUTTON_INSET_CSS);
+    const hover_pad = theme.scaledUi(SCROLLING_EDGE_HOVER_PAD_CSS);
+    if (available.previous) renderScrollingEdgeControl(state, workspace, direction, .previous, thickness, length, inset, hover_pad);
+    if (available.next) renderScrollingEdgeControl(state, workspace, direction, .next, thickness, length, inset, hover_pad);
+}
+
+// One previous/next chevron inside the hovered workspace edge.
+fn renderScrollingEdgeControl(
+    state: *runtime.AppState,
+    workspace: palette.Rect,
+    direction: app_config.WorkspaceScrollDirection,
+    edge: ScrollingEdgeDirection,
+    thickness: f32,
+    length: f32,
+    inset: f32,
+    hover_pad: f32,
+) void {
+    const rects = scrollingEdgeRects(workspace, direction, edge, thickness, length, inset, hover_pad);
+    switch (edge) {
+        .previous => scrolling_previous_proximity = rects.proximity,
+        .next => scrolling_next_proximity = rects.proximity,
+    }
+    if (!state.transcript_controller.palette_mouse_in_workspace or
+        !rectContains(rects.proximity, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y)) return;
+
+    const previous_z = state.palette_overlay_batch.setZIndex(SCROLLING_EDGE_CONTROL_Z);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
+    queueRounded(state, rects.button, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 232)), theme.scaledUi(9.0));
+    queueBorder(state, rects.button, paletteColor(theme.withAlpha(theme.accent(), 190)), theme.scaledUi(9.0), theme.scaledUi(1.5));
+
+    const icon_size = theme.scaledUi(18.0);
+    const icon_rect: palette.Rect = .{
+        .x = rects.button.x + (rects.button.w - icon_size) * 0.5,
+        .y = rects.button.y + (rects.button.h - icon_size) * 0.5,
+        .w = icon_size,
+        .h = icon_size,
+    };
+    const glyph = switch (direction) {
+        .horizontal => if (edge == .previous) NF_COD_CHEVRON_LEFT else NF_COD_CHEVRON_RIGHT,
+        .vertical => if (edge == .previous) NF_COD_CHEVRON_UP else NF_COD_CHEVRON_DOWN,
+    };
+    queueIcon(state, icon_rect, glyph, paletteColor(theme.COLOR_WHITE), icon_size, workspace);
+    appendHit(.{
+        .action = if (edge == .previous) .scrolling_previous else .scrolling_next,
+        .rect = rects.button,
+    });
+}
+
+fn scrollingEdgeProximityContains(x: f32, y: f32) bool {
+    if (scrolling_previous_proximity) |rect| if (rectContains(rect, x, y)) return true;
+    if (scrolling_next_proximity) |rect| if (rectContains(rect, x, y)) return true;
+    return false;
+}
+
+fn focusScrollingEdgePane(state: *runtime.AppState, edge: ScrollingEdgeDirection) void {
+    const direction: FocusDirection = switch (state.app_config.workspace_scroll_direction) {
+        .horizontal => if (edge == .previous) .left else .right,
+        .vertical => if (edge == .previous) .up else .down,
+    };
+    _ = focusPaneInDirection(state, direction);
 }
 
 fn renderScrollingPane(
@@ -2012,6 +2184,41 @@ test "scrolling focus direction follows the configured axis" {
     try std.testing.expectEqual(runtime.WorkspacePaneDirection.up, scrollingPaneDirection(.vertical, .up).?);
     try std.testing.expectEqual(runtime.WorkspacePaneDirection.down, scrollingPaneDirection(.vertical, .down).?);
     try std.testing.expect(scrollingPaneDirection(.vertical, .right) == null);
+}
+
+test "scrolling edge navigation only exposes adjacent sidebar panes" {
+    const missing = scrollingEdgeAvailability(null, 4);
+    try std.testing.expect(!missing.previous);
+    try std.testing.expect(!missing.next);
+
+    const first = scrollingEdgeAvailability(0, 4);
+    try std.testing.expect(!first.previous);
+    try std.testing.expect(first.next);
+
+    const middle = scrollingEdgeAvailability(2, 4);
+    try std.testing.expect(middle.previous);
+    try std.testing.expect(middle.next);
+
+    const last = scrollingEdgeAvailability(3, 4);
+    try std.testing.expect(last.previous);
+    try std.testing.expect(!last.next);
+}
+
+test "scrolling edge navigation geometry follows the configured axis" {
+    const workspace: palette.Rect = .{ .x = 10.0, .y = 20.0, .w = 400.0, .h = 200.0 };
+    const left = scrollingEdgeRects(workspace, .horizontal, .previous, 32.0, 64.0, 6.0, 14.0);
+    const right = scrollingEdgeRects(workspace, .horizontal, .next, 32.0, 64.0, 6.0, 14.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 16.0), left.button.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 88.0), left.button.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 372.0), right.button.x, 0.0001);
+    try std.testing.expect(rectContains(left.proximity, left.button.x, left.button.y));
+    try std.testing.expect(!rectContains(left.proximity, workspace.x + workspace.w * 0.5, workspace.y + workspace.h * 0.5));
+
+    const top = scrollingEdgeRects(workspace, .vertical, .previous, 32.0, 64.0, 6.0, 14.0);
+    const bottom = scrollingEdgeRects(workspace, .vertical, .next, 32.0, 64.0, 6.0, 14.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 178.0), top.button.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 26.0), top.button.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 182.0), bottom.button.y, 0.0001);
 }
 
 test "scrolling wheel routing preserves ordinary vertical pane scrolling" {
