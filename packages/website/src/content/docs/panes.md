@@ -56,11 +56,15 @@ By default, Verde automatically switches to a scrolling strip when a workspace
 reaches two tiled panes, keeping the same order shown in the sidebar. **Settings
 → Workspace → Scrolling layout** can keep that automatic behavior, pin the
 scrolling layout with **Always**, or retain the split tree with **Disabled**.
-**Activation threshold** changes the automatic trigger from 1–64 panes.
+**Activation threshold** changes the automatic trigger from 1–64 panes. Use
+**Scrolling settings scope** to edit the global defaults or override mode and
+threshold only for the currently selected workspace. Workspace overrides and
+scroll positions both survive restart.
 The command palette also exposes **Scrolling Layout: Automatic**, **Always**,
-and **Disabled** for immediate policy changes without opening Settings. Use
-**Previous Pane** and **Next Pane** there to move through panes in sidebar order;
-the displayed shortcut follows the selected scroll direction.
+and **Disabled** to set an immediate override for the current workspace;
+**Scrolling Layout: Use Global Default** clears it. Use **Previous Pane** and
+**Next Pane** there to move through panes in sidebar order; the displayed
+shortcut follows the selected scroll direction.
 
 **Scroll direction** chooses a horizontal strip (the default) or vertical
 strip. **Panes per view** controls how many panes fit along that axis (1–6,

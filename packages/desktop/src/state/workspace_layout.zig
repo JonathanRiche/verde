@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const browser_pane = @import("browser_pane.zig");
+const app_config = @import("../app/config.zig");
 
 const BrowserTabRef = browser_pane.BrowserTabRef;
 const BrowserPaneRef = browser_pane.BrowserPaneRef;
@@ -128,6 +129,11 @@ pub const WorkspaceLayout = struct {
     scroll_revealed_pane_id: ?WorkspacePaneId = null,
     scroll_animation_last_ms: i64 = 0,
     scroll_axis_vertical: bool = false,
+    /// Null values inherit the global app configuration. Both fields are
+    /// persisted with the workspace layout so a local pin/threshold survives
+    /// restart without requiring a database schema change.
+    scroll_mode_override: ?app_config.WorkspaceScrollMode = null,
+    scroll_threshold_override: ?u8 = null,
 
     pub fn initDefaultChat(allocator: std.mem.Allocator) !WorkspaceLayout {
         var layout: WorkspaceLayout = .{};
@@ -307,6 +313,18 @@ pub const WorkspaceLayout = struct {
     pub fn visiblePaneCount(self: *const WorkspaceLayout) usize {
         const root_node = self.root orelse return 0;
         return countWorkspaceNodeLeaves(root_node);
+    }
+
+    pub fn effectiveScrollMode(self: *const WorkspaceLayout, global_mode: app_config.WorkspaceScrollMode) app_config.WorkspaceScrollMode {
+        return self.scroll_mode_override orelse global_mode;
+    }
+
+    pub fn effectiveScrollThreshold(self: *const WorkspaceLayout, global_threshold: u8) u8 {
+        return self.scroll_threshold_override orelse global_threshold;
+    }
+
+    pub fn hasScrollOverride(self: *const WorkspaceLayout) bool {
+        return self.scroll_mode_override != null or self.scroll_threshold_override != null;
     }
 
     /// Returns the adjacent tiled pane in the same order as the expanded
@@ -732,6 +750,14 @@ pub const WorkspaceLayout = struct {
         try stringify.write(self.scroll_target_x);
         try stringify.objectField("scroll_y");
         try stringify.write(self.scroll_target_y);
+        if (self.scroll_mode_override) |mode| {
+            try stringify.objectField("scroll_mode");
+            try stringify.write(@tagName(mode));
+        }
+        if (self.scroll_threshold_override) |threshold| {
+            try stringify.objectField("scroll_threshold");
+            try stringify.write(threshold);
+        }
         try stringify.objectField("quick");
         if (self.quick_pane) |quick| {
             try stringify.beginObject();
@@ -852,6 +878,14 @@ pub const WorkspaceLayout = struct {
         next_layout.scroll_offset_x = next_layout.scroll_target_x;
         next_layout.scroll_target_y = @max(0.0, jsonFloat(root_value.object.get("scroll_y") orelse .null) orelse 0.0);
         next_layout.scroll_offset_y = next_layout.scroll_target_y;
+        if (jsonString(root_value.object.get("scroll_mode") orelse .null)) |mode_value| {
+            next_layout.scroll_mode_override = app_config.WorkspaceScrollMode.parse(mode_value);
+        }
+        if (jsonInt(root_value.object.get("scroll_threshold") orelse .null)) |threshold| {
+            if (threshold >= app_config.MIN_WORKSPACE_SCROLL_THRESHOLD and threshold <= app_config.MAX_WORKSPACE_SCROLL_THRESHOLD) {
+                next_layout.scroll_threshold_override = @intCast(threshold);
+            }
+        }
         if (root_value.object.get("quick")) |quick_value| {
             if (quick_value == .object) {
                 if (jsonInt(quick_value.object.get("pane") orelse .null)) |pane_id| {
@@ -1466,6 +1500,39 @@ test "workspace layout persists the scrolling target" {
     try std.testing.expectApproxEqAbs(restored.scroll_target_y, restored.scroll_offset_y, 0.0001);
     try std.testing.expectEqual(@as(?WorkspacePaneId, null), restored.scroll_revealed_pane_id);
     try std.testing.expectEqual(@as(i64, 0), restored.scroll_animation_last_ms);
+}
+
+test "workspace layout persists scrolling policy overrides" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    layout.scroll_mode_override = .always;
+    layout.scroll_threshold_override = 8;
+
+    const persisted = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(persisted);
+    var restored = try WorkspaceLayout.initDefaultChat(allocator);
+    defer restored.deinit(allocator);
+    try restored.applyPersistedWorkspaceJson(allocator, persisted);
+
+    try std.testing.expect(restored.hasScrollOverride());
+    try std.testing.expectEqual(app_config.WorkspaceScrollMode.always, restored.effectiveScrollMode(.automatic));
+    try std.testing.expectEqual(@as(u8, 8), restored.effectiveScrollThreshold(2));
+}
+
+test "workspace layout ignores invalid scrolling policy overrides" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    const persisted =
+        \\{"v":2,"next":2,"focused":1,"maximized":null,"scroll_mode":"sometimes","scroll_threshold":0,
+        \\"panes":[{"id":1,"kind":"chat","thread":0}],"root":{"leaf":1}}
+    ;
+    try layout.applyPersistedWorkspaceJson(allocator, persisted);
+
+    try std.testing.expect(!layout.hasScrollOverride());
+    try std.testing.expectEqual(app_config.WorkspaceScrollMode.disabled, layout.effectiveScrollMode(.disabled));
+    try std.testing.expectEqual(@as(u8, 4), layout.effectiveScrollThreshold(4));
 }
 
 test "closing a maximized pane transfers zoom in sidebar order" {
