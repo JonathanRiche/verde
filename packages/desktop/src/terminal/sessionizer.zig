@@ -204,6 +204,39 @@ pub fn requestAlloc(
     );
 }
 
+/// Desktop transport adapter for `headless.Client`: send one raw request JSON
+/// document to the session daemon at `pref_path` (or the endpoint override).
+/// Keeps the headless package std-only; sockets/pipes live here.
+pub const HeadlessTransport = struct {
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+
+    pub fn send(ctx: *anyopaque, request_json: []const u8) anyerror![]u8 {
+        const self: *HeadlessTransport = @ptrCast(@alignCast(ctx));
+        return try sendRequestJsonAlloc(self.allocator, self.pref_path, request_json);
+    }
+};
+
+/// Send a pre-encoded request envelope to the sessionizer endpoint.
+pub fn sendRequestJsonAlloc(
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    request_json: []const u8,
+) ![]u8 {
+    const endpoint = try socketPath(allocator, pref_path);
+    defer allocator.free(endpoint);
+    return try platform_ipc.requestAlloc(allocator, endpoint, request_json, .{
+        .max_message_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
+        .max_response_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
+        .timeout_ms = SESSIONIZER_REQUEST_TIMEOUT_MS,
+    });
+}
+
+/// Build a typed headless client bound to the sessionizer transport for `pref_path`.
+pub fn headlessClient(allocator: std.mem.Allocator, transport: *HeadlessTransport) headless.Client {
+    return headless.Client.init(allocator, transport, HeadlessTransport.send);
+}
+
 /// Sends one daemon request while bounding the response scratch allocation.
 pub fn requestAllocMaxResponse(
     allocator: std.mem.Allocator,
@@ -288,11 +321,12 @@ pub const ReusableRequestConnection = struct {
         const request_json = try requestJsonAlloc(allocator, method, params, request_id);
         defer allocator.free(request_json);
         if (self.reuse_disabled) {
-            return requestJsonOnNewUnixStreamAlloc(allocator, pref_path, request_json, response_buffer) catch |err| {
+            const response = requestJsonOnNewUnixStreamAlloc(allocator, pref_path, request_json, response_buffer) catch |err| {
                 // A daemon replacement should get a fresh capability probe.
                 self.reuse_disabled = false;
                 return err;
             };
+            return validateResponseAndKeepAlloc(allocator, response);
         }
 
         const reused_stream = self.stream != null;
@@ -303,16 +337,18 @@ pub const ReusableRequestConnection = struct {
                 .return_error => return err,
                 .disable_and_retry => {
                     self.reuse_disabled = true;
-                    return requestJsonOnNewUnixStreamAlloc(allocator, pref_path, request_json, response_buffer);
+                    const fresh_response = try requestJsonOnNewUnixStreamAlloc(allocator, pref_path, request_json, response_buffer);
+                    return validateResponseAndKeepAlloc(allocator, fresh_response);
                 },
                 .reconnect => {
                     self.stream = try connectUnixStream(allocator, pref_path);
-                    return requestJsonOnUnixStreamAlloc(allocator, self.stream.?, request_json, response_buffer);
+                    const reconnected_response = try requestJsonOnUnixStreamAlloc(allocator, self.stream.?, request_json, response_buffer);
+                    return validateResponseAndKeepAlloc(allocator, reconnected_response);
                 },
             }
         };
         if (reused_stream) self.reuse_confirmed = true;
-        return response;
+        return validateResponseAndKeepAlloc(allocator, response);
     }
 
     fn closeStream(self: *ReusableRequestConnection) void {
@@ -344,6 +380,36 @@ const RequestResult = struct {
     authenticated_server_process_id: ?u32 = null,
 };
 
+const RequestTransport = struct {
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    max_response_bytes: usize,
+    response_buffer: ?[]u8,
+    authenticated_server_process_id: ?u32 = null,
+
+    fn send(ctx: *anyopaque, request_json: []const u8) anyerror![]u8 {
+        const self: *RequestTransport = @ptrCast(@alignCast(ctx));
+        const socket_path = try socketPath(self.allocator, self.pref_path);
+        defer self.allocator.free(socket_path);
+
+        if (builtin.os.tag == .windows) {
+            const result = try platform_ipc.requestWithPeerAlloc(self.allocator, socket_path, request_json, .{
+                .max_message_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
+                .max_response_bytes = self.max_response_bytes,
+                .timeout_ms = SESSIONIZER_REQUEST_TIMEOUT_MS,
+            });
+            self.authenticated_server_process_id = result.server_process_id;
+            return result.response;
+        }
+
+        const stream = try connectUnixStreamAtPath(socket_path);
+        defer stream.close(std.Io.Threaded.global_single_threaded.io());
+        const read_buffer = self.response_buffer orelse try self.allocator.alloc(u8, self.max_response_bytes);
+        defer if (self.response_buffer == null) self.allocator.free(read_buffer);
+        return try requestJsonOnUnixStreamAlloc(self.allocator, stream, request_json, read_buffer);
+    }
+};
+
 fn requestWithPeerAlloc(
     allocator: std.mem.Allocator,
     pref_path: []const u8,
@@ -353,44 +419,35 @@ fn requestWithPeerAlloc(
     max_response_bytes: usize,
     response_buffer: ?[]u8,
 ) !RequestResult {
-    const socket_path = try socketPath(allocator, pref_path);
-    defer allocator.free(socket_path);
-    const request_json = try requestJsonAlloc(allocator, method, params, request_id);
-    defer allocator.free(request_json);
-
-    if (builtin.os.tag == .windows) {
-        const result = try platform_ipc.requestWithPeerAlloc(allocator, socket_path, request_json, .{
-            .max_message_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
-            .max_response_bytes = max_response_bytes,
-            .timeout_ms = SESSIONIZER_REQUEST_TIMEOUT_MS,
-        });
-        return .{
-            .response = result.response,
-            .authenticated_server_process_id = result.server_process_id,
-        };
-    }
-
-    const stream = try connectUnixStreamAtPath(socket_path);
-    defer stream.close(std.Io.Threaded.global_single_threaded.io());
-
-    const read_buffer = response_buffer orelse try allocator.alloc(u8, max_response_bytes);
-    defer if (response_buffer == null) allocator.free(read_buffer);
-    return .{ .response = try requestJsonOnUnixStreamAlloc(allocator, stream, request_json, read_buffer) };
+    var transport: RequestTransport = .{
+        .allocator = allocator,
+        .pref_path = pref_path,
+        .max_response_bytes = max_response_bytes,
+        .response_buffer = response_buffer,
+    };
+    var client = headless.Client.init(allocator, &transport, RequestTransport.send);
+    var call = try client.callAllocWithId(request_id, method, params);
+    const response = call.takeResponse();
+    call.deinit(allocator);
+    return .{
+        .response = response,
+        .authenticated_server_process_id = transport.authenticated_server_process_id,
+    };
 }
 
 fn requestJsonAlloc(allocator: std.mem.Allocator, method: []const u8, params: anytype, request_id: u64) ![]u8 {
-    var request_writer: std.Io.Writer.Allocating = .init(allocator);
-    errdefer request_writer.deinit();
-    var s: std.json.Stringify = .{ .writer = &request_writer.writer, .options = .{} };
-    try s.beginObject();
-    try s.objectField("id");
-    try s.write(request_id);
-    try s.objectField("method");
-    try s.write(method);
-    try s.objectField("params");
-    try s.write(params);
-    try s.endObject();
-    return request_writer.toOwnedSlice();
+    var client = headless.Client.initEncoder(allocator);
+    return try client.encodeRequestWithId(request_id, method, params);
+}
+
+fn validateResponseAndKeepAlloc(allocator: std.mem.Allocator, response: []u8) ![]u8 {
+    var client = headless.Client.initEncoder(allocator);
+    var parsed = client.parseResponse(response) catch |err| {
+        allocator.free(response);
+        return err;
+    };
+    parsed.deinit();
+    return response;
 }
 
 fn connectUnixStream(allocator: std.mem.Allocator, pref_path: []const u8) !std.Io.net.Stream {

@@ -95,14 +95,12 @@ pub const Response = struct {
 };
 
 /// Encode a request matching the sessionizer client shape (id/method/params).
-/// Includes jsonrpc for parity with daemon tests and future clients.
+/// Field order is part of the compatibility contract with existing callers.
 pub fn encodeRequest(allocator: std.mem.Allocator, id: u64, method: []const u8, params: anytype) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
     var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
     try s.beginObject();
-    try s.objectField("jsonrpc");
-    try s.write("2.0");
     try s.objectField("id");
     try s.write(id);
     try s.objectField("method");
