@@ -3972,8 +3972,11 @@ fn mcpToolsCall(
             break :blk sendLiveRequestAlloc(allocator, io, "terminal.tail", .{ .workspace = workspace, .pane = pane, .lines = lines }, 1);
         }
         if (std.mem.eql(u8, tool_name, "write_surface_text")) {
-            const text = mcpArgString(arguments, "text") orelse return try mcpError(allocator, out, id_value, -32602, "write_surface_text requires text");
+            // Daemon-direct path validates text first. Live-compat path restores
+            // the pre-route precedence (pane_id before text) and the original
+            // "requires pane_id" message for byte-compatible errors.
             if (session_id) |daemon_session| {
+                const text = mcpArgString(arguments, "text") orelse return try mcpError(allocator, out, id_value, -32602, "write_surface_text requires text");
                 const response = mcpDaemonSessionCallAlloc(allocator, io, "session.write", .{
                     .id = daemon_session,
                     .text = text,
@@ -3981,29 +3984,30 @@ fn mcpToolsCall(
                 defer allocator.free(response);
                 return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
             }
-            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "write_surface_text requires pane_id or session_id");
+            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "write_surface_text requires pane_id");
+            const text = mcpArgString(arguments, "text") orelse return try mcpError(allocator, out, id_value, -32602, "write_surface_text requires text");
             break :blk sendLiveRequestAlloc(allocator, io, "terminal.write", .{ .workspace = workspace, .pane = pane, .text = text }, 1);
         }
         if (std.mem.eql(u8, tool_name, "send_terminal_key")) {
-            const key = mcpArgString(arguments, "key");
-            const chord = mcpArgString(arguments, "chord");
-            if ((mcpArgIsNonNull(arguments, "key") and key == null) or
-                (mcpArgIsNonNull(arguments, "chord") and chord == null))
-            {
-                return try mcpError(allocator, out, id_value, -32602, "send_terminal_key key and chord must be strings");
-            }
-            const ctrl = mcpArgBool(arguments, "ctrl");
-            const alt = mcpArgBool(arguments, "alt");
-            const shift = mcpArgBool(arguments, "shift");
-            const super = mcpArgBool(arguments, "super");
-            if ((mcpArgIsNonNull(arguments, "ctrl") and ctrl == null) or
-                (mcpArgIsNonNull(arguments, "alt") and alt == null) or
-                (mcpArgIsNonNull(arguments, "shift") and shift == null) or
-                (mcpArgIsNonNull(arguments, "super") and super == null))
-            {
-                return try mcpError(allocator, out, id_value, -32602, "send_terminal_key modifiers must be booleans");
-            }
             if (session_id) |daemon_session| {
+                const key = mcpArgString(arguments, "key");
+                const chord = mcpArgString(arguments, "chord");
+                if ((mcpArgIsNonNull(arguments, "key") and key == null) or
+                    (mcpArgIsNonNull(arguments, "chord") and chord == null))
+                {
+                    return try mcpError(allocator, out, id_value, -32602, "send_terminal_key key and chord must be strings");
+                }
+                const ctrl = mcpArgBool(arguments, "ctrl");
+                const alt = mcpArgBool(arguments, "alt");
+                const shift = mcpArgBool(arguments, "shift");
+                const super = mcpArgBool(arguments, "super");
+                if ((mcpArgIsNonNull(arguments, "ctrl") and ctrl == null) or
+                    (mcpArgIsNonNull(arguments, "alt") and alt == null) or
+                    (mcpArgIsNonNull(arguments, "shift") and shift == null) or
+                    (mcpArgIsNonNull(arguments, "super") and super == null))
+                {
+                    return try mcpError(allocator, out, id_value, -32602, "send_terminal_key modifiers must be booleans");
+                }
                 const encoded = mcpEncodeTerminalKeyAlloc(
                     allocator,
                     key,
@@ -4026,7 +4030,27 @@ fn mcpToolsCall(
                 defer allocator.free(response);
                 return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
             }
-            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "send_terminal_key requires pane_id or session_id");
+            // Live-compat addressing: pane_id before key/modifier validation
+            // (matches the pre-daemon-direct error precedence and message).
+            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "send_terminal_key requires pane_id");
+            const key = mcpArgString(arguments, "key");
+            const chord = mcpArgString(arguments, "chord");
+            if ((mcpArgIsNonNull(arguments, "key") and key == null) or
+                (mcpArgIsNonNull(arguments, "chord") and chord == null))
+            {
+                return try mcpError(allocator, out, id_value, -32602, "send_terminal_key key and chord must be strings");
+            }
+            const ctrl = mcpArgBool(arguments, "ctrl");
+            const alt = mcpArgBool(arguments, "alt");
+            const shift = mcpArgBool(arguments, "shift");
+            const super = mcpArgBool(arguments, "super");
+            if ((mcpArgIsNonNull(arguments, "ctrl") and ctrl == null) or
+                (mcpArgIsNonNull(arguments, "alt") and alt == null) or
+                (mcpArgIsNonNull(arguments, "shift") and shift == null) or
+                (mcpArgIsNonNull(arguments, "super") and super == null))
+            {
+                return try mcpError(allocator, out, id_value, -32602, "send_terminal_key modifiers must be booleans");
+            }
             break :blk sendLiveRequestAlloc(allocator, io, "terminal.key", .{
                 .workspace = workspace,
                 .pane = pane,

@@ -189,7 +189,10 @@ fn requestUnixAlloc(
     return readUnixLineAlloc(allocator, io, stream, options.max_response_bytes, options.timeout_ms);
 }
 
-fn unixEndpointAcceptsConnections(io: std.Io, endpoint: []const u8) bool {
+/// True when a peer can complete a connection to a Unix endpoint path.
+/// Shared with the sessionizer live-endpoint bind guard so both refuse to
+/// unlink/steal a pathname still accepted by another process.
+pub fn unixEndpointAcceptsConnections(io: std.Io, endpoint: []const u8) bool {
     const address = std.Io.net.UnixAddress.init(endpoint) catch return false;
     const stream = address.connect(io) catch return false;
     stream.close(io);

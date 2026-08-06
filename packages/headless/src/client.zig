@@ -170,7 +170,7 @@ test "client parses ok envelope via injected transport" {
     defer parsed.deinit();
 
     try std.testing.expect(parsed.response.isOk());
-    try std.testing.expectEqual(@as(u64, 1), parsed.response.id);
+    try std.testing.expectEqual(@as(?u64, 1), parsed.response.id);
     try std.testing.expect(parsed.response.result.?.object.get("capabilities") != null);
     const capabilities = try client.decodeCapabilities(&parsed);
     try std.testing.expectEqual(@as(u32, 1), capabilities.headless_protocol_version);

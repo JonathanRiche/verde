@@ -15,6 +15,7 @@ const process_env = @import("../platform/env.zig");
 const send_runner = @import("../chat/send_runner.zig");
 const windows_conpty = @import("platform/windows_conpty.zig");
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 const log = std.log.scoped(.sessionizer);
 
@@ -51,14 +52,13 @@ const SESSIONIZER_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = SESSIONIZER_MAX_MESSAGE_BYTES;
 const SESSIONIZER_REQUEST_TIMEOUT_MS: u32 = 5000;
 const ATTACH_STALE_MS: i64 = 60 * std.time.ms_per_s;
-/// Historical generic idle window. The authoritative daemon no longer uses this
-/// by default; keep the constant for tests and documentation only.
-const LEGACY_IDLE_EXIT_MS: i64 = 30 * std.time.ms_per_s;
 /// Env override so hermetic tests can force a fast idle exit without changing
 /// production lifetime policy (null / unset = never idle-exit).
 const IDLE_EXIT_ENV_NAME = "VERDE_SESSION_DAEMON_IDLE_EXIT_MS";
 /// Bounded wait while an incompatible daemon drains live state before upgrade.
 const REPLACEMENT_WAIT_MS: i64 = 5 * std.time.ms_per_s;
+/// Extra grace after prepareShutdown accepts, independent of the prepare deadline.
+const REPLACEMENT_GONE_GRACE_MS: i64 = 1 * std.time.ms_per_s;
 const REPLACEMENT_POLL_MS: i64 = 50;
 const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
     .macos => @bitCast(@as(u32, 0x80087467)),
@@ -176,9 +176,45 @@ pub fn sessionIdForLeaf(
     return try stableSessionId(allocator, ctx.project_id, ctx.dock_id, pane_id);
 }
 
+/// Env override for the sessionizer endpoint (Unix socket path or Windows
+/// named-pipe path). When set and non-empty, clients and daemons use this
+/// instead of deriving the endpoint from `pref_path`, so hermetic tests and
+/// isolated CLI/MCP helpers never fall back to the user's live daemon.
+pub const SESSIONIZER_SOCKET_ENV_NAME = "VERDE_SESSIONIZER_SOCKET";
+
 pub fn socketPath(allocator: std.mem.Allocator, pref_path: []const u8) ![]u8 {
+    if (try sessionizerEndpointOverrideAlloc(allocator)) |override| return override;
+    return defaultSocketPath(allocator, pref_path);
+}
+
+/// Pref-derived endpoint only (ignores `VERDE_SESSIONIZER_SOCKET`). Used by
+/// hermetic spawners that compute an isolation path before installing the env
+/// override for both client and daemon bind.
+pub fn defaultSocketPath(allocator: std.mem.Allocator, pref_path: []const u8) ![]u8 {
     if (builtin.os.tag == .windows) return windowsPipeName(allocator, pref_path);
     return std.fs.path.join(allocator, &.{ pref_path, SOCKET_NAME });
+}
+
+/// Returns a caller-owned endpoint when `VERDE_SESSIONIZER_SOCKET` is set.
+fn sessionizerEndpointOverrideAlloc(allocator: std.mem.Allocator) !?[]u8 {
+    const environ: std.process.Environ = if (builtin.os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    const raw = environ.getAlloc(allocator, SESSIONIZER_SOCKET_ENV_NAME) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return null,
+        else => return err,
+    };
+    errdefer allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) {
+        allocator.free(raw);
+        return null;
+    }
+    if (trimmed.ptr == raw.ptr and trimmed.len == raw.len) return raw;
+    const owned = try allocator.dupe(u8, trimmed);
+    allocator.free(raw);
+    return owned;
 }
 
 fn windowsPipeName(allocator: std.mem.Allocator, pref_path: []const u8) ![]u8 {
@@ -620,7 +656,7 @@ pub fn ensureDaemon(allocator: std.mem.Allocator, pref_path: []const u8, exe_pat
 }
 
 /// Graceful protocol-version replacement (headless_verde.md Lifetime).
-/// Never hard-kills while running PTYs or keep-alive turns remain.
+/// v19+ drains via prepareShutdown; pre-v19 falls back to terminate+respawn.
 fn replaceIncompatibleDaemon(
     allocator: std.mem.Allocator,
     pref_path: []const u8,
@@ -638,18 +674,19 @@ fn replaceIncompatibleDaemon(
             defer allocator.free(response);
             if (parsePrepareShutdownResult(allocator, response)) |prepared| {
                 if (prepared.method_missing) {
-                    // Pre-v19 daemon: only terminate when status proves empty.
-                    return terminateEmptyLegacyDaemon(
-                        status,
-                        authenticated_server_process_id,
-                        io,
-                    );
+                    // Pre-v19: method_not_found. Match historical ensureDaemon —
+                    // terminate when a PID is available and let spawn replace.
+                    // Do not gate on session_count (legacy status counts every shell).
+                    terminateLegacyDaemon(status, authenticated_server_process_id, io);
+                    return;
                 }
                 saw_method = true;
                 last_running_sessions = prepared.running_sessions;
                 last_keep_alive_turns = prepared.keep_alive_turns;
                 if (prepared.accepted and prepared.safe_to_exit) {
-                    if (waitForDaemonGone(allocator, pref_path, io, deadline_ms)) return;
+                    // Own grace window so a late prepare accept still has time to exit.
+                    const gone_deadline_ms = nowMs() + REPLACEMENT_GONE_GRACE_MS;
+                    if (try waitForDaemonGone(allocator, pref_path, io, gone_deadline_ms)) return;
                     log.warn(
                         "session daemon prepareShutdown accepted but process remained protocol={d} pid={?}",
                         .{ status.protocol_version, status.pid },
@@ -657,15 +694,19 @@ fn replaceIncompatibleDaemon(
                     return error.DaemonReplacementTimeout;
                 }
             }
-        } else |_| {
-            // Endpoint already gone — safe to spawn a replacement.
-            return;
+        } else |err| {
+            // Only connect-class failures mean the endpoint is gone. Parse
+            // failures / internal_error must not trigger a doomed respawn.
+            if (isEndpointGoneError(err)) return;
+            // Transient or protocol errors: retry until deadline.
         }
         std.Io.sleep(io, .fromMilliseconds(REPLACEMENT_POLL_MS), .awake) catch {};
     }
 
     if (!saw_method) {
-        return terminateEmptyLegacyDaemon(status, authenticated_server_process_id, io);
+        // No prepareShutdown surface observed — treat as legacy terminate+respawn.
+        terminateLegacyDaemon(status, authenticated_server_process_id, io);
+        return;
     }
     log.warn(
         "session daemon replacement blocked live_sessions={d} keep_alive_turns={d} protocol={d}",
@@ -674,26 +715,38 @@ fn replaceIncompatibleDaemon(
     return error.DaemonReplacementBlocked;
 }
 
-fn terminateEmptyLegacyDaemon(
+/// Historical pre-v19 replacement: SIGTERM/pipe-kill when a PID is known, then
+/// return so ensureDaemon can spawn. Never returns DaemonReplacementBlocked —
+/// callers use bare `try` and must not surface a new error on the legacy path.
+fn terminateLegacyDaemon(
     status: DaemonStatus,
     authenticated_server_process_id: ?u32,
     io: std.Io,
-) !void {
-    const sessions = status.running_session_count orelse status.session_count orelse 0;
-    const turns = status.keep_alive_turn_count orelse status.chat_turn_count orelse 0;
-    if (sessions > 0 or turns > 0) return error.DaemonReplacementBlocked;
-    const pid = daemonProcessIdForReplacement(builtin.os.tag, status.pid, authenticated_server_process_id) orelse
-        return error.DaemonReplacementBlocked;
-    terminateDaemonProcess(pid);
-    std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+) void {
+    if (daemonProcessIdForReplacement(builtin.os.tag, status.pid, authenticated_server_process_id)) |pid| {
+        terminateDaemonProcess(pid);
+        std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+    }
 }
 
-fn waitForDaemonGone(allocator: std.mem.Allocator, pref_path: []const u8, io: std.Io, deadline_ms: i64) bool {
+/// Connect-class errors only. A live daemon that returns parse/internal errors
+/// must not be classified as gone (would doom spawn with EndpointInUse).
+fn isEndpointGoneError(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionRefused, error.FileNotFound => true,
+        else => false,
+    };
+}
+
+/// Returns true when the endpoint is connect-gone. Propagates non-connect errors
+/// so callers can distinguish a live-but-unhappy daemon from a free endpoint.
+fn waitForDaemonGone(allocator: std.mem.Allocator, pref_path: []const u8, io: std.Io, deadline_ms: i64) !bool {
     while (nowMs() <= deadline_ms) {
         if (requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
             allocator.free(response);
-        } else |_| {
-            return true;
+        } else |err| {
+            if (isEndpointGoneError(err)) return true;
+            // Still reachable but unhappy — keep waiting within the grace window.
         }
         std.Io.sleep(io, .fromMilliseconds(REPLACEMENT_POLL_MS), .awake) catch {};
     }
@@ -1533,7 +1586,7 @@ pub const Daemon = struct {
     pub fn init(allocator: std.mem.Allocator) Daemon {
         return .{
             .allocator = allocator,
-            .idle_exit_ms = idleExitMsFromEnv(),
+            .idle_exit_ms = idleExitMsFromEnv(allocator),
         };
     }
 
@@ -2249,20 +2302,18 @@ fn sessionizerServerShouldStop(raw_context: *anyopaque) bool {
 /// `platform_ipc.serve` (FIRST_PIPE_INSTANCE); this probe is Unix-oriented.
 fn sessionizerEndpointIsLive(io: std.Io, endpoint: []const u8) bool {
     if (builtin.os.tag == .windows) return false;
-    const address = std.Io.net.UnixAddress.init(endpoint) catch return false;
-    const stream = address.connect(io) catch return false;
-    stream.close(io);
-    return true;
+    return platform_ipc.unixEndpointAcceptsConnections(io, endpoint);
 }
 
 /// Optional idle-exit override for hermetic tests. Unset/empty => persistent.
-fn idleExitMsFromEnv() ?i64 {
+/// Uses the daemon allocator (not page_allocator) so test GPAs observe the alloc.
+fn idleExitMsFromEnv(allocator: std.mem.Allocator) ?i64 {
     const environ: std.process.Environ = if (builtin.os.tag == .windows)
         .{ .block = .global }
     else
         .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
-    const raw = environ.getAlloc(std.heap.page_allocator, IDLE_EXIT_ENV_NAME) catch return null;
-    defer std.heap.page_allocator.free(raw);
+    const raw = environ.getAlloc(allocator, IDLE_EXIT_ENV_NAME) catch return null;
+    defer allocator.free(raw);
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return null;
     const parsed = std.fmt.parseInt(i64, trimmed, 10) catch return null;
@@ -3371,10 +3422,38 @@ test "session id for leaf preserves existing id" {
 }
 
 test "sessionizer socket paths use Verde pref path" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
+    // Hermetic: pin/clear override so pref-derived derivation is what we assert.
+    const prev = std.c.getenv(SESSIONIZER_SOCKET_ENV_NAME);
+    _ = unsetenv(SESSIONIZER_SOCKET_ENV_NAME);
+    defer {
+        if (prev) |value| {
+            _ = setenv(SESSIONIZER_SOCKET_ENV_NAME, value, 1);
+        }
+    }
     const socket = try socketPath(allocator, "/tmp/verde");
     defer allocator.free(socket);
     try std.testing.expect(std.mem.endsWith(u8, socket, "/tmp/verde/" ++ SOCKET_NAME));
+}
+
+test "sessionizer socket path honors VERDE_SESSIONIZER_SOCKET override" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const override_path = "/tmp/verde-sessionizer-override-test.sock";
+    const prev = std.c.getenv(SESSIONIZER_SOCKET_ENV_NAME);
+    try std.testing.expect(setenv(SESSIONIZER_SOCKET_ENV_NAME, override_path, 1) == 0);
+    defer {
+        if (prev) |value| {
+            _ = setenv(SESSIONIZER_SOCKET_ENV_NAME, value, 1);
+        } else {
+            _ = unsetenv(SESSIONIZER_SOCKET_ENV_NAME);
+        }
+    }
+
+    const socket = try socketPath(allocator, "/tmp/verde-ignored-pref");
+    defer allocator.free(socket);
+    try std.testing.expectEqualStrings(override_path, socket);
 }
 
 test "Windows sessionizer pipe name is stable across path spelling" {
@@ -3548,17 +3627,26 @@ test "prepareShutdown preserves unconsumed completed turns" {
 
 test "idle exit is disabled by default and honors override" {
     const allocator = std.testing.allocator;
+    // Pin idle env so Daemon.init does not inherit a runner override.
+    const prev_idle = std.c.getenv(IDLE_EXIT_ENV_NAME);
+    _ = unsetenv(IDLE_EXIT_ENV_NAME);
+    defer {
+        if (prev_idle) |value| {
+            _ = setenv(IDLE_EXIT_ENV_NAME, value, 1);
+        }
+    }
     var daemon = Daemon.init(allocator);
     defer daemon.deinit();
 
-    daemon.idle_exit_ms = null;
+    try std.testing.expect(daemon.idle_exit_ms == null);
     try std.testing.expect(!daemon.shouldExitForIdle());
     try std.testing.expect(!daemon.shouldExitForIdle());
 
     daemon.idle_exit_ms = 0;
     daemon.idle_since_ms = null;
     try std.testing.expect(!daemon.shouldExitForIdle()); // first observation arms the timer
-    daemon.idle_since_ms = nowMs() - LEGACY_IDLE_EXIT_MS;
+    // Historical 30s idle window is enough to prove the override elapsed.
+    daemon.idle_since_ms = nowMs() - (30 * std.time.ms_per_s);
     try std.testing.expect(daemon.shouldExitForIdle());
 }
 
@@ -3568,6 +3656,8 @@ test "stale sessionizer endpoint is not treated as live" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
+    // Use a short /tmp path rather than testing.tmpDir: AF_UNIX sun_path is
+    // ~104 bytes on Linux, and Zig's nested tmpDir paths routinely overflow it.
     const base = try std.fmt.allocPrint(allocator, "/tmp/verde-lifecycle-stale-{d}", .{platform_runtime.processId()});
     defer allocator.free(base);
     defer std.Io.Dir.cwd().deleteTree(io, base) catch {};
@@ -3589,6 +3679,7 @@ test "live sessionizer endpoint probe detects a listening daemon socket" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
+    // Short /tmp path: sun_path ~104-byte limit rejects long testing.tmpDir paths.
     const base = try std.fmt.allocPrint(allocator, "/tmp/verde-lifecycle-live-{d}", .{platform_runtime.processId()});
     defer allocator.free(base);
     defer std.Io.Dir.cwd().deleteTree(io, base) catch {};
