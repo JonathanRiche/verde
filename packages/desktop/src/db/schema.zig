@@ -138,7 +138,7 @@ fn migrate(conn: zqlite.Conn, comptime failure_point: MigrationFailurePoint) !vo
                 try conn.execNoArgs("pragma user_version = 1");
                 version = 1;
             },
-            else => unreachable,
+            else => return error.DatabaseSchemaInvalid,
         }
     }
 
