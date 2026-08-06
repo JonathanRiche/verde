@@ -160,6 +160,36 @@ pub fn build(b: *std.Build) void {
     headless_test_cmd.setCwd(b.path("packages/headless"));
     const headless_test_step = b.step("headless-test", "Run headless package unit tests from the repo root");
     headless_test_step.dependOn(&headless_test_cmd.step);
+
+    // Hermetic headless client ↔ forked session-daemon integration (desktop graph).
+    const headless_daemon_it_cmd = addDesktopCommand(b, test_optimize, .{
+        .subcommand = "headless-daemon-it",
+        .forward_runtime_args = false,
+        .target = target,
+        .version = version,
+        .ui_debug = ui_debug,
+        .palette_renderer = palette_renderer,
+        .browser_backend = browser_backend,
+        .terminal_backend = terminal_backend,
+        .local_ipc = local_ipc,
+        .windows_integrations = windows_integrations,
+        .build_fff = build_fff,
+        .fff_cargo_target = fff_cargo_target,
+        .fff_lib_dir = fff_lib_dir,
+        .fff_import_lib = fff_import_lib,
+        .fff_runtime_lib = fff_runtime_lib,
+        .sdl3_include_dir = sdl3_include_dir,
+        .sdl3_lib_dir = sdl3_lib_dir,
+        .sdl3_runtime_lib = sdl3_runtime_lib,
+        .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
+        .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
+        .sdl3_ttf_runtime_lib = sdl3_ttf_runtime_lib,
+        .webview2_include_dir = webview2_include_dir,
+        .webview2_loader_lib = webview2_loader_lib,
+        .webview2_loader_dll = webview2_loader_dll,
+    });
+    const headless_daemon_it_step = b.step("headless-daemon-it", "Hermetic headless client/session-daemon integration test");
+    headless_daemon_it_step.dependOn(&headless_daemon_it_cmd.step);
 }
 
 const DesktopCommandOptions = struct {
