@@ -31,6 +31,22 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("headless-daemon-it --daemon requires pref_path\n", .{});
                 std.process.exit(2);
             };
+            // Optional --parent-pid so a panicked/aborted IT parent cannot leave
+            // an orphan daemon (defers are skipped on panic/abort).
+            var parent_pid: ?std.posix.pid_t = null;
+            while (iterator.next()) |flag| {
+                if (std.mem.eql(u8, flag, "--parent-pid")) {
+                    const raw = iterator.next() orelse {
+                        std.debug.print("headless-daemon-it --daemon --parent-pid requires a pid\n", .{});
+                        std.process.exit(2);
+                    };
+                    parent_pid = std.fmt.parseInt(std.posix.pid_t, raw, 10) catch {
+                        std.debug.print("headless-daemon-it: invalid --parent-pid\n", .{});
+                        std.process.exit(2);
+                    };
+                }
+            }
+            installItDaemonCleanupGuards(parent_pid);
             try sessionizer.runDaemon(allocator, pref_path);
             return;
         }
@@ -85,8 +101,14 @@ fn spawnIsolatedDaemonWithEnv(
         _ = env_map.swapRemove("VERDE_SESSION_DAEMON_IDLE_EXIT_MS");
     }
 
+    // Pass the IT parent pid so the --daemon child can self-terminate if this
+    // process panics/aborts (defers do not run). Prefer getpid over getppid in
+    // the child so nested wrappers cannot confuse the guard.
+    var parent_pid_buf: [32]u8 = undefined;
+    const parent_pid_arg = try std.fmt.bufPrint(&parent_pid_buf, "{d}", .{platform_runtime.processId()});
+
     var child = try std.process.spawn(io, .{
-        .argv = &.{ self_exe, "--daemon", pref_path },
+        .argv = &.{ self_exe, "--daemon", pref_path, "--parent-pid", parent_pid_arg },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -110,6 +132,40 @@ fn spawnIsolatedDaemonWithEnv(
 fn currentEnviron() std.process.Environ {
     if (builtin.os.tag == .windows) return .{ .block = .global };
     return .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+}
+
+/// Ensure IT daemon children do not outlive a crashed parent.
+///
+/// Linux: PR_SET_PDEATHSIG delivers SIGTERM when the parent dies (covers
+/// panic/abort where parent defers never run). Portable fallback: a poll
+/// thread watches `--parent-pid` via kill(pid, 0) and process.exit's when gone.
+/// Empty-daemon idle exit remains a separate env override (see lifecycle tests).
+fn installItDaemonCleanupGuards(parent_pid: ?std.posix.pid_t) void {
+    if (builtin.os.tag == .linux) {
+        // Race: parent may die between fork and prctl; check after arming.
+        _ = std.posix.prctl(.SET_PDEATHSIG, .{@as(usize, @intFromEnum(std.posix.SIG.TERM))}) catch {};
+        // Parent may have already died between spawn and prctl; reparented to init.
+        if (std.posix.getppid() == 1) {
+            std.process.exit(0);
+        }
+    }
+    if (parent_pid) |pid| {
+        const thread = std.Thread.spawn(.{}, parentDeathWatchThread, .{pid}) catch return;
+        thread.detach();
+    }
+}
+
+fn parentDeathWatchThread(parent_pid: std.posix.pid_t) void {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    while (true) {
+        // Signal 0 only checks liveness (portable parent-death fallback).
+        std.posix.kill(parent_pid, @enumFromInt(0)) catch {
+            // Parent is gone (or not killable): exit so orphan PTYs die with us.
+            std.process.exit(0);
+        };
+        std.Io.sleep(io, .fromMilliseconds(200), .awake) catch {};
+    }
 }
 
 fn runIntegration(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -245,6 +301,7 @@ fn runLifecycleBindGuard(allocator: std.mem.Allocator, io: std.Io) !void {
     defer first.kill(io);
 
     // Second daemon on the same pref must refuse (live endpoint), not unlink.
+    // No parent-pid guard needed: this process exits immediately on EndpointInUse.
     var second = try std.process.spawn(io, .{
         .argv = &.{ self_exe, "--daemon", pref_path },
         .stdin = .ignore,

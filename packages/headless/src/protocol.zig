@@ -84,8 +84,12 @@ pub const Request = struct {
 };
 
 /// Typed response envelope: exactly one of result or err is meaningful.
+///
+/// `id` is optional so daemon generic internal-error paths that emit
+/// `"id": null` still round-trip through parseResponse (callers receive the
+/// error envelope rather than InvalidRequest).
 pub const Response = struct {
-    id: u64,
+    id: ?u64,
     result: ?std.json.Value = null,
     err: ?Error = null,
 
@@ -194,6 +198,7 @@ pub fn parseRequest(allocator: std.mem.Allocator, json_bytes: []const u8) !Parse
 }
 
 /// Parse a response envelope. Unknown fields are ignored; bad/oversized JSON is invalid_request.
+/// Accepts numeric or null `id` so error envelopes with `"id": null` round-trip.
 pub fn parseResponse(allocator: std.mem.Allocator, json_bytes: []const u8) !ParsedResponse {
     try rejectOversizedOrEmpty(json_bytes);
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{
@@ -204,7 +209,7 @@ pub fn parseResponse(allocator: std.mem.Allocator, json_bytes: []const u8) !Pars
 
     if (parsed.value != .object) return error.InvalidRequest;
     const obj = parsed.value.object;
-    const id = jsonU64(obj.get("id") orelse .null) orelse return error.InvalidRequest;
+    const id = try jsonOptionalU64(obj.get("id") orelse .null);
 
     if (obj.get("error")) |err_value| {
         if (err_value != .object) return error.InvalidRequest;
@@ -248,6 +253,16 @@ fn jsonU64(value: std.json.Value) ?u64 {
     };
 }
 
+/// Response ids may be a non-negative integer or JSON null (daemon internal errors).
+fn jsonOptionalU64(value: std.json.Value) !?u64 {
+    return switch (value) {
+        .null => null,
+        .integer => |int| if (int >= 0) @as(u64, @intCast(int)) else error.InvalidRequest,
+        .number_string => |text| std.fmt.parseInt(u64, text, 10) catch return error.InvalidRequest,
+        else => error.InvalidRequest,
+    };
+}
+
 test "envelope round-trip encode/decode request and ok response" {
     const allocator = std.testing.allocator;
     const req_json = try encodeRequest(allocator, 42, "core.status", .{ .extra = true });
@@ -276,7 +291,7 @@ test "envelope round-trip encode/decode request and ok response" {
     var parsed_ok = try parseResponse(allocator, ok_json);
     defer parsed_ok.deinit();
     try std.testing.expect(parsed_ok.response.isOk());
-    try std.testing.expectEqual(@as(u64, 42), parsed_ok.response.id);
+    try std.testing.expectEqual(@as(?u64, 42), parsed_ok.response.id);
     const result = parsed_ok.response.result.?;
     try std.testing.expect(result == .object);
     try std.testing.expectEqual(
@@ -294,8 +309,23 @@ test "parseResponse reads error envelopes" {
     var parsed = try parseResponse(allocator, err_json);
     defer parsed.deinit();
     try std.testing.expect(!parsed.response.isOk());
+    try std.testing.expectEqual(@as(?u64, 7), parsed.response.id);
     try std.testing.expectEqualStrings(ERR_UNKNOWN_METHOD, parsed.response.err.?.code);
     try std.testing.expectEqualStrings("nope", parsed.response.err.?.message);
+}
+
+test "parseResponse accepts null id on error envelopes" {
+    const allocator = std.testing.allocator;
+    // Matches the daemon generic internal-error path (id: null).
+    const err_json =
+        \\{"jsonrpc":"2.0","id":null,"error":{"code":"internal_error","message":"OutOfMemory"}}
+    ;
+    var parsed = try parseResponse(allocator, err_json);
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.response.isOk());
+    try std.testing.expect(parsed.response.id == null);
+    try std.testing.expectEqualStrings("internal_error", parsed.response.err.?.code);
+    try std.testing.expectEqualStrings("OutOfMemory", parsed.response.err.?.message);
 }
 
 test "invalid or empty JSON yields InvalidRequest" {
