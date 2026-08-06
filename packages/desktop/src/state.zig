@@ -4041,6 +4041,8 @@ pub const AppState = struct {
     pub const clearTranscriptMarkdownEntries = transcript_controller.clearTranscriptMarkdownEntries;
     pub const transcriptMarkdownBodyEntry = transcript_controller.transcriptMarkdownBodyEntry;
     pub const transcriptPlainBodyEntry = transcript_controller.transcriptPlainBodyEntry;
+    pub const pendingTranscriptPlainBodyEntry = transcript_controller.pendingTranscriptPlainBodyEntry;
+    pub const clearPendingTranscriptBody = transcript_controller.clearPendingTranscriptBody;
     pub const createTranscriptMarkdownBody = transcript_controller.createTranscriptMarkdownBody;
     pub const buildCurrentTranscriptSelectionText = transcript_controller.buildCurrentTranscriptSelectionText;
 

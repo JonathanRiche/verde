@@ -2442,7 +2442,8 @@ fn transcriptPendingStreamHeight(state: *app_state.AppState, thread: *const app_
     const stream_text: []const u8 = send_state.partial_text.items;
     const body_for_height = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
     const stream_plain = stream_text.len > 0;
-    total += transcriptMessageHeightStream(null, null, body_for_height, .assistant, column_width, "", stream_plain, stream_text.len > 0) + theme.scaledUi(12.0);
+    const stream_msg_idx = base + send_state.pending_events.items.len;
+    total += transcriptMessageHeightStream(state, stream_msg_idx, body_for_height, .assistant, column_width, "", stream_plain, stream_text.len > 0) + theme.scaledUi(12.0);
     return total;
 }
 
@@ -2520,8 +2521,8 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
     const stream_text: []const u8 = send_state.partial_text.items;
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
     const stream_plain = stream_text.len > 0;
-    const assistant_h = transcriptMessageHeightStream(null, null, body, .assistant, column.w, "", stream_plain, stream_text.len > 0);
     const stream_msg_idx = base_message_index + send_state.pending_events.items.len;
+    const assistant_h = transcriptMessageHeightStream(state, stream_msg_idx, body, .assistant, column.w, "", stream_plain, stream_text.len > 0);
     if (y + assistant_h >= column.y and y <= column.y + column.h) {
         renderTranscriptBubbleFromParts(state, column, y, assistant_h, .assistant, working_label, body, stream_text.len == 0, stream_plain, clip, stream_msg_idx, stream_text.len > 0, true);
     }
@@ -2937,6 +2938,17 @@ fn transcriptMessageHeightStream(
         defer view.deinit(std.heap.page_allocator);
         const measured = chat_markdown.measureBodyHeight(view, body_inner_width, markdownOptions(font_size));
         return theme.scaledUi(46.0) + measured;
+    }
+    if (state) |app| {
+        if (message_index) |index| {
+            const cached = if (streaming)
+                app.pendingTranscriptPlainBodyEntry(body)
+            else
+                app.transcriptPlainBodyEntry(index, body);
+            if (cached) |entry| {
+                return theme.scaledUi(46.0) + chat_markdown.measureBodyHeight(entry.view, body_inner_width, transcriptPlainTextOptions(theme.COLOR_WHITE));
+            }
+        }
     }
     var plain_view = chat_markdown.buildPlainBodyView(std.heap.page_allocator, body) catch {
         const chars_per_line = @max(@as(usize, @intFromFloat(body_inner_width / (font_size * 0.52))), 1);
@@ -5013,6 +5025,7 @@ fn renderTranscriptBubbleFromParts(
             body_text,
             if (muted_body) theme.COLOR_TEXT_MUTED else theme.COLOR_WHITE,
             clip,
+            streaming,
         );
     }
 }
@@ -5073,12 +5086,16 @@ fn renderMarkdownBodyView(state: *app_state.AppState, message_index: usize, rect
     renderSelectableBodyView(state, message_index, rect, view, clip, transcriptMarkdownOptions(), true);
 }
 
-fn renderPlainSelectableBody(state: *app_state.AppState, message_index: usize, rect: palette.Rect, body: []const u8, color: [4]f32, clip: palette.Rect) void {
+// Pending or committed selectable plain-text transcript body.
+fn renderPlainSelectableBody(state: *app_state.AppState, message_index: usize, rect: palette.Rect, body: []const u8, color: [4]f32, clip: palette.Rect, streaming: bool) void {
     if (body.len == 0) return;
-    // Committed rows are immutable between transcript mutations. Reuse their
-    // parsed selectable geometry; pending stream indices intentionally miss
-    // this cache and continue rebuilding from their latest body immediately.
-    if (state.transcriptPlainBodyEntry(message_index, body)) |entry| {
+    // Stream entries replace their cache on each delta, while animation-only
+    // frames replay the unchanged selectable geometry immediately.
+    const cached = if (streaming)
+        state.pendingTranscriptPlainBodyEntry(body)
+    else
+        state.transcriptPlainBodyEntry(message_index, body);
+    if (cached) |entry| {
         renderSelectableBodyEntry(state, message_index, rect, entry, clip, transcriptPlainTextOptions(color), false);
         return;
     }
@@ -5208,15 +5225,10 @@ fn replayTranscriptBodyRenderCache(
             .clip = null,
             .code_copy_recorder = null,
         };
-        var output = chat_markdown.renderSelectablePaletteBody(
-            &context,
-            state.allocator,
-            entry.view,
-            options,
-            null,
-            false,
-        );
-        output.deinit(state.allocator);
+        // Selection-aware frames bypass this cache above. Build the static
+        // commands with the shared visual layout path so an incoming stream
+        // delta does not allocate throwaway per-line selection geometry.
+        chat_markdown.renderPaletteBody(&context, entry.view, options);
         entry.render_cache_key = key;
     }
 

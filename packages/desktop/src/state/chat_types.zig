@@ -173,6 +173,7 @@ pub const ChatThread = struct {
     send_state: *SendState,
     title_generation_state: *TitleGenerationState,
     transcript_markdown_entries: std.ArrayList(?*TranscriptMarkdownBody),
+    pending_transcript_body: ?*TranscriptMarkdownBody,
     transcript_height_entries: std.ArrayList(TranscriptHeightEntry),
     transcript_layout_items: std.ArrayList(TranscriptLayoutItem),
     transcript_layout_width: f32 = 0.0,
@@ -216,6 +217,7 @@ pub const ChatThread = struct {
             .send_state = send_state,
             .title_generation_state = title_generation_state,
             .transcript_markdown_entries = .empty,
+            .pending_transcript_body = null,
             .transcript_height_entries = .empty,
             .transcript_layout_items = .empty,
             .transcript_scroll_valid = false,
@@ -605,6 +607,8 @@ pub const ChatThread = struct {
     pub fn deinit(self: *ChatThread, allocator: std.mem.Allocator) void {
         self.deinitSendState(allocator);
         self.deinitTitleGenerationState(allocator);
+        if (self.pending_transcript_body) |entry| entry.deinit(allocator);
+        self.pending_transcript_body = null;
         self.clearTranscriptMarkdownEntries(allocator);
         self.transcript_markdown_entries.deinit(allocator);
         self.transcript_height_entries.deinit(allocator);

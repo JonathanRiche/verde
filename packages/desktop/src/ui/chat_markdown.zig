@@ -4170,6 +4170,52 @@ test "plain transcript selection preserves user and system text literally" {
     try expectWholeBodyCopy("User *literal* text\nSystem notice", true, "User *literal* text\nSystem notice");
 }
 
+test "static and selectable plain transcript rendering share layout height" {
+    const allocator = std.testing.allocator;
+    var body = try buildPlainBodyView(
+        allocator,
+        "A streamed paragraph long enough to wrap across several visual lines without changing its literal text.\nThen another line arrives.",
+    );
+    defer body.deinit(allocator);
+
+    var static_batch: palette.RenderBatch = .{};
+    defer static_batch.deinit(allocator);
+    var static_text: std.ArrayList(u8) = .empty;
+    defer static_text.deinit(allocator);
+    var static_arena = std.heap.ArenaAllocator.init(allocator);
+    defer static_arena.deinit();
+    var static_context: PaletteRenderContext = .{
+        .allocator = allocator,
+        .batch = &static_batch,
+        .frame_text = &static_text,
+        .text_arena = &static_arena,
+        .cursor = .{ .x = 0.0, .y = 0.0, .w = 240.0, .h = 600.0 },
+        .available_width = 240.0,
+    };
+
+    var selectable_batch: palette.RenderBatch = .{};
+    defer selectable_batch.deinit(allocator);
+    var selectable_text: std.ArrayList(u8) = .empty;
+    defer selectable_text.deinit(allocator);
+    var selectable_arena = std.heap.ArenaAllocator.init(allocator);
+    defer selectable_arena.deinit();
+    var selectable_context: PaletteRenderContext = .{
+        .allocator = allocator,
+        .batch = &selectable_batch,
+        .frame_text = &selectable_text,
+        .text_arena = &selectable_arena,
+        .cursor = .{ .x = 0.0, .y = 0.0, .w = 240.0, .h = 600.0 },
+        .available_width = 240.0,
+    };
+
+    const options: RenderOptions = .{ .base_font_size = 16.0, .line_height = 22.0 };
+    renderPaletteBody(&static_context, body, options);
+    var output = renderSelectablePaletteBody(&selectable_context, allocator, body, options, null, false);
+    defer output.deinit(allocator);
+
+    try std.testing.expectApproxEqAbs(static_context.cursor.y, selectable_context.cursor.y, 0.001);
+}
+
 test "unicode arrows survive markdown flatten for chat prose" {
     // Agents often write path edges as →/⇒ in chat. Keep them as real Unicode
     // so the prose font-fallback chain can render them (Noto Sans lacks the

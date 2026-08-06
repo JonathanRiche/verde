@@ -441,9 +441,11 @@ pub const State = struct {
     pending_send_count: usize = 0,
     codex_background_poll: CodexBackgroundPollState = .{},
     daemon_tail_response_buffer: ?[]u8 = null,
+    daemon_tail_connection: sessionizer.ReusableRequestConnection = .{},
 
     /// Releases chat-controller-owned polling scratch space.
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
+        self.daemon_tail_connection.deinit();
         if (self.daemon_tail_response_buffer) |buffer| allocator.free(buffer);
         self.daemon_tail_response_buffer = null;
     }
@@ -2771,7 +2773,7 @@ pub fn pollDaemonChatTurn(self: anytype, thread: *ChatThread) bool {
         log.warn("failed to allocate daemon chat tail buffer: {s}", .{@errorName(err)});
         return false;
     };
-    const response = sessionizer.requestAllocUsingBuffer(
+    const response = self.chat_controller.daemon_tail_connection.requestAllocUsingBuffer(
         page_alloc,
         self.storage.pref_path,
         "chat.turn.tail",
@@ -3123,6 +3125,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
     if (next_status != .idle) {
         self.chat_controller.finishSend();
         thread.finishSendThread();
+        self.clearPendingTranscriptBody(thread);
         if (project_index < self.project_controller.projects.items.len) {
             self.project_controller.projects.items[project_index].invalidateSidebarThreadCache();
         }

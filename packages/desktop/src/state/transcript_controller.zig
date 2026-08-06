@@ -313,18 +313,21 @@ pub fn transcriptBodyEntry(self: anytype, message_index: usize, body: []const u8
     const thread = self.currentThreadMutable();
     thread.ensureTranscriptMarkdownEntries(self.allocator);
     if (message_index >= thread.transcript_markdown_entries.items.len) return null;
+    return transcriptBodyEntryForSlot(self, &thread.transcript_markdown_entries.items[message_index], body, kind);
+}
 
-    if (thread.transcript_markdown_entries.items[message_index]) |entry| {
+fn transcriptBodyEntryForSlot(self: anytype, slot: *?*TranscriptMarkdownBody, body: []const u8, kind: TranscriptBodyKind) ?*TranscriptMarkdownBody {
+    if (slot.*) |entry| {
         if (entry.kind != kind or !std.mem.eql(u8, entry.owned_body, body)) {
             entry.deinit(self.allocator);
-            thread.transcript_markdown_entries.items[message_index] = null;
+            slot.* = null;
         } else {
             return entry;
         }
     }
 
     const created = createTranscriptBody(self, body, kind) catch return null;
-    thread.transcript_markdown_entries.items[message_index] = created;
+    slot.* = created;
     return created;
 }
 
@@ -334,6 +337,19 @@ pub fn transcriptMarkdownBodyEntry(self: anytype, message_index: usize, body: []
 
 pub fn transcriptPlainBodyEntry(self: anytype, message_index: usize, body: []const u8) ?*TranscriptMarkdownBody {
     return transcriptBodyEntry(self, message_index, body, .plain);
+}
+
+/// Returns parsed geometry for the current in-flight assistant text.
+pub fn pendingTranscriptPlainBodyEntry(self: anytype, body: []const u8) ?*TranscriptMarkdownBody {
+    if (body.len == 0) return null;
+    const thread = self.currentThreadMutable();
+    return transcriptBodyEntryForSlot(self, &thread.pending_transcript_body, body, .plain);
+}
+
+/// Releases parsed/render data retained only for an in-flight assistant row.
+pub fn clearPendingTranscriptBody(self: anytype, thread: *chat_types.ChatThread) void {
+    if (thread.pending_transcript_body) |entry| entry.deinit(self.allocator);
+    thread.pending_transcript_body = null;
 }
 
 pub fn createTranscriptBody(self: anytype, body: []const u8, kind: TranscriptBodyKind) !*TranscriptMarkdownBody {
@@ -379,6 +395,21 @@ test "transcript body cache preserves markdown and literal plain parsing" {
     try std.testing.expect(plain.document == null);
     try std.testing.expectEqual(@as(usize, 1), plain.blockCount());
     try std.testing.expectEqualStrings(source, plain.blockAt(0).text.text);
+}
+
+test "pending transcript body slot reuses unchanged text and replaces changed text" {
+    const FakeState = struct {
+        allocator: std.mem.Allocator,
+    };
+    var state: FakeState = .{ .allocator = std.testing.allocator };
+    var slot: ?*TranscriptMarkdownBody = null;
+    defer if (slot) |entry| entry.deinit(std.testing.allocator);
+
+    const first = transcriptBodyEntryForSlot(&state, &slot, "hello", .plain).?;
+    try std.testing.expectEqual(first, transcriptBodyEntryForSlot(&state, &slot, "hello", .plain).?);
+    const changed = transcriptBodyEntryForSlot(&state, &slot, "hello world", .plain).?;
+    try std.testing.expectEqualStrings("hello world", changed.owned_body);
+    try std.testing.expectEqual(TranscriptBodyKind.plain, changed.kind);
 }
 
 pub fn buildCurrentTranscriptSelectionText(self: anytype) ![:0]u8 {
