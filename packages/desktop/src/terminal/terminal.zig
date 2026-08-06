@@ -4440,6 +4440,15 @@ fn encodeTerminalKeyChord(
     try ghostty_vt.input.encodeKey(writer, key_event, options);
 }
 
+/// Encode a validated key chord with default terminal protocol options.
+/// Used by headless/daemon-direct MCP key delivery where no local VT model exists.
+pub fn encodeKeyChordDefaultAlloc(allocator: std.mem.Allocator, chord: TerminalKeyChord) ![]u8 {
+    var buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try encodeTerminalKeyChord(&writer, chord, .default);
+    return try allocator.dupe(u8, writer.buffered());
+}
+
 fn terminalKeyEvent(chord: TerminalKeyChord, utf8_buffer: *[1]u8) ghostty_vt.input.KeyEvent {
     const codepoint = terminalKeyCodepoint(chord.key);
     var utf8: []const u8 = "";

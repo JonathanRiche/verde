@@ -16,6 +16,7 @@ const spec = @import("spec.zig");
 const db_client = @import("../db/client.zig");
 const db_types = @import("../db/types.zig");
 const sessionizer = @import("../terminal/sessionizer.zig");
+const terminal = @import("../terminal/terminal.zig");
 const app_config = @import("../app/config.zig");
 const theme_package = @import("../theme/package.zig");
 const update_installer = @import("../app/update_installer.zig");
@@ -3506,10 +3507,10 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTypedTool(&s, "open_chat", "Create a native GUI chat pane in an explicitly selected Verde workspace without changing the user's visible workspace or focus.", &OPEN_CHAT_MCP_INPUTS);
     try writeMcpTool(&s, "list_surfaces", "List registered live terminal control surfaces. Use list_panes for ordinary Verde terminal panes.");
     try writeMcpTool(&s, "inspect_surface", "Inspect one Verde terminal surface.");
-    try writeMcpTool(&s, "read_surface_screen", "Read the current screen text for a terminal surface pane.");
-    try writeMcpTool(&s, "tail_surface_output", "Read recent terminal output for a surface pane.");
-    try writeMcpTool(&s, "write_surface_text", "Write text to a terminal surface pane.");
-    try writeMcpTypedTool(&s, "send_terminal_key", "Send one validated atomic key chord to a terminal pane without changing desktop focus.", &TERMINAL_KEY_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "read_surface_screen", "Read terminal screen text. With pane_id uses the desktop Live server; with session_id talks to the session daemon directly (raw_tail fidelity, no GUI).", &TERMINAL_SURFACE_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "tail_surface_output", "Read recent terminal output. With pane_id uses Live; with session_id talks to the session daemon directly (no GUI).", &TERMINAL_SURFACE_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "write_surface_text", "Write text to a terminal. With pane_id uses Live; with session_id talks to the session daemon directly (no GUI).", &TERMINAL_WRITE_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "send_terminal_key", "Send one validated atomic key chord. With pane_id uses Live without changing focus; with session_id writes the encoded key to the session daemon directly (no GUI).", &TERMINAL_KEY_MCP_INPUTS);
     try writeMcpTool(&s, "notify_surface", "Update terminal surface status or notification text.");
     try writeMcpTool(&s, "clear_surface_attention", "Clear terminal surface attention.");
     try writeMcpTypedTool(&s, "list_processes", "List tracked workspace commands, agents, terminal processes, background tasks, and active leases.", &.{
@@ -3655,9 +3656,24 @@ const OPEN_CHAT_MCP_INPUTS = [_]McpToolInput{
     .{ .name = "axis", .type_name = "string", .description = "Optional split axis: horizontal or vertical; defaults to horizontal." },
 };
 
+const TERMINAL_SURFACE_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the agent's workspace. Used with pane_id Live addressing." },
+    .{ .name = "pane_id", .type_name = "integer", .description = "Target terminal workspace pane id for Live (desktop) addressing. Required when session_id is omitted." },
+    .{ .name = "session_id", .type_name = "string", .description = "Stable session-daemon session id for headless daemon-direct addressing. When set, no Live server or GUI is required." },
+    .{ .name = "lines", .type_name = "integer", .description = "Optional number of recent lines for tail_surface_output." },
+};
+
+const TERMINAL_WRITE_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the agent's workspace. Used with pane_id Live addressing." },
+    .{ .name = "pane_id", .type_name = "integer", .description = "Target terminal workspace pane id for Live (desktop) addressing. Required when session_id is omitted." },
+    .{ .name = "session_id", .type_name = "string", .description = "Stable session-daemon session id for headless daemon-direct addressing. When set, no Live server or GUI is required." },
+    .{ .name = "text", .type_name = "string", .description = "Text to write to the terminal.", .required = true },
+};
+
 const TERMINAL_KEY_MCP_INPUTS = [_]McpToolInput{
-    .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the agent's workspace." },
-    .{ .name = "pane_id", .type_name = "integer", .description = "Target terminal workspace pane id.", .required = true },
+    .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the agent's workspace. Used with pane_id Live addressing." },
+    .{ .name = "pane_id", .type_name = "integer", .description = "Target terminal workspace pane id for Live (desktop) addressing. Required when session_id is omitted." },
+    .{ .name = "session_id", .type_name = "string", .description = "Stable session-daemon session id for headless daemon-direct addressing. When set, no Live server or GUI is required." },
     .{ .name = "key", .type_name = "string", .enum_values = &spec.terminal_key_values, .description = "Named key. Use either key plus modifier booleans or chord." },
     .{ .name = "chord", .type_name = "string", .description = "Atomic chord such as shift+tab or ctrl+x. Use instead of key and modifier fields." },
     .{ .name = "ctrl", .type_name = "boolean", .description = "Hold Control for key." },
@@ -3930,20 +3946,45 @@ fn mcpToolsCall(
             break :blk sendLiveRequestAlloc(allocator, io, "surface.inspect", .{ .session_id = session }, 1);
         }
         if (std.mem.eql(u8, tool_name, "read_surface_screen")) {
-            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "read_surface_screen requires pane_id");
+            if (session_id) |daemon_session| {
+                const response = mcpDaemonSessionCallAlloc(allocator, io, "session.screen", .{
+                    .id = daemon_session,
+                    .lines = lines,
+                }) catch |err| return try mcpDaemonUnavailableError(allocator, out, id_value, err);
+                defer allocator.free(response);
+                const tagged = try mcpDaemonScreenResponseWithFidelityAlloc(allocator, response);
+                defer allocator.free(tagged);
+                return try mcpToolTextResult(allocator, out, id_value, tagged, tool_name);
+            }
+            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "read_surface_screen requires pane_id or session_id");
             break :blk sendLiveRequestAlloc(allocator, io, "terminal.screen", .{ .workspace = workspace, .pane = pane }, 1);
         }
         if (std.mem.eql(u8, tool_name, "tail_surface_output")) {
-            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "tail_surface_output requires pane_id");
+            if (session_id) |daemon_session| {
+                const response = mcpDaemonSessionCallAlloc(allocator, io, "session.tail", .{
+                    .id = daemon_session,
+                    .lines = lines,
+                }) catch |err| return try mcpDaemonUnavailableError(allocator, out, id_value, err);
+                defer allocator.free(response);
+                return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+            }
+            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "tail_surface_output requires pane_id or session_id");
             break :blk sendLiveRequestAlloc(allocator, io, "terminal.tail", .{ .workspace = workspace, .pane = pane, .lines = lines }, 1);
         }
         if (std.mem.eql(u8, tool_name, "write_surface_text")) {
-            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "write_surface_text requires pane_id");
             const text = mcpArgString(arguments, "text") orelse return try mcpError(allocator, out, id_value, -32602, "write_surface_text requires text");
+            if (session_id) |daemon_session| {
+                const response = mcpDaemonSessionCallAlloc(allocator, io, "session.write", .{
+                    .id = daemon_session,
+                    .text = text,
+                }) catch |err| return try mcpDaemonUnavailableError(allocator, out, id_value, err);
+                defer allocator.free(response);
+                return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+            }
+            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "write_surface_text requires pane_id or session_id");
             break :blk sendLiveRequestAlloc(allocator, io, "terminal.write", .{ .workspace = workspace, .pane = pane, .text = text }, 1);
         }
         if (std.mem.eql(u8, tool_name, "send_terminal_key")) {
-            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "send_terminal_key requires pane_id");
             const key = mcpArgString(arguments, "key");
             const chord = mcpArgString(arguments, "chord");
             if ((mcpArgIsNonNull(arguments, "key") and key == null) or
@@ -3962,6 +4003,30 @@ fn mcpToolsCall(
             {
                 return try mcpError(allocator, out, id_value, -32602, "send_terminal_key modifiers must be booleans");
             }
+            if (session_id) |daemon_session| {
+                const encoded = mcpEncodeTerminalKeyAlloc(
+                    allocator,
+                    key,
+                    chord,
+                    ctrl orelse false,
+                    alt orelse false,
+                    shift orelse false,
+                    super orelse false,
+                ) catch |err| switch (err) {
+                    error.MissingKey => return try mcpError(allocator, out, id_value, -32602, "send_terminal_key requires exactly one of key or chord"),
+                    error.ConflictingKeySpec => return try mcpError(allocator, out, id_value, -32602, "send_terminal_key accepts key plus modifiers or chord, not both"),
+                    error.InvalidKey => return try mcpError(allocator, out, id_value, -32602, "unsupported terminal key or chord"),
+                    else => return try mcpError(allocator, out, id_value, -32000, @errorName(err)),
+                };
+                defer allocator.free(encoded);
+                const response = mcpDaemonSessionCallAlloc(allocator, io, "session.write", .{
+                    .id = daemon_session,
+                    .text = encoded,
+                }) catch |err| return try mcpDaemonUnavailableError(allocator, out, id_value, err);
+                defer allocator.free(response);
+                return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+            }
+            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "send_terminal_key requires pane_id or session_id");
             break :blk sendLiveRequestAlloc(allocator, io, "terminal.key", .{
                 .workspace = workspace,
                 .pane = pane,
@@ -4049,6 +4114,133 @@ fn mcpToolsCall(
     };
     defer allocator.free(response);
     try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+}
+
+fn mcpDaemonSessionCallAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    method: []const u8,
+    params: anytype,
+) ![]u8 {
+    const exe_path = try platform_runtime.executablePathAlloc(allocator);
+    defer allocator.free(exe_path);
+    try ensureSessionDaemon(allocator, io, exe_path);
+
+    const pref_path = try prefPath(allocator);
+    defer allocator.free(pref_path);
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = allocator,
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(allocator, &transport);
+    var parsed = try client.call(method, params);
+    defer parsed.deinit();
+
+    // Re-encode as a Live-shaped-ish envelope so mcpToolTextResult tagging stays consistent.
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    try s.objectField("ok");
+    try s.write(parsed.response.isOk());
+    if (parsed.response.isOk()) {
+        const result = parsed.response.result orelse return error.InvalidResponse;
+        try s.objectField("result");
+        try s.write(result);
+    } else {
+        try s.objectField("error");
+        try s.beginObject();
+        try s.objectField("code");
+        try s.write(parsed.response.err.?.code);
+        try s.objectField("message");
+        try s.write(parsed.response.err.?.message);
+        try s.endObject();
+    }
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+fn mcpDaemonUnavailableError(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    id_value: std.json.Value,
+    err: anyerror,
+) !void {
+    var message_buf: [128]u8 = undefined;
+    const message = std.fmt.bufPrint(&message_buf, "session daemon unavailable: {s}", .{@errorName(err)}) catch
+        "session daemon unavailable";
+    return mcpError(allocator, out, id_value, -32000, message);
+}
+
+fn mcpDaemonScreenResponseWithFidelityAlloc(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch
+        return allocator.dupe(u8, response);
+    defer parsed.deinit();
+    if (parsed.value != .object) return allocator.dupe(u8, response);
+    const result = parsed.value.object.get("result") orelse return allocator.dupe(u8, response);
+    if (result != .object) return allocator.dupe(u8, response);
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    try s.objectField("ok");
+    try s.write(jsonBool(parsed.value.object.get("ok") orelse .null) orelse true);
+    try s.objectField("result");
+    try s.beginObject();
+    var it = result.object.iterator();
+    while (it.next()) |entry| {
+        try s.objectField(entry.key_ptr.*);
+        try s.write(entry.value_ptr.*);
+    }
+    // Explicit marker: daemon session.screen is a bounded raw ring tail, not a rendered grid.
+    try s.objectField("fidelity");
+    try s.write("raw_tail");
+    try s.endObject();
+    if (parsed.value.object.get("error")) |err_value| {
+        try s.objectField("error");
+        try s.write(err_value);
+    }
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+const McpTerminalKeyEncodeError = error{
+    MissingKey,
+    ConflictingKeySpec,
+    InvalidKey,
+    WriteFailed,
+} || std.mem.Allocator.Error;
+
+fn mcpEncodeTerminalKeyAlloc(
+    allocator: std.mem.Allocator,
+    key: ?[]const u8,
+    chord: ?[]const u8,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    super: bool,
+) McpTerminalKeyEncodeError![]u8 {
+    const modifiers: terminal.TerminalKeyModifiers = .{
+        .ctrl = ctrl,
+        .alt = alt,
+        .shift = shift,
+        .super = super,
+    };
+    const parsed_chord: terminal.TerminalKeyChord = blk: {
+        if (chord) |value| {
+            if (key != null or @as(u4, @bitCast(modifiers)) != 0) return error.ConflictingKeySpec;
+            break :blk terminal.TerminalKeyChord.parse(value) catch return error.InvalidKey;
+        }
+        const key_text = key orelse return error.MissingKey;
+        break :blk .{
+            .key = terminal.TerminalKey.parse(key_text) orelse return error.InvalidKey,
+            .modifiers = modifiers,
+        };
+    };
+    // Default protocol encoding rejects free-form control-character strings
+    // (only allowlisted keys/chords encode), matching Live terminal.key validation.
+    return try terminal.encodeKeyChordDefaultAlloc(allocator, parsed_chord);
 }
 
 fn mcpBrowserEvalAndWaitAlloc(

@@ -1449,6 +1449,13 @@ pub const Daemon = struct {
             return try errorResponseAlloc(self.allocator, id_value, "invalid_request", "missing method");
         const params = parsed.value.object.get("params") orelse .null;
 
+        return self.handleMethodRequest(id_value, method, params) catch |err| switch (err) {
+            error.SessionNotFound => try errorResponseAlloc(self.allocator, id_value, "resource_not_found", "session not found"),
+            else => return err,
+        };
+    }
+
+    fn handleMethodRequest(self: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
         if (std.mem.eql(u8, method, "session.list")) return try self.listResponse(id_value);
         if (std.mem.eql(u8, method, "session.inspect")) return try self.inspectResponse(id_value, params);
         if (std.mem.eql(u8, method, "session.create")) return try self.createResponse(id_value, params);
@@ -3044,6 +3051,22 @@ test "daemon kill response retains the session until termination is observed" {
     }
     try std.testing.expect(!session.running);
     try std.testing.expect(session.exit_status != null);
+}
+
+test "unknown terminal session returns resource_not_found" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":7,"method":"session.tail","params":{"id":"missing-session"}}
+    );
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const err = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings("resource_not_found", err.get("code").?.string);
+    try std.testing.expectEqualStrings("session not found", err.get("message").?.string);
 }
 
 test "stable session id sanitizes project id" {
