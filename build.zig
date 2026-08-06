@@ -143,6 +143,23 @@ pub fn build(b: *std.Build) void {
     });
     const test_compile_step = b.step("test-compile", "Compile desktop tests without running them");
     test_compile_step.dependOn(&test_compile_cmd.step);
+
+    // Focused hermetic gate for packages/headless (std only; no desktop GUI deps).
+    // Runs the standalone package build rather than the desktop graph so the
+    // step stays free of SDL/Palette/Ghostty even when those deps are broken.
+    var headless_argv: std.ArrayList([]const u8) = .empty;
+    defer headless_argv.deinit(b.allocator);
+    headless_argv.appendSlice(b.allocator, &.{ "zig", "build", "headless-test" }) catch @panic("OOM");
+    if (test_optimize != .Debug) {
+        headless_argv.append(b.allocator, b.fmt("-Doptimize={s}", .{@tagName(test_optimize)})) catch @panic("OOM");
+    }
+    if (target) |value| {
+        headless_argv.append(b.allocator, b.fmt("-Dtarget={s}", .{value})) catch @panic("OOM");
+    }
+    const headless_test_cmd = b.addSystemCommand(headless_argv.items);
+    headless_test_cmd.setCwd(b.path("packages/headless"));
+    const headless_test_step = b.step("headless-test", "Run headless package unit tests from the repo root");
+    headless_test_step.dependOn(&headless_test_cmd.step);
 }
 
 const DesktopCommandOptions = struct {

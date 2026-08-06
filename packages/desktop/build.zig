@@ -88,6 +88,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const palette_module = palette.module("palette");
+    // GUI-free protocol core. Linked into the session daemon for core.* methods;
+    // headless-test runs this package alone with no SDL/Palette/Ghostty deps.
+    const headless_module = b.createModule(.{
+        .root_source_file = b.path("../headless/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     // Browser contract tests use a narrower module root than the full app, so
     // portable platform helpers must be explicit imports instead of escaping it.
     const platform_runtime_module = b.createModule(.{
@@ -200,6 +207,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = build_options_module },
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
+                .{ .name = "headless", .module = headless_module },
                 .{ .name = "loop_wakeup", .module = loop_wakeup_module },
                 .{ .name = "palette", .module = palette_module },
                 .{ .name = "platform_paths", .module = platform_paths_module },
@@ -275,6 +283,7 @@ pub fn build(b: *std.Build) void {
                         .{ .name = "build_options", .module = build_options_module },
                         .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                         .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
+                        .{ .name = "headless", .module = headless_module },
                         .{ .name = "loop_wakeup", .module = loop_wakeup_module },
                         .{ .name = "palette", .module = palette_module },
                         .{ .name = "platform_paths", .module = platform_paths_module },
@@ -493,6 +502,19 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     const test_compile_step = b.step("test-compile", "Compile unit tests without running them");
+    // Headless package tests are hermetic (std only) and intentionally avoid
+    // SDL/Palette/Ghostty/zqlite so they stay a fast focused gate for core.* work.
+    const headless_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("../headless/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const headless_test_step = b.step("headless-test", "Run headless package unit tests (no GUI deps)");
+    headless_test_step.dependOn(&b.addRunArtifact(headless_tests).step);
+    test_compile_step.dependOn(&headless_tests.step);
+    addTestArtifact(b, test_step, headless_tests, target);
     const chat_markdown_tests = b.addTest(.{
         .root_module = chat_markdown,
     });
@@ -568,6 +590,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = build_options_module },
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
+                .{ .name = "headless", .module = headless_module },
                 .{ .name = "loop_wakeup", .module = loop_wakeup_module },
                 .{ .name = "palette", .module = palette.module("palette") },
                 .{ .name = "platform_paths", .module = platform_paths_module },
