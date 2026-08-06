@@ -16,6 +16,7 @@ pub const top_level_commands = [_][]const u8{
     "notify",
     "integrations",
     "session",
+    "core",
     "live",
     "mcp",
     "completion",
@@ -76,6 +77,11 @@ pub const session_commands = [_][]const u8{
     "screen",
     "kill",
     "cleanup",
+};
+
+pub const core_commands = [_][]const u8{
+    "status",
+    "capabilities",
 };
 
 pub const live_commands = [_][]const u8{
