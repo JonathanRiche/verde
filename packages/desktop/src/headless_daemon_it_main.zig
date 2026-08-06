@@ -15,6 +15,13 @@ const platform_paths = @import("platform_paths");
 const platform_runtime = @import("platform_runtime");
 const sessionizer = @import("terminal/sessionizer.zig");
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+/// Safety-net idle for every IT daemon so a crashed run cannot leave a
+/// permanent daemon+socket when persistent-by-default is enabled.
+const IT_SAFETY_IDLE_EXIT_MS = "30000";
+
 pub fn main(init: std.process.Init) !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
@@ -40,10 +47,12 @@ pub fn main(init: std.process.Init) !void {
                         std.debug.print("headless-daemon-it --daemon --parent-pid requires a pid\n", .{});
                         std.process.exit(2);
                     };
-                    parent_pid = std.fmt.parseInt(std.posix.pid_t, raw, 10) catch {
-                        std.debug.print("headless-daemon-it: invalid --parent-pid\n", .{});
-                        std.process.exit(2);
-                    };
+                    if (comptime builtin.os.tag != .windows) {
+                        parent_pid = std.fmt.parseInt(std.posix.pid_t, raw, 10) catch {
+                            std.debug.print("headless-daemon-it: invalid --parent-pid\n", .{});
+                            std.process.exit(2);
+                        };
+                    }
                 }
             }
             installItDaemonCleanupGuards(parent_pid);
@@ -63,6 +72,7 @@ pub fn main(init: std.process.Init) !void {
     try runIntegration(allocator, io);
     try runLifecycleBindGuard(allocator, io);
     try runLifecyclePrepareShutdownWithLivePty(allocator, io);
+    try runLifecycleGracefulReplace(allocator, io);
     try runLifecycleIdleExitOverride(allocator, io);
     std.debug.print("headless-daemon-it: ok\n", .{});
 }
@@ -76,6 +86,54 @@ fn makePrefPath(allocator: std.mem.Allocator, label: []const u8) ![]u8 {
         platform_runtime.processId(),
     });
 }
+
+/// Install `VERDE_SESSIONIZER_SOCKET` for both this process and the child so
+/// neither can fall through to the user's live daemon endpoint.
+const EndpointIsolation = struct {
+    endpoint: []u8,
+    /// Owned copy of the previous env value (if any); restored on deinit.
+    prev_socket: ?[]u8,
+
+    fn install(allocator: std.mem.Allocator, pref_path: []const u8) !EndpointIsolation {
+        // Pref-derived path (ignores any ambient override) so isolation is absolute.
+        const endpoint = try sessionizer.defaultSocketPath(allocator, pref_path);
+        errdefer allocator.free(endpoint);
+        const prev_owned: ?[]u8 = if (std.c.getenv(sessionizer.SESSIONIZER_SOCKET_ENV_NAME)) |p|
+            try allocator.dupe(u8, std.mem.span(p))
+        else
+            null;
+        errdefer if (prev_owned) |v| allocator.free(v);
+
+        const endpoint_z = try allocator.dupeZ(u8, endpoint);
+        defer allocator.free(endpoint_z);
+        if (setenv(sessionizer.SESSIONIZER_SOCKET_ENV_NAME, endpoint_z.ptr, 1) != 0) {
+            return error.SetEnvFailed;
+        }
+        return .{
+            .endpoint = endpoint,
+            .prev_socket = prev_owned,
+        };
+    }
+
+    fn deinit(self: *EndpointIsolation, allocator: std.mem.Allocator) void {
+        if (self.prev_socket) |value| {
+            const value_z = allocator.dupeZ(u8, value) catch {
+                _ = unsetenv(sessionizer.SESSIONIZER_SOCKET_ENV_NAME);
+                allocator.free(value);
+                allocator.free(self.endpoint);
+                self.* = undefined;
+                return;
+            };
+            defer allocator.free(value_z);
+            _ = setenv(sessionizer.SESSIONIZER_SOCKET_ENV_NAME, value_z.ptr, 1);
+            allocator.free(value);
+        } else {
+            _ = unsetenv(sessionizer.SESSIONIZER_SOCKET_ENV_NAME);
+        }
+        allocator.free(self.endpoint);
+        self.* = undefined;
+    }
+};
 
 fn spawnIsolatedDaemon(
     allocator: std.mem.Allocator,
@@ -95,11 +153,15 @@ fn spawnIsolatedDaemonWithEnv(
 ) !std.process.Child {
     var env_map = try std.process.Environ.createMap(currentEnviron(), allocator);
     defer env_map.deinit();
-    if (idle_exit_ms) |value| {
-        try env_map.put("VERDE_SESSION_DAEMON_IDLE_EXIT_MS", value);
-    } else {
-        _ = env_map.swapRemove("VERDE_SESSION_DAEMON_IDLE_EXIT_MS");
-    }
+
+    // Always set a safety-net idle so a crashed IT cannot leak a permanent daemon.
+    // Per-test tighter overrides still win when provided.
+    try env_map.put("VERDE_SESSION_DAEMON_IDLE_EXIT_MS", idle_exit_ms orelse IT_SAFETY_IDLE_EXIT_MS);
+
+    // Bind the child to the same isolated endpoint the parent uses.
+    const endpoint = try sessionizer.defaultSocketPath(allocator, pref_path);
+    defer allocator.free(endpoint);
+    try env_map.put(sessionizer.SESSIONIZER_SOCKET_ENV_NAME, endpoint);
 
     // Pass the IT parent pid so the --daemon child can self-terminate if this
     // process panics/aborts (defers do not run). Prefer getpid over getppid in
@@ -149,13 +211,16 @@ fn installItDaemonCleanupGuards(parent_pid: ?std.posix.pid_t) void {
             std.process.exit(0);
         }
     }
-    if (parent_pid) |pid| {
-        const thread = std.Thread.spawn(.{}, parentDeathWatchThread, .{pid}) catch return;
-        thread.detach();
+    if (comptime builtin.os.tag != .windows) {
+        if (parent_pid) |pid| {
+            const thread = std.Thread.spawn(.{}, parentDeathWatchThread, .{pid}) catch return;
+            thread.detach();
+        }
     }
 }
 
 fn parentDeathWatchThread(parent_pid: std.posix.pid_t) void {
+    if (comptime builtin.os.tag == .windows) return;
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
     while (true) {
@@ -168,12 +233,37 @@ fn parentDeathWatchThread(parent_pid: std.posix.pid_t) void {
     }
 }
 
+/// Wait for a child to exit with a deadline; kill on timeout so a regression
+/// fails instead of hanging the IT binary forever.
+fn waitChildBounded(child: *std.process.Child, io: std.Io, timeout_ms: u64) !std.process.Child.Term {
+    const pid = child.id orelse return error.ChildAlreadyWaited;
+    const deadline = sessionizer.nowMs() + @as(i64, @intCast(timeout_ms));
+    while (sessionizer.nowMs() <= deadline) {
+        var status: c_int = 0;
+        const rc = std.c.waitpid(pid, &status, @intCast(std.posix.W.NOHANG));
+        if (rc == pid) {
+            child.id = null;
+            const st: u32 = @bitCast(@as(i32, status));
+            if (std.posix.W.IFEXITED(st)) return .{ .exited = std.posix.W.EXITSTATUS(st) };
+            if (std.posix.W.IFSIGNALED(st)) return .{ .signal = std.posix.W.TERMSIG(st) };
+            if (std.posix.W.IFSTOPPED(st)) return .{ .stopped = std.posix.W.STOPSIG(st) };
+            return .{ .unknown = st };
+        }
+        std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+    }
+    child.kill(io);
+    return error.ChildTimedOut;
+}
+
 fn runIntegration(allocator: std.mem.Allocator, io: std.Io) !void {
     // Isolated pref dir under the system temp path (never the user's Verde pref).
     const pref_path = try makePrefPath(allocator, "core");
     defer allocator.free(pref_path);
     defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
     try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
 
     const self_exe = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_exe);
@@ -286,14 +376,15 @@ fn runLifecycleBindGuard(allocator: std.mem.Allocator, io: std.Io) !void {
     defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
     try std.Io.Dir.cwd().createDirPath(io, pref_path);
 
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
     const self_exe = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_exe);
 
     // Stale socket file with nothing accepting: daemon must still start.
-    const socket = try sessionizer.socketPath(allocator, pref_path);
-    defer allocator.free(socket);
     {
-        var file = try std.Io.Dir.cwd().createFile(io, socket, .{});
+        var file = try std.Io.Dir.cwd().createFile(io, isolation.endpoint, .{});
         file.close(io);
     }
 
@@ -308,7 +399,11 @@ fn runLifecycleBindGuard(allocator: std.mem.Allocator, io: std.Io) !void {
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    const second_term = try second.wait(io);
+    // Bound wait: a hang regression fails instead of blocking CI forever.
+    const second_term = waitChildBounded(&second, io, 5000) catch |err| {
+        if (err == error.ChildTimedOut) return error.SecondDaemonDidNotExit;
+        return err;
+    };
     switch (second_term) {
         .exited => |code| {
             if (code == 0) return error.SecondDaemonStoleEndpoint;
@@ -328,6 +423,9 @@ fn runLifecyclePrepareShutdownWithLivePty(allocator: std.mem.Allocator, io: std.
     defer allocator.free(pref_path);
     defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
     try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
 
     const self_exe = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_exe);
@@ -365,6 +463,18 @@ fn runLifecyclePrepareShutdownWithLivePty(allocator: std.mem.Allocator, io: std.
     {
         return error.PrepareShutdownShouldNotBeSafeWithLivePty;
     }
+    // Refused prepare must leave the daemon accepting mutations.
+    if (std.mem.indexOf(u8, prepare, "\"accepting_mutations\":true") == null and
+        std.mem.indexOf(u8, prepare, "\"accepting_mutations\": true") == null)
+    {
+        const status_after = try sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 6);
+        defer allocator.free(status_after);
+        if (std.mem.indexOf(u8, status_after, "\"accepting_mutations\":false") != null or
+            std.mem.indexOf(u8, status_after, "\"accepting_mutations\": false") != null)
+        {
+            return error.AcceptingMutationsClearedOnRefusedPrepare;
+        }
+    }
 
     // Daemon still alive with the same session.
     const status = try sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 3);
@@ -379,7 +489,105 @@ fn runLifecyclePrepareShutdownWithLivePty(allocator: std.mem.Allocator, io: std.
         if (std.mem.indexOf(u8, list, session_id) == null) return error.LivePtyDestroyedOnPrepare;
     }
 
-    _ = try sessionizer.requestAlloc(allocator, pref_path, "session.kill", .{ .id = session_id }, 5);
+    const kill_response = try sessionizer.requestAlloc(allocator, pref_path, "session.kill", .{ .id = session_id }, 5);
+    defer allocator.free(kill_response);
+}
+
+/// Empty daemon: prepareShutdown accepts → daemon exits → replacement binds.
+fn runLifecycleGracefulReplace(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "graceful");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var first = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    // Do not kill: prepareShutdown acceptance should drain and exit.
+
+    {
+        const status = try sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 0);
+        defer allocator.free(status);
+        if (std.mem.indexOf(u8, status, "\"accepting_mutations\":true") == null and
+            std.mem.indexOf(u8, status, "\"accepting_mutations\": true") == null)
+        {
+            first.kill(io);
+            return error.StatusMissingAcceptingMutations;
+        }
+    }
+
+    const prepare = try sessionizer.requestAlloc(allocator, pref_path, "daemon.prepareShutdown", .{}, 1);
+    defer allocator.free(prepare);
+    if (std.mem.indexOf(u8, prepare, "\"accepted\":true") == null and
+        std.mem.indexOf(u8, prepare, "\"accepted\": true") == null)
+    {
+        first.kill(io);
+        std.debug.print("headless-daemon-it: prepareShutdown not accepted on empty daemon: {s}\n", .{prepare});
+        return error.PrepareShutdownShouldAcceptEmpty;
+    }
+    if (std.mem.indexOf(u8, prepare, "\"safe_to_exit\":true") == null and
+        std.mem.indexOf(u8, prepare, "\"safe_to_exit\": true") == null)
+    {
+        first.kill(io);
+        return error.PrepareShutdownShouldBeSafeEmpty;
+    }
+    if (std.mem.indexOf(u8, prepare, "\"accepting_mutations\":false") == null and
+        std.mem.indexOf(u8, prepare, "\"accepting_mutations\": false") == null)
+    {
+        first.kill(io);
+        return error.PrepareShouldStopAcceptingMutations;
+    }
+    if (std.mem.indexOf(u8, prepare, "\"shutdown_requested\":true") == null and
+        std.mem.indexOf(u8, prepare, "\"shutdown_requested\": true") == null)
+    {
+        first.kill(io);
+        return error.PrepareShouldRequestShutdown;
+    }
+
+    // Daemon must exit after accepted prepare (drain thread process.exit).
+    var exited = false;
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        if (sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
+            allocator.free(response);
+            std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+            continue;
+        } else |err| {
+            // Only treat connect-class as gone (mirrors production replacement).
+            if (err == error.ConnectionRefused or err == error.FileNotFound) {
+                exited = true;
+                break;
+            }
+            std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+        }
+    }
+    if (!exited) {
+        first.kill(io);
+        return error.DaemonDidNotExitAfterPrepare;
+    }
+    _ = first.wait(io) catch {};
+
+    // New daemon must bind the same endpoint after the previous process exited.
+    var second = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    defer second.kill(io);
+
+    const status = try sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 2);
+    defer allocator.free(status);
+    if (std.mem.indexOf(u8, status, "protocol_version") == null) return error.ReplacementDaemonStatusFailed;
+    if (std.mem.indexOf(u8, status, "\"accepting_mutations\":true") == null and
+        std.mem.indexOf(u8, status, "\"accepting_mutations\": true") == null)
+    {
+        return error.ReplacementDaemonNotAcceptingMutations;
+    }
+    if (std.mem.indexOf(u8, status, "\"shutdown_requested\":true") != null or
+        std.mem.indexOf(u8, status, "\"shutdown_requested\": true") != null)
+    {
+        return error.ReplacementDaemonUnexpectedlyShuttingDown;
+    }
 }
 
 /// Env override enables fast idle exit for hermetic tests; default is persistent.
@@ -389,18 +597,22 @@ fn runLifecycleIdleExitOverride(allocator: std.mem.Allocator, io: std.Io) !void 
     defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
     try std.Io.Dir.cwd().createDirPath(io, pref_path);
 
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
     const self_exe = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_exe);
 
-    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, "100");
+    // >=500ms: 100ms raced on loaded CI before the status probe observed exit.
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, "500");
     // Do not kill: idle exit should terminate the empty daemon.
 
     // Confirm the daemon advertised the override before waiting for exit.
     {
         const status = try sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 0);
         defer allocator.free(status);
-        if (std.mem.indexOf(u8, status, "\"idle_exit_ms\":100") == null and
-            std.mem.indexOf(u8, status, "\"idle_exit_ms\": 100") == null)
+        if (std.mem.indexOf(u8, status, "\"idle_exit_ms\":500") == null and
+            std.mem.indexOf(u8, status, "\"idle_exit_ms\": 500") == null)
         {
             child.kill(io);
             std.debug.print("headless-daemon-it: status missing idle override: {s}\n", .{status});
@@ -415,9 +627,12 @@ fn runLifecycleIdleExitOverride(allocator: std.mem.Allocator, io: std.Io) !void 
             allocator.free(response);
             std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
             continue;
-        } else |_| {
-            exited = true;
-            break;
+        } else |err| {
+            if (err == error.ConnectionRefused or err == error.FileNotFound) {
+                exited = true;
+                break;
+            }
+            std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
         }
     }
     if (!exited) {

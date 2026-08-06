@@ -686,7 +686,7 @@ fn replaceIncompatibleDaemon(
                 if (prepared.accepted and prepared.safe_to_exit) {
                     // Own grace window so a late prepare accept still has time to exit.
                     const gone_deadline_ms = nowMs() + REPLACEMENT_GONE_GRACE_MS;
-                    if (try waitForDaemonGone(allocator, pref_path, io, gone_deadline_ms)) return;
+                    if (waitForDaemonGone(allocator, pref_path, io, gone_deadline_ms)) return;
                     log.warn(
                         "session daemon prepareShutdown accepted but process remained protocol={d} pid={?}",
                         .{ status.protocol_version, status.pid },
@@ -738,9 +738,9 @@ fn isEndpointGoneError(err: anyerror) bool {
     };
 }
 
-/// Returns true when the endpoint is connect-gone. Propagates non-connect errors
-/// so callers can distinguish a live-but-unhappy daemon from a free endpoint.
-fn waitForDaemonGone(allocator: std.mem.Allocator, pref_path: []const u8, io: std.Io, deadline_ms: i64) !bool {
+/// Returns true when the endpoint is connect-gone. Non-connect errors keep the
+/// poll alive until the grace deadline because the daemon may still be exiting.
+fn waitForDaemonGone(allocator: std.mem.Allocator, pref_path: []const u8, io: std.Io, deadline_ms: i64) bool {
     while (nowMs() <= deadline_ms) {
         if (requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
             allocator.free(response);
@@ -3425,11 +3425,15 @@ test "sessionizer socket paths use Verde pref path" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     // Hermetic: pin/clear override so pref-derived derivation is what we assert.
-    const prev = std.c.getenv(SESSIONIZER_SOCKET_ENV_NAME);
+    const prev: ?[:0]u8 = if (std.c.getenv(SESSIONIZER_SOCKET_ENV_NAME)) |value|
+        try allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
     _ = unsetenv(SESSIONIZER_SOCKET_ENV_NAME);
     defer {
         if (prev) |value| {
-            _ = setenv(SESSIONIZER_SOCKET_ENV_NAME, value, 1);
+            _ = setenv(SESSIONIZER_SOCKET_ENV_NAME, value.ptr, 1);
+            allocator.free(value);
         }
     }
     const socket = try socketPath(allocator, "/tmp/verde");
@@ -3441,11 +3445,15 @@ test "sessionizer socket path honors VERDE_SESSIONIZER_SOCKET override" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const override_path = "/tmp/verde-sessionizer-override-test.sock";
-    const prev = std.c.getenv(SESSIONIZER_SOCKET_ENV_NAME);
+    const prev: ?[:0]u8 = if (std.c.getenv(SESSIONIZER_SOCKET_ENV_NAME)) |value|
+        try allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
     try std.testing.expect(setenv(SESSIONIZER_SOCKET_ENV_NAME, override_path, 1) == 0);
     defer {
         if (prev) |value| {
-            _ = setenv(SESSIONIZER_SOCKET_ENV_NAME, value, 1);
+            _ = setenv(SESSIONIZER_SOCKET_ENV_NAME, value.ptr, 1);
+            allocator.free(value);
         } else {
             _ = unsetenv(SESSIONIZER_SOCKET_ENV_NAME);
         }
@@ -3626,13 +3634,18 @@ test "prepareShutdown preserves unconsumed completed turns" {
 }
 
 test "idle exit is disabled by default and honors override" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     // Pin idle env so Daemon.init does not inherit a runner override.
-    const prev_idle = std.c.getenv(IDLE_EXIT_ENV_NAME);
+    const prev_idle: ?[:0]u8 = if (std.c.getenv(IDLE_EXIT_ENV_NAME)) |value|
+        try allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
     _ = unsetenv(IDLE_EXIT_ENV_NAME);
     defer {
         if (prev_idle) |value| {
-            _ = setenv(IDLE_EXIT_ENV_NAME, value, 1);
+            _ = setenv(IDLE_EXIT_ENV_NAME, value.ptr, 1);
+            allocator.free(value);
         }
     }
     var daemon = Daemon.init(allocator);
@@ -3709,6 +3722,14 @@ test "parsePrepareShutdownResult detects method_not_found for legacy daemons" {
     try std.testing.expect(ready.accepted);
     try std.testing.expect(ready.safe_to_exit);
     try std.testing.expect(!ready.method_missing);
+}
+
+test "endpoint-gone classification is connect-class only" {
+    try std.testing.expect(isEndpointGoneError(error.ConnectionRefused));
+    try std.testing.expect(isEndpointGoneError(error.FileNotFound));
+    try std.testing.expect(!isEndpointGoneError(error.ConnectionTimedOut));
+    try std.testing.expect(!isEndpointGoneError(error.MessageTooLarge));
+    try std.testing.expect(!isEndpointGoneError(error.OutOfMemory));
 }
 
 test "Windows daemon replacement still requires authenticated pipe PID" {
