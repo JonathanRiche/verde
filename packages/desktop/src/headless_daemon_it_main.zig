@@ -1,8 +1,8 @@
 //! Hermetic headless client ↔ session-daemon integration binary.
 //!
 //! Spawns an isolated session-daemon subprocess that listens only on a tmp
-//! pref dir, then exercises the typed headless client. Never touches the
-//! user's live socket, daemon, or DB.
+//! pref dir, then exercises the typed headless client and daemon lifecycle.
+//! Never touches the user's live socket, daemon, or DB.
 //!
 //! Built as a dedicated step (`headless-daemon-it`) rather than a unit test so
 //! the daemon's idle `process.exit` and multi-thread fork hazards stay out of
@@ -45,17 +45,76 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try runIntegration(allocator, io);
+    try runLifecycleBindGuard(allocator, io);
+    try runLifecyclePrepareShutdownWithLivePty(allocator, io);
+    try runLifecycleIdleExitOverride(allocator, io);
     std.debug.print("headless-daemon-it: ok\n", .{});
+}
+
+fn makePrefPath(allocator: std.mem.Allocator, label: []const u8) ![]u8 {
+    const base_tmp = try platform_paths.tempDir(allocator);
+    defer allocator.free(base_tmp);
+    return std.fmt.allocPrint(allocator, "{s}/verde-headless-it-{s}-{d}", .{
+        base_tmp,
+        label,
+        platform_runtime.processId(),
+    });
+}
+
+fn spawnIsolatedDaemon(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    self_exe: []const u8,
+    pref_path: []const u8,
+) !std.process.Child {
+    return spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, null);
+}
+
+fn spawnIsolatedDaemonWithEnv(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    self_exe: []const u8,
+    pref_path: []const u8,
+    idle_exit_ms: ?[]const u8,
+) !std.process.Child {
+    var env_map = try std.process.Environ.createMap(currentEnviron(), allocator);
+    defer env_map.deinit();
+    if (idle_exit_ms) |value| {
+        try env_map.put("VERDE_SESSION_DAEMON_IDLE_EXIT_MS", value);
+    } else {
+        _ = env_map.swapRemove("VERDE_SESSION_DAEMON_IDLE_EXIT_MS");
+    }
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ self_exe, "--daemon", pref_path },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .environ_map = &env_map,
+    });
+    errdefer child.kill(io);
+
+    var ready_attempts: usize = 0;
+    while (ready_attempts < 250) : (ready_attempts += 1) {
+        if (sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
+            allocator.free(response);
+            return child;
+        } else |_| {
+            std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+        }
+    }
+    std.debug.print("headless-daemon-it: daemon did not become ready ({s})\n", .{pref_path});
+    return error.SessionDaemonUnavailable;
+}
+
+fn currentEnviron() std.process.Environ {
+    if (builtin.os.tag == .windows) return .{ .block = .global };
+    return .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
 }
 
 fn runIntegration(allocator: std.mem.Allocator, io: std.Io) !void {
     // Isolated pref dir under the system temp path (never the user's Verde pref).
-    const base_tmp = try platform_paths.tempDir(allocator);
-    defer allocator.free(base_tmp);
-    const pref_path = try std.fmt.allocPrint(allocator, "{s}/verde-headless-it-{d}", .{
-        base_tmp,
-        platform_runtime.processId(),
-    });
+    const pref_path = try makePrefPath(allocator, "core");
     defer allocator.free(pref_path);
     defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
     try std.Io.Dir.cwd().createDirPath(io, pref_path);
@@ -63,29 +122,8 @@ fn runIntegration(allocator: std.mem.Allocator, io: std.Io) !void {
     const self_exe = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_exe);
 
-    // Spawn a dedicated daemon subprocess that listens only under pref_path.
-    var child = try std.process.spawn(io, .{
-        .argv = &.{ self_exe, "--daemon", pref_path },
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    });
-    errdefer child.kill(io);
+    var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
     defer child.kill(io);
-
-    // Wait until the isolated daemon accepts connections.
-    var ready_attempts: usize = 0;
-    while (ready_attempts < 250) : (ready_attempts += 1) {
-        if (sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
-            allocator.free(response);
-            break;
-        } else |_| {
-            std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
-        }
-    } else {
-        std.debug.print("headless-daemon-it: daemon did not become ready\n", .{});
-        return error.SessionDaemonUnavailable;
-    }
 
     var transport: sessionizer.HeadlessTransport = .{
         .allocator = allocator,
@@ -183,4 +221,152 @@ fn runIntegration(allocator: std.mem.Allocator, io: std.Io) !void {
     }
 
     _ = headless.HEADLESS_PROTOCOL_VERSION;
+}
+
+/// Live socket must not be stolen; stale socket path may be reclaimed.
+fn runLifecycleBindGuard(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "bind");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    // Stale socket file with nothing accepting: daemon must still start.
+    const socket = try sessionizer.socketPath(allocator, pref_path);
+    defer allocator.free(socket);
+    {
+        var file = try std.Io.Dir.cwd().createFile(io, socket, .{});
+        file.close(io);
+    }
+
+    var first = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    defer first.kill(io);
+
+    // Second daemon on the same pref must refuse (live endpoint), not unlink.
+    var second = try std.process.spawn(io, .{
+        .argv = &.{ self_exe, "--daemon", pref_path },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    const second_term = try second.wait(io);
+    switch (second_term) {
+        .exited => |code| {
+            if (code == 0) return error.SecondDaemonStoleEndpoint;
+        },
+        else => {},
+    }
+
+    // Original daemon still answers.
+    const status = try sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 0);
+    defer allocator.free(status);
+    if (std.mem.indexOf(u8, status, "protocol_version") == null) return error.LiveDaemonLostAfterBindRace;
+}
+
+/// Replacement prepareShutdown while a live PTY exists must refuse, not kill.
+fn runLifecyclePrepareShutdownWithLivePty(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "prepare");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    defer child.kill(io);
+
+    const session_id = "verde:headless-it:prepare-pty";
+    {
+        const create = try sessionizer.requestAlloc(allocator, pref_path, "session.create", .{
+            .id = session_id,
+            .cwd = pref_path,
+            .command = &[_][]const u8{"/bin/cat"},
+            .cols = sessionizer.DEFAULT_COLS,
+            .rows = sessionizer.DEFAULT_ROWS,
+        }, 1);
+        defer allocator.free(create);
+        if (std.mem.indexOf(u8, create, "\"created\":true") == null and
+            std.mem.indexOf(u8, create, "\"created\": true") == null)
+        {
+            // created may be false only on reuse; first create must succeed.
+            if (std.mem.indexOf(u8, create, "\"error\"") != null) return error.SessionCreateFailed;
+        }
+    }
+
+    const prepare = try sessionizer.requestAlloc(allocator, pref_path, "daemon.prepareShutdown", .{}, 2);
+    defer allocator.free(prepare);
+    if (std.mem.indexOf(u8, prepare, "\"accepted\":false") == null and
+        std.mem.indexOf(u8, prepare, "\"accepted\": false") == null)
+    {
+        return error.PrepareShutdownShouldRefuseLivePty;
+    }
+    if (std.mem.indexOf(u8, prepare, "\"safe_to_exit\":false") == null and
+        std.mem.indexOf(u8, prepare, "\"safe_to_exit\": false") == null)
+    {
+        return error.PrepareShutdownShouldNotBeSafeWithLivePty;
+    }
+
+    // Daemon still alive with the same session.
+    const status = try sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 3);
+    defer allocator.free(status);
+    if (std.mem.indexOf(u8, status, "protocol_version") == null) return error.DaemonDiedDuringPrepare;
+    if (std.mem.indexOf(u8, status, "\"running_session_count\":1") == null and
+        std.mem.indexOf(u8, status, "\"running_session_count\": 1") == null)
+    {
+        // Fall back: session still listable.
+        const list = try sessionizer.requestAlloc(allocator, pref_path, "session.list", .{}, 4);
+        defer allocator.free(list);
+        if (std.mem.indexOf(u8, list, session_id) == null) return error.LivePtyDestroyedOnPrepare;
+    }
+
+    _ = try sessionizer.requestAlloc(allocator, pref_path, "session.kill", .{ .id = session_id }, 5);
+}
+
+/// Env override enables fast idle exit for hermetic tests; default is persistent.
+fn runLifecycleIdleExitOverride(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "idle");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, "100");
+    // Do not kill: idle exit should terminate the empty daemon.
+
+    // Confirm the daemon advertised the override before waiting for exit.
+    {
+        const status = try sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 0);
+        defer allocator.free(status);
+        if (std.mem.indexOf(u8, status, "\"idle_exit_ms\":100") == null and
+            std.mem.indexOf(u8, status, "\"idle_exit_ms\": 100") == null)
+        {
+            child.kill(io);
+            std.debug.print("headless-daemon-it: status missing idle override: {s}\n", .{status});
+            return error.IdleExitOverrideNotApplied;
+        }
+    }
+
+    var exited = false;
+    var attempts: usize = 0;
+    while (attempts < 200) : (attempts += 1) {
+        if (sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
+            allocator.free(response);
+            std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
+            continue;
+        } else |_| {
+            exited = true;
+            break;
+        }
+    }
+    if (!exited) {
+        child.kill(io);
+        return error.IdleExitDidNotFire;
+    }
+    // Reap the exited child to avoid zombies.
+    _ = child.wait(io) catch {};
 }

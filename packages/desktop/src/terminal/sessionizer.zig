@@ -38,7 +38,10 @@ pub const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\verde-sessionizer-";
 // Version 16 transports complete diff snapshots instead of empty diff events.
 // Version 17 transports MCP tool outputs from every daemon-owned GUI provider.
 // Version 18 reloads daemon-owned Cursor turns with structured edit diffs.
-pub const PROTOCOL_VERSION: u32 = 18;
+// Version 19 makes the daemon authoritative for lifecycle: bind-safe startup,
+// prepare-for-upgrade drain instead of hard-kill, and persistent-by-default
+// idle policy (see headless_verde.md Lifetime).
+pub const PROTOCOL_VERSION: u32 = 19;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
@@ -48,7 +51,15 @@ const SESSIONIZER_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = SESSIONIZER_MAX_MESSAGE_BYTES;
 const SESSIONIZER_REQUEST_TIMEOUT_MS: u32 = 5000;
 const ATTACH_STALE_MS: i64 = 60 * std.time.ms_per_s;
-const IDLE_EXIT_MS: i64 = 30 * std.time.ms_per_s;
+/// Historical generic idle window. The authoritative daemon no longer uses this
+/// by default; keep the constant for tests and documentation only.
+const LEGACY_IDLE_EXIT_MS: i64 = 30 * std.time.ms_per_s;
+/// Env override so hermetic tests can force a fast idle exit without changing
+/// production lifetime policy (null / unset = never idle-exit).
+const IDLE_EXIT_ENV_NAME = "VERDE_SESSION_DAEMON_IDLE_EXIT_MS";
+/// Bounded wait while an incompatible daemon drains live state before upgrade.
+const REPLACEMENT_WAIT_MS: i64 = 5 * std.time.ms_per_s;
+const REPLACEMENT_POLL_MS: i64 = 50;
 const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
     .macos => @bitCast(@as(u32, 0x80087467)),
     .windows => 0,
@@ -493,6 +504,21 @@ fn requestJsonOnUnixStreamAlloc(
 const DaemonStatus = struct {
     protocol_version: u32,
     pid: ?usize = null,
+    session_count: ?usize = null,
+    chat_turn_count: ?usize = null,
+    running_session_count: ?usize = null,
+    keep_alive_turn_count: ?usize = null,
+    accepting_mutations: ?bool = null,
+    shutdown_requested: ?bool = null,
+};
+
+const PrepareShutdownResult = struct {
+    accepted: bool,
+    safe_to_exit: bool,
+    running_sessions: usize,
+    keep_alive_turns: usize,
+    shutdown_requested: bool,
+    method_missing: bool = false,
 };
 
 fn parseDaemonStatus(allocator: std.mem.Allocator, response: []const u8) ?DaemonStatus {
@@ -503,9 +529,54 @@ fn parseDaemonStatus(allocator: std.mem.Allocator, response: []const u8) ?Daemon
     if (result != .object) return null;
     const protocol_version = jsonU32(result.object.get("protocol_version") orelse .null) orelse return null;
     const pid = jsonUsize(result.object.get("pid") orelse .null);
-    return .{ .protocol_version = protocol_version, .pid = pid };
+    return .{
+        .protocol_version = protocol_version,
+        .pid = pid,
+        .session_count = jsonUsize(result.object.get("session_count") orelse .null),
+        .chat_turn_count = jsonUsize(result.object.get("chat_turn_count") orelse .null),
+        .running_session_count = jsonUsize(result.object.get("running_session_count") orelse .null),
+        .keep_alive_turn_count = jsonUsize(result.object.get("keep_alive_turn_count") orelse .null),
+        .accepting_mutations = jsonBool(result.object.get("accepting_mutations") orelse .null),
+        .shutdown_requested = jsonBool(result.object.get("shutdown_requested") orelse .null),
+    };
 }
 
+fn parsePrepareShutdownResult(allocator: std.mem.Allocator, response: []const u8) ?PrepareShutdownResult {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    if (parsed.value.object.get("error")) |err_value| {
+        if (err_value == .object) {
+            const code = jsonString(err_value.object.get("code") orelse .null) orelse return null;
+            if (std.mem.eql(u8, code, "method_not_found")) {
+                return .{
+                    .accepted = false,
+                    .safe_to_exit = false,
+                    .running_sessions = 0,
+                    .keep_alive_turns = 0,
+                    .shutdown_requested = false,
+                    .method_missing = true,
+                };
+            }
+        }
+        return null;
+    }
+    const result = parsed.value.object.get("result") orelse return null;
+    if (result != .object) return null;
+    return .{
+        .accepted = jsonBool(result.object.get("accepted") orelse .null) orelse false,
+        .safe_to_exit = jsonBool(result.object.get("safe_to_exit") orelse .null) orelse false,
+        .running_sessions = jsonUsize(result.object.get("running_sessions") orelse .null) orelse 0,
+        .keep_alive_turns = jsonUsize(result.object.get("keep_alive_turns") orelse .null) orelse 0,
+        .shutdown_requested = jsonBool(result.object.get("shutdown_requested") orelse .null) orelse false,
+    };
+}
+
+/// Ensure a protocol-compatible session daemon is reachable at `pref_path`.
+///
+/// On version mismatch, requests a prepare-for-upgrade drain instead of
+/// hard-killing while live PTYs or unconsumed/running turns exist. Replacement
+/// waits are bounded; callers get a clear error rather than a silent kill.
 pub fn ensureDaemon(allocator: std.mem.Allocator, pref_path: []const u8, exe_path: []const u8) !void {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
@@ -514,10 +585,13 @@ pub fn ensureDaemon(allocator: std.mem.Allocator, pref_path: []const u8, exe_pat
         defer allocator.free(result.response);
         if (parseDaemonStatus(allocator, result.response)) |status| {
             if (status.protocol_version == PROTOCOL_VERSION) return;
-            if (daemonProcessIdForReplacement(builtin.os.tag, status.pid, result.authenticated_server_process_id)) |pid| {
-                terminateDaemonProcess(pid);
-                std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
-            }
+            try replaceIncompatibleDaemon(
+                allocator,
+                pref_path,
+                io,
+                status,
+                result.authenticated_server_process_id,
+            );
         }
     } else |_| {}
 
@@ -543,6 +617,87 @@ pub fn ensureDaemon(allocator: std.mem.Allocator, pref_path: []const u8, exe_pat
         .{ attempts, @errorName(last_probe_error) },
     );
     return error.SessionDaemonUnavailable;
+}
+
+/// Graceful protocol-version replacement (headless_verde.md Lifetime).
+/// Never hard-kills while running PTYs or keep-alive turns remain.
+fn replaceIncompatibleDaemon(
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    io: std.Io,
+    status: DaemonStatus,
+    authenticated_server_process_id: ?u32,
+) !void {
+    const deadline_ms = nowMs() + REPLACEMENT_WAIT_MS;
+    var saw_method = false;
+    var last_running_sessions: usize = status.running_session_count orelse status.session_count orelse 0;
+    var last_keep_alive_turns: usize = status.keep_alive_turn_count orelse status.chat_turn_count orelse 0;
+
+    while (nowMs() <= deadline_ms) {
+        if (requestAlloc(allocator, pref_path, "daemon.prepareShutdown", .{}, 0)) |response| {
+            defer allocator.free(response);
+            if (parsePrepareShutdownResult(allocator, response)) |prepared| {
+                if (prepared.method_missing) {
+                    // Pre-v19 daemon: only terminate when status proves empty.
+                    return terminateEmptyLegacyDaemon(
+                        status,
+                        authenticated_server_process_id,
+                        io,
+                    );
+                }
+                saw_method = true;
+                last_running_sessions = prepared.running_sessions;
+                last_keep_alive_turns = prepared.keep_alive_turns;
+                if (prepared.accepted and prepared.safe_to_exit) {
+                    if (waitForDaemonGone(allocator, pref_path, io, deadline_ms)) return;
+                    log.warn(
+                        "session daemon prepareShutdown accepted but process remained protocol={d} pid={?}",
+                        .{ status.protocol_version, status.pid },
+                    );
+                    return error.DaemonReplacementTimeout;
+                }
+            }
+        } else |_| {
+            // Endpoint already gone — safe to spawn a replacement.
+            return;
+        }
+        std.Io.sleep(io, .fromMilliseconds(REPLACEMENT_POLL_MS), .awake) catch {};
+    }
+
+    if (!saw_method) {
+        return terminateEmptyLegacyDaemon(status, authenticated_server_process_id, io);
+    }
+    log.warn(
+        "session daemon replacement blocked live_sessions={d} keep_alive_turns={d} protocol={d}",
+        .{ last_running_sessions, last_keep_alive_turns, status.protocol_version },
+    );
+    return error.DaemonReplacementBlocked;
+}
+
+fn terminateEmptyLegacyDaemon(
+    status: DaemonStatus,
+    authenticated_server_process_id: ?u32,
+    io: std.Io,
+) !void {
+    const sessions = status.running_session_count orelse status.session_count orelse 0;
+    const turns = status.keep_alive_turn_count orelse status.chat_turn_count orelse 0;
+    if (sessions > 0 or turns > 0) return error.DaemonReplacementBlocked;
+    const pid = daemonProcessIdForReplacement(builtin.os.tag, status.pid, authenticated_server_process_id) orelse
+        return error.DaemonReplacementBlocked;
+    terminateDaemonProcess(pid);
+    std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+}
+
+fn waitForDaemonGone(allocator: std.mem.Allocator, pref_path: []const u8, io: std.Io, deadline_ms: i64) bool {
+    while (nowMs() <= deadline_ms) {
+        if (requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
+            allocator.free(response);
+        } else |_| {
+            return true;
+        }
+        std.Io.sleep(io, .fromMilliseconds(REPLACEMENT_POLL_MS), .awake) catch {};
+    }
+    return false;
 }
 
 /// Windows replacement must use the PID bound to the authenticated pipe
@@ -1368,9 +1523,18 @@ pub const Daemon = struct {
     chat_turns: std.ArrayList(*ChatTurn) = .empty,
     mutex: std.atomic.Mutex = .unlocked,
     idle_since_ms: ?i64 = null,
+    /// null = persistent (no idle exit). Tests set VERDE_SESSION_DAEMON_IDLE_EXIT_MS.
+    idle_exit_ms: ?i64 = null,
+    /// False after a successful prepareShutdown while the daemon drains out.
+    accepting_mutations: bool = true,
+    /// Set only when prepareShutdown accepted a safe upgrade handoff.
+    shutdown_requested: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Daemon {
-        return .{ .allocator = allocator };
+        return .{
+            .allocator = allocator,
+            .idle_exit_ms = idleExitMsFromEnv(),
+        };
     }
 
     pub fn deinit(self: *Daemon) void {
@@ -1388,29 +1552,58 @@ pub const Daemon = struct {
         }
     }
 
-    fn shouldExitForIdle(self: *Daemon) bool {
+    /// Live PTY sessions or unconsumed/running turns that must not be dropped.
+    fn hasLiveKeepAliveState(self: *Daemon) bool {
         self.removeFinishedConsumedChatTurns();
         for (self.sessions.items) |session| {
-            if (session.running) {
-                self.idle_since_ms = null;
-                return false;
-            }
+            if (session.running) return true;
         }
         for (self.chat_turns.items) |turn| {
             lockTurn(turn);
             const keep_alive = chatTurnKeepsDaemonAlive(turn.status, turn.consumed, turn.worker_done);
             turn.mutex.unlock();
-            if (keep_alive) {
-                self.idle_since_ms = null;
-                return false;
-            }
+            if (keep_alive) return true;
         }
+        return false;
+    }
+
+    fn countRunningSessions(self: *const Daemon) usize {
+        var count: usize = 0;
+        for (self.sessions.items) |session| {
+            if (session.running) count += 1;
+        }
+        return count;
+    }
+
+    fn countKeepAliveTurns(self: *Daemon) usize {
+        var count: usize = 0;
+        for (self.chat_turns.items) |turn| {
+            lockTurn(turn);
+            const keep_alive = chatTurnKeepsDaemonAlive(turn.status, turn.consumed, turn.worker_done);
+            turn.mutex.unlock();
+            if (keep_alive) count += 1;
+        }
+        return count;
+    }
+
+    /// Exit when prepareShutdown accepted a safe handoff, or when the optional
+    /// idle-exit override elapses with no keep-alive state (tests only by default).
+    fn shouldExitForIdle(self: *Daemon) bool {
+        if (self.hasLiveKeepAliveState()) {
+            self.idle_since_ms = null;
+            return false;
+        }
+        if (self.shutdown_requested) return true;
+
+        // Authoritative lifetime: stay up until explicit stop/upgrade/logout
+        // unless tests set VERDE_SESSION_DAEMON_IDLE_EXIT_MS.
+        const idle_exit_ms = self.idle_exit_ms orelse return false;
         const now = nowMs();
         if (self.idle_since_ms == null) {
             self.idle_since_ms = now;
             return false;
         }
-        return now - self.idle_since_ms.? >= IDLE_EXIT_MS;
+        return now - self.idle_since_ms.? >= idle_exit_ms;
     }
 
     fn removeFinishedConsumedChatTurns(self: *Daemon) void {
@@ -1475,17 +1668,49 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, "chat.turn.cancel")) return try self.chatTurnCancelResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.consume")) return try self.chatTurnConsumeResponse(id_value, params);
         if (std.mem.eql(u8, method, "status")) return try self.statusResponse(id_value);
+        if (std.mem.eql(u8, method, "daemon.prepareShutdown")) return try self.prepareShutdownResponse(id_value);
         // Additive headless core methods; existing methods and error codes unchanged.
         if (std.mem.startsWith(u8, method, "core.")) return try self.coreResponse(id_value, method, params);
         return try errorResponseAlloc(self.allocator, id_value, "method_not_found", method);
     }
 
     fn statusResponse(self: *Daemon, id_value: std.json.Value) ![]u8 {
+        const keep_alive_turns = self.countKeepAliveTurns();
         return try okValueResponse(self.allocator, id_value, .{
             .protocol_version = PROTOCOL_VERSION,
             .pid = platform_runtime.processId(),
             .session_count = self.sessions.items.len,
-            .idle_exit_ms = IDLE_EXIT_MS,
+            .chat_turn_count = self.chat_turns.items.len,
+            .running_session_count = self.countRunningSessions(),
+            .keep_alive_turn_count = keep_alive_turns,
+            .accepting_mutations = self.accepting_mutations,
+            .shutdown_requested = self.shutdown_requested,
+            // null when idle exit is disabled (authoritative default).
+            .idle_exit_ms = self.idle_exit_ms,
+        });
+    }
+
+    /// Prepare-for-upgrade shutdown (headless_verde.md Lifetime §Protocol-version
+    /// replacement). Enters drain only when no live PTYs / keep-alive turns remain
+    /// so a refused upgrade does not freeze a healthy daemon.
+    fn prepareShutdownResponse(self: *Daemon, id_value: std.json.Value) ![]u8 {
+        self.removeFinishedConsumedChatTurns();
+        const running_sessions = self.countRunningSessions();
+        const keep_alive_turns = self.countKeepAliveTurns();
+        const safe_to_exit = running_sessions == 0 and keep_alive_turns == 0;
+        if (safe_to_exit) {
+            self.accepting_mutations = false;
+            self.shutdown_requested = true;
+        }
+        return try okValueResponse(self.allocator, id_value, .{
+            .accepted = safe_to_exit,
+            .safe_to_exit = safe_to_exit,
+            .running_sessions = running_sessions,
+            .keep_alive_turns = keep_alive_turns,
+            .session_count = self.sessions.items.len,
+            .chat_turn_count = self.chat_turns.items.len,
+            .shutdown_requested = self.shutdown_requested,
+            .accepting_mutations = self.accepting_mutations,
         });
     }
 
@@ -1581,6 +1806,15 @@ pub const Daemon = struct {
                 existing.last_attached_at_ms = nowMs();
                 return try okSessionResponse(self.allocator, id_value, existing, false);
             }
+        }
+
+        if (!self.accepting_mutations) {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                "daemon_draining",
+                "daemon is preparing shutdown and is not accepting new sessions",
+            );
         }
 
         const command = try jsonStringArray(self.allocator, params.object.get("command") orelse .null);
@@ -1787,6 +2021,15 @@ pub const Daemon = struct {
         const turn_id = jsonString(params.object.get("turn_id") orelse .null) orelse return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing turn_id");
         if (self.findChatTurn(turn_id)) |turn| return try okValueResponse(self.allocator, id_value, .{ .turn_id = turn.turn_id, .created = false });
 
+        if (!self.accepting_mutations) {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                "daemon_draining",
+                "daemon is preparing shutdown and is not accepting new turns",
+            );
+        }
+
         const turn = try createChatTurnFromParams(self.allocator, params);
         errdefer turn.deinit(self.allocator);
         try self.chat_turns.append(self.allocator, turn);
@@ -1909,6 +2152,13 @@ fn runUnixDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
     defer allocator.free(socket_path);
     const pid_path = try pidFilePath(allocator, pref_path);
     defer allocator.free(pid_path);
+
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    // Mirror platform/ipc.zig serve: never unlink a live endpoint. A second
+    // daemon must fail distinctly rather than steal hooks still bound to the
+    // old pathname.
+    if (sessionizerEndpointIsLive(io, socket_path)) return error.EndpointInUse;
     deleteSocketPath(socket_path);
     try writePidFile(pid_path);
     defer deleteSocketPath(socket_path);
@@ -1917,8 +2167,6 @@ fn runUnixDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
         deleteFilePath(cleanup_threaded.io(), pid_path);
     }
 
-    var threaded = std.Io.Threaded.init_single_threaded;
-    const io = threaded.io();
     const address = try std.Io.net.UnixAddress.init(socket_path);
     var listener = try address.listen(io, .{});
     defer listener.deinit(io);
@@ -1932,6 +2180,7 @@ fn runUnixDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
     }});
     drain_thread.detach();
 
+    // Accept loop runs until the drain thread process.exit's after idle/upgrade.
     while (true) {
         const stream = listener.accept(io) catch |err| switch (err) {
             error.ConnectionAborted => continue,
@@ -1968,6 +2217,8 @@ fn runWindowsDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
     }});
     drain_thread.detach();
 
+    // platform_ipc.serve returns EndpointInUse when the named pipe is busy
+    // (FIRST_PIPE_INSTANCE), matching the Unix live-endpoint guard above.
     var server_context: SessionizerServerContext = .{ .daemon = &daemon };
     try platform_ipc.serve(allocator, endpoint, .{
         .context = &server_context,
@@ -1984,8 +2235,39 @@ const SessionizerServerContext = struct {
     daemon: *Daemon,
 };
 
-fn sessionizerServerShouldStop(_: *anyopaque) bool {
-    return false;
+fn sessionizerServerShouldStop(raw_context: *anyopaque) bool {
+    const context: *SessionizerServerContext = @ptrCast(@alignCast(raw_context));
+    const daemon = context.daemon;
+    lockDaemon(daemon);
+    defer daemon.mutex.unlock();
+    return daemon.shutdown_requested and !daemon.hasLiveKeepAliveState();
+}
+
+/// True when a peer can still complete a connection to `endpoint`.
+/// Used to refuse binding over a live daemon (Unix) instead of unlinking first.
+/// Windows named-pipe busy is reported as `error.EndpointInUse` from
+/// `platform_ipc.serve` (FIRST_PIPE_INSTANCE); this probe is Unix-oriented.
+fn sessionizerEndpointIsLive(io: std.Io, endpoint: []const u8) bool {
+    if (builtin.os.tag == .windows) return false;
+    const address = std.Io.net.UnixAddress.init(endpoint) catch return false;
+    const stream = address.connect(io) catch return false;
+    stream.close(io);
+    return true;
+}
+
+/// Optional idle-exit override for hermetic tests. Unset/empty => persistent.
+fn idleExitMsFromEnv() ?i64 {
+    const environ: std.process.Environ = if (builtin.os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    const raw = environ.getAlloc(std.heap.page_allocator, IDLE_EXIT_ENV_NAME) catch return null;
+    defer std.heap.page_allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const parsed = std.fmt.parseInt(i64, trimmed, 10) catch return null;
+    if (parsed < 0) return null;
+    return parsed;
 }
 
 fn handleSessionizerServerRequest(raw_context: *anyopaque, request: []u8) anyerror![]u8 {
@@ -3163,6 +3445,190 @@ test "daemon retains chat turns until their result is consumed" {
     try std.testing.expect(chatTurnKeepsDaemonAlive(.failed, false, true));
     try std.testing.expect(chatTurnKeepsDaemonAlive(.aborted, false, true));
     try std.testing.expect(!chatTurnKeepsDaemonAlive(.completed, true, true));
+}
+
+test "prepareShutdown refuses while a live PTY exists" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    // Unit tests pin idle policy explicitly so env from the runner cannot
+    // make shouldExitForIdle spuriously true.
+    daemon.idle_exit_ms = null;
+
+    const create_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"session.create","params":{"id":"lifecycle-live-pty","cwd":".","command":["/bin/cat"],"pref_path":"/tmp"}}
+    );
+    defer allocator.free(create_response);
+    try std.testing.expect(try testSessionCreateResponseWasCreated(allocator, create_response));
+    try std.testing.expect(daemon.sessions.items[0].running);
+
+    const prepare_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"daemon.prepareShutdown","params":{}}
+    );
+    defer allocator.free(prepare_response);
+    var prepared = try std.json.parseFromSlice(std.json.Value, allocator, prepare_response, .{});
+    defer prepared.deinit();
+    const result = prepared.value.object.get("result").?.object;
+    try std.testing.expect(!jsonBool(result.get("accepted") orelse .null).?);
+    try std.testing.expect(!jsonBool(result.get("safe_to_exit") orelse .null).?);
+    try std.testing.expectEqual(@as(usize, 1), jsonUsize(result.get("running_sessions") orelse .null).?);
+    try std.testing.expect(daemon.accepting_mutations);
+    try std.testing.expect(!daemon.shutdown_requested);
+    try std.testing.expect(!daemon.shouldExitForIdle());
+
+    // Existing live session is preserved; replacement must wait, not kill.
+    try std.testing.expectEqual(@as(usize, 1), daemon.sessions.items.len);
+    try std.testing.expect(daemon.sessions.items[0].running);
+}
+
+test "prepareShutdown preserves unconsumed completed turns" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    daemon.idle_exit_ms = null;
+
+    const turn = try allocator.create(ChatTurn);
+    errdefer allocator.destroy(turn);
+    const empty_images = try allocator.alloc([]const u8, 0);
+    errdefer allocator.free(empty_images);
+    turn.* = .{
+        .allocator = allocator,
+        .turn_id = try allocator.dupe(u8, "turn-unconsumed"),
+        .workspace_id = try allocator.dupe(u8, "ws"),
+        .local_thread_id = try allocator.dupe(u8, "thread"),
+        .request = .{
+            .provider = .claude,
+            .harness_kind = .local_cli,
+            .project_path = try allocator.dupe(u8, "."),
+            .prompt = try allocator.dupe(u8, "hello"),
+            .thread_title = try allocator.dupe(u8, ""),
+        },
+        .owned_image_paths = empty_images,
+        .status = .completed,
+        .consumed = false,
+        .worker_done = true,
+    };
+    try daemon.chat_turns.append(allocator, turn);
+
+    const prepare_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"daemon.prepareShutdown","params":{}}
+    );
+    defer allocator.free(prepare_response);
+    var prepared = try std.json.parseFromSlice(std.json.Value, allocator, prepare_response, .{});
+    defer prepared.deinit();
+    const result = prepared.value.object.get("result").?.object;
+    try std.testing.expect(!jsonBool(result.get("accepted") orelse .null).?);
+    try std.testing.expect(!jsonBool(result.get("safe_to_exit") orelse .null).?);
+    try std.testing.expectEqual(@as(usize, 1), jsonUsize(result.get("keep_alive_turns") orelse .null).?);
+    try std.testing.expect(daemon.accepting_mutations);
+    try std.testing.expect(!daemon.shutdown_requested);
+    try std.testing.expectEqual(@as(usize, 1), daemon.chat_turns.items.len);
+    try std.testing.expect(!daemon.chat_turns.items[0].consumed);
+
+    // After consume, prepareShutdown may accept.
+    const consume_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":4,"method":"chat.turn.consume","params":{"turn_id":"turn-unconsumed"}}
+    );
+    defer allocator.free(consume_response);
+    const prepare_ok = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":5,"method":"daemon.prepareShutdown","params":{}}
+    );
+    defer allocator.free(prepare_ok);
+    var prepared_ok = try std.json.parseFromSlice(std.json.Value, allocator, prepare_ok, .{});
+    defer prepared_ok.deinit();
+    const ok_result = prepared_ok.value.object.get("result").?.object;
+    try std.testing.expect(jsonBool(ok_result.get("accepted") orelse .null).?);
+    try std.testing.expect(jsonBool(ok_result.get("safe_to_exit") orelse .null).?);
+    try std.testing.expect(daemon.shutdown_requested);
+    try std.testing.expect(!daemon.accepting_mutations);
+    try std.testing.expect(daemon.shouldExitForIdle());
+}
+
+test "idle exit is disabled by default and honors override" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    daemon.idle_exit_ms = null;
+    try std.testing.expect(!daemon.shouldExitForIdle());
+    try std.testing.expect(!daemon.shouldExitForIdle());
+
+    daemon.idle_exit_ms = 0;
+    daemon.idle_since_ms = null;
+    try std.testing.expect(!daemon.shouldExitForIdle()); // first observation arms the timer
+    daemon.idle_since_ms = nowMs() - LEGACY_IDLE_EXIT_MS;
+    try std.testing.expect(daemon.shouldExitForIdle());
+}
+
+test "stale sessionizer endpoint is not treated as live" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const base = try std.fmt.allocPrint(allocator, "/tmp/verde-lifecycle-stale-{d}", .{platform_runtime.processId()});
+    defer allocator.free(base);
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+    const socket = try std.fs.path.join(allocator, &.{ base, SOCKET_NAME });
+    defer allocator.free(socket);
+
+    // Stale path: file exists but nothing accepts connections.
+    {
+        var file = try std.Io.Dir.cwd().createFile(io, socket, .{});
+        file.close(io);
+    }
+    try std.testing.expect(!sessionizerEndpointIsLive(io, socket));
+}
+
+test "live sessionizer endpoint probe detects a listening daemon socket" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const base = try std.fmt.allocPrint(allocator, "/tmp/verde-lifecycle-live-{d}", .{platform_runtime.processId()});
+    defer allocator.free(base);
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+    const socket = try std.fs.path.join(allocator, &.{ base, SOCKET_NAME });
+    defer allocator.free(socket);
+
+    const address = try std.Io.net.UnixAddress.init(socket);
+    var listener = try address.listen(io, .{});
+    defer listener.deinit(io);
+    defer deleteSocketPath(socket);
+
+    try std.testing.expect(sessionizerEndpointIsLive(io, socket));
+}
+
+test "parsePrepareShutdownResult detects method_not_found for legacy daemons" {
+    const allocator = std.testing.allocator;
+    const missing = parsePrepareShutdownResult(allocator,
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":"method_not_found","message":"daemon.prepareShutdown"}}
+    ).?;
+    try std.testing.expect(missing.method_missing);
+    try std.testing.expect(!missing.accepted);
+
+    const ready = parsePrepareShutdownResult(allocator,
+        \\{"jsonrpc":"2.0","id":1,"result":{"accepted":true,"safe_to_exit":true,"running_sessions":0,"keep_alive_turns":0,"shutdown_requested":true}}
+    ).?;
+    try std.testing.expect(ready.accepted);
+    try std.testing.expect(ready.safe_to_exit);
+    try std.testing.expect(!ready.method_missing);
+}
+
+test "Windows daemon replacement still requires authenticated pipe PID" {
+    try std.testing.expectEqual(
+        @as(?usize, 77),
+        daemonProcessIdForReplacement(.windows, 999_999, 77),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        daemonProcessIdForReplacement(.windows, 999_999, null),
+    );
 }
 
 const TestCliPathMapping = struct {
