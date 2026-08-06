@@ -6,6 +6,7 @@ const zqlite = @import("zqlite");
 
 const schema = @import("schema.zig");
 const db_types = @import("types.zig");
+const migration_fixture = @import("migration_fixture.zig");
 const provider_types = @import("../providers/types.zig");
 
 const LoadedState = db_types.LoadedState;
@@ -586,6 +587,342 @@ fn testDirPathAlloc(dir: std.Io.Dir, allocator: std.mem.Allocator) ![]u8 {
     var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const len = try dir.realPath(testing.io, &buffer);
     return allocator.dupe(u8, buffer[0..len]);
+}
+
+fn testOpenDatabase(allocator: std.mem.Allocator, pref_path: []const u8) !zqlite.Conn {
+    const path = try Client.pathForPrefPath(allocator, pref_path);
+    defer allocator.free(path);
+    const flags = zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode;
+    return zqlite.open(path, flags);
+}
+
+fn testCreateLegacyFixture(pref_path: []const u8) !void {
+    const conn = try testOpenDatabase(testing.allocator, pref_path);
+    defer conn.close();
+    try conn.execNoArgs(migration_fixture.LEGACY_V0_SQL);
+}
+
+fn testUserVersion(conn: zqlite.Conn) !i64 {
+    var row = (try conn.row("pragma user_version", .{})).?;
+    defer row.deinit();
+    return row.int(0);
+}
+
+fn testExpectRowCount(conn: zqlite.Conn, table_name: []const u8, expected: i64) !void {
+    var sql_buf: [128]u8 = undefined;
+    const sql = try std.fmt.bufPrint(&sql_buf, "select count(*) from {s}", .{table_name});
+    var row = (try conn.row(sql, .{})).?;
+    defer row.deinit();
+    try testing.expectEqual(expected, row.int(0));
+}
+
+fn testExpectStableId(conn: zqlite.Conn, sql: []const u8, key: []const u8, expected: i64) !void {
+    var row = (try conn.row(sql, .{key})).?;
+    defer row.deinit();
+    try testing.expectEqual(expected, row.int(0));
+}
+
+fn testExpectDatabaseChecks(conn: zqlite.Conn) !void {
+    var integrity = (try conn.row("pragma integrity_check", .{})).?;
+    defer integrity.deinit();
+    try testing.expectEqualStrings("ok", integrity.text(0));
+
+    var foreign_keys = try conn.rows("pragma foreign_key_check", .{});
+    defer foreign_keys.deinit();
+    try testing.expect(foreign_keys.next() == null);
+    if (foreign_keys.err) |err| return err;
+}
+
+fn testExpectLegacyFixtureState(state: PersistedState, expected_reasoning_variant: ?[]const u8) !void {
+    try testing.expectEqual(@as(usize, 1), state.selected_project_index);
+    try testing.expect(state.sidebar_collapsed);
+    try testing.expectEqual(@as(usize, 2), state.projects.len);
+
+    const active = state.projects[0];
+    try testing.expectEqualStrings("workspace-α", active.id.?);
+    try testing.expectEqualStrings("Montréal 🚀", active.label);
+    try testing.expectEqualStrings("/tmp/verde/équipe", active.path);
+    try testing.expect(!active.archived);
+    try testing.expectEqual(@as(u8, 7), active.unread_count);
+    try testing.expect(active.collapsed.?);
+    try testing.expect(active.thread_list_expanded.?);
+    try testing.expectEqual(@as(?f32, 384.5), active.terminal_height);
+    try testing.expectEqualStrings("{\"root\":\"terminal\"}", active.terminal_layout_json.?);
+    try testing.expectEqualStrings("[{\"id\":4}]", active.terminal_docks_json.?);
+    try testing.expectEqualStrings("{\"pane\":\"chat\"}", active.workspace_layout_json.?);
+    try testing.expectEqual(@as(usize, 0), active.selected_thread_index);
+    try testing.expectEqualStrings("thread-archived", active.companion_thread_local_id.?);
+    const herdr = active.herdr_link.?;
+    try testing.expectEqualStrings("zod.example", herdr.remote_alias);
+    try testing.expectEqualStrings("défaut", herdr.session_name);
+    try testing.expectEqualStrings("remote-α", herdr.workspace_id);
+    try testing.expectEqualStrings("/tmp/verde/équipe", herdr.local_dir);
+    try testing.expectEqualStrings("/srv/工程", herdr.remote_cwd.?);
+    try testing.expectEqualStrings("pane-九", herdr.last_pane_id.?);
+    try testing.expectEqual(@as(?u32, 4), herdr.attach_dock_id);
+    try testing.expectEqual(@as(?u32, 9), herdr.attach_pane_id);
+    try testing.expectEqualStrings("[{\"verde_pane_id\":9}]", herdr.pane_links_json.?);
+    try testing.expectEqual(@as(i64, 1700000000123), herdr.updated_at_ms);
+
+    const active_threads = active.threads.?;
+    try testing.expectEqual(@as(usize, 2), active_threads.len);
+    const thread = active_threads[0];
+    try testing.expectEqualStrings("thread-active", thread.local_thread_id.?);
+    try testing.expectEqualStrings("Active café", thread.title);
+    try testing.expect(!thread.archived);
+    try testing.expect(thread.committed);
+    try testing.expectEqual(@as(?i64, 1700000001000), thread.last_activity_at);
+    try testing.expectEqualStrings("provider-活", thread.provider_thread_id.?);
+    try testing.expectEqualStrings("openai/gpt-5", thread.model_ref.?);
+    try testing.expectEqual(db_types.ReasoningEffort.high, thread.reasoning_effort.?);
+    if (expected_reasoning_variant) |variant| {
+        try testing.expectEqualStrings(variant, thread.reasoning_variant.?);
+    } else {
+        try testing.expect(thread.reasoning_variant == null);
+    }
+    try testing.expectEqual(db_types.FastMode.on, thread.fast_mode.?);
+    try testing.expectEqual(db_types.AccessMode.full_access, thread.access_mode.?);
+    try testing.expectEqual(db_types.Provider.codex, thread.provider);
+    try testing.expectEqual(db_types.Harness.local_cli, thread.harness);
+    try testing.expectEqual(@as(?u32, 4), thread.tui_dock_id);
+    try testing.expectEqualStrings("draft — keep exactly", thread.draft);
+    try testing.expectEqualStrings("/tmp/draft-猫.png", thread.draft_image.?.path);
+    try testing.expectEqualStrings("image/png", thread.draft_image.?.mime);
+    try testing.expectEqual(@as(usize, 4242), thread.draft_image.?.byte_size);
+    try testing.expectEqual(@as(usize, 3), thread.messages.len);
+    try testing.expectEqual(db_types.ChatRole.user, thread.messages[0].role);
+    try testing.expectEqualStrings("You", thread.messages[0].author);
+    try testing.expectEqualStrings("Hello, 世界 👋", thread.messages[0].body);
+    try testing.expectEqualStrings("/tmp/input-λ.jpg", thread.messages[0].image.?.path);
+    try testing.expectEqualStrings("image/jpeg", thread.messages[0].image.?.mime);
+    try testing.expectEqual(@as(usize, 12345), thread.messages[0].image.?.byte_size);
+    try testing.expectEqual(db_types.ChatRole.assistant, thread.messages[1].role);
+    try testing.expectEqualStrings("Codex", thread.messages[1].author);
+    try testing.expectEqualStrings("It's persisted — café", thread.messages[1].body);
+    try testing.expectEqual(db_types.ChatRole.system, thread.messages[2].role);
+    try testing.expectEqualStrings("Ran command", thread.messages[2].author);
+    try testing.expectEqualStrings("$ printf '✓'", thread.messages[2].body);
+    try testing.expectEqualStrings("call-π", thread.messages[2].tool_call_id.?);
+    try testing.expectEqual(provider_types.ToolCallKind.execute, thread.messages[2].tool_call_kind.?);
+    try testing.expectEqual(provider_types.ToolCallStatus.completed, thread.messages[2].tool_call_status.?);
+
+    const archived_thread = active_threads[1];
+    try testing.expectEqualStrings("thread-archived", archived_thread.local_thread_id.?);
+    try testing.expectEqualStrings("Archived thread 🗄️", archived_thread.title);
+    try testing.expect(archived_thread.archived);
+    try testing.expect(archived_thread.committed);
+    try testing.expectEqual(@as(?i64, 1700000002000), archived_thread.last_activity_at);
+    try testing.expect(archived_thread.provider_thread_id == null);
+    try testing.expectEqualStrings("opencode/model", archived_thread.model_ref.?);
+    try testing.expectEqual(db_types.ReasoningEffort.medium, archived_thread.reasoning_effort.?);
+    try testing.expectEqual(db_types.FastMode.off, archived_thread.fast_mode.?);
+    try testing.expectEqual(db_types.AccessMode.supervised, archived_thread.access_mode.?);
+    try testing.expectEqual(db_types.Provider.opencode, archived_thread.provider);
+    try testing.expectEqual(db_types.Harness.remote_session, archived_thread.harness);
+    try testing.expect(archived_thread.tui_dock_id == null);
+    try testing.expectEqualStrings("", archived_thread.draft);
+    try testing.expect(archived_thread.draft_image == null);
+    try testing.expectEqual(@as(usize, 1), archived_thread.messages.len);
+    try testing.expectEqual(db_types.ChatRole.user, archived_thread.messages[0].role);
+    try testing.expectEqualStrings("You", archived_thread.messages[0].author);
+    try testing.expectEqualStrings("Archived question ¿qué?", archived_thread.messages[0].body);
+
+    const archived_workspace = state.projects[1];
+    try testing.expectEqualStrings("workspace-archive", archived_workspace.id.?);
+    try testing.expectEqualStrings("Archive Ω", archived_workspace.label);
+    try testing.expectEqualStrings("C:/Users/Test/Verde Ω", archived_workspace.path);
+    try testing.expect(archived_workspace.archived);
+    try testing.expectEqual(@as(u8, 0), archived_workspace.unread_count);
+    try testing.expect(!archived_workspace.collapsed.?);
+    try testing.expect(!archived_workspace.thread_list_expanded.?);
+    try testing.expect(archived_workspace.terminal_height == null);
+    try testing.expect(archived_workspace.terminal_layout_json == null);
+    try testing.expect(archived_workspace.terminal_docks_json == null);
+    try testing.expect(archived_workspace.workspace_layout_json == null);
+    try testing.expectEqual(@as(usize, 0), archived_workspace.selected_thread_index);
+    try testing.expect(archived_workspace.companion_thread_local_id == null);
+    try testing.expect(archived_workspace.herdr_link == null);
+    try testing.expectEqual(@as(usize, 1), archived_workspace.threads.?.len);
+    const workspace_archived_thread = archived_workspace.threads.?[0];
+    try testing.expectEqualStrings("thread-workspace-archive", workspace_archived_thread.local_thread_id.?);
+    try testing.expectEqualStrings("Workspace archive thread", workspace_archived_thread.title);
+    try testing.expect(workspace_archived_thread.archived);
+    try testing.expect(workspace_archived_thread.committed);
+    try testing.expectEqual(@as(?i64, 1700000003000), workspace_archived_thread.last_activity_at);
+    try testing.expectEqualStrings("provider-old", workspace_archived_thread.provider_thread_id.?);
+    try testing.expect(workspace_archived_thread.model_ref == null);
+    try testing.expect(workspace_archived_thread.reasoning_effort == null);
+    try testing.expect(workspace_archived_thread.fast_mode == null);
+    try testing.expect(workspace_archived_thread.access_mode == null);
+    try testing.expectEqual(db_types.Provider.cursor, workspace_archived_thread.provider);
+    try testing.expectEqual(db_types.Harness.local_cli, workspace_archived_thread.harness);
+    try testing.expectEqual(@as(?u32, 12), workspace_archived_thread.tui_dock_id);
+    try testing.expectEqualStrings("再開", workspace_archived_thread.draft);
+    try testing.expectEqual(@as(usize, 1), workspace_archived_thread.messages.len);
+    try testing.expectEqual(db_types.ChatRole.assistant, workspace_archived_thread.messages[0].role);
+    try testing.expectEqualStrings("Claude", workspace_archived_thread.messages[0].author);
+    try testing.expectEqualStrings("旧 workspace answer", workspace_archived_thread.messages[0].body);
+
+    try testing.expectEqual(@as(usize, 2), state.surface_states.len);
+    try testing.expectEqualStrings("session-α", state.surface_states[0].session_id);
+    try testing.expectEqualStrings("workspace-α", state.surface_states[0].workspace_id);
+    try testing.expectEqualStrings("/tmp/verde/équipe", state.surface_states[0].workspace_path);
+    try testing.expectEqual(@as(u32, 4), state.surface_states[0].dock_id);
+    try testing.expectEqual(@as(?u32, 9), state.surface_states[0].pane_id);
+    try testing.expectEqual(db_types.SurfaceProvider.codex, state.surface_states[0].provider.?);
+    try testing.expectEqualStrings("provider-活", state.surface_states[0].provider_thread_id.?);
+    try testing.expectEqualStrings("Build ✓", state.surface_states[0].title);
+    try testing.expectEqual(db_types.SurfaceStatus.done, state.surface_states[0].status);
+    try testing.expectEqual(@as(i64, 1700000004000), state.surface_states[0].status_changed_at_ms);
+    try testing.expectEqual(@as(i64, 1700000004000), state.surface_states[0].completed_at_ms);
+    try testing.expectEqualStrings("Ran command", state.surface_states[0].last_event_title.?);
+    try testing.expectEqualStrings("全部 good", state.surface_states[0].last_event_body.?);
+    try testing.expectEqualStrings("session-error", state.surface_states[1].session_id);
+    try testing.expectEqualStrings("workspace-archive", state.surface_states[1].workspace_id);
+    try testing.expectEqualStrings("C:/Users/Test/Verde Ω", state.surface_states[1].workspace_path);
+    try testing.expectEqual(@as(u32, 12), state.surface_states[1].dock_id);
+    try testing.expect(state.surface_states[1].pane_id == null);
+    try testing.expectEqual(db_types.SurfaceProvider.claude, state.surface_states[1].provider.?);
+    try testing.expect(state.surface_states[1].provider_thread_id == null);
+    try testing.expectEqualStrings("Failure ⚠", state.surface_states[1].title);
+    try testing.expectEqual(db_types.SurfaceStatus.@"error", state.surface_states[1].status);
+    try testing.expectEqual(@as(i64, 1700000005000), state.surface_states[1].status_changed_at_ms);
+    try testing.expectEqual(@as(i64, 0), state.surface_states[1].completed_at_ms);
+    try testing.expectEqualStrings("Command failed", state.surface_states[1].last_event_title.?);
+    try testing.expectEqualStrings("exit 2 — Ω", state.surface_states[1].last_event_body.?);
+
+    try testing.expectEqual(@as(usize, 2), state.chat_completions.len);
+    try testing.expectEqualStrings("workspace-α", state.chat_completions[0].workspace_id);
+    try testing.expectEqualStrings("thread-active", state.chat_completions[0].local_thread_id);
+    try testing.expectEqual(@as(i64, 1700000006000), state.chat_completions[0].completed_at_ms);
+    try testing.expectEqualStrings("workspace-archive", state.chat_completions[1].workspace_id);
+    try testing.expectEqualStrings("thread-workspace-archive", state.chat_completions[1].local_thread_id);
+    try testing.expectEqual(@as(i64, 1700000007000), state.chat_completions[1].completed_at_ms);
+}
+
+test "fresh database initializes at the current schema version" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+
+    var client = try Client.init(testing.allocator, pref_path);
+    defer client.deinit();
+    try testing.expectEqual(schema.CURRENT_VERSION, try testUserVersion(client.conn));
+    try testing.expect(try schema.testHasColumn(client.conn, "threads", "reasoning_variant"));
+    var table_count = (try client.conn.row("select count(*) from sqlite_schema where type = 'table' and name not like 'sqlite_%'", .{})).?;
+    defer table_count.deinit();
+    try testing.expectEqual(@as(i64, 6), table_count.int(0));
+    try testExpectDatabaseChecks(client.conn);
+}
+
+test "pre-versioning fixture migrates without transcript or ledger loss" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+    try testCreateLegacyFixture(pref_path);
+
+    var client = try Client.init(testing.allocator, pref_path);
+    defer client.deinit();
+    try testing.expectEqual(schema.CURRENT_VERSION, try testUserVersion(client.conn));
+    try testing.expect(try schema.testHasColumn(client.conn, "threads", "reasoning_variant"));
+    try testExpectRowCount(client.conn, "workspaces", 2);
+    try testExpectRowCount(client.conn, "threads", 3);
+    try testExpectRowCount(client.conn, "messages", 5);
+    try testExpectRowCount(client.conn, "surface_completions", 2);
+    try testExpectRowCount(client.conn, "chat_completions", 2);
+    try testExpectStableId(client.conn, "select id from workspaces where workspace_id = ?1", "workspace-α", 101);
+    try testExpectStableId(client.conn, "select id from workspaces where workspace_id = ?1", "workspace-archive", 202);
+    try testExpectStableId(client.conn, "select id from threads where local_thread_id = ?1", "thread-active", 1001);
+    try testExpectStableId(client.conn, "select id from threads where local_thread_id = ?1", "thread-archived", 1002);
+    try testExpectStableId(client.conn, "select id from threads where local_thread_id = ?1", "thread-workspace-archive", 2001);
+    try testExpectStableId(client.conn, "select id from messages where body = ?1", "Hello, 世界 👋", 5001);
+    try testExpectStableId(client.conn, "select id from messages where body = ?1", "It's persisted — café", 5002);
+    try testExpectStableId(client.conn, "select id from messages where body = ?1", "$ printf '✓'", 5003);
+    try testExpectStableId(client.conn, "select id from messages where body = ?1", "Archived question ¿qué?", 5004);
+    try testExpectStableId(client.conn, "select id from messages where body = ?1", "旧 workspace answer", 5005);
+
+    var loaded = (try client.load(testing.allocator)).?;
+    defer loaded.deinit();
+    try testExpectLegacyFixtureState(loaded.value, null);
+    try testExpectDatabaseChecks(client.conn);
+}
+
+test "schema migration is idempotent across repeated client initialization" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+    try testCreateLegacyFixture(pref_path);
+    {
+        const legacy = try testOpenDatabase(testing.allocator, pref_path);
+        defer legacy.close();
+        try legacy.execNoArgs(
+            \\alter table threads add column reasoning_variant text;
+            \\update threads set reasoning_variant = '最高' where id = 1001;
+        );
+    }
+
+    {
+        var first = try Client.init(testing.allocator, pref_path);
+        defer first.deinit();
+        try testing.expectEqual(schema.CURRENT_VERSION, try testUserVersion(first.conn));
+    }
+    {
+        var second = try Client.init(testing.allocator, pref_path);
+        defer second.deinit();
+        try testing.expectEqual(schema.CURRENT_VERSION, try testUserVersion(second.conn));
+        var columns = try second.conn.rows("pragma table_info(threads)", .{});
+        defer columns.deinit();
+        var reasoning_variant_count: usize = 0;
+        while (columns.next()) |row| {
+            if (std.mem.eql(u8, row.text(1), "reasoning_variant")) reasoning_variant_count += 1;
+        }
+        if (columns.err) |err| return err;
+        try testing.expectEqual(@as(usize, 1), reasoning_variant_count);
+        try testExpectRowCount(second.conn, "workspaces", 2);
+        try testExpectRowCount(second.conn, "threads", 3);
+        try testExpectRowCount(second.conn, "messages", 5);
+        var loaded = (try second.load(testing.allocator)).?;
+        defer loaded.deinit();
+        try testExpectLegacyFixtureState(loaded.value, "最高");
+        try testExpectDatabaseChecks(second.conn);
+    }
+}
+
+test "newer schema version is rejected without touching the database" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+
+    // Keep this fixture in rollback-journal mode so byte-for-byte comparison remains meaningful.
+    {
+        const conn = try testOpenDatabase(testing.allocator, pref_path);
+        defer conn.close();
+        try conn.execNoArgs(
+            \\create table future_marker (id integer primary key, value text not null);
+            \\insert into future_marker (id, value) values (1, 'future data Ω');
+            \\pragma user_version = 2;
+        );
+    }
+    const before = try tmp.dir.readFileAlloc(testing.io, STATE_DB_NAME, testing.allocator, .unlimited);
+    defer testing.allocator.free(before);
+
+    try testing.expectError(error.DatabaseSchemaTooNew, Client.init(testing.allocator, pref_path));
+
+    const after = try tmp.dir.readFileAlloc(testing.io, STATE_DB_NAME, testing.allocator, .unlimited);
+    defer testing.allocator.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+
+    const conn = try testOpenDatabase(testing.allocator, pref_path);
+    defer conn.close();
+    try testing.expectEqual(@as(i64, 2), try testUserVersion(conn));
+    var marker = (try conn.row("select value from future_marker where id = 1", .{})).?;
+    defer marker.deinit();
+    try testing.expectEqualStrings("future data Ω", marker.text(0));
+    try testing.expect(!try schema.testHasColumn(conn, "future_marker", "reasoning_variant"));
 }
 
 test "terminal surface states survive state saves and clear explicitly" {
