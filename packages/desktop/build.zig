@@ -512,7 +512,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const headless_test_step = b.step("headless-test", "Run headless package unit tests (no GUI deps)");
-    headless_test_step.dependOn(&b.addRunArtifact(headless_tests).step);
+    addTestArtifact(b, headless_test_step, headless_tests, target);
     test_compile_step.dependOn(&headless_tests.step);
     addTestArtifact(b, test_step, headless_tests, target);
     const chat_markdown_tests = b.addTest(.{

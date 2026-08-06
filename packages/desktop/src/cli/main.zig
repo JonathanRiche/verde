@@ -25,6 +25,7 @@ const VERSION = build_options.version;
 const SOCKET_NAME = live_endpoint.SOCKET_NAME;
 const LIVE_RESPONSE_TIMEOUT_MS: u32 = 5000;
 const MCP_TOOL_NAME_FIELD = "_verdeMcpTool";
+const CORE_COMMANDS = [_][]const u8{ "status", "capabilities" };
 const TERMINAL_GET_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
     .macos => @bitCast(@as(u32, 0x40087468)),
     .windows => 0,
@@ -69,6 +70,10 @@ fn dispatchArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []const 
     }
     if (std.mem.eql(u8, parsed.command, "capabilities")) {
         try printCapabilities(allocator, out, parsed.json);
+        return .handled;
+    }
+    if (std.mem.eql(u8, parsed.command, "core")) {
+        try handleCore(allocator, out, io, argv[0], parsed.rest);
         return .handled;
     }
     if (std.mem.eql(u8, parsed.command, "open")) {
@@ -140,6 +145,7 @@ fn printHelp(out: output.Output) !void {
         \\  verde notify [options]        Update the current terminal surface
         \\  verde integrations <command>  Inspect optional provider hook support
         \\  verde session <command>       Manage persistent terminal sessions
+        \\  verde core <command>          Query the session daemon headless core
         \\  verde live <command>          Talk to the running app
         \\  verde mcp                     Run the stdio MCP bridge
         \\
@@ -180,6 +186,10 @@ fn printHelp(out: output.Output) !void {
         \\  screen --id <session-id> [--json]
         \\  kill --id <session-id>
         \\  cleanup
+        \\
+        \\Core commands:
+        \\  status [--json]
+        \\  capabilities [--json]
         \\
         \\Live commands:
         \\  status [--json]
@@ -308,6 +318,7 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
             .integrations = spec.integration_commands[0..],
             .theme = spec.theme_commands[0..],
             .session = spec.session_commands[0..],
+            .core = CORE_COMMANDS[0..],
             .live = spec.live_capabilities[0..],
             .completion = spec.shells[0..],
             .encodings = spec.encodings[0..],
@@ -333,6 +344,7 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
         \\  integrations: list, doctor, install, remove, disable
         \\  theme: import, validate, export, reset
         \\  session: list, inspect, new, attach, write, tail, screen, kill, cleanup
+        \\  core: status, capabilities
         \\  live: status, workspaces, panes, pane control, chat control, terminal text/key/process/agent control
         \\  completion: bash, zsh, fish, powershell
         \\  encodings: json, jsonl
@@ -1241,6 +1253,74 @@ const PersistedSessionRef = struct {
     revive_policy: []const u8 = "attach_or_create",
     daemon_status: []const u8 = "metadata_only",
 };
+
+fn handleCore(allocator: std.mem.Allocator, out: output.Output, io: std.Io, exe_path: []const u8, argv: []const []const u8) !void {
+    const command = args.positional(argv, 0) orelse {
+        try out.stderr("missing core command; expected status or capabilities\n", .{});
+        std.process.exit(2);
+    };
+    if (args.hasFlag(argv, "--help") or args.hasFlag(argv, "-h") or std.mem.eql(u8, command, "help")) {
+        try out.stdout(
+            \\Usage:
+            \\  verde core status [--json]
+            \\  verde core capabilities [--json]
+            \\
+            \\Queries the GUI-free session daemon over its local socket.
+            \\
+        , .{});
+        return;
+    }
+
+    const method = if (std.mem.eql(u8, command, "status"))
+        "core.status"
+    else if (std.mem.eql(u8, command, "capabilities"))
+        "core.capabilities"
+    else {
+        try out.stderr("unknown core command: {s}\n", .{command});
+        std.process.exit(2);
+    };
+
+    // Same endpoint resolution and spawn-if-needed path as session commands.
+    try ensureSessionDaemon(allocator, io, exe_path);
+    const pref_path = try prefPath(allocator);
+    defer allocator.free(pref_path);
+
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = allocator,
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(allocator, &transport);
+    // Explicit empty object: bare `.{}` can stringify as `[]` and fail params validation.
+    const empty_params: struct {} = .{};
+    var parsed = client.call(method, empty_params) catch |err| {
+        try out.stderr("session daemon request failed: {s}\n", .{@errorName(err)});
+        std.process.exit(3);
+    };
+    defer parsed.deinit();
+
+    if (!parsed.response.isOk()) {
+        const err = parsed.response.err orelse unreachable;
+        try out.jsonValue(allocator, .{
+            .ok = false,
+            .error_code = err.code,
+            .error_message = err.message,
+        });
+        std.process.exit(4);
+    }
+
+    // Always emit JSON (daemon result payload). --json is accepted for parity
+    // with other CLI commands but is not required for core.*.
+    _ = args.hasFlag(argv, "--json");
+    try writeCoreJsonResult(out, allocator, parsed.response.result.?);
+}
+
+fn writeCoreJsonResult(out: output.Output, allocator: std.mem.Allocator, value: std.json.Value) !void {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.write(value);
+    try out.stdout("{s}\n", .{writer.written()});
+}
 
 fn handleSession(allocator: std.mem.Allocator, out: output.Output, io: std.Io, exe_path: []const u8, argv: []const []const u8) !void {
     const command = args.positional(argv, 0) orelse {

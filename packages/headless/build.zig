@@ -21,11 +21,25 @@ pub fn build(b: *std.Build) void {
     // Keep the module referenced so future library artifacts can import it.
     _ = headless_module;
 
-    const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run headless package unit tests");
-    test_step.dependOn(&run_tests.step);
-
     // Alias used by the monorepo root step name.
     const headless_test_step = b.step("headless-test", "Run headless package unit tests");
-    headless_test_step.dependOn(&run_tests.step);
+
+    // Mirror packages/desktop/build.zig: foreign test binaries are compile-only.
+    // Never invoke Wine/binfmt implicitly for a non-host target.
+    const host = b.graph.host.result;
+    // Keep a real linked artifact in the cache. Without an emitted-bin
+    // consumer Zig can reduce a compile-only test to `-fno-emit-bin`.
+    _ = tests.getEmittedBin();
+    const is_native = target.result.os.tag == host.os.tag and
+        target.result.cpu.arch == host.cpu.arch and
+        target.result.abi == host.abi;
+    if (is_native) {
+        const run_tests = b.addRunArtifact(tests);
+        test_step.dependOn(&run_tests.step);
+        headless_test_step.dependOn(&run_tests.step);
+    } else {
+        test_step.dependOn(&tests.step);
+        headless_test_step.dependOn(&tests.step);
+    }
 }
