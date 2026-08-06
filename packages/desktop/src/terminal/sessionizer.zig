@@ -7,6 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const harness = @import("../providers/harness.zig");
+const headless = @import("headless");
 const platform_ipc = @import("../platform/ipc.zig");
 const platform_live_endpoint = @import("../platform/live_endpoint.zig");
 const platform_runtime = @import("platform_runtime");
@@ -1410,6 +1411,8 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, "chat.turn.cancel")) return try self.chatTurnCancelResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.consume")) return try self.chatTurnConsumeResponse(id_value, params);
         if (std.mem.eql(u8, method, "status")) return try self.statusResponse(id_value);
+        // Additive headless core methods; existing methods and error codes unchanged.
+        if (std.mem.startsWith(u8, method, "core.")) return try self.coreResponse(id_value, method, params);
         return try errorResponseAlloc(self.allocator, id_value, "method_not_found", method);
     }
 
@@ -1420,6 +1423,22 @@ pub const Daemon = struct {
             .session_count = self.sessions.items.len,
             .idle_exit_ms = IDLE_EXIT_MS,
         });
+    }
+
+    fn coreResponse(self: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
+        const ctx: headless.Context = .{
+            .pid = platform_runtime.processId(),
+            .sessionizer_protocol_version = PROTOCOL_VERSION,
+            .session_count = self.sessions.items.len,
+            .chat_turn_count = self.chat_turns.items.len,
+        };
+        // Request id for the typed dispatcher is informational; wire id stays id_value.
+        const typed = headless.dispatchMethod(0, method, params, ctx);
+        return switch (typed.body) {
+            .status => |result| try okValueResponse(self.allocator, id_value, result),
+            .capabilities => |result| try okValueResponse(self.allocator, id_value, result),
+            .err => |err| try errorResponseAlloc(self.allocator, id_value, err.code, err.message),
+        };
     }
 
     fn listResponse(self: *Daemon, id_value: std.json.Value) ![]u8 {
