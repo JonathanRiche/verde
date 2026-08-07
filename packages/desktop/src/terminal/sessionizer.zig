@@ -17,6 +17,7 @@ const stack = @import("../workspace/stack.zig");
 const platform_runtime = @import("platform_runtime");
 const process_env = @import("../platform/env.zig");
 const send_runner = @import("../chat/send_runner.zig");
+const transcript_apply = @import("../chat/transcript_apply.zig");
 const windows_conpty = @import("platform/windows_conpty.zig");
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -70,6 +71,9 @@ pub const SESSION_DAEMON_STORE_DISABLE_ENV_NAME = "VERDE_SESSION_DAEMON_STORE_DI
 /// Test-only store fault arm (B9). Parsed only when the store-dir override is
 /// also set; maps 1:1 to `daemon_store.StoreFault` tag names.
 pub const SESSION_DAEMON_STORE_FAULT_ENV_NAME = "VERDE_SESSION_DAEMON_STORE_FAULT";
+/// Hermetic chat stub: when set (non-empty, not 0/false/no), chat workers skip
+/// real providers and complete with canned events so IT scenarios stay offline.
+pub const SESSION_DAEMON_CHAT_STUB_ENV_NAME = "VERDE_SESSION_DAEMON_CHAT_STUB";
 /// Test-only latency injection for the unlocked managed-process phase.
 const TEST_SLOW_IO_ENV_NAME = "VERDE_SESSIONIZER_TEST_SLOW_IO_MS";
 /// Test-only orphan retention override; registry-internal TTLs remain fixed.
@@ -1546,6 +1550,7 @@ const ChatTurn = struct {
     request: send_runner.Request,
     owned_image_paths: []const []const u8,
     started_at_ms: i64 = 0,
+    finished_at_ms: ?i64 = null,
     mutex: std.atomic.Mutex = .unlocked,
     worker_thread: ?std.Thread = null,
     events: std.ArrayList(ChatEvent) = .empty,
@@ -1553,7 +1558,19 @@ const ChatTurn = struct {
     status: ChatTurnStatus = .running,
     consumed: bool = false,
     worker_done: bool = false,
+    /// True from worker terminalization until the store receipt returns.
+    durability_pending: bool = false,
+    /// Set only after commitTurn returns a WriteResult (including receipt replay).
+    committed_store_revision: ?u64 = null,
     cancel_requested: bool = false,
+    /// Q5 cancel hint: suppress "Conversation interrupted" when a follow-up is pending.
+    followup_pending: bool = false,
+    /// Optional client-supplied user message id staged at acceptance (M4-P2/P3).
+    user_message_id: ?[]u8 = null,
+    /// Hermetic IT stub path (also armed by VERDE_SESSION_DAEMON_CHAT_STUB).
+    use_stub: bool = false,
+    /// Last durable-commit error name (diagnostic; dual-write-unread only).
+    durability_error: ?[]u8 = null,
     provider_thread_id: ?[]u8 = null,
     active_turn_id: ?[]u8 = null,
     result_reply_text: ?[]u8 = null,
@@ -1578,6 +1595,8 @@ const ChatTurn = struct {
         freeRunnerRequest(allocator, self.request, self.owned_image_paths);
         for (self.events.items) |*event| event.deinit(allocator);
         self.events.deinit(allocator);
+        if (self.user_message_id) |value| allocator.free(value);
+        if (self.durability_error) |value| allocator.free(value);
         if (self.provider_thread_id) |value| allocator.free(value);
         if (self.active_turn_id) |value| allocator.free(value);
         if (self.result_reply_text) |value| allocator.free(value);
@@ -1770,7 +1789,12 @@ pub const Daemon = struct {
         }
         for (self.chat_turns.items) |turn| {
             lockTurn(turn);
-            const keep_alive = chatTurnKeepsDaemonAlive(turn.status, turn.consumed, turn.worker_done);
+            const keep_alive = chatTurnKeepsDaemonAlive(
+                turn.status,
+                turn.consumed,
+                turn.worker_done,
+                turn.durability_pending,
+            );
             turn.mutex.unlock();
             if (keep_alive) return true;
         }
@@ -1812,7 +1836,12 @@ pub const Daemon = struct {
         var count: usize = 0;
         for (self.chat_turns.items) |turn| {
             lockTurn(turn);
-            const keep_alive = chatTurnKeepsDaemonAlive(turn.status, turn.consumed, turn.worker_done);
+            const keep_alive = chatTurnKeepsDaemonAlive(
+                turn.status,
+                turn.consumed,
+                turn.worker_done,
+                turn.durability_pending,
+            );
             turn.mutex.unlock();
             if (keep_alive) count += 1;
         }
@@ -1844,7 +1873,8 @@ pub const Daemon = struct {
         while (index < self.chat_turns.items.len) {
             const turn = self.chat_turns.items[index];
             lockTurn(turn);
-            const remove = turn.consumed and turn.worker_done;
+            // Never drop a turn while its store commit is still in flight.
+            const remove = turn.consumed and turn.worker_done and !turn.durability_pending;
             turn.mutex.unlock();
             if (remove) {
                 self.chat_turns.orderedRemove(index).deinit(self.allocator);
@@ -2118,7 +2148,12 @@ pub const Daemon = struct {
         const arena = arena_state.allocator();
 
         const is_status = std.mem.eql(u8, method, store_protocol.METHOD_DAEMON_STORE_STATUS);
-        const is_mutator = !is_status;
+        const is_thread_get = std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_GET);
+        const is_thread_list = std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_LIST);
+        const is_turn_record = std.mem.eql(u8, method, store_protocol.METHOD_CHAT_TURN_RECORD);
+        const is_chat_read = is_thread_get or is_thread_list or is_turn_record;
+        // Reads never join the mutator drain gate or in_flight write counter.
+        const is_mutator = !is_status and !is_chat_read;
 
         // 1. Decode typed params OUTSIDE any lock into the per-request arena.
         // parseFromValueLeaky ignores allocate; string slices borrow params,
@@ -2126,8 +2161,47 @@ pub const Daemon = struct {
         // OutOfMemory is re-raised (never remapped to invalid_params).
         var decode_failed = false;
         var decoded_mutation: ?daemon_store.Mutation = null;
+        var decoded_thread_get: ?store_protocol.ThreadGetRequest = null;
+        var decoded_thread_list: ?store_protocol.ThreadListRequest = null;
+        var decoded_turn_record: ?store_protocol.TurnRecordRequest = null;
         if (is_status) {
             // No params body required for status.
+        } else if (is_thread_get) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.ThreadGetRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_thread_get = value;
+        } else if (is_thread_list) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.ThreadListRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_thread_list = value;
+        } else if (is_turn_record) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.TurnRecordRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_turn_record = value;
         } else if (std.mem.eql(u8, method, store_protocol.METHOD_STATE_SNAPSHOT_REPLACE)) {
             const req = std.json.parseFromValueLeaky(
                 store_protocol.SnapshotReplaceRequest,
@@ -2256,7 +2330,17 @@ pub const Daemon = struct {
             );
         };
         // (iii) held decode failure.
-        if (decode_failed or (!is_status and decoded_mutation == null)) {
+        const decode_missing = if (is_status)
+            false
+        else if (is_thread_get)
+            decoded_thread_get == null
+        else if (is_thread_list)
+            decoded_thread_list == null
+        else if (is_turn_record)
+            decoded_turn_record == null
+        else
+            decoded_mutation == null;
+        if (decode_failed or decode_missing) {
             self.mutex.unlock();
             return try errorResponseAlloc(
                 self.allocator,
@@ -2331,6 +2415,46 @@ pub const Daemon = struct {
                 .queued_mutation_count = service.in_flight.load(.monotonic),
                 .drain_state = if (service_draining) "draining" else "open",
             };
+            return try okValueResponse(self.allocator, id_value, result);
+        }
+
+        if (is_thread_get) {
+            const req = decoded_thread_get orelse return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid params",
+            );
+            const result = loadThreadGetResult(self.allocator, &service.store, req) catch |err| {
+                return try storeErrorResponse(self.allocator, id_value, err);
+            };
+            defer freeThreadGetResult(self.allocator, result);
+            return try okValueResponse(self.allocator, id_value, result);
+        }
+        if (is_thread_list) {
+            const req = decoded_thread_list orelse return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid params",
+            );
+            const result = loadThreadListResult(self.allocator, &service.store, req) catch |err| {
+                return try storeErrorResponse(self.allocator, id_value, err);
+            };
+            defer freeThreadListResult(self.allocator, result);
+            return try okValueResponse(self.allocator, id_value, result);
+        }
+        if (is_turn_record) {
+            const req = decoded_turn_record orelse return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid params",
+            );
+            const result = loadTurnRecord(self.allocator, &service.store, req) catch |err| {
+                return try storeErrorResponse(self.allocator, id_value, err);
+            };
+            defer freeTurnRecord(self.allocator, result);
             return try okValueResponse(self.allocator, id_value, result);
         }
 
@@ -4036,7 +4160,9 @@ pub const Daemon = struct {
         errdefer turn.deinit(self.allocator);
         try self.chat_turns.append(self.allocator, turn);
         errdefer _ = self.chat_turns.pop();
-        const thread = try std.Thread.spawn(.{}, chatTurnThread, .{ self.allocator, turn });
+        // Staging runs on the worker thread: the normal request path holds
+        // lockDaemon, and store I/O must never run under that spin lock.
+        const thread = try std.Thread.spawn(.{}, chatTurnThread, .{ self, turn });
         turn.worker_thread = thread;
         return try okValueResponse(self.allocator, id_value, .{ .turn_id = turn.turn_id, .created = true });
     }
@@ -4104,8 +4230,10 @@ pub const Daemon = struct {
         if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
         const turn = self.findChatTurn(jsonString(params.object.get("turn_id") orelse .null) orelse return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing turn_id")) orelse
             return try errorResponseAlloc(self.allocator, id_value, "not_found", "turn not found");
+        const followup_pending = jsonBool(params.object.get("followup_pending") orelse .null) orelse false;
         lockTurn(turn);
         turn.cancel_requested = true;
+        turn.followup_pending = followup_pending;
         if (turn.status == .running or turn.status == .waiting_approval) {
             turn.status = .aborted;
             turn.appendEvent(self.allocator, "aborted", "{}");
@@ -4120,6 +4248,16 @@ pub const Daemon = struct {
         for (self.chat_turns.items, 0..) |turn, index| {
             if (!std.mem.eql(u8, turn.turn_id, turn_id)) continue;
             lockTurn(turn);
+            // Durable-before-consume: refuse until the store receipt lands.
+            if (turn.durability_pending) {
+                turn.mutex.unlock();
+                return try errorResponseAlloc(
+                    self.allocator,
+                    id_value,
+                    headless.protocol.ERR_INVALID_STATE,
+                    "turn durability is still pending",
+                );
+            }
             const can_remove = turn.worker_done;
             turn.consumed = true;
             turn.mutex.unlock();
@@ -4995,7 +5133,7 @@ fn sessionizerServerClosing(raw_context: *anyopaque) void {
     finalizeSessionizerStore(context);
 }
 
-/// Full store mutation surface plus storeStatus (S3).
+/// Full store mutation surface plus storeStatus (S3) and M4 durable chat reads.
 fn isStoreMethod(method: []const u8) bool {
     return std.mem.eql(u8, method, store_protocol.METHOD_STATE_SNAPSHOT_REPLACE) or
         std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_UPSERT) or
@@ -5005,7 +5143,10 @@ fn isStoreMethod(method: []const u8) bool {
         std.mem.eql(u8, method, store_protocol.METHOD_SURFACE_CLEAR) or
         std.mem.eql(u8, method, store_protocol.METHOD_NOTIFICATION_CHAT_COMPLETION_UPSERT) or
         std.mem.eql(u8, method, store_protocol.METHOD_NOTIFICATION_CHAT_COMPLETION_CLEAR) or
-        std.mem.eql(u8, method, store_protocol.METHOD_DAEMON_STORE_STATUS);
+        std.mem.eql(u8, method, store_protocol.METHOD_DAEMON_STORE_STATUS) or
+        std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_GET) or
+        std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_LIST) or
+        std.mem.eql(u8, method, store_protocol.METHOD_CHAT_TURN_RECORD);
 }
 
 fn mutationHeader(mutation: daemon_store.Mutation) store_protocol.MutationHeader {
@@ -5121,9 +5262,570 @@ fn maybeInitStoreService(daemon: *Daemon) !void {
     defer imported.deinit(daemon.allocator);
     try seedRegistryFromTransfer(daemon, &imported);
 
+    // Crash recovery: any non-terminal ledger rows left by a killed predecessor
+    // become `interrupted` before the writer is published.
+    sweepInterruptedChatTurns(&service.store);
+
     lockDaemon(daemon);
     daemon.store_service = service;
     daemon.mutex.unlock();
+}
+
+/// Mark dangling non-terminal ledger rows interrupted. Runs under the store
+/// open path before the service is published; no lockDaemon.
+fn sweepInterruptedChatTurns(store: *daemon_store.Store) void {
+    const finished_at = nowMs();
+    store.conn.exec(
+        \\update chat_turns
+        \\set status = 'interrupted',
+        \\    finished_at_ms = coalesce(finished_at_ms, ?1)
+        \\where status in ('accepted', 'running', 'waiting_approval')
+    ,
+        .{finished_at},
+    ) catch |err| {
+        log.warn("interrupted-turn sweep failed err={s}", .{@errorName(err)});
+    };
+}
+
+/// Stage a running ledger row (+ optional user message) at turn acceptance.
+/// Store I/O only under the service mutex; never under lockDaemon.
+fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !void {
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    daemon.mutex.unlock();
+    const svc = service orelse return;
+
+    var arena_state: std.heap.ArenaAllocator = .init(daemon.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const turn_id = try arena.dupe(u8, turn.turn_id);
+    const workspace_id = try arena.dupe(u8, turn.workspace_id);
+    const local_thread_id = try arena.dupe(u8, turn.local_thread_id);
+    const project_path = try arena.dupe(u8, turn.request.project_path);
+    const provider = try arena.dupe(u8, @tagName(turn.request.provider));
+    const thread_title = try arena.dupe(u8, turn.request.thread_title);
+    const prompt = try arena.dupe(u8, turn.request.prompt);
+    const user_message_id = if (turn.user_message_id) |id|
+        try arena.dupe(u8, id)
+    else
+        try std.fmt.allocPrint(arena, "turn:{s}:user", .{turn_id});
+    const started_at_ms = turn.started_at_ms;
+
+    lockStoreService(svc);
+    defer svc.mutex.unlock();
+    _ = svc.in_flight.fetchAdd(1, .monotonic);
+    defer _ = svc.in_flight.fetchSub(1, .monotonic);
+
+    const ws_key = try std.fmt.allocPrint(arena, "turn:{s}:stage-ws", .{turn_id});
+    _ = svc.store.upsertWorkspace(.{
+        .mutation = .{ .request_key = ws_key, .client_id = "daemon" },
+        .workspace = .{
+            .workspace_id = workspace_id,
+            .label = workspace_id,
+            .path = project_path,
+        },
+    }) catch |err| return err;
+
+    const thread_key = try std.fmt.allocPrint(arena, "turn:{s}:stage-thread", .{turn_id});
+    _ = svc.store.upsertThread(.{
+        .mutation = .{ .request_key = thread_key, .client_id = "daemon" },
+        .workspace_id = workspace_id,
+        .thread = .{
+            .local_thread_id = local_thread_id,
+            .title = if (thread_title.len != 0) thread_title else local_thread_id,
+            .provider = provider,
+            .harness = @tagName(turn.request.harness_kind),
+        },
+    }) catch |err| return err;
+
+    const msg_key = try std.fmt.allocPrint(arena, "turn:{s}:stage-user", .{turn_id});
+    _ = svc.store.appendMessage(.{
+        .mutation = .{ .request_key = msg_key, .client_id = "daemon" },
+        .workspace_id = workspace_id,
+        .thread_id = local_thread_id,
+        .message = .{
+            .message_id = user_message_id,
+            .role = "user",
+            .author = "You",
+            .body = prompt,
+            .created_at_ms = started_at_ms,
+            .updated_at_ms = started_at_ms,
+        },
+    }) catch |err| return err;
+
+    // Ledger stage is not receipt-backed: the terminal commitTurn path deletes
+    // non-terminal rows before inserting the durable terminal row.
+    svc.store.conn.exec(
+        \\insert or ignore into chat_turns (
+        \\  turn_id, workspace_id, local_thread_id, status, started_at_ms,
+        \\  provider, user_message_id
+        \\) values (?1, ?2, ?3, 'running', ?4, ?5, ?6)
+    ,
+        .{ turn_id, workspace_id, local_thread_id, started_at_ms, provider, user_message_id },
+    ) catch |err| return mapStageStoreError(err);
+
+    // Mirror the staged id back onto the in-memory turn when it was generated.
+    if (turn.user_message_id == null) {
+        lockTurn(turn);
+        defer turn.mutex.unlock();
+        if (turn.user_message_id == null) {
+            turn.user_message_id = daemon.allocator.dupe(u8, user_message_id) catch null;
+        }
+    }
+}
+
+fn mapStageStoreError(err: anyerror) daemon_store.StoreError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.StoreUnavailable,
+    };
+}
+
+/// Apply transcript_apply and commitTurn outside lockDaemon. Caller must not
+/// hold the turn lock. Sets committed_store_revision and clears durability_pending
+/// on success; leaves durability_pending set on failure (bounded retry later).
+fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(daemon.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // 1. Snapshot turn state under the turn lock only (no SQLite).
+    lockTurn(turn);
+    const turn_id = try arena.dupe(u8, turn.turn_id);
+    const workspace_id = try arena.dupe(u8, turn.workspace_id);
+    const local_thread_id = try arena.dupe(u8, turn.local_thread_id);
+    const provider = try arena.dupe(u8, @tagName(turn.request.provider));
+    const project_path = try arena.dupe(u8, turn.request.project_path);
+    const thread_title = try arena.dupe(u8, turn.request.thread_title);
+    const harness_kind = @tagName(turn.request.harness_kind);
+    const started_at_ms = turn.started_at_ms;
+    const finished_at_ms = turn.finished_at_ms orelse nowMs();
+    const followup_pending = turn.followup_pending;
+    const status = turn.status;
+    const user_message_id = if (turn.user_message_id) |id| try arena.dupe(u8, id) else null;
+    const provider_thread_id = if (turn.provider_thread_id) |id| try arena.dupe(u8, id) else null;
+    const error_message = if (turn.error_message) |msg| try arena.dupe(u8, msg) else null;
+    const reply_text = if (turn.result_reply_text) |text| try arena.dupe(u8, text) else "";
+    var events = try arena.alloc(transcript_apply.ChatEvent, turn.events.items.len);
+    for (turn.events.items, 0..) |event, index| {
+        events[index] = .{
+            .kind = try arena.dupe(u8, event.kind),
+            .payload_json = try arena.dupe(u8, event.payload_json),
+        };
+    }
+    turn.mutex.unlock();
+
+    const store_status: daemon_store.TurnStatus = switch (status) {
+        .completed => .completed,
+        .failed => .failed,
+        .aborted => .aborted,
+        .running, .waiting_approval => .interrupted,
+    };
+    const outcome: transcript_apply.WorkerOutcome = .{
+        .status = switch (store_status) {
+            .completed => .completed,
+            .failed => .failed,
+            .aborted => .aborted,
+            .interrupted => .interrupted,
+            else => .failed,
+        },
+        .provider = provider,
+        .reply_text = reply_text,
+        .failure_message = error_message,
+        .error_message = error_message,
+        .followup_pending = followup_pending,
+    };
+    const messages = try transcript_apply.apply(arena, events, outcome);
+
+    // 2. Short lockDaemon for service pointer + in_flight only.
+    lockDaemon(daemon);
+    const service = daemon.store_service orelse {
+        daemon.mutex.unlock();
+        // Store closed between check and commit: clear pending so the turn
+        // does not keep the daemon alive forever without a writer.
+        lockTurn(turn);
+        turn.durability_pending = false;
+        turn.mutex.unlock();
+        return;
+    };
+    _ = service.in_flight.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    defer _ = service.in_flight.fetchSub(1, .monotonic);
+
+    // 3. SQLite under the store service lock only.
+    lockStoreService(service);
+    defer service.mutex.unlock();
+
+    const ws_key = try std.fmt.allocPrint(arena, "turn:{s}:commit-ws", .{turn_id});
+    _ = try service.store.upsertWorkspace(.{
+        .mutation = .{ .request_key = ws_key, .client_id = "daemon" },
+        .workspace = .{
+            .workspace_id = workspace_id,
+            .label = workspace_id,
+            .path = project_path,
+        },
+    });
+    const thread_key = try std.fmt.allocPrint(arena, "turn:{s}:commit-thread", .{turn_id});
+    _ = try service.store.upsertThread(.{
+        .mutation = .{ .request_key = thread_key, .client_id = "daemon" },
+        .workspace_id = workspace_id,
+        .thread = .{
+            .local_thread_id = local_thread_id,
+            .title = if (thread_title.len != 0) thread_title else local_thread_id,
+            .provider = provider,
+            .harness = harness_kind,
+            .provider_thread_id = provider_thread_id,
+        },
+    });
+
+    // Terminal commitTurn inserts the ledger row; drop any acceptance stage first.
+    service.store.conn.exec(
+        "delete from chat_turns where turn_id = ?1 and status in ('accepted', 'running', 'waiting_approval')",
+        .{turn_id},
+    ) catch {};
+
+    // commitTurn uses conn.commit() (not commitWithFault). Inject the stall
+    // only on this path so turn-commit latency ITs exercise the worker-thread
+    // store seam without multiplying the upsert stalls already applied above.
+    if (service.store.fault == .commit_stall) {
+        platform_runtime.sleepMillis(daemon_store.STORE_FAULT_COMMIT_STALL_MS);
+    }
+
+    const write_result = try service.store.commitTurn(.{
+        .turn_id = turn_id,
+        .workspace_id = workspace_id,
+        .local_thread_id = local_thread_id,
+        .status = store_status,
+        .started_at_ms = started_at_ms,
+        .finished_at_ms = finished_at_ms,
+        .provider = provider,
+        .provider_thread_id = provider_thread_id,
+        .error_message = error_message,
+        .user_message_id = user_message_id,
+        .messages = messages,
+        .followup_pending = followup_pending,
+        .completion = if (store_status == .completed) .{
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+            .completed_at_ms = finished_at_ms,
+        } else null,
+        .client_id = "daemon",
+    });
+
+    // 4. Publish revision on the turn after the receipt (outside store lock is
+    // fine; turn lock only for field writes).
+    lockTurn(turn);
+    turn.committed_store_revision = write_result.store_revision;
+    turn.durability_pending = false;
+    turn.mutex.unlock();
+}
+
+fn loadTurnRecord(
+    allocator: std.mem.Allocator,
+    store: *daemon_store.Store,
+    request: store_protocol.TurnRecordRequest,
+) daemon_store.StoreError!store_protocol.TurnRecord {
+    if (request.turn_id.len == 0) return error.InvalidParams;
+    const row_or_null = store.conn.row(
+        \\select turn_id, workspace_id, local_thread_id, status, started_at_ms,
+        \\       finished_at_ms, provider, provider_thread_id, error_message,
+        \\       user_message_id, committed_store_revision
+        \\from chat_turns where turn_id = ?1
+    ,
+        .{request.turn_id},
+    ) catch return error.StoreUnavailable;
+    const row = row_or_null orelse return error.ResourceNotFound;
+    defer row.deinit();
+
+    const turn_id = allocator.dupe(u8, row.text(0)) catch return error.OutOfMemory;
+    errdefer allocator.free(turn_id);
+    const workspace_id = allocator.dupe(u8, row.text(1)) catch return error.OutOfMemory;
+    errdefer allocator.free(workspace_id);
+    const local_thread_id = allocator.dupe(u8, row.text(2)) catch return error.OutOfMemory;
+    errdefer allocator.free(local_thread_id);
+    const status = allocator.dupe(u8, row.text(3)) catch return error.OutOfMemory;
+    errdefer allocator.free(status);
+    const provider = allocator.dupe(u8, row.text(6)) catch return error.OutOfMemory;
+    errdefer allocator.free(provider);
+    const provider_thread_id = dupeOptionalText(allocator, row.nullableText(7)) catch return error.OutOfMemory;
+    errdefer if (provider_thread_id) |value| allocator.free(value);
+    const error_message = dupeOptionalText(allocator, row.nullableText(8)) catch return error.OutOfMemory;
+    errdefer if (error_message) |value| allocator.free(value);
+    const user_message_id = dupeOptionalText(allocator, row.nullableText(9)) catch return error.OutOfMemory;
+    errdefer if (user_message_id) |value| allocator.free(value);
+    const committed = if (row.nullableInt(10)) |value|
+        @as(?u64, @intCast(value))
+    else
+        null;
+
+    return .{
+        .turn_id = turn_id,
+        .workspace_id = workspace_id,
+        .local_thread_id = local_thread_id,
+        .status = status,
+        .started_at_ms = row.int(4),
+        .finished_at_ms = row.nullableInt(5),
+        .provider = provider,
+        .provider_thread_id = provider_thread_id,
+        .error_message = error_message,
+        .user_message_id = user_message_id,
+        .committed_store_revision = committed,
+    };
+}
+
+fn freeTurnRecord(allocator: std.mem.Allocator, record: store_protocol.TurnRecord) void {
+    allocator.free(record.turn_id);
+    allocator.free(record.workspace_id);
+    allocator.free(record.local_thread_id);
+    allocator.free(record.status);
+    allocator.free(record.provider);
+    if (record.provider_thread_id) |value| allocator.free(value);
+    if (record.error_message) |value| allocator.free(value);
+    if (record.user_message_id) |value| allocator.free(value);
+}
+
+fn loadThreadGetResult(
+    allocator: std.mem.Allocator,
+    store: *daemon_store.Store,
+    request: store_protocol.ThreadGetRequest,
+) daemon_store.StoreError!store_protocol.ThreadGetResult {
+    if (request.workspace_id.len == 0 or request.local_thread_id.len == 0) return error.InvalidParams;
+    const meta_or_null = store.conn.row(
+        \\select t.local_thread_id, t.title, t.archived, t.committed, t.last_activity_at,
+        \\       t.provider_thread_id, t.model_ref, t.provider, t.harness, t.id
+        \\from threads t
+        \\join workspaces w on w.id = t.workspace_id
+        \\where w.workspace_id = ?1 and t.local_thread_id = ?2
+    ,
+        .{ request.workspace_id, request.local_thread_id },
+    ) catch return error.StoreUnavailable;
+    const meta = meta_or_null orelse return error.ResourceNotFound;
+    defer meta.deinit();
+
+    const thread_row_id = meta.int(9);
+    const local_thread_id = allocator.dupe(u8, meta.text(0)) catch return error.OutOfMemory;
+    errdefer allocator.free(local_thread_id);
+    const title = allocator.dupe(u8, meta.text(1)) catch return error.OutOfMemory;
+    errdefer allocator.free(title);
+    const provider_thread_id = dupeOptionalText(allocator, meta.nullableText(5)) catch return error.OutOfMemory;
+    errdefer if (provider_thread_id) |value| allocator.free(value);
+    const model_ref = dupeOptionalText(allocator, meta.nullableText(6)) catch return error.OutOfMemory;
+    errdefer if (model_ref) |value| allocator.free(value);
+    const provider = allocator.dupe(u8, providerNameFromCode(meta.int(7))) catch return error.OutOfMemory;
+    errdefer allocator.free(provider);
+    const harness_name = allocator.dupe(u8, harnessNameFromCode(meta.int(8))) catch return error.OutOfMemory;
+    errdefer allocator.free(harness_name);
+    const archived = meta.int(2) != 0;
+    const committed = meta.int(3) != 0;
+    const last_activity_at = meta.nullableInt(4);
+
+    var messages_list: std.ArrayListUnmanaged(store_protocol.Message) = .empty;
+    errdefer {
+        for (messages_list.items) |message| freeOwnedMessage(allocator, message);
+        messages_list.deinit(allocator);
+    }
+    var rows = store.conn.rows(
+        \\select message_id, role, author, body, created_at_ms, updated_at_ms,
+        \\       tool_call_id, tool_call_kind, tool_call_status
+        \\from messages where thread_id = ?1 order by sort_index
+    ,
+        .{thread_row_id},
+    ) catch return error.StoreUnavailable;
+    defer rows.deinit();
+    while (rows.next()) |row| {
+        const message_id = allocator.dupe(u8, row.nullableText(0) orelse "") catch return error.OutOfMemory;
+        errdefer allocator.free(message_id);
+        const role = allocator.dupe(u8, roleNameFromCode(row.int(1))) catch return error.OutOfMemory;
+        errdefer allocator.free(role);
+        const author = allocator.dupe(u8, row.text(2)) catch return error.OutOfMemory;
+        errdefer allocator.free(author);
+        const body = allocator.dupe(u8, row.text(3)) catch return error.OutOfMemory;
+        errdefer allocator.free(body);
+        const tool_call_id = dupeOptionalText(allocator, row.nullableText(6)) catch return error.OutOfMemory;
+        errdefer if (tool_call_id) |value| allocator.free(value);
+        const tool_call_kind = if (row.nullableInt(7)) |code|
+            (allocator.dupe(u8, toolCallKindNameFromCode(code)) catch return error.OutOfMemory)
+        else
+            null;
+        errdefer if (tool_call_kind) |value| allocator.free(value);
+        const tool_call_status = if (row.nullableInt(8)) |code|
+            (allocator.dupe(u8, toolCallStatusNameFromCode(code)) catch return error.OutOfMemory)
+        else
+            null;
+        errdefer if (tool_call_status) |value| allocator.free(value);
+        messages_list.append(allocator, .{
+            .message_id = message_id,
+            .role = role,
+            .author = author,
+            .body = body,
+            .created_at_ms = row.nullableInt(4),
+            .updated_at_ms = row.nullableInt(5),
+            .tool_call_id = tool_call_id,
+            .tool_call_kind = tool_call_kind,
+            .tool_call_status = tool_call_status,
+        }) catch return error.OutOfMemory;
+    }
+    if (rows.err) |_| return error.StoreUnavailable;
+
+    const store_revision = store.storeRevision() catch return error.StoreUnavailable;
+    return .{
+        .thread = .{
+            .local_thread_id = local_thread_id,
+            .title = title,
+            .archived = archived,
+            .committed = committed,
+            .last_activity_at = last_activity_at,
+            .provider_thread_id = provider_thread_id,
+            .model_ref = model_ref,
+            .provider = provider,
+            .harness = harness_name,
+            .messages = try messages_list.toOwnedSlice(allocator),
+        },
+        .store_revision = store_revision,
+    };
+}
+
+fn freeThreadGetResult(allocator: std.mem.Allocator, result: store_protocol.ThreadGetResult) void {
+    allocator.free(result.thread.local_thread_id);
+    allocator.free(result.thread.title);
+    if (result.thread.provider_thread_id) |value| allocator.free(value);
+    if (result.thread.model_ref) |value| allocator.free(value);
+    allocator.free(result.thread.provider);
+    allocator.free(result.thread.harness);
+    for (result.thread.messages) |message| freeOwnedMessage(allocator, message);
+    allocator.free(result.thread.messages);
+}
+
+fn freeOwnedMessage(allocator: std.mem.Allocator, message: store_protocol.Message) void {
+    if (message.message_id.len != 0) allocator.free(message.message_id);
+    allocator.free(message.role);
+    allocator.free(message.author);
+    allocator.free(message.body);
+    if (message.tool_call_id) |value| allocator.free(value);
+    if (message.tool_call_kind) |value| allocator.free(value);
+    if (message.tool_call_status) |value| allocator.free(value);
+}
+
+fn loadThreadListResult(
+    allocator: std.mem.Allocator,
+    store: *daemon_store.Store,
+    request: store_protocol.ThreadListRequest,
+) daemon_store.StoreError!store_protocol.ThreadListResult {
+    if (request.workspace_id.len == 0) return error.InvalidParams;
+    const limit: u32 = if (request.limit == 0) 100 else request.limit;
+
+    var items: std.ArrayListUnmanaged(store_protocol.ThreadListItem) = .empty;
+    errdefer {
+        for (items.items) |item| freeThreadListItem(allocator, item);
+        items.deinit(allocator);
+    }
+
+    var rows = store.conn.rows(
+        \\select t.local_thread_id, t.title, t.archived, t.committed, t.last_activity_at,
+        \\       t.provider_thread_id, t.model_ref, t.provider, t.harness
+        \\from threads t
+        \\join workspaces w on w.id = t.workspace_id
+        \\where w.workspace_id = ?1
+        \\order by coalesce(t.last_activity_at, 0) desc, t.local_thread_id asc
+        \\limit ?2
+    ,
+        .{ request.workspace_id, @as(i64, @intCast(limit)) },
+    ) catch return error.StoreUnavailable;
+    defer rows.deinit();
+    while (rows.next()) |row| {
+        const local_thread_id = allocator.dupe(u8, row.text(0)) catch return error.OutOfMemory;
+        errdefer allocator.free(local_thread_id);
+        const title = allocator.dupe(u8, row.text(1)) catch return error.OutOfMemory;
+        errdefer allocator.free(title);
+        const provider_thread_id = dupeOptionalText(allocator, row.nullableText(5)) catch return error.OutOfMemory;
+        errdefer if (provider_thread_id) |value| allocator.free(value);
+        const model_ref = dupeOptionalText(allocator, row.nullableText(6)) catch return error.OutOfMemory;
+        errdefer if (model_ref) |value| allocator.free(value);
+        const provider = allocator.dupe(u8, providerNameFromCode(row.int(7))) catch return error.OutOfMemory;
+        errdefer allocator.free(provider);
+        const harness_name = allocator.dupe(u8, harnessNameFromCode(row.int(8))) catch return error.OutOfMemory;
+        errdefer allocator.free(harness_name);
+        items.append(allocator, .{
+            .local_thread_id = local_thread_id,
+            .title = title,
+            .archived = row.int(2) != 0,
+            .committed = row.int(3) != 0,
+            .last_activity_at = row.nullableInt(4),
+            .provider_thread_id = provider_thread_id,
+            .model_ref = model_ref,
+            .provider = provider,
+            .harness = harness_name,
+        }) catch return error.OutOfMemory;
+    }
+    if (rows.err) |_| return error.StoreUnavailable;
+
+    const store_revision = store.storeRevision() catch return error.StoreUnavailable;
+    return .{
+        .threads = try items.toOwnedSlice(allocator),
+        .next_cursor = null,
+        .store_revision = store_revision,
+    };
+}
+
+fn freeThreadListResult(allocator: std.mem.Allocator, result: store_protocol.ThreadListResult) void {
+    for (result.threads) |item| freeThreadListItem(allocator, item);
+    allocator.free(result.threads);
+    if (result.next_cursor) |value| allocator.free(value);
+}
+
+fn freeThreadListItem(allocator: std.mem.Allocator, item: store_protocol.ThreadListItem) void {
+    allocator.free(item.local_thread_id);
+    allocator.free(item.title);
+    if (item.provider_thread_id) |value| allocator.free(value);
+    if (item.model_ref) |value| allocator.free(value);
+    allocator.free(item.provider);
+    allocator.free(item.harness);
+}
+
+fn dupeOptionalText(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
+    const text = value orelse return null;
+    if (text.len == 0) return null;
+    return try allocator.dupe(u8, text);
+}
+
+fn providerNameFromCode(code: i64) []const u8 {
+    return switch (code) {
+        0 => "opencode",
+        1 => "codex",
+        2 => "cursor",
+        3 => "claude",
+        else => "opencode",
+    };
+}
+
+fn harnessNameFromCode(code: i64) []const u8 {
+    return switch (code) {
+        0 => "local_cli",
+        1 => "remote_session",
+        else => "local_cli",
+    };
+}
+
+fn roleNameFromCode(code: i64) []const u8 {
+    return switch (code) {
+        0 => "system",
+        1 => "user",
+        2 => "assistant",
+        else => "system",
+    };
+}
+
+fn toolCallKindNameFromCode(code: i64) []const u8 {
+    const names = [_][]const u8{ "read", "edit", "delete", "move", "search", "execute", "think", "fetch", "mcp", "other" };
+    if (code < 0 or code >= names.len) return "other";
+    return names[@intCast(code)];
+}
+
+fn toolCallStatusNameFromCode(code: i64) []const u8 {
+    const names = [_][]const u8{ "pending", "in_progress", "completed", "failed", "cancelled", "unknown" };
+    if (code < 0 or code >= names.len) return "unknown";
+    return names[@intCast(code)];
 }
 
 fn storeErrorResponse(
@@ -5625,7 +6327,15 @@ fn lockTurn(turn: *ChatTurn) void {
     while (!turn.mutex.tryLock()) std.atomic.spinLoopHint();
 }
 
-fn chatTurnKeepsDaemonAlive(status: ChatTurnStatus, consumed: bool, worker_done: bool) bool {
+fn chatTurnKeepsDaemonAlive(
+    status: ChatTurnStatus,
+    consumed: bool,
+    worker_done: bool,
+    durability_pending: bool,
+) bool {
+    // Durable commit is in flight: the turn is not consumable and must keep
+    // the daemon alive until the store receipt lands (M4 dual-write-unread).
+    if (durability_pending) return true;
     if (status == .running or status == .waiting_approval) return true;
     // A finished result exists only in daemon memory until the desktop tails
     // and consumes it. Exiting after the generic idle timeout would discard
@@ -5815,6 +6525,16 @@ fn writeChatTurnTail(s: *std.json.Stringify, turn: *const ChatTurn, after_seq: u
     if (turn.error_message) |value| try s.write(value) else try s.write(null);
     try s.objectField("pending_approval");
     try writePendingApproval(s, turn.pending_approval);
+    // M4 durable-commit publication: present only after the store receipt.
+    try s.objectField("committed_store_revision");
+    if (turn.committed_store_revision) |value| try s.write(value) else try s.write(null);
+    // Compaction horizon is owned by the live tail; null until M5 compaction.
+    try s.objectField("events_compacted_before_seq");
+    try s.write(null);
+    try s.objectField("durability_pending");
+    try s.write(turn.durability_pending);
+    try s.objectField("durability_error");
+    if (turn.durability_error) |value| try s.write(value) else try s.write(null);
     try s.endObject();
 }
 
@@ -5888,6 +6608,11 @@ fn createChatTurnFromParams(allocator: std.mem.Allocator, params: std.json.Value
         .remote_ssh_host = try optionalDupe(allocator, params, "remote_ssh_host"),
         .remote_cwd = try optionalDupe(allocator, params, "remote_cwd"),
     };
+    const user_message_id = try optionalDupe(allocator, params, "message_id");
+    errdefer if (user_message_id) |value| allocator.free(value);
+    // IT/hermetic: params.test_stub OR process env both select the offline worker.
+    const use_stub = (jsonBool(params.object.get("test_stub") orelse .null) orelse false) or
+        chatStubEnabledFromEnv(allocator);
     turn.* = .{
         .allocator = allocator,
         .turn_id = try requiredDupe(allocator, params, "turn_id"),
@@ -5896,44 +6621,141 @@ fn createChatTurnFromParams(allocator: std.mem.Allocator, params: std.json.Value
         .request = request,
         .owned_image_paths = image_paths,
         .started_at_ms = nowMs(),
+        .user_message_id = user_message_id,
+        .use_stub = use_stub,
     };
     return turn;
 }
 
-fn chatTurnThread(allocator: std.mem.Allocator, turn: *ChatTurn) void {
-    const result = send_runner.run(allocator, turn.request, .{
-        .context = turn,
-        .on_thread_id = chatSinkThreadId,
-        .on_turn_id = chatSinkTurnId,
-        .on_stream_delta = chatSinkDelta,
-        .on_stream_event = chatSinkEvent,
-        .on_failure = chatSinkFailure,
-        .on_should_stop = chatSinkShouldStop,
-        .on_approval_request = chatSinkApproval,
-    });
+fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
+    const allocator = daemon.allocator;
+    // Acceptance staging before provider work so a mid-turn kill still leaves
+    // the user row + running ledger for the interrupted sweep. Must not run
+    // under lockDaemon (the accept path holds it for chat.turn.start).
+    stageAcceptedChatTurn(daemon, turn) catch |err| {
+        log.warn("chat turn acceptance staging failed turn_id={s} err={s}", .{ turn.turn_id, @errorName(err) });
+    };
+    if (turn.use_stub or chatStubEnabledFromEnv(allocator)) {
+        runStubChatTurn(allocator, turn);
+    } else {
+        const result = send_runner.run(allocator, turn.request, .{
+            .context = turn,
+            .on_thread_id = chatSinkThreadId,
+            .on_turn_id = chatSinkTurnId,
+            .on_stream_delta = chatSinkDelta,
+            .on_stream_event = chatSinkEvent,
+            .on_failure = chatSinkFailure,
+            .on_should_stop = chatSinkShouldStop,
+            .on_approval_request = chatSinkApproval,
+        });
+        lockTurn(turn);
+        if (!(turn.cancel_requested or turn.status == .aborted)) {
+            if (result) |value| {
+                turn.status = .completed;
+                if (turn.provider_thread_id) |old| allocator.free(old);
+                turn.provider_thread_id = allocator.dupe(u8, value.provider_thread_id) catch null;
+                turn.result_reply_text = allocator.dupe(u8, value.reply_text) catch null;
+                turn.appendEvent(allocator, "completed", "{}");
+                allocator.free(value.provider_thread_id);
+                allocator.free(value.reply_text);
+            } else |err| {
+                turn.status = if (turn.cancel_requested) .aborted else .failed;
+                if (turn.error_message == null) {
+                    turn.error_message = allocator.dupe(u8, @errorName(err)) catch null;
+                }
+                const message = turn.error_message orelse @errorName(err);
+                turn.appendStringEvent(allocator, if (turn.status == .aborted) "aborted" else "failed", "message", message);
+            }
+        } else {
+            turn.status = .aborted;
+        }
+        turn.mutex.unlock();
+    }
+
+    finalizeChatTurnWorker(daemon, turn);
+}
+
+/// Common post-worker bookkeeping: durability_pending then store commit outside
+/// both the turn lock and lockDaemon (store service seam only).
+fn finalizeChatTurnWorker(daemon: *Daemon, turn: *ChatTurn) void {
+    const should_commit = daemonStoreIsOpen(daemon);
+    lockTurn(turn);
+    turn.finished_at_ms = turn.finished_at_ms orelse nowMs();
+    if (should_commit) turn.durability_pending = true;
+    turn.worker_done = true;
+    turn.mutex.unlock();
+    if (should_commit) {
+        commitChatTurnDurable(daemon, turn) catch |err| {
+            log.warn("chat turn durable commit failed turn_id={s} err={s}", .{ turn.turn_id, @errorName(err) });
+            // Keep durability_pending true (turn not consumable) but record the
+            // failure so tails/ITs can distinguish hang vs store error.
+            lockTurn(turn);
+            if (turn.durability_error) |old| daemon.allocator.free(old);
+            turn.durability_error = daemon.allocator.dupe(u8, @errorName(err)) catch null;
+            turn.mutex.unlock();
+        };
+    }
+}
+
+fn daemonStoreIsOpen(daemon: *Daemon) bool {
+    lockDaemon(daemon);
+    defer daemon.mutex.unlock();
+    return daemon.store_service != null;
+}
+
+/// Hermetic offline provider. Prompt tokens:
+/// - contains "fail" → failed
+/// - contains "slow" → sleep then complete (cancel may abort)
+/// - otherwise complete with a canned assistant delta.
+fn runStubChatTurn(allocator: std.mem.Allocator, turn: *ChatTurn) void {
+    const prompt = turn.request.prompt;
+    const want_fail = std.mem.indexOf(u8, prompt, "fail") != null;
+    const want_slow = std.mem.indexOf(u8, prompt, "slow") != null;
+    if (want_slow) {
+        // Keep the stall short enough for IT budgets but long enough to race a kill.
+        platform_runtime.sleepMillis(400);
+    }
     lockTurn(turn);
     defer turn.mutex.unlock();
     if (turn.cancel_requested or turn.status == .aborted) {
-        turn.worker_done = true;
+        turn.status = .aborted;
+        turn.appendEvent(allocator, "aborted", "{}");
+        turn.finished_at_ms = nowMs();
         return;
     }
-    if (result) |value| {
-        turn.status = .completed;
-        if (turn.provider_thread_id) |old| allocator.free(old);
-        turn.provider_thread_id = allocator.dupe(u8, value.provider_thread_id) catch null;
-        turn.result_reply_text = allocator.dupe(u8, value.reply_text) catch null;
-        turn.appendEvent(allocator, "completed", "{}");
-        allocator.free(value.provider_thread_id);
-        allocator.free(value.reply_text);
-    } else |err| {
-        turn.status = if (turn.cancel_requested) .aborted else .failed;
-        if (turn.error_message == null) {
-            turn.error_message = allocator.dupe(u8, @errorName(err)) catch null;
-        }
-        const message = turn.error_message orelse @errorName(err);
-        turn.appendStringEvent(allocator, if (turn.status == .aborted) "aborted" else "failed", "message", message);
+    if (want_fail) {
+        turn.status = .failed;
+        turn.error_message = allocator.dupe(u8, "stub failure") catch null;
+        turn.appendStringEvent(allocator, "failed", "message", "stub failure");
+        turn.finished_at_ms = nowMs();
+        return;
     }
-    turn.worker_done = true;
+    turn.status = .completed;
+    if (turn.provider_thread_id) |old| allocator.free(old);
+    turn.provider_thread_id = allocator.dupe(u8, "stub-provider-thread") catch null;
+    turn.result_reply_text = allocator.dupe(u8, "stub-ok") catch null;
+    turn.appendStringEvent(allocator, "assistant_delta", "text", "stub-ok");
+    turn.appendEvent(allocator, "completed", "{}");
+    turn.finished_at_ms = nowMs();
+}
+
+fn chatStubEnabledFromEnv(allocator: std.mem.Allocator) bool {
+    const environ: std.process.Environ = if (builtin.os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    const raw = environ.getAlloc(allocator, SESSION_DAEMON_CHAT_STUB_ENV_NAME) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return false,
+        error.OutOfMemory => return false,
+        error.InvalidWtf8 => return false,
+    };
+    defer allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    if (std.mem.eql(u8, trimmed, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(trimmed, "false")) return false;
+    if (std.ascii.eqlIgnoreCase(trimmed, "no")) return false;
+    return true;
 }
 
 fn chatSinkThreadId(context: ?*anyopaque, thread_id: []const u8) void {
@@ -7877,12 +8699,14 @@ test "daemon chat diff payload preserves files and patches" {
 }
 
 test "daemon retains chat turns until their result is consumed" {
-    try std.testing.expect(chatTurnKeepsDaemonAlive(.running, false, false));
-    try std.testing.expect(chatTurnKeepsDaemonAlive(.waiting_approval, false, false));
-    try std.testing.expect(chatTurnKeepsDaemonAlive(.completed, false, true));
-    try std.testing.expect(chatTurnKeepsDaemonAlive(.failed, false, true));
-    try std.testing.expect(chatTurnKeepsDaemonAlive(.aborted, false, true));
-    try std.testing.expect(!chatTurnKeepsDaemonAlive(.completed, true, true));
+    try std.testing.expect(chatTurnKeepsDaemonAlive(.running, false, false, false));
+    try std.testing.expect(chatTurnKeepsDaemonAlive(.waiting_approval, false, false, false));
+    try std.testing.expect(chatTurnKeepsDaemonAlive(.completed, false, true, false));
+    try std.testing.expect(chatTurnKeepsDaemonAlive(.failed, false, true, false));
+    try std.testing.expect(chatTurnKeepsDaemonAlive(.aborted, false, true, false));
+    try std.testing.expect(!chatTurnKeepsDaemonAlive(.completed, true, true, false));
+    // Durable commit in flight keeps the daemon alive even if already consumed.
+    try std.testing.expect(chatTurnKeepsDaemonAlive(.completed, true, true, true));
 }
 
 test "prepareShutdown refuses while a live PTY exists" {
@@ -9287,4 +10111,156 @@ test "Windows CLI resolver falls back through PATH then current executable" {
     const fallback = try resolveWindowsCliPathWith(allocator, "C:\\standalone\\Verde.exe", &fallback_resolver);
     defer allocator.free(fallback);
     try std.testing.expectEqualStrings("C:\\standalone\\Verde.exe", fallback);
+}
+
+test "durable turn commit is exactly once and interrupt sweep marks running rows" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+
+    // Seed a dangling running row as if a predecessor was killed mid-turn.
+    {
+        lockStoreService(daemon.store_service.?);
+        defer daemon.store_service.?.mutex.unlock();
+        _ = try daemon.store_service.?.store.upsertWorkspace(.{
+            .mutation = .{ .request_key = "sweep-ws", .client_id = "daemon" },
+            .workspace = .{ .workspace_id = "ws-sweep", .label = "Sweep", .path = "/tmp/sweep" },
+        });
+        _ = try daemon.store_service.?.store.upsertThread(.{
+            .mutation = .{ .request_key = "sweep-thread", .client_id = "daemon" },
+            .workspace_id = "ws-sweep",
+            .thread = .{ .local_thread_id = "t-sweep", .title = "Sweep", .provider = "codex", .harness = "local_cli" },
+        });
+        try daemon.store_service.?.store.conn.exec(
+            "insert into chat_turns (turn_id, workspace_id, local_thread_id, status, started_at_ms, provider) values ('turn-running', 'ws-sweep', 't-sweep', 'running', 1, 'codex')",
+            .{},
+        );
+        sweepInterruptedChatTurns(&daemon.store_service.?.store);
+        var row = (try daemon.store_service.?.store.conn.row(
+            "select status from chat_turns where turn_id = 'turn-running'",
+            .{},
+        )).?;
+        defer row.deinit();
+        try std.testing.expectEqualStrings("interrupted", row.text(0));
+    }
+
+    const turn = try allocator.create(ChatTurn);
+    const image_paths: []const []const u8 = &.{};
+    turn.* = .{
+        .allocator = allocator,
+        .turn_id = try allocator.dupe(u8, "turn-commit-once"),
+        .workspace_id = try allocator.dupe(u8, "ws-commit"),
+        .local_thread_id = try allocator.dupe(u8, "t-commit"),
+        .request = .{
+            .provider = .codex,
+            .harness_kind = .local_cli,
+            .project_path = try allocator.dupe(u8, "/tmp/commit"),
+            .prompt = try allocator.dupe(u8, "hello"),
+            .thread_title = try allocator.dupe(u8, "Commit"),
+        },
+        .owned_image_paths = image_paths,
+        .started_at_ms = 10,
+        .finished_at_ms = 20,
+        .status = .completed,
+        .worker_done = true,
+        .durability_pending = true,
+        .result_reply_text = try allocator.dupe(u8, "reply"),
+        .user_message_id = try allocator.dupe(u8, "user-1"),
+    };
+    turn.appendStringEvent(allocator, "assistant_delta", "text", "reply");
+    turn.appendEvent(allocator, "completed", "{}");
+    // Owned by daemon.chat_turns (freed in daemon.deinit).
+    try daemon.chat_turns.append(allocator, turn);
+
+    try commitChatTurnDurable(&daemon, turn);
+    try std.testing.expect(turn.committed_store_revision != null);
+    try std.testing.expect(!turn.durability_pending);
+    const first_revision = turn.committed_store_revision.?;
+
+    // Receipt replay: same turn commit must not append or bump again.
+    turn.durability_pending = true;
+    turn.committed_store_revision = null;
+    try commitChatTurnDurable(&daemon, turn);
+    try std.testing.expectEqual(first_revision, turn.committed_store_revision.?);
+    try std.testing.expect(!turn.durability_pending);
+
+    lockStoreService(daemon.store_service.?);
+    defer daemon.store_service.?.mutex.unlock();
+    var count = (try daemon.store_service.?.store.conn.row(
+        "select count(*) from chat_turns where turn_id = 'turn-commit-once'",
+        .{},
+    )).?;
+    defer count.deinit();
+    try std.testing.expectEqual(@as(i64, 1), count.int(0));
+
+    var receipt = (try daemon.store_service.?.store.conn.row(
+        "select count(*) from store_receipts where request_key = 'turn:turn-commit-once:commit'",
+        .{},
+    )).?;
+    defer receipt.deinit();
+    try std.testing.expectEqual(@as(i64, 1), receipt.int(0));
+}
+
+test "chat.thread.get and chat.turn.record dispatch typed durable reads" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+
+    lockStoreService(daemon.store_service.?);
+    _ = try daemon.store_service.?.store.upsertWorkspace(.{
+        .mutation = .{ .request_key = "dto-ws", .client_id = "daemon" },
+        .workspace = .{ .workspace_id = "ws-dto", .label = "DTO", .path = "/tmp/dto" },
+    });
+    _ = try daemon.store_service.?.store.upsertThread(.{
+        .mutation = .{ .request_key = "dto-thread", .client_id = "daemon" },
+        .workspace_id = "ws-dto",
+        .thread = .{ .local_thread_id = "t-dto", .title = "DTO thread", .provider = "codex", .harness = "local_cli" },
+    });
+    _ = try daemon.store_service.?.store.commitTurn(.{
+        .turn_id = "turn-dto",
+        .workspace_id = "ws-dto",
+        .local_thread_id = "t-dto",
+        .status = .completed,
+        .started_at_ms = 1,
+        .finished_at_ms = 2,
+        .provider = "codex",
+        .messages = &.{
+            .{ .message_id = "m1", .role = "assistant", .author = "codex", .body = "hi" },
+        },
+    });
+    daemon.store_service.?.mutex.unlock();
+
+    const get_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"chat.thread.get","params":{"workspace_id":"ws-dto","local_thread_id":"t-dto"}}
+    );
+    defer allocator.free(get_response);
+    try std.testing.expect(std.mem.indexOf(u8, get_response, "\"local_thread_id\":\"t-dto\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_response, "\"body\":\"hi\"") != null);
+
+    const record_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"chat.turn.record","params":{"turn_id":"turn-dto"}}
+    );
+    defer allocator.free(record_response);
+    try std.testing.expect(std.mem.indexOf(u8, record_response, "\"turn_id\":\"turn-dto\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, record_response, "\"status\":\"completed\"") != null);
+
+    const list_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"chat.thread.list","params":{"workspace_id":"ws-dto","limit":10}}
+    );
+    defer allocator.free(list_response);
+    try std.testing.expect(std.mem.indexOf(u8, list_response, "\"local_thread_id\":\"t-dto\"") != null);
 }
