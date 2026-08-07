@@ -366,10 +366,6 @@ pub const TurnRecordRequest = struct {
     turn_id: []const u8,
 };
 
-/// Compatibility names for callers that describe list rows as summaries.
-pub const ThreadSummary = ThreadListItem;
-pub const ThreadListEntry = ThreadListItem;
-
 // Descriptive aliases keep the wire vocabulary usable at call sites without
 // introducing duplicate representations.
 pub const ImageAttachment = Attachment;
@@ -688,6 +684,11 @@ test "decode owns strings after the input buffer is released" {
     try std.testing.expectEqualStrings("body", parsed.value.message.body);
 }
 
+// "Byte-compatible" here means decode-tolerance in both directions plus an
+// exact-JSON pin of the M3 request bytes — NOT that new-struct encodes are
+// byte-identical (std.json emits the additive optionals as null by default).
+// The daemon hand-serializes responses, so decode-level compatibility is the
+// real contract.
 test "M3 core.snapshot shapes are byte-compatible when scopes are absent" {
     const allocator = std.testing.allocator;
     // Frozen copies of the M3 wire shapes, exactly as published before M5.

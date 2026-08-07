@@ -11,6 +11,9 @@ pub const store_protocol = @import("store_protocol.zig");
 pub const changes_protocol = @import("changes_protocol.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const client = @import("client.zig");
+// Deliberate second alias for store_protocol: `.store` predates it and is
+// consumed by the daemon store and IT binary; consolidate to one name only
+// when those consumers' owning chunks are free to edit.
 pub const store = @import("store_protocol.zig");
 
 pub const HEADLESS_PROTOCOL_VERSION = protocol.HEADLESS_PROTOCOL_VERSION;
