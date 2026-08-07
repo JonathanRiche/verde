@@ -668,6 +668,11 @@ pub const WorkspaceLayout = struct {
         var next_sidebar_pane_id: ?WorkspacePaneId = null;
         var next_tiled_pane_id: ?WorkspacePaneId = null;
         if (was_maximized and self.panes.items.len > 1) {
+            if (self.quick_pane) |quick| {
+                if (quick.pane_id != pane_id and self.paneById(quick.pane_id) != null) {
+                    next_sidebar_pane_id = quick.pane_id;
+                }
+            }
             var offset: usize = 1;
             while (offset < self.panes.items.len) : (offset += 1) {
                 const candidate_index = (pane_index + offset) % self.panes.items.len;
