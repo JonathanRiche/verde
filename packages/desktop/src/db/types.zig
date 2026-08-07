@@ -161,11 +161,15 @@ pub const PersistedState = struct {
 pub const LoadedState = struct {
     arena: std.heap.ArenaAllocator,
     value: PersistedState = .{},
+    /// Durable store revision observed inside the same RO load transaction
+    /// (0 when store_state is absent, e.g. pre-v2 schemas).
+    store_revision: u64 = 0,
 
     pub fn init(backing_allocator: std.mem.Allocator) LoadedState {
         return .{
             .arena = std.heap.ArenaAllocator.init(backing_allocator),
             .value = .{},
+            .store_revision = 0,
         };
     }
 

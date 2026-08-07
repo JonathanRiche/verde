@@ -1,18 +1,48 @@
 //! Dirty-state debounce and interaction lifecycle tracking.
 //!
-//! Phase 3: flush completion means daemon acknowledgement of
-//! `state.snapshot.replace`, not launch of a detached SQLite save worker.
+//! Phase 3 fix: frame-loop flush is scheduled off the render-critical path onto
+//! a worker thread. Dirty clears only on daemon acknowledgement; failures back
+//! off and mark persistence unavailable (visible unsaved/read-only). Shutdown
+//! and pre-turn durability still use the blocking flush path.
 
 const std = @import("std");
 const platform_runtime = @import("platform_runtime");
+const db_types = @import("../db/types.zig");
+const storage_mod = @import("storage.zig");
 
 const SAVE_DEBOUNCE_MS: i64 = 750;
+/// Minimum delay before retrying a failed frame-loop flush (avoids per-frame storms).
+const FLUSH_RETRY_BACKOFF_MS: i64 = 2000;
+/// When persistence is unavailable, probe no more often than this interval.
+const FLUSH_UNAVAILABLE_PROBE_MS: i64 = 5000;
 const log = std.log.scoped(.native_shell);
+
+const LoadedPersistedState = db_types.LoadedState;
+const Storage = storage_mod.Storage;
+
+const FlushWorkerResult = struct {
+    success: bool = false,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+const FlushWorkerArgs = struct {
+    allocator: std.mem.Allocator,
+    storage: *const Storage,
+    loaded: LoadedPersistedState,
+    result: *FlushWorkerResult,
+};
 
 pub const State = struct {
     dirty: bool = false,
     last_dirty_at_ms: i64 = 0,
     last_interaction_at_ms: i64 = 0,
+    /// Worker currently running a daemon snapshot replace for a frame-loop flush.
+    flush_in_flight: bool = false,
+    flush_worker: ?std.Thread = null,
+    flush_result: ?*FlushWorkerResult = null,
+    flush_args: ?*FlushWorkerArgs = null,
+    /// Earliest wall-clock ms to attempt another frame-loop flush after a failure.
+    next_flush_attempt_ms: i64 = 0,
 
     pub fn markDirty(self: *State, now_ms: i64) void {
         self.dirty = true;
@@ -44,13 +74,127 @@ pub fn noteInteraction(self: anytype) void {
     self.lifecycle.noteInteraction(platform_runtime.unixTimestampMs());
 }
 
+/// Frame-loop entry: poll any in-flight flush, then schedule a worker if due.
+/// Never blocks on ensureDaemon/socket/fsync on the render thread.
 pub fn flushIfDirty(self: anytype) void {
+    pollFlushWorker(self);
     const now = platform_runtime.unixTimestampMs();
     if (!self.lifecycle.shouldFlush(now, SAVE_DEBOUNCE_MS)) return;
-    flushDirtyNow(self);
+    if (self.lifecycle.flush_in_flight) return;
+    if (now < self.lifecycle.next_flush_attempt_ms) return;
+
+    scheduleFlushWorker(self, now);
 }
 
+fn scheduleFlushWorker(self: anytype, now_ms: i64) void {
+    const storage: *const Storage = self.storage;
+    var persisted = self.buildPersistedState(storage.allocator) catch |err| {
+        log.err("failed to snapshot native state for async flush: {s}", .{@errorName(err)});
+        self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
+        return;
+    };
+
+    const result = storage.allocator.create(FlushWorkerResult) catch {
+        persisted.deinit();
+        self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
+        return;
+    };
+    result.* = .{};
+
+    const args = storage.allocator.create(FlushWorkerArgs) catch {
+        storage.allocator.destroy(result);
+        persisted.deinit();
+        self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
+        return;
+    };
+    args.* = .{
+        .allocator = storage.allocator,
+        .storage = storage,
+        .loaded = persisted,
+        .result = result,
+    };
+
+    const thread = std.Thread.spawn(.{}, flushWorkerMain, .{args}) catch |err| {
+        log.err("failed to spawn state flush worker: {s}", .{@errorName(err)});
+        // Take loaded back so we can deinit; args holds the moved value.
+        var owned = args.loaded;
+        owned.deinit();
+        storage.allocator.destroy(args);
+        storage.allocator.destroy(result);
+        storage.markPersistenceUnavailable();
+        self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
+        return;
+    };
+    self.lifecycle.flush_worker = thread;
+    self.lifecycle.flush_result = result;
+    self.lifecycle.flush_args = args;
+    self.lifecycle.flush_in_flight = true;
+}
+
+fn flushWorkerMain(args: *FlushWorkerArgs) void {
+    args.storage.save(args.loaded.value) catch {
+        args.result.success = false;
+        args.result.done.store(true, .release);
+        return;
+    };
+    args.result.success = true;
+    args.result.done.store(true, .release);
+}
+
+/// Join a completed flush worker and apply ack / backoff. Safe to call every frame.
+pub fn pollFlushWorker(self: anytype) void {
+    if (!self.lifecycle.flush_in_flight) return;
+    const result = self.lifecycle.flush_result orelse return;
+    if (!result.done.load(.acquire)) return;
+
+    if (self.lifecycle.flush_worker) |thread| {
+        thread.join();
+        self.lifecycle.flush_worker = null;
+    }
+    const success = result.success;
+    const storage: *const Storage = self.storage;
+    if (self.lifecycle.flush_args) |args| {
+        args.loaded.deinit();
+        storage.allocator.destroy(args);
+        self.lifecycle.flush_args = null;
+    }
+    storage.allocator.destroy(result);
+    self.lifecycle.flush_result = null;
+    self.lifecycle.flush_in_flight = false;
+
+    const now = platform_runtime.unixTimestampMs();
+    if (success) {
+        self.lifecycle.clearDirty();
+        self.lifecycle.next_flush_attempt_ms = 0;
+    } else {
+        log.err("async native state save failed; retaining dirty and backing off", .{});
+        storage.markPersistenceUnavailable();
+        self.lifecycle.next_flush_attempt_ms = now + FLUSH_UNAVAILABLE_PROBE_MS;
+    }
+}
+
+/// Blocking flush for shutdown and latency-sensitive pre-turn durability.
+/// Waits for any in-flight worker first, then performs a synchronous save.
 pub fn flushDirtyBlocking(self: anytype) void {
+    // Drain any scheduled frame flush before a blocking path.
+    if (self.lifecycle.flush_in_flight) {
+        if (self.lifecycle.flush_worker) |thread| {
+            thread.join();
+            self.lifecycle.flush_worker = null;
+        }
+        const storage: *const Storage = self.storage;
+        if (self.lifecycle.flush_result) |result| {
+            if (result.success) self.lifecycle.clearDirty();
+            storage.allocator.destroy(result);
+            self.lifecycle.flush_result = null;
+        }
+        if (self.lifecycle.flush_args) |args| {
+            args.loaded.deinit();
+            storage.allocator.destroy(args);
+            self.lifecycle.flush_args = null;
+        }
+        self.lifecycle.flush_in_flight = false;
+    }
     if (!self.lifecycle.dirty) return;
     var persisted = self.buildPersistedState(self.storage.allocator) catch |err| {
         log.err("failed to snapshot native state: {s}", .{@errorName(err)});
@@ -59,26 +203,35 @@ pub fn flushDirtyBlocking(self: anytype) void {
     defer persisted.deinit();
     self.storage.save(persisted.value) catch |err| {
         log.err("failed to save native state via daemon: {s}", .{@errorName(err)});
-        // Keep dirty so a later flush can retry; mark the UI read-only path.
         self.storage.markPersistenceUnavailable();
+        self.lifecycle.next_flush_attempt_ms = platform_runtime.unixTimestampMs() + FLUSH_RETRY_BACKOFF_MS;
         return;
     };
     self.lifecycle.clearDirty();
+    self.lifecycle.next_flush_attempt_ms = 0;
 }
 
-/// Pre-turn thread durability: full compatibility snapshot through the daemon.
+/// Pre-turn thread durability: full compatibility snapshot through the daemon (blocking).
+/// Indices are unused in Phase 3 — the bridge serializes full app state; Phase 4
+/// owns targeted thread/message writes.
 pub fn persistThreadBlocking(self: anytype, project_index: usize, thread_index: usize) !void {
     _ = project_index;
     _ = thread_index;
-    var persisted = try self.buildPersistedState(self.storage.allocator);
-    defer persisted.deinit();
-    try self.storage.save(persisted.value);
-    self.lifecycle.clearDirty();
+    const now_ms = platform_runtime.unixTimestampMs();
+    self.lifecycle.markDirty(now_ms);
+    flushDirtyBlocking(self);
+    if (self.lifecycle.dirty) return error.StoreMutationFailed;
 }
 
-/// Flush dirty state and wait for daemon acknowledgement (no detached worker).
+/// Interactive "flush now": schedule off-thread (same as flushIfDirty body).
+/// Callers that need ack use flushDirtyBlocking.
 pub fn flushDirtyNow(self: anytype) void {
-    flushDirtyBlocking(self);
+    const now = platform_runtime.unixTimestampMs();
+    pollFlushWorker(self);
+    if (!self.lifecycle.dirty) return;
+    if (self.lifecycle.flush_in_flight) return;
+    if (now < self.lifecycle.next_flush_attempt_ms) return;
+    scheduleFlushWorker(self, now);
 }
 
 test "lifecycle debounce requires both dirty and interaction quiet periods" {
@@ -89,4 +242,13 @@ test "lifecycle debounce requires both dirty and interaction quiet periods" {
     try std.testing.expect(state.shouldFlush(950, 750));
     state.clearDirty();
     try std.testing.expect(!state.shouldFlush(2000, 750));
+}
+
+test "lifecycle backoff gate skips flush while next_attempt is in the future" {
+    var state: State = .{};
+    state.markDirty(0);
+    state.noteInteraction(0);
+    state.next_flush_attempt_ms = 5000;
+    try std.testing.expect(state.shouldFlush(1000, 750));
+    try std.testing.expect(1000 < state.next_flush_attempt_ms);
 }

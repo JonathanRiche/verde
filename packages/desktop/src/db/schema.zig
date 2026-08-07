@@ -198,8 +198,12 @@ fn migrateToVersion(
 
 fn migrateV1ToV2(conn: zqlite.Conn) !void {
     // Production flip (S1 Minor 5 / S5 P3 handoff): legacy v1 DBs may hold
-    // duplicate non-null (workspace_id, local_thread_id) rows. Dedupe by keeping
-    // the lowest row id per key before creating the partial unique index.
+    // duplicate non-null (workspace_id, local_thread_id) rows. Dedupe before
+    // the partial unique index. Survivor = MAX(rowid): re-import / re-insert
+    // paths that created duplicates typically append a fresher copy at a higher
+    // id, so keeping the newest row preserves the latest transcript content.
+    // Messages for discarded rows are deleted first because foreign_keys are
+    // off during migration (cascade would not fire).
     try conn.execNoArgs(
         \\delete from messages where thread_id in (
         \\  select t.id from threads t
@@ -208,7 +212,7 @@ fn migrateV1ToV2(conn: zqlite.Conn) !void {
         \\      select 1 from threads t2
         \\      where t2.workspace_id = t.workspace_id
         \\        and t2.local_thread_id = t.local_thread_id
-        \\        and t2.id < t.id
+        \\        and t2.id > t.id
         \\    )
         \\);
         \\delete from threads where id in (
@@ -218,7 +222,7 @@ fn migrateV1ToV2(conn: zqlite.Conn) !void {
         \\      select 1 from threads t2
         \\      where t2.workspace_id = t.workspace_id
         \\        and t2.local_thread_id = t.local_thread_id
-        \\        and t2.id < t.id
+        \\        and t2.id > t.id
         \\    )
         \\);
     );
@@ -588,4 +592,101 @@ test "failed migration rolls back schema, version, and data" {
     var marker = (try conn.row("select marker from threads where id = 7", .{})).?;
     defer marker.deinit();
     try std.testing.expectEqualStrings("kept through rollback", marker.text(0));
+}
+
+test "v1 to v2 dedupe keeps max-rowid survivor and its messages; idempotent re-run" {
+    // MAJOR-4: three duplicate (workspace_id, local_thread_id) rows with
+    // distinct messages; max-rowid survives; discarded messages deleted;
+    // re-running migrate is a no-op.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const path = try std.fs.path.joinZ(std.testing.allocator, &.{ path_buf[0..path_len], "state.sqlite" });
+    defer std.testing.allocator.free(path);
+
+    const conn = try zqlite.open(path, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
+    defer conn.close();
+
+    try migrateToVersion(conn, 1, .none);
+    try std.testing.expectEqual(@as(i64, 1), try userVersion(conn));
+    try conn.execNoArgs(
+        \\insert into app_state (id, selected_workspace_index, sidebar_collapsed) values (1, 0, 0);
+        \\insert into workspaces (workspace_id, sort_index, label, path) values ('dup-ws', 0, 'Dup', '/dup');
+    );
+    // Three threads with the same local_thread_id under the same workspace FK.
+    try conn.execNoArgs(
+        \\insert into threads (workspace_id, sort_index, title, local_thread_id, provider, harness)
+        \\values ((select id from workspaces where workspace_id = 'dup-ws'), 0, 'Oldest', 'shared-thread', 0, 0);
+        \\insert into messages (thread_id, sort_index, role, author, body)
+        \\values ((select id from threads where title = 'Oldest'), 0, 0, 'You', 'oldest body');
+        \\insert into threads (workspace_id, sort_index, title, local_thread_id, provider, harness)
+        \\values ((select id from workspaces where workspace_id = 'dup-ws'), 1, 'Middle', 'shared-thread', 0, 0);
+        \\insert into messages (thread_id, sort_index, role, author, body)
+        \\values ((select id from threads where title = 'Middle'), 0, 0, 'You', 'middle body');
+        \\insert into threads (workspace_id, sort_index, title, local_thread_id, provider, harness)
+        \\values ((select id from workspaces where workspace_id = 'dup-ws'), 2, 'Newest', 'shared-thread', 0, 0);
+        \\insert into messages (thread_id, sort_index, role, author, body)
+        \\values ((select id from threads where title = 'Newest'), 0, 0, 'You', 'newest body');
+        \\insert into messages (thread_id, sort_index, role, author, body)
+        \\values ((select id from threads where title = 'Newest'), 1, 2, 'assistant', 'newest reply');
+    );
+
+    var before_threads = (try conn.row(
+        "select count(*) from threads where local_thread_id = 'shared-thread'",
+        .{},
+    )).?;
+    defer before_threads.deinit();
+    try std.testing.expectEqual(@as(i64, 3), before_threads.int(0));
+
+    try migrateToVersion(conn, 2, .none);
+    try std.testing.expectEqual(@as(i64, 2), try userVersion(conn));
+
+    var after_threads = (try conn.row(
+        "select count(*) from threads where local_thread_id = 'shared-thread'",
+        .{},
+    )).?;
+    defer after_threads.deinit();
+    try std.testing.expectEqual(@as(i64, 1), after_threads.int(0));
+
+    var survivor = (try conn.row(
+        "select title from threads where local_thread_id = 'shared-thread'",
+        .{},
+    )).?;
+    defer survivor.deinit();
+    // MAX(rowid) survivor is the freshest re-insert ("Newest").
+    try std.testing.expectEqualStrings("Newest", survivor.text(0));
+
+    var msg_count = (try conn.row(
+        \\select count(*) from messages where thread_id = (
+        \\  select id from threads where local_thread_id = 'shared-thread'
+        \\)
+    , .{})).?;
+    defer msg_count.deinit();
+    try std.testing.expectEqual(@as(i64, 2), msg_count.int(0));
+
+    var newest_body = (try conn.row(
+        \\select body from messages where thread_id = (
+        \\  select id from threads where local_thread_id = 'shared-thread'
+        \\) order by sort_index limit 1
+    , .{})).?;
+    defer newest_body.deinit();
+    try std.testing.expectEqualStrings("newest body", newest_body.text(0));
+
+    // Idempotent re-run (already at v2): no further loss.
+    try migrateToVersion(conn, 2, .none);
+    var after_rerun = (try conn.row(
+        "select count(*) from threads where local_thread_id = 'shared-thread'",
+        .{},
+    )).?;
+    defer after_rerun.deinit();
+    try std.testing.expectEqual(@as(i64, 1), after_rerun.int(0));
+    var msg_rerun = (try conn.row(
+        \\select count(*) from messages where thread_id = (
+        \\  select id from threads where local_thread_id = 'shared-thread'
+        \\)
+    , .{})).?;
+    defer msg_rerun.deinit();
+    try std.testing.expectEqual(@as(i64, 2), msg_rerun.int(0));
 }

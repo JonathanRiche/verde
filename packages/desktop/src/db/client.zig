@@ -174,8 +174,35 @@ pub const Client = struct {
         loaded.value.projects = try workspaces.toOwnedSlice(arena);
         loaded.value.surface_states = try self.loadSurfaceStates(arena);
         loaded.value.chat_completions = try self.loadChatCompletions(arena);
+        // Same RO transaction: pin store_revision when the v2+ table exists so
+        // GUI sessions reopen with a usable optimistic-concurrency guard.
+        if (self.conn.row("select store_revision from store_state where id = 1", .{})) |rev_row_opt| {
+            if (rev_row_opt) |rev_row| {
+                defer rev_row.deinit();
+                loaded.store_revision = @intCast(@max(rev_row.int(0), 0));
+            }
+        } else |_| {
+            // Pre-v2 DBs (or missing table) leave revision 0; daemon migration
+            // creates store_state before the first client mutation.
+        }
+        // Note: `row` returns error when the table is missing — caught above.
         try self.conn.commit();
         return loaded;
+    }
+
+    /// Standalone revision read for DBs whose projection is empty (e.g. a
+    /// CLI-notify-only history has no app_state row but a real revision).
+    pub fn storeRevision(self: *const Self) !u64 {
+        if (self.conn.row("select store_revision from store_state where id = 1", .{})) |rev_row_opt| {
+            if (rev_row_opt) |rev_row| {
+                defer rev_row.deinit();
+                return @intCast(@max(rev_row.int(0), 0));
+            }
+            return 0;
+        } else |_| {
+            // Pre-v2 DBs / missing table: revision 0.
+            return 0;
+        }
     }
 
     pub fn upsertSurfaceState(self: *const Self, surface: PersistedSurfaceState) !void {

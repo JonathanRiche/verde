@@ -194,6 +194,9 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
         sidebar.renderPalette(state, root_layout.sidebar);
         workspace_panes.renderAt(state, root_layout.workspace);
     }
+    // Persistence unavailable banner (M3-P3 MAJOR-5): full-width strip so
+    // failed/wedged daemon flushes are visible, not log-only.
+    renderPersistenceBanner(state, width, height);
     workspace_panes.renderPaneDragPreview(state);
     sidebar.renderFloatingDragPreview(state);
     const companion_z = state.palette_overlay_batch.setZIndex(COMPANION_Z);
@@ -217,6 +220,26 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
 
 pub fn isSidebarAnimating() bool {
     return sidebar_animating;
+}
+
+/// Top-of-window banner when daemon-backed persistence is unavailable or wedged.
+/// Region: full-width strip under the title bar; yellow warning chrome.
+fn renderPersistenceBanner(state: *runtime.AppState, width: f32, height: f32) void {
+    _ = height;
+    if (state.storage.isPersistenceAvailable()) return;
+    const banner_h = theme.scaledUi(28.0);
+    const rect: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = width, .h = banner_h };
+    var fill = theme.COLOR_YELLOW;
+    fill[3] = 0.92;
+    queuePaletteRoundedRect(state, rect, paletteColor(fill), 0.0);
+    queuePaletteText(
+        state,
+        .{ .x = theme.scaledUi(12.0), .y = theme.scaledUi(5.0), .w = width - theme.scaledUi(24.0), .h = theme.scaledUi(18.0) },
+        "Changes not saved — persistence unavailable (read-only until the daemon recovers)",
+        paletteColor(theme.COLOR_BLACK),
+        theme.scaledUi(13.0),
+        rect,
+    );
 }
 
 fn computeRootLayout(state: *runtime.AppState, width: f32, height: f32) RootLayout {
