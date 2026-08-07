@@ -96,6 +96,9 @@ pub fn main(init: std.process.Init) !void {
     try runRegistryMethodPresenceScenario(allocator, io);
     try runLeaseConflictScenario(allocator, io);
     try runLeaseRenewReleaseScenario(allocator, io);
+    try runPrepareGateScenario(allocator, io);
+    try runDisconnectedClientRetentionScenario(allocator, io);
+    try runScopedStopScenario(allocator, io);
     try runStoreFixtureScenario(allocator, io);
     try runLifecycleBindGuard(allocator, io);
     try runLifecyclePrepareShutdownWithLivePty(allocator, io);
@@ -178,7 +181,17 @@ fn spawnIsolatedDaemonWithEnv(
     pref_path: []const u8,
     idle_exit_ms: ?[]const u8,
 ) !std.process.Child {
-    return spawnIsolatedDaemonWithOptions(allocator, io, self_exe, pref_path, idle_exit_ms, null);
+    return spawnIsolatedDaemonWithOptions(allocator, io, self_exe, pref_path, idle_exit_ms, null, null);
+}
+
+fn spawnIsolatedDaemonWithRetention(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    self_exe: []const u8,
+    pref_path: []const u8,
+    retention_ms: []const u8,
+) !std.process.Child {
+    return spawnIsolatedDaemonWithOptions(allocator, io, self_exe, pref_path, IT_SAFETY_IDLE_EXIT_MS, null, retention_ms);
 }
 
 fn spawnIsolatedDaemonWithSlowIo(
@@ -188,7 +201,7 @@ fn spawnIsolatedDaemonWithSlowIo(
     pref_path: []const u8,
     slow_io_ms: []const u8,
 ) !std.process.Child {
-    return spawnIsolatedDaemonWithOptions(allocator, io, self_exe, pref_path, IT_SAFETY_IDLE_EXIT_MS, slow_io_ms);
+    return spawnIsolatedDaemonWithOptions(allocator, io, self_exe, pref_path, IT_SAFETY_IDLE_EXIT_MS, slow_io_ms, null);
 }
 
 fn spawnIsolatedDaemonWithOptions(
@@ -198,6 +211,7 @@ fn spawnIsolatedDaemonWithOptions(
     pref_path: []const u8,
     idle_exit_ms: ?[]const u8,
     slow_io_ms: ?[]const u8,
+    retention_ms: ?[]const u8,
 ) !std.process.Child {
     var env_map = try std.process.Environ.createMap(currentEnviron(), allocator);
     defer env_map.deinit();
@@ -206,6 +220,7 @@ fn spawnIsolatedDaemonWithOptions(
     // Per-test tighter overrides still win when provided.
     try env_map.put("VERDE_SESSION_DAEMON_IDLE_EXIT_MS", idle_exit_ms orelse IT_SAFETY_IDLE_EXIT_MS);
     if (slow_io_ms) |value| try env_map.put("VERDE_SESSIONIZER_TEST_SLOW_IO_MS", value);
+    if (retention_ms) |value| try env_map.put("VERDE_SESSIONIZER_TEST_RETENTION_MS", value);
 
     // Bind the child to the same isolated endpoint the parent uses.
     const endpoint = try sessionizer.defaultSocketPath(allocator, pref_path);
@@ -382,6 +397,7 @@ const DISPATCHED_REGISTRY_METHODS = [_][]const u8{
     headless.registry.METHOD_DAEMON_CLIENT_REGISTER,
     headless.registry.METHOD_DAEMON_CLIENT_HEARTBEAT,
     headless.registry.METHOD_DAEMON_CLIENT_CLOSE,
+    headless.registry.METHOD_DAEMON_STOP,
 };
 
 const FixtureSurface = enum {
@@ -1260,6 +1276,277 @@ fn runLeaseRenewReleaseScenario(allocator: std.mem.Allocator, io: std.Io) !void 
     if (!released_result.released or released_result.released_count != 1) return error.LeaseReleaseFailed;
 }
 
+/// Scenario 6: each prepareShutdown live-state gate refuses independently,
+/// while the daemon remains fully accepting until the gate is clear.
+fn runPrepareGateScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "prepare-gates");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+    var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    var child_exited = false;
+    defer if (!child_exited) child.kill(io);
+
+    var transport: sessionizer.HeadlessTransport = .{ .allocator = allocator, .pref_path = pref_path };
+    var client = sessionizer.headlessClient(allocator, &transport);
+    const session_id = "prepare-gate-session";
+    var created = try client.call("session.create", .{
+        .id = session_id,
+        .cwd = pref_path,
+        .workspace_path = pref_path,
+        .command = &[_][]const u8{"/bin/cat"},
+    });
+    defer created.deinit();
+    if (!created.response.isOk()) return error.PrepareGateSessionCreateFailed;
+
+    var refused = try client.call("daemon.prepareShutdown", .{});
+    defer refused.deinit();
+    const session_error = refused.response.err orelse return error.PrepareGateSessionNotRefused;
+    if (!std.mem.eql(u8, session_error.code, headless.protocol.ERR_INVALID_STATE)) return error.PrepareGateWrongSessionError;
+    const session_data = session_error.data orelse return error.PrepareGateMissingSessionData;
+    if (session_data != .object or (session_data.object.get("running_sessions") orelse .null) != .integer or session_data.object.get("running_sessions").?.integer < 1) return error.PrepareGateMissingRunningCount;
+
+    var written = try client.call("session.write", .{ .id = session_id, .text = "prepare-gate\n" });
+    defer written.deinit();
+    if (!written.response.isOk()) return error.PrepareGateWriteFailed;
+    var killed = try client.call("session.kill", .{ .id = session_id });
+    defer killed.deinit();
+    if (!killed.response.isOk()) return error.PrepareGateKillFailed;
+    var session_reaped = false;
+    var reap_attempt: usize = 0;
+    while (reap_attempt < 100) : (reap_attempt += 1) {
+        var cleaned = try client.call("session.cleanup", .{});
+        defer cleaned.deinit();
+        if (!cleaned.response.isOk()) return error.PrepareGateCleanupFailed;
+        if (cleaned.response.result) |result| {
+            if (result == .object) {
+                if ((result.object.get("removed") orelse .null) == .integer and result.object.get("removed").?.integer > 0) {
+                    session_reaped = true;
+                    break;
+                }
+            }
+        }
+        std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+    }
+    if (!session_reaped) return error.PrepareGateSessionDidNotReap;
+
+    const resources = [_][]const u8{"build"};
+    var lease = try client.call(headless.registry.METHOD_LEASE_ACQUIRE, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner = "prepare-gate-owner",
+        .resources = &resources,
+    });
+    defer lease.deinit();
+    if (!lease.response.isOk()) return error.PrepareGateLeaseAcquireFailed;
+    const lease_result = lease.response.result orelse return error.PrepareGateLeaseIdMissing;
+    const lease_id = if (lease_result == .object) jsonStringValue(lease_result.object.get("lease_id") orelse .null) else null;
+    const owned_lease_id = lease_id orelse return error.PrepareGateLeaseIdMissing;
+
+    var lease_refused = try client.call("daemon.prepareShutdown", .{});
+    defer lease_refused.deinit();
+    const lease_error = lease_refused.response.err orelse return error.PrepareGateLeaseNotRefused;
+    const lease_data = lease_error.data orelse return error.PrepareGateLeaseDataMissing;
+    if (lease_data != .object or (lease_data.object.get("leases") orelse .null) != .integer or lease_data.object.get("leases").?.integer < 1) return error.PrepareGateMissingLeaseCount;
+
+    var released = try client.call(headless.registry.METHOD_LEASE_RELEASE, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner = "prepare-gate-owner",
+        .lease_id = owned_lease_id,
+    });
+    defer released.deinit();
+    if (!released.response.isOk()) return error.PrepareGateLeaseReleaseFailed;
+
+    // Keep-alive turns remain pinned by the inline gate test; the existing
+    // graceful-replace scenario also exercises the empty-daemon success path.
+    var accepted = try client.call("daemon.prepareShutdown", .{});
+    defer accepted.deinit();
+    if (!accepted.response.isOk()) return error.PrepareGateFinalPrepareFailed;
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        if (sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
+            allocator.free(response);
+            std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
+        } else |err| switch (err) {
+            error.ConnectionRefused, error.FileNotFound => break,
+            else => std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {},
+        }
+    }
+    if (attempts >= 100) return error.PrepareGateDaemonDidNotExit;
+    _ = child.wait(io) catch {};
+    child_exited = true;
+}
+
+/// Scenario 8: a disconnected non-persistent client eventually loses its
+/// owned session, while the daemon remains available for new requests.
+fn runDisconnectedClientRetentionScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "disconnected-retention");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+    var child = try spawnIsolatedDaemonWithRetention(allocator, io, self_exe, pref_path, "300");
+    defer child.kill(io);
+    var transport: sessionizer.HeadlessTransport = .{ .allocator = allocator, .pref_path = pref_path };
+    var client = sessionizer.headlessClient(allocator, &transport);
+
+    var registered = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer registered.deinit();
+    const registered_result = registered.response.result orelse return error.RetentionRegisterMissingResult;
+    const client_id = if (registered_result == .object) jsonStringValue(registered_result.object.get("client_id") orelse .null) else null;
+    const owned_client_id = client_id orelse return error.RetentionClientIdMissing;
+
+    var created = try client.call("session.create", .{
+        .id = "disconnected-session",
+        .cwd = pref_path,
+        .workspace_path = pref_path,
+        .client_id = owned_client_id,
+        .command = &[_][]const u8{"/bin/cat"},
+    });
+    defer created.deinit();
+    if (!created.response.isOk()) return error.RetentionSessionCreateFailed;
+
+    var observed = false;
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        var listed = try client.call(headless.registry.METHOD_PROCESS_LIST, .{
+            .workspace = .{ .workspace_path = pref_path },
+            .include_outcomes = true,
+        });
+        defer listed.deinit();
+        if (!listed.response.isOk()) return error.RetentionListFailed;
+        const result = listed.response.result orelse return error.RetentionListMissingResult;
+        if (result == .object) {
+            const processes = result.object.get("processes") orelse .null;
+            const outcomes = result.object.get("outcomes") orelse .null;
+            if (processes == .array and processes.array.items.len == 0 and outcomes == .array) {
+                for (outcomes.array.items) |outcome| {
+                    if (outcome == .object and
+                        std.mem.eql(u8, jsonStringValue(outcome.object.get("session_id") orelse .null) orelse "", "disconnected-session") and
+                        std.mem.eql(u8, jsonStringValue(outcome.object.get("cancellation_reason") orelse .null) orelse "", "orphaned"))
+                    {
+                        observed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (observed) break;
+        std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+    }
+    if (!observed) return error.RetentionOrphanOutcomeMissing;
+    var status = try client.call("status", .{});
+    defer status.deinit();
+    if (!status.response.isOk()) return error.RetentionDaemonDied;
+}
+
+/// Scenario 9: daemon.stop is scoped for ordinary sessions, force-all stops
+/// managed processes, and persistent-client sessions survive untouched.
+fn runScopedStopScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "scoped-stop");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+    try writeManagedProcessConfig(io, pref_path, "/bin/cat");
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, "500");
+    var child_exited = false;
+    defer if (!child_exited) child.kill(io);
+    var transport: sessionizer.HeadlessTransport = .{ .allocator = allocator, .pref_path = pref_path };
+    var client = sessionizer.headlessClient(allocator, &transport);
+
+    var registered_a = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = true });
+    defer registered_a.deinit();
+    var registered_b = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer registered_b.deinit();
+    const a_result = registered_a.response.result orelse return error.ScopedStopRegisterAMissing;
+    const b_result = registered_b.response.result orelse return error.ScopedStopRegisterBMissing;
+    const client_a = if (a_result == .object) jsonStringValue(a_result.object.get("client_id") orelse .null) else null;
+    const client_b = if (b_result == .object) jsonStringValue(b_result.object.get("client_id") orelse .null) else null;
+    const owner_a = client_a orelse return error.ScopedStopClientAMissing;
+    const owner_b = client_b orelse return error.ScopedStopClientBMissing;
+
+    var created = try client.call("session.create", .{
+        .id = "scoped-persistent-session",
+        .cwd = pref_path,
+        .workspace_path = pref_path,
+        .client_id = owner_a,
+        .command = &[_][]const u8{"/bin/cat"},
+    });
+    defer created.deinit();
+    if (!created.response.isOk()) return error.ScopedStopSessionCreateFailed;
+    var started = try client.call(headless.registry.METHOD_PROCESS_START, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .client_id = owner_b,
+        .name = "sleeper",
+    });
+    defer started.deinit();
+    if (!started.response.isOk()) return error.ScopedStopManagedStartFailed;
+    const managed_id = try managedProcessIdFromResponse(&started, allocator);
+    defer allocator.free(managed_id);
+
+    var unknown = try client.call(headless.registry.METHOD_DAEMON_STOP, .{ .client_id = "unregistered-client", .force = true });
+    defer unknown.deinit();
+    if (unknown.response.isOk() or unknown.response.err == null or !std.mem.eql(u8, unknown.response.err.?.code, headless.protocol.ERR_INVALID_STATE)) return error.ScopedStopUnknownClientAccepted;
+
+    var stopped = try client.call(headless.registry.METHOD_DAEMON_STOP, .{ .client_id = owner_b, .force = true });
+    defer stopped.deinit();
+    if (!stopped.response.isOk()) return error.ScopedStopFailed;
+    const stopped_result = try client.decodeDaemonStop(&stopped);
+    if (!stopped_result.accepted or stopped_result.stopping) return error.ScopedStopUnexpectedStopping;
+
+    var listed = try client.call(headless.registry.METHOD_PROCESS_LIST, .{ .workspace = .{ .workspace_path = pref_path } });
+    defer listed.deinit();
+    if (!listed.response.isOk()) return error.ScopedStopListFailed;
+    const processes = listed.response.result.?.object.get("processes") orelse return error.ScopedStopMissingProcesses;
+    var saw_stopped = false;
+    if (processes == .array) for (processes.array.items) |process| {
+        if (process == .object and std.mem.eql(u8, jsonStringValue(process.object.get("id") orelse .null) orelse "", managed_id) and
+            std.mem.eql(u8, jsonStringValue(process.object.get("status") orelse .null) orelse "", "stopped")) saw_stopped = true;
+    };
+    if (!saw_stopped) return error.ScopedStopManagedStillRunning;
+
+    var tailed = try client.call("session.tail", .{ .id = "scoped-persistent-session", .after_cursor = 0, .max_bytes = 128 });
+    defer tailed.deinit();
+    if (!tailed.response.isOk()) return error.ScopedStopPersistentSessionLost;
+    var killed = try client.call("session.kill", .{ .id = "scoped-persistent-session" });
+    defer killed.deinit();
+    if (!killed.response.isOk()) return error.ScopedStopPersistentKillFailed;
+    var closed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_CLOSE, .{ .client_id = owner_a });
+    defer closed.deinit();
+    if (!closed.response.isOk()) return error.ScopedStopClientCloseFailed;
+
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        if (sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
+            allocator.free(response);
+            std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
+        } else |err| switch (err) {
+            error.ConnectionRefused, error.FileNotFound => break,
+            else => std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {},
+        }
+    }
+    if (attempts >= 100) return error.ScopedStopDaemonDidNotIdleExit;
+    _ = child.wait(io) catch {};
+    child_exited = true;
+}
+
+fn jsonStringValue(value: std.json.Value) ?[]const u8 {
+    return if (value == .string) value.string else null;
+}
+
 /// Phase-1 store fixture: exercise a typed workspace-upsert request against
 /// the daemon and pin its current unimplemented response shape for phase 2.
 fn runStoreFixtureScenario(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -1500,27 +1787,23 @@ fn runLifecyclePrepareShutdownWithLivePty(allocator: std.mem.Allocator, io: std.
 
     const prepare = try sessionizer.requestAlloc(allocator, pref_path, "daemon.prepareShutdown", .{}, 2);
     defer allocator.free(prepare);
-    if (std.mem.indexOf(u8, prepare, "\"accepted\":false") == null and
-        std.mem.indexOf(u8, prepare, "\"accepted\": false") == null)
+    if (std.mem.indexOf(u8, prepare, "\"code\":\"invalid_state\"") == null and
+        std.mem.indexOf(u8, prepare, "\"code\": \"invalid_state\"") == null)
     {
         return error.PrepareShutdownShouldRefuseLivePty;
     }
-    if (std.mem.indexOf(u8, prepare, "\"safe_to_exit\":false") == null and
-        std.mem.indexOf(u8, prepare, "\"safe_to_exit\": false") == null)
+    if (std.mem.indexOf(u8, prepare, "\"running_sessions\":1") == null and
+        std.mem.indexOf(u8, prepare, "\"running_sessions\": 1") == null)
     {
-        return error.PrepareShutdownShouldNotBeSafeWithLivePty;
+        return error.PrepareShutdownMissingRunningCount;
     }
     // Refused prepare must leave the daemon accepting mutations.
-    if (std.mem.indexOf(u8, prepare, "\"accepting_mutations\":true") == null and
-        std.mem.indexOf(u8, prepare, "\"accepting_mutations\": true") == null)
+    const status_after = try sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 6);
+    defer allocator.free(status_after);
+    if (std.mem.indexOf(u8, status_after, "\"accepting_mutations\":false") != null or
+        std.mem.indexOf(u8, status_after, "\"accepting_mutations\": false") != null)
     {
-        const status_after = try sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 6);
-        defer allocator.free(status_after);
-        if (std.mem.indexOf(u8, status_after, "\"accepting_mutations\":false") != null or
-            std.mem.indexOf(u8, status_after, "\"accepting_mutations\": false") != null)
-        {
-            return error.AcceptingMutationsClearedOnRefusedPrepare;
-        }
+        return error.AcceptingMutationsClearedOnRefusedPrepare;
     }
 
     // Daemon still alive with the same session.

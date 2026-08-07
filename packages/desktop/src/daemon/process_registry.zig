@@ -1601,6 +1601,29 @@ pub const ProcessRegistry = struct {
         return if (self.workspace(workspace_id)) |workspace_record| workspace_record.leases.items.len else 0;
     }
 
+    /// Releases every lease held by client_id across all workspaces. Returns count.
+    /// Expired leases are pruned as part of the same clock-driven pass; one
+    /// revision bump represents the complete client-scoped release.
+    pub fn releaseLeasesForClient(self: *ProcessRegistry, allocator: std.mem.Allocator, client_id: []const u8, now_ms: i64) usize {
+        if (client_id.len == 0) return 0;
+        var released: usize = 0;
+        for (self.workspaces.items) |*workspace_record| {
+            _ = self.pruneExpiredLeases(allocator, workspace_record.id, now_ms);
+            var index: usize = 0;
+            while (index < workspace_record.leases.items.len) {
+                if (!std.mem.eql(u8, workspace_record.leases.items[index].client_id, client_id)) {
+                    index += 1;
+                    continue;
+                }
+                var removed = workspace_record.leases.orderedRemove(index);
+                removed.deinit(allocator);
+                released += 1;
+            }
+        }
+        if (released != 0) self.bumpRevision();
+        return released;
+    }
+
     /// Returns a borrowed tracked process pointer, invalidated by later
     /// registry mutations. Phase-2 callers must copy it while holding the
     /// registry lock/queue.
@@ -2296,6 +2319,27 @@ test "registry owns and finishes external processes" {
     try std.testing.expect(registry.finishExternalProcess("workspace-a", "external-1", .completed, 42));
     try std.testing.expectEqual(ExternalProcessStatus.completed, registered.status);
     try std.testing.expectEqual(@as(?i64, 42), registered.finished_at_ms);
+}
+
+test "releaseLeasesForClient releases across workspaces and bumps revision once" {
+    const allocator = std.testing.allocator;
+    var registry = try ProcessRegistry.init(allocator, "daemon-release-client");
+    defer registry.deinit(allocator);
+
+    var first = try registry.acquireLease(allocator, "workspace-a", "owner-a", "client-a", "build", &[_][]const u8{"build"}, false, 0, 10);
+    defer first.deinit(allocator);
+    var second = try registry.acquireLease(allocator, "workspace-b", "owner-b", "client-a", "test", &[_][]const u8{"test"}, false, 0, 10);
+    defer second.deinit(allocator);
+    var retained = try registry.acquireLease(allocator, "workspace-a", "owner-c", "client-c", "lint", &[_][]const u8{"lint"}, false, 0, 10);
+    defer retained.deinit(allocator);
+
+    const revision_before = registry.registry_revision;
+    try std.testing.expectEqual(@as(usize, 2), registry.releaseLeasesForClient(allocator, "client-a", 11));
+    try std.testing.expectEqual(revision_before + 1, registry.registry_revision);
+    try std.testing.expectEqual(@as(usize, 1), registry.activeLeaseCount(allocator, "workspace-a", 11));
+    try std.testing.expectEqual(@as(usize, 0), registry.activeLeaseCount(allocator, "workspace-b", 11));
+    try std.testing.expectEqual(@as(usize, 0), registry.releaseLeasesForClient(allocator, "client-a", 11));
+    try std.testing.expectEqual(revision_before + 1, registry.registry_revision);
 }
 
 test "registry lease ids are opaque unique and nonce-scoped" {

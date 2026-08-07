@@ -60,6 +60,8 @@ const ATTACH_STALE_MS: i64 = 60 * std.time.ms_per_s;
 const IDLE_EXIT_ENV_NAME = "VERDE_SESSION_DAEMON_IDLE_EXIT_MS";
 /// Test-only latency injection for the unlocked managed-process phase.
 const TEST_SLOW_IO_ENV_NAME = "VERDE_SESSIONIZER_TEST_SLOW_IO_MS";
+/// Test-only orphan retention override; registry-internal TTLs remain fixed.
+const TEST_RETENTION_ENV_NAME = "VERDE_SESSIONIZER_TEST_RETENTION_MS";
 /// Bounded wait while an incompatible daemon drains live state before upgrade.
 const REPLACEMENT_WAIT_MS: i64 = 5 * std.time.ms_per_s;
 /// Extra grace after prepareShutdown accepts, independent of the prepare deadline.
@@ -518,6 +520,18 @@ fn parsePrepareShutdownResult(allocator: std.mem.Allocator, response: []const u8
                     .method_missing = true,
                 };
             }
+            if (std.mem.eql(u8, code, headless.registry.ERR_INVALID_STATE)) {
+                const data = err_value.object.get("data") orelse .null;
+                if (data == .object) {
+                    return .{
+                        .accepted = false,
+                        .safe_to_exit = false,
+                        .running_sessions = jsonUsize(data.object.get("running_sessions") orelse .null) orelse 0,
+                        .keep_alive_turns = jsonUsize(data.object.get("turns") orelse .null) orelse 0,
+                        .shutdown_requested = false,
+                    };
+                }
+            }
         }
         return null;
     }
@@ -928,6 +942,7 @@ pub const CreateOptions = struct {
     session_id: []const u8,
     project_id: []const u8 = "",
     project_path: []const u8 = "",
+    owner_client_id: ?[]const u8 = null,
     cwd: []const u8 = "",
     label: []const u8 = "",
     command: []const []const u8 = &.{},
@@ -1226,6 +1241,9 @@ const PtySession = struct {
     registry_workspace_id: ?[]u8 = null,
     /// Prevent duplicate terminal outcomes when kill, polling, and cleanup overlap.
     registry_finished: bool = false,
+    /// Optional registered daemon client that owns this session for retention
+    /// and client-scoped stop. The desktop omits this field.
+    owner_client_id: ?[]u8 = null,
     created_at_ms: i64,
     last_attached_at_ms: ?i64 = null,
     attach_clients: std.ArrayList(AttachClient) = .empty,
@@ -1254,6 +1272,8 @@ const PtySession = struct {
         errdefer allocator.free(project_id);
         const project_path = try allocator.dupe(u8, options.project_path);
         errdefer allocator.free(project_path);
+        const owner_client_id = if (options.owner_client_id) |client_id| try allocator.dupe(u8, client_id) else null;
+        errdefer if (owner_client_id) |client_id| allocator.free(client_id);
         const owned_cwd = try allocator.dupe(u8, cwd);
         errdefer allocator.free(owned_cwd);
         const label = try allocator.dupe(u8, if (options.label.len > 0) options.label else command_label);
@@ -1263,6 +1283,7 @@ const PtySession = struct {
             .session_id = session_id,
             .project_id = project_id,
             .project_path = project_path,
+            .owner_client_id = owner_client_id,
             .cwd = owned_cwd,
             .label = label,
             .command_label = command_label,
@@ -1286,6 +1307,7 @@ const PtySession = struct {
         allocator.free(self.label);
         allocator.free(self.command_label);
         if (self.registry_workspace_id) |workspace_id| allocator.free(workspace_id);
+        if (self.owner_client_id) |client_id| allocator.free(client_id);
         for (self.attach_clients.items) |client| {
             allocator.free(client.attach_id);
             allocator.free(client.label);
@@ -1658,6 +1680,8 @@ pub const Daemon = struct {
     /// deduplicates in-flight registry work, it is not a background worker.
     registry_jobs: process_registry.RegistryJobQueue,
     test_slow_io_delay_ms: u64 = 0,
+    /// Test-only orphan retention override. It never changes registry TTLs.
+    test_retention_override_ms: ?i64 = null,
 
     pub fn init(allocator: std.mem.Allocator) Daemon {
         return initWithPrefPath(allocator, "");
@@ -1675,6 +1699,7 @@ pub const Daemon = struct {
             .idle_exit_ms = idleExitMsFromEnv(allocator),
             .registry_jobs = process_registry.RegistryJobQueue.init(process_registry.REGISTRY_JOB_QUEUE_MAX) catch @panic("failed to initialize registry job queue"),
             .test_slow_io_delay_ms = slowIoDelayMsFromEnv(allocator),
+            .test_retention_override_ms = retentionOverrideMsFromEnv(allocator),
         };
     }
 
@@ -1702,12 +1727,15 @@ pub const Daemon = struct {
         }
     }
 
-    /// Live PTY sessions or unconsumed/running turns that must not be dropped.
+    /// Shared daemon state that must not be dropped during idle exit or stop.
     fn hasLiveKeepAliveState(self: *Daemon) bool {
         self.removeFinishedConsumedChatTurns();
         for (self.sessions.items) |session| {
             if (session.running) return true;
         }
+        if (self.countLiveManagedProcesses() != 0) return true;
+        if (self.registry_jobs.len() != 0) return true;
+        if (self.countActiveLeases(nowMs()) != 0) return true;
         for (self.chat_turns.items) |turn| {
             lockTurn(turn);
             const keep_alive = chatTurnKeepsDaemonAlive(turn.status, turn.consumed, turn.worker_done);
@@ -1715,6 +1743,29 @@ pub const Daemon = struct {
             if (keep_alive) return true;
         }
         return false;
+    }
+
+    fn countLiveManagedProcesses(self: *const Daemon) usize {
+        var count: usize = 0;
+        for (self.registry.workspaces.items) |workspace| {
+            for (workspace.managed_processes.items) |process| {
+                switch (process.status) {
+                    .starting, .running, .stopping => count += 1,
+                    .stopped, .crashed, .restarting => {},
+                }
+            }
+        }
+        return count;
+    }
+
+    fn countActiveLeases(self: *Daemon, now_ms: i64) usize {
+        var count: usize = 0;
+        // Lease pruning mutates only each workspace's lease list, not the
+        // workspace array; the daemon lock protects the borrowed records.
+        for (self.registry.workspaces.items) |workspace| {
+            count += self.registry.activeLeaseCount(self.allocator, workspace.id, now_ms);
+        }
+        return count;
     }
 
     fn countRunningSessions(self: *const Daemon) usize {
@@ -1765,6 +1816,50 @@ pub const Daemon = struct {
             turn.mutex.unlock();
             if (remove) {
                 self.chat_turns.orderedRemove(index).deinit(self.allocator);
+                continue;
+            }
+            index += 1;
+        }
+    }
+
+    /// Retire sessions whose registered client has disappeared or gone stale.
+    /// This is a pure in-memory O(sessions) scan; all clock-driven registry
+    /// retention happens in the drain thread while the daemon lock is held.
+    fn reapOrphanedSessions(self: *Daemon, now_ms: i64) void {
+        var index: usize = 0;
+        while (index < self.sessions.items.len) {
+            const session = self.sessions.items[index];
+            const client_id = session.owner_client_id orelse {
+                index += 1;
+                continue;
+            };
+            const client = self.registry.client(client_id) orelse {
+                index += 1;
+                continue;
+            };
+            // Persistent clients are exempt before either closed or stale
+            // checks, matching the W1 disconnected-retention contract.
+            if (client.persistent) {
+                index += 1;
+                continue;
+            }
+            const retention_ms = self.test_retention_override_ms;
+            const closed_expired = if (client.closed) if (client.closed_at_ms) |closed_at_ms|
+                retentionExpiredForDaemon(closed_at_ms, now_ms, retention_ms orelse process_registry.ORPHAN_GRACE_MS)
+            else
+                false else false;
+            const stale_expired = if (retention_ms) |override_ms|
+                retentionExpiredForDaemon(client.last_heartbeat_ms, now_ms, override_ms)
+            else
+                process_registry.disconnectedRetentionExpired(client.last_heartbeat_ms, now_ms, false);
+            if (!closed_expired and !stale_expired) {
+                index += 1;
+                continue;
+            }
+            _ = session.terminate();
+            self.noteSessionExitInRegistry(session, "orphaned", now_ms);
+            if (!session.running) {
+                self.removeAt(index);
                 continue;
             }
             index += 1;
@@ -1963,6 +2058,7 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, headless.registry.METHOD_DAEMON_CLIENT_REGISTER)) return try self.clientRegisterResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_DAEMON_CLIENT_HEARTBEAT)) return try self.clientHeartbeatResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_DAEMON_CLIENT_CLOSE)) return try self.clientCloseResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.registry.METHOD_DAEMON_STOP)) return try self.daemonStopResponse(id_value, params);
         if (std.mem.eql(u8, method, "status")) return try self.statusResponse(id_value);
         if (std.mem.eql(u8, method, "daemon.prepareShutdown")) return try self.prepareShutdownResponse(id_value);
         // Additive headless core methods; existing methods and error codes unchanged.
@@ -1991,13 +2087,31 @@ pub const Daemon = struct {
     }
 
     /// Prepare-for-upgrade shutdown (headless_verde.md Lifetime §Protocol-version
-    /// replacement). Enters drain only when no live PTYs / keep-alive turns remain
+    /// replacement). Enters drain only when the full shared state gate is clear
     /// so a refused upgrade does not freeze a healthy daemon.
     fn prepareShutdownResponse(self: *Daemon, id_value: std.json.Value) ![]u8 {
+        const now_ms = nowMs();
+        // Reap expired registry state before evaluating the handoff gate; a
+        // stale lease must not keep an otherwise empty daemon alive.
+        _ = self.registry.reap(self.allocator, now_ms);
         self.removeFinishedConsumedChatTurns();
         const running_sessions = self.countRunningSessions();
         const keep_alive_turns = self.countKeepAliveTurns();
-        const safe_to_exit = running_sessions == 0 and keep_alive_turns == 0;
+        const managed = self.countLiveManagedProcesses();
+        const leases = self.countActiveLeases(now_ms);
+        const registry_jobs = self.registry_jobs.len();
+        const safe_to_exit = running_sessions == 0 and managed == 0 and keep_alive_turns == 0 and leases == 0 and registry_jobs == 0;
+        if (!safe_to_exit) {
+            return prepareShutdownRefusalResponse(
+                self,
+                id_value,
+                running_sessions,
+                managed,
+                keep_alive_turns,
+                leases,
+                registry_jobs,
+            );
+        }
         if (safe_to_exit) {
             self.accepting_mutations = false;
             self.shutdown_requested = true;
@@ -2006,7 +2120,10 @@ pub const Daemon = struct {
             .accepted = safe_to_exit,
             .safe_to_exit = safe_to_exit,
             .running_sessions = running_sessions,
+            .managed_processes = managed,
             .keep_alive_turns = keep_alive_turns,
+            .active_leases = leases,
+            .registry_jobs = registry_jobs,
             .session_count = self.sessions.items.len,
             .chat_turn_count = self.chat_turns.items.len,
             .shutdown_requested = self.shutdown_requested,
@@ -3081,7 +3198,7 @@ pub const Daemon = struct {
         const persistent = if (params == .object) jsonBool(params.object.get("persistent") orelse .null) orelse false else false;
         if (params != .object and params != .null) return try errorResponseAlloc(self.allocator, id_value, headless.registry.ERR_INVALID_PARAMS, "params must be an object or null");
         const client = self.registry.registerClient(self.allocator, persistent, nowMs()) catch |err| return self.registryErrorResponse(id_value, err);
-        return try clientResponse(self.allocator, id_value, &self.registry, .register, client);
+        return try clientResponse(self.allocator, id_value, &self.registry, .register, client, 0);
     }
 
     fn clientHeartbeatResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
@@ -3089,15 +3206,84 @@ pub const Daemon = struct {
         const accepted = self.registry.heartbeatClient(client_id, nowMs());
         if (!accepted) return try errorResponseAlloc(self.allocator, id_value, headless.registry.ERR_RESOURCE_NOT_FOUND, "client not found");
         const client = self.registry.client(client_id).?;
-        return try clientResponse(self.allocator, id_value, &self.registry, .heartbeat, client);
+        return try clientResponse(self.allocator, id_value, &self.registry, .heartbeat, client, 0);
     }
 
     fn clientCloseResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
         const client_id = requiredObjectString(params, "client_id") catch |err| return self.registryErrorResponse(id_value, err);
-        const closed = self.registry.closeClient(client_id, nowMs());
+        const now_ms = nowMs();
+        const released_leases = self.registry.releaseLeasesForClient(self.allocator, client_id, now_ms);
+        const closed = self.registry.closeClient(client_id, now_ms);
         if (!closed) return try errorResponseAlloc(self.allocator, id_value, headless.registry.ERR_RESOURCE_NOT_FOUND, "client not found");
         const client = self.registry.client(client_id).?;
-        return try clientResponse(self.allocator, id_value, &self.registry, .close, client);
+        return try clientResponse(self.allocator, id_value, &self.registry, .close, client, released_leases);
+    }
+
+    fn daemonStopResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.registry.DaemonStopRequest, self.allocator, params) catch
+            return self.registryErrorResponse(id_value, error.InvalidParams);
+        defer parsed.deinit();
+        const request = parsed.value;
+        if (request.client_id.len == 0) return self.registryErrorResponse(id_value, error.ClientNotFound);
+        const client = self.registry.client(request.client_id) orelse return self.registryErrorResponse(id_value, error.ClientNotFound);
+        if (client.closed) return self.registryErrorResponse(id_value, error.ClientClosed);
+
+        const now_ms = nowMs();
+        _ = self.registry.releaseLeasesForClient(self.allocator, request.client_id, now_ms);
+        for (self.sessions.items) |session| {
+            if (session.owner_client_id == null or !std.mem.eql(u8, session.owner_client_id.?, request.client_id)) continue;
+            _ = session.terminate();
+            self.noteSessionExitInRegistry(session, "daemon.stop", now_ms);
+        }
+        if (request.force) self.stopAllManagedProcessesInline(now_ms);
+        _ = self.registry.closeClient(request.client_id, now_ms);
+
+        const stopping = !self.hasLiveKeepAliveState();
+        if (stopping) {
+            // The drain thread owns provider cleanup and endpoint wake-up. Do
+            // not duplicate those actions on this locked request path.
+            self.shutdown_requested = true;
+            self.accepting_mutations = false;
+        }
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer writer.deinit();
+        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try s.beginObject();
+        try writeRegistryEnvelope(&s, self);
+        try s.objectField("accepted");
+        try s.write(true);
+        try s.objectField("stopping");
+        try s.write(stopping);
+        try s.endObject();
+        try s.endObject();
+        return try writer.toOwnedSlice();
+    }
+
+    /// Force-all stop is deliberately bounded to immediate terminate calls on
+    /// the locked path. The drain thread observes actual exits and performs
+    /// the normal cleanup/provider handoff afterward.
+    fn stopAllManagedProcessesInline(self: *Daemon, now_ms: i64) void {
+        var changed = false;
+        for (self.registry.workspaces.items) |*workspace| {
+            for (workspace.managed_processes.items) |*process| {
+                switch (process.status) {
+                    .starting, .running, .stopping => {},
+                    .stopped, .crashed, .restarting => continue,
+                }
+                if (process.session_id) |session_id| {
+                    if (self.find(session_id)) |session| _ = session.terminate();
+                }
+                process.transition(.stop, now_ms) catch continue;
+                if (process.session_id) |session_id| self.allocator.free(session_id);
+                process.session_id = null;
+                process.pid = null;
+                process.process_group = null;
+                changed = true;
+            }
+        }
+        if (changed) self.bumpRegistryRevision();
     }
 
     fn resolveWorkspaceFromParams(self: *Daemon, params: std.json.Value) !*process_registry.WorkspaceRecord {
@@ -3151,6 +3337,7 @@ pub const Daemon = struct {
             error.WorkspaceNotFound => .{ headless.registry.ERR_RESOURCE_NOT_FOUND, "workspace not found" },
             error.LeaseNotFound => .{ headless.registry.ERR_RESOURCE_NOT_FOUND, "lease not found" },
             error.ManagedProcessNotFound => .{ headless.registry.ERR_RESOURCE_NOT_FOUND, "managed process not found" },
+            error.ClientNotFound => .{ headless.registry.ERR_INVALID_STATE, "client is not registered" },
             error.ClientClosed => .{ headless.registry.ERR_INVALID_STATE, "client is closed" },
             error.DaemonDraining => .{ headless.registry.ERR_INVALID_STATE, "daemon is preparing shutdown and is not accepting mutations" },
             error.OperationAlreadyInProgress => .{ headless.registry.ERR_INVALID_STATE, "operation already in progress" },
@@ -3245,10 +3432,17 @@ pub const Daemon = struct {
         const command = try jsonStringArray(self.allocator, params.object.get("command") orelse .null);
         defer freeStringArray(self.allocator, command);
         const cwd = jsonString(params.object.get("cwd") orelse .null) orelse ".";
+        const owner_client_id = if (jsonString(params.object.get("client_id") orelse .null)) |client_id| blk: {
+            const client = self.registry.client(client_id) orelse
+                return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "client_id is not registered");
+            if (client.closed) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "client_id is closed");
+            break :blk client_id;
+        } else null;
         const session = try PtySession.create(self.allocator, .{
             .session_id = session_id,
             .project_id = jsonString(params.object.get("workspace_id") orelse params.object.get("project_id") orelse .null) orelse "",
             .project_path = jsonString(params.object.get("workspace_path") orelse params.object.get("project_path") orelse .null) orelse "",
+            .owner_client_id = owner_client_id,
             .cwd = cwd,
             .label = jsonString(params.object.get("label") orelse .null) orelse "",
             .command = command,
@@ -3778,6 +3972,51 @@ fn resourceLimitErrorResponse(
     );
 }
 
+fn prepareShutdownRefusalResponse(
+    self: *Daemon,
+    id_value: std.json.Value,
+    running_sessions: usize,
+    managed: usize,
+    turns: usize,
+    leases: usize,
+    registry_jobs: usize,
+) ![]u8 {
+    var data_writer: std.Io.Writer.Allocating = .init(self.allocator);
+    errdefer data_writer.deinit();
+    var data_stringify: std.json.Stringify = .{ .writer = &data_writer.writer, .options = .{} };
+    try data_stringify.beginObject();
+    try data_stringify.objectField("running_sessions");
+    try data_stringify.write(running_sessions);
+    try data_stringify.objectField("managed");
+    try data_stringify.write(managed);
+    try data_stringify.objectField("turns");
+    try data_stringify.write(turns);
+    try data_stringify.objectField("leases");
+    try data_stringify.write(leases);
+    try data_stringify.objectField("registry_jobs");
+    try data_stringify.write(registry_jobs);
+    try data_stringify.endObject();
+    const data_json = try data_writer.toOwnedSlice();
+    defer self.allocator.free(data_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, data_json, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    const message = try std.fmt.allocPrint(
+        self.allocator,
+        "daemon cannot prepare shutdown: running_sessions={d} managed={d} turns={d} leases={d} registry_jobs={d}",
+        .{ running_sessions, managed, turns, leases, registry_jobs },
+    );
+    defer self.allocator.free(message);
+    return try errorResponseAllocWithData(
+        self.allocator,
+        id_value,
+        headless.registry.ERR_INVALID_STATE,
+        message,
+        parsed.value,
+    );
+}
+
 fn configUnavailableErrorResponse(
     self: *Daemon,
     id_value: std.json.Value,
@@ -4110,6 +4349,7 @@ fn clientResponse(
     registry: *const process_registry.ProcessRegistry,
     kind: ClientResponseKind,
     client: *const process_registry.ClientRecord,
+    released_leases: usize,
 ) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -4140,7 +4380,7 @@ fn clientResponse(
             try s.objectField("closed");
             try s.write(client.closed);
             try s.objectField("released_leases");
-            try s.write(@as(u32, 0));
+            try s.write(@as(u32, @intCast(released_leases)));
         },
     }
     try s.endObject();
@@ -4262,6 +4502,23 @@ fn slowIoDelayMsFromEnv(allocator: std.mem.Allocator) u64 {
     return @min(parsed, 5000);
 }
 
+fn retentionOverrideMsFromEnv(allocator: std.mem.Allocator) ?i64 {
+    const environ: std.process.Environ = if (builtin.os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    const raw = environ.getAlloc(allocator, TEST_RETENTION_ENV_NAME) catch return null;
+    defer allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const parsed = std.fmt.parseInt(i64, trimmed, 10) catch return null;
+    return @max(parsed, 100);
+}
+
+fn retentionExpiredForDaemon(start_ms: i64, now_ms: i64, retention_ms: i64) bool {
+    if (now_ms < start_ms) return false;
+    return now_ms - start_ms > retention_ms;
+}
+
 fn handleSessionizerServerRequest(raw_context: *anyopaque, request: []u8) anyerror![]u8 {
     const context: *SessionizerServerContext = @ptrCast(@alignCast(raw_context));
     const daemon = context.daemon;
@@ -4341,13 +4598,13 @@ fn drainSessionsThread(context: DrainThreadContext) void {
     while (!context.stop_requested.load(.acquire)) {
         const daemon = context.daemon;
         lockDaemon(daemon);
+        const now_ms = nowMs();
+        // Run every bounded registry retention rule once per tick, even when
+        // no GUI is attached; the registry is intentionally cheap at these
+        // in-memory phase-2 sizes.
+        _ = daemon.registry.reap(daemon.allocator, now_ms);
         daemon.pollSessions();
-        const prune_now_ms = nowMs();
-        // Pruning mutates only each outcome list, not the workspaces array, so
-        // iterating the records while pruning is safe under this lock.
-        for (daemon.registry.workspaces.items) |workspace| {
-            _ = daemon.registry.pruneTerminalProcessOutcomes(daemon.allocator, workspace.id, prune_now_ms);
-        }
+        daemon.reapOrphanedSessions(now_ms);
         const should_exit = daemon.shouldExitForIdle();
         daemon.mutex.unlock();
         if (should_exit) {
@@ -6343,10 +6600,10 @@ test "prepareShutdown refuses while a live PTY exists" {
     defer allocator.free(prepare_response);
     var prepared = try std.json.parseFromSlice(std.json.Value, allocator, prepare_response, .{});
     defer prepared.deinit();
-    const result = prepared.value.object.get("result").?.object;
-    try std.testing.expect(!jsonBool(result.get("accepted") orelse .null).?);
-    try std.testing.expect(!jsonBool(result.get("safe_to_exit") orelse .null).?);
-    try std.testing.expectEqual(@as(usize, 1), jsonUsize(result.get("running_sessions") orelse .null).?);
+    const error_value = prepared.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings(headless.registry.ERR_INVALID_STATE, jsonString(error_value.get("code").?).?);
+    const data = error_value.get("data").?.object;
+    try std.testing.expectEqual(@as(i64, 1), data.get("running_sessions").?.integer);
     try std.testing.expect(daemon.accepting_mutations);
     try std.testing.expect(!daemon.shutdown_requested);
     try std.testing.expect(!daemon.shouldExitForIdle());
@@ -6391,10 +6648,10 @@ test "prepareShutdown preserves unconsumed completed turns" {
     defer allocator.free(prepare_response);
     var prepared = try std.json.parseFromSlice(std.json.Value, allocator, prepare_response, .{});
     defer prepared.deinit();
-    const result = prepared.value.object.get("result").?.object;
-    try std.testing.expect(!jsonBool(result.get("accepted") orelse .null).?);
-    try std.testing.expect(!jsonBool(result.get("safe_to_exit") orelse .null).?);
-    try std.testing.expectEqual(@as(usize, 1), jsonUsize(result.get("keep_alive_turns") orelse .null).?);
+    const error_value = prepared.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings(headless.registry.ERR_INVALID_STATE, jsonString(error_value.get("code").?).?);
+    const data = error_value.get("data").?.object;
+    try std.testing.expectEqual(@as(i64, 1), data.get("turns").?.integer);
     try std.testing.expect(daemon.accepting_mutations);
     try std.testing.expect(!daemon.shutdown_requested);
     try std.testing.expectEqual(@as(usize, 1), daemon.chat_turns.items.len);
@@ -6417,6 +6674,171 @@ test "prepareShutdown preserves unconsumed completed turns" {
     try std.testing.expect(daemon.shutdown_requested);
     try std.testing.expect(!daemon.accepting_mutations);
     try std.testing.expect(daemon.shouldExitForIdle());
+}
+
+test "prepare shutdown refuses on every shared live-state gate and preserves accepting" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    daemon.idle_exit_ms = null;
+
+    const managed = try daemon.registry.ensureManagedProcess(allocator, "prepare-gates", "worker", "/bin/cat", nowMs());
+    try managed.transition(.start, nowMs());
+    const managed_response = try daemon.handleRequest("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"daemon.prepareShutdown\",\"params\":{}}");
+    defer allocator.free(managed_response);
+    var managed_parsed = try std.json.parseFromSlice(std.json.Value, allocator, managed_response, .{});
+    defer managed_parsed.deinit();
+    try std.testing.expectEqualStrings(headless.registry.ERR_INVALID_STATE, managed_parsed.value.object.get("error").?.object.get("code").?.string);
+    try std.testing.expectEqual(@as(i64, 1), managed_parsed.value.object.get("error").?.object.get("data").?.object.get("managed").?.integer);
+    try std.testing.expect(daemon.accepting_mutations);
+    try managed.transition(.stop, nowMs());
+
+    var lease = try daemon.registry.acquireLease(allocator, "prepare-gates", "owner", "client", "build", &[_][]const u8{"build"}, false, 0, nowMs());
+    defer lease.deinit(allocator);
+    const lease_response = try daemon.handleRequest("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"daemon.prepareShutdown\",\"params\":{}}");
+    defer allocator.free(lease_response);
+    var lease_parsed = try std.json.parseFromSlice(std.json.Value, allocator, lease_response, .{});
+    defer lease_parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), lease_parsed.value.object.get("error").?.object.get("data").?.object.get("leases").?.integer);
+    try std.testing.expect(daemon.accepting_mutations);
+    _ = daemon.registry.releaseLease(allocator, "prepare-gates", "owner", lease.lease.id, nowMs());
+
+    const job = try process_registry.RegistryJob.init(allocator, .start_managed_process, "prepare-gates", "proc:prepare-gates:worker", "client");
+    try daemon.registry_jobs.push(allocator, job);
+    const job_response = try daemon.handleRequest("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"daemon.prepareShutdown\",\"params\":{}}");
+    defer allocator.free(job_response);
+    var job_parsed = try std.json.parseFromSlice(std.json.Value, allocator, job_response, .{});
+    defer job_parsed.deinit();
+    const job_data = job_parsed.value.object.get("error").?.object.get("data").?.object;
+    try std.testing.expectEqual(@as(i64, 1), job_data.get("registry_jobs").?.integer);
+    try std.testing.expect(daemon.accepting_mutations);
+    var removed_job = daemon.registry_jobs.take().?;
+    removed_job.deinit(allocator);
+
+    const register_response = try daemon.handleRequest("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"daemon.client.register\",\"params\":{}}");
+    defer allocator.free(register_response);
+    try std.testing.expect(std.mem.indexOf(u8, register_response, "client_id") != null);
+}
+
+test "idle exit ignores retained outcomes and notifications" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    daemon.idle_exit_ms = 0;
+    _ = try daemon.registry.observeTerminalProcess(allocator, "retained-state", .{
+        .process_identity = 7,
+        .session_id = "retained-session",
+        .command = "/bin/true",
+        .cwd = ".",
+        .started_at_ms = 1,
+        .observed_at_ms = 1,
+        .dock_id = 0,
+        .owner_kind = "terminal",
+        .owner_title = "retained-session",
+    }, .{});
+    try std.testing.expect(try daemon.registry.finishTerminalProcess(allocator, "retained-state", "retained-session", .{ .exit_code = 0 }, 2));
+    try daemon.registry.queueNotification(allocator, "retained-state", "owner", "build", 2);
+    try std.testing.expect(!daemon.shouldExitForIdle());
+    daemon.idle_since_ms = nowMs() - 1;
+    try std.testing.expect(daemon.shouldExitForIdle());
+}
+
+test "orphaned client sessions are reaped after the grace window" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    daemon.test_retention_override_ms = 100;
+
+    const register_response = try daemon.handleRequest("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"daemon.client.register\",\"params\":{}}");
+    defer allocator.free(register_response);
+    var registered = try std.json.parseFromSlice(std.json.Value, allocator, register_response, .{});
+    defer registered.deinit();
+    const client_id = registered.value.object.get("result").?.object.get("client_id").?.string;
+    const create_request = try std.fmt.allocPrint(allocator, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session.create\",\"params\":{{\"id\":\"orphan-session\",\"workspace_id\":\"orphan-workspace\",\"client_id\":\"{s}\",\"cwd\":\".\",\"command\":[\"/bin/cat\"],\"pref_path\":\"/tmp\"}}}}", .{client_id});
+    defer allocator.free(create_request);
+    const create_response = try daemon.handleRequest(create_request);
+    defer allocator.free(create_response);
+    try std.testing.expect(daemon.find("orphan-session") != null);
+    const client = daemon.registry.client(client_id).?;
+    client.closed = true;
+    client.closed_at_ms = nowMs() - 101;
+    daemon.reapOrphanedSessions(nowMs());
+    try std.testing.expect(daemon.find("orphan-session").?.registry_finished);
+}
+
+test "daemon.stop scoped to a client releases leases and kills only its sessions" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    const client_a = try daemon.registry.registerClient(allocator, true, nowMs());
+    const client_b = try daemon.registry.registerClient(allocator, false, nowMs());
+    const client_a_id = try allocator.dupe(u8, client_a.client_id);
+    defer allocator.free(client_a_id);
+    const client_b_id = try allocator.dupe(u8, client_b.client_id);
+    defer allocator.free(client_b_id);
+    var lease = try daemon.registry.acquireLease(allocator, "stop-client", "owner-b", client_b_id, "build", &[_][]const u8{"build"}, false, 0, nowMs());
+    defer lease.deinit(allocator);
+
+    const session = try PtySession.create(allocator, .{
+        .session_id = "stop-client-session",
+        .project_id = "stop-client",
+        .cwd = ".",
+        .command = &[_][]const u8{"/bin/cat"},
+        .owner_client_id = client_b_id,
+        .pref_path = "/tmp",
+    });
+    try daemon.sessions.append(allocator, session);
+    daemon.observeSessionInRegistry(session, "/bin/cat", nowMs());
+    const request = try std.fmt.allocPrint(allocator, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"daemon.stop\",\"params\":{{\"client_id\":\"{s}\"}}}}", .{client_b_id});
+    defer allocator.free(request);
+    const response = try daemon.handleRequest(request);
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("result") != null);
+    try std.testing.expect(daemon.registry.client(client_b_id).?.closed);
+    try std.testing.expect(!daemon.registry.client(client_a_id).?.closed);
+    try std.testing.expectEqual(@as(usize, 0), daemon.registry.activeLeaseCount(allocator, "stop-client", nowMs()));
+    try std.testing.expect(daemon.find("stop-client-session") != null);
+    try std.testing.expectEqualStrings("daemon.stop", daemon.registry.workspace("stop-client").?.terminal_process_outcomes.items[0].cancellation_reason.?);
+}
+
+test "daemon.stop force stops managed processes but spares persistent client sessions" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    const persistent = try daemon.registry.registerClient(allocator, true, nowMs());
+    const stopper = try daemon.registry.registerClient(allocator, false, nowMs());
+    const persistent_id = try allocator.dupe(u8, persistent.client_id);
+    defer allocator.free(persistent_id);
+    const stopper_id = try allocator.dupe(u8, stopper.client_id);
+    defer allocator.free(stopper_id);
+    const managed = try daemon.registry.ensureManagedProcess(allocator, "force-stop", "worker", "/bin/cat", nowMs());
+    try managed.transition(.start, nowMs());
+    try managed.transition(.started, nowMs());
+    const session = try PtySession.create(allocator, .{
+        .session_id = "persistent-stop-session",
+        .project_id = "force-stop",
+        .cwd = ".",
+        .command = &[_][]const u8{"/bin/cat"},
+        .owner_client_id = persistent_id,
+        .pref_path = "/tmp",
+    });
+    try daemon.sessions.append(allocator, session);
+
+    const request = try std.fmt.allocPrint(allocator, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"daemon.stop\",\"params\":{{\"client_id\":\"{s}\",\"force\":true}}}}", .{stopper_id});
+    defer allocator.free(request);
+    const response = try daemon.handleRequest(request);
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("result") != null);
+    try std.testing.expectEqual(process_registry.ManagedProcessRuntimeState.stopped, managed.runtime_state);
+    try std.testing.expect(daemon.find("persistent-stop-session").?.running);
+    try std.testing.expect(!daemon.registry.client(persistent_id).?.closed);
 }
 
 test "draining dispatcher rejects every state mutator" {
