@@ -8,8 +8,7 @@ const protocol = @import("protocol.zig");
 
 /// Methods that must be refused once the daemon has entered its drain phase.
 ///
-/// S2 dispatches the first two store mutators; the remaining six stay
-/// undispatched (method_not_found) until S3. daemon.storeStatus is a read.
+/// Full store mutation surface (S3). daemon.storeStatus is a read, not a mutator.
 const MUTATING_METHODS = [_][]const u8{
     // Sessionizer-owned mutations.
     "session.create",
@@ -34,9 +33,15 @@ const MUTATING_METHODS = [_][]const u8{
     "daemon.client.heartbeat",
     "daemon.client.close",
     "daemon.stop",
-    // Store mutations dispatched in S2.
+    // Full store mutation surface.
     "state.snapshot.replace",
     "workspace.upsert",
+    "chat.thread.upsert",
+    "chat.message.append",
+    "surface.upsert",
+    "surface.clear",
+    "notification.chatCompletion.upsert",
+    "notification.chatCompletion.clear",
 };
 
 /// Return whether a method changes daemon-owned state.
@@ -246,7 +251,7 @@ test "shared mutator table pins the current sessionizer methods" {
     }
 }
 
-test "reads and undispatched store methods are not mutators" {
+test "reads are not mutators and store mutators drain" {
     const reads = [_][]const u8{
         "session.list",
         "session.inspect",
@@ -272,12 +277,10 @@ test "reads and undispatched store methods are not mutators" {
         try std.testing.expect(!isMutatingMethod(method));
     }
 
-    // S2-dispatched store mutators must drain with the rest of the mutator set.
-    try std.testing.expect(isMutatingMethod("state.snapshot.replace"));
-    try std.testing.expect(isMutatingMethod("workspace.upsert"));
-
-    // Remaining store mutations stay undispatched until S3.
-    const undispatched_store_methods = [_][]const u8{
+    // Full store mutation surface must drain with the rest of the mutator set.
+    const store_mutators = [_][]const u8{
+        "state.snapshot.replace",
+        "workspace.upsert",
         "chat.thread.upsert",
         "chat.message.append",
         "surface.upsert",
@@ -285,7 +288,7 @@ test "reads and undispatched store methods are not mutators" {
         "notification.chatCompletion.upsert",
         "notification.chatCompletion.clear",
     };
-    for (undispatched_store_methods) |method| {
-        try std.testing.expect(!isMutatingMethod(method));
+    for (store_mutators) |method| {
+        try std.testing.expect(isMutatingMethod(method));
     }
 }
