@@ -445,6 +445,42 @@ test "schema migration chain advances v1 to v2 to v3 to v4 and preserves populat
     try std.testing.expect(unmapped_message.nullableInt(2) == null);
 }
 
+test "v1 to v2 migration failure before version bump rolls back cleanly" {
+    // Carried S1 review Minor 1: inject failure after v1→v2 DDL, before user_version bump.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const path = try std.fs.path.joinZ(std.testing.allocator, &.{ path_buf[0..path_len], "state.sqlite" });
+    defer std.testing.allocator.free(path);
+
+    const conn = try zqlite.open(path, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
+    defer conn.close();
+    try initialize(conn);
+    try conn.execNoArgs(
+        \\insert into app_state (id, selected_workspace_index, sidebar_collapsed) values (1, 0, 0);
+        \\insert into workspaces (workspace_id, sort_index, label, path) values ('v1-probe', 0, 'Probe', '/probe');
+    );
+
+    try std.testing.expectError(error.TestMigrationFailure, migrateToVersion(conn, 2, .before_version_bump));
+    try std.testing.expectEqual(@as(i64, 1), try userVersion(conn));
+    try std.testing.expect(!try testHasColumn(conn, "store_state", "store_revision"));
+    try std.testing.expect(!try testHasColumn(conn, "store_receipts", "request_key"));
+    try std.testing.expect(!try testHasColumn(conn, "client_message_keys", "message_id"));
+    // Partial unique index must not survive a rolled-back v1→v2 arm.
+    var index_row = (try conn.row(
+        "select count(*) from sqlite_schema where type = 'index' and name = 'threads_workspace_local_thread_id_idx'",
+        .{},
+    )).?;
+    defer index_row.deinit();
+    try std.testing.expectEqual(@as(i64, 0), index_row.int(0));
+
+    var probe = (try conn.row("select label from workspaces where workspace_id = 'v1-probe'", .{})).?;
+    defer probe.deinit();
+    try std.testing.expectEqualStrings("Probe", probe.text(0));
+}
+
 test "v2 to v3 migration failure rolls back transfer tables and preserves v2 data" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

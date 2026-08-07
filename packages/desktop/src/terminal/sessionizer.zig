@@ -64,6 +64,9 @@ const IDLE_EXIT_ENV_NAME = "VERDE_SESSION_DAEMON_IDLE_EXIT_MS";
 /// When set, the daemon opens `{value}/state.sqlite` post-bind. Unset keeps
 /// the daemon store-less through Phase 2 (capability_unavailable).
 pub const SESSION_DAEMON_STORE_DIR_ENV_NAME = "VERDE_SESSION_DAEMON_STORE_DIR";
+/// Test-only store fault arm (B9). Parsed only when the store-dir override is
+/// also set; maps 1:1 to `daemon_store.StoreFault` tag names.
+pub const SESSION_DAEMON_STORE_FAULT_ENV_NAME = "VERDE_SESSION_DAEMON_STORE_FAULT";
 /// Test-only latency injection for the unlocked managed-process phase.
 const TEST_SLOW_IO_ENV_NAME = "VERDE_SESSIONIZER_TEST_SLOW_IO_MS";
 /// Test-only orphan retention override; registry-internal TTLs remain fixed.
@@ -5002,16 +5005,39 @@ fn storeDirFromEnv(allocator: std.mem.Allocator) !?[]u8 {
     return owned;
 }
 
+/// Parse B9 store fault arm. Only called when the store-dir override is set.
+/// Missing/empty → `.none`. Unknown tag name → error (fail readiness loudly).
+fn storeFaultFromEnv(allocator: std.mem.Allocator) !daemon_store.StoreFault {
+    const environ: std.process.Environ = if (builtin.os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    const raw = environ.getAlloc(allocator, SESSION_DAEMON_STORE_FAULT_ENV_NAME) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return .none,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidWtf8 => return error.InvalidParams,
+    };
+    defer allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return .none;
+    inline for (std.meta.fields(daemon_store.StoreFault)) |field| {
+        if (std.mem.eql(u8, trimmed, field.name)) return @enumFromInt(field.value);
+    }
+    return error.InvalidParams;
+}
+
 fn maybeInitStoreService(daemon: *Daemon) !void {
     const store_dir = (try storeDirFromEnv(daemon.allocator)) orelse return;
     defer daemon.allocator.free(store_dir);
+    // B9: fault env is active only alongside the store-dir override.
+    const fault = try storeFaultFromEnv(daemon.allocator);
     const db_path = try std.fs.path.join(daemon.allocator, &.{ store_dir, "state.sqlite" });
     defer daemon.allocator.free(db_path);
 
     const service = try daemon.allocator.create(StoreService);
     errdefer daemon.allocator.destroy(service);
     service.* = .{
-        .store = try daemon_store.Store.init(daemon.allocator, db_path),
+        .store = try daemon_store.Store.initWithFault(daemon.allocator, db_path, fault),
     };
     errdefer service.store.deinit();
 
@@ -7843,10 +7869,14 @@ test "draining dispatcher rejects every state mutator" {
 }
 
 fn attachTestStoreService(daemon: *Daemon, db_path: []const u8) !void {
+    try attachTestStoreServiceWithFault(daemon, db_path, .none);
+}
+
+fn attachTestStoreServiceWithFault(daemon: *Daemon, db_path: []const u8, fault: daemon_store.StoreFault) !void {
     const service = try daemon.allocator.create(StoreService);
     errdefer daemon.allocator.destroy(service);
     service.* = .{
-        .store = try daemon_store.Store.init(daemon.allocator, db_path),
+        .store = try daemon_store.Store.initWithFault(daemon.allocator, db_path, fault),
     };
     daemon.store_service = service;
 }
@@ -8303,6 +8333,82 @@ test "drained daemon rejects store mutators with invalid_state" {
     const status_result = status_parsed.value.object.get("result").?.object;
     try std.testing.expectEqualStrings("draining", jsonString(status_result.get("drain_state").?).?);
     try std.testing.expect(!status_result.get("writer_ready").?.bool);
+}
+
+/// Worker for the lock-boundary pin: runs a store mutation that stalls at commit.
+const SlowStoreCommitContext = struct {
+    daemon: *Daemon,
+    request: []const u8,
+    response: ?[]u8 = null,
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn slowStoreCommitThread(ctx: *SlowStoreCommitContext) void {
+    defer ctx.done.store(true, .release);
+    ctx.response = ctx.daemon.handleRequest(ctx.request) catch |err| {
+        ctx.err = err;
+        return;
+    };
+}
+
+test "daemon lock stays free during a slow store commit" {
+    // Normative pin of ground-truth rule #4: SQLite work (including a commit
+    // stall) must never hold lockDaemon. Probe with a non-store read that does
+    // not take the store service mutex (daemon.storeStatus would block).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreServiceWithFault(&daemon, db_path, .commit_stall);
+    defer detachTestStoreService(&daemon);
+
+    const client_id = try registerTestClientId(&daemon, allocator);
+    defer allocator.free(client_id);
+
+    const upsert_request = try std.fmt.allocPrint(allocator,
+        \\{{"jsonrpc":"2.0","id":2,"method":"workspace.upsert","params":{{"mutation":{{"request_key":"slow-commit","client_id":"{s}"}},"workspace":{{"workspace_id":"ws-slow","label":"Slow","path":"/ws-slow"}}}}}}
+    , .{client_id});
+    defer allocator.free(upsert_request);
+
+    var ctx: SlowStoreCommitContext = .{
+        .daemon = &daemon,
+        .request = upsert_request,
+    };
+    const worker = try std.Thread.spawn(.{}, slowStoreCommitThread, .{&ctx});
+
+    // Give the worker time to enter the commit stall under the store mutex.
+    platform_runtime.sleepMillis(100);
+
+    var probes: usize = 0;
+    while (!ctx.done.load(.acquire)) : (probes += 1) {
+        const started = platform_runtime.monotonicTimestampNs();
+        // session.list is a non-store read; must complete well under the stall.
+        const list_response = try daemon.handleRequest(
+            \\{"jsonrpc":"2.0","id":99,"method":"session.list","params":{}}
+        );
+        defer allocator.free(list_response);
+        const elapsed_ms = (platform_runtime.monotonicTimestampNs() - started) / std.time.ns_per_ms;
+        try std.testing.expect(elapsed_ms < 200);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, list_response, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("result") != null);
+        if (probes > 40) break; // stall is ~1500ms; do not loop forever
+        platform_runtime.sleepMillis(50);
+    }
+    worker.join();
+    if (ctx.err) |err| return err;
+    const mutation_response = ctx.response orelse return error.SlowStoreCommitMissingResponse;
+    defer allocator.free(mutation_response);
+    var mut_parsed = try std.json.parseFromSlice(std.json.Value, allocator, mutation_response, .{});
+    defer mut_parsed.deinit();
+    const result = mut_parsed.value.object.get("result").?.object;
+    try std.testing.expect(result.get("applied").?.bool);
+    try std.testing.expect(probes >= 1);
 }
 
 test "idle exit is disabled by default and honors override" {

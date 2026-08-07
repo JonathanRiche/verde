@@ -11,6 +11,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const headless = @import("headless");
+const platform_ipc = @import("platform/ipc.zig");
 const platform_paths = @import("platform_paths");
 const platform_runtime = @import("platform_runtime");
 const sessionizer = @import("terminal/sessionizer.zig");
@@ -144,6 +145,10 @@ pub fn main(init: std.process.Init) !void {
     try runStoreEnabledScenario(allocator, io);
     try runStoreFullSurfaceScenario(allocator, io);
     try runStoreDurableReopenScenario(allocator, io);
+    try runStoreBoundedQueueingScenario(allocator, io);
+    try runStoreBusyRetryScenario(allocator, io);
+    try runStoreCrashBeforeCommitScenario(allocator, io);
+    try runStoreCrashAfterCommitScenario(allocator, io);
 
     // PTY tier: sessions, managed spawn, prepare/stop retention, lifecycle.
     if (posix_pty_supported) {
@@ -270,10 +275,12 @@ const EndpointIsolation = struct {
     }
 };
 
-/// Spawn options for hermetic IT daemons. S4 adds `store_fault`.
+/// Spawn options for hermetic IT daemons. S4 adds `store_fault` (B9 arm names).
 const IsolatedDaemonOptions = struct {
     idle_exit_ms: ?[]const u8 = null,
     store_dir: ?[]const u8 = null,
+    /// When set with `store_dir`, maps to `VERDE_SESSION_DAEMON_STORE_FAULT`.
+    store_fault: ?[]const u8 = null,
     slow_io_ms: ?[]const u8 = null,
     retention_ms: ?[]const u8 = null,
 };
@@ -339,6 +346,8 @@ fn spawnIsolatedDaemonWithOptions(
     if (options.slow_io_ms) |value| try env_map.put("VERDE_SESSIONIZER_TEST_SLOW_IO_MS", value);
     if (options.retention_ms) |value| try env_map.put("VERDE_SESSIONIZER_TEST_RETENTION_MS", value);
     if (options.store_dir) |value| try env_map.put(sessionizer.SESSION_DAEMON_STORE_DIR_ENV_NAME, value);
+    // B9: fault env is only meaningful with the store-dir override.
+    if (options.store_fault) |value| try env_map.put(sessionizer.SESSION_DAEMON_STORE_FAULT_ENV_NAME, value);
 
     // Bind the child to the same isolated endpoint the parent uses.
     const endpoint = try isolationEndpoint(allocator, pref_path);
@@ -2540,6 +2549,575 @@ fn runStoreDurableReopenScenario(allocator: std.mem.Allocator, io: std.Io) !void
         const replay_result = try client.decodeWriteResult(&replay_parsed);
         if (replay_result.store_revision != persisted_revision) return error.StoreDurableReceiptReplayRevision;
         if (!replay_result.applied or replay_result.duplicate) return error.StoreDurableReceiptReplayShape;
+    }
+}
+
+/// Bounded serial queueing under a slow store commit (commit_stall).
+/// True mid-stall responsiveness is blocked on accept-loop concurrency
+/// (packages/desktop/src/platform/ipc.zig serial handleUnixClient); this pin
+/// only asserts no deadlock and both requests complete within stall+timeout.
+fn runStoreBoundedQueueingScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "store-queue");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fmt.allocPrint(allocator, "{s}/store", .{pref_path});
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+        .store_fault = "commit_stall",
+    });
+    defer child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer register_parsed.deinit();
+    if (!register_parsed.response.isOk()) return error.StoreQueueRegisterFailed;
+    const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+    const SlowMutationCtx = struct {
+        allocator: std.mem.Allocator,
+        pref_path: []const u8,
+        client_id: []const u8,
+        err: ?anyerror = null,
+        applied: bool = false,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    };
+    var mut_ctx: SlowMutationCtx = .{
+        .allocator = allocator,
+        .pref_path = pref_path,
+        .client_id = client_id,
+    };
+    const slowThread = struct {
+        fn run(ctx: *SlowMutationCtx) void {
+            defer ctx.done.store(true, .release);
+            var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+            defer arena.deinit();
+            var t: sessionizer.HeadlessTransport = .{
+                .allocator = arena.allocator(),
+                .pref_path = ctx.pref_path,
+            };
+            var mut_client = sessionizer.headlessClient(arena.allocator(), &t);
+            const upsert: headless.store.WorkspaceUpsertRequest = .{
+                .mutation = .{
+                    .request_key = "s4-queue-upsert",
+                    .client_id = ctx.client_id,
+                },
+                .workspace = .{
+                    .workspace_id = "s4-queue-ws",
+                    .label = "Queue",
+                    .path = ctx.pref_path,
+                },
+            };
+            var parsed = mut_client.call(headless.store.METHOD_WORKSPACE_UPSERT, upsert) catch |err| {
+                ctx.err = err;
+                return;
+            };
+            defer parsed.deinit();
+            if (!parsed.response.isOk()) {
+                ctx.err = error.StoreQueueMutationFailed;
+                return;
+            }
+            const result = mut_client.decodeWriteResult(&parsed) catch |err| {
+                ctx.err = err;
+                return;
+            };
+            ctx.applied = result.applied;
+        }
+    }.run;
+    const worker = try std.Thread.spawn(.{}, slowThread, .{&mut_ctx});
+
+    // Issue the read immediately after the mutation thread starts. With a serial
+    // accept loop it queues behind the stalled commit; both must still finish.
+    std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+    const read_started = sessionizer.nowMs();
+    const list_req: headless.registry.ProcessListRequest = .{
+        .workspace = .{ .workspace_path = pref_path },
+    };
+    var list_parsed = try client.call(headless.registry.METHOD_PROCESS_LIST, list_req);
+    defer list_parsed.deinit();
+    const read_elapsed = sessionizer.nowMs() - read_started;
+    worker.join();
+
+    if (mut_ctx.err) |err| return err;
+    if (!mut_ctx.applied) return error.StoreQueueMutationNotApplied;
+    if (!list_parsed.response.isOk()) return error.StoreQueueReadFailed;
+    // stall(1500) + transport timeout budget — no deadlock, bounded queueing.
+    if (read_elapsed > 8000) return error.StoreQueueReadTooSlow;
+}
+
+/// Parent holds BEGIN IMMEDIATE so the daemon writer hits the busy timeout →
+/// store_busy; after release, same request_key applies once and replays.
+fn runStoreBusyRetryScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "store-busy");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fmt.allocPrint(allocator, "{s}/store", .{pref_path});
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+    });
+    defer child.kill(io);
+
+    // BusyTimeout on the store is schema.BUSY_TIMEOUT_MS (5000); budget the IT.
+    const db_path = try std.fs.path.join(allocator, &.{ store_dir, "state.sqlite" });
+    defer allocator.free(db_path);
+    const db_path_z = try allocator.dupeZ(u8, db_path);
+    defer allocator.free(db_path_z);
+
+    var parent_conn = zqlite.open(db_path_z, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode) catch |err| {
+        std.debug.print("headless-daemon-it: busy parent sqlite open failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    // Always release the writer lock on every exit path so the daemon cannot hang
+    // on its busy timeout during teardown.
+    errdefer parent_conn.close();
+    // Parent acquires immediately; do not compete with the daemon's 5s busy wait.
+    parent_conn.busyTimeout(0) catch {};
+    parent_conn.execNoArgs("begin immediate") catch |err| {
+        parent_conn.close();
+        return err;
+    };
+    var txn_open = true;
+    errdefer if (txn_open) parent_conn.rollback();
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+    var scenario: FixtureScenario = .{ .client = &client };
+
+    var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer register_parsed.deinit();
+    if (!register_parsed.response.isOk()) return error.StoreBusyRegisterFailed;
+    const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+    const receipt_key = "s4-busy-upsert";
+    const upsert: headless.store.WorkspaceUpsertRequest = .{
+        .mutation = .{
+            .request_key = receipt_key,
+            .client_id = client_id,
+        },
+        .workspace = .{
+            .workspace_id = "s4-busy-ws",
+            .label = "Busy",
+            .path = pref_path,
+        },
+    };
+
+    // Client default timeout is 5s; store busyTimeout is also 5s. Use a longer
+    // transport budget so the busy mapping arrives before the read deadline.
+    {
+        const encoded = try client.encodeRequest(headless.store.METHOD_WORKSPACE_UPSERT, upsert);
+        defer client.allocator.free(encoded.json);
+        const endpoint = try sessionizer.socketPath(allocator, pref_path);
+        defer allocator.free(endpoint);
+        const raw = try platform_ipc.requestAlloc(allocator, endpoint, encoded.json, .{
+            .max_message_bytes = sessionizer.MAX_RESPONSE_BYTES,
+            .max_response_bytes = sessionizer.MAX_RESPONSE_BYTES,
+            .timeout_ms = 15000,
+        });
+        defer allocator.free(raw);
+        var busy_parsed = try client.parseResponse(raw);
+        defer busy_parsed.deinit();
+        const err = busy_parsed.response.err orelse return error.StoreBusyMissingError;
+        if (!std.mem.eql(u8, err.code, headless.protocol.ERR_STORE_BUSY)) return error.StoreBusyWrongCode;
+    }
+
+    parent_conn.rollback();
+    txn_open = false;
+    parent_conn.close();
+
+    {
+        var applied_parsed = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, upsert);
+        defer applied_parsed.deinit();
+        if (!applied_parsed.response.isOk()) return error.StoreBusyRetryFailed;
+        const result = try client.decodeWriteResult(&applied_parsed);
+        if (!result.applied or result.duplicate) return error.StoreBusyRetryNotApplied;
+    }
+
+    {
+        var replay_parsed = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, upsert);
+        defer replay_parsed.deinit();
+        if (!replay_parsed.response.isOk()) return error.StoreBusyReplayFailed;
+        const result = try client.decodeWriteResult(&replay_parsed);
+        // Receipt replay returns the original WriteResult (applied=true).
+        if (!result.applied or result.duplicate) return error.StoreBusyReplayShape;
+    }
+}
+
+/// Crash before commit: mutation absent, recovery clean, same key applies once.
+fn runStoreCrashBeforeCommitScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "store-crash-before");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fmt.allocPrint(allocator, "{s}/store", .{pref_path});
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    const receipt_key = "s4-crash-before";
+    // Seed revision 0 DB and capture baseline, then crash a mutation.
+    {
+        var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+            .store_fault = "crash_before_commit",
+        });
+        // Child aborts; wait/reap below. Kill only if it hangs.
+
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+        var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+        defer register_parsed.deinit();
+        if (!register_parsed.response.isOk()) {
+            child.kill(io);
+            return error.StoreCrashBeforeRegisterFailed;
+        }
+        const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+        const upsert: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{
+                .request_key = receipt_key,
+                .client_id = client_id,
+            },
+            .workspace = .{
+                .workspace_id = "s4-crash-before-ws",
+                .label = "CrashBefore",
+                .path = pref_path,
+            },
+        };
+        // Transport error/EOF expected when the daemon aborts mid-request.
+        if (client.call(headless.store.METHOD_WORKSPACE_UPSERT, upsert)) |owned| {
+            var parsed = owned;
+            defer parsed.deinit();
+            // If a response arrived, treat success as a failure of the crash arm.
+            if (parsed.response.isOk()) {
+                child.kill(io);
+                return error.StoreCrashBeforeUnexpectedSuccess;
+            }
+        } else |_| {}
+
+        const term = waitChildBounded(&child, io, 10000) catch {
+            child.kill(io);
+            return error.StoreCrashBeforeDidNotExit;
+        };
+        switch (term) {
+            .exited => |code| if (code == 0) return error.StoreCrashBeforeCleanExit,
+            .signal => {}, // abort → signal is the expected abnormal path
+            else => {},
+        }
+    }
+
+    // Direct read-only integrity: mutation ABSENT, revision unchanged, no receipt.
+    {
+        const db_path = try std.fs.path.join(allocator, &.{ store_dir, "state.sqlite" });
+        defer allocator.free(db_path);
+        const db_path_z = try allocator.dupeZ(u8, db_path);
+        defer allocator.free(db_path_z);
+        var conn = try zqlite.open(db_path_z, zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode);
+        defer conn.close();
+
+        const integrity = (try conn.row("pragma integrity_check", .{})).?;
+        defer integrity.deinit();
+        if (!std.mem.eql(u8, integrity.text(0), "ok")) return error.StoreCrashBeforeIntegrityFailed;
+
+        const fk = (try conn.row("pragma foreign_key_check", .{}));
+        if (fk) |row| {
+            defer row.deinit();
+            return error.StoreCrashBeforeFkFailed;
+        }
+
+        const rev_row = (try conn.row("select store_revision from store_state where id = 1", .{})) orelse
+            return error.StoreCrashBeforeMissingState;
+        defer rev_row.deinit();
+        if (rev_row.int(0) != 0) return error.StoreCrashBeforeRevisionBumped;
+
+        const ws_row = (try conn.row(
+            "select count(*) from workspaces where workspace_id = 's4-crash-before-ws'",
+            .{},
+        )).?;
+        defer ws_row.deinit();
+        if (ws_row.int(0) != 0) return error.StoreCrashBeforeMutationPresent;
+
+        const receipt_row = (try conn.row(
+            "select count(*) from store_receipts where request_key = ?1",
+            .{receipt_key},
+        )).?;
+        defer receipt_row.deinit();
+        if (receipt_row.int(0) != 0) return error.StoreCrashBeforeReceiptPresent;
+    }
+
+    // Respawn fault-none; same request_key applies exactly once.
+    {
+        var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+        });
+        defer child.kill(io);
+
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+        var scenario: FixtureScenario = .{ .client = &client };
+
+        var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+        defer register_parsed.deinit();
+        if (!register_parsed.response.isOk()) return error.StoreCrashBeforeReopenRegisterFailed;
+        const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+        const upsert: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{
+                .request_key = receipt_key,
+                .client_id = client_id,
+            },
+            .workspace = .{
+                .workspace_id = "s4-crash-before-ws",
+                .label = "CrashBefore",
+                .path = pref_path,
+            },
+        };
+        var applied = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, upsert);
+        defer applied.deinit();
+        if (!applied.response.isOk()) return error.StoreCrashBeforeReopenApplyFailed;
+        const result = try client.decodeWriteResult(&applied);
+        if (!result.applied or result.duplicate) return error.StoreCrashBeforeReopenNotApplied;
+
+        // Counts via zqlite: one workspace row + one receipt for the key.
+        const db_path = try std.fs.path.join(allocator, &.{ store_dir, "state.sqlite" });
+        defer allocator.free(db_path);
+        const db_path_z = try allocator.dupeZ(u8, db_path);
+        defer allocator.free(db_path_z);
+        // Close the daemon writer before parent RO open for a clean snapshot.
+        // The store is still open on the daemon; RO open of WAL is fine.
+        var conn = try zqlite.open(db_path_z, zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode);
+        defer conn.close();
+        const ws_row = (try conn.row(
+            "select count(*) from workspaces where workspace_id = 's4-crash-before-ws'",
+            .{},
+        )).?;
+        defer ws_row.deinit();
+        if (ws_row.int(0) != 1) return error.StoreCrashBeforeCountMismatch;
+        const receipt_row = (try conn.row(
+            "select count(*) from store_receipts where request_key = ?1",
+            .{receipt_key},
+        )).?;
+        defer receipt_row.deinit();
+        if (receipt_row.int(0) != 1) return error.StoreCrashBeforeReceiptCountMismatch;
+    }
+}
+
+/// Crash after commit: mutation PRESENT with bumped revision; same key replays.
+fn runStoreCrashAfterCommitScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "store-crash-after");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fmt.allocPrint(allocator, "{s}/store", .{pref_path});
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    const receipt_key = "s4-crash-after";
+    var committed_revision: u64 = 0;
+    {
+        var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+            .store_fault = "crash_after_commit",
+        });
+
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+        var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+        defer register_parsed.deinit();
+        if (!register_parsed.response.isOk()) {
+            child.kill(io);
+            return error.StoreCrashAfterRegisterFailed;
+        }
+        const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+        const upsert: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{
+                .request_key = receipt_key,
+                .client_id = client_id,
+            },
+            .workspace = .{
+                .workspace_id = "s4-crash-after-ws",
+                .label = "CrashAfter",
+                .path = pref_path,
+            },
+        };
+        if (client.call(headless.store.METHOD_WORKSPACE_UPSERT, upsert)) |owned| {
+            var parsed = owned;
+            defer parsed.deinit();
+            // Response may race abort after commit; either transport error or a
+            // partial/ok response is acceptable. Success is verified via SQLite.
+            if (parsed.response.isOk()) {
+                if (client.decodeWriteResult(&parsed)) |result| {
+                    committed_revision = result.store_revision;
+                } else |_| {}
+            }
+        } else |_| {}
+
+        const term = waitChildBounded(&child, io, 10000) catch {
+            child.kill(io);
+            return error.StoreCrashAfterDidNotExit;
+        };
+        switch (term) {
+            .exited => |code| if (code == 0) return error.StoreCrashAfterCleanExit,
+            .signal => {},
+            else => {},
+        }
+    }
+
+    {
+        const db_path = try std.fs.path.join(allocator, &.{ store_dir, "state.sqlite" });
+        defer allocator.free(db_path);
+        const db_path_z = try allocator.dupeZ(u8, db_path);
+        defer allocator.free(db_path_z);
+        var conn = try zqlite.open(db_path_z, zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode);
+        defer conn.close();
+
+        const integrity = (try conn.row("pragma integrity_check", .{})).?;
+        defer integrity.deinit();
+        if (!std.mem.eql(u8, integrity.text(0), "ok")) return error.StoreCrashAfterIntegrityFailed;
+
+        const rev_row = (try conn.row("select store_revision from store_state where id = 1", .{})) orelse
+            return error.StoreCrashAfterMissingState;
+        defer rev_row.deinit();
+        const rev: u64 = @intCast(rev_row.int(0));
+        if (rev == 0) return error.StoreCrashAfterRevisionUnchanged;
+        if (committed_revision == 0) committed_revision = rev;
+        if (rev != committed_revision) return error.StoreCrashAfterRevisionMismatch;
+
+        const ws_row = (try conn.row(
+            "select count(*) from workspaces where workspace_id = 's4-crash-after-ws'",
+            .{},
+        )).?;
+        defer ws_row.deinit();
+        if (ws_row.int(0) != 1) return error.StoreCrashAfterMutationMissing;
+
+        const receipt_row = (try conn.row(
+            "select count(*) from store_receipts where request_key = ?1",
+            .{receipt_key},
+        )).?;
+        defer receipt_row.deinit();
+        if (receipt_row.int(0) != 1) return error.StoreCrashAfterReceiptMissing;
+    }
+
+    // Respawn: same request_key → receipt replay; pin counts (no second row).
+    {
+        var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+        });
+        defer child.kill(io);
+
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+        var scenario: FixtureScenario = .{ .client = &client };
+
+        var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+        defer register_parsed.deinit();
+        if (!register_parsed.response.isOk()) return error.StoreCrashAfterReopenRegisterFailed;
+        const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+        const upsert: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{
+                .request_key = receipt_key,
+                .client_id = client_id,
+            },
+            .workspace = .{
+                .workspace_id = "s4-crash-after-ws",
+                .label = "CrashAfter",
+                .path = pref_path,
+            },
+        };
+        var replay = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, upsert);
+        defer replay.deinit();
+        if (!replay.response.isOk()) return error.StoreCrashAfterReplayFailed;
+        const result = try client.decodeWriteResult(&replay);
+        if (result.store_revision != committed_revision) return error.StoreCrashAfterReplayRevision;
+        if (!result.applied or result.duplicate) return error.StoreCrashAfterReplayShape;
+
+        const db_path = try std.fs.path.join(allocator, &.{ store_dir, "state.sqlite" });
+        defer allocator.free(db_path);
+        const db_path_z = try allocator.dupeZ(u8, db_path);
+        defer allocator.free(db_path_z);
+        var conn = try zqlite.open(db_path_z, zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode);
+        defer conn.close();
+        const ws_row = (try conn.row(
+            "select count(*) from workspaces where workspace_id = 's4-crash-after-ws'",
+            .{},
+        )).?;
+        defer ws_row.deinit();
+        if (ws_row.int(0) != 1) return error.StoreCrashAfterReplayCountMismatch;
+        const receipt_row = (try conn.row(
+            "select count(*) from store_receipts where request_key = ?1",
+            .{receipt_key},
+        )).?;
+        defer receipt_row.deinit();
+        if (receipt_row.int(0) != 1) return error.StoreCrashAfterReplayReceiptCount;
     }
 }
 
