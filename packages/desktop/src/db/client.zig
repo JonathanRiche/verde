@@ -602,6 +602,13 @@ fn testCreateLegacyFixture(pref_path: []const u8) !void {
     try conn.execNoArgs(migration_fixture.LEGACY_V0_SQL);
 }
 
+fn testCreateLegacyWalFixture(pref_path: []const u8) !zqlite.Conn {
+    const conn = try testOpenDatabase(testing.allocator, pref_path);
+    errdefer conn.close();
+    try conn.execNoArgs(migration_fixture.LEGACY_V0_WAL_SQL);
+    return conn;
+}
+
 fn testUserVersion(conn: zqlite.Conn) !i64 {
     var row = (try conn.row("pragma user_version", .{})).?;
     defer row.deinit();
@@ -849,6 +856,48 @@ test "pre-versioning fixture migrates without transcript or ledger loss" {
     try testExpectDatabaseChecks(client.conn);
 }
 
+test "WAL pre-versioning fixture migrates and reopens with sidecars present" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+
+    const legacy = try testCreateLegacyWalFixture(pref_path);
+    var legacy_open = true;
+    defer if (legacy_open) legacy.close();
+    {
+        var journal_mode = (try legacy.row("pragma journal_mode", .{})).?;
+        defer journal_mode.deinit();
+        try testing.expectEqualStrings("wal", journal_mode.text(0));
+    }
+    _ = try tmp.dir.statFile(testing.io, STATE_DB_NAME ++ "-wal", .{});
+    _ = try tmp.dir.statFile(testing.io, STATE_DB_NAME ++ "-shm", .{});
+
+    {
+        var migrated = try Client.init(testing.allocator, pref_path);
+        defer migrated.deinit();
+        try testing.expectEqual(schema.CURRENT_VERSION, try testUserVersion(migrated.conn));
+        try testing.expect(try schema.testHasColumn(migrated.conn, "threads", "reasoning_variant"));
+        try testExpectRowCount(migrated.conn, "messages", 5);
+        var loaded = (try migrated.load(testing.allocator)).?;
+        defer loaded.deinit();
+        try testExpectLegacyFixtureState(loaded.value, null);
+        try testExpectDatabaseChecks(migrated.conn);
+    }
+    legacy.close();
+    legacy_open = false;
+
+    var reopened = try Client.init(testing.allocator, pref_path);
+    defer reopened.deinit();
+    try testing.expectEqual(schema.CURRENT_VERSION, try testUserVersion(reopened.conn));
+    try testing.expect(try schema.testHasColumn(reopened.conn, "threads", "reasoning_variant"));
+    try testExpectRowCount(reopened.conn, "messages", 5);
+    var loaded = (try reopened.load(testing.allocator)).?;
+    defer loaded.deinit();
+    try testExpectLegacyFixtureState(loaded.value, null);
+    try testExpectDatabaseChecks(reopened.conn);
+}
+
 test "schema migration is idempotent across repeated client initialization" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -923,6 +972,45 @@ test "newer schema version is rejected without touching the database" {
     defer marker.deinit();
     try testing.expectEqualStrings("future data Ω", marker.text(0));
     try testing.expect(!try schema.testHasColumn(conn, "future_marker", "reasoning_variant"));
+}
+
+test "newer WAL schema rejection leaves WAL state untouched" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+
+    const future = try testCreateLegacyWalFixture(pref_path);
+    defer future.close();
+    try future.execNoArgs(
+        \\create table future_marker (id integer primary key, value text not null);
+        \\insert into future_marker (id, value) values (1, 'future WAL data Ω');
+        \\pragma user_version = 2;
+    );
+    _ = try tmp.dir.statFile(testing.io, STATE_DB_NAME ++ "-wal", .{});
+    _ = try tmp.dir.statFile(testing.io, STATE_DB_NAME ++ "-shm", .{});
+
+    const main_before = try tmp.dir.readFileAlloc(testing.io, STATE_DB_NAME, testing.allocator, .unlimited);
+    defer testing.allocator.free(main_before);
+    const wal_before = try tmp.dir.readFileAlloc(testing.io, STATE_DB_NAME ++ "-wal", testing.allocator, .unlimited);
+    defer testing.allocator.free(wal_before);
+    try testing.expectError(error.DatabaseSchemaTooNew, Client.init(testing.allocator, pref_path));
+
+    const main_after = try tmp.dir.readFileAlloc(testing.io, STATE_DB_NAME, testing.allocator, .unlimited);
+    defer testing.allocator.free(main_after);
+    const wal_after = try tmp.dir.readFileAlloc(testing.io, STATE_DB_NAME ++ "-wal", testing.allocator, .unlimited);
+    defer testing.allocator.free(wal_after);
+    try testing.expectEqualSlices(u8, main_before, main_after);
+    try testing.expectEqualSlices(u8, wal_before, wal_after);
+    // SQLite may update volatile WAL-index read marks while opening a
+    // connection, even when the database and WAL receive no writes.
+    _ = try tmp.dir.statFile(testing.io, STATE_DB_NAME ++ "-shm", .{});
+
+    try testing.expectEqual(@as(i64, 2), try testUserVersion(future));
+    var marker = (try future.row("select value from future_marker where id = 1", .{})).?;
+    defer marker.deinit();
+    try testing.expectEqualStrings("future WAL data Ω", marker.text(0));
+    try testing.expect(!try schema.testHasColumn(future, "future_marker", "reasoning_variant"));
 }
 
 test "terminal surface states survive state saves and clear explicitly" {

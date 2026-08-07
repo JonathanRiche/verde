@@ -10,6 +10,7 @@ pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 256 * 1024;
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_TIMEOUT_MS: u32 = 5000;
 const WINDOWS_PIPE_BUFFER_BYTES: usize = 64 * 1024;
+const RESPONSE_TOO_LARGE_RESPONSE = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":\"response_too_large\",\"message\":\"response exceeds transport limit\"}}";
 
 pub const Options = struct {
     /// Maximum request size. Kept under the historical field name so existing
@@ -32,6 +33,9 @@ pub const ServerCallbacks = struct {
     context: *anyopaque,
     should_stop: *const fn (context: *anyopaque) bool,
     handle_request: *const fn (context: *anyopaque, request: []u8) anyerror![]u8,
+    /// Runs after the transport has acquired exclusive endpoint ownership.
+    /// Servers use this to publish state and start lifetime-dependent workers.
+    on_ready: ?*const fn (context: *anyopaque) anyerror!void = null,
 };
 
 /// Serves newline-delimited messages until the callback requests shutdown.
@@ -92,15 +96,21 @@ fn serveUnix(
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
 
-    // Do not unlink a live instance: existing hooks retain this pathname and
-    // would otherwise be stranded on an anonymous listening descriptor.
-    if (unixEndpointAcceptsConnections(io, endpoint)) return error.EndpointInUse;
-    deleteUnixEndpoint(io, endpoint);
+    var endpoint_guard = try UnixEndpointGuard.acquire(allocator, io, endpoint);
+    defer endpoint_guard.deinit();
+    // The lock serializes the probe, reclaim, and bind with every Verde
+    // server using this transport, closing the check/unlink/listen TOCTOU.
+    try endpoint_guard.reclaimStaleEndpoint();
 
     const address = try std.Io.net.UnixAddress.init(endpoint);
     var listener = try address.listen(io, .{});
     defer listener.deinit(io);
-    defer deleteUnixEndpoint(io, endpoint);
+    endpoint_guard.claimListener();
+    // The guard remains held while the listener is live. Re-checking the
+    // claim before unlink prevents cleanup from deleting a replacement path.
+    defer endpoint_guard.deleteIfOwned();
+
+    if (callbacks.on_ready) |on_ready| try on_ready(callbacks.context);
 
     while (!callbacks.should_stop(callbacks.context)) {
         const stream = listener.accept(io) catch |err| switch (err) {
@@ -128,13 +138,49 @@ fn handleUnixClient(
     ) catch return;
     const response = callbacks.handle_request(callbacks.context, request) catch return;
     defer allocator.free(response);
-    if (response.len > options.max_response_bytes) return;
+    const response_to_write = if (response.len <= options.max_response_bytes)
+        response
+    else
+        RESPONSE_TOO_LARGE_RESPONSE;
 
-    var write_buffer: [64 * 1024]u8 = undefined;
-    var writer = stream.writer(io, &write_buffer);
-    writer.interface.writeAll(response) catch return;
-    writer.interface.writeByte('\n') catch return;
-    writer.interface.flush() catch return;
+    // Keep a stalled peer from holding the single-threaded accept loop hostage.
+    const deadline = deadlineFromNow(options.timeout_ms);
+    writeUnixAllWithDeadline(stream, response_to_write, deadline) catch return;
+    writeUnixAllWithDeadline(stream, "\n", deadline) catch return;
+}
+
+fn writeUnixAllWithDeadline(stream: std.Io.net.Stream, bytes: []const u8, deadline: u64) !void {
+    comptime if (builtin.os.tag == .windows) @compileError("Unix transport helper on Windows");
+
+    var remaining = bytes;
+    while (remaining.len > 0) {
+        const remaining_ms = remainingTimeoutMs(deadline) orelse return error.ConnectionTimedOut;
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = stream.socket.handle,
+            .events = std.posix.POLL.OUT,
+            .revents = 0,
+        }};
+        const poll_timeout: i32 = @intCast(@min(remaining_ms, std.math.maxInt(i32)));
+        const ready = try std.posix.poll(&poll_fds, poll_timeout);
+        if (ready == 0) return error.ConnectionTimedOut;
+        if (poll_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) {
+            return error.ConnectionResetByPeer;
+        }
+
+        const written_raw = std.c.send(
+            stream.socket.handle,
+            remaining.ptr,
+            remaining.len,
+            std.posix.MSG.NOSIGNAL | std.posix.MSG.DONTWAIT,
+        );
+        if (written_raw < 0) switch (std.posix.errno(written_raw)) {
+            .AGAIN, .INTR => continue,
+            else => return error.ConnectionResetByPeer,
+        };
+        const written: usize = @intCast(written_raw);
+        if (written == 0) return error.ConnectionResetByPeer;
+        remaining = remaining[written..];
+    }
 }
 
 fn readUnixLineAlloc(
@@ -199,6 +245,71 @@ pub fn unixEndpointAcceptsConnections(io: std.Io, endpoint: []const u8) bool {
     return true;
 }
 
+/// Holds an advisory lock beside a Unix endpoint for the complete reclaim and
+/// listener lifetime. The lock file is intentionally persistent; its inode is
+/// the cross-process coordination object, while the socket pathname is owned
+/// only by the listener that successfully claimed it.
+pub const UnixEndpointGuard = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    endpoint: []const u8,
+    lock_file: std.Io.File,
+    listener_claimed: bool = false,
+
+    pub fn acquire(allocator: std.mem.Allocator, io: std.Io, endpoint: []const u8) !UnixEndpointGuard {
+        const lock_path = try unixEndpointLockPathAlloc(allocator, endpoint);
+        defer allocator.free(lock_path);
+        var lock_file = if (std.fs.path.isAbsolute(lock_path))
+            std.Io.Dir.createFileAbsolute(io, lock_path, .{ .read = true, .lock = .exclusive, .lock_nonblocking = true }) catch |err|
+                return switch (err) {
+                    error.WouldBlock => error.EndpointInUse,
+                    else => err,
+                }
+        else
+            std.Io.Dir.cwd().createFile(io, lock_path, .{ .read = true, .lock = .exclusive, .lock_nonblocking = true }) catch |err|
+                return switch (err) {
+                    error.WouldBlock => error.EndpointInUse,
+                    else => err,
+                };
+        errdefer lock_file.close(io);
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .endpoint = endpoint,
+            .lock_file = lock_file,
+        };
+    }
+
+    pub fn reclaimStaleEndpoint(self: *UnixEndpointGuard) !void {
+        // Do not unlink a live instance: existing hooks retain this pathname
+        // and would otherwise be stranded on an anonymous listening descriptor.
+        if (unixEndpointAcceptsConnections(self.io, self.endpoint)) return error.EndpointInUse;
+        deleteUnixEndpoint(self.io, self.endpoint);
+    }
+
+    pub fn claimListener(self: *UnixEndpointGuard) void {
+        self.listener_claimed = true;
+    }
+
+    pub fn deleteIfOwned(self: *UnixEndpointGuard) void {
+        if (!self.listener_claimed) return;
+        self.listener_claimed = false;
+        // The exclusive lock is the ownership re-check: another compliant
+        // daemon cannot reclaim or bind this pathname until this guard closes.
+        deleteUnixEndpoint(self.io, self.endpoint);
+    }
+
+    pub fn deinit(self: *UnixEndpointGuard) void {
+        self.deleteIfOwned();
+        self.lock_file.close(self.io);
+        self.* = undefined;
+    }
+};
+
+fn unixEndpointLockPathAlloc(allocator: std.mem.Allocator, endpoint: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}.lock", .{endpoint});
+}
+
 fn deleteUnixEndpoint(io: std.Io, endpoint: []const u8) void {
     std.Io.Dir.deleteFileAbsolute(io, endpoint) catch {};
 }
@@ -211,6 +322,8 @@ fn serveWindows(
 ) !void {
     const pipe = try createWindowsPipe(allocator, endpoint, options);
     defer windows.CloseHandle(pipe);
+
+    if (callbacks.on_ready) |on_ready| try on_ready(callbacks.context);
 
     // Keep the FIRST_PIPE_INSTANCE handle for the server lifetime. A client can
     // retain its disconnected handle briefly, so closing and recreating this
@@ -231,10 +344,13 @@ fn serveWindows(
         const request = readWindowsLineAlloc(allocator, pipe, options) catch continue;
         const response = callbacks.handle_request(callbacks.context, request) catch continue;
         defer allocator.free(response);
-        if (response.len > options.max_response_bytes) continue;
+        const response_to_write = if (response.len <= options.max_response_bytes)
+            response
+        else
+            RESPONSE_TOO_LARGE_RESPONSE;
 
         const deadline = deadlineFromNow(options.timeout_ms);
-        writeWindowsAll(pipe, response, deadline) catch continue;
+        writeWindowsAll(pipe, response_to_write, deadline) catch continue;
         writeWindowsAll(pipe, "\n", deadline) catch continue;
         // DisconnectNamedPipe discards unread bytes. Wait until the client has
         // consumed the complete newline-delimited reply before the loop's
@@ -714,6 +830,13 @@ test "pipe security descriptor excludes broad principals" {
 test "named pipe clients prevent server impersonation" {
     try std.testing.expect(WINDOWS_PIPE_CLIENT_FLAGS & SECURITY_SQOS_PRESENT != 0);
     try std.testing.expect(WINDOWS_PIPE_CLIENT_FLAGS & SECURITY_IDENTIFICATION != 0);
+}
+
+test "unix endpoint guard derives a neighboring lock path" {
+    const allocator = std.testing.allocator;
+    const lock_path = try unixEndpointLockPathAlloc(allocator, "/tmp/verde-sessionizer.sock");
+    defer allocator.free(lock_path);
+    try std.testing.expectEqualStrings("/tmp/verde-sessionizer.sock.lock", lock_path);
 }
 
 test "message limits are release invariant" {
