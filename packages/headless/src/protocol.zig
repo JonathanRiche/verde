@@ -51,11 +51,17 @@ pub const ERR_RESOURCE_NOT_FOUND: []const u8 = "resource_not_found";
 pub const ERR_INTERNAL: []const u8 = "internal";
 pub const ERR_CONFLICT: []const u8 = "conflict";
 pub const ERR_INVALID_STATE: []const u8 = "invalid_state";
+pub const ERR_STORE_BUSY: []const u8 = "store_busy";
+pub const ERR_SCHEMA_TOO_NEW: []const u8 = "schema_too_new";
+pub const ERR_STORE_CORRUPT: []const u8 = "store_corrupt";
+pub const ERR_STORE_UNAVAILABLE: []const u8 = "store_unavailable";
 
 /// Typed protocol error carried inside a response envelope.
 pub const Error = struct {
     code: []const u8,
     message: []const u8,
+    /// Optional structured details; omitted from the wire when absent.
+    data: ?std.json.Value = null,
 };
 
 /// Stable names for independently negotiable optional runtime features.
@@ -315,8 +321,19 @@ pub fn encodeOkResponse(allocator: std.mem.Allocator, id: u64, result: anytype) 
     return try writer.toOwnedSlice();
 }
 
-/// Encode an error response envelope (jsonrpc + id + error{code,message}).
+/// Encode an error response envelope (jsonrpc + id + error{code,message,data}).
 pub fn encodeErrorResponse(allocator: std.mem.Allocator, id: u64, code: []const u8, message: []const u8) ![]u8 {
+    return encodeErrorResponseWithData(allocator, id, code, message, null);
+}
+
+/// Encode an error response envelope with optional structured error details.
+pub fn encodeErrorResponseWithData(
+    allocator: std.mem.Allocator,
+    id: u64,
+    code: []const u8,
+    message: []const u8,
+    data: ?std.json.Value,
+) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
     var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
@@ -331,6 +348,10 @@ pub fn encodeErrorResponse(allocator: std.mem.Allocator, id: u64, code: []const 
     try s.write(code);
     try s.objectField("message");
     try s.write(message);
+    if (data) |payload| {
+        try s.objectField("data");
+        try s.write(payload);
+    }
     try s.endObject();
     try s.endObject();
     return try writer.toOwnedSlice();
@@ -407,11 +428,12 @@ pub fn parseResponse(allocator: std.mem.Allocator, json_bytes: []const u8) !Pars
         if (err_value != .object) return error.InvalidRequest;
         const code = jsonString(err_value.object.get("code") orelse .null) orelse return error.InvalidRequest;
         const message = jsonString(err_value.object.get("message") orelse .null) orelse "";
+        const data = err_value.object.get("data");
         return .{
             .arena_parsed = parsed,
             .response = .{
                 .id = id,
-                .err = .{ .code = code, .message = message },
+                .err = .{ .code = code, .message = message, .data = data },
             },
         };
     }
@@ -504,6 +526,75 @@ test "parseResponse reads error envelopes" {
     try std.testing.expectEqual(@as(?u64, 7), parsed.response.id);
     try std.testing.expectEqualStrings(ERR_UNKNOWN_METHOD, parsed.response.err.?.code);
     try std.testing.expectEqualStrings("nope", parsed.response.err.?.message);
+}
+
+test "error response without data remains byte compatible" {
+    const allocator = std.testing.allocator;
+    const err_json = try encodeErrorResponse(allocator, 7, ERR_UNKNOWN_METHOD, "nope");
+    defer allocator.free(err_json);
+
+    try std.testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":\"unknown_method\",\"message\":\"nope\"}}",
+        err_json,
+    );
+}
+
+test "error data round trips as a structured JSON value" {
+    const allocator = std.testing.allocator;
+    var data_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"expected_store_revision\":4,\"resource\":\"workspace\"}",
+        .{},
+    );
+    defer data_parsed.deinit();
+
+    const err_json = try encodeErrorResponseWithData(
+        allocator,
+        8,
+        ERR_CONFLICT,
+        "store revision conflict",
+        data_parsed.value,
+    );
+    defer allocator.free(err_json);
+
+    var parsed = try parseResponse(allocator, err_json);
+    defer parsed.deinit();
+    const err = parsed.response.err.?;
+    try std.testing.expectEqualStrings(ERR_CONFLICT, err.code);
+    try std.testing.expectEqualStrings("store revision conflict", err.message);
+    try std.testing.expect(err.data != null);
+    const data = err.data.?.object;
+    try std.testing.expectEqual(@as(i64, 4), data.get("expected_store_revision").?.integer);
+    try std.testing.expectEqualStrings("workspace", data.get("resource").?.string);
+}
+
+test "legacy error decoders tolerate the optional data field" {
+    const LegacyError = struct {
+        code: []const u8,
+        message: []const u8,
+    };
+    const LegacyResponse = struct {
+        jsonrpc: []const u8,
+        id: u64,
+        @"error": LegacyError,
+    };
+    const raw =
+        "{\"jsonrpc\":\"2.0\",\"id\":9,\"error\":{\"code\":\"conflict\",\"message\":\"stale\",\"data\":{\"expected_store_revision\":4}}}";
+
+    var parsed = try std.json.parseFromSlice(LegacyResponse, std.testing.allocator, raw, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("conflict", parsed.value.@"error".code);
+    try std.testing.expectEqualStrings("stale", parsed.value.@"error".message);
+}
+
+test "storage error codes retain their stable wire values" {
+    try std.testing.expectEqualStrings("store_busy", ERR_STORE_BUSY);
+    try std.testing.expectEqualStrings("schema_too_new", ERR_SCHEMA_TOO_NEW);
+    try std.testing.expectEqualStrings("store_corrupt", ERR_STORE_CORRUPT);
+    try std.testing.expectEqualStrings("store_unavailable", ERR_STORE_UNAVAILABLE);
 }
 
 test "parseResponse accepts null id on error envelopes" {
