@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const headless = @import("headless");
 
 const args = @import("args.zig");
 const completion = @import("completion.zig");
@@ -3782,22 +3783,20 @@ fn mcpToolsCall(
             mcpArgU32(arguments, "text_limit") orelse 12_000,
         );
         defer allocator.free(script);
-        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, workspace, script, 3_000) catch |err| {
-            return try mcpError(allocator, out, id_value, -32000, @errorName(err));
-        };
+        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, workspace, script, 3_000) catch |err|
+            return try mcpLiveCallError(allocator, out, id_value, tool_name, err);
         defer allocator.free(response);
-        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+        return try mcpToolLiveTextResult(allocator, out, id_value, response, tool_name);
     }
     if (std.mem.eql(u8, tool_name, "click_browser_element")) {
         const selector = mcpArgString(arguments, "selector") orelse
             return try mcpError(allocator, out, id_value, -32602, "click_browser_element requires selector");
         const script = try mcpBrowserClickScriptAlloc(allocator, selector, mcpArgBool(arguments, "confirmed") orelse false);
         defer allocator.free(script);
-        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, workspace, script, 3_000) catch |err| {
-            return try mcpError(allocator, out, id_value, -32000, @errorName(err));
-        };
+        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, workspace, script, 3_000) catch |err|
+            return try mcpLiveCallError(allocator, out, id_value, tool_name, err);
         defer allocator.free(response);
-        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+        return try mcpToolLiveTextResult(allocator, out, id_value, response, tool_name);
     }
     if (std.mem.eql(u8, tool_name, "type_browser_text")) {
         const selector = mcpArgString(arguments, "selector") orelse
@@ -3812,18 +3811,16 @@ fn mcpToolsCall(
             mcpArgBool(arguments, "confirmed") orelse false,
         );
         defer allocator.free(script);
-        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, workspace, script, 3_000) catch |err| {
-            return try mcpError(allocator, out, id_value, -32000, @errorName(err));
-        };
+        const response = mcpBrowserEvalAndWaitAlloc(allocator, io, workspace, script, 3_000) catch |err|
+            return try mcpLiveCallError(allocator, out, id_value, tool_name, err);
         defer allocator.free(response);
-        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+        return try mcpToolLiveTextResult(allocator, out, id_value, response, tool_name);
     }
     if (std.mem.eql(u8, tool_name, "capture_browser_screenshot")) {
-        const response = sendLiveRequestAlloc(allocator, io, "browser.screenshot", .{ .workspace = workspace }, 1) catch |err| {
-            return try mcpError(allocator, out, id_value, -32000, @errorName(err));
-        };
+        const response = sendLiveRequestAlloc(allocator, io, "browser.screenshot", .{ .workspace = workspace }, 1) catch |err|
+            return try mcpLiveCallError(allocator, out, id_value, tool_name, err);
         defer allocator.free(response);
-        return try mcpToolScreenshotResult(allocator, out, id_value, response, tool_name);
+        return try mcpToolLiveScreenshotResult(allocator, out, id_value, response, tool_name);
     }
     if (std.mem.eql(u8, tool_name, "evaluate_browser_js")) {
         const script = mcpArgString(arguments, "script") orelse
@@ -3834,9 +3831,9 @@ fn mcpToolsCall(
             workspace,
             script,
             @min(mcpArgU32(arguments, "timeout_ms") orelse 3_000, 60_000),
-        ) catch |err| return try mcpError(allocator, out, id_value, -32000, @errorName(err));
+        ) catch |err| return try mcpLiveCallError(allocator, out, id_value, tool_name, err);
         defer allocator.free(response);
-        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+        return try mcpToolLiveTextResult(allocator, out, id_value, response, tool_name);
     }
     if (std.mem.eql(u8, tool_name, "browser_pointer_input")) {
         const action = mcpArgString(arguments, "action") orelse
@@ -3851,7 +3848,7 @@ fn mcpToolsCall(
             return try mcpError(allocator, out, id_value, -32602, "invalid browser pointer action");
         const x = mcpArgF32(arguments, "x") orelse return try mcpError(allocator, out, id_value, -32602, "browser_pointer_input requires x");
         const y = mcpArgF32(arguments, "y") orelse return try mcpError(allocator, out, id_value, -32602, "browser_pointer_input requires y");
-        const response = try sendLiveRequestAlloc(allocator, io, method, .{
+        const response = sendLiveRequestAlloc(allocator, io, method, .{
             .workspace = workspace,
             .x = x,
             .y = y,
@@ -3860,9 +3857,9 @@ fn mcpToolsCall(
             .shift = mcpArgBool(arguments, "shift") orelse false,
             .alt = mcpArgBool(arguments, "alt") orelse false,
             .super = mcpArgBool(arguments, "super") orelse false,
-        }, 1);
+        }, 1) catch |err| return try mcpLiveCallError(allocator, out, id_value, tool_name, err);
         defer allocator.free(response);
-        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+        return try mcpToolLiveTextResult(allocator, out, id_value, response, tool_name);
     }
     if (std.mem.eql(u8, tool_name, "wait_for_process")) {
         const process_id = mcpArgString(arguments, "process_id") orelse
@@ -4134,10 +4131,10 @@ fn mcpToolsCall(
         }
         return try mcpError(allocator, out, id_value, -32602, "unknown tool");
     } catch |err| {
-        return try mcpError(allocator, out, id_value, -32000, @errorName(err));
+        return try mcpLiveCallError(allocator, out, id_value, tool_name, err);
     };
     defer allocator.free(response);
-    try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+    try mcpToolLiveTextResult(allocator, out, id_value, response, tool_name);
 }
 
 fn mcpDaemonSessionCallAlloc(
@@ -4593,6 +4590,222 @@ fn mcpToolTextResult(
     try out.stdout("{s}\n", .{writer.written()});
 }
 
+const McpUnavailableCapability = struct {
+    name: []const u8,
+    message: []const u8,
+};
+
+fn mcpHeadlessUnavailableCapability(feature: headless.CapabilityFeature) McpUnavailableCapability {
+    const err = headless.capabilityUnavailable(feature);
+    return .{ .name = feature.wireName(), .message = err.message };
+}
+
+fn mcpUnavailableCapability(tool_name: []const u8) ?McpUnavailableCapability {
+    if (std.mem.eql(u8, tool_name, "list_panes")) {
+        return .{
+            .name = "presentation.panes",
+            .message = "presentation.panes capability is unavailable",
+        };
+    }
+    if (std.mem.eql(u8, tool_name, "read_surface_screen")) {
+        return mcpHeadlessUnavailableCapability(.terminal_grid);
+    }
+    if (std.mem.eql(u8, tool_name, "browser_status")) {
+        return mcpHeadlessUnavailableCapability(.browser_session_state);
+    }
+    if (std.mem.eql(u8, tool_name, "open_browser")) {
+        return mcpHeadlessUnavailableCapability(.browser_create);
+    }
+    if (std.mem.eql(u8, tool_name, "navigate_browser")) {
+        return mcpHeadlessUnavailableCapability(.browser_navigation);
+    }
+    if (std.mem.eql(u8, tool_name, "restart_browser")) {
+        return mcpHeadlessUnavailableCapability(.browser_lifecycle_restart);
+    }
+    if (std.mem.eql(u8, tool_name, "reset_browser")) {
+        return mcpHeadlessUnavailableCapability(.browser_lifecycle_reset);
+    }
+    if (std.mem.eql(u8, tool_name, "evaluate_browser_js")) {
+        return mcpHeadlessUnavailableCapability(.browser_javascript_eval);
+    }
+    if (std.mem.eql(u8, tool_name, "browser_pointer_input")) {
+        return mcpHeadlessUnavailableCapability(.browser_low_level_pointer);
+    }
+    if (std.mem.eql(u8, tool_name, "inspect_browser_page")) {
+        return mcpHeadlessUnavailableCapability(.browser_dom_inspection);
+    }
+    if (std.mem.eql(u8, tool_name, "click_browser_element")) {
+        return mcpHeadlessUnavailableCapability(.browser_selector_actions);
+    }
+    if (std.mem.eql(u8, tool_name, "type_browser_text")) {
+        return mcpHeadlessUnavailableCapability(.browser_form_input);
+    }
+    if (std.mem.eql(u8, tool_name, "capture_browser_screenshot")) {
+        return mcpHeadlessUnavailableCapability(.browser_screenshot);
+    }
+    return null;
+}
+
+fn mcpLiveResponseCapabilityUnavailable(allocator: std.mem.Allocator, response: []const u8) bool {
+    const capability_error = mcpLiveResponseCapabilityErrorAlloc(allocator, response) catch return false;
+    if (capability_error) |value| {
+        if (value.detail) |detail| allocator.free(detail);
+        return true;
+    }
+    return false;
+}
+
+fn mcpCapabilityUnavailableTextAlloc(
+    allocator: std.mem.Allocator,
+    capability: McpUnavailableCapability,
+    detail: ?[]const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    try s.objectField("ok");
+    try s.write(false);
+    try s.objectField("error");
+    try s.beginObject();
+    try s.objectField("code");
+    try s.write(headless.protocol.ERR_CAPABILITY_UNAVAILABLE);
+    try s.objectField("message");
+    try s.write(capability.message);
+    if (detail) |value| {
+        try s.objectField("detail");
+        try s.write(value);
+    }
+    try s.objectField("capability");
+    try s.write(capability.name);
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+fn mcpToolCapabilityUnavailable(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    id_value: std.json.Value,
+    capability: McpUnavailableCapability,
+    detail: ?[]const u8,
+) !void {
+    const response = try mcpCapabilityUnavailableResponseAlloc(allocator, id_value, capability, detail);
+    defer allocator.free(response);
+    try out.stdout("{s}\n", .{response});
+}
+
+fn mcpCapabilityUnavailableResponseAlloc(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    capability: McpUnavailableCapability,
+    detail: ?[]const u8,
+) ![]u8 {
+    const text_payload = try mcpCapabilityUnavailableTextAlloc(allocator, capability, detail);
+    defer allocator.free(text_payload);
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try mcpBeginResult(&s, id_value);
+    try s.beginObject();
+    try s.objectField("content");
+    try s.beginArray();
+    try s.beginObject();
+    try s.objectField("type");
+    try s.write("text");
+    try s.objectField("text");
+    try s.write(text_payload);
+    try s.endObject();
+    try s.endArray();
+    try s.objectField("isError");
+    try s.write(true);
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+fn mcpLiveUnavailableError(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    id_value: std.json.Value,
+    tool_name: []const u8,
+) !void {
+    const capability = mcpUnavailableCapability(tool_name) orelse
+        return mcpError(allocator, out, id_value, -32000, "Live socket unavailable");
+    return mcpToolCapabilityUnavailable(allocator, out, id_value, capability, null);
+}
+
+fn isLiveSocketUnavailable(err: anyerror) bool {
+    return err == error.FileNotFound or
+        err == error.ConnectionRefused;
+}
+
+const McpLiveCallRoute = enum {
+    capability_unavailable,
+    numeric,
+};
+
+fn mcpLiveCallRoute(tool_name: []const u8, err: anyerror) McpLiveCallRoute {
+    return if (isLiveSocketUnavailable(err) and mcpUnavailableCapability(tool_name) != null)
+        .capability_unavailable
+    else
+        .numeric;
+}
+
+fn mcpLiveCallError(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    id_value: std.json.Value,
+    tool_name: []const u8,
+    err: anyerror,
+) !void {
+    switch (mcpLiveCallRoute(tool_name, err)) {
+        .capability_unavailable => return mcpLiveUnavailableError(allocator, out, id_value, tool_name),
+        .numeric => return mcpError(allocator, out, id_value, -32000, @errorName(err)),
+    }
+}
+
+const McpLiveCapabilityError = struct {
+    detail: ?[]u8,
+};
+
+fn mcpLiveResponseCapabilityErrorAlloc(
+    allocator: std.mem.Allocator,
+    response: []const u8,
+) !?McpLiveCapabilityError {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    if (jsonBool(parsed.value.object.get("ok") orelse .null) orelse false) return null;
+    const err = parsed.value.object.get("error") orelse return null;
+    if (err != .object) return null;
+    const code = jsonString(err.object.get("code") orelse .null) orelse return null;
+    if (!std.mem.eql(u8, code, headless.protocol.ERR_CAPABILITY_UNAVAILABLE) and
+        !std.mem.eql(u8, code, "unsupported")) return null;
+    const detail = if (jsonString(err.object.get("message") orelse .null)) |message|
+        try allocator.dupe(u8, message)
+    else
+        null;
+    return .{ .detail = detail };
+}
+
+fn mcpToolLiveTextResult(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    id_value: std.json.Value,
+    response: []const u8,
+    tool_name: []const u8,
+) !void {
+    if (mcpUnavailableCapability(tool_name)) |capability| {
+        if (try mcpLiveResponseCapabilityErrorAlloc(allocator, response)) |live_error| {
+            defer if (live_error.detail) |detail| allocator.free(detail);
+            return mcpToolCapabilityUnavailable(allocator, out, id_value, capability, live_error.detail);
+        }
+    }
+    return mcpToolTextResult(allocator, out, id_value, response, tool_name);
+}
+
 fn mcpToolScreenshotResult(
     allocator: std.mem.Allocator,
     out: output.Output,
@@ -4654,6 +4867,22 @@ fn mcpToolScreenshotResult(
     try s.endObject();
     try s.endObject();
     try out.stdout("{s}\n", .{writer.written()});
+}
+
+fn mcpToolLiveScreenshotResult(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    id_value: std.json.Value,
+    response: []const u8,
+    tool_name: []const u8,
+) !void {
+    if (mcpUnavailableCapability(tool_name)) |capability| {
+        if (try mcpLiveResponseCapabilityErrorAlloc(allocator, response)) |live_error| {
+            defer if (live_error.detail) |detail| allocator.free(detail);
+            return mcpToolCapabilityUnavailable(allocator, out, id_value, capability, live_error.detail);
+        }
+    }
+    return mcpToolScreenshotResult(allocator, out, id_value, response, tool_name);
 }
 
 fn mcpError(allocator: std.mem.Allocator, out: output.Output, id_value: std.json.Value, code: i32, message: []const u8) !void {
@@ -5491,4 +5720,120 @@ test "browser MCP scripts JSON-escape selectors and typed text" {
     defer allocator.free(typed);
     try std.testing.expect(std.mem.indexOf(u8, typed, "hello\\nworld") != null);
     try std.testing.expect(std.mem.indexOf(u8, typed, "requestSubmit") != null);
+}
+
+test "MCP unavailable mapping is limited to presentation and optional capability tools" {
+    const browser = mcpUnavailableCapability("capture_browser_screenshot") orelse
+        return error.MissingBrowserCapabilityMapping;
+    try std.testing.expectEqualStrings("browser.screenshot", browser.name);
+    try std.testing.expectEqualStrings("browser.screenshot capability is unavailable", browser.message);
+
+    const panes = mcpUnavailableCapability("list_panes") orelse
+        return error.MissingPresentationCapabilityMapping;
+    try std.testing.expectEqualStrings("presentation.panes", panes.name);
+    const grid = mcpUnavailableCapability("read_surface_screen") orelse
+        return error.MissingTerminalGridCapabilityMapping;
+    try std.testing.expectEqualStrings("terminal_grid", grid.name);
+
+    // Daemon-domain and raw terminal operations retain their existing transport errors.
+    try std.testing.expect(mcpUnavailableCapability("list_workspaces") == null);
+    try std.testing.expect(mcpUnavailableCapability("tail_surface_output") == null);
+    try std.testing.expect(mcpUnavailableCapability("write_surface_text") == null);
+    try std.testing.expect(mcpUnavailableCapability("send_terminal_key") == null);
+}
+
+test "MCP capability unavailable is a tool execution error with stable text JSON" {
+    const allocator = std.testing.allocator;
+    const capability = mcpUnavailableCapability("evaluate_browser_js") orelse
+        return error.MissingBrowserCapabilityMapping;
+    const response = try mcpCapabilityUnavailableResponseAlloc(
+        allocator,
+        .{ .integer = 7 },
+        capability,
+        null,
+    );
+    defer allocator.free(response);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?;
+    try std.testing.expect(jsonBool(result.object.get("isError") orelse .null) orelse false);
+    const content = result.object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), content.len);
+    const text_payload = jsonString(content[0].object.get("text") orelse .null).?;
+
+    var text = try std.json.parseFromSlice(std.json.Value, allocator, text_payload, .{});
+    defer text.deinit();
+    try std.testing.expect(!(jsonBool(text.value.object.get("ok") orelse .null) orelse true));
+    const err = text.value.object.get("error").?;
+    try std.testing.expectEqualStrings(
+        headless.protocol.ERR_CAPABILITY_UNAVAILABLE,
+        jsonString(err.object.get("code") orelse .null).?,
+    );
+    try std.testing.expectEqualStrings(
+        "browser.javascript_eval",
+        jsonString(err.object.get("capability") orelse .null).?,
+    );
+}
+
+test "MCP maps only capability-shaped Live business errors" {
+    const allocator = std.testing.allocator;
+    const diagnostic_response =
+        "{\"id\":1,\"ok\":false,\"error\":{\"code\":\"unsupported\",\"message\":\"browser runtime is disabled\"}}";
+    try std.testing.expect(mcpLiveResponseCapabilityUnavailable(
+        allocator,
+        diagnostic_response,
+    ));
+    try std.testing.expect(mcpLiveResponseCapabilityUnavailable(
+        allocator,
+        "{\"id\":1,\"ok\":false,\"error\":{\"code\":\"capability_unavailable\",\"message\":\"missing\"}}",
+    ));
+    try std.testing.expect(!mcpLiveResponseCapabilityUnavailable(
+        allocator,
+        "{\"id\":1,\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"missing pane\"}}",
+    ));
+    const live_error = (try mcpLiveResponseCapabilityErrorAlloc(allocator, diagnostic_response)) orelse
+        return error.MissingCapabilityDiagnostic;
+    defer if (live_error.detail) |detail| allocator.free(detail);
+    try std.testing.expectEqualStrings("browser runtime is disabled", live_error.detail.?);
+
+    try std.testing.expect(isLiveSocketUnavailable(error.FileNotFound));
+    try std.testing.expect(isLiveSocketUnavailable(error.ConnectionRefused));
+    try std.testing.expect(!isLiveSocketUnavailable(error.ConnectionTimedOut));
+    try std.testing.expect(!isLiveSocketUnavailable(error.ConnectionAborted));
+    try std.testing.expect(!isLiveSocketUnavailable(error.ConnectionResetByPeer));
+    try std.testing.expect(!isLiveSocketUnavailable(error.BrowserActionTimeout));
+    try std.testing.expect(!isLiveSocketUnavailable(error.OutOfMemory));
+}
+
+test "MCP Live routing composes business, socket, and numeric branches" {
+    const allocator = std.testing.allocator;
+    const browser_tool = "capture_browser_screenshot";
+    const non_capability_tool = "open_chat";
+    const business_response =
+        "{\"id\":1,\"ok\":false,\"error\":{\"code\":\"unsupported\",\"message\":\"browser runtime is disabled\"}}";
+
+    // Business-error normalization is gated by the C/O capability map.
+    try std.testing.expect(mcpUnavailableCapability(browser_tool) != null);
+    try std.testing.expect(mcpLiveResponseCapabilityUnavailable(allocator, business_response));
+    try std.testing.expect(mcpUnavailableCapability(non_capability_tool) == null);
+
+    // Connect-phase absence maps only for the C/O tool; post-connect failures
+    // and all non-C/O tools retain numeric JSON-RPC errors.
+    try std.testing.expectEqual(
+        McpLiveCallRoute.capability_unavailable,
+        mcpLiveCallRoute(browser_tool, error.ConnectionRefused),
+    );
+    try std.testing.expectEqual(
+        McpLiveCallRoute.numeric,
+        mcpLiveCallRoute(browser_tool, error.ConnectionTimedOut),
+    );
+    try std.testing.expectEqual(
+        McpLiveCallRoute.numeric,
+        mcpLiveCallRoute(non_capability_tool, error.FileNotFound),
+    );
+    try std.testing.expectEqual(
+        McpLiveCallRoute.numeric,
+        mcpLiveCallRoute(non_capability_tool, error.OutOfMemory),
+    );
 }

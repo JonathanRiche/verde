@@ -15,6 +15,9 @@ pub const MAX_SUPPORTED_PROTOCOL_VERSION = protocol.MAX_SUPPORTED_PROTOCOL_VERSI
 pub const ProtocolRange = protocol.ProtocolRange;
 
 pub const Error = protocol.Error;
+pub const CapabilityFeature = protocol.CapabilityFeature;
+pub const BrowserFeatures = protocol.BrowserFeatures;
+pub const BrowserCapabilities = protocol.BrowserCapabilities;
 pub const Capabilities = protocol.Capabilities;
 pub const StatusResult = protocol.StatusResult;
 pub const CapabilitiesResult = protocol.CapabilitiesResult;
@@ -30,6 +33,7 @@ pub const parseRequest = protocol.parseRequest;
 pub const parseResponse = protocol.parseResponse;
 pub const validateProtocolRange = protocol.validateProtocolRange;
 pub const negotiateProtocolVersion = protocol.negotiateProtocolVersion;
+pub const capabilityUnavailable = protocol.capabilityUnavailable;
 
 pub const Context = dispatch.Context;
 pub const DispatchResponse = dispatch.Response;

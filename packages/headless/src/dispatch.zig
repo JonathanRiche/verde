@@ -129,6 +129,8 @@ test "core.status happy path with fake context" {
     try std.testing.expect(!status.capabilities.leases);
     try std.testing.expect(!status.capabilities.browser_execution);
     try std.testing.expect(!status.capabilities.browser_presentation);
+    try std.testing.expect(!status.capabilities.browser.available);
+    try std.testing.expect(!status.capabilities.isFeatureAvailable(.browser_navigation));
 }
 
 test "core.capabilities content" {
@@ -144,6 +146,8 @@ test "core.capabilities content" {
     try std.testing.expectEqual(protocol.MAX_SUPPORTED_PROTOCOL_VERSION, caps.max_supported);
     try std.testing.expect(caps.capabilities.terminal_raw);
     try std.testing.expect(!caps.capabilities.browser_presentation);
+    try std.testing.expect(!caps.capabilities.browser.available);
+    try std.testing.expect(!caps.capabilities.isFeatureAvailable(.browser_screenshot));
 }
 
 test "unknown method yields unknown_method" {
