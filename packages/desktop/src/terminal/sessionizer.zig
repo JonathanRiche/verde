@@ -2113,6 +2113,7 @@ pub const Daemon = struct {
         // 1. Decode typed params OUTSIDE any lock into the per-request arena.
         // parseFromValueLeaky ignores allocate; string slices borrow params,
         // which outlive this call via the parent handleRequest parse.
+        // OutOfMemory is re-raised (never remapped to invalid_params).
         var decode_failed = false;
         var decoded_mutation: ?daemon_store.Mutation = null;
         if (is_status) {
@@ -2123,7 +2124,8 @@ pub const Daemon = struct {
                 arena,
                 params,
                 .{ .ignore_unknown_fields = true },
-            ) catch blk: {
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
                 decode_failed = true;
                 break :blk null;
             };
@@ -2134,7 +2136,8 @@ pub const Daemon = struct {
                 arena,
                 params,
                 .{ .ignore_unknown_fields = true },
-            ) catch blk: {
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
                 decode_failed = true;
                 break :blk null;
             };
@@ -2145,7 +2148,8 @@ pub const Daemon = struct {
                 arena,
                 params,
                 .{ .ignore_unknown_fields = true },
-            ) catch blk: {
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
                 decode_failed = true;
                 break :blk null;
             };
@@ -2156,7 +2160,8 @@ pub const Daemon = struct {
                 arena,
                 params,
                 .{ .ignore_unknown_fields = true },
-            ) catch blk: {
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
                 decode_failed = true;
                 break :blk null;
             };
@@ -2167,7 +2172,8 @@ pub const Daemon = struct {
                 arena,
                 params,
                 .{ .ignore_unknown_fields = true },
-            ) catch blk: {
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
                 decode_failed = true;
                 break :blk null;
             };
@@ -2178,7 +2184,8 @@ pub const Daemon = struct {
                 arena,
                 params,
                 .{ .ignore_unknown_fields = true },
-            ) catch blk: {
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
                 decode_failed = true;
                 break :blk null;
             };
@@ -2189,7 +2196,8 @@ pub const Daemon = struct {
                 arena,
                 params,
                 .{ .ignore_unknown_fields = true },
-            ) catch blk: {
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
                 decode_failed = true;
                 break :blk null;
             };
@@ -2200,7 +2208,8 @@ pub const Daemon = struct {
                 arena,
                 params,
                 .{ .ignore_unknown_fields = true },
-            ) catch blk: {
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
                 decode_failed = true;
                 break :blk null;
             };
@@ -2284,6 +2293,8 @@ pub const Daemon = struct {
             };
             // Store.init always opens at MAX_SUPPORTED_VERSION; read the live
             // pragma under the service mutex so the status reflects the file.
+            // Range-check before cast: a corrupt/negative user_version maps to
+            // store_corrupt rather than panicking in Debug (requiredU32 style).
             const schema_version: u32 = blk: {
                 const row_or_null = service.store.conn.row("pragma user_version", .{}) catch {
                     return try storeErrorResponse(self.allocator, id_value, error.StoreUnavailable);
@@ -2292,7 +2303,9 @@ pub const Daemon = struct {
                     return try storeErrorResponse(self.allocator, id_value, error.StoreCorrupt);
                 };
                 defer row.deinit();
-                break :blk @intCast(row.int(0));
+                break :blk std.math.cast(u32, row.int(0)) orelse {
+                    return try storeErrorResponse(self.allocator, id_value, error.StoreCorrupt);
+                };
             };
             const result: store_protocol.StoreStatusResult = .{
                 .schema_version = schema_version,
@@ -2493,10 +2506,9 @@ pub const Daemon = struct {
         try writeRegistryEnvelope(&s, self);
         try s.objectField("workspace");
         try writeWorkspaceInfo(&s, self, workspace);
-        // `turn:` is reserved for derived chat-turn records. Inspect and wait
-        // both resolve that prefix before any stored managed/tracked/external
-        // id so a future registerExternalProcess with a colliding id cannot
-        // split the two paths.
+        // `turn:` is reserved for derived chat-turn records. On a miss (absent
+        // or consumed), return not-found immediately — never fall through to
+        // stored managed/tracked/external/outcome ids (matches process.wait).
         if (std.mem.startsWith(u8, process_id, "turn:")) {
             const turn_id = process_id["turn:".len..];
             for (self.chat_turns.items) |turn| {
@@ -2510,6 +2522,9 @@ pub const Daemon = struct {
                 try s.endObject();
                 return try writer.toOwnedSlice();
             }
+            const response = try errorResponseAlloc(self.allocator, id_value, headless.registry.ERR_RESOURCE_NOT_FOUND, "process not found");
+            writer.deinit();
+            return response;
         }
         for (workspace.managed_processes.items) |process| {
             if (!std.mem.eql(u8, process.id, process_id) and !std.mem.eql(u8, process.name, process_id)) continue;
@@ -4961,12 +4976,18 @@ fn mutationHeader(mutation: daemon_store.Mutation) store_protocol.MutationHeader
 }
 
 /// Path-valued store-dir override. Caller frees a non-null result.
-fn storeDirFromEnv(allocator: std.mem.Allocator) ?[]u8 {
+/// OutOfMemory propagates so a broken/oom test store fails readiness loudly
+/// (never silently store-less). Missing/empty env → null (store-less daemon).
+fn storeDirFromEnv(allocator: std.mem.Allocator) !?[]u8 {
     const environ: std.process.Environ = if (builtin.os.tag == .windows)
         .{ .block = .global }
     else
         .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
-    const raw = environ.getAlloc(allocator, SESSION_DAEMON_STORE_DIR_ENV_NAME) catch return null;
+    const raw = environ.getAlloc(allocator, SESSION_DAEMON_STORE_DIR_ENV_NAME) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidWtf8 => return null,
+    };
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) {
         allocator.free(raw);
@@ -4975,14 +4996,14 @@ fn storeDirFromEnv(allocator: std.mem.Allocator) ?[]u8 {
     if (trimmed.len == raw.len) return raw;
     const owned = allocator.dupe(u8, trimmed) catch {
         allocator.free(raw);
-        return null;
+        return error.OutOfMemory;
     };
     allocator.free(raw);
     return owned;
 }
 
 fn maybeInitStoreService(daemon: *Daemon) !void {
-    const store_dir = storeDirFromEnv(daemon.allocator) orelse return;
+    const store_dir = (try storeDirFromEnv(daemon.allocator)) orelse return;
     defer daemon.allocator.free(store_dir);
     const db_path = try std.fs.path.join(daemon.allocator, &.{ store_dir, "state.sqlite" });
     defer daemon.allocator.free(db_path);
@@ -5019,12 +5040,18 @@ fn storeErrorResponse(
     return try errorResponseAllocWithData(allocator, id_value, mapped.code, mapped.message, null);
 }
 
-fn requestIsStoreMethod(allocator: std.mem.Allocator, request: []const u8) bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, request, .{}) catch return false;
+/// Single serve-path classification (one JSON parse). Fold W5 slow-work and
+/// S2/S3 store routing so store/normal cannot disagree about lock ownership.
+const ServerRequestClass = enum { slow_registry, store, normal };
+
+fn classifyServerRequest(allocator: std.mem.Allocator, request: []const u8) !ServerRequestClass {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, request, .{});
     defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const method = jsonString(parsed.value.object.get("method") orelse .null) orelse return false;
-    return isStoreMethod(method);
+    if (parsed.value != .object) return error.InvalidRequest;
+    const method = jsonString(parsed.value.object.get("method") orelse .null) orelse return error.InvalidRequest;
+    if (methodNeedsSlowWork(method)) return .slow_registry;
+    if (isStoreMethod(method)) return .store;
+    return .normal;
 }
 
 fn sessionizerServerShouldStop(raw_context: *anyopaque) bool {
@@ -5097,32 +5124,29 @@ fn handleSessionizerServerRequest(raw_context: *anyopaque, request: []u8) anyerr
     defer daemon.allocator.free(request);
     const trimmed = std.mem.trim(u8, request, "\r");
 
-    // Envelope classification happens outside lockDaemon (W5 slow-work seam +
-    // S2 store path). Store handlers take only a short bookkeeping lock.
-    if (requestNeedsSlowWork(daemon.allocator, request)) {
-        return daemon.handleSlowRegistryRequest(daemon.allocator, request) catch |err|
-            errorResponseAlloc(daemon.allocator, .null, "internal_error", @errorName(err));
-    }
-    if (requestIsStoreMethod(daemon.allocator, trimmed)) {
-        return daemon.handleRequest(trimmed) catch |err|
-            errorResponseAlloc(daemon.allocator, .null, "internal_error", @errorName(err));
-    }
-
-    lockDaemon(daemon);
-    const response = daemon.handleRequest(trimmed) catch |err| {
-        daemon.mutex.unlock();
-        return errorResponseAlloc(daemon.allocator, .null, "internal_error", @errorName(err));
+    // One envelope parse outside lockDaemon classifies W5 slow-work vs store vs
+    // normal. Store methods run unlocked (handleStoreRequest takes a short
+    // bookkeeping lock). Classification failure returns invalid_request without
+    // lockDaemon so a later successful re-parse cannot self-deadlock on the
+    // non-reentrant daemon spin mutex (NIT-1/NIT-2).
+    const class = classifyServerRequest(daemon.allocator, trimmed) catch {
+        return errorResponseAlloc(daemon.allocator, .null, "invalid_request", "malformed request");
     };
-    daemon.mutex.unlock();
-    return response;
-}
-
-fn requestNeedsSlowWork(allocator: std.mem.Allocator, request: []const u8) bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, request, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const method = jsonString(parsed.value.object.get("method") orelse .null) orelse return false;
-    return methodNeedsSlowWork(method);
+    switch (class) {
+        .slow_registry => return daemon.handleSlowRegistryRequest(daemon.allocator, request) catch |err|
+            errorResponseAlloc(daemon.allocator, .null, "internal_error", @errorName(err)),
+        .store => return daemon.handleRequest(trimmed) catch |err|
+            errorResponseAlloc(daemon.allocator, .null, "internal_error", @errorName(err)),
+        .normal => {
+            lockDaemon(daemon);
+            const response = daemon.handleRequest(trimmed) catch |err| {
+                daemon.mutex.unlock();
+                return errorResponseAlloc(daemon.allocator, .null, "internal_error", @errorName(err));
+            };
+            daemon.mutex.unlock();
+            return response;
+        },
+    }
 }
 
 fn methodNeedsSlowWork(method: []const u8) bool {
@@ -6380,15 +6404,27 @@ test "process.inspect resolves turn: ids and rejects malformed turn ids" {
         malformed_parsed.value.object.get("error").?.object.get("code").?.string,
     );
 
-    const other_ws = try daemon.handleRequest(
+    // Missing turn: same not-found for both inspect and wait (no stored fall-through).
+    const missing_inspect = try daemon.handleRequest(
         \\{"jsonrpc":"2.0","id":3,"method":"process.inspect","params":{"workspace":{"workspace_id":"turn-inspect"},"process_id":"turn:missing-turn"}}
     );
-    defer allocator.free(other_ws);
-    var other_parsed = try std.json.parseFromSlice(std.json.Value, allocator, other_ws, .{});
-    defer other_parsed.deinit();
+    defer allocator.free(missing_inspect);
+    var missing_inspect_parsed = try std.json.parseFromSlice(std.json.Value, allocator, missing_inspect, .{});
+    defer missing_inspect_parsed.deinit();
     try std.testing.expectEqualStrings(
         headless.registry.ERR_RESOURCE_NOT_FOUND,
-        other_parsed.value.object.get("error").?.object.get("code").?.string,
+        missing_inspect_parsed.value.object.get("error").?.object.get("code").?.string,
+    );
+
+    const missing_wait = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":4,"method":"process.wait","params":{"workspace":{"workspace_id":"turn-inspect"},"process_id":"turn:missing-turn"}}
+    );
+    defer allocator.free(missing_wait);
+    var missing_wait_parsed = try std.json.parseFromSlice(std.json.Value, allocator, missing_wait, .{});
+    defer missing_wait_parsed.deinit();
+    try std.testing.expectEqualStrings(
+        headless.registry.ERR_RESOURCE_NOT_FOUND,
+        missing_wait_parsed.value.object.get("error").?.object.get("code").?.string,
     );
 }
 
@@ -6478,6 +6514,48 @@ test "turn: prefix takes precedence over stored external ids in inspect and wait
     const wait_result = wait_parsed.value.object.get("result").?.object;
     try std.testing.expectEqualStrings("failed", wait_result.get("terminal_state").?.string);
     try std.testing.expect(!wait_result.get("timed_out").?.bool);
+}
+
+test "turn: miss does not fall through to stored external ids in inspect or wait" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    _ = try daemon.registry.ensureWorkspace(allocator, "turn-miss");
+
+    // Only a stored external reuses the turn: prefix; no live chat turn exists.
+    const process = try process_registry.ExternalProcess.init(
+        allocator,
+        "turn-miss",
+        "turn:only-stored",
+        "stored-command",
+        "/tmp/miss",
+        "stored_kind",
+        "Stored title",
+        "client-stored",
+    );
+    _ = try daemon.registry.registerExternalProcess(allocator, "turn-miss", process);
+
+    const inspect = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"process.inspect","params":{"workspace":{"workspace_id":"turn-miss"},"process_id":"turn:only-stored"}}
+    );
+    defer allocator.free(inspect);
+    var inspect_parsed = try std.json.parseFromSlice(std.json.Value, allocator, inspect, .{});
+    defer inspect_parsed.deinit();
+    try std.testing.expectEqualStrings(
+        headless.registry.ERR_RESOURCE_NOT_FOUND,
+        inspect_parsed.value.object.get("error").?.object.get("code").?.string,
+    );
+
+    const wait = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"process.wait","params":{"workspace":{"workspace_id":"turn-miss"},"process_id":"turn:only-stored"}}
+    );
+    defer allocator.free(wait);
+    var wait_parsed = try std.json.parseFromSlice(std.json.Value, allocator, wait, .{});
+    defer wait_parsed.deinit();
+    try std.testing.expectEqualStrings(
+        headless.registry.ERR_RESOURCE_NOT_FOUND,
+        wait_parsed.value.object.get("error").?.object.get("code").?.string,
+    );
 }
 
 test "session create dual-writes a tracked terminal process" {
@@ -7960,6 +8038,46 @@ test "store errors map to wire codes" {
     const stale_response = try daemon.handleRequest(stale);
     defer allocator.free(stale_response);
     try expectErrorCodeMessage(stale_response, allocator, headless.protocol.ERR_CONFLICT, "store revision conflict");
+}
+
+test "store error precedence capability_unavailable outranks invalid_params" {
+    // (ii) > (iii): store-less daemon with malformed params still reports
+    // capability_unavailable, not invalid_params.
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"workspace.upsert","params":{"mutation":{"request_key":"k","client_id":"not-registered"},"workspace":123}}
+    );
+    defer allocator.free(response);
+    try expectErrorCodeMessage(
+        response,
+        allocator,
+        headless.protocol.ERR_CAPABILITY_UNAVAILABLE,
+        "store capability is unavailable",
+    );
+}
+
+test "store error precedence invalid_params outranks unknown client_id" {
+    // (iii) > (iv): decode failure wins over unknown-client validation even when
+    // a client_id string is present in the broken payload.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+
+    const response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"workspace.upsert","params":{"mutation":{"request_key":"k","client_id":"not-registered"},"workspace":123}}
+    );
+    defer allocator.free(response);
+    try expectErrorCodeMessage(response, allocator, headless.protocol.ERR_INVALID_PARAMS, "invalid params");
 }
 
 fn expectWriteApplied(response: []const u8, allocator: std.mem.Allocator, expected_revision: i64) !void {

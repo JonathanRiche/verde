@@ -102,10 +102,17 @@ pub fn main(init: std.process.Init) !void {
                             std.debug.print("headless-daemon-it --daemon --parent-pid requires a pid\n", .{});
                             std.process.exit(2);
                         };
-                        parent_pid = std.fmt.parseInt(std.posix.pid_t, raw, 10) catch {
+                        // Reject non-positive values (signed pid_t would otherwise
+                        // accept negatives the old u32 parse rejected).
+                        const parsed = std.fmt.parseInt(std.posix.pid_t, raw, 10) catch {
                             std.debug.print("headless-daemon-it: invalid --parent-pid\n", .{});
                             std.process.exit(2);
                         };
+                        if (parsed <= 0) {
+                            std.debug.print("headless-daemon-it: invalid --parent-pid\n", .{});
+                            std.process.exit(2);
+                        }
+                        parent_pid = parsed;
                     }
                 }
                 installItDaemonCleanupGuards(parent_pid, pref_path);
@@ -550,13 +557,8 @@ const DISPATCHED_REGISTRY_METHODS = [_][]const u8{
     headless.registry.METHOD_DAEMON_STOP,
 };
 
-const FixtureSurface = enum {
-    registry,
-    store,
-};
-
-/// Shared phase-1 scenario plumbing. Typed DTOs are passed to Client.call so
-/// the normal headless protocol encoder owns the request envelope and JSON.
+/// Shared scenario plumbing. Typed DTOs are passed to Client.call so the
+/// normal headless protocol encoder owns the request envelope and JSON.
 const FixtureScenario = struct {
     client: *headless.Client,
 
@@ -577,30 +579,6 @@ const FixtureScenario = struct {
     /// Phase-2 placeholder: the store fixture will open a temporary SQLite
     /// database here once the daemon routes store methods in the IT binary.
     fn storeTemporaryDatabaseHook(_: *@This(), _: []const u8) void {}
-
-    /// Assert the tolerant phase-1 response contract for a not-yet-dispatched
-    /// method. Optional error data is intentionally accepted by parseResponse.
-    fn expectInterimError(_: *@This(), surface: FixtureSurface, parsed: *const headless.protocol.ParsedResponse) !void {
-        if (parsed.response.isOk()) return switch (surface) {
-            .registry => error.RegistryFixtureMethodUnexpectedlySucceeded,
-            .store => error.StoreFixtureMethodUnexpectedlySucceeded,
-        };
-
-        const err = parsed.response.err orelse return switch (surface) {
-            .registry => error.RegistryFixtureMissingError,
-            .store => error.StoreFixtureMissingError,
-        };
-        const method_not_found = std.mem.eql(u8, err.code, FIXTURE_METHOD_NOT_FOUND);
-        const capability_unavailable = std.mem.eql(u8, err.code, headless.protocol.ERR_CAPABILITY_UNAVAILABLE);
-        if (!method_not_found and !capability_unavailable) return switch (surface) {
-            .registry => error.RegistryFixtureUnexpectedErrorCode,
-            .store => error.StoreFixtureUnexpectedErrorCode,
-        };
-        if (err.message.len == 0) return switch (surface) {
-            .registry => error.RegistryFixtureMissingErrorMessage,
-            .store => error.StoreFixtureMissingErrorMessage,
-        };
-    }
 };
 
 /// Phase-2 registry fixture: exercise a typed process-list request against the
@@ -1451,10 +1429,14 @@ fn runForcedAcquireOverTransportScenario(allocator: std.mem.Allocator, io: std.I
     var typed_client = sessionizer.headlessClient(decode_arena.allocator(), &typed_transport);
     const resources = [_][]const u8{"build"};
 
+    // Distinct commands so the notification body can discriminate forcer vs incumbent.
+    const incumbent_command = "incumbent-build";
+    const forcer_command = "cargo test";
+
     var first = try typed_client.call(headless.registry.METHOD_LEASE_ACQUIRE, .{
         .workspace = .{ .workspace_path = pref_path },
         .owner = "owner-a",
-        .command = "build",
+        .command = incumbent_command,
         .resources = &resources,
     });
     defer first.deinit();
@@ -1464,7 +1446,7 @@ fn runForcedAcquireOverTransportScenario(allocator: std.mem.Allocator, io: std.I
     var conflict = try client.call(headless.registry.METHOD_LEASE_ACQUIRE, .{
         .workspace = .{ .workspace_path = pref_path },
         .owner = "owner-b",
-        .command = "build",
+        .command = forcer_command,
         .resources = &resources,
     });
     defer conflict.deinit();
@@ -1481,7 +1463,7 @@ fn runForcedAcquireOverTransportScenario(allocator: std.mem.Allocator, io: std.I
     var forced = try typed_client.call(headless.registry.METHOD_LEASE_ACQUIRE, .{
         .workspace = .{ .workspace_path = pref_path },
         .owner = "owner-b",
-        .command = "build",
+        .command = forcer_command,
         .resources = &resources,
         .force = true,
     });
@@ -1505,8 +1487,11 @@ fn runForcedAcquireOverTransportScenario(allocator: std.mem.Allocator, io: std.I
     if (notification_result.notifications.len != 1) return error.ForcedTransportNotificationCountMismatch;
     const note = notification_result.notifications[0];
     if (!std.mem.eql(u8, note.title, "Conflicting command started")) return error.ForcedTransportNotificationTitleMismatch;
-    // Body is the forcing command (registry NotificationEntry shares body/command).
-    if (!std.mem.eql(u8, note.body, "build")) return error.ForcedTransportNotificationBodyMismatch;
+    // Body/command are the forcing command (registry unit test pins "cargo test").
+    // Distinct from incumbent_command so this cannot pass by coincidence.
+    if (!std.mem.eql(u8, note.body, forcer_command)) return error.ForcedTransportNotificationBodyMismatch;
+    if (!std.mem.eql(u8, note.command, forcer_command)) return error.ForcedTransportNotificationCommandMismatch;
+    if (std.mem.eql(u8, note.body, incumbent_command)) return error.ForcedTransportNotificationMatchedIncumbent;
     if (notification_result.next_notification_seq <= note.seq) return error.ForcedTransportNextSeqNotAdvanced;
 
     // Forcing owner is not an "affected" mailbox recipient.
@@ -1888,11 +1873,15 @@ fn runStoreEnabledScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     });
     defer child.kill(io);
 
+    // Typed decodes use leaky .alloc_always — must run over a scoped arena
+    // (file convention) so DebugAllocator does not report per-scenario leaks.
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
     var transport: sessionizer.HeadlessTransport = .{
-        .allocator = allocator,
+        .allocator = decode_arena.allocator(),
         .pref_path = pref_path,
     };
-    var client = sessionizer.headlessClient(allocator, &transport);
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
     var scenario: FixtureScenario = .{ .client = &client };
 
     // B7: register clients before store mutations.
@@ -2144,11 +2133,13 @@ fn runStoreFullSurfaceScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     });
     defer child.kill(io);
 
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
     var transport: sessionizer.HeadlessTransport = .{
-        .allocator = allocator,
+        .allocator = decode_arena.allocator(),
         .pref_path = pref_path,
     };
-    var client = sessionizer.headlessClient(allocator, &transport);
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
     var scenario: FixtureScenario = .{ .client = &client };
 
     var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
@@ -2340,11 +2331,13 @@ fn runStoreDurableReopenScenario(allocator: std.mem.Allocator, io: std.Io) !void
         });
         // prepareShutdown should exit the child; kill only if it hangs.
 
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
         var transport: sessionizer.HeadlessTransport = .{
-            .allocator = allocator,
+            .allocator = decode_arena.allocator(),
             .pref_path = pref_path,
         };
-        var client = sessionizer.headlessClient(allocator, &transport);
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
         var scenario: FixtureScenario = .{ .client = &client };
 
         var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
@@ -2505,11 +2498,13 @@ fn runStoreDurableReopenScenario(allocator: std.mem.Allocator, io: std.Io) !void
         });
         defer child.kill(io);
 
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
         var transport: sessionizer.HeadlessTransport = .{
-            .allocator = allocator,
+            .allocator = decode_arena.allocator(),
             .pref_path = pref_path,
         };
-        var client = sessionizer.headlessClient(allocator, &transport);
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
         var scenario: FixtureScenario = .{ .client = &client };
 
         const empty_params: struct {} = .{};
