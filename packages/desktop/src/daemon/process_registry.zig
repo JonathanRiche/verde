@@ -2605,8 +2605,10 @@ test "windows path spellings are opaque alias bytes" {
     // Do NOT import workspace_identity here: its deriveProjectIdForOs is private
     // and that file is out of W8 scope. Normalization is the caller's job via
     // workspace_identity (which already pins Windows fixtures in its own tests).
-    // The registry treats alias bytes as opaque — case and separator variants
-    // are distinct aliases until the caller normalizes.
+    // The registry treats path bytes as opaque: the first registration becomes
+    // canonical_path and the second is a distinct alias string. Case/separator
+    // variants are NOT folded — both resolve to the same workspace only because
+    // they were registered under it.
     const allocator = std.testing.allocator;
     var registry = try ProcessRegistry.init(allocator, "nonce-win-path");
     defer registry.deinit(allocator);
