@@ -2838,6 +2838,7 @@ test {
     _ = @import("ui/companion.zig");
     _ = @import("ui/diff_view_cache.zig");
     _ = @import("compile_tests/windows_conpty.zig");
+    _ = @import("daemon/change_journal.zig");
     _ = @import("daemon/process_registry.zig");
     _ = @import("daemon/store.zig");
 }
