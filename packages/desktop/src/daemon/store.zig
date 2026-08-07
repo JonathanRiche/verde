@@ -11,9 +11,23 @@ const headless = @import("headless");
 
 const schema = @import("../db/schema.zig");
 const transcript_apply = @import("../chat/transcript_apply.zig");
+const platform_runtime = @import("platform_runtime");
 
 const store_protocol = headless.store;
 const protocol = headless.protocol;
+
+/// Test-only fault injection for crash/busy/latency ITs (B9). Armed only via
+/// `initWithFault` or the env-selected store override path; production `init`
+/// always uses `.none`.
+pub const StoreFault = enum {
+    none,
+    commit_stall,
+    crash_before_commit,
+    crash_after_commit,
+};
+
+/// Stall duration when `StoreFault.commit_stall` is armed (before commit).
+pub const STORE_FAULT_COMMIT_STALL_MS: u64 = 1500;
 
 pub const StoreError = error{
     Conflict,
@@ -229,9 +243,17 @@ pub const Store = struct {
     allocator: std.mem.Allocator,
     path: [:0]u8,
     conn: zqlite.Conn,
+    /// Test-only; production construction always leaves `.none`.
+    fault: StoreFault = .none,
 
     /// Open the exact database path as the dormant test-only store adapter.
     pub fn init(allocator: std.mem.Allocator, db_path: []const u8) StoreError!Self {
+        return initWithFault(allocator, db_path, .none);
+    }
+
+    /// Open the store with an optional test-only fault hook (B9). Reachable only
+    /// via hermetic tests and the env-selected store override path.
+    pub fn initWithFault(allocator: std.mem.Allocator, db_path: []const u8, fault: StoreFault) StoreError!Self {
         const path = try allocator.dupeZ(u8, db_path);
         errdefer allocator.free(path);
 
@@ -246,12 +268,32 @@ pub const Store = struct {
             .allocator = allocator,
             .path = path,
             .conn = conn,
+            .fault = fault,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.conn.close();
         self.allocator.free(self.path);
+    }
+
+    /// Commit the open transaction, optionally applying the test-only fault hook.
+    /// Why: stall/crash arms exist only for ITs (B9); production always sees `.none`.
+    fn commitWithFault(self: *Self) StoreError!void {
+        // Test-only: hold the open transaction while sleeping so the busy/lock
+        // boundary and latency ITs exercise real writer contention.
+        if (self.fault == .commit_stall) {
+            platform_runtime.sleepMillis(STORE_FAULT_COMMIT_STALL_MS);
+        }
+        // Test-only: abort with no unwind so SQLite journal recovery is exercised.
+        if (self.fault == .crash_before_commit) {
+            std.process.abort();
+        }
+        self.conn.commit() catch |err| return mapStoreError(err);
+        // Test-only: process death after durable commit (exactly-once on reopen).
+        if (self.fault == .crash_after_commit) {
+            std.process.abort();
+        }
     }
 
     /// Return the durable revision currently recorded by the store.
@@ -305,7 +347,7 @@ pub const Store = struct {
                 .duplicate = true,
             };
             self.insertReceipt(mutationHeader(mutation), operation, fingerprint, result) catch |err| return mapStoreError(err);
-            self.conn.commit() catch |err| return mapStoreError(err);
+            try self.commitWithFault();
             transaction_open = false;
             return result;
         }
@@ -337,7 +379,7 @@ pub const Store = struct {
         };
         self.insertReceipt(mutationHeader(mutation), operation, fingerprint, result) catch |err| return mapStoreError(err);
 
-        self.conn.commit() catch |err| return mapStoreError(err);
+        try self.commitWithFault();
         transaction_open = false;
         return result;
     }
@@ -2419,6 +2461,46 @@ test "store refuses a schema newer than the supported database layer" {
     const row = (try conn.row("pragma user_version", .{})).?;
     defer row.deinit();
     try std.testing.expectEqual(@as(i64, 99), row.int(0));
+}
+
+test "fault hook stalls and crashes only when armed" {
+    // Crash variants are not unit-testable in-process (abort kills the test
+    // runner); they are covered by the headless-daemon-it subprocess scenarios.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db_path = try testDbPath(&tmp);
+        defer std.testing.allocator.free(db_path);
+
+        var store = try Store.init(std.testing.allocator, db_path);
+        defer store.deinit();
+        try std.testing.expect(store.fault == .none);
+        const started = platform_runtime.monotonicTimestampNs();
+        const result = try store.applyMutation(.{
+            .workspace_upsert = testWorkspaceRequest("fault-none", null, testWorkspace("ws-none", "None")),
+        });
+        const elapsed_ms = (platform_runtime.monotonicTimestampNs() - started) / std.time.ns_per_ms;
+        try std.testing.expect(result.applied);
+        // Unarmed path must not pay the commit_stall delay.
+        try std.testing.expect(elapsed_ms < STORE_FAULT_COMMIT_STALL_MS / 2);
+    }
+
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db_path = try testDbPath(&tmp);
+        defer std.testing.allocator.free(db_path);
+
+        var store = try Store.initWithFault(std.testing.allocator, db_path, .commit_stall);
+        defer store.deinit();
+        const started = platform_runtime.monotonicTimestampNs();
+        const result = try store.applyMutation(.{
+            .workspace_upsert = testWorkspaceRequest("fault-stall", null, testWorkspace("ws-stall", "Stall")),
+        });
+        const elapsed_ms = (platform_runtime.monotonicTimestampNs() - started) / std.time.ns_per_ms;
+        try std.testing.expect(result.applied);
+        try std.testing.expect(elapsed_ms >= STORE_FAULT_COMMIT_STALL_MS);
+    }
 }
 
 test "natural duplicate replay wins over stale expected revision" {
