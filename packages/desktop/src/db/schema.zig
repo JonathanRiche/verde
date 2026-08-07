@@ -595,9 +595,10 @@ test "failed migration rolls back schema, version, and data" {
 }
 
 test "v1 to v2 dedupe keeps max-rowid survivor and its messages; idempotent re-run" {
-    // MAJOR-4: three duplicate (workspace_id, local_thread_id) rows with
+    // MAJOR-4 / NEW-3: three duplicate (workspace_id, local_thread_id) rows with
     // distinct messages; max-rowid survives; discarded messages deleted;
-    // re-running migrate is a no-op.
+    // non-duplicate control thread+message survives; re-running the dedupe SQL
+    // itself is a no-op (not just the version-gated migrate no-op).
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -614,6 +615,7 @@ test "v1 to v2 dedupe keeps max-rowid survivor and its messages; idempotent re-r
     try conn.execNoArgs(
         \\insert into app_state (id, selected_workspace_index, sidebar_collapsed) values (1, 0, 0);
         \\insert into workspaces (workspace_id, sort_index, label, path) values ('dup-ws', 0, 'Dup', '/dup');
+        \\insert into workspaces (workspace_id, sort_index, label, path) values ('ctrl-ws', 1, 'Control', '/ctrl');
     );
     // Three threads with the same local_thread_id under the same workspace FK.
     try conn.execNoArgs(
@@ -631,6 +633,10 @@ test "v1 to v2 dedupe keeps max-rowid survivor and its messages; idempotent re-r
         \\values ((select id from threads where title = 'Newest'), 0, 0, 'You', 'newest body');
         \\insert into messages (thread_id, sort_index, role, author, body)
         \\values ((select id from threads where title = 'Newest'), 1, 2, 'assistant', 'newest reply');
+        \\insert into threads (workspace_id, sort_index, title, local_thread_id, provider, harness)
+        \\values ((select id from workspaces where workspace_id = 'ctrl-ws'), 0, 'ControlOnly', 'unique-thread', 0, 0);
+        \\insert into messages (thread_id, sort_index, role, author, body)
+        \\values ((select id from threads where title = 'ControlOnly'), 0, 0, 'You', 'control body');
     );
 
     var before_threads = (try conn.row(
@@ -674,7 +680,68 @@ test "v1 to v2 dedupe keeps max-rowid survivor and its messages; idempotent re-r
     defer newest_body.deinit();
     try std.testing.expectEqualStrings("newest body", newest_body.text(0));
 
-    // Idempotent re-run (already at v2): no further loss.
+    // NEW-3: non-duplicate control thread + message must survive (no-loss-beyond-dupes).
+    var control = (try conn.row(
+        "select title from threads where local_thread_id = 'unique-thread'",
+        .{},
+    )).?;
+    defer control.deinit();
+    try std.testing.expectEqualStrings("ControlOnly", control.text(0));
+    var control_msg = (try conn.row(
+        \\select body from messages where thread_id = (
+        \\  select id from threads where local_thread_id = 'unique-thread'
+        \\)
+    , .{})).?;
+    defer control_msg.deinit();
+    try std.testing.expectEqualStrings("control body", control_msg.text(0));
+    var total_threads = (try conn.row("select count(*) from threads", .{})).?;
+    defer total_threads.deinit();
+    try std.testing.expectEqual(@as(i64, 2), total_threads.int(0));
+
+    // NEW-3: re-execute the dedupe SQL directly (version gate would no-op).
+    try conn.execNoArgs(
+        \\delete from messages where thread_id in (
+        \\  select t.id from threads t
+        \\  where t.local_thread_id is not null
+        \\    and exists (
+        \\      select 1 from threads t2
+        \\      where t2.workspace_id = t.workspace_id
+        \\        and t2.local_thread_id = t.local_thread_id
+        \\        and t2.id > t.id
+        \\    )
+        \\);
+        \\delete from threads where id in (
+        \\  select t.id from threads t
+        \\  where t.local_thread_id is not null
+        \\    and exists (
+        \\      select 1 from threads t2
+        \\      where t2.workspace_id = t.workspace_id
+        \\        and t2.local_thread_id = t.local_thread_id
+        \\        and t2.id > t.id
+        \\    )
+        \\);
+    );
+    var after_sql_rerun = (try conn.row(
+        "select count(*) from threads where local_thread_id = 'shared-thread'",
+        .{},
+    )).?;
+    defer after_sql_rerun.deinit();
+    try std.testing.expectEqual(@as(i64, 1), after_sql_rerun.int(0));
+    var msg_sql_rerun = (try conn.row(
+        \\select count(*) from messages where thread_id = (
+        \\  select id from threads where local_thread_id = 'shared-thread'
+        \\)
+    , .{})).?;
+    defer msg_sql_rerun.deinit();
+    try std.testing.expectEqual(@as(i64, 2), msg_sql_rerun.int(0));
+    var control_after = (try conn.row(
+        "select count(*) from threads where local_thread_id = 'unique-thread'",
+        .{},
+    )).?;
+    defer control_after.deinit();
+    try std.testing.expectEqual(@as(i64, 1), control_after.int(0));
+
+    // Version-gated re-run remains a no-op at v2.
     try migrateToVersion(conn, 2, .none);
     var after_rerun = (try conn.row(
         "select count(*) from threads where local_thread_id = 'shared-thread'",

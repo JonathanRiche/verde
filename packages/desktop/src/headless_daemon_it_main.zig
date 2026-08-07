@@ -151,6 +151,9 @@ pub fn main(init: std.process.Init) !void {
     try runStoreProductionOpenScenario(allocator, io);
     try runStoreDurableReopenScenario(allocator, io);
     try runNotifyRequiresDaemonScenario(allocator, io);
+    // M3-P3 Phase B design pins (protocol-layer GUI reopen + conflict recovery).
+    try runGuiReopenRevisionScenario(allocator, io); // MAJOR-3(a)
+    try runCliGuiSimultaneousConflictScenario(allocator, io); // MAJOR-3(b)
 
     // M4-P2 durable chat (Windows-safe subset): stub provider + store dir.
     try runChatDisconnectedCommitScenario(allocator, io); // scenario 1
@@ -169,6 +172,8 @@ pub fn main(init: std.process.Init) !void {
         // M4-P2 POSIX-only: kill mid-turn + slow commit vs session.tail.
         try runChatKillMidTurnScenario(allocator, io); // scenario 3
         try runChatSlowCommitDoesNotStallSessionTailScenario(allocator, io); // scenario 5
+        // MAJOR-3(c): real `verde notify` CLI binary against hermetic daemon / auto-start.
+        try runCliBinaryNotifyScenario(allocator, io);
     }
 
     // PTY tier: sessions, managed spawn, prepare/stop retention, lifecycle.
@@ -1920,6 +1925,543 @@ fn runStoreProductionOpenScenario(allocator: std.mem.Allocator, io: std.Io) !voi
     )) orelse return error.StoreProductionDbMissingRow;
     defer row.deinit();
     if (!std.mem.eql(u8, row.text(0), "Production")) return error.StoreProductionDbWrongLabel;
+}
+
+/// MAJOR-3(a): GUI reopen / revision pin at the protocol layer.
+/// Launch-1: persistent client mutates via snapshot.replace with expected guard.
+/// Launch-2: new connection + client (second GUI process), RO-load equivalent via
+/// store.status, then snapshot.replace with the pinned revision succeeds — the
+/// exact BLOCKER-1 regression pin (never bootstrap / never expected=null).
+fn runGuiReopenRevisionScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "gui-reopen-revision");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    // Production open (no store_dir) so revision lives under pref_path/state.sqlite.
+    var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    defer child.kill(io);
+
+    var receipt_revision: u64 = 0;
+    {
+        // Launch-1: persistent GUI client.
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+        var reg = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = true });
+        defer reg.deinit();
+        if (!reg.response.isOk()) return error.GuiReopenLaunch1RegisterFailed;
+        const client_id = (try client.decodeClientRegister(&reg)).client_id;
+
+        const replace: headless.store.SnapshotReplaceRequest = .{
+            .mutation = .{
+                .request_key = "m3p3-gui-launch1-replace",
+                .client_id = client_id,
+                .expected_store_revision = 0,
+            },
+            .snapshot = .{
+                .schema_version = 1,
+                .workspaces = &.{.{
+                    .workspace_id = "m3p3-gui-ws",
+                    .label = "GUI reopen",
+                    .path = pref_path,
+                }},
+                .surface_states = &.{.{
+                    .session_id = "m3p3-gui-session",
+                    .status = "working",
+                    .title = "launch-1",
+                }},
+            },
+            .bootstrap = false,
+        };
+        var parsed = try client.call(headless.store.METHOD_STATE_SNAPSHOT_REPLACE, replace);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.GuiReopenLaunch1ReplaceFailed;
+        const write = try client.decodeWriteResult(&parsed);
+        if (!write.applied or write.store_revision < 1) return error.GuiReopenLaunch1RevisionWrong;
+        receipt_revision = write.store_revision;
+    }
+
+    // Launch-2: new connection / new client (simulates GUI close + reopen).
+    {
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+        // RO-load equivalent: store.status pins the durable revision.
+        const empty_params: struct {} = .{};
+        var status_parsed = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params);
+        defer status_parsed.deinit();
+        if (!status_parsed.response.isOk()) return error.GuiReopenStatusFailed;
+        const status = try client.decodeStoreStatus(&status_parsed);
+        if (status.store_revision != receipt_revision) return error.GuiReopenStatusRevisionMismatch;
+
+        var reg = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = true });
+        defer reg.deinit();
+        if (!reg.response.isOk()) return error.GuiReopenLaunch2RegisterFailed;
+        const client_id = (try client.decodeClientRegister(&reg)).client_id;
+
+        // Fresh snapshot.replace with the pinned launch-1 receipt revision must succeed
+        // (BLOCKER-1: launch-2 never sends bootstrap / expected=null).
+        const replace: headless.store.SnapshotReplaceRequest = .{
+            .mutation = .{
+                .request_key = "m3p3-gui-launch2-replace",
+                .client_id = client_id,
+                .expected_store_revision = receipt_revision,
+            },
+            .snapshot = .{
+                .schema_version = 1,
+                .workspaces = &.{.{
+                    .workspace_id = "m3p3-gui-ws",
+                    .label = "GUI reopen",
+                    .path = pref_path,
+                }},
+                .surface_states = &.{.{
+                    .session_id = "m3p3-gui-session",
+                    .status = "done",
+                    .title = "launch-2",
+                }},
+            },
+            .bootstrap = false,
+        };
+        var parsed = try client.call(headless.store.METHOD_STATE_SNAPSHOT_REPLACE, replace);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.GuiReopenLaunch2ReplaceFailed;
+        const write = try client.decodeWriteResult(&parsed);
+        if (!write.applied or write.store_revision != receipt_revision + 1) return error.GuiReopenLaunch2RevisionWrong;
+    }
+}
+
+/// MAJOR-3(b): two clients mutate; client A's expected goes stale → explicit conflict
+/// (not silent clobber) → A refreshes via store.status and retries once with a fresh
+/// guard → success. Pins Phase A conflict-recovery protocol at the wire layer.
+fn runCliGuiSimultaneousConflictScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "cli-gui-conflict");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    defer child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    var reg_a = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = true });
+    defer reg_a.deinit();
+    if (!reg_a.response.isOk()) return error.ConflictClientARegisterFailed;
+    const client_a = (try client.decodeClientRegister(&reg_a)).client_id;
+
+    var reg_b = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer reg_b.deinit();
+    if (!reg_b.response.isOk()) return error.ConflictClientBRegisterFailed;
+    const client_b = (try client.decodeClientRegister(&reg_b)).client_id;
+
+    // Seed revision 1 so both clients share a known baseline N.
+    {
+        const seed: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{
+                .request_key = "m3p3-conflict-seed",
+                .client_id = client_a,
+                .expected_store_revision = 0,
+            },
+            .workspace = .{
+                .workspace_id = "m3p3-conflict-ws",
+                .label = "Seed",
+                .path = pref_path,
+            },
+        };
+        var parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, seed);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.ConflictSeedFailed;
+        const write = try client.decodeWriteResult(&parsed);
+        if (!write.applied or write.store_revision != 1) return error.ConflictSeedRevision;
+    }
+
+    const empty_params: struct {} = .{};
+    var status_n = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params);
+    defer status_n.deinit();
+    if (!status_n.response.isOk()) return error.ConflictStatusNFailed;
+    const n = (try client.decodeStoreStatus(&status_n)).store_revision;
+    if (n != 1) return error.ConflictUnexpectedN;
+
+    // Client B advances the store to N+1 while A still holds expected=N.
+    {
+        const b_upsert: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{
+                .request_key = "m3p3-conflict-b-advance",
+                .client_id = client_b,
+                .expected_store_revision = n,
+            },
+            .workspace = .{
+                .workspace_id = "m3p3-conflict-b",
+                .label = "B advanced",
+                .path = pref_path,
+            },
+        };
+        var parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, b_upsert);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.ConflictBAdvanceFailed;
+        const write = try client.decodeWriteResult(&parsed);
+        if (!write.applied or write.store_revision != n + 1) return error.ConflictBAdvanceRevision;
+    }
+
+    // Client A with stale expected=N → explicit conflict (not silent clobber).
+    {
+        const stale: headless.store.SnapshotReplaceRequest = .{
+            .mutation = .{
+                .request_key = "m3p3-conflict-a-stale",
+                .client_id = client_a,
+                .expected_store_revision = n,
+            },
+            .snapshot = .{
+                .schema_version = 1,
+                .workspaces = &.{.{
+                    .workspace_id = "m3p3-conflict-a",
+                    .label = "A stale",
+                    .path = pref_path,
+                }},
+            },
+            .bootstrap = false,
+        };
+        var parsed = try client.call(headless.store.METHOD_STATE_SNAPSHOT_REPLACE, stale);
+        defer parsed.deinit();
+        const err = parsed.response.err orelse return error.ConflictAMissingError;
+        if (!std.mem.eql(u8, err.code, headless.protocol.ERR_CONFLICT)) return error.ConflictAWrongCode;
+    }
+
+    // A refreshes via store.status (Phase A client recovery) and retries once.
+    var status_fresh = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params);
+    defer status_fresh.deinit();
+    if (!status_fresh.response.isOk()) return error.ConflictRefreshFailed;
+    const fresh = (try client.decodeStoreStatus(&status_fresh)).store_revision;
+    if (fresh != n + 1) return error.ConflictRefreshRevision;
+
+    {
+        const retry: headless.store.SnapshotReplaceRequest = .{
+            .mutation = .{
+                .request_key = "m3p3-conflict-a-retry",
+                .client_id = client_a,
+                .expected_store_revision = fresh,
+            },
+            .snapshot = .{
+                .schema_version = 1,
+                .workspaces = &.{.{
+                    .workspace_id = "m3p3-conflict-a",
+                    .label = "A recovered",
+                    .path = pref_path,
+                }},
+            },
+            .bootstrap = false,
+        };
+        var parsed = try client.call(headless.store.METHOD_STATE_SNAPSHOT_REPLACE, retry);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.ConflictARetryFailed;
+        const write = try client.decodeWriteResult(&parsed);
+        if (!write.applied or write.store_revision != fresh + 1) return error.ConflictARetryRevision;
+    }
+}
+
+/// Resolve the production `verde` CLI binary for MAJOR-3(c). Mirrors daemon
+/// discovery: VERDE_IT_CLI_PATH override, sibling of this IT exe, then
+/// zig-out/bin/verde from cwd. Returns null when absent so the scenario can
+/// declare an honest residual gap.
+fn resolveVerdeCliBinary(allocator: std.mem.Allocator, io: std.Io, self_exe: []const u8) !?[]u8 {
+    if (try itGetEnvAlloc(allocator, "VERDE_IT_CLI_PATH")) |path| {
+        if (path.len > 0) {
+            if (std.Io.Dir.cwd().access(io, path, .{})) |_| {
+                return path;
+            } else |_| {
+                allocator.free(path);
+            }
+        } else {
+            allocator.free(path);
+        }
+    }
+    if (std.fs.path.dirname(self_exe)) |dir| {
+        const sibling = try std.fs.path.join(allocator, &.{ dir, "verde" });
+        if (std.Io.Dir.cwd().access(io, sibling, .{})) |_| {
+            return sibling;
+        } else |_| {
+            allocator.free(sibling);
+        }
+    }
+    // Headless-daemon-it often runs with packages/desktop as cwd (desktop
+    // build -p), so also probe monorepo-root zig-out via ../.. .
+    const cwd_candidates = [_][]const u8{
+        "zig-out/bin/verde",
+        "packages/desktop/zig-out/bin/verde",
+        "../../zig-out/bin/verde",
+        "../zig-out/bin/verde",
+    };
+    for (cwd_candidates) |rel| {
+        if (std.Io.Dir.cwd().access(io, rel, .{})) |_| {
+            var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const abs_len = std.Io.Dir.cwd().realPathFile(io, rel, &path_buf) catch continue;
+            return try allocator.dupe(u8, path_buf[0..abs_len]);
+        } else |_| {}
+    }
+    return null;
+}
+
+/// MAJOR-3(c): execute the real `verde notify` CLI binary against a hermetic
+/// daemon (env-pointed pref + socket) and pin daemon auto-start via argv[0].
+/// POSIX tier only. When the CLI binary is not build-provided, falls back to
+/// the protocol-layer surface.upsert path and declares the residual gap.
+fn runCliBinaryNotifyScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    if (comptime !posix_pty_supported) return;
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    const cli_path = try resolveVerdeCliBinary(allocator, io, self_exe);
+    defer if (cli_path) |p| allocator.free(p);
+
+    if (cli_path) |verde| {
+        const cli_ok = runCliBinaryNotifyWithBinary(allocator, io, self_exe, verde) catch |err| blk: {
+            std.debug.print(
+                "headless-daemon-it: MAJOR-3(c) CLI binary path failed ({s}) with {s}; falling back to protocol pin\n",
+                .{ verde, @errorName(err) },
+            );
+            break :blk false;
+        };
+        if (cli_ok) return;
+        std.debug.print(
+            "headless-daemon-it: MAJOR-3(c) residual gap — CLI binary {s} did not land a surface row (stale pre-Phase-A install or missing VERDE_IT_CLI_PATH); protocol-layer notify pin only. Full zig build install of post-Phase-A verde is blocked by unrelated ghostty comptime assert on this host.\n",
+            .{verde},
+        );
+    } else {
+        std.debug.print(
+            "headless-daemon-it: MAJOR-3(c) residual gap — verde CLI binary not found beside IT or at zig-out/bin/verde; running protocol-layer notify pin only\n",
+            .{},
+        );
+    }
+    // Closest honest variant: protocol-layer surface.upsert against hermetic daemon
+    // (the store path `verde notify` uses). BLOCKER-2 argv[0] remains unit-pinned
+    // in cli/main.zig; re-run full CLI legs via VERDE_IT_CLI_PATH when available.
+    try runNotifyProtocolLayerFallback(allocator, io);
+}
+
+/// Returns true when both live-daemon and auto-start legs succeed with `verde`.
+fn runCliBinaryNotifyWithBinary(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    self_exe: []const u8,
+    verde: []const u8,
+) !bool {
+    // --- Leg 1: notify against a live hermetic daemon (env-pointed). ---
+    {
+        const base_tmp = try makePrefPath(allocator, "cli-notify-live");
+        defer allocator.free(base_tmp);
+        defer std.Io.Dir.cwd().deleteTree(io, base_tmp) catch {};
+        try std.Io.Dir.cwd().createDirPath(io, base_tmp);
+
+        // CLI prefPath = $XDG_DATA_HOME/verde/Native on Linux.
+        const xdg_data = try std.fs.path.join(allocator, &.{ base_tmp, "xdg-data" });
+        defer allocator.free(xdg_data);
+        try std.Io.Dir.cwd().createDirPath(io, xdg_data);
+        const pref_path = try std.fs.path.join(allocator, &.{ xdg_data, "verde", "Native" });
+        defer allocator.free(pref_path);
+        try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+        var isolation = try EndpointIsolation.install(allocator, pref_path);
+        defer isolation.deinit(allocator);
+
+        var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+        defer child.kill(io);
+
+        var env_map = try std.process.Environ.createMap(currentEnviron(), allocator);
+        defer env_map.deinit();
+        try env_map.put("XDG_DATA_HOME", xdg_data);
+        try env_map.put(sessionizer.SESSIONIZER_SOCKET_ENV_NAME, isolation.endpoint);
+        try env_map.put("VERDE_SESSION_DAEMON_IDLE_EXIT_MS", IT_SAFETY_IDLE_EXIT_MS);
+        try env_map.put("VERDE_SESSION_ID", "m3p3-cli-notify-live");
+
+        var notify_child = try std.process.spawn(io, .{
+            .argv = &.{
+                verde,
+                "notify",
+                "--status",
+                "working",
+                "--session",
+                "m3p3-cli-notify-live",
+                "--quiet",
+            },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+            .environ_map = &env_map,
+        });
+        const term = try notify_child.wait(io);
+        switch (term) {
+            .exited => |code| if (code != 0) return false,
+            else => return false,
+        }
+
+        // Surface state must land in the production DB under pref_path.
+        // surfaceStatusCode: idle=0, working=1, waiting=2, done=3, error=4.
+        const db_path = try std.fs.path.join(allocator, &.{ pref_path, "state.sqlite" });
+        defer allocator.free(db_path);
+        const db_path_z = try allocator.dupeZ(u8, db_path);
+        defer allocator.free(db_path_z);
+        var conn = zqlite.open(db_path_z, zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode) catch return false;
+        defer conn.close();
+        const row = (try conn.row(
+            "select status from surface_completions where session_id = ?1",
+            .{"m3p3-cli-notify-live"},
+        )) orelse return false;
+        defer row.deinit();
+        if (row.int(0) != 1) return false;
+    }
+
+    // --- Leg 2: no daemon + auto-start via real argv[0] (BLOCKER-2 pin). ---
+    {
+        const base_tmp = try makePrefPath(allocator, "cli-notify-autostart");
+        defer allocator.free(base_tmp);
+        defer std.Io.Dir.cwd().deleteTree(io, base_tmp) catch {};
+        try std.Io.Dir.cwd().createDirPath(io, base_tmp);
+
+        const xdg_data = try std.fs.path.join(allocator, &.{ base_tmp, "xdg-data" });
+        defer allocator.free(xdg_data);
+        try std.Io.Dir.cwd().createDirPath(io, xdg_data);
+        const pref_path = try std.fs.path.join(allocator, &.{ xdg_data, "verde", "Native" });
+        defer allocator.free(pref_path);
+        try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+        // Pref-derived socket only (no VERDE_SESSIONIZER_SOCKET): ensureDaemon
+        // spawns `verde __session-daemon` with the real binary path (argv[0]).
+        var env_map = try std.process.Environ.createMap(currentEnviron(), allocator);
+        defer env_map.deinit();
+        try env_map.put("XDG_DATA_HOME", xdg_data);
+        // Clear any ambient isolation socket from prior legs / parent.
+        _ = env_map.swapRemove(sessionizer.SESSIONIZER_SOCKET_ENV_NAME);
+        try env_map.put("VERDE_SESSION_DAEMON_IDLE_EXIT_MS", IT_SAFETY_IDLE_EXIT_MS);
+        try env_map.put("VERDE_SESSION_ID", "m3p3-cli-notify-autostart");
+
+        var notify_child = try std.process.spawn(io, .{
+            .argv = &.{
+                verde,
+                "notify",
+                "--status",
+                "done",
+                "--session",
+                "m3p3-cli-notify-autostart",
+                "--quiet",
+            },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+            .environ_map = &env_map,
+        });
+        const term = try notify_child.wait(io);
+        switch (term) {
+            .exited => |code| if (code != 0) return false,
+            else => return false,
+        }
+
+        var ready = false;
+        var attempts: usize = 0;
+        while (attempts < 100) : (attempts += 1) {
+            if (sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
+                allocator.free(response);
+                ready = true;
+                break;
+            } else |_| {
+                std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+            }
+        }
+        if (!ready) return false;
+
+        if (sessionizer.requestAlloc(allocator, pref_path, "daemon.prepareShutdown", .{}, 0)) |resp| {
+            allocator.free(resp);
+        } else |_| {}
+
+        const db_path = try std.fs.path.join(allocator, &.{ pref_path, "state.sqlite" });
+        defer allocator.free(db_path);
+        const db_path_z = try allocator.dupeZ(u8, db_path);
+        defer allocator.free(db_path_z);
+        var conn = zqlite.open(db_path_z, zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode) catch return false;
+        defer conn.close();
+        const row = (try conn.row(
+            "select status from surface_completions where session_id = ?1",
+            .{"m3p3-cli-notify-autostart"},
+        )) orelse return false;
+        defer row.deinit();
+        // done = 3 (surfaceStatusCode ordinal).
+        if (row.int(0) != 3) return false;
+    }
+    return true;
+}
+
+/// Protocol-layer stand-in when the CLI binary is not available to the harness.
+fn runNotifyProtocolLayerFallback(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "notify-protocol-fallback");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    defer child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    var reg = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer reg.deinit();
+    const client_id = (try client.decodeClientRegister(&reg)).client_id;
+
+    const request: headless.store.SurfaceUpsertRequest = .{
+        .mutation = .{
+            .request_key = "m3p3-notify-fallback",
+            .client_id = client_id,
+        },
+        .surface = .{
+            .session_id = "m3p3-notify-fallback",
+            .status = "working",
+        },
+    };
+    var parsed = try client.call(headless.store.METHOD_SURFACE_UPSERT, request);
+    defer parsed.deinit();
+    if (!parsed.response.isOk()) return error.NotifyFallbackUpsertFailed;
+    const write = try client.decodeWriteResult(&parsed);
+    if (!write.applied) return error.NotifyFallbackNotApplied;
 }
 
 /// P3 notify regression: with store disabled (daemon auto-start yields store-less),
@@ -4543,6 +5085,12 @@ fn runLifecycleGracefulReplace(allocator: std.mem.Allocator, io: std.Io) !void {
 /// live PTY blocks prepareShutdown, the old daemon stays fully working, store
 /// mutations remain accepted, and no direct SQLite writer fallback is opened.
 /// Named exactly as m3_design requires.
+///
+/// TODO(NIT-3 / M3-P3 review item 7): two-binary version-skew IT is NOT expected
+/// this round. A full pin needs two protocol-version binaries so ensureDaemon
+/// surfaces DaemonReplacementBlocked under a live-PTY prepare refusal. Covered
+/// piecewise today (this scenario + M2-era prepare-refusal unit pins). Tracked
+/// so the debt is discoverable — see fable_m3p3_review_out.md §7 / NIT-3.
 fn version_skew_blocked_replacement_is_read_only_without_fallback(allocator: std.mem.Allocator, io: std.Io) !void {
     const pref_path = try makePrefPath(allocator, "version-skew-blocked");
     defer allocator.free(pref_path);

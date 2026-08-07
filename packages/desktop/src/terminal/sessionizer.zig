@@ -5235,13 +5235,28 @@ fn storeFaultFromEnv(allocator: std.mem.Allocator) !daemon_store.StoreFault {
 /// VERDE_SESSION_DAEMON_STORE_DISABLE. Runs the shared migration chain and
 /// advertises store=true only after the writer is published.
 fn maybeInitStoreService(daemon: *Daemon) !void {
-    if (try storeDisabledFromEnv(daemon.allocator)) return;
+    // NIT-2: a stray VERDE_SESSION_DAEMON_STORE_DISABLE in a user session is
+    // production-latent (GUI read-only, notify hard-fails). Loud warn so the
+    // knob is deliberate at runtime, not only in comments.
+    if (try storeDisabledFromEnv(daemon.allocator)) {
+        log.warn(
+            "store disabled by env — daemon is store-less; GUI read-only, notify will fail",
+            .{},
+        );
+        return;
+    }
 
     const override_dir = try storeDirFromEnv(daemon.allocator);
     defer if (override_dir) |dir| daemon.allocator.free(dir);
 
     const store_dir = override_dir orelse blk: {
-        if (daemon.pref_path.len == 0) return;
+        // NIT-1: never silently store-less. Empty pref_path is unreachable in
+        // production (__session-daemon always passes a real path) but a quiet
+        // fallback here would contradict the loud-fail readiness rule.
+        if (daemon.pref_path.len == 0) {
+            log.err("production store open requires non-empty pref_path", .{});
+            return error.InvalidParams;
+        }
         break :blk daemon.pref_path;
     };
     // B9: fault env is active only alongside the hermetic store-dir override.

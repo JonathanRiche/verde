@@ -175,6 +175,10 @@ pub const Storage = struct {
     }
 
     pub fn upsertSurfaceState(self: *const Storage, surface: PersistedSurfaceState) !void {
+        // NEW-2: gate on the same persistence_available clock as frame-loop
+        // flush backoff — never run ensureDaemon's 5s spawn-poll on event threads
+        // after a prior store failure. Self-heals when a snapshot flush succeeds.
+        try self.ensureGranularMutationAllowed();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -196,6 +200,7 @@ pub const Storage = struct {
     }
 
     pub fn clearSurfaceState(self: *const Storage, session_id: []const u8) !bool {
+        try self.ensureGranularMutationAllowed();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -217,6 +222,7 @@ pub const Storage = struct {
     }
 
     pub fn upsertChatCompletion(self: *const Storage, completion: PersistedChatCompletion) !void {
+        try self.ensureGranularMutationAllowed();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -242,6 +248,7 @@ pub const Storage = struct {
     }
 
     pub fn clearChatCompletion(self: *const Storage, workspace_id: []const u8, local_thread_id: []const u8) !bool {
+        try self.ensureGranularMutationAllowed();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -355,7 +362,7 @@ pub const Storage = struct {
             };
         }
 
-        const first = try self.replaceSnapshotOnce(state, bootstrap, false);
+        const first = try self.replaceSnapshotOnce(state, bootstrap);
         if (first) |result| {
             self.noteStoreRevision(result.store_revision);
             return;
@@ -363,7 +370,7 @@ pub const Storage = struct {
         // first == null means conflict → refresh + single retry (never re-bootstrap).
         if (bootstrap) return error.StoreRevisionConflict;
         _ = try self.refreshStoreRevision();
-        const second = try self.replaceSnapshotOnce(state, false, true);
+        const second = try self.replaceSnapshotOnce(state, false);
         if (second) |result| {
             self.noteStoreRevision(result.store_revision);
             return;
@@ -377,9 +384,7 @@ pub const Storage = struct {
         self: *const Storage,
         state: PersistedState,
         bootstrap: bool,
-        is_retry: bool,
     ) !?headless.store.WriteResult {
-        _ = is_retry;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -515,7 +520,19 @@ pub const Storage = struct {
         });
     }
 
+    /// NEW-2: skip ensureDaemon when persistence is already known unavailable so
+    /// surface/completion event threads do not stall up to 5s on every click.
+    /// Mirrors the frame-loop `next_flush_attempt_ms` gate (lifecycle_controller)
+    /// via the shared `persistence_available` clock — restored only by a successful
+    /// write receipt (`noteStoreRevision`) or explicit recovery.
+    fn ensureGranularMutationAllowed(self: *const Storage) !void {
+        if (!self.isPersistenceAvailable()) return error.SessionDaemonUnavailable;
+    }
+
     /// On unknown-client (daemon restart), clear cache, re-register, retry once (MAJOR-1).
+    /// Granular StoreRevisionConflict is intentionally not refresh+retried here:
+    /// the next whole-snapshot flush (`replaceSnapshot`) refreshes the guard and
+    /// self-heals. Event-thread mutators must stay cheap (no nested refresh/IPC).
     fn withClientRetry(
         self: *const Storage,
         arena: std.mem.Allocator,
@@ -563,9 +580,10 @@ pub const Storage = struct {
                 // Do not mark unavailable yet — caller may refresh+retry once.
                 return error.StoreRevisionConflict;
             }
+            // NEW-5(c): sniff only the daemon's actual message ("unknown client_id"),
+            // not a broad "client_id" substring that would spuriously re-register.
             if (std.mem.eql(u8, err.code, headless.protocol.ERR_INVALID_PARAMS) and
-                (std.mem.indexOf(u8, err.message, "unknown client") != null or
-                    std.mem.indexOf(u8, err.message, "client_id") != null))
+                std.mem.indexOf(u8, err.message, "unknown client_id") != null)
             {
                 return error.UnknownClientId;
             }

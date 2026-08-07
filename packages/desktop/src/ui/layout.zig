@@ -224,6 +224,8 @@ pub fn isSidebarAnimating() bool {
 
 /// Top-of-window banner when daemon-backed persistence is unavailable or wedged.
 /// Region: full-width strip under the title bar; yellow warning chrome.
+/// NEW-5(d): y=0 anchors over whatever occupies the top strip (cosmetic overlay);
+/// narrow-width text relies on the clip rect alone for truncation.
 fn renderPersistenceBanner(state: *runtime.AppState, width: f32, height: f32) void {
     _ = height;
     if (state.storage.isPersistenceAvailable()) return;
