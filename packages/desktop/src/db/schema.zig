@@ -5,6 +5,8 @@ const zqlite = @import("zqlite");
 
 /// Latest schema version understood by this build.
 pub const CURRENT_VERSION: i64 = 1;
+/// Maximum schema version understood by read-only clients and the daemon store.
+pub const MAX_SUPPORTED_VERSION: i64 = 2;
 /// SQLite busy timeout shared by writer and read-only connections.
 pub const BUSY_TIMEOUT_MS = 5000;
 
@@ -107,12 +109,24 @@ pub const INIT_SQL: [:0]const u8 =
 ;
 
 pub fn initialize(conn: zqlite.Conn) !void {
+    try initializeToVersion(conn, CURRENT_VERSION);
+}
+
+/// Initialize a writer connection to the requested schema version.
+///
+/// The normal desktop writer deliberately requests v1. The daemon store is
+/// the only caller that requests v2 while the store remains dormant in
+/// production.
+pub fn initializeToVersion(conn: zqlite.Conn, target_version: i64) !void {
+    if (target_version < CURRENT_VERSION or target_version > MAX_SUPPORTED_VERSION) {
+        return error.DatabaseSchemaInvalid;
+    }
     try conn.busyTimeout(BUSY_TIMEOUT_MS);
     const initial_version = try userVersion(conn);
-    if (initial_version > CURRENT_VERSION) return error.DatabaseSchemaTooNew;
+    if (initial_version > target_version) return error.DatabaseSchemaTooNew;
 
-    if (initial_version < CURRENT_VERSION) {
-        try migrate(conn, .none);
+    if (initial_version < target_version) {
+        try migrateToVersion(conn, target_version, .none);
     }
 
     try conn.execNoArgs(
@@ -126,7 +140,7 @@ pub fn initialize(conn: zqlite.Conn) !void {
 pub fn validateReadOnly(conn: zqlite.Conn) !void {
     const version = try userVersion(conn);
     if (version < 0) return error.DatabaseSchemaInvalid;
-    if (version > CURRENT_VERSION) return error.DatabaseSchemaTooNew;
+    if (version > MAX_SUPPORTED_VERSION) return error.DatabaseSchemaTooNew;
     if (version < CURRENT_VERSION) return error.DatabaseSchemaTooOld;
 }
 
@@ -136,12 +150,20 @@ const MigrationFailurePoint = enum {
 };
 
 fn migrate(conn: zqlite.Conn, comptime failure_point: MigrationFailurePoint) !void {
+    try migrateToVersion(conn, CURRENT_VERSION, failure_point);
+}
+
+fn migrateToVersion(
+    conn: zqlite.Conn,
+    target_version: i64,
+    comptime failure_point: MigrationFailurePoint,
+) !void {
     try conn.execNoArgs("begin immediate");
     errdefer conn.rollback();
 
     var version = try userVersion(conn);
-    if (version > CURRENT_VERSION) return error.DatabaseSchemaTooNew;
-    while (version < CURRENT_VERSION) {
+    if (version > target_version) return error.DatabaseSchemaTooNew;
+    while (version < target_version) {
         switch (version) {
             0 => {
                 try migrateV0ToV1(conn);
@@ -149,11 +171,47 @@ fn migrate(conn: zqlite.Conn, comptime failure_point: MigrationFailurePoint) !vo
                 try conn.execNoArgs("pragma user_version = 1");
                 version = 1;
             },
+            1 => {
+                try migrateV1ToV2(conn);
+                if (failure_point == .before_version_bump) return error.TestMigrationFailure;
+                try conn.execNoArgs("pragma user_version = 2");
+                version = 2;
+            },
             else => return error.DatabaseSchemaInvalid,
         }
     }
 
     try conn.commit();
+}
+
+fn migrateV1ToV2(conn: zqlite.Conn) !void {
+    try conn.execNoArgs(
+        \\create table if not exists store_state (
+        \\    id integer primary key check (id = 1),
+        \\    store_revision integer not null check (store_revision >= 0)
+        \\);
+        \\insert or ignore into store_state (id, store_revision) values (1, 0);
+        \\create table if not exists store_receipts (
+        \\    request_key text primary key,
+        \\    operation text not null,
+        \\    fingerprint text not null,
+        \\    store_revision integer not null check (store_revision >= 0),
+        \\    response_payload text not null,
+        \\    response_status integer not null default 0
+        \\);
+        \\create table if not exists client_message_keys (
+        \\    thread_id integer not null references threads(id) on delete cascade,
+        \\    message_id text not null,
+        \\    message_fingerprint text not null,
+        \\    sort_index integer not null,
+        \\    created_at_ms integer,
+        \\    updated_at_ms integer,
+        \\    store_revision integer not null check (store_revision >= 0),
+        \\    primary key (thread_id, message_id)
+        \\);
+        \\create unique index if not exists threads_workspace_local_thread_id_idx
+        \\    on threads(workspace_id, local_thread_id) where local_thread_id is not null;
+    );
 }
 
 fn migrateV0ToV1(conn: zqlite.Conn) !void {
