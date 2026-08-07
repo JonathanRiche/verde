@@ -39,6 +39,10 @@ var in_process_write_mutex: InProcessWriteMutex = .{};
 
 pub const STATE_DB_NAME = "state.sqlite";
 
+const NoopLoadHook = struct {
+    fn afterAppStateRead(_: @This()) !void {}
+};
+
 pub const Client = struct {
     const Self = @This();
 
@@ -68,17 +72,46 @@ pub const Client = struct {
         };
     }
 
+    /// Open an existing database without write capability or schema changes.
+    pub fn initReadOnly(allocator: std.mem.Allocator, pref_path: []const u8) !Self {
+        const path = try pathForPrefPath(allocator, pref_path);
+        errdefer allocator.free(path);
+
+        const flags = zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode;
+        const conn = try zqlite.open(path, flags);
+        errdefer conn.close();
+
+        try conn.busyTimeout(schema.BUSY_TIMEOUT_MS);
+        try schema.validateReadOnly(conn);
+        return .{
+            .allocator = allocator,
+            .path = path,
+            .conn = conn,
+        };
+    }
+
     pub fn deinit(self: *Self) void {
         self.conn.close();
         self.allocator.free(self.path);
     }
 
+    /// Load a consistent snapshot; do not call this while `self.conn` has an open transaction.
     pub fn load(self: *const Self, backing_allocator: std.mem.Allocator) !?LoadedState {
+        return self.loadSnapshot(backing_allocator, NoopLoadHook{});
+    }
+
+    fn loadSnapshot(self: *const Self, backing_allocator: std.mem.Allocator, hook: anytype) !?LoadedState {
+        try self.conn.transaction();
+        errdefer self.conn.rollback();
+
         const row = try self.conn.row(
             "select selected_workspace_index, sidebar_collapsed from app_state where id = 1",
             .{},
         );
-        if (row == null) return null;
+        if (row == null) {
+            try self.conn.commit();
+            return null;
+        }
 
         var loaded = LoadedState.init(backing_allocator);
         errdefer loaded.deinit();
@@ -89,6 +122,8 @@ pub const Client = struct {
             loaded.value.selected_project_index = @intCast(state_row.int(0));
             loaded.value.sidebar_collapsed = state_row.int(1) != 0;
         }
+
+        try hook.afterAppStateRead();
 
         const arena = loaded.allocator();
         var workspaces: std.ArrayList(PersistedProject) = .empty;
@@ -139,6 +174,7 @@ pub const Client = struct {
         loaded.value.projects = try workspaces.toOwnedSlice(arena);
         loaded.value.surface_states = try self.loadSurfaceStates(arena);
         loaded.value.chat_completions = try self.loadChatCompletions(arena);
+        try self.conn.commit();
         return loaded;
     }
 
@@ -823,6 +859,89 @@ test "fresh database initializes at the current schema version" {
     try testExpectDatabaseChecks(client.conn);
 }
 
+test "read-only open cannot migrate a legacy database" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+    try testCreateLegacyFixture(pref_path);
+
+    try testing.expectError(error.DatabaseSchemaTooOld, Client.initReadOnly(testing.allocator, pref_path));
+
+    const conn = try testOpenDatabase(testing.allocator, pref_path);
+    defer conn.close();
+    try testing.expectEqual(@as(i64, 0), try testUserVersion(conn));
+    try testing.expect(!try schema.testHasColumn(conn, "threads", "reasoning_variant"));
+    try testExpectRowCount(conn, "messages", 5);
+}
+
+test "read-only open loads a current database" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+
+    {
+        var writer = try Client.init(testing.allocator, pref_path);
+        defer writer.deinit();
+        try writer.save(.{ .sidebar_collapsed = true });
+    }
+
+    var reader = try Client.initReadOnly(testing.allocator, pref_path);
+    defer reader.deinit();
+    var busy_timeout = (try reader.conn.row("pragma busy_timeout", .{})).?;
+    defer busy_timeout.deinit();
+    try testing.expectEqual(@as(i64, schema.BUSY_TIMEOUT_MS), busy_timeout.int(0));
+    var loaded = (try reader.load(testing.allocator)).?;
+    defer loaded.deinit();
+    try testing.expect(loaded.value.sidebar_collapsed);
+    try testing.expectError(error.ReadOnly, reader.conn.execNoArgs("delete from app_state"));
+}
+
+test "load holds one WAL snapshot across all reads" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+
+    var writer = try Client.init(testing.allocator, pref_path);
+    defer writer.deinit();
+    try writer.save(.{
+        .selected_project_index = 0,
+        .projects = &.{.{
+            .id = "workspace-1",
+            .label = "before",
+            .path = "/tmp/workspace",
+        }},
+    });
+
+    var reader = try Client.initReadOnly(testing.allocator, pref_path);
+    defer reader.deinit();
+    const UpdateAfterFirstRead = struct {
+        conn: zqlite.Conn,
+
+        fn afterAppStateRead(self: @This()) !void {
+            try self.conn.transaction();
+            errdefer self.conn.rollback();
+            try self.conn.execNoArgs(
+                \\update app_state set selected_workspace_index = 1 where id = 1;
+                \\update workspaces set label = 'after' where workspace_id = 'workspace-1';
+            );
+            try self.conn.commit();
+        }
+    };
+
+    var loaded = (try reader.loadSnapshot(testing.allocator, UpdateAfterFirstRead{ .conn = writer.conn })).?;
+    defer loaded.deinit();
+    try testing.expectEqual(@as(usize, 0), loaded.value.selected_project_index);
+    try testing.expectEqualStrings("before", loaded.value.projects[0].label);
+
+    var current = (try writer.load(testing.allocator)).?;
+    defer current.deinit();
+    try testing.expectEqual(@as(usize, 1), current.value.selected_project_index);
+    try testing.expectEqualStrings("after", current.value.projects[0].label);
+}
+
 test "pre-versioning fixture migrates without transcript or ledger loss" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -959,6 +1078,7 @@ test "newer schema version is rejected without touching the database" {
     const before = try tmp.dir.readFileAlloc(testing.io, STATE_DB_NAME, testing.allocator, .unlimited);
     defer testing.allocator.free(before);
 
+    try testing.expectError(error.DatabaseSchemaTooNew, Client.initReadOnly(testing.allocator, pref_path));
     try testing.expectError(error.DatabaseSchemaTooNew, Client.init(testing.allocator, pref_path));
 
     const after = try tmp.dir.readFileAlloc(testing.io, STATE_DB_NAME, testing.allocator, .unlimited);
@@ -994,6 +1114,7 @@ test "newer WAL schema rejection leaves WAL state untouched" {
     defer testing.allocator.free(main_before);
     const wal_before = try tmp.dir.readFileAlloc(testing.io, STATE_DB_NAME ++ "-wal", testing.allocator, .unlimited);
     defer testing.allocator.free(wal_before);
+    try testing.expectError(error.DatabaseSchemaTooNew, Client.initReadOnly(testing.allocator, pref_path));
     try testing.expectError(error.DatabaseSchemaTooNew, Client.init(testing.allocator, pref_path));
 
     const main_after = try tmp.dir.readFileAlloc(testing.io, STATE_DB_NAME, testing.allocator, .unlimited);

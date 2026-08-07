@@ -5,6 +5,8 @@ const zqlite = @import("zqlite");
 
 /// Latest schema version understood by this build.
 pub const CURRENT_VERSION: i64 = 1;
+/// SQLite busy timeout shared by writer and read-only connections.
+pub const BUSY_TIMEOUT_MS = 5000;
 
 pub const INIT_SQL: [:0]const u8 =
     \\create table if not exists app_state (
@@ -105,7 +107,7 @@ pub const INIT_SQL: [:0]const u8 =
 ;
 
 pub fn initialize(conn: zqlite.Conn) !void {
-    try conn.busyTimeout(5000);
+    try conn.busyTimeout(BUSY_TIMEOUT_MS);
     const initial_version = try userVersion(conn);
     if (initial_version > CURRENT_VERSION) return error.DatabaseSchemaTooNew;
 
@@ -117,6 +119,15 @@ pub fn initialize(conn: zqlite.Conn) !void {
         \\pragma foreign_keys = on;
         \\pragma journal_mode = wal;
     );
+}
+
+/// Validate that a read-only connection can consume the schema without
+/// attempting initialization or migration.
+pub fn validateReadOnly(conn: zqlite.Conn) !void {
+    const version = try userVersion(conn);
+    if (version < 0) return error.DatabaseSchemaInvalid;
+    if (version > CURRENT_VERSION) return error.DatabaseSchemaTooNew;
+    if (version < CURRENT_VERSION) return error.DatabaseSchemaTooOld;
 }
 
 const MigrationFailurePoint = enum {
