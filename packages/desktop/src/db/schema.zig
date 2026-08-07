@@ -6,7 +6,7 @@ const zqlite = @import("zqlite");
 /// Latest schema version understood by this build.
 pub const CURRENT_VERSION: i64 = 1;
 /// Maximum schema version understood by read-only clients and the daemon store.
-pub const MAX_SUPPORTED_VERSION: i64 = 3;
+pub const MAX_SUPPORTED_VERSION: i64 = 4;
 /// SQLite busy timeout shared by writer and read-only connections.
 pub const BUSY_TIMEOUT_MS = 5000;
 
@@ -183,6 +183,12 @@ fn migrateToVersion(
                 try conn.execNoArgs("pragma user_version = 3");
                 version = 3;
             },
+            3 => {
+                try migrateV3ToV4(conn);
+                if (failure_point == .before_version_bump) return error.TestMigrationFailure;
+                try conn.execNoArgs("pragma user_version = 4");
+                version = 4;
+            },
             else => return error.DatabaseSchemaInvalid,
         }
     }
@@ -263,6 +269,44 @@ fn migrateV2ToV3(conn: zqlite.Conn) !void {
     );
 }
 
+fn migrateV3ToV4(conn: zqlite.Conn) !void {
+    try conn.execNoArgs(
+        \\create table if not exists chat_turns (
+        \\    turn_id text primary key,
+        \\    workspace_id text not null,
+        \\    local_thread_id text not null,
+        \\    status text not null check (status in ('accepted', 'running', 'waiting_approval', 'completed', 'failed', 'aborted', 'interrupted')),
+        \\    started_at_ms integer not null,
+        \\    finished_at_ms integer,
+        \\    provider text not null,
+        \\    provider_thread_id text,
+        \\    error_message text,
+        \\    user_message_id text,
+        \\    committed_store_revision integer
+        \\);
+        \\create index if not exists chat_turns_thread_idx
+        \\    on chat_turns(workspace_id, local_thread_id, started_at_ms);
+        \\create index if not exists chat_turns_status_idx
+        \\    on chat_turns(status, started_at_ms);
+    );
+
+    // M3 kept client-visible identity and timestamps in its receipt mapping.
+    // Mirror them on transcript rows so durable reads retain the exact order
+    // emitted by transcript_apply without requiring a private mapping join.
+    try ensureColumn(conn, "messages", "message_id", "alter table messages add column message_id text");
+    try ensureColumn(conn, "messages", "created_at_ms", "alter table messages add column created_at_ms integer");
+    try ensureColumn(conn, "messages", "updated_at_ms", "alter table messages add column updated_at_ms integer");
+    try conn.execNoArgs(
+        \\update messages
+        \\set message_id = (select message_id from client_message_keys where client_message_keys.thread_id = messages.thread_id and client_message_keys.sort_index = messages.sort_index),
+        \\    created_at_ms = (select created_at_ms from client_message_keys where client_message_keys.thread_id = messages.thread_id and client_message_keys.sort_index = messages.sort_index),
+        \\    updated_at_ms = (select updated_at_ms from client_message_keys where client_message_keys.thread_id = messages.thread_id and client_message_keys.sort_index = messages.sort_index)
+        \\where message_id is null;
+        \\create unique index if not exists messages_thread_message_id_idx
+        \\    on messages(thread_id, message_id) where message_id is not null;
+    );
+}
+
 fn migrateV0ToV1(conn: zqlite.Conn) !void {
     try conn.execNoArgs(INIT_SQL);
     try ensureColumn(conn, "app_state", "sidebar_collapsed", "alter table app_state add column sidebar_collapsed integer not null default 0");
@@ -328,7 +372,7 @@ pub fn testHasColumn(conn: zqlite.Conn, table_name: []const u8, column_name: []c
     return false;
 }
 
-test "schema migration chain advances v1 to v2 to v3 and preserves populated v2 data" {
+test "schema migration chain advances v1 to v2 to v3 to v4 and preserves populated v3 data" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -358,6 +402,20 @@ test "schema migration chain advances v1 to v2 to v3 and preserves populated v2 
     try std.testing.expectEqual(@as(i64, 3), try userVersion(conn));
     try std.testing.expect(try testHasColumn(conn, "workspace_leases", "resources_json"));
     try std.testing.expect(try testHasColumn(conn, "terminal_process_outcomes", "cancellation_reason"));
+    try conn.execNoArgs(
+        \\insert into workspaces (workspace_id, sort_index, label, path) values ('v3-workspace', 1, 'V3', '/v3');
+        \\insert into threads (workspace_id, sort_index, title, local_thread_id, provider, harness)
+        \\values ((select id from workspaces where workspace_id = 'v3-workspace'), 0, 'V3 thread', 'v3-thread', 0, 0);
+        \\insert into messages (thread_id, sort_index, role, author, body)
+        \\values ((select id from threads where local_thread_id = 'v3-thread'), 0, 2, 'assistant', 'kept transcript');
+    );
+
+    try migrateToVersion(conn, 4, .none);
+    try std.testing.expectEqual(@as(i64, 4), try userVersion(conn));
+    try std.testing.expect(try testHasColumn(conn, "chat_turns", "committed_store_revision"));
+    try std.testing.expect(try testHasColumn(conn, "messages", "message_id"));
+    try std.testing.expect(try testHasColumn(conn, "messages", "created_at_ms"));
+    try std.testing.expect(try testHasColumn(conn, "messages", "updated_at_ms"));
 
     var workspace = (try conn.row("select label from workspaces where workspace_id = 'chain-workspace'", .{})).?;
     defer workspace.deinit();
@@ -365,6 +423,9 @@ test "schema migration chain advances v1 to v2 to v3 and preserves populated v2 
     var receipt = (try conn.row("select response_payload from store_receipts where request_key = 'chain-key'", .{})).?;
     defer receipt.deinit();
     try std.testing.expectEqualStrings("{}", receipt.text(0));
+    var message = (try conn.row("select body from messages where message_id is null and body = 'kept transcript'", .{})).?;
+    defer message.deinit();
+    try std.testing.expectEqualStrings("kept transcript", message.text(0));
 }
 
 test "v2 to v3 migration failure rolls back transfer tables and preserves v2 data" {
@@ -391,6 +452,32 @@ test "v2 to v3 migration failure rolls back transfer tables and preserves v2 dat
     var receipt = (try conn.row("select response_payload from store_receipts where request_key = 'rollback-key'", .{})).?;
     defer receipt.deinit();
     try std.testing.expectEqualStrings("{\"ok\":true}", receipt.text(0));
+}
+
+test "v3 to v4 migration failure rolls back ledger and ordering columns" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const path = try std.fs.path.joinZ(std.testing.allocator, &.{ path_buf[0..path_len], "state.sqlite" });
+    defer std.testing.allocator.free(path);
+
+    const conn = try zqlite.open(path, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
+    defer conn.close();
+    try migrateToVersion(conn, 3, .none);
+    try conn.execNoArgs(
+        \\insert into workspace_leases (workspace_id, lease_id, owner, client_id, command, resources_json, created_at_ms, expires_at_ms, last_renewal_ms)
+        \\values ('rollback-workspace', 'lease-1', 'owner', 'client', 'build', '[]', 1, 2, 1);
+    );
+
+    try std.testing.expectError(error.TestMigrationFailure, migrateToVersion(conn, 4, .before_version_bump));
+    try std.testing.expectEqual(@as(i64, 3), try userVersion(conn));
+    try std.testing.expect(!try testHasColumn(conn, "chat_turns", "turn_id"));
+    try std.testing.expect(!try testHasColumn(conn, "messages", "message_id"));
+    var lease = (try conn.row("select lease_id from workspace_leases where lease_id = 'lease-1'", .{})).?;
+    defer lease.deinit();
+    try std.testing.expectEqualStrings("lease-1", lease.text(0));
 }
 
 test "failed migration rolls back schema, version, and data" {

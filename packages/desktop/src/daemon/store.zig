@@ -11,6 +11,7 @@ const headless = @import("headless");
 const schema = @import("../db/schema.zig");
 
 const store_protocol = headless.store;
+const protocol = headless.protocol;
 
 pub const StoreError = error{
     Conflict,
@@ -35,6 +36,66 @@ pub const Mutation = union(enum) {
     chat_completion_upsert: store_protocol.NotificationChatCompletionUpsertRequest,
     chat_completion_clear: store_protocol.NotificationChatCompletionClearRequest,
 };
+
+pub const TurnStatus = enum {
+    accepted,
+    running,
+    waiting_approval,
+    completed,
+    failed,
+    aborted,
+    interrupted,
+};
+
+pub const TurnCommitRequest = struct {
+    turn_id: []const u8,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    status: TurnStatus,
+    started_at_ms: i64,
+    finished_at_ms: ?i64 = null,
+    provider: []const u8,
+    provider_thread_id: ?[]const u8 = null,
+    error_message: ?[]const u8 = null,
+    user_message_id: ?[]const u8 = null,
+    /// Rows are already ordered by transcript_apply; the store appends them
+    /// in this order while retaining stable message IDs and timestamps.
+    messages: []const store_protocol.Message = &.{},
+    /// The stop path carries this Q5 input through the commit seam. The pure
+    /// transcript application happens before this store call.
+    followup_pending: bool = false,
+    /// A completed turn gets a notification ledger row. When omitted, the
+    /// store derives it from the turn identity and finish timestamp.
+    completion: ?store_protocol.ChatCompletion = null,
+    /// Internal daemon commits do not need a registered client identity, but
+    /// receipts retain the existing non-empty client-id invariant.
+    client_id: []const u8 = "daemon",
+};
+
+pub const TurnCommit = TurnCommitRequest;
+
+pub const CompactionErrorData = struct {
+    compacted_before_seq: u64,
+};
+
+/// Wire-compatible structured error for a tail cursor below the compaction
+/// horizon. The sessionizer owns the live tail; this helper keeps its error
+/// code and data shape centralized in the store seam.
+pub const CompactionError = struct {
+    code: []const u8,
+    message: []const u8,
+    data: CompactionErrorData,
+};
+
+pub fn compactionError(compacted_before_seq: u64) CompactionError {
+    return .{
+        .code = protocol.ERR_REVISION_EXPIRED,
+        .message = "turn event cursor is below the compaction horizon",
+        .data = .{ .compacted_before_seq = compacted_before_seq },
+    };
+}
+
+pub const revisionExpiredError = compactionError;
 
 pub const TERMINAL_PROCESS_OUTCOME_TTL_MS: i64 = 15 * std.time.ms_per_min;
 
@@ -160,6 +221,7 @@ const SURFACE_UPSERT_OPERATION = store_protocol.METHOD_SURFACE_UPSERT;
 const SURFACE_CLEAR_OPERATION = store_protocol.METHOD_SURFACE_CLEAR;
 const CHAT_COMPLETION_UPSERT_OPERATION = store_protocol.METHOD_NOTIFICATION_CHAT_COMPLETION_UPSERT;
 const CHAT_COMPLETION_CLEAR_OPERATION = store_protocol.METHOD_NOTIFICATION_CHAT_COMPLETION_CLEAR;
+const TURN_COMMIT_OPERATION: []const u8 = "chat.turn.commit";
 const RESPONSE_STATUS_OK: i64 = 0;
 
 pub const Store = struct {
@@ -302,6 +364,63 @@ pub const Store = struct {
 
     pub fn clearChatCompletion(self: *Self, request: store_protocol.NotificationChatCompletionClearRequest) StoreError!store_protocol.WriteResult {
         return self.applyMutation(.{ .chat_completion_clear = request });
+    }
+
+    /// Commit an already-applied terminal transcript and its durable turn
+    /// summary atomically. The generated request key is the public retry
+    /// identity required by the M4 contract, so receipt replay returns the
+    /// original revision without appending rows or bumping the revision.
+    pub fn commitTurn(self: *Self, request: TurnCommitRequest) StoreError!store_protocol.WriteResult {
+        validateTurnCommit(request) catch |err| return err;
+
+        const request_key = std.fmt.allocPrint(self.allocator, "turn:{s}:commit", .{request.turn_id}) catch return error.OutOfMemory;
+        defer self.allocator.free(request_key);
+        const header: store_protocol.MutationHeader = .{
+            .request_key = request_key,
+            .client_id = request.client_id,
+        };
+        const fingerprint = self.encodeFingerprint(request) catch |err| return err;
+        defer self.allocator.free(fingerprint);
+
+        self.conn.execNoArgs("begin immediate") catch |err| return mapStoreError(err);
+        var transaction_open = true;
+        defer if (transaction_open) self.conn.rollback();
+
+        const prior_receipt = self.receiptFor(header, TURN_COMMIT_OPERATION, fingerprint) catch |err| return mapStoreError(err);
+        if (prior_receipt) |result| {
+            self.conn.rollback();
+            transaction_open = false;
+            return result;
+        }
+
+        const current_revision = self.readStoreRevision() catch |err| return mapStoreError(err);
+        const next_revision = std.math.add(u64, current_revision, 1) catch return error.StoreUnavailable;
+        const next_revision_sql: i64 = std.math.cast(i64, next_revision) orelse return error.StoreUnavailable;
+
+        self.insertTurnMessages(request, next_revision_sql) catch |err| return mapStoreError(err);
+        self.insertTurnLedger(request, next_revision_sql) catch |err| return mapStoreError(err);
+        if (request.status == .completed) {
+            const completion: store_protocol.ChatCompletion = request.completion orelse .{
+                .workspace_id = request.workspace_id,
+                .local_thread_id = request.local_thread_id,
+                .completed_at_ms = request.finished_at_ms orelse request.started_at_ms,
+            };
+            self.applyChatCompletionUpsert(completion) catch |err| return mapStoreError(err);
+        }
+
+        self.conn.exec(
+            "update store_state set store_revision = ?1 where id = 1",
+            .{next_revision_sql},
+        ) catch |err| return mapStoreError(err);
+        const result: store_protocol.WriteResult = .{
+            .store_revision = next_revision,
+            .applied = true,
+            .duplicate = false,
+        };
+        self.insertReceipt(header, TURN_COMMIT_OPERATION, fingerprint, result) catch |err| return mapStoreError(err);
+        self.conn.commit() catch |err| return mapStoreError(err);
+        transaction_open = false;
+        return result;
     }
 
     /// Replace the drain transfer snapshot in one transaction. The transfer is
@@ -579,12 +698,20 @@ pub const Store = struct {
         self: *const Self,
         request: store_protocol.MessageAppendRequest,
     ) !?MessageKeyStatus {
-        const message = request.message;
+        return self.messageKeyStatusFor(request.workspace_id, request.thread_id, request.message);
+    }
+
+    fn messageKeyStatusFor(
+        self: *const Self,
+        workspace_id: []const u8,
+        local_thread_id: []const u8,
+        message: store_protocol.Message,
+    ) !?MessageKeyStatus {
         const fingerprint = self.encodeFingerprint(message) catch |err| return err;
         defer self.allocator.free(fingerprint);
         const thread_row = (try self.conn.row(
             "select t.id from threads t join workspaces w on w.id = t.workspace_id where w.workspace_id = ?1 and t.local_thread_id = ?2",
-            .{ request.workspace_id, request.thread_id },
+            .{ workspace_id, local_thread_id },
         )) orelse return error.ResourceNotFound;
         defer thread_row.deinit();
         const thread_id = thread_row.int(0);
@@ -777,6 +904,55 @@ pub const Store = struct {
                 sort_index,
                 request.message.created_at_ms,
                 request.message.updated_at_ms,
+                store_revision,
+            },
+        );
+    }
+
+    fn insertTurnMessages(self: *Self, request: TurnCommitRequest, store_revision: i64) !void {
+        const thread_row = (try self.conn.row(
+            "select t.id from threads t join workspaces w on w.id = t.workspace_id where w.workspace_id = ?1 and t.local_thread_id = ?2",
+            .{ request.workspace_id, request.local_thread_id },
+        )) orelse return error.ResourceNotFound;
+        defer thread_row.deinit();
+        const thread_id = thread_row.int(0);
+
+        const next_sort_row = (try self.conn.row(
+            "select coalesce(max(sort_index) + 1, 0) from messages where thread_id = ?1",
+            .{thread_id},
+        )) orelse return error.StoreCorrupt;
+        defer next_sort_row.deinit();
+        var next_sort = next_sort_row.int(0);
+
+        for (request.messages) |message| {
+            if (message.message_id.len == 0) return error.InvalidParams;
+            if (self.messageKeyStatusFor(request.workspace_id, request.local_thread_id, message)) |existing| {
+                if (existing) |status| {
+                    if (status.conflict) return error.Conflict;
+                    continue;
+                }
+            } else |err| return err;
+
+            try self.insertMessage(thread_id, next_sort, message);
+            try self.insertMessageKey(thread_id, next_sort, message, store_revision);
+            next_sort += 1;
+        }
+    }
+
+    fn insertTurnLedger(self: *Self, request: TurnCommitRequest, store_revision: i64) !void {
+        try self.conn.exec(
+            "insert into chat_turns (turn_id, workspace_id, local_thread_id, status, started_at_ms, finished_at_ms, provider, provider_thread_id, error_message, user_message_id, committed_store_revision) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            .{
+                request.turn_id,
+                request.workspace_id,
+                request.local_thread_id,
+                @tagName(request.status),
+                request.started_at_ms,
+                request.finished_at_ms,
+                request.provider,
+                request.provider_thread_id,
+                request.error_message,
+                request.user_message_id,
                 store_revision,
             },
         );
@@ -997,7 +1173,7 @@ pub const Store = struct {
         const image = try firstAttachment(message.image, message.images);
 
         try self.conn.exec(
-            "insert into messages (thread_id, sort_index, role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "insert into messages (thread_id, sort_index, role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status, message_id, created_at_ms, updated_at_ms) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             .{
                 thread_row_id,
                 sort_index,
@@ -1010,6 +1186,9 @@ pub const Store = struct {
                 message.tool_call_id,
                 kind_code,
                 status_code,
+                if (message.message_id.len != 0) message.message_id else null,
+                message.created_at_ms,
+                message.updated_at_ms,
             },
         );
     }
@@ -1117,6 +1296,21 @@ fn validateMutation(mutation: Mutation) StoreError!void {
         .chat_completion_clear => |request| {
             if (request.workspace_id.len == 0 or request.local_thread_id.len == 0) return error.InvalidParams;
         },
+    }
+}
+
+fn validateTurnCommit(request: TurnCommitRequest) StoreError!void {
+    if (request.turn_id.len == 0 or request.workspace_id.len == 0 or request.local_thread_id.len == 0 or request.provider.len == 0) {
+        return error.InvalidParams;
+    }
+    if (request.client_id.len == 0) return error.InvalidParams;
+    if (request.completion) |completion| {
+        if (!std.mem.eql(u8, completion.workspace_id, request.workspace_id) or
+            !std.mem.eql(u8, completion.local_thread_id, request.local_thread_id)) return error.InvalidParams;
+    }
+    for (request.messages) |message| {
+        if (message.message_id.len == 0) return error.InvalidParams;
+        _ = try firstAttachment(message.image, message.images);
     }
 }
 
@@ -1510,6 +1704,167 @@ test "lease and terminal outcome transfer is durable, pruned, and one revision" 
     try std.testing.expectEqual(@as(u64, 1), try store.storeRevision());
 }
 
+test "turn commit is durable, ordered, exactly once, and revision guarded by receipt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    const workspace = testWorkspace("workspace-turn", "Turn workspace");
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("turn-workspace", null),
+        .workspace = workspace,
+    });
+    const thread = testThread("thread-turn", "Turn thread");
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("turn-thread", 1),
+        .workspace_id = workspace.workspace_id,
+        .thread = thread,
+    });
+
+    const messages = [_]store_protocol.Message{
+        .{
+            .message_id = "turn-message-1",
+            .role = "assistant",
+            .author = "codex",
+            .body = "first row",
+            .created_at_ms = 101,
+            .updated_at_ms = 102,
+        },
+        .{
+            .message_id = "turn-message-2",
+            .role = "system",
+            .author = "System",
+            .body = "second row",
+            .created_at_ms = 103,
+            .updated_at_ms = 104,
+        },
+    };
+    const request: TurnCommitRequest = .{
+        .turn_id = "turn-1",
+        .workspace_id = workspace.workspace_id,
+        .local_thread_id = thread.local_thread_id,
+        .status = .completed,
+        .started_at_ms = 100,
+        .finished_at_ms = 110,
+        .provider = "codex",
+        .provider_thread_id = "provider-turn-1",
+        .user_message_id = "user-message-1",
+        .messages = &messages,
+        .completion = .{
+            .workspace_id = workspace.workspace_id,
+            .local_thread_id = thread.local_thread_id,
+            .completed_at_ms = 110,
+        },
+    };
+
+    const first = try store.commitTurn(request);
+    try std.testing.expectEqual(@as(u64, 3), first.store_revision);
+    try std.testing.expect(first.applied);
+    try std.testing.expect(!first.duplicate);
+    try std.testing.expectEqual(@as(u64, 3), try store.storeRevision());
+
+    var rows = try store.conn.rows(
+        "select message_id, body, created_at_ms, updated_at_ms from messages where thread_id = (select id from threads where local_thread_id = ?1) order by sort_index",
+        .{thread.local_thread_id},
+    );
+    defer rows.deinit();
+    var row_count: usize = 0;
+    while (rows.next()) |row| : (row_count += 1) {
+        if (row_count == 0) {
+            try std.testing.expectEqualStrings("turn-message-1", row.text(0));
+            try std.testing.expectEqualStrings("first row", row.text(1));
+            try std.testing.expectEqual(@as(i64, 101), row.int(2));
+            try std.testing.expectEqual(@as(i64, 102), row.int(3));
+        } else if (row_count == 1) {
+            try std.testing.expectEqualStrings("turn-message-2", row.text(0));
+            try std.testing.expectEqualStrings("second row", row.text(1));
+            try std.testing.expectEqual(@as(i64, 103), row.int(2));
+            try std.testing.expectEqual(@as(i64, 104), row.int(3));
+        }
+    }
+    if (rows.err) |err| return err;
+    try std.testing.expectEqual(@as(usize, 2), row_count);
+
+    var ledger = (try store.conn.row(
+        "select status, provider_thread_id, user_message_id, committed_store_revision from chat_turns where turn_id = ?1",
+        .{request.turn_id},
+    )).?;
+    defer ledger.deinit();
+    try std.testing.expectEqualStrings("completed", ledger.text(0));
+    try std.testing.expectEqualStrings("provider-turn-1", ledger.text(1));
+    try std.testing.expectEqualStrings("user-message-1", ledger.text(2));
+    try std.testing.expectEqual(@as(i64, 3), ledger.int(3));
+
+    var completion = (try store.conn.row(
+        "select count(*) from chat_completions where workspace_id = ?1 and local_thread_id = ?2",
+        .{ workspace.workspace_id, thread.local_thread_id },
+    )).?;
+    defer completion.deinit();
+    try std.testing.expectEqual(@as(i64, 1), completion.int(0));
+
+    const replay = try store.commitTurn(request);
+    try std.testing.expectEqual(first.store_revision, replay.store_revision);
+    try std.testing.expect(replay.applied);
+    try std.testing.expect(!replay.duplicate);
+    try std.testing.expectEqual(@as(u64, 3), try store.storeRevision());
+
+    var replay_rows = (try store.conn.row(
+        "select count(*) from messages where thread_id = (select id from threads where local_thread_id = ?1)",
+        .{thread.local_thread_id},
+    )).?;
+    defer replay_rows.deinit();
+    try std.testing.expectEqual(@as(i64, 2), replay_rows.int(0));
+}
+
+test "aborted turn carries followup intent and compaction expiry uses revision_expired data" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    const workspace = testWorkspace("workspace-aborted", "Aborted workspace");
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("aborted-workspace", null),
+        .workspace = workspace,
+    });
+    const thread = testThread("thread-aborted", "Aborted thread");
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("aborted-thread", 1),
+        .workspace_id = workspace.workspace_id,
+        .thread = thread,
+    });
+
+    const request: TurnCommitRequest = .{
+        .turn_id = "turn-aborted",
+        .workspace_id = workspace.workspace_id,
+        .local_thread_id = thread.local_thread_id,
+        .status = .aborted,
+        .started_at_ms = 200,
+        .finished_at_ms = 210,
+        .provider = "codex",
+        .followup_pending = true,
+    };
+    const result = try store.commitTurn(request);
+    try std.testing.expectEqual(@as(u64, 3), result.store_revision);
+    var ledger = (try store.conn.row("select status from chat_turns where turn_id = ?1", .{request.turn_id})).?;
+    defer ledger.deinit();
+    try std.testing.expectEqualStrings("aborted", ledger.text(0));
+
+    const expiry = compactionError(17);
+    try std.testing.expectEqualStrings(protocol.ERR_REVISION_EXPIRED, expiry.code);
+    try std.testing.expectEqual(@as(u64, 17), expiry.data.compacted_before_seq);
+    const encoded = try store_protocol.encode(std.testing.allocator, expiry);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "compacted_before_seq") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "revision_expired") != null);
+}
+
 test "store commit increments durable revision and survives reopen" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1537,7 +1892,7 @@ test "store commit increments durable revision and survives reopen" {
     try std.testing.expectEqualStrings("First", label);
 }
 
-test "store migrates populated v1 WAL state into the v3 chain" {
+test "store migrates populated v1 WAL state into the v4 chain" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const db_path = try testDbPath(&tmp);
@@ -1554,7 +1909,7 @@ test "store migrates populated v1 WAL state into the v3 chain" {
 
     var store = try Store.init(std.testing.allocator, db_path);
     defer store.deinit();
-    try std.testing.expectEqual(@as(i64, 3), blk: {
+    try std.testing.expectEqual(@as(i64, 4), blk: {
         const row = (try store.conn.row("pragma user_version", .{})).?;
         defer row.deinit();
         break :blk row.int(0);
