@@ -1021,8 +1021,11 @@ pub const Store = struct {
     }
 
     fn insertTurnLedger(self: *Self, request: TurnCommitRequest, store_revision: i64) !void {
+        // Upsert: supersedes acceptance-stage / interrupted rows inside commitTurn's
+        // transaction (no external pre-delete). Receipt replay still short-circuits
+        // before this call, so a duplicate commit never mutates the ledger.
         try self.conn.exec(
-            "insert into chat_turns (turn_id, workspace_id, local_thread_id, status, started_at_ms, finished_at_ms, provider, provider_thread_id, error_message, user_message_id, committed_store_revision) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "insert into chat_turns (turn_id, workspace_id, local_thread_id, status, started_at_ms, finished_at_ms, provider, provider_thread_id, error_message, user_message_id, committed_store_revision) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) on conflict(turn_id) do update set workspace_id = excluded.workspace_id, local_thread_id = excluded.local_thread_id, status = excluded.status, started_at_ms = excluded.started_at_ms, finished_at_ms = excluded.finished_at_ms, provider = excluded.provider, provider_thread_id = excluded.provider_thread_id, error_message = excluded.error_message, user_message_id = excluded.user_message_id, committed_store_revision = excluded.committed_store_revision",
             .{
                 request.turn_id,
                 request.workspace_id,
