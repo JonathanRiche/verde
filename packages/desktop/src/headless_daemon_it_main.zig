@@ -484,6 +484,21 @@ fn deleteItPath(io: std.Io, path: []const u8) void {
     }
 }
 
+/// Connect/EOF-class transport errors: the peer is gone or mid-teardown.
+/// Matches the durable exit-wait discrimination plus the EOF class seen when
+/// prepareShutdown's drain thread tears down the endpoint under a racing probe
+/// (ConnectionResetByPeer / ConnectionAborted). Not OOM/protocol/timeouts.
+fn isConnectClassError(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionRefused,
+        error.FileNotFound,
+        error.ConnectionResetByPeer,
+        error.ConnectionAborted,
+        => true,
+        else => false,
+    };
+}
+
 /// Wait for a child to exit with a deadline; kill on timeout so a regression
 /// fails instead of hanging the IT binary forever.
 fn waitChildBounded(child: *std.process.Child, io: std.Io, timeout_ms: u64) !std.process.Child.Term {
@@ -2052,6 +2067,8 @@ fn runStoreEnabledScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     }
 
     // Two-client conflict: A and B both read N; A applies expected N; B's expected N conflicts.
+    // Track the post-A revision so the S2 storeStatus revision pin below stays accurate.
+    var expected_store_revision: u64 = 4; // ordering block ends at revision 4
     {
         const empty_params: struct {} = .{};
         var status_parsed = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params);
@@ -2059,6 +2076,7 @@ fn runStoreEnabledScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         if (!status_parsed.response.isOk()) return error.StoreEnabledTwoClientStatusFailed;
         const status = try client.decodeStoreStatus(&status_parsed);
         const n = status.store_revision;
+        if (n != expected_store_revision) return error.StoreEnabledTwoClientUnexpectedN;
 
         const a_upsert: headless.store.WorkspaceUpsertRequest = .{
             .mutation = .{
@@ -2077,6 +2095,7 @@ fn runStoreEnabledScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         if (!a_parsed.response.isOk()) return error.StoreEnabledTwoClientAFailed;
         const a_result = try client.decodeWriteResult(&a_parsed);
         if (!a_result.applied or a_result.store_revision != n + 1) return error.StoreEnabledTwoClientANotApplied;
+        expected_store_revision = a_result.store_revision;
 
         const b_snapshot: headless.store.SnapshotReplaceRequest = .{
             .mutation = .{
@@ -2106,6 +2125,9 @@ fn runStoreEnabledScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         if (!status_parsed.response.isOk()) return error.StoreEnabledStatusFailed;
         const status = try client.decodeStoreStatus(&status_parsed);
         if (!std.mem.eql(u8, status.drain_state, "open")) return error.StoreEnabledDrainStateWrong;
+        // S2 pin restored: status revision must match the current expected watermark
+        // (advanced past first_result by the ordering + two-client blocks).
+        if (status.store_revision != expected_store_revision) return error.StoreEnabledStatusRevisionMismatch;
         if (!status.writer_ready) return error.StoreEnabledWriterNotReady;
     }
 
@@ -2338,7 +2360,10 @@ fn runStoreDurableReopenScenario(allocator: std.mem.Allocator, io: std.Io) !void
         var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
             .store_dir = store_dir,
         });
-        // prepareShutdown should exit the child; kill only if it hangs.
+        // No defer kill: prepareShutdown should exit the child. Kill on bare-try
+        // unwind until prepare is accepted (pre-prepare orphan would hold the endpoint).
+        var kill_on_unwind = true;
+        errdefer if (kill_on_unwind) child.kill(io);
 
         var decode_arena = std.heap.ArenaAllocator.init(allocator);
         defer decode_arena.deinit();
@@ -2351,10 +2376,7 @@ fn runStoreDurableReopenScenario(allocator: std.mem.Allocator, io: std.Io) !void
 
         var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
         defer register_parsed.deinit();
-        if (!register_parsed.response.isOk()) {
-            child.kill(io);
-            return error.StoreDurableRegisterFailed;
-        }
+        if (!register_parsed.response.isOk()) return error.StoreDurableRegisterFailed;
         const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
 
         const upsert: headless.store.WorkspaceUpsertRequest = .{
@@ -2370,40 +2392,28 @@ fn runStoreDurableReopenScenario(allocator: std.mem.Allocator, io: std.Io) !void
         };
         var first = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, upsert);
         defer first.deinit();
-        if (!first.response.isOk()) {
-            child.kill(io);
-            return error.StoreDurableUpsertFailed;
-        }
+        if (!first.response.isOk()) return error.StoreDurableUpsertFailed;
         const first_result = try client.decodeWriteResult(&first);
-        if (!first_result.applied) {
-            child.kill(io);
-            return error.StoreDurableUpsertNotApplied;
-        }
+        if (!first_result.applied) return error.StoreDurableUpsertNotApplied;
         persisted_revision = first_result.store_revision;
 
         var prepare_parsed = try client.call("daemon.prepareShutdown", .{});
         defer prepare_parsed.deinit();
-        if (!prepare_parsed.response.isOk()) {
-            child.kill(io);
+        if (!prepare_parsed.response.isOk()) return error.StoreDurablePrepareNotAccepted;
+        const prepare_result = prepare_parsed.arena_parsed.value.object.get("result") orelse
             return error.StoreDurablePrepareNotAccepted;
-        }
-        const prepare_result = prepare_parsed.arena_parsed.value.object.get("result") orelse {
-            child.kill(io);
+        const accepted = prepare_result.object.get("accepted") orelse
             return error.StoreDurablePrepareNotAccepted;
-        };
-        const accepted = prepare_result.object.get("accepted") orelse {
-            child.kill(io);
-            return error.StoreDurablePrepareNotAccepted;
-        };
-        if (accepted != .bool or !accepted.bool) {
-            child.kill(io);
-            return error.StoreDurablePrepareNotAccepted;
-        }
+        if (accepted != .bool or !accepted.bool) return error.StoreDurablePrepareNotAccepted;
+
+        // Prepare accepted: daemon will self-exit via the drain path.
+        kill_on_unwind = false;
 
         // Post-drain rejection on a still-live daemon: mutator → invalid_state;
         // storeStatus still answers with drain_state=draining. The drain thread
-        // may race exit after prepare; treat connect failures as "already gone"
-        // only after we attempted the gate (unit tests pin the non-race path).
+        // may race exit after prepare; only connect/EOF-class errors mean "already
+        // gone". Other errors (OOM, protocol, unexpected success shape) propagate.
+        // Unit tests hard-pin the non-race invalid_state path.
         {
             const post_drain: headless.store.WorkspaceUpsertRequest = .{
                 .mutation = .{
@@ -2416,14 +2426,14 @@ fn runStoreDurableReopenScenario(allocator: std.mem.Allocator, io: std.Io) !void
                     .path = pref_path,
                 },
             };
-            // Connect-class errors mean the drain thread already tore down the
-            // endpoint; post-drain invalid_state is still pinned by unit tests.
             if (scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, post_drain)) |post_owned| {
                 var post_parsed = post_owned;
                 defer post_parsed.deinit();
                 const err = post_parsed.response.err orelse return error.StoreDurablePostDrainMissingError;
                 if (!std.mem.eql(u8, err.code, headless.protocol.ERR_INVALID_STATE)) return error.StoreDurablePostDrainWrongCode;
-            } else |_| {}
+            } else |err| {
+                if (!isConnectClassError(err)) return err;
+            }
 
             const empty_params: struct {} = .{};
             if (client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params)) |status_owned| {
@@ -2434,7 +2444,9 @@ fn runStoreDurableReopenScenario(allocator: std.mem.Allocator, io: std.Io) !void
                     if (!std.mem.eql(u8, status.drain_state, "draining")) return error.StoreDurablePostDrainStateWrong;
                     if (status.writer_ready) return error.StoreDurablePostDrainWriterReady;
                 }
-            } else |_| {}
+            } else |err| {
+                if (!isConnectClassError(err)) return err;
+            }
         }
 
         var exited = false;
@@ -2445,7 +2457,8 @@ fn runStoreDurableReopenScenario(allocator: std.mem.Allocator, io: std.Io) !void
                 std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
                 continue;
             } else |err| {
-                if (err == error.ConnectionRefused or err == error.FileNotFound) {
+                // Exit-wait uses the same connect-class discrimination as the probes.
+                if (isConnectClassError(err)) {
                     exited = true;
                     break;
                 }

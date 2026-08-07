@@ -2281,10 +2281,17 @@ pub const Daemon = struct {
         }
         // Capture draining under the daemon lock (only written by prepareShutdown).
         const service_draining = service.draining;
-        // (v) track in-flight, capture service pointer, unlock.
-        _ = service.in_flight.fetchAdd(1, .monotonic);
+        // (v) track in-flight WRITES only, capture service pointer, unlock.
+        // storeStatus is a read: counting it would make prepare's
+        // store_writes_in_flight refusal lie under concurrent transport (M5).
+        // queued_mutation_count therefore also excludes concurrent status.
+        if (is_mutator) {
+            _ = service.in_flight.fetchAdd(1, .monotonic);
+        }
         self.mutex.unlock();
-        defer _ = service.in_flight.fetchSub(1, .monotonic);
+        defer if (is_mutator) {
+            _ = service.in_flight.fetchSub(1, .monotonic);
+        };
 
         // 3. Store work with NO daemon lock.
         lockStoreService(service);
@@ -2378,6 +2385,8 @@ pub const Daemon = struct {
             );
         }
         // Store gate (after registry is clear): refuse while writes are in flight.
+        // in_flight counts mutators only (not daemon.storeStatus), so this field
+        // stays truthful once the accept loop is concurrent.
         if (self.store_service) |service| {
             const store_writes_in_flight = service.in_flight.load(.monotonic);
             if (store_writes_in_flight > 0) {
@@ -8285,6 +8294,54 @@ test "prepare shutdown refuses while store writes are in flight" {
     const status_result = status_parsed.value.object.get("result").?.object;
     try std.testing.expectEqualStrings("draining", jsonString(status_result.get("drain_state").?).?);
     try std.testing.expect(!status_result.get("writer_ready").?.bool);
+}
+
+test "prepare shutdown accepts while store status is in flight" {
+    // storeStatus must not inflate in_flight / store_writes_in_flight. A concurrent
+    // status-shaped hold of the service mutex (slow SQLite read) must not refuse prepare.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    daemon.idle_exit_ms = null;
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+
+    // Completed storeStatus leaves in_flight at 0 (reads are not counted).
+    const status_before = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"daemon.storeStatus","params":{}}
+    );
+    defer allocator.free(status_before);
+    try std.testing.expectEqual(@as(usize, 0), daemon.store_service.?.in_flight.load(.monotonic));
+
+    // Hold the service mutex as a long status SQLite read would, without a write counter bump.
+    const service = daemon.store_service.?;
+    const holder = try std.Thread.spawn(.{}, struct {
+        fn run(svc: *StoreService) void {
+            lockStoreService(svc);
+            platform_runtime.sleepMillis(150);
+            svc.mutex.unlock();
+        }
+    }.run, .{service});
+
+    platform_runtime.sleepMillis(20);
+    // Prepare only consults in_flight (writes), not the service mutex.
+    const prepare = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"daemon.prepareShutdown","params":{}}
+    );
+    defer allocator.free(prepare);
+    holder.join();
+
+    var prepare_parsed = try std.json.parseFromSlice(std.json.Value, allocator, prepare, .{});
+    defer prepare_parsed.deinit();
+    const prepare_result = prepare_parsed.value.object.get("result").?.object;
+    try std.testing.expect(jsonBool(prepare_result.get("accepted") orelse .null).?);
+    try std.testing.expect(daemon.store_service.?.draining);
+    try std.testing.expectEqual(@as(usize, 0), daemon.store_service.?.in_flight.load(.monotonic));
 }
 
 test "drained daemon rejects store mutators with invalid_state" {
