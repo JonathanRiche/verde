@@ -141,14 +141,25 @@ pub fn main(init: std.process.Init) !void {
     try runLeaseConflictScenario(allocator, io);
     try runLeaseRenewReleaseScenario(allocator, io);
     try runForcedAcquireOverTransportScenario(allocator, io);
+
+    // Windows-safe store subset (S5): named-pipe transport parity + store off-Unix.
+    // Paths use std.fs.path; endpoints via platform isolation (no Unix-socket assumptions).
+    // First-pipe ownership stays the transport's job — reuse bind/replace patterns rather
+    // than new pipe code. P3 carry-forwards: capability flip, core.snapshot, real-DB
+    // dedupe before partial unique index, concurrent-accept tail IT (see m3_track_specs).
     try runStoreLessScenario(allocator, io);
     try runStoreEnabledScenario(allocator, io);
-    try runStoreFullSurfaceScenario(allocator, io);
     try runStoreDurableReopenScenario(allocator, io);
-    try runStoreBoundedQueueingScenario(allocator, io);
-    try runStoreBusyRetryScenario(allocator, io);
-    try runStoreCrashBeforeCommitScenario(allocator, io);
-    try runStoreCrashAfterCommitScenario(allocator, io);
+
+    // Extended store scenarios (POSIX only): full surface + S4 fault/busy/crash pins.
+    // Transport-tier primitives, but not part of the Windows-safe subset.
+    if (posix_pty_supported) {
+        try runStoreFullSurfaceScenario(allocator, io);
+        try runStoreBoundedQueueingScenario(allocator, io);
+        try runStoreBusyRetryScenario(allocator, io);
+        try runStoreCrashBeforeCommitScenario(allocator, io);
+        try runStoreCrashAfterCommitScenario(allocator, io);
+    }
 
     // PTY tier: sessions, managed spawn, prepare/stop retention, lifecycle.
     if (posix_pty_supported) {
@@ -1882,7 +1893,8 @@ fn runStoreEnabledScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
     try std.Io.Dir.cwd().createDirPath(io, pref_path);
 
-    const store_dir = try std.fmt.allocPrint(allocator, "{s}/store", .{pref_path});
+    // Backslash-safe on Windows; same join used for state.sqlite below.
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
     defer allocator.free(store_dir);
     try std.Io.Dir.cwd().createDirPath(io, store_dir);
 
@@ -2149,7 +2161,8 @@ fn runStoreFullSurfaceScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
     try std.Io.Dir.cwd().createDirPath(io, pref_path);
 
-    const store_dir = try std.fmt.allocPrint(allocator, "{s}/store", .{pref_path});
+    // Backslash-safe on Windows; same join used for state.sqlite below.
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
     defer allocator.free(store_dir);
     try std.Io.Dir.cwd().createDirPath(io, store_dir);
 
@@ -2343,7 +2356,8 @@ fn runStoreDurableReopenScenario(allocator: std.mem.Allocator, io: std.Io) !void
     defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
     try std.Io.Dir.cwd().createDirPath(io, pref_path);
 
-    const store_dir = try std.fmt.allocPrint(allocator, "{s}/store", .{pref_path});
+    // Backslash-safe on Windows; same join used for state.sqlite below.
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
     defer allocator.free(store_dir);
     try std.Io.Dir.cwd().createDirPath(io, store_dir);
 
@@ -2575,7 +2589,8 @@ fn runStoreBoundedQueueingScenario(allocator: std.mem.Allocator, io: std.Io) !vo
     defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
     try std.Io.Dir.cwd().createDirPath(io, pref_path);
 
-    const store_dir = try std.fmt.allocPrint(allocator, "{s}/store", .{pref_path});
+    // Backslash-safe on Windows; same join used for state.sqlite below.
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
     defer allocator.free(store_dir);
     try std.Io.Dir.cwd().createDirPath(io, store_dir);
 
@@ -2683,7 +2698,8 @@ fn runStoreBusyRetryScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
     try std.Io.Dir.cwd().createDirPath(io, pref_path);
 
-    const store_dir = try std.fmt.allocPrint(allocator, "{s}/store", .{pref_path});
+    // Backslash-safe on Windows; same join used for state.sqlite below.
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
     defer allocator.free(store_dir);
     try std.Io.Dir.cwd().createDirPath(io, store_dir);
 
@@ -2795,7 +2811,8 @@ fn runStoreCrashBeforeCommitScenario(allocator: std.mem.Allocator, io: std.Io) !
     defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
     try std.Io.Dir.cwd().createDirPath(io, pref_path);
 
-    const store_dir = try std.fmt.allocPrint(allocator, "{s}/store", .{pref_path});
+    // Backslash-safe on Windows; same join used for state.sqlite below.
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
     defer allocator.free(store_dir);
     try std.Io.Dir.cwd().createDirPath(io, store_dir);
 
@@ -2971,7 +2988,8 @@ fn runStoreCrashAfterCommitScenario(allocator: std.mem.Allocator, io: std.Io) !v
     defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
     try std.Io.Dir.cwd().createDirPath(io, pref_path);
 
-    const store_dir = try std.fmt.allocPrint(allocator, "{s}/store", .{pref_path});
+    // Backslash-safe on Windows; same join used for state.sqlite below.
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
     defer allocator.free(store_dir);
     try std.Io.Dir.cwd().createDirPath(io, store_dir);
 

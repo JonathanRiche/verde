@@ -2572,3 +2572,136 @@ test "natural duplicate replay wins over stale expected revision" {
     }));
     try std.testing.expectEqual(@as(u64, 4), try store.storeRevision());
 }
+
+// Read-only reopen of a store-created DB must accept the schema without
+// migration or any main-file write (m3_design read-only contract; S5 pin).
+// Store.init lands at MAX_SUPPORTED_VERSION (includes v2 store tables);
+// validateReadOnly accepts CURRENT_VERSION..=MAX without migrating.
+test "read-only reopen accepts schema v2 without migration" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    const version_before: i64, const journal_before: []u8 = blk: {
+        var store = try Store.init(std.testing.allocator, db_path);
+        defer store.deinit();
+        const result = try store.applyMutation(.{
+            .workspace_upsert = testWorkspaceRequest(
+                "ro-reopen-ws",
+                null,
+                testWorkspace("ro-workspace", "ReadOnly"),
+            ),
+        });
+        try std.testing.expect(result.applied);
+        try std.testing.expectEqual(@as(u64, 1), result.store_revision);
+
+        const version_row = (try store.conn.row("pragma user_version", .{})).?;
+        defer version_row.deinit();
+        const version = version_row.int(0);
+        try std.testing.expect(version >= schema.CURRENT_VERSION);
+        try std.testing.expect(version <= schema.MAX_SUPPORTED_VERSION);
+        // Store tables land at v2+; pin that we reopen a store-capable schema.
+        try std.testing.expect(version >= 2);
+
+        const journal_row = (try store.conn.row("pragma journal_mode", .{})).?;
+        defer journal_row.deinit();
+        break :blk .{ version, try std.testing.allocator.dupe(u8, journal_row.text(0)) };
+    };
+    defer std.testing.allocator.free(journal_before);
+
+    const before_bytes = try tmp.dir.readFileAlloc(std.testing.io, "state.sqlite", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(before_bytes);
+    const before_stat = try tmp.dir.statFile(std.testing.io, "state.sqlite", .{});
+
+    {
+        const flags = zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode;
+        var conn = try zqlite.open(db_path, flags);
+        defer conn.close();
+        // Accept without initialize/migrate (same pathway as db/client.zig initReadOnly).
+        try schema.validateReadOnly(conn);
+
+        const version_row = (try conn.row("pragma user_version", .{})).?;
+        defer version_row.deinit();
+        try std.testing.expectEqual(version_before, version_row.int(0));
+
+        const journal_row = (try conn.row("pragma journal_mode", .{})).?;
+        defer journal_row.deinit();
+        try std.testing.expectEqualStrings(journal_before, journal_row.text(0));
+
+        // Copy text before finalize (Zig 0.16 / zqlite lifetime rule).
+        const label_row = (try conn.row(
+            "select label from workspaces where workspace_id = ?1",
+            .{"ro-workspace"},
+        )).?;
+        defer label_row.deinit();
+        const label = try std.testing.allocator.dupe(u8, label_row.text(0));
+        defer std.testing.allocator.free(label);
+        try std.testing.expectEqualStrings("ReadOnly", label);
+
+        const rev_row = (try conn.row("select store_revision from store_state where id = 1", .{})).?;
+        defer rev_row.deinit();
+        try std.testing.expectEqual(@as(i64, 1), rev_row.int(0));
+
+        // RO open must not write (query_only / ReadOnly flags).
+        try std.testing.expectError(error.ReadOnly, conn.execNoArgs("delete from workspaces"));
+    }
+
+    const after_bytes = try tmp.dir.readFileAlloc(std.testing.io, "state.sqlite", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(after_bytes);
+    try std.testing.expectEqualSlices(u8, before_bytes, after_bytes);
+    const after_stat = try tmp.dir.statFile(std.testing.io, "state.sqlite", .{});
+    try std.testing.expectEqual(before_stat.size, after_stat.size);
+    try std.testing.expectEqual(before_stat.mtime.nanoseconds, after_stat.mtime.nanoseconds);
+}
+
+// Clean writer close may leave -wal/-shm absent or residual; deleting them must
+// not prevent a read-only open from seeing committed store data (S5 / m3_design).
+test "read-only reopen succeeds after clean close removes WAL sidecars" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    {
+        var store = try Store.init(std.testing.allocator, db_path);
+        defer store.deinit();
+        const result = try store.applyMutation(.{
+            .workspace_upsert = testWorkspaceRequest(
+                "ro-sidecar-ws",
+                null,
+                testWorkspace("ro-sidecar-workspace", "Sidecar"),
+            ),
+        });
+        try std.testing.expect(result.applied);
+        try std.testing.expectEqual(@as(u64, 1), result.store_revision);
+    }
+
+    // Sidecars are absent or harmless after clean close; force the -shm-absent case.
+    tmp.dir.deleteFile(std.testing.io, "state.sqlite-wal") catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    tmp.dir.deleteFile(std.testing.io, "state.sqlite-shm") catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+
+    const flags = zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode;
+    var conn = try zqlite.open(db_path, flags);
+    defer conn.close();
+    try schema.validateReadOnly(conn);
+
+    const label_row = (try conn.row(
+        "select label from workspaces where workspace_id = ?1",
+        .{"ro-sidecar-workspace"},
+    )).?;
+    defer label_row.deinit();
+    const label = try std.testing.allocator.dupe(u8, label_row.text(0));
+    defer std.testing.allocator.free(label);
+    try std.testing.expectEqualStrings("Sidecar", label);
+
+    const rev_row = (try conn.row("select store_revision from store_state where id = 1", .{})).?;
+    defer rev_row.deinit();
+    try std.testing.expectEqual(@as(i64, 1), rev_row.int(0));
+}
