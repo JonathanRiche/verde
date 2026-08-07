@@ -2681,7 +2681,8 @@ fn runStoreBoundedQueueingScenario(allocator: std.mem.Allocator, io: std.Io) !vo
     const worker = try std.Thread.spawn(.{}, slowThread, .{&mut_ctx});
     // Join on every path so a fallible concurrent read cannot leave the
     // mutation thread writing into a dead stack frame.
-    defer worker.join();
+    var worker_joined = false;
+    defer if (!worker_joined) worker.join();
 
     // Issue the read immediately after the mutation thread starts. With a serial
     // accept loop it queues behind the stalled commit; both must still finish.
@@ -2693,6 +2694,12 @@ fn runStoreBoundedQueueingScenario(allocator: std.mem.Allocator, io: std.Io) !vo
     var list_parsed = try client.call(headless.registry.METHOD_PROCESS_LIST, list_req);
     defer list_parsed.deinit();
     const read_elapsed = sessionizer.nowMs() - read_started;
+
+    // The worker must be joined before its results are read: the defer above
+    // covers only unwind paths, and these loads would otherwise race the
+    // thread's final writes.
+    worker.join();
+    worker_joined = true;
 
     if (mut_ctx.err) |err| return err;
     if (!mut_ctx.applied) return error.StoreQueueMutationNotApplied;
