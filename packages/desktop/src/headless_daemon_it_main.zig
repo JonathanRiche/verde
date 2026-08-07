@@ -14,6 +14,7 @@ const headless = @import("headless");
 const platform_paths = @import("platform_paths");
 const platform_runtime = @import("platform_runtime");
 const sessionizer = @import("terminal/sessionizer.zig");
+const zqlite = @import("zqlite");
 
 /// PTY / process-group / Unix-signal scenarios (forkpty, waitpid, kill(pid,0)).
 const posix_pty_supported = switch (builtin.os.tag) {
@@ -134,6 +135,8 @@ pub fn main(init: std.process.Init) !void {
     try runForcedAcquireOverTransportScenario(allocator, io);
     try runStoreLessScenario(allocator, io);
     try runStoreEnabledScenario(allocator, io);
+    try runStoreFullSurfaceScenario(allocator, io);
+    try runStoreDurableReopenScenario(allocator, io);
 
     // PTY tier: sessions, managed spawn, prepare/stop retention, lifecycle.
     if (posix_pty_supported) {
@@ -1797,8 +1800,7 @@ fn jsonStringValue(value: std.json.Value) ?[]const u8 {
     return if (value == .string) value.string else null;
 }
 
-/// Store-less daemon: dispatched store methods return capability_unavailable;
-/// undispatched store mutations remain method_not_found until S3.
+/// Store-less daemon: all store methods return capability_unavailable (S3 full surface).
 fn runStoreLessScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const pref_path = try makePrefPath(allocator, "store-less");
     defer allocator.free(pref_path);
@@ -1823,19 +1825,30 @@ fn runStoreLessScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     scenario.storeTemporaryDatabaseHook("phase-2-store-temporary-database");
 
     const mutation: headless.store.MutationHeader = .{
-        .request_key = "s2-store-less-workspace-upsert",
-        .client_id = "s2-fixture-client",
+        .request_key = "s3-store-less-workspace-upsert",
+        .client_id = "s3-fixture-client",
     };
     const request: headless.store.WorkspaceUpsertRequest = .{
         .mutation = mutation,
         .workspace = .{
-            .workspace_id = "s2-fixture-workspace",
-            .label = "S2 fixture workspace",
+            .workspace_id = "s3-fixture-workspace",
+            .label = "S3 fixture workspace",
             .path = pref_path,
         },
     };
-    {
-        var parsed = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, request);
+
+    const store_methods = [_][]const u8{
+        headless.store.METHOD_STATE_SNAPSHOT_REPLACE,
+        headless.store.METHOD_WORKSPACE_UPSERT,
+        headless.store.METHOD_CHAT_THREAD_UPSERT,
+        headless.store.METHOD_CHAT_MESSAGE_APPEND,
+        headless.store.METHOD_SURFACE_UPSERT,
+        headless.store.METHOD_SURFACE_CLEAR,
+        headless.store.METHOD_NOTIFICATION_CHAT_COMPLETION_UPSERT,
+        headless.store.METHOD_NOTIFICATION_CHAT_COMPLETION_CLEAR,
+    };
+    for (store_methods) |method| {
+        var parsed = try scenario.storeStep(method, request);
         defer parsed.deinit();
         const err = parsed.response.err orelse return error.StoreLessMissingError;
         if (!std.mem.eql(u8, err.code, headless.protocol.ERR_CAPABILITY_UNAVAILABLE)) return error.StoreLessWrongCode;
@@ -1849,25 +1862,11 @@ fn runStoreLessScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         if (!std.mem.eql(u8, err.code, headless.protocol.ERR_CAPABILITY_UNAVAILABLE)) return error.StoreLessStatusWrongCode;
         if (!std.mem.eql(u8, err.message, "store capability is unavailable")) return error.StoreLessStatusWrongMessage;
     }
-
-    const undispatched = [_][]const u8{
-        headless.store.METHOD_CHAT_THREAD_UPSERT,
-        headless.store.METHOD_CHAT_MESSAGE_APPEND,
-        headless.store.METHOD_SURFACE_UPSERT,
-        headless.store.METHOD_SURFACE_CLEAR,
-        headless.store.METHOD_NOTIFICATION_CHAT_COMPLETION_UPSERT,
-        headless.store.METHOD_NOTIFICATION_CHAT_COMPLETION_CLEAR,
-    };
-    for (undispatched) |method| {
-        var parsed = try scenario.storeStep(method, request);
-        defer parsed.deinit();
-        const err = parsed.response.err orelse return error.UndispatchedStoreMissingError;
-        if (!std.mem.eql(u8, err.code, FIXTURE_METHOD_NOT_FOUND)) return error.UndispatchedStoreWrongCode;
-    }
 }
 
-/// Store-enabled daemon under VERDE_SESSION_DAEMON_STORE_DIR: real mutations,
-/// receipt replay, client validation, conflict, status, and dormancy pin.
+/// Store-enabled daemon: receipt replay, client validation, conflict, status,
+/// dormancy pin, wire-level natural-duplicate ordering, two-client conflict,
+/// and post-drain rejection.
 fn runStoreEnabledScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const pref_path = try makePrefPath(allocator, "store-enabled");
     defer allocator.free(pref_path);
@@ -1896,23 +1895,27 @@ fn runStoreEnabledScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     var client = sessionizer.headlessClient(allocator, &transport);
     var scenario: FixtureScenario = .{ .client = &client };
 
-    // B7: register a client before store mutations.
+    // B7: register clients before store mutations.
     // Explicit field: bare `.{}` can stringify as `[]` and fail params validation.
-    var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
-    defer register_parsed.deinit();
-    if (!register_parsed.response.isOk()) return error.StoreEnabledRegisterFailed;
-    const registered = try client.decodeClientRegister(&register_parsed);
-    const client_id = registered.client_id;
+    var register_a = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer register_a.deinit();
+    if (!register_a.response.isOk()) return error.StoreEnabledRegisterFailed;
+    const client_a = (try client.decodeClientRegister(&register_a)).client_id;
+
+    var register_b = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer register_b.deinit();
+    if (!register_b.response.isOk()) return error.StoreEnabledRegisterBFailed;
+    const client_b = (try client.decodeClientRegister(&register_b)).client_id;
 
     const mutation: headless.store.MutationHeader = .{
-        .request_key = "s2-store-enabled-workspace-upsert",
-        .client_id = client_id,
+        .request_key = "s3-store-enabled-workspace-upsert",
+        .client_id = client_a,
     };
     const request: headless.store.WorkspaceUpsertRequest = .{
         .mutation = mutation,
         .workspace = .{
-            .workspace_id = "s2-enabled-workspace",
-            .label = "S2 enabled workspace",
+            .workspace_id = "s3-enabled-workspace",
+            .label = "S3 enabled workspace",
             .path = pref_path,
         },
     };
@@ -1938,11 +1941,11 @@ fn runStoreEnabledScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     {
         const unknown: headless.store.WorkspaceUpsertRequest = .{
             .mutation = .{
-                .request_key = "s2-unknown-client",
+                .request_key = "s3-unknown-client",
                 .client_id = "not-a-registered-client",
             },
             .workspace = .{
-                .workspace_id = "s2-other",
+                .workspace_id = "s3-other",
                 .label = "Other",
                 .path = pref_path,
             },
@@ -1956,12 +1959,12 @@ fn runStoreEnabledScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     {
         const stale: headless.store.WorkspaceUpsertRequest = .{
             .mutation = .{
-                .request_key = "s2-stale-revision",
-                .client_id = client_id,
+                .request_key = "s3-stale-revision",
+                .client_id = client_a,
                 .expected_store_revision = 0,
             },
             .workspace = .{
-                .workspace_id = "s2-stale",
+                .workspace_id = "s3-stale",
                 .label = "Stale",
                 .path = pref_path,
             },
@@ -1972,6 +1975,132 @@ fn runStoreEnabledScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         if (!std.mem.eql(u8, err.code, headless.protocol.ERR_CONFLICT)) return error.StoreEnabledConflictWrongCode;
     }
 
+    // Wire-level natural-duplicate ordering pin (mandated): same message identity
+    // + identical payload + fresh request_key + stale expected_store_revision
+    // still returns applied=false, duplicate=true (wins over the revision guard).
+    {
+        const thread_req: headless.store.ThreadUpsertRequest = .{
+            .mutation = .{
+                .request_key = "s3-order-thread",
+                .client_id = client_a,
+                .expected_store_revision = 1,
+            },
+            .workspace_id = "s3-enabled-workspace",
+            .thread = .{
+                .local_thread_id = "s3-order-thread",
+                .title = "Order thread",
+            },
+        };
+        var thread_parsed = try scenario.storeStep(headless.store.METHOD_CHAT_THREAD_UPSERT, thread_req);
+        defer thread_parsed.deinit();
+        if (!thread_parsed.response.isOk()) return error.StoreEnabledOrderThreadFailed;
+        const thread_result = try client.decodeWriteResult(&thread_parsed);
+        if (thread_result.store_revision != 2) return error.StoreEnabledOrderThreadRevision;
+
+        const message: headless.store.Message = .{
+            .message_id = "s3-order-msg",
+            .role = "user",
+            .author = "You",
+            .body = "hello",
+        };
+        const append_req: headless.store.MessageAppendRequest = .{
+            .mutation = .{
+                .request_key = "s3-order-append",
+                .client_id = client_a,
+                .expected_store_revision = 2,
+            },
+            .workspace_id = "s3-enabled-workspace",
+            .thread_id = "s3-order-thread",
+            .message = message,
+        };
+        var append_parsed = try scenario.storeStep(headless.store.METHOD_CHAT_MESSAGE_APPEND, append_req);
+        defer append_parsed.deinit();
+        if (!append_parsed.response.isOk()) return error.StoreEnabledOrderAppendFailed;
+        const append_result = try client.decodeWriteResult(&append_parsed);
+        if (!append_result.applied or append_result.store_revision != 3) return error.StoreEnabledOrderAppendNotApplied;
+        const original_revision = append_result.store_revision;
+
+        // Advance revision so the original expected revision is stale.
+        const advance: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{
+                .request_key = "s3-order-advance",
+                .client_id = client_a,
+                .expected_store_revision = 3,
+            },
+            .workspace = .{
+                .workspace_id = "s3-order-advance",
+                .label = "Advance",
+                .path = pref_path,
+            },
+        };
+        var advance_parsed = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, advance);
+        defer advance_parsed.deinit();
+        if (!advance_parsed.response.isOk()) return error.StoreEnabledOrderAdvanceFailed;
+        const advance_result = try client.decodeWriteResult(&advance_parsed);
+        if (advance_result.store_revision != 4) return error.StoreEnabledOrderAdvanceRevision;
+
+        var natural_dup = append_req;
+        natural_dup.mutation = .{
+            .request_key = "s3-order-append-retry",
+            .client_id = client_a,
+            .expected_store_revision = original_revision, // stale
+        };
+        var dup_parsed = try scenario.storeStep(headless.store.METHOD_CHAT_MESSAGE_APPEND, natural_dup);
+        defer dup_parsed.deinit();
+        if (!dup_parsed.response.isOk()) return error.StoreEnabledOrderDupFailed;
+        const dup_result = try client.decodeWriteResult(&dup_parsed);
+        if (dup_result.applied or !dup_result.duplicate) return error.StoreEnabledOrderDupNotDuplicate;
+        if (dup_result.store_revision != 4) return error.StoreEnabledOrderDupRevision;
+    }
+
+    // Two-client conflict: A and B both read N; A applies expected N; B's expected N conflicts.
+    {
+        const empty_params: struct {} = .{};
+        var status_parsed = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params);
+        defer status_parsed.deinit();
+        if (!status_parsed.response.isOk()) return error.StoreEnabledTwoClientStatusFailed;
+        const status = try client.decodeStoreStatus(&status_parsed);
+        const n = status.store_revision;
+
+        const a_upsert: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{
+                .request_key = "s3-two-client-a",
+                .client_id = client_a,
+                .expected_store_revision = n,
+            },
+            .workspace = .{
+                .workspace_id = "s3-two-client-a",
+                .label = "A",
+                .path = pref_path,
+            },
+        };
+        var a_parsed = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, a_upsert);
+        defer a_parsed.deinit();
+        if (!a_parsed.response.isOk()) return error.StoreEnabledTwoClientAFailed;
+        const a_result = try client.decodeWriteResult(&a_parsed);
+        if (!a_result.applied or a_result.store_revision != n + 1) return error.StoreEnabledTwoClientANotApplied;
+
+        const b_snapshot: headless.store.SnapshotReplaceRequest = .{
+            .mutation = .{
+                .request_key = "s3-two-client-b",
+                .client_id = client_b,
+                .expected_store_revision = n, // stale after A
+            },
+            .snapshot = .{
+                .schema_version = 1,
+                .workspaces = &.{.{
+                    .workspace_id = "s3-two-client-b",
+                    .label = "B",
+                    .path = pref_path,
+                }},
+            },
+        };
+        var b_parsed = try scenario.storeStep(headless.store.METHOD_STATE_SNAPSHOT_REPLACE, b_snapshot);
+        defer b_parsed.deinit();
+        const err = b_parsed.response.err orelse return error.StoreEnabledTwoClientBMissingError;
+        if (!std.mem.eql(u8, err.code, headless.protocol.ERR_CONFLICT)) return error.StoreEnabledTwoClientBWrongCode;
+    }
+
     {
         const empty_params: struct {} = .{};
         var status_parsed = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params);
@@ -1979,7 +2108,6 @@ fn runStoreEnabledScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         if (!status_parsed.response.isOk()) return error.StoreEnabledStatusFailed;
         const status = try client.decodeStoreStatus(&status_parsed);
         if (!std.mem.eql(u8, status.drain_state, "open")) return error.StoreEnabledDrainStateWrong;
-        if (status.store_revision != first_result.store_revision) return error.StoreEnabledStatusRevisionMismatch;
         if (!status.writer_ready) return error.StoreEnabledWriterNotReady;
     }
 
@@ -1991,6 +2119,432 @@ fn runStoreEnabledScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         if (!status_parsed.response.isOk()) return error.StoreEnabledCoreStatusFailed;
         const status = try client.decodeStatus(&status_parsed);
         if (status.capabilities.store) return error.StoreEnabledStoreCapabilityAdvertised;
+    }
+}
+
+/// Full store mutation surface over the wire with monotone revisions.
+fn runStoreFullSurfaceScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "store-full-surface");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fmt.allocPrint(allocator, "{s}/store", .{pref_path});
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+    });
+    defer child.kill(io);
+
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = allocator,
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(allocator, &transport);
+    var scenario: FixtureScenario = .{ .client = &client };
+
+    var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer register_parsed.deinit();
+    if (!register_parsed.response.isOk()) return error.StoreFullRegisterFailed;
+    const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+    var last_revision: u64 = 0;
+
+    {
+        const req: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{ .request_key = "s3-full-ws", .client_id = client_id },
+            .workspace = .{
+                .workspace_id = "s3-full-ws",
+                .label = "Full",
+                .path = pref_path,
+            },
+        };
+        var parsed = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, req);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.StoreFullWorkspaceFailed;
+        const result = try client.decodeWriteResult(&parsed);
+        if (!result.applied or result.store_revision != 1) return error.StoreFullWorkspaceRevision;
+        last_revision = result.store_revision;
+    }
+    {
+        const req: headless.store.ThreadUpsertRequest = .{
+            .mutation = .{
+                .request_key = "s3-full-thread",
+                .client_id = client_id,
+                .expected_store_revision = last_revision,
+            },
+            .workspace_id = "s3-full-ws",
+            .thread = .{ .local_thread_id = "s3-full-t", .title = "Full thread" },
+        };
+        var parsed = try scenario.storeStep(headless.store.METHOD_CHAT_THREAD_UPSERT, req);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.StoreFullThreadFailed;
+        const result = try client.decodeWriteResult(&parsed);
+        if (!result.applied or result.store_revision <= last_revision) return error.StoreFullThreadRevision;
+        last_revision = result.store_revision;
+    }
+    {
+        const req: headless.store.MessageAppendRequest = .{
+            .mutation = .{
+                .request_key = "s3-full-msg",
+                .client_id = client_id,
+                .expected_store_revision = last_revision,
+            },
+            .workspace_id = "s3-full-ws",
+            .thread_id = "s3-full-t",
+            .message = .{
+                .message_id = "s3-full-m",
+                .role = "user",
+                .author = "You",
+                .body = "full surface",
+            },
+        };
+        var parsed = try scenario.storeStep(headless.store.METHOD_CHAT_MESSAGE_APPEND, req);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.StoreFullMessageFailed;
+        const result = try client.decodeWriteResult(&parsed);
+        if (!result.applied or result.store_revision <= last_revision) return error.StoreFullMessageRevision;
+        last_revision = result.store_revision;
+    }
+    {
+        const req: headless.store.SurfaceUpsertRequest = .{
+            .mutation = .{
+                .request_key = "s3-full-surface",
+                .client_id = client_id,
+                .expected_store_revision = last_revision,
+            },
+            .surface = .{ .session_id = "s3-full-s", .status = "done" },
+        };
+        var parsed = try scenario.storeStep(headless.store.METHOD_SURFACE_UPSERT, req);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.StoreFullSurfaceFailed;
+        const result = try client.decodeWriteResult(&parsed);
+        if (!result.applied or result.store_revision <= last_revision) return error.StoreFullSurfaceRevision;
+        last_revision = result.store_revision;
+    }
+    {
+        const req: headless.store.NotificationChatCompletionUpsertRequest = .{
+            .mutation = .{
+                .request_key = "s3-full-completion",
+                .client_id = client_id,
+                .expected_store_revision = last_revision,
+            },
+            .completion = .{
+                .workspace_id = "s3-full-ws",
+                .local_thread_id = "s3-full-t",
+                .completed_at_ms = 99,
+            },
+        };
+        var parsed = try scenario.storeStep(headless.store.METHOD_NOTIFICATION_CHAT_COMPLETION_UPSERT, req);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.StoreFullCompletionFailed;
+        const result = try client.decodeWriteResult(&parsed);
+        if (!result.applied or result.store_revision <= last_revision) return error.StoreFullCompletionRevision;
+        last_revision = result.store_revision;
+    }
+    {
+        const req: headless.store.SnapshotReplaceRequest = .{
+            .mutation = .{
+                .request_key = "s3-full-snapshot",
+                .client_id = client_id,
+                .expected_store_revision = last_revision,
+            },
+            .snapshot = .{
+                .schema_version = 1,
+                .workspaces = &.{.{
+                    .workspace_id = "s3-full-snap",
+                    .label = "Snap",
+                    .path = pref_path,
+                }},
+                .surface_states = &.{.{ .session_id = "s3-full-snap-s", .status = "idle" }},
+                .chat_completions = &.{.{
+                    .workspace_id = "s3-full-snap",
+                    .local_thread_id = "s3-full-snap-t",
+                    .completed_at_ms = 1,
+                }},
+            },
+        };
+        var parsed = try scenario.storeStep(headless.store.METHOD_STATE_SNAPSHOT_REPLACE, req);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.StoreFullSnapshotFailed;
+        const result = try client.decodeWriteResult(&parsed);
+        if (!result.applied or result.store_revision <= last_revision) return error.StoreFullSnapshotRevision;
+        last_revision = result.store_revision;
+    }
+    {
+        const req: headless.store.SurfaceClearRequest = .{
+            .mutation = .{
+                .request_key = "s3-full-surface-clear",
+                .client_id = client_id,
+                .expected_store_revision = last_revision,
+            },
+            .session_id = "s3-full-snap-s",
+        };
+        var parsed = try scenario.storeStep(headless.store.METHOD_SURFACE_CLEAR, req);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.StoreFullSurfaceClearFailed;
+        const result = try client.decodeWriteResult(&parsed);
+        if (!result.applied or result.store_revision <= last_revision) return error.StoreFullSurfaceClearRevision;
+        last_revision = result.store_revision;
+    }
+    {
+        const req: headless.store.NotificationChatCompletionClearRequest = .{
+            .mutation = .{
+                .request_key = "s3-full-completion-clear",
+                .client_id = client_id,
+                .expected_store_revision = last_revision,
+            },
+            .workspace_id = "s3-full-snap",
+            .local_thread_id = "s3-full-snap-t",
+        };
+        var parsed = try scenario.storeStep(headless.store.METHOD_NOTIFICATION_CHAT_COMPLETION_CLEAR, req);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.StoreFullCompletionClearFailed;
+        const result = try client.decodeWriteResult(&parsed);
+        if (!result.applied or result.store_revision <= last_revision) return error.StoreFullCompletionClearRevision;
+    }
+}
+
+/// Durable reopen: mutate → prepareShutdown → exit → direct SQLite check →
+/// respawn on same store_dir → status + receipt replay.
+fn runStoreDurableReopenScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "store-durable");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fmt.allocPrint(allocator, "{s}/store", .{pref_path});
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    const receipt_key = "s3-durable-workspace";
+    var persisted_revision: u64 = 0;
+
+    {
+        var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+        });
+        // prepareShutdown should exit the child; kill only if it hangs.
+
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = allocator,
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(allocator, &transport);
+        var scenario: FixtureScenario = .{ .client = &client };
+
+        var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+        defer register_parsed.deinit();
+        if (!register_parsed.response.isOk()) {
+            child.kill(io);
+            return error.StoreDurableRegisterFailed;
+        }
+        const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+        const upsert: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{
+                .request_key = receipt_key,
+                .client_id = client_id,
+            },
+            .workspace = .{
+                .workspace_id = "s3-durable-ws",
+                .label = "Durable",
+                .path = pref_path,
+            },
+        };
+        var first = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, upsert);
+        defer first.deinit();
+        if (!first.response.isOk()) {
+            child.kill(io);
+            return error.StoreDurableUpsertFailed;
+        }
+        const first_result = try client.decodeWriteResult(&first);
+        if (!first_result.applied) {
+            child.kill(io);
+            return error.StoreDurableUpsertNotApplied;
+        }
+        persisted_revision = first_result.store_revision;
+
+        var prepare_parsed = try client.call("daemon.prepareShutdown", .{});
+        defer prepare_parsed.deinit();
+        if (!prepare_parsed.response.isOk()) {
+            child.kill(io);
+            return error.StoreDurablePrepareNotAccepted;
+        }
+        const prepare_result = prepare_parsed.arena_parsed.value.object.get("result") orelse {
+            child.kill(io);
+            return error.StoreDurablePrepareNotAccepted;
+        };
+        const accepted = prepare_result.object.get("accepted") orelse {
+            child.kill(io);
+            return error.StoreDurablePrepareNotAccepted;
+        };
+        if (accepted != .bool or !accepted.bool) {
+            child.kill(io);
+            return error.StoreDurablePrepareNotAccepted;
+        }
+
+        // Post-drain rejection on a still-live daemon: mutator → invalid_state;
+        // storeStatus still answers with drain_state=draining. The drain thread
+        // may race exit after prepare; treat connect failures as "already gone"
+        // only after we attempted the gate (unit tests pin the non-race path).
+        {
+            const post_drain: headless.store.WorkspaceUpsertRequest = .{
+                .mutation = .{
+                    .request_key = "s3-post-drain",
+                    .client_id = client_id,
+                },
+                .workspace = .{
+                    .workspace_id = "s3-post-drain",
+                    .label = "Post drain",
+                    .path = pref_path,
+                },
+            };
+            // Connect-class errors mean the drain thread already tore down the
+            // endpoint; post-drain invalid_state is still pinned by unit tests.
+            if (scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, post_drain)) |post_owned| {
+                var post_parsed = post_owned;
+                defer post_parsed.deinit();
+                const err = post_parsed.response.err orelse return error.StoreDurablePostDrainMissingError;
+                if (!std.mem.eql(u8, err.code, headless.protocol.ERR_INVALID_STATE)) return error.StoreDurablePostDrainWrongCode;
+            } else |_| {}
+
+            const empty_params: struct {} = .{};
+            if (client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params)) |status_owned| {
+                var status_parsed = status_owned;
+                defer status_parsed.deinit();
+                if (status_parsed.response.isOk()) {
+                    const status = try client.decodeStoreStatus(&status_parsed);
+                    if (!std.mem.eql(u8, status.drain_state, "draining")) return error.StoreDurablePostDrainStateWrong;
+                    if (status.writer_ready) return error.StoreDurablePostDrainWriterReady;
+                }
+            } else |_| {}
+        }
+
+        var exited = false;
+        var attempts: usize = 0;
+        while (attempts < 100) : (attempts += 1) {
+            if (sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
+                allocator.free(response);
+                std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+                continue;
+            } else |err| {
+                if (err == error.ConnectionRefused or err == error.FileNotFound) {
+                    exited = true;
+                    break;
+                }
+                std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+            }
+        }
+        if (!exited) {
+            child.kill(io);
+            return error.StoreDurableDaemonDidNotExit;
+        }
+        const term = child.wait(io) catch {
+            return error.StoreDurableWaitFailed;
+        };
+        switch (term) {
+            .exited => |code| if (code != 0) return error.StoreDurableNonZeroExit,
+            else => return error.StoreDurableAbnormalExit,
+        }
+    }
+
+    // Direct read-only SQLite verification from the IT parent (never write/migrate).
+    {
+        const db_path = try std.fs.path.join(allocator, &.{ store_dir, "state.sqlite" });
+        defer allocator.free(db_path);
+        // Confirm the file exists before open so a missing-store failure is explicit.
+        std.Io.Dir.cwd().access(io, db_path, .{}) catch {
+            std.debug.print("headless-daemon-it: durable store file missing at {s}\n", .{db_path});
+            return error.StoreDurableSqliteMissing;
+        };
+        const db_path_z = try allocator.dupeZ(u8, db_path);
+        defer allocator.free(db_path_z);
+        var conn = zqlite.open(db_path_z, zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode) catch |err| {
+            std.debug.print("headless-daemon-it: durable sqlite open failed at {s}: {s}\n", .{ db_path, @errorName(err) });
+            return err;
+        };
+        defer conn.close();
+
+        const rev_row = (try conn.row("select store_revision from store_state where id = 1", .{})) orelse
+            return error.StoreDurableMissingStoreState;
+        defer rev_row.deinit();
+        if (@as(u64, @intCast(rev_row.int(0))) != persisted_revision) return error.StoreDurableSqliteRevisionMismatch;
+
+        const ws_row = (try conn.row("select count(*) from workspaces", .{})) orelse
+            return error.StoreDurableMissingWorkspaces;
+        defer ws_row.deinit();
+        if (ws_row.int(0) < 1) return error.StoreDurableNoWorkspaceRows;
+
+        const receipt_row = (try conn.row(
+            "select store_revision from store_receipts where request_key = ?1",
+            .{receipt_key},
+        )) orelse return error.StoreDurableMissingReceipt;
+        defer receipt_row.deinit();
+        if (@as(u64, @intCast(receipt_row.int(0))) != persisted_revision) return error.StoreDurableReceiptRevisionMismatch;
+    }
+
+    // Respawn on the SAME store_dir: status shows persisted revision; receipt replay works.
+    {
+        var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+        });
+        defer child.kill(io);
+
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = allocator,
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(allocator, &transport);
+        var scenario: FixtureScenario = .{ .client = &client };
+
+        const empty_params: struct {} = .{};
+        var status_parsed = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params);
+        defer status_parsed.deinit();
+        if (!status_parsed.response.isOk()) return error.StoreDurableReopenStatusFailed;
+        const status = try client.decodeStoreStatus(&status_parsed);
+        if (status.store_revision != persisted_revision) return error.StoreDurableReopenRevisionMismatch;
+        if (!std.mem.eql(u8, status.drain_state, "open")) return error.StoreDurableReopenDrainStateWrong;
+        if (!status.writer_ready) return error.StoreDurableReopenWriterNotReady;
+
+        var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+        defer register_parsed.deinit();
+        if (!register_parsed.response.isOk()) return error.StoreDurableReopenRegisterFailed;
+        const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+        // Replay the OLD request_key — receipt is durable across restart.
+        // client_id is not part of receipt identity; the key alone is enough.
+        const replay: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{
+                .request_key = receipt_key,
+                .client_id = client_id,
+            },
+            .workspace = .{
+                .workspace_id = "s3-durable-ws",
+                .label = "Durable",
+                .path = pref_path,
+            },
+        };
+        var replay_parsed = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, replay);
+        defer replay_parsed.deinit();
+        if (!replay_parsed.response.isOk()) return error.StoreDurableReceiptReplayFailed;
+        const replay_result = try client.decodeWriteResult(&replay_parsed);
+        if (replay_result.store_revision != persisted_revision) return error.StoreDurableReceiptReplayRevision;
+        if (!replay_result.applied or replay_result.duplicate) return error.StoreDurableReceiptReplayShape;
     }
 }
 

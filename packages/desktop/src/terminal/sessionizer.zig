@@ -2114,10 +2114,11 @@ pub const Daemon = struct {
         // parseFromValueLeaky ignores allocate; string slices borrow params,
         // which outlive this call via the parent handleRequest parse.
         var decode_failed = false;
-        var snapshot_request: ?store_protocol.SnapshotReplaceRequest = null;
-        var workspace_request: ?store_protocol.WorkspaceUpsertRequest = null;
-        if (std.mem.eql(u8, method, store_protocol.METHOD_STATE_SNAPSHOT_REPLACE)) {
-            snapshot_request = std.json.parseFromValueLeaky(
+        var decoded_mutation: ?daemon_store.Mutation = null;
+        if (is_status) {
+            // No params body required for status.
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_STATE_SNAPSHOT_REPLACE)) {
+            const req = std.json.parseFromValueLeaky(
                 store_protocol.SnapshotReplaceRequest,
                 arena,
                 params,
@@ -2126,8 +2127,9 @@ pub const Daemon = struct {
                 decode_failed = true;
                 break :blk null;
             };
+            if (req) |value| decoded_mutation = .{ .snapshot_replace = value };
         } else if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_UPSERT)) {
-            workspace_request = std.json.parseFromValueLeaky(
+            const req = std.json.parseFromValueLeaky(
                 store_protocol.WorkspaceUpsertRequest,
                 arena,
                 params,
@@ -2136,15 +2138,81 @@ pub const Daemon = struct {
                 decode_failed = true;
                 break :blk null;
             };
-        } else if (!is_status) {
+            if (req) |value| decoded_mutation = .{ .workspace_upsert = value };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_UPSERT)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.ThreadUpsertRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch blk: {
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .thread_upsert = value };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_CHAT_MESSAGE_APPEND)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.MessageAppendRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch blk: {
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .message_append = value };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_SURFACE_UPSERT)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.SurfaceUpsertRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch blk: {
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .surface_upsert = value };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_SURFACE_CLEAR)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.SurfaceClearRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch blk: {
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .surface_clear = value };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_NOTIFICATION_CHAT_COMPLETION_UPSERT)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.NotificationChatCompletionUpsertRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch blk: {
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .chat_completion_upsert = value };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_NOTIFICATION_CHAT_COMPLETION_CLEAR)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.NotificationChatCompletionClearRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch blk: {
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .chat_completion_clear = value };
+        } else {
             decode_failed = true;
         }
 
-        const client_id: ?[]const u8 = blk: {
-            if (snapshot_request) |req| break :blk req.mutation.client_id;
-            if (workspace_request) |req| break :blk req.mutation.client_id;
-            break :blk null;
-        };
+        const client_id: ?[]const u8 = if (decoded_mutation) |mutation|
+            mutationHeader(mutation).client_id
+        else
+            null;
 
         // 2. Short lockDaemon for bookkeeping only (never SQLite).
         lockDaemon(self);
@@ -2169,7 +2237,7 @@ pub const Daemon = struct {
             );
         };
         // (iii) held decode failure.
-        if (decode_failed) {
+        if (decode_failed or (!is_status and decoded_mutation == null)) {
             self.mutex.unlock();
             return try errorResponseAlloc(
                 self.allocator,
@@ -2199,6 +2267,8 @@ pub const Daemon = struct {
                 );
             }
         }
+        // Capture draining under the daemon lock (only written by prepareShutdown).
+        const service_draining = service.draining;
         // (v) track in-flight, capture service pointer, unlock.
         _ = service.in_flight.fetchAdd(1, .monotonic);
         self.mutex.unlock();
@@ -2224,28 +2294,22 @@ pub const Daemon = struct {
                 defer row.deinit();
                 break :blk @intCast(row.int(0));
             };
-            // S2: drain_state is always "open"; S3 flips when service.draining.
             const result: store_protocol.StoreStatusResult = .{
                 .schema_version = schema_version,
                 .store_revision = store_revision,
-                .writer_ready = true,
+                .writer_ready = !service_draining,
                 .queued_mutation_count = service.in_flight.load(.monotonic),
-                .drain_state = "open",
+                .drain_state = if (service_draining) "draining" else "open",
             };
             return try okValueResponse(self.allocator, id_value, result);
         }
 
-        const mutation: daemon_store.Mutation = if (snapshot_request) |req|
-            .{ .snapshot_replace = req }
-        else if (workspace_request) |req|
-            .{ .workspace_upsert = req }
-        else
-            return try errorResponseAlloc(
-                self.allocator,
-                id_value,
-                headless.protocol.ERR_INVALID_PARAMS,
-                "invalid params",
-            );
+        const mutation = decoded_mutation orelse return try errorResponseAlloc(
+            self.allocator,
+            id_value,
+            headless.protocol.ERR_INVALID_PARAMS,
+            "invalid params",
+        );
 
         const write_result = service.store.applyMutation(mutation) catch |err| {
             return try storeErrorResponse(self.allocator, id_value, err);
@@ -2272,6 +2336,8 @@ pub const Daemon = struct {
     /// Prepare-for-upgrade shutdown (headless_verde.md Lifetime §Protocol-version
     /// replacement). Enters drain only when the full shared state gate is clear
     /// so a refused upgrade does not freeze a healthy daemon.
+    /// Gate order: registry safe → store drained → store closed on exit
+    /// (final close lives in `finishSessionizerServer` after drain join).
     fn prepareShutdownResponse(self: *Daemon, id_value: std.json.Value) ![]u8 {
         const now_ms = nowMs();
         // Reap expired registry state before evaluating the handoff gate; a
@@ -2295,13 +2361,20 @@ pub const Daemon = struct {
                 registry_jobs,
             );
         }
-        if (safe_to_exit) {
-            self.accepting_mutations = false;
-            self.shutdown_requested = true;
+        // Store gate (after registry is clear): refuse while writes are in flight.
+        if (self.store_service) |service| {
+            const store_writes_in_flight = service.in_flight.load(.monotonic);
+            if (store_writes_in_flight > 0) {
+                return prepareShutdownStoreRefusalResponse(self, id_value, store_writes_in_flight);
+            }
+            // Written only here under the caller's daemon lock; storeStatus reads it there.
+            service.draining = true;
         }
+        self.accepting_mutations = false;
+        self.shutdown_requested = true;
         return try okValueResponse(self.allocator, id_value, .{
-            .accepted = safe_to_exit,
-            .safe_to_exit = safe_to_exit,
+            .accepted = true,
+            .safe_to_exit = true,
             .running_sessions = running_sessions,
             .managed_processes = managed,
             .keep_alive_turns = keep_alive_turns,
@@ -4283,6 +4356,41 @@ fn prepareShutdownRefusalResponse(
     );
 }
 
+/// Store-specific prepare refusal (registry gates already clear). Additive
+/// Error.data field matches the W6 structured-reason style.
+fn prepareShutdownStoreRefusalResponse(
+    self: *Daemon,
+    id_value: std.json.Value,
+    store_writes_in_flight: usize,
+) ![]u8 {
+    var data_writer: std.Io.Writer.Allocating = .init(self.allocator);
+    errdefer data_writer.deinit();
+    var data_stringify: std.json.Stringify = .{ .writer = &data_writer.writer, .options = .{} };
+    try data_stringify.beginObject();
+    try data_stringify.objectField("store_writes_in_flight");
+    try data_stringify.write(store_writes_in_flight);
+    try data_stringify.endObject();
+    const data_json = try data_writer.toOwnedSlice();
+    defer self.allocator.free(data_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, data_json, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    const message = try std.fmt.allocPrint(
+        self.allocator,
+        "daemon cannot prepare shutdown: store_writes_in_flight={d}",
+        .{store_writes_in_flight},
+    );
+    defer self.allocator.free(message);
+    return try errorResponseAllocWithData(
+        self.allocator,
+        id_value,
+        headless.registry.ERR_INVALID_STATE,
+        message,
+        parsed.value,
+    );
+}
+
 fn configUnavailableErrorResponse(
     self: *Daemon,
     id_value: std.json.Value,
@@ -4826,12 +4934,30 @@ fn sessionizerServerReady(raw_context: *anyopaque) !void {
     }});
 }
 
-/// S2 dispatches only the first two store mutators plus storeStatus; the
-/// remaining six mutation methods stay method_not_found until S3.
+/// Full store mutation surface plus storeStatus (S3).
 fn isStoreMethod(method: []const u8) bool {
     return std.mem.eql(u8, method, store_protocol.METHOD_STATE_SNAPSHOT_REPLACE) or
         std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_UPSERT) or
+        std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_UPSERT) or
+        std.mem.eql(u8, method, store_protocol.METHOD_CHAT_MESSAGE_APPEND) or
+        std.mem.eql(u8, method, store_protocol.METHOD_SURFACE_UPSERT) or
+        std.mem.eql(u8, method, store_protocol.METHOD_SURFACE_CLEAR) or
+        std.mem.eql(u8, method, store_protocol.METHOD_NOTIFICATION_CHAT_COMPLETION_UPSERT) or
+        std.mem.eql(u8, method, store_protocol.METHOD_NOTIFICATION_CHAT_COMPLETION_CLEAR) or
         std.mem.eql(u8, method, store_protocol.METHOD_DAEMON_STORE_STATUS);
+}
+
+fn mutationHeader(mutation: daemon_store.Mutation) store_protocol.MutationHeader {
+    return switch (mutation) {
+        .snapshot_replace => |request| request.mutation,
+        .workspace_upsert => |request| request.mutation,
+        .thread_upsert => |request| request.mutation,
+        .message_append => |request| request.mutation,
+        .surface_upsert => |request| request.mutation,
+        .surface_clear => |request| request.mutation,
+        .chat_completion_upsert => |request| request.mutation,
+        .chat_completion_clear => |request| request.mutation,
+    };
 }
 
 /// Path-valued store-dir override. Caller frees a non-null result.
@@ -7601,9 +7727,15 @@ test "draining dispatcher rejects every state mutator" {
         "daemon.client.heartbeat",
         "daemon.client.close",
         "daemon.stop",
-        // S2-dispatched store mutators participate in the drain gate.
+        // Full store mutation surface participates in the drain gate (S3).
         "state.snapshot.replace",
         "workspace.upsert",
+        "chat.thread.upsert",
+        "chat.message.append",
+        "surface.upsert",
+        "surface.clear",
+        "notification.chatCompletion.upsert",
+        "notification.chatCompletion.clear",
     };
     for (methods, 0..) |method, index| {
         const request = try std.fmt.allocPrint(
@@ -7828,6 +7960,231 @@ test "store errors map to wire codes" {
     const stale_response = try daemon.handleRequest(stale);
     defer allocator.free(stale_response);
     try expectErrorCodeMessage(stale_response, allocator, headless.protocol.ERR_CONFLICT, "store revision conflict");
+}
+
+fn expectWriteApplied(response: []const u8, allocator: std.mem.Allocator, expected_revision: i64) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?.object;
+    try std.testing.expect(result.get("applied").?.bool);
+    try std.testing.expect(!result.get("duplicate").?.bool);
+    try std.testing.expectEqual(expected_revision, result.get("store_revision").?.integer);
+}
+
+test "store dispatch covers the full mutation surface" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    const client_id = try registerTestClientId(&daemon, allocator);
+    defer allocator.free(client_id);
+
+    // workspace → thread → message → surface → completion → snapshot.replace → surface.clear → completion.clear
+    const workspace_req = try std.fmt.allocPrint(allocator,
+        \\{{"jsonrpc":"2.0","id":2,"method":"workspace.upsert","params":{{"mutation":{{"request_key":"full-ws","client_id":"{s}"}},"workspace":{{"workspace_id":"ws-full","label":"Full","path":"/ws-full"}}}}}}
+    , .{client_id});
+    defer allocator.free(workspace_req);
+    const workspace_response = try daemon.handleRequest(workspace_req);
+    defer allocator.free(workspace_response);
+    try expectWriteApplied(workspace_response, allocator, 1);
+
+    const thread_req = try std.fmt.allocPrint(allocator,
+        \\{{"jsonrpc":"2.0","id":3,"method":"chat.thread.upsert","params":{{"mutation":{{"request_key":"full-thread","client_id":"{s}","expected_store_revision":1}},"workspace_id":"ws-full","thread":{{"local_thread_id":"t1","title":"Thread"}}}}}}
+    , .{client_id});
+    defer allocator.free(thread_req);
+    const thread_response = try daemon.handleRequest(thread_req);
+    defer allocator.free(thread_response);
+    try expectWriteApplied(thread_response, allocator, 2);
+
+    const message_req = try std.fmt.allocPrint(allocator,
+        \\{{"jsonrpc":"2.0","id":4,"method":"chat.message.append","params":{{"mutation":{{"request_key":"full-msg","client_id":"{s}","expected_store_revision":2}},"workspace_id":"ws-full","thread_id":"t1","message":{{"message_id":"m1","role":"user","author":"You","body":"hello"}}}}}}
+    , .{client_id});
+    defer allocator.free(message_req);
+    const message_response = try daemon.handleRequest(message_req);
+    defer allocator.free(message_response);
+    try expectWriteApplied(message_response, allocator, 3);
+
+    // Natural-duplicate replay (fresh request_key, same identity + payload).
+    const message_dup_req = try std.fmt.allocPrint(allocator,
+        \\{{"jsonrpc":"2.0","id":5,"method":"chat.message.append","params":{{"mutation":{{"request_key":"full-msg-dup","client_id":"{s}","expected_store_revision":3}},"workspace_id":"ws-full","thread_id":"t1","message":{{"message_id":"m1","role":"user","author":"You","body":"hello"}}}}}}
+    , .{client_id});
+    defer allocator.free(message_dup_req);
+    const message_dup_response = try daemon.handleRequest(message_dup_req);
+    defer allocator.free(message_dup_response);
+    {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, message_dup_response, .{});
+        defer parsed.deinit();
+        const result = parsed.value.object.get("result").?.object;
+        try std.testing.expect(!result.get("applied").?.bool);
+        try std.testing.expect(result.get("duplicate").?.bool);
+        try std.testing.expectEqual(@as(i64, 3), result.get("store_revision").?.integer);
+    }
+
+    // Same message key, different payload → conflict.
+    const message_conflict_req = try std.fmt.allocPrint(allocator,
+        \\{{"jsonrpc":"2.0","id":6,"method":"chat.message.append","params":{{"mutation":{{"request_key":"full-msg-conflict","client_id":"{s}","expected_store_revision":3}},"workspace_id":"ws-full","thread_id":"t1","message":{{"message_id":"m1","role":"user","author":"You","body":"changed"}}}}}}
+    , .{client_id});
+    defer allocator.free(message_conflict_req);
+    const message_conflict_response = try daemon.handleRequest(message_conflict_req);
+    defer allocator.free(message_conflict_response);
+    try expectErrorCodeMessage(message_conflict_response, allocator, headless.protocol.ERR_CONFLICT, "store revision conflict");
+
+    // thread.upsert against a missing workspace → resource_not_found.
+    const missing_ws_req = try std.fmt.allocPrint(allocator,
+        \\{{"jsonrpc":"2.0","id":7,"method":"chat.thread.upsert","params":{{"mutation":{{"request_key":"full-missing-ws","client_id":"{s}","expected_store_revision":3}},"workspace_id":"does-not-exist","thread":{{"local_thread_id":"t-missing","title":"Missing"}}}}}}
+    , .{client_id});
+    defer allocator.free(missing_ws_req);
+    const missing_ws_response = try daemon.handleRequest(missing_ws_req);
+    defer allocator.free(missing_ws_response);
+    try expectErrorCodeMessage(missing_ws_response, allocator, headless.protocol.ERR_RESOURCE_NOT_FOUND, "resource not found");
+
+    const surface_req = try std.fmt.allocPrint(allocator,
+        \\{{"jsonrpc":"2.0","id":8,"method":"surface.upsert","params":{{"mutation":{{"request_key":"full-surface","client_id":"{s}","expected_store_revision":3}},"surface":{{"session_id":"s1","status":"done"}}}}}}
+    , .{client_id});
+    defer allocator.free(surface_req);
+    const surface_response = try daemon.handleRequest(surface_req);
+    defer allocator.free(surface_response);
+    try expectWriteApplied(surface_response, allocator, 4);
+
+    const completion_req = try std.fmt.allocPrint(allocator,
+        \\{{"jsonrpc":"2.0","id":9,"method":"notification.chatCompletion.upsert","params":{{"mutation":{{"request_key":"full-completion","client_id":"{s}","expected_store_revision":4}},"completion":{{"workspace_id":"ws-full","local_thread_id":"t1","completed_at_ms":42}}}}}}
+    , .{client_id});
+    defer allocator.free(completion_req);
+    const completion_response = try daemon.handleRequest(completion_req);
+    defer allocator.free(completion_response);
+    try expectWriteApplied(completion_response, allocator, 5);
+
+    const snapshot_req = try std.fmt.allocPrint(allocator,
+        \\{{"jsonrpc":"2.0","id":10,"method":"state.snapshot.replace","params":{{"mutation":{{"request_key":"full-snapshot","client_id":"{s}","expected_store_revision":5}},"snapshot":{{"schema_version":1,"store_revision":5,"workspaces":[{{"workspace_id":"ws-snap","label":"Snap","path":"/ws-snap"}}],"surface_states":[{{"session_id":"s-snap","status":"idle"}}],"chat_completions":[{{"workspace_id":"ws-snap","local_thread_id":"t-snap","completed_at_ms":1}}]}}}}}}
+    , .{client_id});
+    defer allocator.free(snapshot_req);
+    const snapshot_response = try daemon.handleRequest(snapshot_req);
+    defer allocator.free(snapshot_response);
+    try expectWriteApplied(snapshot_response, allocator, 6);
+
+    const surface_clear_req = try std.fmt.allocPrint(allocator,
+        \\{{"jsonrpc":"2.0","id":11,"method":"surface.clear","params":{{"mutation":{{"request_key":"full-surface-clear","client_id":"{s}","expected_store_revision":6}},"session_id":"s-snap"}}}}
+    , .{client_id});
+    defer allocator.free(surface_clear_req);
+    const surface_clear_response = try daemon.handleRequest(surface_clear_req);
+    defer allocator.free(surface_clear_response);
+    try expectWriteApplied(surface_clear_response, allocator, 7);
+
+    const completion_clear_req = try std.fmt.allocPrint(allocator,
+        \\{{"jsonrpc":"2.0","id":12,"method":"notification.chatCompletion.clear","params":{{"mutation":{{"request_key":"full-completion-clear","client_id":"{s}","expected_store_revision":7}},"workspace_id":"ws-snap","local_thread_id":"t-snap"}}}}
+    , .{client_id});
+    defer allocator.free(completion_clear_req);
+    const completion_clear_response = try daemon.handleRequest(completion_clear_req);
+    defer allocator.free(completion_clear_response);
+    try expectWriteApplied(completion_clear_response, allocator, 8);
+}
+
+test "prepare shutdown refuses while store writes are in flight" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    daemon.idle_exit_ms = null;
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+
+    // Simulate a write in flight without holding the service mutex.
+    _ = daemon.store_service.?.in_flight.fetchAdd(1, .monotonic);
+
+    const refused = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"daemon.prepareShutdown","params":{}}
+    );
+    defer allocator.free(refused);
+    var refused_parsed = try std.json.parseFromSlice(std.json.Value, allocator, refused, .{});
+    defer refused_parsed.deinit();
+    const refused_error = refused_parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings(headless.registry.ERR_INVALID_STATE, jsonString(refused_error.get("code").?).?);
+    try std.testing.expectEqual(@as(i64, 1), refused_error.get("data").?.object.get("store_writes_in_flight").?.integer);
+    try std.testing.expect(daemon.accepting_mutations);
+    try std.testing.expect(!daemon.shutdown_requested);
+    try std.testing.expect(!daemon.store_service.?.draining);
+
+    _ = daemon.store_service.?.in_flight.fetchSub(1, .monotonic);
+
+    const accepted = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"daemon.prepareShutdown","params":{}}
+    );
+    defer allocator.free(accepted);
+    var accepted_parsed = try std.json.parseFromSlice(std.json.Value, allocator, accepted, .{});
+    defer accepted_parsed.deinit();
+    const accepted_result = accepted_parsed.value.object.get("result").?.object;
+    try std.testing.expect(jsonBool(accepted_result.get("accepted") orelse .null).?);
+    try std.testing.expect(daemon.shutdown_requested);
+    try std.testing.expect(!daemon.accepting_mutations);
+    try std.testing.expect(daemon.store_service.?.draining);
+
+    const status = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"daemon.storeStatus","params":{}}
+    );
+    defer allocator.free(status);
+    var status_parsed = try std.json.parseFromSlice(std.json.Value, allocator, status, .{});
+    defer status_parsed.deinit();
+    const status_result = status_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings("draining", jsonString(status_result.get("drain_state").?).?);
+    try std.testing.expect(!status_result.get("writer_ready").?.bool);
+}
+
+test "drained daemon rejects store mutators with invalid_state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    daemon.idle_exit_ms = null;
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    const client_id = try registerTestClientId(&daemon, allocator);
+    defer allocator.free(client_id);
+
+    const prepare = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"daemon.prepareShutdown","params":{}}
+    );
+    defer allocator.free(prepare);
+    var prepare_parsed = try std.json.parseFromSlice(std.json.Value, allocator, prepare, .{});
+    defer prepare_parsed.deinit();
+    try std.testing.expect(jsonBool(prepare_parsed.value.object.get("result").?.object.get("accepted") orelse .null).?);
+
+    const append = try std.fmt.allocPrint(allocator,
+        \\{{"jsonrpc":"2.0","id":2,"method":"chat.message.append","params":{{"mutation":{{"request_key":"post-drain","client_id":"{s}"}},"workspace_id":"ws","thread_id":"t","message":{{"message_id":"m","role":"user","author":"You","body":"x"}}}}}}
+    , .{client_id});
+    defer allocator.free(append);
+    const append_response = try daemon.handleRequest(append);
+    defer allocator.free(append_response);
+    try expectErrorCodeMessage(
+        append_response,
+        allocator,
+        headless.protocol.ERR_INVALID_STATE,
+        "daemon is preparing shutdown and is not accepting mutations",
+    );
+
+    // storeStatus still answers after accepted prepare.
+    const status = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"daemon.storeStatus","params":{}}
+    );
+    defer allocator.free(status);
+    var status_parsed = try std.json.parseFromSlice(std.json.Value, allocator, status, .{});
+    defer status_parsed.deinit();
+    const status_result = status_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings("draining", jsonString(status_result.get("drain_state").?).?);
+    try std.testing.expect(!status_result.get("writer_ready").?.bool);
 }
 
 test "idle exit is disabled by default and honors override" {
