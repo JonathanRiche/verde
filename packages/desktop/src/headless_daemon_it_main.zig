@@ -23,6 +23,23 @@ const posix_pty_supported = switch (builtin.os.tag) {
 /// Daemon transport scenarios (Unix socket today; named pipe on Windows).
 const daemon_transport_supported = posix_pty_supported or builtin.os.tag == .windows;
 
+// Pinned windows-gnu IT cross-compile (A3 gate). Bare `-Dtarget=…` fails on this
+// host without SDL3/WebView2 search paths; use the same dep flags as
+// `scripts/dev/build-windows.sh` after `python3 scripts/dev/bootstrap_windows_deps.py --toolchain gnu`:
+//
+//   deps=$PWD/.zig-cache/windows-deps/gnu
+//   zig build headless-daemon-it -Dtarget=x86_64-windows-gnu \
+//     -Dbrowser-backend=native_webview -Dterminal_backend=true -Dlocal_ipc=true \
+//     -Dwindows_integrations=true -Dfff-cargo-target=x86_64-pc-windows-gnu \
+//     -Dsdl3-include-dir=$deps/include -Dsdl3-lib-dir=$deps/lib \
+//     -Dsdl3-runtime-lib=$deps/bin/SDL3.dll \
+//     -Dsdl3-ttf-include-dir=$deps/include -Dsdl3-ttf-lib-dir=$deps/lib \
+//     -Dsdl3-ttf-runtime-lib=$deps/bin/SDL3_ttf.dll \
+//     -Dwebview2-include-dir=$deps/include \
+//     -Dwebview2-loader-lib=$deps/lib/libWebView2Loader.a \
+//     -Dwebview2-loader-dll=$deps/bin/WebView2Loader.dll \
+//     --summary all
+
 const c = struct {
     // POSIX process-env mutation (not available on the Windows CRT).
     extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
@@ -41,15 +58,19 @@ const IT_SAFETY_IDLE_EXIT_MS = "30000";
 /// concurrent transport. Set true when M5-P3 lands concurrent transport.
 const CONCURRENT_TRANSPORT_LANDED = false;
 
-// Force semantic analysis while the compile-time gate is false so the M5-P3
-// timing scenario cannot type-rot before concurrent transport lands. Only pin
-// under POSIX: the scenario body uses PTY-tier helpers and is never run on
-// Windows (A3 compile gate covers the transport tier only).
+// Force semantic analysis for OS-gated helpers whose only runtime callers sit
+// behind a comptime-false tier on the other OS (lazy analysis would elide them).
+// - POSIX: M5-P3 timing scenario trio (never run on Windows).
+// - Windows: waitChildBounded's WaitForSingleObject arm (only caller is PTY-tier
+//   lifecycle bind guard, which is elided under windows-gnu).
 comptime {
     if (posix_pty_supported) {
         _ = &runSlowConfigDoesNotBlockTailScenario;
         _ = &slowStartThread;
         _ = &spawnIsolatedDaemonWithSlowIo;
+    }
+    if (builtin.os.tag == .windows) {
+        _ = &waitChildBounded;
     }
 }
 
@@ -70,23 +91,30 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(2);
             };
             // Optional --parent-pid so a panicked/aborted IT parent cannot leave
-            // an orphan daemon (defers are skipped on panic/abort).
-            var parent_pid: ?u32 = null;
-            while (iterator.next()) |flag| {
-                if (std.mem.eql(u8, flag, "--parent-pid")) {
-                    const raw = iterator.next() orelse {
-                        std.debug.print("headless-daemon-it --daemon --parent-pid requires a pid\n", .{});
-                        std.process.exit(2);
-                    };
-                    if (comptime posix_pty_supported) {
-                        parent_pid = std.fmt.parseInt(u32, raw, 10) catch {
+            // an orphan daemon (defers are skipped on panic/abort). Parse as the
+            // platform pid type on POSIX; Windows ignores the flag (no watcher).
+            if (comptime posix_pty_supported) {
+                var parent_pid: ?std.posix.pid_t = null;
+                while (iterator.next()) |flag| {
+                    if (std.mem.eql(u8, flag, "--parent-pid")) {
+                        const raw = iterator.next() orelse {
+                            std.debug.print("headless-daemon-it --daemon --parent-pid requires a pid\n", .{});
+                            std.process.exit(2);
+                        };
+                        parent_pid = std.fmt.parseInt(std.posix.pid_t, raw, 10) catch {
                             std.debug.print("headless-daemon-it: invalid --parent-pid\n", .{});
                             std.process.exit(2);
                         };
                     }
                 }
+                installItDaemonCleanupGuards(parent_pid, pref_path);
+            } else {
+                while (iterator.next()) |flag| {
+                    if (std.mem.eql(u8, flag, "--parent-pid")) {
+                        _ = iterator.next(); // consume value; watcher is POSIX-only
+                    }
+                }
             }
-            installItDaemonCleanupGuards(parent_pid, pref_path);
             try sessionizer.runDaemon(allocator, pref_path);
             return;
         }
@@ -157,6 +185,9 @@ fn isolationEndpoint(allocator: std.mem.Allocator, pref_path: []const u8) ![]u8 
 
 fn itSetEnv(name: [*:0]const u8, value: [*:0]const u8) !void {
     if (comptime builtin.os.tag == .windows) {
+        // CRT `_putenv_s(name, "")` DELETEs the variable rather than storing an
+        // empty value. Callers must never set an empty endpoint; use itUnsetEnv
+        // for removal and restore only non-empty previous values.
         if (c._putenv_s(name, value) != 0) return error.SetEnvFailed;
     } else {
         if (c.setenv(name, value, 1) != 0) return error.SetEnvFailed;
@@ -165,6 +196,7 @@ fn itSetEnv(name: [*:0]const u8, value: [*:0]const u8) !void {
 
 fn itUnsetEnv(name: [*:0]const u8) void {
     if (comptime builtin.os.tag == .windows) {
+        // Empty value is the CRT delete convention (see itSetEnv).
         _ = c._putenv_s(name, "");
     } else {
         _ = c.unsetenv(name);
@@ -345,41 +377,33 @@ fn currentEnviron() std.process.Environ {
 ///
 /// On Windows the watcher is compiled out: kill(pid,0) has no equivalent in
 /// the transport-tier subset, and A3's gate is compile+subset rather than a
-/// full orphan-reaper on named pipes.
-fn installItDaemonCleanupGuards(parent_pid: ?u32, pref_path: []const u8) void {
-    if (comptime posix_pty_supported) {
-        if (parent_pid) |pid| {
-            const thread = std.Thread.spawn(.{}, parentDeathWatchThread, .{ pid, pref_path }) catch return;
-            thread.detach();
-        }
-        return;
+/// full orphan-reaper on named pipes. Callers on non-POSIX must not invoke this.
+fn installItDaemonCleanupGuards(parent_pid: ?std.posix.pid_t, pref_path: []const u8) void {
+    if (comptime !posix_pty_supported) return;
+    if (parent_pid) |pid| {
+        const thread = std.Thread.spawn(.{}, parentDeathWatchThread, .{ pid, pref_path }) catch return;
+        thread.detach();
     }
-    // Windows / non-POSIX: watcher is a Unix safety net only (A3 compile+subset).
-    // Touch params so both OS analyses accept the stable signature without discards.
-    if (parent_pid != null and pref_path.len == std.math.maxInt(usize)) unreachable;
 }
 
-fn parentDeathWatchThread(parent_pid: u32, pref_path: []const u8) void {
-    // Entire body must live inside the comptime branch so Windows analysis
-    // never sees std.posix.kill / pid_t.
-    if (comptime posix_pty_supported) {
-        var threaded = std.Io.Threaded.init_single_threaded;
-        const io = threaded.io();
-        while (true) {
-            // Signal 0 only checks liveness (portable parent-death fallback).
-            const pid: std.posix.pid_t = @intCast(parent_pid);
-            std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
-                error.ProcessNotFound => {
-                    cleanupAfterItParentDeath(pref_path, io);
-                    std.process.exit(1);
-                },
-                // EPERM and unexpected/transient failures do not prove death.
-                else => {},
-            };
-            std.Io.sleep(io, .fromMilliseconds(200), .awake) catch {};
-        }
-    } else if (parent_pid == std.math.maxInt(u32) and pref_path.len == std.math.maxInt(usize)) {
-        unreachable;
+fn parentDeathWatchThread(parent_pid: std.posix.pid_t, pref_path: []const u8) void {
+    // Body is only referenced from the POSIX install path; keep the kill probe
+    // inside a comptime branch so a windows-gnu analysis of the decl (if any)
+    // never sees std.posix.kill.
+    if (comptime !posix_pty_supported) return;
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    while (true) {
+        // Signal 0 only checks liveness (portable parent-death fallback).
+        std.posix.kill(parent_pid, @enumFromInt(0)) catch |err| switch (err) {
+            error.ProcessNotFound => {
+                cleanupAfterItParentDeath(pref_path, io);
+                std.process.exit(1);
+            },
+            // EPERM and unexpected/transient failures do not prove death.
+            else => {},
+        };
+        std.Io.sleep(io, .fromMilliseconds(200), .awake) catch {};
     }
 }
 
@@ -1400,8 +1424,9 @@ fn runLeaseRenewReleaseScenario(allocator: std.mem.Allocator, io: std.Io) !void 
 }
 
 /// Scenario 10: forced-acquire + notification flow over the platform transport
-/// only (no sessions/PTYs/posix). Same assertions as scenario 4; runs on Linux
-/// over the Unix socket today and compiles for Windows named-pipe transport.
+/// only (no sessions/PTYs/posix). Shares the scenario-4 skeleton but asserts
+/// extra wire fields scenario 4 does not: notification body (command), zero
+/// mailbox for the forcing owner, and cursor progress via next_notification_seq.
 fn runForcedAcquireOverTransportScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const pref_path = try makePrefPath(allocator, "forced-acquire-transport");
     defer allocator.free(pref_path);
@@ -1475,12 +1500,26 @@ fn runForcedAcquireOverTransportScenario(allocator: std.mem.Allocator, io: std.I
     defer notifications.deinit();
     const notification_result = try typed_client.decodeNotifications(&notifications);
     if (notification_result.notifications.len != 1) return error.ForcedTransportNotificationCountMismatch;
-    if (!std.mem.eql(u8, notification_result.notifications[0].title, "Conflicting command started")) return error.ForcedTransportNotificationTitleMismatch;
+    const note = notification_result.notifications[0];
+    if (!std.mem.eql(u8, note.title, "Conflicting command started")) return error.ForcedTransportNotificationTitleMismatch;
+    // Body is the forcing command (registry NotificationEntry shares body/command).
+    if (!std.mem.eql(u8, note.body, "build")) return error.ForcedTransportNotificationBodyMismatch;
+    if (notification_result.next_notification_seq <= note.seq) return error.ForcedTransportNextSeqNotAdvanced;
 
+    // Forcing owner is not an "affected" mailbox recipient.
+    var forcer_pull = try typed_client.call(headless.registry.METHOD_DAEMON_NOTIFICATIONS, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner_session_id = "owner-b",
+    });
+    defer forcer_pull.deinit();
+    const forcer_result = try typed_client.decodeNotifications(&forcer_pull);
+    if (forcer_result.notifications.len != 0) return error.ForcedTransportForcerReceivedNotification;
+
+    // Cursor via next_notification_seq (scenario 4 uses the entry's seq only).
     var second_pull = try typed_client.call(headless.registry.METHOD_DAEMON_NOTIFICATIONS, .{
         .workspace = .{ .workspace_path = pref_path },
         .owner_session_id = "owner-a",
-        .after_seq = notification_result.notifications[0].seq,
+        .after_seq = notification_result.next_notification_seq,
     });
     defer second_pull.deinit();
     const second_result = try typed_client.decodeNotifications(&second_pull);
