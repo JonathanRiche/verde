@@ -2520,8 +2520,11 @@ pub const Daemon = struct {
         if (process) |existing| {
             if (requested_name.len != 0 and !std.mem.eql(u8, existing.name, name)) return error.InvalidParams;
             if (!std.mem.eql(u8, existing.id, process_id)) {
+                // Dupe before free: an OOM here must not leave the errdefer
+                // above pointing at an already-freed slice.
+                const canonical_id = try allocator.dupe(u8, existing.id);
                 allocator.free(process_id);
-                process_id = try allocator.dupe(u8, existing.id);
+                process_id = canonical_id;
             }
         } else if (operation != .start) {
             return error.ManagedProcessNotFound;
