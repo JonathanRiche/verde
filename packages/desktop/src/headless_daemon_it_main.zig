@@ -2670,6 +2670,9 @@ fn runStoreBoundedQueueingScenario(allocator: std.mem.Allocator, io: std.Io) !vo
         }
     }.run;
     const worker = try std.Thread.spawn(.{}, slowThread, .{&mut_ctx});
+    // Join on every path so a fallible concurrent read cannot leave the
+    // mutation thread writing into a dead stack frame.
+    defer worker.join();
 
     // Issue the read immediately after the mutation thread starts. With a serial
     // accept loop it queues behind the stalled commit; both must still finish.
@@ -2681,7 +2684,6 @@ fn runStoreBoundedQueueingScenario(allocator: std.mem.Allocator, io: std.Io) !vo
     var list_parsed = try client.call(headless.registry.METHOD_PROCESS_LIST, list_req);
     defer list_parsed.deinit();
     const read_elapsed = sessionizer.nowMs() - read_started;
-    worker.join();
 
     if (mut_ctx.err) |err| return err;
     if (!mut_ctx.applied) return error.StoreQueueMutationNotApplied;
@@ -2724,15 +2726,13 @@ fn runStoreBusyRetryScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         std.debug.print("headless-daemon-it: busy parent sqlite open failed: {s}\n", .{@errorName(err)});
         return err;
     };
-    // Always release the writer lock on every exit path so the daemon cannot hang
-    // on its busy timeout during teardown.
-    errdefer parent_conn.close();
+    // Single-owner close: one errdefer + flag; never close twice on success or
+    // assertion-failure paths (spec trap #7 / S4 (f)).
+    var conn_open = true;
+    errdefer if (conn_open) parent_conn.close();
     // Parent acquires immediately; do not compete with the daemon's 5s busy wait.
     parent_conn.busyTimeout(0) catch {};
-    parent_conn.execNoArgs("begin immediate") catch |err| {
-        parent_conn.close();
-        return err;
-    };
+    try parent_conn.execNoArgs("begin immediate");
     var txn_open = true;
     errdefer if (txn_open) parent_conn.rollback();
 
@@ -2785,13 +2785,16 @@ fn runStoreBusyRetryScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     parent_conn.rollback();
     txn_open = false;
     parent_conn.close();
+    conn_open = false;
 
+    var applied_revision: u64 = 0;
     {
         var applied_parsed = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, upsert);
         defer applied_parsed.deinit();
         if (!applied_parsed.response.isOk()) return error.StoreBusyRetryFailed;
         const result = try client.decodeWriteResult(&applied_parsed);
         if (!result.applied or result.duplicate) return error.StoreBusyRetryNotApplied;
+        applied_revision = result.store_revision;
     }
 
     {
@@ -2799,8 +2802,9 @@ fn runStoreBusyRetryScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         defer replay_parsed.deinit();
         if (!replay_parsed.response.isOk()) return error.StoreBusyReplayFailed;
         const result = try client.decodeWriteResult(&replay_parsed);
-        // Receipt replay returns the original WriteResult (applied=true).
+        // Receipt replay: original shape AND no extra revision bump (exactly-once).
         if (!result.applied or result.duplicate) return error.StoreBusyReplayShape;
+        if (result.store_revision != applied_revision) return error.StoreBusyReplayRevisionBumped;
     }
 }
 
@@ -2829,7 +2833,9 @@ fn runStoreCrashBeforeCommitScenario(allocator: std.mem.Allocator, io: std.Io) !
             .store_dir = store_dir,
             .store_fault = "crash_before_commit",
         });
-        // Child aborts; wait/reap below. Kill only if it hangs.
+        // Kill on bare-try unwind until the abort arm owns teardown (S3 fix pattern).
+        var kill_on_unwind = true;
+        errdefer if (kill_on_unwind) child.kill(io);
 
         var decode_arena = std.heap.ArenaAllocator.init(allocator);
         defer decode_arena.deinit();
@@ -2841,10 +2847,7 @@ fn runStoreCrashBeforeCommitScenario(allocator: std.mem.Allocator, io: std.Io) !
 
         var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
         defer register_parsed.deinit();
-        if (!register_parsed.response.isOk()) {
-            child.kill(io);
-            return error.StoreCrashBeforeRegisterFailed;
-        }
+        if (!register_parsed.response.isOk()) return error.StoreCrashBeforeRegisterFailed;
         const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
 
         const upsert: headless.store.WorkspaceUpsertRequest = .{
@@ -2863,16 +2866,15 @@ fn runStoreCrashBeforeCommitScenario(allocator: std.mem.Allocator, io: std.Io) !
             var parsed = owned;
             defer parsed.deinit();
             // If a response arrived, treat success as a failure of the crash arm.
-            if (parsed.response.isOk()) {
-                child.kill(io);
-                return error.StoreCrashBeforeUnexpectedSuccess;
-            }
+            if (parsed.response.isOk()) return error.StoreCrashBeforeUnexpectedSuccess;
         } else |_| {}
 
+        // Abort/exit owns teardown from here; waitChildBounded kills on hang.
         const term = waitChildBounded(&child, io, 10000) catch {
-            child.kill(io);
+            kill_on_unwind = false;
             return error.StoreCrashBeforeDidNotExit;
         };
+        kill_on_unwind = false;
         switch (term) {
             .exited => |code| if (code == 0) return error.StoreCrashBeforeCleanExit,
             .signal => {}, // abort → signal is the expected abnormal path
@@ -3006,6 +3008,9 @@ fn runStoreCrashAfterCommitScenario(allocator: std.mem.Allocator, io: std.Io) !v
             .store_dir = store_dir,
             .store_fault = "crash_after_commit",
         });
+        // Kill on bare-try unwind until the abort arm owns teardown (S3 fix pattern).
+        var kill_on_unwind = true;
+        errdefer if (kill_on_unwind) child.kill(io);
 
         var decode_arena = std.heap.ArenaAllocator.init(allocator);
         defer decode_arena.deinit();
@@ -3017,10 +3022,7 @@ fn runStoreCrashAfterCommitScenario(allocator: std.mem.Allocator, io: std.Io) !v
 
         var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
         defer register_parsed.deinit();
-        if (!register_parsed.response.isOk()) {
-            child.kill(io);
-            return error.StoreCrashAfterRegisterFailed;
-        }
+        if (!register_parsed.response.isOk()) return error.StoreCrashAfterRegisterFailed;
         const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
 
         const upsert: headless.store.WorkspaceUpsertRequest = .{
@@ -3046,10 +3048,12 @@ fn runStoreCrashAfterCommitScenario(allocator: std.mem.Allocator, io: std.Io) !v
             }
         } else |_| {}
 
+        // Abort/exit owns teardown from here; waitChildBounded kills on hang.
         const term = waitChildBounded(&child, io, 10000) catch {
-            child.kill(io);
+            kill_on_unwind = false;
             return error.StoreCrashAfterDidNotExit;
         };
+        kill_on_unwind = false;
         switch (term) {
             .exited => |code| if (code == 0) return error.StoreCrashAfterCleanExit,
             .signal => {},
