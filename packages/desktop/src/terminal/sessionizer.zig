@@ -1760,7 +1760,11 @@ pub const Daemon = struct {
         }
         if (self.countLiveManagedProcesses() != 0) return true;
         if (self.registry_jobs.len() != 0) return true;
-        if (self.countActiveLeases(nowMs()) != 0) return true;
+        // Active leases normally keep the daemon alive. During a store-backed
+        // prepare drain they transfer via SQLite, so they must not block exit.
+        if (!(self.store_service != null and self.shutdown_requested)) {
+            if (self.countActiveLeases(nowMs()) != 0) return true;
+        }
         for (self.chat_turns.items) |turn| {
             lockTurn(turn);
             const keep_alive = chatTurnKeepsDaemonAlive(turn.status, turn.consumed, turn.worker_done);
@@ -2359,7 +2363,8 @@ pub const Daemon = struct {
     /// Prepare-for-upgrade shutdown (headless_verde.md Lifetime §Protocol-version
     /// replacement). Enters drain only when the full shared state gate is clear
     /// so a refused upgrade does not freeze a healthy daemon.
-    /// Gate order: registry safe → store drained → store closed on exit
+    /// Gate order: registry safe (leases transfer when the hermetic store is
+    /// active) → store writes drained → transfer commit + store close on exit
     /// (final close lives in `finishSessionizerServer` after drain join).
     fn prepareShutdownResponse(self: *Daemon, id_value: std.json.Value) ![]u8 {
         const now_ms = nowMs();
@@ -2372,7 +2377,10 @@ pub const Daemon = struct {
         const managed = self.countLiveManagedProcesses();
         const leases = self.countActiveLeases(now_ms);
         const registry_jobs = self.registry_jobs.len();
-        const safe_to_exit = running_sessions == 0 and managed == 0 and keep_alive_turns == 0 and leases == 0 and registry_jobs == 0;
+        // Hermetic store open: leases transfer at drain and stop blocking prepare.
+        // Production (store-less) keeps the pre-M3 DaemonReplacementBlocked path.
+        const leases_block = if (self.store_service != null) @as(usize, 0) else leases;
+        const safe_to_exit = running_sessions == 0 and managed == 0 and keep_alive_turns == 0 and leases_block == 0 and registry_jobs == 0;
         if (!safe_to_exit) {
             return prepareShutdownRefusalResponse(
                 self,
@@ -5050,6 +5058,12 @@ fn maybeInitStoreService(daemon: *Daemon) !void {
     };
     errdefer service.store.deinit();
 
+    // Successor path: import+prune after endpoint ownership, seed the registry,
+    // then publish the service. Drain has not started yet (ready callback).
+    var imported = try service.store.importLeasesAndOutcomes(nowMs());
+    defer imported.deinit(daemon.allocator);
+    try seedRegistryFromTransfer(daemon, &imported);
+
     lockDaemon(daemon);
     daemon.store_service = service;
     daemon.mutex.unlock();
@@ -5271,13 +5285,199 @@ fn finishSessionizerServer(context: *SessionizerServerContext) void {
         context.drain_thread = null;
     }
     // Serve loop returned and drain joined: no request can still be in flight.
-    // Final store gate (S3 names prepare-shutdown drain; close lives here).
+    // Final store gate: commit the lease/outcome transfer snapshot (even when
+    // empty — a real snapshot so a stale predecessor cannot resurrect), then
+    // close the writer. Close is the handoff barrier for the successor open.
     if (context.daemon.store_service) |service| {
+        lockDaemon(context.daemon);
+        // Reap once more so the committed snapshot matches the prepare gate.
+        _ = context.daemon.registry.reap(context.daemon.allocator, nowMs());
+        persistTransferSnapshot(context.daemon, service) catch |err| {
+            log.warn("lease/outcome transfer persist failed err={s}", .{@errorName(err)});
+        };
+        context.daemon.store_service = null;
+        context.daemon.mutex.unlock();
         service.store.deinit();
         context.daemon.allocator.destroy(service);
-        context.daemon.store_service = null;
     }
     if (context.pid_published) deletePidFileIfOwned(context.pid_path);
+}
+
+/// Drain-time transfer: always write one real snapshot (delete-all + set,
+/// possibly empty, one revision bump). Caller holds the daemon lock; this
+/// takes the store service lock for the SQLite call.
+fn persistTransferSnapshot(daemon: *Daemon, service: *StoreService) !void {
+    var arena = std.heap.ArenaAllocator.init(daemon.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    var leases: std.ArrayListUnmanaged(daemon_store.LeaseRecord) = .empty;
+    var outcomes: std.ArrayListUnmanaged(daemon_store.TerminalProcessOutcome) = .empty;
+
+    for (daemon.registry.workspaces.items) |*workspace| {
+        for (workspace.leases.items) |*lease| {
+            const resources = try scratch.alloc([]const u8, lease.resources.items.len);
+            for (lease.resources.items, 0..) |resource, index| resources[index] = resource;
+            try leases.append(scratch, .{
+                .workspace_id = lease.workspace_id,
+                .lease_id = lease.id,
+                .owner = lease.owner,
+                .client_id = lease.client_id,
+                .command = lease.command,
+                .resources = resources,
+                .created_at_ms = lease.created_at_ms,
+                .expires_at_ms = lease.expires_at_ms,
+                .last_renewal_ms = lease.last_renewal_ms,
+            });
+        }
+        for (workspace.terminal_process_outcomes.items) |*outcome| {
+            try outcomes.append(scratch, .{
+                .workspace_id = outcome.workspace_id,
+                .process_id = outcome.process_id,
+                .generation = outcome.generation,
+                .session_id = outcome.session_id,
+                .command = outcome.command,
+                .cwd = outcome.cwd,
+                .pid = outcome.pid,
+                .process_group = outcome.process_group,
+                .started_at_ms = outcome.started_at_ms,
+                .finished_at_ms = outcome.finished_at_ms,
+                .dock_id = outcome.dock_id,
+                .pane_id = outcome.pane_id,
+                .owner_kind = outcome.owner_kind,
+                .owner_title = outcome.owner_title,
+                .provider = outcome.provider,
+                .status = mapOutcomeStatusToStore(outcome.status),
+                .exit_code = outcome.exit_code,
+                .signal = outcome.signal,
+                .cancellation_reason = outcome.cancellation_reason,
+            });
+        }
+    }
+
+    lockStoreService(service);
+    defer service.mutex.unlock();
+    // Empty set is still a real snapshot (M2-DT-a fix binding semantics).
+    _ = try service.store.persistLeasesAndOutcomes(leases.items, outcomes.items);
+}
+
+fn mapOutcomeStatusToStore(status: process_registry.TerminalProcessOutcomeStatus) daemon_store.TerminalProcessOutcomeStatus {
+    return switch (status) {
+        .completed => .completed,
+        .failed => .failed,
+        .cancelled => .cancelled,
+        .crashed => .crashed,
+        .unknown => .unknown,
+    };
+}
+
+fn mapOutcomeStatusFromStore(status: daemon_store.TerminalProcessOutcomeStatus) process_registry.TerminalProcessOutcomeStatus {
+    return switch (status) {
+        .completed => .completed,
+        .failed => .failed,
+        .cancelled => .cancelled,
+        .crashed => .crashed,
+        .unknown => .unknown,
+    };
+}
+
+/// Seed the volatile registry from a committed transfer import. Dupes all
+/// strings so the imported container can be freed independently.
+fn seedRegistryFromTransfer(daemon: *Daemon, imported: *const daemon_store.ImportedLeasesAndOutcomes) !void {
+    var seeded: usize = 0;
+    for (imported.leases.items) |src| {
+        const workspace = try daemon.registry.ensureWorkspace(daemon.allocator, src.workspace_id);
+        var lease = try cloneImportedLease(daemon.allocator, src);
+        errdefer lease.deinit(daemon.allocator);
+        try workspace.leases.append(daemon.allocator, lease);
+        seeded += 1;
+    }
+    for (imported.outcomes.items) |src| {
+        const workspace = try daemon.registry.ensureWorkspace(daemon.allocator, src.workspace_id);
+        var outcome = try cloneImportedOutcome(daemon.allocator, src);
+        errdefer outcome.deinit(daemon.allocator);
+        try workspace.terminal_process_outcomes.append(daemon.allocator, outcome);
+        seeded += 1;
+    }
+    if (seeded != 0) {
+        // Mirror process_registry.bumpRevision without exporting it.
+        daemon.registry.registry_revision +%= 1;
+        if (daemon.registry.registry_revision == 0) daemon.registry.registry_revision = 1;
+    }
+}
+
+fn cloneImportedLease(allocator: std.mem.Allocator, src: daemon_store.ImportedLeaseRecord) !process_registry.LeaseRecord {
+    const owned_workspace_id = try allocator.dupe(u8, src.workspace_id);
+    errdefer allocator.free(owned_workspace_id);
+    const owned_id = try allocator.dupe(u8, src.lease_id);
+    errdefer allocator.free(owned_id);
+    const owned_owner = try allocator.dupe(u8, src.owner);
+    errdefer allocator.free(owned_owner);
+    const owned_client_id = try allocator.dupe(u8, src.client_id);
+    errdefer allocator.free(owned_client_id);
+    const owned_command = try allocator.dupe(u8, src.command);
+    errdefer allocator.free(owned_command);
+    var resources: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (resources.items) |resource| allocator.free(resource);
+        resources.deinit(allocator);
+    }
+    for (src.resources.items) |resource| {
+        try resources.append(allocator, try allocator.dupe(u8, resource));
+    }
+    return .{
+        .workspace_id = owned_workspace_id,
+        .id = owned_id,
+        .owner = owned_owner,
+        .client_id = owned_client_id,
+        .command = owned_command,
+        .resources = resources,
+        .created_at_ms = src.created_at_ms,
+        .expires_at_ms = src.expires_at_ms,
+        .last_renewal_ms = src.last_renewal_ms,
+    };
+}
+
+fn cloneImportedOutcome(allocator: std.mem.Allocator, src: daemon_store.ImportedTerminalProcessOutcome) !process_registry.TerminalProcessOutcome {
+    const owned_workspace_id = try allocator.dupe(u8, src.workspace_id);
+    errdefer allocator.free(owned_workspace_id);
+    const owned_process_id = try allocator.dupe(u8, src.process_id);
+    errdefer allocator.free(owned_process_id);
+    const owned_session_id = try allocator.dupe(u8, src.session_id);
+    errdefer allocator.free(owned_session_id);
+    const owned_command = try allocator.dupe(u8, src.command);
+    errdefer allocator.free(owned_command);
+    const owned_cwd = try allocator.dupe(u8, src.cwd);
+    errdefer allocator.free(owned_cwd);
+    const owned_owner_kind = try allocator.dupe(u8, src.owner_kind);
+    errdefer allocator.free(owned_owner_kind);
+    const owned_owner_title = try allocator.dupe(u8, src.owner_title);
+    errdefer allocator.free(owned_owner_title);
+    const owned_provider: ?[]u8 = if (src.provider) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (owned_provider) |value| allocator.free(value);
+    const owned_cancellation: ?[]u8 = if (src.cancellation_reason) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (owned_cancellation) |value| allocator.free(value);
+    return .{
+        .workspace_id = owned_workspace_id,
+        .process_id = owned_process_id,
+        .generation = src.generation,
+        .session_id = owned_session_id,
+        .command = owned_command,
+        .cwd = owned_cwd,
+        .pid = src.pid,
+        .process_group = src.process_group,
+        .started_at_ms = src.started_at_ms,
+        .finished_at_ms = src.finished_at_ms,
+        .dock_id = src.dock_id,
+        .pane_id = src.pane_id,
+        .owner_kind = owned_owner_kind,
+        .owner_title = owned_owner_title,
+        .provider = owned_provider,
+        .status = mapOutcomeStatusFromStore(src.status),
+        .exit_code = src.exit_code,
+        .signal = src.signal,
+        .cancellation_reason = owned_cancellation,
+    };
 }
 
 fn lockDaemon(daemon: *Daemon) void {
@@ -8240,6 +8440,170 @@ test "store dispatch covers the full mutation surface" {
     const completion_clear_response = try daemon.handleRequest(completion_clear_req);
     defer allocator.free(completion_clear_response);
     try expectWriteApplied(completion_clear_response, allocator, 8);
+}
+
+test "prepare accepts active leases when store is active for transfer" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    daemon.idle_exit_ms = null;
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+
+    var lease = try daemon.registry.acquireLease(
+        allocator,
+        "transfer-ws",
+        "owner",
+        "client",
+        "build",
+        &[_][]const u8{"build"},
+        false,
+        0,
+        nowMs(),
+    );
+    defer lease.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), daemon.countActiveLeases(nowMs()));
+
+    // Store active: leases transfer and no longer block prepare (M2-DT-b).
+    const accepted = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"daemon.prepareShutdown","params":{}}
+    );
+    defer allocator.free(accepted);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, accepted, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?.object;
+    try std.testing.expect(jsonBool(result.get("accepted") orelse .null).?);
+    try std.testing.expect(jsonBool(result.get("safe_to_exit") orelse .null).?);
+    try std.testing.expectEqual(@as(i64, 1), result.get("active_leases").?.integer);
+    try std.testing.expect(daemon.shutdown_requested);
+    try std.testing.expect(!daemon.accepting_mutations);
+    // Drain must be allowed to exit despite the live lease.
+    try std.testing.expect(daemon.shouldExitForIdle());
+}
+
+test "prepare still refuses active leases when store is dormant" {
+    // Production path: no hermetic store → existing DaemonReplacementBlocked gate.
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    daemon.idle_exit_ms = null;
+
+    var lease = try daemon.registry.acquireLease(
+        allocator,
+        "dormant-ws",
+        "owner",
+        "client",
+        "build",
+        &[_][]const u8{"build"},
+        false,
+        0,
+        nowMs(),
+    );
+    defer lease.deinit(allocator);
+
+    const refused = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"daemon.prepareShutdown","params":{}}
+    );
+    defer allocator.free(refused);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, refused, .{});
+    defer parsed.deinit();
+    const data = parsed.value.object.get("error").?.object.get("data").?.object;
+    try std.testing.expectEqual(@as(i64, 1), data.get("leases").?.integer);
+    try std.testing.expect(daemon.accepting_mutations);
+    try std.testing.expect(!daemon.shutdown_requested);
+}
+
+test "transfer persist and import seed preserves lease id and prunes expired" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    const now_ms: i64 = 10_000;
+    var predecessor = Daemon.init(allocator);
+    defer predecessor.deinit();
+    try attachTestStoreService(&predecessor, db_path);
+
+    var keep = try predecessor.registry.acquireLease(
+        allocator,
+        "seed-ws",
+        "owner-keep",
+        "client-keep",
+        "build",
+        &[_][]const u8{"build"},
+        false,
+        60_000,
+        now_ms,
+    );
+    defer keep.deinit(allocator);
+    const keep_id = try allocator.dupe(u8, keep.lease.id);
+    defer allocator.free(keep_id);
+
+    var expired = try predecessor.registry.acquireLease(
+        allocator,
+        "seed-ws",
+        "owner-exp",
+        "client-exp",
+        "test",
+        &[_][]const u8{"test"},
+        false,
+        1_000,
+        now_ms - 2_000,
+    );
+    defer expired.deinit(allocator);
+    // Force the second lease past its expiry for import pruning.
+    predecessor.registry.workspace("seed-ws").?.leases.items[1].expires_at_ms = now_ms - 1;
+
+    _ = try predecessor.registry.observeTerminalProcess(allocator, "seed-ws", .{
+        .process_identity = 42,
+        .session_id = "seed-session",
+        .command = "/bin/true",
+        .cwd = ".",
+        .started_at_ms = now_ms - 100,
+        .observed_at_ms = now_ms - 100,
+        .dock_id = 0,
+        .owner_kind = "terminal",
+        .owner_title = "seed-session",
+    }, .{});
+    try std.testing.expect(try predecessor.registry.finishTerminalProcess(
+        allocator,
+        "seed-ws",
+        "seed-session",
+        .{ .exit_code = 0 },
+        now_ms - 50,
+    ));
+
+    const before_revision = try predecessor.store_service.?.store.storeRevision();
+    try persistTransferSnapshot(&predecessor, predecessor.store_service.?);
+    const after_revision = try predecessor.store_service.?.store.storeRevision();
+    try std.testing.expectEqual(before_revision + 1, after_revision);
+
+    // Close predecessor store; successor reopens the same path.
+    detachTestStoreService(&predecessor);
+
+    var successor = Daemon.init(allocator);
+    defer successor.deinit();
+    try attachTestStoreService(&successor, db_path);
+    defer detachTestStoreService(&successor);
+
+    var imported = try successor.store_service.?.store.importLeasesAndOutcomes(now_ms);
+    defer imported.deinit(allocator);
+    try seedRegistryFromTransfer(&successor, &imported);
+
+    // Import does not bump store_revision; only the drain commit did.
+    try std.testing.expectEqual(after_revision, try successor.store_service.?.store.storeRevision());
+
+    const workspace = successor.registry.workspace("seed-ws") orelse return error.TestExpectedWorkspace;
+    try std.testing.expectEqual(@as(usize, 1), workspace.leases.items.len);
+    try std.testing.expectEqualStrings(keep_id, workspace.leases.items[0].id);
+    try std.testing.expectEqual(@as(usize, 1), workspace.terminal_process_outcomes.items.len);
+    try std.testing.expectEqualStrings("seed-session", workspace.terminal_process_outcomes.items[0].session_id);
 }
 
 test "prepare shutdown refuses while store writes are in flight" {

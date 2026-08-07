@@ -177,6 +177,9 @@ pub fn main(init: std.process.Init) !void {
         try runLifecycleBindGuard(allocator, io);
         try runLifecyclePrepareShutdownWithLivePty(allocator, io);
         try runLifecycleGracefulReplace(allocator, io);
+        // Store-backed lease/outcome transfer (M2-DT-b). Lifecycle/bind tier:
+        // spawns daemons; needs PTY for the finished-terminal-process half.
+        try runLifecycleGracefulReplaceWithTransfer(allocator, io);
         try runLifecycleIdleExitOverride(allocator, io);
     }
     std.debug.print("headless-daemon-it: ok\n", .{});
@@ -2350,6 +2353,8 @@ fn runStoreFullSurfaceScenario(allocator: std.mem.Allocator, io: std.Io) !void {
 
 /// Durable reopen: mutate → prepareShutdown → exit → direct SQLite check →
 /// respawn on same store_dir → status + receipt replay.
+/// Prepare drain always commits a transfer snapshot (M2-DT-b), so the durable
+/// store_revision advances one more time after the last mutation receipt.
 fn runStoreDurableReopenScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const pref_path = try makePrefPath(allocator, "store-durable");
     defer allocator.free(pref_path);
@@ -2509,16 +2514,19 @@ fn runStoreDurableReopenScenario(allocator: std.mem.Allocator, io: std.Io) !void
         };
         defer conn.close();
 
+        // Drain-time transfer always bumps once (possibly empty snapshot).
+        const after_transfer_revision = persisted_revision + 1;
         const rev_row = (try conn.row("select store_revision from store_state where id = 1", .{})) orelse
             return error.StoreDurableMissingStoreState;
         defer rev_row.deinit();
-        if (@as(u64, @intCast(rev_row.int(0))) != persisted_revision) return error.StoreDurableSqliteRevisionMismatch;
+        if (@as(u64, @intCast(rev_row.int(0))) != after_transfer_revision) return error.StoreDurableSqliteRevisionMismatch;
 
         const ws_row = (try conn.row("select count(*) from workspaces", .{})) orelse
             return error.StoreDurableMissingWorkspaces;
         defer ws_row.deinit();
         if (ws_row.int(0) < 1) return error.StoreDurableNoWorkspaceRows;
 
+        // Receipt still records the mutation revision, not the transfer bump.
         const receipt_row = (try conn.row(
             "select store_revision from store_receipts where request_key = ?1",
             .{receipt_key},
@@ -2527,7 +2535,7 @@ fn runStoreDurableReopenScenario(allocator: std.mem.Allocator, io: std.Io) !void
         if (@as(u64, @intCast(receipt_row.int(0))) != persisted_revision) return error.StoreDurableReceiptRevisionMismatch;
     }
 
-    // Respawn on the SAME store_dir: status shows persisted revision; receipt replay works.
+    // Respawn on the SAME store_dir: status shows post-transfer revision; receipt replay works.
     {
         var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
             .store_dir = store_dir,
@@ -2543,12 +2551,13 @@ fn runStoreDurableReopenScenario(allocator: std.mem.Allocator, io: std.Io) !void
         var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
         var scenario: FixtureScenario = .{ .client = &client };
 
+        const after_transfer_revision = persisted_revision + 1;
         const empty_params: struct {} = .{};
         var status_parsed = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params);
         defer status_parsed.deinit();
         if (!status_parsed.response.isOk()) return error.StoreDurableReopenStatusFailed;
         const status = try client.decodeStoreStatus(&status_parsed);
-        if (status.store_revision != persisted_revision) return error.StoreDurableReopenRevisionMismatch;
+        if (status.store_revision != after_transfer_revision) return error.StoreDurableReopenRevisionMismatch;
         if (!std.mem.eql(u8, status.drain_state, "open")) return error.StoreDurableReopenDrainStateWrong;
         if (!status.writer_ready) return error.StoreDurableReopenWriterNotReady;
 
@@ -3388,6 +3397,244 @@ fn runLifecyclePrepareShutdownWithLivePty(allocator: std.mem.Allocator, io: std.
 
     const kill_response = try sessionizer.requestAlloc(allocator, pref_path, "session.kill", .{ .id = session_id }, 5);
     defer allocator.free(kill_response);
+}
+
+/// Store-active graceful replace: two leases (one short-expiry) + finished
+/// terminal process transfer to the successor with same lease_id; expired
+/// lease pruned; store_revision advances exactly once for the drain commit.
+fn runLifecycleGracefulReplaceWithTransfer(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "graceful-xfer");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var keep_lease_id: ?[]const u8 = null;
+    defer if (keep_lease_id) |id| allocator.free(id);
+    var expired_lease_id: ?[]const u8 = null;
+    defer if (expired_lease_id) |id| allocator.free(id);
+    var finished_session_id: ?[]const u8 = null;
+    defer if (finished_session_id) |id| allocator.free(id);
+    var baseline_revision: u64 = 0;
+
+    {
+        var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+        });
+        // No defer kill: prepareShutdown should exit. Kill only on bare-try unwind.
+        var kill_on_unwind = true;
+        errdefer if (kill_on_unwind) child.kill(io);
+
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+        var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+        defer register_parsed.deinit();
+        if (!register_parsed.response.isOk()) return error.TransferRegisterFailed;
+
+        // Finished terminal process → durable outcome for transfer.
+        const session_id = "verde:headless-it:xfer-session";
+        var created = try client.call("session.create", .{
+            .id = session_id,
+            .cwd = pref_path,
+            .workspace_path = pref_path,
+            .command = &[_][]const u8{"/bin/cat"},
+            .cols = sessionizer.DEFAULT_COLS,
+            .rows = sessionizer.DEFAULT_ROWS,
+        });
+        defer created.deinit();
+        if (!created.response.isOk()) return error.TransferSessionCreateFailed;
+
+        var killed = try client.call("session.kill", .{ .id = session_id });
+        defer killed.deinit();
+        if (!killed.response.isOk()) return error.TransferSessionKillFailed;
+
+        // Wait for the outcome to land in the registry (drain poll).
+        var saw_outcome = false;
+        var outcome_attempt: usize = 0;
+        while (outcome_attempt < 100) : (outcome_attempt += 1) {
+            var listed = try client.call(headless.registry.METHOD_PROCESS_LIST, .{
+                .workspace = .{ .workspace_path = pref_path },
+                .include_outcomes = true,
+            });
+            defer listed.deinit();
+            if (listed.response.isOk()) {
+                const result = try client.decodeProcessList(&listed);
+                for (result.outcomes) |outcome| {
+                    if (std.mem.eql(u8, outcome.session_id, session_id)) {
+                        saw_outcome = true;
+                        break;
+                    }
+                }
+                if (saw_outcome) break;
+            }
+            // Reap finished session so prepare is not blocked by a live PTY.
+            var cleanup = try client.call("session.cleanup", .{});
+            defer cleanup.deinit();
+            std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+        }
+        if (!saw_outcome) return error.TransferOutcomeMissing;
+        finished_session_id = try allocator.dupe(u8, session_id);
+
+        // Ensure the PTY session is gone before prepare (live PTY still blocks).
+        var session_reaped = false;
+        var reap_attempt: usize = 0;
+        while (reap_attempt < 100) : (reap_attempt += 1) {
+            var cleanup = try client.call("session.cleanup", .{});
+            defer cleanup.deinit();
+            var status = try client.call("status", .{});
+            defer status.deinit();
+            if (status.response.result) |result| {
+                if (result == .object) {
+                    const running = result.object.get("running_session_count") orelse .null;
+                    if (running == .integer and running.integer == 0) {
+                        session_reaped = true;
+                        break;
+                    }
+                }
+            }
+            std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+        }
+        if (!session_reaped) return error.TransferSessionDidNotReap;
+
+        const resources_keep = [_][]const u8{"build"};
+        const resources_exp = [_][]const u8{"test"};
+
+        // Short-expiry lease (min TTL = 1s) and a long-lived lease.
+        var short_parsed = try client.call(headless.registry.METHOD_LEASE_ACQUIRE, .{
+            .workspace = .{ .workspace_path = pref_path },
+            .owner = "owner-short",
+            .command = "test",
+            .resources = &resources_exp,
+            .ttl_ms = 1_000,
+        });
+        defer short_parsed.deinit();
+        if (!short_parsed.response.isOk()) return error.TransferShortLeaseFailed;
+        const short_result = try client.decodeLeaseAcquire(&short_parsed);
+        const short_id = short_result.lease_id orelse return error.TransferShortLeaseIdMissing;
+        expired_lease_id = try allocator.dupe(u8, short_id);
+
+        var long_parsed = try client.call(headless.registry.METHOD_LEASE_ACQUIRE, .{
+            .workspace = .{ .workspace_path = pref_path },
+            .owner = "owner-keep",
+            .command = "build",
+            .resources = &resources_keep,
+            .ttl_ms = 60_000,
+        });
+        defer long_parsed.deinit();
+        if (!long_parsed.response.isOk()) return error.TransferLongLeaseFailed;
+        const long_result = try client.decodeLeaseAcquire(&long_parsed);
+        const long_id = long_result.lease_id orelse return error.TransferLongLeaseIdMissing;
+        keep_lease_id = try allocator.dupe(u8, long_id);
+
+        // Baseline: no store mutations yet → revision 0.
+        const empty_params: struct {} = .{};
+        var status_parsed = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params);
+        defer status_parsed.deinit();
+        if (!status_parsed.response.isOk()) return error.TransferStoreStatusFailed;
+        const status = try client.decodeStoreStatus(&status_parsed);
+        baseline_revision = status.store_revision;
+        if (baseline_revision != 0) return error.TransferUnexpectedBaselineRevision;
+
+        // Wait for the short lease to expire so successor import prunes it.
+        std.Io.sleep(io, .fromMilliseconds(1_100), .awake) catch {};
+
+        // Store active + unexpired lease must NOT block prepare (transfer path).
+        var prepare_parsed = try client.call("daemon.prepareShutdown", .{});
+        defer prepare_parsed.deinit();
+        if (!prepare_parsed.response.isOk()) return error.TransferPrepareNotAccepted;
+        const prepare_result = prepare_parsed.arena_parsed.value.object.get("result") orelse
+            return error.TransferPrepareNotAccepted;
+        const accepted = prepare_result.object.get("accepted") orelse
+            return error.TransferPrepareNotAccepted;
+        if (accepted != .bool or !accepted.bool) return error.TransferPrepareNotAccepted;
+
+        kill_on_unwind = false;
+
+        var exited = false;
+        var attempts: usize = 0;
+        while (attempts < 100) : (attempts += 1) {
+            if (sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
+                allocator.free(response);
+                std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+                continue;
+            } else |err| {
+                if (err == error.ConnectionRefused or err == error.FileNotFound) {
+                    exited = true;
+                    break;
+                }
+                std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+            }
+        }
+        if (!exited) {
+            child.kill(io);
+            return error.TransferDaemonDidNotExit;
+        }
+        _ = child.wait(io) catch {};
+    }
+
+    // Successor opens the same store_dir after endpoint ownership.
+    var second = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+    });
+    defer second.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    // store_revision advanced exactly once for the transfer commit.
+    const empty_params: struct {} = .{};
+    var status_parsed = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params);
+    defer status_parsed.deinit();
+    if (!status_parsed.response.isOk()) return error.TransferSuccessorStatusFailed;
+    const status = try client.decodeStoreStatus(&status_parsed);
+    if (status.store_revision != baseline_revision + 1) return error.TransferRevisionNotAdvancedOnce;
+
+    var listed = try client.call(headless.registry.METHOD_PROCESS_LIST, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .include_outcomes = true,
+    });
+    defer listed.deinit();
+    if (!listed.response.isOk()) return error.TransferSuccessorListFailed;
+    const list_result = try client.decodeProcessList(&listed);
+
+    const keep_id = keep_lease_id orelse return error.TransferKeepIdMissing;
+    const exp_id = expired_lease_id orelse return error.TransferExpIdMissing;
+    const session_id = finished_session_id orelse return error.TransferSessionIdMissing;
+
+    if (list_result.leases.len != 1) return error.TransferLeaseCountMismatch;
+    if (!std.mem.eql(u8, list_result.leases[0].id, keep_id)) return error.TransferLeaseIdMismatch;
+    for (list_result.leases) |lease| {
+        if (std.mem.eql(u8, lease.id, exp_id)) return error.TransferExpiredLeaseResurrected;
+    }
+
+    var found_outcome = false;
+    for (list_result.outcomes) |outcome| {
+        if (std.mem.eql(u8, outcome.session_id, session_id)) {
+            found_outcome = true;
+            break;
+        }
+    }
+    if (!found_outcome) return error.TransferOutcomeNotImported;
 }
 
 /// Empty daemon: prepareShutdown accepts → daemon exits → replacement binds.
