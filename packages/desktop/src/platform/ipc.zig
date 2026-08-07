@@ -115,6 +115,13 @@ fn serveUnix(
     // claim before unlink prevents cleanup from deleting a replacement path.
     defer endpoint_guard.deleteIfOwned();
 
+    // Transfer/store finalization must complete while this process still owns
+    // the endpoint — on EVERY exit path, error returns included. Declared
+    // after the teardown defers so LIFO runs it first: on_closing, then
+    // deleteIfOwned (unlink socket), then listener.deinit, then endpoint_guard
+    // deinit (releases exclusive lock).
+    defer if (callbacks.on_closing) |on_closing| on_closing(callbacks.context);
+
     if (callbacks.on_ready) |on_ready| try on_ready(callbacks.context);
 
     while (!callbacks.should_stop(callbacks.context)) {
@@ -124,12 +131,6 @@ fn serveUnix(
         };
         handleUnixClient(allocator, io, stream, callbacks, options);
     }
-
-    // Transfer/store finalization must complete while this process still owns
-    // the endpoint. LIFO defers below run only after this returns: first
-    // deleteIfOwned (unlink socket), then listener.deinit, then endpoint_guard
-    // deinit (releases exclusive lock).
-    if (callbacks.on_closing) |on_closing| on_closing(callbacks.context);
 }
 
 fn handleUnixClient(
@@ -333,6 +334,9 @@ fn serveWindows(
 ) !void {
     const pipe = try createWindowsPipe(allocator, endpoint, options);
     defer windows.CloseHandle(pipe);
+    // Mirror Unix: finalize on every exit path (error returns included)
+    // before the deferred pipe CloseHandle runs (LIFO).
+    defer if (callbacks.on_closing) |on_closing| on_closing(callbacks.context);
 
     if (callbacks.on_ready) |on_ready| try on_ready(callbacks.context);
 
@@ -368,9 +372,6 @@ fn serveWindows(
         // deferred disconnect makes this instance available again.
         _ = FlushFileBuffers(pipe);
     }
-
-    // Mirror Unix: finalize before the deferred pipe CloseHandle runs.
-    if (callbacks.on_closing) |on_closing| on_closing(callbacks.context);
 }
 
 fn requestWindowsAlloc(
