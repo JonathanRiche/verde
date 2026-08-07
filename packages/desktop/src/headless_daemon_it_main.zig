@@ -22,6 +22,20 @@ extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 /// permanent daemon+socket when persistent-by-default is enabled.
 const IT_SAFETY_IDLE_EXIT_MS = "30000";
 
+/// The Unix accept loop invokes each client callback synchronously
+/// (packages/desktop/src/platform/ipc.zig:115-121), so this scenario's second
+/// connection cannot reach the fast path during Phase B until M5-P3 lands
+/// concurrent transport. Set true when M5-P3 lands concurrent transport.
+const CONCURRENT_TRANSPORT_LANDED = false;
+
+// Force semantic analysis while the compile-time gate is false so the M5-P3
+// timing scenario cannot type-rot before concurrent transport lands.
+comptime {
+    _ = &runSlowConfigDoesNotBlockTailScenario;
+    _ = &slowStartThread;
+    _ = &spawnIsolatedDaemonWithSlowIo;
+}
+
 pub fn main(init: std.process.Init) !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
@@ -73,6 +87,12 @@ pub fn main(init: std.process.Init) !void {
     try runRegistryFixtureScenario(allocator, io);
     try runRegistryCapabilityScenario(allocator, io);
     try runProcessLifecycleScenario(allocator, io);
+    try runManagedProcessScenario(allocator, io);
+    if (CONCURRENT_TRANSPORT_LANDED) {
+        try runSlowConfigDoesNotBlockTailScenario(allocator, io);
+    } else {
+        std.debug.print("headless-daemon-it: skip runSlowConfigDoesNotBlockTailScenario (requires concurrent transport; enable when M5-P3 lands)\n", .{});
+    }
     try runRegistryMethodPresenceScenario(allocator, io);
     try runLeaseConflictScenario(allocator, io);
     try runLeaseRenewReleaseScenario(allocator, io);
@@ -158,12 +178,34 @@ fn spawnIsolatedDaemonWithEnv(
     pref_path: []const u8,
     idle_exit_ms: ?[]const u8,
 ) !std.process.Child {
+    return spawnIsolatedDaemonWithOptions(allocator, io, self_exe, pref_path, idle_exit_ms, null);
+}
+
+fn spawnIsolatedDaemonWithSlowIo(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    self_exe: []const u8,
+    pref_path: []const u8,
+    slow_io_ms: []const u8,
+) !std.process.Child {
+    return spawnIsolatedDaemonWithOptions(allocator, io, self_exe, pref_path, IT_SAFETY_IDLE_EXIT_MS, slow_io_ms);
+}
+
+fn spawnIsolatedDaemonWithOptions(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    self_exe: []const u8,
+    pref_path: []const u8,
+    idle_exit_ms: ?[]const u8,
+    slow_io_ms: ?[]const u8,
+) !std.process.Child {
     var env_map = try std.process.Environ.createMap(currentEnviron(), allocator);
     defer env_map.deinit();
 
     // Always set a safety-net idle so a crashed IT cannot leak a permanent daemon.
     // Per-test tighter overrides still win when provided.
     try env_map.put("VERDE_SESSION_DAEMON_IDLE_EXIT_MS", idle_exit_ms orelse IT_SAFETY_IDLE_EXIT_MS);
+    if (slow_io_ms) |value| try env_map.put("VERDE_SESSIONIZER_TEST_SLOW_IO_MS", value);
 
     // Bind the child to the same isolated endpoint the parent uses.
     const endpoint = try sessionizer.defaultSocketPath(allocator, pref_path);
@@ -322,14 +364,16 @@ fn waitChildBounded(child: *std.process.Child, io: std.Io, timeout_ms: u64) !std
 /// while the phase-2 daemon hooks remain unimplemented.
 const FIXTURE_METHOD_NOT_FOUND: []const u8 = "method_not_found";
 
-// W5 appends process.start/stop/restart and W6 appends daemon.stop here when
-// those methods become dispatched. Keep this canonical presence list growing.
+// W6 appends daemon.stop here. Keep this canonical presence list growing.
 const DISPATCHED_REGISTRY_METHODS = [_][]const u8{
     headless.registry.METHOD_WORKSPACE_RESOLVE,
     headless.registry.METHOD_PROCESS_LIST,
     headless.registry.METHOD_PROCESS_INSPECT,
     headless.registry.METHOD_PROCESS_WAIT,
     headless.registry.METHOD_PROCESS_LOGS,
+    headless.registry.METHOD_PROCESS_START,
+    headless.registry.METHOD_PROCESS_STOP,
+    headless.registry.METHOD_PROCESS_RESTART,
     headless.registry.METHOD_LEASE_CHECK,
     headless.registry.METHOD_LEASE_ACQUIRE,
     headless.registry.METHOD_LEASE_RENEW,
@@ -757,6 +801,263 @@ fn runProcessLifecycleScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         if (result.outcomes.len > 32) return error.ProcessLifecycleOutcomeCapExceeded;
         if (result.processes.len != 0) return error.ProcessLifecycleLiveSessionsRemain;
     }
+}
+
+fn writeManagedProcessConfig(io: std.Io, workspace_path: []const u8, command: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(io, workspace_path);
+    const config_path = try std.fs.path.join(std.heap.page_allocator, &.{ workspace_path, "verde.yml" });
+    defer std.heap.page_allocator.free(config_path);
+    var file = try std.Io.Dir.cwd().createFile(io, config_path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "processes:\n  sleeper:\n    command: \"");
+    try file.writeStreamingAll(io, command);
+    try file.writeStreamingAll(io, "\"\n");
+}
+
+fn managedProcessIdFromResponse(response: *const headless.protocol.ParsedResponse, allocator: std.mem.Allocator) ![]u8 {
+    const result = response.response.result orelse return error.ManagedProcessMissingResult;
+    if (result != .object) return error.ManagedProcessMalformedResult;
+    const process = result.object.get("process") orelse return error.ManagedProcessMissingProcess;
+    if (process != .object) return error.ManagedProcessMalformedProcess;
+    const id = process.object.get("id") orelse return error.ManagedProcessMissingId;
+    if (id != .string) return error.ManagedProcessMalformedId;
+    return allocator.dupe(u8, id.string);
+}
+
+fn expectManagedList(response: *const headless.protocol.ParsedResponse, expected_id: []const u8) !void {
+    const result = response.response.result orelse return error.ManagedProcessListMissingResult;
+    if (result != .object) return error.ManagedProcessListMalformedResult;
+    const processes = result.object.get("processes") orelse return error.ManagedProcessListMissingProcesses;
+    if (processes != .array or processes.array.items.len != 1) return error.ManagedProcessListCountMismatch;
+    const process = processes.array.items[0];
+    if (process != .object) return error.ManagedProcessListMalformedProcess;
+    const id = process.object.get("id") orelse return error.ManagedProcessListMissingId;
+    if (id != .string or !std.mem.eql(u8, id.string, expected_id)) return error.ManagedProcessListWrongId;
+}
+
+/// Scenario 2: daemon-owned managed records are workspace-scoped even when
+/// two projects use the same configured process name.
+fn runManagedProcessScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "managed-processes");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    const workspace_a = try std.fmt.allocPrint(allocator, "{s}/workspace-a", .{pref_path});
+    defer allocator.free(workspace_a);
+    const workspace_b = try std.fmt.allocPrint(allocator, "{s}/workspace-b", .{pref_path});
+    defer allocator.free(workspace_b);
+    try writeManagedProcessConfig(io, workspace_a, "/bin/cat");
+    try writeManagedProcessConfig(io, workspace_b, "/bin/cat");
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, "500");
+    var child_exited = false;
+    defer if (!child_exited) child.kill(io);
+
+    var transport: sessionizer.HeadlessTransport = .{ .allocator = allocator, .pref_path = pref_path };
+    var client = sessionizer.headlessClient(allocator, &transport);
+    var process_id_a: ?[]u8 = null;
+    var process_id_b: ?[]u8 = null;
+    defer {
+        if (process_id_a) |process_id| {
+            if (client.call(headless.registry.METHOD_PROCESS_STOP, .{
+                .workspace = .{ .workspace_path = workspace_a },
+                .process_id = process_id,
+            })) |response| {
+                var owned = response;
+                owned.deinit();
+            } else |_| {}
+            allocator.free(process_id);
+        }
+        if (process_id_b) |process_id| {
+            if (client.call(headless.registry.METHOD_PROCESS_STOP, .{
+                .workspace = .{ .workspace_path = workspace_b },
+                .process_id = process_id,
+            })) |response| {
+                var owned = response;
+                owned.deinit();
+            } else |_| {}
+            allocator.free(process_id);
+        }
+    }
+    var start_a = try client.call(headless.registry.METHOD_PROCESS_START, .{
+        .workspace = .{ .workspace_path = workspace_a },
+        .name = "sleeper",
+    });
+    defer start_a.deinit();
+    if (!start_a.response.isOk()) return error.ManagedProcessStartAFailed;
+    process_id_a = try managedProcessIdFromResponse(&start_a, allocator);
+
+    var start_b = try client.call(headless.registry.METHOD_PROCESS_START, .{
+        .workspace = .{ .workspace_path = workspace_b },
+        .name = "sleeper",
+    });
+    defer start_b.deinit();
+    if (!start_b.response.isOk()) return error.ManagedProcessStartBFailed;
+    process_id_b = try managedProcessIdFromResponse(&start_b, allocator);
+    if (std.mem.eql(u8, process_id_a.?, process_id_b.?) or
+        !std.mem.startsWith(u8, process_id_a.?, "proc:") or
+        !std.mem.startsWith(u8, process_id_b.?, "proc:") or
+        std.mem.eql(u8, process_id_a.?, "proc:sleeper") or
+        std.mem.eql(u8, process_id_b.?, "proc:sleeper")) return error.ManagedProcessIdsNotWorkspaceScoped;
+
+    var listed_a = try client.call(headless.registry.METHOD_PROCESS_LIST, .{ .workspace = .{ .workspace_path = workspace_a } });
+    defer listed_a.deinit();
+    if (!listed_a.response.isOk()) return error.ManagedProcessListAFailed;
+    try expectManagedList(&listed_a, process_id_a.?);
+
+    var listed_b = try client.call(headless.registry.METHOD_PROCESS_LIST, .{ .workspace = .{ .workspace_path = workspace_b } });
+    defer listed_b.deinit();
+    if (!listed_b.response.isOk()) return error.ManagedProcessListBFailed;
+    try expectManagedList(&listed_b, process_id_b.?);
+
+    var stop_a = try client.call(headless.registry.METHOD_PROCESS_STOP, .{
+        .workspace = .{ .workspace_path = workspace_a },
+        .process_id = process_id_a.?,
+    });
+    defer stop_a.deinit();
+    if (!stop_a.response.isOk()) return error.ManagedProcessStopAFailed;
+    var stop_b = try client.call(headless.registry.METHOD_PROCESS_STOP, .{
+        .workspace = .{ .workspace_path = workspace_b },
+        .process_id = process_id_b.?,
+    });
+    defer stop_b.deinit();
+    if (!stop_b.response.isOk()) return error.ManagedProcessStopBFailed;
+
+    var stopped_a = try client.call(headless.registry.METHOD_PROCESS_LIST, .{ .workspace = .{ .workspace_path = workspace_a } });
+    defer stopped_a.deinit();
+    try expectManagedList(&stopped_a, process_id_a.?);
+    const stopped_result = stopped_a.response.result orelse return error.ManagedProcessStoppedMissingResult;
+    const stopped_process = stopped_result.object.get("processes").?.array.items[0].object;
+    const stopped_status = stopped_process.get("status") orelse return error.ManagedProcessStopStateMissing;
+    if (stopped_status != .string or !std.mem.eql(u8, stopped_status.string, "stopped")) return error.ManagedProcessStopStateMissing;
+
+    var exited = false;
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        if (sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 300)) |response| {
+            allocator.free(response);
+            std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
+        } else |err| switch (err) {
+            error.ConnectionRefused, error.FileNotFound => {
+                exited = true;
+                break;
+            },
+            else => std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {},
+        }
+    }
+    if (!exited) return error.ManagedProcessDaemonDidNotExit;
+    _ = child.wait(io) catch {};
+    child_exited = true;
+}
+
+const SlowStartThreadContext = struct {
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    workspace_path: []const u8,
+    response: ?[]u8 = null,
+};
+
+fn slowStartThread(context: *SlowStartThreadContext) void {
+    context.response = sessionizer.requestAlloc(context.allocator, context.pref_path, headless.registry.METHOD_PROCESS_START, .{
+        .workspace = .{ .workspace_path = context.workspace_path },
+        .name = "sleeper",
+    }, 401) catch null;
+}
+
+/// The config/spawn delay is intentionally larger than the tail deadline. A
+/// second connection must still reach the locked fast path during Phase B.
+fn runSlowConfigDoesNotBlockTailScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "managed-slow-tail");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    const workspace_path = try std.fmt.allocPrint(allocator, "{s}/workspace", .{pref_path});
+    defer allocator.free(workspace_path);
+    try writeManagedProcessConfig(io, workspace_path, "/bin/cat");
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+    var child = try spawnIsolatedDaemonWithSlowIo(allocator, io, self_exe, pref_path, "400");
+    defer {
+        if (comptime builtin.os.tag == .windows) {
+            child.kill(io);
+        } else if (child.id != null) {
+            _ = child.wait(io) catch {};
+        }
+    }
+
+    var transport: sessionizer.HeadlessTransport = .{ .allocator = allocator, .pref_path = pref_path };
+    var client = sessionizer.headlessClient(allocator, &transport);
+    const session_id = "managed-slow-tail-plain";
+    var created = try client.call("session.create", .{
+        .id = session_id,
+        .cwd = workspace_path,
+        .workspace_path = workspace_path,
+        .command = &[_][]const u8{"/bin/cat"},
+    });
+    defer created.deinit();
+    if (!created.response.isOk()) return error.ManagedSlowTailSessionCreateFailed;
+    defer {
+        if (client.call("session.kill", .{ .id = session_id })) |response| {
+            var owned = response;
+            owned.deinit();
+        } else |_| {}
+        if (client.call("session.cleanup", .{})) |response| {
+            var owned = response;
+            owned.deinit();
+        } else |_| {}
+    }
+
+    var context: SlowStartThreadContext = .{
+        .allocator = allocator,
+        .pref_path = pref_path,
+        .workspace_path = workspace_path,
+    };
+    const thread = try std.Thread.spawn(.{}, slowStartThread, .{&context});
+    std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+    const started_at_ms = sessionizer.nowMs();
+    var tail = try client.call("session.tail", .{ .id = session_id, .after_cursor = 0, .max_bytes = 1024 });
+    defer tail.deinit();
+    const elapsed_ms = sessionizer.nowMs() - started_at_ms;
+    thread.join();
+    const start_response = context.response orelse return error.ManagedSlowTailStartMissingResponse;
+    defer allocator.free(start_response);
+    var parsed_start = try std.json.parseFromSlice(std.json.Value, allocator, start_response, .{});
+    defer parsed_start.deinit();
+    if (parsed_start.value.object.get("error")) |error_value| {
+        if (error_value.object.get("code")) |code| {
+            if (code == .string and std.mem.eql(u8, code.string, "internal_error")) return error.ManagedSlowTailStartInternalError;
+        }
+    }
+    if (parsed_start.value.object.get("result")) |result| {
+        if (result == .object) {
+            if (result.object.get("process")) |process| {
+                if (process == .object) {
+                    if (process.object.get("id")) |process_id| {
+                        if (process_id == .string) {
+                            var stopped = try client.call(headless.registry.METHOD_PROCESS_STOP, .{
+                                .workspace = .{ .workspace_path = workspace_path },
+                                .process_id = process_id.string,
+                            });
+                            defer stopped.deinit();
+                            if (!stopped.response.isOk()) return error.ManagedSlowTailStopFailed;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    var killed = try client.call("session.kill", .{ .id = session_id });
+    defer killed.deinit();
+    if (!killed.response.isOk()) return error.ManagedSlowTailSessionKillFailed;
+    var shutdown = try client.call("daemon.prepareShutdown", .{});
+    defer shutdown.deinit();
+    if (!shutdown.response.isOk()) return error.ManagedSlowTailShutdownFailed;
+    if (elapsed_ms >= 300) return error.ManagedSlowTailBlocked;
 }
 
 /// Scenario 1: every registry method dispatched by the phase-2 daemon is

@@ -1,6 +1,7 @@
 //! Pure daemon-side process, outcome, and lease registry.
 
 const std = @import("std");
+const stack = @import("../workspace/stack.zig");
 
 pub const TERMINAL_PROCESS_OUTCOME_MAX: usize = 32;
 pub const TERMINAL_PROCESS_OUTCOME_TTL_MS: i64 = 15 * std.time.ms_per_min;
@@ -403,7 +404,8 @@ pub const RegistryJob = struct {
     }
 };
 
-/// Bounded FIFO used to hand slow registry work to an unlocked worker.
+/// Bounded FIFO for slow registry work driven by the requesting thread after
+/// its locked Phase A; it is an in-flight bound/dedupe table, not a drainer.
 pub const RegistryJobQueue = struct {
     jobs: std.ArrayList(RegistryJob) = .empty,
     capacity: usize = REGISTRY_JOB_QUEUE_MAX,
@@ -441,6 +443,17 @@ pub const RegistryJobQueue = struct {
 
     pub fn isFull(self: *const RegistryJobQueue) bool {
         return self.jobs.items.len >= self.capacity;
+    }
+
+    /// Remove and return the queued job owned by one workspace/process pair.
+    /// The returned job transfers ownership to the caller.
+    pub fn removeMatching(self: *RegistryJobQueue, workspace_id: []const u8, process_id: []const u8) ?RegistryJob {
+        for (self.jobs.items, 0..) |job, index| {
+            if (!std.mem.eql(u8, job.workspace_id, workspace_id)) continue;
+            if (!std.mem.eql(u8, job.process_id, process_id)) continue;
+            return self.jobs.orderedRemove(index);
+        }
+        return null;
     }
 };
 
@@ -1171,6 +1184,48 @@ pub const ProcessRegistry = struct {
         try self.workspaces.append(allocator, workspace_record);
         self.bumpRevision();
         return &self.workspaces.items[self.workspaces.items.len - 1];
+    }
+
+    /// Ensure one daemon-owned managed process record per workspace/name.
+    /// Existing records are refreshed with non-empty command/cwd metadata.
+    pub fn ensureManagedProcess(
+        self: *ProcessRegistry,
+        allocator: std.mem.Allocator,
+        workspace_id: []const u8,
+        name: []const u8,
+        command: []const u8,
+        now_ms: i64,
+    ) !*ManagedProcess {
+        if (name.len == 0) return error.ProcessNameRequired;
+        const workspace_record = try self.ensureWorkspace(allocator, workspace_id);
+        for (workspace_record.managed_processes.items) |*process| {
+            if (!std.mem.eql(u8, process.name, name)) continue;
+            var changed = false;
+            if (command.len != 0 and !std.mem.eql(u8, process.command, command)) {
+                const replacement = try allocator.dupe(u8, command);
+                allocator.free(process.command);
+                process.command = replacement;
+                changed = true;
+            }
+            if (changed) self.bumpRevision();
+            return process;
+        }
+
+        if (workspace_record.managed_processes.items.len >= stack.MAX_PROCESS_DEFINITIONS) {
+            return error.ManagedProcessCapacityExceeded;
+        }
+
+        const process_id = try std.fmt.allocPrint(allocator, "proc:{s}:{s}", .{ workspace_id, name });
+        var process_id_owned = true;
+        errdefer if (process_id_owned) allocator.free(process_id);
+        var process = try ManagedProcess.init(allocator, workspace_id, process_id, name, command, "");
+        errdefer process.deinit(allocator);
+        allocator.free(process_id);
+        process_id_owned = false;
+        _ = now_ms;
+        try workspace_record.managed_processes.append(allocator, process);
+        self.bumpRevision();
+        return &workspace_record.managed_processes.items[workspace_record.managed_processes.items.len - 1];
     }
 
     /// Append one pull-only notification without revoking or changing any
@@ -2448,5 +2503,44 @@ test "registry job queue is an owned bounded FIFO" {
     try std.testing.expectEqual(RegistryJobKind.start_managed_process, queue.peek().?.kind);
     var second = queue.take().?;
     second.deinit(allocator);
+    try queue.push(allocator, try RegistryJob.init(allocator, .restart_managed_process, "workspace-r", "proc:workspace-r:web", "client-r"));
+    var removed = queue.removeMatching("workspace-r", "proc:workspace-r:web").?;
+    defer removed.deinit(allocator);
+    try std.testing.expectEqual(RegistryJobKind.restart_managed_process, removed.kind);
     try std.testing.expect(queue.take() == null);
+}
+
+test "ensureManagedProcess is idempotent per workspace and name" {
+    const allocator = std.testing.allocator;
+    var registry = try ProcessRegistry.init(allocator, "nonce-a");
+    defer registry.deinit(allocator);
+
+    const first = try registry.ensureManagedProcess(allocator, "workspace-a", "sleeper", "/bin/cat", 10);
+    try std.testing.expectEqualStrings("proc:workspace-a:sleeper", first.id);
+    const first_id = try allocator.dupe(u8, first.id);
+    defer allocator.free(first_id);
+    try std.testing.expectEqual(@as(usize, 1), registry.workspace("workspace-a").?.managed_processes.items.len);
+    const second = try registry.ensureManagedProcess(allocator, "workspace-a", "sleeper", "/bin/cat", 20);
+    try std.testing.expectEqualStrings(first.id, second.id);
+    try std.testing.expectEqual(@as(usize, 1), registry.workspace("workspace-a").?.managed_processes.items.len);
+
+    const other_workspace = try registry.ensureManagedProcess(allocator, "workspace-b", "sleeper", "/bin/cat", 30);
+    try std.testing.expectEqualStrings("proc:workspace-b:sleeper", other_workspace.id);
+    try std.testing.expect(!std.mem.eql(u8, first_id, other_workspace.id));
+}
+
+test "managed process records are bounded per workspace" {
+    const allocator = std.testing.allocator;
+    var registry = try ProcessRegistry.init(allocator, "nonce-cap");
+    defer registry.deinit(allocator);
+
+    var name_buffer: [32]u8 = undefined;
+    for (0..stack.MAX_PROCESS_DEFINITIONS) |index| {
+        const name = try std.fmt.bufPrint(&name_buffer, "process-{d}", .{index});
+        _ = try registry.ensureManagedProcess(allocator, "workspace-cap", name, "/bin/true", @intCast(index));
+    }
+    try std.testing.expectError(
+        error.ManagedProcessCapacityExceeded,
+        registry.ensureManagedProcess(allocator, "workspace-cap", "process-overflow", "/bin/true", 1000),
+    );
 }
