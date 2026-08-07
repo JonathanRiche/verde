@@ -72,6 +72,10 @@ pub fn main(init: std.process.Init) !void {
     try runIntegration(allocator, io);
     try runRegistryFixtureScenario(allocator, io);
     try runRegistryCapabilityScenario(allocator, io);
+    try runProcessLifecycleScenario(allocator, io);
+    try runRegistryMethodPresenceScenario(allocator, io);
+    try runLeaseConflictScenario(allocator, io);
+    try runLeaseRenewReleaseScenario(allocator, io);
     try runStoreFixtureScenario(allocator, io);
     try runLifecycleBindGuard(allocator, io);
     try runLifecyclePrepareShutdownWithLivePty(allocator, io);
@@ -318,6 +322,24 @@ fn waitChildBounded(child: *std.process.Child, io: std.Io, timeout_ms: u64) !std
 /// while the phase-2 daemon hooks remain unimplemented.
 const FIXTURE_METHOD_NOT_FOUND: []const u8 = "method_not_found";
 
+// W5 appends process.start/stop/restart and W6 appends daemon.stop here when
+// those methods become dispatched. Keep this canonical presence list growing.
+const DISPATCHED_REGISTRY_METHODS = [_][]const u8{
+    headless.registry.METHOD_WORKSPACE_RESOLVE,
+    headless.registry.METHOD_PROCESS_LIST,
+    headless.registry.METHOD_PROCESS_INSPECT,
+    headless.registry.METHOD_PROCESS_WAIT,
+    headless.registry.METHOD_PROCESS_LOGS,
+    headless.registry.METHOD_LEASE_CHECK,
+    headless.registry.METHOD_LEASE_ACQUIRE,
+    headless.registry.METHOD_LEASE_RENEW,
+    headless.registry.METHOD_LEASE_RELEASE,
+    headless.registry.METHOD_DAEMON_NOTIFICATIONS,
+    headless.registry.METHOD_DAEMON_CLIENT_REGISTER,
+    headless.registry.METHOD_DAEMON_CLIENT_HEARTBEAT,
+    headless.registry.METHOD_DAEMON_CLIENT_CLOSE,
+};
+
 const FixtureSurface = enum {
     registry,
     store,
@@ -449,6 +471,492 @@ fn runRegistryCapabilityScenario(allocator: std.mem.Allocator, io: std.Io) !void
         error.CapabilityUnavailable => capability_rejected = true,
     };
     if (!capability_rejected) return error.RegistryCapabilityUnexpectedlyAvailable;
+}
+
+/// Scenario 3: a live PTY is mirrored into the daemon registry and produces one
+/// bounded outcome when killed, without advertising the phase-1 capability bit.
+fn runProcessLifecycleScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "process-lifecycle");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+    var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    defer child.kill(io);
+
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = allocator,
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(allocator, &transport);
+    // Typed process-list decodes use alloc_always. Keep their copies in a
+    // scenario-local arena so each response is independent of its parse arena.
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var typed_transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var typed_client = sessionizer.headlessClient(decode_arena.allocator(), &typed_transport);
+
+    const session_id = "verde:process-lifecycle:session";
+    var session_created = false;
+    defer if (session_created) {
+        if (client.call("session.kill", .{ .id = session_id })) |parsed_response| {
+            var parsed = parsed_response;
+            parsed.deinit();
+        } else |_| {}
+        if (client.call("session.cleanup", .{})) |parsed_response| {
+            var parsed = parsed_response;
+            parsed.deinit();
+        } else |_| {}
+    };
+
+    {
+        const empty_params: struct {} = .{};
+        var capabilities = try client.call("core.capabilities", empty_params);
+        defer capabilities.deinit();
+        if (!capabilities.response.isOk()) return error.ProcessLifecycleCapabilitiesFailed;
+        const capability_result = capabilities.response.result orelse return error.MissingResult;
+        if (capability_result != .object) return error.MissingResult;
+        const capability_set = capability_result.object.get("capabilities") orelse return error.MissingResult;
+        if (capability_set != .object) return error.MissingResult;
+        const process_capability = capability_set.object.get("processes") orelse return error.MissingResult;
+        if (process_capability == .bool and process_capability.bool) return error.ProcessLifecycleCapabilityUnexpectedlyAdvertised;
+    }
+
+    {
+        var created = try client.call("session.create", .{
+            .id = session_id,
+            .cwd = pref_path,
+            .workspace_path = pref_path,
+            .command = &[_][]const u8{"/bin/cat"},
+            .cols = sessionizer.DEFAULT_COLS,
+            .rows = sessionizer.DEFAULT_ROWS,
+        });
+        defer created.deinit();
+        if (!created.response.isOk()) return error.ProcessLifecycleSessionCreateFailed;
+        session_created = true;
+    }
+
+    var process_id: []const u8 = "";
+    var first_generation: u64 = 0;
+    {
+        var listed = try typed_client.call(headless.registry.METHOD_PROCESS_LIST, .{
+            .workspace = .{ .workspace_path = pref_path },
+        });
+        defer listed.deinit();
+        if (!listed.response.isOk()) return error.ProcessLifecycleListFailed;
+        const result = try typed_client.decodeProcessList(&listed);
+        if (result.processes.len != 1) return error.ProcessLifecycleExpectedOneTrackedProcess;
+        const process = result.processes[0];
+        if (process.kind != .tracked_terminal or !std.mem.startsWith(u8, process.id, "term:")) return error.ProcessLifecycleWrongProcessKind;
+        if (!std.mem.eql(u8, process.command, "/bin/cat") or !std.mem.eql(u8, process.cwd, pref_path)) return error.ProcessLifecycleProcessMetadataMismatch;
+        process_id = process.id;
+        first_generation = std.fmt.parseInt(u64, process.id[std.mem.lastIndexOfScalar(u8, process.id, ':').? + 1 ..], 10) catch return error.ProcessLifecycleBadGeneration;
+    }
+
+    {
+        var waited = try client.call(headless.registry.METHOD_PROCESS_WAIT, .{
+            .workspace = .{ .workspace_path = pref_path },
+            .process_id = process_id,
+            .timeout_ms = 20_000,
+        });
+        defer waited.deinit();
+        if (!waited.response.isOk()) return error.ProcessLifecycleWaitFailed;
+        const result = waited.response.result orelse return error.MissingResult;
+        if (result != .object) return error.MissingResult;
+        const timed_out = result.object.get("timed_out") orelse return error.MissingResult;
+        const terminal_state = result.object.get("terminal_state") orelse return error.MissingResult;
+        if (timed_out != .bool or !timed_out.bool or terminal_state != .null) return error.ProcessLifecycleWaitDidNotTimeOut;
+    }
+
+    {
+        var written = try client.call("session.write", .{
+            .id = session_id,
+            .text = "process-lifecycle-marker\n",
+        });
+        defer written.deinit();
+        if (!written.response.isOk()) return error.ProcessLifecycleSessionWriteFailed;
+    }
+
+    var saw_marker = false;
+    var log_attempt: usize = 0;
+    while (log_attempt < 100) : (log_attempt += 1) {
+        var logs = try client.call(headless.registry.METHOD_PROCESS_LOGS, .{
+            .workspace = .{ .workspace_path = pref_path },
+            .process_id = process_id,
+            .after_cursor = 0,
+            .max_bytes = 4096,
+        });
+        defer logs.deinit();
+        if (!logs.response.isOk()) return error.ProcessLifecycleLogsFailed;
+        const result = logs.response.result orelse return error.MissingResult;
+        if (result != .object) return error.MissingResult;
+        if (result.object.get("text")) |text| {
+            if (text == .string and std.mem.indexOf(u8, text.string, "process-lifecycle-marker") != null) {
+                saw_marker = true;
+                break;
+            }
+        }
+        std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+    }
+    if (!saw_marker) return error.ProcessLifecycleMarkerNotObserved;
+
+    {
+        var killed = try client.call("session.kill", .{ .id = session_id });
+        defer killed.deinit();
+        if (!killed.response.isOk()) return error.ProcessLifecycleSessionKillFailed;
+    }
+
+    var saw_cancelled = false;
+    var wait_attempt: usize = 0;
+    while (wait_attempt < 100) : (wait_attempt += 1) {
+        var waited = try client.call(headless.registry.METHOD_PROCESS_WAIT, .{
+            .workspace = .{ .workspace_path = pref_path },
+            .process_id = process_id,
+        });
+        defer waited.deinit();
+        if (!waited.response.isOk()) return error.ProcessLifecycleWaitAfterKillFailed;
+        const result = waited.response.result orelse return error.MissingResult;
+        if (result != .object) return error.MissingResult;
+        if (result.object.get("terminal_state")) |state| {
+            if (state == .string and std.mem.eql(u8, state.string, "cancelled")) {
+                saw_cancelled = true;
+                break;
+            }
+        }
+        std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+    }
+    if (!saw_cancelled) return error.ProcessLifecycleOutcomeNotObserved;
+
+    {
+        var listed = try typed_client.call(headless.registry.METHOD_PROCESS_LIST, .{
+            .workspace = .{ .workspace_path = pref_path },
+            .include_outcomes = true,
+        });
+        defer listed.deinit();
+        if (!listed.response.isOk()) return error.ProcessLifecycleOutcomeListFailed;
+        const result = try typed_client.decodeProcessList(&listed);
+        var matching_outcomes: usize = 0;
+        for (result.outcomes) |outcome| {
+            if (std.mem.eql(u8, outcome.session_id, session_id)) matching_outcomes += 1;
+        }
+        if (matching_outcomes != 1) return error.ProcessLifecycleOutcomeCountMismatch;
+    }
+
+    // A stopped duplicate create is replaced after its outcome is published,
+    // so the new observation must have a higher daemon-owned generation.
+    {
+        var recreated = try client.call("session.create", .{
+            .id = session_id,
+            .cwd = pref_path,
+            .workspace_path = pref_path,
+            .command = &[_][]const u8{"/bin/cat"},
+            .cols = sessionizer.DEFAULT_COLS,
+            .rows = sessionizer.DEFAULT_ROWS,
+        });
+        defer recreated.deinit();
+        if (!recreated.response.isOk()) return error.ProcessLifecycleReplacementCreateFailed;
+    }
+    {
+        var listed = try typed_client.call(headless.registry.METHOD_PROCESS_LIST, .{
+            .workspace = .{ .workspace_path = pref_path },
+            .include_outcomes = true,
+        });
+        defer listed.deinit();
+        if (!listed.response.isOk()) return error.ProcessLifecycleReplacementListFailed;
+        const result = try typed_client.decodeProcessList(&listed);
+        if (result.processes.len != 1 or result.outcomes.len != 1) return error.ProcessLifecycleReplacementCountsMismatch;
+        const generation = result.processes[0].id[std.mem.lastIndexOfScalar(u8, result.processes[0].id, ':').? + 1 ..];
+        const next_generation = std.fmt.parseInt(u64, generation, 10) catch return error.ProcessLifecycleBadReplacementGeneration;
+        if (next_generation <= first_generation or std.mem.eql(u8, result.processes[0].id, process_id)) return error.ProcessLifecycleGenerationDidNotAdvance;
+    }
+
+    // Remove the replacement before exercising the bounded outcome cap.
+    {
+        var killed = try client.call("session.kill", .{ .id = session_id });
+        defer killed.deinit();
+        if (!killed.response.isOk()) return error.ProcessLifecycleReplacementKillFailed;
+    }
+    var replacement_cleaned = false;
+    var cleanup_attempt: usize = 0;
+    while (cleanup_attempt < 100) : (cleanup_attempt += 1) {
+        var cleaned = try client.call("session.cleanup", .{});
+        defer cleaned.deinit();
+        if (!cleaned.response.isOk()) return error.ProcessLifecycleCleanupFailed;
+        if (cleaned.response.result) |result| {
+            if (result == .object) {
+                if (result.object.get("removed")) |removed| {
+                    if (removed == .integer and removed.integer > 0) {
+                        replacement_cleaned = true;
+                        break;
+                    }
+                }
+            }
+        }
+        std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+    }
+    if (!replacement_cleaned) return error.ProcessLifecycleReplacementNotCleaned;
+    session_created = false;
+
+    for (0..35) |index| {
+        const short_session_id = try std.fmt.allocPrint(allocator, "verde:process-lifecycle:short:{d}", .{index});
+        defer allocator.free(short_session_id);
+        var created = try client.call("session.create", .{
+            .id = short_session_id,
+            .cwd = pref_path,
+            .workspace_path = pref_path,
+            .command = &[_][]const u8{"/bin/true"},
+        });
+        defer created.deinit();
+        if (!created.response.isOk()) return error.ProcessLifecycleShortCreateFailed;
+
+        var killed = try client.call("session.kill", .{ .id = short_session_id });
+        defer killed.deinit();
+        if (!killed.response.isOk()) return error.ProcessLifecycleShortKillFailed;
+
+        var completed = false;
+        var short_attempt: usize = 0;
+        while (short_attempt < 100) : (short_attempt += 1) {
+            var cleaned = try client.call("session.cleanup", .{});
+            defer cleaned.deinit();
+            if (!cleaned.response.isOk()) return error.ProcessLifecycleShortCleanupFailed;
+            var listed = try typed_client.call(headless.registry.METHOD_PROCESS_LIST, .{
+                .workspace = .{ .workspace_path = pref_path },
+                .include_outcomes = true,
+            });
+            defer listed.deinit();
+            if (!listed.response.isOk()) return error.ProcessLifecycleShortListFailed;
+            const result = try typed_client.decodeProcessList(&listed);
+            for (result.outcomes) |outcome| {
+                if (std.mem.eql(u8, outcome.session_id, short_session_id)) {
+                    completed = true;
+                    break;
+                }
+            }
+            if (completed) break;
+            std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+        }
+        if (!completed) return error.ProcessLifecycleShortOutcomeMissing;
+    }
+
+    {
+        var listed = try typed_client.call(headless.registry.METHOD_PROCESS_LIST, .{
+            .workspace = .{ .workspace_path = pref_path },
+            .include_outcomes = true,
+        });
+        defer listed.deinit();
+        if (!listed.response.isOk()) return error.ProcessLifecycleCapListFailed;
+        const result = try typed_client.decodeProcessList(&listed);
+        if (result.outcomes.len > 32) return error.ProcessLifecycleOutcomeCapExceeded;
+        if (result.processes.len != 0) return error.ProcessLifecycleLiveSessionsRemain;
+    }
+}
+
+/// Scenario 1: every registry method dispatched by the phase-2 daemon is
+/// present on the wire, while the client-facing capability bits stay phase 1.
+fn runRegistryMethodPresenceScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "registry-method-presence");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+    var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    defer child.kill(io);
+
+    var transport: sessionizer.HeadlessTransport = .{ .allocator = allocator, .pref_path = pref_path };
+    var client = sessionizer.headlessClient(allocator, &transport);
+    const empty_params: struct {} = .{};
+    for (DISPATCHED_REGISTRY_METHODS) |method| {
+        var parsed = try client.call(method, empty_params);
+        defer parsed.deinit();
+        if (parsed.response.err) |err| {
+            if (std.mem.eql(u8, err.code, FIXTURE_METHOD_NOT_FOUND)) return error.RegistryMethodPresenceMissing;
+        }
+    }
+
+    var status_response = try client.call("core.status", empty_params);
+    defer status_response.deinit();
+    if (!status_response.response.isOk()) return error.RegistryMethodPresenceStatusFailed;
+    const status = try client.decodeStatus(&status_response);
+    if (status.capabilities.processes or status.capabilities.leases) return error.RegistryMethodPresenceCapabilityChanged;
+}
+
+/// Scenario 4: forced lease acquisition preserves the incumbent lease and
+/// delivers one pull-only notification to each affected owner.
+fn runLeaseConflictScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "lease-conflict");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+    var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    defer child.kill(io);
+
+    var transport: sessionizer.HeadlessTransport = .{ .allocator = allocator, .pref_path = pref_path };
+    var client = sessionizer.headlessClient(allocator, &transport);
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var typed_transport: sessionizer.HeadlessTransport = .{ .allocator = decode_arena.allocator(), .pref_path = pref_path };
+    var typed_client = sessionizer.headlessClient(decode_arena.allocator(), &typed_transport);
+    const resources = [_][]const u8{"build"};
+
+    var first = try typed_client.call(headless.registry.METHOD_LEASE_ACQUIRE, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner = "owner-a",
+        .command = "build",
+        .resources = &resources,
+    });
+    defer first.deinit();
+    const first_result = try typed_client.decodeLeaseAcquire(&first);
+    if (!first_result.acquired) return error.LeaseConflictInitialAcquireFailed;
+
+    var conflict = try client.call(headless.registry.METHOD_LEASE_ACQUIRE, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner = "owner-b",
+        .command = "build",
+        .resources = &resources,
+    });
+    defer conflict.deinit();
+    if (conflict.response.isOk()) return error.LeaseConflictWasNotRejected;
+    const conflict_error = conflict.response.err orelse return error.LeaseConflictMissingError;
+    if (!std.mem.eql(u8, conflict_error.code, headless.protocol.ERR_CONFLICT)) return error.LeaseConflictWrongError;
+    _ = typed_client.decodeLeaseAcquire(&conflict) catch |err| switch (err) {
+        error.RemoteError => {},
+        else => return err,
+    };
+    const conflict_data = conflict_error.data orelse return error.LeaseConflictMissingData;
+    if (conflict_data != .object or conflict_data.object.get("conflicts") == null) return error.LeaseConflictMalformedData;
+
+    var forced = try typed_client.call(headless.registry.METHOD_LEASE_ACQUIRE, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner = "owner-b",
+        .command = "build",
+        .resources = &resources,
+        .force = true,
+    });
+    defer forced.deinit();
+    const forced_result = try typed_client.decodeLeaseAcquire(&forced);
+    if (!forced_result.acquired or !forced_result.forced) return error.LeaseConflictForcedAcquireFailed;
+
+    var listed = try typed_client.call(headless.registry.METHOD_PROCESS_LIST, .{
+        .workspace = .{ .workspace_path = pref_path },
+    });
+    defer listed.deinit();
+    const list_result = try typed_client.decodeProcessList(&listed);
+    if (list_result.leases.len != 2) return error.LeaseConflictIncumbentLeaseMissing;
+
+    var notifications = try typed_client.call(headless.registry.METHOD_DAEMON_NOTIFICATIONS, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner_session_id = "owner-a",
+    });
+    defer notifications.deinit();
+    const notification_result = try typed_client.decodeNotifications(&notifications);
+    if (notification_result.notifications.len != 1) return error.LeaseConflictNotificationCountMismatch;
+    if (!std.mem.eql(u8, notification_result.notifications[0].title, "Conflicting command started")) return error.LeaseConflictNotificationTitleMismatch;
+
+    var second_pull = try typed_client.call(headless.registry.METHOD_DAEMON_NOTIFICATIONS, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner_session_id = "owner-a",
+        .after_seq = notification_result.notifications[0].seq,
+    });
+    defer second_pull.deinit();
+    const second_result = try typed_client.decodeNotifications(&second_pull);
+    if (second_result.notifications.len != 0) return error.LeaseConflictNotificationWasConsumed;
+}
+
+/// Scenario 5: same-owner renewal, explicit renew-by-id, and owner-only
+/// release preserve lease identity and idempotence.
+fn runLeaseRenewReleaseScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "lease-renew-release");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+    var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    defer child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var typed_transport: sessionizer.HeadlessTransport = .{ .allocator = decode_arena.allocator(), .pref_path = pref_path };
+    var typed_client = sessionizer.headlessClient(decode_arena.allocator(), &typed_transport);
+    const resources = [_][]const u8{"build"};
+
+    var first = try typed_client.call(headless.registry.METHOD_LEASE_ACQUIRE, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner = "owner-a",
+        .command = "build",
+        .resources = &resources,
+        .ttl_ms = 5_000,
+    });
+    defer first.deinit();
+    const first_result = try typed_client.decodeLeaseAcquire(&first);
+    const lease_id = first_result.lease_id orelse return error.LeaseRenewMissingId;
+    const first_expiry = first_result.expires_at_ms orelse return error.LeaseRenewMissingExpiry;
+
+    var reacquired = try typed_client.call(headless.registry.METHOD_LEASE_ACQUIRE, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner = "owner-a",
+        .command = "build",
+        .resources = &resources,
+        .ttl_ms = 20_000,
+    });
+    defer reacquired.deinit();
+    const reacquired_result = try typed_client.decodeLeaseAcquire(&reacquired);
+    if (!reacquired_result.renewed or !std.mem.eql(u8, reacquired_result.lease_id orelse return error.LeaseRenewReacquireMissingId, lease_id)) return error.LeaseRenewReacquireFailed;
+
+    var renewed = try typed_client.call(headless.registry.METHOD_LEASE_RENEW, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner = "owner-a",
+        .lease_id = lease_id,
+        .ttl_ms = 30_000,
+    });
+    defer renewed.deinit();
+    const renewed_result = try typed_client.decodeLeaseRenew(&renewed);
+    if (!renewed_result.renewed or !std.mem.eql(u8, renewed_result.lease_id, lease_id)) return error.LeaseRenewByIdFailed;
+    if ((renewed_result.expires_at_ms orelse 0) <= first_expiry) return error.LeaseRenewExpiryDidNotExtend;
+
+    var wrong_release = try typed_client.call(headless.registry.METHOD_LEASE_RELEASE, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner = "owner-b",
+        .lease_id = lease_id,
+    });
+    defer wrong_release.deinit();
+    const wrong_release_result = try typed_client.decodeLeaseRelease(&wrong_release);
+    if (wrong_release_result.released or wrong_release_result.released_count != 0) return error.LeaseWrongOwnerReleased;
+
+    var listed = try typed_client.call(headless.registry.METHOD_PROCESS_LIST, .{
+        .workspace = .{ .workspace_path = pref_path },
+    });
+    defer listed.deinit();
+    if ((try typed_client.decodeProcessList(&listed)).leases.len != 1) return error.LeaseWrongOwnerLeaseMissing;
+
+    var released = try typed_client.call(headless.registry.METHOD_LEASE_RELEASE, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner = "owner-a",
+        .lease_id = lease_id,
+    });
+    defer released.deinit();
+    const released_result = try typed_client.decodeLeaseRelease(&released);
+    if (!released_result.released or released_result.released_count != 1) return error.LeaseReleaseFailed;
 }
 
 /// Phase-1 store fixture: exercise a typed workspace-upsert request against

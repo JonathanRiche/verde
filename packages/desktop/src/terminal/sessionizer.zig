@@ -1212,6 +1212,10 @@ const PtySession = struct {
     running: bool = true,
     stream_eof: bool = false,
     exit_status: ?u32 = null,
+    /// Daemon-owned workspace identity used by the unread registry dual-write.
+    registry_workspace_id: ?[]u8 = null,
+    /// Prevent duplicate terminal outcomes when kill, polling, and cleanup overlap.
+    registry_finished: bool = false,
     created_at_ms: i64,
     last_attached_at_ms: ?i64 = null,
     attach_clients: std.ArrayList(AttachClient) = .empty,
@@ -1271,6 +1275,7 @@ const PtySession = struct {
         allocator.free(self.cwd);
         allocator.free(self.label);
         allocator.free(self.command_label);
+        if (self.registry_workspace_id) |workspace_id| allocator.free(workspace_id);
         for (self.attach_clients.items) |client| {
             allocator.free(client.attach_id);
             allocator.free(client.label);
@@ -1605,6 +1610,7 @@ pub const Daemon = struct {
         const now = nowMs();
         for (self.sessions.items) |session| {
             session.poll(self.allocator) catch {};
+            if (!session.running) self.noteSessionExitInRegistry(session, null, now);
             session.cleanupStaleAttaches(self.allocator, now);
         }
     }
@@ -1685,6 +1691,94 @@ pub const Daemon = struct {
         return null;
     }
 
+    /// Dual-write (unread): publish a newly created session into the registry.
+    /// Registry failures are diagnostic only and never fail session.create.
+    fn observeSessionInRegistry(self: *Daemon, session: *PtySession, command_line: []const u8, now_ms: i64) void {
+        if (session.project_id.len == 0 and session.project_path.len == 0) return;
+
+        var derived_workspace_id: ?[]u8 = null;
+        defer if (derived_workspace_id) |workspace_id| self.allocator.free(workspace_id);
+        const workspace_id = if (session.project_id.len > 0)
+            session.project_id
+        else blk: {
+            derived_workspace_id = workspace_identity.deriveProjectId(self.allocator, session.project_path) catch |err| {
+                log.warn("registry workspace derivation failed id_len={d} err={s}", .{ session.session_id.len, @errorName(err) });
+                return;
+            };
+            break :blk derived_workspace_id.?;
+        };
+
+        // Register the path before observeTerminalProcess: observe returns a
+        // borrowed pointer that any later registry mutation invalidates.
+        if (session.project_path.len > 0) {
+            _ = self.registry.registerWorkspacePath(
+                self.allocator,
+                workspace_id,
+                session.project_path,
+                now_ms,
+            ) catch |err| {
+                log.warn("registry workspace path failed id_len={d} err={s}", .{ session.session_id.len, @errorName(err) });
+                return;
+            };
+        }
+
+        session.registry_workspace_id = self.allocator.dupe(u8, workspace_id) catch |err| {
+            log.warn("registry workspace dupe failed id_len={d} err={s}", .{ session.session_id.len, @errorName(err) });
+            return;
+        };
+        const process_group: ?u32 = if (session.foregroundProcessGroup()) |group| @intCast(group) else null;
+        const pid: u32 = @intCast(session.child_pid);
+        const observation: process_registry.TerminalProcessObservation = .{
+            .process_identity = process_registry.processIdentity(process_group, pid),
+            .session_id = session.session_id,
+            .command = command_line,
+            .cwd = session.project_path,
+            .pid = pid,
+            .process_group = process_group,
+            .started_at_ms = now_ms,
+            .observed_at_ms = now_ms,
+            // Daemon-socket sessions have no desktop dock or pane.
+            .dock_id = 0,
+            .pane_id = null,
+            .owner_kind = "terminal",
+            .owner_title = session.session_id,
+            .provider = null,
+        };
+        _ = self.registry.observeTerminalProcess(self.allocator, workspace_id, observation, .{}) catch |err| {
+            log.warn("registry session observation failed id_len={d} err={s}", .{ session.session_id.len, @errorName(err) });
+            return;
+        };
+    }
+
+    /// Record a session exit in the registry exactly once.
+    fn noteSessionExitInRegistry(self: *Daemon, session: *PtySession, cancellation_reason: ?[]const u8, now_ms: i64) void {
+        if (session.registry_finished or session.registry_workspace_id == null) return;
+
+        const finish: process_registry.TerminalProcessFinish = if (cancellation_reason != null)
+            .{ .cancellation_reason = cancellation_reason }
+        else if (session.exit_status) |raw_status|
+            // exit_status is a raw wait status on fork backends, not a decoded
+            // exit code. P2 only preserves zero/non-zero classification; signal
+            // decoding differs by backend and remains deferred.
+            .{ .exit_code = if (raw_status == 0) 0 else raw_status }
+        else
+            .{};
+        const finished = self.registry.finishTerminalProcess(
+            self.allocator,
+            session.registry_workspace_id.?,
+            session.session_id,
+            finish,
+            now_ms,
+        ) catch |err| {
+            log.warn("registry session finish failed id_len={d} err={s}", .{ session.session_id.len, @errorName(err) });
+            return;
+        };
+        _ = finished;
+        // finishTerminalProcess is idempotent-by-removal; mark the local guard
+        // for both an actual finish and a harmless already-finished no-op.
+        session.registry_finished = true;
+    }
+
     fn removeAt(self: *Daemon, index: usize) void {
         const session = self.sessions.orderedRemove(index);
         session.deinit(self.allocator);
@@ -1741,6 +1835,13 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, headless.registry.METHOD_WORKSPACE_RESOLVE)) return try self.workspaceResolveResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_LIST)) return try self.processListResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_INSPECT)) return try self.processInspectResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_WAIT)) return try self.processWaitResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_LOGS)) return try self.processLogsResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.registry.METHOD_LEASE_CHECK)) return try self.leaseCheckResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.registry.METHOD_LEASE_ACQUIRE)) return try self.leaseAcquireResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.registry.METHOD_LEASE_RENEW)) return try self.leaseRenewResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.registry.METHOD_LEASE_RELEASE)) return try self.leaseReleaseResponse(id_value, params);
+        if (std.mem.eql(u8, method, headless.registry.METHOD_DAEMON_NOTIFICATIONS)) return try self.notificationsResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_DAEMON_CLIENT_REGISTER)) return try self.clientRegisterResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_DAEMON_CLIENT_HEARTBEAT)) return try self.clientHeartbeatResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_DAEMON_CLIENT_CLOSE)) return try self.clientCloseResponse(id_value, params);
@@ -1829,6 +1930,9 @@ pub const Daemon = struct {
 
     fn processListResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
         const workspace = self.resolveWorkspaceFromParams(params) catch |err| return self.registryErrorResponse(id_value, err);
+        // Pruning only mutates this workspace's outcome list, so the borrowed
+        // workspace record remains valid while the snapshot is serialized.
+        _ = self.registry.pruneTerminalProcessOutcomes(self.allocator, workspace.id, nowMs());
         const include_notifications = if (params == .object) jsonBool(params.object.get("include_notifications") orelse .null) orelse false else false;
         const include_outcomes = if (params == .object) jsonBool(params.object.get("include_outcomes") orelse .null) orelse false else false;
         var notifications: std.ArrayList(*const process_registry.Notification) = .empty;
@@ -1923,6 +2027,415 @@ pub const Daemon = struct {
         return response;
     }
 
+    fn processWaitResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        const workspace = self.resolveWorkspaceFromParams(params) catch |err| return self.registryErrorResponse(id_value, err);
+        const process_id = requiredObjectString(params, "process_id") catch |err| return self.registryErrorResponse(id_value, err);
+        const after_registry_revision = if (params == .object)
+            jsonU64(params.object.get("after_registry_revision") orelse .null)
+        else
+            null;
+        // A7 is deliberately bounded-immediate in P2. Clients poll; this
+        // accepted field is ignored and never sleeps under the daemon lock.
+        _ = if (params == .object) params.object.get("timeout_ms") else null;
+
+        _ = self.registry.pruneTerminalProcessOutcomes(self.allocator, workspace.id, nowMs());
+        var running = false;
+        var outcome: ?*const process_registry.TerminalProcessOutcome = null;
+        for (workspace.tracked_terminal_processes.items) |process| {
+            if (!std.mem.eql(u8, process.process_id, process_id)) continue;
+            running = true;
+            break;
+        }
+        if (!running) {
+            for (workspace.terminal_process_outcomes.items) |*candidate| {
+                if (!std.mem.eql(u8, candidate.process_id, process_id)) continue;
+                outcome = candidate;
+                break;
+            }
+        }
+        if (!running and outcome == null) {
+            return try errorResponseAlloc(self.allocator, id_value, headless.registry.ERR_RESOURCE_NOT_FOUND, "process not found");
+        }
+
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer writer.deinit();
+        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try s.beginObject();
+        try writeRegistryEnvelope(&s, self);
+        try s.objectField("workspace");
+        try writeWorkspaceInfo(&s, self, workspace);
+        try s.objectField("process_id");
+        try s.write(process_id);
+        try s.objectField("terminal_state");
+        if (outcome) |finished| try s.write(@tagName(finished.status)) else try s.write(null);
+        try s.objectField("outcome");
+        if (outcome) |finished| try writeTerminalOutcome(&s, finished) else try s.write(null);
+        try s.objectField("changed");
+        try s.write(if (running)
+            (after_registry_revision != null and self.registry.registry_revision != after_registry_revision.?)
+        else
+            true);
+        try s.objectField("timed_out");
+        try s.write(running);
+        try s.endObject();
+        try s.endObject();
+        return try writer.toOwnedSlice();
+    }
+
+    fn processLogsResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        const workspace = self.resolveWorkspaceFromParams(params) catch |err| return self.registryErrorResponse(id_value, err);
+        const process_id = requiredObjectString(params, "process_id") catch |err| return self.registryErrorResponse(id_value, err);
+
+        // Managed proc:{...} IDs join this lookup when W5 adds daemon-owned
+        // managed sessions. W3 only resolves tracked terminal process IDs.
+        var session_id: ?[]const u8 = null;
+        for (workspace.tracked_terminal_processes.items) |process| {
+            if (std.mem.eql(u8, process.process_id, process_id)) {
+                session_id = process.session_id;
+                break;
+            }
+        }
+        const session = if (session_id) |id| self.find(id) else null;
+        if (session == null) {
+            return try errorResponseAlloc(self.allocator, id_value, headless.registry.ERR_RESOURCE_NOT_FOUND, "process logs unavailable");
+        }
+
+        const after_cursor = if (params == .object)
+            jsonU64(params.object.get("after_cursor") orelse .null)
+        else
+            null;
+        const requested_max_bytes = if (params == .object)
+            jsonU32(params.object.get("max_bytes") orelse .null) orelse 0
+        else
+            0;
+        const max_bytes: ?usize = if (requested_max_bytes == 0)
+            null
+        else
+            @min(@as(usize, @intCast(requested_max_bytes)), MAX_OUTPUT_RING);
+        try session.?.poll(self.allocator);
+        const text_range = outputWindowRange(session.?, after_cursor, 0, max_bytes);
+        const text = try self.allocator.dupe(u8, session.?.output_ring.items[text_range.start..text_range.end]);
+        defer self.allocator.free(text);
+
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer writer.deinit();
+        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try s.beginObject();
+        try writeRegistryEnvelope(&s, self);
+        try s.objectField("workspace");
+        try writeWorkspaceInfo(&s, self, workspace);
+        try s.objectField("process_id");
+        try s.write(process_id);
+        try s.objectField("cursor");
+        try s.write(session.?.output_total);
+        try s.objectField("complete");
+        // poll drained the backend before this check; EOF means no unread
+        // stream bytes remain, while the ring still retains the returned text.
+        try s.write(!session.?.running and session.?.stream_eof);
+        try s.objectField("text");
+        try s.write(text);
+        try s.endObject();
+        try s.endObject();
+        return try writer.toOwnedSlice();
+    }
+
+    fn leaseCheckResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.registry.LeaseCheckRequest, self.allocator, params) catch
+            return self.registryErrorResponse(id_value, error.InvalidParams);
+        defer parsed.deinit();
+        const request = parsed.value;
+        const workspace = self.resolveWorkspaceFromParams(params) catch |err| return self.registryErrorResponse(id_value, err);
+        if (request.owner.len == 0) return self.registryErrorResponse(id_value, error.LeaseOwnerRequired);
+
+        var inferred_resources: [1][]const u8 = undefined;
+        const selected_resources: []const []const u8 = if (request.explicit_resources.len != 0)
+            request.explicit_resources
+        else if (request.resources.len != 0)
+            request.resources
+        else if (process_registry.inferredWorkspaceResource(request.command)) |resource| blk: {
+            inferred_resources[0] = resource;
+            break :blk inferred_resources[0..];
+        } else &.{};
+
+        var conflicts: std.ArrayList(process_registry.LeaseConflictInfo) = .empty;
+        defer conflicts.deinit(self.allocator);
+        if (selected_resources.len != 0) {
+            self.registry.checkLeaseConflicts(
+                self.allocator,
+                workspace.id,
+                request.owner,
+                selected_resources,
+                nowMs(),
+                &conflicts,
+            ) catch |err| return self.registryErrorResponse(id_value, err);
+        }
+
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer writer.deinit();
+        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try s.beginObject();
+        try writeRegistryEnvelope(&s, self);
+        try s.objectField("workspace");
+        try writeWorkspaceInfo(&s, self, workspace);
+        try s.objectField("command");
+        try s.write(request.command);
+        try s.objectField("classification");
+        try s.write(@tagName(process_registry.classifyWorkspaceCommand(request.command)));
+        try s.objectField("resources");
+        try writeStringList(&s, request.resources);
+        try s.objectField("explicit_resources");
+        try writeStringList(&s, request.explicit_resources);
+        try s.objectField("inferred_resources");
+        if (request.explicit_resources.len == 0 and request.resources.len == 0)
+            try writeStringList(&s, selected_resources)
+        else
+            try s.beginArray();
+        if (request.explicit_resources.len != 0 or request.resources.len != 0) try s.endArray();
+        try s.objectField("conflicts");
+        try writeLeaseConflictList(&s, workspace, conflicts.items);
+        try s.objectField("allowed");
+        try s.write(conflicts.items.len == 0);
+        try s.objectField("conflict_count");
+        try s.write(@as(u32, @intCast(conflicts.items.len)));
+        try s.objectField("warning");
+        try s.write(null);
+        try s.objectField("options");
+        try writeLeaseOptions(&s);
+        try s.endObject();
+        try s.endObject();
+        return try writer.toOwnedSlice();
+    }
+
+    fn leaseAcquireResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.registry.LeaseAcquireRequest, self.allocator, params) catch
+            return self.registryErrorResponse(id_value, error.InvalidParams);
+        defer parsed.deinit();
+        const request = parsed.value;
+        const workspace = self.resolveLeaseAcquireWorkspace(params) catch |err| return self.registryErrorResponse(id_value, err);
+        if (request.owner.len == 0) return self.registryErrorResponse(id_value, error.LeaseOwnerRequired);
+        if (request.resources.len == 0) return self.registryErrorResponse(id_value, error.LeaseResourcesRequired);
+
+        var conflicts: std.ArrayList(process_registry.LeaseConflictInfo) = .empty;
+        defer conflicts.deinit(self.allocator);
+        self.registry.checkLeaseConflicts(
+            self.allocator,
+            workspace.id,
+            request.owner,
+            request.resources,
+            nowMs(),
+            &conflicts,
+        ) catch |err| return self.registryErrorResponse(id_value, err);
+        if (!request.force and conflicts.items.len != 0) {
+            return try leaseConflictErrorResponse(self, id_value, workspace, conflicts.items);
+        }
+
+        const renewed_in_place = leaseResourcesMatch(workspace.leases.items, request.owner, request.resources);
+        const client_id = self.effectiveLeaseClientId(request.client_id, request.owner, nowMs()) catch |err| return self.registryErrorResponse(id_value, err);
+        var acquired = self.registry.acquireLease(
+            self.allocator,
+            workspace.id,
+            request.owner,
+            client_id,
+            request.command,
+            request.resources,
+            request.force,
+            process_registry.clampLeaseTtl(request.ttl_ms),
+            nowMs(),
+        ) catch |err| return self.registryErrorResponse(id_value, err);
+        defer acquired.deinit(self.allocator);
+
+        const lease = acquired.lease;
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer writer.deinit();
+        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try s.beginObject();
+        try writeRegistryEnvelope(&s, self);
+        try s.objectField("workspace");
+        try writeWorkspaceInfo(&s, self, workspace);
+        try s.objectField("acquired");
+        try s.write(true);
+        try s.objectField("forced");
+        try s.write(request.force);
+        try s.objectField("renewed");
+        try s.write(renewed_in_place);
+        try s.objectField("lease_id");
+        try s.write(lease.id);
+        try s.objectField("owner");
+        try s.write(lease.owner);
+        try s.objectField("client_id");
+        try s.write(lease.client_id);
+        try s.objectField("command");
+        try s.write(lease.command);
+        try s.objectField("resources");
+        try writeStringList(&s, lease.resources.items);
+        try s.objectField("created_at_ms");
+        try s.write(lease.created_at_ms);
+        try s.objectField("expires_at_ms");
+        try s.write(lease.expires_at_ms);
+        try s.objectField("last_renewal_ms");
+        try s.write(lease.last_renewal_ms);
+        try s.objectField("lease");
+        try writeLeaseRecord(&s, lease);
+        try s.objectField("conflicts");
+        try s.beginArray();
+        try s.endArray();
+        try s.endObject();
+        try s.endObject();
+        return try writer.toOwnedSlice();
+    }
+
+    fn leaseRenewResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.registry.LeaseRenewRequest, self.allocator, params) catch
+            return self.registryErrorResponse(id_value, error.InvalidParams);
+        defer parsed.deinit();
+        const request = parsed.value;
+        const workspace = self.resolveWorkspaceFromParams(params) catch |err| return self.registryErrorResponse(id_value, err);
+        if (request.owner.len == 0 or request.lease_id.len == 0) return self.registryErrorResponse(id_value, error.InvalidParams);
+        const client_id = self.effectiveLeaseClientId(request.client_id, request.owner, nowMs()) catch |err| return self.registryErrorResponse(id_value, err);
+        const lease = self.registry.renewLeaseById(
+            self.allocator,
+            workspace.id,
+            request.owner,
+            request.lease_id,
+            process_registry.clampLeaseTtl(request.ttl_ms),
+            nowMs(),
+        ) catch |err| switch (err) {
+            error.LeaseNotFound => return self.registryErrorResponse(id_value, err),
+            error.LeaseOwnerMismatch => {
+                var conflicts: std.ArrayList(process_registry.LeaseConflictInfo) = .empty;
+                defer conflicts.deinit(self.allocator);
+                for (workspace.leases.items) |existing| {
+                    if (!std.mem.eql(u8, existing.id, request.lease_id)) continue;
+                    try conflicts.append(self.allocator, .{
+                        .owner = existing.owner,
+                        .client_id = existing.client_id,
+                        .lease_id = existing.id,
+                        .command = existing.command,
+                        .resources = existing.resources.items,
+                    });
+                    break;
+                }
+                return try leaseConflictErrorResponse(self, id_value, workspace, conflicts.items);
+            },
+        };
+
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer writer.deinit();
+        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try s.beginObject();
+        try writeRegistryEnvelope(&s, self);
+        try s.objectField("workspace");
+        try writeWorkspaceInfo(&s, self, workspace);
+        try s.objectField("renewed");
+        try s.write(true);
+        try s.objectField("lease_id");
+        try s.write(lease.id);
+        try s.objectField("owner");
+        try s.write(lease.owner);
+        try s.objectField("client_id");
+        try s.write(client_id);
+        try s.objectField("created_at_ms");
+        try s.write(lease.created_at_ms);
+        try s.objectField("expires_at_ms");
+        try s.write(lease.expires_at_ms);
+        try s.objectField("last_renewal_ms");
+        try s.write(lease.last_renewal_ms);
+        try s.objectField("lease");
+        try writeLeaseRecord(&s, lease);
+        try s.endObject();
+        try s.endObject();
+        return try writer.toOwnedSlice();
+    }
+
+    fn leaseReleaseResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.registry.LeaseReleaseRequest, self.allocator, params) catch
+            return self.registryErrorResponse(id_value, error.InvalidParams);
+        defer parsed.deinit();
+        const request = parsed.value;
+        const workspace = self.resolveWorkspaceFromParams(params) catch |err| return self.registryErrorResponse(id_value, err);
+        if (request.owner.len == 0) return self.registryErrorResponse(id_value, error.LeaseOwnerRequired);
+        _ = self.effectiveLeaseClientId(request.client_id, request.owner, nowMs()) catch |err| return self.registryErrorResponse(id_value, err);
+        const released_count = self.registry.releaseLease(self.allocator, workspace.id, request.owner, request.lease_id, nowMs());
+
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer writer.deinit();
+        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try s.beginObject();
+        try writeRegistryEnvelope(&s, self);
+        try s.objectField("workspace");
+        try writeWorkspaceInfo(&s, self, workspace);
+        try s.objectField("released");
+        try s.write(released_count != 0);
+        try s.objectField("released_count");
+        try s.write(@as(u32, @intCast(released_count)));
+        try s.objectField("lease_id");
+        if (request.lease_id) |lease_id| try s.write(lease_id) else try s.write(null);
+        try s.endObject();
+        try s.endObject();
+        return try writer.toOwnedSlice();
+    }
+
+    fn notificationsResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        var parsed = parseDaemonParams(headless.registry.NotificationsRequest, self.allocator, params) catch
+            return self.registryErrorResponse(id_value, error.InvalidParams);
+        defer parsed.deinit();
+        const request = parsed.value;
+        const workspace = self.resolveWorkspaceFromParams(params) catch |err| return self.registryErrorResponse(id_value, err);
+        var notifications: std.ArrayList(*const process_registry.Notification) = .empty;
+        defer notifications.deinit(self.allocator);
+        const next_seq = self.registry.collectNotifications(
+            self.allocator,
+            workspace.id,
+            request.owner_session_id,
+            request.after_seq,
+            @intCast(request.limit),
+            &notifications,
+        ) catch |err| return self.registryErrorResponse(id_value, err);
+
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer writer.deinit();
+        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try s.beginObject();
+        try writeRegistryEnvelope(&s, self);
+        try s.objectField("workspace");
+        try writeWorkspaceInfo(&s, self, workspace);
+        try s.objectField("notifications");
+        try s.beginArray();
+        for (notifications.items) |notification| try writeRegistryNotification(&s, notification);
+        try s.endArray();
+        try s.objectField("next_notification_seq");
+        try s.write(next_seq);
+        try s.endObject();
+        try s.endObject();
+        return try writer.toOwnedSlice();
+    }
+
+    /// Returns the registered client for a lease request, or creates the
+    /// short-lived compatibility client used by legacy owner callers.
+    fn effectiveLeaseClientId(self: *Daemon, params_client_id: ?[]const u8, owner: []const u8, now_ms: i64) ![]const u8 {
+        if (params_client_id) |client_id| {
+            if (self.registry.client(client_id)) |client| {
+                if (client.closed) return error.ClientClosed;
+                return client.client_id;
+            }
+        }
+        return (try self.registry.ensureCompatibilityClient(self.allocator, owner, now_ms)).client_id;
+    }
+
     fn clientRegisterResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
         const persistent = if (params == .object) jsonBool(params.object.get("persistent") orelse .null) orelse false else false;
         if (params != .object and params != .null) return try errorResponseAlloc(self.allocator, id_value, headless.registry.ERR_INVALID_PARAMS, "params must be an object or null");
@@ -1973,6 +2486,14 @@ pub const Daemon = struct {
         return workspace;
     }
 
+    fn resolveLeaseAcquireWorkspace(self: *Daemon, params: std.json.Value) !*process_registry.WorkspaceRecord {
+        const fields = try workspaceRefFields(params);
+        if (fields.workspace_id) |workspace_id| {
+            if (fields.workspace_path == null) return try self.registry.ensureWorkspace(self.allocator, workspace_id);
+        }
+        return self.resolveWorkspaceFromParams(params);
+    }
+
     fn registryErrorResponse(self: *Daemon, id_value: std.json.Value, err: anyerror) ![]u8 {
         const mapped = switch (err) {
             error.InvalidParams,
@@ -1982,8 +2503,12 @@ pub const Daemon = struct {
             error.WorkspacePathMapsToDifferentId,
             error.WorkspaceIdRequired,
             error.ClientOwnerRequired,
+            error.LeaseOwnerRequired,
+            error.LeaseResourcesRequired,
             => .{ headless.registry.ERR_INVALID_PARAMS, "invalid workspace or client parameters" },
             error.WorkspaceNotFound => .{ headless.registry.ERR_RESOURCE_NOT_FOUND, "workspace not found" },
+            error.LeaseNotFound => .{ headless.registry.ERR_RESOURCE_NOT_FOUND, "lease not found" },
+            error.ClientClosed => .{ headless.registry.ERR_INVALID_STATE, "client is closed" },
             error.WorkspaceCapacityExceeded => .{ headless.registry.ERR_INVALID_STATE, "workspace registry capacity exceeded" },
             error.SessionNotFound => .{ headless.registry.ERR_RESOURCE_NOT_FOUND, "resource not found" },
             else => .{ headless.registry.ERR_INTERNAL, @errorName(err) },
@@ -2060,6 +2585,7 @@ pub const Daemon = struct {
             if (!existing.running) {
                 for (self.sessions.items, 0..) |candidate, index| {
                     if (candidate != existing) continue;
+                    self.noteSessionExitInRegistry(existing, null, nowMs());
                     self.removeAt(index);
                     break;
                 }
@@ -2087,6 +2613,12 @@ pub const Daemon = struct {
         });
         errdefer session.deinit(self.allocator);
         try self.sessions.append(self.allocator, session);
+        const command_line = std.mem.join(self.allocator, " ", command) catch |err| {
+            log.warn("registry command join failed id_len={d} err={s}", .{ session.session_id.len, @errorName(err) });
+            return try okSessionResponse(self.allocator, id_value, session, true);
+        };
+        defer self.allocator.free(command_line);
+        self.observeSessionInRegistry(session, command_line, nowMs());
         return try okSessionResponse(self.allocator, id_value, session, true);
     }
 
@@ -2220,10 +2752,7 @@ pub const Daemon = struct {
         const lines = jsonU32(params.object.get("lines") orelse .null) orelse if (screen) DEFAULT_ROWS else 80;
         const start_offset = jsonUsize(params.object.get("offset") orelse .null);
         const max_bytes = jsonUsize(params.object.get("max_bytes") orelse .null);
-        const text_range = if (start_offset) |offset|
-            bytesRangeFromOffset(session.output_ring.items, session.ringIndexForOffset(@intCast(offset)), max_bytes)
-        else
-            bytesRangeForTailLines(session.output_ring.items, lines, max_bytes);
+        const text_range = outputWindowRange(session, if (start_offset) |offset| @intCast(offset) else null, lines, max_bytes);
         const text = try self.allocator.dupe(u8, session.output_ring.items[text_range.start..text_range.end]);
         defer self.allocator.free(text);
         const ring_start = session.ringStart();
@@ -2247,6 +2776,7 @@ pub const Daemon = struct {
         for (self.sessions.items) |session| {
             if (!std.mem.eql(u8, session.session_id, wanted_id)) continue;
             const signaled = session.terminate();
+            self.noteSessionExitInRegistry(session, "session.kill", nowMs());
             return try okValueResponse(self.allocator, id_value, .{ .accepted = true, .signaled = signaled });
         }
         return try errorResponseAlloc(self.allocator, id_value, "not_found", wanted_id);
@@ -2262,6 +2792,7 @@ pub const Daemon = struct {
                 index += 1;
                 continue;
             }
+            self.noteSessionExitInRegistry(session, null, nowMs());
             self.removeAt(index);
             removed += 1;
         }
@@ -2388,6 +2919,13 @@ const WorkspaceRefFields = struct {
     workspace_path: ?[]const u8 = null,
 };
 
+fn parseDaemonParams(comptime T: type, allocator: std.mem.Allocator, params: std.json.Value) !std.json.Parsed(T) {
+    return try std.json.parseFromValue(T, allocator, params, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+}
+
 fn workspaceRefFields(params: std.json.Value) !WorkspaceRefFields {
     if (params != .object) return error.InvalidParams;
     const params_object = params.object;
@@ -2408,6 +2946,44 @@ fn optionalObjectString(object: std.json.ObjectMap, field: []const u8) !?[]const
     return jsonString(value) orelse error.InvalidParams;
 }
 
+fn leaseResourcesMatch(
+    leases: []const process_registry.LeaseRecord,
+    owner: []const u8,
+    requested: []const []const u8,
+) bool {
+    for (leases) |lease| {
+        if (!std.mem.eql(u8, lease.owner, owner)) continue;
+        var unique_requested: usize = 0;
+        for (requested, 0..) |resource, index| {
+            var duplicate = false;
+            for (requested[0..index]) |prior| {
+                if (std.mem.eql(u8, prior, resource)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) unique_requested += 1;
+        }
+        if (lease.resources.items.len != unique_requested) continue;
+        var matches = true;
+        for (lease.resources.items) |resource| {
+            var found = false;
+            for (requested) |candidate| {
+                if (std.mem.eql(u8, resource, candidate)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return true;
+    }
+    return false;
+}
+
 fn requiredObjectString(params: std.json.Value, field: []const u8) ![]const u8 {
     if (params != .object) return error.InvalidParams;
     const value = params.object.get(field) orelse return error.InvalidParams;
@@ -2421,6 +2997,108 @@ fn writeRegistryEnvelope(s: *std.json.Stringify, daemon: *const Daemon) !void {
     try s.write(daemon.registry.instance_nonce);
     try s.objectField("registry_revision");
     try s.write(daemon.registry.registry_revision);
+}
+
+fn writeLeaseOptions(s: *std.json.Stringify) !void {
+    try s.beginArray();
+    try s.write(headless.registry.NOTIFICATION_OPTION_WAIT);
+    try s.write(headless.registry.NOTIFICATION_OPTION_CANCEL_EXISTING);
+    try s.write(headless.registry.NOTIFICATION_OPTION_RUN_ANYWAY);
+    try s.write(headless.registry.NOTIFICATION_OPTION_OPEN_OWNER);
+    try s.endArray();
+}
+
+fn writeLeaseConflictList(
+    s: *std.json.Stringify,
+    workspace: *const process_registry.WorkspaceRecord,
+    conflicts: []const process_registry.LeaseConflictInfo,
+) !void {
+    try s.beginArray();
+    for (conflicts) |conflict| try writeLeaseConflict(s, workspace, conflict);
+    try s.endArray();
+}
+
+fn writeLeaseConflict(
+    s: *std.json.Stringify,
+    workspace: *const process_registry.WorkspaceRecord,
+    conflict: process_registry.LeaseConflictInfo,
+) !void {
+    var created_at_ms: i64 = 0;
+    var expires_at_ms: ?i64 = null;
+    for (workspace.leases.items) |lease| {
+        if (!std.mem.eql(u8, lease.id, conflict.lease_id)) continue;
+        created_at_ms = lease.created_at_ms;
+        expires_at_ms = lease.expires_at_ms;
+        break;
+    }
+    try s.beginObject();
+    try s.objectField("kind");
+    try s.write("lease");
+    try s.objectField("source");
+    try s.write("lease");
+    try s.objectField("resource");
+    if (conflict.resources.len != 0) try s.write(conflict.resources[0]) else try s.write("");
+    try s.objectField("id");
+    try s.write(conflict.lease_id);
+    try s.objectField("owner");
+    try s.write(conflict.owner);
+    try s.objectField("owner_kind");
+    try s.write("agent");
+    try s.objectField("command");
+    try s.write(conflict.command);
+    try s.objectField("status");
+    try s.write("leased");
+    try s.objectField("cancel_method");
+    try s.write("workspace.releaseLease (owner only)");
+    try s.objectField("session_id");
+    try s.write(null);
+    try s.objectField("pane_id");
+    try s.write(null);
+    try s.objectField("thread_id");
+    try s.write(null);
+    try s.objectField("started_at_ms");
+    try s.write(created_at_ms);
+    try s.objectField("expires_at_ms");
+    if (expires_at_ms) |expires| try s.write(expires) else try s.write(null);
+    try s.endObject();
+}
+
+fn writeLeaseConflictData(
+    s: *std.json.Stringify,
+    workspace: *const process_registry.WorkspaceRecord,
+    conflicts: []const process_registry.LeaseConflictInfo,
+) !void {
+    try s.beginObject();
+    try s.objectField("conflicts");
+    try writeLeaseConflictList(s, workspace, conflicts);
+    try s.objectField("options");
+    try writeLeaseOptions(s);
+    try s.endObject();
+}
+
+fn leaseConflictErrorResponse(
+    self: *Daemon,
+    id_value: std.json.Value,
+    workspace: *const process_registry.WorkspaceRecord,
+    conflicts: []const process_registry.LeaseConflictInfo,
+) ![]u8 {
+    var data_writer: std.Io.Writer.Allocating = .init(self.allocator);
+    errdefer data_writer.deinit();
+    var data_stringify: std.json.Stringify = .{ .writer = &data_writer.writer, .options = .{} };
+    try writeLeaseConflictData(&data_stringify, workspace, conflicts);
+    const data_json = try data_writer.toOwnedSlice();
+    defer self.allocator.free(data_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, data_json, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    return try errorResponseAllocWithData(
+        self.allocator,
+        id_value,
+        headless.registry.ERR_CONFLICT,
+        "workspace lease conflicts with an existing lease",
+        parsed.value,
+    );
 }
 
 fn writeWorkspaceInfo(s: *std.json.Stringify, daemon: *const Daemon, workspace: *const process_registry.WorkspaceRecord) !void {
@@ -2893,6 +3571,12 @@ fn drainSessionsThread(context: DrainThreadContext) void {
         const daemon = context.daemon;
         lockDaemon(daemon);
         daemon.pollSessions();
+        const prune_now_ms = nowMs();
+        // Pruning mutates only each outcome list, not the workspaces array, so
+        // iterating the records while pruning is safe under this lock.
+        for (daemon.registry.workspaces.items) |workspace| {
+            _ = daemon.registry.pruneTerminalProcessOutcomes(daemon.allocator, workspace.id, prune_now_ms);
+        }
         const should_exit = daemon.shouldExitForIdle();
         daemon.mutex.unlock();
         if (should_exit) {
@@ -3460,6 +4144,14 @@ fn jsonU32(value: std.json.Value) ?u32 {
     };
 }
 
+fn jsonU64(value: std.json.Value) ?u64 {
+    return switch (value) {
+        .integer => |int| if (int >= 0) @intCast(int) else null,
+        .number_string => |text| std.fmt.parseInt(u64, text, 10) catch null,
+        else => null,
+    };
+}
+
 fn jsonUsize(value: std.json.Value) ?usize {
     return switch (value) {
         .integer => |int| if (int >= 0) @intCast(int) else null,
@@ -3642,6 +4334,17 @@ fn bytesRangeForTailLines(bytes: []const u8, lines: u32, max_bytes: ?usize) Byte
         if (limit > 0 and bytes.len - start > limit) start = bytes.len - limit;
     }
     return .{ .start = start, .end = bytes.len };
+}
+
+fn outputWindowRange(session: *const PtySession, offset: ?u64, lines: u32, max_bytes: ?usize) ByteRange {
+    if (offset) |cursor| {
+        return bytesRangeFromOffset(
+            session.output_ring.items,
+            session.ringIndexForOffset(cursor),
+            max_bytes,
+        );
+    }
+    return bytesRangeForTailLines(session.output_ring.items, lines, max_bytes);
 }
 
 fn bytesFromOffset(allocator: std.mem.Allocator, bytes: []const u8, offset: usize) ![]u8 {
@@ -3858,6 +4561,448 @@ fn testSessionCreateResponseWasCreated(allocator: std.mem.Allocator, response: [
     const result = parsed.value.object.get("result") orelse return error.InvalidResponse;
     if (result != .object) return error.InvalidResponse;
     return jsonBool(result.object.get("created") orelse .null) orelse error.InvalidResponse;
+}
+
+fn observeTestTerminalProcess(
+    daemon: *Daemon,
+    allocator: std.mem.Allocator,
+    workspace_id: []const u8,
+    session_id: []const u8,
+    process_identity: u32,
+    command: []const u8,
+    cwd: []const u8,
+) ![]u8 {
+    const observed = try daemon.registry.observeTerminalProcess(allocator, workspace_id, .{
+        .process_identity = process_identity,
+        .session_id = session_id,
+        .command = command,
+        .cwd = cwd,
+        .pid = 42,
+        .process_group = 42,
+        .started_at_ms = 1,
+        .observed_at_ms = 1,
+        .dock_id = 0,
+        .pane_id = null,
+        .owner_kind = "terminal",
+        .owner_title = session_id,
+        .provider = null,
+    }, .{});
+    return allocator.dupe(u8, observed.process_id);
+}
+
+test "session create dual-writes a tracked terminal process" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const before_revision = daemon.registry.registry_revision;
+    const process_id = try observeTestTerminalProcess(
+        &daemon,
+        allocator,
+        "test-dual-write-workspace",
+        "test-dual-write-session",
+        101,
+        "/bin/cat",
+        "/tmp/test-dual-write",
+    );
+    defer allocator.free(process_id);
+
+    const response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"process.list","params":{"workspace":{"workspace_id":"test-dual-write-workspace"}}}
+    );
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?.object;
+    const process = result.get("processes").?.array.items[0].object;
+    try std.testing.expectEqual(@as(usize, 1), result.get("processes").?.array.items.len);
+    try std.testing.expect(std.mem.startsWith(u8, process.get("id").?.string, "term:"));
+    try std.testing.expectEqualStrings("/bin/cat", process.get("command").?.string);
+    try std.testing.expectEqualStrings("/tmp/test-dual-write", process.get("cwd").?.string);
+    try std.testing.expectEqualStrings(process_id, process.get("id").?.string);
+    try std.testing.expect(daemon.registry.registry_revision > before_revision);
+}
+
+test "session exit records exactly one outcome" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const completed_id = try observeTestTerminalProcess(&daemon, allocator, "test-outcomes", "completed-session", 201, "/bin/true", ".");
+    defer allocator.free(completed_id);
+    const failed_id = try observeTestTerminalProcess(&daemon, allocator, "test-outcomes", "failed-session", 202, "/bin/false", ".");
+    defer allocator.free(failed_id);
+    const cancelled_id = try observeTestTerminalProcess(&daemon, allocator, "test-outcomes", "cancelled-session", 203, "/bin/cat", ".");
+    defer allocator.free(cancelled_id);
+
+    const finished_at_ms = nowMs();
+    try std.testing.expect(try daemon.registry.finishTerminalProcess(allocator, "test-outcomes", "completed-session", .{ .exit_code = 0 }, finished_at_ms));
+    try std.testing.expect(!try daemon.registry.finishTerminalProcess(allocator, "test-outcomes", "completed-session", .{ .exit_code = 0 }, finished_at_ms + 1));
+    try std.testing.expect(try daemon.registry.finishTerminalProcess(allocator, "test-outcomes", "failed-session", .{ .exit_code = 2 }, finished_at_ms));
+    try std.testing.expect(try daemon.registry.finishTerminalProcess(allocator, "test-outcomes", "cancelled-session", .{ .cancellation_reason = "session.kill" }, finished_at_ms));
+
+    const response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"process.list","params":{"workspace":{"workspace_id":"test-outcomes"},"include_outcomes":true}}
+    );
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const outcomes = parsed.value.object.get("result").?.object.get("outcomes").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), outcomes.len);
+    var completed_count: usize = 0;
+    var failed_count: usize = 0;
+    var cancelled_count: usize = 0;
+    for (outcomes) |outcome| {
+        const status = outcome.object.get("status").?.string;
+        if (std.mem.eql(u8, status, "completed")) completed_count += 1;
+        if (std.mem.eql(u8, status, "failed")) failed_count += 1;
+        if (std.mem.eql(u8, status, "cancelled")) cancelled_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), completed_count);
+    try std.testing.expectEqual(@as(usize, 1), failed_count);
+    try std.testing.expectEqual(@as(usize, 1), cancelled_count);
+}
+
+test "duplicate create replacement advances the tracked generation" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const first_id = try observeTestTerminalProcess(&daemon, allocator, "test-replacement", "replacement-session", 301, "/bin/cat", ".");
+    defer allocator.free(first_id);
+    const first = daemon.registry.terminalProcessActiveForSession("test-replacement", "replacement-session").?;
+    const first_generation = first.generation;
+    try std.testing.expect(try daemon.registry.finishTerminalProcess(allocator, "test-replacement", "replacement-session", .{ .exit_code = 0 }, nowMs()));
+
+    const second_id = try observeTestTerminalProcess(&daemon, allocator, "test-replacement", "replacement-session", 302, "/bin/cat", ".");
+    defer allocator.free(second_id);
+    const second = daemon.registry.terminalProcessActiveForSession("test-replacement", "replacement-session").?;
+    try std.testing.expect(second.generation > first_generation);
+    try std.testing.expect(!std.mem.eql(u8, first_id, second_id));
+
+    const response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"process.list","params":{"workspace":{"workspace_id":"test-replacement"},"include_outcomes":true}}
+    );
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(usize, 1), result.get("processes").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 1), result.get("outcomes").?.array.items.len);
+}
+
+test "process.wait is a bounded immediate check" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const process_id = try observeTestTerminalProcess(&daemon, allocator, "test-wait", "wait-session", 401, "/bin/cat", ".");
+    defer allocator.free(process_id);
+    const running_revision = daemon.registry.registry_revision;
+    const running_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"process.wait\",\"params\":{{\"workspace\":{{\"workspace_id\":\"test-wait\"}},\"process_id\":\"{s}\",\"after_registry_revision\":{d},\"timeout_ms\":20000}}}}",
+        .{ process_id, running_revision },
+    );
+    defer allocator.free(running_request);
+    const running_response = try daemon.handleRequest(running_request);
+    defer allocator.free(running_response);
+    var running_parsed = try std.json.parseFromSlice(std.json.Value, allocator, running_response, .{});
+    defer running_parsed.deinit();
+    const running_result = running_parsed.value.object.get("result").?.object;
+    try std.testing.expect(running_result.get("timed_out").?.bool);
+    try std.testing.expect(running_result.get("terminal_state").? == .null);
+    try std.testing.expect(!running_result.get("changed").?.bool);
+
+    try std.testing.expect(try daemon.registry.finishTerminalProcess(allocator, "test-wait", "wait-session", .{ .exit_code = 0 }, nowMs()));
+    const finished_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"process.wait\",\"params\":{{\"workspace\":{{\"workspace_id\":\"test-wait\"}},\"process_id\":\"{s}\"}}}}",
+        .{process_id},
+    );
+    defer allocator.free(finished_request);
+    const finished_response = try daemon.handleRequest(finished_request);
+    defer allocator.free(finished_response);
+    var finished_parsed = try std.json.parseFromSlice(std.json.Value, allocator, finished_response, .{});
+    defer finished_parsed.deinit();
+    const finished_result = finished_parsed.value.object.get("result").?.object;
+    try std.testing.expect(!finished_result.get("timed_out").?.bool);
+    try std.testing.expectEqualStrings("completed", finished_result.get("terminal_state").?.string);
+    try std.testing.expect(finished_result.get("outcome").? == .object);
+    try std.testing.expect(finished_result.get("changed").?.bool);
+
+    const unknown_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":6,"method":"process.wait","params":{"workspace":{"workspace_id":"test-wait"},"process_id":"term:missing:1"}}
+    );
+    defer allocator.free(unknown_response);
+    var unknown_parsed = try std.json.parseFromSlice(std.json.Value, allocator, unknown_response, .{});
+    defer unknown_parsed.deinit();
+    try std.testing.expectEqualStrings(
+        headless.registry.ERR_RESOURCE_NOT_FOUND,
+        unknown_parsed.value.object.get("error").?.object.get("code").?.string,
+    );
+}
+
+test "process.logs resolves opaque id to session tail" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    _ = try daemon.registry.ensureWorkspace(allocator, "test-logs");
+
+    const response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":7,"method":"process.logs","params":{"workspace":{"workspace_id":"test-logs"},"process_id":"term:missing:1"}}
+    );
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const error_value = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings(headless.registry.ERR_RESOURCE_NOT_FOUND, error_value.get("code").?.string);
+    try std.testing.expectEqualStrings("process logs unavailable", error_value.get("message").?.string);
+}
+
+test "lease acquire returns conflict data with options" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    _ = try daemon.registry.ensureWorkspace(allocator, "lease-conflict");
+
+    const first_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"lease.acquire","params":{"workspace":{"workspace_id":"lease-conflict"},"owner":"owner-a","command":"build","resources":["build"]}}
+    );
+    defer allocator.free(first_response);
+    const second_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"lease.acquire","params":{"workspace":{"workspace_id":"lease-conflict"},"owner":"owner-b","command":"build","resources":["build"]}}
+    );
+    defer allocator.free(second_response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, second_response, .{});
+    defer parsed.deinit();
+    const error_value = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings(headless.registry.ERR_CONFLICT, error_value.get("code").?.string);
+    const data = error_value.get("data").?.object;
+    const conflicts = data.get("conflicts").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), conflicts.len);
+    try std.testing.expectEqualStrings("owner-a", conflicts[0].object.get("owner").?.string);
+    try std.testing.expectEqualStrings("workspace.releaseLease (owner only)", conflicts[0].object.get("cancel_method").?.string);
+    const options = data.get("options").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), options.len);
+    try std.testing.expectEqualStrings("wait", options[0].string);
+    try std.testing.expectEqualStrings("cancel_existing", options[1].string);
+    try std.testing.expectEqualStrings("run_anyway", options[2].string);
+    try std.testing.expectEqualStrings("open_owner", options[3].string);
+}
+
+test "forced lease acquire keeps both leases and queues one notification" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    _ = try daemon.registry.ensureWorkspace(allocator, "lease-forced");
+
+    const first_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"lease.acquire","params":{"workspace":{"workspace_id":"lease-forced"},"owner":"owner-a","command":"build","resources":["build"]}}
+    );
+    defer allocator.free(first_response);
+    const forced_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"lease.acquire","params":{"workspace":{"workspace_id":"lease-forced"},"owner":"owner-b","command":"build","resources":["build"],"force":true}}
+    );
+    defer allocator.free(forced_response);
+    var forced_parsed = try std.json.parseFromSlice(std.json.Value, allocator, forced_response, .{});
+    defer forced_parsed.deinit();
+    const forced_result = forced_parsed.value.object.get("result").?.object;
+    try std.testing.expect(forced_result.get("acquired").?.bool);
+    try std.testing.expect(forced_result.get("forced").?.bool);
+
+    const listed_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"process.list","params":{"workspace":{"workspace_id":"lease-forced"},"include_notifications":true}}
+    );
+    defer allocator.free(listed_response);
+    var listed = try std.json.parseFromSlice(std.json.Value, allocator, listed_response, .{});
+    defer listed.deinit();
+    const result = listed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(usize, 2), result.get("leases").?.array.items.len);
+    const notifications = result.get("notifications").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), notifications.len);
+    try std.testing.expectEqualStrings("Conflicting command started", notifications[0].object.get("title").?.string);
+    try std.testing.expectEqualStrings("owner-a", notifications[0].object.get("owner_session_id").?.string);
+}
+
+test "same-owner acquire renews the same lease id" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    _ = try daemon.registry.ensureWorkspace(allocator, "lease-renew-acquire");
+
+    const first_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"lease.acquire","params":{"workspace":{"workspace_id":"lease-renew-acquire"},"owner":"owner-a","command":"build","resources":["build"],"ttl_ms":1000}}
+    );
+    defer allocator.free(first_response);
+    var first = try std.json.parseFromSlice(std.json.Value, allocator, first_response, .{});
+    defer first.deinit();
+    const first_result = first.value.object.get("result").?.object;
+    const first_id = first_result.get("lease_id").?.string;
+    const first_expiry = first_result.get("expires_at_ms").?.integer;
+    const second_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"lease.acquire","params":{"workspace":{"workspace_id":"lease-renew-acquire"},"owner":"owner-a","command":"build","resources":["build"],"ttl_ms":3600000}}
+    );
+    defer allocator.free(second_response);
+    var second = try std.json.parseFromSlice(std.json.Value, allocator, second_response, .{});
+    defer second.deinit();
+    const second_result = second.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings(first_id, second_result.get("lease_id").?.string);
+    try std.testing.expect(second_result.get("expires_at_ms").?.integer > first_expiry);
+    try std.testing.expect(second_result.get("renewed").?.bool);
+}
+
+test "lease renew by id is owner-checked" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    _ = try daemon.registry.ensureWorkspace(allocator, "lease-renew-id");
+
+    const acquired_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"lease.acquire","params":{"workspace":{"workspace_id":"lease-renew-id"},"owner":"owner-a","command":"build","resources":["build"]}}
+    );
+    defer allocator.free(acquired_response);
+    var acquired = try std.json.parseFromSlice(std.json.Value, allocator, acquired_response, .{});
+    defer acquired.deinit();
+    const lease_id = acquired.value.object.get("result").?.object.get("lease_id").?.string;
+    const wrong_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"lease.renew\",\"params\":{{\"workspace\":{{\"workspace_id\":\"lease-renew-id\"}},\"owner\":\"owner-b\",\"lease_id\":\"{s}\"}}}}",
+        .{lease_id},
+    );
+    defer allocator.free(wrong_request);
+    const wrong_response = try daemon.handleRequest(wrong_request);
+    defer allocator.free(wrong_response);
+    var wrong = try std.json.parseFromSlice(std.json.Value, allocator, wrong_response, .{});
+    defer wrong.deinit();
+    try std.testing.expectEqualStrings(headless.registry.ERR_CONFLICT, wrong.value.object.get("error").?.object.get("code").?.string);
+
+    const right_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"lease.renew\",\"params\":{{\"workspace\":{{\"workspace_id\":\"lease-renew-id\"}},\"owner\":\"owner-a\",\"lease_id\":\"{s}\",\"ttl_ms\":5000}}}}",
+        .{lease_id},
+    );
+    defer allocator.free(right_request);
+    const right_response = try daemon.handleRequest(right_request);
+    defer allocator.free(right_response);
+    var right = try std.json.parseFromSlice(std.json.Value, allocator, right_response, .{});
+    defer right.deinit();
+    const right_result = right.value.object.get("result").?.object;
+    try std.testing.expect(right_result.get("renewed").?.bool);
+    try std.testing.expectEqualStrings(lease_id, right_result.get("lease_id").?.string);
+
+    const unknown_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":4,"method":"lease.renew","params":{"workspace":{"workspace_id":"lease-renew-id"},"owner":"owner-a","lease_id":"lease:missing"}}
+    );
+    defer allocator.free(unknown_response);
+    var unknown = try std.json.parseFromSlice(std.json.Value, allocator, unknown_response, .{});
+    defer unknown.deinit();
+    try std.testing.expectEqualStrings(headless.registry.ERR_RESOURCE_NOT_FOUND, unknown.value.object.get("error").?.object.get("code").?.string);
+}
+
+test "lease release is owner-only and idempotent" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    _ = try daemon.registry.ensureWorkspace(allocator, "lease-release");
+
+    const acquired_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"lease.acquire","params":{"workspace":{"workspace_id":"lease-release"},"owner":"owner-a","command":"build","resources":["build"]}}
+    );
+    defer allocator.free(acquired_response);
+    var acquired = try std.json.parseFromSlice(std.json.Value, allocator, acquired_response, .{});
+    defer acquired.deinit();
+    const lease_id = acquired.value.object.get("result").?.object.get("lease_id").?.string;
+    const wrong_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"lease.release\",\"params\":{{\"workspace\":{{\"workspace_id\":\"lease-release\"}},\"owner\":\"owner-b\",\"lease_id\":\"{s}\"}}}}",
+        .{lease_id},
+    );
+    defer allocator.free(wrong_request);
+    const wrong_response = try daemon.handleRequest(wrong_request);
+    defer allocator.free(wrong_response);
+    var wrong = try std.json.parseFromSlice(std.json.Value, allocator, wrong_response, .{});
+    defer wrong.deinit();
+    const wrong_result = wrong.value.object.get("result").?.object;
+    try std.testing.expect(!wrong_result.get("released").?.bool);
+    try std.testing.expectEqual(@as(i64, 0), wrong_result.get("released_count").?.integer);
+
+    const listed_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"process.list","params":{"workspace":{"workspace_id":"lease-release"}}}
+    );
+    defer allocator.free(listed_response);
+    var listed = try std.json.parseFromSlice(std.json.Value, allocator, listed_response, .{});
+    defer listed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), listed.value.object.get("result").?.object.get("leases").?.array.items.len);
+
+    const right_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"lease.release\",\"params\":{{\"workspace\":{{\"workspace_id\":\"lease-release\"}},\"owner\":\"owner-a\",\"lease_id\":\"{s}\"}}}}",
+        .{lease_id},
+    );
+    defer allocator.free(right_request);
+    const right_response = try daemon.handleRequest(right_request);
+    defer allocator.free(right_response);
+    var right = try std.json.parseFromSlice(std.json.Value, allocator, right_response, .{});
+    defer right.deinit();
+    const right_result = right.value.object.get("result").?.object;
+    try std.testing.expect(right_result.get("released").?.bool);
+    try std.testing.expectEqual(@as(i64, 1), right_result.get("released_count").?.integer);
+}
+
+test "notifications pull honors cursor and limit" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    _ = try daemon.registry.ensureWorkspace(allocator, "notification-cursor");
+
+    const first_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"lease.acquire","params":{"workspace":{"workspace_id":"notification-cursor"},"owner":"owner-a","command":"build","resources":["build"]}}
+    );
+    defer allocator.free(first_response);
+    const second_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"lease.acquire","params":{"workspace":{"workspace_id":"notification-cursor"},"owner":"owner-b","command":"deps","resources":["deps"]}}
+    );
+    defer allocator.free(second_response);
+    const first_force_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"lease.acquire","params":{"workspace":{"workspace_id":"notification-cursor"},"owner":"owner-c","command":"build","resources":["build"],"force":true}}
+    );
+    defer allocator.free(first_force_response);
+    const second_force_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":4,"method":"lease.acquire","params":{"workspace":{"workspace_id":"notification-cursor"},"owner":"owner-c","command":"deps","resources":["deps"],"force":true}}
+    );
+    defer allocator.free(second_force_response);
+
+    const first_pull_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":5,"method":"daemon.notifications","params":{"workspace":{"workspace_id":"notification-cursor"},"after_seq":0,"limit":1}}
+    );
+    defer allocator.free(first_pull_response);
+    var first_pull = try std.json.parseFromSlice(std.json.Value, allocator, first_pull_response, .{});
+    defer first_pull.deinit();
+    const first_result = first_pull.value.object.get("result").?.object;
+    const first_notifications = first_result.get("notifications").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), first_notifications.len);
+    try std.testing.expectEqualStrings("owner-a", first_notifications[0].object.get("owner_session_id").?.string);
+    try std.testing.expectEqual(@as(i64, 3), first_result.get("next_notification_seq").?.integer);
+
+    const second_pull_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":6,"method":"daemon.notifications","params":{"workspace":{"workspace_id":"notification-cursor"},"after_seq":1,"limit":1}}
+    );
+    defer allocator.free(second_pull_response);
+    var second_pull = try std.json.parseFromSlice(std.json.Value, allocator, second_pull_response, .{});
+    defer second_pull.deinit();
+    const second_notifications = second_pull.value.object.get("result").?.object.get("notifications").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), second_notifications.len);
+    try std.testing.expectEqualStrings("owner-b", second_notifications[0].object.get("owner_session_id").?.string);
+
+    const unaffected_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":7,"method":"daemon.notifications","params":{"workspace":{"workspace_id":"notification-cursor"},"owner_session_id":"owner-z","after_seq":0}}
+    );
+    defer allocator.free(unaffected_response);
+    var unaffected = try std.json.parseFromSlice(std.json.Value, allocator, unaffected_response, .{});
+    defer unaffected.deinit();
+    try std.testing.expectEqual(@as(usize, 0), unaffected.value.object.get("result").?.object.get("notifications").?.array.items.len);
 }
 
 test "session create reuses running session and replaces stopped session" {

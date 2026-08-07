@@ -7,6 +7,8 @@ const std = @import("std");
 
 pub const protocol = @import("protocol.zig");
 pub const registry = @import("registry_protocol.zig");
+pub const store_protocol = @import("store_protocol.zig");
+pub const changes_protocol = @import("changes_protocol.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const client = @import("client.zig");
 pub const store = @import("store_protocol.zig");
