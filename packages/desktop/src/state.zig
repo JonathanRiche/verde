@@ -9123,11 +9123,11 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     try std.testing.expect(!state.browser_controller.address_focused);
 
     try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(1));
-    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.focused_pane_id);
-    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.maximized_pane_id);
-    try std.testing.expect(state.composer_controller.focused);
-    try std.testing.expect(state.composer_controller.composer.focused);
-    try std.testing.expect(!state.terminal_controller.focused);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, first_terminal_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, first_terminal_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(!state.composer_controller.focused);
+    try std.testing.expect(!state.composer_controller.composer.focused);
+    try std.testing.expect(state.terminal_controller.focused);
     try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(-1));
     try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.maximized_pane_id);
@@ -9135,11 +9135,16 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     try std.testing.expect(!state.composer_controller.focused);
     try std.testing.expect(!state.composer_controller.composer.focused);
     try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(-1));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(state.composer_controller.focused);
+    try std.testing.expect(state.composer_controller.composer.focused);
+    try std.testing.expect(!state.terminal_controller.focused);
+    try std.testing.expect(state.focusCurrentProjectWorkspacePaneAtSidebarIndex(2));
     try std.testing.expectEqual(@as(?WorkspacePaneId, first_terminal_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, first_terminal_pane_id), layout.maximized_pane_id);
-    try std.testing.expect(state.focusCurrentProjectWorkspacePaneAtSidebarIndex(2));
-    try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.focused_pane_id);
-    try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(state.terminal_controller.focused);
+    try std.testing.expect(!state.composer_controller.focused);
     try std.testing.expect(!state.focusCurrentProjectWorkspacePaneAtSidebarIndex(3));
 
     layout.quick_pane = .{
