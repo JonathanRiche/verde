@@ -70,6 +70,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try runIntegration(allocator, io);
+    try runRegistryFixtureScenario(allocator, io);
+    try runStoreFixtureScenario(allocator, io);
     try runLifecycleBindGuard(allocator, io);
     try runLifecyclePrepareShutdownWithLivePty(allocator, io);
     try runLifecycleGracefulReplace(allocator, io);
@@ -307,6 +309,142 @@ fn waitChildBounded(child: *std.process.Child, io: std.Io, timeout_ms: u64) !std
     }
     child.kill(io);
     return error.ChildTimedOut;
+}
+
+/// The existing sessionizer uses this compatibility code for methods that have
+/// not reached its dispatcher yet.  `capability_unavailable` is the typed
+/// headless error used by optional surfaces; both are valid interim responses
+/// while the phase-2 daemon hooks remain unimplemented.
+const FIXTURE_METHOD_NOT_FOUND: []const u8 = "method_not_found";
+
+const FixtureSurface = enum {
+    registry,
+    store,
+};
+
+/// Shared phase-1 scenario plumbing. Typed DTOs are passed to Client.call so
+/// the normal headless protocol encoder owns the request envelope and JSON.
+const FixtureScenario = struct {
+    client: *headless.Client,
+
+    /// Encode and send one registry DTO through the hermetic daemon transport.
+    fn registryStep(self: *@This(), method: []const u8, params: anytype) !headless.protocol.ParsedResponse {
+        return self.client.call(method, params);
+    }
+
+    /// Encode and send one store DTO through the hermetic daemon transport.
+    fn storeStep(self: *@This(), method: []const u8, params: anytype) !headless.protocol.ParsedResponse {
+        return self.client.call(method, params);
+    }
+
+    /// Phase-2 placeholder: session create/exit observations will be attached
+    /// to the registry fixture here once the daemon owns registry state.
+    fn registrySessionObservationHook(_: *@This(), _: []const u8) void {}
+
+    /// Phase-2 placeholder: the store fixture will open a temporary SQLite
+    /// database here once the daemon routes store methods in the IT binary.
+    fn storeTemporaryDatabaseHook(_: *@This(), _: []const u8) void {}
+
+    /// Assert the tolerant phase-1 response contract for a not-yet-dispatched
+    /// method. Optional error data is intentionally accepted by parseResponse.
+    fn expectInterimError(_: *@This(), surface: FixtureSurface, parsed: *const headless.protocol.ParsedResponse) !void {
+        if (parsed.response.isOk()) return switch (surface) {
+            .registry => error.RegistryFixtureMethodUnexpectedlySucceeded,
+            .store => error.StoreFixtureMethodUnexpectedlySucceeded,
+        };
+
+        const err = parsed.response.err orelse return switch (surface) {
+            .registry => error.RegistryFixtureMissingError,
+            .store => error.StoreFixtureMissingError,
+        };
+        const method_not_found = std.mem.eql(u8, err.code, FIXTURE_METHOD_NOT_FOUND);
+        const capability_unavailable = std.mem.eql(u8, err.code, headless.protocol.ERR_CAPABILITY_UNAVAILABLE);
+        if (!method_not_found and !capability_unavailable) return switch (surface) {
+            .registry => error.RegistryFixtureUnexpectedErrorCode,
+            .store => error.StoreFixtureUnexpectedErrorCode,
+        };
+        if (err.message.len == 0) return switch (surface) {
+            .registry => error.RegistryFixtureMissingErrorMessage,
+            .store => error.StoreFixtureMissingErrorMessage,
+        };
+    }
+};
+
+/// Phase-1 registry fixture: exercise a typed process-list request against the
+/// daemon and pin its current unimplemented response shape for phase 2.
+fn runRegistryFixtureScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "registry-hooks");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    defer child.kill(io);
+
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = allocator,
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(allocator, &transport);
+    var scenario: FixtureScenario = .{ .client = &client };
+    scenario.registrySessionObservationHook("phase-2-registry-observation");
+
+    const request: headless.registry.ProcessListRequest = .{
+        .workspace = .{ .workspace_path = pref_path },
+        .include_outcomes = true,
+        .include_notifications = true,
+    };
+    var parsed = try scenario.registryStep(headless.registry.METHOD_PROCESS_LIST, request);
+    defer parsed.deinit();
+    try scenario.expectInterimError(.registry, &parsed);
+}
+
+/// Phase-1 store fixture: exercise a typed workspace-upsert request against
+/// the daemon and pin its current unimplemented response shape for phase 2.
+fn runStoreFixtureScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "store-hooks");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    defer child.kill(io);
+
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = allocator,
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(allocator, &transport);
+    var scenario: FixtureScenario = .{ .client = &client };
+    scenario.storeTemporaryDatabaseHook("phase-2-store-temporary-database");
+
+    const mutation: headless.store.MutationHeader = .{
+        .request_key = "w7-store-fixture-workspace-upsert",
+        .client_id = "w7-fixture-client",
+    };
+    const request: headless.store.WorkspaceUpsertRequest = .{
+        .mutation = mutation,
+        .workspace = .{
+            .workspace_id = "w7-fixture-workspace",
+            .label = "W7 fixture workspace",
+            .path = pref_path,
+        },
+    };
+    var parsed = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, request);
+    defer parsed.deinit();
+    try scenario.expectInterimError(.store, &parsed);
 }
 
 fn runIntegration(allocator: std.mem.Allocator, io: std.Io) !void {
