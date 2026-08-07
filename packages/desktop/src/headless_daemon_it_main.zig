@@ -172,6 +172,8 @@ pub fn main(init: std.process.Init) !void {
         // M4-P2 POSIX-only: kill mid-turn + slow commit vs session.tail.
         try runChatKillMidTurnScenario(allocator, io); // scenario 3
         try runChatSlowCommitDoesNotStallSessionTailScenario(allocator, io); // scenario 5
+        // MAJOR-3 (M4-P2b fix): commit fault + bounded retry recovery.
+        try runChatCommitFaultRetryScenario(allocator, io);
         // MAJOR-3(c): real `verde notify` CLI binary against hermetic daemon / auto-start.
         try runCliBinaryNotifyScenario(allocator, io);
     }
@@ -319,6 +321,9 @@ const IsolatedDaemonOptions = struct {
     store_disable: bool = false,
     /// When true, chat workers complete with canned events (no provider I/O).
     chat_stub: bool = false,
+    /// When set with `store_dir`, maps to `VERDE_SESSION_DAEMON_CHAT_COMMIT_FAULT`
+    /// (MAJOR-3 bounded-retry IT: `fail_once`).
+    chat_commit_fault: ?[]const u8 = null,
     slow_io_ms: ?[]const u8 = null,
     retention_ms: ?[]const u8 = null,
 };
@@ -388,6 +393,7 @@ fn spawnIsolatedDaemonWithOptions(
     if (options.store_fault) |value| try env_map.put(sessionizer.SESSION_DAEMON_STORE_FAULT_ENV_NAME, value);
     if (options.store_disable) try env_map.put(sessionizer.SESSION_DAEMON_STORE_DISABLE_ENV_NAME, "1");
     if (options.chat_stub) try env_map.put(sessionizer.SESSION_DAEMON_CHAT_STUB_ENV_NAME, "1");
+    if (options.chat_commit_fault) |value| try env_map.put(sessionizer.SESSION_DAEMON_CHAT_COMMIT_FAULT_ENV_NAME, value);
 
     // Bind the child to the same isolated endpoint the parent uses.
     const endpoint = try isolationEndpoint(allocator, pref_path);
@@ -4060,12 +4066,20 @@ fn runChatDisconnectedCommitScenario(allocator: std.mem.Allocator, io: std.Io) !
     if (!std.mem.eql(u8, ledger.text(1), "user-disc-1")) return error.ChatDisconnectBadUserId;
     if (ledger.nullableInt(2) == null) return error.ChatDisconnectMissingRevision;
 
+    // MINOR-1: require ≥2 messages including at least one assistant row
+    // (not just the staged user row).
     var msgs = (try conn.row(
         "select count(*) from messages where thread_id = (select id from threads where local_thread_id = 'thread-disc')",
         .{},
     )).?;
     defer msgs.deinit();
-    if (msgs.int(0) < 1) return error.ChatDisconnectMissingMessages;
+    if (msgs.int(0) < 2) return error.ChatDisconnectMissingMessages;
+    var assistants = (try conn.row(
+        "select count(*) from messages where thread_id = (select id from threads where local_thread_id = 'thread-disc') and role = 2",
+        .{},
+    )).?;
+    defer assistants.deinit();
+    if (assistants.int(0) < 1) return error.ChatDisconnectMissingAssistant;
 
     var receipts = (try conn.row(
         "select count(*) from store_receipts where request_key = 'turn:turn-disc-1:commit'",
@@ -4277,11 +4291,59 @@ fn runChatKillMidTurnScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         }
         if (!saw_user) return error.ChatKillMissingUserMessage;
 
+        // MAJOR-2 pin: stable-turn_id replay after interrupted sweep must commit
+        // (upsert supersedes 'interrupted'; receipt/ledger stay 1-per-key).
+        try startStubChatTurn(
+            &client2,
+            "turn-kill-1",
+            "ws-kill",
+            "thread-kill",
+            pref_path,
+            "replay after interrupt",
+            "user-kill-1",
+        );
+        try waitChatTurnTerminal(io, &client2, "turn-kill-1", true);
+        var replay_rec = try client2.call(headless.store.METHOD_CHAT_TURN_RECORD, .{ .turn_id = "turn-kill-1" });
+        defer replay_rec.deinit();
+        if (!replay_rec.response.isOk()) return error.ChatKillReplayRecordFailed;
+        const replayed = try client2.decodeTurnRecord(&replay_rec);
+        if (!std.mem.eql(u8, replayed.status, "completed")) return error.ChatKillReplayNotCompleted;
+        if (replayed.committed_store_revision == null) return error.ChatKillReplayMissingRevision;
+        try consumeChatTurn(&client2, "turn-kill-1");
+
         var prepare = try client2.call("daemon.prepareShutdown", .{});
         defer prepare.deinit();
         if (!prepare.response.isOk()) return error.ChatKillPrepareFailed;
         kill_on_unwind = false;
         _ = child2.wait(io) catch {};
+    }
+
+    // RO pin: exactly one ledger row + one commit receipt after interrupted→replay.
+    {
+        const db_path = try std.fs.path.join(allocator, &.{ store_dir, "state.sqlite" });
+        defer allocator.free(db_path);
+        const db_path_z = try allocator.dupeZ(u8, db_path);
+        defer allocator.free(db_path_z);
+        var conn = try zqlite.open(db_path_z, zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode);
+        defer conn.close();
+        var turns = (try conn.row(
+            "select count(*) from chat_turns where turn_id = 'turn-kill-1'",
+            .{},
+        )).?;
+        defer turns.deinit();
+        if (turns.int(0) != 1) return error.ChatKillReplayTurnCount;
+        var receipts = (try conn.row(
+            "select count(*) from store_receipts where request_key = 'turn:turn-kill-1:commit'",
+            .{},
+        )).?;
+        defer receipts.deinit();
+        if (receipts.int(0) != 1) return error.ChatKillReplayReceiptCount;
+        var status_row = (try conn.row(
+            "select status from chat_turns where turn_id = 'turn-kill-1'",
+            .{},
+        )).?;
+        defer status_row.deinit();
+        if (!std.mem.eql(u8, status_row.text(0), "completed")) return error.ChatKillReplayLedgerStatus;
     }
 }
 
@@ -4342,9 +4404,157 @@ fn runChatFailedAbortedCommitScenario(allocator: std.mem.Allocator, io: std.Io) 
     const aborted = try client.decodeTurnRecord(&abort_rec);
     if (!std.mem.eql(u8, aborted.status, "aborted")) return error.ChatAbortBadStatus;
 
+    // MAJOR-4: assert synthesized failure / interruption rows exist in messages.
+    {
+        var fail_get = try client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+            .workspace_id = "ws-fail",
+            .local_thread_id = "thread-fail",
+        });
+        defer fail_get.deinit();
+        if (!fail_get.response.isOk()) return error.ChatFailThreadGetFailed;
+        const fail_thread = try client.decodeThreadGet(&fail_get);
+        var saw_failure_row = false;
+        for (fail_thread.thread.messages) |message| {
+            if (std.mem.eql(u8, message.role, "system") and
+                std.mem.indexOf(u8, message.body, "stub failure") != null)
+            {
+                saw_failure_row = true;
+                break;
+            }
+        }
+        if (!saw_failure_row) return error.ChatFailMissingFailureRow;
+    }
+    {
+        var abort_get = try client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+            .workspace_id = "ws-fail",
+            .local_thread_id = "thread-abort",
+        });
+        defer abort_get.deinit();
+        if (!abort_get.response.isOk()) return error.ChatAbortThreadGetFailed;
+        const abort_thread = try client.decodeThreadGet(&abort_get);
+        var saw_interrupt_row = false;
+        for (abort_thread.thread.messages) |message| {
+            // transcript_apply: author = "Conversation interrupted" for aborted.
+            if (std.mem.eql(u8, message.role, "system") and
+                (std.mem.indexOf(u8, message.author, "Conversation interrupted") != null or
+                    std.mem.indexOf(u8, message.body, "differently") != null))
+            {
+                saw_interrupt_row = true;
+                break;
+            }
+        }
+        if (!saw_interrupt_row) return error.ChatAbortMissingInterruptRow;
+    }
+
     var prepare = try client.call("daemon.prepareShutdown", .{});
     defer prepare.deinit();
     if (!prepare.response.isOk()) return error.ChatFailPrepareFailed;
+    kill_on_unwind = false;
+    _ = child.wait(io) catch {};
+}
+
+/// MAJOR-3: one-shot StoreBusy at durable commit → bounded retry recovers.
+/// Asserts durability_error is visible during the failure window, then the
+/// receipt lands, consume succeeds, and prepareShutdown accepts.
+fn runChatCommitFaultRetryScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m4-chat-commit-fault");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+        .chat_stub = true,
+        .chat_commit_fault = "fail_once",
+    });
+    var kill_on_unwind = true;
+    errdefer if (kill_on_unwind) child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    try startStubChatTurn(
+        &client,
+        "turn-fault-1",
+        "ws-fault",
+        "thread-fault",
+        pref_path,
+        "commit fault once",
+        "user-fault-1",
+    );
+
+    // Poll: first observe terminal + durability_pending + durability_error
+    // (failure window), then observe committed_store_revision after retry.
+    var saw_error_window = false;
+    var attempts: usize = 0;
+    while (attempts < 800) : (attempts += 1) {
+        var parsed = client.call("chat.turn.tail", .{ .turn_id = "turn-fault-1", .after_seq = 0 }) catch {
+            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+            continue;
+        };
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) {
+            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+            continue;
+        }
+        const result = parsed.response.result orelse {
+            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+            continue;
+        };
+        if (result != .object) {
+            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+            continue;
+        }
+        const status = result.object.get("status") orelse .null;
+        const status_text = if (status == .string) status.string else "";
+        const terminal = std.mem.eql(u8, status_text, "completed") or
+            std.mem.eql(u8, status_text, "failed") or
+            std.mem.eql(u8, status_text, "aborted");
+        if (!terminal) {
+            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+            continue;
+        }
+        const pending = result.object.get("durability_pending") orelse .null;
+        const is_pending = pending == .bool and pending.bool;
+        const d_err = result.object.get("durability_error") orelse .null;
+        const has_err = d_err == .string and d_err.string.len != 0;
+        const committed = result.object.get("committed_store_revision") orelse .null;
+        if (is_pending and has_err and committed == .null) {
+            saw_error_window = true;
+            // Keep polling for recovery.
+            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+            continue;
+        }
+        if (committed != .null and !is_pending) {
+            // Recovered.
+            break;
+        }
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    } else {
+        return error.ChatCommitFaultDidNotRecover;
+    }
+    if (!saw_error_window) return error.ChatCommitFaultMissedErrorWindow;
+
+    try consumeChatTurn(&client, "turn-fault-1");
+
+    var prepare = try client.call("daemon.prepareShutdown", .{});
+    defer prepare.deinit();
+    if (!prepare.response.isOk()) return error.ChatCommitFaultPrepareFailed;
     kill_on_unwind = false;
     _ = child.wait(io) catch {};
 }

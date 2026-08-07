@@ -74,6 +74,10 @@ pub const SESSION_DAEMON_STORE_FAULT_ENV_NAME = "VERDE_SESSION_DAEMON_STORE_FAUL
 /// Hermetic chat stub: when set (non-empty, not 0/false/no), chat workers skip
 /// real providers and complete with canned events so IT scenarios stay offline.
 pub const SESSION_DAEMON_CHAT_STUB_ENV_NAME = "VERDE_SESSION_DAEMON_CHAT_STUB";
+/// Hermetic-only one-shot chat durable-commit fault. Only meaningful with the
+/// store-dir override. `fail_once` → first commitTurn attempt returns StoreBusy
+/// without touching SQLite; subsequent attempts pass through (MAJOR-3 IT arm).
+pub const SESSION_DAEMON_CHAT_COMMIT_FAULT_ENV_NAME = "VERDE_SESSION_DAEMON_CHAT_COMMIT_FAULT";
 /// Test-only latency injection for the unlocked managed-process phase.
 const TEST_SLOW_IO_ENV_NAME = "VERDE_SESSIONIZER_TEST_SLOW_IO_MS";
 /// Test-only orphan retention override; registry-internal TTLs remain fixed.
@@ -1558,7 +1562,8 @@ const ChatTurn = struct {
     status: ChatTurnStatus = .running,
     consumed: bool = false,
     worker_done: bool = false,
-    /// True from worker terminalization until the store receipt returns.
+    /// True from turn acceptance (when the store is open) until the store
+    /// receipt returns, so consume cannot race a pre-commit terminal status.
     durability_pending: bool = false,
     /// Set only after commitTurn returns a WriteResult (including receipt replay).
     committed_store_revision: ?u64 = null,
@@ -4158,6 +4163,10 @@ pub const Daemon = struct {
 
         const turn = try createChatTurnFromParams(self.allocator, params);
         errdefer turn.deinit(self.allocator);
+        // MINOR-3: arm durability_pending at acceptance while lockDaemon is held
+        // (caller is the `.normal` branch) so consume cannot TOCTOU a terminal
+        // status published before finalize sets pending.
+        if (self.store_service != null) turn.durability_pending = true;
         try self.chat_turns.append(self.allocator, turn);
         errdefer _ = self.chat_turns.pop();
         // Staging runs on the worker thread: the normal request path holds
@@ -5279,7 +5288,7 @@ fn maybeInitStoreService(daemon: *Daemon) !void {
 
     // Crash recovery: any non-terminal ledger rows left by a killed predecessor
     // become `interrupted` before the writer is published.
-    sweepInterruptedChatTurns(&service.store);
+    try sweepInterruptedChatTurns(&service.store);
 
     lockDaemon(daemon);
     daemon.store_service = service;
@@ -5287,8 +5296,9 @@ fn maybeInitStoreService(daemon: *Daemon) !void {
 }
 
 /// Mark dangling non-terminal ledger rows interrupted. Runs under the store
-/// open path before the service is published; no lockDaemon.
-fn sweepInterruptedChatTurns(store: *daemon_store.Store) void {
+/// open path before the service is published; no lockDaemon. Propagates so a
+/// failed sweep fails readiness loudly (NIT-4).
+fn sweepInterruptedChatTurns(store: *daemon_store.Store) !void {
     const finished_at = nowMs();
     store.conn.exec(
         \\update chat_turns
@@ -5298,17 +5308,22 @@ fn sweepInterruptedChatTurns(store: *daemon_store.Store) void {
     ,
         .{finished_at},
     ) catch |err| {
-        log.warn("interrupted-turn sweep failed err={s}", .{@errorName(err)});
+        log.err("interrupted-turn sweep failed err={s}", .{@errorName(err)});
+        return mapStageStoreError(err);
     };
 }
 
 /// Stage a running ledger row (+ optional user message) at turn acceptance.
 /// Store I/O only under the service mutex; never under lockDaemon.
 fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !void {
+    // MINOR-5(a): bump in_flight under lockDaemon (match dispatch spine) so
+    // finalize cannot destroy the service while this pointer is live.
     lockDaemon(daemon);
     const service = daemon.store_service;
+    if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
     daemon.mutex.unlock();
     const svc = service orelse return;
+    defer _ = svc.in_flight.fetchSub(1, .monotonic);
 
     var arena_state: std.heap.ArenaAllocator = .init(daemon.allocator);
     defer arena_state.deinit();
@@ -5329,8 +5344,6 @@ fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !void {
 
     lockStoreService(svc);
     defer svc.mutex.unlock();
-    _ = svc.in_flight.fetchAdd(1, .monotonic);
-    defer _ = svc.in_flight.fetchSub(1, .monotonic);
 
     const ws_key = try std.fmt.allocPrint(arena, "turn:{s}:stage-ws", .{turn_id});
     _ = svc.store.upsertWorkspace(.{
@@ -5369,8 +5382,8 @@ fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !void {
         },
     }) catch |err| return err;
 
-    // Ledger stage is not receipt-backed: the terminal commitTurn path deletes
-    // non-terminal rows before inserting the durable terminal row.
+    // Ledger stage is not receipt-backed: the terminal commitTurn path upserts
+    // the durable terminal row over any staged / interrupted ledger row.
     svc.store.conn.exec(
         \\insert or ignore into chat_turns (
         \\  turn_id, workspace_id, local_thread_id, status, started_at_ms,
@@ -5397,9 +5410,34 @@ fn mapStageStoreError(err: anyerror) daemon_store.StoreError {
     };
 }
 
+/// Process-global one-shot for VERDE_SESSION_DAEMON_CHAT_COMMIT_FAULT=fail_once.
+/// Consumed on first armed check; subsequent calls return false.
+var chat_commit_fault_once_consumed = std.atomic.Value(bool).init(false);
+
+/// Hermetic-only: true when store-dir override is set AND commit-fault env is
+/// `fail_once` and this process has not yet consumed the one-shot. Does not
+/// touch SQLite; caller returns StoreBusy for the bounded-retry path.
+fn chatCommitFaultOnceShouldFail(allocator: std.mem.Allocator) bool {
+    const override_dir = storeDirFromEnv(allocator) catch return false;
+    defer if (override_dir) |dir| allocator.free(dir);
+    if (override_dir == null) return false;
+
+    const environ: std.process.Environ = if (builtin.os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    const raw = environ.getAlloc(allocator, SESSION_DAEMON_CHAT_COMMIT_FAULT_ENV_NAME) catch return false;
+    defer allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (!std.mem.eql(u8, trimmed, "fail_once")) return false;
+
+    // swap true → already consumed; false → first call, consume and fail.
+    return !chat_commit_fault_once_consumed.swap(true, .monotonic);
+}
+
 /// Apply transcript_apply and commitTurn outside lockDaemon. Caller must not
 /// hold the turn lock. Sets committed_store_revision and clears durability_pending
-/// on success; leaves durability_pending set on failure (bounded retry later).
+/// on success; leaves durability_pending set on failure (caller may retry).
 fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
     var arena_state: std.heap.ArenaAllocator = .init(daemon.allocator);
     defer arena_state.deinit();
@@ -5453,20 +5491,26 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
     };
     const messages = try transcript_apply.apply(arena, events, outcome);
 
-    // 2. Short lockDaemon for service pointer + in_flight only.
+    // 2. Short lockDaemon for service pointer + in_flight only (MINOR-5(a)).
     lockDaemon(daemon);
     const service = daemon.store_service orelse {
         daemon.mutex.unlock();
         // Store closed between check and commit: clear pending so the turn
-        // does not keep the daemon alive forever without a writer.
+        // does not keep the daemon alive forever without a writer, but flag
+        // the lost commit (MINOR-4).
         lockTurn(turn);
         turn.durability_pending = false;
+        if (turn.durability_error) |old| daemon.allocator.free(old);
+        turn.durability_error = daemon.allocator.dupe(u8, "store_closed") catch null;
         turn.mutex.unlock();
         return;
     };
     _ = service.in_flight.fetchAdd(1, .monotonic);
     daemon.mutex.unlock();
     defer _ = service.in_flight.fetchSub(1, .monotonic);
+
+    // Hermetic one-shot fault: fail before any SQLite under the store lock.
+    if (chatCommitFaultOnceShouldFail(daemon.allocator)) return error.StoreBusy;
 
     // 3. SQLite under the store service lock only.
     lockStoreService(service);
@@ -5494,11 +5538,8 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
         },
     });
 
-    // Terminal commitTurn inserts the ledger row; drop any acceptance stage first.
-    service.store.conn.exec(
-        "delete from chat_turns where turn_id = ?1 and status in ('accepted', 'running', 'waiting_approval')",
-        .{turn_id},
-    ) catch {};
+    // commitTurn upserts the ledger row over any staged/interrupted row
+    // (insertTurnLedger ON CONFLICT). No external pre-delete (MAJOR-1/2).
 
     // commitTurn uses conn.commit() (not commitWithFault). Inject the stall
     // only on this path so turn-commit latency ITs exercise the worker-thread
@@ -5528,8 +5569,9 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
         .client_id = "daemon",
     });
 
-    // 4. Publish revision on the turn after the receipt (outside store lock is
-    // fine; turn lock only for field writes).
+    // 4. Publish revision on the turn after the receipt. The store service
+    // mutex is still held here (defer releases at fn exit); store→turn nesting
+    // is globally consistent (NIT-1).
     lockTurn(turn);
     turn.committed_store_revision = write_result.store_revision;
     turn.durability_pending = false;
@@ -5569,8 +5611,10 @@ fn loadTurnRecord(
     errdefer if (error_message) |value| allocator.free(value);
     const user_message_id = dupeOptionalText(allocator, row.nullableText(9)) catch return error.OutOfMemory;
     errdefer if (user_message_id) |value| allocator.free(value);
-    const committed = if (row.nullableInt(10)) |value|
-        @as(?u64, @intCast(value))
+    // MINOR-6: range-check before cast (storeStatus pattern); corrupt/negative
+    // committed_store_revision maps to store_corrupt, not a Debug panic.
+    const committed: ?u64 = if (row.nullableInt(10)) |value|
+        std.math.cast(u64, value) orelse return error.StoreCorrupt
     else
         null;
 
@@ -6118,6 +6162,22 @@ fn finalizeSessionizerStore(context: *SessionizerServerContext) void {
         };
     }
 
+    // MINOR-5(b): drain in_flight before destroy so a late staging/commit
+    // pointer-grab cannot UAF after store.deinit. Bounded; warn on timeout.
+    {
+        const drain_deadline = nowMs() + 2000;
+        while (service.in_flight.load(.monotonic) != 0) {
+            if (nowMs() >= drain_deadline) {
+                log.warn(
+                    "store finalize in_flight drain timed out count={d}",
+                    .{service.in_flight.load(.monotonic)},
+                );
+                break;
+            }
+            platform_runtime.sleepMillis(5);
+        }
+    }
+
     service.store.deinit();
     context.daemon.allocator.destroy(service);
 }
@@ -6625,9 +6685,12 @@ fn createChatTurnFromParams(allocator: std.mem.Allocator, params: std.json.Value
     };
     const user_message_id = try optionalDupe(allocator, params, "message_id");
     errdefer if (user_message_id) |value| allocator.free(value);
-    // IT/hermetic: params.test_stub OR process env both select the offline worker.
-    const use_stub = (jsonBool(params.object.get("test_stub") orelse .null) orelse false) or
-        chatStubEnabledFromEnv(allocator);
+    // MINOR-7: wire test_stub is only honored when the hermetic stub env is
+    // also set, so a production client cannot force canned durable rows.
+    // Env alone still enables the offline worker for hermetic ITs.
+    const env_stub = chatStubEnabledFromEnv(allocator);
+    const wire_stub = jsonBool(params.object.get("test_stub") orelse .null) orelse false;
+    const use_stub = env_stub or (wire_stub and env_stub);
     turn.* = .{
         .allocator = allocator,
         .turn_id = try requiredDupe(allocator, params, "turn_id"),
@@ -6650,7 +6713,8 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
     stageAcceptedChatTurn(daemon, turn) catch |err| {
         log.warn("chat turn acceptance staging failed turn_id={s} err={s}", .{ turn.turn_id, @errorName(err) });
     };
-    if (turn.use_stub or chatStubEnabledFromEnv(allocator)) {
+    // NIT-3: use_stub already folded the env at creation; do not re-eval.
+    if (turn.use_stub) {
         runStubChatTurn(allocator, turn);
     } else {
         const result = send_runner.run(allocator, turn.request, .{
@@ -6691,24 +6755,48 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
 }
 
 /// Common post-worker bookkeeping: durability_pending then store commit outside
-/// both the turn lock and lockDaemon (store service seam only).
+/// both the turn lock and lockDaemon (store service seam only). Bounded retry
+/// with backoff sleeps taken while holding NO locks (MAJOR-3).
 fn finalizeChatTurnWorker(daemon: *Daemon, turn: *ChatTurn) void {
     const should_commit = daemonStoreIsOpen(daemon);
     lockTurn(turn);
     turn.finished_at_ms = turn.finished_at_ms orelse nowMs();
-    if (should_commit) turn.durability_pending = true;
+    if (should_commit) {
+        turn.durability_pending = true;
+    } else {
+        // MINOR-3: clear pending when there is no writer (accept may have armed it).
+        turn.durability_pending = false;
+    }
     turn.worker_done = true;
     turn.mutex.unlock();
-    if (should_commit) {
+    if (!should_commit) return;
+
+    // 3 attempts total; backoffs between attempts with no lock held.
+    const backoffs_ms = [_]u64{ 50, 250, 1000 };
+    var attempt: usize = 0;
+    while (attempt < 3) : (attempt += 1) {
         commitChatTurnDurable(daemon, turn) catch |err| {
-            log.warn("chat turn durable commit failed turn_id={s} err={s}", .{ turn.turn_id, @errorName(err) });
-            // Keep durability_pending true (turn not consumable) but record the
-            // failure so tails/ITs can distinguish hang vs store error.
+            log.warn(
+                "chat turn durable commit failed turn_id={s} attempt={d} err={s}",
+                .{ turn.turn_id, attempt + 1, @errorName(err) },
+            );
             lockTurn(turn);
             if (turn.durability_error) |old| daemon.allocator.free(old);
             turn.durability_error = daemon.allocator.dupe(u8, @errorName(err)) catch null;
+            // durability_pending stays true (unconsumable; keep-alive holds).
             turn.mutex.unlock();
+            if (attempt + 1 >= 3) return; // exhausted: design §2 terminal state
+            platform_runtime.sleepMillis(backoffs_ms[attempt]);
+            continue;
         };
+        // Success: clear any prior attempt's error marker.
+        lockTurn(turn);
+        if (turn.durability_error) |old| {
+            daemon.allocator.free(old);
+            turn.durability_error = null;
+        }
+        turn.mutex.unlock();
+        return;
     }
 }
 
@@ -6733,8 +6821,11 @@ fn runStubChatTurn(allocator: std.mem.Allocator, turn: *ChatTurn) void {
     lockTurn(turn);
     defer turn.mutex.unlock();
     if (turn.cancel_requested or turn.status == .aborted) {
-        turn.status = .aborted;
-        turn.appendEvent(allocator, "aborted", "{}");
+        // NIT-2: cancel path may already have set aborted + appended the event.
+        if (turn.status != .aborted) {
+            turn.status = .aborted;
+            turn.appendEvent(allocator, "aborted", "{}");
+        }
         turn.finished_at_ms = nowMs();
         return;
     }
@@ -10157,13 +10248,24 @@ test "durable turn commit is exactly once and interrupt sweep marks running rows
             "insert into chat_turns (turn_id, workspace_id, local_thread_id, status, started_at_ms, provider) values ('turn-running', 'ws-sweep', 't-sweep', 'running', 1, 'codex')",
             .{},
         );
-        sweepInterruptedChatTurns(&daemon.store_service.?.store);
+        try sweepInterruptedChatTurns(&daemon.store_service.?.store);
         var row = (try daemon.store_service.?.store.conn.row(
             "select status from chat_turns where turn_id = 'turn-running'",
             .{},
         )).?;
         defer row.deinit();
         try std.testing.expectEqualStrings("interrupted", row.text(0));
+    }
+
+    // MAJOR-1/2 pin: pre-stage a 'running' row for the turn that will commit
+    // (upsert supersedes it inside commitTurn; no external delete).
+    {
+        lockStoreService(daemon.store_service.?);
+        defer daemon.store_service.?.mutex.unlock();
+        try daemon.store_service.?.store.conn.exec(
+            "insert into chat_turns (turn_id, workspace_id, local_thread_id, status, started_at_ms, provider, user_message_id) values ('turn-commit-once', 'ws-commit', 't-commit', 'running', 10, 'codex', 'user-1')",
+            .{},
+        );
     }
 
     const turn = try allocator.create(ChatTurn);
@@ -10214,6 +10316,13 @@ test "durable turn commit is exactly once and interrupt sweep marks running rows
     )).?;
     defer count.deinit();
     try std.testing.expectEqual(@as(i64, 1), count.int(0));
+
+    var ledger_status = (try daemon.store_service.?.store.conn.row(
+        "select status from chat_turns where turn_id = 'turn-commit-once'",
+        .{},
+    )).?;
+    defer ledger_status.deinit();
+    try std.testing.expectEqualStrings("completed", ledger_status.text(0));
 
     var receipt = (try daemon.store_service.?.store.conn.row(
         "select count(*) from store_receipts where request_key = 'turn:turn-commit-once:commit'",
