@@ -20,6 +20,7 @@ const loop_wakeup = @import("loop_wakeup");
 const platform_paths = @import("platform_paths");
 const platform_runtime = @import("platform_runtime");
 const platform_process = @import("platform/process.zig");
+const workspace_identity = @import("platform/workspace_identity.zig");
 const process_env = @import("platform/env.zig");
 const provider_hooks = @import("providers/hooks.zig");
 const provider_mcp = @import("providers/mcp.zig");
@@ -7997,11 +7998,7 @@ pub const AppState = struct {
     }
 
     pub fn deriveProjectId(self: *AppState, path: []const u8) ![]u8 {
-        const comparison_key = try platform_paths.projectComparisonKeyAllocForOs(self.allocator, builtin.os.tag, path);
-        defer self.allocator.free(comparison_key);
-        var hasher = std.hash.Wyhash.init(0);
-        hasher.update(comparison_key);
-        return std.fmt.allocPrint(self.allocator, "{x}", .{hasher.final()});
+        return workspace_identity.deriveProjectId(self.allocator, path);
     }
 
     fn dupeOptionalSlice(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
