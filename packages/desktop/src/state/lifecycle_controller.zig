@@ -36,17 +36,29 @@ pub const State = struct {
     dirty: bool = false,
     last_dirty_at_ms: i64 = 0,
     last_interaction_at_ms: i64 = 0,
+    /// Monotonic count of markDirty calls; an ack may clear dirty only when no
+    /// mutation arrived after the acked snapshot was built.
+    dirty_generation: u64 = 0,
     /// Worker currently running a daemon snapshot replace for a frame-loop flush.
     flush_in_flight: bool = false,
     flush_worker: ?std.Thread = null,
     flush_result: ?*FlushWorkerResult = null,
     flush_args: ?*FlushWorkerArgs = null,
+    /// dirty_generation at the moment the in-flight worker's snapshot was built.
+    flush_snapshot_generation: u64 = 0,
     /// Earliest wall-clock ms to attempt another frame-loop flush after a failure.
     next_flush_attempt_ms: i64 = 0,
 
     pub fn markDirty(self: *State, now_ms: i64) void {
         self.dirty = true;
         self.last_dirty_at_ms = now_ms;
+        self.dirty_generation +%= 1;
+    }
+
+    /// Clear dirty only if the acked snapshot covered every mutation so far;
+    /// a stale ack leaves dirty set so the next flush picks up the newer state.
+    pub fn clearDirtyForGeneration(self: *State, generation: u64) void {
+        if (self.dirty_generation == generation) self.dirty = false;
     }
 
     pub fn noteInteraction(self: *State, now_ms: i64) void {
@@ -129,6 +141,9 @@ fn scheduleFlushWorker(self: anytype, now_ms: i64) void {
     self.lifecycle.flush_result = result;
     self.lifecycle.flush_args = args;
     self.lifecycle.flush_in_flight = true;
+    // Single-threaded scheduling: the snapshot above covers every mutation
+    // up to this generation, and markDirty cannot interleave within this call.
+    self.lifecycle.flush_snapshot_generation = self.lifecycle.dirty_generation;
 }
 
 fn flushWorkerMain(args: *FlushWorkerArgs) void {
@@ -164,7 +179,7 @@ pub fn pollFlushWorker(self: anytype) void {
 
     const now = platform_runtime.unixTimestampMs();
     if (success) {
-        self.lifecycle.clearDirty();
+        self.lifecycle.clearDirtyForGeneration(self.lifecycle.flush_snapshot_generation);
         self.lifecycle.next_flush_attempt_ms = 0;
     } else {
         log.err("async native state save failed; retaining dirty and backing off", .{});
@@ -184,7 +199,8 @@ pub fn flushDirtyBlocking(self: anytype) void {
         }
         const storage: *const Storage = self.storage;
         if (self.lifecycle.flush_result) |result| {
-            if (result.success) self.lifecycle.clearDirty();
+            if (result.success)
+                self.lifecycle.clearDirtyForGeneration(self.lifecycle.flush_snapshot_generation);
             storage.allocator.destroy(result);
             self.lifecycle.flush_result = null;
         }
@@ -242,6 +258,19 @@ test "lifecycle debounce requires both dirty and interaction quiet periods" {
     try std.testing.expect(state.shouldFlush(950, 750));
     state.clearDirty();
     try std.testing.expect(!state.shouldFlush(2000, 750));
+}
+
+test "stale flush ack does not clear dirty for later mutations" {
+    var state: State = .{};
+    state.markDirty(100);
+    const scheduled_generation = state.dirty_generation;
+    // Mutation lands while the worker is in flight: its ack is stale.
+    state.markDirty(200);
+    state.clearDirtyForGeneration(scheduled_generation);
+    try std.testing.expect(state.dirty);
+    // An ack covering the latest generation clears normally.
+    state.clearDirtyForGeneration(state.dirty_generation);
+    try std.testing.expect(!state.dirty);
 }
 
 test "lifecycle backoff gate skips flush while next_attempt is in the future" {
