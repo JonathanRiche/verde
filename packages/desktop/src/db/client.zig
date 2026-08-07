@@ -1069,11 +1069,12 @@ test "newer schema version is rejected without touching the database" {
     {
         const conn = try testOpenDatabase(testing.allocator, pref_path);
         defer conn.close();
-        try conn.execNoArgs(
+        // Derive the future version so schema-chain growth can't stale this fixture.
+        try conn.execNoArgs(std.fmt.comptimePrint(
             \\create table future_marker (id integer primary key, value text not null);
             \\insert into future_marker (id, value) values (1, 'future data Ω');
-            \\pragma user_version = 3;
-        );
+            \\pragma user_version = {d};
+        , .{schema.MAX_SUPPORTED_VERSION + 1}));
     }
     const before = try tmp.dir.readFileAlloc(testing.io, STATE_DB_NAME, testing.allocator, .unlimited);
     defer testing.allocator.free(before);
@@ -1087,7 +1088,7 @@ test "newer schema version is rejected without touching the database" {
 
     const conn = try testOpenDatabase(testing.allocator, pref_path);
     defer conn.close();
-    try testing.expectEqual(@as(i64, 3), try testUserVersion(conn));
+    try testing.expectEqual(schema.MAX_SUPPORTED_VERSION + 1, try testUserVersion(conn));
     var marker = (try conn.row("select value from future_marker where id = 1", .{})).?;
     defer marker.deinit();
     try testing.expectEqualStrings("future data Ω", marker.text(0));
@@ -1102,11 +1103,12 @@ test "newer WAL schema rejection leaves WAL state untouched" {
 
     const future = try testCreateLegacyWalFixture(pref_path);
     defer future.close();
-    try future.execNoArgs(
+    // Derive the future version so schema-chain growth can't stale this fixture.
+    try future.execNoArgs(std.fmt.comptimePrint(
         \\create table future_marker (id integer primary key, value text not null);
         \\insert into future_marker (id, value) values (1, 'future WAL data Ω');
-        \\pragma user_version = 3;
-    );
+        \\pragma user_version = {d};
+    , .{schema.MAX_SUPPORTED_VERSION + 1}));
     _ = try tmp.dir.statFile(testing.io, STATE_DB_NAME ++ "-wal", .{});
     _ = try tmp.dir.statFile(testing.io, STATE_DB_NAME ++ "-shm", .{});
 
@@ -1127,7 +1129,7 @@ test "newer WAL schema rejection leaves WAL state untouched" {
     // connection, even when the database and WAL receive no writes.
     _ = try tmp.dir.statFile(testing.io, STATE_DB_NAME ++ "-shm", .{});
 
-    try testing.expectEqual(@as(i64, 3), try testUserVersion(future));
+    try testing.expectEqual(schema.MAX_SUPPORTED_VERSION + 1, try testUserVersion(future));
     var marker = (try future.row("select value from future_marker where id = 1", .{})).?;
     defer marker.deinit();
     try testing.expectEqualStrings("future WAL data Ω", marker.text(0));

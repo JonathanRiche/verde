@@ -6,7 +6,7 @@ const zqlite = @import("zqlite");
 /// Latest schema version understood by this build.
 pub const CURRENT_VERSION: i64 = 1;
 /// Maximum schema version understood by read-only clients and the daemon store.
-pub const MAX_SUPPORTED_VERSION: i64 = 2;
+pub const MAX_SUPPORTED_VERSION: i64 = 3;
 /// SQLite busy timeout shared by writer and read-only connections.
 pub const BUSY_TIMEOUT_MS = 5000;
 
@@ -115,8 +115,8 @@ pub fn initialize(conn: zqlite.Conn) !void {
 /// Initialize a writer connection to the requested schema version.
 ///
 /// The normal desktop writer deliberately requests v1. The daemon store is
-/// the only caller that requests v2 while the store remains dormant in
-/// production.
+/// the only caller that requests the newer versions while the store remains
+/// dormant in production.
 pub fn initializeToVersion(conn: zqlite.Conn, target_version: i64) !void {
     if (target_version < CURRENT_VERSION or target_version > MAX_SUPPORTED_VERSION) {
         return error.DatabaseSchemaInvalid;
@@ -177,6 +177,12 @@ fn migrateToVersion(
                 try conn.execNoArgs("pragma user_version = 2");
                 version = 2;
             },
+            2 => {
+                try migrateV2ToV3(conn);
+                if (failure_point == .before_version_bump) return error.TestMigrationFailure;
+                try conn.execNoArgs("pragma user_version = 3");
+                version = 3;
+            },
             else => return error.DatabaseSchemaInvalid,
         }
     }
@@ -211,6 +217,49 @@ fn migrateV1ToV2(conn: zqlite.Conn) !void {
         \\);
         \\create unique index if not exists threads_workspace_local_thread_id_idx
         \\    on threads(workspace_id, local_thread_id) where local_thread_id is not null;
+    );
+}
+
+fn migrateV2ToV3(conn: zqlite.Conn) !void {
+    try conn.execNoArgs(
+        \\create table if not exists workspace_leases (
+        \\    workspace_id text not null,
+        \\    lease_id text not null,
+        \\    owner text not null,
+        \\    client_id text not null,
+        \\    command text not null,
+        \\    resources_json text not null,
+        \\    created_at_ms integer not null,
+        \\    expires_at_ms integer not null,
+        \\    last_renewal_ms integer not null,
+        \\    primary key (workspace_id, lease_id)
+        \\);
+        \\create index if not exists workspace_leases_expires_idx
+        \\    on workspace_leases(expires_at_ms);
+        \\create table if not exists terminal_process_outcomes (
+        \\    workspace_id text not null,
+        \\    process_id text not null,
+        \\    generation integer not null,
+        \\    session_id text not null,
+        \\    command text not null,
+        \\    cwd text not null,
+        \\    pid integer,
+        \\    process_group integer,
+        \\    started_at_ms integer not null,
+        \\    finished_at_ms integer not null,
+        \\    dock_id integer not null,
+        \\    pane_id integer,
+        \\    owner_kind text not null,
+        \\    owner_title text not null,
+        \\    provider text,
+        \\    status text not null,
+        \\    exit_code integer,
+        \\    signal integer,
+        \\    cancellation_reason text,
+        \\    primary key (workspace_id, process_id, generation)
+        \\);
+        \\create index if not exists terminal_process_outcomes_finished_idx
+        \\    on terminal_process_outcomes(finished_at_ms);
     );
 }
 
@@ -277,6 +326,71 @@ pub fn testHasColumn(conn: zqlite.Conn, table_name: []const u8, column_name: []c
     }
     if (rows.err) |err| return err;
     return false;
+}
+
+test "schema migration chain advances v1 to v2 to v3 and preserves populated v2 data" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const path = try std.fs.path.joinZ(std.testing.allocator, &.{ path_buf[0..path_len], "state.sqlite" });
+    defer std.testing.allocator.free(path);
+
+    const conn = try zqlite.open(path, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
+    defer conn.close();
+
+    try migrateToVersion(conn, 1, .none);
+    try std.testing.expectEqual(@as(i64, 1), try userVersion(conn));
+    try conn.execNoArgs(
+        \\insert into app_state (id, selected_workspace_index, sidebar_collapsed) values (1, 0, 0);
+        \\insert into workspaces (workspace_id, sort_index, label, path) values ('chain-workspace', 0, 'Chain', '/chain');
+    );
+
+    try migrateToVersion(conn, 2, .none);
+    try std.testing.expectEqual(@as(i64, 2), try userVersion(conn));
+    try conn.execNoArgs(
+        \\insert into store_receipts (request_key, operation, fingerprint, store_revision, response_payload, response_status)
+        \\values ('chain-key', 'workspace.upsert', 'fingerprint', 1, '{}', 0);
+    );
+
+    try migrateToVersion(conn, 3, .none);
+    try std.testing.expectEqual(@as(i64, 3), try userVersion(conn));
+    try std.testing.expect(try testHasColumn(conn, "workspace_leases", "resources_json"));
+    try std.testing.expect(try testHasColumn(conn, "terminal_process_outcomes", "cancellation_reason"));
+
+    var workspace = (try conn.row("select label from workspaces where workspace_id = 'chain-workspace'", .{})).?;
+    defer workspace.deinit();
+    try std.testing.expectEqualStrings("Chain", workspace.text(0));
+    var receipt = (try conn.row("select response_payload from store_receipts where request_key = 'chain-key'", .{})).?;
+    defer receipt.deinit();
+    try std.testing.expectEqualStrings("{}", receipt.text(0));
+}
+
+test "v2 to v3 migration failure rolls back transfer tables and preserves v2 data" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const path = try std.fs.path.joinZ(std.testing.allocator, &.{ path_buf[0..path_len], "state.sqlite" });
+    defer std.testing.allocator.free(path);
+
+    const conn = try zqlite.open(path, zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode);
+    defer conn.close();
+    try migrateToVersion(conn, 2, .none);
+    try conn.execNoArgs(
+        \\insert into store_receipts (request_key, operation, fingerprint, store_revision, response_payload, response_status)
+        \\values ('rollback-key', 'workspace.upsert', 'fingerprint', 1, '{"ok":true}', 0);
+    );
+
+    try std.testing.expectError(error.TestMigrationFailure, migrateToVersion(conn, 3, .before_version_bump));
+    try std.testing.expectEqual(@as(i64, 2), try userVersion(conn));
+    try std.testing.expect(!try testHasColumn(conn, "workspace_leases", "lease_id"));
+    try std.testing.expect(!try testHasColumn(conn, "terminal_process_outcomes", "process_id"));
+    var receipt = (try conn.row("select response_payload from store_receipts where request_key = 'rollback-key'", .{})).?;
+    defer receipt.deinit();
+    try std.testing.expectEqualStrings("{\"ok\":true}", receipt.text(0));
 }
 
 test "failed migration rolls back schema, version, and data" {
