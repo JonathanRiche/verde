@@ -11,7 +11,8 @@ test {
 test "sessionizer platform boundary compiles" {
     const endpoint = try sessionizer.socketPath(std.testing.allocator, if (builtin.os.tag == .windows) "C:\\verde-test" else "/tmp/verde-test");
     defer std.testing.allocator.free(endpoint);
-    _ = sessionizer.Daemon.init(std.testing.allocator);
+    var daemon = sessionizer.Daemon.init(std.testing.allocator);
+    defer daemon.deinit();
     // Referencing the daemon entry point exercises the platform boundary without
     // starting its blocking accept loop inside the test runner.
     _ = sessionizer.runDaemon;

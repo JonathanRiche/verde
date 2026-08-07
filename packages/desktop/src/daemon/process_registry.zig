@@ -7,6 +7,435 @@ pub const TERMINAL_PROCESS_OUTCOME_TTL_MS: i64 = 15 * std.time.ms_per_min;
 pub const TERMINAL_PROCESS_EXIT_GRACE_MS: i64 = 250;
 pub const WORKSPACE_LEASE_TTL_MS: i64 = 120 * std.time.ms_per_s;
 
+pub const CLIENT_COMPATIBILITY_RETENTION_MS: i64 = 5 * std.time.ms_per_min;
+pub const ORPHAN_GRACE_MS: i64 = 5 * std.time.ms_per_min;
+pub const DISCONNECTED_RETENTION_MS: i64 = 30 * std.time.ms_per_min;
+pub const TURN_ABANDONMENT_GRACE_MS: i64 = 5 * std.time.ms_per_min;
+pub const TURN_RETENTION_TTL_MS: i64 = 15 * std.time.ms_per_min;
+pub const TURN_RETENTION_MAX: usize = 32;
+pub const STALE_ATTACH_TIMEOUT_MS: i64 = 60 * std.time.ms_per_s;
+pub const WORKSPACE_PATH_ALIAS_TTL_MS: i64 = 24 * std.time.ms_per_hour;
+pub const WORKSPACE_PATH_ALIAS_MAX: usize = 16;
+pub const WORKSPACE_PATH_ALIAS_GLOBAL_MAX: usize = 256;
+pub const WORKSPACE_RECORD_MAX: usize = 256;
+pub const NOTIFICATION_MAILBOX_MAX: usize = 64;
+pub const NOTIFICATION_SESSION_MAX: usize = 32;
+pub const NOTIFICATION_GLOBAL_MAX: usize = 256;
+pub const NOTIFICATION_TTL_MS: i64 = 15 * std.time.ms_per_min;
+pub const REGISTRY_JOB_QUEUE_MAX: usize = 64;
+
+// These are mirrored from headless/registry_protocol.zig deliberately.  The
+// daemon registry stays independent of the std-only wire package; W2 projects
+// these records into the protocol DTOs at the transport boundary.
+pub const NOTIFICATION_TYPE_COORDINATION_CONFLICT: []const u8 = "coordination.conflict";
+pub const NOTIFICATION_TITLE_CONFLICTING_COMMAND: []const u8 = "Conflicting command started";
+
+pub const ClientRecord = struct {
+    client_id: []u8,
+    last_heartbeat_ms: i64,
+    persistent: bool = false,
+    compatibility: bool = false,
+    closed: bool = false,
+    closed_at_ms: ?i64 = null,
+
+    pub fn deinit(self: *ClientRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.client_id);
+    }
+};
+
+/// A notification is owned by its workspace mailbox. `command` borrows the
+/// same allocation as `body`, which keeps the daemon and wire shapes aligned
+/// without storing the conflict command twice.
+pub const Notification = struct {
+    seq: u64,
+    type: []const u8 = NOTIFICATION_TYPE_COORDINATION_CONFLICT,
+    workspace_id: []u8,
+    owner_session_id: ?[]u8,
+    title: []const u8 = NOTIFICATION_TITLE_CONFLICTING_COMMAND,
+    body: []u8,
+    command: []const u8,
+    created_at_ms: i64,
+    order_seq: u64,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        seq: u64,
+        workspace_id: []const u8,
+        owner_session_id: []const u8,
+        command: []const u8,
+        created_at_ms: i64,
+        order_seq: u64,
+    ) !Notification {
+        const owned_workspace_id = try allocator.dupe(u8, workspace_id);
+        errdefer allocator.free(owned_workspace_id);
+        const owned_owner = try allocator.dupe(u8, owner_session_id);
+        errdefer allocator.free(owned_owner);
+        const body = try allocator.dupe(u8, command);
+        return .{
+            .seq = seq,
+            .workspace_id = owned_workspace_id,
+            .owner_session_id = owned_owner,
+            .body = body,
+            .command = body,
+            .created_at_ms = created_at_ms,
+            .order_seq = order_seq,
+        };
+    }
+
+    pub fn deinit(self: *Notification, allocator: std.mem.Allocator) void {
+        allocator.free(self.workspace_id);
+        if (self.owner_session_id) |owner| allocator.free(owner);
+        allocator.free(self.body);
+    }
+};
+
+pub const RegistryNotification = Notification;
+
+/// Pull-only bounded mailbox for one workspace. Entries are filtered by the
+/// affected owner/session at read time, while `seq` remains a workspace-local
+/// cursor that never moves backwards when old entries are evicted.
+pub const NotificationMailbox = struct {
+    entries: std.ArrayList(Notification) = .empty,
+    next_seq: u64 = 1,
+    max_entries: usize = NOTIFICATION_MAILBOX_MAX,
+    max_entries_per_session: usize = NOTIFICATION_SESSION_MAX,
+
+    pub fn deinit(self: *NotificationMailbox, allocator: std.mem.Allocator) void {
+        for (self.entries.items) |*entry| entry.deinit(allocator);
+        self.entries.deinit(allocator);
+    }
+
+    pub fn append(
+        self: *NotificationMailbox,
+        allocator: std.mem.Allocator,
+        workspace_id: []const u8,
+        owner_session_id: []const u8,
+        command: []const u8,
+        created_at_ms: i64,
+        order_seq: u64,
+    ) !usize {
+        if (owner_session_id.len == 0) return error.NotificationOwnerRequired;
+        if (command.len == 0) return error.NotificationBodyRequired;
+
+        var removed_count: usize = 0;
+        while (self.sessionCount(owner_session_id) >= self.max_entries_per_session) {
+            if (!self.removeOldestForSession(allocator, owner_session_id)) break;
+            removed_count += 1;
+        }
+        while (self.entries.items.len >= self.max_entries) {
+            self.removeOldest(allocator);
+            removed_count += 1;
+        }
+
+        var entry = try Notification.init(
+            allocator,
+            self.next_seq,
+            workspace_id,
+            owner_session_id,
+            command,
+            created_at_ms,
+            order_seq,
+        );
+        errdefer entry.deinit(allocator);
+        try self.entries.append(allocator, entry);
+        self.next_seq +%= 1;
+        if (self.next_seq == 0) self.next_seq = 1;
+        return removed_count;
+    }
+
+    /// Append borrowed entry pointers matching a session and cursor. The
+    /// pointers are invalidated by the next mailbox mutation.
+    pub fn collect(
+        self: *const NotificationMailbox,
+        allocator: std.mem.Allocator,
+        owner_session_id: ?[]const u8,
+        after_seq: u64,
+        limit: usize,
+        out: *std.ArrayList(*const Notification),
+    ) !u64 {
+        var collected: usize = 0;
+        for (self.entries.items) |*entry| {
+            if (entry.seq <= after_seq) continue;
+            if (owner_session_id) |owner| {
+                if (entry.owner_session_id == null or !std.mem.eql(u8, entry.owner_session_id.?, owner)) continue;
+            }
+            if (limit != 0 and collected >= limit) break;
+            try out.append(allocator, entry);
+            collected += 1;
+        }
+        return self.next_seq;
+    }
+
+    pub fn pruneExpired(self: *NotificationMailbox, allocator: std.mem.Allocator, now_ms: i64) usize {
+        var removed_count: usize = 0;
+        var index: usize = 0;
+        while (index < self.entries.items.len) {
+            const created_at_ms = self.entries.items[index].created_at_ms;
+            if (now_ms < created_at_ms or now_ms - created_at_ms <= NOTIFICATION_TTL_MS) {
+                index += 1;
+                continue;
+            }
+            self.removeAt(allocator, index);
+            removed_count += 1;
+        }
+        return removed_count;
+    }
+
+    fn sessionCount(self: *const NotificationMailbox, owner_session_id: []const u8) usize {
+        var count: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.owner_session_id) |owner| {
+                if (std.mem.eql(u8, owner, owner_session_id)) count += 1;
+            }
+        }
+        return count;
+    }
+
+    fn removeOldestForSession(self: *NotificationMailbox, allocator: std.mem.Allocator, owner_session_id: []const u8) bool {
+        for (self.entries.items, 0..) |entry, index| {
+            if (entry.owner_session_id) |owner| {
+                if (std.mem.eql(u8, owner, owner_session_id)) {
+                    self.removeAt(allocator, index);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    fn removeOldest(self: *NotificationMailbox, allocator: std.mem.Allocator) void {
+        if (self.entries.items.len == 0) return;
+        self.removeAt(allocator, 0);
+    }
+
+    fn removeAt(self: *NotificationMailbox, allocator: std.mem.Allocator, index: usize) void {
+        var removed = self.entries.orderedRemove(index);
+        removed.deinit(allocator);
+    }
+};
+
+pub const ManagedProcessRuntimeState = enum {
+    configured,
+    starting,
+    running,
+    stopped,
+    failed,
+};
+
+pub const ManagedProcessRuntimeEvent = enum {
+    start,
+    started,
+    stop,
+    stopped,
+    failed,
+    restart,
+};
+
+/// Pure managed-process lifecycle. It records intent and observations only;
+/// spawning, waiting, and I/O remain owned by the session daemon.
+pub const ManagedProcessRuntime = struct {
+    state: ManagedProcessRuntimeState = .configured,
+    restart_count: u32 = 0,
+    explicit_stop: bool = false,
+    generation: u64 = 0,
+    last_start_ms: ?i64 = null,
+    last_exit_ms: ?i64 = null,
+
+    pub fn transition(self: *ManagedProcessRuntime, event: ManagedProcessRuntimeEvent, now_ms: i64) !void {
+        switch (event) {
+            .start => switch (self.state) {
+                .configured, .stopped, .failed => self.beginStart(now_ms),
+                .starting, .running => return error.InvalidManagedProcessTransition,
+            },
+            .restart => switch (self.state) {
+                .stopped, .failed, .running => {
+                    self.restart_count +%= 1;
+                    self.beginStart(now_ms);
+                },
+                .configured, .starting => return error.InvalidManagedProcessTransition,
+            },
+            .started => {
+                if (self.state != .starting) return error.InvalidManagedProcessTransition;
+                self.state = .running;
+            },
+            .stop => switch (self.state) {
+                .starting, .running => {
+                    self.explicit_stop = true;
+                    self.state = .stopped;
+                    self.last_exit_ms = now_ms;
+                },
+                .configured, .stopped, .failed => return error.InvalidManagedProcessTransition,
+            },
+            .stopped => switch (self.state) {
+                .starting, .running => {
+                    self.state = .stopped;
+                    self.last_exit_ms = now_ms;
+                },
+                .configured, .stopped, .failed => return error.InvalidManagedProcessTransition,
+            },
+            .failed => switch (self.state) {
+                .starting, .running => {
+                    self.state = .failed;
+                    self.last_exit_ms = now_ms;
+                },
+                .configured, .stopped, .failed => return error.InvalidManagedProcessTransition,
+            },
+        }
+    }
+
+    fn beginStart(self: *ManagedProcessRuntime, now_ms: i64) void {
+        self.state = .starting;
+        self.explicit_stop = false;
+        self.last_start_ms = now_ms;
+        self.generation +%= 1;
+        if (self.generation == 0) self.generation = 1;
+    }
+};
+
+pub const WorkspacePathAlias = struct {
+    path: []u8,
+    last_seen_ms: i64,
+
+    fn deinit(self: *WorkspacePathAlias, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+    }
+};
+
+pub const RetainedTurnState = enum {
+    running,
+    approval_waiting,
+    completed,
+};
+
+pub const RetainedTurn = struct {
+    id: []u8,
+    workspace_id: []u8,
+    state: RetainedTurnState,
+    abandoned_at_ms: i64,
+
+    pub fn init(allocator: std.mem.Allocator, workspace_id: []const u8, id: []const u8, state: RetainedTurnState, abandoned_at_ms: i64) !RetainedTurn {
+        const owned_workspace_id = try allocator.dupe(u8, workspace_id);
+        errdefer allocator.free(owned_workspace_id);
+        const owned_id = try allocator.dupe(u8, id);
+        return .{
+            .id = owned_id,
+            .workspace_id = owned_workspace_id,
+            .state = state,
+            .abandoned_at_ms = abandoned_at_ms,
+        };
+    }
+
+    pub fn deinit(self: *RetainedTurn, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.workspace_id);
+    }
+};
+
+pub const RegistryReapCounts = struct {
+    aliases: usize = 0,
+    notifications: usize = 0,
+    turns: usize = 0,
+    outcomes: usize = 0,
+    leases: usize = 0,
+    workspaces: usize = 0,
+};
+
+pub fn orphanGraceExpired(orphaned_at_ms: i64, now_ms: i64) bool {
+    return retentionExpired(orphaned_at_ms, now_ms, ORPHAN_GRACE_MS);
+}
+
+pub fn disconnectedRetentionExpired(last_heartbeat_ms: i64, now_ms: i64, persistent: bool) bool {
+    return !persistent and retentionExpired(last_heartbeat_ms, now_ms, DISCONNECTED_RETENTION_MS);
+}
+
+pub fn turnAbandonmentExpired(abandoned_at_ms: i64, now_ms: i64, state: RetainedTurnState) bool {
+    const ttl = switch (state) {
+        .running, .approval_waiting => TURN_ABANDONMENT_GRACE_MS,
+        .completed => TURN_RETENTION_TTL_MS,
+    };
+    return retentionExpired(abandoned_at_ms, now_ms, ttl);
+}
+
+pub fn staleAttachExpired(last_attach_ms: i64, now_ms: i64) bool {
+    return retentionExpired(last_attach_ms, now_ms, STALE_ATTACH_TIMEOUT_MS);
+}
+
+pub const RegistryJobKind = enum {
+    load_config,
+    start_managed_process,
+    stop_managed_process,
+    restart_managed_process,
+    fanout_notification,
+};
+
+pub const RegistryJob = struct {
+    kind: RegistryJobKind,
+    workspace_id: []u8 = &.{},
+    process_id: []u8 = &.{},
+    client_id: []u8 = &.{},
+
+    pub fn init(allocator: std.mem.Allocator, kind: RegistryJobKind, workspace_id: []const u8, process_id: []const u8, client_id: []const u8) !RegistryJob {
+        const owned_workspace_id = try allocator.dupe(u8, workspace_id);
+        errdefer allocator.free(owned_workspace_id);
+        const owned_process_id = try allocator.dupe(u8, process_id);
+        errdefer allocator.free(owned_process_id);
+        const owned_client_id = try allocator.dupe(u8, client_id);
+        return .{
+            .kind = kind,
+            .workspace_id = owned_workspace_id,
+            .process_id = owned_process_id,
+            .client_id = owned_client_id,
+        };
+    }
+
+    pub fn deinit(self: *RegistryJob, allocator: std.mem.Allocator) void {
+        if (self.workspace_id.len != 0) allocator.free(self.workspace_id);
+        if (self.process_id.len != 0) allocator.free(self.process_id);
+        if (self.client_id.len != 0) allocator.free(self.client_id);
+    }
+};
+
+/// Bounded FIFO used to hand slow registry work to an unlocked worker.
+pub const RegistryJobQueue = struct {
+    jobs: std.ArrayList(RegistryJob) = .empty,
+    capacity: usize = REGISTRY_JOB_QUEUE_MAX,
+
+    pub fn init(capacity: usize) !RegistryJobQueue {
+        if (capacity == 0) return error.JobQueueCapacityRequired;
+        return .{ .capacity = capacity };
+    }
+
+    pub fn deinit(self: *RegistryJobQueue, allocator: std.mem.Allocator) void {
+        for (self.jobs.items) |*job| job.deinit(allocator);
+        self.jobs.deinit(allocator);
+    }
+
+    pub fn push(self: *RegistryJobQueue, allocator: std.mem.Allocator, job: RegistryJob) !void {
+        if (self.jobs.items.len >= self.capacity) return error.JobQueueFull;
+        var owned_job = job;
+        errdefer owned_job.deinit(allocator);
+        try self.jobs.append(allocator, owned_job);
+    }
+
+    pub fn take(self: *RegistryJobQueue) ?RegistryJob {
+        if (self.jobs.items.len == 0) return null;
+        return self.jobs.orderedRemove(0);
+    }
+
+    pub fn peek(self: *const RegistryJobQueue) ?*const RegistryJob {
+        if (self.jobs.items.len == 0) return null;
+        return &self.jobs.items[0];
+    }
+
+    pub fn len(self: *const RegistryJobQueue) usize {
+        return self.jobs.items.len;
+    }
+
+    pub fn isFull(self: *const RegistryJobQueue) bool {
+        return self.jobs.items.len >= self.capacity;
+    }
+};
+
 pub const CommandClass = enum {
     other,
     build,
@@ -132,6 +561,10 @@ pub const ManagedProcess = struct {
     last_start_ms: i64 = 0,
     last_exit_ms: i64 = 0,
     explicit_stop: bool = false,
+    restart_count: u32 = 0,
+    runtime_state: ManagedProcessRuntimeState = .configured,
+    runtime: ManagedProcessRuntime = .{},
+    session_id: ?[]u8 = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -166,6 +599,25 @@ pub const ManagedProcess = struct {
         allocator.free(self.command);
         allocator.free(self.cwd);
         deinitOwnedStringList(allocator, &self.resources);
+        if (self.session_id) |session_id| allocator.free(session_id);
+    }
+
+    /// Apply an observed lifecycle event and mirror the pure runtime state in
+    /// the legacy managed-process fields used by the desktop projection.
+    pub fn transition(self: *ManagedProcess, event: ManagedProcessRuntimeEvent, now_ms: i64) !void {
+        try self.runtime.transition(event, now_ms);
+        self.runtime_state = self.runtime.state;
+        self.generation = self.runtime.generation;
+        self.restart_count = self.runtime.restart_count;
+        self.explicit_stop = self.runtime.explicit_stop;
+        if (self.runtime.last_start_ms) |last_start_ms| self.last_start_ms = last_start_ms;
+        if (self.runtime.last_exit_ms) |last_exit_ms| self.last_exit_ms = last_exit_ms;
+        self.status = switch (self.runtime.state) {
+            .configured, .stopped => .stopped,
+            .starting => .starting,
+            .running => .running,
+            .failed => .crashed,
+        };
     }
 };
 
@@ -458,11 +910,16 @@ pub const LeaseAcquireResult = struct {
 
 pub const WorkspaceRecord = struct {
     id: []u8,
+    canonical_path: ?[]u8 = null,
+    path_aliases: std.ArrayList(WorkspacePathAlias) = .empty,
+    last_seen_ms: i64 = 0,
     managed_processes: std.ArrayList(ManagedProcess) = .empty,
     tracked_terminal_processes: std.ArrayList(TrackedTerminalProcess) = .empty,
     external_processes: std.ArrayList(ExternalProcess) = .empty,
     terminal_process_outcomes: std.ArrayList(TerminalProcessOutcome) = .empty,
     leases: std.ArrayList(LeaseRecord) = .empty,
+    notifications: NotificationMailbox = .{},
+    retained_turns: std.ArrayList(RetainedTurn) = .empty,
     next_terminal_generation: u64 = 1,
 
     fn init(allocator: std.mem.Allocator, id: []const u8) !WorkspaceRecord {
@@ -471,6 +928,9 @@ pub const WorkspaceRecord = struct {
 
     fn deinit(self: *WorkspaceRecord, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
+        if (self.canonical_path) |path| allocator.free(path);
+        for (self.path_aliases.items) |*alias| alias.deinit(allocator);
+        self.path_aliases.deinit(allocator);
         for (self.managed_processes.items) |*process| process.deinit(allocator);
         self.managed_processes.deinit(allocator);
         for (self.tracked_terminal_processes.items) |*process| process.deinit(allocator);
@@ -481,6 +941,9 @@ pub const WorkspaceRecord = struct {
         self.terminal_process_outcomes.deinit(allocator);
         for (self.leases.items) |*lease| lease.deinit(allocator);
         self.leases.deinit(allocator);
+        self.notifications.deinit(allocator);
+        for (self.retained_turns.items) |*turn| turn.deinit(allocator);
+        self.retained_turns.deinit(allocator);
     }
 };
 
@@ -493,6 +956,11 @@ pub const ProcessRegistry = struct {
     /// instance nonce changes and is never durable state.
     registry_revision: u64 = 0,
     workspaces: std.ArrayList(WorkspaceRecord) = .empty,
+    clients: std.StringHashMapUnmanaged(ClientRecord) = .empty,
+    next_client_counter: u64 = 1,
+    notification_count: usize = 0,
+    notification_global_cap: usize = NOTIFICATION_GLOBAL_MAX,
+    next_notification_order: u64 = 1,
 
     pub fn init(allocator: std.mem.Allocator, instance_nonce: []const u8) !ProcessRegistry {
         if (instance_nonce.len == 0) return error.InstanceNonceRequired;
@@ -503,6 +971,12 @@ pub const ProcessRegistry = struct {
         allocator.free(self.instance_nonce);
         for (self.workspaces.items) |*workspace_record| workspace_record.deinit(allocator);
         self.workspaces.deinit(allocator);
+        var client_iterator = self.clients.iterator();
+        while (client_iterator.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(allocator);
+        }
+        self.clients.deinit(allocator);
     }
 
     /// Returns a borrowed workspace record. The pointer is invalidated by any
@@ -515,17 +989,404 @@ pub const ProcessRegistry = struct {
         return null;
     }
 
+    /// Return a borrowed client record. The pointer is invalidated by a later
+    /// client registration or removal.
+    pub fn client(self: *ProcessRegistry, client_id: []const u8) ?*ClientRecord {
+        return self.clients.getPtr(client_id);
+    }
+
+    /// Issue a daemon-scoped opaque client ID. The nonce is part of the ID so
+    /// a client from a previous daemon instance cannot be mistaken for live
+    /// state in this registry.
+    pub fn registerClient(self: *ProcessRegistry, allocator: std.mem.Allocator, persistent: bool, now_ms: i64) !*ClientRecord {
+        const client_id = try std.fmt.allocPrint(allocator, "client:{s}:{d}", .{ self.instance_nonce, self.next_client_counter });
+        errdefer allocator.free(client_id);
+        self.next_client_counter +%= 1;
+        if (self.next_client_counter == 0) self.next_client_counter = 1;
+
+        const key = try allocator.dupe(u8, client_id);
+        errdefer allocator.free(key);
+        try self.clients.put(allocator, key, .{
+            .client_id = client_id,
+            .last_heartbeat_ms = now_ms,
+            .persistent = persistent,
+        });
+        self.bumpRevision();
+        return self.clients.getPtr(client_id).?;
+    }
+
+    pub fn heartbeatClient(self: *ProcessRegistry, client_id: []const u8, now_ms: i64) bool {
+        const record = self.client(client_id) orelse return false;
+        if (record.closed) return false;
+        record.last_heartbeat_ms = now_ms;
+        self.bumpRevision();
+        return true;
+    }
+
+    pub fn closeClient(self: *ProcessRegistry, client_id: []const u8, now_ms: i64) bool {
+        const record = self.client(client_id) orelse return false;
+        if (record.closed) return false;
+        record.closed = true;
+        record.closed_at_ms = now_ms;
+        self.bumpRevision();
+        return true;
+    }
+
+    /// Derive a stable compatibility ID for legacy owner/session callers.
+    /// The owner itself is never used as a client ID on the wire.
+    pub fn deriveCompatibilityClientId(allocator: std.mem.Allocator, owner: []const u8) ![]u8 {
+        if (owner.len == 0) return error.ClientOwnerRequired;
+        return std.fmt.allocPrint(allocator, "compat:{x}", .{std.hash.Wyhash.hash(0, owner)});
+    }
+
+    /// Register or refresh the short-lived compatibility client associated
+    /// with an owner string. The returned record is borrowed from the map.
+    pub fn ensureCompatibilityClient(self: *ProcessRegistry, allocator: std.mem.Allocator, owner: []const u8, now_ms: i64) !*ClientRecord {
+        const derived_id = try deriveCompatibilityClientId(allocator, owner);
+        defer allocator.free(derived_id);
+        if (self.client(derived_id)) |record| {
+            record.last_heartbeat_ms = now_ms;
+            record.closed = false;
+            record.closed_at_ms = null;
+            return record;
+        }
+
+        const client_id = try allocator.dupe(u8, derived_id);
+        errdefer allocator.free(client_id);
+        const key = try allocator.dupe(u8, derived_id);
+        errdefer allocator.free(key);
+        try self.clients.put(allocator, key, .{
+            .client_id = client_id,
+            .last_heartbeat_ms = now_ms,
+            .compatibility = true,
+        });
+        self.bumpRevision();
+        return self.client(derived_id).?;
+    }
+
+    /// Look up a path alias without creating a second workspace identity.
+    pub fn workspaceByPath(self: *ProcessRegistry, allocator: std.mem.Allocator, path: []const u8, now_ms: i64) ?*WorkspaceRecord {
+        if (path.len == 0) return null;
+        _ = self.pruneWorkspacePathAliases(allocator, now_ms);
+        for (self.workspaces.items) |*workspace_record| {
+            if (workspace_record.canonical_path) |canonical_path| {
+                if (std.mem.eql(u8, canonical_path, path)) {
+                    workspace_record.last_seen_ms = now_ms;
+                    return workspace_record;
+                }
+            }
+            for (workspace_record.path_aliases.items) |*alias| {
+                if (std.mem.eql(u8, alias.path, path)) {
+                    alias.last_seen_ms = now_ms;
+                    workspace_record.last_seen_ms = now_ms;
+                    return workspace_record;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Record a canonical path or lookup alias. A path already owned by a
+    /// different workspace is rejected instead of being silently reassigned.
+    pub fn registerWorkspacePath(self: *ProcessRegistry, allocator: std.mem.Allocator, workspace_id: []const u8, path: []const u8, now_ms: i64) !*WorkspaceRecord {
+        if (path.len == 0) return error.WorkspacePathRequired;
+        _ = self.pruneWorkspacePathAliases(allocator, now_ms);
+        for (self.workspaces.items) |candidate| {
+            if (std.mem.eql(u8, candidate.id, workspace_id)) continue;
+            if (candidate.canonical_path) |canonical_path| {
+                if (std.mem.eql(u8, canonical_path, path)) return error.WorkspacePathMapsToDifferentId;
+            }
+            for (candidate.path_aliases.items) |alias| {
+                if (std.mem.eql(u8, alias.path, path)) return error.WorkspacePathMapsToDifferentId;
+            }
+        }
+        const workspace_record = try self.ensureWorkspace(allocator, workspace_id);
+
+        for (self.workspaces.items) |*candidate| {
+            if (std.mem.eql(u8, candidate.id, workspace_record.id)) continue;
+            if (candidate.canonical_path) |canonical_path| {
+                if (std.mem.eql(u8, canonical_path, path)) return error.WorkspacePathMapsToDifferentId;
+            }
+            for (candidate.path_aliases.items) |alias| {
+                if (std.mem.eql(u8, alias.path, path)) return error.WorkspacePathMapsToDifferentId;
+            }
+        }
+
+        if (workspace_record.canonical_path) |canonical_path| {
+            if (std.mem.eql(u8, canonical_path, path)) {
+                workspace_record.last_seen_ms = now_ms;
+                self.bumpRevision();
+                return workspace_record;
+            }
+        } else {
+            workspace_record.canonical_path = try allocator.dupe(u8, path);
+            workspace_record.last_seen_ms = now_ms;
+            self.bumpRevision();
+            return workspace_record;
+        }
+
+        for (workspace_record.path_aliases.items) |*alias| {
+            if (std.mem.eql(u8, alias.path, path)) {
+                alias.last_seen_ms = now_ms;
+                workspace_record.last_seen_ms = now_ms;
+                self.bumpRevision();
+                return workspace_record;
+            }
+        }
+
+        while (workspace_record.path_aliases.items.len >= WORKSPACE_PATH_ALIAS_MAX) {
+            var removed = workspace_record.path_aliases.orderedRemove(0);
+            removed.deinit(allocator);
+        }
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+        try workspace_record.path_aliases.append(allocator, .{
+            .path = owned_path,
+            .last_seen_ms = now_ms,
+        });
+        workspace_record.last_seen_ms = now_ms;
+        _ = self.pruneWorkspacePathAliasesToCap(allocator);
+        self.bumpRevision();
+        return workspace_record;
+    }
+
     /// Returns a borrowed workspace record. The pointer is invalidated by a
     /// later registry mutation, so phase-2 callers must copy data while holding
     /// the registry lock/queue.
     pub fn ensureWorkspace(self: *ProcessRegistry, allocator: std.mem.Allocator, workspace_id: []const u8) !*WorkspaceRecord {
         if (workspace_id.len == 0) return error.WorkspaceIdRequired;
         if (self.workspace(workspace_id)) |workspace_record| return workspace_record;
+        _ = self.evictIdleWorkspaces(allocator, 0);
+        if (self.workspaces.items.len >= WORKSPACE_RECORD_MAX) return error.WorkspaceCapacityExceeded;
         var workspace_record = try WorkspaceRecord.init(allocator, workspace_id);
         errdefer workspace_record.deinit(allocator);
         try self.workspaces.append(allocator, workspace_record);
         self.bumpRevision();
         return &self.workspaces.items[self.workspaces.items.len - 1];
+    }
+
+    /// Append one pull-only notification without revoking or changing any
+    /// lease. Callers that are already publishing a larger mutation can use
+    /// `appendNotificationInternal` and bump the revision once for the batch.
+    pub fn queueNotification(
+        self: *ProcessRegistry,
+        allocator: std.mem.Allocator,
+        workspace_id: []const u8,
+        owner_session_id: []const u8,
+        command: []const u8,
+        now_ms: i64,
+    ) !void {
+        try self.appendNotificationInternal(allocator, workspace_id, owner_session_id, command, now_ms);
+        self.bumpRevision();
+    }
+
+    /// Collect borrowed notification pointers for a workspace/session cursor.
+    /// The returned cursor is the next sequence number, including evicted
+    /// entries, so a client can persist it without observing gaps as errors.
+    pub fn collectNotifications(
+        self: *ProcessRegistry,
+        allocator: std.mem.Allocator,
+        workspace_id: []const u8,
+        owner_session_id: ?[]const u8,
+        after_seq: u64,
+        limit: usize,
+        out: *std.ArrayList(*const Notification),
+    ) !u64 {
+        const workspace_record = self.workspace(workspace_id) orelse return 0;
+        return workspace_record.notifications.collect(allocator, owner_session_id, after_seq, limit, out);
+    }
+
+    pub fn pruneNotifications(self: *ProcessRegistry, allocator: std.mem.Allocator, now_ms: i64) usize {
+        var removed_count: usize = 0;
+        for (self.workspaces.items) |*workspace_record| {
+            removed_count += workspace_record.notifications.pruneExpired(allocator, now_ms);
+        }
+        if (removed_count != 0) {
+            self.notification_count -|= removed_count;
+            self.bumpRevision();
+        }
+        return removed_count;
+    }
+
+    pub fn retainTurn(self: *ProcessRegistry, allocator: std.mem.Allocator, workspace_id: []const u8, turn_id: []const u8, state: RetainedTurnState, abandoned_at_ms: i64) !void {
+        const workspace_record = try self.ensureWorkspace(allocator, workspace_id);
+        var retained_turn = try RetainedTurn.init(allocator, workspace_id, turn_id, state, abandoned_at_ms);
+        errdefer retained_turn.deinit(allocator);
+        try workspace_record.retained_turns.append(allocator, retained_turn);
+        while (workspace_record.retained_turns.items.len > TURN_RETENTION_MAX) {
+            var removed = workspace_record.retained_turns.orderedRemove(0);
+            removed.deinit(allocator);
+        }
+        self.bumpRevision();
+    }
+
+    pub fn reapRetainedTurns(self: *ProcessRegistry, allocator: std.mem.Allocator, now_ms: i64) usize {
+        var removed_count: usize = 0;
+        for (self.workspaces.items) |*workspace_record| {
+            var index: usize = 0;
+            while (index < workspace_record.retained_turns.items.len) {
+                const turn = workspace_record.retained_turns.items[index];
+                if (!retainedTurnExpired(turn, now_ms)) {
+                    index += 1;
+                    continue;
+                }
+                var removed = workspace_record.retained_turns.orderedRemove(index);
+                removed.deinit(allocator);
+                removed_count += 1;
+            }
+        }
+        if (removed_count != 0) self.bumpRevision();
+        return removed_count;
+    }
+
+    /// Run all clock-driven bounded cleanup rules owned by this module.
+    pub fn reap(self: *ProcessRegistry, allocator: std.mem.Allocator, now_ms: i64) RegistryReapCounts {
+        var counts: RegistryReapCounts = .{};
+        counts.aliases = self.pruneWorkspacePathAliases(allocator, now_ms);
+        counts.notifications = self.pruneNotifications(allocator, now_ms);
+        counts.turns = self.reapRetainedTurns(allocator, now_ms);
+        for (self.workspaces.items) |workspace_record| {
+            counts.outcomes += self.pruneTerminalProcessOutcomes(allocator, workspace_record.id, now_ms);
+            counts.leases += self.pruneExpiredLeases(allocator, workspace_record.id, now_ms);
+        }
+        counts.workspaces = self.evictIdleWorkspaces(allocator, now_ms);
+        return counts;
+    }
+
+    pub fn evictIdleWorkspaces(self: *ProcessRegistry, allocator: std.mem.Allocator, now_ms: i64) usize {
+        _ = self.pruneWorkspacePathAliases(allocator, now_ms);
+        var removed_count: usize = 0;
+        var index: usize = 0;
+        while (index < self.workspaces.items.len) {
+            const workspace_record = &self.workspaces.items[index];
+            if (workspaceRecordHasLiveReferences(workspace_record) or !retentionExpired(workspace_record.last_seen_ms, now_ms, WORKSPACE_PATH_ALIAS_TTL_MS)) {
+                index += 1;
+                continue;
+            }
+            self.removeWorkspaceAt(allocator, index);
+            removed_count += 1;
+        }
+
+        while (self.workspaces.items.len > WORKSPACE_RECORD_MAX) {
+            const index_to_remove = self.oldestEvictableWorkspaceIndex();
+            if (index_to_remove == null) break;
+            self.removeWorkspaceAt(allocator, index_to_remove.?);
+            removed_count += 1;
+        }
+        if (removed_count != 0) self.bumpRevision();
+        return removed_count;
+    }
+
+    fn appendNotificationInternal(
+        self: *ProcessRegistry,
+        allocator: std.mem.Allocator,
+        workspace_id: []const u8,
+        owner_session_id: []const u8,
+        command: []const u8,
+        now_ms: i64,
+    ) !void {
+        const workspace_record = try self.ensureWorkspace(allocator, workspace_id);
+        const removed_count = try workspace_record.notifications.append(
+            allocator,
+            workspace_id,
+            owner_session_id,
+            command,
+            now_ms,
+            self.next_notification_order,
+        );
+        self.notification_count -|= removed_count;
+        self.notification_count += 1;
+        self.next_notification_order +%= 1;
+        if (self.next_notification_order == 0) self.next_notification_order = 1;
+        self.pruneNotificationsToGlobalCap(allocator);
+    }
+
+    fn pruneNotificationsToGlobalCap(self: *ProcessRegistry, allocator: std.mem.Allocator) void {
+        while (self.notification_count > self.notification_global_cap) {
+            var oldest_workspace_index: ?usize = null;
+            var oldest_entry_index: ?usize = null;
+            var oldest_order_seq: u64 = std.math.maxInt(u64);
+            for (self.workspaces.items, 0..) |workspace_record, workspace_index| {
+                for (workspace_record.notifications.entries.items, 0..) |entry, entry_index| {
+                    if (entry.order_seq < oldest_order_seq) {
+                        oldest_order_seq = entry.order_seq;
+                        oldest_workspace_index = workspace_index;
+                        oldest_entry_index = entry_index;
+                    }
+                }
+            }
+            if (oldest_workspace_index == null or oldest_entry_index == null) break;
+            self.workspaces.items[oldest_workspace_index.?].notifications.removeAt(allocator, oldest_entry_index.?);
+            self.notification_count -= 1;
+        }
+    }
+
+    fn pruneWorkspacePathAliases(self: *ProcessRegistry, allocator: std.mem.Allocator, now_ms: i64) usize {
+        var removed_count: usize = 0;
+        for (self.workspaces.items) |*workspace_record| {
+            var index: usize = 0;
+            while (index < workspace_record.path_aliases.items.len) {
+                const alias = workspace_record.path_aliases.items[index];
+                if (!retentionExpired(alias.last_seen_ms, now_ms, WORKSPACE_PATH_ALIAS_TTL_MS)) {
+                    index += 1;
+                    continue;
+                }
+                var removed = workspace_record.path_aliases.orderedRemove(index);
+                removed.deinit(allocator);
+                removed_count += 1;
+            }
+        }
+        removed_count += self.pruneWorkspacePathAliasesToCap(allocator);
+        return removed_count;
+    }
+
+    fn pruneWorkspacePathAliasesToCap(self: *ProcessRegistry, allocator: std.mem.Allocator) usize {
+        var total = self.pathAliasCount();
+        var removed_count: usize = 0;
+        while (total > WORKSPACE_PATH_ALIAS_GLOBAL_MAX) {
+            var oldest_workspace_index: ?usize = null;
+            var oldest_alias_index: ?usize = null;
+            var oldest_seen_ms: i64 = std.math.maxInt(i64);
+            for (self.workspaces.items, 0..) |workspace_record, workspace_index| {
+                for (workspace_record.path_aliases.items, 0..) |alias, alias_index| {
+                    if (alias.last_seen_ms < oldest_seen_ms) {
+                        oldest_seen_ms = alias.last_seen_ms;
+                        oldest_workspace_index = workspace_index;
+                        oldest_alias_index = alias_index;
+                    }
+                }
+            }
+            if (oldest_workspace_index == null or oldest_alias_index == null) break;
+            var removed = self.workspaces.items[oldest_workspace_index.?].path_aliases.orderedRemove(oldest_alias_index.?);
+            removed.deinit(allocator);
+            total -= 1;
+            removed_count += 1;
+        }
+        return removed_count;
+    }
+
+    fn pathAliasCount(self: *const ProcessRegistry) usize {
+        var count: usize = 0;
+        for (self.workspaces.items) |workspace_record| count += workspace_record.path_aliases.items.len;
+        return count;
+    }
+
+    fn oldestEvictableWorkspaceIndex(self: *const ProcessRegistry) ?usize {
+        var oldest_index: ?usize = null;
+        var oldest_seen_ms: i64 = std.math.maxInt(i64);
+        for (self.workspaces.items, 0..) |workspace_record, index| {
+            if (workspaceRecordHasLiveReferences(&workspace_record)) continue;
+            if (workspace_record.last_seen_ms < oldest_seen_ms) {
+                oldest_seen_ms = workspace_record.last_seen_ms;
+                oldest_index = index;
+            }
+        }
+        return oldest_index;
+    }
+
+    fn removeWorkspaceAt(self: *ProcessRegistry, allocator: std.mem.Allocator, index: usize) void {
+        var removed = self.workspaces.orderedRemove(index);
+        removed.deinit(allocator);
     }
 
     /// Replaces the daemon namespace after a restart. Existing records remain
@@ -536,6 +1397,7 @@ pub const ProcessRegistry = struct {
         allocator.free(self.instance_nonce);
         self.instance_nonce = replacement;
         self.next_lease_counter = 1;
+        self.next_client_counter = 1;
         self.registry_revision = 0;
     }
 
@@ -589,6 +1451,12 @@ pub const ProcessRegistry = struct {
             &renewal_handler,
             &conflict_observer,
         );
+        if (force) {
+            for (result.affected_agents.items, 0..) |affected, index| {
+                if (notificationOwnerAlreadyQueued(result.affected_agents.items[0..index], affected.owner)) continue;
+                try self.appendNotificationInternal(allocator, workspace_id, affected.owner, command, now_ms);
+            }
+        }
         self.bumpRevision();
         result.lease = &workspace_record.leases.items[lease_index];
         return result;
@@ -760,8 +1628,22 @@ pub const ProcessRegistry = struct {
         return false;
     }
 
+    /// Bump only when the caller still owns this daemon instance namespace.
+    /// A stale request cannot advance a replacement daemon's projection.
+    pub fn bumpRegistryRevision(self: *ProcessRegistry, instance_nonce: []const u8) !u64 {
+        if (!std.mem.eql(u8, self.instance_nonce, instance_nonce)) return error.InstanceNonceMismatch;
+        self.bumpRevision();
+        return self.registry_revision;
+    }
+
+    pub fn revisionForInstance(self: *const ProcessRegistry, instance_nonce: []const u8) ?u64 {
+        if (!std.mem.eql(u8, self.instance_nonce, instance_nonce)) return null;
+        return self.registry_revision;
+    }
+
     fn bumpRevision(self: *ProcessRegistry) void {
         self.registry_revision +%= 1;
+        if (self.registry_revision == 0) self.registry_revision = 1;
     }
 };
 
@@ -770,6 +1652,25 @@ pub const TrackedTerminalProcessRecord = TrackedTerminalProcess;
 pub const ExternalProcessRecord = ExternalProcess;
 pub const Outcome = TerminalProcessOutcome;
 pub const Lease = LeaseRecord;
+
+fn retentionExpired(start_ms: i64, now_ms: i64, ttl_ms: i64) bool {
+    if (now_ms < start_ms) return false;
+    return now_ms - start_ms > ttl_ms;
+}
+
+fn retainedTurnExpired(turn: RetainedTurn, now_ms: i64) bool {
+    return turnAbandonmentExpired(turn.abandoned_at_ms, now_ms, turn.state);
+}
+
+fn workspaceRecordHasLiveReferences(workspace_record: *const WorkspaceRecord) bool {
+    return workspace_record.managed_processes.items.len != 0 or
+        workspace_record.tracked_terminal_processes.items.len != 0 or
+        workspace_record.external_processes.items.len != 0 or
+        workspace_record.terminal_process_outcomes.items.len != 0 or
+        workspace_record.leases.items.len != 0 or
+        workspace_record.notifications.entries.items.len != 0 or
+        workspace_record.retained_turns.items.len != 0;
+}
 
 fn checkedLeaseExpiry(now_ms: i64) i64 {
     return now_ms + WORKSPACE_LEASE_TTL_MS;
@@ -851,6 +1752,13 @@ fn normalizeResources(allocator: std.mem.Allocator, resources: []const []const u
 fn affectedAgentAlreadyListed(affected_agents: []const AffectedAgent, owner: []const u8, client_id: []const u8) bool {
     for (affected_agents) |affected| {
         if (std.mem.eql(u8, affected.owner, owner) and std.mem.eql(u8, affected.client_id, client_id)) return true;
+    }
+    return false;
+}
+
+fn notificationOwnerAlreadyQueued(affected_agents: []const AffectedAgent, owner: []const u8) bool {
+    for (affected_agents) |affected| {
+        if (std.mem.eql(u8, affected.owner, owner)) return true;
     }
     return false;
 }
@@ -1285,4 +2193,189 @@ test "registry lease ids are opaque unique and nonce-scoped" {
     try std.testing.expect(!std.mem.eql(u8, first_id, second.lease.id));
     try std.testing.expect(std.mem.indexOf(u8, second.lease.id, "nonce-b") != null);
     try std.testing.expectEqual(@as(u64, 1), registry.registry_revision);
+}
+
+test "registry clients issue opaque IDs track heartbeats and derive compatibility clients" {
+    const allocator = std.testing.allocator;
+    var registry = try ProcessRegistry.init(allocator, "nonce-a");
+    defer registry.deinit(allocator);
+
+    const persistent = try registry.registerClient(allocator, true, 100);
+    try std.testing.expect(std.mem.startsWith(u8, persistent.client_id, "client:nonce-a:"));
+    try std.testing.expect(persistent.persistent);
+    try std.testing.expect(registry.heartbeatClient(persistent.client_id, 200));
+    try std.testing.expectEqual(@as(i64, 200), persistent.last_heartbeat_ms);
+    try std.testing.expect(registry.closeClient(persistent.client_id, 300));
+    try std.testing.expect(!registry.heartbeatClient(persistent.client_id, 400));
+
+    const derived = try ProcessRegistry.deriveCompatibilityClientId(allocator, "session-a");
+    defer allocator.free(derived);
+    const compatibility = try registry.ensureCompatibilityClient(allocator, "session-a", 500);
+    try std.testing.expectEqualStrings(derived, compatibility.client_id);
+    try std.testing.expect(compatibility.compatibility);
+    const same_compatibility = try registry.ensureCompatibilityClient(allocator, "session-a", 600);
+    try std.testing.expectEqualStrings(compatibility.client_id, same_compatibility.client_id);
+    try std.testing.expectEqual(@as(i64, 600), same_compatibility.last_heartbeat_ms);
+    try std.testing.expectEqual(@as(usize, 2), registry.clients.count());
+}
+
+test "forced lease acquisition appends one pull notification per affected owner" {
+    const allocator = std.testing.allocator;
+    var registry = try ProcessRegistry.init(allocator, "nonce-a");
+    defer registry.deinit(allocator);
+
+    var first = try registry.acquireLease(allocator, "workspace-a", "owner-a", "client-a", "build", &[_][]const u8{"build"}, false, 1_000);
+    defer first.deinit(allocator);
+    var forced = try registry.acquireLease(allocator, "workspace-a", "owner-b", "client-b", "cargo test", &[_][]const u8{"build"}, true, 1_001);
+    defer forced.deinit(allocator);
+
+    const mailbox = &registry.workspace("workspace-a").?.notifications;
+    try std.testing.expectEqual(@as(usize, 1), mailbox.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 1), mailbox.entries.items[0].seq);
+    try std.testing.expectEqualStrings("owner-a", mailbox.entries.items[0].owner_session_id.?);
+    try std.testing.expectEqualStrings(NOTIFICATION_TITLE_CONFLICTING_COMMAND, mailbox.entries.items[0].title);
+    try std.testing.expectEqualStrings("cargo test", mailbox.entries.items[0].body);
+    try std.testing.expectEqualStrings(NOTIFICATION_TYPE_COORDINATION_CONFLICT, mailbox.entries.items[0].type);
+    try std.testing.expectEqual(@as(usize, 2), registry.activeLeaseCount(allocator, "workspace-a", 1_001));
+
+    var pulled: std.ArrayList(*const Notification) = .empty;
+    defer pulled.deinit(allocator);
+    const next_seq = try registry.collectNotifications(allocator, "workspace-a", "owner-a", 0, 10, &pulled);
+    try std.testing.expectEqual(@as(usize, 1), pulled.items.len);
+    try std.testing.expectEqual(@as(u64, 2), next_seq);
+    try std.testing.expectEqualStrings("cargo test", pulled.items[0].command);
+}
+
+test "notification mailboxes enforce per-session and global bounds with monotonic cursors" {
+    const allocator = std.testing.allocator;
+    var registry = try ProcessRegistry.init(allocator, "nonce-a");
+    defer registry.deinit(allocator);
+    registry.notification_global_cap = 3;
+    const workspace = try registry.ensureWorkspace(allocator, "workspace-a");
+    workspace.notifications.max_entries = 8;
+    workspace.notifications.max_entries_per_session = 2;
+
+    try registry.queueNotification(allocator, "workspace-a", "owner-a", "one", 0);
+    try registry.queueNotification(allocator, "workspace-a", "owner-a", "two", 1);
+    try registry.queueNotification(allocator, "workspace-a", "owner-a", "three", 2);
+    try registry.queueNotification(allocator, "workspace-a", "owner-b", "four", 3);
+    try std.testing.expectEqual(@as(usize, 3), registry.notification_count);
+    try std.testing.expectEqual(@as(usize, 3), workspace.notifications.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 5), workspace.notifications.next_seq);
+    try std.testing.expectEqualStrings("two", workspace.notifications.entries.items[0].body);
+
+    var pulled: std.ArrayList(*const Notification) = .empty;
+    defer pulled.deinit(allocator);
+    _ = try workspace.notifications.collect(allocator, "owner-a", 0, 0, &pulled);
+    try std.testing.expectEqual(@as(usize, 2), pulled.items.len);
+    try std.testing.expectEqualStrings("two", pulled.items[0].body);
+}
+
+test "registry revision bump is scoped to the active instance nonce" {
+    const allocator = std.testing.allocator;
+    var registry = try ProcessRegistry.init(allocator, "nonce-a");
+    defer registry.deinit(allocator);
+
+    try std.testing.expectError(error.InstanceNonceMismatch, registry.bumpRegistryRevision("nonce-b"));
+    try std.testing.expectEqual(@as(u64, 0), registry.registry_revision);
+    try std.testing.expectEqual(@as(u64, 1), try registry.bumpRegistryRevision("nonce-a"));
+    try std.testing.expectEqual(@as(?u64, 1), registry.revisionForInstance("nonce-a"));
+    try std.testing.expect(registry.revisionForInstance("nonce-b") == null);
+    try registry.replaceInstanceNonce(allocator, "nonce-b");
+    try std.testing.expectEqual(@as(u64, 0), registry.registry_revision);
+    try std.testing.expectEqual(@as(?u64, 0), registry.revisionForInstance("nonce-b"));
+}
+
+test "managed process runtime transitions preserve restart and explicit-stop state" {
+    var runtime: ManagedProcessRuntime = .{};
+    try std.testing.expectError(error.InvalidManagedProcessTransition, runtime.transition(.started, 1));
+    try runtime.transition(.start, 10);
+    try std.testing.expectEqual(ManagedProcessRuntimeState.starting, runtime.state);
+    try std.testing.expectEqual(@as(u64, 1), runtime.generation);
+    try runtime.transition(.started, 11);
+    try std.testing.expectEqual(ManagedProcessRuntimeState.running, runtime.state);
+    try runtime.transition(.restart, 20);
+    try std.testing.expectEqual(ManagedProcessRuntimeState.starting, runtime.state);
+    try std.testing.expectEqual(@as(u32, 1), runtime.restart_count);
+    try std.testing.expectEqual(@as(u64, 2), runtime.generation);
+    try runtime.transition(.started, 21);
+    try runtime.transition(.stop, 30);
+    try std.testing.expectEqual(ManagedProcessRuntimeState.stopped, runtime.state);
+    try std.testing.expect(runtime.explicit_stop);
+    try runtime.transition(.restart, 40);
+    try std.testing.expectEqual(ManagedProcessRuntimeState.starting, runtime.state);
+    try std.testing.expect(!runtime.explicit_stop);
+    try runtime.transition(.failed, 41);
+    try std.testing.expectEqual(ManagedProcessRuntimeState.failed, runtime.state);
+}
+
+test "workspace path aliases reject collisions and expire by fake clock" {
+    const allocator = std.testing.allocator;
+    var registry = try ProcessRegistry.init(allocator, "nonce-a");
+    defer registry.deinit(allocator);
+
+    _ = try registry.registerWorkspacePath(allocator, "workspace-a", "/work/current", 0);
+    _ = try registry.registerWorkspacePath(allocator, "workspace-a", "/work/old", 0);
+    try std.testing.expectEqualStrings("workspace-a", registry.workspaceByPath(allocator, "/work/old", WORKSPACE_PATH_ALIAS_TTL_MS).?.id);
+    try std.testing.expectError(error.WorkspacePathMapsToDifferentId, registry.registerWorkspacePath(allocator, "workspace-b", "/work/old", 1));
+    try std.testing.expect(registry.workspace("workspace-b") == null);
+    try std.testing.expect(registry.workspaceByPath(allocator, "/work/old", 2 * WORKSPACE_PATH_ALIAS_TTL_MS + 1) == null);
+
+    var alias_buffer: [32]u8 = undefined;
+    for (0..WORKSPACE_PATH_ALIAS_MAX + 1) |index| {
+        const alias = try std.fmt.bufPrint(&alias_buffer, "/work/alias-{d}", .{index});
+        _ = try registry.registerWorkspacePath(allocator, "workspace-a", alias, 100 + @as(i64, @intCast(index)));
+    }
+    try std.testing.expect(registry.workspaceByPath(allocator, "/work/alias-0", 200) == null);
+    try std.testing.expect(registry.workspaceByPath(allocator, "/work/alias-1", 200) != null);
+}
+
+test "retention helpers pin grace boundaries and turn cap" {
+    try std.testing.expect(!orphanGraceExpired(0, ORPHAN_GRACE_MS));
+    try std.testing.expect(orphanGraceExpired(0, ORPHAN_GRACE_MS + 1));
+    try std.testing.expect(!disconnectedRetentionExpired(0, DISCONNECTED_RETENTION_MS + 1, true));
+    try std.testing.expect(!disconnectedRetentionExpired(0, DISCONNECTED_RETENTION_MS, false));
+    try std.testing.expect(disconnectedRetentionExpired(0, DISCONNECTED_RETENTION_MS + 1, false));
+    try std.testing.expect(!turnAbandonmentExpired(0, TURN_ABANDONMENT_GRACE_MS, .running));
+    try std.testing.expect(turnAbandonmentExpired(0, TURN_ABANDONMENT_GRACE_MS + 1, .running));
+    try std.testing.expect(!turnAbandonmentExpired(0, TURN_RETENTION_TTL_MS, .completed));
+    try std.testing.expect(turnAbandonmentExpired(0, TURN_RETENTION_TTL_MS + 1, .completed));
+    try std.testing.expect(!staleAttachExpired(0, STALE_ATTACH_TIMEOUT_MS));
+    try std.testing.expect(staleAttachExpired(0, STALE_ATTACH_TIMEOUT_MS + 1));
+
+    const allocator = std.testing.allocator;
+    var registry = try ProcessRegistry.init(allocator, "nonce-a");
+    defer registry.deinit(allocator);
+    var id_buffer: [32]u8 = undefined;
+    for (0..TURN_RETENTION_MAX + 1) |index| {
+        const turn_id = try std.fmt.bufPrint(&id_buffer, "turn-{d}", .{index});
+        try registry.retainTurn(allocator, "workspace-a", turn_id, .completed, @intCast(index));
+    }
+    const turns = &registry.workspace("workspace-a").?.retained_turns;
+    try std.testing.expectEqual(TURN_RETENTION_MAX, turns.items.len);
+    try std.testing.expectEqualStrings("turn-1", turns.items[0].id);
+    try std.testing.expectEqual(@as(usize, 0), registry.reapRetainedTurns(allocator, TURN_RETENTION_TTL_MS));
+    try std.testing.expectEqual(@as(usize, TURN_RETENTION_MAX - 1), registry.reapRetainedTurns(allocator, TURN_RETENTION_TTL_MS + 32));
+    try std.testing.expectEqual(@as(usize, 1), registry.reapRetainedTurns(allocator, TURN_RETENTION_TTL_MS + 33));
+}
+
+test "registry job queue is an owned bounded FIFO" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.JobQueueCapacityRequired, RegistryJobQueue.init(0));
+    var queue = try RegistryJobQueue.init(2);
+    defer queue.deinit(allocator);
+
+    const first = try RegistryJob.init(allocator, .load_config, "workspace-a", "", "client-a");
+    try queue.push(allocator, first);
+    try queue.push(allocator, .{ .kind = .start_managed_process });
+    try std.testing.expect(queue.isFull());
+    try std.testing.expectError(error.JobQueueFull, queue.push(allocator, .{ .kind = .stop_managed_process }));
+    try std.testing.expectEqual(RegistryJobKind.load_config, queue.peek().?.kind);
+    var popped = queue.take().?;
+    defer popped.deinit(allocator);
+    try std.testing.expectEqualStrings("workspace-a", popped.workspace_id);
+    try std.testing.expectEqual(RegistryJobKind.start_managed_process, queue.peek().?.kind);
+    var second = queue.take().?;
+    second.deinit(allocator);
+    try std.testing.expect(queue.take() == null);
 }

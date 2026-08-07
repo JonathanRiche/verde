@@ -6,6 +6,44 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 
+/// Methods that must be refused once the daemon has entered its drain phase.
+///
+/// This is intentionally registry-only for M2. Store mutations are added when
+/// the store dispatcher lands, so undispatched store methods remain unchanged.
+const MUTATING_METHODS = [_][]const u8{
+    // Sessionizer-owned mutations.
+    "session.create",
+    "session.attach",
+    "session.detach",
+    "session.write",
+    "session.resize",
+    "session.kill",
+    "session.cleanup",
+    "chat.turn.start",
+    "chat.turn.approve",
+    "chat.turn.cancel",
+    "chat.turn.consume",
+    // Registry mutations.
+    "process.start",
+    "process.stop",
+    "process.restart",
+    "lease.acquire",
+    "lease.renew",
+    "lease.release",
+    "daemon.client.register",
+    "daemon.client.heartbeat",
+    "daemon.client.close",
+    "daemon.stop",
+};
+
+/// Return whether a method changes daemon-owned state.
+pub fn isMutatingMethod(method: []const u8) bool {
+    for (MUTATING_METHODS) |candidate| {
+        if (std.mem.eql(u8, method, candidate)) return true;
+    }
+    return false;
+}
+
 /// Daemon-filled snapshot for core.* methods. No pointers into daemon types.
 pub const Context = struct {
     pid: u32,
@@ -168,4 +206,79 @@ test "params object with unknown fields is accepted" {
     try obj.put(std.testing.allocator, "future_field", .{ .bool = true });
     const response = dispatch(5, "core.status", .{ .object = obj }, fakeContext());
     try std.testing.expect(response.isOk());
+}
+
+test "shared mutator table pins the current sessionizer methods" {
+    const sessionizer_mutators = [_][]const u8{
+        "session.create",
+        "session.attach",
+        "session.detach",
+        "session.write",
+        "session.resize",
+        "session.kill",
+        "session.cleanup",
+        "chat.turn.start",
+        "chat.turn.approve",
+        "chat.turn.cancel",
+        "chat.turn.consume",
+    };
+    for (sessionizer_mutators) |method| {
+        try std.testing.expect(isMutatingMethod(method));
+    }
+
+    const registry_mutators = [_][]const u8{
+        "process.start",
+        "process.stop",
+        "process.restart",
+        "lease.acquire",
+        "lease.renew",
+        "lease.release",
+        "daemon.client.register",
+        "daemon.client.heartbeat",
+        "daemon.client.close",
+        "daemon.stop",
+    };
+    for (registry_mutators) |method| {
+        try std.testing.expect(isMutatingMethod(method));
+    }
+}
+
+test "reads and undispatched store methods are not mutators" {
+    const reads = [_][]const u8{
+        "session.list",
+        "session.inspect",
+        "session.tail",
+        "session.tail.batch",
+        "session.screen",
+        "chat.turn.list",
+        "chat.turn.tail",
+        "status",
+        "core.status",
+        "core.capabilities",
+        "process.list",
+        "process.inspect",
+        "process.logs",
+        "process.wait",
+        "lease.check",
+        "daemon.notifications",
+        "workspace.resolve",
+        "daemon.prepareShutdown",
+    };
+    for (reads) |method| {
+        try std.testing.expect(!isMutatingMethod(method));
+    }
+
+    const undispatched_store_methods = [_][]const u8{
+        "state.snapshot.replace",
+        "workspace.upsert",
+        "chat.thread.upsert",
+        "chat.message.append",
+        "surface.upsert",
+        "surface.clear",
+        "notification.chatCompletion.upsert",
+        "notification.chatCompletion.clear",
+    };
+    for (undispatched_store_methods) |method| {
+        try std.testing.expect(!isMutatingMethod(method));
+    }
 }

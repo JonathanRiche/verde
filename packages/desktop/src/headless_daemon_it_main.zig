@@ -71,6 +71,7 @@ pub fn main(init: std.process.Init) !void {
 
     try runIntegration(allocator, io);
     try runRegistryFixtureScenario(allocator, io);
+    try runRegistryCapabilityScenario(allocator, io);
     try runStoreFixtureScenario(allocator, io);
     try runLifecycleBindGuard(allocator, io);
     try runLifecyclePrepareShutdownWithLivePty(allocator, io);
@@ -370,8 +371,8 @@ const FixtureScenario = struct {
     }
 };
 
-/// Phase-1 registry fixture: exercise a typed process-list request against the
-/// daemon and pin its current unimplemented response shape for phase 2.
+/// Phase-2 registry fixture: exercise a typed process-list request against the
+/// daemon and pin the empty snapshot plus its instance/revision envelope.
 fn runRegistryFixtureScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const pref_path = try makePrefPath(allocator, "registry-hooks");
     defer allocator.free(pref_path);
@@ -402,7 +403,52 @@ fn runRegistryFixtureScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     };
     var parsed = try scenario.registryStep(headless.registry.METHOD_PROCESS_LIST, request);
     defer parsed.deinit();
-    try scenario.expectInterimError(.registry, &parsed);
+    if (!parsed.response.isOk()) return error.RegistryFixtureRequestFailed;
+    const result = try client.decodeProcessList(&parsed);
+    if (result.instance_nonce.len == 0) return error.RegistryFixtureMissingInstanceNonce;
+    if (result.registry_revision == 0) return error.RegistryFixtureMissingRegistryRevision;
+    if (result.workspace.id.len == 0 or !std.mem.eql(u8, result.workspace.path, pref_path)) return error.RegistryFixtureWorkspaceMismatch;
+    if (result.processes.len != 0 or result.outcomes.len != 0 or result.leases.len != 0 or result.notifications.len != 0) {
+        return error.RegistryFixtureExpectedEmpty;
+    }
+    if (result.workspace.instance_nonce.len == 0 or result.workspace.registry_revision == 0) {
+        return error.RegistryFixtureWorkspaceMissingEnvelope;
+    }
+}
+
+/// Scenario 7: a daemon-direct typed client must reject registry use when the
+/// daemon still advertises the phase-1 capability set.
+fn runRegistryCapabilityScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "registry-capability");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    defer child.kill(io);
+
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = allocator,
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(allocator, &transport);
+    const empty_params: struct {} = .{};
+    var parsed = try client.call("core.status", empty_params);
+    defer parsed.deinit();
+    if (!parsed.response.isOk()) return error.RegistryCapabilityStatusFailed;
+    const status = try client.decodeStatus(&parsed);
+    if (status.capabilities.processes or status.capabilities.leases) return error.RegistryCapabilityUnexpectedlyAdvertised;
+    var capability_rejected = false;
+    client.requireDaemonDirectCapability(status.capabilities, .processes) catch |err| switch (err) {
+        error.CapabilityUnavailable => capability_rejected = true,
+    };
+    if (!capability_rejected) return error.RegistryCapabilityUnexpectedlyAvailable;
 }
 
 /// Phase-1 store fixture: exercise a typed workspace-upsert request against

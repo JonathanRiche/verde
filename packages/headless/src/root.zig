@@ -40,9 +40,15 @@ pub const capabilityUnavailable = protocol.capabilityUnavailable;
 pub const Context = dispatch.Context;
 pub const DispatchResponse = dispatch.Response;
 pub const dispatchMethod = dispatch.dispatch;
+pub const isMutatingMethod = dispatch.isMutatingMethod;
 
 pub const Client = client.Client;
 pub const TransportFn = client.TransportFn;
+pub const RequiredCapability = client.RequiredCapability;
+pub const CapabilityError = client.CapabilityError;
+pub const requireCapability = client.requireCapability;
+pub const requireFeature = client.requireFeature;
+pub const requireDaemonDirectCapability = client.requireDaemonDirectCapability;
 
 // Ensure inline tests in submodules run when this package is the test root.
 test {

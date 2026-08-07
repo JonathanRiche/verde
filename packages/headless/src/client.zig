@@ -5,9 +5,147 @@
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
+const registry = @import("registry_protocol.zig");
 
 /// Sends one request JSON document and returns an allocator-owned response JSON document.
 pub const TransportFn = *const fn (ctx: *anyopaque, request_json: []const u8) anyerror![]u8;
+
+/// Coarse and granular capabilities that a direct daemon client may require.
+/// The registry capabilities are deliberately included here while their
+/// advertisement remains false during the phase-2 dual-write rollout.
+pub const RequiredCapability = enum {
+    terminal_raw,
+    terminal_grid,
+    chat,
+    processes,
+    leases,
+    browser_execution,
+    browser_presentation,
+    browser_session_state,
+    browser_create,
+    browser_navigation,
+    browser_history,
+    browser_javascript_eval,
+    browser_dom_inspection,
+    browser_selector_actions,
+    browser_form_input,
+    browser_low_level_pointer,
+    browser_screenshot,
+    browser_lifecycle_restart,
+    browser_lifecycle_reset,
+    browser_frame_streaming,
+    browser_downloads,
+    browser_uploads,
+
+    pub fn wireName(self: @This()) []const u8 {
+        return switch (self) {
+            .terminal_raw => "terminal_raw",
+            .terminal_grid => "terminal_grid",
+            .chat => "chat",
+            .processes => "processes",
+            .leases => "leases",
+            .browser_execution => "browser_execution",
+            .browser_presentation => "browser_presentation",
+            .browser_session_state => "browser.session_state",
+            .browser_create => "browser.create",
+            .browser_navigation => "browser.navigation",
+            .browser_history => "browser.history",
+            .browser_javascript_eval => "browser.javascript_eval",
+            .browser_dom_inspection => "browser.dom_inspection",
+            .browser_selector_actions => "browser.selector_actions",
+            .browser_form_input => "browser.form_input",
+            .browser_low_level_pointer => "browser.low_level_pointer",
+            .browser_screenshot => "browser.screenshot",
+            .browser_lifecycle_restart => "browser.lifecycle_restart",
+            .browser_lifecycle_reset => "browser.lifecycle_reset",
+            .browser_frame_streaming => "browser.frame_streaming",
+            .browser_downloads => "browser.downloads",
+            .browser_uploads => "browser.uploads",
+        };
+    }
+};
+
+/// The typed client-side error used when a direct daemon lacks a feature.
+pub const CapabilityError = error{CapabilityUnavailable};
+
+/// Check a coarse or granular advertised capability before a direct call.
+pub fn requireCapability(capabilities: protocol.Capabilities, feature: RequiredCapability) CapabilityError!void {
+    return requireCapabilityChecked(capabilities, feature);
+}
+
+fn requireCapabilityChecked(capabilities: protocol.Capabilities, feature: RequiredCapability) CapabilityError!void {
+    const available = switch (feature) {
+        .terminal_raw => capabilities.terminal_raw,
+        .terminal_grid => capabilities.terminal_grid,
+        .chat => capabilities.chat,
+        .processes => capabilities.processes,
+        .leases => capabilities.leases,
+        .browser_execution => capabilities.browser_execution,
+        .browser_presentation => capabilities.browser_presentation,
+        .browser_session_state => capabilities.isFeatureAvailable(.browser_session_state),
+        .browser_create => capabilities.isFeatureAvailable(.browser_create),
+        .browser_navigation => capabilities.isFeatureAvailable(.browser_navigation),
+        .browser_history => capabilities.isFeatureAvailable(.browser_history),
+        .browser_javascript_eval => capabilities.isFeatureAvailable(.browser_javascript_eval),
+        .browser_dom_inspection => capabilities.isFeatureAvailable(.browser_dom_inspection),
+        .browser_selector_actions => capabilities.isFeatureAvailable(.browser_selector_actions),
+        .browser_form_input => capabilities.isFeatureAvailable(.browser_form_input),
+        .browser_low_level_pointer => capabilities.isFeatureAvailable(.browser_low_level_pointer),
+        .browser_screenshot => capabilities.isFeatureAvailable(.browser_screenshot),
+        .browser_lifecycle_restart => capabilities.isFeatureAvailable(.browser_lifecycle_restart),
+        .browser_lifecycle_reset => capabilities.isFeatureAvailable(.browser_lifecycle_reset),
+        .browser_frame_streaming => capabilities.isFeatureAvailable(.browser_frame_streaming),
+        .browser_downloads => capabilities.isFeatureAvailable(.browser_downloads),
+        .browser_uploads => capabilities.isFeatureAvailable(.browser_uploads),
+    };
+    if (!available) return error.CapabilityUnavailable;
+}
+
+/// Check a protocol capability using the protocol's established feature enum.
+/// This is convenient for callers that already use `protocol.CapabilityFeature`.
+pub fn requireFeature(capabilities: protocol.Capabilities, feature: protocol.CapabilityFeature) CapabilityError!void {
+    return requireFeatureChecked(capabilities, feature);
+}
+
+fn requireFeatureChecked(capabilities: protocol.Capabilities, feature: protocol.CapabilityFeature) CapabilityError!void {
+    if (!capabilities.isFeatureAvailable(feature)) return error.CapabilityUnavailable;
+}
+
+/// Alias documenting that the check is for a direct daemon request.
+pub fn requireDaemonDirectCapability(capabilities: protocol.Capabilities, feature: RequiredCapability) CapabilityError!void {
+    return requireCapabilityChecked(capabilities, feature);
+}
+
+/// Convert a failed direct-mode capability check to the protocol error payload.
+pub fn capabilityUnavailable(feature: RequiredCapability) protocol.Error {
+    return .{
+        .code = protocol.ERR_CAPABILITY_UNAVAILABLE,
+        .message = switch (feature) {
+            .terminal_raw => "terminal_raw capability is unavailable",
+            .terminal_grid => "terminal_grid capability is unavailable",
+            .chat => "chat capability is unavailable",
+            .processes => "processes capability is unavailable",
+            .leases => "leases capability is unavailable",
+            .browser_execution => "browser_execution capability is unavailable",
+            .browser_presentation => "browser_presentation capability is unavailable",
+            .browser_session_state => "browser.session_state capability is unavailable",
+            .browser_create => "browser.create capability is unavailable",
+            .browser_navigation => "browser.navigation capability is unavailable",
+            .browser_history => "browser.history capability is unavailable",
+            .browser_javascript_eval => "browser.javascript_eval capability is unavailable",
+            .browser_dom_inspection => "browser.dom_inspection capability is unavailable",
+            .browser_selector_actions => "browser.selector_actions capability is unavailable",
+            .browser_form_input => "browser.form_input capability is unavailable",
+            .browser_low_level_pointer => "browser.low_level_pointer capability is unavailable",
+            .browser_screenshot => "browser.screenshot capability is unavailable",
+            .browser_lifecycle_restart => "browser.lifecycle_restart capability is unavailable",
+            .browser_lifecycle_reset => "browser.lifecycle_reset capability is unavailable",
+            .browser_frame_streaming => "browser.frame_streaming capability is unavailable",
+            .browser_downloads => "browser.downloads capability is unavailable",
+            .browser_uploads => "browser.uploads capability is unavailable",
+        },
+    };
+}
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
@@ -149,22 +287,86 @@ pub const Client = struct {
 
     /// Decode a successful `core.status` response into its typed result.
     pub fn decodeStatus(self: *Client, parsed: *const protocol.ParsedResponse) !protocol.StatusResult {
-        const result = try self.resultValue(parsed);
-        const status = try std.json.parseFromValueLeaky(protocol.StatusResult, self.allocator, result, .{
-            .ignore_unknown_fields = true,
-        });
+        const status = try self.decodeResult(protocol.StatusResult, parsed);
         _ = try self.recordNegotiatedRange(status.min_supported, status.max_supported);
         return status;
     }
 
     /// Decode a successful `core.capabilities` response into its typed result.
     pub fn decodeCapabilities(self: *Client, parsed: *const protocol.ParsedResponse) !protocol.CapabilitiesResult {
-        const result = try self.resultValue(parsed);
-        const capabilities = try std.json.parseFromValueLeaky(protocol.CapabilitiesResult, self.allocator, result, .{
-            .ignore_unknown_fields = true,
-        });
+        const capabilities = try self.decodeResult(protocol.CapabilitiesResult, parsed);
         _ = try self.recordNegotiatedRange(capabilities.min_supported, capabilities.max_supported);
         return capabilities;
+    }
+
+    /// Decode a successful `process.list` response.
+    pub fn decodeProcessList(self: *Client, parsed: *const protocol.ParsedResponse) !registry.ProcessListResult {
+        return try self.decodeResult(registry.ProcessListResult, parsed);
+    }
+
+    /// Decode a successful `lease.check` response.
+    pub fn decodeLeaseCheck(self: *Client, parsed: *const protocol.ParsedResponse) !registry.LeaseCheckResult {
+        return try self.decodeResult(registry.LeaseCheckResult, parsed);
+    }
+
+    /// Decode a successful `lease.acquire` response.
+    pub fn decodeLeaseAcquire(self: *Client, parsed: *const protocol.ParsedResponse) !registry.LeaseAcquireResult {
+        return try self.decodeResult(registry.LeaseAcquireResult, parsed);
+    }
+
+    /// Decode a successful `lease.renew` response.
+    pub fn decodeLeaseRenew(self: *Client, parsed: *const protocol.ParsedResponse) !registry.LeaseRenewResult {
+        return try self.decodeResult(registry.LeaseRenewResult, parsed);
+    }
+
+    /// Decode a successful `lease.release` response.
+    pub fn decodeLeaseRelease(self: *Client, parsed: *const protocol.ParsedResponse) !registry.LeaseReleaseResult {
+        return try self.decodeResult(registry.LeaseReleaseResult, parsed);
+    }
+
+    /// Decode a successful `daemon.notifications` response.
+    pub fn decodeNotifications(self: *Client, parsed: *const protocol.ParsedResponse) !registry.NotificationsResult {
+        return try self.decodeResult(registry.NotificationsResult, parsed);
+    }
+
+    /// Decode a successful `daemon.client.register` response.
+    pub fn decodeClientRegister(self: *Client, parsed: *const protocol.ParsedResponse) !registry.ClientRegisterResult {
+        return try self.decodeResult(registry.ClientRegisterResult, parsed);
+    }
+
+    /// Decode a successful `daemon.client.heartbeat` response.
+    pub fn decodeClientHeartbeat(self: *Client, parsed: *const protocol.ParsedResponse) !registry.ClientHeartbeatResult {
+        return try self.decodeResult(registry.ClientHeartbeatResult, parsed);
+    }
+
+    /// Decode a successful `daemon.client.close` response.
+    pub fn decodeClientClose(self: *Client, parsed: *const protocol.ParsedResponse) !registry.ClientCloseResult {
+        return try self.decodeResult(registry.ClientCloseResult, parsed);
+    }
+
+    /// Decode a successful `daemon.stop` response.
+    pub fn decodeDaemonStop(self: *Client, parsed: *const protocol.ParsedResponse) !registry.DaemonStopResult {
+        return try self.decodeResult(registry.DaemonStopResult, parsed);
+    }
+
+    /// Decode a successful `workspace.resolve` response.
+    pub fn decodeWorkspaceResolve(self: *Client, parsed: *const protocol.ParsedResponse) !registry.WorkspaceResolveResult {
+        return try self.decodeResult(registry.WorkspaceResolveResult, parsed);
+    }
+
+    /// Require a capability on this client before a direct daemon request.
+    pub fn requireCapability(_: *Client, capabilities: protocol.Capabilities, feature: RequiredCapability) CapabilityError!void {
+        return requireCapabilityChecked(capabilities, feature);
+    }
+
+    /// Require a protocol feature on this client before a direct request.
+    pub fn requireFeature(_: *Client, capabilities: protocol.Capabilities, feature: protocol.CapabilityFeature) CapabilityError!void {
+        return requireFeatureChecked(capabilities, feature);
+    }
+
+    /// Require a capability for a daemon-direct operation.
+    pub fn requireDaemonDirectCapability(_: *Client, capabilities: protocol.Capabilities, feature: RequiredCapability) CapabilityError!void {
+        return requireCapabilityChecked(capabilities, feature);
     }
 
     fn recordNegotiatedRange(self: *Client, daemon_min: u32, daemon_max: u32) !u32 {
@@ -183,6 +385,18 @@ pub const Client = struct {
     fn resultValue(_: *Client, parsed: *const protocol.ParsedResponse) !std.json.Value {
         if (!parsed.response.isOk()) return error.RemoteError;
         return parsed.response.result orelse error.InvalidResponse;
+    }
+
+    /// Re-encode the parsed result before typed parsing so `.alloc_always`
+    /// produces values independent of the response envelope's arena.
+    fn decodeResult(self: *Client, comptime T: type, parsed: *const protocol.ParsedResponse) !T {
+        const result = try self.resultValue(parsed);
+        const result_json = try std.json.Stringify.valueAlloc(self.allocator, result, .{});
+        defer self.allocator.free(result_json);
+        return try std.json.parseFromSliceLeaky(T, self.allocator, result_json, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        });
     }
 
     fn send(self: *Client, request_json: []const u8) ![]u8 {
@@ -405,4 +619,137 @@ test "client encodeRequest assigns monotonic ids" {
         "{\"id\":3,\"method\":\"core.status\",\"params\":[]}",
         core_status,
     );
+}
+
+test "registry decoders are tolerant and own result strings" {
+    var result_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer result_arena.deinit();
+    var client = Client.initEncoder(result_arena.allocator());
+    const response_allocator = std.testing.allocator;
+
+    var process_list = try protocol.parseResponse(response_allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"registry_revision\":7,\"processes\":[{\"id\":\"p1\",\"status\":\"running\"}],\"future\":true}}",
+    );
+    defer process_list.deinit();
+    const process_list_result = try client.decodeProcessList(&process_list);
+    try std.testing.expectEqual(@as(u64, 7), process_list_result.registry_revision);
+    try std.testing.expectEqualStrings("p1", process_list_result.processes[0].id);
+    try std.testing.expectEqual(registry.ProcessStatus.running, process_list_result.processes[0].status);
+
+    var lease_check = try protocol.parseResponse(response_allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"allowed\":false,\"conflicts\":[{\"id\":\"l1\"}],\"future\":true}}",
+    );
+    defer lease_check.deinit();
+    const lease_check_result = try client.decodeLeaseCheck(&lease_check);
+    try std.testing.expect(!lease_check_result.allowed);
+    try std.testing.expectEqualStrings("l1", lease_check_result.conflicts[0].id);
+
+    var lease_acquire = try protocol.parseResponse(response_allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"acquired\":true,\"lease_id\":\"l1\"}}",
+    );
+    defer lease_acquire.deinit();
+    const lease_acquire_result = try client.decodeLeaseAcquire(&lease_acquire);
+    try std.testing.expect(lease_acquire_result.acquired);
+    try std.testing.expectEqualStrings("l1", lease_acquire_result.lease_id.?);
+
+    var lease_renew = try protocol.parseResponse(response_allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"renewed\":true,\"lease_id\":\"l1\"}}",
+    );
+    defer lease_renew.deinit();
+    const lease_renew_result = try client.decodeLeaseRenew(&lease_renew);
+    try std.testing.expect(lease_renew_result.renewed);
+    try std.testing.expectEqualStrings("l1", lease_renew_result.lease_id);
+
+    var lease_release = try protocol.parseResponse(response_allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"released\":true,\"released_count\":1}}",
+    );
+    defer lease_release.deinit();
+    const lease_release_result = try client.decodeLeaseRelease(&lease_release);
+    try std.testing.expect(lease_release_result.released);
+    try std.testing.expectEqual(@as(u32, 1), lease_release_result.released_count);
+
+    var notifications = try protocol.parseResponse(response_allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{\"notifications\":[{\"seq\":4,\"body\":\"conflict\"}],\"next_notification_seq\":5}}",
+    );
+    defer notifications.deinit();
+    const notifications_result = try client.decodeNotifications(&notifications);
+    try std.testing.expectEqual(@as(u64, 5), notifications_result.next_notification_seq);
+    try std.testing.expectEqualStrings("conflict", notifications_result.notifications[0].body);
+
+    var client_register = try protocol.parseResponse(response_allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"client_id\":\"c1\",\"persistent\":true}}",
+    );
+    defer client_register.deinit();
+    const client_register_result = try client.decodeClientRegister(&client_register);
+    try std.testing.expectEqualStrings("c1", client_register_result.client_id);
+    try std.testing.expect(client_register_result.persistent);
+
+    var client_heartbeat = try protocol.parseResponse(response_allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":8,\"result\":{\"client_id\":\"c1\",\"accepted\":true}}",
+    );
+    defer client_heartbeat.deinit();
+    const client_heartbeat_result = try client.decodeClientHeartbeat(&client_heartbeat);
+    try std.testing.expectEqualStrings("c1", client_heartbeat_result.client_id);
+    try std.testing.expect(client_heartbeat_result.accepted);
+
+    var client_close = try protocol.parseResponse(response_allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{\"client_id\":\"c1\",\"closed\":true,\"released_leases\":2}}",
+    );
+    defer client_close.deinit();
+    const client_close_result = try client.decodeClientClose(&client_close);
+    try std.testing.expectEqualStrings("c1", client_close_result.client_id);
+    try std.testing.expect(client_close_result.closed);
+    try std.testing.expectEqual(@as(u32, 2), client_close_result.released_leases);
+
+    var daemon_stop = try protocol.parseResponse(response_allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":10,\"result\":{\"accepted\":true,\"stopping\":true}}",
+    );
+    defer daemon_stop.deinit();
+    const daemon_stop_result = try client.decodeDaemonStop(&daemon_stop);
+    try std.testing.expect(daemon_stop_result.accepted);
+    try std.testing.expect(daemon_stop_result.stopping);
+
+    var workspace_resolve = try protocol.parseResponse(response_allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":11,\"result\":{\"workspace\":{\"id\":\"w1\",\"path\":\"/tmp/w\"}}}",
+    );
+    defer workspace_resolve.deinit();
+    const workspace_resolve_result = try client.decodeWorkspaceResolve(&workspace_resolve);
+    try std.testing.expectEqualStrings("w1", workspace_resolve_result.workspace.id);
+    try std.testing.expectEqualStrings("/tmp/w", workspace_resolve_result.workspace.path);
+}
+
+test "registry decoders return RemoteError for error envelopes" {
+    var client = Client.initEncoder(std.testing.allocator);
+    var parsed = try protocol.parseResponse(std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":\"capability_unavailable\",\"message\":\"processes capability is unavailable\",\"data\":{\"feature\":\"processes\"}}}",
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.RemoteError, client.decodeProcessList(&parsed));
+    try std.testing.expectError(error.RemoteError, client.decodeLeaseCheck(&parsed));
+    try std.testing.expectError(error.RemoteError, client.decodeLeaseAcquire(&parsed));
+    try std.testing.expectError(error.RemoteError, client.decodeLeaseRenew(&parsed));
+    try std.testing.expectError(error.RemoteError, client.decodeLeaseRelease(&parsed));
+    try std.testing.expectError(error.RemoteError, client.decodeNotifications(&parsed));
+    try std.testing.expectError(error.RemoteError, client.decodeClientRegister(&parsed));
+    try std.testing.expectError(error.RemoteError, client.decodeClientHeartbeat(&parsed));
+    try std.testing.expectError(error.RemoteError, client.decodeClientClose(&parsed));
+    try std.testing.expectError(error.RemoteError, client.decodeDaemonStop(&parsed));
+    try std.testing.expectError(error.RemoteError, client.decodeWorkspaceResolve(&parsed));
+}
+
+test "capability checks support direct registry mode" {
+    const phase1 = protocol.Capabilities.phase1();
+    try requireCapability(phase1, .terminal_raw);
+    try std.testing.expectError(error.CapabilityUnavailable, requireCapability(phase1, .processes));
+    try std.testing.expectError(error.CapabilityUnavailable, requireDaemonDirectCapability(phase1, .leases));
+    try std.testing.expectError(error.CapabilityUnavailable, requireFeature(phase1, .browser_navigation));
+
+    const unavailable = capabilityUnavailable(.processes);
+    try std.testing.expectEqualStrings(protocol.ERR_CAPABILITY_UNAVAILABLE, unavailable.code);
+    try std.testing.expectEqualStrings("processes capability is unavailable", unavailable.message);
+
+    const capable = protocol.Capabilities.withBrowser(.{ .navigation = true }, false);
+    try requireCapability(capable, .browser_navigation);
+    try requireFeature(capable, .browser_navigation);
 }
