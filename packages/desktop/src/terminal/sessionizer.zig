@@ -12,6 +12,7 @@ const process_registry = @import("../daemon/process_registry.zig");
 const platform_ipc = @import("../platform/ipc.zig");
 const platform_live_endpoint = @import("../platform/live_endpoint.zig");
 const workspace_identity = @import("../platform/workspace_identity.zig");
+const stack = @import("../workspace/stack.zig");
 const platform_runtime = @import("platform_runtime");
 const process_env = @import("../platform/env.zig");
 const send_runner = @import("../chat/send_runner.zig");
@@ -57,6 +58,8 @@ const ATTACH_STALE_MS: i64 = 60 * std.time.ms_per_s;
 /// Env override so hermetic tests can force a fast idle exit without changing
 /// production lifetime policy (null / unset = never idle-exit).
 const IDLE_EXIT_ENV_NAME = "VERDE_SESSION_DAEMON_IDLE_EXIT_MS";
+/// Test-only latency injection for the unlocked managed-process phase.
+const TEST_SLOW_IO_ENV_NAME = "VERDE_SESSIONIZER_TEST_SLOW_IO_MS";
 /// Bounded wait while an incompatible daemon drains live state before upgrade.
 const REPLACEMENT_WAIT_MS: i64 = 5 * std.time.ms_per_s;
 /// Extra grace after prepareShutdown accepts, independent of the prepare deadline.
@@ -1043,7 +1046,7 @@ const PosixPtyBackend = if (builtin.os.tag == .windows) struct {} else struct {
     }
 
     fn deinit(self: *Self, _: std.mem.Allocator) void {
-        if (self.running) _ = self.signalTermination();
+        if (self.running) _ = self.signalTermination(std.c.SIG.TERM);
         _ = std.c.close(self.master_fd);
         _ = self.captureExitStatus();
     }
@@ -1083,28 +1086,35 @@ const PosixPtyBackend = if (builtin.os.tag == .windows) struct {} else struct {
 
     fn terminate(self: *Self) bool {
         if (!self.running) return false;
-        if (!self.signalTermination()) return false;
+        if (!self.signalTermination(std.c.SIG.TERM)) return false;
         _ = self.captureExitStatus();
         return true;
     }
 
-    fn signalTermination(self: *Self) bool {
+    fn forceTerminate(self: *Self) bool {
+        if (!self.running) return false;
+        if (!self.signalTermination(std.c.SIG.KILL)) return false;
+        _ = self.captureExitStatus();
+        return true;
+    }
+
+    fn signalTermination(self: *Self, signal: std.c.SIG) bool {
         const foreground_process_group: ?std.posix.pid_t = if (self.foregroundProcessGroup()) |pgrp| @intCast(pgrp) else null;
         var signaled = signalDescendantProcessGroups(
             std.heap.smp_allocator,
             self.child_pid,
             foreground_process_group,
-            std.c.SIG.TERM,
+            signal,
         ) > 0;
 
         // forkpty makes the child a process-group leader. Signal both that
         // group and a distinct foreground group so script runners cannot
         // leave their actual application alive after the launcher exits.
         if (foreground_process_group) |pgrp| {
-            if (pgrp != self.child_pid and std.c.kill(-pgrp, std.c.SIG.TERM) == 0) signaled = true;
+            if (pgrp != self.child_pid and std.c.kill(-pgrp, signal) == 0) signaled = true;
         }
-        if (std.c.kill(-self.child_pid, std.c.SIG.TERM) == 0) signaled = true;
-        if (!signaled and std.c.kill(self.child_pid, std.c.SIG.TERM) == 0) signaled = true;
+        if (std.c.kill(-self.child_pid, signal) == 0) signaled = true;
+        if (!signaled and std.c.kill(self.child_pid, signal) == 0) signaled = true;
         return signaled;
     }
 
@@ -1323,6 +1333,13 @@ const PtySession = struct {
         // Windows may still own descendants in the ConPTY job after the direct
         // shell exits, so let the backend decide whether termination applies.
         if (!self.backend.terminate()) return false;
+        _ = self.captureExitStatus();
+        return true;
+    }
+
+    fn forceTerminate(self: *PtySession) bool {
+        if (comptime builtin.os.tag == .windows) return self.terminate();
+        if (!self.backend.forceTerminate()) return false;
         _ = self.captureExitStatus();
         return true;
     }
@@ -1574,8 +1591,58 @@ fn randomInstanceNonce(allocator: std.mem.Allocator) []u8 {
     return allocator.dupe(u8, &hex) catch @panic("failed to allocate daemon instance nonce");
 }
 
+const SlowProcessOperation = enum {
+    start,
+    stop,
+    restart,
+};
+
+const SlowProcessWork = struct {
+    operation: SlowProcessOperation,
+    workspace_id: []u8,
+    workspace_path: []u8,
+    name: []u8,
+    process_id: []u8,
+    client_id: []u8,
+    force: bool = false,
+    generation: u64 = 0,
+    previous_session_id: ?[]u8 = null,
+
+    fn deinit(self: *SlowProcessWork, allocator: std.mem.Allocator) void {
+        if (self.workspace_id.len != 0) allocator.free(self.workspace_id);
+        if (self.workspace_path.len != 0) allocator.free(self.workspace_path);
+        if (self.name.len != 0) allocator.free(self.name);
+        if (self.process_id.len != 0) allocator.free(self.process_id);
+        if (self.client_id.len != 0) allocator.free(self.client_id);
+        if (self.previous_session_id) |session_id| allocator.free(session_id);
+    }
+};
+
+const SlowProcessFailure = union(enum) {
+    resource_not_found,
+    invalid_state,
+    invalid_params,
+    config_unavailable: []const u8,
+    bounds: stack.BoundsViolation,
+};
+
+const SlowProcessPhaseResult = struct {
+    session: ?*PtySession = null,
+    command: []u8 = &.{},
+    cwd: []u8 = &.{},
+    failure: ?SlowProcessFailure = null,
+    stop_completed: bool = false,
+
+    fn deinit(self: *SlowProcessPhaseResult, allocator: std.mem.Allocator) void {
+        if (self.command.len != 0) allocator.free(self.command);
+        if (self.cwd.len != 0) allocator.free(self.cwd);
+        if (self.session) |session| session.deinit(allocator);
+    }
+};
+
 pub const Daemon = struct {
     allocator: std.mem.Allocator,
+    pref_path: []u8,
     registry: process_registry.ProcessRegistry,
     sessions: std.ArrayList(*PtySession) = .empty,
     chat_turns: std.ArrayList(*ChatTurn) = .empty,
@@ -1587,22 +1654,37 @@ pub const Daemon = struct {
     accepting_mutations: bool = true,
     /// Set only when prepareShutdown accepted a safe upgrade handoff.
     shutdown_requested: bool = false,
+    /// Requesting threads drain their own slow job; this queue only bounds and
+    /// deduplicates in-flight registry work, it is not a background worker.
+    registry_jobs: process_registry.RegistryJobQueue,
+    test_slow_io_delay_ms: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Daemon {
+        return initWithPrefPath(allocator, "");
+    }
+
+    pub fn initWithPrefPath(allocator: std.mem.Allocator, pref_path: []const u8) Daemon {
         const instance_nonce = randomInstanceNonce(allocator);
         defer allocator.free(instance_nonce);
+        var owned_pref_path: []u8 = &.{};
+        if (pref_path.len != 0) owned_pref_path = allocator.dupe(u8, pref_path) catch @panic("failed to initialize daemon pref path");
         return .{
             .allocator = allocator,
+            .pref_path = owned_pref_path,
             .registry = process_registry.ProcessRegistry.init(allocator, instance_nonce) catch @panic("failed to initialize daemon process registry"),
             .idle_exit_ms = idleExitMsFromEnv(allocator),
+            .registry_jobs = process_registry.RegistryJobQueue.init(process_registry.REGISTRY_JOB_QUEUE_MAX) catch @panic("failed to initialize registry job queue"),
+            .test_slow_io_delay_ms = slowIoDelayMsFromEnv(allocator),
         };
     }
 
     pub fn deinit(self: *Daemon) void {
+        if (self.pref_path.len != 0) self.allocator.free(self.pref_path);
         for (self.sessions.items) |session| session.deinit(self.allocator);
         self.sessions.deinit(self.allocator);
         for (self.chat_turns.items) |turn| turn.deinit(self.allocator);
         self.chat_turns.deinit(self.allocator);
+        self.registry_jobs.deinit(self.allocator);
         self.registry.deinit(self.allocator);
     }
 
@@ -1610,7 +1692,12 @@ pub const Daemon = struct {
         const now = nowMs();
         for (self.sessions.items) |session| {
             session.poll(self.allocator) catch {};
-            if (!session.running) self.noteSessionExitInRegistry(session, null, now);
+            if (!session.running) {
+                if (isManagedSessionId(session.session_id))
+                    self.noteManagedSessionExit(session, now)
+                else
+                    self.noteSessionExitInRegistry(session, null, now);
+            }
             session.cleanupStaleAttaches(self.allocator, now);
         }
     }
@@ -1694,6 +1781,10 @@ pub const Daemon = struct {
     /// Dual-write (unread): publish a newly created session into the registry.
     /// Registry failures are diagnostic only and never fail session.create.
     fn observeSessionInRegistry(self: *Daemon, session: *PtySession, command_line: []const u8, now_ms: i64) void {
+        // Managed sessions are represented by managed-process records, not a
+        // second tracked-terminal row; double publication would duplicate one
+        // child in process.list.
+        if (isManagedSessionId(session.session_id)) return;
         if (session.project_id.len == 0 and session.project_path.len == 0) return;
 
         var derived_workspace_id: ?[]u8 = null;
@@ -1748,6 +1839,33 @@ pub const Daemon = struct {
             log.warn("registry session observation failed id_len={d} err={s}", .{ session.session_id.len, @errorName(err) });
             return;
         };
+    }
+
+    fn noteManagedSessionExit(self: *Daemon, session: *PtySession, now_ms: i64) void {
+        if (session.registry_finished) return;
+        const workspace = self.registry.workspace(session.project_id) orelse return;
+        for (workspace.managed_processes.items) |*process| {
+            if (process.session_id == null or !std.mem.eql(u8, process.session_id.?, session.session_id)) continue;
+            // A queued stop/restart owns this exit and will detach the old
+            // session in Phase C; do not race its runtime transition here.
+            if (hasRegistryJob(self.registry_jobs.jobs.items, workspace.id, process.id)) return;
+            // P2 records crashes as failed and never auto-restart; restart
+            // policy belongs to P3+ so an exit cannot create a launch loop.
+            const event: process_registry.ManagedProcessRuntimeEvent = if (session.exit_status) |status|
+                if (status == 0) .stopped else .failed
+            else
+                .failed;
+            process.transition(event, now_ms) catch |err| {
+                log.warn("managed session exit transition failed id_len={d} err={s}", .{ session.session_id.len, @errorName(err) });
+                session.registry_finished = true;
+                return;
+            };
+            // Retain the stopped session id so process.logs can still tail
+            // the daemon-owned ring until the next explicit start detaches it.
+            self.bumpRegistryRevision();
+            session.registry_finished = true;
+            return;
+        }
     }
 
     /// Record a session exit in the registry exactly once.
@@ -2088,12 +2206,19 @@ pub const Daemon = struct {
         const workspace = self.resolveWorkspaceFromParams(params) catch |err| return self.registryErrorResponse(id_value, err);
         const process_id = requiredObjectString(params, "process_id") catch |err| return self.registryErrorResponse(id_value, err);
 
-        // Managed proc:{...} IDs join this lookup when W5 adds daemon-owned
-        // managed sessions. W3 only resolves tracked terminal process IDs.
+        // Managed proc:{...} IDs point through the managed record to the
+        // daemon-owned PTY; tracked terminal IDs keep their existing path.
         var session_id: ?[]const u8 = null;
         for (workspace.tracked_terminal_processes.items) |process| {
             if (std.mem.eql(u8, process.process_id, process_id)) {
                 session_id = process.session_id;
+                break;
+            }
+        }
+        if (session_id == null) {
+            for (workspace.managed_processes.items) |process| {
+                if (!std.mem.eql(u8, process.id, process_id) and !std.mem.eql(u8, process.name, process_id)) continue;
+                session_id = process.session_id orelse break;
                 break;
             }
         }
@@ -2141,6 +2266,522 @@ pub const Daemon = struct {
         try s.endObject();
         try s.endObject();
         return try writer.toOwnedSlice();
+    }
+
+    fn handleSlowRegistryRequest(self: *Daemon, allocator: std.mem.Allocator, request: []const u8) ![]u8 {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, request, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidParams;
+        const id_value = parsed.value.object.get("id") orelse .null;
+        const method = jsonString(parsed.value.object.get("method") orelse .null) orelse return error.InvalidParams;
+        const params = parsed.value.object.get("params") orelse .null;
+
+        if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_START)) {
+            var decoded = parseDaemonParams(headless.registry.ProcessStartRequest, allocator, params) catch
+                return self.registryErrorResponse(id_value, error.InvalidParams);
+            defer decoded.deinit();
+            return self.handleSlowProcess(
+                allocator,
+                id_value,
+                params,
+                .start,
+                decoded.value.name,
+                decoded.value.process_id,
+                decoded.value.client_id,
+                false,
+            );
+        }
+        if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_STOP)) {
+            var decoded = parseDaemonParams(headless.registry.ProcessStopRequest, allocator, params) catch
+                return self.registryErrorResponse(id_value, error.InvalidParams);
+            defer decoded.deinit();
+            return self.handleSlowProcess(
+                allocator,
+                id_value,
+                params,
+                .stop,
+                "",
+                decoded.value.process_id,
+                decoded.value.client_id,
+                decoded.value.force,
+            );
+        }
+        if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_RESTART)) {
+            var decoded = parseDaemonParams(headless.registry.ProcessRestartRequest, allocator, params) catch
+                return self.registryErrorResponse(id_value, error.InvalidParams);
+            defer decoded.deinit();
+            return self.handleSlowProcess(
+                allocator,
+                id_value,
+                params,
+                .restart,
+                decoded.value.name,
+                decoded.value.process_id,
+                decoded.value.client_id,
+                false,
+            );
+        }
+        return try errorResponseAlloc(allocator, id_value, "method_not_found", method);
+    }
+
+    fn handleSlowProcess(
+        self: *Daemon,
+        allocator: std.mem.Allocator,
+        id_value: std.json.Value,
+        params: std.json.Value,
+        operation: SlowProcessOperation,
+        requested_name: []const u8,
+        requested_process_id: ?[]const u8,
+        requested_client_id: ?[]const u8,
+        force: bool,
+    ) ![]u8 {
+        lockDaemon(self);
+        var work = self.prepareSlowProcess(
+            allocator,
+            params,
+            operation,
+            requested_name,
+            requested_process_id,
+            requested_client_id,
+            force,
+        ) catch |err| {
+            self.mutex.unlock();
+            if (err == error.JobQueueFull) return resourceLimitErrorResponse(self, id_value, "registry_job_queue", process_registry.REGISTRY_JOB_QUEUE_MAX);
+            return self.registryErrorResponse(id_value, err);
+        };
+        self.mutex.unlock();
+        defer work.deinit(allocator);
+
+        var phase = self.executeSlowProcessPhase(&work);
+        defer phase.deinit(allocator);
+        lockDaemon(self);
+        defer self.mutex.unlock();
+        return self.finishSlowProcess(id_value, &work, &phase);
+    }
+
+    fn prepareSlowProcess(
+        self: *Daemon,
+        allocator: std.mem.Allocator,
+        params: std.json.Value,
+        operation: SlowProcessOperation,
+        requested_name: []const u8,
+        requested_process_id: ?[]const u8,
+        requested_client_id: ?[]const u8,
+        force: bool,
+    ) !SlowProcessWork {
+        if (!self.accepting_mutations) return error.DaemonDraining;
+        const fields = try workspaceRefFields(params);
+        if (operation != .stop and fields.workspace_path == null) {
+            const workspace_id = fields.workspace_id orelse return error.WorkspacePathRequired;
+            const existing_workspace = self.registry.workspace(workspace_id) orelse return error.WorkspacePathRequired;
+            if (existing_workspace.canonical_path == null) return error.WorkspacePathRequired;
+        }
+        const workspace = try self.resolveProcessWorkspace(params, operation);
+        const workspace_path = workspace.canonical_path orelse fields.workspace_path orelse "";
+        if (operation != .stop and workspace_path.len == 0) return error.WorkspacePathRequired;
+
+        var name: []u8 = &.{};
+        var process_id: []u8 = &.{};
+        errdefer if (name.len != 0) allocator.free(name);
+        errdefer if (process_id.len != 0) allocator.free(process_id);
+        if (requested_name.len != 0) {
+            name = try allocator.dupe(u8, requested_name);
+            process_id = if (requested_process_id) |value| blk: {
+                if (value.len == 0) return error.InvalidParams;
+                break :blk try allocator.dupe(u8, value);
+            } else try std.fmt.allocPrint(allocator, "proc:{s}:{s}", .{ workspace.id, name });
+        } else if (requested_process_id) |identifier| {
+            if (identifier.len == 0) return error.InvalidParams;
+            const process = managedProcessByIdentifier(workspace, identifier) orelse return error.ManagedProcessNotFound;
+            name = try allocator.dupe(u8, process.name);
+            process_id = try allocator.dupe(u8, process.id);
+        } else {
+            return error.InvalidParams;
+        }
+
+        const process = managedProcessByIdentifier(workspace, process_id);
+        if (process) |existing| {
+            if (requested_name.len != 0 and !std.mem.eql(u8, existing.name, name)) return error.InvalidParams;
+            if (!std.mem.eql(u8, existing.id, process_id)) {
+                allocator.free(process_id);
+                process_id = try allocator.dupe(u8, existing.id);
+            }
+        } else if (operation != .start) {
+            return error.ManagedProcessNotFound;
+        }
+
+        const now = nowMs();
+        const event: process_registry.ManagedProcessRuntimeEvent = switch (operation) {
+            .start => .start,
+            .stop => .stop,
+            .restart => .restart,
+        };
+        if (hasRegistryJob(self.registry_jobs.jobs.items, workspace.id, process_id)) return error.OperationAlreadyInProgress;
+        if (self.registry_jobs.isFull()) return error.JobQueueFull;
+
+        var trial_runtime: process_registry.ManagedProcessRuntime = if (process) |existing| existing.runtime else .{};
+        try trial_runtime.transition(event, now);
+
+        var job = try process_registry.RegistryJob.init(
+            allocator,
+            switch (operation) {
+                .start => .start_managed_process,
+                .stop => .stop_managed_process,
+                .restart => .restart_managed_process,
+            },
+            workspace.id,
+            process_id,
+            requested_client_id orelse "",
+        );
+        var job_owned_by_caller = true;
+        errdefer if (job_owned_by_caller) job.deinit(allocator);
+        var work: SlowProcessWork = .{
+            .operation = operation,
+            .workspace_id = &.{},
+            .workspace_path = &.{},
+            .name = &.{},
+            .process_id = &.{},
+            .client_id = &.{},
+            .force = force,
+            .generation = trial_runtime.generation,
+        };
+        errdefer work.deinit(allocator);
+        work.workspace_id = try allocator.dupe(u8, workspace.id);
+        work.workspace_path = try allocator.dupe(u8, workspace_path);
+        work.name = name;
+        name = &.{};
+        work.process_id = process_id;
+        process_id = &.{};
+        work.client_id = try allocator.dupe(u8, requested_client_id orelse "");
+        if (process) |existing| {
+            if (existing.session_id) |session_id| work.previous_session_id = try allocator.dupe(u8, session_id);
+        }
+
+        if (self.registry_jobs.push(allocator, job)) |_| {
+            job_owned_by_caller = false;
+        } else |err| {
+            // RegistryJobQueue deinitializes the job when its append fails
+            // after taking ownership; JobQueueFull returns before ownership
+            // transfers and the errdefer above cleans up that path.
+            if (err == error.OutOfMemory) job_owned_by_caller = false;
+            return err;
+        }
+        if (process) |existing| if (operation != .stop) {
+            existing.transition(event, now) catch |err| {
+                if (self.registry_jobs.removeMatching(work.workspace_id, work.process_id)) |queued| {
+                    var owned_queued = queued;
+                    owned_queued.deinit(allocator);
+                }
+                return err;
+            };
+        };
+        return work;
+    }
+
+    fn resolveProcessWorkspace(self: *Daemon, params: std.json.Value, operation: SlowProcessOperation) !*process_registry.WorkspaceRecord {
+        const fields = try workspaceRefFields(params);
+        if (fields.workspace_id) |workspace_id| {
+            if (fields.workspace_path == null) {
+                if (operation == .stop) return self.registry.workspace(workspace_id) orelse error.WorkspaceNotFound;
+                return self.registry.workspace(workspace_id) orelse error.WorkspacePathRequired;
+            }
+        }
+        return self.resolveWorkspaceFromParams(params);
+    }
+
+    fn executeSlowProcessPhase(self: *Daemon, work: *const SlowProcessWork) SlowProcessPhaseResult {
+        var result: SlowProcessPhaseResult = .{};
+        if (self.test_slow_io_delay_ms != 0) sleepMs(@intCast(self.test_slow_io_delay_ms));
+
+        if (work.previous_session_id) |session_id| {
+            if (!self.stopManagedSessionUnlocked(session_id, work.force)) {
+                result.failure = .invalid_state;
+                return result;
+            }
+        }
+        if (work.operation == .stop) {
+            result.stop_completed = true;
+            return result;
+        }
+
+        const loaded = stack.loadFromProject(self.allocator, work.workspace_path) catch |err| {
+            result.failure = .{ .config_unavailable = @errorName(err) };
+            return result;
+        };
+        if (loaded == null) {
+            result.failure = .{ .config_unavailable = "config_not_found" };
+            return result;
+        }
+        var config = loaded.?;
+        defer config.deinit(self.allocator);
+        if (stack.validateDefinitionBounds(&config)) |violation| {
+            result.failure = .{ .bounds = violation };
+            return result;
+        }
+        const definition = for (config.processes.items) |*candidate| {
+            if (std.mem.eql(u8, candidate.name, work.name)) break candidate;
+        } else {
+            result.failure = .resource_not_found;
+            return result;
+        };
+        const launch = definition.launchForOs(builtin.os.tag) orelse {
+            result.failure = .invalid_state;
+            return result;
+        };
+        const cwd = managedProcessCwd(self.allocator, work.workspace_path, definition.cwd) catch {
+            result.failure = .invalid_state;
+            return result;
+        };
+        defer self.allocator.free(cwd);
+        result.cwd = self.allocator.dupe(u8, cwd) catch {
+            result.failure = .invalid_state;
+            return result;
+        };
+        var launch_args: std.ArrayList([]const u8) = .empty;
+        defer launch_args.deinit(self.allocator);
+        switch (launch) {
+            .command => |command| {
+                tryAppendLaunchArg(self.allocator, &launch_args, if (builtin.os.tag == .windows) "powershell.exe" else "/bin/sh") catch {
+                    result.failure = .invalid_state;
+                    return result;
+                };
+                tryAppendLaunchArg(self.allocator, &launch_args, if (builtin.os.tag == .windows) "-Command" else "-c") catch {
+                    result.failure = .invalid_state;
+                    return result;
+                };
+                tryAppendLaunchArg(self.allocator, &launch_args, command) catch {
+                    result.failure = .invalid_state;
+                    return result;
+                };
+                result.command = self.allocator.dupe(u8, command) catch {
+                    result.failure = .invalid_state;
+                    return result;
+                };
+            },
+            .argv => |argv| {
+                for (argv) |arg| {
+                    tryAppendLaunchArg(self.allocator, &launch_args, arg) catch {
+                        result.failure = .invalid_state;
+                        return result;
+                    };
+                }
+                result.command = std.mem.join(self.allocator, " ", launch_args.items) catch {
+                    result.failure = .invalid_state;
+                    return result;
+                };
+            },
+        }
+        const session_id = std.fmt.allocPrint(self.allocator, "managed:{s}:{s}:{d}", .{ work.workspace_id, work.name, work.generation }) catch {
+            result.failure = .invalid_state;
+            return result;
+        };
+        defer self.allocator.free(session_id);
+        const session = PtySession.create(self.allocator, .{
+            .session_id = session_id,
+            .project_id = work.workspace_id,
+            .project_path = work.workspace_path,
+            .cwd = cwd,
+            .label = work.name,
+            .command = launch_args.items,
+            .pref_path = self.pref_path,
+        }) catch {
+            result.failure = .invalid_state;
+            return result;
+        };
+        result.session = session;
+        return result;
+    }
+
+    /// Stop a managed PTY without holding the daemon mutex across the wait.
+    /// The session list may move between polls, so each 20 ms sample re-finds
+    /// the session while briefly holding the lock.
+    fn stopManagedSessionUnlocked(self: *Daemon, session_id: []const u8, force: bool) bool {
+        lockDaemon(self);
+        const terminated = if (self.find(session_id)) |session| session.terminate() else false;
+        self.mutex.unlock();
+        if (terminated and self.waitForManagedSessionStopped(session_id, 2000)) return true;
+        if (!terminated and self.findSessionStopped(session_id)) return true;
+        if (!force) return false;
+
+        lockDaemon(self);
+        const force_terminated = if (self.find(session_id)) |session| session.forceTerminate() else false;
+        self.mutex.unlock();
+        if (!force_terminated) return self.findSessionStopped(session_id);
+        return self.waitForManagedSessionStopped(session_id, 2000);
+    }
+
+    fn waitForManagedSessionStopped(self: *Daemon, session_id: []const u8, timeout_ms: i64) bool {
+        var elapsed_ms: i64 = 0;
+        while (elapsed_ms < timeout_ms) : (elapsed_ms += 20) {
+            if (self.findSessionStopped(session_id)) return true;
+            sleepMs(20);
+        }
+        return self.findSessionStopped(session_id);
+    }
+
+    fn findSessionStopped(self: *Daemon, session_id: []const u8) bool {
+        lockDaemon(self);
+        defer self.mutex.unlock();
+        const session = self.find(session_id) orelse return true;
+        session.poll(self.allocator) catch {};
+        return !session.running;
+    }
+
+    fn finishSlowProcess(
+        self: *Daemon,
+        id_value: std.json.Value,
+        work: *const SlowProcessWork,
+        phase: *SlowProcessPhaseResult,
+    ) ![]u8 {
+        var job = self.registry_jobs.removeMatching(work.workspace_id, work.process_id) orelse
+            return self.registryErrorResponse(id_value, error.OperationAlreadyInProgress);
+        defer job.deinit(self.allocator);
+
+        const workspace = self.registry.workspace(work.workspace_id) orelse {
+            return self.registryErrorResponse(id_value, error.WorkspaceNotFound);
+        };
+
+        if (phase.failure) |failure| {
+            if (phase.session) |session| {
+                _ = session.terminate();
+                session.deinit(self.allocator);
+                phase.session = null;
+            }
+            if (managedProcessByIdentifier(workspace, work.process_id)) |process| {
+                process.transition(.failed, nowMs()) catch {};
+                self.bumpRegistryRevision();
+            }
+            return self.slowProcessFailureResponse(id_value, work.operation, failure);
+        }
+
+        var process = managedProcessByIdentifier(workspace, work.process_id);
+        if (process == null) {
+            if (work.operation != .start) return self.registryErrorResponse(id_value, error.ManagedProcessNotFound);
+            process = self.registry.ensureManagedProcess(
+                self.allocator,
+                work.workspace_id,
+                work.name,
+                phase.command,
+                nowMs(),
+            ) catch |err| {
+                if (err == error.ManagedProcessCapacityExceeded)
+                    return resourceLimitErrorResponse(self, id_value, "managed_process", stack.MAX_PROCESS_DEFINITIONS);
+                return self.registryErrorResponse(id_value, err);
+            };
+            process.?.transition(.start, nowMs()) catch |err| return self.registryErrorResponse(id_value, err);
+        }
+        const managed_process = process.?;
+
+        switch (work.operation) {
+            .stop => {
+                if (!phase.stop_completed) return self.registryErrorResponse(id_value, error.InvalidManagedProcessTransition);
+                try managed_process.transition(.stop, nowMs());
+                if (work.previous_session_id) |session_id| {
+                    _ = self.removeSessionById(session_id);
+                }
+                if (managed_process.session_id) |session_id| {
+                    self.allocator.free(session_id);
+                    managed_process.session_id = null;
+                }
+                managed_process.pid = null;
+                managed_process.process_group = null;
+            },
+            .start, .restart => {
+                const session = phase.session orelse return self.registryErrorResponse(id_value, error.InvalidManagedProcessTransition);
+                var owned_command = try self.allocator.dupe(u8, phase.command);
+                errdefer self.allocator.free(owned_command);
+                var owned_cwd = try self.allocator.dupe(u8, phase.cwd);
+                errdefer self.allocator.free(owned_cwd);
+                var owned_session_id = try self.allocator.dupe(u8, session.session_id);
+                errdefer self.allocator.free(owned_session_id);
+                try self.sessions.append(self.allocator, session);
+                phase.session = null;
+
+                if (managed_process.command.len != 0) self.allocator.free(managed_process.command);
+                managed_process.command = owned_command;
+                owned_command = &.{};
+                if (managed_process.cwd.len != 0) self.allocator.free(managed_process.cwd);
+                managed_process.cwd = owned_cwd;
+                owned_cwd = &.{};
+                if (managed_process.session_id) |session_id| self.allocator.free(session_id);
+                managed_process.session_id = owned_session_id;
+                owned_session_id = &.{};
+                managed_process.pid = @intCast(session.child_pid);
+                managed_process.process_group = if (session.foregroundProcessGroup()) |group| @intCast(group) else null;
+                managed_process.transition(.started, nowMs()) catch |err| {
+                    _ = self.removeSessionById(session.session_id);
+                    return self.registryErrorResponse(id_value, err);
+                };
+                if (work.previous_session_id) |session_id| {
+                    if (!std.mem.eql(u8, session_id, session.session_id)) _ = self.removeSessionById(session_id);
+                }
+            },
+        }
+        self.bumpRegistryRevision();
+        return self.slowProcessSuccessResponse(id_value, work.operation, workspace, managed_process);
+    }
+
+    fn slowProcessFailureResponse(
+        self: *Daemon,
+        id_value: std.json.Value,
+        operation: SlowProcessOperation,
+        failure: SlowProcessFailure,
+    ) ![]u8 {
+        return switch (failure) {
+            .resource_not_found => errorResponseAlloc(self.allocator, id_value, headless.registry.ERR_RESOURCE_NOT_FOUND, "process definition not found"),
+            .invalid_params => errorResponseAlloc(self.allocator, id_value, headless.registry.ERR_INVALID_PARAMS, "invalid process parameters"),
+            .invalid_state => errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.registry.ERR_INVALID_STATE,
+                if (operation == .stop) "managed process stop failed" else "managed process is not startable",
+            ),
+            .config_unavailable => |detail| configUnavailableErrorResponse(self, id_value, detail),
+            .bounds => |violation| resourceLimitErrorResponse(self, id_value, violation.resource, violation.limit),
+        };
+    }
+
+    fn slowProcessSuccessResponse(
+        self: *Daemon,
+        id_value: std.json.Value,
+        operation: SlowProcessOperation,
+        workspace: *const process_registry.WorkspaceRecord,
+        process: *const process_registry.ManagedProcess,
+    ) ![]u8 {
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer writer.deinit();
+        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try s.beginObject();
+        try writeRegistryEnvelope(&s, self);
+        try s.objectField("workspace");
+        try writeWorkspaceInfo(&s, self, workspace);
+        try s.objectField(switch (operation) {
+            .start => "started",
+            .stop => "stopped",
+            .restart => "restarted",
+        });
+        try s.write(true);
+        try s.objectField("process");
+        try writeManagedProcessSnapshot(&s, workspace, process);
+        try s.endObject();
+        try s.endObject();
+        return try writer.toOwnedSlice();
+    }
+
+    fn bumpRegistryRevision(self: *Daemon) void {
+        self.registry.registry_revision +%= 1;
+        if (self.registry.registry_revision == 0) self.registry.registry_revision = 1;
+    }
+
+    fn removeSessionById(self: *Daemon, session_id: []const u8) bool {
+        for (self.sessions.items, 0..) |session, index| {
+            if (!std.mem.eql(u8, session.session_id, session_id)) continue;
+            self.removeAt(index);
+            return true;
+        }
+        return false;
     }
 
     fn leaseCheckResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
@@ -2505,10 +3146,16 @@ pub const Daemon = struct {
             error.ClientOwnerRequired,
             error.LeaseOwnerRequired,
             error.LeaseResourcesRequired,
+            error.ProcessNameRequired,
             => .{ headless.registry.ERR_INVALID_PARAMS, "invalid workspace or client parameters" },
             error.WorkspaceNotFound => .{ headless.registry.ERR_RESOURCE_NOT_FOUND, "workspace not found" },
             error.LeaseNotFound => .{ headless.registry.ERR_RESOURCE_NOT_FOUND, "lease not found" },
+            error.ManagedProcessNotFound => .{ headless.registry.ERR_RESOURCE_NOT_FOUND, "managed process not found" },
             error.ClientClosed => .{ headless.registry.ERR_INVALID_STATE, "client is closed" },
+            error.DaemonDraining => .{ headless.registry.ERR_INVALID_STATE, "daemon is preparing shutdown and is not accepting mutations" },
+            error.OperationAlreadyInProgress => .{ headless.registry.ERR_INVALID_STATE, "operation already in progress" },
+            error.InvalidManagedProcessTransition => .{ headless.registry.ERR_INVALID_STATE, "invalid managed process transition" },
+            error.ManagedProcessCapacityExceeded => .{ headless.registry.ERR_INVALID_STATE, "managed process capacity exceeded" },
             error.WorkspaceCapacityExceeded => .{ headless.registry.ERR_INVALID_STATE, "workspace registry capacity exceeded" },
             error.SessionNotFound => .{ headless.registry.ERR_RESOURCE_NOT_FOUND, "resource not found" },
             else => .{ headless.registry.ERR_INTERNAL, @errorName(err) },
@@ -3101,6 +3748,63 @@ fn leaseConflictErrorResponse(
     );
 }
 
+fn resourceLimitErrorResponse(
+    self: *Daemon,
+    id_value: std.json.Value,
+    resource: []const u8,
+    limit: usize,
+) ![]u8 {
+    var data_writer: std.Io.Writer.Allocating = .init(self.allocator);
+    errdefer data_writer.deinit();
+    var data_stringify: std.json.Stringify = .{ .writer = &data_writer.writer, .options = .{} };
+    try data_stringify.beginObject();
+    try data_stringify.objectField("resource");
+    try data_stringify.write(resource);
+    try data_stringify.objectField("limit");
+    try data_stringify.write(limit);
+    try data_stringify.endObject();
+    const data_json = try data_writer.toOwnedSlice();
+    defer self.allocator.free(data_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, data_json, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    return try errorResponseAllocWithData(
+        self.allocator,
+        id_value,
+        headless.registry.ERR_INVALID_STATE,
+        "process operation exceeds a configured resource limit",
+        parsed.value,
+    );
+}
+
+fn configUnavailableErrorResponse(
+    self: *Daemon,
+    id_value: std.json.Value,
+    detail: []const u8,
+) ![]u8 {
+    var data_writer: std.Io.Writer.Allocating = .init(self.allocator);
+    errdefer data_writer.deinit();
+    var data_stringify: std.json.Stringify = .{ .writer = &data_writer.writer, .options = .{} };
+    try data_stringify.beginObject();
+    try data_stringify.objectField("error");
+    try data_stringify.write(detail);
+    try data_stringify.endObject();
+    const data_json = try data_writer.toOwnedSlice();
+    defer self.allocator.free(data_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, data_json, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    return try errorResponseAllocWithData(
+        self.allocator,
+        id_value,
+        headless.registry.ERR_INVALID_STATE,
+        "workspace config unavailable",
+        parsed.value,
+    );
+}
+
 fn writeWorkspaceInfo(s: *std.json.Stringify, daemon: *const Daemon, workspace: *const process_registry.WorkspaceRecord) !void {
     try s.beginObject();
     try s.objectField("id");
@@ -3466,7 +4170,7 @@ fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8) !vo
     const pid_path = try pidFilePath(allocator, pref_path);
     defer allocator.free(pid_path);
 
-    var daemon = Daemon.init(allocator);
+    var daemon = Daemon.initWithPrefPath(allocator, pref_path);
     defer daemon.deinit();
     var stop_requested = std.atomic.Value(bool).init(false);
     var server_context: SessionizerServerContext = .{
@@ -3546,10 +4250,27 @@ fn idleExitMsFromEnv(allocator: std.mem.Allocator) ?i64 {
     return parsed;
 }
 
+fn slowIoDelayMsFromEnv(allocator: std.mem.Allocator) u64 {
+    const environ: std.process.Environ = if (builtin.os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    const raw = environ.getAlloc(allocator, TEST_SLOW_IO_ENV_NAME) catch return 0;
+    defer allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const parsed = std.fmt.parseInt(u64, trimmed, 10) catch return 0;
+    return @min(parsed, 5000);
+}
+
 fn handleSessionizerServerRequest(raw_context: *anyopaque, request: []u8) anyerror![]u8 {
     const context: *SessionizerServerContext = @ptrCast(@alignCast(raw_context));
     const daemon = context.daemon;
     defer daemon.allocator.free(request);
+
+    if (requestNeedsSlowWork(daemon.allocator, request)) {
+        return daemon.handleSlowRegistryRequest(daemon.allocator, request) catch |err|
+            errorResponseAlloc(daemon.allocator, .null, "internal_error", @errorName(err));
+    }
 
     lockDaemon(daemon);
     const response = daemon.handleRequest(std.mem.trim(u8, request, "\r")) catch |err| {
@@ -3558,6 +4279,56 @@ fn handleSessionizerServerRequest(raw_context: *anyopaque, request: []u8) anyerr
     };
     daemon.mutex.unlock();
     return response;
+}
+
+fn requestNeedsSlowWork(allocator: std.mem.Allocator, request: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, request, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const method = jsonString(parsed.value.object.get("method") orelse .null) orelse return false;
+    return methodNeedsSlowWork(method);
+}
+
+fn methodNeedsSlowWork(method: []const u8) bool {
+    return std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_START) or
+        std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_STOP) or
+        std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_RESTART);
+}
+
+fn managedProcessByIdentifier(
+    workspace: *process_registry.WorkspaceRecord,
+    identifier: []const u8,
+) ?*process_registry.ManagedProcess {
+    for (workspace.managed_processes.items) |*process| {
+        if (std.mem.eql(u8, process.id, identifier) or std.mem.eql(u8, process.name, identifier)) return process;
+    }
+    return null;
+}
+
+fn hasRegistryJob(
+    jobs: []const process_registry.RegistryJob,
+    workspace_id: []const u8,
+    process_id: []const u8,
+) bool {
+    for (jobs) |job| {
+        if (std.mem.eql(u8, job.workspace_id, workspace_id) and std.mem.eql(u8, job.process_id, process_id)) return true;
+    }
+    return false;
+}
+
+fn managedProcessCwd(allocator: std.mem.Allocator, workspace_path: []const u8, definition_cwd: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, definition_cwd, " \t\r\n");
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, ".")) return allocator.dupe(u8, workspace_path);
+    if (std.fs.path.isAbsolute(trimmed)) return allocator.dupe(u8, trimmed);
+    return std.fs.path.join(allocator, &.{ workspace_path, trimmed });
+}
+
+fn tryAppendLaunchArg(
+    allocator: std.mem.Allocator,
+    launch_args: *std.ArrayList([]const u8),
+    arg: []const u8,
+) !void {
+    try launch_args.append(allocator, arg);
 }
 
 const DrainThreadContext = struct {
@@ -3625,6 +4396,10 @@ fn chatTurnKeepsDaemonAlive(status: ChatTurnStatus, consumed: bool, worker_done:
 
 fn sleepMs(milliseconds: i64) void {
     platform_runtime.sleepMillis(@intCast(@max(milliseconds, 0)));
+}
+
+fn isManagedSessionId(session_id: []const u8) bool {
+    return std.mem.startsWith(u8, session_id, "managed:");
 }
 
 fn okSessionResponse(allocator: std.mem.Allocator, id_value: std.json.Value, session: *const PtySession, created: bool) ![]u8 {
@@ -5005,6 +5780,188 @@ test "notifications pull honors cursor and limit" {
     try std.testing.expectEqual(@as(usize, 0), unaffected.value.object.get("result").?.object.get("notifications").?.array.items.len);
 }
 
+test "process.start rejects unknown definitions and unstartable platforms" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const config =
+        \\processes:
+        \\  windows-only:
+        \\    command_windows: "pwsh.exe"
+    ;
+    var file = try tmp.dir.createFile(std.testing.io, "verde.yml", .{});
+    try file.writeStreamingAll(std.testing.io, config);
+    file.close(std.testing.io);
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const workspace_path = path_buf[0..path_len];
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const unknown_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"process.start\",\"params\":{{\"workspace\":{{\"workspace_path\":\"{s}\"}},\"name\":\"missing\"}}}}",
+        .{workspace_path},
+    );
+    defer allocator.free(unknown_request);
+    const unknown_response = try daemon.handleSlowRegistryRequest(allocator, unknown_request);
+    defer allocator.free(unknown_response);
+    var unknown = try std.json.parseFromSlice(std.json.Value, allocator, unknown_response, .{});
+    defer unknown.deinit();
+    try std.testing.expectEqualStrings(
+        headless.registry.ERR_RESOURCE_NOT_FOUND,
+        jsonString(unknown.value.object.get("error").?.object.get("code").?).?,
+    );
+    const unknown_workspace = daemon.registry.workspaceByPath(allocator, workspace_path, nowMs()) orelse return error.WorkspaceRecordMissing;
+    try std.testing.expectEqual(@as(usize, 0), unknown_workspace.managed_processes.items.len);
+
+    const unstartable_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"process.start\",\"params\":{{\"workspace\":{{\"workspace_path\":\"{s}\"}},\"name\":\"windows-only\"}}}}",
+        .{workspace_path},
+    );
+    defer allocator.free(unstartable_request);
+    const unstartable_response = try daemon.handleSlowRegistryRequest(allocator, unstartable_request);
+    defer allocator.free(unstartable_response);
+    var unstartable = try std.json.parseFromSlice(std.json.Value, allocator, unstartable_response, .{});
+    defer unstartable.deinit();
+    try std.testing.expectEqualStrings(
+        headless.registry.ERR_INVALID_STATE,
+        jsonString(unstartable.value.object.get("error").?.object.get("code").?).?,
+    );
+    try std.testing.expectEqual(@as(usize, 0), unknown_workspace.managed_processes.items.len);
+}
+
+test "process.start cap returns a structured managed-process limit" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const config =
+        \\processes:
+        \\  overflow-target:
+        \\    command: "/bin/true"
+    ;
+    var file = try tmp.dir.createFile(std.testing.io, "verde.yml", .{});
+    try file.writeStreamingAll(std.testing.io, config);
+    file.close(std.testing.io);
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const workspace_path = path_buf[0..path_len];
+    var daemon = Daemon.initWithPrefPath(allocator, workspace_path);
+    defer daemon.deinit();
+    const workspace_id = try workspace_identity.deriveProjectId(allocator, workspace_path);
+    defer allocator.free(workspace_id);
+    _ = try daemon.registry.registerWorkspacePath(allocator, workspace_id, workspace_path, nowMs());
+
+    var name_buffer: [32]u8 = undefined;
+    for (0..stack.MAX_PROCESS_DEFINITIONS) |index| {
+        const name = try std.fmt.bufPrint(&name_buffer, "existing-{d}", .{index});
+        _ = try daemon.registry.ensureManagedProcess(allocator, workspace_id, name, "/bin/true", @intCast(index));
+    }
+
+    const request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"process.start\",\"params\":{{\"workspace\":{{\"workspace_path\":\"{s}\"}},\"name\":\"overflow-target\"}}}}",
+        .{workspace_path},
+    );
+    defer allocator.free(request);
+    const response = try daemon.handleSlowRegistryRequest(allocator, request);
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const error_value = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings(headless.registry.ERR_INVALID_STATE, error_value.get("code").?.string);
+    const data = error_value.get("data").?.object;
+    try std.testing.expectEqualStrings("managed_process", data.get("resource").?.string);
+    try std.testing.expectEqual(@as(i64, stack.MAX_PROCESS_DEFINITIONS), data.get("limit").?.integer);
+    try std.testing.expectEqual(stack.MAX_PROCESS_DEFINITIONS, daemon.registry.workspace(workspace_id).?.managed_processes.items.len);
+}
+
+test "failed managed stop keeps a consistent failed runtime state" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    const process = try daemon.registry.ensureManagedProcess(allocator, "stop-failure", "worker", "/bin/cat", nowMs());
+    try process.transition(.start, nowMs());
+    try process.transition(.started, nowMs());
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"process.stop","params":{"workspace":{"workspace_id":"stop-failure"},"process_id":"proc:stop-failure:worker"}}
+    , .{});
+    defer parsed.deinit();
+    const params = parsed.value.object.get("params").?;
+    var work = try daemon.prepareSlowProcess(allocator, params, .stop, "", "proc:stop-failure:worker", null, false);
+    defer work.deinit(allocator);
+    try std.testing.expectEqual(process_registry.ManagedProcessRuntimeState.running, process.runtime.state);
+
+    var phase: SlowProcessPhaseResult = .{ .failure = .invalid_state };
+    const response = try daemon.finishSlowProcess(parsed.value.object.get("id").?, &work, &phase);
+    defer allocator.free(response);
+    try std.testing.expectEqual(process_registry.ManagedProcessRuntimeState.failed, process.runtime.state);
+    try std.testing.expectEqual(@as(usize, 0), daemon.registry_jobs.len());
+}
+
+test "process start/stop transitions and job queue dedupe" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    _ = try daemon.registry.ensureWorkspace(allocator, "process-dedupe");
+    _ = try daemon.registry.registerWorkspacePath(allocator, "process-dedupe", "/tmp", nowMs());
+    _ = try daemon.registry.ensureManagedProcess(allocator, "process-dedupe", "worker", "", nowMs());
+
+    const queued = try process_registry.RegistryJob.init(
+        allocator,
+        .start_managed_process,
+        "process-dedupe",
+        "proc:process-dedupe:worker",
+        "client-a",
+    );
+    try daemon.registry_jobs.push(allocator, queued);
+    const dedupe_response = try daemon.handleSlowRegistryRequest(allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"process.start","params":{"workspace":{"workspace_id":"process-dedupe"},"name":"worker"}}
+    );
+    defer allocator.free(dedupe_response);
+    var dedupe = try std.json.parseFromSlice(std.json.Value, allocator, dedupe_response, .{});
+    defer dedupe.deinit();
+    try std.testing.expectEqualStrings(
+        headless.registry.ERR_INVALID_STATE,
+        jsonString(dedupe.value.object.get("error").?.object.get("code").?).?,
+    );
+    var removed = daemon.registry_jobs.take().?;
+    removed.deinit(allocator);
+
+    var runtime: process_registry.ManagedProcessRuntime = .{};
+    try runtime.transition(.start, 1);
+    try std.testing.expectError(error.InvalidManagedProcessTransition, runtime.transition(.start, 2));
+    try runtime.transition(.started, 3);
+    try runtime.transition(.stop, 4);
+    try std.testing.expectEqual(process_registry.ManagedProcessRuntimeState.stopped, runtime.state);
+
+    for (0..process_registry.REGISTRY_JOB_QUEUE_MAX) |index| {
+        var process_id_buf: [32]u8 = undefined;
+        const process_id = try std.fmt.bufPrint(&process_id_buf, "proc:full:{d}", .{index});
+        const job = try process_registry.RegistryJob.init(allocator, .load_config, "full", process_id, "");
+        try daemon.registry_jobs.push(allocator, job);
+    }
+    const full_response = try daemon.handleSlowRegistryRequest(allocator,
+        \\{"jsonrpc":"2.0","id":2,"method":"process.start","params":{"workspace":{"workspace_path":"/tmp/process-queue-full"},"name":"worker"}}
+    );
+    defer allocator.free(full_response);
+    var full = try std.json.parseFromSlice(std.json.Value, allocator, full_response, .{});
+    defer full.deinit();
+    const full_error = full.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings(headless.registry.ERR_INVALID_STATE, jsonString(full_error.get("code").?).?);
+    const data = full_error.get("data").?;
+    try std.testing.expectEqualStrings("registry_job_queue", jsonString(data.object.get("resource").?).?);
+    try std.testing.expectEqual(@as(i64, process_registry.REGISTRY_JOB_QUEUE_MAX), data.object.get("limit").?.integer);
+}
+
 test "session create reuses running session and replaces stopped session" {
     switch (builtin.os.tag) {
         .linux, .macos => {},
@@ -5505,6 +6462,17 @@ test "draining dispatcher rejects every state mutator" {
         const error_value = parsed.value.object.get("error").?.object;
         try std.testing.expectEqualStrings("invalid_state", jsonString(error_value.get("code").?).?);
     }
+
+    const slow_response = try daemon.handleSlowRegistryRequest(allocator,
+        \\{"jsonrpc":"2.0","id":99,"method":"process.start","params":{}}
+    );
+    defer allocator.free(slow_response);
+    var slow_parsed = try std.json.parseFromSlice(std.json.Value, allocator, slow_response, .{});
+    defer slow_parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "invalid_state",
+        jsonString(slow_parsed.value.object.get("error").?.object.get("code").?).?,
+    );
 }
 
 test "idle exit is disabled by default and honors override" {
