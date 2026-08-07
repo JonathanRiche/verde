@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const harness = @import("../providers/harness.zig");
 const headless = @import("headless");
 const process_registry = @import("../daemon/process_registry.zig");
+const daemon_store = @import("../daemon/store.zig");
 const platform_ipc = @import("../platform/ipc.zig");
 const platform_live_endpoint = @import("../platform/live_endpoint.zig");
 const workspace_identity = @import("../platform/workspace_identity.zig");
@@ -21,6 +22,7 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 const log = std.log.scoped(.sessionizer);
+const store_protocol = headless.store;
 
 pub const SOCKET_NAME = "verde-sessionizer.sock";
 pub const LIVE_SOCKET_NAME = "verde.sock";
@@ -58,10 +60,27 @@ const ATTACH_STALE_MS: i64 = 60 * std.time.ms_per_s;
 /// Env override so hermetic tests can force a fast idle exit without changing
 /// production lifetime policy (null / unset = never idle-exit).
 const IDLE_EXIT_ENV_NAME = "VERDE_SESSION_DAEMON_IDLE_EXIT_MS";
+/// Test-only path-valued override: absolute directory for hermetic store DBs.
+/// When set, the daemon opens `{value}/state.sqlite` post-bind. Unset keeps
+/// the daemon store-less through Phase 2 (capability_unavailable).
+pub const SESSION_DAEMON_STORE_DIR_ENV_NAME = "VERDE_SESSION_DAEMON_STORE_DIR";
 /// Test-only latency injection for the unlocked managed-process phase.
 const TEST_SLOW_IO_ENV_NAME = "VERDE_SESSIONIZER_TEST_SLOW_IO_MS";
 /// Test-only orphan retention override; registry-internal TTLs remain fixed.
 const TEST_RETENTION_ENV_NAME = "VERDE_SESSIONIZER_TEST_RETENTION_MS";
+
+/// Store service spine: SQLite work runs under this mutex, never under lockDaemon.
+/// Uses the same spin-lock primitive as the daemon (Zig 0.16 has no std.Thread.Mutex).
+const StoreService = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    store: daemon_store.Store,
+    in_flight: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    draining: bool = false, // set by prepare-shutdown in S3
+};
+
+fn lockStoreService(service: *StoreService) void {
+    while (!service.mutex.tryLock()) std.atomic.spinLoopHint();
+}
 /// Bounded wait while an incompatible daemon drains live state before upgrade.
 const REPLACEMENT_WAIT_MS: i64 = 5 * std.time.ms_per_s;
 /// Extra grace after prepareShutdown accepts, independent of the prepare deadline.
@@ -1683,6 +1702,8 @@ pub const Daemon = struct {
     test_slow_io_delay_ms: u64 = 0,
     /// Test-only orphan retention override. It never changes registry TTLs.
     test_retention_override_ms: ?i64 = null,
+    /// Null until post-bind construction under VERDE_SESSION_DAEMON_STORE_DIR.
+    store_service: ?*StoreService = null,
 
     pub fn init(allocator: std.mem.Allocator) Daemon {
         return initWithPrefPath(allocator, "");
@@ -2020,6 +2041,9 @@ pub const Daemon = struct {
     }
 
     fn handleMethodRequest(self: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
+        // Store methods own their drain/capability precedence and unlock
+        // lockDaemon for SQLite work; route before the generic mutator drain gate.
+        if (isStoreMethod(method)) return try self.handleStoreRequest(id_value, method, params);
         if (!self.accepting_mutations and methodMutatesState(method)) {
             return try errorResponseAlloc(
                 self.allocator,
@@ -2069,6 +2093,164 @@ pub const Daemon = struct {
 
     fn methodMutatesState(method: []const u8) bool {
         return headless.isMutatingMethod(method);
+    }
+
+    /// Store request pipeline. Caller must NOT hold lockDaemon: this path takes
+    /// a short bookkeeping lock, then runs SQLite under the service mutex only.
+    fn handleStoreRequest(
+        self: *Daemon,
+        id_value: std.json.Value,
+        method: []const u8,
+        params: std.json.Value,
+    ) ![]u8 {
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const is_status = std.mem.eql(u8, method, store_protocol.METHOD_DAEMON_STORE_STATUS);
+        const is_mutator = !is_status;
+
+        // 1. Decode typed params OUTSIDE any lock into the per-request arena.
+        // parseFromValueLeaky ignores allocate; string slices borrow params,
+        // which outlive this call via the parent handleRequest parse.
+        var decode_failed = false;
+        var snapshot_request: ?store_protocol.SnapshotReplaceRequest = null;
+        var workspace_request: ?store_protocol.WorkspaceUpsertRequest = null;
+        if (std.mem.eql(u8, method, store_protocol.METHOD_STATE_SNAPSHOT_REPLACE)) {
+            snapshot_request = std.json.parseFromValueLeaky(
+                store_protocol.SnapshotReplaceRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch blk: {
+                decode_failed = true;
+                break :blk null;
+            };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_UPSERT)) {
+            workspace_request = std.json.parseFromValueLeaky(
+                store_protocol.WorkspaceUpsertRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch blk: {
+                decode_failed = true;
+                break :blk null;
+            };
+        } else if (!is_status) {
+            decode_failed = true;
+        }
+
+        const client_id: ?[]const u8 = blk: {
+            if (snapshot_request) |req| break :blk req.mutation.client_id;
+            if (workspace_request) |req| break :blk req.mutation.client_id;
+            break :blk null;
+        };
+
+        // 2. Short lockDaemon for bookkeeping only (never SQLite).
+        lockDaemon(self);
+        // (i) mutators only: refuse while draining.
+        if (is_mutator and !self.accepting_mutations) {
+            self.mutex.unlock();
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_STATE,
+                "daemon is preparing shutdown and is not accepting mutations",
+            );
+        }
+        // (ii) store-less daemon → capability_unavailable (status included).
+        const service = self.store_service orelse {
+            self.mutex.unlock();
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_CAPABILITY_UNAVAILABLE,
+                "store capability is unavailable",
+            );
+        };
+        // (iii) held decode failure.
+        if (decode_failed) {
+            self.mutex.unlock();
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid params",
+            );
+        }
+        // (iv) mutators: strict client_id validation against M2 client records.
+        if (is_mutator) {
+            const cid = client_id orelse {
+                self.mutex.unlock();
+                return try errorResponseAlloc(
+                    self.allocator,
+                    id_value,
+                    headless.protocol.ERR_INVALID_PARAMS,
+                    "unknown client_id",
+                );
+            };
+            if (self.registry.client(cid) == null) {
+                self.mutex.unlock();
+                return try errorResponseAlloc(
+                    self.allocator,
+                    id_value,
+                    headless.protocol.ERR_INVALID_PARAMS,
+                    "unknown client_id",
+                );
+            }
+        }
+        // (v) track in-flight, capture service pointer, unlock.
+        _ = service.in_flight.fetchAdd(1, .monotonic);
+        self.mutex.unlock();
+        defer _ = service.in_flight.fetchSub(1, .monotonic);
+
+        // 3. Store work with NO daemon lock.
+        lockStoreService(service);
+        defer service.mutex.unlock();
+
+        if (is_status) {
+            const store_revision = service.store.storeRevision() catch |err| {
+                return try storeErrorResponse(self.allocator, id_value, err);
+            };
+            // Store.init always opens at MAX_SUPPORTED_VERSION; read the live
+            // pragma under the service mutex so the status reflects the file.
+            const schema_version: u32 = blk: {
+                const row_or_null = service.store.conn.row("pragma user_version", .{}) catch {
+                    return try storeErrorResponse(self.allocator, id_value, error.StoreUnavailable);
+                };
+                const row = row_or_null orelse {
+                    return try storeErrorResponse(self.allocator, id_value, error.StoreCorrupt);
+                };
+                defer row.deinit();
+                break :blk @intCast(row.int(0));
+            };
+            // S2: drain_state is always "open"; S3 flips when service.draining.
+            const result: store_protocol.StoreStatusResult = .{
+                .schema_version = schema_version,
+                .store_revision = store_revision,
+                .writer_ready = true,
+                .queued_mutation_count = service.in_flight.load(.monotonic),
+                .drain_state = "open",
+            };
+            return try okValueResponse(self.allocator, id_value, result);
+        }
+
+        const mutation: daemon_store.Mutation = if (snapshot_request) |req|
+            .{ .snapshot_replace = req }
+        else if (workspace_request) |req|
+            .{ .workspace_upsert = req }
+        else
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid params",
+            );
+
+        const write_result = service.store.applyMutation(mutation) catch |err| {
+            return try storeErrorResponse(self.allocator, id_value, err);
+        };
+        return try okValueResponse(self.allocator, id_value, write_result);
     }
 
     fn statusResponse(self: *Daemon, id_value: std.json.Value) ![]u8 {
@@ -4610,11 +4792,89 @@ fn sessionizerServerReady(raw_context: *anyopaque) !void {
     const context: *SessionizerServerContext = @ptrCast(@alignCast(raw_context));
     try writePidFile(context.pid_path);
     context.pid_published = true;
+    // Construct the hermetic store only after bind succeeds so a broken test
+    // store fails readiness loudly (never silently store-less).
+    try maybeInitStoreService(context.daemon);
     context.drain_thread = try std.Thread.spawn(.{}, drainSessionsThread, .{DrainThreadContext{
         .daemon = context.daemon,
         .endpoint = context.endpoint,
         .stop_requested = context.stop_requested,
     }});
+}
+
+/// S2 dispatches only the first two store mutators plus storeStatus; the
+/// remaining six mutation methods stay method_not_found until S3.
+fn isStoreMethod(method: []const u8) bool {
+    return std.mem.eql(u8, method, store_protocol.METHOD_STATE_SNAPSHOT_REPLACE) or
+        std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_UPSERT) or
+        std.mem.eql(u8, method, store_protocol.METHOD_DAEMON_STORE_STATUS);
+}
+
+/// Path-valued store-dir override. Caller frees a non-null result.
+fn storeDirFromEnv(allocator: std.mem.Allocator) ?[]u8 {
+    const environ: std.process.Environ = if (builtin.os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    const raw = environ.getAlloc(allocator, SESSION_DAEMON_STORE_DIR_ENV_NAME) catch return null;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) {
+        allocator.free(raw);
+        return null;
+    }
+    if (trimmed.len == raw.len) return raw;
+    const owned = allocator.dupe(u8, trimmed) catch {
+        allocator.free(raw);
+        return null;
+    };
+    allocator.free(raw);
+    return owned;
+}
+
+fn maybeInitStoreService(daemon: *Daemon) !void {
+    const store_dir = storeDirFromEnv(daemon.allocator) orelse return;
+    defer daemon.allocator.free(store_dir);
+    const db_path = try std.fs.path.join(daemon.allocator, &.{ store_dir, "state.sqlite" });
+    defer daemon.allocator.free(db_path);
+
+    const service = try daemon.allocator.create(StoreService);
+    errdefer daemon.allocator.destroy(service);
+    service.* = .{
+        .store = try daemon_store.Store.init(daemon.allocator, db_path),
+    };
+    errdefer service.store.deinit();
+
+    lockDaemon(daemon);
+    daemon.store_service = service;
+    daemon.mutex.unlock();
+}
+
+fn storeErrorResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    err: daemon_store.StoreError,
+) ![]u8 {
+    const mapped: struct { code: []const u8, message: []const u8 } = switch (err) {
+        error.Conflict => .{ .code = headless.protocol.ERR_CONFLICT, .message = "store revision conflict" },
+        error.InvalidParams => .{ .code = headless.protocol.ERR_INVALID_PARAMS, .message = "invalid params" },
+        error.ResourceNotFound => .{ .code = headless.protocol.ERR_RESOURCE_NOT_FOUND, .message = "resource not found" },
+        error.CapabilityUnavailable => .{ .code = headless.protocol.ERR_CAPABILITY_UNAVAILABLE, .message = "store capability is unavailable" },
+        error.StoreBusy => .{ .code = headless.protocol.ERR_STORE_BUSY, .message = "store is busy" },
+        error.SchemaTooNew => .{ .code = headless.protocol.ERR_SCHEMA_TOO_NEW, .message = "database schema is newer than this daemon" },
+        error.StoreCorrupt => .{ .code = headless.protocol.ERR_STORE_CORRUPT, .message = "store is corrupt" },
+        error.StoreUnavailable => .{ .code = headless.protocol.ERR_STORE_UNAVAILABLE, .message = "store is unavailable" },
+        error.Internal => .{ .code = headless.protocol.ERR_INTERNAL, .message = "internal store error" },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    return try errorResponseAllocWithData(allocator, id_value, mapped.code, mapped.message, null);
+}
+
+fn requestIsStoreMethod(allocator: std.mem.Allocator, request: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, request, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const method = jsonString(parsed.value.object.get("method") orelse .null) orelse return false;
+    return isStoreMethod(method);
 }
 
 fn sessionizerServerShouldStop(raw_context: *anyopaque) bool {
@@ -4685,14 +4945,21 @@ fn handleSessionizerServerRequest(raw_context: *anyopaque, request: []u8) anyerr
     const context: *SessionizerServerContext = @ptrCast(@alignCast(raw_context));
     const daemon = context.daemon;
     defer daemon.allocator.free(request);
+    const trimmed = std.mem.trim(u8, request, "\r");
 
+    // Envelope classification happens outside lockDaemon (W5 slow-work seam +
+    // S2 store path). Store handlers take only a short bookkeeping lock.
     if (requestNeedsSlowWork(daemon.allocator, request)) {
         return daemon.handleSlowRegistryRequest(daemon.allocator, request) catch |err|
             errorResponseAlloc(daemon.allocator, .null, "internal_error", @errorName(err));
     }
+    if (requestIsStoreMethod(daemon.allocator, trimmed)) {
+        return daemon.handleRequest(trimmed) catch |err|
+            errorResponseAlloc(daemon.allocator, .null, "internal_error", @errorName(err));
+    }
 
     lockDaemon(daemon);
-    const response = daemon.handleRequest(std.mem.trim(u8, request, "\r")) catch |err| {
+    const response = daemon.handleRequest(trimmed) catch |err| {
         daemon.mutex.unlock();
         return errorResponseAlloc(daemon.allocator, .null, "internal_error", @errorName(err));
     };
@@ -4793,6 +5060,13 @@ fn finishSessionizerServer(context: *SessionizerServerContext) void {
         });
         context.drain_thread.?.join();
         context.drain_thread = null;
+    }
+    // Serve loop returned and drain joined: no request can still be in flight.
+    // Final store gate (S3 names prepare-shutdown drain; close lives here).
+    if (context.daemon.store_service) |service| {
+        service.store.deinit();
+        context.daemon.allocator.destroy(service);
+        context.daemon.store_service = null;
     }
     if (context.pid_published) deletePidFileIfOwned(context.pid_path);
 }
@@ -7173,6 +7447,9 @@ test "draining dispatcher rejects every state mutator" {
         "daemon.client.heartbeat",
         "daemon.client.close",
         "daemon.stop",
+        // S2-dispatched store mutators participate in the drain gate.
+        "state.snapshot.replace",
+        "workspace.upsert",
     };
     for (methods, 0..) |method, index| {
         const request = try std.fmt.allocPrint(
@@ -7199,6 +7476,204 @@ test "draining dispatcher rejects every state mutator" {
         "invalid_state",
         jsonString(slow_parsed.value.object.get("error").?.object.get("code").?).?,
     );
+}
+
+fn attachTestStoreService(daemon: *Daemon, db_path: []const u8) !void {
+    const service = try daemon.allocator.create(StoreService);
+    errdefer daemon.allocator.destroy(service);
+    service.* = .{
+        .store = try daemon_store.Store.init(daemon.allocator, db_path),
+    };
+    daemon.store_service = service;
+}
+
+fn detachTestStoreService(daemon: *Daemon) void {
+    if (daemon.store_service) |service| {
+        service.store.deinit();
+        daemon.allocator.destroy(service);
+        daemon.store_service = null;
+    }
+}
+
+fn testStoreDbPath(tmp: *std.testing.TmpDir) ![]u8 {
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    return std.fs.path.join(std.testing.allocator, &.{ path_buf[0..path_len], "state.sqlite" });
+}
+
+fn registerTestClientId(daemon: *Daemon, allocator: std.mem.Allocator) ![]const u8 {
+    const response = try daemon.handleRequest("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"daemon.client.register\",\"params\":{}}");
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const client_id = jsonString(parsed.value.object.get("result").?.object.get("client_id").?).?;
+    return try allocator.dupe(u8, client_id);
+}
+
+fn expectErrorCodeMessage(response: []const u8, allocator: std.mem.Allocator, code: []const u8, message: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const error_value = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings(code, jsonString(error_value.get("code").?).?);
+    try std.testing.expectEqualStrings(message, jsonString(error_value.get("message").?).?);
+}
+
+test "store methods report capability_unavailable on a store-less daemon" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const upsert = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"workspace.upsert","params":{"mutation":{"request_key":"k","client_id":"c"},"workspace":{"workspace_id":"w","label":"L","path":"/w"}}}
+    );
+    defer allocator.free(upsert);
+    try expectErrorCodeMessage(upsert, allocator, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "store capability is unavailable");
+
+    const status = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"daemon.storeStatus","params":{}}
+    );
+    defer allocator.free(status);
+    try expectErrorCodeMessage(status, allocator, headless.protocol.ERR_CAPABILITY_UNAVAILABLE, "store capability is unavailable");
+}
+
+test "store dispatch commits mutations and replays duplicates" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+
+    const client_id = try registerTestClientId(&daemon, allocator);
+    defer allocator.free(client_id);
+
+    const upsert_request = try std.fmt.allocPrint(allocator,
+        \\{{"jsonrpc":"2.0","id":2,"method":"workspace.upsert","params":{{"mutation":{{"request_key":"ws-1","client_id":"{s}"}},"workspace":{{"workspace_id":"ws-1","label":"One","path":"/ws-1"}}}}}}
+    , .{client_id});
+    defer allocator.free(upsert_request);
+    const first_response = try daemon.handleRequest(upsert_request);
+    defer allocator.free(first_response);
+    var first = try std.json.parseFromSlice(std.json.Value, allocator, first_response, .{});
+    defer first.deinit();
+    const first_result = first.value.object.get("result").?.object;
+    try std.testing.expect(first_result.get("applied").?.bool);
+    try std.testing.expect(!first_result.get("duplicate").?.bool);
+    try std.testing.expectEqual(@as(i64, 1), first_result.get("store_revision").?.integer);
+
+    const replay_response = try daemon.handleRequest(upsert_request);
+    defer allocator.free(replay_response);
+    var replay = try std.json.parseFromSlice(std.json.Value, allocator, replay_response, .{});
+    defer replay.deinit();
+    const replay_result = replay.value.object.get("result").?.object;
+    try std.testing.expectEqual(first_result.get("store_revision").?.integer, replay_result.get("store_revision").?.integer);
+    try std.testing.expectEqual(first_result.get("applied").?.bool, replay_result.get("applied").?.bool);
+    try std.testing.expectEqual(first_result.get("duplicate").?.bool, replay_result.get("duplicate").?.bool);
+
+    const status_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"daemon.storeStatus","params":{}}
+    );
+    defer allocator.free(status_response);
+    var status = try std.json.parseFromSlice(std.json.Value, allocator, status_response, .{});
+    defer status.deinit();
+    const status_result = status.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), status_result.get("store_revision").?.integer);
+    try std.testing.expectEqualStrings("open", jsonString(status_result.get("drain_state").?).?);
+    try std.testing.expect(status_result.get("writer_ready").?.bool);
+}
+
+test "store mutations from unknown clients are invalid_params" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+
+    const response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"workspace.upsert","params":{"mutation":{"request_key":"k","client_id":"not-registered"},"workspace":{"workspace_id":"w","label":"L","path":"/w"}}}
+    );
+    defer allocator.free(response);
+    try expectErrorCodeMessage(response, allocator, headless.protocol.ERR_INVALID_PARAMS, "unknown client_id");
+}
+
+test "draining daemon rejects store mutators with invalid_state" {
+    const allocator = std.testing.allocator;
+    // Store-less: drain outranks capability_unavailable for mutators.
+    {
+        var daemon = Daemon.init(allocator);
+        defer daemon.deinit();
+        daemon.accepting_mutations = false;
+        const response = try daemon.handleRequest(
+            \\{"jsonrpc":"2.0","id":1,"method":"workspace.upsert","params":{"mutation":{"request_key":"k","client_id":"c"},"workspace":{"workspace_id":"w","label":"L","path":"/w"}}}
+        );
+        defer allocator.free(response);
+        try expectErrorCodeMessage(
+            response,
+            allocator,
+            headless.protocol.ERR_INVALID_STATE,
+            "daemon is preparing shutdown and is not accepting mutations",
+        );
+    }
+
+    // Store-enabled: storeStatus still answers while draining.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    daemon.accepting_mutations = false;
+
+    const status_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"daemon.storeStatus","params":{}}
+    );
+    defer allocator.free(status_response);
+    var status = try std.json.parseFromSlice(std.json.Value, allocator, status_response, .{});
+    defer status.deinit();
+    try std.testing.expect(status.value.object.get("result") != null);
+    try std.testing.expectEqualStrings("open", jsonString(status.value.object.get("result").?.object.get("drain_state").?).?);
+}
+
+test "store errors map to wire codes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    const client_id = try registerTestClientId(&daemon, allocator);
+    defer allocator.free(client_id);
+
+    const first = try std.fmt.allocPrint(allocator,
+        \\{{"jsonrpc":"2.0","id":1,"method":"workspace.upsert","params":{{"mutation":{{"request_key":"ws-a","client_id":"{s}"}},"workspace":{{"workspace_id":"ws-a","label":"A","path":"/a"}}}}}}
+    , .{client_id});
+    defer allocator.free(first);
+    const first_response = try daemon.handleRequest(first);
+    defer allocator.free(first_response);
+    try std.testing.expect(std.mem.indexOf(u8, first_response, "\"applied\":true") != null);
+
+    // Stale expected_store_revision → conflict.
+    const stale = try std.fmt.allocPrint(allocator,
+        \\{{"jsonrpc":"2.0","id":2,"method":"workspace.upsert","params":{{"mutation":{{"request_key":"ws-b","client_id":"{s}","expected_store_revision":0}},"workspace":{{"workspace_id":"ws-b","label":"B","path":"/b"}}}}}}
+    , .{client_id});
+    defer allocator.free(stale);
+    const stale_response = try daemon.handleRequest(stale);
+    defer allocator.free(stale_response);
+    try expectErrorCodeMessage(stale_response, allocator, headless.protocol.ERR_CONFLICT, "store revision conflict");
 }
 
 test "idle exit is disabled by default and honors override" {

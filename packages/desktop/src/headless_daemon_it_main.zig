@@ -104,7 +104,8 @@ pub fn main(init: std.process.Init) !void {
     try runLeaseConflictScenario(allocator, io);
     try runLeaseRenewReleaseScenario(allocator, io);
     try runForcedAcquireOverTransportScenario(allocator, io);
-    try runStoreFixtureScenario(allocator, io);
+    try runStoreLessScenario(allocator, io);
+    try runStoreEnabledScenario(allocator, io);
 
     // PTY tier: sessions, managed spawn, prepare/stop retention, lifecycle.
     if (posix_pty_supported) {
@@ -227,13 +228,21 @@ const EndpointIsolation = struct {
     }
 };
 
+/// Spawn options for hermetic IT daemons. S4 adds `store_fault`.
+const IsolatedDaemonOptions = struct {
+    idle_exit_ms: ?[]const u8 = null,
+    store_dir: ?[]const u8 = null,
+    slow_io_ms: ?[]const u8 = null,
+    retention_ms: ?[]const u8 = null,
+};
+
 fn spawnIsolatedDaemon(
     allocator: std.mem.Allocator,
     io: std.Io,
     self_exe: []const u8,
     pref_path: []const u8,
 ) !std.process.Child {
-    return spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, null);
+    return spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{});
 }
 
 fn spawnIsolatedDaemonWithEnv(
@@ -241,9 +250,9 @@ fn spawnIsolatedDaemonWithEnv(
     io: std.Io,
     self_exe: []const u8,
     pref_path: []const u8,
-    idle_exit_ms: ?[]const u8,
+    options: IsolatedDaemonOptions,
 ) !std.process.Child {
-    return spawnIsolatedDaemonWithOptions(allocator, io, self_exe, pref_path, idle_exit_ms, null, null);
+    return spawnIsolatedDaemonWithOptions(allocator, io, self_exe, pref_path, options);
 }
 
 fn spawnIsolatedDaemonWithRetention(
@@ -253,7 +262,10 @@ fn spawnIsolatedDaemonWithRetention(
     pref_path: []const u8,
     retention_ms: []const u8,
 ) !std.process.Child {
-    return spawnIsolatedDaemonWithOptions(allocator, io, self_exe, pref_path, IT_SAFETY_IDLE_EXIT_MS, null, retention_ms);
+    return spawnIsolatedDaemonWithOptions(allocator, io, self_exe, pref_path, .{
+        .idle_exit_ms = IT_SAFETY_IDLE_EXIT_MS,
+        .retention_ms = retention_ms,
+    });
 }
 
 fn spawnIsolatedDaemonWithSlowIo(
@@ -263,7 +275,10 @@ fn spawnIsolatedDaemonWithSlowIo(
     pref_path: []const u8,
     slow_io_ms: []const u8,
 ) !std.process.Child {
-    return spawnIsolatedDaemonWithOptions(allocator, io, self_exe, pref_path, IT_SAFETY_IDLE_EXIT_MS, slow_io_ms, null);
+    return spawnIsolatedDaemonWithOptions(allocator, io, self_exe, pref_path, .{
+        .idle_exit_ms = IT_SAFETY_IDLE_EXIT_MS,
+        .slow_io_ms = slow_io_ms,
+    });
 }
 
 fn spawnIsolatedDaemonWithOptions(
@@ -271,18 +286,17 @@ fn spawnIsolatedDaemonWithOptions(
     io: std.Io,
     self_exe: []const u8,
     pref_path: []const u8,
-    idle_exit_ms: ?[]const u8,
-    slow_io_ms: ?[]const u8,
-    retention_ms: ?[]const u8,
+    options: IsolatedDaemonOptions,
 ) !std.process.Child {
     var env_map = try std.process.Environ.createMap(currentEnviron(), allocator);
     defer env_map.deinit();
 
     // Always set a safety-net idle so a crashed IT cannot leak a permanent daemon.
     // Per-test tighter overrides still win when provided.
-    try env_map.put("VERDE_SESSION_DAEMON_IDLE_EXIT_MS", idle_exit_ms orelse IT_SAFETY_IDLE_EXIT_MS);
-    if (slow_io_ms) |value| try env_map.put("VERDE_SESSIONIZER_TEST_SLOW_IO_MS", value);
-    if (retention_ms) |value| try env_map.put("VERDE_SESSIONIZER_TEST_RETENTION_MS", value);
+    try env_map.put("VERDE_SESSION_DAEMON_IDLE_EXIT_MS", options.idle_exit_ms orelse IT_SAFETY_IDLE_EXIT_MS);
+    if (options.slow_io_ms) |value| try env_map.put("VERDE_SESSIONIZER_TEST_SLOW_IO_MS", value);
+    if (options.retention_ms) |value| try env_map.put("VERDE_SESSIONIZER_TEST_RETENTION_MS", value);
+    if (options.store_dir) |value| try env_map.put(sessionizer.SESSION_DAEMON_STORE_DIR_ENV_NAME, value);
 
     // Bind the child to the same isolated endpoint the parent uses.
     const endpoint = try isolationEndpoint(allocator, pref_path);
@@ -977,7 +991,7 @@ fn runManagedProcessScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     defer isolation.deinit(allocator);
     const self_exe = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_exe);
-    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, "500");
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{ .idle_exit_ms = "500" });
     var child_exited = false;
     defer if (!child_exited) child.kill(io);
 
@@ -1658,7 +1672,7 @@ fn runScopedStopScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     defer isolation.deinit(allocator);
     const self_exe = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_exe);
-    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, "500");
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{ .idle_exit_ms = "500" });
     var child_exited = false;
     defer if (!child_exited) child.kill(io);
     var transport: sessionizer.HeadlessTransport = .{ .allocator = allocator, .pref_path = pref_path };
@@ -1744,10 +1758,10 @@ fn jsonStringValue(value: std.json.Value) ?[]const u8 {
     return if (value == .string) value.string else null;
 }
 
-/// Phase-1 store fixture: exercise a typed workspace-upsert request against
-/// the daemon and pin its current unimplemented response shape for phase 2.
-fn runStoreFixtureScenario(allocator: std.mem.Allocator, io: std.Io) !void {
-    const pref_path = try makePrefPath(allocator, "store-hooks");
+/// Store-less daemon: dispatched store methods return capability_unavailable;
+/// undispatched store mutations remain method_not_found until S3.
+fn runStoreLessScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "store-less");
     defer allocator.free(pref_path);
     defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
     try std.Io.Dir.cwd().createDirPath(io, pref_path);
@@ -1770,20 +1784,175 @@ fn runStoreFixtureScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     scenario.storeTemporaryDatabaseHook("phase-2-store-temporary-database");
 
     const mutation: headless.store.MutationHeader = .{
-        .request_key = "w7-store-fixture-workspace-upsert",
-        .client_id = "w7-fixture-client",
+        .request_key = "s2-store-less-workspace-upsert",
+        .client_id = "s2-fixture-client",
     };
     const request: headless.store.WorkspaceUpsertRequest = .{
         .mutation = mutation,
         .workspace = .{
-            .workspace_id = "w7-fixture-workspace",
-            .label = "W7 fixture workspace",
+            .workspace_id = "s2-fixture-workspace",
+            .label = "S2 fixture workspace",
             .path = pref_path,
         },
     };
-    var parsed = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, request);
-    defer parsed.deinit();
-    try scenario.expectInterimError(.store, &parsed);
+    {
+        var parsed = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, request);
+        defer parsed.deinit();
+        const err = parsed.response.err orelse return error.StoreLessMissingError;
+        if (!std.mem.eql(u8, err.code, headless.protocol.ERR_CAPABILITY_UNAVAILABLE)) return error.StoreLessWrongCode;
+        if (!std.mem.eql(u8, err.message, "store capability is unavailable")) return error.StoreLessWrongMessage;
+    }
+    {
+        const empty_params: struct {} = .{};
+        var parsed = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params);
+        defer parsed.deinit();
+        const err = parsed.response.err orelse return error.StoreLessStatusMissingError;
+        if (!std.mem.eql(u8, err.code, headless.protocol.ERR_CAPABILITY_UNAVAILABLE)) return error.StoreLessStatusWrongCode;
+        if (!std.mem.eql(u8, err.message, "store capability is unavailable")) return error.StoreLessStatusWrongMessage;
+    }
+
+    const undispatched = [_][]const u8{
+        headless.store.METHOD_CHAT_THREAD_UPSERT,
+        headless.store.METHOD_CHAT_MESSAGE_APPEND,
+        headless.store.METHOD_SURFACE_UPSERT,
+        headless.store.METHOD_SURFACE_CLEAR,
+        headless.store.METHOD_NOTIFICATION_CHAT_COMPLETION_UPSERT,
+        headless.store.METHOD_NOTIFICATION_CHAT_COMPLETION_CLEAR,
+    };
+    for (undispatched) |method| {
+        var parsed = try scenario.storeStep(method, request);
+        defer parsed.deinit();
+        const err = parsed.response.err orelse return error.UndispatchedStoreMissingError;
+        if (!std.mem.eql(u8, err.code, FIXTURE_METHOD_NOT_FOUND)) return error.UndispatchedStoreWrongCode;
+    }
+}
+
+/// Store-enabled daemon under VERDE_SESSION_DAEMON_STORE_DIR: real mutations,
+/// receipt replay, client validation, conflict, status, and dormancy pin.
+fn runStoreEnabledScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "store-enabled");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fmt.allocPrint(allocator, "{s}/store", .{pref_path});
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+    });
+    defer child.kill(io);
+
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = allocator,
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(allocator, &transport);
+    var scenario: FixtureScenario = .{ .client = &client };
+
+    // B7: register a client before store mutations.
+    // Explicit field: bare `.{}` can stringify as `[]` and fail params validation.
+    var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer register_parsed.deinit();
+    if (!register_parsed.response.isOk()) return error.StoreEnabledRegisterFailed;
+    const registered = try client.decodeClientRegister(&register_parsed);
+    const client_id = registered.client_id;
+
+    const mutation: headless.store.MutationHeader = .{
+        .request_key = "s2-store-enabled-workspace-upsert",
+        .client_id = client_id,
+    };
+    const request: headless.store.WorkspaceUpsertRequest = .{
+        .mutation = mutation,
+        .workspace = .{
+            .workspace_id = "s2-enabled-workspace",
+            .label = "S2 enabled workspace",
+            .path = pref_path,
+        },
+    };
+
+    var first = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, request);
+    defer first.deinit();
+    if (!first.response.isOk()) return error.StoreEnabledUpsertFailed;
+    const first_result = try client.decodeWriteResult(&first);
+    if (!first_result.applied or first_result.duplicate) return error.StoreEnabledUpsertNotApplied;
+    if (first_result.store_revision != 1) return error.StoreEnabledUnexpectedRevision;
+
+    var replay = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, request);
+    defer replay.deinit();
+    if (!replay.response.isOk()) return error.StoreEnabledReplayFailed;
+    const replay_result = try client.decodeWriteResult(&replay);
+    if (replay_result.store_revision != first_result.store_revision or
+        replay_result.applied != first_result.applied or
+        replay_result.duplicate != first_result.duplicate)
+    {
+        return error.StoreEnabledReplayMismatch;
+    }
+
+    {
+        const unknown: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{
+                .request_key = "s2-unknown-client",
+                .client_id = "not-a-registered-client",
+            },
+            .workspace = .{
+                .workspace_id = "s2-other",
+                .label = "Other",
+                .path = pref_path,
+            },
+        };
+        var parsed = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, unknown);
+        defer parsed.deinit();
+        const err = parsed.response.err orelse return error.StoreEnabledUnknownClientMissingError;
+        if (!std.mem.eql(u8, err.code, headless.protocol.ERR_INVALID_PARAMS)) return error.StoreEnabledUnknownClientWrongCode;
+    }
+
+    {
+        const stale: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{
+                .request_key = "s2-stale-revision",
+                .client_id = client_id,
+                .expected_store_revision = 0,
+            },
+            .workspace = .{
+                .workspace_id = "s2-stale",
+                .label = "Stale",
+                .path = pref_path,
+            },
+        };
+        var parsed = try scenario.storeStep(headless.store.METHOD_WORKSPACE_UPSERT, stale);
+        defer parsed.deinit();
+        const err = parsed.response.err orelse return error.StoreEnabledConflictMissingError;
+        if (!std.mem.eql(u8, err.code, headless.protocol.ERR_CONFLICT)) return error.StoreEnabledConflictWrongCode;
+    }
+
+    {
+        const empty_params: struct {} = .{};
+        var status_parsed = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params);
+        defer status_parsed.deinit();
+        if (!status_parsed.response.isOk()) return error.StoreEnabledStatusFailed;
+        const status = try client.decodeStoreStatus(&status_parsed);
+        if (!std.mem.eql(u8, status.drain_state, "open")) return error.StoreEnabledDrainStateWrong;
+        if (status.store_revision != first_result.store_revision) return error.StoreEnabledStatusRevisionMismatch;
+        if (!status.writer_ready) return error.StoreEnabledWriterNotReady;
+    }
+
+    // Dormancy pin (B2/B10): core.status still advertises store=false in P2.
+    {
+        const empty_params: struct {} = .{};
+        var status_parsed = try client.call("core.status", empty_params);
+        defer status_parsed.deinit();
+        if (!status_parsed.response.isOk()) return error.StoreEnabledCoreStatusFailed;
+        const status = try client.decodeStatus(&status_parsed);
+        if (status.capabilities.store) return error.StoreEnabledStoreCapabilityAdvertised;
+    }
 }
 
 fn runIntegration(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -2131,7 +2300,7 @@ fn runLifecycleIdleExitOverride(allocator: std.mem.Allocator, io: std.Io) !void 
     defer allocator.free(self_exe);
 
     // >=500ms: 100ms raced on loaded CI before the status probe observed exit.
-    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, "500");
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{ .idle_exit_ms = "500" });
     // Do not kill: idle exit should terminate the empty daemon.
 
     // Confirm the daemon advertised the override before waiting for exit.

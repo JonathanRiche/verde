@@ -1,8 +1,9 @@
-//! Test-only phase-1 adapter for the daemon-owned SQLite store.
+//! Dormant daemon-owned SQLite store adapter (Phase 2).
 //!
-//! Production construction is intentionally absent until the M3 authority
-//! flip. The adapter owns the transaction, receipt, and durable revision
-//! boundary while it is exercised against an explicitly supplied database path.
+//! Production construction remains absent until the M3 authority flip: the
+//! daemon opens this adapter only under the hermetic
+//! `VERDE_SESSION_DAEMON_STORE_DIR` override. The adapter owns the transaction,
+//! receipt, and durable revision boundary for an explicitly supplied path.
 
 const std = @import("std");
 const zqlite = @import("zqlite");
@@ -281,14 +282,25 @@ pub const Store = struct {
 
         // Message identity is independent of the transport request key. A
         // retry with a fresh key must not append the same client message.
+        //
+        // Normative ordering (M3 track resolution): recognized duplicates and
+        // conflicting payloads on the same (thread_id, message_id) win over
+        // the expected-revision guard. Idempotent replays apply nothing, so a
+        // stale expected_store_revision must not reject a retrying client that
+        // reconnected with a fresh request_key. Conflicting payloads return
+        // Conflict before the guard as the more specific error. The guard only
+        // rejects NEW state transitions computed from stale reads.
         const message_key = switch (mutation) {
             .message_append => |request| self.messageKeyStatus(request) catch |err| return mapStoreError(err),
             else => null,
         };
         if (message_key) |status| {
             if (status.conflict) return error.Conflict;
+            // Report the live store revision (not the original message-key
+            // revision): duplicates apply nothing and must not bump, but the
+            // receipt should reflect the store's current watermark.
             const result: store_protocol.WriteResult = .{
-                .store_revision = status.store_revision,
+                .store_revision = current_revision,
                 .applied = false,
                 .duplicate = true,
             };
@@ -685,6 +697,9 @@ pub const Store = struct {
         fingerprint: []const u8,
         result: store_protocol.WriteResult,
     ) !void {
+        // Durable WriteResult JSON for exact receipt replay (B4). Reuses the
+        // same JSON encoder as mutation fingerprints; this is the response
+        // body, not a hash of the result.
         const response_payload = self.encodeFingerprint(result) catch |err| return err;
         defer self.allocator.free(response_payload);
         try self.conn.exec(
@@ -2404,4 +2419,74 @@ test "store refuses a schema newer than the supported database layer" {
     const row = (try conn.row("pragma user_version", .{})).?;
     defer row.deinit();
     try std.testing.expectEqual(@as(i64, 99), row.int(0));
+}
+
+test "natural duplicate replay wins over stale expected revision" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    const workspace = testWorkspace("workspace-1", "Workspace");
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("workspace-1", null),
+        .workspace = workspace,
+    });
+    const thread = testThread("thread-1", "Thread");
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("thread-1", 1),
+        .workspace_id = workspace.workspace_id,
+        .thread = thread,
+    });
+
+    const message: store_protocol.Message = .{
+        .message_id = "message-1",
+        .role = "user",
+        .author = "You",
+        .body = "hello",
+    };
+    const original_revision: u64 = 2;
+    const append_result = try store.appendMessage(.{
+        .mutation = testHeader("message-1", original_revision),
+        .workspace_id = workspace.workspace_id,
+        .thread_id = thread.local_thread_id,
+        .message = message,
+    });
+    try std.testing.expectEqual(@as(u64, 3), append_result.store_revision);
+    try std.testing.expect(append_result.applied);
+    try std.testing.expect(!append_result.duplicate);
+
+    // Advance revision with an unrelated mutation so the original revision is stale.
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("workspace-advance", 3),
+        .workspace = testWorkspace("workspace-2", "Second"),
+    });
+    try std.testing.expectEqual(@as(u64, 4), try store.storeRevision());
+
+    // Same message identity + identical payload, fresh request_key, stale expected revision.
+    const natural_duplicate = try store.appendMessage(.{
+        .mutation = testHeader("message-1-retry", original_revision),
+        .workspace_id = workspace.workspace_id,
+        .thread_id = thread.local_thread_id,
+        .message = message,
+    });
+    try std.testing.expect(!natural_duplicate.applied);
+    try std.testing.expect(natural_duplicate.duplicate);
+    try std.testing.expectEqual(@as(u64, 4), natural_duplicate.store_revision);
+    try std.testing.expectEqual(@as(u64, 4), try store.storeRevision());
+
+    // Conflicting payload on the same key with the same stale revision → Conflict,
+    // not a revision-mismatch path (more specific error wins before the guard).
+    var collision = message;
+    collision.body = "changed";
+    try std.testing.expectError(error.Conflict, store.appendMessage(.{
+        .mutation = testHeader("message-1-conflict", original_revision),
+        .workspace_id = workspace.workspace_id,
+        .thread_id = thread.local_thread_id,
+        .message = collision,
+    }));
+    try std.testing.expectEqual(@as(u64, 4), try store.storeRevision());
 }
