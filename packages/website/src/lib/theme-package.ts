@@ -46,6 +46,14 @@ function lighten(hex: string, amount: number): string {
   ) as [number, number, number])
 }
 
+/* Diff colors carry fixed semantic meaning — additions read green, removals
+   read red — so they can't be derived from the four Omarchy palette colors.
+   These bases are toned toward the theme's own foreground, which keeps them
+   legible on light and dark backgrounds alike: on a dark theme fg lightens
+   them, on a light theme fg darkens them. */
+const DIFF_ADD_BASE = '#3fb950'
+const DIFF_REMOVE_BASE = '#f85149'
+
 /** Build the same semantic palette Verde derives from an Omarchy colors.toml. */
 export function portableThemePackage(theme: PortableThemeSource): PortableThemePackage {
   const panelMuted = lighten(theme.bg, 0.12)
@@ -67,8 +75,12 @@ export function portableThemePackage(theme: PortableThemeSource): PortableThemeP
         border: mix(theme.accent, theme.bg, 0.44),
         border_muted: panelMuted,
         warning: theme.warm,
-        diff_add: theme.accent,
-        selection: theme.accent,
+        diff_add: mix(DIFF_ADD_BASE, theme.fg, 0.2),
+        diff_remove: mix(DIFF_REMOVE_BASE, theme.fg, 0.2),
+        // A selection is a fill sitting behind text, so it has to stay a wash
+        // rather than the full-strength accent — otherwise selected text loses
+        // all contrast against it.
+        selection: mix(theme.accent, theme.bg, 0.78),
       },
     },
   }
