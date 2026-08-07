@@ -2377,6 +2377,10 @@ pub const Daemon = struct {
         for (workspace.tracked_terminal_processes.items) |process| try writeTrackedProcessSnapshot(&s, workspace, &process);
         for (workspace.external_processes.items) |process| try writeExternalProcessSnapshot(&s, workspace, &process);
         for (self.chat_turns.items) |turn| {
+            // Match chat.turn.list: hide consumed turns. A consumed turn whose
+            // worker is still draining is therefore invisible here until exit
+            // removes it; process.list is not a second chat-turn surface.
+            if (turn.consumed) continue;
             if (!std.mem.eql(u8, turn.workspace_id, workspace.id)) continue;
             {
                 lockTurn(turn);
@@ -2416,6 +2420,24 @@ pub const Daemon = struct {
         try writeRegistryEnvelope(&s, self);
         try s.objectField("workspace");
         try writeWorkspaceInfo(&s, self, workspace);
+        // `turn:` is reserved for derived chat-turn records. Inspect and wait
+        // both resolve that prefix before any stored managed/tracked/external
+        // id so a future registerExternalProcess with a colliding id cannot
+        // split the two paths.
+        if (std.mem.startsWith(u8, process_id, "turn:")) {
+            const turn_id = process_id["turn:".len..];
+            for (self.chat_turns.items) |turn| {
+                if (turn.consumed) continue;
+                if (!std.mem.eql(u8, turn.turn_id, turn_id) or !std.mem.eql(u8, turn.workspace_id, workspace.id)) continue;
+                lockTurn(turn);
+                defer turn.mutex.unlock();
+                try s.objectField("process");
+                try writeChatTurnProcessSnapshot(&s, turn);
+                try s.endObject();
+                try s.endObject();
+                return try writer.toOwnedSlice();
+            }
+        }
         for (workspace.managed_processes.items) |process| {
             if (!std.mem.eql(u8, process.id, process_id) and !std.mem.eql(u8, process.name, process_id)) continue;
             try s.objectField("process");
@@ -2439,19 +2461,6 @@ pub const Daemon = struct {
             try s.endObject();
             try s.endObject();
             return try writer.toOwnedSlice();
-        }
-        if (std.mem.startsWith(u8, process_id, "turn:")) {
-            const turn_id = process_id["turn:".len..];
-            for (self.chat_turns.items) |turn| {
-                if (!std.mem.eql(u8, turn.turn_id, turn_id) or !std.mem.eql(u8, turn.workspace_id, workspace.id)) continue;
-                lockTurn(turn);
-                defer turn.mutex.unlock();
-                try s.objectField("process");
-                try writeChatTurnProcessSnapshot(&s, turn);
-                try s.endObject();
-                try s.endObject();
-                return try writer.toOwnedSlice();
-            }
         }
         for (workspace.terminal_process_outcomes.items) |outcome| {
             if (!std.mem.eql(u8, outcome.process_id, process_id)) continue;
@@ -2477,10 +2486,13 @@ pub const Daemon = struct {
         // accepted field is ignored and never sleeps under the daemon lock.
         _ = if (params == .object) params.object.get("timeout_ms") else null;
 
+        // Same `turn:` precedence as process.inspect: reserved prefix resolves
+        // against derived chat turns only and never falls through to stored ids.
         if (std.mem.startsWith(u8, process_id, "turn:")) {
             const turn_id = process_id["turn:".len..];
             var turn_status: ?process_registry.ExternalProcessStatus = null;
             for (self.chat_turns.items) |turn| {
+                if (turn.consumed) continue;
                 if (!std.mem.eql(u8, turn.turn_id, turn_id) or !std.mem.eql(u8, turn.workspace_id, workspace.id)) continue;
                 lockTurn(turn);
                 turn_status = chatTurnExternalStatus(turn.status);
@@ -2508,6 +2520,11 @@ pub const Daemon = struct {
             // result deliberately keeps this field null for turn records.
             try s.write(null);
             try s.objectField("changed");
+            // Turn state transitions do not bump registry_revision, so while
+            // the turn is still running `changed` cannot signal progress — only
+            // a concurrent registry mutation would flip it. Terminal turns
+            // always report changed=true (poll complete). Live progress waits
+            // for a P3 turn-revision or similar signal.
             try s.write(if (status == .running)
                 (after_registry_revision != null and self.registry.registry_revision != after_registry_revision.?)
             else
@@ -4313,6 +4330,10 @@ fn writeManagedProcessSnapshot(
     workspace: *const process_registry.WorkspaceRecord,
     process: *const process_registry.ManagedProcess,
 ) !void {
+    // Managed/tracked snapshots intentionally omit owner_kind/owner_title/
+    // client_id/generation; those fields exist on the external+turn shape
+    // only. Value-based consumers ignore missing keys; full array shape
+    // convergence is a follow-up, not this adapter's job.
     try s.beginObject();
     try s.objectField("id");
     try s.write(process.id);
@@ -4469,14 +4490,17 @@ fn writeChatTurnProcessSnapshot(s: *std.json.Stringify, turn: *const ChatTurn) !
     // future RPC-backed replacement for these derived turn records.
     try s.objectField("generation");
     try s.write(@as(u64, 0));
+    // Spec: command = provider/prompt summary if one exists, else "". Request
+    // has no summary field; embedding the full prompt would unbounded-grow
+    // process.list (see writeChatTurnSummary, which also omits the prompt).
     try s.objectField("command");
-    try s.write(turn.request.prompt);
+    try s.write("");
     try s.objectField("cwd");
     try s.write(turn.request.project_path);
     try s.objectField("status");
     try s.write(@tagName(status));
     try s.objectField("classification");
-    try s.write(@tagName(process_registry.classifyWorkspaceCommand(turn.request.prompt)));
+    try s.write(@tagName(process_registry.classifyWorkspaceCommand("")));
     try s.objectField("resources");
     try s.beginArray();
     try s.endArray();
@@ -4541,13 +4565,13 @@ fn writeExternalProcessSnapshot(
     try s.objectField("owner_session_id");
     try s.write(null);
     try s.objectField("owner_kind");
-    try s.write("");
+    try s.write(process.owner_kind);
     try s.objectField("owner_title");
     try s.write(process.owner_title);
     try s.objectField("client_id");
-    try s.write("");
+    try s.write(process.client_id);
     try s.objectField("generation");
-    try s.write(@as(u64, 0));
+    try s.write(process.generation);
     try s.objectField("command");
     try s.write(process.command);
     try s.objectField("cwd");
@@ -6198,6 +6222,136 @@ test "turn records are derived not stored" {
     );
     defer allocator.free(response);
     try std.testing.expectEqual(@as(usize, 0), daemon.registry.workspace("turn-derived").?.external_processes.items.len);
+}
+
+test "process.inspect resolves turn: ids and rejects malformed turn ids" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    _ = try daemon.registry.ensureWorkspace(allocator, "turn-inspect");
+    _ = try appendTestChatTurn(&daemon, allocator, "inspect-turn", "turn-inspect", "/tmp/inspect", "Inspect title", "inspect prompt", .running, 40);
+
+    const happy = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"process.inspect","params":{"workspace":{"workspace_id":"turn-inspect"},"process_id":"turn:inspect-turn"}}
+    );
+    defer allocator.free(happy);
+    var happy_parsed = try std.json.parseFromSlice(std.json.Value, allocator, happy, .{});
+    defer happy_parsed.deinit();
+    const process = happy_parsed.value.object.get("result").?.object.get("process").?.object;
+    try std.testing.expectEqualStrings("turn:inspect-turn", process.get("id").?.string);
+    try std.testing.expectEqualStrings("gui_agent", process.get("owner_kind").?.string);
+    try std.testing.expectEqualStrings("running", process.get("status").?.string);
+    try std.testing.expectEqualStrings("", process.get("command").?.string);
+
+    const malformed = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"process.inspect","params":{"workspace":{"workspace_id":"turn-inspect"},"process_id":"turn:"}}
+    );
+    defer allocator.free(malformed);
+    var malformed_parsed = try std.json.parseFromSlice(std.json.Value, allocator, malformed, .{});
+    defer malformed_parsed.deinit();
+    try std.testing.expectEqualStrings(
+        headless.registry.ERR_RESOURCE_NOT_FOUND,
+        malformed_parsed.value.object.get("error").?.object.get("code").?.string,
+    );
+
+    const other_ws = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"process.inspect","params":{"workspace":{"workspace_id":"turn-inspect"},"process_id":"turn:missing-turn"}}
+    );
+    defer allocator.free(other_ws);
+    var other_parsed = try std.json.parseFromSlice(std.json.Value, allocator, other_ws, .{});
+    defer other_parsed.deinit();
+    try std.testing.expectEqualStrings(
+        headless.registry.ERR_RESOURCE_NOT_FOUND,
+        other_parsed.value.object.get("error").?.object.get("code").?.string,
+    );
+}
+
+test "stored external process snapshot preserves owner fields" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    _ = try daemon.registry.ensureWorkspace(allocator, "ext-snapshot");
+
+    var process = try process_registry.ExternalProcess.init(
+        allocator,
+        "ext-snapshot",
+        "external-owned-1",
+        "cargo build",
+        "/tmp/ext",
+        "background_task",
+        "Nightly build",
+        "client-ext-42",
+    );
+    process.generation = 7;
+    process.started_at_ms = 99;
+    _ = try daemon.registry.registerExternalProcess(allocator, "ext-snapshot", process);
+
+    const response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"process.list","params":{"workspace":{"workspace_id":"ext-snapshot"}}}
+    );
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const processes = parsed.value.object.get("result").?.object.get("processes").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), processes.len);
+    const snapshot = processes[0].object;
+    try std.testing.expectEqualStrings("external-owned-1", snapshot.get("id").?.string);
+    try std.testing.expectEqualStrings("background_task", snapshot.get("owner_kind").?.string);
+    try std.testing.expectEqualStrings("Nightly build", snapshot.get("owner_title").?.string);
+    try std.testing.expectEqualStrings("client-ext-42", snapshot.get("client_id").?.string);
+    try std.testing.expectEqual(@as(i64, 7), snapshot.get("generation").?.integer);
+
+    const inspect = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"process.inspect","params":{"workspace":{"workspace_id":"ext-snapshot"},"process_id":"external-owned-1"}}
+    );
+    defer allocator.free(inspect);
+    var inspect_parsed = try std.json.parseFromSlice(std.json.Value, allocator, inspect, .{});
+    defer inspect_parsed.deinit();
+    const inspected = inspect_parsed.value.object.get("result").?.object.get("process").?.object;
+    try std.testing.expectEqualStrings("background_task", inspected.get("owner_kind").?.string);
+    try std.testing.expectEqualStrings("client-ext-42", inspected.get("client_id").?.string);
+    try std.testing.expectEqual(@as(i64, 7), inspected.get("generation").?.integer);
+}
+
+test "turn: prefix takes precedence over stored external ids in inspect and wait" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    _ = try daemon.registry.ensureWorkspace(allocator, "turn-precedence");
+    _ = try appendTestChatTurn(&daemon, allocator, "collide", "turn-precedence", "/tmp/prec", "Turn title", "turn prompt", .failed, 50);
+
+    // A stored external that reuses the turn: id must not win over the turn.
+    const process = try process_registry.ExternalProcess.init(
+        allocator,
+        "turn-precedence",
+        "turn:collide",
+        "stored-command",
+        "/tmp/prec",
+        "stored_kind",
+        "Stored title",
+        "client-stored",
+    );
+    _ = try daemon.registry.registerExternalProcess(allocator, "turn-precedence", process);
+
+    const inspect = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"process.inspect","params":{"workspace":{"workspace_id":"turn-precedence"},"process_id":"turn:collide"}}
+    );
+    defer allocator.free(inspect);
+    var inspect_parsed = try std.json.parseFromSlice(std.json.Value, allocator, inspect, .{});
+    defer inspect_parsed.deinit();
+    const inspected = inspect_parsed.value.object.get("result").?.object.get("process").?.object;
+    try std.testing.expectEqualStrings("gui_agent", inspected.get("owner_kind").?.string);
+    try std.testing.expectEqualStrings("failed", inspected.get("status").?.string);
+
+    const wait = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"process.wait","params":{"workspace":{"workspace_id":"turn-precedence"},"process_id":"turn:collide"}}
+    );
+    defer allocator.free(wait);
+    var wait_parsed = try std.json.parseFromSlice(std.json.Value, allocator, wait, .{});
+    defer wait_parsed.deinit();
+    const wait_result = wait_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings("failed", wait_result.get("terminal_state").?.string);
+    try std.testing.expect(!wait_result.get("timed_out").?.bool);
 }
 
 test "session create dual-writes a tracked terminal process" {
