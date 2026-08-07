@@ -6,6 +6,8 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const registry = @import("registry_protocol.zig");
+const store_protocol = @import("store_protocol.zig");
+const changes_protocol = @import("changes_protocol.zig");
 
 /// Sends one request JSON document and returns an allocator-owned response JSON document.
 pub const TransportFn = *const fn (ctx: *anyopaque, request_json: []const u8) anyerror![]u8;
@@ -19,6 +21,7 @@ pub const RequiredCapability = enum {
     chat,
     processes,
     leases,
+    store,
     browser_execution,
     browser_presentation,
     browser_session_state,
@@ -44,6 +47,7 @@ pub const RequiredCapability = enum {
             .chat => "chat",
             .processes => "processes",
             .leases => "leases",
+            .store => "store",
             .browser_execution => "browser_execution",
             .browser_presentation => "browser_presentation",
             .browser_session_state => "browser.session_state",
@@ -80,6 +84,7 @@ fn requireCapabilityChecked(capabilities: protocol.Capabilities, feature: Requir
         .chat => capabilities.chat,
         .processes => capabilities.processes,
         .leases => capabilities.leases,
+        .store => capabilities.store,
         .browser_execution => capabilities.browser_execution,
         .browser_presentation => capabilities.browser_presentation,
         .browser_session_state => capabilities.isFeatureAvailable(.browser_session_state),
@@ -126,6 +131,7 @@ pub fn capabilityUnavailable(feature: RequiredCapability) protocol.Error {
             .chat => "chat capability is unavailable",
             .processes => "processes capability is unavailable",
             .leases => "leases capability is unavailable",
+            .store => "store capability is unavailable",
             .browser_execution => "browser_execution capability is unavailable",
             .browser_presentation => "browser_presentation capability is unavailable",
             .browser_session_state => "browser.session_state capability is unavailable",
@@ -144,6 +150,34 @@ pub fn capabilityUnavailable(feature: RequiredCapability) protocol.Error {
             .browser_downloads => "browser.downloads capability is unavailable",
             .browser_uploads => "browser.uploads capability is unavailable",
         },
+    };
+}
+
+/// What a client-held core.changes cursor should do after one poll reply.
+pub const ChangeCursorAdvance = struct {
+    /// Cursor to send on the next core.changes request.
+    next_cursor: u64,
+    /// True when incremental entries can no longer be trusted (journal expiry
+    /// or a daemon-instance change); the caller must refresh from
+    /// core.snapshot before resuming incremental application.
+    snapshot_required: bool,
+};
+
+/// Advance a client-held change cursor from one `core.changes` reply.
+/// `previous_envelope` is the envelope from the last accepted reply (null on
+/// the first poll); a nonce change resets the projection exactly like
+/// registry_revision consumers do.
+pub fn advanceChangeCursor(
+    previous_envelope: ?registry.RegistryRevisionEnvelope,
+    result: changes_protocol.ChangesResult,
+) ChangeCursorAdvance {
+    const instance_changed = if (previous_envelope) |previous|
+        previous.shouldResetProjection(result.envelope)
+    else
+        false;
+    return .{
+        .next_cursor = result.next_cursor,
+        .snapshot_required = result.expired or instance_changed,
     };
 }
 
@@ -352,6 +386,42 @@ pub const Client = struct {
     /// Decode a successful `workspace.resolve` response.
     pub fn decodeWorkspaceResolve(self: *Client, parsed: *const protocol.ParsedResponse) !registry.WorkspaceResolveResult {
         return try self.decodeResult(registry.WorkspaceResolveResult, parsed);
+    }
+
+    /// Decode a successful store write response.
+    pub fn decodeWriteResult(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.WriteResult {
+        return try self.decodeResult(store_protocol.WriteResult, parsed);
+    }
+
+    /// Decode a successful daemon store status response.
+    pub fn decodeStoreStatus(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.StoreStatusResult {
+        return try self.decodeResult(store_protocol.StoreStatusResult, parsed);
+    }
+
+    /// Decode one durable thread read with allocations independent of the
+    /// response envelope's parse arena.
+    pub fn decodeThreadGet(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.ThreadGetResult {
+        return try self.decodeResult(store_protocol.ThreadGetResult, parsed);
+    }
+
+    /// Decode a bounded durable thread metadata list.
+    pub fn decodeThreadList(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.ThreadListResult {
+        return try self.decodeResult(store_protocol.ThreadListResult, parsed);
+    }
+
+    /// Decode one durable turn-ledger record.
+    pub fn decodeTurnRecord(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.TurnRecord {
+        return try self.decodeResult(store_protocol.TurnRecord, parsed);
+    }
+
+    /// Decode a successful `core.changes` journal poll.
+    pub fn decodeChanges(self: *Client, parsed: *const protocol.ParsedResponse) !changes_protocol.ChangesResult {
+        return try self.decodeResult(changes_protocol.ChangesResult, parsed);
+    }
+
+    /// Decode a successful scoped composite `core.snapshot` response.
+    pub fn decodeCompositeSnapshot(self: *Client, parsed: *const protocol.ParsedResponse) !store_protocol.CoreSnapshotResult {
+        return try self.decodeResult(store_protocol.CoreSnapshotResult, parsed);
     }
 
     /// Require a capability on this client before a direct daemon request.
@@ -627,7 +697,8 @@ test "registry decoders are tolerant and own result strings" {
     var client = Client.initEncoder(result_arena.allocator());
     const response_allocator = std.testing.allocator;
 
-    var process_list = try protocol.parseResponse(response_allocator,
+    var process_list = try protocol.parseResponse(
+        response_allocator,
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"registry_revision\":7,\"processes\":[{\"id\":\"p1\",\"status\":\"running\"}],\"future\":true}}",
     );
     defer process_list.deinit();
@@ -636,7 +707,8 @@ test "registry decoders are tolerant and own result strings" {
     try std.testing.expectEqualStrings("p1", process_list_result.processes[0].id);
     try std.testing.expectEqual(registry.ProcessStatus.running, process_list_result.processes[0].status);
 
-    var lease_check = try protocol.parseResponse(response_allocator,
+    var lease_check = try protocol.parseResponse(
+        response_allocator,
         "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"allowed\":false,\"conflicts\":[{\"id\":\"l1\"}],\"future\":true}}",
     );
     defer lease_check.deinit();
@@ -644,7 +716,8 @@ test "registry decoders are tolerant and own result strings" {
     try std.testing.expect(!lease_check_result.allowed);
     try std.testing.expectEqualStrings("l1", lease_check_result.conflicts[0].id);
 
-    var lease_acquire = try protocol.parseResponse(response_allocator,
+    var lease_acquire = try protocol.parseResponse(
+        response_allocator,
         "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"acquired\":true,\"lease_id\":\"l1\"}}",
     );
     defer lease_acquire.deinit();
@@ -652,7 +725,8 @@ test "registry decoders are tolerant and own result strings" {
     try std.testing.expect(lease_acquire_result.acquired);
     try std.testing.expectEqualStrings("l1", lease_acquire_result.lease_id.?);
 
-    var lease_renew = try protocol.parseResponse(response_allocator,
+    var lease_renew = try protocol.parseResponse(
+        response_allocator,
         "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"renewed\":true,\"lease_id\":\"l1\"}}",
     );
     defer lease_renew.deinit();
@@ -660,7 +734,8 @@ test "registry decoders are tolerant and own result strings" {
     try std.testing.expect(lease_renew_result.renewed);
     try std.testing.expectEqualStrings("l1", lease_renew_result.lease_id);
 
-    var lease_release = try protocol.parseResponse(response_allocator,
+    var lease_release = try protocol.parseResponse(
+        response_allocator,
         "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"released\":true,\"released_count\":1}}",
     );
     defer lease_release.deinit();
@@ -668,7 +743,8 @@ test "registry decoders are tolerant and own result strings" {
     try std.testing.expect(lease_release_result.released);
     try std.testing.expectEqual(@as(u32, 1), lease_release_result.released_count);
 
-    var notifications = try protocol.parseResponse(response_allocator,
+    var notifications = try protocol.parseResponse(
+        response_allocator,
         "{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{\"notifications\":[{\"seq\":4,\"body\":\"conflict\"}],\"next_notification_seq\":5}}",
     );
     defer notifications.deinit();
@@ -676,7 +752,8 @@ test "registry decoders are tolerant and own result strings" {
     try std.testing.expectEqual(@as(u64, 5), notifications_result.next_notification_seq);
     try std.testing.expectEqualStrings("conflict", notifications_result.notifications[0].body);
 
-    var client_register = try protocol.parseResponse(response_allocator,
+    var client_register = try protocol.parseResponse(
+        response_allocator,
         "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"client_id\":\"c1\",\"persistent\":true}}",
     );
     defer client_register.deinit();
@@ -684,7 +761,8 @@ test "registry decoders are tolerant and own result strings" {
     try std.testing.expectEqualStrings("c1", client_register_result.client_id);
     try std.testing.expect(client_register_result.persistent);
 
-    var client_heartbeat = try protocol.parseResponse(response_allocator,
+    var client_heartbeat = try protocol.parseResponse(
+        response_allocator,
         "{\"jsonrpc\":\"2.0\",\"id\":8,\"result\":{\"client_id\":\"c1\",\"accepted\":true}}",
     );
     defer client_heartbeat.deinit();
@@ -692,7 +770,8 @@ test "registry decoders are tolerant and own result strings" {
     try std.testing.expectEqualStrings("c1", client_heartbeat_result.client_id);
     try std.testing.expect(client_heartbeat_result.accepted);
 
-    var client_close = try protocol.parseResponse(response_allocator,
+    var client_close = try protocol.parseResponse(
+        response_allocator,
         "{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{\"client_id\":\"c1\",\"closed\":true,\"released_leases\":2}}",
     );
     defer client_close.deinit();
@@ -701,7 +780,8 @@ test "registry decoders are tolerant and own result strings" {
     try std.testing.expect(client_close_result.closed);
     try std.testing.expectEqual(@as(u32, 2), client_close_result.released_leases);
 
-    var daemon_stop = try protocol.parseResponse(response_allocator,
+    var daemon_stop = try protocol.parseResponse(
+        response_allocator,
         "{\"jsonrpc\":\"2.0\",\"id\":10,\"result\":{\"accepted\":true,\"stopping\":true}}",
     );
     defer daemon_stop.deinit();
@@ -709,7 +789,8 @@ test "registry decoders are tolerant and own result strings" {
     try std.testing.expect(daemon_stop_result.accepted);
     try std.testing.expect(daemon_stop_result.stopping);
 
-    var workspace_resolve = try protocol.parseResponse(response_allocator,
+    var workspace_resolve = try protocol.parseResponse(
+        response_allocator,
         "{\"jsonrpc\":\"2.0\",\"id\":11,\"result\":{\"workspace\":{\"id\":\"w1\",\"path\":\"/tmp/w\"}}}",
     );
     defer workspace_resolve.deinit();
@@ -720,7 +801,8 @@ test "registry decoders are tolerant and own result strings" {
 
 test "registry decoders return RemoteError for error envelopes" {
     var client = Client.initEncoder(std.testing.allocator);
-    var parsed = try protocol.parseResponse(std.testing.allocator,
+    var parsed = try protocol.parseResponse(
+        std.testing.allocator,
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":\"capability_unavailable\",\"message\":\"processes capability is unavailable\",\"data\":{\"feature\":\"processes\"}}}",
     );
     defer parsed.deinit();
@@ -736,6 +818,257 @@ test "registry decoders return RemoteError for error envelopes" {
     try std.testing.expectError(error.RemoteError, client.decodeClientClose(&parsed));
     try std.testing.expectError(error.RemoteError, client.decodeDaemonStop(&parsed));
     try std.testing.expectError(error.RemoteError, client.decodeWorkspaceResolve(&parsed));
+}
+
+test "decodeWriteResult decodes success payloads" {
+    var client = Client.initEncoder(std.testing.allocator);
+    var parsed = try protocol.parseResponse(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"store_revision\":7,\"applied\":true,\"duplicate\":false}}",
+    );
+    defer parsed.deinit();
+
+    const result = try client.decodeWriteResult(&parsed);
+    try std.testing.expectEqual(@as(u64, 7), result.store_revision);
+    try std.testing.expect(result.applied);
+    try std.testing.expect(!result.duplicate);
+}
+
+test "decodeWriteResult rejects error envelopes" {
+    var client = Client.initEncoder(std.testing.allocator);
+    var parsed = try protocol.parseResponse(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":\"store_busy\",\"message\":\"store is busy\"}}",
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.RemoteError, client.decodeWriteResult(&parsed));
+}
+
+test "decodeStoreStatus decodes all fields" {
+    var result_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer result_arena.deinit();
+    var client = Client.initEncoder(result_arena.allocator());
+    var drain_state: []const u8 = undefined;
+
+    {
+        var response_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer response_arena.deinit();
+        var parsed = try protocol.parseResponse(
+            response_arena.allocator(),
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"schema_version\":2,\"store_revision\":9,\"writer_ready\":true,\"queued_mutation_count\":3,\"drain_state\":\"open\"}}",
+        );
+        defer parsed.deinit();
+
+        const result = try client.decodeStoreStatus(&parsed);
+        try std.testing.expectEqual(@as(u32, 2), result.schema_version);
+        try std.testing.expectEqual(@as(u64, 9), result.store_revision);
+        try std.testing.expect(result.writer_ready);
+        try std.testing.expectEqual(@as(usize, 3), result.queued_mutation_count);
+        drain_state = result.drain_state;
+    }
+
+    try std.testing.expectEqualStrings("open", drain_state);
+}
+
+test "chat read decoders are tolerant and own result strings" {
+    var result_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer result_arena.deinit();
+    var client = Client.initEncoder(result_arena.allocator());
+    var thread_title: []const u8 = undefined;
+    var list_cursor: []const u8 = undefined;
+    var turn_status: []const u8 = undefined;
+
+    {
+        var response_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer response_arena.deinit();
+
+        var thread_get = try protocol.parseResponse(
+            response_arena.allocator(),
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"thread\":{\"local_thread_id\":\"t1\",\"title\":\"A thread\",\"messages\":[{\"message_id\":\"m1\",\"role\":\"user\",\"author\":\"me\",\"body\":\"hi\",\"future\":true}],\"future\":1},\"store_revision\":7,\"future_result\":{}}}",
+        );
+        defer thread_get.deinit();
+        const thread_get_result = try client.decodeThreadGet(&thread_get);
+        try std.testing.expectEqual(@as(u64, 7), thread_get_result.store_revision);
+        try std.testing.expectEqualStrings("t1", thread_get_result.thread.local_thread_id);
+        try std.testing.expectEqual(@as(usize, 1), thread_get_result.thread.messages.len);
+        try std.testing.expectEqualStrings("hi", thread_get_result.thread.messages[0].body);
+        thread_title = thread_get_result.thread.title;
+
+        var thread_list = try protocol.parseResponse(
+            response_arena.allocator(),
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"threads\":[{\"local_thread_id\":\"t1\",\"title\":\"A thread\",\"future\":true}],\"next_cursor\":\"cursor-2\",\"store_revision\":7,\"future\":[]}}",
+        );
+        defer thread_list.deinit();
+        const thread_list_result = try client.decodeThreadList(&thread_list);
+        try std.testing.expectEqual(@as(usize, 1), thread_list_result.threads.len);
+        try std.testing.expectEqualStrings("t1", thread_list_result.threads[0].local_thread_id);
+        // Defaults fill fields the daemon omitted.
+        try std.testing.expectEqualStrings("opencode", thread_list_result.threads[0].provider);
+        list_cursor = thread_list_result.next_cursor.?;
+
+        var turn_record = try protocol.parseResponse(
+            response_arena.allocator(),
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"turn_id\":\"turn-1\",\"workspace_id\":\"w1\",\"local_thread_id\":\"t1\",\"status\":\"completed\",\"started_at_ms\":50,\"provider\":\"codex\",\"future\":true}}",
+        );
+        defer turn_record.deinit();
+        const turn_record_result = try client.decodeTurnRecord(&turn_record);
+        try std.testing.expectEqualStrings("turn-1", turn_record_result.turn_id);
+        try std.testing.expect(turn_record_result.finished_at_ms == null);
+        turn_status = turn_record_result.status;
+    }
+
+    // The response arenas above are gone; decoded strings must still be valid.
+    try std.testing.expectEqualStrings("A thread", thread_title);
+    try std.testing.expectEqualStrings("cursor-2", list_cursor);
+    try std.testing.expectEqualStrings("completed", turn_status);
+}
+
+test "chat read decoders return RemoteError for error envelopes" {
+    var client = Client.initEncoder(std.testing.allocator);
+    var parsed = try protocol.parseResponse(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":\"resource_not_found\",\"message\":\"no such thread\"}}",
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.RemoteError, client.decodeThreadGet(&parsed));
+    try std.testing.expectError(error.RemoteError, client.decodeThreadList(&parsed));
+    try std.testing.expectError(error.RemoteError, client.decodeTurnRecord(&parsed));
+}
+
+test "changes and composite snapshot decoders are tolerant and own result strings" {
+    var result_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer result_arena.deinit();
+    var client = Client.initEncoder(result_arena.allocator());
+    var entry_topic: []const u8 = undefined;
+    var incomplete_scope: []const u8 = undefined;
+
+    {
+        var response_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer response_arena.deinit();
+
+        var changes = try protocol.parseResponse(
+            response_arena.allocator(),
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"envelope\":{\"instance_nonce\":\"daemon-a\",\"registry_revision\":12},\"store_revision\":9,\"entries\":[{\"change_seq\":6,\"topic\":\"chat.thread\",\"resource_id\":\"t1\",\"workspace_id\":\"w1\",\"store_revision\":9,\"future\":true}],\"next_cursor\":6,\"journal_floor_seq\":2,\"expired\":false,\"future\":{}}}",
+        );
+        defer changes.deinit();
+        const changes_result = try client.decodeChanges(&changes);
+        try std.testing.expectEqualStrings("daemon-a", changes_result.envelope.instance_nonce);
+        try std.testing.expectEqual(@as(u64, 9), changes_result.store_revision);
+        try std.testing.expectEqual(@as(u64, 6), changes_result.next_cursor);
+        try std.testing.expectEqual(@as(u64, 2), changes_result.journal_floor_seq);
+        try std.testing.expect(!changes_result.expired);
+        try std.testing.expectEqual(@as(usize, 1), changes_result.entries.len);
+        try std.testing.expectEqualStrings("t1", changes_result.entries[0].resource_id);
+        try std.testing.expect(changes_result.entries[0].registry_revision == null);
+        entry_topic = changes_result.entries[0].topic;
+
+        var composite = try protocol.parseResponse(
+            response_arena.allocator(),
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"snapshot\":{\"store_revision\":9},\"store_revision\":9,\"envelope\":{\"instance_nonce\":\"daemon-a\",\"registry_revision\":12},\"change_cursor\":6,\"processes\":[{\"id\":\"p1\",\"status\":\"running\",\"future\":true}],\"leases\":[{\"id\":\"l1\"}],\"sessions\":[{\"session_id\":\"s1\",\"running\":true}],\"turns\":[{\"turn_id\":\"turn-1\",\"workspace_id\":\"w1\",\"local_thread_id\":\"t1\",\"status\":\"completed\",\"started_at_ms\":50,\"provider\":\"codex\"}],\"incomplete_scopes\":[\"turns\"],\"future\":true}}",
+        );
+        defer composite.deinit();
+        const composite_result = try client.decodeCompositeSnapshot(&composite);
+        try std.testing.expectEqual(@as(u64, 9), composite_result.store_revision);
+        try std.testing.expectEqual(@as(?u64, 6), composite_result.change_cursor);
+        try std.testing.expectEqualStrings("daemon-a", composite_result.envelope.?.instance_nonce);
+        try std.testing.expectEqualStrings("p1", composite_result.processes[0].id);
+        try std.testing.expectEqualStrings("l1", composite_result.leases[0].id);
+        try std.testing.expectEqualStrings("s1", composite_result.sessions[0].session_id);
+        try std.testing.expect(composite_result.sessions[0].running);
+        try std.testing.expectEqualStrings("turn-1", composite_result.turns[0].turn_id);
+        incomplete_scope = composite_result.incomplete_scopes[0];
+
+        // The M3 store-only result still decodes with composite fields absent.
+        var store_only = try protocol.parseResponse(
+            response_arena.allocator(),
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"snapshot\":{\"store_revision\":9},\"store_revision\":9}}",
+        );
+        defer store_only.deinit();
+        const store_only_result = try client.decodeCompositeSnapshot(&store_only);
+        try std.testing.expect(store_only_result.envelope == null);
+        try std.testing.expect(store_only_result.change_cursor == null);
+        try std.testing.expectEqual(@as(usize, 0), store_only_result.incomplete_scopes.len);
+    }
+
+    // The response arenas above are gone; decoded strings must still be valid.
+    try std.testing.expectEqualStrings("chat.thread", entry_topic);
+    try std.testing.expectEqualStrings("turns", incomplete_scope);
+}
+
+test "changes and composite snapshot decoders return RemoteError for error envelopes" {
+    var client = Client.initEncoder(std.testing.allocator);
+    var parsed = try protocol.parseResponse(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":\"revision_expired\",\"message\":\"cursor below journal floor\",\"data\":{\"floor_seq\":42}}}",
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.RemoteError, client.decodeChanges(&parsed));
+    try std.testing.expectError(error.RemoteError, client.decodeCompositeSnapshot(&parsed));
+    try std.testing.expectEqualStrings(protocol.ERR_REVISION_EXPIRED, parsed.response.err.?.code);
+}
+
+test "advanceChangeCursor advances, surfaces expiry, and resets across instances" {
+    const same_instance: registry.RegistryRevisionEnvelope = .{
+        .instance_nonce = "daemon-a",
+        .registry_revision = 12,
+    };
+
+    // Ordinary advance: adopt next_cursor, no snapshot required.
+    const advanced = advanceChangeCursor(same_instance, .{
+        .envelope = .{ .instance_nonce = "daemon-a", .registry_revision = 13 },
+        .next_cursor = 7,
+    });
+    try std.testing.expectEqual(@as(u64, 7), advanced.next_cursor);
+    try std.testing.expect(!advanced.snapshot_required);
+
+    // Heartbeat (no entries, unchanged cursor) is still a plain advance.
+    const heartbeat = advanceChangeCursor(same_instance, .{
+        .envelope = same_instance,
+        .next_cursor = 7,
+    });
+    try std.testing.expectEqual(@as(u64, 7), heartbeat.next_cursor);
+    try std.testing.expect(!heartbeat.snapshot_required);
+
+    // Journal expiry forces a snapshot before trusting increments again.
+    const expired = advanceChangeCursor(same_instance, .{
+        .envelope = same_instance,
+        .next_cursor = 40,
+        .journal_floor_seq = 40,
+        .expired = true,
+    });
+    try std.testing.expectEqual(@as(u64, 40), expired.next_cursor);
+    try std.testing.expect(expired.snapshot_required);
+
+    // A daemon-instance change invalidates the cursor even without expiry.
+    const replaced = advanceChangeCursor(same_instance, .{
+        .envelope = .{ .instance_nonce = "daemon-b", .registry_revision = 1 },
+        .next_cursor = 1,
+    });
+    try std.testing.expectEqual(@as(u64, 1), replaced.next_cursor);
+    try std.testing.expect(replaced.snapshot_required);
+
+    // First poll has no previous envelope; nothing to reset against.
+    const first = advanceChangeCursor(null, .{
+        .envelope = same_instance,
+        .next_cursor = 3,
+    });
+    try std.testing.expectEqual(@as(u64, 3), first.next_cursor);
+    try std.testing.expect(!first.snapshot_required);
+}
+
+test "store capability gate reports capability_unavailable" {
+    const phase1 = protocol.Capabilities.phase1();
+    var client = Client.initEncoder(std.testing.allocator);
+    try std.testing.expectError(error.CapabilityUnavailable, requireCapability(phase1, .store));
+    try std.testing.expectError(error.CapabilityUnavailable, client.requireCapability(phase1, .store));
+
+    const unavailable = capabilityUnavailable(.store);
+    try std.testing.expectEqualStrings("store", RequiredCapability.store.wireName());
+    try std.testing.expectEqualStrings(protocol.ERR_CAPABILITY_UNAVAILABLE, unavailable.code);
+    try std.testing.expectEqualStrings("store capability is unavailable", unavailable.message);
 }
 
 test "capability checks support direct registry mode" {

@@ -515,6 +515,27 @@ pub fn build(b: *std.Build) void {
     addTestArtifact(b, headless_test_step, headless_tests, target);
     test_compile_step.dependOn(&headless_tests.step);
     addTestArtifact(b, test_step, headless_tests, target);
+    const transcript_apply_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/chat/transcript_apply.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "headless", .module = headless_module }},
+        }),
+    });
+    addTestArtifact(b, test_step, transcript_apply_tests, target);
+    test_compile_step.dependOn(&transcript_apply_tests.step);
+    // Change journal is std-only by design (process_registry discipline), so
+    // its tests build without GUI deps or the headless module.
+    const change_journal_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/daemon/change_journal.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    addTestArtifact(b, test_step, change_journal_tests, target);
+    test_compile_step.dependOn(&change_journal_tests.step);
     const chat_markdown_tests = b.addTest(.{
         .root_module = chat_markdown,
     });

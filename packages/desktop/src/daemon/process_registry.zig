@@ -6,6 +6,8 @@ pub const TERMINAL_PROCESS_OUTCOME_MAX: usize = 32;
 pub const TERMINAL_PROCESS_OUTCOME_TTL_MS: i64 = 15 * std.time.ms_per_min;
 pub const TERMINAL_PROCESS_EXIT_GRACE_MS: i64 = 250;
 pub const WORKSPACE_LEASE_TTL_MS: i64 = 120 * std.time.ms_per_s;
+pub const WORKSPACE_LEASE_TTL_MIN_MS: i64 = 1_000;
+pub const WORKSPACE_LEASE_TTL_MAX_MS: i64 = 3_600_000;
 
 pub const CLIENT_COMPATIBILITY_RETENTION_MS: i64 = 5 * std.time.ms_per_min;
 pub const ORPHAN_GRACE_MS: i64 = 5 * std.time.ms_per_min;
@@ -23,6 +25,12 @@ pub const NOTIFICATION_SESSION_MAX: usize = 32;
 pub const NOTIFICATION_GLOBAL_MAX: usize = 256;
 pub const NOTIFICATION_TTL_MS: i64 = 15 * std.time.ms_per_min;
 pub const REGISTRY_JOB_QUEUE_MAX: usize = 64;
+
+/// Clamp client-provided lease lifetimes before they reach expiry arithmetic.
+pub fn clampLeaseTtl(ttl_ms: i64) i64 {
+    if (ttl_ms <= 0) return WORKSPACE_LEASE_TTL_MS;
+    return @min(@max(ttl_ms, WORKSPACE_LEASE_TTL_MIN_MS), WORKSPACE_LEASE_TTL_MAX_MS);
+}
 
 // These are mirrored from headless/registry_protocol.zig deliberately.  The
 // daemon registry stays independent of the std-only wire package; W2 projects
@@ -1421,6 +1429,7 @@ pub const ProcessRegistry = struct {
         command: []const u8,
         resources: []const []const u8,
         force: bool,
+        ttl_ms: i64,
         now_ms: i64,
     ) !LeaseAcquireResult {
         if (owner.len == 0) return error.LeaseOwnerRequired;
@@ -1440,7 +1449,7 @@ pub const ProcessRegistry = struct {
             owner,
             command,
             resources,
-            WORKSPACE_LEASE_TTL_MS,
+            clampLeaseTtl(ttl_ms),
             force,
             now_ms,
             .@"opaque",
@@ -1460,6 +1469,30 @@ pub const ProcessRegistry = struct {
         self.bumpRevision();
         result.lease = &workspace_record.leases.items[lease_index];
         return result;
+    }
+
+    /// Renew one lease by its opaque ID, enforcing the owning agent identity.
+    /// The returned record is borrowed and must be serialized before mutation.
+    pub fn renewLeaseById(
+        self: *ProcessRegistry,
+        allocator: std.mem.Allocator,
+        workspace_id: []const u8,
+        owner: []const u8,
+        lease_id: []const u8,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) !*LeaseRecord {
+        const workspace_record = self.workspace(workspace_id) orelse return error.LeaseNotFound;
+        _ = self.pruneExpiredLeases(allocator, workspace_id, now_ms);
+        for (workspace_record.leases.items) |*lease| {
+            if (!std.mem.eql(u8, lease.id, lease_id)) continue;
+            if (!std.mem.eql(u8, lease.owner, owner)) return error.LeaseOwnerMismatch;
+            lease.expires_at_ms = now_ms + clampLeaseTtl(ttl_ms);
+            lease.last_renewal_ms = now_ms;
+            self.bumpRevision();
+            return lease;
+        }
+        return error.LeaseNotFound;
     }
 
     /// Returns borrowed conflict metadata after pruning expired leases. The
@@ -2042,11 +2075,11 @@ test "registry lease acquire renew conflict force release and expiry rules" {
     var registry = try ProcessRegistry.init(allocator, "daemon-a");
     defer registry.deinit(allocator);
 
-    try std.testing.expectError(error.LeaseOwnerRequired, registry.acquireLease(allocator, "workspace-a", "", "client-a", "build", &[_][]const u8{"build"}, false, 0));
-    try std.testing.expectError(error.LeaseResourcesRequired, registry.acquireLease(allocator, "workspace-a", "agent-a", "client-a", "build", &[_][]const u8{}, false, 0));
+    try std.testing.expectError(error.LeaseOwnerRequired, registry.acquireLease(allocator, "workspace-a", "", "client-a", "build", &[_][]const u8{"build"}, false, 0, 0));
+    try std.testing.expectError(error.LeaseResourcesRequired, registry.acquireLease(allocator, "workspace-a", "agent-a", "client-a", "build", &[_][]const u8{}, false, 0, 0));
 
     const build = [_][]const u8{ "build", "build" };
-    var first_result = try registry.acquireLease(allocator, "workspace-a", "agent-a", "client-a", "mise run build", &build, false, 1_000);
+    var first_result = try registry.acquireLease(allocator, "workspace-a", "agent-a", "client-a", "mise run build", &build, false, 0, 1_000);
     defer first_result.deinit(allocator);
     const first_id = try allocator.dupe(u8, first_result.lease.id);
     defer allocator.free(first_id);
@@ -2058,16 +2091,16 @@ test "registry lease acquire renew conflict force release and expiry rules" {
     defer conflict_list.deinit(allocator);
     try registry.checkLeaseConflicts(allocator, "workspace-a", "agent-b", &[_][]const u8{"build"}, 1_001, &conflict_list);
     try std.testing.expectEqual(@as(usize, 1), conflict_list.items.len);
-    try std.testing.expectError(error.LeaseConflict, registry.acquireLease(allocator, "workspace-a", "agent-b", "client-b", "cargo test", &[_][]const u8{"build"}, false, 1_001));
+    try std.testing.expectError(error.LeaseConflict, registry.acquireLease(allocator, "workspace-a", "agent-b", "client-b", "cargo test", &[_][]const u8{"build"}, false, 0, 1_001));
 
-    var forced = try registry.acquireLease(allocator, "workspace-a", "agent-b", "client-b", "cargo test", &[_][]const u8{"build"}, true, 1_001);
+    var forced = try registry.acquireLease(allocator, "workspace-a", "agent-b", "client-b", "cargo test", &[_][]const u8{"build"}, true, 0, 1_001);
     defer forced.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), forced.affected_agents.items.len);
     try std.testing.expectEqualStrings("agent-a", forced.affected_agents.items[0].owner);
     try std.testing.expect(!std.mem.eql(u8, first_id, forced.lease.id));
     try std.testing.expectEqual(@as(usize, 2), registry.activeLeaseCount(allocator, "workspace-a", 1_001));
 
-    var renewed = try registry.acquireLease(allocator, "workspace-a", "agent-a", "client-a", "cargo build", &[_][]const u8{"build"}, false, 2_000);
+    var renewed = try registry.acquireLease(allocator, "workspace-a", "agent-a", "client-a", "cargo build", &[_][]const u8{"build"}, false, 0, 2_000);
     defer renewed.deinit(allocator);
     try std.testing.expectEqualStrings(first_id, renewed.lease.id);
     try std.testing.expectEqualStrings("cargo build", renewed.lease.command);
@@ -2075,10 +2108,48 @@ test "registry lease acquire renew conflict force release and expiry rules" {
     try std.testing.expectEqual(@as(usize, 1), registry.releaseLease(allocator, "workspace-a", "agent-a", renewed.lease.id, 2_001));
     try std.testing.expectEqual(@as(usize, 1), registry.releaseLease(allocator, "workspace-a", "agent-b", null, 2_001));
 
-    var expiring = try registry.acquireLease(allocator, "workspace-a", "agent-a", "client-a", "build", &[_][]const u8{"build"}, false, 3_000);
+    var expiring = try registry.acquireLease(allocator, "workspace-a", "agent-a", "client-a", "build", &[_][]const u8{"build"}, false, 0, 3_000);
     defer expiring.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), registry.activeLeaseCount(allocator, "workspace-a", 3_000 + WORKSPACE_LEASE_TTL_MS - 1));
     try std.testing.expectEqual(@as(usize, 0), registry.activeLeaseCount(allocator, "workspace-a", 3_000 + WORKSPACE_LEASE_TTL_MS));
+}
+
+test "lease ttl clamps to sane bounds and renewLeaseById extends only the owner's lease" {
+    const allocator = std.testing.allocator;
+    var registry = try ProcessRegistry.init(allocator, "daemon-a");
+    defer registry.deinit(allocator);
+
+    try std.testing.expectEqual(WORKSPACE_LEASE_TTL_MS, clampLeaseTtl(0));
+    try std.testing.expectEqual(WORKSPACE_LEASE_TTL_MIN_MS, clampLeaseTtl(999));
+    try std.testing.expectEqual(WORKSPACE_LEASE_TTL_MAX_MS, clampLeaseTtl(1_000_000_000));
+
+    var acquired = try registry.acquireLease(
+        allocator,
+        "workspace-a",
+        "owner-a",
+        "client-a",
+        "build",
+        &[_][]const u8{"build"},
+        false,
+        10_000,
+        100,
+    );
+    defer acquired.deinit(allocator);
+    const lease_id = try allocator.dupe(u8, acquired.lease.id);
+    defer allocator.free(lease_id);
+
+    try std.testing.expectError(
+        error.LeaseOwnerMismatch,
+        registry.renewLeaseById(allocator, "workspace-a", "owner-b", lease_id, 5_000, 200),
+    );
+    const renewed = try registry.renewLeaseById(allocator, "workspace-a", "owner-a", lease_id, 5_000, 200);
+    try std.testing.expectEqualStrings(lease_id, renewed.id);
+    try std.testing.expectEqual(@as(i64, 5_200), renewed.expires_at_ms);
+    try std.testing.expectEqual(@as(i64, 200), renewed.last_renewal_ms);
+    try std.testing.expectError(
+        error.LeaseNotFound,
+        registry.renewLeaseById(allocator, "workspace-a", "owner-a", "lease:missing", 5_000, 300),
+    );
 }
 
 test "registry terminal replacement bumps generation and preserves outcomes" {
@@ -2177,7 +2248,7 @@ test "registry lease ids are opaque unique and nonce-scoped" {
     var registry = try ProcessRegistry.init(allocator, "nonce-a");
     defer registry.deinit(allocator);
 
-    var first = try registry.acquireLease(allocator, "workspace-a", "agent-a", "client-a", "build", &[_][]const u8{"build"}, false, 1);
+    var first = try registry.acquireLease(allocator, "workspace-a", "agent-a", "client-a", "build", &[_][]const u8{"build"}, false, 0, 1);
     defer first.deinit(allocator);
     const first_id = try allocator.dupe(u8, first.lease.id);
     defer allocator.free(first_id);
@@ -2188,7 +2259,7 @@ test "registry lease ids are opaque unique and nonce-scoped" {
     try std.testing.expect(revision_before_replacement > 0);
     try registry.replaceInstanceNonce(allocator, "nonce-b");
     try std.testing.expectEqual(@as(u64, 0), registry.registry_revision);
-    var second = try registry.acquireLease(allocator, "workspace-a", "agent-a", "client-a", "deps", &[_][]const u8{"deps"}, false, 3);
+    var second = try registry.acquireLease(allocator, "workspace-a", "agent-a", "client-a", "deps", &[_][]const u8{"deps"}, false, 0, 3);
     defer second.deinit(allocator);
     try std.testing.expect(!std.mem.eql(u8, first_id, second.lease.id));
     try std.testing.expect(std.mem.indexOf(u8, second.lease.id, "nonce-b") != null);
@@ -2224,9 +2295,9 @@ test "forced lease acquisition appends one pull notification per affected owner"
     var registry = try ProcessRegistry.init(allocator, "nonce-a");
     defer registry.deinit(allocator);
 
-    var first = try registry.acquireLease(allocator, "workspace-a", "owner-a", "client-a", "build", &[_][]const u8{"build"}, false, 1_000);
+    var first = try registry.acquireLease(allocator, "workspace-a", "owner-a", "client-a", "build", &[_][]const u8{"build"}, false, 0, 1_000);
     defer first.deinit(allocator);
-    var forced = try registry.acquireLease(allocator, "workspace-a", "owner-b", "client-b", "cargo test", &[_][]const u8{"build"}, true, 1_001);
+    var forced = try registry.acquireLease(allocator, "workspace-a", "owner-b", "client-b", "cargo test", &[_][]const u8{"build"}, true, 0, 1_001);
     defer forced.deinit(allocator);
 
     const mailbox = &registry.workspace("workspace-a").?.notifications;

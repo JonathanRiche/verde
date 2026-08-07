@@ -55,6 +55,11 @@ pub const ERR_STORE_BUSY: []const u8 = "store_busy";
 pub const ERR_SCHEMA_TOO_NEW: []const u8 = "schema_too_new";
 pub const ERR_STORE_CORRUPT: []const u8 = "store_corrupt";
 pub const ERR_STORE_UNAVAILABLE: []const u8 = "store_unavailable";
+/// A client cursor/sequence fell below a retention floor (journal ring or
+/// compacted turn tail).  Recovery is snapshot-fallback + reseed, not the
+/// refresh-and-reguard reaction `conflict` implies (m4m5_decisions Q6).
+/// Error.data carries {floor_seq} (journal) or {compacted_before_seq} (tail).
+pub const ERR_REVISION_EXPIRED: []const u8 = "revision_expired";
 
 /// Typed protocol error carried inside a response envelope.
 pub const Error = struct {
@@ -213,6 +218,16 @@ pub const Capabilities = struct {
     browser_execution: bool = false,
     browser_presentation: bool = false,
     browser: BrowserCapabilities = .{},
+    /// Daemon-owned durable state store. Stays false through Phase 2; the
+    /// production flip to true is a Phase 3 decision (dormant-store contract).
+    store: bool = false,
+    /// Composite scoped core.snapshot reads. False until the M5-P5 flip.
+    snapshots: bool = false,
+    /// Change-journal cursor reads (core.changes). False until the M5-P5 flip.
+    changes: bool = false,
+    /// Push streaming (core.subscribe). Stays false through all of M5 (Q8);
+    /// the names are reserved but undispatched.
+    subscriptions: bool = false,
 
     /// Query the authoritative granular availability of an optional feature.
     pub fn isFeatureAvailable(self: Capabilities, feature: CapabilityFeature) bool {
@@ -242,6 +257,10 @@ pub const Capabilities = struct {
             .browser_execution = false,
             .browser_presentation = false,
             .browser = .{},
+            .store = false,
+            .snapshots = false,
+            .changes = false,
+            .subscriptions = false,
         };
     }
 };
@@ -595,6 +614,7 @@ test "storage error codes retain their stable wire values" {
     try std.testing.expectEqualStrings("schema_too_new", ERR_SCHEMA_TOO_NEW);
     try std.testing.expectEqualStrings("store_corrupt", ERR_STORE_CORRUPT);
     try std.testing.expectEqualStrings("store_unavailable", ERR_STORE_UNAVAILABLE);
+    try std.testing.expectEqualStrings("revision_expired", ERR_REVISION_EXPIRED);
 }
 
 test "parseResponse accepts null id on error envelopes" {
@@ -693,6 +713,10 @@ test "old capability shape defaults every granular feature to unavailable" {
         try std.testing.expect(!parsed.value.capabilities.isFeatureAvailable(feature));
     }
     try std.testing.expect(!parsed.value.capabilities.browser.available);
+    try std.testing.expect(!parsed.value.capabilities.store);
+    try std.testing.expect(!parsed.value.capabilities.snapshots);
+    try std.testing.expect(!parsed.value.capabilities.changes);
+    try std.testing.expect(!parsed.value.capabilities.subscriptions);
 }
 
 test "new granular capability shape round trips" {
@@ -726,10 +750,18 @@ test "new granular capability shape round trips" {
     try std.testing.expect(parsed.value.capabilities.isFeatureAvailable(.browser_lifecycle_restart));
     try std.testing.expect(!parsed.value.capabilities.isFeatureAvailable(.browser_dom_inspection));
     try std.testing.expect(!parsed.value.capabilities.isFeatureAvailable(.terminal_grid));
+    try std.testing.expect(!parsed.value.capabilities.store);
+    try std.testing.expect(!parsed.value.capabilities.snapshots);
+    try std.testing.expect(!parsed.value.capabilities.changes);
+    try std.testing.expect(!parsed.value.capabilities.subscriptions);
 }
 
 test "granular feature and unavailable error helpers use stable names" {
     var capabilities: Capabilities = .phase1();
+    try std.testing.expect(!capabilities.store);
+    try std.testing.expect(!capabilities.snapshots);
+    try std.testing.expect(!capabilities.changes);
+    try std.testing.expect(!capabilities.subscriptions);
     capabilities.terminal_grid = true;
     try std.testing.expect(capabilities.isFeatureAvailable(.terminal_grid));
     try std.testing.expect(!capabilities.isFeatureAvailable(.browser_navigation));
