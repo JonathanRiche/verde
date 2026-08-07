@@ -2824,6 +2824,7 @@ test {
     _ = @import("browser/screenshot.zig");
     _ = @import("ipc/server.zig");
     _ = @import("platform/mod.zig");
+    _ = @import("platform/workspace_identity.zig");
     _ = @import("state/browser_controller.zig");
     _ = @import("providers/claude.zig");
     _ = @import("providers/diagnostics.zig");
@@ -2838,4 +2839,5 @@ test {
     _ = @import("ui/diff_view_cache.zig");
     _ = @import("compile_tests/windows_conpty.zig");
     _ = @import("daemon/process_registry.zig");
+    _ = @import("daemon/store.zig");
 }
