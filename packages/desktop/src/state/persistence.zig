@@ -1,7 +1,11 @@
-//! Persistence snapshot construction and asynchronous schema writes.
+//! Persistence snapshot construction and daemon-routed compatibility payloads.
+//!
+//! Phase 3: the detached SQLite save worker is gone. Snapshot construction
+//! remains as the compatibility payload for `state.snapshot.replace`; actual
+//! commits run in the endpoint-owning daemon.
 
 const std = @import("std");
-const db_client = @import("../db/client.zig");
+const headless = @import("headless");
 const db_types = @import("../db/types.zig");
 const terminal = @import("../terminal/terminal.zig");
 const chat_types = @import("chat_types.zig");
@@ -281,19 +285,168 @@ fn dupeOptionalSlice(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
     return if (value) |slice| try allocator.dupe(u8, slice) else null;
 }
 
-pub fn saveWorker(pref_path: []u8, loaded_state: LoadedPersistedState) void {
-    var loaded = loaded_state;
-    defer loaded.deinit();
-    defer std.heap.page_allocator.free(pref_path);
-
-    var client = db_client.Client.init(std.heap.page_allocator, pref_path) catch |err| {
-        log.err("failed to initialize async native state save: {s}", .{@errorName(err)});
-        return;
+/// Convert a desktop persisted surface row into the store wire DTO.
+pub fn surfaceToProtocol(allocator: std.mem.Allocator, surface: PersistedSurfaceState) !headless.store.SurfaceState {
+    return .{
+        .session_id = try allocator.dupe(u8, surface.session_id),
+        .workspace_id = try allocator.dupe(u8, surface.workspace_id),
+        .workspace_path = try allocator.dupe(u8, surface.workspace_path),
+        .dock_id = surface.dock_id,
+        .pane_id = surface.pane_id,
+        .provider = if (surface.provider) |p| try allocator.dupe(u8, @tagName(p)) else null,
+        .provider_thread_id = try dupeOptionalSlice(allocator, surface.provider_thread_id),
+        .title = try allocator.dupe(u8, surface.title),
+        .status = try allocator.dupe(u8, @tagName(surface.status)),
+        .status_changed_at_ms = surface.status_changed_at_ms,
+        .completed_at_ms = surface.completed_at_ms,
+        .last_event_title = try dupeOptionalSlice(allocator, surface.last_event_title),
+        .last_event_body = try dupeOptionalSlice(allocator, surface.last_event_body),
     };
-    defer client.deinit();
+}
 
-    client.save(loaded.value) catch |err| {
-        log.err("failed to save native state: {s}", .{@errorName(err)});
+/// Convert a full desktop snapshot into the store wire snapshot for
+/// `state.snapshot.replace` (Phase 3 compatibility bridge).
+pub fn persistedStateToProtocolSnapshot(
+    allocator: std.mem.Allocator,
+    state: PersistedState,
+    store_revision: u64,
+) !headless.store.Snapshot {
+    var workspaces = try allocator.alloc(headless.store.Workspace, state.projects.len);
+    for (state.projects, 0..) |project, i| {
+        workspaces[i] = try projectToProtocol(allocator, project);
+    }
+
+    var surfaces = try allocator.alloc(headless.store.SurfaceState, state.surface_states.len);
+    for (state.surface_states, 0..) |surface, i| {
+        surfaces[i] = try surfaceToProtocol(allocator, surface);
+    }
+
+    var completions = try allocator.alloc(headless.store.ChatCompletion, state.chat_completions.len);
+    for (state.chat_completions, 0..) |completion, i| {
+        completions[i] = .{
+            .workspace_id = try allocator.dupe(u8, completion.workspace_id),
+            .local_thread_id = try allocator.dupe(u8, completion.local_thread_id),
+            .completed_at_ms = completion.completed_at_ms,
+        };
+    }
+
+    return .{
+        .schema_version = 1,
+        .store_revision = store_revision,
+        .selected_workspace_index = state.selected_project_index,
+        .sidebar_collapsed = state.sidebar_collapsed,
+        .workspaces = workspaces,
+        .surface_states = surfaces,
+        .chat_completions = completions,
+        .provider = if (state.provider) |p| try allocator.dupe(u8, @tagName(p)) else null,
+        .harness = if (state.harness) |h| try allocator.dupe(u8, @tagName(h)) else null,
+        .draft = try dupeOptionalSlice(allocator, state.draft),
+        .messages = if (state.messages) |msgs| try messagesToProtocol(allocator, msgs) else null,
+    };
+}
+
+fn projectToProtocol(allocator: std.mem.Allocator, project: PersistedProject) !headless.store.Workspace {
+    const workspace_id = if (project.id) |id| try allocator.dupe(u8, id) else try allocator.dupe(u8, project.path);
+    const threads: []const headless.store.Thread = if (project.threads) |src|
+        try threadsToProtocol(allocator, src)
+    else
+        &.{};
+    const messages: []const headless.store.Message = try messagesToProtocol(allocator, project.messages);
+    return .{
+        .workspace_id = workspace_id,
+        .label = try allocator.dupe(u8, project.label),
+        .path = try allocator.dupe(u8, project.path),
+        .archived = project.archived,
+        .unread_count = project.unread_count,
+        .collapsed = project.collapsed,
+        .thread_list_expanded = project.thread_list_expanded,
+        .terminal_height = project.terminal_height,
+        .terminal_layout_json = try dupeOptionalSlice(allocator, project.terminal_layout_json),
+        .terminal_docks_json = try dupeOptionalSlice(allocator, project.terminal_docks_json),
+        .workspace_layout_json = try dupeOptionalSlice(allocator, project.workspace_layout_json),
+        .selected_thread_index = project.selected_thread_index,
+        .companion_thread_local_id = try dupeOptionalSlice(allocator, project.companion_thread_local_id),
+        .herdr_link = if (project.herdr_link) |link| try herdrToProtocol(allocator, link) else null,
+        .provider = try allocator.dupe(u8, @tagName(project.provider)),
+        .harness = try allocator.dupe(u8, @tagName(project.harness)),
+        .draft = try allocator.dupe(u8, project.draft),
+        .threads = threads,
+        .messages = messages,
+    };
+}
+
+fn threadsToProtocol(allocator: std.mem.Allocator, threads: []const PersistedThread) ![]const headless.store.Thread {
+    var out = try allocator.alloc(headless.store.Thread, threads.len);
+    for (threads, 0..) |thread, i| {
+        out[i] = try threadToProtocol(allocator, thread, i);
+    }
+    return out;
+}
+
+fn threadToProtocol(allocator: std.mem.Allocator, thread: PersistedThread, index: usize) !headless.store.Thread {
+    const local_id = if (thread.local_thread_id) |id|
+        try allocator.dupe(u8, id)
+    else
+        try std.fmt.allocPrint(allocator, "thread-{d}", .{index});
+    return .{
+        .local_thread_id = local_id,
+        .title = try allocator.dupe(u8, thread.title),
+        .archived = thread.archived,
+        .committed = thread.committed,
+        .last_activity_at = thread.last_activity_at,
+        .provider_thread_id = try dupeOptionalSlice(allocator, thread.provider_thread_id),
+        .model_ref = try dupeOptionalSlice(allocator, thread.model_ref),
+        .reasoning_effort = if (thread.reasoning_effort) |v| try allocator.dupe(u8, @tagName(v)) else null,
+        .reasoning_variant = try dupeOptionalSlice(allocator, thread.reasoning_variant),
+        .fast_mode = if (thread.fast_mode) |v| try allocator.dupe(u8, @tagName(v)) else null,
+        .access_mode = if (thread.access_mode) |v| try allocator.dupe(u8, @tagName(v)) else null,
+        .provider = try allocator.dupe(u8, @tagName(thread.provider)),
+        .harness = try allocator.dupe(u8, @tagName(thread.harness)),
+        .tui_dock_id = thread.tui_dock_id,
+        .draft = try allocator.dupe(u8, thread.draft),
+        .draft_image = if (thread.draft_image) |img| try imageToProtocol(allocator, img) else null,
+        .messages = try messagesToProtocol(allocator, thread.messages),
+    };
+}
+
+fn messagesToProtocol(allocator: std.mem.Allocator, messages: []const PersistedMessage) ![]const headless.store.Message {
+    var out = try allocator.alloc(headless.store.Message, messages.len);
+    for (messages, 0..) |message, i| {
+        out[i] = .{
+            // Snapshot rows may omit message_id; the store accepts empty here.
+            .message_id = try std.fmt.allocPrint(allocator, "snap-msg-{d}", .{i}),
+            .role = try allocator.dupe(u8, @tagName(message.role)),
+            .author = try allocator.dupe(u8, message.author),
+            .body = try allocator.dupe(u8, message.body),
+            .image = if (message.image) |img| try imageToProtocol(allocator, img) else null,
+            .tool_call_id = try dupeOptionalSlice(allocator, message.tool_call_id),
+            .tool_call_kind = if (message.tool_call_kind) |v| try allocator.dupe(u8, @tagName(v)) else null,
+            .tool_call_status = if (message.tool_call_status) |v| try allocator.dupe(u8, @tagName(v)) else null,
+        };
+    }
+    return out;
+}
+
+fn imageToProtocol(allocator: std.mem.Allocator, image: PersistedImageAttachment) !headless.store.Attachment {
+    return .{
+        .path = try allocator.dupe(u8, image.path),
+        .mime = try allocator.dupe(u8, image.mime),
+        .byte_size = image.byte_size,
+    };
+}
+
+fn herdrToProtocol(allocator: std.mem.Allocator, link: db_types.PersistedHerdrWorkspaceLink) !headless.store.HerdrWorkspaceLink {
+    return .{
+        .remote_alias = try allocator.dupe(u8, link.remote_alias),
+        .session_name = try allocator.dupe(u8, link.session_name),
+        .workspace_id = try allocator.dupe(u8, link.workspace_id),
+        .local_dir = try allocator.dupe(u8, link.local_dir),
+        .remote_cwd = try dupeOptionalSlice(allocator, link.remote_cwd),
+        .last_pane_id = try dupeOptionalSlice(allocator, link.last_pane_id),
+        .attach_dock_id = link.attach_dock_id,
+        .attach_pane_id = link.attach_pane_id,
+        .pane_links_json = try dupeOptionalSlice(allocator, link.pane_links_json),
+        .updated_at_ms = link.updated_at_ms,
     };
 }
 

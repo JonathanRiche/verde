@@ -1,9 +1,8 @@
-//! Dormant daemon-owned SQLite store adapter (Phase 2).
+//! Daemon-owned SQLite store adapter (M3 sole writer after Phase 3 flip).
 //!
-//! Production construction remains absent until the M3 authority flip: the
-//! daemon opens this adapter only under the hermetic
-//! `VERDE_SESSION_DAEMON_STORE_DIR` override. The adapter owns the transaction,
-//! receipt, and durable revision boundary for an explicitly supplied path.
+//! After endpoint ownership the production daemon opens `{pref}/state.sqlite`
+//! (hermetic tests may redirect via `VERDE_SESSION_DAEMON_STORE_DIR`). The
+//! adapter owns the transaction, receipt, and durable revision boundary.
 
 const std = @import("std");
 const zqlite = @import("zqlite");
@@ -246,13 +245,13 @@ pub const Store = struct {
     /// Test-only; production construction always leaves `.none`.
     fault: StoreFault = .none,
 
-    /// Open the exact database path as the dormant test-only store adapter.
+    /// Open the exact database path as the sole store writer.
     pub fn init(allocator: std.mem.Allocator, db_path: []const u8) StoreError!Self {
         return initWithFault(allocator, db_path, .none);
     }
 
-    /// Open the store with an optional test-only fault hook (B9). Reachable only
-    /// via hermetic tests and the env-selected store override path.
+    /// Open the store with an optional test-only fault hook (B9). Production
+    /// always uses `.none`; hermetic ITs may arm stalls/crashes via env.
     pub fn initWithFault(allocator: std.mem.Allocator, db_path: []const u8, fault: StoreFault) StoreError!Self {
         const path = try allocator.dupeZ(u8, db_path);
         errdefer allocator.free(path);
@@ -2571,6 +2570,64 @@ test "natural duplicate replay wins over stale expected revision" {
         .message = collision,
     }));
     try std.testing.expectEqual(@as(u64, 4), try store.storeRevision());
+}
+
+// Literal schema-v2 fixture: RO-open must accept a genuine v2-era DB without
+// migration (S5 NIT-1 / production flip compatibility promise). Distinct from
+// the MAX_SUPPORTED_VERSION pin below.
+test "read-only reopen accepts literal schema v2 fixture without migration" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    {
+        const flags = zqlite.OpenFlags.Create | zqlite.OpenFlags.EXResCode;
+        var conn = try zqlite.open(db_path, flags);
+        defer conn.close();
+        try schema.initializeToVersion(conn, 2);
+        try conn.exec(
+            "insert into workspaces (workspace_id, sort_index, label, path) values (?1, 0, ?2, ?3)",
+            .{ "v2-fixture-ws", "V2Fixture", "/v2-fixture" },
+        );
+        const version_row = (try conn.row("pragma user_version", .{})).?;
+        defer version_row.deinit();
+        try std.testing.expectEqual(@as(i64, 2), version_row.int(0));
+    }
+
+    const before_bytes = try tmp.dir.readFileAlloc(std.testing.io, "state.sqlite", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(before_bytes);
+
+    {
+        const flags = zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode;
+        var conn = try zqlite.open(db_path, flags);
+        defer conn.close();
+        try schema.validateReadOnly(conn);
+
+        const version_row = (try conn.row("pragma user_version", .{})).?;
+        defer version_row.deinit();
+        try std.testing.expectEqual(@as(i64, 2), version_row.int(0));
+
+        const label_row = (try conn.row(
+            "select label from workspaces where workspace_id = ?1",
+            .{"v2-fixture-ws"},
+        )).?;
+        defer label_row.deinit();
+        const label = try std.testing.allocator.dupe(u8, label_row.text(0));
+        defer std.testing.allocator.free(label);
+        try std.testing.expectEqualStrings("V2Fixture", label);
+
+        // Store tables exist at v2; revision row is present and unmigrated.
+        const rev_row = (try conn.row("select store_revision from store_state where id = 1", .{})).?;
+        defer rev_row.deinit();
+        try std.testing.expectEqual(@as(i64, 0), rev_row.int(0));
+
+        try std.testing.expectError(error.ReadOnly, conn.execNoArgs("delete from workspaces"));
+    }
+
+    const after_bytes = try tmp.dir.readFileAlloc(std.testing.io, "state.sqlite", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(after_bytes);
+    try std.testing.expectEqualSlices(u8, before_bytes, after_bytes);
 }
 
 // Read-only reopen of a store-created DB must accept the schema without

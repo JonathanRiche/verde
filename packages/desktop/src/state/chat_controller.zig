@@ -3250,12 +3250,12 @@ pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usi
     const completed_at_ms = unixTimestampMs();
     thread.completion_pending = true;
     thread.completed_at_ms = completed_at_ms;
-    self.storage.client.upsertChatCompletion(.{
+    self.storage.upsertChatCompletion(.{
         .workspace_id = project.id,
         .local_thread_id = thread.local_thread_id,
         .completed_at_ms = completed_at_ms,
     }) catch |err| {
-        log.err("failed to persist chat completion: {s}", .{@errorName(err)});
+        log.err("failed to persist chat completion via daemon: {s}", .{@errorName(err)});
     };
     self.markDirty();
 

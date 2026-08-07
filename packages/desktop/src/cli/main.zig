@@ -622,7 +622,16 @@ fn handleState(allocator: std.mem.Allocator, out: output.Output, argv: []const [
         return;
     }
 
-    var client = try db_client.Client.init(allocator, pref_path);
+    var client = try openStateReadOnly(allocator, pref_path) orelse {
+        if (json) {
+            try out.jsonValue(allocator, .{ .workspaces = &.{} });
+        } else {
+            const db_path = try db_client.Client.pathForPrefPath(allocator, pref_path);
+            defer allocator.free(db_path);
+            try out.stdout("No persisted Verde state found at {s}\n", .{db_path});
+        }
+        return;
+    };
     defer client.deinit();
     var loaded = try client.load(allocator) orelse {
         if (json) {
@@ -1120,7 +1129,14 @@ fn handleHerdrStatus(allocator: std.mem.Allocator, out: output.Output, io: std.I
 fn writeOfflineHerdrStatus(allocator: std.mem.Allocator, out: output.Output, json: bool) !void {
     const pref_path = try prefPath(allocator);
     defer allocator.free(pref_path);
-    var client = try db_client.Client.init(allocator, pref_path);
+    var client = try openStateReadOnly(allocator, pref_path) orelse {
+        if (json) {
+            try out.jsonValue(allocator, .{ .id = 1, .ok = true, .result = .{ .daemon_running = false, .links = &.{} } });
+        } else {
+            try out.stdout("No persisted Verde Herdr links found.\n", .{});
+        }
+        return;
+    };
     defer client.deinit();
     var loaded = try client.load(allocator) orelse {
         if (json) {
@@ -1358,7 +1374,16 @@ fn handleSession(allocator: std.mem.Allocator, out: output.Output, io: std.Io, e
 
         const pref_path = try prefPath(allocator);
         defer allocator.free(pref_path);
-        var client = try db_client.Client.init(allocator, pref_path);
+        var client = try openStateReadOnly(allocator, pref_path) orelse {
+            if (json) {
+                try out.jsonValue(allocator, .{ .daemon_running = false, .sessions = &.{} });
+            } else {
+                const db_path = try db_client.Client.pathForPrefPath(allocator, pref_path);
+                defer allocator.free(db_path);
+                try out.stdout("No persisted Verde state found at {s}\n", .{db_path});
+            }
+            return;
+        };
         defer client.deinit();
         var loaded = try client.load(allocator) orelse {
             if (json) {
@@ -1637,11 +1662,13 @@ fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, ar
     const status = args.optionValue(argv, "--status");
     const label = args.optionValue(argv, "--label");
     const persisted_status = if (status) |value| std.meta.stringToEnum(db_types.SurfaceStatus, value) else null;
-    var persistence_error: ?anyerror = null;
+
+    // Phase 3: surface durability is daemon-routed. Offline direct-writer
+    // fallback is intentionally removed; auto-start failure is a structured error.
     if (clear or persisted_status != null) {
         const changed_at_ms = unixTimestampMs();
         const status_value: db_types.SurfaceStatus = persisted_status orelse .idle;
-        persistSurfaceState(allocator, .{
+        persistSurfaceStateViaDaemon(allocator, io, argv[0], .{
             .session_id = session_id,
             .workspace_id = workspace_id orelse "",
             .workspace_path = workspace_path orelse "",
@@ -1656,9 +1683,20 @@ fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, ar
             .last_event_title = title orelse label,
             .last_event_body = body,
         }, clear or status_value == .idle) catch |err| {
-            persistence_error = err;
+            if (args.hasFlag(argv, "--json")) {
+                try out.jsonValue(allocator, .{
+                    .ok = false,
+                    .error_code = "store_unavailable",
+                    .error_message = @errorName(err),
+                    .session_id = session_id,
+                });
+            } else if (!args.hasFlag(argv, "--quiet")) {
+                try out.stderr("verde notify: daemon store unavailable ({s})\n", .{@errorName(err)});
+            }
+            std.process.exit(1);
         };
     }
+
     const response = sendLiveRequestAlloc(allocator, io, method, .{
         .session_id = session_id,
         .workspace_id = workspace_id,
@@ -1673,38 +1711,25 @@ fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, ar
         .label = label,
         .attention = if (args.hasFlag(argv, "--attention")) true else null,
     }, 1) catch |err| {
+        // Live GUI notification is best-effort after durable store write.
+        if (!args.hasFlag(argv, "--quiet")) {
+            try out.stderr("verde notify: running app unavailable ({s})\n", .{@errorName(err)});
+        }
         if (clear or persisted_status != null) {
-            if (persistence_error) |persist_err| {
-                if (!args.hasFlag(argv, "--quiet")) {
-                    try out.stderr("verde notify: app unavailable ({s}); failed to persist surface state ({s})\n", .{ @errorName(err), @errorName(persist_err) });
-                }
-                return;
-            }
+            // Store write already succeeded; do not fail the CLI for live-only delivery.
             if (args.hasFlag(argv, "--json")) {
                 try out.jsonValue(allocator, .{
                     .ok = true,
-                    .offline = true,
+                    .offline_live = true,
                     .session_id = session_id,
                     .cleared = clear,
                 });
-            } else if (!args.hasFlag(argv, "--quiet")) {
-                if (clear) {
-                    try out.stdout("Surface state cleared.\n", .{});
-                } else {
-                    try out.stdout("Surface state saved for Verde.\n", .{});
-                }
             }
             return;
         }
-        if (!args.hasFlag(argv, "--quiet")) try out.stderr("verde notify: running app unavailable ({s})\n", .{@errorName(err)});
-        return;
+        std.process.exit(1);
     };
     defer allocator.free(response);
-    if (persistence_error) |err| {
-        if (!args.hasFlag(argv, "--quiet")) {
-            try out.stderr("verde notify: live update delivered; failed to persist surface state ({s})\n", .{@errorName(err)});
-        }
-    }
     if (args.hasFlag(argv, "--json")) {
         try out.stdout("{s}\n", .{response});
     } else if (!args.hasFlag(argv, "--quiet")) {
@@ -1712,20 +1737,85 @@ fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, ar
     }
 }
 
-fn persistSurfaceState(
+/// Route surface persistence through the session daemon (no direct SQLite writer).
+fn persistSurfaceStateViaDaemon(
     allocator: std.mem.Allocator,
+    io: std.Io,
+    exe_path: []const u8,
     record: db_types.PersistedSurfaceState,
     clear: bool,
 ) !void {
     const pref_path = try prefPath(allocator);
     defer allocator.free(pref_path);
-    var client = try db_client.Client.init(allocator, pref_path);
-    defer client.deinit();
+    try ensureSessionDaemon(allocator, io, exe_path);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    const arena = decode_arena.allocator();
+
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = arena,
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(arena, &transport);
+
+    var registered = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer registered.deinit();
+    if (registered.response.err) |_| return error.SessionDaemonUnavailable;
+    const client_id = (try client.decodeClientRegister(&registered)).client_id;
+
+    const request_key = try std.fmt.allocPrint(arena, "cli:notify:{s}:{d}", .{
+        record.session_id,
+        unixTimestampMs(),
+    });
+    const mutation: headless.store.MutationHeader = .{
+        .request_key = request_key,
+        .client_id = client_id,
+    };
+
     if (clear) {
-        _ = try client.clearSurfaceState(record.session_id);
-    } else {
-        try client.upsertSurfaceState(record);
+        const request: headless.store.SurfaceClearRequest = .{
+            .mutation = mutation,
+            .session_id = record.session_id,
+        };
+        var parsed = try client.call(headless.store.METHOD_SURFACE_CLEAR, request);
+        defer parsed.deinit();
+        if (parsed.response.err) |_| return error.StoreMutationFailed;
+        _ = try client.decodeWriteResult(&parsed);
+        return;
     }
+
+    const provider_name: ?[]const u8 = if (record.provider) |p| @tagName(p) else null;
+    const request: headless.store.SurfaceUpsertRequest = .{
+        .mutation = mutation,
+        .surface = .{
+            .session_id = record.session_id,
+            .workspace_id = record.workspace_id,
+            .workspace_path = record.workspace_path,
+            .dock_id = record.dock_id,
+            .pane_id = record.pane_id,
+            .provider = provider_name,
+            .provider_thread_id = record.provider_thread_id,
+            .title = record.title,
+            .status = @tagName(record.status),
+            .status_changed_at_ms = record.status_changed_at_ms,
+            .completed_at_ms = record.completed_at_ms,
+            .last_event_title = record.last_event_title,
+            .last_event_body = record.last_event_body,
+        },
+    };
+    var parsed = try client.call(headless.store.METHOD_SURFACE_UPSERT, request);
+    defer parsed.deinit();
+    if (parsed.response.err) |_| return error.StoreMutationFailed;
+    _ = try client.decodeWriteResult(&parsed);
+}
+
+/// Strict read-only state open for CLI inspection; never initializes schema.
+fn openStateReadOnly(allocator: std.mem.Allocator, pref_path: []const u8) !?db_client.Client {
+    return db_client.Client.initReadOnly(allocator, pref_path) catch |err| switch (err) {
+        error.CantOpen => null,
+        else => err,
+    };
 }
 
 const IntegrationProvider = struct {
@@ -2971,7 +3061,10 @@ fn resolveAttachSessionId(allocator: std.mem.Allocator, out: output.Output, argv
     };
     const pref_path = try prefPath(allocator);
     defer allocator.free(pref_path);
-    var client = try db_client.Client.init(allocator, pref_path);
+    var client = try openStateReadOnly(allocator, pref_path) orelse {
+        try out.stderr("no persisted Verde state found\n", .{});
+        std.process.exit(4);
+    };
     defer client.deinit();
     var loaded = try client.load(allocator) orelse {
         try out.stderr("no persisted Verde state found at {s}\n", .{client.path});

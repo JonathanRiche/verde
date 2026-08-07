@@ -546,8 +546,8 @@ pub fn clearChatCompletion(self: anytype, project_index: usize, thread_index: us
     if (thread_index >= project.threads.items.len) return false;
     const thread = &project.threads.items[thread_index];
     if (!thread.completion_pending) return false;
-    _ = self.storage.client.clearChatCompletion(project.id, thread.local_thread_id) catch |err| {
-        log.err("failed to persist chat completion acknowledgement: {s}", .{@errorName(err)});
+    _ = self.storage.clearChatCompletion(project.id, thread.local_thread_id) catch |err| {
+        log.err("failed to persist chat completion acknowledgement via daemon: {s}", .{@errorName(err)});
         return false;
     };
     thread.completion_pending = false;

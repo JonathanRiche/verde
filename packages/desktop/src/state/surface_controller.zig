@@ -153,7 +153,7 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
         }
     }
     if (update.clear) {
-        _ = try self.storage.client.clearSurfaceState(s.session_id);
+        _ = try self.storage.clearSurfaceState(s.session_id);
         if (s.status != .idle) s.status_changed_at_ms = unixTimestampMs();
         s.status = .idle;
         s.completion_pending = false;
@@ -193,11 +193,10 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
             s.last_event_at_ms = unixTimestampMs();
         }
         if (s.status == .idle) {
-            if (update.status != null) _ = try self.storage.client.clearSurfaceState(s.session_id);
+            if (update.status != null) _ = try self.storage.clearSurfaceState(s.session_id);
         } else {
-            // Every non-idle hook state is durable. This is also the offline
-            // handoff point used to restore a daemon-owned TUI after restart.
-            try self.storage.client.upsertSurfaceState(persistedSurfaceState(s));
+            // Every non-idle hook state is durable via the daemon store.
+            try self.storage.upsertSurfaceState(persistedSurfaceState(s));
         }
     }
     // Notify on the completion edge. Runs on the main thread (live commands
@@ -336,8 +335,8 @@ fn clearSurfaceAttentionAtIndex(self: anytype, surface_index: usize) bool {
     const done_ack = surface.completion_pending or surface.status == .done;
     if (!surface.attention and surface.unread_count == 0 and !done_ack) return terminal_changed;
     if (done_ack) {
-        _ = self.storage.client.clearSurfaceState(surface.session_id) catch |err| {
-            log.err("failed to persist surface acknowledgement: {s}", .{@errorName(err)});
+        _ = self.storage.clearSurfaceState(surface.session_id) catch |err| {
+            log.err("failed to persist surface acknowledgement via daemon: {s}", .{@errorName(err)});
             return terminal_changed;
         };
     }

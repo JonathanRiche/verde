@@ -142,14 +142,15 @@ pub fn main(init: std.process.Init) !void {
     try runLeaseRenewReleaseScenario(allocator, io);
     try runForcedAcquireOverTransportScenario(allocator, io);
 
-    // Windows-safe store subset (S5): named-pipe transport parity + store off-Unix.
+    // Windows-safe store subset (S5 + P3 production open).
     // Paths use std.fs.path; endpoints via platform isolation (no Unix-socket assumptions).
-    // First-pipe ownership stays the transport's job — reuse bind/replace patterns rather
-    // than new pipe code. P3 carry-forwards: capability flip, core.snapshot, real-DB
-    // dedupe before partial unique index, concurrent-accept tail IT (see m3_track_specs).
+    // NIT-2: bind exclusivity for Windows remains transport-owned via PTY-tier
+    // runLifecycleBindGuard / runLifecycleGracefulReplace (subsumed; not re-added here).
     try runStoreLessScenario(allocator, io);
     try runStoreEnabledScenario(allocator, io);
+    try runStoreProductionOpenScenario(allocator, io);
     try runStoreDurableReopenScenario(allocator, io);
+    try runNotifyRequiresDaemonScenario(allocator, io);
 
     // Extended store scenarios (POSIX only): full surface + S4 fault/busy/crash pins.
     // Transport-tier primitives, but not part of the Windows-safe subset.
@@ -180,6 +181,8 @@ pub fn main(init: std.process.Init) !void {
         // Store-backed lease/outcome transfer (M2-DT-b). Lifecycle/bind tier:
         // spawns daemons; needs PTY for the finished-terminal-process half.
         try runLifecycleGracefulReplaceWithTransfer(allocator, io);
+        // P3: version-skew blocked replacement with live PTY is read-only, no writer fallback.
+        try version_skew_blocked_replacement_is_read_only_without_fallback(allocator, io);
         try runLifecycleIdleExitOverride(allocator, io);
     }
     std.debug.print("headless-daemon-it: ok\n", .{});
@@ -290,11 +293,15 @@ const EndpointIsolation = struct {
 };
 
 /// Spawn options for hermetic IT daemons. S4 adds `store_fault` (B9 arm names).
+/// P3 adds `store_disable` so store-less capability pins survive production open.
 const IsolatedDaemonOptions = struct {
     idle_exit_ms: ?[]const u8 = null,
     store_dir: ?[]const u8 = null,
     /// When set with `store_dir`, maps to `VERDE_SESSION_DAEMON_STORE_FAULT`.
     store_fault: ?[]const u8 = null,
+    /// When true, sets VERDE_SESSION_DAEMON_STORE_DISABLE so the production store
+    /// open is skipped (store-less capability_unavailable pin).
+    store_disable: bool = false,
     slow_io_ms: ?[]const u8 = null,
     retention_ms: ?[]const u8 = null,
 };
@@ -362,6 +369,7 @@ fn spawnIsolatedDaemonWithOptions(
     if (options.store_dir) |value| try env_map.put(sessionizer.SESSION_DAEMON_STORE_DIR_ENV_NAME, value);
     // B9: fault env is only meaningful with the store-dir override.
     if (options.store_fault) |value| try env_map.put(sessionizer.SESSION_DAEMON_STORE_FAULT_ENV_NAME, value);
+    if (options.store_disable) try env_map.put(sessionizer.SESSION_DAEMON_STORE_DISABLE_ENV_NAME, "1");
 
     // Bind the child to the same isolated endpoint the parent uses.
     const endpoint = try isolationEndpoint(allocator, pref_path);
@@ -502,6 +510,8 @@ fn deleteItPath(io: std.Io, path: []const u8) void {
 /// Matches the durable exit-wait discrimination plus the EOF class seen when
 /// prepareShutdown's drain thread tears down the endpoint under a racing probe
 /// (ConnectionResetByPeer / ConnectionAborted). Not OOM/protocol/timeouts.
+/// NIT-3 (S5): Unix-tuned; Windows named-pipe teardown can also surface
+/// PipeBusy / BrokenPipe / Unexpected — widen when a Windows runtime IT exists.
 fn isConnectClassError(err: anyerror) bool {
     return switch (err) {
         error.ConnectionRefused,
@@ -1564,7 +1574,11 @@ fn runPrepareGateScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     defer isolation.deinit(allocator);
     const self_exe = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_exe);
-    var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    // Store-disabled: pin the dormant path where active leases still refuse
+    // prepare. Store-active transfer is covered by runLifecycleGracefulReplaceWithTransfer.
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_disable = true,
+    });
     var child_exited = false;
     defer if (!child_exited) child.kill(io);
 
@@ -1823,7 +1837,140 @@ fn jsonStringValue(value: std.json.Value) ?[]const u8 {
     return if (value == .string) value.string else null;
 }
 
-/// Store-less daemon: all store methods return capability_unavailable (S3 full surface).
+/// P3 production open: no store_dir override → daemon opens `{pref}/state.sqlite`,
+/// advertises store=true, and accepts a mutation. Pins the authority flip path.
+fn runStoreProductionOpenScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "store-production-open");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    // No store_dir: production path opens pref_path/state.sqlite after bind.
+    var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    defer child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    {
+        const empty_params: struct {} = .{};
+        var status_parsed = try client.call("core.status", empty_params);
+        defer status_parsed.deinit();
+        if (!status_parsed.response.isOk()) return error.StoreProductionCoreStatusFailed;
+        const status = try client.decodeStatus(&status_parsed);
+        if (!status.capabilities.store) return error.StoreProductionCapabilityFalse;
+    }
+
+    var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer register_parsed.deinit();
+    const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+    const request: headless.store.WorkspaceUpsertRequest = .{
+        .mutation = .{
+            .request_key = "p3-production-ws",
+            .client_id = client_id,
+        },
+        .workspace = .{
+            .workspace_id = "p3-production-ws",
+            .label = "Production",
+            .path = pref_path,
+        },
+    };
+    var upsert = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, request);
+    defer upsert.deinit();
+    if (!upsert.response.isOk()) return error.StoreProductionUpsertFailed;
+    const write = try client.decodeWriteResult(&upsert);
+    if (!write.applied or write.store_revision != 1) return error.StoreProductionWriteResultWrong;
+
+    // Production DB must exist under the preference path (not a hermetic redirect).
+    const db_path = try std.fs.path.join(allocator, &.{ pref_path, "state.sqlite" });
+    defer allocator.free(db_path);
+    const db_path_z = try allocator.dupeZ(u8, db_path);
+    defer allocator.free(db_path_z);
+    const flags = zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode;
+    var conn = try zqlite.open(db_path_z, flags);
+    defer conn.close();
+    const row = (try conn.row(
+        "select label from workspaces where workspace_id = ?1",
+        .{"p3-production-ws"},
+    )) orelse return error.StoreProductionDbMissingRow;
+    defer row.deinit();
+    if (!std.mem.eql(u8, row.text(0), "Production")) return error.StoreProductionDbWrongLabel;
+}
+
+/// P3 notify regression: with store disabled (daemon auto-start yields store-less),
+/// surface mutations return a structured store error — never a silent offline writer.
+fn runNotifyRequiresDaemonScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "notify-requires-daemon");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_disable = true,
+    });
+    defer child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer register_parsed.deinit();
+    const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+    const request: headless.store.SurfaceUpsertRequest = .{
+        .mutation = .{
+            .request_key = "p3-notify-surface",
+            .client_id = client_id,
+        },
+        .surface = .{
+            .session_id = "notify-session",
+            .status = "working",
+        },
+    };
+    var parsed = try client.call(headless.store.METHOD_SURFACE_UPSERT, request);
+    defer parsed.deinit();
+    const err = parsed.response.err orelse return error.NotifyStoreLessMissingError;
+    if (!std.mem.eql(u8, err.code, headless.protocol.ERR_CAPABILITY_UNAVAILABLE)) return error.NotifyStoreLessWrongCode;
+    if (!std.mem.eql(u8, err.message, "store capability is unavailable")) return error.NotifyStoreLessWrongMessage;
+
+    // No production DB must have been created by a direct writer fallback.
+    const db_path = try std.fs.path.join(allocator, &.{ pref_path, "state.sqlite" });
+    defer allocator.free(db_path);
+    const db_path_z = try allocator.dupeZ(u8, db_path);
+    defer allocator.free(db_path_z);
+    const open_flags = zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode;
+    if (zqlite.open(db_path_z, open_flags)) |conn| {
+        conn.close();
+        return error.NotifyDirectWriterCreatedDb;
+    } else |_| {}
+}
+
+/// Store-less daemon: all store methods return capability_unavailable.
+/// After P3 production open, this uses VERDE_SESSION_DAEMON_STORE_DISABLE so the
+/// capability_unavailable surface remains pinable without a dual-writer path.
 fn runStoreLessScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const pref_path = try makePrefPath(allocator, "store-less");
     defer allocator.free(pref_path);
@@ -1836,7 +1983,9 @@ fn runStoreLessScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const self_exe = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_exe);
 
-    var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_disable = true,
+    });
     defer child.kill(io);
 
     var transport: sessionizer.HeadlessTransport = .{
@@ -2146,14 +2295,14 @@ fn runStoreEnabledScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         if (!status.writer_ready) return error.StoreEnabledWriterNotReady;
     }
 
-    // Dormancy pin (B2/B10): core.status still advertises store=false in P2.
+    // P3 authority pin: core.status advertises store=true once the writer owns the DB.
     {
         const empty_params: struct {} = .{};
         var status_parsed = try client.call("core.status", empty_params);
         defer status_parsed.deinit();
         if (!status_parsed.response.isOk()) return error.StoreEnabledCoreStatusFailed;
         const status = try client.decodeStatus(&status_parsed);
-        if (status.capabilities.store) return error.StoreEnabledStoreCapabilityAdvertised;
+        if (!status.capabilities.store) return error.StoreEnabledStoreCapabilityNotAdvertised;
     }
 }
 
@@ -3742,6 +3891,103 @@ fn runLifecycleGracefulReplace(allocator: std.mem.Allocator, io: std.Io) !void {
 }
 
 /// Env override enables fast idle exit for hermetic tests; default is persistent.
+/// P3 pin: when a store-required desktop would need protocol replacement but a
+/// live PTY blocks prepareShutdown, the old daemon stays fully working, store
+/// mutations remain accepted, and no direct SQLite writer fallback is opened.
+/// Named exactly as m3_design requires.
+fn version_skew_blocked_replacement_is_read_only_without_fallback(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "version-skew-blocked");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    // Production store open (no redirect) so the user DB path is the sole writer path.
+    var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    defer child.kill(io);
+
+    const session_id = "verde:headless-it:version-skew-pty";
+    {
+        const create = try sessionizer.requestAlloc(allocator, pref_path, "session.create", .{
+            .id = session_id,
+            .cwd = pref_path,
+            .command = &[_][]const u8{"/bin/cat"},
+            .cols = sessionizer.DEFAULT_COLS,
+            .rows = sessionizer.DEFAULT_ROWS,
+        }, 1);
+        defer allocator.free(create);
+        if (std.mem.indexOf(u8, create, "\"error\"") != null) return error.VersionSkewSessionCreateFailed;
+    }
+
+    // Live PTY blocks prepare — the version-skew replacement path cannot drain.
+    const prepare = try sessionizer.requestAlloc(allocator, pref_path, "daemon.prepareShutdown", .{}, 2);
+    defer allocator.free(prepare);
+    if (std.mem.indexOf(u8, prepare, "invalid_state") == null) return error.VersionSkewPrepareShouldRefuse;
+
+    // Old daemon remains fully working: store mutations accepted, store=true.
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    {
+        const empty_params: struct {} = .{};
+        var status_parsed = try client.call("core.status", empty_params);
+        defer status_parsed.deinit();
+        if (!status_parsed.response.isOk()) return error.VersionSkewCoreStatusFailed;
+        const status = try client.decodeStatus(&status_parsed);
+        if (!status.capabilities.store) return error.VersionSkewStoreCapabilityFalse;
+    }
+
+    var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer register_parsed.deinit();
+    const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+    const request: headless.store.WorkspaceUpsertRequest = .{
+        .mutation = .{
+            .request_key = "version-skew-ws",
+            .client_id = client_id,
+        },
+        .workspace = .{
+            .workspace_id = "version-skew-ws",
+            .label = "Skew",
+            .path = pref_path,
+        },
+    };
+    var upsert = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, request);
+    defer upsert.deinit();
+    if (!upsert.response.isOk()) return error.VersionSkewStoreMutationFailed;
+
+    // ensureDaemon with a matching protocol must not tear down the live daemon.
+    try sessionizer.ensureDaemon(allocator, pref_path, self_exe);
+    const status_after = try sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 3);
+    defer allocator.free(status_after);
+    if (std.mem.indexOf(u8, status_after, "protocol_version") == null) return error.VersionSkewDaemonDied;
+
+    // Read-only projection is allowed; Create/writer open is never the desktop fallback.
+    const db_path = try std.fs.path.join(allocator, &.{ pref_path, "state.sqlite" });
+    defer allocator.free(db_path);
+    const db_path_z = try allocator.dupeZ(u8, db_path);
+    defer allocator.free(db_path_z);
+    var ro = try zqlite.open(db_path_z, zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode);
+    defer ro.close();
+    if (ro.execNoArgs("delete from workspaces")) |_| {
+        return error.VersionSkewDirectWriteSucceeded;
+    } else |err| {
+        if (err != error.ReadOnly) return err;
+    }
+
+    const kill_response = try sessionizer.requestAlloc(allocator, pref_path, "session.kill", .{ .id = session_id }, 4);
+    defer allocator.free(kill_response);
+}
+
 fn runLifecycleIdleExitOverride(allocator: std.mem.Allocator, io: std.Io) !void {
     const pref_path = try makePrefPath(allocator, "idle");
     defer allocator.free(pref_path);
