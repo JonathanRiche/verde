@@ -678,6 +678,9 @@ fn mainInner(init: std.process.Init) !void {
         }.run, .{ &state, fb_width, fb_height });
         recordSpan(&frame_sample, .flush_dirty, struct {
             fn run(app_state: *AppState) void {
+                // Poll first so a completed worker acks without blocking; then
+                // schedule off-thread if due (never ensureDaemon on the frame path).
+                app_state.pollFlushWorker();
                 app_state.flushIfDirty();
             }
         }.run, .{&state});

@@ -3127,6 +3127,7 @@ pub const AppState = struct {
     pub const commandPaletteQuery = command_controller.commandPaletteQuery;
     pub const commandPaletteQueryBuffer = command_controller.commandPaletteQueryBuffer;
     pub const flushIfDirty = lifecycle_controller.flushIfDirty;
+    pub const pollFlushWorker = lifecycle_controller.pollFlushWorker;
     pub const flushDirtyBlocking = lifecycle_controller.flushDirtyBlocking;
     pub const persistThreadBlocking = lifecycle_controller.persistThreadBlocking;
     pub const flushDirtyNow = lifecycle_controller.flushDirtyNow;

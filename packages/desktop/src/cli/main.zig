@@ -99,7 +99,8 @@ fn dispatchArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []const 
         return .handled;
     }
     if (std.mem.eql(u8, parsed.command, "notify")) {
-        try handleNotify(allocator, out, io, parsed.rest);
+        // Thread the real process path (argv[0]), never parsed.rest[0] (a flag).
+        try handleNotify(allocator, out, io, argv[0], parsed.rest);
         return .handled;
     }
     if (std.mem.eql(u8, parsed.command, "integrations")) {
@@ -1633,7 +1634,9 @@ fn handleOpen(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv
     }, json);
 }
 
-fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8) !void {
+/// `exe_path` is the process binary (main argv[0]). `argv` is notify flags only
+/// (`parsed.rest`) — never pass rest as the daemon executable (BLOCKER-2).
+fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, exe_path: []const u8, argv: []const []const u8) !void {
     if (args.hasFlag(argv, "--help") or args.hasFlag(argv, "-h")) {
         try out.stdout(
             \\Usage:
@@ -1668,7 +1671,7 @@ fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, ar
     if (clear or persisted_status != null) {
         const changed_at_ms = unixTimestampMs();
         const status_value: db_types.SurfaceStatus = persisted_status orelse .idle;
-        persistSurfaceStateViaDaemon(allocator, io, argv[0], .{
+        persistSurfaceStateViaDaemon(allocator, io, exe_path, .{
             .session_id = session_id,
             .workspace_id = workspace_id orelse "",
             .workspace_path = workspace_path orelse "",
@@ -5929,4 +5932,11 @@ test "MCP Live routing composes business, socket, and numeric branches" {
         McpLiveCallRoute.numeric,
         mcpLiveCallRoute(non_capability_tool, error.OutOfMemory),
     );
+}
+
+test "notify handler requires a dedicated exe_path separate from flag argv" {
+    // BLOCKER-2 pin: handleNotify(allocator, out, io, exe_path, argv) has five
+    // parameters so parsed.rest can never masquerade as the daemon binary.
+    const info = @typeInfo(@TypeOf(handleNotify)).@"fn";
+    try std.testing.expectEqual(@as(usize, 5), info.params.len);
 }
