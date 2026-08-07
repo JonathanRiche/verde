@@ -197,6 +197,31 @@ fn migrateToVersion(
 }
 
 fn migrateV1ToV2(conn: zqlite.Conn) !void {
+    // Production flip (S1 Minor 5 / S5 P3 handoff): legacy v1 DBs may hold
+    // duplicate non-null (workspace_id, local_thread_id) rows. Dedupe by keeping
+    // the lowest row id per key before creating the partial unique index.
+    try conn.execNoArgs(
+        \\delete from messages where thread_id in (
+        \\  select t.id from threads t
+        \\  where t.local_thread_id is not null
+        \\    and exists (
+        \\      select 1 from threads t2
+        \\      where t2.workspace_id = t.workspace_id
+        \\        and t2.local_thread_id = t.local_thread_id
+        \\        and t2.id < t.id
+        \\    )
+        \\);
+        \\delete from threads where id in (
+        \\  select t.id from threads t
+        \\  where t.local_thread_id is not null
+        \\    and exists (
+        \\      select 1 from threads t2
+        \\      where t2.workspace_id = t.workspace_id
+        \\        and t2.local_thread_id = t.local_thread_id
+        \\        and t2.id < t.id
+        \\    )
+        \\);
+    );
     try conn.execNoArgs(
         \\create table if not exists store_state (
         \\    id integer primary key check (id = 1),

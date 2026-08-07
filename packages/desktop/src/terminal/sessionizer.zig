@@ -60,10 +60,13 @@ const ATTACH_STALE_MS: i64 = 60 * std.time.ms_per_s;
 /// Env override so hermetic tests can force a fast idle exit without changing
 /// production lifetime policy (null / unset = never idle-exit).
 const IDLE_EXIT_ENV_NAME = "VERDE_SESSION_DAEMON_IDLE_EXIT_MS";
-/// Test-only path-valued override: absolute directory for hermetic store DBs.
-/// When set, the daemon opens `{value}/state.sqlite` post-bind. Unset keeps
-/// the daemon store-less through Phase 2 (capability_unavailable).
+/// Optional path-valued override: absolute directory for hermetic store DBs.
+/// When set, the daemon opens `{value}/state.sqlite` post-bind. When unset,
+/// production opens `{pref_path}/state.sqlite` after endpoint ownership (M3-P3).
 pub const SESSION_DAEMON_STORE_DIR_ENV_NAME = "VERDE_SESSION_DAEMON_STORE_DIR";
+/// Test-only: when set to a non-empty value other than "0"/"false", skip the
+/// production store open so store-less capability_unavailable paths remain pinable.
+pub const SESSION_DAEMON_STORE_DISABLE_ENV_NAME = "VERDE_SESSION_DAEMON_STORE_DISABLE";
 /// Test-only store fault arm (B9). Parsed only when the store-dir override is
 /// also set; maps 1:1 to `daemon_store.StoreFault` tag names.
 pub const SESSION_DAEMON_STORE_FAULT_ENV_NAME = "VERDE_SESSION_DAEMON_STORE_FAULT";
@@ -1705,7 +1708,7 @@ pub const Daemon = struct {
     test_slow_io_delay_ms: u64 = 0,
     /// Test-only orphan retention override. It never changes registry TTLs.
     test_retention_override_ms: ?i64 = null,
-    /// Null until post-bind construction under VERDE_SESSION_DAEMON_STORE_DIR.
+    /// Null until post-bind production (or hermetic override) store construction.
     store_service: ?*StoreService = null,
 
     pub fn init(allocator: std.mem.Allocator) Daemon {
@@ -2429,9 +2432,19 @@ pub const Daemon = struct {
         };
         // Request id for the typed dispatcher is informational; wire id stays id_value.
         const typed = headless.dispatchMethod(0, method, params, ctx);
+        // Authority signal: store=true only after the production writer owns the DB.
+        const store_ready = self.store_service != null;
         return switch (typed.body) {
-            .status => |result| try okValueResponse(self.allocator, id_value, result),
-            .capabilities => |result| try okValueResponse(self.allocator, id_value, result),
+            .status => |result| blk: {
+                var status = result;
+                status.capabilities.store = store_ready;
+                break :blk try okValueResponse(self.allocator, id_value, status);
+            },
+            .capabilities => |result| blk: {
+                var caps = result;
+                caps.capabilities.store = store_ready;
+                break :blk try okValueResponse(self.allocator, id_value, caps);
+            },
             .err => |err| try errorResponseAllocWithData(self.allocator, id_value, err.code, err.message, err.data),
         };
     }
@@ -4959,8 +4972,8 @@ fn sessionizerServerReady(raw_context: *anyopaque) !void {
     const context: *SessionizerServerContext = @ptrCast(@alignCast(raw_context));
     try writePidFile(context.pid_path);
     context.pid_published = true;
-    // Construct the hermetic store only after bind succeeds so a broken test
-    // store fails readiness loudly (never silently store-less).
+    // Open the production (or hermetic-override) store only after bind succeeds
+    // so a failed open fails readiness loudly (never a silent dual-writer).
     try maybeInitStoreService(context.daemon);
     context.drain_thread = try std.Thread.spawn(.{}, drainSessionsThread, .{DrainThreadContext{
         .daemon = context.daemon,
@@ -4997,7 +5010,7 @@ fn mutationHeader(mutation: daemon_store.Mutation) store_protocol.MutationHeader
 
 /// Path-valued store-dir override. Caller frees a non-null result.
 /// OutOfMemory propagates so a broken/oom test store fails readiness loudly
-/// (never silently store-less). Missing/empty env → null (store-less daemon).
+/// Hermetic store-dir override. Missing/empty → null (use production pref_path).
 fn storeDirFromEnv(allocator: std.mem.Allocator) !?[]u8 {
     const environ: std.process.Environ = if (builtin.os.tag == .windows)
         .{ .block = .global }
@@ -5022,7 +5035,27 @@ fn storeDirFromEnv(allocator: std.mem.Allocator) !?[]u8 {
     return owned;
 }
 
-/// Parse B9 store fault arm. Only called when the store-dir override is set.
+/// Test-only store disable (keeps store-less IT / unit pins alive after P3).
+fn storeDisabledFromEnv(allocator: std.mem.Allocator) !bool {
+    const environ: std.process.Environ = if (builtin.os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    const raw = environ.getAlloc(allocator, SESSION_DAEMON_STORE_DISABLE_ENV_NAME) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return false,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidWtf8 => return false,
+    };
+    defer allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    if (std.mem.eql(u8, trimmed, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(trimmed, "false")) return false;
+    if (std.ascii.eqlIgnoreCase(trimmed, "no")) return false;
+    return true;
+}
+
+/// Parse B9 store fault arm. Only active with the hermetic store-dir override.
 /// Missing/empty → `.none`. Unknown tag name → error (fail readiness loudly).
 fn storeFaultFromEnv(allocator: std.mem.Allocator) !daemon_store.StoreFault {
     const environ: std.process.Environ = if (builtin.os.tag == .windows)
@@ -5043,11 +5076,22 @@ fn storeFaultFromEnv(allocator: std.mem.Allocator) !daemon_store.StoreFault {
     return error.InvalidParams;
 }
 
+/// Post-bind store open: production uses `{pref_path}/state.sqlite`; hermetic
+/// tests may redirect via VERDE_SESSION_DAEMON_STORE_DIR or disable via
+/// VERDE_SESSION_DAEMON_STORE_DISABLE. Runs the shared migration chain and
+/// advertises store=true only after the writer is published.
 fn maybeInitStoreService(daemon: *Daemon) !void {
-    const store_dir = (try storeDirFromEnv(daemon.allocator)) orelse return;
-    defer daemon.allocator.free(store_dir);
-    // B9: fault env is active only alongside the store-dir override.
-    const fault = try storeFaultFromEnv(daemon.allocator);
+    if (try storeDisabledFromEnv(daemon.allocator)) return;
+
+    const override_dir = try storeDirFromEnv(daemon.allocator);
+    defer if (override_dir) |dir| daemon.allocator.free(dir);
+
+    const store_dir = override_dir orelse blk: {
+        if (daemon.pref_path.len == 0) return;
+        break :blk daemon.pref_path;
+    };
+    // B9: fault env is active only alongside the hermetic store-dir override.
+    const fault = if (override_dir != null) try storeFaultFromEnv(daemon.allocator) else daemon_store.StoreFault.none;
     const db_path = try std.fs.path.join(daemon.allocator, &.{ store_dir, "state.sqlite" });
     defer daemon.allocator.free(db_path);
 

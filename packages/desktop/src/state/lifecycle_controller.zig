@@ -1,8 +1,10 @@
 //! Dirty-state debounce and interaction lifecycle tracking.
+//!
+//! Phase 3: flush completion means daemon acknowledgement of
+//! `state.snapshot.replace`, not launch of a detached SQLite save worker.
 
 const std = @import("std");
 const platform_runtime = @import("platform_runtime");
-const persistence = @import("persistence.zig");
 
 const SAVE_DEBOUNCE_MS: i64 = 750;
 const log = std.log.scoped(.native_shell);
@@ -56,41 +58,27 @@ pub fn flushDirtyBlocking(self: anytype) void {
     };
     defer persisted.deinit();
     self.storage.save(persisted.value) catch |err| {
-        log.err("failed to save native state: {s}", .{@errorName(err)});
+        log.err("failed to save native state via daemon: {s}", .{@errorName(err)});
+        // Keep dirty so a later flush can retry; mark the UI read-only path.
+        self.storage.markPersistenceUnavailable();
         return;
     };
     self.lifecycle.clearDirty();
 }
 
+/// Pre-turn thread durability: full compatibility snapshot through the daemon.
 pub fn persistThreadBlocking(self: anytype, project_index: usize, thread_index: usize) !void {
-    const project = &self.project_controller.projects.items[project_index];
-    var arena = std.heap.ArenaAllocator.init(self.storage.allocator);
-    defer arena.deinit();
-    const snapshot = try persistence.threadSnapshot(arena.allocator(), &project.threads.items[thread_index]);
-    try self.storage.saveThread(project.id, thread_index, snapshot);
+    _ = project_index;
+    _ = thread_index;
+    var persisted = try self.buildPersistedState(self.storage.allocator);
+    defer persisted.deinit();
+    try self.storage.save(persisted.value);
+    self.lifecycle.clearDirty();
 }
 
+/// Flush dirty state and wait for daemon acknowledgement (no detached worker).
 pub fn flushDirtyNow(self: anytype) void {
-    if (!self.lifecycle.dirty) return;
-
-    var persisted = self.buildPersistedState(std.heap.page_allocator) catch |err| {
-        log.err("failed to snapshot native state: {s}", .{@errorName(err)});
-        return;
-    };
-    errdefer persisted.deinit();
-
-    const pref_path = std.heap.page_allocator.dupe(u8, self.storage.pref_path) catch |err| {
-        log.err("failed to prepare async native state save: {s}", .{@errorName(err)});
-        return;
-    };
-    errdefer std.heap.page_allocator.free(pref_path);
-
-    const worker = std.Thread.spawn(.{}, persistence.saveWorker, .{ pref_path, persisted }) catch |err| {
-        log.err("failed to start async native state save: {s}", .{@errorName(err)});
-        return;
-    };
-    worker.detach();
-    self.lifecycle.clearDirty();
+    flushDirtyBlocking(self);
 }
 
 test "lifecycle debounce requires both dirty and interaction quiet periods" {
