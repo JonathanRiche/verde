@@ -15,8 +15,21 @@ const platform_paths = @import("platform_paths");
 const platform_runtime = @import("platform_runtime");
 const sessionizer = @import("terminal/sessionizer.zig");
 
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+/// PTY / process-group / Unix-signal scenarios (forkpty, waitpid, kill(pid,0)).
+const posix_pty_supported = switch (builtin.os.tag) {
+    .linux, .macos => true,
+    else => false,
+};
+/// Daemon transport scenarios (Unix socket today; named pipe on Windows).
+const daemon_transport_supported = posix_pty_supported or builtin.os.tag == .windows;
+
+const c = struct {
+    // POSIX process-env mutation (not available on the Windows CRT).
+    extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+    extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    // MSVCRT / mingw process-env mutation used by the Windows branch.
+    extern "c" fn _putenv_s(varname: [*:0]const u8, value_string: [*:0]const u8) c_int;
+};
 
 /// Safety-net idle for every IT daemon so a crashed run cannot leave a
 /// permanent daemon+socket when persistent-by-default is enabled.
@@ -29,11 +42,15 @@ const IT_SAFETY_IDLE_EXIT_MS = "30000";
 const CONCURRENT_TRANSPORT_LANDED = false;
 
 // Force semantic analysis while the compile-time gate is false so the M5-P3
-// timing scenario cannot type-rot before concurrent transport lands.
+// timing scenario cannot type-rot before concurrent transport lands. Only pin
+// under POSIX: the scenario body uses PTY-tier helpers and is never run on
+// Windows (A3 compile gate covers the transport tier only).
 comptime {
-    _ = &runSlowConfigDoesNotBlockTailScenario;
-    _ = &slowStartThread;
-    _ = &spawnIsolatedDaemonWithSlowIo;
+    if (posix_pty_supported) {
+        _ = &runSlowConfigDoesNotBlockTailScenario;
+        _ = &slowStartThread;
+        _ = &spawnIsolatedDaemonWithSlowIo;
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -54,15 +71,15 @@ pub fn main(init: std.process.Init) !void {
             };
             // Optional --parent-pid so a panicked/aborted IT parent cannot leave
             // an orphan daemon (defers are skipped on panic/abort).
-            var parent_pid: ?std.posix.pid_t = null;
+            var parent_pid: ?u32 = null;
             while (iterator.next()) |flag| {
                 if (std.mem.eql(u8, flag, "--parent-pid")) {
                     const raw = iterator.next() orelse {
                         std.debug.print("headless-daemon-it --daemon --parent-pid requires a pid\n", .{});
                         std.process.exit(2);
                     };
-                    if (comptime builtin.os.tag != .windows) {
-                        parent_pid = std.fmt.parseInt(std.posix.pid_t, raw, 10) catch {
+                    if (comptime posix_pty_supported) {
+                        parent_pid = std.fmt.parseInt(u32, raw, 10) catch {
                             std.debug.print("headless-daemon-it: invalid --parent-pid\n", .{});
                             std.process.exit(2);
                         };
@@ -75,46 +92,94 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    switch (builtin.os.tag) {
-        .linux, .macos => {},
-        else => {
-            std.debug.print("headless-daemon-it: skip on this OS\n", .{});
-            return;
-        },
+    if (!daemon_transport_supported) {
+        std.debug.print("headless-daemon-it: skip on this OS\n", .{});
+        return;
     }
 
-    try runIntegration(allocator, io);
+    // Transport tier first so a Windows subset exits cleanly without PTY work.
     try runRegistryFixtureScenario(allocator, io);
     try runRegistryCapabilityScenario(allocator, io);
-    try runProcessLifecycleScenario(allocator, io);
-    try runManagedProcessScenario(allocator, io);
-    if (CONCURRENT_TRANSPORT_LANDED) {
-        try runSlowConfigDoesNotBlockTailScenario(allocator, io);
-    } else {
-        std.debug.print("headless-daemon-it: skip runSlowConfigDoesNotBlockTailScenario (requires concurrent transport; enable when M5-P3 lands)\n", .{});
-    }
     try runRegistryMethodPresenceScenario(allocator, io);
     try runLeaseConflictScenario(allocator, io);
     try runLeaseRenewReleaseScenario(allocator, io);
-    try runPrepareGateScenario(allocator, io);
-    try runDisconnectedClientRetentionScenario(allocator, io);
-    try runScopedStopScenario(allocator, io);
+    try runForcedAcquireOverTransportScenario(allocator, io);
     try runStoreFixtureScenario(allocator, io);
-    try runLifecycleBindGuard(allocator, io);
-    try runLifecyclePrepareShutdownWithLivePty(allocator, io);
-    try runLifecycleGracefulReplace(allocator, io);
-    try runLifecycleIdleExitOverride(allocator, io);
+
+    // PTY tier: sessions, managed spawn, prepare/stop retention, lifecycle.
+    if (posix_pty_supported) {
+        try runIntegration(allocator, io);
+        try runProcessLifecycleScenario(allocator, io);
+        try runManagedProcessScenario(allocator, io);
+        if (CONCURRENT_TRANSPORT_LANDED) {
+            try runSlowConfigDoesNotBlockTailScenario(allocator, io);
+        } else {
+            std.debug.print("headless-daemon-it: skip runSlowConfigDoesNotBlockTailScenario (requires concurrent transport; enable when M5-P3 lands)\n", .{});
+        }
+        try runPrepareGateScenario(allocator, io);
+        try runDisconnectedClientRetentionScenario(allocator, io);
+        try runScopedStopScenario(allocator, io);
+        try runLifecycleBindGuard(allocator, io);
+        try runLifecyclePrepareShutdownWithLivePty(allocator, io);
+        try runLifecycleGracefulReplace(allocator, io);
+        try runLifecycleIdleExitOverride(allocator, io);
+    }
     std.debug.print("headless-daemon-it: ok\n", .{});
 }
 
 fn makePrefPath(allocator: std.mem.Allocator, label: []const u8) ![]u8 {
     const base_tmp = try platform_paths.tempDir(allocator);
     defer allocator.free(base_tmp);
+    // Forward slashes are fine on Windows path APIs used here; endpoint
+    // isolation uses a separate named-pipe name on that OS (see below).
     return std.fmt.allocPrint(allocator, "{s}/verde-headless-it-{s}-{d}", .{
         base_tmp,
         label,
         platform_runtime.processId(),
     });
+}
+
+/// Hermetic endpoint for IT parent+child. POSIX: pref-dir Unix socket.
+/// Windows: unique named pipe so isolation never collides with the live pipe.
+fn isolationEndpoint(allocator: std.mem.Allocator, pref_path: []const u8) ![]u8 {
+    if (comptime builtin.os.tag == .windows) {
+        // Spec shape: \\.\pipe\verde-it-{pid}-{nonce}. Nonce = pref-path hash
+        // so concurrent scenarios in one process stay unique.
+        const nonce = std.hash.Wyhash.hash(0, pref_path);
+        return std.fmt.allocPrint(allocator, "\\\\.\\pipe\\verde-it-{d}-{x:0>16}", .{
+            platform_runtime.processId(),
+            nonce,
+        });
+    }
+    return sessionizer.defaultSocketPath(allocator, pref_path);
+}
+
+fn itSetEnv(name: [*:0]const u8, value: [*:0]const u8) !void {
+    if (comptime builtin.os.tag == .windows) {
+        if (c._putenv_s(name, value) != 0) return error.SetEnvFailed;
+    } else {
+        if (c.setenv(name, value, 1) != 0) return error.SetEnvFailed;
+    }
+}
+
+fn itUnsetEnv(name: [*:0]const u8) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = c._putenv_s(name, "");
+    } else {
+        _ = c.unsetenv(name);
+    }
+}
+
+fn itGetEnvAlloc(allocator: std.mem.Allocator, name: [:0]const u8) !?[]u8 {
+    if (comptime builtin.os.tag == .windows) {
+        const environ: std.process.Environ = .{ .block = .global };
+        return environ.getAlloc(allocator, name) catch |err| switch (err) {
+            error.EnvironmentVariableMissing => null,
+            else => return err,
+        };
+    }
+    if (std.c.getenv(name.ptr)) |p| return try allocator.dupe(u8, std.mem.span(p));
+    return null;
 }
 
 /// Install `VERDE_SESSIONIZER_SOCKET` for both this process and the child so
@@ -125,20 +190,15 @@ const EndpointIsolation = struct {
     prev_socket: ?[]u8,
 
     fn install(allocator: std.mem.Allocator, pref_path: []const u8) !EndpointIsolation {
-        // Pref-derived path (ignores any ambient override) so isolation is absolute.
-        const endpoint = try sessionizer.defaultSocketPath(allocator, pref_path);
+        // Isolation endpoint (ignores ambient override) so IT never binds live.
+        const endpoint = try isolationEndpoint(allocator, pref_path);
         errdefer allocator.free(endpoint);
-        const prev_owned: ?[]u8 = if (std.c.getenv(sessionizer.SESSIONIZER_SOCKET_ENV_NAME)) |p|
-            try allocator.dupe(u8, std.mem.span(p))
-        else
-            null;
+        const prev_owned = try itGetEnvAlloc(allocator, sessionizer.SESSIONIZER_SOCKET_ENV_NAME);
         errdefer if (prev_owned) |v| allocator.free(v);
 
         const endpoint_z = try allocator.dupeZ(u8, endpoint);
         defer allocator.free(endpoint_z);
-        if (setenv(sessionizer.SESSIONIZER_SOCKET_ENV_NAME, endpoint_z.ptr, 1) != 0) {
-            return error.SetEnvFailed;
-        }
+        try itSetEnv(sessionizer.SESSIONIZER_SOCKET_ENV_NAME, endpoint_z.ptr);
         return .{
             .endpoint = endpoint,
             .prev_socket = prev_owned,
@@ -148,17 +208,19 @@ const EndpointIsolation = struct {
     fn deinit(self: *EndpointIsolation, allocator: std.mem.Allocator) void {
         if (self.prev_socket) |value| {
             const value_z = allocator.dupeZ(u8, value) catch {
-                _ = unsetenv(sessionizer.SESSIONIZER_SOCKET_ENV_NAME);
+                itUnsetEnv(sessionizer.SESSIONIZER_SOCKET_ENV_NAME);
                 allocator.free(value);
                 allocator.free(self.endpoint);
                 self.* = undefined;
                 return;
             };
             defer allocator.free(value_z);
-            _ = setenv(sessionizer.SESSIONIZER_SOCKET_ENV_NAME, value_z.ptr, 1);
+            itSetEnv(sessionizer.SESSIONIZER_SOCKET_ENV_NAME, value_z.ptr) catch {
+                itUnsetEnv(sessionizer.SESSIONIZER_SOCKET_ENV_NAME);
+            };
             allocator.free(value);
         } else {
-            _ = unsetenv(sessionizer.SESSIONIZER_SOCKET_ENV_NAME);
+            itUnsetEnv(sessionizer.SESSIONIZER_SOCKET_ENV_NAME);
         }
         allocator.free(self.endpoint);
         self.* = undefined;
@@ -223,7 +285,7 @@ fn spawnIsolatedDaemonWithOptions(
     if (retention_ms) |value| try env_map.put("VERDE_SESSIONIZER_TEST_RETENTION_MS", value);
 
     // Bind the child to the same isolated endpoint the parent uses.
-    const endpoint = try sessionizer.defaultSocketPath(allocator, pref_path);
+    const endpoint = try isolationEndpoint(allocator, pref_path);
     defer allocator.free(endpoint);
     try env_map.put(sessionizer.SESSIONIZER_SOCKET_ENV_NAME, endpoint);
 
@@ -266,30 +328,44 @@ fn currentEnviron() std.process.Environ {
 /// parent-death handling on every Unix so Linux does not take an unclean
 /// PDEATHSIG exit before the watcher can terminate PTYs and remove IT files.
 /// Empty-daemon idle exit remains a separate env override (see lifecycle tests).
-fn installItDaemonCleanupGuards(parent_pid: ?std.posix.pid_t, pref_path: []const u8) void {
-    if (comptime builtin.os.tag != .windows) {
+///
+/// On Windows the watcher is compiled out: kill(pid,0) has no equivalent in
+/// the transport-tier subset, and A3's gate is compile+subset rather than a
+/// full orphan-reaper on named pipes.
+fn installItDaemonCleanupGuards(parent_pid: ?u32, pref_path: []const u8) void {
+    if (comptime posix_pty_supported) {
         if (parent_pid) |pid| {
             const thread = std.Thread.spawn(.{}, parentDeathWatchThread, .{ pid, pref_path }) catch return;
             thread.detach();
         }
+        return;
     }
+    // Windows / non-POSIX: watcher is a Unix safety net only (A3 compile+subset).
+    // Touch params so both OS analyses accept the stable signature without discards.
+    if (parent_pid != null and pref_path.len == std.math.maxInt(usize)) unreachable;
 }
 
-fn parentDeathWatchThread(parent_pid: std.posix.pid_t, pref_path: []const u8) void {
-    if (comptime builtin.os.tag == .windows) return;
-    var threaded = std.Io.Threaded.init_single_threaded;
-    const io = threaded.io();
-    while (true) {
-        // Signal 0 only checks liveness (portable parent-death fallback).
-        std.posix.kill(parent_pid, @enumFromInt(0)) catch |err| switch (err) {
-            error.ProcessNotFound => {
-                cleanupAfterItParentDeath(pref_path, io);
-                std.process.exit(1);
-            },
-            // EPERM and unexpected/transient failures do not prove death.
-            else => {},
-        };
-        std.Io.sleep(io, .fromMilliseconds(200), .awake) catch {};
+fn parentDeathWatchThread(parent_pid: u32, pref_path: []const u8) void {
+    // Entire body must live inside the comptime branch so Windows analysis
+    // never sees std.posix.kill / pid_t.
+    if (comptime posix_pty_supported) {
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const io = threaded.io();
+        while (true) {
+            // Signal 0 only checks liveness (portable parent-death fallback).
+            const pid: std.posix.pid_t = @intCast(parent_pid);
+            std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+                error.ProcessNotFound => {
+                    cleanupAfterItParentDeath(pref_path, io);
+                    std.process.exit(1);
+                },
+                // EPERM and unexpected/transient failures do not prove death.
+                else => {},
+            };
+            std.Io.sleep(io, .fromMilliseconds(200), .awake) catch {};
+        }
+    } else if (parent_pid == std.math.maxInt(u32) and pref_path.len == std.math.maxInt(usize)) {
+        unreachable;
     }
 }
 
@@ -354,24 +430,57 @@ fn deleteItPath(io: std.Io, path: []const u8) void {
 /// Wait for a child to exit with a deadline; kill on timeout so a regression
 /// fails instead of hanging the IT binary forever.
 fn waitChildBounded(child: *std.process.Child, io: std.Io, timeout_ms: u64) !std.process.Child.Term {
-    const pid = child.id orelse return error.ChildAlreadyWaited;
     const deadline = sessionizer.nowMs() + @as(i64, @intCast(timeout_ms));
-    while (sessionizer.nowMs() <= deadline) {
-        var status: c_int = 0;
-        const rc = std.c.waitpid(pid, &status, @intCast(std.posix.W.NOHANG));
-        if (rc == pid) {
-            child.id = null;
-            const st: u32 = @bitCast(@as(i32, status));
-            if (std.posix.W.IFEXITED(st)) return .{ .exited = std.posix.W.EXITSTATUS(st) };
-            if (std.posix.W.IFSIGNALED(st)) return .{ .signal = std.posix.W.TERMSIG(st) };
-            if (std.posix.W.IFSTOPPED(st)) return .{ .stopped = std.posix.W.STOPSIG(st) };
-            return .{ .unknown = st };
+    if (comptime posix_pty_supported) {
+        const pid = child.id orelse return error.ChildAlreadyWaited;
+        while (sessionizer.nowMs() <= deadline) {
+            var status: c_int = 0;
+            const rc = std.c.waitpid(pid, &status, @intCast(std.posix.W.NOHANG));
+            if (rc == pid) {
+                child.id = null;
+                const st: u32 = @bitCast(@as(i32, status));
+                if (std.posix.W.IFEXITED(st)) return .{ .exited = std.posix.W.EXITSTATUS(st) };
+                if (std.posix.W.IFSIGNALED(st)) return .{ .signal = std.posix.W.TERMSIG(st) };
+                if (std.posix.W.IFSTOPPED(st)) return .{ .stopped = std.posix.W.STOPSIG(st) };
+                return .{ .unknown = st };
+            }
+            std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
         }
-        std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+        child.kill(io);
+        return error.ChildTimedOut;
     }
-    child.kill(io);
-    return error.ChildTimedOut;
+    if (comptime builtin.os.tag == .windows) {
+        // Poll the process handle (id is hProcess on Windows). On timeout,
+        // Child.kill already waits for TerminateProcess, so we do not need a
+        // second bounded wait — tradeoff: kill path is unbounded only by the
+        // OS force-terminate latency, not by waitpid-style polling.
+        const handle = child.id orelse return error.ChildAlreadyWaited;
+        while (sessionizer.nowMs() <= deadline) {
+            const wait_rc = WaitForSingleObject(handle, 0);
+            if (wait_rc == WAIT_OBJECT_0) {
+                return try child.wait(io);
+            }
+            std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+        }
+        child.kill(io);
+        return error.ChildTimedOut;
+    }
+    return error.UnsupportedOs;
 }
+
+// Windows-only symbols for waitChildBounded; referenced only under the
+// windows comptime branch so the linux native binary does not need them.
+const WaitForSingleObject = if (builtin.os.tag == .windows)
+    struct {
+        extern "kernel32" fn WaitForSingleObject(handle: std.os.windows.HANDLE, milliseconds: std.os.windows.DWORD) callconv(.winapi) std.os.windows.DWORD;
+    }.WaitForSingleObject
+else
+    struct {
+        fn WaitForSingleObject(_: *anyopaque, _: u32) u32 {
+            return 0;
+        }
+    }.WaitForSingleObject;
+const WAIT_OBJECT_0: u32 = 0;
 
 /// The existing sessionizer uses this compatibility code for methods that have
 /// not reached its dispatcher yet.  `capability_unavailable` is the typed
@@ -1274,6 +1383,94 @@ fn runLeaseRenewReleaseScenario(allocator: std.mem.Allocator, io: std.Io) !void 
     defer released.deinit();
     const released_result = try typed_client.decodeLeaseRelease(&released);
     if (!released_result.released or released_result.released_count != 1) return error.LeaseReleaseFailed;
+}
+
+/// Scenario 10: forced-acquire + notification flow over the platform transport
+/// only (no sessions/PTYs/posix). Same assertions as scenario 4; runs on Linux
+/// over the Unix socket today and compiles for Windows named-pipe transport.
+fn runForcedAcquireOverTransportScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "forced-acquire-transport");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+    var child = try spawnIsolatedDaemon(allocator, io, self_exe, pref_path);
+    defer child.kill(io);
+
+    var transport: sessionizer.HeadlessTransport = .{ .allocator = allocator, .pref_path = pref_path };
+    var client = sessionizer.headlessClient(allocator, &transport);
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var typed_transport: sessionizer.HeadlessTransport = .{ .allocator = decode_arena.allocator(), .pref_path = pref_path };
+    var typed_client = sessionizer.headlessClient(decode_arena.allocator(), &typed_transport);
+    const resources = [_][]const u8{"build"};
+
+    var first = try typed_client.call(headless.registry.METHOD_LEASE_ACQUIRE, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner = "owner-a",
+        .command = "build",
+        .resources = &resources,
+    });
+    defer first.deinit();
+    const first_result = try typed_client.decodeLeaseAcquire(&first);
+    if (!first_result.acquired) return error.ForcedTransportInitialAcquireFailed;
+
+    var conflict = try client.call(headless.registry.METHOD_LEASE_ACQUIRE, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner = "owner-b",
+        .command = "build",
+        .resources = &resources,
+    });
+    defer conflict.deinit();
+    if (conflict.response.isOk()) return error.ForcedTransportWasNotRejected;
+    const conflict_error = conflict.response.err orelse return error.ForcedTransportMissingError;
+    if (!std.mem.eql(u8, conflict_error.code, headless.protocol.ERR_CONFLICT)) return error.ForcedTransportWrongError;
+    _ = typed_client.decodeLeaseAcquire(&conflict) catch |err| switch (err) {
+        error.RemoteError => {},
+        else => return err,
+    };
+    const conflict_data = conflict_error.data orelse return error.ForcedTransportMissingData;
+    if (conflict_data != .object or conflict_data.object.get("conflicts") == null) return error.ForcedTransportMalformedData;
+
+    var forced = try typed_client.call(headless.registry.METHOD_LEASE_ACQUIRE, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner = "owner-b",
+        .command = "build",
+        .resources = &resources,
+        .force = true,
+    });
+    defer forced.deinit();
+    const forced_result = try typed_client.decodeLeaseAcquire(&forced);
+    if (!forced_result.acquired or !forced_result.forced) return error.ForcedTransportForcedAcquireFailed;
+
+    var listed = try typed_client.call(headless.registry.METHOD_PROCESS_LIST, .{
+        .workspace = .{ .workspace_path = pref_path },
+    });
+    defer listed.deinit();
+    const list_result = try typed_client.decodeProcessList(&listed);
+    if (list_result.leases.len != 2) return error.ForcedTransportIncumbentLeaseMissing;
+
+    var notifications = try typed_client.call(headless.registry.METHOD_DAEMON_NOTIFICATIONS, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner_session_id = "owner-a",
+    });
+    defer notifications.deinit();
+    const notification_result = try typed_client.decodeNotifications(&notifications);
+    if (notification_result.notifications.len != 1) return error.ForcedTransportNotificationCountMismatch;
+    if (!std.mem.eql(u8, notification_result.notifications[0].title, "Conflicting command started")) return error.ForcedTransportNotificationTitleMismatch;
+
+    var second_pull = try typed_client.call(headless.registry.METHOD_DAEMON_NOTIFICATIONS, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner_session_id = "owner-a",
+        .after_seq = notification_result.notifications[0].seq,
+    });
+    defer second_pull.deinit();
+    const second_result = try typed_client.decodeNotifications(&second_pull);
+    if (second_result.notifications.len != 0) return error.ForcedTransportNotificationWasConsumed;
 }
 
 /// Scenario 6: each prepareShutdown live-state gate refuses independently,
