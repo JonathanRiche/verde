@@ -2588,3 +2588,112 @@ test "managed process records are bounded per workspace" {
         registry.ensureManagedProcess(allocator, "workspace-cap", "process-overflow", "/bin/true", 1000),
     );
 }
+
+// --- W8: Windows-shaped registry semantics (data only; no builtin.os branches) ---
+
+test "process identity is stable without a process group" {
+    // Windows has no process-group concept: identity falls back to pid alone.
+    try std.testing.expectEqual(@as(u32, 42), processIdentity(null, 42));
+    try std.testing.expectEqual(@as(u32, 42), processIdentity(null, 42));
+    try std.testing.expect(processIdentity(null, 42) != processIdentity(null, 43));
+    try std.testing.expect(processIdentity(null, 42) != processIdentity(7, 42));
+    try std.testing.expectEqual(@as(u32, 7), processIdentity(7, 42));
+    try std.testing.expectEqual(@as(u32, 0), processIdentity(null, null));
+}
+
+test "windows path spellings are opaque alias bytes" {
+    // Do NOT import workspace_identity here: its deriveProjectIdForOs is private
+    // and that file is out of W8 scope. Normalization is the caller's job via
+    // workspace_identity (which already pins Windows fixtures in its own tests).
+    // The registry treats alias bytes as opaque — case and separator variants
+    // are distinct aliases until the caller normalizes.
+    const allocator = std.testing.allocator;
+    var registry = try ProcessRegistry.init(allocator, "nonce-win-path");
+    defer registry.deinit(allocator);
+
+    _ = try registry.registerWorkspacePath(allocator, "workspace-win", "C:\\Repo\\App", 0);
+    _ = try registry.registerWorkspacePath(allocator, "workspace-win", "c:\\repo\\app", 0);
+    try std.testing.expectEqualStrings("workspace-win", registry.workspaceByPath(allocator, "C:\\Repo\\App", 1).?.id);
+    try std.testing.expectEqualStrings("workspace-win", registry.workspaceByPath(allocator, "c:\\repo\\app", 1).?.id);
+    try std.testing.expectError(
+        error.WorkspacePathMapsToDifferentId,
+        registry.registerWorkspacePath(allocator, "workspace-other", "C:\\Repo\\App", 2),
+    );
+}
+
+test "terminate-process style finishes classify without signals" {
+    // Windows kills use TerminateProcess (no signal concept). Classification
+    // must prefer cancellation_reason over exit_code, then exit_code alone.
+    const allocator = std.testing.allocator;
+    var registry = try ProcessRegistry.init(allocator, "nonce-win-finish");
+    defer registry.deinit(allocator);
+
+    _ = try registry.observeTerminalProcess(allocator, "workspace-win", .{
+        .process_identity = 100,
+        .session_id = "session-term",
+        .command = "build",
+        .cwd = "C:\\Repo",
+        .started_at_ms = 1,
+        .observed_at_ms = 2,
+        .dock_id = 1,
+        .owner_kind = "terminal",
+        .owner_title = "build",
+    }, .{});
+    try std.testing.expect(try registry.finishTerminalProcess(
+        allocator,
+        "workspace-win",
+        "session-term",
+        .{ .exit_code = 1, .cancellation_reason = "TerminateProcess" },
+        3,
+    ));
+    try std.testing.expectEqual(
+        TerminalProcessOutcomeStatus.cancelled,
+        registry.workspace("workspace-win").?.terminal_process_outcomes.items[0].status,
+    );
+
+    _ = try registry.observeTerminalProcess(allocator, "workspace-win", .{
+        .process_identity = 101,
+        .session_id = "session-fail",
+        .command = "build",
+        .cwd = "C:\\Repo",
+        .started_at_ms = 4,
+        .observed_at_ms = 5,
+        .dock_id = 1,
+        .owner_kind = "terminal",
+        .owner_title = "build",
+    }, .{});
+    try std.testing.expect(try registry.finishTerminalProcess(
+        allocator,
+        "workspace-win",
+        "session-fail",
+        .{ .exit_code = 1 },
+        6,
+    ));
+    try std.testing.expectEqual(
+        TerminalProcessOutcomeStatus.failed,
+        registry.workspace("workspace-win").?.terminal_process_outcomes.items[1].status,
+    );
+
+    _ = try registry.observeTerminalProcess(allocator, "workspace-win", .{
+        .process_identity = 102,
+        .session_id = "session-ok",
+        .command = "build",
+        .cwd = "C:\\Repo",
+        .started_at_ms = 7,
+        .observed_at_ms = 8,
+        .dock_id = 1,
+        .owner_kind = "terminal",
+        .owner_title = "build",
+    }, .{});
+    try std.testing.expect(try registry.finishTerminalProcess(
+        allocator,
+        "workspace-win",
+        "session-ok",
+        .{ .exit_code = 0 },
+        9,
+    ));
+    try std.testing.expectEqual(
+        TerminalProcessOutcomeStatus.completed,
+        registry.workspace("workspace-win").?.terminal_process_outcomes.items[2].status,
+    );
+}
