@@ -8437,6 +8437,9 @@ test "daemon lock stays free during a slow store commit" {
         .request = upsert_request,
     };
     const worker = try std.Thread.spawn(.{}, slowStoreCommitThread, .{&ctx});
+    // Join on every path (assertion failure included) so detach/deinit never
+    // races a live worker still holding the store connection.
+    defer worker.join();
 
     // Give the worker time to enter the commit stall under the store mutex.
     platform_runtime.sleepMillis(100);
@@ -8457,7 +8460,6 @@ test "daemon lock stays free during a slow store commit" {
         if (probes > 40) break; // stall is ~1500ms; do not loop forever
         platform_runtime.sleepMillis(50);
     }
-    worker.join();
     if (ctx.err) |err| return err;
     const mutation_response = ctx.response orelse return error.SlowStoreCommitMissingResponse;
     defer allocator.free(mutation_response);
