@@ -9,6 +9,7 @@ const zqlite = @import("zqlite");
 const headless = @import("headless");
 
 const schema = @import("../db/schema.zig");
+const transcript_apply = @import("../chat/transcript_apply.zig");
 
 const store_protocol = headless.store;
 const protocol = headless.protocol;
@@ -59,7 +60,8 @@ pub const TurnCommitRequest = struct {
     error_message: ?[]const u8 = null,
     user_message_id: ?[]const u8 = null,
     /// Rows are already ordered by transcript_apply; the store appends them
-    /// in this order while retaining stable message IDs and timestamps.
+    /// in this order. Empty synthesized-row IDs are assigned at this boundary
+    /// from the turn identity and row index.
     messages: []const store_protocol.Message = &.{},
     /// The stop path carries this Q5 input through the commit seam. The pure
     /// transcript application happens before this store call.
@@ -71,8 +73,6 @@ pub const TurnCommitRequest = struct {
     /// receipts retain the existing non-empty client-id invariant.
     client_id: []const u8 = "daemon",
 };
-
-pub const TurnCommit = TurnCommitRequest;
 
 pub const CompactionErrorData = struct {
     compacted_before_seq: u64,
@@ -94,8 +94,6 @@ pub fn compactionError(compacted_before_seq: u64) CompactionError {
         .data = .{ .compacted_before_seq = compacted_before_seq },
     };
 }
-
-pub const revisionExpiredError = compactionError;
 
 pub const TERMINAL_PROCESS_OUTCOME_TTL_MS: i64 = 15 * std.time.ms_per_min;
 
@@ -219,6 +217,8 @@ const SURFACE_UPSERT_OPERATION = store_protocol.METHOD_SURFACE_UPSERT;
 const SURFACE_CLEAR_OPERATION = store_protocol.METHOD_SURFACE_CLEAR;
 const CHAT_COMPLETION_UPSERT_OPERATION = store_protocol.METHOD_NOTIFICATION_CHAT_COMPLETION_UPSERT;
 const CHAT_COMPLETION_CLEAR_OPERATION = store_protocol.METHOD_NOTIFICATION_CHAT_COMPLETION_CLEAR;
+// Reserved receipt operation for durable turn commits; keep it distinct from
+// future wire method names so receipt identity cannot silently overlap.
 const TURN_COMMIT_OPERATION: []const u8 = "chat.turn.commit";
 const RESPONSE_STATUS_OK: i64 = 0;
 
@@ -377,7 +377,23 @@ pub const Store = struct {
             .request_key = request_key,
             .client_id = request.client_id,
         };
-        const fingerprint = self.encodeFingerprint(request) catch |err| return err;
+        // Match the S1 mutation convention: client_id identifies the caller
+        // but is not part of the logical turn state or its replay fingerprint.
+        const fingerprint = self.encodeFingerprint(.{
+            .turn_id = request.turn_id,
+            .workspace_id = request.workspace_id,
+            .local_thread_id = request.local_thread_id,
+            .status = request.status,
+            .started_at_ms = request.started_at_ms,
+            .finished_at_ms = request.finished_at_ms,
+            .provider = request.provider,
+            .provider_thread_id = request.provider_thread_id,
+            .error_message = request.error_message,
+            .user_message_id = request.user_message_id,
+            .messages = request.messages,
+            .followup_pending = request.followup_pending,
+            .completion = request.completion,
+        }) catch |err| return err;
         defer self.allocator.free(fingerprint);
 
         self.conn.execNoArgs("begin immediate") catch |err| return mapStoreError(err);
@@ -919,17 +935,31 @@ pub const Store = struct {
         defer next_sort_row.deinit();
         var next_sort = next_sort_row.int(0);
 
-        for (request.messages) |message| {
-            if (message.message_id.len == 0) return error.InvalidParams;
-            if (self.messageKeyStatusFor(request.workspace_id, request.local_thread_id, message)) |existing| {
-                if (existing) |status| {
-                    if (status.conflict) return error.Conflict;
-                    continue;
+        for (request.messages, 0..) |message, row_index| {
+            // transcript_apply deliberately leaves synthesized rows without a
+            // client identity. Minting here keeps the reducer pure while
+            // making retries stable and keeping the generated namespace apart
+            // from client-supplied message IDs.
+            {
+                var stored_message = message;
+                var synthesized_id: ?[]u8 = null;
+                defer if (synthesized_id) |id| self.allocator.free(id);
+                if (message.message_id.len == 0) {
+                    const id = std.fmt.allocPrint(self.allocator, "turn:{s}:msg:{d}", .{ request.turn_id, row_index }) catch return error.OutOfMemory;
+                    synthesized_id = id;
+                    stored_message.message_id = id;
                 }
-            } else |err| return err;
 
-            try self.insertMessage(thread_id, next_sort, message);
-            try self.insertMessageKey(thread_id, next_sort, message, store_revision);
+                if (self.messageKeyStatusFor(request.workspace_id, request.local_thread_id, stored_message)) |existing| {
+                    if (existing) |status| {
+                        if (status.conflict) return error.Conflict;
+                        continue;
+                    }
+                } else |err| return err;
+
+                try self.insertMessage(thread_id, next_sort, stored_message);
+                try self.insertMessageKey(thread_id, next_sort, stored_message, store_revision);
+            }
             next_sort += 1;
         }
     }
@@ -1304,7 +1334,6 @@ fn validateTurnCommit(request: TurnCommitRequest) StoreError!void {
             !std.mem.eql(u8, completion.local_thread_id, request.local_thread_id)) return error.InvalidParams;
     }
     for (request.messages) |message| {
-        if (message.message_id.len == 0) return error.InvalidParams;
         _ = try firstAttachment(message.image, message.images);
     }
 }
@@ -1666,7 +1695,7 @@ test "lease and terminal outcome transfer is durable, pruned, and one revision" 
             .command = "zig fmt",
             .resources = &.{"fmt"},
             .created_at_ms = 11,
-            // expires == now is expired on both delete and select sides.
+            // expires == now is deleted on import and excluded by the > select.
             .expires_at_ms = 150,
             .last_renewal_ms = 60,
         },
@@ -1714,6 +1743,7 @@ test "lease and terminal outcome transfer is durable, pruned, and one revision" 
     var imported = try store.importLeasesAndOutcomes(150);
     defer imported.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), imported.leases.items.len);
+    try std.testing.expectEqual(@as(i64, 1), try transferLeaseCount(&store));
     try std.testing.expectEqualStrings("lease:keep", imported.leases.items[0].lease_id);
     try std.testing.expectEqualStrings("owner-a", imported.leases.items[0].owner);
     try std.testing.expectEqualStrings("client-a", imported.leases.items[0].client_id);
@@ -1927,6 +1957,85 @@ test "turn commit is durable, ordered, exactly once, and revision guarded by rec
     try std.testing.expectEqual(@as(i64, 2), replay_rows.int(0));
 }
 
+test "transcript_apply rows commit with deterministic IDs and replay exactly once" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    const workspace = testWorkspace("workspace-apply", "Apply workspace");
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("apply-workspace", null),
+        .workspace = workspace,
+    });
+    const thread = testThread("thread-apply", "Apply thread");
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("apply-thread", 1),
+        .workspace_id = workspace.workspace_id,
+        .thread = thread,
+    });
+
+    const events = [_]transcript_apply.ChatEvent{
+        .{ .kind = "assistant_delta", .payload_json = "{\"text\":\"synthesized row\"}" },
+        .{ .kind = "message", .payload_json = "{\"title\":\"Existing\",\"body\":\"real row\",\"message_id\":\"real-message-id\"}" },
+    };
+    const outcome: transcript_apply.WorkerOutcome = .{
+        .status = .completed,
+        .provider = "codex",
+    };
+    const applied = try transcript_apply.apply(std.testing.allocator, &events, outcome);
+    defer transcript_apply.freeMessages(std.testing.allocator, applied);
+    try std.testing.expectEqual(@as(usize, 2), applied.len);
+    try std.testing.expectEqual(@as(usize, 0), applied[0].message_id.len);
+    try std.testing.expectEqualStrings("real-message-id", applied[1].message_id);
+
+    const request: TurnCommitRequest = .{
+        .turn_id = "turn-apply",
+        .workspace_id = workspace.workspace_id,
+        .local_thread_id = thread.local_thread_id,
+        .status = .completed,
+        .started_at_ms = 300,
+        .finished_at_ms = 310,
+        .provider = outcome.provider,
+        .messages = applied,
+    };
+    try std.testing.expectEqualStrings("chat.turn.commit", TURN_COMMIT_OPERATION);
+    const first = try store.commitTurn(request);
+    try std.testing.expectEqual(@as(u64, 3), first.store_revision);
+
+    var rows = try store.conn.rows(
+        "select message_id, body from messages where thread_id = (select id from threads where local_thread_id = ?1) order by sort_index",
+        .{thread.local_thread_id},
+    );
+    defer rows.deinit();
+    var row_count: usize = 0;
+    while (rows.next()) |row| : (row_count += 1) {
+        if (row_count == 0) {
+            try std.testing.expectEqualStrings("turn:turn-apply:msg:0", row.text(0));
+            try std.testing.expectEqualStrings("synthesized row", row.text(1));
+        } else if (row_count == 1) {
+            try std.testing.expectEqualStrings("real-message-id", row.text(0));
+            try std.testing.expectEqualStrings("real row", row.text(1));
+        }
+    }
+    if (rows.err) |err| return err;
+    try std.testing.expectEqual(@as(usize, 2), row_count);
+
+    const replay = try store.commitTurn(request);
+    try std.testing.expectEqual(first.store_revision, replay.store_revision);
+    try std.testing.expect(replay.applied);
+    try std.testing.expect(!replay.duplicate);
+    var replay_rows = (try store.conn.row(
+        "select count(*) from messages where thread_id = (select id from threads where local_thread_id = ?1)",
+        .{thread.local_thread_id},
+    )).?;
+    defer replay_rows.deinit();
+    try std.testing.expectEqual(@as(i64, 2), replay_rows.int(0));
+    try std.testing.expectEqual(@as(usize, 0), applied[0].message_id.len);
+}
+
 test "aborted turn carries followup intent and compaction expiry uses revision_expired data" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1962,6 +2071,12 @@ test "aborted turn carries followup intent and compaction expiry uses revision_e
     var ledger = (try store.conn.row("select status from chat_turns where turn_id = ?1", .{request.turn_id})).?;
     defer ledger.deinit();
     try std.testing.expectEqualStrings("aborted", ledger.text(0));
+    var completion = (try store.conn.row(
+        "select count(*) from chat_completions where workspace_id = ?1 and local_thread_id = ?2",
+        .{ workspace.workspace_id, thread.local_thread_id },
+    )).?;
+    defer completion.deinit();
+    try std.testing.expectEqual(@as(i64, 0), completion.int(0));
 
     const expiry = compactionError(17);
     try std.testing.expectEqualStrings(protocol.ERR_REVISION_EXPIRED, expiry.code);

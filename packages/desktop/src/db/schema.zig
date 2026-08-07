@@ -407,7 +407,11 @@ test "schema migration chain advances v1 to v2 to v3 to v4 and preserves populat
         \\insert into threads (workspace_id, sort_index, title, local_thread_id, provider, harness)
         \\values ((select id from workspaces where workspace_id = 'v3-workspace'), 0, 'V3 thread', 'v3-thread', 0, 0);
         \\insert into messages (thread_id, sort_index, role, author, body)
-        \\values ((select id from threads where local_thread_id = 'v3-thread'), 0, 2, 'assistant', 'kept transcript');
+        \\values ((select id from threads where local_thread_id = 'v3-thread'), 0, 2, 'assistant', 'mapped transcript');
+        \\insert into messages (thread_id, sort_index, role, author, body)
+        \\values ((select id from threads where local_thread_id = 'v3-thread'), 1, 2, 'assistant', 'unmapped transcript');
+        \\insert into client_message_keys (thread_id, message_id, message_fingerprint, sort_index, created_at_ms, updated_at_ms, store_revision)
+        \\values ((select id from threads where local_thread_id = 'v3-thread'), 'mapped-message', 'v3-fingerprint', 0, 301, 302, 3);
     );
 
     try migrateToVersion(conn, 4, .none);
@@ -423,9 +427,22 @@ test "schema migration chain advances v1 to v2 to v3 to v4 and preserves populat
     var receipt = (try conn.row("select response_payload from store_receipts where request_key = 'chain-key'", .{})).?;
     defer receipt.deinit();
     try std.testing.expectEqualStrings("{}", receipt.text(0));
-    var message = (try conn.row("select body from messages where message_id is null and body = 'kept transcript'", .{})).?;
-    defer message.deinit();
-    try std.testing.expectEqualStrings("kept transcript", message.text(0));
+    var mapped_message = (try conn.row(
+        "select message_id, created_at_ms, updated_at_ms from messages where body = 'mapped transcript'",
+        .{},
+    )).?;
+    defer mapped_message.deinit();
+    try std.testing.expectEqualStrings("mapped-message", mapped_message.text(0));
+    try std.testing.expectEqual(@as(i64, 301), mapped_message.int(1));
+    try std.testing.expectEqual(@as(i64, 302), mapped_message.int(2));
+    var unmapped_message = (try conn.row(
+        "select message_id, created_at_ms, updated_at_ms from messages where body = 'unmapped transcript'",
+        .{},
+    )).?;
+    defer unmapped_message.deinit();
+    try std.testing.expect(unmapped_message.nullableText(0) == null);
+    try std.testing.expect(unmapped_message.nullableInt(1) == null);
+    try std.testing.expect(unmapped_message.nullableInt(2) == null);
 }
 
 test "v2 to v3 migration failure rolls back transfer tables and preserves v2 data" {
