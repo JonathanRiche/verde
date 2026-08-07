@@ -285,7 +285,14 @@ pub const Storage = struct {
     pub fn noteStoreRevision(self: *const Storage, revision: u64) void {
         self.store_session.lock();
         defer self.store_session.unlock();
-        self.store_session.store_revision = revision;
+        // The durable revision is globally monotonic, so an out-of-order ack
+        // (flush worker vs a concurrent granular mutation) must never regress
+        // the cached guard.
+        if (self.store_session.revision_known) {
+            self.store_session.store_revision = @max(self.store_session.store_revision, revision);
+        } else {
+            self.store_session.store_revision = revision;
+        }
         self.store_session.revision_known = true;
         self.store_session.persistence_available = true;
     }
@@ -303,19 +310,15 @@ pub const Storage = struct {
     /// Refresh durable revision from the RO projection or daemon.storeStatus.
     pub fn refreshStoreRevision(self: *const Storage) !u64 {
         // Prefer a fresh RO open of the local projection (no daemon required).
+        // The purpose-built revision read avoids loading the full projection
+        // on the conflict path and also covers projection-less DBs.
         if (openReadOnlyOptional(self.allocator, self.pref_path)) |maybe_client| {
             if (maybe_client) |client_owned| {
                 var client = client_owned;
                 defer client.deinit();
-                if (client.load(self.allocator)) |maybe_loaded| {
-                    if (maybe_loaded) |loaded| {
-                        defer {
-                            var owned = loaded;
-                            owned.deinit();
-                        }
-                        self.noteStoreRevision(loaded.store_revision);
-                        return loaded.store_revision;
-                    }
+                if (client.storeRevision()) |revision| {
+                    self.noteStoreRevision(revision);
+                    return revision;
                 } else |_| {}
             }
         } else |_| {}
