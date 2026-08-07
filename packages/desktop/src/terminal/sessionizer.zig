@@ -1520,6 +1520,7 @@ const ChatTurn = struct {
     local_thread_id: []u8,
     request: send_runner.Request,
     owned_image_paths: []const []const u8,
+    started_at_ms: i64 = 0,
     mutex: std.atomic.Mutex = .unlocked,
     worker_thread: ?std.Thread = null,
     events: std.ArrayList(ChatEvent) = .empty,
@@ -2193,6 +2194,14 @@ pub const Daemon = struct {
         for (workspace.managed_processes.items) |process| try writeManagedProcessSnapshot(&s, workspace, &process);
         for (workspace.tracked_terminal_processes.items) |process| try writeTrackedProcessSnapshot(&s, workspace, &process);
         for (workspace.external_processes.items) |process| try writeExternalProcessSnapshot(&s, workspace, &process);
+        for (self.chat_turns.items) |turn| {
+            if (!std.mem.eql(u8, turn.workspace_id, workspace.id)) continue;
+            {
+                lockTurn(turn);
+                defer turn.mutex.unlock();
+                try writeChatTurnProcessSnapshot(&s, turn);
+            }
+        }
         try s.endArray();
         try s.objectField("outcomes");
         try s.beginArray();
@@ -2249,6 +2258,19 @@ pub const Daemon = struct {
             try s.endObject();
             return try writer.toOwnedSlice();
         }
+        if (std.mem.startsWith(u8, process_id, "turn:")) {
+            const turn_id = process_id["turn:".len..];
+            for (self.chat_turns.items) |turn| {
+                if (!std.mem.eql(u8, turn.turn_id, turn_id) or !std.mem.eql(u8, turn.workspace_id, workspace.id)) continue;
+                lockTurn(turn);
+                defer turn.mutex.unlock();
+                try s.objectField("process");
+                try writeChatTurnProcessSnapshot(&s, turn);
+                try s.endObject();
+                try s.endObject();
+                return try writer.toOwnedSlice();
+            }
+        }
         for (workspace.terminal_process_outcomes.items) |outcome| {
             if (!std.mem.eql(u8, outcome.process_id, process_id)) continue;
             try s.objectField("outcome");
@@ -2272,6 +2294,48 @@ pub const Daemon = struct {
         // A7 is deliberately bounded-immediate in P2. Clients poll; this
         // accepted field is ignored and never sleeps under the daemon lock.
         _ = if (params == .object) params.object.get("timeout_ms") else null;
+
+        if (std.mem.startsWith(u8, process_id, "turn:")) {
+            const turn_id = process_id["turn:".len..];
+            var turn_status: ?process_registry.ExternalProcessStatus = null;
+            for (self.chat_turns.items) |turn| {
+                if (!std.mem.eql(u8, turn.turn_id, turn_id) or !std.mem.eql(u8, turn.workspace_id, workspace.id)) continue;
+                lockTurn(turn);
+                turn_status = chatTurnExternalStatus(turn.status);
+                turn.mutex.unlock();
+                break;
+            }
+            const status = turn_status orelse
+                return try errorResponseAlloc(self.allocator, id_value, headless.registry.ERR_RESOURCE_NOT_FOUND, "process not found");
+
+            var writer: std.Io.Writer.Allocating = .init(self.allocator);
+            errdefer writer.deinit();
+            var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+            try beginOk(&s, id_value);
+            try s.objectField("result");
+            try s.beginObject();
+            try writeRegistryEnvelope(&s, self);
+            try s.objectField("workspace");
+            try writeWorkspaceInfo(&s, self, workspace);
+            try s.objectField("process_id");
+            try s.write(process_id);
+            try s.objectField("terminal_state");
+            if (status == .running) try s.write(null) else try s.write(@tagName(status));
+            try s.objectField("outcome");
+            // Chat turns have no TerminalProcessOutcome; the process.wait
+            // result deliberately keeps this field null for turn records.
+            try s.write(null);
+            try s.objectField("changed");
+            try s.write(if (status == .running)
+                (after_registry_revision != null and self.registry.registry_revision != after_registry_revision.?)
+            else
+                true);
+            try s.objectField("timed_out");
+            try s.write(status == .running);
+            try s.endObject();
+            try s.endObject();
+            return try writer.toOwnedSlice();
+        }
 
         _ = self.registry.pruneTerminalProcessOutcomes(self.allocator, workspace.id, nowMs());
         var running = false;
@@ -4185,6 +4249,93 @@ fn writeTrackedProcessSnapshot(
     try s.endObject();
 }
 
+/// Projects a live chat turn as an external-process snapshot (A1 adapter).
+/// Derivation only: no registry storage or RPC surface. Consumers distinguish
+/// these external-shaped records from stored records by the `turn:` id prefix.
+fn writeChatTurnProcessSnapshot(s: *std.json.Stringify, turn: *const ChatTurn) !void {
+    const process_id = try std.fmt.allocPrint(turn.allocator, "turn:{s}", .{turn.turn_id});
+    defer turn.allocator.free(process_id);
+    const owner_title = if (turn.request.thread_title.len != 0) turn.request.thread_title else turn.turn_id;
+    const status = chatTurnExternalStatus(turn.status);
+
+    try s.beginObject();
+    try s.objectField("id");
+    try s.write(process_id);
+    try s.objectField("workspace_id");
+    try s.write(turn.workspace_id);
+    try s.objectField("workspace_path");
+    try s.write(turn.request.project_path);
+    try s.objectField("source");
+    try s.write("external");
+    try s.objectField("kind");
+    try s.write("external");
+    try s.objectField("name");
+    try s.write("");
+    try s.objectField("owner");
+    try s.write(owner_title);
+    try s.objectField("owner_session_id");
+    try s.write(null);
+    // These fields are part of the external-process shape; ChatTurn does not
+    // currently carry a client binding, so that part of the adapter is empty.
+    try s.objectField("owner_kind");
+    try s.write("gui_agent");
+    try s.objectField("owner_title");
+    try s.write(owner_title);
+    try s.objectField("client_id");
+    try s.write("");
+    // ExternalProcess storage remains unused by this adapter; P3 owns the
+    // future RPC-backed replacement for these derived turn records.
+    try s.objectField("generation");
+    try s.write(@as(u64, 0));
+    try s.objectField("command");
+    try s.write(turn.request.prompt);
+    try s.objectField("cwd");
+    try s.write(turn.request.project_path);
+    try s.objectField("status");
+    try s.write(@tagName(status));
+    try s.objectField("classification");
+    try s.write(@tagName(process_registry.classifyWorkspaceCommand(turn.request.prompt)));
+    try s.objectField("resources");
+    try s.beginArray();
+    try s.endArray();
+    try s.objectField("pid");
+    try s.write(null);
+    try s.objectField("process_group");
+    try s.write(null);
+    try s.objectField("dock_id");
+    try s.write(null);
+    try s.objectField("pane_id");
+    try s.write(null);
+    try s.objectField("created_at_ms");
+    try s.write(turn.started_at_ms);
+    try s.objectField("started_at_ms");
+    try s.write(turn.started_at_ms);
+    try s.objectField("finished_at_ms");
+    try s.write(null);
+    try s.objectField("exit_code");
+    try s.write(null);
+    try s.objectField("signal");
+    try s.write(null);
+    try s.objectField("cancellation_reason");
+    try s.write(null);
+    try s.objectField("runtime_status");
+    try s.write(null);
+    try s.objectField("restart_count");
+    try s.write(@as(u32, 0));
+    try s.objectField("attention");
+    try s.write(status == .failed);
+    try s.endObject();
+}
+
+fn chatTurnExternalStatus(status: ChatTurnStatus) process_registry.ExternalProcessStatus {
+    return switch (status) {
+        .running, .waiting_approval => .running,
+        .completed => .completed,
+        .failed => .failed,
+        .aborted => .cancelled,
+    };
+}
+
 fn writeExternalProcessSnapshot(
     s: *std.json.Stringify,
     workspace: *const process_registry.WorkspaceRecord,
@@ -4207,6 +4358,14 @@ fn writeExternalProcessSnapshot(
     try s.write(process.owner_title);
     try s.objectField("owner_session_id");
     try s.write(null);
+    try s.objectField("owner_kind");
+    try s.write("");
+    try s.objectField("owner_title");
+    try s.write(process.owner_title);
+    try s.objectField("client_id");
+    try s.write("");
+    try s.objectField("generation");
+    try s.write(@as(u64, 0));
     try s.objectField("command");
     try s.write(process.command);
     try s.objectField("cwd");
@@ -4916,6 +5075,7 @@ fn createChatTurnFromParams(allocator: std.mem.Allocator, params: std.json.Value
         .local_thread_id = try requiredDupe(allocator, params, "local_thread_id"),
         .request = request,
         .owned_image_paths = image_paths,
+        .started_at_ms = nowMs(),
     };
     return turn;
 }
@@ -5623,6 +5783,147 @@ fn observeTestTerminalProcess(
         .provider = null,
     }, .{});
     return allocator.dupe(u8, observed.process_id);
+}
+
+fn appendTestChatTurn(
+    daemon: *Daemon,
+    allocator: std.mem.Allocator,
+    turn_id: []const u8,
+    workspace_id: []const u8,
+    project_path: []const u8,
+    thread_title: []const u8,
+    prompt: []const u8,
+    status: ChatTurnStatus,
+    started_at_ms: i64,
+) !*ChatTurn {
+    const turn = try allocator.create(ChatTurn);
+    var owns_turn = true;
+    defer if (owns_turn) allocator.destroy(turn);
+
+    var owned_turn_id: ?[]u8 = null;
+    defer if (owned_turn_id) |value| allocator.free(value);
+    owned_turn_id = try allocator.dupe(u8, turn_id);
+    var owned_workspace_id: ?[]u8 = null;
+    defer if (owned_workspace_id) |value| allocator.free(value);
+    owned_workspace_id = try allocator.dupe(u8, workspace_id);
+    var owned_local_thread_id: ?[]u8 = null;
+    defer if (owned_local_thread_id) |value| allocator.free(value);
+    owned_local_thread_id = try allocator.dupe(u8, "local-thread");
+    var owned_project_path: ?[]u8 = null;
+    defer if (owned_project_path) |value| allocator.free(value);
+    owned_project_path = try allocator.dupe(u8, project_path);
+    var owned_prompt: ?[]u8 = null;
+    defer if (owned_prompt) |value| allocator.free(value);
+    owned_prompt = try allocator.dupe(u8, prompt);
+    var owned_thread_title: ?[]u8 = null;
+    defer if (owned_thread_title) |value| allocator.free(value);
+    owned_thread_title = try allocator.dupe(u8, thread_title);
+    var owned_image_paths: ?[]const []const u8 = null;
+    defer if (owned_image_paths) |value| allocator.free(value);
+    owned_image_paths = try allocator.alloc([]const u8, 0);
+
+    turn.* = .{
+        .allocator = allocator,
+        .turn_id = owned_turn_id.?,
+        .workspace_id = owned_workspace_id.?,
+        .local_thread_id = owned_local_thread_id.?,
+        .request = .{
+            .provider = .claude,
+            .harness_kind = .local_cli,
+            .project_path = owned_project_path.?,
+            .prompt = owned_prompt.?,
+            .thread_title = owned_thread_title.?,
+        },
+        .owned_image_paths = owned_image_paths.?,
+        .started_at_ms = started_at_ms,
+        .status = status,
+        .worker_done = status == .completed or status == .failed or status == .aborted,
+    };
+    try daemon.chat_turns.append(allocator, turn);
+    owned_turn_id = null;
+    owned_workspace_id = null;
+    owned_local_thread_id = null;
+    owned_project_path = null;
+    owned_prompt = null;
+    owned_thread_title = null;
+    owned_image_paths = null;
+    owns_turn = false;
+    return turn;
+}
+
+test "chat turns project into process.list as turn records" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    _ = try daemon.registry.ensureWorkspace(allocator, "turn-project-a");
+    _ = try daemon.registry.ensureWorkspace(allocator, "turn-project-empty");
+    _ = try appendTestChatTurn(&daemon, allocator, "projected-turn", "turn-project-a", "/tmp/project-a", "Chat title", "streaming prompt", .running, 10);
+
+    const response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"process.list","params":{"workspace":{"workspace_id":"turn-project-a"}}}
+    );
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const processes = parsed.value.object.get("result").?.object.get("processes").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), processes.len);
+    try std.testing.expectEqualStrings("turn:projected-turn", processes[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("gui_agent", processes[0].object.get("owner_kind").?.string);
+    try std.testing.expectEqualStrings("running", processes[0].object.get("status").?.string);
+
+    const other_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"process.list","params":{"workspace":{"workspace_id":"turn-project-empty"}}}
+    );
+    defer allocator.free(other_response);
+    var other_parsed = try std.json.parseFromSlice(std.json.Value, allocator, other_response, .{});
+    defer other_parsed.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        other_parsed.value.object.get("result").?.object.get("processes").?.array.items.len,
+    );
+}
+
+test "finished retained turns report terminal status and wait maps them" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    _ = try daemon.registry.ensureWorkspace(allocator, "turn-finished");
+    _ = try appendTestChatTurn(&daemon, allocator, "finished-turn", "turn-finished", "/tmp/finished", "Finished title", "failed prompt", .failed, 20);
+
+    const list_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"process.list","params":{"workspace":{"workspace_id":"turn-finished"}}}
+    );
+    defer allocator.free(list_response);
+    var listed = try std.json.parseFromSlice(std.json.Value, allocator, list_response, .{});
+    defer listed.deinit();
+    const processes = listed.value.object.get("result").?.object.get("processes").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), processes.len);
+    try std.testing.expectEqualStrings("failed", processes[0].object.get("status").?.string);
+
+    const wait_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"process.wait","params":{"workspace":{"workspace_id":"turn-finished"},"process_id":"turn:finished-turn"}}
+    );
+    defer allocator.free(wait_response);
+    var waited = try std.json.parseFromSlice(std.json.Value, allocator, wait_response, .{});
+    defer waited.deinit();
+    const result = waited.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings("failed", result.get("terminal_state").?.string);
+    try std.testing.expect(!result.get("timed_out").?.bool);
+    try std.testing.expect(result.get("outcome").? == .null);
+}
+
+test "turn records are derived not stored" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    _ = try daemon.registry.ensureWorkspace(allocator, "turn-derived");
+    _ = try appendTestChatTurn(&daemon, allocator, "derived-turn", "turn-derived", "/tmp/derived", "", "prompt", .running, 30);
+
+    const response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"process.list","params":{"workspace":{"workspace_id":"turn-derived"}}}
+    );
+    defer allocator.free(response);
+    try std.testing.expectEqual(@as(usize, 0), daemon.registry.workspace("turn-derived").?.external_processes.items.len);
 }
 
 test "session create dual-writes a tracked terminal process" {
