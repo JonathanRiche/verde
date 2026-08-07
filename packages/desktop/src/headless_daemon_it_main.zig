@@ -15,6 +15,7 @@ const platform_ipc = @import("platform/ipc.zig");
 const platform_paths = @import("platform_paths");
 const platform_runtime = @import("platform_runtime");
 const sessionizer = @import("terminal/sessionizer.zig");
+const transcript_apply = @import("chat/transcript_apply.zig");
 const zqlite = @import("zqlite");
 
 /// PTY / process-group / Unix-signal scenarios (forkpty, waitpid, kill(pid,0)).
@@ -160,6 +161,9 @@ pub fn main(init: std.process.Init) !void {
     try runChatDuplicateCommitReceiptScenario(allocator, io); // scenario 2
     try runChatFailedAbortedCommitScenario(allocator, io); // scenario 4
     try runChatTypedDtoRoundTripScenario(allocator, io); // scenario 6
+    // M4-P3 production dual-write pins (Windows-safe): parity + revision conflict.
+    try runChatTurnParityScenario(allocator, io);
+    try runChatDaemonCommitStaleSnapshotConflictScenario(allocator, io);
 
     // Extended store scenarios (POSIX only): full surface + S4 fault/busy/crash pins.
     // Transport-tier primitives, but not part of the Windows-safe subset.
@@ -4717,6 +4721,245 @@ fn runChatTypedDtoRoundTripScenario(allocator: std.mem.Allocator, io: std.Io) !v
     var prepare = try client.call("daemon.prepareShutdown", .{});
     defer prepare.deinit();
     if (!prepare.response.isOk()) return error.ChatDtoPrepareFailed;
+    kill_on_unwind = false;
+    _ = child.wait(io) catch {};
+}
+
+/// M4-P3 parity IT: complete a real-shaped stub turn, then diff daemon-committed
+/// rows against the rows the GUI projection would write (acceptance-staged user
+/// message with the client message_id + transcript_apply on the same stub
+/// events with daemon-minted assistant message_ids). Any divergence fails.
+fn runChatTurnParityScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m4-chat-parity");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+        .chat_stub = true,
+    });
+    var kill_on_unwind = true;
+    errdefer if (kill_on_unwind) child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    const turn_id = "turn-parity-1";
+    const workspace_id = "ws-parity";
+    const local_thread_id = "thread-parity";
+    const prompt = "parity hello durable";
+    const user_message_id = "gui-msg:ws-parity:thread-parity:1";
+
+    try startStubChatTurn(&client, turn_id, workspace_id, local_thread_id, pref_path, prompt, user_message_id);
+    try waitChatTurnTerminal(io, &client, turn_id, true);
+
+    var get = try client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+        .workspace_id = workspace_id,
+        .local_thread_id = local_thread_id,
+    });
+    defer get.deinit();
+    if (!get.response.isOk()) return error.ChatParityThreadGetFailed;
+    const committed = try client.decodeThreadGet(&get);
+
+    // GUI projection for this dual-write window:
+    // 1) user row staged at acceptance with the client message_id
+    // 2) transcript_apply on the deterministic stub event stream (same pure
+    //    reducer the daemon commit path uses); empty message_ids are minted
+    //    as turn:{id}:msg:{index} by insertTurnMessages.
+    const stub_events = [_]transcript_apply.ChatEvent{
+        .{ .kind = "assistant_delta", .payload_json = "{\"text\":\"stub-ok\"}" },
+        .{ .kind = "completed", .payload_json = "{}" },
+    };
+    const outcome: transcript_apply.WorkerOutcome = .{
+        .status = .completed,
+        .provider = "codex",
+        .reply_text = "stub-ok",
+    };
+    const applied = try transcript_apply.apply(allocator, &stub_events, outcome);
+    defer transcript_apply.freeMessages(allocator, applied);
+
+    const expected_len = 1 + applied.len;
+    if (committed.thread.messages.len != expected_len) {
+        std.debug.print(
+            "headless-daemon-it: parity message count daemon={d} projection={d}\n",
+            .{ committed.thread.messages.len, expected_len },
+        );
+        return error.ChatParityMessageCount;
+    }
+
+    const user = committed.thread.messages[0];
+    if (!std.mem.eql(u8, user.message_id, user_message_id)) return error.ChatParityUserMessageId;
+    if (!std.mem.eql(u8, user.role, "user")) return error.ChatParityUserRole;
+    if (!std.mem.eql(u8, user.author, "You")) return error.ChatParityUserAuthor;
+    if (!std.mem.eql(u8, user.body, prompt)) return error.ChatParityUserBody;
+
+    for (applied, 0..) |proj, i| {
+        const daemon_msg = committed.thread.messages[i + 1];
+        const expected_id = try std.fmt.allocPrint(allocator, "turn:{s}:msg:{d}", .{ turn_id, i });
+        defer allocator.free(expected_id);
+        if (!std.mem.eql(u8, daemon_msg.message_id, expected_id)) return error.ChatParityAssistantMessageId;
+        if (!std.mem.eql(u8, daemon_msg.role, proj.role)) return error.ChatParityAssistantRole;
+        if (!std.mem.eql(u8, daemon_msg.author, proj.author)) return error.ChatParityAssistantAuthor;
+        if (!std.mem.eql(u8, daemon_msg.body, proj.body)) return error.ChatParityAssistantBody;
+    }
+
+    // Ledger must point at the same acceptance-staged user id.
+    var record = try client.call(headless.store.METHOD_CHAT_TURN_RECORD, .{ .turn_id = turn_id });
+    defer record.deinit();
+    if (!record.response.isOk()) return error.ChatParityRecordFailed;
+    const turn = try client.decodeTurnRecord(&record);
+    if (turn.user_message_id) |mid| {
+        if (!std.mem.eql(u8, mid, user_message_id)) return error.ChatParityLedgerUserId;
+    } else return error.ChatParityLedgerMissingUserId;
+    if (turn.committed_store_revision == null) return error.ChatParityMissingRevision;
+
+    try consumeChatTurn(&client, turn_id);
+    var prepare = try client.call("daemon.prepareShutdown", .{});
+    defer prepare.deinit();
+    if (!prepare.response.isOk()) return error.ChatParityPrepareFailed;
+    kill_on_unwind = false;
+    _ = child.wait(io) catch {};
+}
+
+/// M4-P3 revision-guard conflict: after a daemon turn commit advances the store
+/// revision, a stale GUI-shaped snapshot.replace with the pre-commit expected
+/// revision must return explicit conflict; refresh via store.status then retry
+/// once with the fresh guard succeeds.
+fn runChatDaemonCommitStaleSnapshotConflictScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m4-chat-conflict");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+        .chat_stub = true,
+    });
+    var kill_on_unwind = true;
+    errdefer if (kill_on_unwind) child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    var reg = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = true });
+    defer reg.deinit();
+    if (!reg.response.isOk()) return error.ChatConflictRegisterFailed;
+    const client_id = (try client.decodeClientRegister(&reg)).client_id;
+
+    // Capture pre-turn revision (seed-less store may already be at 0).
+    const empty_params: struct {} = .{};
+    var status_pre = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params);
+    defer status_pre.deinit();
+    if (!status_pre.response.isOk()) return error.ChatConflictStatusPreFailed;
+    const pre_revision = (try client.decodeStoreStatus(&status_pre)).store_revision;
+
+    try startStubChatTurn(
+        &client,
+        "turn-conflict-1",
+        "ws-conflict",
+        "thread-conflict",
+        pref_path,
+        "conflict body",
+        "user-conflict-1",
+    );
+    try waitChatTurnTerminal(io, &client, "turn-conflict-1", true);
+
+    var status_post = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params);
+    defer status_post.deinit();
+    if (!status_post.response.isOk()) return error.ChatConflictStatusPostFailed;
+    const post_revision = (try client.decodeStoreStatus(&status_post)).store_revision;
+    if (post_revision <= pre_revision) return error.ChatConflictRevisionDidNotAdvance;
+
+    // Stale GUI snapshot still holding pre_revision → explicit conflict.
+    {
+        const stale: headless.store.SnapshotReplaceRequest = .{
+            .mutation = .{
+                .request_key = "m4p3-stale-after-turn",
+                .client_id = client_id,
+                .expected_store_revision = pre_revision,
+            },
+            .snapshot = .{
+                .schema_version = 1,
+                .workspaces = &.{.{
+                    .workspace_id = "ws-conflict-stale",
+                    .label = "stale GUI",
+                    .path = pref_path,
+                }},
+            },
+            .bootstrap = false,
+        };
+        var parsed = try client.call(headless.store.METHOD_STATE_SNAPSHOT_REPLACE, stale);
+        defer parsed.deinit();
+        const err = parsed.response.err orelse return error.ChatConflictMissingError;
+        if (!std.mem.eql(u8, err.code, headless.protocol.ERR_CONFLICT)) return error.ChatConflictWrongCode;
+    }
+
+    // Refresh + retry with the post-commit guard (Phase A recovery shape).
+    var status_fresh = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params);
+    defer status_fresh.deinit();
+    if (!status_fresh.response.isOk()) return error.ChatConflictRefreshFailed;
+    const fresh = (try client.decodeStoreStatus(&status_fresh)).store_revision;
+    if (fresh != post_revision) return error.ChatConflictRefreshMismatch;
+
+    {
+        const retry: headless.store.SnapshotReplaceRequest = .{
+            .mutation = .{
+                .request_key = "m4p3-retry-after-refresh",
+                .client_id = client_id,
+                .expected_store_revision = fresh,
+            },
+            .snapshot = .{
+                .schema_version = 1,
+                .workspaces = &.{.{
+                    .workspace_id = "ws-conflict-recovered",
+                    .label = "recovered GUI",
+                    .path = pref_path,
+                }},
+            },
+            .bootstrap = false,
+        };
+        var parsed = try client.call(headless.store.METHOD_STATE_SNAPSHOT_REPLACE, retry);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.ChatConflictRetryFailed;
+        const write = try client.decodeWriteResult(&parsed);
+        if (!write.applied or write.store_revision != fresh + 1) return error.ChatConflictRetryRevision;
+    }
+
+    try consumeChatTurn(&client, "turn-conflict-1");
+    var prepare = try client.call("daemon.prepareShutdown", .{});
+    defer prepare.deinit();
+    if (!prepare.response.isOk()) return error.ChatConflictPrepareFailed;
     kill_on_unwind = false;
     _ = child.wait(io) catch {};
 }

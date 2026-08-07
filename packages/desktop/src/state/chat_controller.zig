@@ -1054,7 +1054,10 @@ test "prospective prompt preflight rejects before thread staging" {
     try std.testing.expectEqual(@as(usize, 0), prospective.messages.items.len);
 }
 
-test "persistence contention keeps one retryable draft and starts one addressed turn" {
+test "confirmed daemon rejection restores retryable draft; acceptance starts one addressed turn" {
+    // M4-P3: durability is the acceptance receipt, not pre-send persistThreadBlocking.
+    // Confirmed JSON-RPC rejection restores the draft (no provider handoff); a
+    // later acceptance clears the draft and stages exactly one user row in-memory.
     const allocator = std.testing.allocator;
     const FakeState = struct {
         allocator: std.mem.Allocator,
@@ -1062,7 +1065,7 @@ test "persistence contention keeps one retryable draft and starts one addressed 
             projects: std.ArrayList(Project) = .empty,
             selected_index: usize = 0,
         } = .{},
-        persist_calls: usize = 0,
+        handoff_attempts: usize = 0,
         provider_handoffs: usize = 0,
         failure_rows: usize = 0,
         flushes: usize = 0,
@@ -1097,11 +1100,6 @@ test "persistence contention keeps one retryable draft and starts one addressed 
             self.allocator.free(message.extra_images);
         }
 
-        pub fn persistThreadBlocking(self: *@This(), _: usize, _: usize) !void {
-            self.persist_calls += 1;
-            if (self.persist_calls == 1) return error.Busy;
-        }
-
         pub fn beginSendForThreadWithReadyDaemon(
             self: *@This(),
             _: usize,
@@ -1110,6 +1108,8 @@ test "persistence contention keeps one retryable draft and starts one addressed 
             _: ProviderExecutionTarget,
         ) !void {
             try std.testing.expectEqualStrings("retryable prompt", prompt);
+            self.handoff_attempts += 1;
+            if (self.handoff_attempts == 1) return error.DaemonRequestFailed;
             self.provider_handoffs += 1;
         }
 
@@ -1126,7 +1126,7 @@ test "persistence contention keeps one retryable draft and starts one addressed 
     };
 
     var state: FakeState = .{ .allocator = allocator };
-    var project = try Project.init(allocator, "busy-send", "Busy send", "/tmp/busy-send", 0);
+    var project = try Project.init(allocator, "accept-send", "Accept send", "/tmp/accept-send", 0);
     state.project_controller.projects.append(allocator, project) catch |err| {
         project.deinit(allocator);
         return err;
@@ -1138,17 +1138,18 @@ test "persistence contention keeps one retryable draft and starts one addressed 
     const thread = &state.project_controller.projects.items[0].threads.items[0];
     thread.setDraft("retryable prompt");
 
-    try std.testing.expectError(error.Busy, sendThreadDraft(&state, 0, 0));
+    try std.testing.expectError(error.DaemonRequestFailed, sendThreadDraft(&state, 0, 0));
     try std.testing.expectEqual(@as(usize, 0), state.provider_handoffs);
-    try std.testing.expectEqual(@as(usize, 0), state.failure_rows);
-    try std.testing.expectEqual(@as(usize, 0), state.flushes);
+    try std.testing.expectEqual(@as(usize, 1), state.handoff_attempts);
+    try std.testing.expectEqual(@as(usize, 1), state.failure_rows);
+    try std.testing.expectEqual(@as(usize, 1), state.flushes);
     try std.testing.expectEqualStrings("retryable prompt", thread.currentDraft());
     try std.testing.expectEqual(@as(usize, 0), thread.messages.items.len);
     try std.testing.expect(!thread.committed);
 
     try std.testing.expect(try sendThreadDraft(&state, 0, 0));
     try std.testing.expectEqual(@as(usize, 1), state.provider_handoffs);
-    try std.testing.expectEqual(@as(usize, 0), state.failure_rows);
+    try std.testing.expectEqual(@as(usize, 2), state.handoff_attempts);
     try std.testing.expectEqualStrings("", thread.currentDraft());
     try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
     try std.testing.expectEqualStrings("retryable prompt", thread.messages.items[0].body);
@@ -1453,32 +1454,12 @@ pub fn sendThreadDraftWithUiPolicy(self: anytype, project_index: usize, thread_i
         return err;
     };
     project.invalidateSidebarThreadCache();
-    // Persist the user turn before handing provider execution to the daemon,
-    // so a fast app quit can still reattach the daemon-owned reply to a
-    // known local chat thread. Only this thread changed here; rewriting every
-    // historical transcript can otherwise block the UI for seconds.
-    const persist_started_at_ms = monotonicMs();
-    self.persistThreadBlocking(project_index, thread_index) catch |err| {
-        if (err == error.WorkspaceNotFound) {
-            // A newly-created workspace may not have a database row yet.
-            self.flushDirtyBlocking();
-        } else {
-            snapshot.restore(self, thread);
-            if (persistenceContention(err)) {
-                // No provider handoff occurred. Keep the exact draft retryable
-                // and do not manufacture a failed transcript row for storage
-                // ownership contention.
-                project.invalidateSidebarThreadCache();
-                return err;
-            }
-            self.appendInitialSendFailure(thread, initialSendStartFailureMessage(err));
-            project.invalidateSidebarThreadCache();
-            if (selected_target) self.requestTranscriptScrollToBottom();
-            self.flushDirtyBlocking();
-            return err;
-        }
-    };
-    const persist_elapsed_ms = monotonicMs() - persist_started_at_ms;
+    // M4-P3: user-message durability is the daemon acceptance receipt.
+    // chat.turn.start stages the user row (keyed by message_id) on the worker
+    // thread before provider work; do not pre-flush via persistThreadBlocking.
+    // Thread metadata dual-write still rides the post-flip M3 store path on
+    // later flushes; transcript application / flushDirtyNow / consume are
+    // deliberately unchanged for this dual-write window.
     const daemon_start_at_ms = monotonicMs();
     self.beginSendForThreadWithReadyDaemon(project_index, thread, draft, execution_target) catch |err| {
         if (err == error.DaemonRequestFailed) {
@@ -1488,8 +1469,8 @@ pub fn sendThreadDraftWithUiPolicy(self: anytype, project_index: usize, thread_i
             self.appendInitialSendFailure(thread, initialSendStartFailureMessage(err));
         } else {
             // Transport and response failures may happen after acceptance.
-            // Keep the one persisted user row, but clear the composer so a
-            // blind retry cannot duplicate it (or the provider turn).
+            // Keep the in-memory user row (daemon may have staged it); clear
+            // the composer so a blind retry cannot duplicate the provider turn.
             thread.clearDraft();
             thread.clearDraftImage(self.allocator);
             if (selected_target) self.resetComposerInputWidget();
@@ -1500,8 +1481,7 @@ pub fn sendThreadDraftWithUiPolicy(self: anytype, project_index: usize, thread_i
         self.flushDirtyBlocking();
         return err;
     };
-    runtime_log.diagnostic("chat submit accepted persist_ms={d} daemon_start_ms={d} thread_messages={d}", .{
-        persist_elapsed_ms,
+    runtime_log.diagnostic("chat submit accepted daemon_start_ms={d} thread_messages={d}", .{
         monotonicMs() - daemon_start_at_ms,
         thread.messages.items.len,
     });
@@ -1815,8 +1795,14 @@ pub fn beginSendForThreadWithReadyDaemon(
 ) !void {
     const page_alloc = std.heap.page_allocator;
     const execution_cwd = execution_target.cwd();
-    const turn_id = try std.fmt.allocPrint(page_alloc, "gui:{s}:{s}:{d}", .{ self.project_controller.projects.items[project_index].id, thread.local_thread_id, unixTimestampMs() });
+    const now_ms = unixTimestampMs();
+    const project_id = self.project_controller.projects.items[project_index].id;
+    const turn_id = try std.fmt.allocPrint(page_alloc, "gui:{s}:{s}:{d}", .{ project_id, thread.local_thread_id, now_ms });
     errdefer page_alloc.free(turn_id);
+    // Stable client identity for the staged user row at acceptance (M4-P3).
+    // Lives only for the RPC; the daemon keys the durable message by this id.
+    const message_id = try std.fmt.allocPrint(self.allocator, "gui-msg:{s}:{s}:{d}", .{ project_id, thread.local_thread_id, now_ms });
+    defer self.allocator.free(message_id);
     const cursor_model_params_json = if (thread.provider == .cursor) try self.cursorModelParamsJsonAlloc(page_alloc, thread) else null;
     defer if (cursor_model_params_json) |params| page_alloc.free(params);
 
@@ -1832,6 +1818,9 @@ pub fn beginSendForThreadWithReadyDaemon(
     // The daemon response is owned by self.allocator (startDaemonChatTurn ->
     // sessionizer.requestAlloc); freeing it with page_alloc trips
     // PageAllocator's alignment safety check and crashes the send.
+    // Ordering: await the chat.turn.start acceptance receipt before the GUI
+    // marks the send pending / clears the draft (caller). Staging SQLite runs
+    // on the worker after the RPC returns (never under lockDaemon).
     const response: ?[]u8 = self.startDaemonChatTurn(
         project_index,
         thread,
@@ -1840,6 +1829,7 @@ pub fn beginSendForThreadWithReadyDaemon(
         execution_cwd,
         cursor_model_params_json,
         turn_id,
+        message_id,
     ) catch |err| recovered: {
         // A lost reply can follow successful acceptance. Probe this exact
         // idempotency key before exposing a retry that could run twice.
@@ -1922,6 +1912,7 @@ pub fn startDaemonChatTurn(
     execution_cwd: []const u8,
     cursor_model_params_json: ?[]const u8,
     turn_id: []const u8,
+    message_id: []const u8,
 ) ![]u8 {
     var image_paths: std.ArrayList([]const u8) = .empty;
     defer image_paths.deinit(self.allocator);
@@ -1947,6 +1938,8 @@ pub fn startDaemonChatTurn(
         .access_mode = @tagName(thread.access_mode),
         .remote_ssh_host = if (execution_target.remoteHost()) |host| host else null,
         .remote_cwd = if (execution_target.remoteHost() != null) execution_cwd else null,
+        // Additive M4 param: stages this stable id at acceptance (daemon worker).
+        .message_id = message_id,
     }, 1);
 }
 
