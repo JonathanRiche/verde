@@ -58,6 +58,145 @@ pub const Error = struct {
     message: []const u8,
 };
 
+/// Stable names for independently negotiable optional runtime features.
+pub const CapabilityFeature = enum {
+    terminal_grid,
+    browser_session_state,
+    browser_create,
+    browser_navigation,
+    browser_history,
+    browser_javascript_eval,
+    browser_dom_inspection,
+    browser_selector_actions,
+    browser_form_input,
+    browser_low_level_pointer,
+    browser_screenshot,
+    browser_lifecycle_restart,
+    browser_lifecycle_reset,
+    browser_frame_streaming,
+    browser_downloads,
+    browser_uploads,
+
+    /// Stable wire name used in errors and capability-gating diagnostics.
+    pub fn wireName(self: CapabilityFeature) []const u8 {
+        return switch (self) {
+            .terminal_grid => "terminal_grid",
+            .browser_session_state => "browser.session_state",
+            .browser_create => "browser.create",
+            .browser_navigation => "browser.navigation",
+            .browser_history => "browser.history",
+            .browser_javascript_eval => "browser.javascript_eval",
+            .browser_dom_inspection => "browser.dom_inspection",
+            .browser_selector_actions => "browser.selector_actions",
+            .browser_form_input => "browser.form_input",
+            .browser_low_level_pointer => "browser.low_level_pointer",
+            .browser_screenshot => "browser.screenshot",
+            .browser_lifecycle_restart => "browser.lifecycle_restart",
+            .browser_lifecycle_reset => "browser.lifecycle_reset",
+            .browser_frame_streaming => "browser.frame_streaming",
+            .browser_downloads => "browser.downloads",
+            .browser_uploads => "browser.uploads",
+        };
+    }
+
+    fn unavailableMessage(self: CapabilityFeature) []const u8 {
+        return switch (self) {
+            .terminal_grid => "terminal_grid capability is unavailable",
+            .browser_session_state => "browser.session_state capability is unavailable",
+            .browser_create => "browser.create capability is unavailable",
+            .browser_navigation => "browser.navigation capability is unavailable",
+            .browser_history => "browser.history capability is unavailable",
+            .browser_javascript_eval => "browser.javascript_eval capability is unavailable",
+            .browser_dom_inspection => "browser.dom_inspection capability is unavailable",
+            .browser_selector_actions => "browser.selector_actions capability is unavailable",
+            .browser_form_input => "browser.form_input capability is unavailable",
+            .browser_low_level_pointer => "browser.low_level_pointer capability is unavailable",
+            .browser_screenshot => "browser.screenshot capability is unavailable",
+            .browser_lifecycle_restart => "browser.lifecycle_restart capability is unavailable",
+            .browser_lifecycle_reset => "browser.lifecycle_reset capability is unavailable",
+            .browser_frame_streaming => "browser.frame_streaming capability is unavailable",
+            .browser_downloads => "browser.downloads capability is unavailable",
+            .browser_uploads => "browser.uploads capability is unavailable",
+        };
+    }
+};
+
+/// Independently advertised features of a browser-session adapter.
+pub const BrowserFeatures = struct {
+    session_state: bool = false,
+    create: bool = false,
+    navigation: bool = false,
+    history: bool = false,
+    javascript_eval: bool = false,
+    dom_inspection: bool = false,
+    selector_actions: bool = false,
+    form_input: bool = false,
+    low_level_pointer: bool = false,
+    screenshot: bool = false,
+    lifecycle_restart: bool = false,
+    lifecycle_reset: bool = false,
+    frame_streaming: bool = false,
+    downloads: bool = false,
+    uploads: bool = false,
+
+    pub fn any(self: BrowserFeatures) bool {
+        return self.session_state or
+            self.create or
+            self.navigation or
+            self.history or
+            self.javascript_eval or
+            self.dom_inspection or
+            self.selector_actions or
+            self.form_input or
+            self.low_level_pointer or
+            self.screenshot or
+            self.lifecycle_restart or
+            self.lifecycle_reset or
+            self.frame_streaming or
+            self.downloads or
+            self.uploads;
+    }
+
+    pub fn isAvailable(self: BrowserFeatures, feature: CapabilityFeature) bool {
+        return switch (feature) {
+            .terminal_grid => false,
+            .browser_session_state => self.session_state,
+            .browser_create => self.create,
+            .browser_navigation => self.navigation,
+            .browser_history => self.history,
+            .browser_javascript_eval => self.javascript_eval,
+            .browser_dom_inspection => self.dom_inspection,
+            .browser_selector_actions => self.selector_actions,
+            .browser_form_input => self.form_input,
+            .browser_low_level_pointer => self.low_level_pointer,
+            .browser_screenshot => self.screenshot,
+            .browser_lifecycle_restart => self.lifecycle_restart,
+            .browser_lifecycle_reset => self.lifecycle_reset,
+            .browser_frame_streaming => self.frame_streaming,
+            .browser_downloads => self.downloads,
+            .browser_uploads => self.uploads,
+        };
+    }
+};
+
+/// Aggregate browser-adapter state plus its authoritative granular feature set.
+pub const BrowserCapabilities = struct {
+    available: bool = false,
+    features: BrowserFeatures = .{},
+
+    pub fn init(features: BrowserFeatures) BrowserCapabilities {
+        return .{ .available = features.any(), .features = features };
+    }
+};
+
+/// Construct a stable capability_unavailable protocol error for one feature.
+pub fn capabilityUnavailable(feature: CapabilityFeature) Error {
+    return .{
+        .code = ERR_CAPABILITY_UNAVAILABLE,
+        .message = feature.unavailableMessage(),
+    };
+}
+
 /// Capabilities currently offered by the headless core. Phase 1 only claims terminal_raw.
 pub const Capabilities = struct {
     terminal_raw: bool = true,
@@ -67,6 +206,25 @@ pub const Capabilities = struct {
     leases: bool = false,
     browser_execution: bool = false,
     browser_presentation: bool = false,
+    browser: BrowserCapabilities = .{},
+
+    /// Query the authoritative granular availability of an optional feature.
+    pub fn isFeatureAvailable(self: Capabilities, feature: CapabilityFeature) bool {
+        return switch (feature) {
+            .terminal_grid => self.terminal_grid,
+            else => self.browser.available and self.browser.features.isAvailable(feature),
+        };
+    }
+
+    /// Construct capabilities with coarse browser_execution derived for old clients.
+    pub fn withBrowser(features: BrowserFeatures, browser_presentation: bool) Capabilities {
+        const browser: BrowserCapabilities = .init(features);
+        return .{
+            .browser_execution = browser.available,
+            .browser_presentation = browser_presentation,
+            .browser = browser,
+        };
+    }
 
     pub fn phase1() Capabilities {
         return .{
@@ -77,6 +235,7 @@ pub const Capabilities = struct {
             .leases = false,
             .browser_execution = false,
             .browser_presentation = false,
+            .browser = .{},
         };
     }
 };
@@ -428,4 +587,68 @@ test "unknown fields in params are tolerated by request parse" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("core.capabilities", parsed.request.method);
     try std.testing.expect(parsed.request.params.object.get("future_flag") != null);
+}
+
+test "old capability shape defaults every granular feature to unavailable" {
+    const raw =
+        \\{"headless_protocol_version":1,"min_supported":1,"max_supported":1,"capabilities":{"terminal_raw":true,"terminal_grid":false,"chat":false,"processes":false,"leases":false,"browser_execution":false,"browser_presentation":false}}
+    ;
+    var parsed = try std.json.parseFromSlice(CapabilitiesResult, std.testing.allocator, raw, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    inline for (std.meta.tags(CapabilityFeature)) |feature| {
+        try std.testing.expect(!parsed.value.capabilities.isFeatureAvailable(feature));
+    }
+    try std.testing.expect(!parsed.value.capabilities.browser.available);
+}
+
+test "new granular capability shape round trips" {
+    const capabilities: Capabilities = .withBrowser(.{
+        .session_state = true,
+        .navigation = true,
+        .javascript_eval = true,
+        .screenshot = true,
+        .lifecycle_restart = true,
+    }, true);
+    const result: CapabilitiesResult = .{
+        .headless_protocol_version = HEADLESS_PROTOCOL_VERSION,
+        .min_supported = MIN_SUPPORTED_PROTOCOL_VERSION,
+        .max_supported = MAX_SUPPORTED_PROTOCOL_VERSION,
+        .capabilities = capabilities,
+    };
+
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try stringify.write(result);
+    var parsed = try std.json.parseFromSlice(CapabilitiesResult, std.testing.allocator, writer.written(), .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value.capabilities.browser_execution);
+    try std.testing.expect(parsed.value.capabilities.browser_presentation);
+    try std.testing.expect(parsed.value.capabilities.browser.available);
+    try std.testing.expect(parsed.value.capabilities.isFeatureAvailable(.browser_navigation));
+    try std.testing.expect(parsed.value.capabilities.isFeatureAvailable(.browser_javascript_eval));
+    try std.testing.expect(parsed.value.capabilities.isFeatureAvailable(.browser_screenshot));
+    try std.testing.expect(parsed.value.capabilities.isFeatureAvailable(.browser_lifecycle_restart));
+    try std.testing.expect(!parsed.value.capabilities.isFeatureAvailable(.browser_dom_inspection));
+    try std.testing.expect(!parsed.value.capabilities.isFeatureAvailable(.terminal_grid));
+}
+
+test "granular feature and unavailable error helpers use stable names" {
+    var capabilities: Capabilities = .phase1();
+    capabilities.terminal_grid = true;
+    try std.testing.expect(capabilities.isFeatureAvailable(.terminal_grid));
+    try std.testing.expect(!capabilities.isFeatureAvailable(.browser_navigation));
+
+    capabilities = .withBrowser(.{ .navigation = true }, false);
+    try std.testing.expect(capabilities.isFeatureAvailable(.browser_navigation));
+    try std.testing.expect(!capabilities.isFeatureAvailable(.browser_screenshot));
+    try std.testing.expectEqualStrings("browser.navigation", CapabilityFeature.browser_navigation.wireName());
+
+    const unavailable = capabilityUnavailable(.browser_screenshot);
+    try std.testing.expectEqualStrings(ERR_CAPABILITY_UNAVAILABLE, unavailable.code);
+    try std.testing.expectEqualStrings("browser.screenshot capability is unavailable", unavailable.message);
 }
