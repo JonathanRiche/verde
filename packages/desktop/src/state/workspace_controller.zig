@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const project_state = @import("project.zig");
+const process_registry = @import("../daemon/process_registry.zig");
 const ai_harness = @import("../providers/harness.zig");
 const chat_threads = @import("../chat/threads.zig");
 const runtime_log = @import("../runtime/log.zig");
@@ -109,115 +110,14 @@ const Project = project_state.Project;
 const WorkspaceLease = project_state.WorkspaceLease;
 const TerminalProcessFinish = project_state.TerminalProcessFinish;
 
-pub const CommandClass = enum {
-    other,
-    build,
-    @"test",
-    formatter,
-    package_install,
-    migration,
-    dev_server,
-};
-
-/// Conservatively classifies commands whose shared output is well-known.
-/// Unknown commands remain concurrent unless callers declare resources.
-pub fn classifyWorkspaceCommand(command: []const u8) CommandClass {
-    if (commandHasAnyToken(command, &.{ "migrate", "migration", "migrations" })) return .migration;
-    if (isPackageInstallCommand(command)) return .package_install;
-    if (commandHasAnyToken(command, &.{ "fmt", "format", "formatter", "prettier", "gofmt", "rustfmt" })) return .formatter;
-    if (commandHasAnyToken(command, &.{ "test", "tests", "pytest", "vitest", "jest" })) return .@"test";
-    if (commandHasAnyToken(command, &.{ "build", "compile" }) or commandStartsWithToken(command, "make")) return .build;
-    if (commandHasAnyToken(command, &.{ "dev", "serve", "server" })) return .dev_server;
-    return .other;
-}
-
-pub fn inferredWorkspaceResource(command: []const u8) ?[]const u8 {
-    return switch (classifyWorkspaceCommand(command)) {
-        .build, .@"test" => "build",
-        .formatter => "source",
-        .package_install => "deps",
-        .migration => "db",
-        .other, .dev_server => null,
-    };
-}
-
-fn commandHasAnyToken(command: []const u8, wanted: []const []const u8) bool {
-    var tokens = std.mem.tokenizeAny(u8, command, " \t\r\n'\"=,:;()[]{}");
-    while (tokens.next()) |token| {
-        for (wanted) |candidate| {
-            if (std.ascii.eqlIgnoreCase(token, candidate)) return true;
-        }
-    }
-    return false;
-}
-
-fn commandStartsWithAnyToken(command: []const u8, wanted: []const []const u8) bool {
-    for (wanted) |candidate| {
-        if (commandStartsWithToken(command, candidate)) return true;
-    }
-    return false;
-}
-
-fn commandStartsWithToken(command: []const u8, wanted: []const u8) bool {
-    var tokens = std.mem.tokenizeAny(u8, command, " \t\r\n'\"");
-    while (tokens.next()) |token| {
-        if (std.ascii.eqlIgnoreCase(token, "exec") or
-            std.ascii.eqlIgnoreCase(token, "sh") or
-            std.ascii.eqlIgnoreCase(token, "bash") or
-            std.ascii.eqlIgnoreCase(token, "zsh") or
-            std.mem.eql(u8, token, "-c") or
-            std.mem.eql(u8, token, "-lc")) continue;
-        return std.ascii.eqlIgnoreCase(std.fs.path.basename(token), wanted);
-    }
-    return false;
-}
-
-fn isPackageInstallCommand(command: []const u8) bool {
-    const managers = [_][]const u8{ "npm", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "cargo", "gem", "bundle", "composer" };
-    const has_manager = commandHasAnyToken(command, &managers) or commandStartsWithAnyToken(command, &managers);
-    return has_manager and commandHasAnyToken(command, &.{ "install", "add", "remove", "update", "upgrade" });
-}
-
-pub fn workspaceResourcesOverlap(left: anytype, right: anytype) bool {
-    for (left) |left_resource| {
-        for (right) |right_resource| {
-            if (std.mem.eql(u8, left_resource, right_resource)) return true;
-        }
-    }
-    return false;
-}
-
-fn workspaceLeaseResourcesEqual(left: anytype, right: anytype) bool {
-    if (left.len != right.len) return false;
-    for (left) |resource| {
-        var found = false;
-        for (right) |candidate| {
-            if (std.mem.eql(u8, resource, candidate)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) return false;
-    }
-    return true;
-}
-
-pub fn appendOwnedString(allocator: std.mem.Allocator, list: *std.ArrayList([]u8), value: []const u8) !void {
-    const owned = try allocator.dupe(u8, value);
-    errdefer allocator.free(owned);
-    try list.append(allocator, owned);
-}
+pub const CommandClass = process_registry.CommandClass;
+pub const classifyWorkspaceCommand = process_registry.classifyWorkspaceCommand;
+pub const inferredWorkspaceResource = process_registry.inferredWorkspaceResource;
+pub const workspaceResourcesOverlap = process_registry.workspaceResourcesOverlap;
+pub const appendOwnedString = process_registry.appendOwnedString;
 
 pub fn pruneExpiredLeases(project: *Project, allocator: std.mem.Allocator, now_ms: i64) void {
-    var index: usize = 0;
-    while (index < project.workspace_leases.items.len) {
-        if (project.workspace_leases.items[index].expires_at_ms > now_ms) {
-            index += 1;
-            continue;
-        }
-        var expired = project.workspace_leases.orderedRemove(index);
-        expired.deinit(allocator);
-    }
+    _ = process_registry.pruneExpiredLeaseList(&project.workspace_leases, allocator, now_ms);
 }
 
 pub fn acquireLease(
@@ -232,72 +132,32 @@ pub fn acquireLease(
 ) !*WorkspaceLease {
     if (owner.len == 0) return error.LeaseOwnerRequired;
     if (resources.len == 0) return error.LeaseResourcesRequired;
-    pruneExpiredLeases(project, allocator, now_ms);
-
-    for (project.workspace_leases.items) |*existing| {
-        if (!std.mem.eql(u8, existing.owner, owner)) continue;
-        if (!workspaceLeaseResourcesEqual(existing.resources.items, resources)) continue;
-        existing.expires_at_ms = now_ms + ttl_ms;
-        if (!std.mem.eql(u8, existing.command, command)) {
-            const replacement = try allocator.dupe(u8, command);
-            allocator.free(existing.command);
-            existing.command = replacement;
-        }
-        return existing;
-    }
-
-    if (!force) {
-        for (project.workspace_leases.items) |existing| {
-            if (std.mem.eql(u8, existing.owner, owner)) continue;
-            if (workspaceResourcesOverlap(existing.resources.items, resources)) return error.LeaseConflict;
-        }
-    }
-
-    var lease: WorkspaceLease = lease: {
-        const id = try std.fmt.allocPrint(allocator, "lease:{d}", .{project.next_workspace_lease_id});
-        errdefer allocator.free(id);
-        const owned_owner = try allocator.dupe(u8, owner);
-        errdefer allocator.free(owned_owner);
-        const owned_command = try allocator.dupe(u8, command);
-        errdefer allocator.free(owned_command);
-        break :lease .{
-            .id = id,
-            .owner = owned_owner,
-            .command = owned_command,
-            .created_at_ms = now_ms,
-            .expires_at_ms = now_ms + ttl_ms,
-        };
-    };
-    project.next_workspace_lease_id += 1;
-    errdefer lease.deinit(allocator);
-    for (resources) |resource| try appendOwnedString(allocator, &lease.resources, resource);
-    try project.workspace_leases.append(allocator, lease);
-    return &project.workspace_leases.items[project.workspace_leases.items.len - 1];
+    const lease_index = try process_registry.acquireLeaseInList(
+        &project.workspace_leases,
+        allocator,
+        owner,
+        command,
+        resources,
+        ttl_ms,
+        force,
+        now_ms,
+        .legacy_decimal,
+        "",
+        &project.next_workspace_lease_id,
+    );
+    return &project.workspace_leases.items[lease_index];
 }
 
 pub fn releaseLease(project: *Project, allocator: std.mem.Allocator, owner: []const u8, lease_id: ?[]const u8, now_ms: i64) usize {
     if (owner.len == 0) return 0;
-    pruneExpiredLeases(project, allocator, now_ms);
-    var released: usize = 0;
-    var index: usize = 0;
-    while (index < project.workspace_leases.items.len) {
-        const existing = &project.workspace_leases.items[index];
-        if (!std.mem.eql(u8, existing.owner, owner) or
-            (lease_id != null and !std.mem.eql(u8, existing.id, lease_id.?)))
-        {
-            index += 1;
-            continue;
-        }
-        var removed = project.workspace_leases.orderedRemove(index);
-        removed.deinit(allocator);
-        released += 1;
-        if (lease_id != null) break;
-    }
-    return released;
+    _ = process_registry.pruneExpiredLeaseList(&project.workspace_leases, allocator, now_ms);
+    return process_registry.releaseLeaseList(&project.workspace_leases, allocator, owner, lease_id);
 }
 
 pub fn releaseLeasesForExactOwner(project: *Project, allocator: std.mem.Allocator, owner: []const u8, now_ms: i64) usize {
-    return releaseLease(project, allocator, owner, null, now_ms);
+    if (owner.len == 0) return 0;
+    _ = process_registry.pruneExpiredLeaseList(&project.workspace_leases, allocator, now_ms);
+    return process_registry.releaseLeasesForExactOwnerList(&project.workspace_leases, allocator, owner);
 }
 
 pub fn ensureCurrentProjectWorkspace(self: anytype) void {
