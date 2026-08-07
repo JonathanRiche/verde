@@ -8,8 +8,8 @@ const protocol = @import("protocol.zig");
 
 /// Methods that must be refused once the daemon has entered its drain phase.
 ///
-/// This is intentionally registry-only for M2. Store mutations are added when
-/// the store dispatcher lands, so undispatched store methods remain unchanged.
+/// S2 dispatches the first two store mutators; the remaining six stay
+/// undispatched (method_not_found) until S3. daemon.storeStatus is a read.
 const MUTATING_METHODS = [_][]const u8{
     // Sessionizer-owned mutations.
     "session.create",
@@ -34,6 +34,9 @@ const MUTATING_METHODS = [_][]const u8{
     "daemon.client.heartbeat",
     "daemon.client.close",
     "daemon.stop",
+    // Store mutations dispatched in S2.
+    "state.snapshot.replace",
+    "workspace.upsert",
 };
 
 /// Return whether a method changes daemon-owned state.
@@ -263,14 +266,18 @@ test "reads and undispatched store methods are not mutators" {
         "daemon.notifications",
         "workspace.resolve",
         "daemon.prepareShutdown",
+        "daemon.storeStatus",
     };
     for (reads) |method| {
         try std.testing.expect(!isMutatingMethod(method));
     }
 
+    // S2-dispatched store mutators must drain with the rest of the mutator set.
+    try std.testing.expect(isMutatingMethod("state.snapshot.replace"));
+    try std.testing.expect(isMutatingMethod("workspace.upsert"));
+
+    // Remaining store mutations stay undispatched until S3.
     const undispatched_store_methods = [_][]const u8{
-        "state.snapshot.replace",
-        "workspace.upsert",
         "chat.thread.upsert",
         "chat.message.append",
         "surface.upsert",
