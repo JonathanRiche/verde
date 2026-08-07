@@ -36,6 +36,122 @@ pub const Mutation = union(enum) {
     chat_completion_clear: store_protocol.NotificationChatCompletionClearRequest,
 };
 
+pub const TERMINAL_PROCESS_OUTCOME_TTL_MS: i64 = 15 * std.time.ms_per_min;
+
+/// Borrowed input shape for the drain-time lease transfer.
+pub const LeaseRecord = struct {
+    workspace_id: []const u8,
+    lease_id: []const u8,
+    owner: []const u8,
+    client_id: []const u8,
+    command: []const u8,
+    resources: []const []const u8,
+    created_at_ms: i64,
+    expires_at_ms: i64,
+    last_renewal_ms: i64,
+};
+
+pub const TerminalProcessOutcomeStatus = enum {
+    completed,
+    failed,
+    cancelled,
+    crashed,
+    unknown,
+};
+
+/// Borrowed input shape mirroring process_registry.TerminalProcessOutcome.
+pub const TerminalProcessOutcome = struct {
+    workspace_id: []const u8,
+    process_id: []const u8,
+    generation: u64,
+    session_id: []const u8,
+    command: []const u8,
+    cwd: []const u8,
+    pid: ?u32,
+    process_group: ?u32,
+    started_at_ms: i64,
+    finished_at_ms: i64,
+    dock_id: u32,
+    pane_id: ?u32,
+    owner_kind: []const u8,
+    owner_title: []const u8,
+    provider: ?[]const u8,
+    status: TerminalProcessOutcomeStatus,
+    exit_code: ?u32,
+    signal: ?u32,
+    cancellation_reason: ?[]const u8,
+};
+
+pub const ImportedLeaseRecord = struct {
+    workspace_id: []u8,
+    lease_id: []u8,
+    owner: []u8,
+    client_id: []u8,
+    command: []u8,
+    resources: std.ArrayListUnmanaged([]u8) = .empty,
+    created_at_ms: i64,
+    expires_at_ms: i64,
+    last_renewal_ms: i64,
+
+    pub fn deinit(self: *ImportedLeaseRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.workspace_id);
+        allocator.free(self.lease_id);
+        allocator.free(self.owner);
+        allocator.free(self.client_id);
+        allocator.free(self.command);
+        for (self.resources.items) |resource| allocator.free(resource);
+        self.resources.deinit(allocator);
+    }
+};
+
+pub const ImportedTerminalProcessOutcome = struct {
+    workspace_id: []u8,
+    process_id: []u8,
+    generation: u64,
+    session_id: []u8,
+    command: []u8,
+    cwd: []u8,
+    pid: ?u32,
+    process_group: ?u32,
+    started_at_ms: i64,
+    finished_at_ms: i64,
+    dock_id: u32,
+    pane_id: ?u32,
+    owner_kind: []u8,
+    owner_title: []u8,
+    provider: ?[]u8,
+    status: TerminalProcessOutcomeStatus,
+    exit_code: ?u32,
+    signal: ?u32,
+    cancellation_reason: ?[]u8,
+
+    pub fn deinit(self: *ImportedTerminalProcessOutcome, allocator: std.mem.Allocator) void {
+        allocator.free(self.workspace_id);
+        allocator.free(self.process_id);
+        allocator.free(self.session_id);
+        allocator.free(self.command);
+        allocator.free(self.cwd);
+        allocator.free(self.owner_kind);
+        allocator.free(self.owner_title);
+        if (self.provider) |value| allocator.free(value);
+        if (self.cancellation_reason) |value| allocator.free(value);
+    }
+};
+
+pub const ImportedLeasesAndOutcomes = struct {
+    leases: std.ArrayListUnmanaged(ImportedLeaseRecord) = .empty,
+    outcomes: std.ArrayListUnmanaged(ImportedTerminalProcessOutcome) = .empty,
+
+    pub fn deinit(self: *ImportedLeasesAndOutcomes, allocator: std.mem.Allocator) void {
+        for (self.leases.items) |*lease| lease.deinit(allocator);
+        self.leases.deinit(allocator);
+        for (self.outcomes.items) |*outcome| outcome.deinit(allocator);
+        self.outcomes.deinit(allocator);
+    }
+};
+
+pub const TransferImport = ImportedLeasesAndOutcomes;
+
 const SNAPSHOT_REPLACE_OPERATION = store_protocol.METHOD_STATE_SNAPSHOT_REPLACE;
 const WORKSPACE_UPSERT_OPERATION = store_protocol.METHOD_WORKSPACE_UPSERT;
 const THREAD_UPSERT_OPERATION = store_protocol.METHOD_CHAT_THREAD_UPSERT;
@@ -186,6 +302,218 @@ pub const Store = struct {
 
     pub fn clearChatCompletion(self: *Self, request: store_protocol.NotificationChatCompletionClearRequest) StoreError!store_protocol.WriteResult {
         return self.applyMutation(.{ .chat_completion_clear = request });
+    }
+
+    /// Replace the drain transfer snapshot in one transaction. The transfer is
+    /// intentionally not a receipt-backed mutation: the old daemon owns this
+    /// call during shutdown, and the successor imports the committed snapshot.
+    pub fn persistLeasesAndOutcomes(
+        self: *Self,
+        leases: []const LeaseRecord,
+        outcomes: []const TerminalProcessOutcome,
+    ) StoreError!store_protocol.WriteResult {
+        const current_revision = self.readStoreRevision() catch |err| return mapStoreError(err);
+        if (leases.len == 0 and outcomes.len == 0) {
+            return .{ .store_revision = current_revision, .applied = false, .duplicate = false };
+        }
+
+        self.conn.execNoArgs("begin immediate") catch |err| return mapStoreError(err);
+        var transaction_open = true;
+        defer if (transaction_open) self.conn.rollback();
+
+        const revision = self.readStoreRevision() catch |err| return mapStoreError(err);
+        const next_revision = std.math.add(u64, revision, 1) catch return error.StoreUnavailable;
+        const next_revision_sql: i64 = std.math.cast(i64, next_revision) orelse return error.StoreUnavailable;
+
+        self.conn.execNoArgs(
+            \\delete from terminal_process_outcomes;
+            \\delete from workspace_leases;
+        ) catch |err| return mapStoreError(err);
+        for (leases) |lease| self.insertLeaseTransfer(lease) catch |err| return mapStoreError(err);
+        for (outcomes) |outcome| self.insertOutcomeTransfer(outcome) catch |err| return mapStoreError(err);
+
+        self.conn.exec(
+            "update store_state set store_revision = ?1 where id = 1",
+            .{next_revision_sql},
+        ) catch |err| return mapStoreError(err);
+        self.conn.commit() catch |err| return mapStoreError(err);
+        transaction_open = false;
+        return .{ .store_revision = next_revision, .applied = true, .duplicate = false };
+    }
+
+    /// Load the committed transfer snapshot and remove expired records. Import
+    /// pruning deliberately does not advance store_revision: the drain commit
+    /// is the single durable revision event observed by the replacement.
+    pub fn importLeasesAndOutcomes(self: *Self, now_ms: i64) StoreError!ImportedLeasesAndOutcomes {
+        var imported: ImportedLeasesAndOutcomes = .{};
+        errdefer imported.deinit(self.allocator);
+
+        self.conn.execNoArgs("begin immediate") catch |err| return mapStoreError(err);
+        var transaction_open = true;
+        defer if (transaction_open) self.conn.rollback();
+
+        const outcome_cutoff = std.math.sub(i64, now_ms, TERMINAL_PROCESS_OUTCOME_TTL_MS) catch std.math.minInt(i64);
+        self.conn.exec(
+            "delete from workspace_leases where expires_at_ms <= ?1",
+            .{now_ms},
+        ) catch |err| return mapStoreError(err);
+        self.conn.exec(
+            "delete from terminal_process_outcomes where finished_at_ms < ?1",
+            .{outcome_cutoff},
+        ) catch |err| return mapStoreError(err);
+
+        var lease_rows = self.conn.rows(
+            "select workspace_id, lease_id, owner, client_id, command, resources_json, created_at_ms, expires_at_ms, last_renewal_ms from workspace_leases where expires_at_ms > ?1 order by workspace_id, lease_id",
+            .{now_ms},
+        ) catch |err| return mapStoreError(err);
+        defer lease_rows.deinit();
+        while (lease_rows.next()) |row| {
+            var lease = copyImportedLease(self.allocator, row) catch |err| return mapStoreError(err);
+            var lease_owned = true;
+            defer if (lease_owned) lease.deinit(self.allocator);
+            imported.leases.append(self.allocator, lease) catch |err| return mapStoreError(err);
+            lease_owned = false;
+        }
+        if (lease_rows.err) |err| return mapStoreError(err);
+
+        var outcome_rows = self.conn.rows(
+            "select workspace_id, process_id, generation, session_id, command, cwd, pid, process_group, started_at_ms, finished_at_ms, dock_id, pane_id, owner_kind, owner_title, provider, status, exit_code, signal, cancellation_reason from terminal_process_outcomes where finished_at_ms >= ?1 order by workspace_id, finished_at_ms, process_id",
+            .{outcome_cutoff},
+        ) catch |err| return mapStoreError(err);
+        defer outcome_rows.deinit();
+        while (outcome_rows.next()) |row| {
+            var outcome = copyImportedOutcome(self.allocator, row) catch |err| return mapStoreError(err);
+            var outcome_owned = true;
+            defer if (outcome_owned) outcome.deinit(self.allocator);
+            imported.outcomes.append(self.allocator, outcome) catch |err| return mapStoreError(err);
+            outcome_owned = false;
+        }
+        if (outcome_rows.err) |err| return mapStoreError(err);
+
+        self.conn.commit() catch |err| return mapStoreError(err);
+        transaction_open = false;
+        return imported;
+    }
+
+    fn insertLeaseTransfer(self: *Self, lease: LeaseRecord) !void {
+        if (lease.workspace_id.len == 0 or lease.lease_id.len == 0 or lease.owner.len == 0 or lease.client_id.len == 0) {
+            return error.InvalidParams;
+        }
+        const resources_json = try store_protocol.encode(self.allocator, lease.resources);
+        defer self.allocator.free(resources_json);
+        try self.conn.exec(
+            "insert into workspace_leases (workspace_id, lease_id, owner, client_id, command, resources_json, created_at_ms, expires_at_ms, last_renewal_ms) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            .{
+                lease.workspace_id,
+                lease.lease_id,
+                lease.owner,
+                lease.client_id,
+                lease.command,
+                resources_json,
+                lease.created_at_ms,
+                lease.expires_at_ms,
+                lease.last_renewal_ms,
+            },
+        );
+    }
+
+    fn insertOutcomeTransfer(self: *Self, outcome: TerminalProcessOutcome) !void {
+        if (outcome.workspace_id.len == 0 or outcome.process_id.len == 0 or outcome.session_id.len == 0) {
+            return error.InvalidParams;
+        }
+        try self.conn.exec(
+            "insert into terminal_process_outcomes (workspace_id, process_id, generation, session_id, command, cwd, pid, process_group, started_at_ms, finished_at_ms, dock_id, pane_id, owner_kind, owner_title, provider, status, exit_code, signal, cancellation_reason) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            .{
+                outcome.workspace_id,
+                outcome.process_id,
+                @as(i64, @intCast(outcome.generation)),
+                outcome.session_id,
+                outcome.command,
+                outcome.cwd,
+                if (outcome.pid) |value| @as(i64, @intCast(value)) else null,
+                if (outcome.process_group) |value| @as(i64, @intCast(value)) else null,
+                outcome.started_at_ms,
+                outcome.finished_at_ms,
+                @as(i64, @intCast(outcome.dock_id)),
+                if (outcome.pane_id) |value| @as(i64, @intCast(value)) else null,
+                outcome.owner_kind,
+                outcome.owner_title,
+                outcome.provider,
+                @tagName(outcome.status),
+                if (outcome.exit_code) |value| @as(i64, @intCast(value)) else null,
+                if (outcome.signal) |value| @as(i64, @intCast(value)) else null,
+                outcome.cancellation_reason,
+            },
+        );
+    }
+
+    fn copyImportedLease(allocator: std.mem.Allocator, row: anytype) !ImportedLeaseRecord {
+        const workspace_id = try allocator.dupe(u8, row.text(0));
+        errdefer allocator.free(workspace_id);
+        const lease_id = try allocator.dupe(u8, row.text(1));
+        errdefer allocator.free(lease_id);
+        const owner = try allocator.dupe(u8, row.text(2));
+        errdefer allocator.free(owner);
+        const client_id = try allocator.dupe(u8, row.text(3));
+        errdefer allocator.free(client_id);
+        const command = try allocator.dupe(u8, row.text(4));
+        errdefer allocator.free(command);
+        var resources = try copyResources(allocator, row.text(5));
+        errdefer freeOwnedResources(allocator, &resources);
+        return .{
+            .workspace_id = workspace_id,
+            .lease_id = lease_id,
+            .owner = owner,
+            .client_id = client_id,
+            .command = command,
+            .resources = resources,
+            .created_at_ms = row.int(6),
+            .expires_at_ms = row.int(7),
+            .last_renewal_ms = row.int(8),
+        };
+    }
+
+    fn copyImportedOutcome(allocator: std.mem.Allocator, row: anytype) !ImportedTerminalProcessOutcome {
+        const workspace_id = try allocator.dupe(u8, row.text(0));
+        errdefer allocator.free(workspace_id);
+        const process_id = try allocator.dupe(u8, row.text(1));
+        errdefer allocator.free(process_id);
+        const session_id = try allocator.dupe(u8, row.text(3));
+        errdefer allocator.free(session_id);
+        const command = try allocator.dupe(u8, row.text(4));
+        errdefer allocator.free(command);
+        const cwd = try allocator.dupe(u8, row.text(5));
+        errdefer allocator.free(cwd);
+        const owner_kind = try allocator.dupe(u8, row.text(12));
+        errdefer allocator.free(owner_kind);
+        const owner_title = try allocator.dupe(u8, row.text(13));
+        errdefer allocator.free(owner_title);
+        const provider = try dupeNullableText(allocator, row.nullableText(14));
+        errdefer if (provider) |value| allocator.free(value);
+        const cancellation_reason = try dupeNullableText(allocator, row.nullableText(18));
+        errdefer if (cancellation_reason) |value| allocator.free(value);
+        const status = try parseOutcomeStatus(row.text(15));
+        return .{
+            .workspace_id = workspace_id,
+            .process_id = process_id,
+            .generation = @intCast(row.int(2)),
+            .session_id = session_id,
+            .command = command,
+            .cwd = cwd,
+            .pid = optionalU32(row.nullableInt(6)),
+            .process_group = optionalU32(row.nullableInt(7)),
+            .started_at_ms = row.int(8),
+            .finished_at_ms = row.int(9),
+            .dock_id = @intCast(row.int(10)),
+            .pane_id = optionalU32(row.nullableInt(11)),
+            .owner_kind = owner_kind,
+            .owner_title = owner_title,
+            .provider = provider,
+            .status = status,
+            .exit_code = optionalU32(row.nullableInt(16)),
+            .signal = optionalU32(row.nullableInt(17)),
+            .cancellation_reason = cancellation_reason,
+        };
     }
 
     fn readStoreRevision(self: *const Self) !u64 {
@@ -968,6 +1296,47 @@ fn mapStoreError(err: anyerror) StoreError {
     return mapSqliteError(err);
 }
 
+fn dupeNullableText(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
+    return if (value) |text| try allocator.dupe(u8, text) else null;
+}
+
+fn optionalU32(value: ?i64) ?u32 {
+    const integer = value orelse return null;
+    if (integer < 0 or integer > std.math.maxInt(u32)) return null;
+    return @intCast(integer);
+}
+
+fn copyResources(allocator: std.mem.Allocator, resources_json: []const u8) !std.ArrayListUnmanaged([]u8) {
+    var parsed = std.json.parseFromSlice([][]const u8, allocator, resources_json, .{
+        .allocate = .alloc_always,
+    }) catch return error.StoreCorrupt;
+    defer parsed.deinit();
+
+    var resources: std.ArrayListUnmanaged([]u8) = .empty;
+    errdefer freeOwnedResources(allocator, &resources);
+    for (parsed.value) |resource| {
+        const owned = try allocator.dupe(u8, resource);
+        resources.append(allocator, owned) catch |err| {
+            allocator.free(owned);
+            return err;
+        };
+    }
+    return resources;
+}
+
+fn freeOwnedResources(allocator: std.mem.Allocator, resources: *std.ArrayListUnmanaged([]u8)) void {
+    for (resources.items) |resource| allocator.free(resource);
+    resources.deinit(allocator);
+    resources.* = .empty;
+}
+
+fn parseOutcomeStatus(value: []const u8) !TerminalProcessOutcomeStatus {
+    inline for (std.meta.fields(TerminalProcessOutcomeStatus)) |field| {
+        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    }
+    return error.StoreCorrupt;
+}
+
 fn mapSqliteError(err: anyerror) StoreError {
     if (err == error.Busy or err == error.Locked or err == error.BusyTimeout or err == error.LockedSharedCache) return error.StoreBusy;
     if (err == error.Corrupt or err == error.NotADB or err == error.CorruptVTab or err == error.CorruptSequence or err == error.CorruptIndex) return error.StoreCorrupt;
@@ -1060,6 +1429,87 @@ fn workspaceLabel(store: *const Store, workspace_id: []const u8) ![]u8 {
     return std.testing.allocator.dupe(u8, row.text(0));
 }
 
+test "lease and terminal outcome transfer is durable, pruned, and one revision" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    const empty = try store.persistLeasesAndOutcomes(&.{}, &.{});
+    try std.testing.expectEqual(@as(u64, 0), empty.store_revision);
+    try std.testing.expect(!empty.applied);
+
+    const resources = [_][]const u8{ "build", "src" };
+    const leases = [_]LeaseRecord{
+        .{
+            .workspace_id = "workspace-transfer",
+            .lease_id = "lease:keep",
+            .owner = "owner-a",
+            .client_id = "client-a",
+            .command = "zig build",
+            .resources = &resources,
+            .created_at_ms = 10,
+            .expires_at_ms = 200,
+            .last_renewal_ms = 100,
+        },
+        .{
+            .workspace_id = "workspace-transfer",
+            .lease_id = "lease:expired",
+            .owner = "owner-b",
+            .client_id = "client-b",
+            .command = "zig test",
+            .resources = &.{"test"},
+            .created_at_ms = 10,
+            .expires_at_ms = 100,
+            .last_renewal_ms = 50,
+        },
+    };
+    const outcomes = [_]TerminalProcessOutcome{.{
+        .workspace_id = "workspace-transfer",
+        .process_id = "term:session-1:1",
+        .generation = 1,
+        .session_id = "session-1",
+        .command = "zig build",
+        .cwd = "/workspace",
+        .pid = 42,
+        .process_group = null,
+        .started_at_ms = 20,
+        .finished_at_ms = 120,
+        .dock_id = 0,
+        .pane_id = null,
+        .owner_kind = "terminal",
+        .owner_title = "Build",
+        .provider = "codex",
+        .status = .failed,
+        .exit_code = 1,
+        .signal = null,
+        .cancellation_reason = "test",
+    }};
+
+    const persisted = try store.persistLeasesAndOutcomes(&leases, &outcomes);
+    try std.testing.expectEqual(@as(u64, 1), persisted.store_revision);
+    try std.testing.expect(persisted.applied);
+    try std.testing.expectEqual(@as(u64, 1), try store.storeRevision());
+
+    var imported = try store.importLeasesAndOutcomes(150);
+    defer imported.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), imported.leases.items.len);
+    try std.testing.expectEqualStrings("lease:keep", imported.leases.items[0].lease_id);
+    try std.testing.expectEqualStrings("owner-a", imported.leases.items[0].owner);
+    try std.testing.expectEqual(@as(i64, 200), imported.leases.items[0].expires_at_ms);
+    try std.testing.expectEqual(@as(usize, 2), imported.leases.items[0].resources.items.len);
+    try std.testing.expectEqualStrings("build", imported.leases.items[0].resources.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), imported.outcomes.items.len);
+    try std.testing.expectEqualStrings("term:session-1:1", imported.outcomes.items[0].process_id);
+    try std.testing.expectEqual(TerminalProcessOutcomeStatus.failed, imported.outcomes.items[0].status);
+    try std.testing.expectEqual(@as(?u32, 42), imported.outcomes.items[0].pid);
+    try std.testing.expectEqualStrings("test", imported.outcomes.items[0].cancellation_reason.?);
+    try std.testing.expectEqual(@as(u64, 1), try store.storeRevision());
+}
+
 test "store commit increments durable revision and survives reopen" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1087,7 +1537,7 @@ test "store commit increments durable revision and survives reopen" {
     try std.testing.expectEqualStrings("First", label);
 }
 
-test "store migrates populated v1 WAL state into the v2 chain" {
+test "store migrates populated v1 WAL state into the v3 chain" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const db_path = try testDbPath(&tmp);
@@ -1104,7 +1554,7 @@ test "store migrates populated v1 WAL state into the v2 chain" {
 
     var store = try Store.init(std.testing.allocator, db_path);
     defer store.deinit();
-    try std.testing.expectEqual(@as(i64, 2), blk: {
+    try std.testing.expectEqual(@as(i64, 3), blk: {
         const row = (try store.conn.row("pragma user_version", .{})).?;
         defer row.deinit();
         break :blk row.int(0);
