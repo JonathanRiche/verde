@@ -13,6 +13,32 @@ pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
 /// Newest headless protocol version this implementation understands.
 pub const MAX_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
 
+/// Inclusive protocol-version range advertised by a client or daemon.
+/// A range is valid only when `min <= max`.
+pub const ProtocolRange = struct {
+    min: u32,
+    max: u32,
+};
+
+/// Validate an advertised inclusive protocol range.
+/// Invalid ranges return `error.InvalidProtocolRange` before compatibility is considered.
+pub fn validateProtocolRange(range: ProtocolRange) !void {
+    if (range.min > range.max) return error.InvalidProtocolRange;
+}
+
+/// Select the highest version in the overlap between two inclusive ranges.
+/// Both ranges are validated first; disjoint valid ranges return the distinct
+/// `error.IncompatibleProtocolVersion` error.
+pub fn negotiateProtocolVersion(client: ProtocolRange, daemon: ProtocolRange) !u32 {
+    try validateProtocolRange(client);
+    try validateProtocolRange(daemon);
+
+    const overlap_min = @max(client.min, daemon.min);
+    const overlap_max = @min(client.max, daemon.max);
+    if (overlap_min > overlap_max) return error.IncompatibleProtocolVersion;
+    return overlap_max;
+}
+
 /// Soft upper bound for a single envelope. Oversized input is rejected as invalid_request.
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
@@ -83,11 +109,10 @@ pub const Request = struct {
     params: std.json.Value = .null,
 };
 
-/// Typed response envelope: exactly one of result or err is meaningful.
+/// Typed response envelope: exactly one of result or err is present.
 ///
-/// `id` is optional so daemon generic internal-error paths that emit
-/// `"id": null` still round-trip through parseResponse (callers receive the
-/// error envelope rather than InvalidRequest).
+/// `id` is null only for uncorrelated daemon error paths. Successful responses
+/// always have a numeric id; request-aware clients must correlate numeric ids.
 pub const Response = struct {
     id: ?u64,
     result: ?std.json.Value = null,
@@ -197,8 +222,9 @@ pub fn parseRequest(allocator: std.mem.Allocator, json_bytes: []const u8) !Parse
     };
 }
 
-/// Parse a response envelope. Unknown fields are ignored; bad/oversized JSON is invalid_request.
-/// Accepts numeric or null `id` so error envelopes with `"id": null` round-trip.
+/// Parse a JSON-RPC 2.0 response envelope. Unknown fields are ignored;
+/// malformed/oversized envelopes are invalid_request. Exactly one of `result`
+/// and `error` must be present. A null id is accepted only for an error envelope.
 pub fn parseResponse(allocator: std.mem.Allocator, json_bytes: []const u8) !ParsedResponse {
     try rejectOversizedOrEmpty(json_bytes);
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{
@@ -209,9 +235,16 @@ pub fn parseResponse(allocator: std.mem.Allocator, json_bytes: []const u8) !Pars
 
     if (parsed.value != .object) return error.InvalidRequest;
     const obj = parsed.value.object;
-    const id = try jsonOptionalU64(obj.get("id") orelse .null);
+    const jsonrpc = jsonString(obj.get("jsonrpc") orelse .null) orelse return error.InvalidRequest;
+    if (!std.mem.eql(u8, jsonrpc, "2.0")) return error.InvalidRequest;
 
-    if (obj.get("error")) |err_value| {
+    const id_value = obj.get("id") orelse return error.InvalidRequest;
+    const result_value = obj.get("result");
+    const error_value = obj.get("error");
+    if ((result_value == null) == (error_value == null)) return error.InvalidRequest;
+
+    if (error_value) |err_value| {
+        const id = try jsonOptionalU64(id_value);
         if (err_value != .object) return error.InvalidRequest;
         const code = jsonString(err_value.object.get("code") orelse .null) orelse return error.InvalidRequest;
         const message = jsonString(err_value.object.get("message") orelse .null) orelse "";
@@ -224,12 +257,12 @@ pub fn parseResponse(allocator: std.mem.Allocator, json_bytes: []const u8) !Pars
         };
     }
 
-    const result = obj.get("result") orelse return error.InvalidRequest;
+    const id = (try jsonOptionalU64(id_value)) orelse return error.InvalidRequest;
     return .{
         .arena_parsed = parsed,
         .response = .{
             .id = id,
-            .result = result,
+            .result = result_value.?,
         },
     };
 }
@@ -326,6 +359,57 @@ test "parseResponse accepts null id on error envelopes" {
     try std.testing.expect(parsed.response.id == null);
     try std.testing.expectEqualStrings("internal_error", parsed.response.err.?.code);
     try std.testing.expectEqualStrings("OutOfMemory", parsed.response.err.?.message);
+}
+
+test "parseResponse rejects null id success envelopes" {
+    try std.testing.expectError(
+        error.InvalidRequest,
+        parseResponse(std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":null,\"result\":{}}"),
+    );
+}
+
+test "parseResponse rejects missing jsonrpc" {
+    try std.testing.expectError(
+        error.InvalidRequest,
+        parseResponse(std.testing.allocator, "{\"id\":1,\"result\":{}}"),
+    );
+}
+
+test "parseResponse rejects envelopes with result and error" {
+    try std.testing.expectError(
+        error.InvalidRequest,
+        parseResponse(
+            std.testing.allocator,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{},\"error\":{\"code\":\"internal\",\"message\":\"nope\"}}",
+        ),
+    );
+}
+
+test "protocol range validation and negotiation" {
+    try std.testing.expectError(
+        error.InvalidProtocolRange,
+        validateProtocolRange(.{ .min = 4, .max = 3 }),
+    );
+    try std.testing.expectError(
+        error.IncompatibleProtocolVersion,
+        negotiateProtocolVersion(.{ .min = 1, .max = 2 }, .{ .min = 3, .max = 4 }),
+    );
+
+    // The client range is newer but overlaps the daemon at version 4.
+    try std.testing.expectEqual(
+        @as(u32, 4),
+        try negotiateProtocolVersion(.{ .min = 3, .max = 5 }, .{ .min = 1, .max = 4 }),
+    );
+    // The daemon range is newer but overlaps the client at version 4.
+    try std.testing.expectEqual(
+        @as(u32, 4),
+        try negotiateProtocolVersion(.{ .min = 1, .max = 4 }, .{ .min = 3, .max = 6 }),
+    );
+    // A boundary-only overlap negotiates that exact version.
+    try std.testing.expectEqual(
+        @as(u32, 3),
+        try negotiateProtocolVersion(.{ .min = 1, .max = 3 }, .{ .min = 3, .max = 5 }),
+    );
 }
 
 test "invalid or empty JSON yields InvalidRequest" {

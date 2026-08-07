@@ -164,3 +164,11 @@ pub const LEGACY_V0_SQL: [:0]const u8 =
     \\    ('workspace-α', 'thread-active', 1700000006000),
     \\    ('workspace-archive', 'thread-workspace-archive', 1700000007000);
 ;
+
+/// The shipped pre-versioning initializer enabled these connection pragmas
+/// before creating the same frozen v0 schema above.
+pub const LEGACY_V0_WAL_SQL: [:0]const u8 =
+    \\pragma foreign_keys = on;
+    \\pragma journal_mode = wal;
+    \\
+++ LEGACY_V0_SQL;

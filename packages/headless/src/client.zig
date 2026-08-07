@@ -14,6 +14,14 @@ pub const Client = struct {
     transport_ctx: ?*anyopaque,
     transport: ?TransportFn,
     next_id: u64 = 1,
+    negotiated_version: ?u32 = null,
+
+    /// Successful `core.status` handshake result. Requests remain wire-compatible;
+    /// the selected protocol version exists only in client state this milestone.
+    pub const HandshakeResult = struct {
+        status: protocol.StatusResult,
+        negotiated_version: u32,
+    };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -52,7 +60,7 @@ pub const Client = struct {
         const response_json = try self.send(request_json);
         defer self.allocator.free(response_json);
 
-        return try protocol.parseResponse(self.allocator, response_json);
+        return try self.parseResponseWithId(id, response_json);
     }
 
     /// Result of a call when the transport adapter must return the original response bytes.
@@ -80,9 +88,11 @@ pub const Client = struct {
 
         const response_json = try self.send(request_json);
         errdefer self.allocator.free(response_json);
+        var parsed = try self.parseResponseWithId(id, response_json);
+        errdefer parsed.deinit();
         return .{
             .response_json = response_json,
-            .parsed = try protocol.parseResponse(self.allocator, response_json),
+            .parsed = parsed,
         };
     }
 
@@ -104,20 +114,70 @@ pub const Client = struct {
         return try protocol.parseResponse(self.allocator, response_json);
     }
 
+    /// Parse and correlate a response with the request that produced it.
+    /// Numeric mismatches return `error.ResponseIdMismatch`; null-id errors are
+    /// uncorrelated daemon failures and remain valid error responses.
+    pub fn parseResponseWithId(self: *Client, request_id: u64, response_json: []const u8) !protocol.ParsedResponse {
+        var parsed = try protocol.parseResponse(self.allocator, response_json);
+        errdefer parsed.deinit();
+        if (parsed.response.id) |response_id| {
+            if (response_id != request_id) return error.ResponseIdMismatch;
+        }
+        return parsed;
+    }
+
+    /// Perform the client-side protocol handshake using the daemon's advertised
+    /// `core.status` range. Call this before normal calls when using `Client` as
+    /// a long-lived connection; no negotiation fields are added to requests.
+    pub fn handshake(self: *Client) !HandshakeResult {
+        const empty_params: struct {} = .{};
+        var parsed = try self.call("core.status", empty_params);
+        defer parsed.deinit();
+        const status = try self.decodeStatus(&parsed);
+        return .{
+            .status = status,
+            .negotiated_version = self.negotiated_version.?,
+        };
+    }
+
+    /// Return the version selected by the most recent successful status or
+    /// capabilities decode. Before a successful handshake this returns
+    /// `error.HandshakeRequired`.
+    pub fn negotiatedProtocolVersion(self: *const Client) !u32 {
+        return self.negotiated_version orelse error.HandshakeRequired;
+    }
+
     /// Decode a successful `core.status` response into its typed result.
     pub fn decodeStatus(self: *Client, parsed: *const protocol.ParsedResponse) !protocol.StatusResult {
         const result = try self.resultValue(parsed);
-        return try std.json.parseFromValueLeaky(protocol.StatusResult, self.allocator, result, .{
+        const status = try std.json.parseFromValueLeaky(protocol.StatusResult, self.allocator, result, .{
             .ignore_unknown_fields = true,
         });
+        _ = try self.recordNegotiatedRange(status.min_supported, status.max_supported);
+        return status;
     }
 
     /// Decode a successful `core.capabilities` response into its typed result.
     pub fn decodeCapabilities(self: *Client, parsed: *const protocol.ParsedResponse) !protocol.CapabilitiesResult {
         const result = try self.resultValue(parsed);
-        return try std.json.parseFromValueLeaky(protocol.CapabilitiesResult, self.allocator, result, .{
+        const capabilities = try std.json.parseFromValueLeaky(protocol.CapabilitiesResult, self.allocator, result, .{
             .ignore_unknown_fields = true,
         });
+        _ = try self.recordNegotiatedRange(capabilities.min_supported, capabilities.max_supported);
+        return capabilities;
+    }
+
+    fn recordNegotiatedRange(self: *Client, daemon_min: u32, daemon_max: u32) !u32 {
+        self.negotiated_version = null;
+        const negotiated_version = try protocol.negotiateProtocolVersion(
+            .{
+                .min = protocol.MIN_SUPPORTED_PROTOCOL_VERSION,
+                .max = protocol.MAX_SUPPORTED_PROTOCOL_VERSION,
+            },
+            .{ .min = daemon_min, .max = daemon_max },
+        );
+        self.negotiated_version = negotiated_version;
+        return negotiated_version;
     }
 
     fn resultValue(_: *Client, parsed: *const protocol.ParsedResponse) !std.json.Value {
@@ -218,6 +278,102 @@ test "client parses error envelope via injected transport" {
 
     try std.testing.expect(!parsed.response.isOk());
     try std.testing.expectEqualStrings(protocol.ERR_UNKNOWN_METHOD, parsed.response.err.?.code);
+}
+
+test "client rejects mismatched response ids in both call paths" {
+    const allocator = std.testing.allocator;
+    const wrong_id_body = try protocol.encodeOkResponse(allocator, 99, .{ .ok = true });
+    defer allocator.free(wrong_id_body);
+
+    var mock: MockTransport = .{
+        .allocator = allocator,
+        .canned_response = wrong_id_body,
+    };
+    defer mock.deinit();
+
+    var client = Client.init(allocator, &mock, MockTransport.send);
+    try std.testing.expectError(error.ResponseIdMismatch, client.callWithId(1, "core.status", .{}));
+    try std.testing.expectError(error.ResponseIdMismatch, client.callAllocWithId(1, "core.status", .{}));
+}
+
+test "client accepts null id error as an uncorrelated failure" {
+    const allocator = std.testing.allocator;
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":\"internal_error\",\"message\":\"OutOfMemory\"}}";
+    var mock: MockTransport = .{
+        .allocator = allocator,
+        .canned_response = body,
+    };
+    defer mock.deinit();
+
+    var client = Client.init(allocator, &mock, MockTransport.send);
+    var parsed = try client.callWithId(7, "core.status", .{});
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.response.isOk());
+    try std.testing.expect(parsed.response.id == null);
+    try std.testing.expectEqualStrings("internal_error", parsed.response.err.?.code);
+}
+
+test "client handshake returns and records negotiated version" {
+    const allocator = std.testing.allocator;
+    const status_body = try protocol.encodeOkResponse(allocator, 1, .{
+        .headless_protocol_version = protocol.HEADLESS_PROTOCOL_VERSION,
+        .min_supported = protocol.MIN_SUPPORTED_PROTOCOL_VERSION,
+        .max_supported = protocol.MAX_SUPPORTED_PROTOCOL_VERSION,
+        .protocol_version = 18,
+        .pid = 4242,
+        .session_count = 0,
+        .chat_turn_count = 0,
+        .capabilities = protocol.Capabilities.phase1(),
+    });
+    defer allocator.free(status_body);
+
+    var mock: MockTransport = .{
+        .allocator = allocator,
+        .canned_response = status_body,
+    };
+    defer mock.deinit();
+
+    var client = Client.init(allocator, &mock, MockTransport.send);
+    try std.testing.expectError(error.HandshakeRequired, client.negotiatedProtocolVersion());
+    const result = try client.handshake();
+    try std.testing.expectEqual(protocol.HEADLESS_PROTOCOL_VERSION, result.negotiated_version);
+    try std.testing.expectEqual(result.negotiated_version, try client.negotiatedProtocolVersion());
+    try std.testing.expectEqual(@as(u32, 4242), result.status.pid);
+}
+
+test "client status decode rejects invalid and incompatible daemon ranges" {
+    const allocator = std.testing.allocator;
+    var client = Client.initEncoder(allocator);
+
+    const invalid_body = try protocol.encodeOkResponse(allocator, 1, .{
+        .headless_protocol_version = 3,
+        .min_supported = 3,
+        .max_supported = 2,
+        .protocol_version = 18,
+        .pid = 1,
+        .session_count = 0,
+        .chat_turn_count = 0,
+        .capabilities = protocol.Capabilities.phase1(),
+    });
+    defer allocator.free(invalid_body);
+    var invalid = try client.parseResponseWithId(1, invalid_body);
+    defer invalid.deinit();
+    try std.testing.expectError(error.InvalidProtocolRange, client.decodeStatus(&invalid));
+
+    const incompatible_body = try protocol.encodeOkResponse(allocator, 2, .{
+        .headless_protocol_version = 3,
+        .min_supported = 2,
+        .max_supported = 3,
+        .protocol_version = 18,
+        .pid = 1,
+        .session_count = 0,
+        .chat_turn_count = 0,
+        .capabilities = protocol.Capabilities.phase1(),
+    });
+    defer allocator.free(incompatible_body);
+    var incompatible = try client.parseResponseWithId(2, incompatible_body);
+    defer incompatible.deinit();
+    try std.testing.expectError(error.IncompatibleProtocolVersion, client.decodeStatus(&incompatible));
 }
 
 test "client encodeRequest assigns monotonic ids" {

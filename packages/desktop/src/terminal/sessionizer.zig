@@ -60,6 +60,8 @@ const REPLACEMENT_WAIT_MS: i64 = 5 * std.time.ms_per_s;
 /// Extra grace after prepareShutdown accepts, independent of the prepare deadline.
 const REPLACEMENT_GONE_GRACE_MS: i64 = 1 * std.time.ms_per_s;
 const REPLACEMENT_POLL_MS: i64 = 50;
+const REPLACEMENT_BIND_WAIT_MS: i64 = 1 * std.time.ms_per_s;
+const LEGACY_TERMINATION_GRACE_MS: i64 = 500;
 const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
     .macos => @bitCast(@as(u32, 0x80087467)),
     .windows => 0,
@@ -309,7 +311,7 @@ pub fn requestAllocMaxResponse(
 /// Sends one daemon request using caller-owned response scratch space.
 ///
 /// The returned response remains allocator-owned.
-pub fn requestAllocUsingBuffer(
+fn requestAllocUsingBufferDirect(
     allocator: std.mem.Allocator,
     pref_path: []const u8,
     method: []const u8,
@@ -330,16 +332,11 @@ pub fn requestAllocUsingBuffer(
     return result.response;
 }
 
-/// Keeps the Unix session-daemon socket open across repeated requests. Older
-/// daemons close after one response; that is detected once and falls back to
-/// the existing one-request connection without changing request semantics.
+/// Compatibility wrapper retaining the old call-site lifetime shape. The
+/// daemon serves one request per connection, so each call deliberately opens
+/// a fresh transport instead of silently retrying a dead reusable stream.
 pub const ReusableRequestConnection = struct {
-    stream: ?std.Io.net.Stream = null,
-    reuse_confirmed: bool = false,
-    reuse_disabled: bool = false,
-
     pub fn deinit(self: *ReusableRequestConnection) void {
-        self.closeStream();
         self.* = .{};
     }
 
@@ -352,74 +349,18 @@ pub const ReusableRequestConnection = struct {
         request_id: u64,
         response_buffer: []u8,
     ) ![]u8 {
-        if (builtin.os.tag == .windows) {
-            const result = try requestWithPeerAlloc(
-                allocator,
-                pref_path,
-                method,
-                params,
-                request_id,
-                response_buffer.len,
-                response_buffer,
-            );
-            return result.response;
-        }
-
-        const request_json = try requestJsonAlloc(allocator, method, params, request_id);
-        defer allocator.free(request_json);
-        if (self.reuse_disabled) {
-            const response = requestJsonOnNewUnixStreamAlloc(allocator, pref_path, request_json, response_buffer) catch |err| {
-                // A daemon replacement should get a fresh capability probe.
-                self.reuse_disabled = false;
-                return err;
-            };
-            return validateResponseAndKeepAlloc(allocator, response);
-        }
-
-        const reused_stream = self.stream != null;
-        if (self.stream == null) self.stream = try connectUnixStream(allocator, pref_path);
-        const response = requestJsonOnUnixStreamAlloc(allocator, self.stream.?, request_json, response_buffer) catch |err| {
-            self.closeStream();
-            switch (reuseFailureAction(reused_stream, self.reuse_confirmed)) {
-                .return_error => return err,
-                .disable_and_retry => {
-                    self.reuse_disabled = true;
-                    const fresh_response = try requestJsonOnNewUnixStreamAlloc(allocator, pref_path, request_json, response_buffer);
-                    return validateResponseAndKeepAlloc(allocator, fresh_response);
-                },
-                .reconnect => {
-                    self.stream = try connectUnixStream(allocator, pref_path);
-                    const reconnected_response = try requestJsonOnUnixStreamAlloc(allocator, self.stream.?, request_json, response_buffer);
-                    return validateResponseAndKeepAlloc(allocator, reconnected_response);
-                },
-            }
-        };
-        if (reused_stream) self.reuse_confirmed = true;
-        return validateResponseAndKeepAlloc(allocator, response);
-    }
-
-    fn closeStream(self: *ReusableRequestConnection) void {
-        if (self.stream) |stream| stream.close(std.Io.Threaded.global_single_threaded.io());
-        self.stream = null;
-        self.reuse_confirmed = false;
+        _ = self;
+        return requestAllocUsingBufferDirect(allocator, pref_path, method, params, request_id, response_buffer);
     }
 };
 
-const ReuseFailureAction = enum {
-    return_error,
-    disable_and_retry,
-    reconnect,
-};
-
-fn reuseFailureAction(reused_stream: bool, reuse_confirmed: bool) ReuseFailureAction {
-    if (!reused_stream) return .return_error;
-    return if (reuse_confirmed) .reconnect else .disable_and_retry;
-}
-
-test "reusable daemon connection distinguishes old servers from dropped confirmed connections" {
-    try std.testing.expectEqual(ReuseFailureAction.return_error, reuseFailureAction(false, false));
-    try std.testing.expectEqual(ReuseFailureAction.disable_and_retry, reuseFailureAction(true, false));
-    try std.testing.expectEqual(ReuseFailureAction.reconnect, reuseFailureAction(true, true));
+test "reusable daemon connection rejects a stale response id" {
+    const allocator = std.testing.allocator;
+    const response = try allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}");
+    try std.testing.expectError(
+        error.ResponseIdMismatch,
+        validateResponseAndKeepAlloc(allocator, response, 8),
+    );
 }
 
 const RequestResult = struct {
@@ -482,14 +423,9 @@ fn requestWithPeerAlloc(
     };
 }
 
-fn requestJsonAlloc(allocator: std.mem.Allocator, method: []const u8, params: anytype, request_id: u64) ![]u8 {
+fn validateResponseAndKeepAlloc(allocator: std.mem.Allocator, response: []u8, request_id: u64) ![]u8 {
     var client = headless.Client.initEncoder(allocator);
-    return try client.encodeRequestWithId(request_id, method, params);
-}
-
-fn validateResponseAndKeepAlloc(allocator: std.mem.Allocator, response: []u8) ![]u8 {
-    var client = headless.Client.initEncoder(allocator);
-    var parsed = client.parseResponse(response) catch |err| {
+    var parsed = client.parseResponseWithId(request_id, response) catch |err| {
         allocator.free(response);
         return err;
     };
@@ -497,26 +433,9 @@ fn validateResponseAndKeepAlloc(allocator: std.mem.Allocator, response: []u8) ![
     return response;
 }
 
-fn connectUnixStream(allocator: std.mem.Allocator, pref_path: []const u8) !std.Io.net.Stream {
-    const socket_path = try socketPath(allocator, pref_path);
-    defer allocator.free(socket_path);
-    return connectUnixStreamAtPath(socket_path);
-}
-
 fn connectUnixStreamAtPath(socket_path: []const u8) !std.Io.net.Stream {
     const address = try std.Io.net.UnixAddress.init(socket_path);
     return address.connect(std.Io.Threaded.global_single_threaded.io());
-}
-
-fn requestJsonOnNewUnixStreamAlloc(
-    allocator: std.mem.Allocator,
-    pref_path: []const u8,
-    request_json: []const u8,
-    response_buffer: []u8,
-) ![]u8 {
-    const stream = try connectUnixStream(allocator, pref_path);
-    defer stream.close(std.Io.Threaded.global_single_threaded.io());
-    return requestJsonOnUnixStreamAlloc(allocator, stream, request_json, response_buffer);
 }
 
 fn requestJsonOnUnixStreamAlloc(
@@ -616,11 +535,13 @@ fn parsePrepareShutdownResult(allocator: std.mem.Allocator, response: []const u8
 pub fn ensureDaemon(allocator: std.mem.Allocator, pref_path: []const u8, exe_path: []const u8) !void {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
+    var replacement_requested = false;
 
     if (requestWithPeerAlloc(allocator, pref_path, "status", .{}, 0, SESSIONIZER_MAX_MESSAGE_BYTES, null)) |result| {
         defer allocator.free(result.response);
         if (parseDaemonStatus(allocator, result.response)) |status| {
             if (status.protocol_version == PROTOCOL_VERSION) return;
+            replacement_requested = true;
             try replaceIncompatibleDaemon(
                 allocator,
                 pref_path,
@@ -631,6 +552,10 @@ pub fn ensureDaemon(allocator: std.mem.Allocator, pref_path: []const u8, exe_pat
         }
     } else |_| {}
 
+    // The old daemon releases its endpoint lock just before the replacement
+    // tries to bind. Probe both lock and pathname briefly so that tiny release
+    // windows do not turn a graceful handoff into a 5-second unavailable retry.
+    if (replacement_requested) try waitForReplacementBindSlot(allocator, pref_path, io);
     try spawnDaemon(allocator, exe_path);
     var attempts: usize = 0;
     var last_probe_error: anyerror = error.NoDaemonStatus;
@@ -674,10 +599,9 @@ fn replaceIncompatibleDaemon(
             defer allocator.free(response);
             if (parsePrepareShutdownResult(allocator, response)) |prepared| {
                 if (prepared.method_missing) {
-                    // Pre-v19: method_not_found. Match historical ensureDaemon —
-                    // terminate when a PID is available and let spawn replace.
-                    // Do not gate on session_count (legacy status counts every shell).
-                    terminateLegacyDaemon(status, authenticated_server_process_id, io);
+                    // Pre-v19: method_not_found. Do not spawn until the old
+                    // listener is gone; status counts every legacy shell.
+                    try terminateLegacyDaemon(allocator, pref_path, status, authenticated_server_process_id, io);
                     return;
                 }
                 saw_method = true;
@@ -705,7 +629,7 @@ fn replaceIncompatibleDaemon(
 
     if (!saw_method) {
         // No prepareShutdown surface observed — treat as legacy terminate+respawn.
-        terminateLegacyDaemon(status, authenticated_server_process_id, io);
+        try terminateLegacyDaemon(allocator, pref_path, status, authenticated_server_process_id, io);
         return;
     }
     log.warn(
@@ -715,18 +639,64 @@ fn replaceIncompatibleDaemon(
     return error.DaemonReplacementBlocked;
 }
 
-/// Historical pre-v19 replacement: SIGTERM/pipe-kill when a PID is known, then
-/// return so ensureDaemon can spawn. Never returns DaemonReplacementBlocked —
-/// callers use bare `try` and must not surface a new error on the legacy path.
+/// Historical pre-v19 replacement: terminate and authenticate that the old
+/// endpoint disappeared before ensureDaemon attempts a new bind.
 fn terminateLegacyDaemon(
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
     status: DaemonStatus,
     authenticated_server_process_id: ?u32,
     io: std.Io,
-) void {
+) !void {
     if (daemonProcessIdForReplacement(builtin.os.tag, status.pid, authenticated_server_process_id)) |pid| {
         terminateDaemonProcess(pid);
-        std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
     }
+    if (waitForDaemonGone(allocator, pref_path, io, nowMs() + LEGACY_TERMINATION_GRACE_MS)) return;
+
+    if (builtin.os.tag != .windows) {
+        if (daemonProcessIdForReplacement(builtin.os.tag, status.pid, authenticated_server_process_id)) |pid| {
+            if (legacyPidStillOwnsEndpoint(allocator, pref_path, pid)) {
+                forceTerminateDaemonProcess(pid);
+                if (waitForDaemonGone(allocator, pref_path, io, nowMs() + REPLACEMENT_GONE_GRACE_MS)) return;
+            } else {
+                log.warn("skipping legacy daemon SIGKILL pid={d}: endpoint pid verification failed", .{pid});
+            }
+        }
+    }
+    return error.LegacyDaemonTerminationTimeout;
+}
+
+fn waitForReplacementBindSlot(allocator: std.mem.Allocator, pref_path: []const u8, io: std.Io) !void {
+    if (builtin.os.tag == .windows) return;
+    const endpoint = try socketPath(allocator, pref_path);
+    defer allocator.free(endpoint);
+    const deadline_ms = nowMs() + REPLACEMENT_BIND_WAIT_MS;
+    while (nowMs() <= deadline_ms) {
+        var guard = platform_ipc.UnixEndpointGuard.acquire(allocator, io, endpoint) catch |err| switch (err) {
+            error.EndpointInUse => {
+                std.Io.sleep(io, .fromMilliseconds(REPLACEMENT_POLL_MS), .awake) catch {};
+                continue;
+            },
+            else => return err,
+        };
+        const reclaim_result = guard.reclaimStaleEndpoint();
+        guard.deinit();
+        reclaim_result catch |err| switch (err) {
+            error.EndpointInUse => {
+                std.Io.sleep(io, .fromMilliseconds(REPLACEMENT_POLL_MS), .awake) catch {};
+                continue;
+            },
+        };
+        return;
+    }
+    return error.SessionDaemonUnavailable;
+}
+
+fn legacyPidStillOwnsEndpoint(allocator: std.mem.Allocator, pref_path: []const u8, expected_pid: usize) bool {
+    const response = requestAlloc(allocator, pref_path, "status", .{}, 0) catch return false;
+    defer allocator.free(response);
+    const status = parseDaemonStatus(allocator, response) orelse return false;
+    return status.pid == expected_pid;
 }
 
 /// Connect-class errors only. A live daemon that returns parse/internal errors
@@ -939,6 +909,14 @@ fn terminateDaemonProcess(pid: usize) void {
         return;
     }
     std.posix.kill(@intCast(pid), std.posix.SIG.TERM) catch {};
+}
+
+fn forceTerminateDaemonProcess(pid: usize) void {
+    if (builtin.os.tag == .windows) {
+        _ = windows_conpty.terminateProcessById(@intCast(pid));
+        return;
+    }
+    std.posix.kill(@intCast(pid), std.posix.SIG.KILL) catch {};
 }
 
 pub const CreateOptions = struct {
@@ -1497,6 +1475,7 @@ const ChatTurn = struct {
     request: send_runner.Request,
     owned_image_paths: []const []const u8,
     mutex: std.atomic.Mutex = .unlocked,
+    worker_thread: ?std.Thread = null,
     events: std.ArrayList(ChatEvent) = .empty,
     next_seq: u64 = 1,
     status: ChatTurnStatus = .running,
@@ -1512,6 +1491,15 @@ const ChatTurn = struct {
     approval_decision: ?ApprovalDecision = null,
 
     fn deinit(self: *ChatTurn, allocator: std.mem.Allocator) void {
+        if (self.worker_thread) |worker_thread| {
+            // Error paths can deinitialize the daemon while a provider worker
+            // still has callbacks into this turn. Cancel and join before any
+            // storage it may dereference is released.
+            lockTurn(self);
+            self.cancel_requested = true;
+            self.mutex.unlock();
+            worker_thread.join();
+        }
         allocator.free(self.turn_id);
         allocator.free(self.workspace_id);
         allocator.free(self.local_thread_id);
@@ -1695,13 +1683,27 @@ pub const Daemon = struct {
             return try errorResponseAlloc(self.allocator, id_value, "invalid_request", "missing method");
         const params = parsed.value.object.get("params") orelse .null;
 
-        return self.handleMethodRequest(id_value, method, params) catch |err| switch (err) {
+        const response = self.handleMethodRequest(id_value, method, params) catch |err| switch (err) {
             error.SessionNotFound => try errorResponseAlloc(self.allocator, id_value, "resource_not_found", "session not found"),
+            error.ResponseTooLarge => try errorResponseAlloc(self.allocator, id_value, "response_too_large", "response exceeds transport limit"),
             else => return err,
         };
+        if (response.len > MAX_RESPONSE_BYTES) {
+            self.allocator.free(response);
+            return try errorResponseAlloc(self.allocator, id_value, "response_too_large", "response exceeds transport limit");
+        }
+        return response;
     }
 
     fn handleMethodRequest(self: *Daemon, id_value: std.json.Value, method: []const u8, params: std.json.Value) ![]u8 {
+        if (!self.accepting_mutations and methodMutatesState(method)) {
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                "invalid_state",
+                "daemon is preparing shutdown and is not accepting mutations",
+            );
+        }
         if (std.mem.eql(u8, method, "session.list")) return try self.listResponse(id_value);
         if (std.mem.eql(u8, method, "session.inspect")) return try self.inspectResponse(id_value, params);
         if (std.mem.eql(u8, method, "session.create")) return try self.createResponse(id_value, params);
@@ -1725,6 +1727,22 @@ pub const Daemon = struct {
         // Additive headless core methods; existing methods and error codes unchanged.
         if (std.mem.startsWith(u8, method, "core.")) return try self.coreResponse(id_value, method, params);
         return try errorResponseAlloc(self.allocator, id_value, "method_not_found", method);
+    }
+
+    fn methodMutatesState(method: []const u8) bool {
+        return std.mem.eql(u8, method, "session.create") or
+            std.mem.eql(u8, method, "session.attach") or
+            std.mem.eql(u8, method, "session.detach") or
+            std.mem.eql(u8, method, "session.write") or
+            std.mem.eql(u8, method, "session.resize") or
+            std.mem.eql(u8, method, "session.kill") or
+            std.mem.eql(u8, method, "session.cleanup") or
+            std.mem.eql(u8, method, "chat.turn.start") or
+            std.mem.eql(u8, method, "chat.turn.approve") or
+            std.mem.eql(u8, method, "chat.turn.cancel") or
+            // Consumption removes daemon-owned state, so allowing it during
+            // drain could invalidate the replacement handoff's view of turns.
+            std.mem.eql(u8, method, "chat.turn.consume");
     }
 
     fn statusResponse(self: *Daemon, id_value: std.json.Value) ![]u8 {
@@ -1859,15 +1877,6 @@ pub const Daemon = struct {
                 existing.last_attached_at_ms = nowMs();
                 return try okSessionResponse(self.allocator, id_value, existing, false);
             }
-        }
-
-        if (!self.accepting_mutations) {
-            return try errorResponseAlloc(
-                self.allocator,
-                id_value,
-                "daemon_draining",
-                "daemon is preparing shutdown and is not accepting new sessions",
-            );
         }
 
         const command = try jsonStringArray(self.allocator, params.object.get("command") orelse .null);
@@ -2074,21 +2083,12 @@ pub const Daemon = struct {
         const turn_id = jsonString(params.object.get("turn_id") orelse .null) orelse return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing turn_id");
         if (self.findChatTurn(turn_id)) |turn| return try okValueResponse(self.allocator, id_value, .{ .turn_id = turn.turn_id, .created = false });
 
-        if (!self.accepting_mutations) {
-            return try errorResponseAlloc(
-                self.allocator,
-                id_value,
-                "daemon_draining",
-                "daemon is preparing shutdown and is not accepting new turns",
-            );
-        }
-
         const turn = try createChatTurnFromParams(self.allocator, params);
         errdefer turn.deinit(self.allocator);
         try self.chat_turns.append(self.allocator, turn);
         errdefer _ = self.chat_turns.pop();
         const thread = try std.Thread.spawn(.{}, chatTurnThread, .{ self.allocator, turn });
-        thread.detach();
+        turn.worker_thread = thread;
         return try okValueResponse(self.allocator, id_value, .{ .turn_id = turn.turn_id, .created = true });
     }
 
@@ -2122,11 +2122,12 @@ pub const Daemon = struct {
         const turn = self.findChatTurn(jsonString(params.object.get("turn_id") orelse .null) orelse return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing turn_id")) orelse
             return try errorResponseAlloc(self.allocator, id_value, "not_found", "turn not found");
         const after_seq = jsonUsize(params.object.get("after_seq") orelse .null) orelse 0;
+        lockTurn(turn);
+        defer turn.mutex.unlock();
+        if (chatTailUpperBound(turn, @intCast(after_seq)) > MAX_RESPONSE_BYTES) return error.ResponseTooLarge;
         var writer: std.Io.Writer.Allocating = .init(self.allocator);
         errdefer writer.deinit();
         var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
-        lockTurn(turn);
-        defer turn.mutex.unlock();
         try beginOk(&s, id_value);
         try s.objectField("result");
         try writeChatTurnTail(&s, turn, @intCast(after_seq));
@@ -2199,84 +2200,39 @@ pub fn runDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
 }
 
 fn runUnixDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
-    var setup_threaded = std.Io.Threaded.init_single_threaded;
-    try std.Io.Dir.cwd().createDirPath(setup_threaded.io(), pref_path);
-    const socket_path = try socketPath(allocator, pref_path);
-    defer allocator.free(socket_path);
-    const pid_path = try pidFilePath(allocator, pref_path);
-    defer allocator.free(pid_path);
-
-    var threaded = std.Io.Threaded.init_single_threaded;
-    const io = threaded.io();
-    // Mirror platform/ipc.zig serve: never unlink a live endpoint. A second
-    // daemon must fail distinctly rather than steal hooks still bound to the
-    // old pathname.
-    if (sessionizerEndpointIsLive(io, socket_path)) return error.EndpointInUse;
-    deleteSocketPath(socket_path);
-    try writePidFile(pid_path);
-    defer deleteSocketPath(socket_path);
-    defer {
-        var cleanup_threaded = std.Io.Threaded.init_single_threaded;
-        deleteFilePath(cleanup_threaded.io(), pid_path);
-    }
-
-    const address = try std.Io.net.UnixAddress.init(socket_path);
-    var listener = try address.listen(io, .{});
-    defer listener.deinit(io);
-
-    var daemon = Daemon.init(allocator);
-    defer daemon.deinit();
-    const drain_thread = try std.Thread.spawn(.{}, drainSessionsThread, .{DrainThreadContext{
-        .daemon = &daemon,
-        .socket_path = socket_path,
-        .pid_path = pid_path,
-    }});
-    drain_thread.detach();
-
-    // Accept loop runs until the drain thread process.exit's after idle/upgrade.
-    while (true) {
-        const stream = listener.accept(io) catch |err| switch (err) {
-            error.ConnectionAborted => continue,
-            else => return err,
-        };
-        const client_thread = std.Thread.spawn(.{}, handleClientThread, .{ &daemon, stream }) catch |err| {
-            log.warn("failed to start session daemon client worker: {s}", .{@errorName(err)});
-            handleClient(&daemon, io, stream);
-            continue;
-        };
-        client_thread.detach();
-    }
+    return runSessionizerServer(allocator, pref_path);
 }
 
 fn runWindowsDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
+    return runSessionizerServer(allocator, pref_path);
+}
+
+fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8) !void {
     var setup_threaded = std.Io.Threaded.init_single_threaded;
     try std.Io.Dir.cwd().createDirPath(setup_threaded.io(), pref_path);
     const endpoint = try socketPath(allocator, pref_path);
     defer allocator.free(endpoint);
     const pid_path = try pidFilePath(allocator, pref_path);
     defer allocator.free(pid_path);
-    try writePidFile(pid_path);
-    defer {
-        var cleanup_threaded = std.Io.Threaded.init_single_threaded;
-        deleteFilePath(cleanup_threaded.io(), pid_path);
-    }
 
     var daemon = Daemon.init(allocator);
     defer daemon.deinit();
-    const drain_thread = try std.Thread.spawn(.{}, drainSessionsThread, .{DrainThreadContext{
+    var stop_requested = std.atomic.Value(bool).init(false);
+    var server_context: SessionizerServerContext = .{
         .daemon = &daemon,
-        .socket_path = endpoint,
+        .endpoint = endpoint,
         .pid_path = pid_path,
-    }});
-    drain_thread.detach();
+        .stop_requested = &stop_requested,
+    };
+    defer finishSessionizerServer(&server_context);
 
-    // platform_ipc.serve returns EndpointInUse when the named pipe is busy
-    // (FIRST_PIPE_INSTANCE), matching the Unix live-endpoint guard above.
-    var server_context: SessionizerServerContext = .{ .daemon = &daemon };
+    // The readiness callback runs only after Unix bind or Windows pipe
+    // ownership succeeds, so no lifetime worker can outlive a failed bind.
     try platform_ipc.serve(allocator, endpoint, .{
         .context = &server_context,
         .should_stop = sessionizerServerShouldStop,
         .handle_request = handleSessionizerServerRequest,
+        .on_ready = sessionizerServerReady,
     }, .{
         .max_message_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
         .max_response_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
@@ -2286,10 +2242,27 @@ fn runWindowsDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
 
 const SessionizerServerContext = struct {
     daemon: *Daemon,
+    endpoint: []const u8,
+    pid_path: []const u8,
+    stop_requested: *std.atomic.Value(bool),
+    drain_thread: ?std.Thread = null,
+    pid_published: bool = false,
 };
+
+fn sessionizerServerReady(raw_context: *anyopaque) !void {
+    const context: *SessionizerServerContext = @ptrCast(@alignCast(raw_context));
+    try writePidFile(context.pid_path);
+    context.pid_published = true;
+    context.drain_thread = try std.Thread.spawn(.{}, drainSessionsThread, .{DrainThreadContext{
+        .daemon = context.daemon,
+        .endpoint = context.endpoint,
+        .stop_requested = context.stop_requested,
+    }});
+}
 
 fn sessionizerServerShouldStop(raw_context: *anyopaque) bool {
     const context: *SessionizerServerContext = @ptrCast(@alignCast(raw_context));
+    if (context.stop_requested.load(.acquire)) return true;
     const daemon = context.daemon;
     lockDaemon(daemon);
     defer daemon.mutex.unlock();
@@ -2299,7 +2272,8 @@ fn sessionizerServerShouldStop(raw_context: *anyopaque) bool {
 /// True when a peer can still complete a connection to `endpoint`.
 /// Used to refuse binding over a live daemon (Unix) instead of unlinking first.
 /// Windows named-pipe busy is reported as `error.EndpointInUse` from
-/// `platform_ipc.serve` (FIRST_PIPE_INSTANCE); this probe is Unix-oriented.
+/// `platform_ipc.serve` (FIRST_PIPE_INSTANCE); this probe is retained for
+/// endpoint classification tests and is Unix-oriented.
 fn sessionizerEndpointIsLive(io: std.Io, endpoint: []const u8) bool {
     if (builtin.os.tag == .windows) return false;
     return platform_ipc.unixEndpointAcceptsConnections(io, endpoint);
@@ -2337,65 +2311,43 @@ fn handleSessionizerServerRequest(raw_context: *anyopaque, request: []u8) anyerr
 
 const DrainThreadContext = struct {
     daemon: *Daemon,
-    socket_path: []const u8,
-    pid_path: []const u8,
+    endpoint: []const u8,
+    stop_requested: *std.atomic.Value(bool),
 };
 
 fn drainSessionsThread(context: DrainThreadContext) void {
-    while (true) {
+    while (!context.stop_requested.load(.acquire)) {
         const daemon = context.daemon;
         lockDaemon(daemon);
         daemon.pollSessions();
         const should_exit = daemon.shouldExitForIdle();
         daemon.mutex.unlock();
         if (should_exit) {
-            deleteSocketPath(context.socket_path);
-            var cleanup_threaded = std.Io.Threaded.init_single_threaded;
-            deleteFilePath(cleanup_threaded.io(), context.pid_path);
+            context.stop_requested.store(true, .release);
+            platform_ipc.wake(daemon.allocator, context.endpoint, .{
+                .max_message_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
+                .max_response_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
+                .timeout_ms = SESSIONIZER_REQUEST_TIMEOUT_MS,
+            });
             harness.shutdownOwnedProviderProcesses();
-            std.process.exit(0);
+            return;
         }
         sleepMs(20);
     }
 }
 
-fn handleClientThread(daemon: *Daemon, stream: std.Io.net.Stream) void {
-    var threaded = std.Io.Threaded.init_single_threaded;
-    handleClient(daemon, threaded.io(), stream);
-}
-
-fn handleClient(daemon: *Daemon, io: std.Io, stream: std.Io.net.Stream) void {
-    defer stream.close(io);
-    var read_buffer: [64 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &read_buffer);
-    var write_buffer: [64 * 1024]u8 = undefined;
-    var writer = stream.writer(io, &write_buffer);
-    while (true) {
-        const line = reader.interface.takeDelimiter('\n') catch return orelse return;
-
-        var locked = true;
-        lockDaemon(daemon);
-        const response_json = daemon.handleRequest(std.mem.trim(u8, line, "\r")) catch |err| blk: {
-            daemon.mutex.unlock();
-            locked = false;
-            break :blk errorResponseAlloc(daemon.allocator, .null, "internal_error", @errorName(err)) catch return;
-        };
-        if (locked) daemon.mutex.unlock();
-
-        writer.interface.writeAll(response_json) catch {
-            daemon.allocator.free(response_json);
-            return;
-        };
-        writer.interface.writeByte('\n') catch {
-            daemon.allocator.free(response_json);
-            return;
-        };
-        writer.interface.flush() catch {
-            daemon.allocator.free(response_json);
-            return;
-        };
-        daemon.allocator.free(response_json);
+fn finishSessionizerServer(context: *SessionizerServerContext) void {
+    context.stop_requested.store(true, .release);
+    if (context.drain_thread != null) {
+        platform_ipc.wake(context.daemon.allocator, context.endpoint, .{
+            .max_message_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
+            .max_response_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
+            .timeout_ms = SESSIONIZER_REQUEST_TIMEOUT_MS,
+        });
+        context.drain_thread.?.join();
+        context.drain_thread = null;
     }
+    if (context.pid_published) deletePidFileIfOwned(context.pid_path);
 }
 
 fn lockDaemon(daemon: *Daemon) void {
@@ -2579,6 +2531,37 @@ fn writeChatTurnTail(s: *std.json.Stringify, turn: *const ChatTurn, after_seq: u
     try s.objectField("pending_approval");
     try writePendingApproval(s, turn.pending_approval);
     try s.endObject();
+}
+
+fn chatTailUpperBound(turn: *const ChatTurn, after_seq: u64) usize {
+    var total: usize = 4096;
+    for (turn.events.items) |event| {
+        if (event.seq <= after_seq) continue;
+        total = saturatedAdd(total, 96);
+        total = saturatedAdd(total, jsonStringUpperBound(event.kind.len));
+        total = saturatedAdd(total, jsonStringUpperBound(event.payload_json.len));
+    }
+    if (turn.provider_thread_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
+    if (turn.active_turn_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
+    if (turn.result_reply_text) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
+    if (turn.error_message) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
+    if (turn.pending_approval) |approval| {
+        total = saturatedAdd(total, 96);
+        total = saturatedAdd(total, jsonStringUpperBound(approval.call_id.len));
+        total = saturatedAdd(total, jsonStringUpperBound(approval.title.len));
+        total = saturatedAdd(total, jsonStringUpperBound(approval.body.len));
+    }
+    return total;
+}
+
+fn jsonStringUpperBound(byte_len: usize) usize {
+    // This is only a cheap allocation guard; the exact serialized length
+    // check after writing the response is authoritative for the 8 MiB limit.
+    return saturatedAdd(2, byte_len);
+}
+
+fn saturatedAdd(left: usize, right: usize) usize {
+    return std.math.add(usize, left, right) catch std.math.maxInt(usize);
 }
 
 fn writePendingApproval(s: *std.json.Stringify, pending: ?PendingApproval) !void {
@@ -3230,6 +3213,17 @@ fn writePidFile(path: []const u8) !void {
     try writer.interface.flush();
 }
 
+fn deletePidFileIfOwned(path: []const u8) void {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, std.heap.page_allocator, .limited(64)) catch return;
+    defer std.heap.page_allocator.free(bytes);
+    const text = std.mem.trim(u8, bytes, " \t\r\n");
+    const pid = std.fmt.parseInt(usize, text, 10) catch return;
+    if (pid != platform_runtime.processId()) return;
+    deleteFilePath(io, path);
+}
+
 fn deleteSocketPath(path: []const u8) void {
     if (builtin.os.tag == .windows) return;
     var threaded = std.Io.Threaded.init_single_threaded;
@@ -3631,6 +3625,41 @@ test "prepareShutdown preserves unconsumed completed turns" {
     try std.testing.expect(daemon.shutdown_requested);
     try std.testing.expect(!daemon.accepting_mutations);
     try std.testing.expect(daemon.shouldExitForIdle());
+}
+
+test "draining dispatcher rejects every state mutator" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    daemon.accepting_mutations = false;
+
+    const methods = [_][]const u8{
+        "session.create",
+        "session.attach",
+        "session.detach",
+        "session.write",
+        "session.resize",
+        "session.kill",
+        "session.cleanup",
+        "chat.turn.start",
+        "chat.turn.approve",
+        "chat.turn.cancel",
+        "chat.turn.consume",
+    };
+    for (methods, 0..) |method, index| {
+        const request = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":{{}}}}",
+            .{ index, method },
+        );
+        defer allocator.free(request);
+        const response = try daemon.handleRequest(request);
+        defer allocator.free(response);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+        defer parsed.deinit();
+        const error_value = parsed.value.object.get("error").?.object;
+        try std.testing.expectEqualStrings("invalid_state", jsonString(error_value.get("code").?).?);
+    }
 }
 
 test "idle exit is disabled by default and honors override" {

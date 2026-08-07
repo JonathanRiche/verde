@@ -55,7 +55,7 @@ pub fn main(init: std.process.Init) !void {
                     }
                 }
             }
-            installItDaemonCleanupGuards(parent_pid);
+            installItDaemonCleanupGuards(parent_pid, pref_path);
             try sessionizer.runDaemon(allocator, pref_path);
             return;
         }
@@ -198,38 +198,92 @@ fn currentEnviron() std.process.Environ {
 
 /// Ensure IT daemon children do not outlive a crashed parent.
 ///
-/// Linux: PR_SET_PDEATHSIG delivers SIGTERM when the parent dies (covers
-/// panic/abort where parent defers never run). Portable fallback: a poll
-/// thread watches `--parent-pid` via kill(pid, 0) and process.exit's when gone.
+/// A poll thread watches `--parent-pid` via kill(pid, 0). It deliberately owns
+/// parent-death handling on every Unix so Linux does not take an unclean
+/// PDEATHSIG exit before the watcher can terminate PTYs and remove IT files.
 /// Empty-daemon idle exit remains a separate env override (see lifecycle tests).
-fn installItDaemonCleanupGuards(parent_pid: ?std.posix.pid_t) void {
-    if (builtin.os.tag == .linux) {
-        // Race: parent may die between fork and prctl; check after arming.
-        _ = std.posix.prctl(.SET_PDEATHSIG, .{@as(usize, @intFromEnum(std.posix.SIG.TERM))}) catch {};
-        // Parent may have already died between spawn and prctl; reparented to init.
-        if (std.posix.getppid() == 1) {
-            std.process.exit(0);
-        }
-    }
+fn installItDaemonCleanupGuards(parent_pid: ?std.posix.pid_t, pref_path: []const u8) void {
     if (comptime builtin.os.tag != .windows) {
         if (parent_pid) |pid| {
-            const thread = std.Thread.spawn(.{}, parentDeathWatchThread, .{pid}) catch return;
+            const thread = std.Thread.spawn(.{}, parentDeathWatchThread, .{ pid, pref_path }) catch return;
             thread.detach();
         }
     }
 }
 
-fn parentDeathWatchThread(parent_pid: std.posix.pid_t) void {
+fn parentDeathWatchThread(parent_pid: std.posix.pid_t, pref_path: []const u8) void {
     if (comptime builtin.os.tag == .windows) return;
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
     while (true) {
         // Signal 0 only checks liveness (portable parent-death fallback).
-        std.posix.kill(parent_pid, @enumFromInt(0)) catch {
-            // Parent is gone (or not killable): exit so orphan PTYs die with us.
-            std.process.exit(0);
+        std.posix.kill(parent_pid, @enumFromInt(0)) catch |err| switch (err) {
+            error.ProcessNotFound => {
+                cleanupAfterItParentDeath(pref_path, io);
+                std.process.exit(1);
+            },
+            // EPERM and unexpected/transient failures do not prove death.
+            else => {},
         };
         std.Io.sleep(io, .fromMilliseconds(200), .awake) catch {};
+    }
+}
+
+/// Bound orphan cleanup so a broken daemon endpoint cannot stall the watcher.
+fn cleanupAfterItParentDeath(pref_path: []const u8, io: std.Io) void {
+    const allocator = std.heap.page_allocator;
+    var attempts: usize = 0;
+    while (attempts < 25) : (attempts += 1) {
+        const response = sessionizer.requestAlloc(allocator, pref_path, "session.list", .{}, 90) catch break;
+        defer allocator.free(response);
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch break;
+        defer parsed.deinit();
+
+        const result = if (parsed.value == .object)
+            parsed.value.object.get("result") orelse break
+        else
+            break;
+        const sessions = if (result == .object)
+            result.object.get("sessions") orelse break
+        else
+            break;
+        if (sessions != .array or sessions.array.items.len == 0) break;
+
+        for (sessions.array.items) |session| {
+            if (session != .object) continue;
+            const id_value = session.object.get("id") orelse continue;
+            if (id_value != .string) continue;
+            const kill_response = sessionizer.requestAlloc(
+                allocator,
+                pref_path,
+                "session.kill",
+                .{ .id = id_value.string },
+                91,
+            ) catch continue;
+            allocator.free(kill_response);
+        }
+        const cleanup_response = sessionizer.requestAlloc(allocator, pref_path, "session.cleanup", .{}, 92) catch null;
+        if (cleanup_response) |owned| allocator.free(owned);
+        std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+    }
+
+    const socket_path = sessionizer.socketPath(allocator, pref_path) catch null;
+    if (socket_path) |path| {
+        deleteItPath(io, path);
+        allocator.free(path);
+    }
+    const pid_path = sessionizer.pidFilePath(allocator, pref_path) catch null;
+    if (pid_path) |path| {
+        deleteItPath(io, path);
+        allocator.free(path);
+    }
+}
+
+fn deleteItPath(io: std.Io, path: []const u8) void {
+    if (std.fs.path.isAbsolute(path)) {
+        std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    } else {
+        std.Io.Dir.cwd().deleteFile(io, path) catch {};
     }
 }
 
@@ -548,7 +602,7 @@ fn runLifecycleGracefulReplace(allocator: std.mem.Allocator, io: std.Io) !void {
         return error.PrepareShouldRequestShutdown;
     }
 
-    // Daemon must exit after accepted prepare (drain thread process.exit).
+    // Daemon must exit after accepted prepare through the joined drain path.
     var exited = false;
     var attempts: usize = 0;
     while (attempts < 100) : (attempts += 1) {

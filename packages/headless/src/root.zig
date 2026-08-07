@@ -12,6 +12,7 @@ pub const client = @import("client.zig");
 pub const HEADLESS_PROTOCOL_VERSION = protocol.HEADLESS_PROTOCOL_VERSION;
 pub const MIN_SUPPORTED_PROTOCOL_VERSION = protocol.MIN_SUPPORTED_PROTOCOL_VERSION;
 pub const MAX_SUPPORTED_PROTOCOL_VERSION = protocol.MAX_SUPPORTED_PROTOCOL_VERSION;
+pub const ProtocolRange = protocol.ProtocolRange;
 
 pub const Error = protocol.Error;
 pub const Capabilities = protocol.Capabilities;
@@ -27,6 +28,8 @@ pub const encodeOkResponse = protocol.encodeOkResponse;
 pub const encodeErrorResponse = protocol.encodeErrorResponse;
 pub const parseRequest = protocol.parseRequest;
 pub const parseResponse = protocol.parseResponse;
+pub const validateProtocolRange = protocol.validateProtocolRange;
+pub const negotiateProtocolVersion = protocol.negotiateProtocolVersion;
 
 pub const Context = dispatch.Context;
 pub const DispatchResponse = dispatch.Response;
