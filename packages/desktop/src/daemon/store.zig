@@ -211,8 +211,6 @@ pub const ImportedLeasesAndOutcomes = struct {
     }
 };
 
-pub const TransferImport = ImportedLeasesAndOutcomes;
-
 const SNAPSHOT_REPLACE_OPERATION = store_protocol.METHOD_STATE_SNAPSHOT_REPLACE;
 const WORKSPACE_UPSERT_OPERATION = store_protocol.METHOD_WORKSPACE_UPSERT;
 const THREAD_UPSERT_OPERATION = store_protocol.METHOD_CHAT_THREAD_UPSERT;
@@ -423,19 +421,16 @@ pub const Store = struct {
         return result;
     }
 
-    /// Replace the drain transfer snapshot in one transaction. The transfer is
-    /// intentionally not a receipt-backed mutation: the old daemon owns this
+    /// Replace the drain transfer snapshot in one transaction. An empty set is
+    /// still a real snapshot: both transfer tables are cleared and store_revision
+    /// advances exactly once so a successor never resurrects a stale predecessor.
+    /// The transfer is intentionally not receipt-backed: the old daemon owns this
     /// call during shutdown, and the successor imports the committed snapshot.
     pub fn persistLeasesAndOutcomes(
         self: *Self,
         leases: []const LeaseRecord,
         outcomes: []const TerminalProcessOutcome,
     ) StoreError!store_protocol.WriteResult {
-        const current_revision = self.readStoreRevision() catch |err| return mapStoreError(err);
-        if (leases.len == 0 and outcomes.len == 0) {
-            return .{ .store_revision = current_revision, .applied = false, .duplicate = false };
-        }
-
         self.conn.execNoArgs("begin immediate") catch |err| return mapStoreError(err);
         var transaction_open = true;
         defer if (transaction_open) self.conn.rollback();
@@ -615,22 +610,22 @@ pub const Store = struct {
         return .{
             .workspace_id = workspace_id,
             .process_id = process_id,
-            .generation = @intCast(row.int(2)),
+            .generation = try requiredU64(row.int(2)),
             .session_id = session_id,
             .command = command,
             .cwd = cwd,
-            .pid = optionalU32(row.nullableInt(6)),
-            .process_group = optionalU32(row.nullableInt(7)),
+            .pid = try optionalU32(row.nullableInt(6)),
+            .process_group = try optionalU32(row.nullableInt(7)),
             .started_at_ms = row.int(8),
             .finished_at_ms = row.int(9),
-            .dock_id = @intCast(row.int(10)),
-            .pane_id = optionalU32(row.nullableInt(11)),
+            .dock_id = try requiredU32(row.int(10)),
+            .pane_id = try optionalU32(row.nullableInt(11)),
             .owner_kind = owner_kind,
             .owner_title = owner_title,
             .provider = provider,
             .status = status,
-            .exit_code = optionalU32(row.nullableInt(16)),
-            .signal = optionalU32(row.nullableInt(17)),
+            .exit_code = try optionalU32(row.nullableInt(16)),
+            .signal = try optionalU32(row.nullableInt(17)),
             .cancellation_reason = cancellation_reason,
         };
     }
@@ -1494,10 +1489,20 @@ fn dupeNullableText(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
     return if (value) |text| try allocator.dupe(u8, text) else null;
 }
 
-fn optionalU32(value: ?i64) ?u32 {
+fn optionalU32(value: ?i64) !?u32 {
     const integer = value orelse return null;
-    if (integer < 0 or integer > std.math.maxInt(u32)) return null;
+    if (integer < 0 or integer > std.math.maxInt(u32)) return error.StoreCorrupt;
     return @intCast(integer);
+}
+
+fn requiredU32(value: i64) !u32 {
+    if (value < 0 or value > std.math.maxInt(u32)) return error.StoreCorrupt;
+    return @intCast(value);
+}
+
+fn requiredU64(value: i64) !u64 {
+    if (value < 0) return error.StoreCorrupt;
+    return @intCast(value);
 }
 
 fn copyResources(allocator: std.mem.Allocator, resources_json: []const u8) !std.ArrayListUnmanaged([]u8) {
@@ -1632,9 +1637,13 @@ test "lease and terminal outcome transfer is durable, pruned, and one revision" 
     var store = try Store.init(std.testing.allocator, db_path);
     defer store.deinit();
 
+    // Empty transfer is a real snapshot: clears tables and bumps once.
     const empty = try store.persistLeasesAndOutcomes(&.{}, &.{});
-    try std.testing.expectEqual(@as(u64, 0), empty.store_revision);
-    try std.testing.expect(!empty.applied);
+    try std.testing.expectEqual(@as(u64, 1), empty.store_revision);
+    try std.testing.expect(empty.applied);
+    try std.testing.expectEqual(@as(u64, 1), try store.storeRevision());
+    try std.testing.expectEqual(@as(i64, 0), try transferLeaseCount(&store));
+    try std.testing.expectEqual(@as(i64, 0), try transferOutcomeCount(&store));
 
     const resources = [_][]const u8{ "build", "src" };
     const leases = [_]LeaseRecord{
@@ -1648,6 +1657,18 @@ test "lease and terminal outcome transfer is durable, pruned, and one revision" 
             .created_at_ms = 10,
             .expires_at_ms = 200,
             .last_renewal_ms = 100,
+        },
+        .{
+            .workspace_id = "workspace-transfer",
+            .lease_id = "lease:boundary",
+            .owner = "owner-boundary",
+            .client_id = "client-boundary",
+            .command = "zig fmt",
+            .resources = &.{"fmt"},
+            .created_at_ms = 11,
+            // expires == now is expired on both delete and select sides.
+            .expires_at_ms = 150,
+            .last_renewal_ms = 60,
         },
         .{
             .workspace_id = "workspace-transfer",
@@ -1684,16 +1705,22 @@ test "lease and terminal outcome transfer is durable, pruned, and one revision" 
     }};
 
     const persisted = try store.persistLeasesAndOutcomes(&leases, &outcomes);
-    try std.testing.expectEqual(@as(u64, 1), persisted.store_revision);
+    try std.testing.expectEqual(@as(u64, 2), persisted.store_revision);
     try std.testing.expect(persisted.applied);
-    try std.testing.expectEqual(@as(u64, 1), try store.storeRevision());
+    try std.testing.expectEqual(@as(u64, 2), try store.storeRevision());
+    try std.testing.expectEqual(@as(i64, 3), try transferLeaseCount(&store));
+    try std.testing.expectEqual(@as(i64, 1), try transferOutcomeCount(&store));
 
     var imported = try store.importLeasesAndOutcomes(150);
     defer imported.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), imported.leases.items.len);
     try std.testing.expectEqualStrings("lease:keep", imported.leases.items[0].lease_id);
     try std.testing.expectEqualStrings("owner-a", imported.leases.items[0].owner);
+    try std.testing.expectEqualStrings("client-a", imported.leases.items[0].client_id);
+    try std.testing.expectEqualStrings("zig build", imported.leases.items[0].command);
+    try std.testing.expectEqual(@as(i64, 10), imported.leases.items[0].created_at_ms);
     try std.testing.expectEqual(@as(i64, 200), imported.leases.items[0].expires_at_ms);
+    try std.testing.expectEqual(@as(i64, 100), imported.leases.items[0].last_renewal_ms);
     try std.testing.expectEqual(@as(usize, 2), imported.leases.items[0].resources.items.len);
     try std.testing.expectEqualStrings("build", imported.leases.items[0].resources.items[0]);
     try std.testing.expectEqual(@as(usize, 1), imported.outcomes.items.len);
@@ -1701,7 +1728,87 @@ test "lease and terminal outcome transfer is durable, pruned, and one revision" 
     try std.testing.expectEqual(TerminalProcessOutcomeStatus.failed, imported.outcomes.items[0].status);
     try std.testing.expectEqual(@as(?u32, 42), imported.outcomes.items[0].pid);
     try std.testing.expectEqualStrings("test", imported.outcomes.items[0].cancellation_reason.?);
-    try std.testing.expectEqual(@as(u64, 1), try store.storeRevision());
+    // Import prunes only; it does not bump revision.
+    try std.testing.expectEqual(@as(u64, 2), try store.storeRevision());
+
+    // Empty drain over a stale non-empty snapshot clears transfer rows and bumps once.
+    const cleared = try store.persistLeasesAndOutcomes(&.{}, &.{});
+    try std.testing.expectEqual(@as(u64, 3), cleared.store_revision);
+    try std.testing.expect(cleared.applied);
+    try std.testing.expectEqual(@as(u64, 3), try store.storeRevision());
+    try std.testing.expectEqual(@as(i64, 0), try transferLeaseCount(&store));
+    try std.testing.expectEqual(@as(i64, 0), try transferOutcomeCount(&store));
+    var after_empty = try store.importLeasesAndOutcomes(150);
+    defer after_empty.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), after_empty.leases.items.len);
+    try std.testing.expectEqual(@as(usize, 0), after_empty.outcomes.items.len);
+    try std.testing.expectEqual(@as(u64, 3), try store.storeRevision());
+}
+
+test "import maps out-of-range transfer integers to StoreCorrupt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    const outcomes = [_]TerminalProcessOutcome{.{
+        .workspace_id = "workspace-corrupt",
+        .process_id = "term:session-corrupt:1",
+        .generation = 1,
+        .session_id = "session-corrupt",
+        .command = "zig build",
+        .cwd = "/workspace",
+        .pid = 7,
+        .process_group = null,
+        .started_at_ms = 20,
+        .finished_at_ms = 120,
+        .dock_id = 1,
+        .pane_id = null,
+        .owner_kind = "terminal",
+        .owner_title = "Build",
+        .provider = null,
+        .status = .completed,
+        .exit_code = 0,
+        .signal = null,
+        .cancellation_reason = null,
+    }};
+    _ = try store.persistLeasesAndOutcomes(&.{}, &outcomes);
+
+    // Negative generation would panic under unguarded @intCast on release=safe.
+    try store.conn.exec(
+        "update terminal_process_outcomes set generation = -1 where process_id = ?1",
+        .{"term:session-corrupt:1"},
+    );
+    try std.testing.expectError(error.StoreCorrupt, store.importLeasesAndOutcomes(150));
+
+    // Restore a valid generation then poison dock_id.
+    try store.conn.exec(
+        "update terminal_process_outcomes set generation = 1, dock_id = -1 where process_id = ?1",
+        .{"term:session-corrupt:1"},
+    );
+    try std.testing.expectError(error.StoreCorrupt, store.importLeasesAndOutcomes(150));
+
+    // Invalid non-null optional integer must also be StoreCorrupt, not silent null.
+    try store.conn.exec(
+        "update terminal_process_outcomes set dock_id = 1, pid = -1 where process_id = ?1",
+        .{"term:session-corrupt:1"},
+    );
+    try std.testing.expectError(error.StoreCorrupt, store.importLeasesAndOutcomes(150));
+}
+
+fn transferLeaseCount(store: *const Store) !i64 {
+    const row = (try store.conn.row("select count(*) from workspace_leases", .{})).?;
+    defer row.deinit();
+    return row.int(0);
+}
+
+fn transferOutcomeCount(store: *const Store) !i64 {
+    const row = (try store.conn.row("select count(*) from terminal_process_outcomes", .{})).?;
+    defer row.deinit();
+    return row.int(0);
 }
 
 test "turn commit is durable, ordered, exactly once, and revision guarded by receipt" {
