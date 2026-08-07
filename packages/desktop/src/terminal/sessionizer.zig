@@ -2366,9 +2366,9 @@ pub const Daemon = struct {
     /// Prepare-for-upgrade shutdown (headless_verde.md Lifetime §Protocol-version
     /// replacement). Enters drain only when the full shared state gate is clear
     /// so a refused upgrade does not freeze a healthy daemon.
-    /// Gate order: registry safe (leases transfer when the hermetic store is
-    /// active) → store writes drained → transfer commit + store close on exit
-    /// (final close lives in `finishSessionizerServer` after drain join).
+    /// Gate order: registry safe (leases transfer when the store is active) →
+    /// store writes drained → transfer commit + store close in on_closing
+    /// (before endpoint release; finishSessionizerServer is the idempotent fallback).
     fn prepareShutdownResponse(self: *Daemon, id_value: std.json.Value) ![]u8 {
         const now_ms = nowMs();
         // Reap expired registry state before evaluating the handoff gate; a
@@ -4952,6 +4952,9 @@ fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8) !vo
         .should_stop = sessionizerServerShouldStop,
         .handle_request = handleSessionizerServerRequest,
         .on_ready = sessionizerServerReady,
+        // Transfer commit + store close run here — after accept exits, before
+        // ipc.serve's endpoint teardown defers release the socket/lock.
+        .on_closing = sessionizerServerClosing,
     }, .{
         .max_message_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
         .max_response_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
@@ -4980,6 +4983,16 @@ fn sessionizerServerReady(raw_context: *anyopaque) !void {
         .endpoint = context.endpoint,
         .stop_requested = context.stop_requested,
     }});
+}
+
+/// Invoked by platform_ipc.serve after the accept loop exits and before its
+/// endpoint teardown defers run. Join the drain thread and finalize the store
+/// transfer while this process still holds exclusive endpoint ownership.
+fn sessionizerServerClosing(raw_context: *anyopaque) void {
+    const context: *SessionizerServerContext = @ptrCast(@alignCast(raw_context));
+    context.stop_requested.store(true, .release);
+    joinDrainThread(context);
+    finalizeSessionizerStore(context);
 }
 
 /// Full store mutation surface plus storeStatus (S3).
@@ -5317,57 +5330,101 @@ fn drainSessionsThread(context: DrainThreadContext) void {
     }
 }
 
+fn joinDrainThread(context: *SessionizerServerContext) void {
+    if (context.drain_thread == null) return;
+    platform_ipc.wake(context.daemon.allocator, context.endpoint, .{
+        .max_message_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
+        .max_response_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
+        .timeout_ms = SESSIONIZER_REQUEST_TIMEOUT_MS,
+    });
+    context.drain_thread.?.join();
+    context.drain_thread = null;
+}
+
+/// Idempotent: safe from both on_closing (primary) and finishSessionizerServer
+/// (error-path fallback when serve fails before the accept loop).
 fn finishSessionizerServer(context: *SessionizerServerContext) void {
     context.stop_requested.store(true, .release);
-    if (context.drain_thread != null) {
-        platform_ipc.wake(context.daemon.allocator, context.endpoint, .{
-            .max_message_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
-            .max_response_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
-            .timeout_ms = SESSIONIZER_REQUEST_TIMEOUT_MS,
-        });
-        context.drain_thread.?.join();
-        context.drain_thread = null;
-    }
-    // Serve loop returned and drain joined: no request can still be in flight.
-    // Final store gate: commit the lease/outcome transfer snapshot (even when
-    // empty — a real snapshot so a stale predecessor cannot resurrect), then
-    // close the writer. Close is the handoff barrier for the successor open.
-    if (context.daemon.store_service) |service| {
-        lockDaemon(context.daemon);
-        // Reap once more so the committed snapshot matches the prepare gate.
-        _ = context.daemon.registry.reap(context.daemon.allocator, nowMs());
-        persistTransferSnapshot(context.daemon, service) catch |err| {
-            log.warn("lease/outcome transfer persist failed err={s}", .{@errorName(err)});
-        };
-        context.daemon.store_service = null;
-        context.daemon.mutex.unlock();
-        service.store.deinit();
-        context.daemon.allocator.destroy(service);
-    }
+    joinDrainThread(context);
+    // Store finalization is primarily done in on_closing (before endpoint
+    // release). This call is a no-op when that already ran.
+    finalizeSessionizerStore(context);
     if (context.pid_published) deletePidFileIfOwned(context.pid_path);
 }
 
-/// Drain-time transfer: always write one real snapshot (delete-all + set,
-/// possibly empty, one revision bump). Caller holds the daemon lock; this
-/// takes the store service lock for the SQLite call.
-fn persistTransferSnapshot(daemon: *Daemon, service: *StoreService) !void {
-    var arena = std.heap.ArenaAllocator.init(daemon.allocator);
+/// Commit the lease/outcome transfer and close the writer. Idempotent when
+/// store_service is already null. Ordering contract: must run while this
+/// process still owns the endpoint (on_closing), so successor bind cannot
+/// import a pre-transfer snapshot. Snapshot-copy under lockDaemon only;
+/// SQLite runs after unlock (never SQLite under the daemon spin lock).
+fn finalizeSessionizerStore(context: *SessionizerServerContext) void {
+    const service = context.daemon.store_service orelse return;
+
+    var arena = std.heap.ArenaAllocator.init(context.daemon.allocator);
     defer arena.deinit();
     const scratch = arena.allocator();
 
     var leases: std.ArrayListUnmanaged(daemon_store.LeaseRecord) = .empty;
     var outcomes: std.ArrayListUnmanaged(daemon_store.TerminalProcessOutcome) = .empty;
 
+    // 1. Snapshot-copy under the daemon lock only (borrowed registry strings
+    // are duped into the arena so SQLite does not hold the spin lock).
+    lockDaemon(context.daemon);
+    _ = context.daemon.registry.reap(context.daemon.allocator, nowMs());
+    const collect_ok = collectTransferSnapshotOwned(context.daemon, scratch, &leases, &outcomes);
+    // Detach the service pointer under the lock so concurrent status paths see
+    // store-less immediately; close happens after unlock.
+    context.daemon.store_service = null;
+    context.daemon.mutex.unlock();
+
+    // 2. SQLite under the store service lock only — never under lockDaemon.
+    if (collect_ok) |_| {
+        persistTransferLists(service, leases.items, outcomes.items) catch |err| {
+            log.warn("lease/outcome transfer persist failed err={s}; attempting empty snapshot fallback", .{@errorName(err)});
+            // Fallback: publish a real empty snapshot so a prior generation
+            // cannot resurrect. If this also fails the residual risk is bounded
+            // (lease TTL ≤ 1h, outcome TTL 15min) until the next successful drain.
+            persistTransferLists(service, &.{}, &.{}) catch |fallback_err| {
+                log.warn(
+                    "lease/outcome empty-snapshot fallback failed err={s}; successor may import a stale predecessor snapshot until TTLs elapse",
+                    .{@errorName(fallback_err)},
+                );
+            };
+        };
+    } else |err| {
+        log.warn("lease/outcome transfer collect failed err={s}; attempting empty snapshot fallback", .{@errorName(err)});
+        persistTransferLists(service, &.{}, &.{}) catch |fallback_err| {
+            log.warn(
+                "lease/outcome empty-snapshot fallback failed err={s}; successor may import a stale predecessor snapshot until TTLs elapse",
+                .{@errorName(fallback_err)},
+            );
+        };
+    }
+
+    service.store.deinit();
+    context.daemon.allocator.destroy(service);
+}
+
+/// Copy registry transfer state into arena-owned store records. Caller holds
+/// the daemon lock for the duration of this call only.
+fn collectTransferSnapshotOwned(
+    daemon: *Daemon,
+    scratch: std.mem.Allocator,
+    leases: *std.ArrayListUnmanaged(daemon_store.LeaseRecord),
+    outcomes: *std.ArrayListUnmanaged(daemon_store.TerminalProcessOutcome),
+) !void {
     for (daemon.registry.workspaces.items) |*workspace| {
         for (workspace.leases.items) |*lease| {
             const resources = try scratch.alloc([]const u8, lease.resources.items.len);
-            for (lease.resources.items, 0..) |resource, index| resources[index] = resource;
+            for (lease.resources.items, 0..) |resource, index| {
+                resources[index] = try scratch.dupe(u8, resource);
+            }
             try leases.append(scratch, .{
-                .workspace_id = lease.workspace_id,
-                .lease_id = lease.id,
-                .owner = lease.owner,
-                .client_id = lease.client_id,
-                .command = lease.command,
+                .workspace_id = try scratch.dupe(u8, lease.workspace_id),
+                .lease_id = try scratch.dupe(u8, lease.id),
+                .owner = try scratch.dupe(u8, lease.owner),
+                .client_id = try scratch.dupe(u8, lease.client_id),
+                .command = try scratch.dupe(u8, lease.command),
                 .resources = resources,
                 .created_at_ms = lease.created_at_ms,
                 .expires_at_ms = lease.expires_at_ms,
@@ -5376,33 +5433,61 @@ fn persistTransferSnapshot(daemon: *Daemon, service: *StoreService) !void {
         }
         for (workspace.terminal_process_outcomes.items) |*outcome| {
             try outcomes.append(scratch, .{
-                .workspace_id = outcome.workspace_id,
-                .process_id = outcome.process_id,
+                .workspace_id = try scratch.dupe(u8, outcome.workspace_id),
+                .process_id = try scratch.dupe(u8, outcome.process_id),
                 .generation = outcome.generation,
-                .session_id = outcome.session_id,
-                .command = outcome.command,
-                .cwd = outcome.cwd,
+                .session_id = try scratch.dupe(u8, outcome.session_id),
+                .command = try scratch.dupe(u8, outcome.command),
+                .cwd = try scratch.dupe(u8, outcome.cwd),
                 .pid = outcome.pid,
                 .process_group = outcome.process_group,
                 .started_at_ms = outcome.started_at_ms,
                 .finished_at_ms = outcome.finished_at_ms,
                 .dock_id = outcome.dock_id,
                 .pane_id = outcome.pane_id,
-                .owner_kind = outcome.owner_kind,
-                .owner_title = outcome.owner_title,
-                .provider = outcome.provider,
+                .owner_kind = try scratch.dupe(u8, outcome.owner_kind),
+                .owner_title = try scratch.dupe(u8, outcome.owner_title),
+                .provider = if (outcome.provider) |value| try scratch.dupe(u8, value) else null,
                 .status = mapOutcomeStatusToStore(outcome.status),
                 .exit_code = outcome.exit_code,
                 .signal = outcome.signal,
-                .cancellation_reason = outcome.cancellation_reason,
+                .cancellation_reason = if (outcome.cancellation_reason) |value| try scratch.dupe(u8, value) else null,
             });
         }
     }
+}
 
+/// Drain-time transfer: always write one real snapshot (delete-all + set,
+/// possibly empty, one revision bump). Takes the store service lock; must NOT
+/// be called under lockDaemon.
+fn persistTransferLists(
+    service: *StoreService,
+    leases: []const daemon_store.LeaseRecord,
+    outcomes: []const daemon_store.TerminalProcessOutcome,
+) !void {
     lockStoreService(service);
     defer service.mutex.unlock();
-    // Empty set is still a real snapshot (M2-DT-a fix binding semantics).
-    _ = try service.store.persistLeasesAndOutcomes(leases.items, outcomes.items);
+    _ = try service.store.persistLeasesAndOutcomes(leases, outcomes);
+}
+
+/// Test/helper: collect under daemon lock then persist without holding it.
+/// Does not reap — callers that need a clock-aligned snapshot (production
+/// finalizeSessionizerStore) reap before collect with the intended now_ms.
+fn persistTransferSnapshot(daemon: *Daemon, service: *StoreService) !void {
+    var arena = std.heap.ArenaAllocator.init(daemon.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var leases: std.ArrayListUnmanaged(daemon_store.LeaseRecord) = .empty;
+    var outcomes: std.ArrayListUnmanaged(daemon_store.TerminalProcessOutcome) = .empty;
+
+    lockDaemon(daemon);
+    collectTransferSnapshotOwned(daemon, scratch, &leases, &outcomes) catch |err| {
+        daemon.mutex.unlock();
+        return err;
+    };
+    daemon.mutex.unlock();
+
+    try persistTransferLists(service, leases.items, outcomes.items);
 }
 
 fn mapOutcomeStatusToStore(status: process_registry.TerminalProcessOutcomeStatus) daemon_store.TerminalProcessOutcomeStatus {
@@ -5426,7 +5511,9 @@ fn mapOutcomeStatusFromStore(status: daemon_store.TerminalProcessOutcomeStatus) 
 }
 
 /// Seed the volatile registry from a committed transfer import. Dupes all
-/// strings so the imported container can be freed independently.
+/// strings so the imported container can be freed independently. Raises each
+/// workspace's `next_terminal_generation` above any imported outcome generation
+/// so `term:{session}:{generation}` IDs cannot collide across a replacement.
 fn seedRegistryFromTransfer(daemon: *Daemon, imported: *const daemon_store.ImportedLeasesAndOutcomes) !void {
     var seeded: usize = 0;
     for (imported.leases.items) |src| {
@@ -5441,6 +5528,12 @@ fn seedRegistryFromTransfer(daemon: *Daemon, imported: *const daemon_store.Impor
         var outcome = try cloneImportedOutcome(daemon.allocator, src);
         errdefer outcome.deinit(daemon.allocator);
         try workspace.terminal_process_outcomes.append(daemon.allocator, outcome);
+        // Keep the successor generation counter above imported outcomes so a
+        // re-used session id cannot mint a colliding term:{session}:{gen} id.
+        const next_gen = std.math.add(u64, src.generation, 1) catch std.math.maxInt(u64);
+        if (next_gen > workspace.next_terminal_generation) {
+            workspace.next_terminal_generation = next_gen;
+        }
         seeded += 1;
     }
     if (seeded != 0) {
@@ -5467,7 +5560,7 @@ fn cloneImportedLease(allocator: std.mem.Allocator, src: daemon_store.ImportedLe
         resources.deinit(allocator);
     }
     for (src.resources.items) |resource| {
-        try resources.append(allocator, try allocator.dupe(u8, resource));
+        try process_registry.appendOwnedString(allocator, &resources, resource);
     }
     return .{
         .workspace_id = owned_workspace_id,
@@ -8648,6 +8741,125 @@ test "transfer persist and import seed preserves lease id and prunes expired" {
     try std.testing.expectEqualStrings(keep_id, workspace.leases.items[0].id);
     try std.testing.expectEqual(@as(usize, 1), workspace.terminal_process_outcomes.items.len);
     try std.testing.expectEqualStrings("seed-session", workspace.terminal_process_outcomes.items[0].session_id);
+}
+
+test "finalizeSessionizerStore nulls store before endpoint release seam and is idempotent" {
+    // Seam pin for MAJOR-1: on_closing calls finalizeSessionizerStore while the
+    // endpoint is still owned; by the time endpoint teardown runs, store_service
+    // is already null and the transfer revision has advanced. A second call
+    // (finishSessionizerServer fallback) is a no-op.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+
+    var lease = try daemon.registry.acquireLease(
+        allocator,
+        "finalize-ws",
+        "owner",
+        "client",
+        "build",
+        &[_][]const u8{"build"},
+        false,
+        0,
+        nowMs(),
+    );
+    defer lease.deinit(allocator);
+
+    const before = try daemon.store_service.?.store.storeRevision();
+    var stop = std.atomic.Value(bool).init(false);
+    var context: SessionizerServerContext = .{
+        .daemon = &daemon,
+        .endpoint = "",
+        .pid_path = "",
+        .stop_requested = &stop,
+    };
+
+    finalizeSessionizerStore(&context);
+    try std.testing.expect(daemon.store_service == null);
+    // Re-open the same path read-only via a fresh store to assert the bump.
+    var reopened = try daemon_store.Store.init(allocator, db_path);
+    defer reopened.deinit();
+    try std.testing.expectEqual(before + 1, try reopened.storeRevision());
+
+    // Idempotent: second finalize must not panic or re-open.
+    finalizeSessionizerStore(&context);
+    try std.testing.expect(daemon.store_service == null);
+}
+
+test "seed raises next_terminal_generation above imported outcome generations" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var predecessor = Daemon.init(allocator);
+    defer predecessor.deinit();
+    try attachTestStoreService(&predecessor, db_path);
+
+    // Manually plant an outcome with a high generation so the successor must
+    // mint ids starting at generation+1.
+    const workspace = try predecessor.registry.ensureWorkspace(allocator, "gen-ws");
+    // Use a recent wall-clock finish time so import pruning (TTL 15m) retains it.
+    const finished_at = nowMs();
+    const outcome: process_registry.TerminalProcessOutcome = .{
+        .workspace_id = try allocator.dupe(u8, "gen-ws"),
+        .process_id = try allocator.dupe(u8, "term:reused-session:7"),
+        .generation = 7,
+        .session_id = try allocator.dupe(u8, "reused-session"),
+        .command = try allocator.dupe(u8, "/bin/true"),
+        .cwd = try allocator.dupe(u8, "."),
+        .pid = null,
+        .process_group = null,
+        .started_at_ms = finished_at - 100,
+        .finished_at_ms = finished_at,
+        .dock_id = 0,
+        .pane_id = null,
+        .owner_kind = try allocator.dupe(u8, "terminal"),
+        .owner_title = try allocator.dupe(u8, "reused-session"),
+        .provider = null,
+        .status = .completed,
+        .exit_code = 0,
+        .signal = null,
+        .cancellation_reason = null,
+    };
+    try workspace.terminal_process_outcomes.append(allocator, outcome);
+
+    try persistTransferSnapshot(&predecessor, predecessor.store_service.?);
+    detachTestStoreService(&predecessor);
+
+    var successor = Daemon.init(allocator);
+    defer successor.deinit();
+    try attachTestStoreService(&successor, db_path);
+    defer detachTestStoreService(&successor);
+
+    var imported = try successor.store_service.?.store.importLeasesAndOutcomes(finished_at);
+    defer imported.deinit(allocator);
+    try seedRegistryFromTransfer(&successor, &imported);
+
+    const seeded = successor.registry.workspace("gen-ws") orelse return error.TestExpectedWorkspace;
+    try std.testing.expect(seeded.next_terminal_generation >= 8);
+
+    // A new observation on the same session id must mint generation >= 8.
+    const tracked = try successor.registry.observeTerminalProcess(allocator, "gen-ws", .{
+        .process_identity = 99,
+        .session_id = "reused-session",
+        .command = "/bin/cat",
+        .cwd = ".",
+        .started_at_ms = nowMs(),
+        .observed_at_ms = nowMs(),
+        .dock_id = 0,
+        .owner_kind = "terminal",
+        .owner_title = "reused-session",
+    }, .{});
+    try std.testing.expect(tracked.generation >= 8);
+    try std.testing.expect(std.mem.indexOf(u8, tracked.process_id, ":8") != null or tracked.generation > 7);
 }
 
 test "prepare shutdown refuses while store writes are in flight" {
