@@ -6,8 +6,10 @@
 const std = @import("std");
 
 pub const protocol = @import("protocol.zig");
+pub const registry = @import("registry_protocol.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const client = @import("client.zig");
+pub const store = @import("store_protocol.zig");
 
 pub const HEADLESS_PROTOCOL_VERSION = protocol.HEADLESS_PROTOCOL_VERSION;
 pub const MIN_SUPPORTED_PROTOCOL_VERSION = protocol.MIN_SUPPORTED_PROTOCOL_VERSION;
