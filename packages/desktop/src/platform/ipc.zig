@@ -36,6 +36,11 @@ pub const ServerCallbacks = struct {
     /// Runs after the transport has acquired exclusive endpoint ownership.
     /// Servers use this to publish state and start lifetime-dependent workers.
     on_ready: ?*const fn (context: *anyopaque) anyerror!void = null,
+    /// Runs after the accept loop exits but BEFORE endpoint teardown defers
+    /// (socket unlink, listener close, exclusive lock release). Servers use
+    /// this for transfer commit + store close so successor bind cannot race
+    /// a pre-transfer snapshot. Invoked on both Unix and Windows serve paths.
+    on_closing: ?*const fn (context: *anyopaque) void = null,
 };
 
 /// Serves newline-delimited messages until the callback requests shutdown.
@@ -119,6 +124,12 @@ fn serveUnix(
         };
         handleUnixClient(allocator, io, stream, callbacks, options);
     }
+
+    // Transfer/store finalization must complete while this process still owns
+    // the endpoint. LIFO defers below run only after this returns: first
+    // deleteIfOwned (unlink socket), then listener.deinit, then endpoint_guard
+    // deinit (releases exclusive lock).
+    if (callbacks.on_closing) |on_closing| on_closing(callbacks.context);
 }
 
 fn handleUnixClient(
@@ -339,7 +350,7 @@ fn serveWindows(
             }
         };
         defer _ = DisconnectNamedPipe(pipe);
-        if (callbacks.should_stop(callbacks.context)) return;
+        if (callbacks.should_stop(callbacks.context)) break;
 
         const request = readWindowsLineAlloc(allocator, pipe, options) catch continue;
         const response = callbacks.handle_request(callbacks.context, request) catch continue;
@@ -357,6 +368,9 @@ fn serveWindows(
         // deferred disconnect makes this instance available again.
         _ = FlushFileBuffers(pipe);
     }
+
+    // Mirror Unix: finalize before the deferred pipe CloseHandle runs.
+    if (callbacks.on_closing) |on_closing| on_closing(callbacks.context);
 }
 
 fn requestWindowsAlloc(
@@ -846,4 +860,78 @@ test "message limits are release invariant" {
     try std.testing.expect(DEFAULT_MAX_RESPONSE_BYTES <= 32 * 1024 * 1024);
     try std.testing.expect(WINDOWS_PIPE_BUFFER_BYTES <= DEFAULT_MAX_MESSAGE_BYTES);
     try std.testing.expect(DEFAULT_TIMEOUT_MS > 0);
+}
+
+// Pins the handoff barrier: on_closing runs while the socket path still
+// accepts connections and before serve's LIFO endpoint teardown defers.
+// Use a short absolute path: AF_UNIX sun_path is ~108 bytes on Linux.
+test "on_closing runs before unix endpoint teardown" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    // /tmp/verde-oc-{pid}.sock stays well under the Unix path length limit.
+    const endpoint = try std.fmt.allocPrint(allocator, "/tmp/verde-oc-{d}.sock", .{runtime.processId()});
+    defer allocator.free(endpoint);
+    defer {
+        var cleanup_threaded = std.Io.Threaded.init_single_threaded;
+        const cleanup_io = cleanup_threaded.io();
+        std.Io.Dir.deleteFileAbsolute(cleanup_io, endpoint) catch {};
+        if (std.fmt.allocPrint(allocator, "{s}.lock", .{endpoint})) |lock_path| {
+            defer allocator.free(lock_path);
+            std.Io.Dir.deleteFileAbsolute(cleanup_io, lock_path) catch {};
+        } else |_| {}
+    }
+
+    const State = struct {
+        stop: bool = false,
+        closing_ran: bool = false,
+        endpoint_alive_at_closing: bool = false,
+        endpoint: []const u8 = "",
+    };
+    var state: State = .{ .endpoint = endpoint };
+
+    const should_stop = struct {
+        fn call(ctx: *anyopaque) bool {
+            const s: *State = @ptrCast(@alignCast(ctx));
+            return s.stop;
+        }
+    }.call;
+    const handle = struct {
+        fn call(ctx: *anyopaque, request: []u8) anyerror![]u8 {
+            _ = ctx;
+            _ = request;
+            return error.UnexpectedRequest;
+        }
+    }.call;
+    const on_ready = struct {
+        fn call(ctx: *anyopaque) anyerror!void {
+            const s: *State = @ptrCast(@alignCast(ctx));
+            // Exit the accept loop on the next should_stop check.
+            s.stop = true;
+        }
+    }.call;
+    const on_closing = struct {
+        fn call(ctx: *anyopaque) void {
+            const s: *State = @ptrCast(@alignCast(ctx));
+            s.closing_ran = true;
+            var threaded = std.Io.Threaded.init_single_threaded;
+            s.endpoint_alive_at_closing = unixEndpointAcceptsConnections(threaded.io(), s.endpoint);
+        }
+    }.call;
+
+    try serve(allocator, endpoint, .{
+        .context = &state,
+        .should_stop = should_stop,
+        .handle_request = handle,
+        .on_ready = on_ready,
+        .on_closing = on_closing,
+    }, .{
+        .timeout_ms = 500,
+    });
+
+    try std.testing.expect(state.closing_ran);
+    try std.testing.expect(state.endpoint_alive_at_closing);
+    // After serve returns, LIFO defers have unlinked the socket.
+    var threaded = std.Io.Threaded.init_single_threaded;
+    try std.testing.expect(!unixEndpointAcceptsConnections(threaded.io(), endpoint));
 }
