@@ -5601,7 +5601,7 @@ fn runM5P5CliIndependentCursorScenario(allocator: std.mem.Allocator, io: std.Io)
 
     // MAJOR-2: the genuine CLI survives a quiet long-poll beyond the old 5s
     // transport timeout and receives the daemon's normal empty heartbeat.
-    const long_poll_started_ms = sessionizer.nowMs();
+    const long_poll_started_ms = sessionizer.monotonicNowMs();
     const long_poll_bytes = try runCoreCliSubprocessAlloc(
         allocator,
         io,
@@ -5610,7 +5610,7 @@ fn runM5P5CliIndependentCursorScenario(allocator: std.mem.Allocator, io: std.Io)
         &.{ "changes", "--cursor", fresh_cursor_arg, "--wait-ms", "5500", "--json" },
     );
     defer allocator.free(long_poll_bytes);
-    const long_poll_elapsed_ms = sessionizer.nowMs() - long_poll_started_ms;
+    const long_poll_elapsed_ms = sessionizer.monotonicNowMs() - long_poll_started_ms;
     if (long_poll_elapsed_ms < 5_000 or long_poll_elapsed_ms > 10_000) {
         return error.M5P5LongPollElapsed;
     }
@@ -9238,9 +9238,43 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         var stall_thread_joined = false;
         defer if (!stall_thread_joined) stall_thread.join();
 
-        // commit_stall sleeps for 1.5s while holding the store-service mutex.
-        std.Io.sleep(io, .fromMilliseconds(250), .awake) catch {};
-        const confirm_started_ms = sessionizer.nowMs();
+        // Synchronization barrier: retry a real store-backed read until its
+        // short end-to-end transport deadline expires. That can happen here
+        // only after the mutation above has entered commit_stall while holding
+        // the store-service mutex. The lower elapsed bound below separately
+        // proves the production helper remained queued behind that stall.
+        const barrier_deadline_ms = sessionizer.monotonicNowMs() + 1_000;
+        var stall_observed = false;
+        while (sessionizer.monotonicNowMs() < barrier_deadline_ms) {
+            var barrier_arena = std.heap.ArenaAllocator.init(allocator);
+            defer barrier_arena.deinit();
+            const barrier_allocator = barrier_arena.allocator();
+            var barrier_transport: sessionizer.HeadlessTransport = .{
+                .allocator = barrier_allocator,
+                .pref_path = pref_path,
+                .timeout_ms = 75,
+            };
+            var barrier_client = sessionizer.headlessClient(barrier_allocator, &barrier_transport);
+            if (barrier_client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+                .workspace_id = "ws-mcp",
+                .local_thread_id = "thread-confirm-durable",
+            })) |response| {
+                var barrier_response = response;
+                barrier_response.deinit();
+            } else |err| {
+                if (std.mem.eql(u8, @errorName(err), "ConnectionTimedOut") or
+                    std.mem.eql(u8, @errorName(err), "Timeout"))
+                {
+                    stall_observed = true;
+                    break;
+                }
+                return err;
+            }
+            std.Io.sleep(io, .fromMilliseconds(5), .awake) catch {};
+        }
+        if (!stall_observed) return error.McpConfirmStallBarrierFailed;
+
+        const confirm_started_ms = sessionizer.monotonicNowMs();
         const stalled = try cli_main.chatOpenConfirmThreadDurable(
             allocator,
             io,
@@ -9249,8 +9283,9 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             4,
             50,
         );
-        const confirm_elapsed_ms = sessionizer.nowMs() - confirm_started_ms;
+        const confirm_elapsed_ms = sessionizer.monotonicNowMs() - confirm_started_ms;
         if (stalled != .timeout) return error.McpConfirmStalledOutcome;
+        if (confirm_elapsed_ms < 150) return error.McpConfirmStalledTooFast;
         if (confirm_elapsed_ms > 750) return error.McpConfirmStalledElapsed;
 
         stall_thread.join();

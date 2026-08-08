@@ -1395,11 +1395,6 @@ pub fn handleCore(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
     var transport: sessionizer.HeadlessTransport = .{
         .allocator = arena,
         .pref_path = pref_path,
-        // Cross-boundary ordering: the daemon parks for at most wait_ms, while
-        // this transport remains alive for that full interval plus bounded
-        // connect/write/response overhead. The CLI rejects values above the
-        // daemon's 25s cap, so this deadline is never above 30s.
-        .timeout_ms = if (is_changes) wait_ms + CORE_CHANGES_TRANSPORT_OVERHEAD_MS else 5_000,
     };
     var client = sessionizer.headlessClient(arena, &transport);
     // Explicit empty object: bare `.{}` can stringify as `[]` and fail params validation.
@@ -1432,6 +1427,10 @@ pub fn handleCore(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
             .wait_ms = wait_ms,
             .topics = if (topics.items.len == 0) null else topics.items,
         };
+        // The status handshake above retains the default five-second
+        // deadline. Only the potentially parked changes request receives the
+        // wait interval plus its fixed end-to-end transport overhead.
+        transport.timeout_ms = wait_ms + CORE_CHANGES_TRANSPORT_OVERHEAD_MS;
         break :blk client.callChanges(handshake.status.capabilities, request) catch |err| {
             if (err == error.CapabilityUnavailable) {
                 const unavailable = headless.client.capabilityUnavailable(.changes);
@@ -5092,7 +5091,7 @@ pub fn chatOpenConfirmThreadDurable(
 ) !ChatOpenConfirmOutcome {
     const budget_ms_u64 = std.math.mul(u64, attempts, delay_ms) catch std.math.maxInt(u64);
     const budget_ms: i64 = @intCast(@min(budget_ms_u64, @as(u64, std.math.maxInt(i64))));
-    const started_at_ms = sessionizer.nowMs();
+    const started_at_ms = sessionizer.monotonicNowMs();
     const deadline_ms = std.math.add(i64, started_at_ms, budget_ms) catch std.math.maxInt(i64);
     // A Live chat.open just reached the running desktop/daemon pair. Do not
     // autostart here: ensureDaemon has its own multi-second retry contract and
@@ -5148,7 +5147,7 @@ pub fn chatOpenConfirmThreadDurable(
 }
 
 fn confirmationRemainingMs(deadline_ms: i64) ?i64 {
-    const remaining_ms = deadline_ms -| sessionizer.nowMs();
+    const remaining_ms = deadline_ms -| sessionizer.monotonicNowMs();
     return if (remaining_ms > 0) remaining_ms else null;
 }
 
