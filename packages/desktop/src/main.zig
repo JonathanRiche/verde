@@ -552,7 +552,8 @@ fn mainInner(init: std.process.Init) !void {
                 app_state.pollUpdateCheck();
             }
         }.run, .{&state});
-        if (state.consumeUpdateExitRequest()) {
+        if (state.settings_controller.update_exit_requested and closePreflightPassed(&state)) {
+            _ = state.consumeUpdateExitRequest();
             running = false;
             continue;
         }
@@ -1469,7 +1470,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
     switch (event.type) {
         .quit => {
             runtime_log.diagnostic("shutdown requested by SDL quit event", .{});
-            return false;
+            return !closePreflightPassed(state);
         },
         .window_close_requested => {
             const keep_running = handleWindowCloseRequested(window, state);
@@ -2591,11 +2592,6 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
             return true;
         }
     }
-    if (builtin.os.tag == .macos) {
-        _ = state.browser_controller.runtime.controller.hide() catch {};
-        verde_macos_host_window_order_out(nativeBrowserHostWindow(window));
-        _ = SDL_HideWindow(window);
-    }
     if (builtin.os.tag == .linux) {
         const now_ms = currentTimeMillis();
         if (state.isPickerPending()) {
@@ -2637,7 +2633,79 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
             return true;
         }
     }
+    if (!closePreflightPassed(state)) return true;
+    if (builtin.os.tag == .macos) {
+        _ = state.browser_controller.runtime.controller.hide() catch {};
+        verde_macos_host_window_order_out(nativeBrowserHostWindow(window));
+        _ = SDL_HideWindow(window);
+    }
     return false;
+}
+
+// Durability boundary shared by every graceful exit request. A failed handoff
+// leaves the event loop, window, and controllers live for an interactive retry.
+fn closePreflightPassed(state: anytype) bool {
+    state.handoffDirtyStateForShutdown() catch |err| {
+        state.noteCloseDurabilityFailure(err);
+        return false;
+    };
+    return true;
+}
+
+test "close preflight keeps loop live after real handoff failure" {
+    const lifecycle_controller = @import("state/lifecycle_controller.zig");
+    const db_types = @import("db/types.zig");
+    const FakeStorage = struct {
+        allocator: std.mem.Allocator,
+
+        pub fn currentProjectionObservedRevision(_: *const @This()) u64 {
+            return 1;
+        }
+        pub fn saveCaptured(_: *@This(), _: db_types.PersistedState, _: u64) !void {
+            return error.StoreUnavailable;
+        }
+        pub fn markPersistenceUnavailable(_: *@This()) void {}
+        pub fn clearPendingStateSpoolBestEffort(_: *@This()) void {}
+    };
+    const FakeState = struct {
+        lifecycle: lifecycle_controller.State = .{},
+        storage: *FakeStorage,
+        close_failure_notice: bool = false,
+        daemon_stale: bool = true,
+
+        pub fn hasUnresolvedAdoptionRows(_: *@This()) bool {
+            return false;
+        }
+        pub fn completePendingProjectionRepairBlocking(_: *@This()) !void {}
+        pub fn buildPersistedState(_: *@This(), allocator: std.mem.Allocator) !db_types.LoadedState {
+            return db_types.LoadedState.init(allocator);
+        }
+        pub fn clonePersistedState(_: *@This(), allocator: std.mem.Allocator, _: db_types.PersistedState) !db_types.LoadedState {
+            return db_types.LoadedState.init(allocator);
+        }
+        pub fn spoolPendingStateForShutdown(_: *@This()) !void {
+            return error.InjectedSpoolFailure;
+        }
+        fn handoffDirtyStateForShutdown(self: *@This()) !void {
+            try lifecycle_controller.handoffDirtyStateForShutdown(self);
+        }
+        fn noteCloseDurabilityFailure(self: *@This(), _: anyerror) void {
+            self.close_failure_notice = true;
+        }
+        fn sidebarNotice(self: *const @This()) []const u8 {
+            if (self.close_failure_notice) return "Could not close";
+            if (self.daemon_stale) return "Daemon sync stalled";
+            return "";
+        }
+    };
+
+    var storage: FakeStorage = .{ .allocator = std.testing.allocator };
+    var state: FakeState = .{ .storage = &storage };
+    state.lifecycle.dirty = true;
+    defer state.lifecycle.deinit();
+    try std.testing.expect(!closePreflightPassed(&state));
+    try std.testing.expect(state.lifecycle.dirty);
+    try std.testing.expectEqualStrings("Could not close", state.sidebarNotice());
 }
 
 fn linuxCloseRequestFollowsSuspiciousBurst(now_ms: i64) bool {
@@ -2654,6 +2722,7 @@ fn macosHostWindowRequestedClose(window: *sdl.Window, state: *AppState) bool {
     if (builtin.os.tag != .macos) return false;
     const host_window = nativeBrowserHostWindow(window);
     if (!verde_macos_host_window_should_close(host_window)) return false;
+    if (!closePreflightPassed(state)) return false;
     _ = state.browser_controller.runtime.controller.hide() catch {};
     verde_macos_host_window_order_out(host_window);
     _ = SDL_HideWindow(window);
