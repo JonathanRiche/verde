@@ -14,6 +14,7 @@ const WINDOWS_PIPE_BUFFER_BYTES: usize = 64 * 1024;
 /// turn a request deadline into an infinite drain. This is the only permitted
 /// transport overrun after the shared request deadline expires.
 pub const WINDOWS_CANCEL_DRAIN_TIMEOUT_MS: u32 = 250;
+const WINDOWS_RETIRED_POLL_INTERVAL_MS: u32 = 100;
 const RESPONSE_TOO_LARGE_RESPONSE = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":\"response_too_large\",\"message\":\"response exceeds transport limit\"}}";
 
 // M5-P3 transport concurrency limits (m4m5_decisions Q7). These are real,
@@ -331,15 +332,12 @@ fn writeUnixAllWithDeadline(stream: std.Io.net.Stream, bytes: []const u8, deadli
 
     var remaining = bytes;
     while (remaining.len > 0) {
-        const remaining_ms = remainingTimeoutMs(deadline) orelse return error.ConnectionTimedOut;
         var poll_fds = [_]std.posix.pollfd{.{
             .fd = stream.socket.handle,
             .events = std.posix.POLL.OUT,
             .revents = 0,
         }};
-        const poll_timeout: i32 = @intCast(@min(remaining_ms, std.math.maxInt(i32)));
-        const ready = try std.posix.poll(&poll_fds, poll_timeout);
-        if (ready == 0) return error.ConnectionTimedOut;
+        _ = try pollUnixUntilDeadline(&poll_fds, deadline);
         if (poll_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) {
             return error.ConnectionResetByPeer;
         }
@@ -357,6 +355,27 @@ fn writeUnixAllWithDeadline(stream: std.Io.net.Stream, bytes: []const u8, deadli
         const written: usize = @intCast(written_raw);
         if (written == 0) return error.ConnectionResetByPeer;
         remaining = remaining[written..];
+    }
+}
+
+/// Polls beneath one absolute deadline while keeping EINTR visible. The
+/// standard wrapper retries with its original duration; recomputing here is
+/// what prevents repeated signals from extending the request budget.
+fn pollUnixUntilDeadline(fds: []std.posix.pollfd, deadline: u64) !usize {
+    while (true) {
+        const remaining_ms = remainingTimeoutMs(deadline) orelse return error.ConnectionTimedOut;
+        const timeout: c_int = @intCast(@min(remaining_ms, std.math.maxInt(c_int)));
+        const ready = std.c.poll(@ptrCast(fds.ptr), @intCast(fds.len), timeout);
+        if (ready >= 0) {
+            if (ready == 0) return error.ConnectionTimedOut;
+            return @intCast(ready);
+        }
+        switch (std.posix.errno(ready)) {
+            .INTR => continue,
+            .NOMEM => return error.SystemResources,
+            .FAULT, .INVAL => unreachable,
+            else => return error.Unexpected,
+        }
     }
 }
 
@@ -439,39 +458,30 @@ fn connectUnixWithDeadline(endpoint: []const u8, deadline: u64) !std.Io.net.Stre
     const address_len: std.posix.socklen_t = @intCast(@offsetOf(std.posix.sockaddr.un, "path") + endpoint.len + 1);
     if (@hasField(std.posix.sockaddr.un, "len")) storage.un.len = @intCast(address_len);
 
-    const socket_raw = std.c.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    if (socket_raw < 0) return unixConnectError(std.posix.errno(socket_raw));
-    const socket_fd: std.posix.fd_t = @intCast(socket_raw);
+    const socket_fd = try createNonblockingUnixSocket();
     errdefer _ = std.c.close(socket_fd);
-    if (std.c.fcntl(socket_fd, std.c.F.SETFD, @as(c_int, std.posix.FD_CLOEXEC)) < 0) {
-        return error.Unexpected;
-    }
 
     const original_flags = std.c.fcntl(socket_fd, std.c.F.GETFL, @as(c_int, 0));
     if (original_flags < 0) return error.Unexpected;
     const nonblock = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
-    if (std.c.fcntl(socket_fd, std.c.F.SETFL, original_flags | @as(c_int, @intCast(nonblock))) < 0) {
-        return error.Unexpected;
-    }
+    const blocking_flags = original_flags & ~@as(c_int, @intCast(nonblock));
 
-    while (true) {
-        if (remainingTimeoutMs(deadline) == null) return error.ConnectionTimedOut;
-        const connected = std.c.connect(socket_fd, &storage.any, address_len);
-        if (connected == 0) break;
+    if (remainingTimeoutMs(deadline) == null) return error.ConnectionTimedOut;
+    const connected = std.c.connect(socket_fd, &storage.any, address_len);
+    if (connected != 0) {
+        // EINTR does not prove connect failed. The socket may already be
+        // pending or complete, so resolve it exactly once through poll/SO_ERROR.
         switch (std.posix.errno(connected)) {
-            .INTR => continue,
-            .AGAIN, .ALREADY, .INPROGRESS => {},
+            .INTR, .AGAIN, .ALREADY, .INPROGRESS => {},
             else => |err| return unixConnectError(err),
         }
 
-        const remaining_ms = remainingTimeoutMs(deadline) orelse return error.ConnectionTimedOut;
         var poll_fds = [_]std.posix.pollfd{.{
             .fd = socket_fd,
             .events = std.posix.POLL.OUT,
             .revents = 0,
         }};
-        const ready = try std.posix.poll(&poll_fds, @intCast(@min(remaining_ms, std.math.maxInt(i32))));
-        if (ready == 0) return error.ConnectionTimedOut;
+        _ = try pollUnixUntilDeadline(&poll_fds, deadline);
         if (poll_fds[0].revents & std.posix.POLL.NVAL != 0) return error.ConnectionAborted;
 
         var socket_error: c_int = 0;
@@ -484,14 +494,63 @@ fn connectUnixWithDeadline(endpoint: []const u8, deadline: u64) !std.Io.net.Stre
             &socket_error_len,
         ) != 0) return error.Unexpected;
         if (socket_error != 0) return unixConnectError(@enumFromInt(socket_error));
-        break;
     }
 
-    if (std.c.fcntl(socket_fd, std.c.F.SETFL, original_flags) < 0) return error.Unexpected;
+    if (std.c.fcntl(socket_fd, std.c.F.SETFL, blocking_flags) < 0) return error.Unexpected;
     return .{ .socket = .{
         .handle = socket_fd,
         .address = .{ .ip4 = .loopback(0) },
     } };
+}
+
+/// Creates the descriptor atomically close-on-exec and nonblocking on kernels
+/// that support socket type flags. Darwin/Haiku and old kernels use the
+/// unavoidable fcntl fallback.
+fn createNonblockingUnixSocket() !std.posix.fd_t {
+    const socket_flags_supported = switch (builtin.os.tag) {
+        .driverkit, .haiku, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => false,
+        else => true,
+    };
+    const atomic_type = std.posix.SOCK.STREAM |
+        (if (socket_flags_supported) std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK else 0);
+
+    var socket_raw: c_int = undefined;
+    while (true) {
+        socket_raw = std.c.socket(std.posix.AF.UNIX, atomic_type, 0);
+        if (socket_raw >= 0) break;
+        switch (std.posix.errno(socket_raw)) {
+            .INTR => continue,
+            .INVAL => if (socket_flags_supported) return createNonblockingUnixSocketFallback(),
+            else => |err| return unixConnectError(err),
+        }
+    }
+    const socket_fd: std.posix.fd_t = @intCast(socket_raw);
+    if (!socket_flags_supported) {
+        errdefer _ = std.c.close(socket_fd);
+        try setUnixSocketFlagsFallback(socket_fd);
+    }
+    return socket_fd;
+}
+
+fn createNonblockingUnixSocketFallback() !std.posix.fd_t {
+    const socket_raw = std.c.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    if (socket_raw < 0) return unixConnectError(std.posix.errno(socket_raw));
+    const socket_fd: std.posix.fd_t = @intCast(socket_raw);
+    errdefer _ = std.c.close(socket_fd);
+    try setUnixSocketFlagsFallback(socket_fd);
+    return socket_fd;
+}
+
+fn setUnixSocketFlagsFallback(socket_fd: std.posix.fd_t) !void {
+    if (std.c.fcntl(socket_fd, std.c.F.SETFD, @as(c_int, std.posix.FD_CLOEXEC)) < 0) {
+        return error.Unexpected;
+    }
+    const flags = std.c.fcntl(socket_fd, std.c.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return error.Unexpected;
+    const nonblock = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
+    if (std.c.fcntl(socket_fd, std.c.F.SETFL, flags | @as(c_int, @intCast(nonblock))) < 0) {
+        return error.Unexpected;
+    }
 }
 
 fn unixConnectError(err: std.c.E) anyerror {
@@ -595,7 +654,7 @@ fn serveWindows(
     callbacks: ServerCallbacks,
     options: Options,
 ) !void {
-    const pipe = try createWindowsPipe(allocator, endpoint, options, .claim_endpoint);
+    var pipe = try createWindowsPipe(allocator, endpoint, options, .claim_endpoint);
     defer windows.CloseHandle(pipe);
     // Mirror Unix: finalize on every exit path (error returns included)
     // before the deferred pipe CloseHandle runs (LIFO).
@@ -619,10 +678,10 @@ fn serveWindows(
 
     if (callbacks.on_ready) |on_ready| try on_ready(callbacks.context);
 
-    // Keep the FIRST_PIPE_INSTANCE handle for the server lifetime. A client can
-    // retain its disconnected handle briefly, so closing and recreating this
-    // instance between requests can make CreateNamedPipeW report ACCESS_DENIED.
-    try servePipeInstanceLoop(allocator, pipe, callbacks, options, &pool.stop);
+    // Keep the FIRST_PIPE_INSTANCE handle for the server lifetime except when
+    // the sanctioned pathological cancellation path must retire it. Ordinary
+    // requests and signaled cancellations continue to reuse this instance.
+    try servePipeInstanceLoop(allocator, endpoint, &pipe, callbacks, options, &pool.stop);
 }
 
 /// Serves one named-pipe instance until shutdown. Shared by the main-thread
@@ -632,25 +691,40 @@ fn serveWindows(
 /// worker join latency is capped at `options.timeout_ms`.
 fn servePipeInstanceLoop(
     allocator: std.mem.Allocator,
-    pipe: windows.HANDLE,
+    endpoint: []const u8,
+    pipe: *windows.HANDLE,
     callbacks: ServerCallbacks,
     options: Options,
     stop: *const std.atomic.Value(bool),
 ) !void {
     while (!callbacks.should_stop(callbacks.context) and !stop.load(.acquire)) {
-        connectWindowsPipe(pipe, deadlineFromNow(options.timeout_ms)) catch |err| {
-            // A cancelled overlapped connect must be reset before this handle
-            // can listen for the next client.
-            _ = DisconnectNamedPipe(pipe);
-            switch (err) {
-                error.ConnectionTimedOut => continue,
-                else => return err,
-            }
+        const connect_result = connectWindowsPipe(pipe.*, deadlineFromNow(options.timeout_ms)) catch |err| {
+            _ = DisconnectNamedPipe(pipe.*);
+            return err;
         };
-        defer _ = DisconnectNamedPipe(pipe);
+        switch (connect_result) {
+            .connected => {},
+            .timed_out => {
+                // Normal cancellation completed inside the drain window, so
+                // the instance is safe to reset and reuse exactly as before.
+                _ = DisconnectNamedPipe(pipe.*);
+                continue;
+            },
+            .retired => |operation| {
+                // Never disconnect or reuse a handle while Windows may still
+                // complete into its OVERLAPPED. This worker owns at most one
+                // retired operation: it waits here, then replaces the instance.
+                if (!operation.waitForRetiredServerCompletion(callbacks, stop)) return;
+                windows.CloseHandle(pipe.*);
+                pipe.* = windows.INVALID_HANDLE_VALUE;
+                pipe.* = try createWindowsPipe(allocator, endpoint, options, .additional_instance);
+                continue;
+            },
+        }
+        defer _ = DisconnectNamedPipe(pipe.*);
         if (callbacks.should_stop(callbacks.context) or stop.load(.acquire)) break;
 
-        const request = readWindowsLineAlloc(allocator, pipe, options) catch continue;
+        const request = readWindowsLineAlloc(allocator, pipe.*, options) catch continue;
         const response = callbacks.handle_request(callbacks.context, request) catch continue;
         defer allocator.free(response);
         const response_to_write = if (response.len <= options.max_response_bytes)
@@ -659,12 +733,12 @@ fn servePipeInstanceLoop(
             RESPONSE_TOO_LARGE_RESPONSE;
 
         const deadline = deadlineFromNow(options.timeout_ms);
-        writeWindowsAll(pipe, response_to_write, deadline) catch continue;
-        writeWindowsAll(pipe, "\n", deadline) catch continue;
+        writeWindowsAll(pipe.*, response_to_write, deadline) catch continue;
+        writeWindowsAll(pipe.*, "\n", deadline) catch continue;
         // DisconnectNamedPipe discards unread bytes. Wait until the client has
         // consumed the complete newline-delimited reply before the loop's
         // deferred disconnect makes this instance available again.
-        _ = FlushFileBuffers(pipe);
+        _ = FlushFileBuffers(pipe.*);
     }
 }
 
@@ -691,9 +765,9 @@ const WindowsPipeWorkerPool = struct {
         // The endpoint is already claimed by the main thread's first instance;
         // a failure here only reduces available concurrency, never endpoint
         // ownership, so it degrades silently instead of aborting the server.
-        const pipe = createWindowsPipe(self.allocator, self.endpoint, self.options, .additional_instance) catch return;
+        var pipe = createWindowsPipe(self.allocator, self.endpoint, self.options, .additional_instance) catch return;
         defer windows.CloseHandle(pipe);
-        servePipeInstanceLoop(self.allocator, pipe, self.callbacks, self.options, &self.stop) catch {};
+        servePipeInstanceLoop(self.allocator, self.endpoint, &pipe, self.callbacks, self.options, &self.stop) catch {};
     }
 
     /// Quiesce order (M5-P3/A2), mirroring UnixWorkerPool.stopAndJoin:
@@ -840,16 +914,39 @@ fn authenticateWindowsPipeServer(allocator: std.mem.Allocator, pipe: windows.HAN
     return server_process_id;
 }
 
-fn connectWindowsPipe(pipe: windows.HANDLE, deadline: u64) !void {
-    if (remainingTimeoutMs(deadline) == null) return error.ConnectionTimedOut;
+const ServerPipeConnectResult = union(enum) {
+    connected,
+    timed_out,
+    retired: *OverlappedOperation,
+};
+
+fn connectWindowsPipe(pipe: windows.HANDLE, deadline: u64) !ServerPipeConnectResult {
+    if (remainingTimeoutMs(deadline) == null) return .timed_out;
     const operation = try OverlappedOperation.init();
-    defer operation.deinit();
-    if (ConnectNamedPipe(pipe, &operation.overlapped).toBool()) return;
-    switch (windows.GetLastError()) {
-        .PIPE_CONNECTED => return,
-        .IO_PENDING => try operation.wait(pipe, deadline, null),
-        else => return error.ConnectionAborted,
+    if (ConnectNamedPipe(pipe, &operation.overlapped).toBool()) {
+        operation.deinit();
+        return .connected;
     }
+    switch (windows.GetLastError()) {
+        .PIPE_CONNECTED => {
+            operation.deinit();
+            return .connected;
+        },
+        .IO_PENDING => operation.wait(pipe, deadline, null) catch |err| {
+            if (operation.abandoned) return .{ .retired = operation };
+            operation.deinit();
+            return switch (err) {
+                error.ConnectionTimedOut => .timed_out,
+                else => err,
+            };
+        },
+        else => {
+            operation.deinit();
+            return error.ConnectionAborted;
+        },
+    }
+    operation.deinit();
+    return .connected;
 }
 
 fn readWindowsLineAlloc(allocator: std.mem.Allocator, pipe: windows.HANDLE, options: Options) ![]u8 {
@@ -975,6 +1072,28 @@ const OverlappedOperation = struct {
         if (WaitForSingleObject(self.event, WINDOWS_CANCEL_DRAIN_TIMEOUT_MS) != WAIT_OBJECT_0) {
             self.abandoned = true;
         }
+    }
+
+    /// A pathological server cancellation owns this worker until completion,
+    /// bounding retention to one operation per pipe instance. False means the
+    /// server is stopping; deinit deliberately keeps the storage alive.
+    fn waitForRetiredServerCompletion(
+        self: *OverlappedOperation,
+        callbacks: ServerCallbacks,
+        stop: *const std.atomic.Value(bool),
+    ) bool {
+        while (!callbacks.should_stop(callbacks.context) and !stop.load(.acquire)) {
+            switch (WaitForSingleObject(self.event, WINDOWS_RETIRED_POLL_INTERVAL_MS)) {
+                WAIT_OBJECT_0 => {
+                    self.abandoned = false;
+                    self.deinit();
+                    return true;
+                },
+                WAIT_TIMEOUT => continue,
+                else => return false,
+            }
+        }
+        return false;
     }
 };
 
@@ -1205,6 +1324,71 @@ extern "advapi32" fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
     security_descriptor: *?*anyopaque,
     security_descriptor_size: ?*windows.ULONG,
 ) callconv(.winapi) windows.BOOL;
+
+test "unix poll recomputes its absolute deadline after EINTR" {
+    if (builtin.os.tag == .linux) return testUnixPollDeadlineInterruptions();
+    return error.SkipZigTest;
+}
+
+fn testUnixPollDeadlineInterruptions() !void {
+    const SignalState = struct {
+        var received: std.atomic.Value(u32) = .init(0);
+
+        fn handle(_: std.posix.SIG) callconv(.c) void {
+            _ = received.fetchAdd(1, .monotonic);
+        }
+    };
+    const Sender = struct {
+        target: std.c.pthread_t,
+
+        fn run(self: @This()) void {
+            const interval: std.c.timespec = .{
+                .sec = 0,
+                .nsec = 5 * std.time.ns_per_ms,
+            };
+            for (0..100) |_| {
+                _ = std.c.nanosleep(&interval, null);
+                _ = std.c.pthread_kill(self.target, .USR1);
+            }
+        }
+    };
+
+    SignalState.received.store(0, .monotonic);
+    var old_action: std.posix.Sigaction = undefined;
+    const action: std.posix.Sigaction = .{
+        .handler = .{ .handler = SignalState.handle },
+        .mask = std.posix.sigemptyset(),
+        // Deliberately omit SA.RESTART so poll observes every signal.
+        .flags = 0,
+    };
+    std.posix.sigaction(.USR1, &action, &old_action);
+    defer std.posix.sigaction(.USR1, &old_action, null);
+
+    var pipe_fds: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.Unexpected;
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+
+    const sender = try std.Thread.spawn(.{}, Sender.run, .{Sender{ .target = std.c.pthread_self() }});
+    defer sender.join();
+
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = pipe_fds[0],
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const started_ms = monotonicMilliseconds();
+    try std.testing.expectError(
+        error.ConnectionTimedOut,
+        pollUnixUntilDeadline(&poll_fds, deadlineFromNow(50)),
+    );
+    const elapsed_ms = monotonicMilliseconds() - started_ms;
+
+    try std.testing.expect(SignalState.received.load(.monotonic) > 0);
+    // The sender runs for roughly 500ms. A wrapper that restarts the original
+    // 50ms duration on every EINTR cannot satisfy this bound.
+    try std.testing.expect(elapsed_ms < 300);
+}
 
 test "pipe security descriptor excludes broad principals" {
     try std.testing.expect(std.mem.indexOf(u8, PIPE_SDDL_FORMAT, ";;;WD") == null);
