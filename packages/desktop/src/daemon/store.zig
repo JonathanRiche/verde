@@ -2797,6 +2797,32 @@ test "snapshot replace rejects stale relabel and tombstones ownership without re
     try std.testing.expectEqual(@as(i64, 1), replay_guard.int(0));
 }
 
+test "existing database backfills terminal replay guard on reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    {
+        var legacy = try Store.init(std.testing.allocator, db_path);
+        defer legacy.deinit();
+        try legacy.conn.execNoArgs("drop table terminal_turn_replay_guard");
+        try legacy.conn.exec(
+            "insert into chat_turns (turn_id, workspace_id, local_thread_id, status, started_at_ms, finished_at_ms, provider) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            .{ "turn-pre-guard", "ws-old", "thread-old", "completed", @as(i64, 1), @as(i64, 2), "codex" },
+        );
+    }
+
+    var reopened = try Store.init(std.testing.allocator, db_path);
+    defer reopened.deinit();
+    var row = (try reopened.conn.row(
+        "select count(*) from terminal_turn_replay_guard where turn_id = 'turn-pre-guard' and status = 'completed'",
+        .{},
+    )).?;
+    defer row.deinit();
+    try std.testing.expectEqual(@as(i64, 1), row.int(0));
+}
+
 // M5-P4 Amendment 1 duplicate-id invariant: one snapshot carrying the same
 // (thread, message_id) twice applies cleanly — identity wins, the later
 // occurrence refreshes position and content, and exactly one row plus one

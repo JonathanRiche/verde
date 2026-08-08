@@ -107,8 +107,8 @@ fn projectionStaleAt(
     return now_ms - basis > CHANGE_CURSOR_STALE_AFTER_MS;
 }
 
-fn projectionRefreshApplyGate(dirty: bool, flush_in_flight: bool, has_rebase: bool) bool {
-    return !flush_in_flight and (!dirty or has_rebase);
+fn projectionRefreshApplyGate(dirty: bool, flush_in_flight: bool, has_rebase: bool, adoption_repair: bool) bool {
+    return !flush_in_flight and (!dirty or has_rebase or adoption_repair);
 }
 
 /// Coalesced main-loop refresh signals derived from change-journal entries.
@@ -606,6 +606,174 @@ fn overlayConflictedLocalEdits(remote: *PersistedState, local: PersistedState) v
                 remote_thread.draft_image = local_thread.draft_image;
                 break;
             }
+        }
+    }
+}
+
+fn projectIndexById(projects: []const PersistedProject, id: []const u8) ?usize {
+    for (projects, 0..) |project, index| {
+        if (project.id) |candidate| if (std.mem.eql(u8, candidate, id)) return index;
+    }
+    return null;
+}
+
+fn threadIndexById(threads: []const PersistedThread, id: []const u8) ?usize {
+    for (threads, 0..) |thread, index| {
+        if (thread.local_thread_id) |candidate| if (std.mem.eql(u8, candidate, id)) return index;
+    }
+    return null;
+}
+
+fn optionalSliceEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn optionalImageEqual(a: ?db_types.PersistedImageAttachment, b: ?db_types.PersistedImageAttachment) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?.path, b.?.path) and
+        std.mem.eql(u8, a.?.mime, b.?.mime) and
+        a.?.byte_size == b.?.byte_size;
+}
+
+fn optionalHerdrEqual(a: ?db_types.PersistedHerdrWorkspaceLink, b: ?db_types.PersistedHerdrWorkspaceLink) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?.remote_alias, b.?.remote_alias) and
+        std.mem.eql(u8, a.?.session_name, b.?.session_name) and
+        std.mem.eql(u8, a.?.workspace_id, b.?.workspace_id) and
+        std.mem.eql(u8, a.?.local_dir, b.?.local_dir) and
+        optionalSliceEqual(a.?.remote_cwd, b.?.remote_cwd) and
+        optionalSliceEqual(a.?.last_pane_id, b.?.last_pane_id) and
+        a.?.attach_dock_id == b.?.attach_dock_id and
+        a.?.attach_pane_id == b.?.attach_pane_id and
+        optionalSliceEqual(a.?.pane_links_json, b.?.pane_links_json) and
+        a.?.updated_at_ms == b.?.updated_at_ms;
+}
+
+fn overlayCurrentThreadEdits(
+    remote: *PersistedThread,
+    baseline: PersistedThread,
+    current: PersistedThread,
+) void {
+    if (!std.mem.eql(u8, current.title, baseline.title)) remote.title = current.title;
+    if (current.archived != baseline.archived) remote.archived = current.archived;
+    if (current.committed != baseline.committed) remote.committed = current.committed;
+    if (current.last_activity_at != baseline.last_activity_at) remote.last_activity_at = current.last_activity_at;
+    if (!optionalSliceEqual(current.model_ref, baseline.model_ref)) remote.model_ref = current.model_ref;
+    if (current.reasoning_effort != baseline.reasoning_effort) remote.reasoning_effort = current.reasoning_effort;
+    if (!optionalSliceEqual(current.reasoning_variant, baseline.reasoning_variant)) remote.reasoning_variant = current.reasoning_variant;
+    if (current.fast_mode != baseline.fast_mode) remote.fast_mode = current.fast_mode;
+    if (current.access_mode != baseline.access_mode) remote.access_mode = current.access_mode;
+    if (current.provider != baseline.provider) remote.provider = current.provider;
+    if (current.harness != baseline.harness) remote.harness = current.harness;
+    if (current.tui_dock_id != baseline.tui_dock_id) remote.tui_dock_id = current.tui_dock_id;
+    if (!std.mem.eql(u8, current.draft, baseline.draft)) remote.draft = current.draft;
+    if (!optionalImageEqual(current.draft_image, baseline.draft_image)) remote.draft_image = current.draft_image;
+}
+
+fn mergeCurrentThreads(
+    allocator: std.mem.Allocator,
+    remote: *PersistedProject,
+    baseline: PersistedProject,
+    current: PersistedProject,
+) !void {
+    const remote_slice = remote.threads orelse &.{};
+    const baseline_threads = baseline.threads orelse &.{};
+    const current_threads = current.threads orelse &.{};
+    var merged: std.ArrayList(PersistedThread) = .empty;
+    defer merged.deinit(allocator);
+    try merged.appendSlice(allocator, remote_slice);
+
+    // Baseline identities deleted locally stay deleted. Remote-only identities
+    // are untouched, while current-only identities are proven local additions.
+    for (baseline_threads) |base_thread| {
+        const id = base_thread.local_thread_id orelse continue;
+        if (threadIndexById(current_threads, id) != null) continue;
+        if (threadIndexById(merged.items, id)) |index| _ = merged.orderedRemove(index);
+    }
+    for (current_threads) |current_thread| {
+        const id = current_thread.local_thread_id orelse continue;
+        const baseline_index = threadIndexById(baseline_threads, id);
+        const remote_index = threadIndexById(merged.items, id);
+        if (baseline_index == null) {
+            if (remote_index == null) try merged.append(allocator, current_thread);
+            continue;
+        }
+        if (remote_index) |index| overlayCurrentThreadEdits(
+            &merged.items[index],
+            baseline_threads[baseline_index.?],
+            current_thread,
+        );
+        // If remote omitted an identity present in the baseline, that is a
+        // remote deletion and wins over local edits to the old thread.
+    }
+    remote.threads = try merged.toOwnedSlice(allocator);
+}
+
+fn overlayCurrentProjectEdits(
+    remote: *PersistedProject,
+    baseline: PersistedProject,
+    current: PersistedProject,
+) void {
+    if (!std.mem.eql(u8, current.label, baseline.label)) remote.label = current.label;
+    if (!std.mem.eql(u8, current.path, baseline.path)) remote.path = current.path;
+    if (current.archived != baseline.archived) remote.archived = current.archived;
+    if (current.unread_count != baseline.unread_count) remote.unread_count = current.unread_count;
+    if (current.collapsed != baseline.collapsed) remote.collapsed = current.collapsed;
+    if (current.thread_list_expanded != baseline.thread_list_expanded) remote.thread_list_expanded = current.thread_list_expanded;
+    if (current.terminal_height != baseline.terminal_height) remote.terminal_height = current.terminal_height;
+    if (!optionalSliceEqual(current.terminal_layout_json, baseline.terminal_layout_json)) remote.terminal_layout_json = current.terminal_layout_json;
+    if (!optionalSliceEqual(current.terminal_docks_json, baseline.terminal_docks_json)) remote.terminal_docks_json = current.terminal_docks_json;
+    if (!optionalSliceEqual(current.workspace_layout_json, baseline.workspace_layout_json)) remote.workspace_layout_json = current.workspace_layout_json;
+    if (current.selected_thread_index != baseline.selected_thread_index) remote.selected_thread_index = current.selected_thread_index;
+    if (!optionalSliceEqual(current.companion_thread_local_id, baseline.companion_thread_local_id)) remote.companion_thread_local_id = current.companion_thread_local_id;
+    if (!optionalHerdrEqual(current.herdr_link, baseline.herdr_link)) remote.herdr_link = current.herdr_link;
+    if (current.provider != baseline.provider) remote.provider = current.provider;
+    if (current.harness != baseline.harness) remote.harness = current.harness;
+    if (!std.mem.eql(u8, current.draft, baseline.draft)) remote.draft = current.draft;
+}
+
+/// Three-way merge at the frame-thread apply boundary. `baseline` is the
+/// daemon projection observed at capture, `current` includes every later UI
+/// edit, and `remote` supplies durable transcript identities and deletions.
+fn mergeCurrentLocalEdits(
+    allocator: std.mem.Allocator,
+    remote: *PersistedState,
+    baseline: PersistedState,
+    current: PersistedState,
+) !void {
+    if (current.sidebar_collapsed != baseline.sidebar_collapsed) remote.sidebar_collapsed = current.sidebar_collapsed;
+    var merged: std.ArrayList(PersistedProject) = .empty;
+    defer merged.deinit(allocator);
+    try merged.appendSlice(allocator, remote.projects);
+
+    for (baseline.projects) |base_project| {
+        const id = base_project.id orelse continue;
+        if (projectIndexById(current.projects, id) != null) continue;
+        if (projectIndexById(merged.items, id)) |index| _ = merged.orderedRemove(index);
+    }
+    for (current.projects) |current_project| {
+        const id = current_project.id orelse continue;
+        const baseline_index = projectIndexById(baseline.projects, id);
+        const remote_index = projectIndexById(merged.items, id);
+        if (baseline_index == null) {
+            if (remote_index == null) try merged.append(allocator, current_project);
+            continue;
+        }
+        if (remote_index) |index| {
+            const base_project = baseline.projects[baseline_index.?];
+            overlayCurrentProjectEdits(&merged.items[index], base_project, current_project);
+            try mergeCurrentThreads(allocator, &merged.items[index], base_project, current_project);
+        }
+    }
+    remote.projects = try merged.toOwnedSlice(allocator);
+    if (remote.projects.len == 0) {
+        remote.selected_project_index = 0;
+    } else {
+        if (current.selected_project_index != baseline.selected_project_index) {
+            remote.selected_project_index = @min(current.selected_project_index, remote.projects.len - 1);
+        } else {
+            remote.selected_project_index = @min(remote.selected_project_index, remote.projects.len - 1);
         }
     }
 }
@@ -3592,9 +3760,17 @@ pub const AppState = struct {
     pub const projectThreadIndexByLocalId = chat_controller.projectThreadIndexByLocalId;
     pub const resolveThreadApprovalByLocalId = chat_controller.resolveThreadApprovalByLocalId;
     pub const applyPersisted = persistence.applyPersisted;
+    pub const applyDaemonSessionProjection = terminal_controller.applyDaemonSessionProjection;
     pub const restorePersistedSurfaceStates = persistence.restorePersistedSurfaceStates;
     pub const restorePersistedChatCompletions = persistence.restorePersistedChatCompletions;
     pub const buildPersistedState = persistence.buildPersistedState;
+    pub fn clonePersistedState(
+        _: *AppState,
+        backing_allocator: std.mem.Allocator,
+        source: PersistedState,
+    ) !db_types.LoadedState {
+        return persistence.clonePersistedState(backing_allocator, source);
+    }
     pub const applyPersistedTerminalDocksJson = persistence.applyPersistedTerminalDocksJson;
     pub const seedDefaultState = persistence.seedDefaultState;
     pub const clearSurfaces = surface_controller.clearSurfaces;
@@ -8518,17 +8694,39 @@ pub const AppState = struct {
     }
 
     pub fn applyDaemonProjectionRefresh(self: *AppState, result: headless.store.CoreSnapshotResult) !void {
+        const adoption_repair = self.hasUnresolvedAdoptionRows();
         if (!projectionRefreshApplyGate(
             self.lifecycle.dirty,
             self.lifecycle.flush_in_flight,
             self.lifecycle.rebase_snapshot != null,
+            adoption_repair,
         )) return error.ProjectionRefreshDeferred;
         const envelope = result.envelope orelse return error.MissingProjectionEnvelope;
         const cursor = result.change_cursor orelse return error.MissingProjectionCursor;
         var conversion_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer conversion_arena.deinit();
         var persisted = try compositeSnapshotToPersisted(conversion_arena.allocator(), result.snapshot);
-        if (self.lifecycle.rebase_snapshot) |*local| overlayConflictedLocalEdits(&persisted, local.value);
+        var next_baseline = try self.clonePersistedState(self.allocator, persisted);
+        var baseline_owned = true;
+        errdefer if (baseline_owned) next_baseline.deinit();
+        if (self.lifecycle.dirty or self.lifecycle.rebase_snapshot != null or adoption_repair) {
+            var current = try self.buildPersistedState(self.allocator);
+            defer current.deinit();
+            const baseline = if (self.lifecycle.rebase_baseline) |*captured|
+                captured.value
+            else if (self.lifecycle.projection_baseline) |*last_applied|
+                last_applied.value
+            else
+                null;
+            if (baseline) |base| {
+                try mergeCurrentLocalEdits(conversion_arena.allocator(), &persisted, base, current.value);
+            } else {
+                // A bootstrap state has no daemon baseline. Preserve matching
+                // UI fields without guessing whether absent durable identities
+                // are local additions or remote deletions.
+                overlayConflictedLocalEdits(&persisted, current.value);
+            }
+        }
 
         // Build the complete replacement behind a shallow AppState view whose
         // owned projection containers are empty. No live pointer is changed
@@ -8541,7 +8739,8 @@ pub const AppState = struct {
         errdefer if (staged_owned) deinitProjectionContainers(self.allocator, &staged.project_controller, &staged.surface_controller);
         try staged.applyPersisted(persisted);
         try staged.applyDaemonRegistryProjection(result.processes, result.leases);
-        staged.applyDaemonChatTurnsSnapshot(result.turns);
+        try staged.applyDaemonSessionProjection(result.sessions);
+        try staged.applyDaemonChatTurnsSnapshot(result.turns);
         var staged_sessions = try terminal_controller.buildDaemonSessionProjection(self.allocator, result.sessions);
         var sessions_owned = true;
         errdefer if (sessions_owned) terminal_controller.deinitDaemonSessionProjection(self.allocator, &staged_sessions);
@@ -8580,8 +8779,22 @@ pub const AppState = struct {
         seed_owned = false;
         if (self.lifecycle.rebase_snapshot) |*local| local.deinit();
         self.lifecycle.rebase_snapshot = null;
+        if (self.lifecycle.rebase_baseline) |*baseline| baseline.deinit();
+        self.lifecycle.rebase_baseline = null;
+        if (self.lifecycle.projection_baseline) |*baseline| baseline.deinit();
+        self.lifecycle.projection_baseline = next_baseline;
+        baseline_owned = false;
         self.daemon_projection_stale = false;
         self.daemon_projection_stale_notified = false;
+    }
+
+    /// Complete a conflict/adoption refresh after the cursor worker has
+    /// stopped. The ordinary apply path still performs the transactional
+    /// merge, replacement, and cursor publication.
+    pub fn completePendingProjectionRepairBlocking(self: *AppState) !void {
+        const refresh = fetchOwnedCompositeSnapshot(self.storage) orelse return error.ProjectionRefreshUnavailable;
+        defer refresh.deinit();
+        try self.applyDaemonProjectionRefresh(refresh.result);
     }
 
     fn deinitProjectionContainers(
@@ -8687,12 +8900,9 @@ pub const AppState = struct {
         return self.daemon_projection_stale;
     }
 
-    /// M5-P4 read flip for Live IPC reads: once the change-cursor projection
-    /// has synced at least once, reads are served from the projection kept
-    /// fresh by cursor-triggered pulls; a desktop that never synced keeps the
-    /// legacy inline pull so behavior is unchanged without the loop.
+    /// Composite sessions seed matching dock identities transactionally. Keep
+    /// the legacy pull too until every historical session shape is projectable.
     pub fn pollWorkspaceTerminalProcessLifecyclesForLiveRead(self: *AppState, project_index: usize) void {
-        if (self.storage.daemonProjectionEverSynced()) return;
         self.pollWorkspaceTerminalProcessLifecycles(project_index);
     }
 
@@ -11792,6 +12002,189 @@ test "M5-P4 composite conversion matches the pull-driven durable projection" {
         pull_project.threads.items[0].messages.items[0].body,
         cursor_project.threads.items[0].messages.items[0].body,
     );
+
+    // Tombstone/deletion equivalence: both production paths replace the prior
+    // workspace projection with the same empty durable snapshot.
+    const deleted = try compositeSnapshotToPersisted(arena.allocator(), .{
+        .store_revision = 12,
+        .workspaces = &.{},
+    });
+    pull_state.clearProjects();
+    pull_state.clearSurfaces();
+    try pull_state.applyPersisted(deleted);
+    cursor_state.lifecycle.dirty = false;
+    try cursor_state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 12, .workspaces = &.{} },
+        .store_revision = 12,
+        .envelope = .{ .instance_nonce = "equivalence", .registry_revision = 2 },
+        .change_cursor = 6,
+    });
+    try std.testing.expectEqual(@as(usize, 0), pull_state.project_controller.projects.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cursor_state.project_controller.projects.items.len);
+}
+
+test "M5-P4 three-way conflict merge keeps post-capture edits and local additions without resurrecting remote deletes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const base_threads = [_]PersistedThread{
+        .{ .title = "base kept", .local_thread_id = "thread-kept" },
+        .{ .title = "base deleted", .local_thread_id = "thread-deleted" },
+    };
+    const current_threads = [_]PersistedThread{
+        .{ .title = "edit B after capture", .local_thread_id = "thread-kept", .draft = "draft B" },
+        .{ .title = "base deleted locally unchanged", .local_thread_id = "thread-deleted" },
+        .{ .title = "local addition", .local_thread_id = "thread-local" },
+    };
+    const remote_threads = [_]PersistedThread{
+        .{ .title = "remote kept", .local_thread_id = "thread-kept" },
+    };
+    const baseline_projects = [_]PersistedProject{.{
+        .id = "ws-merge",
+        .label = "baseline",
+        .path = "/tmp/ws-merge",
+        .threads = &base_threads,
+    }};
+    const current_projects = [_]PersistedProject{.{
+        .id = "ws-merge",
+        .label = "current",
+        .path = "/tmp/ws-merge",
+        .threads = &current_threads,
+    }};
+    const remote_projects = [_]PersistedProject{.{
+        .id = "ws-merge",
+        .label = "remote",
+        .path = "/tmp/ws-merge",
+        .threads = &remote_threads,
+    }};
+    var remote: PersistedState = .{ .projects = &remote_projects };
+    try mergeCurrentLocalEdits(
+        arena.allocator(),
+        &remote,
+        .{ .projects = &baseline_projects },
+        .{ .projects = &current_projects },
+    );
+    const threads = remote.projects[0].threads.?;
+    try std.testing.expectEqual(@as(usize, 2), threads.len);
+    try std.testing.expectEqualStrings("edit B after capture", threads[0].title);
+    try std.testing.expectEqualStrings("draft B", threads[0].draft);
+    try std.testing.expectEqualStrings("thread-local", threads[1].local_thread_id.?);
+    try std.testing.expect(threadIndexById(threads, "thread-deleted") == null);
+}
+
+test "M5-P4 terminal adoption refresh crosses dirty gate and replaces id-less row" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer state.deinit();
+    // This test proves the repair boundary, not daemon persistence. Keep the
+    // hermetic AppState teardown from trying to spawn a session daemon.
+    defer state.lifecycle.dirty = false;
+    const initial_messages = [_]headless.store.Message{.{
+        .message_id = "turn:adopt:user",
+        .role = "user",
+        .author = "You",
+        .body = "hello",
+    }};
+    const refreshed_messages = [_]headless.store.Message{
+        initial_messages[0],
+        .{
+            .message_id = "turn:adopt:msg:1",
+            .role = "assistant",
+            .author = "Codex",
+            .body = "durable reply",
+        },
+    };
+    const initial_threads = [_]headless.store.Thread{
+        .{
+            .local_thread_id = "thread-adopt-real",
+            .title = "Adoption",
+            .messages = &initial_messages,
+        },
+        .{
+            .local_thread_id = "thread-remote-delete",
+            .title = "Remote deletion baseline",
+        },
+    };
+    const refreshed_threads = [_]headless.store.Thread{.{
+        .local_thread_id = "thread-adopt-real",
+        .title = "Adoption",
+        .messages = &refreshed_messages,
+    }};
+    const initial_workspaces = [_]headless.store.Workspace{.{
+        .workspace_id = "ws-adopt-real",
+        .label = "Adoption",
+        .path = "/tmp/ws-adopt-real",
+        .threads = &initial_threads,
+    }};
+    const refreshed_workspaces = [_]headless.store.Workspace{.{
+        .workspace_id = "ws-adopt-real",
+        .label = "Adoption",
+        .path = "/tmp/ws-adopt-real",
+        .threads = &refreshed_threads,
+    }};
+    const daemon_sessions = [_]headless.store.SessionSummary{.{
+        .session_id = "daemon-created-session",
+        .workspace_id = "ws-adopt-real",
+        .workspace_path = "/tmp/ws-adopt-real",
+        .cwd = "/tmp/ws-adopt-real",
+        .label = "shell",
+        .command = "bash",
+        .dock_id = 0,
+        .running = true,
+        .status = "running",
+    }};
+    state.lifecycle.dirty = false;
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 1, .workspaces = &initial_workspaces },
+        .store_revision = 1,
+        .envelope = .{ .instance_nonce = "adopt-real", .registry_revision = 1 },
+        .change_cursor = 1,
+    });
+    const thread = &state.project_controller.projects.items[0].threads.items[0];
+    try thread.messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Codex"),
+        .body = try allocator.dupeZ(u8, "durable reply"),
+    });
+    thread.setDraft("keep this UI draft");
+    var local_thread = try ChatThread.init(allocator, "Local addition");
+    allocator.free(local_thread.local_thread_id);
+    local_thread.local_thread_id = try allocator.dupeZ(u8, "thread-local-addition");
+    local_thread.committed = true;
+    state.project_controller.projects.items[0].threads.append(allocator, local_thread) catch |err| {
+        local_thread.deinit(allocator);
+        return err;
+    };
+    state.project_controller.projects.items[0].selected_thread_index = 2;
+    state.lifecycle.dirty = true;
+    chat_controller.markAdoptionTerminalRepairForTest("ws-adopt-real", "thread-adopt-real");
+    defer chat_controller.clearAdoptionRepairForTest("ws-adopt-real", "thread-adopt-real");
+    try std.testing.expect(state.hasUnresolvedAdoptionRows());
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 2, .workspaces = &refreshed_workspaces },
+        .store_revision = 2,
+        .envelope = .{ .instance_nonce = "adopt-real", .registry_revision = 2 },
+        .change_cursor = 2,
+        .sessions = &daemon_sessions,
+    });
+    const repaired = &state.project_controller.projects.items[0].threads.items[0];
+    try std.testing.expectEqual(@as(usize, 2), repaired.messages.items.len);
+    try std.testing.expectEqualStrings("turn:adopt:msg:1", repaired.messages.items[1].message_id.?);
+    try std.testing.expectEqualStrings("keep this UI draft", repaired.currentDraft());
+    try std.testing.expect(state.threadByLocalId("ws-adopt-real", "thread-local-addition") != null);
+    try std.testing.expect(state.threadByLocalId("ws-adopt-real", "thread-remote-delete") == null);
+    const projected_session_id = state.project_controller.projects.items[0].terminal_dock.activeSessionId();
+    try std.testing.expect(projected_session_id != null);
+    try std.testing.expectEqualStrings("daemon-created-session", projected_session_id.?);
+    try std.testing.expect(!state.hasUnresolvedAdoptionRows());
 }
 
 test "M5-P4 stalled daemon worker cannot block frame-side bridge drain" {
@@ -11887,9 +12280,37 @@ test "M5-P4 stale status covers saved bootstrap and clears after applied refresh
     try std.testing.expect(!projectionStaleAt(true, started_ms, applied_ms, applied_ms));
     // Exercise the same gate used by applyDaemonProjectionRefresh: neither an
     // in-flight capture nor unrebased dirty state may clear stale status.
-    try std.testing.expect(!projectionRefreshApplyGate(false, true, false));
-    try std.testing.expect(!projectionRefreshApplyGate(true, false, false));
-    try std.testing.expect(projectionRefreshApplyGate(true, false, true));
+    try std.testing.expect(!projectionRefreshApplyGate(false, true, false, false));
+    try std.testing.expect(!projectionRefreshApplyGate(true, false, false, false));
+    try std.testing.expect(projectionRefreshApplyGate(true, false, true, false));
+    try std.testing.expect(projectionRefreshApplyGate(true, false, false, true));
+}
+
+test "M5-P4 stale refresh is rejected by the actual transactional apply path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer state.deinit();
+    state.lifecycle.dirty = true;
+    state.daemon_projection_stale = true;
+    const before_projects = state.project_controller.projects.items.len;
+    try std.testing.expectError(error.ProjectionRefreshDeferred, state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 4, .workspaces = &.{} },
+        .store_revision = 4,
+        .envelope = .{ .instance_nonce = "stale-apply", .registry_revision = 4 },
+        .change_cursor = 4,
+    }));
+    try std.testing.expectEqual(before_projects, state.project_controller.projects.items.len);
+    try std.testing.expect(state.daemon_projection_stale);
+    state.lifecycle.dirty = false;
 }
 
 test "M5-P4 cursor loop shutdown flag interrupts sleeps and join is idempotent" {
