@@ -212,9 +212,12 @@ pub fn capabilityUnavailable(feature: CapabilityFeature) Error {
 pub const Capabilities = struct {
     terminal_raw: bool = true,
     terminal_grid: bool = false,
-    /// M4-P4: stays false until M4-P5 advertises chat with the MCP/CLI flip
-    /// (authority flip alone does not advertise; mirrors M2's discipline).
-    chat: bool = false,
+    /// M4-P5: advertised together with the MCP/CLI daemon-direct chat flip.
+    /// The M4-P4 authority flip (durable-before-consume) landed first; this
+    /// advertisement is what daemon-direct clients gate on — an old daemon
+    /// that serialized `chat:false` is rejected with capability_unavailable
+    /// and never silently re-routed through Live.
+    chat: bool = true,
     processes: bool = false,
     leases: bool = false,
     browser_execution: bool = false,
@@ -253,7 +256,9 @@ pub const Capabilities = struct {
         return .{
             .terminal_raw = true,
             .terminal_grid = false,
-            .chat = false,
+            // M4-P5 flip: chat advertised in the same commit that makes the
+            // MCP/CLI chat tools daemon-direct (design "Phase M4-P5").
+            .chat = true,
             .processes = false,
             .leases = false,
             .browser_execution = false,
@@ -715,6 +720,10 @@ test "old capability shape defaults every granular feature to unavailable" {
         try std.testing.expect(!parsed.value.capabilities.isFeatureAvailable(feature));
     }
     try std.testing.expect(!parsed.value.capabilities.browser.available);
+    // M4-P5: the old daemon serialized `chat:false` explicitly; the flipped
+    // default-true must never resurrect chat on an old-shape parse — this is
+    // the wire basis for the old-daemon capability_unavailable rejection.
+    try std.testing.expect(!parsed.value.capabilities.chat);
     try std.testing.expect(!parsed.value.capabilities.store);
     try std.testing.expect(!parsed.value.capabilities.snapshots);
     try std.testing.expect(!parsed.value.capabilities.changes);
@@ -760,6 +769,8 @@ test "new granular capability shape round trips" {
 
 test "granular feature and unavailable error helpers use stable names" {
     var capabilities: Capabilities = .phase1();
+    // M4-P5 flip pin: chat is advertised (was false through M4-P4).
+    try std.testing.expect(capabilities.chat);
     try std.testing.expect(!capabilities.store);
     try std.testing.expect(!capabilities.snapshots);
     try std.testing.expect(!capabilities.changes);

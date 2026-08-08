@@ -2463,6 +2463,32 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
     }
     if (std.mem.eql(u8, subcommand, "send") or std.mem.eql(u8, subcommand, "followup")) {
         const prompt = args.optionValue(argv, "--prompt") orelse args.optionValue(argv, "--text") orelse trailingFreeArg(argv, 2);
+        // M4-P5: thread-addressed sends are daemon-owned and go daemon-direct
+        // (works with no GUI; old daemon → capability_unavailable, no Live
+        // fallback). Pane-addressed sends stay on Live for compatibility.
+        if (args.optionValue(argv, "--thread")) |local_thread_id| {
+            const workspace_id = workspaceOption(argv) orelse {
+                try out.stderr("verde live chat {s} --thread requires --workspace\n", .{subcommand});
+                std.process.exit(2);
+            };
+            const prompt_text = prompt orelse {
+                try out.stderr("verde live chat {s} requires a prompt\n", .{subcommand});
+                std.process.exit(2);
+            };
+            const project_path = args.optionValue(argv, "--path") orelse
+                try currentWorkingDirectoryAlloc(allocator);
+            defer if (args.optionValue(argv, "--path") == null) allocator.free(project_path);
+            const response = chatDaemonSendEnvelopeAlloc(allocator, io, .{
+                .workspace_id = workspace_id,
+                .local_thread_id = local_thread_id,
+                .prompt = prompt_text,
+                .project_path = project_path,
+                .turn_id = args.optionValue(argv, "--turn"),
+            }) catch |err| return chatDaemonCliFailure(out, err);
+            defer allocator.free(response);
+            try out.stdout("{s}\n", .{response});
+            return;
+        }
         const method = if (std.mem.eql(u8, subcommand, "send")) "chat.send" else "chat.followup";
         try sendLiveRequest(allocator, out, io, method, .{
             .workspace = workspaceOption(argv),
@@ -2473,6 +2499,21 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
         return;
     }
     if (std.mem.eql(u8, subcommand, "approve")) {
+        // M4-P5: turn-addressed approval goes daemon-direct.
+        if (args.optionValue(argv, "--turn")) |turn_id| {
+            const call_id = args.optionValue(argv, "--call") orelse {
+                try out.stderr("verde live chat approve --turn requires --call\n", .{});
+                std.process.exit(2);
+            };
+            const response = chatDaemonCallEnvelopeAlloc(allocator, io, "chat.turn.approve", .{
+                .turn_id = turn_id,
+                .call_id = call_id,
+                .decision = args.optionValue(argv, "--decision") orelse "approve",
+            }) catch |err| return chatDaemonCliFailure(out, err);
+            defer allocator.free(response);
+            try out.stdout("{s}\n", .{response});
+            return;
+        }
         try sendLiveRequest(allocator, out, io, "chat.approve", .{
             .workspace = workspaceOption(argv),
             .pane = try paneOption(out, argv),
@@ -2482,9 +2523,68 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
         }, json);
         return;
     }
+    if (std.mem.eql(u8, subcommand, "stop")) {
+        // M4-P5: turn-addressed stop goes daemon-direct; pane-addressed stop
+        // keeps its Live route below.
+        if (args.optionValue(argv, "--turn")) |turn_id| {
+            const response = chatDaemonCallEnvelopeAlloc(allocator, io, "chat.turn.cancel", .{
+                .turn_id = turn_id,
+                .followup_pending = false,
+            }) catch |err| return chatDaemonCliFailure(out, err);
+            defer allocator.free(response);
+            try out.stdout("{s}\n", .{response});
+            return;
+        }
+    }
+    if (std.mem.eql(u8, subcommand, "tail")) {
+        // M4-P5: streaming read of a daemon-owned turn (daemon-direct only).
+        const turn_id = args.optionValue(argv, "--turn") orelse {
+            try out.stderr("verde live chat tail requires --turn\n", .{});
+            std.process.exit(2);
+        };
+        const after_seq = parseOptionalU32(args.optionValue(argv, "--after")) orelse 0;
+        const response = chatDaemonCallEnvelopeAlloc(allocator, io, "chat.turn.tail", .{
+            .turn_id = turn_id,
+            .after_seq = after_seq,
+        }) catch |err| return chatDaemonCliFailure(out, err);
+        defer allocator.free(response);
+        try out.stdout("{s}\n", .{response});
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "read")) {
+        // M4-P5: durable transcript read from the daemon store (daemon-direct only).
+        const workspace_id = workspaceOption(argv) orelse {
+            try out.stderr("verde live chat read requires --workspace\n", .{});
+            std.process.exit(2);
+        };
+        const local_thread_id = args.optionValue(argv, "--thread") orelse {
+            try out.stderr("verde live chat read requires --thread\n", .{});
+            std.process.exit(2);
+        };
+        const response = chatDaemonCallEnvelopeAlloc(allocator, io, headless.store.METHOD_CHAT_THREAD_GET, .{
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+        }) catch |err| return chatDaemonCliFailure(out, err);
+        defer allocator.free(response);
+        try out.stdout("{s}\n", .{response});
+        return;
+    }
     const method = try std.fmt.allocPrint(allocator, "chat.{s}", .{subcommand});
     defer allocator.free(method);
     try sendLiveRequest(allocator, out, io, method, commonPaneParams(argv), json);
+}
+
+/// M4-P5: report a failed daemon-direct chat call. Deliberately terminal —
+/// daemon-direct chat never retries through Live.
+fn chatDaemonCliFailure(out: output.Output, err: anyerror) !void {
+    switch (chatDaemonErrorRoute(err)) {
+        .capability_unavailable => try out.stderr(
+            "chat capability is unavailable on this session daemon; daemon-direct chat does not fall back to Live\n",
+            .{},
+        ),
+        .numeric => try out.stderr("daemon-direct chat call failed: {s}\n", .{@errorName(err)}),
+    }
+    std.process.exit(1);
 }
 
 const ChatOpenCreationSettings = struct {
@@ -3601,7 +3701,12 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTypedTool(&s, "list_panes", "List chat and terminal panes in a Verde workspace.", &.{
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
     });
-    try writeMcpTypedTool(&s, "open_chat", "Create a native GUI chat pane in an explicitly selected Verde workspace without changing the user's visible workspace or focus.", &OPEN_CHAT_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "open_chat", "Create a durable chat thread in an explicitly selected Verde workspace and return its stable ids. With the desktop GUI running the thread is also presented as a native chat pane; with no GUI it is created daemon-direct.", &OPEN_CHAT_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "send_chat_message", "Send a prompt on an existing chat thread daemon-direct (no GUI required) and return the accepted turn_id. Poll tail_chat_turn for streaming events and completion.", &CHAT_SEND_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "tail_chat_turn", "Read a chat turn's streamed events and status daemon-direct. Terminal status (completed/failed/aborted) is published only after the durable transcript commit.", &CHAT_TAIL_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "approve_chat_turn", "Approve or deny a chat turn's pending tool approval daemon-direct.", &CHAT_APPROVE_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "stop_chat_turn", "Stop a running chat turn daemon-direct. The interruption still commits durably.", &CHAT_STOP_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "read_chat_thread", "Read a chat thread's durable transcript daemon-direct from the session daemon store.", &CHAT_READ_MCP_INPUTS);
     try writeMcpTool(&s, "list_surfaces", "List registered live terminal control surfaces. Use list_panes for ordinary Verde terminal panes.");
     try writeMcpTool(&s, "inspect_surface", "Inspect one Verde terminal surface.");
     try writeMcpTypedTool(&s, "read_surface_screen", "Read terminal screen text. With pane_id uses the desktop Live server; with session_id talks to the session daemon directly (raw_tail fidelity, no GUI).", &TERMINAL_SURFACE_MCP_INPUTS);
@@ -3751,6 +3856,39 @@ const OPEN_CHAT_MCP_INPUTS = [_]McpToolInput{
     .{ .name = "fast_mode", .type_name = "boolean", .description = "Optional explicit Fast setting. Pass false to guarantee Fast is off." },
     .{ .name = "target_pane_id", .type_name = "integer", .description = "Optional pane beside which to place the chat; defaults to the workspace's focused pane." },
     .{ .name = "axis", .type_name = "string", .description = "Optional split axis: horizontal or vertical; defaults to horizontal." },
+};
+
+// M4-P5 daemon-direct chat tools: these call `chat.turn.*` / `chat.thread.get`
+// on the session daemon behind the shared chat capability check; an old daemon
+// (chat=false) yields a structured capability_unavailable error and is never
+// silently re-routed through Live.
+const CHAT_SEND_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "workspace_id", .type_name = "string", .description = "Stable workspace id owning the thread.", .required = true },
+    .{ .name = "local_thread_id", .type_name = "string", .description = "Stable thread id returned by open_chat or read from the thread list.", .required = true },
+    .{ .name = "prompt", .type_name = "string", .description = "User prompt text for the new turn.", .required = true },
+    .{ .name = "project_path", .type_name = "string", .description = "Optional provider working directory; defaults to VERDE_WORKSPACE_PATH. Required when that environment variable is absent." },
+    .{ .name = "turn_id", .type_name = "string", .description = "Optional stable turn id for idempotent retry; minted when omitted." },
+};
+
+const CHAT_TAIL_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "turn_id", .type_name = "string", .description = "Turn id returned by send_chat_message.", .required = true },
+    .{ .name = "after_seq", .type_name = "integer", .description = "Optional event cursor; only events with seq greater than this are returned. Defaults to 0." },
+};
+
+const CHAT_APPROVE_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "turn_id", .type_name = "string", .description = "Turn id with the pending approval.", .required = true },
+    .{ .name = "call_id", .type_name = "string", .description = "Pending approval call id from the turn's tail events.", .required = true },
+    .{ .name = "decision", .type_name = "string", .description = "approve or deny; defaults to approve.", .enum_values = &.{ "approve", "deny" } },
+};
+
+const CHAT_STOP_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "turn_id", .type_name = "string", .description = "Turn id to stop.", .required = true },
+    .{ .name = "followup_pending", .type_name = "boolean", .description = "Optional: mark the thread as expecting an immediate follow-up send." },
+};
+
+const CHAT_READ_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "workspace_id", .type_name = "string", .description = "Stable workspace id owning the thread.", .required = true },
+    .{ .name = "local_thread_id", .type_name = "string", .description = "Stable thread id to read.", .required = true },
 };
 
 const TERMINAL_SURFACE_MCP_INPUTS = [_]McpToolInput{
@@ -3957,6 +4095,74 @@ fn mcpToolsCall(
         defer allocator.free(response);
         return try mcpToolLiveTextResult(allocator, out, id_value, response, tool_name);
     }
+    // M4-P5 daemon-direct chat tools: capability-checked against the session
+    // daemon; an old daemon (chat=false) yields the structured
+    // capability_unavailable error below and is never re-routed through Live.
+    if (std.mem.eql(u8, tool_name, "send_chat_message")) {
+        const workspace_id = mcpArgString(arguments, "workspace_id") orelse
+            return try mcpError(allocator, out, id_value, -32602, "send_chat_message requires workspace_id");
+        const local_thread_id = mcpArgString(arguments, "local_thread_id") orelse
+            return try mcpError(allocator, out, id_value, -32602, "send_chat_message requires local_thread_id");
+        const prompt = mcpArgString(arguments, "prompt") orelse
+            return try mcpError(allocator, out, id_value, -32602, "send_chat_message requires prompt");
+        const project_path = mcpArgString(arguments, "project_path") orelse
+            getenvSlice("VERDE_WORKSPACE_PATH") orelse
+            return try mcpError(allocator, out, id_value, -32602, "send_chat_message requires project_path when VERDE_WORKSPACE_PATH is unset");
+        const response = chatDaemonSendEnvelopeAlloc(allocator, io, .{
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+            .prompt = prompt,
+            .project_path = project_path,
+            .turn_id = mcpArgString(arguments, "turn_id"),
+        }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
+        defer allocator.free(response);
+        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+    }
+    if (std.mem.eql(u8, tool_name, "tail_chat_turn")) {
+        const turn_id = mcpArgString(arguments, "turn_id") orelse
+            return try mcpError(allocator, out, id_value, -32602, "tail_chat_turn requires turn_id");
+        const response = chatDaemonCallEnvelopeAlloc(allocator, io, "chat.turn.tail", .{
+            .turn_id = turn_id,
+            .after_seq = mcpArgU32(arguments, "after_seq") orelse 0,
+        }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
+        defer allocator.free(response);
+        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+    }
+    if (std.mem.eql(u8, tool_name, "approve_chat_turn")) {
+        const turn_id = mcpArgString(arguments, "turn_id") orelse
+            return try mcpError(allocator, out, id_value, -32602, "approve_chat_turn requires turn_id");
+        const call_id = mcpArgString(arguments, "call_id") orelse
+            return try mcpError(allocator, out, id_value, -32602, "approve_chat_turn requires call_id");
+        const response = chatDaemonCallEnvelopeAlloc(allocator, io, "chat.turn.approve", .{
+            .turn_id = turn_id,
+            .call_id = call_id,
+            .decision = mcpArgString(arguments, "decision") orelse "approve",
+        }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
+        defer allocator.free(response);
+        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+    }
+    if (std.mem.eql(u8, tool_name, "stop_chat_turn")) {
+        const turn_id = mcpArgString(arguments, "turn_id") orelse
+            return try mcpError(allocator, out, id_value, -32602, "stop_chat_turn requires turn_id");
+        const response = chatDaemonCallEnvelopeAlloc(allocator, io, "chat.turn.cancel", .{
+            .turn_id = turn_id,
+            .followup_pending = mcpArgBool(arguments, "followup_pending") orelse false,
+        }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
+        defer allocator.free(response);
+        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+    }
+    if (std.mem.eql(u8, tool_name, "read_chat_thread")) {
+        const workspace_id = mcpArgString(arguments, "workspace_id") orelse
+            return try mcpError(allocator, out, id_value, -32602, "read_chat_thread requires workspace_id");
+        const local_thread_id = mcpArgString(arguments, "local_thread_id") orelse
+            return try mcpError(allocator, out, id_value, -32602, "read_chat_thread requires local_thread_id");
+        const response = chatDaemonCallEnvelopeAlloc(allocator, io, headless.store.METHOD_CHAT_THREAD_GET, .{
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+        }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
+        defer allocator.free(response);
+        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+    }
     if (std.mem.eql(u8, tool_name, "wait_for_process")) {
         const process_id = mcpArgString(arguments, "process_id") orelse
             return try mcpError(allocator, out, id_value, -32602, "wait_for_process requires process_id");
@@ -3994,7 +4200,15 @@ fn mcpToolsCall(
             if (mcpArgIsNonNull(arguments, "axis") and axis == null) {
                 return try mcpError(allocator, out, id_value, -32602, "open_chat axis must be a string");
             }
-            break :blk sendLiveRequestAlloc(allocator, io, "chat.open", .{
+            // M4-P5: open_chat is thread creation returning stable ids.
+            // GUI client registered (Live socket reachable): Live chat.open
+            // creates AND presents the thread — the GUI dual-writes the
+            // durable thread and its response carries the stable
+            // local_thread_id. No GUI: daemon-direct chat.thread.upsert; the
+            // thread creation succeeds with no GUI registered, and an old
+            // daemon (chat=false) gets capability_unavailable — never a
+            // second Live attempt.
+            const live_response = sendLiveRequestAlloc(allocator, io, "chat.open", .{
                 .workspace_id = workspace_id,
                 .provider = provider,
                 .model = model,
@@ -4004,7 +4218,19 @@ fn mcpToolsCall(
                 .target_pane_id = target_pane_id,
                 .axis = axis orelse "horizontal",
                 .focus = false,
-            }, 1);
+            }, 1) catch |err| live_blk: {
+                if (!isLiveSocketUnavailable(err)) return try mcpError(allocator, out, id_value, -32000, @errorName(err));
+                break :live_blk null;
+            };
+            if (live_response) |response| break :blk response;
+            break :blk chatDaemonOpenThreadEnvelopeAlloc(allocator, io, .{
+                .workspace_id = workspace_id,
+                .provider = provider,
+                .model = model,
+                .reasoning_effort = creation_settings.reasoning_effort,
+                .reasoning_variant = creation_settings.reasoning_variant,
+                .fast_mode = creation_settings.fast_mode,
+            }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
         }
         if (std.mem.eql(u8, tool_name, "list_workspaces")) {
             break :blk sendLiveRequestAlloc(allocator, io, "workspaces", .{}, 1);
@@ -4254,27 +4480,7 @@ fn mcpDaemonSessionCallAlloc(
     defer parsed.deinit();
 
     // Re-encode as a Live-shaped-ish envelope so mcpToolTextResult tagging stays consistent.
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    errdefer writer.deinit();
-    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
-    try s.beginObject();
-    try s.objectField("ok");
-    try s.write(parsed.response.isOk());
-    if (parsed.response.isOk()) {
-        const result = parsed.response.result orelse return error.InvalidResponse;
-        try s.objectField("result");
-        try s.write(result);
-    } else {
-        try s.objectField("error");
-        try s.beginObject();
-        try s.objectField("code");
-        try s.write(parsed.response.err.?.code);
-        try s.objectField("message");
-        try s.write(parsed.response.err.?.message);
-        try s.endObject();
-    }
-    try s.endObject();
-    return try writer.toOwnedSlice();
+    return try daemonResponseEnvelopeAlloc(allocator, &parsed);
 }
 
 fn mcpDaemonUnavailableError(
@@ -4318,6 +4524,282 @@ fn mcpDaemonScreenResponseWithFidelityAlloc(allocator: std.mem.Allocator, respon
         try s.objectField("error");
         try s.write(err_value);
     }
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+// ---------------------------------------------------------------------------
+// M4-P5: daemon-direct chat (MCP tools + `verde live chat` thread/turn verbs).
+//
+// Every operation here talks to the session daemon only: handshake, require
+// the advertised `chat` capability via the shared client helper, then call
+// `chat.turn.*` / `chat.thread.*`. An old daemon that advertises `chat:false`
+// surfaces error.ChatCapabilityUnavailable, which callers convert into the
+// structured capability_unavailable error — there is deliberately no code
+// path that re-routes a failed daemon-direct chat call through Live.
+// ---------------------------------------------------------------------------
+
+/// Capability payload for MCP chat tools, built from the shared client helper
+/// so the wire name and message stay pinned to the headless protocol.
+fn mcpChatUnavailableCapability() McpUnavailableCapability {
+    const err = headless.client.capabilityUnavailable(.chat);
+    return .{ .name = headless.client.RequiredCapability.chat.wireName(), .message = err.message };
+}
+
+/// Routing for a failed daemon-direct chat call. The enum has exactly two
+/// arms on purpose: capability_unavailable (old daemon) or a numeric error.
+/// A Live fallback arm does not exist (design M4-P5: "no silent Live
+/// fallback for daemon-direct chat").
+const ChatDaemonRoute = enum {
+    capability_unavailable,
+    numeric,
+};
+
+fn chatDaemonErrorRoute(err: anyerror) ChatDaemonRoute {
+    return if (err == error.ChatCapabilityUnavailable) .capability_unavailable else .numeric;
+}
+
+fn mcpChatDaemonError(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    id_value: std.json.Value,
+    err: anyerror,
+) !void {
+    switch (chatDaemonErrorRoute(err)) {
+        .capability_unavailable => return mcpToolCapabilityUnavailable(allocator, out, id_value, mcpChatUnavailableCapability(), null),
+        .numeric => return mcpError(allocator, out, id_value, -32000, @errorName(err)),
+    }
+}
+
+/// Handshake with the session daemon and gate on the advertised chat
+/// capability. Old daemons serialized `chat:false`, so the shared helper
+/// rejects them here before any chat method is attempted.
+fn chatDaemonRequireCapability(client: *headless.Client) !void {
+    const handshake = client.handshake() catch return error.SessionDaemonUnavailable;
+    headless.client.requireDaemonDirectCapability(handshake.status.capabilities, .chat) catch
+        return error.ChatCapabilityUnavailable;
+}
+
+/// Mint a collision-resistant stable id with a readable prefix.
+fn mintChatIdAlloc(allocator: std.mem.Allocator, io: std.Io, comptime prefix: []const u8) ![]u8 {
+    var raw: [8]u8 = undefined;
+    io.random(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    return std.fmt.allocPrint(allocator, prefix ++ "{d}-{s}", .{ unixTimestampMs(), @as([]const u8, &hex) });
+}
+
+/// Re-encode one daemon response as the Live-shaped `{ok, result|error}`
+/// envelope used by MCP text results and `verde live` printing.
+fn daemonResponseEnvelopeAlloc(allocator: std.mem.Allocator, parsed: *const headless.protocol.ParsedResponse) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    try s.objectField("ok");
+    try s.write(parsed.response.isOk());
+    if (parsed.response.isOk()) {
+        const result = parsed.response.result orelse return error.InvalidResponse;
+        try s.objectField("result");
+        try s.write(result);
+    } else {
+        try s.objectField("error");
+        try s.beginObject();
+        try s.objectField("code");
+        try s.write(parsed.response.err.?.code);
+        try s.objectField("message");
+        try s.write(parsed.response.err.?.message);
+        try s.endObject();
+    }
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+/// One capability-checked daemon-direct chat call returning the envelope.
+fn chatDaemonCallEnvelopeAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    method: []const u8,
+    params: anytype,
+) ![]u8 {
+    const exe_path = try platform_runtime.executablePathAlloc(allocator);
+    defer allocator.free(exe_path);
+    try ensureSessionDaemon(allocator, io, exe_path);
+    const pref_path = try prefPath(allocator);
+    defer allocator.free(pref_path);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    const arena = decode_arena.allocator();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = arena,
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(arena, &transport);
+    try chatDaemonRequireCapability(&client);
+
+    var parsed = try client.call(method, params);
+    defer parsed.deinit();
+    return try daemonResponseEnvelopeAlloc(allocator, &parsed);
+}
+
+const ChatDaemonSendArgs = struct {
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    prompt: []const u8,
+    project_path: []const u8,
+    /// Stable id for idempotent retry; minted when null.
+    turn_id: ?[]const u8 = null,
+};
+
+/// Daemon-direct chat send: read the durable thread for its provider/model
+/// settings (the thread must exist — open_chat creates it), then accept a new
+/// turn via `chat.turn.start`. The daemon stages the user row at acceptance
+/// (minting `turn:{id}:user`) and commits the transcript durably on finish.
+fn chatDaemonSendEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, send: ChatDaemonSendArgs) ![]u8 {
+    const exe_path = try platform_runtime.executablePathAlloc(allocator);
+    defer allocator.free(exe_path);
+    try ensureSessionDaemon(allocator, io, exe_path);
+    const pref_path = try prefPath(allocator);
+    defer allocator.free(pref_path);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    const arena = decode_arena.allocator();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = arena,
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(arena, &transport);
+    try chatDaemonRequireCapability(&client);
+
+    var get = try client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+        .workspace_id = send.workspace_id,
+        .local_thread_id = send.local_thread_id,
+    });
+    defer get.deinit();
+    // Pass the daemon's structured error through (not_found and friends).
+    if (!get.response.isOk()) return try daemonResponseEnvelopeAlloc(allocator, &get);
+    const thread = (try client.decodeThreadGet(&get)).thread;
+
+    const turn_id = send.turn_id orelse try mintChatIdAlloc(arena, io, "cli-turn-");
+    const fast_mode = if (thread.fast_mode) |value| std.mem.eql(u8, value, "on") else false;
+    var start = try client.call("chat.turn.start", .{
+        .turn_id = turn_id,
+        .workspace_id = send.workspace_id,
+        .local_thread_id = send.local_thread_id,
+        .project_path = send.project_path,
+        .prompt = send.prompt,
+        .thread_title = thread.title,
+        .provider = thread.provider,
+        .harness = thread.harness,
+        .model_ref = thread.model_ref,
+        .reasoning_effort = thread.reasoning_effort,
+        .opencode_reasoning_variant = thread.reasoning_variant,
+        .fast_mode = fast_mode,
+        .provider_thread_id = thread.provider_thread_id,
+        .access_mode = thread.access_mode,
+    });
+    defer start.deinit();
+    if (!start.response.isOk()) return try daemonResponseEnvelopeAlloc(allocator, &start);
+    const result = start.response.result orelse return error.InvalidResponse;
+    const created = if (result == .object)
+        jsonBool(result.object.get("created") orelse .null) orelse false
+    else
+        false;
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    try s.objectField("ok");
+    try s.write(true);
+    try s.objectField("result");
+    try s.write(.{
+        .turn_id = turn_id,
+        .workspace_id = send.workspace_id,
+        .local_thread_id = send.local_thread_id,
+        .created = created,
+        .status = "accepted",
+    });
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+const ChatDaemonOpenArgs = struct {
+    workspace_id: []const u8,
+    provider: []const u8,
+    model: ?[]const u8 = null,
+    reasoning_effort: ?[]const u8 = null,
+    reasoning_variant: ?[]const u8 = null,
+    fast_mode: ?bool = null,
+};
+
+/// Daemon-direct thread creation for open_chat with no GUI registered:
+/// register a store client and upsert the thread durably, returning its
+/// stable ids. Requires the workspace row to already exist in the daemon
+/// store (the desktop dual-write owns workspace creation).
+fn chatDaemonOpenThreadEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, open: ChatDaemonOpenArgs) ![]u8 {
+    const exe_path = try platform_runtime.executablePathAlloc(allocator);
+    defer allocator.free(exe_path);
+    try ensureSessionDaemon(allocator, io, exe_path);
+    const pref_path = try prefPath(allocator);
+    defer allocator.free(pref_path);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    const arena = decode_arena.allocator();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = arena,
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(arena, &transport);
+    try chatDaemonRequireCapability(&client);
+
+    var registered = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer registered.deinit();
+    if (registered.response.err != null) return error.SessionDaemonUnavailable;
+    const client_id = (try client.decodeClientRegister(&registered)).client_id;
+
+    const local_thread_id = try mintChatIdAlloc(arena, io, "cli-thread-");
+    const request_key = try std.fmt.allocPrint(arena, "cli:chat.open:{s}", .{local_thread_id});
+    const request: headless.store.ThreadUpsertRequest = .{
+        .mutation = .{
+            .request_key = request_key,
+            .client_id = client_id,
+        },
+        .workspace_id = open.workspace_id,
+        .thread = .{
+            .local_thread_id = local_thread_id,
+            .title = "New Chat",
+            .provider = open.provider,
+            .harness = "local_cli",
+            .model_ref = open.model,
+            .reasoning_effort = open.reasoning_effort,
+            .reasoning_variant = open.reasoning_variant,
+            .fast_mode = if (open.fast_mode) |value| (if (value) "on" else "off") else null,
+            .last_activity_at = unixTimestampMs(),
+        },
+    };
+    var parsed = try client.call(headless.store.METHOD_CHAT_THREAD_UPSERT, request);
+    defer parsed.deinit();
+    if (!parsed.response.isOk()) return try daemonResponseEnvelopeAlloc(allocator, &parsed);
+    const write = try client.decodeWriteResult(&parsed);
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    try s.objectField("ok");
+    try s.write(true);
+    try s.objectField("result");
+    try s.write(.{
+        .workspace_id = open.workspace_id,
+        .local_thread_id = local_thread_id,
+        .store_revision = write.store_revision,
+        .created = true,
+        // No GUI client is registered, so no pane presentation happened.
+        .presented = false,
+    });
     try s.endObject();
     return try writer.toOwnedSlice();
 }
@@ -4738,6 +5220,17 @@ fn mcpUnavailableCapability(tool_name: []const u8) ?McpUnavailableCapability {
     }
     if (std.mem.eql(u8, tool_name, "capture_browser_screenshot")) {
         return mcpHeadlessUnavailableCapability(.browser_screenshot);
+    }
+    // M4-P5: daemon-direct chat tools map to the coarse chat capability so an
+    // old daemon's rejection carries the stable capability payload.
+    if (std.mem.eql(u8, tool_name, "open_chat") or
+        std.mem.eql(u8, tool_name, "send_chat_message") or
+        std.mem.eql(u8, tool_name, "tail_chat_turn") or
+        std.mem.eql(u8, tool_name, "approve_chat_turn") or
+        std.mem.eql(u8, tool_name, "stop_chat_turn") or
+        std.mem.eql(u8, tool_name, "read_chat_thread"))
+    {
+        return mcpChatUnavailableCapability();
     }
     return null;
 }
@@ -5286,7 +5779,10 @@ fn optionConsumesValue(name: []const u8) bool {
         std.mem.eql(u8, name, "--x") or
         std.mem.eql(u8, name, "--y") or
         std.mem.eql(u8, name, "--button") or
-        std.mem.eql(u8, name, "--thread");
+        std.mem.eql(u8, name, "--thread") or
+        // M4-P5 daemon-direct chat addressing.
+        std.mem.eql(u8, name, "--turn") or
+        std.mem.eql(u8, name, "--after");
 }
 
 fn collectPersistedSessionRefs(allocator: std.mem.Allocator, state: db_types.PersistedState) ![]const PersistedSessionRef {
@@ -5831,6 +6327,22 @@ test "MCP unavailable mapping is limited to presentation and optional capability
         return error.MissingTerminalGridCapabilityMapping;
     try std.testing.expectEqualStrings("terminal_grid", grid.name);
 
+    // M4-P5: daemon-direct chat tools map to the coarse chat capability so an
+    // old daemon's rejection carries the stable payload (no Live fallback).
+    inline for (.{
+        "open_chat",
+        "send_chat_message",
+        "tail_chat_turn",
+        "approve_chat_turn",
+        "stop_chat_turn",
+        "read_chat_thread",
+    }) |chat_tool| {
+        const chat = mcpUnavailableCapability(chat_tool) orelse
+            return error.MissingChatCapabilityMapping;
+        try std.testing.expectEqualStrings("chat", chat.name);
+        try std.testing.expectEqualStrings("chat capability is unavailable", chat.message);
+    }
+
     // Daemon-domain and raw terminal operations retain their existing transport errors.
     try std.testing.expect(mcpUnavailableCapability("list_workspaces") == null);
     try std.testing.expect(mcpUnavailableCapability("tail_surface_output") == null);
@@ -5905,7 +6417,9 @@ test "MCP maps only capability-shaped Live business errors" {
 test "MCP Live routing composes business, socket, and numeric branches" {
     const allocator = std.testing.allocator;
     const browser_tool = "capture_browser_screenshot";
-    const non_capability_tool = "open_chat";
+    // M4-P5: open_chat gained a chat capability mapping, so the non-capability
+    // pin moved to a tool that genuinely retains numeric transport errors.
+    const non_capability_tool = "list_workspaces";
     const business_response =
         "{\"id\":1,\"ok\":false,\"error\":{\"code\":\"unsupported\",\"message\":\"browser runtime is disabled\"}}";
 
@@ -5932,6 +6446,58 @@ test "MCP Live routing composes business, socket, and numeric branches" {
         McpLiveCallRoute.numeric,
         mcpLiveCallRoute(non_capability_tool, error.OutOfMemory),
     );
+}
+
+test "M4-P5 daemon-direct chat routing has no Live fallback arm" {
+    // Structural pin: ChatDaemonRoute has exactly two arms — the old-daemon
+    // capability rejection and numeric errors. A Live fallback variant does
+    // not exist (design M4-P5: "no silent Live fallback for daemon-direct
+    // chat"), so a socket-shaped or transport error can only surface as a
+    // numeric failure, never as a re-route.
+    try std.testing.expectEqual(2, @typeInfo(ChatDaemonRoute).@"enum".fields.len);
+    try std.testing.expectEqual(
+        ChatDaemonRoute.capability_unavailable,
+        chatDaemonErrorRoute(error.ChatCapabilityUnavailable),
+    );
+    try std.testing.expectEqual(ChatDaemonRoute.numeric, chatDaemonErrorRoute(error.ConnectionRefused));
+    try std.testing.expectEqual(ChatDaemonRoute.numeric, chatDaemonErrorRoute(error.FileNotFound));
+    try std.testing.expectEqual(ChatDaemonRoute.numeric, chatDaemonErrorRoute(error.SessionDaemonUnavailable));
+
+    // The MCP payload for the old-daemon rejection reuses the shared client
+    // helper's stable wire name and message.
+    const capability = mcpChatUnavailableCapability();
+    try std.testing.expectEqualStrings("chat", capability.name);
+    try std.testing.expectEqualStrings("chat capability is unavailable", capability.message);
+}
+
+test "M4-P5 MCP chat tool schemas require stable daemon addressing" {
+    // send: workspace + thread + prompt are required; turn_id is an optional
+    // idempotency handle; project_path optional (env-defaulted).
+    var required_count: usize = 0;
+    for (CHAT_SEND_MCP_INPUTS) |input| {
+        if (input.required) required_count += 1;
+        if (std.mem.eql(u8, input.name, "turn_id")) try std.testing.expect(!input.required);
+        if (std.mem.eql(u8, input.name, "project_path")) try std.testing.expect(!input.required);
+    }
+    try std.testing.expectEqual(@as(usize, 3), required_count);
+
+    // approve requires the exact pending call identity; decision is enum-typed.
+    var saw_decision = false;
+    for (CHAT_APPROVE_MCP_INPUTS) |input| {
+        if (std.mem.eql(u8, input.name, "turn_id") or std.mem.eql(u8, input.name, "call_id")) {
+            try std.testing.expect(input.required);
+        }
+        if (std.mem.eql(u8, input.name, "decision")) {
+            saw_decision = true;
+            try std.testing.expect(input.enum_values != null);
+        }
+    }
+    try std.testing.expect(saw_decision);
+
+    // read/tail address durable thread ids and turn ids respectively.
+    try std.testing.expect(CHAT_READ_MCP_INPUTS[0].required and CHAT_READ_MCP_INPUTS[1].required);
+    try std.testing.expect(CHAT_TAIL_MCP_INPUTS[0].required);
+    try std.testing.expect(!CHAT_TAIL_MCP_INPUTS[1].required);
 }
 
 test "notify handler requires a dedicated exe_path separate from flag argv" {

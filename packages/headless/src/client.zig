@@ -1071,6 +1071,34 @@ test "store capability gate reports capability_unavailable" {
     try std.testing.expectEqualStrings("store capability is unavailable", unavailable.message);
 }
 
+test "M4-P5 chat flip: current daemon passes, old-daemon shape rejects daemon-direct chat" {
+    // Flip side A: a current daemon (phase1) advertises chat, so the shared
+    // capability check helper admits daemon-direct chat calls.
+    const current = protocol.Capabilities.phase1();
+    try requireCapability(current, .chat);
+    try requireDaemonDirectCapability(current, .chat);
+
+    // Flip side B: an old daemon serialized `chat:false` explicitly; the
+    // helper must reject with CapabilityUnavailable, and the caller surfaces
+    // capabilityUnavailable(.chat) — never a silent re-route through Live.
+    const old_shape =
+        \\{"headless_protocol_version":1,"min_supported":1,"max_supported":1,"capabilities":{"terminal_raw":true,"terminal_grid":false,"chat":false,"processes":false,"leases":false,"browser_execution":false,"browser_presentation":false}}
+    ;
+    var parsed = try std.json.parseFromSlice(protocol.CapabilitiesResult, std.testing.allocator, old_shape, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try std.testing.expectError(
+        error.CapabilityUnavailable,
+        requireDaemonDirectCapability(parsed.value.capabilities, .chat),
+    );
+
+    const unavailable = capabilityUnavailable(.chat);
+    try std.testing.expectEqualStrings("chat", RequiredCapability.chat.wireName());
+    try std.testing.expectEqualStrings(protocol.ERR_CAPABILITY_UNAVAILABLE, unavailable.code);
+    try std.testing.expectEqualStrings("chat capability is unavailable", unavailable.message);
+}
+
 test "capability checks support direct registry mode" {
     const phase1 = protocol.Capabilities.phase1();
     try requireCapability(phase1, .terminal_raw);
