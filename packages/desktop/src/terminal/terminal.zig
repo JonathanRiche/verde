@@ -1793,11 +1793,15 @@ pub const Dock = struct {
     }
 
     fn allocatePaneIdWithin(self: *Dock, limit: u32) !u32 {
-        std.debug.assert(limit > 0);
+        std.debug.assert(limit > 0 and limit <= MAX_PANE_ID);
+        var occupied: std.bit_set.StaticBitSet(MAX_PANE_ID + 1) = .empty;
+        for (self.tabs.items) |tab| markOccupiedPaneIds(tab.root, limit, &occupied);
+        if (occupied.count() >= @as(usize, limit)) return error.PaneIdExhausted;
+
         var candidate = if (self.next_pane_id == 0 or self.next_pane_id > limit) @as(u32, 1) else self.next_pane_id;
         var attempts: u32 = 0;
         while (attempts < limit) : (attempts += 1) {
-            if (self.findPaneById(candidate) == null) {
+            if (!occupied.isSet(@intCast(candidate))) {
                 self.next_pane_id = if (candidate == limit) 1 else candidate + 1;
                 return candidate;
             }
@@ -1884,6 +1888,22 @@ pub const Dock = struct {
         return true;
     }
 };
+
+fn markOccupiedPaneIds(
+    node: *const PaneNode,
+    limit: u32,
+    occupied: *std.bit_set.StaticBitSet(MAX_PANE_ID + 1),
+) void {
+    switch (node.*) {
+        .leaf => |leaf| {
+            if (leaf.id > 0 and leaf.id <= limit) occupied.set(@intCast(leaf.id));
+        },
+        .split => |split| {
+            markOccupiedPaneIds(split.first, limit, occupied);
+            markOccupiedPaneIds(split.second, limit, occupied);
+        },
+    }
+}
 
 fn deinitPaneNode(node: *PaneNode, allocator: std.mem.Allocator) void {
     switch (node.*) {
@@ -2430,16 +2450,40 @@ fn persistedRevivePolicy(revive_policy: TerminalRevivePolicy) TerminalRevivePoli
 }
 
 fn validatePersistedPaneIds(allocator: std.mem.Allocator, persisted: PersistedWorkspace) !void {
-    var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
-    defer seen.deinit(allocator);
+    var seen_pane_ids: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer seen_pane_ids.deinit(allocator);
     for (persisted.tabs) |tab| {
         if (tab.active_pane_id > MAX_PANE_ID) return error.InvalidPersistedTerminalLayout;
-        for (tab.nodes) |node| {
-            if (node.kind != .leaf) continue;
-            if (node.pane_id == 0 or node.pane_id > MAX_PANE_ID) return error.InvalidPersistedTerminalLayout;
-            const entry = try seen.getOrPut(allocator, node.pane_id);
-            if (entry.found_existing) return error.InvalidPersistedTerminalLayout;
+
+        var node_indexes: std.AutoHashMapUnmanaged(u32, usize) = .empty;
+        defer node_indexes.deinit(allocator);
+        for (tab.nodes, 0..) |node, index| {
+            const node_entry = try node_indexes.getOrPut(allocator, node.node_id);
+            if (node_entry.found_existing) return error.InvalidPersistedTerminalLayout;
+            node_entry.value_ptr.* = index;
+            if (node.kind == .leaf) {
+                if (node.pane_id == 0 or node.pane_id > MAX_PANE_ID) return error.InvalidPersistedTerminalLayout;
+                const pane_entry = try seen_pane_ids.getOrPut(allocator, node.pane_id);
+                if (pane_entry.found_existing) return error.InvalidPersistedTerminalLayout;
+            }
         }
+
+        var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer visited.deinit(allocator);
+        var pending: std.ArrayList(u32) = .empty;
+        defer pending.deinit(allocator);
+        try pending.append(allocator, tab.root_node_id);
+        while (pending.pop()) |node_id| {
+            const visited_entry = try visited.getOrPut(allocator, node_id);
+            if (visited_entry.found_existing) return error.InvalidPersistedTerminalLayout;
+            const node_index = node_indexes.get(node_id) orelse return error.InvalidPersistedTerminalLayout;
+            const node = tab.nodes[node_index];
+            if (node.kind == .split) {
+                try pending.append(allocator, node.first_node_id orelse return error.InvalidPersistedTerminalLayout);
+                try pending.append(allocator, node.second_node_id orelse return error.InvalidPersistedTerminalLayout);
+            }
+        }
+        if (visited.count() != tab.nodes.len) return error.InvalidPersistedTerminalLayout;
     }
 }
 
@@ -5525,6 +5569,52 @@ test "persisted layout rejects out-of-range pane id without replacing live layou
     try std.testing.expectEqual(live_pane_id, dock.activePaneConst().?.id);
 }
 
+test "persisted layout rejects shared child references without replacing live layout" {
+    const allocator = std.testing.allocator;
+    var dock = try Dock.init(allocator);
+    defer dock.deinit(allocator);
+    try dock.tabs.append(allocator, try dock.buildSinglePaneTabWithoutSession(allocator));
+    const live_pane_id = dock.activePaneConst().?.id;
+    const invalid_layout_json =
+        \\{"tabs":[{
+        \\  "active_pane_id":7,"root_node_id":1,"nodes":[
+        \\    {"node_id":1,"kind":"split","first_node_id":2,"second_node_id":2},
+        \\    {"node_id":2,"kind":"leaf","pane_id":7}
+        \\  ]
+        \\}]}
+    ;
+
+    try std.testing.expectError(
+        error.InvalidPersistedTerminalLayout,
+        dock.applyPersistedLayoutJson(allocator, invalid_layout_json),
+    );
+    try std.testing.expectEqual(@as(usize, 1), dock.tabs.items.len);
+    try std.testing.expectEqual(live_pane_id, dock.activePaneConst().?.id);
+}
+
+test "persisted layout rejects cycles without replacing live layout" {
+    const allocator = std.testing.allocator;
+    var dock = try Dock.init(allocator);
+    defer dock.deinit(allocator);
+    try dock.tabs.append(allocator, try dock.buildSinglePaneTabWithoutSession(allocator));
+    const live_pane_id = dock.activePaneConst().?.id;
+    const invalid_layout_json =
+        \\{"tabs":[{
+        \\  "active_pane_id":7,"root_node_id":1,"nodes":[
+        \\    {"node_id":1,"kind":"split","first_node_id":2,"second_node_id":1},
+        \\    {"node_id":2,"kind":"leaf","pane_id":7}
+        \\  ]
+        \\}]}
+    ;
+
+    try std.testing.expectError(
+        error.InvalidPersistedTerminalLayout,
+        dock.applyPersistedLayoutJson(allocator, invalid_layout_json),
+    );
+    try std.testing.expectEqual(@as(usize, 1), dock.tabs.items.len);
+    try std.testing.expectEqual(live_pane_id, dock.activePaneConst().?.id);
+}
+
 test "pane id exhaustion is fallible and never returns a duplicate" {
     const allocator = std.testing.allocator;
     var dock = try Dock.init(allocator);
@@ -5538,6 +5628,40 @@ test "pane id exhaustion is fallible and never returns a duplicate" {
     try std.testing.expectEqualStrings("session-1", dock.paneById(1).?.session_id.?);
     try std.testing.expectEqualStrings("session-2", dock.paneById(2).?.session_id.?);
     try std.testing.expectEqualStrings("session-3", dock.paneById(3).?.session_id.?);
+}
+
+test "pane id allocation stays linear at the full id bound" {
+    const allocator = std.testing.allocator;
+    var dock = try Dock.init(allocator);
+    defer dock.deinit(allocator);
+
+    var pane_id: u32 = 1;
+    while (pane_id < MAX_PANE_ID) : (pane_id += 1) {
+        const node = try allocator.create(PaneNode);
+        node.* = .{ .leaf = .{ .id = pane_id } };
+        dock.tabs.append(allocator, .{
+            .id = pane_id,
+            .root = node,
+            .active_pane_id = pane_id,
+        }) catch |err| {
+            allocator.destroy(node);
+            return err;
+        };
+    }
+    dock.next_pane_id = 1;
+    try std.testing.expectEqual(MAX_PANE_ID, try dock.allocatePaneIdWithin(MAX_PANE_ID));
+
+    const last_node = try allocator.create(PaneNode);
+    last_node.* = .{ .leaf = .{ .id = MAX_PANE_ID } };
+    dock.tabs.append(allocator, .{
+        .id = MAX_PANE_ID,
+        .root = last_node,
+        .active_pane_id = MAX_PANE_ID,
+    }) catch |err| {
+        allocator.destroy(last_node);
+        return err;
+    };
+    try std.testing.expectError(error.PaneIdExhausted, dock.allocatePaneIdWithin(MAX_PANE_ID));
 }
 
 test "persisted restart revive policy reloads as attach" {

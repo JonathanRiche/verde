@@ -268,6 +268,7 @@ pub fn pollFlushWorker(self: anytype) void {
         self.storage.clearPendingStateSpoolBestEffort();
         self.lifecycle.clearDirtyForGeneration(self.lifecycle.flush_snapshot_generation);
         self.lifecycle.next_flush_attempt_ms = 0;
+        clearCloseDurabilityNoticeAfterSuccess(self);
     } else if (conflict) {
         log.warn("async native state save conflicted; awaiting cursor rebase", .{});
         self.lifecycle.next_flush_attempt_ms = now + FLUSH_RETRY_BACKOFF_MS;
@@ -290,11 +291,15 @@ pub fn flushDirtyBlocking(self: anytype) void {
 /// only after this returns successfully; failure leaves every live owner and
 /// controller untouched so an interactive close request can be retried.
 pub fn handoffDirtyStateForShutdown(self: anytype) !void {
-    if (!self.lifecycle.dirty or self.lifecycle.dirty_spooled) return;
+    if (!self.lifecycle.dirty or self.lifecycle.dirty_spooled) {
+        clearCloseDurabilityNoticeAfterSuccess(self);
+        return;
+    }
     try flushDirtyBlockingResult(self);
     if (self.lifecycle.dirty and !self.lifecycle.dirty_spooled) {
         try spoolDirtyState(self, "shutdown durability handoff retry");
     }
+    clearCloseDurabilityNoticeAfterSuccess(self);
 }
 
 fn flushDirtyBlockingResult(self: anytype) !void {
@@ -372,6 +377,13 @@ fn flushDirtyBlockingResult(self: anytype) !void {
         self.storage.clearPendingStateSpoolBestEffort();
         self.lifecycle.clearDirty();
         self.lifecycle.next_flush_attempt_ms = 0;
+        clearCloseDurabilityNoticeAfterSuccess(self);
+    }
+}
+
+fn clearCloseDurabilityNoticeAfterSuccess(self: anytype) void {
+    if (@hasDecl(@TypeOf(self.*), "clearCloseDurabilityNotice")) {
+        self.clearCloseDurabilityNotice();
     }
 }
 
@@ -447,6 +459,11 @@ test "acknowledged full save atomically advances revision-paired projection base
     const FakeState = struct {
         lifecycle: State = .{},
         storage: *FakeStorage,
+        close_durability_notice: bool = true,
+
+        fn clearCloseDurabilityNotice(self: *@This()) void {
+            self.close_durability_notice = false;
+        }
     };
 
     var storage: FakeStorage = .{ .allocator = std.testing.allocator };
@@ -483,6 +500,7 @@ test "acknowledged full save atomically advances revision-paired projection base
     try std.testing.expect(state.lifecycle.projection_baseline.?.value.sidebar_collapsed);
     try std.testing.expectEqual(@as(?u64, 5), state.lifecycle.projection_baseline_revision);
     try std.testing.expect(storage.cleared_spool);
+    try std.testing.expect(!state.close_durability_notice);
 }
 
 test "shutdown blocking flush repairs conflict or terminal adoption before saving" {
