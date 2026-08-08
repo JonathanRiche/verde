@@ -59,6 +59,11 @@ const SESSIONIZER_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum response capacity accepted by the sessionizer protocol.
 pub const MAX_RESPONSE_BYTES: usize = SESSIONIZER_MAX_MESSAGE_BYTES;
 const SESSIONIZER_REQUEST_TIMEOUT_MS: u32 = 5000;
+/// Q7: hard ceiling for a `core.changes` bounded long-poll (25s). A real
+/// limit, not a tuning knob: it bounds how long a parked waiter can occupy
+/// one of the TRANSPORT_WORKER_COUNT transport workers before answering with
+/// a heartbeat, so a shutdown/join is never gated on an unbounded wait.
+const MAX_CHANGES_WAIT_MS: u32 = 25_000;
 const ATTACH_STALE_MS: i64 = 60 * std.time.ms_per_s;
 /// Env override so hermetic tests can force a fast idle exit without changing
 /// production lifetime policy (null / unset = never idle-exit).
@@ -1747,6 +1752,22 @@ pub const Daemon = struct {
     /// and store service mutex → journal_mutex; the journal path never takes
     /// another lock, so no cycle is possible.
     journal_mutex: std.atomic.Mutex = .unlocked,
+    /// M5-P3 long-poll park state. `changes_signal` is a futex word bumped by
+    /// every journal append (after the leaf lock is RELEASED) and by drain;
+    /// parked `core.changes` waiters sleep on it holding NO locks. The
+    /// missed-wake-free protocol: a waiter loads this BEFORE reading the
+    /// journal window, and the appender appends BEFORE bumping — so either
+    /// the waiter's read sees the entry or its futex expectation is stale and
+    /// the wait returns immediately.
+    changes_signal: std.atomic.Value(u32) = .init(0),
+    /// Count of currently parked long-pollers, capped at
+    /// platform_ipc.MAX_PARKED_LONG_POLL_WAITERS (Q7). Over-cap requests
+    /// degrade to an immediate heartbeat — never an error.
+    changes_parked: std.atomic.Value(u32) = .init(0),
+    /// Sticky drain latch (prepareShutdown accepted, or transport draining).
+    /// Parked waiters terminate with the structured drain response; new
+    /// positive waits degrade to immediate heartbeats.
+    changes_draining: std.atomic.Value(bool) = .init(false),
 
     pub fn init(allocator: std.mem.Allocator) Daemon {
         return initWithPrefPath(allocator, "");
@@ -2557,9 +2578,14 @@ pub const Daemon = struct {
         return try okValueResponse(self.allocator, id_value, write_result);
     }
 
-    /// core.changes: immediate-check cursor poll (M5-P2). wait_ms>0 is CLAMPED
-    /// to 0 this phase — the serial accept loop must never park; a positive
-    /// wait degrades to an immediate (possibly heartbeat-shaped) reply.
+    /// core.changes: cursor poll with a real bounded long-poll (M5-P3).
+    /// wait_ms clamps to MAX_CHANGES_WAIT_MS (25s, Q7); an exhausted wait is
+    /// a heartbeat, never an error. Parked waiters sleep on `changes_signal`
+    /// holding NO locks; drain wakes them into the structured drain error.
+    /// Over-cap long-polls (Q7: more than MAX_PARKED_LONG_POLL_WAITERS
+    /// already parked) reuse the wait_ms=0 immediate path — heartbeat, never
+    /// an error. Bootstrap (absent cursor) never parks: there is no "since"
+    /// point for new entries to satisfy.
     ///
     /// Capture order pins the reply invariant "envelope/store_revision >= any
     /// entry's revision": the journal window is copied FIRST, then the
@@ -2573,48 +2599,84 @@ pub const Daemon = struct {
         service: *StoreService,
         request: changes_protocol.ChangesRequest,
     ) ![]u8 {
+        // A4: the over-cap degradation and the plain wait_ms=0 request share
+        // this one clamp + immediate-check code path.
+        const effective_wait_ms: u32 = @min(request.wait_ms, MAX_CHANGES_WAIT_MS);
+        const wait_deadline_ms: i64 = nowMs() + effective_wait_ms;
+        var wait_exhausted = false;
+
         // (1) Journal window under the leaf lock; entries copy into the arena.
+        // Re-checked after every park wake-up until it is non-empty, the wait
+        // budget is spent, or drain terminates the poll.
         var entries: std.ArrayList(changes_protocol.ChangeEntry) = .empty;
         var next_cursor: u64 = 0;
         var floor_seq: u64 = 0;
-        {
-            lockJournal(self);
-            defer self.journal_mutex.unlock();
-            if (request.cursor) |cursor| {
-                switch (self.journal.entriesAfter(cursor)) {
-                    .expired => |expired| {
-                        // Q6: expiry is an error envelope with a floor_seq datum.
-                        var data_map: std.json.ObjectMap = .empty;
-                        try data_map.put(arena, "floor_seq", .{ .integer = std.math.cast(i64, expired.floor_seq) orelse std.math.maxInt(i64) });
-                        return try errorResponseAllocWithData(
-                            self.allocator,
-                            id_value,
-                            headless.protocol.ERR_REVISION_EXPIRED,
-                            "cursor below journal floor",
-                            .{ .object = data_map },
-                        );
-                    },
-                    .ok => |window| {
-                        next_cursor = window.last_change_seq;
-                        floor_seq = window.journal_floor_seq;
-                        for (window.entries) |entry| {
-                            if (!changeEntryMatchesTopics(entry.topic, request.topics)) continue;
-                            try entries.append(arena, .{
-                                .change_seq = entry.change_seq,
-                                .topic = entry.topic.wireName(),
-                                .resource_id = try arena.dupe(u8, entry.resource_id),
-                                .workspace_id = if (entry.workspace_id) |value| try arena.dupe(u8, value) else null,
-                                .store_revision = entry.store_revision,
-                                .registry_revision = entry.registry_revision,
-                            });
-                        }
-                    },
+        park_loop: while (true) {
+            // Missed-wake protocol: load the signal word BEFORE the window
+            // read. An append bumps it only AFTER releasing the leaf lock, so
+            // either this read observes the entry or the park below sees a
+            // changed word and returns immediately.
+            const observed_signal = self.changes_signal.load(.acquire);
+            entries = .empty; // Prior iteration's copies are arena garbage.
+            {
+                lockJournal(self);
+                defer self.journal_mutex.unlock();
+                if (request.cursor) |cursor| {
+                    switch (self.journal.entriesAfter(cursor)) {
+                        .expired => |expired| {
+                            // Q6: expiry is an error envelope with a floor_seq datum.
+                            var data_map: std.json.ObjectMap = .empty;
+                            try data_map.put(arena, "floor_seq", .{ .integer = std.math.cast(i64, expired.floor_seq) orelse std.math.maxInt(i64) });
+                            return try errorResponseAllocWithData(
+                                self.allocator,
+                                id_value,
+                                headless.protocol.ERR_REVISION_EXPIRED,
+                                "cursor below journal floor",
+                                .{ .object = data_map },
+                            );
+                        },
+                        .ok => |window| {
+                            next_cursor = window.last_change_seq;
+                            floor_seq = window.journal_floor_seq;
+                            for (window.entries) |entry| {
+                                if (!changeEntryMatchesTopics(entry.topic, request.topics)) continue;
+                                try entries.append(arena, .{
+                                    .change_seq = entry.change_seq,
+                                    .topic = entry.topic.wireName(),
+                                    .resource_id = try arena.dupe(u8, entry.resource_id),
+                                    .workspace_id = if (entry.workspace_id) |value| try arena.dupe(u8, value) else null,
+                                    .store_revision = entry.store_revision,
+                                    .registry_revision = entry.registry_revision,
+                                });
+                            }
+                        },
+                    }
+                } else {
+                    // Absent cursor bootstraps at the tail: no historical replay,
+                    // and no expiry check because nothing could have been missed.
+                    next_cursor = self.journal.last_seq;
+                    floor_seq = self.journal.journal_floor_seq;
                 }
-            } else {
-                // Absent cursor bootstraps at the tail: no historical replay,
-                // and no expiry check because nothing could have been missed.
-                next_cursor = self.journal.last_seq;
-                floor_seq = self.journal.journal_floor_seq;
+            }
+
+            if (entries.items.len != 0) break :park_loop;
+            if (request.cursor == null) break :park_loop; // Bootstrap never parks.
+            if (effective_wait_ms == 0) break :park_loop; // Immediate check (incl. A4 over-cap reuse).
+            if (wait_exhausted) break :park_loop; // Budget spent → heartbeat.
+            // Draining before park: degrade NEW long-polls to an immediate
+            // heartbeat; only already-parked waiters get the drain error.
+            if (self.changes_draining.load(.acquire)) break :park_loop;
+            switch (self.parkForChanges(observed_signal, wait_deadline_ms)) {
+                .woken => continue :park_loop,
+                // One final consistent window read, then heartbeat.
+                .timed_out => {
+                    wait_exhausted = true;
+                    continue :park_loop;
+                },
+                // Q7 pinned: over-cap degrades to the immediate heartbeat
+                // shape above, NEVER an error.
+                .over_cap => break :park_loop,
+                .drained => return try self.changesDrainingResponse(arena, id_value),
             }
         }
 
@@ -2635,8 +2697,9 @@ pub const Daemon = struct {
         };
         service.mutex.unlock();
 
-        // (4) Assembly off every lock. wait_ms was deliberately ignored above
-        // (clamped to 0); an empty window is reported as a heartbeat.
+        // (4) Assembly off every lock. An empty window (immediate check,
+        // exhausted long-poll, over-cap degradation, or drain pre-park) is
+        // reported as a heartbeat.
         const result: changes_protocol.ChangesResult = .{
             .entries = entries.items,
             .next_cursor = next_cursor,
@@ -2647,6 +2710,22 @@ pub const Daemon = struct {
             .store_revision = store_revision,
         };
         return try okValueResponse(self.allocator, id_value, result);
+    }
+
+    /// Structured drain response for a parked long-poll waiter woken by
+    /// beginChangesDrain (A2): the client learns the daemon is going away
+    /// (invalid_state + data.reason="draining") instead of receiving a
+    /// heartbeat that invites an immediate re-poll of a dying endpoint.
+    fn changesDrainingResponse(self: *Daemon, arena: std.mem.Allocator, id_value: std.json.Value) ![]u8 {
+        var data_map: std.json.ObjectMap = .empty;
+        try data_map.put(arena, "reason", .{ .string = "draining" });
+        return try errorResponseAllocWithData(
+            self.allocator,
+            id_value,
+            headless.protocol.ERR_INVALID_STATE,
+            "daemon is draining; long-poll terminated",
+            .{ .object = data_map },
+        );
     }
 
     /// M5-P2 composite snapshot. Capture order: journal cursor FIRST, then the
@@ -2811,7 +2890,7 @@ pub const Daemon = struct {
         }
         // Store gate (after registry is clear): refuse while writes are in flight.
         // in_flight counts mutators only (not daemon.storeStatus), so this field
-        // stays truthful once the accept loop is concurrent.
+        // stays truthful under the concurrent transport (M5-P3).
         if (self.store_service) |service| {
             const store_writes_in_flight = service.in_flight.load(.monotonic);
             if (store_writes_in_flight > 0) {
@@ -2822,6 +2901,11 @@ pub const Daemon = struct {
         }
         self.accepting_mutations = false;
         self.shutdown_requested = true;
+        // Accepted handoff: terminate parked core.changes long-polls with the
+        // structured drain response NOW (atomics + futex only — safe under
+        // the caller's daemon lock) so no waiter rides out its wait against a
+        // daemon that is about to release the endpoint.
+        self.beginChangesDrain();
         return try okValueResponse(self.allocator, id_value, .{
             .accepted = true,
             .safe_to_exit = true,
@@ -3709,14 +3793,74 @@ pub const Daemon = struct {
         workspace_id: ?[]const u8,
         revision: change_journal.Revision,
     ) void {
-        lockJournal(self);
-        defer self.journal_mutex.unlock();
-        _ = self.journal.append(self.allocator, topic, resource_id, workspace_id, revision, nowMs()) catch {
-            // The entry the client should have seen was dropped; force every
-            // existing cursor below the new floor so it snapshot-falls-back.
-            self.journal.last_seq += 1;
-            self.journal.journal_floor_seq = self.journal.last_seq;
-        };
+        {
+            lockJournal(self);
+            defer self.journal_mutex.unlock();
+            _ = self.journal.append(self.allocator, topic, resource_id, workspace_id, revision, nowMs()) catch {
+                // The entry the client should have seen was dropped; force every
+                // existing cursor below the new floor so it snapshot-falls-back.
+                self.journal.last_seq += 1;
+                self.journal.journal_floor_seq = self.journal.last_seq;
+            };
+        }
+        // M5-P3 wake ordering (append → signal, leaf lock released first): a
+        // parked core.changes waiter either re-reads the window and sees this
+        // entry, or it loaded changes_signal before this bump and its futex
+        // wait returns immediately on the changed value — a wake can never be
+        // missed, and the waker never holds the lock the woken reader needs.
+        self.signalChangesWaiters();
+    }
+
+    /// Publish "the journal advanced (or drain began)" to parked long-pollers.
+    /// The fetchAdd is unconditional so the signal word always reflects every
+    /// append; the futexWake syscall is skipped when nobody is parked.
+    fn signalChangesWaiters(self: *Daemon) void {
+        _ = self.changes_signal.fetchAdd(1, .release);
+        if (self.changes_parked.load(.acquire) == 0) return;
+        // The Threaded futex shim is stateless; an ephemeral instance is the
+        // sanctioned way to reach futexWake from an arbitrary thread.
+        var threaded = std.Io.Threaded.init_single_threaded;
+        threaded.io().futexWake(u32, &self.changes_signal.raw, std.math.maxInt(u32));
+    }
+
+    /// Begin core.changes drain (sticky): parked waiters wake and answer with
+    /// the structured drain response; new positive waits degrade to immediate
+    /// heartbeats. Called by prepareShutdown (accepted) and by the transport's
+    /// on_draining callback — before transport workers are joined, so a
+    /// parked waiter can never stall worker quiesce.
+    fn beginChangesDrain(self: *Daemon) void {
+        self.changes_draining.store(true, .release);
+        self.signalChangesWaiters();
+    }
+
+    const ChangesParkOutcome = enum { woken, timed_out, drained, over_cap };
+
+    /// Park the calling transport worker until the journal advances, the
+    /// deadline passes, or drain begins. Holds NO locks while parked (Q7).
+    /// `observed_signal` must have been loaded BEFORE the caller's journal
+    /// window read — that ordering is the missed-wake guarantee.
+    fn parkForChanges(self: *Daemon, observed_signal: u32, deadline_ms: i64) ChangesParkOutcome {
+        // Q7 parked-waiter cap: reserve a slot first; over-cap callers degrade
+        // to an immediate heartbeat (never an error — pinned in the IT).
+        const prev_parked = self.changes_parked.fetchAdd(1, .acquire);
+        if (prev_parked >= platform_ipc.MAX_PARKED_LONG_POLL_WAITERS) {
+            _ = self.changes_parked.fetchSub(1, .release);
+            return .over_cap;
+        }
+        defer _ = self.changes_parked.fetchSub(1, .release);
+
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const io = threaded.io();
+        while (true) {
+            if (self.changes_draining.load(.acquire)) return .drained;
+            if (self.changes_signal.load(.acquire) != observed_signal) return .woken;
+            const remaining = deadline_ms - nowMs();
+            if (remaining <= 0) return .timed_out;
+            io.futexWaitTimeout(u32, &self.changes_signal.raw, observed_signal, .{ .duration = .{
+                .raw = std.Io.Duration.fromMilliseconds(@intCast(remaining)),
+                .clock = .awake,
+            } }) catch {};
+        }
     }
 
     fn removeSessionById(self: *Daemon, session_id: []const u8) bool {
@@ -5498,9 +5642,13 @@ fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8) !vo
         .should_stop = sessionizerServerShouldStop,
         .handle_request = handleSessionizerServerRequest,
         .on_ready = sessionizerServerReady,
-        // Transfer commit + store close run here — after accept exits, before
-        // ipc.serve's endpoint teardown defers release the socket/lock.
+        // Transfer commit + store close run here — after accept exits AND
+        // after every transport worker is quiesced/joined, before ipc.serve's
+        // endpoint teardown defers release the socket/lock.
         .on_closing = sessionizerServerClosing,
+        // Runs before workers are joined: wakes parked core.changes waiters
+        // so quiesce is bounded by request work, never by a parked long-poll.
+        .on_draining = sessionizerServerDraining,
     }, .{
         .max_message_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
         .max_response_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
@@ -5531,9 +5679,20 @@ fn sessionizerServerReady(raw_context: *anyopaque) !void {
     }});
 }
 
-/// Invoked by platform_ipc.serve after the accept loop exits and before its
-/// endpoint teardown defers run. Join the drain thread and finalize the store
-/// transfer while this process still holds exclusive endpoint ownership.
+/// Invoked by platform_ipc.serve after the accept loop exits, BEFORE the
+/// transport worker pool is joined (M5-P3). A `core.changes` long-poll parked
+/// on a worker thread holds that worker; waking it here (with the structured
+/// drain response) is what makes the subsequent worker join bounded.
+fn sessionizerServerDraining(raw_context: *anyopaque) void {
+    const context: *SessionizerServerContext = @ptrCast(@alignCast(raw_context));
+    context.daemon.beginChangesDrain();
+}
+
+/// Invoked by platform_ipc.serve after the accept loop exits and every
+/// transport worker is quiesced/joined (on_draining above ran first), and
+/// before its endpoint teardown defers run. Join the drain thread and
+/// finalize the store transfer while this process still holds exclusive
+/// endpoint ownership.
 fn sessionizerServerClosing(raw_context: *anyopaque) void {
     const context: *SessionizerServerContext = @ptrCast(@alignCast(raw_context));
     context.stop_requested.store(true, .release);
@@ -5602,15 +5761,29 @@ fn storeMutationCommittedHook(context: *anyopaque, mutation: *const daemon_store
             for (request.snapshot.chat_completions) |completion| {
                 daemon.appendJournalEntry(.chat_completion, completion.local_thread_id, completion.workspace_id, revision);
             }
+            // MAJOR-2 (M5-P3 amendment): a replace DELETES everything it does
+            // not carry — including the empty replace, which carries nothing —
+            // so per-resource entries alone leave deletions cursor-invisible
+            // and clients would keep deleted workspaces forever. Publish one
+            // batch entry with the registry "*" convention ("re-read the
+            // topic", process_registry.RevisionBumpEvent) so every replace is
+            // observable via core.changes.
+            daemon.appendJournalEntry(.workspace, "*", null, revision);
         },
         .workspace_upsert => |request| daemon.appendJournalEntry(.workspace, request.workspace.workspace_id, request.workspace.workspace_id, revision),
         .thread_upsert => |request| daemon.appendJournalEntry(.chat_thread, request.thread.local_thread_id, request.workspace_id, revision),
         .message_append => |request| daemon.appendJournalEntry(.chat_thread, request.thread_id, request.workspace_id, revision),
-        // Landed Q10 policy pins `surface` as registry_only, so a store-side
-        // surface commit has no representable revision family and is not
-        // journaled (documented M5-P2 deviation; surface volatility publishes
-        // through registry bumps, and no client reads surface deltas yet).
-        .surface_upsert, .surface_clear => {},
+        // MAJOR-1 (M5-P3 amendment): store commits are the ONLY surface
+        // publisher (the registry has no surface records or bump variant), so
+        // these must journal or a surface-topic cursor is silently stale
+        // forever. revisionPolicy(.surface) is store_only to match.
+        .surface_upsert => |request| daemon.appendJournalEntry(
+            .surface,
+            request.surface.session_id,
+            if (request.surface.workspace_id.len != 0) request.surface.workspace_id else null,
+            revision,
+        ),
+        .surface_clear => |request| daemon.appendJournalEntry(.surface, request.session_id, request.workspace_id, revision),
         .chat_completion_upsert => |request| daemon.appendJournalEntry(.chat_completion, request.completion.local_thread_id, request.completion.workspace_id, revision),
         .chat_completion_clear => |request| daemon.appendJournalEntry(.chat_completion, request.local_thread_id, request.workspace_id, revision),
     }
@@ -6635,6 +6808,63 @@ test "changes topic filter matches wire spellings and ignores unknown names" {
     try std.testing.expect(!changeEntryMatchesTopics(.lease, filter));
     const unknown: []const []const u8 = &.{"terminal.bytes"};
     try std.testing.expect(!changeEntryMatchesTopics(.chat_thread, unknown));
+}
+
+test "Q7 core.changes long-poll limits are pinned" {
+    // 25s wait ceiling and the pool-derived parked cap (m4m5_decisions Q7).
+    try std.testing.expectEqual(@as(u32, 25_000), MAX_CHANGES_WAIT_MS);
+    try std.testing.expectEqual(@as(usize, 2), platform_ipc.MAX_PARKED_LONG_POLL_WAITERS);
+    // The daemon-side cap intentionally exceeds the 5s transport client
+    // timeout: wire clients are bounded by their own timeout first, while
+    // in-process callers may use the full 25s budget.
+    try std.testing.expect(MAX_CHANGES_WAIT_MS >= SESSIONIZER_REQUEST_TIMEOUT_MS);
+}
+
+test "core.changes park protocol: over-cap, woken, timeout, drain" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    // Over-cap: with the Q7 cap's worth of parked waiters, the next park
+    // degrades immediately and releases its reserved slot.
+    const cap: u32 = @intCast(platform_ipc.MAX_PARKED_LONG_POLL_WAITERS);
+    daemon.changes_parked.store(cap, .release);
+    try std.testing.expectEqual(Daemon.ChangesParkOutcome.over_cap, daemon.parkForChanges(daemon.changes_signal.load(.acquire), nowMs() + 1000));
+    try std.testing.expectEqual(cap, daemon.changes_parked.load(.acquire));
+    daemon.changes_parked.store(0, .release);
+
+    // Missed-wake protocol: a signal bump AFTER the observed load but BEFORE
+    // the park returns .woken without sleeping.
+    const observed = daemon.changes_signal.load(.acquire);
+    daemon.signalChangesWaiters();
+    try std.testing.expectEqual(Daemon.ChangesParkOutcome.woken, daemon.parkForChanges(observed, nowMs() + 60_000));
+
+    // Deadline exhaustion is a timeout (mapped to a heartbeat by the caller).
+    try std.testing.expectEqual(Daemon.ChangesParkOutcome.timed_out, daemon.parkForChanges(daemon.changes_signal.load(.acquire), nowMs() + 10));
+
+    // Drain is sticky and terminates parks immediately, even fresh ones.
+    daemon.beginChangesDrain();
+    try std.testing.expectEqual(Daemon.ChangesParkOutcome.drained, daemon.parkForChanges(daemon.changes_signal.load(.acquire), nowMs() + 60_000));
+}
+
+test "journal append wakes a parked changes waiter" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const observed = daemon.changes_signal.load(.acquire);
+    const Parker = struct {
+        fn run(d: *Daemon, obs: u32, out: *std.atomic.Value(u32)) void {
+            // Race-free either way: if the append lands first, the changed
+            // signal word makes this return .woken without sleeping.
+            if (d.parkForChanges(obs, nowMs() + 10_000) == .woken) out.store(1, .release);
+        }
+    };
+    var woken: std.atomic.Value(u32) = .init(0);
+    const thread = try std.Thread.spawn(.{}, Parker.run, .{ &daemon, observed, &woken });
+    daemon.appendJournalEntry(.process, "p1", null, .{ .registry = 1 });
+    thread.join();
+    try std.testing.expectEqual(@as(u32, 1), woken.load(.acquire));
 }
 
 const LoadedStoreSnapshot = struct {

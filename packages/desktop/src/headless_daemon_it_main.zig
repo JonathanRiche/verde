@@ -68,23 +68,19 @@ const c = struct {
 /// permanent daemon+socket when persistent-by-default is enabled.
 const IT_SAFETY_IDLE_EXIT_MS = "30000";
 
-/// The Unix accept loop invokes each client callback synchronously
-/// (packages/desktop/src/platform/ipc.zig:115-121), so this scenario's second
-/// connection cannot reach the fast path during Phase B until M5-P3 lands
-/// concurrent transport. Set true when M5-P3 lands concurrent transport.
-const CONCURRENT_TRANSPORT_LANDED = false;
+/// M5-P3 landed the bounded transport worker pool (platform_ipc: fixed
+/// TRANSPORT_WORKER_COUNT workers behind the single accept caller), so a
+/// second connection reaches its handler while an earlier one is still in
+/// flight — the timing scenarios gated on this constant now run for real.
+const CONCURRENT_TRANSPORT_LANDED = true;
 
 // Force semantic analysis for OS-gated helpers whose only runtime callers sit
 // behind a comptime-false tier on the other OS (lazy analysis would elide them).
-// - POSIX: M5-P3 timing scenario trio (never run on Windows).
 // - Windows: waitChildBounded's WaitForSingleObject arm (only caller is PTY-tier
 //   lifecycle bind guard, which is elided under windows-gnu).
+// (The former POSIX M5-P3 timing trio is now referenced by the taken
+// CONCURRENT_TRANSPORT_LANDED branch and needs no forced analysis.)
 comptime {
-    if (posix_pty_supported) {
-        _ = &runSlowConfigDoesNotBlockTailScenario;
-        _ = &slowStartThread;
-        _ = &spawnIsolatedDaemonWithSlowIo;
-    }
     if (builtin.os.tag == .windows) {
         _ = &waitChildBounded;
     }
@@ -203,14 +199,19 @@ pub fn main(init: std.process.Init) !void {
     try runChatAdoptionRetryDurabilityScenario(allocator, io);
 
     // M5-P2 composite snapshot + change-journal cursor (Windows-safe subset:
-    // transport + store dir only). Wire-level tail-vs-slow-commit concurrency
-    // stays out of scope until M5-P3 (A7); scenario 1 pins the wait_ms clamp.
-    try runM5ChangesJournalScenario(allocator, io); // scenario 1 + wait_ms clamp
+    // transport + store dir only). Scenario 1 now pins the M5-P3 bounded
+    // long-poll timeout heartbeat plus the amendment journal-completeness
+    // arms (surface topic + snapshot_replace deletion visibility).
+    try runM5ChangesJournalScenario(allocator, io); // scenario 1 + bounded long-poll + amendment arms
     try runM5SnapshotCompositeScenario(allocator, io); // scenario 2 + M3 byte-compat
     try runM5ChangesOverflowExpiryScenario(allocator, io); // scenario 3
     try runM5DaemonReplacementCursorScenario(allocator, io); // scenario 4
     try runM5RollbackReplayJournalScenario(allocator, io); // scenario 5 (A2)
     try runM5SnapshotIncompleteScopesScenario(allocator, io); // scenario 6
+    // M5-P3 transport concurrency + bounded long-poll (Windows-safe: wire
+    // requests + threads only, no PTY).
+    try runM5LongPollWakeScenario(allocator, io); // park → journal-append wake + Q7 over-cap heartbeat
+    try runM5LongPollDrainScenario(allocator, io); // prepare/drain wakes parked waiter with structured response
 
     // Extended store scenarios (POSIX only): full surface + S4 fault/busy/crash pins.
     // Transport-tier primitives, but not part of the Windows-safe subset.
@@ -227,6 +228,10 @@ pub fn main(init: std.process.Init) !void {
         try runChatCommitFaultRetryScenario(allocator, io);
         // MAJOR-3(c): real `verde notify` CLI binary against hermetic daemon / auto-start.
         try runCliBinaryNotifyScenario(allocator, io);
+        // M5-P3 A1: genuinely concurrent two-connection wire IT — one
+        // connection stalled in a store commit, a second completes
+        // session.tail within deadline.
+        try runWireConcurrentTailDuringSlowStoreCommitScenario(allocator, io);
     }
 
     // PTY tier: sessions, managed spawn, prepare/stop retention, lifecycle.
@@ -1253,13 +1258,13 @@ fn runSlowConfigDoesNotBlockTailScenario(allocator: std.mem.Allocator, io: std.I
     const self_exe = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_exe);
     var child = try spawnIsolatedDaemonWithSlowIo(allocator, io, self_exe, pref_path, "400");
-    defer {
-        if (comptime builtin.os.tag == .windows) {
-            child.kill(io);
-        } else if (child.id != null) {
-            _ = child.wait(io) catch {};
-        }
-    }
+    // MAJOR-5 re-enable fix (fable_p2w5_review): the old POSIX defer did an
+    // unbounded child.wait, and an early-error path can leave the running
+    // managed /bin/cat that keep-alive treats as live — the daemon would
+    // never idle-exit and the IT would hang. Scenario-2 pattern instead:
+    // kill on unwind, bounded wait only after prepareShutdown is accepted.
+    var kill_on_unwind = true;
+    errdefer if (kill_on_unwind) child.kill(io);
 
     var transport: sessionizer.HeadlessTransport = .{ .allocator = allocator, .pref_path = pref_path };
     var client = sessionizer.headlessClient(allocator, &transport);
@@ -1325,9 +1330,29 @@ fn runSlowConfigDoesNotBlockTailScenario(allocator: std.mem.Allocator, io: std.I
     var killed = try client.call("session.kill", .{ .id = session_id });
     defer killed.deinit();
     if (!killed.response.isOk()) return error.ManagedSlowTailSessionKillFailed;
-    var shutdown = try client.call("daemon.prepareShutdown", .{});
-    defer shutdown.deinit();
-    if (!shutdown.response.isOk()) return error.ManagedSlowTailShutdownFailed;
+    // Kill/stop are asynchronous: the session stays in running_sessions until
+    // cleanup reaps it, and the stopped managed process needs a reap tick.
+    // Poll prepareShutdown bounded (same shape as runPrepareGateScenario's
+    // reap loop) instead of demanding first-call acceptance.
+    var shutdown_accepted = false;
+    var shutdown_attempt: usize = 0;
+    while (shutdown_attempt < 100) : (shutdown_attempt += 1) {
+        var cleaned = try client.call("session.cleanup", .{});
+        defer cleaned.deinit();
+        var shutdown = try client.call("daemon.prepareShutdown", .{});
+        defer shutdown.deinit();
+        if (shutdown.response.isOk()) {
+            shutdown_accepted = true;
+            break;
+        }
+        std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+    }
+    if (!shutdown_accepted) return error.ManagedSlowTailShutdownFailed;
+    // Prepare accepted: the daemon self-exits via its drain path. Bounded
+    // wait (never a bare child.wait) so a drain regression fails the IT
+    // instead of hanging it.
+    kill_on_unwind = false;
+    _ = waitChildBounded(&child, io, 10_000) catch {};
     if (elapsed_ms >= 300) return error.ManagedSlowTailBlocked;
 }
 
@@ -3480,13 +3505,14 @@ fn runM5ChangesJournalScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     }
     if (filtered_result.next_cursor != poll_result.next_cursor) return error.M5ChangesFilterCursorMismatch;
 
-    // wait_ms clamp pin (Q7/A7): a large wait at the tail answers immediately
-    // as a heartbeat. The bound is generous — it proves "no 60s park", not an
-    // SLO — and stays far under the request timeout.
+    // Bounded long-poll pin (M5-P3, supersedes the M5-P2 wait_ms clamp pin):
+    // at the tail with no new appends, a positive wait PARKS and answers a
+    // heartbeat only once the wait budget is spent — provably not immediate,
+    // and provably bounded (well under the 5s transport timeout).
     const wait_started_ms = sessionizer.nowMs();
     const heartbeat_req: headless.changes_protocol.ChangesRequest = .{
         .cursor = poll_result.next_cursor,
-        .wait_ms = 60_000,
+        .wait_ms = 1_000,
     };
     var heartbeat = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, heartbeat_req);
     defer heartbeat.deinit();
@@ -3495,7 +3521,74 @@ fn runM5ChangesJournalScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const heartbeat_result = try client.decodeChanges(&heartbeat);
     if (!heartbeat_result.heartbeat or heartbeat_result.entries.len != 0) return error.M5ChangesHeartbeatShape;
     if (heartbeat_result.next_cursor != poll_result.next_cursor) return error.M5ChangesHeartbeatCursorMoved;
-    if (wait_elapsed_ms > 5_000) return error.M5ChangesWaitNotClamped;
+    if (wait_elapsed_ms < 700) return error.M5ChangesLongPollReturnedEarly;
+    if (wait_elapsed_ms > 4_500) return error.M5ChangesLongPollNotBounded;
+
+    // Amendment arm 1 (MAJOR-1): a surface store commit is observable via
+    // core.changes as a `surface` entry carrying the committing store
+    // revision (previously journaled nowhere → stale-forever cursors).
+    const surface_upsert: headless.store.SurfaceUpsertRequest = .{
+        .mutation = .{ .request_key = "m5-changes-surface", .client_id = client_id },
+        .surface = .{
+            .session_id = "m5-changes-surface-1",
+            .workspace_id = "m5-changes-ws",
+            .status = "working",
+            .title = "amendment surface",
+        },
+    };
+    var surface_parsed = try client.call(headless.store.METHOD_SURFACE_UPSERT, surface_upsert);
+    defer surface_parsed.deinit();
+    if (!surface_parsed.response.isOk()) return error.M5ChangesSurfaceUpsertFailed;
+    const surface_write = try client.decodeWriteResult(&surface_parsed);
+    if (!surface_write.applied) return error.M5ChangesSurfaceNotApplied;
+
+    const surface_poll_req: headless.changes_protocol.ChangesRequest = .{ .cursor = poll_result.next_cursor };
+    var surface_poll = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, surface_poll_req);
+    defer surface_poll.deinit();
+    if (!surface_poll.response.isOk()) return error.M5ChangesSurfacePollFailed;
+    const surface_poll_result = try client.decodeChanges(&surface_poll);
+    var found_surface = false;
+    for (surface_poll_result.entries) |entry| {
+        if (!std.mem.eql(u8, entry.topic, "surface")) continue;
+        if (!std.mem.eql(u8, entry.resource_id, "m5-changes-surface-1")) return error.M5ChangesSurfaceResourceId;
+        if ((entry.store_revision orelse 0) != surface_write.store_revision) return error.M5ChangesSurfaceRevision;
+        found_surface = true;
+    }
+    if (!found_surface) return error.M5ChangesSurfaceEntryMissing;
+
+    // Amendment arm 2 (MAJOR-2): a snapshot_replace that DELETES resources
+    // (here: an empty replace dropping the workspace and surface) must be
+    // cursor-observable — the batch `workspace` entry with the registry "*"
+    // convention tells clients to re-read, so nothing is stale forever.
+    const wipe: headless.store.SnapshotReplaceRequest = .{
+        .mutation = .{
+            .request_key = "m5-changes-wipe",
+            .client_id = client_id,
+            .expected_store_revision = surface_write.store_revision,
+        },
+        .snapshot = .{ .schema_version = 1 },
+        .bootstrap = false,
+    };
+    var wipe_parsed = try client.call(headless.store.METHOD_STATE_SNAPSHOT_REPLACE, wipe);
+    defer wipe_parsed.deinit();
+    if (!wipe_parsed.response.isOk()) return error.M5ChangesWipeFailed;
+    const wipe_write = try client.decodeWriteResult(&wipe_parsed);
+    if (!wipe_write.applied) return error.M5ChangesWipeNotApplied;
+
+    const wipe_poll_req: headless.changes_protocol.ChangesRequest = .{ .cursor = surface_poll_result.next_cursor };
+    var wipe_poll = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, wipe_poll_req);
+    defer wipe_poll.deinit();
+    if (!wipe_poll.response.isOk()) return error.M5ChangesWipePollFailed;
+    const wipe_poll_result = try client.decodeChanges(&wipe_poll);
+    if (wipe_poll_result.heartbeat) return error.M5ChangesWipeInvisible;
+    var found_wipe_batch = false;
+    for (wipe_poll_result.entries) |entry| {
+        if (!std.mem.eql(u8, entry.topic, "workspace")) continue;
+        if (!std.mem.eql(u8, entry.resource_id, "*")) continue;
+        if ((entry.store_revision orelse 0) != wipe_write.store_revision) return error.M5ChangesWipeRevision;
+        found_wipe_batch = true;
+    }
+    if (!found_wipe_batch) return error.M5ChangesWipeBatchEntryMissing;
 }
 
 /// M5-P2 scenario 2: composite core.snapshot coherence — the store half and
@@ -4129,10 +4222,251 @@ fn runM5SnapshotIncompleteScopesScenario(allocator: std.mem.Allocator, io: std.I
     }
 }
 
+/// One background `core.changes` long-poll issued over its own wire
+/// connection. `response` stays null on transport error; timestamps let the
+/// scenario prove park (started) vs wake/timeout (completed) ordering.
+const LongPollWaiterContext = struct {
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    cursor: u64,
+    wait_ms: u32,
+    request_id: u64,
+    response: ?[]u8 = null,
+    started_ms: i64 = 0,
+    completed_ms: i64 = 0,
+
+    fn run(self: *LongPollWaiterContext) void {
+        self.started_ms = sessionizer.nowMs();
+        self.response = sessionizer.requestAlloc(self.allocator, self.pref_path, headless.changes_protocol.METHOD_CORE_CHANGES, .{
+            .cursor = self.cursor,
+            .wait_ms = self.wait_ms,
+        }, self.request_id) catch null;
+        self.completed_ms = sessionizer.nowMs();
+    }
+};
+
+/// M5-P3: the real bounded long-poll over the wire. Two connections park in
+/// `core.changes`; a third long-poll hits the Q7 parked-waiter cap and
+/// degrades to an IMMEDIATE heartbeat (pinned: never an error); a plain
+/// request stays responsive on a free worker; one store commit then wakes
+/// BOTH parked waiters with the new entry well before their wait budget.
+fn runM5LongPollWakeScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m5-longpoll-wake");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    // Backslash-safe on Windows; same join used for state.sqlite below.
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+    });
+    var kill_on_unwind = true;
+    errdefer if (kill_on_unwind) child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer register_parsed.deinit();
+    if (!register_parsed.response.isOk()) return error.M5LongPollRegisterFailed;
+    const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+    const boot_req: headless.changes_protocol.ChangesRequest = .{};
+    var boot = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, boot_req);
+    defer boot.deinit();
+    if (!boot.response.isOk()) return error.M5LongPollBootstrapFailed;
+    const cursor = (try client.decodeChanges(&boot)).next_cursor;
+
+    // Both waiters use a 4s budget: long enough to prove "wake, not timeout",
+    // short enough to stay under the 5s transport timeout.
+    var first_waiter: LongPollWaiterContext = .{ .allocator = allocator, .pref_path = pref_path, .cursor = cursor, .wait_ms = 4_000, .request_id = 9101 };
+    var second_waiter: LongPollWaiterContext = .{ .allocator = allocator, .pref_path = pref_path, .cursor = cursor, .wait_ms = 4_000, .request_id = 9102 };
+    const first_thread = try std.Thread.spawn(.{}, LongPollWaiterContext.run, .{&first_waiter});
+    const second_thread = try std.Thread.spawn(.{}, LongPollWaiterContext.run, .{&second_waiter});
+    var waiters_joined = false;
+    // Bounded on every unwind path: a waiter answers by wait_ms + transport
+    // margin even if nothing below runs.
+    defer if (!waiters_joined) {
+        first_thread.join();
+        second_thread.join();
+    };
+
+    // Let both waiters connect and park (generous for a local endpoint).
+    std.Io.sleep(io, .fromMilliseconds(600), .awake) catch {};
+
+    // Q7 over-cap pin: MAX_PARKED_LONG_POLL_WAITERS (2) slots are occupied,
+    // so a third positive wait answers an immediate heartbeat — NEVER an
+    // error, never a park. This also proves both waiters really are parked.
+    const third_started_ms = sessionizer.nowMs();
+    const third_req: headless.changes_protocol.ChangesRequest = .{ .cursor = cursor, .wait_ms = 4_000 };
+    var third = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, third_req);
+    defer third.deinit();
+    const third_elapsed_ms = sessionizer.nowMs() - third_started_ms;
+    if (!third.response.isOk()) return error.M5LongPollOverCapErrored;
+    const third_result = try client.decodeChanges(&third);
+    if (!third_result.heartbeat or third_result.entries.len != 0) return error.M5LongPollOverCapShape;
+    if (third_elapsed_ms > 1_500) return error.M5LongPollOverCapParked;
+
+    // Transport responsiveness with half the pool parked: a short request
+    // finds a free worker immediately (the M3 crash class this phase retires).
+    const status_started_ms = sessionizer.nowMs();
+    const empty_params: struct {} = .{};
+    var status = try client.call("core.status", empty_params);
+    defer status.deinit();
+    if (!status.response.isOk()) return error.M5LongPollStatusFailed;
+    if (sessionizer.nowMs() - status_started_ms > 1_500) return error.M5LongPollStatusSlow;
+
+    // One store commit → journal append → both parked waiters wake.
+    const upsert: headless.store.WorkspaceUpsertRequest = .{
+        .mutation = .{ .request_key = "m5-longpoll-ws", .client_id = client_id },
+        .workspace = .{ .workspace_id = "m5-longpoll-ws", .label = "M5 long-poll", .path = pref_path },
+    };
+    var upsert_parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, upsert);
+    defer upsert_parsed.deinit();
+    if (!upsert_parsed.response.isOk()) return error.M5LongPollUpsertFailed;
+    if (!(try client.decodeWriteResult(&upsert_parsed)).applied) return error.M5LongPollUpsertNotApplied;
+
+    first_thread.join();
+    second_thread.join();
+    waiters_joined = true;
+
+    for ([_]*const LongPollWaiterContext{ &first_waiter, &second_waiter }) |waiter| {
+        const response = waiter.response orelse return error.M5LongPollWaiterTransportError;
+        defer allocator.free(response);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+        defer parsed.deinit();
+        const result = parsed.value.object.get("result") orelse return error.M5LongPollWaiterErrored;
+        const heartbeat_value = result.object.get("heartbeat") orelse return error.M5LongPollWaiterShape;
+        if (heartbeat_value != .bool or heartbeat_value.bool) return error.M5LongPollWaiterHeartbeat;
+        const entries = result.object.get("entries") orelse return error.M5LongPollWaiterShape;
+        var found_workspace = false;
+        for (entries.array.items) |entry| {
+            const topic = entry.object.get("topic") orelse continue;
+            if (topic == .string and std.mem.eql(u8, topic.string, "workspace")) found_workspace = true;
+        }
+        if (!found_workspace) return error.M5LongPollWaiterMissingEntry;
+        // Wake, not timeout: the reply landed well inside the 4s budget.
+        if (waiter.completed_ms - waiter.started_ms >= 3_500) return error.M5LongPollWaiterTimedOutInstead;
+    }
+
+    var prepare = try client.call("daemon.prepareShutdown", .{});
+    defer prepare.deinit();
+    if (!prepare.response.isOk()) return error.M5LongPollPrepareFailed;
+    kill_on_unwind = false;
+    _ = waitChildBounded(&child, io, 10_000) catch {};
+}
+
+/// M5-P3 drain interaction: prepareShutdown terminates a PARKED long-poll
+/// promptly with the structured drain response (invalid_state +
+/// data.reason="draining"), and a post-prepare long-poll degrades to an
+/// immediate answer (or a connect-class error once the endpoint is gone) —
+/// never a park against a dying daemon.
+fn runM5LongPollDrainScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m5-longpoll-drain");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    // Backslash-safe on Windows; same join used for state.sqlite below.
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+    });
+    var kill_on_unwind = true;
+    errdefer if (kill_on_unwind) child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    const boot_req: headless.changes_protocol.ChangesRequest = .{};
+    var boot = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, boot_req);
+    defer boot.deinit();
+    if (!boot.response.isOk()) return error.M5DrainBootstrapFailed;
+    const cursor = (try client.decodeChanges(&boot)).next_cursor;
+
+    var waiter: LongPollWaiterContext = .{ .allocator = allocator, .pref_path = pref_path, .cursor = cursor, .wait_ms = 4_000, .request_id = 9111 };
+    const waiter_thread = try std.Thread.spawn(.{}, LongPollWaiterContext.run, .{&waiter});
+    var waiter_joined = false;
+    defer if (!waiter_joined) waiter_thread.join();
+
+    // Let the waiter connect and park before drain begins.
+    std.Io.sleep(io, .fromMilliseconds(500), .awake) catch {};
+
+    var prepare = try client.call("daemon.prepareShutdown", .{});
+    defer prepare.deinit();
+    if (!prepare.response.isOk()) return error.M5DrainPrepareFailed;
+    kill_on_unwind = false;
+
+    waiter_thread.join();
+    waiter_joined = true;
+    const response = waiter.response orelse return error.M5DrainWaiterTransportError;
+    defer allocator.free(response);
+    // Prompt termination: woken by beginChangesDrain, not by the 4s budget.
+    if (waiter.completed_ms - waiter.started_ms > 2_500) return error.M5DrainWaiterNotWoken;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const error_value = parsed.value.object.get("error") orelse return error.M5DrainWaiterNotErrorShaped;
+    const code = error_value.object.get("code") orelse return error.M5DrainWaiterMissingCode;
+    if (code != .string or !std.mem.eql(u8, code.string, "invalid_state")) return error.M5DrainWaiterWrongCode;
+    const data = error_value.object.get("data") orelse return error.M5DrainWaiterMissingData;
+    const reason = data.object.get("reason") orelse return error.M5DrainWaiterMissingReason;
+    if (reason != .string or !std.mem.eql(u8, reason.string, "draining")) return error.M5DrainWaiterWrongReason;
+
+    // A NEW long-poll after prepare must not park: immediate answer while the
+    // endpoint lives (heartbeat/degraded), or a teardown error once the drain
+    // thread releases it. Both are bounded; a 2s park is neither. Mid-teardown
+    // the connect can still succeed and the write/read then fail (EPIPE/reset
+    // normalized by std.Io to WriteFailed/ReadFailed/EndOfStream), so accept
+    // that class here in addition to connect-class.
+    const post_started_ms = sessionizer.nowMs();
+    if (sessionizer.requestAlloc(allocator, pref_path, headless.changes_protocol.METHOD_CORE_CHANGES, .{
+        .cursor = cursor,
+        .wait_ms = 2_000,
+    }, 9112)) |post_response| {
+        allocator.free(post_response);
+        if (sessionizer.nowMs() - post_started_ms > 1_500) return error.M5DrainPostPrepareParked;
+    } else |err| switch (err) {
+        error.WriteFailed, error.ReadFailed, error.EndOfStream, error.BrokenPipe => {},
+        else => if (!isConnectClassError(err)) return err,
+    }
+
+    _ = waitChildBounded(&child, io, 10_000) catch {};
+}
+
 /// Bounded serial queueing under a slow store commit (commit_stall).
-/// True mid-stall responsiveness is blocked on accept-loop concurrency
-/// (packages/desktop/src/platform/ipc.zig serial handleUnixClient); this pin
-/// only asserts no deadlock and both requests complete within stall+timeout.
+/// Pre-M5-P3 this only pinned "no deadlock" because the accept loop was
+/// serial; genuine mid-stall responsiveness over the wire is now pinned by
+/// runWireConcurrentTailDuringSlowStoreCommitScenario, while this scenario
+/// keeps the weaker bound (both requests complete within stall+timeout).
 fn runStoreBoundedQueueingScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const pref_path = try makePrefPath(allocator, "store-queue");
     defer allocator.free(pref_path);
@@ -5489,6 +5823,137 @@ fn runChatSlowCommitDoesNotStallSessionTailScenario(allocator: std.mem.Allocator
     if (!prepare.response.isOk()) return error.ChatSlowPrepareFailed;
     kill_on_unwind = false;
     _ = child.wait(io) catch {};
+}
+
+/// Background wire mutator that rides the commit_stall fault: applyMutation
+/// holds the store mutex (and its transport worker) for the full stall.
+const SlowUpsertThreadContext = struct {
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    client_id: []const u8,
+    response: ?[]u8 = null,
+    started_ms: i64 = 0,
+    completed_ms: i64 = 0,
+
+    fn run(self: *SlowUpsertThreadContext) void {
+        self.started_ms = sessionizer.nowMs();
+        const upsert: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{ .request_key = "m5-wire-slow-ws", .client_id = self.client_id },
+            .workspace = .{ .workspace_id = "m5-wire-slow-ws", .label = "wire slow", .path = self.pref_path },
+        };
+        self.response = sessionizer.requestAlloc(self.allocator, self.pref_path, headless.store.METHOD_WORKSPACE_UPSERT, upsert, 9121) catch null;
+        self.completed_ms = sessionizer.nowMs();
+    }
+};
+
+/// M5-P3 A1: the genuinely concurrent two-connection wire IT. Connection A is
+/// stalled inside a store commit (commit_stall holds lockStoreService and one
+/// transport worker for ~1.5s); connection B's session.tail — which needs
+/// only lockDaemon + session state on a DIFFERENT worker — completes within
+/// its deadline and provably BEFORE A finishes. The pre-M5 serial accept loop
+/// could never pass this: B would queue behind A's entire stall.
+fn runWireConcurrentTailDuringSlowStoreCommitScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m5-wire-concurrent");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+        .store_fault = "commit_stall",
+    });
+    var kill_on_unwind = true;
+    errdefer if (kill_on_unwind) child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer register_parsed.deinit();
+    if (!register_parsed.response.isOk()) return error.M5WireRegisterFailed;
+    const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+    const session_id = "m5-wire-tail-session";
+    var created = try client.call("session.create", .{
+        .id = session_id,
+        .cwd = pref_path,
+        .workspace_path = pref_path,
+        .command = &[_][]const u8{"/bin/cat"},
+    });
+    defer created.deinit();
+    if (!created.response.isOk()) return error.M5WireSessionCreateFailed;
+    // Best-effort cleanup on unwind so a killed daemon cannot strand the PTY.
+    defer {
+        if (client.call("session.kill", .{ .id = session_id })) |response| {
+            var owned = response;
+            owned.deinit();
+        } else |_| {}
+        if (client.call("session.cleanup", .{})) |response| {
+            var owned = response;
+            owned.deinit();
+        } else |_| {}
+    }
+
+    var upsert_context: SlowUpsertThreadContext = .{
+        .allocator = allocator,
+        .pref_path = pref_path,
+        .client_id = client_id,
+    };
+    const upsert_thread = try std.Thread.spawn(.{}, SlowUpsertThreadContext.run, .{&upsert_context});
+    var upsert_joined = false;
+    defer if (!upsert_joined) upsert_thread.join();
+
+    // Let connection A reach the stalled applyMutation before B measures.
+    std.Io.sleep(io, .fromMilliseconds(250), .awake) catch {};
+
+    const tail_started_ms = sessionizer.nowMs();
+    var tail = try client.call("session.tail", .{ .id = session_id, .after_cursor = 0, .max_bytes = 1024 });
+    defer tail.deinit();
+    const tail_done_ms = sessionizer.nowMs();
+    if (!tail.response.isOk()) return error.M5WireTailFailed;
+    // Deadline pin: far under the 1.5s stall the other connection is inside.
+    if (tail_done_ms - tail_started_ms > 1_000) return error.M5WireTailBlocked;
+
+    upsert_thread.join();
+    upsert_joined = true;
+    const upsert_response = upsert_context.response orelse return error.M5WireUpsertTransportError;
+    defer allocator.free(upsert_response);
+    // Absolute-timestamp concurrency proof: B finished while A was in flight.
+    if (tail_done_ms >= upsert_context.completed_ms) return error.M5WireTailNotConcurrent;
+    // A really rode the stall (fault seam engaged), and still committed.
+    if (upsert_context.completed_ms - upsert_context.started_ms < 1_200) return error.M5WireUpsertNotStalled;
+    var upsert_parsed = try std.json.parseFromSlice(std.json.Value, allocator, upsert_response, .{});
+    defer upsert_parsed.deinit();
+    const upsert_result = upsert_parsed.value.object.get("result") orelse return error.M5WireUpsertErrored;
+    const applied = upsert_result.object.get("applied") orelse return error.M5WireUpsertShape;
+    if (applied != .bool or !applied.bool) return error.M5WireUpsertNotApplied;
+
+    var killed = try client.call("session.kill", .{ .id = session_id });
+    defer killed.deinit();
+    if (!killed.response.isOk()) return error.M5WireSessionKillFailed;
+    var cleanup = try client.call("session.cleanup", .{});
+    defer cleanup.deinit();
+
+    var prepare = try client.call("daemon.prepareShutdown", .{});
+    defer prepare.deinit();
+    if (!prepare.response.isOk()) return error.M5WirePrepareFailed;
+    kill_on_unwind = false;
+    _ = waitChildBounded(&child, io, 10_000) catch {};
 }
 
 /// Scenario 6: chat.turn.record / chat.thread.get typed DTO round-trip.
