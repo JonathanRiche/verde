@@ -2765,6 +2765,30 @@ fn shouldHideCursorLifecycleSystemEvent(thread: anytype, author: []const u8, bod
         std.mem.eql(u8, body, "completed");
 }
 
+test "M5-P4 background rows persist while the display filter hides known task events" {
+    const allocator = std.testing.allocator;
+    var thread = try app_state.ChatThread.init(allocator, "Background persistence");
+    defer thread.deinit(allocator);
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "mise run build"),
+        .status = .running,
+    });
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "Background command"),
+        .body = try allocator.dupeZ(u8, "mise run build"),
+    });
+
+    // Persistence/identity owns the row; presentation alone suppresses it.
+    try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
+    try std.testing.expect(shouldHideCursorLifecycleSystemEvent(
+        &thread,
+        thread.messages.items[0].author,
+        thread.messages.items[0].body,
+    ));
+    try std.testing.expect(!shouldHideCursorLifecycleSystemEvent(&thread, "Notice", "mise run build"));
+}
+
 fn isUsageSummaryBody(body: []const u8, title: []const u8) bool {
     return std.mem.eql(u8, body, title) or
         (body.len > title.len and std.mem.startsWith(u8, body, title) and body[title.len] == '\n');

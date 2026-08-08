@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const headless = @import("headless");
 const ai_harness = @import("../providers/harness.zig");
 const app_config = @import("../app/config.zig");
 const bang_commands = @import("../workspace/bang_commands.zig");
@@ -2095,6 +2096,32 @@ pub fn restoreDaemonChatTurnsOnLaunch(self: anytype) void {
     }
 }
 
+/// Bounded main-thread half of cursor reconciliation. Blocking list/get work
+/// lives on the cursor worker; this only attaches live turns carried by the
+/// owned composite snapshot. Terminal rows are already in its durable half.
+pub fn applyDaemonChatTurnsSnapshot(self: anytype, turns: []const headless.store.TurnRecord) void {
+    for (turns) |turn| {
+        if (std.mem.eql(u8, turn.status, "completed") or
+            std.mem.eql(u8, turn.status, "failed") or
+            std.mem.eql(u8, turn.status, "aborted")) continue;
+        const thread = self.threadByLocalId(turn.workspace_id, turn.local_thread_id) orelse continue;
+        const send_state = thread.send_state;
+        send_state.mutex.lock();
+        if (send_state.status == .idle and !send_state.daemon_owned) {
+            send_state.status = .pending;
+            send_state.started_at_ms = turn.started_at_ms;
+            send_state.provider = thread.provider;
+            send_state.daemon_turn_id = std.heap.page_allocator.dupe(u8, turn.turn_id) catch null;
+            send_state.daemon_last_seq = 0;
+            send_state.daemon_last_poll_ms = -1;
+            send_state.daemon_owned = send_state.daemon_turn_id != null;
+            send_state.ui_revision +%= 1;
+            if (send_state.daemon_owned) self.chat_controller.beginSend();
+        }
+        send_state.mutex.unlock();
+    }
+}
+
 pub fn threadByLocalId(self: anytype, workspace_id: []const u8, local_thread_id: []const u8) ?*ChatThread {
     for (self.project_controller.projects.items) |*project| {
         if (!std.mem.eql(u8, project.id, workspace_id)) continue;
@@ -3519,8 +3546,8 @@ const ADOPTION_RETRY_INTERVAL_MS: i64 = 1_000;
 /// costs one RPC a minute instead of one a second, forever.
 const ADOPTION_RETRY_MAX_BACKOFF_MS: i64 = 60_000;
 /// M5-P4 Amendment 2: loud give-up bound. Past this many consecutive failed
-/// attempts (~1.5h at the capped backoff) the entry is dropped with an error
-/// log; the next completed turn or cursor-triggered sweep re-queues fresh.
+/// attempts (~1.5h at the capped backoff) the entry enters a terminal failed
+/// state until cursor reconciliation supplies durable identities.
 const ADOPTION_RETRY_MAX_ATTEMPTS: u32 = 100;
 /// Bounded logging: warn once per this many consecutive failed retries.
 const ADOPTION_RETRY_LOG_EVERY: u32 = 10;
@@ -3529,6 +3556,7 @@ const ADOPTION_RETRY_KEY_SEPARATOR: u8 = 0x1f;
 const AdoptionRetryState = struct {
     attempts: u32 = 0,
     next_retry_at_ms: i64 = 0,
+    terminal_failed: bool = false,
 };
 
 var adoption_retry_pending: std.StringHashMapUnmanaged(AdoptionRetryState) = .empty;
@@ -3551,24 +3579,24 @@ fn markAdoptionPending(workspace_id: []const u8, local_thread_id: []const u8) vo
     gop.value_ptr.attempts +|= 1;
     const attempts = gop.value_ptr.attempts;
     if (attempts >= ADOPTION_RETRY_MAX_ATTEMPTS) {
-        // Loud give-up (never silent): rows stay id-less until the next
-        // adoption trigger re-queues the thread from scratch. `gop` must not
-        // be touched after the remove below invalidates it. The test runner
+        // Loud give-up (never silent): retain a terminal repair marker until
+        // a cursor snapshot supplies durable identities. The test runner
         // fails the whole binary on err-level logs, so the give-up unit test
         // (which drives this arm for real) demotes the level — production
         // keeps err.
         if (builtin.is_test) {
             log.warn(
-                "giving up on transcript identity adoption for {s} after {d} attempts; will re-queue on the next adoption trigger",
+                "transcript identity adoption for {s} entered terminal repair after {d} attempts",
                 .{ local_thread_id, attempts },
             );
         } else {
             log.err(
-                "giving up on transcript identity adoption for {s} after {d} attempts; will re-queue on the next adoption trigger",
+                "transcript identity adoption for {s} entered terminal repair after {d} attempts",
                 .{ local_thread_id, attempts },
             );
         }
-        clearAdoptionPending(workspace_id, local_thread_id);
+        gop.value_ptr.terminal_failed = true;
+        gop.value_ptr.next_retry_at_ms = std.math.maxInt(i64);
         return;
     }
     const backoff_shift: u6 = @intCast(@min(attempts -| 1, 6));
@@ -3588,6 +3616,28 @@ fn clearAdoptionPending(workspace_id: []const u8, local_thread_id: []const u8) v
     if (adoption_retry_pending.fetchRemove(key)) |entry| {
         std.heap.page_allocator.free(entry.key);
     }
+}
+
+/// Cursor snapshots carry durable message identities directly. Once every row
+/// in a re-read thread is identified, clear any retry/terminal-repair marker;
+/// id-less rows deliberately keep their marker and remain visibly unresolved.
+pub fn clearSatisfiedAdoptionRepairs(self: anytype) void {
+    for (self.project_controller.projects.items) |*project| {
+        clearSatisfiedProjectAdoptionRepairs(project);
+    }
+    for (self.project_controller.archived_projects.items) |*project| {
+        clearSatisfiedProjectAdoptionRepairs(project);
+    }
+}
+
+fn clearSatisfiedProjectAdoptionRepairs(project: anytype) void {
+    for (project.threads.items) |*thread| clearSatisfiedThreadAdoptionRepair(project.id, thread);
+    for (project.archived_threads.items) |*thread| clearSatisfiedThreadAdoptionRepair(project.id, thread);
+}
+
+fn clearSatisfiedThreadAdoptionRepair(workspace_id: []const u8, thread: *ChatThread) void {
+    for (thread.messages.items) |message| if (message.message_id == null) return;
+    clearAdoptionPending(workspace_id, thread.local_thread_id);
 }
 
 /// Terminal-tick entry: run adoption and queue a retry when incomplete.
@@ -3635,6 +3685,7 @@ fn retryPendingAdoptions(self: anytype) bool {
     var due_key: ?[]const u8 = null;
     var iterator = adoption_retry_pending.iterator();
     while (iterator.next()) |entry| {
+        if (entry.value_ptr.terminal_failed) continue;
         if (entry.value_ptr.next_retry_at_ms <= now_ms) {
             due_key = entry.key_ptr.*;
             break;
@@ -3880,8 +3931,8 @@ test "M5-P4 amendment 2: retry pump backs off, reaches archived threads, and giv
     _ = pollSend(&state);
     try std.testing.expect((try entryState("retry-ws", "thread-gone")) == null);
 
-    // Arm 5 — loud give-up: one more failure at the attempt cap removes the
-    // entry instead of retrying forever.
+    // Arm 5 — loud give-up retains a terminal repair marker. Cursor snapshot
+    // application is now the only path allowed to clear the id-less state.
     markAdoptionPending("retry-ws", "thread-live");
     {
         const key = adoptionRetryKeyAlloc("retry-ws", "thread-live").?;
@@ -3891,7 +3942,10 @@ test "M5-P4 amendment 2: retry pump backs off, reaches archived threads, and giv
         value_ptr.next_retry_at_ms = 0;
     }
     _ = pollSend(&state);
-    try std.testing.expect((try entryState("retry-ws", "thread-live")) == null);
+    const terminal_entry = (try entryState("retry-ws", "thread-live")).?;
+    try std.testing.expect(terminal_entry.terminal_failed);
+    try std.testing.expectEqual(ADOPTION_RETRY_MAX_ATTEMPTS, terminal_entry.attempts);
+    clearAdoptionPending("retry-ws", "thread-live");
     try std.testing.expectEqual(@as(usize, 0), adoption_retry_pending.count());
 }
 

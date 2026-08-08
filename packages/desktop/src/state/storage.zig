@@ -390,6 +390,31 @@ pub const Storage = struct {
         instance_changed: bool,
     };
 
+    /// Check the nonce boundary without acknowledging any entries. A caller
+    /// that received real changes must first re-read and apply their durable
+    /// projection, then publish the replacement snapshot cursor through
+    /// noteCompositeSnapshotSeed. This keeps the old cursor dirty/retryable
+    /// across transport, decode, allocation, and main-thread apply failures.
+    pub fn inspectChangesResult(
+        self: *const Storage,
+        result: headless.changes_protocol.ChangesResult,
+    ) ChangesNoteOutcome {
+        self.store_session.lock();
+        const previous: ?headless.registry.RegistryRevisionEnvelope = if (self.store_session.change_cursor_known) .{
+            .instance_nonce = self.store_session.instance_nonce orelse "",
+            .registry_revision = self.store_session.registry_revision,
+        } else null;
+        const instance_changed = if (previous) |p| p.shouldResetProjection(result.envelope) else false;
+        const snapshot_required = result.expired or instance_changed;
+        if (snapshot_required) self.store_session.change_cursor_known = false;
+        self.store_session.unlock();
+        if (instance_changed) self.clearCachedClientId();
+        return .{
+            .snapshot_required = snapshot_required,
+            .instance_changed = instance_changed,
+        };
+    }
+
     /// Advance the change cursor from one accepted `core.changes` reply.
     ///
     /// PENDING_FIXES #27: the client-side nonce rule is the ONLY guard against
@@ -432,6 +457,10 @@ pub const Storage = struct {
         };
     }
 
+    /// Publish a seed only AFTER its owned composite payload has been applied
+    /// to AppState. This is the apply-before-advance half of the cursor
+    /// contract; callers must not invoke it merely because decoding succeeded.
+    ///
     /// Seed (or reseed) cursor + envelope from one composite `core.snapshot`.
     /// The daemon captures the journal cursor BEFORE either state read, so a
     /// cursor seeded here can only over-deliver — never miss — entries
@@ -500,15 +529,12 @@ pub const Storage = struct {
             self.noteStoreRevision(result.store_revision);
             return;
         }
-        // first == null means conflict → refresh + single retry (never re-bootstrap).
+        // A conflict means this payload was built from an older projection.
+        // Refresh the guard for the next independently rebuilt flush, but
+        // never resend the same stale snapshot under the newer revision: that
+        // would erase the mutation which caused the conflict.
         if (bootstrap) return error.StoreRevisionConflict;
         _ = try self.refreshStoreRevision();
-        const second = try self.replaceSnapshotOnce(state, false);
-        if (second) |result| {
-            self.noteStoreRevision(result.store_revision);
-            return;
-        }
-        self.markPersistenceUnavailable();
         return error.StoreRevisionConflict;
     }
 
@@ -820,6 +846,39 @@ test "M5-P4 reconnect-from-cursor: same-instance results advance the cursor and 
     try std.testing.expect(!advanced.snapshot_required and !advanced.instance_changed);
     try std.testing.expectEqual(@as(?u64, 9), storage.currentChangeCursorForPoll());
     try std.testing.expectEqual(@as(u64, 6), storage.currentStoreRevision());
+}
+
+test "M5-P4 dirty entries remain unacknowledged until their projection re-read applies" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(std.testing.allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+
+    try storage.noteCompositeSnapshotSeed(.{ .instance_nonce = "nonce-a", .registry_revision = 1 }, 7, 10);
+    const result: headless.changes_protocol.ChangesResult = .{
+        .entries = &.{.{
+            .change_seq = 8,
+            .topic = "workspace",
+            .resource_id = "workspace-new",
+            .store_revision = 11,
+        }},
+        .next_cursor = 8,
+        .envelope = .{ .instance_nonce = "nonce-a", .registry_revision = 1 },
+        .store_revision = 11,
+    };
+    const inspection = storage.inspectChangesResult(result);
+    try std.testing.expect(!inspection.snapshot_required);
+    // A failed list/snapshot re-read leaves both the effective cursor and the
+    // GUI flush guard at the last applied projection.
+    try std.testing.expectEqual(@as(?u64, 7), storage.currentChangeCursorForPoll());
+    try std.testing.expectEqual(@as(u64, 10), storage.currentStoreRevision());
+    // Successful application publishes the replacement snapshot cursor only
+    // afterward (the call below models that explicit main-thread boundary).
+    try storage.noteCompositeSnapshotSeed(.{ .instance_nonce = "nonce-a", .registry_revision = 1 }, 9, 11);
+    try std.testing.expectEqual(@as(?u64, 9), storage.currentChangeCursorForPoll());
+    try std.testing.expectEqual(@as(u64, 11), storage.currentStoreRevision());
 }
 
 test "M5-P4 replacement resync (#27): regressed heartbeat under a new nonce forces the snapshot fallback" {
