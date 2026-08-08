@@ -2099,24 +2099,35 @@ pub fn restoreDaemonChatTurnsOnLaunch(self: anytype) void {
 /// Bounded main-thread half of cursor reconciliation. Blocking list/get work
 /// lives on the cursor worker; this only attaches live turns carried by the
 /// owned composite snapshot. Terminal rows are already in its durable half.
-pub fn applyDaemonChatTurnsSnapshot(self: anytype, turns: []const headless.store.TurnRecord) void {
+pub fn applyDaemonChatTurnsSnapshot(self: anytype, turns: []const headless.store.TurnRecord) !void {
+    return applyDaemonChatTurnsSnapshotWithAllocator(self, turns, std.heap.page_allocator);
+}
+
+fn applyDaemonChatTurnsSnapshotWithAllocator(
+    self: anytype,
+    turns: []const headless.store.TurnRecord,
+    attachment_allocator: std.mem.Allocator,
+) !void {
     for (turns) |turn| {
         if (std.mem.eql(u8, turn.status, "completed") or
             std.mem.eql(u8, turn.status, "failed") or
             std.mem.eql(u8, turn.status, "aborted")) continue;
         const thread = self.threadByLocalId(turn.workspace_id, turn.local_thread_id) orelse continue;
         const send_state = thread.send_state;
+        const owned_turn_id = try attachment_allocator.dupe(u8, turn.turn_id);
         send_state.mutex.lock();
         if (send_state.status == .idle and !send_state.daemon_owned) {
             send_state.status = .pending;
             send_state.started_at_ms = turn.started_at_ms;
             send_state.provider = thread.provider;
-            send_state.daemon_turn_id = std.heap.page_allocator.dupe(u8, turn.turn_id) catch null;
+            send_state.daemon_turn_id = owned_turn_id;
             send_state.daemon_last_seq = 0;
             send_state.daemon_last_poll_ms = -1;
-            send_state.daemon_owned = send_state.daemon_turn_id != null;
+            send_state.daemon_owned = true;
             send_state.ui_revision +%= 1;
-            if (send_state.daemon_owned) self.chat_controller.beginSend();
+            self.chat_controller.beginSend();
+        } else {
+            attachment_allocator.free(owned_turn_id);
         }
         send_state.mutex.unlock();
     }
@@ -2126,6 +2137,80 @@ const TerminalTurnConsumeArgs = struct {
     pref_path: []u8,
     turn_id: []u8,
 };
+
+const TerminalConsumeState = enum { in_flight, completed };
+const TerminalConsumeDisposition = enum { accepted, not_found };
+var terminal_consume_mutex: std.atomic.Mutex = .unlocked;
+var terminal_consume_turns: std.StringHashMapUnmanaged(TerminalConsumeState) = .empty;
+
+fn lockTerminalConsumes() void {
+    while (!terminal_consume_mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn reserveTerminalConsume(turn_id: []const u8) bool {
+    lockTerminalConsumes();
+    defer terminal_consume_mutex.unlock();
+    if (terminal_consume_turns.contains(turn_id)) return false;
+    const key = std.heap.page_allocator.dupe(u8, turn_id) catch return false;
+    terminal_consume_turns.put(std.heap.page_allocator, key, .in_flight) catch {
+        std.heap.page_allocator.free(key);
+        return false;
+    };
+    return true;
+}
+
+fn finishTerminalConsume(turn_id: []const u8, completed: bool) void {
+    lockTerminalConsumes();
+    defer terminal_consume_mutex.unlock();
+    if (completed) {
+        if (terminal_consume_turns.getPtr(turn_id)) |state| state.* = .completed;
+    } else if (terminal_consume_turns.fetchRemove(turn_id)) |entry| {
+        std.heap.page_allocator.free(entry.key);
+    }
+}
+
+fn pruneCompletedTerminalConsumes(turns: []const headless.store.TurnRecord) void {
+    lockTerminalConsumes();
+    defer terminal_consume_mutex.unlock();
+    while (true) {
+        var stale_key: ?[]const u8 = null;
+        var iterator = terminal_consume_turns.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.value_ptr.* != .completed) continue;
+            var present = false;
+            for (turns) |turn| {
+                if (std.mem.eql(u8, entry.key_ptr.*, turn.turn_id)) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) {
+                stale_key = entry.key_ptr.*;
+                break;
+            }
+        }
+        const key = stale_key orelse return;
+        const removed = terminal_consume_turns.fetchRemove(key) orelse continue;
+        std.heap.page_allocator.free(removed.key);
+    }
+}
+
+fn terminalConsumeDisposition(response: []const u8) !TerminalConsumeDisposition {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDaemonResponse;
+    if (parsed.value.object.get("error")) |error_value| {
+        if (error_value != .object) return error.InvalidDaemonResponse;
+        const code = jsonValueString(error_value.object.get("code") orelse .null) orelse return error.InvalidDaemonResponse;
+        if (std.mem.eql(u8, code, "not_found")) return .not_found;
+        return error.DaemonRequestFailed;
+    }
+    const result = parsed.value.object.get("result") orelse return error.InvalidDaemonResponse;
+    if (result != .object) return error.InvalidDaemonResponse;
+    const accepted = result.object.get("accepted") orelse return error.InvalidDaemonResponse;
+    if (accepted != .bool or !accepted.bool) return error.InvalidDaemonResponse;
+    return .accepted;
+}
 
 fn consumeReconciledTerminalTurn(args: *TerminalTurnConsumeArgs) void {
     defer {
@@ -2141,15 +2226,26 @@ fn consumeReconciledTerminalTurn(args: *TerminalTurnConsumeArgs) void {
         6,
     ) catch |err| {
         log.warn("failed to consume reconciled chat turn {s}: {s}", .{ args.turn_id, @errorName(err) });
+        finishTerminalConsume(args.turn_id, false);
         return;
     };
-    std.heap.page_allocator.free(response);
+    defer std.heap.page_allocator.free(response);
+    const disposition = terminalConsumeDisposition(response) catch |err| {
+        log.warn("invalid consume result for reconciled chat turn {s}: {s}", .{ args.turn_id, @errorName(err) });
+        finishTerminalConsume(args.turn_id, false);
+        return;
+    };
+    if (disposition == .not_found) {
+        log.debug("reconciled chat turn {s} was already consumed", .{args.turn_id});
+    }
+    finishTerminalConsume(args.turn_id, true);
 }
 
 /// Bounded reconnect presentation for terminal rows already carried by the
 /// cursor worker. Failure status/error is shown locally; retention cleanup is
 /// dispatched asynchronously so the SDL frame performs no daemon I/O.
 pub fn reconcileTerminalDaemonChatTurnsSnapshot(self: anytype, turns: []const headless.store.TurnRecord) void {
+    pruneCompletedTerminalConsumes(turns);
     for (turns) |turn| {
         const terminal = std.mem.eql(u8, turn.status, "completed") or
             std.mem.eql(u8, turn.status, "failed") or
@@ -2163,10 +2259,15 @@ pub fn reconcileTerminalDaemonChatTurnsSnapshot(self: anytype, turns: []const he
             );
             self.setSidebarNotice("A chat reply failed while Verde was closed.");
         }
-        const args = std.heap.page_allocator.create(TerminalTurnConsumeArgs) catch continue;
+        if (!reserveTerminalConsume(turn.turn_id)) continue;
+        const args = std.heap.page_allocator.create(TerminalTurnConsumeArgs) catch {
+            finishTerminalConsume(turn.turn_id, false);
+            continue;
+        };
         args.* = .{
             .pref_path = std.heap.page_allocator.dupe(u8, self.storage.pref_path) catch {
                 std.heap.page_allocator.destroy(args);
+                finishTerminalConsume(turn.turn_id, false);
                 continue;
             },
             .turn_id = undefined,
@@ -2174,16 +2275,80 @@ pub fn reconcileTerminalDaemonChatTurnsSnapshot(self: anytype, turns: []const he
         args.turn_id = std.heap.page_allocator.dupe(u8, turn.turn_id) catch {
             std.heap.page_allocator.free(args.pref_path);
             std.heap.page_allocator.destroy(args);
+            finishTerminalConsume(turn.turn_id, false);
             continue;
         };
         const worker = std.Thread.spawn(.{}, consumeReconciledTerminalTurn, .{args}) catch {
             std.heap.page_allocator.free(args.pref_path);
             std.heap.page_allocator.free(args.turn_id);
             std.heap.page_allocator.destroy(args);
+            finishTerminalConsume(turn.turn_id, false);
             continue;
         };
         worker.detach();
     }
+}
+
+test "M5-P4 live-turn attachment allocation failure aborts staging" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "fallible attachment");
+    defer thread.deinit(allocator);
+    allocator.free(thread.local_thread_id);
+    thread.local_thread_id = try allocator.dupeZ(u8, "thread-fallible");
+    const AttachState = struct {
+        chat_controller: State = .{},
+        thread: *ChatThread,
+
+        fn threadByLocalId(self: *@This(), workspace_id: []const u8, local_thread_id: []const u8) ?*ChatThread {
+            if (!std.mem.eql(u8, workspace_id, "ws-fallible")) return null;
+            if (!std.mem.eql(u8, local_thread_id, self.thread.local_thread_id)) return null;
+            return self.thread;
+        }
+    };
+    var state: AttachState = .{ .thread = &thread };
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const turns = [_]headless.store.TurnRecord{.{
+        .turn_id = "turn-fallible",
+        .workspace_id = "ws-fallible",
+        .local_thread_id = "thread-fallible",
+        .status = "running",
+        .started_at_ms = 1,
+        .provider = "codex",
+    }};
+    try std.testing.expectError(
+        error.OutOfMemory,
+        applyDaemonChatTurnsSnapshotWithAllocator(&state, &turns, failing.allocator()),
+    );
+    try std.testing.expectEqual(SendStatus.idle, thread.send_state.status);
+    try std.testing.expect(thread.send_state.daemon_turn_id == null);
+    try std.testing.expectEqual(@as(usize, 0), state.chat_controller.pending_send_count);
+}
+
+test "M5-P4 reconnect consume deduplicates and validates accepted or not_found" {
+    defer {
+        lockTerminalConsumes();
+        defer terminal_consume_mutex.unlock();
+        var iterator = terminal_consume_turns.iterator();
+        while (iterator.next()) |entry| std.heap.page_allocator.free(entry.key_ptr.*);
+        terminal_consume_turns.deinit(std.heap.page_allocator);
+        terminal_consume_turns = .empty;
+    }
+    try std.testing.expect(reserveTerminalConsume("turn-consume"));
+    try std.testing.expect(!reserveTerminalConsume("turn-consume"));
+    try std.testing.expectEqual(
+        TerminalConsumeDisposition.accepted,
+        try terminalConsumeDisposition("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"accepted\":true}}"),
+    );
+    finishTerminalConsume("turn-consume", true);
+    try std.testing.expect(!reserveTerminalConsume("turn-consume"));
+    try std.testing.expectEqual(
+        TerminalConsumeDisposition.not_found,
+        try terminalConsumeDisposition("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":\"not_found\",\"message\":\"gone\"}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidDaemonResponse,
+        terminalConsumeDisposition("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"accepted\":false}}"),
+    );
 }
 
 pub fn threadByLocalId(self: anytype, workspace_id: []const u8, local_thread_id: []const u8) ?*ChatThread {
@@ -3680,6 +3845,24 @@ fn clearAdoptionPending(workspace_id: []const u8, local_thread_id: []const u8) v
     if (adoption_retry_pending.fetchRemove(key)) |entry| {
         std.heap.page_allocator.free(entry.key);
     }
+}
+
+/// Test seam for the real dirty-gate/adoption-refresh path. Production creates
+/// this state only through the bounded retry pump above.
+pub fn markAdoptionTerminalRepairForTest(workspace_id: []const u8, local_thread_id: []const u8) void {
+    std.debug.assert(builtin.is_test);
+    markAdoptionPending(workspace_id, local_thread_id);
+    const key = adoptionRetryKeyAlloc(workspace_id, local_thread_id) orelse return;
+    defer std.heap.page_allocator.free(key);
+    const entry = adoption_retry_pending.getPtr(key) orelse return;
+    entry.attempts = ADOPTION_RETRY_MAX_ATTEMPTS;
+    entry.terminal_failed = true;
+    entry.next_retry_at_ms = std.math.maxInt(i64);
+}
+
+pub fn clearAdoptionRepairForTest(workspace_id: []const u8, local_thread_id: []const u8) void {
+    std.debug.assert(builtin.is_test);
+    clearAdoptionPending(workspace_id, local_thread_id);
 }
 
 /// True only when a pending/terminal adoption repair still covers an id-less

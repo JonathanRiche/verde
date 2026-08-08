@@ -256,6 +256,81 @@ pub fn deinitDaemonSessionProjection(
     sessions.* = .empty;
 }
 
+fn paneLeafById(node: *terminal.PaneNode, pane_id: u32) ?*terminal.PaneLeaf {
+    return switch (node.*) {
+        .leaf => |*leaf| if (leaf.id == pane_id) leaf else null,
+        .split => |*split| paneLeafById(split.first, pane_id) orelse paneLeafById(split.second, pane_id),
+    };
+}
+
+fn daemonSessionDock(project: anytype, dock_id: u32) ?*terminal.Dock {
+    if (dock_id == 0) return &project.terminal_dock;
+    for (project.terminal_docks.items) |*entry| {
+        if (entry.id == dock_id) return &entry.dock;
+    }
+    return null;
+}
+
+fn ensureDaemonSessionPane(
+    allocator: std.mem.Allocator,
+    dock: *terminal.Dock,
+    pane_id: u32,
+    session_id: []const u8,
+) !void {
+    if (dock.tabs.items.len != 0) return;
+    const nodes = [_]terminal.PersistedNode{.{
+        .node_id = 1,
+        .kind = .leaf,
+        .pane_id = pane_id,
+        .session_id = session_id,
+        .revive_policy = .attach_or_create,
+    }};
+    const tabs = [_]terminal.PersistedTab{.{
+        .active_pane_id = pane_id,
+        .root_node_id = 1,
+        .nodes = &nodes,
+    }};
+    const layout = try std.json.Stringify.valueAlloc(allocator, terminal.PersistedWorkspace{
+        .active_tab_index = 0,
+        .tabs = &tabs,
+    }, .{});
+    defer allocator.free(layout);
+    try dock.applyPersistedLayoutJson(allocator, layout);
+}
+
+/// Reconcile composite session identities into the real dock projection.
+/// This is allocation-only and runs on staged projects before publication;
+/// normal dock polling then attaches/tails the discovered daemon session.
+pub fn applyDaemonSessionProjection(
+    self: anytype,
+    sessions: []const headless.store.SessionSummary,
+) !void {
+    for (sessions) |session| {
+        if (!session.running) continue;
+        const project = self.projectForDaemonId(session.workspace_id) orelse continue;
+        if (session.workspace_path.len != 0 and !std.mem.eql(u8, project.path, session.workspace_path)) continue;
+        const dock = daemonSessionDock(project, session.dock_id orelse 0) orelse continue;
+        try ensureDaemonSessionPane(self.allocator, dock, session.pane_id orelse 1, session.session_id);
+        const leaf = if (session.pane_id) |pane_id| blk: {
+            var found: ?*terminal.PaneLeaf = null;
+            for (dock.tabs.items) |*tab| {
+                found = paneLeafById(tab.root, pane_id);
+                if (found != null) break;
+            }
+            break :blk found;
+        } else dock.activePane();
+        const pane = leaf orelse continue;
+        if (pane.session != null) continue;
+        if (pane.session_id) |existing| {
+            if (std.mem.eql(u8, existing, session.session_id)) continue;
+        }
+        const next_session_id = try self.allocator.dupe(u8, session.session_id);
+        if (pane.session_id) |existing| self.allocator.free(existing);
+        pane.session_id = next_session_id;
+        pane.revive_policy = .attach_or_create;
+    }
+}
+
 pub fn currentProjectTerminal(self: anytype) *const terminal.Dock {
     if (self.focusedWorkspaceTerminalDockId()) |dock_id| {
         if (self.currentProjectTerminalDock(dock_id)) |dock| return dock;

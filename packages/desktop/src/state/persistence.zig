@@ -768,6 +768,23 @@ pub fn buildPersistedState(self: anytype, backing_allocator: std.mem.Allocator) 
     }, backing_allocator);
 }
 
+/// Deep-copy a persistence projection into one arena. Conflict recovery keeps
+/// the last daemon projection as its three-way merge baseline while frame
+/// state continues to mutate independently.
+pub fn clonePersistedState(
+    backing_allocator: std.mem.Allocator,
+    source: PersistedState,
+) !LoadedPersistedState {
+    var loaded = LoadedPersistedState.init(backing_allocator);
+    errdefer loaded.deinit();
+    const arena = loaded.allocator();
+    const encoded = try std.json.Stringify.valueAlloc(arena, source, .{});
+    loaded.value = try std.json.parseFromSliceLeaky(PersistedState, arena, encoded, .{
+        .allocate = .alloc_always,
+    });
+    return loaded;
+}
+
 pub fn applyPersistedTerminalDocksJson(self: anytype, project: *Project, json: []const u8) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, json, .{});
     defer parsed.deinit();
