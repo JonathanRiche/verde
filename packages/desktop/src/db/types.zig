@@ -101,6 +101,11 @@ pub const PersistedMessage = struct {
     tool_call_id: ?[]const u8 = null,
     tool_call_kind: ?ai_harness.ToolCallKind = null,
     tool_call_status: ?ai_harness.ToolCallStatus = null,
+    /// Durable transcript identity (M4-P4). Daemon-minted (`turn:{id}:msg:{n}`)
+    /// or client-minted (`gui-msg:...`) ids ride the snapshot verbatim so the
+    /// GUI flush never re-mints identities positionally. Null on legacy rows
+    /// (old persisted JSON/DB states decode with the default).
+    message_id: ?[]const u8 = null,
 };
 
 pub const PersistedThread = struct {

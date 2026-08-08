@@ -17,6 +17,10 @@ const platform_runtime = @import("platform_runtime");
 const sessionizer = @import("terminal/sessionizer.zig");
 const transcript_apply = @import("chat/transcript_apply.zig");
 const zqlite = @import("zqlite");
+// M4-P4 fix F2 arm: the GENUINE GUI snapshot conversion + persisted DTOs so
+// the parity scenario exercises the real writer chain, not a hand-built shape.
+const db_types = @import("db/types.zig");
+const persistence = @import("state/persistence.zig");
 
 /// PTY / process-group / Unix-signal scenarios (forkpty, waitpid, kill(pid,0)).
 const posix_pty_supported = switch (builtin.os.tag) {
@@ -4749,12 +4753,17 @@ fn runChatTypedDtoRoundTripScenario(allocator: std.mem.Allocator, io: std.Io) !v
 /// assistant rows with minted `turn:{id}:msg:{i+1}` ids — the F1 self-healing
 /// user-row prepend occupies commit-request slot 0).
 ///
-/// Amendment-2 F2 honesty: this is **daemon identity + content parity**, not a
-/// full GUI writer exercise. Pre-P4 the GUI full-snapshot path rewrote
-/// positional `snap-msg-{i}` ids; M4-P4 write-exclusion stops that rewrite for
-/// daemon-owned terminal turns (GUI applies in-memory only; flush skips
-/// daemon-committed content). Content-level role/author/body/order remains the
-/// dual-write safety property; identity ownership is daemon-side post-P4.
+/// Amendment-2 F2 honesty (M4-P4 fix): identity survival is pinned against the
+/// GENUINE GUI writer chain — a projection-shaped PersistedState carrying the
+/// adopted ids runs through the real `persistence.persistedStateToProtocolSnapshot`
+/// conversion and lands on the daemon store over the real
+/// `state.snapshot.replace` RPC (post-adoption, mid-window, and converged
+/// arms), plus the M4-P5 MAJOR-3 amendment arm (an MCP-created thread no GUI
+/// snapshot ever observed survives the flush). Coverage limits, stated
+/// honestly: the ChatThread → PersistedThread step (`threadSnapshot`) is
+/// pinned desktop-side ("message identities survive the genuine snapshot
+/// chain" in persistence.zig), and no harness drives the full GUI flush
+/// worker loop (buildPersistedState → storage.save scheduling).
 fn runChatTurnParityScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const pref_path = try makePrefPath(allocator, "m4-chat-parity");
     defer allocator.free(pref_path);
@@ -4858,19 +4867,89 @@ fn runChatTurnParityScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     } else return error.ChatParityLedgerMissingUserId;
     if (turn.committed_store_revision == null) return error.ChatParityMissingRevision;
 
-    // P4 identity pin: re-read after a no-op window; daemon ids must remain
-    // (write-exclusion means a concurrent GUI snapshot is no longer expected
-    // to clobber turn:* / gui-msg:* identities for this dual-write window).
+    // M4-P5 MAJOR-3 amendment arm: an MCP-created thread (chat.thread.upsert;
+    // its stable local_thread_id is public API since ae1ea261) that no GUI
+    // snapshot has ever observed must survive the GUI flushes below.
+    var reg = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer reg.deinit();
+    if (!reg.response.isOk()) return error.ChatParityRegisterFailed;
+    const gui_client_id = (try client.decodeClientRegister(&reg)).client_id;
     {
-        var get2 = try client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+        const thread_request: headless.store.ThreadUpsertRequest = .{
+            .mutation = .{ .request_key = "parity-mcp-thread", .client_id = gui_client_id },
             .workspace_id = workspace_id,
-            .local_thread_id = local_thread_id,
+            .thread = .{ .local_thread_id = "thread-parity-mcp", .title = "MCP-created thread" },
+        };
+        var mcp_parsed = try client.call(headless.store.METHOD_CHAT_THREAD_UPSERT, thread_request);
+        defer mcp_parsed.deinit();
+        if (!mcp_parsed.response.isOk()) return error.ChatParityMcpUpsertFailed;
+    }
+
+    // P4 identity fix arms — the GENUINE GUI writer: projection-shaped
+    // PersistedState with ADOPTED ids (what the GUI holds after
+    // adoptDaemonTranscriptIdentities) → real persistedStateToProtocolSnapshot
+    // → real state.snapshot.replace → durable re-read.
+    var writer_arena = std.heap.ArenaAllocator.init(allocator);
+    defer writer_arena.deinit();
+    const wa = writer_arena.allocator();
+
+    var adopted_rows: std.ArrayList(db_types.PersistedMessage) = .empty;
+    defer adopted_rows.deinit(wa);
+    for (committed.thread.messages) |message| {
+        try adopted_rows.append(wa, .{
+            .role = std.meta.stringToEnum(db_types.ChatRole, message.role) orelse return error.ChatParityBadRole,
+            .author = message.author,
+            .body = message.body,
+            .message_id = message.message_id,
         });
-        defer get2.deinit();
-        if (!get2.response.isOk()) return error.ChatParityRereadFailed;
-        const again = try client.decodeThreadGet(&get2);
-        if (again.thread.messages.len != committed.thread.messages.len) return error.ChatParityRereadCount;
-        if (!std.mem.eql(u8, again.thread.messages[0].message_id, user_message_id)) return error.ChatParityRereadUserId;
+    }
+
+    // Arm 1: post-adoption flush — the snapshot carries every id.
+    try runParityGuiFlush(&client, wa, .{
+        .request_key = "m4p4fix-gui-flush-adopted",
+        .client_id = gui_client_id,
+        .workspace_id = workspace_id,
+        .local_thread_id = local_thread_id,
+        .pref_path = pref_path,
+        .messages = adopted_rows.items,
+    });
+    try expectParityTranscriptIntact(&client, workspace_id, local_thread_id, &committed, user_message_id);
+
+    // Arm 2: mid-window flush — the snapshot carries ONLY the user row (the
+    // GUI has not observed the turn's synthesized rows); the store belt must
+    // preserve them with stable order.
+    try runParityGuiFlush(&client, wa, .{
+        .request_key = "m4p4fix-gui-flush-midwindow",
+        .client_id = gui_client_id,
+        .workspace_id = workspace_id,
+        .local_thread_id = local_thread_id,
+        .pref_path = pref_path,
+        .messages = adopted_rows.items[0..1],
+    });
+    try expectParityTranscriptIntact(&client, workspace_id, local_thread_id, &committed, user_message_id);
+
+    // Arm 3: converged flush after re-adoption — exactly one copy per id.
+    try runParityGuiFlush(&client, wa, .{
+        .request_key = "m4p4fix-gui-flush-converged",
+        .client_id = gui_client_id,
+        .workspace_id = workspace_id,
+        .local_thread_id = local_thread_id,
+        .pref_path = pref_path,
+        .messages = adopted_rows.items,
+    });
+    try expectParityTranscriptIntact(&client, workspace_id, local_thread_id, &committed, user_message_id);
+
+    // Amendment assert: the MCP-created thread survived every flush above even
+    // though no snapshot ever carried it.
+    {
+        var mcp_get = try client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+            .workspace_id = workspace_id,
+            .local_thread_id = "thread-parity-mcp",
+        });
+        defer mcp_get.deinit();
+        if (!mcp_get.response.isOk()) return error.ChatParityMcpThreadLost;
+        const mcp_thread = (try client.decodeThreadGet(&mcp_get)).thread;
+        if (!std.mem.eql(u8, mcp_thread.local_thread_id, "thread-parity-mcp")) return error.ChatParityMcpThreadId;
     }
 
     try consumeChatTurn(&client, turn_id);
@@ -4879,6 +4958,88 @@ fn runChatTurnParityScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     if (!prepare.response.isOk()) return error.ChatParityPrepareFailed;
     kill_on_unwind = false;
     _ = child.wait(io) catch {};
+}
+
+const ParityGuiFlush = struct {
+    request_key: []const u8,
+    client_id: []const u8,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    pref_path: []const u8,
+    messages: []const db_types.PersistedMessage,
+};
+
+/// One genuine GUI flush: PersistedState → the real
+/// `persistence.persistedStateToProtocolSnapshot` → `state.snapshot.replace`
+/// with the freshly pinned expected revision (the Storage replaceSnapshot
+/// shape).
+fn runParityGuiFlush(client: anytype, arena: std.mem.Allocator, flush: ParityGuiFlush) !void {
+    const empty_params: struct {} = .{};
+    var status = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params);
+    defer status.deinit();
+    if (!status.response.isOk()) return error.ChatParityFlushStatusFailed;
+    const expected = (try client.decodeStoreStatus(&status)).store_revision;
+
+    const gui_thread: db_types.PersistedThread = .{
+        .title = "Parity thread",
+        .committed = true,
+        .local_thread_id = flush.local_thread_id,
+        .provider = .codex,
+        .messages = flush.messages,
+    };
+    const gui_threads = [_]db_types.PersistedThread{gui_thread};
+    const gui_projects = [_]db_types.PersistedProject{.{
+        .id = flush.workspace_id,
+        .label = "Parity workspace",
+        .path = flush.pref_path,
+        .threads = &gui_threads,
+    }};
+    const gui_state: db_types.PersistedState = .{ .projects = &gui_projects };
+    const wire_snapshot = try persistence.persistedStateToProtocolSnapshot(arena, gui_state, expected);
+
+    const replace: headless.store.SnapshotReplaceRequest = .{
+        .mutation = .{
+            .request_key = flush.request_key,
+            .client_id = flush.client_id,
+            .expected_store_revision = expected,
+        },
+        .snapshot = wire_snapshot,
+        .bootstrap = false,
+    };
+    var parsed = try client.call(headless.store.METHOD_STATE_SNAPSHOT_REPLACE, replace);
+    defer parsed.deinit();
+    if (!parsed.response.isOk()) return error.ChatParityGuiFlushFailed;
+    const write = try client.decodeWriteResult(&parsed);
+    if (!write.applied) return error.ChatParityGuiFlushNotApplied;
+}
+
+/// Durable re-read: every (message_id, role, body) of the committed transcript
+/// must match the original observation exactly, and the ledger-referenced
+/// user row must still be present.
+fn expectParityTranscriptIntact(
+    client: anytype,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    committed: *const headless.store.ThreadGetResult,
+    user_message_id: []const u8,
+) !void {
+    var get = try client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+        .workspace_id = workspace_id,
+        .local_thread_id = local_thread_id,
+    });
+    defer get.deinit();
+    if (!get.response.isOk()) return error.ChatParityRereadFailed;
+    const again = try client.decodeThreadGet(&get);
+    if (again.thread.messages.len != committed.thread.messages.len) return error.ChatParityRereadCount;
+    var saw_user = false;
+    for (again.thread.messages, 0..) |message, i| {
+        const original = committed.thread.messages[i];
+        if (!std.mem.eql(u8, message.message_id, original.message_id)) return error.ChatParityRereadId;
+        if (!std.mem.eql(u8, message.role, original.role)) return error.ChatParityRereadRole;
+        if (!std.mem.eql(u8, message.body, original.body)) return error.ChatParityRereadBody;
+        if (std.mem.eql(u8, message.message_id, user_message_id)) saw_user = true;
+    }
+    if (!saw_user) return error.ChatParityLedgerUserRowMissing;
 }
 
 /// M4-P3 revision-guard conflict: after a daemon turn commit advances the store
@@ -5132,7 +5293,18 @@ fn runChatCloseBeforeConsumeReopenScenario(allocator: std.mem.Allocator, io: std
     const self_exe = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_exe);
 
-    var first_msg_count: usize = 0;
+    // NIT-3: capture the full per-row identity/content shape from launch 1 so
+    // the reopen comparison pins the identical transcript, not just its size.
+    const CapturedRow = struct { message_id: []u8, role: []u8, body: []u8 };
+    var first_rows: std.ArrayList(CapturedRow) = .empty;
+    defer {
+        for (first_rows.items) |row| {
+            allocator.free(row.message_id);
+            allocator.free(row.role);
+            allocator.free(row.body);
+        }
+        first_rows.deinit(allocator);
+    }
     var first_revision: u64 = 0;
     {
         var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
@@ -5160,8 +5332,16 @@ fn runChatCloseBeforeConsumeReopenScenario(allocator: std.mem.Allocator, io: std
         defer get.deinit();
         if (!get.response.isOk()) return error.ChatCloseGetFailed;
         const thread = try client.decodeThreadGet(&get);
-        first_msg_count = thread.thread.messages.len;
-        if (first_msg_count < 2) return error.ChatCloseTooFewMessages;
+        if (thread.thread.messages.len < 2) return error.ChatCloseTooFewMessages;
+        for (thread.thread.messages) |message| {
+            const message_id = try allocator.dupe(u8, message.message_id);
+            errdefer allocator.free(message_id);
+            const role = try allocator.dupe(u8, message.role);
+            errdefer allocator.free(role);
+            const body = try allocator.dupe(u8, message.body);
+            errdefer allocator.free(body);
+            try first_rows.append(allocator, .{ .message_id = message_id, .role = role, .body = body });
+        }
 
         var rec = try client.call(headless.store.METHOD_CHAT_TURN_RECORD, .{ .turn_id = "turn-close-1" });
         defer rec.deinit();
@@ -5201,7 +5381,15 @@ fn runChatCloseBeforeConsumeReopenScenario(allocator: std.mem.Allocator, io: std
         defer get2.deinit();
         if (!get2.response.isOk()) return error.ChatCloseReopenGetFailed;
         const thread2 = try client2.decodeThreadGet(&get2);
-        if (thread2.thread.messages.len != first_msg_count) return error.ChatCloseReopenMsgCount;
+        if (thread2.thread.messages.len != first_rows.items.len) return error.ChatCloseReopenMsgCount;
+        // NIT-3: identical transcript = identical (message_id, role, body) per
+        // row in order, not merely count + revision equality.
+        for (thread2.thread.messages, 0..) |message, i| {
+            const original = first_rows.items[i];
+            if (!std.mem.eql(u8, message.message_id, original.message_id)) return error.ChatCloseReopenRowId;
+            if (!std.mem.eql(u8, message.role, original.role)) return error.ChatCloseReopenRowRole;
+            if (!std.mem.eql(u8, message.body, original.body)) return error.ChatCloseReopenRowBody;
+        }
 
         var rec2 = try client2.call(headless.store.METHOD_CHAT_TURN_RECORD, .{ .turn_id = "turn-close-1" });
         defer rec2.deinit();

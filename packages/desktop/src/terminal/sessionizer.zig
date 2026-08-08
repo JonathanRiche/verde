@@ -4197,7 +4197,11 @@ pub const Daemon = struct {
             return response;
         }
         // Pointer grab only — SQLite for the ledger guard is outside lockDaemon.
+        // MINOR-1 (pre-M5-P3): bump in_flight under the same lockDaemon as the
+        // staging/commit siblings so finalize's drain sees this borrow before
+        // requests can run off the accept thread.
         const service = self.store_service;
+        if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
         self.mutex.unlock();
 
         // MAJOR-R1: reject replay of terminal committed turn_ids. Without this,
@@ -4205,6 +4209,7 @@ pub const Daemon = struct {
         // durability_pending wedges permanently. Interrupted rows still allow
         // replay (sweep → re-commit upsert). Never SQLite under lockDaemon.
         if (service) |svc| {
+            defer _ = svc.in_flight.fetchSub(1, .monotonic);
             if (try ledgerHasTerminalCommittedTurn(svc, turn_id)) {
                 return try errorResponseAlloc(
                     self.allocator,

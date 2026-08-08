@@ -448,9 +448,26 @@ pub const Client = struct {
         var messages: std.ArrayList(PersistedMessage) = .empty;
         defer messages.deinit(allocator);
 
+        // M4-P4 identity round-trip: durable message identities must reload
+        // verbatim so the next flush re-carries them instead of re-minting
+        // positional ids. Pre-v4 projections (daemon not yet migrated) lack
+        // the column; validateReadOnly accepts them, so probe before select.
+        const has_message_id = blk: {
+            const probe = self.conn.row(
+                "select 1 from pragma_table_info('messages') where name = 'message_id'",
+                .{},
+            ) catch break :blk false;
+            const row = probe orelse break :blk false;
+            row.deinit();
+            break :blk true;
+        };
         var message_rows = try self.conn.rows(
-            "select role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status " ++
-                "from messages where thread_id = ?1 order by sort_index",
+            if (has_message_id)
+                "select role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status, message_id " ++
+                    "from messages where thread_id = ?1 order by sort_index"
+            else
+                "select role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status, null " ++
+                    "from messages where thread_id = ?1 order by sort_index",
             .{thread_id},
         );
         defer message_rows.deinit();
@@ -469,6 +486,12 @@ pub const Client = struct {
                 .tool_call_id = try dupeOptionalText(allocator, message_row.nullableText(6)),
                 .tool_call_kind = decodeOptionalEnum(provider_types.ToolCallKind, message_row.nullableInt(7)),
                 .tool_call_status = decodeOptionalEnum(provider_types.ToolCallStatus, message_row.nullableInt(8)),
+                // Empty string normalizes to null: "no identity known".
+                .message_id = blk: {
+                    const raw = message_row.nullableText(9) orelse break :blk null;
+                    if (raw.len == 0) break :blk null;
+                    break :blk try allocator.dupe(u8, raw);
+                },
             });
         }
         if (message_rows.err) |err| return err;
