@@ -73,6 +73,9 @@ const c = struct {
 /// Safety-net idle for every IT daemon so a crashed run cannot leave a
 /// permanent daemon+socket when persistent-by-default is enabled.
 const IT_SAFETY_IDLE_EXIT_MS = "30000";
+const IT_DAEMON_PREF_PATH_ENV = "VERDE_IT_DAEMON_PREF_PATH";
+const CORE_CLI_SUBPROCESS_TIMEOUT_MS: i64 = 40_000;
+const CORE_CLI_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
 /// M5-P3 landed the bounded transport worker pool (platform_ipc: fixed
 /// TRANSPORT_WORKER_COUNT workers behind the single accept caller), so a
@@ -163,6 +166,17 @@ pub fn main(init: std.process.Init) !void {
             defer allocator.free(self_exe);
             const out: cli_output.Output = .{ .io = io };
             try cli_main.handleCore(allocator, out, io, self_exe, core_argv.items);
+            return;
+        }
+        if (std.mem.eql(u8, arg, "__session-daemon")) {
+            // The real core handler's autostart path re-execs this IT binary.
+            // Its parent supplies the exact tmpDir pref path alongside the
+            // endpoint/store/idle overrides, so the detached daemon remains
+            // hermetic and has the same bounded lifetime as explicit IT daemons.
+            const environ = currentEnviron();
+            const pref_path = try environ.getAlloc(allocator, IT_DAEMON_PREF_PATH_ENV);
+            defer allocator.free(pref_path);
+            try sessionizer.runDaemon(allocator, pref_path);
             return;
         }
     }
@@ -688,6 +702,24 @@ else
             return 0;
         }
     }.WaitForSingleObject;
+
+const WindowsPipeApi = if (builtin.os.tag == .windows) struct {
+    extern "kernel32" fn PeekNamedPipe(
+        handle: std.os.windows.HANDLE,
+        buffer: ?*anyopaque,
+        buffer_len: std.os.windows.DWORD,
+        bytes_read: ?*std.os.windows.DWORD,
+        total_available: ?*std.os.windows.DWORD,
+        bytes_left: ?*std.os.windows.DWORD,
+    ) callconv(.winapi) std.os.windows.BOOL;
+    extern "kernel32" fn ReadFile(
+        handle: std.os.windows.HANDLE,
+        buffer: [*]u8,
+        bytes_to_read: std.os.windows.DWORD,
+        bytes_read: *std.os.windows.DWORD,
+        overlapped: ?*anyopaque,
+    ) callconv(.winapi) std.os.windows.BOOL;
+} else struct {};
 const WAIT_OBJECT_0: u32 = 0;
 
 /// The existing sessionizer uses this compatibility code for methods that have
@@ -5154,6 +5186,11 @@ fn runCoreCliSubprocessAlloc(
     try env_map.put(sessionizer.SESSIONIZER_SOCKET_ENV_NAME, endpoint);
     try env_map.put("XDG_DATA_HOME", pref_path);
     try env_map.put("HOME", pref_path);
+    try env_map.put("VERDE_SESSION_DAEMON_IDLE_EXIT_MS", IT_SAFETY_IDLE_EXIT_MS);
+    try env_map.put(IT_DAEMON_PREF_PATH_ENV, pref_path);
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try env_map.put(sessionizer.SESSION_DAEMON_STORE_DIR_ENV_NAME, store_dir);
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
@@ -5169,16 +5206,109 @@ fn runCoreCliSubprocessAlloc(
     });
     var kill_on_unwind = true;
     errdefer if (kill_on_unwind) child.kill(io);
+    errdefer prepareCoreCliDaemonForCleanup(allocator, pref_path);
 
-    const stdout_file = child.stdout orelse return error.CoreCliStdoutClosed;
-    var read_buffer: [16 * 1024]u8 = undefined;
-    var reader = stdout_file.readerStreaming(io, &read_buffer);
-    const bytes = try reader.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024));
+    const deadline_ms = sessionizer.nowMs() + CORE_CLI_SUBPROCESS_TIMEOUT_MS;
+    const bytes = try readCoreCliStdoutBounded(allocator, io, &child, deadline_ms);
     errdefer allocator.free(bytes);
-    const term = try child.wait(io);
+    const remaining_ms = deadline_ms - sessionizer.nowMs();
+    if (remaining_ms <= 0) return error.CoreCliTimedOut;
+    const term = try waitChildBounded(&child, io, @intCast(remaining_ms));
     kill_on_unwind = false;
     if (term != .exited or term.exited != 0) return error.CoreCliExitCode;
     return bytes;
+}
+
+fn prepareCoreCliDaemonForCleanup(allocator: std.mem.Allocator, pref_path: []const u8) void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = arena.allocator(),
+        .pref_path = pref_path,
+        .timeout_ms = 1_000,
+    };
+    var client = sessionizer.headlessClient(arena.allocator(), &transport);
+    if (client.call("daemon.prepareShutdown", .{})) |response| {
+        var owned = response;
+        owned.deinit();
+    } else |_| {}
+}
+
+fn readCoreCliStdoutBounded(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    child: *std.process.Child,
+    deadline_ms: i64,
+) ![]u8 {
+    if (comptime builtin.os.tag == .windows) {
+        return readCoreCliStdoutWindowsBounded(allocator, io, child, deadline_ms);
+    }
+    return readCoreCliStdoutPosixBounded(allocator, child, deadline_ms);
+}
+
+fn readCoreCliStdoutPosixBounded(
+    allocator: std.mem.Allocator,
+    child: *std.process.Child,
+    deadline_ms: i64,
+) ![]u8 {
+    const stdout_file = child.stdout orelse return error.CoreCliStdoutClosed;
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(allocator);
+    while (true) {
+        const remaining_ms = deadline_ms - sessionizer.nowMs();
+        if (remaining_ms <= 0) return error.CoreCliReadTimedOut;
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = stdout_file.handle,
+            .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&poll_fds, @intCast(@min(remaining_ms, 200))) catch 0;
+        if (ready == 0) continue;
+        var buffer: [16 * 1024]u8 = undefined;
+        const read_len = std.posix.read(stdout_file.handle, &buffer) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        if (read_len == 0) return bytes.toOwnedSlice(allocator);
+        if (bytes.items.len + read_len > CORE_CLI_MAX_OUTPUT_BYTES) return error.CoreCliOutputTooLarge;
+        try bytes.appendSlice(allocator, buffer[0..read_len]);
+    }
+}
+
+fn readCoreCliStdoutWindowsBounded(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    child: *std.process.Child,
+    deadline_ms: i64,
+) ![]u8 {
+    const stdout_file = child.stdout orelse return error.CoreCliStdoutClosed;
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(allocator);
+    while (true) {
+        if (sessionizer.nowMs() >= deadline_ms) return error.CoreCliReadTimedOut;
+        var available: std.os.windows.DWORD = 0;
+        if (WindowsPipeApi.PeekNamedPipe(stdout_file.handle, null, 0, null, &available, null) == .FALSE) {
+            return switch (std.os.windows.GetLastError()) {
+                .BROKEN_PIPE, .NO_DATA => bytes.toOwnedSlice(allocator),
+                else => error.CoreCliStdoutReadFailed,
+            };
+        }
+        if (available == 0) {
+            std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+            continue;
+        }
+        var buffer: [16 * 1024]u8 = undefined;
+        var read_len: std.os.windows.DWORD = 0;
+        const wanted: std.os.windows.DWORD = @intCast(@min(buffer.len, available));
+        if (WindowsPipeApi.ReadFile(stdout_file.handle, &buffer, wanted, &read_len, null) == .FALSE) {
+            return switch (std.os.windows.GetLastError()) {
+                .BROKEN_PIPE, .NO_DATA => bytes.toOwnedSlice(allocator),
+                else => error.CoreCliStdoutReadFailed,
+            };
+        }
+        if (bytes.items.len + read_len > CORE_CLI_MAX_OUTPUT_BYTES) return error.CoreCliOutputTooLarge;
+        try bytes.appendSlice(allocator, buffer[0..read_len]);
+    }
 }
 
 /// M5-P5: the actual desktop cursor state and a headless CLI subprocess seed
@@ -5431,6 +5561,31 @@ fn runM5P5CliIndependentCursorScenario(allocator: std.mem.Allocator, io: std.Io)
         !std.mem.eql(u8, resumed_nonce_value.string, replaced_nonce_value.string))
         return error.M5P5ResumeNonceMismatch;
 
+    // MAJOR-2: the genuine CLI survives a quiet long-poll beyond the old 5s
+    // transport timeout and receives the daemon's normal empty heartbeat.
+    const long_poll_started_ms = sessionizer.nowMs();
+    const long_poll_bytes = try runCoreCliSubprocessAlloc(
+        allocator,
+        io,
+        self_exe,
+        pref_path,
+        &.{ "changes", "--cursor", fresh_cursor_arg, "--wait-ms", "5500", "--json" },
+    );
+    defer allocator.free(long_poll_bytes);
+    const long_poll_elapsed_ms = sessionizer.nowMs() - long_poll_started_ms;
+    if (long_poll_elapsed_ms < 5_000 or long_poll_elapsed_ms > 10_000) {
+        return error.M5P5LongPollElapsed;
+    }
+    var long_poll = try std.json.parseFromSlice(std.json.Value, allocator, long_poll_bytes, .{});
+    defer long_poll.deinit();
+    const long_poll_entries = if (long_poll.value == .object)
+        long_poll.value.object.get("entries") orelse return error.M5P5LongPollEntries
+    else
+        return error.M5P5LongPollShape;
+    if (long_poll_entries != .array or long_poll_entries.array.items.len != 0) {
+        return error.M5P5LongPollNotHeartbeat;
+    }
+
     const empty_params: struct {} = .{};
     var prepare_successor = try client.call("daemon.prepareShutdown", empty_params);
     defer prepare_successor.deinit();
@@ -5438,6 +5593,53 @@ fn runM5P5CliIndependentCursorScenario(allocator: std.mem.Allocator, io: std.Io)
     kill_successor_on_unwind = false;
     const successor_term = try waitChildBounded(&successor, io, 10_000);
     if (successor_term != .exited or successor_term.exited != 0) return error.M5P5SuccessorExitCode;
+
+    // MINOR-1: with no tracked daemon, the genuine core handler autostarts its
+    // detached __session-daemon. Every subprocess supplies the tmpDir store
+    // and 30s idle override; the child capture is bounded even though POSIX
+    // fork/exec may retain its stdout pipe until the idle exit closes it.
+    const autostart_started_ms = sessionizer.nowMs();
+    const autostart_bytes = try runCoreCliSubprocessAlloc(
+        allocator,
+        io,
+        self_exe,
+        pref_path,
+        &.{ "changes", "--json" },
+    );
+    defer allocator.free(autostart_bytes);
+    var autostart = try std.json.parseFromSlice(std.json.Value, allocator, autostart_bytes, .{});
+    defer autostart.deinit();
+    if (autostart.value != .object or autostart.value.object.get("next_cursor") == null) {
+        return error.M5P5AutostartCliShape;
+    }
+    try waitForCoreCliDaemonUnavailable(allocator, io, pref_path, autostart_started_ms + 36_000);
+}
+
+fn waitForCoreCliDaemonUnavailable(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    pref_path: []const u8,
+    deadline_ms: i64,
+) !void {
+    while (sessionizer.nowMs() < deadline_ms) {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = arena.allocator(),
+            .pref_path = pref_path,
+            .timeout_ms = 250,
+        };
+        var client = sessionizer.headlessClient(arena.allocator(), &transport);
+        if (client.call("status", .{})) |response| {
+            var owned = response;
+            owned.deinit();
+        } else |_| {
+            return;
+        }
+        std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+    }
+    prepareCoreCliDaemonForCleanup(allocator, pref_path);
+    return error.M5P5AutostartDaemonDidNotIdleExit;
 }
 
 /// Bounded serial queueing under a slow store commit (commit_stall).
@@ -8928,6 +9130,97 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             defer prepare.deinit();
             if (!prepare.response.isOk()) return error.McpDaemonPrepareFailed;
         }
+        kill_daemon_on_unwind = false;
+        _ = try waitChildBounded(&daemon, io, 10_000);
+    }
+
+    // --- Arm 3 (m5p5fix MAJOR-1): a real chat.thread.get queues behind a
+    // deliberately stalled store mutation. The production helper must return
+    // on its one absolute budget rather than multiplying the transport's 5s
+    // default by its attempt count. ---
+    {
+        var daemon = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+            .store_fault = "commit_stall",
+        });
+        var kill_daemon_on_unwind = true;
+        errdefer if (kill_daemon_on_unwind) daemon.kill(io);
+
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+        var reg = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+        defer reg.deinit();
+        if (!reg.response.isOk()) return error.McpConfirmStallRegisterFailed;
+        const client_id = (try client.decodeClientRegister(&reg)).client_id;
+
+        const StallMutationContext = struct {
+            allocator: std.mem.Allocator,
+            pref_path: []const u8,
+            client_id: []const u8,
+            err: ?anyerror = null,
+        };
+        var stall_context: StallMutationContext = .{
+            .allocator = allocator,
+            .pref_path = pref_path,
+            .client_id = client_id,
+        };
+        const stall_thread = try std.Thread.spawn(.{}, struct {
+            fn run(context: *StallMutationContext) void {
+                var arena = std.heap.ArenaAllocator.init(context.allocator);
+                defer arena.deinit();
+                var stall_transport: sessionizer.HeadlessTransport = .{
+                    .allocator = arena.allocator(),
+                    .pref_path = context.pref_path,
+                };
+                var stall_client = sessionizer.headlessClient(arena.allocator(), &stall_transport);
+                var parsed = stall_client.call(headless.store.METHOD_WORKSPACE_UPSERT, .{
+                    .mutation = .{
+                        .request_key = "m5p5-confirm-stalled-read",
+                        .client_id = context.client_id,
+                    },
+                    .workspace = .{
+                        .workspace_id = "ws-confirm-stall",
+                        .label = "Confirm stalled read",
+                        .path = context.pref_path,
+                    },
+                }) catch |err| {
+                    context.err = err;
+                    return;
+                };
+                defer parsed.deinit();
+                if (!parsed.response.isOk()) context.err = error.McpConfirmStallMutationFailed;
+            }
+        }.run, .{&stall_context});
+        var stall_thread_joined = false;
+        defer if (!stall_thread_joined) stall_thread.join();
+
+        // commit_stall sleeps for 1.5s while holding the store-service mutex.
+        std.Io.sleep(io, .fromMilliseconds(250), .awake) catch {};
+        const confirm_started_ms = sessionizer.nowMs();
+        const stalled = try cli_main.chatOpenConfirmThreadDurable(
+            allocator,
+            io,
+            "ws-mcp",
+            "thread-confirm-durable",
+            4,
+            50,
+        );
+        const confirm_elapsed_ms = sessionizer.nowMs() - confirm_started_ms;
+        if (stalled != .timeout) return error.McpConfirmStalledOutcome;
+        if (confirm_elapsed_ms > 750) return error.McpConfirmStalledElapsed;
+
+        stall_thread.join();
+        stall_thread_joined = true;
+        if (stall_context.err) |err| return err;
+
+        var prepare = try client.call("daemon.prepareShutdown", .{});
+        defer prepare.deinit();
+        if (!prepare.response.isOk()) return error.McpConfirmStallPrepareFailed;
         kill_daemon_on_unwind = false;
         _ = try waitChildBounded(&daemon, io, 10_000);
     }

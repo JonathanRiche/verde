@@ -309,10 +309,18 @@ pub fn requestAlloc(
 pub const HeadlessTransport = struct {
     allocator: std.mem.Allocator,
     pref_path: []const u8,
+    /// Per-request deadline. Callers that intentionally issue a bounded
+    /// long-poll must opt into a matching transport budget.
+    timeout_ms: u32 = SESSIONIZER_REQUEST_TIMEOUT_MS,
 
     pub fn send(ctx: *anyopaque, request_json: []const u8) anyerror![]u8 {
         const self: *HeadlessTransport = @ptrCast(@alignCast(ctx));
-        return try sendRequestJsonAlloc(self.allocator, self.pref_path, request_json);
+        return try sendRequestJsonAllocWithTimeout(
+            self.allocator,
+            self.pref_path,
+            request_json,
+            self.timeout_ms,
+        );
     }
 };
 
@@ -322,12 +330,28 @@ pub fn sendRequestJsonAlloc(
     pref_path: []const u8,
     request_json: []const u8,
 ) ![]u8 {
+    return sendRequestJsonAllocWithTimeout(
+        allocator,
+        pref_path,
+        request_json,
+        SESSIONIZER_REQUEST_TIMEOUT_MS,
+    );
+}
+
+/// Send a pre-encoded request with a caller-selected finite transport timeout.
+pub fn sendRequestJsonAllocWithTimeout(
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    request_json: []const u8,
+    timeout_ms: u32,
+) ![]u8 {
+    std.debug.assert(timeout_ms > 0);
     const endpoint = try socketPath(allocator, pref_path);
     defer allocator.free(endpoint);
     return try platform_ipc.requestAlloc(allocator, endpoint, request_json, .{
         .max_message_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
         .max_response_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
-        .timeout_ms = SESSIONIZER_REQUEST_TIMEOUT_MS,
+        .timeout_ms = timeout_ms,
     });
 }
 
