@@ -148,6 +148,10 @@ pub const State = struct {
     last_poll_ms: i64 = 0,
     last_managed_process_poll_ms: i64 = 0,
     poll_requested: bool = false,
+    /// M5-P4 cursor-triggered registry pull: set by the change-cursor drain
+    /// when a registry-plane change entry (or a resync) arrives; consumed by
+    /// pollTerminals to run the M2-P3 pull path across all projects.
+    daemon_registry_pull_requested: bool = false,
     daemon_batch_retry_at_ms: i64 = 0,
     daemon_poll_batch: terminal.DaemonPollBatch = .{},
 
@@ -414,6 +418,17 @@ pub fn pollTerminals(self: anytype) bool {
     }
     self.terminal_controller.poll_requested = false;
     self.terminal_controller.last_poll_ms = now_ms;
+    // M5-P4: a change-cursor registry signal replaces the old per-read daemon
+    // pull. Run the SAME pull path the Live read used (projection equivalence
+    // by construction), across every project so background workspaces stay
+    // fresh for projection-served reads.
+    if (self.terminal_controller.daemon_registry_pull_requested) {
+        self.terminal_controller.daemon_registry_pull_requested = false;
+        var registry_pull_index: usize = 0;
+        while (registry_pull_index < self.project_controller.projects.items.len) : (registry_pull_index += 1) {
+            self.pollWorkspaceTerminalProcessLifecycles(registry_pull_index);
+        }
+    }
     const poll_managed_processes = managedProcessPollDue(
         self.terminal_controller.last_managed_process_poll_ms,
         now_ms,

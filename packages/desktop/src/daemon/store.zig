@@ -913,6 +913,32 @@ pub const Store = struct {
             \\    draft_image_mime text,
             \\    draft_image_byte_size integer
             \\);
+            \\create temp table if not exists preserved_workspaces (
+            \\    workspace_id text not null,
+            \\    sort_index integer not null,
+            \\    label text not null,
+            \\    path text not null,
+            \\    archived integer not null,
+            \\    unread_count integer not null,
+            \\    collapsed integer not null,
+            \\    thread_list_expanded integer not null,
+            \\    terminal_height real,
+            \\    terminal_layout_json text,
+            \\    terminal_docks_json text,
+            \\    workspace_layout_json text,
+            \\    selected_thread_index integer not null,
+            \\    companion_thread_local_id text,
+            \\    herdr_remote_alias text,
+            \\    herdr_session_name text,
+            \\    herdr_workspace_id text,
+            \\    herdr_local_dir text,
+            \\    herdr_remote_cwd text,
+            \\    herdr_last_pane_id text,
+            \\    herdr_attach_dock_id integer,
+            \\    herdr_attach_pane_id integer,
+            \\    herdr_pane_links_json text,
+            \\    herdr_updated_at_ms integer
+            \\);
             \\create temp table if not exists preserved_chat_messages (
             \\    workspace_key text not null,
             \\    thread_key text not null,
@@ -936,6 +962,20 @@ pub const Store = struct {
             \\);
             \\delete from preserved_chat_threads;
             \\delete from preserved_chat_messages;
+            \\delete from preserved_workspaces;
+            \\insert into preserved_workspaces
+            \\select w.workspace_id, w.sort_index, w.label, w.path, w.archived, w.unread_count,
+            \\       w.collapsed, w.thread_list_expanded, w.terminal_height, w.terminal_layout_json,
+            \\       w.terminal_docks_json, w.workspace_layout_json, w.selected_thread_index,
+            \\       w.companion_thread_local_id, w.herdr_remote_alias, w.herdr_session_name,
+            \\       w.herdr_workspace_id, w.herdr_local_dir, w.herdr_remote_cwd, w.herdr_last_pane_id,
+            \\       w.herdr_attach_dock_id, w.herdr_attach_pane_id, w.herdr_pane_links_json,
+            \\       w.herdr_updated_at_ms
+            \\from workspaces w
+            \\where exists (
+            \\    select 1 from chat_turns ct
+            \\    where ct.workspace_id = w.workspace_id and ct.committed_store_revision is not null
+            \\);
             \\insert into preserved_chat_threads
             \\select w.workspace_id, t.sort_index, t.title, t.archived, t.committed, t.local_thread_id,
             \\       t.last_activity_at, t.provider_thread_id, t.model_ref, t.reasoning_effort,
@@ -996,13 +1036,24 @@ pub const Store = struct {
         try self.conn.execNoArgs(
             \\delete from preserved_chat_threads;
             \\delete from preserved_chat_messages;
+            \\delete from preserved_workspaces;
         );
     }
 
     /// Re-home staged daemon-owned rows the snapshot did not carry.
     ///
-    /// Scope rules: a workspace absent from the snapshot is a deliberate
-    /// GUI-side project deletion — its threads and rows are not resurrected.
+    /// Scope rules: a workspace absent from the snapshot is normally a
+    /// deliberate GUI-side project deletion — its threads and rows are not
+    /// resurrected. M5-P4 Amendment 1 carves out one exception: a workspace
+    /// holding COMMITTED turn-ledger rows (chat_turns.committed_store_revision
+    /// not null) is restored, because daemon-side turn commits can create and
+    /// populate a workspace the GUI has never observed, and dropping it would
+    /// both lose committed transcripts and leave the ledger dangling. The
+    /// workspaces table carries no revision column, so there is no honest
+    /// "GUI observed this workspace" key — the committed-ledger scope is the
+    /// deliberate tradeoff: deleting a project with committed daemon turns
+    /// resurrects it until the ledger rows are consumed/cleared, while
+    /// ordinary (never-committed) project deletions stay deletions.
     /// A thread absent from the snapshot whose workspace survives is restored
     /// (the GUI cannot have observed it — see applySnapshot). A message id the
     /// snapshot already carries wins on position/content (M4-P3 parity makes
@@ -1019,6 +1070,32 @@ pub const Store = struct {
     /// appending preserves transcript order, and the post-adoption flush
     /// carries every id and converges to exactly one copy per identity.
     fn restorePreservedChatRows(self: *Self) !void {
+        // M5-P4 Amendment 1 workspace belt: re-home ledger-referenced
+        // workspaces first so the thread/message restores below can join
+        // them. Restored rows append after the snapshot's workspaces
+        // (global unique sort_index, same max+row_number pattern as threads).
+        try self.conn.execNoArgs(
+            \\insert into workspaces (workspace_id, sort_index, label, path, archived, unread_count,
+            \\                        collapsed, thread_list_expanded, terminal_height, terminal_layout_json,
+            \\                        terminal_docks_json, workspace_layout_json, selected_thread_index,
+            \\                        companion_thread_local_id, herdr_remote_alias, herdr_session_name,
+            \\                        herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id,
+            \\                        herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json,
+            \\                        herdr_updated_at_ms)
+            \\select p.workspace_id,
+            \\       (select coalesce(max(w2.sort_index) + 1, 0) from workspaces w2)
+            \\           + (row_number() over (order by p.sort_index) - 1),
+            \\       p.label, p.path, p.archived, p.unread_count, p.collapsed, p.thread_list_expanded,
+            \\       p.terminal_height, p.terminal_layout_json, p.terminal_docks_json,
+            \\       p.workspace_layout_json, p.selected_thread_index, p.companion_thread_local_id,
+            \\       p.herdr_remote_alias, p.herdr_session_name, p.herdr_workspace_id, p.herdr_local_dir,
+            \\       p.herdr_remote_cwd, p.herdr_last_pane_id, p.herdr_attach_dock_id, p.herdr_attach_pane_id,
+            \\       p.herdr_pane_links_json, p.herdr_updated_at_ms
+            \\from temp.preserved_workspaces p
+            \\where not exists (
+            \\    select 1 from workspaces w3 where w3.workspace_id = p.workspace_id
+            \\);
+        );
         try self.conn.execNoArgs(
             \\insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id,
             \\                     last_activity_at, provider_thread_id, model_ref, reasoning_effort,
@@ -1489,8 +1566,15 @@ pub const Store = struct {
         const status_code = if (message.tool_call_status) |value| try toolCallStatusCode(value) else null;
         const image = try firstAttachment(message.image, message.images);
 
+        // M5-P4 Amendment 1 duplicate-id invariant: a snapshot carrying the
+        // same (thread, message_id) twice must refresh position/content in
+        // place (identity wins) instead of wedging the whole replace on the
+        // partial unique index. The freed sort_index slot stays reserved to
+        // this statement's sequence, so the per-thread unique(sort_index)
+        // cannot collide.
         try self.conn.exec(
-            "insert into messages (thread_id, sort_index, role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status, message_id, created_at_ms, updated_at_ms) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "insert into messages (thread_id, sort_index, role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status, message_id, created_at_ms, updated_at_ms) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) " ++
+                "on conflict(thread_id, message_id) where message_id is not null do update set sort_index = excluded.sort_index, role = excluded.role, author = excluded.author, body = excluded.body, image_path = excluded.image_path, image_mime = excluded.image_mime, image_byte_size = excluded.image_byte_size, tool_call_id = excluded.tool_call_id, tool_call_kind = excluded.tool_call_kind, tool_call_status = excluded.tool_call_status, created_at_ms = excluded.created_at_ms, updated_at_ms = excluded.updated_at_ms",
             .{
                 thread_row_id,
                 sort_index,
@@ -1519,8 +1603,12 @@ pub const Store = struct {
     ) !void {
         const fingerprint = self.encodeFingerprint(message) catch |err| return err;
         defer self.allocator.free(fingerprint);
+        // M5-P4 Amendment 1: same duplicate-id tolerance as the message row —
+        // the key table's (thread_id, message_id) primary key must follow the
+        // refreshed row instead of failing the replace.
         try self.conn.exec(
-            "insert into client_message_keys (thread_id, message_id, message_fingerprint, sort_index, created_at_ms, updated_at_ms, store_revision) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "insert into client_message_keys (thread_id, message_id, message_fingerprint, sort_index, created_at_ms, updated_at_ms, store_revision) values (?1, ?2, ?3, ?4, ?5, ?6, ?7) " ++
+                "on conflict(thread_id, message_id) do update set message_fingerprint = excluded.message_fingerprint, sort_index = excluded.sort_index, created_at_ms = excluded.created_at_ms, updated_at_ms = excluded.updated_at_ms, store_revision = excluded.store_revision",
             .{ thread_row_id, message.message_id, fingerprint, sort_index, message.created_at_ms, message.updated_at_ms, store_revision },
         );
     }
@@ -2455,6 +2543,158 @@ test "snapshot replace preserves daemon-committed identities keys and ledger ref
     )).?;
     defer user_rows.deinit();
     try std.testing.expectEqual(@as(i64, 1), user_rows.int(0));
+}
+
+// M5-P4 Amendment 1: a snapshot omitting a workspace that holds COMMITTED
+// turn-ledger rows must restore the workspace (plus its preserved thread and
+// rows) instead of dropping committed daemon transcripts and leaving the
+// ledger dangling; never-committed omitted workspaces stay deleted.
+test "snapshot replace restores ledger-referenced workspaces and still deletes plain ones" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    const workspace = testWorkspace("ws-belt2", "Ledger workspace");
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("wsbelt-workspace", null),
+        .workspace = workspace,
+    });
+    const thread = testThread("thread-belt2", "Ledger thread");
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("wsbelt-thread", 1),
+        .workspace_id = workspace.workspace_id,
+        .thread = thread,
+    });
+    const user_message: store_protocol.Message = .{
+        .message_id = "gui-msg:wsbelt:1",
+        .role = "user",
+        .author = "You",
+        .body = "wsbelt hello",
+        .created_at_ms = 10,
+        .updated_at_ms = 10,
+    };
+    _ = try store.appendMessage(.{
+        .mutation = testHeader("wsbelt-user-stage", 2),
+        .workspace_id = workspace.workspace_id,
+        .thread_id = thread.local_thread_id,
+        .message = user_message,
+    });
+    const commit_messages = [_]store_protocol.Message{
+        user_message,
+        .{ .message_id = "", .role = "assistant", .author = "Codex", .body = "wsbelt-ok", .created_at_ms = 20, .updated_at_ms = 20 },
+    };
+    _ = try store.commitTurn(.{
+        .turn_id = "turn-wsbelt",
+        .workspace_id = workspace.workspace_id,
+        .local_thread_id = thread.local_thread_id,
+        .status = .completed,
+        .started_at_ms = 10,
+        .finished_at_ms = 20,
+        .provider = "codex",
+        .user_message_id = "gui-msg:wsbelt:1",
+        .messages = &commit_messages,
+    });
+    // Control: a workspace with no turns at all is a plain deletion target.
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("wsbelt-plain", 4),
+        .workspace = testWorkspace("ws-plain", "Plain workspace"),
+    });
+
+    // GUI flush that never observed ws-belt2 (nor ws-plain): only a fresh
+    // workspace survives the wipe by carriage.
+    const carried = [_]store_protocol.Workspace{testWorkspace("ws-other", "Other workspace")};
+    _ = try store.applyMutation(.{ .snapshot_replace = testSnapshotRequest("wsbelt-flush", 5, false, testSnapshot(&carried)) });
+
+    const counts = [_]struct { id: []const u8, expected: i64 }{
+        .{ .id = "ws-belt2", .expected = 1 }, // restored by the ledger belt
+        .{ .id = "ws-plain", .expected = 0 }, // deliberate deletion honored
+        .{ .id = "ws-other", .expected = 1 }, // carried by the snapshot
+    };
+    for (counts) |case| {
+        var row = (try store.conn.row(
+            "select count(*) from workspaces where workspace_id = ?1",
+            .{case.id},
+        )).?;
+        defer row.deinit();
+        try std.testing.expectEqual(case.expected, row.int(0));
+    }
+
+    // The preserved thread re-homed under the restored workspace with both
+    // ledger-referenced rows, and the ledger reference resolves again.
+    var restored_rows = (try store.conn.row(
+        \\select count(*) from messages m
+        \\join threads t on t.id = m.thread_id
+        \\join workspaces w on w.id = t.workspace_id
+        \\where w.workspace_id = 'ws-belt2' and t.local_thread_id = 'thread-belt2'
+    ,
+        .{},
+    )).?;
+    defer restored_rows.deinit();
+    try std.testing.expectEqual(@as(i64, 2), restored_rows.int(0));
+    var resolved = (try store.conn.row(
+        \\select count(*) from chat_turns ct
+        \\join threads t on t.local_thread_id = ct.local_thread_id
+        \\join messages m on m.thread_id = t.id and m.message_id = ct.user_message_id
+        \\where ct.turn_id = 'turn-wsbelt'
+    ,
+        .{},
+    )).?;
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(i64, 1), resolved.int(0));
+}
+
+// M5-P4 Amendment 1 duplicate-id invariant: one snapshot carrying the same
+// (thread, message_id) twice applies cleanly — identity wins, the later
+// occurrence refreshes position and content, and exactly one row plus one
+// client key remain.
+test "snapshot replace tolerates duplicate message ids by refreshing in place" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("dup-workspace", null),
+        .workspace = testWorkspace("ws-dup", "Dup workspace"),
+    });
+
+    const snapshot_messages = [_]store_protocol.Message{
+        .{ .message_id = "dup-1", .role = "user", .author = "You", .body = "first copy" },
+        .{ .message_id = "", .role = "assistant", .author = "Codex", .body = "middle" },
+        .{ .message_id = "dup-1", .role = "user", .author = "You", .body = "second copy" },
+    };
+    var snapshot_thread = testThread("thread-dup", "Dup thread");
+    snapshot_thread.messages = &snapshot_messages;
+    var snapshot_workspace = testWorkspace("ws-dup", "Dup workspace");
+    snapshot_workspace.threads = &.{snapshot_thread};
+    const workspaces = [_]store_protocol.Workspace{snapshot_workspace};
+    _ = try store.applyMutation(.{ .snapshot_replace = testSnapshotRequest("dup-flush", 1, false, testSnapshot(&workspaces)) });
+
+    var dup_row = (try store.conn.row(
+        "select count(*), max(body), max(sort_index) from messages where message_id = 'dup-1'",
+        .{},
+    )).?;
+    defer dup_row.deinit();
+    try std.testing.expectEqual(@as(i64, 1), dup_row.int(0));
+    try std.testing.expectEqualStrings("second copy", dup_row.text(1));
+    try std.testing.expectEqual(@as(i64, 2), dup_row.int(2));
+    var total_rows = (try store.conn.row(
+        "select count(*) from messages",
+        .{},
+    )).?;
+    defer total_rows.deinit();
+    try std.testing.expectEqual(@as(i64, 2), total_rows.int(0));
+    var key_rows = (try store.conn.row(
+        "select count(*) from client_message_keys where message_id = 'dup-1'",
+        .{},
+    )).?;
+    defer key_rows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), key_rows.int(0));
 }
 
 // M4-P4 fix Layer B (ii): a mid-window snapshot (commit → GUI observation gap)

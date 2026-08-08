@@ -964,7 +964,7 @@ fn transcriptMarkdownBubbleHit(
     var msg_idx: usize = 0;
     while (msg_idx < thread.messages.items.len) {
         const message = thread.messages.items[msg_idx];
-        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) {
+        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(thread, message.author, message.body)) {
             msg_idx += 1;
             continue;
         }
@@ -996,7 +996,7 @@ fn transcriptMarkdownBubbleHit(
     var pi: usize = 0;
     while (pi < send_state.pending_events.items.len) {
         const event = send_state.pending_events.items[pi];
-        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) {
+        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(thread, event.author, event.body)) {
             pi += 1;
             continue;
         }
@@ -1046,7 +1046,7 @@ fn transcriptMarkdownBubbleLinkHit(
     var msg_idx: usize = 0;
     while (msg_idx < thread.messages.items.len) {
         const message = thread.messages.items[msg_idx];
-        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) {
+        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(thread, message.author, message.body)) {
             msg_idx += 1;
             continue;
         }
@@ -1077,7 +1077,7 @@ fn transcriptMarkdownBubbleLinkHit(
     var pi: usize = 0;
     while (pi < send_state.pending_events.items.len) {
         const event = send_state.pending_events.items[pi];
-        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) {
+        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(thread, event.author, event.body)) {
             pi += 1;
             continue;
         }
@@ -1418,7 +1418,7 @@ fn transcriptMarkdownMessageSnapshot(state: *app_state.AppState, message_index: 
     const n = thread.messages.items.len;
     if (message_index < n) {
         const m = thread.messages.items[message_index];
-        if (m.role == .system and shouldHideCursorLifecycleSystemEvent(m.author, m.body)) return null;
+        if (m.role == .system and shouldHideCursorLifecycleSystemEvent(thread, m.author, m.body)) return null;
         const kind = transcriptSelectableBodyKind(m.role, m.author, m.body, false, false) orelse return null;
         const body_trim = std.mem.trim(u8, m.body, "\n\r\t ");
         const body_rect = transcriptSelectableBodyRect(column, 0.0, 100000.0, m.role, m.author, m.body) orelse return null;
@@ -1432,7 +1432,7 @@ fn transcriptMarkdownMessageSnapshot(state: *app_state.AppState, message_index: 
     const pi = message_index - n;
     if (pi < send_state.pending_events.items.len) {
         const ev = send_state.pending_events.items[pi];
-        if (ev.role == .system and shouldHideCursorLifecycleSystemEvent(ev.author, ev.body)) return null;
+        if (ev.role == .system and shouldHideCursorLifecycleSystemEvent(thread, ev.author, ev.body)) return null;
         const kind = transcriptSelectableBodyKind(ev.role, ev.author, ev.body, false, false) orelse return null;
         const body_trim = std.mem.trim(u8, ev.body, "\n\r\t ");
         const body_rect = transcriptSelectableBodyRect(column, 0.0, 100000.0, ev.role, ev.author, ev.body) orelse return null;
@@ -2094,7 +2094,7 @@ fn transcriptCommittedHeightUncached(state: *app_state.AppState, thread: anytype
     var message_index: usize = 0;
     while (message_index < thread.messages.items.len) {
         const message = thread.messages.items[message_index];
-        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) {
+        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(thread, message.author, message.body)) {
             message_index += 1;
             continue;
         }
@@ -2150,7 +2150,7 @@ fn ensureTranscriptLayout(state: *app_state.AppState, width: f32) bool {
     var message_index: usize = 0;
     while (message_index < thread.messages.items.len) {
         const message = thread.messages.items[message_index];
-        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) {
+        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(thread, message.author, message.body)) {
             message_index += 1;
             continue;
         }
@@ -2250,7 +2250,7 @@ fn renderCommittedTranscriptUncached(
     var message_index: usize = 0;
     while (message_index < thread.messages.items.len) {
         const message = thread.messages.items[message_index];
-        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) {
+        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(thread, message.author, message.body)) {
             message_index += 1;
             continue;
         }
@@ -2422,7 +2422,7 @@ fn transcriptPendingStreamHeight(state: *app_state.AppState, thread: *const app_
     var pi: usize = 0;
     while (pi < send_state.pending_events.items.len) {
         const event = send_state.pending_events.items[pi];
-        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) {
+        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(thread, event.author, event.body)) {
             pi += 1;
             continue;
         }
@@ -2458,7 +2458,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
     var pi: usize = 0;
     while (pi < pending_count) {
         const event = send_state.pending_events.items[pi];
-        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) {
+        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(thread, event.author, event.body)) {
             pi += 1;
             continue;
         }
@@ -2754,8 +2754,11 @@ test "provider-specific MCP authors still render as structured tool cards" {
     ));
 }
 
-fn shouldHideCursorLifecycleSystemEvent(author: []const u8, body_raw: []const u8) bool {
-    _ = author;
+fn shouldHideCursorLifecycleSystemEvent(thread: anytype, author: []const u8, body_raw: []const u8) bool {
+    // M5-P4 Amendment 1: background bookkeeping rows are now committed to the
+    // transcript (daemon reducer parity for adoption's row compare) and are
+    // filtered here at render time only.
+    if (app_state.shouldHideBackgroundTranscriptRow(thread, author, body_raw)) return true;
     const body = std.mem.trim(u8, body_raw, "\n\r\t ");
     return std.mem.eql(u8, body, "pending") or
         std.mem.eql(u8, body, "in_progress") or

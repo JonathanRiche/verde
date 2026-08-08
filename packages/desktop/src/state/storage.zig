@@ -37,6 +37,18 @@ const StoreSession = struct {
     /// visibly read-only/unsaved and never falls back to a direct writer.
     persistence_available: bool = true,
     request_counter: u64 = 0,
+    // M5-P4 change-cursor projection sync (composite core.snapshot + journal
+    // cursor). The cursor is nonce-scoped: it is only meaningful together with
+    // the envelope identity below, and it is cleared whenever incremental
+    // entries can no longer be trusted (journal expiry or daemon replacement)
+    // so the cursor loop reseeds through exactly one composite snapshot.
+    change_cursor: u64 = 0,
+    change_cursor_known: bool = false,
+    /// Owned copy of the last accepted envelope's instance nonce.
+    instance_nonce: ?[]u8 = null,
+    registry_revision: u64 = 0,
+    /// Wall-clock ms of the last accepted changes/snapshot sync; 0 = never.
+    projection_synced_at_ms: i64 = 0,
 
     fn lock(self: *StoreSession) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -49,6 +61,8 @@ const StoreSession = struct {
     fn deinit(self: *StoreSession, allocator: std.mem.Allocator) void {
         if (self.client_id) |id| allocator.free(id);
         self.client_id = null;
+        if (self.instance_nonce) |nonce| allocator.free(nonce);
+        self.instance_nonce = null;
     }
 };
 
@@ -354,6 +368,125 @@ pub const Storage = struct {
         return status.store_revision;
     }
 
+    // -----------------------------------------------------------------------
+    // M5-P4 change-cursor projection plumbing.
+    //
+    // The desktop read flip keeps ONE nonce-scoped cursor here (next to the
+    // durable store_revision guard) so the cursor loop thread and the main
+    // loop share a single synchronized view. Nonce-change handling reuses the
+    // M2-P3 reset path: the cached daemon client_id is cleared (MAJOR-1
+    // re-register rule) and the volatile projection is re-pulled by the
+    // cursor-triggered conversions, while the durable half is only ever
+    // VALIDATED by store_revision (noteStoreRevision is monotonic) — the
+    // journal is never a second source of truth.
+    // -----------------------------------------------------------------------
+
+    pub const ChangesNoteOutcome = struct {
+        /// Incremental entries can no longer be trusted; the cursor loop must
+        /// refresh through exactly ONE composite snapshot before resuming.
+        snapshot_required: bool,
+        /// The daemon instance changed (envelope nonce mismatch) — reuse the
+        /// M2-P3 reset/resync path.
+        instance_changed: bool,
+    };
+
+    /// Advance the change cursor from one accepted `core.changes` reply.
+    ///
+    /// PENDING_FIXES #27: the client-side nonce rule is the ONLY guard against
+    /// a stale cross-instance cursor receiving a valid-looking heartbeat with
+    /// a regressed next_cursor after daemon replacement — the server never
+    /// forces a resync. This funnels EVERY changes result (heartbeats
+    /// included) through `headless.client.advanceChangeCursor`, whose contract
+    /// is `snapshot_required = result.expired or instance_changed`.
+    pub fn noteChangesResult(
+        self: *const Storage,
+        result: headless.changes_protocol.ChangesResult,
+    ) ChangesNoteOutcome {
+        self.store_session.lock();
+        const previous: ?headless.registry.RegistryRevisionEnvelope = if (self.store_session.change_cursor_known) .{
+            .instance_nonce = self.store_session.instance_nonce orelse "",
+            .registry_revision = self.store_session.registry_revision,
+        } else null;
+        const instance_changed = if (previous) |p| p.shouldResetProjection(result.envelope) else false;
+        const advance = headless.client.advanceChangeCursor(previous, result);
+        if (advance.snapshot_required) {
+            // Do NOT adopt next_cursor: for expiry it is unusable, and for a
+            // replaced instance it belongs to a projection we have not
+            // resynced yet. Clearing forces the single snapshot fallback.
+            self.store_session.change_cursor_known = false;
+        } else {
+            self.store_session.change_cursor = advance.next_cursor;
+            self.store_session.change_cursor_known = true;
+            self.store_session.registry_revision = result.envelope.registry_revision;
+            self.store_session.projection_synced_at_ms = platform_runtime.unixTimestampMs();
+        }
+        self.store_session.unlock();
+
+        // Durable revision is globally monotonic across instances: always
+        // safe to fold in (noteStoreRevision clamps with @max).
+        self.noteStoreRevision(result.store_revision);
+        if (instance_changed) self.clearCachedClientId();
+        return .{
+            .snapshot_required = advance.snapshot_required,
+            .instance_changed = instance_changed,
+        };
+    }
+
+    /// Seed (or reseed) cursor + envelope from one composite `core.snapshot`.
+    /// The daemon captures the journal cursor BEFORE either state read, so a
+    /// cursor seeded here can only over-deliver — never miss — entries
+    /// relative to the snapshot contents (M5-P2 capture order).
+    pub fn noteCompositeSnapshotSeed(
+        self: *const Storage,
+        envelope: headless.registry.RegistryRevisionEnvelope,
+        change_cursor: u64,
+        store_revision: u64,
+    ) !void {
+        const owned_nonce = try self.allocator.dupe(u8, envelope.instance_nonce);
+        self.store_session.lock();
+        if (self.store_session.instance_nonce) |old| self.allocator.free(old);
+        self.store_session.instance_nonce = owned_nonce;
+        self.store_session.registry_revision = envelope.registry_revision;
+        self.store_session.change_cursor = change_cursor;
+        self.store_session.change_cursor_known = true;
+        self.store_session.projection_synced_at_ms = platform_runtime.unixTimestampMs();
+        self.store_session.unlock();
+        self.noteStoreRevision(store_revision);
+    }
+
+    /// Cursor for the next core.changes poll; null when the loop must
+    /// bootstrap/fallback through a composite snapshot first.
+    pub fn currentChangeCursorForPoll(self: *const Storage) ?u64 {
+        self.store_session.lock();
+        defer self.store_session.unlock();
+        if (!self.store_session.change_cursor_known) return null;
+        return self.store_session.change_cursor;
+    }
+
+    /// `revision_expired` arrives as a structured RPC error (never a result),
+    /// so the cursor invalidation has its own entry point (Q7: converts into
+    /// exactly one snapshot fallback, then a fresh cursor resumes).
+    pub fn invalidateChangeCursorForSnapshotFallback(self: *const Storage) void {
+        self.store_session.lock();
+        defer self.store_session.unlock();
+        self.store_session.change_cursor_known = false;
+    }
+
+    pub fn daemonProjectionEverSynced(self: *const Storage) bool {
+        self.store_session.lock();
+        defer self.store_session.unlock();
+        return self.store_session.projection_synced_at_ms != 0;
+    }
+
+    /// Freshness check for the stale indicator and projection-served Live
+    /// reads: true only when a sync happened within `window_ms`.
+    pub fn daemonProjectionSyncedWithinMs(self: *const Storage, now_ms: i64, window_ms: i64) bool {
+        self.store_session.lock();
+        defer self.store_session.unlock();
+        if (self.store_session.projection_synced_at_ms == 0) return false;
+        return now_ms - self.store_session.projection_synced_at_ms <= window_ms;
+    }
+
     fn replaceSnapshot(self: *const Storage, state: PersistedState, bootstrap: bool) !void {
         // Non-bootstrap flushes must never send expected=null against a non-empty store.
         if (!bootstrap and !self.revisionIsKnown()) {
@@ -657,6 +790,109 @@ test "RO load pins store_revision from store_state for launch-2 guard" {
     try std.testing.expect(storage.revisionIsKnown());
     // Non-bootstrap replace must use expected=1, never bootstrap=true.
     try std.testing.expectEqual(@as(u64, 1), storage.currentStoreRevision());
+}
+
+test "M5-P4 reconnect-from-cursor: same-instance results advance the cursor and pin the durable revision" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(std.testing.allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+
+    // Bootstrap requires a snapshot seed first.
+    try std.testing.expect(storage.currentChangeCursorForPoll() == null);
+    try storage.noteCompositeSnapshotSeed(.{ .instance_nonce = "nonce-a", .registry_revision = 3 }, 7, 4);
+    try std.testing.expectEqual(@as(?u64, 7), storage.currentChangeCursorForPoll());
+    try std.testing.expectEqual(@as(u64, 4), storage.currentStoreRevision());
+    try std.testing.expect(storage.daemonProjectionEverSynced());
+
+    // A same-nonce reply (entries or heartbeat) advances without a fallback.
+    const advanced = storage.noteChangesResult(.{
+        .entries = &.{},
+        .next_cursor = 9,
+        .journal_floor_seq = 0,
+        .expired = false,
+        .heartbeat = true,
+        .envelope = .{ .instance_nonce = "nonce-a", .registry_revision = 5 },
+        .store_revision = 6,
+    });
+    try std.testing.expect(!advanced.snapshot_required and !advanced.instance_changed);
+    try std.testing.expectEqual(@as(?u64, 9), storage.currentChangeCursorForPoll());
+    try std.testing.expectEqual(@as(u64, 6), storage.currentStoreRevision());
+}
+
+test "M5-P4 replacement resync (#27): regressed heartbeat under a new nonce forces the snapshot fallback" {
+    // PENDING_FIXES #27: after daemon replacement a stale cursor gets .ok
+    // heartbeats with next_cursor regressed to the fresh journal's tail — no
+    // revision_expired. Only the client-side nonce compare catches it.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(std.testing.allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+
+    try storage.noteCompositeSnapshotSeed(.{ .instance_nonce = "nonce-a", .registry_revision = 3 }, 40, 5);
+    // Simulate a stale cached client identity from the replaced instance.
+    storage.store_session.lock();
+    storage.store_session.client_id = try std.testing.allocator.dupe(u8, "replaced-instance-client");
+    storage.store_session.unlock();
+
+    const outcome = storage.noteChangesResult(.{
+        .entries = &.{},
+        .next_cursor = 0, // regressed, valid-looking
+        .journal_floor_seq = 0,
+        .expired = false,
+        .heartbeat = true,
+        .envelope = .{ .instance_nonce = "nonce-b", .registry_revision = 1 },
+        .store_revision = 6,
+    });
+    try std.testing.expect(outcome.snapshot_required);
+    try std.testing.expect(outcome.instance_changed);
+    // Cursor invalidated → the loop's next iteration performs the single
+    // composite-snapshot fallback; regressed cursor 0 was NOT adopted.
+    try std.testing.expect(storage.currentChangeCursorForPoll() == null);
+    // Durable revision only moves forward (globally monotonic across instances).
+    try std.testing.expectEqual(@as(u64, 6), storage.currentStoreRevision());
+    // M2-P3 reset reuse: cached client id cleared for re-register.
+    storage.store_session.lock();
+    try std.testing.expect(storage.store_session.client_id == null);
+    storage.store_session.unlock();
+
+    // The fallback reseeds under the new nonce and the loop resumes.
+    try storage.noteCompositeSnapshotSeed(.{ .instance_nonce = "nonce-b", .registry_revision = 1 }, 2, 6);
+    try std.testing.expectEqual(@as(?u64, 2), storage.currentChangeCursorForPoll());
+}
+
+test "M5-P4 journal expiry invalidates the cursor for exactly one snapshot fallback" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(std.testing.allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+
+    try storage.noteCompositeSnapshotSeed(.{ .instance_nonce = "nonce-a", .registry_revision = 1 }, 1, 1);
+    storage.invalidateChangeCursorForSnapshotFallback();
+    try std.testing.expect(storage.currentChangeCursorForPoll() == null);
+    // One snapshot fallback restores incremental polling.
+    try storage.noteCompositeSnapshotSeed(.{ .instance_nonce = "nonce-a", .registry_revision = 2 }, 12, 9);
+    try std.testing.expectEqual(@as(?u64, 12), storage.currentChangeCursorForPoll());
+    // The expired-result shape (result.expired=true) also routes through the
+    // #27 rule: snapshot_required regardless of nonce equality.
+    const outcome = storage.noteChangesResult(.{
+        .entries = &.{},
+        .next_cursor = 12,
+        .journal_floor_seq = 12,
+        .expired = true,
+        .heartbeat = false,
+        .envelope = .{ .instance_nonce = "nonce-a", .registry_revision = 2 },
+        .store_revision = 9,
+    });
+    try std.testing.expect(outcome.snapshot_required);
+    try std.testing.expect(!outcome.instance_changed);
+    try std.testing.expect(storage.currentChangeCursorForPoll() == null);
 }
 
 test "clearCachedClientId drops the registered identity for re-register" {

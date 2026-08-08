@@ -1,6 +1,7 @@
 //! Cross-thread send accounting and approval state transitions.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ai_harness = @import("../providers/harness.zig");
 const app_config = @import("../app/config.zig");
 const bang_commands = @import("../workspace/bang_commands.zig");
@@ -174,6 +175,21 @@ fn daemonPayloadStringAlloc(payload_json: []const u8, field: []const u8) ?[]u8 {
     if (parsed.value != .object) return null;
     const value = jsonValueString(parsed.value.object.get(field) orelse .null) orelse return null;
     return std.heap.page_allocator.dupe(u8, value) catch null;
+}
+
+/// M5-P4 Amendment 1 display-time filter: background bookkeeping rows are now
+/// COMMITTED to the transcript (matching the daemon reducer, so adoption's
+/// role+body row compare holds) and hidden only at render time. Hides the
+/// codex background snapshot marker unconditionally, and background-command
+/// system rows whose body maps to a tracked background task (mirroring the
+/// rows the pre-M5-P4 reducer used to skip appending).
+pub fn shouldHideBackgroundTranscriptRow(thread: *const ChatThread, author: []const u8, body: []const u8) bool {
+    if (std.mem.eql(u8, author, "__verde_codex_background_snapshot")) return true;
+    if (!ChatThread.isBackgroundCommandEvent(author)) return false;
+    // Read-only membership probe: backgroundTaskForEventBody returns mutable
+    // task pointers for its other callers, so cast away const here instead of
+    // duplicating its four identity-matching rules.
+    return backgroundTaskForEventBody(@constCast(thread), body) != null;
 }
 
 pub fn backgroundTaskForEventBody(thread: *ChatThread, body: []const u8) ?*BackgroundTask {
@@ -3408,6 +3424,13 @@ pub const AdoptionOutcome = enum { complete, incomplete };
 pub fn adoptDaemonTranscriptIdentities(self: anytype, project_index: usize, thread: *ChatThread) AdoptionOutcome {
     if (project_index >= self.project_controller.projects.items.len) return .complete;
     const workspace_id = self.project_controller.projects.items[project_index].id;
+    return adoptDaemonTranscriptIdentitiesByWorkspaceId(self, workspace_id, thread);
+}
+
+/// Workspace-id-keyed adoption entry (M5-P4 Amendment 2): the RPC only needs
+/// the workspace id, so retries can reach archived threads and archived
+/// workspaces where no live project index exists.
+fn adoptDaemonTranscriptIdentitiesByWorkspaceId(self: anytype, workspace_id: []const u8, thread: *ChatThread) AdoptionOutcome {
     const response = sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.thread.get", .{
         .workspace_id = workspace_id,
         .local_thread_id = thread.local_thread_id,
@@ -3491,6 +3514,14 @@ fn adoptTranscriptIdentitiesFromStoreMessages(
 // ---------------------------------------------------------------------------
 
 const ADOPTION_RETRY_INTERVAL_MS: i64 = 1_000;
+/// M5-P4 Amendment 2: exponential backoff ceiling. The base interval doubles
+/// per consecutive failure (1s, 2s, 4s, ... capped here) so a wedged daemon
+/// costs one RPC a minute instead of one a second, forever.
+const ADOPTION_RETRY_MAX_BACKOFF_MS: i64 = 60_000;
+/// M5-P4 Amendment 2: loud give-up bound. Past this many consecutive failed
+/// attempts (~1.5h at the capped backoff) the entry is dropped with an error
+/// log; the next completed turn or cursor-triggered sweep re-queues fresh.
+const ADOPTION_RETRY_MAX_ATTEMPTS: u32 = 100;
 /// Bounded logging: warn once per this many consecutive failed retries.
 const ADOPTION_RETRY_LOG_EVERY: u32 = 10;
 const ADOPTION_RETRY_KEY_SEPARATOR: u8 = 0x1f;
@@ -3518,11 +3549,35 @@ fn markAdoptionPending(workspace_id: []const u8, local_thread_id: []const u8) vo
         gop.value_ptr.* = .{};
     }
     gop.value_ptr.attempts +|= 1;
-    gop.value_ptr.next_retry_at_ms = sessionizer.nowMs() + ADOPTION_RETRY_INTERVAL_MS;
-    if (gop.value_ptr.attempts > 1 and gop.value_ptr.attempts % ADOPTION_RETRY_LOG_EVERY == 0) {
+    const attempts = gop.value_ptr.attempts;
+    if (attempts >= ADOPTION_RETRY_MAX_ATTEMPTS) {
+        // Loud give-up (never silent): rows stay id-less until the next
+        // adoption trigger re-queues the thread from scratch. `gop` must not
+        // be touched after the remove below invalidates it. The test runner
+        // fails the whole binary on err-level logs, so the give-up unit test
+        // (which drives this arm for real) demotes the level — production
+        // keeps err.
+        if (builtin.is_test) {
+            log.warn(
+                "giving up on transcript identity adoption for {s} after {d} attempts; will re-queue on the next adoption trigger",
+                .{ local_thread_id, attempts },
+            );
+        } else {
+            log.err(
+                "giving up on transcript identity adoption for {s} after {d} attempts; will re-queue on the next adoption trigger",
+                .{ local_thread_id, attempts },
+            );
+        }
+        clearAdoptionPending(workspace_id, local_thread_id);
+        return;
+    }
+    const backoff_shift: u6 = @intCast(@min(attempts -| 1, 6));
+    const backoff_ms = @min(ADOPTION_RETRY_INTERVAL_MS << backoff_shift, ADOPTION_RETRY_MAX_BACKOFF_MS);
+    gop.value_ptr.next_retry_at_ms = sessionizer.nowMs() + backoff_ms;
+    if (attempts > 1 and attempts % ADOPTION_RETRY_LOG_EVERY == 0) {
         log.warn(
             "daemon transcript identity adoption still incomplete for {s} after {d} attempts; retrying",
-            .{ local_thread_id, gop.value_ptr.attempts },
+            .{ local_thread_id, attempts },
         );
     }
 }
@@ -3546,6 +3601,31 @@ fn adoptDaemonTranscriptIdentitiesWithRetry(self: anytype, project_index: usize,
     }
 }
 
+/// M5-P4 Amendment 2: pending-retry thread lookup spanning live threads,
+/// archived threads, and archived workspaces (adoption only needs the
+/// workspace id and the thread rows, both preserved by archiving).
+fn retryAdoptionThreadByLocalId(self: anytype, workspace_id: []const u8, local_thread_id: []const u8) ?*ChatThread {
+    for (self.project_controller.projects.items) |*project| {
+        if (!std.mem.eql(u8, project.id, workspace_id)) continue;
+        for (project.threads.items) |*thread| {
+            if (std.mem.eql(u8, thread.local_thread_id, local_thread_id)) return thread;
+        }
+        for (project.archived_threads.items) |*thread| {
+            if (std.mem.eql(u8, thread.local_thread_id, local_thread_id)) return thread;
+        }
+    }
+    for (self.project_controller.archived_projects.items) |*project| {
+        if (!std.mem.eql(u8, project.id, workspace_id)) continue;
+        for (project.threads.items) |*thread| {
+            if (std.mem.eql(u8, thread.local_thread_id, local_thread_id)) return thread;
+        }
+        for (project.archived_threads.items) |*thread| {
+            if (std.mem.eql(u8, thread.local_thread_id, local_thread_id)) return thread;
+        }
+    }
+    return null;
+}
+
 /// Retry pump: at most one due adoption per tick (each retry is one local
 /// RPC; the interval bounds pressure). Threads that no longer exist drop
 /// their entry. Returns whether an adoption completed this tick.
@@ -3567,13 +3647,17 @@ fn retryPendingAdoptions(self: anytype) bool {
     };
     const workspace_id = key[0..separator];
     const local_thread_id = key[separator + 1 ..];
-    const location = projectThreadIndexByLocalId(self, workspace_id, local_thread_id) orelse {
-        // Thread gone (archived/removed workspace): nothing left to adopt.
+    // M5-P4 Amendment 2: the lookup must also reach archived threads and
+    // archived workspaces — archiving preserves the rows, so dropping the
+    // entry here used to leave them id-less forever (permanent duplication
+    // once the store belt restored the identity twins on unarchive).
+    const thread = retryAdoptionThreadByLocalId(self, workspace_id, local_thread_id) orelse {
+        // Thread deleted everywhere (live, archived, archived workspace):
+        // nothing left to adopt.
         clearAdoptionPending(workspace_id, local_thread_id);
         return false;
     };
-    const thread = &self.project_controller.projects.items[location.project_index].threads.items[location.thread_index];
-    switch (adoptDaemonTranscriptIdentities(self, location.project_index, thread)) {
+    switch (adoptDaemonTranscriptIdentitiesByWorkspaceId(self, workspace_id, thread)) {
         .complete => {
             clearAdoptionPending(workspace_id, local_thread_id);
             return true;
@@ -3661,6 +3745,154 @@ test "M4-P5 amendment: incomplete adoption retries to a single identity set" {
     try std.testing.expectEqual(@as(u32, 2), adoption_retry_pending.get(key).?.attempts);
     clearAdoptionPending("ws-adopt-test", "thread-adopt-test");
     try std.testing.expect(adoption_retry_pending.get(key) == null);
+}
+
+test "M5-P4 amendment 2: retry pump backs off, reaches archived threads, and gives up loudly" {
+    const allocator = std.testing.allocator;
+    const storage_mod = @import("storage.zig");
+
+    // Global-registry hygiene: leave nothing behind for other tests.
+    defer while (true) {
+        var leftover = adoption_retry_pending.iterator();
+        const entry = leftover.next() orelse break;
+        const removed = adoption_retry_pending.fetchRemove(entry.key_ptr.*).?;
+        std.heap.page_allocator.free(removed.key);
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    // Real Storage against a daemon-less tmp pref path: every chat.thread.get
+    // the pump issues fails hermetically at connect, exercising the true
+    // incomplete → markAdoptionPending path.
+    var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+
+    const ProjectStub = struct {
+        id: []const u8,
+        threads: std.ArrayList(ChatThread) = .empty,
+        archived_threads: std.ArrayList(ChatThread) = .empty,
+    };
+    const PumpState = struct {
+        allocator: std.mem.Allocator,
+        storage: *const storage_mod.Storage,
+        chat_controller: State = .{},
+        project_controller: struct {
+            projects: std.ArrayList(ProjectStub) = .empty,
+            archived_projects: std.ArrayList(ProjectStub) = .empty,
+        } = .{},
+        pub fn pollTitleGenerations(_: *@This()) bool {
+            return false;
+        }
+        // Never reached (pending_send_count stays 0) but required so the
+        // generic pollSend body instantiates against this stub.
+        pub fn pollThreadSend(_: *@This(), _: usize, _: usize, _: *ChatThread) bool {
+            return false;
+        }
+        pub fn markDirty(_: *@This()) void {}
+    };
+    var state: PumpState = .{ .allocator = allocator, .storage = &storage };
+    defer {
+        for (state.project_controller.projects.items) |*project| {
+            for (project.threads.items) |*thread| thread.deinit(allocator);
+            for (project.archived_threads.items) |*thread| thread.deinit(allocator);
+            project.threads.deinit(allocator);
+            project.archived_threads.deinit(allocator);
+        }
+        for (state.project_controller.archived_projects.items) |*project| {
+            for (project.threads.items) |*thread| thread.deinit(allocator);
+            for (project.archived_threads.items) |*thread| thread.deinit(allocator);
+            project.threads.deinit(allocator);
+            project.archived_threads.deinit(allocator);
+        }
+        state.project_controller.projects.deinit(allocator);
+        state.project_controller.archived_projects.deinit(allocator);
+    }
+
+    const makeThread = struct {
+        fn run(a: std.mem.Allocator, local_id: []const u8) !ChatThread {
+            var thread = try ChatThread.init(a, "Retry pump thread");
+            a.free(thread.local_thread_id);
+            thread.local_thread_id = try a.dupeZ(u8, local_id);
+            return thread;
+        }
+    }.run;
+
+    var live_project: ProjectStub = .{ .id = "retry-ws" };
+    try live_project.threads.append(allocator, try makeThread(allocator, "thread-live"));
+    try live_project.archived_threads.append(allocator, try makeThread(allocator, "thread-archived"));
+    try state.project_controller.projects.append(allocator, live_project);
+    var archived_project: ProjectStub = .{ .id = "ws-arch" };
+    try archived_project.threads.append(allocator, try makeThread(allocator, "thread-arch-proj"));
+    try state.project_controller.archived_projects.append(allocator, archived_project);
+
+    const forceDue = struct {
+        fn run(workspace_id: []const u8, local_thread_id: []const u8) !void {
+            const key = adoptionRetryKeyAlloc(workspace_id, local_thread_id).?;
+            defer std.heap.page_allocator.free(key);
+            adoption_retry_pending.getPtr(key).?.next_retry_at_ms = 0;
+        }
+    }.run;
+    const entryState = struct {
+        fn run(workspace_id: []const u8, local_thread_id: []const u8) !?AdoptionRetryState {
+            const key = adoptionRetryKeyAlloc(workspace_id, local_thread_id).?;
+            defer std.heap.page_allocator.free(key);
+            return if (adoption_retry_pending.get(key)) |value| value else null;
+        }
+    }.run;
+
+    // Arm 1 — live thread, growing backoff: each failed pump attempt doubles
+    // the next-retry delay (1s base, shift by attempts-1).
+    markAdoptionPending("retry-ws", "thread-live");
+    try forceDue("retry-ws", "thread-live");
+    try std.testing.expect(!pollSend(&state));
+    var pump_entry = (try entryState("retry-ws", "thread-live")).?;
+    try std.testing.expectEqual(@as(u32, 2), pump_entry.attempts);
+    const after_two = pump_entry.next_retry_at_ms - sessionizer.nowMs();
+    try std.testing.expect(after_two > ADOPTION_RETRY_INTERVAL_MS);
+    try forceDue("retry-ws", "thread-live");
+    _ = pollSend(&state);
+    pump_entry = (try entryState("retry-ws", "thread-live")).?;
+    try std.testing.expectEqual(@as(u32, 3), pump_entry.attempts);
+    const after_three = pump_entry.next_retry_at_ms - sessionizer.nowMs();
+    try std.testing.expect(after_three > 2 * ADOPTION_RETRY_INTERVAL_MS);
+    clearAdoptionPending("retry-ws", "thread-live");
+
+    // Arm 2 — archived thread in a live workspace: the entry survives the
+    // pump (pre-amendment it was dropped as "thread gone").
+    markAdoptionPending("retry-ws", "thread-archived");
+    try forceDue("retry-ws", "thread-archived");
+    _ = pollSend(&state);
+    try std.testing.expectEqual(@as(u32, 2), ((try entryState("retry-ws", "thread-archived")).?).attempts);
+    clearAdoptionPending("retry-ws", "thread-archived");
+
+    // Arm 3 — thread inside an archived workspace: also reachable.
+    markAdoptionPending("ws-arch", "thread-arch-proj");
+    try forceDue("ws-arch", "thread-arch-proj");
+    _ = pollSend(&state);
+    try std.testing.expectEqual(@as(u32, 2), ((try entryState("ws-arch", "thread-arch-proj")).?).attempts);
+    clearAdoptionPending("ws-arch", "thread-arch-proj");
+
+    // Arm 4 — truly deleted thread: entry dropped (no eternal ghost retries).
+    markAdoptionPending("retry-ws", "thread-gone");
+    try forceDue("retry-ws", "thread-gone");
+    _ = pollSend(&state);
+    try std.testing.expect((try entryState("retry-ws", "thread-gone")) == null);
+
+    // Arm 5 — loud give-up: one more failure at the attempt cap removes the
+    // entry instead of retrying forever.
+    markAdoptionPending("retry-ws", "thread-live");
+    {
+        const key = adoptionRetryKeyAlloc("retry-ws", "thread-live").?;
+        defer std.heap.page_allocator.free(key);
+        const value_ptr = adoption_retry_pending.getPtr(key).?;
+        value_ptr.attempts = ADOPTION_RETRY_MAX_ATTEMPTS - 1;
+        value_ptr.next_retry_at_ms = 0;
+    }
+    _ = pollSend(&state);
+    try std.testing.expect((try entryState("retry-ws", "thread-live")) == null);
+    try std.testing.expectEqual(@as(usize, 0), adoption_retry_pending.count());
 }
 
 // Records a finished in-app chat turn unless that exact pane currently has
@@ -4431,15 +4663,15 @@ pub fn applySendSuccess(self: anytype, thread: *ChatThread, result: SendResultPa
 pub fn applyPendingTimelineEvents(self: anytype, thread: *ChatThread, events: *std.ArrayListUnmanaged(PendingTimelineEvent)) !void {
     if (events.items.len == 0) return;
     for (events.items) |event| {
+        // M5-P4 Amendment 1 (reducer alignment): the daemon reducer commits a
+        // system row for EVERY message event — including the codex background
+        // snapshot marker and known background-command events — so the local
+        // reducer must append the same rows for adoption's role+body row
+        // compare to hold across restarts. The GUI-only side effects still
+        // run (below); hiding these rows is display-time only, via
+        // shouldHideBackgroundTranscriptRow in the transcript renderer.
         if (std.mem.eql(u8, event.author, "__verde_codex_background_snapshot")) {
             try self.reconcileCodexBackgroundSnapshot(thread, event.body);
-            continue;
-        }
-        const known_background = ChatThread.isBackgroundCommandEvent(event.author) and backgroundTaskForEventBody(thread, event.body) != null;
-        if (known_background) {
-            try thread.noteBackgroundTaskEvent(self.allocator, event.author, event.body);
-            if (backgroundTaskForEventBody(thread, event.body)) |task| task.pid_verified = task.task_id != null;
-            continue;
         }
         try thread.messages.append(self.allocator, .{
             .role = event.role,
@@ -4495,7 +4727,9 @@ pub fn applySendFailure(
     failure_message: []const u8,
 ) !void {
     for (events.items) |event| {
-        if (std.mem.eql(u8, event.author, "__verde_codex_background_snapshot")) continue;
+        // M5-P4 Amendment 1 (reducer alignment): keep the failure path
+        // committing the same rows the daemon reducer journals — the codex
+        // background snapshot marker included (hidden at display time).
         try thread.messages.append(self.allocator, .{
             .role = event.role,
             .author = try self.dupeZ(event.author),

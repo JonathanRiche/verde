@@ -5761,14 +5761,31 @@ fn storeMutationCommittedHook(context: *anyopaque, mutation: *const daemon_store
             for (request.snapshot.chat_completions) |completion| {
                 daemon.appendJournalEntry(.chat_completion, completion.local_thread_id, completion.workspace_id, revision);
             }
+            // M5-P4 Amendment 3 (M5-P3 verify MAJOR): carried surfaces must
+            // journal like every other carried resource, matching the
+            // surface_upsert arm below.
+            for (request.snapshot.surface_states) |surface| {
+                daemon.appendJournalEntry(
+                    .surface,
+                    surface.session_id,
+                    if (surface.workspace_id.len != 0) surface.workspace_id else null,
+                    revision,
+                );
+            }
             // MAJOR-2 (M5-P3 amendment): a replace DELETES everything it does
             // not carry — including the empty replace, which carries nothing —
             // so per-resource entries alone leave deletions cursor-invisible
             // and clients would keep deleted workspaces forever. Publish one
             // batch entry with the registry "*" convention ("re-read the
             // topic", process_registry.RevisionBumpEvent) so every replace is
-            // observable via core.changes.
+            // observable via core.changes — on EVERY store-plane topic a
+            // replace can delete from, or topic-filtered cursors (e.g.
+            // {surface}, or chat topics without workspace) would go silently
+            // stale forever across a snapshot_replace (M5-P4 Amendment 3).
             daemon.appendJournalEntry(.workspace, "*", null, revision);
+            daemon.appendJournalEntry(.chat_thread, "*", null, revision);
+            daemon.appendJournalEntry(.chat_completion, "*", null, revision);
+            daemon.appendJournalEntry(.surface, "*", null, revision);
         },
         .workspace_upsert => |request| daemon.appendJournalEntry(.workspace, request.workspace.workspace_id, request.workspace.workspace_id, revision),
         .thread_upsert => |request| daemon.appendJournalEntry(.chat_thread, request.thread.local_thread_id, request.workspace_id, revision),
