@@ -3849,6 +3849,7 @@ pub const AppState = struct {
     pub const reconcileTerminalDaemonChatTurnsSnapshot = chat_controller.reconcileTerminalDaemonChatTurnsSnapshot;
     pub const threadByLocalId = chat_controller.threadByLocalId;
     pub const projectThreadIndexByLocalId = chat_controller.projectThreadIndexByLocalId;
+    pub const handoffDirtyStateForShutdown = lifecycle_controller.handoffDirtyStateForShutdown;
     pub const resolveThreadApprovalByLocalId = chat_controller.resolveThreadApprovalByLocalId;
     pub const applyPersisted = persistence.applyPersisted;
     pub const applyDaemonSessionProjection = terminal_controller.applyDaemonSessionProjection;
@@ -4049,9 +4050,23 @@ pub const AppState = struct {
     }
 
     pub fn shouldSuppressExternalOpenCloseRequest(self: *AppState, now_ms: i64) bool {
-        if (self.external_open_close_suppress_until_ms < now_ms) return false;
-        self.external_open_close_suppress_until_ms = 0;
-        return true;
+        if (self.external_open_close_suppress_until_ms >= now_ms) {
+            self.external_open_close_suppress_until_ms = 0;
+            return true;
+        }
+        // Linux routes every ordinary window-close request through this
+        // existing suppression seam. Durability handoff therefore happens
+        // while the event loop and all controllers are still live. Failure
+        // keeps the window open; another close request retries the same path.
+        self.handoffDirtyStateForShutdown() catch |err| {
+            runtime_log.diagnostic("interactive close durability handoff failed: {s}", .{@errorName(err)});
+            const notice = "Could not close: unsaved changes are not durable. Free space, then close again; keep working to cancel.";
+            @memset(&self.sidebar_notice_storage, 0);
+            const len = @min(notice.len, self.sidebar_notice_storage.len - 1);
+            @memcpy(self.sidebar_notice_storage[0..len], notice[0..len]);
+            return true;
+        };
+        return false;
     }
 
     pub fn rethemeTerminalSessions(self: *AppState) !void {
@@ -8563,6 +8578,18 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit begin", .{});
         shutdown_watchdog_deinit_complete.store(false, .release);
         shutdown_watchdog_state_durable.store(false, .release);
+        // Final fallback for non-window quit paths. Ordinary interactive close
+        // already completed this handoff before leaving the event loop. Keep
+        // every owner live here until durability succeeds; teardown starts
+        // only below this loop.
+        while (true) {
+            self.handoffDirtyStateForShutdown() catch |err| {
+                runtime_log.diagnostic("AppState.deinit pre-teardown durability handoff failed: {s}", .{@errorName(err)});
+                platform_runtime.sleepMillis(500);
+                continue;
+            };
+            break;
+        }
         startShutdownWatchdog();
         // Flag the cursor loop first so an in-flight long-poll (bounded by
         // the 4s wait budget + 5s transport timeout) drains concurrently with
@@ -8599,16 +8626,16 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit chat controller finished", .{});
         ai_harness.shutdownOwnedProviderProcesses();
         runtime_log.diagnostic("AppState.deinit provider processes shutdown", .{});
-        self.flushDirtyBlocking();
-        while (self.lifecycle.dirty and !self.lifecycle.dirty_spooled) {
-            // A failed spool must keep the owning state alive. Retry slowly;
-            // the watchdog is forbidden to force exit until durability flips.
-            self.spoolPendingStateForShutdown() catch |err| {
-                runtime_log.diagnostic("AppState.deinit spool retry failed: {s}", .{@errorName(err)});
+        while (true) {
+            self.handoffDirtyStateForShutdown() catch |err| {
+                // Worker settlement can publish a final dirty generation after
+                // the interactive preflight. It must acquire durable ownership
+                // before the watchdog may exit, even though teardown is ending.
+                runtime_log.diagnostic("AppState.deinit final durability handoff failed: {s}", .{@errorName(err)});
                 platform_runtime.sleepMillis(500);
                 continue;
             };
-            self.lifecycle.dirty_spooled = true;
+            break;
         }
         shutdown_watchdog_state_durable.store(true, .release);
         chat_controller.deinitProcessGlobalState(self.storage.pref_path);
@@ -8885,13 +8912,17 @@ pub const AppState = struct {
         terminal_controller.deinitDaemonSessionProjection(self.allocator, &old_sessions);
         self.clearTranscriptMarkdownSelection();
         self.clearTranscriptMarkdownEntries();
-        self.clearValidatedAdoptionRepairs();
-        self.reconcileTerminalDaemonChatTurnsSnapshot(result.turns);
 
         // Atomic publication boundary: all fallible work and the projection
         // swap are complete before cursor/write-guard/freshness advance.
         self.storage.commitPreparedCompositeSnapshotSeed(prepared_seed);
         seed_owned = false;
+        // Reconciliation derives consume reservations from Storage's current
+        // nonce, so publish the validated replacement seed first. The first
+        // refresh after daemon replacement must never reserve under the old
+        // instance and then release that key on the following cycle.
+        self.clearValidatedAdoptionRepairs();
+        self.reconcileTerminalDaemonChatTurnsSnapshot(result.turns);
         if (self.lifecycle.rebase_snapshot) |*local| local.deinit();
         self.lifecycle.rebase_snapshot = null;
         if (self.lifecycle.rebase_baseline) |*baseline| baseline.deinit();
@@ -12270,7 +12301,7 @@ test "M5-P4 acknowledged-save baseline preserves later edit on the same new thre
     try std.testing.expectEqualStrings("draft B", remote.projects[0].threads.?[0].draft);
 }
 
-test "M5-P4 next launch restores durable pending-state spool before saving" {
+test "M5-P4 fix5 production repair failure writes a spool that the next AppState restores" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -12278,23 +12309,48 @@ test "M5-P4 next launch restores durable pending-state spool before saving" {
     const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
     var storage = try Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
     defer storage.deinit();
-    const threads = [_]PersistedThread{.{
+    var closing = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    const initial_threads = [_]PersistedThread{.{
         .title = "Recovered thread",
         .local_thread_id = "recovered-thread",
-        .draft = "unsaved draft",
     }};
-    const projects = [_]PersistedProject{.{
+    const initial_projects = [_]PersistedProject{.{
         .id = "recovered-workspace",
-        .label = "Recovered after failed shutdown",
+        .label = "Before failed shutdown",
         .path = "/tmp/recovered-workspace",
-        .threads = &threads,
+        .threads = &initial_threads,
     }};
-    try storage.writePendingStateSpool(.{
-        .capture_revision = 0,
-        .baseline_revision = 0,
-        .current = .{ .projects = &projects },
-        .baseline = .{},
-    });
+    try closing.applyPersisted(.{ .projects = &initial_projects });
+    const project = &closing.project_controller.projects.items[0];
+    allocator.free(project.label);
+    project.label = try allocator.dupeZ(u8, "Recovered after failed shutdown");
+    const thread = &project.threads.items[project.currentThreadIndex()];
+    thread.setDraft("unsaved draft");
+    closing.lifecycle.dirty = true;
+    chat_controller.markAdoptionTerminalRepairForTest(&closing, project.id, thread.local_thread_id, "real-spool-repair");
+    const workspace_id = try allocator.dupe(u8, project.id);
+    defer allocator.free(workspace_id);
+    const local_thread_id = try allocator.dupe(u8, thread.local_thread_id);
+    defer allocator.free(local_thread_id);
+    var closing_live = true;
+    defer if (closing_live) {
+        chat_controller.clearAdoptionRepairForTest(workspace_id, local_thread_id, "real-spool-repair");
+        closing.lifecycle.dirty = false;
+        closing.deinit();
+    };
+    try closing.handoffDirtyStateForShutdown();
+    try std.testing.expect(closing.lifecycle.dirty_spooled);
+    var written = (try storage.loadPendingStateSpool(allocator)).?;
+    try std.testing.expectEqualStrings("Recovered after failed shutdown", written.value.current.projects[0].label);
+    written.deinit();
+    chat_controller.clearAdoptionRepairForTest(workspace_id, local_thread_id, "real-spool-repair");
+    closing.lifecycle.dirty = false;
+    closing.deinit();
+    closing_live = false;
+
     var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
         .gl_texture_uploads_enabled = false,
         .browser_textures_enabled = false,
@@ -12332,6 +12388,18 @@ test "M5-P4 terminal adoption refresh crosses dirty gate and replaces id-less ro
     }};
     const refreshed_messages = [_]headless.store.Message{
         initial_messages[0],
+        .{
+            .message_id = "turn:concurrent:user",
+            .role = "user",
+            .author = "You",
+            .body = "concurrent prompt",
+        },
+        .{
+            .message_id = "turn:concurrent:msg:1",
+            .role = "assistant",
+            .author = "Codex",
+            .body = "concurrent reply",
+        },
         .{
             .message_id = "turn:adopt:msg:1",
             .role = "assistant",
@@ -12469,8 +12537,8 @@ test "M5-P4 terminal adoption refresh crosses dirty gate and replaces id-less ro
         .sessions = &daemon_sessions,
     });
     const repaired = &state.project_controller.projects.items[0].threads.items[0];
-    try std.testing.expectEqual(@as(usize, 2), repaired.messages.items.len);
-    try std.testing.expectEqualStrings("turn:adopt:msg:1", repaired.messages.items[1].message_id.?);
+    try std.testing.expectEqual(@as(usize, 4), repaired.messages.items.len);
+    try std.testing.expectEqualStrings("turn:adopt:msg:1", repaired.messages.items[3].message_id.?);
     try std.testing.expectEqualStrings("keep this UI draft", repaired.currentDraft());
     try std.testing.expect(state.threadByLocalId("ws-adopt-real", "thread-local-addition") != null);
     try std.testing.expect(state.threadByLocalId("ws-adopt-real", "thread-remote-delete") == null);
@@ -12484,6 +12552,154 @@ test "M5-P4 terminal adoption refresh crosses dirty gate and replaces id-less ro
     defer allocator.free(base_layout);
     try std.testing.expect(std.mem.indexOf(u8, base_layout, "daemon-missing-pane") != null);
     try std.testing.expect(!state.hasUnresolvedAdoptionRows());
+}
+
+test "M5-P4 fix5 daemon session coordinates reject extremes reallocate collisions and cap materialization" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    const fixture_threads = [_]PersistedThread{.{
+        .title = "Coordinate validation",
+        .local_thread_id = "coordinate-thread",
+    }};
+    const fixture_projects = [_]PersistedProject{.{
+        .id = "coordinate-workspace",
+        .label = "Coordinate validation",
+        .path = "/tmp/coordinate-workspace",
+        .threads = &fixture_threads,
+    }};
+    try state.applyPersisted(.{ .projects = &fixture_projects });
+    defer state.deinit();
+    defer state.lifecycle.dirty = false;
+    const project = &state.project_controller.projects.items[0];
+    const initial_dock_count = project.terminal_docks.items.len;
+    const initial_tab_count = project.terminal_dock.tabs.items.len;
+    const collision_sessions = [_]headless.store.SessionSummary{
+        .{
+            .session_id = "coord-first",
+            .workspace_id = project.id,
+            .workspace_path = project.path,
+            .cwd = project.path,
+            .label = "first",
+            .command = "bash",
+            .dock_id = 7,
+            .pane_id = 4,
+            .running = true,
+            .status = "running",
+        },
+        .{
+            .session_id = "coord-second",
+            .workspace_id = project.id,
+            .workspace_path = project.path,
+            .cwd = project.path,
+            .label = "second",
+            .command = "bash",
+            .dock_id = 7,
+            .pane_id = 4,
+            .running = true,
+            .status = "running",
+        },
+        .{
+            .session_id = "coord-max-dock",
+            .workspace_id = project.id,
+            .workspace_path = project.path,
+            .cwd = project.path,
+            .label = "corrupt",
+            .command = "bash",
+            .dock_id = std.math.maxInt(u32),
+            .pane_id = 1,
+            .running = true,
+            .status = "running",
+        },
+        .{
+            .session_id = "coord-max-pane",
+            .workspace_id = project.id,
+            .workspace_path = project.path,
+            .cwd = project.path,
+            .label = "corrupt",
+            .command = "bash",
+            .dock_id = 8,
+            .pane_id = std.math.maxInt(u32),
+            .running = true,
+            .status = "running",
+        },
+    };
+    try state.applyDaemonSessionProjection(&collision_sessions);
+    const collision_dock = project.terminalDockEntryById(7) orelse return error.MissingCollisionDock;
+    try std.testing.expectEqualStrings("coord-first", collision_dock.dock.paneById(4).?.session_id.?);
+    try std.testing.expectEqualStrings("coord-second", collision_dock.dock.paneById(1).?.session_id.?);
+    try std.testing.expect(project.terminalDockEntryById(std.math.maxInt(u32)) == null);
+    try std.testing.expect(project.terminalDockEntryById(8) == null);
+
+    const session_count = terminal_controller.MAX_MATERIALIZED_DAEMON_PANES_PER_REFRESH + 2;
+    const capped_sessions = try allocator.alloc(headless.store.SessionSummary, session_count);
+    defer allocator.free(capped_sessions);
+    var owned_ids: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned_ids.items) |id| allocator.free(id);
+        owned_ids.deinit(allocator);
+    }
+    try owned_ids.ensureTotalCapacity(allocator, session_count);
+    for (capped_sessions, 0..) |*session, index| {
+        const id = try std.fmt.allocPrint(allocator, "cap-session-{d}", .{index});
+        owned_ids.appendAssumeCapacity(id);
+        session.* = .{
+            .session_id = id,
+            .workspace_id = project.id,
+            .workspace_path = project.path,
+            .cwd = project.path,
+            .label = "bounded",
+            .command = "bash",
+            .dock_id = 0,
+            .pane_id = @intCast(1_000 + index),
+            .running = true,
+            .status = "running",
+        };
+    }
+    try state.applyDaemonSessionProjection(capped_sessions);
+    try std.testing.expectEqual(
+        initial_tab_count + terminal_controller.MAX_MATERIALIZED_DAEMON_PANES_PER_REFRESH,
+        project.terminal_dock.tabs.items.len,
+    );
+    try std.testing.expectEqual(initial_dock_count + 1, project.terminal_docks.items.len);
+}
+
+test "M5-P4 fix5 replacement refresh reconciles consumes under the committed nonce" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const pref_path = path_buf[0..path_len];
+    var storage = try Storage.initWithPrefPath(allocator, pref_path);
+    defer storage.deinit();
+    try storage.noteCompositeSnapshotSeed(.{ .instance_nonce = "old-nonce", .registry_revision = 1 }, 1, 1);
+    try std.testing.expect(chat_controller.reserveTerminalConsumeForTest(pref_path, "old-nonce", "nonce-turn"));
+    try std.testing.expect(chat_controller.reserveTerminalConsumeForTest(pref_path, "new-nonce", "nonce-turn"));
+    defer chat_controller.deinitProcessGlobalState(pref_path);
+    var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer state.deinit();
+    defer state.lifecycle.dirty = false;
+    state.lifecycle.dirty = false;
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 2, .workspaces = &.{} },
+        .store_revision = 2,
+        .envelope = .{ .instance_nonce = "new-nonce", .registry_revision = 2 },
+        .change_cursor = 2,
+    });
+    try std.testing.expect(!chat_controller.terminalConsumeReservedForTest(pref_path, "old-nonce", "nonce-turn"));
+    try std.testing.expect(chat_controller.terminalConsumeReservedForTest(pref_path, "new-nonce", "nonce-turn"));
 }
 
 test "M5-P4 stalled daemon worker cannot block frame-side bridge drain" {

@@ -2172,10 +2172,8 @@ const TerminalTurnConsumeArgs = struct {
 const TerminalConsumeStatus = enum { in_flight, completed, not_found };
 const TerminalConsumeState = struct {
     status: TerminalConsumeStatus = .in_flight,
-    observation_cycles: u8 = 0,
 };
 const TerminalConsumeDisposition = enum { accepted, not_found };
-const TERMINAL_NOT_FOUND_RELEASE_CYCLES: u8 = 2;
 var terminal_consume_mutex: std.atomic.Mutex = .unlocked;
 var terminal_consume_turns: std.StringHashMapUnmanaged(TerminalConsumeState) = .empty;
 
@@ -2251,11 +2249,11 @@ fn pruneCompletedTerminalConsumes(
                     break;
                 }
             }
-            if (entry.value_ptr.status == .not_found) entry.value_ptr.observation_cycles +|= 1;
-            if (!present or
-                (entry.value_ptr.status == .not_found and
-                    entry.value_ptr.observation_cycles >= TERMINAL_NOT_FOUND_RELEASE_CYCLES))
-            {
+            // A not_found response is still a completed consume reservation:
+            // retain it while the same daemon instance continues advertising
+            // the record. Only disappearance or instance replacement releases
+            // the key, preventing a two-refresh consume loop.
+            if (!present) {
                 stale_key = entry.key_ptr.*;
                 break;
             }
@@ -2485,9 +2483,27 @@ test "M5-P4 reconnect consume deduplicates and validates accepted or not_found" 
     pruneCompletedTerminalConsumes("/profile-a", "nonce-b", &turns);
     try std.testing.expect(reserveTerminalConsume("/profile-a", "nonce-b", "turn-consume") == null);
     pruneCompletedTerminalConsumes("/profile-a", "nonce-b", &turns);
+    try std.testing.expect(reserveTerminalConsume("/profile-a", "nonce-b", "turn-consume") == null);
+    pruneCompletedTerminalConsumes("/profile-a", "nonce-b", &.{});
     const retried = reserveTerminalConsume("/profile-a", "nonce-b", "turn-consume").?;
     defer std.heap.page_allocator.free(retried);
     finishTerminalConsume(retried, null);
+}
+
+pub fn reserveTerminalConsumeForTest(pref_path: []const u8, instance_nonce: []const u8, turn_id: []const u8) bool {
+    std.debug.assert(builtin.is_test);
+    const reservation = reserveTerminalConsume(pref_path, instance_nonce, turn_id) orelse return false;
+    std.heap.page_allocator.free(reservation);
+    return true;
+}
+
+pub fn terminalConsumeReservedForTest(pref_path: []const u8, instance_nonce: []const u8, turn_id: []const u8) bool {
+    std.debug.assert(builtin.is_test);
+    const key = terminalConsumeKeyAlloc(pref_path, instance_nonce, turn_id) orelse return false;
+    defer std.heap.page_allocator.free(key);
+    lockTerminalConsumes();
+    defer terminal_consume_mutex.unlock();
+    return terminal_consume_turns.contains(key);
 }
 
 pub fn threadByLocalId(self: anytype, workspace_id: []const u8, local_thread_id: []const u8) ?*ChatThread {
@@ -3922,7 +3938,7 @@ const ADOPTION_RETRY_LOG_EVERY: u32 = 10;
 const ADOPTION_RETRY_KEY_SEPARATOR: u8 = 0x1f;
 
 const AdoptionExpectedRow = struct {
-    row_index: usize,
+    row_index_hint: ?usize,
     role: provider_models.ChatRole,
     author: []u8,
     body: []u8,
@@ -3946,7 +3962,7 @@ const AdoptionRetryState = struct {
         for (thread.messages.items, 0..) |message, row_index| {
             if (message.message_id != null) continue;
             var row: AdoptionExpectedRow = .{
-                .row_index = row_index,
+                .row_index_hint = row_index,
                 .role = message.role,
                 .author = try std.heap.page_allocator.dupe(u8, message.author),
                 .body = undefined,
@@ -4100,16 +4116,90 @@ pub fn validateAdoptionRepairsForRefresh(_: anytype, persisted: db_types.Persist
             }
             return error.AdoptionRepairMismatch;
         };
-        for (entry.value_ptr.rows.items) |expected| {
-            if (expected.row_index >= thread.messages.len) return error.AdoptionRepairMismatch;
-            const durable = thread.messages[expected.row_index];
-            const message_id = durable.message_id orelse return error.AdoptionRepairMismatch;
-            if (!messageIdBelongsToTurn(message_id, parts.turn_id) or
-                durable.role != expected.role or
-                !std.mem.eql(u8, durable.author, expected.author) or
-                !std.mem.eql(u8, durable.body, expected.body)) return error.AdoptionRepairMismatch;
+        switch (try adoptionTurnMatch(thread.messages, entry.value_ptr.rows.items, parts.turn_id)) {
+            .unique => {},
+            .missing => return error.AdoptionRepairMismatch,
+            // Multiple ordered fingerprint correspondences are not enough to
+            // prove identity. Retain every marker and leave live state intact.
+            .ambiguous => return error.AdoptionRepairAmbiguous,
         }
     }
+}
+
+const AdoptionTurnMatch = enum { missing, unique, ambiguous };
+
+/// Count ordered fingerprint correspondences within one durable turn. Counts
+/// saturate at two because the repair only distinguishes unique from ambiguous.
+fn adoptionTurnMatch(
+    messages: anytype,
+    expected_rows: anytype,
+    turn_id: []const u8,
+) !AdoptionTurnMatch {
+    if (expected_rows.len == 0) return .unique;
+    const counts = try std.heap.page_allocator.alloc(u8, expected_rows.len + 1);
+    defer std.heap.page_allocator.free(counts);
+    @memset(counts, 0);
+    counts[0] = 1;
+    for (messages) |durable| {
+        const message_id = durable.message_id orelse continue;
+        if (!messageIdBelongsToTurn(message_id, turn_id)) continue;
+        var reverse_index = expected_rows.len;
+        while (reverse_index > 0) {
+            reverse_index -= 1;
+            const expected = expected_rows[reverse_index];
+            if (durable.role != expected.role or
+                !std.mem.eql(u8, durable.author, expected.author) or
+                !std.mem.eql(u8, durable.body, expected.body)) continue;
+            counts[reverse_index + 1] = @min(
+                @as(u8, 2),
+                counts[reverse_index + 1] +| counts[reverse_index],
+            );
+        }
+    }
+    return switch (counts[expected_rows.len]) {
+        0 => .missing,
+        1 => .unique,
+        else => .ambiguous,
+    };
+}
+
+test "turn-scoped adoption matcher retains ambiguous fingerprints" {
+    const allocator = std.testing.allocator;
+    const expected = AdoptionExpectedRow{
+        .row_index_hint = 1,
+        .role = .assistant,
+        .author = try allocator.dupe(u8, "Codex"),
+        .body = try allocator.dupe(u8, "same reply"),
+    };
+    defer {
+        allocator.free(expected.author);
+        allocator.free(expected.body);
+    }
+    const messages = [_]db_types.PersistedMessage{
+        .{
+            .message_id = "turn:shift:user",
+            .role = .user,
+            .author = "You",
+            .body = "unrelated fingerprint",
+        },
+        .{
+            .message_id = "turn:target:msg:1",
+            .role = .assistant,
+            .author = "Codex",
+            .body = "same reply",
+        },
+        .{
+            .message_id = "turn:target:msg:2",
+            .role = .assistant,
+            .author = "Codex",
+            .body = "same reply",
+        },
+    };
+    const expected_rows = [_]AdoptionExpectedRow{expected};
+    try std.testing.expectEqual(
+        AdoptionTurnMatch.ambiguous,
+        try adoptionTurnMatch(&messages, &expected_rows, "target"),
+    );
 }
 
 fn messageIdBelongsToTurn(message_id: []const u8, turn_id: []const u8) bool {
@@ -4129,16 +4219,8 @@ fn adoptionRepairSatisfiedByLiveThread(
     const key = adoptionRetryKeyAlloc(workspace_id, thread.local_thread_id, turn_id) orelse return false;
     defer std.heap.page_allocator.free(key);
     const repair = adoption_retry_pending.get(key) orelse return false;
-    for (repair.rows.items) |expected| {
-        if (expected.row_index >= thread.messages.items.len) return false;
-        const row = thread.messages.items[expected.row_index];
-        const message_id = row.message_id orelse return false;
-        if (!messageIdBelongsToTurn(message_id, turn_id) or
-            row.role != expected.role or
-            !std.mem.eql(u8, row.author, expected.author) or
-            !std.mem.eql(u8, row.body, expected.body)) return false;
-    }
-    return true;
+    const match = adoptionTurnMatch(thread.messages.items, repair.rows.items, turn_id) catch return false;
+    return match == .unique;
 }
 
 /// Called only after validation, all fallible staging, and the ownership swap.
@@ -4165,7 +4247,7 @@ pub fn pendingAdoptionRepairsSnapshot(
         const rows = try allocator.alloc(storage_mod.PendingAdoptionRow, entry.value_ptr.rows.items.len);
         for (entry.value_ptr.rows.items, rows) |expected, *row| {
             row.* = .{
-                .row_index = expected.row_index,
+                .row_index = expected.row_index_hint,
                 .role = expected.role,
                 .author = try allocator.dupe(u8, expected.author),
                 .body = try allocator.dupe(u8, expected.body),
@@ -4201,7 +4283,7 @@ pub fn restorePendingAdoptionRepairs(repairs: []const storage_mod.PendingAdoptio
         errdefer if (state_owned) state.deinit();
         for (repair.rows) |source| {
             var row: AdoptionExpectedRow = .{
-                .row_index = source.row_index,
+                .row_index_hint = source.row_index,
                 .role = source.role,
                 .author = try std.heap.page_allocator.dupe(u8, source.author),
                 .body = undefined,

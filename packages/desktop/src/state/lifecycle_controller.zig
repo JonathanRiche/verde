@@ -281,6 +281,23 @@ pub fn pollFlushWorker(self: anytype) void {
 /// Blocking flush for shutdown and latency-sensitive pre-turn durability.
 /// Waits for any in-flight worker first, then performs a synchronous save.
 pub fn flushDirtyBlocking(self: anytype) void {
+    flushDirtyBlockingResult(self) catch |err| {
+        log.err("failed to hand off dirty native state: {s}", .{@errorName(err)});
+    };
+}
+
+/// Close-time durability boundary. Callers may begin irreversible teardown
+/// only after this returns successfully; failure leaves every live owner and
+/// controller untouched so an interactive close request can be retried.
+pub fn handoffDirtyStateForShutdown(self: anytype) !void {
+    if (!self.lifecycle.dirty or self.lifecycle.dirty_spooled) return;
+    try flushDirtyBlockingResult(self);
+    if (self.lifecycle.dirty and !self.lifecycle.dirty_spooled) {
+        try spoolDirtyState(self, "shutdown durability handoff retry");
+    }
+}
+
+fn flushDirtyBlockingResult(self: anytype) !void {
     // Drain any scheduled frame flush before a blocking path.
     if (self.lifecycle.flush_in_flight) {
         if (self.lifecycle.flush_worker) |thread| {
@@ -295,8 +312,7 @@ pub fn flushDirtyBlocking(self: anytype) void {
         if (conflicts >= SHUTDOWN_MAX_CONFLICTS or
             platform_runtime.unixTimestampMs() - started_at_ms >= SHUTDOWN_FLUSH_BUDGET_MS)
         {
-            spoolDirtyState(self, "shutdown conflict retry bound reached");
-            return;
+            return spoolDirtyState(self, "shutdown conflict retry bound reached");
         }
         if (self.lifecycle.rebase_snapshot != null or self.hasUnresolvedAdoptionRows()) {
             self.completePendingProjectionRepairBlocking() catch |err| {
@@ -305,15 +321,13 @@ pub fn flushDirtyBlocking(self: anytype) void {
                 } else {
                     log.err("failed to complete shutdown projection repair: {s}", .{@errorName(err)});
                 }
-                spoolDirtyState(self, "shutdown projection repair failed");
-                return;
+                return spoolDirtyState(self, "shutdown projection repair failed");
             };
         }
         const observed_revision = self.storage.currentProjectionObservedRevision();
         var persisted = self.buildPersistedState(self.storage.allocator) catch |err| {
             log.err("failed to snapshot native state: {s}", .{@errorName(err)});
-            spoolDirtyState(self, "shutdown snapshot allocation failed");
-            return;
+            return spoolDirtyState(self, "shutdown snapshot allocation failed");
         };
         var persisted_owned = true;
         defer if (persisted_owned) persisted.deinit();
@@ -325,8 +339,7 @@ pub fn flushDirtyBlocking(self: anytype) void {
                         persisted.deinit();
                         persisted_owned = false;
                         log.err("failed to retain shutdown merge baseline: {s}", .{@errorName(clone_err)});
-                        spoolDirtyState(self, "shutdown baseline clone failed");
-                        return;
+                        return spoolDirtyState(self, "shutdown baseline clone failed");
                     };
                 }
                 if (self.lifecycle.rebase_snapshot) |*old| old.deinit();
@@ -342,11 +355,14 @@ pub fn flushDirtyBlocking(self: anytype) void {
                 // under its newly observed revision.
                 continue;
             }
-            log.err("failed to save native state via daemon: {s}", .{@errorName(err)});
+            if (builtin.is_test) {
+                log.warn("failed to save native state via daemon: {s}", .{@errorName(err)});
+            } else {
+                log.err("failed to save native state via daemon: {s}", .{@errorName(err)});
+            }
             self.storage.markPersistenceUnavailable();
             self.lifecycle.next_flush_attempt_ms = platform_runtime.unixTimestampMs() + FLUSH_RETRY_BACKOFF_MS;
-            spoolDirtyState(self, "shutdown save failed");
-            return;
+            return spoolDirtyState(self, "shutdown save failed");
         };
         const acknowledged_revision = self.storage.currentProjectionObservedRevision();
         if (self.lifecycle.projection_baseline) |*old| old.deinit();
@@ -359,10 +375,14 @@ pub fn flushDirtyBlocking(self: anytype) void {
     }
 }
 
-fn spoolDirtyState(self: anytype, reason: []const u8) void {
+fn spoolDirtyState(self: anytype, reason: []const u8) !void {
     self.spoolPendingStateForShutdown() catch |err| {
-        log.err("failed to durably spool dirty native state after {s}: {s}", .{ reason, @errorName(err) });
-        return;
+        if (builtin.is_test) {
+            log.warn("failed to durably spool dirty native state after {s}: {s}", .{ reason, @errorName(err) });
+        } else {
+            log.err("failed to durably spool dirty native state after {s}: {s}", .{ reason, @errorName(err) });
+        }
+        return err;
     };
     self.lifecycle.dirty_spooled = true;
     log.warn("durably spooled dirty native state: {s}", .{reason});
@@ -597,6 +617,57 @@ test "shutdown repair failure and repeated conflicts transfer dirty ownership to
     try std.testing.expect(conflict_state.lifecycle.dirty_spooled);
     try std.testing.expectEqual(SHUTDOWN_MAX_CONFLICTS, conflict_storage.saves);
     try std.testing.expectEqual(@as(usize, 1), conflict_state.spools);
+}
+
+test "close durability failure returns before teardown and retry succeeds" {
+    const FakeStorage = struct {
+        allocator: std.mem.Allocator,
+
+        fn currentProjectionObservedRevision(_: *const @This()) u64 {
+            return 3;
+        }
+        fn saveCaptured(_: *@This(), _: db_types.PersistedState, _: u64) !void {
+            return error.StoreUnavailable;
+        }
+        fn markPersistenceUnavailable(_: *@This()) void {}
+        fn clearPendingStateSpoolBestEffort(_: *@This()) void {}
+    };
+    const FakeState = struct {
+        lifecycle: State = .{},
+        storage: *FakeStorage,
+        spool_fails: bool = true,
+        teardown_started: bool = false,
+        spool_attempts: usize = 0,
+
+        fn hasUnresolvedAdoptionRows(_: *@This()) bool {
+            return false;
+        }
+        fn completePendingProjectionRepairBlocking(_: *@This()) !void {}
+        fn buildPersistedState(_: *@This(), allocator: std.mem.Allocator) !LoadedPersistedState {
+            return LoadedPersistedState.init(allocator);
+        }
+        fn clonePersistedState(_: *@This(), allocator: std.mem.Allocator, _: db_types.PersistedState) !LoadedPersistedState {
+            return LoadedPersistedState.init(allocator);
+        }
+        fn spoolPendingStateForShutdown(self: *@This()) !void {
+            self.spool_attempts += 1;
+            if (self.spool_fails) return error.InjectedSpoolFailure;
+        }
+    };
+
+    var storage: FakeStorage = .{ .allocator = std.testing.allocator };
+    var state: FakeState = .{ .storage = &storage };
+    state.lifecycle.dirty = true;
+    defer state.lifecycle.deinit();
+    try std.testing.expectError(error.InjectedSpoolFailure, handoffDirtyStateForShutdown(&state));
+    try std.testing.expect(state.lifecycle.dirty);
+    try std.testing.expect(!state.lifecycle.dirty_spooled);
+    try std.testing.expect(!state.teardown_started);
+    state.spool_fails = false;
+    try handoffDirtyStateForShutdown(&state);
+    try std.testing.expect(state.lifecycle.dirty_spooled);
+    try std.testing.expectEqual(@as(usize, 2), state.spool_attempts);
+    try std.testing.expect(!state.teardown_started);
 }
 
 test "lifecycle backoff gate skips flush while next_attempt is in the future" {
