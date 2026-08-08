@@ -2089,7 +2089,9 @@ pub const Daemon = struct {
         // Store methods own their drain/capability precedence and unlock
         // lockDaemon for SQLite work; route before the generic mutator drain gate.
         if (isStoreMethod(method)) return try self.handleStoreRequest(id_value, method, params);
-        if (!self.accepting_mutations and methodMutatesState(method)) {
+        // chat.turn.start owns its drain check under lockDaemon (unlocked serve
+        // path); other mutators still gate here under the `.normal` outer lock.
+        if (!std.mem.eql(u8, method, "chat.turn.start") and !self.accepting_mutations and methodMutatesState(method)) {
             return try errorResponseAlloc(
                 self.allocator,
                 id_value,
@@ -2745,7 +2747,7 @@ pub const Daemon = struct {
                 if (turn.consumed) continue;
                 if (!std.mem.eql(u8, turn.turn_id, turn_id) or !std.mem.eql(u8, turn.workspace_id, workspace.id)) continue;
                 lockTurn(turn);
-                turn_status = chatTurnExternalStatus(turn.status);
+                turn_status = chatTurnExternalStatus(chatTurnPublishedStatus(turn));
                 turn.mutex.unlock();
                 break;
             }
@@ -4156,23 +4158,101 @@ pub const Daemon = struct {
         return try okValueResponse(self.allocator, id_value, .{ .removed = removed });
     }
 
+    /// Accept a new turn. Runs unlocked on the serve path (see
+    /// `methodRunsUnlocked`) so the MAJOR-R1 ledger identity guard can consult
+    /// SQLite under the store service mutex without ever nesting under
+    /// lockDaemon. Takes lockDaemon only for the short in-memory critical
+    /// sections (find/append + durability_pending arm).
     fn chatTurnStartResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        // Drain gate first (outranks invalid_params) so the mutator drain table
+        // test and prepare-shutdown refuse path stay consistent for empty bodies.
+        lockDaemon(self);
+        if (!self.accepting_mutations) {
+            self.mutex.unlock();
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                "invalid_state",
+                "daemon is preparing shutdown and is not accepting mutations",
+            );
+        }
+        self.mutex.unlock();
+
         if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
         const turn_id = jsonString(params.object.get("turn_id") orelse .null) orelse return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing turn_id");
-        if (self.findChatTurn(turn_id)) |turn| return try okValueResponse(self.allocator, id_value, .{ .turn_id = turn.turn_id, .created = false });
+
+        lockDaemon(self);
+        if (!self.accepting_mutations) {
+            self.mutex.unlock();
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                "invalid_state",
+                "daemon is preparing shutdown and is not accepting mutations",
+            );
+        }
+        if (self.findChatTurn(turn_id)) |turn| {
+            const response = try okValueResponse(self.allocator, id_value, .{ .turn_id = turn.turn_id, .created = false });
+            self.mutex.unlock();
+            return response;
+        }
+        // Pointer grab only — SQLite for the ledger guard is outside lockDaemon.
+        const service = self.store_service;
+        self.mutex.unlock();
+
+        // MAJOR-R1: reject replay of terminal committed turn_ids. Without this,
+        // a fresh worker re-runs and commitTurn hits receipt Conflict ×3 →
+        // durability_pending wedges permanently. Interrupted rows still allow
+        // replay (sweep → re-commit upsert). Never SQLite under lockDaemon.
+        if (service) |svc| {
+            if (try ledgerHasTerminalCommittedTurn(svc, turn_id)) {
+                return try errorResponseAlloc(
+                    self.allocator,
+                    id_value,
+                    headless.protocol.ERR_INVALID_STATE,
+                    "turn already committed",
+                );
+            }
+        }
 
         const turn = try createChatTurnFromParams(self.allocator, params);
         errdefer turn.deinit(self.allocator);
-        // MINOR-3: arm durability_pending at acceptance while lockDaemon is held
-        // (caller is the `.normal` branch) so consume cannot TOCTOU a terminal
-        // status published before finalize sets pending.
+
+        lockDaemon(self);
+        // Re-check after the unlocked ledger window (concurrent start / race).
+        if (self.findChatTurn(turn_id)) |existing| {
+            const response = try okValueResponse(self.allocator, id_value, .{ .turn_id = existing.turn_id, .created = false });
+            self.mutex.unlock();
+            turn.deinit(self.allocator);
+            return response;
+        }
+        if (!self.accepting_mutations) {
+            self.mutex.unlock();
+            turn.deinit(self.allocator);
+            return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                "invalid_state",
+                "daemon is preparing shutdown and is not accepting mutations",
+            );
+        }
+        // MINOR-3: arm durability_pending at acceptance under lockDaemon so
+        // consume cannot TOCTOU a terminal status published before finalize.
         if (self.store_service != null) turn.durability_pending = true;
-        try self.chat_turns.append(self.allocator, turn);
-        errdefer _ = self.chat_turns.pop();
-        // Staging runs on the worker thread: the normal request path holds
-        // lockDaemon, and store I/O must never run under that spin lock.
-        const thread = try std.Thread.spawn(.{}, chatTurnThread, .{ self, turn });
+        self.chat_turns.append(self.allocator, turn) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        // Staging runs on the worker thread: store I/O never under lockDaemon.
+        // On spawn failure, drop the turn and release lockDaemon before return.
+        const thread = std.Thread.spawn(.{}, chatTurnThread, .{ self, turn }) catch |err| {
+            _ = self.chat_turns.pop();
+            turn.deinit(self.allocator);
+            self.mutex.unlock();
+            return err;
+        };
         turn.worker_thread = thread;
+        self.mutex.unlock();
         return try okValueResponse(self.allocator, id_value, .{ .turn_id = turn.turn_id, .created = true });
     }
 
@@ -4762,7 +4842,8 @@ fn writeChatTurnProcessSnapshot(s: *std.json.Stringify, turn: *const ChatTurn) !
     const process_id = try std.fmt.allocPrint(turn.allocator, "turn:{s}", .{turn.turn_id});
     defer turn.allocator.free(process_id);
     const owner_title = if (turn.request.thread_title.len != 0) turn.request.thread_title else turn.turn_id;
-    const status = chatTurnExternalStatus(turn.status);
+    // Durable-first: external process projection matches tail/list publication.
+    const status = chatTurnExternalStatus(chatTurnPublishedStatus(turn));
 
     try s.beginObject();
     try s.objectField("id");
@@ -5380,7 +5461,14 @@ fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !void {
             .created_at_ms = started_at_ms,
             .updated_at_ms = started_at_ms,
         },
-    }) catch |err| return err;
+    }) catch |err| switch (err) {
+        // Legal stable-turn_id replay (interrupted sweep): the originally
+        // staged user row keeps its identity; drifted prompt/timestamps must
+        // not fail acceptance (first-writer-wins — commitTurn's F1 upsert
+        // skips the identity-matched row the same way).
+        error.Conflict => {},
+        else => return err,
+    };
 
     // Ledger stage is not receipt-backed: the terminal commitTurn path upserts
     // the durable terminal row over any staged / interrupted ledger row.
@@ -5415,8 +5503,8 @@ fn mapStageStoreError(err: anyerror) daemon_store.StoreError {
 var chat_commit_fault_once_consumed = std.atomic.Value(bool).init(false);
 
 /// Hermetic-only: true when store-dir override is set AND commit-fault env is
-/// `fail_once` and this process has not yet consumed the one-shot. Does not
-/// touch SQLite; caller returns StoreBusy for the bounded-retry path.
+/// `fail_once` (one-shot) or `fail_always` (every attempt). Does not touch
+/// SQLite; caller returns StoreBusy for the bounded-retry path.
 fn chatCommitFaultOnceShouldFail(allocator: std.mem.Allocator) bool {
     const override_dir = storeDirFromEnv(allocator) catch return false;
     defer if (override_dir) |dir| allocator.free(dir);
@@ -5429,10 +5517,30 @@ fn chatCommitFaultOnceShouldFail(allocator: std.mem.Allocator) bool {
     const raw = environ.getAlloc(allocator, SESSION_DAEMON_CHAT_COMMIT_FAULT_ENV_NAME) catch return false;
     defer allocator.free(raw);
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.eql(u8, trimmed, "fail_always")) return true;
     if (!std.mem.eql(u8, trimmed, "fail_once")) return false;
 
     // swap true → already consumed; false → first call, consume and fail.
     return !chat_commit_fault_once_consumed.swap(true, .monotonic);
+}
+
+/// MAJOR-R1 ledger identity guard: true when the durable ledger already has a
+/// terminal committed row for `turn_id` (completed/failed/aborted). Interrupted
+/// / running / accepted rows return false so same-id replay after a crash sweep
+/// remains legal. SQLite under the store service mutex only — never lockDaemon.
+fn ledgerHasTerminalCommittedTurn(service: *StoreService, turn_id: []const u8) !bool {
+    lockStoreService(service);
+    defer service.mutex.unlock();
+    const row_or_null = service.store.conn.row(
+        "select status from chat_turns where turn_id = ?1",
+        .{turn_id},
+    ) catch return error.StoreUnavailable;
+    const row = row_or_null orelse return false;
+    defer row.deinit();
+    const status = row.text(0);
+    return std.mem.eql(u8, status, "completed") or
+        std.mem.eql(u8, status, "failed") or
+        std.mem.eql(u8, status, "aborted");
 }
 
 /// Apply transcript_apply and commitTurn outside lockDaemon. Caller must not
@@ -5457,6 +5565,7 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
     const followup_pending = turn.followup_pending;
     const status = turn.status;
     const user_message_id = if (turn.user_message_id) |id| try arena.dupe(u8, id) else null;
+    const prompt = try arena.dupe(u8, turn.request.prompt);
     const provider_thread_id = if (turn.provider_thread_id) |id| try arena.dupe(u8, id) else null;
     const error_message = if (turn.error_message) |msg| try arena.dupe(u8, msg) else null;
     const reply_text = if (turn.result_reply_text) |text| try arena.dupe(u8, text) else "";
@@ -5489,7 +5598,25 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
         .error_message = error_message,
         .followup_pending = followup_pending,
     };
-    const messages = try transcript_apply.apply(arena, events, outcome);
+    const applied = try transcript_apply.apply(arena, events, outcome);
+    // Amendment-2 F1: terminal commit is self-healing for the user row.
+    // insertTurnMessages is idempotent by message_id (skip existing non-conflict),
+    // so a successful staging leaves this prepend as a no-op; a missed staging
+    // still lands the acceptance-keyed user message in the same transaction.
+    const messages: []const store_protocol.Message = blk: {
+        const uid = user_message_id orelse break :blk applied;
+        var all = try arena.alloc(store_protocol.Message, applied.len + 1);
+        all[0] = .{
+            .message_id = uid,
+            .role = "user",
+            .author = "You",
+            .body = prompt,
+            .created_at_ms = started_at_ms,
+            .updated_at_ms = started_at_ms,
+        };
+        @memcpy(all[1..], applied);
+        break :blk all;
+    };
 
     // 2. Short lockDaemon for service pointer + in_flight only (MINOR-5(a)).
     lockDaemon(daemon);
@@ -5909,7 +6036,15 @@ fn storeErrorResponse(
 
 /// Single serve-path classification (one JSON parse). Fold W5 slow-work and
 /// S2/S3 store routing so store/normal cannot disagree about lock ownership.
-const ServerRequestClass = enum { slow_registry, store, normal };
+/// `unlocked_method` is for handlers that manage their own short lockDaemon
+/// windows (chat.turn.start needs a store-seam ledger read without nesting).
+const ServerRequestClass = enum { slow_registry, store, unlocked_method, normal };
+
+fn methodRunsUnlocked(method: []const u8) bool {
+    // M4-P4: ledger identity guard on accept must read SQLite under the store
+    // mutex only; the `.normal` outer lockDaemon window cannot nest that work.
+    return std.mem.eql(u8, method, "chat.turn.start");
+}
 
 fn classifyServerRequest(allocator: std.mem.Allocator, request: []const u8) !ServerRequestClass {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, request, .{});
@@ -5918,6 +6053,7 @@ fn classifyServerRequest(allocator: std.mem.Allocator, request: []const u8) !Ser
     const method = jsonString(parsed.value.object.get("method") orelse .null) orelse return error.InvalidRequest;
     if (methodNeedsSlowWork(method)) return .slow_registry;
     if (isStoreMethod(method)) return .store;
+    if (methodRunsUnlocked(method)) return .unlocked_method;
     return .normal;
 }
 
@@ -6003,6 +6139,9 @@ fn handleSessionizerServerRequest(raw_context: *anyopaque, request: []u8) anyerr
         .slow_registry => return daemon.handleSlowRegistryRequest(daemon.allocator, request) catch |err|
             errorResponseAlloc(daemon.allocator, .null, "internal_error", @errorName(err)),
         .store => return daemon.handleRequest(trimmed) catch |err|
+            errorResponseAlloc(daemon.allocator, .null, "internal_error", @errorName(err)),
+        // chat.turn.start: handler owns short lockDaemon sections + store seam.
+        .unlocked_method => return daemon.handleRequest(trimmed) catch |err|
             errorResponseAlloc(daemon.allocator, .null, "internal_error", @errorName(err)),
         .normal => {
             lockDaemon(daemon);
@@ -6162,17 +6301,20 @@ fn finalizeSessionizerStore(context: *SessionizerServerContext) void {
         };
     }
 
-    // MINOR-5(b): drain in_flight before destroy so a late staging/commit
-    // pointer-grab cannot UAF after store.deinit. Bounded; warn on timeout.
+    // MINOR-5(b) / MINOR-V1: drain in_flight before destroy so a late
+    // staging/commit pointer-grab cannot UAF after store.deinit. On timeout,
+    // deliberately leak the service (loud warn) rather than deinit under a
+    // live in_flight commit — a bounded one-time leak on the serve-error
+    // fallback beats use-after-free.
     {
         const drain_deadline = nowMs() + 2000;
         while (service.in_flight.load(.monotonic) != 0) {
             if (nowMs() >= drain_deadline) {
                 log.warn(
-                    "store finalize in_flight drain timed out count={d}",
+                    "store finalize in_flight drain timed out count={d}; leaking store service to avoid UAF",
                     .{service.in_flight.load(.monotonic)},
                 );
-                break;
+                return;
             }
             platform_runtime.sleepMillis(5);
         }
@@ -6408,14 +6550,27 @@ fn chatTurnKeepsDaemonAlive(
     worker_done: bool,
     durability_pending: bool,
 ) bool {
-    // Durable commit is in flight: the turn is not consumable and must keep
-    // the daemon alive until the store receipt lands (M4 dual-write-unread).
+    // M4-P4 authority flip: committed terminal turns no longer keep the daemon
+    // alive. Only in-flight work and durability_pending do. `consumed` is a
+    // retention hint for GC, not a keep-alive / prepareShutdown gate.
+    _ = consumed;
+    _ = worker_done;
     if (durability_pending) return true;
-    if (status == .running or status == .waiting_approval) return true;
-    // A finished result exists only in daemon memory until the desktop tails
-    // and consumes it. Exiting after the generic idle timeout would discard
-    // replies whenever Verde remained closed for more than 30 seconds.
-    return !consumed or !worker_done;
+    return status == .running or status == .waiting_approval;
+}
+
+/// Durable-first publication: terminal statuses are only visible on tail/list
+/// once the store receipt has landed (`committed_store_revision` set and
+/// `durability_pending` clear). Until then the wire status stays non-terminal
+/// so clients never observe `completed`/`failed`/`aborted` pre-commit.
+fn chatTurnPublishedStatus(turn: *const ChatTurn) ChatTurnStatus {
+    if (turn.durability_pending) {
+        return switch (turn.status) {
+            .completed, .failed, .aborted => .running,
+            .running, .waiting_approval => turn.status,
+        };
+    }
+    return turn.status;
 }
 
 fn sleepMs(milliseconds: i64) void {
@@ -6560,20 +6715,26 @@ fn writeChatTurnSummary(s: *std.json.Stringify, turn: *const ChatTurn) !void {
     try s.objectField("local_thread_id");
     try s.write(turn.local_thread_id);
     try s.objectField("status");
-    try s.write(@tagName(turn.status));
+    // Durable-first: list never publishes terminal status pre-commit.
+    try s.write(@tagName(chatTurnPublishedStatus(turn)));
     try s.objectField("next_seq");
     try s.write(turn.next_seq);
     try s.objectField("provider_thread_id");
     if (turn.provider_thread_id) |value| try s.write(value) else try s.write(null);
     try s.objectField("pending_approval");
     try writePendingApproval(s, turn.pending_approval);
+    try s.objectField("committed_store_revision");
+    if (turn.committed_store_revision) |value| try s.write(value) else try s.write(null);
+    try s.objectField("durability_pending");
+    try s.write(turn.durability_pending);
     try s.endObject();
 }
 
 fn writeChatTurnTail(s: *std.json.Stringify, turn: *const ChatTurn, after_seq: u64) !void {
     try s.beginObject();
     try s.objectField("status");
-    try s.write(@tagName(turn.status));
+    // Durable-first: tail status=completed/failed/aborted only with the receipt.
+    try s.write(@tagName(chatTurnPublishedStatus(turn)));
     try s.objectField("events");
     try s.beginArray();
     for (turn.events.items) |event| {
@@ -6710,9 +6871,28 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
     // Acceptance staging before provider work so a mid-turn kill still leaves
     // the user row + running ledger for the interrupted sweep. Must not run
     // under lockDaemon (the accept path holds it for chat.turn.start).
+    // Amendment-2 F1: staging failure is no longer swallowed — surface on the
+    // turn and skip provider work. Terminal commit still re-upserts the user
+    // row (self-healing) when staging partially succeeded; a total staging
+    // failure fails the turn loudly so the GUI does not wait forever.
+    var staging_failed = false;
     stageAcceptedChatTurn(daemon, turn) catch |err| {
         log.warn("chat turn acceptance staging failed turn_id={s} err={s}", .{ turn.turn_id, @errorName(err) });
+        lockTurn(turn);
+        turn.status = .failed;
+        if (turn.durability_error) |old| allocator.free(old);
+        turn.durability_error = allocator.dupe(u8, @errorName(err)) catch null;
+        if (turn.error_message) |old| allocator.free(old);
+        turn.error_message = allocator.dupe(u8, "acceptance staging failed") catch null;
+        turn.appendStringEvent(allocator, "failed", "message", turn.error_message orelse "acceptance staging failed");
+        turn.finished_at_ms = nowMs();
+        turn.mutex.unlock();
+        staging_failed = true;
     };
+    if (staging_failed) {
+        finalizeChatTurnWorker(daemon, turn);
+        return;
+    }
     // NIT-3: use_stub already folded the env at creation; do not re-eval.
     if (turn.use_stub) {
         runStubChatTurn(allocator, turn);
@@ -6764,15 +6944,19 @@ fn finalizeChatTurnWorker(daemon: *Daemon, turn: *ChatTurn) void {
     if (should_commit) {
         turn.durability_pending = true;
     } else {
-        // MINOR-3: clear pending when there is no writer (accept may have armed it).
+        // MINOR-3 / MINOR-V2: clear pending when there is no writer (accept may
+        // have armed it) and surface store_closed so the lost commit is not
+        // silent (sibling of the commit-time store_closed branch).
         turn.durability_pending = false;
+        if (turn.durability_error) |old| daemon.allocator.free(old);
+        turn.durability_error = daemon.allocator.dupe(u8, "store_closed") catch null;
     }
     turn.worker_done = true;
     turn.mutex.unlock();
     if (!should_commit) return;
 
-    // 3 attempts total; backoffs between attempts with no lock held.
-    const backoffs_ms = [_]u64{ 50, 250, 1000 };
+    // 3 attempts total; up to 2 lock-free backoffs between them (50, 250 ms).
+    const backoffs_ms = [_]u64{ 50, 250 };
     var attempt: usize = 0;
     while (attempt < 3) : (attempt += 1) {
         commitChatTurnDurable(daemon, turn) catch |err| {
@@ -8804,15 +8988,18 @@ test "daemon chat diff payload preserves files and patches" {
     );
 }
 
-test "daemon retains chat turns until their result is consumed" {
+test "daemon keep-alive is durability_pending and live work only (M4-P4)" {
+    // Live work keeps the daemon.
     try std.testing.expect(chatTurnKeepsDaemonAlive(.running, false, false, false));
     try std.testing.expect(chatTurnKeepsDaemonAlive(.waiting_approval, false, false, false));
-    try std.testing.expect(chatTurnKeepsDaemonAlive(.completed, false, true, false));
-    try std.testing.expect(chatTurnKeepsDaemonAlive(.failed, false, true, false));
-    try std.testing.expect(chatTurnKeepsDaemonAlive(.aborted, false, true, false));
+    // M4-P4: committed terminal turns no longer keep-alive regardless of consume.
+    try std.testing.expect(!chatTurnKeepsDaemonAlive(.completed, false, true, false));
+    try std.testing.expect(!chatTurnKeepsDaemonAlive(.failed, false, true, false));
+    try std.testing.expect(!chatTurnKeepsDaemonAlive(.aborted, false, true, false));
     try std.testing.expect(!chatTurnKeepsDaemonAlive(.completed, true, true, false));
-    // Durable commit in flight keeps the daemon alive even if already consumed.
+    // Durable commit in flight still keeps the daemon alive (even if consumed).
     try std.testing.expect(chatTurnKeepsDaemonAlive(.completed, true, true, true));
+    try std.testing.expect(chatTurnKeepsDaemonAlive(.completed, false, true, true));
 }
 
 test "prepareShutdown refuses while a live PTY exists" {
@@ -8851,7 +9038,9 @@ test "prepareShutdown refuses while a live PTY exists" {
     try std.testing.expect(daemon.sessions.items[0].running);
 }
 
-test "prepareShutdown preserves unconsumed completed turns" {
+test "prepareShutdown accepts committed unconsumed turns; blocks on durability_pending" {
+    // M4-P4 gate flip: item 1 drops "completed-but-unconsumed" and gains
+    // "no durability_pending turns". Consume is a retention hint only.
     const allocator = std.testing.allocator;
     var daemon = Daemon.init(allocator);
     defer daemon.deinit();
@@ -8877,31 +9066,14 @@ test "prepareShutdown preserves unconsumed completed turns" {
         .status = .completed,
         .consumed = false,
         .worker_done = true,
+        .durability_pending = false,
+        .committed_store_revision = 1,
     };
     try daemon.chat_turns.append(allocator, turn);
 
-    const prepare_response = try daemon.handleRequest(
-        \\{"jsonrpc":"2.0","id":3,"method":"daemon.prepareShutdown","params":{}}
-    );
-    defer allocator.free(prepare_response);
-    var prepared = try std.json.parseFromSlice(std.json.Value, allocator, prepare_response, .{});
-    defer prepared.deinit();
-    const error_value = prepared.value.object.get("error").?.object;
-    try std.testing.expectEqualStrings(headless.registry.ERR_INVALID_STATE, jsonString(error_value.get("code").?).?);
-    const data = error_value.get("data").?.object;
-    try std.testing.expectEqual(@as(i64, 1), data.get("turns").?.integer);
-    try std.testing.expect(daemon.accepting_mutations);
-    try std.testing.expect(!daemon.shutdown_requested);
-    try std.testing.expectEqual(@as(usize, 1), daemon.chat_turns.items.len);
-    try std.testing.expect(!daemon.chat_turns.items[0].consumed);
-
-    // After consume, prepareShutdown may accept.
-    const consume_response = try daemon.handleRequest(
-        \\{"jsonrpc":"2.0","id":4,"method":"chat.turn.consume","params":{"turn_id":"turn-unconsumed"}}
-    );
-    defer allocator.free(consume_response);
+    // Committed unconsumed: prepare accepts (no keep-alive).
     const prepare_ok = try daemon.handleRequest(
-        \\{"jsonrpc":"2.0","id":5,"method":"daemon.prepareShutdown","params":{}}
+        \\{"jsonrpc":"2.0","id":3,"method":"daemon.prepareShutdown","params":{}}
     );
     defer allocator.free(prepare_ok);
     var prepared_ok = try std.json.parseFromSlice(std.json.Value, allocator, prepare_ok, .{});
@@ -8911,7 +9083,27 @@ test "prepareShutdown preserves unconsumed completed turns" {
     try std.testing.expect(jsonBool(ok_result.get("safe_to_exit") orelse .null).?);
     try std.testing.expect(daemon.shutdown_requested);
     try std.testing.expect(!daemon.accepting_mutations);
-    try std.testing.expect(daemon.shouldExitForIdle());
+    try std.testing.expectEqual(@as(usize, 1), daemon.chat_turns.items.len);
+    try std.testing.expect(!daemon.chat_turns.items[0].consumed);
+
+    // Reset drain so we can pin the durability_pending refusal arm.
+    daemon.shutdown_requested = false;
+    daemon.accepting_mutations = true;
+    turn.durability_pending = true;
+    turn.committed_store_revision = null;
+
+    const prepare_pending = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":4,"method":"daemon.prepareShutdown","params":{}}
+    );
+    defer allocator.free(prepare_pending);
+    var prepared_pending = try std.json.parseFromSlice(std.json.Value, allocator, prepare_pending, .{});
+    defer prepared_pending.deinit();
+    const error_value = prepared_pending.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings(headless.registry.ERR_INVALID_STATE, jsonString(error_value.get("code").?).?);
+    const data = error_value.get("data").?.object;
+    try std.testing.expectEqual(@as(i64, 1), data.get("turns").?.integer);
+    try std.testing.expect(daemon.accepting_mutations);
+    try std.testing.expect(!daemon.shutdown_requested);
 }
 
 test "prepare shutdown refuses on every shared live-state gate and preserves accepting" {

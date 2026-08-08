@@ -164,6 +164,12 @@ pub fn main(init: std.process.Init) !void {
     // M4-P3 production dual-write pins (Windows-safe): parity + revision conflict.
     try runChatTurnParityScenario(allocator, io);
     try runChatDaemonCommitStaleSnapshotConflictScenario(allocator, io);
+    // M4-P4 authority flip (Windows-safe): durable-before-consume + MAJOR-R1.
+    try runChatAuthorityFlipPrepareAndCrashObserveScenario(allocator, io);
+    try runChatCloseBeforeConsumeReopenScenario(allocator, io);
+    try runChatFocusedCompletionClearScenario(allocator, io);
+    try runChatCompletedTurnReplayRejectScenario(allocator, io);
+    try runChatDurableCommitFailAlwaysScenario(allocator, io);
 
     // Extended store scenarios (POSIX only): full surface + S4 fault/busy/crash pins.
     // Transport-tier primitives, but not part of the Windows-safe subset.
@@ -3902,6 +3908,12 @@ fn waitChatTurnTerminal(
     var last_err_len: usize = 0;
     var last_pending: bool = false;
     var last_has_commit: bool = false;
+    // M4-P4 durable-first: status may stay non-terminal while durability_pending.
+    // Count consecutive pending+error observations so fail_once's ~50 ms window
+    // cannot trip ChatTurnDurableCommitFailed, but fail_always (exhausted retry)
+    // does after the backoff budget.
+    var consecutive_pending_error: usize = 0;
+    const pending_error_fail_threshold: usize = 20; // ~500 ms at 25 ms poll
     // Budget covers commit_stall staging/finalize (multiple 1.5s arms) + network.
     while (attempts < 800) : (attempts += 1) {
         var parsed = client.call("chat.turn.tail", .{ .turn_id = turn_id, .after_seq = 0 }) catch {
@@ -3928,10 +3940,6 @@ fn waitChatTurnTerminal(
         const terminal = std.mem.eql(u8, status_text, "completed") or
             std.mem.eql(u8, status_text, "failed") or
             std.mem.eql(u8, status_text, "aborted");
-        if (!terminal) {
-            std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
-            continue;
-        }
         if (require_commit) {
             const committed = result.object.get("committed_store_revision") orelse .null;
             last_has_commit = committed != .null;
@@ -3942,18 +3950,29 @@ fn waitChatTurnTerminal(
                 last_err_len = @min(d_err.string.len, last_err_buf.len);
                 @memcpy(last_err_buf[0..last_err_len], d_err.string[0..last_err_len]);
             } else last_err_len = 0;
-            // Store failure: fail fast with a distinct error instead of spinning.
+            // Exhausted durable commit (fail_always): pending+error sticks after
+            // 3 attempts. Require consecutive observations so fail_once recovery
+            // cannot false-fail (MINOR-V3). Observable before terminal status
+            // under durable-first publication.
             if (last_pending and last_err_len != 0) {
-                std.debug.print(
-                    "headless-daemon-it: durable commit failed turn_id={s} status={s} err={s}\n",
-                    .{ turn_id, status_text, last_err_buf[0..last_err_len] },
-                );
-                return error.ChatTurnDurableCommitFailed;
+                consecutive_pending_error += 1;
+                if (consecutive_pending_error >= pending_error_fail_threshold) {
+                    std.debug.print(
+                        "headless-daemon-it: durable commit failed turn_id={s} status={s} err={s}\n",
+                        .{ turn_id, status_text, last_err_buf[0..last_err_len] },
+                    );
+                    return error.ChatTurnDurableCommitFailed;
+                }
+            } else {
+                consecutive_pending_error = 0;
             }
-            if (committed == .null or last_pending) {
-                std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
-                continue;
-            }
+            if (committed != .null and !last_pending and terminal) return;
+            std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
+            continue;
+        }
+        if (!terminal) {
+            std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
+            continue;
         }
         return;
     }
@@ -4502,8 +4521,9 @@ fn runChatCommitFaultRetryScenario(allocator: std.mem.Allocator, io: std.Io) !vo
         "user-fault-1",
     );
 
-    // Poll: first observe terminal + durability_pending + durability_error
-    // (failure window), then observe committed_store_revision after retry.
+    // Poll: under durable-first, wire status stays non-terminal while pending.
+    // Observe durability_pending + durability_error (failure window), then
+    // committed_store_revision + terminal status after retry recovery.
     var saw_error_window = false;
     var attempts: usize = 0;
     while (attempts < 800) : (attempts += 1) {
@@ -4524,15 +4544,6 @@ fn runChatCommitFaultRetryScenario(allocator: std.mem.Allocator, io: std.Io) !vo
             std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
             continue;
         }
-        const status = result.object.get("status") orelse .null;
-        const status_text = if (status == .string) status.string else "";
-        const terminal = std.mem.eql(u8, status_text, "completed") or
-            std.mem.eql(u8, status_text, "failed") or
-            std.mem.eql(u8, status_text, "aborted");
-        if (!terminal) {
-            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
-            continue;
-        }
         const pending = result.object.get("durability_pending") orelse .null;
         const is_pending = pending == .bool and pending.bool;
         const d_err = result.object.get("durability_error") orelse .null;
@@ -4544,8 +4555,13 @@ fn runChatCommitFaultRetryScenario(allocator: std.mem.Allocator, io: std.Io) !vo
             std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
             continue;
         }
-        if (committed != .null and !is_pending) {
-            // Recovered.
+        const status = result.object.get("status") orelse .null;
+        const status_text = if (status == .string) status.string else "";
+        const terminal = std.mem.eql(u8, status_text, "completed") or
+            std.mem.eql(u8, status_text, "failed") or
+            std.mem.eql(u8, status_text, "aborted");
+        if (committed != .null and !is_pending and terminal) {
+            // Recovered (durable-first: terminal only with the receipt).
             break;
         }
         std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
@@ -4725,10 +4741,17 @@ fn runChatTypedDtoRoundTripScenario(allocator: std.mem.Allocator, io: std.Io) !v
     _ = child.wait(io) catch {};
 }
 
-/// M4-P3 parity IT: complete a real-shaped stub turn, then diff daemon-committed
-/// rows against the rows the GUI projection would write (acceptance-staged user
-/// message with the client message_id + transcript_apply on the same stub
-/// events with daemon-minted assistant message_ids). Any divergence fails.
+/// M4-P3/P4 parity IT: daemon-committed rows vs the daemon-owned transcript
+/// identity contract (acceptance-staged user `message_id` + `transcript_apply`
+/// assistant rows with minted `turn:{id}:msg:{i+1}` ids — the F1 self-healing
+/// user-row prepend occupies commit-request slot 0).
+///
+/// Amendment-2 F2 honesty: this is **daemon identity + content parity**, not a
+/// full GUI writer exercise. Pre-P4 the GUI full-snapshot path rewrote
+/// positional `snap-msg-{i}` ids; M4-P4 write-exclusion stops that rewrite for
+/// daemon-owned terminal turns (GUI applies in-memory only; flush skips
+/// daemon-committed content). Content-level role/author/body/order remains the
+/// dual-write safety property; identity ownership is daemon-side post-P4.
 fn runChatTurnParityScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const pref_path = try makePrefPath(allocator, "m4-chat-parity");
     defer allocator.free(pref_path);
@@ -4781,7 +4804,9 @@ fn runChatTurnParityScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     // 1) user row staged at acceptance with the client message_id
     // 2) transcript_apply on the deterministic stub event stream (same pure
     //    reducer the daemon commit path uses); empty message_ids are minted
-    //    as turn:{id}:msg:{index} by insertTurnMessages.
+    //    as turn:{id}:msg:{request_index} by insertTurnMessages. Post-P4/F1
+    //    the commit request is [user row] ++ transcript rows (self-healing
+    //    user upsert), so transcript row i mints at request index i + 1.
     const stub_events = [_]transcript_apply.ChatEvent{
         .{ .kind = "assistant_delta", .payload_json = "{\"text\":\"stub-ok\"}" },
         .{ .kind = "completed", .payload_json = "{}" },
@@ -4811,7 +4836,8 @@ fn runChatTurnParityScenario(allocator: std.mem.Allocator, io: std.Io) !void {
 
     for (applied, 0..) |proj, i| {
         const daemon_msg = committed.thread.messages[i + 1];
-        const expected_id = try std.fmt.allocPrint(allocator, "turn:{s}:msg:{d}", .{ turn_id, i });
+        // F1 prepend shifts synthesized rows by one request slot (user row at 0).
+        const expected_id = try std.fmt.allocPrint(allocator, "turn:{s}:msg:{d}", .{ turn_id, i + 1 });
         defer allocator.free(expected_id);
         if (!std.mem.eql(u8, daemon_msg.message_id, expected_id)) return error.ChatParityAssistantMessageId;
         if (!std.mem.eql(u8, daemon_msg.role, proj.role)) return error.ChatParityAssistantRole;
@@ -4828,6 +4854,21 @@ fn runChatTurnParityScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         if (!std.mem.eql(u8, mid, user_message_id)) return error.ChatParityLedgerUserId;
     } else return error.ChatParityLedgerMissingUserId;
     if (turn.committed_store_revision == null) return error.ChatParityMissingRevision;
+
+    // P4 identity pin: re-read after a no-op window; daemon ids must remain
+    // (write-exclusion means a concurrent GUI snapshot is no longer expected
+    // to clobber turn:* / gui-msg:* identities for this dual-write window).
+    {
+        var get2 = try client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+        });
+        defer get2.deinit();
+        if (!get2.response.isOk()) return error.ChatParityRereadFailed;
+        const again = try client.decodeThreadGet(&get2);
+        if (again.thread.messages.len != committed.thread.messages.len) return error.ChatParityRereadCount;
+        if (!std.mem.eql(u8, again.thread.messages[0].message_id, user_message_id)) return error.ChatParityRereadUserId;
+    }
 
     try consumeChatTurn(&client, turn_id);
     var prepare = try client.call("daemon.prepareShutdown", .{});
@@ -4962,6 +5003,479 @@ fn runChatDaemonCommitStaleSnapshotConflictScenario(allocator: std.mem.Allocator
     if (!prepare.response.isOk()) return error.ChatConflictPrepareFailed;
     kill_on_unwind = false;
     _ = child.wait(io) catch {};
+}
+
+/// M4-P4: prepare accepts with a committed unconsumed turn; still blocks on
+/// durability_pending; crash/exit between commit and any client observation
+/// leaves the transcript available to a new client (M3-named acceptance).
+fn runChatAuthorityFlipPrepareAndCrashObserveScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m4p4-auth-flip");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    // --- Launch 1: complete a turn, do NOT consume, prepare accepts, exit ---
+    {
+        var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+            .chat_stub = true,
+        });
+        var kill_on_unwind = true;
+        errdefer if (kill_on_unwind) child.kill(io);
+
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+        try startStubChatTurn(&client, "turn-auth-1", "ws-auth", "thread-auth", pref_path, "auth flip body", "user-auth-1");
+        try waitChatTurnTerminal(io, &client, "turn-auth-1", true);
+
+        // Durable-first pin: tail status=completed only with revision.
+        {
+            var tail = try client.call("chat.turn.tail", .{ .turn_id = "turn-auth-1", .after_seq = 0 });
+            defer tail.deinit();
+            if (!tail.response.isOk()) return error.ChatAuthTailFailed;
+            const result = tail.response.result orelse return error.ChatAuthTailNoResult;
+            if (result != .object) return error.ChatAuthTailShape;
+            const status = result.object.get("status") orelse .null;
+            if (status != .string or !std.mem.eql(u8, status.string, "completed")) return error.ChatAuthStatusNotCompleted;
+            const committed = result.object.get("committed_store_revision") orelse .null;
+            if (committed == .null) return error.ChatAuthMissingRevision;
+            const pending = result.object.get("durability_pending") orelse .null;
+            if (pending == .bool and pending.bool) return error.ChatAuthStillPending;
+        }
+
+        // Prepare accepts with committed unconsumed turn present (gate flip).
+        var prepare = try client.call("daemon.prepareShutdown", .{});
+        defer prepare.deinit();
+        if (!prepare.response.isOk()) return error.ChatAuthPrepareUnconsumedFailed;
+        kill_on_unwind = false;
+        _ = child.wait(io) catch {};
+    }
+
+    // --- Launch 2 (new client observation after crash/exit between commit and consume) ---
+    {
+        var child2 = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+            .chat_stub = true,
+        });
+        var kill_on_unwind = true;
+        errdefer if (kill_on_unwind) child2.kill(io);
+
+        var decode_arena2 = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena2.deinit();
+        var transport2: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena2.allocator(),
+            .pref_path = pref_path,
+        };
+        var client2 = sessionizer.headlessClient(decode_arena2.allocator(), &transport2);
+
+        var record = try client2.call(headless.store.METHOD_CHAT_TURN_RECORD, .{ .turn_id = "turn-auth-1" });
+        defer record.deinit();
+        if (!record.response.isOk()) return error.ChatAuthRecordFailed;
+        const turn = try client2.decodeTurnRecord(&record);
+        if (!std.mem.eql(u8, turn.status, "completed")) return error.ChatAuthRecordStatus;
+        if (turn.committed_store_revision == null) return error.ChatAuthRecordRevision;
+
+        var get = try client2.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+            .workspace_id = "ws-auth",
+            .local_thread_id = "thread-auth",
+        });
+        defer get.deinit();
+        if (!get.response.isOk()) return error.ChatAuthThreadGetFailed;
+        const committed_thread = try client2.decodeThreadGet(&get);
+        if (committed_thread.thread.messages.len < 2) return error.ChatAuthTranscriptMissing;
+
+        var prepare2 = try client2.call("daemon.prepareShutdown", .{});
+        defer prepare2.deinit();
+        if (!prepare2.response.isOk()) return error.ChatAuthPrepare2Failed;
+        kill_on_unwind = false;
+        _ = child2.wait(io) catch {};
+    }
+
+    // --- durability_pending still blocks prepare (running keep-alive path) ---
+    // Exercised by the fail_always scenario + unit test; no extra daemon here.
+}
+
+/// M4-P4: GUI close-before-consume then reopen renders the identical transcript
+/// with no consume handshake (store snapshot + chat.turn.record).
+fn runChatCloseBeforeConsumeReopenScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m4p4-close-reopen");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var first_msg_count: usize = 0;
+    var first_revision: u64 = 0;
+    {
+        var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+            .chat_stub = true,
+        });
+        var kill_on_unwind = true;
+        errdefer if (kill_on_unwind) child.kill(io);
+
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+        try startStubChatTurn(&client, "turn-close-1", "ws-close", "thread-close", pref_path, "close reopen body", "user-close-1");
+        try waitChatTurnTerminal(io, &client, "turn-close-1", true);
+
+        var get = try client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+            .workspace_id = "ws-close",
+            .local_thread_id = "thread-close",
+        });
+        defer get.deinit();
+        if (!get.response.isOk()) return error.ChatCloseGetFailed;
+        const thread = try client.decodeThreadGet(&get);
+        first_msg_count = thread.thread.messages.len;
+        if (first_msg_count < 2) return error.ChatCloseTooFewMessages;
+
+        var rec = try client.call(headless.store.METHOD_CHAT_TURN_RECORD, .{ .turn_id = "turn-close-1" });
+        defer rec.deinit();
+        if (!rec.response.isOk()) return error.ChatCloseRecordFailed;
+        const turn = try client.decodeTurnRecord(&rec);
+        first_revision = turn.committed_store_revision orelse return error.ChatCloseMissingRevision;
+
+        // Close without consume: prepare accepts (authority flip).
+        var prepare = try client.call("daemon.prepareShutdown", .{});
+        defer prepare.deinit();
+        if (!prepare.response.isOk()) return error.ChatClosePrepareFailed;
+        kill_on_unwind = false;
+        _ = child.wait(io) catch {};
+    }
+
+    // Reopen: identical transcript, no consume handshake.
+    {
+        var child2 = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+            .chat_stub = true,
+        });
+        var kill_on_unwind = true;
+        errdefer if (kill_on_unwind) child2.kill(io);
+
+        var decode_arena2 = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena2.deinit();
+        var transport2: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena2.allocator(),
+            .pref_path = pref_path,
+        };
+        var client2 = sessionizer.headlessClient(decode_arena2.allocator(), &transport2);
+
+        var get2 = try client2.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+            .workspace_id = "ws-close",
+            .local_thread_id = "thread-close",
+        });
+        defer get2.deinit();
+        if (!get2.response.isOk()) return error.ChatCloseReopenGetFailed;
+        const thread2 = try client2.decodeThreadGet(&get2);
+        if (thread2.thread.messages.len != first_msg_count) return error.ChatCloseReopenMsgCount;
+
+        var rec2 = try client2.call(headless.store.METHOD_CHAT_TURN_RECORD, .{ .turn_id = "turn-close-1" });
+        defer rec2.deinit();
+        if (!rec2.response.isOk()) return error.ChatCloseReopenRecordFailed;
+        const turn2 = try client2.decodeTurnRecord(&rec2);
+        if (turn2.committed_store_revision) |rev| {
+            if (rev != first_revision) return error.ChatCloseReopenRevision;
+        } else return error.ChatCloseReopenMissingRevision;
+
+        // list should not require consume for durability; prepare still accepts.
+        var prepare2 = try client2.call("daemon.prepareShutdown", .{});
+        defer prepare2.deinit();
+        if (!prepare2.response.isOk()) return error.ChatCloseReopenPrepareFailed;
+        kill_on_unwind = false;
+        _ = child2.wait(io) catch {};
+    }
+}
+
+/// M4-P4 / Q3 focused-thread IT: completion ledger row upserted by daemon
+/// commit, then cleared via notification.chatCompletion.clear within one poll.
+fn runChatFocusedCompletionClearScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m4p4-focused-clear");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+        .chat_stub = true,
+    });
+    var kill_on_unwind = true;
+    errdefer if (kill_on_unwind) child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    try startStubChatTurn(&client, "turn-focus-1", "ws-focus", "thread-focus", pref_path, "focus clear body", "user-focus-1");
+    try waitChatTurnTerminal(io, &client, "turn-focus-1", true);
+
+    // Daemon commit upserted the completion row unconditionally.
+    const db_path = try std.fs.path.join(allocator, &.{ store_dir, "state.sqlite" });
+    defer allocator.free(db_path);
+    const db_path_z = try allocator.dupeZ(u8, db_path);
+    defer allocator.free(db_path_z);
+    {
+        var conn = try zqlite.open(db_path_z, zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode);
+        defer conn.close();
+        var row = (try conn.row(
+            "select count(*) from chat_completions where workspace_id = 'ws-focus' and local_thread_id = 'thread-focus'",
+            .{},
+        )).?;
+        defer row.deinit();
+        if (row.int(0) != 1) return error.ChatFocusMissingCompletionRow;
+    }
+
+    // Focused client clear within one poll cycle (Q3).
+    {
+        var reg = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = true });
+        defer reg.deinit();
+        if (!reg.response.isOk()) return error.ChatFocusRegisterFailed;
+        const client_id = (try client.decodeClientRegister(&reg)).client_id;
+
+        const empty_params: struct {} = .{};
+        var status = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params);
+        defer status.deinit();
+        if (!status.response.isOk()) return error.ChatFocusStatusFailed;
+        const expected = (try client.decodeStoreStatus(&status)).store_revision;
+
+        const clear_req: headless.store.NotificationChatCompletionClearRequest = .{
+            .mutation = .{
+                .request_key = "m4p4-focus-clear",
+                .client_id = client_id,
+                .expected_store_revision = if (expected == 0) null else expected,
+            },
+            .workspace_id = "ws-focus",
+            .local_thread_id = "thread-focus",
+        };
+        var clear = try client.call(headless.store.METHOD_NOTIFICATION_CHAT_COMPLETION_CLEAR, clear_req);
+        defer clear.deinit();
+        if (!clear.response.isOk()) return error.ChatFocusClearFailed;
+    }
+
+    {
+        var conn = try zqlite.open(db_path_z, zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode);
+        defer conn.close();
+        var row = (try conn.row(
+            "select count(*) from chat_completions where workspace_id = 'ws-focus' and local_thread_id = 'thread-focus'",
+            .{},
+        )).?;
+        defer row.deinit();
+        if (row.int(0) != 0) return error.ChatFocusCompletionNotCleared;
+    }
+
+    try consumeChatTurn(&client, "turn-focus-1");
+    var prepare = try client.call("daemon.prepareShutdown", .{});
+    defer prepare.deinit();
+    if (!prepare.response.isOk()) return error.ChatFocusPrepareFailed;
+    kill_on_unwind = false;
+    _ = child.wait(io) catch {};
+}
+
+/// MAJOR-R1: complete+consume → restart → same turn_id chat.turn.start →
+/// explicit rejection, no durability_pending wedge, prepareShutdown accepts.
+fn runChatCompletedTurnReplayRejectScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m4p4-replay-reject");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    {
+        var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+            .chat_stub = true,
+        });
+        var kill_on_unwind = true;
+        errdefer if (kill_on_unwind) child.kill(io);
+
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+        try startStubChatTurn(&client, "turn-replay-1", "ws-replay", "thread-replay", pref_path, "replay body", "user-replay-1");
+        try waitChatTurnTerminal(io, &client, "turn-replay-1", true);
+        try consumeChatTurn(&client, "turn-replay-1");
+
+        var prepare = try client.call("daemon.prepareShutdown", .{});
+        defer prepare.deinit();
+        if (!prepare.response.isOk()) return error.ChatReplayPrepare1Failed;
+        kill_on_unwind = false;
+        _ = child.wait(io) catch {};
+    }
+
+    {
+        var child2 = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+            .chat_stub = true,
+        });
+        var kill_on_unwind = true;
+        errdefer if (kill_on_unwind) child2.kill(io);
+
+        var decode_arena2 = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena2.deinit();
+        var transport2: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena2.allocator(),
+            .pref_path = pref_path,
+        };
+        var client2 = sessionizer.headlessClient(decode_arena2.allocator(), &transport2);
+
+        // Same turn_id must be rejected (ledger identity guard) — not re-run.
+        var start = try client2.call("chat.turn.start", .{
+            .turn_id = "turn-replay-1",
+            .workspace_id = "ws-replay",
+            .local_thread_id = "thread-replay",
+            .project_path = pref_path,
+            .prompt = "replay again",
+            .thread_title = "M4 IT thread",
+            .provider = "codex",
+            .harness = "local_cli",
+            .message_id = "user-replay-2",
+            .test_stub = true,
+        });
+        defer start.deinit();
+        if (start.response.isOk()) return error.ChatReplayShouldReject;
+        const err_obj = start.response.err orelse return error.ChatReplayNoError;
+        if (!std.mem.eql(u8, err_obj.code, headless.protocol.ERR_INVALID_STATE)) {
+            std.debug.print("headless-daemon-it: replay reject code={s}\n", .{err_obj.code});
+            return error.ChatReplayWrongCode;
+        }
+
+        // No wedge: prepareShutdown accepts (no durability_pending live turn).
+        var prepare2 = try client2.call("daemon.prepareShutdown", .{});
+        defer prepare2.deinit();
+        if (!prepare2.response.isOk()) return error.ChatReplayPrepareWedged;
+        kill_on_unwind = false;
+        _ = child2.wait(io) catch {};
+    }
+
+    // Ledger still single completed row.
+    const db_path = try std.fs.path.join(allocator, &.{ store_dir, "state.sqlite" });
+    defer allocator.free(db_path);
+    const db_path_z = try allocator.dupeZ(u8, db_path);
+    defer allocator.free(db_path_z);
+    var conn = try zqlite.open(db_path_z, zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode);
+    defer conn.close();
+    var ledger = (try conn.row(
+        "select count(*), max(status) from chat_turns where turn_id = 'turn-replay-1'",
+        .{},
+    )).?;
+    defer ledger.deinit();
+    if (ledger.int(0) != 1) return error.ChatReplayLedgerCount;
+    if (!std.mem.eql(u8, ledger.text(1), "completed")) return error.ChatReplayLedgerStatus;
+}
+
+/// MINOR-V3 / amendment: fail_always exhausts retries → waitChatTurnTerminal
+/// raises ChatTurnDurableCommitFailed (the previously undriven branch).
+fn runChatDurableCommitFailAlwaysScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m4p4-fail-always");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+        .chat_stub = true,
+        .chat_commit_fault = "fail_always",
+    });
+    var kill_on_unwind = true;
+    errdefer if (kill_on_unwind) child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    try startStubChatTurn(&client, "turn-fail-always-1", "ws-fa", "thread-fa", pref_path, "fail always", "user-fa-1");
+
+    const wait_err = waitChatTurnTerminal(io, &client, "turn-fail-always-1", true);
+    if (wait_err) |_| {
+        return error.ChatFailAlwaysShouldFail;
+    } else |err| {
+        if (err != error.ChatTurnDurableCommitFailed) {
+            std.debug.print("headless-daemon-it: fail_always unexpected err={s}\n", .{@errorName(err)});
+            return error.ChatFailAlwaysWrongErr;
+        }
+    }
+
+    // durability_pending keeps prepare refused (gate still includes pending).
+    var prepare = try client.call("daemon.prepareShutdown", .{});
+    defer prepare.deinit();
+    if (prepare.response.isOk()) return error.ChatFailAlwaysPrepareShouldRefuse;
+
+    // SIGKILL: wedged-pending is intentional keep-alive until operator kill.
+    // kill() is terminating+reaping; do not wait() afterward (Zig 0.16 Child).
+    child.kill(io);
+    kill_on_unwind = false;
 }
 
 fn runIntegration(allocator: std.mem.Allocator, io: std.Io) !void {

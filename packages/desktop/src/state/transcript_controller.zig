@@ -545,6 +545,12 @@ pub fn clearChatCompletion(self: anytype, project_index: usize, thread_index: us
     const project = &self.project_controller.projects.items[project_index];
     if (thread_index >= project.threads.items.len) return false;
     const thread = &project.threads.items[thread_index];
+    // M4-P4 / Q3 focused-clear: the daemon upserts `chat_completions` in the
+    // turn commit unconditionally. The local `completion_pending` flag stays
+    // the storage-clear gate for every focus route; the daemon-owned focused
+    // completion path arms it in `noteChatCompletion` before routing here so
+    // the daemon-written row is cleared within one poll cycle without turning
+    // every pane focus into a storage round-trip.
     if (!thread.completion_pending) return false;
     _ = self.storage.clearChatCompletion(project.id, thread.local_thread_id) catch |err| {
         log.err("failed to persist chat completion acknowledgement via daemon: {s}", .{@errorName(err)});

@@ -680,6 +680,10 @@ pub const SendState = struct {
     daemon_last_seq: u64 = 0,
     daemon_last_poll_ms: i64 = -1,
     daemon_owned: bool = false,
+    /// Consecutive chat.turn.tail failures while daemon-owned (Amendment-2 F5).
+    /// Resets on a successful apply; thresholds to a visible failed send so the
+    /// GUI does not spin forever after a mid-turn daemon crash/restart.
+    daemon_tail_fail_count: u8 = 0,
     partial_text: std.ArrayListUnmanaged(u8) = .empty,
     /// True while the provider reports an active content-less reasoning item.
     /// Surfaced as "Thinking - mm:ss" in the pending stream header rather

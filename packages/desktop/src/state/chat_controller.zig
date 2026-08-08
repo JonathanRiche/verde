@@ -1867,6 +1867,7 @@ pub fn beginSendForThreadWithReadyDaemon(
     send_state.daemon_last_seq = 0;
     send_state.daemon_last_poll_ms = -1;
     send_state.daemon_owned = true;
+    send_state.daemon_tail_fail_count = 0;
     send_state.thinking = false;
     send_state.partial_text.clearRetainingCapacity();
     freePendingTimelineEventsLocked(page_alloc, &send_state.pending_events);
@@ -1995,6 +1996,27 @@ pub fn restoreDaemonChatTurnsOnLaunch(self: anytype) void {
         const turn_id = jsonValueString(turn_value.object.get("turn_id") orelse .null) orelse continue;
         const status = jsonValueString(turn_value.object.get("status") orelse .null) orelse "running";
         const thread = self.threadByLocalId(workspace_id, local_thread_id) orelse continue;
+
+        // M4-P4: turns that ended while the GUI was closed are durable in the
+        // store snapshot (loaded at startup). Consult chat.turn.record for the
+        // committed fact; do not re-attach as a live pending send — consume is
+        // no longer required for transcript visibility.
+        if (std.mem.eql(u8, status, "completed") or std.mem.eql(u8, status, "failed") or std.mem.eql(u8, status, "aborted")) {
+            if (sessionizer.requestAlloc(
+                self.allocator,
+                self.storage.pref_path,
+                "chat.turn.record",
+                .{ .turn_id = turn_id },
+                6,
+            )) |record_response| {
+                // Best-effort: record confirms durable status; transcript rows
+                // already ride the store snapshot. No consume handshake.
+                self.allocator.free(record_response);
+            } else |_| {}
+            continue;
+        }
+
+        // Still-live turns: re-attach and resume tail from seq 0.
         const send_state = thread.send_state;
         send_state.mutex.lock();
         if (send_state.status == .idle and !send_state.daemon_owned) {
@@ -2006,9 +2028,6 @@ pub fn restoreDaemonChatTurnsOnLaunch(self: anytype) void {
             send_state.daemon_last_poll_ms = -1;
             send_state.daemon_owned = send_state.daemon_turn_id != null;
             send_state.ui_revision +%= 1;
-            if (std.mem.eql(u8, status, "completed") or std.mem.eql(u8, status, "failed") or std.mem.eql(u8, status, "aborted")) {
-                send_state.polled_working_seconds = 0;
-            }
             if (send_state.daemon_owned) self.chat_controller.beginSend();
         }
         send_state.mutex.unlock();
@@ -2744,6 +2763,12 @@ pub fn backgroundTaskProcessIsAlive(pid: u32) bool {
     return platform_process.processIdIsAlive(pid);
 }
 
+/// Consecutive tail transport failures before the GUI surfaces a terminal
+/// error (Amendment-2 F5). ~16 × 16 ms poll ≈ 250 ms minimum; with the
+/// daemon-poll interval this is several seconds of silence — enough to cover
+/// a restart handoff without flapping, short enough to end the eternal spinner.
+const DAEMON_CHAT_TAIL_FAIL_THRESHOLD: u8 = 16;
+
 pub fn pollDaemonChatTurn(self: anytype, thread: *ChatThread) bool {
     const page_alloc = std.heap.page_allocator;
     const send_state = thread.send_state;
@@ -2778,13 +2803,52 @@ pub fn pollDaemonChatTurn(self: anytype, thread: *ChatThread) bool {
         response_buffer,
     ) catch |err| {
         log.warn("failed to tail daemon chat turn: {s}", .{@errorName(err)});
-        return false;
+        return noteDaemonChatTailFailure(thread, "daemon chat turn is unavailable (daemon may have restarted mid-turn)");
     };
     defer page_alloc.free(response);
-    return self.applyDaemonChatTurnTail(thread, response) catch |err| {
+
+    // JSON-RPC not_found (turn gone after restart / interrupted sweep with no
+    // live memory) — surface immediately rather than spinning.
+    if (daemonTailResponseIsNotFound(response)) {
+        return noteDaemonChatTailFailure(thread, "daemon chat turn not found after reconnect; message is preserved above");
+    }
+
+    const applied = self.applyDaemonChatTurnTail(thread, response) catch |err| {
         log.warn("failed to apply daemon chat turn tail: {s}", .{@errorName(err)});
-        return false;
+        return noteDaemonChatTailFailure(thread, "failed to apply daemon chat turn");
     };
+    if (applied) {
+        send_state.mutex.lock();
+        send_state.daemon_tail_fail_count = 0;
+        send_state.mutex.unlock();
+    }
+    return applied;
+}
+
+fn daemonTailResponseIsNotFound(response: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response, .{}) catch return false;
+    defer parsed.deinit();
+    const err_val = parsed.value.object.get("error") orelse return false;
+    if (err_val != .object) return false;
+    const code = jsonValueString(err_val.object.get("code") orelse .null) orelse return false;
+    return std.mem.eql(u8, code, "not_found") or std.mem.eql(u8, code, "resource_not_found");
+}
+
+/// Amendment-2 F5: after enough consecutive tail failures, resolve the send to
+/// a visible failed state so the GUI does not spin forever. Message content
+/// stays in the in-memory transcript (and may already be staged in the store).
+fn noteDaemonChatTailFailure(thread: *ChatThread, message: []const u8) bool {
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    if (send_state.status != .pending or !send_state.daemon_owned) return false;
+    send_state.daemon_tail_fail_count +|= 1;
+    if (send_state.daemon_tail_fail_count < DAEMON_CHAT_TAIL_FAIL_THRESHOLD) return false;
+    if (send_state.error_message) |old| std.heap.page_allocator.free(old);
+    send_state.error_message = std.heap.page_allocator.dupe(u8, message) catch null;
+    send_state.status = .failed;
+    send_state.ui_revision +%= 1;
+    return true;
 }
 
 fn daemonChatPollDue(last_poll_ms: i64, now_ms: i64) bool {
@@ -3165,7 +3229,13 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
                 if (project_index == self.project_controller.selected_index and thread_index == self.currentProject().selected_thread_index) {
                     self.requestTranscriptScrollToBottom();
                 }
-                self.flushDirtyNow();
+                // M4-P4: daemon-owned turns are durable in the store commit; do
+                // not rewrite transcript rows via the GUI full-snapshot flush
+                // (A-M3P4-overlap / flush-exclusion). In-memory projection is
+                // applied above for rendering. Local-command / non-daemon
+                // paths still flush as before.
+                if (completed_daemon_turn_id == null) self.flushDirtyNow();
+                // Consume is a retention hint only (daemon already committed).
                 self.consumeDaemonChatTurn(completed_daemon_turn_id);
             }
         },
@@ -3181,7 +3251,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             } else {
                 self.setSidebarNotice("Provider request failed.");
             }
-            self.flushDirtyNow();
+            if (completed_daemon_turn_id == null) self.flushDirtyNow();
             self.consumeDaemonChatTurn(completed_daemon_turn_id);
         },
         .aborted => {
@@ -3209,7 +3279,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             thread.touch();
             self.markDirty();
             self.setSidebarNotice(if (completed_local_command) "Workspace command cancelled." else "Provider reply stopped.");
-            self.flushDirtyNow();
+            if (completed_daemon_turn_id == null) self.flushDirtyNow();
             self.consumeDaemonChatTurn(completed_daemon_turn_id);
         },
         else => {},
@@ -3224,8 +3294,10 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
     // Record a real chat turn completion. Skip when a follow-up is queued
     // (the turn continues immediately) so DONE only appears once the agent
     // truly rests, mirroring the terminal-agent `.done` notification.
+    // M4-P4 / Q3: daemon-owned completions already upserted the ledger row
+    // in the commit transaction; GUI only focused-clears (or mirrors pending).
     if (!completed_local_command and next_status == .completed and !had_pending_followup) {
-        self.noteChatCompletion(project_index, thread_index, thread);
+        self.noteChatCompletion(project_index, thread_index, thread, completed_daemon_turn_id != null);
     }
     return next_status != .idle or stream_changed or daemon_changed;
 }
@@ -3233,8 +3305,18 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
 // Records a finished in-app chat turn unless that exact pane currently has
 // focus. The independent ledger survives ordinary state saves and process
 // restarts until any pane-focus route acknowledges it.
-pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usize, thread: *ChatThread) void {
+//
+// `daemon_owned_completion` (M4-P4 / Q3): when true the daemon already upserted
+// `chat_completions` in the turn commit; the GUI never re-writes that row —
+// focused clients clear it, unfocused clients only set the in-memory flag so
+// the next focus/poll path can clear via the existing storage clear.
+pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usize, thread: *ChatThread, daemon_owned_completion: bool) void {
     if (self.isChatThreadFocused(project_index, thread_index)) {
+        // Focused-clear: storage clear drops the daemon-written row (or a
+        // legacy GUI row) within one poll cycle. The daemon-owned path never
+        // set the local pending flag, so arm it to pass clearChatCompletion's
+        // pending gate (which keeps ordinary focus routes storage-free).
+        if (daemon_owned_completion) thread.completion_pending = true;
         _ = self.clearChatCompletion(project_index, thread_index);
         return;
     }
@@ -3243,13 +3325,16 @@ pub fn noteChatCompletion(self: anytype, project_index: usize, thread_index: usi
     const completed_at_ms = unixTimestampMs();
     thread.completion_pending = true;
     thread.completed_at_ms = completed_at_ms;
-    self.storage.upsertChatCompletion(.{
-        .workspace_id = project.id,
-        .local_thread_id = thread.local_thread_id,
-        .completed_at_ms = completed_at_ms,
-    }) catch |err| {
-        log.err("failed to persist chat completion via daemon: {s}", .{@errorName(err)});
-    };
+    if (!daemon_owned_completion) {
+        // Non-daemon / local paths still own the ledger write.
+        self.storage.upsertChatCompletion(.{
+            .workspace_id = project.id,
+            .local_thread_id = thread.local_thread_id,
+            .completed_at_ms = completed_at_ms,
+        }) catch |err| {
+            log.err("failed to persist chat completion via daemon: {s}", .{@errorName(err)});
+        };
+    }
     self.markDirty();
 
     if (!self.app_config.notifications_enabled) return;
