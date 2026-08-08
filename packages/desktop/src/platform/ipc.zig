@@ -15,6 +15,8 @@ const WINDOWS_PIPE_BUFFER_BYTES: usize = 64 * 1024;
 /// transport overrun after the shared request deadline expires.
 pub const WINDOWS_CANCEL_DRAIN_TIMEOUT_MS: u32 = 250;
 const WINDOWS_RETIRED_POLL_INTERVAL_MS: u32 = 100;
+const WINDOWS_PIPE_RECREATE_ATTEMPTS: usize = 5;
+const WINDOWS_PIPE_RECREATE_BACKOFF_MS: u32 = 25;
 const RESPONSE_TOO_LARGE_RESPONSE = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":\"response_too_large\",\"message\":\"response exceeds transport limit\"}}";
 
 // M5-P3 transport concurrency limits (m4m5_decisions Q7). These are real,
@@ -713,12 +715,22 @@ fn servePipeInstanceLoop(
             .retired => |operation| {
                 // Never disconnect or reuse a handle while Windows may still
                 // complete into its OVERLAPPED. This worker owns at most one
-                // retired operation: it waits here, then replaces the instance.
-                if (!operation.waitForRetiredServerCompletion(callbacks, stop)) return;
-                windows.CloseHandle(pipe.*);
-                pipe.* = windows.INVALID_HANDLE_VALUE;
-                pipe.* = try createWindowsPipe(allocator, endpoint, options, .additional_instance);
-                continue;
+                // retired operation: it waits here, then either serves a
+                // racing connection or replaces a confirmed-aborted instance.
+                switch (operation.waitForRetiredServerCompletion(pipe.*, callbacks, stop)) {
+                    .connected => {},
+                    .aborted => {
+                        windows.CloseHandle(pipe.*);
+                        pipe.* = windows.INVALID_HANDLE_VALUE;
+                        // Five shutdown-checked attempts cover transient
+                        // instance saturation. Persistent failure propagates
+                        // from the main instance and stops the server; a pool
+                        // worker's existing catch exits only that worker.
+                        pipe.* = (try recreateWindowsPipe(allocator, endpoint, options, callbacks, stop)) orelse return;
+                        continue;
+                    },
+                    .stopping => return,
+                }
             },
         }
         defer _ = DisconnectNamedPipe(pipe.*);
@@ -846,6 +858,25 @@ fn createWindowsPipe(
         else => error.OpenFailed,
     };
     return pipe;
+}
+
+fn recreateWindowsPipe(
+    allocator: std.mem.Allocator,
+    endpoint: []const u8,
+    options: Options,
+    callbacks: ServerCallbacks,
+    stop: *const std.atomic.Value(bool),
+) !?windows.HANDLE {
+    for (0..WINDOWS_PIPE_RECREATE_ATTEMPTS) |attempt| {
+        if (callbacks.should_stop(callbacks.context) or stop.load(.acquire)) return null;
+        return createWindowsPipe(allocator, endpoint, options, .additional_instance) catch |err| {
+            if (callbacks.should_stop(callbacks.context) or stop.load(.acquire)) return null;
+            if (attempt + 1 == WINDOWS_PIPE_RECREATE_ATTEMPTS) return err;
+            Sleep(WINDOWS_PIPE_RECREATE_BACKOFF_MS);
+            continue;
+        };
+    }
+    unreachable;
 }
 
 const WindowsPipeConnection = struct {
@@ -1074,26 +1105,38 @@ const OverlappedOperation = struct {
         }
     }
 
+    const RetiredServerCompletion = enum { connected, aborted, stopping };
+
     /// A pathological server cancellation owns this worker until completion,
-    /// bounding retention to one operation per pipe instance. False means the
-    /// server is stopping; deinit deliberately keeps the storage alive.
+    /// bounding retention to one operation per pipe instance. On shutdown,
+    /// deinit deliberately keeps the storage alive.
     fn waitForRetiredServerCompletion(
         self: *OverlappedOperation,
+        pipe: windows.HANDLE,
         callbacks: ServerCallbacks,
         stop: *const std.atomic.Value(bool),
-    ) bool {
+    ) RetiredServerCompletion {
         while (!callbacks.should_stop(callbacks.context) and !stop.load(.acquire)) {
             switch (WaitForSingleObject(self.event, WINDOWS_RETIRED_POLL_INTERVAL_MS)) {
                 WAIT_OBJECT_0 => {
                     self.abandoned = false;
+                    var transferred: windows.DWORD = 0;
+                    if (GetOverlappedResult(pipe, &self.overlapped, &transferred, .FALSE).toBool()) {
+                        self.deinit();
+                        return .connected;
+                    }
+                    const completion_error = windows.GetLastError();
+                    if (completion_error != .OPERATION_ABORTED) {
+                        std.log.err("retired named-pipe accept failed: {s}", .{@tagName(completion_error)});
+                    }
                     self.deinit();
-                    return true;
+                    return .aborted;
                 },
                 WAIT_TIMEOUT => continue,
-                else => return false,
+                else => return .stopping,
             }
         }
-        return false;
+        return .stopping;
     }
 };
 
@@ -1248,6 +1291,7 @@ extern "kernel32" fn CreateEventW(
     name: ?windows.LPCWSTR,
 ) callconv(.winapi) ?windows.HANDLE;
 extern "kernel32" fn WaitForSingleObject(handle: windows.HANDLE, milliseconds: windows.DWORD) callconv(.winapi) windows.DWORD;
+extern "kernel32" fn Sleep(milliseconds: windows.DWORD) callconv(.winapi) void;
 extern "kernel32" fn GetOverlappedResult(
     file: windows.HANDLE,
     overlapped: *Overlapped,
