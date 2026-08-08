@@ -10,6 +10,10 @@ pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 256 * 1024;
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_TIMEOUT_MS: u32 = 5000;
 const WINDOWS_PIPE_BUFFER_BYTES: usize = 64 * 1024;
+/// Cancellation normally completes immediately, but a broken driver must not
+/// turn a request deadline into an infinite drain. This is the only permitted
+/// transport overrun after the shared request deadline expires.
+pub const WINDOWS_CANCEL_DRAIN_TIMEOUT_MS: u32 = 250;
 const RESPONSE_TOO_LARGE_RESPONSE = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":\"response_too_large\",\"message\":\"response exceeds transport limit\"}}";
 
 // M5-P3 transport concurrency limits (m4m5_decisions Q7). These are real,
@@ -106,14 +110,15 @@ pub fn requestWithPeerAlloc(
     options: Options,
 ) !RequestResult {
     if (request.len > options.max_message_bytes) return error.MessageTooLarge;
-    if (builtin.os.tag == .windows) return requestWindowsAlloc(allocator, endpoint, request, options);
-    return .{ .response = try requestUnixAlloc(allocator, endpoint, request, options) };
+    const deadline = deadlineFromNow(options.timeout_ms);
+    if (builtin.os.tag == .windows) return requestWindowsAlloc(allocator, endpoint, request, options, deadline);
+    return .{ .response = try requestUnixAlloc(allocator, endpoint, request, options, deadline) };
 }
 
 /// Wakes a listener so it can observe its shutdown flag.
 pub fn wake(allocator: std.mem.Allocator, endpoint: []const u8, options: Options) void {
     if (builtin.os.tag == .windows) {
-        const connection = openWindowsPipe(allocator, endpoint, options.timeout_ms) catch return;
+        const connection = openWindowsPipe(allocator, endpoint, deadlineFromNow(options.timeout_ms)) catch return;
         windows.CloseHandle(connection.handle);
         return;
     }
@@ -362,9 +367,18 @@ fn readUnixLineAlloc(
     max_bytes: usize,
     timeout_ms: u32,
 ) ![]u8 {
+    return readUnixLineAllocWithDeadline(allocator, io, stream, max_bytes, deadlineFromNow(timeout_ms));
+}
+
+fn readUnixLineAllocWithDeadline(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    max_bytes: usize,
+    deadline: u64,
+) ![]u8 {
     var bytes: std.ArrayList(u8) = .empty;
     errdefer bytes.deinit(allocator);
-    const deadline = deadlineFromNow(timeout_ms);
     var buffer: [4096]u8 = undefined;
 
     while (bytes.items.len <= max_bytes) {
@@ -373,7 +387,10 @@ fn readUnixLineAlloc(
             .raw = std.Io.Duration.fromMilliseconds(remaining_ms),
             .clock = .awake,
         } };
-        const message = try stream.socket.receiveTimeout(io, &buffer, timeout);
+        const message = stream.socket.receiveTimeout(io, &buffer, timeout) catch |err| switch (err) {
+            error.Timeout => return error.ConnectionTimedOut,
+            else => return err,
+        };
         if (message.data.len == 0) return error.ConnectionAborted;
         if (std.mem.indexOfScalar(u8, message.data, '\n')) |newline| {
             if (bytes.items.len + newline > max_bytes) return error.MessageTooLarge;
@@ -392,19 +409,105 @@ fn requestUnixAlloc(
     endpoint: []const u8,
     request: []const u8,
     options: Options,
+    deadline: u64,
 ) ![]u8 {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
-    const address = try std.Io.net.UnixAddress.init(endpoint);
-    const stream = try address.connect(io);
+    const stream = try connectUnixWithDeadline(endpoint, deadline);
     defer stream.close(io);
 
-    var write_buffer: [64 * 1024]u8 = undefined;
-    var writer = stream.writer(io, &write_buffer);
-    try writer.interface.writeAll(request);
-    try writer.interface.writeByte('\n');
-    try writer.interface.flush();
-    return readUnixLineAlloc(allocator, io, stream, options.max_response_bytes, options.timeout_ms);
+    try writeUnixAllWithDeadline(stream, request, deadline);
+    try writeUnixAllWithDeadline(stream, "\n", deadline);
+    return readUnixLineAllocWithDeadline(allocator, io, stream, options.max_response_bytes, deadline);
+}
+
+/// Opens a nonblocking Unix-domain socket and waits only beneath the request's
+/// one monotonic deadline. The returned descriptor is restored to blocking
+/// mode because `std.Io.Threaded` owns response reads after connection.
+fn connectUnixWithDeadline(endpoint: []const u8, deadline: u64) !std.Io.net.Stream {
+    comptime if (builtin.os.tag == .windows) @compileError("Unix transport helper on Windows");
+
+    const NativeUnixAddress = extern union {
+        any: std.posix.sockaddr,
+        un: std.posix.sockaddr.un,
+    };
+    var storage: NativeUnixAddress = undefined;
+    storage.un.family = std.posix.AF.UNIX;
+    if (endpoint.len >= storage.un.path.len) return error.NameTooLong;
+    @memcpy(storage.un.path[0..endpoint.len], endpoint);
+    storage.un.path[endpoint.len] = 0;
+    const address_len: std.posix.socklen_t = @intCast(@offsetOf(std.posix.sockaddr.un, "path") + endpoint.len + 1);
+    if (@hasField(std.posix.sockaddr.un, "len")) storage.un.len = @intCast(address_len);
+
+    const socket_raw = std.c.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    if (socket_raw < 0) return unixConnectError(std.posix.errno(socket_raw));
+    const socket_fd: std.posix.fd_t = @intCast(socket_raw);
+    errdefer _ = std.c.close(socket_fd);
+    if (std.c.fcntl(socket_fd, std.c.F.SETFD, @as(c_int, std.posix.FD_CLOEXEC)) < 0) {
+        return error.Unexpected;
+    }
+
+    const original_flags = std.c.fcntl(socket_fd, std.c.F.GETFL, @as(c_int, 0));
+    if (original_flags < 0) return error.Unexpected;
+    const nonblock = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
+    if (std.c.fcntl(socket_fd, std.c.F.SETFL, original_flags | @as(c_int, @intCast(nonblock))) < 0) {
+        return error.Unexpected;
+    }
+
+    while (true) {
+        if (remainingTimeoutMs(deadline) == null) return error.ConnectionTimedOut;
+        const connected = std.c.connect(socket_fd, &storage.any, address_len);
+        if (connected == 0) break;
+        switch (std.posix.errno(connected)) {
+            .INTR => continue,
+            .AGAIN, .ALREADY, .INPROGRESS => {},
+            else => |err| return unixConnectError(err),
+        }
+
+        const remaining_ms = remainingTimeoutMs(deadline) orelse return error.ConnectionTimedOut;
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = socket_fd,
+            .events = std.posix.POLL.OUT,
+            .revents = 0,
+        }};
+        const ready = try std.posix.poll(&poll_fds, @intCast(@min(remaining_ms, std.math.maxInt(i32))));
+        if (ready == 0) return error.ConnectionTimedOut;
+        if (poll_fds[0].revents & std.posix.POLL.NVAL != 0) return error.ConnectionAborted;
+
+        var socket_error: c_int = 0;
+        var socket_error_len: std.c.socklen_t = @sizeOf(c_int);
+        if (std.c.getsockopt(
+            socket_fd,
+            std.c.SOL.SOCKET,
+            std.c.SO.ERROR,
+            &socket_error,
+            &socket_error_len,
+        ) != 0) return error.Unexpected;
+        if (socket_error != 0) return unixConnectError(@enumFromInt(socket_error));
+        break;
+    }
+
+    if (std.c.fcntl(socket_fd, std.c.F.SETFL, original_flags) < 0) return error.Unexpected;
+    return .{ .socket = .{
+        .handle = socket_fd,
+        .address = .{ .ip4 = .loopback(0) },
+    } };
+}
+
+fn unixConnectError(err: std.c.E) anyerror {
+    return switch (err) {
+        .ACCES => error.AccessDenied,
+        .AFNOSUPPORT => error.AddressFamilyUnsupported,
+        .CONNREFUSED => error.ConnectionRefused,
+        .NOENT => error.FileNotFound,
+        .NOTDIR => error.NotDir,
+        .PERM => error.PermissionDenied,
+        .ROFS => error.ReadOnlyFileSystem,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .NOBUFS, .NOMEM => error.SystemResources,
+        else => error.Unexpected,
+    };
 }
 
 /// True when a peer can complete a connection to a Unix endpoint path.
@@ -615,10 +718,10 @@ fn requestWindowsAlloc(
     endpoint: []const u8,
     request: []const u8,
     options: Options,
+    deadline: u64,
 ) !RequestResult {
-    const connection = try openWindowsPipe(allocator, endpoint, options.timeout_ms);
+    const connection = try openWindowsPipe(allocator, endpoint, deadline);
     defer windows.CloseHandle(connection.handle);
-    const deadline = deadlineFromNow(options.timeout_ms);
     try writeWindowsAll(connection.handle, request, deadline);
     try writeWindowsAll(connection.handle, "\n", deadline);
     return .{
@@ -676,12 +779,11 @@ const WindowsPipeConnection = struct {
     server_process_id: u32,
 };
 
-fn openWindowsPipe(allocator: std.mem.Allocator, endpoint: []const u8, timeout_ms: u32) !WindowsPipeConnection {
+fn openWindowsPipe(allocator: std.mem.Allocator, endpoint: []const u8, deadline: u64) !WindowsPipeConnection {
     const endpoint_w = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, endpoint);
     defer allocator.free(endpoint_w);
-    const deadline = deadlineFromNow(timeout_ms);
-
     while (true) {
+        if (remainingTimeoutMs(deadline) == null) return error.ConnectionTimedOut;
         const pipe = CreateFileW(
             endpoint_w,
             GENERIC_READ | GENERIC_WRITE,
@@ -739,7 +841,8 @@ fn authenticateWindowsPipeServer(allocator: std.mem.Allocator, pipe: windows.HAN
 }
 
 fn connectWindowsPipe(pipe: windows.HANDLE, deadline: u64) !void {
-    var operation = try OverlappedOperation.init();
+    if (remainingTimeoutMs(deadline) == null) return error.ConnectionTimedOut;
+    const operation = try OverlappedOperation.init();
     defer operation.deinit();
     if (ConnectNamedPipe(pipe, &operation.overlapped).toBool()) return;
     switch (windows.GetLastError()) {
@@ -780,7 +883,8 @@ fn readWindowsLineAllocWithDeadline(
 }
 
 fn readWindows(pipe: windows.HANDLE, buffer: []u8, deadline: u64) !usize {
-    var operation = try OverlappedOperation.init();
+    if (remainingTimeoutMs(deadline) == null) return error.ConnectionTimedOut;
+    const operation = try OverlappedOperation.init();
     defer operation.deinit();
     var read_len: windows.DWORD = 0;
     if (ReadFile(pipe, buffer.ptr, @intCast(buffer.len), &read_len, &operation.overlapped).toBool()) return read_len;
@@ -795,7 +899,8 @@ fn readWindows(pipe: windows.HANDLE, buffer: []u8, deadline: u64) !usize {
 fn writeWindowsAll(pipe: windows.HANDLE, bytes: []const u8, deadline: u64) !void {
     var offset: usize = 0;
     while (offset < bytes.len) {
-        var operation = try OverlappedOperation.init();
+        if (remainingTimeoutMs(deadline) == null) return error.ConnectionTimedOut;
+        const operation = try OverlappedOperation.init();
         defer operation.deinit();
         const chunk = bytes[offset..@min(bytes.len, offset + 64 * 1024)];
         var written: windows.DWORD = 0;
@@ -822,14 +927,23 @@ const Overlapped = extern struct {
 const OverlappedOperation = struct {
     event: windows.HANDLE,
     overlapped: Overlapped,
+    abandoned: bool = false,
 
-    fn init() !OverlappedOperation {
+    fn init() !*OverlappedOperation {
+        const self = try std.heap.page_allocator.create(OverlappedOperation);
+        errdefer std.heap.page_allocator.destroy(self);
         const event = CreateEventW(null, .TRUE, .FALSE, null) orelse return error.SystemResources;
-        return .{ .event = event, .overlapped = .{ .event = event } };
+        self.* = .{ .event = event, .overlapped = .{ .event = event } };
+        return self;
     }
 
     fn deinit(self: *OverlappedOperation) void {
+        // A cancellation that did not signal within the bounded drain keeps
+        // its OVERLAPPED storage alive. Windows may still complete into it;
+        // freeing the storage here would be a use-after-free.
+        if (self.abandoned) return;
         windows.CloseHandle(self.event);
+        std.heap.page_allocator.destroy(self);
     }
 
     fn wait(self: *OverlappedOperation, pipe: windows.HANDLE, deadline: u64, transferred: ?*windows.DWORD) !void {
@@ -858,7 +972,9 @@ const OverlappedOperation = struct {
 
     fn cancelAndDrain(self: *OverlappedOperation, pipe: windows.HANDLE) void {
         _ = CancelIoEx(pipe, &self.overlapped);
-        _ = WaitForSingleObject(self.event, INFINITE);
+        if (WaitForSingleObject(self.event, WINDOWS_CANCEL_DRAIN_TIMEOUT_MS) != WAIT_OBJECT_0) {
+            self.abandoned = true;
+        }
     }
 };
 
@@ -987,10 +1103,9 @@ const WINDOWS_PIPE_CLIENT_FLAGS = FILE_ATTRIBUTE_NORMAL |
 const PROCESS_QUERY_LIMITED_INFORMATION: windows.DWORD = 0x1000;
 const WAIT_OBJECT_0: windows.DWORD = 0;
 const WAIT_TIMEOUT: windows.DWORD = 258;
-const INFINITE: windows.DWORD = 0xffffffff;
 
 fn deadlineFromNow(timeout_ms: u32) u64 {
-    return monotonicMilliseconds() + timeout_ms;
+    return monotonicMilliseconds() +| timeout_ms;
 }
 
 fn remainingTimeoutMs(deadline: u64) ?u32 {

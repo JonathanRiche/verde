@@ -8764,6 +8764,13 @@ pub fn nowMs() i64 {
     return platform_runtime.unixTimestampMs();
 }
 
+/// Milliseconds from an unspecified monotonic origin. Deadline arithmetic
+/// must use this rather than the wall-clock timestamp returned by `nowMs`.
+pub fn monotonicNowMs() i64 {
+    const milliseconds = platform_runtime.monotonicTimestampNs() / std.time.ns_per_ms;
+    return @intCast(@min(milliseconds, @as(u64, std.math.maxInt(i64))));
+}
+
 fn setNonBlocking(fd: std.posix.fd_t) !void {
     const current = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
     if (current < 0) return error.FcntlFailed;
