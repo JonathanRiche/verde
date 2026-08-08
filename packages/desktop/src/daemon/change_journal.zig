@@ -83,12 +83,16 @@ pub const RevisionPolicy = enum {
 /// because lifecycle transitions happen registry-side (started / status
 /// change) while the durable commit carries the store revision; `workspace`
 /// identity likewise lives in both the durable workspaces table and the
-/// volatile registry records. All other topics are single-plane and appends
-/// with the wrong family are rejected.
+/// volatile registry records. `surface` is store_only (M5-P3 amendment): the
+/// registry has no surface records or bump variant — surface state lives in
+/// the durable surfaces table and only store commits can publish it, so the
+/// prior registry_only pin made every surface append unrepresentable and left
+/// surface cursors silently stale forever. All other topics are single-plane
+/// and appends with the wrong family are rejected.
 pub fn revisionPolicy(topic: Topic) RevisionPolicy {
     return switch (topic) {
-        .chat_thread, .chat_completion => .store_only,
-        .surface, .process, .lease, .session, .notification => .registry_only,
+        .chat_thread, .chat_completion, .surface => .store_only,
+        .process, .lease, .session, .notification => .registry_only,
         .workspace, .chat_turn => .either,
     };
 }
@@ -351,9 +355,12 @@ test "exactly one revision field is set and topic families are enforced" {
     var journal: ChangeJournal = .{};
     defer journal.deinit(allocator);
 
-    // Wrong family is rejected for single-plane topics.
+    // Wrong family is rejected for single-plane topics. `surface` pins the
+    // M5-P3 amendment: store commits are its ONLY publisher, so a registry
+    // revision is the wrong plane.
     try std.testing.expectError(error.RevisionKindMismatch, journal.append(allocator, .lease, "l1", null, .{ .store = 1 }, 0));
     try std.testing.expectError(error.RevisionKindMismatch, journal.append(allocator, .chat_thread, "t1", null, .{ .registry = 1 }, 0));
+    try std.testing.expectError(error.RevisionKindMismatch, journal.append(allocator, .surface, "sess-1", null, .{ .registry = 1 }, 0));
     try std.testing.expectError(error.ResourceIdRequired, journal.append(allocator, .process, "", null, .{ .registry = 1 }, 0));
     try std.testing.expectEqual(@as(usize, 0), journal.len());
 
@@ -361,6 +368,7 @@ test "exactly one revision field is set and topic families are enforced" {
     _ = try journal.append(allocator, .chat_turn, "turn1", "ws", .{ .registry = 5 }, 0);
     _ = try journal.append(allocator, .workspace, "ws", null, .{ .store = 9 }, 0);
     _ = try journal.append(allocator, .chat_completion, "turn1", "ws", .{ .store = 10 }, 0);
+    _ = try journal.append(allocator, .surface, "sess-1", "ws", .{ .store = 11 }, 0);
     for (journal.entries.items) |entry| {
         const store_set = entry.store_revision != null;
         const registry_set = entry.registry_revision != null;

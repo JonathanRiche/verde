@@ -12,6 +12,30 @@ pub const DEFAULT_TIMEOUT_MS: u32 = 5000;
 const WINDOWS_PIPE_BUFFER_BYTES: usize = 64 * 1024;
 const RESPONSE_TOO_LARGE_RESPONSE = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":\"response_too_large\",\"message\":\"response exceeds transport limit\"}}";
 
+// M5-P3 transport concurrency limits (m4m5_decisions Q7). These are real,
+// enforced limits — not tuning suggestions — and each exists to bound a
+// specific resource:
+/// Fixed number of per-connection worker threads. Bounds concurrent in-flight
+/// requests so a slow handler can never spawn unbounded threads; no client
+/// class (desktop included) gets a reserved slot.
+pub const TRANSPORT_WORKER_COUNT: usize = 4;
+/// Bounds accepted-but-unassigned connections. Overflow receives the fast
+/// structured busy response below instead of queueing unboundedly.
+pub const TRANSPORT_ACCEPT_QUEUE_CAP: usize = 8;
+/// At most half the pool may be parked in a long-poll (`core.changes`) so
+/// short requests always find a free worker. Handlers that park consult this
+/// cap and degrade an over-cap wait to an immediate check (never an error).
+/// The cap lives here because it is a property of the worker pool; the
+/// enforcement lives with the parking handler, which owns wait semantics.
+pub const MAX_PARKED_LONG_POLL_WAITERS: usize = TRANSPORT_WORKER_COUNT / 2;
+/// Q7 accept-queue overflow reply: `invalid_state` + Error.data.reason="busy".
+/// Written before any request byte is read, so the id is necessarily null.
+const BUSY_RESPONSE = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":\"invalid_state\",\"message\":\"transport worker pool and accept queue are saturated\",\"data\":{\"reason\":\"busy\"}}}";
+/// Busy replies must stay fast: the payload fits any socket buffer so this
+/// write virtually never blocks, and the short deadline keeps a stalled
+/// overflow peer from holding the accept loop hostage.
+const BUSY_WRITE_TIMEOUT_MS: u32 = 250;
+
 pub const Options = struct {
     /// Maximum request size. Kept under the historical field name so existing
     /// callers continue to compile while responses use their own larger cap.
@@ -40,7 +64,15 @@ pub const ServerCallbacks = struct {
     /// (socket unlink, listener close, exclusive lock release). Servers use
     /// this for transfer commit + store close so successor bind cannot race
     /// a pre-transfer snapshot. Invoked on both Unix and Windows serve paths.
+    /// M5-P3 ordering guarantee: on_closing fires only after every in-flight
+    /// transport worker has been quiesced/joined (see on_draining).
     on_closing: ?*const fn (context: *anyopaque) void = null,
+    /// Runs after the accept loop exits, BEFORE in-flight workers are joined
+    /// and therefore before on_closing. Servers wake handler-parked waiters
+    /// here (e.g. `core.changes` long-polls) so worker quiesce is bounded by
+    /// request work rather than by a parked wait. Invoked on every serve exit
+    /// path, error returns included.
+    on_draining: ?*const fn (context: *anyopaque) void = null,
 };
 
 /// Serves newline-delimited messages until the callback requests shutdown.
@@ -122,6 +154,20 @@ fn serveUnix(
     // deinit (releases exclusive lock).
     defer if (callbacks.on_closing) |on_closing| on_closing(callbacks.context);
 
+    // Bounded per-connection worker pool (M5-P3). Declared AFTER the
+    // on_closing defer so LIFO ordering quiesces the pool first: on_draining
+    // (wake parked long-poll waiters), worker join, THEN on_closing, then the
+    // endpoint teardown defers — on error paths included. Workers start before
+    // on_ready, mirroring the pre-M5 shape where the listener existed before
+    // on_ready and requests were only processed afterwards.
+    var pool: UnixWorkerPool = .{
+        .allocator = allocator,
+        .callbacks = callbacks,
+        .options = options,
+    };
+    try pool.start();
+    defer pool.stopAndJoin();
+
     if (callbacks.on_ready) |on_ready| try on_ready(callbacks.context);
 
     while (!callbacks.should_stop(callbacks.context)) {
@@ -129,8 +175,122 @@ fn serveUnix(
             error.WouldBlock, error.ConnectionAborted => continue,
             else => return err,
         };
-        handleUnixClient(allocator, io, stream, callbacks, options);
+        if (!pool.tryPush(stream)) rejectBusyUnix(io, stream);
     }
+}
+
+/// Spin-acquire the queue lock. Critical sections are a handful of pointer
+/// moves, so a spin beats parking a worker for them.
+fn lockPoolQueue(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+/// Fixed worker pool + bounded accept queue for the Unix serve loop (Q7).
+/// The accept loop stays the single accept() caller; workers only consume
+/// accepted streams, so first-bind endpoint ownership semantics are unchanged.
+const UnixWorkerPool = struct {
+    allocator: std.mem.Allocator,
+    callbacks: ServerCallbacks,
+    options: Options,
+    /// Ring of accepted-but-unassigned connections, capped at
+    /// TRANSPORT_ACCEPT_QUEUE_CAP; overflow is rejected at accept time.
+    queue: [TRANSPORT_ACCEPT_QUEUE_CAP]std.Io.net.Stream = undefined,
+    queue_head: usize = 0,
+    queue_len: usize = 0,
+    queue_lock: std.atomic.Mutex = .unlocked,
+    /// Futex word idle workers sleep on; bumped by every push and by
+    /// shutdown so a sleeping worker can never miss either event.
+    signal: std.atomic.Value(u32) = .init(0),
+    shutdown: std.atomic.Value(bool) = .init(false),
+    threads: [TRANSPORT_WORKER_COUNT]?std.Thread = @splat(null),
+
+    fn start(self: *UnixWorkerPool) !void {
+        errdefer self.shutdownAndJoinWorkers();
+        for (&self.threads) |*slot| {
+            slot.* = try std.Thread.spawn(.{}, workerMain, .{self});
+        }
+    }
+
+    /// Bounded handoff: false when the queue is at cap (caller sends busy).
+    /// Only the accept thread pushes, so a false result is an authoritative
+    /// overflow signal, not a transient race.
+    fn tryPush(self: *UnixWorkerPool, stream: std.Io.net.Stream) bool {
+        {
+            lockPoolQueue(&self.queue_lock);
+            defer self.queue_lock.unlock();
+            if (self.queue_len == TRANSPORT_ACCEPT_QUEUE_CAP) return false;
+            self.queue[(self.queue_head + self.queue_len) % TRANSPORT_ACCEPT_QUEUE_CAP] = stream;
+            self.queue_len += 1;
+        }
+        self.bumpSignal(1);
+        return true;
+    }
+
+    fn pop(self: *UnixWorkerPool) ?std.Io.net.Stream {
+        lockPoolQueue(&self.queue_lock);
+        defer self.queue_lock.unlock();
+        if (self.queue_len == 0) return null;
+        const stream = self.queue[self.queue_head];
+        self.queue_head = (self.queue_head + 1) % TRANSPORT_ACCEPT_QUEUE_CAP;
+        self.queue_len -= 1;
+        return stream;
+    }
+
+    fn bumpSignal(self: *UnixWorkerPool, max_waiters: u32) void {
+        _ = self.signal.fetchAdd(1, .release);
+        // The Threaded futex shim is stateless; an ephemeral instance is the
+        // sanctioned way to reach it from an arbitrary thread.
+        var threaded = std.Io.Threaded.init_single_threaded;
+        threaded.io().futexWake(u32, &self.signal.raw, max_waiters);
+    }
+
+    fn workerMain(self: *UnixWorkerPool) void {
+        // Each worker owns its Io instance; the shared allocator must be
+        // thread-safe (both daemon entry points already require this for the
+        // drain and chat worker threads).
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const io = threaded.io();
+        while (true) {
+            const observed = self.signal.load(.acquire);
+            if (self.pop()) |stream| {
+                handleUnixClient(self.allocator, io, stream, self.callbacks, self.options);
+                continue;
+            }
+            // pop-before-shutdown-check: accepted connections are always
+            // served (bounded by the queue cap) before shutdown completes.
+            if (self.shutdown.load(.acquire)) return;
+            io.futexWait(u32, &self.signal.raw, observed) catch {};
+        }
+    }
+
+    /// Quiesce order (M5-P3/A2): on_draining first so handler-parked waiters
+    /// (long-polls) are woken and their workers can finish, then join every
+    /// worker. The caller's on_closing defer therefore observes a transport
+    /// with zero in-flight requests.
+    fn stopAndJoin(self: *UnixWorkerPool) void {
+        if (self.callbacks.on_draining) |on_draining| on_draining(self.callbacks.context);
+        self.shutdownAndJoinWorkers();
+    }
+
+    fn shutdownAndJoinWorkers(self: *UnixWorkerPool) void {
+        self.shutdown.store(true, .release);
+        self.bumpSignal(std.math.maxInt(u32));
+        for (&self.threads) |*slot| {
+            if (slot.*) |thread| thread.join();
+            slot.* = null;
+        }
+    }
+};
+
+/// Fast-fail an accepted connection when workers and queue are saturated
+/// (Q7). The reply is written without reading the request — the peer gets a
+/// definitive structured busy signal instead of an opaque stall — and the
+/// connection is closed immediately afterwards.
+fn rejectBusyUnix(io: std.Io, stream: std.Io.net.Stream) void {
+    defer stream.close(io);
+    const deadline = deadlineFromNow(BUSY_WRITE_TIMEOUT_MS);
+    writeUnixAllWithDeadline(stream, BUSY_RESPONSE, deadline) catch return;
+    writeUnixAllWithDeadline(stream, "\n", deadline) catch {};
 }
 
 fn handleUnixClient(
@@ -332,18 +492,49 @@ fn serveWindows(
     callbacks: ServerCallbacks,
     options: Options,
 ) !void {
-    const pipe = try createWindowsPipe(allocator, endpoint, options);
+    const pipe = try createWindowsPipe(allocator, endpoint, options, .claim_endpoint);
     defer windows.CloseHandle(pipe);
     // Mirror Unix: finalize on every exit path (error returns included)
     // before the deferred pipe CloseHandle runs (LIFO).
     defer if (callbacks.on_closing) |on_closing| on_closing(callbacks.context);
+
+    // Multi-instance equivalence of the Unix worker pool (M5-P3/Q7). Declared
+    // AFTER the on_closing defer so LIFO ordering quiesces the additional
+    // instances first (on_draining, then stop+join), and only then runs
+    // on_closing while the FIRST_PIPE_INSTANCE handle — the endpoint claim —
+    // is still open. There is no user-space accept queue on Windows: the OS
+    // itself parks up to `nMaxInstances` connects and reports PIPE_BUSY
+    // beyond that, which clients already surface as a bounded busy/timeout.
+    var pool: WindowsPipeWorkerPool = .{
+        .allocator = allocator,
+        .endpoint = endpoint,
+        .callbacks = callbacks,
+        .options = options,
+    };
+    try pool.start();
+    defer pool.stopAndJoin();
 
     if (callbacks.on_ready) |on_ready| try on_ready(callbacks.context);
 
     // Keep the FIRST_PIPE_INSTANCE handle for the server lifetime. A client can
     // retain its disconnected handle briefly, so closing and recreating this
     // instance between requests can make CreateNamedPipeW report ACCESS_DENIED.
-    while (!callbacks.should_stop(callbacks.context)) {
+    try servePipeInstanceLoop(allocator, pipe, callbacks, options, &pool.stop);
+}
+
+/// Serves one named-pipe instance until shutdown. Shared by the main-thread
+/// FIRST_PIPE_INSTANCE loop and the additional worker instances; `stop` lets
+/// pool teardown terminate workers on serve error paths where the caller's
+/// should_stop flag never flips. Connect timeouts bound every re-check, so
+/// worker join latency is capped at `options.timeout_ms`.
+fn servePipeInstanceLoop(
+    allocator: std.mem.Allocator,
+    pipe: windows.HANDLE,
+    callbacks: ServerCallbacks,
+    options: Options,
+    stop: *const std.atomic.Value(bool),
+) !void {
+    while (!callbacks.should_stop(callbacks.context) and !stop.load(.acquire)) {
         connectWindowsPipe(pipe, deadlineFromNow(options.timeout_ms)) catch |err| {
             // A cancelled overlapped connect must be reset before this handle
             // can listen for the next client.
@@ -354,7 +545,7 @@ fn serveWindows(
             }
         };
         defer _ = DisconnectNamedPipe(pipe);
-        if (callbacks.should_stop(callbacks.context)) break;
+        if (callbacks.should_stop(callbacks.context) or stop.load(.acquire)) break;
 
         const request = readWindowsLineAlloc(allocator, pipe, options) catch continue;
         const response = callbacks.handle_request(callbacks.context, request) catch continue;
@@ -374,6 +565,51 @@ fn serveWindows(
     }
 }
 
+/// Additional named-pipe instances behind the FIRST_PIPE_INSTANCE endpoint
+/// claim (M5-P3 Windows equivalence of `UnixWorkerPool`). The main thread's
+/// instance plus these workers total TRANSPORT_WORKER_COUNT concurrent
+/// connections; the OS enforces that as `nMaxInstances`.
+const WindowsPipeWorkerPool = struct {
+    allocator: std.mem.Allocator,
+    endpoint: []const u8,
+    callbacks: ServerCallbacks,
+    options: Options,
+    stop: std.atomic.Value(bool) = .init(false),
+    threads: [TRANSPORT_WORKER_COUNT - 1]?std.Thread = @splat(null),
+
+    fn start(self: *WindowsPipeWorkerPool) !void {
+        errdefer self.stopAndJoinWorkers();
+        for (&self.threads) |*slot| {
+            slot.* = try std.Thread.spawn(.{}, workerMain, .{self});
+        }
+    }
+
+    fn workerMain(self: *WindowsPipeWorkerPool) void {
+        // The endpoint is already claimed by the main thread's first instance;
+        // a failure here only reduces available concurrency, never endpoint
+        // ownership, so it degrades silently instead of aborting the server.
+        const pipe = createWindowsPipe(self.allocator, self.endpoint, self.options, .additional_instance) catch return;
+        defer windows.CloseHandle(pipe);
+        servePipeInstanceLoop(self.allocator, pipe, self.callbacks, self.options, &self.stop) catch {};
+    }
+
+    /// Quiesce order (M5-P3/A2), mirroring UnixWorkerPool.stopAndJoin:
+    /// on_draining wakes handler-parked waiters first so worker joins are
+    /// bounded by request work plus one connect timeout, never a parked wait.
+    fn stopAndJoin(self: *WindowsPipeWorkerPool) void {
+        if (self.callbacks.on_draining) |on_draining| on_draining(self.callbacks.context);
+        self.stopAndJoinWorkers();
+    }
+
+    fn stopAndJoinWorkers(self: *WindowsPipeWorkerPool) void {
+        self.stop.store(true, .release);
+        for (&self.threads) |*slot| {
+            if (slot.*) |thread| thread.join();
+            slot.* = null;
+        }
+    }
+};
+
 fn requestWindowsAlloc(
     allocator: std.mem.Allocator,
     endpoint: []const u8,
@@ -391,17 +627,38 @@ fn requestWindowsAlloc(
     };
 }
 
-fn createWindowsPipe(allocator: std.mem.Allocator, endpoint: []const u8, options: Options) !windows.HANDLE {
+/// Whether a pipe instance claims exclusive endpoint ownership or extends an
+/// already-claimed endpoint with additional concurrency (M5-P3).
+const WindowsPipeRole = enum {
+    /// FIRST_PIPE_INSTANCE: fails with ACCESS_DENIED if another process
+    /// already serves this name — the endpoint ownership semantic.
+    claim_endpoint,
+    /// A further instance of an endpoint this process already claimed.
+    additional_instance,
+};
+
+fn createWindowsPipe(
+    allocator: std.mem.Allocator,
+    endpoint: []const u8,
+    options: Options,
+    role: WindowsPipeRole,
+) !windows.HANDLE {
     const endpoint_w = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, endpoint);
     defer allocator.free(endpoint_w);
     var security = try PipeSecurity.init(allocator);
     defer security.deinit();
 
+    const first_instance_flag: windows.DWORD = switch (role) {
+        .claim_endpoint => FILE_FLAG_FIRST_PIPE_INSTANCE,
+        .additional_instance => 0,
+    };
     const pipe = CreateNamedPipeW(
         endpoint_w,
-        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
+        PIPE_ACCESS_DUPLEX | first_instance_flag | FILE_FLAG_OVERLAPPED,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-        1,
+        // The OS-enforced concurrent-connection bound, matching the Unix
+        // worker pool: one instance per transport worker.
+        @intCast(TRANSPORT_WORKER_COUNT),
         @intCast(@min(options.max_response_bytes, WINDOWS_PIPE_BUFFER_BYTES)),
         @intCast(@min(options.max_message_bytes, WINDOWS_PIPE_BUFFER_BYTES)),
         options.timeout_ms,
@@ -933,6 +1190,311 @@ test "on_closing runs before unix endpoint teardown" {
     try std.testing.expect(state.closing_ran);
     try std.testing.expect(state.endpoint_alive_at_closing);
     // After serve returns, LIFO defers have unlinked the socket.
+    var threaded = std.Io.Threaded.init_single_threaded;
+    try std.testing.expect(!unixEndpointAcceptsConnections(threaded.io(), endpoint));
+}
+
+// ---- M5-P3 test helpers -------------------------------------------------
+
+/// Sets a futex word to 1 and wakes every waiter. Test-only analog of the
+/// production signal pattern (store/wake after the state change).
+fn testSetAndWakeWord(word: *std.atomic.Value(u32)) void {
+    word.store(1, .release);
+    var threaded = std.Io.Threaded.init_single_threaded;
+    threaded.io().futexWake(u32, &word.raw, std.math.maxInt(u32));
+}
+
+/// Waits (bounded) until `word` becomes nonzero. Returns false on timeout so
+/// tests fail with an assertion instead of hanging.
+fn testWaitForWord(word: *const std.atomic.Value(u32), timeout_ms: u32) bool {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const deadline = deadlineFromNow(timeout_ms);
+    while (word.load(.acquire) == 0) {
+        if (remainingTimeoutMs(deadline) == null) return false;
+        io.futexWaitTimeout(u32, &word.raw, 0, .{ .duration = .{
+            .raw = std.Io.Duration.fromMilliseconds(25),
+            .clock = .awake,
+        } }) catch {};
+    }
+    return true;
+}
+
+fn testNeverStop(ctx: *anyopaque) bool {
+    _ = ctx;
+    return false;
+}
+
+fn testRejectRequest(ctx: *anyopaque, request: []u8) anyerror![]u8 {
+    _ = ctx;
+    _ = request;
+    return error.UnexpectedRequest;
+}
+
+test "Q7 transport concurrency constants are pinned" {
+    // m4m5_decisions Q7: 4 workers, accept-queue cap 8, at most 2 parked
+    // long-pollers. Changing any of these is a design decision, not a patch.
+    try std.testing.expectEqual(@as(usize, 4), TRANSPORT_WORKER_COUNT);
+    try std.testing.expectEqual(@as(usize, 8), TRANSPORT_ACCEPT_QUEUE_CAP);
+    try std.testing.expectEqual(@as(usize, 2), MAX_PARKED_LONG_POLL_WAITERS);
+    // Overflow reply shape: invalid_state with Error.data.reason="busy".
+    try std.testing.expect(std.mem.indexOf(u8, BUSY_RESPONSE, "\"code\":\"invalid_state\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, BUSY_RESPONSE, "\"reason\":\"busy\"") != null);
+}
+
+test "unix accept queue is bounded at TRANSPORT_ACCEPT_QUEUE_CAP" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var dummy_context: u8 = 0;
+    // Workers intentionally NOT started: tryPush only enqueues, so ring
+    // capacity behavior is deterministic without racing consumers.
+    var pool: UnixWorkerPool = .{
+        .allocator = std.testing.allocator,
+        .callbacks = .{
+            .context = &dummy_context,
+            .should_stop = testNeverStop,
+            .handle_request = testRejectRequest,
+        },
+        .options = .{},
+    };
+    // Queue slots are plain value storage; the streams are never read here.
+    const fake_stream: std.Io.net.Stream = .{ .socket = .{ .handle = undefined, .address = undefined } };
+
+    for (0..TRANSPORT_ACCEPT_QUEUE_CAP) |_| {
+        try std.testing.expect(pool.tryPush(fake_stream));
+    }
+    // Overflow is an authoritative bounded-queue signal (caller sends busy).
+    try std.testing.expect(!pool.tryPush(fake_stream));
+
+    for (0..TRANSPORT_ACCEPT_QUEUE_CAP) |_| {
+        try std.testing.expect(pool.pop() != null);
+    }
+    try std.testing.expect(pool.pop() == null);
+    // The ring recovers after wrap-around: capacity is reusable, not consumed.
+    try std.testing.expect(pool.tryPush(fake_stream));
+    try std.testing.expect(pool.pop() != null);
+}
+
+test "busy rejection writes the structured overflow response and closes" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var fds: [2]std.c.fd_t = undefined;
+    try std.testing.expect(std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) == 0);
+    // rejectBusyUnix owns and closes the server end; the test owns the peer.
+    defer _ = std.c.close(fds[1]);
+
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const server_stream: std.Io.net.Stream = .{ .socket = .{ .handle = fds[0], .address = undefined } };
+    rejectBusyUnix(threaded.io(), server_stream);
+
+    var buffer: [512]u8 = undefined;
+    var total: usize = 0;
+    while (total < buffer.len) {
+        const read_len = std.posix.read(fds[1], buffer[total..]) catch break;
+        if (read_len == 0) break; // Server end closed after the reply.
+        total += read_len;
+    }
+    const reply = buffer[0..total];
+    try std.testing.expect(std.mem.indexOf(u8, reply, "\"code\":\"invalid_state\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "\"reason\":\"busy\"") != null);
+    try std.testing.expect(reply.len > 0 and reply[reply.len - 1] == '\n');
+}
+
+const ConcurrentServeState = struct {
+    allocator: std.mem.Allocator,
+    stop: std.atomic.Value(bool) = .init(false),
+    ready: std.atomic.Value(u32) = .init(0),
+    /// Count of requests that reached the handler; the gate below only opens
+    /// once BOTH are in flight, which is impossible on a serial transport.
+    arrived: std.atomic.Value(u32) = .init(0),
+
+    fn shouldStop(ctx: *anyopaque) bool {
+        const s: *ConcurrentServeState = @ptrCast(@alignCast(ctx));
+        return s.stop.load(.acquire);
+    }
+
+    fn onReady(ctx: *anyopaque) anyerror!void {
+        const s: *ConcurrentServeState = @ptrCast(@alignCast(ctx));
+        testSetAndWakeWord(&s.ready);
+    }
+
+    fn handle(ctx: *anyopaque, request: []u8) anyerror![]u8 {
+        const s: *ConcurrentServeState = @ptrCast(@alignCast(ctx));
+        s.allocator.free(request);
+        _ = s.arrived.fetchAdd(1, .release);
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const io = threaded.io();
+        const deadline = deadlineFromNow(3000);
+        while (s.arrived.load(.acquire) < 2) {
+            // A serial transport would park the only handler here forever;
+            // the deadline converts that hang into a test failure.
+            if (remainingTimeoutMs(deadline) == null) return error.ConcurrencyGateTimeout;
+            io.futexWaitTimeout(u32, &s.arrived.raw, 1, .{ .duration = .{
+                .raw = std.Io.Duration.fromMilliseconds(25),
+                .clock = .awake,
+            } }) catch {};
+        }
+        return s.allocator.dupe(u8, "ok");
+    }
+
+    fn serveMain(s: *ConcurrentServeState, endpoint: []const u8) void {
+        serve(s.allocator, endpoint, .{
+            .context = s,
+            .should_stop = shouldStop,
+            .handle_request = handle,
+            .on_ready = onReady,
+        }, .{ .timeout_ms = 2000 }) catch {};
+    }
+
+    fn clientMain(s: *ConcurrentServeState, endpoint: []const u8, out_ok: *std.atomic.Value(u32)) void {
+        const response = requestAlloc(s.allocator, endpoint, "{\"probe\":true}", .{ .timeout_ms = 5000 }) catch return;
+        defer s.allocator.free(response);
+        if (std.mem.eql(u8, response, "ok")) out_ok.store(1, .release);
+    }
+};
+
+// Pins the M5-P3 deliverable itself: two connections are IN the handler at
+// the same time, which the pre-M5 serial accept loop could never do.
+test "worker pool serves two connections concurrently" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const endpoint = try std.fmt.allocPrint(allocator, "/tmp/verde-cc-{d}.sock", .{runtime.processId()});
+    defer allocator.free(endpoint);
+    defer {
+        var cleanup_threaded = std.Io.Threaded.init_single_threaded;
+        const cleanup_io = cleanup_threaded.io();
+        std.Io.Dir.deleteFileAbsolute(cleanup_io, endpoint) catch {};
+        if (std.fmt.allocPrint(allocator, "{s}.lock", .{endpoint})) |lock_path| {
+            defer allocator.free(lock_path);
+            std.Io.Dir.deleteFileAbsolute(cleanup_io, lock_path) catch {};
+        } else |_| {}
+    }
+
+    var state: ConcurrentServeState = .{ .allocator = allocator };
+    const server_thread = try std.Thread.spawn(.{}, ConcurrentServeState.serveMain, .{ &state, endpoint });
+    defer {
+        state.stop.store(true, .release);
+        wake(allocator, endpoint, .{});
+        server_thread.join();
+    }
+    try std.testing.expect(testWaitForWord(&state.ready, 5000));
+
+    var first_ok: std.atomic.Value(u32) = .init(0);
+    var second_ok: std.atomic.Value(u32) = .init(0);
+    const first_client = try std.Thread.spawn(.{}, ConcurrentServeState.clientMain, .{ &state, endpoint, &first_ok });
+    const second_client = try std.Thread.spawn(.{}, ConcurrentServeState.clientMain, .{ &state, endpoint, &second_ok });
+    first_client.join();
+    second_client.join();
+    try std.testing.expectEqual(@as(u32, 1), first_ok.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), second_ok.load(.acquire));
+}
+
+const QuiesceServeState = struct {
+    allocator: std.mem.Allocator,
+    endpoint: []const u8,
+    stop: std.atomic.Value(bool) = .init(false),
+    ready: std.atomic.Value(u32) = .init(0),
+    handler_started: std.atomic.Value(u32) = .init(0),
+    /// Set by on_draining — the same seam the daemon uses to wake parked
+    /// `core.changes` long-polls before workers are joined.
+    release: std.atomic.Value(u32) = .init(0),
+    handler_completed: std.atomic.Value(bool) = .init(false),
+    closing_ran: bool = false,
+    handler_completed_at_closing: bool = false,
+    endpoint_alive_at_closing: bool = false,
+
+    fn shouldStop(ctx: *anyopaque) bool {
+        const s: *QuiesceServeState = @ptrCast(@alignCast(ctx));
+        return s.stop.load(.acquire);
+    }
+
+    fn onReady(ctx: *anyopaque) anyerror!void {
+        const s: *QuiesceServeState = @ptrCast(@alignCast(ctx));
+        testSetAndWakeWord(&s.ready);
+    }
+
+    /// Models a parked long-poll: holds its worker until on_draining releases
+    /// it, exactly the shape a `core.changes` waiter has during shutdown.
+    fn handle(ctx: *anyopaque, request: []u8) anyerror![]u8 {
+        const s: *QuiesceServeState = @ptrCast(@alignCast(ctx));
+        s.allocator.free(request);
+        testSetAndWakeWord(&s.handler_started);
+        if (!testWaitForWord(&s.release, 5000)) return error.DrainReleaseTimeout;
+        s.handler_completed.store(true, .release);
+        return s.allocator.dupe(u8, "done");
+    }
+
+    fn onDraining(ctx: *anyopaque) void {
+        const s: *QuiesceServeState = @ptrCast(@alignCast(ctx));
+        testSetAndWakeWord(&s.release);
+    }
+
+    fn onClosing(ctx: *anyopaque) void {
+        const s: *QuiesceServeState = @ptrCast(@alignCast(ctx));
+        s.closing_ran = true;
+        s.handler_completed_at_closing = s.handler_completed.load(.acquire);
+        var threaded = std.Io.Threaded.init_single_threaded;
+        s.endpoint_alive_at_closing = unixEndpointAcceptsConnections(threaded.io(), s.endpoint);
+    }
+
+    fn serveMain(s: *QuiesceServeState) void {
+        serve(s.allocator, s.endpoint, .{
+            .context = s,
+            .should_stop = shouldStop,
+            .handle_request = handle,
+            .on_ready = onReady,
+            .on_closing = onClosing,
+            .on_draining = onDraining,
+        }, .{ .timeout_ms = 2000 }) catch {};
+    }
+
+    fn clientMain(s: *QuiesceServeState, out_ok: *std.atomic.Value(u32)) void {
+        const response = requestAlloc(s.allocator, s.endpoint, "{\"park\":true}", .{ .timeout_ms = 8000 }) catch return;
+        defer s.allocator.free(response);
+        if (std.mem.eql(u8, response, "done")) out_ok.store(1, .release);
+    }
+};
+
+// A2 variant of the on_closing barrier pin: with a worker still in-flight
+// (parked, long-poll shaped), shutdown must run on_draining → worker join →
+// on_closing, so on_closing observes zero in-flight requests while the
+// endpoint is still bound.
+test "on_closing waits for in-flight worker quiesce after on_draining release" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const endpoint = try std.fmt.allocPrint(allocator, "/tmp/verde-wq-{d}.sock", .{runtime.processId()});
+    defer allocator.free(endpoint);
+    defer {
+        var cleanup_threaded = std.Io.Threaded.init_single_threaded;
+        const cleanup_io = cleanup_threaded.io();
+        std.Io.Dir.deleteFileAbsolute(cleanup_io, endpoint) catch {};
+        if (std.fmt.allocPrint(allocator, "{s}.lock", .{endpoint})) |lock_path| {
+            defer allocator.free(lock_path);
+            std.Io.Dir.deleteFileAbsolute(cleanup_io, lock_path) catch {};
+        } else |_| {}
+    }
+
+    var state: QuiesceServeState = .{ .allocator = allocator, .endpoint = endpoint };
+    const server_thread = try std.Thread.spawn(.{}, QuiesceServeState.serveMain, .{&state});
+    try std.testing.expect(testWaitForWord(&state.ready, 5000));
+
+    var client_ok: std.atomic.Value(u32) = .init(0);
+    const client_thread = try std.Thread.spawn(.{}, QuiesceServeState.clientMain, .{ &state, &client_ok });
+    // Only begin shutdown once the request provably holds a worker.
+    try std.testing.expect(testWaitForWord(&state.handler_started, 5000));
+    state.stop.store(true, .release);
+    wake(allocator, endpoint, .{});
+    server_thread.join();
+    client_thread.join();
+
+    // The parked handler finished (released by on_draining, not abandoned)…
+    try std.testing.expectEqual(@as(u32, 1), client_ok.load(.acquire));
+    // …BEFORE on_closing ran, and the endpoint was still bound at that point.
+    try std.testing.expect(state.closing_ran);
+    try std.testing.expect(state.handler_completed_at_closing);
+    try std.testing.expect(state.endpoint_alive_at_closing);
     var threaded = std.Io.Threaded.init_single_threaded;
     try std.testing.expect(!unixEndpointAcceptsConnections(threaded.io(), endpoint));
 }
