@@ -277,7 +277,9 @@ fn ensureDaemonSessionPane(
     pane_id: u32,
     session_id: []const u8,
 ) !void {
-    if (dock.tabs.items.len != 0) return;
+    for (dock.tabs.items) |*tab| {
+        if (paneLeafById(tab.root, pane_id) != null) return;
+    }
     const nodes = [_]terminal.PersistedNode{.{
         .node_id = 1,
         .kind = .leaf,
@@ -285,17 +287,39 @@ fn ensureDaemonSessionPane(
         .session_id = session_id,
         .revive_policy = .attach_or_create,
     }};
-    const tabs = [_]terminal.PersistedTab{.{
+    const new_tab: terminal.PersistedTab = .{
         .active_pane_id = pane_id,
         .root_node_id = 1,
         .nodes = &nodes,
-    }};
-    const layout = try std.json.Stringify.valueAlloc(allocator, terminal.PersistedWorkspace{
+    };
+    const layout = if (try dock.persistedLayoutJson(allocator)) |existing_layout| blk: {
+        defer allocator.free(existing_layout);
+        var parsed = try std.json.parseFromSlice(terminal.PersistedWorkspace, allocator, existing_layout, .{});
+        defer parsed.deinit();
+        const tabs = try allocator.alloc(terminal.PersistedTab, parsed.value.tabs.len + 1);
+        defer allocator.free(tabs);
+        @memcpy(tabs[0..parsed.value.tabs.len], parsed.value.tabs);
+        tabs[tabs.len - 1] = new_tab;
+        var workspace = parsed.value;
+        workspace.tabs = tabs;
+        break :blk try std.json.Stringify.valueAlloc(allocator, workspace, .{});
+    } else try std.json.Stringify.valueAlloc(allocator, terminal.PersistedWorkspace{
         .active_tab_index = 0,
-        .tabs = &tabs,
+        .tabs = &.{new_tab},
     }, .{});
     defer allocator.free(layout);
     try dock.applyPersistedLayoutJson(allocator, layout);
+}
+
+fn ensureDaemonSessionDock(self: anytype, project: anytype, dock_id: u32) !*terminal.Dock {
+    if (daemonSessionDock(project, dock_id)) |dock| return dock;
+    std.debug.assert(dock_id != 0);
+    var dock = try terminal.Dock.init(self.allocator);
+    dock.setDefaultFontSize(self.app_config.terminal_font_size);
+    errdefer dock.deinit(self.allocator);
+    try project.terminal_docks.append(self.allocator, .{ .id = dock_id, .dock = dock });
+    project.next_terminal_dock_id = @max(project.next_terminal_dock_id, dock_id +| 1);
+    return &project.terminal_docks.items[project.terminal_docks.items.len - 1].dock;
 }
 
 /// Reconcile composite session identities into the real dock projection.
@@ -309,7 +333,7 @@ pub fn applyDaemonSessionProjection(
         if (!session.running) continue;
         const project = self.projectForDaemonId(session.workspace_id) orelse continue;
         if (session.workspace_path.len != 0 and !std.mem.eql(u8, project.path, session.workspace_path)) continue;
-        const dock = daemonSessionDock(project, session.dock_id orelse 0) orelse continue;
+        const dock = try ensureDaemonSessionDock(self, project, session.dock_id orelse 0);
         try ensureDaemonSessionPane(self.allocator, dock, session.pane_id orelse 1, session.session_id);
         const leaf = if (session.pane_id) |pane_id| blk: {
             var found: ?*terminal.PaneLeaf = null;

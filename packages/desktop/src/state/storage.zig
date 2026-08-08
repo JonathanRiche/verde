@@ -17,12 +17,46 @@ const persistence = @import("persistence.zig");
 const ORG_NAME: [:0]const u8 = "verde";
 const APP_NAME: [:0]const u8 = "Native";
 pub const LEGACY_STATE_FILE_NAME = "state.json";
+pub const PENDING_STATE_SPOOL_FILE_NAME = "pending-state-spool.json";
+const PENDING_STATE_SPOOL_TEMP_FILE_NAME = "pending-state-spool.json.tmp";
 const LoadedPersistedState = db_types.LoadedState;
 const PersistedState = db_types.PersistedState;
 const PersistedThread = db_types.PersistedThread;
 const PersistedSurfaceState = db_types.PersistedSurfaceState;
 const PersistedChatCompletion = db_types.PersistedChatCompletion;
 const log = std.log.scoped(.native_shell);
+
+pub const PendingAdoptionRow = struct {
+    row_index: usize,
+    role: db_types.ChatRole,
+    author: []const u8,
+    body: []const u8,
+};
+
+pub const PendingAdoptionRepair = struct {
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    turn_id: []const u8,
+    rows: []const PendingAdoptionRow = &.{},
+};
+
+pub const PendingStateSpool = struct {
+    version: u32 = 1,
+    capture_revision: u64,
+    baseline_revision: ?u64 = null,
+    current: PersistedState,
+    baseline: ?PersistedState = null,
+    adoption_repairs: []const PendingAdoptionRepair = &.{},
+};
+
+pub const LoadedPendingStateSpool = struct {
+    arena: std.heap.ArenaAllocator,
+    value: PendingStateSpool,
+
+    pub fn deinit(self: *LoadedPendingStateSpool) void {
+        self.arena.deinit();
+    }
+};
 
 /// Mutable session state for daemon-routed mutations. Owned by Storage and
 /// reachable through a const Storage pointer so AppState can keep `*const Storage`.
@@ -182,6 +216,68 @@ pub const Storage = struct {
         return loaded;
     }
 
+    /// Load a close-time durability spool. The file remains until a later
+    /// full-snapshot acknowledgement, so a crash during replay is idempotent.
+    pub fn loadPendingStateSpool(self: *const Storage, allocator: std.mem.Allocator) !?LoadedPendingStateSpool {
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        var dir = try std.Io.Dir.openDirAbsolute(threaded.io(), self.pref_path, .{});
+        defer dir.close(threaded.io());
+        const bytes = dir.readFileAlloc(
+            threaded.io(),
+            PENDING_STATE_SPOOL_FILE_NAME,
+            allocator,
+            .limited(64 * 1024 * 1024),
+        ) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer allocator.free(bytes);
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value = try std.json.parseFromSliceLeaky(PendingStateSpool, arena.allocator(), bytes, .{
+            .allocate = .alloc_always,
+        });
+        if (value.version != 1) return error.UnsupportedPendingStateSpoolVersion;
+        return .{ .arena = arena, .value = value };
+    }
+
+    /// Atomically replace and fsync the close-time spool before state teardown.
+    pub fn writePendingStateSpool(self: *const Storage, spool: PendingStateSpool) !void {
+        const encoded = try std.json.Stringify.valueAlloc(self.allocator, spool, .{ .whitespace = .minified });
+        defer self.allocator.free(encoded);
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        var dir = try std.Io.Dir.openDirAbsolute(threaded.io(), self.pref_path, .{});
+        defer dir.close(threaded.io());
+        var file = try dir.createFile(threaded.io(), PENDING_STATE_SPOOL_TEMP_FILE_NAME, .{ .truncate = true });
+        var file_open = true;
+        defer if (file_open) file.close(threaded.io());
+        try file.writeStreamingAll(threaded.io(), encoded);
+        try file.sync(threaded.io());
+        file.close(threaded.io());
+        file_open = false;
+        try dir.rename(PENDING_STATE_SPOOL_TEMP_FILE_NAME, dir, PENDING_STATE_SPOOL_FILE_NAME, threaded.io());
+    }
+
+    pub fn clearPendingStateSpool(self: *const Storage) !void {
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        var dir = try std.Io.Dir.openDirAbsolute(threaded.io(), self.pref_path, .{});
+        defer dir.close(threaded.io());
+        dir.deleteFile(threaded.io(), PENDING_STATE_SPOOL_FILE_NAME) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+
+    pub fn clearPendingStateSpoolBestEffort(self: *const Storage) void {
+        self.clearPendingStateSpool() catch |err| {
+            log.warn("failed to remove acknowledged pending-state spool: {s}", .{@errorName(err)});
+        };
+    }
+
     /// Compatibility whole-state save via `state.snapshot.replace`.
     pub fn save(self: *const Storage, state: PersistedState) !void {
         try self.saveCaptured(state, self.currentProjectionObservedRevision());
@@ -336,6 +432,12 @@ pub const Storage = struct {
         self.store_session.lock();
         defer self.store_session.unlock();
         return self.store_session.projection_observed_revision;
+    }
+
+    pub fn currentInstanceNonceAlloc(self: *const Storage, allocator: std.mem.Allocator) ![]u8 {
+        self.store_session.lock();
+        defer self.store_session.unlock();
+        return allocator.dupe(u8, self.store_session.instance_nonce orelse "");
     }
 
     fn noteProjectionObservedRevision(self: *const Storage, revision: u64) void {
@@ -1062,4 +1164,53 @@ test "capture revision remains bound when the write guard advances" {
     try std.testing.expectEqual(@as(u64, 7), captured);
     try std.testing.expectEqual(@as(u64, 7), storage.currentProjectionObservedRevision());
     try std.testing.expectEqual(@as(u64, 9), storage.currentStoreRevision());
+}
+
+test "pending state spool is durable, replayable, and acknowledgement-cleared" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(std.testing.allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+
+    const baseline_projects = [_]db_types.PersistedProject{.{
+        .id = "spool-workspace",
+        .label = "Before",
+        .path = "/tmp/spool-workspace",
+    }};
+    const current_projects = [_]db_types.PersistedProject{.{
+        .id = "spool-workspace",
+        .label = "Unsaved after repair failure",
+        .path = "/tmp/spool-workspace",
+    }};
+    const rows = [_]PendingAdoptionRow{.{
+        .row_index = 1,
+        .role = .assistant,
+        .author = "Codex",
+        .body = "unsaved reply",
+    }};
+    const repairs = [_]PendingAdoptionRepair{.{
+        .workspace_id = "spool-workspace",
+        .local_thread_id = "spool-thread",
+        .turn_id = "spool-turn",
+        .rows = &rows,
+    }};
+    try storage.writePendingStateSpool(.{
+        .capture_revision = 41,
+        .baseline_revision = 41,
+        .current = .{ .projects = &current_projects },
+        .baseline = .{ .projects = &baseline_projects },
+        .adoption_repairs = &repairs,
+    });
+
+    var loaded = (try storage.loadPendingStateSpool(std.testing.allocator)).?;
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u64, 41), loaded.value.capture_revision);
+    try std.testing.expectEqual(@as(?u64, 41), loaded.value.baseline_revision);
+    try std.testing.expectEqualStrings("Unsaved after repair failure", loaded.value.current.projects[0].label);
+    try std.testing.expectEqualStrings("Before", loaded.value.baseline.?.projects[0].label);
+    try std.testing.expectEqualStrings("spool-turn", loaded.value.adoption_repairs[0].turn_id);
+    try storage.clearPendingStateSpool();
+    try std.testing.expect((try storage.loadPendingStateSpool(std.testing.allocator)) == null);
 }
