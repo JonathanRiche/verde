@@ -1894,13 +1894,13 @@ fn workspaceProcessesResponse(allocator: std.mem.Allocator, id_value: std.json.V
     if (project_index) |index| {
         if (index >= state.project_controller.projects.items.len) return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
         if (try refreshStackConfigOrError(allocator, id_value, state, index)) |response| return response;
-        state.pollWorkspaceTerminalProcessLifecycles(index);
+        state.pollWorkspaceTerminalProcessLifecyclesForLiveRead(index);
         state.pruneExpiredWorkspaceLeases(index);
     } else {
         var index: usize = 0;
         while (index < state.project_controller.projects.items.len) : (index += 1) {
             if (try refreshStackConfigOrError(allocator, id_value, state, index)) |response| return response;
-            state.pollWorkspaceTerminalProcessLifecycles(index);
+            state.pollWorkspaceTerminalProcessLifecyclesForLiveRead(index);
             state.pruneExpiredWorkspaceLeases(index);
         }
     }
@@ -2389,7 +2389,7 @@ fn workspaceCheckCommandResponse(
     if (command.len == 0 and resource_request.len == 0) {
         return try errorResponseAlloc(allocator, id_value, "invalid_request", "workspace.checkCommand requires command or resources");
     }
-    state.pollWorkspaceTerminalProcessLifecycles(project_index);
+    state.pollWorkspaceTerminalProcessLifecyclesForLiveRead(project_index);
     state.pruneExpiredWorkspaceLeases(project_index);
 
     var writer: std.Io.Writer.Allocating = .init(allocator);
@@ -2446,7 +2446,7 @@ fn workspaceAcquireLeaseResponse(allocator: std.mem.Allocator, id_value: std.jso
     const force = boolParam(params, "force") orelse false;
     const ttl_ms = std.math.clamp(intParam(params, "ttl_ms") orelse 120_000, 1_000, 3_600_000);
 
-    state.pollWorkspaceTerminalProcessLifecycles(project_index);
+    state.pollWorkspaceTerminalProcessLifecyclesForLiveRead(project_index);
     if (!force and workspaceProcessConflictCount(state, project_index, owner, resources.items()) > 0) {
         return try workspaceCheckCommandResponse(allocator, id_value, state, params, true);
     }

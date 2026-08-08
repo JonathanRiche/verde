@@ -30,6 +30,12 @@ const cli_output = @import("cli/output.zig");
 const chat_controller = @import("state/chat_controller.zig");
 const chat_types = @import("state/chat_types.zig");
 const live_endpoint = @import("platform/live_endpoint.zig");
+// M5-P4: the REAL desktop cursor/session plumbing (Storage.noteChangesResult /
+// noteCompositeSnapshotSeed / snapshot-fallback invalidation) exercised against
+// a genuine daemon over the wire. Safe to import here: the IT binary links the
+// full SDL3 module set, and only initWithPrefPath (no SDL pref-path lookup) is
+// used.
+const state_storage = @import("state/storage.zig");
 
 /// PTY / process-group / Unix-signal scenarios (forkpty, waitpid, kill(pid,0)).
 const posix_pty_supported = switch (builtin.os.tag) {
@@ -212,6 +218,11 @@ pub fn main(init: std.process.Init) !void {
     // requests + threads only, no PTY).
     try runM5LongPollWakeScenario(allocator, io); // park → journal-append wake + Q7 over-cap heartbeat
     try runM5LongPollDrainScenario(allocator, io); // prepare/drain wakes parked waiter with structured response
+    // M5-P4 desktop read flip (Windows-safe: wire + std threads only): the
+    // REAL Storage cursor plumbing (seed/advance/expiry-fallback/#27 nonce
+    // resync) and the amendment 1.2 workspace-level belt across a flush.
+    try runM5P4DesktopCursorPlumbingScenario(allocator, io);
+    try runM5P4WorkspaceBeltScenario(allocator, io);
 
     // Extended store scenarios (POSIX only): full surface + S4 fault/busy/crash pins.
     // Transport-tier primitives, but not part of the Windows-safe subset.
@@ -3589,6 +3600,99 @@ fn runM5ChangesJournalScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         found_wipe_batch = true;
     }
     if (!found_wipe_batch) return error.M5ChangesWipeBatchEntryMissing;
+
+    // Amendment 3 arm (M5-P4, from M5-P3 verify MAJOR): the SAME wipe must be
+    // observable through TOPIC-FILTERED cursors that exclude `workspace`.
+    // Pre-fix the wipe journaled only the workspace-topic "*" entry, so a
+    // {surface} or {chat.thread, chat.completion} cursor crossed the replace
+    // blind and stayed stale forever.
+    const surface_only = [_][]const u8{"surface"};
+    const wipe_surface_req: headless.changes_protocol.ChangesRequest = .{
+        .cursor = surface_poll_result.next_cursor,
+        .topics = &surface_only,
+    };
+    var wipe_surface = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, wipe_surface_req);
+    defer wipe_surface.deinit();
+    if (!wipe_surface.response.isOk()) return error.M5ChangesA3SurfaceFilterFailed;
+    const wipe_surface_result = try client.decodeChanges(&wipe_surface);
+    var found_surface_star = false;
+    for (wipe_surface_result.entries) |entry| {
+        if (!std.mem.eql(u8, entry.topic, "surface")) return error.M5ChangesA3SurfaceFilterLeaked;
+        if (std.mem.eql(u8, entry.resource_id, "*") and (entry.store_revision orelse 0) == wipe_write.store_revision) {
+            found_surface_star = true;
+        }
+    }
+    if (!found_surface_star) return error.M5ChangesA3SurfaceStarMissing;
+
+    const chat_topics = [_][]const u8{ "chat.thread", "chat.completion" };
+    const wipe_chat_req: headless.changes_protocol.ChangesRequest = .{
+        .cursor = surface_poll_result.next_cursor,
+        .topics = &chat_topics,
+    };
+    var wipe_chat = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, wipe_chat_req);
+    defer wipe_chat.deinit();
+    if (!wipe_chat.response.isOk()) return error.M5ChangesA3ChatFilterFailed;
+    const wipe_chat_result = try client.decodeChanges(&wipe_chat);
+    var found_thread_star = false;
+    var found_completion_star = false;
+    for (wipe_chat_result.entries) |entry| {
+        if (!std.mem.eql(u8, entry.resource_id, "*")) return error.M5ChangesA3ChatUnexpectedEntry;
+        if ((entry.store_revision orelse 0) != wipe_write.store_revision) return error.M5ChangesA3ChatRevision;
+        if (std.mem.eql(u8, entry.topic, "chat.thread")) found_thread_star = true;
+        if (std.mem.eql(u8, entry.topic, "chat.completion")) found_completion_star = true;
+    }
+    if (!found_thread_star or !found_completion_star) return error.M5ChangesA3ChatStarMissing;
+
+    // Carried-surface half of the fix: a NON-empty replace journals each
+    // carried surface_state per-resource (matching the surface_upsert arm),
+    // so a {surface} cursor sees the identity, not just the batch marker.
+    const carried_surfaces = [_]headless.store.SurfaceState{.{
+        .session_id = "m5-changes-surface-2",
+        .workspace_id = "m5-changes-ws",
+        .status = "working",
+        .title = "amendment 3 carried surface",
+    }};
+    const carried_workspaces = [_]headless.store.Workspace{.{
+        .workspace_id = "m5-changes-ws",
+        .label = "M5 changes",
+        .path = pref_path,
+    }};
+    const carry: headless.store.SnapshotReplaceRequest = .{
+        .mutation = .{
+            .request_key = "m5-changes-carry",
+            .client_id = client_id,
+            .expected_store_revision = wipe_write.store_revision,
+        },
+        .snapshot = .{
+            .schema_version = 1,
+            .workspaces = &carried_workspaces,
+            .surface_states = &carried_surfaces,
+        },
+        .bootstrap = false,
+    };
+    var carry_parsed = try client.call(headless.store.METHOD_STATE_SNAPSHOT_REPLACE, carry);
+    defer carry_parsed.deinit();
+    if (!carry_parsed.response.isOk()) return error.M5ChangesA3CarryFailed;
+    const carry_write = try client.decodeWriteResult(&carry_parsed);
+    if (!carry_write.applied) return error.M5ChangesA3CarryNotApplied;
+
+    const carry_surface_req: headless.changes_protocol.ChangesRequest = .{
+        .cursor = wipe_poll_result.next_cursor,
+        .topics = &surface_only,
+    };
+    var carry_surface = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, carry_surface_req);
+    defer carry_surface.deinit();
+    if (!carry_surface.response.isOk()) return error.M5ChangesA3CarryPollFailed;
+    const carry_surface_result = try client.decodeChanges(&carry_surface);
+    var found_carried_surface = false;
+    for (carry_surface_result.entries) |entry| {
+        if (!std.mem.eql(u8, entry.topic, "surface")) return error.M5ChangesA3CarryFilterLeaked;
+        if (std.mem.eql(u8, entry.resource_id, "m5-changes-surface-2")) {
+            if ((entry.store_revision orelse 0) != carry_write.store_revision) return error.M5ChangesA3CarryRevision;
+            found_carried_surface = true;
+        }
+    }
+    if (!found_carried_surface) return error.M5ChangesA3CarriedSurfaceMissing;
 }
 
 /// M5-P2 scenario 2: composite core.snapshot coherence — the store half and
@@ -4460,6 +4564,472 @@ fn runM5LongPollDrainScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     }
 
     _ = waitChildBounded(&child, io, 10_000) catch {};
+}
+
+/// M5-P4: the REAL desktop-side cursor plumbing (state/storage.zig) driven by
+/// genuine wire results — bootstrap seed, incremental advance, journal-expiry
+/// snapshot fallback, and the daemon-replacement nonce resync (#27: the
+/// client-side nonce rule is the ONLY guard against a stale cross-instance
+/// cursor receiving a valid-looking ok heartbeat with a regressed
+/// next_cursor).
+fn runM5P4DesktopCursorPlumbingScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m5p4-cursor");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    // Backslash-safe on Windows; same join used for state.sqlite below.
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    // The desktop Storage under test survives the daemon replacement below —
+    // its nonce/cursor state is exactly what phase C invalidates.
+    var storage = try state_storage.Storage.initWithPrefPath(allocator, pref_path);
+    defer storage.deinit();
+
+    // Cap the ring at 4 entries so phase B can push the floor past the cursor.
+    {
+        var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+            .journal_entry_cap = "4",
+        });
+        // No defer kill: prepareShutdown should exit the child. Kill on bare-try
+        // unwind until prepare is accepted (pre-prepare orphan holds the endpoint).
+        var kill_on_unwind = true;
+        errdefer if (kill_on_unwind) child.kill(io);
+
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+        var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+        defer register_parsed.deinit();
+        if (!register_parsed.response.isOk()) return error.M5P4CursorRegisterFailed;
+        const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+        {
+            const upsert: headless.store.WorkspaceUpsertRequest = .{
+                .mutation = .{ .request_key = "m5p4-cursor-ws-1", .client_id = client_id, .expected_store_revision = 0 },
+                .workspace = .{ .workspace_id = "m5p4-cursor-ws-1", .label = "M5P4 cursor", .path = pref_path },
+            };
+            var parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, upsert);
+            defer parsed.deinit();
+            if (!parsed.response.isOk()) return error.M5P4CursorSeedUpsertFailed;
+            const result = try client.decodeWriteResult(&parsed);
+            if (!result.applied or result.store_revision != 1) return error.M5P4CursorSeedUpsertRevision;
+        }
+
+        // Phase A: one composite snapshot seeds the cursor (design: startup is
+        // exactly ONE core.snapshot, then the change-cursor loop).
+        {
+            const scopes = [_][]const u8{
+                headless.store.SNAPSHOT_SCOPE_STORE,
+                headless.store.SNAPSHOT_SCOPE_REGISTRY,
+                headless.store.SNAPSHOT_SCOPE_SESSIONS,
+                headless.store.SNAPSHOT_SCOPE_TURNS,
+            };
+            const snap_req: headless.store.CoreSnapshotRequest = .{ .scopes = &scopes };
+            var snap = try client.call(headless.store.METHOD_CORE_SNAPSHOT, snap_req);
+            defer snap.deinit();
+            if (!snap.response.isOk()) return error.M5P4CursorSnapshotFailed;
+            const snap_result = try client.decodeCompositeSnapshot(&snap);
+            // Q9: production never converts onto a chat-incomplete snapshot.
+            if (snap_result.incomplete_scopes.len != 0) return error.M5P4CursorSnapshotIncomplete;
+            const envelope = snap_result.envelope orelse return error.M5P4CursorSnapshotMissingEnvelope;
+            const seed_cursor = snap_result.change_cursor orelse return error.M5P4CursorSnapshotMissingCursor;
+            if (snap_result.store_revision != 1) return error.M5P4CursorSnapshotRevision;
+            try storage.noteCompositeSnapshotSeed(envelope, seed_cursor, snap_result.store_revision);
+            if ((storage.currentChangeCursorForPoll() orelse return error.M5P4CursorSeedNotAdopted) != seed_cursor)
+                return error.M5P4CursorSeedMismatch;
+            if (storage.currentStoreRevision() != 1) return error.M5P4CursorSeedStoreRevision;
+        }
+
+        // Phase A: an incremental commit advances the cursor through
+        // Storage.noteChangesResult (no snapshot, no instance change).
+        {
+            const upsert: headless.store.WorkspaceUpsertRequest = .{
+                .mutation = .{ .request_key = "m5p4-cursor-ws-2", .client_id = client_id, .expected_store_revision = 1 },
+                .workspace = .{ .workspace_id = "m5p4-cursor-ws-2", .label = "M5P4 cursor", .path = pref_path },
+            };
+            var parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, upsert);
+            defer parsed.deinit();
+            if (!parsed.response.isOk()) return error.M5P4CursorAdvanceUpsertFailed;
+            const result = try client.decodeWriteResult(&parsed);
+            if (!result.applied or result.store_revision != 2) return error.M5P4CursorAdvanceUpsertRevision;
+
+            const cursor = storage.currentChangeCursorForPoll() orelse return error.M5P4CursorLostBeforeAdvance;
+            const req: headless.changes_protocol.ChangesRequest = .{ .cursor = cursor };
+            var changes = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, req);
+            defer changes.deinit();
+            if (!changes.response.isOk()) return error.M5P4CursorAdvancePollFailed;
+            const changes_result = try client.decodeChanges(&changes);
+            if (changes_result.entries.len != 1) return error.M5P4CursorAdvanceEntryCount;
+            if (!std.mem.eql(u8, changes_result.entries[0].topic, "workspace")) return error.M5P4CursorAdvanceTopic;
+            const outcome = storage.noteChangesResult(changes_result);
+            if (outcome.snapshot_required or outcome.instance_changed) return error.M5P4CursorAdvanceSpuriousReset;
+            if ((storage.currentChangeCursorForPoll() orelse return error.M5P4CursorAdvanceNotAdopted) != changes_result.next_cursor)
+                return error.M5P4CursorAdvanceMismatch;
+            if (storage.currentStoreRevision() != 2) return error.M5P4CursorAdvanceStoreRevision;
+        }
+
+        // Phase B: five more commits overflow the capped ring; the stale
+        // desktop cursor gets the structured revision_expired error and falls
+        // back through exactly one composite snapshot.
+        var commit_index: u64 = 0;
+        while (commit_index < 5) : (commit_index += 1) {
+            var key_buf: [48]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "m5p4-cursor-exp-{d}", .{commit_index});
+            const req: headless.store.WorkspaceUpsertRequest = .{
+                .mutation = .{ .request_key = key, .client_id = client_id, .expected_store_revision = commit_index + 2 },
+                .workspace = .{ .workspace_id = key, .label = "M5P4 cursor", .path = pref_path },
+            };
+            var parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, req);
+            defer parsed.deinit();
+            if (!parsed.response.isOk()) return error.M5P4CursorOverflowUpsertFailed;
+            const result = try client.decodeWriteResult(&parsed);
+            if (!result.applied or result.store_revision != commit_index + 3) return error.M5P4CursorOverflowUpsertRevision;
+        }
+        {
+            const stale_cursor = storage.currentChangeCursorForPoll() orelse return error.M5P4CursorLostBeforeExpiry;
+            const req: headless.changes_protocol.ChangesRequest = .{ .cursor = stale_cursor };
+            var stale = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, req);
+            defer stale.deinit();
+            if (stale.response.isOk()) return error.M5P4CursorExpiryNotRejected;
+            const stale_err = stale.response.err orelse return error.M5P4CursorExpiryMissingError;
+            if (!std.mem.eql(u8, stale_err.code, headless.protocol.ERR_REVISION_EXPIRED)) return error.M5P4CursorExpiryWrongCode;
+            // Q7/desktop rule: a structured expiry converts into exactly one
+            // snapshot fallback (cursor cleared, next poll must reseed).
+            storage.invalidateChangeCursorForSnapshotFallback();
+            if (storage.currentChangeCursorForPoll() != null) return error.M5P4CursorExpiryNotInvalidated;
+        }
+        {
+            const scopes = [_][]const u8{
+                headless.store.SNAPSHOT_SCOPE_STORE,
+                headless.store.SNAPSHOT_SCOPE_REGISTRY,
+            };
+            const snap_req: headless.store.CoreSnapshotRequest = .{ .scopes = &scopes };
+            var snap = try client.call(headless.store.METHOD_CORE_SNAPSHOT, snap_req);
+            defer snap.deinit();
+            if (!snap.response.isOk()) return error.M5P4CursorReseedSnapshotFailed;
+            const snap_result = try client.decodeCompositeSnapshot(&snap);
+            const envelope = snap_result.envelope orelse return error.M5P4CursorReseedMissingEnvelope;
+            const reseed_cursor = snap_result.change_cursor orelse return error.M5P4CursorReseedMissingCursor;
+            try storage.noteCompositeSnapshotSeed(envelope, reseed_cursor, snap_result.store_revision);
+
+            const upsert: headless.store.WorkspaceUpsertRequest = .{
+                .mutation = .{ .request_key = "m5p4-cursor-resume", .client_id = client_id, .expected_store_revision = 7 },
+                .workspace = .{ .workspace_id = "m5p4-cursor-resume", .label = "M5P4 cursor", .path = pref_path },
+            };
+            var parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, upsert);
+            defer parsed.deinit();
+            if (!parsed.response.isOk()) return error.M5P4CursorResumeUpsertFailed;
+            const result = try client.decodeWriteResult(&parsed);
+            if (!result.applied or result.store_revision != 8) return error.M5P4CursorResumeUpsertRevision;
+
+            const cursor = storage.currentChangeCursorForPoll() orelse return error.M5P4CursorLostAfterReseed;
+            const req: headless.changes_protocol.ChangesRequest = .{ .cursor = cursor };
+            var changes = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, req);
+            defer changes.deinit();
+            if (!changes.response.isOk()) return error.M5P4CursorResumePollFailed;
+            const changes_result = try client.decodeChanges(&changes);
+            if (changes_result.entries.len != 1) return error.M5P4CursorResumeEntryCount;
+            const outcome = storage.noteChangesResult(changes_result);
+            if (outcome.snapshot_required or outcome.instance_changed) return error.M5P4CursorResumeSpuriousReset;
+            if (storage.currentStoreRevision() != 8) return error.M5P4CursorResumeStoreRevision;
+        }
+
+        var prepare = try client.call("daemon.prepareShutdown", .{});
+        defer prepare.deinit();
+        if (!prepare.response.isOk()) return error.M5P4CursorPrepareFailed;
+        const prepare_result = prepare.arena_parsed.value.object.get("result") orelse
+            return error.M5P4CursorPrepareNotAccepted;
+        const accepted = prepare_result.object.get("accepted") orelse
+            return error.M5P4CursorPrepareNotAccepted;
+        if (accepted != .bool or !accepted.bool) return error.M5P4CursorPrepareNotAccepted;
+        kill_on_unwind = false;
+
+        // Exit-wait uses the same connect-class discrimination as the durable
+        // reopen scenario: probes may still succeed while the drain completes.
+        var exited = false;
+        var attempts: usize = 0;
+        while (attempts < 100) : (attempts += 1) {
+            if (sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
+                allocator.free(response);
+                std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+                continue;
+            } else |err| {
+                if (isConnectClassError(err)) {
+                    exited = true;
+                    break;
+                }
+                std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+            }
+        }
+        if (!exited) {
+            child.kill(io);
+            return error.M5P4CursorDaemonDidNotExit;
+        }
+        _ = child.wait(io) catch {};
+    }
+
+    // Phase C (#27): successor on the SAME store. The stale desktop cursor
+    // receives a valid-looking .ok heartbeat whose next_cursor regressed —
+    // ONLY the client-side nonce rule (advanceChangeCursor via
+    // Storage.noteChangesResult) forces the snapshot resync.
+    {
+        var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+            .journal_entry_cap = "4",
+        });
+        defer child.kill(io);
+
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+        const stale_cursor = storage.currentChangeCursorForPoll() orelse return error.M5P4CursorLostBeforeReplace;
+        const req: headless.changes_protocol.ChangesRequest = .{ .cursor = stale_cursor };
+        var poll = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, req);
+        defer poll.deinit();
+        if (!poll.response.isOk()) return error.M5P4CursorReplacePollFailed;
+        const poll_result = try client.decodeChanges(&poll);
+        // The wire reply itself looks healthy: ok heartbeat, no expiry flag.
+        if (!poll_result.heartbeat or poll_result.expired) return error.M5P4CursorReplaceNotHeartbeat;
+        if (poll_result.next_cursor >= stale_cursor) return error.M5P4CursorReplaceCursorNotRegressed;
+        const outcome = storage.noteChangesResult(poll_result);
+        if (!outcome.instance_changed) return error.M5P4CursorReplaceNonceNotDetected;
+        if (!outcome.snapshot_required) return error.M5P4CursorReplaceNoSnapshotRequired;
+        if (storage.currentChangeCursorForPoll() != null) return error.M5P4CursorReplaceCursorKept;
+        // Durable revision is globally monotonic across instances (drain
+        // transfer adds one on top of the pre-replacement mutation revision).
+        if (storage.currentStoreRevision() < 8) return error.M5P4CursorReplaceRevisionLost;
+
+        // Resync: one composite snapshot under the successor nonce, then the
+        // cursor loop resumes cleanly.
+        var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+        defer register_parsed.deinit();
+        if (!register_parsed.response.isOk()) return error.M5P4CursorReplaceRegisterFailed;
+        const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+        const scopes = [_][]const u8{
+            headless.store.SNAPSHOT_SCOPE_STORE,
+            headless.store.SNAPSHOT_SCOPE_REGISTRY,
+        };
+        const snap_req: headless.store.CoreSnapshotRequest = .{ .scopes = &scopes };
+        var snap = try client.call(headless.store.METHOD_CORE_SNAPSHOT, snap_req);
+        defer snap.deinit();
+        if (!snap.response.isOk()) return error.M5P4CursorReplaceSnapshotFailed;
+        const snap_result = try client.decodeCompositeSnapshot(&snap);
+        const envelope = snap_result.envelope orelse return error.M5P4CursorReplaceMissingEnvelope;
+        const reseed_cursor = snap_result.change_cursor orelse return error.M5P4CursorReplaceMissingCursor;
+        try storage.noteCompositeSnapshotSeed(envelope, reseed_cursor, snap_result.store_revision);
+
+        const upsert: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{
+                .request_key = "m5p4-cursor-successor",
+                .client_id = client_id,
+                .expected_store_revision = snap_result.store_revision,
+            },
+            .workspace = .{ .workspace_id = "m5p4-cursor-successor", .label = "M5P4 cursor", .path = pref_path },
+        };
+        var upsert_parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, upsert);
+        defer upsert_parsed.deinit();
+        if (!upsert_parsed.response.isOk()) return error.M5P4CursorSuccessorUpsertFailed;
+        const upsert_result = try client.decodeWriteResult(&upsert_parsed);
+        if (!upsert_result.applied) return error.M5P4CursorSuccessorUpsertNotApplied;
+
+        const cursor = storage.currentChangeCursorForPoll() orelse return error.M5P4CursorLostAfterReplaceReseed;
+        const resume_req: headless.changes_protocol.ChangesRequest = .{ .cursor = cursor };
+        var resumed = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, resume_req);
+        defer resumed.deinit();
+        if (!resumed.response.isOk()) return error.M5P4CursorSuccessorPollFailed;
+        const resumed_result = try client.decodeChanges(&resumed);
+        if (resumed_result.entries.len != 1) return error.M5P4CursorSuccessorEntryCount;
+        const resumed_outcome = storage.noteChangesResult(resumed_result);
+        if (resumed_outcome.snapshot_required or resumed_outcome.instance_changed) return error.M5P4CursorSuccessorSpuriousReset;
+        if (storage.currentStoreRevision() != upsert_result.store_revision) return error.M5P4CursorSuccessorStoreRevision;
+    }
+}
+
+/// M5-P4 amendment 1.2: the workspace-level belt over the wire. A workspace
+/// holding daemon-committed turns survives a snapshot_replace flush that
+/// omits it (restored with its committed transcript, ledger resolvable),
+/// while a plain workspace omitted from the same flush is deleted normally.
+fn runM5P4WorkspaceBeltScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m5p4-belt");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+        .chat_stub = true,
+    });
+    var kill_on_unwind = true;
+    errdefer if (kill_on_unwind) child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer register_parsed.deinit();
+    if (!register_parsed.response.isOk()) return error.M5P4BeltRegisterFailed;
+    const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+    // A plain workspace with NO committed turns: the belt must not shield it.
+    {
+        const upsert: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{ .request_key = "m5p4-belt-plain", .client_id = client_id, .expected_store_revision = 0 },
+            .workspace = .{ .workspace_id = "ws-belt-plain", .label = "Belt plain", .path = pref_path },
+        };
+        var parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, upsert);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.M5P4BeltPlainUpsertFailed;
+        const result = try client.decodeWriteResult(&parsed);
+        if (!result.applied) return error.M5P4BeltPlainUpsertNotApplied;
+    }
+
+    // A daemon-committed stub turn creates ws-belt-it + thread + transcript +
+    // ledger row (committed_store_revision) entirely daemon-side.
+    try startStubChatTurn(
+        &client,
+        "turn-belt-1",
+        "ws-belt-it",
+        "thread-belt-it",
+        pref_path,
+        "belt survival",
+        "user-belt-1",
+    );
+    try waitChatTurnTerminal(io, &client, "turn-belt-1", true);
+    try consumeChatTurn(&client, "turn-belt-1");
+
+    // Pin the durable revision for the guarded flush.
+    var status_parsed = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, .{});
+    defer status_parsed.deinit();
+    if (!status_parsed.response.isOk()) return error.M5P4BeltStatusFailed;
+    const status_result = status_parsed.response.result orelse return error.M5P4BeltStatusMissing;
+    const revision_value = status_result.object.get("store_revision") orelse return error.M5P4BeltStatusMissingRevision;
+    if (revision_value != .integer) return error.M5P4BeltStatusMalformed;
+    const flush_expected: u64 = @intCast(revision_value.integer);
+
+    // GUI-style flush that OMITS both ws-belt-it (committed turns) and
+    // ws-belt-plain (no turns), carrying only an unrelated workspace.
+    {
+        const flush: headless.store.SnapshotReplaceRequest = .{
+            .mutation = .{
+                .request_key = "m5p4-belt-flush",
+                .client_id = client_id,
+                .expected_store_revision = flush_expected,
+            },
+            .snapshot = .{
+                .workspaces = &.{
+                    .{ .workspace_id = "ws-belt-other", .label = "Belt other", .path = pref_path },
+                },
+            },
+        };
+        var parsed = try client.call(headless.store.METHOD_STATE_SNAPSHOT_REPLACE, flush);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.M5P4BeltFlushFailed;
+        const result = try client.decodeWriteResult(&parsed);
+        if (!result.applied or result.store_revision != flush_expected + 1) return error.M5P4BeltFlushRevision;
+    }
+
+    // Wire read: the belt restored ws-belt-it with its committed transcript;
+    // ws-belt-plain was deleted normally; ws-belt-other was carried.
+    {
+        const scopes = [_][]const u8{headless.store.SNAPSHOT_SCOPE_STORE};
+        const snap_req: headless.store.CoreSnapshotRequest = .{ .scopes = &scopes };
+        var snap = try client.call(headless.store.METHOD_CORE_SNAPSHOT, snap_req);
+        defer snap.deinit();
+        if (!snap.response.isOk()) return error.M5P4BeltSnapshotFailed;
+        const snap_result = try client.decodeCompositeSnapshot(&snap);
+        var saw_belt = false;
+        var saw_other = false;
+        for (snap_result.snapshot.workspaces) |workspace| {
+            if (std.mem.eql(u8, workspace.workspace_id, "ws-belt-plain")) return error.M5P4BeltPlainSurvived;
+            if (std.mem.eql(u8, workspace.workspace_id, "ws-belt-other")) saw_other = true;
+            if (std.mem.eql(u8, workspace.workspace_id, "ws-belt-it")) {
+                saw_belt = true;
+                var saw_thread = false;
+                for (workspace.threads) |thread| {
+                    if (!std.mem.eql(u8, thread.local_thread_id, "thread-belt-it")) continue;
+                    saw_thread = true;
+                    // Stub turn commits user prompt + assistant reply.
+                    if (thread.messages.len < 2) return error.M5P4BeltTranscriptLost;
+                }
+                if (!saw_thread) return error.M5P4BeltThreadLost;
+            }
+        }
+        if (!saw_belt) return error.M5P4BeltWorkspaceLost;
+        if (!saw_other) return error.M5P4BeltCarriedWorkspaceLost;
+    }
+
+    // Prepare + exit so the RO reopen below sees the finalized store.
+    var prepare = try client.call("daemon.prepareShutdown", .{});
+    defer prepare.deinit();
+    if (!prepare.response.isOk()) return error.M5P4BeltPrepareFailed;
+    kill_on_unwind = false;
+    _ = child.wait(io) catch {};
+
+    // Durable half: the ledger row still resolves to a real message row
+    // (the belt's whole point — no dangling committed receipts).
+    const db_path = try std.fs.path.join(allocator, &.{ store_dir, "state.sqlite" });
+    defer allocator.free(db_path);
+    const db_path_z = try allocator.dupeZ(u8, db_path);
+    defer allocator.free(db_path_z);
+    var conn = try zqlite.open(db_path_z, zqlite.OpenFlags.ReadOnly | zqlite.OpenFlags.EXResCode);
+    defer conn.close();
+
+    {
+        const row = (try conn.row(
+            "select count(*) from chat_turns ct join messages m on m.message_id = ct.user_message_id where ct.turn_id = 'turn-belt-1' and ct.committed_store_revision is not null",
+            .{},
+        )) orelse return error.M5P4BeltLedgerRowMissing;
+        defer row.deinit();
+        if (row.int(0) != 1) return error.M5P4BeltLedgerDangling;
+    }
+    {
+        const row = (try conn.row("select count(*) from workspaces where workspace_id = 'ws-belt-it'", .{})) orelse
+            return error.M5P4BeltDurableRowMissing;
+        defer row.deinit();
+        if (row.int(0) != 1) return error.M5P4BeltDurableWorkspaceMissing;
+    }
+    {
+        const row = (try conn.row("select count(*) from workspaces where workspace_id = 'ws-belt-plain'", .{})) orelse
+            return error.M5P4BeltDurableRowMissing;
+        defer row.deinit();
+        if (row.int(0) != 0) return error.M5P4BeltDurablePlainSurvived;
+    }
 }
 
 /// Bounded serial queueing under a slow store commit (commit_stall).
@@ -5726,6 +6296,55 @@ fn runChatCommitFaultRetryScenario(allocator: std.mem.Allocator, io: std.Io) !vo
     if (!saw_error_window) return error.ChatCommitFaultMissedErrorWindow;
 
     try consumeChatTurn(&client, "turn-fault-1");
+
+    // PENDING_FIXES #26 (runtime journal arm): fail_once fires BEFORE SQLite,
+    // so only the successful retry reaches storeTurnCommittedHook — the
+    // journal must carry EXACTLY one chat.turn / chat.thread / chat.completion
+    // entry for this turn (replayed duplicate receipts return before the
+    // hook and cannot double-journal).
+    {
+        const changes_req: headless.changes_protocol.ChangesRequest = .{ .cursor = 0 };
+        var changes = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, changes_req);
+        defer changes.deinit();
+        if (!changes.response.isOk()) return error.ChatCommitFaultChangesFailed;
+        const changes_result = try client.decodeChanges(&changes);
+        // Acceptance staging legitimately journals its own workspace/thread
+        // upserts at earlier revisions; the #26 exactly-once property is
+        // scoped to the COMMIT revision — the one the single chat.turn entry
+        // carries.
+        var turn_entries: usize = 0;
+        var commit_revision: ?u64 = null;
+        for (changes_result.entries) |entry| {
+            if (std.mem.eql(u8, entry.topic, "chat.turn") and
+                std.mem.eql(u8, entry.resource_id, "turn-fault-1"))
+            {
+                turn_entries += 1;
+                commit_revision = entry.store_revision;
+            }
+        }
+        var thread_entries: usize = 0;
+        var completion_entries: usize = 0;
+        for (changes_result.entries) |entry| {
+            if (entry.store_revision == null or commit_revision == null or
+                entry.store_revision.? != commit_revision.?) continue;
+            if (std.mem.eql(u8, entry.topic, "chat.thread") and
+                std.mem.eql(u8, entry.resource_id, "thread-fault")) thread_entries += 1;
+            if (std.mem.eql(u8, entry.topic, "chat.completion") and
+                std.mem.eql(u8, entry.resource_id, "thread-fault")) completion_entries += 1;
+        }
+        if (turn_entries != 1 or thread_entries != 1 or completion_entries != 1) {
+            // Diagnostic dump so a count regression names the extra appender.
+            for (changes_result.entries) |entry| {
+                std.debug.print(
+                    "headless-daemon-it: #26 journal entry topic={s} resource={s} store_rev={?d} registry_rev={?d}\n",
+                    .{ entry.topic, entry.resource_id, entry.store_revision, entry.registry_revision },
+                );
+            }
+        }
+        if (turn_entries != 1) return error.ChatCommitFaultTurnJournalCount;
+        if (thread_entries != 1) return error.ChatCommitFaultThreadJournalCount;
+        if (completion_entries != 1) return error.ChatCommitFaultCompletionJournalCount;
+    }
 
     var prepare = try client.call("daemon.prepareShutdown", .{});
     defer prepare.deinit();

@@ -30,6 +30,7 @@ const slash_commands = @import("chat/slash_commands.zig");
 const stack_config = @import("workspace/stack.zig");
 const stb_image = @import("media/stb_image.zig");
 const sessionizer = @import("terminal/sessionizer.zig");
+const headless = @import("headless");
 const terminal = @import("terminal/terminal.zig");
 const theme = @import("ui/theme.zig");
 const text_measure = @import("ui/text_measure.zig");
@@ -68,6 +69,220 @@ const MANAGED_PROCESS_MAX_RESTART_BACKOFF_MS: i64 = 30000;
 const MANAGED_PROCESS_WATCH_SCAN_MS: i64 = 1000;
 const MANAGED_PROCESS_WATCH_DEBOUNCE_MS: i64 = 500;
 const EXTERNAL_OPEN_CLOSE_SUPPRESS_MS: i64 = 2000;
+
+// ---------------------------------------------------------------------------
+// M5-P4 change-cursor loop (desktop read flip).
+//
+// One background thread owns ALL blocking daemon I/O for change tracking:
+// startup issues a single composite core.snapshot, then long-polls
+// core.changes from the seeded cursor. Results are marshaled to the SDL main
+// loop as coalesced boolean signals that the frame-driven pollSend drain
+// consumes — the thread never touches AppState, so the frame loop can never
+// block on a stalled daemon (it just keeps rendering the last synced state).
+// ---------------------------------------------------------------------------
+
+/// Long-poll budget per core.changes call. Kept under the 5s sessionizer
+/// transport timeout so a full-length heartbeat never reads as a failure.
+const CHANGE_CURSOR_WAIT_MS: u32 = 4_000;
+const CHANGE_CURSOR_RETRY_MIN_MS: u64 = 250;
+const CHANGE_CURSOR_RETRY_MAX_MS: u64 = 5_000;
+/// Q7: daemon `invalid_state` marks an over-budget waiter pool ("busy") and
+/// is retried like a heartbeat, just without the long-poll credit.
+const CHANGE_CURSOR_BUSY_RETRY_MS: u64 = 250;
+/// Shutdown-responsive sleep granularity for the loop thread.
+const CHANGE_CURSOR_SHUTDOWN_SLICE_MS: u64 = 50;
+/// Projection staleness horizon: two full long-poll rounds plus slack. Past
+/// this without an accepted result the sidebar shows the stale indicator.
+pub const CHANGE_CURSOR_STALE_AFTER_MS: i64 = 2 * @as(i64, CHANGE_CURSOR_WAIT_MS) + 2_000;
+
+/// Coalesced main-loop refresh signals derived from change-journal entries.
+pub const ChangeCursorSignals = struct {
+    /// Registry/workspace-plane resources changed (workspace, surface,
+    /// process, lease, session, notification): run the M2-P3 pull path.
+    registry: bool = false,
+    /// Chat-plane resources changed (chat.thread, chat.turn,
+    /// chat.completion): run the adoption sweep + ledger re-checks.
+    chat: bool = false,
+    /// Cursor was reseeded through a composite snapshot (expiry or daemon
+    /// replacement): refresh both planes from the new basis.
+    resync: bool = false,
+
+    pub fn any(self: ChangeCursorSignals) bool {
+        return self.registry or self.chat or self.resync;
+    }
+
+    pub fn merge(self: *ChangeCursorSignals, other: ChangeCursorSignals) void {
+        self.registry = self.registry or other.registry;
+        self.chat = self.chat or other.chat;
+        self.resync = self.resync or other.resync;
+    }
+};
+
+/// Shared bridge between the cursor-loop thread and the SDL main loop. The
+/// thread only ever publishes signals here; the main loop drains them once
+/// per frame from pollSend. Field addresses must be stable before spawn, so
+/// the loop is lazily started from the first frame (AppState.init returns by
+/// value and cannot hand out durable pointers to itself).
+pub const ChangeCursorLoopState = struct {
+    worker: ?std.Thread = null,
+    shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    mutex: Mutex = .{},
+    pending: ChangeCursorSignals = .{},
+
+    pub fn publish(self: *ChangeCursorLoopState, signals: ChangeCursorSignals) void {
+        if (!signals.any()) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.pending.merge(signals);
+    }
+
+    pub fn take(self: *ChangeCursorLoopState) ChangeCursorSignals {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const out = self.pending;
+        self.pending = .{};
+        return out;
+    }
+
+    /// Flag-only: lets an in-flight long-poll drain concurrently with the
+    /// rest of deinit before the blocking join happens.
+    pub fn beginShutdown(self: *ChangeCursorLoopState) void {
+        self.shutdown.store(true, .release);
+    }
+
+    pub fn join(self: *ChangeCursorLoopState) void {
+        self.beginShutdown();
+        if (self.worker) |worker| {
+            worker.join();
+            self.worker = null;
+        }
+    }
+};
+
+/// Map one frozen change-journal topic (m4m5_decisions Q10 nine-topic set)
+/// onto the desktop refresh plane it converts into. Unknown topics refresh
+/// the registry plane conservatively so future additive topics degrade to a
+/// harmless extra pull instead of a silent gap.
+fn changeCursorSignalsForTopic(topic: []const u8) ChangeCursorSignals {
+    if (std.mem.eql(u8, topic, "chat.thread") or
+        std.mem.eql(u8, topic, "chat.turn") or
+        std.mem.eql(u8, topic, "chat.completion"))
+    {
+        return .{ .chat = true };
+    }
+    return .{ .registry = true };
+}
+
+const ChangeCursorPollOutcome = enum { advanced, snapshot_required, busy, unavailable };
+
+/// One core.changes long-poll from the loop thread. Every accepted result —
+/// heartbeats included — flows through Storage.noteChangesResult, whose
+/// PENDING_FIXES #27 nonce compare is the ONLY guard against a replaced
+/// daemon answering a stale cursor with valid-looking regressed heartbeats.
+fn pollCoreChangesOnce(storage: *const Storage, loop: *ChangeCursorLoopState, cursor: u64) ChangeCursorPollOutcome {
+    var decode_arena = std.heap.ArenaAllocator.init(storage.allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = storage.pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+    const request: headless.changes_protocol.ChangesRequest = .{
+        .cursor = cursor,
+        .wait_ms = CHANGE_CURSOR_WAIT_MS,
+    };
+    var parsed = client.call(headless.changes_protocol.METHOD_CORE_CHANGES, request) catch return .unavailable;
+    defer parsed.deinit();
+    if (parsed.response.err) |err| {
+        if (std.mem.eql(u8, err.code, headless.changes_protocol.ERR_REVISION_EXPIRED)) {
+            // Journal expiry arrives as a structured RPC error (never an ok
+            // result): invalidate for exactly one composite-snapshot fallback.
+            storage.invalidateChangeCursorForSnapshotFallback();
+            return .snapshot_required;
+        }
+        if (std.mem.eql(u8, err.code, headless.changes_protocol.ERR_INVALID_STATE)) return .busy;
+        return .unavailable;
+    }
+    const result = client.decodeChanges(&parsed) catch return .unavailable;
+    const outcome = storage.noteChangesResult(result);
+    if (outcome.snapshot_required) {
+        loop.publish(.{ .resync = true });
+        return .snapshot_required;
+    }
+    var signals: ChangeCursorSignals = .{};
+    for (result.entries) |entry| signals.merge(changeCursorSignalsForTopic(entry.topic));
+    loop.publish(signals);
+    return .advanced;
+}
+
+/// The single composite core.snapshot (bootstrap and every fallback). The
+/// daemon captures the journal cursor BEFORE both state reads, so a cursor
+/// seeded from the result can only over-deliver relative to the snapshot.
+fn fetchCompositeSnapshotSeed(storage: *const Storage, loop: *ChangeCursorLoopState) bool {
+    var decode_arena = std.heap.ArenaAllocator.init(storage.allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = storage.pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+    const scopes = [_][]const u8{
+        headless.store.SNAPSHOT_SCOPE_STORE,
+        headless.store.SNAPSHOT_SCOPE_REGISTRY,
+        headless.store.SNAPSHOT_SCOPE_SESSIONS,
+        headless.store.SNAPSHOT_SCOPE_TURNS,
+    };
+    const request: headless.store.CoreSnapshotRequest = .{ .scopes = &scopes };
+    var parsed = client.call(headless.store.METHOD_CORE_SNAPSHOT, request) catch return false;
+    defer parsed.deinit();
+    if (!parsed.response.isOk()) return false;
+    const result = client.decodeCompositeSnapshot(&parsed) catch return false;
+    // Q9: production desktop never converts onto a chat-incomplete snapshot.
+    if (result.incomplete_scopes.len != 0) return false;
+    const envelope = result.envelope orelse return false;
+    const cursor = result.change_cursor orelse return false;
+    storage.noteCompositeSnapshotSeed(envelope, cursor, result.store_revision) catch return false;
+    // A (re)seed means the projection basis changed: refresh both planes.
+    loop.publish(.{ .registry = true, .chat = true, .resync = true });
+    return true;
+}
+
+/// Cursor-loop thread body. Bounded backoff against an absent/stalled daemon
+/// keeps startup non-blocking: the desktop renders its last persisted state
+/// while this thread retries in the background (no local authority claims).
+fn changeCursorLoopMain(storage: *const Storage, loop: *ChangeCursorLoopState) void {
+    var backoff_ms: u64 = CHANGE_CURSOR_RETRY_MIN_MS;
+    while (!loop.shutdown.load(.acquire)) {
+        if (storage.currentChangeCursorForPoll()) |cursor| {
+            switch (pollCoreChangesOnce(storage, loop, cursor)) {
+                .advanced => backoff_ms = CHANGE_CURSOR_RETRY_MIN_MS,
+                // Loop straight around: the fallback snapshot runs on the next
+                // iteration through the null-cursor arm below.
+                .snapshot_required => backoff_ms = CHANGE_CURSOR_RETRY_MIN_MS,
+                .busy => changeCursorSleep(loop, CHANGE_CURSOR_BUSY_RETRY_MS),
+                .unavailable => {
+                    changeCursorSleep(loop, backoff_ms);
+                    backoff_ms = @min(backoff_ms * 2, CHANGE_CURSOR_RETRY_MAX_MS);
+                },
+            }
+        } else if (fetchCompositeSnapshotSeed(storage, loop)) {
+            backoff_ms = CHANGE_CURSOR_RETRY_MIN_MS;
+        } else {
+            changeCursorSleep(loop, backoff_ms);
+            backoff_ms = @min(backoff_ms * 2, CHANGE_CURSOR_RETRY_MAX_MS);
+        }
+    }
+}
+
+fn changeCursorSleep(loop: *ChangeCursorLoopState, total_ms: u64) void {
+    var remaining = total_ms;
+    while (remaining > 0) {
+        if (loop.shutdown.load(.acquire)) return;
+        const slice = @min(remaining, CHANGE_CURSOR_SHUTDOWN_SLICE_MS);
+        platform_runtime.sleepMillis(slice);
+        remaining -= slice;
+    }
+}
 
 pub fn paletteUiTextPrefixWidth(text: []const u8, font_size: f32, end: usize) f32 {
     return text_measure.textPrefixWidth(.ui, text, font_size, end);
@@ -1418,6 +1633,9 @@ const herdrUiFailureMessage = herdr_controller.herdrUiFailureMessage;
 pub const Project = project_state.Project;
 
 pub const Storage = state_storage.Storage;
+/// M5-P4 Amendment 1: display-time filter for committed background
+/// bookkeeping rows (see chat_controller.shouldHideBackgroundTranscriptRow).
+pub const shouldHideBackgroundTranscriptRow = chat_controller.shouldHideBackgroundTranscriptRow;
 
 pub const SendStatus = chat_types.SendStatus;
 pub const FollowupKind = chat_types.FollowupKind;
@@ -1590,6 +1808,11 @@ pub const AppState = struct {
     /// a focused SDL close event back to Verde even though the user only opened
     /// the workspace folder.
     external_open_close_suppress_until_ms: i64,
+    /// M5-P4 change-cursor thread bridge (worker + coalesced signals).
+    /// Defaulted so the loop lazily starts from the first pollSend frame.
+    change_cursor_loop: ChangeCursorLoopState = .{},
+    /// Edge detector for the daemon-projection stale sidebar indicator.
+    daemon_projection_stale_notified: bool = false,
 
     pub const InitOptions = struct {
         gl_texture_uploads_enabled: bool = true,
@@ -1719,7 +1942,11 @@ pub const AppState = struct {
         } else {
             try state.seedDefaultState();
         }
-        state.restoreDaemonChatTurnsOnLaunch();
+        // M5-P4: the launch-time chat.turn.list adoption sweep is now
+        // cursor-triggered — the change-cursor loop's first composite
+        // snapshot publishes a resync signal whose frame drain runs
+        // restoreDaemonChatTurnsOnLaunch (and again on every chat-topic
+        // change entry; the sweep is idempotent per-thread).
         state.loadCursorModelOptionsDiskCache() catch |err| {
             log.warn("failed to load Cursor model cache: {s}", .{@errorName(err)});
             state.clearCursorModelOptions();
@@ -7733,6 +7960,11 @@ pub const AppState = struct {
     pub fn deinit(self: *AppState) void {
         runtime_log.diagnostic("AppState.deinit begin", .{});
         startShutdownWatchdog();
+        // Flag the cursor loop first so an in-flight long-poll (bounded by
+        // the 4s wait budget + 5s transport timeout) drains concurrently with
+        // the shutdown work below; the blocking join happens further down,
+        // inside the 10s watchdog envelope.
+        self.change_cursor_loop.beginShutdown();
         self.preparePendingSendsForShutdown();
         runtime_log.diagnostic("AppState.deinit pending sends prepared", .{});
         self.finishPickerThread();
@@ -7755,6 +7987,8 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit send threads finished", .{});
         self.finishAllTitleGenerationThreads();
         runtime_log.diagnostic("AppState.deinit title generation threads finished", .{});
+        self.change_cursor_loop.join();
+        runtime_log.diagnostic("AppState.deinit change cursor loop joined", .{});
         _ = self.pollSend();
         runtime_log.diagnostic("AppState.deinit sends polled", .{});
         self.chat_controller.deinit(self.allocator);
@@ -7896,7 +8130,88 @@ pub const AppState = struct {
     pub const pollCursorModelOptionsCache = provider_controller.pollCursorModelOptionsCache;
     pub const pollClaudeModelOptionsCache = provider_controller.pollClaudeModelOptionsCache;
 
-    pub const pollSend = chat_controller.pollSend;
+    /// Frame-loop entry point (main.zig calls this every frame): starts the
+    /// M5-P4 change-cursor loop lazily (AppState.init returns by value, so
+    /// the loop-state address is only stable once the caller stored the
+    /// AppState), drains cursor signals into the existing pull paths, then
+    /// runs the unchanged chat send pump.
+    pub fn pollSend(self: *AppState) bool {
+        self.ensureChangeCursorLoopStarted();
+        self.drainChangeCursorSignals();
+        return chat_controller.pollSend(self);
+    }
+
+    fn ensureChangeCursorLoopStarted(self: *AppState) void {
+        if (self.change_cursor_loop.worker != null) return;
+        // Never (re)spawn once shutdown began — deinit's trailing pollSend
+        // drain must not resurrect the thread after the join.
+        if (self.change_cursor_loop.shutdown.load(.acquire)) return;
+        self.change_cursor_loop.worker = std.Thread.spawn(
+            .{},
+            changeCursorLoopMain,
+            .{ self.storage, &self.change_cursor_loop },
+        ) catch |err| {
+            // Retried next frame; until then the projection stays unsynced
+            // and Live reads keep the legacy inline-pull fallback.
+            log.debug("failed to start change-cursor loop: {s}", .{@errorName(err)});
+            return;
+        };
+    }
+
+    /// Main-thread half of the cursor bridge: converts coalesced signals into
+    /// the SAME pull paths the M2-P3 per-read model used (projection
+    /// equivalence by construction), so no daemon I/O ever moves onto a new
+    /// code path — only its trigger changes.
+    fn drainChangeCursorSignals(self: *AppState) void {
+        const signals = self.change_cursor_loop.take();
+        if (self.change_cursor_loop.shutdown.load(.acquire)) return;
+        self.pollDaemonProjectionStaleness();
+        if (signals.registry or signals.resync) {
+            // Cursor-triggered registry pull: pollTerminals consumes the flag
+            // and runs pollWorkspaceTerminalProcessLifecycles per project.
+            self.terminal_controller.daemon_registry_pull_requested = true;
+            self.terminal_controller.poll_requested = true;
+        }
+        if (signals.chat or signals.resync) {
+            // Cursor-triggered launch sweep + ledger re-checks (idempotent:
+            // per-thread guards skip attached/incompatible threads).
+            self.restoreDaemonChatTurnsOnLaunch();
+        }
+    }
+
+    /// Sidebar stale indicator (design: stalled daemon keeps the last synced
+    /// snapshot on screen with an explicit indicator, never local authority).
+    fn pollDaemonProjectionStaleness(self: *AppState) void {
+        if (!self.storage.daemonProjectionEverSynced()) return;
+        const stale = !self.storage.daemonProjectionSyncedWithinMs(
+            platform_runtime.unixTimestampMs(),
+            CHANGE_CURSOR_STALE_AFTER_MS,
+        );
+        if (stale and !self.daemon_projection_stale_notified) {
+            self.daemon_projection_stale_notified = true;
+            self.setSidebarNotice("Daemon sync stalled; showing last synced state.");
+        } else if (!stale) {
+            self.daemon_projection_stale_notified = false;
+        }
+    }
+
+    pub fn isDaemonProjectionStale(self: *AppState) bool {
+        return self.storage.daemonProjectionEverSynced() and
+            !self.storage.daemonProjectionSyncedWithinMs(
+                platform_runtime.unixTimestampMs(),
+                CHANGE_CURSOR_STALE_AFTER_MS,
+            );
+    }
+
+    /// M5-P4 read flip for Live IPC reads: once the change-cursor projection
+    /// has synced at least once, reads are served from the projection kept
+    /// fresh by cursor-triggered pulls; a desktop that never synced keeps the
+    /// legacy inline pull so behavior is unchanged without the loop.
+    pub fn pollWorkspaceTerminalProcessLifecyclesForLiveRead(self: *AppState, project_index: usize) void {
+        if (self.storage.daemonProjectionEverSynced()) return;
+        self.pollWorkspaceTerminalProcessLifecycles(project_index);
+    }
+
     pub const pollTitleGenerations = chat_controller.pollTitleGenerations;
     pub const pollThreadTitleGeneration = chat_controller.pollThreadTitleGeneration;
     pub const openingExchange = chat_controller.openingExchange;
@@ -10863,6 +11178,55 @@ fn unixTimestampMs() i64 {
 test "inspector disabled lifecycle messages are distinguished from other events" {
     try std.testing.expect(AppState.isInspectorDisabledMessage("{\"source\":\"verde-inspector\",\"type\":\"inspector:disabled\"}"));
     try std.testing.expect(!AppState.isInspectorDisabledMessage("{\"source\":\"verde-inspector\",\"type\":\"inspector:enabled\"}"));
+}
+
+test "M5-P4 change topic mapping is total over the frozen nine-topic set" {
+    // m4m5_decisions Q10 froze exactly these journal topics; every one must
+    // convert into at least one refresh plane so no change entry is dropped.
+    const chat_topics = [_][]const u8{ "chat.thread", "chat.turn", "chat.completion" };
+    const registry_topics = [_][]const u8{ "workspace", "surface", "process", "lease", "session", "notification" };
+    for (chat_topics) |topic| {
+        const signals = changeCursorSignalsForTopic(topic);
+        try std.testing.expect(signals.chat and !signals.registry);
+    }
+    for (registry_topics) |topic| {
+        const signals = changeCursorSignalsForTopic(topic);
+        try std.testing.expect(signals.registry and !signals.chat);
+    }
+    // Unknown future additive topics degrade to a conservative registry pull.
+    try std.testing.expect(changeCursorSignalsForTopic("future.topic").registry);
+}
+
+test "M5-P4 cursor signal bridge coalesces publishes and drains non-blocking" {
+    var loop: ChangeCursorLoopState = .{};
+    loop.publish(.{ .registry = true });
+    loop.publish(.{ .chat = true });
+    loop.publish(.{}); // all-false publish is a no-op, never a lock hit
+    const first = loop.take();
+    try std.testing.expect(first.registry and first.chat and !first.resync);
+    // The drain clears the pending set; an empty take is the steady state.
+    const second = loop.take();
+    try std.testing.expect(!second.any());
+    loop.publish(.{ .resync = true });
+    try std.testing.expect(loop.take().resync);
+}
+
+test "M5-P4 cursor loop shutdown flag interrupts sleeps and join is idempotent" {
+    var loop: ChangeCursorLoopState = .{};
+    // join() with a never-spawned worker must be a harmless no-op (deinit
+    // runs before the first frame in some teardown paths).
+    loop.join();
+    loop.shutdown = std.atomic.Value(bool).init(false);
+    // A worker parked in the loop's sleep primitive must observe shutdown
+    // within one 50ms slice; the wall-clock bound proves deinit never waits
+    // out the full backoff interval.
+    const started_ms = platform_runtime.unixTimestampMs();
+    loop.worker = try std.Thread.spawn(.{}, changeCursorSleep, .{ &loop, @as(u64, 60_000) });
+    platform_runtime.sleepMillis(20);
+    loop.join();
+    const waited_ms = platform_runtime.unixTimestampMs() - started_ms;
+    try std.testing.expect(waited_ms < 5_000);
+    try std.testing.expect(loop.worker == null);
 }
 
 test "browser context-menu payload retains an optional link disposition target" {
