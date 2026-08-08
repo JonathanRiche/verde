@@ -21,6 +21,15 @@ const zqlite = @import("zqlite");
 // the parity scenario exercises the real writer chain, not a hand-built shape.
 const db_types = @import("db/types.zig");
 const persistence = @import("state/persistence.zig");
+// M4-P5 fix (MAJOR-4): the IT binary embeds the REAL CLI MCP serve loop for
+// the `--mcp` child, and (amendment arm) the GUI-side adoption entry point.
+// Only POSIX-gated scenarios reference these decls, so lazy analysis keeps the
+// windows-gnu cross-compile surface unchanged.
+const cli_main = @import("cli/main.zig");
+const cli_output = @import("cli/output.zig");
+const chat_controller = @import("state/chat_controller.zig");
+const chat_types = @import("state/chat_types.zig");
+const live_endpoint = @import("platform/live_endpoint.zig");
 
 /// PTY / process-group / Unix-signal scenarios (forkpty, waitpid, kill(pid,0)).
 const posix_pty_supported = switch (builtin.os.tag) {
@@ -132,6 +141,15 @@ pub fn main(init: std.process.Init) !void {
             try sessionizer.runDaemon(allocator, pref_path);
             return;
         }
+        if (std.mem.eql(u8, arg, "--mcp")) {
+            // M4-P5 fix (MAJOR-4): serve the REAL MCP loop (cli/main.zig
+            // handleMcp) over this child's stdin/stdout. The inherited
+            // endpoint override routes every daemon transport to the parent's
+            // hermetic daemon; the loop exits cleanly on stdin EOF.
+            const out: cli_output.Output = .{ .io = io };
+            try cli_main.handleMcp(allocator, out, io);
+            return;
+        }
     }
 
     if (!daemon_transport_supported) {
@@ -177,6 +195,12 @@ pub fn main(init: std.process.Init) !void {
     // M4-P5 MCP/CLI flip (Windows-safe): capability advertisement + no-GUI
     // create/send/stream/approve/stop/read lifecycle with a daemon restart.
     try runChatMcpCliFlipNoGuiScenario(allocator, io);
+    // M4-P5 fix (MAJOR-4): the REAL MCP tool layer over a piped `--mcp` child.
+    // Self-gates POSIX-only (bounded pipe reads use std.posix.poll).
+    try runChatMcpToolLayerScenario(allocator, io);
+    // M4-P5 fix amendment: failed-first identity adoption converges via retry
+    // to a single identity set across flush + daemon restart. POSIX-gated.
+    try runChatAdoptionRetryDurabilityScenario(allocator, io);
 
     // Extended store scenarios (POSIX only): full surface + S4 fault/busy/crash pins.
     // Transport-tier primitives, but not part of the Windows-safe subset.
@@ -5694,6 +5718,18 @@ fn runChatMcpCliFlipNoGuiScenario(allocator: std.mem.Allocator, io: std.Io) !voi
     defer allocator.free(self_exe);
 
     var durable_msg_count: usize = 0;
+    // MINOR-4: per-row (message_id, role, body) capture from launch 1 so the
+    // restart comparison pins identity-level parity, not just a row count.
+    const FlipRow = struct { message_id: []u8, role: []u8, body: []u8 };
+    var captured_rows: std.ArrayList(FlipRow) = .empty;
+    defer {
+        for (captured_rows.items) |row| {
+            allocator.free(row.message_id);
+            allocator.free(row.role);
+            allocator.free(row.body);
+        }
+        captured_rows.deinit(allocator);
+    }
 
     // --- Launch 1: full no-GUI chat lifecycle over the flipped surface ---
     {
@@ -5878,6 +5914,20 @@ fn runChatMcpCliFlipNoGuiScenario(allocator: std.mem.Allocator, io: std.Io) !voi
                 if (std.mem.eql(u8, message.body, "stub-ok")) saw_reply = true;
             }
             if (!saw_prompt or !saw_reply or durable_msg_count < 2) return error.ChatFlipReadTranscript;
+            // MINOR-4: capture each durable row's identity for launch 2.
+            for (thread.messages) |message| {
+                const row_id = try allocator.dupe(u8, message.message_id);
+                errdefer allocator.free(row_id);
+                const row_role = try allocator.dupe(u8, message.role);
+                errdefer allocator.free(row_role);
+                const row_body = try allocator.dupe(u8, message.body);
+                errdefer allocator.free(row_body);
+                try captured_rows.append(allocator, .{
+                    .message_id = row_id,
+                    .role = row_role,
+                    .body = row_body,
+                });
+            }
         }
 
         // Exit without any consume: M4-P4 gate accepts committed unconsumed turns.
@@ -5922,6 +5972,14 @@ fn runChatMcpCliFlipNoGuiScenario(allocator: std.mem.Allocator, io: std.Io) !voi
         if (!get2.response.isOk()) return error.ChatFlipRestartReadFailed;
         const thread2 = (try client2.decodeThreadGet(&get2)).thread;
         if (thread2.messages.len != durable_msg_count) return error.ChatFlipRestartMsgCount;
+        // MINOR-4: identity-level restart parity — every row survives with
+        // the same message_id, role, and body in the same order.
+        for (captured_rows.items, 0..) |row, index| {
+            const message = thread2.messages[index];
+            if (!std.mem.eql(u8, message.message_id, row.message_id)) return error.ChatFlipRestartRowId;
+            if (!std.mem.eql(u8, message.role, row.role)) return error.ChatFlipRestartRowRole;
+            if (!std.mem.eql(u8, message.body, row.body)) return error.ChatFlipRestartRowBody;
+        }
 
         var record2 = try client2.call(headless.store.METHOD_CHAT_TURN_RECORD, .{ .turn_id = "turn-p5-send" });
         defer record2.deinit();
@@ -5930,11 +5988,883 @@ fn runChatMcpCliFlipNoGuiScenario(allocator: std.mem.Allocator, io: std.Io) !voi
         if (!std.mem.eql(u8, turn2.status, "completed")) return error.ChatFlipRestartRecordStatus;
         if (turn2.committed_store_revision == null) return error.ChatFlipRestartRecordRevision;
 
+        // MINOR-4: the ABORTED turn's record also survives the restart with
+        // its durable commit receipt intact.
+        var record_stop2 = try client2.call(headless.store.METHOD_CHAT_TURN_RECORD, .{ .turn_id = "turn-p5-stop" });
+        defer record_stop2.deinit();
+        if (!record_stop2.response.isOk()) return error.ChatFlipRestartStopRecordFailed;
+        const stop_turn2 = try client2.decodeTurnRecord(&record_stop2);
+        if (!std.mem.eql(u8, stop_turn2.status, "aborted")) return error.ChatFlipRestartStopStatus;
+        if (stop_turn2.committed_store_revision == null) return error.ChatFlipRestartStopRevision;
+
         var prepare2 = try client2.call("daemon.prepareShutdown", .{});
         defer prepare2.deinit();
         if (!prepare2.response.isOk()) return error.ChatFlipRestartPrepareFailed;
         kill_on_unwind = false;
         _ = child2.wait(io) catch {};
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M4-P5 fix (MAJOR-4): real MCP tool-layer harness (POSIX tier).
+//
+// The parent spawns `self_exe --mcp` with PIPED stdio (the child runs the real
+// cli/main.zig handleMcp serve loop), writes line-delimited JSON-RPC to its
+// stdin, and reads its stdout with poll()-bounded deadlines so a wedged child
+// times out instead of deadlocking the IT binary. Lifecycle: close stdin →
+// serve loop sees EOF → child exits 0 (waited with a deadline); kill_on_unwind
+// guards both the daemon and the MCP child on any assertion failure.
+// ---------------------------------------------------------------------------
+
+const MCP_CHILD_READ_TIMEOUT_MS: i64 = 10_000;
+
+fn spawnMcpChild(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    self_exe: []const u8,
+    pref_path: []const u8,
+) !std.process.Child {
+    var env_map = try std.process.Environ.createMap(currentEnviron(), allocator);
+    defer env_map.deinit();
+    // Same hermetic endpoint as the parent: the child's ensureSessionDaemon
+    // status-probes this socket first (sessionizer.socketPath honors the env
+    // override ahead of pref-path derivation) and reuses the already-running
+    // IT daemon instead of spawning a stray one.
+    const endpoint = try isolationEndpoint(allocator, pref_path);
+    defer allocator.free(endpoint);
+    try env_map.put(sessionizer.SESSIONIZER_SOCKET_ENV_NAME, endpoint);
+    // Root the child's pref/XDG resolution inside the IT tmp dir and point
+    // the Live endpoint at a nonexistent path: open_chat's Live attempt fails
+    // FileNotFound → isLiveSocketUnavailable → the daemon-direct arm runs
+    // deterministically, and the child can never reach a real GUI socket.
+    try env_map.put("XDG_DATA_HOME", pref_path);
+    try env_map.put("HOME", pref_path);
+    const live_socket = try std.fs.path.join(allocator, &.{ pref_path, "no-live.sock" });
+    defer allocator.free(live_socket);
+    try env_map.put(live_endpoint.ENDPOINT_ENV, live_socket);
+
+    return std.process.spawn(io, .{
+        .argv = &.{ self_exe, "--mcp" },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        // The child's stderr (incl. any child-side DebugAllocator report) must
+        // not pollute the parent log: the leak gate rg-counts this log only.
+        .stderr = .ignore,
+        .environ_map = &env_map,
+    });
+}
+
+fn mcpChildWriteLine(io: std.Io, child: *std.process.Child, line: []const u8) !void {
+    const stdin_file = child.stdin orelse return error.McpChildStdinClosed;
+    var buffer: [64 * 1024]u8 = undefined;
+    var writer = stdin_file.writerStreaming(io, &buffer);
+    try writer.interface.writeAll(line);
+    try writer.interface.writeAll("\n");
+    try writer.interface.flush();
+}
+
+/// Line-buffered bounded reader over the MCP child's stdout pipe.
+const McpChildReader = struct {
+    pending: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *McpChildReader, allocator: std.mem.Allocator) void {
+        self.pending.deinit(allocator);
+    }
+
+    /// One line read bounded by `timeout_ms` (poll + monotonic deadline).
+    fn readLineAlloc(
+        self: *McpChildReader,
+        allocator: std.mem.Allocator,
+        child: *std.process.Child,
+        timeout_ms: i64,
+    ) ![]u8 {
+        const stdout_file = child.stdout orelse return error.McpChildStdoutClosed;
+        const deadline = sessionizer.nowMs() + timeout_ms;
+        while (true) {
+            if (std.mem.indexOfScalar(u8, self.pending.items, '\n')) |newline_index| {
+                const line = try allocator.dupe(u8, self.pending.items[0..newline_index]);
+                const remaining = self.pending.items.len - (newline_index + 1);
+                std.mem.copyForwards(u8, self.pending.items[0..remaining], self.pending.items[newline_index + 1 ..]);
+                self.pending.shrinkRetainingCapacity(remaining);
+                return line;
+            }
+            const now = sessionizer.nowMs();
+            if (now > deadline) return error.McpChildReadTimeout;
+            var poll_fds = [_]std.posix.pollfd{.{
+                .fd = stdout_file.handle,
+                .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR,
+                .revents = 0,
+            }};
+            const wait_ms: i32 = @intCast(@min(deadline - now, 200));
+            const ready = std.posix.poll(&poll_fds, wait_ms) catch 0;
+            if (ready == 0) continue;
+            var read_buffer: [16 * 1024]u8 = undefined;
+            const read_len = std.posix.read(stdout_file.handle, &read_buffer) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            if (read_len == 0) return error.McpChildStdoutEof;
+            try self.pending.appendSlice(allocator, read_buffer[0..read_len]);
+        }
+    }
+};
+
+/// Write one request line, read and parse the single JSON-RPC response line.
+fn mcpChildCallParsed(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    child: *std.process.Child,
+    reader: *McpChildReader,
+    request_line: []const u8,
+    timeout_ms: i64,
+) !std.json.Parsed(std.json.Value) {
+    try mcpChildWriteLine(io, child, request_line);
+    const line = try reader.readLineAlloc(allocator, child, timeout_ms);
+    defer allocator.free(line);
+    return std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+}
+
+fn mcpToolCallRequestAlloc(
+    allocator: std.mem.Allocator,
+    id: u32,
+    tool_name: []const u8,
+    arguments: anytype,
+) ![]u8 {
+    const args_json = try std.json.Stringify.valueAlloc(allocator, arguments, .{});
+    defer allocator.free(args_json);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\",\"arguments\":{s}}}}}",
+        .{ id, tool_name, args_json },
+    );
+}
+
+fn jsonObjectField(value: std.json.Value, name: []const u8) ?std.json.Value {
+    if (value != .object) return null;
+    return value.object.get(name);
+}
+
+const McpToolText = struct {
+    text: []u8,
+    is_error: bool,
+};
+
+/// Extract the tool result's `content[0].text` envelope plus its isError flag
+/// from a raw JSON-RPC tools/call response.
+fn mcpToolTextFromResponseAlloc(allocator: std.mem.Allocator, response: std.json.Value) !McpToolText {
+    const result = jsonObjectField(response, "result") orelse return error.McpToolResponseNoResult;
+    const is_error = blk: {
+        const value = jsonObjectField(result, "isError") orelse break :blk false;
+        break :blk value == .bool and value.bool;
+    };
+    const content = jsonObjectField(result, "content") orelse return error.McpToolResponseNoContent;
+    if (content != .array or content.array.items.len == 0) return error.McpToolResponseNoContent;
+    const text = jsonObjectField(content.array.items[0], "text") orelse return error.McpToolResponseNoText;
+    if (text != .string) return error.McpToolResponseNoText;
+    return .{ .text = try allocator.dupe(u8, text.string), .is_error = is_error };
+}
+
+/// Poll `tail_chat_turn` through the MCP child until the turn is terminal
+/// with a committed revision (durable-first publication). When
+/// `require_delta` is set, an `assistant_delta` streamed event must have been
+/// observed on the way (streamed-events-then-committed-revision ordering).
+fn mcpTailTurnToTerminal(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    child: *std.process.Child,
+    reader: *McpChildReader,
+    next_id: *u32,
+    turn_id: []const u8,
+    expect_status: []const u8,
+    require_delta: bool,
+) !void {
+    var saw_delta = false;
+    var attempts: usize = 0;
+    while (attempts < 800) : (attempts += 1) {
+        const request = try mcpToolCallRequestAlloc(allocator, next_id.*, "tail_chat_turn", .{ .turn_id = turn_id });
+        defer allocator.free(request);
+        next_id.* += 1;
+        var response = try mcpChildCallParsed(allocator, io, child, reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+        defer response.deinit();
+        const tool_text = try mcpToolTextFromResponseAlloc(allocator, response.value);
+        defer allocator.free(tool_text.text);
+        if (tool_text.is_error) return error.McpTailToolError;
+        var envelope = try std.json.parseFromSlice(std.json.Value, allocator, tool_text.text, .{});
+        defer envelope.deinit();
+        const ok = jsonObjectField(envelope.value, "ok") orelse return error.McpTailShape;
+        if (ok != .bool or !ok.bool) {
+            std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
+            continue;
+        }
+        const result = jsonObjectField(envelope.value, "result") orelse return error.McpTailShape;
+        const events = jsonObjectField(result, "events") orelse .null;
+        if (events == .array) {
+            for (events.array.items) |event| {
+                const kind = jsonObjectField(event, "kind") orelse continue;
+                if (kind == .string and std.mem.eql(u8, kind.string, "assistant_delta")) saw_delta = true;
+            }
+        }
+        const status = jsonObjectField(result, "status") orelse .null;
+        const status_text = if (status == .string) status.string else "";
+        const terminal = std.mem.eql(u8, status_text, "completed") or
+            std.mem.eql(u8, status_text, "failed") or
+            std.mem.eql(u8, status_text, "aborted");
+        const committed = jsonObjectField(result, "committed_store_revision") orelse .null;
+        if (terminal and committed != .null) {
+            if (!std.mem.eql(u8, status_text, expect_status)) {
+                std.debug.print(
+                    "headless-daemon-it: MCP tail terminal status {s} (expected {s})\n",
+                    .{ status_text, expect_status },
+                );
+                return error.McpTailUnexpectedStatus;
+            }
+            if (require_delta and !saw_delta) return error.McpTailNoStreamedDelta;
+            return;
+        }
+        std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
+    }
+    return error.McpTailDidNotFinish;
+}
+
+/// M4-P5 fix (MAJOR-4): execute the REAL MCP tool layer end-to-end — the
+/// flagship no-GUI pipeline (open_chat → send_chat_message → tail_chat_turn →
+/// approve/stop → read_chat_thread) driven as genuine JSON-RPC through a
+/// piped `--mcp` child running cli/main.zig handleMcp, every chat tool
+/// routing daemon-direct to the hermetic daemon. POSIX-only: the bounded
+/// child-stdout reads use std.posix.poll.
+fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    if (comptime !posix_pty_supported) {
+        std.debug.print("headless-daemon-it: skip runChatMcpToolLayerScenario (POSIX-only bounded pipe reads)\n", .{});
+        return;
+    }
+
+    const pref_path = try makePrefPath(allocator, "m4p5-mcp");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    // --- Arm 1: full pipeline against a chat-stub store daemon ---
+    {
+        var daemon = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+            .chat_stub = true,
+        });
+        var kill_daemon_on_unwind = true;
+        errdefer if (kill_daemon_on_unwind) daemon.kill(io);
+
+        // Seed the workspace row daemon-direct (MINOR-1: open_chat requires
+        // the workspace to pre-exist; the desktop dual-write owns creation).
+        {
+            var decode_arena = std.heap.ArenaAllocator.init(allocator);
+            defer decode_arena.deinit();
+            var transport: sessionizer.HeadlessTransport = .{
+                .allocator = decode_arena.allocator(),
+                .pref_path = pref_path,
+            };
+            var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+            var reg = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+            defer reg.deinit();
+            if (!reg.response.isOk()) return error.McpToolLayerRegisterFailed;
+            const client_id = (try client.decodeClientRegister(&reg)).client_id;
+            const ws_request: headless.store.WorkspaceUpsertRequest = .{
+                .mutation = .{ .request_key = "m4p5-mcp-ws", .client_id = client_id },
+                .workspace = .{ .workspace_id = "ws-mcp", .label = "ws-mcp", .path = pref_path },
+            };
+            var parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, ws_request);
+            defer parsed.deinit();
+            if (!parsed.response.isOk()) return error.McpToolLayerWorkspaceUpsertFailed;
+        }
+
+        var mcp = try spawnMcpChild(allocator, io, self_exe, pref_path);
+        var kill_mcp_on_unwind = true;
+        errdefer if (kill_mcp_on_unwind) mcp.kill(io);
+        var reader: McpChildReader = .{};
+        defer reader.deinit(allocator);
+        var next_id: u32 = 1;
+
+        // initialize → the real serve loop identifies itself.
+        {
+            const request = try std.fmt.allocPrint(
+                allocator,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"initialize\",\"params\":{{}}}}",
+                .{next_id},
+            );
+            defer allocator.free(request);
+            next_id += 1;
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const result = jsonObjectField(response.value, "result") orelse return error.McpInitializeShape;
+            const server_info = jsonObjectField(result, "serverInfo") orelse return error.McpInitializeShape;
+            const name = jsonObjectField(server_info, "name") orelse return error.McpInitializeShape;
+            if (name != .string or !std.mem.eql(u8, name.string, "verde")) return error.McpInitializeName;
+        }
+
+        // tools/list → all six chat tools advertised by the real registry.
+        {
+            const request = try std.fmt.allocPrint(
+                allocator,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"tools/list\"}}",
+                .{next_id},
+            );
+            defer allocator.free(request);
+            next_id += 1;
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const result = jsonObjectField(response.value, "result") orelse return error.McpToolsListShape;
+            const tools = jsonObjectField(result, "tools") orelse return error.McpToolsListShape;
+            if (tools != .array) return error.McpToolsListShape;
+            const required = [_][]const u8{
+                "open_chat",         "send_chat_message", "tail_chat_turn",
+                "approve_chat_turn", "stop_chat_turn",    "read_chat_thread",
+            };
+            for (required) |tool_name| {
+                var found = false;
+                for (tools.array.items) |tool| {
+                    const name = jsonObjectField(tool, "name") orelse continue;
+                    if (name == .string and std.mem.eql(u8, name.string, tool_name)) found = true;
+                }
+                if (!found) {
+                    std.debug.print("headless-daemon-it: MCP tools/list missing {s}\n", .{tool_name});
+                    return error.McpToolsListMissingChatTool;
+                }
+            }
+        }
+
+        // open_chat → daemon-direct creation with the unified stable-id
+        // contract (MAJOR-1): local_thread_id AND thread_id present + equal.
+        var local_thread_id: ?[]u8 = null;
+        defer if (local_thread_id) |value| allocator.free(value);
+        {
+            const request = try mcpToolCallRequestAlloc(allocator, next_id, "open_chat", .{
+                .workspace_id = "ws-mcp",
+                .provider = "codex",
+            });
+            defer allocator.free(request);
+            next_id += 1;
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const tool_text = try mcpToolTextFromResponseAlloc(allocator, response.value);
+            defer allocator.free(tool_text.text);
+            if (tool_text.is_error) return error.McpOpenChatToolError;
+            var envelope = try std.json.parseFromSlice(std.json.Value, allocator, tool_text.text, .{});
+            defer envelope.deinit();
+            const ok = jsonObjectField(envelope.value, "ok") orelse return error.McpOpenChatShape;
+            if (ok != .bool or !ok.bool) {
+                std.debug.print("headless-daemon-it: MCP open_chat envelope: {s}\n", .{tool_text.text});
+                return error.McpOpenChatNotOk;
+            }
+            const result = jsonObjectField(envelope.value, "result") orelse return error.McpOpenChatShape;
+            const id_value = jsonObjectField(result, "local_thread_id") orelse return error.McpOpenChatNoLocalThreadId;
+            const legacy_value = jsonObjectField(result, "thread_id") orelse return error.McpOpenChatNoThreadId;
+            if (id_value != .string or legacy_value != .string) return error.McpOpenChatShape;
+            if (!std.mem.eql(u8, id_value.string, legacy_value.string)) return error.McpOpenChatIdMismatch;
+            if (!std.mem.startsWith(u8, id_value.string, "cli-thread-")) return error.McpOpenChatIdPrefix;
+            const created = jsonObjectField(result, "created") orelse return error.McpOpenChatShape;
+            if (created != .bool or !created.bool) return error.McpOpenChatCreated;
+            const presented = jsonObjectField(result, "presented") orelse return error.McpOpenChatShape;
+            if (presented != .bool or presented.bool) return error.McpOpenChatPresented;
+            local_thread_id = try allocator.dupe(u8, id_value.string);
+        }
+
+        // send_chat_message using result.local_thread_id verbatim.
+        var turn_id: ?[]u8 = null;
+        defer if (turn_id) |value| allocator.free(value);
+        {
+            const request = try mcpToolCallRequestAlloc(allocator, next_id, "send_chat_message", .{
+                .workspace_id = "ws-mcp",
+                .local_thread_id = local_thread_id.?,
+                .prompt = "hello mcp tool layer",
+                .project_path = pref_path,
+            });
+            defer allocator.free(request);
+            next_id += 1;
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const tool_text = try mcpToolTextFromResponseAlloc(allocator, response.value);
+            defer allocator.free(tool_text.text);
+            if (tool_text.is_error) return error.McpSendToolError;
+            var envelope = try std.json.parseFromSlice(std.json.Value, allocator, tool_text.text, .{});
+            defer envelope.deinit();
+            const ok = jsonObjectField(envelope.value, "ok") orelse return error.McpSendShape;
+            if (ok != .bool or !ok.bool) {
+                std.debug.print("headless-daemon-it: MCP send envelope: {s}\n", .{tool_text.text});
+                return error.McpSendNotOk;
+            }
+            const result = jsonObjectField(envelope.value, "result") orelse return error.McpSendShape;
+            const status = jsonObjectField(result, "status") orelse return error.McpSendShape;
+            if (status != .string or !std.mem.eql(u8, status.string, "accepted")) return error.McpSendNotAccepted;
+            const turn_value = jsonObjectField(result, "turn_id") orelse return error.McpSendNoTurnId;
+            if (turn_value != .string) return error.McpSendShape;
+            turn_id = try allocator.dupe(u8, turn_value.string);
+        }
+
+        // tail_chat_turn → streamed assistant_delta, then terminal completed
+        // with a committed revision.
+        try mcpTailTurnToTerminal(allocator, io, &mcp, &reader, &next_id, turn_id.?, "completed", true);
+
+        // approve_chat_turn → the not_found contract (stub exposes no pause).
+        {
+            const request = try mcpToolCallRequestAlloc(allocator, next_id, "approve_chat_turn", .{
+                .turn_id = turn_id.?,
+                .call_id = "missing-call",
+            });
+            defer allocator.free(request);
+            next_id += 1;
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const tool_text = try mcpToolTextFromResponseAlloc(allocator, response.value);
+            defer allocator.free(tool_text.text);
+            var envelope = try std.json.parseFromSlice(std.json.Value, allocator, tool_text.text, .{});
+            defer envelope.deinit();
+            const ok = jsonObjectField(envelope.value, "ok") orelse return error.McpApproveShape;
+            if (ok != .bool or ok.bool) return error.McpApproveShouldReject;
+            const err_value = jsonObjectField(envelope.value, "error") orelse return error.McpApproveShape;
+            const code = jsonObjectField(err_value, "code") orelse return error.McpApproveShape;
+            if (code != .string or !std.mem.eql(u8, code.string, "not_found")) return error.McpApproveWrongCode;
+        }
+
+        // stop_chat_turn on a second (slow-stub) turn: aborted + accepted
+        // no-op on the re-issue after terminal.
+        var stop_turn_id: ?[]u8 = null;
+        defer if (stop_turn_id) |value| allocator.free(value);
+        {
+            const request = try mcpToolCallRequestAlloc(allocator, next_id, "send_chat_message", .{
+                .workspace_id = "ws-mcp",
+                .local_thread_id = local_thread_id.?,
+                .prompt = "slow stop me",
+                .project_path = pref_path,
+            });
+            defer allocator.free(request);
+            next_id += 1;
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const tool_text = try mcpToolTextFromResponseAlloc(allocator, response.value);
+            defer allocator.free(tool_text.text);
+            if (tool_text.is_error) return error.McpStopSendToolError;
+            var envelope = try std.json.parseFromSlice(std.json.Value, allocator, tool_text.text, .{});
+            defer envelope.deinit();
+            const ok = jsonObjectField(envelope.value, "ok") orelse return error.McpStopSendShape;
+            if (ok != .bool or !ok.bool) return error.McpStopSendNotOk;
+            const result = jsonObjectField(envelope.value, "result") orelse return error.McpStopSendShape;
+            const turn_value = jsonObjectField(result, "turn_id") orelse return error.McpStopSendShape;
+            if (turn_value != .string) return error.McpStopSendShape;
+            stop_turn_id = try allocator.dupe(u8, turn_value.string);
+        }
+        {
+            const request = try mcpToolCallRequestAlloc(allocator, next_id, "stop_chat_turn", .{
+                .turn_id = stop_turn_id.?,
+            });
+            defer allocator.free(request);
+            next_id += 1;
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const tool_text = try mcpToolTextFromResponseAlloc(allocator, response.value);
+            defer allocator.free(tool_text.text);
+            if (tool_text.is_error) return error.McpStopToolError;
+            var envelope = try std.json.parseFromSlice(std.json.Value, allocator, tool_text.text, .{});
+            defer envelope.deinit();
+            const ok = jsonObjectField(envelope.value, "ok") orelse return error.McpStopShape;
+            if (ok != .bool or !ok.bool) return error.McpStopNotOk;
+        }
+        // Aborted turns publish terminal only after their durable commit;
+        // no assistant_delta is required for the interrupted slow stub.
+        try mcpTailTurnToTerminal(allocator, io, &mcp, &reader, &next_id, stop_turn_id.?, "aborted", false);
+        {
+            // Re-issued stop after terminal: accepted no-op, not an error.
+            const request = try mcpToolCallRequestAlloc(allocator, next_id, "stop_chat_turn", .{
+                .turn_id = stop_turn_id.?,
+            });
+            defer allocator.free(request);
+            next_id += 1;
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const tool_text = try mcpToolTextFromResponseAlloc(allocator, response.value);
+            defer allocator.free(tool_text.text);
+            var envelope = try std.json.parseFromSlice(std.json.Value, allocator, tool_text.text, .{});
+            defer envelope.deinit();
+            const ok = jsonObjectField(envelope.value, "ok") orelse return error.McpStopNoopShape;
+            if (ok != .bool or !ok.bool) return error.McpStopNoopRejected;
+        }
+
+        // read_chat_thread → durable transcript rows in the turn:% namespace.
+        {
+            const request = try mcpToolCallRequestAlloc(allocator, next_id, "read_chat_thread", .{
+                .workspace_id = "ws-mcp",
+                .local_thread_id = local_thread_id.?,
+            });
+            defer allocator.free(request);
+            next_id += 1;
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const tool_text = try mcpToolTextFromResponseAlloc(allocator, response.value);
+            defer allocator.free(tool_text.text);
+            if (tool_text.is_error) return error.McpReadToolError;
+            var envelope = try std.json.parseFromSlice(std.json.Value, allocator, tool_text.text, .{});
+            defer envelope.deinit();
+            const ok = jsonObjectField(envelope.value, "ok") orelse return error.McpReadShape;
+            if (ok != .bool or !ok.bool) return error.McpReadNotOk;
+            const result = jsonObjectField(envelope.value, "result") orelse return error.McpReadShape;
+            const thread = jsonObjectField(result, "thread") orelse return error.McpReadShape;
+            const messages = jsonObjectField(thread, "messages") orelse return error.McpReadShape;
+            if (messages != .array or messages.array.items.len < 2) return error.McpReadRowCount;
+            var saw_prompt = false;
+            var saw_reply = false;
+            for (messages.array.items) |message| {
+                const body = jsonObjectField(message, "body") orelse return error.McpReadShape;
+                if (body != .string) return error.McpReadShape;
+                if (std.mem.eql(u8, body.string, "hello mcp tool layer")) saw_prompt = true;
+                if (std.mem.eql(u8, body.string, "stub-ok")) saw_reply = true;
+                const message_id = jsonObjectField(message, "message_id") orelse return error.McpReadShape;
+                if (message_id != .string) return error.McpReadShape;
+                if (!std.mem.startsWith(u8, message_id.string, "turn:")) return error.McpReadIdNamespace;
+            }
+            if (!saw_prompt or !saw_reply) return error.McpReadTranscript;
+        }
+
+        // Lifecycle: close stdin → EOF ends the serve loop → child exits 0.
+        mcp.stdin.?.close(io);
+        mcp.stdin = null;
+        const term = try waitChildBounded(&mcp, io, 10_000);
+        kill_mcp_on_unwind = false;
+        if (term != .exited or term.exited != 0) return error.McpChildExitCode;
+
+        {
+            var decode_arena = std.heap.ArenaAllocator.init(allocator);
+            defer decode_arena.deinit();
+            var transport: sessionizer.HeadlessTransport = .{
+                .allocator = decode_arena.allocator(),
+                .pref_path = pref_path,
+            };
+            var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+            var prepare = try client.call("daemon.prepareShutdown", .{});
+            defer prepare.deinit();
+            if (!prepare.response.isOk()) return error.McpDaemonPrepareFailed;
+        }
+        kill_daemon_on_unwind = false;
+        _ = try waitChildBounded(&daemon, io, 10_000);
+    }
+
+    // --- Arm 2 (MINOR-3 pin): store-less daemon — open_chat's failure names
+    // the STORE capability verbatim, never re-attributed to chat. ---
+    {
+        var daemon = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_disable = true,
+            .chat_stub = true,
+        });
+        var kill_daemon_on_unwind = true;
+        errdefer if (kill_daemon_on_unwind) daemon.kill(io);
+
+        var mcp = try spawnMcpChild(allocator, io, self_exe, pref_path);
+        var kill_mcp_on_unwind = true;
+        errdefer if (kill_mcp_on_unwind) mcp.kill(io);
+        var reader: McpChildReader = .{};
+        defer reader.deinit(allocator);
+
+        {
+            const request = try mcpToolCallRequestAlloc(allocator, 1, "open_chat", .{
+                .workspace_id = "ws-mcp",
+                .provider = "codex",
+            });
+            defer allocator.free(request);
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const tool_text = try mcpToolTextFromResponseAlloc(allocator, response.value);
+            defer allocator.free(tool_text.text);
+            if (std.mem.indexOf(u8, tool_text.text, "store capability is unavailable") == null) {
+                std.debug.print("headless-daemon-it: MCP store-less open_chat text: {s}\n", .{tool_text.text});
+                return error.McpStoreLessWrongCapability;
+            }
+            if (std.mem.indexOf(u8, tool_text.text, "chat capability is unavailable") != null) {
+                return error.McpStoreLessMisattributed;
+            }
+        }
+
+        mcp.stdin.?.close(io);
+        mcp.stdin = null;
+        const term = try waitChildBounded(&mcp, io, 10_000);
+        kill_mcp_on_unwind = false;
+        if (term != .exited or term.exited != 0) return error.McpChildExitCode;
+
+        {
+            var decode_arena = std.heap.ArenaAllocator.init(allocator);
+            defer decode_arena.deinit();
+            var transport: sessionizer.HeadlessTransport = .{
+                .allocator = decode_arena.allocator(),
+                .pref_path = pref_path,
+            };
+            var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+            var prepare = try client.call("daemon.prepareShutdown", .{});
+            defer prepare.deinit();
+            if (!prepare.response.isOk()) return error.McpDaemonPrepareFailed;
+        }
+        kill_daemon_on_unwind = false;
+        _ = try waitChildBounded(&daemon, io, 10_000);
+    }
+}
+
+/// M4-P5 fix amendment (m4p4fix verify MAJOR-1): failed-first identity
+/// adoption converges via retry to a single identity set that survives the
+/// genuine GUI flush chain (real persistedStateToProtocolSnapshot →
+/// state.snapshot.replace) and a daemon restart — no duplicated rows.
+fn runChatAdoptionRetryDurabilityScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    if (comptime !posix_pty_supported) {
+        std.debug.print("headless-daemon-it: skip runChatAdoptionRetryDurabilityScenario (POSIX tier)\n", .{});
+        return;
+    }
+
+    const pref_path = try makePrefPath(allocator, "m4p5-adopt");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    const workspace_id = "ws-adopt";
+    const local_thread_id = "thread-adopt";
+    const turn_id = "turn-adopt";
+    const prompt = "hello adoption";
+
+    // Identities captured after the converged flush, for the restart check.
+    var captured_ids: std.ArrayList([]u8) = .empty;
+    defer {
+        for (captured_ids.items) |id| allocator.free(id);
+        captured_ids.deinit(allocator);
+    }
+
+    // --- Launch 1: seed, fail-first adoption, retry, converged flush ---
+    {
+        var daemon = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+            .chat_stub = true,
+        });
+        var kill_on_unwind = true;
+        errdefer if (kill_on_unwind) daemon.kill(io);
+
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+        var reg = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+        defer reg.deinit();
+        if (!reg.response.isOk()) return error.AdoptRegisterFailed;
+        const client_id = (try client.decodeClientRegister(&reg)).client_id;
+
+        {
+            const ws_request: headless.store.WorkspaceUpsertRequest = .{
+                .mutation = .{ .request_key = "m4p5-adopt-ws", .client_id = client_id },
+                .workspace = .{ .workspace_id = workspace_id, .label = workspace_id, .path = pref_path },
+            };
+            var parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, ws_request);
+            defer parsed.deinit();
+            if (!parsed.response.isOk()) return error.AdoptWorkspaceUpsertFailed;
+        }
+        {
+            const thread_request: headless.store.ThreadUpsertRequest = .{
+                .mutation = .{ .request_key = "m4p5-adopt-thread", .client_id = client_id },
+                .workspace_id = workspace_id,
+                .thread = .{
+                    .local_thread_id = local_thread_id,
+                    .title = "Adoption thread",
+                    .provider = "codex",
+                    .harness = "local_cli",
+                },
+            };
+            var parsed = try client.call(headless.store.METHOD_CHAT_THREAD_UPSERT, thread_request);
+            defer parsed.deinit();
+            if (!parsed.response.isOk()) return error.AdoptThreadUpsertFailed;
+        }
+        {
+            var parsed = try client.call("chat.turn.start", .{
+                .turn_id = turn_id,
+                .workspace_id = workspace_id,
+                .local_thread_id = local_thread_id,
+                .project_path = pref_path,
+                .prompt = prompt,
+                .thread_title = "Adoption thread",
+                .provider = "codex",
+                .harness = "local_cli",
+                .fast_mode = false,
+                .test_stub = true,
+            });
+            defer parsed.deinit();
+            if (!parsed.response.isOk()) return error.AdoptTurnStartFailed;
+        }
+        try waitChatTurnTerminal(io, &client, turn_id, true);
+
+        var get = try client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+        });
+        defer get.deinit();
+        if (!get.response.isOk()) return error.AdoptSeedReadFailed;
+        const committed = (try client.decodeThreadGet(&get)).thread;
+        if (committed.messages.len < 2) return error.AdoptSeedRowCount;
+
+        // GUI-projection double: the same rows id-less, with the FINAL row's
+        // body still diverged (mid-stream projection) to force the mismatch.
+        var thread = try chat_types.ChatThread.init(allocator, "Adoption thread");
+        defer thread.deinit(allocator);
+        allocator.free(thread.local_thread_id);
+        thread.local_thread_id = try allocator.dupeZ(u8, local_thread_id);
+        for (committed.messages, 0..) |message, index| {
+            const is_last = index == committed.messages.len - 1;
+            const body: []const u8 = if (is_last) "still streaming" else message.body;
+            const is_user = std.mem.eql(u8, message.role, "user");
+            try thread.messages.append(allocator, .{
+                .role = if (is_user) .user else .assistant,
+                .author = try allocator.dupeZ(u8, if (is_user) "You" else "Assistant"),
+                .body = try allocator.dupeZ(u8, body),
+            });
+        }
+
+        const AdoptProject = struct { id: []const u8 };
+        const AdoptSelf = struct {
+            allocator: std.mem.Allocator,
+            storage: struct { pref_path: []const u8 },
+            project_controller: struct { projects: struct { items: []const AdoptProject } },
+            dirty: bool = false,
+            pub fn markDirty(self: *@This()) void {
+                self.dirty = true;
+            }
+        };
+        const projects = [_]AdoptProject{.{ .id = workspace_id }};
+        var adopt_self: AdoptSelf = .{
+            .allocator = allocator,
+            .storage = .{ .pref_path = pref_path },
+            .project_controller = .{ .projects = .{ .items = &projects } },
+        };
+
+        // Failed-first adoption: durable read succeeds, final row mismatches
+        // → incomplete (the pre-amendment one-shot stopped here forever).
+        if (chat_controller.adoptDaemonTranscriptIdentities(&adopt_self, 0, &thread) != .incomplete) {
+            return error.AdoptFirstNotIncomplete;
+        }
+        if (thread.messages.items[0].message_id == null) return error.AdoptUserIdNotAdopted;
+        if (thread.messages.items[thread.messages.items.len - 1].message_id != null) {
+            return error.AdoptMismatchedIdAssigned;
+        }
+
+        // Projection converges on the durable body; the idempotent retry
+        // completes and yields the single identity set.
+        {
+            const last = &thread.messages.items[thread.messages.items.len - 1];
+            allocator.free(last.body);
+            last.body = try allocator.dupeZ(u8, committed.messages[committed.messages.len - 1].body);
+        }
+        if (chat_controller.adoptDaemonTranscriptIdentities(&adopt_self, 0, &thread) != .complete) {
+            return error.AdoptRetryNotComplete;
+        }
+        for (thread.messages.items) |message| {
+            const id = message.message_id orelse return error.AdoptIdMissing;
+            if (!std.mem.startsWith(u8, id, "turn:")) return error.AdoptIdNamespace;
+        }
+        if (!adopt_self.dirty) return error.AdoptDirtyNotMarked;
+
+        // Genuine GUI flush of the converged projection, then re-read: the
+        // durable transcript keeps exactly one row per identity.
+        var writer_arena = std.heap.ArenaAllocator.init(allocator);
+        defer writer_arena.deinit();
+        const wa = writer_arena.allocator();
+        var adopted_rows: std.ArrayList(db_types.PersistedMessage) = .empty;
+        defer adopted_rows.deinit(wa);
+        for (thread.messages.items) |message| {
+            try adopted_rows.append(wa, .{
+                .role = std.meta.stringToEnum(db_types.ChatRole, @tagName(message.role)) orelse return error.AdoptBadRole,
+                .author = message.author,
+                .body = message.body,
+                .message_id = message.message_id,
+            });
+        }
+        try runParityGuiFlush(&client, wa, .{
+            .request_key = "m4p5-adopt-flush",
+            .client_id = client_id,
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+            .pref_path = pref_path,
+            .messages = adopted_rows.items,
+        });
+
+        var verify = try client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+        });
+        defer verify.deinit();
+        if (!verify.response.isOk()) return error.AdoptVerifyReadFailed;
+        const flushed = (try client.decodeThreadGet(&verify)).thread;
+        if (flushed.messages.len != thread.messages.items.len) return error.AdoptFlushDuplicatedRows;
+        for (flushed.messages, 0..) |message, index| {
+            const projection_id = thread.messages.items[index].message_id.?;
+            if (!std.mem.eql(u8, message.message_id, projection_id)) return error.AdoptFlushIdMismatch;
+            const captured = try allocator.dupe(u8, message.message_id);
+            errdefer allocator.free(captured);
+            try captured_ids.append(allocator, captured);
+        }
+
+        var prepare = try client.call("daemon.prepareShutdown", .{});
+        defer prepare.deinit();
+        if (!prepare.response.isOk()) return error.AdoptPrepareFailed;
+        kill_on_unwind = false;
+        _ = try waitChildBounded(&daemon, io, 10_000);
+    }
+
+    // --- Launch 2 (reopen): the single identity set survives the restart ---
+    {
+        var daemon = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+            .chat_stub = true,
+        });
+        var kill_on_unwind = true;
+        errdefer if (kill_on_unwind) daemon.kill(io);
+
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+        var get = try client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+        });
+        defer get.deinit();
+        if (!get.response.isOk()) return error.AdoptReopenReadFailed;
+        const reopened = (try client.decodeThreadGet(&get)).thread;
+        if (reopened.messages.len != captured_ids.items.len) return error.AdoptReopenDuplicatedRows;
+        for (reopened.messages, 0..) |message, index| {
+            if (!std.mem.eql(u8, message.message_id, captured_ids.items[index])) {
+                return error.AdoptReopenIdMismatch;
+            }
+        }
+
+        var prepare = try client.call("daemon.prepareShutdown", .{});
+        defer prepare.deinit();
+        if (!prepare.response.isOk()) return error.AdoptReopenPrepareFailed;
+        kill_on_unwind = false;
+        _ = try waitChildBounded(&daemon, io, 10_000);
     }
 }
 

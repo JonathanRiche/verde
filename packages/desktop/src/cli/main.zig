@@ -2542,7 +2542,16 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
             try out.stderr("verde live chat tail requires --turn\n", .{});
             std.process.exit(2);
         };
-        const after_seq = parseOptionalU32(args.optionValue(argv, "--after")) orelse 0;
+        const after_raw = args.optionValue(argv, "--after");
+        const after_seq = parseOptionalU32(after_raw) orelse blk: {
+            // Distinguish an absent flag (default 0) from a garbled value,
+            // which must fail loudly instead of silently re-reading from 0.
+            if (after_raw) |raw| {
+                try out.stderr("verde live chat tail --after must be a non-negative integer, got: {s}\n", .{raw});
+                std.process.exit(2);
+            }
+            break :blk 0;
+        };
         const response = chatDaemonCallEnvelopeAlloc(allocator, io, "chat.turn.tail", .{
             .turn_id = turn_id,
             .after_seq = after_seq,
@@ -3612,7 +3621,9 @@ fn printLiveResponse(out: output.Output, response: []const u8) !void {
     try out.stdout("{s}\n", .{response});
 }
 
-fn handleMcp(allocator: std.mem.Allocator, out: output.Output, io: std.Io) !void {
+// pub so the headless IT harness can drive the real MCP serve loop over
+// piped stdio (`--mcp` arm in headless_daemon_it_main.zig).
+pub fn handleMcp(allocator: std.mem.Allocator, out: output.Output, io: std.Io) !void {
     const cwd_workspace = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch null;
     defer if (cwd_workspace) |path| allocator.free(path);
     const default_workspace = mcpDefaultWorkspace(
@@ -3701,11 +3712,11 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try writeMcpTypedTool(&s, "list_panes", "List chat and terminal panes in a Verde workspace.", &.{
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
     });
-    try writeMcpTypedTool(&s, "open_chat", "Create a durable chat thread in an explicitly selected Verde workspace and return its stable ids. With the desktop GUI running the thread is also presented as a native chat pane; with no GUI it is created daemon-direct.", &OPEN_CHAT_MCP_INPUTS);
-    try writeMcpTypedTool(&s, "send_chat_message", "Send a prompt on an existing chat thread daemon-direct (no GUI required) and return the accepted turn_id. Poll tail_chat_turn for streaming events and completion.", &CHAT_SEND_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "open_chat", "Create a durable chat thread in an explicitly selected Verde workspace and return its stable ids. The workspace row must already exist in the session daemon store (the desktop dual-write creates it; open_chat never creates workspaces). With the desktop GUI running the thread is also presented as a native chat pane; with no GUI it is created daemon-direct.", &OPEN_CHAT_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "send_chat_message", "Send a prompt on an existing chat thread daemon-direct (no GUI required) and return the accepted turn_id. The thread and its workspace row must already exist in the daemon store (open_chat creates the thread, the desktop dual-write creates the workspace). Poll tail_chat_turn for streaming events and completion.", &CHAT_SEND_MCP_INPUTS);
     try writeMcpTypedTool(&s, "tail_chat_turn", "Read a chat turn's streamed events and status daemon-direct. Terminal status (completed/failed/aborted) is published only after the durable transcript commit.", &CHAT_TAIL_MCP_INPUTS);
-    try writeMcpTypedTool(&s, "approve_chat_turn", "Approve or deny a chat turn's pending tool approval daemon-direct.", &CHAT_APPROVE_MCP_INPUTS);
-    try writeMcpTypedTool(&s, "stop_chat_turn", "Stop a running chat turn daemon-direct. The interruption still commits durably.", &CHAT_STOP_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "approve_chat_turn", "Approve or deny a chat turn's pending tool approval daemon-direct. Returns not_found both for an unknown turn and for a turn with no pending approval matching call_id; re-check tail_chat_turn before retrying.", &CHAT_APPROVE_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "stop_chat_turn", "Stop a running chat turn daemon-direct. The interruption still commits durably. Stopping an already-terminal turn is an accepted no-op, not an error.", &CHAT_STOP_MCP_INPUTS);
     try writeMcpTypedTool(&s, "read_chat_thread", "Read a chat thread's durable transcript daemon-direct from the session daemon store.", &CHAT_READ_MCP_INPUTS);
     try writeMcpTool(&s, "list_surfaces", "List registered live terminal control surfaces. Use list_panes for ordinary Verde terminal panes.");
     try writeMcpTool(&s, "inspect_surface", "Inspect one Verde terminal surface.");
@@ -4121,9 +4132,13 @@ fn mcpToolsCall(
     if (std.mem.eql(u8, tool_name, "tail_chat_turn")) {
         const turn_id = mcpArgString(arguments, "turn_id") orelse
             return try mcpError(allocator, out, id_value, -32602, "tail_chat_turn requires turn_id");
+        const after_seq = mcpArgU32(arguments, "after_seq");
+        if (mcpArgIsNonNull(arguments, "after_seq") and after_seq == null) {
+            return try mcpError(allocator, out, id_value, -32602, "tail_chat_turn after_seq must be a non-negative integer");
+        }
         const response = chatDaemonCallEnvelopeAlloc(allocator, io, "chat.turn.tail", .{
             .turn_id = turn_id,
-            .after_seq = mcpArgU32(arguments, "after_seq") orelse 0,
+            .after_seq = after_seq orelse 0,
         }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
         defer allocator.free(response);
         return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
@@ -4200,14 +4215,17 @@ fn mcpToolsCall(
             if (mcpArgIsNonNull(arguments, "axis") and axis == null) {
                 return try mcpError(allocator, out, id_value, -32602, "open_chat axis must be a string");
             }
-            // M4-P5: open_chat is thread creation returning stable ids.
-            // GUI client registered (Live socket reachable): Live chat.open
-            // creates AND presents the thread — the GUI dual-writes the
-            // durable thread and its response carries the stable
-            // local_thread_id. No GUI: daemon-direct chat.thread.upsert; the
-            // thread creation succeeds with no GUI registered, and an old
-            // daemon (chat=false) gets capability_unavailable — never a
-            // second Live attempt.
+            // M4-P5: open_chat is thread creation returning the stable id
+            // contract (local_thread_id, mirrored as legacy thread_id).
+            // GUI registered (Live socket reachable): Live chat.open creates
+            // AND presents the thread, but the GUI's durable store write is
+            // asynchronous relative to its response — so before reporting
+            // success the CLI confirms the daemon can read the thread back
+            // (bounded chat.thread.get poll; old daemons without the chat
+            // capability skip the confirm). No GUI: daemon-direct
+            // chat.thread.upsert creates the thread durably by construction,
+            // and an old daemon (chat=false) gets capability_unavailable —
+            // never a second Live attempt.
             const live_response = sendLiveRequestAlloc(allocator, io, "chat.open", .{
                 .workspace_id = workspace_id,
                 .provider = provider,
@@ -4222,8 +4240,62 @@ fn mcpToolsCall(
                 if (!isLiveSocketUnavailable(err)) return try mcpError(allocator, out, id_value, -32000, @errorName(err));
                 break :live_blk null;
             };
-            if (live_response) |response| break :blk response;
-            break :blk chatDaemonOpenThreadEnvelopeAlloc(allocator, io, .{
+            if (live_response) |response| {
+                defer allocator.free(response);
+                var live_parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch |err|
+                    return try mcpError(allocator, out, id_value, -32000, @errorName(err));
+                defer live_parsed.deinit();
+                switch (classifyChatOpenLiveEnvelope(live_parsed.value)) {
+                    // GUI-authored error envelopes pass through unchanged.
+                    .not_ok => {},
+                    // ok without any stable id can never be reported as
+                    // success: the caller would hold nothing durable to read.
+                    .missing_ids => return try mcpChatOpenNotDurable(
+                        allocator,
+                        out,
+                        id_value,
+                        workspace_id,
+                        "(unknown)",
+                        "Live chat.open returned ok without local_thread_id or thread_id",
+                    ),
+                    .ids => |ids| {
+                        const confirm_workspace = ids.workspace_id orelse workspace_id;
+                        const outcome = chatOpenConfirmThreadDurable(
+                            allocator,
+                            io,
+                            confirm_workspace,
+                            ids.local_thread_id,
+                            CHAT_OPEN_CONFIRM_ATTEMPTS,
+                            CHAT_OPEN_CONFIRM_DELAY_MS,
+                        ) catch return try mcpChatOpenNotDurable(
+                            allocator,
+                            out,
+                            id_value,
+                            confirm_workspace,
+                            ids.local_thread_id,
+                            "the session daemon read-back transport failed",
+                        );
+                        switch (outcome) {
+                            // Durable, or an old daemon that cannot serve the
+                            // confirm: return the Live envelope unchanged.
+                            .durable, .capability_skip => {},
+                            .timeout => return try mcpChatOpenNotDurable(
+                                allocator,
+                                out,
+                                id_value,
+                                confirm_workspace,
+                                ids.local_thread_id,
+                                "the durable thread row was not readable within the confirmation budget",
+                            ),
+                        }
+                    },
+                }
+                return try mcpToolLiveTextResult(allocator, out, id_value, response, tool_name);
+            }
+            // No GUI: return through mcpToolTextResult directly so a daemon
+            // store-capability rejection in the envelope is not re-attributed
+            // by the Live capability rewriting in mcpToolLiveTextResult.
+            const daemon_response = chatDaemonOpenThreadEnvelopeAlloc(allocator, io, .{
                 .workspace_id = workspace_id,
                 .provider = provider,
                 .model = model,
@@ -4231,6 +4303,8 @@ fn mcpToolsCall(
                 .reasoning_variant = creation_settings.reasoning_variant,
                 .fast_mode = creation_settings.fast_mode,
             }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
+            defer allocator.free(daemon_response);
+            return try mcpToolTextResult(allocator, out, id_value, daemon_response, tool_name);
         }
         if (std.mem.eql(u8, tool_name, "list_workspaces")) {
             break :blk sendLiveRequestAlloc(allocator, io, "workspaces", .{}, 1);
@@ -4734,6 +4808,11 @@ const ChatDaemonOpenArgs = struct {
     fast_mode: ?bool = null,
 };
 
+/// Pinned presentation defaults for daemon-created threads; the GUI
+/// re-titles the thread on its first real turn.
+const CHAT_DAEMON_OPEN_TITLE = "New Chat";
+const CHAT_DAEMON_OPEN_HARNESS = "local_cli";
+
 /// Daemon-direct thread creation for open_chat with no GUI registered:
 /// register a store client and upsert the thread durably, returning its
 /// stable ids. Requires the workspace row to already exist in the daemon
@@ -4770,9 +4849,9 @@ fn chatDaemonOpenThreadEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, o
         .workspace_id = open.workspace_id,
         .thread = .{
             .local_thread_id = local_thread_id,
-            .title = "New Chat",
+            .title = CHAT_DAEMON_OPEN_TITLE,
             .provider = open.provider,
-            .harness = "local_cli",
+            .harness = CHAT_DAEMON_OPEN_HARNESS,
             .model_ref = open.model,
             .reasoning_effort = open.reasoning_effort,
             .reasoning_variant = open.reasoning_variant,
@@ -4795,6 +4874,9 @@ fn chatDaemonOpenThreadEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, o
     try s.write(.{
         .workspace_id = open.workspace_id,
         .local_thread_id = local_thread_id,
+        // MAJOR-1: mirror the stable id under the Live arm's legacy field
+        // name so both open_chat arms expose the same id contract.
+        .thread_id = local_thread_id,
         .store_revision = write.store_revision,
         .created = true,
         // No GUI client is registered, so no pane presentation happened.
@@ -4802,6 +4884,185 @@ fn chatDaemonOpenThreadEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, o
     });
     try s.endObject();
     return try writer.toOwnedSlice();
+}
+
+// ---------------------------------------------------------------------------
+// M4-P5 fix (MAJOR-2): Live-arm durability confirmation for open_chat.
+//
+// The GUI's chat.open response is authored before its store dual-write is
+// necessarily durable, so after a Live success the CLI confirms the session
+// daemon can read the thread row back before reporting success. Budget:
+// 40 attempts x 50 ms = 2 s. The confirm is read-only (chat.thread.get); the
+// CLI never upserts GUI-created threads.
+// ---------------------------------------------------------------------------
+
+const CHAT_OPEN_CONFIRM_ATTEMPTS: u32 = 40;
+const CHAT_OPEN_CONFIRM_DELAY_MS: u64 = 50;
+
+const ChatOpenLiveIds = struct {
+    local_thread_id: []const u8,
+    workspace_id: ?[]const u8,
+};
+
+const ChatOpenLiveEnvelope = union(enum) {
+    /// ok envelope carrying a stable id to confirm.
+    ids: ChatOpenLiveIds,
+    /// Error envelope: passed through unchanged (the GUI authored it).
+    not_ok,
+    /// ok envelope without any stable id: must never surface as success.
+    missing_ids,
+};
+
+/// Classify a Live chat.open envelope for the durability confirm. Returned
+/// slices point into `value`; the caller keeps the parsed JSON alive.
+fn classifyChatOpenLiveEnvelope(value: std.json.Value) ChatOpenLiveEnvelope {
+    if (value != .object) return .missing_ids;
+    if (!(jsonBool(value.object.get("ok") orelse .null) orelse false)) return .not_ok;
+    const result = value.object.get("result") orelse return .missing_ids;
+    if (result != .object) return .missing_ids;
+    const local_thread_id = jsonString(result.object.get("local_thread_id") orelse .null) orelse
+        jsonString(result.object.get("thread_id") orelse .null) orelse
+        return .missing_ids;
+    return .{ .ids = .{
+        .local_thread_id = local_thread_id,
+        .workspace_id = jsonString(result.object.get("workspace_id") orelse .null),
+    } };
+}
+
+const ChatOpenConfirmOutcome = enum {
+    durable,
+    /// Old daemon without the chat capability: the confirm cannot run, so
+    /// the Live envelope is returned exactly as before this fix (declared
+    /// residual — the id may still be non-durable on such daemons).
+    capability_skip,
+    timeout,
+};
+
+/// Bounded read-back confirm: poll `chat.thread.get` until the daemon serves
+/// the thread row durably. Cross-boundary ordering: each attempt builds a
+/// fresh arena + transport, performs one call, and fully tears both down
+/// before the next sleep — no lock, connection, or arena is held across a
+/// sleep.
+fn chatOpenConfirmThreadDurable(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    attempts: u32,
+    delay_ms: u64,
+) !ChatOpenConfirmOutcome {
+    const exe_path = try platform_runtime.executablePathAlloc(allocator);
+    defer allocator.free(exe_path);
+    try ensureSessionDaemon(allocator, io, exe_path);
+    const pref_path = try prefPath(allocator);
+    defer allocator.free(pref_path);
+
+    // Capability gate once, in its own arena: an old daemon (chat=false)
+    // cannot serve chat.thread.get, so the confirm is skipped rather than
+    // misreported as a durability failure.
+    {
+        var gate_arena = std.heap.ArenaAllocator.init(allocator);
+        defer gate_arena.deinit();
+        const arena = gate_arena.allocator();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = arena,
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(arena, &transport);
+        chatDaemonRequireCapability(&client) catch |err| switch (err) {
+            error.ChatCapabilityUnavailable => return .capability_skip,
+            else => return err,
+        };
+    }
+
+    var attempt: u32 = 0;
+    while (attempt < attempts) : (attempt += 1) {
+        if (attempt != 0) std.Io.sleep(io, .fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
+        var poll_arena = std.heap.ArenaAllocator.init(allocator);
+        defer poll_arena.deinit();
+        const arena = poll_arena.allocator();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = arena,
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(arena, &transport);
+        var parsed = client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+        }) catch continue;
+        defer parsed.deinit();
+        if (parsed.response.isOk()) return .durable;
+    }
+    return .timeout;
+}
+
+/// Typed MCP tool error for a Live open_chat whose durable read-back failed:
+/// names the stable id so callers can retry read_chat_thread instead of
+/// treating the thread as lost. Never a success shape.
+fn mcpChatOpenNotDurableResponseAlloc(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    detail: []const u8,
+) ![]u8 {
+    var text_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer text_writer.deinit();
+    var text_s: std.json.Stringify = .{ .writer = &text_writer.writer, .options = .{} };
+    try text_s.beginObject();
+    try text_s.objectField("ok");
+    try text_s.write(false);
+    try text_s.objectField("error");
+    try text_s.beginObject();
+    try text_s.objectField("code");
+    try text_s.write("thread_not_durable");
+    try text_s.objectField("message");
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "chat.open was accepted by the GUI but thread {s} in workspace {s} could not be read back from the session daemon: {s}. The thread may still become durable; retry read_chat_thread with this local_thread_id before assuming loss.",
+        .{ local_thread_id, workspace_id, detail },
+    );
+    defer allocator.free(message);
+    try text_s.write(message);
+    try text_s.objectField("workspace_id");
+    try text_s.write(workspace_id);
+    try text_s.objectField("local_thread_id");
+    try text_s.write(local_thread_id);
+    try text_s.endObject();
+    try text_s.endObject();
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try mcpBeginResult(&s, id_value);
+    try s.beginObject();
+    try s.objectField("content");
+    try s.beginArray();
+    try s.beginObject();
+    try s.objectField("type");
+    try s.write("text");
+    try s.objectField("text");
+    try s.write(text_writer.written());
+    try s.endObject();
+    try s.endArray();
+    try s.objectField("isError");
+    try s.write(true);
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+fn mcpChatOpenNotDurable(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    id_value: std.json.Value,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    detail: []const u8,
+) !void {
+    const response = try mcpChatOpenNotDurableResponseAlloc(allocator, id_value, workspace_id, local_thread_id, detail);
+    defer allocator.free(response);
+    try out.stdout("{s}\n", .{response});
 }
 
 const McpTerminalKeyEncodeError = error{
@@ -6498,6 +6759,122 @@ test "M4-P5 MCP chat tool schemas require stable daemon addressing" {
     try std.testing.expect(CHAT_READ_MCP_INPUTS[0].required and CHAT_READ_MCP_INPUTS[1].required);
     try std.testing.expect(CHAT_TAIL_MCP_INPUTS[0].required);
     try std.testing.expect(!CHAT_TAIL_MCP_INPUTS[1].required);
+}
+
+test "M4-P5 fix open_chat Live envelope classifier extracts stable ids" {
+    const allocator = std.testing.allocator;
+    // ok + local_thread_id: confirmable, workspace carried along.
+    {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"thread_id\":\"chat-9\",\"local_thread_id\":\"chat-9\"}}",
+            .{},
+        );
+        defer parsed.deinit();
+        const classified = classifyChatOpenLiveEnvelope(parsed.value);
+        try std.testing.expectEqualStrings("chat-9", classified.ids.local_thread_id);
+        try std.testing.expectEqualStrings("ws-1", classified.ids.workspace_id.?);
+    }
+    // ok + legacy thread_id only: fallback id (pre-fix GUI response shape).
+    {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            "{\"ok\":true,\"result\":{\"thread_id\":\"chat-legacy\"}}",
+            .{},
+        );
+        defer parsed.deinit();
+        const classified = classifyChatOpenLiveEnvelope(parsed.value);
+        try std.testing.expectEqualStrings("chat-legacy", classified.ids.local_thread_id);
+        try std.testing.expect(classified.ids.workspace_id == null);
+    }
+    // Error envelope: passed through unchanged, never confirmed.
+    {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}",
+            .{},
+        );
+        defer parsed.deinit();
+        try std.testing.expect(classifyChatOpenLiveEnvelope(parsed.value) == .not_ok);
+    }
+    // ok without any stable id: must never surface as success.
+    {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            "{\"ok\":true,\"result\":{\"pane_id\":4}}",
+            .{},
+        );
+        defer parsed.deinit();
+        try std.testing.expect(classifyChatOpenLiveEnvelope(parsed.value) == .missing_ids);
+    }
+}
+
+test "M4-P5 fix open_chat Live confirm budget is bounded at two seconds" {
+    try std.testing.expectEqual(
+        @as(u64, 2_000),
+        @as(u64, CHAT_OPEN_CONFIRM_ATTEMPTS) * CHAT_OPEN_CONFIRM_DELAY_MS,
+    );
+}
+
+test "M4-P5 fix open_chat not-durable result is a typed tool error naming the id" {
+    const allocator = std.testing.allocator;
+    const response = try mcpChatOpenNotDurableResponseAlloc(
+        allocator,
+        .{ .integer = 3 },
+        "ws-1",
+        "cli-thread-1-aabbccdd00112233",
+        "the durable thread row was not readable within the confirmation budget",
+    );
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?.object;
+    try std.testing.expect(jsonBool(result.get("isError") orelse .null).?);
+    const text = jsonString(result.get("content").?.array.items[0].object.get("text").?).?;
+    var text_parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+    defer text_parsed.deinit();
+    try std.testing.expect(!(jsonBool(text_parsed.value.object.get("ok").?).?));
+    const err_obj = text_parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings("thread_not_durable", jsonString(err_obj.get("code").?).?);
+    try std.testing.expectEqualStrings("ws-1", jsonString(err_obj.get("workspace_id").?).?);
+    try std.testing.expectEqualStrings(
+        "cli-thread-1-aabbccdd00112233",
+        jsonString(err_obj.get("local_thread_id").?).?,
+    );
+    const message = jsonString(err_obj.get("message").?).?;
+    try std.testing.expect(std.mem.indexOf(u8, message, "cli-thread-1-aabbccdd00112233") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "read_chat_thread") != null);
+}
+
+fn expectMintedChatId(id: []const u8, comptime prefix: []const u8) !void {
+    try std.testing.expect(std.mem.startsWith(u8, id, prefix));
+    const rest = id[prefix.len..];
+    const dash = std.mem.lastIndexOfScalar(u8, rest, '-') orelse return error.TestUnexpectedResult;
+    const timestamp = rest[0..dash];
+    const hex = rest[dash + 1 ..];
+    try std.testing.expect(timestamp.len > 0);
+    _ = try std.fmt.parseInt(i64, timestamp, 10);
+    try std.testing.expectEqual(@as(usize, 16), hex.len);
+    for (hex) |char| try std.testing.expect(std.ascii.isHex(char) and !std.ascii.isUpper(char));
+}
+
+test "M4-P5 fix minted chat ids pin their namespace shape" {
+    const allocator = std.testing.allocator;
+    // NIT-3: id shape `cli-thread-{unix_ms}-{16 lowercase hex}` (and the
+    // cli-turn- namespace), plus the pinned daemon-open presentation
+    // defaults, are contract surface for daemon-direct threads.
+    const thread_id = try mintChatIdAlloc(allocator, std.testing.io, "cli-thread-");
+    defer allocator.free(thread_id);
+    const turn_id = try mintChatIdAlloc(allocator, std.testing.io, "cli-turn-");
+    defer allocator.free(turn_id);
+    try expectMintedChatId(thread_id, "cli-thread-");
+    try expectMintedChatId(turn_id, "cli-turn-");
+    try std.testing.expectEqualStrings("New Chat", CHAT_DAEMON_OPEN_TITLE);
+    try std.testing.expectEqualStrings("local_cli", CHAT_DAEMON_OPEN_HARNESS);
 }
 
 test "notify handler requires a dedicated exe_path separate from flag argv" {

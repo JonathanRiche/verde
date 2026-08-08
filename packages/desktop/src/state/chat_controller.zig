@@ -2109,6 +2109,13 @@ pub fn projectThreadIndexByLocalId(self: anytype, workspace_id: []const u8, loca
 
 pub fn pollSend(self: anytype) bool {
     var changed = self.pollTitleGenerations();
+    // M4-P5 fix amendment: retry incomplete daemon identity adoptions on
+    // ordinary ticks, ahead of the has-pending gate so an idle thread whose
+    // terminal adoption failed still converges. Comptime-gated so slim
+    // poll-test states without the storage surface can drive pollSend.
+    if (comptime @hasField(std.meta.Child(@TypeOf(self)), "storage")) {
+        changed = retryPendingAdoptions(self) or changed;
+    }
     if (!self.chat_controller.hasPending()) return changed;
 
     for (self.project_controller.projects.items, 0..) |*project, project_index| {
@@ -3294,7 +3301,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
                 // one, the frame-loop debounce, title-generation completion,
                 // provider_thread_id capture, bang-command start, and the
                 // close-time blocking flush are all safe by construction.
-                if (completed_daemon_turn_id != null) self.adoptDaemonTranscriptIdentities(project_index, thread);
+                if (completed_daemon_turn_id != null) adoptDaemonTranscriptIdentitiesWithRetry(self, project_index, thread);
                 self.flushDirtyNow();
                 // Consume is a retention hint only (daemon already committed).
                 self.consumeDaemonChatTurn(completed_daemon_turn_id);
@@ -3314,7 +3321,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             }
             // M4-P4 fix: identity-preserving flush — adopt ids (failed turns
             // also commit durably), then flush without gating.
-            if (completed_daemon_turn_id != null) self.adoptDaemonTranscriptIdentities(project_index, thread);
+            if (completed_daemon_turn_id != null) adoptDaemonTranscriptIdentitiesWithRetry(self, project_index, thread);
             self.flushDirtyNow();
             self.consumeDaemonChatTurn(completed_daemon_turn_id);
         },
@@ -3345,7 +3352,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             self.setSidebarNotice(if (completed_local_command) "Workspace command cancelled." else "Provider reply stopped.");
             // M4-P4 fix: identity-preserving flush — adopt ids (aborted turns
             // also commit durably), then flush without gating.
-            if (completed_daemon_turn_id != null) self.adoptDaemonTranscriptIdentities(project_index, thread);
+            if (completed_daemon_turn_id != null) adoptDaemonTranscriptIdentitiesWithRetry(self, project_index, thread);
             self.flushDirtyNow();
             self.consumeDaemonChatTurn(completed_daemon_turn_id);
         },
@@ -3377,6 +3384,12 @@ fn projectionHasMessageId(thread: *const ChatThread, message_id: []const u8) boo
     return false;
 }
 
+/// M4-P5 fix amendment: adoption result. `incomplete` marks any attempt that
+/// could leave daemon-minted identities unadopted (RPC/parse failure, durable
+/// row not yet visible, or a row mismatch) and therefore must be retried.
+/// pub so the headless IT amendment arm can assert the retry contract.
+pub const AdoptionOutcome = enum { complete, incomplete };
+
 /// M4-P4 fix: adopt daemon-minted transcript identities into the in-memory
 /// projection at terminal via the durable `chat.thread.get` read, so the next
 /// persistence flush carries `turn:{id}:msg:{n}` ids instead of re-minting.
@@ -3389,32 +3402,49 @@ fn projectionHasMessageId(thread: *const ChatThread, message_id: []const u8) boo
 /// A mismatch logs loudly and leaves the projection row id-less — an id is
 /// never guessed (an id-less row persists as a legacy `snap-msg` row, which
 /// the store belt then dedupes by identity, never by position).
-pub fn adoptDaemonTranscriptIdentities(self: anytype, project_index: usize, thread: *ChatThread) void {
-    if (project_index >= self.project_controller.projects.items.len) return;
+///
+/// M4-P5 fix amendment: no longer one-shot — the outcome is reported so a
+/// failed or partial adoption is queued for retry (adoption is idempotent).
+pub fn adoptDaemonTranscriptIdentities(self: anytype, project_index: usize, thread: *ChatThread) AdoptionOutcome {
+    if (project_index >= self.project_controller.projects.items.len) return .complete;
     const workspace_id = self.project_controller.projects.items[project_index].id;
     const response = sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.thread.get", .{
         .workspace_id = workspace_id,
         .local_thread_id = thread.local_thread_id,
     }, 6) catch |err| {
         log.warn("failed to fetch durable thread for identity adoption: {s}", .{@errorName(err)});
-        return;
+        return .incomplete;
     };
     defer self.allocator.free(response);
     var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response, .{}) catch |err| {
         log.warn("failed to parse durable thread for identity adoption: {s}", .{@errorName(err)});
-        return;
+        return .incomplete;
     };
     defer parsed.deinit();
-    const result = jsonRpcResult(parsed.value) catch return;
-    if (result != .object) return;
-    const thread_value = result.object.get("thread") orelse return;
-    if (thread_value != .object) return;
-    const messages_value = thread_value.object.get("messages") orelse return;
-    if (messages_value != .array) return;
+    // A missing/oddly-shaped durable row may simply not be visible yet
+    // (daemon restarting, commit racing the terminal tick): retryable.
+    const result = jsonRpcResult(parsed.value) catch return .incomplete;
+    if (result != .object) return .incomplete;
+    const thread_value = result.object.get("thread") orelse return .incomplete;
+    if (thread_value != .object) return .incomplete;
+    const messages_value = thread_value.object.get("messages") orelse return .incomplete;
+    if (messages_value != .array) return .incomplete;
+    return adoptTranscriptIdentitiesFromStoreMessages(self, thread, messages_value.array.items);
+}
 
+/// Pure alignment half of the adoption (no RPC), split out so the retry
+/// contract is unit-testable: mismatches and OOM leave rows id-less and
+/// report `incomplete`; a pass where every store id is either already
+/// present or adopted reports `complete`.
+fn adoptTranscriptIdentitiesFromStoreMessages(
+    self: anytype,
+    thread: *ChatThread,
+    store_messages: []const std.json.Value,
+) AdoptionOutcome {
     var projection_index: usize = 0;
     var adopted_any = false;
-    for (messages_value.array.items) |message_value| {
+    var unresolved = false;
+    for (store_messages) |message_value| {
         if (message_value != .object) continue;
         const store_id = jsonValueString(message_value.object.get("message_id") orelse .null) orelse continue;
         if (store_id.len == 0) continue;
@@ -3422,15 +3452,21 @@ pub fn adoptDaemonTranscriptIdentities(self: anytype, project_index: usize, thre
         while (projection_index < thread.messages.items.len and thread.messages.items[projection_index].message_id != null) {
             projection_index += 1;
         }
-        if (projection_index >= thread.messages.items.len) break;
+        if (projection_index >= thread.messages.items.len) {
+            // Store rows beyond the projection carry content the projection
+            // never held; the store belt preserves them by identity, so there
+            // is nothing to adopt into — not a retry condition.
+            break;
+        }
         const store_role = jsonValueString(message_value.object.get("role") orelse .null) orelse continue;
         const store_body = jsonValueString(message_value.object.get("body") orelse .null) orelse continue;
         const row = &thread.messages.items[projection_index];
         if (std.mem.eql(u8, store_role, @tagName(row.role)) and std.mem.eql(u8, store_body, row.body)) {
             row.message_id = self.allocator.dupe(u8, store_id) catch null;
-            if (row.message_id != null) adopted_any = true;
+            if (row.message_id != null) adopted_any = true else unresolved = true;
             projection_index += 1;
         } else {
+            unresolved = true;
             log.warn(
                 "daemon transcript identity adoption mismatch for {s} (store role={s}, projection role={s}); leaving projection row id-less",
                 .{ store_id, store_role, @tagName(row.role) },
@@ -3438,6 +3474,193 @@ pub fn adoptDaemonTranscriptIdentities(self: anytype, project_index: usize, thre
         }
     }
     if (adopted_any) self.markDirty();
+    return if (unresolved) .incomplete else .complete;
+}
+
+// ---------------------------------------------------------------------------
+// M4-P5 fix amendment (m4p4fix verify MAJOR-1): adoption retry registry.
+//
+// A failed or partial terminal adoption used to be one-shot: the unconditional
+// flush then persisted id-less `snap-msg` copies of daemon content while the
+// store belt restored the `turn:%` twins — permanent duplication on reopen.
+// Adoption is idempotent, so incomplete attempts are queued here (keyed by
+// workspace+thread ids) and retried on later pollSend ticks until complete.
+// Main-thread-only, matching the ownership rule for `thread.messages`; keys
+// use page_allocator so no per-controller allocator outlives its owner. The
+// flush itself is never gated on adoption — it stays unconditional.
+// ---------------------------------------------------------------------------
+
+const ADOPTION_RETRY_INTERVAL_MS: i64 = 1_000;
+/// Bounded logging: warn once per this many consecutive failed retries.
+const ADOPTION_RETRY_LOG_EVERY: u32 = 10;
+const ADOPTION_RETRY_KEY_SEPARATOR: u8 = 0x1f;
+
+const AdoptionRetryState = struct {
+    attempts: u32 = 0,
+    next_retry_at_ms: i64 = 0,
+};
+
+var adoption_retry_pending: std.StringHashMapUnmanaged(AdoptionRetryState) = .empty;
+
+fn adoptionRetryKeyAlloc(workspace_id: []const u8, local_thread_id: []const u8) ?[]u8 {
+    return std.fmt.allocPrint(std.heap.page_allocator, "{s}\x1f{s}", .{ workspace_id, local_thread_id }) catch null;
+}
+
+fn markAdoptionPending(workspace_id: []const u8, local_thread_id: []const u8) void {
+    const key = adoptionRetryKeyAlloc(workspace_id, local_thread_id) orelse return;
+    const gop = adoption_retry_pending.getOrPut(std.heap.page_allocator, key) catch {
+        std.heap.page_allocator.free(key);
+        return;
+    };
+    if (gop.found_existing) {
+        std.heap.page_allocator.free(key);
+    } else {
+        gop.value_ptr.* = .{};
+    }
+    gop.value_ptr.attempts +|= 1;
+    gop.value_ptr.next_retry_at_ms = sessionizer.nowMs() + ADOPTION_RETRY_INTERVAL_MS;
+    if (gop.value_ptr.attempts > 1 and gop.value_ptr.attempts % ADOPTION_RETRY_LOG_EVERY == 0) {
+        log.warn(
+            "daemon transcript identity adoption still incomplete for {s} after {d} attempts; retrying",
+            .{ local_thread_id, gop.value_ptr.attempts },
+        );
+    }
+}
+
+fn clearAdoptionPending(workspace_id: []const u8, local_thread_id: []const u8) void {
+    const key = adoptionRetryKeyAlloc(workspace_id, local_thread_id) orelse return;
+    defer std.heap.page_allocator.free(key);
+    if (adoption_retry_pending.fetchRemove(key)) |entry| {
+        std.heap.page_allocator.free(entry.key);
+    }
+}
+
+/// Terminal-tick entry: run adoption and queue a retry when incomplete.
+/// Never blocks or gates the caller's flush.
+fn adoptDaemonTranscriptIdentitiesWithRetry(self: anytype, project_index: usize, thread: *ChatThread) void {
+    if (project_index >= self.project_controller.projects.items.len) return;
+    const workspace_id = self.project_controller.projects.items[project_index].id;
+    switch (adoptDaemonTranscriptIdentities(self, project_index, thread)) {
+        .complete => clearAdoptionPending(workspace_id, thread.local_thread_id),
+        .incomplete => markAdoptionPending(workspace_id, thread.local_thread_id),
+    }
+}
+
+/// Retry pump: at most one due adoption per tick (each retry is one local
+/// RPC; the interval bounds pressure). Threads that no longer exist drop
+/// their entry. Returns whether an adoption completed this tick.
+fn retryPendingAdoptions(self: anytype) bool {
+    if (adoption_retry_pending.count() == 0) return false;
+    const now_ms = sessionizer.nowMs();
+    var due_key: ?[]const u8 = null;
+    var iterator = adoption_retry_pending.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.next_retry_at_ms <= now_ms) {
+            due_key = entry.key_ptr.*;
+            break;
+        }
+    }
+    const key = due_key orelse return false;
+    const separator = std.mem.indexOfScalar(u8, key, ADOPTION_RETRY_KEY_SEPARATOR) orelse {
+        if (adoption_retry_pending.fetchRemove(key)) |entry| std.heap.page_allocator.free(entry.key);
+        return false;
+    };
+    const workspace_id = key[0..separator];
+    const local_thread_id = key[separator + 1 ..];
+    const location = projectThreadIndexByLocalId(self, workspace_id, local_thread_id) orelse {
+        // Thread gone (archived/removed workspace): nothing left to adopt.
+        clearAdoptionPending(workspace_id, local_thread_id);
+        return false;
+    };
+    const thread = &self.project_controller.projects.items[location.project_index].threads.items[location.thread_index];
+    switch (adoptDaemonTranscriptIdentities(self, location.project_index, thread)) {
+        .complete => {
+            clearAdoptionPending(workspace_id, local_thread_id);
+            return true;
+        },
+        .incomplete => {
+            markAdoptionPending(workspace_id, local_thread_id);
+            return false;
+        },
+    }
+}
+
+test "M4-P5 amendment: incomplete adoption retries to a single identity set" {
+    const allocator = std.testing.allocator;
+    const AdoptState = struct {
+        allocator: std.mem.Allocator,
+        dirty: bool = false,
+        pub fn markDirty(self: *@This()) void {
+            self.dirty = true;
+        }
+    };
+    var state: AdoptState = .{ .allocator = allocator };
+
+    var thread = try ChatThread.init(allocator, "Adoption thread");
+    defer thread.deinit(allocator);
+    try thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "hello m4p5"),
+    });
+    try thread.messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Assistant"),
+        .body = try allocator.dupeZ(u8, "still streaming"),
+    });
+
+    var store_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\[{"message_id":"turn:t1:user","role":"user","body":"hello m4p5"},
+        \\ {"message_id":"turn:t1:msg:1","role":"assistant","body":"stub-ok"}]
+    ,
+        .{},
+    );
+    defer store_parsed.deinit();
+    const store_rows = store_parsed.value.array.items;
+
+    // Failed-first adoption: the assistant row mismatches the durable body,
+    // so the pass is incomplete — user id adopted, assistant left id-less,
+    // and (the old one-shot bug) nothing would ever retry.
+    try std.testing.expectEqual(
+        AdoptionOutcome.incomplete,
+        adoptTranscriptIdentitiesFromStoreMessages(&state, &thread, store_rows),
+    );
+    try std.testing.expect(state.dirty);
+    try std.testing.expectEqualStrings("turn:t1:user", thread.messages.items[0].message_id.?);
+    try std.testing.expect(thread.messages.items[1].message_id == null);
+
+    // The projection converges on the durable body; the retry completes and
+    // adopts the remaining identity.
+    allocator.free(thread.messages.items[1].body);
+    thread.messages.items[1].body = try allocator.dupeZ(u8, "stub-ok");
+    try std.testing.expectEqual(
+        AdoptionOutcome.complete,
+        adoptTranscriptIdentitiesFromStoreMessages(&state, &thread, store_rows),
+    );
+    try std.testing.expectEqualStrings("turn:t1:msg:1", thread.messages.items[1].message_id.?);
+
+    // Idempotent: another pass adopts nothing new, never grows the
+    // projection, and keeps exactly one identity per row — the single
+    // identity set the flush then persists (no snap-msg duplicates).
+    try std.testing.expectEqual(
+        AdoptionOutcome.complete,
+        adoptTranscriptIdentitiesFromStoreMessages(&state, &thread, store_rows),
+    );
+    try std.testing.expectEqual(@as(usize, 2), thread.messages.items.len);
+    try std.testing.expectEqualStrings("turn:t1:user", thread.messages.items[0].message_id.?);
+    try std.testing.expectEqualStrings("turn:t1:msg:1", thread.messages.items[1].message_id.?);
+
+    // Registry mechanics: repeated incomplete outcomes accumulate one entry
+    // with a bounded attempt counter; completion clears it.
+    markAdoptionPending("ws-adopt-test", "thread-adopt-test");
+    markAdoptionPending("ws-adopt-test", "thread-adopt-test");
+    const key = adoptionRetryKeyAlloc("ws-adopt-test", "thread-adopt-test").?;
+    defer std.heap.page_allocator.free(key);
+    try std.testing.expectEqual(@as(u32, 2), adoption_retry_pending.get(key).?.attempts);
+    clearAdoptionPending("ws-adopt-test", "thread-adopt-test");
+    try std.testing.expect(adoption_retry_pending.get(key) == null);
 }
 
 // Records a finished in-app chat turn unless that exact pane currently has

@@ -3121,6 +3121,14 @@ fn chatOpenResultResponse(
     try s.write(result.pane_id);
     try s.objectField("thread_id");
     try s.write(thread_id);
+    // The GUI Live arm keys threads by local_thread_id; emit it alongside the
+    // legacy thread_id (same value) so both open_chat arms expose one stable id.
+    try s.objectField("local_thread_id");
+    try s.write(thread_id);
+    try s.objectField("created");
+    try s.write(true);
+    try s.objectField("presented");
+    try s.write(true);
     try s.objectField("thread_index");
     try s.write(result.thread_index);
     try s.objectField("provider");
@@ -3433,6 +3441,12 @@ test "chat open response exposes stable identifiers" {
     try std.testing.expectEqualStrings("workspace-1", jsonString(result.get("workspace_id").?).?);
     try std.testing.expectEqual(@as(i64, 7), jsonInt(result.get("pane_id").?).?);
     try std.testing.expectEqualStrings("chat-123", jsonString(result.get("thread_id").?).?);
+    try std.testing.expectEqualStrings(
+        jsonString(result.get("thread_id").?).?,
+        jsonString(result.get("local_thread_id").?).?,
+    );
+    try std.testing.expect(boolParam(.{ .object = result }, "created").?);
+    try std.testing.expect(boolParam(.{ .object = result }, "presented").?);
     try std.testing.expectEqualStrings("codex", jsonString(result.get("provider").?).?);
     try std.testing.expectEqualStrings("gpt-5.6-sol", jsonString(result.get("model").?).?);
     try std.testing.expectEqualStrings("high", jsonString(result.get("reasoning_effort").?).?);
