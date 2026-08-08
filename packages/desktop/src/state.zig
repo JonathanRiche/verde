@@ -4064,6 +4064,10 @@ pub const AppState = struct {
         self.close_durability_notice = true;
     }
 
+    pub fn clearCloseDurabilityNotice(self: *AppState) void {
+        self.close_durability_notice = false;
+    }
+
     pub fn rethemeTerminalSessions(self: *AppState) !void {
         for (self.project_controller.projects.items) |*project| {
             try project.terminal_dock.rethemeSessions(self.allocator);

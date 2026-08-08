@@ -532,6 +532,7 @@ fn mainInner(init: std.process.Init) !void {
         getWindowSizeInPixels(window, &input_fb_w, &input_fb_h);
         ui_layout.refreshPaletteModalHits(&state, @floatFromInt(input_fb_w), @floatFromInt(input_fb_h));
         running = processEvents(window, &state, &keyboard, ui_scale, &event_flags, &frame_sample, &event_wait_ns, &render_pacer);
+        if (!running) break;
         frame_sample.waited_ns = event_wait_ns;
         recordSpan(&frame_sample, .poll_picker, struct {
             fn run(app_state: *AppState) void {
@@ -2657,12 +2658,13 @@ test "close preflight keeps loop live after real handoff failure" {
     const db_types = @import("db/types.zig");
     const FakeStorage = struct {
         allocator: std.mem.Allocator,
+        save_fails: bool = true,
 
         pub fn currentProjectionObservedRevision(_: *const @This()) u64 {
             return 1;
         }
-        pub fn saveCaptured(_: *@This(), _: db_types.PersistedState, _: u64) !void {
-            return error.StoreUnavailable;
+        pub fn saveCaptured(self: *@This(), _: db_types.PersistedState, _: u64) !void {
+            if (self.save_fails) return error.StoreUnavailable;
         }
         pub fn markPersistenceUnavailable(_: *@This()) void {}
         pub fn clearPendingStateSpoolBestEffort(_: *@This()) void {}
@@ -2672,6 +2674,7 @@ test "close preflight keeps loop live after real handoff failure" {
         storage: *FakeStorage,
         close_failure_notice: bool = false,
         daemon_stale: bool = true,
+        spool_fails: bool = true,
 
         pub fn hasUnresolvedAdoptionRows(_: *@This()) bool {
             return false;
@@ -2683,14 +2686,17 @@ test "close preflight keeps loop live after real handoff failure" {
         pub fn clonePersistedState(_: *@This(), allocator: std.mem.Allocator, _: db_types.PersistedState) !db_types.LoadedState {
             return db_types.LoadedState.init(allocator);
         }
-        pub fn spoolPendingStateForShutdown(_: *@This()) !void {
-            return error.InjectedSpoolFailure;
+        pub fn spoolPendingStateForShutdown(self: *@This()) !void {
+            if (self.spool_fails) return error.InjectedSpoolFailure;
         }
         fn handoffDirtyStateForShutdown(self: *@This()) !void {
             try lifecycle_controller.handoffDirtyStateForShutdown(self);
         }
         fn noteCloseDurabilityFailure(self: *@This(), _: anyerror) void {
             self.close_failure_notice = true;
+        }
+        pub fn clearCloseDurabilityNotice(self: *@This()) void {
+            self.close_failure_notice = false;
         }
         fn sidebarNotice(self: *const @This()) []const u8 {
             if (self.close_failure_notice) return "Could not close";
@@ -2706,6 +2712,33 @@ test "close preflight keeps loop live after real handoff failure" {
     try std.testing.expect(!closePreflightPassed(&state));
     try std.testing.expect(state.lifecycle.dirty);
     try std.testing.expectEqualStrings("Could not close", state.sidebarNotice());
+    storage.save_fails = false;
+    state.spool_fails = false;
+    try std.testing.expect(closePreflightPassed(&state));
+    try std.testing.expectEqualStrings("Daemon sync stalled", state.sidebarNotice());
+}
+
+test "successful event close preflight skips later frame polls" {
+    const FakeState = struct {
+        dirty_poll_executed: bool = false,
+
+        fn handoffDirtyStateForShutdown(_: *@This()) !void {}
+        fn noteCloseDurabilityFailure(_: *@This(), _: anyerror) void {}
+        fn dirtyPoll(self: *@This()) void {
+            self.dirty_poll_executed = true;
+        }
+    };
+
+    const source = @embedFile("main.zig");
+    const event_assignment = std.mem.indexOf(u8, source, "running = processEvents(").?;
+    const frame_break = std.mem.indexOf(u8, source[event_assignment..], "if (!running) break;").?;
+    const first_poll = std.mem.indexOf(u8, source[event_assignment..], "app_state.processDeferredProjectDirectoryBrowse();").?;
+    try std.testing.expect(frame_break < first_poll);
+
+    var state: FakeState = .{};
+    const running_after_close_event = !closePreflightPassed(&state);
+    if (running_after_close_event) state.dirtyPoll();
+    try std.testing.expect(!state.dirty_poll_executed);
 }
 
 fn linuxCloseRequestFollowsSuspiciousBurst(now_ms: i64) bool {
