@@ -1843,6 +1843,17 @@ pub fn beginSendForThreadWithReadyDaemon(
         };
     }
 
+    // M4-P4 fix: retain the acceptance-staged client id on the user row the
+    // caller just appended. The ledger's user_message_id references exactly
+    // this value, so the persistence flush now carries the identity instead
+    // of re-minting a positional `snap-msg-{i}` for it.
+    if (thread.messages.items.len > 0) {
+        const user_row = &thread.messages.items[thread.messages.items.len - 1];
+        if (user_row.role == .user and user_row.message_id == null and std.mem.eql(u8, user_row.body, prompt)) {
+            user_row.message_id = self.allocator.dupe(u8, message_id) catch null;
+        }
+    }
+
     const send_state = thread.send_state;
     send_state.mutex.lock();
     defer send_state.mutex.unlock();
@@ -1999,8 +2010,10 @@ pub fn restoreDaemonChatTurnsOnLaunch(self: anytype) void {
 
         // M4-P4: turns that ended while the GUI was closed are durable in the
         // store snapshot (loaded at startup). Consult chat.turn.record for the
-        // committed fact; do not re-attach as a live pending send — consume is
-        // no longer required for transcript visibility.
+        // committed fact and surface failed turns; do not re-attach as a live
+        // pending send. Consume is issued as the pure retention hint it now is
+        // (MINOR-3): without it, ended-while-closed turns accumulate in daemon
+        // memory and chat.turn.list forever (GC requires consumed).
         if (std.mem.eql(u8, status, "completed") or std.mem.eql(u8, status, "failed") or std.mem.eql(u8, status, "aborted")) {
             if (sessionizer.requestAlloc(
                 self.allocator,
@@ -2009,10 +2022,42 @@ pub fn restoreDaemonChatTurnsOnLaunch(self: anytype) void {
                 .{ .turn_id = turn_id },
                 6,
             )) |record_response| {
-                // Best-effort: record confirms durable status; transcript rows
-                // already ride the store snapshot. No consume handshake.
-                self.allocator.free(record_response);
-            } else |_| {}
+                defer self.allocator.free(record_response);
+                if (std.json.parseFromSlice(std.json.Value, self.allocator, record_response, .{})) |record_parsed_value| {
+                    var record_parsed = record_parsed_value;
+                    defer record_parsed.deinit();
+                    if (jsonRpcResult(record_parsed.value)) |record_result| {
+                        if (record_result == .object) {
+                            const record_status = jsonValueString(record_result.object.get("status") orelse .null) orelse status;
+                            if (std.mem.eql(u8, record_status, "failed")) {
+                                const error_message = jsonValueString(record_result.object.get("error_message") orelse .null) orelse
+                                    "Provider request failed.";
+                                log.warn("chat turn {s} failed while the GUI was closed: {s}", .{ turn_id, error_message });
+                                self.setSidebarNotice("A chat reply failed while Verde was closed.");
+                            }
+                        }
+                    } else |err| {
+                        log.warn("chat.turn.record for {s} returned an error: {s}", .{ turn_id, @errorName(err) });
+                    }
+                } else |err| {
+                    log.warn("failed to decode chat.turn.record for {s}: {s}", .{ turn_id, @errorName(err) });
+                }
+                // Retention hint: the committed record is durable; let the
+                // daemon GC the in-memory turn.
+                if (sessionizer.requestAlloc(
+                    self.allocator,
+                    self.storage.pref_path,
+                    "chat.turn.consume",
+                    .{ .turn_id = turn_id },
+                    6,
+                )) |consume_response| {
+                    self.allocator.free(consume_response);
+                } else |err| {
+                    log.warn("failed to consume reconciled chat turn {s}: {s}", .{ turn_id, @errorName(err) });
+                }
+            } else |err| {
+                log.warn("failed to consult chat.turn.record for {s}: {s}", .{ turn_id, @errorName(err) });
+            }
             continue;
         }
 
@@ -2934,7 +2979,18 @@ pub fn applyDaemonChatEventLocked(self: anytype, send_state: *SendState, kind: [
         errdefer std.heap.page_allocator.free(owned_author);
         const owned_body = try std.heap.page_allocator.dupe(u8, body);
         errdefer std.heap.page_allocator.free(owned_body);
-        try send_state.pending_events.append(std.heap.page_allocator, .{ .role = .system, .author = owned_author, .body = owned_body });
+        // M4-P4 fix: honor a payload identity when the daemon event carries
+        // one (transcript_apply keys the committed row by the same value), so
+        // the projection row lands id-carrying without waiting for terminal
+        // adoption.
+        const payload_message_id = daemonPayloadStringAlloc(payload_json, "message_id");
+        errdefer if (payload_message_id) |value| std.heap.page_allocator.free(value);
+        try send_state.pending_events.append(std.heap.page_allocator, .{
+            .role = .system,
+            .author = owned_author,
+            .body = owned_body,
+            .message_id = payload_message_id,
+        });
     } else if (std.mem.eql(u8, kind, "tool_call")) {
         var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, payload_json, .{});
         defer parsed.deinit();
@@ -3229,12 +3285,17 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
                 if (project_index == self.project_controller.selected_index and thread_index == self.currentProject().selected_thread_index) {
                     self.requestTranscriptScrollToBottom();
                 }
-                // M4-P4: daemon-owned turns are durable in the store commit; do
-                // not rewrite transcript rows via the GUI full-snapshot flush
-                // (A-M3P4-overlap / flush-exclusion). In-memory projection is
-                // applied above for rendering. Local-command / non-daemon
-                // paths still flush as before.
-                if (completed_daemon_turn_id == null) self.flushDirtyNow();
+                // M4-P4 fix: adopt the daemon-minted transcript identities into
+                // the projection, then flush unconditionally. The flush itself
+                // is identity-preserving now (PersistedMessage carries
+                // message_id end-to-end; the store's applySnapshot upserts by
+                // identity and preserves daemon-committed rows missing from
+                // the snapshot), so no flush site needs gating anymore — this
+                // one, the frame-loop debounce, title-generation completion,
+                // provider_thread_id capture, bang-command start, and the
+                // close-time blocking flush are all safe by construction.
+                if (completed_daemon_turn_id != null) self.adoptDaemonTranscriptIdentities(project_index, thread);
+                self.flushDirtyNow();
                 // Consume is a retention hint only (daemon already committed).
                 self.consumeDaemonChatTurn(completed_daemon_turn_id);
             }
@@ -3251,7 +3312,10 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             } else {
                 self.setSidebarNotice("Provider request failed.");
             }
-            if (completed_daemon_turn_id == null) self.flushDirtyNow();
+            // M4-P4 fix: identity-preserving flush — adopt ids (failed turns
+            // also commit durably), then flush without gating.
+            if (completed_daemon_turn_id != null) self.adoptDaemonTranscriptIdentities(project_index, thread);
+            self.flushDirtyNow();
             self.consumeDaemonChatTurn(completed_daemon_turn_id);
         },
         .aborted => {
@@ -3279,7 +3343,10 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             thread.touch();
             self.markDirty();
             self.setSidebarNotice(if (completed_local_command) "Workspace command cancelled." else "Provider reply stopped.");
-            if (completed_daemon_turn_id == null) self.flushDirtyNow();
+            // M4-P4 fix: identity-preserving flush — adopt ids (aborted turns
+            // also commit durably), then flush without gating.
+            if (completed_daemon_turn_id != null) self.adoptDaemonTranscriptIdentities(project_index, thread);
+            self.flushDirtyNow();
             self.consumeDaemonChatTurn(completed_daemon_turn_id);
         },
         else => {},
@@ -3300,6 +3367,77 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
         self.noteChatCompletion(project_index, thread_index, thread, completed_daemon_turn_id != null);
     }
     return next_status != .idle or stream_changed or daemon_changed;
+}
+
+fn projectionHasMessageId(thread: *const ChatThread, message_id: []const u8) bool {
+    for (thread.messages.items) |message| {
+        const existing = message.message_id orelse continue;
+        if (std.mem.eql(u8, existing, message_id)) return true;
+    }
+    return false;
+}
+
+/// M4-P4 fix: adopt daemon-minted transcript identities into the in-memory
+/// projection at terminal via the durable `chat.thread.get` read, so the next
+/// persistence flush carries `turn:{id}:msg:{n}` ids instead of re-minting.
+///
+/// Runs on the poll path AFTER the terminal branch released the send_state
+/// mutex — no GUI mutex is held across the RPC, and `thread.messages` is
+/// main-thread-owned state. Alignment is conservative: rows the projection
+/// already ids are skipped; each remaining id-carrying store row aligns to the
+/// next id-less projection row in order only when role+body match exactly.
+/// A mismatch logs loudly and leaves the projection row id-less — an id is
+/// never guessed (an id-less row persists as a legacy `snap-msg` row, which
+/// the store belt then dedupes by identity, never by position).
+pub fn adoptDaemonTranscriptIdentities(self: anytype, project_index: usize, thread: *ChatThread) void {
+    if (project_index >= self.project_controller.projects.items.len) return;
+    const workspace_id = self.project_controller.projects.items[project_index].id;
+    const response = sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.thread.get", .{
+        .workspace_id = workspace_id,
+        .local_thread_id = thread.local_thread_id,
+    }, 6) catch |err| {
+        log.warn("failed to fetch durable thread for identity adoption: {s}", .{@errorName(err)});
+        return;
+    };
+    defer self.allocator.free(response);
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response, .{}) catch |err| {
+        log.warn("failed to parse durable thread for identity adoption: {s}", .{@errorName(err)});
+        return;
+    };
+    defer parsed.deinit();
+    const result = jsonRpcResult(parsed.value) catch return;
+    if (result != .object) return;
+    const thread_value = result.object.get("thread") orelse return;
+    if (thread_value != .object) return;
+    const messages_value = thread_value.object.get("messages") orelse return;
+    if (messages_value != .array) return;
+
+    var projection_index: usize = 0;
+    var adopted_any = false;
+    for (messages_value.array.items) |message_value| {
+        if (message_value != .object) continue;
+        const store_id = jsonValueString(message_value.object.get("message_id") orelse .null) orelse continue;
+        if (store_id.len == 0) continue;
+        if (projectionHasMessageId(thread, store_id)) continue;
+        while (projection_index < thread.messages.items.len and thread.messages.items[projection_index].message_id != null) {
+            projection_index += 1;
+        }
+        if (projection_index >= thread.messages.items.len) break;
+        const store_role = jsonValueString(message_value.object.get("role") orelse .null) orelse continue;
+        const store_body = jsonValueString(message_value.object.get("body") orelse .null) orelse continue;
+        const row = &thread.messages.items[projection_index];
+        if (std.mem.eql(u8, store_role, @tagName(row.role)) and std.mem.eql(u8, store_body, row.body)) {
+            row.message_id = self.allocator.dupe(u8, store_id) catch null;
+            if (row.message_id != null) adopted_any = true;
+            projection_index += 1;
+        } else {
+            log.warn(
+                "daemon transcript identity adoption mismatch for {s} (store role={s}, projection role={s}); leaving projection row id-less",
+                .{ store_id, store_role, @tagName(row.role) },
+            );
+        }
+    }
+    if (adopted_any) self.markDirty();
 }
 
 // Records a finished in-app chat turn unless that exact pane currently has
@@ -4088,6 +4226,7 @@ pub fn applyPendingTimelineEvents(self: anytype, thread: *ChatThread, events: *s
             .tool_call_id = if (event.tool_call_id) |call_id| try self.allocator.dupe(u8, call_id) else null,
             .tool_call_kind = event.tool_call_kind,
             .tool_call_status = event.tool_call_status,
+            .message_id = if (event.message_id) |id| self.allocator.dupe(u8, id) catch null else null,
         });
         if (event.role == .system) {
             thread.noteBackgroundTaskEvent(self.allocator, event.author, event.body) catch |err| {
@@ -4142,6 +4281,7 @@ pub fn applySendFailure(
             .tool_call_id = if (event.tool_call_id) |call_id| try self.allocator.dupe(u8, call_id) else null,
             .tool_call_kind = event.tool_call_kind,
             .tool_call_status = event.tool_call_status,
+            .message_id = if (event.message_id) |id| self.allocator.dupe(u8, id) catch null else null,
         });
         if (event.role == .system) {
             thread.noteBackgroundTaskEvent(self.allocator, event.author, event.body) catch |err| {

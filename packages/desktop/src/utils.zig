@@ -2216,6 +2216,7 @@ pub fn freePendingApprovalLocked(allocator: std.mem.Allocator, approval: *?chat_
 fn freePendingTimelineEvent(allocator: std.mem.Allocator, event: chat_types.PendingTimelineEvent) void {
     allocator.free(event.author);
     allocator.free(event.body);
+    if (event.message_id) |value| allocator.free(value);
     if (event.tool_call_id) |call_id| allocator.free(call_id);
     if (event.tool_call_title) |value| allocator.free(value);
     if (event.tool_call_input) |value| allocator.free(value);

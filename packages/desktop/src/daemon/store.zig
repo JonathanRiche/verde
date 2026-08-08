@@ -832,9 +832,112 @@ pub const Store = struct {
         };
     }
 
+    /// Identity-preserving snapshot application (M4-P4 authority fix).
+    ///
+    /// The GUI snapshot is not the transcript authority anymore: rows the
+    /// daemon committed (`turn:{id}:msg:{n}` plus ledger-referenced client
+    /// user ids) and thread rows created daemon-side (MCP `chat.thread.upsert`
+    /// / turn staging — their `local_thread_id` is public API since M4-P5)
+    /// must survive a snapshot the GUI built before observing them. The wipe
+    /// therefore stages those rows in temp tables first and re-homes any of
+    /// them the snapshot did not carry, all inside applyMutation's single
+    /// `begin immediate` transaction.
     fn applySnapshot(self: *Self, snapshot: store_protocol.Snapshot, store_revision: i64) !void {
         if (snapshot.schema_version != 1) return error.InvalidParams;
 
+        // Stage the protected sets before the wipe. Thread scope: any thread
+        // with a stable id that is committed or ledger-referenced — the GUI
+        // never deliberately omits a committed thread from its snapshot (only
+        // uncommitted trailing drafts / pristine legacy companions are ever
+        // dropped), so an omitted committed thread is one the GUI has not
+        // observed. Message scope: daemon-minted `turn:%` ids plus rows a
+        // committed ledger entry references as its user row.
+        //
+        // The staging tables are created once per connection (`if not exists`)
+        // and emptied per apply: repeated DROP/CREATE would be schema ops,
+        // which SQLite refuses (SQLITE_LOCKED) while any statement on the
+        // connection is unfinalized.
+        try self.conn.execNoArgs(
+            \\create temp table if not exists preserved_chat_threads (
+            \\    workspace_key text not null,
+            \\    sort_index integer not null,
+            \\    title text not null,
+            \\    archived integer not null,
+            \\    committed integer not null,
+            \\    local_thread_id text not null,
+            \\    last_activity_at integer,
+            \\    provider_thread_id text,
+            \\    model_ref text,
+            \\    reasoning_effort integer,
+            \\    reasoning_variant text,
+            \\    fast_mode integer,
+            \\    access_mode integer,
+            \\    provider integer not null,
+            \\    harness integer not null,
+            \\    tui_dock_id integer,
+            \\    draft text not null,
+            \\    draft_image_path text,
+            \\    draft_image_mime text,
+            \\    draft_image_byte_size integer
+            \\);
+            \\create temp table if not exists preserved_chat_messages (
+            \\    workspace_key text not null,
+            \\    thread_key text not null,
+            \\    sort_index integer not null,
+            \\    role integer not null,
+            \\    author text not null,
+            \\    body text not null,
+            \\    image_path text,
+            \\    image_mime text,
+            \\    image_byte_size integer,
+            \\    tool_call_id text,
+            \\    tool_call_kind integer,
+            \\    tool_call_status integer,
+            \\    message_id text not null,
+            \\    created_at_ms integer,
+            \\    updated_at_ms integer,
+            \\    key_fingerprint text,
+            \\    key_created_at_ms integer,
+            \\    key_updated_at_ms integer,
+            \\    key_store_revision integer
+            \\);
+            \\delete from preserved_chat_threads;
+            \\delete from preserved_chat_messages;
+            \\insert into preserved_chat_threads
+            \\select w.workspace_id, t.sort_index, t.title, t.archived, t.committed, t.local_thread_id,
+            \\       t.last_activity_at, t.provider_thread_id, t.model_ref, t.reasoning_effort,
+            \\       t.reasoning_variant, t.fast_mode, t.access_mode, t.provider, t.harness, t.tui_dock_id,
+            \\       t.draft, t.draft_image_path, t.draft_image_mime, t.draft_image_byte_size
+            \\from threads t join workspaces w on w.id = t.workspace_id
+            \\where t.local_thread_id is not null and (
+            \\    t.committed != 0
+            \\    or exists (
+            \\        select 1 from chat_turns ct
+            \\        where ct.workspace_id = w.workspace_id and ct.local_thread_id = t.local_thread_id
+            \\    )
+            \\);
+            \\insert into preserved_chat_messages
+            \\select w.workspace_id, t.local_thread_id, m.sort_index, m.role, m.author, m.body,
+            \\       m.image_path, m.image_mime, m.image_byte_size,
+            \\       m.tool_call_id, m.tool_call_kind, m.tool_call_status,
+            \\       m.message_id, m.created_at_ms, m.updated_at_ms,
+            \\       k.message_fingerprint, k.created_at_ms, k.updated_at_ms, k.store_revision
+            \\from messages m
+            \\join threads t on t.id = m.thread_id
+            \\join workspaces w on w.id = t.workspace_id
+            \\left join client_message_keys k on k.thread_id = m.thread_id and k.message_id = m.message_id
+            \\where t.local_thread_id is not null and m.message_id is not null and (
+            \\    m.message_id like 'turn:%'
+            \\    or m.message_id in (
+            \\        select user_message_id from chat_turns
+            \\        where user_message_id is not null and committed_store_revision is not null
+            \\    )
+            \\);
+        );
+
+        // MINOR-5: `chat_completions` stays out of the wipe — the daemon owns
+        // that ledger post-flip; snapshot rows merge via upsert below and row
+        // removal remains the targeted `chat_completion_clear` command only.
         try self.conn.execNoArgs(
             \\delete from client_message_keys;
             \\delete from messages;
@@ -842,7 +945,6 @@ pub const Store = struct {
             \\delete from app_state;
             \\delete from workspaces;
             \\delete from surface_completions;
-            \\delete from chat_completions;
         );
         try self.conn.exec(
             "insert into app_state (id, selected_workspace_index, sidebar_collapsed) values (1, ?1, ?2)",
@@ -853,7 +955,92 @@ pub const Store = struct {
             try self.insertWorkspaceAtRevision(workspace, workspace_index, snapshot, workspace_index == 0, store_revision);
         }
         for (snapshot.surface_states) |surface| try self.insertSurface(surface);
-        for (snapshot.chat_completions) |completion| try self.insertChatCompletion(completion);
+        for (snapshot.chat_completions) |completion| try self.applyChatCompletionUpsert(completion);
+
+        try self.restorePreservedChatRows();
+        // Empty (never DROP — schema op) so stale copies of transcript rows
+        // do not outlive the apply.
+        try self.conn.execNoArgs(
+            \\delete from preserved_chat_threads;
+            \\delete from preserved_chat_messages;
+        );
+    }
+
+    /// Re-home staged daemon-owned rows the snapshot did not carry.
+    ///
+    /// Scope rules: a workspace absent from the snapshot is a deliberate
+    /// GUI-side project deletion — its threads and rows are not resurrected.
+    /// A thread absent from the snapshot whose workspace survives is restored
+    /// (the GUI cannot have observed it — see applySnapshot). A message id the
+    /// snapshot already carries wins on position/content (M4-P3 parity makes
+    /// content equal); identity is what must never fork, so a second row for
+    /// an existing (thread, message_id) is never inserted — pinned by the
+    /// `messages_thread_message_id_idx` unique index as a hard belt.
+    ///
+    /// Sort-index coherence: restored rows append after the snapshot's rows
+    /// (`max(sort_index) + 1` base plus a per-partition row_number offset, so
+    /// the per-thread/per-workspace unique(sort_index) constraints cannot
+    /// collide). Unobserved daemon rows are always newer than everything the
+    /// GUI carried for that thread — sends are serialized per thread and the
+    /// GUI observes a turn's rows before it can start the next one — so
+    /// appending preserves transcript order, and the post-adoption flush
+    /// carries every id and converges to exactly one copy per identity.
+    fn restorePreservedChatRows(self: *Self) !void {
+        try self.conn.execNoArgs(
+            \\insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id,
+            \\                     last_activity_at, provider_thread_id, model_ref, reasoning_effort,
+            \\                     reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id,
+            \\                     draft, draft_image_path, draft_image_mime, draft_image_byte_size)
+            \\select w.id,
+            \\       (select coalesce(max(t2.sort_index) + 1, 0) from threads t2 where t2.workspace_id = w.id)
+            \\           + (row_number() over (partition by p.workspace_key order by p.sort_index) - 1),
+            \\       p.title, p.archived, p.committed, p.local_thread_id, p.last_activity_at,
+            \\       p.provider_thread_id, p.model_ref, p.reasoning_effort, p.reasoning_variant,
+            \\       p.fast_mode, p.access_mode, p.provider, p.harness, p.tui_dock_id,
+            \\       p.draft, p.draft_image_path, p.draft_image_mime, p.draft_image_byte_size
+            \\from temp.preserved_chat_threads p
+            \\join workspaces w on w.workspace_id = p.workspace_key
+            \\where not exists (
+            \\    select 1 from threads t3
+            \\    where t3.workspace_id = w.id and t3.local_thread_id = p.local_thread_id
+            \\);
+        );
+        try self.conn.execNoArgs(
+            \\insert into messages (thread_id, sort_index, role, author, body, image_path, image_mime,
+            \\                      image_byte_size, tool_call_id, tool_call_kind, tool_call_status,
+            \\                      message_id, created_at_ms, updated_at_ms)
+            \\select t.id,
+            \\       (select coalesce(max(m2.sort_index) + 1, 0) from messages m2 where m2.thread_id = t.id)
+            \\           + (row_number() over (partition by p.workspace_key, p.thread_key order by p.sort_index) - 1),
+            \\       p.role, p.author, p.body, p.image_path, p.image_mime, p.image_byte_size,
+            \\       p.tool_call_id, p.tool_call_kind, p.tool_call_status,
+            \\       p.message_id, p.created_at_ms, p.updated_at_ms
+            \\from temp.preserved_chat_messages p
+            \\join workspaces w on w.workspace_id = p.workspace_key
+            \\join threads t on t.workspace_id = w.id and t.local_thread_id = p.thread_key
+            \\where not exists (
+            \\    select 1 from messages m3
+            \\    where m3.thread_id = t.id and m3.message_id = p.message_id
+            \\);
+        );
+        // Keys of restored rows keep their original fingerprint/revision so a
+        // later same-turn replay commit still resolves duplicate-by-identity
+        // (the F1 user-row exception tolerates the fingerprint drift). Rows
+        // the snapshot carried already re-wrote their key on insert.
+        try self.conn.execNoArgs(
+            \\insert into client_message_keys (thread_id, message_id, message_fingerprint, sort_index,
+            \\                                 created_at_ms, updated_at_ms, store_revision)
+            \\select t.id, p.message_id, p.key_fingerprint, m.sort_index,
+            \\       p.key_created_at_ms, p.key_updated_at_ms, p.key_store_revision
+            \\from temp.preserved_chat_messages p
+            \\join workspaces w on w.workspace_id = p.workspace_key
+            \\join threads t on t.workspace_id = w.id and t.local_thread_id = p.thread_key
+            \\join messages m on m.thread_id = t.id and m.message_id = p.message_id
+            \\where p.key_fingerprint is not null and not exists (
+            \\    select 1 from client_message_keys k2
+            \\    where k2.thread_id = t.id and k2.message_id = p.message_id
+            \\);
+        );
     }
 
     fn applyWorkspace(self: *Self, workspace: store_protocol.Workspace) !void {
@@ -2106,6 +2293,367 @@ test "transcript_apply rows commit with deterministic IDs and replay exactly onc
     defer replay_rows.deinit();
     try std.testing.expectEqual(@as(i64, 2), replay_rows.int(0));
     try std.testing.expectEqual(@as(usize, 0), applied[0].message_id.len);
+}
+
+// M4-P4 fix Layer B (i): a GUI-shaped id-carrying snapshot after a daemon
+// commit preserves every identity, the message keys, and the ledger's
+// user_message_id reference — and an interrupted same-turn replay commit
+// after the snapshot does not duplicate the user row.
+test "snapshot replace preserves daemon-committed identities keys and ledger reference" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    const workspace = testWorkspace("workspace-belt", "Belt workspace");
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("belt-workspace", null),
+        .workspace = workspace,
+    });
+    const thread = testThread("thread-belt", "Belt thread");
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("belt-thread", 1),
+        .workspace_id = workspace.workspace_id,
+        .thread = thread,
+    });
+
+    // Acceptance staging shape: the client user row lands with its stable id.
+    const user_message: store_protocol.Message = .{
+        .message_id = "gui-msg:belt:1",
+        .role = "user",
+        .author = "You",
+        .body = "belt hello",
+        .created_at_ms = 10,
+        .updated_at_ms = 10,
+    };
+    _ = try store.appendMessage(.{
+        .mutation = testHeader("belt-user-stage", 2),
+        .workspace_id = workspace.workspace_id,
+        .thread_id = thread.local_thread_id,
+        .message = user_message,
+    });
+
+    // Commit: F1 prepend (user row slot 0) + one synthesized assistant row.
+    const commit_messages = [_]store_protocol.Message{
+        user_message,
+        .{ .message_id = "", .role = "assistant", .author = "Codex", .body = "belt-ok", .created_at_ms = 20, .updated_at_ms = 20 },
+    };
+    const commit = try store.commitTurn(.{
+        .turn_id = "turn-belt",
+        .workspace_id = workspace.workspace_id,
+        .local_thread_id = thread.local_thread_id,
+        .status = .completed,
+        .started_at_ms = 10,
+        .finished_at_ms = 20,
+        .provider = "codex",
+        .user_message_id = "gui-msg:belt:1",
+        .messages = &commit_messages,
+    });
+    try std.testing.expectEqual(@as(u64, 4), commit.store_revision);
+
+    // Post-adoption GUI flush: full snapshot carrying both adopted ids.
+    const snapshot_messages = [_]store_protocol.Message{
+        .{ .message_id = "gui-msg:belt:1", .role = "user", .author = "You", .body = "belt hello" },
+        .{ .message_id = "turn:turn-belt:msg:1", .role = "assistant", .author = "Codex", .body = "belt-ok" },
+    };
+    var snapshot_thread = testThread("thread-belt", "Belt thread");
+    snapshot_thread.messages = &snapshot_messages;
+    var snapshot_workspace = testWorkspace("workspace-belt", "Belt workspace");
+    snapshot_workspace.threads = &.{snapshot_thread};
+    const workspaces = [_]store_protocol.Workspace{snapshot_workspace};
+    _ = try store.applyMutation(.{ .snapshot_replace = testSnapshotRequest("belt-flush-1", 4, false, testSnapshot(&workspaces)) });
+
+    var rows = try store.conn.rows(
+        "select message_id from messages where thread_id = (select id from threads where local_thread_id = ?1) order by sort_index",
+        .{thread.local_thread_id},
+    );
+    defer rows.deinit();
+    const ids: [2][]const u8 = .{ "gui-msg:belt:1", "turn:turn-belt:msg:1" };
+    var row_count: usize = 0;
+    while (rows.next()) |row| : (row_count += 1) {
+        try std.testing.expect(row_count < ids.len);
+        try std.testing.expectEqualStrings(ids[row_count], row.text(0));
+    }
+    if (rows.err) |err| return err;
+    try std.testing.expectEqual(@as(usize, 2), row_count);
+
+    var keys = (try store.conn.row(
+        "select count(*) from client_message_keys where thread_id = (select id from threads where local_thread_id = ?1)",
+        .{thread.local_thread_id},
+    )).?;
+    defer keys.deinit();
+    try std.testing.expectEqual(@as(i64, 2), keys.int(0));
+
+    // Ledger user_message_id must resolve to a real transcript row.
+    var resolved = (try store.conn.row(
+        \\select count(*) from chat_turns ct
+        \\join threads t on t.local_thread_id = ct.local_thread_id
+        \\join messages m on m.thread_id = t.id and m.message_id = ct.user_message_id
+        \\where ct.turn_id = 'turn-belt'
+    ,
+        .{},
+    )).?;
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(i64, 1), resolved.int(0));
+
+    // Interrupted-replay corner: a second commit for the same turn with a
+    // drifted user-row fingerprint must not duplicate the user row. Use a
+    // fresh turn (no receipt) whose user row the snapshot already carries.
+    const replay_messages = [_]store_protocol.Message{
+        .{ .message_id = "gui-msg:belt:1", .role = "user", .author = "You", .body = "belt hello", .created_at_ms = 99, .updated_at_ms = 99 },
+        .{ .message_id = "", .role = "assistant", .author = "Codex", .body = "belt-again", .created_at_ms = 100, .updated_at_ms = 100 },
+    };
+    _ = try store.commitTurn(.{
+        .turn_id = "turn-belt-replay",
+        .workspace_id = workspace.workspace_id,
+        .local_thread_id = thread.local_thread_id,
+        .status = .completed,
+        .started_at_ms = 99,
+        .finished_at_ms = 100,
+        .provider = "codex",
+        .user_message_id = "gui-msg:belt:1",
+        .messages = &replay_messages,
+    });
+    var user_rows = (try store.conn.row(
+        "select count(*) from messages where message_id = 'gui-msg:belt:1'",
+        .{},
+    )).?;
+    defer user_rows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), user_rows.int(0));
+}
+
+// M4-P4 fix Layer B (ii): a mid-window snapshot (commit → GUI observation gap)
+// missing the turn's synthesized rows preserves them with coherent order, and
+// the converged post-adoption flush keeps exactly one copy per identity.
+test "snapshot missing unobserved turn rows preserves them in transcript order" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    const workspace = testWorkspace("workspace-mid", "Mid workspace");
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("mid-workspace", null),
+        .workspace = workspace,
+    });
+    const thread = testThread("thread-mid", "Mid thread");
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("mid-thread", 1),
+        .workspace_id = workspace.workspace_id,
+        .thread = thread,
+    });
+
+    const commit_messages = [_]store_protocol.Message{
+        .{ .message_id = "gui-msg:mid:1", .role = "user", .author = "You", .body = "mid hello", .created_at_ms = 10, .updated_at_ms = 10 },
+        .{ .message_id = "", .role = "assistant", .author = "Codex", .body = "mid-a", .created_at_ms = 20, .updated_at_ms = 20 },
+        .{ .message_id = "", .role = "system", .author = "Ran command", .body = "$ true", .created_at_ms = 21, .updated_at_ms = 21 },
+    };
+    const commit = try store.commitTurn(.{
+        .turn_id = "turn-mid",
+        .workspace_id = workspace.workspace_id,
+        .local_thread_id = thread.local_thread_id,
+        .status = .completed,
+        .started_at_ms = 10,
+        .finished_at_ms = 21,
+        .provider = "codex",
+        .user_message_id = "gui-msg:mid:1",
+        .messages = &commit_messages,
+    });
+    try std.testing.expectEqual(@as(u64, 3), commit.store_revision);
+
+    const expected_ids = [_][]const u8{ "gui-msg:mid:1", "turn:turn-mid:msg:1", "turn:turn-mid:msg:2" };
+
+    // Mid-window flush: the GUI knows only its own user row.
+    const mid_messages = [_]store_protocol.Message{
+        .{ .message_id = "gui-msg:mid:1", .role = "user", .author = "You", .body = "mid hello" },
+    };
+    var mid_thread = testThread("thread-mid", "Mid thread");
+    mid_thread.messages = &mid_messages;
+    var mid_workspace = testWorkspace("workspace-mid", "Mid workspace");
+    mid_workspace.threads = &.{mid_thread};
+    const mid_workspaces = [_]store_protocol.Workspace{mid_workspace};
+    _ = try store.applyMutation(.{ .snapshot_replace = testSnapshotRequest("mid-flush-1", 3, false, testSnapshot(&mid_workspaces)) });
+
+    {
+        var rows = try store.conn.rows(
+            "select message_id, sort_index from messages where thread_id = (select id from threads where local_thread_id = ?1) order by sort_index",
+            .{thread.local_thread_id},
+        );
+        defer rows.deinit();
+        var row_count: usize = 0;
+        var last_sort: i64 = -1;
+        while (rows.next()) |row| : (row_count += 1) {
+            try std.testing.expect(row_count < expected_ids.len);
+            try std.testing.expectEqualStrings(expected_ids[row_count], row.text(0));
+            try std.testing.expect(row.int(1) > last_sort);
+            last_sort = row.int(1);
+        }
+        if (rows.err) |err| return err;
+        try std.testing.expectEqual(@as(usize, 3), row_count);
+    }
+
+    // Restored keys keep identities resolvable for later replay commits.
+    var keys = (try store.conn.row(
+        "select count(*) from client_message_keys where thread_id = (select id from threads where local_thread_id = ?1)",
+        .{thread.local_thread_id},
+    )).?;
+    defer keys.deinit();
+    try std.testing.expectEqual(@as(i64, 3), keys.int(0));
+
+    // Converged post-adoption flush: all ids present, exactly one copy each.
+    const full_messages = [_]store_protocol.Message{
+        .{ .message_id = "gui-msg:mid:1", .role = "user", .author = "You", .body = "mid hello" },
+        .{ .message_id = "turn:turn-mid:msg:1", .role = "assistant", .author = "Codex", .body = "mid-a" },
+        .{ .message_id = "turn:turn-mid:msg:2", .role = "system", .author = "Ran command", .body = "$ true" },
+    };
+    var full_thread = testThread("thread-mid", "Mid thread");
+    full_thread.messages = &full_messages;
+    var full_workspace = testWorkspace("workspace-mid", "Mid workspace");
+    full_workspace.threads = &.{full_thread};
+    const full_workspaces = [_]store_protocol.Workspace{full_workspace};
+    _ = try store.applyMutation(.{ .snapshot_replace = testSnapshotRequest("mid-flush-2", 4, false, testSnapshot(&full_workspaces)) });
+
+    {
+        var rows = try store.conn.rows(
+            "select message_id from messages where thread_id = (select id from threads where local_thread_id = ?1) order by sort_index",
+            .{thread.local_thread_id},
+        );
+        defer rows.deinit();
+        var row_count: usize = 0;
+        while (rows.next()) |row| : (row_count += 1) {
+            try std.testing.expect(row_count < expected_ids.len);
+            try std.testing.expectEqualStrings(expected_ids[row_count], row.text(0));
+        }
+        if (rows.err) |err| return err;
+        try std.testing.expectEqual(@as(usize, 3), row_count);
+    }
+}
+
+// M4-P4 fix Layer B (iii) / MINOR-5: the daemon-owned chat_completions ledger
+// survives a GUI snapshot that does not know the row yet; removal remains the
+// targeted clear command only.
+test "chat completion ledger survives snapshot lacking it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    const workspace = testWorkspace("workspace-done", "Done workspace");
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("done-workspace", null),
+        .workspace = workspace,
+    });
+    const thread = testThread("thread-done", "Done thread");
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("done-thread", 1),
+        .workspace_id = workspace.workspace_id,
+        .thread = thread,
+    });
+    const commit_messages = [_]store_protocol.Message{
+        .{ .message_id = "gui-msg:done:1", .role = "user", .author = "You", .body = "done hello" },
+    };
+    _ = try store.commitTurn(.{
+        .turn_id = "turn-done",
+        .workspace_id = workspace.workspace_id,
+        .local_thread_id = thread.local_thread_id,
+        .status = .completed,
+        .started_at_ms = 10,
+        .finished_at_ms = 20,
+        .provider = "codex",
+        .user_message_id = "gui-msg:done:1",
+        .messages = &commit_messages,
+    });
+
+    // Snapshot in the commit→observation window: no chat_completions payload.
+    const workspaces = [_]store_protocol.Workspace{testWorkspace("workspace-done", "Done workspace")};
+    _ = try store.applyMutation(.{ .snapshot_replace = testSnapshotRequest("done-flush", 3, false, testSnapshot(&workspaces)) });
+
+    var survived = (try store.conn.row(
+        "select count(*) from chat_completions where workspace_id = ?1 and local_thread_id = ?2",
+        .{ workspace.workspace_id, thread.local_thread_id },
+    )).?;
+    defer survived.deinit();
+    try std.testing.expectEqual(@as(i64, 1), survived.int(0));
+
+    const cleared = try store.clearChatCompletion(.{
+        .mutation = testHeader("done-clear", 4),
+        .workspace_id = workspace.workspace_id,
+        .local_thread_id = thread.local_thread_id,
+    });
+    try std.testing.expect(cleared.applied);
+    var removed = (try store.conn.row(
+        "select count(*) from chat_completions where workspace_id = ?1 and local_thread_id = ?2",
+        .{ workspace.workspace_id, thread.local_thread_id },
+    )).?;
+    defer removed.deinit();
+    try std.testing.expectEqual(@as(i64, 0), removed.int(0));
+}
+
+// M4-P5 verify MAJOR-3 amendment: daemon-created thread rows (MCP
+// chat.thread.upsert — stable local_thread_id is public API) survive a GUI
+// snapshot that never observed them, while uncommitted GUI drafts the GUI
+// deliberately dropped stay deleted.
+test "snapshot preserves daemon-created thread rows and still drops abandoned drafts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    const workspace = testWorkspace("workspace-mcp", "MCP workspace");
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("mcp-workspace", null),
+        .workspace = workspace,
+    });
+    // MCP open_chat shape: committed thread, no messages, no GUI observation.
+    const mcp_thread = testThread("thread-mcp", "MCP thread");
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("mcp-thread", 1),
+        .workspace_id = workspace.workspace_id,
+        .thread = mcp_thread,
+    });
+
+    // GUI flush 1 knows only its own uncommitted draft thread.
+    var draft_thread = testThread("draft-1", "New thread");
+    draft_thread.committed = false;
+    var gui_workspace = testWorkspace("workspace-mcp", "MCP workspace");
+    gui_workspace.threads = &.{draft_thread};
+    const first_workspaces = [_]store_protocol.Workspace{gui_workspace};
+    _ = try store.applyMutation(.{ .snapshot_replace = testSnapshotRequest("mcp-flush-1", 2, false, testSnapshot(&first_workspaces)) });
+
+    var after_first = (try store.conn.row(
+        "select count(*) from threads where local_thread_id = 'thread-mcp'",
+        .{},
+    )).?;
+    defer after_first.deinit();
+    try std.testing.expectEqual(@as(i64, 1), after_first.int(0));
+
+    // GUI flush 2 dropped the abandoned draft (pane closed): the draft must
+    // stay deleted while the daemon-created thread still survives.
+    var empty_workspace = testWorkspace("workspace-mcp", "MCP workspace");
+    empty_workspace.threads = &.{};
+    const second_workspaces = [_]store_protocol.Workspace{empty_workspace};
+    _ = try store.applyMutation(.{ .snapshot_replace = testSnapshotRequest("mcp-flush-2", 3, false, testSnapshot(&second_workspaces)) });
+
+    var kept = (try store.conn.row(
+        "select count(*) from threads where local_thread_id = 'thread-mcp'",
+        .{},
+    )).?;
+    defer kept.deinit();
+    try std.testing.expectEqual(@as(i64, 1), kept.int(0));
+    var dropped = (try store.conn.row(
+        "select count(*) from threads where local_thread_id = 'draft-1'",
+        .{},
+    )).?;
+    defer dropped.deinit();
+    try std.testing.expectEqual(@as(i64, 0), dropped.int(0));
 }
 
 test "aborted turn carries followup intent and compaction expiry uses revision_expired data" {

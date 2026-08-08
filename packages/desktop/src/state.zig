@@ -3830,6 +3830,7 @@ pub const AppState = struct {
         self.allocator.free(message.author);
         self.allocator.free(message.body);
         if (message.tool_call_id) |call_id| self.allocator.free(call_id);
+        if (message.message_id) |message_id| self.allocator.free(message_id);
         if (message.image) |image| {
             self.evictCachedImageTexture(image.path);
             var owned_image = image;

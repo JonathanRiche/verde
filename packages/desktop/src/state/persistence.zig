@@ -269,6 +269,9 @@ fn persistedMessageSnapshot(allocator: std.mem.Allocator, message: *const ChatMe
         .tool_call_id = try dupeOptionalSlice(allocator, message.tool_call_id),
         .tool_call_kind = message.tool_call_kind,
         .tool_call_status = message.tool_call_status,
+        // Identity carriage (M4-P4): the flush must never re-mint an id the
+        // projection already knows (daemon-adopted or client-staged).
+        .message_id = try dupeOptionalSlice(allocator, message.message_id),
     };
 }
 
@@ -283,6 +286,14 @@ fn imageSnapshot(allocator: std.mem.Allocator, image: ?ChatImageAttachment) !?Pe
 
 fn dupeOptionalSlice(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
     return if (value) |slice| try allocator.dupe(u8, slice) else null;
+}
+
+/// Identity round-trip helper (M4-P4): the wire encodes "no identity" as an
+/// empty string; the projection uses null. Never carry an empty id inward.
+fn dupeOptionalNonEmptySlice(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
+    const slice = value orelse return null;
+    if (slice.len == 0) return null;
+    return try allocator.dupe(u8, slice);
 }
 
 /// Convert a desktop persisted surface row into the store wire DTO.
@@ -413,8 +424,17 @@ fn messagesToProtocol(allocator: std.mem.Allocator, messages: []const PersistedM
     var out = try allocator.alloc(headless.store.Message, messages.len);
     for (messages, 0..) |message, i| {
         out[i] = .{
-            // Snapshot rows may omit message_id; the store accepts empty here.
-            .message_id = try std.fmt.allocPrint(allocator, "snap-msg-{d}", .{i}),
+            // Identity carriage (M4-P4): pass a known projection identity
+            // through verbatim; mint the positional legacy id only for rows
+            // that never had one. Minted ids become sticky on the next load,
+            // so a flush never re-mints an id positionally. Positional minting
+            // cannot collide with a sticky `snap-msg-{j}`: a sticky id keeps
+            // the array index it was minted at (rows only ever append), so a
+            // null-id row always sits at a different index than any sticky id.
+            .message_id = if (message.message_id) |id|
+                try allocator.dupe(u8, id)
+            else
+                try std.fmt.allocPrint(allocator, "snap-msg-{d}", .{i}),
             .role = try allocator.dupe(u8, @tagName(message.role)),
             .author = try allocator.dupe(u8, message.author),
             .body = try allocator.dupe(u8, message.body),
@@ -551,6 +571,7 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
                         .tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id),
                         .tool_call_kind = message.tool_call_kind,
                         .tool_call_status = message.tool_call_status,
+                        .message_id = try dupeOptionalNonEmptySlice(self.allocator, message.message_id),
                     });
                 }
                 thread.rebuildBackgroundTasksFromMessages(self.allocator);
@@ -591,6 +612,7 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
                     .tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id),
                     .tool_call_kind = message.tool_call_kind,
                     .tool_call_status = message.tool_call_status,
+                    .message_id = try dupeOptionalNonEmptySlice(self.allocator, message.message_id),
                 });
             }
             thread.rebuildBackgroundTasksFromMessages(self.allocator);
@@ -619,6 +641,7 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
                     .tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id),
                     .tool_call_kind = message.tool_call_kind,
                     .tool_call_status = message.tool_call_status,
+                    .message_id = try dupeOptionalNonEmptySlice(self.allocator, message.message_id),
                 });
             }
             fallback_thread.rebuildBackgroundTasksFromMessages(self.allocator);
@@ -782,6 +805,87 @@ pub fn appJsonInt(value: std.json.Value) ?i64 {
         .float => |f| @intFromFloat(f),
         else => null,
     };
+}
+
+test "message identities survive the genuine snapshot chain into a real store" {
+    // M4-P4 fix: the REAL GUI writer chain — projection ChatThread (adopted
+    // ids) → threadSnapshot → persistedStateToProtocolSnapshot → daemon store
+    // applySnapshot — must preserve daemon-minted and client identities and
+    // mint `snap-msg-{i}` only for legacy id-less rows.
+    const store_mod = @import("../daemon/store.zig");
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const db_path = try std.fs.path.joinZ(allocator, &.{ path_buf[0..path_len], "state.sqlite" });
+    defer allocator.free(db_path);
+
+    var thread = try ChatThread.init(allocator, "Identity thread");
+    defer thread.deinit(allocator);
+    thread.committed = true;
+    try thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "hello"),
+        .message_id = try allocator.dupe(u8, "gui-msg:ws-id:t:1"),
+    });
+    try thread.messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Codex"),
+        .body = try allocator.dupeZ(u8, "reply"),
+        .message_id = try allocator.dupe(u8, "turn:turn-x:msg:1"),
+    });
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "System"),
+        .body = try allocator.dupeZ(u8, "legacy row"),
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const persisted_thread = try threadSnapshot(arena, &thread);
+    const persisted_threads = [_]PersistedThread{persisted_thread};
+    const projects = [_]PersistedProject{.{
+        .id = "ws-id",
+        .label = "Identity workspace",
+        .path = "/tmp/ws-id",
+        .threads = &persisted_threads,
+    }};
+    const state: PersistedState = .{ .projects = &projects };
+    const snapshot = try persistedStateToProtocolSnapshot(arena, state, 0);
+    const wire_messages = snapshot.workspaces[0].threads[0].messages;
+    try std.testing.expectEqual(@as(usize, 3), wire_messages.len);
+    try std.testing.expectEqualStrings("gui-msg:ws-id:t:1", wire_messages[0].message_id);
+    try std.testing.expectEqualStrings("turn:turn-x:msg:1", wire_messages[1].message_id);
+    try std.testing.expectEqualStrings("snap-msg-2", wire_messages[2].message_id);
+
+    var writer = try store_mod.Store.init(allocator, db_path);
+    defer writer.deinit();
+    _ = try writer.replaceSnapshot(.{
+        .mutation = .{
+            .request_key = "identity-chain-flush",
+            .client_id = "test-client",
+            // Non-bootstrap snapshots require an explicit guard; a fresh
+            // store sits at revision 0.
+            .expected_store_revision = 0,
+        },
+        .snapshot = snapshot,
+        .bootstrap = false,
+    });
+
+    var rows = try writer.conn.rows("select message_id from messages order by sort_index", .{});
+    defer rows.deinit();
+    const expected_ids = [_][]const u8{ "gui-msg:ws-id:t:1", "turn:turn-x:msg:1", "snap-msg-2" };
+    var row_count: usize = 0;
+    while (rows.next()) |row| : (row_count += 1) {
+        try std.testing.expect(row_count < expected_ids.len);
+        try std.testing.expectEqualStrings(expected_ids[row_count], row.text(0));
+    }
+    if (rows.err) |err| return err;
+    try std.testing.expectEqual(@as(usize, 3), row_count);
 }
 
 pub fn seedDefaultState(self: anytype) !void {

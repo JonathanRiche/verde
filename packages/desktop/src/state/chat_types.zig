@@ -84,6 +84,11 @@ pub const ChatMessage = struct {
     tool_call_id: ?[]const u8 = null,
     tool_call_kind: ?ai_harness.ToolCallKind = null,
     tool_call_status: ?ai_harness.ToolCallStatus = null,
+    /// Durable transcript identity (M4-P4): the acceptance-staged client id on
+    /// user rows, or the daemon-minted id adopted from `chat.thread.get` at
+    /// terminal. Null until an identity is known; persistence carries it
+    /// verbatim so flushes never rewrite daemon-committed identities.
+    message_id: ?[]const u8 = null,
 };
 
 pub const ChatImageAttachment = struct {
@@ -622,6 +627,7 @@ pub const ChatThread = struct {
             allocator.free(message.author);
             allocator.free(message.body);
             if (message.tool_call_id) |call_id| allocator.free(call_id);
+            if (message.message_id) |message_id| allocator.free(message_id);
             if (message.image) |*image| image.deinit(allocator);
             for (message.extra_images) |*image| image.deinit(allocator);
             allocator.free(message.extra_images);
@@ -761,6 +767,9 @@ pub const PendingTimelineEvent = struct {
     role: ChatRole,
     author: []u8,
     body: []u8,
+    /// Daemon payload identity when the event carried one (`message` events);
+    /// adopted into the projection row so the persistence flush keeps it.
+    message_id: ?[]u8 = null,
     tool_call_id: ?[]u8 = null,
     tool_call_kind: ?ai_harness.ToolCallKind = null,
     tool_call_status: ?ai_harness.ToolCallStatus = null,
@@ -795,6 +804,7 @@ pub fn freePendingApproval(allocator: std.mem.Allocator, approval: *?PendingAppr
 fn freePendingTimelineEvent(allocator: std.mem.Allocator, event: PendingTimelineEvent) void {
     allocator.free(event.author);
     allocator.free(event.body);
+    if (event.message_id) |value| allocator.free(value);
     if (event.tool_call_id) |value| allocator.free(value);
     if (event.tool_call_title) |value| allocator.free(value);
     if (event.tool_call_input) |value| allocator.free(value);
