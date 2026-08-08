@@ -169,6 +169,7 @@ test "core.status happy path with fake context" {
     try std.testing.expectEqual(@as(usize, 3), status.session_count);
     try std.testing.expectEqual(@as(usize, 5), status.chat_turn_count);
     try std.testing.expect(status.capabilities.terminal_raw);
+    // M4-P4: chat capability remains false (advertisement is M4-P5).
     try std.testing.expect(!status.capabilities.chat);
     try std.testing.expect(!status.capabilities.terminal_grid);
     try std.testing.expect(!status.capabilities.processes);

@@ -1008,7 +1008,20 @@ pub const Store = struct {
 
                 if (self.messageKeyStatusFor(request.workspace_id, request.local_thread_id, stored_message)) |existing| {
                     if (existing) |status| {
-                        if (status.conflict) return error.Conflict;
+                        if (status.conflict) {
+                            // Amendment-2 F1: the turn's user row is idempotent
+                            // by IDENTITY, not fingerprint. A stable-turn_id
+                            // replay after an interrupted sweep re-sends the
+                            // acceptance user row with drifted prompt/timestamps;
+                            // the originally staged row stays authoritative
+                            // (first-writer-wins). All other rows keep strict
+                            // fingerprint conflicts.
+                            const is_user_row = if (request.user_message_id) |uid|
+                                std.mem.eql(u8, stored_message.message_id, uid)
+                            else
+                                false;
+                            if (!is_user_row) return error.Conflict;
+                        }
                         continue;
                     }
                 } else |err| return err;

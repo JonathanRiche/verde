@@ -212,6 +212,8 @@ pub fn capabilityUnavailable(feature: CapabilityFeature) Error {
 pub const Capabilities = struct {
     terminal_raw: bool = true,
     terminal_grid: bool = false,
+    /// M4-P4: stays false until M4-P5 advertises chat with the MCP/CLI flip
+    /// (authority flip alone does not advertise; mirrors M2's discipline).
     chat: bool = false,
     processes: bool = false,
     leases: bool = false,
