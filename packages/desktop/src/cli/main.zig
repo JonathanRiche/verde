@@ -1363,6 +1363,18 @@ pub fn handleCore(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
                 try out.stderr("core changes --wait-ms must be a non-negative 32-bit integer\n", .{});
                 std.process.exit(2);
             };
+            if (wait_ms > CORE_CHANGES_MAX_WAIT_MS) {
+                if (args.hasFlag(argv, "--json")) {
+                    try out.jsonValue(allocator, .{
+                        .ok = false,
+                        .error_code = "invalid_params",
+                        .error_message = "core changes --wait-ms must not exceed 25000",
+                    });
+                } else {
+                    try out.stderr("core changes --wait-ms must not exceed 25000\n", .{});
+                }
+                std.process.exit(2);
+            }
             arg_index += 2;
             continue;
         }
@@ -1383,6 +1395,11 @@ pub fn handleCore(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
     var transport: sessionizer.HeadlessTransport = .{
         .allocator = arena,
         .pref_path = pref_path,
+        // Cross-boundary ordering: the daemon parks for at most wait_ms, while
+        // this transport remains alive for that full interval plus bounded
+        // connect/write/response overhead. The CLI rejects values above the
+        // daemon's 25s cap, so this deadline is never above 30s.
+        .timeout_ms = if (is_changes) wait_ms + CORE_CHANGES_TRANSPORT_OVERHEAD_MS else 5_000,
     };
     var client = sessionizer.headlessClient(arena, &transport);
     // Explicit empty object: bare `.{}` can stringify as `[]` and fail params validation.
@@ -5009,12 +5026,15 @@ fn chatDaemonOpenThreadEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, o
 // The GUI's chat.open response is authored before its store dual-write is
 // necessarily durable, so after a Live success the CLI confirms the session
 // daemon can read the thread row back before reporting success. Budget:
-// 40 attempts x 50 ms = 2 s. The confirm is read-only (chat.thread.get); the
+// 40 attempts x 50 ms = one absolute 2 s wall-clock budget. The confirm is
+// read-only (chat.thread.get); the
 // CLI never upserts GUI-created threads.
 // ---------------------------------------------------------------------------
 
 const CHAT_OPEN_CONFIRM_ATTEMPTS: u32 = 40;
 const CHAT_OPEN_CONFIRM_DELAY_MS: u64 = 50;
+const CORE_CHANGES_MAX_WAIT_MS: u32 = 25_000;
+const CORE_CHANGES_TRANSPORT_OVERHEAD_MS: u32 = 5_000;
 
 const ChatOpenLiveIds = struct {
     local_thread_id: []const u8,
@@ -5070,9 +5090,13 @@ pub fn chatOpenConfirmThreadDurable(
     attempts: u32,
     delay_ms: u64,
 ) !ChatOpenConfirmOutcome {
-    const exe_path = try platform_runtime.executablePathAlloc(allocator);
-    defer allocator.free(exe_path);
-    try ensureSessionDaemon(allocator, io, exe_path);
+    const budget_ms_u64 = std.math.mul(u64, attempts, delay_ms) catch std.math.maxInt(u64);
+    const budget_ms: i64 = @intCast(@min(budget_ms_u64, @as(u64, std.math.maxInt(i64))));
+    const started_at_ms = sessionizer.nowMs();
+    const deadline_ms = std.math.add(i64, started_at_ms, budget_ms) catch std.math.maxInt(i64);
+    // A Live chat.open just reached the running desktop/daemon pair. Do not
+    // autostart here: ensureDaemon has its own multi-second retry contract and
+    // would escape this helper's single confirmation deadline.
     const pref_path = try prefPath(allocator);
     defer allocator.free(pref_path);
 
@@ -5086,23 +5110,31 @@ pub fn chatOpenConfirmThreadDurable(
         var transport: sessionizer.HeadlessTransport = .{
             .allocator = arena,
             .pref_path = pref_path,
+            .timeout_ms = confirmationRemainingTimeoutMs(deadline_ms) orelse return .timeout,
         };
         var client = sessionizer.headlessClient(arena, &transport);
         chatDaemonRequireCapability(&client) catch |err| switch (err) {
             error.ChatCapabilityUnavailable => return .capability_skip,
-            else => return err,
+            else => if (confirmationRemainingTimeoutMs(deadline_ms) == null) return .timeout else return err,
         };
     }
 
     var attempt: u32 = 0;
     while (attempt < attempts) : (attempt += 1) {
-        if (attempt != 0) std.Io.sleep(io, .fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
+        if (attempt != 0) {
+            const remaining_ms = confirmationRemainingMs(deadline_ms) orelse return .timeout;
+            const sleep_ms = @min(delay_ms, @as(u64, @intCast(remaining_ms)));
+            std.Io.sleep(io, .fromMilliseconds(@intCast(sleep_ms)), .awake) catch {};
+        }
         var poll_arena = std.heap.ArenaAllocator.init(allocator);
         defer poll_arena.deinit();
         const arena = poll_arena.allocator();
         var transport: sessionizer.HeadlessTransport = .{
             .allocator = arena,
             .pref_path = pref_path,
+            // Cross-boundary ordering: every stalled read receives only the
+            // remaining absolute budget, never a fresh 5s timeout.
+            .timeout_ms = confirmationRemainingTimeoutMs(deadline_ms) orelse return .timeout,
         };
         var client = sessionizer.headlessClient(arena, &transport);
         var parsed = client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
@@ -5113,6 +5145,16 @@ pub fn chatOpenConfirmThreadDurable(
         if (parsed.response.isOk()) return .durable;
     }
     return .timeout;
+}
+
+fn confirmationRemainingMs(deadline_ms: i64) ?i64 {
+    const remaining_ms = deadline_ms -| sessionizer.nowMs();
+    return if (remaining_ms > 0) remaining_ms else null;
+}
+
+fn confirmationRemainingTimeoutMs(deadline_ms: i64) ?u32 {
+    const remaining_ms = confirmationRemainingMs(deadline_ms) orelse return null;
+    return @intCast(@min(remaining_ms, @as(i64, std.math.maxInt(u32))));
 }
 
 /// Typed MCP tool error for a Live open_chat whose durable read-back failed:
