@@ -108,6 +108,20 @@ pub fn dispatch(
             .body = .{ .capabilities = buildCapabilities() },
         };
     }
+    // Q8: these names are wire-reserved but explicitly undispatched through
+    // all of M5. Use the host dispatch spelling so callers cannot mistake a
+    // reserved push contract for the generic core extension namespace.
+    if (std.mem.eql(u8, method, "core.subscribe") or
+        std.mem.eql(u8, method, "core.unsubscribe"))
+    {
+        return .{
+            .id = id,
+            .body = .{ .err = .{
+                .code = "method_not_found",
+                .message = method,
+            } },
+        };
+    }
 
     return .{
         .id = id,
@@ -172,6 +186,9 @@ test "core.status happy path with fake context" {
     // M4-P5 flip: chat is advertised in the same commit that routes the
     // MCP/CLI chat tools daemon-direct (was pinned false through M4-P4).
     try std.testing.expect(status.capabilities.chat);
+    try std.testing.expect(status.capabilities.snapshots);
+    try std.testing.expect(status.capabilities.changes);
+    try std.testing.expect(!status.capabilities.subscriptions);
     try std.testing.expect(!status.capabilities.terminal_grid);
     try std.testing.expect(!status.capabilities.processes);
     try std.testing.expect(!status.capabilities.leases);
@@ -195,6 +212,11 @@ test "core.capabilities content" {
     try std.testing.expect(caps.capabilities.terminal_raw);
     // M4-P5 flip: buildCapabilities advertises chat with the MCP/CLI flip.
     try std.testing.expect(caps.capabilities.chat);
+    // M5-P5: both already-routed read surfaces advertise atomically.
+    try std.testing.expect(caps.capabilities.snapshots);
+    try std.testing.expect(caps.capabilities.changes);
+    // Q8 is unconditional: reserved push names remain undispatched.
+    try std.testing.expect(!caps.capabilities.subscriptions);
     try std.testing.expect(!caps.capabilities.browser_presentation);
     try std.testing.expect(!caps.capabilities.browser.available);
     try std.testing.expect(!caps.capabilities.isFeatureAvailable(.browser_screenshot));
@@ -204,6 +226,21 @@ test "unknown method yields unknown_method" {
     const response = dispatch(3, "core.snapshot", .null, fakeContext());
     try std.testing.expect(!response.isOk());
     try std.testing.expectEqualStrings(protocol.ERR_UNKNOWN_METHOD, response.body.err.code);
+}
+
+test "M5-P5 snapshot and changes are reads while push names stay reserved" {
+    try std.testing.expect(!isMutatingMethod("core.snapshot"));
+    try std.testing.expect(!isMutatingMethod("core.changes"));
+    try std.testing.expect(!isMutatingMethod("core.subscribe"));
+    try std.testing.expect(!isMutatingMethod("core.unsubscribe"));
+
+    // This transport-independent dispatcher does not own the store-backed
+    // handlers; importantly it also does not dispatch either reserved name.
+    inline for (.{ "core.subscribe", "core.unsubscribe" }) |method| {
+        const response = dispatch(30, method, .null, fakeContext());
+        try std.testing.expect(!response.isOk());
+        try std.testing.expectEqualStrings("method_not_found", response.body.err.code);
+    }
 }
 
 test "invalid params yields invalid_params" {

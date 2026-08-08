@@ -27,7 +27,7 @@ const VERSION = build_options.version;
 const SOCKET_NAME = live_endpoint.SOCKET_NAME;
 const LIVE_RESPONSE_TIMEOUT_MS: u32 = 5000;
 const MCP_TOOL_NAME_FIELD = "_verdeMcpTool";
-const CORE_COMMANDS = [_][]const u8{ "status", "capabilities" };
+const CORE_COMMANDS = [_][]const u8{ "status", "capabilities", "snapshot", "changes" };
 const TERMINAL_GET_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
     .macos => @bitCast(@as(u32, 0x40087468)),
     .windows => 0,
@@ -193,6 +193,8 @@ fn printHelp(out: output.Output) !void {
         \\Core commands:
         \\  status [--json]
         \\  capabilities [--json]
+        \\  snapshot [--scope <store|registry|sessions|turns>]... [--json]
+        \\  changes [--cursor <seq>] [--wait-ms <ms>] [--topic <topic>]... [--json]
         \\
         \\Live commands:
         \\  status [--json]
@@ -347,7 +349,7 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
         \\  integrations: list, doctor, install, remove, disable
         \\  theme: import, validate, export, reset
         \\  session: list, inspect, new, attach, write, tail, screen, kill, cleanup
-        \\  core: status, capabilities
+        \\  core: status, capabilities, snapshot, changes
         \\  live: status, workspaces, panes, pane control, chat control, terminal text/key/process/agent control
         \\  completion: bash, zsh, fish, powershell
         \\  encodings: json, jsonl
@@ -1273,9 +1275,9 @@ const PersistedSessionRef = struct {
     daemon_status: []const u8 = "metadata_only",
 };
 
-fn handleCore(allocator: std.mem.Allocator, out: output.Output, io: std.Io, exe_path: []const u8, argv: []const []const u8) !void {
+pub fn handleCore(allocator: std.mem.Allocator, out: output.Output, io: std.Io, exe_path: []const u8, argv: []const []const u8) !void {
     const command = args.positional(argv, 0) orelse {
-        try out.stderr("missing core command; expected status or capabilities\n", .{});
+        try out.stderr("missing core command; expected status, capabilities, snapshot, or changes\n", .{});
         std.process.exit(2);
     };
     if (args.hasFlag(argv, "--help") or args.hasFlag(argv, "-h") or std.mem.eql(u8, command, "help")) {
@@ -1283,6 +1285,8 @@ fn handleCore(allocator: std.mem.Allocator, out: output.Output, io: std.Io, exe_
             \\Usage:
             \\  verde core status [--json]
             \\  verde core capabilities [--json]
+            \\  verde core snapshot [--scope <store|registry|sessions|turns>]... [--json]
+            \\  verde core changes [--cursor <seq>] [--wait-ms <ms>] [--topic <topic>]... [--json]
             \\
             \\Queries the GUI-free session daemon over its local socket.
             \\
@@ -1290,28 +1294,141 @@ fn handleCore(allocator: std.mem.Allocator, out: output.Output, io: std.Io, exe_
         return;
     }
 
+    const is_snapshot = std.mem.eql(u8, command, "snapshot");
+    const is_changes = std.mem.eql(u8, command, "changes");
     const method = if (std.mem.eql(u8, command, "status"))
         "core.status"
     else if (std.mem.eql(u8, command, "capabilities"))
         "core.capabilities"
+    else if (is_snapshot)
+        headless.store.METHOD_CORE_SNAPSHOT
+    else if (is_changes)
+        headless.changes_protocol.METHOD_CORE_CHANGES
     else {
         try out.stderr("unknown core command: {s}\n", .{command});
         std.process.exit(2);
     };
+
+    // Parse only the two new DTO surfaces here. Repeated scope/topic flags
+    // preserve the wire arrays without inventing a comma-escaping convention.
+    var scopes: std.ArrayList([]const u8) = .empty;
+    defer scopes.deinit(allocator);
+    var topics: std.ArrayList([]const u8) = .empty;
+    defer topics.deinit(allocator);
+    var cursor: ?u64 = null;
+    var wait_ms: u32 = 0;
+    var arg_index: usize = 1;
+    while (arg_index < argv.len) {
+        const arg = argv[arg_index];
+        if (std.mem.eql(u8, arg, "--json")) {
+            arg_index += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--scope") and is_snapshot) {
+            if (arg_index + 1 >= argv.len) {
+                try out.stderr("core snapshot --scope requires a value\n", .{});
+                std.process.exit(2);
+            }
+            try scopes.append(allocator, argv[arg_index + 1]);
+            arg_index += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--topic") and is_changes) {
+            if (arg_index + 1 >= argv.len) {
+                try out.stderr("core changes --topic requires a value\n", .{});
+                std.process.exit(2);
+            }
+            try topics.append(allocator, argv[arg_index + 1]);
+            arg_index += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--cursor") and is_changes) {
+            if (arg_index + 1 >= argv.len) {
+                try out.stderr("core changes --cursor requires a value\n", .{});
+                std.process.exit(2);
+            }
+            cursor = std.fmt.parseInt(u64, argv[arg_index + 1], 10) catch {
+                try out.stderr("core changes --cursor must be a non-negative integer\n", .{});
+                std.process.exit(2);
+            };
+            arg_index += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--wait-ms") and is_changes) {
+            if (arg_index + 1 >= argv.len) {
+                try out.stderr("core changes --wait-ms requires a value\n", .{});
+                std.process.exit(2);
+            }
+            wait_ms = std.fmt.parseInt(u32, argv[arg_index + 1], 10) catch {
+                try out.stderr("core changes --wait-ms must be a non-negative 32-bit integer\n", .{});
+                std.process.exit(2);
+            };
+            arg_index += 2;
+            continue;
+        }
+        try out.stderr("unknown core {s} option: {s}\n", .{ command, arg });
+        std.process.exit(2);
+    }
 
     // Same endpoint resolution and spawn-if-needed path as session commands.
     try ensureSessionDaemon(allocator, io, exe_path);
     const pref_path = try prefPath(allocator);
     defer allocator.free(pref_path);
 
+    // Typed result decoders use `.alloc_always`; keep all daemon-response
+    // allocations under a scoped arena, matching the integration harness.
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    const arena = decode_arena.allocator();
     var transport: sessionizer.HeadlessTransport = .{
-        .allocator = allocator,
+        .allocator = arena,
         .pref_path = pref_path,
     };
-    var client = sessionizer.headlessClient(allocator, &transport);
+    var client = sessionizer.headlessClient(arena, &transport);
     // Explicit empty object: bare `.{}` can stringify as `[]` and fail params validation.
     const empty_params: struct {} = .{};
-    var parsed = client.call(method, empty_params) catch |err| {
+    var parsed: headless.protocol.ParsedResponse = if (is_snapshot or is_changes) blk: {
+        const handshake = client.handshake() catch |err| {
+            try out.stderr("session daemon request failed: {s}\n", .{@errorName(err)});
+            std.process.exit(3);
+        };
+        if (is_snapshot) {
+            const request: headless.store.CoreSnapshotRequest = .{
+                .scopes = if (scopes.items.len == 0) null else scopes.items,
+            };
+            break :blk client.callCompositeSnapshot(handshake.status.capabilities, request) catch |err| {
+                if (err == error.CapabilityUnavailable) {
+                    const unavailable = headless.client.capabilityUnavailable(.snapshots);
+                    try out.jsonValue(allocator, .{
+                        .ok = false,
+                        .error_code = unavailable.code,
+                        .error_message = unavailable.message,
+                    });
+                    std.process.exit(4);
+                }
+                try out.stderr("session daemon request failed: {s}\n", .{@errorName(err)});
+                std.process.exit(3);
+            };
+        }
+        const request: headless.changes_protocol.ChangesRequest = .{
+            .cursor = cursor,
+            .wait_ms = wait_ms,
+            .topics = if (topics.items.len == 0) null else topics.items,
+        };
+        break :blk client.callChanges(handshake.status.capabilities, request) catch |err| {
+            if (err == error.CapabilityUnavailable) {
+                const unavailable = headless.client.capabilityUnavailable(.changes);
+                try out.jsonValue(allocator, .{
+                    .ok = false,
+                    .error_code = unavailable.code,
+                    .error_message = unavailable.message,
+                });
+                std.process.exit(4);
+            }
+            try out.stderr("session daemon request failed: {s}\n", .{@errorName(err)});
+            std.process.exit(3);
+        };
+    } else client.call(method, empty_params) catch |err| {
         try out.stderr("session daemon request failed: {s}\n", .{@errorName(err)});
         std.process.exit(3);
     };
@@ -4929,7 +5046,9 @@ fn classifyChatOpenLiveEnvelope(value: std.json.Value) ChatOpenLiveEnvelope {
     } };
 }
 
-const ChatOpenConfirmOutcome = enum {
+/// Public only so the hermetic daemon IT can execute the production confirm
+/// helper directly; callers outside that harness should use `open_chat`.
+pub const ChatOpenConfirmOutcome = enum {
     durable,
     /// Old daemon without the chat capability: the confirm cannot run, so
     /// the Live envelope is returned exactly as before this fix (declared
@@ -4943,7 +5062,7 @@ const ChatOpenConfirmOutcome = enum {
 /// fresh arena + transport, performs one call, and fully tears both down
 /// before the next sleep — no lock, connection, or arena is held across a
 /// sleep.
-fn chatOpenConfirmThreadDurable(
+pub fn chatOpenConfirmThreadDurable(
     allocator: std.mem.Allocator,
     io: std.Io,
     workspace_id: []const u8,

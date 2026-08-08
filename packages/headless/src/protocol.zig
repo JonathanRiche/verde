@@ -226,9 +226,12 @@ pub const Capabilities = struct {
     /// Daemon-owned durable state store. Stays false through Phase 2; the
     /// production flip to true is a Phase 3 decision (dormant-store contract).
     store: bool = false,
-    /// Composite scoped core.snapshot reads. False until the M5-P5 flip.
+    /// Composite scoped core.snapshot reads. The field default stays false so
+    /// decoding an old-daemon shape cannot invent support; `phase1` is the
+    /// current-daemon advertisement and flips it explicitly below.
     snapshots: bool = false,
-    /// Change-journal cursor reads (core.changes). False until the M5-P5 flip.
+    /// Change-journal cursor reads. As above, absence on an old daemon decodes
+    /// false while the current-daemon constructor advertises the routed read.
     changes: bool = false,
     /// Push streaming (core.subscribe). Stays false through all of M5 (Q8);
     /// the names are reserved but undispatched.
@@ -265,8 +268,10 @@ pub const Capabilities = struct {
             .browser_presentation = false,
             .browser = .{},
             .store = false,
-            .snapshots = false,
-            .changes = false,
+            // M5-P5 atomic external flip: daemon dispatch for both reads was
+            // proven through P2-P4 before these two flags became observable.
+            .snapshots = true,
+            .changes = true,
             .subscriptions = false,
         };
     }
@@ -772,8 +777,8 @@ test "granular feature and unavailable error helpers use stable names" {
     // M4-P5 flip pin: chat is advertised (was false through M4-P4).
     try std.testing.expect(capabilities.chat);
     try std.testing.expect(!capabilities.store);
-    try std.testing.expect(!capabilities.snapshots);
-    try std.testing.expect(!capabilities.changes);
+    try std.testing.expect(capabilities.snapshots);
+    try std.testing.expect(capabilities.changes);
     try std.testing.expect(!capabilities.subscriptions);
     capabilities.terminal_grid = true;
     try std.testing.expect(capabilities.isFeatureAvailable(.terminal_grid));
