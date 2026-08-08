@@ -152,6 +152,19 @@ pub fn main(init: std.process.Init) !void {
             try cli_main.handleMcp(allocator, out, io);
             return;
         }
+        if (std.mem.eql(u8, arg, "--core-cli")) {
+            // M5-P5: execute the REAL verde core handler in a subprocess while
+            // inheriting only the hermetic endpoint/pref overrides supplied by
+            // the parent scenario.
+            var core_argv: std.ArrayList([]const u8) = .empty;
+            defer core_argv.deinit(allocator);
+            while (iterator.next()) |core_arg| try core_argv.append(allocator, core_arg);
+            const self_exe = try std.process.executablePathAlloc(io, allocator);
+            defer allocator.free(self_exe);
+            const out: cli_output.Output = .{ .io = io };
+            try cli_main.handleCore(allocator, out, io, self_exe, core_argv.items);
+            return;
+        }
     }
 
     if (!daemon_transport_supported) {
@@ -223,6 +236,10 @@ pub fn main(init: std.process.Init) !void {
     // resync) and the amendment 1.2 workspace-level belt across a flush.
     try runM5P4DesktopCursorPlumbingScenario(allocator, io);
     try runM5P4WorkspaceBeltScenario(allocator, io);
+    // M5-P5 final external flip: a desktop-shaped cursor and a genuine core
+    // CLI subprocess independently observe one mutation; reserved push names
+    // remain method_not_found.
+    try runM5P5CliIndependentCursorScenario(allocator, io);
 
     // Extended store scenarios (POSIX only): full surface + S4 fault/busy/crash pins.
     // Transport-tier primitives, but not part of the Windows-safe subset.
@@ -3699,7 +3716,8 @@ fn runM5ChangesJournalScenario(allocator: std.mem.Allocator, io: std.Io) !void {
 /// its revision come from ONE read transaction, the change cursor seeds the
 /// first poll without gaps, a scope-less request keeps the M3 store-only
 /// reply byte-compatible (no composite keys at all), and the capability
-/// advertisement for snapshots/changes/subscriptions stays false (M5-P5 flip).
+/// final-tree advertisement flips snapshots/changes together while
+/// subscriptions stays false (M5-P5/Q8).
 fn runM5SnapshotCompositeScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const pref_path = try makePrefPath(allocator, "m5-snapshot");
     defer allocator.free(pref_path);
@@ -3818,14 +3836,15 @@ fn runM5SnapshotCompositeScenario(allocator: std.mem.Allocator, io: std.Io) !voi
     if (legacy_result_value.object.get("snapshot") == null) return error.M5SnapshotLegacyMissingSnapshot;
     if (legacy_result_value.object.get("store_revision") == null) return error.M5SnapshotLegacyMissingRevision;
 
-    // Capabilities stay unflipped through M5-P2 (charter: flip is M5-P5).
+    // M5-P5 final-tree pin: both proven read surfaces are now advertised,
+    // while push remains unconditionally deferred (Q8).
     const empty_params: struct {} = .{};
     var caps = try client.call("core.capabilities", empty_params);
     defer caps.deinit();
     if (!caps.response.isOk()) return error.M5SnapshotCapabilitiesFailed;
     const caps_result = try client.decodeCapabilities(&caps);
-    if (caps_result.capabilities.snapshots) return error.M5SnapshotCapabilitySnapshotsFlipped;
-    if (caps_result.capabilities.changes) return error.M5SnapshotCapabilityChangesFlipped;
+    if (!caps_result.capabilities.snapshots) return error.M5SnapshotCapabilitySnapshotsNotFlipped;
+    if (!caps_result.capabilities.changes) return error.M5SnapshotCapabilityChangesNotFlipped;
     if (caps_result.capabilities.subscriptions) return error.M5SnapshotCapabilitySubscriptionsFlipped;
 }
 
@@ -5030,6 +5049,309 @@ fn runM5P4WorkspaceBeltScenario(allocator: std.mem.Allocator, io: std.Io) !void 
         defer row.deinit();
         if (row.int(0) != 0) return error.M5P4BeltDurablePlainSurvived;
     }
+}
+
+/// Run the real `verde core` handler in this IT executable and capture its
+/// stdout. The subprocess inherits a tmpDir-only endpoint and exits after one
+/// command, so there is no CLI process to orphan on success or unwind.
+fn runCoreCliSubprocessAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    self_exe: []const u8,
+    pref_path: []const u8,
+    core_args: []const []const u8,
+) ![]u8 {
+    var env_map = try std.process.Environ.createMap(currentEnviron(), allocator);
+    defer env_map.deinit();
+    const endpoint = try isolationEndpoint(allocator, pref_path);
+    defer allocator.free(endpoint);
+    try env_map.put(sessionizer.SESSIONIZER_SOCKET_ENV_NAME, endpoint);
+    try env_map.put("XDG_DATA_HOME", pref_path);
+    try env_map.put("HOME", pref_path);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{ self_exe, "--core-cli" });
+    try argv.appendSlice(allocator, core_args);
+
+    var child = try std.process.spawn(io, .{
+        .argv = argv.items,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .environ_map = &env_map,
+    });
+    var kill_on_unwind = true;
+    errdefer if (kill_on_unwind) child.kill(io);
+
+    const stdout_file = child.stdout orelse return error.CoreCliStdoutClosed;
+    var read_buffer: [16 * 1024]u8 = undefined;
+    var reader = stdout_file.readerStreaming(io, &read_buffer);
+    const bytes = try reader.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024));
+    errdefer allocator.free(bytes);
+    const term = try child.wait(io);
+    kill_on_unwind = false;
+    if (term != .exited or term.exited != 0) return error.CoreCliExitCode;
+    return bytes;
+}
+
+/// M5-P5: the actual desktop cursor state and a headless CLI subprocess seed
+/// independent cursors before one durable mutation, then both observe it.
+/// This is Windows-safe: daemon transport remains Unix-socket/named-pipe
+/// abstracted and subprocess capture uses std.Io pipes on both tiers.
+fn runM5P5CliIndependentCursorScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m5p5-cli-cursors");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var daemon = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+    });
+    var kill_on_unwind = true;
+    errdefer if (kill_on_unwind) daemon.kill(io);
+
+    var storage = try state_storage.Storage.initWithPrefPath(allocator, pref_path);
+    defer storage.deinit();
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    const arena = decode_arena.allocator();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = arena,
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(arena, &transport);
+    const handshake = try client.handshake();
+    if (!handshake.status.capabilities.snapshots or !handshake.status.capabilities.changes)
+        return error.M5P5CapabilitiesNotAtomic;
+    if (handshake.status.capabilities.subscriptions) return error.M5P5SubscriptionsAdvertised;
+
+    var register = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer register.deinit();
+    if (!register.response.isOk()) return error.M5P5RegisterFailed;
+    const client_id = (try client.decodeClientRegister(&register)).client_id;
+
+    // Desktop-shaped seed: the real Storage adopts one composite snapshot's
+    // nonce/cursor/revision exactly as the production cursor loop does.
+    const scopes = [_][]const u8{
+        headless.store.SNAPSHOT_SCOPE_STORE,
+        headless.store.SNAPSHOT_SCOPE_REGISTRY,
+    };
+    var desktop_seed = try client.callCompositeSnapshot(handshake.status.capabilities, .{ .scopes = &scopes });
+    defer desktop_seed.deinit();
+    if (!desktop_seed.response.isOk()) return error.M5P5DesktopSnapshotFailed;
+    const desktop_snapshot = try client.decodeCompositeSnapshot(&desktop_seed);
+    try storage.noteCompositeSnapshotSeed(
+        desktop_snapshot.envelope orelse return error.M5P5DesktopSnapshotEnvelope,
+        desktop_snapshot.change_cursor orelse return error.M5P5DesktopSnapshotCursor,
+        desktop_snapshot.store_revision,
+    );
+
+    // Independent headless CLI cursor, produced by the genuine core handler.
+    const cli_boot_bytes = try runCoreCliSubprocessAlloc(allocator, io, self_exe, pref_path, &.{ "changes", "--json" });
+    defer allocator.free(cli_boot_bytes);
+    var cli_boot = try std.json.parseFromSlice(std.json.Value, allocator, cli_boot_bytes, .{});
+    defer cli_boot.deinit();
+    if (cli_boot.value != .object) return error.M5P5CliBootstrapShape;
+    const cli_cursor_value = cli_boot.value.object.get("next_cursor") orelse return error.M5P5CliBootstrapCursor;
+    if (cli_cursor_value != .integer) return error.M5P5CliBootstrapCursor;
+    const cli_cursor = std.math.cast(u64, cli_cursor_value.integer) orelse return error.M5P5CliBootstrapCursor;
+    const cli_boot_envelope = cli_boot.value.object.get("envelope") orelse return error.M5P5CliBootstrapEnvelope;
+    if (cli_boot_envelope != .object) return error.M5P5CliBootstrapEnvelope;
+    const cli_boot_nonce_value = cli_boot_envelope.object.get("instance_nonce") orelse return error.M5P5CliBootstrapNonce;
+    if (cli_boot_nonce_value != .string) return error.M5P5CliBootstrapNonce;
+    const cli_boot_nonce = try allocator.dupe(u8, cli_boot_nonce_value.string);
+    defer allocator.free(cli_boot_nonce);
+
+    const mutation: headless.store.WorkspaceUpsertRequest = .{
+        .mutation = .{
+            .request_key = "m5p5-shared-mutation",
+            .client_id = client_id,
+            .expected_store_revision = desktop_snapshot.store_revision,
+        },
+        .workspace = .{
+            .workspace_id = "m5p5-shared-workspace",
+            .label = "M5-P5 shared cursor mutation",
+            .path = pref_path,
+        },
+    };
+    var upsert = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, mutation);
+    defer upsert.deinit();
+    if (!upsert.response.isOk()) return error.M5P5MutationFailed;
+    const write = try client.decodeWriteResult(&upsert);
+    if (!write.applied) return error.M5P5MutationNotApplied;
+
+    const desktop_cursor = storage.currentChangeCursorForPoll() orelse return error.M5P5DesktopCursorLost;
+    var desktop_poll = try client.callChanges(handshake.status.capabilities, .{ .cursor = desktop_cursor });
+    defer desktop_poll.deinit();
+    if (!desktop_poll.response.isOk()) return error.M5P5DesktopPollFailed;
+    const desktop_changes = try client.decodeChanges(&desktop_poll);
+    var desktop_saw_mutation = false;
+    for (desktop_changes.entries) |entry| {
+        if (std.mem.eql(u8, entry.topic, "workspace") and
+            std.mem.eql(u8, entry.resource_id, "m5p5-shared-workspace") and
+            (entry.store_revision orelse 0) == write.store_revision) desktop_saw_mutation = true;
+    }
+    if (!desktop_saw_mutation) return error.M5P5DesktopMissedMutation;
+    const desktop_outcome = storage.noteChangesResult(desktop_changes);
+    if (desktop_outcome.snapshot_required or desktop_outcome.instance_changed)
+        return error.M5P5DesktopSpuriousResync;
+
+    var cursor_buf: [32]u8 = undefined;
+    const cursor_arg = try std.fmt.bufPrint(&cursor_buf, "{d}", .{cli_cursor});
+    const cli_poll_bytes = try runCoreCliSubprocessAlloc(
+        allocator,
+        io,
+        self_exe,
+        pref_path,
+        &.{ "changes", "--cursor", cursor_arg, "--json" },
+    );
+    defer allocator.free(cli_poll_bytes);
+    var cli_poll = try std.json.parseFromSlice(std.json.Value, allocator, cli_poll_bytes, .{});
+    defer cli_poll.deinit();
+    const cli_entries = if (cli_poll.value == .object)
+        cli_poll.value.object.get("entries") orelse return error.M5P5CliPollEntries
+    else
+        return error.M5P5CliPollShape;
+    if (cli_entries != .array) return error.M5P5CliPollEntries;
+    const cli_poll_cursor_value = cli_poll.value.object.get("next_cursor") orelse return error.M5P5CliPollCursor;
+    if (cli_poll_cursor_value != .integer) return error.M5P5CliPollCursor;
+    const cli_poll_cursor = std.math.cast(u64, cli_poll_cursor_value.integer) orelse return error.M5P5CliPollCursor;
+    var cli_saw_mutation = false;
+    for (cli_entries.array.items) |entry| {
+        if (entry != .object) continue;
+        const topic = entry.object.get("topic") orelse continue;
+        const resource = entry.object.get("resource_id") orelse continue;
+        if (topic == .string and resource == .string and
+            std.mem.eql(u8, topic.string, "workspace") and
+            std.mem.eql(u8, resource.string, "m5p5-shared-workspace")) cli_saw_mutation = true;
+    }
+    if (!cli_saw_mutation) return error.M5P5CliMissedMutation;
+
+    // Execute the other new CLI command and pin composite output fields.
+    const cli_snapshot_bytes = try runCoreCliSubprocessAlloc(
+        allocator,
+        io,
+        self_exe,
+        pref_path,
+        &.{ "snapshot", "--scope", "store", "--scope", "registry", "--json" },
+    );
+    defer allocator.free(cli_snapshot_bytes);
+    var cli_snapshot = try std.json.parseFromSlice(std.json.Value, allocator, cli_snapshot_bytes, .{});
+    defer cli_snapshot.deinit();
+    if (cli_snapshot.value != .object or
+        cli_snapshot.value.object.get("snapshot") == null or
+        cli_snapshot.value.object.get("envelope") == null or
+        cli_snapshot.value.object.get("change_cursor") == null)
+        return error.M5P5CliSnapshotShape;
+
+    // Q8 reserved-name runtime pin: neither is routed by the daemon.
+    inline for (.{
+        headless.changes_protocol.METHOD_CORE_SUBSCRIBE,
+        headless.changes_protocol.METHOD_CORE_UNSUBSCRIBE,
+    }) |method| {
+        const empty_params: struct {} = .{};
+        var reserved = try client.call(method, empty_params);
+        defer reserved.deinit();
+        if (reserved.response.isOk()) return error.M5P5ReservedMethodDispatched;
+        const err = reserved.response.err orelse return error.M5P5ReservedMethodMissingError;
+        if (!std.mem.eql(u8, err.code, "method_not_found")) {
+            std.debug.print("headless-daemon-it: reserved {s} returned {s}\n", .{ method, err.code });
+            return error.M5P5ReservedMethodWrongError;
+        }
+    }
+
+    var prepare = try client.call("daemon.prepareShutdown", .{});
+    defer prepare.deinit();
+    if (!prepare.response.isOk()) return error.M5P5PrepareFailed;
+    kill_on_unwind = false;
+    const term = try waitChildBounded(&daemon, io, 10_000);
+    if (term != .exited or term.exited != 0) return error.M5P5DaemonExitCode;
+
+    // Session lifecycle: launch a successor on the same durable store, carry
+    // the CLI's old cursor into it, detect the nonce reset from the otherwise
+    // healthy heartbeat, perform exactly one composite snapshot fallback,
+    // then resume from that snapshot's fresh cursor.
+    var successor = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+    });
+    var kill_successor_on_unwind = true;
+    errdefer if (kill_successor_on_unwind) successor.kill(io);
+
+    var old_cursor_buf: [32]u8 = undefined;
+    const old_cursor_arg = try std.fmt.bufPrint(&old_cursor_buf, "{d}", .{cli_poll_cursor});
+    const replaced_bytes = try runCoreCliSubprocessAlloc(
+        allocator,
+        io,
+        self_exe,
+        pref_path,
+        &.{ "changes", "--cursor", old_cursor_arg, "--json" },
+    );
+    defer allocator.free(replaced_bytes);
+    var replaced = try std.json.parseFromSlice(std.json.Value, allocator, replaced_bytes, .{});
+    defer replaced.deinit();
+    if (replaced.value != .object) return error.M5P5ReplacementShape;
+    const replaced_envelope = replaced.value.object.get("envelope") orelse return error.M5P5ReplacementEnvelope;
+    if (replaced_envelope != .object) return error.M5P5ReplacementEnvelope;
+    const replaced_nonce_value = replaced_envelope.object.get("instance_nonce") orelse return error.M5P5ReplacementNonce;
+    if (replaced_nonce_value != .string or std.mem.eql(u8, replaced_nonce_value.string, cli_boot_nonce))
+        return error.M5P5ReplacementNonceNotReset;
+
+    // Exactly one fallback snapshot after the envelope mismatch.
+    const fallback_bytes = try runCoreCliSubprocessAlloc(
+        allocator,
+        io,
+        self_exe,
+        pref_path,
+        &.{ "snapshot", "--scope", "store", "--scope", "registry", "--json" },
+    );
+    defer allocator.free(fallback_bytes);
+    var fallback = try std.json.parseFromSlice(std.json.Value, allocator, fallback_bytes, .{});
+    defer fallback.deinit();
+    if (fallback.value != .object) return error.M5P5FallbackShape;
+    const fallback_cursor_value = fallback.value.object.get("change_cursor") orelse return error.M5P5FallbackCursor;
+    if (fallback_cursor_value != .integer) return error.M5P5FallbackCursor;
+    const fallback_cursor = std.math.cast(u64, fallback_cursor_value.integer) orelse return error.M5P5FallbackCursor;
+    const fallback_revision_value = fallback.value.object.get("store_revision") orelse return error.M5P5FallbackRevision;
+    if (fallback_revision_value != .integer or fallback_revision_value.integer < @as(i64, @intCast(write.store_revision)))
+        return error.M5P5FallbackDurableRevision;
+
+    var fresh_cursor_buf: [32]u8 = undefined;
+    const fresh_cursor_arg = try std.fmt.bufPrint(&fresh_cursor_buf, "{d}", .{fallback_cursor});
+    const resumed_bytes = try runCoreCliSubprocessAlloc(
+        allocator,
+        io,
+        self_exe,
+        pref_path,
+        &.{ "changes", "--cursor", fresh_cursor_arg, "--json" },
+    );
+    defer allocator.free(resumed_bytes);
+    var resumed = try std.json.parseFromSlice(std.json.Value, allocator, resumed_bytes, .{});
+    defer resumed.deinit();
+    if (resumed.value != .object) return error.M5P5ResumeShape;
+    const resumed_envelope = resumed.value.object.get("envelope") orelse return error.M5P5ResumeEnvelope;
+    if (resumed_envelope != .object) return error.M5P5ResumeEnvelope;
+    const resumed_nonce_value = resumed_envelope.object.get("instance_nonce") orelse return error.M5P5ResumeNonce;
+    if (resumed_nonce_value != .string or
+        !std.mem.eql(u8, resumed_nonce_value.string, replaced_nonce_value.string))
+        return error.M5P5ResumeNonceMismatch;
+
+    const empty_params: struct {} = .{};
+    var prepare_successor = try client.call("daemon.prepareShutdown", empty_params);
+    defer prepare_successor.deinit();
+    if (!prepare_successor.response.isOk()) return error.M5P5SuccessorPrepareFailed;
+    kill_successor_on_unwind = false;
+    const successor_term = try waitChildBounded(&successor, io, 10_000);
+    if (successor_term != .exited or successor_term.exited != 0) return error.M5P5SuccessorExitCode;
 }
 
 /// Bounded serial queueing under a slow store commit (commit_stall).
@@ -8157,6 +8479,45 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             var parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, ws_request);
             defer parsed.deinit();
             if (!parsed.response.isOk()) return error.McpToolLayerWorkspaceUpsertFailed;
+
+            // Amendment 1 (mandatory first item): execute the production
+            // Live-arm durability confirm against this hermetic daemon. Seed
+            // one durable thread exactly as the GUI's async store write does,
+            // then prove both the success and bounded-timeout outcomes. The
+            // endpoint override installed above keeps ensureSessionDaemon and
+            // every helper poll on this tmpDir-only daemon.
+            const thread_request: headless.store.ThreadUpsertRequest = .{
+                .mutation = .{ .request_key = "m4p5-confirm-thread", .client_id = client_id },
+                .workspace_id = "ws-mcp",
+                .thread = .{
+                    .local_thread_id = "thread-confirm-durable",
+                    .title = "Confirm helper pin",
+                    .provider = "codex",
+                    .harness = "local_cli",
+                },
+            };
+            var thread_parsed = try client.call(headless.store.METHOD_CHAT_THREAD_UPSERT, thread_request);
+            defer thread_parsed.deinit();
+            if (!thread_parsed.response.isOk()) return error.McpConfirmThreadUpsertFailed;
+
+            const durable = try cli_main.chatOpenConfirmThreadDurable(
+                allocator,
+                io,
+                "ws-mcp",
+                "thread-confirm-durable",
+                2,
+                10,
+            );
+            if (durable != .durable) return error.McpConfirmDurableOutcome;
+            const missing = try cli_main.chatOpenConfirmThreadDurable(
+                allocator,
+                io,
+                "ws-mcp",
+                "thread-confirm-missing",
+                2,
+                10,
+            );
+            if (missing != .timeout) return error.McpConfirmMissingOutcome;
         }
 
         var mcp = try spawnMcpChild(allocator, io, self_exe, pref_path);

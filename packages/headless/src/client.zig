@@ -22,6 +22,8 @@ pub const RequiredCapability = enum {
     processes,
     leases,
     store,
+    snapshots,
+    changes,
     browser_execution,
     browser_presentation,
     browser_session_state,
@@ -48,6 +50,8 @@ pub const RequiredCapability = enum {
             .processes => "processes",
             .leases => "leases",
             .store => "store",
+            .snapshots => "snapshots",
+            .changes => "changes",
             .browser_execution => "browser_execution",
             .browser_presentation => "browser_presentation",
             .browser_session_state => "browser.session_state",
@@ -85,6 +89,8 @@ fn requireCapabilityChecked(capabilities: protocol.Capabilities, feature: Requir
         .processes => capabilities.processes,
         .leases => capabilities.leases,
         .store => capabilities.store,
+        .snapshots => capabilities.snapshots,
+        .changes => capabilities.changes,
         .browser_execution => capabilities.browser_execution,
         .browser_presentation => capabilities.browser_presentation,
         .browser_session_state => capabilities.isFeatureAvailable(.browser_session_state),
@@ -132,6 +138,8 @@ pub fn capabilityUnavailable(feature: RequiredCapability) protocol.Error {
             .processes => "processes capability is unavailable",
             .leases => "leases capability is unavailable",
             .store => "store capability is unavailable",
+            .snapshots => "snapshots capability is unavailable",
+            .changes => "changes capability is unavailable",
             .browser_execution => "browser_execution capability is unavailable",
             .browser_presentation => "browser_presentation capability is unavailable",
             .browser_session_state => "browser.session_state capability is unavailable",
@@ -424,6 +432,30 @@ pub const Client = struct {
         return try self.decodeResult(store_protocol.CoreSnapshotResult, parsed);
     }
 
+    /// Issue an explicitly daemon-direct composite snapshot read. The gate is
+    /// deliberately inside the typed call so an old daemon cannot silently
+    /// re-enable a caller's legacy fallback after this API was chosen.
+    pub fn callCompositeSnapshot(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: store_protocol.CoreSnapshotRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .snapshots);
+        return try self.call(store_protocol.METHOD_CORE_SNAPSHOT, request);
+    }
+
+    /// Issue an explicitly daemon-direct journal read. Capability rejection
+    /// and a daemon's method_not_found response are terminal outcomes for this
+    /// call; the typed client performs exactly zero implicit fallback polls.
+    pub fn callChanges(
+        self: *Client,
+        capabilities: protocol.Capabilities,
+        request: changes_protocol.ChangesRequest,
+    ) !protocol.ParsedResponse {
+        try requireCapabilityChecked(capabilities, .changes);
+        return try self.call(changes_protocol.METHOD_CORE_CHANGES, request);
+    }
+
     /// Require a capability on this client before a direct daemon request.
     pub fn requireCapability(_: *Client, capabilities: protocol.Capabilities, feature: RequiredCapability) CapabilityError!void {
         return requireCapabilityChecked(capabilities, feature);
@@ -479,6 +511,7 @@ pub const Client = struct {
 const MockTransport = struct {
     allocator: std.mem.Allocator,
     last_request: ?[]u8 = null,
+    call_count: usize = 0,
     canned_response: []const u8,
 
     fn deinit(self: *MockTransport) void {
@@ -487,6 +520,7 @@ const MockTransport = struct {
 
     fn send(ctx: *anyopaque, request_json: []const u8) anyerror![]u8 {
         const self: *MockTransport = @ptrCast(@alignCast(ctx));
+        self.call_count += 1;
         if (self.last_request) |bytes| self.allocator.free(bytes);
         self.last_request = try self.allocator.dupe(u8, request_json);
         return try self.allocator.dupe(u8, self.canned_response);
@@ -1097,6 +1131,55 @@ test "M4-P5 chat flip: current daemon passes, old-daemon shape rejects daemon-di
     try std.testing.expectEqualStrings("chat", RequiredCapability.chat.wireName());
     try std.testing.expectEqualStrings(protocol.ERR_CAPABILITY_UNAVAILABLE, unavailable.code);
     try std.testing.expectEqualStrings("chat capability is unavailable", unavailable.message);
+}
+
+test "M5-P5 typed snapshot and changes calls gate old daemons without fallback" {
+    const allocator = std.testing.allocator;
+    // These fields did not exist on an old daemon, so tolerant decoding must
+    // leave both false. The typed calls reject before transport: zero legacy
+    // polls or alternate-route requests can be silently re-enabled.
+    const old_shape =
+        \\{"headless_protocol_version":1,"min_supported":1,"max_supported":1,"capabilities":{"terminal_raw":true}}
+    ;
+    var old = try std.json.parseFromSlice(protocol.CapabilitiesResult, allocator, old_shape, .{
+        .ignore_unknown_fields = true,
+    });
+    defer old.deinit();
+
+    var mock: MockTransport = .{
+        .allocator = allocator,
+        .canned_response = "unused",
+    };
+    defer mock.deinit();
+    var client = Client.init(allocator, &mock, MockTransport.send);
+    try std.testing.expectError(
+        error.CapabilityUnavailable,
+        client.callCompositeSnapshot(old.value.capabilities, .{}),
+    );
+    try std.testing.expectError(
+        error.CapabilityUnavailable,
+        client.callChanges(old.value.capabilities, .{}),
+    );
+    try std.testing.expectEqual(@as(usize, 0), mock.call_count);
+
+    // Version-skew defense: even if a peer advertises `changes` but answers
+    // method_not_found, the explicit direct call returns that one envelope
+    // unchanged. There is no second transport call and no fallback arm.
+    const missing_body = try protocol.encodeErrorResponse(
+        allocator,
+        1,
+        "method_not_found",
+        changes_protocol.METHOD_CORE_CHANGES,
+    );
+    defer allocator.free(missing_body);
+    mock.canned_response = missing_body;
+    var advertised = old.value.capabilities;
+    advertised.changes = true;
+    var missing = try client.callChanges(advertised, .{ .cursor = 7 });
+    defer missing.deinit();
+    try std.testing.expect(!missing.response.isOk());
+    try std.testing.expectEqualStrings("method_not_found", missing.response.err.?.code);
+    try std.testing.expectEqual(@as(usize, 1), mock.call_count);
 }
 
 test "capability checks support direct registry mode" {
