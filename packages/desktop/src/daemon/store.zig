@@ -486,7 +486,11 @@ pub const Store = struct {
         if (prior_receipt) |result| {
             self.conn.rollback();
             transaction_open = false;
-            return result;
+            return .{
+                .store_revision = result.store_revision,
+                .applied = false,
+                .duplicate = true,
+            };
         }
 
         const current_revision = self.readStoreRevision() catch |err| return mapStoreError(err);
@@ -963,6 +967,8 @@ pub const Store = struct {
             \\delete from preserved_chat_threads;
             \\delete from preserved_chat_messages;
             \\delete from preserved_workspaces;
+        );
+        try self.conn.exec(
             \\insert into preserved_workspaces
             \\select w.workspace_id, w.sort_index, w.label, w.path, w.archived, w.unread_count,
             \\       w.collapsed, w.thread_list_expanded, w.terminal_height, w.terminal_layout_json,
@@ -974,8 +980,12 @@ pub const Store = struct {
             \\from workspaces w
             \\where exists (
             \\    select 1 from chat_turns ct
-            \\    where ct.workspace_id = w.workspace_id and ct.committed_store_revision is not null
-            \\);
+            \\    where ct.workspace_id = w.workspace_id
+            \\      and ct.committed_store_revision > 0
+            \\      and ct.committed_store_revision > ?1
+            \\)
+        , .{@as(i64, @intCast(snapshot.store_revision))});
+        try self.conn.execNoArgs(
             \\insert into preserved_chat_threads
             \\select w.workspace_id, t.sort_index, t.title, t.archived, t.committed, t.local_thread_id,
             \\       t.last_activity_at, t.provider_thread_id, t.model_ref, t.reasoning_effort,
@@ -1030,6 +1040,27 @@ pub const Store = struct {
         for (snapshot.surface_states) |surface| try self.insertSurface(surface);
         for (snapshot.chat_completions) |completion| try self.applyChatCompletionUpsert(completion);
 
+        // Omitted workspaces whose retained turns were already within the
+        // GUI's observed revision are deliberate deletions. Remove their
+        // ledger ownership in this same guarded transaction so no future
+        // snapshot can resurrect them. Newer, not-yet-observed turns were
+        // staged above and remain protected until a later snapshot carries
+        // their workspace.
+        try self.conn.exec(
+            \\delete from chat_turns
+            \\where committed_store_revision is not null
+            \\  and committed_store_revision <= ?1
+            \\  and not exists (
+            \\      select 1 from workspaces w where w.workspace_id = chat_turns.workspace_id
+            \\  )
+        , .{@as(i64, @intCast(snapshot.store_revision))});
+        try self.conn.exec(
+            \\delete from chat_completions
+            \\where not exists (
+            \\    select 1 from workspaces w where w.workspace_id = chat_completions.workspace_id
+            \\)
+        , .{});
+
         try self.restorePreservedChatRows();
         // Empty (never DROP — schema op) so stale copies of transcript rows
         // do not outlive the apply.
@@ -1045,15 +1076,11 @@ pub const Store = struct {
     /// Scope rules: a workspace absent from the snapshot is normally a
     /// deliberate GUI-side project deletion — its threads and rows are not
     /// resurrected. M5-P4 Amendment 1 carves out one exception: a workspace
-    /// holding COMMITTED turn-ledger rows (chat_turns.committed_store_revision
-    /// not null) is restored, because daemon-side turn commits can create and
-    /// populate a workspace the GUI has never observed, and dropping it would
-    /// both lose committed transcripts and leave the ledger dangling. The
-    /// workspaces table carries no revision column, so there is no honest
-    /// "GUI observed this workspace" key — the committed-ledger scope is the
-    /// deliberate tradeoff: deleting a project with committed daemon turns
-    /// resurrects it until the ledger rows are consumed/cleared, while
-    /// ordinary (never-committed) project deletions stay deletions.
+    /// holding a turn committed AFTER the snapshot's observed store revision
+    /// is restored, because that daemon-owned content was not yet visible to
+    /// the GUI. Historical committed turns are not preservation keys: an
+    /// omission after their revision is a deliberate deletion and the ledger
+    /// ownership is removed atomically in applySnapshot.
     /// A thread absent from the snapshot whose workspace survives is restored
     /// (the GUI cannot have observed it — see applySnapshot). A message id the
     /// snapshot already carries wins on position/content (M4-P3 parity makes
@@ -2325,8 +2352,8 @@ test "turn commit is durable, ordered, exactly once, and revision guarded by rec
 
     const replay = try store.commitTurn(request);
     try std.testing.expectEqual(first.store_revision, replay.store_revision);
-    try std.testing.expect(replay.applied);
-    try std.testing.expect(!replay.duplicate);
+    try std.testing.expect(!replay.applied);
+    try std.testing.expect(replay.duplicate);
     try std.testing.expectEqual(@as(u64, 3), try store.storeRevision());
 
     var replay_rows = (try store.conn.row(
@@ -2335,6 +2362,69 @@ test "turn commit is durable, ordered, exactly once, and revision guarded by rec
     )).?;
     defer replay_rows.deinit();
     try std.testing.expectEqual(@as(i64, 2), replay_rows.int(0));
+}
+
+test "committed turn receipt replay fires the journal hook exactly once" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    const workspace = testWorkspace("workspace-turn-hook", "Hook workspace");
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("turn-hook-workspace", null),
+        .workspace = workspace,
+    });
+    const thread = testThread("thread-turn-hook", "Hook thread");
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("turn-hook-thread", 1),
+        .workspace_id = workspace.workspace_id,
+        .thread = thread,
+    });
+
+    const Counter = struct {
+        count: usize = 0,
+        revision: u64 = 0,
+
+        fn mutation(_: *anyopaque, _: *const Mutation, _: store_protocol.WriteResult) void {}
+
+        fn turn(context: *anyopaque, _: *const TurnCommitRequest, result: store_protocol.WriteResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.count += 1;
+            self.revision = result.store_revision;
+        }
+    };
+    var counter: Counter = .{};
+    store.commit_hook = .{
+        .context = &counter,
+        .on_mutation_committed = Counter.mutation,
+        .on_turn_committed = Counter.turn,
+    };
+    const messages = [_]store_protocol.Message{.{
+        .message_id = "turn-hook-message",
+        .role = "assistant",
+        .author = "Codex",
+        .body = "once",
+    }};
+    const request: TurnCommitRequest = .{
+        .turn_id = "turn-hook",
+        .workspace_id = workspace.workspace_id,
+        .local_thread_id = thread.local_thread_id,
+        .status = .completed,
+        .started_at_ms = 1,
+        .finished_at_ms = 2,
+        .provider = "codex",
+        .messages = &messages,
+    };
+    const first = try store.commitTurn(request);
+    const replay = try store.commitTurn(request);
+    try std.testing.expectEqual(first.store_revision, replay.store_revision);
+    try std.testing.expect(!replay.applied);
+    try std.testing.expect(replay.duplicate);
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
+    try std.testing.expectEqual(first.store_revision, counter.revision);
 }
 
 test "transcript_apply rows commit with deterministic IDs and replay exactly once" {
@@ -2405,8 +2495,8 @@ test "transcript_apply rows commit with deterministic IDs and replay exactly onc
 
     const replay = try store.commitTurn(request);
     try std.testing.expectEqual(first.store_revision, replay.store_revision);
-    try std.testing.expect(replay.applied);
-    try std.testing.expect(!replay.duplicate);
+    try std.testing.expect(!replay.applied);
+    try std.testing.expect(replay.duplicate);
     var replay_rows = (try store.conn.row(
         "select count(*) from messages where thread_id = (select id from threads where local_thread_id = ?1)",
         .{thread.local_thread_id},
@@ -2545,11 +2635,10 @@ test "snapshot replace preserves daemon-committed identities keys and ledger ref
     try std.testing.expectEqual(@as(i64, 1), user_rows.int(0));
 }
 
-// M5-P4 Amendment 1: a snapshot omitting a workspace that holds COMMITTED
-// turn-ledger rows must restore the workspace (plus its preserved thread and
-// rows) instead of dropping committed daemon transcripts and leaving the
-// ledger dangling; never-committed omitted workspaces stay deleted.
-test "snapshot replace restores ledger-referenced workspaces and still deletes plain ones" {
+// A snapshot may preserve only committed work newer than its durable
+// observation boundary. Once observed, deleting the same committed workspace
+// removes its retained turn ownership and cannot resurrect on later replaces.
+test "snapshot replace preserves only unobserved committed workspaces and tombstones observed deletion" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const db_path = try testDbPath(&tmp);
@@ -2603,13 +2692,16 @@ test "snapshot replace restores ledger-referenced workspaces and still deletes p
         .workspace = testWorkspace("ws-plain", "Plain workspace"),
     });
 
-    // GUI flush that never observed ws-belt2 (nor ws-plain): only a fresh
-    // workspace survives the wipe by carriage.
+    // Guard is current, but the projection payload was captured at revision 2,
+    // before the turn committed. This pins the pending-adoption distinction
+    // independently of the optimistic guard.
     const carried = [_]store_protocol.Workspace{testWorkspace("ws-other", "Other workspace")};
-    _ = try store.applyMutation(.{ .snapshot_replace = testSnapshotRequest("wsbelt-flush", 5, false, testSnapshot(&carried)) });
+    var unobserved_request = testSnapshotRequest("wsbelt-flush", 5, false, testSnapshot(&carried));
+    unobserved_request.snapshot.store_revision = 2;
+    const unobserved_result = try store.applyMutation(.{ .snapshot_replace = unobserved_request });
 
     const counts = [_]struct { id: []const u8, expected: i64 }{
-        .{ .id = "ws-belt2", .expected = 1 }, // restored by the ledger belt
+        .{ .id = "ws-belt2", .expected = 1 }, // newer than observed revision
         .{ .id = "ws-plain", .expected = 0 }, // deliberate deletion honored
         .{ .id = "ws-other", .expected = 1 }, // carried by the snapshot
     };
@@ -2644,6 +2736,30 @@ test "snapshot replace restores ledger-referenced workspaces and still deletes p
     )).?;
     defer resolved.deinit();
     try std.testing.expectEqual(@as(i64, 1), resolved.int(0));
+
+    // The next projection has observed the committed revision and deliberately
+    // omits the workspace. Deletion and retained-ledger removal are atomic.
+    const retained_control = [_]store_protocol.Workspace{testWorkspace("ws-other", "Other workspace")};
+    var deletion_request = testSnapshotRequest(
+        "wsbelt-delete-observed",
+        unobserved_result.store_revision,
+        false,
+        testSnapshot(&retained_control),
+    );
+    deletion_request.snapshot.store_revision = unobserved_result.store_revision;
+    _ = try store.applyMutation(.{ .snapshot_replace = deletion_request });
+    var deleted_workspace = (try store.conn.row(
+        "select count(*) from workspaces where workspace_id = 'ws-belt2'",
+        .{},
+    )).?;
+    defer deleted_workspace.deinit();
+    try std.testing.expectEqual(@as(i64, 0), deleted_workspace.int(0));
+    var deleted_ledger = (try store.conn.row(
+        "select count(*) from chat_turns where workspace_id = 'ws-belt2'",
+        .{},
+    )).?;
+    defer deleted_ledger.deinit();
+    try std.testing.expectEqual(@as(i64, 0), deleted_ledger.int(0));
 }
 
 // M5-P4 Amendment 1 duplicate-id invariant: one snapshot carrying the same

@@ -4885,10 +4885,9 @@ fn runM5P4DesktopCursorPlumbingScenario(allocator: std.mem.Allocator, io: std.Io
     }
 }
 
-/// M5-P4 amendment 1.2: the workspace-level belt over the wire. A workspace
-/// holding daemon-committed turns survives a snapshot_replace flush that
-/// omits it (restored with its committed transcript, ledger resolvable),
-/// while a plain workspace omitted from the same flush is deleted normally.
+/// Workspace retention over the wire: an unobserved committed workspace is
+/// preserved once, then an observed deletion removes both it and its retained
+/// turn ownership. Restart proves it cannot resurrect.
 fn runM5P4WorkspaceBeltScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const pref_path = try makePrefPath(allocator, "m5p4-belt");
     defer allocator.free(pref_path);
@@ -4938,6 +4937,47 @@ fn runM5P4WorkspaceBeltScenario(allocator: std.mem.Allocator, io: std.Io) !void 
         if (!result.applied) return error.M5P4BeltPlainUpsertNotApplied;
     }
 
+    // Materialize the desktop snapshot row so the initial read is a genuine
+    // saved projection, not merely a daemon-created workspace without
+    // app_state. The committed turn below must land after this RO boundary.
+    {
+        const initial_workspaces = [_]headless.store.Workspace{.{
+            .workspace_id = "ws-belt-plain",
+            .label = "Belt plain",
+            .path = pref_path,
+        }};
+        const initial_flush: headless.store.SnapshotReplaceRequest = .{
+            .mutation = .{
+                .request_key = "m5p4-belt-initial-flush",
+                .client_id = client_id,
+                .expected_store_revision = 1,
+            },
+            .snapshot = .{
+                .schema_version = 1,
+                .store_revision = 1,
+                .workspaces = &initial_workspaces,
+            },
+        };
+        var parsed = try client.call(headless.store.METHOD_STATE_SNAPSHOT_REPLACE, initial_flush);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.M5P4BeltInitialFlushFailed;
+        const result = try client.decodeWriteResult(&parsed);
+        if (!result.applied or result.store_revision != 2) return error.M5P4BeltInitialFlushRevision;
+    }
+
+    // Initial desktop RO projection is captured before the daemon-only turn.
+    {
+        // This scenario deliberately overrides the daemon store directory;
+        // point the RO client at that exact hermetic database location.
+        var ro_storage = try state_storage.Storage.initWithPrefPath(allocator, store_dir);
+        defer ro_storage.deinit();
+        if (try ro_storage.load(allocator)) |loaded_value| {
+            var loaded = loaded_value;
+            defer loaded.deinit();
+            if (loaded.store_revision != 2) return error.M5P4BeltInitialRoRevision;
+        } else return error.M5P4BeltInitialRoMissing;
+    }
+
     // A daemon-committed stub turn creates ws-belt-it + thread + transcript +
     // ledger row (committed_store_revision) entirely daemon-side.
     try startStubChatTurn(
@@ -4952,6 +4992,26 @@ fn runM5P4WorkspaceBeltScenario(allocator: std.mem.Allocator, io: std.Io) !void 
     try waitChatTurnTerminal(io, &client, "turn-belt-1", true);
     try consumeChatTurn(&client, "turn-belt-1");
 
+    // Capture after the intervening durable mutation. This owned wire payload
+    // is what the desktop projection application must render before it may
+    // publish the seed cursor/revision.
+    const capture_scopes = [_][]const u8{headless.store.SNAPSHOT_SCOPE_STORE};
+    var captured = try client.call(
+        headless.store.METHOD_CORE_SNAPSHOT,
+        headless.store.CoreSnapshotRequest{ .scopes = &capture_scopes },
+    );
+    defer captured.deinit();
+    if (!captured.response.isOk()) return error.M5P4BeltCaptureFailed;
+    const captured_result = try client.decodeCompositeSnapshot(&captured);
+    var captured_mutation = false;
+    for (captured_result.snapshot.workspaces) |workspace| {
+        if (!std.mem.eql(u8, workspace.workspace_id, "ws-belt-it")) continue;
+        captured_mutation = true;
+        if (workspace.threads.len == 0 or workspace.threads[0].messages.len < 2)
+            return error.M5P4BeltCaptureTranscriptMissing;
+    }
+    if (!captured_mutation) return error.M5P4BeltCaptureMutationMissing;
+
     // Pin the durable revision for the guarded flush.
     var status_parsed = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, .{});
     defer status_parsed.deinit();
@@ -4961,8 +5021,9 @@ fn runM5P4WorkspaceBeltScenario(allocator: std.mem.Allocator, io: std.Io) !void 
     if (revision_value != .integer) return error.M5P4BeltStatusMalformed;
     const flush_expected: u64 = @intCast(revision_value.integer);
 
-    // GUI-style flush that OMITS both ws-belt-it (committed turns) and
-    // ws-belt-plain (no turns), carrying only an unrelated workspace.
+    // GUI flush applies the captured payload verbatim. The mutation that was
+    // absent from the initial RO load must survive this replacement.
+    var first_flush_revision: u64 = 0;
     {
         const flush: headless.store.SnapshotReplaceRequest = .{
             .mutation = .{
@@ -4970,21 +5031,17 @@ fn runM5P4WorkspaceBeltScenario(allocator: std.mem.Allocator, io: std.Io) !void 
                 .client_id = client_id,
                 .expected_store_revision = flush_expected,
             },
-            .snapshot = .{
-                .workspaces = &.{
-                    .{ .workspace_id = "ws-belt-other", .label = "Belt other", .path = pref_path },
-                },
-            },
+            .snapshot = captured_result.snapshot,
         };
         var parsed = try client.call(headless.store.METHOD_STATE_SNAPSHOT_REPLACE, flush);
         defer parsed.deinit();
         if (!parsed.response.isOk()) return error.M5P4BeltFlushFailed;
         const result = try client.decodeWriteResult(&parsed);
         if (!result.applied or result.store_revision != flush_expected + 1) return error.M5P4BeltFlushRevision;
+        first_flush_revision = result.store_revision;
     }
 
-    // Wire read: the belt restored ws-belt-it with its committed transcript;
-    // ws-belt-plain was deleted normally; ws-belt-other was carried.
+    // Wire read: the intervening mutation is rendered and preserved.
     {
         const scopes = [_][]const u8{headless.store.SNAPSHOT_SCOPE_STORE};
         const snap_req: headless.store.CoreSnapshotRequest = .{ .scopes = &scopes };
@@ -4993,10 +5050,7 @@ fn runM5P4WorkspaceBeltScenario(allocator: std.mem.Allocator, io: std.Io) !void 
         if (!snap.response.isOk()) return error.M5P4BeltSnapshotFailed;
         const snap_result = try client.decodeCompositeSnapshot(&snap);
         var saw_belt = false;
-        var saw_other = false;
         for (snap_result.snapshot.workspaces) |workspace| {
-            if (std.mem.eql(u8, workspace.workspace_id, "ws-belt-plain")) return error.M5P4BeltPlainSurvived;
-            if (std.mem.eql(u8, workspace.workspace_id, "ws-belt-other")) saw_other = true;
             if (std.mem.eql(u8, workspace.workspace_id, "ws-belt-it")) {
                 saw_belt = true;
                 var saw_thread = false;
@@ -5010,7 +5064,39 @@ fn runM5P4WorkspaceBeltScenario(allocator: std.mem.Allocator, io: std.Io) !void 
             }
         }
         if (!saw_belt) return error.M5P4BeltWorkspaceLost;
-        if (!saw_other) return error.M5P4BeltCarriedWorkspaceLost;
+    }
+
+    // Once the projection revision includes the committed turn, omission is
+    // a deliberate delete. It must clear both the workspace and ledger in the
+    // same guarded snapshot_replace.
+    {
+        const flush: headless.store.SnapshotReplaceRequest = .{
+            .mutation = .{
+                .request_key = "m5p4-belt-delete-observed",
+                .client_id = client_id,
+                .expected_store_revision = first_flush_revision,
+            },
+            .snapshot = .{
+                .store_revision = first_flush_revision,
+                .workspaces = &.{},
+            },
+        };
+        var parsed = try client.call(headless.store.METHOD_STATE_SNAPSHOT_REPLACE, flush);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.M5P4BeltObservedDeleteFailed;
+        const result = try client.decodeWriteResult(&parsed);
+        if (!result.applied or result.store_revision != first_flush_revision + 1)
+            return error.M5P4BeltObservedDeleteRevision;
+    }
+    {
+        const scopes = [_][]const u8{headless.store.SNAPSHOT_SCOPE_STORE};
+        var snap = try client.call(headless.store.METHOD_CORE_SNAPSHOT, headless.store.CoreSnapshotRequest{ .scopes = &scopes });
+        defer snap.deinit();
+        const snap_result = try client.decodeCompositeSnapshot(&snap);
+        for (snap_result.snapshot.workspaces) |workspace| {
+            if (std.mem.eql(u8, workspace.workspace_id, "ws-belt-it"))
+                return error.M5P4BeltObservedWorkspaceResurrected;
+        }
     }
 
     // Prepare + exit so the RO reopen below sees the finalized store.
@@ -5020,8 +5106,8 @@ fn runM5P4WorkspaceBeltScenario(allocator: std.mem.Allocator, io: std.Io) !void 
     kill_on_unwind = false;
     _ = child.wait(io) catch {};
 
-    // Durable half: the ledger row still resolves to a real message row
-    // (the belt's whole point — no dangling committed receipts).
+    // Durable half after restart: deletion remains deleted and its ledger
+    // ownership is gone, so a later snapshot cannot resurrect it.
     const db_path = try std.fs.path.join(allocator, &.{ store_dir, "state.sqlite" });
     defer allocator.free(db_path);
     const db_path_z = try allocator.dupeZ(u8, db_path);
@@ -5035,13 +5121,13 @@ fn runM5P4WorkspaceBeltScenario(allocator: std.mem.Allocator, io: std.Io) !void 
             .{},
         )) orelse return error.M5P4BeltLedgerRowMissing;
         defer row.deinit();
-        if (row.int(0) != 1) return error.M5P4BeltLedgerDangling;
+        if (row.int(0) != 0) return error.M5P4BeltLedgerSurvivedDeletion;
     }
     {
         const row = (try conn.row("select count(*) from workspaces where workspace_id = 'ws-belt-it'", .{})) orelse
             return error.M5P4BeltDurableRowMissing;
         defer row.deinit();
-        if (row.int(0) != 1) return error.M5P4BeltDurableWorkspaceMissing;
+        if (row.int(0) != 0) return error.M5P4BeltDurableWorkspaceResurrected;
     }
     {
         const row = (try conn.row("select count(*) from workspaces where workspace_id = 'ws-belt-plain'", .{})) orelse
