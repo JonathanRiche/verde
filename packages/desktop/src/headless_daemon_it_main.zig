@@ -202,6 +202,16 @@ pub fn main(init: std.process.Init) !void {
     // to a single identity set across flush + daemon restart. POSIX-gated.
     try runChatAdoptionRetryDurabilityScenario(allocator, io);
 
+    // M5-P2 composite snapshot + change-journal cursor (Windows-safe subset:
+    // transport + store dir only). Wire-level tail-vs-slow-commit concurrency
+    // stays out of scope until M5-P3 (A7); scenario 1 pins the wait_ms clamp.
+    try runM5ChangesJournalScenario(allocator, io); // scenario 1 + wait_ms clamp
+    try runM5SnapshotCompositeScenario(allocator, io); // scenario 2 + M3 byte-compat
+    try runM5ChangesOverflowExpiryScenario(allocator, io); // scenario 3
+    try runM5DaemonReplacementCursorScenario(allocator, io); // scenario 4
+    try runM5RollbackReplayJournalScenario(allocator, io); // scenario 5 (A2)
+    try runM5SnapshotIncompleteScopesScenario(allocator, io); // scenario 6
+
     // Extended store scenarios (POSIX only): full surface + S4 fault/busy/crash pins.
     // Transport-tier primitives, but not part of the Windows-safe subset.
     if (posix_pty_supported) {
@@ -367,6 +377,9 @@ const IsolatedDaemonOptions = struct {
     chat_commit_fault: ?[]const u8 = null,
     slow_io_ms: ?[]const u8 = null,
     retention_ms: ?[]const u8 = null,
+    /// When set, maps to `VERDE_SESSION_DAEMON_JOURNAL_ENTRY_CAP` so the M5-P2
+    /// overflow scenario can force change-journal eviction with few entries.
+    journal_entry_cap: ?[]const u8 = null,
 };
 
 fn spawnIsolatedDaemon(
@@ -435,6 +448,7 @@ fn spawnIsolatedDaemonWithOptions(
     if (options.store_disable) try env_map.put(sessionizer.SESSION_DAEMON_STORE_DISABLE_ENV_NAME, "1");
     if (options.chat_stub) try env_map.put(sessionizer.SESSION_DAEMON_CHAT_STUB_ENV_NAME, "1");
     if (options.chat_commit_fault) |value| try env_map.put(sessionizer.SESSION_DAEMON_CHAT_COMMIT_FAULT_ENV_NAME, value);
+    if (options.journal_entry_cap) |value| try env_map.put(sessionizer.SESSION_DAEMON_JOURNAL_ENTRY_CAP_ENV_NAME, value);
 
     // Bind the child to the same isolated endpoint the parent uses.
     const endpoint = try isolationEndpoint(allocator, pref_path);
@@ -3336,6 +3350,782 @@ fn runStoreDurableReopenScenario(allocator: std.mem.Allocator, io: std.Io) !void
         const replay_result = try client.decodeWriteResult(&replay_parsed);
         if (replay_result.store_revision != persisted_revision) return error.StoreDurableReceiptReplayRevision;
         if (!replay_result.applied or replay_result.duplicate) return error.StoreDurableReceiptReplayShape;
+    }
+}
+
+/// M5-P2 scenario 1: core.changes reports store commits and registry bumps
+/// through the nonce-scoped journal with one volatile envelope per reply,
+/// topic filters narrow entries without stalling the cursor, and wait_ms is
+/// clamped to an immediate heartbeat (Q7) instead of parking the serial
+/// accept loop (A7: latency pin only until M5-P3 lands concurrency).
+fn runM5ChangesJournalScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m5-changes");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    // Backslash-safe on Windows; same join used for state.sqlite below.
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+    });
+    defer child.kill(io);
+
+    // Typed decodes use leaky .alloc_always — must run over a scoped arena
+    // (file convention) so DebugAllocator does not report per-scenario leaks.
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer register_parsed.deinit();
+    if (!register_parsed.response.isOk()) return error.M5ChangesRegisterFailed;
+    const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+    // Absent cursor bootstraps at the tail of the (still empty) journal.
+    const boot_req: headless.changes_protocol.ChangesRequest = .{};
+    var boot = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, boot_req);
+    defer boot.deinit();
+    if (!boot.response.isOk()) return error.M5ChangesBootstrapFailed;
+    const boot_result = try client.decodeChanges(&boot);
+    if (boot_result.next_cursor != 0) return error.M5ChangesBootstrapCursorNotZero;
+    if (!boot_result.heartbeat or boot_result.entries.len != 0) return error.M5ChangesBootstrapNotHeartbeat;
+    if (boot_result.expired) return error.M5ChangesBootstrapExpired;
+    if (boot_result.envelope.instance_nonce.len == 0) return error.M5ChangesBootstrapMissingNonce;
+
+    // One store commit (durable revision family) ...
+    const upsert: headless.store.WorkspaceUpsertRequest = .{
+        .mutation = .{ .request_key = "m5-changes-ws", .client_id = client_id },
+        .workspace = .{
+            .workspace_id = "m5-changes-ws",
+            .label = "M5 changes",
+            .path = pref_path,
+        },
+    };
+    var upsert_parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, upsert);
+    defer upsert_parsed.deinit();
+    if (!upsert_parsed.response.isOk()) return error.M5ChangesUpsertFailed;
+    const upsert_result = try client.decodeWriteResult(&upsert_parsed);
+    if (!upsert_result.applied or upsert_result.store_revision != 1) return error.M5ChangesUpsertNotApplied;
+
+    // ... and one registry bump (volatile revision family).
+    const resources = [_][]const u8{"build"};
+    var lease_parsed = try client.call(headless.registry.METHOD_LEASE_ACQUIRE, .{
+        .workspace = .{ .workspace_path = pref_path },
+        .owner = "m5-owner",
+        .command = "build",
+        .resources = &resources,
+    });
+    defer lease_parsed.deinit();
+    const lease_result = try client.decodeLeaseAcquire(&lease_parsed);
+    if (!lease_result.acquired) return error.M5ChangesLeaseNotAcquired;
+
+    const poll_req: headless.changes_protocol.ChangesRequest = .{ .cursor = boot_result.next_cursor };
+    var poll = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, poll_req);
+    defer poll.deinit();
+    if (!poll.response.isOk()) return error.M5ChangesPollFailed;
+    const poll_result = try client.decodeChanges(&poll);
+    if (poll_result.expired or poll_result.heartbeat) return error.M5ChangesPollShape;
+    if (poll_result.entries.len < 2) return error.M5ChangesPollTooFewEntries;
+    if (poll_result.store_revision != 1) return error.M5ChangesPollStoreRevision;
+    if (!std.mem.eql(u8, poll_result.envelope.instance_nonce, boot_result.envelope.instance_nonce))
+        return error.M5ChangesPollNonceDrift;
+    var found_store_workspace = false;
+    var found_lease = false;
+    var last_seq: u64 = 0;
+    for (poll_result.entries) |entry| {
+        if (entry.change_seq <= last_seq) return error.M5ChangesEntriesNotAscending;
+        last_seq = entry.change_seq;
+        if (std.mem.eql(u8, entry.topic, "workspace") and entry.store_revision != null) {
+            if (entry.store_revision.? != 1) return error.M5ChangesWorkspaceRevision;
+            found_store_workspace = true;
+        }
+        if (std.mem.eql(u8, entry.topic, "lease")) {
+            if (entry.registry_revision == null) return error.M5ChangesLeaseMissingRegistryRevision;
+            found_lease = true;
+        }
+    }
+    if (!found_store_workspace) return error.M5ChangesMissingWorkspaceEntry;
+    if (!found_lease) return error.M5ChangesMissingLeaseEntry;
+    // Unfiltered poll drains to the tail, so next_cursor is the last entry seq.
+    if (poll_result.next_cursor != last_seq) return error.M5ChangesNextCursorNotTail;
+
+    // Topic filter narrows entries; the cursor still advances to the tail so
+    // a filtered client never re-reads suppressed entries.
+    const lease_topics = [_][]const u8{"lease"};
+    const filtered_req: headless.changes_protocol.ChangesRequest = .{
+        .cursor = boot_result.next_cursor,
+        .topics = &lease_topics,
+    };
+    var filtered = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, filtered_req);
+    defer filtered.deinit();
+    if (!filtered.response.isOk()) return error.M5ChangesFilteredFailed;
+    const filtered_result = try client.decodeChanges(&filtered);
+    if (filtered_result.entries.len == 0) return error.M5ChangesFilterEmpty;
+    for (filtered_result.entries) |entry| {
+        if (!std.mem.eql(u8, entry.topic, "lease")) return error.M5ChangesFilterLeaked;
+    }
+    if (filtered_result.next_cursor != poll_result.next_cursor) return error.M5ChangesFilterCursorMismatch;
+
+    // wait_ms clamp pin (Q7/A7): a large wait at the tail answers immediately
+    // as a heartbeat. The bound is generous — it proves "no 60s park", not an
+    // SLO — and stays far under the request timeout.
+    const wait_started_ms = sessionizer.nowMs();
+    const heartbeat_req: headless.changes_protocol.ChangesRequest = .{
+        .cursor = poll_result.next_cursor,
+        .wait_ms = 60_000,
+    };
+    var heartbeat = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, heartbeat_req);
+    defer heartbeat.deinit();
+    const wait_elapsed_ms = sessionizer.nowMs() - wait_started_ms;
+    if (!heartbeat.response.isOk()) return error.M5ChangesHeartbeatFailed;
+    const heartbeat_result = try client.decodeChanges(&heartbeat);
+    if (!heartbeat_result.heartbeat or heartbeat_result.entries.len != 0) return error.M5ChangesHeartbeatShape;
+    if (heartbeat_result.next_cursor != poll_result.next_cursor) return error.M5ChangesHeartbeatCursorMoved;
+    if (wait_elapsed_ms > 5_000) return error.M5ChangesWaitNotClamped;
+}
+
+/// M5-P2 scenario 2: composite core.snapshot coherence — the store half and
+/// its revision come from ONE read transaction, the change cursor seeds the
+/// first poll without gaps, a scope-less request keeps the M3 store-only
+/// reply byte-compatible (no composite keys at all), and the capability
+/// advertisement for snapshots/changes/subscriptions stays false (M5-P5 flip).
+fn runM5SnapshotCompositeScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m5-snapshot");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    // Backslash-safe on Windows; same join used for state.sqlite below.
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+    });
+    defer child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer register_parsed.deinit();
+    if (!register_parsed.response.isOk()) return error.M5SnapshotRegisterFailed;
+    const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+    const upsertWorkspace = struct {
+        fn run(cl: *headless.Client, cid: []const u8, key: []const u8, ws: []const u8, path: []const u8, expected: u64) !u64 {
+            const req: headless.store.WorkspaceUpsertRequest = .{
+                .mutation = .{ .request_key = key, .client_id = cid, .expected_store_revision = expected },
+                .workspace = .{ .workspace_id = ws, .label = ws, .path = path },
+            };
+            var parsed = try cl.call(headless.store.METHOD_WORKSPACE_UPSERT, req);
+            defer parsed.deinit();
+            if (!parsed.response.isOk()) return error.M5SnapshotUpsertFailed;
+            const result = try cl.decodeWriteResult(&parsed);
+            if (!result.applied) return error.M5SnapshotUpsertNotApplied;
+            return result.store_revision;
+        }
+    }.run;
+
+    if (try upsertWorkspace(&client, client_id, "m5-snap-a", "m5-snap-a", pref_path, 0) != 1)
+        return error.M5SnapshotFirstCommitRevision;
+
+    const scopes = [_][]const u8{ "store", "registry", "sessions", "turns" };
+    const snap_req: headless.store.CoreSnapshotRequest = .{ .scopes = &scopes };
+    var snap1 = try client.call(headless.store.METHOD_CORE_SNAPSHOT, snap_req);
+    defer snap1.deinit();
+    if (!snap1.response.isOk()) return error.M5SnapshotFirstFailed;
+    const snap1_result = try client.decodeCompositeSnapshot(&snap1);
+    if (snap1_result.store_revision != 1) return error.M5SnapshotFirstRevision;
+    // Coherence pin: the embedded snapshot and the top-level revision are the
+    // same committed state (single read transaction on the store queue).
+    if (snap1_result.snapshot.store_revision != snap1_result.store_revision) return error.M5SnapshotFirstIncoherent;
+    if (snap1_result.snapshot.workspaces.len != 1) return error.M5SnapshotFirstWorkspaceCount;
+    const envelope1 = snap1_result.envelope orelse return error.M5SnapshotFirstMissingEnvelope;
+    if (envelope1.instance_nonce.len == 0) return error.M5SnapshotFirstMissingNonce;
+    const cursor1 = snap1_result.change_cursor orelse return error.M5SnapshotFirstMissingCursor;
+    if (cursor1 == 0) return error.M5SnapshotFirstCursorZero; // the commit above was journaled
+    if (snap1_result.incomplete_scopes.len != 0) return error.M5SnapshotFirstIncomplete;
+    if (snap1_result.turns.len != 0) return error.M5SnapshotFirstTurns;
+
+    if (try upsertWorkspace(&client, client_id, "m5-snap-b", "m5-snap-b", pref_path, 1) != 2)
+        return error.M5SnapshotSecondCommitRevision;
+
+    var snap2 = try client.call(headless.store.METHOD_CORE_SNAPSHOT, snap_req);
+    defer snap2.deinit();
+    if (!snap2.response.isOk()) return error.M5SnapshotSecondFailed;
+    const snap2_result = try client.decodeCompositeSnapshot(&snap2);
+    if (snap2_result.store_revision != 2) return error.M5SnapshotSecondRevision;
+    if (snap2_result.snapshot.store_revision != 2) return error.M5SnapshotSecondIncoherent;
+    if (snap2_result.snapshot.workspaces.len != 2) return error.M5SnapshotSecondWorkspaceCount;
+    const envelope2 = snap2_result.envelope orelse return error.M5SnapshotSecondMissingEnvelope;
+    if (!std.mem.eql(u8, envelope2.instance_nonce, envelope1.instance_nonce)) return error.M5SnapshotNonceDrift;
+    const cursor2 = snap2_result.change_cursor orelse return error.M5SnapshotSecondMissingCursor;
+    if (cursor2 <= cursor1) return error.M5SnapshotCursorNotAdvancing;
+
+    // Snapshot-seeded cursor resumes without gaps: the first commit after the
+    // snapshot is exactly what the first poll sees.
+    if (try upsertWorkspace(&client, client_id, "m5-snap-c", "m5-snap-c", pref_path, 2) != 3)
+        return error.M5SnapshotThirdCommitRevision;
+    const resume_req: headless.changes_protocol.ChangesRequest = .{ .cursor = cursor2 };
+    var resume_parsed = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, resume_req);
+    defer resume_parsed.deinit();
+    if (!resume_parsed.response.isOk()) return error.M5SnapshotResumeFailed;
+    const resume_result = try client.decodeChanges(&resume_parsed);
+    if (resume_result.expired) return error.M5SnapshotResumeExpired;
+    if (resume_result.entries.len != 1) return error.M5SnapshotResumeEntryCount;
+    if (!std.mem.eql(u8, resume_result.entries[0].topic, "workspace")) return error.M5SnapshotResumeTopic;
+    if ((resume_result.entries[0].store_revision orelse 0) != 3) return error.M5SnapshotResumeRevision;
+
+    // M3 byte-compat: absent scopes keep the store-only reply shape — the
+    // result object carries ONLY snapshot + store_revision, nothing else.
+    const legacy_req: headless.store.CoreSnapshotRequest = .{};
+    var legacy = try client.call(headless.store.METHOD_CORE_SNAPSHOT, legacy_req);
+    defer legacy.deinit();
+    if (!legacy.response.isOk()) return error.M5SnapshotLegacyFailed;
+    const legacy_result = try client.decodeCompositeSnapshot(&legacy);
+    if (legacy_result.envelope != null or legacy_result.change_cursor != null) return error.M5SnapshotLegacyComposite;
+    if (legacy_result.store_revision != 3 or legacy_result.snapshot.workspaces.len != 3) return error.M5SnapshotLegacyContents;
+    if (legacy_result.incomplete_scopes.len != 0) return error.M5SnapshotLegacyIncomplete;
+    const legacy_root = legacy.arena_parsed.value;
+    if (legacy_root != .object) return error.M5SnapshotLegacyRootShape;
+    const legacy_result_value = legacy_root.object.get("result") orelse return error.M5SnapshotLegacyMissingResult;
+    if (legacy_result_value != .object) return error.M5SnapshotLegacyResultShape;
+    if (legacy_result_value.object.count() != 2) return error.M5SnapshotLegacyExtraKeys;
+    if (legacy_result_value.object.get("snapshot") == null) return error.M5SnapshotLegacyMissingSnapshot;
+    if (legacy_result_value.object.get("store_revision") == null) return error.M5SnapshotLegacyMissingRevision;
+
+    // Capabilities stay unflipped through M5-P2 (charter: flip is M5-P5).
+    const empty_params: struct {} = .{};
+    var caps = try client.call("core.capabilities", empty_params);
+    defer caps.deinit();
+    if (!caps.response.isOk()) return error.M5SnapshotCapabilitiesFailed;
+    const caps_result = try client.decodeCapabilities(&caps);
+    if (caps_result.capabilities.snapshots) return error.M5SnapshotCapabilitySnapshotsFlipped;
+    if (caps_result.capabilities.changes) return error.M5SnapshotCapabilityChangesFlipped;
+    if (caps_result.capabilities.subscriptions) return error.M5SnapshotCapabilitySubscriptionsFlipped;
+}
+
+/// M5-P2 scenario 3: overflow honesty — a capped journal expires stale
+/// cursors with `revision_expired` + a floor_seq datum (Q6), the composite
+/// snapshot fallback reseeds the cursor, and polling resumes from the seed.
+fn runM5ChangesOverflowExpiryScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m5-overflow");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    // Backslash-safe on Windows; same join used for state.sqlite below.
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    // Cap the ring at 4 entries so six commits evict seq 1 and 2 (floor 2).
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+        .journal_entry_cap = "4",
+    });
+    defer child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer register_parsed.deinit();
+    if (!register_parsed.response.isOk()) return error.M5OverflowRegisterFailed;
+    const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+    // Client seeds its cursor at the empty tail (0), then falls behind.
+    const boot_req: headless.changes_protocol.ChangesRequest = .{};
+    var boot = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, boot_req);
+    defer boot.deinit();
+    if (!boot.response.isOk()) return error.M5OverflowBootstrapFailed;
+    const boot_result = try client.decodeChanges(&boot);
+    if (boot_result.next_cursor != 0) return error.M5OverflowBootstrapCursor;
+
+    var commit_index: u64 = 0;
+    while (commit_index < 6) : (commit_index += 1) {
+        var key_buf: [48]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "m5-overflow-{d}", .{commit_index});
+        const req: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{
+                .request_key = key,
+                .client_id = client_id,
+                .expected_store_revision = commit_index,
+            },
+            .workspace = .{ .workspace_id = key, .label = "M5 overflow", .path = pref_path },
+        };
+        var parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, req);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.M5OverflowUpsertFailed;
+        const result = try client.decodeWriteResult(&parsed);
+        if (!result.applied or result.store_revision != commit_index + 1) return error.M5OverflowUpsertRevision;
+    }
+
+    // Stale cursor 0 fell below the floor (2): Q6 error envelope + floor datum.
+    const stale_req: headless.changes_protocol.ChangesRequest = .{ .cursor = 0 };
+    var stale = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, stale_req);
+    defer stale.deinit();
+    if (stale.response.isOk()) return error.M5OverflowStaleNotRejected;
+    const stale_err = stale.response.err orelse return error.M5OverflowStaleMissingError;
+    if (!std.mem.eql(u8, stale_err.code, headless.protocol.ERR_REVISION_EXPIRED)) return error.M5OverflowWrongCode;
+    _ = client.decodeChanges(&stale) catch |err| switch (err) {
+        error.RemoteError => {},
+        else => return err,
+    };
+    const stale_data = stale_err.data orelse return error.M5OverflowMissingData;
+    if (stale_data != .object) return error.M5OverflowMalformedData;
+    const floor_value = stale_data.object.get("floor_seq") orelse return error.M5OverflowMissingFloor;
+    if (floor_value != .integer or floor_value.integer != 2) return error.M5OverflowWrongFloor;
+
+    // Snapshot fallback reseeds the cursor at the journal tail.
+    const scopes = [_][]const u8{"store"};
+    const snap_req: headless.store.CoreSnapshotRequest = .{ .scopes = &scopes };
+    var snap = try client.call(headless.store.METHOD_CORE_SNAPSHOT, snap_req);
+    defer snap.deinit();
+    if (!snap.response.isOk()) return error.M5OverflowSnapshotFailed;
+    const snap_result = try client.decodeCompositeSnapshot(&snap);
+    if (snap_result.store_revision != 6) return error.M5OverflowSnapshotRevision;
+    if (snap_result.snapshot.workspaces.len != 6) return error.M5OverflowSnapshotWorkspaces;
+    const reseeded = snap_result.change_cursor orelse return error.M5OverflowSnapshotMissingCursor;
+    if (reseeded != 6) return error.M5OverflowSnapshotCursor;
+
+    // The reseeded cursor resumes cleanly on the next commit.
+    {
+        const req: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{ .request_key = "m5-overflow-resume", .client_id = client_id, .expected_store_revision = 6 },
+            .workspace = .{ .workspace_id = "m5-overflow-resume", .label = "M5 overflow", .path = pref_path },
+        };
+        var parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, req);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.M5OverflowResumeUpsertFailed;
+        const result = try client.decodeWriteResult(&parsed);
+        if (!result.applied or result.store_revision != 7) return error.M5OverflowResumeUpsertRevision;
+    }
+    const resume_req: headless.changes_protocol.ChangesRequest = .{ .cursor = reseeded };
+    var resumed = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, resume_req);
+    defer resumed.deinit();
+    if (!resumed.response.isOk()) return error.M5OverflowResumeFailed;
+    const resumed_result = try client.decodeChanges(&resumed);
+    if (resumed_result.expired) return error.M5OverflowResumeExpired;
+    if (resumed_result.entries.len != 1) return error.M5OverflowResumeEntryCount;
+    if (!std.mem.eql(u8, resumed_result.entries[0].topic, "workspace")) return error.M5OverflowResumeTopic;
+    if ((resumed_result.entries[0].store_revision orelse 0) != 7) return error.M5OverflowResumeRevision;
+    if (resumed_result.next_cursor != 7) return error.M5OverflowResumeCursor;
+    // Seventh append evicted seq 3 (cap 4): floor advanced with the ring.
+    if (resumed_result.journal_floor_seq != 3) return error.M5OverflowResumeFloor;
+}
+
+/// M5-P2 scenario 4: daemon replacement on the same store — the successor
+/// mints a fresh instance_nonce and an empty nonce-scoped journal (change_seq
+/// restarts), while the durable store_revision persists. The old cursor is
+/// invalidated by the envelope nonce change (client-side rule pinned in
+/// packages/headless/src/client.zig advanceChangeCursor), not by seq compare.
+fn runM5DaemonReplacementCursorScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m5-replace");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    // Backslash-safe on Windows; same join used for state.sqlite below.
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var first_nonce: ?[]u8 = null;
+    defer if (first_nonce) |owned| allocator.free(owned);
+    var first_cursor: u64 = 0;
+    var persisted_revision: u64 = 0;
+
+    {
+        var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+        });
+        // No defer kill: prepareShutdown should exit the child. Kill on bare-try
+        // unwind until prepare is accepted (pre-prepare orphan holds the endpoint).
+        var kill_on_unwind = true;
+        errdefer if (kill_on_unwind) child.kill(io);
+
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+        var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+        defer register_parsed.deinit();
+        if (!register_parsed.response.isOk()) return error.M5ReplaceRegisterFailed;
+        const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+        const upsert: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{ .request_key = "m5-replace-ws", .client_id = client_id },
+            .workspace = .{ .workspace_id = "m5-replace-ws", .label = "M5 replace", .path = pref_path },
+        };
+        var upsert_parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, upsert);
+        defer upsert_parsed.deinit();
+        if (!upsert_parsed.response.isOk()) return error.M5ReplaceUpsertFailed;
+        const upsert_result = try client.decodeWriteResult(&upsert_parsed);
+        if (!upsert_result.applied) return error.M5ReplaceUpsertNotApplied;
+        persisted_revision = upsert_result.store_revision;
+
+        const boot_req: headless.changes_protocol.ChangesRequest = .{};
+        var boot = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, boot_req);
+        defer boot.deinit();
+        if (!boot.response.isOk()) return error.M5ReplaceBootstrapFailed;
+        const boot_result = try client.decodeChanges(&boot);
+        if (boot_result.next_cursor == 0) return error.M5ReplaceBootstrapCursorZero; // the commit was journaled
+        if (boot_result.envelope.instance_nonce.len == 0) return error.M5ReplaceMissingNonce;
+        first_nonce = try allocator.dupe(u8, boot_result.envelope.instance_nonce);
+        first_cursor = boot_result.next_cursor;
+
+        var prepare = try client.call("daemon.prepareShutdown", .{});
+        defer prepare.deinit();
+        if (!prepare.response.isOk()) return error.M5ReplacePrepareFailed;
+        const prepare_result = prepare.arena_parsed.value.object.get("result") orelse
+            return error.M5ReplacePrepareNotAccepted;
+        const accepted = prepare_result.object.get("accepted") orelse
+            return error.M5ReplacePrepareNotAccepted;
+        if (accepted != .bool or !accepted.bool) return error.M5ReplacePrepareNotAccepted;
+        kill_on_unwind = false;
+
+        // Exit-wait uses the same connect-class discrimination as the durable
+        // reopen scenario: probes may still succeed while the drain completes.
+        var exited = false;
+        var attempts: usize = 0;
+        while (attempts < 100) : (attempts += 1) {
+            if (sessionizer.requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
+                allocator.free(response);
+                std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+                continue;
+            } else |err| {
+                if (isConnectClassError(err)) {
+                    exited = true;
+                    break;
+                }
+                std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+            }
+        }
+        if (!exited) {
+            child.kill(io);
+            return error.M5ReplaceDaemonDidNotExit;
+        }
+        _ = child.wait(io) catch {};
+    }
+
+    // Successor on the SAME store: fresh nonce + fresh journal, durable revision
+    // persists (drain transfer bump adds one on top of the mutation revision).
+    {
+        var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+        });
+        defer child.kill(io);
+
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+        const boot_req: headless.changes_protocol.ChangesRequest = .{};
+        var boot = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, boot_req);
+        defer boot.deinit();
+        if (!boot.response.isOk()) return error.M5ReplaceReopenBootstrapFailed;
+        const boot_result = try client.decodeChanges(&boot);
+        // Nonce-scoped restart: new instance, empty journal, cursor restarts.
+        if (std.mem.eql(u8, boot_result.envelope.instance_nonce, first_nonce.?)) return error.M5ReplaceNonceReused;
+        if (boot_result.next_cursor != 0) return error.M5ReplaceJournalNotReset;
+        if (boot_result.journal_floor_seq != 0) return error.M5ReplaceFloorNotReset;
+        if (!boot_result.heartbeat or boot_result.entries.len != 0) return error.M5ReplaceReopenNotHeartbeat;
+        // Durable half survives replacement: mutation revision + drain transfer bump.
+        if (boot_result.store_revision != persisted_revision + 1) return error.M5ReplaceDurableRevisionLost;
+        // The pre-replacement cursor value is numerically meaningless here; the
+        // envelope nonce mismatch above is the invalidation signal clients use.
+        if (first_cursor == 0) return error.M5ReplaceFirstCursorUnset;
+    }
+}
+
+/// M5-P2 scenario 5 (A2 rollback/replay honesty): a conflicted mutation and a
+/// replayed duplicate request_key append nothing to the journal, and a stub
+/// chat turn's commitTurn journals its lifecycle exactly once (reads add zero).
+fn runM5RollbackReplayJournalScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m5-rollback");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    // Backslash-safe on Windows; same join used for state.sqlite below.
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+        .store_dir = store_dir,
+        .chat_stub = true,
+    });
+    defer child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+    var register_parsed = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer register_parsed.deinit();
+    if (!register_parsed.response.isOk()) return error.M5RollbackRegisterFailed;
+    const client_id = (try client.decodeClientRegister(&register_parsed)).client_id;
+
+    const original: headless.store.WorkspaceUpsertRequest = .{
+        .mutation = .{ .request_key = "m5-rollback-ws", .client_id = client_id },
+        .workspace = .{ .workspace_id = "m5-rollback-ws", .label = "M5 rollback", .path = pref_path },
+    };
+    var first = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, original);
+    defer first.deinit();
+    if (!first.response.isOk()) return error.M5RollbackUpsertFailed;
+    const first_result = try client.decodeWriteResult(&first);
+    if (!first_result.applied or first_result.store_revision != 1) return error.M5RollbackUpsertNotApplied;
+
+    const boot_req: headless.changes_protocol.ChangesRequest = .{ .cursor = 0 };
+    var boot = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, boot_req);
+    defer boot.deinit();
+    if (!boot.response.isOk()) return error.M5RollbackBaselineFailed;
+    const boot_result = try client.decodeChanges(&boot);
+    if (boot_result.entries.len == 0) return error.M5RollbackBaselineEmpty;
+    const baseline_cursor = boot_result.next_cursor;
+
+    // Conflict (stale expected_store_revision): rolled back, nothing journaled.
+    {
+        const conflicted: headless.store.WorkspaceUpsertRequest = .{
+            .mutation = .{
+                .request_key = "m5-rollback-conflict",
+                .client_id = client_id,
+                .expected_store_revision = 0, // stale: store is at 1
+            },
+            .workspace = .{ .workspace_id = "m5-rollback-conflict", .label = "M5 conflict", .path = pref_path },
+        };
+        var parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, conflicted);
+        defer parsed.deinit();
+        const err = parsed.response.err orelse return error.M5RollbackConflictMissingError;
+        if (!std.mem.eql(u8, err.code, headless.protocol.ERR_CONFLICT)) return error.M5RollbackConflictWrongCode;
+    }
+    {
+        const req: headless.changes_protocol.ChangesRequest = .{ .cursor = baseline_cursor };
+        var parsed = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, req);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.M5RollbackPostConflictFailed;
+        const result = try client.decodeChanges(&parsed);
+        if (result.entries.len != 0 or !result.heartbeat) return error.M5RollbackConflictJournaled;
+        if (result.next_cursor != baseline_cursor) return error.M5RollbackConflictCursorMoved;
+        if (result.store_revision != 1) return error.M5RollbackConflictRevision;
+    }
+
+    // Receipt replay (same request_key): original result, zero new entries (A2).
+    {
+        var parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, original);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.M5RollbackReplayFailed;
+        const result = try client.decodeWriteResult(&parsed);
+        if (result.store_revision != first_result.store_revision or
+            result.applied != first_result.applied or
+            result.duplicate != first_result.duplicate)
+        {
+            return error.M5RollbackReplayMismatch;
+        }
+    }
+    {
+        const req: headless.changes_protocol.ChangesRequest = .{ .cursor = baseline_cursor };
+        var parsed = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, req);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.M5RollbackPostReplayFailed;
+        const result = try client.decodeChanges(&parsed);
+        if (result.entries.len != 0) return error.M5RollbackReplayJournaled;
+        if (result.next_cursor != baseline_cursor) return error.M5RollbackReplayCursorMoved;
+    }
+
+    // A2 chat half: one stub turn commits once; its journal window carries the
+    // chat lifecycle topics, and a follow-up read adds nothing new.
+    try startStubChatTurn(&client, "m5-rollback-turn", "m5-rollback-ws", "m5-rollback-thread", pref_path, "m5 body", "m5-user-1");
+    try waitChatTurnTerminal(io, &client, "m5-rollback-turn", true);
+    var chat_thread_entries: usize = 0;
+    var chat_turn_entries: usize = 0;
+    var chat_completion_entries: usize = 0;
+    var post_chat_cursor: u64 = 0;
+    {
+        const req: headless.changes_protocol.ChangesRequest = .{ .cursor = baseline_cursor };
+        var parsed = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, req);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.M5RollbackChatPollFailed;
+        const result = try client.decodeChanges(&parsed);
+        for (result.entries) |entry| {
+            if (std.mem.eql(u8, entry.topic, "chat.thread")) chat_thread_entries += 1;
+            if (std.mem.eql(u8, entry.topic, "chat.turn")) chat_turn_entries += 1;
+            if (std.mem.eql(u8, entry.topic, "chat.completion")) chat_completion_entries += 1;
+        }
+        post_chat_cursor = result.next_cursor;
+    }
+    if (chat_thread_entries == 0) return error.M5RollbackChatThreadMissing;
+    if (chat_turn_entries == 0) return error.M5RollbackChatTurnMissing;
+    // Exactly one completion append per committed turn (commitTurn hook, A2).
+    if (chat_completion_entries != 1) return error.M5RollbackChatCompletionCount;
+
+    // A turn-record read replays nothing and journals nothing.
+    var record = try client.call(headless.store.METHOD_CHAT_TURN_RECORD, .{ .turn_id = "m5-rollback-turn" });
+    defer record.deinit();
+    if (!record.response.isOk()) return error.M5RollbackRecordFailed;
+    const record_result = try client.decodeTurnRecord(&record);
+    if (record_result.committed_store_revision == null) return error.M5RollbackRecordNotCommitted;
+    {
+        const req: headless.changes_protocol.ChangesRequest = .{ .cursor = post_chat_cursor };
+        var parsed = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, req);
+        defer parsed.deinit();
+        if (!parsed.response.isOk()) return error.M5RollbackPostRecordFailed;
+        const result = try client.decodeChanges(&parsed);
+        if (result.entries.len != 0) return error.M5RollbackReadJournaled;
+        if (result.next_cursor != post_chat_cursor) return error.M5RollbackReadCursorMoved;
+    }
+}
+
+/// M5-P2 scenario 6: incomplete_scopes honesty — unknown scopes are marked
+/// while every known scope is served completely (CHAT_AUTHORITY_LANDED), and
+/// a store-less daemon answers capability_unavailable for both core reads.
+fn runM5SnapshotIncompleteScopesScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    // Store-enabled half: unknown scope is marked, known scopes are not.
+    {
+        const pref_path = try makePrefPath(allocator, "m5-scopes");
+        defer allocator.free(pref_path);
+        defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+        try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+        // Backslash-safe on Windows; same join used for state.sqlite below.
+        const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+        defer allocator.free(store_dir);
+        try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+        var isolation = try EndpointIsolation.install(allocator, pref_path);
+        defer isolation.deinit(allocator);
+
+        const self_exe = try std.process.executablePathAlloc(io, allocator);
+        defer allocator.free(self_exe);
+
+        var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+        });
+        defer child.kill(io);
+
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+        const scopes = [_][]const u8{ "store", "registry", "sessions", "turns", "surface.experimental" };
+        const snap_req: headless.store.CoreSnapshotRequest = .{ .scopes = &scopes };
+        var snap = try client.call(headless.store.METHOD_CORE_SNAPSHOT, snap_req);
+        defer snap.deinit();
+        if (!snap.response.isOk()) return error.M5ScopesSnapshotFailed;
+        const snap_result = try client.decodeCompositeSnapshot(&snap);
+        if (snap_result.incomplete_scopes.len != 1) return error.M5ScopesIncompleteCount;
+        if (!std.mem.eql(u8, snap_result.incomplete_scopes[0], "surface.experimental")) return error.M5ScopesWrongIncomplete;
+        // Known scopes are answered, not merely tolerated: composite fields present.
+        if (snap_result.envelope == null or snap_result.change_cursor == null) return error.M5ScopesMissingComposite;
+        if (snap_result.store_revision != 0) return error.M5ScopesUnexpectedRevision;
+    }
+
+    // Store-less half: both core reads refuse with capability_unavailable
+    // (documented M5-P2 simplification; the store owns both durable halves).
+    {
+        const pref_path = try makePrefPath(allocator, "m5-scopes-less");
+        defer allocator.free(pref_path);
+        defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+        try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+        var isolation = try EndpointIsolation.install(allocator, pref_path);
+        defer isolation.deinit(allocator);
+
+        const self_exe = try std.process.executablePathAlloc(io, allocator);
+        defer allocator.free(self_exe);
+
+        var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_disable = true,
+        });
+        defer child.kill(io);
+
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+        const snap_req: headless.store.CoreSnapshotRequest = .{};
+        var snap = try client.call(headless.store.METHOD_CORE_SNAPSHOT, snap_req);
+        defer snap.deinit();
+        const snap_err = snap.response.err orelse return error.M5ScopesStoreLessSnapshotAccepted;
+        if (!std.mem.eql(u8, snap_err.code, headless.protocol.ERR_CAPABILITY_UNAVAILABLE)) return error.M5ScopesStoreLessSnapshotWrongCode;
+
+        const changes_req: headless.changes_protocol.ChangesRequest = .{};
+        var changes = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, changes_req);
+        defer changes.deinit();
+        const changes_err = changes.response.err orelse return error.M5ScopesStoreLessChangesAccepted;
+        if (!std.mem.eql(u8, changes_err.code, headless.protocol.ERR_CAPABILITY_UNAVAILABLE)) return error.M5ScopesStoreLessChangesWrongCode;
     }
 }
 

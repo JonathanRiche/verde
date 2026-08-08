@@ -88,6 +88,26 @@ pub const TurnCommitRequest = struct {
     client_id: []const u8 = "daemon",
 };
 
+/// Post-commit notification hook (M5-P2 change journal). Invoked strictly
+/// AFTER the SQLite transaction commits durably and never on receipt-replay,
+/// message-key-duplicate, or rollback paths — a fired callback therefore
+/// proves a NEW durable revision exists. Callbacks run on the committing
+/// thread (the store queue, under the store service mutex, never under
+/// lockDaemon) and must not call back into this store.
+pub const CommitHook = struct {
+    context: *anyopaque,
+    on_mutation_committed: *const fn (
+        context: *anyopaque,
+        mutation: *const Mutation,
+        result: store_protocol.WriteResult,
+    ) void,
+    on_turn_committed: *const fn (
+        context: *anyopaque,
+        request: *const TurnCommitRequest,
+        result: store_protocol.WriteResult,
+    ) void,
+};
+
 pub const CompactionErrorData = struct {
     compacted_before_seq: u64,
 };
@@ -244,6 +264,9 @@ pub const Store = struct {
     conn: zqlite.Conn,
     /// Test-only; production construction always leaves `.none`.
     fault: StoreFault = .none,
+    /// Optional post-commit journal hook; production installs it at store
+    /// service construction (M5-P2). Never fired for replays or rollbacks.
+    commit_hook: ?CommitHook = null,
 
     /// Open the exact database path as the sole store writer.
     pub fn init(allocator: std.mem.Allocator, db_path: []const u8) StoreError!Self {
@@ -380,6 +403,12 @@ pub const Store = struct {
 
         try self.commitWithFault();
         transaction_open = false;
+        // Post-commit boundary: the transaction is durable above this line, so
+        // the journal hook can only ever observe committed revisions (the M3
+        // "no event before commit" invariant extended to journal entries).
+        // Replay and message-key duplicate paths return earlier and never
+        // reach this hook: no new revision, no journal entry.
+        if (self.commit_hook) |hook| hook.on_mutation_committed(hook.context, &mutation, result);
         return result;
     }
 
@@ -487,6 +516,10 @@ pub const Store = struct {
         self.insertReceipt(header, TURN_COMMIT_OPERATION, fingerprint, result) catch |err| return mapStoreError(err);
         self.conn.commit() catch |err| return mapStoreError(err);
         transaction_open = false;
+        // Post-commit boundary (A2): turn commits are store commits and fire
+        // the same hook. A replayed duplicate turn receipt returned above
+        // without committing, so it can never append a second journal entry.
+        if (self.commit_hook) |hook| hook.on_turn_committed(hook.context, &request, result);
         return result;
     }
 

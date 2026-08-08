@@ -24,6 +24,8 @@ extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 const log = std.log.scoped(.sessionizer);
 const store_protocol = headless.store;
+const changes_protocol = headless.changes_protocol;
+const change_journal = @import("../daemon/change_journal.zig");
 
 pub const SOCKET_NAME = "verde-sessionizer.sock";
 pub const LIVE_SOCKET_NAME = "verde.sock";
@@ -78,6 +80,9 @@ pub const SESSION_DAEMON_CHAT_STUB_ENV_NAME = "VERDE_SESSION_DAEMON_CHAT_STUB";
 /// store-dir override. `fail_once` → first commitTurn attempt returns StoreBusy
 /// without touching SQLite; subsequent attempts pass through (MAJOR-3 IT arm).
 pub const SESSION_DAEMON_CHAT_COMMIT_FAULT_ENV_NAME = "VERDE_SESSION_DAEMON_CHAT_COMMIT_FAULT";
+/// Test-only change-journal entry-cap override so overflow ITs stay small
+/// (M5-P2 scenario 3). Missing/empty/invalid keeps the production ring cap.
+pub const SESSION_DAEMON_JOURNAL_ENTRY_CAP_ENV_NAME = "VERDE_SESSION_DAEMON_JOURNAL_ENTRY_CAP";
 /// Test-only latency injection for the unlocked managed-process phase.
 const TEST_SLOW_IO_ENV_NAME = "VERDE_SESSIONIZER_TEST_SLOW_IO_MS";
 /// Test-only orphan retention override; registry-internal TTLs remain fixed.
@@ -1734,6 +1739,14 @@ pub const Daemon = struct {
     test_retention_override_ms: ?i64 = null,
     /// Null until post-bind production (or hermetic override) store construction.
     store_service: ?*StoreService = null,
+    /// Nonce-scoped change journal (M5-P2). A fresh Daemon IS the instance-start
+    /// reset: `instance_nonce` is fixed for this Daemon's lifetime and the
+    /// journal starts empty with it, so change_seq restarts at 1 per instance.
+    journal: change_journal.ChangeJournal = .{},
+    /// Leaf spin lock for the journal. Lock order: lockDaemon → journal_mutex
+    /// and store service mutex → journal_mutex; the journal path never takes
+    /// another lock, so no cycle is possible.
+    journal_mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(allocator: std.mem.Allocator) Daemon {
         return initWithPrefPath(allocator, "");
@@ -1752,6 +1765,7 @@ pub const Daemon = struct {
             .registry_jobs = process_registry.RegistryJobQueue.init(process_registry.REGISTRY_JOB_QUEUE_MAX) catch @panic("failed to initialize registry job queue"),
             .test_slow_io_delay_ms = slowIoDelayMsFromEnv(allocator),
             .test_retention_override_ms = retentionOverrideMsFromEnv(allocator),
+            .journal = .{ .max_entries = journalEntryCapFromEnv(allocator) },
         };
     }
 
@@ -1763,6 +1777,7 @@ pub const Daemon = struct {
         self.chat_turns.deinit(self.allocator);
         self.registry_jobs.deinit(self.allocator);
         self.registry.deinit(self.allocator);
+        self.journal.deinit(self.allocator);
     }
 
     fn pollSessions(self: *Daemon) void {
@@ -2024,7 +2039,7 @@ pub const Daemon = struct {
             };
             // Retain the stopped session id so process.logs can still tail
             // the daemon-owned ring until the next explicit start detaches it.
-            self.bumpRegistryRevision();
+            self.bumpRegistryRevision(.{ .topic = .process, .resource_id = process.id, .workspace_id = workspace.id });
             session.registry_finished = true;
             return;
         }
@@ -2159,8 +2174,10 @@ pub const Daemon = struct {
         const is_thread_list = std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_LIST);
         const is_turn_record = std.mem.eql(u8, method, store_protocol.METHOD_CHAT_TURN_RECORD);
         const is_chat_read = is_thread_get or is_thread_list or is_turn_record;
+        const is_core_snapshot = std.mem.eql(u8, method, store_protocol.METHOD_CORE_SNAPSHOT);
+        const is_core_changes = std.mem.eql(u8, method, changes_protocol.METHOD_CORE_CHANGES);
         // Reads never join the mutator drain gate or in_flight write counter.
-        const is_mutator = !is_status and !is_chat_read;
+        const is_mutator = !is_status and !is_chat_read and !is_core_snapshot and !is_core_changes;
 
         // 1. Decode typed params OUTSIDE any lock into the per-request arena.
         // parseFromValueLeaky ignores allocate; string slices borrow params,
@@ -2171,8 +2188,44 @@ pub const Daemon = struct {
         var decoded_thread_get: ?store_protocol.ThreadGetRequest = null;
         var decoded_thread_list: ?store_protocol.ThreadListRequest = null;
         var decoded_turn_record: ?store_protocol.TurnRecordRequest = null;
+        var decoded_core_snapshot: ?store_protocol.CoreSnapshotRequest = null;
+        var decoded_core_changes: ?changes_protocol.ChangesRequest = null;
         if (is_status) {
             // No params body required for status.
+        } else if (is_core_snapshot) {
+            // Absent params keep the M3 store-only default request.
+            if (params == .null) {
+                decoded_core_snapshot = .{};
+            } else {
+                const req = std.json.parseFromValueLeaky(
+                    store_protocol.CoreSnapshotRequest,
+                    arena,
+                    params,
+                    .{ .ignore_unknown_fields = true },
+                ) catch |err| blk: {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    decode_failed = true;
+                    break :blk null;
+                };
+                if (req) |value| decoded_core_snapshot = value;
+            }
+        } else if (is_core_changes) {
+            // Absent params bootstrap at the journal tail (ChangesRequest{}).
+            if (params == .null) {
+                decoded_core_changes = .{};
+            } else {
+                const req = std.json.parseFromValueLeaky(
+                    changes_protocol.ChangesRequest,
+                    arena,
+                    params,
+                    .{ .ignore_unknown_fields = true },
+                ) catch |err| blk: {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    decode_failed = true;
+                    break :blk null;
+                };
+                if (req) |value| decoded_core_changes = value;
+            }
         } else if (is_thread_get) {
             const req = std.json.parseFromValueLeaky(
                 store_protocol.ThreadGetRequest,
@@ -2339,6 +2392,10 @@ pub const Daemon = struct {
         // (iii) held decode failure.
         const decode_missing = if (is_status)
             false
+        else if (is_core_snapshot)
+            decoded_core_snapshot == null
+        else if (is_core_changes)
+            decoded_core_changes == null
         else if (is_thread_get)
             decoded_thread_get == null
         else if (is_thread_list)
@@ -2390,6 +2447,28 @@ pub const Daemon = struct {
         defer if (is_mutator) {
             _ = service.in_flight.fetchSub(1, .monotonic);
         };
+
+        // M5-P2 composite reads own their lock choreography (journal leaf lock,
+        // short lockDaemon for the volatile half, store mutex for the durable
+        // half) and must never sit under the generic store-mutex window below.
+        if (is_core_changes) {
+            const req = decoded_core_changes orelse return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid params",
+            );
+            return try self.coreChangesResponse(arena, id_value, service, req);
+        }
+        if (is_core_snapshot) {
+            const req = decoded_core_snapshot orelse return try errorResponseAlloc(
+                self.allocator,
+                id_value,
+                headless.protocol.ERR_INVALID_PARAMS,
+                "invalid params",
+            );
+            return try self.coreSnapshotResponse(arena, id_value, service, req);
+        }
 
         // 3. Store work with NO daemon lock.
         lockStoreService(service);
@@ -2476,6 +2555,210 @@ pub const Daemon = struct {
             return try storeErrorResponse(self.allocator, id_value, err);
         };
         return try okValueResponse(self.allocator, id_value, write_result);
+    }
+
+    /// core.changes: immediate-check cursor poll (M5-P2). wait_ms>0 is CLAMPED
+    /// to 0 this phase — the serial accept loop must never park; a positive
+    /// wait degrades to an immediate (possibly heartbeat-shaped) reply.
+    ///
+    /// Capture order pins the reply invariant "envelope/store_revision >= any
+    /// entry's revision": the journal window is copied FIRST, then the
+    /// registry envelope, then the store revision. A commit landing between
+    /// captures can only make the envelope/store_revision newer than the
+    /// entries, never older.
+    fn coreChangesResponse(
+        self: *Daemon,
+        arena: std.mem.Allocator,
+        id_value: std.json.Value,
+        service: *StoreService,
+        request: changes_protocol.ChangesRequest,
+    ) ![]u8 {
+        // (1) Journal window under the leaf lock; entries copy into the arena.
+        var entries: std.ArrayList(changes_protocol.ChangeEntry) = .empty;
+        var next_cursor: u64 = 0;
+        var floor_seq: u64 = 0;
+        {
+            lockJournal(self);
+            defer self.journal_mutex.unlock();
+            if (request.cursor) |cursor| {
+                switch (self.journal.entriesAfter(cursor)) {
+                    .expired => |expired| {
+                        // Q6: expiry is an error envelope with a floor_seq datum.
+                        var data_map: std.json.ObjectMap = .empty;
+                        try data_map.put(arena, "floor_seq", .{ .integer = std.math.cast(i64, expired.floor_seq) orelse std.math.maxInt(i64) });
+                        return try errorResponseAllocWithData(
+                            self.allocator,
+                            id_value,
+                            headless.protocol.ERR_REVISION_EXPIRED,
+                            "cursor below journal floor",
+                            .{ .object = data_map },
+                        );
+                    },
+                    .ok => |window| {
+                        next_cursor = window.last_change_seq;
+                        floor_seq = window.journal_floor_seq;
+                        for (window.entries) |entry| {
+                            if (!changeEntryMatchesTopics(entry.topic, request.topics)) continue;
+                            try entries.append(arena, .{
+                                .change_seq = entry.change_seq,
+                                .topic = entry.topic.wireName(),
+                                .resource_id = try arena.dupe(u8, entry.resource_id),
+                                .workspace_id = if (entry.workspace_id) |value| try arena.dupe(u8, value) else null,
+                                .store_revision = entry.store_revision,
+                                .registry_revision = entry.registry_revision,
+                            });
+                        }
+                    },
+                }
+            } else {
+                // Absent cursor bootstraps at the tail: no historical replay,
+                // and no expiry check because nothing could have been missed.
+                next_cursor = self.journal.last_seq;
+                floor_seq = self.journal.journal_floor_seq;
+            }
+        }
+
+        // (2) Volatile envelope under a short lockDaemon, after the journal drain.
+        lockDaemon(self);
+        const instance_nonce = arena.dupe(u8, self.registry.instance_nonce) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        const registry_revision = self.registry.registry_revision;
+        self.mutex.unlock();
+
+        // (3) Durable revision under the store mutex, after the journal drain.
+        lockStoreService(service);
+        const store_revision = service.store.storeRevision() catch |err| {
+            service.mutex.unlock();
+            return try storeErrorResponse(self.allocator, id_value, err);
+        };
+        service.mutex.unlock();
+
+        // (4) Assembly off every lock. wait_ms was deliberately ignored above
+        // (clamped to 0); an empty window is reported as a heartbeat.
+        const result: changes_protocol.ChangesResult = .{
+            .entries = entries.items,
+            .next_cursor = next_cursor,
+            .journal_floor_seq = floor_seq,
+            .expired = false,
+            .heartbeat = entries.items.len == 0,
+            .envelope = .{ .instance_nonce = instance_nonce, .registry_revision = registry_revision },
+            .store_revision = store_revision,
+        };
+        return try okValueResponse(self.allocator, id_value, result);
+    }
+
+    /// M5-P2 composite snapshot. Capture order: journal cursor FIRST, then the
+    /// volatile half under one short lockDaemon window, then the durable half
+    /// in ONE read transaction under the store mutex, then assembly OFF all
+    /// locks. A cursor captured before both halves can only over-deliver: a
+    /// change landing after the cursor but before a half is read appears both
+    /// in the snapshot and in the first core.changes poll — never in neither.
+    ///
+    /// Declared simplifications: `after_store_revision` is accepted but not
+    /// used for short-circuiting (a full snapshot is always returned), and a
+    /// store-less daemon answers capability_unavailable for every scope.
+    fn coreSnapshotResponse(
+        self: *Daemon,
+        arena: std.mem.Allocator,
+        id_value: std.json.Value,
+        service: *StoreService,
+        request: store_protocol.CoreSnapshotRequest,
+    ) ![]u8 {
+        // Absent scopes preserve the M3 store-only reply shape exactly:
+        // {snapshot, store_revision} with no composite fields at all.
+        const composite = request.scopes != null;
+        var include_store = true;
+        var include_registry = false;
+        var include_sessions = false;
+        var include_turns = false;
+        var incomplete: std.ArrayList([]const u8) = .empty;
+        if (request.scopes) |names| {
+            include_store = false;
+            for (names) |name| {
+                if (std.mem.eql(u8, name, store_protocol.SNAPSHOT_SCOPE_STORE)) include_store = true;
+                if (std.mem.eql(u8, name, store_protocol.SNAPSHOT_SCOPE_REGISTRY)) include_registry = true;
+                if (std.mem.eql(u8, name, store_protocol.SNAPSHOT_SCOPE_SESSIONS)) include_sessions = true;
+                if (std.mem.eql(u8, name, store_protocol.SNAPSHOT_SCOPE_TURNS)) include_turns = true;
+                if (scopeIsIncomplete(name, CHAT_AUTHORITY_LANDED)) {
+                    try incomplete.append(arena, try arena.dupe(u8, name));
+                }
+            }
+        }
+
+        // (1) Journal cursor first (leaf lock): over-delivery-safe seed for
+        // the client's first core.changes poll after this snapshot.
+        var change_cursor: u64 = 0;
+        if (composite) {
+            lockJournal(self);
+            change_cursor = self.journal.last_seq;
+            self.journal_mutex.unlock();
+        }
+
+        // (2) Volatile fragments under one short lockDaemon window, serialized
+        // into arena strings via the existing registry serializers so the wire
+        // shapes stay identical to process.list / session.list / turn records.
+        var envelope_json: []const u8 = "";
+        var processes_json: []const u8 = "[]";
+        var leases_json: []const u8 = "[]";
+        var sessions_json: []const u8 = "[]";
+        var turns_json: []const u8 = "[]";
+        if (composite) {
+            lockDaemon(self);
+            defer self.mutex.unlock();
+            envelope_json = try serializeEnvelopeFragment(arena, self);
+            if (include_registry) {
+                processes_json = try serializeProcessesFragment(arena, self, request.workspace_id);
+                leases_json = try serializeLeasesFragment(arena, self, request.workspace_id);
+            }
+            if (include_sessions) sessions_json = try serializeSessionsFragment(arena, self, request.workspace_id);
+            if (include_turns) turns_json = try serializeTurnsFragment(arena, self, request.workspace_id);
+        }
+
+        // (3) Durable half in ONE read transaction on the store queue: the
+        // snapshot contents and its store_revision are the same committed state.
+        var loaded: LoadedStoreSnapshot = undefined;
+        {
+            lockStoreService(service);
+            defer service.mutex.unlock();
+            loaded = loadStoreSnapshotTxn(arena, &service.store, request.workspace_id, include_store) catch |err| {
+                return try storeErrorResponse(self.allocator, id_value, err);
+            };
+        }
+
+        // (4) Assembly off every lock.
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer writer.deinit();
+        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try s.beginObject();
+        try s.objectField("snapshot");
+        try s.write(loaded.snapshot);
+        try s.objectField("store_revision");
+        try s.write(loaded.store_revision);
+        if (composite) {
+            try s.objectField("envelope");
+            try writeRawFragment(&s, envelope_json);
+            try s.objectField("change_cursor");
+            try s.write(change_cursor);
+            try s.objectField("processes");
+            try writeRawFragment(&s, processes_json);
+            try s.objectField("leases");
+            try writeRawFragment(&s, leases_json);
+            try s.objectField("sessions");
+            try writeRawFragment(&s, sessions_json);
+            try s.objectField("turns");
+            try writeRawFragment(&s, turns_json);
+            try s.objectField("incomplete_scopes");
+            try s.beginArray();
+            for (incomplete.items) |name| try s.write(name);
+            try s.endArray();
+        }
+        try s.endObject();
+        try s.endObject();
+        return try writer.toOwnedSlice();
     }
 
     fn statusResponse(self: *Daemon, id_value: std.json.Value) ![]u8 {
@@ -3284,7 +3567,7 @@ pub const Daemon = struct {
             }
             if (managedProcessByIdentifier(workspace, work.process_id)) |process| {
                 process.transition(.failed, nowMs()) catch {};
-                self.bumpRegistryRevision();
+                self.bumpRegistryRevision(.{ .topic = .process, .resource_id = process.id, .workspace_id = work.workspace_id });
             }
             return self.slowProcessFailureResponse(id_value, work.operation, failure);
         }
@@ -3352,7 +3635,7 @@ pub const Daemon = struct {
                 }
             },
         }
-        self.bumpRegistryRevision();
+        self.bumpRegistryRevision(.{ .topic = .process, .resource_id = managed_process.id, .workspace_id = work.workspace_id });
         return self.slowProcessSuccessResponse(id_value, work.operation, workspace, managed_process);
     }
 
@@ -3405,9 +3688,35 @@ pub const Daemon = struct {
         return try writer.toOwnedSlice();
     }
 
-    fn bumpRegistryRevision(self: *Daemon) void {
+    fn bumpRegistryRevision(self: *Daemon, event: process_registry.RevisionBumpEvent) void {
         self.registry.registry_revision +%= 1;
         if (self.registry.registry_revision == 0) self.registry.registry_revision = 1;
+        // Mirror ProcessRegistry.bumpRevision: publish the volatile-topic
+        // journal entry at the same point that advances registry_revision and
+        // under the same daemon lock, so an observed entry's registry_revision
+        // never leads an envelope captured after draining the journal.
+        if (self.registry.revision_hook) |hook| hook.notify(hook.context, event, self.registry.registry_revision);
+    }
+
+    /// Append one change entry under the journal leaf lock. On append failure
+    /// (OOM / oversized entry) the journal advances its floor past a fresh seq
+    /// so cursor clients observe an honest `revision_expired` and re-snapshot
+    /// instead of silently missing the dropped change.
+    fn appendJournalEntry(
+        self: *Daemon,
+        topic: change_journal.Topic,
+        resource_id: []const u8,
+        workspace_id: ?[]const u8,
+        revision: change_journal.Revision,
+    ) void {
+        lockJournal(self);
+        defer self.journal_mutex.unlock();
+        _ = self.journal.append(self.allocator, topic, resource_id, workspace_id, revision, nowMs()) catch {
+            // The entry the client should have seen was dropped; force every
+            // existing cursor below the new floor so it snapshot-falls-back.
+            self.journal.last_seq += 1;
+            self.journal.journal_floor_seq = self.journal.last_seq;
+        };
     }
 
     fn removeSessionById(self: *Daemon, session_id: []const u8) bool {
@@ -3801,7 +4110,7 @@ pub const Daemon = struct {
                 changed = true;
             }
         }
-        if (changed) self.bumpRegistryRevision();
+        if (changed) self.bumpRegistryRevision(.{ .topic = .process, .resource_id = "*" });
     }
 
     fn resolveWorkspaceFromParams(self: *Daemon, params: std.json.Value) !*process_registry.WorkspaceRecord {
@@ -5169,6 +5478,10 @@ fn runSessionizerServer(allocator: std.mem.Allocator, pref_path: []const u8) !vo
 
     var daemon = Daemon.initWithPrefPath(allocator, pref_path);
     defer daemon.deinit();
+    // M5-P2 journal hook: volatile revision bumps publish identity entries.
+    // `&daemon` is stable for the daemon's whole lifetime (A3: production
+    // default, not hermetic-gated; capability flags stay false regardless).
+    daemon.registry.revision_hook = .{ .context = &daemon, .notify = registryRevisionHookNotify };
     var stop_requested = std.atomic.Value(bool).init(false);
     var server_context: SessionizerServerContext = .{
         .daemon = &daemon,
@@ -5241,7 +5554,81 @@ fn isStoreMethod(method: []const u8) bool {
         std.mem.eql(u8, method, store_protocol.METHOD_DAEMON_STORE_STATUS) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_GET) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_LIST) or
-        std.mem.eql(u8, method, store_protocol.METHOD_CHAT_TURN_RECORD);
+        std.mem.eql(u8, method, store_protocol.METHOD_CHAT_TURN_RECORD) or
+        // M5-P2: the composite snapshot and cursor route through the same
+        // classify → store-queue seam (A1) so they never run under the outer
+        // lockDaemon window and own their lock choreography.
+        std.mem.eql(u8, method, store_protocol.METHOD_CORE_SNAPSHOT) or
+        std.mem.eql(u8, method, changes_protocol.METHOD_CORE_CHANGES);
+}
+
+/// Registry bump topics → journal topics. `.client` returns null: client
+/// records are registry bookkeeping, not part of the frozen Q10 topic set.
+fn journalTopicFromBumpTopic(topic: process_registry.BumpTopic) ?change_journal.Topic {
+    return switch (topic) {
+        .client => null,
+        .workspace => .workspace,
+        .process => .process,
+        .lease => .lease,
+        .notification => .notification,
+        .chat_turn => .chat_turn,
+    };
+}
+
+/// ProcessRegistry revision hook: runs at the bump site under lockDaemon; the
+/// journal append itself takes only the journal leaf lock.
+fn registryRevisionHookNotify(context: *anyopaque, event: process_registry.RevisionBumpEvent, registry_revision: u64) void {
+    const daemon: *Daemon = @ptrCast(@alignCast(context));
+    const topic = journalTopicFromBumpTopic(event.topic) orelse return;
+    daemon.appendJournalEntry(topic, event.resource_id, event.workspace_id, .{ .registry = registry_revision });
+}
+
+/// Store post-commit hook (mutations). Fires only after a durable commit —
+/// never for receipt replays, message-key duplicates, or rollbacks — so every
+/// journal entry corresponds to exactly one committed store_revision.
+fn storeMutationCommittedHook(context: *anyopaque, mutation: *const daemon_store.Mutation, result: store_protocol.WriteResult) void {
+    const daemon: *Daemon = @ptrCast(@alignCast(context));
+    const revision: change_journal.Revision = .{ .store = result.store_revision };
+    switch (mutation.*) {
+        .snapshot_replace => |request| {
+            // A whole-state replace may touch every durable resource; publish
+            // identity entries for each carried workspace/thread/completion.
+            for (request.snapshot.workspaces) |workspace| {
+                daemon.appendJournalEntry(.workspace, workspace.workspace_id, workspace.workspace_id, revision);
+                for (workspace.threads) |thread| {
+                    daemon.appendJournalEntry(.chat_thread, thread.local_thread_id, workspace.workspace_id, revision);
+                }
+            }
+            for (request.snapshot.chat_completions) |completion| {
+                daemon.appendJournalEntry(.chat_completion, completion.local_thread_id, completion.workspace_id, revision);
+            }
+        },
+        .workspace_upsert => |request| daemon.appendJournalEntry(.workspace, request.workspace.workspace_id, request.workspace.workspace_id, revision),
+        .thread_upsert => |request| daemon.appendJournalEntry(.chat_thread, request.thread.local_thread_id, request.workspace_id, revision),
+        .message_append => |request| daemon.appendJournalEntry(.chat_thread, request.thread_id, request.workspace_id, revision),
+        // Landed Q10 policy pins `surface` as registry_only, so a store-side
+        // surface commit has no representable revision family and is not
+        // journaled (documented M5-P2 deviation; surface volatility publishes
+        // through registry bumps, and no client reads surface deltas yet).
+        .surface_upsert, .surface_clear => {},
+        .chat_completion_upsert => |request| daemon.appendJournalEntry(.chat_completion, request.completion.local_thread_id, request.completion.workspace_id, revision),
+        .chat_completion_clear => |request| daemon.appendJournalEntry(.chat_completion, request.local_thread_id, request.workspace_id, revision),
+    }
+}
+
+/// Store post-commit hook (turn commits, A2). Journals lifecycle + transcript
+/// identity only — never streaming deltas (Q10). Replayed duplicate receipts
+/// return before the hook, so they cannot append a second entry.
+fn storeTurnCommittedHook(context: *anyopaque, request: *const daemon_store.TurnCommitRequest, result: store_protocol.WriteResult) void {
+    const daemon: *Daemon = @ptrCast(@alignCast(context));
+    const revision: change_journal.Revision = .{ .store = result.store_revision };
+    daemon.appendJournalEntry(.chat_thread, request.local_thread_id, request.workspace_id, revision);
+    daemon.appendJournalEntry(.chat_turn, request.turn_id, request.workspace_id, revision);
+    // commitTurn writes a completion ledger row whenever the turn completed
+    // (deriving one if the request omitted it); mirror that exactly.
+    if (request.status == .completed) {
+        daemon.appendJournalEntry(.chat_completion, request.local_thread_id, request.workspace_id, revision);
+    }
 }
 
 fn mutationHeader(mutation: daemon_store.Mutation) store_protocol.MutationHeader {
@@ -5365,6 +5752,14 @@ fn maybeInitStoreService(daemon: *Daemon) !void {
         .store = try daemon_store.Store.initWithFault(daemon.allocator, db_path, fault),
     };
     errdefer service.store.deinit();
+    // M5-P2 journal hook: every durable commit (mutations AND turn commits)
+    // publishes identity entries post-commit. Installed before the service is
+    // published so no committed write can slip past the journal.
+    service.store.commit_hook = .{
+        .context = daemon,
+        .on_mutation_committed = storeMutationCommittedHook,
+        .on_turn_committed = storeTurnCommittedHook,
+    };
 
     // Successor path: import+prune after endpoint ownership, seed the registry,
     // then publish the service. Drain has not started yet (ready callback).
@@ -6019,6 +6414,482 @@ fn toolCallStatusNameFromCode(code: i64) []const u8 {
     return names[@intCast(code)];
 }
 
+fn reasoningEffortNameFromCode(code: i64) []const u8 {
+    const names = [_][]const u8{ "low", "medium", "high", "xhigh", "max" };
+    if (code < 0 or code >= names.len) return "medium";
+    return names[@intCast(code)];
+}
+
+fn fastModeNameFromCode(code: i64) []const u8 {
+    return switch (code) {
+        1 => "on",
+        else => "off",
+    };
+}
+
+fn accessModeNameFromCode(code: i64) []const u8 {
+    return switch (code) {
+        1 => "supervised",
+        else => "full_access",
+    };
+}
+
+fn surfaceProviderNameFromCode(code: i64) []const u8 {
+    const names = [_][]const u8{ "opencode", "codex", "cursor", "claude", "grok", "amp" };
+    if (code < 0 or code >= names.len) return "opencode";
+    return names[@intCast(code)];
+}
+
+fn surfaceStatusNameFromCode(code: i64) []const u8 {
+    const names = [_][]const u8{ "idle", "working", "waiting", "done", "error" };
+    if (code < 0 or code >= names.len) return "idle";
+    return names[@intCast(code)];
+}
+
+/// M4-P4/P5 landed: the daemon owns durable chat, so store-scope snapshots
+/// are complete. Named constant (CONCURRENT_TRANSPORT_LANDED pattern) so the
+/// pre-flip incomplete_scopes arm stays pinned by unit test, not dead code.
+const CHAT_AUTHORITY_LANDED = true;
+
+/// Pure incomplete-scope policy (scenario 6). Unknown scope names are always
+/// incomplete; pre-authority-flip the durable chat rows exist but the GUI is
+/// still the authority, so "store" must be reported incomplete too.
+fn scopeIsIncomplete(scope_name: []const u8, chat_authority_landed: bool) bool {
+    const known = std.mem.eql(u8, scope_name, store_protocol.SNAPSHOT_SCOPE_STORE) or
+        std.mem.eql(u8, scope_name, store_protocol.SNAPSHOT_SCOPE_REGISTRY) or
+        std.mem.eql(u8, scope_name, store_protocol.SNAPSHOT_SCOPE_SESSIONS) or
+        std.mem.eql(u8, scope_name, store_protocol.SNAPSHOT_SCOPE_TURNS);
+    if (!known) return true;
+    if (!chat_authority_landed and std.mem.eql(u8, scope_name, store_protocol.SNAPSHOT_SCOPE_STORE)) return true;
+    return false;
+}
+
+/// Topic filter for core.changes. Unknown wire spellings match nothing so a
+/// newer client's future topic yields an empty (heartbeat) window, not junk.
+fn changeEntryMatchesTopics(topic: change_journal.Topic, topics: ?[]const []const u8) bool {
+    const filter = topics orelse return true;
+    for (filter) |name| {
+        const wanted = change_journal.Topic.fromWireName(name) orelse continue;
+        if (wanted == topic) return true;
+    }
+    return false;
+}
+
+/// Splice a pre-serialized JSON fragment as the current Stringify value.
+fn writeRawFragment(s: *std.json.Stringify, fragment: []const u8) !void {
+    try s.beginWriteRaw();
+    try s.writer.writeAll(fragment);
+    s.endWriteRaw();
+}
+
+/// Serialize the registry envelope object into an arena string. Caller holds
+/// lockDaemon; the fragment is spliced into the reply off the lock.
+fn serializeEnvelopeFragment(arena: std.mem.Allocator, daemon: *const Daemon) ![]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(arena);
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    try writeRegistryEnvelope(&s, daemon);
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+/// Composite `processes` array: same per-record serializers as process.list,
+/// spanning all (or one filtered) workspaces plus derived chat-turn records.
+/// Caller holds lockDaemon.
+fn serializeProcessesFragment(arena: std.mem.Allocator, daemon: *Daemon, workspace_filter: ?[]const u8) ![]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(arena);
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginArray();
+    for (daemon.registry.workspaces.items) |*workspace| {
+        if (workspace_filter) |filter| {
+            if (!std.mem.eql(u8, workspace.id, filter)) continue;
+        }
+        for (workspace.managed_processes.items) |process| try writeManagedProcessSnapshot(&s, workspace, &process);
+        for (workspace.tracked_terminal_processes.items) |process| try writeTrackedProcessSnapshot(&s, workspace, &process);
+        for (workspace.external_processes.items) |process| try writeExternalProcessSnapshot(&s, workspace, &process);
+        for (daemon.chat_turns.items) |turn| {
+            // Match process.list: consumed turns are invisible.
+            if (turn.consumed) continue;
+            if (!std.mem.eql(u8, turn.workspace_id, workspace.id)) continue;
+            {
+                lockTurn(turn);
+                defer turn.mutex.unlock();
+                try writeChatTurnProcessSnapshot(&s, turn);
+            }
+        }
+    }
+    try s.endArray();
+    return try writer.toOwnedSlice();
+}
+
+/// Composite `leases` array (writeLeaseRecord wire shape). Caller holds lockDaemon.
+fn serializeLeasesFragment(arena: std.mem.Allocator, daemon: *Daemon, workspace_filter: ?[]const u8) ![]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(arena);
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginArray();
+    for (daemon.registry.workspaces.items) |*workspace| {
+        if (workspace_filter) |filter| {
+            if (!std.mem.eql(u8, workspace.id, filter)) continue;
+        }
+        for (workspace.leases.items) |lease| try writeLeaseRecord(&s, &lease);
+    }
+    try s.endArray();
+    return try writer.toOwnedSlice();
+}
+
+/// Composite `sessions` array (writeSessionSummary wire shape — a superset of
+/// the SessionSummary DTO; decoders ignore the extra fields). Caller holds
+/// lockDaemon.
+fn serializeSessionsFragment(arena: std.mem.Allocator, daemon: *Daemon, workspace_filter: ?[]const u8) ![]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(arena);
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginArray();
+    for (daemon.sessions.items) |session| {
+        if (workspace_filter) |filter| {
+            if (!std.mem.eql(u8, session.project_id, filter)) continue;
+        }
+        try writeSessionSummary(&s, session);
+    }
+    try s.endArray();
+    return try writer.toOwnedSlice();
+}
+
+/// Composite `turns` array in the TurnRecord wire shape, from in-memory turns
+/// with durable-first status masking. Caller holds lockDaemon.
+fn serializeTurnsFragment(arena: std.mem.Allocator, daemon: *Daemon, workspace_filter: ?[]const u8) ![]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(arena);
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginArray();
+    for (daemon.chat_turns.items) |turn| {
+        if (turn.consumed) continue;
+        if (workspace_filter) |filter| {
+            if (!std.mem.eql(u8, turn.workspace_id, filter)) continue;
+        }
+        lockTurn(turn);
+        defer turn.mutex.unlock();
+        try s.beginObject();
+        try s.objectField("turn_id");
+        try s.write(turn.turn_id);
+        try s.objectField("workspace_id");
+        try s.write(turn.workspace_id);
+        try s.objectField("local_thread_id");
+        try s.write(turn.local_thread_id);
+        try s.objectField("status");
+        try s.write(@tagName(chatTurnPublishedStatus(turn)));
+        try s.objectField("started_at_ms");
+        try s.write(turn.started_at_ms);
+        try s.objectField("finished_at_ms");
+        if (turn.finished_at_ms) |value| try s.write(value) else try s.write(null);
+        try s.objectField("provider");
+        try s.write(@tagName(turn.request.provider));
+        try s.objectField("provider_thread_id");
+        if (turn.provider_thread_id) |value| try s.write(value) else try s.write(null);
+        try s.objectField("error_message");
+        if (turn.error_message) |value| try s.write(value) else try s.write(null);
+        try s.objectField("user_message_id");
+        if (turn.user_message_id) |value| try s.write(value) else try s.write(null);
+        try s.objectField("committed_store_revision");
+        if (turn.committed_store_revision) |value| try s.write(value) else try s.write(null);
+        try s.endObject();
+    }
+    try s.endArray();
+    return try writer.toOwnedSlice();
+}
+
+test "incomplete scope policy pins both chat-authority arms" {
+    // Landed arm (runtime): every frozen scope name is complete.
+    try std.testing.expect(!scopeIsIncomplete("store", true));
+    try std.testing.expect(!scopeIsIncomplete("registry", true));
+    try std.testing.expect(!scopeIsIncomplete("sessions", true));
+    try std.testing.expect(!scopeIsIncomplete("turns", true));
+    // Pre-M4 arm (scenario 6): the store scope must be honestly incomplete
+    // while chat authority is still GUI-side; volatile scopes are unaffected.
+    try std.testing.expect(scopeIsIncomplete("store", false));
+    try std.testing.expect(!scopeIsIncomplete("registry", false));
+    // Unknown scope names are incomplete in both arms.
+    try std.testing.expect(scopeIsIncomplete("chat", true));
+    try std.testing.expect(scopeIsIncomplete("chat", false));
+    // The runtime constant documents the landed authority flip.
+    try std.testing.expect(CHAT_AUTHORITY_LANDED);
+}
+
+test "registry bump topics map onto the frozen journal topic set" {
+    // .client is registry bookkeeping and never journals.
+    try std.testing.expect(journalTopicFromBumpTopic(.client) == null);
+    try std.testing.expectEqual(change_journal.Topic.workspace, journalTopicFromBumpTopic(.workspace).?);
+    try std.testing.expectEqual(change_journal.Topic.process, journalTopicFromBumpTopic(.process).?);
+    try std.testing.expectEqual(change_journal.Topic.lease, journalTopicFromBumpTopic(.lease).?);
+    try std.testing.expectEqual(change_journal.Topic.notification, journalTopicFromBumpTopic(.notification).?);
+    try std.testing.expectEqual(change_journal.Topic.chat_turn, journalTopicFromBumpTopic(.chat_turn).?);
+    // Every mapped topic accepts the registry revision family (Q10).
+    inline for (.{ change_journal.Topic.workspace, change_journal.Topic.process, change_journal.Topic.lease, change_journal.Topic.notification, change_journal.Topic.chat_turn }) |topic| {
+        try std.testing.expect(change_journal.revisionPolicy(topic) != .store_only);
+    }
+}
+
+test "changes topic filter matches wire spellings and ignores unknown names" {
+    try std.testing.expect(changeEntryMatchesTopics(.chat_thread, null));
+    const filter: []const []const u8 = &.{ "chat.thread", "process" };
+    try std.testing.expect(changeEntryMatchesTopics(.chat_thread, filter));
+    try std.testing.expect(changeEntryMatchesTopics(.process, filter));
+    try std.testing.expect(!changeEntryMatchesTopics(.lease, filter));
+    const unknown: []const []const u8 = &.{"terminal.bytes"};
+    try std.testing.expect(!changeEntryMatchesTopics(.chat_thread, unknown));
+}
+
+const LoadedStoreSnapshot = struct {
+    snapshot: store_protocol.Snapshot,
+    store_revision: u64,
+};
+
+/// Read the durable snapshot half in ONE read transaction so its contents and
+/// `store_revision` are the same committed state (M5-P2 coherence pin). All
+/// result memory lives in the caller's arena. Caller holds the store mutex.
+fn loadStoreSnapshotTxn(
+    arena: std.mem.Allocator,
+    store: *daemon_store.Store,
+    workspace_filter: ?[]const u8,
+    include_store: bool,
+) daemon_store.StoreError!LoadedStoreSnapshot {
+    store.conn.execNoArgs("begin") catch return error.StoreUnavailable;
+    var transaction_open = true;
+    defer if (transaction_open) store.conn.rollback();
+
+    const store_revision = try store.storeRevision();
+    var snapshot: store_protocol.Snapshot = .{ .store_revision = store_revision };
+    if (include_store) {
+        snapshot = try loadSnapshotContents(arena, store, workspace_filter);
+        snapshot.store_revision = store_revision;
+    }
+    store.conn.commit() catch return error.StoreUnavailable;
+    transaction_open = false;
+    return .{ .snapshot = snapshot, .store_revision = store_revision };
+}
+
+/// Materialize the typed store snapshot (workspaces → threads → messages,
+/// surfaces, completions) inside the caller's open read transaction.
+fn loadSnapshotContents(
+    arena: std.mem.Allocator,
+    store: *daemon_store.Store,
+    workspace_filter: ?[]const u8,
+) daemon_store.StoreError!store_protocol.Snapshot {
+    var snapshot: store_protocol.Snapshot = .{};
+    if (store.conn.row("select selected_workspace_index, sidebar_collapsed from app_state where id = 1", .{}) catch return error.StoreUnavailable) |row| {
+        defer row.deinit();
+        snapshot.selected_workspace_index = std.math.cast(usize, row.int(0)) orelse 0;
+        snapshot.sidebar_collapsed = row.int(1) != 0;
+    }
+
+    // Phase 1: workspace rows (collected first so no two statements interleave).
+    const WorkspaceRow = struct { row_id: i64, workspace: store_protocol.Workspace };
+    var workspace_rows: std.ArrayList(WorkspaceRow) = .empty;
+    {
+        var rows = store.conn.rows(
+            \\select id, workspace_id, label, path, archived, unread_count, collapsed,
+            \\       thread_list_expanded, terminal_height, terminal_layout_json,
+            \\       terminal_docks_json, workspace_layout_json, selected_thread_index,
+            \\       companion_thread_local_id, herdr_remote_alias, herdr_session_name,
+            \\       herdr_workspace_id, herdr_local_dir, herdr_remote_cwd,
+            \\       herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id,
+            \\       herdr_pane_links_json, herdr_updated_at_ms
+            \\from workspaces order by sort_index
+        , .{}) catch return error.StoreUnavailable;
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            const workspace_id = arena.dupe(u8, row.text(1)) catch return error.OutOfMemory;
+            if (workspace_filter) |filter| {
+                if (!std.mem.eql(u8, workspace_id, filter)) continue;
+            }
+            const herdr_session_name = dupeOptionalText(arena, row.nullableText(15)) catch return error.OutOfMemory;
+            const herdr_workspace_id = dupeOptionalText(arena, row.nullableText(16)) catch return error.OutOfMemory;
+            const herdr_local_dir = dupeOptionalText(arena, row.nullableText(17)) catch return error.OutOfMemory;
+            const herdr_link: ?store_protocol.HerdrWorkspaceLink = if (herdr_session_name != null and herdr_workspace_id != null and herdr_local_dir != null) .{
+                .remote_alias = (dupeOptionalText(arena, row.nullableText(14)) catch return error.OutOfMemory) orelse "",
+                .session_name = herdr_session_name.?,
+                .workspace_id = herdr_workspace_id.?,
+                .local_dir = herdr_local_dir.?,
+                .remote_cwd = dupeOptionalText(arena, row.nullableText(18)) catch return error.OutOfMemory,
+                .last_pane_id = dupeOptionalText(arena, row.nullableText(19)) catch return error.OutOfMemory,
+                .attach_dock_id = if (row.nullableInt(20)) |value| (std.math.cast(u32, value) orelse null) else null,
+                .attach_pane_id = if (row.nullableInt(21)) |value| (std.math.cast(u32, value) orelse null) else null,
+                .pane_links_json = dupeOptionalText(arena, row.nullableText(22)) catch return error.OutOfMemory,
+                .updated_at_ms = row.nullableInt(23) orelse 0,
+            } else null;
+            workspace_rows.append(arena, .{
+                .row_id = row.int(0),
+                .workspace = .{
+                    .workspace_id = workspace_id,
+                    .label = arena.dupe(u8, row.text(2)) catch return error.OutOfMemory,
+                    .path = arena.dupe(u8, row.text(3)) catch return error.OutOfMemory,
+                    .archived = row.int(4) != 0,
+                    .unread_count = std.math.cast(u32, row.int(5)) orelse 0,
+                    .collapsed = row.int(6) != 0,
+                    .thread_list_expanded = row.int(7) != 0,
+                    .terminal_height = if (row.nullableFloat(8)) |value| @floatCast(value) else null,
+                    .terminal_layout_json = dupeOptionalText(arena, row.nullableText(9)) catch return error.OutOfMemory,
+                    .terminal_docks_json = dupeOptionalText(arena, row.nullableText(10)) catch return error.OutOfMemory,
+                    .workspace_layout_json = dupeOptionalText(arena, row.nullableText(11)) catch return error.OutOfMemory,
+                    .selected_thread_index = std.math.cast(usize, row.int(12)) orelse 0,
+                    .companion_thread_local_id = dupeOptionalText(arena, row.nullableText(13)) catch return error.OutOfMemory,
+                    .herdr_link = herdr_link,
+                },
+            }) catch return error.OutOfMemory;
+        }
+        if (rows.err) |_| return error.StoreUnavailable;
+    }
+
+    // Phase 2: threads per workspace, then messages per thread (statements
+    // never nest: each list is fully collected before the next query runs).
+    const ThreadRow = struct { row_id: i64, thread: store_protocol.Thread };
+    for (workspace_rows.items) |*workspace_row| {
+        var thread_rows: std.ArrayList(ThreadRow) = .empty;
+        {
+            var rows = store.conn.rows(
+                \\select id, local_thread_id, title, archived, committed, last_activity_at,
+                \\       provider_thread_id, model_ref, reasoning_effort, reasoning_variant,
+                \\       fast_mode, access_mode, provider, harness, tui_dock_id, draft,
+                \\       draft_image_path, draft_image_mime, draft_image_byte_size
+                \\from threads where workspace_id = ?1 order by sort_index
+            , .{workspace_row.row_id}) catch return error.StoreUnavailable;
+            defer rows.deinit();
+            while (rows.next()) |row| {
+                const draft_image: ?store_protocol.Attachment = if (row.nullableText(16)) |path| .{
+                    .path = arena.dupe(u8, path) catch return error.OutOfMemory,
+                    .mime = arena.dupe(u8, row.nullableText(17) orelse "") catch return error.OutOfMemory,
+                    .byte_size = if (row.nullableInt(18)) |value| (std.math.cast(usize, value) orelse 0) else 0,
+                } else null;
+                thread_rows.append(arena, .{
+                    .row_id = row.int(0),
+                    .thread = .{
+                        .local_thread_id = arena.dupe(u8, row.nullableText(1) orelse "") catch return error.OutOfMemory,
+                        .title = arena.dupe(u8, row.text(2)) catch return error.OutOfMemory,
+                        .archived = row.int(3) != 0,
+                        .committed = row.int(4) != 0,
+                        .last_activity_at = row.nullableInt(5),
+                        .provider_thread_id = dupeOptionalText(arena, row.nullableText(6)) catch return error.OutOfMemory,
+                        .model_ref = dupeOptionalText(arena, row.nullableText(7)) catch return error.OutOfMemory,
+                        .reasoning_effort = if (row.nullableInt(8)) |code| reasoningEffortNameFromCode(code) else null,
+                        .reasoning_variant = dupeOptionalText(arena, row.nullableText(9)) catch return error.OutOfMemory,
+                        .fast_mode = if (row.nullableInt(10)) |code| fastModeNameFromCode(code) else null,
+                        .access_mode = if (row.nullableInt(11)) |code| accessModeNameFromCode(code) else null,
+                        .provider = providerNameFromCode(row.int(12)),
+                        .harness = harnessNameFromCode(row.int(13)),
+                        .tui_dock_id = if (row.nullableInt(14)) |value| (std.math.cast(u32, value) orelse null) else null,
+                        .draft = arena.dupe(u8, row.nullableText(15) orelse "") catch return error.OutOfMemory,
+                        .draft_image = draft_image,
+                    },
+                }) catch return error.OutOfMemory;
+            }
+            if (rows.err) |_| return error.StoreUnavailable;
+        }
+
+        var threads: std.ArrayList(store_protocol.Thread) = .empty;
+        for (thread_rows.items) |*thread_row| {
+            var messages: std.ArrayList(store_protocol.Message) = .empty;
+            var rows = store.conn.rows(
+                \\select message_id, role, author, body, image_path, image_mime,
+                \\       image_byte_size, tool_call_id, tool_call_kind, tool_call_status,
+                \\       created_at_ms, updated_at_ms
+                \\from messages where thread_id = ?1 order by sort_index
+            , .{thread_row.row_id}) catch return error.StoreUnavailable;
+            defer rows.deinit();
+            while (rows.next()) |row| {
+                const image: ?store_protocol.Attachment = if (row.nullableText(4)) |path| .{
+                    .path = arena.dupe(u8, path) catch return error.OutOfMemory,
+                    .mime = arena.dupe(u8, row.nullableText(5) orelse "") catch return error.OutOfMemory,
+                    .byte_size = if (row.nullableInt(6)) |value| (std.math.cast(usize, value) orelse 0) else 0,
+                } else null;
+                const images: []const store_protocol.Attachment = if (image) |value| blk: {
+                    const slice = arena.alloc(store_protocol.Attachment, 1) catch return error.OutOfMemory;
+                    slice[0] = value;
+                    break :blk slice;
+                } else &.{};
+                messages.append(arena, .{
+                    .message_id = arena.dupe(u8, row.nullableText(0) orelse "") catch return error.OutOfMemory,
+                    .role = roleNameFromCode(row.int(1)),
+                    .author = arena.dupe(u8, row.text(2)) catch return error.OutOfMemory,
+                    .body = arena.dupe(u8, row.text(3)) catch return error.OutOfMemory,
+                    .images = images,
+                    .image = image,
+                    .tool_call_id = dupeOptionalText(arena, row.nullableText(7)) catch return error.OutOfMemory,
+                    .tool_call_kind = if (row.nullableInt(8)) |code| toolCallKindNameFromCode(code) else null,
+                    .tool_call_status = if (row.nullableInt(9)) |code| toolCallStatusNameFromCode(code) else null,
+                    .created_at_ms = row.nullableInt(10),
+                    .updated_at_ms = row.nullableInt(11),
+                }) catch return error.OutOfMemory;
+            }
+            if (rows.err) |_| return error.StoreUnavailable;
+            thread_row.thread.messages = messages.items;
+            threads.append(arena, thread_row.thread) catch return error.OutOfMemory;
+        }
+        workspace_row.workspace.threads = threads.items;
+    }
+
+    var workspaces: std.ArrayList(store_protocol.Workspace) = .empty;
+    for (workspace_rows.items) |workspace_row| {
+        workspaces.append(arena, workspace_row.workspace) catch return error.OutOfMemory;
+    }
+    snapshot.workspaces = workspaces.items;
+
+    // Surfaces and legacy completion ledger.
+    var surfaces: std.ArrayList(store_protocol.SurfaceState) = .empty;
+    {
+        var rows = store.conn.rows(
+            \\select session_id, workspace_id, workspace_path, dock_id, pane_id, provider,
+            \\       provider_thread_id, title, status, status_changed_at_ms, completed_at_ms,
+            \\       last_event_title, last_event_body
+            \\from surface_completions order by session_id
+        , .{}) catch return error.StoreUnavailable;
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            const workspace_id = arena.dupe(u8, row.text(1)) catch return error.OutOfMemory;
+            if (workspace_filter) |filter| {
+                if (!std.mem.eql(u8, workspace_id, filter)) continue;
+            }
+            surfaces.append(arena, .{
+                .session_id = arena.dupe(u8, row.text(0)) catch return error.OutOfMemory,
+                .workspace_id = workspace_id,
+                .workspace_path = arena.dupe(u8, row.text(2)) catch return error.OutOfMemory,
+                .dock_id = std.math.cast(u32, row.int(3)) orelse 0,
+                .pane_id = if (row.nullableInt(4)) |value| (std.math.cast(u32, value) orelse null) else null,
+                .provider = if (row.nullableInt(5)) |code| surfaceProviderNameFromCode(code) else null,
+                .provider_thread_id = dupeOptionalText(arena, row.nullableText(6)) catch return error.OutOfMemory,
+                .title = arena.dupe(u8, row.text(7)) catch return error.OutOfMemory,
+                .status = surfaceStatusNameFromCode(row.int(8)),
+                .status_changed_at_ms = row.int(9),
+                .completed_at_ms = row.int(10),
+                .last_event_title = dupeOptionalText(arena, row.nullableText(11)) catch return error.OutOfMemory,
+                .last_event_body = dupeOptionalText(arena, row.nullableText(12)) catch return error.OutOfMemory,
+            }) catch return error.OutOfMemory;
+        }
+        if (rows.err) |_| return error.StoreUnavailable;
+    }
+    snapshot.surface_states = surfaces.items;
+
+    var completions: std.ArrayList(store_protocol.ChatCompletion) = .empty;
+    {
+        var rows = store.conn.rows(
+            "select workspace_id, local_thread_id, completed_at_ms from chat_completions order by workspace_id, local_thread_id",
+            .{},
+        ) catch return error.StoreUnavailable;
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            const workspace_id = arena.dupe(u8, row.text(0)) catch return error.OutOfMemory;
+            if (workspace_filter) |filter| {
+                if (!std.mem.eql(u8, workspace_id, filter)) continue;
+            }
+            completions.append(arena, .{
+                .workspace_id = workspace_id,
+                .local_thread_id = arena.dupe(u8, row.text(1)) catch return error.OutOfMemory,
+                .completed_at_ms = row.int(2),
+            }) catch return error.OutOfMemory;
+        }
+        if (rows.err) |_| return error.StoreUnavailable;
+    }
+    snapshot.chat_completions = completions.items;
+    return snapshot;
+}
+
 fn storeErrorResponse(
     allocator: std.mem.Allocator,
     id_value: std.json.Value,
@@ -6107,6 +6978,22 @@ fn slowIoDelayMsFromEnv(allocator: std.mem.Allocator) u64 {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     const parsed = std.fmt.parseInt(u64, trimmed, 10) catch return 0;
     return @min(parsed, 5000);
+}
+
+/// Test-only journal entry-cap override (M5-P2 overflow IT). Zero/invalid
+/// keeps the production cap so a stray value can only shrink retention.
+fn journalEntryCapFromEnv(allocator: std.mem.Allocator) usize {
+    const environ: std.process.Environ = if (builtin.os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    const raw = environ.getAlloc(allocator, SESSION_DAEMON_JOURNAL_ENTRY_CAP_ENV_NAME) catch return change_journal.CHANGE_JOURNAL_ENTRY_MAX;
+    defer allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return change_journal.CHANGE_JOURNAL_ENTRY_MAX;
+    const parsed = std.fmt.parseInt(usize, trimmed, 10) catch return change_journal.CHANGE_JOURNAL_ENTRY_MAX;
+    if (parsed == 0) return change_journal.CHANGE_JOURNAL_ENTRY_MAX;
+    return parsed;
 }
 
 fn retentionOverrideMsFromEnv(allocator: std.mem.Allocator) ?i64 {
@@ -6547,6 +7434,10 @@ fn lockDaemon(daemon: *Daemon) void {
 
 fn lockTurn(turn: *ChatTurn) void {
     while (!turn.mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn lockJournal(daemon: *Daemon) void {
+    while (!daemon.journal_mutex.tryLock()) std.atomic.spinLoopHint();
 }
 
 fn chatTurnKeepsDaemonAlive(
