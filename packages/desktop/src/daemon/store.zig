@@ -285,6 +285,20 @@ pub const Store = struct {
 
         conn.busyTimeout(schema.BUSY_TIMEOUT_MS) catch |err| return mapOpenError(err);
         schema.initializeToVersion(conn, schema.MAX_SUPPORTED_VERSION) catch |err| return mapOpenError(err);
+        // Terminal turn identity outlives workspace retention ownership. This
+        // ledger is intentionally independent from `chat_turns`, whose rows
+        // may be tombstoned by an observed snapshot deletion.
+        conn.execNoArgs(
+            \\create table if not exists terminal_turn_replay_guard (
+            \\    turn_id text primary key,
+            \\    status text not null
+            \\);
+        ) catch |err| return mapOpenError(err);
+        conn.execNoArgs(
+            \\insert or ignore into terminal_turn_replay_guard (turn_id, status)
+            \\select turn_id, status from chat_turns
+            \\where status in ('completed', 'failed', 'aborted');
+        ) catch |err| return mapOpenError(err);
 
         return .{
             .allocator = allocator,
@@ -499,6 +513,7 @@ pub const Store = struct {
 
         self.insertTurnMessages(request, next_revision_sql) catch |err| return mapStoreError(err);
         self.insertTurnLedger(request, next_revision_sql) catch |err| return mapStoreError(err);
+        self.insertTerminalTurnReplayGuard(request) catch |err| return mapStoreError(err);
         if (request.status == .completed) {
             const completion: store_protocol.ChatCompletion = request.completion orelse .{
                 .workspace_id = request.workspace_id,
@@ -1379,6 +1394,13 @@ pub const Store = struct {
         );
     }
 
+    fn insertTerminalTurnReplayGuard(self: *Self, request: TurnCommitRequest) !void {
+        try self.conn.exec(
+            "insert into terminal_turn_replay_guard (turn_id, status) values (?1, ?2) on conflict(turn_id) do update set status = excluded.status",
+            .{ request.turn_id, @tagName(request.status) },
+        );
+    }
+
     fn applySurfaceUpsert(self: *Self, surface: store_protocol.SurfaceState) !void {
         if (surface.session_id.len == 0) return error.InvalidParams;
         try self.conn.exec(
@@ -1702,6 +1724,12 @@ fn validateMutation(mutation: Mutation) StoreError!void {
     switch (mutation) {
         .snapshot_replace => |request| {
             if (!request.bootstrap and request.mutation.expected_store_revision == null) return error.InvalidParams;
+            if (!request.bootstrap and request.snapshot.store_revision != request.mutation.expected_store_revision.?) {
+                // A payload may only be guarded by the revision it actually
+                // observed. This rejects both stale relabeling and carried
+                // workspace resurrection before the transaction mutates rows.
+                return error.Conflict;
+            }
         },
         .workspace_upsert => |request| {
             if (request.workspace.workspace_id.len == 0 or request.workspace.label.len == 0 or request.workspace.path.len == 0) return error.InvalidParams;
@@ -2026,13 +2054,15 @@ fn testSnapshotRequest(
     bootstrap: bool,
     snapshot: store_protocol.Snapshot,
 ) store_protocol.SnapshotReplaceRequest {
+    var bound_snapshot = snapshot;
+    if (!bootstrap) bound_snapshot.store_revision = expected_store_revision orelse 0;
     return .{
         .mutation = .{
             .request_key = request_key,
             .expected_store_revision = expected_store_revision,
             .client_id = "test-client",
         },
-        .snapshot = snapshot,
+        .snapshot = bound_snapshot,
         .bootstrap = bootstrap,
     };
 }
@@ -2635,10 +2665,10 @@ test "snapshot replace preserves daemon-committed identities keys and ledger ref
     try std.testing.expectEqual(@as(i64, 1), user_rows.int(0));
 }
 
-// A snapshot may preserve only committed work newer than its durable
-// observation boundary. Once observed, deleting the same committed workspace
-// removes its retained turn ownership and cannot resurrect on later replaces.
-test "snapshot replace preserves only unobserved committed workspaces and tombstones observed deletion" {
+// A snapshot cannot be relabeled with a newer guard. Once a current projection
+// deliberately deletes a workspace, ownership rows are tombstoned while the
+// independent terminal replay identity remains durable.
+test "snapshot replace rejects stale relabel and tombstones ownership without replay identity" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const db_path = try testDbPath(&tmp);
@@ -2698,12 +2728,12 @@ test "snapshot replace preserves only unobserved committed workspaces and tombst
     const carried = [_]store_protocol.Workspace{testWorkspace("ws-other", "Other workspace")};
     var unobserved_request = testSnapshotRequest("wsbelt-flush", 5, false, testSnapshot(&carried));
     unobserved_request.snapshot.store_revision = 2;
-    const unobserved_result = try store.applyMutation(.{ .snapshot_replace = unobserved_request });
+    try std.testing.expectError(error.Conflict, store.applyMutation(.{ .snapshot_replace = unobserved_request }));
 
     const counts = [_]struct { id: []const u8, expected: i64 }{
-        .{ .id = "ws-belt2", .expected = 1 }, // newer than observed revision
-        .{ .id = "ws-plain", .expected = 0 }, // deliberate deletion honored
-        .{ .id = "ws-other", .expected = 1 }, // carried by the snapshot
+        .{ .id = "ws-belt2", .expected = 1 }, // stale payload changed nothing
+        .{ .id = "ws-plain", .expected = 1 },
+        .{ .id = "ws-other", .expected = 0 },
     };
     for (counts) |case| {
         var row = (try store.conn.row(
@@ -2737,16 +2767,15 @@ test "snapshot replace preserves only unobserved committed workspaces and tombst
     defer resolved.deinit();
     try std.testing.expectEqual(@as(i64, 1), resolved.int(0));
 
-    // The next projection has observed the committed revision and deliberately
-    // omits the workspace. Deletion and retained-ledger removal are atomic.
+    // A current projection deliberately omits the workspace. Ownership
+    // deletion and replay-guard retention are atomic in the same commit.
     const retained_control = [_]store_protocol.Workspace{testWorkspace("ws-other", "Other workspace")};
-    var deletion_request = testSnapshotRequest(
+    const deletion_request = testSnapshotRequest(
         "wsbelt-delete-observed",
-        unobserved_result.store_revision,
+        5,
         false,
         testSnapshot(&retained_control),
     );
-    deletion_request.snapshot.store_revision = unobserved_result.store_revision;
     _ = try store.applyMutation(.{ .snapshot_replace = deletion_request });
     var deleted_workspace = (try store.conn.row(
         "select count(*) from workspaces where workspace_id = 'ws-belt2'",
@@ -2760,6 +2789,12 @@ test "snapshot replace preserves only unobserved committed workspaces and tombst
     )).?;
     defer deleted_ledger.deinit();
     try std.testing.expectEqual(@as(i64, 0), deleted_ledger.int(0));
+    var replay_guard = (try store.conn.row(
+        "select count(*) from terminal_turn_replay_guard where turn_id = 'turn-wsbelt' and status = 'completed'",
+        .{},
+    )).?;
+    defer replay_guard.deinit();
+    try std.testing.expectEqual(@as(i64, 1), replay_guard.int(0));
 }
 
 // M5-P4 Amendment 1 duplicate-id invariant: one snapshot carrying the same

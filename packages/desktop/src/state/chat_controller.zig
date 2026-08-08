@@ -2122,6 +2122,70 @@ pub fn applyDaemonChatTurnsSnapshot(self: anytype, turns: []const headless.store
     }
 }
 
+const TerminalTurnConsumeArgs = struct {
+    pref_path: []u8,
+    turn_id: []u8,
+};
+
+fn consumeReconciledTerminalTurn(args: *TerminalTurnConsumeArgs) void {
+    defer {
+        std.heap.page_allocator.free(args.pref_path);
+        std.heap.page_allocator.free(args.turn_id);
+        std.heap.page_allocator.destroy(args);
+    }
+    const response = sessionizer.requestAlloc(
+        std.heap.page_allocator,
+        args.pref_path,
+        "chat.turn.consume",
+        .{ .turn_id = args.turn_id },
+        6,
+    ) catch |err| {
+        log.warn("failed to consume reconciled chat turn {s}: {s}", .{ args.turn_id, @errorName(err) });
+        return;
+    };
+    std.heap.page_allocator.free(response);
+}
+
+/// Bounded reconnect presentation for terminal rows already carried by the
+/// cursor worker. Failure status/error is shown locally; retention cleanup is
+/// dispatched asynchronously so the SDL frame performs no daemon I/O.
+pub fn reconcileTerminalDaemonChatTurnsSnapshot(self: anytype, turns: []const headless.store.TurnRecord) void {
+    for (turns) |turn| {
+        const terminal = std.mem.eql(u8, turn.status, "completed") or
+            std.mem.eql(u8, turn.status, "failed") or
+            std.mem.eql(u8, turn.status, "aborted");
+        if (!terminal) continue;
+        if (retryAdoptionThreadByLocalId(self, turn.workspace_id, turn.local_thread_id) == null) continue;
+        if (std.mem.eql(u8, turn.status, "failed")) {
+            log.warn(
+                "chat turn {s} failed while the GUI was closed: {s}",
+                .{ turn.turn_id, turn.error_message orelse "Provider request failed." },
+            );
+            self.setSidebarNotice("A chat reply failed while Verde was closed.");
+        }
+        const args = std.heap.page_allocator.create(TerminalTurnConsumeArgs) catch continue;
+        args.* = .{
+            .pref_path = std.heap.page_allocator.dupe(u8, self.storage.pref_path) catch {
+                std.heap.page_allocator.destroy(args);
+                continue;
+            },
+            .turn_id = undefined,
+        };
+        args.turn_id = std.heap.page_allocator.dupe(u8, turn.turn_id) catch {
+            std.heap.page_allocator.free(args.pref_path);
+            std.heap.page_allocator.destroy(args);
+            continue;
+        };
+        const worker = std.Thread.spawn(.{}, consumeReconciledTerminalTurn, .{args}) catch {
+            std.heap.page_allocator.free(args.pref_path);
+            std.heap.page_allocator.free(args.turn_id);
+            std.heap.page_allocator.destroy(args);
+            continue;
+        };
+        worker.detach();
+    }
+}
+
 pub fn threadByLocalId(self: anytype, workspace_id: []const u8, local_thread_id: []const u8) ?*ChatThread {
     for (self.project_controller.projects.items) |*project| {
         if (!std.mem.eql(u8, project.id, workspace_id)) continue;
@@ -3536,8 +3600,8 @@ fn adoptTranscriptIdentitiesFromStoreMessages(
 // Adoption is idempotent, so incomplete attempts are queued here (keyed by
 // workspace+thread ids) and retried on later pollSend ticks until complete.
 // Main-thread-only, matching the ownership rule for `thread.messages`; keys
-// use page_allocator so no per-controller allocator outlives its owner. The
-// flush itself is never gated on adoption — it stays unconditional.
+// use page_allocator so no per-controller allocator outlives its owner.
+// Snapshot persistence is gated while a covered row is still id-less.
 // ---------------------------------------------------------------------------
 
 const ADOPTION_RETRY_INTERVAL_MS: i64 = 1_000;
@@ -3616,6 +3680,24 @@ fn clearAdoptionPending(workspace_id: []const u8, local_thread_id: []const u8) v
     if (adoption_retry_pending.fetchRemove(key)) |entry| {
         std.heap.page_allocator.free(entry.key);
     }
+}
+
+/// True only when a pending/terminal adoption repair still covers an id-less
+/// transcript row. Lifecycle persistence calls this before capture so it can
+/// never mint a `snap-msg-*` twin for daemon-owned content.
+pub fn hasUnresolvedAdoptionRows(self: anytype) bool {
+    var iterator = adoption_retry_pending.iterator();
+    while (iterator.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const separator = std.mem.indexOfScalar(u8, key, ADOPTION_RETRY_KEY_SEPARATOR) orelse continue;
+        const workspace_id = key[0..separator];
+        const local_thread_id = key[separator + 1 ..];
+        const thread = retryAdoptionThreadByLocalId(self, workspace_id, local_thread_id) orelse continue;
+        for (thread.messages.items) |message| {
+            if (message.message_id == null) return true;
+        }
+    }
+    return false;
 }
 
 /// Cursor snapshots carry durable message identities directly. Once every row
@@ -3933,6 +4015,11 @@ test "M5-P4 amendment 2: retry pump backs off, reaches archived threads, and giv
 
     // Arm 5 — loud give-up retains a terminal repair marker. Cursor snapshot
     // application is now the only path allowed to clear the id-less state.
+    try state.project_controller.projects.items[0].threads.items[0].messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Codex"),
+        .body = try allocator.dupeZ(u8, "awaiting durable identity"),
+    });
     markAdoptionPending("retry-ws", "thread-live");
     {
         const key = adoptionRetryKeyAlloc("retry-ws", "thread-live").?;
@@ -3945,6 +4032,10 @@ test "M5-P4 amendment 2: retry pump backs off, reaches archived threads, and giv
     const terminal_entry = (try entryState("retry-ws", "thread-live")).?;
     try std.testing.expect(terminal_entry.terminal_failed);
     try std.testing.expectEqual(ADOPTION_RETRY_MAX_ATTEMPTS, terminal_entry.attempts);
+    try std.testing.expect(hasUnresolvedAdoptionRows(&state));
+    state.project_controller.projects.items[0].threads.items[0].messages.items[0].message_id =
+        try allocator.dupe(u8, "turn:retry:msg:0");
+    try std.testing.expect(!hasUnresolvedAdoptionRows(&state));
     clearAdoptionPending("retry-ws", "thread-live");
     try std.testing.expectEqual(@as(usize, 0), adoption_retry_pending.count());
 }

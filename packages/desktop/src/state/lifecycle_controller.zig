@@ -22,13 +22,15 @@ const Storage = storage_mod.Storage;
 
 const FlushWorkerResult = struct {
     success: bool = false,
+    conflict: bool = false,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
 const FlushWorkerArgs = struct {
     allocator: std.mem.Allocator,
     storage: *const Storage,
-    loaded: LoadedPersistedState,
+    loaded: ?LoadedPersistedState,
+    observed_revision: u64,
     result: *FlushWorkerResult,
 };
 
@@ -48,6 +50,9 @@ pub const State = struct {
     flush_snapshot_generation: u64 = 0,
     /// Earliest wall-clock ms to attempt another frame-loop flush after a failure.
     next_flush_attempt_ms: i64 = 0,
+    /// Payload rejected because its capture-time revision lost a race. It is
+    /// retained until the cursor refresh rebases its local UI edits.
+    rebase_snapshot: ?LoadedPersistedState = null,
 
     pub fn markDirty(self: *State, now_ms: i64) void {
         self.dirty = true;
@@ -74,6 +79,11 @@ pub const State = struct {
     pub fn clearDirty(self: *State) void {
         self.dirty = false;
     }
+
+    pub fn deinit(self: *State) void {
+        if (self.rebase_snapshot) |*snapshot| snapshot.deinit();
+        self.rebase_snapshot = null;
+    }
 };
 
 pub fn markDirty(self: anytype) void {
@@ -99,7 +109,12 @@ pub fn flushIfDirty(self: anytype) void {
 }
 
 fn scheduleFlushWorker(self: anytype, now_ms: i64) void {
+    if (self.hasUnresolvedAdoptionRows()) {
+        self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
+        return;
+    }
     const storage: *const Storage = self.storage;
+    const observed_revision = storage.currentProjectionObservedRevision();
     var persisted = self.buildPersistedState(storage.allocator) catch |err| {
         log.err("failed to snapshot native state for async flush: {s}", .{@errorName(err)});
         self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
@@ -123,13 +138,14 @@ fn scheduleFlushWorker(self: anytype, now_ms: i64) void {
         .allocator = storage.allocator,
         .storage = storage,
         .loaded = persisted,
+        .observed_revision = observed_revision,
         .result = result,
     };
 
     const thread = std.Thread.spawn(.{}, flushWorkerMain, .{args}) catch |err| {
         log.err("failed to spawn state flush worker: {s}", .{@errorName(err)});
         // Take loaded back so we can deinit; args holds the moved value.
-        var owned = args.loaded;
+        var owned = args.loaded.?;
         owned.deinit();
         storage.allocator.destroy(args);
         storage.allocator.destroy(result);
@@ -147,8 +163,9 @@ fn scheduleFlushWorker(self: anytype, now_ms: i64) void {
 }
 
 fn flushWorkerMain(args: *FlushWorkerArgs) void {
-    args.storage.save(args.loaded.value) catch {
+    args.storage.saveCaptured(args.loaded.?.value, args.observed_revision) catch |err| {
         args.result.success = false;
+        args.result.conflict = err == error.StoreRevisionConflict;
         args.result.done.store(true, .release);
         return;
     };
@@ -167,9 +184,15 @@ pub fn pollFlushWorker(self: anytype) void {
         self.lifecycle.flush_worker = null;
     }
     const success = result.success;
+    const conflict = result.conflict;
     const storage: *const Storage = self.storage;
     if (self.lifecycle.flush_args) |args| {
-        args.loaded.deinit();
+        if (conflict) {
+            if (self.lifecycle.rebase_snapshot) |*old| old.deinit();
+            self.lifecycle.rebase_snapshot = args.loaded;
+            args.loaded = null;
+        }
+        if (args.loaded) |*loaded| loaded.deinit();
         storage.allocator.destroy(args);
         self.lifecycle.flush_args = null;
     }
@@ -181,6 +204,9 @@ pub fn pollFlushWorker(self: anytype) void {
     if (success) {
         self.lifecycle.clearDirtyForGeneration(self.lifecycle.flush_snapshot_generation);
         self.lifecycle.next_flush_attempt_ms = 0;
+    } else if (conflict) {
+        log.warn("async native state save conflicted; awaiting cursor rebase", .{});
+        self.lifecycle.next_flush_attempt_ms = now + FLUSH_RETRY_BACKOFF_MS;
     } else {
         log.err("async native state save failed; retaining dirty and backing off", .{});
         storage.markPersistenceUnavailable();
@@ -197,27 +223,18 @@ pub fn flushDirtyBlocking(self: anytype) void {
             thread.join();
             self.lifecycle.flush_worker = null;
         }
-        const storage: *const Storage = self.storage;
-        if (self.lifecycle.flush_result) |result| {
-            if (result.success)
-                self.lifecycle.clearDirtyForGeneration(self.lifecycle.flush_snapshot_generation);
-            storage.allocator.destroy(result);
-            self.lifecycle.flush_result = null;
-        }
-        if (self.lifecycle.flush_args) |args| {
-            args.loaded.deinit();
-            storage.allocator.destroy(args);
-            self.lifecycle.flush_args = null;
-        }
-        self.lifecycle.flush_in_flight = false;
+        pollFlushWorker(self);
     }
     if (!self.lifecycle.dirty) return;
+    if (self.lifecycle.rebase_snapshot != null) return;
+    if (self.hasUnresolvedAdoptionRows()) return;
+    const observed_revision = self.storage.currentProjectionObservedRevision();
     var persisted = self.buildPersistedState(self.storage.allocator) catch |err| {
         log.err("failed to snapshot native state: {s}", .{@errorName(err)});
         return;
     };
     defer persisted.deinit();
-    self.storage.save(persisted.value) catch |err| {
+    self.storage.saveCaptured(persisted.value, observed_revision) catch |err| {
         log.err("failed to save native state via daemon: {s}", .{@errorName(err)});
         self.storage.markPersistenceUnavailable();
         self.lifecycle.next_flush_attempt_ms = platform_runtime.unixTimestampMs() + FLUSH_RETRY_BACKOFF_MS;

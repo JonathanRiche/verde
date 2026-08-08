@@ -5808,6 +5808,10 @@ fn storeMutationCommittedHook(context: *anyopaque, mutation: *const daemon_store
             // stale forever across a snapshot_replace (M5-P4 Amendment 3).
             daemon.appendJournalEntry(.workspace, "*", null, revision);
             daemon.appendJournalEntry(.chat_thread, "*", null, revision);
+            // Snapshot tombstoning may remove workspace-owned turn records;
+            // the durable replay guard is separate, but chat.turn projection
+            // subscribers must still re-read after the committed deletion.
+            daemon.appendJournalEntry(.chat_turn, "*", null, revision);
             daemon.appendJournalEntry(.chat_completion, "*", null, revision);
             daemon.appendJournalEntry(.surface, "*", null, revision);
         },
@@ -6146,7 +6150,7 @@ fn ledgerHasTerminalCommittedTurn(service: *StoreService, turn_id: []const u8) !
     lockStoreService(service);
     defer service.mutex.unlock();
     const row_or_null = service.store.conn.row(
-        "select status from chat_turns where turn_id = ?1",
+        "select status from terminal_turn_replay_guard where turn_id = ?1",
         .{turn_id},
     ) catch return error.StoreUnavailable;
     const row = row_or_null orelse return false;

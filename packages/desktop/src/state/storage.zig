@@ -33,6 +33,10 @@ const StoreSession = struct {
     store_revision: u64 = 0,
     /// True once we have observed a revision from RO load, storeStatus, or a write receipt.
     revision_known: bool = false,
+    /// Revision whose durable projection was actually applied to AppState.
+    /// This is deliberately separate from `store_revision`, which can move
+    /// ahead after a status read or another writer's receipt.
+    projection_observed_revision: u64 = 0,
     /// False when the daemon is unavailable or replacement is blocked; GUI stays
     /// visibly read-only/unsaved and never falls back to a direct writer.
     persistence_available: bool = true,
@@ -130,14 +134,17 @@ pub const Storage = struct {
                 // Pin the durable revision observed in the same RO transaction so
                 // launch-2 does not resend a guard-less bootstrap against a non-empty store.
                 self.noteStoreRevision(loaded.store_revision);
+                self.noteProjectionObservedRevision(loaded.store_revision);
                 return loaded;
             }
             // DB exists but has no app snapshot (e.g. CLI-notify-only history):
             // still pin the real revision so the first flush is guarded.
             self.noteStoreRevision(client.storeRevision() catch 0);
+            self.noteProjectionObservedRevision(self.currentStoreRevision());
         } else {
             // No DB yet: revision 0 is known; first write may bootstrap or use expected=0.
             self.noteStoreRevision(0);
+            self.noteProjectionObservedRevision(0);
         }
         if (try self.loadLegacyJson(allocator)) |loaded| {
             errdefer {
@@ -148,7 +155,7 @@ pub const Storage = struct {
             // non-empty store (CLI history) gets a guarded replace instead so
             // the daemon's conflict check stays meaningful.
             const use_bootstrap = self.currentStoreRevision() == 0;
-            try self.replaceSnapshot(loaded.value, use_bootstrap);
+            try self.replaceSnapshot(loaded.value, use_bootstrap, self.currentProjectionObservedRevision());
             try self.reopenReadOnly();
             return loaded;
         }
@@ -177,7 +184,14 @@ pub const Storage = struct {
 
     /// Compatibility whole-state save via `state.snapshot.replace`.
     pub fn save(self: *const Storage, state: PersistedState) !void {
-        try self.replaceSnapshot(state, false);
+        try self.saveCaptured(state, self.currentProjectionObservedRevision());
+    }
+
+    /// Persist one frame-thread capture under the exact revision that
+    /// projection observed while that payload was built. The worker must not
+    /// relabel it with a later guard learned from a cursor refresh.
+    pub fn saveCaptured(self: *const Storage, state: PersistedState, observed_revision: u64) !void {
+        try self.replaceSnapshot(state, false, observed_revision);
         try self.reopenReadOnly();
     }
 
@@ -316,6 +330,18 @@ pub const Storage = struct {
         }
         self.store_session.revision_known = true;
         self.store_session.persistence_available = true;
+    }
+
+    pub fn currentProjectionObservedRevision(self: *const Storage) u64 {
+        self.store_session.lock();
+        defer self.store_session.unlock();
+        return self.store_session.projection_observed_revision;
+    }
+
+    fn noteProjectionObservedRevision(self: *const Storage, revision: u64) void {
+        self.store_session.lock();
+        defer self.store_session.unlock();
+        self.store_session.projection_observed_revision = revision;
     }
 
     /// Clear cached client identity so the next mutation re-registers (MAJOR-1).
@@ -465,22 +491,67 @@ pub const Storage = struct {
     /// The daemon captures the journal cursor BEFORE either state read, so a
     /// cursor seeded here can only over-deliver — never miss — entries
     /// relative to the snapshot contents (M5-P2 capture order).
+    pub const PreparedCompositeSnapshotSeed = struct {
+        instance_nonce: []u8,
+        registry_revision: u64,
+        change_cursor: u64,
+        store_revision: u64,
+    };
+
+    /// Perform the only fallible seed work before the AppState projection is
+    /// swapped. Committing this value below is allocation-free.
+    pub fn prepareCompositeSnapshotSeed(
+        self: *const Storage,
+        envelope: headless.registry.RegistryRevisionEnvelope,
+        change_cursor: u64,
+        store_revision: u64,
+    ) !PreparedCompositeSnapshotSeed {
+        return .{
+            .instance_nonce = try self.allocator.dupe(u8, envelope.instance_nonce),
+            .registry_revision = envelope.registry_revision,
+            .change_cursor = change_cursor,
+            .store_revision = store_revision,
+        };
+    }
+
+    pub fn discardPreparedCompositeSnapshotSeed(self: *const Storage, prepared: PreparedCompositeSnapshotSeed) void {
+        self.allocator.free(prepared.instance_nonce);
+    }
+
+    /// Allocation-free publication, called only after the fully built
+    /// projection has been swapped into AppState.
+    pub fn commitPreparedCompositeSnapshotSeed(
+        self: *const Storage,
+        prepared: PreparedCompositeSnapshotSeed,
+    ) void {
+        self.store_session.lock();
+        if (self.store_session.instance_nonce) |old| self.allocator.free(old);
+        self.store_session.instance_nonce = prepared.instance_nonce;
+        self.store_session.registry_revision = prepared.registry_revision;
+        self.store_session.change_cursor = prepared.change_cursor;
+        self.store_session.change_cursor_known = true;
+        self.store_session.projection_synced_at_ms = platform_runtime.unixTimestampMs();
+        self.store_session.projection_observed_revision = prepared.store_revision;
+        if (self.store_session.revision_known) {
+            self.store_session.store_revision = @max(self.store_session.store_revision, prepared.store_revision);
+        } else {
+            self.store_session.store_revision = prepared.store_revision;
+        }
+        self.store_session.revision_known = true;
+        self.store_session.persistence_available = true;
+        self.store_session.unlock();
+    }
+
+    /// Compatibility helper for tests and non-AppState callers. Production
+    /// projection application uses prepare/commit around its atomic swap.
     pub fn noteCompositeSnapshotSeed(
         self: *const Storage,
         envelope: headless.registry.RegistryRevisionEnvelope,
         change_cursor: u64,
         store_revision: u64,
     ) !void {
-        const owned_nonce = try self.allocator.dupe(u8, envelope.instance_nonce);
-        self.store_session.lock();
-        if (self.store_session.instance_nonce) |old| self.allocator.free(old);
-        self.store_session.instance_nonce = owned_nonce;
-        self.store_session.registry_revision = envelope.registry_revision;
-        self.store_session.change_cursor = change_cursor;
-        self.store_session.change_cursor_known = true;
-        self.store_session.projection_synced_at_ms = platform_runtime.unixTimestampMs();
-        self.store_session.unlock();
-        self.noteStoreRevision(store_revision);
+        const prepared = try self.prepareCompositeSnapshotSeed(envelope, change_cursor, store_revision);
+        self.commitPreparedCompositeSnapshotSeed(prepared);
     }
 
     /// Cursor for the next core.changes poll; null when the loop must
@@ -516,7 +587,7 @@ pub const Storage = struct {
         return now_ms - self.store_session.projection_synced_at_ms <= window_ms;
     }
 
-    fn replaceSnapshot(self: *const Storage, state: PersistedState, bootstrap: bool) !void {
+    fn replaceSnapshot(self: *const Storage, state: PersistedState, bootstrap: bool, observed_revision: u64) !void {
         // Non-bootstrap flushes must never send expected=null against a non-empty store.
         if (!bootstrap and !self.revisionIsKnown()) {
             _ = self.refreshStoreRevision() catch |err| {
@@ -524,9 +595,10 @@ pub const Storage = struct {
             };
         }
 
-        const first = try self.replaceSnapshotOnce(state, bootstrap);
+        const first = try self.replaceSnapshotOnce(state, bootstrap, observed_revision);
         if (first) |result| {
             self.noteStoreRevision(result.store_revision);
+            self.noteProjectionObservedRevision(result.store_revision);
             return;
         }
         // A conflict means this payload was built from an older projection.
@@ -543,17 +615,18 @@ pub const Storage = struct {
         self: *const Storage,
         state: PersistedState,
         bootstrap: bool,
+        observed_revision: u64,
     ) !?headless.store.WriteResult {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const snapshot = try persistence.persistedStateToProtocolSnapshot(a, state, self.currentStoreRevision());
+        const snapshot = try persistence.persistedStateToProtocolSnapshot(a, state, observed_revision);
         const client_id = try self.ensureStoreClientId();
         defer self.allocator.free(client_id);
         const request_key = try self.nextRequestKey(a, if (bootstrap) "snapshot.bootstrap" else "snapshot.replace");
         // bootstrap=true is reserved for legacy JSON import only. Normal saves
         // always send an expected revision (including 0 for an empty store).
-        const expected: ?u64 = if (bootstrap) null else self.currentStoreRevision();
+        const expected: ?u64 = if (bootstrap) null else observed_revision;
         const request: headless.store.SnapshotReplaceRequest = .{
             .mutation = .{
                 .request_key = request_key,
@@ -973,4 +1046,20 @@ test "clearCachedClientId drops the registered identity for re-register" {
     storage.store_session.lock();
     defer storage.store_session.unlock();
     try std.testing.expect(storage.store_session.client_id == null);
+}
+
+test "capture revision remains bound when the write guard advances" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(std.testing.allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+
+    try storage.noteCompositeSnapshotSeed(.{ .instance_nonce = "nonce-a", .registry_revision = 1 }, 4, 7);
+    const captured = storage.currentProjectionObservedRevision();
+    storage.noteStoreRevision(9);
+    try std.testing.expectEqual(@as(u64, 7), captured);
+    try std.testing.expectEqual(@as(u64, 7), storage.currentProjectionObservedRevision());
+    try std.testing.expectEqual(@as(u64, 9), storage.currentStoreRevision());
 }

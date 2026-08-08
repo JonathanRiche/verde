@@ -490,6 +490,8 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
         defer self.allocator.free(project_id);
 
         var loaded = try Project.init(self.allocator, project_id, project.label, project.path, project.unread_count);
+        var loaded_owned = true;
+        errdefer if (loaded_owned) loaded.deinit(self.allocator);
         if (project.companion_thread_local_id) |local_id| {
             loaded.companion_thread_local_id = try self.allocator.dupeZ(u8, local_id);
         }
@@ -655,6 +657,7 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
         } else {
             try self.project_controller.projects.append(self.allocator, loaded);
         }
+        loaded_owned = false;
     }
 
     if (self.project_controller.projects.items.len == 0) {
