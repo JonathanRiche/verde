@@ -107,8 +107,14 @@ fn projectionStaleAt(
     return now_ms - basis > CHANGE_CURSOR_STALE_AFTER_MS;
 }
 
-fn projectionRefreshApplyGate(dirty: bool, flush_in_flight: bool, has_rebase: bool, adoption_repair: bool) bool {
-    return !flush_in_flight and (!dirty or has_rebase or adoption_repair);
+fn projectionRefreshApplyGate(
+    dirty: bool,
+    flush_in_flight: bool,
+    has_rebase: bool,
+    adoption_repair: bool,
+    baseline_repair: bool,
+) bool {
+    return !flush_in_flight and (!dirty or has_rebase or adoption_repair or baseline_repair);
 }
 
 /// Coalesced main-loop refresh signals derived from change-journal entries.
@@ -776,6 +782,40 @@ fn mergeCurrentLocalEdits(
             remote.selected_project_index = @min(remote.selected_project_index, remote.projects.len - 1);
         }
     }
+}
+
+/// Bootstrap/revision-repair merge used only when no revision-paired baseline
+/// exists. It never consults a stale baseline and conservatively retains every
+/// current-only workspace/thread identity while durable transcript rows remain
+/// authoritative for identities present on both sides.
+fn preserveCurrentIdentitiesWithoutBaseline(
+    allocator: std.mem.Allocator,
+    remote: *PersistedState,
+    current: PersistedState,
+) !void {
+    var projects: std.ArrayList(PersistedProject) = .empty;
+    defer projects.deinit(allocator);
+    try projects.appendSlice(allocator, remote.projects);
+    for (current.projects) |current_project| {
+        const id = current_project.id orelse continue;
+        const remote_index = projectIndexById(projects.items, id) orelse {
+            try projects.append(allocator, current_project);
+            continue;
+        };
+        var remote_project = &projects.items[remote_index];
+        var threads: std.ArrayList(PersistedThread) = .empty;
+        defer threads.deinit(allocator);
+        try threads.appendSlice(allocator, remote_project.threads orelse &.{});
+        for (current_project.threads orelse &.{}) |current_thread| {
+            const thread_id = current_thread.local_thread_id orelse continue;
+            if (threadIndexById(threads.items, thread_id) == null) {
+                try threads.append(allocator, current_thread);
+            }
+        }
+        remote_project.threads = try threads.toOwnedSlice(allocator);
+    }
+    remote.projects = try projects.toOwnedSlice(allocator);
+    overlayConflictedLocalEdits(remote, current);
 }
 
 pub fn paletteUiTextPrefixWidth(text: []const u8, font_size: f32, end: usize) f32 {
@@ -1948,6 +1988,7 @@ const PersistedProject = db_types.PersistedProject;
 const PersistedState = db_types.PersistedState;
 const PersistedSurfaceState = db_types.PersistedSurfaceState;
 const PersistedThread = db_types.PersistedThread;
+const LoadedPersistedState = db_types.LoadedState;
 
 // `utils.zig` owns the cross-cutting runtime helpers that are shared with the UI shell.
 const SendWorkerRequest = utils.SendWorkerRequest;
@@ -2433,12 +2474,60 @@ pub const AppState = struct {
         };
         state.composer_controller.composer.setCallbacks(.{});
 
+        var pending_spool = try storage.loadPendingStateSpool(allocator);
+        defer if (pending_spool) |*spool| spool.deinit();
         if (try storage.load(allocator)) |persisted_value| {
             var persisted = persisted_value;
             defer persisted.deinit();
+            var projection_baseline = try state.clonePersistedState(allocator, persisted.value);
+            errdefer projection_baseline.deinit();
+            if (pending_spool) |*spool| {
+                if (spool.value.baseline) |baseline| {
+                    if (spool.value.baseline_revision == spool.value.capture_revision) {
+                        try mergeCurrentLocalEdits(
+                            persisted.allocator(),
+                            &persisted.value,
+                            baseline,
+                            spool.value.current,
+                        );
+                    } else {
+                        try preserveCurrentIdentitiesWithoutBaseline(
+                            persisted.allocator(),
+                            &persisted.value,
+                            spool.value.current,
+                        );
+                    }
+                } else {
+                    try preserveCurrentIdentitiesWithoutBaseline(
+                        persisted.allocator(),
+                        &persisted.value,
+                        spool.value.current,
+                    );
+                }
+            }
             try state.applyPersisted(persisted.value);
+            state.lifecycle.projection_baseline = projection_baseline;
+            state.lifecycle.projection_baseline_revision = storage.currentProjectionObservedRevision();
+            state.daemon_projection_has_saved_state = true;
+            if (pending_spool) |*spool| {
+                try chat_controller.restorePendingAdoptionRepairs(spool.value.adoption_repairs);
+                state.lifecycle.markDirty(platform_runtime.unixTimestampMs());
+                state.lifecycle.dirty_spooled = true;
+            }
+        } else if (pending_spool) |*spool| {
+            try state.applyPersisted(spool.value.current);
+            state.lifecycle.projection_baseline = LoadedPersistedState.init(allocator);
+            state.lifecycle.projection_baseline_revision = storage.currentProjectionObservedRevision();
+            try chat_controller.restorePendingAdoptionRepairs(spool.value.adoption_repairs);
+            state.lifecycle.markDirty(platform_runtime.unixTimestampMs());
+            state.lifecycle.dirty_spooled = true;
             state.daemon_projection_has_saved_state = true;
         } else {
+            // A genuinely empty durable store still has a valid revision-0
+            // baseline. Seed local defaults only after pairing that empty
+            // projection so their first save is a proven local addition.
+            state.lifecycle.projection_baseline = LoadedPersistedState.init(allocator);
+            state.lifecycle.projection_baseline_revision = storage.currentProjectionObservedRevision();
             try state.seedDefaultState();
         }
         // Launch reconciliation is cursor-driven: the owned composite result
@@ -3753,7 +3842,9 @@ pub const AppState = struct {
     pub const consumeDaemonChatTurn = chat_controller.consumeDaemonChatTurn;
     pub const restoreDaemonChatTurnsOnLaunch = chat_controller.restoreDaemonChatTurnsOnLaunch;
     pub const applyDaemonChatTurnsSnapshot = chat_controller.applyDaemonChatTurnsSnapshot;
-    pub const clearSatisfiedAdoptionRepairs = chat_controller.clearSatisfiedAdoptionRepairs;
+    pub const validateAdoptionRepairsForRefresh = chat_controller.validateAdoptionRepairsForRefresh;
+    pub const clearValidatedAdoptionRepairs = chat_controller.clearValidatedAdoptionRepairs;
+    pub const pendingAdoptionRepairsSnapshot = chat_controller.pendingAdoptionRepairsSnapshot;
     pub const hasUnresolvedAdoptionRows = chat_controller.hasUnresolvedAdoptionRows;
     pub const reconcileTerminalDaemonChatTurnsSnapshot = chat_controller.reconcileTerminalDaemonChatTurnsSnapshot;
     pub const threadByLocalId = chat_controller.threadByLocalId;
@@ -8470,6 +8561,8 @@ pub const AppState = struct {
 
     pub fn deinit(self: *AppState) void {
         runtime_log.diagnostic("AppState.deinit begin", .{});
+        shutdown_watchdog_deinit_complete.store(false, .release);
+        shutdown_watchdog_state_durable.store(false, .release);
         startShutdownWatchdog();
         // Flag the cursor loop first so an in-flight long-poll (bounded by
         // the 4s wait budget + 5s transport timeout) drains concurrently with
@@ -8507,7 +8600,19 @@ pub const AppState = struct {
         ai_harness.shutdownOwnedProviderProcesses();
         runtime_log.diagnostic("AppState.deinit provider processes shutdown", .{});
         self.flushDirtyBlocking();
-        runtime_log.diagnostic("AppState.deinit dirty state flushed", .{});
+        while (self.lifecycle.dirty and !self.lifecycle.dirty_spooled) {
+            // A failed spool must keep the owning state alive. Retry slowly;
+            // the watchdog is forbidden to force exit until durability flips.
+            self.spoolPendingStateForShutdown() catch |err| {
+                runtime_log.diagnostic("AppState.deinit spool retry failed: {s}", .{@errorName(err)});
+                platform_runtime.sleepMillis(500);
+                continue;
+            };
+            self.lifecycle.dirty_spooled = true;
+        }
+        shutdown_watchdog_state_durable.store(true, .release);
+        chat_controller.deinitProcessGlobalState(self.storage.pref_path);
+        runtime_log.diagnostic("AppState.deinit dirty state durable", .{});
         self.lifecycle.deinit();
         self.file_search_controller.deinit(self.allocator);
         self.composer_controller.composer.deinit(self.allocator);
@@ -8695,36 +8800,46 @@ pub const AppState = struct {
 
     pub fn applyDaemonProjectionRefresh(self: *AppState, result: headless.store.CoreSnapshotResult) !void {
         const adoption_repair = self.hasUnresolvedAdoptionRows();
+        const observed_revision = self.storage.currentProjectionObservedRevision();
+        const baseline_repair = self.lifecycle.projection_baseline == null or
+            self.lifecycle.projection_baseline_revision != observed_revision;
         if (!projectionRefreshApplyGate(
             self.lifecycle.dirty,
             self.lifecycle.flush_in_flight,
             self.lifecycle.rebase_snapshot != null,
             adoption_repair,
+            baseline_repair,
         )) return error.ProjectionRefreshDeferred;
         const envelope = result.envelope orelse return error.MissingProjectionEnvelope;
         const cursor = result.change_cursor orelse return error.MissingProjectionCursor;
         var conversion_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer conversion_arena.deinit();
         var persisted = try compositeSnapshotToPersisted(conversion_arena.allocator(), result.snapshot);
+        if (adoption_repair) try self.validateAdoptionRepairsForRefresh(persisted);
         var next_baseline = try self.clonePersistedState(self.allocator, persisted);
         var baseline_owned = true;
         errdefer if (baseline_owned) next_baseline.deinit();
         if (self.lifecycle.dirty or self.lifecycle.rebase_snapshot != null or adoption_repair) {
             var current = try self.buildPersistedState(self.allocator);
             defer current.deinit();
-            const baseline = if (self.lifecycle.rebase_baseline) |*captured|
-                captured.value
-            else if (self.lifecycle.projection_baseline) |*last_applied|
-                last_applied.value
-            else
-                null;
+            const baseline = if (self.lifecycle.rebase_baseline) |*captured| blk: {
+                if (self.lifecycle.rebase_baseline_revision == self.lifecycle.rebase_capture_revision and
+                    self.lifecycle.rebase_capture_revision == observed_revision)
+                {
+                    break :blk captured.value;
+                }
+                break :blk null;
+            } else if (self.lifecycle.projection_baseline) |*last_applied| blk: {
+                if (self.lifecycle.projection_baseline_revision == observed_revision) break :blk last_applied.value;
+                break :blk null;
+            } else null;
             if (baseline) |base| {
                 try mergeCurrentLocalEdits(conversion_arena.allocator(), &persisted, base, current.value);
             } else {
-                // A bootstrap state has no daemon baseline. Preserve matching
-                // UI fields without guessing whether absent durable identities
-                // are local additions or remote deletions.
-                overlayConflictedLocalEdits(&persisted, current.value);
+                // Bootstrap or explicit revision mismatch: never merge through
+                // a stale baseline. This fresh remote rebuild conservatively
+                // preserves current-only identities before pairing a new base.
+                try preserveCurrentIdentitiesWithoutBaseline(conversion_arena.allocator(), &persisted, current.value);
             }
         }
 
@@ -8770,7 +8885,7 @@ pub const AppState = struct {
         terminal_controller.deinitDaemonSessionProjection(self.allocator, &old_sessions);
         self.clearTranscriptMarkdownSelection();
         self.clearTranscriptMarkdownEntries();
-        self.clearSatisfiedAdoptionRepairs();
+        self.clearValidatedAdoptionRepairs();
         self.reconcileTerminalDaemonChatTurnsSnapshot(result.turns);
 
         // Atomic publication boundary: all fallible work and the projection
@@ -8781,8 +8896,11 @@ pub const AppState = struct {
         self.lifecycle.rebase_snapshot = null;
         if (self.lifecycle.rebase_baseline) |*baseline| baseline.deinit();
         self.lifecycle.rebase_baseline = null;
+        self.lifecycle.rebase_baseline_revision = null;
+        self.lifecycle.rebase_capture_revision = null;
         if (self.lifecycle.projection_baseline) |*baseline| baseline.deinit();
         self.lifecycle.projection_baseline = next_baseline;
+        self.lifecycle.projection_baseline_revision = result.store_revision;
         baseline_owned = false;
         self.daemon_projection_stale = false;
         self.daemon_projection_stale_notified = false;
@@ -8795,6 +8913,35 @@ pub const AppState = struct {
         const refresh = fetchOwnedCompositeSnapshot(self.storage) orelse return error.ProjectionRefreshUnavailable;
         defer refresh.deinit();
         try self.applyDaemonProjectionRefresh(refresh.result);
+    }
+
+    /// Transfer dirty projection ownership to a durable sidecar before close.
+    /// The sidecar remains through replay and is removed only by a later full
+    /// snapshot acknowledgement.
+    pub fn spoolPendingStateForShutdown(self: *AppState) !void {
+        var current = try self.buildPersistedState(self.allocator);
+        defer current.deinit();
+        const capture_revision = self.storage.currentProjectionObservedRevision();
+        const baseline: ?PersistedState = if (self.lifecycle.rebase_baseline) |*captured| blk: {
+            if (self.lifecycle.rebase_baseline_revision == self.lifecycle.rebase_capture_revision and
+                self.lifecycle.rebase_capture_revision == capture_revision)
+            {
+                break :blk captured.value;
+            }
+            break :blk null;
+        } else if (self.lifecycle.projection_baseline) |*projection| blk: {
+            if (self.lifecycle.projection_baseline_revision == capture_revision) break :blk projection.value;
+            break :blk null;
+        } else null;
+        const baseline_revision: ?u64 = if (baseline != null) capture_revision else null;
+        const adoption_repairs = try self.pendingAdoptionRepairsSnapshot(current.allocator());
+        try self.storage.writePendingStateSpool(.{
+            .capture_revision = capture_revision,
+            .baseline_revision = baseline_revision,
+            .current = current.value,
+            .baseline = baseline,
+            .adoption_repairs = adoption_repairs,
+        });
     }
 
     fn deinitProjectionContainers(
@@ -9495,6 +9642,7 @@ const SHUTDOWN_WATCHDOG_TIMEOUT_MS: u64 = 10_000;
 const SHUTDOWN_WATCHDOG_POLL_MS: u64 = 200;
 
 var shutdown_watchdog_deinit_complete: std.atomic.Value(bool) = .init(false);
+var shutdown_watchdog_state_durable: std.atomic.Value(bool) = .init(false);
 
 fn startShutdownWatchdog() void {
     const thread = std.Thread.spawn(.{}, shutdownWatchdogMain, .{}) catch |err| {
@@ -9511,6 +9659,14 @@ fn shutdownWatchdogMain() void {
         platform_runtime.sleepMillis(SHUTDOWN_WATCHDOG_POLL_MS);
     }
     if (shutdown_watchdog_deinit_complete.load(.acquire)) return;
+    while (!shutdown_watchdog_state_durable.load(.acquire)) {
+        // Never discard an unsaved/unspooled projection. The owning deinit
+        // remains alive and may recover enough filesystem/allocator capacity
+        // to complete the durability transfer.
+        runtime_log.diagnostic("AppState.deinit watchdog waiting for dirty-state durability", .{});
+        platform_runtime.sleepMillis(SHUTDOWN_WATCHDOG_POLL_MS);
+        if (shutdown_watchdog_deinit_complete.load(.acquire)) return;
+    }
     runtime_log.diagnostic(
         "AppState.deinit watchdog expired after {d} ms; forcing process exit",
         .{SHUTDOWN_WATCHDOG_TIMEOUT_MS},
@@ -12071,6 +12227,87 @@ test "M5-P4 three-way conflict merge keeps post-capture edits and local addition
     try std.testing.expect(threadIndexById(threads, "thread-deleted") == null);
 }
 
+test "M5-P4 acknowledged-save baseline preserves later edit on the same new thread" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const acknowledged_threads = [_]PersistedThread{.{
+        .title = "A",
+        .local_thread_id = "thread-created-by-flush-a",
+        .draft = "draft A",
+    }};
+    const edited_threads = [_]PersistedThread{.{
+        .title = "B",
+        .local_thread_id = "thread-created-by-flush-a",
+        .draft = "draft B",
+    }};
+    const baseline_projects = [_]PersistedProject{.{
+        .id = "ws-ack-baseline",
+        .label = "workspace",
+        .path = "/tmp/ws-ack-baseline",
+        .threads = &acknowledged_threads,
+    }};
+    const current_projects = [_]PersistedProject{.{
+        .id = "ws-ack-baseline",
+        .label = "workspace",
+        .path = "/tmp/ws-ack-baseline",
+        .threads = &edited_threads,
+    }};
+    const remote_projects = [_]PersistedProject{.{
+        .id = "ws-ack-baseline",
+        .label = "workspace remote",
+        .path = "/tmp/ws-ack-baseline",
+        .threads = &acknowledged_threads,
+    }};
+    var remote: PersistedState = .{ .projects = &remote_projects };
+    try mergeCurrentLocalEdits(
+        arena.allocator(),
+        &remote,
+        .{ .projects = &baseline_projects },
+        .{ .projects = &current_projects },
+    );
+    try std.testing.expectEqual(@as(usize, 1), remote.projects[0].threads.?.len);
+    try std.testing.expectEqualStrings("B", remote.projects[0].threads.?[0].title);
+    try std.testing.expectEqualStrings("draft B", remote.projects[0].threads.?[0].draft);
+}
+
+test "M5-P4 next launch restores durable pending-state spool before saving" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    const threads = [_]PersistedThread{.{
+        .title = "Recovered thread",
+        .local_thread_id = "recovered-thread",
+        .draft = "unsaved draft",
+    }};
+    const projects = [_]PersistedProject{.{
+        .id = "recovered-workspace",
+        .label = "Recovered after failed shutdown",
+        .path = "/tmp/recovered-workspace",
+        .threads = &threads,
+    }};
+    try storage.writePendingStateSpool(.{
+        .capture_revision = 0,
+        .baseline_revision = 0,
+        .current = .{ .projects = &projects },
+        .baseline = .{},
+    });
+    var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer state.deinit();
+    defer state.lifecycle.dirty = false;
+    try std.testing.expectEqualStrings("Recovered after failed shutdown", state.project_controller.projects.items[0].label);
+    try std.testing.expectEqualStrings("unsaved draft", state.project_controller.projects.items[0].threads.items[0].currentDraft());
+    try std.testing.expect(state.lifecycle.dirty);
+    try std.testing.expect(state.lifecycle.dirty_spooled);
+    try std.testing.expectEqual(@as(?u64, 0), state.lifecycle.projection_baseline_revision);
+}
+
 test "M5-P4 terminal adoption refresh crosses dirty gate and replaces id-less row" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -12130,17 +12367,44 @@ test "M5-P4 terminal adoption refresh crosses dirty gate and replaces id-less ro
         .path = "/tmp/ws-adopt-real",
         .threads = &refreshed_threads,
     }};
-    const daemon_sessions = [_]headless.store.SessionSummary{.{
-        .session_id = "daemon-created-session",
-        .workspace_id = "ws-adopt-real",
-        .workspace_path = "/tmp/ws-adopt-real",
-        .cwd = "/tmp/ws-adopt-real",
-        .label = "shell",
-        .command = "bash",
-        .dock_id = 0,
-        .running = true,
-        .status = "running",
-    }};
+    const daemon_sessions = [_]headless.store.SessionSummary{
+        .{
+            .session_id = "daemon-created-session",
+            .workspace_id = "ws-adopt-real",
+            .workspace_path = "/tmp/ws-adopt-real",
+            .cwd = "/tmp/ws-adopt-real",
+            .label = "shell",
+            .command = "bash",
+            .dock_id = 0,
+            .pane_id = 1,
+            .running = true,
+            .status = "running",
+        },
+        .{
+            .session_id = "daemon-missing-pane",
+            .workspace_id = "ws-adopt-real",
+            .workspace_path = "/tmp/ws-adopt-real",
+            .cwd = "/tmp/ws-adopt-real",
+            .label = "second shell",
+            .command = "bash",
+            .dock_id = 0,
+            .pane_id = 9,
+            .running = true,
+            .status = "running",
+        },
+        .{
+            .session_id = "daemon-missing-dock",
+            .workspace_id = "ws-adopt-real",
+            .workspace_path = "/tmp/ws-adopt-real",
+            .cwd = "/tmp/ws-adopt-real",
+            .label = "aux shell",
+            .command = "bash",
+            .dock_id = 7,
+            .pane_id = 4,
+            .running = true,
+            .status = "running",
+        },
+    };
     state.lifecycle.dirty = false;
     try state.applyDaemonProjectionRefresh(.{
         .snapshot = .{ .store_revision = 1, .workspaces = &initial_workspaces },
@@ -12165,14 +12429,43 @@ test "M5-P4 terminal adoption refresh crosses dirty gate and replaces id-less ro
     };
     state.project_controller.projects.items[0].selected_thread_index = 2;
     state.lifecycle.dirty = true;
-    chat_controller.markAdoptionTerminalRepairForTest("ws-adopt-real", "thread-adopt-real");
-    defer chat_controller.clearAdoptionRepairForTest("ws-adopt-real", "thread-adopt-real");
+    chat_controller.markAdoptionTerminalRepairForTest(&state, "ws-adopt-real", "thread-adopt-real", "adopt");
+    defer chat_controller.clearAdoptionRepairForTest("ws-adopt-real", "thread-adopt-real", "adopt");
+    try std.testing.expect(state.hasUnresolvedAdoptionRows());
+    state.flushDirtyNow();
+    try std.testing.expect(!state.lifecycle.flush_in_flight);
+    const mismatched_messages = [_]headless.store.Message{.{
+        .message_id = "turn:different:msg:0",
+        .role = "assistant",
+        .author = "Codex",
+        .body = "different durable row",
+    }};
+    const mismatched_threads = [_]headless.store.Thread{.{
+        .local_thread_id = "thread-adopt-real",
+        .title = "Adoption",
+        .messages = &mismatched_messages,
+    }};
+    const mismatched_workspaces = [_]headless.store.Workspace{.{
+        .workspace_id = "ws-adopt-real",
+        .label = "Adoption",
+        .path = "/tmp/ws-adopt-real",
+        .threads = &mismatched_threads,
+    }};
+    try std.testing.expectError(error.AdoptionRepairMismatch, state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 2, .workspaces = &mismatched_workspaces },
+        .store_revision = 2,
+        .envelope = .{ .instance_nonce = "adopt-real", .registry_revision = 2 },
+        .change_cursor = 2,
+    }));
+    const retained_after_mismatch = state.threadByLocalId("ws-adopt-real", "thread-adopt-real").?;
+    try std.testing.expectEqual(@as(usize, 2), retained_after_mismatch.messages.items.len);
+    try std.testing.expect(retained_after_mismatch.messages.items[1].message_id == null);
     try std.testing.expect(state.hasUnresolvedAdoptionRows());
     try state.applyDaemonProjectionRefresh(.{
         .snapshot = .{ .store_revision = 2, .workspaces = &refreshed_workspaces },
         .store_revision = 2,
         .envelope = .{ .instance_nonce = "adopt-real", .registry_revision = 2 },
-        .change_cursor = 2,
+        .change_cursor = 3,
         .sessions = &daemon_sessions,
     });
     const repaired = &state.project_controller.projects.items[0].threads.items[0];
@@ -12184,6 +12477,12 @@ test "M5-P4 terminal adoption refresh crosses dirty gate and replaces id-less ro
     const projected_session_id = state.project_controller.projects.items[0].terminal_dock.activeSessionId();
     try std.testing.expect(projected_session_id != null);
     try std.testing.expectEqualStrings("daemon-created-session", projected_session_id.?);
+    const missing_dock = state.project_controller.projects.items[0].terminalDockEntryById(7) orelse
+        return error.MissingMaterializedDaemonDock;
+    try std.testing.expectEqualStrings("daemon-missing-dock", missing_dock.dock.activeSessionId().?);
+    const base_layout = (try state.project_controller.projects.items[0].terminal_dock.persistedLayoutJson(allocator)).?;
+    defer allocator.free(base_layout);
+    try std.testing.expect(std.mem.indexOf(u8, base_layout, "daemon-missing-pane") != null);
     try std.testing.expect(!state.hasUnresolvedAdoptionRows());
 }
 
@@ -12280,10 +12579,11 @@ test "M5-P4 stale status covers saved bootstrap and clears after applied refresh
     try std.testing.expect(!projectionStaleAt(true, started_ms, applied_ms, applied_ms));
     // Exercise the same gate used by applyDaemonProjectionRefresh: neither an
     // in-flight capture nor unrebased dirty state may clear stale status.
-    try std.testing.expect(!projectionRefreshApplyGate(false, true, false, false));
-    try std.testing.expect(!projectionRefreshApplyGate(true, false, false, false));
-    try std.testing.expect(projectionRefreshApplyGate(true, false, true, false));
-    try std.testing.expect(projectionRefreshApplyGate(true, false, false, true));
+    try std.testing.expect(!projectionRefreshApplyGate(false, true, false, false, false));
+    try std.testing.expect(!projectionRefreshApplyGate(true, false, false, false, false));
+    try std.testing.expect(projectionRefreshApplyGate(true, false, true, false, false));
+    try std.testing.expect(projectionRefreshApplyGate(true, false, false, true, false));
+    try std.testing.expect(projectionRefreshApplyGate(true, false, false, false, true));
 }
 
 test "M5-P4 stale refresh is rejected by the actual transactional apply path" {

@@ -8,6 +8,7 @@ const app_config = @import("../app/config.zig");
 const bang_commands = @import("../workspace/bang_commands.zig");
 const chat_threads = @import("../chat/threads.zig");
 const db_client = @import("../db/client.zig");
+const db_types = @import("../db/types.zig");
 const notifier = @import("../app/notifier.zig");
 const runtime_log = @import("../runtime/log.zig");
 const sessionizer = @import("../terminal/sessionizer.zig");
@@ -20,6 +21,7 @@ const command_controller = @import("command_controller.zig");
 const herdr_types = @import("herdr_types.zig");
 const project_state = @import("project.zig");
 const provider_models = @import("provider_models.zig");
+const storage_mod = @import("storage.zig");
 const utils = @import("../utils.zig");
 
 const log = std.log.scoped(.native_shell);
@@ -2108,26 +2110,54 @@ fn applyDaemonChatTurnsSnapshotWithAllocator(
     turns: []const headless.store.TurnRecord,
     attachment_allocator: std.mem.Allocator,
 ) !void {
+    const PlannedAttachment = struct {
+        send_state: *SendState,
+        turn_id: ?[]u8,
+        started_at_ms: i64,
+        provider: Provider,
+    };
+    var planned: std.ArrayList(PlannedAttachment) = .empty;
+    defer {
+        for (planned.items) |attachment| {
+            if (attachment.turn_id) |turn_id| attachment_allocator.free(turn_id);
+        }
+        planned.deinit(attachment_allocator);
+    }
     for (turns) |turn| {
         if (std.mem.eql(u8, turn.status, "completed") or
             std.mem.eql(u8, turn.status, "failed") or
             std.mem.eql(u8, turn.status, "aborted")) continue;
         const thread = self.threadByLocalId(turn.workspace_id, turn.local_thread_id) orelse continue;
         const send_state = thread.send_state;
+        send_state.mutex.lock();
+        const eligible = send_state.status == .idle and !send_state.daemon_owned;
+        send_state.mutex.unlock();
+        if (!eligible) continue;
         const owned_turn_id = try attachment_allocator.dupe(u8, turn.turn_id);
+        planned.append(attachment_allocator, .{
+            .send_state = send_state,
+            .turn_id = owned_turn_id,
+            .started_at_ms = turn.started_at_ms,
+            .provider = thread.provider,
+        }) catch |err| {
+            attachment_allocator.free(owned_turn_id);
+            return err;
+        };
+    }
+    for (planned.items) |*attachment| {
+        const send_state = attachment.send_state;
         send_state.mutex.lock();
         if (send_state.status == .idle and !send_state.daemon_owned) {
             send_state.status = .pending;
-            send_state.started_at_ms = turn.started_at_ms;
-            send_state.provider = thread.provider;
-            send_state.daemon_turn_id = owned_turn_id;
+            send_state.started_at_ms = attachment.started_at_ms;
+            send_state.provider = attachment.provider;
+            send_state.daemon_turn_id = attachment.turn_id;
+            attachment.turn_id = null;
             send_state.daemon_last_seq = 0;
             send_state.daemon_last_poll_ms = -1;
             send_state.daemon_owned = true;
             send_state.ui_revision +%= 1;
             self.chat_controller.beginSend();
-        } else {
-            attachment_allocator.free(owned_turn_id);
         }
         send_state.mutex.unlock();
     }
@@ -2136,10 +2166,16 @@ fn applyDaemonChatTurnsSnapshotWithAllocator(
 const TerminalTurnConsumeArgs = struct {
     pref_path: []u8,
     turn_id: []u8,
+    reservation_key: []u8,
 };
 
-const TerminalConsumeState = enum { in_flight, completed };
+const TerminalConsumeStatus = enum { in_flight, completed, not_found };
+const TerminalConsumeState = struct {
+    status: TerminalConsumeStatus = .in_flight,
+    observation_cycles: u8 = 0,
+};
 const TerminalConsumeDisposition = enum { accepted, not_found };
+const TERMINAL_NOT_FOUND_RELEASE_CYCLES: u8 = 2;
 var terminal_consume_mutex: std.atomic.Mutex = .unlocked;
 var terminal_consume_turns: std.StringHashMapUnmanaged(TerminalConsumeState) = .empty;
 
@@ -2147,44 +2183,79 @@ fn lockTerminalConsumes() void {
     while (!terminal_consume_mutex.tryLock()) std.atomic.spinLoopHint();
 }
 
-fn reserveTerminalConsume(turn_id: []const u8) bool {
-    lockTerminalConsumes();
-    defer terminal_consume_mutex.unlock();
-    if (terminal_consume_turns.contains(turn_id)) return false;
-    const key = std.heap.page_allocator.dupe(u8, turn_id) catch return false;
-    terminal_consume_turns.put(std.heap.page_allocator, key, .in_flight) catch {
-        std.heap.page_allocator.free(key);
-        return false;
-    };
-    return true;
+fn terminalConsumeKeyAlloc(pref_path: []const u8, instance_nonce: []const u8, turn_id: []const u8) ?[]u8 {
+    return std.fmt.allocPrint(
+        std.heap.page_allocator,
+        "{s}\x1f{s}\x1f{s}",
+        .{ pref_path, instance_nonce, turn_id },
+    ) catch null;
 }
 
-fn finishTerminalConsume(turn_id: []const u8, completed: bool) void {
+fn reserveTerminalConsume(pref_path: []const u8, instance_nonce: []const u8, turn_id: []const u8) ?[]u8 {
+    const key = terminalConsumeKeyAlloc(pref_path, instance_nonce, turn_id) orelse return null;
     lockTerminalConsumes();
     defer terminal_consume_mutex.unlock();
-    if (completed) {
-        if (terminal_consume_turns.getPtr(turn_id)) |state| state.* = .completed;
-    } else if (terminal_consume_turns.fetchRemove(turn_id)) |entry| {
+    if (terminal_consume_turns.contains(key)) {
+        std.heap.page_allocator.free(key);
+        return null;
+    }
+    terminal_consume_turns.put(std.heap.page_allocator, key, .{}) catch {
+        std.heap.page_allocator.free(key);
+        return null;
+    };
+    return std.heap.page_allocator.dupe(u8, key) catch {
+        if (terminal_consume_turns.fetchRemove(key)) |entry| std.heap.page_allocator.free(entry.key);
+        return null;
+    };
+}
+
+fn finishTerminalConsume(reservation_key: []const u8, disposition: ?TerminalConsumeDisposition) void {
+    lockTerminalConsumes();
+    defer terminal_consume_mutex.unlock();
+    if (disposition) |value| {
+        if (terminal_consume_turns.getPtr(reservation_key)) |state| state.* = switch (value) {
+            .accepted => .{ .status = .completed },
+            .not_found => .{ .status = .not_found },
+        };
+    } else if (terminal_consume_turns.fetchRemove(reservation_key)) |entry| {
         std.heap.page_allocator.free(entry.key);
     }
 }
 
-fn pruneCompletedTerminalConsumes(turns: []const headless.store.TurnRecord) void {
+fn pruneCompletedTerminalConsumes(
+    pref_path: []const u8,
+    instance_nonce: []const u8,
+    turns: []const headless.store.TurnRecord,
+) void {
+    const pref_prefix = std.fmt.allocPrint(std.heap.page_allocator, "{s}\x1f", .{pref_path}) catch return;
+    defer std.heap.page_allocator.free(pref_prefix);
+    const instance_prefix = std.fmt.allocPrint(std.heap.page_allocator, "{s}\x1f{s}\x1f", .{ pref_path, instance_nonce }) catch return;
+    defer std.heap.page_allocator.free(instance_prefix);
     lockTerminalConsumes();
     defer terminal_consume_mutex.unlock();
     while (true) {
         var stale_key: ?[]const u8 = null;
         var iterator = terminal_consume_turns.iterator();
         while (iterator.next()) |entry| {
-            if (entry.value_ptr.* != .completed) continue;
+            if (!std.mem.startsWith(u8, entry.key_ptr.*, pref_prefix)) continue;
+            if (!std.mem.startsWith(u8, entry.key_ptr.*, instance_prefix)) {
+                stale_key = entry.key_ptr.*;
+                break;
+            }
+            if (entry.value_ptr.status == .in_flight) continue;
+            const turn_id = entry.key_ptr.*[instance_prefix.len..];
             var present = false;
             for (turns) |turn| {
-                if (std.mem.eql(u8, entry.key_ptr.*, turn.turn_id)) {
+                if (std.mem.eql(u8, turn_id, turn.turn_id)) {
                     present = true;
                     break;
                 }
             }
-            if (!present) {
+            if (entry.value_ptr.status == .not_found) entry.value_ptr.observation_cycles +|= 1;
+            if (!present or
+                (entry.value_ptr.status == .not_found and
+                    entry.value_ptr.observation_cycles >= TERMINAL_NOT_FOUND_RELEASE_CYCLES))
+            {
                 stale_key = entry.key_ptr.*;
                 break;
             }
@@ -2216,6 +2287,7 @@ fn consumeReconciledTerminalTurn(args: *TerminalTurnConsumeArgs) void {
     defer {
         std.heap.page_allocator.free(args.pref_path);
         std.heap.page_allocator.free(args.turn_id);
+        std.heap.page_allocator.free(args.reservation_key);
         std.heap.page_allocator.destroy(args);
     }
     const response = sessionizer.requestAlloc(
@@ -2226,26 +2298,28 @@ fn consumeReconciledTerminalTurn(args: *TerminalTurnConsumeArgs) void {
         6,
     ) catch |err| {
         log.warn("failed to consume reconciled chat turn {s}: {s}", .{ args.turn_id, @errorName(err) });
-        finishTerminalConsume(args.turn_id, false);
+        finishTerminalConsume(args.reservation_key, null);
         return;
     };
     defer std.heap.page_allocator.free(response);
     const disposition = terminalConsumeDisposition(response) catch |err| {
         log.warn("invalid consume result for reconciled chat turn {s}: {s}", .{ args.turn_id, @errorName(err) });
-        finishTerminalConsume(args.turn_id, false);
+        finishTerminalConsume(args.reservation_key, null);
         return;
     };
     if (disposition == .not_found) {
         log.debug("reconciled chat turn {s} was already consumed", .{args.turn_id});
     }
-    finishTerminalConsume(args.turn_id, true);
+    finishTerminalConsume(args.reservation_key, disposition);
 }
 
 /// Bounded reconnect presentation for terminal rows already carried by the
 /// cursor worker. Failure status/error is shown locally; retention cleanup is
 /// dispatched asynchronously so the SDL frame performs no daemon I/O.
 pub fn reconcileTerminalDaemonChatTurnsSnapshot(self: anytype, turns: []const headless.store.TurnRecord) void {
-    pruneCompletedTerminalConsumes(turns);
+    const instance_nonce = self.storage.currentInstanceNonceAlloc(std.heap.page_allocator) catch return;
+    defer std.heap.page_allocator.free(instance_nonce);
+    pruneCompletedTerminalConsumes(self.storage.pref_path, instance_nonce, turns);
     for (turns) |turn| {
         const terminal = std.mem.eql(u8, turn.status, "completed") or
             std.mem.eql(u8, turn.status, "failed") or
@@ -2259,37 +2333,70 @@ pub fn reconcileTerminalDaemonChatTurnsSnapshot(self: anytype, turns: []const he
             );
             self.setSidebarNotice("A chat reply failed while Verde was closed.");
         }
-        if (!reserveTerminalConsume(turn.turn_id)) continue;
+        const reservation_key = reserveTerminalConsume(self.storage.pref_path, instance_nonce, turn.turn_id) orelse continue;
         const args = std.heap.page_allocator.create(TerminalTurnConsumeArgs) catch {
-            finishTerminalConsume(turn.turn_id, false);
+            finishTerminalConsume(reservation_key, null);
+            std.heap.page_allocator.free(reservation_key);
             continue;
         };
         args.* = .{
             .pref_path = std.heap.page_allocator.dupe(u8, self.storage.pref_path) catch {
                 std.heap.page_allocator.destroy(args);
-                finishTerminalConsume(turn.turn_id, false);
+                finishTerminalConsume(reservation_key, null);
+                std.heap.page_allocator.free(reservation_key);
                 continue;
             },
             .turn_id = undefined,
+            .reservation_key = reservation_key,
         };
         args.turn_id = std.heap.page_allocator.dupe(u8, turn.turn_id) catch {
             std.heap.page_allocator.free(args.pref_path);
             std.heap.page_allocator.destroy(args);
-            finishTerminalConsume(turn.turn_id, false);
+            finishTerminalConsume(reservation_key, null);
+            std.heap.page_allocator.free(reservation_key);
             continue;
         };
         const worker = std.Thread.spawn(.{}, consumeReconciledTerminalTurn, .{args}) catch {
+            finishTerminalConsume(reservation_key, null);
             std.heap.page_allocator.free(args.pref_path);
             std.heap.page_allocator.free(args.turn_id);
+            std.heap.page_allocator.free(args.reservation_key);
             std.heap.page_allocator.destroy(args);
-            finishTerminalConsume(turn.turn_id, false);
             continue;
         };
         worker.detach();
     }
 }
 
-test "M5-P4 live-turn attachment allocation failure aborts staging" {
+/// Production teardown for process-global repair and consume reservations.
+/// Detached consume workers own their request arguments; a late completion
+/// safely observes that its reservation was already removed.
+pub fn deinitProcessGlobalState(pref_path: []const u8) void {
+    deinitAdoptionRepairs();
+    const prefix = std.fmt.allocPrint(std.heap.page_allocator, "{s}\x1f", .{pref_path}) catch return;
+    defer std.heap.page_allocator.free(prefix);
+    lockTerminalConsumes();
+    defer terminal_consume_mutex.unlock();
+    while (true) {
+        var iterator = terminal_consume_turns.iterator();
+        var found: ?[]const u8 = null;
+        while (iterator.next()) |entry| {
+            if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
+                found = entry.key_ptr.*;
+                break;
+            }
+        }
+        const key = found orelse break;
+        const removed = terminal_consume_turns.fetchRemove(key) orelse continue;
+        std.heap.page_allocator.free(removed.key);
+    }
+    if (terminal_consume_turns.count() == 0) {
+        terminal_consume_turns.deinit(std.heap.page_allocator);
+        terminal_consume_turns = .empty;
+    }
+}
+
+test "M5-P4 live-turn attachment allocation failure sweeps staged attachment indices" {
     const allocator = std.testing.allocator;
     var thread = try ChatThread.init(allocator, "fallible attachment");
     defer thread.deinit(allocator);
@@ -2306,22 +2413,35 @@ test "M5-P4 live-turn attachment allocation failure aborts staging" {
         }
     };
     var state: AttachState = .{ .thread = &thread };
-    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
-    const turns = [_]headless.store.TurnRecord{.{
-        .turn_id = "turn-fallible",
-        .workspace_id = "ws-fallible",
-        .local_thread_id = "thread-fallible",
-        .status = "running",
-        .started_at_ms = 1,
-        .provider = "codex",
-    }};
-    try std.testing.expectError(
-        error.OutOfMemory,
-        applyDaemonChatTurnsSnapshotWithAllocator(&state, &turns, failing.allocator()),
-    );
-    try std.testing.expectEqual(SendStatus.idle, thread.send_state.status);
-    try std.testing.expect(thread.send_state.daemon_turn_id == null);
-    try std.testing.expectEqual(@as(usize, 0), state.chat_controller.pending_send_count);
+    const turns = [_]headless.store.TurnRecord{
+        .{
+            .turn_id = "turn-fallible-1",
+            .workspace_id = "ws-fallible",
+            .local_thread_id = "thread-fallible",
+            .status = "running",
+            .started_at_ms = 1,
+            .provider = "codex",
+        },
+        .{
+            .turn_id = "turn-fallible-2",
+            .workspace_id = "ws-fallible",
+            .local_thread_id = "thread-fallible",
+            .status = "running",
+            .started_at_ms = 2,
+            .provider = "codex",
+        },
+    };
+    for (0..3) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        try std.testing.expectError(
+            error.OutOfMemory,
+            applyDaemonChatTurnsSnapshotWithAllocator(&state, &turns, failing.allocator()),
+        );
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(SendStatus.idle, thread.send_state.status);
+        try std.testing.expect(thread.send_state.daemon_turn_id == null);
+        try std.testing.expectEqual(@as(usize, 0), state.chat_controller.pending_send_count);
+    }
 }
 
 test "M5-P4 reconnect consume deduplicates and validates accepted or not_found" {
@@ -2333,14 +2453,15 @@ test "M5-P4 reconnect consume deduplicates and validates accepted or not_found" 
         terminal_consume_turns.deinit(std.heap.page_allocator);
         terminal_consume_turns = .empty;
     }
-    try std.testing.expect(reserveTerminalConsume("turn-consume"));
-    try std.testing.expect(!reserveTerminalConsume("turn-consume"));
+    const reservation = reserveTerminalConsume("/profile-a", "nonce-a", "turn-consume").?;
+    defer std.heap.page_allocator.free(reservation);
+    try std.testing.expect(reserveTerminalConsume("/profile-a", "nonce-a", "turn-consume") == null);
     try std.testing.expectEqual(
         TerminalConsumeDisposition.accepted,
         try terminalConsumeDisposition("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"accepted\":true}}"),
     );
-    finishTerminalConsume("turn-consume", true);
-    try std.testing.expect(!reserveTerminalConsume("turn-consume"));
+    finishTerminalConsume(reservation, .accepted);
+    try std.testing.expect(reserveTerminalConsume("/profile-a", "nonce-a", "turn-consume") == null);
     try std.testing.expectEqual(
         TerminalConsumeDisposition.not_found,
         try terminalConsumeDisposition("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":\"not_found\",\"message\":\"gone\"}}"),
@@ -2349,6 +2470,24 @@ test "M5-P4 reconnect consume deduplicates and validates accepted or not_found" 
         error.InvalidDaemonResponse,
         terminalConsumeDisposition("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"accepted\":false}}"),
     );
+    const turns = [_]headless.store.TurnRecord{.{
+        .turn_id = "turn-consume",
+        .workspace_id = "ws",
+        .local_thread_id = "thread",
+        .status = "completed",
+        .started_at_ms = 1,
+        .provider = "codex",
+    }};
+    pruneCompletedTerminalConsumes("/profile-a", "nonce-b", &turns);
+    const restarted = reserveTerminalConsume("/profile-a", "nonce-b", "turn-consume").?;
+    defer std.heap.page_allocator.free(restarted);
+    finishTerminalConsume(restarted, .not_found);
+    pruneCompletedTerminalConsumes("/profile-a", "nonce-b", &turns);
+    try std.testing.expect(reserveTerminalConsume("/profile-a", "nonce-b", "turn-consume") == null);
+    pruneCompletedTerminalConsumes("/profile-a", "nonce-b", &turns);
+    const retried = reserveTerminalConsume("/profile-a", "nonce-b", "turn-consume").?;
+    defer std.heap.page_allocator.free(retried);
+    finishTerminalConsume(retried, null);
 }
 
 pub fn threadByLocalId(self: anytype, workspace_id: []const u8, local_thread_id: []const u8) ?*ChatThread {
@@ -3573,7 +3712,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
                 // one, the frame-loop debounce, title-generation completion,
                 // provider_thread_id capture, bang-command start, and the
                 // close-time blocking flush are all safe by construction.
-                if (completed_daemon_turn_id != null) adoptDaemonTranscriptIdentitiesWithRetry(self, project_index, thread);
+                if (completed_daemon_turn_id) |turn_id| adoptDaemonTranscriptIdentitiesWithRetry(self, project_index, thread, turn_id);
                 self.flushDirtyNow();
                 // Consume is a retention hint only (daemon already committed).
                 self.consumeDaemonChatTurn(completed_daemon_turn_id);
@@ -3593,7 +3732,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             }
             // M4-P4 fix: identity-preserving flush — adopt ids (failed turns
             // also commit durably), then flush without gating.
-            if (completed_daemon_turn_id != null) adoptDaemonTranscriptIdentitiesWithRetry(self, project_index, thread);
+            if (completed_daemon_turn_id) |turn_id| adoptDaemonTranscriptIdentitiesWithRetry(self, project_index, thread, turn_id);
             self.flushDirtyNow();
             self.consumeDaemonChatTurn(completed_daemon_turn_id);
         },
@@ -3624,7 +3763,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             self.setSidebarNotice(if (completed_local_command) "Workspace command cancelled." else "Provider reply stopped.");
             // M4-P4 fix: identity-preserving flush — adopt ids (aborted turns
             // also commit durably), then flush without gating.
-            if (completed_daemon_turn_id != null) adoptDaemonTranscriptIdentitiesWithRetry(self, project_index, thread);
+            if (completed_daemon_turn_id) |turn_id| adoptDaemonTranscriptIdentitiesWithRetry(self, project_index, thread, turn_id);
             self.flushDirtyNow();
             self.consumeDaemonChatTurn(completed_daemon_turn_id);
         },
@@ -3763,7 +3902,7 @@ fn adoptTranscriptIdentitiesFromStoreMessages(
 // flush then persisted id-less `snap-msg` copies of daemon content while the
 // store belt restored the `turn:%` twins — permanent duplication on reopen.
 // Adoption is idempotent, so incomplete attempts are queued here (keyed by
-// workspace+thread ids) and retried on later pollSend ticks until complete.
+// workspace+thread+turn ids) and retried on later pollSend ticks until complete.
 // Main-thread-only, matching the ownership rule for `thread.messages`; keys
 // use page_allocator so no per-controller allocator outlives its owner.
 // Snapshot persistence is gated while a covered row is still id-less.
@@ -3782,20 +3921,79 @@ const ADOPTION_RETRY_MAX_ATTEMPTS: u32 = 100;
 const ADOPTION_RETRY_LOG_EVERY: u32 = 10;
 const ADOPTION_RETRY_KEY_SEPARATOR: u8 = 0x1f;
 
+const AdoptionExpectedRow = struct {
+    row_index: usize,
+    role: provider_models.ChatRole,
+    author: []u8,
+    body: []u8,
+
+    fn deinit(self: *AdoptionExpectedRow) void {
+        std.heap.page_allocator.free(self.author);
+        std.heap.page_allocator.free(self.body);
+    }
+};
+
 const AdoptionRetryState = struct {
     attempts: u32 = 0,
     next_retry_at_ms: i64 = 0,
     terminal_failed: bool = false,
+    turn_id: []u8,
+    rows: std.ArrayList(AdoptionExpectedRow) = .empty,
+
+    fn init(turn_id: []const u8, thread: *const ChatThread) !AdoptionRetryState {
+        var state: AdoptionRetryState = .{ .turn_id = try std.heap.page_allocator.dupe(u8, turn_id) };
+        errdefer state.deinit();
+        for (thread.messages.items, 0..) |message, row_index| {
+            if (message.message_id != null) continue;
+            var row: AdoptionExpectedRow = .{
+                .row_index = row_index,
+                .role = message.role,
+                .author = try std.heap.page_allocator.dupe(u8, message.author),
+                .body = undefined,
+            };
+            var row_owned = true;
+            errdefer if (row_owned) std.heap.page_allocator.free(row.author);
+            row.body = try std.heap.page_allocator.dupe(u8, message.body);
+            errdefer if (row_owned) std.heap.page_allocator.free(row.body);
+            try state.rows.append(std.heap.page_allocator, row);
+            row_owned = false;
+        }
+        return state;
+    }
+
+    fn deinit(self: *AdoptionRetryState) void {
+        for (self.rows.items) |*row| row.deinit();
+        self.rows.deinit(std.heap.page_allocator);
+        std.heap.page_allocator.free(self.turn_id);
+    }
 };
 
 var adoption_retry_pending: std.StringHashMapUnmanaged(AdoptionRetryState) = .empty;
 
-fn adoptionRetryKeyAlloc(workspace_id: []const u8, local_thread_id: []const u8) ?[]u8 {
-    return std.fmt.allocPrint(std.heap.page_allocator, "{s}\x1f{s}", .{ workspace_id, local_thread_id }) catch null;
+fn adoptionRetryKeyAlloc(workspace_id: []const u8, local_thread_id: []const u8, turn_id: []const u8) ?[]u8 {
+    return std.fmt.allocPrint(std.heap.page_allocator, "{s}\x1f{s}\x1f{s}", .{ workspace_id, local_thread_id, turn_id }) catch null;
 }
 
-fn markAdoptionPending(workspace_id: []const u8, local_thread_id: []const u8) void {
-    const key = adoptionRetryKeyAlloc(workspace_id, local_thread_id) orelse return;
+const AdoptionRetryKeyParts = struct {
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    turn_id: []const u8,
+};
+
+fn adoptionRetryKeyParts(key: []const u8) ?AdoptionRetryKeyParts {
+    const first = std.mem.indexOfScalar(u8, key, ADOPTION_RETRY_KEY_SEPARATOR) orelse return null;
+    const tail = key[first + 1 ..];
+    const second_relative = std.mem.indexOfScalar(u8, tail, ADOPTION_RETRY_KEY_SEPARATOR) orelse return null;
+    const second = first + 1 + second_relative;
+    return .{
+        .workspace_id = key[0..first],
+        .local_thread_id = key[first + 1 .. second],
+        .turn_id = key[second + 1 ..],
+    };
+}
+
+fn markAdoptionPending(workspace_id: []const u8, thread: *const ChatThread, turn_id: []const u8) void {
+    const key = adoptionRetryKeyAlloc(workspace_id, thread.local_thread_id, turn_id) orelse return;
     const gop = adoption_retry_pending.getOrPut(std.heap.page_allocator, key) catch {
         std.heap.page_allocator.free(key);
         return;
@@ -3803,7 +4001,11 @@ fn markAdoptionPending(workspace_id: []const u8, local_thread_id: []const u8) vo
     if (gop.found_existing) {
         std.heap.page_allocator.free(key);
     } else {
-        gop.value_ptr.* = .{};
+        gop.value_ptr.* = AdoptionRetryState.init(turn_id, thread) catch {
+            _ = adoption_retry_pending.remove(key);
+            std.heap.page_allocator.free(key);
+            return;
+        };
     }
     gop.value_ptr.attempts +|= 1;
     const attempts = gop.value_ptr.attempts;
@@ -3816,12 +4018,12 @@ fn markAdoptionPending(workspace_id: []const u8, local_thread_id: []const u8) vo
         if (builtin.is_test) {
             log.warn(
                 "transcript identity adoption for {s} entered terminal repair after {d} attempts",
-                .{ local_thread_id, attempts },
+                .{ thread.local_thread_id, attempts },
             );
         } else {
             log.err(
                 "transcript identity adoption for {s} entered terminal repair after {d} attempts",
-                .{ local_thread_id, attempts },
+                .{ thread.local_thread_id, attempts },
             );
         }
         gop.value_ptr.terminal_failed = true;
@@ -3834,25 +4036,28 @@ fn markAdoptionPending(workspace_id: []const u8, local_thread_id: []const u8) vo
     if (attempts > 1 and attempts % ADOPTION_RETRY_LOG_EVERY == 0) {
         log.warn(
             "daemon transcript identity adoption still incomplete for {s} after {d} attempts; retrying",
-            .{ local_thread_id, attempts },
+            .{ thread.local_thread_id, attempts },
         );
     }
 }
 
-fn clearAdoptionPending(workspace_id: []const u8, local_thread_id: []const u8) void {
-    const key = adoptionRetryKeyAlloc(workspace_id, local_thread_id) orelse return;
+fn clearAdoptionPending(workspace_id: []const u8, local_thread_id: []const u8, turn_id: []const u8) void {
+    const key = adoptionRetryKeyAlloc(workspace_id, local_thread_id, turn_id) orelse return;
     defer std.heap.page_allocator.free(key);
     if (adoption_retry_pending.fetchRemove(key)) |entry| {
+        var state = entry.value;
+        state.deinit();
         std.heap.page_allocator.free(entry.key);
     }
 }
 
 /// Test seam for the real dirty-gate/adoption-refresh path. Production creates
 /// this state only through the bounded retry pump above.
-pub fn markAdoptionTerminalRepairForTest(workspace_id: []const u8, local_thread_id: []const u8) void {
+pub fn markAdoptionTerminalRepairForTest(self: anytype, workspace_id: []const u8, local_thread_id: []const u8, turn_id: []const u8) void {
     std.debug.assert(builtin.is_test);
-    markAdoptionPending(workspace_id, local_thread_id);
-    const key = adoptionRetryKeyAlloc(workspace_id, local_thread_id) orelse return;
+    const thread = retryAdoptionThreadByLocalId(self, workspace_id, local_thread_id) orelse return;
+    markAdoptionPending(workspace_id, thread, turn_id);
+    const key = adoptionRetryKeyAlloc(workspace_id, local_thread_id, turn_id) orelse return;
     defer std.heap.page_allocator.free(key);
     const entry = adoption_retry_pending.getPtr(key) orelse return;
     entry.attempts = ADOPTION_RETRY_MAX_ATTEMPTS;
@@ -3860,59 +4065,186 @@ pub fn markAdoptionTerminalRepairForTest(workspace_id: []const u8, local_thread_
     entry.next_retry_at_ms = std.math.maxInt(i64);
 }
 
-pub fn clearAdoptionRepairForTest(workspace_id: []const u8, local_thread_id: []const u8) void {
+pub fn clearAdoptionRepairForTest(workspace_id: []const u8, local_thread_id: []const u8, turn_id: []const u8) void {
     std.debug.assert(builtin.is_test);
-    clearAdoptionPending(workspace_id, local_thread_id);
+    clearAdoptionPending(workspace_id, local_thread_id, turn_id);
 }
 
-/// True only when a pending/terminal adoption repair still covers an id-less
-/// transcript row. Lifecycle persistence calls this before capture so it can
-/// never mint a `snap-msg-*` twin for daemon-owned content.
+/// True while any turn-bound adoption marker owns unresolved correspondence.
+/// Lifecycle persistence calls this before capture so it can never mint a
+/// `snap-msg-*` twin for daemon-owned content.
 pub fn hasUnresolvedAdoptionRows(self: anytype) bool {
+    _ = self;
+    var iterator = adoption_retry_pending.iterator();
+    return iterator.next() != null;
+}
+
+/// Prove every covered local row has the matching durable turn identity before
+/// projection ownership can swap. A different all-identified transcript is
+/// not satisfaction and must leave both the live rows and marker untouched.
+pub fn validateAdoptionRepairsForRefresh(_: anytype, persisted: db_types.PersistedState) !void {
     var iterator = adoption_retry_pending.iterator();
     while (iterator.next()) |entry| {
-        const key = entry.key_ptr.*;
-        const separator = std.mem.indexOfScalar(u8, key, ADOPTION_RETRY_KEY_SEPARATOR) orelse continue;
-        const workspace_id = key[0..separator];
-        const local_thread_id = key[separator + 1 ..];
-        const thread = retryAdoptionThreadByLocalId(self, workspace_id, local_thread_id) orelse continue;
-        for (thread.messages.items) |message| {
-            if (message.message_id == null) return true;
+        const parts = adoptionRetryKeyParts(entry.key_ptr.*) orelse return error.InvalidAdoptionRepairKey;
+        const project = blk: {
+            for (persisted.projects) |candidate| {
+                const id = candidate.id orelse continue;
+                if (std.mem.eql(u8, id, parts.workspace_id)) break :blk candidate;
+            }
+            return error.AdoptionRepairMismatch;
+        };
+        const thread = blk: {
+            for (project.threads orelse &.{}) |candidate| {
+                const id = candidate.local_thread_id orelse continue;
+                if (std.mem.eql(u8, id, parts.local_thread_id)) break :blk candidate;
+            }
+            return error.AdoptionRepairMismatch;
+        };
+        for (entry.value_ptr.rows.items) |expected| {
+            if (expected.row_index >= thread.messages.len) return error.AdoptionRepairMismatch;
+            const durable = thread.messages[expected.row_index];
+            const message_id = durable.message_id orelse return error.AdoptionRepairMismatch;
+            if (!messageIdBelongsToTurn(message_id, parts.turn_id) or
+                durable.role != expected.role or
+                !std.mem.eql(u8, durable.author, expected.author) or
+                !std.mem.eql(u8, durable.body, expected.body)) return error.AdoptionRepairMismatch;
         }
     }
-    return false;
 }
 
-/// Cursor snapshots carry durable message identities directly. Once every row
-/// in a re-read thread is identified, clear any retry/terminal-repair marker;
-/// id-less rows deliberately keep their marker and remain visibly unresolved.
-pub fn clearSatisfiedAdoptionRepairs(self: anytype) void {
-    for (self.project_controller.projects.items) |*project| {
-        clearSatisfiedProjectAdoptionRepairs(project);
+fn messageIdBelongsToTurn(message_id: []const u8, turn_id: []const u8) bool {
+    const prefix = "turn:";
+    if (!std.mem.startsWith(u8, message_id, prefix)) return false;
+    const tail = message_id[prefix.len..];
+    return tail.len > turn_id.len and
+        std.mem.eql(u8, tail[0..turn_id.len], turn_id) and
+        tail[turn_id.len] == ':';
+}
+
+fn adoptionRepairSatisfiedByLiveThread(
+    workspace_id: []const u8,
+    thread: *const ChatThread,
+    turn_id: []const u8,
+) bool {
+    const key = adoptionRetryKeyAlloc(workspace_id, thread.local_thread_id, turn_id) orelse return false;
+    defer std.heap.page_allocator.free(key);
+    const repair = adoption_retry_pending.get(key) orelse return false;
+    for (repair.rows.items) |expected| {
+        if (expected.row_index >= thread.messages.items.len) return false;
+        const row = thread.messages.items[expected.row_index];
+        const message_id = row.message_id orelse return false;
+        if (!messageIdBelongsToTurn(message_id, turn_id) or
+            row.role != expected.role or
+            !std.mem.eql(u8, row.author, expected.author) or
+            !std.mem.eql(u8, row.body, expected.body)) return false;
     }
-    for (self.project_controller.archived_projects.items) |*project| {
-        clearSatisfiedProjectAdoptionRepairs(project);
+    return true;
+}
+
+/// Called only after validation, all fallible staging, and the ownership swap.
+pub fn clearValidatedAdoptionRepairs(_: anytype) void {
+    while (true) {
+        var iterator = adoption_retry_pending.iterator();
+        const entry = iterator.next() orelse return;
+        const removed = adoption_retry_pending.fetchRemove(entry.key_ptr.*) orelse continue;
+        var state = removed.value;
+        state.deinit();
+        std.heap.page_allocator.free(removed.key);
     }
 }
 
-fn clearSatisfiedProjectAdoptionRepairs(project: anytype) void {
-    for (project.threads.items) |*thread| clearSatisfiedThreadAdoptionRepair(project.id, thread);
-    for (project.archived_threads.items) |*thread| clearSatisfiedThreadAdoptionRepair(project.id, thread);
+pub fn pendingAdoptionRepairsSnapshot(
+    _: anytype,
+    allocator: std.mem.Allocator,
+) ![]const storage_mod.PendingAdoptionRepair {
+    const repairs = try allocator.alloc(storage_mod.PendingAdoptionRepair, adoption_retry_pending.count());
+    var repair_index: usize = 0;
+    var iterator = adoption_retry_pending.iterator();
+    while (iterator.next()) |entry| : (repair_index += 1) {
+        const parts = adoptionRetryKeyParts(entry.key_ptr.*) orelse return error.InvalidAdoptionRepairKey;
+        const rows = try allocator.alloc(storage_mod.PendingAdoptionRow, entry.value_ptr.rows.items.len);
+        for (entry.value_ptr.rows.items, rows) |expected, *row| {
+            row.* = .{
+                .row_index = expected.row_index,
+                .role = expected.role,
+                .author = try allocator.dupe(u8, expected.author),
+                .body = try allocator.dupe(u8, expected.body),
+            };
+        }
+        repairs[repair_index] = .{
+            .workspace_id = try allocator.dupe(u8, parts.workspace_id),
+            .local_thread_id = try allocator.dupe(u8, parts.local_thread_id),
+            .turn_id = try allocator.dupe(u8, parts.turn_id),
+            .rows = rows,
+        };
+    }
+    return repairs;
 }
 
-fn clearSatisfiedThreadAdoptionRepair(workspace_id: []const u8, thread: *ChatThread) void {
-    for (thread.messages.items) |message| if (message.message_id == null) return;
-    clearAdoptionPending(workspace_id, thread.local_thread_id);
+pub fn restorePendingAdoptionRepairs(repairs: []const storage_mod.PendingAdoptionRepair) !void {
+    for (repairs) |repair| {
+        const key = adoptionRetryKeyAlloc(repair.workspace_id, repair.local_thread_id, repair.turn_id) orelse
+            return error.OutOfMemory;
+        if (adoption_retry_pending.contains(key)) {
+            std.heap.page_allocator.free(key);
+            continue;
+        }
+        var key_owned = true;
+        errdefer if (key_owned) std.heap.page_allocator.free(key);
+        var state: AdoptionRetryState = .{
+            .attempts = ADOPTION_RETRY_MAX_ATTEMPTS,
+            .next_retry_at_ms = std.math.maxInt(i64),
+            .terminal_failed = true,
+            .turn_id = try std.heap.page_allocator.dupe(u8, repair.turn_id),
+        };
+        var state_owned = true;
+        errdefer if (state_owned) state.deinit();
+        for (repair.rows) |source| {
+            var row: AdoptionExpectedRow = .{
+                .row_index = source.row_index,
+                .role = source.role,
+                .author = try std.heap.page_allocator.dupe(u8, source.author),
+                .body = undefined,
+            };
+            var row_owned = true;
+            errdefer if (row_owned) std.heap.page_allocator.free(row.author);
+            row.body = try std.heap.page_allocator.dupe(u8, source.body);
+            errdefer if (row_owned) std.heap.page_allocator.free(row.body);
+            try state.rows.append(std.heap.page_allocator, row);
+            row_owned = false;
+        }
+        adoption_retry_pending.put(std.heap.page_allocator, key, state) catch |err| {
+            return err;
+        };
+        key_owned = false;
+        state_owned = false;
+    }
+}
+
+fn deinitAdoptionRepairs() void {
+    while (true) {
+        var iterator = adoption_retry_pending.iterator();
+        const entry = iterator.next() orelse break;
+        const removed = adoption_retry_pending.fetchRemove(entry.key_ptr.*) orelse continue;
+        var state = removed.value;
+        state.deinit();
+        std.heap.page_allocator.free(removed.key);
+    }
+    adoption_retry_pending.deinit(std.heap.page_allocator);
+    adoption_retry_pending = .empty;
 }
 
 /// Terminal-tick entry: run adoption and queue a retry when incomplete.
 /// Never blocks or gates the caller's flush.
-fn adoptDaemonTranscriptIdentitiesWithRetry(self: anytype, project_index: usize, thread: *ChatThread) void {
+fn adoptDaemonTranscriptIdentitiesWithRetry(self: anytype, project_index: usize, thread: *ChatThread, turn_id: []const u8) void {
     if (project_index >= self.project_controller.projects.items.len) return;
     const workspace_id = self.project_controller.projects.items[project_index].id;
     switch (adoptDaemonTranscriptIdentities(self, project_index, thread)) {
-        .complete => clearAdoptionPending(workspace_id, thread.local_thread_id),
-        .incomplete => markAdoptionPending(workspace_id, thread.local_thread_id),
+        .complete => if (adoptionRepairSatisfiedByLiveThread(workspace_id, thread, turn_id))
+            clearAdoptionPending(workspace_id, thread.local_thread_id, turn_id),
+        // Capture only the rows left id-less by this turn's partial adoption;
+        // already-adopted history is outside this marker's correspondence set.
+        .incomplete => markAdoptionPending(workspace_id, thread, turn_id),
     }
 }
 
@@ -3957,29 +4289,35 @@ fn retryPendingAdoptions(self: anytype) bool {
         }
     }
     const key = due_key orelse return false;
-    const separator = std.mem.indexOfScalar(u8, key, ADOPTION_RETRY_KEY_SEPARATOR) orelse {
-        if (adoption_retry_pending.fetchRemove(key)) |entry| std.heap.page_allocator.free(entry.key);
+    const parts = adoptionRetryKeyParts(key) orelse {
+        if (adoption_retry_pending.fetchRemove(key)) |entry| {
+            var state = entry.value;
+            state.deinit();
+            std.heap.page_allocator.free(entry.key);
+        }
         return false;
     };
-    const workspace_id = key[0..separator];
-    const local_thread_id = key[separator + 1 ..];
     // M5-P4 Amendment 2: the lookup must also reach archived threads and
     // archived workspaces — archiving preserves the rows, so dropping the
     // entry here used to leave them id-less forever (permanent duplication
     // once the store belt restored the identity twins on unarchive).
-    const thread = retryAdoptionThreadByLocalId(self, workspace_id, local_thread_id) orelse {
+    const thread = retryAdoptionThreadByLocalId(self, parts.workspace_id, parts.local_thread_id) orelse {
         // Thread deleted everywhere (live, archived, archived workspace):
         // nothing left to adopt.
-        clearAdoptionPending(workspace_id, local_thread_id);
+        clearAdoptionPending(parts.workspace_id, parts.local_thread_id, parts.turn_id);
         return false;
     };
-    switch (adoptDaemonTranscriptIdentitiesByWorkspaceId(self, workspace_id, thread)) {
+    switch (adoptDaemonTranscriptIdentitiesByWorkspaceId(self, parts.workspace_id, thread)) {
         .complete => {
-            clearAdoptionPending(workspace_id, local_thread_id);
-            return true;
+            if (adoptionRepairSatisfiedByLiveThread(parts.workspace_id, thread, parts.turn_id)) {
+                clearAdoptionPending(parts.workspace_id, parts.local_thread_id, parts.turn_id);
+                return true;
+            }
+            markAdoptionPending(parts.workspace_id, thread, parts.turn_id);
+            return false;
         },
         .incomplete => {
-            markAdoptionPending(workspace_id, local_thread_id);
+            markAdoptionPending(parts.workspace_id, thread, parts.turn_id);
             return false;
         },
     }
@@ -4054,26 +4392,19 @@ test "M4-P5 amendment: incomplete adoption retries to a single identity set" {
 
     // Registry mechanics: repeated incomplete outcomes accumulate one entry
     // with a bounded attempt counter; completion clears it.
-    markAdoptionPending("ws-adopt-test", "thread-adopt-test");
-    markAdoptionPending("ws-adopt-test", "thread-adopt-test");
-    const key = adoptionRetryKeyAlloc("ws-adopt-test", "thread-adopt-test").?;
+    markAdoptionPending("ws-adopt-test", &thread, "turn-adopt-test");
+    markAdoptionPending("ws-adopt-test", &thread, "turn-adopt-test");
+    const key = adoptionRetryKeyAlloc("ws-adopt-test", thread.local_thread_id, "turn-adopt-test").?;
     defer std.heap.page_allocator.free(key);
     try std.testing.expectEqual(@as(u32, 2), adoption_retry_pending.get(key).?.attempts);
-    clearAdoptionPending("ws-adopt-test", "thread-adopt-test");
+    clearAdoptionPending("ws-adopt-test", thread.local_thread_id, "turn-adopt-test");
     try std.testing.expect(adoption_retry_pending.get(key) == null);
 }
 
 test "M5-P4 amendment 2: retry pump backs off, reaches archived threads, and gives up loudly" {
     const allocator = std.testing.allocator;
-    const storage_mod = @import("storage.zig");
-
     // Global-registry hygiene: leave nothing behind for other tests.
-    defer while (true) {
-        var leftover = adoption_retry_pending.iterator();
-        const entry = leftover.next() orelse break;
-        const removed = adoption_retry_pending.fetchRemove(entry.key_ptr.*).?;
-        std.heap.page_allocator.free(removed.key);
-    };
+    defer deinitAdoptionRepairs();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4144,15 +4475,15 @@ test "M5-P4 amendment 2: retry pump backs off, reaches archived threads, and giv
     try state.project_controller.archived_projects.append(allocator, archived_project);
 
     const forceDue = struct {
-        fn run(workspace_id: []const u8, local_thread_id: []const u8) !void {
-            const key = adoptionRetryKeyAlloc(workspace_id, local_thread_id).?;
+        fn run(workspace_id: []const u8, local_thread_id: []const u8, turn_id: []const u8) !void {
+            const key = adoptionRetryKeyAlloc(workspace_id, local_thread_id, turn_id).?;
             defer std.heap.page_allocator.free(key);
             adoption_retry_pending.getPtr(key).?.next_retry_at_ms = 0;
         }
     }.run;
     const entryState = struct {
-        fn run(workspace_id: []const u8, local_thread_id: []const u8) !?AdoptionRetryState {
-            const key = adoptionRetryKeyAlloc(workspace_id, local_thread_id).?;
+        fn run(workspace_id: []const u8, local_thread_id: []const u8, turn_id: []const u8) !?AdoptionRetryState {
+            const key = adoptionRetryKeyAlloc(workspace_id, local_thread_id, turn_id).?;
             defer std.heap.page_allocator.free(key);
             return if (adoption_retry_pending.get(key)) |value| value else null;
         }
@@ -4160,41 +4491,43 @@ test "M5-P4 amendment 2: retry pump backs off, reaches archived threads, and giv
 
     // Arm 1 — live thread, growing backoff: each failed pump attempt doubles
     // the next-retry delay (1s base, shift by attempts-1).
-    markAdoptionPending("retry-ws", "thread-live");
-    try forceDue("retry-ws", "thread-live");
+    markAdoptionPending("retry-ws", &state.project_controller.projects.items[0].threads.items[0], "turn-live");
+    try forceDue("retry-ws", "thread-live", "turn-live");
     try std.testing.expect(!pollSend(&state));
-    var pump_entry = (try entryState("retry-ws", "thread-live")).?;
+    var pump_entry = (try entryState("retry-ws", "thread-live", "turn-live")).?;
     try std.testing.expectEqual(@as(u32, 2), pump_entry.attempts);
     const after_two = pump_entry.next_retry_at_ms - sessionizer.nowMs();
     try std.testing.expect(after_two > ADOPTION_RETRY_INTERVAL_MS);
-    try forceDue("retry-ws", "thread-live");
+    try forceDue("retry-ws", "thread-live", "turn-live");
     _ = pollSend(&state);
-    pump_entry = (try entryState("retry-ws", "thread-live")).?;
+    pump_entry = (try entryState("retry-ws", "thread-live", "turn-live")).?;
     try std.testing.expectEqual(@as(u32, 3), pump_entry.attempts);
     const after_three = pump_entry.next_retry_at_ms - sessionizer.nowMs();
     try std.testing.expect(after_three > 2 * ADOPTION_RETRY_INTERVAL_MS);
-    clearAdoptionPending("retry-ws", "thread-live");
+    clearAdoptionPending("retry-ws", "thread-live", "turn-live");
 
     // Arm 2 — archived thread in a live workspace: the entry survives the
     // pump (pre-amendment it was dropped as "thread gone").
-    markAdoptionPending("retry-ws", "thread-archived");
-    try forceDue("retry-ws", "thread-archived");
+    markAdoptionPending("retry-ws", &state.project_controller.projects.items[0].archived_threads.items[0], "turn-archived");
+    try forceDue("retry-ws", "thread-archived", "turn-archived");
     _ = pollSend(&state);
-    try std.testing.expectEqual(@as(u32, 2), ((try entryState("retry-ws", "thread-archived")).?).attempts);
-    clearAdoptionPending("retry-ws", "thread-archived");
+    try std.testing.expectEqual(@as(u32, 2), ((try entryState("retry-ws", "thread-archived", "turn-archived")).?).attempts);
+    clearAdoptionPending("retry-ws", "thread-archived", "turn-archived");
 
     // Arm 3 — thread inside an archived workspace: also reachable.
-    markAdoptionPending("ws-arch", "thread-arch-proj");
-    try forceDue("ws-arch", "thread-arch-proj");
+    markAdoptionPending("ws-arch", &state.project_controller.archived_projects.items[0].threads.items[0], "turn-arch-proj");
+    try forceDue("ws-arch", "thread-arch-proj", "turn-arch-proj");
     _ = pollSend(&state);
-    try std.testing.expectEqual(@as(u32, 2), ((try entryState("ws-arch", "thread-arch-proj")).?).attempts);
-    clearAdoptionPending("ws-arch", "thread-arch-proj");
+    try std.testing.expectEqual(@as(u32, 2), ((try entryState("ws-arch", "thread-arch-proj", "turn-arch-proj")).?).attempts);
+    clearAdoptionPending("ws-arch", "thread-arch-proj", "turn-arch-proj");
 
     // Arm 4 — truly deleted thread: entry dropped (no eternal ghost retries).
-    markAdoptionPending("retry-ws", "thread-gone");
-    try forceDue("retry-ws", "thread-gone");
+    var gone_thread = try makeThread(allocator, "thread-gone");
+    defer gone_thread.deinit(allocator);
+    markAdoptionPending("retry-ws", &gone_thread, "turn-gone");
+    try forceDue("retry-ws", "thread-gone", "turn-gone");
     _ = pollSend(&state);
-    try std.testing.expect((try entryState("retry-ws", "thread-gone")) == null);
+    try std.testing.expect((try entryState("retry-ws", "thread-gone", "turn-gone")) == null);
 
     // Arm 5 — loud give-up retains a terminal repair marker. Cursor snapshot
     // application is now the only path allowed to clear the id-less state.
@@ -4203,23 +4536,23 @@ test "M5-P4 amendment 2: retry pump backs off, reaches archived threads, and giv
         .author = try allocator.dupeZ(u8, "Codex"),
         .body = try allocator.dupeZ(u8, "awaiting durable identity"),
     });
-    markAdoptionPending("retry-ws", "thread-live");
+    markAdoptionPending("retry-ws", &state.project_controller.projects.items[0].threads.items[0], "turn-retry");
     {
-        const key = adoptionRetryKeyAlloc("retry-ws", "thread-live").?;
+        const key = adoptionRetryKeyAlloc("retry-ws", "thread-live", "turn-retry").?;
         defer std.heap.page_allocator.free(key);
         const value_ptr = adoption_retry_pending.getPtr(key).?;
         value_ptr.attempts = ADOPTION_RETRY_MAX_ATTEMPTS - 1;
         value_ptr.next_retry_at_ms = 0;
     }
     _ = pollSend(&state);
-    const terminal_entry = (try entryState("retry-ws", "thread-live")).?;
+    const terminal_entry = (try entryState("retry-ws", "thread-live", "turn-retry")).?;
     try std.testing.expect(terminal_entry.terminal_failed);
     try std.testing.expectEqual(ADOPTION_RETRY_MAX_ATTEMPTS, terminal_entry.attempts);
     try std.testing.expect(hasUnresolvedAdoptionRows(&state));
     state.project_controller.projects.items[0].threads.items[0].messages.items[0].message_id =
         try allocator.dupe(u8, "turn:retry:msg:0");
-    try std.testing.expect(!hasUnresolvedAdoptionRows(&state));
-    clearAdoptionPending("retry-ws", "thread-live");
+    try std.testing.expect(hasUnresolvedAdoptionRows(&state));
+    clearAdoptionPending("retry-ws", "thread-live", "turn-retry");
     try std.testing.expectEqual(@as(usize, 0), adoption_retry_pending.count());
 }
 

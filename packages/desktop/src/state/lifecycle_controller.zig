@@ -6,6 +6,7 @@
 //! and pre-turn durability still use the blocking flush path.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const platform_runtime = @import("platform_runtime");
 const db_types = @import("../db/types.zig");
 const storage_mod = @import("storage.zig");
@@ -15,6 +16,9 @@ const SAVE_DEBOUNCE_MS: i64 = 750;
 const FLUSH_RETRY_BACKOFF_MS: i64 = 2000;
 /// When persistence is unavailable, probe no more often than this interval.
 const FLUSH_UNAVAILABLE_PROBE_MS: i64 = 5000;
+/// Leave enough room below the ten-second process watchdog to durably spool.
+const SHUTDOWN_FLUSH_BUDGET_MS: i64 = 7000;
+const SHUTDOWN_MAX_CONFLICTS: usize = 2;
 const log = std.log.scoped(.native_shell);
 
 const LoadedPersistedState = db_types.LoadedState;
@@ -23,6 +27,7 @@ const Storage = storage_mod.Storage;
 const FlushWorkerResult = struct {
     success: bool = false,
     conflict: bool = false,
+    acknowledged_revision: u64 = 0,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
@@ -57,13 +62,19 @@ pub const State = struct {
     /// Daemon projection observed when the conflicted payload was captured.
     /// This distinguishes a local addition from an identity deleted remotely.
     rebase_baseline: ?LoadedPersistedState = null,
+    rebase_baseline_revision: ?u64 = null,
+    rebase_capture_revision: ?u64 = null,
     /// Last successfully applied daemon projection, before local UI overlays.
     projection_baseline: ?LoadedPersistedState = null,
+    projection_baseline_revision: ?u64 = null,
+    /// True once the current dirty projection has durable spool ownership.
+    dirty_spooled: bool = false,
 
     pub fn markDirty(self: *State, now_ms: i64) void {
         self.dirty = true;
         self.last_dirty_at_ms = now_ms;
         self.dirty_generation +%= 1;
+        self.dirty_spooled = false;
     }
 
     /// Clear dirty only if the acked snapshot covered every mutation so far;
@@ -91,8 +102,11 @@ pub const State = struct {
         self.rebase_snapshot = null;
         if (self.rebase_baseline) |*snapshot| snapshot.deinit();
         self.rebase_baseline = null;
+        self.rebase_baseline_revision = null;
+        self.rebase_capture_revision = null;
         if (self.projection_baseline) |*snapshot| snapshot.deinit();
         self.projection_baseline = null;
+        self.projection_baseline_revision = null;
     }
 };
 
@@ -131,15 +145,24 @@ fn scheduleFlushWorker(self: anytype, now_ms: i64) void {
         self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
         return;
     };
-    var baseline: ?LoadedPersistedState = if (self.lifecycle.projection_baseline) |snapshot|
-        self.clonePersistedState(storage.allocator, snapshot.value) catch |err| {
-            log.err("failed to capture daemon merge baseline: {s}", .{@errorName(err)});
-            persisted.deinit();
-            self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
-            return;
-        }
-    else
-        null;
+    const baseline_current = self.lifecycle.projection_baseline != null and
+        self.lifecycle.projection_baseline_revision == observed_revision;
+    if (!baseline_current) {
+        // A cursor refresh will establish a revision-paired baseline. Never
+        // capture a payload against a baseline from another revision.
+        persisted.deinit();
+        self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
+        return;
+    }
+    var baseline: ?LoadedPersistedState = self.clonePersistedState(
+        storage.allocator,
+        self.lifecycle.projection_baseline.?.value,
+    ) catch |err| {
+        log.err("failed to capture daemon merge baseline: {s}", .{@errorName(err)});
+        persisted.deinit();
+        self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
+        return;
+    };
 
     const result = storage.allocator.create(FlushWorkerResult) catch {
         if (baseline) |*snapshot| snapshot.deinit();
@@ -193,6 +216,7 @@ fn flushWorkerMain(args: *FlushWorkerArgs) void {
         args.result.done.store(true, .release);
         return;
     };
+    args.result.acknowledged_revision = args.storage.currentProjectionObservedRevision();
     args.result.success = true;
     args.result.done.store(true, .release);
 }
@@ -209,6 +233,7 @@ pub fn pollFlushWorker(self: anytype) void {
     }
     const success = result.success;
     const conflict = result.conflict;
+    const acknowledged_revision = result.acknowledged_revision;
     const storage = self.storage;
     if (self.lifecycle.flush_args) |args| {
         if (conflict) {
@@ -218,6 +243,16 @@ pub fn pollFlushWorker(self: anytype) void {
             args.loaded = null;
             self.lifecycle.rebase_baseline = args.baseline;
             args.baseline = null;
+            self.lifecycle.rebase_baseline_revision = if (self.lifecycle.rebase_baseline != null) args.observed_revision else null;
+            self.lifecycle.rebase_capture_revision = args.observed_revision;
+        } else if (success) {
+            // Save acknowledgement and baseline publication are one frame-thread
+            // transaction: move the exact acknowledged payload, then pair it
+            // with the revision returned by that acknowledgement.
+            if (self.lifecycle.projection_baseline) |*old| old.deinit();
+            self.lifecycle.projection_baseline = args.loaded;
+            args.loaded = null;
+            self.lifecycle.projection_baseline_revision = acknowledged_revision;
         }
         if (args.loaded) |*loaded| loaded.deinit();
         if (args.baseline) |*baseline| baseline.deinit();
@@ -230,6 +265,7 @@ pub fn pollFlushWorker(self: anytype) void {
 
     const now = platform_runtime.unixTimestampMs();
     if (success) {
+        self.storage.clearPendingStateSpoolBestEffort();
         self.lifecycle.clearDirtyForGeneration(self.lifecycle.flush_snapshot_generation);
         self.lifecycle.next_flush_attempt_ms = 0;
     } else if (conflict) {
@@ -253,16 +289,30 @@ pub fn flushDirtyBlocking(self: anytype) void {
         }
         pollFlushWorker(self);
     }
+    const started_at_ms = platform_runtime.unixTimestampMs();
+    var conflicts: usize = 0;
     while (self.lifecycle.dirty) {
+        if (conflicts >= SHUTDOWN_MAX_CONFLICTS or
+            platform_runtime.unixTimestampMs() - started_at_ms >= SHUTDOWN_FLUSH_BUDGET_MS)
+        {
+            spoolDirtyState(self, "shutdown conflict retry bound reached");
+            return;
+        }
         if (self.lifecycle.rebase_snapshot != null or self.hasUnresolvedAdoptionRows()) {
             self.completePendingProjectionRepairBlocking() catch |err| {
-                log.err("failed to complete shutdown projection repair: {s}", .{@errorName(err)});
+                if (builtin.is_test) {
+                    log.warn("failed to complete shutdown projection repair: {s}", .{@errorName(err)});
+                } else {
+                    log.err("failed to complete shutdown projection repair: {s}", .{@errorName(err)});
+                }
+                spoolDirtyState(self, "shutdown projection repair failed");
                 return;
             };
         }
         const observed_revision = self.storage.currentProjectionObservedRevision();
         var persisted = self.buildPersistedState(self.storage.allocator) catch |err| {
             log.err("failed to snapshot native state: {s}", .{@errorName(err)});
+            spoolDirtyState(self, "shutdown snapshot allocation failed");
             return;
         };
         var persisted_owned = true;
@@ -275,6 +325,7 @@ pub fn flushDirtyBlocking(self: anytype) void {
                         persisted.deinit();
                         persisted_owned = false;
                         log.err("failed to retain shutdown merge baseline: {s}", .{@errorName(clone_err)});
+                        spoolDirtyState(self, "shutdown baseline clone failed");
                         return;
                     };
                 }
@@ -283,6 +334,9 @@ pub fn flushDirtyBlocking(self: anytype) void {
                 self.lifecycle.rebase_snapshot = persisted;
                 persisted_owned = false;
                 self.lifecycle.rebase_baseline = baseline_copy;
+                self.lifecycle.rebase_baseline_revision = if (baseline_copy != null) self.lifecycle.projection_baseline_revision else null;
+                self.lifecycle.rebase_capture_revision = observed_revision;
+                conflicts += 1;
                 // Loop only after a fresh remote projection has been merged
                 // into the current frame state; the retry captures that result
                 // under its newly observed revision.
@@ -291,13 +345,27 @@ pub fn flushDirtyBlocking(self: anytype) void {
             log.err("failed to save native state via daemon: {s}", .{@errorName(err)});
             self.storage.markPersistenceUnavailable();
             self.lifecycle.next_flush_attempt_ms = platform_runtime.unixTimestampMs() + FLUSH_RETRY_BACKOFF_MS;
+            spoolDirtyState(self, "shutdown save failed");
             return;
         };
-        persisted.deinit();
+        const acknowledged_revision = self.storage.currentProjectionObservedRevision();
+        if (self.lifecycle.projection_baseline) |*old| old.deinit();
+        self.lifecycle.projection_baseline = persisted;
         persisted_owned = false;
+        self.lifecycle.projection_baseline_revision = acknowledged_revision;
+        self.storage.clearPendingStateSpoolBestEffort();
         self.lifecycle.clearDirty();
         self.lifecycle.next_flush_attempt_ms = 0;
     }
+}
+
+fn spoolDirtyState(self: anytype, reason: []const u8) void {
+    self.spoolPendingStateForShutdown() catch |err| {
+        log.err("failed to durably spool dirty native state after {s}: {s}", .{ reason, @errorName(err) });
+        return;
+    };
+    self.lifecycle.dirty_spooled = true;
+    log.warn("durably spooled dirty native state: {s}", .{reason});
 }
 
 /// Pre-turn thread durability: full compatibility snapshot through the daemon (blocking).
@@ -346,6 +414,57 @@ test "stale flush ack does not clear dirty for later mutations" {
     try std.testing.expect(!state.dirty);
 }
 
+test "acknowledged full save atomically advances revision-paired projection baseline" {
+    const FakeStorage = struct {
+        allocator: std.mem.Allocator,
+        cleared_spool: bool = false,
+
+        fn clearPendingStateSpoolBestEffort(self: *@This()) void {
+            self.cleared_spool = true;
+        }
+        fn markPersistenceUnavailable(_: *@This()) void {}
+    };
+    const FakeState = struct {
+        lifecycle: State = .{},
+        storage: *FakeStorage,
+    };
+
+    var storage: FakeStorage = .{ .allocator = std.testing.allocator };
+    var state: FakeState = .{ .storage = &storage };
+    defer state.lifecycle.deinit();
+    var old_baseline = LoadedPersistedState.init(std.testing.allocator);
+    old_baseline.value.sidebar_collapsed = false;
+    state.lifecycle.projection_baseline = old_baseline;
+    state.lifecycle.projection_baseline_revision = 4;
+    state.lifecycle.dirty = true;
+    state.lifecycle.dirty_generation = 1;
+    state.lifecycle.flush_snapshot_generation = 1;
+
+    var acknowledged = LoadedPersistedState.init(std.testing.allocator);
+    acknowledged.value.sidebar_collapsed = true;
+    const result = try std.testing.allocator.create(FlushWorkerResult);
+    result.* = .{ .success = true, .acknowledged_revision = 5 };
+    result.done.store(true, .release);
+    const args = try std.testing.allocator.create(FlushWorkerArgs);
+    args.* = .{
+        .allocator = std.testing.allocator,
+        .storage = undefined,
+        .loaded = acknowledged,
+        .baseline = null,
+        .observed_revision = 4,
+        .result = result,
+    };
+    state.lifecycle.flush_in_flight = true;
+    state.lifecycle.flush_result = result;
+    state.lifecycle.flush_args = args;
+    pollFlushWorker(&state);
+
+    try std.testing.expect(!state.lifecycle.dirty);
+    try std.testing.expect(state.lifecycle.projection_baseline.?.value.sidebar_collapsed);
+    try std.testing.expectEqual(@as(?u64, 5), state.lifecycle.projection_baseline_revision);
+    try std.testing.expect(storage.cleared_spool);
+}
+
 test "shutdown blocking flush repairs conflict or terminal adoption before saving" {
     const FakeStorage = struct {
         allocator: std.mem.Allocator,
@@ -359,12 +478,14 @@ test "shutdown blocking flush repairs conflict or terminal adoption before savin
             self.saves += 1;
         }
         fn markPersistenceUnavailable(_: *@This()) void {}
+        fn clearPendingStateSpoolBestEffort(_: *@This()) void {}
     };
     const FakeState = struct {
         lifecycle: State = .{},
         storage: *FakeStorage,
         unresolved_adoption: bool = true,
         repairs: usize = 0,
+        spools: usize = 0,
 
         fn hasUnresolvedAdoptionRows(self: *@This()) bool {
             return self.unresolved_adoption;
@@ -376,12 +497,17 @@ test "shutdown blocking flush repairs conflict or terminal adoption before savin
             self.lifecycle.rebase_snapshot = null;
             if (self.lifecycle.rebase_baseline) |*snapshot| snapshot.deinit();
             self.lifecycle.rebase_baseline = null;
+            self.lifecycle.rebase_baseline_revision = null;
+            self.lifecycle.rebase_capture_revision = null;
         }
         fn buildPersistedState(_: *@This(), allocator: std.mem.Allocator) !LoadedPersistedState {
             return LoadedPersistedState.init(allocator);
         }
         fn clonePersistedState(_: *@This(), allocator: std.mem.Allocator, _: db_types.PersistedState) !LoadedPersistedState {
             return LoadedPersistedState.init(allocator);
+        }
+        fn spoolPendingStateForShutdown(self: *@This()) !void {
+            self.spools += 1;
         }
     };
 
@@ -390,6 +516,8 @@ test "shutdown blocking flush repairs conflict or terminal adoption before savin
     state.lifecycle.dirty = true;
     state.lifecycle.rebase_snapshot = LoadedPersistedState.init(std.testing.allocator);
     state.lifecycle.rebase_baseline = LoadedPersistedState.init(std.testing.allocator);
+    state.lifecycle.rebase_baseline_revision = 9;
+    state.lifecycle.rebase_capture_revision = 9;
     flushDirtyBlocking(&state);
     defer state.lifecycle.deinit();
     try std.testing.expectEqual(@as(usize, 1), state.repairs);
@@ -397,6 +525,78 @@ test "shutdown blocking flush repairs conflict or terminal adoption before savin
     try std.testing.expect(!state.lifecycle.dirty);
     try std.testing.expect(!state.unresolved_adoption);
     try std.testing.expect(state.lifecycle.rebase_snapshot == null);
+    try std.testing.expectEqual(@as(usize, 0), state.spools);
+}
+
+test "shutdown repair failure and repeated conflicts transfer dirty ownership to spool" {
+    const FakeStorage = struct {
+        allocator: std.mem.Allocator,
+        saves: usize = 0,
+
+        fn currentProjectionObservedRevision(_: *const @This()) u64 {
+            return 12;
+        }
+        fn saveCaptured(self: *@This(), _: db_types.PersistedState, _: u64) !void {
+            self.saves += 1;
+            return error.StoreRevisionConflict;
+        }
+        fn markPersistenceUnavailable(_: *@This()) void {}
+        fn clearPendingStateSpoolBestEffort(_: *@This()) void {}
+    };
+    const FakeState = struct {
+        lifecycle: State = .{},
+        storage: *FakeStorage,
+        repair_fails: bool,
+        unresolved: bool = true,
+        spools: usize = 0,
+
+        fn hasUnresolvedAdoptionRows(self: *@This()) bool {
+            return self.unresolved;
+        }
+        fn completePendingProjectionRepairBlocking(self: *@This()) !void {
+            if (self.repair_fails) return error.ProjectionRefreshUnavailable;
+            self.unresolved = false;
+            if (self.lifecycle.rebase_snapshot) |*snapshot| snapshot.deinit();
+            self.lifecycle.rebase_snapshot = null;
+            if (self.lifecycle.rebase_baseline) |*snapshot| snapshot.deinit();
+            self.lifecycle.rebase_baseline = null;
+            self.lifecycle.rebase_baseline_revision = null;
+            self.lifecycle.rebase_capture_revision = null;
+        }
+        fn buildPersistedState(_: *@This(), allocator: std.mem.Allocator) !LoadedPersistedState {
+            return LoadedPersistedState.init(allocator);
+        }
+        fn clonePersistedState(_: *@This(), allocator: std.mem.Allocator, _: db_types.PersistedState) !LoadedPersistedState {
+            return LoadedPersistedState.init(allocator);
+        }
+        fn spoolPendingStateForShutdown(self: *@This()) !void {
+            try std.testing.expect(self.lifecycle.dirty);
+            self.spools += 1;
+        }
+    };
+
+    var repair_storage: FakeStorage = .{ .allocator = std.testing.allocator };
+    var repair_state: FakeState = .{ .storage = &repair_storage, .repair_fails = true };
+    repair_state.lifecycle.dirty = true;
+    repair_state.lifecycle.rebase_snapshot = LoadedPersistedState.init(std.testing.allocator);
+    defer repair_state.lifecycle.deinit();
+    flushDirtyBlocking(&repair_state);
+    try std.testing.expect(repair_state.lifecycle.dirty);
+    try std.testing.expect(repair_state.lifecycle.dirty_spooled);
+    try std.testing.expectEqual(@as(usize, 1), repair_state.spools);
+    try std.testing.expectEqual(@as(usize, 0), repair_storage.saves);
+
+    var conflict_storage: FakeStorage = .{ .allocator = std.testing.allocator };
+    var conflict_state: FakeState = .{ .storage = &conflict_storage, .repair_fails = false, .unresolved = false };
+    conflict_state.lifecycle.dirty = true;
+    conflict_state.lifecycle.projection_baseline = LoadedPersistedState.init(std.testing.allocator);
+    conflict_state.lifecycle.projection_baseline_revision = 12;
+    defer conflict_state.lifecycle.deinit();
+    flushDirtyBlocking(&conflict_state);
+    try std.testing.expect(conflict_state.lifecycle.dirty);
+    try std.testing.expect(conflict_state.lifecycle.dirty_spooled);
+    try std.testing.expectEqual(SHUTDOWN_MAX_CONFLICTS, conflict_storage.saves);
+    try std.testing.expectEqual(@as(usize, 1), conflict_state.spools);
 }
 
 test "lifecycle backoff gate skips flush while next_attempt is in the future" {
