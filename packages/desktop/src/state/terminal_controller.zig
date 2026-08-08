@@ -19,6 +19,11 @@ const POLL_INTERVAL_MS: i64 = 16;
 // Process watch/config/restart maintenance is human-paced and already uses
 // 1-2 second inner cadences. Keep it off the display-rate terminal tail path.
 const MANAGED_PROCESS_POLL_INTERVAL_MS: i64 = 250;
+pub const MAX_DAEMON_SESSION_DOCK_ID: u32 = 4_095;
+pub const MAX_DAEMON_SESSION_PANE_ID: u32 = 65_535;
+pub const MAX_MATERIALIZED_DAEMON_DOCKS_PER_REFRESH: usize = 64;
+pub const MAX_MATERIALIZED_DAEMON_PANES_PER_REFRESH: usize = 256;
+const MAX_OWNED_DAEMON_SESSIONS_PER_REFRESH: usize = 1_024;
 
 fn monotonicMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
@@ -214,8 +219,9 @@ pub fn buildDaemonSessionProjection(
 ) !std.ArrayList(OwnedDaemonSessionSummary) {
     var out: std.ArrayList(OwnedDaemonSessionSummary) = .empty;
     errdefer deinitDaemonSessionProjection(allocator, &out);
-    try out.ensureTotalCapacity(allocator, sessions.len);
-    for (sessions) |session| {
+    const retained_len = @min(sessions.len, MAX_OWNED_DAEMON_SESSIONS_PER_REFRESH);
+    try out.ensureTotalCapacity(allocator, retained_len);
+    for (sessions[0..retained_len]) |session| {
         var owned: OwnedDaemonSessionSummary = .{
             .session_id = try allocator.dupe(u8, session.session_id),
             .workspace_id = undefined,
@@ -244,6 +250,12 @@ pub fn buildDaemonSessionProjection(
         owned.status = try allocator.dupe(u8, session.status);
         out.appendAssumeCapacity(owned);
     }
+    if (sessions.len > retained_len) {
+        log.warn(
+            "daemon session projection capped at {d}; dropped {d} snapshot records",
+            .{ retained_len, sessions.len - retained_len },
+        );
+    }
     return out;
 }
 
@@ -256,13 +268,6 @@ pub fn deinitDaemonSessionProjection(
     sessions.* = .empty;
 }
 
-fn paneLeafById(node: *terminal.PaneNode, pane_id: u32) ?*terminal.PaneLeaf {
-    return switch (node.*) {
-        .leaf => |*leaf| if (leaf.id == pane_id) leaf else null,
-        .split => |*split| paneLeafById(split.first, pane_id) orelse paneLeafById(split.second, pane_id),
-    };
-}
-
 fn daemonSessionDock(project: anytype, dock_id: u32) ?*terminal.Dock {
     if (dock_id == 0) return &project.terminal_dock;
     for (project.terminal_docks.items) |*entry| {
@@ -271,44 +276,13 @@ fn daemonSessionDock(project: anytype, dock_id: u32) ?*terminal.Dock {
     return null;
 }
 
-fn ensureDaemonSessionPane(
-    allocator: std.mem.Allocator,
-    dock: *terminal.Dock,
-    pane_id: u32,
-    session_id: []const u8,
-) !void {
-    for (dock.tabs.items) |*tab| {
-        if (paneLeafById(tab.root, pane_id) != null) return;
+fn collisionFreeDaemonPaneId(dock: *terminal.Dock) ?u32 {
+    var candidate: u32 = 1;
+    while (true) {
+        if (dock.paneById(candidate) == null) return candidate;
+        if (candidate == MAX_DAEMON_SESSION_PANE_ID) return null;
+        candidate += 1;
     }
-    const nodes = [_]terminal.PersistedNode{.{
-        .node_id = 1,
-        .kind = .leaf,
-        .pane_id = pane_id,
-        .session_id = session_id,
-        .revive_policy = .attach_or_create,
-    }};
-    const new_tab: terminal.PersistedTab = .{
-        .active_pane_id = pane_id,
-        .root_node_id = 1,
-        .nodes = &nodes,
-    };
-    const layout = if (try dock.persistedLayoutJson(allocator)) |existing_layout| blk: {
-        defer allocator.free(existing_layout);
-        var parsed = try std.json.parseFromSlice(terminal.PersistedWorkspace, allocator, existing_layout, .{});
-        defer parsed.deinit();
-        const tabs = try allocator.alloc(terminal.PersistedTab, parsed.value.tabs.len + 1);
-        defer allocator.free(tabs);
-        @memcpy(tabs[0..parsed.value.tabs.len], parsed.value.tabs);
-        tabs[tabs.len - 1] = new_tab;
-        var workspace = parsed.value;
-        workspace.tabs = tabs;
-        break :blk try std.json.Stringify.valueAlloc(allocator, workspace, .{});
-    } else try std.json.Stringify.valueAlloc(allocator, terminal.PersistedWorkspace{
-        .active_tab_index = 0,
-        .tabs = &.{new_tab},
-    }, .{});
-    defer allocator.free(layout);
-    try dock.applyPersistedLayoutJson(allocator, layout);
 }
 
 fn ensureDaemonSessionDock(self: anytype, project: anytype, dock_id: u32) !*terminal.Dock {
@@ -329,29 +303,79 @@ pub fn applyDaemonSessionProjection(
     self: anytype,
     sessions: []const headless.store.SessionSummary,
 ) !void {
+    var materialized_docks: usize = 0;
+    var materialized_panes: usize = 0;
     for (sessions) |session| {
         if (!session.running) continue;
         const project = self.projectForDaemonId(session.workspace_id) orelse continue;
         if (session.workspace_path.len != 0 and !std.mem.eql(u8, project.path, session.workspace_path)) continue;
-        const dock = try ensureDaemonSessionDock(self, project, session.dock_id orelse 0);
-        try ensureDaemonSessionPane(self.allocator, dock, session.pane_id orelse 1, session.session_id);
-        const leaf = if (session.pane_id) |pane_id| blk: {
-            var found: ?*terminal.PaneLeaf = null;
-            for (dock.tabs.items) |*tab| {
-                found = paneLeafById(tab.root, pane_id);
-                if (found != null) break;
+        const dock_id = session.dock_id orelse 0;
+        const requested_pane_id = session.pane_id orelse 1;
+        if (dock_id > MAX_DAEMON_SESSION_DOCK_ID or
+            requested_pane_id == 0 or requested_pane_id > MAX_DAEMON_SESSION_PANE_ID)
+        {
+            log.warn(
+                "dropping daemon session {s} with out-of-range coordinates dock={d} pane={d}",
+                .{ session.session_id, dock_id, requested_pane_id },
+            );
+            continue;
+        }
+        var dock = daemonSessionDock(project, dock_id);
+        if (dock == null) {
+            if (materialized_docks >= MAX_MATERIALIZED_DAEMON_DOCKS_PER_REFRESH or
+                materialized_panes >= MAX_MATERIALIZED_DAEMON_PANES_PER_REFRESH)
+            {
+                log.warn("dropping daemon session {s}: refresh materialization cap reached", .{session.session_id});
+                continue;
             }
-            break :blk found;
-        } else dock.activePane();
-        const pane = leaf orelse continue;
-        if (pane.session != null) continue;
-        if (pane.session_id) |existing| {
+            dock = try ensureDaemonSessionDock(self, project, dock_id);
+            materialized_docks += 1;
+        }
+        const target_dock = dock.?;
+        var pane = target_dock.paneById(requested_pane_id);
+        if (pane) |existing_pane| {
+            if (existing_pane.session_id) |existing_id| {
+                if (std.mem.eql(u8, existing_id, session.session_id)) continue;
+            }
+            if (existing_pane.session != null or existing_pane.session_id != null) {
+                const replacement_pane_id = collisionFreeDaemonPaneId(target_dock) orelse {
+                    log.warn("dropping daemon session {s}: no collision-free pane coordinate", .{session.session_id});
+                    continue;
+                };
+                if (materialized_panes >= MAX_MATERIALIZED_DAEMON_PANES_PER_REFRESH) {
+                    log.warn("dropping daemon session {s}: pane materialization cap reached", .{session.session_id});
+                    continue;
+                }
+                // First ownership of the requested coordinate wins. A later
+                // valid running session is preserved at a fresh coordinate;
+                // an existing user/restored leaf is never overwritten.
+                log.warn(
+                    "daemon session coordinate collision dock={d} pane={d}; reallocating {s} to pane={d}",
+                    .{ dock_id, requested_pane_id, session.session_id, replacement_pane_id },
+                );
+                pane = try target_dock.appendDaemonSessionPane(
+                    self.allocator,
+                    replacement_pane_id,
+                    session.session_id,
+                );
+                materialized_panes += 1;
+            }
+        } else {
+            if (materialized_panes >= MAX_MATERIALIZED_DAEMON_PANES_PER_REFRESH) {
+                log.warn("dropping daemon session {s}: pane materialization cap reached", .{session.session_id});
+                continue;
+            }
+            pane = try target_dock.appendDaemonSessionPane(self.allocator, requested_pane_id, session.session_id);
+            materialized_panes += 1;
+        }
+        const target_pane = pane orelse continue;
+        if (target_pane.session != null) continue;
+        if (target_pane.session_id) |existing| {
             if (std.mem.eql(u8, existing, session.session_id)) continue;
         }
         const next_session_id = try self.allocator.dupe(u8, session.session_id);
-        if (pane.session_id) |existing| self.allocator.free(existing);
-        pane.session_id = next_session_id;
-        pane.revive_policy = .attach_or_create;
+        target_pane.session_id = next_session_id;
+        target_pane.revive_policy = .attach_or_create;
     }
 }
 

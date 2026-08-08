@@ -1252,6 +1252,39 @@ pub const Dock = struct {
         return findPaneLeafConst(tab.root, tab.active_pane_id) orelse findFirstPaneLeafConst(tab.root);
     }
 
+    /// Coordinate seam for validated daemon snapshot materialization.
+    pub fn paneById(self: *Dock, pane_id: u32) ?*PaneLeaf {
+        return self.findPaneById(pane_id);
+    }
+
+    /// Append one validated daemon-owned pane without round-tripping the whole
+    /// dock through JSON. The caller owns coordinate bounds and collision caps.
+    pub fn appendDaemonSessionPane(
+        self: *Dock,
+        allocator: std.mem.Allocator,
+        pane_id: u32,
+        session_id: []const u8,
+    ) !*PaneLeaf {
+        std.debug.assert(pane_id != 0);
+        std.debug.assert(self.findPaneById(pane_id) == null);
+        const node = try allocator.create(PaneNode);
+        errdefer allocator.destroy(node);
+        const owned_session_id = try allocator.dupe(u8, session_id);
+        errdefer allocator.free(owned_session_id);
+        node.* = .{ .leaf = .{
+            .id = pane_id,
+            .session_id = owned_session_id,
+            .revive_policy = .attach_or_create,
+        } };
+        try self.tabs.append(allocator, .{
+            .id = self.allocateTabId(),
+            .root = node,
+            .active_pane_id = pane_id,
+        });
+        self.next_pane_id = @max(self.next_pane_id, pane_id +| 1);
+        return &node.leaf;
+    }
+
     pub fn activeSessionId(self: *const Dock) ?[]const u8 {
         const pane = self.activePaneConst() orelse return null;
         if (pane.session) |session| {
@@ -1558,7 +1591,7 @@ pub const Dock = struct {
         }
 
         self.active_tab_index = @min(parsed.value.active_tab_index, self.tabs.items.len - 1);
-        self.next_pane_id = @max(self.next_pane_id, max_pane_id + 1);
+        self.next_pane_id = @max(self.next_pane_id, max_pane_id +| 1);
     }
 
     fn ensureWorkspace(self: *Dock, allocator: std.mem.Allocator) !void {
@@ -1750,7 +1783,7 @@ pub const Dock = struct {
 
     fn allocatePaneId(self: *Dock) u32 {
         const id = self.next_pane_id;
-        self.next_pane_id += 1;
+        self.next_pane_id +|= 1;
         return id;
     }
 

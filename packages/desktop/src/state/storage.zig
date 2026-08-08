@@ -6,6 +6,7 @@
 //! never runs schema initialization or writes.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const sdl = @import("zsdl3");
 const headless = @import("headless");
 const db_client = @import("../db/client.zig");
@@ -19,6 +20,7 @@ const APP_NAME: [:0]const u8 = "Native";
 pub const LEGACY_STATE_FILE_NAME = "state.json";
 pub const PENDING_STATE_SPOOL_FILE_NAME = "pending-state-spool.json";
 const PENDING_STATE_SPOOL_TEMP_FILE_NAME = "pending-state-spool.json.tmp";
+const PENDING_STATE_SPOOL_MAX_BYTES: usize = 64 * 1024 * 1024;
 const LoadedPersistedState = db_types.LoadedState;
 const PersistedState = db_types.PersistedState;
 const PersistedThread = db_types.PersistedThread;
@@ -27,7 +29,10 @@ const PersistedChatCompletion = db_types.PersistedChatCompletion;
 const log = std.log.scoped(.native_shell);
 
 pub const PendingAdoptionRow = struct {
-    row_index: usize,
+    /// Legacy f76364f7 sidecars stored an absolute transcript index here.
+    /// It remains readable as an optional hint, but repair validation is
+    /// turn-scoped because unrelated turns may shift the durable transcript.
+    row_index: ?usize = null,
     role: db_types.ChatRole,
     author: []const u8,
     body: []const u8,
@@ -227,7 +232,7 @@ pub const Storage = struct {
             threaded.io(),
             PENDING_STATE_SPOOL_FILE_NAME,
             allocator,
-            .limited(64 * 1024 * 1024),
+            .limited(PENDING_STATE_SPOOL_MAX_BYTES),
         ) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
@@ -247,9 +252,14 @@ pub const Storage = struct {
     pub fn writePendingStateSpool(self: *const Storage, spool: PendingStateSpool) !void {
         const encoded = try std.json.Stringify.valueAlloc(self.allocator, spool, .{ .whitespace = .minified });
         defer self.allocator.free(encoded);
+        if (encoded.len > PENDING_STATE_SPOOL_MAX_BYTES) return error.PendingStateSpoolExceedsReplayLimit;
         var threaded: std.Io.Threaded = .init(self.allocator, .{});
         defer threaded.deinit();
-        var dir = try std.Io.Dir.openDirAbsolute(threaded.io(), self.pref_path, .{});
+        // Directory fsync cannot operate on Linux O_PATH handles; iteration
+        // capability makes std.Io open a real readable directory descriptor.
+        var dir = try std.Io.Dir.openDirAbsolute(threaded.io(), self.pref_path, .{
+            .iterate = builtin.os.tag != .windows,
+        });
         defer dir.close(threaded.io());
         var file = try dir.createFile(threaded.io(), PENDING_STATE_SPOOL_TEMP_FILE_NAME, .{ .truncate = true });
         var file_open = true;
@@ -259,6 +269,16 @@ pub const Storage = struct {
         file.close(threaded.io());
         file_open = false;
         try dir.rename(PENDING_STATE_SPOOL_TEMP_FILE_NAME, dir, PENDING_STATE_SPOOL_FILE_NAME, threaded.io());
+        // POSIX rename durability requires the containing directory metadata
+        // to reach disk too. Windows does not expose directory sync through
+        // std.Io and its rename primitive has different persistence semantics.
+        if (builtin.os.tag != .windows) {
+            const dir_file: std.Io.File = .{
+                .handle = dir.handle,
+                .flags = .{ .nonblocking = false },
+            };
+            try dir_file.sync(threaded.io());
+        }
     }
 
     pub fn clearPendingStateSpool(self: *const Storage) !void {
@@ -1211,6 +1231,9 @@ test "pending state spool is durable, replayable, and acknowledgement-cleared" {
     try std.testing.expectEqualStrings("Unsaved after repair failure", loaded.value.current.projects[0].label);
     try std.testing.expectEqualStrings("Before", loaded.value.baseline.?.projects[0].label);
     try std.testing.expectEqualStrings("spool-turn", loaded.value.adoption_repairs[0].turn_id);
+    // f76364f7 encoded row_index as a required bare number. The optional hint
+    // keeps that exact old JSON shape readable while new validation ignores it.
+    try std.testing.expectEqual(@as(?usize, 1), loaded.value.adoption_repairs[0].rows[0].row_index);
     try storage.clearPendingStateSpool();
     try std.testing.expect((try storage.loadPendingStateSpool(std.testing.allocator)) == null);
 }
