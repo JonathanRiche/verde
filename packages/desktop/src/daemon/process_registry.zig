@@ -968,6 +968,38 @@ pub const WorkspaceRecord = struct {
     }
 };
 
+/// Local topic vocabulary for revision-bump identity (M5-P2). Kept as a
+/// registry-owned enum (not an import of change_journal.Topic) so this module
+/// stays std-only and free of sibling couplings; the sessionizer maps these
+/// onto the frozen journal topic set and skips topics with no journal
+/// spelling (`client`).
+pub const BumpTopic = enum {
+    client,
+    workspace,
+    process,
+    lease,
+    notification,
+    chat_turn,
+};
+
+/// Identity of the state that a revision bump invalidated. `resource_id` is
+/// "*" for batch mutations that touch an unbounded set (prunes/evictions);
+/// clients treat those as "re-read the topic". Slices borrow registry
+/// storage and are only valid for the duration of the hook call.
+pub const RevisionBumpEvent = struct {
+    topic: BumpTopic,
+    resource_id: []const u8,
+    workspace_id: ?[]const u8 = null,
+};
+
+/// Observer invoked synchronously inside every revision bump, while the
+/// caller still holds whatever lock guards this registry (the daemon lock in
+/// the sessionizer). The callback must not re-enter the registry.
+pub const RevisionHook = struct {
+    context: *anyopaque,
+    notify: *const fn (context: *anyopaque, event: RevisionBumpEvent, registry_revision: u64) void,
+};
+
 pub const ProcessRegistry = struct {
     /// A new daemon instance chooses a fresh nonce. Lease IDs therefore stay
     /// opaque and cannot collide with IDs from a prior instance.
@@ -982,6 +1014,9 @@ pub const ProcessRegistry = struct {
     notification_count: usize = 0,
     notification_global_cap: usize = NOTIFICATION_GLOBAL_MAX,
     next_notification_order: u64 = 1,
+    /// Change-journal seam (M5-P2): fired at every revision bump with the
+    /// bumped identity. Null outside the daemon server path (unit tests).
+    revision_hook: ?RevisionHook = null,
 
     pub fn init(allocator: std.mem.Allocator, instance_nonce: []const u8) !ProcessRegistry {
         if (instance_nonce.len == 0) return error.InstanceNonceRequired;
@@ -1032,7 +1067,7 @@ pub const ProcessRegistry = struct {
             .last_heartbeat_ms = now_ms,
             .persistent = persistent,
         });
-        self.bumpRevision();
+        self.bumpRevision(.{ .topic = .client, .resource_id = client_id });
         return self.clients.getPtr(client_id).?;
     }
 
@@ -1040,7 +1075,7 @@ pub const ProcessRegistry = struct {
         const record = self.client(client_id) orelse return false;
         if (record.closed) return false;
         record.last_heartbeat_ms = now_ms;
-        self.bumpRevision();
+        self.bumpRevision(.{ .topic = .client, .resource_id = client_id });
         return true;
     }
 
@@ -1049,7 +1084,7 @@ pub const ProcessRegistry = struct {
         if (record.closed) return false;
         record.closed = true;
         record.closed_at_ms = now_ms;
-        self.bumpRevision();
+        self.bumpRevision(.{ .topic = .client, .resource_id = client_id });
         return true;
     }
 
@@ -1081,7 +1116,7 @@ pub const ProcessRegistry = struct {
             .last_heartbeat_ms = now_ms,
             .compatibility = true,
         });
-        self.bumpRevision();
+        self.bumpRevision(.{ .topic = .client, .resource_id = derived_id });
         return self.client(derived_id).?;
     }
 
@@ -1136,13 +1171,13 @@ pub const ProcessRegistry = struct {
         if (workspace_record.canonical_path) |canonical_path| {
             if (std.mem.eql(u8, canonical_path, path)) {
                 workspace_record.last_seen_ms = now_ms;
-                self.bumpRevision();
+                self.bumpRevision(.{ .topic = .workspace, .resource_id = workspace_record.id, .workspace_id = workspace_record.id });
                 return workspace_record;
             }
         } else {
             workspace_record.canonical_path = try allocator.dupe(u8, path);
             workspace_record.last_seen_ms = now_ms;
-            self.bumpRevision();
+            self.bumpRevision(.{ .topic = .workspace, .resource_id = workspace_record.id, .workspace_id = workspace_record.id });
             return workspace_record;
         }
 
@@ -1150,7 +1185,7 @@ pub const ProcessRegistry = struct {
             if (std.mem.eql(u8, alias.path, path)) {
                 alias.last_seen_ms = now_ms;
                 workspace_record.last_seen_ms = now_ms;
-                self.bumpRevision();
+                self.bumpRevision(.{ .topic = .workspace, .resource_id = workspace_record.id, .workspace_id = workspace_record.id });
                 return workspace_record;
             }
         }
@@ -1167,7 +1202,7 @@ pub const ProcessRegistry = struct {
         });
         workspace_record.last_seen_ms = now_ms;
         _ = self.pruneWorkspacePathAliasesToCap(allocator);
-        self.bumpRevision();
+        self.bumpRevision(.{ .topic = .workspace, .resource_id = workspace_record.id, .workspace_id = workspace_record.id });
         return workspace_record;
     }
 
@@ -1182,7 +1217,7 @@ pub const ProcessRegistry = struct {
         var workspace_record = try WorkspaceRecord.init(allocator, workspace_id);
         errdefer workspace_record.deinit(allocator);
         try self.workspaces.append(allocator, workspace_record);
-        self.bumpRevision();
+        self.bumpRevision(.{ .topic = .workspace, .resource_id = workspace_id, .workspace_id = workspace_id });
         return &self.workspaces.items[self.workspaces.items.len - 1];
     }
 
@@ -1207,7 +1242,7 @@ pub const ProcessRegistry = struct {
                 process.command = replacement;
                 changed = true;
             }
-            if (changed) self.bumpRevision();
+            if (changed) self.bumpRevision(.{ .topic = .process, .resource_id = process.id, .workspace_id = workspace_id });
             return process;
         }
 
@@ -1224,8 +1259,9 @@ pub const ProcessRegistry = struct {
         process_id_owned = false;
         _ = now_ms;
         try workspace_record.managed_processes.append(allocator, process);
-        self.bumpRevision();
-        return &workspace_record.managed_processes.items[workspace_record.managed_processes.items.len - 1];
+        const appended = &workspace_record.managed_processes.items[workspace_record.managed_processes.items.len - 1];
+        self.bumpRevision(.{ .topic = .process, .resource_id = appended.id, .workspace_id = workspace_id });
+        return appended;
     }
 
     /// Append one pull-only notification without revoking or changing any
@@ -1240,7 +1276,9 @@ pub const ProcessRegistry = struct {
         now_ms: i64,
     ) !void {
         try self.appendNotificationInternal(allocator, workspace_id, owner_session_id, command, now_ms);
-        self.bumpRevision();
+        // The mailbox is the re-readable resource, so its identity is the
+        // workspace the notification was queued into.
+        self.bumpRevision(.{ .topic = .notification, .resource_id = workspace_id, .workspace_id = workspace_id });
     }
 
     /// Collect borrowed notification pointers for a workspace/session cursor.
@@ -1266,7 +1304,7 @@ pub const ProcessRegistry = struct {
         }
         if (removed_count != 0) {
             self.notification_count -|= removed_count;
-            self.bumpRevision();
+            self.bumpRevision(.{ .topic = .notification, .resource_id = "*" });
         }
         return removed_count;
     }
@@ -1280,7 +1318,7 @@ pub const ProcessRegistry = struct {
             var removed = workspace_record.retained_turns.orderedRemove(0);
             removed.deinit(allocator);
         }
-        self.bumpRevision();
+        self.bumpRevision(.{ .topic = .chat_turn, .resource_id = turn_id, .workspace_id = workspace_id });
     }
 
     pub fn reapRetainedTurns(self: *ProcessRegistry, allocator: std.mem.Allocator, now_ms: i64) usize {
@@ -1298,7 +1336,7 @@ pub const ProcessRegistry = struct {
                 removed_count += 1;
             }
         }
-        if (removed_count != 0) self.bumpRevision();
+        if (removed_count != 0) self.bumpRevision(.{ .topic = .chat_turn, .resource_id = "*" });
         return removed_count;
     }
 
@@ -1336,7 +1374,7 @@ pub const ProcessRegistry = struct {
             self.removeWorkspaceAt(allocator, index_to_remove.?);
             removed_count += 1;
         }
-        if (removed_count != 0) self.bumpRevision();
+        if (removed_count != 0) self.bumpRevision(.{ .topic = .workspace, .resource_id = "*" });
         return removed_count;
     }
 
@@ -1467,7 +1505,7 @@ pub const ProcessRegistry = struct {
     pub fn pruneExpiredLeases(self: *ProcessRegistry, allocator: std.mem.Allocator, workspace_id: []const u8, now_ms: i64) usize {
         const workspace_record = self.workspace(workspace_id) orelse return 0;
         const removed = pruneExpiredLeaseList(&workspace_record.leases, allocator, now_ms);
-        if (removed != 0) self.bumpRevision();
+        if (removed != 0) self.bumpRevision(.{ .topic = .lease, .resource_id = workspace_id, .workspace_id = workspace_id });
         return removed;
     }
 
@@ -1521,8 +1559,8 @@ pub const ProcessRegistry = struct {
                 try self.appendNotificationInternal(allocator, workspace_id, affected.owner, command, now_ms);
             }
         }
-        self.bumpRevision();
         result.lease = &workspace_record.leases.items[lease_index];
+        self.bumpRevision(.{ .topic = .lease, .resource_id = result.lease.id, .workspace_id = workspace_id });
         return result;
     }
 
@@ -1544,7 +1582,7 @@ pub const ProcessRegistry = struct {
             if (!std.mem.eql(u8, lease.owner, owner)) return error.LeaseOwnerMismatch;
             lease.expires_at_ms = now_ms + clampLeaseTtl(ttl_ms);
             lease.last_renewal_ms = now_ms;
-            self.bumpRevision();
+            self.bumpRevision(.{ .topic = .lease, .resource_id = lease.id, .workspace_id = workspace_id });
             return lease;
         }
         return error.LeaseNotFound;
@@ -1592,7 +1630,11 @@ pub const ProcessRegistry = struct {
         const workspace_record = self.workspace(workspace_id) orelse return 0;
         _ = self.pruneExpiredLeases(allocator, workspace_id, now_ms);
         const released = releaseLeaseList(&workspace_record.leases, allocator, owner, lease_id);
-        if (released != 0) self.bumpRevision();
+        if (released != 0) self.bumpRevision(.{
+            .topic = .lease,
+            .resource_id = lease_id orelse workspace_id,
+            .workspace_id = workspace_id,
+        });
         return released;
     }
 
@@ -1620,7 +1662,7 @@ pub const ProcessRegistry = struct {
                 released += 1;
             }
         }
-        if (released != 0) self.bumpRevision();
+        if (released != 0) self.bumpRevision(.{ .topic = .lease, .resource_id = "*" });
         return released;
     }
 
@@ -1655,8 +1697,9 @@ pub const ProcessRegistry = struct {
         }
         try workspace_record.tracked_terminal_processes.append(allocator, tracked);
         advanceGeneration(&workspace_record.next_terminal_generation);
-        self.bumpRevision();
-        return &workspace_record.tracked_terminal_processes.items[workspace_record.tracked_terminal_processes.items.len - 1];
+        const appended = &workspace_record.tracked_terminal_processes.items[workspace_record.tracked_terminal_processes.items.len - 1];
+        self.bumpRevision(.{ .topic = .process, .resource_id = appended.process_id, .workspace_id = workspace_id });
+        return appended;
     }
 
     /// Returns a borrowed tracked process pointer, invalidated by later
@@ -1697,7 +1740,7 @@ pub const ProcessRegistry = struct {
         for (workspace_record.tracked_terminal_processes.items, 0..) |tracked, index| {
             if (!std.mem.eql(u8, tracked.session_id, session_id)) continue;
             try finishTrackedTerminalProcess(allocator, workspace_record, index, finish, finished_at_ms);
-            self.bumpRevision();
+            self.bumpRevision(.{ .topic = .process, .resource_id = session_id, .workspace_id = workspace_id });
             return true;
         }
         return false;
@@ -1706,7 +1749,7 @@ pub const ProcessRegistry = struct {
     pub fn pruneTerminalProcessOutcomes(self: *ProcessRegistry, allocator: std.mem.Allocator, workspace_id: []const u8, now_ms: i64) usize {
         const workspace_record = self.workspace(workspace_id) orelse return 0;
         const removed = pruneOutcomeList(&workspace_record.terminal_process_outcomes, allocator, now_ms);
-        if (removed != 0) self.bumpRevision();
+        if (removed != 0) self.bumpRevision(.{ .topic = .process, .resource_id = workspace_id, .workspace_id = workspace_id });
         return removed;
     }
 
@@ -1723,8 +1766,9 @@ pub const ProcessRegistry = struct {
         errdefer owned_process.deinit(allocator);
         const workspace_record = try self.ensureWorkspace(allocator, workspace_id);
         try workspace_record.external_processes.append(allocator, owned_process);
-        self.bumpRevision();
-        return &workspace_record.external_processes.items[workspace_record.external_processes.items.len - 1];
+        const appended = &workspace_record.external_processes.items[workspace_record.external_processes.items.len - 1];
+        self.bumpRevision(.{ .topic = .process, .resource_id = appended.process_id, .workspace_id = workspace_id });
+        return appended;
     }
 
     pub fn finishExternalProcess(self: *ProcessRegistry, workspace_id: []const u8, process_id: []const u8, status: ExternalProcessStatus, finished_at_ms: i64) bool {
@@ -1733,7 +1777,7 @@ pub const ProcessRegistry = struct {
             if (!std.mem.eql(u8, process.process_id, process_id)) continue;
             process.status = status;
             process.finished_at_ms = finished_at_ms;
-            self.bumpRevision();
+            self.bumpRevision(.{ .topic = .process, .resource_id = process_id, .workspace_id = workspace_id });
             return true;
         }
         return false;
@@ -1743,7 +1787,11 @@ pub const ProcessRegistry = struct {
     /// A stale request cannot advance a replacement daemon's projection.
     pub fn bumpRegistryRevision(self: *ProcessRegistry, instance_nonce: []const u8) !u64 {
         if (!std.mem.eql(u8, self.instance_nonce, instance_nonce)) return error.InstanceNonceMismatch;
-        self.bumpRevision();
+        // No production caller reaches this seam (Daemon.bumpRegistryRevision in
+        // sessionizer.zig mutates registry_revision directly and journals there);
+        // .client keeps test-only bumps out of the journal, matching the hook's
+        // skip-.client policy in sessionizer.zig.
+        self.bumpRevision(.{ .topic = .client, .resource_id = "external" });
         return self.registry_revision;
     }
 
@@ -1752,9 +1800,15 @@ pub const ProcessRegistry = struct {
         return self.registry_revision;
     }
 
-    fn bumpRevision(self: *ProcessRegistry) void {
+    fn bumpRevision(self: *ProcessRegistry, event: RevisionBumpEvent) void {
         self.registry_revision +%= 1;
         if (self.registry_revision == 0) self.registry_revision = 1;
+        // Volatile-topic journal publication point (m5_design §1): the entry
+        // is appended at the same point that bumps registry_revision, under
+        // the same lock that guards the registry, so an observed entry's
+        // registry_revision can never lead the envelope a reader captures
+        // after draining the journal.
+        if (self.revision_hook) |hook| hook.notify(hook.context, event, self.registry_revision);
     }
 };
 
