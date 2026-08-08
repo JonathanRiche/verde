@@ -15,6 +15,8 @@ const log = std.log.scoped(.native_terminal);
 pub const DEFAULT_DOCK_HEIGHT: f32 = 136.0;
 pub const MIN_DOCK_HEIGHT: f32 = 96.0;
 pub const MAX_DOCK_HEIGHT: f32 = 900.0;
+/// Shared persisted/runtime pane-coordinate bound; matches daemon validation.
+pub const MAX_PANE_ID: u32 = 65_535;
 
 pub const TerminalKey = enum {
     enter,
@@ -1561,6 +1563,10 @@ pub const Dock = struct {
         var parsed = try std.json.parseFromSlice(PersistedWorkspace, allocator, json, .{});
         defer parsed.deinit();
 
+        // Validate before touching the live dock so corrupt coordinates leave
+        // the previously loaded layout intact and can never introduce aliases.
+        try validatePersistedPaneIds(allocator, parsed.value);
+
         if (parsed.value.font_scale) |font_scale| {
             self.font_scale = clampf(font_scale, MIN_FONT_SCALE, MAX_FONT_SCALE);
         }
@@ -1707,7 +1713,8 @@ pub const Dock = struct {
 
     fn createLeafNode(self: *Dock, allocator: std.mem.Allocator, ensure_session: bool) !*PaneNode {
         const node = try allocator.create(PaneNode);
-        node.* = .{ .leaf = .{ .id = self.allocatePaneId(), .session = null } };
+        errdefer allocator.destroy(node);
+        node.* = .{ .leaf = .{ .id = try self.allocatePaneId(), .session = null } };
         if (ensure_session) {
             try self.ensureLeafSession(allocator, &node.leaf);
         }
@@ -1781,10 +1788,22 @@ pub const Dock = struct {
         return id;
     }
 
-    fn allocatePaneId(self: *Dock) u32 {
-        const id = self.next_pane_id;
-        self.next_pane_id +|= 1;
-        return id;
+    fn allocatePaneId(self: *Dock) !u32 {
+        return self.allocatePaneIdWithin(MAX_PANE_ID);
+    }
+
+    fn allocatePaneIdWithin(self: *Dock, limit: u32) !u32 {
+        std.debug.assert(limit > 0);
+        var candidate = if (self.next_pane_id == 0 or self.next_pane_id > limit) @as(u32, 1) else self.next_pane_id;
+        var attempts: u32 = 0;
+        while (attempts < limit) : (attempts += 1) {
+            if (self.findPaneById(candidate) == null) {
+                self.next_pane_id = if (candidate == limit) 1 else candidate + 1;
+                return candidate;
+            }
+            candidate = if (candidate == limit) 1 else candidate + 1;
+        }
+        return error.PaneIdExhausted;
     }
 
     fn findTabIndexById(self: *const Dock, tab_id: u32) ?usize {
@@ -1814,6 +1833,7 @@ pub const Dock = struct {
                 if (leaf.id != target_pane_id) break :blk error.PaneNotFound;
 
                 const existing_leaf_node = try allocator.create(PaneNode);
+                errdefer allocator.destroy(existing_leaf_node);
                 existing_leaf_node.* = .{ .leaf = leaf };
                 const new_leaf_node = try self.createLeafNode(allocator, true);
                 const new_pane_id = new_leaf_node.leaf.id;
@@ -2407,6 +2427,20 @@ fn persistedRevivePolicy(revive_policy: TerminalRevivePolicy) TerminalRevivePoli
         .restart => .attach_or_create,
         else => revive_policy,
     };
+}
+
+fn validatePersistedPaneIds(allocator: std.mem.Allocator, persisted: PersistedWorkspace) !void {
+    var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer seen.deinit(allocator);
+    for (persisted.tabs) |tab| {
+        if (tab.active_pane_id > MAX_PANE_ID) return error.InvalidPersistedTerminalLayout;
+        for (tab.nodes) |node| {
+            if (node.kind != .leaf) continue;
+            if (node.pane_id == 0 or node.pane_id > MAX_PANE_ID) return error.InvalidPersistedTerminalLayout;
+            const entry = try seen.getOrPut(allocator, node.pane_id);
+            if (entry.found_existing) return error.InvalidPersistedTerminalLayout;
+        }
+    }
 }
 
 fn buildPaneNodeFromPersisted(
@@ -5460,6 +5494,50 @@ test "persisted layout accepts leaves without session metadata" {
     defer round_trip.deinit();
     try std.testing.expectEqual(@as(i64, 1_234), round_trip.value.tabs[0].agent_history_at);
     try std.testing.expectEqual(pane.restored_modes.?, round_trip.value.tabs[0].nodes[0].terminal_modes.?);
+}
+
+test "persisted layout rejects out-of-range pane id without replacing live layout" {
+    const allocator = std.testing.allocator;
+    var dock = try Dock.init(allocator);
+    defer dock.deinit(allocator);
+    try dock.tabs.append(allocator, try dock.buildSinglePaneTabWithoutSession(allocator));
+    const live_pane_id = dock.activePaneConst().?.id;
+    const invalid_layout_json =
+        \\{
+        \\  "active_tab_index": 0,
+        \\  "tabs": [{
+        \\    "active_pane_id": 4294967295,
+        \\    "root_node_id": 1,
+        \\    "nodes": [{
+        \\      "node_id": 1,
+        \\      "kind": "leaf",
+        \\      "pane_id": 4294967295
+        \\    }]
+        \\  }]
+        \\}
+    ;
+
+    try std.testing.expectError(
+        error.InvalidPersistedTerminalLayout,
+        dock.applyPersistedLayoutJson(allocator, invalid_layout_json),
+    );
+    try std.testing.expectEqual(@as(usize, 1), dock.tabs.items.len);
+    try std.testing.expectEqual(live_pane_id, dock.activePaneConst().?.id);
+}
+
+test "pane id exhaustion is fallible and never returns a duplicate" {
+    const allocator = std.testing.allocator;
+    var dock = try Dock.init(allocator);
+    defer dock.deinit(allocator);
+    _ = try dock.appendDaemonSessionPane(allocator, 1, "session-1");
+    _ = try dock.appendDaemonSessionPane(allocator, 2, "session-2");
+    _ = try dock.appendDaemonSessionPane(allocator, 3, "session-3");
+    dock.next_pane_id = 1;
+
+    try std.testing.expectError(error.PaneIdExhausted, dock.allocatePaneIdWithin(3));
+    try std.testing.expectEqualStrings("session-1", dock.paneById(1).?.session_id.?);
+    try std.testing.expectEqualStrings("session-2", dock.paneById(2).?.session_id.?);
+    try std.testing.expectEqualStrings("session-3", dock.paneById(3).?.session_id.?);
 }
 
 test "persisted restart revive policy reloads as attach" {
