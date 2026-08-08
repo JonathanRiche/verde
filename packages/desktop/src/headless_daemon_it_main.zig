@@ -170,6 +170,9 @@ pub fn main(init: std.process.Init) !void {
     try runChatFocusedCompletionClearScenario(allocator, io);
     try runChatCompletedTurnReplayRejectScenario(allocator, io);
     try runChatDurableCommitFailAlwaysScenario(allocator, io);
+    // M4-P5 MCP/CLI flip (Windows-safe): capability advertisement + no-GUI
+    // create/send/stream/approve/stop/read lifecycle with a daemon restart.
+    try runChatMcpCliFlipNoGuiScenario(allocator, io);
 
     // Extended store scenarios (POSIX only): full surface + S4 fault/busy/crash pins.
     // Transport-tier primitives, but not part of the Windows-safe subset.
@@ -5476,6 +5479,275 @@ fn runChatDurableCommitFailAlwaysScenario(allocator: std.mem.Allocator, io: std.
     // kill() is terminating+reaping; do not wait() afterward (Zig 0.16 Child).
     child.kill(io);
     kill_on_unwind = false;
+}
+
+/// M4-P5 (design "Phase M4-P5" tests, no-GUI subprocess IT): capability
+/// advertisement + the daemon-direct chat surface the MCP/CLI flip rides on —
+/// create thread (`chat.thread.upsert`), send with the stub provider
+/// (`chat.turn.start`), stream (`chat.turn.tail`), approve contract
+/// (`chat.turn.approve`), stop (`chat.turn.cancel`), read the durable
+/// transcript (`chat.thread.get`) — then a daemon restart proving the flipped
+/// surface stays durable and advertised on a second launch. No consume
+/// handshake anywhere: retention rides the M4-P4 durable-before-consume gate.
+fn runChatMcpCliFlipNoGuiScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "m4p5-flip");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+
+    var durable_msg_count: usize = 0;
+
+    // --- Launch 1: full no-GUI chat lifecycle over the flipped surface ---
+    {
+        var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+            .chat_stub = true,
+        });
+        var kill_on_unwind = true;
+        errdefer if (kill_on_unwind) child.kill(io);
+
+        var decode_arena = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = pref_path,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+
+        // Capability flip pin at the real daemon: chat=true is advertised in
+        // the same change that routes the MCP/CLI tools daemon-direct.
+        {
+            const empty_params: struct {} = .{};
+            var status_parsed = try client.call("core.status", empty_params);
+            defer status_parsed.deinit();
+            if (!status_parsed.response.isOk()) return error.ChatFlipStatusFailed;
+            const status = try client.decodeStatus(&status_parsed);
+            if (!status.capabilities.chat) return error.ChatFlipCapabilityFalse;
+            if (!status.capabilities.store) return error.ChatFlipStoreCapabilityFalse;
+        }
+
+        // Thread creation exactly as daemon-direct open_chat performs it:
+        // register a store client, ensure the workspace row, upsert the thread.
+        var reg = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+        defer reg.deinit();
+        if (!reg.response.isOk()) return error.ChatFlipRegisterFailed;
+        const client_id = (try client.decodeClientRegister(&reg)).client_id;
+
+        {
+            const ws_request: headless.store.WorkspaceUpsertRequest = .{
+                .mutation = .{ .request_key = "p5-flip-ws", .client_id = client_id },
+                .workspace = .{
+                    .workspace_id = "ws-p5",
+                    .label = "ws-p5",
+                    .path = pref_path,
+                },
+            };
+            var parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, ws_request);
+            defer parsed.deinit();
+            if (!parsed.response.isOk()) return error.ChatFlipWorkspaceUpsertFailed;
+        }
+        {
+            const thread_request: headless.store.ThreadUpsertRequest = .{
+                .mutation = .{ .request_key = "p5-flip-thread", .client_id = client_id },
+                .workspace_id = "ws-p5",
+                .thread = .{
+                    .local_thread_id = "thread-p5",
+                    .title = "M4P5 flip thread",
+                    .provider = "codex",
+                    .harness = "local_cli",
+                },
+            };
+            var parsed = try client.call(headless.store.METHOD_CHAT_THREAD_UPSERT, thread_request);
+            defer parsed.deinit();
+            if (!parsed.response.isOk()) return error.ChatFlipThreadUpsertFailed;
+            const write = try client.decodeWriteResult(&parsed);
+            if (write.store_revision == 0) return error.ChatFlipThreadRevisionZero;
+        }
+
+        // Send: CLI-shaped chat.turn.start (no message_id — the daemon mints
+        // the acceptance-staged user row id `turn:{id}:user`).
+        {
+            var parsed = try client.call("chat.turn.start", .{
+                .turn_id = "turn-p5-send",
+                .workspace_id = "ws-p5",
+                .local_thread_id = "thread-p5",
+                .project_path = pref_path,
+                .prompt = "hello m4p5",
+                .thread_title = "M4P5 flip thread",
+                .provider = "codex",
+                .harness = "local_cli",
+                .fast_mode = false,
+                .test_stub = true,
+            });
+            defer parsed.deinit();
+            if (!parsed.response.isOk()) return error.ChatFlipSendFailed;
+        }
+
+        // Stream: observe the assistant_delta event through chat.turn.tail
+        // before/while the turn completes, then require the durable receipt.
+        {
+            var saw_delta = false;
+            var attempts: usize = 0;
+            while (attempts < 800) : (attempts += 1) {
+                var tail = client.call("chat.turn.tail", .{ .turn_id = "turn-p5-send", .after_seq = 0 }) catch {
+                    std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
+                    continue;
+                };
+                defer tail.deinit();
+                if (tail.response.isOk()) {
+                    const result = tail.response.result orelse return error.ChatFlipTailNoResult;
+                    if (result != .object) return error.ChatFlipTailShape;
+                    const events = result.object.get("events") orelse .null;
+                    if (events == .array) {
+                        for (events.array.items) |event| {
+                            if (event != .object) continue;
+                            const kind = event.object.get("kind") orelse .null;
+                            if (kind == .string and std.mem.eql(u8, kind.string, "assistant_delta")) saw_delta = true;
+                        }
+                    }
+                    if (saw_delta) break;
+                }
+                std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
+            }
+            if (!saw_delta) return error.ChatFlipStreamDeltaMissing;
+        }
+        try waitChatTurnTerminal(io, &client, "turn-p5-send", true);
+
+        // Approve contract: the stub provider exposes no approval pause, so
+        // the daemon-direct approve surface pins its absent-approval error.
+        {
+            var approve = try client.call("chat.turn.approve", .{
+                .turn_id = "turn-p5-send",
+                .call_id = "missing-call",
+                .decision = "approve",
+            });
+            defer approve.deinit();
+            const approve_err = approve.response.err orelse return error.ChatFlipApproveShouldReject;
+            if (!std.mem.eql(u8, approve_err.code, "not_found")) return error.ChatFlipApproveWrongCode;
+        }
+
+        // Stop: slow stub turn on the same thread, cancelled mid-run; the
+        // interruption still commits durably (durable-first publication).
+        {
+            var parsed = try client.call("chat.turn.start", .{
+                .turn_id = "turn-p5-stop",
+                .workspace_id = "ws-p5",
+                .local_thread_id = "thread-p5",
+                .project_path = pref_path,
+                .prompt = "slow stop me",
+                .thread_title = "M4P5 flip thread",
+                .provider = "codex",
+                .harness = "local_cli",
+                .fast_mode = false,
+                .test_stub = true,
+            });
+            defer parsed.deinit();
+            if (!parsed.response.isOk()) return error.ChatFlipStopStartFailed;
+
+            var cancel = try client.call("chat.turn.cancel", .{
+                .turn_id = "turn-p5-stop",
+                .followup_pending = false,
+            });
+            defer cancel.deinit();
+            if (!cancel.response.isOk()) return error.ChatFlipCancelFailed;
+        }
+        try waitChatTurnTerminal(io, &client, "turn-p5-stop", true);
+        {
+            var record = try client.call(headless.store.METHOD_CHAT_TURN_RECORD, .{ .turn_id = "turn-p5-stop" });
+            defer record.deinit();
+            if (!record.response.isOk()) return error.ChatFlipStopRecordFailed;
+            const turn = try client.decodeTurnRecord(&record);
+            if (!std.mem.eql(u8, turn.status, "aborted")) return error.ChatFlipStopNotAborted;
+            if (turn.committed_store_revision == null) return error.ChatFlipStopMissingRevision;
+        }
+
+        // Read: durable transcript via chat.thread.get — the same read the
+        // MCP read_chat_thread / `verde live chat read` surface performs.
+        {
+            var get = try client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+                .workspace_id = "ws-p5",
+                .local_thread_id = "thread-p5",
+            });
+            defer get.deinit();
+            if (!get.response.isOk()) return error.ChatFlipReadFailed;
+            const thread = (try client.decodeThreadGet(&get)).thread;
+            if (!std.mem.eql(u8, thread.title, "M4P5 flip thread")) return error.ChatFlipReadTitle;
+            durable_msg_count = thread.messages.len;
+            var saw_prompt = false;
+            var saw_reply = false;
+            for (thread.messages) |message| {
+                if (std.mem.eql(u8, message.body, "hello m4p5")) saw_prompt = true;
+                if (std.mem.eql(u8, message.body, "stub-ok")) saw_reply = true;
+            }
+            if (!saw_prompt or !saw_reply or durable_msg_count < 2) return error.ChatFlipReadTranscript;
+        }
+
+        // Exit without any consume: M4-P4 gate accepts committed unconsumed turns.
+        var prepare = try client.call("daemon.prepareShutdown", .{});
+        defer prepare.deinit();
+        if (!prepare.response.isOk()) return error.ChatFlipPrepareFailed;
+        kill_on_unwind = false;
+        _ = child.wait(io) catch {};
+    }
+
+    // --- Launch 2 (daemon restart): flipped surface stays durable + advertised ---
+    {
+        var child2 = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{
+            .store_dir = store_dir,
+            .chat_stub = true,
+        });
+        var kill_on_unwind = true;
+        errdefer if (kill_on_unwind) child2.kill(io);
+
+        var decode_arena2 = std.heap.ArenaAllocator.init(allocator);
+        defer decode_arena2.deinit();
+        var transport2: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena2.allocator(),
+            .pref_path = pref_path,
+        };
+        var client2 = sessionizer.headlessClient(decode_arena2.allocator(), &transport2);
+
+        {
+            const empty_params: struct {} = .{};
+            var status_parsed = try client2.call("core.status", empty_params);
+            defer status_parsed.deinit();
+            if (!status_parsed.response.isOk()) return error.ChatFlipRestartStatusFailed;
+            const status = try client2.decodeStatus(&status_parsed);
+            if (!status.capabilities.chat) return error.ChatFlipRestartCapabilityFalse;
+        }
+
+        var get2 = try client2.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+            .workspace_id = "ws-p5",
+            .local_thread_id = "thread-p5",
+        });
+        defer get2.deinit();
+        if (!get2.response.isOk()) return error.ChatFlipRestartReadFailed;
+        const thread2 = (try client2.decodeThreadGet(&get2)).thread;
+        if (thread2.messages.len != durable_msg_count) return error.ChatFlipRestartMsgCount;
+
+        var record2 = try client2.call(headless.store.METHOD_CHAT_TURN_RECORD, .{ .turn_id = "turn-p5-send" });
+        defer record2.deinit();
+        if (!record2.response.isOk()) return error.ChatFlipRestartRecordFailed;
+        const turn2 = try client2.decodeTurnRecord(&record2);
+        if (!std.mem.eql(u8, turn2.status, "completed")) return error.ChatFlipRestartRecordStatus;
+        if (turn2.committed_store_revision == null) return error.ChatFlipRestartRecordRevision;
+
+        var prepare2 = try client2.call("daemon.prepareShutdown", .{});
+        defer prepare2.deinit();
+        if (!prepare2.response.isOk()) return error.ChatFlipRestartPrepareFailed;
+        kill_on_unwind = false;
+        _ = child2.wait(io) catch {};
+    }
 }
 
 fn runIntegration(allocator: std.mem.Allocator, io: std.Io) !void {

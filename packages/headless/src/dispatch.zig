@@ -169,8 +169,9 @@ test "core.status happy path with fake context" {
     try std.testing.expectEqual(@as(usize, 3), status.session_count);
     try std.testing.expectEqual(@as(usize, 5), status.chat_turn_count);
     try std.testing.expect(status.capabilities.terminal_raw);
-    // M4-P4: chat capability remains false (advertisement is M4-P5).
-    try std.testing.expect(!status.capabilities.chat);
+    // M4-P5 flip: chat is advertised in the same commit that routes the
+    // MCP/CLI chat tools daemon-direct (was pinned false through M4-P4).
+    try std.testing.expect(status.capabilities.chat);
     try std.testing.expect(!status.capabilities.terminal_grid);
     try std.testing.expect(!status.capabilities.processes);
     try std.testing.expect(!status.capabilities.leases);
@@ -192,6 +193,8 @@ test "core.capabilities content" {
     try std.testing.expectEqual(protocol.MIN_SUPPORTED_PROTOCOL_VERSION, caps.min_supported);
     try std.testing.expectEqual(protocol.MAX_SUPPORTED_PROTOCOL_VERSION, caps.max_supported);
     try std.testing.expect(caps.capabilities.terminal_raw);
+    // M4-P5 flip: buildCapabilities advertises chat with the MCP/CLI flip.
+    try std.testing.expect(caps.capabilities.chat);
     try std.testing.expect(!caps.capabilities.browser_presentation);
     try std.testing.expect(!caps.capabilities.browser.available);
     try std.testing.expect(!caps.capabilities.isFeatureAvailable(.browser_screenshot));
