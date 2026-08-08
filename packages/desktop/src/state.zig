@@ -20,6 +20,7 @@ const loop_wakeup = @import("loop_wakeup");
 const platform_paths = @import("platform_paths");
 const platform_runtime = @import("platform_runtime");
 const platform_process = @import("platform/process.zig");
+const platform_ipc = @import("platform/ipc.zig");
 const workspace_identity = @import("platform/workspace_identity.zig");
 const process_env = @import("platform/env.zig");
 const provider_hooks = @import("providers/hooks.zig");
@@ -106,6 +107,10 @@ fn projectionStaleAt(
     return now_ms - basis > CHANGE_CURSOR_STALE_AFTER_MS;
 }
 
+fn projectionRefreshApplyGate(dirty: bool, flush_in_flight: bool, has_rebase: bool) bool {
+    return !flush_in_flight and (!dirty or has_rebase);
+}
+
 /// Coalesced main-loop refresh signals derived from change-journal entries.
 pub const ChangeCursorSignals = struct {
     /// Registry/workspace-plane resources changed (workspace, surface,
@@ -164,6 +169,9 @@ pub const ChangeCursorLoopState = struct {
     mutex: Mutex = .{},
     pending: ChangeCursorSignals = .{},
     pending_refresh: ?*OwnedProjectionRefresh = null,
+    /// 0=no report, 1=applied, 2=failed/deferred. Written by the frame after
+    /// taking a refresh and consumed by the worker before its next fetch.
+    refresh_apply_outcome: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
     pub fn publish(self: *ChangeCursorLoopState, signals: ChangeCursorSignals) void {
         if (!signals.any()) return;
@@ -202,6 +210,18 @@ pub const ChangeCursorLoopState = struct {
         return self.pending_refresh != null;
     }
 
+    pub fn noteRefreshApplication(self: *ChangeCursorLoopState, success: bool) void {
+        self.refresh_apply_outcome.store(if (success) 1 else 2, .release);
+    }
+
+    pub fn takeRefreshApplication(self: *ChangeCursorLoopState) ?bool {
+        return switch (self.refresh_apply_outcome.swap(0, .acq_rel)) {
+            1 => true,
+            2 => false,
+            else => null,
+        };
+    }
+
     /// Flag-only: lets an in-flight long-poll drain concurrently with the
     /// rest of deinit before the blocking join happens.
     pub fn beginShutdown(self: *ChangeCursorLoopState) void {
@@ -236,7 +256,8 @@ const ChangeCursorPollOutcome = enum { advanced, heartbeat, snapshot_required, b
 
 fn fetchOwnedCompositeSnapshot(storage: *const Storage) ?*OwnedProjectionRefresh {
     const refresh = OwnedProjectionRefresh.create(storage.allocator) catch return null;
-    errdefer refresh.deinit();
+    var refresh_owned = true;
+    defer if (refresh_owned) refresh.deinit();
     const allocator = refresh.arena.allocator();
     var transport: sessionizer.HeadlessTransport = .{
         .allocator = allocator,
@@ -260,6 +281,7 @@ fn fetchOwnedCompositeSnapshot(storage: *const Storage) ?*OwnedProjectionRefresh
     {
         return null;
     }
+    refresh_owned = false;
     return refresh;
 }
 
@@ -336,13 +358,23 @@ fn fetchCompositeSnapshotSeed(storage: *const Storage, loop: *ChangeCursorLoopSt
 fn changeCursorLoopMain(storage: *const Storage, loop: *ChangeCursorLoopState) void {
     var backoff_ms: u64 = CHANGE_CURSOR_RETRY_MIN_MS;
     while (!loop.shutdown.load(.acquire)) {
+        if (loop.takeRefreshApplication()) |applied| {
+            if (applied) {
+                backoff_ms = CHANGE_CURSOR_RETRY_MIN_MS;
+            } else {
+                changeCursorSleep(loop, backoff_ms);
+                backoff_ms = @min(backoff_ms * 2, CHANGE_CURSOR_RETRY_MAX_MS);
+            }
+        }
         if (loop.refreshPending()) {
             changeCursorSleep(loop, CHANGE_CURSOR_SHUTDOWN_SLICE_MS);
             continue;
         }
         if (storage.currentChangeCursorForPoll()) |cursor| {
             switch (pollCoreChangesOnce(storage, loop, cursor)) {
-                .advanced => backoff_ms = CHANGE_CURSOR_RETRY_MIN_MS,
+                // Publication is not success: the frame reports whether the
+                // complete generation applied transactionally.
+                .advanced => {},
                 .heartbeat => changeCursorSleep(loop, CHANGE_CURSOR_BUSY_RETRY_MS),
                 // Loop straight around: the fallback snapshot runs on the next
                 // iteration through the null-cursor arm below.
@@ -354,7 +386,7 @@ fn changeCursorLoopMain(storage: *const Storage, loop: *ChangeCursorLoopState) v
                 },
             }
         } else if (fetchCompositeSnapshotSeed(storage, loop)) {
-            backoff_ms = CHANGE_CURSOR_RETRY_MIN_MS;
+            // Wait for the frame's application report before resetting.
         } else {
             changeCursorSleep(loop, backoff_ms);
             backoff_ms = @min(backoff_ms * 2, CHANGE_CURSOR_RETRY_MAX_MS);
@@ -526,6 +558,56 @@ fn compositeSnapshotToPersisted(
         .draft = snapshot.draft,
         .messages = if (snapshot.messages) |messages| try snapshotMessagesToPersisted(allocator, messages) else null,
     };
+}
+
+/// Rebase UI-owned edits from a conflicted capture onto the fresh daemon
+/// projection. Only matching durable identities are overlaid: daemon-deleted
+/// workspaces are never resurrected, and daemon transcript rows/identities
+/// remain authoritative.
+fn overlayConflictedLocalEdits(remote: *PersistedState, local: PersistedState) void {
+    remote.sidebar_collapsed = local.sidebar_collapsed;
+    const remote_projects = @constCast(remote.projects);
+    for (remote_projects) |*remote_project| {
+        const remote_id = remote_project.id orelse continue;
+        const local_project = blk: {
+            for (local.projects) |candidate| {
+                const candidate_id = candidate.id orelse continue;
+                if (std.mem.eql(u8, candidate_id, remote_id)) break :blk candidate;
+            }
+            continue;
+        };
+        remote_project.label = local_project.label;
+        remote_project.collapsed = local_project.collapsed;
+        remote_project.thread_list_expanded = local_project.thread_list_expanded;
+        remote_project.terminal_height = local_project.terminal_height;
+        remote_project.terminal_layout_json = local_project.terminal_layout_json;
+        remote_project.terminal_docks_json = local_project.terminal_docks_json;
+        remote_project.workspace_layout_json = local_project.workspace_layout_json;
+        remote_project.selected_thread_index = local_project.selected_thread_index;
+        remote_project.companion_thread_local_id = local_project.companion_thread_local_id;
+        remote_project.herdr_link = local_project.herdr_link;
+
+        const remote_threads = @constCast(remote_project.threads orelse continue);
+        const local_threads = local_project.threads orelse continue;
+        for (remote_threads) |*remote_thread| {
+            const remote_thread_id = remote_thread.local_thread_id orelse continue;
+            for (local_threads) |local_thread| {
+                const local_thread_id = local_thread.local_thread_id orelse continue;
+                if (!std.mem.eql(u8, local_thread_id, remote_thread_id)) continue;
+                remote_thread.title = local_thread.title;
+                remote_thread.archived = local_thread.archived;
+                remote_thread.model_ref = local_thread.model_ref;
+                remote_thread.reasoning_effort = local_thread.reasoning_effort;
+                remote_thread.reasoning_variant = local_thread.reasoning_variant;
+                remote_thread.fast_mode = local_thread.fast_mode;
+                remote_thread.access_mode = local_thread.access_mode;
+                remote_thread.tui_dock_id = local_thread.tui_dock_id;
+                remote_thread.draft = local_thread.draft;
+                remote_thread.draft_image = local_thread.draft_image;
+                break;
+            }
+        }
+    }
 }
 
 pub fn paletteUiTextPrefixWidth(text: []const u8, font_size: f32, end: usize) f32 {
@@ -2191,11 +2273,10 @@ pub const AppState = struct {
         } else {
             try state.seedDefaultState();
         }
-        // M5-P4: the launch-time chat.turn.list adoption sweep is now
-        // cursor-triggered — the change-cursor loop's first composite
-        // snapshot publishes a resync signal whose frame drain runs
-        // restoreDaemonChatTurnsOnLaunch (and again on every chat-topic
-        // change entry; the sweep is idempotent per-thread).
+        // Launch reconciliation is cursor-driven: the owned composite result
+        // carries live and terminal turn records. The frame attaches live
+        // turns, presents terminal failures, and queues retention cleanup
+        // without running chat.turn.list/record RPCs on the SDL thread.
         state.loadCursorModelOptionsDiskCache() catch |err| {
             log.warn("failed to load Cursor model cache: {s}", .{@errorName(err)});
             state.clearCursorModelOptions();
@@ -3505,6 +3586,8 @@ pub const AppState = struct {
     pub const restoreDaemonChatTurnsOnLaunch = chat_controller.restoreDaemonChatTurnsOnLaunch;
     pub const applyDaemonChatTurnsSnapshot = chat_controller.applyDaemonChatTurnsSnapshot;
     pub const clearSatisfiedAdoptionRepairs = chat_controller.clearSatisfiedAdoptionRepairs;
+    pub const hasUnresolvedAdoptionRows = chat_controller.hasUnresolvedAdoptionRows;
+    pub const reconcileTerminalDaemonChatTurnsSnapshot = chat_controller.reconcileTerminalDaemonChatTurnsSnapshot;
     pub const threadByLocalId = chat_controller.threadByLocalId;
     pub const projectThreadIndexByLocalId = chat_controller.projectThreadIndexByLocalId;
     pub const resolveThreadApprovalByLocalId = chat_controller.resolveThreadApprovalByLocalId;
@@ -8249,6 +8332,7 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit provider processes shutdown", .{});
         self.flushDirtyBlocking();
         runtime_log.diagnostic("AppState.deinit dirty state flushed", .{});
+        self.lifecycle.deinit();
         self.file_search_controller.deinit(self.allocator);
         self.composer_controller.composer.deinit(self.allocator);
         self.companion_composer.deinit(self.allocator);
@@ -8420,36 +8504,102 @@ pub const AppState = struct {
         if (self.change_cursor_loop.takeRefresh()) |refresh| {
             defer refresh.deinit();
             self.applyDaemonProjectionRefresh(refresh.result) catch |err| {
+                self.change_cursor_loop.noteRefreshApplication(false);
                 // The cursor is deliberately still old: the worker will
                 // re-read this dirty range on its next iteration.
                 log.warn("failed to apply daemon projection refresh: {s}", .{@errorName(err)});
+                return;
             };
+            self.change_cursor_loop.noteRefreshApplication(true);
         }
         const signals = self.change_cursor_loop.take();
         self.pollDaemonProjectionStaleness();
         if (signals.registry or signals.resync) self.terminal_controller.poll_requested = true;
     }
 
-    fn applyDaemonProjectionRefresh(self: *AppState, result: headless.store.CoreSnapshotResult) !void {
+    pub fn applyDaemonProjectionRefresh(self: *AppState, result: headless.store.CoreSnapshotResult) !void {
+        if (!projectionRefreshApplyGate(
+            self.lifecycle.dirty,
+            self.lifecycle.flush_in_flight,
+            self.lifecycle.rebase_snapshot != null,
+        )) return error.ProjectionRefreshDeferred;
         const envelope = result.envelope orelse return error.MissingProjectionEnvelope;
         const cursor = result.change_cursor orelse return error.MissingProjectionCursor;
         var conversion_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer conversion_arena.deinit();
-        const persisted = try compositeSnapshotToPersisted(conversion_arena.allocator(), result.snapshot);
+        var persisted = try compositeSnapshotToPersisted(conversion_arena.allocator(), result.snapshot);
+        if (self.lifecycle.rebase_snapshot) |*local| overlayConflictedLocalEdits(&persisted, local.value);
 
-        // Apply before publishing cursor, durable guard, or sync freshness.
-        self.clearProjects();
-        self.clearSurfaces();
-        try self.applyPersisted(persisted);
-        try self.applyDaemonRegistryProjection(result.processes, result.leases);
-        self.applyDaemonChatTurnsSnapshot(result.turns);
+        // Build the complete replacement behind a shallow AppState view whose
+        // owned projection containers are empty. No live pointer is changed
+        // until every allocation (projects, leases, sessions, nonce) succeeds.
+        var staged = self.*;
+        staged.project_controller = .{};
+        staged.surface_controller = .{};
+        staged.chat_controller.pending_send_count = 0;
+        var staged_owned = true;
+        errdefer if (staged_owned) deinitProjectionContainers(self.allocator, &staged.project_controller, &staged.surface_controller);
+        try staged.applyPersisted(persisted);
+        try staged.applyDaemonRegistryProjection(result.processes, result.leases);
+        staged.applyDaemonChatTurnsSnapshot(result.turns);
+        var staged_sessions = try terminal_controller.buildDaemonSessionProjection(self.allocator, result.sessions);
+        var sessions_owned = true;
+        errdefer if (sessions_owned) terminal_controller.deinitDaemonSessionProjection(self.allocator, &staged_sessions);
+        const prepared_seed = try self.storage.prepareCompositeSnapshotSeed(envelope, cursor, result.store_revision);
+        var seed_owned = true;
+        errdefer if (seed_owned) self.storage.discardPreparedCompositeSnapshotSeed(prepared_seed);
+
+        const old_projects = self.project_controller;
+        const old_surfaces = self.surface_controller;
+        var old_sessions = self.terminal_controller.daemon_sessions;
+        self.project_controller = staged.project_controller;
+        self.surface_controller = staged.surface_controller;
+        self.sidebar_collapsed = staged.sidebar_collapsed;
+        self.rename_storage = staged.rename_storage;
+        self.transcript_controller.auto_follow_pending = staged.transcript_controller.auto_follow_pending;
+        self.transcript_controller.scroll_to_bottom_frames = staged.transcript_controller.scroll_to_bottom_frames;
+        self.transcript_controller.pending_scroll_px = staged.transcript_controller.pending_scroll_px;
+        self.transcript_controller.pending_page_steps = staged.transcript_controller.pending_page_steps;
+        self.chat_controller.pending_send_count = staged.chat_controller.pending_send_count;
+        self.terminal_controller.daemon_sessions = staged_sessions;
+        staged_owned = false;
+        sessions_owned = false;
+
+        var deinit_projects = old_projects;
+        var deinit_surfaces = old_surfaces;
+        deinitProjectionContainers(self.allocator, &deinit_projects, &deinit_surfaces);
+        terminal_controller.deinitDaemonSessionProjection(self.allocator, &old_sessions);
+        self.clearTranscriptMarkdownSelection();
+        self.clearTranscriptMarkdownEntries();
         self.clearSatisfiedAdoptionRepairs();
-        try self.storage.noteCompositeSnapshotSeed(envelope, cursor, result.store_revision);
+        self.reconcileTerminalDaemonChatTurnsSnapshot(result.turns);
+
+        // Atomic publication boundary: all fallible work and the projection
+        // swap are complete before cursor/write-guard/freshness advance.
+        self.storage.commitPreparedCompositeSnapshotSeed(prepared_seed);
+        seed_owned = false;
+        if (self.lifecycle.rebase_snapshot) |*local| local.deinit();
+        self.lifecycle.rebase_snapshot = null;
         self.daemon_projection_stale = false;
         self.daemon_projection_stale_notified = false;
     }
 
-    fn projectForDaemonId(self: *AppState, workspace_id: []const u8) ?*Project {
+    fn deinitProjectionContainers(
+        allocator: std.mem.Allocator,
+        projects: *project_controller.State,
+        surfaces: *surface_controller.State,
+    ) void {
+        for (projects.projects.items) |*project| project.deinit(allocator);
+        projects.projects.deinit(allocator);
+        for (projects.archived_projects.items) |*project| project.deinit(allocator);
+        projects.archived_projects.deinit(allocator);
+        for (surfaces.surfaces.items) |*surface| surface.deinit(allocator);
+        surfaces.surfaces.deinit(allocator);
+        projects.* = .{};
+        surfaces.* = .{};
+    }
+
+    pub fn projectForDaemonId(self: *AppState, workspace_id: []const u8) ?*Project {
         for (self.project_controller.projects.items) |*project| {
             if (std.mem.eql(u8, project.id, workspace_id)) return project;
         }
@@ -11543,6 +11693,11 @@ test "M5-P4 cursor signal bridge coalesces publishes and drains non-blocking" {
     try std.testing.expect(!second.any());
     loop.publish(.{ .resync = true });
     try std.testing.expect(loop.take().resync);
+    loop.noteRefreshApplication(false);
+    try std.testing.expectEqual(false, loop.takeRefreshApplication().?);
+    try std.testing.expect(loop.takeRefreshApplication() == null);
+    loop.noteRefreshApplication(true);
+    try std.testing.expectEqual(true, loop.takeRefreshApplication().?);
 }
 
 test "M5-P4 composite conversion matches the pull-driven durable projection" {
@@ -11582,23 +11737,145 @@ test "M5-P4 composite conversion matches the pull-driven durable projection" {
     try std.testing.expectEqualStrings("durable mutation", persisted.projects[0].threads.?[0].messages[0].body);
     try std.testing.expectEqual(Provider.codex, persisted.projects[0].threads.?[0].provider);
     try std.testing.expectEqual(@as(usize, 1), persisted.chat_completions.len);
+
+    var tmp_pull = std.testing.tmpDir(.{});
+    defer tmp_pull.cleanup();
+    var pull_path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const pull_len = try tmp_pull.dir.realPath(std.testing.io, &pull_path);
+    var pull_storage = try Storage.initWithPrefPath(std.testing.allocator, pull_path[0..pull_len]);
+    defer pull_storage.deinit();
+    var pull_state = try AppState.init(std.testing.allocator, &pull_storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer pull_state.deinit();
+    pull_state.clearProjects();
+    pull_state.clearSurfaces();
+    try pull_state.applyPersisted(persisted);
+
+    var tmp_cursor = std.testing.tmpDir(.{});
+    defer tmp_cursor.cleanup();
+    var cursor_path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cursor_len = try tmp_cursor.dir.realPath(std.testing.io, &cursor_path);
+    var cursor_storage = try Storage.initWithPrefPath(std.testing.allocator, cursor_path[0..cursor_len]);
+    defer cursor_storage.deinit();
+    var cursor_state = try AppState.init(std.testing.allocator, &cursor_storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer cursor_state.deinit();
+    cursor_state.lifecycle.dirty = false;
+    try cursor_state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{
+            .store_revision = 11,
+            .workspaces = &workspaces,
+            .chat_completions = &.{.{
+                .workspace_id = "daemon-workspace",
+                .local_thread_id = "daemon-thread",
+                .completed_at_ms = 12,
+            }},
+        },
+        .store_revision = 11,
+        .envelope = .{ .instance_nonce = "equivalence", .registry_revision = 1 },
+        .change_cursor = 5,
+    });
+    try std.testing.expectEqual(pull_state.project_controller.projects.items.len, cursor_state.project_controller.projects.items.len);
+    const pull_project = &pull_state.project_controller.projects.items[0];
+    const cursor_project = &cursor_state.project_controller.projects.items[0];
+    try std.testing.expectEqualStrings(pull_project.id, cursor_project.id);
+    try std.testing.expectEqual(pull_project.threads.items.len, cursor_project.threads.items.len);
+    try std.testing.expectEqualStrings(
+        pull_project.threads.items[0].messages.items[0].message_id.?,
+        cursor_project.threads.items[0].messages.items[0].message_id.?,
+    );
+    try std.testing.expectEqualStrings(
+        pull_project.threads.items[0].messages.items[0].body,
+        cursor_project.threads.items[0].messages.items[0].body,
+    );
 }
 
 test "M5-P4 stalled daemon worker cannot block frame-side bridge drain" {
-    const stalledPublish = struct {
-        fn run(loop: *ChangeCursorLoopState) void {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const pref_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "/tmp/verde116/m5p4-stall-{d}",
+        .{platform_runtime.unixTimestampMs()},
+    );
+    defer std.testing.allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, pref_path);
+    const endpoint = try sessionizer.socketPath(std.testing.allocator, pref_path);
+    defer std.testing.allocator.free(endpoint);
+    const StallServer = struct {
+        allocator: std.mem.Allocator,
+        endpoint: []const u8,
+        ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        request_started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn shouldStop(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.stop.load(.acquire);
+        }
+        fn handle(raw: *anyopaque, request: []u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.allocator.free(request);
+            self.request_started.store(true, .release);
             platform_runtime.sleepMillis(200);
-            loop.publish(.{ .chat = true });
+            return try self.allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":\"invalid_state\",\"message\":\"stalled test\"}}");
+        }
+        fn onReady(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ready.store(true, .release);
+        }
+        fn run(self: *@This()) void {
+            platform_ipc.serve(self.allocator, self.endpoint, .{
+                .context = self,
+                .should_stop = shouldStop,
+                .handle_request = handle,
+                .on_ready = onReady,
+            }, .{}) catch {};
+        }
+    };
+    var server: StallServer = .{ .allocator = std.testing.allocator, .endpoint = endpoint };
+    const server_thread = try std.Thread.spawn(.{}, StallServer.run, .{&server});
+    defer {
+        server.stop.store(true, .release);
+        platform_ipc.wake(std.testing.allocator, endpoint, .{});
+        server_thread.join();
+    }
+    var ready_attempts: usize = 0;
+    while (!server.ready.load(.acquire) and ready_attempts < 100) : (ready_attempts += 1) {
+        platform_runtime.sleepMillis(5);
+    }
+    if (!server.ready.load(.acquire)) return error.StallServerNotReady;
+
+    var storage = try Storage.initWithPrefPath(std.testing.allocator, pref_path);
+    defer storage.deinit();
+    const stalledFetch = struct {
+        fn run(store: *const Storage) void {
+            if (fetchOwnedCompositeSnapshot(store)) |refresh| refresh.deinit();
         }
     }.run;
-    var loop: ChangeCursorLoopState = .{};
-    const worker = try std.Thread.spawn(.{}, stalledPublish, .{&loop});
+    const worker = try std.Thread.spawn(.{}, stalledFetch, .{&storage});
+    var request_attempts: usize = 0;
+    while (!server.request_started.load(.acquire) and request_attempts < 100) : (request_attempts += 1) {
+        platform_runtime.sleepMillis(5);
+    }
+    if (!server.request_started.load(.acquire)) return error.StallRequestNotStarted;
+    var state: AppState = undefined;
+    state.storage = &storage;
+    state.change_cursor_loop = .{};
+    state.daemon_projection_has_saved_state = false;
+    state.daemon_projection_bootstrap_started_at_ms = 0;
+    state.daemon_projection_stale = false;
+    state.daemon_projection_stale_notified = false;
+    state.terminal_controller.poll_requested = false;
     const started_ms = platform_runtime.unixTimestampMs();
-    try std.testing.expect(!loop.take().any());
+    state.drainChangeCursorSignals();
     const drain_ms = platform_runtime.unixTimestampMs() - started_ms;
-    try std.testing.expect(drain_ms < 50);
+    if (drain_ms >= 50) return error.FrameDrainBlocked;
     worker.join();
-    try std.testing.expect(loop.take().chat);
 }
 
 test "M5-P4 stale status covers saved bootstrap and clears after applied refresh" {
@@ -11608,6 +11885,11 @@ test "M5-P4 stale status covers saved bootstrap and clears after applied refresh
     try std.testing.expect(!projectionStaleAt(false, started_ms, 0, started_ms + CHANGE_CURSOR_STALE_AFTER_MS + 1));
     const applied_ms = started_ms + CHANGE_CURSOR_STALE_AFTER_MS + 1;
     try std.testing.expect(!projectionStaleAt(true, started_ms, applied_ms, applied_ms));
+    // Exercise the same gate used by applyDaemonProjectionRefresh: neither an
+    // in-flight capture nor unrebased dirty state may clear stale status.
+    try std.testing.expect(!projectionRefreshApplyGate(false, true, false));
+    try std.testing.expect(!projectionRefreshApplyGate(true, false, false));
+    try std.testing.expect(projectionRefreshApplyGate(true, false, true));
 }
 
 test "M5-P4 cursor loop shutdown flag interrupts sleeps and join is idempotent" {

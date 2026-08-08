@@ -36,6 +36,11 @@ const live_endpoint = @import("platform/live_endpoint.zig");
 // full SDL3 module set, and only initWithPrefPath (no SDL pref-path lookup) is
 // used.
 const state_storage = @import("state/storage.zig");
+// The real AppState belt arm is POSIX-only. Keeping these imports target-lazy
+// preserves the pinned Windows Debug cross-check, whose full Ghostty UI graph
+// has a known target-layout assertion unrelated to this headless IT binary.
+const desktop_state = if (builtin.os.tag == .linux or builtin.os.tag == .macos) @import("state.zig") else struct {};
+const app_config = if (builtin.os.tag == .linux or builtin.os.tag == .macos) @import("app/config.zig") else struct {};
 
 /// PTY / process-group / Unix-signal scenarios (forkpty, waitpid, kill(pid,0)).
 const posix_pty_supported = switch (builtin.os.tag) {
@@ -2118,6 +2123,7 @@ fn runGuiReopenRevisionScenario(allocator: std.mem.Allocator, io: std.Io) !void 
             },
             .snapshot = .{
                 .schema_version = 1,
+                .store_revision = receipt_revision,
                 .workspaces = &.{.{
                     .workspace_id = "m3p3-gui-ws",
                     .label = "GUI reopen",
@@ -2172,6 +2178,7 @@ fn runGuiReopenRevisionScenario(allocator: std.mem.Allocator, io: std.Io) !void 
             },
             .snapshot = .{
                 .schema_version = 1,
+                .store_revision = receipt_revision,
                 .workspaces = &.{.{
                     .workspace_id = "m3p3-gui-ws",
                     .label = "GUI reopen",
@@ -2318,6 +2325,7 @@ fn runCliGuiSimultaneousConflictScenario(allocator: std.mem.Allocator, io: std.I
             },
             .snapshot = .{
                 .schema_version = 1,
+                .store_revision = fresh,
                 .workspaces = &.{.{
                     .workspace_id = "m3p3-conflict-a",
                     .label = "A recovered",
@@ -3147,6 +3155,7 @@ fn runStoreFullSurfaceScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             },
             .snapshot = .{
                 .schema_version = 1,
+                .store_revision = last_revision,
                 .workspaces = &.{.{
                     .workspace_id = "s3-full-snap",
                     .label = "Snap",
@@ -3626,7 +3635,7 @@ fn runM5ChangesJournalScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             .client_id = client_id,
             .expected_store_revision = surface_write.store_revision,
         },
-        .snapshot = .{ .schema_version = 1 },
+        .snapshot = .{ .schema_version = 1, .store_revision = surface_write.store_revision },
         .bootstrap = false,
     };
     var wipe_parsed = try client.call(headless.store.METHOD_STATE_SNAPSHOT_REPLACE, wipe);
@@ -3673,7 +3682,7 @@ fn runM5ChangesJournalScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     }
     if (!found_surface_star) return error.M5ChangesA3SurfaceStarMissing;
 
-    const chat_topics = [_][]const u8{ "chat.thread", "chat.completion" };
+    const chat_topics = [_][]const u8{ "chat.thread", "chat.turn", "chat.completion" };
     const wipe_chat_req: headless.changes_protocol.ChangesRequest = .{
         .cursor = surface_poll_result.next_cursor,
         .topics = &chat_topics,
@@ -3683,14 +3692,16 @@ fn runM5ChangesJournalScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     if (!wipe_chat.response.isOk()) return error.M5ChangesA3ChatFilterFailed;
     const wipe_chat_result = try client.decodeChanges(&wipe_chat);
     var found_thread_star = false;
+    var found_turn_star = false;
     var found_completion_star = false;
     for (wipe_chat_result.entries) |entry| {
         if (!std.mem.eql(u8, entry.resource_id, "*")) return error.M5ChangesA3ChatUnexpectedEntry;
         if ((entry.store_revision orelse 0) != wipe_write.store_revision) return error.M5ChangesA3ChatRevision;
         if (std.mem.eql(u8, entry.topic, "chat.thread")) found_thread_star = true;
+        if (std.mem.eql(u8, entry.topic, "chat.turn")) found_turn_star = true;
         if (std.mem.eql(u8, entry.topic, "chat.completion")) found_completion_star = true;
     }
-    if (!found_thread_star or !found_completion_star) return error.M5ChangesA3ChatStarMissing;
+    if (!found_thread_star or !found_turn_star or !found_completion_star) return error.M5ChangesA3ChatStarMissing;
 
     // Carried-surface half of the fix: a NON-empty replace journals each
     // carried surface_state per-resource (matching the surface_upsert arm),
@@ -3714,6 +3725,7 @@ fn runM5ChangesJournalScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         },
         .snapshot = .{
             .schema_version = 1,
+            .store_revision = wipe_write.store_revision,
             .workspaces = &carried_workspaces,
             .surface_states = &carried_surfaces,
         },
@@ -5027,7 +5039,12 @@ fn runM5P4WorkspaceBeltScenario(allocator: std.mem.Allocator, io: std.Io) !void 
     // Capture after the intervening durable mutation. This owned wire payload
     // is what the desktop projection application must render before it may
     // publish the seed cursor/revision.
-    const capture_scopes = [_][]const u8{headless.store.SNAPSHOT_SCOPE_STORE};
+    const capture_scopes = [_][]const u8{
+        headless.store.SNAPSHOT_SCOPE_STORE,
+        headless.store.SNAPSHOT_SCOPE_REGISTRY,
+        headless.store.SNAPSHOT_SCOPE_SESSIONS,
+        headless.store.SNAPSHOT_SCOPE_TURNS,
+    };
     var captured = try client.call(
         headless.store.METHOD_CORE_SNAPSHOT,
         headless.store.CoreSnapshotRequest{ .scopes = &capture_scopes },
@@ -5044,24 +5061,36 @@ fn runM5P4WorkspaceBeltScenario(allocator: std.mem.Allocator, io: std.Io) !void 
     }
     if (!captured_mutation) return error.M5P4BeltCaptureMutationMissing;
 
-    // Pin the durable revision for the guarded flush.
-    var status_parsed = try client.call(headless.store.METHOD_DAEMON_STORE_STATUS, .{});
-    defer status_parsed.deinit();
-    if (!status_parsed.response.isOk()) return error.M5P4BeltStatusFailed;
-    const status_result = status_parsed.response.result orelse return error.M5P4BeltStatusMissing;
-    const revision_value = status_result.object.get("store_revision") orelse return error.M5P4BeltStatusMissingRevision;
-    if (revision_value != .integer) return error.M5P4BeltStatusMalformed;
-    const flush_expected: u64 = @intCast(revision_value.integer);
-
-    // GUI flush applies the captured payload verbatim. The mutation that was
-    // absent from the initial RO load must survive this replacement.
+    // Run the REAL desktop build-then-swap apply and real persistence capture
+    // path on the native POSIX IT tier. The Windows transport tier retains the
+    // original wire replacement so the pinned Debug cross-build stays focused
+    // on headless portability instead of importing Ghostty's full UI graph.
     var first_flush_revision: u64 = 0;
-    {
+    if (comptime posix_pty_supported) {
+        var gui_storage = try state_storage.Storage.initWithPrefPath(allocator, store_dir);
+        defer gui_storage.deinit();
+        var gui_state = try desktop_state.AppState.init(allocator, &gui_storage, app_config.AppConfig{}, .{
+            .gl_texture_uploads_enabled = false,
+            .browser_textures_enabled = false,
+        });
+        defer gui_state.deinit();
+        try gui_state.applyDaemonProjectionRefresh(captured_result);
+        const rendered = gui_state.projectForDaemonId("ws-belt-it") orelse return error.M5P4BeltApplyWorkspaceMissing;
+        const rendered_thread = rendered.threads.items[0];
+        if (rendered_thread.messages.items.len < 2) return error.M5P4BeltApplyTranscriptMissing;
+        var flush_payload = try gui_state.buildPersistedState(allocator);
+        defer flush_payload.deinit();
+        const observed_revision = gui_storage.currentProjectionObservedRevision();
+        if (observed_revision != captured_result.store_revision) return error.M5P4BeltApplyRevisionMismatch;
+        try gui_storage.saveCaptured(flush_payload.value, observed_revision);
+        first_flush_revision = gui_storage.currentStoreRevision();
+        if (first_flush_revision != observed_revision + 1) return error.M5P4BeltFlushRevision;
+    } else {
         const flush: headless.store.SnapshotReplaceRequest = .{
             .mutation = .{
                 .request_key = "m5p4-belt-flush",
                 .client_id = client_id,
-                .expected_store_revision = flush_expected,
+                .expected_store_revision = captured_result.store_revision,
             },
             .snapshot = captured_result.snapshot,
         };
@@ -5069,7 +5098,8 @@ fn runM5P4WorkspaceBeltScenario(allocator: std.mem.Allocator, io: std.Io) !void 
         defer parsed.deinit();
         if (!parsed.response.isOk()) return error.M5P4BeltFlushFailed;
         const result = try client.decodeWriteResult(&parsed);
-        if (!result.applied or result.store_revision != flush_expected + 1) return error.M5P4BeltFlushRevision;
+        if (!result.applied or result.store_revision != captured_result.store_revision + 1)
+            return error.M5P4BeltFlushRevision;
         first_flush_revision = result.store_revision;
     }
 
@@ -5154,6 +5184,14 @@ fn runM5P4WorkspaceBeltScenario(allocator: std.mem.Allocator, io: std.Io) !void 
         )) orelse return error.M5P4BeltLedgerRowMissing;
         defer row.deinit();
         if (row.int(0) != 0) return error.M5P4BeltLedgerSurvivedDeletion;
+    }
+    {
+        const row = (try conn.row(
+            "select count(*) from terminal_turn_replay_guard where turn_id = 'turn-belt-1' and status = 'completed'",
+            .{},
+        )) orelse return error.M5P4BeltReplayGuardMissing;
+        defer row.deinit();
+        if (row.int(0) != 1) return error.M5P4BeltReplayGuardLost;
     }
     {
         const row = (try conn.row("select count(*) from workspaces where workspace_id = 'ws-belt-it'", .{})) orelse
@@ -7654,6 +7692,7 @@ fn runChatDaemonCommitStaleSnapshotConflictScenario(allocator: std.mem.Allocator
             },
             .snapshot = .{
                 .schema_version = 1,
+                .store_revision = fresh,
                 .workspaces = &.{.{
                     .workspace_id = "ws-conflict-recovered",
                     .label = "recovered GUI",

@@ -9,6 +9,7 @@ const platform_runtime = @import("platform_runtime");
 const stack_config = @import("../workspace/stack.zig");
 const terminal = @import("../terminal/terminal.zig");
 const workspace_layout = @import("workspace_layout.zig");
+const headless = @import("headless");
 
 const log = std.log.scoped(.native_shell);
 const deinitWorkspacePaneRef = workspace_layout.deinitWorkspacePaneRef;
@@ -49,6 +50,27 @@ test "managed process maintenance is decoupled from terminal tail cadence" {
     try std.testing.expect(managedProcessPollDue(100, 350));
     try std.testing.expect(managedProcessPollDue(500, 10));
     try std.testing.expectEqual(@as(i64, 16), POLL_INTERVAL_MS);
+}
+
+test "composite session scope becomes an owned bounded projection" {
+    const source = [_]headless.store.SessionSummary{.{
+        .session_id = "session-1",
+        .workspace_id = "workspace-1",
+        .workspace_path = "/tmp/workspace-1",
+        .cwd = "/tmp/workspace-1",
+        .label = "shell",
+        .command = "bash",
+        .dock_id = 2,
+        .pane_id = 3,
+        .pid = 42,
+        .running = true,
+        .status = "running",
+    }};
+    var projection = try buildDaemonSessionProjection(std.testing.allocator, &source);
+    defer deinitDaemonSessionProjection(std.testing.allocator, &projection);
+    try std.testing.expectEqual(@as(usize, 1), projection.items.len);
+    try std.testing.expectEqualStrings("session-1", projection.items[0].session_id);
+    try std.testing.expect(projection.items[0].running);
 }
 
 pub const DefaultAgentTui = struct {
@@ -148,17 +170,91 @@ pub const State = struct {
     last_poll_ms: i64 = 0,
     last_managed_process_poll_ms: i64 = 0,
     poll_requested: bool = false,
-    /// M5-P4 cursor-triggered registry pull: set by the change-cursor drain
-    /// when a registry-plane change entry (or a resync) arrives; consumed by
-    /// pollTerminals to run the M2-P3 pull path across all projects.
-    daemon_registry_pull_requested: bool = false,
     daemon_batch_retry_at_ms: i64 = 0,
     daemon_poll_batch: terminal.DaemonPollBatch = .{},
+    /// Bounded owned projection of the daemon's composite `sessions` scope.
+    /// Terminal byte streams remain owned by their docks; this list supplies
+    /// discovery/lifecycle identity without frame-thread RPC.
+    daemon_sessions: std.ArrayList(OwnedDaemonSessionSummary) = .empty,
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
         self.daemon_poll_batch.deinit(allocator);
+        deinitDaemonSessionProjection(allocator, &self.daemon_sessions);
     }
 };
+
+pub const OwnedDaemonSessionSummary = struct {
+    session_id: []u8,
+    workspace_id: []u8,
+    workspace_path: []u8,
+    cwd: []u8,
+    label: []u8,
+    command: []u8,
+    dock_id: ?u32,
+    pane_id: ?u32,
+    pid: ?i64,
+    running: bool,
+    status: []u8,
+    exit_status: ?i64,
+
+    fn deinit(self: *OwnedDaemonSessionSummary, allocator: std.mem.Allocator) void {
+        allocator.free(self.session_id);
+        allocator.free(self.workspace_id);
+        allocator.free(self.workspace_path);
+        allocator.free(self.cwd);
+        allocator.free(self.label);
+        allocator.free(self.command);
+        allocator.free(self.status);
+    }
+};
+
+pub fn buildDaemonSessionProjection(
+    allocator: std.mem.Allocator,
+    sessions: []const headless.store.SessionSummary,
+) !std.ArrayList(OwnedDaemonSessionSummary) {
+    var out: std.ArrayList(OwnedDaemonSessionSummary) = .empty;
+    errdefer deinitDaemonSessionProjection(allocator, &out);
+    try out.ensureTotalCapacity(allocator, sessions.len);
+    for (sessions) |session| {
+        var owned: OwnedDaemonSessionSummary = .{
+            .session_id = try allocator.dupe(u8, session.session_id),
+            .workspace_id = undefined,
+            .workspace_path = undefined,
+            .cwd = undefined,
+            .label = undefined,
+            .command = undefined,
+            .dock_id = session.dock_id,
+            .pane_id = session.pane_id,
+            .pid = session.pid,
+            .running = session.running,
+            .status = undefined,
+            .exit_status = session.exit_status,
+        };
+        errdefer allocator.free(owned.session_id);
+        owned.workspace_id = try allocator.dupe(u8, session.workspace_id);
+        errdefer allocator.free(owned.workspace_id);
+        owned.workspace_path = try allocator.dupe(u8, session.workspace_path);
+        errdefer allocator.free(owned.workspace_path);
+        owned.cwd = try allocator.dupe(u8, session.cwd);
+        errdefer allocator.free(owned.cwd);
+        owned.label = try allocator.dupe(u8, session.label);
+        errdefer allocator.free(owned.label);
+        owned.command = try allocator.dupe(u8, session.command);
+        errdefer allocator.free(owned.command);
+        owned.status = try allocator.dupe(u8, session.status);
+        out.appendAssumeCapacity(owned);
+    }
+    return out;
+}
+
+pub fn deinitDaemonSessionProjection(
+    allocator: std.mem.Allocator,
+    sessions: *std.ArrayList(OwnedDaemonSessionSummary),
+) void {
+    for (sessions.items) |*session| session.deinit(allocator);
+    sessions.deinit(allocator);
+    sessions.* = .empty;
+}
 
 pub fn currentProjectTerminal(self: anytype) *const terminal.Dock {
     if (self.focusedWorkspaceTerminalDockId()) |dock_id| {
@@ -418,17 +514,9 @@ pub fn pollTerminals(self: anytype) bool {
     }
     self.terminal_controller.poll_requested = false;
     self.terminal_controller.last_poll_ms = now_ms;
-    // M5-P4: a change-cursor registry signal replaces the old per-read daemon
-    // pull. Run the SAME pull path the Live read used (projection equivalence
-    // by construction), across every project so background workspaces stay
-    // fresh for projection-served reads.
-    if (self.terminal_controller.daemon_registry_pull_requested) {
-        self.terminal_controller.daemon_registry_pull_requested = false;
-        var registry_pull_index: usize = 0;
-        while (registry_pull_index < self.project_controller.projects.items.len) : (registry_pull_index += 1) {
-            self.pollWorkspaceTerminalProcessLifecycles(registry_pull_index);
-        }
-    }
+    // Cursor refresh already applied registry + owned session summaries on
+    // the frame. `poll_requested` only wakes the normal bounded tail pass; it
+    // never triggers a second blocking registry pull here.
     const poll_managed_processes = managedProcessPollDue(
         self.terminal_controller.last_managed_process_poll_ms,
         now_ms,
