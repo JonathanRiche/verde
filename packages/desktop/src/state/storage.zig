@@ -20,7 +20,12 @@ const APP_NAME: [:0]const u8 = "Native";
 pub const LEGACY_STATE_FILE_NAME = "state.json";
 pub const PENDING_STATE_SPOOL_FILE_NAME = "pending-state-spool.json";
 const PENDING_STATE_SPOOL_TEMP_FILE_NAME = "pending-state-spool.json.tmp";
-const PENDING_STATE_SPOOL_MAX_BYTES: usize = 64 * 1024 * 1024;
+// A close-time spool contains both the current projection and, when available,
+// its merge baseline. Real stores can therefore require roughly twice their
+// durable JSON footprint. Keep replay bounded, but leave room for two copies of
+// the largest field state seen in production (about 136 MiB).
+const PENDING_STATE_SPOOL_MAX_BYTES: usize = 384 * 1024 * 1024;
+const SNAPSHOT_REQUEST_HEADROOM_BYTES: usize = 64 * 1024;
 const LoadedPersistedState = db_types.LoadedState;
 const PersistedState = db_types.PersistedState;
 const PersistedThread = db_types.PersistedThread;
@@ -201,6 +206,23 @@ pub const Storage = struct {
         return null;
     }
 
+    /// Read the current durable projection through an independent RO
+    /// connection. Composite attach uses this after obtaining the daemon's
+    /// cursor and volatile scopes, avoiding a full-store JSON response while
+    /// retaining a revision paired with the SQLite read transaction.
+    pub fn loadProjection(self: *const Storage, allocator: std.mem.Allocator) !LoadedPersistedState {
+        var client = (try openReadOnlyOptional(allocator, self.pref_path)) orelse {
+            var empty = LoadedPersistedState.init(allocator);
+            empty.store_revision = 0;
+            return empty;
+        };
+        defer client.deinit();
+        if (try client.load(allocator)) |loaded| return loaded;
+        var empty = LoadedPersistedState.init(allocator);
+        empty.store_revision = try client.storeRevision();
+        return empty;
+    }
+
     pub fn loadLegacyJson(self: *const Storage, allocator: std.mem.Allocator) !?LoadedPersistedState {
         var threaded: std.Io.Threaded = .init(allocator, .{});
         defer threaded.deinit();
@@ -250,9 +272,14 @@ pub const Storage = struct {
 
     /// Atomically replace and fsync the close-time spool before state teardown.
     pub fn writePendingStateSpool(self: *const Storage, spool: PendingStateSpool) !void {
+        // Count first so an oversized state cannot make valueAlloc grow beyond
+        // the replay ceiling before the limit is enforced.
+        var counter: std.Io.Writer.Discarding = .init(&.{});
+        try std.json.Stringify.value(spool, .{ .whitespace = .minified }, &counter.writer);
+        if (counter.fullCount() > PENDING_STATE_SPOOL_MAX_BYTES) return error.PendingStateSpoolExceedsReplayLimit;
         const encoded = try std.json.Stringify.valueAlloc(self.allocator, spool, .{ .whitespace = .minified });
         defer self.allocator.free(encoded);
-        if (encoded.len > PENDING_STATE_SPOOL_MAX_BYTES) return error.PendingStateSpoolExceedsReplayLimit;
+        std.debug.assert(encoded.len == counter.fullCount());
         var threaded: std.Io.Threaded = .init(self.allocator, .{});
         defer threaded.deinit();
         // Directory fsync cannot operate on Linux O_PATH handles; iteration
@@ -279,6 +306,15 @@ pub const Storage = struct {
             };
             try dir_file.sync(threaded.io());
         }
+    }
+
+    /// Conservative allocation-free preflight for the compatibility snapshot
+    /// request. The protocol envelope and converted enum strings add bytes, so
+    /// reserve fixed headroom below the daemon's hard request ceiling.
+    pub fn stateFitsSnapshotTransport(_: *const Storage, state: PersistedState) !bool {
+        var counter: std.Io.Writer.Discarding = .init(&.{});
+        try std.json.Stringify.value(state, .{ .whitespace = .minified }, &counter.writer);
+        return counter.fullCount() <= headless.protocol.MAX_MESSAGE_BYTES - SNAPSHOT_REQUEST_HEADROOM_BYTES;
     }
 
     pub fn clearPendingStateSpool(self: *const Storage) !void {
@@ -1013,6 +1049,53 @@ test "RO load pins store_revision from store_state for launch-2 guard" {
     try std.testing.expectEqual(@as(u64, 1), storage.currentStoreRevision());
 }
 
+test "projection load uses an independent coherent RO transaction" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const pref_path = path_buf[0..path_len];
+    const db_path = try std.fs.path.join(std.testing.allocator, &.{ pref_path, db_client.STATE_DB_NAME });
+    defer std.testing.allocator.free(db_path);
+    const projects = [_]db_types.PersistedProject{.{
+        .id = "large-state-workspace",
+        .label = "Loaded without daemon JSON",
+        .path = "/tmp/large-state-workspace",
+    }};
+    {
+        var writer = try db_client.Client.init(std.testing.allocator, pref_path);
+        defer writer.deinit();
+        try writer.save(.{ .projects = &projects });
+    }
+    {
+        const store = @import("../daemon/store.zig");
+        var writer = try store.Store.init(std.testing.allocator, db_path);
+        defer writer.deinit();
+        const result = try writer.applyMutation(.{
+            .workspace_upsert = .{
+                .mutation = .{
+                    .request_key = "projection-load-revision",
+                    .client_id = "test-client",
+                },
+                .workspace = .{
+                    .workspace_id = "large-state-workspace",
+                    .label = "Loaded without daemon JSON",
+                    .path = "/tmp/large-state-workspace",
+                },
+            },
+        });
+        try std.testing.expectEqual(@as(u64, 1), result.store_revision);
+    }
+
+    var storage = try Storage.initWithPrefPath(std.testing.allocator, pref_path);
+    defer storage.deinit();
+    var loaded = try storage.loadProjection(std.testing.allocator);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u64, 1), loaded.store_revision);
+    try std.testing.expectEqual(@as(usize, 1), loaded.value.projects.len);
+    try std.testing.expectEqualStrings("Loaded without daemon JSON", loaded.value.projects[0].label);
+}
+
 test "M5-P4 reconnect-from-cursor: same-instance results advance the cursor and pin the durable revision" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1236,4 +1319,24 @@ test "pending state spool is durable, replayable, and acknowledgement-cleared" {
     try std.testing.expectEqual(@as(?usize, 1), loaded.value.adoption_repairs[0].rows[0].row_index);
     try storage.clearPendingStateSpool();
     try std.testing.expect((try storage.loadPendingStateSpool(std.testing.allocator)) == null);
+}
+
+test "snapshot transport preflight rejects a full-state payload without allocating its request" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(std.testing.allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    try std.testing.expect(try storage.stateFitsSnapshotTransport(.{}));
+
+    const body = try std.testing.allocator.alloc(u8, headless.protocol.MAX_MESSAGE_BYTES);
+    defer std.testing.allocator.free(body);
+    @memset(body, 'x');
+    const messages = [_]db_types.PersistedMessage{.{
+        .role = .assistant,
+        .author = "test",
+        .body = body,
+    }};
+    try std.testing.expect(!try storage.stateFitsSnapshotTransport(.{ .messages = &messages }));
 }

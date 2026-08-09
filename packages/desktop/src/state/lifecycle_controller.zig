@@ -3,7 +3,8 @@
 //! Phase 3 fix: frame-loop flush is scheduled off the render-critical path onto
 //! a worker thread. Dirty clears only on daemon acknowledgement; failures back
 //! off and mark persistence unavailable (visible unsaved/read-only). Shutdown
-//! and pre-turn durability still use the blocking flush path.
+//! and pre-turn durability still use the blocking flush path. Full snapshots
+//! above the protocol ceiling transfer ownership to the bounded durable spool.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -27,6 +28,7 @@ const Storage = storage_mod.Storage;
 const FlushWorkerResult = struct {
     success: bool = false,
     conflict: bool = false,
+    spooled: bool = false,
     acknowledged_revision: u64 = 0,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
@@ -124,6 +126,7 @@ pub fn noteInteraction(self: anytype) void {
 /// Never blocks on ensureDaemon/socket/fsync on the render thread.
 pub fn flushIfDirty(self: anytype) void {
     pollFlushWorker(self);
+    if (self.lifecycle.dirty_spooled) return;
     const now = platform_runtime.unixTimestampMs();
     if (!self.lifecycle.shouldFlush(now, SAVE_DEBOUNCE_MS)) return;
     if (self.lifecycle.flush_in_flight) return;
@@ -210,6 +213,21 @@ fn scheduleFlushWorker(self: anytype, now_ms: i64) void {
 }
 
 fn flushWorkerMain(args: *FlushWorkerArgs) void {
+    const fits_transport = args.storage.stateFitsSnapshotTransport(args.loaded.?.value) catch false;
+    if (!fits_transport) {
+        args.storage.writePendingStateSpool(.{
+            .capture_revision = args.observed_revision,
+            .baseline_revision = if (args.baseline != null) args.observed_revision else null,
+            .current = args.loaded.?.value,
+            .baseline = if (args.baseline) |baseline| baseline.value else null,
+        }) catch {
+            args.result.done.store(true, .release);
+            return;
+        };
+        args.result.spooled = true;
+        args.result.done.store(true, .release);
+        return;
+    }
     args.storage.saveCaptured(args.loaded.?.value, args.observed_revision) catch |err| {
         args.result.success = false;
         args.result.conflict = err == error.StoreRevisionConflict;
@@ -233,6 +251,7 @@ pub fn pollFlushWorker(self: anytype) void {
     }
     const success = result.success;
     const conflict = result.conflict;
+    const spooled = result.spooled;
     const acknowledged_revision = result.acknowledged_revision;
     const storage = self.storage;
     if (self.lifecycle.flush_args) |args| {
@@ -269,6 +288,11 @@ pub fn pollFlushWorker(self: anytype) void {
         self.lifecycle.clearDirtyForGeneration(self.lifecycle.flush_snapshot_generation);
         self.lifecycle.next_flush_attempt_ms = 0;
         clearCloseDurabilityNoticeAfterSuccess(self);
+    } else if (spooled) {
+        // The spool owns exactly the captured generation. A newer edit resets
+        // dirty_spooled through markDirty and schedules a replacement spool.
+        noteCompletedSpool(&self.lifecycle, self.lifecycle.flush_snapshot_generation);
+        clearCloseDurabilityNoticeAfterSuccess(self);
     } else if (conflict) {
         log.warn("async native state save conflicted; awaiting cursor rebase", .{});
         self.lifecycle.next_flush_attempt_ms = now + FLUSH_RETRY_BACKOFF_MS;
@@ -277,6 +301,11 @@ pub fn pollFlushWorker(self: anytype) void {
         storage.markPersistenceUnavailable();
         self.lifecycle.next_flush_attempt_ms = now + FLUSH_UNAVAILABLE_PROBE_MS;
     }
+}
+
+fn noteCompletedSpool(state: *State, captured_generation: u64) void {
+    if (state.dirty_generation == captured_generation) state.dirty_spooled = true;
+    state.next_flush_attempt_ms = 0;
 }
 
 /// Blocking flush for shutdown and latency-sensitive pre-turn durability.
@@ -695,4 +724,15 @@ test "lifecycle backoff gate skips flush while next_attempt is in the future" {
     state.next_flush_attempt_ms = 5000;
     try std.testing.expect(state.shouldFlush(1000, 750));
     try std.testing.expect(1000 < state.next_flush_attempt_ms);
+}
+
+test "completed spool owns only its captured dirty generation" {
+    var state: State = .{ .dirty = true, .dirty_generation = 4, .next_flush_attempt_ms = 99 };
+    noteCompletedSpool(&state, 3);
+    try std.testing.expect(!state.dirty_spooled);
+    try std.testing.expectEqual(@as(i64, 0), state.next_flush_attempt_ms);
+    noteCompletedSpool(&state, 4);
+    try std.testing.expect(state.dirty_spooled);
+    state.markDirty(100);
+    try std.testing.expect(!state.dirty_spooled);
 }

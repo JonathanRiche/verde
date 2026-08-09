@@ -148,6 +148,7 @@ pub const OwnedProjectionRefresh = struct {
     backing_allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     result: headless.store.CoreSnapshotResult = undefined,
+    durable: ?LoadedPersistedState = null,
 
     fn create(backing_allocator: std.mem.Allocator) !*OwnedProjectionRefresh {
         const refresh = try backing_allocator.create(OwnedProjectionRefresh);
@@ -160,6 +161,7 @@ pub const OwnedProjectionRefresh = struct {
 
     fn deinit(self: *OwnedProjectionRefresh) void {
         const backing_allocator = self.backing_allocator;
+        if (self.durable) |*durable| durable.deinit();
         self.arena.deinit();
         backing_allocator.destroy(self);
     }
@@ -271,8 +273,13 @@ fn fetchOwnedCompositeSnapshot(storage: *const Storage) ?*OwnedProjectionRefresh
         .pref_path = storage.pref_path,
     };
     var client = sessionizer.headlessClient(allocator, &transport);
+    // The durable store can be far larger than the protocol-19 8 MiB
+    // transport ceiling. Capture the cursor and volatile scopes from the live
+    // daemon, then read SQLite locally through a separate coherent RO
+    // transaction. Because the daemon captures the cursor first and the RO
+    // load happens last, concurrent changes can only be over-delivered by the
+    // first core.changes poll.
     const scopes = [_][]const u8{
-        headless.store.SNAPSHOT_SCOPE_STORE,
         headless.store.SNAPSHOT_SCOPE_REGISTRY,
         headless.store.SNAPSHOT_SCOPE_SESSIONS,
         headless.store.SNAPSHOT_SCOPE_TURNS,
@@ -288,6 +295,13 @@ fn fetchOwnedCompositeSnapshot(storage: *const Storage) ?*OwnedProjectionRefresh
     {
         return null;
     }
+    var durable = storage.loadProjection(storage.allocator) catch return null;
+    if (durable.store_revision < refresh.result.store_revision) {
+        durable.deinit();
+        return null;
+    }
+    refresh.result.store_revision = durable.store_revision;
+    refresh.durable = durable;
     refresh_owned = false;
     return refresh;
 }
@@ -8811,7 +8825,7 @@ pub const AppState = struct {
         if (self.change_cursor_loop.shutdown.load(.acquire)) return;
         if (self.change_cursor_loop.takeRefresh()) |refresh| {
             defer refresh.deinit();
-            self.applyDaemonProjectionRefresh(refresh.result) catch |err| {
+            self.applyDaemonProjectionRefreshWithDurable(refresh.result, refresh.durable.?.value) catch |err| {
                 self.change_cursor_loop.noteRefreshApplication(false);
                 // The cursor is deliberately still old: the worker will
                 // re-read this dirty range on its next iteration.
@@ -8826,6 +8840,22 @@ pub const AppState = struct {
     }
 
     pub fn applyDaemonProjectionRefresh(self: *AppState, result: headless.store.CoreSnapshotResult) !void {
+        return self.applyDaemonProjectionRefreshWithOptionalDurable(result, null);
+    }
+
+    fn applyDaemonProjectionRefreshWithDurable(
+        self: *AppState,
+        result: headless.store.CoreSnapshotResult,
+        durable: PersistedState,
+    ) !void {
+        return self.applyDaemonProjectionRefreshWithOptionalDurable(result, durable);
+    }
+
+    fn applyDaemonProjectionRefreshWithOptionalDurable(
+        self: *AppState,
+        result: headless.store.CoreSnapshotResult,
+        durable: ?PersistedState,
+    ) !void {
         const adoption_repair = self.hasUnresolvedAdoptionRows();
         const observed_revision = self.storage.currentProjectionObservedRevision();
         const baseline_repair = self.lifecycle.projection_baseline == null or
@@ -8841,7 +8871,10 @@ pub const AppState = struct {
         const cursor = result.change_cursor orelse return error.MissingProjectionCursor;
         var conversion_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer conversion_arena.deinit();
-        var persisted = try compositeSnapshotToPersisted(conversion_arena.allocator(), result.snapshot);
+        var persisted = if (durable) |projection|
+            projection
+        else
+            try compositeSnapshotToPersisted(conversion_arena.allocator(), result.snapshot);
         if (adoption_repair) try self.validateAdoptionRepairsForRefresh(persisted);
         var next_baseline = try self.clonePersistedState(self.allocator, persisted);
         var baseline_owned = true;
@@ -8943,7 +8976,7 @@ pub const AppState = struct {
     pub fn completePendingProjectionRepairBlocking(self: *AppState) !void {
         const refresh = fetchOwnedCompositeSnapshot(self.storage) orelse return error.ProjectionRefreshUnavailable;
         defer refresh.deinit();
-        try self.applyDaemonProjectionRefresh(refresh.result);
+        try self.applyDaemonProjectionRefreshWithDurable(refresh.result, refresh.durable.?.value);
     }
 
     /// Transfer dirty projection ownership to a durable sidecar before close.
