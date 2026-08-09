@@ -98,7 +98,6 @@ const MACOS_CMD_W_CLOSE_SUPPRESS_MS: i64 = 750;
 // Some Wayland compositors can emit a burst of SDL close requests while a
 // screenshot/portal overlay is being dismissed. Most of the burst lacks focus,
 // but the final event may briefly report focus again; suppress that tail too.
-const LINUX_SUSPICIOUS_CLOSE_BURST_SUPPRESS_MS: i64 = 3500;
 var linux_wayland_browser_host: browser_runtime.LinuxWaylandHost = .{};
 const SYSTEM_CURSOR_COUNT = @typeInfo(sdl.SystemCursor).@"enum".fields.len;
 
@@ -185,7 +184,6 @@ var macos_launch_close_suppress_until_ms: i64 = 0;
 var macos_last_text_input_timestamp_ns: u64 = 0;
 var macos_last_text_input_len: usize = 0;
 var macos_last_text_input: [64]u8 = std.mem.zeroes([64]u8);
-var linux_last_suspicious_close_ms: i64 = 0;
 const MACOS_DUPLICATE_TEXT_INPUT_SUPPRESS_NS: u64 = 30 * std.time.ns_per_ms;
 const MACOS_LAUNCH_CLOSE_SUPPRESS_MS: i64 = 650;
 
@@ -2616,25 +2614,19 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
             runtime_log.diagnostic("ignoring linux window close request after external open launch", .{});
             return true;
         }
-        const suspicious_close = linuxWindowFlagsIndicateSuspiciousClose(
+        // SDL focus/visibility flags describe compositor presentation, not
+        // whether a Wayland WM close request is genuine. In particular,
+        // address-targeted closes for windows on another workspace arrive
+        // hidden/occluded and often without SDL focus. The explicit picker and
+        // external-launch guards above retain the distinguishable phantom-close
+        // protections; every other WM-delivered close is actionable.
+        std.debug.assert(linuxWindowFlagsPermitWmClose(
             window_flags.input_focus,
             window_flags.mouse_focus,
             window_flags.hidden,
             window_flags.minimized,
             window_flags.occluded,
-        );
-        if (suspicious_close) {
-            linux_last_suspicious_close_ms = now_ms;
-            runtime_log.diagnostic(
-                "ignoring suspicious linux window close request focus={} mouse_focus={} hidden={} minimized={} occluded={}",
-                .{ window_flags.input_focus, window_flags.mouse_focus, window_flags.hidden, window_flags.minimized, window_flags.occluded },
-            );
-            return true;
-        }
-        if (linuxCloseRequestFollowsSuspiciousBurst(now_ms)) {
-            runtime_log.diagnostic("ignoring linux window close request after suspicious close burst", .{});
-            return true;
-        }
+        ));
     }
     if (!closePreflightPassed(state)) return true;
     if (builtin.os.tag == .macos) {
@@ -2743,33 +2735,25 @@ test "successful event close preflight skips later frame polls" {
     try std.testing.expect(!state.dirty_poll_executed);
 }
 
-fn linuxCloseRequestFollowsSuspiciousBurst(now_ms: i64) bool {
-    if (linux_last_suspicious_close_ms == 0) return false;
-    if (now_ms < linux_last_suspicious_close_ms) {
-        linux_last_suspicious_close_ms = 0;
-        return false;
-    }
-    if (now_ms - linux_last_suspicious_close_ms > LINUX_SUSPICIOUS_CLOSE_BURST_SUPPRESS_MS) return false;
-    return true;
-}
-
-fn linuxWindowFlagsIndicateSuspiciousClose(
+fn linuxWindowFlagsPermitWmClose(
     input_focus: bool,
     mouse_focus: bool,
     hidden: bool,
     minimized: bool,
     occluded: bool,
 ) bool {
-    // Keyboard-driven tiling WMs legitimately close a keyboard-focused window
-    // while the pointer is elsewhere. Focus is suspicious only when both SDL
-    // focus signals are absent.
-    return (!input_focus and !mouse_focus) or hidden or minimized or occluded;
+    _ = input_focus;
+    _ = mouse_focus;
+    _ = hidden;
+    _ = minimized;
+    _ = occluded;
+    return true;
 }
 
-test "linux keyboard-focused close remains actionable without mouse focus" {
-    try std.testing.expect(!linuxWindowFlagsIndicateSuspiciousClose(true, false, false, false, false));
-    try std.testing.expect(linuxWindowFlagsIndicateSuspiciousClose(false, false, false, false, false));
-    try std.testing.expect(linuxWindowFlagsIndicateSuspiciousClose(true, true, true, false, false));
+test "linux WM close remains actionable for every presentation state" {
+    try std.testing.expect(linuxWindowFlagsPermitWmClose(true, true, false, false, false));
+    try std.testing.expect(linuxWindowFlagsPermitWmClose(false, false, false, false, false));
+    try std.testing.expect(linuxWindowFlagsPermitWmClose(false, false, true, true, true));
 }
 
 fn macosHostWindowRequestedClose(window: *sdl.Window, state: *AppState) bool {
