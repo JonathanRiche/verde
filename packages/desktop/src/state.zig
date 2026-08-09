@@ -2213,6 +2213,14 @@ pub const SidebarThreadHover = struct {
     thread_index: usize,
 };
 
+pub const WorkspaceSwitchTrace = struct {
+    sequence: u64,
+    target_index: usize,
+    input_sdl_timestamp_ns: u64,
+    input_arrival_monotonic_ns: i128,
+    render_attempt: u32 = 0,
+};
+
 pub const SidebarContextMenuKind = enum {
     none,
     project,
@@ -2370,6 +2378,10 @@ pub const AppState = struct {
     daemon_projection_stale: bool = false,
     daemon_projection_bootstrap_started_at_ms: i64 = 0,
     daemon_projection_has_saved_state: bool = false,
+    workspace_switch_trace_next_sequence: u64 = 1,
+    workspace_switch_trace_input: ?WorkspaceSwitchTrace = null,
+    workspace_switch_trace_pending: ?WorkspaceSwitchTrace = null,
+    workspace_switch_frame_pending: bool = false,
 
     pub const InitOptions = struct {
         gl_texture_uploads_enabled: bool = true,
@@ -2977,7 +2989,95 @@ pub const AppState = struct {
         self.sidebar_context_menu_open = false;
         self.syncRenameBuffer();
         self.markSelectionDirty(index);
+        self.noteWorkspaceSwitchApplied(index);
         return true;
+    }
+
+    /// Captures the SDL timestamp and main-thread arrival for a workspace hotkey.
+    pub fn noteWorkspaceSwitchInput(self: *AppState, target_index: usize, sdl_timestamp_ns: u64, arrival_monotonic_ns: i128) void {
+        if (self.workspace_switch_trace_pending) |pending| {
+            runtime_log.diagnostic(
+                "workspace-switch-trace seq={d} stage=superseded target_index={d} by_seq={d}",
+                .{ pending.sequence, pending.target_index, self.workspace_switch_trace_next_sequence },
+            );
+        }
+        const trace: WorkspaceSwitchTrace = .{
+            .sequence = self.nextWorkspaceSwitchTraceSequence(),
+            .target_index = target_index,
+            .input_sdl_timestamp_ns = sdl_timestamp_ns,
+            .input_arrival_monotonic_ns = arrival_monotonic_ns,
+        };
+        self.workspace_switch_trace_input = trace;
+        runtime_log.diagnostic(
+            "workspace-switch-trace seq={d} stage=input_receipt target_index={d} sdl_timestamp_ns={d} arrival_monotonic_ns={d}",
+            .{ trace.sequence, target_index, sdl_timestamp_ns, arrival_monotonic_ns },
+        );
+    }
+
+    pub fn workspaceSwitchFramePending(self: *const AppState) bool {
+        return self.workspace_switch_frame_pending;
+    }
+
+    pub fn noteWorkspaceSwitchRenderStarted(self: *AppState) void {
+        const trace = &(self.workspace_switch_trace_pending orelse return);
+        trace.render_attempt +|= 1;
+        runtime_log.diagnostic(
+            "workspace-switch-trace seq={d} stage=render_start target_index={d} attempt={d}",
+            .{ trace.sequence, trace.target_index, trace.render_attempt },
+        );
+    }
+
+    pub fn noteWorkspaceSwitchPresentDeferred(self: *const AppState) void {
+        const trace = self.workspace_switch_trace_pending orelse return;
+        runtime_log.diagnostic(
+            "workspace-switch-trace seq={d} stage=present_deferred target_index={d} attempt={d} reason=no_swapchain_texture",
+            .{ trace.sequence, trace.target_index, trace.render_attempt },
+        );
+    }
+
+    pub fn noteWorkspaceSwitchPresented(self: *AppState) void {
+        const trace = self.workspace_switch_trace_pending orelse return;
+        runtime_log.diagnostic(
+            "workspace-switch-trace seq={d} stage=present_submit_complete target_index={d} attempt={d} elapsed_from_arrival_ms={d:.2}",
+            .{
+                trace.sequence,
+                trace.target_index,
+                trace.render_attempt,
+                profiler.nsToMs(profiler.elapsedNs(trace.input_arrival_monotonic_ns)),
+            },
+        );
+        self.workspace_switch_trace_pending = null;
+        self.workspace_switch_frame_pending = false;
+    }
+
+    fn nextWorkspaceSwitchTraceSequence(self: *AppState) u64 {
+        const sequence = self.workspace_switch_trace_next_sequence;
+        self.workspace_switch_trace_next_sequence +%= 1;
+        if (self.workspace_switch_trace_next_sequence == 0) self.workspace_switch_trace_next_sequence = 1;
+        return sequence;
+    }
+
+    fn noteWorkspaceSwitchApplied(self: *AppState, index: usize) void {
+        var trace = if (self.workspace_switch_trace_input) |input| blk: {
+            self.workspace_switch_trace_input = null;
+            break :blk input;
+        } else WorkspaceSwitchTrace{
+            .sequence = self.nextWorkspaceSwitchTraceSequence(),
+            .target_index = index,
+            .input_sdl_timestamp_ns = 0,
+            .input_arrival_monotonic_ns = profiler.nowNs(),
+        };
+        trace.target_index = index;
+        self.workspace_switch_trace_pending = trace;
+        self.workspace_switch_frame_pending = true;
+        runtime_log.diagnostic(
+            "workspace-switch-trace seq={d} stage=selection_applied target_index={d} selected_index={d}",
+            .{ trace.sequence, index, self.project_controller.selected_index },
+        );
+        runtime_log.diagnostic(
+            "workspace-switch-trace seq={d} stage=frame_scheduled target_index={d} reason=selection_pending",
+            .{ trace.sequence, index },
+        );
     }
 
     pub fn selectAdjacentProject(self: *AppState, direction: isize) bool {

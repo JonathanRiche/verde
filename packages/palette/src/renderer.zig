@@ -121,6 +121,11 @@ pub const FrameStats = struct {
     }
 };
 
+pub const WindowRenderOutcome = enum {
+    presented,
+    deferred,
+};
+
 pub const Renderer = struct {
     device: ?*c.SDL_GPUDevice = null,
     pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
@@ -339,7 +344,7 @@ pub const Renderer = struct {
         }
     }
 
-    pub fn renderWindow(self: *Renderer, allocator: std.mem.Allocator, window: *sdl.Window, batch: *const draw.RenderBatch, clear_color: draw.Color) !void {
+    pub fn renderWindow(self: *Renderer, allocator: std.mem.Allocator, window: *sdl.Window, batch: *const draw.RenderBatch, clear_color: draw.Color) !WindowRenderOutcome {
         const device = self.device orelse return error.SdlGpuCreateDeviceFailed;
         if (self.pipeline == null) return error.MissingGpuPipeline;
         if (CommandCounts.fromBatch(batch).text > 0 and !self.supportsGpuText()) return error.GpuTextAtlasNotConfigured;
@@ -352,50 +357,53 @@ pub const Renderer = struct {
         var stats = self.beginFrameStats();
         const command_ends = try self.frame_scratch.begin(batch.commands.items.len);
         const command_buffer = c.SDL_AcquireGPUCommandBuffer(device) orelse return error.SdlGpuCommandBufferFailed;
-        try self.flushPendingTextureUploads(command_buffer, &stats);
-        try self.prepareBatch(allocator, command_buffer, batch, command_ends.solid, &stats);
-        const image_frame = try self.prepareImageFrame(allocator, command_buffer, batch, command_ends.image, &stats);
-        const text_frame = try self.prepareTextFrame(allocator, command_buffer, batch, command_ends.text, &stats);
-
         var swapchain_texture: ?*c.SDL_GPUTexture = null;
         var width: u32 = 0;
         var height: u32 = 0;
         if (!c.SDL_AcquireGPUSwapchainTexture(command_buffer, @ptrCast(window), &swapchain_texture, &width, &height)) return error.SdlGpuSwapchainFailed;
-        if (swapchain_texture) |texture| {
-            var target: c.SDL_GPUColorTargetInfo = .{
-                .texture = texture,
-                .mip_level = 0,
-                .layer_or_depth_plane = 0,
-                .clear_color = .{ .r = clear_color.r, .g = clear_color.g, .b = clear_color.b, .a = clear_color.a },
-                .load_op = c.SDL_GPU_LOADOP_CLEAR,
-                .store_op = c.SDL_GPU_STOREOP_STORE,
-                .resolve_texture = null,
-                .resolve_mip_level = 0,
-                .resolve_layer = 0,
-                .cycle = false,
-                .cycle_resolve_texture = false,
-                .padding1 = 0,
-                .padding2 = 0,
-            };
-            const pass = c.SDL_BeginGPURenderPass(command_buffer, &target, 1, null) orelse return error.SdlGpuRenderPassFailed;
-            c.SDL_PushGPUVertexUniformData(command_buffer, 0, &ViewportUniform{ .viewport_size = .{ @floatFromInt(width), @floatFromInt(height) } }, @sizeOf(ViewportUniform));
-            self.renderBatchInterleaved(
-                pass,
-                batch,
-                command_ends.solid,
-                image_frame,
-                command_ends.image,
-                text_frame,
-                command_ends.text,
-                @floatFromInt(height),
-            );
-            c.SDL_EndGPURenderPass(pass);
-        }
+        const texture = swapchain_texture orelse {
+            if (!c.SDL_CancelGPUCommandBuffer(command_buffer)) return error.SdlGpuSubmitFailed;
+            self.last_frame_stats = stats;
+            return .deferred;
+        };
+        try self.flushPendingTextureUploads(command_buffer, &stats);
+        try self.prepareBatch(allocator, command_buffer, batch, command_ends.solid, &stats);
+        const image_frame = try self.prepareImageFrame(allocator, command_buffer, batch, command_ends.image, &stats);
+        const text_frame = try self.prepareTextFrame(allocator, command_buffer, batch, command_ends.text, &stats);
+        var target: c.SDL_GPUColorTargetInfo = .{
+            .texture = texture,
+            .mip_level = 0,
+            .layer_or_depth_plane = 0,
+            .clear_color = .{ .r = clear_color.r, .g = clear_color.g, .b = clear_color.b, .a = clear_color.a },
+            .load_op = c.SDL_GPU_LOADOP_CLEAR,
+            .store_op = c.SDL_GPU_STOREOP_STORE,
+            .resolve_texture = null,
+            .resolve_mip_level = 0,
+            .resolve_layer = 0,
+            .cycle = false,
+            .cycle_resolve_texture = false,
+            .padding1 = 0,
+            .padding2 = 0,
+        };
+        const pass = c.SDL_BeginGPURenderPass(command_buffer, &target, 1, null) orelse return error.SdlGpuRenderPassFailed;
+        c.SDL_PushGPUVertexUniformData(command_buffer, 0, &ViewportUniform{ .viewport_size = .{ @floatFromInt(width), @floatFromInt(height) } }, @sizeOf(ViewportUniform));
+        self.renderBatchInterleaved(
+            pass,
+            batch,
+            command_ends.solid,
+            image_frame,
+            command_ends.image,
+            text_frame,
+            command_ends.text,
+            @floatFromInt(height),
+        );
+        c.SDL_EndGPURenderPass(pass);
         const submit_start = nowNs();
         if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) return error.SdlGpuSubmitFailed;
         stats.submit_present_ns +|= elapsedNs(submit_start);
         self.releaseRetiredBuffers(device);
         self.last_frame_stats = stats;
+        return .presented;
     }
 
     pub fn supportsGpuText(self: *const Renderer) bool {
