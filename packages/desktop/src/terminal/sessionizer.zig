@@ -303,6 +303,29 @@ pub fn requestAlloc(
     );
 }
 
+/// Send a legacy-shaped daemon request through the deadline-enforced
+/// cross-platform transport. Teardown call sites use this instead of the
+/// direct Unix stream path, whose blocking read has no deadline.
+pub fn requestAllocWithTimeout(
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    method: []const u8,
+    params: anytype,
+    request_id: u64,
+    timeout_ms: u32,
+) ![]u8 {
+    var transport: HeadlessTransport = .{
+        .allocator = allocator,
+        .pref_path = pref_path,
+        .timeout_ms = timeout_ms,
+    };
+    var client = headlessClient(allocator, &transport);
+    var call = try client.callAllocWithId(request_id, method, params);
+    const response = call.takeResponse();
+    call.deinit(allocator);
+    return response;
+}
+
 /// Desktop transport adapter for `headless.Client`: send one raw request JSON
 /// document to the session daemon at `pref_path` (or the endpoint override).
 /// Keeps the headless package std-only; sockets/pipes live here.

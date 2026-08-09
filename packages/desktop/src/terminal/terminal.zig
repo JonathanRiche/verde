@@ -17,6 +17,9 @@ pub const MIN_DOCK_HEIGHT: f32 = 96.0;
 pub const MAX_DOCK_HEIGHT: f32 = 900.0;
 /// Shared persisted/runtime pane-coordinate bound; matches daemon validation.
 pub const MAX_PANE_ID: u32 = 65_535;
+/// Detach is best-effort teardown after terminal identity has already been
+/// persisted; an unhealthy daemon must not hold the process open indefinitely.
+const SESSION_DETACH_TIMEOUT_MS: u32 = 750;
 
 pub const TerminalKey = enum {
     enter,
@@ -3946,10 +3949,17 @@ const UnixSession = struct {
         const pref_path = self.pref_path orelse return;
         const session_id = self.session_id orelse return;
         const attach_id = self.attach_id orelse return;
-        const response = sessionizer.requestAlloc(allocator, pref_path, "session.detach", .{
-            .id = session_id,
-            .attach_id = attach_id,
-        }, 1) catch return;
+        const response = sessionizer.requestAllocWithTimeout(
+            allocator,
+            pref_path,
+            "session.detach",
+            .{
+                .id = session_id,
+                .attach_id = attach_id,
+            },
+            1,
+            SESSION_DETACH_TIMEOUT_MS,
+        ) catch return;
         allocator.free(response);
     }
 

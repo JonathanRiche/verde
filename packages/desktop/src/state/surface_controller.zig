@@ -334,12 +334,7 @@ fn clearSurfaceAttentionAtIndex(self: anytype, surface_index: usize) bool {
     // to act on them).
     const done_ack = surface.completion_pending or surface.status == .done;
     if (!surface.attention and surface.unread_count == 0 and !done_ack) return terminal_changed;
-    if (done_ack) {
-        _ = self.storage.clearSurfaceState(surface.session_id) catch |err| {
-            log.err("failed to persist surface acknowledgement via daemon: {s}", .{@errorName(err)});
-            return terminal_changed;
-        };
-    }
+    if (done_ack and !self.queueSurfaceAcknowledgement(surface)) return terminal_changed;
     surface.attention = false;
     surface.unread_count = 0;
     if (done_ack) {
@@ -427,4 +422,53 @@ test "nested provider cannot claim a terminal pinned to another agent" {
     try std.testing.expect(surfaceProviderClaimMatchesPin(.cursor, null));
     try std.testing.expect(surfaceProviderClaimMatchesPin(.cursor, "cursor"));
     try std.testing.expect(!surfaceProviderClaimMatchesPin(.cursor, "amp"));
+}
+
+test "surface focus clear queues persistence and updates local state immediately" {
+    const project_state = @import("project.zig");
+    const FakeState = struct {
+        allocator: std.mem.Allocator,
+        surface_controller: State = .{},
+        project_controller: struct {
+            projects: std.ArrayList(project_state.Project) = .empty,
+        } = .{},
+        queued: bool = false,
+        dirty: bool = false,
+
+        fn queueSurfaceAcknowledgement(self: *@This(), surface: *const SurfaceState) bool {
+            self.queued = std.mem.eql(u8, surface.session_id, "session-a");
+            return true;
+        }
+
+        fn markDirty(self: *@This()) void {
+            self.dirty = true;
+        }
+    };
+
+    var state: FakeState = .{ .allocator = std.testing.allocator };
+    defer state.project_controller.projects.deinit(state.allocator);
+    try state.surface_controller.surfaces.append(state.allocator, .{
+        .session_id = try state.allocator.dupe(u8, "session-a"),
+        .workspace_id = try state.allocator.dupe(u8, "workspace-a"),
+        .workspace_path = try state.allocator.dupe(u8, "/workspace-a"),
+        .title = try state.allocator.dupe(u8, "Done"),
+        .status = .done,
+        .completion_pending = true,
+        .completed_at_ms = 42,
+        .attention = true,
+        .unread_count = 3,
+    });
+    defer {
+        for (state.surface_controller.surfaces.items) |*surface| surface.deinit(state.allocator);
+        state.surface_controller.surfaces.deinit(state.allocator);
+    }
+
+    try std.testing.expect(clearSurfaceAttentionBySession(&state, "session-a"));
+    const surface = &state.surface_controller.surfaces.items[0];
+    try std.testing.expect(state.queued);
+    try std.testing.expect(state.dirty);
+    try std.testing.expectEqual(SurfaceStatus.idle, surface.status);
+    try std.testing.expect(!surface.completion_pending);
+    try std.testing.expect(!surface.attention);
+    try std.testing.expectEqual(@as(u32, 0), surface.unread_count);
 }

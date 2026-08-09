@@ -296,6 +296,11 @@ fn mainInner(init: std.process.Init) !void {
     }
     defer sdl.stopTextInput(window) catch {};
     installWindowIcon(window);
+    // Map the native window immediately. Font materialization, GPU setup, and
+    // the large durable projection all happen below; none should postpone the
+    // compositor-visible launch boundary.
+    _ = SDL_ShowWindow(window);
+    _ = SDL_SyncWindow(window);
 
     const loaded_app_config = app_config.loadAppConfig(allocator) catch |err| blk: {
         log.warn("failed to load app config: {s}", .{@errorName(err)});
@@ -461,6 +466,14 @@ fn mainInner(init: std.process.Init) !void {
     // Apply the global ImGui style after the display scale is known.
     ui_theme.applyTheme(ui_scale);
 
+    // Startup surface: submit one real GPU frame before the potentially large
+    // read-only SQLite projection is materialized into AppState.
+    renderStartupFrame(&palette_renderer, allocator, window) catch |err| {
+        log.warn("failed to render startup frame: {s}", .{@errorName(err)});
+    };
+    _ = SDL_ShowWindow(window);
+    _ = SDL_SyncWindow(window);
+
     var state = try AppState.init(allocator, &storage, loaded_app_config, .{
         .gl_texture_uploads_enabled = false,
         .browser_textures_enabled = palette_renderer.activeBackend() == .sdl_gpu,
@@ -532,6 +545,7 @@ fn mainInner(init: std.process.Init) !void {
         running = processEvents(window, &state, &keyboard, ui_scale, &event_flags, &frame_sample, &event_wait_ns, &render_pacer);
         if (!running) break;
         frame_sample.waited_ns = event_wait_ns;
+        state.pollAcknowledgements();
         recordSpan(&frame_sample, .poll_picker, struct {
             fn run(app_state: *AppState) void {
                 app_state.processDeferredProjectDirectoryBrowse();
@@ -722,6 +736,32 @@ fn mainInner(init: std.process.Init) !void {
         profiler.recordFrame(frame_sample);
         maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
     }
+}
+
+fn renderStartupFrame(
+    renderer: *palette_frame_renderer.Renderer,
+    allocator: std.mem.Allocator,
+    window: *sdl.Window,
+) !void {
+    var width: c_int = 0;
+    var height: c_int = 0;
+    getWindowSizeInPixels(window, &width, &height);
+    const frame_width: f32 = @floatFromInt(@max(width, 1));
+    const frame_height: f32 = @floatFromInt(@max(height, 1));
+    var batch: palette.RenderBatch = .{};
+    defer batch.deinit(allocator);
+    const text_color = ui_theme.COLOR_TEXT_MUTED;
+    try batch.roleText(
+        allocator,
+        .{ .x = 40.0, .y = frame_height - 64.0, .w = frame_width - 80.0, .h = 28.0 },
+        "Loading workspace…",
+        .{ .r = text_color[0], .g = text_color[1], .b = text_color[2], .a = text_color[3] },
+        16.0,
+        .ui,
+        null,
+        null,
+    );
+    try renderer.renderBatch(allocator, &batch, frame_width, frame_height);
 }
 
 // Resolves the OS mouse cursor each frame: terminal and browser-reported
@@ -2640,7 +2680,9 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
 // Durability boundary shared by every graceful exit request. A failed handoff
 // leaves the event loop, window, and controllers live for an interactive retry.
 fn closePreflightPassed(state: anytype) bool {
+    if (@hasDecl(@TypeOf(state.*), "beginClosePreflight")) state.beginClosePreflight();
     state.handoffDirtyStateForShutdown() catch |err| {
+        if (@hasDecl(@TypeOf(state.*), "cancelClosePreflight")) state.cancelClosePreflight();
         state.noteCloseDurabilityFailure(err);
         return false;
     };
@@ -2733,6 +2775,17 @@ test "successful event close preflight skips later frame polls" {
     const running_after_close_event = !closePreflightPassed(&state);
     if (running_after_close_event) state.dirtyPoll();
     try std.testing.expect(!state.dirty_poll_executed);
+}
+
+test "startup frame is submitted before the durable projection load" {
+    const source = @embedFile("main.zig");
+    const icon_install = std.mem.indexOf(u8, source, "installWindowIcon(window);").?;
+    const early_show = icon_install + std.mem.indexOf(u8, source[icon_install..], "_ = SDL_ShowWindow(window);").?;
+    const renderer_init = std.mem.indexOf(u8, source, "var palette_renderer = try").?;
+    const startup_frame = std.mem.indexOf(u8, source, "renderStartupFrame(&palette_renderer").?;
+    const app_state_load = std.mem.indexOf(u8, source, "var state = try AppState.init").?;
+    try std.testing.expect(early_show < renderer_init);
+    try std.testing.expect(startup_frame < app_state_load);
 }
 
 fn linuxWindowFlagsPermitWmClose(

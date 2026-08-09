@@ -552,12 +552,58 @@ pub fn clearChatCompletion(self: anytype, project_index: usize, thread_index: us
     // the daemon-written row is cleared within one poll cycle without turning
     // every pane focus into a storage round-trip.
     if (!thread.completion_pending) return false;
-    _ = self.storage.clearChatCompletion(project.id, thread.local_thread_id) catch |err| {
-        log.err("failed to persist chat completion acknowledgement via daemon: {s}", .{@errorName(err)});
-        return false;
-    };
+    if (!self.queueChatCompletionAcknowledgement(project.id, thread.local_thread_id, thread.completed_at_ms)) return false;
     thread.completion_pending = false;
     thread.completed_at_ms = 0;
     self.markDirty();
     return true;
+}
+
+test "chat completion focus clear queues persistence and updates local state immediately" {
+    const ProjectStub = struct {
+        id: []const u8,
+        threads: std.ArrayList(chat_types.ChatThread) = .empty,
+    };
+    const FakeState = struct {
+        allocator: std.mem.Allocator,
+        project_controller: struct {
+            projects: std.ArrayList(ProjectStub) = .empty,
+        } = .{},
+        queued: bool = false,
+        dirty: bool = false,
+
+        fn queueChatCompletionAcknowledgement(
+            self: *@This(),
+            workspace_id: []const u8,
+            local_thread_id: []const u8,
+            completed_at_ms: i64,
+        ) bool {
+            self.queued = std.mem.eql(u8, workspace_id, "workspace-a") and
+                local_thread_id.len > 0 and completed_at_ms == 42;
+            return true;
+        }
+
+        fn markDirty(self: *@This()) void {
+            self.dirty = true;
+        }
+    };
+
+    var state: FakeState = .{ .allocator = std.testing.allocator };
+    defer state.project_controller.projects.deinit(state.allocator);
+    var project: ProjectStub = .{ .id = "workspace-a" };
+    var thread = try chat_types.ChatThread.init(state.allocator, "Done");
+    thread.completion_pending = true;
+    thread.completed_at_ms = 42;
+    try project.threads.append(state.allocator, thread);
+    defer {
+        for (project.threads.items) |*item| item.deinit(state.allocator);
+        project.threads.deinit(state.allocator);
+    }
+    try state.project_controller.projects.append(state.allocator, project);
+
+    try std.testing.expect(clearChatCompletion(&state, 0, 0));
+    try std.testing.expect(state.queued);
+    try std.testing.expect(state.dirty);
+    try std.testing.expect(!project.threads.items[0].completion_pending);
+    try std.testing.expectEqual(@as(i64, 0), project.threads.items[0].completed_at_ms);
 }
