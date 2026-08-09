@@ -29,6 +29,9 @@ pub const Controller = struct {
     visible: bool = false,
     host_window: ?*anyopaque = null,
     pane_bounds: browser_types.PaneBounds = .{},
+    /// Unit-test-only capture at the real controller navigation boundary.
+    /// Production construction leaves this null and follows the backend path.
+    test_navigation_capture: ?*std.ArrayList(u8) = null,
 
     /// Creates a lazy browser controller without touching the heavy browser runtime yet.
     pub fn init(allocator: std.mem.Allocator) !Controller {
@@ -95,6 +98,11 @@ pub const Controller = struct {
 
     /// Navigates the browser pane to the requested URL, creating the backend on demand.
     pub fn navigate(self: *Controller, url: []const u8) !void {
+        if (self.test_navigation_capture) |capture| {
+            capture.clearRetainingCapacity();
+            try capture.appendSlice(self.allocator, url);
+            return;
+        }
         const backend = try self.ensureBackend();
         try self.applyPaneBounds(backend);
         switch (backend.*) {

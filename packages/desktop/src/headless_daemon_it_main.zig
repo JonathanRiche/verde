@@ -6687,15 +6687,15 @@ fn runChatKillMidTurnScenario(allocator: std.mem.Allocator, io: std.Io) !void {
         }
         if (!saw_user) return error.ChatKillMissingUserMessage;
 
-        // MAJOR-2 pin: stable-turn_id replay after interrupted sweep must commit
-        // (upsert supersedes 'interrupted'; receipt/ledger stay 1-per-key).
+        // Stable-turn replay after the interrupted sweep keeps the immutable
+        // first-writer prompt while naturally drifting retry timestamps.
         try startStubChatTurn(
             &client2,
             "turn-kill-1",
             "ws-kill",
             "thread-kill",
             pref_path,
-            "replay after interrupt",
+            "slow mid-turn",
             "user-kill-1",
         );
         try waitChatTurnTerminal(io, &client2, "turn-kill-1", true);
@@ -6945,21 +6945,18 @@ fn runChatCommitFaultRetryScenario(allocator: std.mem.Allocator, io: std.Io) !vo
 
     try consumeChatTurn(&client, "turn-fault-1");
 
-    // PENDING_FIXES #26 (runtime journal arm): fail_once fires BEFORE SQLite,
-    // so only the successful retry reaches storeTurnCommittedHook — the
-    // journal must carry EXACTLY one chat.turn / chat.thread / chat.completion
-    // entry for this turn (replayed duplicate receipts return before the
-    // hook and cannot double-journal).
+    // PENDING_FIXES #26 (runtime journal arm): acceptance and terminal commit
+    // are separate durable revisions, so the journal carries one chat.turn at
+    // each boundary. fail_once fires before the terminal SQLite transaction;
+    // only its successful retry journals the second turn/thread plus completion.
     {
         const changes_req: headless.changes_protocol.ChangesRequest = .{ .cursor = 0 };
         var changes = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, changes_req);
         defer changes.deinit();
         if (!changes.response.isOk()) return error.ChatCommitFaultChangesFailed;
         const changes_result = try client.decodeChanges(&changes);
-        // Acceptance staging legitimately journals its own workspace/thread
-        // upserts at earlier revisions; the #26 exactly-once property is
-        // scoped to the COMMIT revision — the one the single chat.turn entry
-        // carries.
+        // The last chat.turn entry identifies the terminal commit revision;
+        // the first is the atomic accepted message/running-ledger revision.
         var turn_entries: usize = 0;
         var commit_revision: ?u64 = null;
         for (changes_result.entries) |entry| {
@@ -6980,7 +6977,7 @@ fn runChatCommitFaultRetryScenario(allocator: std.mem.Allocator, io: std.Io) !vo
             if (std.mem.eql(u8, entry.topic, "chat.completion") and
                 std.mem.eql(u8, entry.resource_id, "thread-fault")) completion_entries += 1;
         }
-        if (turn_entries != 1 or thread_entries != 1 or completion_entries != 1) {
+        if (turn_entries != 2 or thread_entries != 1 or completion_entries != 1) {
             // Diagnostic dump so a count regression names the extra appender.
             for (changes_result.entries) |entry| {
                 std.debug.print(
@@ -6989,7 +6986,7 @@ fn runChatCommitFaultRetryScenario(allocator: std.mem.Allocator, io: std.Io) !vo
                 );
             }
         }
-        if (turn_entries != 1) return error.ChatCommitFaultTurnJournalCount;
+        if (turn_entries != 2) return error.ChatCommitFaultTurnJournalCount;
         if (thread_entries != 1) return error.ChatCommitFaultThreadJournalCount;
         if (completion_entries != 1) return error.ChatCommitFaultCompletionJournalCount;
     }

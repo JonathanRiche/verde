@@ -846,24 +846,29 @@ pub fn handleTerminalTextInput(self: anytype, text: [*c]const u8) bool {
 
 pub fn requestTerminalFocus(self: anytype) void {
     self.focusCurrentProjectWorkspaceTerminalPane();
-    finishTerminalFocusRequest(self);
+    finishTerminalFocusRequest(self, true);
 }
 
 pub fn requestTerminalDockFocus(self: anytype, dock_id: u32) void {
     self.focusCurrentProjectWorkspaceTerminalDock(dock_id);
-    finishTerminalFocusRequest(self);
+    finishTerminalFocusRequest(self, true);
 }
 
-fn finishTerminalFocusRequest(self: anytype) void {
+pub fn restoreTerminalDockFocus(self: anytype, dock_id: u32) void {
+    self.focusCurrentProjectWorkspaceTerminalDock(dock_id);
+    finishTerminalFocusRequest(self, false);
+}
+
+fn finishTerminalFocusRequest(self: anytype, acknowledge_completion: bool) void {
     self.terminal_controller.focused = true;
     self.composer_controller.focused = false;
     self.composer_controller.composer.focused = false;
     self.unfocusBrowserPane();
     self.browser_controller.address_focused = false;
     self.palette_modal_text_focus = .none;
-    if (self.focusedWorkspaceTerminalDockId()) |dock_id| {
+    if (acknowledge_completion) if (self.focusedWorkspaceTerminalDockId()) |dock_id| {
         _ = self.clearSurfaceAttentionForDock(self.project_controller.selected_index, dock_id);
-    }
+    };
 }
 
 pub fn canRouteTerminalInput(self: anytype) bool {

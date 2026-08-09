@@ -1666,6 +1666,33 @@ test "workspace layout persists the scrolling target" {
     try std.testing.expectEqual(@as(i64, 0), restored.scroll_animation_last_ms);
 }
 
+test "workspace layout round-trips nonuniform split and explicit focus exactly" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const second_pane_id = try layout.createChatPane(allocator, 1);
+    try layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
+    try std.testing.expect(layout.resizeSplit(1, second_pane_id, .vertical, 0.63));
+    layout.focused_pane_id = second_pane_id;
+
+    const persisted = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(persisted);
+    var restored = try WorkspaceLayout.initDefaultChat(allocator);
+    defer restored.deinit(allocator);
+    try restored.applyPersistedWorkspaceJson(allocator, persisted);
+
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), restored.focused_pane_id);
+    const root = restored.root orelse return error.TestExpectedEqual;
+    switch (root.*) {
+        .split => |split| {
+            try std.testing.expectEqual(WorkspaceSplitAxis.vertical, split.axis);
+            try std.testing.expectApproxEqAbs(@as(f32, 0.63), split.ratio, 0.0001);
+        },
+        .leaf => return error.TestExpectedEqual,
+    }
+}
+
 test "workspace layout persists scrolling policy overrides" {
     const allocator = std.testing.allocator;
     var layout = try WorkspaceLayout.initDefaultChat(allocator);

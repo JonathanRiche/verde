@@ -70,7 +70,12 @@ pub const TurnCommitRequest = struct {
     started_at_ms: i64,
     finished_at_ms: ?i64 = null,
     provider: []const u8,
+    harness: []const u8 = "local_cli",
     provider_thread_id: ?[]const u8 = null,
+    /// Missing owners are created inside the receipt-backed commit. Existing
+    /// owners retain GUI metadata; only turn-owned provider identity changes.
+    workspace: ?store_protocol.Workspace = null,
+    thread: ?store_protocol.Thread = null,
     error_message: ?[]const u8 = null,
     user_message_id: ?[]const u8 = null,
     /// Rows are already ordered by transcript_apply; the store appends them
@@ -86,6 +91,30 @@ pub const TurnCommitRequest = struct {
     /// Internal daemon commits do not need a registered client identity, but
     /// receipts retain the existing non-empty client-id invariant.
     client_id: []const u8 = "daemon",
+};
+
+/// One durable acceptance transition: owner creation, provider identity, the
+/// user row, and the running ledger share one revision and rollback boundary.
+pub const TurnAcceptanceRequest = struct {
+    mutation: store_protocol.MutationHeader,
+    turn_id: []const u8,
+    workspace: store_protocol.Workspace,
+    thread: store_protocol.Thread,
+    started_at_ms: i64,
+    provider: []const u8,
+    harness: []const u8,
+    provider_thread_id: ?[]const u8 = null,
+    user_message: store_protocol.Message,
+};
+
+pub const TurnOwnerInsertions = struct {
+    workspace: bool = false,
+    thread: bool = false,
+};
+
+const AcceptanceTestHold = struct {
+    acquired: *std.atomic.Value(bool),
+    release: *std.atomic.Value(bool),
 };
 
 /// Post-commit notification hook (M5-P2 change journal). Invoked strictly
@@ -104,6 +133,13 @@ pub const CommitHook = struct {
     on_turn_committed: *const fn (
         context: *anyopaque,
         request: *const TurnCommitRequest,
+        inserted: TurnOwnerInsertions,
+        result: store_protocol.WriteResult,
+    ) void,
+    on_acceptance_committed: *const fn (
+        context: *anyopaque,
+        request: *const TurnAcceptanceRequest,
+        inserted: TurnOwnerInsertions,
         result: store_protocol.WriteResult,
     ) void,
 };
@@ -254,6 +290,7 @@ const CHAT_COMPLETION_CLEAR_OPERATION = store_protocol.METHOD_NOTIFICATION_CHAT_
 // Reserved receipt operation for durable turn commits; keep it distinct from
 // future wire method names so receipt identity cannot silently overlap.
 const TURN_COMMIT_OPERATION: []const u8 = "chat.turn.commit";
+const TURN_ACCEPT_OPERATION: []const u8 = "chat.turn.accept";
 const RESPONSE_STATUS_OK: i64 = 0;
 
 pub const Store = struct {
@@ -267,6 +304,10 @@ pub const Store = struct {
     /// Optional post-commit journal hook; production installs it at store
     /// service construction (M5-P2). Never fired for replays or rollbacks.
     commit_hook: ?CommitHook = null,
+    /// Unit-test-only acceptance controls. Production construction leaves both
+    /// unset, so they cannot delay or fail a live transaction.
+    acceptance_test_hold: ?AcceptanceTestHold = null,
+    acceptance_test_fail_before_revision: bool = false,
 
     /// Open the exact database path as the sole store writer.
     pub fn init(allocator: std.mem.Allocator, db_path: []const u8) StoreError!Self {
@@ -440,6 +481,96 @@ pub const Store = struct {
         return self.applyMutation(.{ .thread_upsert = request });
     }
 
+    /// Accept a chat turn under one receipt-backed SQLite transaction. The
+    /// receipt check intentionally precedes owner repair so replay is inert.
+    pub fn acceptTurn(self: *Self, request: TurnAcceptanceRequest) StoreError!store_protocol.WriteResult {
+        try validateTurnAcceptance(request);
+        const user_attachment = try firstAttachment(request.user_message.image, request.user_message.images);
+        const fingerprint = self.encodeFingerprint(.{
+            .turn_id = request.turn_id,
+            .workspace_id = request.workspace.workspace_id,
+            .local_thread_id = request.thread.local_thread_id,
+            .provider = request.provider,
+            .harness = request.harness,
+            .provider_thread_id = request.provider_thread_id,
+            // Acceptance replay may legitimately carry new wall-clock
+            // timestamps, but it must never run a provider with content that
+            // differs from the durable first writer.
+            .user_message = .{
+                .message_id = request.user_message.message_id,
+                .role = request.user_message.role,
+                .author = request.user_message.author,
+                .body = request.user_message.body,
+                .attachment = user_attachment,
+            },
+        }) catch |err| return err;
+        defer self.allocator.free(fingerprint);
+
+        self.conn.execNoArgs("begin immediate") catch |err| return mapStoreError(err);
+        var transaction_open = true;
+        defer if (transaction_open) self.conn.rollback();
+
+        if (self.acceptance_test_hold) |hold| {
+            hold.acquired.store(true, .release);
+            while (!hold.release.load(.acquire)) std.atomic.spinLoopHint();
+        }
+
+        const prior_receipt = self.receiptFor(request.mutation, TURN_ACCEPT_OPERATION, fingerprint) catch |err| return mapStoreError(err);
+        if (prior_receipt) |result| {
+            self.conn.rollback();
+            transaction_open = false;
+            return .{ .store_revision = result.store_revision, .applied = false, .duplicate = true };
+        }
+
+        const current_revision = self.readStoreRevision() catch |err| return mapStoreError(err);
+        if (request.mutation.expected_store_revision) |expected| {
+            if (expected != current_revision) return error.Conflict;
+        }
+        const next_revision = std.math.add(u64, current_revision, 1) catch return error.StoreUnavailable;
+        const next_revision_sql: i64 = std.math.cast(i64, next_revision) orelse return error.StoreUnavailable;
+
+        const legacy_staged = self.isLegacyStagedAcceptance(request) catch |err| return mapStoreError(err);
+
+        const inserted: TurnOwnerInsertions = .{
+            .workspace = self.insertChatTurnWorkspaceIfMissing(request.workspace) catch |err| return mapStoreError(err),
+            .thread = self.insertChatTurnThreadIfMissing(request.workspace.workspace_id, request.thread) catch |err| return mapStoreError(err),
+        };
+        self.updateTurnProviderIdentity(
+            request.workspace.workspace_id,
+            request.thread.local_thread_id,
+            request.provider,
+            request.harness,
+            request.provider_thread_id,
+        ) catch |err| return mapStoreError(err);
+        if (!legacy_staged) {
+            self.applyMessageAppend(.{
+                .mutation = request.mutation,
+                .workspace_id = request.workspace.workspace_id,
+                .thread_id = request.thread.local_thread_id,
+                .message = request.user_message,
+            }, next_revision_sql) catch |err| return mapStoreError(err);
+        }
+        self.insertTurnLedger(.{
+            .turn_id = request.turn_id,
+            .workspace_id = request.workspace.workspace_id,
+            .local_thread_id = request.thread.local_thread_id,
+            .status = .running,
+            .started_at_ms = request.started_at_ms,
+            .provider = request.provider,
+            .harness = request.harness,
+            .provider_thread_id = request.provider_thread_id,
+            .user_message_id = request.user_message.message_id,
+        }, next_revision_sql) catch |err| return mapStoreError(err);
+        if (self.acceptance_test_fail_before_revision) return error.Internal;
+        self.conn.exec("update store_state set store_revision = ?1 where id = 1", .{next_revision_sql}) catch |err| return mapStoreError(err);
+        const result: store_protocol.WriteResult = .{ .store_revision = next_revision, .applied = true, .duplicate = false };
+        self.insertReceipt(request.mutation, TURN_ACCEPT_OPERATION, fingerprint, result) catch |err| return mapStoreError(err);
+        try self.commitWithFault();
+        transaction_open = false;
+        if (self.commit_hook) |hook| hook.on_acceptance_committed(hook.context, &request, inserted, result);
+        return result;
+    }
+
     pub fn appendMessage(self: *Self, request: store_protocol.MessageAppendRequest) StoreError!store_protocol.WriteResult {
         return self.applyMutation(.{ .message_append = request });
     }
@@ -483,6 +614,7 @@ pub const Store = struct {
             .started_at_ms = request.started_at_ms,
             .finished_at_ms = request.finished_at_ms,
             .provider = request.provider,
+            .harness = request.harness,
             .provider_thread_id = request.provider_thread_id,
             .error_message = request.error_message,
             .user_message_id = request.user_message_id,
@@ -511,6 +643,24 @@ pub const Store = struct {
         const next_revision = std.math.add(u64, current_revision, 1) catch return error.StoreUnavailable;
         const next_revision_sql: i64 = std.math.cast(i64, next_revision) orelse return error.StoreUnavailable;
 
+        // Self-healing owner creation belongs inside this receipt-backed
+        // transaction. A replay above cannot resurrect a deleted owner.
+        var inserted: TurnOwnerInsertions = .{};
+        if (request.workspace) |workspace| {
+            inserted.workspace = self.insertChatTurnWorkspaceIfMissing(workspace) catch |err| return mapStoreError(err);
+        }
+        if (request.thread) |thread| {
+            inserted.thread = self.insertChatTurnThreadIfMissing(request.workspace_id, thread) catch |err| return mapStoreError(err);
+        }
+        // Provider identity is turn-owned. Assign all three columns including
+        // null provider_thread_id so a provider switch clears stale identity.
+        self.updateTurnProviderIdentity(
+            request.workspace_id,
+            request.local_thread_id,
+            request.provider,
+            request.harness,
+            request.provider_thread_id,
+        ) catch |err| return mapStoreError(err);
         self.insertTurnMessages(request, next_revision_sql) catch |err| return mapStoreError(err);
         self.insertTurnLedger(request, next_revision_sql) catch |err| return mapStoreError(err);
         self.insertTerminalTurnReplayGuard(request) catch |err| return mapStoreError(err);
@@ -538,7 +688,7 @@ pub const Store = struct {
         // Post-commit boundary (A2): turn commits are store commits and fire
         // the same hook. A replayed duplicate turn receipt returned above
         // without committing, so it can never append a second journal entry.
-        if (self.commit_hook) |hook| hook.on_turn_committed(hook.context, &request, result);
+        if (self.commit_hook) |hook| hook.on_turn_committed(hook.context, &request, inserted, result);
         return result;
     }
 
@@ -781,6 +931,40 @@ pub const Store = struct {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return error.StoreCorrupt;
         };
+    }
+
+    const LegacyReceipt = struct {
+        store_revision: u64,
+    };
+
+    /// Read one pre-atomic-acceptance receipt as compatibility evidence. Unlike
+    /// ordinary replay, every malformed or semantically impossible legacy row
+    /// is a compatibility mismatch; SQLite access failures still propagate.
+    fn legacyReceiptFor(
+        self: *const Self,
+        mutation: store_protocol.MutationHeader,
+        operation: []const u8,
+        fingerprint: []const u8,
+    ) !?LegacyReceipt {
+        const row = (try self.conn.row(
+            "select operation, fingerprint, store_revision, response_status, response_payload from store_receipts where request_key = ?1",
+            .{mutation.request_key},
+        )) orelse return null;
+        defer row.deinit();
+
+        if (!std.mem.eql(u8, row.text(0), operation) or !std.mem.eql(u8, row.text(1), fingerprint)) {
+            return error.Conflict;
+        }
+        const revision_sql = row.int(2);
+        if (revision_sql < 0 or row.int(3) != RESPONSE_STATUS_OK) return error.Conflict;
+        const response_payload = row.nullableText(4) orelse return error.Conflict;
+        const result = store_protocol.decodeLeaky(store_protocol.WriteResult, self.allocator, response_payload) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return error.Conflict;
+        };
+        const store_revision: u64 = @intCast(revision_sql);
+        if (result.store_revision != store_revision or !result.applied or result.duplicate) return error.Conflict;
+        return .{ .store_revision = store_revision };
     }
 
     fn insertReceipt(
@@ -1283,6 +1467,194 @@ pub const Store = struct {
         );
     }
 
+    fn insertChatTurnWorkspaceIfMissing(self: *Self, workspace: store_protocol.Workspace) !bool {
+        try self.conn.exec(
+            "insert into workspaces (workspace_id, sort_index, label, path) " ++
+                "values (?1, coalesce((select max(sort_index) + 1 from workspaces), 0), ?2, ?3) " ++
+                "on conflict(workspace_id) do nothing",
+            .{ workspace.workspace_id, workspace.label, workspace.path },
+        );
+        return self.conn.changes() > 0;
+    }
+
+    fn insertChatTurnThreadIfMissing(
+        self: *Self,
+        workspace_id: []const u8,
+        thread: store_protocol.Thread,
+    ) !bool {
+        const provider_code = try providerCode(thread.provider);
+        const harness_code = try harnessCode(thread.harness);
+        try self.conn.exec(
+            "insert into threads (workspace_id, sort_index, title, local_thread_id, provider_thread_id, provider, harness) " ++
+                "select w.id, coalesce((select max(t.sort_index) + 1 from threads t where t.workspace_id = w.id), 0), ?2, ?3, ?4, ?5, ?6 " ++
+                "from workspaces w where w.workspace_id = ?1 " ++
+                "on conflict(workspace_id, local_thread_id) where local_thread_id is not null do nothing",
+            .{ workspace_id, thread.title, thread.local_thread_id, thread.provider_thread_id, provider_code, harness_code },
+        );
+        if (self.conn.changes() > 0) return true;
+        const owner = try self.conn.row(
+            "select 1 from threads t join workspaces w on w.id = t.workspace_id where w.workspace_id = ?1 and t.local_thread_id = ?2",
+            .{ workspace_id, thread.local_thread_id },
+        );
+        if (owner) |row| {
+            row.deinit();
+            return false;
+        }
+        return error.ResourceNotFound;
+    }
+
+    /// Adopt only the exact protocol-19 acceptance shape written before the
+    /// atomic acceptance receipt existed. The three old receipts prove the
+    /// row was staged by the turn path; the ledger, key fingerprint, and row
+    /// checks prevent an unrelated message with the same public ID from being
+    /// mistaken for that staging write.
+    fn isLegacyStagedAcceptance(self: *Self, request: TurnAcceptanceRequest) !bool {
+        const workspace_key = try std.fmt.allocPrint(self.allocator, "turn:{s}:stage-ws", .{request.turn_id});
+        defer self.allocator.free(workspace_key);
+        const thread_key = try std.fmt.allocPrint(self.allocator, "turn:{s}:stage-thread", .{request.turn_id});
+        defer self.allocator.free(thread_key);
+        const user_key = try std.fmt.allocPrint(self.allocator, "turn:{s}:stage-user", .{request.turn_id});
+        defer self.allocator.free(user_key);
+
+        const evidence = (try self.conn.row(
+            "select " ++
+                "exists(select 1 from chat_turns where turn_id = ?1), " ++
+                "exists(select 1 from store_receipts where request_key in (?2, ?3, ?4)), " ++
+                "exists(select 1 from client_message_keys k join threads t on t.id = k.thread_id join workspaces w on w.id = t.workspace_id " ++
+                "where w.workspace_id = ?5 and t.local_thread_id = ?6 and k.message_id = ?7)",
+            .{ request.turn_id, workspace_key, thread_key, user_key, request.workspace.workspace_id, request.thread.local_thread_id, request.user_message.message_id },
+        )) orelse return error.StoreCorrupt;
+        defer evidence.deinit();
+        if (evidence.int(0) == 0 and evidence.int(1) == 0 and evidence.int(2) == 0) return false;
+
+        const workspace_fingerprint = try self.encodeFingerprint(request.workspace);
+        defer self.allocator.free(workspace_fingerprint);
+        const workspace_receipt = try self.legacyReceiptFor(.{
+            .request_key = workspace_key,
+            .client_id = "daemon",
+        }, WORKSPACE_UPSERT_OPERATION, workspace_fingerprint);
+        if (workspace_receipt == null) return error.Conflict;
+
+        // HEAD's stage-thread request predated provider-thread persistence.
+        // Reconstruct that exact request shape rather than fingerprinting the
+        // richer retry request and mistaking omitted legacy evidence for a
+        // contradiction.
+        var legacy_thread = request.thread;
+        legacy_thread.provider_thread_id = null;
+        const thread_fingerprint = try self.encodeFingerprint(.{
+            .workspace_id = request.workspace.workspace_id,
+            .thread = legacy_thread,
+        });
+        defer self.allocator.free(thread_fingerprint);
+        const thread_receipt = try self.legacyReceiptFor(.{
+            .request_key = thread_key,
+            .client_id = "daemon",
+        }, THREAD_UPSERT_OPERATION, thread_fingerprint);
+        if (thread_receipt == null) return error.Conflict;
+
+        const workspace_revision = workspace_receipt.?.store_revision;
+        const expected_thread_revision = std.math.add(u64, workspace_revision, 1) catch return error.Conflict;
+        if (thread_receipt.?.store_revision != expected_thread_revision) return error.Conflict;
+
+        const ledger = (try self.conn.row(
+            "select workspace_id, local_thread_id, status, started_at_ms, finished_at_ms, provider, " ++
+                "provider_thread_id, error_message, user_message_id, committed_store_revision " ++
+                "from chat_turns where turn_id = ?1",
+            .{request.turn_id},
+        )) orelse return error.Conflict;
+        defer ledger.deinit();
+        const legacy_running = std.mem.eql(u8, ledger.text(2), "running") and ledger.nullableInt(4) == null;
+        const legacy_interrupted = std.mem.eql(u8, ledger.text(2), "interrupted") and ledger.nullableInt(4) != null;
+        if (!std.mem.eql(u8, ledger.text(0), request.workspace.workspace_id) or
+            !std.mem.eql(u8, ledger.text(1), request.thread.local_thread_id) or
+            !(legacy_running or legacy_interrupted) or
+            !std.mem.eql(u8, ledger.text(5), request.provider) or
+            // HEAD omitted provider_thread_id from this insert for both new
+            // and continuing provider threads. A non-null durable value is
+            // therefore not the legacy shape and remains conflicting.
+            ledger.nullableText(6) != null or
+            ledger.nullableText(7) != null or
+            !optionalBytesEqual(ledger.nullableText(8), request.user_message.message_id) or
+            ledger.nullableInt(9) != null)
+        {
+            return error.Conflict;
+        }
+
+        const message_row = (try self.conn.row(
+            "select k.message_fingerprint, m.message_id, m.role, m.author, m.body, " ++
+                "m.image_path, m.image_mime, m.image_byte_size, m.tool_call_id, m.tool_call_kind, m.tool_call_status, " ++
+                "m.created_at_ms, m.updated_at_ms, k.store_revision " ++
+                "from client_message_keys k join messages m on m.thread_id = k.thread_id and m.sort_index = k.sort_index " ++
+                "join threads t on t.id = k.thread_id join workspaces w on w.id = t.workspace_id " ++
+                "where w.workspace_id = ?1 and t.local_thread_id = ?2 and k.message_id = ?3",
+            .{ request.workspace.workspace_id, request.thread.local_thread_id, request.user_message.message_id },
+        )) orelse return error.Conflict;
+        defer message_row.deinit();
+
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        const stored_message = store_protocol.decodeLeaky(store_protocol.Message, arena_state.allocator(), message_row.text(0)) catch return error.Conflict;
+        const stored_image = firstAttachment(stored_message.image, stored_message.images) catch return error.Conflict;
+        const incoming_image = firstAttachment(request.user_message.image, request.user_message.images) catch return error.Conflict;
+        if (!std.mem.eql(u8, stored_message.message_id, request.user_message.message_id) or
+            !std.mem.eql(u8, stored_message.role, request.user_message.role) or
+            !std.mem.eql(u8, stored_message.author, request.user_message.author) or
+            !std.mem.eql(u8, stored_message.body, request.user_message.body) or
+            // HEAD's staged Message literal omitted both image encodings, so
+            // compatibility can authorize only the same durable no-attachment
+            // shape rather than inventing absent first-writer evidence.
+            stored_image != null or stored_message.images.len != 0 or incoming_image != null or
+            !optionalIntEqual(stored_message.created_at_ms, ledger.int(3)) or
+            !optionalIntEqual(stored_message.updated_at_ms, ledger.int(3)) or
+            !storedMessageMatchesRow(stored_message, message_row))
+        {
+            return error.Conflict;
+        }
+
+        const user_fingerprint = try self.encodeFingerprint(.{
+            .workspace_id = request.workspace.workspace_id,
+            .thread_id = request.thread.local_thread_id,
+            .message = stored_message,
+        });
+        defer self.allocator.free(user_fingerprint);
+        const user_receipt = try self.legacyReceiptFor(.{
+            .request_key = user_key,
+            .client_id = "daemon",
+        }, MESSAGE_APPEND_OPERATION, user_fingerprint);
+        if (user_receipt == null) return error.Conflict;
+        const expected_user_revision = std.math.add(u64, thread_receipt.?.store_revision, 1) catch return error.Conflict;
+        if (user_receipt.?.store_revision != expected_user_revision or
+            message_row.int(13) < 0 or
+            @as(u64, @intCast(message_row.int(13))) != user_receipt.?.store_revision)
+        {
+            return error.Conflict;
+        }
+        return true;
+    }
+
+    fn updateTurnProviderIdentity(
+        self: *Self,
+        workspace_id: []const u8,
+        local_thread_id: []const u8,
+        provider: []const u8,
+        harness: []const u8,
+        provider_thread_id: ?[]const u8,
+    ) !void {
+        try self.conn.exec(
+            "update threads set provider = ?1, harness = ?2, provider_thread_id = ?3 " ++
+                "where id = (select t.id from threads t join workspaces w on w.id = t.workspace_id " ++
+                "where w.workspace_id = ?4 and t.local_thread_id = ?5)",
+            .{ try providerCode(provider), try harnessCode(harness), provider_thread_id, workspace_id, local_thread_id },
+        );
+        if (self.conn.changes() == 0) {
+            const row = try self.conn.row(
+                "select 1 from threads t join workspaces w on w.id = t.workspace_id where w.workspace_id = ?1 and t.local_thread_id = ?2",
+                .{ workspace_id, local_thread_id },
+            );
+            if (row) |existing| existing.deinit() else return error.ResourceNotFound;
+        }
+    }
+
     fn applyMessageAppend(self: *Self, request: store_protocol.MessageAppendRequest, store_revision: i64) !void {
         const thread_row_id = (try self.conn.row(
             "select t.id from threads t join workspaces w on w.id = t.workspace_id where w.workspace_id = ?1 and t.local_thread_id = ?2",
@@ -1764,6 +2136,17 @@ fn validateTurnCommit(request: TurnCommitRequest) StoreError!void {
         return error.InvalidParams;
     }
     if (request.client_id.len == 0) return error.InvalidParams;
+    _ = providerCode(request.provider) catch return error.InvalidParams;
+    _ = harnessCode(request.harness) catch return error.InvalidParams;
+    if (request.workspace) |workspace| {
+        if (!std.mem.eql(u8, workspace.workspace_id, request.workspace_id) or workspace.label.len == 0 or workspace.path.len == 0 or
+            workspace.threads.len != 0 or workspace.messages.len != 0) return error.InvalidParams;
+    }
+    if (request.thread) |thread| {
+        if (!std.mem.eql(u8, thread.local_thread_id, request.local_thread_id) or thread.messages.len != 0 or
+            !std.mem.eql(u8, thread.provider, request.provider) or !std.mem.eql(u8, thread.harness, request.harness) or
+            !optionalBytesEqual(thread.provider_thread_id, request.provider_thread_id)) return error.InvalidParams;
+    }
     if (request.completion) |completion| {
         if (!std.mem.eql(u8, completion.workspace_id, request.workspace_id) or
             !std.mem.eql(u8, completion.local_thread_id, request.local_thread_id)) return error.InvalidParams;
@@ -1771,6 +2154,23 @@ fn validateTurnCommit(request: TurnCommitRequest) StoreError!void {
     for (request.messages) |message| {
         _ = try firstAttachment(message.image, message.images);
     }
+}
+
+fn validateTurnAcceptance(request: TurnAcceptanceRequest) StoreError!void {
+    if (request.mutation.request_key.len == 0 or request.mutation.client_id.len == 0 or
+        request.turn_id.len == 0 or request.workspace.workspace_id.len == 0 or
+        request.workspace.label.len == 0 or request.workspace.path.len == 0 or
+        request.thread.local_thread_id.len == 0 or request.user_message.message_id.len == 0)
+    {
+        return error.InvalidParams;
+    }
+    if (request.workspace.threads.len != 0 or request.workspace.messages.len != 0 or request.thread.messages.len != 0) return error.InvalidParams;
+    if (!std.mem.eql(u8, request.thread.provider, request.provider) or
+        !std.mem.eql(u8, request.thread.harness, request.harness) or
+        !optionalBytesEqual(request.thread.provider_thread_id, request.provider_thread_id)) return error.InvalidParams;
+    _ = providerCode(request.provider) catch return error.InvalidParams;
+    _ = harnessCode(request.harness) catch return error.InvalidParams;
+    _ = try firstAttachment(request.user_message.image, request.user_message.images);
 }
 
 fn checkExpectedRevision(mutation: Mutation, current_revision: u64) StoreError!void {
@@ -1796,6 +2196,47 @@ fn attachmentsEqual(left: store_protocol.Attachment, right: store_protocol.Attac
         std.mem.eql(u8, left.mime, right.mime) and
         left.byte_size == right.byte_size and
         optionalBytesEqual(left.attachment_id, right.attachment_id);
+}
+
+fn optionalAttachmentEqual(left: ?store_protocol.Attachment, right: ?store_protocol.Attachment) bool {
+    if (left) |left_value| {
+        const right_value = right orelse return false;
+        return attachmentsEqual(left_value, right_value);
+    }
+    return right == null;
+}
+
+fn storedMessageMatchesRow(message: store_protocol.Message, row: anytype) bool {
+    if (!std.mem.eql(u8, row.text(1), message.message_id) or
+        row.int(2) != (roleCode(message.role) catch return false) or
+        !std.mem.eql(u8, row.text(3), message.author) or
+        !std.mem.eql(u8, row.text(4), message.body) or
+        !optionalBytesEqual(row.nullableText(8), message.tool_call_id) or
+        !optionalIntEqual(row.nullableInt(9), if (message.tool_call_kind) |value| toolCallKindCode(value) catch return false else null) or
+        !optionalIntEqual(row.nullableInt(10), if (message.tool_call_status) |value| toolCallStatusCode(value) catch return false else null) or
+        !optionalIntEqual(row.nullableInt(11), message.created_at_ms) or
+        !optionalIntEqual(row.nullableInt(12), message.updated_at_ms))
+    {
+        return false;
+    }
+    const image = firstAttachment(message.image, message.images) catch return false;
+    if (image) |value| {
+        if (!optionalBytesEqual(row.nullableText(5), value.path) or
+            !optionalBytesEqual(row.nullableText(6), value.mime) or
+            !optionalIntEqual(row.nullableInt(7), @intCast(value.byte_size)) or
+            value.attachment_id != null)
+        {
+            return false;
+        }
+    } else if (row.nullableText(5) != null or row.nullableText(6) != null or row.nullableInt(7) != null) {
+        return false;
+    }
+    return true;
+}
+
+fn optionalIntEqual(left: ?i64, right: ?i64) bool {
+    if (left) |left_value| return right != null and left_value == right.?;
+    return right == null;
 }
 
 fn optionalBytesEqual(left: ?[]const u8, right: ?[]const u8) bool {
@@ -2040,6 +2481,200 @@ fn testHeader(request_key: []const u8, expected_store_revision: ?u64) store_prot
         .expected_store_revision = expected_store_revision,
         .client_id = "test-client",
     };
+}
+
+fn seedLegacyStagedAcceptance(store: *Store, request: TurnAcceptanceRequest) !void {
+    const workspace_key = try std.fmt.allocPrint(std.testing.allocator, "turn:{s}:stage-ws", .{request.turn_id});
+    defer std.testing.allocator.free(workspace_key);
+    const thread_key = try std.fmt.allocPrint(std.testing.allocator, "turn:{s}:stage-thread", .{request.turn_id});
+    defer std.testing.allocator.free(thread_key);
+    const user_key = try std.fmt.allocPrint(std.testing.allocator, "turn:{s}:stage-user", .{request.turn_id});
+    defer std.testing.allocator.free(user_key);
+    // Reproduce stageAcceptedChatTurn from committed HEAD literally. These
+    // sparse DTOs, unguarded daemon headers, and the ledger column list are
+    // the compatibility contract; do not seed them from the richer request.
+    _ = try store.upsertWorkspace(.{
+        .mutation = .{ .request_key = workspace_key, .client_id = "daemon" },
+        .workspace = .{
+            .workspace_id = request.workspace.workspace_id,
+            .label = request.workspace.workspace_id,
+            .path = request.workspace.path,
+        },
+    });
+    _ = try store.upsertThread(.{
+        .mutation = .{ .request_key = thread_key, .client_id = "daemon" },
+        .workspace_id = request.workspace.workspace_id,
+        .thread = .{
+            .local_thread_id = request.thread.local_thread_id,
+            .title = request.thread.title,
+            .provider = request.provider,
+            .harness = request.harness,
+        },
+    });
+    _ = try store.appendMessage(.{
+        .mutation = .{ .request_key = user_key, .client_id = "daemon" },
+        .workspace_id = request.workspace.workspace_id,
+        .thread_id = request.thread.local_thread_id,
+        .message = .{
+            .message_id = request.user_message.message_id,
+            .role = "user",
+            .author = "You",
+            .body = request.user_message.body,
+            .created_at_ms = request.started_at_ms,
+            .updated_at_ms = request.started_at_ms,
+        },
+    });
+    try store.conn.exec(
+        "insert or ignore into chat_turns (turn_id, workspace_id, local_thread_id, status, started_at_ms, provider, user_message_id) " ++
+            "values (?1, ?2, ?3, 'running', ?4, ?5, ?6)",
+        .{
+            request.turn_id,
+            request.workspace.workspace_id,
+            request.thread.local_thread_id,
+            request.started_at_ms,
+            request.provider,
+            request.user_message.message_id,
+        },
+    );
+    // Reproduce the startup interrupted-turn sweep, including deliberate
+    // finished-at drift relative to both the staged row and a later retry.
+    try store.conn.exec(
+        "update chat_turns set status = 'interrupted', finished_at_ms = coalesce(finished_at_ms, ?1) where turn_id = ?2",
+        .{ request.started_at_ms + 91, request.turn_id },
+    );
+}
+
+const LegacyEvidenceAttack = enum {
+    workspace_receipt_revision,
+    thread_receipt_revision,
+    user_receipt_revision,
+    response_revision,
+    response_applied,
+    response_duplicate,
+    response_status,
+    non_contiguous_revisions,
+    client_key_revision,
+    malformed_response,
+    operation,
+    fingerprint,
+    missing_receipt,
+    provider,
+    content,
+};
+
+const LegacyStateSnapshot = struct {
+    revision: u64,
+    workspace: []u8,
+    thread: []u8,
+    message: []u8,
+    message_key: []u8,
+    ledger: []u8,
+    receipts: []u8,
+    replay_guard: []u8,
+
+    fn capture(allocator: std.mem.Allocator, store: *Store) !LegacyStateSnapshot {
+        const row = (try store.conn.row(
+            "select (select store_revision from store_state where id = 1), " ++
+                "coalesce((select group_concat(v, char(30)) from (select quote(workspace_id)||char(31)||quote(label)||char(31)||quote(path) v from workspaces order by workspace_id)), ''), " ++
+                "coalesce((select group_concat(v, char(30)) from (select quote(w.workspace_id)||char(31)||quote(t.local_thread_id)||char(31)||quote(t.title)||char(31)||quote(t.provider_thread_id)||char(31)||t.provider||char(31)||t.harness v from threads t join workspaces w on w.id=t.workspace_id order by w.workspace_id,t.local_thread_id)), ''), " ++
+                "coalesce((select group_concat(v, char(30)) from (select quote(message_id)||char(31)||quote(role)||char(31)||quote(author)||char(31)||quote(body)||char(31)||quote(image_path)||char(31)||quote(image_mime)||char(31)||quote(image_byte_size)||char(31)||quote(created_at_ms)||char(31)||quote(updated_at_ms) v from messages order by thread_id,sort_index)), ''), " ++
+                "coalesce((select group_concat(v, char(30)) from (select quote(message_id)||char(31)||quote(message_fingerprint)||char(31)||quote(sort_index)||char(31)||quote(created_at_ms)||char(31)||quote(updated_at_ms)||char(31)||quote(store_revision) v from client_message_keys order by thread_id,message_id)), ''), " ++
+                "coalesce((select group_concat(v, char(30)) from (select quote(turn_id)||char(31)||quote(workspace_id)||char(31)||quote(local_thread_id)||char(31)||quote(status)||char(31)||quote(started_at_ms)||char(31)||quote(finished_at_ms)||char(31)||quote(provider)||char(31)||quote(provider_thread_id)||char(31)||quote(error_message)||char(31)||quote(user_message_id)||char(31)||quote(committed_store_revision) v from chat_turns order by turn_id)), ''), " ++
+                "coalesce((select group_concat(v, char(30)) from (select quote(request_key)||char(31)||quote(operation)||char(31)||quote(fingerprint)||char(31)||quote(store_revision)||char(31)||quote(response_status)||char(31)||quote(response_payload) v from store_receipts order by request_key)), ''), " ++
+                "coalesce((select group_concat(v, char(30)) from (select quote(turn_id)||char(31)||quote(status) v from terminal_turn_replay_guard order by turn_id)), '')",
+            .{},
+        )) orelse return error.StoreCorrupt;
+        defer row.deinit();
+        return .{
+            .revision = try requiredU64(row.int(0)),
+            .workspace = try allocator.dupe(u8, row.text(1)),
+            .thread = try allocator.dupe(u8, row.text(2)),
+            .message = try allocator.dupe(u8, row.text(3)),
+            .message_key = try allocator.dupe(u8, row.text(4)),
+            .ledger = try allocator.dupe(u8, row.text(5)),
+            .receipts = try allocator.dupe(u8, row.text(6)),
+            .replay_guard = try allocator.dupe(u8, row.text(7)),
+        };
+    }
+
+    fn deinit(self: LegacyStateSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.workspace);
+        allocator.free(self.thread);
+        allocator.free(self.message);
+        allocator.free(self.message_key);
+        allocator.free(self.ledger);
+        allocator.free(self.receipts);
+        allocator.free(self.replay_guard);
+    }
+
+    fn expectEqual(expected: LegacyStateSnapshot, actual: LegacyStateSnapshot) !void {
+        try std.testing.expectEqual(expected.revision, actual.revision);
+        try std.testing.expectEqualStrings(expected.workspace, actual.workspace);
+        try std.testing.expectEqualStrings(expected.thread, actual.thread);
+        try std.testing.expectEqualStrings(expected.message, actual.message);
+        try std.testing.expectEqualStrings(expected.message_key, actual.message_key);
+        try std.testing.expectEqualStrings(expected.ledger, actual.ledger);
+        try std.testing.expectEqualStrings(expected.receipts, actual.receipts);
+        try std.testing.expectEqualStrings(expected.replay_guard, actual.replay_guard);
+    }
+};
+
+fn runLegacyEvidenceAttack(attack: LegacyEvidenceAttack) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("legacy-nonzero-prefix", null),
+        .workspace = testWorkspace("legacy-prefix-workspace", "Legacy prefix"),
+    });
+    var request: TurnAcceptanceRequest = .{
+        .mutation = testHeader("turn:evidence-turn:accept", null),
+        .turn_id = "evidence-turn",
+        .workspace = testWorkspace("evidence-workspace", "evidence-workspace"),
+        .thread = .{ .local_thread_id = "evidence-thread", .title = "Evidence", .provider = "codex" },
+        .started_at_ms = 10,
+        .provider = "codex",
+        .harness = "local_cli",
+        .user_message = .{ .message_id = "evidence-user", .role = "user", .author = "You", .body = "original", .created_at_ms = 10, .updated_at_ms = 10 },
+    };
+    try seedLegacyStagedAcceptance(&store, request);
+    try std.testing.expectEqual(@as(u64, 4), try store.storeRevision());
+
+    switch (attack) {
+        .workspace_receipt_revision => try store.conn.exec("update store_receipts set store_revision = 40 where request_key = 'turn:evidence-turn:stage-ws'", .{}),
+        .thread_receipt_revision => try store.conn.exec("update store_receipts set store_revision = 40 where request_key = 'turn:evidence-turn:stage-thread'", .{}),
+        .user_receipt_revision => try store.conn.exec("update store_receipts set store_revision = 40 where request_key = 'turn:evidence-turn:stage-user'", .{}),
+        .response_revision => try store.conn.exec("update store_receipts set response_payload = '{\"store_revision\":40,\"applied\":true,\"duplicate\":false}' where request_key = 'turn:evidence-turn:stage-thread'", .{}),
+        .response_applied => try store.conn.exec("update store_receipts set response_payload = '{\"store_revision\":3,\"applied\":false,\"duplicate\":false}' where request_key = 'turn:evidence-turn:stage-thread'", .{}),
+        .response_duplicate => try store.conn.exec("update store_receipts set response_payload = '{\"store_revision\":3,\"applied\":true,\"duplicate\":true}' where request_key = 'turn:evidence-turn:stage-thread'", .{}),
+        .response_status => try store.conn.exec("update store_receipts set response_status = 500 where request_key = 'turn:evidence-turn:stage-thread'", .{}),
+        .non_contiguous_revisions => {
+            try store.conn.exec("update store_receipts set store_revision = 4, response_payload = '{\"store_revision\":4,\"applied\":true,\"duplicate\":false}' where request_key = 'turn:evidence-turn:stage-thread'", .{});
+            try store.conn.exec("update store_receipts set store_revision = 5, response_payload = '{\"store_revision\":5,\"applied\":true,\"duplicate\":false}' where request_key = 'turn:evidence-turn:stage-user'", .{});
+            try store.conn.exec("update client_message_keys set store_revision = 5 where message_id = 'evidence-user'", .{});
+        },
+        .client_key_revision => try store.conn.exec("update client_message_keys set store_revision = 40 where message_id = 'evidence-user'", .{}),
+        .malformed_response => try store.conn.exec("update store_receipts set response_payload = '{malformed' where request_key = 'turn:evidence-turn:stage-thread'", .{}),
+        .operation => try store.conn.exec("update store_receipts set operation = 'wrong-operation' where request_key = 'turn:evidence-turn:stage-thread'", .{}),
+        .fingerprint => try store.conn.exec("update store_receipts set fingerprint = 'wrong-fingerprint' where request_key = 'turn:evidence-turn:stage-thread'", .{}),
+        .missing_receipt => try store.conn.exec("delete from store_receipts where request_key = 'turn:evidence-turn:stage-thread'", .{}),
+        .provider => {
+            request.provider = "claude";
+            request.thread.provider = "claude";
+        },
+        .content => request.user_message.body = "changed",
+    }
+
+    const before = try LegacyStateSnapshot.capture(std.testing.allocator, &store);
+    defer before.deinit(std.testing.allocator);
+    try std.testing.expectError(error.Conflict, store.acceptTurn(request));
+    const after = try LegacyStateSnapshot.capture(std.testing.allocator, &store);
+    defer after.deinit(std.testing.allocator);
+    try before.expectEqual(after);
 }
 
 // Borrow caller-owned storage; returning &.{workspace} would leave the DTO
@@ -2394,6 +3029,795 @@ test "turn commit is durable, ordered, exactly once, and revision guarded by rec
     try std.testing.expectEqual(@as(i64, 2), replay_rows.int(0));
 }
 
+test "daemon chat turn ownership preserves workspace layout identity and composer draft" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("turn-owner-workspace", null),
+        .workspace = .{
+            .workspace_id = "workspace-owner",
+            .label = "Friendly workspace",
+            .path = "/tmp/friendly-workspace",
+            .workspace_layout_json = "{\"version\":2,\"focused\":42}",
+            .selected_thread_index = 1,
+        },
+    });
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("turn-owner-thread", 1),
+        .workspace_id = "workspace-owner",
+        .thread = .{
+            .local_thread_id = "thread-owner",
+            .title = "Friendly thread",
+            .draft = "unsent independent draft",
+        },
+    });
+
+    _ = try store.acceptTurn(.{
+        .mutation = testHeader("turn-owner-accept", 2),
+        .turn_id = "turn-owner",
+        .workspace = .{
+            .workspace_id = "workspace-owner",
+            .label = "workspace-owner",
+            .path = "/tmp/friendly-workspace",
+        },
+        .thread = .{
+            .local_thread_id = "thread-owner",
+            .title = "Daemon turn title",
+            .provider = "codex",
+            .provider_thread_id = "provider-owner",
+        },
+        .started_at_ms = 100,
+        .provider = "codex",
+        .harness = "local_cli",
+        .provider_thread_id = "provider-owner",
+        .user_message = .{
+            .message_id = "turn-owner-user",
+            .role = "user",
+            .author = "You",
+            .body = "hello",
+        },
+    });
+
+    {
+        const workspace_row = (try store.conn.row(
+            "select label, path, workspace_layout_json, selected_thread_index from workspaces where workspace_id = ?1",
+            .{"workspace-owner"},
+        )).?;
+        defer workspace_row.deinit();
+        try std.testing.expectEqualStrings("Friendly workspace", workspace_row.text(0));
+        try std.testing.expectEqualStrings("/tmp/friendly-workspace", workspace_row.text(1));
+        try std.testing.expectEqualStrings("{\"version\":2,\"focused\":42}", workspace_row.text(2));
+        try std.testing.expectEqual(@as(i64, 1), workspace_row.int(3));
+    }
+
+    {
+        const thread_row = (try store.conn.row(
+            "select title, draft from threads t join workspaces w on w.id = t.workspace_id where w.workspace_id = ?1 and t.local_thread_id = ?2",
+            .{ "workspace-owner", "thread-owner" },
+        )).?;
+        defer thread_row.deinit();
+        try std.testing.expectEqualStrings("Friendly thread", thread_row.text(0));
+        try std.testing.expectEqualStrings("unsent independent draft", thread_row.text(1));
+    }
+
+    _ = try store.commitTurn(.{
+        .turn_id = "turn-owner",
+        .workspace_id = "workspace-owner",
+        .local_thread_id = "thread-owner",
+        .status = .completed,
+        .started_at_ms = 100,
+        .finished_at_ms = 200,
+        .provider = "codex",
+        .provider_thread_id = "provider-owner",
+        .messages = &.{},
+        .client_id = "daemon",
+    });
+    const committed_thread_row = (try store.conn.row(
+        "select provider_thread_id, draft from threads t join workspaces w on w.id = t.workspace_id where w.workspace_id = ?1 and t.local_thread_id = ?2",
+        .{ "workspace-owner", "thread-owner" },
+    )).?;
+    defer committed_thread_row.deinit();
+    try std.testing.expectEqualStrings("provider-owner", committed_thread_row.text(0));
+    try std.testing.expectEqualStrings("unsent independent draft", committed_thread_row.text(1));
+}
+
+test "protocol 19 staged acceptance upgrades atomically and replays without owner repair" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    const request: TurnAcceptanceRequest = .{
+        .mutation = testHeader("turn:upgrade-turn:accept", null),
+        .turn_id = "upgrade-turn",
+        .workspace = testWorkspace("upgrade-workspace", "upgrade-workspace"),
+        .thread = .{
+            .local_thread_id = "upgrade-thread",
+            .title = "Upgrade thread",
+            .provider = "codex",
+            .provider_thread_id = "provider-upgrade",
+        },
+        .started_at_ms = 100,
+        .provider = "codex",
+        .harness = "local_cli",
+        .provider_thread_id = "provider-upgrade",
+        .user_message = .{
+            .message_id = "upgrade-user",
+            .role = "user",
+            .author = "You",
+            .body = "resume exactly once",
+            .created_at_ms = 100,
+            .updated_at_ms = 100,
+        },
+    };
+    try seedLegacyStagedAcceptance(&store, request);
+    const legacy_shape = (try store.conn.row(
+        "select t.provider_thread_id, c.provider_thread_id, c.committed_store_revision, c.status, " ++
+            "m.image_path, m.image_mime, m.image_byte_size, m.created_at_ms, m.updated_at_ms, " ++
+            "(select count(*) from store_receipts) " ++
+            "from threads t join workspaces w on w.id = t.workspace_id " ++
+            "join chat_turns c on c.workspace_id = w.workspace_id and c.local_thread_id = t.local_thread_id " ++
+            "join messages m on m.thread_id = t.id where c.turn_id = ?1",
+        .{request.turn_id},
+    )).?;
+    defer legacy_shape.deinit();
+    try std.testing.expect(legacy_shape.nullableText(0) == null);
+    try std.testing.expect(legacy_shape.nullableText(1) == null);
+    try std.testing.expect(legacy_shape.nullableInt(2) == null);
+    try std.testing.expectEqualStrings("interrupted", legacy_shape.text(3));
+    try std.testing.expect(legacy_shape.nullableText(4) == null);
+    try std.testing.expect(legacy_shape.nullableText(5) == null);
+    try std.testing.expect(legacy_shape.nullableInt(6) == null);
+    try std.testing.expectEqual(@as(i64, 100), legacy_shape.int(7));
+    try std.testing.expectEqual(@as(i64, 100), legacy_shape.int(8));
+    try std.testing.expectEqual(@as(i64, 3), legacy_shape.int(9));
+
+    const Counter = struct {
+        count: usize = 0,
+        inserted: TurnOwnerInsertions = .{},
+        revision: u64 = 0,
+
+        fn mutation(_: *anyopaque, _: *const Mutation, _: store_protocol.WriteResult) void {}
+        fn turn(_: *anyopaque, _: *const TurnCommitRequest, _: TurnOwnerInsertions, _: store_protocol.WriteResult) void {}
+        fn acceptance(context: *anyopaque, _: *const TurnAcceptanceRequest, inserted: TurnOwnerInsertions, result: store_protocol.WriteResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.count += 1;
+            self.inserted = inserted;
+            self.revision = result.store_revision;
+        }
+    };
+    var counter: Counter = .{};
+    store.commit_hook = .{
+        .context = &counter,
+        .on_mutation_committed = Counter.mutation,
+        .on_turn_committed = Counter.turn,
+        .on_acceptance_committed = Counter.acceptance,
+    };
+
+    const accepted = try store.acceptTurn(request);
+    try std.testing.expect(accepted.applied);
+    try std.testing.expectEqual(@as(u64, 4), accepted.store_revision);
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
+    try std.testing.expect(!counter.inserted.workspace and !counter.inserted.thread);
+    try std.testing.expectEqual(accepted.store_revision, counter.revision);
+    const durable = (try store.conn.row(
+        "select (select count(*) from messages), (select count(*) from client_message_keys), " ++
+            "(select count(*) from store_receipts), c.status, c.committed_store_revision, m.body, m.created_at_ms " ++
+            "from chat_turns c join messages m on m.message_id = c.user_message_id where c.turn_id = ?1",
+        .{request.turn_id},
+    )).?;
+    defer durable.deinit();
+    try std.testing.expectEqual(@as(i64, 1), durable.int(0));
+    try std.testing.expectEqual(@as(i64, 1), durable.int(1));
+    try std.testing.expectEqual(@as(i64, 4), durable.int(2));
+    try std.testing.expectEqualStrings("running", durable.text(3));
+    try std.testing.expectEqual(@as(i64, 4), durable.int(4));
+    try std.testing.expectEqualStrings("resume exactly once", durable.text(5));
+    try std.testing.expectEqual(@as(i64, 100), durable.int(6));
+    const durable_image = (try store.conn.row(
+        "select image_path, image_mime, image_byte_size from messages where message_id = ?1",
+        .{request.user_message.message_id},
+    )).?;
+    defer durable_image.deinit();
+    try std.testing.expect(durable_image.nullableText(0) == null);
+    try std.testing.expect(durable_image.nullableText(1) == null);
+    try std.testing.expect(durable_image.nullableInt(2) == null);
+
+    const replay = try store.acceptTurn(request);
+    try std.testing.expect(replay.duplicate and !replay.applied);
+    try std.testing.expectEqual(accepted.store_revision, replay.store_revision);
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
+    try store.conn.exec("delete from workspaces where workspace_id = ?1", .{request.workspace.workspace_id});
+    const replay_after_delete = try store.acceptTurn(request);
+    try std.testing.expect(replay_after_delete.duplicate);
+    const owner_count = (try store.conn.row("select count(*) from workspaces", .{})).?;
+    defer owner_count.deinit();
+    try std.testing.expectEqual(@as(i64, 0), owner_count.int(0));
+}
+
+test "protocol 19 staged acceptance upgrades with null continuing provider thread" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    const request: TurnAcceptanceRequest = .{
+        .mutation = testHeader("turn:null-provider-upgrade:accept", null),
+        .turn_id = "null-provider-upgrade",
+        .workspace = testWorkspace("null-provider-workspace", "null-provider-workspace"),
+        .thread = .{ .local_thread_id = "null-provider-thread", .title = "Null provider thread", .provider = "codex" },
+        .started_at_ms = 44,
+        .provider = "codex",
+        .harness = "local_cli",
+        .provider_thread_id = null,
+        .user_message = .{
+            .message_id = "null-provider-user",
+            .role = "user",
+            .author = "You",
+            .body = "resume without a provider thread",
+            .created_at_ms = 144,
+            .updated_at_ms = 145,
+        },
+    };
+    try seedLegacyStagedAcceptance(&store, request);
+
+    const accepted = try store.acceptTurn(request);
+    try std.testing.expect(accepted.applied);
+    try std.testing.expectEqual(@as(u64, 4), accepted.store_revision);
+    const durable = (try store.conn.row(
+        "select c.provider_thread_id, m.image_path, m.created_at_ms, " ++
+            "(select count(*) from messages), (select count(*) from client_message_keys) " ++
+            "from chat_turns c join messages m on m.message_id = c.user_message_id where c.turn_id = ?1",
+        .{request.turn_id},
+    )).?;
+    defer durable.deinit();
+    try std.testing.expect(durable.nullableText(0) == null);
+    try std.testing.expect(durable.nullableText(1) == null);
+    try std.testing.expectEqual(@as(i64, 44), durable.int(2));
+    try std.testing.expectEqual(@as(i64, 1), durable.int(3));
+    try std.testing.expectEqual(@as(i64, 1), durable.int(4));
+}
+
+test "new acceptance replay binds immutable user content but permits timestamp drift" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    const request: TurnAcceptanceRequest = .{
+        .mutation = testHeader("turn:identity:accept", null),
+        .turn_id = "identity-turn",
+        .workspace = testWorkspace("identity-workspace", "Identity workspace"),
+        .thread = .{ .local_thread_id = "identity-thread", .title = "Identity thread", .provider = "codex" },
+        .started_at_ms = 70,
+        .provider = "codex",
+        .harness = "local_cli",
+        .user_message = .{
+            .message_id = "identity-user",
+            .role = "user",
+            .author = "You",
+            .body = "first writer prompt",
+            .image = .{ .path = "/tmp/identity.png", .mime = "image/png", .byte_size = 17 },
+            .created_at_ms = 70,
+            .updated_at_ms = 71,
+        },
+    };
+    const accepted = try store.acceptTurn(request);
+
+    var timestamp_drift = request;
+    timestamp_drift.user_message.created_at_ms = 700;
+    timestamp_drift.user_message.updated_at_ms = 701;
+    const replay = try store.acceptTurn(timestamp_drift);
+    try std.testing.expect(replay.duplicate and !replay.applied);
+    try std.testing.expectEqual(accepted.store_revision, replay.store_revision);
+
+    var changed_role = request;
+    changed_role.user_message.role = "assistant";
+    try std.testing.expectError(error.Conflict, store.acceptTurn(changed_role));
+    var changed_author = request;
+    changed_author.user_message.author = "Someone else";
+    try std.testing.expectError(error.Conflict, store.acceptTurn(changed_author));
+    var changed_body = request;
+    changed_body.user_message.body = "second writer prompt";
+    try std.testing.expectError(error.Conflict, store.acceptTurn(changed_body));
+    var changed_attachment = request;
+    changed_attachment.user_message.image = .{ .path = "/tmp/changed.png", .mime = "image/png", .byte_size = 17 };
+    try std.testing.expectError(error.Conflict, store.acceptTurn(changed_attachment));
+
+    const unchanged = (try store.conn.row(
+        "select (select store_revision from store_state where id = 1), " ++
+            "(select count(*) from messages), (select count(*) from client_message_keys), " ++
+            "(select count(*) from store_receipts), m.role, m.author, m.body, m.image_path, m.created_at_ms, m.updated_at_ms " ++
+            "from messages m where m.message_id = ?1",
+        .{request.user_message.message_id},
+    )).?;
+    defer unchanged.deinit();
+    try std.testing.expectEqual(@as(i64, 1), unchanged.int(0));
+    try std.testing.expectEqual(@as(i64, 1), unchanged.int(1));
+    try std.testing.expectEqual(@as(i64, 1), unchanged.int(2));
+    try std.testing.expectEqual(@as(i64, 1), unchanged.int(3));
+    try std.testing.expectEqual(@as(i64, 1), unchanged.int(4));
+    try std.testing.expectEqualStrings("You", unchanged.text(5));
+    try std.testing.expectEqualStrings("first writer prompt", unchanged.text(6));
+    try std.testing.expectEqualStrings("/tmp/identity.png", unchanged.text(7));
+    try std.testing.expectEqual(@as(i64, 70), unchanged.int(8));
+    try std.testing.expectEqual(@as(i64, 71), unchanged.int(9));
+}
+
+test "protocol 19 staged acceptance rejects mismatched provenance without mutation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    const request: TurnAcceptanceRequest = .{
+        .mutation = testHeader("turn:mismatch-turn:accept", null),
+        .turn_id = "mismatch-turn",
+        .workspace = testWorkspace("mismatch-workspace", "mismatch-workspace"),
+        .thread = .{ .local_thread_id = "mismatch-thread", .title = "Mismatch", .provider = "codex" },
+        .started_at_ms = 10,
+        .provider = "codex",
+        .harness = "local_cli",
+        .user_message = .{ .message_id = "mismatch-user", .role = "user", .author = "You", .body = "original", .created_at_ms = 10 },
+    };
+    try seedLegacyStagedAcceptance(&store, request);
+
+    var body_mismatch = request;
+    body_mismatch.user_message.body = "coincidental replacement";
+    try std.testing.expectError(error.Conflict, store.acceptTurn(body_mismatch));
+    try std.testing.expectEqual(@as(u64, 3), try store.storeRevision());
+
+    var provider_mismatch = request;
+    provider_mismatch.provider = "claude";
+    provider_mismatch.thread.provider = "claude";
+    try std.testing.expectError(error.Conflict, store.acceptTurn(provider_mismatch));
+    var harness_mismatch = request;
+    harness_mismatch.harness = "remote_session";
+    harness_mismatch.thread.harness = "remote_session";
+    try std.testing.expectError(error.Conflict, store.acceptTurn(harness_mismatch));
+
+    try store.conn.exec("update chat_turns set provider_thread_id = 'forged-provider-thread' where turn_id = ?1", .{request.turn_id});
+    try std.testing.expectError(error.Conflict, store.acceptTurn(request));
+    try store.conn.exec("update chat_turns set provider_thread_id = null where turn_id = ?1", .{request.turn_id});
+
+    try store.conn.exec("update client_message_keys set message_id = 'wrong-client-key-owner' where message_id = ?1", .{request.user_message.message_id});
+    try std.testing.expectError(error.Conflict, store.acceptTurn(request));
+    try store.conn.exec("update client_message_keys set message_id = ?1 where message_id = 'wrong-client-key-owner'", .{request.user_message.message_id});
+
+    var turn_mismatch = request;
+    turn_mismatch.turn_id = "coincidental-turn";
+    turn_mismatch.mutation.request_key = "turn:coincidental-turn:accept";
+    try std.testing.expectError(error.Conflict, store.acceptTurn(turn_mismatch));
+
+    try store.conn.exec("update chat_turns set workspace_id = 'other-workspace' where turn_id = ?1", .{request.turn_id});
+    try std.testing.expectError(error.Conflict, store.acceptTurn(request));
+    try store.conn.exec("update chat_turns set workspace_id = ?1 where turn_id = ?2", .{ request.workspace.workspace_id, request.turn_id });
+
+    try store.conn.exec("update store_receipts set operation = 'wrong-owner' where request_key = 'turn:mismatch-turn:stage-thread'", .{});
+    try std.testing.expectError(error.Conflict, store.acceptTurn(request));
+    try store.conn.exec("update store_receipts set operation = ?1 where request_key = 'turn:mismatch-turn:stage-thread'", .{THREAD_UPSERT_OPERATION});
+    try store.conn.exec("delete from store_receipts where request_key = 'turn:mismatch-turn:stage-user'", .{});
+    try std.testing.expectError(error.Conflict, store.acceptTurn(request));
+    const unchanged = (try store.conn.row(
+        "select (select store_revision from store_state where id = 1), " ++
+            "(select count(*) from store_receipts where request_key = ?1), status, " ++
+            "(select count(*) from messages), (select count(*) from client_message_keys) " ++
+            "from chat_turns where turn_id = ?2",
+        .{ request.mutation.request_key, request.turn_id },
+    )).?;
+    defer unchanged.deinit();
+    try std.testing.expectEqual(@as(i64, 3), unchanged.int(0));
+    try std.testing.expectEqual(@as(i64, 0), unchanged.int(1));
+    try std.testing.expectEqualStrings("interrupted", unchanged.text(2));
+    try std.testing.expectEqual(@as(i64, 1), unchanged.int(3));
+    try std.testing.expectEqual(@as(i64, 1), unchanged.int(4));
+}
+
+test "protocol 19 legacy receipt evidence is strict at a nonzero starting revision" {
+    for (std.enums.values(LegacyEvidenceAttack)) |attack| {
+        try runLegacyEvidenceAttack(attack);
+    }
+}
+
+test "protocol 19 staged acceptance rollback retains first writer" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    const Counter = struct {
+        count: usize = 0,
+        fn mutation(_: *anyopaque, _: *const Mutation, _: store_protocol.WriteResult) void {}
+        fn turn(_: *anyopaque, _: *const TurnCommitRequest, _: TurnOwnerInsertions, _: store_protocol.WriteResult) void {}
+        fn acceptance(context: *anyopaque, _: *const TurnAcceptanceRequest, _: TurnOwnerInsertions, _: store_protocol.WriteResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.count += 1;
+        }
+    };
+    var counter: Counter = .{};
+    store.commit_hook = .{
+        .context = &counter,
+        .on_mutation_committed = Counter.mutation,
+        .on_turn_committed = Counter.turn,
+        .on_acceptance_committed = Counter.acceptance,
+    };
+    const request: TurnAcceptanceRequest = .{
+        .mutation = testHeader("turn:rollback-upgrade:accept", null),
+        .turn_id = "rollback-upgrade",
+        .workspace = testWorkspace("rollback-upgrade-workspace", "rollback-upgrade-workspace"),
+        .thread = .{ .local_thread_id = "rollback-upgrade-thread", .title = "Rollback", .provider = "codex" },
+        .started_at_ms = 20,
+        .provider = "codex",
+        .harness = "local_cli",
+        .user_message = .{ .message_id = "rollback-upgrade-user", .role = "user", .author = "You", .body = "keep me", .created_at_ms = 20 },
+    };
+    try seedLegacyStagedAcceptance(&store, request);
+    try store.conn.exec(
+        "update threads set provider = 0 where local_thread_id = ?1",
+        .{request.thread.local_thread_id},
+    );
+    store.acceptance_test_fail_before_revision = true;
+    try std.testing.expectError(error.Internal, store.acceptTurn(request));
+    store.acceptance_test_fail_before_revision = false;
+    const retained = (try store.conn.row(
+        "select (select store_revision from store_state where id = 1), t.provider, c.status, c.committed_store_revision, " ++
+            "(select count(*) from messages where message_id = ?1), (select count(*) from store_receipts where request_key = ?2) " ++
+            "from threads t join chat_turns c on c.local_thread_id = t.local_thread_id where c.turn_id = ?3",
+        .{ request.user_message.message_id, request.mutation.request_key, request.turn_id },
+    )).?;
+    defer retained.deinit();
+    try std.testing.expectEqual(@as(i64, 3), retained.int(0));
+    try std.testing.expectEqual(@as(i64, 0), retained.int(1));
+    try std.testing.expectEqualStrings("interrupted", retained.text(2));
+    try std.testing.expect(retained.nullableInt(3) == null);
+    try std.testing.expectEqual(@as(i64, 1), retained.int(4));
+    try std.testing.expectEqual(@as(i64, 0), retained.int(5));
+    try std.testing.expectEqual(@as(usize, 0), counter.count);
+}
+
+test "turn acceptance atomically creates owners journals one revision and replays before mutation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    const Counter = struct {
+        count: usize = 0,
+        inserted: TurnOwnerInsertions = .{},
+        revision: u64 = 0,
+        fn mutation(_: *anyopaque, _: *const Mutation, _: store_protocol.WriteResult) void {}
+        fn turn(_: *anyopaque, _: *const TurnCommitRequest, _: TurnOwnerInsertions, _: store_protocol.WriteResult) void {}
+        fn acceptance(context: *anyopaque, _: *const TurnAcceptanceRequest, inserted: TurnOwnerInsertions, result: store_protocol.WriteResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.count += 1;
+            self.inserted = inserted;
+            self.revision = result.store_revision;
+        }
+    };
+    var counter: Counter = .{};
+    store.commit_hook = .{
+        .context = &counter,
+        .on_mutation_committed = Counter.mutation,
+        .on_turn_committed = Counter.turn,
+        .on_acceptance_committed = Counter.acceptance,
+    };
+    const request: TurnAcceptanceRequest = .{
+        .mutation = testHeader("missing-owner-accept", 0),
+        .turn_id = "missing-owner-turn",
+        .workspace = testWorkspace("missing-owner-workspace", "Missing owner"),
+        .thread = .{
+            .local_thread_id = "missing-owner-thread",
+            .title = "Missing owner thread",
+            .provider = "codex",
+        },
+        .started_at_ms = 10,
+        .provider = "codex",
+        .harness = "local_cli",
+        .user_message = .{
+            .message_id = "missing-owner-user",
+            .role = "user",
+            .author = "You",
+            .body = "accepted",
+        },
+    };
+    const accepted = try store.acceptTurn(request);
+    try std.testing.expectEqual(@as(u64, 1), accepted.store_revision);
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
+    try std.testing.expect(counter.inserted.workspace);
+    try std.testing.expect(counter.inserted.thread);
+    try std.testing.expectEqual(accepted.store_revision, counter.revision);
+    const durable = (try store.conn.row(
+        "select (select count(*) from workspaces), (select count(*) from threads), (select count(*) from messages), (select count(*) from chat_turns)",
+        .{},
+    )).?;
+    defer durable.deinit();
+    try std.testing.expectEqual(@as(i64, 1), durable.int(0));
+    try std.testing.expectEqual(@as(i64, 1), durable.int(1));
+    try std.testing.expectEqual(@as(i64, 1), durable.int(2));
+    try std.testing.expectEqual(@as(i64, 1), durable.int(3));
+
+    // Simulate an external deletion after the accepted receipt. Even with a
+    // now-stale expected revision, receipt replay must be completely inert.
+    try store.conn.exec("delete from workspaces where workspace_id = ?1", .{request.workspace.workspace_id});
+    const replay = try store.acceptTurn(request);
+    try std.testing.expect(replay.duplicate);
+    try std.testing.expect(!replay.applied);
+    try std.testing.expectEqual(accepted.store_revision, replay.store_revision);
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
+    const after_replay = (try store.conn.row("select count(*) from workspaces", .{})).?;
+    defer after_replay.deinit();
+    try std.testing.expectEqual(@as(i64, 0), after_replay.int(0));
+}
+
+test "turn acceptance failure rolls back missing owners receipt ledger and revision" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    try std.testing.expectError(error.InvalidParams, store.acceptTurn(.{
+        .mutation = testHeader("rollback-accept", 0),
+        .turn_id = "rollback-turn",
+        .workspace = testWorkspace("rollback-workspace", "Rollback"),
+        .thread = .{ .local_thread_id = "rollback-thread", .title = "Rollback", .provider = "codex" },
+        .started_at_ms = 1,
+        .provider = "codex",
+        .harness = "local_cli",
+        .user_message = .{
+            .message_id = "rollback-user",
+            .role = "not-a-role",
+            .author = "You",
+            .body = "must roll back",
+        },
+    }));
+    try std.testing.expectEqual(@as(u64, 0), try store.storeRevision());
+    const counts = (try store.conn.row(
+        "select (select count(*) from workspaces), (select count(*) from threads), (select count(*) from messages), (select count(*) from chat_turns), (select count(*) from store_receipts)",
+        .{},
+    )).?;
+    defer counts.deinit();
+    var index: usize = 0;
+    while (index < 5) : (index += 1) try std.testing.expectEqual(@as(i64, 0), counts.int(index));
+}
+
+test "turn acceptance provider switch clears stale identity without touching GUI metadata" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("switch-workspace", null),
+        .workspace = testWorkspace("switch-workspace", "Friendly switch"),
+    });
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("switch-thread", 1),
+        .workspace_id = "switch-workspace",
+        .thread = .{
+            .local_thread_id = "switch-thread",
+            .title = "User title",
+            .provider = "opencode",
+            .harness = "remote_session",
+            .provider_thread_id = "stale-provider-thread",
+            .draft = "independent draft",
+        },
+    });
+    _ = try store.acceptTurn(.{
+        .mutation = testHeader("switch-accept", 2),
+        .turn_id = "switch-turn",
+        .workspace = testWorkspace("switch-workspace", "placeholder"),
+        .thread = .{ .local_thread_id = "switch-thread", .title = "placeholder", .provider = "codex", .harness = "local_cli" },
+        .started_at_ms = 3,
+        .provider = "codex",
+        .harness = "local_cli",
+        .provider_thread_id = null,
+        .user_message = .{ .message_id = "switch-user", .role = "user", .author = "You", .body = "switch" },
+    });
+    const row = (try store.conn.row(
+        "select t.title, t.draft, t.provider, t.harness, t.provider_thread_id, c.provider, c.provider_thread_id " ++
+            "from threads t join workspaces w on w.id = t.workspace_id join chat_turns c on c.workspace_id = w.workspace_id and c.local_thread_id = t.local_thread_id " ++
+            "where w.workspace_id = ?1 and t.local_thread_id = ?2",
+        .{ "switch-workspace", "switch-thread" },
+    )).?;
+    defer row.deinit();
+    try std.testing.expectEqualStrings("User title", row.text(0));
+    try std.testing.expectEqualStrings("independent draft", row.text(1));
+    try std.testing.expectEqual(@as(i64, 1), row.int(2));
+    try std.testing.expectEqual(@as(i64, 0), row.int(3));
+    try std.testing.expect(row.nullableText(4) == null);
+    try std.testing.expectEqualStrings("codex", row.text(5));
+    try std.testing.expect(row.nullableText(6) == null);
+
+    _ = try store.commitTurn(.{
+        .turn_id = "switch-turn",
+        .workspace_id = "switch-workspace",
+        .local_thread_id = "switch-thread",
+        .status = .failed,
+        .started_at_ms = 3,
+        .finished_at_ms = 4,
+        .provider = "codex",
+        .harness = "local_cli",
+        .provider_thread_id = null,
+        .error_message = "failed before provider identity",
+    });
+    const failed = (try store.conn.row(
+        "select t.provider_thread_id, c.provider_thread_id, c.status from threads t join workspaces w on w.id = t.workspace_id join chat_turns c on c.workspace_id = w.workspace_id and c.local_thread_id = t.local_thread_id where c.turn_id = ?1",
+        .{"switch-turn"},
+    )).?;
+    defer failed.deinit();
+    try std.testing.expect(failed.nullableText(0) == null);
+    try std.testing.expect(failed.nullableText(1) == null);
+    try std.testing.expectEqualStrings("failed", failed.text(2));
+}
+
+test "terminal turn missing-owner failure rolls back and replay cannot resurrect owners" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    const bad_messages = [_]store_protocol.Message{.{
+        .message_id = "commit-bad-message",
+        .role = "invalid-role",
+        .author = "System",
+        .body = "rollback",
+    }};
+    const base: TurnCommitRequest = .{
+        .turn_id = "commit-missing-turn",
+        .workspace_id = "commit-missing-workspace",
+        .local_thread_id = "commit-missing-thread",
+        .status = .failed,
+        .started_at_ms = 1,
+        .finished_at_ms = 2,
+        .provider = "codex",
+        .harness = "local_cli",
+        .workspace = testWorkspace("commit-missing-workspace", "Commit missing"),
+        .thread = .{ .local_thread_id = "commit-missing-thread", .title = "Commit missing", .provider = "codex" },
+        .messages = &bad_messages,
+    };
+    try std.testing.expectError(error.InvalidParams, store.commitTurn(base));
+    try std.testing.expectEqual(@as(u64, 0), try store.storeRevision());
+    const rolled_back = (try store.conn.row("select (select count(*) from workspaces), (select count(*) from store_receipts)", .{})).?;
+    defer rolled_back.deinit();
+    try std.testing.expectEqual(@as(i64, 0), rolled_back.int(0));
+    try std.testing.expectEqual(@as(i64, 0), rolled_back.int(1));
+
+    var valid = base;
+    valid.messages = &.{};
+    const committed = try store.commitTurn(valid);
+    try store.conn.exec("delete from workspaces where workspace_id = ?1", .{valid.workspace_id});
+    const replay = try store.commitTurn(valid);
+    try std.testing.expect(replay.duplicate);
+    try std.testing.expectEqual(committed.store_revision, replay.store_revision);
+    const owners = (try store.conn.row("select count(*) from workspaces", .{})).?;
+    defer owners.deinit();
+    try std.testing.expectEqual(@as(i64, 0), owners.int(0));
+}
+
+test "two Store connections race one turn acceptance idempotently" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var first_store = try Store.init(std.testing.allocator, db_path);
+    defer first_store.deinit();
+    var second_store = try Store.init(std.testing.allocator, db_path);
+    defer second_store.deinit();
+    const request: TurnAcceptanceRequest = .{
+        .mutation = testHeader("race-accept", null),
+        .turn_id = "race-turn",
+        .workspace = testWorkspace("race-workspace", "Race"),
+        .thread = .{ .local_thread_id = "race-thread", .title = "Race", .provider = "codex" },
+        .started_at_ms = 1,
+        .provider = "codex",
+        .harness = "local_cli",
+        .user_message = .{ .message_id = "race-user", .role = "user", .author = "You", .body = "once" },
+    };
+    const FirstRunner = struct {
+        fn run(store: *Store, req: TurnAcceptanceRequest, ready: *std.atomic.Value(u8), start: *std.atomic.Value(bool), result: *?store_protocol.WriteResult, failure: *?StoreError) void {
+            _ = ready.fetchAdd(1, .release);
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            result.* = store.acceptTurn(req) catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    const SecondRunner = struct {
+        fn run(
+            store: *Store,
+            req: TurnAcceptanceRequest,
+            ready: *std.atomic.Value(u8),
+            start: *std.atomic.Value(bool),
+            first_released: *std.atomic.Value(bool),
+            contended: *std.atomic.Value(bool),
+            result: *?store_protocol.WriteResult,
+            failure: *?StoreError,
+        ) void {
+            _ = ready.fetchAdd(1, .release);
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            store.conn.busyTimeout(1) catch {
+                failure.* = error.Internal;
+                contended.store(true, .release);
+                return;
+            };
+            _ = store.acceptTurn(req) catch |err| {
+                if (err != error.StoreBusy) {
+                    failure.* = err;
+                    contended.store(true, .release);
+                    return;
+                }
+                contended.store(true, .release);
+                store.conn.busyTimeout(schema.BUSY_TIMEOUT_MS) catch {
+                    failure.* = error.Internal;
+                    return;
+                };
+                while (!first_released.load(.acquire)) std.atomic.spinLoopHint();
+                result.* = store.acceptTurn(req) catch |retry_err| {
+                    failure.* = retry_err;
+                    return;
+                };
+                return;
+            };
+            failure.* = error.Internal;
+            contended.store(true, .release);
+        }
+    };
+    var ready = std.atomic.Value(u8).init(0);
+    var first_start = std.atomic.Value(bool).init(false);
+    var second_start = std.atomic.Value(bool).init(false);
+    var first_acquired = std.atomic.Value(bool).init(false);
+    var first_release = std.atomic.Value(bool).init(false);
+    var second_contended = std.atomic.Value(bool).init(false);
+    first_store.acceptance_test_hold = .{ .acquired = &first_acquired, .release = &first_release };
+    var first_result: ?store_protocol.WriteResult = null;
+    var second_result: ?store_protocol.WriteResult = null;
+    var first_failure: ?StoreError = null;
+    var second_failure: ?StoreError = null;
+    const first_thread = try std.Thread.spawn(.{}, FirstRunner.run, .{ &first_store, request, &ready, &first_start, &first_result, &first_failure });
+    const second_thread = try std.Thread.spawn(.{}, SecondRunner.run, .{ &second_store, request, &ready, &second_start, &first_release, &second_contended, &second_result, &second_failure });
+    while (ready.load(.acquire) != 2) std.atomic.spinLoopHint();
+    first_start.store(true, .release);
+    while (!first_acquired.load(.acquire)) std.atomic.spinLoopHint();
+    second_start.store(true, .release);
+    while (!second_contended.load(.acquire)) std.atomic.spinLoopHint();
+    // The second connection returned StoreBusy while BEGIN IMMEDIATE was held;
+    // this is proof of SQLite writer arbitration, not scheduler coincidence.
+    first_release.store(true, .release);
+    first_thread.join();
+    second_thread.join();
+    first_store.acceptance_test_hold = null;
+    try std.testing.expect(first_failure == null);
+    try std.testing.expect(second_failure == null);
+    try std.testing.expect(first_result != null and second_result != null);
+    try std.testing.expect(first_result.?.applied != second_result.?.applied);
+    try std.testing.expect(first_result.?.duplicate != second_result.?.duplicate);
+    try std.testing.expectEqual(@as(u64, 1), try first_store.storeRevision());
+    const counts = (try first_store.conn.row(
+        "select (select count(*) from workspaces), (select count(*) from threads), (select count(*) from messages), (select count(*) from chat_turns), (select count(*) from store_receipts)",
+        .{},
+    )).?;
+    defer counts.deinit();
+    var index: usize = 0;
+    while (index < 5) : (index += 1) try std.testing.expectEqual(@as(i64, 1), counts.int(index));
+}
+
 test "committed turn receipt replay fires the journal hook exactly once" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2420,17 +3844,20 @@ test "committed turn receipt replay fires the journal hook exactly once" {
 
         fn mutation(_: *anyopaque, _: *const Mutation, _: store_protocol.WriteResult) void {}
 
-        fn turn(context: *anyopaque, _: *const TurnCommitRequest, result: store_protocol.WriteResult) void {
+        fn turn(context: *anyopaque, _: *const TurnCommitRequest, _: TurnOwnerInsertions, result: store_protocol.WriteResult) void {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.count += 1;
             self.revision = result.store_revision;
         }
+
+        fn acceptance(_: *anyopaque, _: *const TurnAcceptanceRequest, _: TurnOwnerInsertions, _: store_protocol.WriteResult) void {}
     };
     var counter: Counter = .{};
     store.commit_hook = .{
         .context = &counter,
         .on_mutation_committed = Counter.mutation,
         .on_turn_committed = Counter.turn,
+        .on_acceptance_committed = Counter.acceptance,
     };
     const messages = [_]store_protocol.Message{.{
         .message_id = "turn-hook-message",
