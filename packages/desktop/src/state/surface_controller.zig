@@ -342,7 +342,9 @@ fn clearSurfaceAttentionAtIndex(self: anytype, surface_index: usize) bool {
         surface.completed_at_ms = 0;
         if (surface.status == .done) surface.status = .idle;
     }
-    self.markDirty();
+    // A completed surface is durably removed by the queued targeted clear.
+    // Attention-only changes still need the compatibility snapshot path.
+    if (!done_ack) self.markDirty();
     return true;
 }
 
@@ -466,7 +468,7 @@ test "surface focus clear queues persistence and updates local state immediately
     try std.testing.expect(clearSurfaceAttentionBySession(&state, "session-a"));
     const surface = &state.surface_controller.surfaces.items[0];
     try std.testing.expect(state.queued);
-    try std.testing.expect(state.dirty);
+    try std.testing.expect(!state.dirty);
     try std.testing.expectEqual(SurfaceStatus.idle, surface.status);
     try std.testing.expect(!surface.completion_pending);
     try std.testing.expect(!surface.attention);
