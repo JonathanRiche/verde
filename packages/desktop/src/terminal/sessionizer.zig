@@ -1579,6 +1579,7 @@ const PtySession = struct {
 
 const ChatTurnStatus = enum { running, waiting_approval, completed, failed, aborted };
 const ApprovalDecision = enum { approve, deny };
+const AcceptanceOwnership = enum { owned, conflict_not_owned };
 
 const PendingApproval = struct {
     call_id: []u8,
@@ -1631,6 +1632,11 @@ const ChatTurn = struct {
     user_message_id: ?[]u8 = null,
     /// Hermetic IT stub path (also armed by VERDE_SESSION_DAEMON_CHAT_STUB).
     use_stub: bool = false,
+    /// Unit-test-only Store message override for immutable acceptance fields
+    /// the public prompt API does not independently expose.
+    acceptance_message_override: ?store_protocol.Message = null,
+    /// Unit-test-only proof that a rejected acceptance never enters a provider.
+    provider_invocation_count: ?*usize = null,
     /// Last durable-commit error name (diagnostic; dual-write-unread only).
     durability_error: ?[]u8 = null,
     provider_thread_id: ?[]u8 = null,
@@ -5860,9 +5866,15 @@ fn storeMutationCommittedHook(context: *anyopaque, mutation: *const daemon_store
 /// Store post-commit hook (turn commits, A2). Journals lifecycle + transcript
 /// identity only — never streaming deltas (Q10). Replayed duplicate receipts
 /// return before the hook, so they cannot append a second entry.
-fn storeTurnCommittedHook(context: *anyopaque, request: *const daemon_store.TurnCommitRequest, result: store_protocol.WriteResult) void {
+fn storeTurnCommittedHook(
+    context: *anyopaque,
+    request: *const daemon_store.TurnCommitRequest,
+    inserted: daemon_store.TurnOwnerInsertions,
+    result: store_protocol.WriteResult,
+) void {
     const daemon: *Daemon = @ptrCast(@alignCast(context));
     const revision: change_journal.Revision = .{ .store = result.store_revision };
+    if (inserted.workspace) daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision);
     daemon.appendJournalEntry(.chat_thread, request.local_thread_id, request.workspace_id, revision);
     daemon.appendJournalEntry(.chat_turn, request.turn_id, request.workspace_id, revision);
     // commitTurn writes a completion ledger row whenever the turn completed
@@ -5870,6 +5882,22 @@ fn storeTurnCommittedHook(context: *anyopaque, request: *const daemon_store.Turn
     if (request.status == .completed) {
         daemon.appendJournalEntry(.chat_completion, request.local_thread_id, request.workspace_id, revision);
     }
+}
+
+/// Acceptance journals the inserted workspace owner (when any), the accepted
+/// message's thread identity, and the running turn at one shared revision.
+fn storeAcceptanceCommittedHook(
+    context: *anyopaque,
+    request: *const daemon_store.TurnAcceptanceRequest,
+    inserted: daemon_store.TurnOwnerInsertions,
+    result: store_protocol.WriteResult,
+) void {
+    const daemon: *Daemon = @ptrCast(@alignCast(context));
+    const workspace_id = request.workspace.workspace_id;
+    const revision: change_journal.Revision = .{ .store = result.store_revision };
+    if (inserted.workspace) daemon.appendJournalEntry(.workspace, workspace_id, workspace_id, revision);
+    daemon.appendJournalEntry(.chat_thread, request.thread.local_thread_id, workspace_id, revision);
+    daemon.appendJournalEntry(.chat_turn, request.turn_id, workspace_id, revision);
 }
 
 fn mutationHeader(mutation: daemon_store.Mutation) store_protocol.MutationHeader {
@@ -6000,6 +6028,7 @@ fn maybeInitStoreService(daemon: *Daemon) !void {
         .context = daemon,
         .on_mutation_committed = storeMutationCommittedHook,
         .on_turn_committed = storeTurnCommittedHook,
+        .on_acceptance_committed = storeAcceptanceCommittedHook,
     };
 
     // Successor path: import+prune after endpoint ownership, seed the registry,
@@ -6037,14 +6066,14 @@ fn sweepInterruptedChatTurns(store: *daemon_store.Store) !void {
 
 /// Stage a running ledger row (+ optional user message) at turn acceptance.
 /// Store I/O only under the service mutex; never under lockDaemon.
-fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !void {
+fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !AcceptanceOwnership {
     // MINOR-5(a): bump in_flight under lockDaemon (match dispatch spine) so
     // finalize cannot destroy the service while this pointer is live.
     lockDaemon(daemon);
     const service = daemon.store_service;
     if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
     daemon.mutex.unlock();
-    const svc = service orelse return;
+    const svc = service orelse return .owned;
     defer _ = svc.in_flight.fetchSub(1, .monotonic);
 
     var arena_state: std.heap.ArenaAllocator = .init(daemon.allocator);
@@ -6056,6 +6085,8 @@ fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !void {
     const local_thread_id = try arena.dupe(u8, turn.local_thread_id);
     const project_path = try arena.dupe(u8, turn.request.project_path);
     const provider = try arena.dupe(u8, @tagName(turn.request.provider));
+    const harness_kind = @tagName(turn.request.harness_kind);
+    const provider_thread_id = if (turn.request.provider_thread_id) |id| try arena.dupe(u8, id) else null;
     const thread_title = try arena.dupe(u8, turn.request.thread_title);
     const prompt = try arena.dupe(u8, turn.request.prompt);
     const user_message_id = if (turn.user_message_id) |id|
@@ -6067,60 +6098,39 @@ fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !void {
     lockStoreService(svc);
     defer svc.mutex.unlock();
 
-    const ws_key = try std.fmt.allocPrint(arena, "turn:{s}:stage-ws", .{turn_id});
-    _ = svc.store.upsertWorkspace(.{
-        .mutation = .{ .request_key = ws_key, .client_id = "daemon" },
+    const acceptance_key = try std.fmt.allocPrint(arena, "turn:{s}:accept", .{turn_id});
+    const user_message: store_protocol.Message = turn.acceptance_message_override orelse .{
+        .message_id = user_message_id,
+        .role = "user",
+        .author = "You",
+        .body = prompt,
+        .created_at_ms = started_at_ms,
+        .updated_at_ms = started_at_ms,
+    };
+    _ = svc.store.acceptTurn(.{
+        .mutation = .{ .request_key = acceptance_key, .client_id = "daemon" },
+        .turn_id = turn_id,
         .workspace = .{
             .workspace_id = workspace_id,
             .label = workspace_id,
             .path = project_path,
         },
-    }) catch |err| return err;
-
-    const thread_key = try std.fmt.allocPrint(arena, "turn:{s}:stage-thread", .{turn_id});
-    _ = svc.store.upsertThread(.{
-        .mutation = .{ .request_key = thread_key, .client_id = "daemon" },
-        .workspace_id = workspace_id,
         .thread = .{
             .local_thread_id = local_thread_id,
             .title = if (thread_title.len != 0) thread_title else local_thread_id,
             .provider = provider,
-            .harness = @tagName(turn.request.harness_kind),
+            .harness = harness_kind,
+            .provider_thread_id = provider_thread_id,
         },
-    }) catch |err| return err;
-
-    const msg_key = try std.fmt.allocPrint(arena, "turn:{s}:stage-user", .{turn_id});
-    _ = svc.store.appendMessage(.{
-        .mutation = .{ .request_key = msg_key, .client_id = "daemon" },
-        .workspace_id = workspace_id,
-        .thread_id = local_thread_id,
-        .message = .{
-            .message_id = user_message_id,
-            .role = "user",
-            .author = "You",
-            .body = prompt,
-            .created_at_ms = started_at_ms,
-            .updated_at_ms = started_at_ms,
-        },
+        .started_at_ms = started_at_ms,
+        .provider = provider,
+        .harness = harness_kind,
+        .provider_thread_id = provider_thread_id,
+        .user_message = user_message,
     }) catch |err| switch (err) {
-        // Legal stable-turn_id replay (interrupted sweep): the originally
-        // staged user row keeps its identity; drifted prompt/timestamps must
-        // not fail acceptance (first-writer-wins — commitTurn's F1 upsert
-        // skips the identity-matched row the same way).
-        error.Conflict => {},
+        error.Conflict => return .conflict_not_owned,
         else => return err,
     };
-
-    // Ledger stage is not receipt-backed: the terminal commitTurn path upserts
-    // the durable terminal row over any staged / interrupted ledger row.
-    svc.store.conn.exec(
-        \\insert or ignore into chat_turns (
-        \\  turn_id, workspace_id, local_thread_id, status, started_at_ms,
-        \\  provider, user_message_id
-        \\) values (?1, ?2, ?3, 'running', ?4, ?5, ?6)
-    ,
-        .{ turn_id, workspace_id, local_thread_id, started_at_ms, provider, user_message_id },
-    ) catch |err| return mapStageStoreError(err);
 
     // Mirror the staged id back onto the in-memory turn when it was generated.
     if (turn.user_message_id == null) {
@@ -6130,6 +6140,7 @@ fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !void {
             turn.user_message_id = daemon.allocator.dupe(u8, user_message_id) catch null;
         }
     }
+    return .owned;
 }
 
 fn mapStageStoreError(err: anyerror) daemon_store.StoreError {
@@ -6284,28 +6295,6 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
     lockStoreService(service);
     defer service.mutex.unlock();
 
-    const ws_key = try std.fmt.allocPrint(arena, "turn:{s}:commit-ws", .{turn_id});
-    _ = try service.store.upsertWorkspace(.{
-        .mutation = .{ .request_key = ws_key, .client_id = "daemon" },
-        .workspace = .{
-            .workspace_id = workspace_id,
-            .label = workspace_id,
-            .path = project_path,
-        },
-    });
-    const thread_key = try std.fmt.allocPrint(arena, "turn:{s}:commit-thread", .{turn_id});
-    _ = try service.store.upsertThread(.{
-        .mutation = .{ .request_key = thread_key, .client_id = "daemon" },
-        .workspace_id = workspace_id,
-        .thread = .{
-            .local_thread_id = local_thread_id,
-            .title = if (thread_title.len != 0) thread_title else local_thread_id,
-            .provider = provider,
-            .harness = harness_kind,
-            .provider_thread_id = provider_thread_id,
-        },
-    });
-
     // commitTurn upserts the ledger row over any staged/interrupted row
     // (insertTurnLedger ON CONFLICT). No external pre-delete (MAJOR-1/2).
 
@@ -6324,7 +6313,20 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
         .started_at_ms = started_at_ms,
         .finished_at_ms = finished_at_ms,
         .provider = provider,
+        .harness = harness_kind,
         .provider_thread_id = provider_thread_id,
+        .workspace = .{
+            .workspace_id = workspace_id,
+            .label = workspace_id,
+            .path = project_path,
+        },
+        .thread = .{
+            .local_thread_id = local_thread_id,
+            .title = if (thread_title.len != 0) thread_title else local_thread_id,
+            .provider = provider,
+            .harness = harness_kind,
+            .provider_thread_id = provider_thread_id,
+        },
         .error_message = error_message,
         .user_message_id = user_message_id,
         .messages = messages,
@@ -8070,7 +8072,7 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
     // row (self-healing) when staging partially succeeded; a total staging
     // failure fails the turn loudly so the GUI does not wait forever.
     var staging_failed = false;
-    stageAcceptedChatTurn(daemon, turn) catch |err| {
+    const acceptance_ownership = stageAcceptedChatTurn(daemon, turn) catch |err| ownership: {
         log.warn("chat turn acceptance staging failed turn_id={s} err={s}", .{ turn.turn_id, @errorName(err) });
         lockTurn(turn);
         turn.status = .failed;
@@ -8082,11 +8084,31 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
         turn.finished_at_ms = nowMs();
         turn.mutex.unlock();
         staging_failed = true;
+        break :ownership AcceptanceOwnership.owned;
     };
     if (staging_failed) {
         finalizeChatTurnWorker(daemon, turn);
         return;
     }
+    if (acceptance_ownership == .conflict_not_owned) {
+        // This retry never acquired the durable accepted work. Publish the
+        // rejection only on its in-memory request; terminal durability belongs
+        // to the first writer and must remain available to an exact retry.
+        log.warn("chat turn acceptance conflict turn_id={s}", .{turn.turn_id});
+        lockTurn(turn);
+        turn.status = .failed;
+        turn.durability_pending = false;
+        if (turn.durability_error) |old| allocator.free(old);
+        turn.durability_error = allocator.dupe(u8, "Conflict") catch null;
+        if (turn.error_message) |old| allocator.free(old);
+        turn.error_message = allocator.dupe(u8, "acceptance conflicts with durable first writer") catch null;
+        turn.appendStringEvent(allocator, "failed", "message", turn.error_message orelse "acceptance conflict");
+        turn.finished_at_ms = nowMs();
+        turn.worker_done = true;
+        turn.mutex.unlock();
+        return;
+    }
+    if (turn.provider_invocation_count) |count| count.* += 1;
     // NIT-3: use_stub already folded the env at creation; do not re-eval.
     if (turn.use_stub) {
         runStubChatTurn(allocator, turn);
@@ -10581,6 +10603,234 @@ fn expectErrorCodeMessage(response: []const u8, allocator: std.mem.Allocator, co
     try std.testing.expectEqualStrings(message, jsonString(error_value.get("message").?).?);
 }
 
+const WorkerDurableSnapshot = struct {
+    revision: u64,
+    owners: []u8,
+    message: []u8,
+    message_key: []u8,
+    ledger: []u8,
+    receipts: []u8,
+    replay_guard: []u8,
+    completions: i64,
+    journal_cursor: u64,
+
+    fn capture(allocator: std.mem.Allocator, daemon: *Daemon) !WorkerDurableSnapshot {
+        const store = &daemon.store_service.?.store;
+        const row = (try store.conn.row(
+            "select (select store_revision from store_state where id = 1), " ++
+                "coalesce((select group_concat(v, char(30)) from (select quote(w.workspace_id)||char(31)||quote(w.label)||char(31)||quote(w.path)||char(31)||quote(t.local_thread_id)||char(31)||quote(t.title)||char(31)||quote(t.provider_thread_id)||char(31)||t.provider||char(31)||t.harness v from workspaces w left join threads t on t.workspace_id=w.id order by w.workspace_id,t.local_thread_id)), ''), " ++
+                "coalesce((select group_concat(v, char(30)) from (select quote(message_id)||char(31)||quote(role)||char(31)||quote(author)||char(31)||quote(body)||char(31)||quote(image_path)||char(31)||quote(image_mime)||char(31)||quote(image_byte_size)||char(31)||quote(created_at_ms)||char(31)||quote(updated_at_ms) v from messages order by thread_id,sort_index)), ''), " ++
+                "coalesce((select group_concat(v, char(30)) from (select quote(message_id)||char(31)||quote(message_fingerprint)||char(31)||quote(sort_index)||char(31)||quote(created_at_ms)||char(31)||quote(updated_at_ms)||char(31)||quote(store_revision) v from client_message_keys order by thread_id,message_id)), ''), " ++
+                "coalesce((select group_concat(v, char(30)) from (select quote(turn_id)||char(31)||quote(workspace_id)||char(31)||quote(local_thread_id)||char(31)||quote(status)||char(31)||quote(started_at_ms)||char(31)||quote(finished_at_ms)||char(31)||quote(provider)||char(31)||quote(provider_thread_id)||char(31)||quote(error_message)||char(31)||quote(user_message_id)||char(31)||quote(committed_store_revision) v from chat_turns order by turn_id)), ''), " ++
+                "coalesce((select group_concat(v, char(30)) from (select quote(request_key)||char(31)||quote(operation)||char(31)||quote(fingerprint)||char(31)||quote(store_revision)||char(31)||quote(response_status)||char(31)||quote(response_payload) v from store_receipts order by request_key)), ''), " ++
+                "coalesce((select group_concat(v, char(30)) from (select quote(turn_id)||char(31)||quote(status) v from terminal_turn_replay_guard order by turn_id)), ''), " ++
+                "(select count(*) from chat_completions)",
+            .{},
+        )) orelse return error.StoreUnavailable;
+        defer row.deinit();
+        return .{
+            .revision = @intCast(row.int(0)),
+            .owners = try allocator.dupe(u8, row.text(1)),
+            .message = try allocator.dupe(u8, row.text(2)),
+            .message_key = try allocator.dupe(u8, row.text(3)),
+            .ledger = try allocator.dupe(u8, row.text(4)),
+            .receipts = try allocator.dupe(u8, row.text(5)),
+            .replay_guard = try allocator.dupe(u8, row.text(6)),
+            .completions = row.int(7),
+            .journal_cursor = daemon.journal.last_seq,
+        };
+    }
+
+    fn deinit(self: WorkerDurableSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.owners);
+        allocator.free(self.message);
+        allocator.free(self.message_key);
+        allocator.free(self.ledger);
+        allocator.free(self.receipts);
+        allocator.free(self.replay_guard);
+    }
+
+    fn expectEqual(expected: WorkerDurableSnapshot, actual: WorkerDurableSnapshot) !void {
+        try std.testing.expectEqual(expected.revision, actual.revision);
+        try std.testing.expectEqualStrings(expected.owners, actual.owners);
+        try std.testing.expectEqualStrings(expected.message, actual.message);
+        try std.testing.expectEqualStrings(expected.message_key, actual.message_key);
+        try std.testing.expectEqualStrings(expected.ledger, actual.ledger);
+        try std.testing.expectEqualStrings(expected.receipts, actual.receipts);
+        try std.testing.expectEqualStrings(expected.replay_guard, actual.replay_guard);
+        try std.testing.expectEqual(expected.completions, actual.completions);
+        try std.testing.expectEqual(expected.journal_cursor, actual.journal_cursor);
+    }
+};
+
+fn appendAcceptanceWorkerTurn(
+    daemon: *Daemon,
+    turn_id: []const u8,
+    prompt: []const u8,
+    started_at_ms: i64,
+    provider_thread_id: ?[]const u8,
+    message_override: ?store_protocol.Message,
+    provider_invocation_count: *usize,
+) !*ChatTurn {
+    const allocator = daemon.allocator;
+    const turn = try allocator.create(ChatTurn);
+    errdefer allocator.destroy(turn);
+    const image_paths = try allocator.alloc([]const u8, 0);
+    errdefer allocator.free(image_paths);
+    turn.* = .{
+        .allocator = allocator,
+        .turn_id = try allocator.dupe(u8, turn_id),
+        .workspace_id = try allocator.dupe(u8, "ownership-workspace"),
+        .local_thread_id = try allocator.dupe(u8, "ownership-thread"),
+        .request = .{
+            .provider = .codex,
+            .harness_kind = .local_cli,
+            .project_path = try allocator.dupe(u8, "/tmp/ownership-workspace"),
+            .prompt = try allocator.dupe(u8, prompt),
+            .image_paths = image_paths,
+            .provider_thread_id = if (provider_thread_id) |value| try allocator.dupe(u8, value) else null,
+            .thread_title = try allocator.dupe(u8, "Ownership thread"),
+        },
+        .owned_image_paths = image_paths,
+        .started_at_ms = started_at_ms,
+        .user_message_id = try allocator.dupe(u8, "ownership-user"),
+        .use_stub = true,
+        .acceptance_message_override = message_override,
+        .provider_invocation_count = provider_invocation_count,
+    };
+    try daemon.chat_turns.append(allocator, turn);
+    return turn;
+}
+
+fn seedLegacyAcceptanceWorker(store: *daemon_store.Store, turn_id: []const u8) !void {
+    const workspace_key = try std.fmt.allocPrint(std.testing.allocator, "turn:{s}:stage-ws", .{turn_id});
+    defer std.testing.allocator.free(workspace_key);
+    const thread_key = try std.fmt.allocPrint(std.testing.allocator, "turn:{s}:stage-thread", .{turn_id});
+    defer std.testing.allocator.free(thread_key);
+    const user_key = try std.fmt.allocPrint(std.testing.allocator, "turn:{s}:stage-user", .{turn_id});
+    defer std.testing.allocator.free(user_key);
+    _ = try store.upsertWorkspace(.{
+        .mutation = .{ .request_key = workspace_key, .client_id = "daemon" },
+        .workspace = .{ .workspace_id = "ownership-workspace", .label = "ownership-workspace", .path = "/tmp/ownership-workspace" },
+    });
+    _ = try store.upsertThread(.{
+        .mutation = .{ .request_key = thread_key, .client_id = "daemon" },
+        .workspace_id = "ownership-workspace",
+        .thread = .{ .local_thread_id = "ownership-thread", .title = "Ownership thread", .provider = "codex", .harness = "local_cli" },
+    });
+    _ = try store.appendMessage(.{
+        .mutation = .{ .request_key = user_key, .client_id = "daemon" },
+        .workspace_id = "ownership-workspace",
+        .thread_id = "ownership-thread",
+        .message = .{ .message_id = "ownership-user", .role = "user", .author = "You", .body = "original prompt", .created_at_ms = 10, .updated_at_ms = 10 },
+    });
+    try store.conn.exec(
+        "insert into chat_turns (turn_id,workspace_id,local_thread_id,status,started_at_ms,provider,user_message_id) values (?1,'ownership-workspace','ownership-thread','running',10,'codex','ownership-user')",
+        .{turn_id},
+    );
+    try sweepInterruptedChatTurns(store);
+}
+
+fn seedNewAcceptanceWorker(store: *daemon_store.Store, turn_id: []const u8) !void {
+    const acceptance_key = try std.fmt.allocPrint(std.testing.allocator, "turn:{s}:accept", .{turn_id});
+    defer std.testing.allocator.free(acceptance_key);
+    _ = try store.acceptTurn(.{
+        .mutation = .{ .request_key = acceptance_key, .client_id = "daemon" },
+        .turn_id = turn_id,
+        .workspace = .{ .workspace_id = "ownership-workspace", .label = "ownership-workspace", .path = "/tmp/ownership-workspace" },
+        .thread = .{ .local_thread_id = "ownership-thread", .title = "Ownership thread", .provider = "codex", .harness = "local_cli", .provider_thread_id = "provider-new" },
+        .started_at_ms = 10,
+        .provider = "codex",
+        .harness = "local_cli",
+        .provider_thread_id = "provider-new",
+        .user_message = .{ .message_id = "ownership-user", .role = "user", .author = "You", .body = "original prompt", .created_at_ms = 10, .updated_at_ms = 10 },
+    });
+    try sweepInterruptedChatTurns(store);
+}
+
+fn runAcceptanceOwnershipWorkerScenario(legacy: bool) !void {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    const turn_id = if (legacy) "ownership-legacy-turn" else "ownership-new-turn";
+    if (legacy) {
+        try seedLegacyAcceptanceWorker(&daemon.store_service.?.store, turn_id);
+    } else {
+        try seedNewAcceptanceWorker(&daemon.store_service.?.store, turn_id);
+    }
+    daemon.store_service.?.store.commit_hook = .{
+        .context = &daemon,
+        .on_mutation_committed = storeMutationCommittedHook,
+        .on_turn_committed = storeTurnCommittedHook,
+        .on_acceptance_committed = storeAcceptanceCommittedHook,
+    };
+
+    const baseline = try WorkerDurableSnapshot.capture(allocator, &daemon);
+    defer baseline.deinit(allocator);
+    var provider_invocations: usize = 0;
+    const attacks = [_]struct { prompt: []const u8, message: store_protocol.Message }{
+        .{ .prompt = "original prompt", .message = .{ .message_id = "ownership-user", .role = "assistant", .author = "You", .body = "original prompt" } },
+        .{ .prompt = "original prompt", .message = .{ .message_id = "ownership-user", .role = "user", .author = "Someone else", .body = "original prompt" } },
+        .{ .prompt = "changed prompt", .message = .{ .message_id = "ownership-user", .role = "user", .author = "You", .body = "changed prompt" } },
+        .{ .prompt = "original prompt", .message = .{ .message_id = "ownership-user", .role = "user", .author = "You", .body = "original prompt", .image = .{ .path = "/tmp/changed.png", .mime = "image/png", .byte_size = 17 } } },
+    };
+    for (attacks, 0..) |attack, index| {
+        const turn = try appendAcceptanceWorkerTurn(
+            &daemon,
+            turn_id,
+            attack.prompt,
+            100 + @as(i64, @intCast(index)),
+            if (legacy) "provider-legacy" else "provider-new",
+            attack.message,
+            &provider_invocations,
+        );
+        chatTurnThread(&daemon, turn);
+        try std.testing.expectEqual(@as(usize, 0), provider_invocations);
+        try std.testing.expectEqual(ChatTurnStatus.failed, turn.status);
+        try std.testing.expect(turn.worker_done and !turn.durability_pending);
+        try std.testing.expect(turn.committed_store_revision == null);
+        const unchanged = try WorkerDurableSnapshot.capture(allocator, &daemon);
+        defer unchanged.deinit(allocator);
+        try baseline.expectEqual(unchanged);
+    }
+
+    const exact = try appendAcceptanceWorkerTurn(
+        &daemon,
+        turn_id,
+        "original prompt",
+        777,
+        if (legacy) "provider-legacy" else "provider-new",
+        null,
+        &provider_invocations,
+    );
+    chatTurnThread(&daemon, exact);
+    try std.testing.expectEqual(@as(usize, 1), provider_invocations);
+    try std.testing.expectEqual(ChatTurnStatus.completed, exact.status);
+    try std.testing.expect(exact.worker_done and !exact.durability_pending);
+    try std.testing.expect(exact.committed_store_revision != null);
+    const committed = try WorkerDurableSnapshot.capture(allocator, &daemon);
+    defer committed.deinit(allocator);
+    {
+        const row = (try daemon.store_service.?.store.conn.row("select status from chat_turns where turn_id = ?1", .{turn_id})).?;
+        defer row.deinit();
+        try std.testing.expectEqualStrings("completed", row.text(0));
+    }
+    try std.testing.expectEqual(if (legacy) @as(u64, 5) else @as(u64, 2), committed.revision);
+    {
+        const row = (try daemon.store_service.?.store.conn.row("select count(*) from store_receipts", .{})).?;
+        defer row.deinit();
+        try std.testing.expectEqual(if (legacy) @as(i64, 5) else @as(i64, 2), row.int(0));
+    }
+    try std.testing.expectEqual(@as(i64, 1), committed.completions);
+    try std.testing.expect(committed.journal_cursor > baseline.journal_cursor);
+}
+
 test "store methods report capability_unavailable on a store-less daemon" {
     const allocator = std.testing.allocator;
     var daemon = Daemon.init(allocator);
@@ -11723,6 +11973,14 @@ test "durable turn commit is exactly once and interrupt sweep marks running rows
     )).?;
     defer receipt.deinit();
     try std.testing.expectEqual(@as(i64, 1), receipt.int(0));
+}
+
+test "legacy interrupted acceptance conflict never terminalizes unowned work" {
+    try runAcceptanceOwnershipWorkerScenario(true);
+}
+
+test "new interrupted acceptance conflict never terminalizes unowned work" {
+    try runAcceptanceOwnershipWorkerScenario(false);
 }
 
 test "chat.thread.get and chat.turn.record dispatch typed durable reads" {

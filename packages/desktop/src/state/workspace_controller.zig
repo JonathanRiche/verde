@@ -985,6 +985,19 @@ pub fn isCurrentProjectWorkspacePaneMaximized(self: anytype, pane_id: WorkspaceP
 }
 
 pub fn focusWorkspacePane(self: anytype, project_index: usize, pane_id: WorkspacePaneId) bool {
+    return focusWorkspacePaneWithCompletionPolicy(self, project_index, pane_id, true);
+}
+
+pub fn restoreWorkspacePaneFocus(self: anytype, project_index: usize, pane_id: WorkspacePaneId) bool {
+    return focusWorkspacePaneWithCompletionPolicy(self, project_index, pane_id, false);
+}
+
+fn focusWorkspacePaneWithCompletionPolicy(
+    self: anytype,
+    project_index: usize,
+    pane_id: WorkspacePaneId,
+    acknowledge_completion: bool,
+) bool {
     if (project_index >= self.project_controller.projects.items.len) return false;
     var layout = &self.project_controller.projects.items[project_index].workspace_layout;
     const pane = layout.paneById(pane_id) orelse return false;
@@ -1005,23 +1018,39 @@ pub fn focusWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
             if (ref.thread_index < project.threads.items.len) {
                 persisted_focus_changed = persisted_focus_changed or project.selected_thread_index != ref.thread_index;
                 project.selected_thread_index = ref.thread_index;
-                _ = self.clearChatCompletion(project_index, ref.thread_index);
+                if (acknowledge_completion) _ = self.clearChatCompletion(project_index, ref.thread_index);
             }
             project.last_content_pane_id = pane_id;
             if (self.project_controller.selected_index == project_index) {
                 self.syncPaletteComposerFromDraft();
-                self.requestComposerFocus();
+                if (acknowledge_completion) {
+                    self.requestComposerFocus();
+                } else {
+                    self.restoreComposerFocus();
+                }
             }
         },
         .terminal => |ref| {
             self.project_controller.projects.items[project_index].last_content_pane_id = pane_id;
-            if (self.project_controller.selected_index == project_index) self.requestTerminalDockFocus(ref.dock_id);
+            if (self.project_controller.selected_index == project_index) {
+                if (acknowledge_completion) {
+                    self.requestTerminalDockFocus(ref.dock_id);
+                } else {
+                    self.restoreTerminalDockFocus(ref.dock_id);
+                }
+            }
         },
         .browser => {
-            if (self.project_controller.selected_index == project_index) self.focusBrowserPane();
+            if (self.project_controller.selected_index == project_index) {
+                if (acknowledge_completion) {
+                    self.focusBrowserPaneInWorkspace(project_index, pane_id);
+                } else {
+                    self.restoreBrowserPaneFocus(project_index, pane_id);
+                }
+            }
         },
     }
-    if (persisted_focus_changed) self.markDirty();
+    if (acknowledge_completion and persisted_focus_changed) self.markDirty();
     return true;
 }
 
@@ -1211,11 +1240,7 @@ pub fn closeWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
             self.setSidebarNotice(if (preserve_agent_history) "Agent TUI closed. Reopen it from History." else "Terminal pane closed.");
         },
         .browser => {
-            const removed_runtime_owner = if (self.browser_controller.runtime_project_index) |runtime_project_index|
-                runtime_project_index == project_index
-            else
-                false;
-            self.reconcileBrowserRuntimeAfterPaneRemoval(project_index, removed_runtime_owner);
+            self.reconcileBrowserRuntimeAfterPaneRemoval(project_index, pane_id);
             self.setSidebarNotice("Browser pane closed.");
         },
     }

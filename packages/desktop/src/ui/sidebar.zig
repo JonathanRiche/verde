@@ -1163,22 +1163,7 @@ fn renderAttentionClusterSection(
 ) f32 {
     var y = y_in;
     var rows: [palette_hits.len]AttentionClusterRow = undefined;
-    var row_count: usize = 0;
-
-    var project_index: usize = 0;
-    while (project_index < state.project_controller.projects.items.len) : (project_index += 1) {
-        const project = &state.project_controller.projects.items[project_index];
-        for (project.workspace_layout.panes.items) |*pane| {
-            if (!paneNeedsAttention(state, project_index, project, pane)) continue;
-            if (row_count >= rows.len) continue;
-            rows[row_count] = .{
-                .project_index = project_index,
-                .pane = pane,
-                .completed_at_ms = paneCompletionTime(state, project_index, pane),
-            };
-            row_count += 1;
-        }
-    }
+    const row_count = collectAttentionClusterRows(state, &rows);
     if (row_count == 0) return y;
 
     sortAttentionClusterRows(rows[0..row_count]);
@@ -1199,6 +1184,39 @@ fn renderAttentionClusterSection(
     if (rowVisible(divider_rect, list_clip)) queuePaletteRect(state, divider_rect, paletteColor(theme.borderMuted()));
     y += theme.scaledUi(12.0);
     return y;
+}
+
+fn collectAttentionClusterRows(state: *runtime.AppState, rows: []AttentionClusterRow) usize {
+    var row_count: usize = 0;
+    for (state.project_controller.projects.items, 0..) |*project, project_index| {
+        for (project.workspace_layout.panes.items) |*pane| {
+            if (!paneNeedsAttention(state, project_index, project, pane)) continue;
+            var duplicate = false;
+            for (rows[0..row_count]) |row| {
+                if (row.project_index != project_index) continue;
+                duplicate = switch (pane.ref) {
+                    .chat => |ref| switch (row.pane.ref) {
+                        .chat => |existing| existing.thread_index == ref.thread_index,
+                        else => false,
+                    },
+                    .terminal => |ref| switch (row.pane.ref) {
+                        .terminal => |existing| existing.dock_id == ref.dock_id,
+                        else => false,
+                    },
+                    .browser => false,
+                };
+                if (duplicate) break;
+            }
+            if (duplicate or row_count >= rows.len) continue;
+            rows[row_count] = .{
+                .project_index = project_index,
+                .pane = pane,
+                .completed_at_ms = paneCompletionTime(state, project_index, pane),
+            };
+            row_count += 1;
+        }
+    }
+    return row_count;
 }
 
 fn sortAttentionClusterRows(rows: []AttentionClusterRow) void {
@@ -2417,4 +2435,37 @@ test "ACTIVE rows put durable completions first in finish order" {
     try std.testing.expectEqual(@as(native_state.WorkspacePaneId, 3), rows[0].pane.id);
     try std.testing.expectEqual(@as(native_state.WorkspacePaneId, 2), rows[1].pane.id);
     try std.testing.expectEqual(@as(native_state.WorkspacePaneId, 1), rows[2].pane.id);
+}
+
+test "ACTIVE collection sees every restored chat pane and deduplicates one thread owner" {
+    const allocator = std.testing.allocator;
+    var state: runtime.AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+
+    var project = try native_state.Project.init(allocator, "active-workspace", "Active", "/tmp/active", 0);
+    const second_thread_index = try project.addThread(allocator);
+    const second_pane_id = try project.workspace_layout.createChatPane(allocator, second_thread_index);
+    try project.workspace_layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
+    const duplicate_pane_id = try project.workspace_layout.createChatPane(allocator, second_thread_index);
+    try project.workspace_layout.splitPaneWithLeaf(allocator, second_pane_id, duplicate_pane_id, .horizontal, true);
+    project.threads.items[0].completion_pending = true;
+    project.threads.items[0].completed_at_ms = 100;
+    project.threads.items[second_thread_index].completion_pending = true;
+    project.threads.items[second_thread_index].completed_at_ms = 200;
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+
+    var rows: [8]AttentionClusterRow = undefined;
+    const row_count = collectAttentionClusterRows(&state, &rows);
+    try std.testing.expectEqual(@as(usize, 2), row_count);
+    sortAttentionClusterRows(rows[0..row_count]);
+    try std.testing.expectEqual(@as(usize, 0), rows[0].pane.ref.chat.thread_index);
+    try std.testing.expectEqual(second_thread_index, rows[1].pane.ref.chat.thread_index);
 }

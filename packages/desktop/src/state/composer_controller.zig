@@ -69,6 +69,10 @@ pub fn State(
 
 pub fn requestComposerFocus(self: anytype) void {
     _ = self.acknowledgeFocusedChatCompletion();
+    restoreComposerFocus(self);
+}
+
+pub fn restoreComposerFocus(self: anytype) void {
     self.composer_controller.composer.focused = true;
     self.composer_controller.focused = true;
     self.terminal_controller.focused = false;
