@@ -521,7 +521,8 @@ fn mainInner(init: std.process.Init) !void {
     defer log.info("verde main loop exiting", .{});
 
     var running = true;
-    var needs_render = true;
+    var presentation_demand: loop_pacing.PresentationDemand = .{};
+    presentation_demand.request();
     var last_mouse_motion_render_ms: i64 = 0;
     const frame_profile_logging = frameProfileLoggingEnabled();
     var last_frame_profile_log_ms: i64 = 0;
@@ -530,7 +531,24 @@ fn mainInner(init: std.process.Init) !void {
     var render_pacer: loop_pacing.FramePacer = .{};
     var app_config_poll_cadence: loop_pacing.Cadence = .{};
     var pending_wake_sequence: ?u64 = null;
+    var previous_loop_start_ns = profiler.nowNs();
+    var previous_loop_wait: LoopWaitTrace = .{};
     while (running) {
+        const loop_start_ns = profiler.nowNs();
+        const loop_gap_ns = profiler.elapsedNs(previous_loop_start_ns);
+        if (loop_gap_ns > 100 * std.time.ns_per_ms) {
+            runtime_log.diagnostic(
+                "main-loop gap elapsed_ms={d:.2} sleep_reason={s} wait_requested_ms={d} waited_ms={d:.2} pending_frame_on_entry={}",
+                .{
+                    profiler.nsToMs(loop_gap_ns),
+                    @tagName(previous_loop_wait.reason),
+                    previous_loop_wait.requested_timeout_ms,
+                    profiler.nsToMs(previous_loop_wait.waited_ns),
+                    previous_loop_wait.pending_frame_on_entry,
+                },
+            );
+        }
+        previous_loop_start_ns = loop_start_ns;
         if (macosHostWindowRequestedClose(window, &state)) {
             running = false;
             break;
@@ -538,14 +556,17 @@ fn mainInner(init: std.process.Init) !void {
         var frame_sample = profiler.FrameSample{};
         syncWindowTextInput(window, &state);
         var event_flags = EventFlags{};
-        var event_wait_ns: u64 = 0;
+        var loop_wait: LoopWaitTrace = .{
+            .pending_frame_on_entry = presentation_demand.pending,
+        };
         var input_fb_w: c_int = 0;
         var input_fb_h: c_int = 0;
         getWindowSizeInPixels(window, &input_fb_w, &input_fb_h);
         ui_layout.refreshPaletteModalHits(&state, @floatFromInt(input_fb_w), @floatFromInt(input_fb_h));
-        running = processEvents(window, &state, &keyboard, ui_scale, &event_flags, &frame_sample, &event_wait_ns, &render_pacer);
+        running = processEvents(window, &state, &keyboard, ui_scale, &event_flags, &frame_sample, &loop_wait, &render_pacer, &presentation_demand);
+        previous_loop_wait = loop_wait;
         if (!running) break;
-        frame_sample.waited_ns = event_wait_ns;
+        frame_sample.waited_ns = loop_wait.waited_ns;
         state.pollAcknowledgements();
         recordSpan(&frame_sample, .poll_picker, struct {
             fn run(app_state: *AppState) void {
@@ -610,7 +631,7 @@ fn mainInner(init: std.process.Init) !void {
             applyAppConfigRuntime(&state);
         }
         if (live_server) |*server| {
-            if (server.processPending(&state)) needs_render = true;
+            if (server.processPending(&state)) presentation_demand.request();
         }
 
         var observed_fb_width: c_int = 0;
@@ -649,13 +670,14 @@ fn mainInner(init: std.process.Init) !void {
         // A wake-driven send change is covered by the display-rate wake frame.
         // Non-wake polling changes still render immediately.
         const immediate_send_render = send_needs_render and event_flags.loop_wakeup_sequence == null;
-        needs_render = needs_render or immediate_send_render or background_tasks_need_render or browser_needs_render or terminal_needs_render or event_needs_render or framebuffer_size_changed or continuous_frame_due or wake_frame_due;
-        if (!needs_render) {
+        if (immediate_send_render or background_tasks_need_render or browser_needs_render or terminal_needs_render or event_needs_render or framebuffer_size_changed or continuous_frame_due or wake_frame_due or state.workspaceSwitchFramePending()) {
+            presentation_demand.request();
+        }
+        if (!presentation_demand.pending) {
             recordFrameWithStallDiagnostic(frame_sample);
             maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
             continue;
         }
-        needs_render = false;
 
         var fb_width: c_int = 0;
         var fb_height: c_int = 0;
@@ -686,12 +708,13 @@ fn mainInner(init: std.process.Init) !void {
         state.card_toggle_hits.clearRetainingCapacity();
         state.background_task_action_hits.clearRetainingCapacity();
 
+        state.noteWorkspaceSwitchRenderStarted();
         recordSpan(&frame_sample, .render_root, struct {
             fn run(app_state: *AppState, framebuffer_width: c_int, framebuffer_height: c_int) void {
                 ui_layout.renderRoot(app_state, @floatFromInt(framebuffer_width), @floatFromInt(framebuffer_height));
             }
         }.run, .{ &state, fb_width, fb_height });
-        var frame_submitted = false;
+        var frame_presented = false;
         recordSpan(&frame_sample, .draw_backend, struct {
             fn run(
                 palette_command_renderer: *palette_frame_renderer.Renderer,
@@ -699,9 +722,9 @@ fn mainInner(init: std.process.Init) !void {
                 allocator_arg: std.mem.Allocator,
                 framebuffer_width: c_int,
                 framebuffer_height: c_int,
-                submitted: *bool,
+                presented: *bool,
             ) void {
-                palette_command_renderer.renderBatch(
+                const outcome = palette_command_renderer.renderBatch(
                     allocator_arg,
                     &app_state.palette_overlay_batch,
                     @floatFromInt(framebuffer_width),
@@ -710,31 +733,33 @@ fn mainInner(init: std.process.Init) !void {
                     log.warn("failed to render palette overlay batch: {s}", .{@errorName(err)});
                     return;
                 };
-                submitted.* = true;
+                presented.* = outcome == .presented;
             }
-        }.run, .{ &palette_renderer, &state, allocator, fb_width, fb_height, &frame_submitted });
-        if (frame_submitted) {
+        }.run, .{ &palette_renderer, &state, allocator, fb_width, fb_height, &frame_presented });
+        presentation_demand.noteAttempt(frame_presented);
+        if (frame_presented) {
             state.noteBrowserFramePresented();
             render_pacer.noteRendered(monotonicMs());
-        }
-        recordSpan(&frame_sample, .flush_dirty, struct {
-            fn run(app_state: *AppState) void {
-                // Compatibility capture advances under a per-frame byte
-                // budget; the worker owns all deep-copy/encode/I/O work.
-                // Advance only after presentation so even the bounded slice
-                // cannot delay visual feedback for the accepted input.
-                app_state.pollFlushWorker();
-                app_state.flushIfDirty();
+            state.noteWorkspaceSwitchPresented();
+            recordSpan(&frame_sample, .flush_dirty, struct {
+                fn run(app_state: *AppState) void {
+                    // Compatibility capture advances under a per-frame byte
+                    // budget; the worker owns all deep-copy/encode/I/O work.
+                    // Advance only after presentation so even the bounded slice
+                    // cannot delay visual feedback for the accepted input.
+                    app_state.pollFlushWorker();
+                    app_state.flushIfDirty();
+                }
+            }.run, .{&state});
+            if (pending_wake_sequence) |sequence| {
+                loop_wakeup.finish(sequence);
+                pending_wake_sequence = null;
+                render_pacer.clearWakeRender();
             }
-        }.run, .{&state});
-        if (pending_wake_sequence) |sequence| {
-            loop_wakeup.finish(sequence);
-            pending_wake_sequence = null;
-            render_pacer.clearWakeRender();
+        } else {
+            state.noteWorkspaceSwitchPresentDeferred();
         }
-        const swap_start = profiler.nowNs();
-        frame_sample.add(.swap_window, profiler.elapsedNs(swap_start));
-        frame_sample.rendered = true;
+        frame_sample.rendered = frame_presented;
         recordFrameWithStallDiagnostic(frame_sample);
         maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
     }
@@ -763,7 +788,7 @@ fn renderStartupFrame(
         null,
         null,
     );
-    try renderer.renderBatch(allocator, &batch, frame_width, frame_height);
+    _ = try renderer.renderBatch(allocator, &batch, frame_width, frame_height);
 }
 
 // Resolves the OS mouse cursor each frame: terminal and browser-reported
@@ -1100,6 +1125,20 @@ const EventFlags = struct {
     loop_wakeup_sequence: ?u64 = null,
 };
 
+const LoopSleepReason = enum {
+    none,
+    event_already_queued,
+    wait_event,
+    wait_timeout,
+};
+
+const LoopWaitTrace = struct {
+    reason: LoopSleepReason = .none,
+    requested_timeout_ms: c_int = 0,
+    waited_ns: u64 = 0,
+    pending_frame_on_entry: bool = false,
+};
+
 fn frameProfileLoggingEnabled() bool {
     return std.c.getenv("VERDE_FRAME_PROFILE_LOG") != null;
 }
@@ -1383,22 +1422,28 @@ fn processEvents(
     ui_scale: f32,
     event_flags: *EventFlags,
     frame_sample: *profiler.FrameSample,
-    waited_ns: *u64,
+    wait_trace: *LoopWaitTrace,
     render_pacer: *const loop_pacing.FramePacer,
+    presentation_demand: *const loop_pacing.PresentationDemand,
 ) bool {
     event_flags.* = .{};
     var event: sdl.Event = undefined;
 
     if (!sdl.pollEvent(&event)) {
+        const wait_timeout_ms = eventWaitTimeoutMs(state, render_pacer, presentation_demand);
+        wait_trace.requested_timeout_ms = wait_timeout_ms;
         const wait_start = profiler.nowNs();
-        if (!SDL_WaitEventTimeout(&event, eventWaitTimeoutMs(state, render_pacer))) {
-            waited_ns.* +|= profiler.elapsedNs(wait_start);
+        if (!SDL_WaitEventTimeout(&event, wait_timeout_ms)) {
+            wait_trace.waited_ns +|= profiler.elapsedNs(wait_start);
+            wait_trace.reason = .wait_timeout;
             return true;
         }
-        waited_ns.* +|= profiler.elapsedNs(wait_start);
+        wait_trace.waited_ns +|= profiler.elapsedNs(wait_start);
+        wait_trace.reason = .wait_event;
         noteEventForRender(&event, event_flags);
         if (!processOneEvent(window, state, keyboard, ui_scale, &event, frame_sample)) return false;
     } else {
+        wait_trace.reason = .event_already_queued;
         noteEventForRender(&event, event_flags);
         if (!processOneEvent(window, state, keyboard, ui_scale, &event, frame_sample)) return false;
     }
@@ -1528,9 +1573,14 @@ fn continuousFrameIntervalMs(state: *AppState) i64 {
     return 0;
 }
 
-fn eventWaitTimeoutMs(state: *AppState, render_pacer: *const loop_pacing.FramePacer) c_int {
+fn eventWaitTimeoutMs(
+    state: *AppState,
+    render_pacer: *const loop_pacing.FramePacer,
+    presentation_demand: *const loop_pacing.PresentationDemand,
+) c_int {
     const base_timeout_ms = eventWaitBaseTimeoutMs(state);
-    return render_pacer.nextWaitTimeoutMs(monotonicMs(), base_timeout_ms, ACTIVE_WAIT_TIMEOUT_MS);
+    const paced_timeout_ms = render_pacer.nextWaitTimeoutMs(monotonicMs(), base_timeout_ms, ACTIVE_WAIT_TIMEOUT_MS);
+    return presentation_demand.nextWaitTimeoutMs(paced_timeout_ms, ACTIVE_WAIT_TIMEOUT_MS);
 }
 
 fn eventWaitBaseTimeoutMs(state: *AppState) c_int {
@@ -1680,6 +1730,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (keyboard.workspaceSelectIndexForEvent(&event.key)) |workspace_ordinal| {
+                if (workspace_ordinal < state.project_controller.projects.items.len) {
+                    state.noteWorkspaceSwitchInput(workspace_ordinal, event.key.timestamp, profiler.nowNs());
+                }
                 if (state.selectProjectAtIndex(workspace_ordinal)) {
                     syncWindowTextInput(window, state);
                     return true;

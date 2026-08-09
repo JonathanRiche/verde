@@ -44,6 +44,25 @@ pub const FramePacer = struct {
     }
 };
 
+pub const PresentationDemand = struct {
+    pending: bool = false,
+
+    /// Records state that has not yet reached a swapchain presentation.
+    pub fn request(self: *PresentationDemand) void {
+        self.pending = true;
+    }
+
+    /// Records completion of a render attempt.
+    pub fn noteAttempt(self: *PresentationDemand, presented: bool) void {
+        if (presented) self.pending = false;
+    }
+
+    /// A pending presentation retries without depending on an unrelated SDL wakeup.
+    pub fn nextWaitTimeoutMs(self: PresentationDemand, base_timeout_ms: c_int, retry_timeout_ms: c_int) c_int {
+        return if (self.pending) @min(base_timeout_ms, retry_timeout_ms) else base_timeout_ms;
+    }
+};
+
 pub const Cadence = struct {
     last_run_ms: ?i64 = null,
 
@@ -81,6 +100,21 @@ test "continuous frames retain their requested cadence" {
     pacer.noteRendered(10);
     try std.testing.expect(!pacer.continuousFrameDue(42, 33));
     try std.testing.expect(pacer.continuousFrameDue(43, 33));
+}
+
+test "rapid switch keeps the final frame scheduled when swapchain acquisition is deferred" {
+    var demand: PresentationDemand = .{};
+
+    demand.request(); // Alt+1
+    demand.request(); // Alt+2 coalesces before a frame
+    demand.request(); // Alt+3 is the final visible target
+    demand.noteAttempt(false); // no swapchain texture was acquired
+
+    try std.testing.expect(demand.pending);
+    try std.testing.expectEqual(@as(c_int, 16), demand.nextWaitTimeoutMs(1000, 16));
+
+    demand.noteAttempt(true);
+    try std.testing.expect(!demand.pending);
 }
 
 test "poll cadence runs immediately and recovers from clock rollback" {
