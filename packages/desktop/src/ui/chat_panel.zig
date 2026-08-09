@@ -963,32 +963,17 @@ fn transcriptMarkdownBubbleHit(
 
     const thread = state.currentThread();
     const scroll_y = transcript_hit.scroll_y;
-    var content_y = column.y - scroll_y;
-
-    var msg_idx: usize = 0;
-    while (msg_idx < thread.messages.items.len) {
-        const message = thread.messages.items[msg_idx];
-        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(thread, message.author, message.body)) {
-            msg_idx += 1;
-            continue;
+    const content_offset_y = mouse_y - column.y + scroll_y;
+    if (transcriptLayoutItemAtContentY(thread.transcript_layout_items.items, content_offset_y)) |item| {
+        if (item.group_end - item.message_index < 2 and item.message_index < thread.messages.items.len) {
+            const message = thread.messages.items[item.message_index];
+            const content_y = column.y - scroll_y + item.top;
+            if (!(message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body))) {
+                if (transcriptSelectableBodyHit(state, column, content_y, item.height, message.role, message.author, message.body, false, false, false, item.message_index, mouse_x, mouse_y)) |hit| {
+                    return hit;
+                }
+            }
         }
-        const group_end = if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) toolCallGroupEnd(thread.messages.items, msg_idx) else msg_idx + 1;
-        if (group_end - msg_idx >= 2) {
-            content_y += toolCallGroupHeight(state, thread.messages.items, msg_idx, group_end, 0, column.w) + theme.scaledUi(12.0);
-            msg_idx = group_end;
-            continue;
-        }
-        const item_h = transcriptCommittedMessageHeight(state, msg_idx, message, column.w);
-        if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
-            content_y += item_h + theme.scaledUi(12.0);
-            msg_idx += 1;
-            continue;
-        }
-        if (transcriptSelectableBodyHit(state, column, content_y, item_h, message.role, message.author, message.body, false, false, false, msg_idx, mouse_x, mouse_y)) |hit| {
-            return hit;
-        }
-        content_y += item_h + theme.scaledUi(12.0);
-        msg_idx += 1;
     }
 
     const send_state = thread.send_state;
@@ -997,6 +982,7 @@ fn transcriptMarkdownBubbleHit(
     if (send_state.status != .pending) return null;
 
     const base_idx = thread.messages.items.len;
+    var content_y = column.y - scroll_y + estimatedPartialTranscriptHeight(thread);
     var pi: usize = 0;
     while (pi < send_state.pending_events.items.len) {
         const event = send_state.pending_events.items[pi];
@@ -2229,6 +2215,27 @@ fn firstVisibleTranscriptLayoutItem(items: []const chat_types.TranscriptLayoutIt
         }
     }
     return low;
+}
+
+fn transcriptLayoutItemAtContentY(items: []const chat_types.TranscriptLayoutItem, content_y: f32) ?chat_types.TranscriptLayoutItem {
+    const index = firstVisibleTranscriptLayoutItem(items, content_y);
+    if (index >= items.len) return null;
+    const item = items[index];
+    if (content_y < item.top or content_y > item.top + item.height) return null;
+    return item;
+}
+
+test "transcript layout hit lookup skips gaps and finds rows logarithmically" {
+    const items: [3]chat_types.TranscriptLayoutItem = .{
+        .{ .message_index = 0, .group_end = 1, .top = 0.0, .height = 40.0 },
+        .{ .message_index = 1, .group_end = 2, .top = 52.0, .height = 30.0 },
+        .{ .message_index = 2, .group_end = 4, .top = 94.0, .height = 50.0 },
+    };
+    try std.testing.expectEqual(@as(usize, 0), transcriptLayoutItemAtContentY(&items, 20.0).?.message_index);
+    try std.testing.expect(transcriptLayoutItemAtContentY(&items, 46.0) == null);
+    try std.testing.expectEqual(@as(usize, 1), transcriptLayoutItemAtContentY(&items, 52.0).?.message_index);
+    try std.testing.expectEqual(@as(usize, 2), transcriptLayoutItemAtContentY(&items, 144.0).?.message_index);
+    try std.testing.expect(transcriptLayoutItemAtContentY(&items, 145.0) == null);
 }
 
 test "transcript layout lookup starts at the first row intersecting the viewport" {

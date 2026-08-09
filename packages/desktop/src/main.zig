@@ -566,6 +566,7 @@ fn mainInner(init: std.process.Init) !void {
         running = processEvents(window, &state, &keyboard, ui_scale, &event_flags, &frame_sample, &loop_wait, &render_pacer, &presentation_demand);
         previous_loop_wait = loop_wait;
         if (!running) break;
+        state.noteWorkspaceSwitchStage("event_drain_complete");
         frame_sample.waited_ns = loop_wait.waited_ns;
         state.pollAcknowledgements();
         recordSpan(&frame_sample, .poll_picker, struct {
@@ -618,7 +619,6 @@ fn mainInner(init: std.process.Init) !void {
                 changed.* = app_state.pollTerminals();
             }
         }.run, .{ &state, &terminal_needs_render });
-        syncMouseCursor(&state, &cursor_cache);
         if (app_config_poll_cadence.shouldRun(monotonicMs(), APP_CONFIG_POLL_INTERVAL_MS)) {
             recordSpan(&frame_sample, .poll_config, struct {
                 fn run(app_state: *AppState) void {
@@ -633,6 +633,7 @@ fn mainInner(init: std.process.Init) !void {
         if (live_server) |*server| {
             if (server.processPending(&state)) presentation_demand.request();
         }
+        state.noteWorkspaceSwitchStage("pre_render_poll_complete");
 
         var observed_fb_width: c_int = 0;
         var observed_fb_height: c_int = 0;
@@ -674,6 +675,7 @@ fn mainInner(init: std.process.Init) !void {
             presentation_demand.request();
         }
         if (!presentation_demand.pending) {
+            recordSpan(&frame_sample, .sync_cursor, syncMouseCursor, .{ &state, &cursor_cache });
             recordFrameWithStallDiagnostic(frame_sample);
             maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
             continue;
@@ -714,6 +716,8 @@ fn mainInner(init: std.process.Init) !void {
                 ui_layout.renderRoot(app_state, @floatFromInt(framebuffer_width), @floatFromInt(framebuffer_height));
             }
         }.run, .{ &state, fb_width, fb_height });
+        recordSpan(&frame_sample, .sync_cursor, syncMouseCursor, .{ &state, &cursor_cache });
+        state.noteWorkspaceSwitchStage("render_root_cursor_complete");
         var frame_presented = false;
         recordSpan(&frame_sample, .draw_backend, struct {
             fn run(
@@ -736,6 +740,10 @@ fn mainInner(init: std.process.Init) !void {
                 presented.* = outcome == .presented;
             }
         }.run, .{ &palette_renderer, &state, allocator, fb_width, fb_height, &frame_presented });
+        if (palette_renderer.lastSdlGpuFrameStats()) |stats| {
+            logSlowSdlGpuFrameStages(stats);
+            if (state.pendingWorkspaceSwitchTrace()) |trace| logWorkspaceSwitchSdlGpuFrameStats(trace, stats);
+        }
         presentation_demand.noteAttempt(frame_presented);
         if (frame_presented) {
             state.noteBrowserFramePresented();
@@ -1225,8 +1233,12 @@ fn recentSectionStats() SectionStats {
 
 fn logSdlGpuFrameStats(stats: palette.renderer.FrameStats) void {
     runtime_log.diagnostic(
-        "sdlgpu-stage batch_build_ms={d:.2} solid_upload_ms={d:.2} image_prepare_ms={d:.2} image_upload_ms={d:.2} browser_upload_ms={d:.2} text_prepare_ms={d:.2} text_upload_ms={d:.2} submit_present_ms={d:.2} image_uploads={d}/{d} browser_uploads={d}/{d}",
+        "sdlgpu-stage text_cache_rotate_ms={d:.2} text_cache_retire_ms={d:.2}/{d} swapchain_acquire_ms={d:.2} batch_build_ms={d:.2} solid_upload_ms={d:.2} image_prepare_ms={d:.2} image_upload_ms={d:.2} browser_upload_ms={d:.2} text_prepare_ms={d:.2} text_upload_ms={d:.2} render_encode_ms={d:.2} submit_present_ms={d:.2} commands={d} text_draws={d} image_draws={d} image_uploads={d}/{d} browser_uploads={d}/{d} visible_texture_uploads={d} deferred_texture_uploads={d}/{d}",
         .{
+            profiler.nsToMs(stats.text_cache_rotate_ns),
+            profiler.nsToMs(stats.text_cache_retire_ns),
+            stats.text_cache_retired_count,
+            profiler.nsToMs(stats.swapchain_acquire_ns),
             profiler.nsToMs(stats.batch_build_ns),
             profiler.nsToMs(stats.solid_upload_ns),
             profiler.nsToMs(stats.image_prepare_ns),
@@ -1234,13 +1246,75 @@ fn logSdlGpuFrameStats(stats: palette.renderer.FrameStats) void {
             profiler.nsToMs(stats.browser_upload_ns),
             profiler.nsToMs(stats.text_prepare_ns),
             profiler.nsToMs(stats.text_upload_ns),
+            profiler.nsToMs(stats.render_encode_ns),
             profiler.nsToMs(stats.submit_present_ns),
+            stats.command_count,
+            stats.text_draw_count,
+            stats.image_draw_count,
             stats.image_upload_count,
             stats.image_upload_bytes,
             stats.browser_upload_count,
             stats.browser_upload_bytes,
+            stats.visible_texture_upload_count,
+            stats.deferred_texture_upload_count,
+            stats.deferred_texture_upload_bytes,
         },
     );
+}
+
+fn logWorkspaceSwitchSdlGpuFrameStats(trace: native_state.WorkspaceSwitchTrace, stats: palette.renderer.FrameStats) void {
+    runtime_log.diagnostic(
+        "workspace-switch-trace seq={d} stage=sdlgpu_stages target_index={d} attempt={d} text_cache_rotate_ms={d:.2} text_cache_retire_ms={d:.2}/{d} swapchain_acquire_ms={d:.2} batch_build_ms={d:.2} solid_upload_ms={d:.2} image_prepare_ms={d:.2} image_upload_ms={d:.2} browser_upload_ms={d:.2} text_prepare_ms={d:.2} text_upload_ms={d:.2} render_encode_ms={d:.2} submit_present_ms={d:.2} commands={d} text_draws={d} image_draws={d} visible_texture_uploads={d} deferred_texture_uploads={d}/{d}",
+        .{
+            trace.sequence,
+            trace.target_index,
+            trace.render_attempt,
+            profiler.nsToMs(stats.text_cache_rotate_ns),
+            profiler.nsToMs(stats.text_cache_retire_ns),
+            stats.text_cache_retired_count,
+            profiler.nsToMs(stats.swapchain_acquire_ns),
+            profiler.nsToMs(stats.batch_build_ns),
+            profiler.nsToMs(stats.solid_upload_ns),
+            profiler.nsToMs(stats.image_prepare_ns),
+            profiler.nsToMs(stats.image_upload_ns),
+            profiler.nsToMs(stats.browser_upload_ns),
+            profiler.nsToMs(stats.text_prepare_ns),
+            profiler.nsToMs(stats.text_upload_ns),
+            profiler.nsToMs(stats.render_encode_ns),
+            profiler.nsToMs(stats.submit_present_ns),
+            stats.command_count,
+            stats.text_draw_count,
+            stats.image_draw_count,
+            stats.visible_texture_upload_count,
+            stats.deferred_texture_upload_count,
+            stats.deferred_texture_upload_bytes,
+        },
+    );
+}
+
+fn logSlowSdlGpuFrameStages(stats: palette.renderer.FrameStats) void {
+    const Stage = struct { name: []const u8, elapsed_ns: u64 };
+    const stages = [_]Stage{
+        .{ .name = "text cache rotate", .elapsed_ns = stats.text_cache_rotate_ns },
+        .{ .name = "text cache retire", .elapsed_ns = stats.text_cache_retire_ns },
+        .{ .name = "swapchain acquire", .elapsed_ns = stats.swapchain_acquire_ns },
+        .{ .name = "batch build", .elapsed_ns = stats.batch_build_ns },
+        .{ .name = "solid upload", .elapsed_ns = stats.solid_upload_ns },
+        .{ .name = "image prepare", .elapsed_ns = stats.image_prepare_ns },
+        .{ .name = "image upload", .elapsed_ns = stats.image_upload_ns },
+        .{ .name = "browser upload", .elapsed_ns = stats.browser_upload_ns },
+        .{ .name = "text prepare", .elapsed_ns = stats.text_prepare_ns },
+        .{ .name = "text upload", .elapsed_ns = stats.text_upload_ns },
+        .{ .name = "render encode", .elapsed_ns = stats.render_encode_ns },
+        .{ .name = "submit present", .elapsed_ns = stats.submit_present_ns },
+    };
+    for (stages) |stage| {
+        if (stage.elapsed_ns <= SDL_STALL_LOG_THRESHOLD_NS) continue;
+        runtime_log.diagnostic(
+            "SDL thread stall operation=sdlgpu {s} elapsed_ms={d:.2}",
+            .{ stage.name, profiler.nsToMs(stage.elapsed_ns) },
+        );
+    }
 }
 
 fn recordSpan(frame_sample: *profiler.FrameSample, section: profiler.Section, comptime function: anytype, args: anytype) void {
