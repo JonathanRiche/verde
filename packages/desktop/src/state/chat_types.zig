@@ -71,6 +71,7 @@ pub const TranscriptHeightEntry = struct {
 pub const TranscriptLayoutItem = struct {
     message_index: usize,
     group_end: usize,
+    // Negative offset from the estimated committed tail.
     top: f32,
     height: f32,
 };
@@ -184,8 +185,11 @@ pub const ChatThread = struct {
     transcript_layout_width: f32 = 0.0,
     transcript_layout_scale: f32 = 0.0,
     transcript_layout_variant_hash: u64 = 0,
+    transcript_layout_first_message_index: usize = 0,
     transcript_layout_message_count: usize = 0,
     transcript_layout_committed_height: f32 = 0.0,
+    transcript_layout_requested_height: f32 = 0.0,
+    transcript_layout_visible_ready: bool = false,
     transcript_layout_valid: bool = false,
     transcript_scroll_valid: bool = false,
     transcript_scroll_y: f32 = 0.0,

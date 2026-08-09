@@ -1635,7 +1635,8 @@ fn currentTranscriptLayoutNeedsFrames(state: *const AppState) bool {
     const thread = state.currentThread();
     return thread.messages.items.len > 0 and
         !thread.transcript_layout_valid and
-        thread.transcript_layout_message_count > 0;
+        thread.transcript_layout_message_count > 0 and
+        thread.transcript_layout_committed_height < thread.transcript_layout_requested_height;
 }
 
 fn continuousFrameIntervalMs(state: *AppState) i64 {
