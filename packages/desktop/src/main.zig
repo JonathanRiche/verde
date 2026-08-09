@@ -2616,11 +2616,13 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
             runtime_log.diagnostic("ignoring linux window close request after external open launch", .{});
             return true;
         }
-        const suspicious_close = !window_flags.input_focus or
-            !window_flags.mouse_focus or
-            window_flags.hidden or
-            window_flags.minimized or
-            window_flags.occluded;
+        const suspicious_close = linuxWindowFlagsIndicateSuspiciousClose(
+            window_flags.input_focus,
+            window_flags.mouse_focus,
+            window_flags.hidden,
+            window_flags.minimized,
+            window_flags.occluded,
+        );
         if (suspicious_close) {
             linux_last_suspicious_close_ms = now_ms;
             runtime_log.diagnostic(
@@ -2749,6 +2751,25 @@ fn linuxCloseRequestFollowsSuspiciousBurst(now_ms: i64) bool {
     }
     if (now_ms - linux_last_suspicious_close_ms > LINUX_SUSPICIOUS_CLOSE_BURST_SUPPRESS_MS) return false;
     return true;
+}
+
+fn linuxWindowFlagsIndicateSuspiciousClose(
+    input_focus: bool,
+    mouse_focus: bool,
+    hidden: bool,
+    minimized: bool,
+    occluded: bool,
+) bool {
+    // Keyboard-driven tiling WMs legitimately close a keyboard-focused window
+    // while the pointer is elsewhere. Focus is suspicious only when both SDL
+    // focus signals are absent.
+    return (!input_focus and !mouse_focus) or hidden or minimized or occluded;
+}
+
+test "linux keyboard-focused close remains actionable without mouse focus" {
+    try std.testing.expect(!linuxWindowFlagsIndicateSuspiciousClose(true, false, false, false, false));
+    try std.testing.expect(linuxWindowFlagsIndicateSuspiciousClose(false, false, false, false, false));
+    try std.testing.expect(linuxWindowFlagsIndicateSuspiciousClose(true, true, true, false, false));
 }
 
 fn macosHostWindowRequestedClose(window: *sdl.Window, state: *AppState) bool {
