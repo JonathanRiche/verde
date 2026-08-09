@@ -2218,6 +2218,7 @@ pub const WorkspaceSwitchTrace = struct {
     target_index: usize,
     input_sdl_timestamp_ns: u64,
     input_arrival_monotonic_ns: i128,
+    last_stage_monotonic_ns: i128,
     render_attempt: u32 = 0,
 };
 
@@ -3006,6 +3007,7 @@ pub const AppState = struct {
             .target_index = target_index,
             .input_sdl_timestamp_ns = sdl_timestamp_ns,
             .input_arrival_monotonic_ns = arrival_monotonic_ns,
+            .last_stage_monotonic_ns = arrival_monotonic_ns,
         };
         self.workspace_switch_trace_input = trace;
         runtime_log.diagnostic(
@@ -3016,6 +3018,22 @@ pub const AppState = struct {
 
     pub fn workspaceSwitchFramePending(self: *const AppState) bool {
         return self.workspace_switch_frame_pending;
+    }
+
+    pub fn pendingWorkspaceSwitchTrace(self: *const AppState) ?WorkspaceSwitchTrace {
+        return self.workspace_switch_trace_pending;
+    }
+
+    pub fn noteWorkspaceSwitchStage(self: *AppState, comptime stage: []const u8) void {
+        const trace = &(self.workspace_switch_trace_pending orelse return);
+        const now_ns = profiler.nowNs();
+        const stage_ns: u64 = if (now_ns > trace.last_stage_monotonic_ns) @intCast(now_ns - trace.last_stage_monotonic_ns) else 0;
+        const total_ns: u64 = if (now_ns > trace.input_arrival_monotonic_ns) @intCast(now_ns - trace.input_arrival_monotonic_ns) else 0;
+        runtime_log.diagnostic(
+            "workspace-switch-trace seq={d} stage=" ++ stage ++ " target_index={d} stage_ms={d:.2} elapsed_from_arrival_ms={d:.2}",
+            .{ trace.sequence, trace.target_index, profiler.nsToMs(stage_ns), profiler.nsToMs(total_ns) },
+        );
+        trace.last_stage_monotonic_ns = now_ns;
     }
 
     pub fn noteWorkspaceSwitchRenderStarted(self: *AppState) void {
@@ -3061,11 +3079,15 @@ pub const AppState = struct {
         var trace = if (self.workspace_switch_trace_input) |input| blk: {
             self.workspace_switch_trace_input = null;
             break :blk input;
-        } else WorkspaceSwitchTrace{
-            .sequence = self.nextWorkspaceSwitchTraceSequence(),
-            .target_index = index,
-            .input_sdl_timestamp_ns = 0,
-            .input_arrival_monotonic_ns = profiler.nowNs(),
+        } else blk: {
+            const now_ns = profiler.nowNs();
+            break :blk WorkspaceSwitchTrace{
+                .sequence = self.nextWorkspaceSwitchTraceSequence(),
+                .target_index = index,
+                .input_sdl_timestamp_ns = 0,
+                .input_arrival_monotonic_ns = now_ns,
+                .last_stage_monotonic_ns = now_ns,
+            };
         };
         trace.target_index = index;
         self.workspace_switch_trace_pending = trace;
