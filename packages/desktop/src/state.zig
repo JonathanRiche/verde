@@ -47,6 +47,7 @@ const project_state = @import("state/project.zig");
 const state_storage = @import("state/storage.zig");
 const persistence = @import("state/persistence.zig");
 const command_controller = @import("state/command_controller.zig");
+const acknowledgement_controller = @import("state/acknowledgement_controller.zig");
 const composer_controller = @import("state/composer_controller.zig");
 const companion_controller = @import("state/companion_controller.zig");
 const browser_controller = @import("state/browser_controller.zig");
@@ -2236,6 +2237,7 @@ pub const AppState = struct {
     storage: *const Storage,
     project_controller: project_controller.State,
     surface_controller: surface_controller.State,
+    acknowledgement_controller: acknowledgement_controller.State = .{},
     import_path_storage: [DRAFT_CAPACITY:0]u8,
     rename_storage: [256:0]u8,
     sidebar_notice_storage: [256:0]u8,
@@ -3866,6 +3868,21 @@ pub const AppState = struct {
     pub const threadByLocalId = chat_controller.threadByLocalId;
     pub const projectThreadIndexByLocalId = chat_controller.projectThreadIndexByLocalId;
     pub const handoffDirtyStateForShutdown = lifecycle_controller.handoffDirtyStateForShutdown;
+    pub const queueChatCompletionAcknowledgement = acknowledgement_controller.queueChat;
+    pub const queueSurfaceAcknowledgement = acknowledgement_controller.queueSurface;
+    pub const pollAcknowledgements = acknowledgement_controller.poll;
+    pub fn beginClosePreflight(self: *AppState) void {
+        // Let an in-flight core.changes wait drain while durability handoff is
+        // running instead of serializing that wait after the handoff.
+        self.change_cursor_loop.beginShutdown();
+    }
+
+    pub fn cancelClosePreflight(self: *AppState) void {
+        // A failed durability handoff leaves the app interactive. Retire the
+        // cancelled loop before allowing pollSend to lazily start a fresh one.
+        self.change_cursor_loop.join();
+        self.change_cursor_loop.shutdown.store(false, .release);
+    }
     pub const resolveThreadApprovalByLocalId = chat_controller.resolveThreadApprovalByLocalId;
     pub const applyPersisted = persistence.applyPersisted;
     pub const applyDaemonSessionProjection = terminal_controller.applyDaemonSessionProjection;
@@ -8610,6 +8627,8 @@ pub const AppState = struct {
         // the shutdown work below; the blocking join happens further down,
         // inside the 10s watchdog envelope.
         self.change_cursor_loop.beginShutdown();
+        self.pollAcknowledgements();
+        acknowledgement_controller.deinit(self);
         self.preparePendingSendsForShutdown();
         runtime_log.diagnostic("AppState.deinit pending sends prepared", .{});
         self.finishPickerThread();

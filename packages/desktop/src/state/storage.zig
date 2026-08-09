@@ -26,6 +26,12 @@ const PENDING_STATE_SPOOL_TEMP_FILE_NAME = "pending-state-spool.json.tmp";
 // the largest field state seen in production (about 136 MiB).
 const PENDING_STATE_SPOOL_MAX_BYTES: usize = 384 * 1024 * 1024;
 const SNAPSHOT_REQUEST_HEADROOM_BYTES: usize = 64 * 1024;
+/// Focus acknowledgements are best-effort UI bookkeeping and must never own
+/// more than a short background transport window.
+const ACKNOWLEDGEMENT_TIMEOUT_MS: u32 = 500;
+/// Client unregister runs after all durable state is owned and must not hold
+/// process exit behind an unhealthy daemon.
+const CLIENT_CLOSE_TIMEOUT_MS: u32 = 750;
 const LoadedPersistedState = db_types.LoadedState;
 const PersistedState = db_types.PersistedState;
 const PersistedThread = db_types.PersistedThread;
@@ -384,7 +390,7 @@ pub const Storage = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const result = try self.withClientRetry(a, "surface.clear", struct {
+        const result = try self.withAcknowledgementClientRetry(a, "surface.clear", struct {
             fn call(storage: *const Storage, arena_inner: std.mem.Allocator, op: []const u8, client_id: []const u8, expected: u64, sid: []const u8) !headless.store.WriteResult {
                 const req: headless.store.SurfaceClearRequest = .{
                     .mutation = .{
@@ -394,7 +400,12 @@ pub const Storage = struct {
                     },
                     .session_id = sid,
                 };
-                return storage.callStoreMutationAllowConflict(headless.store.METHOD_SURFACE_CLEAR, req);
+                return storage.callStoreMutationAllowConflictWithTimeout(
+                    headless.store.METHOD_SURFACE_CLEAR,
+                    req,
+                    ACKNOWLEDGEMENT_TIMEOUT_MS,
+                    false,
+                );
             }
         }.call, session_id);
         self.noteStoreRevision(result.store_revision);
@@ -433,7 +444,7 @@ pub const Storage = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const pair: struct { []const u8, []const u8 } = .{ workspace_id, local_thread_id };
-        const result = try self.withClientRetry(a, "notification.chatCompletion.clear", struct {
+        const result = try self.withAcknowledgementClientRetry(a, "notification.chatCompletion.clear", struct {
             fn call(storage: *const Storage, arena_inner: std.mem.Allocator, op: []const u8, client_id: []const u8, expected: u64, ids: struct { []const u8, []const u8 }) !headless.store.WriteResult {
                 const req: headless.store.NotificationChatCompletionClearRequest = .{
                     .mutation = .{
@@ -444,7 +455,12 @@ pub const Storage = struct {
                     .workspace_id = ids[0],
                     .local_thread_id = ids[1],
                 };
-                return storage.callStoreMutationAllowConflict(headless.store.METHOD_NOTIFICATION_CHAT_COMPLETION_CLEAR, req);
+                return storage.callStoreMutationAllowConflictWithTimeout(
+                    headless.store.METHOD_NOTIFICATION_CHAT_COMPLETION_CLEAR,
+                    req,
+                    ACKNOWLEDGEMENT_TIMEOUT_MS,
+                    false,
+                );
             }
         }.call, pair);
         self.noteStoreRevision(result.store_revision);
@@ -535,6 +551,7 @@ pub const Storage = struct {
         var transport: sessionizer.HeadlessTransport = .{
             .allocator = decode_arena.allocator(),
             .pref_path = self.pref_path,
+            .timeout_ms = CLIENT_CLOSE_TIMEOUT_MS,
         };
         var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
         const empty_params: struct {} = .{};
@@ -838,6 +855,14 @@ pub const Storage = struct {
     }
 
     fn ensureStoreClientId(self: *const Storage) ![]u8 {
+        return self.ensureStoreClientIdWithOptionalTimeout(null);
+    }
+
+    fn ensureExistingDaemonStoreClientId(self: *const Storage, timeout_ms: u32) ![]u8 {
+        return self.ensureStoreClientIdWithOptionalTimeout(timeout_ms);
+    }
+
+    fn ensureStoreClientIdWithOptionalTimeout(self: *const Storage, timeout_ms: ?u32) ![]u8 {
         self.store_session.lock();
         if (self.store_session.client_id) |id| {
             const owned = try self.allocator.dupe(u8, id);
@@ -846,13 +871,14 @@ pub const Storage = struct {
         }
         self.store_session.unlock();
 
-        try self.ensureDaemon();
+        if (timeout_ms == null) try self.ensureDaemon();
 
         var decode_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer decode_arena.deinit();
         var transport: sessionizer.HeadlessTransport = .{
             .allocator = decode_arena.allocator(),
             .pref_path = self.pref_path,
+            .timeout_ms = timeout_ms orelse 5_000,
         };
         var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
         var registered = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = true });
@@ -942,14 +968,51 @@ pub const Storage = struct {
         };
     }
 
+    /// Focus clears are idempotent and already off-thread. They may register
+    /// with an existing daemon, but never start or replace one: that keeps an
+    /// owned acknowledgement worker's close-time join to finite subsecond
+    /// phases even when registration or the clear exhausts its budget.
+    fn withAcknowledgementClientRetry(
+        self: *const Storage,
+        arena: std.mem.Allocator,
+        op: []const u8,
+        comptime callFn: anytype,
+        payload: anytype,
+    ) !headless.store.WriteResult {
+        const expected = self.currentStoreRevision();
+        const client_id = try self.ensureExistingDaemonStoreClientId(ACKNOWLEDGEMENT_TIMEOUT_MS);
+        defer self.allocator.free(client_id);
+        return callFn(self, arena, op, client_id, expected, payload) catch |err| {
+            if (err != error.UnknownClientId) return err;
+            self.clearCachedClientId();
+            const retry_id = try self.ensureExistingDaemonStoreClientId(ACKNOWLEDGEMENT_TIMEOUT_MS);
+            defer self.allocator.free(retry_id);
+            return callFn(self, arena, op, retry_id, expected, payload);
+        };
+    }
+
     fn callStoreMutationAllowConflict(self: *const Storage, method: []const u8, params: anytype) !headless.store.WriteResult {
-        try self.ensureDaemon();
+        return self.callStoreMutationAllowConflictWithTimeout(method, params, 5_000, true);
+    }
+
+    fn callStoreMutationAllowConflictWithTimeout(
+        self: *const Storage,
+        method: []const u8,
+        params: anytype,
+        timeout_ms: u32,
+        ensure_daemon: bool,
+    ) !headless.store.WriteResult {
+        // Focus acknowledgements already obtained a daemon-issued client id
+        // and may skip this redundant status round-trip. Other mutations keep
+        // the existing recovery behavior when the cached daemon disappeared.
+        if (ensure_daemon) try self.ensureDaemon();
 
         var decode_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer decode_arena.deinit();
         var transport: sessionizer.HeadlessTransport = .{
             .allocator = decode_arena.allocator(),
             .pref_path = self.pref_path,
+            .timeout_ms = timeout_ms,
         };
         var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
         var parsed = client.call(method, params) catch |err| {
