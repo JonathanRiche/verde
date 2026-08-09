@@ -47,6 +47,7 @@ const AppState = native_state.AppState;
 const Storage = native_state.Storage;
 
 const log = native_state.log;
+const SDL_STALL_LOG_THRESHOLD_NS: u64 = 50 * std.time.ns_per_ms;
 
 extern fn SDL_GetWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int) bool;
 extern fn SDL_GetWindowProperties(window: *sdl.Window) sdl.PropertiesID;
@@ -650,7 +651,7 @@ fn mainInner(init: std.process.Init) !void {
         const immediate_send_render = send_needs_render and event_flags.loop_wakeup_sequence == null;
         needs_render = needs_render or immediate_send_render or background_tasks_need_render or browser_needs_render or terminal_needs_render or event_needs_render or framebuffer_size_changed or continuous_frame_due or wake_frame_due;
         if (!needs_render) {
-            profiler.recordFrame(frame_sample);
+            recordFrameWithStallDiagnostic(frame_sample);
             maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
             continue;
         }
@@ -718,9 +719,10 @@ fn mainInner(init: std.process.Init) !void {
         }
         recordSpan(&frame_sample, .flush_dirty, struct {
             fn run(app_state: *AppState) void {
-                // Snapshot capture duplicates the compatibility projection
-                // before the worker owns it. Do that only after presenting
-                // the frame so a due flush cannot hold up visual feedback.
+                // Compatibility capture advances under a per-frame byte
+                // budget; the worker owns all deep-copy/encode/I/O work.
+                // Advance only after presentation so even the bounded slice
+                // cannot delay visual feedback for the accepted input.
                 app_state.pollFlushWorker();
                 app_state.flushIfDirty();
             }
@@ -733,7 +735,7 @@ fn mainInner(init: std.process.Init) !void {
         const swap_start = profiler.nowNs();
         frame_sample.add(.swap_window, profiler.elapsedNs(swap_start));
         frame_sample.rendered = true;
-        profiler.recordFrame(frame_sample);
+        recordFrameWithStallDiagnostic(frame_sample);
         maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
     }
 }
@@ -1205,7 +1207,34 @@ fn logSdlGpuFrameStats(stats: palette.renderer.FrameStats) void {
 fn recordSpan(frame_sample: *profiler.FrameSample, section: profiler.Section, comptime function: anytype, args: anytype) void {
     const start = profiler.nowNs();
     @call(.auto, function, args);
-    frame_sample.add(section, profiler.elapsedNs(start));
+    const elapsed_ns = profiler.elapsedNs(start);
+    frame_sample.add(section, elapsed_ns);
+    if (elapsed_ns > SDL_STALL_LOG_THRESHOLD_NS) {
+        runtime_log.diagnostic(
+            "SDL thread stall operation={s} elapsed_ms={d:.2}",
+            .{ profiler.sectionName(section), profiler.nsToMs(elapsed_ns) },
+        );
+    }
+}
+
+fn recordFrameWithStallDiagnostic(frame_sample: profiler.FrameSample) void {
+    if (frame_sample.active_ns > SDL_STALL_LOG_THRESHOLD_NS) {
+        var slowest: profiler.Section = .event_handling;
+        var slowest_ns = frame_sample.sectionNs(slowest);
+        inline for (@typeInfo(profiler.Section).@"enum".fields) |field| {
+            const section: profiler.Section = @enumFromInt(field.value);
+            const section_ns = frame_sample.sectionNs(section);
+            if (section_ns > slowest_ns) {
+                slowest = section;
+                slowest_ns = section_ns;
+            }
+        }
+        runtime_log.diagnostic(
+            "SDL thread stall operation=frame slowest={s} elapsed_ms={d:.2} active_ms={d:.2}",
+            .{ profiler.sectionName(slowest), profiler.nsToMs(slowest_ns), profiler.nsToMs(frame_sample.active_ns) },
+        );
+    }
+    profiler.recordFrame(frame_sample);
 }
 
 fn installWindowIcon(window: *sdl.Window) void {
@@ -1464,6 +1493,8 @@ fn openHotkeyWorkspaceChatThread(state: *AppState) bool {
 
 fn activeContinuousFrames(state: *AppState) bool {
     return state.isPickerPending() or
+        state.lifecycle.persistenceNeedsFrames(platform_runtime.unixTimestampMs()) or
+        currentTranscriptLayoutNeedsFrames(state) or
         state.transcriptMarkdownSelectionDragging() or
         workspace_panes_ui.isFocusAnimating() or
         workspace_panes_ui.isScrollAnimating() or
@@ -1473,6 +1504,19 @@ fn activeContinuousFrames(state: *AppState) bool {
         state.runConfigStepperAnimating() or
         // Settings modal fades in/out for ~160ms.
         state.settingsModalAnimating();
+}
+
+fn currentTranscriptLayoutNeedsFrames(state: *const AppState) bool {
+    if (state.project_controller.projects.items.len == 0) return false;
+    if (state.currentProjectWorkspaceMaximizedPaneId()) |pane_id| {
+        if (state.workspacePaneKindById(pane_id) != .chat) return false;
+    } else if (!state.currentProject().workspace_layout.hasVisiblePaneKind(.chat)) {
+        return false;
+    }
+    const thread = state.currentThread();
+    return thread.messages.items.len > 0 and
+        !thread.transcript_layout_valid and
+        thread.transcript_layout_message_count > 0;
 }
 
 fn continuousFrameIntervalMs(state: *AppState) i64 {

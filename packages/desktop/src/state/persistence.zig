@@ -46,7 +46,116 @@ pub const SnapshotContext = struct {
     sidebar_collapsed: bool,
 };
 
+/// Incremental copies of transcript bodies for one compatibility snapshot.
+///
+/// Message bodies dominate real-world state size. The SDL thread copies them
+/// in bounded slices over multiple presented frames, then the persistence
+/// worker deep-copies the completed borrowed projection before transport.
+/// `dirty_generation` invalidates this capture before another slice can read
+/// live storage after any mutation.
+pub const IncrementalBodyCapture = struct {
+    const Entry = struct {
+        source: []const u8,
+        copied: []u8,
+    };
+
+    allocator: std.mem.Allocator,
+    dirty_generation: u64,
+    entries: std.ArrayList(Entry) = .empty,
+    entry_index: usize = 0,
+    entry_offset: usize = 0,
+    copied_bytes: usize = 0,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        context: SnapshotContext,
+        dirty_generation: u64,
+    ) !IncrementalBodyCapture {
+        var capture: IncrementalBodyCapture = .{
+            .allocator = allocator,
+            .dirty_generation = dirty_generation,
+        };
+        errdefer capture.deinit();
+
+        for (context.projects) |project| try capture.appendProject(&project);
+        for (context.archived_projects) |project| try capture.appendProject(&project);
+        return capture;
+    }
+
+    pub fn deinit(self: *IncrementalBodyCapture) void {
+        for (self.entries.items) |entry| self.allocator.free(entry.copied);
+        self.entries.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    /// Copy at most `byte_budget` bytes. Returns true when every body is stable.
+    pub fn advance(self: *IncrementalBodyCapture, byte_budget: usize) bool {
+        var remaining = byte_budget;
+        while (remaining > 0 and self.entry_index < self.entries.items.len) {
+            const entry = &self.entries.items[self.entry_index];
+            const available = entry.source.len - self.entry_offset;
+            if (available == 0) {
+                self.entry_index += 1;
+                self.entry_offset = 0;
+                continue;
+            }
+            const count = @min(available, remaining);
+            @memcpy(
+                entry.copied[self.entry_offset..][0..count],
+                entry.source[self.entry_offset..][0..count],
+            );
+            self.entry_offset += count;
+            self.copied_bytes += count;
+            remaining -= count;
+        }
+        while (self.entry_index < self.entries.items.len and
+            self.entry_offset == self.entries.items[self.entry_index].source.len)
+        {
+            self.entry_index += 1;
+            self.entry_offset = 0;
+        }
+        return self.entry_index == self.entries.items.len;
+    }
+
+    fn appendProject(self: *IncrementalBodyCapture, project: *const Project) !void {
+        const retained_thread_index = lastRetainedActiveThreadIndex(project);
+        for (project.threads.items, 0..) |*thread, thread_index| {
+            if (!project.archived and (retained_thread_index == null or thread_index > retained_thread_index.?)) continue;
+            try self.appendThread(thread);
+        }
+        for (project.archived_threads.items) |*thread| try self.appendThread(thread);
+    }
+
+    fn appendThread(self: *IncrementalBodyCapture, thread: *const ChatThread) !void {
+        try self.entries.ensureUnusedCapacity(self.allocator, thread.messages.items.len);
+        for (thread.messages.items) |message| {
+            const copied = try self.allocator.alloc(u8, message.body.len);
+            self.entries.appendAssumeCapacity(.{ .source = message.body, .copied = copied });
+        }
+    }
+};
+
 pub fn buildSnapshot(context: SnapshotContext, backing_allocator: std.mem.Allocator) !LoadedPersistedState {
+    return buildSnapshotWithBodies(context, backing_allocator, null);
+}
+
+/// Finalize the bounded body capture into a projection whose body slices are
+/// borrowed from `body_capture`. The caller must keep the capture alive until
+/// the worker has made its deep-owned copy.
+pub fn buildSnapshotFromBodyCapture(
+    context: SnapshotContext,
+    backing_allocator: std.mem.Allocator,
+    body_capture: *const IncrementalBodyCapture,
+) !LoadedPersistedState {
+    std.debug.assert(body_capture.entry_index == body_capture.entries.items.len);
+    return buildSnapshotWithBodies(context, backing_allocator, body_capture.entries.items);
+}
+
+fn buildSnapshotWithBodies(
+    context: SnapshotContext,
+    backing_allocator: std.mem.Allocator,
+    captured_bodies: ?[]const IncrementalBodyCapture.Entry,
+) !LoadedPersistedState {
     var loaded = LoadedPersistedState.init(backing_allocator);
     errdefer loaded.deinit();
 
@@ -54,12 +163,14 @@ pub fn buildSnapshot(context: SnapshotContext, backing_allocator: std.mem.Alloca
     var projects: std.ArrayList(PersistedProject) = .empty;
     defer projects.deinit(arena);
 
+    var body_index: usize = 0;
     for (context.projects) |project| {
-        try projects.append(arena, try persistedProjectSnapshot(arena, &project));
+        try projects.append(arena, try persistedProjectSnapshot(arena, &project, captured_bodies, &body_index));
     }
     for (context.archived_projects) |project| {
-        try projects.append(arena, try persistedProjectSnapshot(arena, &project));
+        try projects.append(arena, try persistedProjectSnapshot(arena, &project, captured_bodies, &body_index));
     }
+    if (captured_bodies) |bodies| std.debug.assert(body_index == bodies.len);
 
     loaded.value = .{
         .selected_project_index = context.selected_project_index,
@@ -69,7 +180,12 @@ pub fn buildSnapshot(context: SnapshotContext, backing_allocator: std.mem.Alloca
     return loaded;
 }
 
-fn persistedProjectSnapshot(allocator: std.mem.Allocator, project: *const Project) !PersistedProject {
+fn persistedProjectSnapshot(
+    allocator: std.mem.Allocator,
+    project: *const Project,
+    captured_bodies: ?[]const IncrementalBodyCapture.Entry,
+    body_index: *usize,
+) !PersistedProject {
     var threads: std.ArrayList(PersistedThread) = .empty;
     defer threads.deinit(allocator);
     const terminal_layout_json = try project.terminal_dock.persistedLayoutJsonWithContext(allocator, .{
@@ -89,10 +205,10 @@ fn persistedProjectSnapshot(allocator: std.mem.Allocator, project: *const Projec
         // Retaining a contiguous prefix keeps those indexes stable while still
         // dropping abandoned trailing drafts that nothing references.
         if (!project.archived and (retained_thread_index == null or thread_index > retained_thread_index.?)) continue;
-        try threads.append(allocator, try threadSnapshot(allocator, &thread));
+        try threads.append(allocator, try threadSnapshotWithBodies(allocator, &thread, captured_bodies, body_index));
     }
     for (project.archived_threads.items) |thread| {
-        try threads.append(allocator, try threadSnapshot(allocator, &thread));
+        try threads.append(allocator, try threadSnapshotWithBodies(allocator, &thread, captured_bodies, body_index));
     }
 
     return .{
@@ -178,6 +294,45 @@ test "snapshot retains pane-backed draft threads without shifting indexes" {
     try std.testing.expect(std.mem.indexOf(u8, persisted_project.workspace_layout_json.?, "\"thread\":2") != null);
 }
 
+test "incremental snapshot body capture is bounded and finalizes exact transcript bytes" {
+    const allocator = std.testing.allocator;
+    var projects: [1]Project = .{try Project.init(allocator, "workspace-id", "Workspace", "/tmp/workspace", 0)};
+    defer projects[0].deinit(allocator);
+    const thread = &projects[0].threads.items[0];
+    thread.committed = true;
+    const author = try allocator.dupeZ(u8, "Assistant");
+    errdefer allocator.free(author);
+    const body = try allocator.dupeZ(u8, "0123456789abcdef");
+    errdefer allocator.free(body);
+    const extra_images = try allocator.alloc(ChatImageAttachment, 0);
+    errdefer allocator.free(extra_images);
+    try thread.messages.append(allocator, .{
+        .role = .assistant,
+        .author = author,
+        .body = body,
+        .extra_images = extra_images,
+    });
+
+    const context: SnapshotContext = .{
+        .projects = &projects,
+        .archived_projects = &.{},
+        .selected_project_index = 0,
+        .sidebar_collapsed = false,
+    };
+    var capture = try IncrementalBodyCapture.init(allocator, context, 7);
+    defer capture.deinit();
+    try std.testing.expectEqual(@as(u64, 7), capture.dirty_generation);
+    try std.testing.expect(!capture.advance(5));
+    try std.testing.expectEqual(@as(usize, 5), capture.copied_bytes);
+    try std.testing.expect(capture.advance(64));
+
+    var snapshot = try buildSnapshotFromBodyCapture(context, allocator, &capture);
+    defer snapshot.deinit();
+    const persisted_body = snapshot.value.projects[0].threads.?[0].messages[0].body;
+    try std.testing.expectEqualStrings(body, persisted_body);
+    try std.testing.expect(persisted_body.ptr != body.ptr);
+}
+
 test "snapshot retains pane-less Companion identity and stable thread indexes" {
     const allocator = std.testing.allocator;
     var projects: [1]Project = .{try Project.init(allocator, "workspace-id", "Workspace", "/tmp/workspace", 0)};
@@ -232,11 +387,28 @@ fn persistedTerminalDocksJson(allocator: std.mem.Allocator, project: *const Proj
 }
 
 pub fn threadSnapshot(allocator: std.mem.Allocator, thread: *const ChatThread) !PersistedThread {
+    var body_index: usize = 0;
+    return threadSnapshotWithBodies(allocator, thread, null, &body_index);
+}
+
+fn threadSnapshotWithBodies(
+    allocator: std.mem.Allocator,
+    thread: *const ChatThread,
+    captured_bodies: ?[]const IncrementalBodyCapture.Entry,
+    body_index: *usize,
+) !PersistedThread {
     var messages: std.ArrayList(PersistedMessage) = .empty;
     defer messages.deinit(allocator);
 
     for (thread.messages.items) |message| {
-        try messages.append(allocator, try persistedMessageSnapshot(allocator, &message));
+        const captured_body = if (captured_bodies) |bodies| blk: {
+            if (body_index.* >= bodies.len) return error.InvalidIncrementalSnapshot;
+            const entry = bodies[body_index.*];
+            body_index.* += 1;
+            if (entry.source.len != message.body.len) return error.InvalidIncrementalSnapshot;
+            break :blk entry.copied;
+        } else null;
+        try messages.append(allocator, try persistedMessageSnapshot(allocator, &message, captured_body));
     }
 
     return .{
@@ -260,11 +432,15 @@ pub fn threadSnapshot(allocator: std.mem.Allocator, thread: *const ChatThread) !
     };
 }
 
-fn persistedMessageSnapshot(allocator: std.mem.Allocator, message: *const ChatMessage) !PersistedMessage {
+fn persistedMessageSnapshot(
+    allocator: std.mem.Allocator,
+    message: *const ChatMessage,
+    captured_body: ?[]const u8,
+) !PersistedMessage {
     return .{
         .role = message.role,
         .author = try allocator.dupe(u8, message.author),
-        .body = try allocator.dupe(u8, message.body),
+        .body = captured_body orelse try allocator.dupe(u8, message.body),
         .image = try imageSnapshot(allocator, message.image),
         .tool_call_id = try dupeOptionalSlice(allocator, message.tool_call_id),
         .tool_call_kind = message.tool_call_kind,

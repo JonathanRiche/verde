@@ -62,6 +62,10 @@ const TRANSCRIPT_MARKDOWN_FONT_SIZE: f32 = app_state.PALETTE_COMPOSER_FONT_SIZE;
 const TRANSCRIPT_WHEEL_PIXELS: f32 = 96.0;
 const TRANSCRIPT_PAGE_VIEW_FRAC: f32 = 0.88;
 const TOOL_OUTPUT_COLLAPSED_LINES: usize = 18;
+/// Cold transcript geometry advances in small batches so switching to an
+/// unvisited workspace can present immediately and warm over later frames.
+const TRANSCRIPT_LAYOUT_ROWS_PER_SLICE: usize = 8;
+const SDL_STALL_LOG_THRESHOLD_MS: i64 = 50;
 
 const MAX_TRANSCRIPT_HITS = 16;
 const TranscriptHit = struct {
@@ -2018,10 +2022,15 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
 
     updateTranscriptAutoFollowPalette(state, has_pending_stream, max_scroll, scroll_y);
 
-    if (state.transcript_controller.auto_follow_pending or state.transcript_controller.scroll_to_bottom_frames > 0) {
+    if (!thread.transcript_layout_valid) {
+        // A cold layout grows from the first row. Keep the persisted tail
+        // request armed, but show the materialized prefix until exact geometry
+        // is ready; the first complete frame snaps to the real tail.
+        scroll_y = 0.0;
+    } else if (state.transcript_controller.auto_follow_pending or state.transcript_controller.scroll_to_bottom_frames > 0) {
         scroll_y = max_scroll;
     }
-    if (state.transcript_controller.scroll_to_bottom_frames > 0) {
+    if (thread.transcript_layout_valid and state.transcript_controller.scroll_to_bottom_frames > 0) {
         state.transcript_controller.scroll_to_bottom_frames -= 1;
     }
     if (state.transcript_controller.scroll_to_bottom_frames == 0 and !has_pending_stream) {
@@ -2082,35 +2091,41 @@ fn transcriptContentHeight(state: *app_state.AppState, thread: anytype, width: f
     const committed_height = if (ensureTranscriptLayout(state, width))
         thread.transcript_layout_committed_height
     else
-        transcriptCommittedHeightUncached(state, thread, width);
+        estimatedPartialTranscriptHeight(thread);
     var total = theme.scaledUi(4.0) + committed_height;
     total += transcriptPendingSlashCommandHeight(state, width);
     total += transcriptPendingStreamHeight(state, thread, width);
     return total;
 }
 
-fn transcriptCommittedHeightUncached(state: *app_state.AppState, thread: anytype, width: f32) f32 {
-    var total: f32 = 0.0;
-    var message_index: usize = 0;
-    while (message_index < thread.messages.items.len) {
-        const message = thread.messages.items[message_index];
-        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(thread, message.author, message.body)) {
-            message_index += 1;
-            continue;
-        }
-        const group_end = if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body))
-            toolCallGroupEnd(thread.messages.items, message_index)
-        else
-            message_index + 1;
-        if (group_end - message_index >= 2) {
-            total += toolCallGroupHeight(state, thread.messages.items, message_index, group_end, 0, width) + theme.scaledUi(12.0);
-            message_index = group_end;
-            continue;
-        }
-        total += transcriptCommittedMessageHeight(state, message_index, message, width) + theme.scaledUi(12.0);
-        message_index += 1;
-    }
-    return total;
+fn estimatedPartialTranscriptHeight(thread: anytype) f32 {
+    const cursor = thread.transcript_layout_message_count;
+    if (cursor == 0 or cursor >= thread.messages.items.len) return thread.transcript_layout_committed_height;
+    const average = thread.transcript_layout_committed_height / @as(f32, @floatFromInt(cursor));
+    const remaining = thread.messages.items.len - cursor;
+    return thread.transcript_layout_committed_height + average * @as(f32, @floatFromInt(remaining));
+}
+
+test "partial transcript height projects unfinished rows without a full walk" {
+    const FakeThread = struct {
+        transcript_layout_message_count: usize,
+        transcript_layout_committed_height: f32,
+        messages: struct { items: []const u8 },
+    };
+    const messages = [_]u8{ 0, 1, 2, 3 };
+    const partial: FakeThread = .{
+        .transcript_layout_message_count = 2,
+        .transcript_layout_committed_height = 100.0,
+        .messages = .{ .items = &messages },
+    };
+    try std.testing.expectApproxEqAbs(@as(f32, 200.0), estimatedPartialTranscriptHeight(&partial), 0.001);
+
+    const empty: FakeThread = .{
+        .transcript_layout_message_count = 0,
+        .transcript_layout_committed_height = 0.0,
+        .messages = .{ .items = &messages },
+    };
+    try std.testing.expectEqual(@as(f32, 0.0), estimatedPartialTranscriptHeight(&empty));
 }
 
 fn transcriptLayoutVariantHash(state: *app_state.AppState) u64 {
@@ -2142,16 +2157,31 @@ fn ensureTranscriptLayout(state: *app_state.AppState, width: f32) bool {
         return true;
     }
 
-    thread.transcript_layout_valid = false;
-    thread.transcript_layout_items.clearRetainingCapacity();
+    const can_extend = @abs(thread.transcript_layout_width - width) <= 0.5 and
+        @abs(thread.transcript_layout_scale - scale) <= 0.001 and
+        thread.transcript_layout_variant_hash == variant_hash and
+        thread.transcript_layout_message_count <= thread.messages.items.len;
+    if (!can_extend) {
+        thread.transcript_layout_valid = false;
+        thread.transcript_layout_items.clearRetainingCapacity();
+        thread.transcript_layout_width = width;
+        thread.transcript_layout_scale = scale;
+        thread.transcript_layout_variant_hash = variant_hash;
+        thread.transcript_layout_message_count = 0;
+        thread.transcript_layout_committed_height = 0.0;
+    }
     thread.transcript_layout_items.ensureTotalCapacity(state.allocator, thread.messages.items.len) catch return false;
 
-    var top: f32 = 0.0;
-    var message_index: usize = 0;
-    while (message_index < thread.messages.items.len) {
+    thread.transcript_layout_valid = false;
+    var top = thread.transcript_layout_committed_height;
+    var message_index = thread.transcript_layout_message_count;
+    var rows_built: usize = 0;
+    const started_at_ms = unixTimestampMs();
+    while (message_index < thread.messages.items.len and rows_built < TRANSCRIPT_LAYOUT_ROWS_PER_SLICE) {
         const message = thread.messages.items[message_index];
         if (message.role == .system and shouldHideCursorLifecycleSystemEvent(thread, message.author, message.body)) {
             message_index += 1;
+            rows_built += 1;
             continue;
         }
         const group_end = if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body))
@@ -2169,16 +2199,21 @@ fn ensureTranscriptLayout(state: *app_state.AppState, width: f32) bool {
             .height = height,
         });
         top += height + theme.scaledUi(12.0);
+        rows_built += group_end - message_index;
         message_index = group_end;
     }
 
-    thread.transcript_layout_width = width;
-    thread.transcript_layout_scale = scale;
-    thread.transcript_layout_variant_hash = variant_hash;
-    thread.transcript_layout_message_count = thread.messages.items.len;
+    thread.transcript_layout_message_count = message_index;
     thread.transcript_layout_committed_height = top;
-    thread.transcript_layout_valid = true;
-    return true;
+    thread.transcript_layout_valid = message_index == thread.messages.items.len;
+    const elapsed_ms = unixTimestampMs() - started_at_ms;
+    if (elapsed_ms > SDL_STALL_LOG_THRESHOLD_MS) {
+        app_state.log.warn(
+            "SDL thread stall operation=transcript layout materialize elapsed_ms={d} rows={d}",
+            .{ elapsed_ms, rows_built },
+        );
+    }
+    return thread.transcript_layout_valid;
 }
 
 fn firstVisibleTranscriptLayoutItem(items: []const chat_types.TranscriptLayoutItem, scroll_y: f32) usize {
@@ -2216,9 +2251,7 @@ fn renderCommittedTranscript(
     scroll_y: f32,
     clip: palette.Rect,
 ) f32 {
-    if (!ensureTranscriptLayout(state, column.w)) {
-        return renderCommittedTranscriptUncached(state, thread, column, scroll_y, clip);
-    }
+    _ = ensureTranscriptLayout(state, column.w);
 
     const items = thread.transcript_layout_items.items;
     var layout_index = firstVisibleTranscriptLayoutItem(items, scroll_y);
@@ -2235,45 +2268,7 @@ fn renderCommittedTranscript(
             renderTranscriptMessage(state, thread, column, content_y, item.height, message, clip, item.message_index);
         }
     }
-    return column.y - scroll_y + thread.transcript_layout_committed_height;
-}
-
-// Renders committed transcript rows when allocating the layout cache fails.
-fn renderCommittedTranscriptUncached(
-    state: *app_state.AppState,
-    thread: anytype,
-    column: palette.Rect,
-    scroll_y: f32,
-    clip: palette.Rect,
-) f32 {
-    var content_y = column.y - scroll_y;
-    var message_index: usize = 0;
-    while (message_index < thread.messages.items.len) {
-        const message = thread.messages.items[message_index];
-        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(thread, message.author, message.body)) {
-            message_index += 1;
-            continue;
-        }
-        const group_end = if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body))
-            toolCallGroupEnd(thread.messages.items, message_index)
-        else
-            message_index + 1;
-        const height = if (group_end - message_index >= 2)
-            toolCallGroupHeight(state, thread.messages.items, message_index, group_end, 0, column.w)
-        else
-            transcriptCommittedMessageHeight(state, message_index, message, column.w);
-        if (content_y + height >= column.y and content_y <= column.y + column.h) {
-            if (group_end - message_index >= 2) {
-                const last = thread.messages.items[group_end - 1];
-                renderToolCallGroup(state, thread.messages.items, message_index, group_end, 0, column, content_y, height, clip, thread.backgroundCommandIsRunning(last.body), null);
-            } else {
-                renderTranscriptMessage(state, thread, column, content_y, height, message, clip, message_index);
-            }
-        }
-        content_y += height + theme.scaledUi(12.0);
-        message_index = group_end;
-    }
-    return content_y;
+    return column.y - scroll_y + estimatedPartialTranscriptHeight(thread);
 }
 
 fn transcriptPendingSlashCommandHeight(state: *app_state.AppState, column_width: f32) f32 {

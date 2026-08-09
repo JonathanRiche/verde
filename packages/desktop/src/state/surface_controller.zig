@@ -342,9 +342,11 @@ fn clearSurfaceAttentionAtIndex(self: anytype, surface_index: usize) bool {
         surface.completed_at_ms = 0;
         if (surface.status == .done) surface.status = .idle;
     }
-    // A completed surface is durably removed by the queued targeted clear.
-    // Attention-only changes still need the compatibility snapshot path.
-    if (!done_ack) self.markDirty();
+    // Completion durability is owned by the targeted clear. Attention and
+    // unread counts are volatile daemon/session projections and are not fields
+    // in PersistedSurfaceState, so a compatibility snapshot cannot durably
+    // represent their focus acknowledgement; dirtying 136 MiB here only made
+    // workspace focus schedule redundant full-state work.
     return true;
 }
 
