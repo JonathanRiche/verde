@@ -555,7 +555,9 @@ pub fn clearChatCompletion(self: anytype, project_index: usize, thread_index: us
     if (!self.queueChatCompletionAcknowledgement(project.id, thread.local_thread_id, thread.completed_at_ms)) return false;
     thread.completion_pending = false;
     thread.completed_at_ms = 0;
-    self.markDirty();
+    // The acknowledgement worker owns the durable targeted clear. Marking
+    // the compatibility projection dirty here made a tiny focus-only change
+    // recapture every transcript on close.
     return true;
 }
 
@@ -603,7 +605,7 @@ test "chat completion focus clear queues persistence and updates local state imm
 
     try std.testing.expect(clearChatCompletion(&state, 0, 0));
     try std.testing.expect(state.queued);
-    try std.testing.expect(state.dirty);
+    try std.testing.expect(!state.dirty);
     try std.testing.expect(!project.threads.items[0].completion_pending);
     try std.testing.expectEqual(@as(i64, 0), project.threads.items[0].completed_at_ms);
 }

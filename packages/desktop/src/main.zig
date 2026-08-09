@@ -690,15 +690,6 @@ fn mainInner(init: std.process.Init) !void {
                 ui_layout.renderRoot(app_state, @floatFromInt(framebuffer_width), @floatFromInt(framebuffer_height));
             }
         }.run, .{ &state, fb_width, fb_height });
-        recordSpan(&frame_sample, .flush_dirty, struct {
-            fn run(app_state: *AppState) void {
-                // Poll first so a completed worker acks without blocking; then
-                // schedule off-thread if due (never ensureDaemon on the frame path).
-                app_state.pollFlushWorker();
-                app_state.flushIfDirty();
-            }
-        }.run, .{&state});
-
         var frame_submitted = false;
         recordSpan(&frame_sample, .draw_backend, struct {
             fn run(
@@ -725,6 +716,15 @@ fn mainInner(init: std.process.Init) !void {
             state.noteBrowserFramePresented();
             render_pacer.noteRendered(monotonicMs());
         }
+        recordSpan(&frame_sample, .flush_dirty, struct {
+            fn run(app_state: *AppState) void {
+                // Snapshot capture duplicates the compatibility projection
+                // before the worker owns it. Do that only after presenting
+                // the frame so a due flush cannot hold up visual feedback.
+                app_state.pollFlushWorker();
+                app_state.flushIfDirty();
+            }
+        }.run, .{&state});
         if (pending_wake_sequence) |sequence| {
             loop_wakeup.finish(sequence);
             pending_wake_sequence = null;
@@ -2668,7 +2668,20 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
             window_flags.occluded,
         ));
     }
-    if (!closePreflightPassed(state)) return true;
+    if (builtin.os.tag == .linux) {
+        // The durability handoff can legitimately outlive the compositor's
+        // close budget for a very large dirty projection. Remove the window
+        // first, but keep all state owners alive until the handoff succeeds.
+        _ = SDL_HideWindow(window);
+        _ = SDL_SyncWindow(window);
+    }
+    if (!closePreflightPassed(state)) {
+        if (builtin.os.tag == .linux) {
+            _ = SDL_ShowWindow(window);
+            _ = SDL_SyncWindow(window);
+        }
+        return true;
+    }
     if (builtin.os.tag == .macos) {
         _ = state.browser_controller.runtime.controller.hide() catch {};
         verde_macos_host_window_order_out(nativeBrowserHostWindow(window));
@@ -2680,12 +2693,16 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
 // Durability boundary shared by every graceful exit request. A failed handoff
 // leaves the event loop, window, and controllers live for an interactive retry.
 fn closePreflightPassed(state: anytype) bool {
+    const started_at_ms = currentTimeMillis();
+    runtime_log.diagnostic("close durability handoff begin", .{});
     if (@hasDecl(@TypeOf(state.*), "beginClosePreflight")) state.beginClosePreflight();
     state.handoffDirtyStateForShutdown() catch |err| {
         if (@hasDecl(@TypeOf(state.*), "cancelClosePreflight")) state.cancelClosePreflight();
         state.noteCloseDurabilityFailure(err);
+        runtime_log.diagnostic("close durability handoff failed elapsed_ms={d}", .{currentTimeMillis() - started_at_ms});
         return false;
     };
+    runtime_log.diagnostic("close durability handoff complete elapsed_ms={d}", .{currentTimeMillis() - started_at_ms});
     return true;
 }
 
@@ -2786,6 +2803,18 @@ test "startup frame is submitted before the durable projection load" {
     const app_state_load = std.mem.indexOf(u8, source, "var state = try AppState.init").?;
     try std.testing.expect(early_show < renderer_init);
     try std.testing.expect(startup_frame < app_state_load);
+}
+
+test "visual presentation and Linux window removal precede durability work" {
+    const source = @embedFile("main.zig");
+    const frame_submit = std.mem.indexOf(u8, source, "state.noteBrowserFramePresented();").?;
+    const frame_flush = std.mem.indexOf(u8, source, "app_state.flushIfDirty();").?;
+    try std.testing.expect(frame_submit < frame_flush);
+
+    const linux_close = std.mem.indexOf(u8, source, "The durability handoff can legitimately outlive").?;
+    const hide_window = linux_close + std.mem.indexOf(u8, source[linux_close..], "_ = SDL_HideWindow(window);").?;
+    const close_handoff = linux_close + std.mem.indexOf(u8, source[linux_close..], "if (!closePreflightPassed(state))").?;
+    try std.testing.expect(hide_window < close_handoff);
 }
 
 fn linuxWindowFlagsPermitWmClose(
