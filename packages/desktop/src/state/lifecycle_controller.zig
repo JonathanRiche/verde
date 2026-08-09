@@ -10,6 +10,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform_runtime = @import("platform_runtime");
 const db_types = @import("../db/types.zig");
+const persistence = @import("persistence.zig");
 const storage_mod = @import("storage.zig");
 
 const SAVE_DEBOUNCE_MS: i64 = 750;
@@ -20,6 +21,10 @@ const FLUSH_UNAVAILABLE_PROBE_MS: i64 = 5000;
 /// Leave enough room below the ten-second process watchdog to durably spool.
 const SHUTDOWN_FLUSH_BUDGET_MS: i64 = 7000;
 const SHUTDOWN_MAX_CONFLICTS: usize = 2;
+/// Bound transcript copying to a small fraction of one 60 Hz frame. Large
+/// projections advance over multiple already-presented frames.
+const SNAPSHOT_CAPTURE_BYTES_PER_FRAME: usize = 4 * 1024 * 1024;
+const SDL_STALL_LOG_THRESHOLD_MS: i64 = 50;
 const log = std.log.scoped(.native_shell);
 
 const LoadedPersistedState = db_types.LoadedState;
@@ -38,6 +43,8 @@ const FlushWorkerArgs = struct {
     storage: *const Storage,
     loaded: ?LoadedPersistedState,
     baseline: ?LoadedPersistedState,
+    body_capture: ?persistence.IncrementalBodyCapture = null,
+    selected_project_index: ?usize = null,
     observed_revision: u64,
     result: *FlushWorkerResult,
 };
@@ -71,8 +78,25 @@ pub const State = struct {
     projection_baseline_revision: ?u64 = null,
     /// True once the current dirty projection has durable spool ownership.
     dirty_spooled: bool = false,
+    /// True only while every mutation in this generation is workspace
+    /// selection. The worker can derive that projection from the immutable
+    /// daemon baseline without touching live AppState.
+    selection_only: bool = false,
+    selected_project_index: usize = 0,
+    /// Generation-checked, frame-budgeted transcript copy in progress.
+    snapshot_capture: ?persistence.IncrementalBodyCapture = null,
 
     pub fn markDirty(self: *State, now_ms: i64) void {
+        self.dirty = true;
+        self.last_dirty_at_ms = now_ms;
+        self.dirty_generation +%= 1;
+        self.dirty_spooled = false;
+        self.selection_only = false;
+    }
+
+    pub fn markSelectionDirty(self: *State, now_ms: i64, selected_project_index: usize) void {
+        if (!self.dirty or self.selection_only) self.selection_only = true;
+        self.selected_project_index = selected_project_index;
         self.dirty = true;
         self.last_dirty_at_ms = now_ms;
         self.dirty_generation +%= 1;
@@ -82,7 +106,7 @@ pub const State = struct {
     /// Clear dirty only if the acked snapshot covered every mutation so far;
     /// a stale ack leaves dirty set so the next flush picks up the newer state.
     pub fn clearDirtyForGeneration(self: *State, generation: u64) void {
-        if (self.dirty_generation == generation) self.dirty = false;
+        if (self.dirty_generation == generation) self.clearDirty();
     }
 
     pub fn noteInteraction(self: *State, now_ms: i64) void {
@@ -95,11 +119,22 @@ pub const State = struct {
             now_ms - self.last_interaction_at_ms >= debounce_ms;
     }
 
+    pub fn persistenceNeedsFrames(self: State, now_ms: i64) bool {
+        if (self.snapshot_capture != null or self.flush_in_flight) return true;
+        if (!self.dirty or self.dirty_spooled or now_ms < self.next_flush_attempt_ms) return false;
+        return self.shouldFlush(now_ms, SAVE_DEBOUNCE_MS);
+    }
+
     pub fn clearDirty(self: *State) void {
         self.dirty = false;
+        self.selection_only = false;
+        if (self.snapshot_capture) |*capture| capture.deinit();
+        self.snapshot_capture = null;
     }
 
     pub fn deinit(self: *State) void {
+        if (self.snapshot_capture) |*capture| capture.deinit();
+        self.snapshot_capture = null;
         if (self.rebase_snapshot) |*snapshot| snapshot.deinit();
         self.rebase_snapshot = null;
         if (self.rebase_baseline) |*snapshot| snapshot.deinit();
@@ -116,6 +151,12 @@ pub fn markDirty(self: anytype) void {
     const now_ms = platform_runtime.unixTimestampMs();
     self.lifecycle.noteInteraction(now_ms);
     self.lifecycle.markDirty(now_ms);
+}
+
+pub fn markSelectionDirty(self: anytype, selected_project_index: usize) void {
+    const now_ms = platform_runtime.unixTimestampMs();
+    self.lifecycle.noteInteraction(now_ms);
+    self.lifecycle.markSelectionDirty(now_ms, selected_project_index);
 }
 
 pub fn noteInteraction(self: anytype) void {
@@ -143,32 +184,66 @@ fn scheduleFlushWorker(self: anytype, now_ms: i64) void {
     }
     const storage = self.storage;
     const observed_revision = storage.currentProjectionObservedRevision();
-    var persisted = self.buildPersistedState(storage.allocator) catch |err| {
-        log.err("failed to snapshot native state for async flush: {s}", .{@errorName(err)});
-        self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
-        return;
-    };
     const baseline_current = self.lifecycle.projection_baseline != null and
         self.lifecycle.projection_baseline_revision == observed_revision;
     if (!baseline_current) {
-        // A cursor refresh will establish a revision-paired baseline. Never
-        // capture a payload against a baseline from another revision.
-        persisted.deinit();
         self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
         return;
     }
-    var baseline: ?LoadedPersistedState = self.clonePersistedState(
+    if (self.lifecycle.selection_only) {
+        scheduleSelectionFlushWorker(self, storage, observed_revision, now_ms);
+        return;
+    }
+
+    if (self.lifecycle.snapshot_capture) |*capture| {
+        if (capture.dirty_generation != self.lifecycle.dirty_generation) {
+            capture.deinit();
+            self.lifecycle.snapshot_capture = null;
+        }
+    }
+    if (self.lifecycle.snapshot_capture == null) {
+        const begin_started_ms = platform_runtime.unixTimestampMs();
+        self.lifecycle.snapshot_capture = persistence.IncrementalBodyCapture.init(
+            storage.allocator,
+            snapshotContext(self),
+            self.lifecycle.dirty_generation,
+        ) catch |err| {
+            log.err("failed to begin incremental native state snapshot: {s}", .{@errorName(err)});
+            self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
+            return;
+        };
+        logSdlStall("flush snapshot index", begin_started_ms);
+    }
+
+    const capture_started_ms = platform_runtime.unixTimestampMs();
+    const capture_complete = self.lifecycle.snapshot_capture.?.advance(SNAPSHOT_CAPTURE_BYTES_PER_FRAME);
+    logSdlStall("flush capture slice", capture_started_ms);
+    if (!capture_complete) return;
+
+    const finalize_started_ms = platform_runtime.unixTimestampMs();
+    var persisted = persistence.buildSnapshotFromBodyCapture(
+        snapshotContext(self),
         storage.allocator,
-        self.lifecycle.projection_baseline.?.value,
+        &self.lifecycle.snapshot_capture.?,
     ) catch |err| {
-        log.err("failed to capture daemon merge baseline: {s}", .{@errorName(err)});
-        persisted.deinit();
+        log.err("failed to finalize incremental native state snapshot: {s}", .{@errorName(err)});
+        self.lifecycle.snapshot_capture.?.deinit();
+        self.lifecycle.snapshot_capture = null;
         self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
         return;
     };
+    logSdlStall("flush snapshot finalize", finalize_started_ms);
+    var body_capture = self.lifecycle.snapshot_capture;
+    self.lifecycle.snapshot_capture = null;
+    var baseline = self.lifecycle.projection_baseline;
+    self.lifecycle.projection_baseline = null;
+    self.lifecycle.projection_baseline_revision = null;
 
     const result = storage.allocator.create(FlushWorkerResult) catch {
-        if (baseline) |*snapshot| snapshot.deinit();
+        if (body_capture) |*capture| capture.deinit();
+        self.lifecycle.projection_baseline = baseline;
+        baseline = null;
+        self.lifecycle.projection_baseline_revision = observed_revision;
         persisted.deinit();
         self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
         return;
@@ -176,7 +251,10 @@ fn scheduleFlushWorker(self: anytype, now_ms: i64) void {
     result.* = .{};
 
     const args = storage.allocator.create(FlushWorkerArgs) catch {
-        if (baseline) |*snapshot| snapshot.deinit();
+        if (body_capture) |*capture| capture.deinit();
+        self.lifecycle.projection_baseline = baseline;
+        baseline = null;
+        self.lifecycle.projection_baseline_revision = observed_revision;
         storage.allocator.destroy(result);
         persisted.deinit();
         self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
@@ -187,6 +265,7 @@ fn scheduleFlushWorker(self: anytype, now_ms: i64) void {
         .storage = storage,
         .loaded = persisted,
         .baseline = baseline,
+        .body_capture = body_capture,
         .observed_revision = observed_revision,
         .result = result,
     };
@@ -196,7 +275,10 @@ fn scheduleFlushWorker(self: anytype, now_ms: i64) void {
         // Take loaded back so we can deinit; args holds the moved value.
         var owned = args.loaded.?;
         owned.deinit();
-        if (args.baseline) |*snapshot| snapshot.deinit();
+        if (args.body_capture) |*capture| capture.deinit();
+        self.lifecycle.projection_baseline = args.baseline;
+        args.baseline = null;
+        self.lifecycle.projection_baseline_revision = observed_revision;
         storage.allocator.destroy(args);
         storage.allocator.destroy(result);
         storage.markPersistenceUnavailable();
@@ -213,6 +295,11 @@ fn scheduleFlushWorker(self: anytype, now_ms: i64) void {
 }
 
 fn flushWorkerMain(args: *FlushWorkerArgs) void {
+    prepareFlushWorkerLoaded(args) catch {
+        args.result.done.store(true, .release);
+        return;
+    };
+
     const fits_transport = args.storage.stateFitsSnapshotTransport(args.loaded.?.value) catch false;
     if (!fits_transport) {
         args.storage.writePendingStateSpool(.{
@@ -237,6 +324,74 @@ fn flushWorkerMain(args: *FlushWorkerArgs) void {
     args.result.acknowledged_revision = args.storage.currentProjectionObservedRevision();
     args.result.success = true;
     args.result.done.store(true, .release);
+}
+
+fn prepareFlushWorkerLoaded(args: *FlushWorkerArgs) !void {
+    const source = if (args.loaded) |loaded|
+        loaded.value
+    else if (args.baseline) |baseline|
+        baseline.value
+    else
+        return error.MissingFlushSnapshot;
+    var deep_loaded = try persistence.clonePersistedState(args.allocator, source);
+    if (args.selected_project_index) |selected_project_index| {
+        deep_loaded.value.selected_project_index = selected_project_index;
+    }
+    if (args.loaded) |*loaded| loaded.deinit();
+    args.loaded = deep_loaded;
+    if (args.body_capture) |*capture| capture.deinit();
+    args.body_capture = null;
+}
+
+fn scheduleSelectionFlushWorker(
+    self: anytype,
+    storage: *const Storage,
+    observed_revision: u64,
+    now_ms: i64,
+) void {
+    const baseline = self.lifecycle.projection_baseline;
+    self.lifecycle.projection_baseline = null;
+    self.lifecycle.projection_baseline_revision = null;
+
+    const result = storage.allocator.create(FlushWorkerResult) catch {
+        self.lifecycle.projection_baseline = baseline;
+        self.lifecycle.projection_baseline_revision = observed_revision;
+        self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
+        return;
+    };
+    result.* = .{};
+    const args = storage.allocator.create(FlushWorkerArgs) catch {
+        storage.allocator.destroy(result);
+        self.lifecycle.projection_baseline = baseline;
+        self.lifecycle.projection_baseline_revision = observed_revision;
+        self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
+        return;
+    };
+    args.* = .{
+        .allocator = storage.allocator,
+        .storage = storage,
+        .loaded = null,
+        .baseline = baseline,
+        .selected_project_index = self.lifecycle.selected_project_index,
+        .observed_revision = observed_revision,
+        .result = result,
+    };
+    const thread = std.Thread.spawn(.{}, flushWorkerMain, .{args}) catch |err| {
+        log.err("failed to spawn selection flush worker: {s}", .{@errorName(err)});
+        self.lifecycle.projection_baseline = args.baseline;
+        args.baseline = null;
+        self.lifecycle.projection_baseline_revision = observed_revision;
+        storage.allocator.destroy(args);
+        storage.allocator.destroy(result);
+        storage.markPersistenceUnavailable();
+        self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
+        return;
+    };
+    self.lifecycle.flush_worker = thread;
+    self.lifecycle.flush_result = result;
+    self.lifecycle.flush_args = args;
+    self.lifecycle.flush_in_flight = true;
+    self.lifecycle.flush_snapshot_generation = self.lifecycle.dirty_generation;
 }
 
 /// Join a completed flush worker and apply ack / backoff. Safe to call every frame.
@@ -272,9 +427,17 @@ pub fn pollFlushWorker(self: anytype) void {
             self.lifecycle.projection_baseline = args.loaded;
             args.loaded = null;
             self.lifecycle.projection_baseline_revision = acknowledged_revision;
+        } else if (self.lifecycle.projection_baseline == null and args.baseline != null) {
+            // The worker temporarily owns the revision-paired baseline. On a
+            // transport/spool failure, restore it so the next capture remains
+            // correctly guarded without rebuilding state on the SDL thread.
+            self.lifecycle.projection_baseline = args.baseline;
+            args.baseline = null;
+            self.lifecycle.projection_baseline_revision = args.observed_revision;
         }
         if (args.loaded) |*loaded| loaded.deinit();
         if (args.baseline) |*baseline| baseline.deinit();
+        if (args.body_capture) |*capture| capture.deinit();
         storage.allocator.destroy(args);
         self.lifecycle.flush_args = null;
     }
@@ -300,6 +463,22 @@ pub fn pollFlushWorker(self: anytype) void {
         log.err("async native state save failed; retaining dirty and backing off", .{});
         storage.markPersistenceUnavailable();
         self.lifecycle.next_flush_attempt_ms = now + FLUSH_UNAVAILABLE_PROBE_MS;
+    }
+}
+
+fn snapshotContext(self: anytype) persistence.SnapshotContext {
+    return .{
+        .projects = self.project_controller.projects.items,
+        .archived_projects = self.project_controller.archived_projects.items,
+        .selected_project_index = self.project_controller.selected_index,
+        .sidebar_collapsed = self.sidebar_collapsed,
+    };
+}
+
+fn logSdlStall(name: []const u8, started_at_ms: i64) void {
+    const elapsed_ms = platform_runtime.unixTimestampMs() - started_at_ms;
+    if (elapsed_ms > SDL_STALL_LOG_THRESHOLD_MS) {
+        log.warn("SDL thread stall operation={s} elapsed_ms={d}", .{ name, elapsed_ms });
     }
 }
 
@@ -332,6 +511,8 @@ pub fn handoffDirtyStateForShutdown(self: anytype) !void {
 }
 
 fn flushDirtyBlockingResult(self: anytype) !void {
+    if (self.lifecycle.snapshot_capture) |*capture| capture.deinit();
+    self.lifecycle.snapshot_capture = null;
     // Drain any scheduled frame flush before a blocking path.
     if (self.lifecycle.flush_in_flight) {
         if (self.lifecycle.flush_worker) |thread| {
@@ -460,6 +641,53 @@ test "lifecycle debounce requires both dirty and interaction quiet periods" {
     try std.testing.expect(state.shouldFlush(950, 750));
     state.clearDirty();
     try std.testing.expect(!state.shouldFlush(2000, 750));
+}
+
+test "incremental snapshot and worker ownership keep frame progress scheduled" {
+    var state: State = .{ .dirty = true, .last_dirty_at_ms = 100, .last_interaction_at_ms = 100 };
+    try std.testing.expect(!state.persistenceNeedsFrames(849));
+    try std.testing.expect(state.persistenceNeedsFrames(850));
+    state.flush_in_flight = true;
+    state.next_flush_attempt_ms = 10_000;
+    try std.testing.expect(state.persistenceNeedsFrames(900));
+    state.flush_in_flight = false;
+    state.dirty_spooled = true;
+    try std.testing.expect(!state.persistenceNeedsFrames(20_000));
+}
+
+test "selection-only generations coalesce but never hide a full projection mutation" {
+    var state: State = .{};
+    state.markSelectionDirty(100, 2);
+    try std.testing.expect(state.selection_only);
+    try std.testing.expectEqual(@as(usize, 2), state.selected_project_index);
+    state.markSelectionDirty(200, 4);
+    try std.testing.expect(state.selection_only);
+    try std.testing.expectEqual(@as(usize, 4), state.selected_project_index);
+    state.markDirty(300);
+    try std.testing.expect(!state.selection_only);
+}
+
+test "selection worker derives current projection from immutable baseline" {
+    var baseline = LoadedPersistedState.init(std.testing.allocator);
+    baseline.value.selected_project_index = 1;
+    var result: FlushWorkerResult = .{};
+    var args: FlushWorkerArgs = .{
+        .allocator = std.testing.allocator,
+        .storage = undefined,
+        .loaded = null,
+        .baseline = baseline,
+        .selected_project_index = 3,
+        .observed_revision = 8,
+        .result = &result,
+    };
+    defer {
+        if (args.loaded) |*loaded| loaded.deinit();
+        if (args.baseline) |*owned_baseline| owned_baseline.deinit();
+    }
+
+    try prepareFlushWorkerLoaded(&args);
+    try std.testing.expectEqual(@as(usize, 3), args.loaded.?.value.selected_project_index);
+    try std.testing.expectEqual(@as(usize, 1), args.baseline.?.value.selected_project_index);
 }
 
 test "stale flush ack does not clear dirty for later mutations" {

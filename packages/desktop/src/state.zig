@@ -2959,6 +2959,13 @@ pub const AppState = struct {
 
     pub fn selectProjectAtIndex(self: *AppState, index: usize) bool {
         if (index >= self.project_controller.projects.items.len) return false;
+        const switch_started_ms = platform_runtime.unixTimestampMs();
+        defer {
+            const elapsed_ms = platform_runtime.unixTimestampMs() - switch_started_ms;
+            if (elapsed_ms > 50) {
+                log.warn("SDL thread stall operation=workspace switch elapsed_ms={d} target_index={d}", .{ elapsed_ms, index });
+            }
+        }
         self.blurCompanionComposer();
         self.project_controller.selected_index = index;
         self.ensureCurrentProjectWorkspace();
@@ -2969,7 +2976,7 @@ pub const AppState = struct {
         self.workspace_header_open_menu_pane_id = null;
         self.sidebar_context_menu_open = false;
         self.syncRenameBuffer();
-        self.markDirty();
+        self.markSelectionDirty(index);
         return true;
     }
 
@@ -8512,6 +8519,7 @@ pub const AppState = struct {
     pub const clearFileSearch = file_search_controller.clearFileSearch;
 
     pub const markDirty = lifecycle_controller.markDirty;
+    pub const markSelectionDirty = lifecycle_controller.markSelectionDirty;
     pub const noteInteraction = lifecycle_controller.noteInteraction;
     pub const requestTranscriptScrollToBottom = transcript_controller.requestTranscriptScrollToBottom;
     pub const requestTranscriptLineScroll = transcript_controller.requestTranscriptLineScroll;

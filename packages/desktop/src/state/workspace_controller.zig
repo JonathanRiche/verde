@@ -997,11 +997,13 @@ pub fn focusWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
     // eating clicks through the popover routing.
     self.closePaletteModelPicker();
     self.closeRunConfigPopover();
+    var persisted_focus_changed = layout.focused_pane_id != pane_id;
     layout.focused_pane_id = pane_id;
     switch (pane.ref) {
         .chat => |ref| {
             var project = &self.project_controller.projects.items[project_index];
             if (ref.thread_index < project.threads.items.len) {
+                persisted_focus_changed = persisted_focus_changed or project.selected_thread_index != ref.thread_index;
                 project.selected_thread_index = ref.thread_index;
                 _ = self.clearChatCompletion(project_index, ref.thread_index);
             }
@@ -1019,7 +1021,7 @@ pub fn focusWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
             if (self.project_controller.selected_index == project_index) self.focusBrowserPane();
         },
     }
-    self.markDirty();
+    if (persisted_focus_changed) self.markDirty();
     return true;
 }
 
