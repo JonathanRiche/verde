@@ -22,6 +22,11 @@ fn unixTimestampMs() i64 {
 
 pub const SurfaceStatus = db_types.SurfaceStatus;
 
+pub const SurfaceDurability = enum {
+    durable,
+    presentation_only,
+};
+
 pub const SurfaceUpdate = struct {
     session_id: []const u8,
     workspace_id: ?[]const u8 = null,
@@ -38,6 +43,11 @@ pub const SurfaceUpdate = struct {
     last_event_title: ?[]const u8 = null,
     last_event_body: ?[]const u8 = null,
     clear: bool = false,
+    status_changed_at_ms: ?i64 = null,
+    completed_at_ms: ?i64 = null,
+    /// Only the Live server may select presentation_only, after validating an
+    /// exact durable daemon receipt for this mutation.
+    durability: SurfaceDurability = .durable,
 };
 
 pub const SurfaceState = struct {
@@ -59,6 +69,7 @@ pub const SurfaceState = struct {
     last_event_title: ?[]u8 = null,
     last_event_body: ?[]u8 = null,
     last_event_at_ms: i64 = 0,
+    presentation_generation: u64 = 0,
 
     pub fn displayStatus(self: *const SurfaceState) SurfaceStatus {
         return if (self.completion_pending) .done else self.status;
@@ -152,8 +163,9 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
             }
         }
     }
+    s.presentation_generation +%= 1;
     if (update.clear) {
-        _ = try self.storage.clearSurfaceState(s.session_id);
+        if (update.durability == .durable) _ = try self.storage.clearSurfaceState(s.session_id);
         if (s.status != .idle) s.status_changed_at_ms = unixTimestampMs();
         s.status = .idle;
         s.completion_pending = false;
@@ -166,12 +178,12 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
         _ = clearTerminalNotificationBySession(self, update.session_id);
     } else {
         if (update.status) |value| {
-            const now_ms = unixTimestampMs();
+            const now_ms = update.status_changed_at_ms orelse unixTimestampMs();
             if (value != s.status) s.status_changed_at_ms = now_ms;
             s.status = value;
             if (value == .done and !s.completion_pending) {
                 s.completion_pending = true;
-                s.completed_at_ms = now_ms;
+                s.completed_at_ms = update.completed_at_ms orelse now_ms;
                 completion_became_pending = true;
             } else if (value != .done) {
                 // A new active/idle state supersedes any older completion.
@@ -193,10 +205,10 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
             s.last_event_at_ms = unixTimestampMs();
         }
         if (s.status == .idle) {
-            if (update.status != null) _ = try self.storage.clearSurfaceState(s.session_id);
+            if (update.status != null and update.durability == .durable) _ = try self.storage.clearSurfaceState(s.session_id);
         } else {
             // Every non-idle hook state is durable via the daemon store.
-            try self.storage.upsertSurfaceState(persistedSurfaceState(s));
+            if (update.durability == .durable) try self.storage.upsertSurfaceState(persistedSurfaceState(s));
         }
     }
     // Notify on the completion edge. Runs on the main thread (live commands
@@ -208,7 +220,7 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
     return s;
 }
 
-fn persistedSurfaceState(surface: *const SurfaceState) PersistedSurfaceState {
+pub fn persistedSurfaceState(surface: *const SurfaceState) PersistedSurfaceState {
     return .{
         .session_id = surface.session_id,
         .workspace_id = surface.workspace_id,
@@ -342,6 +354,7 @@ fn clearSurfaceAttentionAtIndex(self: anytype, surface_index: usize) bool {
         surface.completed_at_ms = 0;
         if (surface.status == .done) surface.status = .idle;
     }
+    surface.presentation_generation +%= 1;
     // Completion durability is owned by the targeted clear. Attention and
     // unread counts are volatile daemon/session projections and are not fields
     // in PersistedSurfaceState, so a compatibility snapshot cannot durably

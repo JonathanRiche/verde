@@ -357,6 +357,48 @@ test "snapshot retains pane-less Companion identity and stable thread indexes" {
     try std.testing.expectEqualStrings(companion.local_thread_id, persisted.threads.?[1].local_thread_id.?);
 }
 
+test "terminal dock snapshot payload round trips through production consumer" {
+    const allocator = std.testing.allocator;
+    const layout_json =
+        \\{"active_tab_index":0,"font_scale":1.125,"tabs":[{"title":"build","active_pane_id":7,"root_node_id":1,"nodes":[{"node_id":1,"kind":"leaf","pane_id":7,"session_id":"session-seven","revive_policy":"attach_or_create"}]}]}
+    ;
+
+    var source = try Project.init(allocator, "dock-source", "Dock source", "/tmp/dock-source", 0);
+    defer source.deinit(allocator);
+    var source_dock = try terminal.Dock.init(allocator);
+    try source_dock.applyPersistedLayoutJson(allocator, layout_json);
+    source.terminal_docks.append(allocator, .{ .id = 4, .dock = source_dock }) catch |err| {
+        source_dock.deinit(allocator);
+        return err;
+    };
+
+    const source_projects = [_]Project{source};
+    var snapshot = try buildSnapshot(.{
+        .projects = &source_projects,
+        .archived_projects = &.{},
+        .selected_project_index = 0,
+        .sidebar_collapsed = false,
+    }, allocator);
+    defer snapshot.deinit();
+    const docks_json = snapshot.value.projects[0].terminal_docks_json orelse return error.TestExpectedEqual;
+
+    var restored = try Project.init(allocator, "dock-restored", "Dock restored", "/tmp/dock-restored", 0);
+    defer restored.deinit(allocator);
+    const Consumer = struct {
+        allocator: std.mem.Allocator,
+        app_config: struct { terminal_font_size: f32 = 13.0 } = .{},
+    };
+    var consumer: Consumer = .{ .allocator = allocator };
+    try applyPersistedTerminalDocksJson(&consumer, &restored, docks_json);
+
+    try std.testing.expectEqual(@as(usize, 1), restored.terminal_docks.items.len);
+    try std.testing.expectEqual(@as(u32, 4), restored.terminal_docks.items[0].id);
+    const restored_pane = restored.terminal_docks.items[0].dock.activePaneConst() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u32, 7), restored_pane.id);
+    try std.testing.expectEqualStrings("session-seven", restored_pane.session_id.?);
+    try std.testing.expectEqual(@as(u32, 5), restored.next_terminal_dock_id);
+}
+
 fn persistedTerminalDocksJson(allocator: std.mem.Allocator, project: *const Project) !?[]u8 {
     if (project.terminal_docks.items.len == 0) return null;
     var writer: std.Io.Writer.Allocating = .init(allocator);

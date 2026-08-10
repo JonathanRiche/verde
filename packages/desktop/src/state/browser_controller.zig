@@ -2055,7 +2055,17 @@ pub fn pollBrowser(self: anytype) bool {
     if (self.browser_controller.launch_open_delay_frames > 0) {
         self.browser_controller.launch_open_delay_frames -= 1;
         if (self.browser_controller.launch_open_delay_frames == 0) {
-            self.toggleBrowser();
+            if (self.project_controller.projects.items.len > 0 and
+                self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.visibleBrowserPaneId() != null)
+            {
+                // Launch restoration may already have bound the persisted
+                // pane while applying its keyboard focus. Re-enter the exact
+                // restore path: the ordinary toggle would interpret that
+                // successful binding as a request to close the pane.
+                self.restorePersistedBrowserPaneAfterProjectSelection(self.project_controller.selected_index);
+            } else {
+                self.toggleBrowser();
+            }
             needs_render = true;
         }
     }

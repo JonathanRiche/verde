@@ -14,6 +14,7 @@ const bang_commands = @import("workspace/bang_commands.zig");
 const chat_threads = @import("chat/threads.zig");
 const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
+const daemon_store = @import("daemon/store.zig");
 const herdr = @import("workspace/herdr.zig");
 const keybinds = @import("app/keybinds.zig");
 const loop_wakeup = @import("loop_wakeup");
@@ -819,6 +820,9 @@ fn slashCommandMatchesPrefix(name: []const u8, prefix: []const u8) bool {
 
 pub const SurfaceStatus = surface_controller.SurfaceStatus;
 pub const SurfaceUpdate = surface_controller.SurfaceUpdate;
+pub const SurfaceDurability = surface_controller.SurfaceDurability;
+pub const SurfaceCommitProof = state_storage.SurfaceCommitProof;
+pub const SurfaceCommitProofClassification = state_storage.SurfaceCommitProofClassification;
 pub const SurfaceState = surface_controller.SurfaceState;
 pub const SurfaceProvider = db_types.SurfaceProvider;
 
@@ -3897,12 +3901,22 @@ pub const AppState = struct {
             created_pane = true;
         }
 
+        const preserve_viewport = layout.maximized_pane_id != null;
         if (created_pane) {
             layout.focusCreatedPane(chat_pane_id.?);
         } else if (layout.focused_pane_id != chat_pane_id) {
             const was_maximized = layout.maximized_pane_id != null;
             layout.focused_pane_id = chat_pane_id;
             if (was_maximized) layout.maximized_pane_id = chat_pane_id;
+        }
+        if (preserve_viewport) {
+            layout.scroll_leading_pane_id = null;
+            layout.scroll_revealed_pane_id = chat_pane_id.?;
+        } else if (!created_pane) {
+            // Current viewport geometry belongs to the renderer. Clear an old
+            // explicit-leading request and let the next strip render decide
+            // whether this existing pane needs a bounded reveal at all.
+            layout.scroll_leading_pane_id = null;
         }
         project.selected_thread_index = thread_index;
         self.terminal_controller.focused = false;
@@ -3949,6 +3963,7 @@ pub const AppState = struct {
     pub const handoffDirtyStateForShutdown = lifecycle_controller.handoffDirtyStateForShutdown;
     pub const queueChatCompletionAcknowledgement = acknowledgement_controller.queueChat;
     pub const queueSurfaceAcknowledgement = acknowledgement_controller.queueSurface;
+    pub const containsSurfaceCompletionAcknowledgement = acknowledgement_controller.containsSurfaceCompletion;
     pub const pollAcknowledgements = acknowledgement_controller.poll;
     pub fn beginClosePreflight(self: *AppState) void {
         // Let an in-flight core.changes wait drain while durability handoff is
@@ -4280,6 +4295,7 @@ pub const AppState = struct {
             }
         }
         const pane = target orelse return;
+        const preserve_viewport = was_maximized;
         layout.focused_pane_id = pane_id;
         layout.maximized_pane_id = if (preserve_zoom and was_maximized) pane_id else null;
         self.restorePersistedBrowserPaneAfterProjectSelection(project_index);
@@ -4293,7 +4309,12 @@ pub const AppState = struct {
             },
         }
         _ = self.focusWorkspacePane(project_index, pane_id);
-        if (leading_reveal) layout.requestLeadingScrollReveal(pane_id);
+        if (preserve_viewport) {
+            layout.scroll_leading_pane_id = null;
+            layout.scroll_revealed_pane_id = pane_id;
+        } else if (leading_reveal) {
+            layout.requestLeadingScrollReveal(pane_id);
+        }
         self.markDirty();
     }
 
@@ -10042,6 +10063,7 @@ test "shared browser runtime routes state through its workspace owner" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
     state.allocator = allocator;
+    state.app_config = .{};
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
     state.browser_controller.runtime_project_index = null;
@@ -10370,12 +10392,29 @@ test "activating a thread already visible focuses its pane without changing spli
     var project = try Project.init(allocator, "existing-pane", "Existing pane", "/tmp/existing-pane", 0);
     const second_thread_index = try project.addThread(allocator);
     const second_pane_id = try project.workspace_layout.createChatPane(allocator, second_thread_index);
-    try project.workspace_layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
-    try std.testing.expect(project.workspace_layout.resizeSplit(1, second_pane_id, .vertical, 0.63));
+    try project.workspace_layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .horizontal, true);
+    try std.testing.expect(project.workspace_layout.resizeSplit(1, second_pane_id, .horizontal, 0.63));
     project.workspace_layout.focused_pane_id = 1;
     project.workspace_layout.maximized_pane_id = 1;
+    project.workspace_layout.scroll_offset_x = 73.25;
+    project.workspace_layout.scroll_target_x = 73.25;
+    project.workspace_layout.scroll_offset_y = 19.5;
+    project.workspace_layout.scroll_target_y = 19.5;
+    project.workspace_layout.scroll_revealed_pane_id = 1;
+    const activation_layout_json = try project.workspace_layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(activation_layout_json);
+    try project.workspace_layout.applyPersistedWorkspaceJson(allocator, activation_layout_json);
+    try std.testing.expectEqual(@as(f32, 73.25), project.workspace_layout.scroll_offset_x);
+    try std.testing.expectEqual(@as(f32, 73.25), project.workspace_layout.scroll_target_x);
+    try std.testing.expectEqual(@as(f32, 19.5), project.workspace_layout.scroll_offset_y);
+    try std.testing.expectEqual(@as(f32, 19.5), project.workspace_layout.scroll_target_y);
     state.project_controller.projects.append(allocator, project) catch |err| {
         project.deinit(allocator);
+        return err;
+    };
+    var away_project = try Project.init(allocator, "away", "Away", "/tmp/away", 0);
+    state.project_controller.projects.append(allocator, away_project) catch |err| {
+        away_project.deinit(allocator);
         return err;
     };
 
@@ -10383,14 +10422,46 @@ test "activating a thread already visible focuses its pane without changing spli
     const layout = &state.project_controller.projects.items[0].workspace_layout;
     try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_offset_x);
+    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_target_x);
+    try std.testing.expectEqual(@as(f32, 19.5), layout.scroll_offset_y);
+    try std.testing.expectEqual(@as(f32, 19.5), layout.scroll_target_y);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.scroll_revealed_pane_id);
+    try std.testing.expect(layout.scroll_leading_pane_id == null);
     try std.testing.expectEqual(@as(usize, 0), layout.paneById(1).?.ref.chat.thread_index);
     try std.testing.expectEqual(second_thread_index, layout.paneById(second_pane_id).?.ref.chat.thread_index);
     switch (layout.root.?.*) {
         .split => |split| try std.testing.expectApproxEqAbs(@as(f32, 0.63), split.ratio, 0.0001),
         .leaf => return error.TestExpectedEqual,
     }
+    // Existing non-maximized activation leaves current-geometry visibility to
+    // the next workspace render instead of trusting prior-frame membership.
+    layout.maximized_pane_id = null;
+    layout.scroll_revealed_pane_id = second_pane_id;
+    try state.focusProjectThreadInWorkspace(0, 0);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.scroll_revealed_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.scroll_leading_pane_id);
+    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_offset_x);
+    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_target_x);
+    switch (layout.root.?.*) {
+        .split => |split| try std.testing.expectApproxEqAbs(@as(f32, 0.63), split.ratio, 0.0001),
+        .leaf => return error.TestExpectedEqual,
+    }
+
+    // An offscreen pane remains eligible for the renderer's bounded
+    // ensure-visible path; activation itself does not invent a raw offset.
+    layout.scroll_revealed_pane_id = 1;
     try state.focusProjectThreadInWorkspace(0, second_thread_index);
-    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), layout.scroll_revealed_pane_id);
+    layout.requestLeadingScrollReveal(second_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.scroll_leading_pane_id);
+    try state.focusProjectThreadInWorkspace(0, 0);
+    try state.focusProjectThreadInWorkspace(0, second_thread_index);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.scroll_leading_pane_id);
+    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_offset_x);
+    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_target_x);
 }
 
 test "focused chat creation transfers zoom to the new pane" {
@@ -10742,6 +10813,7 @@ test "workspace selection restores focused pane keyboard ownership" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
     state.allocator = allocator;
+    state.app_config = .{};
     state.project_controller.projects = .empty;
     state.surface_controller = .{};
     state.project_controller.selected_index = 0;
@@ -10852,35 +10924,162 @@ test "workspace selection restores focused pane keyboard ownership" {
     try std.testing.expect(state.terminal_controller.focused);
     try std.testing.expect(!state.lifecycle.dirty);
 
-    // Restore an exact persisted second browser pane. The project owns one
-    // native runtime, so this discriminates metadata-only focus from an actual
-    // page rebind/navigation away from pane 1.
-    const persisted_browser_layout =
-        \\{"v":2,"next":4,"focused":3,"maximized":3,"panes":[
-        \\{"id":1,"kind":"chat","thread":0},
-        \\{"id":2,"kind":"browser","active_tab":0,"tabs":[{"url":"https://pane-one.example/first","title":"Pane one","history_index":0,"history":["https://pane-one.example/first"]}]},
-        \\{"id":3,"kind":"browser","active_tab":0,"tabs":[{"url":"https://pane-two.example/second","title":"Pane two","history_index":0,"history":["https://pane-two.example/second"]}]}],
-        \\"root":{"split":{"axis":"vertical","ratio":0.4,"first":{"leaf":1},"second":{"split":{"axis":"vertical","ratio":0.5,"first":{"leaf":2},"second":{"leaf":3}}}}}}
+    // Exercise the production close/relaunch seam: live Project capture,
+    // protocol snapshot, Store replacement, RO projection load, layout
+    // materialization, then exact native-runtime binding.
+    var source_project = try Project.init(allocator, "browser", "Browser", "/tmp/browser", 0);
+    defer source_project.deinit(allocator);
+    const source_chat_pane_id = source_project.workspace_layout.focused_pane_id orelse return error.TestExpectedEqual;
+    source_project.threads.items[0].committed = true;
+    const nested_thread_index = try source_project.addThread(allocator);
+    source_project.threads.items[nested_thread_index].committed = true;
+    const nested_chat_pane_id = try source_project.workspace_layout.createChatPane(allocator, nested_thread_index);
+    try source_project.workspace_layout.splitPaneWithLeaf(allocator, source_chat_pane_id, nested_chat_pane_id, .horizontal, true);
+    const exact_terminal_pane_id = try source_project.workspace_layout.createTerminalPane(allocator, 7);
+    try source_project.workspace_layout.ensurePaneInRootSplit(allocator, exact_terminal_pane_id, .vertical, 0.36);
+    const terminal_layout_json =
+        \\{"active_tab_index":0,"font_scale":1.125,"tabs":[{"title":"exact nested launch dock","active_pane_id":31,"root_node_id":1,"nodes":[{"node_id":1,"kind":"leaf","pane_id":31,"session_id":"exact-launch-session-31","revive_policy":"attach_or_create"}]}]}
     ;
-    try state.project_controller.projects.items[1].workspace_layout.applyPersistedWorkspaceJson(allocator, persisted_browser_layout);
-    const exact_browser_pane_id: WorkspacePaneId = 3;
+    var exact_dock = try terminal.Dock.init(allocator);
+    try exact_dock.applyPersistedLayoutJson(allocator, terminal_layout_json);
+    source_project.terminal_docks.append(allocator, .{ .id = 7, .dock = exact_dock }) catch |err| {
+        exact_dock.deinit(allocator);
+        return err;
+    };
+    const exact_browser_pane_id = try source_project.workspace_layout.ensureBrowserPane(allocator);
+    try std.testing.expect(source_project.workspace_layout.resizeSplit(exact_terminal_pane_id, exact_browser_pane_id, .vertical, 0.41));
+    const source_browser = switch (source_project.workspace_layout.paneByIdMutable(exact_browser_pane_id).?.ref) {
+        .browser => |*browser| browser,
+        else => return error.TestExpectedEqual,
+    };
+    const source_tab = source_browser.activeTab() orelse return error.TestExpectedEqual;
+    try source_tab.recordNavigation(allocator, "about:blank");
+    const exact_url = "https://pane-two.example/second/this-is-a-deliberately-long-launch-target/with-distinct-workspace-layout-and-history?proof=revision-21";
+    const exact_title = "Pane two exact persisted launch title that must survive materialization and delayed runtime binding";
+    try source_tab.recordNavigation(allocator, exact_url);
+    try source_tab.setTitle(allocator, exact_title);
+    source_project.workspace_layout.focused_pane_id = exact_browser_pane_id;
+    source_project.workspace_layout.maximized_pane_id = exact_browser_pane_id;
+
+    var prefix_project = try Project.init(allocator, "prefix", "Prefix", "/tmp/prefix", 0);
+    defer prefix_project.deinit(allocator);
+    prefix_project.threads.items[0].committed = true;
+    const prefix_thread_index = try prefix_project.addThread(allocator);
+    prefix_project.threads.items[prefix_thread_index].committed = true;
+    const prefix_pane_id = try prefix_project.workspace_layout.createChatPane(allocator, prefix_thread_index);
+    try prefix_project.workspace_layout.splitPaneWithLeaf(allocator, 1, prefix_pane_id, .horizontal, true);
+    try std.testing.expect(prefix_project.workspace_layout.resizeSplit(1, prefix_pane_id, .horizontal, 0.67));
+    const source_projects = [_]Project{ prefix_project, source_project };
+    var captured = try persistence.buildSnapshot(.{
+        .projects = &source_projects,
+        .archived_projects = &.{},
+        .selected_project_index = 1,
+        .sidebar_collapsed = false,
+    }, allocator);
+    defer captured.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const pref_path = path_buf[0..path_len];
+    const db_path = try std.fs.path.joinZ(allocator, &.{ pref_path, db_client.STATE_DB_NAME });
+    defer allocator.free(db_path);
+    var store = try daemon_store.Store.init(allocator, db_path);
+    defer store.deinit();
+    var protocol_arena = std.heap.ArenaAllocator.init(allocator);
+    defer protocol_arena.deinit();
+    const protocol_snapshot = try persistence.persistedStateToProtocolSnapshot(protocol_arena.allocator(), captured.value, 0);
+    const write = try store.replaceSnapshot(.{
+        .mutation = .{
+            .request_key = "browser-close-relaunch",
+            .client_id = "browser-test-client",
+            .expected_store_revision = 0,
+        },
+        .snapshot = protocol_snapshot,
+        .bootstrap = false,
+    });
+    try std.testing.expect(write.applied);
+    var launch_storage = try state_storage.Storage.initWithPrefPath(allocator, pref_path);
+    defer launch_storage.deinit();
+    var launch_state = try AppState.init(allocator, &launch_storage, .{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer {
+        launch_state.lifecycle.clearDirty();
+        launch_state.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 2), launch_state.project_controller.projects.items.len);
+    try std.testing.expectEqual(@as(usize, 1), launch_state.project_controller.selected_index);
+    const reloaded_layout = &launch_state.project_controller.projects.items[1].workspace_layout;
+    switch (reloaded_layout.paneById(exact_browser_pane_id).?.ref) {
+        .browser => {},
+        else => return error.TestExpectedEqual,
+    }
+    try std.testing.expectEqual(@as(?WorkspacePaneId, exact_browser_pane_id), reloaded_layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, exact_browser_pane_id), reloaded_layout.maximized_pane_id);
+    const reloaded_terminal = launch_state.project_controller.projects.items[1].terminalDockEntryById(7) orelse return error.TestExpectedEqual;
+    const reloaded_terminal_active = reloaded_terminal.dock.activePaneConst() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u32, 31), reloaded_terminal_active.id);
+    try std.testing.expectEqualStrings("exact-launch-session-31", reloaded_terminal_active.session_id.?);
+    try std.testing.expectEqual(@as(u32, 8), launch_state.project_controller.projects.items[1].next_terminal_dock_id);
     var controller_navigation: std.ArrayList(u8) = .empty;
     defer controller_navigation.deinit(allocator);
-    state.browser_controller.runtime.controller.test_navigation_capture = &controller_navigation;
-    state.browser_textures_enabled = true;
-    state.browser_controller.runtime_project_index = null;
-    state.browser_controller.runtime_pane_id = null;
-    state.lifecycle.dirty = false;
-    state.applyInitialWorkspaceFocusOnLaunch();
-    try std.testing.expectEqual(@as(?WorkspacePaneId, exact_browser_pane_id), state.project_controller.projects.items[1].workspace_layout.focused_pane_id);
-    try std.testing.expectEqual(@as(?WorkspacePaneId, exact_browser_pane_id), state.project_controller.projects.items[1].workspace_layout.maximized_pane_id);
-    try std.testing.expectEqual(@as(?WorkspacePaneId, exact_browser_pane_id), state.browser_controller.runtime_pane_id);
-    try std.testing.expectEqualStrings("https://pane-two.example/second", state.browser_controller.runtime.current_url.?);
-    try std.testing.expectEqualStrings("https://pane-two.example/second", state.browser_controller.runtime.addressInput());
-    try std.testing.expectEqualStrings("https://pane-two.example/second", controller_navigation.items);
-    try std.testing.expectEqual(true, state.browser_controller.pane_focused);
+    launch_state.browser_controller.runtime.controller.test_navigation_capture = &controller_navigation;
+    launch_state.browser_textures_enabled = true;
+    launch_state.browser_controller.runtime_project_index = null;
+    launch_state.browser_controller.runtime_pane_id = null;
+    launch_state.lifecycle.clearDirty();
+    const dirty_generation = launch_state.lifecycle.dirty_generation;
+    launch_state.restorePersistedBrowserPaneOnLaunch();
+    launch_state.applyInitialWorkspaceFocusOnLaunch();
+    _ = launch_state.pollBrowser();
+    _ = launch_state.pollBrowser();
+    try std.testing.expectEqual(@as(?WorkspacePaneId, exact_browser_pane_id), reloaded_layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, exact_browser_pane_id), reloaded_layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, exact_browser_pane_id), launch_state.browser_controller.runtime_pane_id);
+    try std.testing.expectEqualStrings(exact_url, launch_state.browser_controller.runtime.current_url.?);
+    try std.testing.expectEqualStrings(exact_url, launch_state.browser_controller.runtime.addressInput());
+    try std.testing.expectEqualStrings(exact_url, controller_navigation.items);
+    const restored_browser = launch_state.browserPaneRefMutable(1, exact_browser_pane_id) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 2), restored_browser.activeTab().?.history.items.len);
+    try std.testing.expectEqualStrings(exact_title, restored_browser.activeTab().?.title.?);
+    try std.testing.expectEqual(true, launch_state.browser_controller.pane_focused);
     try std.testing.expectEqual(true, state.surface_controller.surfaces.items[0].attention);
-    try std.testing.expectEqual(false, state.lifecycle.dirty);
+    try std.testing.expectEqual(false, launch_state.lifecycle.dirty);
+    try std.testing.expectEqual(dirty_generation, launch_state.lifecycle.dirty_generation);
+    try std.testing.expectEqual(@as(u64, 1), try store.storeRevision());
+
+    // A subsequent legitimate mutation may advance the Store, but its
+    // production snapshot must retain the exact restored owners and payloads.
+    try std.testing.expect(launch_state.selectProjectAtIndex(0));
+    var after_user_mutation = try persistence.buildSnapshot(.{
+        .projects = launch_state.project_controller.projects.items,
+        .archived_projects = &.{},
+        .selected_project_index = launch_state.project_controller.selected_index,
+        .sidebar_collapsed = false,
+    }, allocator);
+    defer after_user_mutation.deinit();
+    var second_protocol_arena = std.heap.ArenaAllocator.init(allocator);
+    defer second_protocol_arena.deinit();
+    const second_protocol_snapshot = try persistence.persistedStateToProtocolSnapshot(second_protocol_arena.allocator(), after_user_mutation.value, 1);
+    const second_write = try store.replaceSnapshot(.{
+        .mutation = .{
+            .request_key = "browser-legitimate-user-mutation",
+            .client_id = "browser-test-client",
+            .expected_store_revision = 1,
+        },
+        .snapshot = second_protocol_snapshot,
+        .bootstrap = false,
+    });
+    try std.testing.expect(second_write.applied);
+    try std.testing.expectEqual(@as(u64, 2), second_write.store_revision);
+    var reader = try db_client.Client.initReadOnly(allocator, pref_path);
+    defer reader.deinit();
+    var reloaded = (try reader.load(allocator)).?;
+    defer reloaded.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, reloaded.value.projects[1].workspace_layout_json.?, exact_url) != null);
+    try std.testing.expect(std.mem.indexOf(u8, reloaded.value.projects[1].terminal_docks_json.?, "exact-launch-session-31") != null);
 }
 
 test "ordinary browser focus and deletion preserve exact pane runtime ownership" {

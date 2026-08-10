@@ -1217,16 +1217,16 @@ pub const Store = struct {
             \\);
         );
 
-        // MINOR-5: `chat_completions` stays out of the wipe — the daemon owns
-        // that ledger post-flip; snapshot rows merge via upsert below and row
-        // removal remains the targeted `chat_completion_clear` command only.
+        // Surface and chat completion rows stay out of the wipe: targeted
+        // daemon mutations own both ledgers post-flip. Snapshot rows may merge
+        // through upsert below, while omission from a GUI compatibility
+        // snapshot must not erase a concurrent notification/session update.
         try self.conn.execNoArgs(
             \\delete from client_message_keys;
             \\delete from messages;
             \\delete from threads;
             \\delete from app_state;
             \\delete from workspaces;
-            \\delete from surface_completions;
         );
         try self.conn.exec(
             "insert into app_state (id, selected_workspace_index, sidebar_collapsed) values (1, ?1, ?2)",
@@ -1236,7 +1236,7 @@ pub const Store = struct {
         for (snapshot.workspaces, 0..) |workspace, workspace_index| {
             try self.insertWorkspaceAtRevision(workspace, workspace_index, snapshot, workspace_index == 0, store_revision);
         }
-        for (snapshot.surface_states) |surface| try self.insertSurface(surface);
+        for (snapshot.surface_states) |surface| try self.applySurfaceUpsert(surface);
         for (snapshot.chat_completions) |completion| try self.applyChatCompletionUpsert(completion);
 
         // Omitted workspaces whose retained turns were already within the
@@ -4470,6 +4470,54 @@ test "chat completion ledger survives snapshot lacking it" {
     )).?;
     defer removed.deinit();
     try std.testing.expectEqual(@as(i64, 0), removed.int(0));
+}
+
+test "surface ledger survives concurrent snapshot lacking it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    const workspace = testWorkspace("workspace-active", "Active workspace");
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("active-workspace", null),
+        .workspace = workspace,
+    });
+    _ = try store.upsertSurface(.{
+        .mutation = testHeader("active-surface", 1),
+        .surface = .{
+            .session_id = "session-active",
+            .workspace_id = workspace.workspace_id,
+            .workspace_path = workspace.path,
+            .dock_id = 1,
+            .pane_id = 3,
+            .title = "Working surface",
+            .status = "working",
+            .status_changed_at_ms = 100,
+        },
+    });
+
+    // The GUI captured R1 before the targeted surface mutation at R2, then
+    // rebased its local layout and retries a snapshot that omits surfaces.
+    const workspaces = [_]store_protocol.Workspace{workspace};
+    _ = try store.applyMutation(.{ .snapshot_replace = testSnapshotRequest(
+        "active-rebased-flush",
+        2,
+        false,
+        testSnapshot(&workspaces),
+    ) });
+
+    var survived = (try store.conn.row(
+        "select status, title, dock_id, pane_id from surface_completions where session_id = ?1",
+        .{"session-active"},
+    )).?;
+    defer survived.deinit();
+    try std.testing.expectEqual(try surfaceStatusCode("working"), survived.int(0));
+    try std.testing.expectEqualStrings("Working surface", survived.text(1));
+    try std.testing.expectEqual(@as(i64, 1), survived.int(2));
+    try std.testing.expectEqual(@as(i64, 3), survived.int(3));
 }
 
 // M4-P5 verify MAJOR-3 amendment: daemon-created thread rows (MCP
