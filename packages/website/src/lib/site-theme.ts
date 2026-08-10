@@ -45,7 +45,9 @@ export interface OmarchyTheme {
 }
 
 /* bg/accent/fg/warm are copied verbatim from each theme's Omarchy colors.toml
-   (warm = color3). 'verde' matches the site's own default tokens. */
+   (warm = color3). 'verde' matches the site's own default tokens.
+   'mist-deep' has no upstream colors.toml — it is a Verde-native light theme,
+   so its four values are the source of truth rather than a copy. */
 const OMARCHY_THEMES: OmarchyTheme[] = [
   { slug: 'verde', name: 'Verde default', bg: '#101820', accent: '#50c878', fg: '#eaf0f2', warm: '#e8a44a', fallbackShot: appScreenshot },
   { slug: 'tokyo-night', name: 'Tokyo Night', bg: '#1a1b26', accent: '#7aa2f7', fg: '#a9b1d6', warm: '#e0af68' },
@@ -65,6 +67,7 @@ const OMARCHY_THEMES: OmarchyTheme[] = [
   { slug: 'miasma', name: 'Miasma', bg: '#222222', accent: '#78824b', fg: '#c2c2b0', warm: '#b36d43' },
   { slug: 'retro-82', name: 'Retro 82', bg: '#05182e', accent: '#faa968', fg: '#f6dcac', warm: '#e97b3c' },
   { slug: 'flexoki-light', name: 'Flexoki Light', bg: '#fffcf0', accent: '#205ea6', fg: '#100f0f', warm: '#d0a215' },
+  { slug: 'mist-deep', name: 'Mist Deep', bg: '#eef2f4', accent: '#0f6ac9', fg: '#0d1012', warm: '#a0791a' },
   { slug: 'vantablack', name: 'Vantablack', bg: '#000000', accent: '#8d8d8d', fg: '#ffffff', warm: '#cecece' },
   { slug: 'white', name: 'White', bg: '#ffffff', accent: '#6e6e6e', fg: '#000000', warm: '#4a4a4a' },
 ]
