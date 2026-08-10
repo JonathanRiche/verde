@@ -98,7 +98,8 @@ pub const TextureUploadKind = enum {
 pub const FrameStats = struct {
     text_cache_rotate_ns: u64 = 0,
     text_cache_retire_ns: u64 = 0,
-    swapchain_acquire_ns: u64 = 0,
+    command_buffer_acquire_ns: u64 = 0,
+    swapchain_texture_acquire_ns: u64 = 0,
     batch_build_ns: u64 = 0,
     solid_upload_ns: u64 = 0,
     image_prepare_ns: u64 = 0,
@@ -122,7 +123,8 @@ pub const FrameStats = struct {
 
     pub fn hasWork(self: FrameStats) bool {
         return self.text_cache_rotate_ns != 0 or
-            self.swapchain_acquire_ns != 0 or
+            self.command_buffer_acquire_ns != 0 or
+            self.swapchain_texture_acquire_ns != 0 or
             self.text_cache_retire_ns != 0 or
             self.batch_build_ns != 0 or
             self.solid_upload_ns != 0 or
@@ -379,13 +381,17 @@ pub const Renderer = struct {
         const command_ends = try self.frame_scratch.begin(batch.commands.items.len);
         try self.frame_scratch.collectVisibleTextureIds(batch);
         stats.command_count = batch.commands.items.len;
-        const acquire_start = nowNs();
-        const command_buffer = c.SDL_AcquireGPUCommandBuffer(device) orelse return error.SdlGpuCommandBufferFailed;
+        const command_buffer_acquire_start = nowNs();
+        const maybe_command_buffer = c.SDL_AcquireGPUCommandBuffer(device);
+        stats.command_buffer_acquire_ns +|= elapsedNs(command_buffer_acquire_start);
+        const command_buffer = maybe_command_buffer orelse return error.SdlGpuCommandBufferFailed;
         var swapchain_texture: ?*c.SDL_GPUTexture = null;
         var width: u32 = 0;
         var height: u32 = 0;
-        if (!c.SDL_AcquireGPUSwapchainTexture(command_buffer, @ptrCast(window), &swapchain_texture, &width, &height)) return error.SdlGpuSwapchainFailed;
-        stats.swapchain_acquire_ns +|= elapsedNs(acquire_start);
+        const swapchain_texture_acquire_start = nowNs();
+        const swapchain_acquired = c.SDL_AcquireGPUSwapchainTexture(command_buffer, @ptrCast(window), &swapchain_texture, &width, &height);
+        stats.swapchain_texture_acquire_ns +|= elapsedNs(swapchain_texture_acquire_start);
+        if (!swapchain_acquired) return error.SdlGpuSwapchainFailed;
         const texture = swapchain_texture orelse {
             if (!c.SDL_CancelGPUCommandBuffer(command_buffer)) return error.SdlGpuSubmitFailed;
             self.last_frame_stats = stats;
