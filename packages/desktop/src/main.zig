@@ -1233,12 +1233,13 @@ fn recentSectionStats() SectionStats {
 
 fn logSdlGpuFrameStats(stats: palette.renderer.FrameStats) void {
     runtime_log.diagnostic(
-        "sdlgpu-stage text_cache_rotate_ms={d:.2} text_cache_retire_ms={d:.2}/{d} swapchain_acquire_ms={d:.2} batch_build_ms={d:.2} solid_upload_ms={d:.2} image_prepare_ms={d:.2} image_upload_ms={d:.2} browser_upload_ms={d:.2} text_prepare_ms={d:.2} text_upload_ms={d:.2} render_encode_ms={d:.2} submit_present_ms={d:.2} commands={d} text_draws={d} image_draws={d} image_uploads={d}/{d} browser_uploads={d}/{d} visible_texture_uploads={d} deferred_texture_uploads={d}/{d}",
+        "sdlgpu-stage text_cache_rotate_ms={d:.2} text_cache_retire_ms={d:.2}/{d} command_buffer_acquire_ms={d:.2} swapchain_texture_acquire_ms={d:.2} batch_build_ms={d:.2} solid_upload_ms={d:.2} image_prepare_ms={d:.2} image_upload_ms={d:.2} browser_upload_ms={d:.2} text_prepare_ms={d:.2} text_upload_ms={d:.2} render_encode_ms={d:.2} submit_present_ms={d:.2} commands={d} text_draws={d} image_draws={d} image_uploads={d}/{d} browser_uploads={d}/{d} visible_texture_uploads={d} deferred_texture_uploads={d}/{d}",
         .{
             profiler.nsToMs(stats.text_cache_rotate_ns),
             profiler.nsToMs(stats.text_cache_retire_ns),
             stats.text_cache_retired_count,
-            profiler.nsToMs(stats.swapchain_acquire_ns),
+            profiler.nsToMs(stats.command_buffer_acquire_ns),
+            profiler.nsToMs(stats.swapchain_texture_acquire_ns),
             profiler.nsToMs(stats.batch_build_ns),
             profiler.nsToMs(stats.solid_upload_ns),
             profiler.nsToMs(stats.image_prepare_ns),
@@ -1264,7 +1265,7 @@ fn logSdlGpuFrameStats(stats: palette.renderer.FrameStats) void {
 
 fn logWorkspaceSwitchSdlGpuFrameStats(trace: native_state.WorkspaceSwitchTrace, stats: palette.renderer.FrameStats) void {
     runtime_log.diagnostic(
-        "workspace-switch-trace seq={d} stage=sdlgpu_stages target_index={d} attempt={d} text_cache_rotate_ms={d:.2} text_cache_retire_ms={d:.2}/{d} swapchain_acquire_ms={d:.2} batch_build_ms={d:.2} solid_upload_ms={d:.2} image_prepare_ms={d:.2} image_upload_ms={d:.2} browser_upload_ms={d:.2} text_prepare_ms={d:.2} text_upload_ms={d:.2} render_encode_ms={d:.2} submit_present_ms={d:.2} commands={d} text_draws={d} image_draws={d} visible_texture_uploads={d} deferred_texture_uploads={d}/{d}",
+        "workspace-switch-trace seq={d} stage=sdlgpu_stages target_index={d} attempt={d} text_cache_rotate_ms={d:.2} text_cache_retire_ms={d:.2}/{d} command_buffer_acquire_ms={d:.2} swapchain_texture_acquire_ms={d:.2} batch_build_ms={d:.2} solid_upload_ms={d:.2} image_prepare_ms={d:.2} image_upload_ms={d:.2} browser_upload_ms={d:.2} text_prepare_ms={d:.2} text_upload_ms={d:.2} render_encode_ms={d:.2} submit_present_ms={d:.2} commands={d} text_draws={d} image_draws={d} visible_texture_uploads={d} deferred_texture_uploads={d}/{d}",
         .{
             trace.sequence,
             trace.target_index,
@@ -1272,7 +1273,8 @@ fn logWorkspaceSwitchSdlGpuFrameStats(trace: native_state.WorkspaceSwitchTrace, 
             profiler.nsToMs(stats.text_cache_rotate_ns),
             profiler.nsToMs(stats.text_cache_retire_ns),
             stats.text_cache_retired_count,
-            profiler.nsToMs(stats.swapchain_acquire_ns),
+            profiler.nsToMs(stats.command_buffer_acquire_ns),
+            profiler.nsToMs(stats.swapchain_texture_acquire_ns),
             profiler.nsToMs(stats.batch_build_ns),
             profiler.nsToMs(stats.solid_upload_ns),
             profiler.nsToMs(stats.image_prepare_ns),
@@ -1297,7 +1299,8 @@ fn logSlowSdlGpuFrameStages(stats: palette.renderer.FrameStats) void {
     const stages = [_]Stage{
         .{ .name = "text cache rotate", .elapsed_ns = stats.text_cache_rotate_ns },
         .{ .name = "text cache retire", .elapsed_ns = stats.text_cache_retire_ns },
-        .{ .name = "swapchain acquire", .elapsed_ns = stats.swapchain_acquire_ns },
+        .{ .name = "command buffer acquire", .elapsed_ns = stats.command_buffer_acquire_ns },
+        .{ .name = "swapchain texture acquire", .elapsed_ns = stats.swapchain_texture_acquire_ns },
         .{ .name = "batch build", .elapsed_ns = stats.batch_build_ns },
         .{ .name = "solid upload", .elapsed_ns = stats.solid_upload_ns },
         .{ .name = "image prepare", .elapsed_ns = stats.image_prepare_ns },
