@@ -1798,13 +1798,20 @@ fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, ex
     const status = args.optionValue(argv, "--status");
     const label = args.optionValue(argv, "--label");
     const persisted_status = if (status) |value| std.meta.stringToEnum(db_types.SurfaceStatus, value) else null;
+    const changed_at_ms = unixTimestampMs();
+    const status_value: db_types.SurfaceStatus = persisted_status orelse .idle;
+    var store_request_key: ?[]u8 = null;
+    defer if (store_request_key) |value| allocator.free(value);
+    var store_write: ?headless.store.WriteResult = null;
 
     // Phase 3: surface durability is daemon-routed. Offline direct-writer
     // fallback is intentionally removed; auto-start failure is a structured error.
     if (clear or persisted_status != null) {
-        const changed_at_ms = unixTimestampMs();
-        const status_value: db_types.SurfaceStatus = persisted_status orelse .idle;
-        persistSurfaceStateViaDaemon(allocator, io, exe_path, .{
+        store_request_key = try std.fmt.allocPrint(allocator, "cli:notify:{s}:{d}", .{
+            session_id,
+            changed_at_ms,
+        });
+        store_write = persistSurfaceStateViaDaemon(allocator, io, exe_path, store_request_key.?, .{
             .session_id = session_id,
             .workspace_id = workspace_id orelse "",
             .workspace_path = workspace_path orelse "",
@@ -1840,12 +1847,19 @@ fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, ex
         .dock_id = dock_id,
         .pane_id = pane_id,
         .provider = provider,
+        .provider_thread_id = getenvSlice("VERDE_PROVIDER_THREAD_ID"),
         .title = title,
         .body = body,
         .status = status,
         .progress = parseOptionalF32(args.optionValue(argv, "--progress")),
         .label = label,
         .attention = if (args.hasFlag(argv, "--attention")) true else null,
+        // Live suppresses its normal durable leg only after matching this
+        // exact mutation fingerprint to the daemon's committed receipt.
+        .store_request_key = store_request_key,
+        .store_revision = if (store_write) |write| write.store_revision else null,
+        .store_status_changed_at_ms = if (store_write != null) changed_at_ms else null,
+        .store_completed_at_ms = if (store_write != null and status_value == .done) changed_at_ms else if (store_write != null) @as(i64, 0) else null,
     }, 1) catch |err| {
         // Live GUI notification is best-effort after durable store write.
         if (!args.hasFlag(argv, "--quiet")) {
@@ -1878,9 +1892,10 @@ fn persistSurfaceStateViaDaemon(
     allocator: std.mem.Allocator,
     io: std.Io,
     exe_path: []const u8,
+    request_key: []const u8,
     record: db_types.PersistedSurfaceState,
     clear: bool,
-) !void {
+) !headless.store.WriteResult {
     const pref_path = try prefPath(allocator);
     defer allocator.free(pref_path);
     try ensureSessionDaemon(allocator, io, exe_path);
@@ -1900,10 +1915,6 @@ fn persistSurfaceStateViaDaemon(
     if (registered.response.err) |_| return error.SessionDaemonUnavailable;
     const client_id = (try client.decodeClientRegister(&registered)).client_id;
 
-    const request_key = try std.fmt.allocPrint(arena, "cli:notify:{s}:{d}", .{
-        record.session_id,
-        unixTimestampMs(),
-    });
     const mutation: headless.store.MutationHeader = .{
         .request_key = request_key,
         .client_id = client_id,
@@ -1917,8 +1928,7 @@ fn persistSurfaceStateViaDaemon(
         var parsed = try client.call(headless.store.METHOD_SURFACE_CLEAR, request);
         defer parsed.deinit();
         if (parsed.response.err) |_| return error.StoreMutationFailed;
-        _ = try client.decodeWriteResult(&parsed);
-        return;
+        return try client.decodeWriteResult(&parsed);
     }
 
     const provider_name: ?[]const u8 = if (record.provider) |p| @tagName(p) else null;
@@ -1943,7 +1953,7 @@ fn persistSurfaceStateViaDaemon(
     var parsed = try client.call(headless.store.METHOD_SURFACE_UPSERT, request);
     defer parsed.deinit();
     if (parsed.response.err) |_| return error.StoreMutationFailed;
-    _ = try client.decodeWriteResult(&parsed);
+    return try client.decodeWriteResult(&parsed);
 }
 
 /// Strict read-only state open for CLI inspection; never initializes schema.

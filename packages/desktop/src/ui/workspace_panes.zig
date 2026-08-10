@@ -10,6 +10,7 @@ const palette = @import("palette");
 const sdl = @import("zsdl3");
 
 const app_config = @import("../app/config.zig");
+const storage_mod = @import("../state/storage.zig");
 const workspace_layout = @import("../state/workspace_layout.zig");
 const runtime = @import("runtime.zig");
 const browser_panel = @import("browser.zig");
@@ -1215,17 +1216,19 @@ fn renderScrollingStrip(
     if (layout.focused_pane_id) |focused_id| {
         if (layout.rootContainsPane(focused_id) and layout.scroll_revealed_pane_id != focused_id) {
             if (paneIndexInSidebarOrder(layout, focused_id)) |focused_index| {
-                const next_target = if (layout.scroll_leading_pane_id == focused_id)
+                const revealed_target = revealedScrollTarget(
+                    target.*,
+                    viewport_extent,
+                    pane_extent,
+                    gap,
+                    focused_index,
+                    max_offset,
+                );
+                const actually_offscreen = @abs(revealed_target - target.*) > 0.001;
+                const next_target = if (layout.scroll_leading_pane_id == focused_id and actually_offscreen)
                     leadingScrollTarget(pane_extent, gap, focused_index, max_offset)
                 else
-                    revealedScrollTarget(
-                        target.*,
-                        viewport_extent,
-                        pane_extent,
-                        gap,
-                        focused_index,
-                        max_offset,
-                    );
+                    revealed_target;
                 setScrollingTarget(state, target, &layout.scroll_animation_last_ms, next_target);
             }
             layout.scroll_leading_pane_id = null;
@@ -2126,6 +2129,220 @@ test "scrolling focus reveal moves only enough to expose the column" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), revealedScrollTarget(0.0, viewport_w, column_w, gap, 0, max_offset), 0.0001);
     try std.testing.expectApproxEqAbs(max_offset, revealedScrollTarget(0.0, viewport_w, column_w, gap, 1, max_offset), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), revealedScrollTarget(max_offset, viewport_w, column_w, gap, 0, max_offset), 0.0001);
+}
+
+test "current horizontal render preserves visible activation and reveals after pre-render resize" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer {
+        state.lifecycle.clearDirty();
+        state.deinit();
+    }
+
+    for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+    state.project_controller.projects.clearRetainingCapacity();
+    state.lifecycle.clearDirty();
+
+    var project = try runtime.Project.init(allocator, "render-a", "Render A", "/tmp/render-a", 0);
+    const second_thread = try project.addThread(allocator);
+    const second_pane = try project.workspace_layout.createChatPane(allocator, second_thread);
+    try project.workspace_layout.splitPaneWithLeaf(allocator, 1, second_pane, .horizontal, true);
+    try std.testing.expect(project.workspace_layout.resizeSplit(1, second_pane, .horizontal, 0.37));
+    const third_thread = try project.addThread(allocator);
+    const third_pane = try project.workspace_layout.createChatPane(allocator, third_thread);
+    try project.workspace_layout.splitPaneWithLeaf(allocator, second_pane, third_pane, .vertical, true);
+    try std.testing.expect(project.workspace_layout.resizeSplit(second_pane, third_pane, .vertical, 0.61));
+    project.workspace_layout.focused_pane_id = second_pane;
+    project.workspace_layout.maximized_pane_id = second_pane;
+    project.workspace_layout.scroll_offset_x = 73.25;
+    project.workspace_layout.scroll_target_x = 73.25;
+    project.workspace_layout.scroll_offset_y = 19.5;
+    project.workspace_layout.scroll_target_y = 19.5;
+    project.workspace_layout.scroll_mode_override = .always;
+    project.workspace_layout.scroll_pane_extent_override = 620.0;
+    project.workspace_layout.scroll_pane_extent_ratio_override = 0.30;
+    const persisted = try project.workspace_layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(persisted);
+    try project.workspace_layout.applyPersistedWorkspaceJson(allocator, persisted);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    var away = try runtime.Project.init(allocator, "render-b", "Render B", "/tmp/render-b", 0);
+    state.project_controller.projects.append(allocator, away) catch |err| {
+        away.deinit(allocator);
+        return err;
+    };
+    state.project_controller.selected_index = 0;
+
+    const wide: palette.Rect = .{ .x = 31.0, .y = 47.0, .w = 1400.0, .h = 780.0 };
+    const narrow: palette.Rect = .{ .x = 31.0, .y = 47.0, .w = 200.0, .h = 780.0 };
+    const layout = &state.project_controller.projects.items[0].workspace_layout;
+
+    // Maximize transfer is presentation-only and does not disturb the saved
+    // asymmetric tree or either viewport axis.
+    renderAt(&state, wide);
+    state.selectThreadForProject(0, third_thread);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, third_pane), layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_target_x);
+    try std.testing.expectEqual(@as(f32, 19.5), layout.scroll_target_y);
+    layout.maximized_pane_id = null;
+    state.selectThreadForProject(0, second_thread);
+    layout.scroll_revealed_pane_id = second_pane;
+
+    // Fully visible A -> B -> A activations preserve exact offsets and targets
+    // because the current renderer's bounded reveal computes no movement.
+    renderAt(&state, wide);
+    state.selectThreadForProject(0, third_thread);
+    renderAt(&state, wide);
+    state.selectThreadForProject(0, second_thread);
+    renderAt(&state, wide);
+    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_offset_x);
+    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_target_x);
+    try std.testing.expectEqual(@as(f32, 19.5), layout.scroll_offset_y);
+    try std.testing.expectEqual(@as(f32, 19.5), layout.scroll_target_y);
+
+    // Away/back at the same geometry is equally presentation-idempotent.
+    state.project_controller.selected_index = 1;
+    state.selectThreadForProject(0, third_thread);
+    renderAt(&state, wide);
+    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_target_x);
+    try std.testing.expectEqual(@as(f32, 19.5), layout.scroll_target_y);
+
+    // Even an explicit leading request is inert when the current viewport
+    // already contains the target completely.
+    layout.requestLeadingScrollReveal(third_pane);
+    renderAt(&state, wide);
+    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_target_x);
+
+    // Focus B at the wide size, then switch away. Activate C after the window
+    // narrows but before A's next render. Only that next current-size render
+    // owns the bounded reveal decision.
+    state.selectThreadForProject(0, second_thread);
+    renderAt(&state, wide);
+    state.project_controller.selected_index = 1;
+    state.selectThreadForProject(0, third_thread);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, second_pane), layout.scroll_revealed_pane_id);
+    renderAt(&state, narrow);
+
+    const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
+    const pane_extent = responsiveScrollingPaneExtent(
+        narrow.w,
+        gap,
+        state.app_config.workspace_panes_per_view,
+        layout.scroll_pane_extent_override,
+        layout.scroll_pane_extent_ratio_override,
+        theme.uiScaleFactor(),
+    );
+    const max_offset = scrollingMaxOffset(narrow.w, pane_extent, gap, layout.visiblePaneCount());
+    const expected_target = revealedScrollTarget(73.25, narrow.w, pane_extent, gap, 2, max_offset);
+    try std.testing.expectApproxEqAbs(expected_target, layout.scroll_target_x, 0.0001);
+    try std.testing.expect(layout.scroll_target_x > 73.25);
+    try std.testing.expect(layout.scroll_target_x <= max_offset);
+    try std.testing.expect(layout.scroll_offset_x >= 0.0 and layout.scroll_offset_x <= max_offset);
+    try std.testing.expectEqual(@as(f32, 19.5), layout.scroll_target_y);
+    switch (layout.root.?.*) {
+        .split => |split| try std.testing.expectApproxEqAbs(@as(f32, 0.37), split.ratio, 0.0001),
+        .leaf => return error.TestExpectedEqual,
+    }
+}
+
+test "current vertical render reveals after pre-render resize" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var config: app_config.AppConfig = .{};
+    config.workspace_scroll_direction = .vertical;
+    var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try runtime.AppState.init(allocator, &storage, config, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer {
+        state.lifecycle.clearDirty();
+        state.deinit();
+    }
+
+    for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+    state.project_controller.projects.clearRetainingCapacity();
+    state.lifecycle.clearDirty();
+
+    var project = try runtime.Project.init(allocator, "render-vertical", "Render vertical", "/tmp/render-vertical", 0);
+    const second_thread = try project.addThread(allocator);
+    const second_pane = try project.workspace_layout.createChatPane(allocator, second_thread);
+    try project.workspace_layout.splitPaneWithLeaf(allocator, 1, second_pane, .horizontal, true);
+    try std.testing.expect(project.workspace_layout.resizeSplit(1, second_pane, .horizontal, 0.38));
+    const third_thread = try project.addThread(allocator);
+    const third_pane = try project.workspace_layout.createChatPane(allocator, third_thread);
+    try project.workspace_layout.splitPaneWithLeaf(allocator, second_pane, third_pane, .vertical, true);
+    try std.testing.expect(project.workspace_layout.resizeSplit(second_pane, third_pane, .vertical, 0.62));
+    project.workspace_layout.focused_pane_id = second_pane;
+    project.workspace_layout.scroll_offset_x = 41.0;
+    project.workspace_layout.scroll_target_x = 41.0;
+    project.workspace_layout.scroll_offset_y = 19.5;
+    project.workspace_layout.scroll_target_y = 19.5;
+    project.workspace_layout.scroll_mode_override = .always;
+    project.workspace_layout.scroll_pane_extent_override = 620.0;
+    project.workspace_layout.scroll_pane_extent_ratio_override = 0.30;
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    var away = try runtime.Project.init(allocator, "render-vertical-away", "Away", "/tmp/render-vertical-away", 0);
+    state.project_controller.projects.append(allocator, away) catch |err| {
+        away.deinit(allocator);
+        return err;
+    };
+    state.project_controller.selected_index = 0;
+
+    const tall: palette.Rect = .{ .x = 31.0, .y = 47.0, .w = 780.0, .h = 1400.0 };
+    const short: palette.Rect = .{ .x = 31.0, .y = 47.0, .w = 780.0, .h = 200.0 };
+    const layout = &state.project_controller.projects.items[0].workspace_layout;
+
+    renderAt(&state, tall);
+    state.selectThreadForProject(0, third_thread);
+    renderAt(&state, tall);
+    state.selectThreadForProject(0, second_thread);
+    renderAt(&state, tall);
+    try std.testing.expectEqual(@as(f32, 41.0), layout.scroll_target_x);
+    try std.testing.expectEqual(@as(f32, 19.5), layout.scroll_target_y);
+
+    state.project_controller.selected_index = 1;
+    state.selectThreadForProject(0, third_thread);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, second_pane), layout.scroll_revealed_pane_id);
+    renderAt(&state, short);
+
+    const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
+    const pane_extent = responsiveScrollingPaneExtent(
+        short.h,
+        gap,
+        state.app_config.workspace_panes_per_view,
+        layout.scroll_pane_extent_override,
+        layout.scroll_pane_extent_ratio_override,
+        theme.uiScaleFactor(),
+    );
+    const max_offset = scrollingMaxOffset(short.h, pane_extent, gap, layout.visiblePaneCount());
+    const expected_target = revealedScrollTarget(19.5, short.h, pane_extent, gap, 2, max_offset);
+    try std.testing.expectApproxEqAbs(expected_target, layout.scroll_target_y, 0.0001);
+    try std.testing.expect(layout.scroll_target_y > 19.5);
+    try std.testing.expect(layout.scroll_target_y <= max_offset);
+    try std.testing.expectEqual(@as(f32, 41.0), layout.scroll_target_x);
+    switch (layout.root.?.*) {
+        .split => |split| try std.testing.expectApproxEqAbs(@as(f32, 0.38), split.ratio, 0.0001),
+        .leaf => return error.TestExpectedEqual,
+    }
 }
 
 test "scrolling pane extent fits the configured panes per view" {

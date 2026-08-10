@@ -1,7 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const headless = @import("headless");
 
 const app_state = @import("../state.zig");
+const state_storage = @import("../state/storage.zig");
 const browser_runtime = @import("../browser/mod.zig");
 const browser_ui = @import("../ui/browser.zig");
 const command_palette = @import("../ui/command_palette.zig");
@@ -768,6 +770,53 @@ fn notificationUpdateResponse(allocator: std.mem.Allocator, id_value: std.json.V
         return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid surface status") else null;
     const status_requests_attention = if (status) |value| value == .waiting or value == .@"error" else false;
     const requested_attention = boolParam(params, "attention") orelse if (status_requests_attention) true else null;
+    const proof = surfaceCommitProof(params);
+    const status_changed_at_ms = intParam(params, "store_status_changed_at_ms");
+    const completed_at_ms = intParam(params, "store_completed_at_ms");
+    const durability: app_state.SurfaceDurability = if (proof) |commit_proof| verified: {
+        const status_value = status orelse break :verified .durable;
+        if (status_changed_at_ms == null or completed_at_ms == null) break :verified .durable;
+        if (status_value == .idle) {
+            switch (state.storage.classifySurfaceClearCommitProof(commit_proof, session_id) catch .invalid) {
+                .current => break :verified .presentation_only,
+                .superseded => return try supersededSurfaceResponse(allocator, id_value, session_id),
+                .invalid => break :verified .durable,
+            }
+        }
+        const provider_value = if (stringParam(params, "provider")) |value|
+            if (parseSurfaceProvider(value)) |parsed| @tagName(parsed) else null
+        else
+            null;
+        const durable_surface: headless.store.SurfaceState = .{
+            .session_id = session_id,
+            .workspace_id = stringParam(params, "workspace_id") orelse stringParam(params, "workspace") orelse "",
+            .workspace_path = stringParam(params, "workspace_path") orelse "",
+            .dock_id = u32Param(params, "dock_id") orelse u32Param(params, "dock") orelse 0,
+            .pane_id = u32Param(params, "pane_id") orelse u32Param(params, "pane"),
+            .provider = provider_value,
+            .provider_thread_id = stringParam(params, "provider_thread_id"),
+            .title = stringParam(params, "label") orelse stringParam(params, "title") orelse "",
+            .status = @tagName(status_value),
+            .status_changed_at_ms = status_changed_at_ms.?,
+            .completed_at_ms = completed_at_ms.?,
+            .last_event_title = stringParam(params, "title") orelse stringParam(params, "label"),
+            .last_event_body = stringParam(params, "body"),
+        };
+        switch (state.storage.classifySurfaceUpsertCommitProof(commit_proof, durable_surface) catch .invalid) {
+            .current => {
+                // Focus acknowledgement clears presentation before its
+                // targeted Store clear finishes. Replaying that exact receipt
+                // must not resurrect the completion during this window.
+                const canonical = state_storage.protocolSurfaceToPersisted(durable_surface) orelse break :verified .durable;
+                if (status_value == .done and state.containsSurfaceCompletionAcknowledgement(canonical)) {
+                    return try supersededSurfaceResponse(allocator, id_value, session_id);
+                }
+                break :verified .presentation_only;
+            },
+            .superseded => return try supersededSurfaceResponse(allocator, id_value, session_id),
+            .invalid => break :verified .durable,
+        }
+    } else .durable;
     const surface = try state.updateSurface(.{
         .session_id = session_id,
         .workspace_id = stringParam(params, "workspace_id") orelse stringParam(params, "workspace"),
@@ -783,6 +832,9 @@ fn notificationUpdateResponse(allocator: std.mem.Allocator, id_value: std.json.V
         .unread_increment = if (requested_attention orelse false) 1 else 0,
         .last_event_title = stringParam(params, "title") orelse stringParam(params, "label"),
         .last_event_body = stringParam(params, "body"),
+        .status_changed_at_ms = if (durability == .presentation_only) status_changed_at_ms else null,
+        .completed_at_ms = if (durability == .presentation_only) completed_at_ms else null,
+        .durability = durability,
     });
     return try surfaceResultResponse(allocator, id_value, surface);
 }
@@ -790,7 +842,18 @@ fn notificationUpdateResponse(allocator: std.mem.Allocator, id_value: std.json.V
 fn notificationClearResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
     const session_id = stringParam(params, "session_id") orelse stringParam(params, "session") orelse
         return try errorResponseAlloc(allocator, id_value, "invalid_request", "notification.clear requires session_id");
-    const surface = try state.updateSurface(.{ .session_id = session_id, .clear = true });
+    const durability: app_state.SurfaceDurability = if (surfaceCommitProof(params)) |proof| classified: {
+        switch (state.storage.classifySurfaceClearCommitProof(proof, session_id) catch .invalid) {
+            .current => break :classified .presentation_only,
+            .superseded => return try supersededSurfaceResponse(allocator, id_value, session_id),
+            .invalid => break :classified .durable,
+        }
+    } else .durable;
+    const surface = try state.updateSurface(.{
+        .session_id = session_id,
+        .clear = true,
+        .durability = durability,
+    });
     return try surfaceResultResponse(allocator, id_value, surface);
 }
 
@@ -3059,6 +3122,24 @@ fn surfaceResultResponse(allocator: std.mem.Allocator, id_value: std.json.Value,
     return try writer.toOwnedSlice();
 }
 
+fn supersededSurfaceResponse(allocator: std.mem.Allocator, id_value: std.json.Value, session_id: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&s, id_value);
+    try s.objectField("result");
+    try s.beginObject();
+    try s.objectField("session_id");
+    try s.write(session_id);
+    try s.objectField("ignored");
+    try s.write(true);
+    try s.objectField("superseded");
+    try s.write(true);
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
 fn resolveSurfaceProjectIndex(state: *const app_state.AppState, surface: *const app_state.SurfaceState) ?usize {
     for (state.project_controller.projects.items, 0..) |project, index| {
         if (surface.workspace_id.len > 0 and std.mem.eql(u8, surface.workspace_id, project.id)) return index;
@@ -3306,6 +3387,19 @@ fn u32Param(params: std.json.Value, name: []const u8) ?u32 {
     const value = intParam(params, name) orelse return null;
     if (value < 0 or value > std.math.maxInt(u32)) return null;
     return @intCast(value);
+}
+
+fn u64Param(params: std.json.Value, name: []const u8) ?u64 {
+    const value = intParam(params, name) orelse return null;
+    if (value < 0) return null;
+    return @intCast(value);
+}
+
+fn surfaceCommitProof(params: std.json.Value) ?app_state.SurfaceCommitProof {
+    return .{
+        .request_key = stringParam(params, "store_request_key") orelse return null,
+        .store_revision = u64Param(params, "store_revision") orelse return null,
+    };
 }
 
 fn floatParam(params: std.json.Value, name: []const u8) ?f32 {
@@ -4111,4 +4205,318 @@ test "terminal key command rejects non-terminal targets and invalid keys" {
     defer parsed_invalid_key.deinit();
     const invalid_key_error = parsed_invalid_key.value.object.get("error").?.object;
     try std.testing.expectEqualStrings("invalid_key", jsonString(invalid_key_error.get("code").?).?);
+}
+
+test "pane close response matches the next durable projection" {
+    const allocator = std.testing.allocator;
+    const daemon_store = @import("../daemon/store.zig");
+    const db_client = @import("../db/client.zig");
+    const persistence = @import("../state/persistence.zig");
+
+    var state: app_state.AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 1;
+    state.lifecycle = .{};
+    @memset(&state.sidebar_notice_storage, 0);
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+
+    var target = try app_state.Project.init(allocator, "close-target", "Close target", "/tmp/close-target", 0);
+    const second_thread_index = try target.addThread(allocator);
+    const closed_pane_id = try target.workspace_layout.createChatPane(allocator, second_thread_index);
+    try target.workspace_layout.splitPaneWithLeaf(allocator, 1, closed_pane_id, .horizontal, true);
+    state.project_controller.projects.append(allocator, target) catch |err| {
+        target.deinit(allocator);
+        return err;
+    };
+    var selected = try app_state.Project.init(allocator, "selected", "Selected", "/tmp/selected", 0);
+    state.project_controller.projects.append(allocator, selected) catch |err| {
+        selected.deinit(allocator);
+        return err;
+    };
+
+    const params_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"workspace\":\"close-target\",\"pane\":{d}}}",
+        .{closed_pane_id},
+    );
+    defer allocator.free(params_json);
+    var params = try std.json.parseFromSlice(std.json.Value, allocator, params_json, .{});
+    defer params.deinit();
+    const response_id: std.json.Value = .{ .integer = 77 };
+    const close_response = try paneCommandResponse(allocator, response_id, &state, params.value, "close");
+    defer allocator.free(close_response);
+
+    var captured = try persistence.buildSnapshot(.{
+        .projects = state.project_controller.projects.items,
+        .archived_projects = &.{},
+        .selected_project_index = state.project_controller.selected_index,
+        .sidebar_collapsed = false,
+    }, allocator);
+    defer captured.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const pref_path = path_buf[0..path_len];
+    const db_path = try std.fs.path.joinZ(allocator, &.{ pref_path, db_client.STATE_DB_NAME });
+    defer allocator.free(db_path);
+    var store = try daemon_store.Store.init(allocator, db_path);
+    defer store.deinit();
+    var protocol_arena = std.heap.ArenaAllocator.init(allocator);
+    defer protocol_arena.deinit();
+    const protocol_snapshot = try persistence.persistedStateToProtocolSnapshot(protocol_arena.allocator(), captured.value, 0);
+    const write = try store.replaceSnapshot(.{
+        .mutation = .{
+            .request_key = "pane-close-projection",
+            .client_id = "pane-close-test-client",
+            .expected_store_revision = 0,
+        },
+        .snapshot = protocol_snapshot,
+        .bootstrap = false,
+    });
+    try std.testing.expect(write.applied);
+
+    var reader = try db_client.Client.initReadOnly(allocator, pref_path);
+    defer reader.deinit();
+    var reloaded = (try reader.load(allocator)).?;
+    defer reloaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), reloaded.value.selected_project_index);
+    const layout_json = reloaded.value.projects[0].workspace_layout_json orelse return error.TestExpectedEqual;
+    try state.project_controller.projects.items[0].workspace_layout.applyPersistedWorkspaceJson(allocator, layout_json);
+    const projection_response = try panesResponseForProject(allocator, response_id, &state, 0);
+    defer allocator.free(projection_response);
+    try std.testing.expectEqualStrings(close_response, projection_response);
+}
+
+test "surface receipt proof is current while superseded delivery is inert" {
+    const allocator = std.testing.allocator;
+    const daemon_store = @import("../daemon/store.zig");
+    const db_client = @import("../db/client.zig");
+    const persistence = @import("../state/persistence.zig");
+    const storage_mod = @import("../state/storage.zig");
+    const app_config = @import("../app/config.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const pref_path = path_buf[0..path_len];
+    const db_path = try std.fs.path.joinZ(allocator, &.{ pref_path, db_client.STATE_DB_NAME });
+    defer allocator.free(db_path);
+    var store = try daemon_store.Store.init(allocator, db_path);
+    defer store.deinit();
+
+    var project = try app_state.Project.init(allocator, "live-proof", "Live proof", "/tmp/live-proof", 0);
+    defer project.deinit(allocator);
+    project.threads.items[0].committed = true;
+    const projects = [_]app_state.Project{project};
+    var captured = try persistence.buildSnapshot(.{
+        .projects = &projects,
+        .archived_projects = &.{},
+        .selected_project_index = 0,
+        .sidebar_collapsed = false,
+    }, allocator);
+    defer captured.deinit();
+    var protocol_arena = std.heap.ArenaAllocator.init(allocator);
+    defer protocol_arena.deinit();
+    const protocol_snapshot = try persistence.persistedStateToProtocolSnapshot(protocol_arena.allocator(), captured.value, 0);
+    const snapshot_write = try store.replaceSnapshot(.{
+        .mutation = .{
+            .request_key = "live-proof-snapshot",
+            .client_id = "live-proof-client",
+            .expected_store_revision = 0,
+        },
+        .snapshot = protocol_snapshot,
+        .bootstrap = false,
+    });
+    try std.testing.expectEqual(@as(u64, 1), snapshot_write.store_revision);
+
+    const durable_surface: headless.store.SurfaceState = .{
+        .session_id = "live-proof-session",
+        .workspace_id = "live-proof",
+        .workspace_path = "/tmp/live-proof",
+        .dock_id = 7,
+        .pane_id = 2,
+        .provider = "codex",
+        .provider_thread_id = "provider-thread-proof",
+        .title = "Receipt surface",
+        .status = "done",
+        .status_changed_at_ms = 100,
+        .completed_at_ms = 100,
+        .last_event_title = "Ran command",
+        .last_event_body = "exact body",
+    };
+    const upsert_write = try store.upsertSurface(.{
+        .mutation = .{
+            .request_key = "cli-live-upsert",
+            .client_id = "live-proof-client",
+            .expected_store_revision = 1,
+        },
+        .surface = durable_surface,
+    });
+    try std.testing.expectEqual(@as(u64, 2), upsert_write.store_revision);
+
+    var storage = try storage_mod.Storage.initWithPrefPath(allocator, pref_path);
+    defer storage.deinit();
+    var state = try app_state.AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer {
+        state.lifecycle.clearDirty();
+        state.deinit();
+    }
+    try std.testing.expectEqual(app_state.SurfaceCommitProofClassification.current, try storage.classifySurfaceUpsertCommitProof(.{
+        .request_key = "cli-live-upsert",
+        .store_revision = 2,
+    }, durable_surface));
+    var spoofed_surface = durable_surface;
+    spoofed_surface.title = "spoofed";
+    try std.testing.expectEqual(app_state.SurfaceCommitProofClassification.invalid, try storage.classifySurfaceUpsertCommitProof(.{
+        .request_key = "cli-live-upsert",
+        .store_revision = 2,
+    }, spoofed_surface));
+    try std.testing.expectEqual(app_state.SurfaceCommitProofClassification.invalid, try storage.classifySurfaceUpsertCommitProof(.{
+        .request_key = "cli-live-upsert",
+        .store_revision = 99,
+    }, durable_surface));
+    try std.testing.expectEqual(app_state.SurfaceCommitProofClassification.invalid, try storage.classifySurfaceUpsertCommitProof(.{
+        .request_key = "missing-receipt",
+        .store_revision = 2,
+    }, durable_surface));
+
+    var update_params = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"session_id":"live-proof-session","workspace_id":"live-proof","workspace_path":"/tmp/live-proof","dock_id":7,"pane_id":2,"provider":"codex","provider_thread_id":"provider-thread-proof","label":"Receipt surface","title":"Ran command","body":"exact body","status":"done","store_request_key":"cli-live-upsert","store_revision":2,"store_status_changed_at_ms":100,"store_completed_at_ms":100}
+    , .{});
+    defer update_params.deinit();
+    const update_response = try notificationUpdateResponse(allocator, .{ .integer = 90 }, &state, update_params.value);
+    defer allocator.free(update_response);
+    var parsed_update = try std.json.parseFromSlice(std.json.Value, allocator, update_response, .{});
+    defer parsed_update.deinit();
+    try std.testing.expect(parsed_update.value.object.get("ok").?.bool);
+    try std.testing.expectEqual(@as(u64, 2), try store.storeRevision());
+    const presented = state.surfaceBySessionIdConst("live-proof-session") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(app_state.SurfaceStatus.done, presented.status);
+    try std.testing.expectEqual(@as(i64, 100), presented.status_changed_at_ms);
+    try std.testing.expect(presented.completion_pending);
+    try std.testing.expectEqual(@as(i64, 100), presented.completed_at_ms);
+
+    // Repeating the still-current done receipt does not change the durable
+    // revision or recreate completion state.
+    const repeated_response = try notificationUpdateResponse(allocator, .{ .integer = 91 }, &state, update_params.value);
+    defer allocator.free(repeated_response);
+    try std.testing.expectEqual(@as(u64, 2), try store.storeRevision());
+    try std.testing.expect(state.surfaceBySessionIdConst("live-proof-session").?.completion_pending);
+    try std.testing.expectEqual(@as(i64, 100), state.surfaceBySessionIdConst("live-proof-session").?.completed_at_ms);
+
+    const clear_write = try store.clearSurface(.{
+        .mutation = .{
+            .request_key = "cli-live-clear",
+            .client_id = "live-proof-client",
+            .expected_store_revision = 2,
+        },
+        .session_id = "live-proof-session",
+    });
+    try std.testing.expectEqual(@as(u64, 3), clear_write.store_revision);
+    try std.testing.expectEqual(app_state.SurfaceCommitProofClassification.current, try storage.classifySurfaceClearCommitProof(.{
+        .request_key = "cli-live-clear",
+        .store_revision = 3,
+    }, "live-proof-session"));
+    try std.testing.expectEqual(app_state.SurfaceCommitProofClassification.invalid, try storage.classifySurfaceClearCommitProof(.{
+        .request_key = "cli-live-clear",
+        .store_revision = 3,
+    }, "different-session"));
+
+    var clear_params = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"session_id":"live-proof-session","store_request_key":"cli-live-clear","store_revision":3}
+    , .{});
+    defer clear_params.deinit();
+    const clear_response = try notificationClearResponse(allocator, .{ .integer = 92 }, &state, clear_params.value);
+    defer allocator.free(clear_response);
+    var parsed_clear = try std.json.parseFromSlice(std.json.Value, allocator, clear_response, .{});
+    defer parsed_clear.deinit();
+    try std.testing.expect(parsed_clear.value.object.get("ok").?.bool);
+    try std.testing.expectEqual(@as(u64, 3), try store.storeRevision());
+    try std.testing.expectEqual(app_state.SurfaceStatus.idle, state.surfaceBySessionIdConst("live-proof-session").?.status);
+
+    // The old exact upsert receipt is historical after the clear. Delayed
+    // delivery is acknowledged as superseded without Store or presentation.
+    try std.testing.expectEqual(app_state.SurfaceCommitProofClassification.superseded, try storage.classifySurfaceUpsertCommitProof(.{
+        .request_key = "cli-live-upsert",
+        .store_revision = 2,
+    }, durable_surface));
+    const delayed_upsert = try notificationUpdateResponse(allocator, .{ .integer = 93 }, &state, update_params.value);
+    defer allocator.free(delayed_upsert);
+    var parsed_delayed_upsert = try std.json.parseFromSlice(std.json.Value, allocator, delayed_upsert, .{});
+    defer parsed_delayed_upsert.deinit();
+    try std.testing.expect(parsed_delayed_upsert.value.object.get("result").?.object.get("superseded").?.bool);
+    try std.testing.expectEqual(@as(u64, 3), try store.storeRevision());
+    try std.testing.expectEqual(app_state.SurfaceStatus.idle, state.surfaceBySessionIdConst("live-proof-session").?.status);
+    try std.testing.expect(!state.surfaceBySessionIdConst("live-proof-session").?.completion_pending);
+
+    var working_surface = durable_surface;
+    working_surface.status = "working";
+    working_surface.status_changed_at_ms = 200;
+    working_surface.completed_at_ms = 0;
+    const working_write = try store.upsertSurface(.{
+        .mutation = .{
+            .request_key = "cli-live-working",
+            .client_id = "live-proof-client",
+            .expected_store_revision = 3,
+        },
+        .surface = working_surface,
+    });
+    try std.testing.expectEqual(@as(u64, 4), working_write.store_revision);
+    var working_params = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"session_id":"live-proof-session","workspace_id":"live-proof","workspace_path":"/tmp/live-proof","dock_id":7,"pane_id":2,"provider":"codex","provider_thread_id":"provider-thread-proof","label":"Receipt surface","title":"Ran command","body":"exact body","status":"working","store_request_key":"cli-live-working","store_revision":4,"store_status_changed_at_ms":200,"store_completed_at_ms":0}
+    , .{});
+    defer working_params.deinit();
+    const working_response = try notificationUpdateResponse(allocator, .{ .integer = 94 }, &state, working_params.value);
+    defer allocator.free(working_response);
+    try std.testing.expectEqual(app_state.SurfaceStatus.working, state.surfaceBySessionIdConst("live-proof-session").?.status);
+    try std.testing.expectEqual(@as(u64, 4), try store.storeRevision());
+
+    // Conversely, the old clear receipt cannot hide the newer exact upsert.
+    try std.testing.expectEqual(app_state.SurfaceCommitProofClassification.superseded, try storage.classifySurfaceClearCommitProof(.{
+        .request_key = "cli-live-clear",
+        .store_revision = 3,
+    }, "live-proof-session"));
+    const delayed_clear = try notificationClearResponse(allocator, .{ .integer = 95 }, &state, clear_params.value);
+    defer allocator.free(delayed_clear);
+    var parsed_delayed_clear = try std.json.parseFromSlice(std.json.Value, allocator, delayed_clear, .{});
+    defer parsed_delayed_clear.deinit();
+    try std.testing.expect(parsed_delayed_clear.value.object.get("result").?.object.get("superseded").?.bool);
+    try std.testing.expectEqual(@as(u64, 4), try store.storeRevision());
+    try std.testing.expectEqual(app_state.SurfaceStatus.working, state.surfaceBySessionIdConst("live-proof-session").?.status);
+
+    // A receipt for the opposite operation is invalid, and incomplete proof
+    // JSON is not recognized as proof at all; both therefore retain the raw
+    // durable path instead of being silently ignored.
+    try std.testing.expectEqual(app_state.SurfaceCommitProofClassification.invalid, try storage.classifySurfaceUpsertCommitProof(.{
+        .request_key = "cli-live-clear",
+        .store_revision = 3,
+    }, working_surface));
+    var incomplete = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"store_request_key":"cli-live-working"}
+    , .{});
+    defer incomplete.deinit();
+    try std.testing.expect(surfaceCommitProof(incomplete.value) == null);
+
+    storage.markPersistenceUnavailable();
+    var invalid_clear_params = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"session_id":"live-proof-session","store_request_key":"cli-live-clear","store_revision":99}
+    , .{});
+    defer invalid_clear_params.deinit();
+    try std.testing.expectError(error.SessionDaemonUnavailable, notificationClearResponse(allocator, .{ .integer = 96 }, &state, invalid_clear_params.value));
+    var raw_clear_params = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"session_id":"live-proof-session"}
+    , .{});
+    defer raw_clear_params.deinit();
+    try std.testing.expectError(error.SessionDaemonUnavailable, notificationClearResponse(allocator, .{ .integer = 97 }, &state, raw_clear_params.value));
+    try std.testing.expectEqual(@as(u64, 4), try store.storeRevision());
+    try std.testing.expectEqual(app_state.SurfaceStatus.working, state.surfaceBySessionIdConst("live-proof-session").?.status);
 }

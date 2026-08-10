@@ -20,6 +20,7 @@ const zqlite = @import("zqlite");
 // M4-P4 fix F2 arm: the GENUINE GUI snapshot conversion + persisted DTOs so
 // the parity scenario exercises the real writer chain, not a hand-built shape.
 const db_types = @import("db/types.zig");
+const db_client = @import("db/client.zig");
 const persistence = @import("state/persistence.zig");
 // M4-P5 fix (MAJOR-4): the IT binary embeds the REAL CLI MCP serve loop for
 // the `--mcp` child, and (amendment arm) the GUI-side adoption entry point.
@@ -255,6 +256,7 @@ pub fn main(init: std.process.Init) !void {
     // resync) and the amendment 1.2 workspace-level belt across a flush.
     try runM5P4DesktopCursorPlumbingScenario(allocator, io);
     try runM5P4WorkspaceBeltScenario(allocator, io);
+    try runStorageStaleGranularRetryScenario(allocator, io);
     // M5-P5 final external flip: a desktop-shaped cursor and a genuine core
     // CLI subprocess independently observe one mutation; reserved push names
     // remain method_not_found.
@@ -3015,6 +3017,178 @@ fn runStoreEnabledScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     }
 }
 
+/// Production Storage retry paths refresh one stale guard and retry exactly
+/// once for both acknowledgement clears and ordinary granular upserts.
+fn runStorageStaleGranularRetryScenario(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pref_path = try makePrefPath(allocator, "storage-stale-granular");
+    defer allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, pref_path);
+    const store_dir = try std.fs.path.join(allocator, &.{ pref_path, "store" });
+    defer allocator.free(store_dir);
+    try std.Io.Dir.cwd().createDirPath(io, store_dir);
+
+    var isolation = try EndpointIsolation.install(allocator, pref_path);
+    defer isolation.deinit(allocator);
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(self_exe);
+    var child = try spawnIsolatedDaemonWithEnv(allocator, io, self_exe, pref_path, .{ .store_dir = store_dir });
+    defer child.kill(io);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{ .allocator = decode_arena.allocator(), .pref_path = pref_path };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+    var registered = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer registered.deinit();
+    if (!registered.response.isOk()) return error.StorageRetryRegisterFailed;
+    const wire_client_id = (try client.decodeClientRegister(&registered)).client_id;
+
+    var storage = try state_storage.Storage.initWithPrefPath(allocator, store_dir);
+    defer storage.deinit();
+    try storage.upsertSurfaceState(.{
+        .session_id = "storage-retry-surface",
+        .workspace_id = "storage-retry-workspace",
+        .workspace_path = pref_path,
+        .dock_id = 7,
+        .pane_id = 31,
+        .title = "first",
+        .status = .working,
+        .status_changed_at_ms = 100,
+    });
+    if (storage.currentStoreRevision() != 1) return error.StorageRetryInitialUpsertRevision;
+
+    const advance_workspace: headless.store.WorkspaceUpsertRequest = .{
+        .mutation = .{
+            .request_key = "storage-retry-advance-workspace",
+            .client_id = wire_client_id,
+            .expected_store_revision = 1,
+        },
+        .workspace = .{
+            .workspace_id = "storage-retry-workspace",
+            .label = "Storage retry",
+            .path = pref_path,
+        },
+    };
+    var advanced_workspace = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, advance_workspace);
+    defer advanced_workspace.deinit();
+    if (!advanced_workspace.response.isOk() or
+        (try client.decodeWriteResult(&advanced_workspace)).store_revision != 2) return error.StorageRetryWorkspaceAdvanceFailed;
+
+    // Cached revision 1 conflicts, refreshes from the real RO Store, and the
+    // production upsert helper commits its single retry at revision 3.
+    try storage.upsertSurfaceState(.{
+        .session_id = "storage-retry-surface",
+        .workspace_id = "storage-retry-workspace",
+        .workspace_path = pref_path,
+        .dock_id = 7,
+        .pane_id = 31,
+        .title = "retried",
+        .status = .waiting,
+        .status_changed_at_ms = 200,
+    });
+    if (storage.currentStoreRevision() != 3) return error.StorageRetryUpsertDidNotRefresh;
+
+    const completion_upsert: headless.store.NotificationChatCompletionUpsertRequest = .{
+        .mutation = .{
+            .request_key = "storage-retry-completion-upsert",
+            .client_id = wire_client_id,
+            .expected_store_revision = 3,
+        },
+        .completion = .{
+            .workspace_id = "storage-retry-workspace",
+            .local_thread_id = "storage-retry-thread",
+            .completed_at_ms = 300,
+        },
+    };
+    var completion_added = try client.call(headless.store.METHOD_NOTIFICATION_CHAT_COMPLETION_UPSERT, completion_upsert);
+    defer completion_added.deinit();
+    if (!completion_added.response.isOk() or
+        (try client.decodeWriteResult(&completion_added)).store_revision != 4) return error.StorageRetryCompletionAdvanceFailed;
+
+    // Surface clear starts from cached revision 3, then uses the bounded
+    // acknowledgement refresh/retry without launching or replacing a daemon.
+    if (!try storage.clearSurfaceState("storage-retry-surface")) return error.StorageRetrySurfaceClearNotApplied;
+    if (storage.currentStoreRevision() != 5) return error.StorageRetrySurfaceClearDidNotRefresh;
+
+    const advance_surface: headless.store.SurfaceUpsertRequest = .{
+        .mutation = .{
+            .request_key = "storage-retry-advance-surface",
+            .client_id = wire_client_id,
+            .expected_store_revision = 5,
+        },
+        .surface = .{ .session_id = "storage-retry-other", .status = "working" },
+    };
+    var surface_advanced = try client.call(headless.store.METHOD_SURFACE_UPSERT, advance_surface);
+    defer surface_advanced.deinit();
+    if (!surface_advanced.response.isOk() or
+        (try client.decodeWriteResult(&surface_advanced)).store_revision != 6) return error.StorageRetrySurfaceAdvanceFailed;
+
+    if (!try storage.clearChatCompletion("storage-retry-workspace", "storage-retry-thread"))
+        return error.StorageRetryCompletionClearNotApplied;
+    if (storage.currentStoreRevision() != 7) return error.StorageRetryCompletionClearDidNotRefresh;
+
+    const old_done: db_types.PersistedSurfaceState = .{
+        .session_id = "storage-retry-ack",
+        .workspace_id = "storage-retry-workspace",
+        .workspace_path = pref_path,
+        .dock_id = 8,
+        .pane_id = 32,
+        .provider = .codex,
+        .provider_thread_id = "old-provider-thread",
+        .title = "old completion",
+        .status = .done,
+        .status_changed_at_ms = 700,
+        .completed_at_ms = 777,
+        .last_event_title = "Ran command",
+        .last_event_body = "old canonical body",
+    };
+    try storage.upsertSurfaceState(old_done);
+    if (storage.currentStoreRevision() != 8) return error.StorageRetryAckSeedRevision;
+
+    // Make Storage's cached guard stale with an unrelated durable write. The
+    // acknowledgement path performs its own revision-first observation and
+    // clears the exact old canonical row once.
+    const unrelated: headless.store.WorkspaceUpsertRequest = .{
+        .mutation = .{ .request_key = "storage-retry-ack-unrelated", .client_id = wire_client_id, .expected_store_revision = 8 },
+        .workspace = .{ .workspace_id = "storage-retry-unrelated", .label = "Unrelated", .path = pref_path },
+    };
+    var unrelated_write = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, unrelated);
+    defer unrelated_write.deinit();
+    if (!unrelated_write.response.isOk() or (try client.decodeWriteResult(&unrelated_write)).store_revision != 9)
+        return error.StorageRetryAckUnrelatedWrite;
+    if (!try storage.clearSurfaceCompletion(old_done)) return error.StorageRetryAckClearNotApplied;
+    if (storage.currentStoreRevision() != 10) return error.StorageRetryAckClearRevision;
+
+    try storage.upsertSurfaceState(old_done);
+    if (storage.currentStoreRevision() != 11) return error.StorageRetryAckReseedRevision;
+    var newer_same_timestamp = old_done;
+    newer_same_timestamp.status_changed_at_ms = 701;
+    newer_same_timestamp.title = "new completion";
+    newer_same_timestamp.last_event_body = "new canonical body";
+    try storage.upsertSurfaceState(newer_same_timestamp);
+    if (storage.currentStoreRevision() != 12) return error.StorageRetryAckNewerRevision;
+    if (try storage.clearSurfaceCompletion(old_done)) return error.StorageRetryAckSupersededApplied;
+    if (storage.currentStoreRevision() != 12) return error.StorageRetryAckSupersededWrote;
+
+    var exact_reader = try db_client.Client.initReadOnly(allocator, store_dir);
+    defer exact_reader.deinit();
+    if (!try exact_reader.surfaceStateMatches(newer_same_timestamp)) return error.StorageRetryAckNewerChanged;
+
+    const scopes = [_][]const u8{headless.store.SNAPSHOT_SCOPE_STORE};
+    var snapshot = try client.call(headless.store.METHOD_CORE_SNAPSHOT, headless.store.CoreSnapshotRequest{ .scopes = &scopes });
+    defer snapshot.deinit();
+    if (!snapshot.response.isOk()) return error.StorageRetrySnapshotFailed;
+    const result = try client.decodeCompositeSnapshot(&snapshot);
+    for (result.snapshot.surface_states) |surface| {
+        if (std.mem.eql(u8, surface.session_id, "storage-retry-surface")) return error.StorageRetrySurfaceClearLost;
+    }
+    for (result.snapshot.chat_completions) |completion| {
+        if (std.mem.eql(u8, completion.workspace_id, "storage-retry-workspace") and
+            std.mem.eql(u8, completion.local_thread_id, "storage-retry-thread")) return error.StorageRetryCompletionClearLost;
+    }
+}
+
 /// Full store mutation surface over the wire with monotone revisions.
 fn runStoreFullSurfaceScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const pref_path = try makePrefPath(allocator, "store-full-surface");
@@ -3625,10 +3799,9 @@ fn runM5ChangesJournalScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     }
     if (!found_surface) return error.M5ChangesSurfaceEntryMissing;
 
-    // Amendment arm 2 (MAJOR-2): a snapshot_replace that DELETES resources
-    // (here: an empty replace dropping the workspace and surface) must be
-    // cursor-observable — the batch `workspace` entry with the registry "*"
-    // convention tells clients to re-read, so nothing is stale forever.
+    // A GUI compatibility snapshot captured before the targeted notification
+    // omits surfaces. Its refreshed-revision retry may replace workspace state,
+    // but must not erase the daemon-owned working surface.
     const wipe: headless.store.SnapshotReplaceRequest = .{
         .mutation = .{
             .request_key = "m5-changes-wipe",
@@ -3643,6 +3816,20 @@ fn runM5ChangesJournalScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     if (!wipe_parsed.response.isOk()) return error.M5ChangesWipeFailed;
     const wipe_write = try client.decodeWriteResult(&wipe_parsed);
     if (!wipe_write.applied) return error.M5ChangesWipeNotApplied;
+
+    const store_scope = [_][]const u8{"store"};
+    var post_replace_snapshot = try client.call(
+        headless.store.METHOD_CORE_SNAPSHOT,
+        headless.store.CoreSnapshotRequest{ .scopes = &store_scope },
+    );
+    defer post_replace_snapshot.deinit();
+    if (!post_replace_snapshot.response.isOk()) return error.M5ChangesSurfaceRefreshFailed;
+    const post_replace = try client.decodeCompositeSnapshot(&post_replace_snapshot);
+    if (post_replace.snapshot.surface_states.len != 1) return error.M5ChangesSurfaceRefreshCount;
+    if (!std.mem.eql(u8, post_replace.snapshot.surface_states[0].session_id, "m5-changes-surface-1"))
+        return error.M5ChangesSurfaceRefreshIdentity;
+    if (!std.mem.eql(u8, post_replace.snapshot.surface_states[0].status, "working"))
+        return error.M5ChangesSurfaceRefreshStatus;
 
     const wipe_poll_req: headless.changes_protocol.ChangesRequest = .{ .cursor = surface_poll_result.next_cursor };
     var wipe_poll = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, wipe_poll_req);
@@ -3659,7 +3846,7 @@ fn runM5ChangesJournalScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     }
     if (!found_wipe_batch) return error.M5ChangesWipeBatchEntryMissing;
 
-    // Amendment 3 arm (M5-P4, from M5-P3 verify MAJOR): the SAME wipe must be
+    // Amendment 3 arm (M5-P4, from M5-P3 verify MAJOR): the SAME replace must be
     // observable through TOPIC-FILTERED cursors that exclude `workspace`.
     // Pre-fix the wipe journaled only the workspace-topic "*" entry, so a
     // {surface} or {chat.thread, chat.completion} cursor crossed the replace

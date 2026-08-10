@@ -39,6 +39,47 @@ const PersistedSurfaceState = db_types.PersistedSurfaceState;
 const PersistedChatCompletion = db_types.PersistedChatCompletion;
 const log = std.log.scoped(.native_shell);
 
+pub const SurfaceCommitProof = struct {
+    request_key: []const u8,
+    store_revision: u64,
+};
+
+pub const SurfaceCommitProofClassification = enum {
+    current,
+    superseded,
+    invalid,
+};
+
+/// Map the Store wire DTO to the one canonical durable surface shape.
+pub fn protocolSurfaceToPersisted(surface: headless.store.SurfaceState) ?PersistedSurfaceState {
+    return .{
+        .session_id = surface.session_id,
+        .workspace_id = surface.workspace_id,
+        .workspace_path = surface.workspace_path,
+        .dock_id = surface.dock_id,
+        .pane_id = surface.pane_id,
+        .provider = if (surface.provider) |value| std.meta.stringToEnum(db_types.SurfaceProvider, value) orelse return null else null,
+        .provider_thread_id = surface.provider_thread_id,
+        .title = surface.title,
+        .status = std.meta.stringToEnum(db_types.SurfaceStatus, surface.status) orelse return null,
+        .status_changed_at_ms = surface.status_changed_at_ms,
+        .completed_at_ms = surface.completed_at_ms,
+        .last_event_title = surface.last_event_title,
+        .last_event_body = surface.last_event_body,
+    };
+}
+
+fn guardedSurfaceClearRequest(request_key: []const u8, client_id: []const u8, expected_revision: u64, session_id: []const u8) headless.store.SurfaceClearRequest {
+    return .{
+        .mutation = .{
+            .request_key = request_key,
+            .expected_store_revision = expected_revision,
+            .client_id = client_id,
+        },
+        .session_id = session_id,
+    };
+}
+
 pub const PendingAdoptionRow = struct {
     /// Legacy f76364f7 sidecars stored an absolute transcript index here.
     /// It remains readable as an optional hint, but repair validation is
@@ -385,6 +426,64 @@ pub const Storage = struct {
         self.noteStoreRevision(result.store_revision);
     }
 
+    pub fn clearSurfaceCompletion(self: *const Storage, acknowledged: PersistedSurfaceState) !bool {
+        try self.ensureGranularMutationAllowed();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var attempt: usize = 0;
+        while (attempt < 2) : (attempt += 1) {
+            const observation = try self.observeSurfaceCompletion(acknowledged);
+            if (!observation.matches) return false;
+            const client_id = try self.ensureExistingDaemonStoreClientId(ACKNOWLEDGEMENT_TIMEOUT_MS);
+            defer self.allocator.free(client_id);
+            const req = guardedSurfaceClearRequest(
+                try self.nextRequestKey(a, "surface.clear"),
+                client_id,
+                observation.store_revision,
+                acknowledged.session_id,
+            );
+            const result = self.callStoreMutationAllowConflictWithTimeout(
+                headless.store.METHOD_SURFACE_CLEAR,
+                req,
+                ACKNOWLEDGEMENT_TIMEOUT_MS,
+                false,
+            ) catch |err| switch (err) {
+                error.UnknownClientId => {
+                    self.clearCachedClientId();
+                    if (attempt == 0) continue;
+                    return err;
+                },
+                error.StoreRevisionConflict => {
+                    if (attempt == 0) continue;
+                    const final_observation = try self.observeSurfaceCompletion(acknowledged);
+                    if (!final_observation.matches) return false;
+                    return err;
+                },
+                else => return err,
+            };
+            self.noteStoreRevision(result.store_revision);
+            return result.applied;
+        }
+        unreachable;
+    }
+
+    const SurfaceCompletionObservation = struct {
+        store_revision: u64,
+        matches: bool,
+    };
+
+    fn observeSurfaceCompletion(self: *const Storage, acknowledged: PersistedSurfaceState) !SurfaceCompletionObservation {
+        var client = (try openReadOnlyOptional(self.allocator, self.pref_path)) orelse return error.SessionDaemonUnavailable;
+        defer client.deinit();
+        // Revision must be read first. A replacement after this read either is
+        // seen by the identity query or makes the guarded clear conflict.
+        const revision = try client.storeRevision();
+        const matches = acknowledged.status == .done and try client.surfaceStateMatches(acknowledged);
+        self.noteStoreRevision(revision);
+        return .{ .store_revision = revision, .matches = matches };
+    }
+
     pub fn clearSurfaceState(self: *const Storage, session_id: []const u8) !bool {
         try self.ensureGranularMutationAllowed();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -393,19 +492,10 @@ pub const Storage = struct {
         const result = try self.withAcknowledgementClientRetry(a, "surface.clear", struct {
             fn call(storage: *const Storage, arena_inner: std.mem.Allocator, op: []const u8, client_id: []const u8, expected: u64, sid: []const u8) !headless.store.WriteResult {
                 const req: headless.store.SurfaceClearRequest = .{
-                    .mutation = .{
-                        .request_key = try storage.nextRequestKey(arena_inner, op),
-                        .expected_store_revision = if (expected == 0) null else expected,
-                        .client_id = client_id,
-                    },
+                    .mutation = .{ .request_key = try storage.nextRequestKey(arena_inner, op), .expected_store_revision = if (expected == 0) null else expected, .client_id = client_id },
                     .session_id = sid,
                 };
-                return storage.callStoreMutationAllowConflictWithTimeout(
-                    headless.store.METHOD_SURFACE_CLEAR,
-                    req,
-                    ACKNOWLEDGEMENT_TIMEOUT_MS,
-                    false,
-                );
+                return storage.callStoreMutationAllowConflictWithTimeout(headless.store.METHOD_SURFACE_CLEAR, req, ACKNOWLEDGEMENT_TIMEOUT_MS, false);
             }
         }.call, session_id);
         self.noteStoreRevision(result.store_revision);
@@ -465,6 +555,46 @@ pub const Storage = struct {
         }.call, pair);
         self.noteStoreRevision(result.store_revision);
         return result.applied;
+    }
+
+    pub fn classifySurfaceUpsertCommitProof(
+        self: *const Storage,
+        proof: SurfaceCommitProof,
+        surface: headless.store.SurfaceState,
+    ) !SurfaceCommitProofClassification {
+        const persisted = protocolSurfaceToPersisted(surface) orelse return .invalid;
+        const fingerprint = try headless.store.encode(self.allocator, surface);
+        defer self.allocator.free(fingerprint);
+        var client = (try openReadOnlyOptional(self.allocator, self.pref_path)) orelse return .invalid;
+        defer client.deinit();
+        if (!try client.committedReceiptMatches(
+            proof.request_key,
+            headless.store.METHOD_SURFACE_UPSERT,
+            fingerprint,
+            proof.store_revision,
+        )) return .invalid;
+        return if (try client.surfaceStateMatches(persisted)) .current else .superseded;
+    }
+
+    pub fn classifySurfaceClearCommitProof(
+        self: *const Storage,
+        proof: SurfaceCommitProof,
+        session_id: []const u8,
+    ) !SurfaceCommitProofClassification {
+        const fingerprint = try headless.store.encode(self.allocator, .{
+            .session_id = session_id,
+            .workspace_id = @as(?[]const u8, null),
+        });
+        defer self.allocator.free(fingerprint);
+        var client = (try openReadOnlyOptional(self.allocator, self.pref_path)) orelse return .invalid;
+        defer client.deinit();
+        if (!try client.committedReceiptMatches(
+            proof.request_key,
+            headless.store.METHOD_SURFACE_CLEAR,
+            fingerprint,
+            proof.store_revision,
+        )) return .invalid;
+        return if (try client.surfaceStateAbsent(session_id)) .current else .superseded;
     }
 
     pub fn isPersistenceAvailable(self: *const Storage) bool {
@@ -552,6 +682,41 @@ pub const Storage = struct {
             .allocator = decode_arena.allocator(),
             .pref_path = self.pref_path,
             .timeout_ms = CLIENT_CLOSE_TIMEOUT_MS,
+        };
+        var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+        const empty_params: struct {} = .{};
+        var parsed = client.call(headless.store.METHOD_DAEMON_STORE_STATUS, empty_params) catch |err| {
+            self.markPersistenceUnavailable();
+            return err;
+        };
+        defer parsed.deinit();
+        if (parsed.response.err) |_| {
+            self.markPersistenceUnavailable();
+            return error.SessionDaemonUnavailable;
+        }
+        const status = try client.decodeStoreStatus(&parsed);
+        self.noteStoreRevision(status.store_revision);
+        return status.store_revision;
+    }
+
+    fn refreshStoreRevisionFromExistingDaemon(self: *const Storage, timeout_ms: u32) !u64 {
+        if (openReadOnlyOptional(self.allocator, self.pref_path)) |maybe_client| {
+            if (maybe_client) |client_owned| {
+                var client = client_owned;
+                defer client.deinit();
+                if (client.storeRevision()) |revision| {
+                    self.noteStoreRevision(revision);
+                    return revision;
+                } else |_| {}
+            }
+        } else |_| {}
+
+        var decode_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer decode_arena.deinit();
+        var transport: sessionizer.HeadlessTransport = .{
+            .allocator = decode_arena.allocator(),
+            .pref_path = self.pref_path,
+            .timeout_ms = timeout_ms,
         };
         var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
         const empty_params: struct {} = .{};
@@ -945,10 +1110,10 @@ pub const Storage = struct {
         if (!self.isPersistenceAvailable()) return error.SessionDaemonUnavailable;
     }
 
-    /// On unknown-client (daemon restart), clear cache, re-register, retry once (MAJOR-1).
-    /// Granular StoreRevisionConflict is intentionally not refresh+retried here:
-    /// the next whole-snapshot flush (`replaceSnapshot`) refreshes the guard and
-    /// self-heals. Event-thread mutators must stay cheap (no nested refresh/IPC).
+    /// On unknown-client or a stale optimistic guard, refresh the single
+    /// relevant owner and retry once. Granular mutations cannot defer a
+    /// conflict to a whole-snapshot flush: doing so lets that later snapshot
+    /// erase the explicit remote notification/session mutation.
     fn withClientRetry(
         self: *const Storage,
         arena: std.mem.Allocator,
@@ -956,15 +1121,23 @@ pub const Storage = struct {
         comptime callFn: anytype,
         payload: anytype,
     ) !headless.store.WriteResult {
-        const expected = self.currentStoreRevision();
-        const client_id = try self.ensureStoreClientId();
+        var expected = self.currentStoreRevision();
+        var client_id = try self.ensureStoreClientId();
         defer self.allocator.free(client_id);
         return callFn(self, arena, op, client_id, expected, payload) catch |err| {
-            if (err != error.UnknownClientId) return err;
-            self.clearCachedClientId();
-            const retry_id = try self.ensureStoreClientId();
-            defer self.allocator.free(retry_id);
-            return callFn(self, arena, op, retry_id, expected, payload);
+            switch (err) {
+                error.UnknownClientId => {
+                    self.clearCachedClientId();
+                    const retry_id = try self.ensureStoreClientId();
+                    self.allocator.free(client_id);
+                    client_id = retry_id;
+                },
+                error.StoreRevisionConflict => {
+                    expected = try self.refreshStoreRevision();
+                },
+                else => return err,
+            }
+            return callFn(self, arena, op, client_id, expected, payload);
         };
     }
 
@@ -979,15 +1152,23 @@ pub const Storage = struct {
         comptime callFn: anytype,
         payload: anytype,
     ) !headless.store.WriteResult {
-        const expected = self.currentStoreRevision();
-        const client_id = try self.ensureExistingDaemonStoreClientId(ACKNOWLEDGEMENT_TIMEOUT_MS);
+        var expected = self.currentStoreRevision();
+        var client_id = try self.ensureExistingDaemonStoreClientId(ACKNOWLEDGEMENT_TIMEOUT_MS);
         defer self.allocator.free(client_id);
         return callFn(self, arena, op, client_id, expected, payload) catch |err| {
-            if (err != error.UnknownClientId) return err;
-            self.clearCachedClientId();
-            const retry_id = try self.ensureExistingDaemonStoreClientId(ACKNOWLEDGEMENT_TIMEOUT_MS);
-            defer self.allocator.free(retry_id);
-            return callFn(self, arena, op, retry_id, expected, payload);
+            switch (err) {
+                error.UnknownClientId => {
+                    self.clearCachedClientId();
+                    const retry_id = try self.ensureExistingDaemonStoreClientId(ACKNOWLEDGEMENT_TIMEOUT_MS);
+                    self.allocator.free(client_id);
+                    client_id = retry_id;
+                },
+                error.StoreRevisionConflict => {
+                    expected = try self.refreshStoreRevisionFromExistingDaemon(ACKNOWLEDGEMENT_TIMEOUT_MS);
+                },
+                else => return err,
+            }
+            return callFn(self, arena, op, client_id, expected, payload);
         };
     }
 
@@ -1066,6 +1247,12 @@ fn openReadOnlyOptional(allocator: std.mem.Allocator, pref_path: []const u8) !?d
         error.CantOpen => null,
         else => err,
     };
+}
+
+test "conditional surface clear encodes revision zero as a present CAS guard" {
+    const req = guardedSurfaceClearRequest("zero-guard", "test-client", 0, "session-zero");
+    try std.testing.expect(req.mutation.expected_store_revision != null);
+    try std.testing.expectEqual(@as(u64, 0), req.mutation.expected_store_revision.?);
 }
 
 test "RO load pins store_revision from store_state for launch-2 guard" {

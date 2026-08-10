@@ -19,6 +19,23 @@ const PersistedState = db_types.PersistedState;
 const PersistedSurfaceState = db_types.PersistedSurfaceState;
 const PersistedThread = db_types.PersistedThread;
 
+/// Compare every field in the canonical durable surface representation.
+pub fn surfaceStatesEqual(a: PersistedSurfaceState, b: PersistedSurfaceState) bool {
+    return std.mem.eql(u8, a.session_id, b.session_id) and
+        std.mem.eql(u8, a.workspace_id, b.workspace_id) and
+        std.mem.eql(u8, a.workspace_path, b.workspace_path) and
+        a.dock_id == b.dock_id and
+        a.pane_id == b.pane_id and
+        a.provider == b.provider and
+        optionalTextEqual(a.provider_thread_id, b.provider_thread_id) and
+        std.mem.eql(u8, a.title, b.title) and
+        a.status == b.status and
+        a.status_changed_at_ms == b.status_changed_at_ms and
+        a.completed_at_ms == b.completed_at_ms and
+        optionalTextEqual(a.last_event_title, b.last_event_title) and
+        optionalTextEqual(a.last_event_body, b.last_event_body);
+}
+
 // Full-state autosaves use a detached connection while focused saves and
 // completion ledgers use the UI-owned connection. SQLite serializes writers,
 // so serialize Verde's in-process owners before entering SQLite rather than
@@ -203,6 +220,69 @@ pub const Client = struct {
             // Pre-v2 DBs / missing table: revision 0.
             return 0;
         }
+    }
+
+    /// Verify that one exact mutation fingerprint has a successful durable
+    /// receipt at the revision returned to its caller.
+    pub fn committedReceiptMatches(
+        self: *const Self,
+        request_key: []const u8,
+        operation: []const u8,
+        fingerprint: []const u8,
+        store_revision: u64,
+    ) !bool {
+        const row = (try self.conn.row(
+            "select operation, fingerprint, store_revision, response_status from store_receipts where request_key = ?1",
+            .{request_key},
+        )) orelse return false;
+        defer row.deinit();
+        if (row.int(2) < 0) return false;
+        return std.mem.eql(u8, row.text(0), operation) and
+            std.mem.eql(u8, row.text(1), fingerprint) and
+            @as(u64, @intCast(row.int(2))) == store_revision and
+            row.int(3) == 0;
+    }
+
+    /// Compare one canonical surface against the current durable row. Receipt
+    /// history alone is insufficient because a later opposite mutation may
+    /// have superseded an otherwise valid proof.
+    pub fn surfaceStateMatches(self: *const Self, surface: PersistedSurfaceState) !bool {
+        const row = (try self.conn.row(
+            "select workspace_id, workspace_path, dock_id, pane_id, provider, provider_thread_id, title, status, status_changed_at_ms, completed_at_ms, last_event_title, last_event_body from surface_completions where session_id = ?1",
+            .{surface.session_id},
+        )) orelse return false;
+        defer row.deinit();
+        return std.mem.eql(u8, row.text(0), surface.workspace_id) and
+            std.mem.eql(u8, row.text(1), surface.workspace_path) and
+            row.int(2) == @as(i64, @intCast(surface.dock_id)) and
+            optionalIntEqual(row.nullableInt(3), if (surface.pane_id) |value| @as(i64, @intCast(value)) else null) and
+            optionalIntEqual(row.nullableInt(4), if (surface.provider) |value| @as(i64, @intFromEnum(value)) else null) and
+            optionalTextEqual(row.nullableText(5), surface.provider_thread_id) and
+            std.mem.eql(u8, row.text(6), surface.title) and
+            row.int(7) == @as(i64, @intFromEnum(surface.status)) and
+            row.int(8) == surface.status_changed_at_ms and
+            row.int(9) == surface.completed_at_ms and
+            optionalTextEqual(row.nullableText(10), surface.last_event_title) and
+            optionalTextEqual(row.nullableText(11), surface.last_event_body);
+    }
+
+    pub fn surfaceStateAbsent(self: *const Self, session_id: []const u8) !bool {
+        const row = try self.conn.row(
+            "select 1 from surface_completions where session_id = ?1",
+            .{session_id},
+        );
+        if (row) |present| present.deinit();
+        return row == null;
+    }
+
+    pub fn surfaceCompletionMatches(self: *const Self, session_id: []const u8, completed_at_ms: i64) !bool {
+        const row = (try self.conn.row(
+            "select status, completed_at_ms from surface_completions where session_id = ?1",
+            .{session_id},
+        )) orelse return false;
+        defer row.deinit();
+        return row.int(0) == @as(i64, @intFromEnum(db_types.SurfaceStatus.done)) and
+            row.int(1) == completed_at_ms;
     }
 
     pub fn upsertSurfaceState(self: *const Self, surface: PersistedSurfaceState) !void {
@@ -659,6 +739,16 @@ fn decodeOptionalEnum(comptime Enum: type, raw: ?i64) ?Enum {
         if (field.value == enum_value) return @enumFromInt(enum_value);
     }
     return null;
+}
+
+fn optionalIntEqual(actual: ?i64, expected: ?i64) bool {
+    if (actual) |actual_value| return if (expected) |expected_value| actual_value == expected_value else false;
+    return expected == null;
+}
+
+fn optionalTextEqual(actual: ?[]const u8, expected: ?[]const u8) bool {
+    if (actual) |actual_value| return if (expected) |expected_value| std.mem.eql(u8, actual_value, expected_value) else false;
+    return expected == null;
 }
 
 fn decodeEnumOr(comptime Enum: type, raw: i64, fallback: Enum) Enum {
