@@ -4212,7 +4212,7 @@ pub const AppState = struct {
 
     /// Selects a pane from the sidebar while keeping a maximized workspace maximized.
     pub fn focusWorkspaceOpenPaneFromSidebar(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) void {
-        self.focusWorkspaceOpenPaneWithZoom(project_index, pane_id, true, true);
+        self.focusWorkspaceOpenPaneWithZoom(project_index, pane_id, true, false);
     }
 
     /// Focuses a pane by its zero-based position in the current workspace's sidebar list.
@@ -4311,9 +4311,11 @@ pub const AppState = struct {
         _ = self.focusWorkspacePane(project_index, pane_id);
         if (preserve_viewport) {
             layout.scroll_leading_pane_id = null;
-            layout.scroll_revealed_pane_id = pane_id;
+            layout.scroll_revealed_pane_id = null;
         } else if (leading_reveal) {
             layout.requestLeadingScrollReveal(pane_id);
+        } else {
+            layout.scroll_revealed_pane_id = null;
         }
         self.markDirty();
     }
@@ -10553,7 +10555,8 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     const clicked_terminal_pane_id = try layout.createTerminalPane(allocator, 2);
 
     state.focusWorkspaceOpenPaneFromSidebar(0, chat_pane_id);
-    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.scroll_leading_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.scroll_leading_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.scroll_revealed_pane_id);
     try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(1));
     try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.scroll_leading_pane_id);
 

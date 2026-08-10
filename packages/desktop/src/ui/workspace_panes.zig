@@ -2131,7 +2131,7 @@ test "scrolling focus reveal moves only enough to expose the column" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), revealedScrollTarget(max_offset, viewport_w, column_w, gap, 0, max_offset), 0.0001);
 }
 
-test "current horizontal render preserves visible activation and reveals after pre-render resize" {
+test "sidebar horizontal render preserves visible activation and minimally reveals after pre-render resize" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2184,54 +2184,24 @@ test "current horizontal render preserves visible activation and reveals after p
     };
     state.project_controller.selected_index = 0;
 
-    const wide: palette.Rect = .{ .x = 31.0, .y = 47.0, .w = 1400.0, .h = 780.0 };
-    const narrow: palette.Rect = .{ .x = 31.0, .y = 47.0, .w = 200.0, .h = 780.0 };
+    const narrow: palette.Rect = .{ .x = 31.0, .y = 47.0, .w = 1000.0, .h = 780.0 };
     const layout = &state.project_controller.projects.items[0].workspace_layout;
 
-    // Maximize transfer is presentation-only and does not disturb the saved
-    // asymmetric tree or either viewport axis.
-    renderAt(&state, wide);
-    state.selectThreadForProject(0, third_thread);
-    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, third_pane), layout.maximized_pane_id);
-    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_target_x);
-    try std.testing.expectEqual(@as(f32, 19.5), layout.scroll_target_y);
-    layout.maximized_pane_id = null;
-    state.selectThreadForProject(0, second_thread);
-    layout.scroll_revealed_pane_id = second_pane;
-
-    // Fully visible A -> B -> A activations preserve exact offsets and targets
-    // because the current renderer's bounded reveal computes no movement.
-    renderAt(&state, wide);
-    state.selectThreadForProject(0, third_thread);
-    renderAt(&state, wide);
-    state.selectThreadForProject(0, second_thread);
-    renderAt(&state, wide);
-    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_offset_x);
-    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_target_x);
-    try std.testing.expectEqual(@as(f32, 19.5), layout.scroll_offset_y);
-    try std.testing.expectEqual(@as(f32, 19.5), layout.scroll_target_y);
-
-    // Away/back at the same geometry is equally presentation-idempotent.
-    state.project_controller.selected_index = 1;
-    state.selectThreadForProject(0, third_thread);
-    renderAt(&state, wide);
-    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_target_x);
-    try std.testing.expectEqual(@as(f32, 19.5), layout.scroll_target_y);
-
-    // Even an explicit leading request is inert when the current viewport
-    // already contains the target completely.
-    layout.requestLeadingScrollReveal(third_pane);
-    renderAt(&state, wide);
-    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_target_x);
-
-    // Focus B at the wide size, then switch away. Activate C after the window
-    // narrows but before A's next render. Only that next current-size render
-    // owns the bounded reveal decision.
-    state.selectThreadForProject(0, second_thread);
-    renderAt(&state, wide);
-    state.project_controller.selected_index = 1;
-    state.selectThreadForProject(0, third_thread);
+    // Establish a real strip acknowledgement, maximize its visible pane,
+    // transfer maximize to offscreen C, then restore through production APIs.
+    try std.testing.expect(state.toggleWorkspacePaneMaximized(0, second_pane));
+    renderAt(&state, narrow);
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, second_pane), layout.scroll_revealed_pane_id);
+    const preserved_target_x = layout.scroll_target_x;
+    const preserved_target_y = layout.scroll_target_y;
+    try std.testing.expect(state.toggleWorkspacePaneMaximized(0, second_pane));
+    state.focusWorkspaceOpenPaneFromSidebar(0, third_pane);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, third_pane), layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.scroll_revealed_pane_id);
+    try std.testing.expectEqual(preserved_target_x, layout.scroll_target_x);
+    try std.testing.expectEqual(preserved_target_y, layout.scroll_target_y);
+    layout.scroll_pane_extent_ratio_override = 0.45;
+    try std.testing.expect(state.clearWorkspacePaneMaximized(0));
     renderAt(&state, narrow);
 
     const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
@@ -2244,19 +2214,54 @@ test "current horizontal render preserves visible activation and reveals after p
         theme.uiScaleFactor(),
     );
     const max_offset = scrollingMaxOffset(narrow.w, pane_extent, gap, layout.visiblePaneCount());
-    const expected_target = revealedScrollTarget(73.25, narrow.w, pane_extent, gap, 2, max_offset);
+    const expected_target = revealedScrollTarget(preserved_target_x, narrow.w, pane_extent, gap, 2, max_offset);
+    const leading_target = leadingScrollTarget(pane_extent, gap, 2, max_offset);
     try std.testing.expectApproxEqAbs(expected_target, layout.scroll_target_x, 0.0001);
-    try std.testing.expect(layout.scroll_target_x > 73.25);
-    try std.testing.expect(layout.scroll_target_x <= max_offset);
+    try std.testing.expect(expected_target > preserved_target_x);
+    try std.testing.expect(layout.scroll_target_x < leading_target);
+    const third_end = 3.0 * pane_extent + 2.0 * gap;
+    try std.testing.expect(third_end <= layout.scroll_target_x + narrow.w + 0.0001);
+    try std.testing.expect(layout.scroll_target_x <= third_end - narrow.w + 0.0001);
     try std.testing.expect(layout.scroll_offset_x >= 0.0 and layout.scroll_offset_x <= max_offset);
-    try std.testing.expectEqual(@as(f32, 19.5), layout.scroll_target_y);
+    try std.testing.expectEqual(preserved_target_y, layout.scroll_target_y);
+
+    // Same-pane sidebar reselection invalidates the old acknowledgement. A
+    // changed same-axis extent is recomputed, while unchanged visible geometry
+    // preserves both the exact animated offset and target.
+    const shorter: palette.Rect = .{ .x = 31.0, .y = 47.0, .w = 700.0, .h = 780.0 };
+    const before_resize_target = layout.scroll_target_x;
+    layout.scroll_pane_extent_ratio_override = 0.60;
+    state.focusWorkspaceOpenPaneFromSidebar(0, third_pane);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.scroll_revealed_pane_id);
+    renderAt(&state, shorter);
+    const resized_extent = responsiveScrollingPaneExtent(shorter.w, gap, state.app_config.workspace_panes_per_view, layout.scroll_pane_extent_override, layout.scroll_pane_extent_ratio_override, theme.uiScaleFactor());
+    const resized_max = scrollingMaxOffset(shorter.w, resized_extent, gap, layout.visiblePaneCount());
+    const resized_expected = revealedScrollTarget(before_resize_target, shorter.w, resized_extent, gap, 2, resized_max);
+    try std.testing.expectApproxEqAbs(resized_expected, layout.scroll_target_x, 0.0001);
+    layout.scroll_offset_x = layout.scroll_target_x;
+    const visible_offset = layout.scroll_offset_x;
+    const visible_target = layout.scroll_target_x;
+    state.focusWorkspaceOpenPaneFromSidebar(0, third_pane);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.scroll_revealed_pane_id);
+    renderAt(&state, shorter);
+    try std.testing.expectEqual(visible_offset, layout.scroll_offset_x);
+    try std.testing.expectEqual(visible_target, layout.scroll_target_x);
+
+    // Explicit non-sidebar navigation still places a genuinely offscreen pane
+    // at its leading edge.
+    state.focusWorkspaceOpenPaneFromSidebar(0, 1);
+    renderAt(&state, shorter);
+    state.focusWorkspaceOpenPane(0, third_pane);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, third_pane), layout.scroll_leading_pane_id);
+    renderAt(&state, shorter);
+    try std.testing.expectApproxEqAbs(leadingScrollTarget(resized_extent, gap, 2, resized_max), layout.scroll_target_x, 0.0001);
     switch (layout.root.?.*) {
         .split => |split| try std.testing.expectApproxEqAbs(@as(f32, 0.37), split.ratio, 0.0001),
         .leaf => return error.TestExpectedEqual,
     }
 }
 
-test "current vertical render reveals after pre-render resize" {
+test "sidebar vertical render minimally reveals after pre-render resize" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2308,20 +2313,29 @@ test "current vertical render reveals after pre-render resize" {
     state.project_controller.selected_index = 0;
 
     const tall: palette.Rect = .{ .x = 31.0, .y = 47.0, .w = 780.0, .h = 1400.0 };
-    const short: palette.Rect = .{ .x = 31.0, .y = 47.0, .w = 780.0, .h = 200.0 };
+    const short: palette.Rect = .{ .x = 31.0, .y = 47.0, .w = 780.0, .h = 1000.0 };
     const layout = &state.project_controller.projects.items[0].workspace_layout;
 
     renderAt(&state, tall);
-    state.selectThreadForProject(0, third_thread);
+    state.focusWorkspaceOpenPaneFromSidebar(0, third_pane);
     renderAt(&state, tall);
-    state.selectThreadForProject(0, second_thread);
+    state.focusWorkspaceOpenPaneFromSidebar(0, second_pane);
     renderAt(&state, tall);
+    layout.scroll_offset_y = layout.scroll_target_y;
+    const visible_offset = layout.scroll_offset_y;
+    const visible_target = layout.scroll_target_y;
+    state.focusWorkspaceOpenPaneFromSidebar(0, second_pane);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.scroll_revealed_pane_id);
+    renderAt(&state, tall);
+    try std.testing.expectEqual(visible_offset, layout.scroll_offset_y);
+    try std.testing.expectEqual(visible_target, layout.scroll_target_y);
     try std.testing.expectEqual(@as(f32, 41.0), layout.scroll_target_x);
-    try std.testing.expectEqual(@as(f32, 19.5), layout.scroll_target_y);
 
     state.project_controller.selected_index = 1;
-    state.selectThreadForProject(0, third_thread);
-    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, second_pane), layout.scroll_revealed_pane_id);
+    layout.scroll_pane_extent_ratio_override = 0.45;
+    state.focusWorkspaceOpenPaneFromSidebar(0, third_pane);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.scroll_revealed_pane_id);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.scroll_leading_pane_id);
     renderAt(&state, short);
 
     const gap = theme.scaledUi(state.app_config.workspace_pane_gap);
@@ -2335,10 +2349,30 @@ test "current vertical render reveals after pre-render resize" {
     );
     const max_offset = scrollingMaxOffset(short.h, pane_extent, gap, layout.visiblePaneCount());
     const expected_target = revealedScrollTarget(19.5, short.h, pane_extent, gap, 2, max_offset);
+    const leading_target = leadingScrollTarget(pane_extent, gap, 2, max_offset);
     try std.testing.expectApproxEqAbs(expected_target, layout.scroll_target_y, 0.0001);
     try std.testing.expect(layout.scroll_target_y > 19.5);
+    try std.testing.expect(layout.scroll_target_y < leading_target);
     try std.testing.expect(layout.scroll_target_y <= max_offset);
     try std.testing.expectEqual(@as(f32, 41.0), layout.scroll_target_x);
+
+    const shorter: palette.Rect = .{ .x = 31.0, .y = 47.0, .w = 780.0, .h = 700.0 };
+    const before_resize_target = layout.scroll_target_y;
+    layout.scroll_pane_extent_ratio_override = 0.60;
+    state.focusWorkspaceOpenPaneFromSidebar(0, third_pane);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.scroll_revealed_pane_id);
+    renderAt(&state, shorter);
+    const resized_extent = responsiveScrollingPaneExtent(shorter.h, gap, state.app_config.workspace_panes_per_view, layout.scroll_pane_extent_override, layout.scroll_pane_extent_ratio_override, theme.uiScaleFactor());
+    const resized_max = scrollingMaxOffset(shorter.h, resized_extent, gap, layout.visiblePaneCount());
+    const resized_expected = revealedScrollTarget(before_resize_target, shorter.h, resized_extent, gap, 2, resized_max);
+    try std.testing.expectApproxEqAbs(resized_expected, layout.scroll_target_y, 0.0001);
+    layout.scroll_offset_y = layout.scroll_target_y;
+    const same_geometry_offset = layout.scroll_offset_y;
+    const same_geometry_target = layout.scroll_target_y;
+    state.focusWorkspaceOpenPaneFromSidebar(0, third_pane);
+    renderAt(&state, shorter);
+    try std.testing.expectEqual(same_geometry_offset, layout.scroll_offset_y);
+    try std.testing.expectEqual(same_geometry_target, layout.scroll_target_y);
     switch (layout.root.?.*) {
         .split => |split| try std.testing.expectApproxEqAbs(@as(f32, 0.38), split.ratio, 0.0001),
         .leaf => return error.TestExpectedEqual,
