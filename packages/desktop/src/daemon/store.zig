@@ -2342,9 +2342,9 @@ fn accessModeCode(value: []const u8) !i64 {
 }
 
 fn roleCode(value: []const u8) !i64 {
-    if (std.mem.eql(u8, value, "system")) return 0;
-    if (std.mem.eql(u8, value, "user")) return 1;
-    if (std.mem.eql(u8, value, "assistant")) return 2;
+    if (std.mem.eql(u8, value, "user")) return 0;
+    if (std.mem.eql(u8, value, "assistant")) return 1;
+    if (std.mem.eql(u8, value, "system")) return 2;
     return error.InvalidParams;
 }
 
@@ -2913,6 +2913,57 @@ fn transferOutcomeCount(store: *const Store) !i64 {
     return row.int(0);
 }
 
+test "daemon writes the shipped chat role codes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    const workspace = testWorkspace("workspace-role-codec", "Role codec");
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("role-workspace", null),
+        .workspace = workspace,
+    });
+    const thread = testThread("thread-role-codec", "Role codec");
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("role-thread", 1),
+        .workspace_id = workspace.workspace_id,
+        .thread = thread,
+    });
+
+    const messages = [_]store_protocol.Message{
+        .{ .message_id = "role-user", .role = "user", .author = "You", .body = "user" },
+        .{ .message_id = "role-assistant", .role = "assistant", .author = "Assistant", .body = "assistant" },
+        .{ .message_id = "role-system", .role = "system", .author = "System", .body = "system" },
+    };
+    _ = try store.commitTurn(.{
+        .turn_id = "turn-role-codec",
+        .workspace_id = workspace.workspace_id,
+        .local_thread_id = thread.local_thread_id,
+        .status = .completed,
+        .started_at_ms = 1,
+        .finished_at_ms = 2,
+        .provider = "codex",
+        .messages = &messages,
+    });
+
+    const expected = [_]i64{ 0, 1, 2 };
+    var rows = try store.conn.rows(
+        "select role from messages where thread_id = (select id from threads where local_thread_id = ?1) order by sort_index",
+        .{thread.local_thread_id},
+    );
+    defer rows.deinit();
+    var index: usize = 0;
+    while (rows.next()) |row| : (index += 1) {
+        try std.testing.expect(index < expected.len);
+        try std.testing.expectEqual(expected[index], row.int(0));
+    }
+    if (rows.err) |err| return err;
+    try std.testing.expectEqual(expected.len, index);
+}
+
 test "turn commit is durable, ordered, exactly once, and revision guarded by receipt" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3345,7 +3396,7 @@ test "new acceptance replay binds immutable user content but permits timestamp d
     try std.testing.expectEqual(@as(i64, 1), unchanged.int(1));
     try std.testing.expectEqual(@as(i64, 1), unchanged.int(2));
     try std.testing.expectEqual(@as(i64, 1), unchanged.int(3));
-    try std.testing.expectEqual(@as(i64, 1), unchanged.int(4));
+    try std.testing.expectEqual(@as(i64, 0), unchanged.int(4));
     try std.testing.expectEqualStrings("You", unchanged.text(5));
     try std.testing.expectEqualStrings("first writer prompt", unchanged.text(6));
     try std.testing.expectEqualStrings("/tmp/identity.png", unchanged.text(7));

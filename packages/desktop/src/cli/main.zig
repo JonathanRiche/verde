@@ -615,7 +615,7 @@ fn handleState(allocator: std.mem.Allocator, out: output.Output, argv: []const [
     defer allocator.free(pref_path);
 
     if (std.mem.eql(u8, command, "path")) {
-        const db_path = try db_client.Client.pathForPrefPath(allocator, pref_path);
+        const db_path = try stateDatabasePath(allocator, pref_path);
         defer allocator.free(db_path);
         if (json) {
             try out.jsonValue(allocator, .{ .pref_path = pref_path, .state_path = db_path });
@@ -629,7 +629,7 @@ fn handleState(allocator: std.mem.Allocator, out: output.Output, argv: []const [
         if (json) {
             try out.jsonValue(allocator, .{ .workspaces = &.{} });
         } else {
-            const db_path = try db_client.Client.pathForPrefPath(allocator, pref_path);
+            const db_path = try stateDatabasePath(allocator, pref_path);
             defer allocator.free(db_path);
             try out.stdout("No persisted Verde state found at {s}\n", .{db_path});
         }
@@ -1512,7 +1512,7 @@ fn handleSession(allocator: std.mem.Allocator, out: output.Output, io: std.Io, e
             if (json) {
                 try out.jsonValue(allocator, .{ .daemon_running = false, .sessions = &.{} });
             } else {
-                const db_path = try db_client.Client.pathForPrefPath(allocator, pref_path);
+                const db_path = try stateDatabasePath(allocator, pref_path);
                 defer allocator.free(db_path);
                 try out.stdout("No persisted Verde state found at {s}\n", .{db_path});
             }
@@ -1958,10 +1958,22 @@ fn persistSurfaceStateViaDaemon(
 
 /// Strict read-only state open for CLI inspection; never initializes schema.
 fn openStateReadOnly(allocator: std.mem.Allocator, pref_path: []const u8) !?db_client.Client {
-    return db_client.Client.initReadOnly(allocator, pref_path) catch |err| switch (err) {
+    const effective_dir = try sessionizer.effectiveStoreDirectory(allocator, pref_path);
+    defer allocator.free(effective_dir.path);
+    return openStateReadOnlyInDirectory(allocator, effective_dir.path);
+}
+
+fn openStateReadOnlyInDirectory(allocator: std.mem.Allocator, store_dir: []const u8) !?db_client.Client {
+    return db_client.Client.initReadOnly(allocator, store_dir) catch |err| switch (err) {
         error.CantOpen => null,
         else => err,
     };
+}
+
+fn stateDatabasePath(allocator: std.mem.Allocator, pref_path: []const u8) ![:0]u8 {
+    const effective_dir = try sessionizer.effectiveStoreDirectory(allocator, pref_path);
+    defer allocator.free(effective_dir.path);
+    return db_client.Client.pathForPrefPath(allocator, effective_dir.path);
 }
 
 const IntegrationProvider = struct {
@@ -3143,6 +3155,10 @@ fn sendLiveRequest(allocator: std.mem.Allocator, out: output.Output, io: std.Io,
 }
 
 fn sendLiveRequestAlloc(allocator: std.mem.Allocator, _: std.Io, method: []const u8, params: anytype, request_id: u64) ![]u8 {
+    return sendLiveRequestAllocWithTimeout(allocator, method, params, request_id, LIVE_RESPONSE_TIMEOUT_MS);
+}
+
+fn sendLiveRequestAllocWithTimeout(allocator: std.mem.Allocator, method: []const u8, params: anytype, request_id: u64, timeout_ms: u32) ![]u8 {
     const pref_path = try prefPath(allocator);
     defer allocator.free(pref_path);
     const endpoint = try live_endpoint.alloc(allocator, pref_path);
@@ -3162,7 +3178,7 @@ fn sendLiveRequestAlloc(allocator: std.mem.Allocator, _: std.Io, method: []const
     const request_json = try request_writer.toOwnedSlice();
     defer allocator.free(request_json);
     return try platform_ipc.requestAlloc(allocator, endpoint, request_json, .{
-        .timeout_ms = LIVE_RESPONSE_TIMEOUT_MS,
+        .timeout_ms = timeout_ms,
     });
 }
 
@@ -3196,7 +3212,7 @@ fn handleSessionAttach(
     argv: []const []const u8,
 ) !void {
     try ensureSessionDaemon(allocator, io, exe_path);
-    const session_id = try resolveAttachSessionId(allocator, out, argv);
+    const session_id = try resolveAttachSessionId(allocator, out, argv, null);
     defer allocator.free(session_id);
 
     const attach_id = attachSessionClient(allocator, io, session_id, "verde-cli") catch |err| {
@@ -3303,7 +3319,12 @@ fn readWindowsTerminalAttachSize() ?AttachSize {
     return .{ .cols = @intCast(cols), .rows = @intCast(rows) };
 }
 
-fn resolveAttachSessionId(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8) ![]u8 {
+fn resolveAttachSessionId(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    argv: []const []const u8,
+    pref_path_override: ?[]const u8,
+) ![]u8 {
     if (args.optionValue(argv, "--id")) |id| return allocator.dupe(u8, id);
 
     const pane_value = args.optionValue(argv, "--pane") orelse {
@@ -3314,8 +3335,9 @@ fn resolveAttachSessionId(allocator: std.mem.Allocator, out: output.Output, argv
         try out.stderr("invalid --pane value: {s}\n", .{pane_value});
         std.process.exit(2);
     };
-    const pref_path = try prefPath(allocator);
-    defer allocator.free(pref_path);
+    const owned_pref_path: ?[]u8 = if (pref_path_override == null) try prefPath(allocator) else null;
+    defer if (owned_pref_path) |path| allocator.free(path);
+    const pref_path = pref_path_override orelse owned_pref_path.?;
     var client = try openStateReadOnly(allocator, pref_path) orelse {
         try out.stderr("no persisted Verde state found\n", .{});
         std.process.exit(4);
@@ -4358,18 +4380,10 @@ fn mcpToolsCall(
             if (mcpArgIsNonNull(arguments, "axis") and axis == null) {
                 return try mcpError(allocator, out, id_value, -32602, "open_chat axis must be a string");
             }
-            // M4-P5: open_chat is thread creation returning the stable id
-            // contract (local_thread_id, mirrored as legacy thread_id).
-            // GUI registered (Live socket reachable): Live chat.open creates
-            // AND presents the thread, but the GUI's durable store write is
-            // asynchronous relative to its response — so before reporting
-            // success the CLI confirms the daemon can read the thread back
-            // (bounded chat.thread.get poll; old daemons without the chat
-            // capability skip the confirm). No GUI: daemon-direct
-            // chat.thread.upsert creates the thread durably by construction,
-            // and an old daemon (chat=false) gets capability_unavailable —
-            // never a second Live attempt.
-            const live_response = sendLiveRequestAlloc(allocator, io, "chat.open", .{
+            // A running GUI validates first without mutation. Identity is then
+            // created daemon-first and Live only presents that exact projected
+            // identity. No GUI retains the daemon-direct behavior.
+            const validation_response = sendLiveRequestAlloc(allocator, io, "chat.open.validate", .{
                 .workspace_id = workspace_id,
                 .provider = provider,
                 .model = model,
@@ -4378,62 +4392,132 @@ fn mcpToolsCall(
                 .fast_mode = creation_settings.fast_mode,
                 .target_pane_id = target_pane_id,
                 .axis = axis orelse "horizontal",
-                .focus = false,
+                .focus = true,
             }, 1) catch |err| live_blk: {
                 if (!isLiveSocketUnavailable(err)) return try mcpError(allocator, out, id_value, -32000, @errorName(err));
                 break :live_blk null;
             };
-            if (live_response) |response| {
-                defer allocator.free(response);
-                var live_parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch |err|
+            if (validation_response) |validation| {
+                defer allocator.free(validation);
+                var validation_parsed = std.json.parseFromSlice(std.json.Value, allocator, validation, .{}) catch |err|
                     return try mcpError(allocator, out, id_value, -32000, @errorName(err));
-                defer live_parsed.deinit();
-                switch (classifyChatOpenLiveEnvelope(live_parsed.value)) {
-                    // GUI-authored error envelopes pass through unchanged.
-                    .not_ok => {},
-                    // ok without any stable id can never be reported as
-                    // success: the caller would hold nothing durable to read.
-                    .missing_ids => return try mcpChatOpenNotDurable(
-                        allocator,
-                        out,
-                        id_value,
-                        workspace_id,
-                        "(unknown)",
-                        "Live chat.open returned ok without local_thread_id or thread_id",
-                    ),
-                    .ids => |ids| {
-                        const confirm_workspace = ids.workspace_id orelse workspace_id;
-                        const outcome = chatOpenConfirmThreadDurable(
-                            allocator,
-                            io,
-                            confirm_workspace,
-                            ids.local_thread_id,
-                            CHAT_OPEN_CONFIRM_ATTEMPTS,
-                            CHAT_OPEN_CONFIRM_DELAY_MS,
-                        ) catch return try mcpChatOpenNotDurable(
-                            allocator,
-                            out,
-                            id_value,
-                            confirm_workspace,
-                            ids.local_thread_id,
-                            "the session daemon read-back transport failed",
-                        );
-                        switch (outcome) {
-                            // Durable, or an old daemon that cannot serve the
-                            // confirm: return the Live envelope unchanged.
-                            .durable, .capability_skip => {},
-                            .timeout => return try mcpChatOpenNotDurable(
-                                allocator,
-                                out,
-                                id_value,
-                                confirm_workspace,
-                                ids.local_thread_id,
-                                "the durable thread row was not readable within the confirmation budget",
-                            ),
-                        }
-                    },
+                defer validation_parsed.deinit();
+                const validation_route = chatOpenValidationRoute(validation_parsed.value);
+                if (validation_route == .terminal) {
+                    return try mcpToolLiveTextResult(allocator, out, id_value, validation, tool_name);
                 }
-                return try mcpToolLiveTextResult(allocator, out, id_value, response, tool_name);
+                if (validation_route == .validated) {
+                    const validated = parseChatOpenValidation(validation_parsed.value, workspace_id, provider) orelse
+                        return try mcpError(allocator, out, id_value, -32000, "invalid chat.open.validate response");
+                    const daemon_response = chatDaemonOpenThreadEnvelopeAlloc(allocator, io, .{
+                        .workspace_id = validated.workspace_id,
+                        .provider = validated.provider,
+                        .model = validated.model,
+                        .reasoning_effort = validated.reasoning_effort,
+                        .reasoning_variant = validated.reasoning_variant,
+                        .fast_mode = validated.fast_mode,
+                    }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
+                    defer allocator.free(daemon_response);
+                    var daemon_parsed = std.json.parseFromSlice(std.json.Value, allocator, daemon_response, .{}) catch |err| return try mcpError(allocator, out, id_value, -32000, @errorName(err));
+                    defer daemon_parsed.deinit();
+                    const daemon_result = if (daemon_parsed.value == .object) daemon_parsed.value.object.get("result") else null;
+                    if (daemon_result == null or daemon_result.? != .object) return try mcpToolTextResult(allocator, out, id_value, daemon_response, tool_name);
+                    const daemon_core = daemon_result.?.object;
+                    const durable_workspace_id = jsonString(daemon_core.get("workspace_id") orelse .null) orelse
+                        return try mcpToolTextResult(allocator, out, id_value, daemon_response, tool_name);
+                    const local_thread_id = jsonString(daemon_core.get("local_thread_id") orelse .null) orelse
+                        return try mcpToolTextResult(allocator, out, id_value, daemon_response, tool_name);
+                    const daemon_store_revision = nonNegativeJsonInteger(daemon_core.get("store_revision") orelse .null) orelse
+                        return try mcpError(allocator, out, id_value, -32000, "invalid daemon store_revision");
+
+                    var presentation_ambiguous = false;
+                    const presentation_deadline_ms = sessionizer.monotonicNowMs() +| CHAT_OPEN_PRESENT_DEADLINE_MS;
+                    while (presentationRemainingMs(presentation_deadline_ms)) |remaining_ms| {
+                        const present = sendLiveRequestAllocWithTimeout(allocator, "chat.present", .{
+                            .workspace_id = workspace_id,
+                            .local_thread_id = local_thread_id,
+                            .store_revision = daemon_store_revision,
+                            .target_pane_id = target_pane_id,
+                            .axis = axis orelse "horizontal",
+                            .focus = true,
+                        }, 1, presentationTransportTimeoutMs(remaining_ms)) catch {
+                            presentation_ambiguous = true;
+                            sleepChatPresentationRetry(io, presentation_deadline_ms);
+                            continue;
+                        };
+                        defer allocator.free(present);
+                        var parsed = std.json.parseFromSlice(std.json.Value, allocator, present, .{}) catch {
+                            presentation_ambiguous = true;
+                            sleepChatPresentationRetry(io, presentation_deadline_ms);
+                            continue;
+                        };
+                        defer parsed.deinit();
+
+                        if (parsed.value != .object) {
+                            presentation_ambiguous = true;
+                            sleepChatPresentationRetry(io, presentation_deadline_ms);
+                            continue;
+                        }
+                        const present_ok = jsonBool(parsed.value.object.get("ok") orelse .null) orelse {
+                            presentation_ambiguous = true;
+                            sleepChatPresentationRetry(io, presentation_deadline_ms);
+                            continue;
+                        };
+                        if (present_ok) {
+                            const presentation = parseChatOpenPresentation(
+                                parsed.value,
+                                durable_workspace_id,
+                                local_thread_id,
+                                daemon_store_revision,
+                            ) orelse {
+                                presentation_ambiguous = true;
+                                sleepChatPresentationRetry(io, presentation_deadline_ms);
+                                continue;
+                            };
+                            const composed = try composeChatOpenPresentationAlloc(allocator, daemon_core, presentation);
+                            defer allocator.free(composed);
+                            return try mcpToolTextResult(allocator, out, id_value, composed, tool_name);
+                        }
+                        const error_code = liveEnvelopeErrorCode(parsed.value) orelse {
+                            presentation_ambiguous = true;
+                            sleepChatPresentationRetry(io, presentation_deadline_ms);
+                            continue;
+                        };
+                        if (std.mem.eql(u8, error_code, "projection_refresh_unavailable")) {
+                            const status = terminalChatOpenPresentation(presentation_ambiguous, "refresh_unavailable");
+                            const composed = try composeChatOpenStatusAlloc(allocator, daemon_core, status.presented, status.status);
+                            defer allocator.free(composed);
+                            return try mcpToolTextResult(allocator, out, id_value, composed, tool_name);
+                        }
+                        if (std.mem.eql(u8, error_code, "projection_identity_missing") or std.mem.eql(u8, error_code, "projection_superseded")) {
+                            const status = terminalChatOpenPresentation(presentation_ambiguous, "projection_identity_missing");
+                            const composed = try composeChatOpenStatusAlloc(allocator, daemon_core, status.presented, status.status);
+                            defer allocator.free(composed);
+                            return try mcpToolTextResult(allocator, out, id_value, composed, tool_name);
+                        }
+                        if (!std.mem.eql(u8, error_code, "projection_pending") and !std.mem.eql(u8, error_code, "projection_revision_pending")) {
+                            // Durability already succeeded. Preserve the durable
+                            // success shape rather than converting presentation
+                            // failure into a false thread failure.
+                            const composed = if (presentation_ambiguous)
+                                try composeChatOpenStatusAlloc(allocator, daemon_core, null, "unknown")
+                            else
+                                try composeChatOpenStatusAlloc(allocator, daemon_core, false, "rejected");
+                            defer allocator.free(composed);
+                            return try mcpToolTextResult(allocator, out, id_value, composed, tool_name);
+                        }
+                        sleepChatPresentationRetry(io, presentation_deadline_ms);
+                    }
+                    const exhausted = exhaustedChatOpenPresentation(presentation_ambiguous);
+                    const composed = try composeChatOpenStatusAlloc(
+                        allocator,
+                        daemon_core,
+                        exhausted.presented,
+                        exhausted.status,
+                    );
+                    defer allocator.free(composed);
+                    return try mcpToolTextResult(allocator, out, id_value, composed, tool_name);
+                }
             }
             // No GUI: return through mcpToolTextResult directly so a daemon
             // store-capability rejection in the envelope is not re-attributed
@@ -5022,8 +5106,14 @@ fn chatDaemonOpenThreadEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, o
         .thread_id = local_thread_id,
         .store_revision = write.store_revision,
         .created = true,
+        .provider = open.provider,
+        .model = open.model,
+        .reasoning_effort = open.reasoning_effort,
+        .reasoning_variant = open.reasoning_variant,
+        .fast_mode = open.fast_mode,
         // No GUI client is registered, so no pane presentation happened.
         .presented = false,
+        .presentation_status = "not_requested",
     });
     try s.endObject();
     return try writer.toOwnedSlice();
@@ -5042,6 +5132,8 @@ fn chatDaemonOpenThreadEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, o
 
 const CHAT_OPEN_CONFIRM_ATTEMPTS: u32 = 40;
 const CHAT_OPEN_CONFIRM_DELAY_MS: u64 = 50;
+const CHAT_OPEN_PRESENT_DELAY_MS: u64 = 50;
+const CHAT_OPEN_PRESENT_DEADLINE_MS: i64 = 2_000;
 const CORE_CHANGES_MAX_WAIT_MS: u32 = 25_000;
 const CORE_CHANGES_TRANSPORT_OVERHEAD_MS: u32 = 5_000;
 
@@ -5073,6 +5165,239 @@ fn classifyChatOpenLiveEnvelope(value: std.json.Value) ChatOpenLiveEnvelope {
         .local_thread_id = local_thread_id,
         .workspace_id = jsonString(result.object.get("workspace_id") orelse .null),
     } };
+}
+
+fn liveEnvelopeErrorCode(value: std.json.Value) ?[]const u8 {
+    if (value != .object) return null;
+    const err = value.object.get("error") orelse return null;
+    if (err != .object) return null;
+    return jsonString(err.object.get("code") orelse .null);
+}
+
+const ChatOpenValidationRoute = enum {
+    validated,
+    daemon_direct,
+    terminal,
+};
+
+fn chatOpenValidationRoute(value: std.json.Value) ChatOpenValidationRoute {
+    if (value != .object) return .terminal;
+    const ok = jsonBool(value.object.get("ok") orelse .null) orelse return .terminal;
+    if (ok) return .validated;
+    const err = value.object.get("error") orelse return .terminal;
+    if (err != .object or jsonString(err.object.get("message") orelse .null) == null) return .terminal;
+    const code = jsonString(err.object.get("code") orelse .null) orelse return .terminal;
+    if (std.mem.eql(u8, code, "method_not_found") or
+        std.mem.eql(u8, code, "unsupported")) return .daemon_direct;
+    return .terminal;
+}
+
+const ChatOpenPresentation = struct {
+    workspace_index: i64,
+    pane_id: i64,
+    thread_index: i64,
+    focused: bool,
+    presentation: []const u8,
+    projected_store_revision: i64,
+};
+
+fn nonNegativeJsonInteger(value: std.json.Value) ?i64 {
+    return switch (value) {
+        .integer => |integer| if (integer >= 0) integer else null,
+        else => null,
+    };
+}
+
+fn presentationRemainingMs(deadline_ms: i64) ?u32 {
+    const remaining = deadline_ms -| sessionizer.monotonicNowMs();
+    return if (remaining > 0) @intCast(@min(remaining, @as(i64, std.math.maxInt(u32)))) else null;
+}
+
+fn presentationTransportTimeoutMs(remaining_ms: u32) u32 {
+    return @min(remaining_ms, LIVE_RESPONSE_TIMEOUT_MS);
+}
+
+fn presentationSleepMs(remaining_ms: u32) u32 {
+    return @min(remaining_ms, @as(u32, @intCast(CHAT_OPEN_PRESENT_DELAY_MS)));
+}
+
+fn sleepChatPresentationRetry(io: std.Io, deadline_ms: i64) void {
+    const remaining_ms = presentationRemainingMs(deadline_ms) orelse return;
+    std.Io.sleep(io, .fromMilliseconds(presentationSleepMs(remaining_ms)), .awake) catch {};
+}
+
+const ChatOpenValidation = struct {
+    workspace_id: []const u8,
+    provider: []const u8,
+    model: []const u8,
+    reasoning_effort: ?[]const u8,
+    reasoning_variant: ?[]const u8,
+    fast_mode: bool,
+};
+
+const ValidationNullableString = union(enum) {
+    invalid,
+    value: ?[]const u8,
+};
+
+fn parseNullableValidationString(object: std.json.ObjectMap, name: []const u8) ValidationNullableString {
+    const value = object.get(name) orelse return .invalid;
+    return switch (value) {
+        .null => .{ .value = null },
+        .string => |string| .{ .value = string },
+        else => .invalid,
+    };
+}
+
+/// Parse canonical Live validation settings before any durable mutation.
+/// Returned slices point into `envelope`; the parsed JSON must remain alive.
+fn parseChatOpenValidation(
+    envelope: std.json.Value,
+    expected_workspace_id: []const u8,
+    expected_provider: []const u8,
+) ?ChatOpenValidation {
+    if (envelope != .object or !(jsonBool(envelope.object.get("ok") orelse .null) orelse false)) return null;
+    const result = envelope.object.get("result") orelse return null;
+    if (result != .object) return null;
+    const workspace_id = jsonString(result.object.get("workspace_id") orelse .null) orelse return null;
+    const provider = jsonString(result.object.get("provider") orelse .null) orelse return null;
+    if (!std.mem.eql(u8, workspace_id, expected_workspace_id) or
+        !std.mem.eql(u8, provider, expected_provider)) return null;
+    const model = jsonString(result.object.get("model") orelse .null) orelse return null;
+    if (model.len == 0) return null;
+    const reasoning_effort = switch (parseNullableValidationString(result.object, "reasoning_effort")) {
+        .invalid => return null,
+        .value => |value| value,
+    };
+    const reasoning_variant = switch (parseNullableValidationString(result.object, "reasoning_variant")) {
+        .invalid => return null,
+        .value => |value| value,
+    };
+    const fast_mode = jsonBool(result.object.get("fast_mode") orelse .null) orelse return null;
+    return .{
+        .workspace_id = workspace_id,
+        .provider = provider,
+        .model = model,
+        .reasoning_effort = reasoning_effort,
+        .reasoning_variant = reasoning_variant,
+        .fast_mode = fast_mode,
+    };
+}
+
+const ExhaustedChatOpenPresentation = struct {
+    presented: ?bool,
+    status: []const u8,
+};
+
+fn exhaustedChatOpenPresentation(ambiguous: bool) ExhaustedChatOpenPresentation {
+    return if (ambiguous)
+        .{ .presented = null, .status = "unknown" }
+    else
+        .{ .presented = false, .status = "projection_pending" };
+}
+
+fn terminalChatOpenPresentation(ambiguous: bool, status: []const u8) ExhaustedChatOpenPresentation {
+    return if (ambiguous)
+        .{ .presented = null, .status = "unknown" }
+    else
+        .{ .presented = false, .status = status };
+}
+
+fn parseChatOpenPresentation(
+    envelope: std.json.Value,
+    expected_workspace_id: []const u8,
+    expected_thread_id: []const u8,
+    expected_store_revision: i64,
+) ?ChatOpenPresentation {
+    if (envelope != .object or !(jsonBool(envelope.object.get("ok") orelse .null) orelse false)) return null;
+    const result = envelope.object.get("result") orelse return null;
+    if (result != .object) return null;
+    const workspace_id = jsonString(result.object.get("workspace_id") orelse .null) orelse return null;
+    const local_thread_id = jsonString(result.object.get("local_thread_id") orelse .null) orelse return null;
+    const thread_id = jsonString(result.object.get("thread_id") orelse .null) orelse return null;
+    if (!std.mem.eql(u8, workspace_id, expected_workspace_id) or
+        !std.mem.eql(u8, local_thread_id, expected_thread_id) or
+        !std.mem.eql(u8, thread_id, expected_thread_id)) return null;
+    const workspace_index = switch (result.object.get("workspace_index") orelse .null) {
+        .integer => |value| if (value >= 0) value else return null,
+        else => return null,
+    };
+    const pane_id = switch (result.object.get("pane_id") orelse .null) {
+        .integer => |value| if (value >= 0) value else return null,
+        else => return null,
+    };
+    const thread_index = switch (result.object.get("thread_index") orelse .null) {
+        .integer => |value| if (value >= 0) value else return null,
+        else => return null,
+    };
+    const focused = jsonBool(result.object.get("focused") orelse .null) orelse return null;
+    const presentation = jsonString(result.object.get("presentation") orelse .null) orelse return null;
+    if (!std.mem.eql(u8, presentation, "created") and !std.mem.eql(u8, presentation, "existing")) return null;
+    const projected_store_revision = nonNegativeJsonInteger(result.object.get("projected_store_revision") orelse .null) orelse return null;
+    if (projected_store_revision < expected_store_revision) return null;
+    return .{
+        .workspace_index = workspace_index,
+        .pane_id = pane_id,
+        .thread_index = thread_index,
+        .focused = focused,
+        .presentation = presentation,
+        .projected_store_revision = projected_store_revision,
+    };
+}
+
+fn composeChatOpenPresentationAlloc(allocator: std.mem.Allocator, core: std.json.ObjectMap, presentation: ChatOpenPresentation) ![]u8 {
+    return composeChatOpenResultAlloc(allocator, core, true, "presented", presentation.workspace_index, presentation.pane_id, presentation.thread_index, presentation.focused, presentation.presentation, presentation.projected_store_revision);
+}
+
+fn composeChatOpenStatusAlloc(allocator: std.mem.Allocator, core: std.json.ObjectMap, presented: ?bool, status: []const u8) ![]u8 {
+    return composeChatOpenResultAlloc(allocator, core, presented, status, null, null, null, null, null, null);
+}
+
+fn composeChatOpenResultAlloc(allocator: std.mem.Allocator, core: std.json.ObjectMap, presented: ?bool, status: []const u8, workspace_index: ?i64, pane_id: ?i64, thread_index: ?i64, focused: ?bool, presentation: ?[]const u8, projected_store_revision: ?i64) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    try s.objectField("ok");
+    try s.write(true);
+    try s.objectField("result");
+    try s.beginObject();
+    const core_names = [_][]const u8{ "workspace_id", "local_thread_id", "thread_id", "store_revision", "created", "provider", "model", "reasoning_effort", "reasoning_variant", "fast_mode" };
+    for (core_names) |name| if (core.get(name)) |value| {
+        try s.objectField(name);
+        try s.write(value);
+    };
+    try s.objectField("presented");
+    try s.write(presented);
+    try s.objectField("presentation_status");
+    try s.write(status);
+    if (workspace_index) |value| {
+        try s.objectField("workspace_index");
+        try s.write(value);
+    }
+    if (pane_id) |value| {
+        try s.objectField("pane_id");
+        try s.write(value);
+    }
+    if (thread_index) |value| {
+        try s.objectField("thread_index");
+        try s.write(value);
+    }
+    if (focused) |value| {
+        try s.objectField("focused");
+        try s.write(value);
+    }
+    if (presentation) |value| {
+        try s.objectField("presentation");
+        try s.write(value);
+    }
+    if (projected_store_revision) |value| {
+        try s.objectField("projected_store_revision");
+        try s.write(value);
+    }
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
 }
 
 /// Public only so the hermetic daemon IT can execute the production confirm
@@ -6408,6 +6733,134 @@ fn prefPath(allocator: std.mem.Allocator) ![]u8 {
     return platform_paths.sdlPrefPathFallback(allocator, "verde", "Native");
 }
 
+const CliTestProcessEnv = struct {
+    const c = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+        extern "c" fn _putenv_s(varname: [*:0]const u8, value_string: [*:0]const u8) c_int;
+    };
+
+    fn getAlloc(allocator: std.mem.Allocator, name: [:0]const u8) !?[:0]u8 {
+        if (comptime builtin.os.tag == .windows) {
+            const environ: std.process.Environ = .{ .block = .global };
+            const raw = environ.getAlloc(allocator, name) catch |err| switch (err) {
+                error.EnvironmentVariableMissing => return null,
+                else => return err,
+            };
+            defer allocator.free(raw);
+            return try allocator.dupeZ(u8, raw);
+        }
+        if (std.c.getenv(name.ptr)) |value| return try allocator.dupeZ(u8, std.mem.span(value));
+        return null;
+    }
+
+    fn set(name: [:0]const u8, value: [:0]const u8) !void {
+        const result = if (comptime builtin.os.tag == .windows)
+            c._putenv_s(name.ptr, value.ptr)
+        else
+            c.setenv(name.ptr, value.ptr, 1);
+        if (result != 0) return error.SetEnvFailed;
+    }
+
+    fn unset(name: [:0]const u8) !void {
+        const result = if (comptime builtin.os.tag == .windows)
+            c._putenv_s(name.ptr, "")
+        else
+            c.unsetenv(name.ptr);
+        if (result != 0) return error.UnsetEnvFailed;
+    }
+
+    fn restore(name: [:0]const u8, previous: ?[:0]const u8) void {
+        if (previous) |value| {
+            set(name, value) catch @panic("failed to restore test environment");
+        } else {
+            unset(name) catch @panic("failed to restore test environment");
+        }
+    }
+};
+
+test "CLI production state readers honor session daemon store override" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "pref", std.Io.File.Permissions.default_dir);
+    try tmp.dir.createDir(std.testing.io, "override", std.Io.File.Permissions.default_dir);
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const pref_dir = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "pref" });
+    defer allocator.free(pref_dir);
+    const override_dir = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "override" });
+    defer allocator.free(override_dir);
+
+    {
+        var writer = try db_client.Client.init(allocator, pref_dir);
+        defer writer.deinit();
+        try writer.save(.{ .projects = &.{.{
+            .id = "fallback-workspace",
+            .label = "Fallback",
+            .path = "/fallback",
+            .terminal_layout_json =
+            \\{"tabs":[{"title":"Fallback","nodes":[{"kind":"leaf","pane_id":42,"session_id":"fallback-session"}]}]}
+            ,
+        }} });
+    }
+    {
+        var writer = try db_client.Client.init(allocator, override_dir);
+        defer writer.deinit();
+        try writer.save(.{ .projects = &.{.{
+            .id = "override-workspace",
+            .label = "Override",
+            .path = "/override",
+            .terminal_layout_json =
+            \\{"tabs":[{"title":"Override","nodes":[{"kind":"leaf","pane_id":42,"session_id":"override-session"}]}]}
+            ,
+        }} });
+    }
+
+    const env_name = sessionizer.SESSION_DAEMON_STORE_DIR_ENV_NAME;
+    // The configured Zig test runner is serial; still restore the process-wide
+    // override on every exit path before any later test can observe it.
+    const previous_override = try CliTestProcessEnv.getAlloc(allocator, env_name);
+    defer if (previous_override) |value| allocator.free(value);
+    defer CliTestProcessEnv.restore(env_name, previous_override);
+    try CliTestProcessEnv.unset(env_name);
+
+    const pref_db_path = try db_client.Client.pathForPrefPath(allocator, pref_dir);
+    defer allocator.free(pref_db_path);
+    const fallback_db_path = try stateDatabasePath(allocator, pref_dir);
+    defer allocator.free(fallback_db_path);
+    try std.testing.expectEqualStrings(pref_db_path, fallback_db_path);
+    var fallback_client = (try openStateReadOnly(allocator, pref_dir)).?;
+    defer fallback_client.deinit();
+    var fallback_state = (try fallback_client.load(allocator)).?;
+    defer fallback_state.deinit();
+    try std.testing.expectEqualStrings("fallback-workspace", fallback_state.value.projects[0].id.?);
+
+    const override_z = try allocator.dupeZ(u8, override_dir);
+    defer allocator.free(override_z);
+    try CliTestProcessEnv.set(env_name, override_z);
+
+    const expected_override_db_path = try db_client.Client.pathForPrefPath(allocator, override_dir);
+    defer allocator.free(expected_override_db_path);
+    const override_db_path = try stateDatabasePath(allocator, pref_dir);
+    defer allocator.free(override_db_path);
+    try std.testing.expectEqualStrings(expected_override_db_path, override_db_path);
+    try std.testing.expect(!std.mem.eql(u8, pref_db_path, override_db_path));
+
+    var override_client = (try openStateReadOnly(allocator, pref_dir)).?;
+    defer override_client.deinit();
+    var override_state = (try override_client.load(allocator)).?;
+    defer override_state.deinit();
+    try std.testing.expectEqualStrings("override-workspace", override_state.value.projects[0].id.?);
+
+    try std.testing.expectEqualStrings(override_db_path, override_client.path);
+
+    const attach_argv = [_][]const u8{ "attach", "--workspace", "override-workspace", "--pane", "42" };
+    const session_id = try resolveAttachSessionId(allocator, .{ .io = std.testing.io }, &attach_argv, pref_dir);
+    defer allocator.free(session_id);
+    try std.testing.expectEqualStrings("override-session", session_id);
+}
+
 test "cli args parse command and json flag" {
     const argv = [_][]const u8{ "verde", "state", "workspaces", "--json" };
     const parsed = args.parse(&argv);
@@ -6981,6 +7434,192 @@ test "M4-P5 fix open_chat Live envelope classifier extracts stable ids" {
         defer parsed.deinit();
         try std.testing.expect(classifyChatOpenLiveEnvelope(parsed.value) == .missing_ids);
     }
+}
+
+test "daemon-first chat presentation validates identity and preserves durable result" {
+    const allocator = std.testing.allocator;
+    var daemon = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"local_thread_id\":\"thread-1\",\"thread_id\":\"thread-1\",\"store_revision\":17,\"created\":true,\"provider\":\"codex\",\"model\":\"gpt-5.6-sol\",\"reasoning_effort\":\"low\",\"reasoning_variant\":null,\"fast_mode\":false,\"presented\":false}}",
+        .{},
+    );
+    defer daemon.deinit();
+    const daemon_core = daemon.value.object.get("result").?.object;
+
+    var live = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"workspace_index\":3,\"local_thread_id\":\"thread-1\",\"thread_id\":\"thread-1\",\"pane_id\":9,\"thread_index\":4,\"focused\":true,\"presented\":true,\"presentation\":\"created\",\"projected_store_revision\":17}}",
+        .{},
+    );
+    defer live.deinit();
+    const presentation = parseChatOpenPresentation(live.value, "ws-1", "thread-1", 17) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 3), presentation.workspace_index);
+    try std.testing.expectEqual(@as(i64, 9), presentation.pane_id);
+    try std.testing.expectEqual(@as(i64, 4), presentation.thread_index);
+    try std.testing.expect(presentation.focused);
+    try std.testing.expectEqualStrings("created", presentation.presentation);
+    try std.testing.expectEqual(@as(i64, 17), presentation.projected_store_revision);
+
+    const composed = try composeChatOpenPresentationAlloc(allocator, daemon_core, presentation);
+    defer allocator.free(composed);
+    var result_envelope = try std.json.parseFromSlice(std.json.Value, allocator, composed, .{});
+    defer result_envelope.deinit();
+    const result = result_envelope.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings("ws-1", jsonString(result.get("workspace_id").?).?);
+    try std.testing.expectEqualStrings("thread-1", jsonString(result.get("local_thread_id").?).?);
+    try std.testing.expectEqual(@as(i64, 17), jsonInt(result.get("store_revision").?).?);
+    try std.testing.expect(jsonBool(result.get("created").?).?);
+    try std.testing.expect(jsonBool(result.get("presented").?).?);
+    try std.testing.expectEqual(@as(i64, 3), jsonInt(result.get("workspace_index").?).?);
+    try std.testing.expectEqualStrings("created", jsonString(result.get("presentation").?).?);
+
+    const malformed = [_][]const u8{
+        "{\"ok\":true}",
+        "{\"ok\":true,\"result\":null}",
+        "{\"ok\":true,\"result\":1}",
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"wrong\",\"local_thread_id\":\"thread-1\",\"thread_id\":\"thread-1\",\"workspace_index\":0,\"pane_id\":1,\"thread_index\":0,\"focused\":true,\"presentation\":\"created\"}}",
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"local_thread_id\":\"wrong\",\"thread_id\":\"thread-1\",\"workspace_index\":0,\"pane_id\":1,\"thread_index\":0,\"focused\":true,\"presentation\":\"created\"}}",
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"local_thread_id\":\"thread-1\",\"thread_id\":\"thread-1\",\"workspace_index\":\"0\",\"pane_id\":1,\"thread_index\":0,\"focused\":true,\"presentation\":\"created\"}}",
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"local_thread_id\":\"thread-1\",\"thread_id\":\"thread-1\",\"workspace_index\":0,\"pane_id\":\"1\",\"thread_index\":0,\"focused\":true,\"presentation\":\"created\"}}",
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"local_thread_id\":\"thread-1\",\"thread_id\":\"thread-1\",\"workspace_index\":0,\"pane_id\":1,\"thread_index\":\"0\",\"focused\":true,\"presentation\":\"created\"}}",
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"local_thread_id\":\"thread-1\",\"thread_id\":\"thread-1\",\"workspace_index\":0,\"pane_id\":1,\"thread_index\":0,\"focused\":\"true\",\"presentation\":\"created\"}}",
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"local_thread_id\":\"thread-1\",\"thread_id\":\"thread-1\",\"workspace_index\":0,\"pane_id\":1,\"thread_index\":0,\"focused\":true,\"presentation\":\"new\"}}",
+    };
+    for (malformed) |payload| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parseChatOpenPresentation(parsed.value, "ws-1", "thread-1", 17) == null);
+    }
+
+    const pending = exhaustedChatOpenPresentation(false);
+    try std.testing.expectEqual(false, pending.presented.?);
+    try std.testing.expectEqualStrings("projection_pending", pending.status);
+    const ambiguous = exhaustedChatOpenPresentation(true);
+    try std.testing.expect(ambiguous.presented == null);
+    try std.testing.expectEqualStrings("unknown", ambiguous.status);
+}
+
+test "daemon-first chat validation requires canonical identity and setting types" {
+    const allocator = std.testing.allocator;
+    const valid_payloads = [_][]const u8{
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"provider\":\"codex\",\"model\":\"gpt-5.6-sol\",\"reasoning_effort\":\"high\",\"reasoning_variant\":null,\"fast_mode\":true}}",
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"provider\":\"codex\",\"model\":\"gpt-5.6-sol\",\"reasoning_effort\":null,\"reasoning_variant\":\"max\",\"fast_mode\":false}}",
+    };
+    for (valid_payloads, 0..) |payload, index| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+        const validated = parseChatOpenValidation(parsed.value, "ws-1", "codex") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("gpt-5.6-sol", validated.model);
+        try std.testing.expectEqual(index == 0, validated.fast_mode);
+        if (index == 0) {
+            try std.testing.expectEqualStrings("high", validated.reasoning_effort.?);
+            try std.testing.expect(validated.reasoning_variant == null);
+        } else {
+            try std.testing.expect(validated.reasoning_effort == null);
+            try std.testing.expectEqualStrings("max", validated.reasoning_variant.?);
+        }
+    }
+
+    const malformed = [_][]const u8{
+        "{\"ok\":true}",
+        "{\"ok\":true,\"result\":null}",
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"wrong\",\"provider\":\"codex\",\"model\":\"m\",\"reasoning_effort\":null,\"reasoning_variant\":null,\"fast_mode\":false}}",
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"provider\":\"claude\",\"model\":\"m\",\"reasoning_effort\":null,\"reasoning_variant\":null,\"fast_mode\":false}}",
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"provider\":\"codex\",\"reasoning_effort\":null,\"reasoning_variant\":null,\"fast_mode\":false}}",
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"provider\":\"codex\",\"model\":7,\"reasoning_effort\":null,\"reasoning_variant\":null,\"fast_mode\":false}}",
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"provider\":\"codex\",\"model\":\"\",\"reasoning_effort\":null,\"reasoning_variant\":null,\"fast_mode\":false}}",
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"provider\":\"codex\",\"model\":\"m\",\"reasoning_variant\":null,\"fast_mode\":false}}",
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"provider\":\"codex\",\"model\":\"m\",\"reasoning_effort\":3,\"reasoning_variant\":null,\"fast_mode\":false}}",
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"provider\":\"codex\",\"model\":\"m\",\"reasoning_effort\":null,\"reasoning_variant\":3,\"fast_mode\":false}}",
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"provider\":\"codex\",\"model\":\"m\",\"reasoning_effort\":null,\"reasoning_variant\":null}}",
+        "{\"ok\":true,\"result\":{\"workspace_id\":\"ws-1\",\"provider\":\"codex\",\"model\":\"m\",\"reasoning_effort\":null,\"reasoning_variant\":null,\"fast_mode\":\"false\"}}",
+    };
+    for (malformed) |payload| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parseChatOpenValidation(parsed.value, "ws-1", "codex") == null);
+    }
+}
+
+test "protocol 19 stale GUI validation falls back only for unsupported methods" {
+    try std.testing.expectEqual(@as(u32, 19), sessionizer.PROTOCOL_VERSION);
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { payload: []const u8, expected: ChatOpenValidationRoute }{
+        .{
+            .payload = "{\"ok\":true,\"result\":{\"workspace_id\":\"ws\"}}",
+            .expected = .validated,
+        },
+        .{
+            .payload = "{\"ok\":false,\"error\":{\"code\":\"method_not_found\",\"message\":\"chat.open.validate\"}}",
+            .expected = .daemon_direct,
+        },
+        .{
+            .payload = "{\"ok\":false,\"error\":{\"code\":\"unsupported\",\"message\":\"validation unavailable\"}}",
+            .expected = .daemon_direct,
+        },
+        .{
+            .payload = "{\"ok\":false,\"error\":{\"code\":\"invalid_model\",\"message\":\"bad model\"}}",
+            .expected = .terminal,
+        },
+        .{
+            .payload = "{\"ok\":false,\"error\":{\"code\":\"capability_unavailable\",\"message\":\"not validation compatibility\"}}",
+            .expected = .terminal,
+        },
+        .{
+            .payload = "{\"error\":{\"code\":\"method_not_found\"}}",
+            .expected = .terminal,
+        },
+        .{
+            .payload = "{\"ok\":\"false\",\"error\":{\"code\":\"unsupported\"}}",
+            .expected = .terminal,
+        },
+        .{
+            .payload = "{\"ok\":false,\"error\":{\"code\":\"method_not_found\"}}",
+            .expected = .terminal,
+        },
+        .{
+            .payload = "{\"ok\":false,\"error\":{\"code\":\"unsupported\",\"message\":7}}",
+            .expected = .terminal,
+        },
+        .{ .payload = "[]", .expected = .terminal },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.payload, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.expected, chatOpenValidationRoute(parsed.value));
+    }
+
+    try std.testing.expect(isLiveSocketUnavailable(error.FileNotFound));
+    try std.testing.expect(isLiveSocketUnavailable(error.ConnectionRefused));
+    try std.testing.expect(!isLiveSocketUnavailable(error.AccessDenied));
+    try std.testing.expect(!isLiveSocketUnavailable(error.TimedOut));
+}
+
+test "chat presentation absolute deadline clamps transport and sleep budgets" {
+    try std.testing.expectEqual(@as(u32, 2_000), presentationTransportTimeoutMs(2_000));
+    try std.testing.expectEqual(@as(u32, 37), presentationTransportTimeoutMs(37));
+    try std.testing.expectEqual(@as(u32, 50), presentationSleepMs(2_000));
+    try std.testing.expectEqual(@as(u32, 19), presentationSleepMs(19));
+    try std.testing.expect(CHAT_OPEN_PRESENT_DEADLINE_MS < LIVE_RESPONSE_TIMEOUT_MS);
+}
+
+test "chat presentation ambiguity dominates typed terminal outcomes" {
+    const ambiguous_unavailable = terminalChatOpenPresentation(true, "refresh_unavailable");
+    try std.testing.expect(ambiguous_unavailable.presented == null);
+    try std.testing.expectEqualStrings("unknown", ambiguous_unavailable.status);
+    const ambiguous_missing = terminalChatOpenPresentation(true, "projection_identity_missing");
+    try std.testing.expect(ambiguous_missing.presented == null);
+    try std.testing.expectEqualStrings("unknown", ambiguous_missing.status);
+
+    const unavailable = terminalChatOpenPresentation(false, "refresh_unavailable");
+    try std.testing.expectEqual(false, unavailable.presented.?);
+    try std.testing.expectEqualStrings("refresh_unavailable", unavailable.status);
+    const missing = terminalChatOpenPresentation(false, "projection_identity_missing");
+    try std.testing.expectEqual(false, missing.presented.?);
+    try std.testing.expectEqualStrings("projection_identity_missing", missing.status);
 }
 
 test "M4-P5 fix open_chat Live confirm budget is bounded at two seconds" {
