@@ -67,7 +67,7 @@ const OMARCHY_THEMES: OmarchyTheme[] = [
   { slug: 'miasma', name: 'Miasma', bg: '#222222', accent: '#78824b', fg: '#c2c2b0', warm: '#b36d43' },
   { slug: 'retro-82', name: 'Retro 82', bg: '#05182e', accent: '#faa968', fg: '#f6dcac', warm: '#e97b3c' },
   { slug: 'flexoki-light', name: 'Flexoki Light', bg: '#fffcf0', accent: '#205ea6', fg: '#100f0f', warm: '#d0a215' },
-  { slug: 'mist-deep', name: 'Mist Deep', bg: '#eef2f4', accent: '#0f6ac9', fg: '#0d1012', warm: '#a0791a', fallbackShot: appScreenshot },
+  { slug: 'mist-deep', name: 'Mist Deep', bg: '#eef2f4', accent: '#0f6ac9', fg: '#0d1012', warm: '#a0791a' },
   { slug: 'vantablack', name: 'Vantablack', bg: '#000000', accent: '#8d8d8d', fg: '#ffffff', warm: '#cecece' },
   { slug: 'white', name: 'White', bg: '#ffffff', accent: '#6e6e6e', fg: '#000000', warm: '#4a4a4a' },
 ]
