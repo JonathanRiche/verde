@@ -98,7 +98,10 @@ const TEST_RETENTION_ENV_NAME = "VERDE_SESSIONIZER_TEST_RETENTION_MS";
 const StoreService = struct {
     mutex: std.atomic.Mutex = .unlocked,
     store: daemon_store.Store,
+    /// Mutators only; prepare-shutdown refuses while nonzero.
     in_flight: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Read-side pointer borrows that must outlive service detachment/deinit.
+    lifetime_pins: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     draining: bool = false, // set by prepare-shutdown in S3
 };
 
@@ -4794,20 +4797,42 @@ pub const Daemon = struct {
 
     fn chatTurnTailResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
         if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
-        const turn = self.findChatTurn(jsonString(params.object.get("turn_id") orelse .null) orelse return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing turn_id")) orelse
-            return try errorResponseAlloc(self.allocator, id_value, "not_found", "turn not found");
+        const turn_id = jsonString(params.object.get("turn_id") orelse .null) orelse return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing turn_id");
         const after_seq = jsonUsize(params.object.get("after_seq") orelse .null) orelse 0;
-        lockTurn(turn);
-        defer turn.mutex.unlock();
-        if (chatTailUpperBound(turn, @intCast(after_seq)) > MAX_RESPONSE_BYTES) return error.ResponseTooLarge;
-        var writer: std.Io.Writer.Allocating = .init(self.allocator);
-        errdefer writer.deinit();
-        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
-        try beginOk(&s, id_value);
-        try s.objectField("result");
-        try writeChatTurnTail(&s, turn, @intCast(after_seq));
-        try s.endObject();
-        return try writer.toOwnedSlice();
+        lockDaemon(self);
+        if (self.findChatTurn(turn_id)) |turn| {
+            lockTurn(turn);
+            self.mutex.unlock();
+            defer turn.mutex.unlock();
+            if (chatTailUpperBound(turn, @intCast(after_seq)) > MAX_RESPONSE_BYTES) return error.ResponseTooLarge;
+            var writer: std.Io.Writer.Allocating = .init(self.allocator);
+            errdefer writer.deinit();
+            var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+            try beginOk(&s, id_value);
+            try s.objectField("result");
+            try writeChatTurnTail(&s, turn, @intCast(after_seq));
+            try s.endObject();
+            return try writer.toOwnedSlice();
+        }
+        const service = self.store_service;
+        if (service) |svc| _ = svc.lifetime_pins.fetchAdd(1, .monotonic);
+        self.mutex.unlock();
+        const svc = service orelse return try errorResponseAlloc(self.allocator, id_value, "not_found", "turn not found");
+        defer _ = svc.lifetime_pins.fetchSub(1, .monotonic);
+
+        lockStoreService(svc);
+        const record = loadTurnRecord(self.allocator, &svc.store, .{ .turn_id = turn_id }) catch |err| {
+            svc.mutex.unlock();
+            return switch (err) {
+                error.ResourceNotFound => try errorResponseAlloc(self.allocator, id_value, "not_found", "turn not found"),
+                else => err,
+            };
+        };
+        svc.mutex.unlock();
+        defer freeTurnRecord(self.allocator, record);
+        if (!durableTurnRecordIsTerminal(record))
+            return try errorResponseAlloc(self.allocator, id_value, "not_found", "turn not found");
+        return try durableChatTurnTailResponse(self.allocator, id_value, record);
     }
 
     fn chatTurnApproveResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
@@ -5913,31 +5938,60 @@ fn mutationHeader(mutation: daemon_store.Mutation) store_protocol.MutationHeader
     };
 }
 
-/// Path-valued store-dir override. Caller frees a non-null result.
-/// OutOfMemory propagates so a broken/oom test store fails readiness loudly
-/// Hermetic store-dir override. Missing/empty → null (use production pref_path).
-fn storeDirFromEnv(allocator: std.mem.Allocator) !?[]u8 {
+pub const EffectiveStoreDirectory = struct {
+    path: []u8,
+    overridden: bool,
+};
+
+/// Resolve the daemon and desktop projection store directory from an injected
+/// raw environment value. The returned path is always owned by the caller.
+pub fn effectiveStoreDirectoryFromRaw(allocator: std.mem.Allocator, pref_path: []const u8, raw_override: ?[]const u8) !EffectiveStoreDirectory {
+    const raw = raw_override orelse return .{
+        .path = try allocator.dupe(u8, pref_path),
+        .overridden = false,
+    };
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return .{
+        .path = try allocator.dupe(u8, pref_path),
+        .overridden = false,
+    };
+    return .{
+        .path = try allocator.dupe(u8, trimmed),
+        .overridden = true,
+    };
+}
+
+/// Resolve the effective store directory from the process environment.
+/// Missing, empty, or invalid-WTF8 overrides retain the production pref path.
+pub fn effectiveStoreDirectory(allocator: std.mem.Allocator, pref_path: []const u8) !EffectiveStoreDirectory {
     const environ: std.process.Environ = if (builtin.os.tag == .windows)
         .{ .block = .global }
     else
         .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
     const raw = environ.getAlloc(allocator, SESSION_DAEMON_STORE_DIR_ENV_NAME) catch |err| switch (err) {
-        error.EnvironmentVariableMissing => return null,
+        error.EnvironmentVariableMissing => return effectiveStoreDirectoryFromRaw(allocator, pref_path, null),
         error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidWtf8 => return null,
+        error.InvalidWtf8 => return effectiveStoreDirectoryFromRaw(allocator, pref_path, null),
     };
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (trimmed.len == 0) {
-        allocator.free(raw);
-        return null;
+    defer allocator.free(raw);
+    return effectiveStoreDirectoryFromRaw(allocator, pref_path, raw);
+}
+
+test "effective store directory preserves override parsing semantics" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { raw: ?[]const u8, expected: []const u8, overridden: bool }{
+        .{ .raw = null, .expected = "/pref", .overridden = false },
+        .{ .raw = "", .expected = "/pref", .overridden = false },
+        .{ .raw = " \t\r\n", .expected = "/pref", .overridden = false },
+        .{ .raw = " /override \n", .expected = "/override", .overridden = true },
+        .{ .raw = "relative/store", .expected = "relative/store", .overridden = true },
+    };
+    for (cases) |case| {
+        const result = try effectiveStoreDirectoryFromRaw(allocator, "/pref", case.raw);
+        defer allocator.free(result.path);
+        try std.testing.expectEqualStrings(case.expected, result.path);
+        try std.testing.expectEqual(case.overridden, result.overridden);
     }
-    if (trimmed.len == raw.len) return raw;
-    const owned = allocator.dupe(u8, trimmed) catch {
-        allocator.free(raw);
-        return error.OutOfMemory;
-    };
-    allocator.free(raw);
-    return owned;
 }
 
 /// Test-only store disable (keeps store-less IT / unit pins alive after P3).
@@ -5997,22 +6051,17 @@ fn maybeInitStoreService(daemon: *Daemon) !void {
         return;
     }
 
-    const override_dir = try storeDirFromEnv(daemon.allocator);
-    defer if (override_dir) |dir| daemon.allocator.free(dir);
-
-    const store_dir = override_dir orelse blk: {
-        // NIT-1: never silently store-less. Empty pref_path is unreachable in
-        // production (__session-daemon always passes a real path) but a quiet
-        // fallback here would contradict the loud-fail readiness rule.
-        if (daemon.pref_path.len == 0) {
-            log.err("production store open requires non-empty pref_path", .{});
-            return error.InvalidParams;
-        }
-        break :blk daemon.pref_path;
-    };
+    // NIT-1: never silently store-less. Empty pref_path is unreachable in
+    // production (__session-daemon always passes a real path).
+    if (daemon.pref_path.len == 0) {
+        log.err("production store open requires non-empty pref_path", .{});
+        return error.InvalidParams;
+    }
+    const effective_dir = try effectiveStoreDirectory(daemon.allocator, daemon.pref_path);
+    defer daemon.allocator.free(effective_dir.path);
     // B9: fault env is active only alongside the hermetic store-dir override.
-    const fault = if (override_dir != null) try storeFaultFromEnv(daemon.allocator) else daemon_store.StoreFault.none;
-    const db_path = try std.fs.path.join(daemon.allocator, &.{ store_dir, "state.sqlite" });
+    const fault = if (effective_dir.overridden) try storeFaultFromEnv(daemon.allocator) else daemon_store.StoreFault.none;
+    const db_path = try std.fs.path.join(daemon.allocator, &.{ effective_dir.path, "state.sqlite" });
     defer daemon.allocator.free(db_path);
 
     const service = try daemon.allocator.create(StoreService);
@@ -6158,9 +6207,9 @@ var chat_commit_fault_once_consumed = std.atomic.Value(bool).init(false);
 /// `fail_once` (one-shot) or `fail_always` (every attempt). Does not touch
 /// SQLite; caller returns StoreBusy for the bounded-retry path.
 fn chatCommitFaultOnceShouldFail(allocator: std.mem.Allocator) bool {
-    const override_dir = storeDirFromEnv(allocator) catch return false;
-    defer if (override_dir) |dir| allocator.free(dir);
-    if (override_dir == null) return false;
+    const effective_dir = effectiveStoreDirectory(allocator, "") catch return false;
+    defer allocator.free(effective_dir.path);
+    if (!effective_dir.overridden) return false;
 
     const environ: std.process.Environ = if (builtin.os.tag == .windows)
         .{ .block = .global }
@@ -6638,10 +6687,10 @@ fn harnessNameFromCode(code: i64) []const u8 {
 
 fn roleNameFromCode(code: i64) []const u8 {
     return switch (code) {
-        0 => "system",
-        1 => "user",
-        2 => "assistant",
-        else => "system",
+        0 => "user",
+        1 => "assistant",
+        2 => "system",
+        else => "user",
     };
 }
 
@@ -7219,7 +7268,8 @@ const ServerRequestClass = enum { slow_registry, store, unlocked_method, normal 
 fn methodRunsUnlocked(method: []const u8) bool {
     // M4-P4: ledger identity guard on accept must read SQLite under the store
     // mutex only; the `.normal` outer lockDaemon window cannot nest that work.
-    return std.mem.eql(u8, method, "chat.turn.start");
+    return std.mem.eql(u8, method, "chat.turn.start") or
+        std.mem.eql(u8, method, "chat.turn.tail");
 }
 
 fn classifyServerRequest(allocator: std.mem.Allocator, request: []const u8) !ServerRequestClass {
@@ -7493,18 +7543,21 @@ fn finalizeSessionizerStore(context: *SessionizerServerContext) void {
         };
     }
 
-    // MINOR-5(b) / MINOR-V1: drain in_flight before destroy so a late
-    // staging/commit pointer-grab cannot UAF after store.deinit. On timeout,
-    // deliberately leak the service (loud warn) rather than deinit under a
-    // live in_flight commit — a bounded one-time leak on the serve-error
-    // fallback beats use-after-free.
+    // Drain writes and read-side lifetime pins before destroy so no captured
+    // service pointer can outlive store.deinit. On timeout, deliberately leak
+    // the service rather than risk use-after-free.
     {
         const drain_deadline = nowMs() + 2000;
-        while (service.in_flight.load(.monotonic) != 0) {
+        while (service.in_flight.load(.monotonic) != 0 or
+            service.lifetime_pins.load(.monotonic) != 0)
+        {
             if (nowMs() >= drain_deadline) {
                 log.warn(
-                    "store finalize in_flight drain timed out count={d}; leaking store service to avoid UAF",
-                    .{service.in_flight.load(.monotonic)},
+                    "store finalize lifetime drain timed out writes={d} pins={d}; leaking store service to avoid UAF",
+                    .{
+                        service.in_flight.load(.monotonic),
+                        service.lifetime_pins.load(.monotonic),
+                    },
                 );
                 return;
             }
@@ -7968,6 +8021,54 @@ fn writeChatTurnTail(s: *std.json.Stringify, turn: *const ChatTurn, after_seq: u
     try s.objectField("durability_error");
     if (turn.durability_error) |value| try s.write(value) else try s.write(null);
     try s.endObject();
+}
+
+fn durableTurnRecordIsTerminal(record: store_protocol.TurnRecord) bool {
+    if (record.committed_store_revision == null) return false;
+    return std.mem.eql(u8, record.status, "completed") or
+        std.mem.eql(u8, record.status, "failed") or
+        std.mem.eql(u8, record.status, "aborted");
+}
+
+fn durableChatTurnTailResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    record: store_protocol.TurnRecord,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&s, id_value);
+    try s.objectField("result");
+    try s.beginObject();
+    try s.objectField("status");
+    try s.write(record.status);
+    try s.objectField("events");
+    try s.beginArray();
+    try s.endArray();
+    try s.objectField("next_seq");
+    try s.write(0);
+    try s.objectField("provider_thread_id");
+    if (record.provider_thread_id) |value| try s.write(value) else try s.write(null);
+    try s.objectField("active_turn_id");
+    try s.write(null);
+    try s.objectField("result_reply_text");
+    try s.write(null);
+    try s.objectField("error_message");
+    if (record.error_message) |value| try s.write(value) else try s.write(null);
+    try s.objectField("pending_approval");
+    try s.write(null);
+    try s.objectField("committed_store_revision");
+    try s.write(record.committed_store_revision.?);
+    try s.objectField("events_compacted_before_seq");
+    try s.write(null);
+    try s.objectField("durability_pending");
+    try s.write(false);
+    try s.objectField("durability_error");
+    try s.write(null);
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
 }
 
 fn chatTailUpperBound(turn: *const ChatTurn, after_seq: u64) usize {
@@ -11365,6 +11466,87 @@ test "finalizeSessionizerStore nulls store before endpoint release seam and is i
     try std.testing.expect(daemon.store_service == null);
 }
 
+const FinalizeStoreThreadContext = struct {
+    server: *SessionizerServerContext,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn finalizeStoreThread(context: *FinalizeStoreThreadContext) void {
+    finalizeSessionizerStore(context.server);
+    context.done.store(true, .release);
+}
+
+test "store finalization drains writes and reader lifetime pins" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+
+    lockDaemon(&daemon);
+    const service = daemon.store_service.?;
+    _ = service.in_flight.fetchAdd(1, .monotonic);
+    _ = service.lifetime_pins.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    var write_held = true;
+    var pin_held = true;
+    defer if (write_held) {
+        _ = service.in_flight.fetchSub(1, .monotonic);
+    };
+    defer if (pin_held) {
+        _ = service.lifetime_pins.fetchSub(1, .monotonic);
+    };
+
+    var stop = std.atomic.Value(bool).init(false);
+    var server: SessionizerServerContext = .{
+        .daemon = &daemon,
+        .endpoint = "",
+        .pid_path = "",
+        .stop_requested = &stop,
+    };
+    var context: FinalizeStoreThreadContext = .{ .server = &server };
+    const worker = try std.Thread.spawn(.{}, finalizeStoreThread, .{&context});
+    var joined = false;
+    defer if (!joined) {
+        if (pin_held) {
+            _ = service.lifetime_pins.fetchSub(1, .monotonic);
+            pin_held = false;
+        }
+        if (write_held) {
+            _ = service.in_flight.fetchSub(1, .monotonic);
+            write_held = false;
+        }
+        worker.join();
+    };
+
+    var detached = false;
+    var attempts: usize = 0;
+    while (!detached and attempts < 200) : (attempts += 1) {
+        lockDaemon(&daemon);
+        detached = daemon.store_service == null;
+        daemon.mutex.unlock();
+        if (!detached) platform_runtime.sleepMillis(5);
+    }
+    try std.testing.expect(detached);
+    try std.testing.expect(!context.done.load(.acquire));
+
+    _ = service.lifetime_pins.fetchSub(1, .monotonic);
+    pin_held = false;
+    platform_runtime.sleepMillis(20);
+    try std.testing.expect(!context.done.load(.acquire));
+
+    _ = service.in_flight.fetchSub(1, .monotonic);
+    write_held = false;
+    worker.join();
+    joined = true;
+    try std.testing.expect(context.done.load(.acquire));
+    try std.testing.expect(daemon.store_service == null);
+}
+
 test "seed raises next_terminal_generation above imported outcome generations" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -11535,6 +11717,78 @@ test "prepare shutdown accepts while store status is in flight" {
     try std.testing.expect(jsonBool(prepare_result.get("accepted") orelse .null).?);
     try std.testing.expect(daemon.store_service.?.draining);
     try std.testing.expectEqual(@as(usize, 0), daemon.store_service.?.in_flight.load(.monotonic));
+}
+
+const DurableTailThreadContext = struct {
+    daemon: *Daemon,
+    response: ?[]u8 = null,
+    err: ?anyerror = null,
+};
+
+fn durableTailThread(context: *DurableTailThreadContext) void {
+    context.response = context.daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"chat.turn.tail","params":{"turn_id":"missing-durable-turn","after_seq":0}}
+    ) catch |err| {
+        context.err = err;
+        return;
+    };
+}
+
+test "durable tail lifetime pin does not count as a prepare-shutdown write" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    daemon.idle_exit_ms = null;
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+    const service = daemon.store_service.?;
+
+    lockStoreService(service);
+    var store_locked = true;
+    defer if (store_locked) service.mutex.unlock();
+    var context: DurableTailThreadContext = .{ .daemon = &daemon };
+    const worker = try std.Thread.spawn(.{}, durableTailThread, .{&context});
+    var joined = false;
+    defer if (!joined) {
+        if (store_locked) {
+            service.mutex.unlock();
+            store_locked = false;
+        }
+        worker.join();
+    };
+
+    var attempts: usize = 0;
+    while (service.lifetime_pins.load(.monotonic) == 0 and attempts < 200) : (attempts += 1) {
+        platform_runtime.sleepMillis(5);
+    }
+    try std.testing.expectEqual(@as(usize, 1), service.lifetime_pins.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), service.in_flight.load(.monotonic));
+
+    const prepare = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"daemon.prepareShutdown","params":{}}
+    );
+    defer allocator.free(prepare);
+    var prepare_parsed = try std.json.parseFromSlice(std.json.Value, allocator, prepare, .{});
+    defer prepare_parsed.deinit();
+    try std.testing.expect(prepare_parsed.value.object.get("result").?.object.get("accepted").?.bool);
+
+    service.mutex.unlock();
+    store_locked = false;
+    worker.join();
+    joined = true;
+    if (context.err) |err| return err;
+    const response = context.response orelse return error.TestUnexpectedResult;
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("not_found", parsed.value.object.get("error").?.object.get("code").?.string);
+    try std.testing.expectEqual(@as(usize, 0), service.lifetime_pins.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), service.in_flight.load(.monotonic));
 }
 
 test "drained daemon rejects store mutators with invalid_state" {
@@ -11983,7 +12237,7 @@ test "new interrupted acceptance conflict never terminalizes unowned work" {
     try runAcceptanceOwnershipWorkerScenario(false);
 }
 
-test "chat.thread.get and chat.turn.record dispatch typed durable reads" {
+test "durable reads decode shipped raw chat role codes" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -12005,6 +12259,30 @@ test "chat.thread.get and chat.turn.record dispatch typed durable reads" {
         .workspace_id = "ws-dto",
         .thread = .{ .local_thread_id = "t-dto", .title = "DTO thread", .provider = "codex", .harness = "local_cli" },
     });
+    const thread_row = (try daemon.store_service.?.store.conn.row(
+        "select id from threads where local_thread_id = ?1",
+        .{"t-dto"},
+    )).?;
+    const thread_row_id = thread_row.int(0);
+    thread_row.deinit();
+    const raw_messages = [_]struct { role: i64, author: []const u8, body: []const u8 }{
+        .{ .role = 0, .author = "You", .body = "raw user" },
+        .{ .role = 1, .author = "Assistant", .body = "raw assistant" },
+        .{ .role = 2, .author = "System", .body = "raw system" },
+    };
+    for (raw_messages, 0..) |message, index| {
+        try daemon.store_service.?.store.conn.exec(
+            "insert into messages (thread_id, sort_index, role, author, body, message_id) values (?1, ?2, ?3, ?4, ?5, ?6)",
+            .{
+                thread_row_id,
+                @as(i64, @intCast(index)),
+                message.role,
+                message.author,
+                message.body,
+                message.body,
+            },
+        );
+    }
     _ = try daemon.store_service.?.store.commitTurn(.{
         .turn_id = "turn-dto",
         .workspace_id = "ws-dto",
@@ -12013,9 +12291,7 @@ test "chat.thread.get and chat.turn.record dispatch typed durable reads" {
         .started_at_ms = 1,
         .finished_at_ms = 2,
         .provider = "codex",
-        .messages = &.{
-            .{ .message_id = "m1", .role = "assistant", .author = "codex", .body = "hi" },
-        },
+        .messages = &.{},
     });
     daemon.store_service.?.mutex.unlock();
 
@@ -12023,8 +12299,16 @@ test "chat.thread.get and chat.turn.record dispatch typed durable reads" {
         \\{"jsonrpc":"2.0","id":1,"method":"chat.thread.get","params":{"workspace_id":"ws-dto","local_thread_id":"t-dto"}}
     );
     defer allocator.free(get_response);
-    try std.testing.expect(std.mem.indexOf(u8, get_response, "\"local_thread_id\":\"t-dto\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, get_response, "\"body\":\"hi\"") != null);
+    var get_parsed = try std.json.parseFromSlice(std.json.Value, allocator, get_response, .{});
+    defer get_parsed.deinit();
+    const thread = get_parsed.value.object.get("result").?.object.get("thread").?.object;
+    try std.testing.expectEqualStrings("t-dto", thread.get("local_thread_id").?.string);
+    const messages = thread.get("messages").?.array.items;
+    const expected_roles = [_][]const u8{ "user", "assistant", "system" };
+    try std.testing.expectEqual(expected_roles.len, messages.len);
+    for (messages, expected_roles) |message, expected_role| {
+        try std.testing.expectEqualStrings(expected_role, message.object.get("role").?.string);
+    }
 
     const record_response = try daemon.handleRequest(
         \\{"jsonrpc":"2.0","id":2,"method":"chat.turn.record","params":{"turn_id":"turn-dto"}}
@@ -12038,4 +12322,70 @@ test "chat.thread.get and chat.turn.record dispatch typed durable reads" {
     );
     defer allocator.free(list_response);
     try std.testing.expect(std.mem.indexOf(u8, list_response, "\"local_thread_id\":\"t-dto\"") != null);
+}
+
+test "chat turn tail falls back to durable terminal record after consume" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testStoreDbPath(&tmp);
+    defer allocator.free(db_path);
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    try attachTestStoreService(&daemon, db_path);
+    defer detachTestStoreService(&daemon);
+
+    const turn = try appendTestChatTurn(&daemon, allocator, "tail-durable", "ws-tail", "/tmp/tail", "Tail", "prompt", .completed, 1);
+    lockStoreService(daemon.store_service.?);
+    _ = try daemon.store_service.?.store.upsertWorkspace(.{
+        .mutation = .{ .request_key = "tail-ws", .client_id = "daemon" },
+        .workspace = .{ .workspace_id = "ws-tail", .label = "Tail", .path = "/tmp/tail" },
+    });
+    _ = try daemon.store_service.?.store.upsertThread(.{
+        .mutation = .{ .request_key = "tail-thread", .client_id = "daemon" },
+        .workspace_id = "ws-tail",
+        .thread = .{ .local_thread_id = turn.local_thread_id, .title = "Tail", .provider = "codex", .harness = "local_cli" },
+    });
+    const committed = try daemon.store_service.?.store.commitTurn(.{
+        .turn_id = "tail-durable",
+        .workspace_id = "ws-tail",
+        .local_thread_id = turn.local_thread_id,
+        .status = .completed,
+        .started_at_ms = 1,
+        .finished_at_ms = 2,
+        .provider = "codex",
+        .provider_thread_id = "provider-tail",
+        .messages = &.{},
+    });
+    daemon.store_service.?.mutex.unlock();
+    turn.committed_store_revision = committed.store_revision;
+
+    const consume = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"chat.turn.consume","params":{"turn_id":"tail-durable"}}
+    );
+    defer allocator.free(consume);
+    try std.testing.expectEqual(@as(usize, 0), daemon.chat_turns.items.len);
+
+    const tail = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"chat.turn.tail","params":{"turn_id":"tail-durable","after_seq":0}}
+    );
+    defer allocator.free(tail);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, tail, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings("completed", result.get("status").?.string);
+    try std.testing.expectEqual(@as(usize, 0), result.get("events").?.array.items.len);
+    try std.testing.expectEqual(@as(i64, 0), result.get("next_seq").?.integer);
+    try std.testing.expectEqualStrings("provider-tail", result.get("provider_thread_id").?.string);
+    try std.testing.expectEqual(@as(i64, @intCast(committed.store_revision)), result.get("committed_store_revision").?.integer);
+    try std.testing.expect(!result.get("durability_pending").?.bool);
+
+    const unknown = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"chat.turn.tail","params":{"turn_id":"tail-unknown"}}
+    );
+    defer allocator.free(unknown);
+    var unknown_parsed = try std.json.parseFromSlice(std.json.Value, allocator, unknown, .{});
+    defer unknown_parsed.deinit();
+    try std.testing.expectEqualStrings("not_found", unknown_parsed.value.object.get("error").?.object.get("code").?.string);
 }

@@ -92,7 +92,8 @@ pub const OPENCODE_TUI_COMMAND =
     \\if [ -n "$candidate" ]; then exec "$candidate"; fi
     \\exec opencode
 ;
-const GROK_TUI_COMMAND = "grok --no-auto-update";
+const GROK_TUI_COMMAND = "grok --no-auto-update --no-alt-screen --no-memory --no-subagents --disable-web-search --permission-mode plan --reasoning-effort low";
+const LEGACY_GROK_TUI_COMMAND = "grok --no-auto-update";
 
 fn opencodeTuiCommandForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
     return if (os_tag == .windows) "opencode" else OPENCODE_TUI_COMMAND;
@@ -116,7 +117,9 @@ pub fn isKnownDefaultAgentTuiCommand(provider: stack_config.AgentProvider, comma
         .claude => std.mem.eql(u8, command, "claude"),
         .opencode => std.mem.eql(u8, command, "opencode") or std.mem.eql(u8, command, OPENCODE_TUI_COMMAND),
         .cursor => std.mem.eql(u8, command, "agent"),
-        .grok => std.mem.eql(u8, command, "grok") or std.mem.eql(u8, command, GROK_TUI_COMMAND),
+        .grok => std.mem.eql(u8, command, "grok") or
+            std.mem.eql(u8, command, LEGACY_GROK_TUI_COMMAND) or
+            std.mem.eql(u8, command, GROK_TUI_COMMAND),
         .amp => std.mem.eql(u8, command, "amp"),
         .other => false,
     };
@@ -149,13 +152,17 @@ pub fn agentTuiProviderFromProcessName(name: []const u8) ?stack_config.AgentProv
     return null;
 }
 
-test "Grok TUI defaults disable auto-update and recognize the process" {
+test "Grok TUI defaults use the least-privilege launch mode" {
     const defaults = defaultAgentTui(.grok).?;
     try std.testing.expectEqualStrings("grok", defaults.name);
-    try std.testing.expectEqualStrings("grok --no-auto-update", defaults.command);
+    try std.testing.expectEqualStrings(
+        "grok --no-auto-update --no-alt-screen --no-memory --no-subagents --disable-web-search --permission-mode plan --reasoning-effort low",
+        defaults.command,
+    );
     try std.testing.expect(defaults.notify);
     try std.testing.expect(defaults.hooks);
     try std.testing.expect(isKnownDefaultAgentTuiCommand(.grok, "grok"));
+    try std.testing.expect(isKnownDefaultAgentTuiCommand(.grok, LEGACY_GROK_TUI_COMMAND));
     try std.testing.expectEqual(stack_config.AgentProvider.grok, agentTuiProviderFromProcessName("grok").?);
 }
 

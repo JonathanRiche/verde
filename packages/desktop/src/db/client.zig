@@ -554,7 +554,7 @@ pub const Client = struct {
 
         while (message_rows.next()) |message_row| {
             try messages.append(allocator, .{
-                .role = decodeEnumOr(db_types.ChatRole, message_row.int(0), .user),
+                .role = decodeChatRole(message_row.int(0)),
                 .author = try allocator.dupe(u8, message_row.text(1)),
                 .body = try allocator.dupe(u8, message_row.text(2)),
                 .image = try loadOptionalImage(
@@ -658,7 +658,7 @@ pub const Client = struct {
                 .{
                     thread_id,
                     @as(i64, @intCast(message_index)),
-                    @as(i64, @intFromEnum(message.role)),
+                    encodeChatRole(message.role),
                     message.author,
                     message.body,
                     if (image) |attachment| attachment.path else null,
@@ -727,6 +727,23 @@ fn boolToInt(value: bool) i64 {
     return if (value) 1 else 0;
 }
 
+fn encodeChatRole(role: db_types.ChatRole) i64 {
+    return switch (role) {
+        .user => 0,
+        .assistant => 1,
+        .system => 2,
+    };
+}
+
+fn decodeChatRole(raw: i64) db_types.ChatRole {
+    return switch (raw) {
+        0 => .user,
+        1 => .assistant,
+        2 => .system,
+        else => .user,
+    };
+}
+
 fn encodeOptionalEnum(value: anytype) ?i64 {
     const enum_value = value orelse return null;
     return @as(i64, @intFromEnum(enum_value));
@@ -772,6 +789,22 @@ fn testOpenDatabase(allocator: std.mem.Allocator, pref_path: []const u8) !zqlite
     return zqlite.open(path, flags);
 }
 
+test "chat roles preserve the shipped store codec" {
+    try testing.expectEqual(db_types.ChatRole.user, decodeChatRole(0));
+    try testing.expectEqual(db_types.ChatRole.assistant, decodeChatRole(1));
+    try testing.expectEqual(db_types.ChatRole.system, decodeChatRole(2));
+    try testing.expectEqual(db_types.ChatRole.user, decodeChatRole(99));
+
+    try testing.expectEqual(@as(i64, 0), encodeChatRole(.user));
+    try testing.expectEqual(@as(i64, 1), encodeChatRole(.assistant));
+    try testing.expectEqual(@as(i64, 2), encodeChatRole(.system));
+
+    inline for (.{ db_types.ChatRole.user, db_types.ChatRole.assistant, db_types.ChatRole.system }) |role| {
+        try testing.expectEqual(@as(i64, @intFromEnum(role)), encodeChatRole(role));
+        try testing.expectEqual(role, decodeChatRole(encodeChatRole(role)));
+    }
+}
+
 fn testCreateLegacyFixture(pref_path: []const u8) !void {
     const conn = try testOpenDatabase(testing.allocator, pref_path);
     defer conn.close();
@@ -783,6 +816,19 @@ fn testCreateLegacyWalFixture(pref_path: []const u8) !zqlite.Conn {
     errdefer conn.close();
     try conn.execNoArgs(migration_fixture.LEGACY_V0_WAL_SQL);
     return conn;
+}
+
+fn testExpectShippedFixtureRoleCodes(conn: zqlite.Conn) !void {
+    const expected = [_]i64{ 0, 1, 2, 0, 1 };
+    var rows = try conn.rows("select role from messages order by id", .{});
+    defer rows.deinit();
+    var index: usize = 0;
+    while (rows.next()) |row| : (index += 1) {
+        try testing.expect(index < expected.len);
+        try testing.expectEqual(expected[index], row.int(0));
+    }
+    if (rows.err) |err| return err;
+    try testing.expectEqual(expected.len, index);
 }
 
 fn testUserVersion(conn: zqlite.Conn) !i64 {
@@ -1108,6 +1154,7 @@ test "pre-versioning fixture migrates without transcript or ledger loss" {
     try testExpectStableId(client.conn, "select id from messages where body = ?1", "$ printf '✓'", 5003);
     try testExpectStableId(client.conn, "select id from messages where body = ?1", "Archived question ¿qué?", 5004);
     try testExpectStableId(client.conn, "select id from messages where body = ?1", "旧 workspace answer", 5005);
+    try testExpectShippedFixtureRoleCodes(client.conn);
 
     var loaded = (try client.load(testing.allocator)).?;
     defer loaded.deinit();

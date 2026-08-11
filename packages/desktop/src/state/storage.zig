@@ -164,6 +164,7 @@ const StoreSession = struct {
 pub const Storage = struct {
     allocator: std.mem.Allocator,
     pref_path: []const u8,
+    projection_store_dir: []const u8,
     /// Read-only projection handle; null when no DB exists yet.
     client: ?db_client.Client = null,
     store_session: *StoreSession,
@@ -172,39 +173,38 @@ pub const Storage = struct {
         const pref_path = sdl.getPrefPath(ORG_NAME, APP_NAME) orelse return error.SdlError;
         const owned_pref_path = try allocator.dupe(u8, pref_path);
         errdefer allocator.free(owned_pref_path);
-
-        const store_session = try allocator.create(StoreSession);
-        errdefer allocator.destroy(store_session);
-        store_session.* = .{};
-
-        const client = openReadOnlyOptional(allocator, owned_pref_path) catch |err| {
-            allocator.destroy(store_session);
-            return err;
-        };
-        return .{
-            .allocator = allocator,
-            .pref_path = owned_pref_path,
-            .client = client,
-            .store_session = store_session,
-        };
+        const effective_dir = try sessionizer.effectiveStoreDirectory(allocator, owned_pref_path);
+        errdefer allocator.free(effective_dir.path);
+        return initOwnedPaths(allocator, owned_pref_path, effective_dir.path);
     }
 
     /// Hermetic/test constructor that skips SDL pref-path resolution.
     pub fn initWithPrefPath(allocator: std.mem.Allocator, pref_path: []const u8) !Storage {
         const owned_pref_path = try allocator.dupe(u8, pref_path);
         errdefer allocator.free(owned_pref_path);
+        const effective_dir = try sessionizer.effectiveStoreDirectory(allocator, owned_pref_path);
+        errdefer allocator.free(effective_dir.path);
+        return initOwnedPaths(allocator, owned_pref_path, effective_dir.path);
+    }
 
+    fn initWithPaths(allocator: std.mem.Allocator, pref_path: []const u8, projection_store_dir: []const u8) !Storage {
+        const owned_pref_path = try allocator.dupe(u8, pref_path);
+        errdefer allocator.free(owned_pref_path);
+        const owned_projection_store_dir = try allocator.dupe(u8, projection_store_dir);
+        errdefer allocator.free(owned_projection_store_dir);
+        return initOwnedPaths(allocator, owned_pref_path, owned_projection_store_dir);
+    }
+
+    fn initOwnedPaths(allocator: std.mem.Allocator, owned_pref_path: []u8, owned_projection_store_dir: []u8) !Storage {
         const store_session = try allocator.create(StoreSession);
         errdefer allocator.destroy(store_session);
         store_session.* = .{};
 
-        const client = openReadOnlyOptional(allocator, owned_pref_path) catch |err| {
-            allocator.destroy(store_session);
-            return err;
-        };
+        const client = try openReadOnlyOptional(allocator, owned_projection_store_dir);
         return .{
             .allocator = allocator,
             .pref_path = owned_pref_path,
+            .projection_store_dir = owned_projection_store_dir,
             .client = client,
             .store_session = store_session,
         };
@@ -216,6 +216,7 @@ pub const Storage = struct {
         if (self.client) |*client| client.deinit();
         self.store_session.deinit(self.allocator);
         self.allocator.destroy(self.store_session);
+        self.allocator.free(self.projection_store_dir);
         self.allocator.free(self.pref_path);
     }
 
@@ -258,7 +259,7 @@ pub const Storage = struct {
     /// cursor and volatile scopes, avoiding a full-store JSON response while
     /// retaining a revision paired with the SQLite read transaction.
     pub fn loadProjection(self: *const Storage, allocator: std.mem.Allocator) !LoadedPersistedState {
-        var client = (try openReadOnlyOptional(allocator, self.pref_path)) orelse {
+        var client = (try openReadOnlyOptional(allocator, self.projection_store_dir)) orelse {
             var empty = LoadedPersistedState.init(allocator);
             empty.store_revision = 0;
             return empty;
@@ -474,7 +475,7 @@ pub const Storage = struct {
     };
 
     fn observeSurfaceCompletion(self: *const Storage, acknowledged: PersistedSurfaceState) !SurfaceCompletionObservation {
-        var client = (try openReadOnlyOptional(self.allocator, self.pref_path)) orelse return error.SessionDaemonUnavailable;
+        var client = (try openReadOnlyOptional(self.allocator, self.projection_store_dir)) orelse return error.SessionDaemonUnavailable;
         defer client.deinit();
         // Revision must be read first. A replacement after this read either is
         // seen by the identity query or makes the guarded clear conflict.
@@ -565,7 +566,7 @@ pub const Storage = struct {
         const persisted = protocolSurfaceToPersisted(surface) orelse return .invalid;
         const fingerprint = try headless.store.encode(self.allocator, surface);
         defer self.allocator.free(fingerprint);
-        var client = (try openReadOnlyOptional(self.allocator, self.pref_path)) orelse return .invalid;
+        var client = (try openReadOnlyOptional(self.allocator, self.projection_store_dir)) orelse return .invalid;
         defer client.deinit();
         if (!try client.committedReceiptMatches(
             proof.request_key,
@@ -586,7 +587,7 @@ pub const Storage = struct {
             .workspace_id = @as(?[]const u8, null),
         });
         defer self.allocator.free(fingerprint);
-        var client = (try openReadOnlyOptional(self.allocator, self.pref_path)) orelse return .invalid;
+        var client = (try openReadOnlyOptional(self.allocator, self.projection_store_dir)) orelse return .invalid;
         defer client.deinit();
         if (!try client.committedReceiptMatches(
             proof.request_key,
@@ -663,7 +664,7 @@ pub const Storage = struct {
         // Prefer a fresh RO open of the local projection (no daemon required).
         // The purpose-built revision read avoids loading the full projection
         // on the conflict path and also covers projection-less DBs.
-        if (openReadOnlyOptional(self.allocator, self.pref_path)) |maybe_client| {
+        if (openReadOnlyOptional(self.allocator, self.projection_store_dir)) |maybe_client| {
             if (maybe_client) |client_owned| {
                 var client = client_owned;
                 defer client.deinit();
@@ -700,7 +701,7 @@ pub const Storage = struct {
     }
 
     fn refreshStoreRevisionFromExistingDaemon(self: *const Storage, timeout_ms: u32) !u64 {
-        if (openReadOnlyOptional(self.allocator, self.pref_path)) |maybe_client| {
+        if (openReadOnlyOptional(self.allocator, self.projection_store_dir)) |maybe_client| {
             if (maybe_client) |client_owned| {
                 var client = client_owned;
                 defer client.deinit();
@@ -1238,7 +1239,7 @@ pub const Storage = struct {
             client.deinit();
             mutable.client = null;
         }
-        mutable.client = openReadOnlyOptional(self.allocator, self.pref_path) catch |err| return err;
+        mutable.client = openReadOnlyOptional(self.allocator, self.projection_store_dir) catch |err| return err;
     }
 };
 
@@ -1344,6 +1345,84 @@ test "projection load uses an independent coherent RO transaction" {
     try std.testing.expectEqual(@as(u64, 1), loaded.store_revision);
     try std.testing.expectEqual(@as(usize, 1), loaded.value.projects.len);
     try std.testing.expectEqualStrings("Loaded without daemon JSON", loaded.value.projects[0].label);
+}
+
+test "effective projection store is independent from pref artifacts" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "pref", .fromMode(0o755));
+    try tmp.dir.createDir(std.testing.io, "store", .fromMode(0o755));
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const pref_path = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "pref" });
+    defer allocator.free(pref_path);
+    const store_dir = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "store" });
+    defer allocator.free(store_dir);
+    const db_path = try std.fs.path.join(allocator, &.{ store_dir, db_client.STATE_DB_NAME });
+    defer allocator.free(db_path);
+
+    const surface: headless.store.SurfaceState = .{
+        .session_id = "override-session",
+        .workspace_id = "override-workspace",
+        .workspace_path = "/override",
+        .dock_id = 1,
+        .pane_id = 2,
+        .title = "Override surface",
+        .status = "done",
+        .status_changed_at_ms = 10,
+        .completed_at_ms = 11,
+    };
+    var surface_revision: u64 = 0;
+    const projects = [_]db_types.PersistedProject{.{
+        .id = "override-workspace",
+        .label = "Override",
+        .path = "/override",
+    }};
+    {
+        var writer = try db_client.Client.init(allocator, store_dir);
+        defer writer.deinit();
+        try writer.save(.{ .projects = &projects });
+    }
+    {
+        const store = @import("../daemon/store.zig");
+        var writer = try store.Store.init(allocator, db_path);
+        defer writer.deinit();
+        _ = try writer.applyMutation(.{ .workspace_upsert = .{
+            .mutation = .{ .request_key = "override-workspace", .client_id = "test-client" },
+            .workspace = .{ .workspace_id = "override-workspace", .label = "Override", .path = "/override" },
+        } });
+        const result = try writer.applyMutation(.{ .surface_upsert = .{
+            .mutation = .{ .request_key = "override-surface", .expected_store_revision = 1, .client_id = "test-client" },
+            .surface = surface,
+        } });
+        surface_revision = result.store_revision;
+    }
+
+    var storage = try Storage.initWithPaths(allocator, pref_path, store_dir);
+    defer storage.deinit();
+    try std.testing.expectEqualStrings(pref_path, storage.pref_path);
+    try std.testing.expectEqualStrings(store_dir, storage.projection_store_dir);
+    try std.testing.expect(storage.client != null);
+    var loaded = try storage.loadProjection(allocator);
+    defer loaded.deinit();
+    try std.testing.expectEqual(surface_revision, loaded.store_revision);
+    try std.testing.expectEqual(@as(usize, 1), loaded.value.projects.len);
+    try std.testing.expectEqual(surface_revision, try storage.refreshStoreRevision());
+    try std.testing.expectEqual(
+        SurfaceCommitProofClassification.current,
+        try storage.classifySurfaceUpsertCommitProof(.{
+            .request_key = "override-surface",
+            .store_revision = surface_revision,
+        }, surface),
+    );
+
+    // Non-SQLite state remains rooted in pref_path even with a distinct store.
+    try storage.writePendingStateSpool(.{ .capture_revision = surface_revision, .current = .{} });
+    var spool = (try storage.loadPendingStateSpool(allocator)).?;
+    defer spool.deinit();
+    try std.testing.expectEqual(surface_revision, spool.value.capture_revision);
+    try std.testing.expectEqualStrings(pref_path, storage.pref_path);
 }
 
 test "M5-P4 reconnect-from-cursor: same-instance results advance the cursor and pin the durable revision" {

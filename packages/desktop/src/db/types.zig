@@ -16,9 +16,9 @@ pub const AccessMode = enum(u8) {
 };
 
 pub const ChatRole = enum(u8) {
-    user,
-    assistant,
-    system,
+    user = 0,
+    assistant = 1,
+    system = 2,
 };
 
 pub const Provider = enum(u8) {

@@ -6658,7 +6658,7 @@ fn runChatDisconnectedCommitScenario(allocator: std.mem.Allocator, io: std.Io) !
     defer msgs.deinit();
     if (msgs.int(0) < 2) return error.ChatDisconnectMissingMessages;
     var assistants = (try conn.row(
-        "select count(*) from messages where thread_id = (select id from threads where local_thread_id = 'thread-disc') and role = 2",
+        "select count(*) from messages where thread_id = (select id from threads where local_thread_id = 'thread-disc') and role = 1",
         .{},
     )).?;
     defer assistants.deinit();

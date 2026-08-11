@@ -44,6 +44,7 @@ pub const OpenChatResult = struct {
     pane_id: WorkspacePaneId,
     thread_index: usize,
     focused: bool,
+    presentation_existing: bool = false,
 };
 
 pub const OpenChatRequest = struct {
@@ -52,6 +53,13 @@ pub const OpenChatRequest = struct {
     reasoning_effort: ?ReasoningEffort = null,
     reasoning_variant: ?[]const u8 = null,
     fast_mode: ?FastMode = null,
+    target_pane_id: ?WorkspacePaneId = null,
+    axis: WorkspaceSplitAxis = .horizontal,
+    focus: bool = true,
+};
+
+pub const PresentChatRequest = struct {
+    local_thread_id: []const u8,
     target_pane_id: ?WorkspacePaneId = null,
     axis: WorkspaceSplitAxis = .horizontal,
     focus: bool = true,
@@ -1350,6 +1358,50 @@ pub fn openWorkspaceChat(
     return result;
 }
 
+/// Present a daemon-projected thread without creating or replacing its identity.
+pub fn presentWorkspaceChat(self: anytype, project_index: usize, request: PresentChatRequest) !OpenChatResult {
+    if (project_index >= self.project_controller.projects.items.len) return error.ProjectNotFound;
+    var project = &self.project_controller.projects.items[project_index];
+    const thread_index = for (project.threads.items, 0..) |thread, index| {
+        if (std.mem.eql(u8, thread.local_thread_id, request.local_thread_id)) break index;
+    } else return error.ProjectionPending;
+
+    for (project.workspace_layout.panes.items) |pane| switch (pane.ref) {
+        .chat => |chat_ref| if (chat_ref.thread_index == thread_index) {
+            if (request.focus) {
+                project.workspace_layout.focusCreatedPane(pane.id);
+                project.selected_thread_index = thread_index;
+                project.last_content_pane_id = pane.id;
+                self.project_controller.selected_index = project_index;
+                self.requestComposerFocus();
+                self.syncPaletteComposerFromDraft();
+                self.syncRenameBuffer();
+                self.markDirty();
+            }
+            return .{ .pane_id = pane.id, .thread_index = thread_index, .focused = request.focus, .presentation_existing = true };
+        },
+        else => {},
+    };
+
+    const result = try createWorkspaceChatPaneForThread(
+        project,
+        self.allocator,
+        thread_index,
+        request.target_pane_id,
+        request.axis,
+        request.focus,
+    );
+    if (request.focus) {
+        self.project_controller.selected_index = project_index;
+        self.requestComposerFocus();
+        self.syncPaletteComposerFromDraft();
+        self.syncRenameBuffer();
+    }
+    self.setSidebarNotice("Chat pane ready.");
+    self.markDirty();
+    return result;
+}
+
 pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, model_ref: []const u8) !EffectiveChatSettings {
     if (request.reasoning_effort != null and request.reasoning_variant != null) {
         return error.ConflictingReasoningSettings;
@@ -1556,6 +1608,80 @@ pub fn createWorkspaceChatPane(
         .thread_index = thread_index,
         .focused = focus,
     };
+}
+
+fn createWorkspaceChatPaneForThread(
+    project: *Project,
+    allocator: std.mem.Allocator,
+    thread_index: usize,
+    target_pane_id: ?WorkspacePaneId,
+    axis: WorkspaceSplitAxis,
+    focus: bool,
+) !OpenChatResult {
+    var layout = &project.workspace_layout;
+    const target_id = target_pane_id orelse layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse
+        return error.TargetPaneNotFound;
+    _ = layout.paneById(target_id) orelse return error.TargetPaneNotFound;
+    const previous_focused_pane_id = layout.focused_pane_id;
+    const previous_maximized_pane_id = layout.maximized_pane_id;
+    const previous_thread_index = project.selected_thread_index;
+    const previous_last_content_pane_id = project.last_content_pane_id;
+    const previous_next_pane_id = layout.next_pane_id;
+    const previous_viewport: WorkspaceViewportSnapshot = .{
+        .offset_x = layout.scroll_offset_x,
+        .target_x = layout.scroll_target_x,
+        .offset_y = layout.scroll_offset_y,
+        .target_y = layout.scroll_target_y,
+        .revealed_pane_id = layout.scroll_revealed_pane_id,
+        .leading_pane_id = layout.scroll_leading_pane_id,
+        .animation_last_ms = layout.scroll_animation_last_ms,
+        .axis_vertical = layout.scroll_axis_vertical,
+    };
+    const previous_quick_pane = layout.quick_pane;
+    errdefer layout.next_pane_id = previous_next_pane_id;
+    const new_pane_id = try layout.createChatPane(allocator, thread_index);
+    var pane_inserted = true;
+    errdefer if (pane_inserted) {
+        if (layout.closePane(allocator, new_pane_id)) |removed| {
+            var removed_ref = removed;
+            deinitWorkspacePaneRef(&removed_ref, allocator);
+        }
+        layout.focused_pane_id = previous_focused_pane_id;
+        layout.maximized_pane_id = previous_maximized_pane_id;
+        project.selected_thread_index = previous_thread_index;
+        project.last_content_pane_id = previous_last_content_pane_id;
+        layout.scroll_offset_x = previous_viewport.offset_x;
+        layout.scroll_target_x = previous_viewport.target_x;
+        layout.scroll_offset_y = previous_viewport.offset_y;
+        layout.scroll_target_y = previous_viewport.target_y;
+        layout.scroll_revealed_pane_id = previous_viewport.revealed_pane_id;
+        layout.scroll_leading_pane_id = previous_viewport.leading_pane_id;
+        layout.scroll_animation_last_ms = previous_viewport.animation_last_ms;
+        layout.scroll_axis_vertical = previous_viewport.axis_vertical;
+        layout.quick_pane = previous_quick_pane;
+    };
+    try layout.splitPaneWithLeaf(allocator, target_id, new_pane_id, axis, true);
+    pane_inserted = false;
+    if (focus) {
+        layout.focusCreatedPane(new_pane_id);
+        project.selected_thread_index = thread_index;
+        project.last_content_pane_id = new_pane_id;
+    } else {
+        layout.focused_pane_id = previous_focused_pane_id;
+        layout.maximized_pane_id = previous_maximized_pane_id;
+        project.selected_thread_index = previous_thread_index;
+        project.last_content_pane_id = previous_last_content_pane_id;
+        layout.scroll_offset_x = previous_viewport.offset_x;
+        layout.scroll_target_x = previous_viewport.target_x;
+        layout.scroll_offset_y = previous_viewport.offset_y;
+        layout.scroll_target_y = previous_viewport.target_y;
+        layout.scroll_revealed_pane_id = previous_viewport.revealed_pane_id;
+        layout.scroll_leading_pane_id = previous_viewport.leading_pane_id;
+        layout.scroll_animation_last_ms = previous_viewport.animation_last_ms;
+        layout.scroll_axis_vertical = previous_viewport.axis_vertical;
+        layout.quick_pane = previous_quick_pane;
+    }
+    return .{ .pane_id = new_pane_id, .thread_index = thread_index, .focused = focus };
 }
 
 pub fn splitCurrentProjectWorkspacePaneWithThread(

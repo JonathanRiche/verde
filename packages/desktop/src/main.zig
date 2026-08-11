@@ -242,7 +242,10 @@ fn mainInner(init: std.process.Init) !void {
         log.warn("failed to set Windows application identity to {s}", .{windows_integrations.app_user_model_id});
     }
 
-    _ = SDL_SetHint("SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY", "1");
+    // SDL's preferred-Wayland probe can fall through to X11's global scale on mixed-scale Wayland sessions.
+    if (builtin.os.tag == .linux) if (std.c.getenv("WAYLAND_DISPLAY")) |display| {
+        if (std.mem.span(display).len != 0) _ = sdl.setHint("SDL_VIDEO_DRIVER", "wayland,x11");
+    };
     // SDL defaults SDL_VIDEO_ALLOW_SCREENSAVER to "0", which makes it inhibit
     // the OS idle/screensaver for the whole window lifetime (on Wayland via the
     // idle-inhibit protocol). Verde is not a media app, so allow the screensaver

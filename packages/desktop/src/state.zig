@@ -151,6 +151,7 @@ pub const OwnedProjectionRefresh = struct {
     arena: std.heap.ArenaAllocator,
     result: headless.store.CoreSnapshotResult = undefined,
     durable: ?LoadedPersistedState = null,
+    requested_projection_revision: ?u64 = null,
 
     fn create(backing_allocator: std.mem.Allocator) !*OwnedProjectionRefresh {
         const refresh = try backing_allocator.create(OwnedProjectionRefresh);
@@ -183,6 +184,52 @@ pub const ChangeCursorLoopState = struct {
     /// 0=no report, 1=applied, 2=failed/deferred. Written by the frame after
     /// taking a refresh and consumed by the worker before its next fetch.
     refresh_apply_outcome: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    requested_projection_revision: ?u64 = null,
+    unavailable_projection_revision: ?u64 = null,
+
+    pub const ProjectionRequestStatus = enum { applied, pending, refresh_unavailable };
+
+    pub fn requestProjectionRevision(self: *ChangeCursorLoopState, revision: u64) ProjectionRequestStatus {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.requested_projection_revision == null or revision > self.requested_projection_revision.?) {
+            self.requested_projection_revision = revision;
+            self.unavailable_projection_revision = null;
+        }
+        return if (self.unavailable_projection_revision == self.requested_projection_revision)
+            .refresh_unavailable
+        else
+            .pending;
+    }
+
+    pub fn requestedProjectionRevision(self: *ChangeCursorLoopState) ?u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.requested_projection_revision;
+    }
+
+    pub fn acknowledgeProjectionRevision(self: *ChangeCursorLoopState, observed_revision: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const requested = self.requested_projection_revision orelse return false;
+        if (observed_revision < requested) return false;
+        self.requested_projection_revision = null;
+        self.unavailable_projection_revision = null;
+        return true;
+    }
+
+    pub fn markProjectionRefreshUnavailable(self: *ChangeCursorLoopState, revision: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.requested_projection_revision == revision) self.unavailable_projection_revision = revision;
+    }
+
+    fn noteProjectionRefreshApplyFailure(self: *ChangeCursorLoopState, refresh: *const OwnedProjectionRefresh, err: anyerror) void {
+        self.noteRefreshApplication(false);
+        if (err != error.ProjectionRefreshDeferred) {
+            if (refresh.requested_projection_revision) |revision| self.markProjectionRefreshUnavailable(revision);
+        }
+    }
 
     pub fn publish(self: *ChangeCursorLoopState, signals: ChangeCursorSignals) void {
         if (!signals.any()) return;
@@ -392,6 +439,24 @@ fn changeCursorLoopMain(storage: *const Storage, loop: *ChangeCursorLoopState) v
         if (loop.refreshPending()) {
             changeCursorSleep(loop, CHANGE_CURSOR_SHUTDOWN_SLICE_MS);
             continue;
+        }
+        if (loop.requestedProjectionRevision()) |requested_revision| {
+            if (storage.currentProjectionObservedRevision() < requested_revision) {
+                const refresh = fetchOwnedCompositeSnapshot(storage) orelse {
+                    loop.markProjectionRefreshUnavailable(requested_revision);
+                    changeCursorSleep(loop, backoff_ms);
+                    backoff_ms = @min(backoff_ms * 2, CHANGE_CURSOR_RETRY_MAX_MS);
+                    continue;
+                };
+                refresh.requested_projection_revision = requested_revision;
+                if (!loop.publishRefresh(refresh)) {
+                    refresh.deinit();
+                    continue;
+                }
+                loop.publish(.{ .registry = true, .chat = true });
+                loop_wakeup.notify();
+                continue;
+            }
         }
         if (storage.currentChangeCursorForPoll()) |cursor| {
             switch (pollCoreChangesOnce(storage, loop, cursor)) {
@@ -2076,6 +2141,7 @@ pub const BrowserOpenResult = browser_controller.BrowserOpenResult;
 
 pub const OpenChatResult = workspace_controller.OpenChatResult;
 pub const OpenChatRequest = workspace_controller.OpenChatRequest;
+pub const PresentChatRequest = workspace_controller.PresentChatRequest;
 
 pub const BrowserScreenshotResult = browser_controller.BrowserScreenshotResult;
 pub const BrowserTabIndicator = browser_controller.BrowserTabIndicator;
@@ -6780,6 +6846,7 @@ pub const AppState = struct {
     pub const splitCurrentProjectWorkspacePaneWithChatPlacement = workspace_controller.splitCurrentProjectWorkspacePaneWithChatPlacement;
     pub const splitWorkspacePaneWithChatAxis = workspace_controller.splitWorkspacePaneWithChatAxis;
     pub const openWorkspaceChat = workspace_controller.openWorkspaceChat;
+    pub const presentWorkspaceChat = workspace_controller.presentWorkspaceChat;
     pub const resolveChatCreationSettings = workspace_controller.resolveChatCreationSettings;
     pub const modelOptionForProvider = workspace_controller.modelOptionForProvider;
     pub const codexSupportsReasoningEffort = workspace_controller.codexSupportsReasoningEffort;
@@ -8946,6 +9013,28 @@ pub const AppState = struct {
         };
     }
 
+    /// Request a worker-owned refresh through the durable projection floor.
+    /// This method performs no daemon or storage I/O beyond reading the
+    /// already-published observed revision.
+    pub fn requestDaemonProjectionForPresentation(self: *AppState, expected_revision: u64) ChangeCursorLoopState.ProjectionRequestStatus {
+        const observed_revision = self.storage.currentProjectionObservedRevision();
+        if (observed_revision >= expected_revision) {
+            _ = self.change_cursor_loop.acknowledgeProjectionRevision(observed_revision);
+            return .applied;
+        }
+        const status = self.change_cursor_loop.requestProjectionRevision(expected_revision);
+        self.ensureChangeCursorLoopStarted();
+        if (self.change_cursor_loop.worker == null) {
+            self.change_cursor_loop.markProjectionRefreshUnavailable(expected_revision);
+            return .refresh_unavailable;
+        }
+        return status;
+    }
+
+    pub fn daemonProjectionObservedRevision(self: *const AppState) u64 {
+        return self.storage.currentProjectionObservedRevision();
+    }
+
     /// Main-thread half of the cursor bridge. It performs bounded in-memory
     /// application only; all daemon reads happened on the cursor worker.
     fn drainChangeCursorSignals(self: *AppState) void {
@@ -8953,13 +9042,14 @@ pub const AppState = struct {
         if (self.change_cursor_loop.takeRefresh()) |refresh| {
             defer refresh.deinit();
             self.applyDaemonProjectionRefreshWithDurable(refresh.result, refresh.durable.?.value) catch |err| {
-                self.change_cursor_loop.noteRefreshApplication(false);
+                self.change_cursor_loop.noteProjectionRefreshApplyFailure(refresh, err);
                 // The cursor is deliberately still old: the worker will
                 // re-read this dirty range on its next iteration.
                 log.warn("failed to apply daemon projection refresh: {s}", .{@errorName(err)});
                 return;
             };
             self.change_cursor_loop.noteRefreshApplication(true);
+            _ = self.change_cursor_loop.acknowledgeProjectionRevision(self.storage.currentProjectionObservedRevision());
         }
         const signals = self.change_cursor_loop.take();
         self.pollDaemonProjectionStaleness();
@@ -10338,6 +10428,112 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
     }));
     try std.testing.expectEqual(thread_count_before_rejection, state.project_controller.projects.items[1].threads.items.len);
     try std.testing.expectEqual(pane_count_before_rejection, state.project_controller.projects.items[1].workspace_layout.panes.items.len);
+}
+
+test "durable projected chat presentation is idempotent and never mints identity" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.lifecycle.dirty = false;
+    state.lifecycle.last_dirty_at_ms = 0;
+    state.lifecycle.last_interaction_at_ms = 0;
+    state.terminal_controller.focused = false;
+    state.composer_controller.focused = false;
+    state.composer_controller.composer = PaletteComposerPrompt.init();
+    state.composer_controller.model_picker = PaletteModelPicker.init(0);
+    @memset(&state.sidebar_notice_storage, 0);
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.composer_controller.composer.deinit(allocator);
+    }
+    var project = try Project.init(allocator, "durable-workspace", "Durable", "/tmp/durable", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    const thread_index = try state.project_controller.projects.items[0].addThread(allocator);
+    const stable_id = state.project_controller.projects.items[0].threads.items[thread_index].local_thread_id;
+    const pane_count = state.project_controller.projects.items[0].workspace_layout.panes.items.len;
+    var layout = &state.project_controller.projects.items[0].workspace_layout;
+    const focused_before = layout.focused_pane_id;
+    const next_pane_id_before = layout.next_pane_id;
+    layout.maximized_pane_id = focused_before;
+    layout.scroll_offset_x = 11.25;
+    layout.scroll_target_x = 12.5;
+    layout.scroll_offset_y = 21.25;
+    layout.scroll_target_y = 22.5;
+    layout.scroll_revealed_pane_id = focused_before;
+    layout.scroll_leading_pane_id = focused_before;
+    layout.scroll_animation_last_ms = 456;
+    layout.scroll_axis_vertical = true;
+    layout.quick_pane = .{
+        .pane_id = focused_before.?,
+        .visible = true,
+        .detached = true,
+        .return_focus_pane_id = focused_before,
+    };
+
+    try std.testing.expectError(error.ProjectionPending, state.presentWorkspaceChat(0, .{ .local_thread_id = "absent", .focus = false }));
+    try std.testing.expect(!state.lifecycle.dirty);
+    const first = try state.presentWorkspaceChat(0, .{ .local_thread_id = stable_id, .focus = false });
+    try std.testing.expectEqual(pane_count + 1, state.project_controller.projects.items[0].workspace_layout.panes.items.len);
+    try std.testing.expectEqual(focused_before, layout.focused_pane_id);
+    try std.testing.expectEqual(focused_before, layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(f32, 11.25), layout.scroll_offset_x);
+    try std.testing.expectEqual(@as(f32, 12.5), layout.scroll_target_x);
+    try std.testing.expectEqual(@as(f32, 21.25), layout.scroll_offset_y);
+    try std.testing.expectEqual(@as(f32, 22.5), layout.scroll_target_y);
+    try std.testing.expectEqual(focused_before, layout.scroll_revealed_pane_id);
+    try std.testing.expectEqual(focused_before, layout.scroll_leading_pane_id);
+    try std.testing.expectEqual(@as(i64, 456), layout.scroll_animation_last_ms);
+    try std.testing.expect(layout.scroll_axis_vertical);
+    try std.testing.expectEqual(focused_before.?, layout.quick_pane.?.pane_id);
+    try std.testing.expect(layout.quick_pane.?.visible);
+    try std.testing.expect(layout.quick_pane.?.detached);
+    try std.testing.expectEqual(focused_before, layout.quick_pane.?.return_focus_pane_id);
+    try std.testing.expectEqual(next_pane_id_before + 1, layout.next_pane_id);
+    try std.testing.expectEqualStrings(stable_id, state.project_controller.projects.items[0].threads.items[first.thread_index].local_thread_id);
+    const repeated = try state.presentWorkspaceChat(0, .{ .local_thread_id = stable_id, .focus = false });
+    try std.testing.expectEqual(first.pane_id, repeated.pane_id);
+    try std.testing.expectEqual(pane_count + 1, state.project_controller.projects.items[0].workspace_layout.panes.items.len);
+}
+
+test "requested projection revision coalesces and failures stay generation scoped" {
+    var loop: ChangeCursorLoopState = .{};
+    try std.testing.expectEqual(.pending, loop.requestProjectionRevision(10));
+    try std.testing.expectEqual(.pending, loop.requestProjectionRevision(8));
+    try std.testing.expectEqual(@as(?u64, 10), loop.requestedProjectionRevision());
+    try std.testing.expect(!loop.acknowledgeProjectionRevision(9));
+    loop.markProjectionRefreshUnavailable(9);
+    try std.testing.expectEqual(.pending, loop.requestProjectionRevision(10));
+    loop.markProjectionRefreshUnavailable(10);
+    try std.testing.expectEqual(.refresh_unavailable, loop.requestProjectionRevision(10));
+    try std.testing.expectEqual(.pending, loop.requestProjectionRevision(12));
+    loop.markProjectionRefreshUnavailable(10);
+    try std.testing.expectEqual(.pending, loop.requestProjectionRevision(12));
+    try std.testing.expect(loop.acknowledgeProjectionRevision(12));
+    try std.testing.expectEqual(@as(?u64, null), loop.requestedProjectionRevision());
+}
+
+test "published forced refresh failure cannot poison a newer requested floor" {
+    const allocator = std.testing.allocator;
+    var loop: ChangeCursorLoopState = .{};
+    try std.testing.expectEqual(.pending, loop.requestProjectionRevision(10));
+    const refresh = try OwnedProjectionRefresh.create(allocator);
+    refresh.requested_projection_revision = 10;
+    try std.testing.expect(loop.publishRefresh(refresh));
+
+    try std.testing.expectEqual(.pending, loop.requestProjectionRevision(12));
+    const drained = loop.takeRefresh().?;
+    defer drained.deinit();
+    loop.noteProjectionRefreshApplyFailure(drained, error.OutOfMemory);
+
+    try std.testing.expectEqual(@as(?u64, 12), loop.requestedProjectionRevision());
+    try std.testing.expectEqual(.pending, loop.requestProjectionRevision(12));
+    try std.testing.expectEqual(false, loop.takeRefreshApplication().?);
 }
 
 test "provider-aware chat creation focuses requested pane" {

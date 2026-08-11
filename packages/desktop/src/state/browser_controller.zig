@@ -732,7 +732,11 @@ pub fn recoverBrowser(self: anytype, restore_url: bool) !void {
 /// Injects a pane-local automation pointer event when the backend supports it.
 pub fn injectBrowserPointer(self: anytype, event: browser_runtime.MouseEvent) !void {
     if (!self.browser_controller.runtime.controller.supportsLowLevelPointer()) return error.UnsupportedBrowserCapability;
-    if (!try self.browser_controller.runtime.controller.handleMouse(event)) return error.UnsupportedBrowserCapability;
+    var pane_event = event;
+    const device_scale = self.browserPaneDeviceScale();
+    pane_event.x = browserAutomationPointerCoordinate(event.x, device_scale);
+    pane_event.y = browserAutomationPointerCoordinate(event.y, device_scale);
+    if (!try self.browser_controller.runtime.controller.handleMouse(pane_event)) return error.UnsupportedBrowserCapability;
 }
 
 /// Returns the workspace whose pane currently owns the shared browser runtime.
@@ -1731,6 +1735,12 @@ fn browserPointerCoordinate(local: f32, displayed_extent: f32, input_extent: f32
     // device scale internally. Other backends expect their declared input size.
     if (uses_scaled_wpe_texture) return local;
     return local * (@max(input_extent, 1.0) / @max(displayed_extent, 1.0));
+}
+
+fn browserAutomationPointerCoordinate(logical: f32, device_scale: f32) f32 {
+    // Live/MCP coordinates use browser logical pixels, while scaled WPE consumes
+    // physical pointer coordinates before applying its configured device scale.
+    return logical * device_scale;
 }
 
 fn browserWheelMultiplier(fast_scrolling_enabled: bool) f32 {
@@ -3449,4 +3459,9 @@ test "browser fast scrolling uses a separate wheel multiplier" {
 test "scaled WPE pointer coordinates stay in physical pane space" {
     try std.testing.expectEqual(@as(f32, 600.0), browserPointerCoordinate(600.0, 1000.0, 600.0, true));
     try std.testing.expectEqual(@as(f32, 360.0), browserPointerCoordinate(600.0, 1000.0, 600.0, false));
+}
+
+test "browser automation pointer coordinates scale logical input once" {
+    try std.testing.expectEqual(@as(f32, 360.0), browserAutomationPointerCoordinate(360.0, 1.0));
+    try std.testing.expectEqual(@as(f32, 600.0), browserAutomationPointerCoordinate(360.0, 5.0 / 3.0));
 }
