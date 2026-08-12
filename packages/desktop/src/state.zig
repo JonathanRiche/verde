@@ -11393,23 +11393,24 @@ test "ordinary browser focus and deletion preserve exact pane runtime ownership"
 
     // Closing an unbound sibling leaves pane 2's runtime untouched. Closing
     // bound/maximized pane 2 transfers focus, zoom, page, and ownership to the
-    // deterministic next browser pane without destroying runtime-local state.
+    // pane on its left without destroying runtime-local state.
     try state.browser_controller.runtime.setLastEvalResult("retained-runtime-sentinel");
     try std.testing.expect(state.closeWorkspacePane(0, 3));
     try std.testing.expectEqual(@as(?WorkspacePaneId, 2), state.browser_controller.runtime_pane_id);
     try std.testing.expectEqualStrings("https://pane-two.example/", controller_navigation.items);
     try std.testing.expectEqualStrings("retained-runtime-sentinel", state.browser_controller.runtime.last_eval_result.?);
     try std.testing.expect(state.closeWorkspacePane(0, 2));
-    try std.testing.expectEqual(@as(?WorkspacePaneId, 4), state.project_controller.projects.items[0].workspace_layout.focused_pane_id);
-    try std.testing.expectEqual(@as(?WorkspacePaneId, 4), state.project_controller.projects.items[0].workspace_layout.maximized_pane_id);
-    try std.testing.expectEqual(@as(?WorkspacePaneId, 4), state.browser_controller.runtime_pane_id);
-    try std.testing.expectEqualStrings("https://pane-four.example/", controller_navigation.items);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), state.project_controller.projects.items[0].workspace_layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), state.project_controller.projects.items[0].workspace_layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), state.browser_controller.runtime_pane_id);
+    try std.testing.expectEqualStrings("https://pane-one.example/", controller_navigation.items);
     try std.testing.expectEqualStrings("retained-runtime-sentinel", state.browser_controller.runtime.last_eval_result.?);
 
     // A stale persisted focus falls back deterministically in workspace 2.
-    // While workspace 1 is retained, deleting an unbound sibling preserves
-    // it; deleting its bound pane invalidates only the binding, and returning
-    // reuses that runtime while navigating to pane 6 exactly.
+    // While workspace 1 is retained, deleting unbound siblings preserves it;
+    // deleting its bound pane invalidates only the binding, and returning
+    // reuses that runtime while navigating to the right-side survivor (no
+    // left neighbor remains).
     state.project_controller.selected_index = 1;
     state.project_controller.projects.items[1].workspace_layout.focused_pane_id = 999;
     state.lifecycle.dirty = false;
@@ -11423,6 +11424,9 @@ test "ordinary browser focus and deletion preserve exact pane runtime ownership"
 
     try std.testing.expect(state.closeWorkspacePane(0, 5));
     try std.testing.expect(state.closeWorkspacePane(0, 4));
+    try std.testing.expect(state.closeWorkspacePane(0, 1));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 6), state.project_controller.projects.items[0].workspace_layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 6), state.project_controller.projects.items[0].workspace_layout.maximized_pane_id);
     state.project_controller.selected_index = 0;
     state.lifecycle.dirty = false;
     state.restorePersistedBrowserPaneAfterProjectSelection(0);
@@ -11435,7 +11439,6 @@ test "ordinary browser focus and deletion preserve exact pane runtime ownership"
     try std.testing.expectEqualStrings("Pane six", state.browser_controller.runtime.current_title.?);
     try std.testing.expectEqualStrings("https://pane-six.example/", controller_navigation.items);
     try std.testing.expectEqualStrings("retained-runtime-sentinel", state.browser_controller.runtime.last_eval_result.?);
-    try std.testing.expectEqual(@as(usize, 1), state.browserPaneRefMutable(0, 1).?.activeTab().?.history.items.len);
     try std.testing.expectEqual(@as(usize, 1), state.browserPaneRefMutable(0, 6).?.activeTab().?.history.items.len);
     try std.testing.expect(state.browser_controller.pane_focused);
     try std.testing.expect(!state.lifecycle.dirty);
