@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const harness = @import("../providers/harness.zig");
 const headless = @import("headless");
+const db_types = @import("../db/types.zig");
 const process_registry = @import("../daemon/process_registry.zig");
 const daemon_store = @import("../daemon/store.zig");
 const platform_ipc = @import("../platform/ipc.zig");
@@ -50,7 +51,8 @@ pub const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\verde-sessionizer-";
 // Version 19 makes the daemon authoritative for lifecycle: bind-safe startup,
 // prepare-for-upgrade drain instead of hard-kill, and persistent-by-default
 // idle policy (see headless_verde.md Lifetime).
-pub const PROTOCOL_VERSION: u32 = 19;
+// Version 20 repairs durable transcript roles from mixed historical codecs.
+pub const PROTOCOL_VERSION: u32 = 20;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
@@ -6514,9 +6516,10 @@ fn loadThreadGetResult(
     while (rows.next()) |row| {
         const message_id = allocator.dupe(u8, row.nullableText(0) orelse "") catch return error.OutOfMemory;
         errdefer allocator.free(message_id);
-        const role = allocator.dupe(u8, roleNameFromCode(row.int(1))) catch return error.OutOfMemory;
+        const author_raw = row.text(2);
+        const role = allocator.dupe(u8, roleNameFromCode(row.int(1), author_raw)) catch return error.OutOfMemory;
         errdefer allocator.free(role);
-        const author = allocator.dupe(u8, row.text(2)) catch return error.OutOfMemory;
+        const author = allocator.dupe(u8, author_raw) catch return error.OutOfMemory;
         errdefer allocator.free(author);
         const body = allocator.dupe(u8, row.text(3)) catch return error.OutOfMemory;
         errdefer allocator.free(body);
@@ -6685,13 +6688,8 @@ fn harnessNameFromCode(code: i64) []const u8 {
     };
 }
 
-fn roleNameFromCode(code: i64) []const u8 {
-    return switch (code) {
-        0 => "user",
-        1 => "assistant",
-        2 => "system",
-        else => "user",
-    };
+fn roleNameFromCode(code: i64, author: []const u8) []const u8 {
+    return @tagName(db_types.decodeStoredChatRole(code, author));
 }
 
 fn toolCallKindNameFromCode(code: i64) []const u8 {
@@ -7155,7 +7153,7 @@ fn loadSnapshotContents(
                 } else &.{};
                 messages.append(arena, .{
                     .message_id = arena.dupe(u8, row.nullableText(0) orelse "") catch return error.OutOfMemory,
-                    .role = roleNameFromCode(row.int(1)),
+                    .role = roleNameFromCode(row.int(1), row.text(2)),
                     .author = arena.dupe(u8, row.text(2)) catch return error.OutOfMemory,
                     .body = arena.dupe(u8, row.text(3)) catch return error.OutOfMemory,
                     .images = images,
@@ -12237,7 +12235,7 @@ test "new interrupted acceptance conflict never terminalizes unowned work" {
     try runAcceptanceOwnershipWorkerScenario(false);
 }
 
-test "durable reads decode shipped raw chat role codes" {
+test "durable reads decode canonical and historical daemon chat role codes" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -12269,6 +12267,12 @@ test "durable reads decode shipped raw chat role codes" {
         .{ .role = 0, .author = "You", .body = "raw user" },
         .{ .role = 1, .author = "Assistant", .body = "raw assistant" },
         .{ .role = 2, .author = "System", .body = "raw system" },
+        .{ .role = 0, .author = "Ran command", .body = "legacy system" },
+        .{ .role = 1, .author = "You", .body = "legacy user" },
+        .{ .role = 2, .author = "Codex", .body = "legacy assistant" },
+        .{ .role = 0, .author = "Codex", .body = "desktop assistant" },
+        .{ .role = 1, .author = "Changed files", .body = "desktop system" },
+        .{ .role = 2, .author = "You", .body = "desktop user" },
     };
     for (raw_messages, 0..) |message, index| {
         try daemon.store_service.?.store.conn.exec(
@@ -12304,10 +12308,33 @@ test "durable reads decode shipped raw chat role codes" {
     const thread = get_parsed.value.object.get("result").?.object.get("thread").?.object;
     try std.testing.expectEqualStrings("t-dto", thread.get("local_thread_id").?.string);
     const messages = thread.get("messages").?.array.items;
-    const expected_roles = [_][]const u8{ "user", "assistant", "system" };
+    const expected_roles = [_][]const u8{
+        "user",      "assistant", "system",
+        "system",    "user",      "assistant",
+        "assistant", "system",    "user",
+    };
     try std.testing.expectEqual(expected_roles.len, messages.len);
     for (messages, expected_roles) |message, expected_role| {
         try std.testing.expectEqualStrings(expected_role, message.object.get("role").?.string);
+    }
+
+    var snapshot_arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer snapshot_arena_state.deinit();
+    lockStoreService(daemon.store_service.?);
+    const durable_snapshot = loadStoreSnapshotTxn(
+        snapshot_arena_state.allocator(),
+        &daemon.store_service.?.store,
+        "ws-dto",
+        true,
+    ) catch |err| {
+        daemon.store_service.?.mutex.unlock();
+        return err;
+    };
+    daemon.store_service.?.mutex.unlock();
+    const snapshot_messages = durable_snapshot.snapshot.workspaces[0].threads[0].messages;
+    try std.testing.expectEqual(expected_roles.len, snapshot_messages.len);
+    for (snapshot_messages, expected_roles) |message, expected_role| {
+        try std.testing.expectEqualStrings(expected_role, message.role);
     }
 
     const record_response = try daemon.handleRequest(

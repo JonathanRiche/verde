@@ -322,7 +322,7 @@ fn fetchOwnedCompositeSnapshot(storage: *const Storage) ?*OwnedProjectionRefresh
         .pref_path = storage.pref_path,
     };
     var client = sessionizer.headlessClient(allocator, &transport);
-    // The durable store can be far larger than the protocol-19 8 MiB
+    // The durable store can be far larger than the protocol-20 8 MiB
     // transport ceiling. Capture the cursor and volatile scopes from the live
     // daemon, then read SQLite locally through a separate coherent RO
     // transaction. Because the daemon captures the cursor first and the RO
