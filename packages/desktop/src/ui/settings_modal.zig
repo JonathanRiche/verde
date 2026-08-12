@@ -19,6 +19,7 @@ pub const Control = enum(u8) {
     workspace_pane_gap_inc,
     workspace_panes_per_view_dec,
     workspace_panes_per_view_inc,
+    workspace_unzoom_on_navigation,
     workspace_scroll_use_global,
     workspace_scroll_override,
     workspace_scroll_mode_automatic,
@@ -171,6 +172,8 @@ const SettingsLayout = struct {
     new_chat_replace_pane: palette.Rect,
     file_links_neovim_pane: palette.Rect,
     file_links_hint_y: f32,
+    workspace_unzoom_on_navigation: palette.Rect,
+    workspace_unzoom_on_navigation_hint_y: f32,
     workspace_pane_gap_dec: palette.Rect,
     workspace_pane_gap_inc: palette.Rect,
     workspace_pane_gap_hint_y: f32,
@@ -321,6 +324,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra +
         m.row_gap + m.label_h + m.inner_gap + m.row_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h +
+        m.row_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.row_h + m.inner_gap + m.label_h +
@@ -498,7 +502,10 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const file_links_y = file_links_label_y + m.label_h + m.inner_gap;
     const file_links_neovim_pane: palette.Rect = .{ .x = open_x, .y = file_links_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const file_links_hint_y = file_links_y + m.row_h + m.inner_gap;
-    const workspace_scroll_scope_label_y = file_links_hint_y + m.label_h + m.row_gap;
+    const workspace_unzoom_on_navigation_y = file_links_hint_y + m.label_h + m.row_gap;
+    const workspace_unzoom_on_navigation: palette.Rect = .{ .x = open_x, .y = workspace_unzoom_on_navigation_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
+    const workspace_unzoom_on_navigation_hint_y = workspace_unzoom_on_navigation_y + m.row_h + m.inner_gap;
+    const workspace_scroll_scope_label_y = workspace_unzoom_on_navigation_hint_y + m.label_h + m.row_gap;
     const workspace_scroll_scope_y = workspace_scroll_scope_label_y + m.label_h + m.inner_gap;
     const workspace_scroll_scope_w = (content_w - m.card_pad * 2.0) * 0.5;
     const workspace_scroll_use_global: palette.Rect = .{ .x = open_x, .y = workspace_scroll_scope_y, .w = workspace_scroll_scope_w, .h = m.row_h };
@@ -626,6 +633,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .new_chat_replace_pane = new_chat_replace_pane,
         .file_links_neovim_pane = file_links_neovim_pane,
         .file_links_hint_y = file_links_hint_y,
+        .workspace_unzoom_on_navigation = workspace_unzoom_on_navigation,
+        .workspace_unzoom_on_navigation_hint_y = workspace_unzoom_on_navigation_hint_y,
         .workspace_pane_gap_dec = workspace_pane_gap_stepper.dec,
         .workspace_pane_gap_inc = workspace_pane_gap_stepper.inc,
         .workspace_pane_gap_hint_y = workspace_pane_gap_hint_y,
@@ -871,6 +880,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.new_chat_new_pane, layout.body_clip, .new_chat_new_pane, queue_hit);
     queueControlHit(state, layout.new_chat_replace_pane, layout.body_clip, .new_chat_replace_pane, queue_hit);
     queueControlHit(state, layout.file_links_neovim_pane, layout.body_clip, .file_links_neovim_pane, queue_hit);
+    queueControlHit(state, layout.workspace_unzoom_on_navigation, layout.body_clip, .workspace_unzoom_on_navigation, queue_hit);
     queueControlHit(state, layout.workspace_scroll_use_global, layout.body_clip, .workspace_scroll_use_global, queue_hit);
     queueControlHit(state, layout.workspace_scroll_override, layout.body_clip, .workspace_scroll_override, queue_hit);
     queueControlHit(state, layout.workspace_scroll_mode_automatic, layout.body_clip, .workspace_scroll_mode_automatic, queue_hit);
@@ -1074,6 +1084,13 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .w = layout.file_links_neovim_pane.w,
         .h = m.label_h,
     }, "Used only when Neovim is the configured editor; otherwise uses the default file action", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+    drawSwitchRow(state, layout.workspace_unzoom_on_navigation, "Unzoom on pane navigation", state.settings_controller.draft.unzoom_on_pane_navigation, isControlHovered(state, .workspace_unzoom_on_navigation), layout.body_clip);
+    queueText(state, .{
+        .x = layout.workspace_unzoom_on_navigation.x,
+        .y = layout.workspace_unzoom_on_navigation_hint_y,
+        .w = layout.workspace_unzoom_on_navigation.w,
+        .h = m.label_h,
+    }, "Off keeps zoom active and moves it to the pane selected with directional shortcuts", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
     queueText(state, .{
         .x = layout.workspace_scroll_use_global.x,
         .y = layout.workspace_scroll_use_global.y - m.inner_gap - m.label_h,
@@ -1484,6 +1501,7 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .open_vscode => state.settings_controller.draft.open_action = .vscode,
         .open_zed => state.settings_controller.draft.open_action = .zed,
         .file_links_neovim_pane => state.settings_controller.draft.file_links_in_neovim_pane = !state.settings_controller.draft.file_links_in_neovim_pane,
+        .workspace_unzoom_on_navigation => state.settings_controller.draft.unzoom_on_pane_navigation = !state.settings_controller.draft.unzoom_on_pane_navigation,
         .links_verde_browser => state.settings_controller.draft.link_open_target = .verde_browser,
         .links_system_browser => state.settings_controller.draft.link_open_target = .system_browser,
         .browser_fast_scrolling => state.settings_controller.draft.browser_fast_scrolling_enabled = !state.settings_controller.draft.browser_fast_scrolling_enabled,
@@ -2647,6 +2665,21 @@ test "companion character option order is Sprout Moss Vireo" {
     try std.testing.expectEqual(app_config.CompanionCharacter.sprout, COMPANION_CHARACTER_OPTIONS[0]);
     try std.testing.expectEqual(app_config.CompanionCharacter.moss, COMPANION_CHARACTER_OPTIONS[1]);
     try std.testing.expectEqual(app_config.CompanionCharacter.vireo, COMPANION_CHARACTER_OPTIONS[2]);
+}
+
+test "pane navigation unzoom setting is a persisted draft toggle" {
+    const allocator = std.testing.allocator;
+    var state = testSettingsState(allocator);
+    defer deinitTestSettingsState(&state, allocator);
+
+    try std.testing.expect(!state.app_config.unzoom_on_pane_navigation);
+    try std.testing.expect(!state.settings_controller.draft.unzoom_on_pane_navigation);
+    applyControl(&state, @intFromEnum(Control.workspace_unzoom_on_navigation));
+    try std.testing.expect(state.settings_controller.draft.unzoom_on_pane_navigation);
+    try std.testing.expect(state.isSettingsDraftDirty());
+
+    state.app_config.unzoom_on_pane_navigation = state.settings_controller.draft.unzoom_on_pane_navigation;
+    try std.testing.expect(!state.isSettingsDraftDirty());
 }
 
 test "Companion experimental setting renders one themed immutable toggle row" {

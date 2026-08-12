@@ -294,7 +294,10 @@ pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool 
             collectNodePaneRects(root, pane_rects[0].rect, &expanded_rects, &expanded_count);
             if (focusPaneInDirectionFromRects(state, current_id, dir, expanded_rects[0..expanded_count], true)) return true;
         }
-        return state.clearCurrentProjectWorkspacePaneMaximized();
+        return if (state.app_config.unzoom_on_pane_navigation)
+            state.clearCurrentProjectWorkspacePaneMaximized()
+        else
+            false;
     }
 
     if (scrollingLayoutActive(state, layout)) {
@@ -337,7 +340,7 @@ fn focusPaneInDirectionFromRects(
     current_id: runtime.WorkspacePaneId,
     dir: FocusDirection,
     rects: []const WorkspacePaneRect,
-    clear_maximized: bool,
+    navigating_maximized: bool,
 ) bool {
     var current_rect: ?palette.Rect = null;
     var i: usize = 0;
@@ -387,7 +390,14 @@ fn focusPaneInDirectionFromRects(
     }
 
     const target = best_id orelse return false;
-    if (clear_maximized) _ = state.clearCurrentProjectWorkspacePaneMaximized();
+    if (navigating_maximized) {
+        if (state.app_config.unzoom_on_pane_navigation) {
+            _ = state.clearCurrentProjectWorkspacePaneMaximized();
+        } else {
+            const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
+            layout.maximized_pane_id = target;
+        }
+    }
     _ = state.focusCurrentProjectWorkspacePane(target);
     state.markDirty();
     return true;
@@ -2148,6 +2158,57 @@ test "pane status pulses are bounded and use deliberately slow periods" {
         try std.testing.expectApproxEqAbs(@as(f32, 0.5), paneStatusPulse(status, @divTrunc(period, 2)), 0.0001);
         try std.testing.expectApproxEqAbs(@as(f32, 0.0), paneStatusPulse(status, @divTrunc(period * 3, 4)), 0.0001);
     }
+}
+
+test "directional navigation transfers zoom unless unzoom is configured" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer {
+        state.lifecycle.clearDirty();
+        state.deinit();
+    }
+
+    for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+    state.project_controller.projects.clearRetainingCapacity();
+    state.lifecycle.clearDirty();
+
+    var project = try runtime.Project.init(allocator, "zoom-navigation", "Zoom Navigation", "/tmp/zoom-navigation", 0);
+    const first_pane_id = project.workspace_layout.focused_pane_id.?;
+    const second_thread = try project.addThread(allocator);
+    const second_pane_id = try project.workspace_layout.createChatPane(allocator, second_thread);
+    try project.workspace_layout.splitPaneWithLeaf(allocator, first_pane_id, second_pane_id, .vertical, true);
+    project.workspace_layout.focused_pane_id = first_pane_id;
+    project.workspace_layout.maximized_pane_id = first_pane_id;
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    state.project_controller.selected_index = 0;
+
+    const rects = [_]WorkspacePaneRect{
+        .{ .pane_id = first_pane_id, .rect = .{ .x = 0.0, .y = 0.0, .w = 100.0, .h = 100.0 } },
+        .{ .pane_id = second_pane_id, .rect = .{ .x = 101.0, .y = 0.0, .w = 100.0, .h = 100.0 } },
+    };
+    try std.testing.expect(focusPaneInDirectionFromRects(&state, first_pane_id, .right, &rects, true));
+    var layout = &state.project_controller.projects.items[0].workspace_layout;
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, second_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, second_pane_id), layout.maximized_pane_id);
+
+    layout.focused_pane_id = first_pane_id;
+    layout.maximized_pane_id = first_pane_id;
+    state.app_config.unzoom_on_pane_navigation = true;
+    try std.testing.expect(focusPaneInDirectionFromRects(&state, first_pane_id, .right, &rects, true));
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, second_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.maximized_pane_id);
 }
 
 test "scrolling focus reveal moves only enough to expose the column" {
