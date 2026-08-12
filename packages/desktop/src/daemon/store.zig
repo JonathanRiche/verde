@@ -535,6 +535,10 @@ pub const Store = struct {
             .workspace = self.insertChatTurnWorkspaceIfMissing(request.workspace) catch |err| return mapStoreError(err),
             .thread = self.insertChatTurnThreadIfMissing(request.workspace.workspace_id, request.thread) catch |err| return mapStoreError(err),
         };
+        self.updateTurnExecutionSettings(
+            request.workspace.workspace_id,
+            request.thread,
+        ) catch |err| return mapStoreError(err);
         self.updateTurnProviderIdentity(
             request.workspace.workspace_id,
             request.thread.local_thread_id,
@@ -651,6 +655,7 @@ pub const Store = struct {
         }
         if (request.thread) |thread| {
             inserted.thread = self.insertChatTurnThreadIfMissing(request.workspace_id, thread) catch |err| return mapStoreError(err);
+            self.updateTurnExecutionSettings(request.workspace_id, thread) catch |err| return mapStoreError(err);
         }
         // Provider identity is turn-owned. Assign all three columns including
         // null provider_thread_id so a provider switch clears stale identity.
@@ -1484,12 +1489,27 @@ pub const Store = struct {
     ) !bool {
         const provider_code = try providerCode(thread.provider);
         const harness_code = try harnessCode(thread.harness);
+        const reasoning_code = if (thread.reasoning_effort) |value| try reasoningEffortCode(value) else null;
+        const fast_code = if (thread.fast_mode) |value| try fastModeCode(value) else null;
+        const access_code = if (thread.access_mode) |value| try accessModeCode(value) else null;
         try self.conn.exec(
-            "insert into threads (workspace_id, sort_index, title, local_thread_id, provider_thread_id, provider, harness) " ++
-                "select w.id, coalesce((select max(t.sort_index) + 1 from threads t where t.workspace_id = w.id), 0), ?2, ?3, ?4, ?5, ?6 " ++
+            "insert into threads (workspace_id, sort_index, title, local_thread_id, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness) " ++
+                "select w.id, coalesce((select max(t.sort_index) + 1 from threads t where t.workspace_id = w.id), 0), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11 " ++
                 "from workspaces w where w.workspace_id = ?1 " ++
                 "on conflict(workspace_id, local_thread_id) where local_thread_id is not null do nothing",
-            .{ workspace_id, thread.title, thread.local_thread_id, thread.provider_thread_id, provider_code, harness_code },
+            .{
+                workspace_id,
+                thread.title,
+                thread.local_thread_id,
+                thread.provider_thread_id,
+                thread.model_ref,
+                reasoning_code,
+                thread.reasoning_variant,
+                fast_code,
+                access_code,
+                provider_code,
+                harness_code,
+            },
         );
         if (self.conn.changes() > 0) return true;
         const owner = try self.conn.row(
@@ -1501,6 +1521,30 @@ pub const Store = struct {
             return false;
         }
         return error.ResourceNotFound;
+    }
+
+    fn updateTurnExecutionSettings(
+        self: *Self,
+        workspace_id: []const u8,
+        thread: store_protocol.Thread,
+    ) !void {
+        const reasoning_code = if (thread.reasoning_effort) |value| try reasoningEffortCode(value) else null;
+        const fast_code = if (thread.fast_mode) |value| try fastModeCode(value) else null;
+        const access_code = if (thread.access_mode) |value| try accessModeCode(value) else null;
+        try self.conn.exec(
+            "update threads set model_ref = ?1, reasoning_effort = ?2, reasoning_variant = ?3, fast_mode = ?4, access_mode = ?5 " ++
+                "where workspace_id = (select id from workspaces where workspace_id = ?6) and local_thread_id = ?7",
+            .{
+                thread.model_ref,
+                reasoning_code,
+                thread.reasoning_variant,
+                fast_code,
+                access_code,
+                workspace_id,
+                thread.local_thread_id,
+            },
+        );
+        if (self.conn.changes() == 0) return error.ResourceNotFound;
     }
 
     /// Adopt only the exact protocol-19 acceptance shape written before the
@@ -1535,12 +1579,17 @@ pub const Store = struct {
         }, WORKSPACE_UPSERT_OPERATION, workspace_fingerprint);
         if (workspace_receipt == null) return error.Conflict;
 
-        // HEAD's stage-thread request predated provider-thread persistence.
-        // Reconstruct that exact request shape rather than fingerprinting the
-        // richer retry request and mistaking omitted legacy evidence for a
-        // contradiction.
+        // HEAD's stage-thread request predated provider-thread and execution-
+        // setting persistence. Reconstruct that exact request shape rather
+        // than fingerprinting the richer retry request and mistaking omitted
+        // legacy evidence for a contradiction.
         var legacy_thread = request.thread;
         legacy_thread.provider_thread_id = null;
+        legacy_thread.model_ref = null;
+        legacy_thread.reasoning_effort = null;
+        legacy_thread.reasoning_variant = null;
+        legacy_thread.fast_mode = null;
+        legacy_thread.access_mode = null;
         const thread_fingerprint = try self.encodeFingerprint(.{
             .workspace_id = request.workspace.workspace_id,
             .thread = legacy_thread,
@@ -3573,6 +3622,10 @@ test "turn acceptance atomically creates owners journals one revision and replay
             .local_thread_id = "missing-owner-thread",
             .title = "Missing owner thread",
             .provider = "codex",
+            .model_ref = "gpt-5.6-sol",
+            .reasoning_effort = "medium",
+            .fast_mode = "off",
+            .access_mode = "full_access",
         },
         .started_at_ms = 10,
         .provider = "codex",
@@ -3591,14 +3644,19 @@ test "turn acceptance atomically creates owners journals one revision and replay
     try std.testing.expect(counter.inserted.thread);
     try std.testing.expectEqual(accepted.store_revision, counter.revision);
     const durable = (try store.conn.row(
-        "select (select count(*) from workspaces), (select count(*) from threads), (select count(*) from messages), (select count(*) from chat_turns)",
-        .{},
+        "select (select count(*) from workspaces), (select count(*) from threads), (select count(*) from messages), (select count(*) from chat_turns), " ++
+            "t.model_ref, t.reasoning_effort, t.fast_mode, t.access_mode from threads t where t.local_thread_id = ?1",
+        .{request.thread.local_thread_id},
     )).?;
     defer durable.deinit();
     try std.testing.expectEqual(@as(i64, 1), durable.int(0));
     try std.testing.expectEqual(@as(i64, 1), durable.int(1));
     try std.testing.expectEqual(@as(i64, 1), durable.int(2));
     try std.testing.expectEqual(@as(i64, 1), durable.int(3));
+    try std.testing.expectEqualStrings("gpt-5.6-sol", durable.text(4));
+    try std.testing.expectEqual(@as(i64, 1), durable.int(5));
+    try std.testing.expectEqual(@as(i64, 0), durable.int(6));
+    try std.testing.expectEqual(@as(i64, 0), durable.int(7));
 
     // Simulate an external deletion after the accepted receipt. Even with a
     // now-stale expected revision, receipt replay must be completely inert.
