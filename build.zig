@@ -161,6 +161,12 @@ pub fn build(b: *std.Build) void {
     const headless_test_step = b.step("headless-test", "Run headless package unit tests from the repo root");
     headless_test_step.dependOn(&headless_test_cmd.step);
 
+    // Optional web client gateway. Not on the default desktop install path.
+    const web_app_cmd = b.addSystemCommand(&.{ "zig", "build" });
+    web_app_cmd.setCwd(b.path("packages/web_app"));
+    const web_app_step = b.step("web-app", "Build the Verde web gateway (packages/web_app)");
+    web_app_step.dependOn(&web_app_cmd.step);
+
     // Hermetic headless client ↔ forked session-daemon integration (desktop graph).
     const headless_daemon_it_cmd = addDesktopCommand(b, test_optimize, .{
         .subcommand = "headless-daemon-it",

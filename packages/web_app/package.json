@@ -1,0 +1,23 @@
+{
+  "name": "web_app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "types": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@slopus/ghostty-wasm": "^1.3.6",
+    "marked": "^18.0.9",
+    "solid-js": "^1.9.14"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.1",
+    "vite-plugin-solid": "^2.11.14"
+  }
+}
