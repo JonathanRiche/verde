@@ -53,8 +53,9 @@ const HIDDEN_SIDEBAR_EDGE_REVEAL_CSS: f32 = 8.0;
 const SIDEBAR_FOOTER_RESERVE_CSS: f32 = 56.0;
 const THREAD_DRAG_THRESHOLD_CSS: f32 = 5.0;
 const THREAD_DRAG_FLOATING_Z: i32 = 160;
-/// Sidebar context menus can extend over workspace panes when the rail is collapsed.
-const SIDEBAR_CONTEXT_MENU_Z: i32 = 180;
+/// Sidebar context menus are root overlays: keep them above pane menus and
+/// composer popovers (up to 1402), but below Companion (1550) and true modals.
+const SIDEBAR_CONTEXT_MENU_Z: i32 = 1450;
 
 const SidebarHitKind = enum {
     collapse,
