@@ -3205,6 +3205,7 @@ test {
     _ = @import("platform/mod.zig");
     _ = @import("platform/workspace_identity.zig");
     _ = @import("state/browser_controller.zig");
+    _ = @import("state/workspace_layout.zig");
     _ = @import("providers/claude.zig");
     _ = @import("providers/diagnostics.zig");
     _ = @import("providers/opencode.zig");

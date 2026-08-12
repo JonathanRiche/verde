@@ -697,25 +697,64 @@ pub const WorkspaceLayout = struct {
         return true;
     }
 
+    /// Pane that should receive focus after `pane_id` closes: previous in
+    /// sidebar/tiled order (the pane to the left), else the next to the right.
+    /// Call before removing `pane_id` from the tree or panes list.
+    pub fn preferredFocusAfterClose(self: *const WorkspaceLayout, pane_id: WorkspacePaneId) ?WorkspacePaneId {
+        return self.adjacentTiledPaneIdInSidebarOrder(pane_id, .left) orelse
+            self.adjacentTiledPaneIdInSidebarOrder(pane_id, .right) orelse
+            self.sidebarNeighborPaneId(pane_id, true) orelse
+            self.sidebarNeighborPaneId(pane_id, false);
+    }
+
+    /// Previous (left) or next (right) entry in persisted sidebar order.
+    fn sidebarNeighborPaneId(self: *const WorkspaceLayout, pane_id: WorkspacePaneId, previous: bool) ?WorkspacePaneId {
+        const pane_index = self.paneIndexById(pane_id) orelse return null;
+        if (previous) {
+            if (pane_index == 0) return null;
+            return self.panes.items[pane_index - 1].id;
+        }
+        if (pane_index + 1 >= self.panes.items.len) return null;
+        return self.panes.items[pane_index + 1].id;
+    }
+
     pub fn closePane(self: *WorkspaceLayout, allocator: std.mem.Allocator, pane_id: WorkspacePaneId) ?WorkspacePaneRef {
         const pane_index = self.paneIndexById(pane_id) orelse return null;
         const removed_ref = self.panes.items[pane_index].ref;
         const was_maximized = self.maximized_pane_id == pane_id;
-        var next_sidebar_pane_id: ?WorkspacePaneId = null;
-        var next_tiled_pane_id: ?WorkspacePaneId = null;
+        const was_focused = self.focused_pane_id == pane_id;
+        // Capture left-preferring neighbor before the pane leaves the tree.
+        const preferred_neighbor = self.preferredFocusAfterClose(pane_id);
+        var next_focus_pane_id: ?WorkspacePaneId = preferred_neighbor;
+        var next_tiled_pane_id: ?WorkspacePaneId = self.adjacentTiledPaneIdInSidebarOrder(pane_id, .left) orelse
+            self.adjacentTiledPaneIdInSidebarOrder(pane_id, .right);
         if (was_maximized and self.panes.items.len > 1) {
+            // Detached quick panes stay available after a zoomed close.
             if (self.quick_pane) |quick| {
                 if (quick.pane_id != pane_id and self.paneById(quick.pane_id) != null) {
-                    next_sidebar_pane_id = quick.pane_id;
+                    next_focus_pane_id = quick.pane_id;
                 }
             }
-            var offset: usize = 1;
-            while (offset < self.panes.items.len) : (offset += 1) {
-                const candidate_index = (pane_index + offset) % self.panes.items.len;
-                const candidate_id = self.panes.items[candidate_index].id;
-                if (next_sidebar_pane_id == null) next_sidebar_pane_id = candidate_id;
-                if (next_tiled_pane_id == null and self.rootContainsPane(candidate_id)) {
-                    next_tiled_pane_id = candidate_id;
+            if (next_tiled_pane_id == null) {
+                var offset: usize = 1;
+                while (offset < self.panes.items.len) : (offset += 1) {
+                    // Scan left first, then right, so zoom transfers toward the left.
+                    const left_index = if (pane_index >= offset) pane_index - offset else null;
+                    const right_index = if (pane_index + offset < self.panes.items.len) pane_index + offset else null;
+                    if (left_index) |index| {
+                        const candidate_id = self.panes.items[index].id;
+                        if (self.rootContainsPane(candidate_id)) {
+                            next_tiled_pane_id = candidate_id;
+                            break;
+                        }
+                    }
+                    if (right_index) |index| {
+                        const candidate_id = self.panes.items[index].id;
+                        if (self.rootContainsPane(candidate_id)) {
+                            next_tiled_pane_id = candidate_id;
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -727,7 +766,7 @@ pub const WorkspaceLayout = struct {
             if (quick.pane_id == pane_id) self.quick_pane = null;
         }
         if (was_maximized) {
-            self.focused_pane_id = next_sidebar_pane_id orelse self.firstVisiblePaneId();
+            self.focused_pane_id = next_focus_pane_id orelse self.firstVisiblePaneId();
             self.maximized_pane_id = next_tiled_pane_id orelse self.firstVisiblePaneId();
             if (self.quick_pane) |*quick| {
                 if (quick.pane_id == self.focused_pane_id) {
@@ -739,7 +778,7 @@ pub const WorkspaceLayout = struct {
                 }
             }
         } else {
-            if (self.focused_pane_id == pane_id) self.focused_pane_id = self.firstVisiblePaneId();
+            if (was_focused) self.focused_pane_id = preferred_neighbor orelse self.firstVisiblePaneId();
             if (self.maximized_pane_id == pane_id) self.maximized_pane_id = null;
         }
         return removed_ref;
@@ -1768,7 +1807,7 @@ test "workspace layout ignores invalid scrolling policy overrides" {
     try std.testing.expectEqual(@as(?f32, null), layout.scroll_pane_extent_ratio_override);
 }
 
-test "closing a maximized pane transfers zoom in sidebar order" {
+test "closing a maximized pane transfers zoom to the left pane" {
     const allocator = std.testing.allocator;
     var layout = try WorkspaceLayout.initDefaultChat(allocator);
     defer layout.deinit(allocator);
@@ -1783,13 +1822,52 @@ test "closing a maximized pane transfers zoom in sidebar order" {
     layout.maximized_pane_id = second_pane_id;
     var removed_ref = layout.closePane(allocator, second_pane_id) orelse return error.TestExpectedEqual;
     deinitWorkspacePaneRef(&removed_ref, allocator);
-    try std.testing.expectEqual(@as(?WorkspacePaneId, third_pane_id), layout.focused_pane_id);
-    try std.testing.expectEqual(@as(?WorkspacePaneId, third_pane_id), layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, first_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, first_pane_id), layout.maximized_pane_id);
 
+    layout.focused_pane_id = third_pane_id;
+    layout.maximized_pane_id = third_pane_id;
     removed_ref = layout.closePane(allocator, third_pane_id) orelse return error.TestExpectedEqual;
     deinitWorkspacePaneRef(&removed_ref, allocator);
     try std.testing.expectEqual(@as(?WorkspacePaneId, first_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, first_pane_id), layout.maximized_pane_id);
+}
+
+test "closing a focused pane focuses the pane to its left" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const first_pane_id = layout.panes.items[0].id;
+    const second_pane_id = try layout.createTerminalPane(allocator, 10);
+    try layout.splitPaneWithLeaf(allocator, first_pane_id, second_pane_id, .vertical, true);
+    const third_pane_id = try layout.createTerminalPane(allocator, 11);
+    try layout.splitPaneWithLeaf(allocator, second_pane_id, third_pane_id, .horizontal, true);
+
+    layout.focused_pane_id = third_pane_id;
+    var removed_ref = layout.closePane(allocator, third_pane_id) orelse return error.TestExpectedEqual;
+    deinitWorkspacePaneRef(&removed_ref, allocator);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.focused_pane_id);
+
+    layout.focused_pane_id = second_pane_id;
+    removed_ref = layout.closePane(allocator, second_pane_id) orelse return error.TestExpectedEqual;
+    deinitWorkspacePaneRef(&removed_ref, allocator);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, first_pane_id), layout.focused_pane_id);
+}
+
+test "closing the leftmost focused pane focuses the pane to its right" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const first_pane_id = layout.panes.items[0].id;
+    const second_pane_id = try layout.createTerminalPane(allocator, 10);
+    try layout.splitPaneWithLeaf(allocator, first_pane_id, second_pane_id, .vertical, true);
+
+    layout.focused_pane_id = first_pane_id;
+    var removed_ref = layout.closePane(allocator, first_pane_id) orelse return error.TestExpectedEqual;
+    deinitWorkspacePaneRef(&removed_ref, allocator);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.focused_pane_id);
 }
 
 test "closing a maximized pane focuses the next quick pane without losing tiled zoom" {
