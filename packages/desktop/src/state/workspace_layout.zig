@@ -269,6 +269,8 @@ pub const WorkspaceLayout = struct {
                 switch (pane.ref) {
                     .chat => |*ref| {
                         ref.thread_index = thread_index;
+                        ref.transcript_scroll_valid = false;
+                        ref.transcript_scroll_y = 0.0;
                         return pane.id;
                     },
                     else => {},
@@ -279,12 +281,46 @@ pub const WorkspaceLayout = struct {
             switch (pane.ref) {
                 .chat => |*ref| {
                     ref.thread_index = thread_index;
+                    ref.transcript_scroll_valid = false;
+                    ref.transcript_scroll_y = 0.0;
                     return pane.id;
                 },
                 else => {},
             }
         }
         return null;
+    }
+
+    /// Moves every valid pane-local offset for the thread by `delta`. Saved
+    /// offsets are measured from the estimated top of the thread's content, so
+    /// when materializing older transcript rows changes that estimate the
+    /// anchors must shift with it to keep pointing at the same rows. Panes in
+    /// tail-follow (no valid offset) stay latched to the tail.
+    pub fn shiftChatTranscriptScrollForThread(self: *WorkspaceLayout, thread_index: usize, delta: f32) void {
+        for (self.panes.items) |*pane| {
+            switch (pane.ref) {
+                .chat => |*ref| {
+                    if (ref.thread_index != thread_index) continue;
+                    if (!ref.transcript_scroll_valid) continue;
+                    ref.transcript_scroll_y = @max(ref.transcript_scroll_y + delta, 0.0);
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// Clears pane-local offsets so every pane showing the thread resumes semantic tail-follow.
+    pub fn resetChatTranscriptScrollForThread(self: *WorkspaceLayout, thread_index: usize) void {
+        for (self.panes.items) |*pane| {
+            switch (pane.ref) {
+                .chat => |*ref| {
+                    if (ref.thread_index != thread_index) continue;
+                    ref.transcript_scroll_valid = false;
+                    ref.transcript_scroll_y = 0.0;
+                },
+                else => {},
+            }
+        }
     }
 
     pub fn visibleTerminalPaneIdForDock(self: *const WorkspaceLayout, dock_id: u32) ?WorkspacePaneId {
@@ -1790,10 +1826,59 @@ test "workspace chat replacement prefers the focused chat pane" {
     const second_pane_id = try layout.createChatPane(allocator, 1);
     try layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
     layout.focused_pane_id = second_pane_id;
+    layout.paneByIdMutable(second_pane_id).?.ref.chat.transcript_scroll_valid = true;
+    layout.paneByIdMutable(second_pane_id).?.ref.chat.transcript_scroll_y = 420.0;
 
     try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.retargetPreferredChatPane(2));
     const first_pane = layout.paneById(1) orelse return error.TestExpectedEqual;
     const second_pane = layout.paneById(second_pane_id) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 0), first_pane.ref.chat.thread_index);
     try std.testing.expectEqual(@as(usize, 2), second_pane.ref.chat.thread_index);
+    try std.testing.expect(!second_pane.ref.chat.transcript_scroll_valid);
+    try std.testing.expectEqual(@as(f32, 0.0), second_pane.ref.chat.transcript_scroll_y);
+
+    layout.paneByIdMutable(1).?.ref.chat.transcript_scroll_valid = true;
+    layout.paneByIdMutable(1).?.ref.chat.transcript_scroll_y = 160.0;
+    layout.paneByIdMutable(second_pane_id).?.ref.chat.transcript_scroll_valid = true;
+    layout.paneByIdMutable(second_pane_id).?.ref.chat.transcript_scroll_y = 320.0;
+    layout.resetChatTranscriptScrollForThread(2);
+    try std.testing.expect(layout.paneById(1).?.ref.chat.transcript_scroll_valid);
+    try std.testing.expect(!layout.paneById(second_pane_id).?.ref.chat.transcript_scroll_valid);
+    try std.testing.expectEqual(@as(f32, 0.0), layout.paneById(second_pane_id).?.ref.chat.transcript_scroll_y);
+}
+
+test "workspace chat scroll shift rebases saved offsets without breaking tail-follow" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    // Pane 1 shows thread 0 with its own saved offset. Two panes show thread
+    // 2: one manually scrolled up, one in tail-follow (e.g. a historical pane
+    // present at startup, or freshly reset by a command-palette retarget).
+    const second_pane_id = try layout.createChatPane(allocator, 2);
+    try layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
+    const third_pane_id = try layout.createChatPane(allocator, 2);
+    try layout.splitPaneWithLeaf(allocator, second_pane_id, third_pane_id, .vertical, true);
+
+    layout.paneByIdMutable(1).?.ref.chat.transcript_scroll_valid = true;
+    layout.paneByIdMutable(1).?.ref.chat.transcript_scroll_y = 160.0;
+    layout.paneByIdMutable(second_pane_id).?.ref.chat.transcript_scroll_valid = true;
+    layout.paneByIdMutable(second_pane_id).?.ref.chat.transcript_scroll_y = 52_000.0;
+
+    // Older-history materialization shrank thread 2's estimated height; the
+    // saved anchor must move with it while other threads and tail-follow
+    // panes stay untouched.
+    layout.shiftChatTranscriptScrollForThread(2, -48_000.0);
+    try std.testing.expectEqual(@as(f32, 160.0), layout.paneById(1).?.ref.chat.transcript_scroll_y);
+    try std.testing.expectEqual(@as(f32, 4_000.0), layout.paneById(second_pane_id).?.ref.chat.transcript_scroll_y);
+    try std.testing.expect(!layout.paneById(third_pane_id).?.ref.chat.transcript_scroll_valid);
+    try std.testing.expectEqual(@as(f32, 0.0), layout.paneById(third_pane_id).?.ref.chat.transcript_scroll_y);
+
+    // A grown estimate shifts anchors down; an over-shrunk one clamps at the
+    // top without invalidating the manual offset into tail-follow.
+    layout.shiftChatTranscriptScrollForThread(2, 1_250.0);
+    try std.testing.expectEqual(@as(f32, 5_250.0), layout.paneById(second_pane_id).?.ref.chat.transcript_scroll_y);
+    layout.shiftChatTranscriptScrollForThread(2, -9_000.0);
+    try std.testing.expectEqual(@as(f32, 0.0), layout.paneById(second_pane_id).?.ref.chat.transcript_scroll_y);
+    try std.testing.expect(layout.paneById(second_pane_id).?.ref.chat.transcript_scroll_valid);
 }

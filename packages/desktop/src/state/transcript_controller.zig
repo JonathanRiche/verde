@@ -450,7 +450,9 @@ pub fn requestTranscriptScrollToBottom(self: anytype) void {
     if (self.project_controller.projects.items.len == 0) return;
     // Drop any saved offset so the next transcript layout uses the fresh tail height
     // (e.g. right after appending the user message and starting a stream).
+    const thread_index = self.currentProject().selected_thread_index;
     self.currentThreadMutable().transcript_scroll_valid = false;
+    self.currentProjectMutable().workspace_layout.resetChatTranscriptScrollForThread(thread_index);
     self.transcript_controller.auto_follow_pending = true;
     self.transcript_controller.scroll_to_bottom_frames = 8;
     self.transcript_controller.pending_scroll_px = 0;
@@ -497,6 +499,21 @@ pub fn rememberWorkspaceChatTranscriptScroll(self: anytype, pane_id: WorkspacePa
         },
         else => {},
     }
+}
+
+/// Rebases every saved transcript offset for the current thread by `delta`.
+/// Offsets are stored relative to the estimated top of the thread's content;
+/// when lazy layout materializes older rows that estimate changes, so anchors
+/// must move by the same amount to keep the rows they point at on screen.
+/// Threads/panes in tail-follow (no saved offset) are left untouched.
+pub fn shiftCurrentTranscriptScroll(self: anytype, delta: f32) void {
+    if (self.project_controller.projects.items.len == 0) return;
+    const thread = self.currentThreadMutable();
+    if (thread.transcript_scroll_valid) {
+        thread.transcript_scroll_y = @max(thread.transcript_scroll_y + delta, 0.0);
+    }
+    const thread_index = self.currentProject().selected_thread_index;
+    self.currentProjectMutable().workspace_layout.shiftChatTranscriptScrollForThread(thread_index, delta);
 }
 
 pub fn currentTranscriptScrollY(self: anytype) ?f32 {

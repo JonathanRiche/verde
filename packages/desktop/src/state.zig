@@ -4157,6 +4157,7 @@ pub const AppState = struct {
     pub const currentThreadMutable = transcript_controller.currentThreadMutable;
     pub const rememberCurrentTranscriptScroll = transcript_controller.rememberCurrentTranscriptScroll;
     pub const rememberWorkspaceChatTranscriptScroll = transcript_controller.rememberWorkspaceChatTranscriptScroll;
+    pub const shiftCurrentTranscriptScroll = transcript_controller.shiftCurrentTranscriptScroll;
     pub const currentTranscriptScrollY = transcript_controller.currentTranscriptScrollY;
     pub const workspaceChatTranscriptScrollY = transcript_controller.workspaceChatTranscriptScrollY;
     pub const acknowledgeFocusedChatCompletion = transcript_controller.acknowledgeFocusedChatCompletion;
