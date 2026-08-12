@@ -21,6 +21,82 @@ pub const ChatRole = enum(u8) {
     system = 2,
 };
 
+/// Decodes canonical role integers while repairing rows written by historical
+/// codecs. Production stores contain all three integer orderings without codec
+/// provenance, so stable Verde authors are the only common discriminator.
+pub fn decodeStoredChatRole(raw: i64, author_raw: []const u8) ChatRole {
+    const author = std.mem.trim(u8, author_raw, "\n\r\t ");
+    if (storedUserAuthor(author)) return .user;
+    if (storedAssistantAuthor(author)) return .assistant;
+
+    // Every persisted Verde event/card title is a system author. Prefer that
+    // stable contract over an ambiguous integer; only authorless corrupt or
+    // third-party rows fall back to the current canonical codec.
+    if (author.len > 0) return .system;
+
+    return switch (raw) {
+        0 => .user,
+        1 => .assistant,
+        2 => .system,
+        else => .user,
+    };
+}
+
+fn storedUserAuthor(author: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(author, "You") or
+        std.ascii.eqlIgnoreCase(author, "User");
+}
+
+fn storedAssistantAuthor(author: []const u8) bool {
+    inline for (.{ "Assistant", "Agent", "OpenCode", "Codex", "Claude", "Cursor", "Sprout", "Moss", "Vireo" }) |known| {
+        if (std.ascii.eqlIgnoreCase(author, known)) return true;
+    }
+    return false;
+}
+
+test "mixed stored chat role codecs retain semantic roles" {
+    const Case = struct {
+        raw: i64,
+        author: []const u8,
+        expected: ChatRole,
+    };
+    const cases = [_]Case{
+        // Canonical SQLite rows.
+        .{ .raw = 0, .author = "You", .expected = .user },
+        .{ .raw = 0, .author = "user", .expected = .user },
+        .{ .raw = 1, .author = "Assistant", .expected = .assistant },
+        .{ .raw = 1, .author = "Codex", .expected = .assistant },
+        .{ .raw = 2, .author = "System", .expected = .system },
+        .{ .raw = 2, .author = "Ran command", .expected = .system },
+        // Historical daemon rows.
+        .{ .raw = 0, .author = "Ran command", .expected = .system },
+        .{ .raw = 0, .author = "Changed files", .expected = .system },
+        .{ .raw = 1, .author = "You", .expected = .user },
+        .{ .raw = 2, .author = "OpenCode", .expected = .assistant },
+        .{ .raw = 2, .author = "Codex", .expected = .assistant },
+        .{ .raw = 2, .author = "Claude", .expected = .assistant },
+        .{ .raw = 2, .author = "Cursor", .expected = .assistant },
+        .{ .raw = 2, .author = "Sprout", .expected = .assistant },
+        // Older desktop projections used assistant=0, system=1, user=2.
+        .{ .raw = 0, .author = "Codex", .expected = .assistant },
+        .{ .raw = 1, .author = "MCP tool", .expected = .system },
+        .{ .raw = 2, .author = "You", .expected = .user },
+        // Non-Verde authors cannot be decoded from an ambiguous integer. They
+        // degrade to system rows instead of rendering as user/assistant prose.
+        .{ .raw = 0, .author = "Custom", .expected = .system },
+        .{ .raw = 1, .author = "Custom", .expected = .system },
+        .{ .raw = 2, .author = "Custom", .expected = .system },
+        // Authorless rows retain deterministic canonical fallback behavior.
+        .{ .raw = 0, .author = "", .expected = .user },
+        .{ .raw = 1, .author = "", .expected = .assistant },
+        .{ .raw = 2, .author = "", .expected = .system },
+        .{ .raw = 99, .author = "", .expected = .user },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, decodeStoredChatRole(case.raw, case.author));
+    }
+}
+
 pub const Provider = enum(u8) {
     opencode = 0,
     codex = 1,

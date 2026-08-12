@@ -553,9 +553,10 @@ pub const Client = struct {
         defer message_rows.deinit();
 
         while (message_rows.next()) |message_row| {
+            const author = message_row.text(1);
             try messages.append(allocator, .{
-                .role = decodeChatRole(message_row.int(0)),
-                .author = try allocator.dupe(u8, message_row.text(1)),
+                .role = db_types.decodeStoredChatRole(message_row.int(0), author),
+                .author = try allocator.dupe(u8, author),
                 .body = try allocator.dupe(u8, message_row.text(2)),
                 .image = try loadOptionalImage(
                     allocator,
@@ -735,15 +736,6 @@ fn encodeChatRole(role: db_types.ChatRole) i64 {
     };
 }
 
-fn decodeChatRole(raw: i64) db_types.ChatRole {
-    return switch (raw) {
-        0 => .user,
-        1 => .assistant,
-        2 => .system,
-        else => .user,
-    };
-}
-
 fn encodeOptionalEnum(value: anytype) ?i64 {
     const enum_value = value orelse return null;
     return @as(i64, @intFromEnum(enum_value));
@@ -790,18 +782,23 @@ fn testOpenDatabase(allocator: std.mem.Allocator, pref_path: []const u8) !zqlite
 }
 
 test "chat roles preserve the shipped store codec" {
-    try testing.expectEqual(db_types.ChatRole.user, decodeChatRole(0));
-    try testing.expectEqual(db_types.ChatRole.assistant, decodeChatRole(1));
-    try testing.expectEqual(db_types.ChatRole.system, decodeChatRole(2));
-    try testing.expectEqual(db_types.ChatRole.user, decodeChatRole(99));
+    try testing.expectEqual(db_types.ChatRole.user, db_types.decodeStoredChatRole(0, "You"));
+    try testing.expectEqual(db_types.ChatRole.assistant, db_types.decodeStoredChatRole(1, "Assistant"));
+    try testing.expectEqual(db_types.ChatRole.system, db_types.decodeStoredChatRole(2, "System"));
+    try testing.expectEqual(db_types.ChatRole.user, db_types.decodeStoredChatRole(99, ""));
 
     try testing.expectEqual(@as(i64, 0), encodeChatRole(.user));
     try testing.expectEqual(@as(i64, 1), encodeChatRole(.assistant));
     try testing.expectEqual(@as(i64, 2), encodeChatRole(.system));
 
     inline for (.{ db_types.ChatRole.user, db_types.ChatRole.assistant, db_types.ChatRole.system }) |role| {
+        const author: []const u8 = switch (role) {
+            .user => "You",
+            .assistant => "Assistant",
+            .system => "System",
+        };
         try testing.expectEqual(@as(i64, @intFromEnum(role)), encodeChatRole(role));
-        try testing.expectEqual(role, decodeChatRole(encodeChatRole(role)));
+        try testing.expectEqual(role, db_types.decodeStoredChatRole(encodeChatRole(role), author));
     }
 }
 
@@ -1082,6 +1079,80 @@ test "read-only open loads a current database" {
     defer loaded.deinit();
     try testing.expect(loaded.value.sidebar_collapsed);
     try testing.expectError(error.ReadOnly, reader.conn.execNoArgs("delete from app_state"));
+}
+
+test "read-only load repairs mixed historical daemon chat roles without mutation" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+
+    {
+        var writer = try Client.init(testing.allocator, pref_path);
+        defer writer.deinit();
+        try writer.save(.{ .projects = &.{.{
+            .id = "mixed-workspace",
+            .label = "Mixed roles",
+            .path = "/tmp/mixed",
+            .threads = &.{.{
+                .title = "Mixed roles",
+                .local_thread_id = "mixed-thread",
+                .provider = .codex,
+                .messages = &.{
+                    .{ .role = .user, .author = "You", .body = "canonical user" },
+                    .{ .role = .assistant, .author = "Assistant", .body = "canonical assistant" },
+                    .{ .role = .system, .author = "System", .body = "canonical system" },
+                    .{
+                        .role = .system,
+                        .author = "Ran command",
+                        .body = "legacy system",
+                        .tool_call_id = "legacy-call",
+                        .tool_call_kind = .execute,
+                        .tool_call_status = .completed,
+                    },
+                    .{ .role = .user, .author = "You", .body = "legacy user" },
+                    .{ .role = .assistant, .author = "Codex", .body = "legacy assistant" },
+                    .{ .role = .assistant, .author = "Codex", .body = "desktop assistant" },
+                    .{ .role = .system, .author = "Changed files", .body = "desktop system" },
+                    .{ .role = .user, .author = "You", .body = "desktop user" },
+                },
+            }},
+        }} });
+        // Reproduce the historical daemon's overlapping role integers.
+        try writer.conn.execNoArgs(
+            \\update messages set role = 0 where body = 'legacy system';
+            \\update messages set role = 1 where body = 'legacy user';
+            \\update messages set role = 2 where body = 'legacy assistant';
+            \\update messages set role = 0 where body = 'desktop assistant';
+            \\update messages set role = 1 where body = 'desktop system';
+            \\update messages set role = 2 where body = 'desktop user';
+        );
+    }
+
+    var reader = try Client.initReadOnly(testing.allocator, pref_path);
+    defer reader.deinit();
+    var loaded = (try reader.load(testing.allocator)).?;
+    defer loaded.deinit();
+    const messages = loaded.value.projects[0].threads.?[0].messages;
+    const expected_roles = [_]db_types.ChatRole{ .user, .assistant, .system, .system, .user, .assistant, .assistant, .system, .user };
+    try testing.expectEqual(expected_roles.len, messages.len);
+    for (messages, expected_roles) |message, expected| {
+        try testing.expectEqual(expected, message.role);
+    }
+    try testing.expectEqualStrings("legacy-call", messages[3].tool_call_id.?);
+    try testing.expectEqual(provider_types.ToolCallKind.execute, messages[3].tool_call_kind.?);
+    try testing.expectEqual(provider_types.ToolCallStatus.completed, messages[3].tool_call_status.?);
+
+    const expected_raw = [_]i64{ 0, 1, 2, 0, 1, 2, 0, 1, 2 };
+    var rows = try reader.conn.rows("select role from messages order by sort_index", .{});
+    defer rows.deinit();
+    var index: usize = 0;
+    while (rows.next()) |row| : (index += 1) {
+        try testing.expect(index < expected_raw.len);
+        try testing.expectEqual(expected_raw[index], row.int(0));
+    }
+    if (rows.err) |err| return err;
+    try testing.expectEqual(expected_raw.len, index);
 }
 
 test "load holds one WAL snapshot across all reads" {
