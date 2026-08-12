@@ -8,6 +8,7 @@ const colors = @import("colors.zig");
 const globe_icon = @import("globe_icon.zig");
 const runtime = @import("runtime.zig");
 const command_palette = @import("command_palette.zig");
+const keybinds = @import("../app/keybinds.zig");
 const utils = @import("../utils.zig");
 const profiler = @import("../runtime/profiler.zig");
 const platform_runtime = @import("platform_runtime");
@@ -968,6 +969,14 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         const row_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w, .h = row_h };
         const project_visible = rowVisible(row_rect, list_clip);
         const project_hovered = state.sidebar_project_hover == project_index;
+        var workspace_shortcut_buf: [16]u8 = undefined;
+        const workspace_shortcut = if (state.alt_shortcut_hints_visible)
+            if (state.command_controller.keyboard_config) |config|
+                keybinds.formatAltKeyTipAt(&workspace_shortcut_buf, config.workspace_select, project_index)
+            else
+                ""
+        else
+            "";
         if (project_visible) {
             if (project_hovered and !selected) {
                 queuePaletteRoundedRect(state, snapRect(row_rect), paletteColor(theme.withAlpha(theme.COLOR_GREEN, 48)), theme.scaledUi(6.0));
@@ -991,8 +1000,11 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         const action_w = theme.scaledUi(30.0);
         const action_gap = theme.scaledUi(2.0);
         const action_cluster_w = action_w * 3.0 + action_gap * 2.0;
-        const show_actions = selected or project_hovered;
-        const content_right = row_rect.x + row_rect.w - action_cluster_w - theme.scaledUi(6.0);
+        const show_actions = workspace_shortcut.len == 0 and (selected or project_hovered);
+        const content_right = if (workspace_shortcut.len > 0)
+            row_rect.x + row_rect.w - theme.scaledUi(32.0)
+        else
+            row_rect.x + row_rect.w - action_cluster_w - theme.scaledUi(6.0);
         const badge_label = herdrRuntimeBadgeLabel(project);
         const badge_w = theme.scaledUi(SIDEBAR_HERDR_BADGE_W_CSS);
         const badge_gap = theme.scaledUi(6.0);
@@ -1002,6 +1014,7 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
             if (badge_label) |label| {
                 renderHerdrRuntimeBadge(state, .{ .x = content_right - badge_w, .y = y + theme.scaledUi(6.0), .w = badge_w, .h = row_h - theme.scaledUi(12.0) }, label, selected or project_hovered, row_rect);
             }
+            if (workspace_shortcut.len > 0) renderSidebarShortcutKeyTip(state, row_rect, list_clip, workspace_shortcut);
         }
         if (project_visible and show_actions) {
             const action_x = row_rect.x + row_rect.w - action_cluster_w;
@@ -1175,7 +1188,7 @@ fn renderAttentionClusterSection(
     for (rows[0..row_count]) |row| {
         const project = &state.project_controller.projects.items[row.project_index];
         const row_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w, .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS) };
-        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, row.project_index, project, row.pane, row_rect, clip, true);
+        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, row.project_index, project, row.pane, row_rect, clip, true, null);
         y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
     }
 
@@ -1346,6 +1359,15 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
             }, paletteColor(theme.COLOR_GREEN), theme.scaledUi(1.5));
         }
 
+        var workspace_shortcut_buf: [16]u8 = undefined;
+        const workspace_shortcut = if (state.alt_shortcut_hints_visible)
+            if (state.command_controller.keyboard_config) |config|
+                keybinds.formatAltKeyTipAt(&workspace_shortcut_buf, config.workspace_select, project_index)
+            else
+                ""
+        else
+            "";
+
         // Workspace initial as the avatar mark. queuePaletteText is left-aligned,
         // so center it manually (single glyph ~= font * 0.6 wide). On the filled
         // active chip the initial reverses out to the dark panel color.
@@ -1359,16 +1381,20 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
             theme.COLOR_WHITE
         else
             theme.COLOR_TEXT_MUTED;
-        queuePaletteText(state, .{
-            .x = @round(avatar_rect.x + (avatar - letter_w) * 0.5),
-            .y = @round(avatar_rect.y + (avatar - letter_font * 1.25) * 0.5),
-            .w = letter_w + theme.scaledUi(3.0),
-            .h = letter_font * 1.25,
-        }, letter, paletteColor(letter_color), letter_font, null);
+        if (workspace_shortcut.len > 0) {
+            renderSidebarShortcutKeyTip(state, avatar_rect, rect, workspace_shortcut);
+        } else {
+            queuePaletteText(state, .{
+                .x = @round(avatar_rect.x + (avatar - letter_w) * 0.5),
+                .y = @round(avatar_rect.y + (avatar - letter_font * 1.25) * 0.5),
+                .w = letter_w + theme.scaledUi(3.0),
+                .h = letter_font * 1.25,
+            }, letter, paletteColor(letter_color), letter_font, null);
+        }
 
         // Attention badge tucked into the top-right corner, kept fully inside the
         // narrow rail so it doesn't clip against the panel edge.
-        if (workspaceStatusColor(state, project_index)) |badge| {
+        if (workspace_shortcut.len == 0) if (workspaceStatusColor(state, project_index)) |badge| {
             const pulse = attentionPulse(state);
             const badge_d = theme.scaledUi(8.0);
             queuePaletteRoundedRect(state, .{
@@ -1377,7 +1403,7 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
                 .w = badge_d,
                 .h = badge_d,
             }, paletteColor(theme.withAlpha(badge, @intFromFloat(pulse * 255.0))), badge_d * 0.5);
-        }
+        };
 
         addPaletteHit(avatar_rect, .workspace_avatar, project_index, 0);
         y += avatar + theme.scaledUi(5.0);
@@ -1659,14 +1685,14 @@ fn renderOpenPanesSection(
     if (layout.panes.items.len == 0) return y;
 
     const indent = theme.scaledUi(SIDEBAR_ROW_INDENT_CSS);
-    for (layout.panes.items) |*pane| {
+    for (layout.panes.items, 0..) |*pane, pane_index| {
         const row_rect: palette.Rect = .{
             .x = x + indent,
             .y = y,
             .w = rail_w - indent,
             .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS),
         };
-        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip, false);
+        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip, false, pane_index);
         y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
     }
     y += theme.scaledUi(4.0);
@@ -1685,6 +1711,7 @@ fn renderOpenPaneRow(
     rect: palette.Rect,
     clip: palette.Rect,
     show_workspace_tag: bool,
+    shortcut_index: ?usize,
 ) void {
     const layout = &project.workspace_layout;
     const quick = if (layout.quick_pane) |value|
@@ -1827,7 +1854,20 @@ fn renderOpenPaneRow(
     // width while a label is actually present.
     var status_buf: [24]u8 = undefined;
     const status_label = paneStatusLabelText(&status_buf, status, running, status_started_at_ms);
-    const status_reserve = if (status_label.len > 0) theme.scaledUi(SIDEBAR_STATUS_COLUMN_CSS) else theme.scaledUi(14.0);
+    var shortcut_buf: [16]u8 = undefined;
+    const shortcut_label = if (state.ctrl_shortcut_hints_visible and shortcut_index != null)
+        if (state.command_controller.keyboard_config) |config|
+            keybinds.formatCtrlKeyTipAt(&shortcut_buf, config.workspace_pane_select, shortcut_index.?)
+        else
+            ""
+    else
+        "";
+    const status_reserve = if (shortcut_label.len > 0)
+        theme.scaledUi(30.0)
+    else if (status_label.len > 0)
+        theme.scaledUi(SIDEBAR_STATUS_COLUMN_CSS)
+    else
+        theme.scaledUi(14.0);
 
     var title_buf = std.mem.zeroes([64:0]u8);
     const title_chars: usize = @intFromFloat(@max((rect.w - title_left - status_reserve) / theme.scaledUi(7.0), 8.0));
@@ -1853,7 +1893,9 @@ fn renderOpenPaneRow(
     // Trailing status column: pulsing pip plus the status text in the same
     // color. The at-a-glance words/elapsed-time are what the expanded rail
     // offers over the collapsed rail's bare dots.
-    if (paneStatusColor(status, running)) |pip_color| {
+    if (shortcut_label.len > 0) {
+        renderSidebarShortcutKeyTip(state, rect, clip, shortcut_label);
+    } else if (paneStatusColor(status, running)) |pip_color| {
         const animated = running or (if (status) |s| s == .working or s == .waiting else false);
         const pulse: f32 = if (animated) attentionPulse(state) else 1.0;
         const dot = theme.scaledUi(6.0);
@@ -1877,6 +1919,35 @@ fn renderOpenPaneRow(
             }, status_label, paletteColor(pip_color), status_font, clip);
         }
     }
+}
+
+// Minimal Ctrl-number badge in the row's existing trailing status slot.
+fn renderSidebarShortcutKeyTip(state: *runtime.AppState, row_rect: palette.Rect, clip: palette.Rect, label: []const u8) void {
+    const size = theme.scaledUi(18.0);
+    const rect: palette.Rect = .{
+        .x = row_rect.x + row_rect.w - size - theme.scaledUi(8.0),
+        .y = row_rect.y + (row_rect.h - size) * 0.5,
+        .w = size,
+        .h = size,
+    };
+    // One SDF command owns fill and stroke, avoiding the doubled AA fringe
+    // produced by overlapping rounded-fill and border commands.
+    queuePalettePanel(
+        state,
+        rect,
+        paletteColor(theme.COLOR_PANEL_ALT),
+        paletteColor(theme.borderMuted()),
+        theme.scaledUi(5.0),
+        theme.scaledUi(1.0),
+    );
+    const font_size = theme.scaledUi(11.0);
+    const text_w = runtime.paletteUiTextPrefixWidth(label, font_size, label.len);
+    queuePaletteUiText(state, .{
+        .x = rect.x + @max((rect.w - text_w) * 0.5, 0.0),
+        .y = rect.y + (rect.h - font_size * 1.25) * 0.5,
+        .w = @min(text_w, rect.w),
+        .h = font_size * 1.25,
+    }, label, paletteColor(theme.accent()), font_size, clip);
 }
 
 /// Formats a pane row's live status label; empty when the pane is quiet.
@@ -2022,6 +2093,12 @@ fn queuePaletteBorder(state: *runtime.AppState, rect: palette.Rect, color: palet
     };
 }
 
+fn queuePalettePanel(state: *runtime.AppState, rect: palette.Rect, fill: palette.Color, border: palette.Color, radius: f32, width: f32) void {
+    state.palette_overlay_batch.panel(state.allocator, snapRect(rect), fill, border, radius, width) catch |err| {
+        log.warn("failed to queue sidebar palette panel: {s}", .{@errorName(err)});
+    };
+}
+
 fn queuePaletteFolderIcon(state: *runtime.AppState, x: f32, center_y: f32, width: f32, height: f32, color: [4]f32, filled: bool) void {
     const tab_rect: palette.Rect = .{
         .x = x,
@@ -2142,6 +2219,25 @@ fn queuePaletteText(state: *runtime.AppState, rect: palette.Rect, value: []const
         false,
     ) catch |err| {
         log.warn("failed to queue sidebar palette text: {s}", .{@errorName(err)});
+    };
+}
+
+fn queuePaletteUiText(state: *runtime.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
+    const stable_value = stablePaletteText(state, value) catch |err| {
+        log.warn("failed to retain sidebar UI text: {s}", .{@errorName(err)});
+        return;
+    };
+    state.palette_overlay_batch.roleText(
+        state.allocator,
+        snapRect(rect),
+        stable_value,
+        color,
+        font_size,
+        .ui,
+        null,
+        clip,
+    ) catch |err| {
+        log.warn("failed to queue sidebar UI text: {s}", .{@errorName(err)});
     };
 }
 

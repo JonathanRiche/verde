@@ -1328,6 +1328,33 @@ pub fn formatAltKeyTip(buf: []u8, bindings: []const Keybind) []const u8 {
     return "";
 }
 
+/// Formats the key portion of an indexed plain Alt binding. Workspace rows
+/// use the binding's configured order rather than assuming 1…0.
+pub fn formatAltKeyTipAt(buf: []u8, bindings: []const Keybind, index: usize) []const u8 {
+    if (index >= bindings.len) return "";
+    const binding = bindings[index];
+    if (!binding.alt or binding.primary or binding.ctrl or binding.meta or binding.shift) return "";
+    const name = keycodeLabel(binding.key);
+    const count = @min(buf.len, name.len);
+    @memcpy(buf[0..count], name[0..count]);
+    for (buf[0..count]) |*byte| byte.* = std.ascii.toUpper(byte.*);
+    return buf[0..count];
+}
+
+/// Formats the key portion of an indexed plain Ctrl binding. Sidebar pane
+/// hints use the same ordering as `workspacePaneSelectIndexForEvent`.
+pub fn formatCtrlKeyTipAt(buf: []u8, bindings: []const Keybind, index: usize) []const u8 {
+    if (index >= bindings.len) return "";
+    const binding = bindings[index];
+    const primary_is_ctrl = binding.primary and builtin.os.tag != .macos;
+    if ((!binding.ctrl and !primary_is_ctrl) or binding.alt or binding.meta or binding.shift) return "";
+    const name = keycodeLabel(binding.key);
+    const count = @min(buf.len, name.len);
+    @memcpy(buf[0..count], name[0..count]);
+    for (buf[0..count]) |*byte| byte.* = std.ascii.toUpper(byte.*);
+    return buf[0..count];
+}
+
 fn formatKeybind(buf: []u8, binding: Keybind) []const u8 {
     var count: usize = 0;
     if (binding.primary or binding.ctrl) count += copyInto(buf[count..], "Ctrl+");
