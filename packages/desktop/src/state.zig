@@ -1224,7 +1224,7 @@ const COMPOSER_MODEL_PICKER_WIDTH: f32 = 430.0;
 const COMPOSER_MODEL_PICKER_RAIL_WIDTH: f32 = 52.0;
 const COMPOSER_MODEL_PICKER_Z: i32 = 1400;
 pub const COMPOSER_RUN_CONFIG_Z: i32 = 1400;
-const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode, .claude, .cursor };
+const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .claude, .cursor, .opencode };
 
 fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
     if (byte_offset >= text.len) return .{ .byte_len = 0, .width = 0.0 };
@@ -1797,6 +1797,9 @@ pub const PaletteModelPicker = palette.richPicker(.{
     .row_height_with_description = 50.0,
     .header_row_height = 26.0,
     .max_body_height = 380.0,
+    // Five model rows stay visible while longer provider lists scroll within
+    // the same popover, preserving pointer and keyboard focus across filters.
+    .fixed_body_height = 250.0,
     .padding_x = 10.0,
     .padding_y = 10.0,
     .row_padding_x = 10.0,
