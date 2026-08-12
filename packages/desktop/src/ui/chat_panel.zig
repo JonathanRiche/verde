@@ -766,8 +766,7 @@ pub fn handleApprovalPaletteMouseButton(state: *app_state.AppState, x: f32, y: f
 pub fn handleTranscriptPaletteWheel(state: *app_state.AppState, x: f32, y: f32, wheel_y: f32) bool {
     if (wheel_y == 0.0) return false;
     const hit = findTranscriptHit(x, y) orelse return false;
-    const pane_id = hit.pane_id;
-    scrollTranscriptByWheel(state, pane_id, wheel_y);
+    scrollTranscriptByWheel(state, hit.pane_id, wheel_y, hit.scroll_y);
     return true;
 }
 
@@ -779,15 +778,15 @@ pub fn handleTranscriptPaletteWheel(state: *app_state.AppState, x: f32, y: f32, 
 pub fn handleFocusedTranscriptPaletteWheel(state: *app_state.AppState, wheel_y: f32) bool {
     if (wheel_y == 0.0) return false;
     const pane_id = state.focusedWorkspaceChatPaneId() orelse if (state.focusedWorkspacePaneKind() == .chat) null else return false;
-    scrollTranscriptByWheel(state, pane_id, wheel_y);
+    scrollTranscriptByWheel(state, pane_id, wheel_y, state.transcript_controller.palette_scroll_y);
     return true;
 }
 
-fn scrollTranscriptByWheel(state: *app_state.AppState, pane_id: ?app_state.WorkspacePaneId, wheel_y: f32) void {
+fn scrollTranscriptByWheel(state: *app_state.AppState, pane_id: ?app_state.WorkspacePaneId, wheel_y: f32, fallback_scroll_y: f32) void {
     if (pane_id) |id| _ = state.focusCurrentProjectWorkspacePane(id);
     state.transcript_controller.focused = true;
     _ = state.acknowledgeFocusedChatCompletion();
-    const current = currentTranscriptScrollY(state, pane_id) orelse state.transcript_controller.palette_scroll_y;
+    const current = currentTranscriptScrollY(state, pane_id) orelse fallback_scroll_y;
     const delta = -wheel_y * theme.scaledUi(TRANSCRIPT_WHEEL_PIXELS);
     rememberTranscriptScroll(state, pane_id, snapTranscriptScrollY(current + delta, null));
     state.transcript_controller.auto_follow_pending = false;
@@ -1963,7 +1962,13 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
 
     if (thread.messages.items.len == 0 and !thread.isSendPendingForUi() and state.currentThreadPendingSlashCommandLabel() == null) {
         if (active_geometry) state.transcript_controller.palette_scroll_y = 0.0;
-        rememberTranscriptScroll(state, pane_id, 0.0);
+        // A historical thread can render empty for one frame before hydration.
+        // Do not turn that transient state into an explicit top offset; retaining
+        // the missing offset keeps the hydrated transcript pinned to its tail.
+        const saved_scroll = currentTranscriptScrollY(state, pane_id);
+        if (shouldRememberTranscriptScroll(saved_scroll, false)) {
+            rememberTranscriptScroll(state, pane_id, 0.0);
+        }
         appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect, .column = column, .clip = clip });
         queueText(state, .{ .x = column.x, .y = column.y, .w = column.w, .h = theme.scaledUi(30.0) }, "No messages yet", paletteColor(theme.COLOR_WHITE), theme.scaledUi(20.0), clip);
         queueText(state, .{ .x = column.x, .y = column.y + theme.scaledUi(32.0), .w = column.w, .h = theme.scaledUi(26.0) }, "Choose a provider, type a prompt below, and start the first chat for this directory.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), clip);
@@ -1971,12 +1976,17 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
     }
 
     const cold_tail_follow = !thread.transcript_layout_visible_ready;
+    const content_height = transcriptContentHeight(state, thread, column.w, column.h, currentTranscriptScrollY(state, pane_id));
+    // Materializing older rows shifts content coordinates (the estimated
+    // history above the viewport changes height) and rebases saved offsets;
+    // read the anchor only after the layout pass so this frame renders the
+    // rows the anchor was pointing at.
     const saved_scroll = currentTranscriptScrollY(state, pane_id);
-    const content_height = transcriptContentHeight(state, thread, column.w, column.h, saved_scroll);
     const max_scroll = @max(0.0, content_height - column.h);
     const has_pending_stream = state.hasPendingStream() or state.currentThreadPendingSlashCommandLabel() != null;
 
-    var scroll_y = snapTranscriptScrollY(currentTranscriptScrollY(state, pane_id) orelse max_scroll, max_scroll);
+    var scroll_y = snapTranscriptScrollY(saved_scroll orelse max_scroll, max_scroll);
+    var manual_scroll_requested = false;
 
     if (paneOwnsActiveChatState(state, pane_id)) {
         const pi = state.project_controller.selected_index;
@@ -1989,17 +1999,20 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
         }
 
         if (state.transcript_controller.pending_scroll_px != 0.0) {
+            manual_scroll_requested = true;
             scroll_y = snapTranscriptScrollY(scroll_y + state.transcript_controller.pending_scroll_px, max_scroll);
             state.transcript_controller.pending_scroll_px = 0.0;
         }
         if (state.transcript_controller.pending_page_steps != 0) {
+            manual_scroll_requested = true;
             const page_h = column.h * TRANSCRIPT_PAGE_VIEW_FRAC;
             scroll_y = snapTranscriptScrollY(scroll_y + @as(f32, @floatFromInt(state.transcript_controller.pending_page_steps)) * page_h, max_scroll);
             state.transcript_controller.pending_page_steps = 0;
         }
     }
 
-    if (!cold_tail_follow and
+    const implicit_cold_tail_follow = shouldImplicitlyFollowColdTail(cold_tail_follow, saved_scroll, manual_scroll_requested);
+    if (!implicit_cold_tail_follow and
         !thread.transcript_layout_valid and
         !state.transcript_controller.auto_follow_pending and
         state.transcript_controller.scroll_to_bottom_frames == 0)
@@ -2011,7 +2024,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
 
     updateTranscriptAutoFollowPalette(state, has_pending_stream, max_scroll, scroll_y);
 
-    if (cold_tail_follow or state.transcript_controller.auto_follow_pending or state.transcript_controller.scroll_to_bottom_frames > 0) {
+    if (implicit_cold_tail_follow or state.transcript_controller.auto_follow_pending or state.transcript_controller.scroll_to_bottom_frames > 0) {
         scroll_y = max_scroll;
     }
     if (!thread.transcript_layout_valid) {
@@ -2031,7 +2044,13 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
     if (state.transcript_controller.scroll_to_bottom_frames == 0 and !has_pending_stream) {
         state.transcript_controller.auto_follow_pending = false;
     }
-    rememberTranscriptScroll(state, pane_id, scroll_y);
+    // A missing saved offset means "follow the tail", not "save this frame's
+    // estimated tail coordinate". Cold long-thread estimates can move by many
+    // screens as width settles; keep the semantic tail latch until the user
+    // explicitly scrolls instead of visibly chasing a stale numeric offset.
+    if (shouldRememberTranscriptScroll(saved_scroll, manual_scroll_requested)) {
+        rememberTranscriptScroll(state, pane_id, scroll_y);
+    }
     if (active_geometry) state.transcript_controller.palette_scroll_y = scroll_y;
 
     var content_y = renderCommittedTranscript(state, thread, column, scroll_y, clip);
@@ -2080,6 +2099,39 @@ fn scrollFromThumbY(track: palette.Rect, thumb_h: f32, max_scroll: f32, y: f32, 
 fn snapTranscriptScrollY(value: f32, max_scroll: ?f32) f32 {
     const upper = max_scroll orelse std.math.floatMax(f32);
     return std.math.clamp(@round(@max(value, 0.0)), 0.0, upper);
+}
+
+fn shouldRememberTranscriptScroll(saved_scroll: ?f32, manual_scroll_requested: bool) bool {
+    return saved_scroll != null or manual_scroll_requested;
+}
+
+fn shouldImplicitlyFollowColdTail(cold_tail_follow: bool, saved_scroll: ?f32, manual_scroll_requested: bool) bool {
+    return cold_tail_follow and saved_scroll == null and !manual_scroll_requested;
+}
+
+test "implicit transcript tail follow survives changing cold-layout estimates" {
+    const changing_max_scroll = [_]f32{ 1_000.0, 4_500.0, 2_800.0, 9_200.0 };
+    var saved_scroll: ?f32 = null;
+    // A transient empty render before historical hydration must not create an
+    // explicit zero offset that the loaded transcript interprets as its top.
+    if (shouldRememberTranscriptScroll(saved_scroll, false)) saved_scroll = 0.0;
+    try std.testing.expect(saved_scroll == null);
+
+    for (changing_max_scroll) |max_scroll| {
+        const scroll_y = snapTranscriptScrollY(saved_scroll orelse max_scroll, max_scroll);
+        try std.testing.expectEqual(max_scroll, scroll_y);
+        if (shouldRememberTranscriptScroll(saved_scroll, false)) saved_scroll = scroll_y;
+    }
+    try std.testing.expect(saved_scroll == null);
+
+    const manual_scroll = snapTranscriptScrollY(changing_max_scroll[0] - 240.0, changing_max_scroll[0]);
+    try std.testing.expect(shouldRememberTranscriptScroll(saved_scroll, true));
+    saved_scroll = manual_scroll;
+    try std.testing.expectEqual(manual_scroll, snapTranscriptScrollY(saved_scroll.?, changing_max_scroll[1]));
+
+    try std.testing.expect(!shouldImplicitlyFollowColdTail(true, null, true));
+    try std.testing.expect(!shouldImplicitlyFollowColdTail(true, manual_scroll, false));
+    try std.testing.expect(shouldImplicitlyFollowColdTail(true, null, false));
 }
 
 fn transcriptContentHeight(state: *app_state.AppState, thread: anytype, width: f32, viewport_height: f32, saved_scroll: ?f32) f32 {
@@ -2135,6 +2187,63 @@ test "partial transcript height projects unfinished rows without a full walk" {
     try std.testing.expectEqual(@as(f32, 0.0), estimatedPartialTranscriptHeight(&empty));
 }
 
+test "materializing older rows keeps a manual upward scroll on the same content" {
+    const FakeThread = struct {
+        transcript_layout_message_count: usize,
+        transcript_layout_first_message_index: usize,
+        transcript_layout_committed_height: f32,
+    };
+
+    // Frame N: two huge measured tail rows (large tool outputs), 119 older
+    // rows still projected from the running 900px average, viewport anchored
+    // inside the newest row after the user wheeled upward.
+    const items_before = [_]chat_types.TranscriptLayoutItem{
+        .{ .message_index = 120, .group_end = 121, .top = -900.0, .height = 880.0 },
+        .{ .message_index = 119, .group_end = 120, .top = -1_800.0, .height = 880.0 },
+    };
+    const before: FakeThread = .{
+        .transcript_layout_message_count = 2,
+        .transcript_layout_first_message_index = 119,
+        .transcript_layout_committed_height = 1_800.0,
+    };
+    const estimate_before = estimatedPartialTranscriptHeight(&before);
+    const scroll_before = estimate_before - 850.0;
+    try std.testing.expectEqual(@as(usize, 120), transcriptLayoutItemAtContentY(&items_before, estimate_before, scroll_before).?.message_index);
+
+    // Frame N+1: two older rows materialize far smaller than the average, so
+    // the estimated height above the viewport collapses by tens of screens.
+    const items_after = items_before ++ [_]chat_types.TranscriptLayoutItem{
+        .{ .message_index = 118, .group_end = 119, .top = -1_900.0, .height = 88.0 },
+        .{ .message_index = 117, .group_end = 118, .top = -2_000.0, .height = 88.0 },
+    };
+    const after: FakeThread = .{
+        .transcript_layout_message_count = 4,
+        .transcript_layout_first_message_index = 117,
+        .transcript_layout_committed_height = 2_000.0,
+    };
+    const estimate_after = estimatedPartialTranscriptHeight(&after);
+    try std.testing.expect(estimate_after < estimate_before - 40_000.0);
+
+    // Without rebasing, the stale numeric offset points past every
+    // materialized row — the on-screen blank gap and multi-screen leap.
+    try std.testing.expect(transcriptLayoutItemAtContentY(&items_after, estimate_after, scroll_before) == null);
+
+    // Production rebase path: ensureTranscriptLayout shifts saved offsets by
+    // the estimate delta through shiftChatTranscriptScrollForThread.
+    const allocator = std.testing.allocator;
+    var layout = try app_state.WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    layout.paneByIdMutable(1).?.ref.chat.transcript_scroll_valid = true;
+    layout.paneByIdMutable(1).?.ref.chat.transcript_scroll_y = scroll_before;
+    layout.shiftChatTranscriptScrollForThread(0, estimate_after - estimate_before);
+    const scroll_after = layout.paneById(1).?.ref.chat.transcript_scroll_y;
+
+    // The anchor stays on the same row at the same intra-row offset: no jump.
+    const anchored = transcriptLayoutItemAtContentY(&items_after, estimate_after, scroll_after) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 120), anchored.message_index);
+    try std.testing.expectEqual(scroll_before - estimate_before, scroll_after - estimate_after);
+}
+
 fn transcriptLayoutVariantHash(state: *app_state.AppState) u64 {
     var hasher = std.hash.Wyhash.init(0x7A4E_5C81_91D2_0B33);
     const tool_group_preference: u8 = @intFromEnum(state.app_config.tool_call_group_preference);
@@ -2164,6 +2273,7 @@ fn ensureTranscriptLayout(state: *app_state.AppState, width: f32, visible_height
         return;
     }
 
+    const estimate_before = estimatedPartialTranscriptHeight(thread);
     const can_extend = @abs(thread.transcript_layout_width - width) <= 0.5 and
         @abs(thread.transcript_layout_scale - scale) <= 0.001 and
         thread.transcript_layout_variant_hash == variant_hash and
@@ -2233,6 +2343,16 @@ fn ensureTranscriptLayout(state: *app_state.AppState, width: f32, visible_height
 
     thread.transcript_layout_valid = thread.transcript_layout_first_message_index == 0;
     if (thread.transcript_layout_valid) thread.transcript_layout_visible_ready = true;
+    // Extending older history rewrites the estimate for everything above the
+    // materialized region, which moves every row's top-relative coordinate by
+    // the same amount. Rebase saved offsets by that delta so each anchor keeps
+    // its distance from the tail and the viewport keeps the rows it was
+    // showing. Resets (width/scale/variant/message-set changes) invalidate the
+    // old coordinate space entirely, so their anchors are left as-is.
+    if (can_extend) {
+        const estimate_delta = estimatedPartialTranscriptHeight(thread) - estimate_before;
+        if (estimate_delta != 0.0) state.shiftCurrentTranscriptScroll(estimate_delta);
+    }
     const elapsed_ms = unixTimestampMs() - started_at_ms;
     if (elapsed_ms > SDL_STALL_LOG_THRESHOLD_MS) {
         app_state.log.warn(
