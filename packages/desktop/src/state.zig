@@ -2279,6 +2279,9 @@ pub const AppState = struct {
     sidebar_collapsed: bool,
     sidebar_hidden: bool,
     sidebar_hover_revealed: bool,
+    /// Held Alt exposes small, non-layout-affecting shortcut key tips beside
+    /// visible controls that own a plain Alt binding.
+    alt_shortcut_hints_visible: bool,
     composer_controller: ComposerControllerState,
     companion_controller: companion_controller,
     companion_composer: CompanionComposerPrompt,
@@ -2436,6 +2439,7 @@ pub const AppState = struct {
             .sidebar_collapsed = false,
             .sidebar_hidden = false,
             .sidebar_hover_revealed = false,
+            .alt_shortcut_hints_visible = false,
             .composer_controller = ComposerControllerState.init(),
             .companion_controller = companion_controller.init(),
             .companion_composer = CompanionComposerPrompt.init(),

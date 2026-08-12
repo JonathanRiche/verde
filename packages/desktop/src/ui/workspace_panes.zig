@@ -10,6 +10,7 @@ const palette = @import("palette");
 const sdl = @import("zsdl3");
 
 const app_config = @import("../app/config.zig");
+const keybinds = @import("../app/keybinds.zig");
 const storage_mod = @import("../state/storage.zig");
 const workspace_layout = @import("../state/workspace_layout.zig");
 const runtime = @import("runtime.zig");
@@ -1761,7 +1762,7 @@ fn renderZoomControl(
         .h = control_size,
     };
     const hovered = state.transcript_controller.palette_mouse_in_workspace and rectContains(control_rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
-    if (kind == .terminal and !maximized) {
+    if (kind == .terminal and !maximized and !state.alt_shortcut_hints_visible) {
         const hover_rect: palette.Rect = .{
             .x = pane_rect.x + pane_rect.w - theme.scaledUi(TERMINAL_ZOOM_HOVER_WIDTH_CSS),
             .y = pane_rect.y,
@@ -1797,6 +1798,13 @@ fn renderZoomControl(
     );
     appendHit(.{ .pane_id = pane_id, .action = .maximize, .rect = control_rect });
 
+    if (state.alt_shortcut_hints_visible and state.isCurrentProjectWorkspacePaneFocused(pane_id)) {
+        if (state.command_controller.keyboard_config) |config| {
+            var label_buf: [16]u8 = undefined;
+            renderPaneShortcutKeyTip(state, control_rect, pane_rect, keybinds.formatAltKeyTip(&label_buf, config.workspace_toggle_maximize));
+        }
+    }
+
     if (kind == .terminal) {
         const split_rect: palette.Rect = .{
             .x = pane_rect.x + pane_rect.w - margin - control_size,
@@ -1810,6 +1818,28 @@ fn renderZoomControl(
         appendHit(.{ .pane_id = pane_id, .action = .toggle_split_menu, .rect = split_rect });
         if (menu_open_here and split_menu_kind == .split_button) split_menu_anchor = split_rect;
     }
+}
+
+// Compact Alt-reveal badge attached to the focused pane's zoom control.
+fn renderPaneShortcutKeyTip(state: *runtime.AppState, target: palette.Rect, clip: palette.Rect, label: []const u8) void {
+    if (label.len == 0) return;
+    const size = theme.scaledUi(15.0);
+    const rect: palette.Rect = .{
+        .x = target.x - size + theme.scaledUi(2.5),
+        .y = target.y + (target.h - size) * 0.5,
+        .w = size,
+        .h = size,
+    };
+    queueRounded(state, rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(3.5));
+    queueBorder(state, rect, paletteColor(theme.borderMuted()), theme.scaledUi(3.5), theme.scaledUi(0.75));
+    const font_size = theme.scaledUi(9.5);
+    const text_w = runtime.paletteUiTextPrefixWidth(label, font_size, label.len);
+    queueText(state, .{
+        .x = rect.x + @max((rect.w - text_w) * 0.5, 0.0),
+        .y = rect.y + (rect.h - font_size * 1.25) * 0.5,
+        .w = @min(text_w, rect.w),
+        .h = font_size * 1.25,
+    }, label, paletteColor(theme.accent()), font_size, clip);
 }
 
 fn zoomIconAccent() [4]f32 {

@@ -1703,10 +1703,15 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
         },
         .window_focus_lost => {
             state.window_input_focus = false;
+            state.alt_shortcut_hints_visible = false;
             ui_layout.resetCompanionInputCaptures(state);
             state.blurCompanionComposer();
         },
         .key_down => {
+            if (event.key.scancode == .lalt or event.key.scancode == .ralt) {
+                state.alt_shortcut_hints_visible = true;
+                state.markDirty();
+            }
             if (browserInputDebugEnabled()) {
                 log.info(
                     "browser-input sdl key_down key=0x{x} scancode={} focused={} visible={}",
@@ -1931,6 +1936,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
         },
         .key_up => {
+            if (event.key.scancode == .lalt or event.key.scancode == .ralt) {
+                state.alt_shortcut_hints_visible = false;
+                state.markDirty();
+            }
             if (browserInputDebugEnabled()) {
                 log.info(
                     "browser-input sdl key_up key=0x{x} scancode={} focused={} visible={}",
