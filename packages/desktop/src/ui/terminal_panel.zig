@@ -2429,7 +2429,11 @@ fn queueRoundedBoxCorner(state: *app_state.AppState, rect: palette.Rect, cp: u21
     const center_x = rect.x + @floor((rect.w - stroke) * 0.5) + stroke * 0.5;
     const center_y = rect.y + @floor((rect.h - stroke) * 0.5) + stroke * 0.5;
     const radius = @min(rect.w, rect.h) * 0.5;
-    const circle: palette.Rect = .{ .x = center_x - radius, .y = center_y - radius, .w = radius * 2.0, .h = radius * 2.0 };
+    // Offset the arc center toward the box interior so its endpoints are tangent to both tails.
+    const arc_cx = if (lines.right != .none) center_x + radius else center_x - radius;
+    const arc_cy = if (lines.down != .none) center_y + radius else center_y - radius;
+    const outer_radius = radius + stroke * 0.5;
+    const circle: palette.Rect = .{ .x = arc_cx - outer_radius, .y = arc_cy - outer_radius, .w = outer_radius * 2.0, .h = outer_radius * 2.0 };
     const quadrant: palette.Rect = .{
         .x = if (lines.right != .none) center_x else center_x - radius,
         .y = if (lines.down != .none) center_y else center_y - radius,
@@ -2438,9 +2442,9 @@ fn queueRoundedBoxCorner(state: *app_state.AppState, rect: palette.Rect, cp: u21
     };
     const cell_clip = intersectRect(rect, quadrant) orelse return;
     if (clip) |outer_clip| {
-        if (intersectRect(cell_clip, outer_clip)) |arc_clip| queueClippedBorder(state, circle, color, radius, stroke, arc_clip);
+        if (intersectRect(cell_clip, outer_clip)) |arc_clip| queueClippedBorder(state, circle, color, outer_radius, stroke, arc_clip);
     } else {
-        queueClippedBorder(state, circle, color, radius, stroke, cell_clip);
+        queueClippedBorder(state, circle, color, outer_radius, stroke, cell_clip);
     }
 
     const center_left = center_x - stroke * 0.5;
