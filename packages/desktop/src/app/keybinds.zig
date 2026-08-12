@@ -1307,6 +1307,56 @@ fn cloneDefaultWorkspaceSelectKeybinds(allocator: std.mem.Allocator) ![]Keybind 
     });
 }
 
+/// Formats the first loaded binding for UI hints. The caller owns `buf`, so
+/// separate controls can render hints in the same frame without shared state.
+pub fn formatFirstKeybind(buf: []u8, bindings: []const Keybind) []const u8 {
+    if (bindings.len == 0) return "";
+    return formatKeybind(buf, bindings[0]);
+}
+
+/// Formats the key portion of the first plain Alt binding. Commands rebound
+/// away from Alt stay out of Alt-reveal mode instead of showing a stale tip.
+pub fn formatAltKeyTip(buf: []u8, bindings: []const Keybind) []const u8 {
+    for (bindings) |binding| {
+        if (!binding.alt or binding.primary or binding.ctrl or binding.meta or binding.shift) continue;
+        const name = keycodeLabel(binding.key);
+        const count = @min(buf.len, name.len);
+        @memcpy(buf[0..count], name[0..count]);
+        for (buf[0..count]) |*byte| byte.* = std.ascii.toUpper(byte.*);
+        return buf[0..count];
+    }
+    return "";
+}
+
+fn formatKeybind(buf: []u8, binding: Keybind) []const u8 {
+    var count: usize = 0;
+    if (binding.primary or binding.ctrl) count += copyInto(buf[count..], "Ctrl+");
+    if (binding.meta) count += copyInto(buf[count..], "Meta+");
+    if (binding.alt) count += copyInto(buf[count..], "Alt+");
+    if (binding.shift) count += copyInto(buf[count..], "Shift+");
+    const name = keycodeLabel(binding.key);
+    count += copyInto(buf[count..], name);
+    if (name.len == 1 and count > 0) buf[count - 1] = std.ascii.toUpper(buf[count - 1]);
+    return buf[0..count];
+}
+
+fn keycodeLabel(key: sdl.Keycode) []const u8 {
+    return switch (key) {
+        .@"return" => "Enter",
+        .left => "Left",
+        .right => "Right",
+        .up => "Up",
+        .down => "Down",
+        else => @tagName(key),
+    };
+}
+
+fn copyInto(dest: []u8, src: []const u8) usize {
+    const count = @min(dest.len, src.len);
+    @memcpy(dest[0..count], src[0..count]);
+    return count;
+}
+
 fn parseDefaultAccelerator(binding: []const u8) !Keybind {
     return parseAccelerator(binding) orelse error.InvalidDefaultKeybind;
 }

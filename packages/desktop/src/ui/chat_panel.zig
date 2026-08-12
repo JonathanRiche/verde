@@ -5,6 +5,7 @@ const palette = @import("palette");
 const zig_dif = @import("zig_dif");
 
 const app_state = @import("../state.zig");
+const keybinds = @import("../app/keybinds.zig");
 const ai_harness = @import("../providers/harness.zig");
 const profiler = @import("../runtime/profiler.zig");
 const platform_runtime = @import("platform_runtime");
@@ -6452,6 +6453,73 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
             .h = icon_size,
         }), icon_color);
     }
+
+    renderComposerShortcutHints(state, model_rect, state.composer_controller.composer.reasoningRect());
+}
+
+// Hover help and held-Alt key tips for the composer toolbar selectors.
+fn renderComposerShortcutHints(state: *app_state.AppState, model_rect: palette.Rect, run_rect: palette.Rect) void {
+    const config = state.command_controller.keyboard_config orelse return;
+    if (state.alt_shortcut_hints_visible) {
+        var model_buf: [16]u8 = undefined;
+        var run_buf: [16]u8 = undefined;
+        renderShortcutKeyTip(state, model_rect, keybinds.formatAltKeyTip(&model_buf, config.chat_model_picker));
+        if (state.composer_controller.composer.showReasoningToggle()) {
+            renderShortcutKeyTip(state, run_rect, keybinds.formatAltKeyTip(&run_buf, config.chat_run_config));
+        }
+        return;
+    }
+    if (state.composer_controller.model_picker.isOpen() or state.composer_controller.run_config_open) return;
+    const point: palette.draw.Vec2 = .{
+        .x = state.transcript_controller.palette_mouse_x,
+        .y = state.transcript_controller.palette_mouse_y,
+    };
+    var shortcut_buf: [32]u8 = undefined;
+    if (model_rect.contains(point)) {
+        renderComposerSelectorTooltip(state, model_rect, "Choose model", keybinds.formatFirstKeybind(&shortcut_buf, config.chat_model_picker));
+    } else if (state.composer_controller.composer.showReasoningToggle() and run_rect.contains(point)) {
+        renderComposerSelectorTooltip(state, run_rect, "Run settings", keybinds.formatFirstKeybind(&shortcut_buf, config.chat_run_config));
+    }
+}
+
+fn renderShortcutKeyTip(state: *app_state.AppState, target: palette.Rect, label: []const u8) void {
+    if (label.len == 0) return;
+    const size = theme.scaledUi(15.0);
+    const inset = theme.scaledUi(4.0);
+    const rect: palette.Rect = .{
+        .x = target.x + target.w - size - inset,
+        .y = target.y - size - theme.scaledUi(3.0),
+        .w = size,
+        .h = size,
+    };
+    queuePanel(state, rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.borderMuted()), theme.scaledUi(3.5), theme.scaledUi(0.75));
+    const font_size = theme.scaledUi(9.5);
+    const text_w = app_state.paletteUiTextPrefixWidth(label, font_size, label.len);
+    queueText(state, .{
+        .x = rect.x + @max((rect.w - text_w) * 0.5, 0.0),
+        .y = rect.y + (rect.h - font_size * 1.25) * 0.5,
+        .w = @min(text_w, rect.w),
+        .h = font_size * 1.25,
+    }, label, paletteColor(theme.accent()), font_size, rect);
+}
+
+fn renderComposerSelectorTooltip(state: *app_state.AppState, target: palette.Rect, title: []const u8, shortcut: []const u8) void {
+    var label_buf: [96]u8 = undefined;
+    const label = if (shortcut.len > 0)
+        std.fmt.bufPrint(&label_buf, "{s}  {s}", .{ title, shortcut }) catch title
+    else
+        title;
+    const font_size = theme.scaledUi(11.0);
+    const text_w = app_state.paletteUiTextPrefixWidth(label, font_size, label.len);
+    const pad_x = theme.scaledUi(7.0);
+    const rect: palette.Rect = .{
+        .x = target.x + @max((target.w - text_w - pad_x * 2.0) * 0.5, 0.0),
+        .y = target.y - theme.scaledUi(28.0),
+        .w = text_w + pad_x * 2.0,
+        .h = theme.scaledUi(22.0),
+    };
+    queuePanel(state, rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.borderMuted()), theme.scaledUi(5.0), theme.scaledUi(0.75));
+    queueText(state, .{ .x = rect.x + pad_x, .y = rect.y + (rect.h - font_size * 1.25) * 0.5, .w = text_w, .h = font_size * 1.25 }, label, paletteColor(theme.COLOR_TEXT_MUTED), font_size, rect);
 }
 
 // Nerd Font Symbols glyphs used for composer-toolbar icons. Rendering them
