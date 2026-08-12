@@ -1,0 +1,263 @@
+/* Desktop Palette clone. Tokens from packages/desktop/src/ui/{colors,theme}.zig. */
+
+@import 'tailwindcss';
+
+@font-face {
+  font-family: 'Cal Sans';
+  src: url('../../../desktop/src/assets/fonts/CalSans-Regular.ttf') format('truetype');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Noto Sans';
+  src: url('../../../desktop/src/assets/fonts/NotoSans-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Noto Sans';
+  src: url('../../../desktop/src/assets/fonts/NotoSans-Bold.ttf') format('truetype');
+  font-weight: 700;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Noto Sans';
+  src: url('../../../desktop/src/assets/fonts/NotoSans-Italic.ttf') format('truetype');
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('../../../desktop/src/assets/fonts/JetBrainsMonoNerdFont-Regular.ttf') format('truetype');
+  font-display: swap;
+}
+
+:root {
+  --chat-black: #0d1213;
+  --panel: #20272a;
+  --panel-alt: #28292e;
+  --panel-muted: #38393e;
+  --border: #375846;
+  --border-muted: #3c474c;
+  --text: #f0f0f5;
+  --text-muted: #b9bbc3;
+  --text-subtle: #787887;
+  --time: #9cb5c0;
+  --accent: #50c878;
+  --accent-hi: #6ee89a;
+  --accent-dim: rgba(124, 221, 94, 0.19);
+  --accent-wash: rgba(80, 200, 120, 0.19);
+  --accent-row: rgba(80, 200, 120, 0.28);
+  --accent-hover: rgba(80, 200, 120, 0.19);
+  --warning: #fbbf24;
+  --danger: #ff6464;
+  --user-bubble: #2a4636;
+  --assistant-card: #161c1e;
+  --radius-row: 7px;
+  --radius-card: 10px;
+  --radius-composer: 14px;
+  --sidebar-w: 280px;
+  --sidebar-collapsed: 68px;
+  --chat-max: 900px;
+  --font-ui: 'Noto Sans', ui-sans-serif, system-ui, sans-serif;
+  --font-display: 'Cal Sans', 'Noto Sans', sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', ui-monospace, monospace;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app {
+  height: 100%;
+  width: 100%;
+  max-width: 100%;
+  overflow: hidden;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 15px;
+  line-height: 1.45;
+  background: var(--chat-black);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+button, textarea, input {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+}
+
+button { cursor: pointer; }
+textarea { resize: none; }
+
+.mono { font-family: var(--font-mono); }
+.wordmark { font-family: var(--font-display); letter-spacing: -0.03em; }
+
+.pulse { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+.markdown {
+  font-size: 16px;
+  line-height: 22px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+@media (min-width: 1024px) {
+  .markdown {
+    font-size: 18px;
+  }
+}
+.markdown p { margin: 0 0 0.7em; }
+.markdown p:last-child { margin-bottom: 0; }
+.markdown code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  background: rgba(255, 255, 255, 0.05);
+  padding: 0.08em 0.32em;
+  border-radius: 4px;
+}
+.markdown pre {
+  overflow-x: auto;
+  max-width: 100%;
+  background: #0b1012;
+  border: 1px solid var(--border-muted);
+  border-radius: 8px;
+  padding: 12px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+@media (max-width: 1023px) {
+  .markdown {
+    font-size: 15px;
+    line-height: 21px;
+  }
+  .markdown pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+  }
+}
+.markdown pre code { background: none; padding: 0; }
+.markdown ul, .markdown ol { padding-left: 1.2em; margin: 0.4em 0; }
+.markdown a { color: var(--accent-hi); }
+.markdown h1, .markdown h2, .markdown h3 {
+  font-family: var(--font-display);
+  font-weight: 400;
+  letter-spacing: -0.03em;
+  margin: 0.8em 0 0.35em;
+}
+
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(185, 187, 195, 0.45) transparent;
+}
+.scrollbar-thin::-webkit-scrollbar { width: 6px; }
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgba(185, 187, 195, 0.35);
+  border-radius: 99px;
+}
+
+.niri-strip {
+  scroll-snap-type: x mandatory;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  background: var(--chat-black);
+}
+/* Desktop split: 12px workspace gutter, matching ui.workspace_pane_gap. */
+.niri-strip.niri-inset {
+  padding: 12px;
+  gap: 12px;
+}
+.niri-column {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 100%;
+  width: 100%;
+  min-width: 100%;
+  max-width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+}
+.niri-inset .niri-column {
+  border-radius: 8px;
+}
+@media (min-width: 1024px) {
+  .niri-strip:has(.niri-column:nth-child(2)) .niri-column {
+    flex-basis: 50%;
+    width: 50%;
+    min-width: 50%;
+    max-width: 50%;
+  }
+  /* 12px strip padding + 12px gap → two visible columns: (100% - 36px) / 2 */
+  .niri-strip.niri-inset:has(.niri-column:nth-child(2)) .niri-column {
+    flex-basis: calc(50% - 18px);
+    width: calc(50% - 18px);
+    min-width: calc(50% - 18px);
+    max-width: calc(50% - 18px);
+  }
+}
+
+.ghostty-host {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  /* Ghostty window-padding-x/y = 14 on desktop. */
+  padding: 14px;
+  overflow: auto;
+  background: var(--vt-bg, var(--chat-black));
+  overscroll-behavior: contain;
+  touch-action: pan-x pan-y;
+}
+.niri-zoomed .ghostty-host {
+  padding: 8px;
+}
+@media (max-width: 1023px) {
+  .niri-strip,
+  .niri-column {
+    max-width: 100%;
+  }
+  /* Phone: spend every column on glyphs. Beats .niri-zoomed's 8px inset so the
+     grid fit in paintGhostty is measured against the real content width. */
+  .ghostty-host,
+  .niri-zoomed .ghostty-host {
+    padding: 2px 0;
+    /* Grid holds a readable font and pans when it is still wider than the phone. */
+    overflow: auto;
+  }
+}
+.ghostty-canvas {
+  display: block;
+  flex: 1 0 auto;
+  min-height: 100%;
+  background: var(--vt-bg, var(--chat-black));
+  outline: none;
+}
+
+.terminal-screen {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.28;
+  color: var(--text);
+  white-space: pre;
+  tab-size: 8;
+  overflow: hidden;
+}

@@ -1,0 +1,12 @@
+.{
+    .name = .web_app,
+    .version = "0.0.0",
+    .fingerprint = 0xaa293d364349a925,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "web",
+    },
+}

@@ -58,3 +58,37 @@ run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && VERDE_BROWSER_L
 [tasks.debug]
 description = "Builds and launches Verde with the in-app diagnostics window enabled and WPE on Linux."
 run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && VERDE_BROWSER_LINUX_WPE=1 zig build run -Dui-debug=true -Dbrowser-backend=native_webview'"
+
+[tasks.web-app-setup]
+description = "Installs the Verde web client JS toolchain (bun) in packages/web_app."
+dir = "packages/web_app"
+run = "bun install"
+
+[tasks.web-app]
+description = "Builds the Verde web gateway and Solid SPA with the repo-pinned Zig, without the desktop graph."
+dir = "packages/web_app"
+depends = ["web-app-setup"]
+run = "zig build --release=safe && bun run build"
+
+[tasks.web-app-test]
+description = "Runs packages/web_app Zig unit tests with the repo-pinned Zig."
+dir = "packages/web_app"
+run = "zig build test --release=safe"
+
+[tasks.web-app-types]
+description = "Typechecks the Verde web Solid SPA."
+dir = "packages/web_app"
+depends = ["web-app-setup"]
+run = "bun run types"
+
+[tasks.web-app-run]
+description = "Builds the web client and serves it on 127.0.0.1:7420. Extra args go to verde-web. Do not run from a Verde pane that owns this session."
+dir = "packages/web_app"
+depends = ["web-app"]
+run = "bash -lc 'exec ./zig-out/bin/verde-web --static dist \"$@\"' --"
+
+[tasks.web-app-dev]
+description = "Vite frontend on :6783, proxying /api and /ws to an already-running verde-web on :7420."
+dir = "packages/web_app"
+depends = ["web-app-setup"]
+run = "bun run dev"
