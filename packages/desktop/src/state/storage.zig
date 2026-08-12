@@ -20,11 +20,6 @@ const APP_NAME: [:0]const u8 = "Native";
 pub const LEGACY_STATE_FILE_NAME = "state.json";
 pub const PENDING_STATE_SPOOL_FILE_NAME = "pending-state-spool.json";
 const PENDING_STATE_SPOOL_TEMP_FILE_NAME = "pending-state-spool.json.tmp";
-// A close-time spool contains both the current projection and, when available,
-// its merge baseline. Real stores can therefore require roughly twice their
-// durable JSON footprint. Keep replay bounded, but leave room for two copies of
-// the largest field state seen in production (about 136 MiB).
-const PENDING_STATE_SPOOL_MAX_BYTES: usize = 384 * 1024 * 1024;
 const SNAPSHOT_REQUEST_HEADROOM_BYTES: usize = 64 * 1024;
 /// Focus acknowledgements are best-effort UI bookkeeping and must never own
 /// more than a short background transport window.
@@ -302,7 +297,7 @@ pub const Storage = struct {
             threaded.io(),
             PENDING_STATE_SPOOL_FILE_NAME,
             allocator,
-            .limited(PENDING_STATE_SPOOL_MAX_BYTES),
+            .unlimited,
         ) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
@@ -320,14 +315,6 @@ pub const Storage = struct {
 
     /// Atomically replace and fsync the close-time spool before state teardown.
     pub fn writePendingStateSpool(self: *const Storage, spool: PendingStateSpool) !void {
-        // Count first so an oversized state cannot make valueAlloc grow beyond
-        // the replay ceiling before the limit is enforced.
-        var counter: std.Io.Writer.Discarding = .init(&.{});
-        try std.json.Stringify.value(spool, .{ .whitespace = .minified }, &counter.writer);
-        if (counter.fullCount() > PENDING_STATE_SPOOL_MAX_BYTES) return error.PendingStateSpoolExceedsReplayLimit;
-        const encoded = try std.json.Stringify.valueAlloc(self.allocator, spool, .{ .whitespace = .minified });
-        defer self.allocator.free(encoded);
-        std.debug.assert(encoded.len == counter.fullCount());
         var threaded: std.Io.Threaded = .init(self.allocator, .{});
         defer threaded.deinit();
         // Directory fsync cannot operate on Linux O_PATH handles; iteration
@@ -339,7 +326,13 @@ pub const Storage = struct {
         var file = try dir.createFile(threaded.io(), PENDING_STATE_SPOOL_TEMP_FILE_NAME, .{ .truncate = true });
         var file_open = true;
         defer if (file_open) file.close(threaded.io());
-        try file.writeStreamingAll(threaded.io(), encoded);
+        // Stream directly to disk: close-state projections can be hundreds of
+        // MiB, and allocating a second encoded copy made shutdown scale with a
+        // fixed replay ceiling instead of the user's actual durable state.
+        var write_buffer: [64 * 1024]u8 = undefined;
+        var writer = file.writer(threaded.io(), &write_buffer);
+        try std.json.Stringify.value(spool, .{ .whitespace = .minified }, &writer.interface);
+        try writer.interface.flush();
         try file.sync(threaded.io());
         file.close(threaded.io());
         file_open = false;

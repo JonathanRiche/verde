@@ -14,6 +14,7 @@ const platform_runtime = @import("platform_runtime");
 
 const store_protocol = headless.store;
 const protocol = headless.protocol;
+const log = std.log.scoped(.daemon_store);
 
 /// Test-only fault injection for crash/busy/latency ITs (B9). Armed only via
 /// `initWithFault` or the env-selected store override path; production `init`
@@ -292,6 +293,10 @@ const CHAT_COMPLETION_CLEAR_OPERATION = store_protocol.METHOD_NOTIFICATION_CHAT_
 const TURN_COMMIT_OPERATION: []const u8 = "chat.turn.commit";
 const TURN_ACCEPT_OPERATION: []const u8 = "chat.turn.accept";
 const RESPONSE_STATUS_OK: i64 = 0;
+const FINGERPRINT_PREFIX: []const u8 = "sha256:";
+const FINGERPRINT_HEX_LEN: usize = std.crypto.hash.sha2.Sha256.digest_length * 2;
+const FINGERPRINT_LEN: usize = FINGERPRINT_PREFIX.len + FINGERPRINT_HEX_LEN;
+const COMPACTION_MIN_FREE_BYTES: u64 = 64 * 1024 * 1024;
 
 pub const Store = struct {
     const Self = @This();
@@ -326,6 +331,18 @@ pub const Store = struct {
 
         conn.busyTimeout(schema.BUSY_TIMEOUT_MS) catch |err| return mapOpenError(err);
         schema.initializeToVersion(conn, schema.MAX_SUPPORTED_VERSION) catch |err| return mapOpenError(err);
+        const migrated_fingerprint_bytes = migrateLegacyFingerprints(allocator, conn) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return mapOpenError(err);
+        };
+        compactFreedPages(conn, COMPACTION_MIN_FREE_BYTES) catch |err| {
+            // Fingerprint conversion is already durable. A failed VACUUM only
+            // postpones disk reclamation and must not make the store unusable.
+            log.warn("database compaction deferred after fingerprint migration: {s}", .{@errorName(err)});
+        };
+        if (migrated_fingerprint_bytes > 0) {
+            log.info("migrated legacy store fingerprints bytes={d}", .{migrated_fingerprint_bytes});
+        }
         // Terminal turn identity outlives workspace retention ownership. This
         // ledger is intentionally independent from `chat_turns`, whose rows
         // may be tombstoned by an observed snapshot deletion.
@@ -486,7 +503,7 @@ pub const Store = struct {
     pub fn acceptTurn(self: *Self, request: TurnAcceptanceRequest) StoreError!store_protocol.WriteResult {
         try validateTurnAcceptance(request);
         const user_attachment = try firstAttachment(request.user_message.image, request.user_message.images);
-        const fingerprint = self.encodeFingerprint(.{
+        const fingerprint = self.fingerprintValue(.{
             .turn_id = request.turn_id,
             .workspace_id = request.workspace.workspace_id,
             .local_thread_id = request.thread.local_thread_id,
@@ -610,7 +627,7 @@ pub const Store = struct {
         };
         // Match the S1 mutation convention: client_id identifies the caller
         // but is not part of the logical turn state or its replay fingerprint.
-        const fingerprint = self.encodeFingerprint(.{
+        const fingerprint = self.fingerprintValue(.{
             .turn_id = request.turn_id,
             .workspace_id = request.workspace_id,
             .local_thread_id = request.local_thread_id,
@@ -979,10 +996,9 @@ pub const Store = struct {
         fingerprint: []const u8,
         result: store_protocol.WriteResult,
     ) !void {
-        // Durable WriteResult JSON for exact receipt replay (B4). Reuses the
-        // same JSON encoder as mutation fingerprints; this is the response
-        // body, not a hash of the result.
-        const response_payload = self.encodeFingerprint(result) catch |err| return err;
+        // Durable WriteResult JSON for exact receipt replay (B4). This remains
+        // the response body; only request fingerprints are reduced to digests.
+        const response_payload = self.encodeValue(result) catch |err| return err;
         defer self.allocator.free(response_payload);
         try self.conn.exec(
             "insert into store_receipts (request_key, operation, fingerprint, store_revision, response_payload, response_status) values (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1015,7 +1031,7 @@ pub const Store = struct {
         local_thread_id: []const u8,
         message: store_protocol.Message,
     ) !?MessageKeyStatus {
-        const fingerprint = self.encodeFingerprint(message) catch |err| return err;
+        const fingerprint = self.fingerprintValue(message) catch |err| return err;
         defer self.allocator.free(fingerprint);
         const thread_row = (try self.conn.row(
             "select t.id from threads t join workspaces w on w.id = t.workspace_id where w.workspace_id = ?1 and t.local_thread_id = ?2",
@@ -1039,34 +1055,41 @@ pub const Store = struct {
 
     fn mutationFingerprint(self: *const Self, mutation: Mutation) StoreError![]u8 {
         return switch (mutation) {
-            .snapshot_replace => |request| self.encodeFingerprint(.{
+            .snapshot_replace => |request| self.fingerprintValue(.{
                 .snapshot = request.snapshot,
                 .bootstrap = request.bootstrap,
             }),
-            .workspace_upsert => |request| self.encodeFingerprint(request.workspace),
-            .thread_upsert => |request| self.encodeFingerprint(.{
+            .workspace_upsert => |request| self.fingerprintValue(request.workspace),
+            .thread_upsert => |request| self.fingerprintValue(.{
                 .workspace_id = request.workspace_id,
                 .thread = request.thread,
             }),
-            .message_append => |request| self.encodeFingerprint(.{
+            .message_append => |request| self.fingerprintValue(.{
                 .workspace_id = request.workspace_id,
                 .thread_id = request.thread_id,
                 .message = request.message,
             }),
-            .surface_upsert => |request| self.encodeFingerprint(request.surface),
-            .surface_clear => |request| self.encodeFingerprint(.{
+            .surface_upsert => |request| self.fingerprintValue(request.surface),
+            .surface_clear => |request| self.fingerprintValue(.{
                 .session_id = request.session_id,
                 .workspace_id = request.workspace_id,
             }),
-            .chat_completion_upsert => |request| self.encodeFingerprint(request.completion),
-            .chat_completion_clear => |request| self.encodeFingerprint(.{
+            .chat_completion_upsert => |request| self.fingerprintValue(request.completion),
+            .chat_completion_clear => |request| self.fingerprintValue(.{
                 .workspace_id = request.workspace_id,
                 .local_thread_id = request.local_thread_id,
             }),
         };
     }
 
-    fn encodeFingerprint(self: *const Self, value: anytype) StoreError![]u8 {
+    fn fingerprintValue(self: *const Self, value: anytype) StoreError![]u8 {
+        const encoded = try self.encodeValue(value);
+        defer self.allocator.free(encoded);
+        const fingerprint = fingerprintBytes(encoded);
+        return self.allocator.dupe(u8, &fingerprint) catch error.OutOfMemory;
+    }
+
+    fn encodeValue(self: *const Self, value: anytype) StoreError![]u8 {
         return store_protocol.encode(self.allocator, value) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return error.Internal;
@@ -1571,7 +1594,7 @@ pub const Store = struct {
         defer evidence.deinit();
         if (evidence.int(0) == 0 and evidence.int(1) == 0 and evidence.int(2) == 0) return false;
 
-        const workspace_fingerprint = try self.encodeFingerprint(request.workspace);
+        const workspace_fingerprint = try self.fingerprintValue(request.workspace);
         defer self.allocator.free(workspace_fingerprint);
         const workspace_receipt = try self.legacyReceiptFor(.{
             .request_key = workspace_key,
@@ -1590,7 +1613,7 @@ pub const Store = struct {
         legacy_thread.reasoning_variant = null;
         legacy_thread.fast_mode = null;
         legacy_thread.access_mode = null;
-        const thread_fingerprint = try self.encodeFingerprint(.{
+        const thread_fingerprint = try self.fingerprintValue(.{
             .workspace_id = request.workspace.workspace_id,
             .thread = legacy_thread,
         });
@@ -1640,27 +1663,33 @@ pub const Store = struct {
         )) orelse return error.Conflict;
         defer message_row.deinit();
 
-        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
-        defer arena_state.deinit();
-        const stored_message = store_protocol.decodeLeaky(store_protocol.Message, arena_state.allocator(), message_row.text(0)) catch return error.Conflict;
-        const stored_image = firstAttachment(stored_message.image, stored_message.images) catch return error.Conflict;
+        // Legacy client keys used to retain the serialized message itself.
+        // Startup now reduces that payload to a digest, so reconstruct HEAD's
+        // exact sparse staging DTO and verify both the row and its digest.
+        const stored_message: store_protocol.Message = .{
+            .message_id = request.user_message.message_id,
+            .role = "user",
+            .author = "You",
+            .body = request.user_message.body,
+            .created_at_ms = ledger.int(3),
+            .updated_at_ms = ledger.int(3),
+        };
+        const stored_message_fingerprint = try self.fingerprintValue(stored_message);
+        defer self.allocator.free(stored_message_fingerprint);
         const incoming_image = firstAttachment(request.user_message.image, request.user_message.images) catch return error.Conflict;
-        if (!std.mem.eql(u8, stored_message.message_id, request.user_message.message_id) or
+        if (!std.mem.eql(u8, message_row.text(0), stored_message_fingerprint) or
             !std.mem.eql(u8, stored_message.role, request.user_message.role) or
             !std.mem.eql(u8, stored_message.author, request.user_message.author) or
-            !std.mem.eql(u8, stored_message.body, request.user_message.body) or
             // HEAD's staged Message literal omitted both image encodings, so
             // compatibility can authorize only the same durable no-attachment
             // shape rather than inventing absent first-writer evidence.
-            stored_image != null or stored_message.images.len != 0 or incoming_image != null or
-            !optionalIntEqual(stored_message.created_at_ms, ledger.int(3)) or
-            !optionalIntEqual(stored_message.updated_at_ms, ledger.int(3)) or
+            incoming_image != null or
             !storedMessageMatchesRow(stored_message, message_row))
         {
             return error.Conflict;
         }
 
-        const user_fingerprint = try self.encodeFingerprint(.{
+        const user_fingerprint = try self.fingerprintValue(.{
             .workspace_id = request.workspace.workspace_id,
             .thread_id = request.thread.local_thread_id,
             .message = stored_message,
@@ -1720,7 +1749,7 @@ pub const Store = struct {
         const sort_index = next_sort.int(0);
         try self.insertMessage(thread_id, sort_index, request.message);
 
-        const message_fingerprint = self.encodeFingerprint(request.message) catch |err| return err;
+        const message_fingerprint = self.fingerprintValue(request.message) catch |err| return err;
         defer self.allocator.free(message_fingerprint);
         try self.conn.exec(
             "insert into client_message_keys (thread_id, message_id, message_fingerprint, sort_index, created_at_ms, updated_at_ms, store_revision) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -2071,7 +2100,7 @@ pub const Store = struct {
         message: store_protocol.Message,
         store_revision: i64,
     ) !void {
-        const fingerprint = self.encodeFingerprint(message) catch |err| return err;
+        const fingerprint = self.fingerprintValue(message) catch |err| return err;
         defer self.allocator.free(fingerprint);
         // M5-P4 Amendment 1: same duplicate-id tolerance as the message row —
         // the key table's (thread_id, message_id) primary key must follow the
@@ -2419,6 +2448,132 @@ fn surfaceStatusCode(value: []const u8) !i64 {
     const names = [_][]const u8{ "idle", "working", "waiting", "done", "error" };
     for (names, 0..) |name, index| if (std.mem.eql(u8, value, name)) return @intCast(index);
     return error.InvalidParams;
+}
+
+const ReceiptFingerprintUpdate = struct {
+    request_key: []u8,
+    fingerprint: [FINGERPRINT_LEN]u8,
+};
+
+const MessageFingerprintUpdate = struct {
+    thread_id: i64,
+    message_id: []u8,
+    fingerprint: [FINGERPRINT_LEN]u8,
+};
+
+fn migrateLegacyFingerprints(allocator: std.mem.Allocator, conn: zqlite.Conn) !u64 {
+    var receipt_updates: std.ArrayList(ReceiptFingerprintUpdate) = .empty;
+    defer {
+        for (receipt_updates.items) |update| allocator.free(update.request_key);
+        receipt_updates.deinit(allocator);
+    }
+    var message_updates: std.ArrayList(MessageFingerprintUpdate) = .empty;
+    defer {
+        for (message_updates.items) |update| allocator.free(update.message_id);
+        message_updates.deinit(allocator);
+    }
+
+    try conn.execNoArgs("begin immediate");
+    errdefer conn.rollback();
+
+    var migrated_bytes: u64 = 0;
+    {
+        var rows = try conn.rows("select request_key, fingerprint from store_receipts", .{});
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            const existing = row.text(1);
+            if (isDigestFingerprint(existing)) continue;
+            const request_key = try allocator.dupe(u8, row.text(0));
+            receipt_updates.append(allocator, .{
+                .request_key = request_key,
+                .fingerprint = fingerprintBytes(existing),
+            }) catch |err| {
+                allocator.free(request_key);
+                return err;
+            };
+            migrated_bytes +|= @intCast(existing.len);
+        }
+        if (rows.err) |err| return err;
+    }
+    {
+        var rows = try conn.rows("select thread_id, message_id, message_fingerprint from client_message_keys", .{});
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            const existing = row.text(2);
+            if (isDigestFingerprint(existing)) continue;
+            const message_id = try allocator.dupe(u8, row.text(1));
+            message_updates.append(allocator, .{
+                .thread_id = row.int(0),
+                .message_id = message_id,
+                .fingerprint = fingerprintBytes(existing),
+            }) catch |err| {
+                allocator.free(message_id);
+                return err;
+            };
+            migrated_bytes +|= @intCast(existing.len);
+        }
+        if (rows.err) |err| return err;
+    }
+
+    for (receipt_updates.items) |*update| {
+        try conn.exec(
+            "update store_receipts set fingerprint = ?1 where request_key = ?2",
+            .{ update.fingerprint[0..], update.request_key },
+        );
+    }
+    for (message_updates.items) |*update| {
+        try conn.exec(
+            "update client_message_keys set message_fingerprint = ?1 where thread_id = ?2 and message_id = ?3",
+            .{ update.fingerprint[0..], update.thread_id, update.message_id },
+        );
+    }
+    try conn.commit();
+    return migrated_bytes;
+}
+
+fn compactFreedPages(conn: zqlite.Conn, min_free_bytes: u64) !void {
+    const page_size: u64 = blk: {
+        var row = (try conn.row("pragma page_size", .{})) orelse return error.StoreMetadataMissing;
+        defer row.deinit();
+        const value = row.int(0);
+        if (value <= 0) return error.StoreMetadataMissing;
+        break :blk @intCast(value);
+    };
+    const free_pages: u64 = blk: {
+        var row = (try conn.row("pragma freelist_count", .{})) orelse return error.StoreMetadataMissing;
+        defer row.deinit();
+        const value = row.int(0);
+        if (value < 0) return error.StoreMetadataMissing;
+        break :blk @intCast(value);
+    };
+    const free_bytes = std.math.mul(u64, page_size, free_pages) catch std.math.maxInt(u64);
+    if (free_bytes < min_free_bytes) return;
+
+    {
+        var checkpoint = (try conn.row("pragma wal_checkpoint(truncate)", .{})) orelse return error.StoreUnavailable;
+        defer checkpoint.deinit();
+        if (checkpoint.int(0) != 0) return error.Busy;
+    }
+    try conn.execNoArgs("vacuum");
+    log.info("compacted daemon store free_bytes={d}", .{free_bytes});
+}
+
+fn fingerprintBytes(value: []const u8) [FINGERPRINT_LEN]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    var fingerprint: [FINGERPRINT_LEN]u8 = undefined;
+    @memcpy(fingerprint[0..FINGERPRINT_PREFIX.len], FINGERPRINT_PREFIX);
+    @memcpy(fingerprint[FINGERPRINT_PREFIX.len..], &hex);
+    return fingerprint;
+}
+
+fn isDigestFingerprint(value: []const u8) bool {
+    if (value.len != FINGERPRINT_LEN or !std.mem.startsWith(u8, value, FINGERPRINT_PREFIX)) return false;
+    for (value[FINGERPRINT_PREFIX.len..]) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
+    return true;
 }
 
 fn mapOpenError(err: anyerror) StoreError {
@@ -4908,6 +5063,12 @@ test "store duplicate request returns the original receipt without reapplying" {
     const workspaces = [_]store_protocol.Workspace{workspace};
     const first_request = testSnapshotRequest("same-key", null, true, testSnapshot(&workspaces));
     const first = try store.applyMutation(.{ .snapshot_replace = first_request });
+    {
+        var receipt = (try store.conn.row("select fingerprint from store_receipts where request_key = 'same-key'", .{})).?;
+        defer receipt.deinit();
+        try std.testing.expectEqual(@as(usize, FINGERPRINT_LEN), receipt.text(0).len);
+        try std.testing.expect(isDigestFingerprint(receipt.text(0)));
+    }
 
     const duplicate = try store.applyMutation(.{ .snapshot_replace = first_request });
     try std.testing.expectEqual(first.store_revision, duplicate.store_revision);
@@ -4930,6 +5091,105 @@ test "store duplicate request returns the original receipt without reapplying" {
     const label = try workspaceLabel(&store, "workspace-1");
     defer std.testing.allocator.free(label);
     try std.testing.expectEqualStrings("First", label);
+}
+
+test "legacy serialized receipt fingerprints migrate without breaking replay" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    const workspace = testWorkspace("legacy-fingerprint-workspace", "Before");
+    const request = testWorkspaceRequest("legacy-fingerprint-key", null, workspace);
+    const legacy_fingerprint = try store_protocol.encode(std.testing.allocator, workspace);
+    defer std.testing.allocator.free(legacy_fingerprint);
+    const legacy_message_fingerprint = "legacy-message-json";
+    var original: store_protocol.WriteResult = undefined;
+    {
+        var store = try Store.init(std.testing.allocator, db_path);
+        defer store.deinit();
+        original = try store.applyMutation(.{ .workspace_upsert = request });
+        try store.conn.exec(
+            "update store_receipts set fingerprint = ?1 where request_key = ?2",
+            .{ legacy_fingerprint, request.mutation.request_key },
+        );
+        try store.conn.execNoArgs(
+            \\insert into threads (workspace_id, sort_index, title, local_thread_id, provider, harness)
+            \\values ((select id from workspaces where workspace_id = 'legacy-fingerprint-workspace'), 0, 'Legacy key', 'legacy-key-thread', 0, 0);
+            \\insert into client_message_keys (thread_id, message_id, message_fingerprint, sort_index, store_revision)
+            \\values ((select id from threads where local_thread_id = 'legacy-key-thread'), 'legacy-message', 'legacy-message-json', 0, 1);
+        );
+    }
+
+    var reopened = try Store.init(std.testing.allocator, db_path);
+    defer reopened.deinit();
+    {
+        var receipt = (try reopened.conn.row(
+            "select fingerprint from store_receipts where request_key = ?1",
+            .{request.mutation.request_key},
+        )).?;
+        defer receipt.deinit();
+        try std.testing.expect(isDigestFingerprint(receipt.text(0)));
+        const expected_fingerprint = fingerprintBytes(legacy_fingerprint);
+        try std.testing.expectEqualSlices(u8, &expected_fingerprint, receipt.text(0));
+    }
+    {
+        var message_key = (try reopened.conn.row(
+            "select message_fingerprint from client_message_keys where message_id = 'legacy-message'",
+            .{},
+        )).?;
+        defer message_key.deinit();
+        const expected_fingerprint = fingerprintBytes(legacy_message_fingerprint);
+        try std.testing.expectEqualSlices(u8, &expected_fingerprint, message_key.text(0));
+    }
+    const replay = try reopened.applyMutation(.{ .workspace_upsert = request });
+    try std.testing.expectEqual(original.store_revision, replay.store_revision);
+    try std.testing.expectEqual(original.applied, replay.applied);
+    try std.testing.expectEqual(original.duplicate, replay.duplicate);
+}
+
+test "fingerprint digest is stable and fixed-size" {
+    const fingerprint = fingerprintBytes("abc");
+    try std.testing.expectEqualStrings(
+        "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        &fingerprint,
+    );
+    try std.testing.expect(isDigestFingerprint(&fingerprint));
+    try std.testing.expect(!isDigestFingerprint("abc"));
+}
+
+test "legacy fingerprint migration compacts released SQLite pages" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    {
+        var store = try Store.init(std.testing.allocator, db_path);
+        store.deinit();
+    }
+    const legacy_fingerprint = try std.testing.allocator.alloc(u8, 2 * 1024 * 1024);
+    defer std.testing.allocator.free(legacy_fingerprint);
+    @memset(legacy_fingerprint, 'x');
+    {
+        const conn = try zqlite.open(db_path, zqlite.OpenFlags.EXResCode);
+        defer conn.close();
+        try conn.exec(
+            "insert into store_receipts (request_key, operation, fingerprint, store_revision, response_payload, response_status) values ('large-legacy', 'test', ?1, 0, '{}', 0)",
+            .{legacy_fingerprint},
+        );
+        var checkpoint = (try conn.row("pragma wal_checkpoint(truncate)", .{})).?;
+        checkpoint.deinit();
+    }
+    const size_before = (try tmp.dir.statFile(std.testing.io, "state.sqlite", .{})).size;
+
+    {
+        var store = try Store.init(std.testing.allocator, db_path);
+        defer store.deinit();
+        try compactFreedPages(store.conn, 1);
+    }
+    const size_after = (try tmp.dir.statFile(std.testing.io, "state.sqlite", .{})).size;
+    try std.testing.expect(size_after < size_before);
 }
 
 test "receipt response payload replays exactly after store reopen" {
