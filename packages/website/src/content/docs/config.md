@@ -31,7 +31,8 @@ file. It is read on startup and on app refresh.
     "workspace_panes_per_view": 2,
     "workspace_scroll_direction": "horizontal",
     "workspace_scroll_mode": "automatic",
-    "workspace_scroll_threshold": 2
+    "workspace_scroll_threshold": 2,
+    "unzoom_on_pane_navigation": false
   },
   "open": {
     "default": "folder",
@@ -100,7 +101,8 @@ Most of these options also appear in Settings:
   can inherit these global values or be overridden for the currently selected
   workspace. Drag-resized column widths are also saved per workspace and take
   precedence over panes-per-view sizing until reset. Pane gaps are omitted
-  while zoomed.
+  while zoomed. Pane navigation keeps the destination zoomed by default; set
+  `ui.unzoom_on_pane_navigation` to `true` to restore on navigation instead.
 - **Agent integrations** — status-pip hooks for supported provider CLIs.
 - **Updates** — check now, install an available release, and automatic checks.
 - **Notifications** — enable or disable desktop notifications.
