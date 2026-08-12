@@ -4,6 +4,7 @@ const std = @import("std");
 const sdl = @import("zsdl3");
 const palette = @import("palette");
 const theme = @import("theme.zig");
+const text_measure = @import("text_measure.zig");
 const colors = @import("colors.zig");
 const sidebar = @import("sidebar.zig");
 const workspace_panes = @import("workspace_panes.zig");
@@ -1597,8 +1598,13 @@ fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) vo
             }
             const title_col = paletteColor(theme.COLOR_WHITE);
             const id_col = paletteColor(if (row_hovered) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE);
-            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(4.0), .w = row.w - theme.scaledUi(16.0), .h = theme.scaledUi(18.0) }, thread.title, title_col, theme.scaledUi(13.0), list_rect);
-            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(22.0), .w = row.w - theme.scaledUi(16.0), .h = theme.scaledUi(16.0) }, thread.id, id_col, theme.scaledUi(12.0), list_rect);
+            const text_w = row.w - theme.scaledUi(16.0);
+            const title_font = theme.scaledUi(13.0);
+            const id_font = theme.scaledUi(12.0);
+            const title = truncateThreadImportLabel(state, threadImportSingleLineLabel(thread.title), text_w, title_font);
+            const id = truncateThreadImportLabel(state, threadImportSingleLineLabel(thread.id), text_w, id_font);
+            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(4.0), .w = text_w, .h = theme.scaledUi(18.0) }, title, title_col, title_font, row);
+            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(22.0), .w = text_w, .h = theme.scaledUi(16.0) }, id, id_col, id_font, row);
         }
     }
 
@@ -1811,4 +1817,40 @@ fn emptyThreadImportListNotice(provider: runtime.Provider) []const u8 {
         .claude => "No cached Claude threads to show.",
         .cursor => "No cached Cursor threads to show.",
     };
+}
+
+fn threadImportSingleLineLabel(value: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    const line_end = std.mem.findAny(u8, trimmed, "\r\n") orelse trimmed.len;
+    return std.mem.trimEnd(u8, trimmed[0..line_end], " \t");
+}
+
+// Import summaries come from external providers, so measure and bound their
+// labels before handing them to Palette's fixed-height rows.
+fn truncateThreadImportLabel(state: *runtime.AppState, value: []const u8, max_width: f32, font_size: f32) []const u8 {
+    if (value.len == 0 or text_measure.textWidth(.ui, font_size, value) <= max_width) return value;
+    const ellipsis = "…";
+    const ellipsis_width = text_measure.textWidth(.ui, font_size, ellipsis);
+    var low: usize = 0;
+    var high: usize = value.len - 1;
+    var best: usize = 0;
+    while (low <= high) {
+        const mid = low + (high - low) / 2;
+        var prefix_end = mid;
+        while (prefix_end > 0 and (value[prefix_end] & 0xC0) == 0x80) prefix_end -= 1;
+        if (text_measure.textWidth(.ui, font_size, value[0..prefix_end]) + ellipsis_width <= max_width) {
+            best = @max(best, prefix_end);
+            low = mid + 1;
+        } else {
+            if (mid == 0) break;
+            high = mid - 1;
+        }
+    }
+    if (best == 0) return ellipsis;
+    return std.fmt.allocPrint(state.palette_frame_text_arena.allocator(), "{s}{s}", .{ value[0..best], ellipsis }) catch value;
+}
+
+test "thread import labels use only the first non-empty line" {
+    try std.testing.expectEqualStrings("First title", threadImportSingleLineLabel(" \nFirst title  \r\nSecond line"));
+    try std.testing.expectEqualStrings("One line", threadImportSingleLineLabel("\tOne line\t"));
 }
