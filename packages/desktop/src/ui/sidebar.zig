@@ -1186,10 +1186,10 @@ fn renderAttentionClusterSection(
     if (rowVisible(label_rect, list_clip)) queuePaletteText(state, label_rect, "ACTIVE", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), clip);
     y += theme.scaledUi(20.0);
 
-    for (rows[0..row_count]) |row| {
+    for (rows[0..row_count], 0..) |row, active_index| {
         const project = &state.project_controller.projects.items[row.project_index];
         const row_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w, .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS) };
-        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, row.project_index, project, row.pane, row_rect, clip, true, null);
+        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, row.project_index, project, row.pane, row_rect, clip, true, true, active_index);
         y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
     }
 
@@ -1231,6 +1231,17 @@ fn collectAttentionClusterRows(state: *runtime.AppState, rows: []AttentionCluste
         }
     }
     return row_count;
+}
+
+/// Focuses the ACTIVE row at the same sorted position used by the sidebar.
+pub fn focusAttentionClusterRowAtIndex(state: *runtime.AppState, row_index: usize) bool {
+    var rows: [palette_hits.len]AttentionClusterRow = undefined;
+    const row_count = collectAttentionClusterRows(state, &rows);
+    if (row_index >= row_count) return false;
+    sortAttentionClusterRows(rows[0..row_count]);
+    const row = rows[row_index];
+    state.focusWorkspaceOpenPaneFromSidebar(row.project_index, row.pane.id);
+    return true;
 }
 
 fn sortAttentionClusterRows(rows: []AttentionClusterRow) void {
@@ -1693,7 +1704,7 @@ fn renderOpenPanesSection(
             .w = rail_w - indent,
             .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS),
         };
-        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip, false, pane_index);
+        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip, false, false, pane_index);
         y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
     }
     y += theme.scaledUi(4.0);
@@ -1712,6 +1723,7 @@ fn renderOpenPaneRow(
     rect: palette.Rect,
     clip: palette.Rect,
     show_workspace_tag: bool,
+    active_shortcut: bool,
     shortcut_index: ?usize,
 ) void {
     const layout = &project.workspace_layout;
@@ -1856,7 +1868,12 @@ fn renderOpenPaneRow(
     var status_buf: [24]u8 = undefined;
     const status_label = paneStatusLabelText(&status_buf, status, running, status_started_at_ms);
     var shortcut_buf: [16]u8 = undefined;
-    const shortcut_label = if (state.ctrl_shortcut_hints_visible and shortcut_index != null)
+    const shortcut_label = if (state.ctrl_shortcut_hints_visible and shortcut_index != null and active_shortcut and state.shift_shortcut_hints_visible)
+        if (state.command_controller.keyboard_config) |config|
+            keybinds.formatCtrlShiftKeyTipAt(&shortcut_buf, config.workspace_active_select, shortcut_index.?)
+        else
+            ""
+    else if (state.ctrl_shortcut_hints_visible and shortcut_index != null and !active_shortcut and !state.shift_shortcut_hints_visible)
         if (state.command_controller.keyboard_config) |config|
             keybinds.formatCtrlKeyTipAt(&shortcut_buf, config.workspace_pane_select, shortcut_index.?)
         else

@@ -2285,6 +2285,8 @@ pub const AppState = struct {
     /// Held Ctrl exposes pane-selection key tips in the selected workspace's
     /// expanded sidebar list.
     ctrl_shortcut_hints_visible: bool,
+    /// Distinguishes Ctrl+Shift ACTIVE-row hints from plain Ctrl pane hints.
+    shift_shortcut_hints_visible: bool,
     composer_controller: ComposerControllerState,
     companion_controller: companion_controller,
     companion_composer: CompanionComposerPrompt,
@@ -2444,6 +2446,7 @@ pub const AppState = struct {
             .sidebar_hover_revealed = false,
             .alt_shortcut_hints_visible = false,
             .ctrl_shortcut_hints_visible = false,
+            .shift_shortcut_hints_visible = false,
             .composer_controller = ComposerControllerState.init(),
             .companion_controller = companion_controller.init(),
             .companion_composer = CompanionComposerPrompt.init(),
