@@ -165,6 +165,7 @@ pub const NativeKeyboardConfig = struct {
     workspace_focus_up: []Keybind,
     workspace_focus_down: []Keybind,
     workspace_focus_prompt: []Keybind,
+    workspace_active_select: []Keybind,
     workspace_pane_select: []Keybind,
     workspace_move_left: []Keybind,
     workspace_move_right: []Keybind,
@@ -225,6 +226,7 @@ pub const NativeKeyboardConfig = struct {
             .workspace_focus_up = try cloneDefaultWorkspaceFocusUpKeybinds(allocator),
             .workspace_focus_down = try cloneDefaultWorkspaceFocusDownKeybinds(allocator),
             .workspace_focus_prompt = try cloneDefaultWorkspaceFocusPromptKeybinds(allocator),
+            .workspace_active_select = try cloneDefaultWorkspaceActiveSelectKeybinds(allocator),
             .workspace_pane_select = try cloneDefaultWorkspacePaneSelectKeybinds(allocator),
             .workspace_move_left = try cloneDefaultWorkspaceMoveLeftKeybinds(allocator),
             .workspace_move_right = try cloneDefaultWorkspaceMoveRightKeybinds(allocator),
@@ -296,6 +298,7 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.workspace_focus_up);
         self.allocator.free(self.workspace_focus_down);
         self.allocator.free(self.workspace_focus_prompt);
+        self.allocator.free(self.workspace_active_select);
         self.allocator.free(self.workspace_pane_select);
         self.allocator.free(self.workspace_move_left);
         self.allocator.free(self.workspace_move_right);
@@ -451,6 +454,13 @@ pub const NativeKeyboardConfig = struct {
             if (binding.matches(event)) {
                 return index;
             }
+        }
+        return null;
+    }
+
+    pub fn workspaceActiveSelectIndexForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?usize {
+        for (self.workspace_active_select, 0..) |binding, index| {
+            if (binding.matches(event)) return index;
         }
         return null;
     }
@@ -814,6 +824,12 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(value, "workspace.focus_prompt")) |bindings| {
                 self.allocator.free(self.workspace_focus_prompt);
                 self.workspace_focus_prompt = bindings;
+            }
+        }
+        if (workspace_value.object.get("active_select")) |value| {
+            if (self.parseOverrideValue(value, "workspace.active_select")) |bindings| {
+                self.allocator.free(self.workspace_active_select);
+                self.workspace_active_select = bindings;
             }
         }
         if (workspace_value.object.get("pane_select")) |value| {
@@ -1232,6 +1248,21 @@ fn cloneDefaultWorkspacePaneSelectKeybinds(allocator: std.mem.Allocator) ![]Keyb
     });
 }
 
+fn cloneDefaultWorkspaceActiveSelectKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Ctrl+Shift+1"),
+        try parseDefaultAccelerator("Ctrl+Shift+2"),
+        try parseDefaultAccelerator("Ctrl+Shift+3"),
+        try parseDefaultAccelerator("Ctrl+Shift+4"),
+        try parseDefaultAccelerator("Ctrl+Shift+5"),
+        try parseDefaultAccelerator("Ctrl+Shift+6"),
+        try parseDefaultAccelerator("Ctrl+Shift+7"),
+        try parseDefaultAccelerator("Ctrl+Shift+8"),
+        try parseDefaultAccelerator("Ctrl+Shift+9"),
+        try parseDefaultAccelerator("Ctrl+Shift+0"),
+    });
+}
+
 fn cloneDefaultWorkspaceMoveLeftKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Ctrl+Shift+H"),
@@ -1348,6 +1379,19 @@ pub fn formatCtrlKeyTipAt(buf: []u8, bindings: []const Keybind, index: usize) []
     const binding = bindings[index];
     const primary_is_ctrl = binding.primary and builtin.os.tag != .macos;
     if ((!binding.ctrl and !primary_is_ctrl) or binding.alt or binding.meta or binding.shift) return "";
+    const name = keycodeLabel(binding.key);
+    const count = @min(buf.len, name.len);
+    @memcpy(buf[0..count], name[0..count]);
+    for (buf[0..count]) |*byte| byte.* = std.ascii.toUpper(byte.*);
+    return buf[0..count];
+}
+
+/// Formats the key portion of an indexed Ctrl+Shift binding used by ACTIVE rows.
+pub fn formatCtrlShiftKeyTipAt(buf: []u8, bindings: []const Keybind, index: usize) []const u8 {
+    if (index >= bindings.len) return "";
+    const binding = bindings[index];
+    const primary_is_ctrl = binding.primary and builtin.os.tag != .macos;
+    if ((!binding.ctrl and !primary_is_ctrl) or binding.alt or binding.meta or !binding.shift) return "";
     const name = keycodeLabel(binding.key);
     const count = @min(buf.len, name.len);
     @memcpy(buf[0..count], name[0..count]);
@@ -1705,6 +1749,36 @@ test "workspace pane select defaults map ctrl number order" {
     try std.testing.expectEqual(sdl.Keycode.@"1", config.workspace_pane_select[0].key);
     try std.testing.expect(config.workspace_pane_select[9].ctrl);
     try std.testing.expectEqual(sdl.Keycode.@"0", config.workspace_pane_select[9].key);
+}
+
+test "workspace active select defaults map ctrl shift number order" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 10), config.workspace_active_select.len);
+    try std.testing.expect(config.workspace_active_select[0].ctrl);
+    try std.testing.expect(config.workspace_active_select[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.@"1", config.workspace_active_select[0].key);
+    try std.testing.expect(config.workspace_active_select[9].ctrl);
+    try std.testing.expect(config.workspace_active_select[9].shift);
+    try std.testing.expectEqual(sdl.Keycode.@"0", config.workspace_active_select[9].key);
+}
+
+test "workspace active select override accepts ordered accelerator array" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"workspace": {"active_select": ["Alt+Shift+1", "Alt+Shift+2"]}}}
+    , .{});
+    defer parsed.deinit();
+    config.applyOverrides(parsed.value);
+
+    try std.testing.expectEqual(@as(usize, 2), config.workspace_active_select.len);
+    try std.testing.expect(config.workspace_active_select[0].alt);
+    try std.testing.expect(config.workspace_active_select[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.@"1", config.workspace_active_select[0].key);
+    try std.testing.expectEqual(sdl.Keycode.@"2", config.workspace_active_select[1].key);
 }
 
 test "workspace pane select override accepts ordered accelerator array" {

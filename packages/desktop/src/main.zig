@@ -1705,6 +1705,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             state.window_input_focus = false;
             state.alt_shortcut_hints_visible = false;
             state.ctrl_shortcut_hints_visible = false;
+            state.shift_shortcut_hints_visible = false;
             ui_layout.resetCompanionInputCaptures(state);
             state.blurCompanionComposer();
         },
@@ -1715,6 +1716,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
             if (event.key.scancode == .lctrl or event.key.scancode == .rctrl) {
                 state.ctrl_shortcut_hints_visible = true;
+                state.markDirty();
+            }
+            if (event.key.scancode == .lshift or event.key.scancode == .rshift) {
+                state.shift_shortcut_hints_visible = true;
                 state.markDirty();
             }
             if (browserInputDebugEnabled()) {
@@ -1767,6 +1772,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (state.routeCompanionComposerKeyDown(&event.key)) {
                 syncWindowTextInput(window, state);
                 return true;
+            }
+            if (keyboard.workspaceActiveSelectIndexForEvent(&event.key)) |active_ordinal| {
+                if (sidebar_ui.focusAttentionClusterRowAtIndex(state, active_ordinal)) {
+                    syncWindowTextInput(window, state);
+                    return true;
+                }
             }
             if (keyboard.workspacePaneSelectIndexForEvent(&event.key)) |pane_ordinal| {
                 if (state.focusCurrentProjectWorkspacePaneAtSidebarIndex(pane_ordinal)) {
@@ -1947,6 +1958,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
             if (event.key.scancode == .lctrl or event.key.scancode == .rctrl) {
                 state.ctrl_shortcut_hints_visible = false;
+                state.markDirty();
+            }
+            if (event.key.scancode == .lshift or event.key.scancode == .rshift) {
+                state.shift_shortcut_hints_visible = false;
                 state.markDirty();
             }
             if (browserInputDebugEnabled()) {
