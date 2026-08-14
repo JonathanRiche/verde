@@ -287,7 +287,18 @@ pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool 
     const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
     const current_id = layout.focused_pane_id orelse return false;
     const maximized = state.currentProjectWorkspaceMaximizedPaneId() != null;
+    const scrolling_navigation = scrollingLayoutEnabled(
+        layout.effectiveScrollMode(state.app_config.workspace_scroll_mode),
+        layout.effectiveScrollThreshold(state.app_config.workspace_scroll_threshold),
+        layout.visiblePaneCount(),
+        false,
+    );
     if (maximized) {
+        if (scrolling_navigation) {
+            const direction = scrollingPaneDirection(state.app_config.workspace_scroll_direction, dir) orelse return false;
+            const target = layout.adjacentTiledPaneIdInSidebarOrder(current_id, direction) orelse return false;
+            return focusPaneNavigationTarget(state, target, true);
+        }
         if (state.currentProjectWorkspaceRoot()) |root| {
             var expanded_rects: [MAX_WORKSPACE_PANE_RECTS]WorkspacePaneRect = undefined;
             var expanded_count: usize = 0;
@@ -300,10 +311,10 @@ pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool 
             false;
     }
 
-    if (scrollingLayoutActive(state, layout)) {
+    if (scrolling_navigation) {
         const direction = scrollingPaneDirection(state.app_config.workspace_scroll_direction, dir) orelse return false;
         const target = layout.adjacentTiledPaneIdInSidebarOrder(current_id, direction) orelse return false;
-        return state.focusCurrentProjectWorkspacePane(target);
+        return focusPaneNavigationTarget(state, target, false);
     }
 
     return focusPaneInDirectionFromRects(state, current_id, dir, pane_rects[0..pane_rect_count], false);
@@ -390,6 +401,10 @@ fn focusPaneInDirectionFromRects(
     }
 
     const target = best_id orelse return false;
+    return focusPaneNavigationTarget(state, target, navigating_maximized);
+}
+
+fn focusPaneNavigationTarget(state: *runtime.AppState, target: runtime.WorkspacePaneId, navigating_maximized: bool) bool {
     if (navigating_maximized) {
         if (state.app_config.unzoom_on_pane_navigation) {
             _ = state.clearCurrentProjectWorkspacePaneMaximized();
@@ -2209,6 +2224,56 @@ test "directional navigation transfers zoom unless unzoom is configured" {
     try std.testing.expect(focusPaneInDirectionFromRects(&state, first_pane_id, .right, &rects, true));
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, second_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, null), layout.maximized_pane_id);
+}
+
+test "zoomed scrolling navigation follows sidebar order through terminal panes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try storage_mod.Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try runtime.AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer {
+        pane_rect_count = 0;
+        state.lifecycle.clearDirty();
+        state.deinit();
+    }
+
+    for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+    state.project_controller.projects.clearRetainingCapacity();
+    state.lifecycle.clearDirty();
+
+    var project = try runtime.Project.init(allocator, "scroll-navigation", "Scroll Navigation", "/tmp/scroll-navigation", 0);
+    const first_pane_id = project.workspace_layout.focused_pane_id.?;
+    const terminal_pane_id = try project.workspace_layout.createTerminalPane(allocator, 7);
+    try project.workspace_layout.splitPaneWithLeaf(allocator, first_pane_id, terminal_pane_id, .vertical, true);
+    const trailing_thread = try project.addThread(allocator);
+    const trailing_chat_pane_id = try project.workspace_layout.createChatPane(allocator, trailing_thread);
+    try project.workspace_layout.splitPaneWithLeaf(allocator, first_pane_id, trailing_chat_pane_id, .vertical, true);
+    project.workspace_layout.focused_pane_id = first_pane_id;
+    project.workspace_layout.maximized_pane_id = first_pane_id;
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    state.project_controller.selected_index = 0;
+    state.app_config.workspace_scroll_mode = .always;
+    state.app_config.workspace_scroll_direction = .horizontal;
+
+    // The split tree places the trailing chat geometrically before the
+    // terminal, while the scrolling strip and sidebar order are chat,
+    // terminal, chat. Zoomed navigation must follow the rendered strip.
+    pane_rect_count = 1;
+    pane_rects[0] = .{ .pane_id = first_pane_id, .rect = .{ .x = 0.0, .y = 0.0, .w = 1000.0, .h = 700.0 } };
+    try std.testing.expect(focusPaneInDirection(&state, .right));
+    const layout = &state.project_controller.projects.items[0].workspace_layout;
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, terminal_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?runtime.WorkspacePaneId, terminal_pane_id), layout.maximized_pane_id);
 }
 
 test "scrolling focus reveal moves only enough to expose the column" {

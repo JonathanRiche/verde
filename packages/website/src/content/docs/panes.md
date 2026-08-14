@@ -1,6 +1,6 @@
 ---
 title: Panes & tiling
-description: How Verde's tiled workspace is laid out — splits, focus, resize, zoom, the sidebar, the terminal dock, and the embedded browser pane.
+description: How Verde's tiled workspace is laid out — splits, scrolling strip, focus, resize, zoom, the sidebar, the terminal dock, and the browser pane.
 section: Workspace
 order: 5
 slug: panes
@@ -77,7 +77,8 @@ numbered pane shortcut place the selected pane at the strip's leading edge
 (left in horizontal mode, top in vertical mode), including the final pane.
 Horizontal and vertical positions are restored independently per workspace;
 zoom temporarily fills the workspace without changing either saved position
-or the selected scrolling policy.
+or the selected scrolling policy. Hovering the leading or trailing edge of
+the strip peeks to the adjacent pane without changing focus.
 
 In scrolling mode, every tiled workspace pane becomes one column (or row) in
 sidebar order. Existing nested split geometry is flattened for the strip;
@@ -99,6 +100,7 @@ Resizes are committed to the layout immediately and persist with the workspace.
 
 - `Ctrl+Shift+H / J / K / L` — move the focused pane past its neighbor in that direction.
 - `Ctrl`-drag a pane — pick it up with the mouse and drop it where it should go.
+- Drag pane rows in the sidebar to reorder them (scrolling strip order follows).
 
 Use these when the layout is right but a pane is in the wrong place. Moves are
 non-destructive — every pane keeps its content and provider.
@@ -189,6 +191,14 @@ And the live layout while the app is running:
 ```bash
 verde live panes --project current --json
 ```
+
+## Experimental companion
+
+**Settings → Experimental features** can enable the Companion sidecar (Sprout,
+Moss, or Vireo — pick the default under Appearance). Toggle it with
+`Ctrl+Shift+Space`. The companion is a pane-less overlay for orchestration:
+durable conversation, run/activity views, operation inspection, and **Mission
+Control** for multi-step goals. It stays experimental and is off by default.
 
 ## Command palette and slash commands
 

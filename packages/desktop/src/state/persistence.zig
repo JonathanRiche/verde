@@ -17,6 +17,7 @@ const LoadedPersistedState = db_types.LoadedState;
 const PersistedState = db_types.PersistedState;
 const PersistedSurfaceState = db_types.PersistedSurfaceState;
 const PersistedChatCompletion = db_types.PersistedChatCompletion;
+const PersistedHerdrWorkspaceLink = db_types.PersistedHerdrWorkspaceLink;
 const PersistedImageAttachment = db_types.PersistedImageAttachment;
 const PersistedMessage = db_types.PersistedMessage;
 const PersistedProject = db_types.PersistedProject;
@@ -470,6 +471,7 @@ fn threadSnapshotWithBodies(
         .tui_dock_id = thread.tui_dock_id,
         .draft = try allocator.dupe(u8, thread.currentDraft()),
         .draft_image = try imageSnapshot(allocator, thread.draft_image),
+        .message_offset = thread.persisted_message_offset,
         .messages = try messages.toOwnedSlice(allocator),
     };
 }
@@ -570,7 +572,7 @@ pub fn persistedStateToProtocolSnapshot(
         .provider = if (state.provider) |p| try allocator.dupe(u8, @tagName(p)) else null,
         .harness = if (state.harness) |h| try allocator.dupe(u8, @tagName(h)) else null,
         .draft = try dupeOptionalSlice(allocator, state.draft),
-        .messages = if (state.messages) |msgs| try messagesToProtocol(allocator, msgs) else null,
+        .messages = if (state.messages) |msgs| try messagesToProtocol(allocator, msgs, 0) else null,
     };
 }
 
@@ -580,7 +582,7 @@ fn projectToProtocol(allocator: std.mem.Allocator, project: PersistedProject) !h
         try threadsToProtocol(allocator, src)
     else
         &.{};
-    const messages: []const headless.store.Message = try messagesToProtocol(allocator, project.messages);
+    const messages: []const headless.store.Message = try messagesToProtocol(allocator, project.messages, 0);
     return .{
         .workspace_id = workspace_id,
         .label = try allocator.dupe(u8, project.label),
@@ -634,11 +636,16 @@ fn threadToProtocol(allocator: std.mem.Allocator, thread: PersistedThread, index
         .tui_dock_id = thread.tui_dock_id,
         .draft = try allocator.dupe(u8, thread.draft),
         .draft_image = if (thread.draft_image) |img| try imageToProtocol(allocator, img) else null,
-        .messages = try messagesToProtocol(allocator, thread.messages),
+        .message_offset = thread.message_offset,
+        .messages = try messagesToProtocol(allocator, thread.messages, thread.message_offset),
     };
 }
 
-fn messagesToProtocol(allocator: std.mem.Allocator, messages: []const PersistedMessage) ![]const headless.store.Message {
+fn messagesToProtocol(
+    allocator: std.mem.Allocator,
+    messages: []const PersistedMessage,
+    message_offset: usize,
+) ![]const headless.store.Message {
     var out = try allocator.alloc(headless.store.Message, messages.len);
     for (messages, 0..) |message, i| {
         out[i] = .{
@@ -652,7 +659,7 @@ fn messagesToProtocol(allocator: std.mem.Allocator, messages: []const PersistedM
             .message_id = if (message.message_id) |id|
                 try allocator.dupe(u8, id)
             else
-                try std.fmt.allocPrint(allocator, "snap-msg-{d}", .{i}),
+                try std.fmt.allocPrint(allocator, "snap-msg-{d}", .{message_offset + i}),
             .role = try allocator.dupe(u8, @tagName(message.role)),
             .author = try allocator.dupe(u8, message.author),
             .body = try allocator.dupe(u8, message.body),
@@ -775,6 +782,7 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
                 thread.provider = persisted_thread.provider;
                 thread.harness = persisted_thread.harness;
                 thread.tui_dock_id = persisted_thread.tui_dock_id;
+                thread.persisted_message_offset = persisted_thread.message_offset;
                 thread.setDraft(persisted_thread.draft);
                 if (persisted_thread.draft_image) |image| {
                     try thread.setDraftImage(self.allocator, image.path, image.mime, image.byte_size);
@@ -986,21 +994,315 @@ pub fn buildPersistedState(self: anytype, backing_allocator: std.mem.Allocator) 
     }, backing_allocator);
 }
 
-/// Deep-copy a persistence projection into one arena. Conflict recovery keeps
-/// the last daemon projection as its three-way merge baseline while frame
-/// state continues to mutate independently.
+fn cloneOptionalSlice(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
+    return if (value) |slice| try allocator.dupe(u8, slice) else null;
+}
+
+fn cloneImage(allocator: std.mem.Allocator, value: ?PersistedImageAttachment) !?PersistedImageAttachment {
+    const image = value orelse return null;
+    return .{
+        .path = try allocator.dupe(u8, image.path),
+        .mime = try allocator.dupe(u8, image.mime),
+        .byte_size = image.byte_size,
+    };
+}
+
+fn cloneMessages(allocator: std.mem.Allocator, messages: []const PersistedMessage) ![]const PersistedMessage {
+    const cloned = try allocator.alloc(PersistedMessage, messages.len);
+    for (messages, 0..) |message, index| {
+        cloned[index] = .{
+            .role = message.role,
+            .author = try allocator.dupe(u8, message.author),
+            .body = try allocator.dupe(u8, message.body),
+            .image = try cloneImage(allocator, message.image),
+            .tool_call_id = try cloneOptionalSlice(allocator, message.tool_call_id),
+            .tool_call_kind = message.tool_call_kind,
+            .tool_call_status = message.tool_call_status,
+            .message_id = try cloneOptionalSlice(allocator, message.message_id),
+        };
+    }
+    return cloned;
+}
+
+fn cloneThreads(
+    allocator: std.mem.Allocator,
+    threads: ?[]const PersistedThread,
+    include_messages: bool,
+) !?[]const PersistedThread {
+    const source = threads orelse return null;
+    const cloned = try allocator.alloc(PersistedThread, source.len);
+    for (source, 0..) |thread, index| {
+        cloned[index] = .{
+            .title = try allocator.dupe(u8, thread.title),
+            .archived = thread.archived,
+            .committed = thread.committed,
+            .local_thread_id = try cloneOptionalSlice(allocator, thread.local_thread_id),
+            .last_activity_at = thread.last_activity_at,
+            .provider_thread_id = try cloneOptionalSlice(allocator, thread.provider_thread_id),
+            .model_ref = try cloneOptionalSlice(allocator, thread.model_ref),
+            .reasoning_effort = thread.reasoning_effort,
+            .reasoning_variant = try cloneOptionalSlice(allocator, thread.reasoning_variant),
+            .fast_mode = thread.fast_mode,
+            .access_mode = thread.access_mode,
+            .provider = thread.provider,
+            .harness = thread.harness,
+            .tui_dock_id = thread.tui_dock_id,
+            .draft = try allocator.dupe(u8, thread.draft),
+            .draft_image = try cloneImage(allocator, thread.draft_image),
+            .message_offset = if (include_messages)
+                thread.message_offset
+            else
+                thread.message_offset + thread.messages.len,
+            .messages = if (include_messages) try cloneMessages(allocator, thread.messages) else &.{},
+        };
+    }
+    return cloned;
+}
+
+fn cloneHerdrLink(allocator: std.mem.Allocator, value: ?PersistedHerdrWorkspaceLink) !?PersistedHerdrWorkspaceLink {
+    const link = value orelse return null;
+    return .{
+        .remote_alias = try allocator.dupe(u8, link.remote_alias),
+        .session_name = try allocator.dupe(u8, link.session_name),
+        .workspace_id = try allocator.dupe(u8, link.workspace_id),
+        .local_dir = try allocator.dupe(u8, link.local_dir),
+        .remote_cwd = try cloneOptionalSlice(allocator, link.remote_cwd),
+        .last_pane_id = try cloneOptionalSlice(allocator, link.last_pane_id),
+        .attach_dock_id = link.attach_dock_id,
+        .attach_pane_id = link.attach_pane_id,
+        .pane_links_json = try cloneOptionalSlice(allocator, link.pane_links_json),
+        .updated_at_ms = link.updated_at_ms,
+    };
+}
+
+fn cloneProjects(
+    allocator: std.mem.Allocator,
+    projects: []const PersistedProject,
+    include_messages: bool,
+) ![]const PersistedProject {
+    const cloned = try allocator.alloc(PersistedProject, projects.len);
+    for (projects, 0..) |project, index| {
+        cloned[index] = .{
+            .id = try cloneOptionalSlice(allocator, project.id),
+            .label = try allocator.dupe(u8, project.label),
+            .path = try allocator.dupe(u8, project.path),
+            .archived = project.archived,
+            .unread_count = project.unread_count,
+            .collapsed = project.collapsed,
+            .thread_list_expanded = project.thread_list_expanded,
+            .terminal_height = project.terminal_height,
+            .terminal_layout_json = try cloneOptionalSlice(allocator, project.terminal_layout_json),
+            .terminal_docks_json = try cloneOptionalSlice(allocator, project.terminal_docks_json),
+            .workspace_layout_json = try cloneOptionalSlice(allocator, project.workspace_layout_json),
+            .selected_thread_index = project.selected_thread_index,
+            .companion_thread_local_id = try cloneOptionalSlice(allocator, project.companion_thread_local_id),
+            .herdr_link = try cloneHerdrLink(allocator, project.herdr_link),
+            .threads = try cloneThreads(allocator, project.threads, include_messages),
+            .provider = project.provider,
+            .harness = project.harness,
+            .draft = try allocator.dupe(u8, project.draft),
+            .messages = if (include_messages) try cloneMessages(allocator, project.messages) else &.{},
+        };
+    }
+    return cloned;
+}
+
+fn cloneSurfaces(allocator: std.mem.Allocator, source: []const PersistedSurfaceState) ![]const PersistedSurfaceState {
+    const cloned = try allocator.alloc(PersistedSurfaceState, source.len);
+    for (source, 0..) |surface, index| {
+        cloned[index] = .{
+            .session_id = try allocator.dupe(u8, surface.session_id),
+            .workspace_id = try allocator.dupe(u8, surface.workspace_id),
+            .workspace_path = try allocator.dupe(u8, surface.workspace_path),
+            .dock_id = surface.dock_id,
+            .pane_id = surface.pane_id,
+            .provider = surface.provider,
+            .provider_thread_id = try cloneOptionalSlice(allocator, surface.provider_thread_id),
+            .title = try allocator.dupe(u8, surface.title),
+            .status = surface.status,
+            .status_changed_at_ms = surface.status_changed_at_ms,
+            .completed_at_ms = surface.completed_at_ms,
+            .last_event_title = try cloneOptionalSlice(allocator, surface.last_event_title),
+            .last_event_body = try cloneOptionalSlice(allocator, surface.last_event_body),
+        };
+    }
+    return cloned;
+}
+
+fn cloneCompletions(allocator: std.mem.Allocator, source: []const PersistedChatCompletion) ![]const PersistedChatCompletion {
+    const cloned = try allocator.alloc(PersistedChatCompletion, source.len);
+    for (source, 0..) |completion, index| {
+        cloned[index] = .{
+            .workspace_id = try allocator.dupe(u8, completion.workspace_id),
+            .local_thread_id = try allocator.dupe(u8, completion.local_thread_id),
+            .completed_at_ms = completion.completed_at_ms,
+        };
+    }
+    return cloned;
+}
+
+fn clonePersistedStateWithMessages(
+    backing_allocator: std.mem.Allocator,
+    source: PersistedState,
+    include_messages: bool,
+) !LoadedPersistedState {
+    var loaded = LoadedPersistedState.init(backing_allocator);
+    errdefer loaded.deinit();
+    const allocator = loaded.allocator();
+    loaded.value = .{
+        .selected_project_index = source.selected_project_index,
+        .sidebar_collapsed = source.sidebar_collapsed,
+        .projects = try cloneProjects(allocator, source.projects, include_messages),
+        .surface_states = try cloneSurfaces(allocator, source.surface_states),
+        .chat_completions = try cloneCompletions(allocator, source.chat_completions),
+        .provider = source.provider,
+        .harness = source.harness,
+        .draft = try cloneOptionalSlice(allocator, source.draft),
+        .messages = if (include_messages and source.messages != null)
+            try cloneMessages(allocator, source.messages.?)
+        else if (source.messages != null)
+            &.{}
+        else
+            null,
+    };
+    return loaded;
+}
+
+/// Deep-copy a persistence projection without retaining a serialized JSON
+/// copy in the destination arena.
 pub fn clonePersistedState(
     backing_allocator: std.mem.Allocator,
     source: PersistedState,
 ) !LoadedPersistedState {
-    var loaded = LoadedPersistedState.init(backing_allocator);
+    return clonePersistedStateWithMessages(backing_allocator, source, true);
+}
+
+/// Conflict baselines compare only workspace/thread metadata and identities.
+/// Keeping transcript bodies here doubled live history memory for no merge
+/// benefit, so baseline snapshots intentionally omit every message payload.
+pub fn clonePersistedBaseline(
+    backing_allocator: std.mem.Allocator,
+    source: PersistedState,
+) !LoadedPersistedState {
+    return clonePersistedStateWithMessages(backing_allocator, source, false);
+}
+
+fn persistedProjectIndexById(projects: []const PersistedProject, id: []const u8) ?usize {
+    for (projects, 0..) |project, index| {
+        if (project.id) |candidate| if (std.mem.eql(u8, candidate, id)) return index;
+    }
+    return null;
+}
+
+fn persistedThreadIndexById(threads: []const PersistedThread, id: []const u8) ?usize {
+    for (threads, 0..) |thread, index| {
+        if (thread.local_thread_id) |candidate| if (std.mem.eql(u8, candidate, id)) return index;
+    }
+    return null;
+}
+
+/// Build the close sidecar's local overlay. Existing durable identities need
+/// metadata only for the three-way merge; transcript payloads are retained
+/// solely for locally added workspaces/threads that have no durable owner yet.
+pub fn clonePersistedSpoolDelta(
+    backing_allocator: std.mem.Allocator,
+    current: PersistedState,
+    baseline: ?PersistedState,
+) !LoadedPersistedState {
+    const base = baseline orelse return clonePersistedState(backing_allocator, current);
+    var loaded = try clonePersistedBaseline(backing_allocator, current);
     errdefer loaded.deinit();
-    const arena = loaded.allocator();
-    const encoded = try std.json.Stringify.valueAlloc(arena, source, .{});
-    loaded.value = try std.json.parseFromSliceLeaky(PersistedState, arena, encoded, .{
-        .allocate = .alloc_always,
-    });
+    const allocator = loaded.allocator();
+    const loaded_projects = @constCast(loaded.value.projects);
+
+    for (current.projects, 0..) |project, project_index| {
+        const project_id = project.id orelse {
+            loaded_projects[project_index].messages = try cloneMessages(allocator, project.messages);
+            continue;
+        };
+        const base_project_index = persistedProjectIndexById(base.projects, project_id) orelse {
+            loaded_projects[project_index].messages = try cloneMessages(allocator, project.messages);
+            if (project.threads) |threads| {
+                const loaded_threads = @constCast(loaded_projects[project_index].threads.?);
+                for (threads, 0..) |thread, thread_index| {
+                    loaded_threads[thread_index].messages = try cloneMessages(allocator, thread.messages);
+                }
+            }
+            continue;
+        };
+        const base_threads = base.projects[base_project_index].threads orelse &.{};
+        if (project.threads) |threads| {
+            const loaded_threads = @constCast(loaded_projects[project_index].threads.?);
+            for (threads, 0..) |thread, thread_index| {
+                const thread_id = thread.local_thread_id orelse {
+                    loaded_threads[thread_index].messages = try cloneMessages(allocator, thread.messages);
+                    continue;
+                };
+                const base_thread_index = persistedThreadIndexById(base_threads, thread_id);
+                if (base_thread_index == null) {
+                    loaded_threads[thread_index].messages = try cloneMessages(allocator, thread.messages);
+                } else {
+                    const base_thread = base_threads[base_thread_index.?];
+                    const baseline_end = base_thread.message_offset + base_thread.messages.len;
+                    const current_end = thread.message_offset + thread.messages.len;
+                    if (current_end > baseline_end) {
+                        const suffix_start = @max(baseline_end, thread.message_offset);
+                        loaded_threads[thread_index].message_offset = suffix_start;
+                        loaded_threads[thread_index].messages = try cloneMessages(
+                            allocator,
+                            thread.messages[suffix_start - thread.message_offset ..],
+                        );
+                    }
+                }
+            }
+        }
+    }
     return loaded;
+}
+
+test "compact baseline and spool delta omit durable transcript bodies" {
+    const old_messages = [_]PersistedMessage{.{ .role = .assistant, .author = "Assistant", .body = "large durable body" }};
+    const extended_messages = [_]PersistedMessage{
+        .{ .role = .assistant, .author = "Assistant", .body = "large durable body" },
+        .{ .role = .user, .author = "You", .body = "new suffix" },
+    };
+    const new_messages = [_]PersistedMessage{.{ .role = .user, .author = "You", .body = "local-only body" }};
+    const baseline_threads = [_]PersistedThread{.{
+        .title = "Durable",
+        .local_thread_id = "durable-thread",
+        .messages = &old_messages,
+    }};
+    const current_threads = [_]PersistedThread{
+        .{ .title = "Renamed", .local_thread_id = "durable-thread", .messages = &extended_messages },
+        .{ .title = "Local", .local_thread_id = "local-thread", .messages = &new_messages },
+    };
+    const baseline_projects = [_]PersistedProject{.{
+        .id = "workspace",
+        .label = "Before",
+        .path = "/tmp/workspace",
+        .threads = &baseline_threads,
+    }};
+    const current_projects = [_]PersistedProject{.{
+        .id = "workspace",
+        .label = "After",
+        .path = "/tmp/workspace",
+        .threads = &current_threads,
+    }};
+    const baseline_state: PersistedState = .{ .projects = &baseline_projects };
+    const current_state: PersistedState = .{ .projects = &current_projects };
+
+    var compact = try clonePersistedBaseline(std.testing.allocator, baseline_state);
+    defer compact.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compact.value.projects[0].threads.?[0].messages.len);
+
+    var delta = try clonePersistedSpoolDelta(std.testing.allocator, current_state, baseline_state);
+    defer delta.deinit();
+    try std.testing.expectEqualStrings("After", delta.value.projects[0].label);
+    try std.testing.expectEqual(@as(usize, 1), delta.value.projects[0].threads.?[0].message_offset);
+    try std.testing.expectEqual(@as(usize, 1), delta.value.projects[0].threads.?[0].messages.len);
+    try std.testing.expectEqualStrings("new suffix", delta.value.projects[0].threads.?[0].messages[0].body);
+    try std.testing.expectEqual(@as(usize, 1), delta.value.projects[0].threads.?[1].messages.len);
+    try std.testing.expectEqualStrings("local-only body", delta.value.projects[0].threads.?[1].messages[0].body);
 }
 
 pub fn applyPersistedTerminalDocksJson(self: anytype, project: *Project, json: []const u8) !void {

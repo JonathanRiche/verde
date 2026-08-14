@@ -27,7 +27,9 @@ export async function openGhostty(cols: number, rows: number): Promise<GhosttyTe
   return createGhosttyTerminal({
     cols: Math.max(20, cols),
     rows: Math.max(6, rows),
-    maxScrollback: 0,
+    // Retained history backs wheel/touch scrolling via the native viewport
+    // (scrollBy/scrollToBottom); 0 would make every pane unscrollable.
+    maxScrollback: 4000,
     colorScheme: 'dark',
   })
 }

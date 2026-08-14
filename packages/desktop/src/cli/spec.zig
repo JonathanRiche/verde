@@ -63,8 +63,10 @@ pub const integration_commands = [_][]const u8{
 pub const integration_providers = [_][]const u8{
     "claude",
     "codex",
+    "amp",
     "opencode",
     "cursor",
+    "grok",
 };
 
 pub const session_commands = [_][]const u8{

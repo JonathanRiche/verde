@@ -20,6 +20,7 @@ in your Verde config — see [Remapping](#remapping) below.
 | `Ctrl+T` / `Cmd+T`          | New chat thread                       |
 | `Ctrl+W` / `Cmd+W`, `Alt+X` | Close the focused pane                |
 | `Ctrl+Shift+W` / `Cmd+Shift+W` | Close the current workspace (reopen from the command palette) |
+| `Ctrl+Shift+Space`          | Toggle the experimental Companion (when enabled in Settings) |
 | `Ctrl+R` / `Cmd+R`, `Ctrl+Shift+R`, `F5` | Refresh / reload app         |
 | `Alt+O`                     | Open the default project              |
 | `Ctrl+Shift+O`              | Open in external editor               |
@@ -127,6 +128,7 @@ shortcuts on the same action:
   "keybinds": {
     "new_thread": "CommandOrControl+T",
     "browser": "Ctrl+Shift+B",
+    "companion": "Ctrl+Shift+Space",
     "workspace": {
       "close_current": "CommandOrControl+Shift+W",
       "focus_up": "Ctrl+K",
@@ -195,7 +197,7 @@ or an array of shortcuts.
 
 | Group       | Keys (subset)                                                                                                                                                                                                                     |
 | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| top         | `refresh`, `open_default`, `open_editor`, `new_thread`, `command_palette`, `toggle_sidebar`, `toggle_sidebar_hidden`, `toggle_browser`, `toggle_terminal`                                                                       |
+| top         | `refresh`, `open_default`, `open_editor`, `new_thread`, `command_palette`, `companion`, `toggle_sidebar`, `toggle_sidebar_hidden`, `toggle_browser`, `toggle_terminal`                                                                       |
 | chat        | `chat_up`, `chat_down`, `chat_page_up`, `chat_page_down`                                                                                                                                                                          |
 | `workspace` | `split_chat_vertical`, `split_chat_horizontal`, `split_terminal_vertical`, `split_terminal_horizontal`, `toggle_maximize`, `close`, `close_current`, `focus_left`, `focus_right`, `focus_up`, `focus_down`, `focus_prompt`, `pane_previous`, `pane_next`, `active_select`, `pane_select`, `move_*`, `grow_*`, `select`, `previous`, `next` |
 | `terminal`  | `new_tab`, `close`, `rename_tab`, `tab_previous`, `tab_next`, `split_up`, `split_down`, `split_left`, `split_right`, `focus_up`, `focus_down`, `focus_left`, `focus_right`                                                       |

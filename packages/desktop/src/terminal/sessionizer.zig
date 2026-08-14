@@ -1611,6 +1611,10 @@ const ChatEvent = struct {
 
 const ChatTurn = struct {
     allocator: std.mem.Allocator,
+    /// Owning daemon, for waking parked `chat.turn.tail wait_ms` long-pollers
+    /// on event appends. Null in unit-test turns built without a daemon
+    /// (nothing parks there, so no wake is needed).
+    daemon: ?*Daemon = null,
     turn_id: []u8,
     workspace_id: []u8,
     local_thread_id: []u8,
@@ -1692,6 +1696,11 @@ const ChatTurn = struct {
         errdefer event.deinit(allocator);
         self.events.append(allocator, event) catch return;
         self.next_seq += 1;
+        // Missed-wake protocol twin of appendJournalEntry: the event is
+        // visible (under this turn's mutex) before the signal bump, and a
+        // tail waiter loads the signal word before reading turn state — so
+        // it either sees this event or its futex expectation is stale.
+        if (self.daemon) |owner| owner.signalTurnEventWaiters();
     }
 
     fn appendStringEvent(self: *ChatTurn, allocator: std.mem.Allocator, kind: []const u8, field: []const u8, value: []const u8) void {
@@ -1826,6 +1835,15 @@ pub const Daemon = struct {
     /// Parked waiters terminate with the structured drain response; new
     /// positive waits degrade to immediate heartbeats.
     changes_draining: std.atomic.Value(bool) = .init(false),
+    /// Turn-event long-poll park state (`chat.turn.tail` with `wait_ms`).
+    /// A separate futex word from `changes_signal` so per-delta wakes never
+    /// fan out to core.changes pollers: streaming deltas stay off the journal
+    /// (Q10) and push through this data-plane signal instead. Bumped on every
+    /// turn event append and on durable-commit publication flips.
+    turn_events_signal: std.atomic.Value(u32) = .init(0),
+    /// Parked chat.turn.tail waiters, capped like `changes_parked`. Over-cap
+    /// waits degrade to an immediate tail response — never an error.
+    turn_events_parked: std.atomic.Value(u32) = .init(0),
 
     pub fn init(allocator: std.mem.Allocator) Daemon {
         return initWithPrefPath(allocator, "");
@@ -2211,6 +2229,7 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, "chat.turn.approve")) return try self.chatTurnApproveResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.cancel")) return try self.chatTurnCancelResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.consume")) return try self.chatTurnConsumeResponse(id_value, params);
+        if (std.mem.eql(u8, method, "provider.models.list")) return try self.providerModelsListResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_WORKSPACE_RESOLVE)) return try self.workspaceResolveResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_LIST)) return try self.processListResponse(id_value, params);
         if (std.mem.eql(u8, method, headless.registry.METHOD_PROCESS_INSPECT)) return try self.processInspectResponse(id_value, params);
@@ -2807,6 +2826,7 @@ pub const Daemon = struct {
         // {snapshot, store_revision} with no composite fields at all.
         const composite = request.scopes != null;
         var include_store = true;
+        var include_workspaces = false;
         var include_registry = false;
         var include_sessions = false;
         var include_turns = false;
@@ -2815,6 +2835,7 @@ pub const Daemon = struct {
             include_store = false;
             for (names) |name| {
                 if (std.mem.eql(u8, name, store_protocol.SNAPSHOT_SCOPE_STORE)) include_store = true;
+                if (std.mem.eql(u8, name, store_protocol.SNAPSHOT_SCOPE_WORKSPACES)) include_workspaces = true;
                 if (std.mem.eql(u8, name, store_protocol.SNAPSHOT_SCOPE_REGISTRY)) include_registry = true;
                 if (std.mem.eql(u8, name, store_protocol.SNAPSHOT_SCOPE_SESSIONS)) include_sessions = true;
                 if (std.mem.eql(u8, name, store_protocol.SNAPSHOT_SCOPE_TURNS)) include_turns = true;
@@ -2859,7 +2880,7 @@ pub const Daemon = struct {
         {
             lockStoreService(service);
             defer service.mutex.unlock();
-            loaded = loadStoreSnapshotTxn(arena, &service.store, request.workspace_id, include_store) catch |err| {
+            loaded = loadStoreSnapshotTxn(arena, &service.store, request.workspace_id, include_store, include_workspaces) catch |err| {
                 return try storeErrorResponse(self.allocator, id_value, err);
             };
         }
@@ -3885,10 +3906,49 @@ pub const Daemon = struct {
     /// the structured drain response; new positive waits degrade to immediate
     /// heartbeats. Called by prepareShutdown (accepted) and by the transport's
     /// on_draining callback — before transport workers are joined, so a
-    /// parked waiter can never stall worker quiesce.
+    /// parked waiter can never stall worker quiesce. Turn-tail waiters share
+    /// the drain latch, so they are woken here too.
     fn beginChangesDrain(self: *Daemon) void {
         self.changes_draining.store(true, .release);
         self.signalChangesWaiters();
+        self.signalTurnEventWaiters();
+    }
+
+    /// Turn-event twin of `signalChangesWaiters` for `chat.turn.tail wait_ms`
+    /// long-pollers. Safe to call while holding a turn mutex: it takes no
+    /// locks, and a woken waiter re-resolves the turn and re-locks after the
+    /// caller releases.
+    fn signalTurnEventWaiters(self: *Daemon) void {
+        _ = self.turn_events_signal.fetchAdd(1, .release);
+        if (self.turn_events_parked.load(.acquire) == 0) return;
+        var threaded = std.Io.Threaded.init_single_threaded;
+        threaded.io().futexWake(u32, &self.turn_events_signal.raw, std.math.maxInt(u32));
+    }
+
+    /// Turn-event twin of `parkForChanges`. Holds NO locks while parked; the
+    /// caller must have loaded `observed_signal` BEFORE reading turn state
+    /// (missed-wake guarantee) and must re-resolve the turn by id after every
+    /// wake — a consumed turn frees its memory.
+    fn parkForTurnEvents(self: *Daemon, observed_signal: u32, deadline_ms: i64) ChangesParkOutcome {
+        const prev_parked = self.turn_events_parked.fetchAdd(1, .acquire);
+        if (prev_parked >= platform_ipc.MAX_PARKED_LONG_POLL_WAITERS) {
+            _ = self.turn_events_parked.fetchSub(1, .release);
+            return .over_cap;
+        }
+        defer _ = self.turn_events_parked.fetchSub(1, .release);
+
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const io = threaded.io();
+        while (true) {
+            if (self.changes_draining.load(.acquire)) return .drained;
+            if (self.turn_events_signal.load(.acquire) != observed_signal) return .woken;
+            const remaining = deadline_ms - nowMs();
+            if (remaining <= 0) return .timed_out;
+            io.futexWaitTimeout(u32, &self.turn_events_signal.raw, observed_signal, .{ .duration = .{
+                .raw = std.Io.Duration.fromMilliseconds(@intCast(remaining)),
+                .clock = .awake,
+            } }) catch {};
+        }
     }
 
     const ChangesParkOutcome = enum { woken, timed_out, drained, over_cap };
@@ -4733,6 +4793,8 @@ pub const Daemon = struct {
 
         const turn = try createChatTurnFromParams(self.allocator, params);
         errdefer turn.deinit(self.allocator);
+        // Wire the wake path before the turn is reachable by any worker.
+        turn.daemon = self;
 
         lockDaemon(self);
         // Re-check after the unlocked ledger window (concurrent start / race).
@@ -4797,24 +4859,61 @@ pub const Daemon = struct {
         return try writer.toOwnedSlice();
     }
 
+    /// Live tail with optional long-poll: `wait_ms > 0` parks the transport
+    /// worker (twin of core.changes, clamped to MAX_CHANGES_WAIT_MS) until
+    /// the turn gains events past `after_seq`, publishes a terminal status,
+    /// or the budget/drain ends the wait — then answers with the current
+    /// tail, never an error. Over-cap parking degrades to an immediate
+    /// response. The turn is re-resolved by id after every wake because a
+    /// consumed turn frees its memory.
     fn chatTurnTailResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
         if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
         const turn_id = jsonString(params.object.get("turn_id") orelse .null) orelse return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing turn_id");
         const after_seq = jsonUsize(params.object.get("after_seq") orelse .null) orelse 0;
-        lockDaemon(self);
-        if (self.findChatTurn(turn_id)) |turn| {
-            lockTurn(turn);
-            self.mutex.unlock();
-            defer turn.mutex.unlock();
-            if (chatTailUpperBound(turn, @intCast(after_seq)) > MAX_RESPONSE_BYTES) return error.ResponseTooLarge;
-            var writer: std.Io.Writer.Allocating = .init(self.allocator);
-            errdefer writer.deinit();
-            var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
-            try beginOk(&s, id_value);
-            try s.objectField("result");
-            try writeChatTurnTail(&s, turn, @intCast(after_seq));
-            try s.endObject();
-            return try writer.toOwnedSlice();
+        const wait_ms = jsonUsize(params.object.get("wait_ms") orelse .null) orelse 0;
+        const effective_wait_ms: u32 = @intCast(@min(wait_ms, MAX_CHANGES_WAIT_MS));
+        const wait_deadline_ms: i64 = nowMs() + effective_wait_ms;
+        var wait_exhausted = false;
+
+        park_loop: while (true) {
+            // Missed-wake protocol: load the signal word BEFORE reading turn
+            // state. appendEvent/commit bump it only after their change is
+            // visible, so either this read observes the change or the park
+            // below sees a stale expectation and returns immediately.
+            const observed_signal = self.turn_events_signal.load(.acquire);
+            lockDaemon(self);
+            if (self.findChatTurn(turn_id)) |turn| {
+                lockTurn(turn);
+                self.mutex.unlock();
+                const deliver = chatTailHasNews(turn, @intCast(after_seq)) or
+                    effective_wait_ms == 0 or wait_exhausted or
+                    self.changes_draining.load(.acquire);
+                if (!deliver) {
+                    turn.mutex.unlock();
+                    // Park holding NO locks (Q7 twin).
+                    switch (self.parkForTurnEvents(observed_signal, wait_deadline_ms)) {
+                        .woken => continue :park_loop,
+                        // One final consistent read, then answer as-is.
+                        .timed_out, .drained, .over_cap => {
+                            wait_exhausted = true;
+                            continue :park_loop;
+                        },
+                    }
+                }
+                defer turn.mutex.unlock();
+                if (chatTailUpperBound(turn, @intCast(after_seq)) > MAX_RESPONSE_BYTES) return error.ResponseTooLarge;
+                var writer: std.Io.Writer.Allocating = .init(self.allocator);
+                errdefer writer.deinit();
+                var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+                try beginOk(&s, id_value);
+                try s.objectField("result");
+                try writeChatTurnTail(&s, turn, @intCast(after_seq));
+                try s.endObject();
+                return try writer.toOwnedSlice();
+            }
+            // Not in memory: fall through to the durable-record path with
+            // lockDaemon still held (matching the pre-wait_ms structure).
+            break :park_loop;
         }
         const service = self.store_service;
         if (service) |svc| _ = svc.lifetime_pins.fetchAdd(1, .monotonic);
@@ -4892,6 +4991,31 @@ pub const Daemon = struct {
             return try okValueResponse(self.allocator, id_value, .{ .accepted = true });
         }
         return try errorResponseAlloc(self.allocator, id_value, "not_found", "turn not found");
+    }
+
+    /// Read-only dynamic model catalog so detached clients (web/CLI) can
+    /// mirror the desktop composer pickers. Runs unlocked (see
+    /// methodRunsUnlocked): provider discovery may block on the OpenCode
+    /// server, cursor-agent CLI, or Claude bridge. Unreachable providers and
+    /// Codex (static catalog only) return provider_unavailable; clients fall
+    /// back to their static tables.
+    fn providerModelsListResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
+        const provider_name = jsonString(params.object.get("provider") orelse .null) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing provider");
+        const provider = parseEnum(harness.Provider, provider_name) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "unknown provider");
+        const project_path = jsonString(params.object.get("project_path") orelse .null) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing project_path");
+
+        const models = send_runner.listModels(self.allocator, provider, project_path) catch |err| {
+            return try errorResponseAlloc(self.allocator, id_value, "provider_unavailable", @errorName(err));
+        };
+        defer harness.freeModelInfos(self.allocator, models);
+        return try okValueResponse(self.allocator, id_value, .{
+            .provider = provider_name,
+            .models = models,
+        });
     }
 
     fn findChatTurn(self: *Daemon, turn_id: []const u8) ?*ChatTurn {
@@ -6338,6 +6462,8 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
         if (turn.durability_error) |old| daemon.allocator.free(old);
         turn.durability_error = daemon.allocator.dupe(u8, "store_closed") catch null;
         turn.mutex.unlock();
+        // The pending flip publishes the terminal status; wake tail waiters.
+        daemon.signalTurnEventWaiters();
         return;
     };
     _ = service.in_flight.fetchAdd(1, .monotonic);
@@ -6407,6 +6533,9 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
     turn.committed_store_revision = write_result.store_revision;
     turn.durability_pending = false;
     turn.mutex.unlock();
+    // Durable-first publication flip: the tail status just became terminal
+    // without a new event append, so wake parked wait_ms tail waiters here.
+    daemon.signalTurnEventWaiters();
 }
 
 fn loadTurnRecord(
@@ -6614,7 +6743,7 @@ fn loadThreadListResult(
 
     var rows = store.conn.rows(
         \\select t.local_thread_id, t.title, t.archived, t.committed, t.last_activity_at,
-        \\       t.provider_thread_id, t.model_ref, t.provider, t.harness
+        \\       t.provider_thread_id, t.model_ref, t.provider, t.harness, t.sort_index
         \\from threads t
         \\join workspaces w on w.id = t.workspace_id
         \\where w.workspace_id = ?1
@@ -6640,6 +6769,7 @@ fn loadThreadListResult(
         items.append(allocator, .{
             .local_thread_id = local_thread_id,
             .title = title,
+            .sort_index = std.math.cast(usize, row.int(9)) orelse 0,
             .archived = row.int(2) != 0,
             .committed = row.int(3) != 0,
             .last_activity_at = row.nullableInt(4),
@@ -6756,6 +6886,7 @@ const CHAT_AUTHORITY_LANDED = true;
 /// still the authority, so "store" must be reported incomplete too.
 fn scopeIsIncomplete(scope_name: []const u8, chat_authority_landed: bool) bool {
     const known = std.mem.eql(u8, scope_name, store_protocol.SNAPSHOT_SCOPE_STORE) or
+        std.mem.eql(u8, scope_name, store_protocol.SNAPSHOT_SCOPE_WORKSPACES) or
         std.mem.eql(u8, scope_name, store_protocol.SNAPSHOT_SCOPE_REGISTRY) or
         std.mem.eql(u8, scope_name, store_protocol.SNAPSHOT_SCOPE_SESSIONS) or
         std.mem.eql(u8, scope_name, store_protocol.SNAPSHOT_SCOPE_TURNS);
@@ -7007,6 +7138,7 @@ fn loadStoreSnapshotTxn(
     store: *daemon_store.Store,
     workspace_filter: ?[]const u8,
     include_store: bool,
+    include_workspaces: bool,
 ) daemon_store.StoreError!LoadedStoreSnapshot {
     store.conn.execNoArgs("begin") catch return error.StoreUnavailable;
     var transaction_open = true;
@@ -7014,8 +7146,10 @@ fn loadStoreSnapshotTxn(
 
     const store_revision = try store.storeRevision();
     var snapshot: store_protocol.Snapshot = .{ .store_revision = store_revision };
-    if (include_store) {
-        snapshot = try loadSnapshotContents(arena, store, workspace_filter);
+    if (include_store or include_workspaces) {
+        // The workspaces-only scope skips thread/message hydration so the
+        // reply stays far below the transport cap the full store scope hits.
+        snapshot = try loadSnapshotContents(arena, store, workspace_filter, include_store);
         snapshot.store_revision = store_revision;
     }
     store.conn.commit() catch return error.StoreUnavailable;
@@ -7029,6 +7163,7 @@ fn loadSnapshotContents(
     arena: std.mem.Allocator,
     store: *daemon_store.Store,
     workspace_filter: ?[]const u8,
+    include_threads: bool,
 ) daemon_store.StoreError!store_protocol.Snapshot {
     var snapshot: store_protocol.Snapshot = .{};
     if (store.conn.row("select selected_workspace_index, sidebar_collapsed from app_state where id = 1", .{}) catch return error.StoreUnavailable) |row| {
@@ -7097,8 +7232,10 @@ fn loadSnapshotContents(
 
     // Phase 2: threads per workspace, then messages per thread (statements
     // never nest: each list is fully collected before the next query runs).
+    // Skipped entirely for the lightweight workspaces-only scope.
     const ThreadRow = struct { row_id: i64, thread: store_protocol.Thread };
     for (workspace_rows.items) |*workspace_row| {
+        if (!include_threads) break;
         var thread_rows: std.ArrayList(ThreadRow) = .empty;
         {
             var rows = store.conn.rows(
@@ -7277,7 +7414,10 @@ fn methodRunsUnlocked(method: []const u8) bool {
     // M4-P4: ledger identity guard on accept must read SQLite under the store
     // mutex only; the `.normal` outer lockDaemon window cannot nest that work.
     return std.mem.eql(u8, method, "chat.turn.start") or
-        std.mem.eql(u8, method, "chat.turn.tail");
+        std.mem.eql(u8, method, "chat.turn.tail") or
+        // Read-only provider discovery can block for seconds on provider
+        // CLIs/servers; it touches no daemon state, so never hold lockDaemon.
+        std.mem.eql(u8, method, "provider.models.list");
 }
 
 fn classifyServerRequest(allocator: std.mem.Allocator, request: []const u8) !ServerRequestClass {
@@ -7830,6 +7970,20 @@ fn chatTurnPublishedStatus(turn: *const ChatTurn) ChatTurnStatus {
     return turn.status;
 }
 
+/// True when a tail response would carry something a `wait_ms` long-poller
+/// has not seen: events past its cursor, or a published terminal status
+/// (the durable-commit flip arrives without a new event append). Must be
+/// called under the turn mutex.
+fn chatTailHasNews(turn: *const ChatTurn, after_seq: u64) bool {
+    // Events carry seqs 1..next_seq-1, so anything exists past the cursor
+    // exactly when next_seq is at least two ahead of it.
+    if (turn.next_seq > after_seq + 1) return true;
+    return switch (chatTurnPublishedStatus(turn)) {
+        .completed, .failed, .aborted => true,
+        .running, .waiting_approval => false,
+    };
+}
+
 fn sleepMs(milliseconds: i64) void {
     platform_runtime.sleepMillis(@intCast(@max(milliseconds, 0)));
 }
@@ -7974,6 +8128,10 @@ fn writeChatTurnSummary(s: *std.json.Stringify, turn: *const ChatTurn) !void {
     try s.objectField("status");
     // Durable-first: list never publishes terminal status pre-commit.
     try s.write(@tagName(chatTurnPublishedStatus(turn)));
+    // Acceptance timestamp so detached clients render the same working timer
+    // as the desktop instead of counting from when they first saw the turn.
+    try s.objectField("started_at_ms");
+    try s.write(turn.started_at_ms);
     try s.objectField("next_seq");
     try s.write(turn.next_seq);
     try s.objectField("provider_thread_id");
@@ -7992,6 +8150,9 @@ fn writeChatTurnTail(s: *std.json.Stringify, turn: *const ChatTurn, after_seq: u
     try s.objectField("status");
     // Durable-first: tail status=completed/failed/aborted only with the receipt.
     try s.write(@tagName(chatTurnPublishedStatus(turn)));
+    // Same clock the desktop's working timer counts from (turn acceptance).
+    try s.objectField("started_at_ms");
+    try s.write(turn.started_at_ms);
     try s.objectField("events");
     try s.beginArray();
     for (turn.events.items) |event| {
@@ -8051,6 +8212,8 @@ fn durableChatTurnTailResponse(
     try s.beginObject();
     try s.objectField("status");
     try s.write(record.status);
+    try s.objectField("started_at_ms");
+    try s.write(record.started_at_ms);
     try s.objectField("events");
     try s.beginArray();
     try s.endArray();
@@ -8278,6 +8441,9 @@ fn finalizeChatTurnWorker(daemon: *Daemon, turn: *ChatTurn) void {
     }
     turn.worker_done = true;
     turn.mutex.unlock();
+    // No-writer path publishes the terminal status via the pending flip;
+    // commit path re-arms pending. Either way tail content changed.
+    daemon.signalTurnEventWaiters();
     if (!should_commit) return;
 
     // 3 attempts total; up to 2 lock-free backoffs between them (50, 250 ms).
@@ -8294,6 +8460,8 @@ fn finalizeChatTurnWorker(daemon: *Daemon, turn: *ChatTurn) void {
             turn.durability_error = daemon.allocator.dupe(u8, @errorName(err)) catch null;
             // durability_pending stays true (unconsumable; keep-alive holds).
             turn.mutex.unlock();
+            // durability_error is published tail content; deliver it.
+            daemon.signalTurnEventWaiters();
             if (attempt + 1 >= 3) return; // exhausted: design §2 terminal state
             platform_runtime.sleepMillis(backoffs_ms[attempt]);
             continue;
@@ -9145,6 +9313,32 @@ test "chat turns project into process.list as turn records" {
         @as(usize, 0),
         other_parsed.value.object.get("result").?.object.get("processes").?.array.items.len,
     );
+}
+
+test "provider.models.list validates params and reports unavailable providers" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const missing_provider = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"provider.models.list","params":{"project_path":"/tmp"}}
+    );
+    defer allocator.free(missing_provider);
+    try std.testing.expect(std.mem.indexOf(u8, missing_provider, "invalid_params") != null);
+
+    const unknown_provider = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"provider.models.list","params":{"provider":"nope","project_path":"/tmp"}}
+    );
+    defer allocator.free(unknown_provider);
+    try std.testing.expect(std.mem.indexOf(u8, unknown_provider, "invalid_params") != null);
+
+    // Codex has no discovery RPC: the handler must fail soft without
+    // spawning provider processes so static fallbacks stay authoritative.
+    const codex = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":3,"method":"provider.models.list","params":{"provider":"codex","project_path":"/tmp"}}
+    );
+    defer allocator.free(codex);
+    try std.testing.expect(std.mem.indexOf(u8, codex, "provider_unavailable") != null);
 }
 
 test "finished retained turns report terminal status and wait maps them" {
@@ -12336,6 +12530,7 @@ test "durable reads decode canonical and historical daemon chat role codes" {
         &daemon.store_service.?.store,
         "ws-dto",
         true,
+        false,
     ) catch |err| {
         daemon.store_service.?.mutex.unlock();
         return err;

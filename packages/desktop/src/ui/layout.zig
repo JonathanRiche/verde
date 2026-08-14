@@ -195,6 +195,10 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
         sidebar.renderPalette(state, root_layout.sidebar);
         workspace_panes.renderAt(state, root_layout.workspace);
     }
+    // Queue this root overlay only after scrolling panes have clipped their
+    // local command range; the batch is z-sorted, so pre-queued high-z menu
+    // commands otherwise move into that range and inherit the workspace clip.
+    sidebar.renderContextMenuOverlay(state);
     // Persistence unavailable banner (M3-P3 MAJOR-5): full-width strip so
     // failed/wedged daemon flushes are visible, not log-only.
     renderPersistenceBanner(state, width, height);
@@ -1067,7 +1071,7 @@ fn registerMcpOnboardingHits(state: *runtime.AppState, width: f32, height: f32) 
 fn registerWorkspaceAddModalHits(state: *runtime.AppState, width: f32, height: f32) void {
     if (!state.project_controller.show_creator) return;
     const modal_w = theme.clampf(width * 0.34, theme.scaledUi(360.0), theme.scaledUi(500.0));
-    const notice_h: f32 = if (state.sidebarNotice().len > 0) theme.scaledUi(24.0) else 0.0;
+    const notice_h: f32 = if (state.projectImportNotice().len > 0) theme.scaledUi(24.0) else 0.0;
     const modal_h = theme.scaledUi(252.0) + notice_h;
     const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
     registerModalChromeHits(state, width, height, modal, false);
@@ -1495,7 +1499,7 @@ fn renderWorkspaceRenameModal(state: *runtime.AppState, width: f32, height: f32)
 fn renderWorkspaceAddModal(state: *runtime.AppState, width: f32, height: f32) void {
     if (!state.project_controller.show_creator) return;
     const modal_w = theme.clampf(width * 0.34, theme.scaledUi(360.0), theme.scaledUi(500.0));
-    const notice = state.sidebarNotice();
+    const notice = state.projectImportNotice();
     const notice_h: f32 = if (notice.len > 0) theme.scaledUi(24.0) else 0.0;
     const modal_h = theme.scaledUi(252.0) + notice_h;
     const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };

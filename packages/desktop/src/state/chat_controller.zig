@@ -966,6 +966,25 @@ test "thread-addressed prompt staging preserves ordered images and legacy first 
     try std.testing.expectEqualStrings("/tmp/second.jpg", thread.draft_extra_images.items[0].path);
 }
 
+test "pending follow-up preserves multiple draft images" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Companion");
+    defer thread.deinit(allocator);
+    try thread.addDraftImage(allocator, "/tmp/first.png", "image/png", 10);
+    try thread.addDraftImage(allocator, "/tmp/second.jpg", "image/jpeg", 20);
+
+    var followup: PendingFollowup = .{
+        .kind = .steer,
+        .prompt = try allocator.dupe(u8, "inspect both"),
+    };
+    defer followup.deinit(allocator);
+    try copyDraftImagesToFollowup(allocator, &thread, &followup.images);
+
+    try std.testing.expectEqual(@as(usize, 2), followup.images.items.len);
+    try std.testing.expectEqualStrings("/tmp/first.png", followup.images.items[0].path);
+    try std.testing.expectEqualStrings("/tmp/second.jpg", followup.images.items[1].path);
+}
+
 test "thread-addressed prompt staging is transactional and alias safe" {
     const allocator = std.testing.allocator;
     var thread = try ChatThread.init(allocator, "Companion");
@@ -1591,6 +1610,31 @@ pub fn storeThreadFollowupPrompt(self: anytype, project_index: usize, thread_ind
     return true;
 }
 
+fn copyFollowupImages(
+    allocator: std.mem.Allocator,
+    destination: *std.ArrayList(ChatImageAttachment),
+    images: []const ChatImageAttachment,
+) !void {
+    try destination.ensureTotalCapacity(allocator, images.len);
+    for (images) |image| {
+        destination.appendAssumeCapacity(try ChatImageAttachment.init(allocator, image.path, image.mime, image.byte_size));
+    }
+}
+
+fn copyDraftImagesToFollowup(
+    allocator: std.mem.Allocator,
+    thread: *const ChatThread,
+    destination: *std.ArrayList(ChatImageAttachment),
+) !void {
+    try destination.ensureTotalCapacity(allocator, thread.draftImageCount());
+    if (thread.draft_image) |image| {
+        destination.appendAssumeCapacity(try ChatImageAttachment.init(allocator, image.path, image.mime, image.byte_size));
+    }
+    for (thread.draft_extra_images.items) |image| {
+        destination.appendAssumeCapacity(try ChatImageAttachment.init(allocator, image.path, image.mime, image.byte_size));
+    }
+}
+
 /// Queues the current composer draft as a new turn after the active reply.
 /// Codex uses this for Enter while Tab remains the distinct steer action.
 pub fn queueDraftDuringSend(self: anytype) void {
@@ -1606,10 +1650,23 @@ pub fn storeDraftDuringSend(self: anytype, kind: FollowupKind) void {
     }
 
     const draft = thread.currentDraft();
-    if (std.mem.trim(u8, draft, &std.ascii.whitespace).len == 0) {
-        self.setSidebarNotice("Type a message first.");
+    if (std.mem.trim(u8, draft, &std.ascii.whitespace).len == 0 and thread.draftImageCount() == 0) {
+        self.setSidebarNotice("Type a message or attach an image first.");
         return;
     }
+
+    var next_followup: PendingFollowup = .{
+        .kind = kind,
+        .prompt = self.allocator.dupe(u8, draft) catch {
+            self.setSidebarNotice("Failed to store the pending follow-up.");
+            return;
+        },
+    };
+    copyDraftImagesToFollowup(self.allocator, thread, &next_followup.images) catch {
+        next_followup.deinit(self.allocator);
+        self.setSidebarNotice("Failed to store the pending follow-up attachments.");
+        return;
+    };
 
     const send_state = thread.send_state;
     send_state.mutex.lock();
@@ -1617,14 +1674,7 @@ pub fn storeDraftDuringSend(self: anytype, kind: FollowupKind) void {
 
     freePendingFollowup(self.allocator, &send_state.pending_followup);
     send_state.pending_followup_signal_sent = false;
-    send_state.pending_followup = .{
-        .kind = kind,
-        .state = .pending,
-        .prompt = self.allocator.dupe(u8, draft) catch {
-            self.setSidebarNotice("Failed to store the pending follow-up.");
-            return;
-        },
-    };
+    send_state.pending_followup = next_followup;
 
     self.clearDraft();
     thread.clearDraftImage(self.allocator);
@@ -1771,6 +1821,7 @@ pub fn steerThreadViaHarness(
     thread_id: []const u8,
     turn_id: []const u8,
     prompt: []const u8,
+    images: []const ChatImageAttachment,
 ) !void {
     const provider_cwd = execution_target.cwd();
     const provider_config = ai_harness.ProviderConfig{
@@ -1787,10 +1838,15 @@ pub fn steerThreadViaHarness(
     var client = try ai_harness.connect(self.allocator, provider_config);
     defer client.deinit();
 
+    const image_attachments = try self.allocator.alloc(ai_harness.types.ImageAttachment, images.len);
+    defer self.allocator.free(image_attachments);
+    for (images, 0..) |image, index| image_attachments[index] = .{ .path = image.path };
+
     return client.steerThread(.{
         .thread_id = thread_id,
         .turn_id = turn_id,
         .prompt = prompt,
+        .images = image_attachments,
     });
 }
 
@@ -1805,12 +1861,35 @@ pub fn beginSendForThread(
     return self.beginSendForThreadWithReadyDaemon(project_index, thread, prompt, execution_target);
 }
 
+fn beginSendForThreadWithImages(
+    self: anytype,
+    project_index: usize,
+    thread: *ChatThread,
+    prompt: []const u8,
+    images: []const ChatImageAttachment,
+    execution_target: ProviderExecutionTarget,
+) !void {
+    try self.ensureSessionDaemon();
+    return beginSendForThreadWithReadyDaemonImages(self, project_index, thread, prompt, execution_target, images);
+}
+
 pub fn beginSendForThreadWithReadyDaemon(
     self: anytype,
     project_index: usize,
     thread: *ChatThread,
     prompt: []const u8,
     execution_target: ProviderExecutionTarget,
+) !void {
+    return beginSendForThreadWithReadyDaemonImages(self, project_index, thread, prompt, execution_target, null);
+}
+
+fn beginSendForThreadWithReadyDaemonImages(
+    self: anytype,
+    project_index: usize,
+    thread: *ChatThread,
+    prompt: []const u8,
+    execution_target: ProviderExecutionTarget,
+    images: ?[]const ChatImageAttachment,
 ) !void {
     const page_alloc = std.heap.page_allocator;
     const execution_cwd = execution_target.cwd();
@@ -1849,6 +1928,7 @@ pub fn beginSendForThreadWithReadyDaemon(
         cursor_model_params_json,
         turn_id,
         message_id,
+        images,
     ) catch |err| recovered: {
         // A lost reply can follow successful acceptance. Probe this exact
         // idempotency key before exposing a retry that could run twice.
@@ -1944,11 +2024,16 @@ pub fn startDaemonChatTurn(
     cursor_model_params_json: ?[]const u8,
     turn_id: []const u8,
     message_id: []const u8,
+    image_override: ?[]const ChatImageAttachment,
 ) ![]u8 {
     var image_paths: std.ArrayList([]const u8) = .empty;
     defer image_paths.deinit(self.allocator);
-    if (thread.draft_image) |image| try image_paths.append(self.allocator, image.path);
-    for (thread.draft_extra_images.items) |image| try image_paths.append(self.allocator, image.path);
+    if (image_override) |images| {
+        for (images) |image| try image_paths.append(self.allocator, image.path);
+    } else {
+        if (thread.draft_image) |image| try image_paths.append(self.allocator, image.path);
+        for (thread.draft_extra_images.items) |image| try image_paths.append(self.allocator, image.path);
+    }
 
     return sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.start", .{
         .turn_id = turn_id,
@@ -2010,8 +2095,19 @@ pub fn consumeDaemonChatTurn(self: anytype, turn_id: ?[]u8) void {
     defer self.allocator.free(response);
 }
 
+/// Reattach still-live daemon turns during launch. Terminal reconciliation
+/// stays on the asynchronous composite-snapshot path.
 pub fn restoreDaemonChatTurnsOnLaunch(self: anytype) void {
-    const response = sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.list", .{}, 6) catch return;
+    // Startup must stay bounded when no compatible daemon is reachable. The
+    // cursor worker will retry through its ordinary composite-snapshot loop.
+    const response = sessionizer.requestAllocWithTimeout(
+        self.allocator,
+        self.storage.pref_path,
+        "chat.turn.list",
+        .{},
+        6,
+        500,
+    ) catch return;
     defer self.allocator.free(response);
     var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response, .{}) catch return;
     defer parsed.deinit();
@@ -2027,58 +2123,9 @@ pub fn restoreDaemonChatTurnsOnLaunch(self: anytype) void {
         const status = jsonValueString(turn_value.object.get("status") orelse .null) orelse "running";
         const thread = self.threadByLocalId(workspace_id, local_thread_id) orelse continue;
 
-        // M4-P4: turns that ended while the GUI was closed are durable in the
-        // store snapshot (loaded at startup). Consult chat.turn.record for the
-        // committed fact and surface failed turns; do not re-attach as a live
-        // pending send. Consume is issued as the pure retention hint it now is
-        // (MINOR-3): without it, ended-while-closed turns accumulate in daemon
-        // memory and chat.turn.list forever (GC requires consumed).
-        if (std.mem.eql(u8, status, "completed") or std.mem.eql(u8, status, "failed") or std.mem.eql(u8, status, "aborted")) {
-            if (sessionizer.requestAlloc(
-                self.allocator,
-                self.storage.pref_path,
-                "chat.turn.record",
-                .{ .turn_id = turn_id },
-                6,
-            )) |record_response| {
-                defer self.allocator.free(record_response);
-                if (std.json.parseFromSlice(std.json.Value, self.allocator, record_response, .{})) |record_parsed_value| {
-                    var record_parsed = record_parsed_value;
-                    defer record_parsed.deinit();
-                    if (jsonRpcResult(record_parsed.value)) |record_result| {
-                        if (record_result == .object) {
-                            const record_status = jsonValueString(record_result.object.get("status") orelse .null) orelse status;
-                            if (std.mem.eql(u8, record_status, "failed")) {
-                                const error_message = jsonValueString(record_result.object.get("error_message") orelse .null) orelse
-                                    "Provider request failed.";
-                                log.warn("chat turn {s} failed while the GUI was closed: {s}", .{ turn_id, error_message });
-                                self.setSidebarNotice("A chat reply failed while Verde was closed.");
-                            }
-                        }
-                    } else |err| {
-                        log.warn("chat.turn.record for {s} returned an error: {s}", .{ turn_id, @errorName(err) });
-                    }
-                } else |err| {
-                    log.warn("failed to decode chat.turn.record for {s}: {s}", .{ turn_id, @errorName(err) });
-                }
-                // Retention hint: the committed record is durable; let the
-                // daemon GC the in-memory turn.
-                if (sessionizer.requestAlloc(
-                    self.allocator,
-                    self.storage.pref_path,
-                    "chat.turn.consume",
-                    .{ .turn_id = turn_id },
-                    6,
-                )) |consume_response| {
-                    self.allocator.free(consume_response);
-                } else |err| {
-                    log.warn("failed to consume reconciled chat turn {s}: {s}", .{ turn_id, @errorName(err) });
-                }
-            } else |err| {
-                log.warn("failed to consult chat.turn.record for {s}: {s}", .{ turn_id, @errorName(err) });
-            }
-            continue;
-        }
+        if (std.mem.eql(u8, status, "completed") or
+            std.mem.eql(u8, status, "failed") or
+            std.mem.eql(u8, status, "aborted")) continue;
 
         // Still-live turns: re-attach and resume tail from seq 0.
         const send_state = thread.send_state;
@@ -2440,6 +2487,43 @@ test "M5-P4 live-turn attachment allocation failure sweeps staged attachment ind
         try std.testing.expect(thread.send_state.daemon_turn_id == null);
         try std.testing.expectEqual(@as(usize, 0), state.chat_controller.pending_send_count);
     }
+}
+
+test "launch reconciliation reattaches a live daemon turn once" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "restored live turn");
+    defer thread.deinit(allocator);
+    allocator.free(thread.local_thread_id);
+    thread.local_thread_id = try allocator.dupeZ(u8, "thread-restored");
+    thread.provider = .cursor;
+    const AttachState = struct {
+        chat_controller: State = .{},
+        thread: *ChatThread,
+
+        fn threadByLocalId(self: *@This(), workspace_id: []const u8, local_thread_id: []const u8) ?*ChatThread {
+            if (!std.mem.eql(u8, workspace_id, "ws-restored")) return null;
+            if (!std.mem.eql(u8, local_thread_id, self.thread.local_thread_id)) return null;
+            return self.thread;
+        }
+    };
+    var state: AttachState = .{ .thread = &thread };
+    const turns = [_]headless.store.TurnRecord{.{
+        .turn_id = "turn-restored",
+        .workspace_id = "ws-restored",
+        .local_thread_id = "thread-restored",
+        .status = "running",
+        .started_at_ms = 42,
+        .provider = "cursor",
+    }};
+
+    try applyDaemonChatTurnsSnapshotWithAllocator(&state, &turns, std.heap.page_allocator);
+    try std.testing.expectEqual(SendStatus.pending, thread.send_state.status);
+    try std.testing.expectEqualStrings("turn-restored", thread.send_state.daemon_turn_id.?);
+    try std.testing.expect(thread.send_state.daemon_owned);
+    try std.testing.expectEqual(@as(usize, 1), state.chat_controller.pending_send_count);
+
+    try applyDaemonChatTurnsSnapshotWithAllocator(&state, &turns, std.heap.page_allocator);
+    try std.testing.expectEqual(@as(usize, 1), state.chat_controller.pending_send_count);
 }
 
 test "M5-P4 reconnect consume deduplicates and validates accepted or not_found" {
@@ -3894,16 +3978,32 @@ fn adoptTranscriptIdentitiesFromStoreMessages(
         }
         const store_role = jsonValueString(message_value.object.get("role") orelse .null) orelse continue;
         const store_body = jsonValueString(message_value.object.get("body") orelse .null) orelse continue;
-        const row = &thread.messages.items[projection_index];
-        if (std.mem.eql(u8, store_role, @tagName(row.role)) and std.mem.eql(u8, store_body, row.body)) {
+        // Forward-scan alignment: a single divergent projection row must not
+        // pin the cursor and cascade mismatches onto every later store row
+        // (one stuck row used to mint hundred-row repair markers that froze
+        // projection convergence). Adopt into the first id-less row whose
+        // role+body fingerprint matches, in order; skipped projection rows
+        // stay id-less and are never revisited, so ordering is preserved.
+        const match_index: ?usize = blk: {
+            var scan_index = projection_index;
+            while (scan_index < thread.messages.items.len) : (scan_index += 1) {
+                const candidate = &thread.messages.items[scan_index];
+                if (candidate.message_id != null) continue;
+                if (std.mem.eql(u8, store_role, @tagName(candidate.role)) and
+                    std.mem.eql(u8, store_body, candidate.body)) break :blk scan_index;
+            }
+            break :blk null;
+        };
+        if (match_index) |matched| {
+            const row = &thread.messages.items[matched];
             row.message_id = self.allocator.dupe(u8, store_id) catch null;
             if (row.message_id != null) adopted_any = true else unresolved = true;
-            projection_index += 1;
+            projection_index = matched + 1;
         } else {
             unresolved = true;
             log.warn(
-                "daemon transcript identity adoption mismatch for {s} (store role={s}, projection role={s}); leaving projection row id-less",
-                .{ store_id, store_role, @tagName(row.role) },
+                "daemon transcript identity adoption mismatch for {s} (store role={s}): no id-less projection row matches; leaving store identity unadopted",
+                .{ store_id, store_role },
             );
         }
     }
@@ -3953,6 +4053,8 @@ const AdoptionRetryState = struct {
     attempts: u32 = 0,
     next_retry_at_ms: i64 = 0,
     terminal_failed: bool = false,
+    /// Failed projection-refresh validations; bounds the terminal veto.
+    refresh_validation_failures: u32 = 0,
     turn_id: []u8,
     rows: std.ArrayList(AdoptionExpectedRow) = .empty,
 
@@ -4095,35 +4197,72 @@ pub fn hasUnresolvedAdoptionRows(self: anytype) bool {
     return iterator.next() != null;
 }
 
+/// A repair whose fingerprints keep failing refresh validation against fresh
+/// durable snapshots is unresolvable in practice (e.g. durable rows disagree
+/// on role/body with what the projection rendered). Past this many failed
+/// validations its veto is abandoned so one poisoned marker can never freeze
+/// projection convergence and dirty-state capture for the retry pump's
+/// multi-hour give-up horizon — or, via the shutdown spool, forever. The
+/// worker's 250ms–5s refresh backoff makes this bound ≈30s of protection,
+/// far beyond commit-visibility races.
+const ADOPTION_REPAIR_MAX_REFRESH_VETOES: u32 = 10;
+
 /// Prove every covered local row has the matching durable turn identity before
 /// projection ownership can swap. A different all-identified transcript is
-/// not satisfaction and must leave both the live rows and marker untouched.
+/// not satisfaction and must leave both the live rows and marker untouched —
+/// while resolution is still plausible. A repair that keeps failing this
+/// validation against fresh durable snapshots has no remaining path to
+/// satisfaction; after a bounded number of vetoes the daemon-owned durable
+/// projection wins: the marker is dropped loudly, accepting bounded, visible
+/// divergence in one thread instead of an app-wide convergence freeze.
 pub fn validateAdoptionRepairsForRefresh(_: anytype, persisted: db_types.PersistedState) !void {
+    var dropped_keys: std.ArrayList([]const u8) = .empty;
+    defer dropped_keys.deinit(std.heap.page_allocator);
+    var veto: ?anyerror = null;
     var iterator = adoption_retry_pending.iterator();
     while (iterator.next()) |entry| {
         const parts = adoptionRetryKeyParts(entry.key_ptr.*) orelse return error.InvalidAdoptionRepairKey;
-        const project = blk: {
-            for (persisted.projects) |candidate| {
-                const id = candidate.id orelse continue;
-                if (std.mem.eql(u8, id, parts.workspace_id)) break :blk candidate;
+        const failure: anyerror = blk: {
+            const project = project: {
+                for (persisted.projects) |candidate| {
+                    const id = candidate.id orelse continue;
+                    if (std.mem.eql(u8, id, parts.workspace_id)) break :project candidate;
+                }
+                break :blk error.AdoptionRepairMismatch;
+            };
+            const thread = thread: {
+                for (project.threads orelse &.{}) |candidate| {
+                    const id = candidate.local_thread_id orelse continue;
+                    if (std.mem.eql(u8, id, parts.local_thread_id)) break :thread candidate;
+                }
+                break :blk error.AdoptionRepairMismatch;
+            };
+            switch (try adoptionTurnMatch(thread.messages, entry.value_ptr.rows.items, parts.turn_id)) {
+                .unique => continue,
+                .missing => break :blk error.AdoptionRepairMismatch,
+                // Multiple ordered fingerprint correspondences are not enough
+                // to prove identity.
+                .ambiguous => break :blk error.AdoptionRepairAmbiguous,
             }
-            return error.AdoptionRepairMismatch;
         };
-        const thread = blk: {
-            for (project.threads orelse &.{}) |candidate| {
-                const id = candidate.local_thread_id orelse continue;
-                if (std.mem.eql(u8, id, parts.local_thread_id)) break :blk candidate;
-            }
-            return error.AdoptionRepairMismatch;
-        };
-        switch (try adoptionTurnMatch(thread.messages, entry.value_ptr.rows.items, parts.turn_id)) {
-            .unique => {},
-            .missing => return error.AdoptionRepairMismatch,
-            // Multiple ordered fingerprint correspondences are not enough to
-            // prove identity. Retain every marker and leave live state intact.
-            .ambiguous => return error.AdoptionRepairAmbiguous,
+        entry.value_ptr.refresh_validation_failures +|= 1;
+        if (entry.value_ptr.refresh_validation_failures > ADOPTION_REPAIR_MAX_REFRESH_VETOES) {
+            log.warn(
+                "dropping unresolvable adoption repair for thread {s} turn {s} after {d} refresh vetoes ({s}): durable projection wins",
+                .{ parts.local_thread_id, parts.turn_id, entry.value_ptr.refresh_validation_failures, @errorName(failure) },
+            );
+            try dropped_keys.append(std.heap.page_allocator, entry.key_ptr.*);
+            continue;
         }
+        if (veto == null) veto = failure;
     }
+    for (dropped_keys.items) |key| {
+        const removed = adoption_retry_pending.fetchRemove(key) orelse continue;
+        var state = removed.value;
+        state.deinit();
+        std.heap.page_allocator.free(removed.key);
+    }
+    if (veto) |err| return err;
 }
 
 const AdoptionTurnMatch = enum { missing, unique, ambiguous };
@@ -4930,6 +5069,11 @@ pub fn issuePendingCodexSteer(
     var thread_id: ?[]u8 = null;
     var turn_id: ?[]u8 = null;
     var prompt: ?[]u8 = null;
+    var images: std.ArrayList(ChatImageAttachment) = .empty;
+    defer {
+        for (images.items) |*image| image.deinit(self.allocator);
+        images.deinit(self.allocator);
+    }
 
     const send_state = thread.send_state;
     if (!send_state.mutex.tryLock()) return;
@@ -4950,7 +5094,13 @@ pub fn issuePendingCodexSteer(
                 thread_id = self.allocator.dupe(u8, resolved_thread_id) catch null;
                 turn_id = self.allocator.dupe(u8, active_turn_id) catch null;
                 prompt = self.allocator.dupe(u8, send_state.pending_followup.?.prompt) catch null;
-                send_state.pending_followup_signal_sent = thread_id != null and turn_id != null and prompt != null;
+                copyFollowupImages(
+                    self.allocator,
+                    &images,
+                    send_state.pending_followup.?.images.items,
+                ) catch {};
+                send_state.pending_followup_signal_sent = thread_id != null and turn_id != null and prompt != null and
+                    images.items.len == send_state.pending_followup.?.images.items.len;
                 if (!send_state.pending_followup_signal_sent) {
                     if (thread_id) |owned_thread_id| {
                         self.allocator.free(owned_thread_id);
@@ -4984,9 +5134,9 @@ pub fn issuePendingCodexSteer(
     defer self.allocator.free(owned_turn_id);
     defer self.allocator.free(owned_prompt);
 
-    const execution_target = self.providerExecutionTargetForProjectThread(project_index, thread, 0) orelse return;
+    const execution_target = self.providerExecutionTargetForProjectThread(project_index, thread, images.items.len) orelse return;
 
-    self.steerThreadViaHarness(execution_target, owned_thread_id, owned_turn_id, owned_prompt) catch |err| {
+    self.steerThreadViaHarness(execution_target, owned_thread_id, owned_turn_id, owned_prompt, images.items) catch |err| {
         send_state.mutex.lock();
         defer send_state.mutex.unlock();
         if (send_state.pending_followup) |*pending_followup| {
@@ -5010,13 +5160,19 @@ pub fn issuePendingCodexSteer(
     const owned_body = std.heap.page_allocator.dupe(u8, owned_prompt) catch null;
     if (owned_author) |author| {
         if (owned_body) |body| {
-            send_state.pending_events.append(std.heap.page_allocator, .{
+            var event: PendingTimelineEvent = .{
                 .role = .system,
                 .author = author,
                 .body = body,
-            }) catch {
-                std.heap.page_allocator.free(author);
-                std.heap.page_allocator.free(body);
+            };
+            copyFollowupImages(std.heap.page_allocator, &event.images, images.items) catch {
+                event.deinit(std.heap.page_allocator);
+                send_state.mutex.unlock();
+                self.setSidebarNotice("Codex steer sent, but Verde could not display its attachments.");
+                return;
+            };
+            send_state.pending_events.append(std.heap.page_allocator, event) catch {
+                event.deinit(std.heap.page_allocator);
             };
         } else {
             std.heap.page_allocator.free(author);
@@ -5039,22 +5195,24 @@ pub fn dispatchPendingFollowup(self: anytype, project_index: usize, thread_index
     send_state.stop_signal_sent = false;
     send_state.mutex.unlock();
 
-    const followup = pending orelse return;
-    defer self.allocator.free(followup.prompt);
+    var followup = pending orelse return;
+    defer followup.deinit(self.allocator);
 
     if (followup.kind == .steer and followup.state == .sent_inline) {
         self.setSidebarNotice("Codex steer applied.");
         return;
     }
 
-    const execution_target = self.providerExecutionTargetForProjectThread(project_index, thread, 0) orelse return;
+    const execution_target = self.providerExecutionTargetForProjectThread(project_index, thread, followup.images.items.len) orelse return;
 
-    self.appendMessageToThread(thread, .user, "You", followup.prompt, null, &.{}) catch |err| {
+    const first_image: ?*const ChatImageAttachment = if (followup.images.items.len > 0) &followup.images.items[0] else null;
+    const extra_images: []const ChatImageAttachment = if (followup.images.items.len > 1) followup.images.items[1..] else &.{};
+    self.appendMessageToThread(thread, .user, "You", followup.prompt, first_image, extra_images) catch |err| {
         log.err("failed to append pending follow-up: {s}", .{@errorName(err)});
         self.setSidebarNotice("Failed to append the pending follow-up.");
         return;
     };
-    self.beginSendForThread(project_index, thread, followup.prompt, execution_target) catch |err| {
+    beginSendForThreadWithImages(self, project_index, thread, followup.prompt, followup.images.items, execution_target) catch |err| {
         log.err("failed to start pending follow-up: {s}", .{@errorName(err)});
         self.setSidebarNotice("Failed to send the pending follow-up.");
         return;
@@ -5416,16 +5574,7 @@ pub fn applyPendingTimelineEvents(self: anytype, thread: *ChatThread, events: *s
         if (std.mem.eql(u8, event.author, "__verde_codex_background_snapshot")) {
             try self.reconcileCodexBackgroundSnapshot(thread, event.body);
         }
-        try thread.messages.append(self.allocator, .{
-            .role = event.role,
-            .author = try self.dupeZ(event.author),
-            .body = try self.dupeZ(event.body),
-            .image = null,
-            .tool_call_id = if (event.tool_call_id) |call_id| try self.allocator.dupe(u8, call_id) else null,
-            .tool_call_kind = event.tool_call_kind,
-            .tool_call_status = event.tool_call_status,
-            .message_id = if (event.message_id) |id| self.allocator.dupe(u8, id) catch null else null,
-        });
+        try appendPendingTimelineEvent(self, thread, event);
         if (event.role == .system) {
             thread.noteBackgroundTaskEvent(self.allocator, event.author, event.body) catch |err| {
                 log.warn("failed to record background task event: {s}", .{@errorName(err)});
@@ -5437,6 +5586,21 @@ pub fn applyPendingTimelineEvents(self: anytype, thread: *ChatThread, events: *s
     }
     thread.touch();
     self.markDirty();
+}
+
+fn appendPendingTimelineEvent(self: anytype, thread: *ChatThread, event: PendingTimelineEvent) !void {
+    const owned_tool_call_id = if (event.tool_call_id) |call_id| try self.allocator.dupe(u8, call_id) else null;
+    errdefer if (owned_tool_call_id) |call_id| self.allocator.free(call_id);
+    const owned_message_id = if (event.message_id) |id| self.allocator.dupe(u8, id) catch null else null;
+    errdefer if (owned_message_id) |id| self.allocator.free(id);
+    const first_image: ?*const ChatImageAttachment = if (event.images.items.len > 0) &event.images.items[0] else null;
+    const extra_images: []const ChatImageAttachment = if (event.images.items.len > 1) event.images.items[1..] else &.{};
+    try self.appendMessageToThread(thread, event.role, event.author, event.body, first_image, extra_images);
+    const message = &thread.messages.items[thread.messages.items.len - 1];
+    message.tool_call_id = owned_tool_call_id;
+    message.tool_call_kind = event.tool_call_kind;
+    message.tool_call_status = event.tool_call_status;
+    message.message_id = owned_message_id;
 }
 
 pub fn reconcileCodexBackgroundSnapshot(self: anytype, thread: *ChatThread, body: []const u8) !void {

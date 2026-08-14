@@ -671,6 +671,31 @@ pub fn terminalPaneScreenTextForProject(self: anytype, project_index: usize, pan
     return try dock.activeScreenTextAlloc(self.allocator);
 }
 
+pub fn terminalPaneRenderStateForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId) ?*const terminal.RenderState {
+    if (project_index >= self.project_controller.projects.items.len) return null;
+    const project = &self.project_controller.projects.items[project_index];
+    const pane = project.workspace_layout.paneById(pane_id) orelse return null;
+    const dock_id = switch (pane.ref) {
+        .terminal => |ref| ref.dock_id,
+        else => return null,
+    };
+    const dock = self.projectTerminalDock(project_index, dock_id) orelse return null;
+    return dock.activeRenderState();
+}
+
+pub fn terminalPaneGridSizeForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId) ?struct { cols: u16, rows: u16 } {
+    if (project_index >= self.project_controller.projects.items.len) return null;
+    const project = &self.project_controller.projects.items[project_index];
+    const pane = project.workspace_layout.paneById(pane_id) orelse return null;
+    const dock_id = switch (pane.ref) {
+        .terminal => |ref| ref.dock_id,
+        else => return null,
+    };
+    const dock = self.projectTerminalDock(project_index, dock_id) orelse return null;
+    const grid = dock.activeGridSize() orelse return null;
+    return .{ .cols = grid.cols, .rows = grid.rows };
+}
+
 pub fn pollTerminalDockBeforeRead(self: anytype, project_index: usize, dock_id: u32, dock: *terminal.Dock) !void {
     const changed = try dock.poll(self.allocator);
     self.syncTerminalDockProcessLifecycle(project_index, dock_id, dock, null);
@@ -1899,6 +1924,41 @@ pub fn tuiResumeCommand(self: anytype, provider: Provider, thread_id: []const u8
     };
 }
 
+fn threadForTuiDock(project: *const Project, dock_id: u32) ?*const ChatThread {
+    for (project.threads.items) |*thread| {
+        if (thread.tui_dock_id == dock_id) return thread;
+    }
+    for (project.archived_threads.items) |*thread| {
+        if (thread.tui_dock_id == dock_id) return thread;
+    }
+    return null;
+}
+
+fn terminalPaneForDock(project: *const Project, dock_id: u32) ?WorkspacePaneId {
+    if (project.workspace_layout.visibleTerminalPaneIdForDock(dock_id)) |pane_id| return pane_id;
+    for (project.workspace_layout.panes.items) |pane| {
+        switch (pane.ref) {
+            .terminal => |ref| if (ref.dock_id == dock_id) return pane.id,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Replays the provider resume command only when the terminal layer reports
+/// that a persisted daemon session had to be recreated. Thread and dock IDs,
+/// rather than mutable display titles, provide the durable association.
+pub fn resumeRecreatedThreadTui(self: anytype, project_index: usize, dock_id: u32) !bool {
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    const project = &self.project_controller.projects.items[project_index];
+    const thread = threadForTuiDock(project, dock_id) orelse return false;
+    const provider_thread_id = thread.provider_thread_id orelse return false;
+    const pane_id = terminalPaneForDock(project, dock_id) orelse return false;
+    const command = try self.tuiResumeCommand(thread.provider, provider_thread_id);
+    defer self.allocator.free(command);
+    return try self.writeWorkspaceTerminalPaneForProject(project_index, pane_id, command);
+}
+
 pub fn splitCurrentProjectWorkspacePaneWithTerminalAxis(self: anytype, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis) bool {
     return self.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, axis, true);
 }
@@ -2115,4 +2175,23 @@ test "background chat creation preserves the scrolling viewport" {
     try std.testing.expectEqual(@as(?WorkspacePaneId, focused_pane_id), layout.scroll_leading_pane_id);
     try std.testing.expectEqual(@as(i64, 456), layout.scroll_animation_last_ms);
     try std.testing.expect(layout.scroll_axis_vertical);
+}
+
+test "TUI restoration associates provider sessions by dock instead of title" {
+    const allocator = std.testing.allocator;
+    var project = try Project.init(allocator, "tui-restore", "TUI restore", "/tmp/tui-restore", 0);
+    defer project.deinit(allocator);
+
+    const first = &project.threads.items[0];
+    first.tui_dock_id = 7;
+    first.provider_thread_id = try allocator.dupeZ(u8, "provider-first");
+    const second_index = try project.addThread(allocator);
+    const second = &project.threads.items[second_index];
+    second.tui_dock_id = 11;
+    second.provider_thread_id = try allocator.dupeZ(u8, "provider-second");
+
+    try std.testing.expectEqualStrings(project.threads.items[0].title, second.title);
+    try std.testing.expectEqualStrings("provider-first", threadForTuiDock(&project, 7).?.provider_thread_id.?);
+    try std.testing.expectEqualStrings("provider-second", threadForTuiDock(&project, 11).?.provider_thread_id.?);
+    try std.testing.expect(threadForTuiDock(&project, 99) == null);
 }

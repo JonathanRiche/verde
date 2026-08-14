@@ -174,6 +174,8 @@ pub const ChatThread = struct {
     tui_dock_id: ?u32 = null,
     completion_pending: bool = false,
     completed_at_ms: i64 = 0,
+    /// Durable sort-index boundary before materialized messages.
+    persisted_message_offset: usize = 0,
     messages: std.ArrayList(ChatMessage),
     background_tasks: std.ArrayList(BackgroundTask),
     send_state: *SendState,
@@ -221,6 +223,7 @@ pub const ChatThread = struct {
             .tui_dock_id = null,
             .completion_pending = false,
             .completed_at_ms = 0,
+            .persisted_message_offset = 0,
             .messages = .empty,
             .background_tasks = .empty,
             .send_state = send_state,
@@ -332,16 +335,19 @@ pub const ChatThread = struct {
     }
 
     /// Activity state consumed by provider-neutral pane chrome and the ACTIVE
-    /// cluster. Approval requests are waiting, rather than generic working.
+    /// cluster. Approval requests and live background work are waiting, rather
+    /// than generic working or a misleading completed state.
     pub fn activityStatusForUi(self: *const ChatThread) ChatActivityStatus {
-        if (self.completion_pending) return .done;
         if (!self.send_state.mutex.tryLock()) return .working;
         defer self.send_state.mutex.unlock();
-        return switch (self.send_state.status) {
-            .pending => if (self.send_state.pending_approval != null and self.send_state.approval_decision == null) .waiting else .working,
-            .failed => .@"error",
-            else => .idle,
-        };
+        if (self.send_state.status == .pending) {
+            return if (self.send_state.pending_approval != null and self.send_state.approval_decision == null) .waiting else .working;
+        }
+        for (self.background_tasks.items) |task| {
+            if (task.status == .running) return .waiting;
+        }
+        if (self.completion_pending) return .done;
+        return if (self.send_state.status == .failed) .@"error" else .idle;
     }
 
     /// Unix ms when the in-flight send began, or null when no send is pending
@@ -595,7 +601,11 @@ pub const ChatThread = struct {
             std.heap.page_allocator.free(turn_id);
             self.send_state.daemon_turn_id = null;
         }
-        freePendingFollowup(std.heap.page_allocator, &self.send_state.pending_followup);
+        // Steer/queue followups are captured on the main thread with the app
+        // allocator (see storeDraftDuringSend), unlike the worker-owned
+        // page_allocator fields around them; freeing them through
+        // page_allocator panics on alignment.
+        freePendingFollowup(allocator, &self.send_state.pending_followup);
         self.send_state.partial_text.deinit(std.heap.page_allocator);
         freePendingTimelineEvents(std.heap.page_allocator, &self.send_state.pending_events);
         freePendingDiffFiles(std.heap.page_allocator, &self.send_state.pending_diff_files);
@@ -672,6 +682,14 @@ pub const PendingFollowup = struct {
     kind: FollowupKind,
     state: FollowupState = .pending,
     prompt: []u8,
+    images: std.ArrayList(ChatImageAttachment) = .empty,
+
+    pub fn deinit(self: *PendingFollowup, allocator: std.mem.Allocator) void {
+        allocator.free(self.prompt);
+        for (self.images.items) |*image| image.deinit(allocator);
+        self.images.deinit(allocator);
+        self.* = undefined;
+    }
 };
 pub const SendState = struct {
     mutex: Mutex = .{},
@@ -771,6 +789,9 @@ pub const PendingTimelineEvent = struct {
     role: ChatRole,
     author: []u8,
     body: []u8,
+    /// GUI-authored timeline rows, such as an accepted Codex steer, retain
+    /// the attachments that were submitted alongside their text.
+    images: std.ArrayList(ChatImageAttachment) = .empty,
     /// Daemon payload identity when the event carried one (`message` events);
     /// adopted into the projection row so the persistence flush keeps it.
     message_id: ?[]u8 = null,
@@ -783,6 +804,22 @@ pub const PendingTimelineEvent = struct {
     tool_call_error: ?[]u8 = null,
     tool_call_locations: ?[]u8 = null,
     tool_call_raw: ?[]u8 = null,
+
+    pub fn deinit(self: *PendingTimelineEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.author);
+        allocator.free(self.body);
+        for (self.images.items) |*image| image.deinit(allocator);
+        self.images.deinit(allocator);
+        if (self.message_id) |value| allocator.free(value);
+        if (self.tool_call_id) |value| allocator.free(value);
+        if (self.tool_call_title) |value| allocator.free(value);
+        if (self.tool_call_input) |value| allocator.free(value);
+        if (self.tool_call_output) |value| allocator.free(value);
+        if (self.tool_call_error) |value| allocator.free(value);
+        if (self.tool_call_locations) |value| allocator.free(value);
+        if (self.tool_call_raw) |value| allocator.free(value);
+        self.* = undefined;
+    }
 };
 pub const SendResultPayload = struct {
     provider_thread_id: []const u8,
@@ -790,8 +827,8 @@ pub const SendResultPayload = struct {
 };
 
 pub fn freePendingFollowup(allocator: std.mem.Allocator, followup: *?PendingFollowup) void {
-    if (followup.*) |pending| {
-        allocator.free(pending.prompt);
+    if (followup.*) |*pending| {
+        pending.deinit(allocator);
         followup.* = null;
     }
 }
@@ -806,16 +843,8 @@ pub fn freePendingApproval(allocator: std.mem.Allocator, approval: *?PendingAppr
 }
 
 fn freePendingTimelineEvent(allocator: std.mem.Allocator, event: PendingTimelineEvent) void {
-    allocator.free(event.author);
-    allocator.free(event.body);
-    if (event.message_id) |value| allocator.free(value);
-    if (event.tool_call_id) |value| allocator.free(value);
-    if (event.tool_call_title) |value| allocator.free(value);
-    if (event.tool_call_input) |value| allocator.free(value);
-    if (event.tool_call_output) |value| allocator.free(value);
-    if (event.tool_call_error) |value| allocator.free(value);
-    if (event.tool_call_locations) |value| allocator.free(value);
-    if (event.tool_call_raw) |value| allocator.free(value);
+    var owned = event;
+    owned.deinit(allocator);
 }
 
 fn freePendingTimelineEvents(allocator: std.mem.Allocator, events: *std.ArrayListUnmanaged(PendingTimelineEvent)) void {
@@ -861,6 +890,26 @@ test "chat activity distinguishes approval waiting from working" {
     thread.send_state.status = .failed;
     try std.testing.expectEqual(ChatActivityStatus.@"error", thread.activityStatusForUi());
     thread.completion_pending = true;
+    try std.testing.expectEqual(ChatActivityStatus.done, thread.activityStatusForUi());
+}
+
+test "chat activity waits for running background work" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Background activity");
+    defer thread.deinit(allocator);
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "background task"),
+        .status = .running,
+    });
+
+    thread.completion_pending = true;
+    try std.testing.expectEqual(ChatActivityStatus.waiting, thread.activityStatusForUi());
+
+    thread.send_state.status = .pending;
+    try std.testing.expectEqual(ChatActivityStatus.working, thread.activityStatusForUi());
+
+    thread.send_state.status = .completed;
+    thread.background_tasks.items[0].status = .completed;
     try std.testing.expectEqual(ChatActivityStatus.done, thread.activityStatusForUi());
 }
 

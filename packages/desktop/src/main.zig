@@ -2095,6 +2095,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (event.button.button == 1 and !event.button.down and state.palette_modal_pointer_captured) {
+                _ = ui_layout.handlePaletteMouseButton(state, event.button.x, event.button.y, false, event.button.clicks);
                 state.palette_modal_pointer_captured = false;
                 state.modal_text_drag_active = false;
                 state.endImageModalPan();
@@ -2124,6 +2125,27 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             // Composer popovers overlay the panes; clicks on (or dismissing)
             // them must not fall through to workspace/transcript handlers.
             if (state.routeComposerPopoverMouseButton(&event.button, ui_scale)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            // The sidebar context menu is a Palette overlay and can extend
+            // across workspace panes when the rail is collapsed. Route its
+            // clicks, and the right-click that opens it, before pane/browser
+            // content so the visual top layer also owns pointer input.
+            if (event.button.button == 1 and event.button.down and state.sidebar_context_menu_open and
+                !sidebar_ui.pointerOverSidebar(event.button.x, event.button.y))
+            {
+                state.closeSidebarContextMenu();
+            }
+            if (event.button.button == 1 and event.button.down and state.sidebar_context_menu_open and
+                sidebar_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down))
+            {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (event.button.down and event.button.button == sidebar_ui.palette_mouse_button_secondary and
+                sidebar_ui.handlePaletteSecondaryMouseButton(state, event.button.x, event.button.y, event.button.down))
+            {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -2178,23 +2200,6 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 state.unfocusBrowserPane();
             }
             if (handled) {
-                syncWindowTextInput(window, state);
-                return true;
-            }
-            if (event.button.button == 1 and event.button.down and state.sidebar_context_menu_open and
-                !sidebar_ui.pointerOverSidebar(event.button.x, event.button.y))
-            {
-                state.closeSidebarContextMenu();
-            }
-            if (event.button.button == 1 and event.button.down and state.sidebar_context_menu_open and
-                sidebar_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down))
-            {
-                syncWindowTextInput(window, state);
-                return true;
-            }
-            if (event.button.down and event.button.button == sidebar_ui.palette_mouse_button_secondary and
-                sidebar_ui.handlePaletteSecondaryMouseButton(state, event.button.x, event.button.y, event.button.down))
-            {
                 syncWindowTextInput(window, state);
                 return true;
             }

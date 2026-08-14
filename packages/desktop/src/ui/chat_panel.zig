@@ -23,6 +23,8 @@ const terminal_panel = @import("terminal_panel.zig");
 const text_measure = @import("text_measure.zig");
 const theme = @import("theme.zig");
 
+const log = std.log.scoped(.chat_panel);
+
 const TOP_BAR_HEIGHT: f32 = 57.0; // ~70% of legacy 82px cap
 const WORKSPACE_HEADER_ICON_CONTROL_CSS: f32 = 30.0;
 const WORKSPACE_HEADER_CHEVRON_CONTROL_CSS: f32 = 22.0;
@@ -788,6 +790,12 @@ fn scrollTranscriptByWheel(state: *app_state.AppState, pane_id: ?app_state.Works
     state.transcript_controller.focused = true;
     _ = state.acknowledgeFocusedChatCompletion();
     const current = currentTranscriptScrollY(state, pane_id) orelse fallback_scroll_y;
+    if (wheel_y > 0.0 and current <= theme.scaledUi(TRANSCRIPT_WHEEL_PIXELS * 2.0)) {
+        _ = state.loadOlderCurrentThreadMessages() catch |err| {
+            log.warn("failed to page older transcript rows: {s}", .{@errorName(err)});
+            return;
+        };
+    }
     const delta = -wheel_y * theme.scaledUi(TRANSCRIPT_WHEEL_PIXELS);
     rememberTranscriptScroll(state, pane_id, snapTranscriptScrollY(current + delta, null));
     state.transcript_controller.auto_follow_pending = false;
@@ -964,6 +972,12 @@ fn transcriptMarkdownBubbleHit(
     const clip = transcript_hit.clip;
     if (column.w <= 0 or !rectContains(clip, mouse_x, mouse_y)) return null;
 
+    const unloaded_thread = state.currentThread();
+    if (unloaded_thread.messages.items.len == 0 and unloaded_thread.persisted_message_offset > 0) {
+        _ = state.loadOlderCurrentThreadMessages() catch |err| {
+            log.warn("failed to hydrate transcript tail: {s}", .{@errorName(err)});
+        };
+    }
     const thread = state.currentThread();
     const scroll_y = transcript_hit.scroll_y;
     const content_offset_y = mouse_y - column.y + scroll_y;
@@ -1001,7 +1015,8 @@ fn transcriptMarkdownBubbleHit(
             continue;
         }
         const pending_msg_idx = base_idx + pi;
-        const item_h = transcriptMessageHeight(null, null, event.body, event.role, column.w, event.author, false);
+        const item_h = transcriptMessageHeight(null, null, event.body, event.role, column.w, event.author, false) +
+            transcriptImageBlockHeightFor(event.role, event.images.items.len, column.w);
         if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
             content_y += item_h + theme.scaledUi(12.0);
             pi += 1;
@@ -1068,7 +1083,8 @@ fn transcriptMarkdownBubbleLinkHit(
             pi = group_end;
             continue;
         }
-        const item_h = transcriptMessageHeight(null, null, event.body, event.role, column.w, event.author, false);
+        const item_h = transcriptMessageHeight(null, null, event.body, event.role, column.w, event.author, false) +
+            transcriptImageBlockHeightFor(event.role, event.images.items.len, column.w);
         if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
             content_y += item_h + theme.scaledUi(12.0);
             pi += 1;
@@ -1879,6 +1895,11 @@ fn transcriptScrollNearBottom(scroll_y: f32, max_scroll: f32) bool {
     return (max_scroll - scroll_y) <= theme.scaledUi(72.0);
 }
 
+fn transcriptShouldFollowTail(active_geometry: bool, implicit_cold_tail_follow: bool, auto_follow_pending: bool, scroll_to_bottom_frames: u8) bool {
+    return implicit_cold_tail_follow or
+        (active_geometry and (auto_follow_pending or scroll_to_bottom_frames > 0));
+}
+
 fn currentTranscriptScrollY(state: *const app_state.AppState, pane_id: ?app_state.WorkspacePaneId) ?f32 {
     if (pane_id) |id| return state.workspaceChatTranscriptScrollY(id);
     return state.currentTranscriptScrollY();
@@ -1959,7 +1980,18 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
         state.transcript_controller.palette_clip = clip;
     }
 
-    const thread = state.currentThread();
+    var thread = state.currentThread();
+
+    // A daemon projection refresh swaps in threads whose transcript tail is
+    // paged out (persisted offset set, no in-memory rows). Rehydrate during
+    // render so history reappears immediately; the event-path loaders alone
+    // left an open pane blank until the next mouse hit-test.
+    if (thread.messages.items.len == 0 and thread.persisted_message_offset > 0) {
+        _ = state.loadOlderCurrentThreadMessages() catch |err| {
+            log.warn("failed to hydrate transcript tail during render: {s}", .{@errorName(err)});
+        };
+        thread = state.currentThread();
+    }
 
     if (thread.messages.items.len == 0 and !thread.isSendPendingForUi() and state.currentThreadPendingSlashCommandLabel() == null) {
         if (active_geometry) state.transcript_controller.palette_scroll_y = 0.0;
@@ -1977,7 +2009,8 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
     }
 
     const cold_tail_follow = !thread.transcript_layout_visible_ready;
-    const content_height = transcriptContentHeight(state, thread, column.w, column.h, currentTranscriptScrollY(state, pane_id));
+    const saved_scroll_before_layout = currentTranscriptScrollY(state, pane_id);
+    const content_height = transcriptContentHeight(state, thread, column.w, column.h, pane_id, saved_scroll_before_layout);
     // Materializing older rows shifts content coordinates (the estimated
     // history above the viewport changes height) and rebases saved offsets;
     // read the anchor only after the layout pass so this frame renders the
@@ -2023,12 +2056,18 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
         mutable_thread.transcript_layout_requested_height = @max(mutable_thread.transcript_layout_requested_height, requested_height);
     }
 
-    updateTranscriptAutoFollowPalette(state, has_pending_stream, max_scroll, scroll_y);
+    if (active_geometry) updateTranscriptAutoFollowPalette(state, has_pending_stream, max_scroll, scroll_y);
 
-    if (implicit_cold_tail_follow or state.transcript_controller.auto_follow_pending or state.transcript_controller.scroll_to_bottom_frames > 0) {
+    const follow_tail = transcriptShouldFollowTail(
+        active_geometry,
+        implicit_cold_tail_follow,
+        state.transcript_controller.auto_follow_pending,
+        state.transcript_controller.scroll_to_bottom_frames,
+    );
+    if (follow_tail) {
         scroll_y = max_scroll;
     }
-    if (!thread.transcript_layout_valid) {
+    if (!thread.transcript_layout_valid and !follow_tail) {
         // Until an earlier region is ready, clamp to the exact suffix rather
         // than exposing an estimated blank. Each continuation frame moves the
         // boundary upward by one newly materialized row.
@@ -2039,10 +2078,10 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
         const materialized_top = @max(0.0, estimated_height - thread.transcript_layout_committed_height);
         scroll_y = @max(scroll_y, materialized_top);
     }
-    if (thread.transcript_layout_visible_ready and state.transcript_controller.scroll_to_bottom_frames > 0) {
+    if (active_geometry and thread.transcript_layout_visible_ready and state.transcript_controller.scroll_to_bottom_frames > 0) {
         state.transcript_controller.scroll_to_bottom_frames -= 1;
     }
-    if (state.transcript_controller.scroll_to_bottom_frames == 0 and !has_pending_stream) {
+    if (active_geometry and state.transcript_controller.scroll_to_bottom_frames == 0 and !has_pending_stream) {
         state.transcript_controller.auto_follow_pending = false;
     }
     // A missing saved offset means "follow the tail", not "save this frame's
@@ -2135,7 +2174,22 @@ test "implicit transcript tail follow survives changing cold-layout estimates" {
     try std.testing.expect(shouldImplicitlyFollowColdTail(true, null, false));
 }
 
-fn transcriptContentHeight(state: *app_state.AppState, thread: anytype, width: f32, viewport_height: f32, saved_scroll: ?f32) f32 {
+test "inactive chat panes cannot consume another pane's tail-follow request" {
+    try std.testing.expect(transcriptShouldFollowTail(true, false, true, 0));
+    try std.testing.expect(transcriptShouldFollowTail(true, false, false, 8));
+    try std.testing.expect(!transcriptShouldFollowTail(false, false, true, 8));
+    // A newly materialized inactive pane still follows its own semantic tail.
+    try std.testing.expect(transcriptShouldFollowTail(false, true, false, 0));
+}
+
+fn transcriptContentHeight(
+    state: *app_state.AppState,
+    thread: anytype,
+    width: f32,
+    viewport_height: f32,
+    pane_id: ?app_state.WorkspacePaneId,
+    saved_scroll: ?f32,
+) f32 {
     const visible_height = viewport_height * (1.0 + TRANSCRIPT_LAYOUT_VISIBLE_MARGIN_FRAC);
     var requested_height = visible_height;
     if (thread.transcript_layout_message_count > 0) {
@@ -2148,7 +2202,7 @@ fn transcriptContentHeight(state: *app_state.AppState, thread: anytype, width: f
             requested_height = @max(requested_height, thread.transcript_layout_requested_height);
         }
     }
-    ensureTranscriptLayout(state, width, visible_height, requested_height);
+    ensureTranscriptLayout(state, width, visible_height, requested_height, pane_id, saved_scroll);
     const committed_height = estimatedPartialTranscriptHeight(thread);
     var total = theme.scaledUi(4.0) + committed_height;
     total += transcriptPendingSlashCommandHeight(state, width);
@@ -2261,7 +2315,14 @@ fn transcriptLayoutVariantHash(state: *app_state.AppState) u64 {
     return hasher.final();
 }
 
-fn ensureTranscriptLayout(state: *app_state.AppState, width: f32, visible_height: f32, requested_height: f32) void {
+fn ensureTranscriptLayout(
+    state: *app_state.AppState,
+    width: f32,
+    visible_height: f32,
+    requested_height: f32,
+    pane_id: ?app_state.WorkspacePaneId,
+    saved_scroll: ?f32,
+) void {
     const thread = state.currentThreadMutable();
     const scale = theme.uiScaleFactor();
     const variant_hash = transcriptLayoutVariantHash(state);
@@ -2275,10 +2336,15 @@ fn ensureTranscriptLayout(state: *app_state.AppState, width: f32, visible_height
     }
 
     const estimate_before = estimatedPartialTranscriptHeight(thread);
+    const layout_covers_current_tail = thread.transcript_layout_first_message_index + thread.transcript_layout_message_count == thread.messages.items.len;
     const can_extend = @abs(thread.transcript_layout_width - width) <= 0.5 and
         @abs(thread.transcript_layout_scale - scale) <= 0.001 and
         thread.transcript_layout_variant_hash == variant_hash and
-        thread.transcript_layout_first_message_index + thread.transcript_layout_message_count == thread.messages.items.len;
+        layout_covers_current_tail;
+    const reset_anchor: ?TranscriptLayoutAnchor = if (!can_extend and layout_covers_current_tail)
+        transcriptLayoutAnchor(thread.transcript_layout_items.items, estimate_before, saved_scroll)
+    else
+        null;
     if (!can_extend) {
         thread.transcript_layout_valid = false;
         thread.transcript_layout_items.clearRetainingCapacity();
@@ -2297,10 +2363,16 @@ fn ensureTranscriptLayout(state: *app_state.AppState, width: f32, visible_height
     var rows_built: usize = 0;
     const started_at_ms = unixTimestampMs();
     while (thread.transcript_layout_first_message_index > 0) {
-        if (thread.transcript_layout_visible_ready and thread.transcript_layout_committed_height >= requested_height) break;
-        const visible_region_ready = thread.transcript_layout_committed_height >= visible_height;
-        if (visible_region_ready and thread.transcript_layout_visible_ready and rows_built >= TRANSCRIPT_LAYOUT_ROWS_PER_SLICE) break;
-        if (visible_region_ready and thread.transcript_layout_visible_ready and unixTimestampMs() - started_at_ms >= TRANSCRIPT_LAYOUT_SLICE_BUDGET_MS) break;
+        const reset_anchor_pending = if (reset_anchor) |anchor|
+            thread.transcript_layout_first_message_index > anchor.message_index
+        else
+            false;
+        if (!reset_anchor_pending) {
+            if (thread.transcript_layout_visible_ready and thread.transcript_layout_committed_height >= requested_height) break;
+            const visible_region_ready = thread.transcript_layout_committed_height >= visible_height;
+            if (visible_region_ready and thread.transcript_layout_visible_ready and rows_built >= TRANSCRIPT_LAYOUT_ROWS_PER_SLICE) break;
+            if (visible_region_ready and thread.transcript_layout_visible_ready and unixTimestampMs() - started_at_ms >= TRANSCRIPT_LAYOUT_SLICE_BUDGET_MS) break;
+        }
 
         const before = thread.transcript_layout_first_message_index;
         const previous_index = before - 1;
@@ -2344,12 +2416,17 @@ fn ensureTranscriptLayout(state: *app_state.AppState, width: f32, visible_height
 
     thread.transcript_layout_valid = thread.transcript_layout_first_message_index == 0;
     if (thread.transcript_layout_valid) thread.transcript_layout_visible_ready = true;
+    if (reset_anchor) |anchor| {
+        if (transcriptScrollForLayoutAnchor(thread.transcript_layout_items.items, estimatedPartialTranscriptHeight(thread), anchor)) |anchored_scroll| {
+            rememberTranscriptScroll(state, pane_id, anchored_scroll);
+        }
+    }
     // Extending older history rewrites the estimate for everything above the
     // materialized region, which moves every row's top-relative coordinate by
     // the same amount. Rebase saved offsets by that delta so each anchor keeps
     // its distance from the tail and the viewport keeps the rows it was
-    // showing. Resets (width/scale/variant/message-set changes) invalidate the
-    // old coordinate space entirely, so their anchors are left as-is.
+    // showing. Width/scale/variant resets instead restore the semantic row
+    // anchor above, after rebuilding enough of the suffix at its new geometry.
     if (can_extend) {
         const estimate_delta = estimatedPartialTranscriptHeight(thread) - estimate_before;
         if (estimate_delta != 0.0) state.shiftCurrentTranscriptScroll(estimate_delta);
@@ -2404,6 +2481,62 @@ fn transcriptLayoutItemAtContentY(items: []const chat_types.TranscriptLayoutItem
     const item = items[index];
     if (tail_y < item.top or tail_y > item.top + item.height) return null;
     return item;
+}
+
+const TranscriptLayoutAnchor = struct {
+    message_index: usize,
+    viewport_y: f32,
+};
+
+fn transcriptLayoutAnchor(
+    items: []const chat_types.TranscriptLayoutItem,
+    estimated_height: f32,
+    saved_scroll: ?f32,
+) ?TranscriptLayoutAnchor {
+    const scroll_y = saved_scroll orelse return null;
+    const layout_index = oldestVisibleTranscriptLayoutItem(items, scroll_y - estimated_height) orelse return null;
+    const item = items[layout_index];
+    return .{
+        .message_index = item.message_index,
+        .viewport_y = estimated_height + item.top - scroll_y,
+    };
+}
+
+fn transcriptScrollForLayoutAnchor(
+    items: []const chat_types.TranscriptLayoutItem,
+    estimated_height: f32,
+    anchor: TranscriptLayoutAnchor,
+) ?f32 {
+    for (items) |item| {
+        if (item.message_index != anchor.message_index) continue;
+        return @max(estimated_height + item.top - anchor.viewport_y, 0.0);
+    }
+    return null;
+}
+
+test "transcript width reflow preserves the visible semantic row" {
+    const before_items = [_]chat_types.TranscriptLayoutItem{
+        .{ .message_index = 9, .group_end = 10, .top = -80.0, .height = 68.0 },
+        .{ .message_index = 8, .group_end = 9, .top = -172.0, .height = 80.0 },
+        .{ .message_index = 7, .group_end = 8, .top = -264.0, .height = 80.0 },
+    };
+    const estimate_before: f32 = 1_200.0;
+    const scroll_before: f32 = 1_050.0;
+    const anchor = transcriptLayoutAnchor(&before_items, estimate_before, scroll_before) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 8), anchor.message_index);
+    try std.testing.expectEqual(@as(f32, -22.0), anchor.viewport_y);
+
+    // The wider layout changes both the unfinished-history estimate and every
+    // tail-relative row position. Reusing 1,050px would show another message.
+    const after_items = [_]chat_types.TranscriptLayoutItem{
+        .{ .message_index = 9, .group_end = 10, .top = -56.0, .height = 44.0 },
+        .{ .message_index = 8, .group_end = 9, .top = -116.0, .height = 48.0 },
+        .{ .message_index = 7, .group_end = 8, .top = -176.0, .height = 48.0 },
+    };
+    const estimate_after: f32 = 760.0;
+    const scroll_after = transcriptScrollForLayoutAnchor(&after_items, estimate_after, anchor) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(f32, 666.0), scroll_after);
+    try std.testing.expectEqual(anchor.viewport_y, estimate_after + after_items[1].top - scroll_after);
 }
 
 test "transcript layout hit lookup skips gaps and finds rows logarithmically" {
@@ -2621,7 +2754,8 @@ fn transcriptPendingStreamHeight(state: *app_state.AppState, thread: *const app_
             continue;
         }
         const msg_idx = base + pi;
-        total += transcriptMessageHeight(state, msg_idx, event.body, event.role, column_width, event.author, false) + theme.scaledUi(12.0);
+        total += transcriptMessageHeight(state, msg_idx, event.body, event.role, column_width, event.author, false) +
+            transcriptImageBlockHeightFor(event.role, event.images.items.len, column_width) + theme.scaledUi(12.0);
         pi += 1;
     }
     const stream_text: []const u8 = send_state.partial_text.items;
@@ -2673,7 +2807,8 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
             continue;
         }
         const msg_idx = base_message_index + pi;
-        const item_h = transcriptMessageHeight(state, msg_idx, event.body, event.role, column.w, event.author, false);
+        const item_h = transcriptMessageHeight(state, msg_idx, event.body, event.role, column.w, event.author, false) +
+            transcriptImageBlockHeightFor(event.role, event.images.items.len, column.w);
         if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
             const is_last = pi + 1 == pending_count;
             const is_backgrounded = chat_types.ChatThread.isBackgroundCommandEvent(event.author);
@@ -2692,6 +2827,9 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
             };
             if (y + item_h >= column.y and y <= column.y + column.h) {
                 renderTranscriptBubbleFromParts(state, column, y, item_h, event.role, role_label, event.body, false, false, clip, msg_idx, false, false);
+                const first_image: ?app_state.ChatImageAttachment = if (event.images.items.len > 0) event.images.items[0] else null;
+                const extra_images: []const app_state.ChatImageAttachment = if (event.images.items.len > 1) event.images.items[1..] else &.{};
+                renderTranscriptImagesFromParts(state, column, y, item_h, event.role, first_image, extra_images, clip);
             }
         }
         y += item_h + theme.scaledUi(12.0);
@@ -3070,17 +3208,13 @@ fn transcriptImageCount(message: app_state.ChatMessage) usize {
     return (if (message.image != null) @as(usize, 1) else 0) + message.extra_images.len;
 }
 
-fn transcriptImageAt(message: app_state.ChatMessage, index: usize) ?app_state.ChatImageAttachment {
-    if (index == 0) return message.image;
-    const extra_index = index - 1;
-    if (extra_index >= message.extra_images.len) return null;
-    return message.extra_images[extra_index];
+fn transcriptImageBlockHeight(message: app_state.ChatMessage, column_width: f32) f32 {
+    return transcriptImageBlockHeightFor(message.role, transcriptImageCount(message), column_width);
 }
 
-fn transcriptImageBlockHeight(message: app_state.ChatMessage, column_width: f32) f32 {
-    const count = transcriptImageCount(message);
+fn transcriptImageBlockHeightFor(role: app_state.ChatRole, count: usize, column_width: f32) f32 {
     if (count == 0) return 0.0;
-    const bubble_width = if (message.role == .user) column_width * 0.62 else column_width;
+    const bubble_width = if (role == .user) column_width * 0.62 else column_width;
     const inner_w = @max(bubble_width - theme.scaledUi(28.0), theme.scaledUi(80.0));
     const thumb_h = @max(@min(inner_w * 0.56, theme.scaledUi(220.0)), theme.scaledUi(96.0));
     const gap = theme.scaledUi(10.0);
@@ -3332,20 +3466,36 @@ fn renderProviderFailureActionCard(
 
 // Renders clickable attachment previews beneath a committed chat message.
 fn renderTranscriptImages(state: *app_state.AppState, column: palette.Rect, y: f32, height: f32, message: app_state.ChatMessage, clip: palette.Rect) void {
-    const count = transcriptImageCount(message);
+    renderTranscriptImagesFromParts(state, column, y, height, message.role, message.image, message.extra_images, clip);
+}
+
+fn renderTranscriptImagesFromParts(
+    state: *app_state.AppState,
+    column: palette.Rect,
+    y: f32,
+    height: f32,
+    role: app_state.ChatRole,
+    first_image: ?app_state.ChatImageAttachment,
+    extra_images: []const app_state.ChatImageAttachment,
+    clip: palette.Rect,
+) void {
+    const count = (if (first_image != null) @as(usize, 1) else 0) + extra_images.len;
     if (count == 0) return;
 
-    const bubble_width = if (message.role == .user) column.w * 0.62 else column.w;
-    const bubble_x = if (message.role == .user) column.x + column.w - bubble_width else column.x;
+    const bubble_width = if (role == .user) column.w * 0.62 else column.w;
+    const bubble_x = if (role == .user) column.x + column.w - bubble_width else column.x;
     const pad = theme.scaledUi(14.0);
     const gap = theme.scaledUi(10.0);
     const inner_w = @max(bubble_width - pad * 2.0, theme.scaledUi(80.0));
     const thumb_h = @max(@min(inner_w * 0.56, theme.scaledUi(220.0)), theme.scaledUi(96.0));
-    var image_y = y + height - transcriptImageBlockHeight(message, column.w) + gap;
+    var image_y = y + height - transcriptImageBlockHeightFor(role, count, column.w) + gap;
 
     var index: usize = 0;
     while (index < count) : (index += 1) {
-        const image = transcriptImageAt(message, index) orelse continue;
+        const image = if (first_image) |first|
+            if (index == 0) first else extra_images[index - 1]
+        else
+            extra_images[index];
         const frame = palette.Rect{
             .x = bubble_x + pad,
             .y = image_y,

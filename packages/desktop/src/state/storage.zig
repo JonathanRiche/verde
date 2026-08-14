@@ -93,7 +93,7 @@ pub const PendingAdoptionRepair = struct {
 };
 
 pub const PendingStateSpool = struct {
-    version: u32 = 1,
+    version: u32 = 2,
     capture_revision: u64,
     baseline_revision: ?u64 = null,
     current: PersistedState,
@@ -217,7 +217,7 @@ pub const Storage = struct {
 
     pub fn load(self: *const Storage, allocator: std.mem.Allocator) !?LoadedPersistedState {
         if (self.client) |*client| {
-            if (try client.load(allocator)) |loaded| {
+            if (try client.loadBounded(allocator)) |loaded| {
                 // Pin the durable revision observed in the same RO transaction so
                 // launch-2 does not resend a guard-less bootstrap against a non-empty store.
                 self.noteStoreRevision(loaded.store_revision);
@@ -260,10 +260,23 @@ pub const Storage = struct {
             return empty;
         };
         defer client.deinit();
-        if (try client.load(allocator)) |loaded| return loaded;
+        if (try client.loadBounded(allocator)) |loaded| return loaded;
         var empty = LoadedPersistedState.init(allocator);
         empty.store_revision = try client.storeRevision();
         return empty;
+    }
+
+    pub fn loadMessagePage(
+        self: *const Storage,
+        allocator: std.mem.Allocator,
+        workspace_id: []const u8,
+        local_thread_id: []const u8,
+        before_offset: usize,
+    ) !db_types.LoadedMessagePage {
+        var client = (try openReadOnlyOptional(allocator, self.projection_store_dir)) orelse
+            return error.DatabaseUnavailable;
+        defer client.deinit();
+        return client.loadMessagePage(allocator, workspace_id, local_thread_id, before_offset);
     }
 
     pub fn loadLegacyJson(self: *const Storage, allocator: std.mem.Allocator) !?LoadedPersistedState {
@@ -309,7 +322,7 @@ pub const Storage = struct {
         const value = try std.json.parseFromSliceLeaky(PendingStateSpool, arena.allocator(), bytes, .{
             .allocate = .alloc_always,
         });
-        if (value.version != 1) return error.UnsupportedPendingStateSpoolVersion;
+        if (value.version != 1 and value.version != 2) return error.UnsupportedPendingStateSpoolVersion;
         return .{ .arena = arena, .value = value };
     }
 

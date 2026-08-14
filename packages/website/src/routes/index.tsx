@@ -121,6 +121,11 @@ const MODE_LABELS: Record<string, string> = {
 
 const featureCards = [
   {
+    icon: 'sidebar',
+    title: 'Niri-style scrolling panes',
+    body: 'When a workspace grows past a couple of panes, switch to a horizontal or vertical strip — free-form panning, resizable columns, sidebar reorder, and per-workspace overrides.',
+  },
+  {
     icon: 'browser',
     title: 'Browser + Design Mode',
     body: 'Tile a native webview beside your agent, then point at an element or draw a region and send the visual context directly to a chat or terminal TUI.',
@@ -136,11 +141,6 @@ const featureCards = [
     body: 'Declare your dev server, build watcher, or queue worker once. Start, stop, restart, and inspect them from chat with /stack and /process.',
   },
   {
-    icon: 'sidebar',
-    title: 'Live-state sidebar',
-    body: 'Projects, threads, and running agents in one rail — each pane shows its provider glyph and a live title. Collapse it to a pip rail and watch every agent\'s working / waiting / done status at a glance.',
-  },
-  {
     icon: 'shield',
     title: 'Local-first, no relay',
     body: 'No hosted inference, no proxy, no telemetry sink. Verde talks to the CLIs already on your machine; tokens, transcripts, and files stay put.',
@@ -153,9 +153,9 @@ const featureCards = [
 ]
 
 const paletteRows = [
+  { section: 'App', icon: '⌘', label: 'Scrolling Layout: Always', hint: 'workspace' },
+  { section: 'Panes', icon: '▦', label: 'Next Pane', hint: 'Ctrl+Tab' },
   { section: 'Threads', icon: '◷', label: 'Fix split chat keyboard scrolling', hint: 'kit' },
-  { section: 'Threads', icon: '◷', label: 'Restore GUI thread sync controls', hint: 'verde' },
-  { section: 'Panes', icon: '▦', label: 'Jump to browser pane', hint: 'Ctrl+L' },
   { section: 'Workspaces', icon: '⦿', label: 'kylos-apparel', hint: 'Alt+1' },
   { section: 'App', icon: '⌘', label: 'Toggle embedded browser', hint: 'Ctrl+Shift+B' },
 ]
@@ -165,9 +165,9 @@ const keybinds = [
   { combo: 'Ctrl+T', desc: 'New chat thread' },
   { combo: 'Ctrl+Shift+T', desc: 'Split a terminal pane next to the focus' },
   { combo: 'Ctrl+Shift+B', desc: 'Toggle the embedded browser pane' },
-  { combo: 'Ctrl+H / J / K / L', desc: 'Move focus across panes, vim-style' },
+  { combo: 'Ctrl+H / J / K / L', desc: 'Move focus across panes (and the scrolling strip)' },
+  { combo: 'Ctrl+Tab / Ctrl+Shift+Tab', desc: 'Next / previous pane in sidebar order' },
   { combo: 'Ctrl+Shift+H / J / K / L', desc: 'Swap panes — rearrange the tiling' },
-  { combo: 'Alt+Shift+←↑↓→', desc: 'Resize the focused pane' },
   { combo: 'Alt+Z', desc: 'Zoom the focused pane to fill the workspace' },
   { combo: 'Alt+1 … Alt+9', desc: 'Jump between workspaces by sidebar order' },
   { combo: 'Alt+↑ / Alt+↓', desc: 'Cycle to the previous / next workspace' },
@@ -355,9 +355,9 @@ function App() {
             <p class="lead">
               Verde runs Codex, Claude Code, OpenCode, and Cursor as native
               chat or terminal panes, with Grok Build and Amp terminal TUIs in
-              the same native desktop app. Tile chat, terminal, and browser
-              panes with vim keybinds. No hosted relay — Verde just talks to
-              the CLIs already on your machine.
+              the same native desktop app. Tile or Niri-style scroll chat,
+              terminal, and browser panes with vim keybinds. No hosted relay —
+              Verde just talks to the CLIs already on your machine.
             </p>
 
             <div class="hero-actions">
@@ -449,19 +449,19 @@ function App() {
             <p class="tag tag-static">Tiling workspace</p>
             <h2 class="heading">A workspace, not a chat box.</h2>
             <p class="band-body">
-              Every pane is a first-class window. Split a chat thread beside its
-              browser pane, drop a terminal underneath, and rearrange the tiling
-              with the same muscle memory you use in your window manager.
+              Every pane is a first-class window. Split chat, browser, and
+              terminal side by side — or let Verde scroll them as a Niri-style
+              strip when the workspace fills up. Same vim keybinds either way.
             </p>
             <p class="band-body band-body-muted">
-              Layouts and per-terminal zoom persist across launches. Right-click
-              any terminal to spawn shell tabs, agent launch-profile tabs, or new
-              splits around it.
+              Automatic, always-on, or disabled per workspace. Free-form wheel
+              panning, resizable columns, sidebar reorder, and layouts that
+              persist across launches.
             </p>
           </div>
 
           <div class="feature-visual">
-            {/* Pure-CSS diagram of a tiled workspace: chat + browser over a terminal dock */}
+            {/* Pure-CSS diagram: Niri-style horizontal scrolling strip of panes */}
             <div class="tiling-mock" aria-hidden="true">
               <div class="tm-sidebar">
                 <span class="tm-dot" />
@@ -470,7 +470,7 @@ function App() {
                 <span class="tm-row" />
                 <span class="tm-row tm-row--short" />
               </div>
-              <div class="tm-main">
+              <div class="tm-main tm-main--scroll">
                 <div class="tm-pane tm-pane--chat">
                   <span class="tm-label">chat · claude</span>
                   <span class="tm-line" />
@@ -482,7 +482,7 @@ function App() {
                   <span class="tm-url" />
                   <span class="tm-block" />
                 </div>
-                <div class="tm-pane tm-pane--term">
+                <div class="tm-pane tm-pane--term tm-pane--peek">
                   <span class="tm-label">terminal · zsh</span>
                   <span class="tm-cmd">$ cargo test</span>
                 </div>

@@ -202,6 +202,8 @@ pub const PersistedThread = struct {
     tui_dock_id: ?u32 = null,
     draft: []const u8 = "",
     draft_image: ?PersistedImageAttachment = null,
+    /// Durable sort-index boundary before the bounded `messages` tail.
+    message_offset: usize = 0,
     messages: []const PersistedMessage = &.{},
 };
 
@@ -259,6 +261,16 @@ pub const LoadedState = struct {
     }
 
     pub fn deinit(self: *LoadedState) void {
+        self.arena.deinit();
+    }
+};
+
+pub const LoadedMessagePage = struct {
+    arena: std.heap.ArenaAllocator,
+    offset: usize,
+    messages: []const PersistedMessage,
+
+    pub fn deinit(self: *LoadedMessagePage) void {
         self.arena.deinit();
     }
 };

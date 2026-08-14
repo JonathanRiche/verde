@@ -1191,8 +1191,30 @@ pub const Store = struct {
             \\    key_updated_at_ms integer,
             \\    key_store_revision integer
             \\);
+            \\create temp table if not exists preserved_lazy_messages (
+            \\    workspace_key text not null,
+            \\    thread_key text not null,
+            \\    sort_index integer not null,
+            \\    role integer not null,
+            \\    author text not null,
+            \\    body text not null,
+            \\    image_path text,
+            \\    image_mime text,
+            \\    image_byte_size integer,
+            \\    tool_call_id text,
+            \\    tool_call_kind integer,
+            \\    tool_call_status integer,
+            \\    message_id text,
+            \\    created_at_ms integer,
+            \\    updated_at_ms integer,
+            \\    key_fingerprint text,
+            \\    key_created_at_ms integer,
+            \\    key_updated_at_ms integer,
+            \\    key_store_revision integer
+            \\);
             \\delete from preserved_chat_threads;
             \\delete from preserved_chat_messages;
+            \\delete from preserved_lazy_messages;
             \\delete from preserved_workspaces;
         );
         try self.conn.exec(
@@ -1245,6 +1267,28 @@ pub const Store = struct {
             \\);
         );
 
+        // A bounded GUI projection explicitly declares how many older rows it
+        // omitted. Preserve that exact prefix, including legacy null-id rows,
+        // while the loaded tail is replaced at its original sort indexes.
+        for (snapshot.workspaces) |workspace| {
+            for (workspace.threads) |thread| {
+                if (thread.message_offset == 0 or thread.local_thread_id.len == 0) continue;
+                try self.conn.exec(
+                    \\insert into preserved_lazy_messages
+                    \\select w.workspace_id, t.local_thread_id, m.sort_index, m.role, m.author, m.body,
+                    \\       m.image_path, m.image_mime, m.image_byte_size,
+                    \\       m.tool_call_id, m.tool_call_kind, m.tool_call_status,
+                    \\       m.message_id, m.created_at_ms, m.updated_at_ms,
+                    \\       k.message_fingerprint, k.created_at_ms, k.updated_at_ms, k.store_revision
+                    \\from messages m
+                    \\join threads t on t.id = m.thread_id
+                    \\join workspaces w on w.id = t.workspace_id
+                    \\left join client_message_keys k on k.thread_id = m.thread_id and k.message_id = m.message_id
+                    \\where w.workspace_id = ?1 and t.local_thread_id = ?2 and m.sort_index < ?3
+                , .{ workspace.workspace_id, thread.local_thread_id, @as(i64, @intCast(thread.message_offset)) });
+            }
+        }
+
         // Surface and chat completion rows stay out of the wipe: targeted
         // daemon mutations own both ledgers post-flip. Snapshot rows may merge
         // through upsert below, while omission from a GUI compatibility
@@ -1294,6 +1338,7 @@ pub const Store = struct {
         try self.conn.execNoArgs(
             \\delete from preserved_chat_threads;
             \\delete from preserved_chat_messages;
+            \\delete from preserved_lazy_messages;
             \\delete from preserved_workspaces;
         );
     }
@@ -1349,6 +1394,33 @@ pub const Store = struct {
             \\where not exists (
             \\    select 1 from workspaces w3 where w3.workspace_id = p.workspace_id
             \\);
+        );
+        try self.conn.execNoArgs(
+            \\insert into messages (thread_id, sort_index, role, author, body, image_path, image_mime,
+            \\                      image_byte_size, tool_call_id, tool_call_kind, tool_call_status,
+            \\                      message_id, created_at_ms, updated_at_ms)
+            \\select t.id, p.sort_index, p.role, p.author, p.body, p.image_path, p.image_mime,
+            \\       p.image_byte_size, p.tool_call_id, p.tool_call_kind, p.tool_call_status,
+            \\       p.message_id, p.created_at_ms, p.updated_at_ms
+            \\from temp.preserved_lazy_messages p
+            \\join workspaces w on w.workspace_id = p.workspace_key
+            \\join threads t on t.workspace_id = w.id and t.local_thread_id = p.thread_key
+            \\where not exists (
+            \\    select 1 from messages m3
+            \\    where m3.thread_id = t.id and m3.sort_index = p.sort_index
+            \\);
+            \\insert into client_message_keys (thread_id, message_id, message_fingerprint, sort_index,
+            \\                                 created_at_ms, updated_at_ms, store_revision)
+            \\select t.id, p.message_id, p.key_fingerprint, p.sort_index,
+            \\       p.key_created_at_ms, p.key_updated_at_ms, p.key_store_revision
+            \\from temp.preserved_lazy_messages p
+            \\join workspaces w on w.workspace_id = p.workspace_key
+            \\join threads t on t.workspace_id = w.id and t.local_thread_id = p.thread_key
+            \\where p.message_id is not null and p.key_fingerprint is not null
+            \\  and not exists (
+            \\      select 1 from client_message_keys k2
+            \\      where k2.thread_id = t.id and k2.message_id = p.message_id
+            \\  );
         );
         try self.conn.execNoArgs(
             \\insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id,
@@ -1490,6 +1562,7 @@ pub const Store = struct {
             thread.draft,
             thread.draft_image,
             thread.draft_images,
+            0,
             &.{},
             null,
         );
@@ -1961,6 +2034,7 @@ pub const Store = struct {
                 draft,
                 null,
                 &.{},
+                0,
                 legacy_messages,
                 store_revision,
             );
@@ -1986,6 +2060,7 @@ pub const Store = struct {
                     thread.draft,
                     thread.draft_image,
                     thread.draft_images,
+                    thread.message_offset,
                     thread.messages,
                     store_revision,
                 );
@@ -2014,6 +2089,7 @@ pub const Store = struct {
         draft: []const u8,
         draft_image: ?store_protocol.Attachment,
         draft_images: []const store_protocol.Attachment,
+        message_offset: usize,
         messages: []const store_protocol.Message,
         store_revision: ?i64,
     ) !void {
@@ -2052,9 +2128,10 @@ pub const Store = struct {
         );
         const thread_row_id = self.conn.lastInsertedRowId();
         for (messages, 0..) |message, message_index| {
-            try self.insertMessage(thread_row_id, @intCast(message_index), message);
+            const durable_index = message_offset + message_index;
+            try self.insertMessage(thread_row_id, @intCast(durable_index), message);
             if (store_revision) |revision| {
-                if (message.message_id.len != 0) try self.insertMessageKey(thread_row_id, @intCast(message_index), message, revision);
+                if (message.message_id.len != 0) try self.insertMessageKey(thread_row_id, @intCast(durable_index), message, revision);
             }
         }
     }
@@ -4563,6 +4640,65 @@ test "snapshot replace tolerates duplicate message ids by refreshing in place" {
     )).?;
     defer key_rows.deinit();
     try std.testing.expectEqual(@as(i64, 1), key_rows.int(0));
+}
+
+test "bounded snapshot preserves unloaded legacy transcript prefix" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("lazy-workspace", null),
+        .workspace = testWorkspace("ws-lazy", "Lazy workspace"),
+    });
+
+    const initial_messages = [_]store_protocol.Message{
+        .{ .role = "user", .author = "You", .body = "old zero" },
+        .{ .role = "assistant", .author = "Assistant", .body = "old one" },
+        .{ .role = "assistant", .author = "Assistant", .body = "old two" },
+    };
+    var initial_thread = testThread("thread-lazy", "Lazy thread");
+    initial_thread.messages = &initial_messages;
+    var initial_workspace = testWorkspace("ws-lazy", "Lazy workspace");
+    initial_workspace.threads = &.{initial_thread};
+    _ = try store.applyMutation(.{ .snapshot_replace = testSnapshotRequest(
+        "lazy-full",
+        1,
+        false,
+        testSnapshot(&.{initial_workspace}),
+    ) });
+
+    const tail = [_]store_protocol.Message{.{
+        .role = "assistant",
+        .author = "Assistant",
+        .body = "updated two",
+    }};
+    var bounded_thread = testThread("thread-lazy", "Lazy thread");
+    bounded_thread.message_offset = 2;
+    bounded_thread.messages = &tail;
+    var bounded_workspace = testWorkspace("ws-lazy", "Lazy workspace");
+    bounded_workspace.threads = &.{bounded_thread};
+    _ = try store.applyMutation(.{ .snapshot_replace = testSnapshotRequest(
+        "lazy-tail",
+        2,
+        false,
+        testSnapshot(&.{bounded_workspace}),
+    ) });
+
+    var rows = try store.conn.rows("select sort_index, body from messages order by sort_index", .{});
+    defer rows.deinit();
+    const expected = [_][]const u8{ "old zero", "old one", "updated two" };
+    var index: usize = 0;
+    while (rows.next()) |row| : (index += 1) {
+        try std.testing.expect(index < expected.len);
+        try std.testing.expectEqual(@as(i64, @intCast(index)), row.int(0));
+        try std.testing.expectEqualStrings(expected[index], row.text(1));
+    }
+    if (rows.err) |err| return err;
+    try std.testing.expectEqual(expected.len, index);
 }
 
 // M4-P4 fix Layer B (ii): a mid-window snapshot (commit → GUI observation gap)
