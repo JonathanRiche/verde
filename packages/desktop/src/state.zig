@@ -312,7 +312,10 @@ fn changeCursorSignalsForTopic(topic: []const u8) ChangeCursorSignals {
 
 const ChangeCursorPollOutcome = enum { advanced, heartbeat, snapshot_required, busy, unavailable };
 
-fn fetchOwnedCompositeSnapshot(storage: *const Storage) ?*OwnedProjectionRefresh {
+/// On null, `failure_reason` names the exact silent arm for the caller's
+/// streak logging (static strings only; safe across the arena teardown).
+fn fetchOwnedCompositeSnapshot(storage: *const Storage, failure_reason: *[]const u8) ?*OwnedProjectionRefresh {
+    failure_reason.* = "refresh allocation failed";
     const refresh = OwnedProjectionRefresh.create(storage.allocator) catch return null;
     var refresh_owned = true;
     defer if (refresh_owned) refresh.deinit();
@@ -334,18 +337,24 @@ fn fetchOwnedCompositeSnapshot(storage: *const Storage) ?*OwnedProjectionRefresh
         headless.store.SNAPSHOT_SCOPE_TURNS,
     };
     const request: headless.store.CoreSnapshotRequest = .{ .scopes = &scopes };
+    failure_reason.* = "core.snapshot transport call failed";
     var parsed = client.call(headless.store.METHOD_CORE_SNAPSHOT, request) catch return null;
     defer parsed.deinit();
+    failure_reason.* = "core.snapshot returned an error response";
     if (!parsed.response.isOk()) return null;
+    failure_reason.* = "core.snapshot decode failed";
     refresh.result = client.decodeCompositeSnapshot(&parsed) catch return null;
     if (refresh.result.incomplete_scopes.len != 0 or
         refresh.result.envelope == null or
         refresh.result.change_cursor == null)
     {
+        failure_reason.* = "core.snapshot incomplete (missing scopes, envelope, or cursor)";
         return null;
     }
+    failure_reason.* = "durable projection load failed";
     var durable = storage.loadProjection(storage.allocator) catch return null;
     if (durable.store_revision < refresh.result.store_revision) {
+        failure_reason.* = "durable store behind live daemon revision";
         durable.deinit();
         return null;
     }
@@ -399,7 +408,11 @@ fn pollCoreChangesOnce(storage: *const Storage, loop: *ChangeCursorLoopState, cu
     }
     var signals: ChangeCursorSignals = .{};
     for (result.entries) |entry| signals.merge(changeCursorSignalsForTopic(entry.topic));
-    const refresh = fetchOwnedCompositeSnapshot(storage) orelse return .unavailable;
+    var fetch_reason: []const u8 = "";
+    const refresh = fetchOwnedCompositeSnapshot(storage, &fetch_reason) orelse {
+        log.warn("change-cursor snapshot after journal entries failed: {s}", .{fetch_reason});
+        return .unavailable;
+    };
     if (!loop.publishRefresh(refresh)) {
         refresh.deinit();
         return .unavailable;
@@ -411,10 +424,11 @@ fn pollCoreChangesOnce(storage: *const Storage, loop: *ChangeCursorLoopState, cu
 /// The single composite core.snapshot (bootstrap and every fallback). The
 /// daemon captures the journal cursor BEFORE both state reads, so a cursor
 /// seeded from the result can only over-deliver relative to the snapshot.
-fn fetchCompositeSnapshotSeed(storage: *const Storage, loop: *ChangeCursorLoopState) bool {
-    const refresh = fetchOwnedCompositeSnapshot(storage) orelse return false;
+fn fetchCompositeSnapshotSeed(storage: *const Storage, loop: *ChangeCursorLoopState, failure_reason: *[]const u8) bool {
+    const refresh = fetchOwnedCompositeSnapshot(storage, failure_reason) orelse return false;
     if (!loop.publishRefresh(refresh)) {
         refresh.deinit();
+        failure_reason.* = "previous refresh still pending in bridge";
         return false;
     }
     // The frame applies the payload before it publishes the seed cursor.
@@ -426,7 +440,14 @@ fn fetchCompositeSnapshotSeed(storage: *const Storage, loop: *ChangeCursorLoopSt
 /// keeps startup non-blocking: the desktop renders its last persisted state
 /// while this thread retries in the background (no local authority claims).
 fn changeCursorLoopMain(storage: *const Storage, loop: *ChangeCursorLoopState) void {
+    log.info("change-cursor loop started", .{});
     var backoff_ms: u64 = CHANGE_CURSOR_RETRY_MIN_MS;
+    // Streak counters keep every previously-silent retry arm observable
+    // without letting a long daemon outage spam the log (first failure, then
+    // roughly every two minutes at max backoff).
+    var seed_failures: u64 = 0;
+    var poll_failures: u64 = 0;
+    var pending_spins: u64 = 0;
     while (!loop.shutdown.load(.acquire)) {
         if (loop.takeRefreshApplication()) |applied| {
             if (applied) {
@@ -437,12 +458,27 @@ fn changeCursorLoopMain(storage: *const Storage, loop: *ChangeCursorLoopState) v
             }
         }
         if (loop.refreshPending()) {
+            // The frame drains the bridge every pollSend; a long spin here
+            // means the main thread stopped consuming published refreshes.
+            pending_spins += 1;
+            if (pending_spins % 200 == 0) {
+                log.warn(
+                    "published projection refresh undrained by frame for ~{d}ms",
+                    .{pending_spins * CHANGE_CURSOR_SHUTDOWN_SLICE_MS},
+                );
+            }
             changeCursorSleep(loop, CHANGE_CURSOR_SHUTDOWN_SLICE_MS);
             continue;
         }
+        pending_spins = 0;
         if (loop.requestedProjectionRevision()) |requested_revision| {
             if (storage.currentProjectionObservedRevision() < requested_revision) {
-                const refresh = fetchOwnedCompositeSnapshot(storage) orelse {
+                var fetch_reason: []const u8 = "";
+                const refresh = fetchOwnedCompositeSnapshot(storage, &fetch_reason) orelse {
+                    log.warn(
+                        "change-cursor refresh for requested revision {d} failed: {s}",
+                        .{ requested_revision, fetch_reason },
+                    );
                     loop.markProjectionRefreshUnavailable(requested_revision);
                     changeCursorSleep(loop, backoff_ms);
                     backoff_ms = @min(backoff_ms * 2, CHANGE_CURSOR_RETRY_MAX_MS);
@@ -459,7 +495,12 @@ fn changeCursorLoopMain(storage: *const Storage, loop: *ChangeCursorLoopState) v
             }
         }
         if (storage.currentChangeCursorForPoll()) |cursor| {
-            switch (pollCoreChangesOnce(storage, loop, cursor)) {
+            const outcome = pollCoreChangesOnce(storage, loop, cursor);
+            if (outcome != .unavailable and poll_failures != 0) {
+                log.info("core.changes poll recovered after {d} failed attempts", .{poll_failures});
+                poll_failures = 0;
+            }
+            switch (outcome) {
                 // Publication is not success: the frame reports whether the
                 // complete generation applied transactionally.
                 .advanced => {},
@@ -469,17 +510,36 @@ fn changeCursorLoopMain(storage: *const Storage, loop: *ChangeCursorLoopState) v
                 .snapshot_required => backoff_ms = CHANGE_CURSOR_RETRY_MIN_MS,
                 .busy => changeCursorSleep(loop, CHANGE_CURSOR_BUSY_RETRY_MS),
                 .unavailable => {
+                    poll_failures += 1;
+                    if (poll_failures == 1 or poll_failures % 24 == 0) {
+                        log.warn("core.changes poll unavailable (attempt {d})", .{poll_failures});
+                    }
                     changeCursorSleep(loop, backoff_ms);
                     backoff_ms = @min(backoff_ms * 2, CHANGE_CURSOR_RETRY_MAX_MS);
                 },
             }
-        } else if (fetchCompositeSnapshotSeed(storage, loop)) {
-            // Wait for the frame's application report before resetting.
         } else {
-            changeCursorSleep(loop, backoff_ms);
-            backoff_ms = @min(backoff_ms * 2, CHANGE_CURSOR_RETRY_MAX_MS);
+            var seed_reason: []const u8 = "";
+            if (fetchCompositeSnapshotSeed(storage, loop, &seed_reason)) {
+                // Wait for the frame's application report before resetting.
+                if (seed_failures != 0) {
+                    log.info("change-cursor bootstrap recovered after {d} failed attempts", .{seed_failures});
+                    seed_failures = 0;
+                }
+            } else {
+                seed_failures += 1;
+                if (seed_failures == 1 or seed_failures % 24 == 0) {
+                    log.warn(
+                        "change-cursor bootstrap failing (attempt {d}): {s}",
+                        .{ seed_failures, seed_reason },
+                    );
+                }
+                changeCursorSleep(loop, backoff_ms);
+                backoff_ms = @min(backoff_ms * 2, CHANGE_CURSOR_RETRY_MAX_MS);
+            }
         }
     }
+    log.info("change-cursor loop exiting", .{});
 }
 
 fn changeCursorSleep(loop: *ChangeCursorLoopState, total_ms: u64) void {
@@ -551,6 +611,7 @@ fn snapshotThreadToPersisted(
         .tui_dock_id = thread.tui_dock_id,
         .draft = thread.draft,
         .draft_image = snapshotAttachment(thread.draft_image),
+        .message_offset = thread.message_offset,
         .messages = try snapshotMessagesToPersisted(allocator, thread.messages),
     };
 }
@@ -709,6 +770,30 @@ fn overlayCurrentThreadEdits(
     if (!optionalImageEqual(current.draft_image, baseline.draft_image)) remote.draft_image = current.draft_image;
 }
 
+fn overlayCurrentThreadMessages(
+    allocator: std.mem.Allocator,
+    remote: *PersistedThread,
+    baseline: PersistedThread,
+    current: PersistedThread,
+) !void {
+    // Compact baselines encode the durable end position in message_offset.
+    // Only rows after that point are proven local additions. A concurrent
+    // remote refresh may already contain part of the suffix, so append from
+    // the greatest absolute end observed by either side.
+    const baseline_end = baseline.message_offset + baseline.messages.len;
+    const current_end = current.message_offset + current.messages.len;
+    if (current_end <= baseline_end) return;
+    const remote_end = remote.message_offset + remote.messages.len;
+    const append_from = @max(@max(baseline_end, remote_end), current.message_offset);
+    if (append_from >= current_end) return;
+
+    var merged: std.ArrayList(PersistedMessage) = .empty;
+    defer merged.deinit(allocator);
+    try merged.appendSlice(allocator, remote.messages);
+    try merged.appendSlice(allocator, current.messages[append_from - current.message_offset ..]);
+    remote.messages = try merged.toOwnedSlice(allocator);
+}
+
 fn mergeCurrentThreads(
     allocator: std.mem.Allocator,
     remote: *PersistedProject,
@@ -737,11 +822,11 @@ fn mergeCurrentThreads(
             if (remote_index == null) try merged.append(allocator, current_thread);
             continue;
         }
-        if (remote_index) |index| overlayCurrentThreadEdits(
-            &merged.items[index],
-            baseline_threads[baseline_index.?],
-            current_thread,
-        );
+        if (remote_index) |index| {
+            const base_thread = baseline_threads[baseline_index.?];
+            overlayCurrentThreadEdits(&merged.items[index], base_thread, current_thread);
+            try overlayCurrentThreadMessages(allocator, &merged.items[index], base_thread, current_thread);
+        }
         // If remote omitted an identity present in the baseline, that is a
         // remote deletion and wins over local edits to the old thread.
     }
@@ -2403,6 +2488,8 @@ pub const AppState = struct {
     /// M5-P4 change-cursor thread bridge (worker + coalesced signals).
     /// Defaulted so the loop lazily starts from the first pollSend frame.
     change_cursor_loop: ChangeCursorLoopState = .{},
+    /// One warn per failure streak from the per-frame lazy spawn path.
+    change_cursor_spawn_failure_logged: bool = false,
     /// Edge detector for the daemon-projection stale sidebar indicator.
     daemon_projection_stale_notified: bool = false,
     /// Dedicated synchronization status, independent of generic notices.
@@ -2543,7 +2630,7 @@ pub const AppState = struct {
         if (try storage.load(allocator)) |persisted_value| {
             var persisted = persisted_value;
             defer persisted.deinit();
-            var projection_baseline = try state.clonePersistedState(allocator, persisted.value);
+            var projection_baseline = try persistence.clonePersistedBaseline(allocator, persisted.value);
             errdefer projection_baseline.deinit();
             if (pending_spool) |*spool| {
                 if (spool.value.baseline) |baseline| {
@@ -2594,10 +2681,10 @@ pub const AppState = struct {
             state.lifecycle.projection_baseline_revision = storage.currentProjectionObservedRevision();
             try state.seedDefaultState();
         }
-        // Launch reconciliation is cursor-driven: the owned composite result
-        // carries live and terminal turn records. The frame attaches live
-        // turns, presents terminal failures, and queues retention cleanup
-        // without running chat.turn.list/record RPCs on the SDL thread.
+        // Reattach daemon-owned turns before the asynchronous projection loop
+        // starts. The composite snapshot remains authoritative for durable
+        // state, but a live turn must be visible immediately after relaunch.
+        state.restoreDaemonChatTurnsOnLaunch();
         state.loadCursorModelOptionsDiskCache() catch |err| {
             log.warn("failed to load Cursor model cache: {s}", .{@errorName(err)});
             state.clearCursorModelOptions();
@@ -4070,6 +4157,13 @@ pub const AppState = struct {
     ) !db_types.LoadedState {
         return persistence.clonePersistedState(backing_allocator, source);
     }
+    pub fn clonePersistedBaseline(
+        _: *AppState,
+        backing_allocator: std.mem.Allocator,
+        source: PersistedState,
+    ) !db_types.LoadedState {
+        return persistence.clonePersistedBaseline(backing_allocator, source);
+    }
     pub const applyPersistedTerminalDocksJson = persistence.applyPersistedTerminalDocksJson;
     pub const seedDefaultState = persistence.seedDefaultState;
     pub const clearSurfaces = surface_controller.clearSurfaces;
@@ -4091,6 +4185,7 @@ pub const AppState = struct {
     pub const toggleCursorGlobalHooks = settings_controller.toggleCursorGlobalHooks;
     pub const toggleGrokGlobalHooks = settings_controller.toggleGrokGlobalHooks;
     pub const toggleAmpGlobalHooks = settings_controller.toggleAmpGlobalHooks;
+    pub const toggleOpencodeGlobalHooks = settings_controller.toggleOpencodeGlobalHooks;
     pub const toggleProviderGlobalHooks = settings_controller.toggleProviderGlobalHooks;
     pub const cancelSettingsModal = settings_controller.cancelSettingsModal;
     pub const saveSettingsModal = settings_controller.saveSettingsModal;
@@ -5514,6 +5609,91 @@ pub const AppState = struct {
         return self.currentProject().currentThread();
     }
 
+    /// Materialize one older durable transcript page for the focused thread.
+    /// Returns true when rows were prepended.
+    pub fn loadOlderCurrentThreadMessages(self: *AppState) !bool {
+        const project = self.currentProjectMutable();
+        const thread = project.currentThreadMutable();
+        const before_offset = thread.persisted_message_offset;
+        if (before_offset == 0) return false;
+
+        var page = try self.storage.loadMessagePage(
+            self.allocator,
+            project.id,
+            thread.local_thread_id,
+            before_offset,
+        );
+        defer page.deinit();
+        if (page.messages.len == 0 or page.offset >= before_offset) return false;
+
+        var prepended: std.ArrayList(ChatMessage) = .empty;
+        defer prepended.deinit(self.allocator);
+        var ownership_transferred = false;
+        defer if (!ownership_transferred) {
+            for (prepended.items) |message| {
+                self.allocator.free(message.author);
+                self.allocator.free(message.body);
+                if (message.image) |owned| owned.deinit(self.allocator);
+                if (message.tool_call_id) |owned| self.allocator.free(owned);
+                if (message.message_id) |owned| self.allocator.free(owned);
+            }
+        };
+        for (page.messages) |message| {
+            const author = try self.dupeZ(message.author);
+            errdefer self.allocator.free(author);
+            const body = try self.dupeZ(message.body);
+            errdefer self.allocator.free(body);
+            const image = if (message.image) |source|
+                try ChatImageAttachment.init(self.allocator, source.path, source.mime, source.byte_size)
+            else
+                null;
+            errdefer if (image) |owned| owned.deinit(self.allocator);
+            const tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id);
+            errdefer if (tool_call_id) |owned| self.allocator.free(owned);
+            const message_id = if (message.message_id) |id|
+                if (id.len == 0) null else try self.allocator.dupe(u8, id)
+            else
+                null;
+            errdefer if (message_id) |owned| self.allocator.free(owned);
+            try prepended.append(self.allocator, .{
+                .role = message.role,
+                .author = author,
+                .body = body,
+                .image = image,
+                .tool_call_id = tool_call_id,
+                .tool_call_kind = message.tool_call_kind,
+                .tool_call_status = message.tool_call_status,
+                .message_id = message_id,
+            });
+        }
+        try thread.messages.insertSlice(self.allocator, 0, prepended.items);
+        ownership_transferred = true;
+        const prepended_count = prepended.items.len;
+        thread.persisted_message_offset = page.offset;
+        if (thread.transcript_markdown_entries.items.len > 0) {
+            if (thread.transcript_markdown_entries.addManyAt(self.allocator, 0, prepended_count)) |slots| {
+                @memset(slots, null);
+            } else |_| {
+                thread.clearTranscriptMarkdownEntries(self.allocator);
+            }
+        }
+        if (thread.transcript_height_entries.items.len > 0) {
+            if (thread.transcript_height_entries.addManyAt(self.allocator, 0, prepended_count)) |slots| {
+                @memset(slots, .{});
+            } else |_| {
+                thread.clearTranscriptHeightEntries();
+            }
+        }
+        for (thread.transcript_layout_items.items) |*item| {
+            item.message_index += prepended_count;
+            item.group_end += prepended_count;
+        }
+        thread.transcript_layout_first_message_index += prepended_count;
+        thread.transcript_layout_valid = false;
+        thread.rebuildBackgroundTasksFromMessages(self.allocator);
+        return true;
+    }
+
     pub fn isSidebarCollapsed(self: *const AppState) bool {
         return self.sidebar_collapsed;
     }
@@ -5771,6 +5951,8 @@ pub const AppState = struct {
     pub const terminalPaneOutputTailForProject = workspace_controller.terminalPaneOutputTailForProject;
     pub const terminalPaneOutputTail = workspace_controller.terminalPaneOutputTail;
     pub const terminalPaneScreenTextForProject = workspace_controller.terminalPaneScreenTextForProject;
+    pub const terminalPaneRenderStateForProject = workspace_controller.terminalPaneRenderStateForProject;
+    pub const terminalPaneGridSizeForProject = workspace_controller.terminalPaneGridSizeForProject;
     pub const pollTerminalDockBeforeRead = workspace_controller.pollTerminalDockBeforeRead;
     pub const pollWorkspaceTerminalProcessLifecycles = workspace_controller.pollWorkspaceTerminalProcessLifecycles;
     pub const pollPendingTerminalSessionTeardowns = workspace_controller.pollPendingTerminalSessionTeardowns;
@@ -6110,7 +6292,9 @@ pub const AppState = struct {
         if (!(process.kind == .agent and process.hooks)) return;
         switch (process.provider orelse return) {
             .codex => try provider_hooks.ensureCodexProjectHooks(self.allocator, project_path),
-            .claude => try provider_hooks.ensureClaudeProjectHooks(self.allocator, project_path),
+            .claude => provider_hooks.ensureClaudeGlobalHooks(self.allocator) catch |err| {
+                log.warn("could not install Claude global status hooks: {s}", .{@errorName(err)});
+            },
             // Hooks add status reporting but are not required to run Cursor.
             // Keep automatic TUI launch fail-open for malformed user config;
             // explicit Settings/CLI installation still reports the error.
@@ -6123,7 +6307,13 @@ pub const AppState = struct {
             .grok => provider_hooks.ensureGrokGlobalHooks(self.allocator) catch |err| {
                 log.warn("could not install Grok personal status hooks: {s}", .{@errorName(err)});
             },
-            .opencode, .amp, .other => {},
+            .opencode => provider_hooks.ensureOpencodeGlobalHooks(self.allocator) catch |err| {
+                log.warn("could not install OpenCode global status plugin: {s}", .{@errorName(err)});
+            },
+            .amp => provider_hooks.ensureAmpGlobalHooks(self.allocator) catch |err| {
+                log.warn("could not install Amp global status plugin: {s}", .{@errorName(err)});
+            },
+            .other => {},
         }
     }
 
@@ -6197,6 +6387,9 @@ pub const AppState = struct {
         new_after: bool,
     ) !bool {
         if (project_index >= self.project_controller.projects.items.len) return false;
+        provider_hooks.ensureAmpGlobalHooks(self.allocator) catch |err| {
+            log.warn("could not install Amp global status plugin: {s}", .{@errorName(err)});
+        };
         self.project_controller.selected_index = project_index;
         self.ensureCurrentProjectWorkspace();
 
@@ -6877,6 +7070,7 @@ pub const AppState = struct {
     pub const openThreadInTui = workspace_controller.openThreadInTui;
     pub const openThreadInChat = workspace_controller.openThreadInChat;
     pub const tuiResumeCommand = workspace_controller.tuiResumeCommand;
+    pub const resumeRecreatedThreadTui = workspace_controller.resumeRecreatedThreadTui;
     pub const splitCurrentProjectWorkspacePaneWithTerminalAxis = workspace_controller.splitCurrentProjectWorkspacePaneWithTerminalAxis;
     pub const splitCurrentProjectWorkspacePaneWithTerminalPlacement = workspace_controller.splitCurrentProjectWorkspacePaneWithTerminalPlacement;
     pub const splitWorkspacePaneWithTerminalAxis = workspace_controller.splitWorkspacePaneWithTerminalAxis;
@@ -8514,23 +8708,23 @@ pub const AppState = struct {
         }
 
         const current = thread.currentDraft();
-        if (std.mem.trim(u8, current, &std.ascii.whitespace).len != 0) {
+        if (std.mem.trim(u8, current, &std.ascii.whitespace).len != 0 or thread.draftImageCount() != 0) {
             send_state.mutex.unlock();
             self.setSidebarNotice("Clear the composer to edit the queued message.");
             return;
         }
 
-        const prompt_copy = self.allocator.dupe(u8, pending.prompt) catch {
-            send_state.mutex.unlock();
-            self.setSidebarNotice("Failed to load the queued message.");
-            return;
-        };
-        defer self.allocator.free(prompt_copy);
-        freePendingFollowup(self.allocator, &send_state.pending_followup);
+        var owned_pending = pending;
+        send_state.pending_followup = null;
         send_state.pending_followup_signal_sent = false;
         send_state.mutex.unlock();
+        defer owned_pending.deinit(self.allocator);
 
-        self.setDraft(prompt_copy);
+        self.setDraft(owned_pending.prompt);
+        if (owned_pending.images.items.len > 0) {
+            thread.draft_image = owned_pending.images.orderedRemove(0);
+            std.mem.swap(std.ArrayList(ChatImageAttachment), &thread.draft_extra_images, &owned_pending.images);
+        }
         self.resetComposerInputWidget();
         self.composer_controller.composer.focused = true;
         self.composer_controller.focused = true;
@@ -8766,6 +8960,11 @@ pub const AppState = struct {
         return std.mem.sliceTo(self.sidebar_notice_storage[0..], 0);
     }
 
+    /// Returns workflow feedback without unrelated global health notices.
+    pub fn projectImportNotice(self: *const AppState) []const u8 {
+        return std.mem.sliceTo(self.sidebar_notice_storage[0..], 0);
+    }
+
     pub fn setSidebarNotice(self: *AppState, value: []const u8) void {
         @memset(&self.sidebar_notice_storage, 0);
         const len = @min(value.len, self.sidebar_notice_storage.len - 1);
@@ -8970,13 +9169,17 @@ pub const AppState = struct {
                                 self.setSidebarNotice("Folder selected, but path setup failed.");
                                 return;
                             };
+                            self.project_import_cursor = self.importDirectoryDraft().len;
+                            self.palette_modal_text_focus = .project_import;
+                            self.setSidebarNotice("Type the new folder name, then Create directory.");
+                            self.markDirty();
                         } else {
                             self.setImportPath(path);
+                            self.importProjectFromInput() catch |err| {
+                                log.warn("failed to import selected workspace: {s}", .{@errorName(err)});
+                                self.setSidebarNotice("Folder selected, but workspace import failed.");
+                            };
                         }
-                        self.project_import_cursor = self.importDirectoryDraft().len;
-                        self.palette_modal_text_focus = .project_import;
-                        self.setSidebarNotice(if (create_parent) "Type the new folder name, then Create directory." else "Folder selected.");
-                        self.markDirty();
                     } else {
                         self.setImportPath(path);
                         self.importProjectFromInput() catch |err| {
@@ -9022,10 +9225,16 @@ pub const AppState = struct {
             .{ self.storage, &self.change_cursor_loop },
         ) catch |err| {
             // Retried next frame; until then the projection stays unsynced
-            // and Live reads keep the legacy inline-pull fallback.
-            log.debug("failed to start change-cursor loop: {s}", .{@errorName(err)});
+            // and Live reads keep the legacy inline-pull fallback. Warn once
+            // per streak: this runs every frame, and a spawn failure here
+            // means the desktop silently never converges daemon state.
+            if (!self.change_cursor_spawn_failure_logged) {
+                self.change_cursor_spawn_failure_logged = true;
+                log.warn("failed to start change-cursor loop: {s}", .{@errorName(err)});
+            }
             return;
         };
+        self.change_cursor_spawn_failure_logged = false;
     }
 
     /// Request a worker-owned refresh through the durable projection floor.
@@ -9108,12 +9317,17 @@ pub const AppState = struct {
         else
             try compositeSnapshotToPersisted(conversion_arena.allocator(), result.snapshot);
         if (adoption_repair) try self.validateAdoptionRepairsForRefresh(persisted);
-        var next_baseline = try self.clonePersistedState(self.allocator, persisted);
+        var next_baseline = try self.clonePersistedBaseline(self.allocator, persisted);
         var baseline_owned = true;
         errdefer if (baseline_owned) next_baseline.deinit();
+        // The merge helpers alias string slices from `current` into `persisted`
+        // without duplication, so `current` must outlive applyPersisted's dupes
+        // below. Scoping it to this block was a use-after-free that stayed
+        // hidden while adoption vetoes rejected every dirty refresh.
+        var current: ?LoadedPersistedState = null;
+        defer if (current) |*captured| captured.deinit();
         if (self.lifecycle.dirty or self.lifecycle.rebase_snapshot != null or adoption_repair) {
-            var current = try self.buildPersistedState(self.allocator);
-            defer current.deinit();
+            current = try self.buildPersistedState(self.allocator);
             const baseline = if (self.lifecycle.rebase_baseline) |*captured| blk: {
                 if (self.lifecycle.rebase_baseline_revision == self.lifecycle.rebase_capture_revision and
                     self.lifecycle.rebase_capture_revision == observed_revision)
@@ -9126,12 +9340,12 @@ pub const AppState = struct {
                 break :blk null;
             } else null;
             if (baseline) |base| {
-                try mergeCurrentLocalEdits(conversion_arena.allocator(), &persisted, base, current.value);
+                try mergeCurrentLocalEdits(conversion_arena.allocator(), &persisted, base, current.?.value);
             } else {
                 // Bootstrap or explicit revision mismatch: never merge through
                 // a stale baseline. This fresh remote rebuild conservatively
                 // preserves current-only identities before pairing a new base.
-                try preserveCurrentIdentitiesWithoutBaseline(conversion_arena.allocator(), &persisted, current.value);
+                try preserveCurrentIdentitiesWithoutBaseline(conversion_arena.allocator(), &persisted, current.?.value);
             }
         }
 
@@ -9206,7 +9420,11 @@ pub const AppState = struct {
     /// stopped. The ordinary apply path still performs the transactional
     /// merge, replacement, and cursor publication.
     pub fn completePendingProjectionRepairBlocking(self: *AppState) !void {
-        const refresh = fetchOwnedCompositeSnapshot(self.storage) orelse return error.ProjectionRefreshUnavailable;
+        var fetch_reason: []const u8 = "";
+        const refresh = fetchOwnedCompositeSnapshot(self.storage, &fetch_reason) orelse {
+            log.warn("blocking projection repair refresh failed: {s}", .{fetch_reason});
+            return error.ProjectionRefreshUnavailable;
+        };
         defer refresh.deinit();
         try self.applyDaemonProjectionRefreshWithDurable(refresh.result, refresh.durable.?.value);
     }
@@ -9230,11 +9448,13 @@ pub const AppState = struct {
             break :blk null;
         } else null;
         const baseline_revision: ?u64 = if (baseline != null) capture_revision else null;
+        var delta = try persistence.clonePersistedSpoolDelta(self.allocator, current.value, baseline);
+        defer delta.deinit();
         const adoption_repairs = try self.pendingAdoptionRepairsSnapshot(current.allocator());
         try self.storage.writePendingStateSpool(.{
             .capture_revision = capture_revision,
             .baseline_revision = baseline_revision,
-            .current = current.value,
+            .current = delta.value,
             .baseline = baseline,
             .adoption_repairs = adoption_repairs,
         });
@@ -13871,7 +14091,8 @@ test "M5-P4 stalled daemon worker cannot block frame-side bridge drain" {
     defer storage.deinit();
     const stalledFetch = struct {
         fn run(store: *const Storage) void {
-            if (fetchOwnedCompositeSnapshot(store)) |refresh| refresh.deinit();
+            var fetch_reason: []const u8 = "";
+            if (fetchOwnedCompositeSnapshot(store, &fetch_reason)) |refresh| refresh.deinit();
         }
     }.run;
     const worker = try std.Thread.spawn(.{}, stalledFetch, .{&storage});

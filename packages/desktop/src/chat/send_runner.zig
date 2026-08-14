@@ -104,6 +104,31 @@ pub fn run(allocator: std.mem.Allocator, request: Request, sink: Sink) !Result {
     return .{ .provider_thread_id = send_result.thread_id, .reply_text = send_result.reply_text };
 }
 
+/// Dynamic model catalog for daemon clients (web/CLI). Connects without
+/// launching provider servers, so it only reports models while the provider
+/// is reachable (OpenCode server running, cursor-agent/claude CLI installed);
+/// callers keep their static fallback tables otherwise.
+pub fn listModels(
+    allocator: std.mem.Allocator,
+    provider: harness.Provider,
+    project_path: []const u8,
+) ![]harness.ModelInfo {
+    const provider_config = switch (provider) {
+        .opencode => harness.ProviderConfig{ .opencode = .{
+            .allocator = allocator,
+            .working_directory = project_path,
+            .launch_if_missing = false,
+        } },
+        // Codex has no model-discovery RPC; clients use the static table.
+        .codex => return error.UnsupportedOperation,
+        .claude => harness.ProviderConfig{ .claude = .{ .cwd = project_path } },
+        .cursor => harness.ProviderConfig{ .cursor = .{ .cwd = project_path } },
+    };
+    var client = try harness.connect(allocator, provider_config);
+    defer client.deinit();
+    return client.listModels(allocator);
+}
+
 fn approvalPolicyForMode(mode: AccessMode) ?harness.ApprovalPolicy {
     return switch (mode) {
         .full_access => .never,

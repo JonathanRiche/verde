@@ -105,6 +105,9 @@ Most of these options also appear in Settings:
   while zoomed. Pane navigation keeps the destination zoomed by default; set
   `ui.unzoom_on_pane_navigation` to `true` to restore on navigation instead.
 - **Agent integrations** — status-pip hooks for supported provider CLIs.
+- **Experimental features** — enable the Companion sidecar and Mission Control
+  (off by default). **Appearance → Default companion** chooses Sprout, Moss, or
+  Vireo when the companion is on.
 - **Updates** — check now, install an available release, and automatic checks.
 - **Notifications** — enable or disable desktop notifications.
 

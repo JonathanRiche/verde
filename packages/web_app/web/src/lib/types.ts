@@ -26,6 +26,9 @@ export interface Message {
 export interface Thread {
   local_thread_id: string
   title: string
+  /// Stable position in the workspace thread array; persisted workspace
+  /// layout JSON references chat panes by this index.
+  sort_index?: number
   archived?: boolean
   last_activity_at?: number | null
   model_ref?: string | null
@@ -46,6 +49,9 @@ export interface Workspace {
   path: string
   archived?: boolean
   unread_count?: number
+  /// Desktop-persisted open-pane layout (workspace_layout.zig v2 JSON).
+  workspace_layout_json?: string | null
+  selected_thread_index?: number
   provider?: string
   harness?: string
   draft?: string
@@ -67,6 +73,9 @@ export interface LivePane {
   thread_title?: string
   provider?: string
   model?: string | null
+  reasoning_effort?: string | null
+  reasoning_variant?: string | null
+  fast_mode?: boolean | null
   send_pending?: boolean
   completion_pending?: boolean
   completed_at_ms?: number | null
@@ -75,6 +84,10 @@ export interface LivePane {
   attention_reasons?: string[]
   dock_id?: number
   running?: boolean
+  /// Desktop-surface work status for terminals: the agent inside the pane is
+  /// actively working. Distinct from `running`, which only means the shell
+  /// process is alive.
+  working?: boolean
   cwd?: string | null
   tab_count?: number
   active_tab_index?: number
@@ -163,6 +176,9 @@ export interface TurnRecord {
   local_thread_id: string
   status: string
   provider: string
+  /// Daemon acceptance timestamp — the clock the desktop's working timer
+  /// counts from. Absent on daemons predating the field.
+  started_at_ms?: number
 }
 
 export interface Snapshot {
@@ -218,12 +234,14 @@ export function isWorking(status: string | undefined): boolean {
 }
 
 export function paneIsActive(pane: LivePane): boolean {
+  // `running` (shell alive) deliberately does not count: the desktop only
+  // marks a terminal active while its surface reports work in progress.
   return Boolean(
     pane.send_pending ||
       pane.completion_pending ||
       pane.pending_approval ||
       pane.attention ||
-      pane.running,
+      pane.working,
   )
 }
 

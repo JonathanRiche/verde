@@ -1183,6 +1183,27 @@ pre code {
   padding: 0.5rem;
 }
 
+/* Horizontal scrolling-strip mock (Niri-style): two full columns + a peek. */
+.tm-main--scroll {
+  display: flex;
+  flex-direction: row;
+  grid-template-columns: none;
+  grid-template-rows: none;
+  overflow: hidden;
+  gap: 0.4rem;
+}
+
+.tm-main--scroll .tm-pane {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.tm-main--scroll .tm-pane--peek {
+  flex: 0 0 28%;
+  opacity: 0.88;
+  border-style: dashed;
+}
+
 .tm-pane {
   position: relative;
   display: flex;
@@ -1196,7 +1217,7 @@ pre code {
 }
 
 .tm-pane--chat { border-color: var(--line-glow); }
-.tm-pane--term { grid-column: 1 / -1; }
+.tm-pane--term:not(.tm-pane--peek) { grid-column: 1 / -1; }
 
 .tm-label {
   font-family: var(--font-mono);

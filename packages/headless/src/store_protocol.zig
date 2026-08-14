@@ -154,6 +154,8 @@ pub const Thread = struct {
     draft: []const u8 = "",
     draft_image: ?Attachment = null,
     draft_images: []const Attachment = &.{},
+    /// Durable sort-index boundary before this bounded tail.
+    message_offset: usize = 0,
     messages: []const Message = &.{},
 };
 
@@ -250,6 +252,10 @@ pub const SNAPSHOT_SCOPE_STORE: []const u8 = "store";
 pub const SNAPSHOT_SCOPE_REGISTRY: []const u8 = "registry";
 pub const SNAPSHOT_SCOPE_SESSIONS: []const u8 = "sessions";
 pub const SNAPSHOT_SCOPE_TURNS: []const u8 = "turns";
+/// Workspace rows only (labels, paths, persisted layout JSON) with no
+/// threads or messages, so detached UIs can read open-pane layout without
+/// tripping the transport cap the full `store` scope hits.
+pub const SNAPSHOT_SCOPE_WORKSPACES: []const u8 = "workspaces";
 
 /// Optional filters for a coherent daemon snapshot read.
 pub const CoreSnapshotRequest = struct {
@@ -317,6 +323,10 @@ pub const ThreadGetRequest = struct {
 pub const ThreadListItem = struct {
     local_thread_id: []const u8,
     title: []const u8,
+    /// Stable position in the workspace's thread array. Persisted workspace
+    /// layout JSON references chat panes by this index, so detached UIs need
+    /// it to resolve open panes to threads.
+    sort_index: usize = 0,
     archived: bool = false,
     committed: bool = true,
     last_activity_at: ?i64 = null,
@@ -588,7 +598,7 @@ test "store DTOs round trip every wire shape" {
         StoreStatusResult{ .schema_version = 2, .store_revision = 8, .writer_ready = true, .queued_mutation_count = 0, .drain_state = "open" },
         SnapshotReplaceRequest{ .mutation = mutation, .snapshot = snapshot, .bootstrap = true },
         ThreadGetRequest{ .workspace_id = "workspace-1", .local_thread_id = "thread-1" },
-        ThreadListItem{ .local_thread_id = "thread-1", .title = "A thread", .archived = true, .committed = false, .last_activity_at = 20, .provider_thread_id = "provider-1", .model_ref = "model-1", .provider = "codex", .harness = "local_cli" },
+        ThreadListItem{ .local_thread_id = "thread-1", .title = "A thread", .sort_index = 3, .archived = true, .committed = false, .last_activity_at = 20, .provider_thread_id = "provider-1", .model_ref = "model-1", .provider = "codex", .harness = "local_cli" },
         ThreadGetResult{ .thread = thread, .store_revision = 8 },
         ThreadListRequest{ .workspace_id = "workspace-1", .limit = 25, .cursor = "cursor-1" },
         ThreadListResult{ .threads = &.{thread_list_item}, .next_cursor = "cursor-2", .store_revision = 8 },
@@ -773,6 +783,7 @@ test "store method names and error codes are pinned" {
     try std.testing.expectEqualStrings("registry", SNAPSHOT_SCOPE_REGISTRY);
     try std.testing.expectEqualStrings("sessions", SNAPSHOT_SCOPE_SESSIONS);
     try std.testing.expectEqualStrings("turns", SNAPSHOT_SCOPE_TURNS);
+    try std.testing.expectEqualStrings("workspaces", SNAPSHOT_SCOPE_WORKSPACES);
     try std.testing.expectEqualStrings("conflict", ERR_CONFLICT);
     try std.testing.expectEqualStrings("store_busy", ERR_STORE_BUSY);
     try std.testing.expectEqualStrings("schema_too_new", ERR_SCHEMA_TOO_NEW);

@@ -55,6 +55,12 @@ const InProcessWriteMutex = struct {
 var in_process_write_mutex: InProcessWriteMutex = .{};
 
 pub const STATE_DB_NAME = "state.sqlite";
+pub const TRANSCRIPT_MESSAGE_PAGE_SIZE: usize = 256;
+
+const ThreadMessages = struct {
+    offset: usize,
+    messages: []const PersistedMessage,
+};
 
 const NoopLoadHook = struct {
     fn afterAppStateRead(_: @This()) !void {}
@@ -114,10 +120,48 @@ pub const Client = struct {
 
     /// Load a consistent snapshot; do not call this while `self.conn` has an open transaction.
     pub fn load(self: *const Self, backing_allocator: std.mem.Allocator) !?LoadedState {
-        return self.loadSnapshot(backing_allocator, NoopLoadHook{});
+        return self.loadSnapshot(backing_allocator, NoopLoadHook{}, true);
     }
 
-    fn loadSnapshot(self: *const Self, backing_allocator: std.mem.Allocator, hook: anytype) !?LoadedState {
+    /// Load projection metadata without materializing transcript bodies.
+    pub fn loadBounded(self: *const Self, backing_allocator: std.mem.Allocator) !?LoadedState {
+        return self.loadSnapshot(backing_allocator, NoopLoadHook{}, false);
+    }
+
+    /// Load the page immediately preceding `before_offset` for one durable
+    /// thread. The caller owns the returned arena.
+    pub fn loadMessagePage(
+        self: *const Self,
+        backing_allocator: std.mem.Allocator,
+        workspace_id: []const u8,
+        local_thread_id: []const u8,
+        before_offset: usize,
+    ) !db_types.LoadedMessagePage {
+        var arena = std.heap.ArenaAllocator.init(backing_allocator);
+        errdefer arena.deinit();
+        const allocator = arena.allocator();
+        const maybe_row = try self.conn.row(
+            "select t.id from threads t join workspaces w on w.id = t.workspace_id " ++
+                "where w.workspace_id = ?1 and t.local_thread_id = ?2",
+            .{ workspace_id, local_thread_id },
+        );
+        const row = maybe_row orelse return error.ThreadNotFound;
+        defer row.deinit();
+        const page = try self.loadMessages(
+            allocator,
+            row.int(0),
+            before_offset,
+            TRANSCRIPT_MESSAGE_PAGE_SIZE,
+        );
+        return .{ .arena = arena, .offset = page.offset, .messages = page.messages };
+    }
+
+    fn loadSnapshot(
+        self: *const Self,
+        backing_allocator: std.mem.Allocator,
+        hook: anytype,
+        load_transcripts: bool,
+    ) !?LoadedState {
         try self.conn.transaction();
         errdefer self.conn.rollback();
 
@@ -183,7 +227,7 @@ pub const Client = struct {
                     workspace_row.nullableText(22),
                     workspace_row.nullableInt(23),
                 ),
-                .threads = try self.loadThreads(arena, workspace_id),
+                .threads = try self.loadThreads(arena, workspace_id, load_transcripts),
             });
         }
         if (workspace_rows.err) |err| return err;
@@ -481,7 +525,12 @@ pub const Client = struct {
         return try completions.toOwnedSlice(allocator);
     }
 
-    fn loadThreads(self: *const Self, allocator: std.mem.Allocator, project_id: i64) ![]const PersistedThread {
+    fn loadThreads(
+        self: *const Self,
+        allocator: std.mem.Allocator,
+        project_id: i64,
+        load_transcripts: bool,
+    ) ![]const PersistedThread {
         var threads: std.ArrayList(PersistedThread) = .empty;
         defer threads.deinit(allocator);
 
@@ -494,6 +543,12 @@ pub const Client = struct {
 
         while (thread_rows.next()) |thread_row| {
             const thread_id = thread_row.int(0);
+            const loaded_messages = try self.loadMessages(
+                allocator,
+                thread_id,
+                null,
+                if (load_transcripts) std.math.maxInt(usize) else 0,
+            );
             try threads.append(allocator, .{
                 .title = try allocator.dupe(u8, thread_row.text(1)),
                 .archived = thread_row.int(2) != 0,
@@ -516,7 +571,8 @@ pub const Client = struct {
                     thread_row.nullableText(17),
                     thread_row.nullableInt(18),
                 ),
-                .messages = try self.loadMessages(allocator, thread_id),
+                .message_offset = loaded_messages.offset,
+                .messages = loaded_messages.messages,
             });
         }
         if (thread_rows.err) |err| return err;
@@ -524,9 +580,24 @@ pub const Client = struct {
         return try threads.toOwnedSlice(allocator);
     }
 
-    fn loadMessages(self: *const Self, allocator: std.mem.Allocator, thread_id: i64) ![]const PersistedMessage {
+    fn loadMessages(
+        self: *const Self,
+        allocator: std.mem.Allocator,
+        thread_id: i64,
+        before_offset: ?usize,
+        limit: usize,
+    ) !ThreadMessages {
         var messages: std.ArrayList(PersistedMessage) = .empty;
         defer messages.deinit(allocator);
+
+        const count_row = (try self.conn.row(
+            "select coalesce(max(sort_index) + 1, 0) from messages where thread_id = ?1",
+            .{thread_id},
+        )) orelse return .{ .offset = 0, .messages = &.{} };
+        defer count_row.deinit();
+        const total: usize = @intCast(count_row.int(0));
+        const end = @min(before_offset orelse total, total);
+        const offset = end - @min(end, limit);
 
         // M4-P4 identity round-trip: durable message identities must reload
         // verbatim so the next flush re-carries them instead of re-minting
@@ -544,11 +615,11 @@ pub const Client = struct {
         var message_rows = try self.conn.rows(
             if (has_message_id)
                 "select role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status, message_id " ++
-                    "from messages where thread_id = ?1 order by sort_index"
+                    "from messages where thread_id = ?1 and sort_index >= ?2 and sort_index < ?3 order by sort_index"
             else
                 "select role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status, null " ++
-                    "from messages where thread_id = ?1 order by sort_index",
-            .{thread_id},
+                    "from messages where thread_id = ?1 and sort_index >= ?2 and sort_index < ?3 order by sort_index",
+            .{ thread_id, @as(i64, @intCast(offset)), @as(i64, @intCast(end)) },
         );
         defer message_rows.deinit();
 
@@ -577,7 +648,7 @@ pub const Client = struct {
         }
         if (message_rows.err) |err| return err;
 
-        return try messages.toOwnedSlice(allocator);
+        return .{ .offset = offset, .messages = try messages.toOwnedSlice(allocator) };
     }
 
     fn saveWorkspaceThreads(
@@ -717,6 +788,69 @@ fn loadOptionalHerdrLink(
         .pane_links_json = try dupeOptionalText(allocator, pane_links_json),
         .updated_at_ms = updated_at_ms orelse 0,
     };
+}
+
+test "projection load bounds transcript tails and pages older rows" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
+    defer testing.allocator.free(pref_path);
+
+    const messages = try testing.allocator.alloc(PersistedMessage, TRANSCRIPT_MESSAGE_PAGE_SIZE + 8);
+    defer testing.allocator.free(messages);
+    for (messages, 0..) |*message, index| {
+        message.* = .{
+            .role = if (index % 2 == 0) .user else .assistant,
+            .author = if (index % 2 == 0) "You" else "Assistant",
+            .body = if (index < 8) "older" else "tail",
+        };
+    }
+    const threads = [_]PersistedThread{.{
+        .title = "Paged",
+        .local_thread_id = "paged-thread",
+        .messages = messages,
+    }};
+    const projects = [_]PersistedProject{.{
+        .id = "paged-workspace",
+        .label = "Paged",
+        .path = "/tmp/paged",
+        .threads = &threads,
+    }};
+    {
+        var writer = try Client.init(testing.allocator, pref_path);
+        defer writer.deinit();
+        try writer.save(.{ .projects = &projects });
+    }
+
+    var reader = try Client.initReadOnly(testing.allocator, pref_path);
+    defer reader.deinit();
+    var loaded = (try reader.loadBounded(testing.allocator)).?;
+    defer loaded.deinit();
+    const loaded_thread = loaded.value.projects[0].threads.?[0];
+    try testing.expectEqual(TRANSCRIPT_MESSAGE_PAGE_SIZE + 8, loaded_thread.message_offset);
+    try testing.expectEqual(@as(usize, 0), loaded_thread.messages.len);
+
+    var tail_page = try reader.loadMessagePage(
+        testing.allocator,
+        "paged-workspace",
+        "paged-thread",
+        loaded_thread.message_offset,
+    );
+    defer tail_page.deinit();
+    try testing.expectEqual(@as(usize, 8), tail_page.offset);
+    try testing.expectEqual(TRANSCRIPT_MESSAGE_PAGE_SIZE, tail_page.messages.len);
+    try testing.expectEqualStrings("tail", tail_page.messages[0].body);
+
+    var old_page = try reader.loadMessagePage(
+        testing.allocator,
+        "paged-workspace",
+        "paged-thread",
+        tail_page.offset,
+    );
+    defer old_page.deinit();
+    try testing.expectEqual(@as(usize, 0), old_page.offset);
+    try testing.expectEqual(@as(usize, 8), old_page.messages.len);
+    try testing.expectEqualStrings("older", old_page.messages[0].body);
 }
 
 fn dupeOptionalText(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
@@ -1188,7 +1322,7 @@ test "load holds one WAL snapshot across all reads" {
         }
     };
 
-    var loaded = (try reader.loadSnapshot(testing.allocator, UpdateAfterFirstRead{ .conn = writer.conn })).?;
+    var loaded = (try reader.loadSnapshot(testing.allocator, UpdateAfterFirstRead{ .conn = writer.conn }, true)).?;
     defer loaded.deinit();
     try testing.expectEqual(@as(usize, 0), loaded.value.selected_project_index);
     try testing.expectEqualStrings("before", loaded.value.projects[0].label);

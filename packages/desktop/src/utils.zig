@@ -609,7 +609,7 @@ pub fn sendWorker(state: *chat_types.SendState, request: *SendWorkerRequest) voi
                 @errorName(err),
             },
         );
-        if (err == error.CodexTurnInterrupted and state.stop_requested) {
+        if ((err == error.CodexTurnInterrupted or err == error.ClaudeTurnInterrupted) and state.stop_requested) {
             state.error_message = null;
             state.result = null;
             state.status = .aborted;
@@ -2214,16 +2214,8 @@ pub fn freePendingApprovalLocked(allocator: std.mem.Allocator, approval: *?chat_
 }
 
 fn freePendingTimelineEvent(allocator: std.mem.Allocator, event: chat_types.PendingTimelineEvent) void {
-    allocator.free(event.author);
-    allocator.free(event.body);
-    if (event.message_id) |value| allocator.free(value);
-    if (event.tool_call_id) |call_id| allocator.free(call_id);
-    if (event.tool_call_title) |value| allocator.free(value);
-    if (event.tool_call_input) |value| allocator.free(value);
-    if (event.tool_call_output) |value| allocator.free(value);
-    if (event.tool_call_error) |value| allocator.free(value);
-    if (event.tool_call_locations) |value| allocator.free(value);
-    if (event.tool_call_raw) |value| allocator.free(value);
+    var owned = event;
+    owned.deinit(allocator);
 }
 
 /// Releases owned streamed timeline events copied out of the send worker.

@@ -168,9 +168,9 @@ fn printHelp(out: output.Output) !void {
         \\Integration commands:
         \\  list [--json]
         \\  doctor [--json]
-        \\  install <claude|codex|opencode|cursor>
-        \\  remove <claude|codex|opencode|cursor>
-        \\  disable <claude|codex|opencode|cursor>
+        \\  install <claude|codex|amp|opencode|cursor|grok>
+        \\  remove <claude|codex|amp|opencode|cursor|grok>
+        \\  disable <claude|codex|amp|opencode|cursor|grok>
         \\
         \\Theme commands:
         \\  import <file-or-url> [--dry-run] [--json]
@@ -1988,7 +1988,7 @@ const integration_providers = [_]IntegrationProvider{
     .{ .name = "claude", .hook_state = "project-local", .installable = true, .installed = false, .reason = "Claude Code hooks are supported through project-local .claude/settings.local.json when enabled for a Verde session." },
     .{ .name = "codex", .hook_state = "project-local", .installable = true, .installed = false, .reason = "Codex hooks are supported through project-local .codex/hooks.json when enabled for a Verde session." },
     .{ .name = "amp", .hook_state = "global-plugin", .installable = true, .installed = false, .reason = "Amp lifecycle events are supported through a global ~/.config/amp/plugins/verde-notify.ts plugin." },
-    .{ .name = "opencode", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
+    .{ .name = "opencode", .hook_state = "global-plugin", .installable = true, .installed = false, .reason = "OpenCode lifecycle events are supported through a global ~/.config/opencode/plugin/verde-notify.ts plugin." },
     .{ .name = "cursor", .hook_state = "project-local", .installable = true, .installed = false, .reason = "Cursor Agent uses the same .cursor/hooks.json format in its terminal and desktop UI; Verde status updates require inherited Verde pane identity." },
     .{ .name = "grok", .hook_state = "global", .installable = true, .installed = false, .reason = "Grok Build personal hooks report lifecycle status from ~/.grok/hooks/verde-notify.json without requiring project trust." },
 };
@@ -2004,7 +2004,7 @@ fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []
             \\  verde integrations disable <claude|codex|amp|opencode|cursor|grok>
             \\
             \\  --global installs Claude/Codex/Cursor/Grok hooks in their user config files,
-            \\  and installs Amp's plugin in ~/.config/amp/plugins for all projects
+            \\  plus Amp/OpenCode plugins in their global plugin directories
             \\  (no-op outside Verde panes); otherwise supported hooks are project-local
             \\  where the provider supports that.
             \\
@@ -2134,6 +2134,25 @@ fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []
             try out.stdout("verde integrations {s} amp --global: removed global Amp plugin from ~/.config/amp/plugins/verde-notify.ts\n", .{command});
             return;
         }
+        if (global and std.mem.eql(u8, provider.name, "opencode")) {
+            provider_hooks.removeOpencodeGlobalHooks(allocator) catch |err| {
+                try out.stderr("verde integrations {s} opencode --global: {s}\n", .{ command, @errorName(err) });
+                std.process.exit(1);
+            };
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = command,
+                    .installed = false,
+                    .changed = true,
+                    .status = "removed",
+                    .scope = "global",
+                });
+                return;
+            }
+            try out.stdout("verde integrations {s} opencode --global: removed global OpenCode plugin from ~/.config/opencode/plugin/verde-notify.ts\n", .{command});
+            return;
+        }
         try printIntegrationNoInstalledHook(allocator, out, json, command, provider);
         return;
     }
@@ -2149,10 +2168,32 @@ fn findIntegrationProvider(name: []const u8) ?IntegrationProvider {
     return null;
 }
 
+fn integrationProvidersWithInstalledState(allocator: std.mem.Allocator) [integration_providers.len]IntegrationProvider {
+    var providers = integration_providers;
+    for (&providers) |*provider| {
+        provider.installed = if (std.mem.eql(u8, provider.name, "claude"))
+            provider_hooks.claudeGlobalHooksInstalled(allocator)
+        else if (std.mem.eql(u8, provider.name, "codex"))
+            provider_hooks.codexGlobalHooksInstalled(allocator)
+        else if (std.mem.eql(u8, provider.name, "amp"))
+            provider_hooks.ampGlobalHooksInstalled(allocator)
+        else if (std.mem.eql(u8, provider.name, "opencode"))
+            provider_hooks.opencodeGlobalHooksInstalled(allocator)
+        else if (std.mem.eql(u8, provider.name, "cursor"))
+            provider_hooks.cursorGlobalHooksInstalled(allocator)
+        else if (std.mem.eql(u8, provider.name, "grok"))
+            provider_hooks.grokGlobalHooksInstalled(allocator)
+        else
+            false;
+    }
+    return providers;
+}
+
 fn printIntegrationsList(allocator: std.mem.Allocator, out: output.Output, json: bool) !void {
+    const providers = integrationProvidersWithInstalledState(allocator);
     if (json) {
         try out.jsonValue(allocator, .{
-            .providers = integration_providers[0..],
+            .providers = providers[0..],
             .policy = .{
                 .writes_config = true,
                 .writes_project_config_only = false,
@@ -2163,13 +2204,14 @@ fn printIntegrationsList(allocator: std.mem.Allocator, out: output.Output, json:
         return;
     }
     try out.stdout("Provider integrations:\n", .{});
-    for (integration_providers) |provider| {
-        try out.stdout("  {s}: {s} ({s})\n", .{ provider.name, provider.hook_state, provider.reason });
+    for (providers) |provider| {
+        try out.stdout("  {s}: {s}, {s} ({s})\n", .{ provider.name, provider.hook_state, if (provider.installed) "installed" else "not installed", provider.reason });
     }
 }
 
 fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, json: bool) !void {
     const verde_env = getenvSlice("VERDE") orelse "";
+    const providers = integrationProvidersWithInstalledState(allocator);
     const has_identity = getenvSlice("VERDE_SESSION_ID") != null and
         (getenvSlice("VERDE_LIVE_ENDPOINT") != null or
             getenvSlice("VERDE_SOCKET") != null or
@@ -2179,8 +2221,8 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
         try out.jsonValue(allocator, .{
             .verde_env = std.mem.eql(u8, verde_env, "1"),
             .has_terminal_identity = has_identity,
-            .providers = integration_providers[0..],
-            .summary = "Claude/Codex/Cursor/Grok hooks and the Amp global plugin are available; other providers currently use generic verde notify, OSC, and MCP paths.",
+            .providers = providers[0..],
+            .summary = "Claude/Codex/Cursor/Grok hooks and Amp/OpenCode global plugins are available.",
         });
         return;
     }
@@ -2188,7 +2230,7 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
         \\Integration doctor:
         \\  VERDE=1: {s}
         \\  terminal identity: {s}
-        \\  hook installers: claude, codex, cursor project-local/global; grok global; amp global plugin
+        \\  hook installers: claude, codex, cursor project-local/global; grok global; amp/opencode global plugins
         \\  generic paths: verde notify, OSC 777 notify, MCP surface tools
         \\
     , .{
@@ -2320,6 +2362,37 @@ fn installIntegration(allocator: std.mem.Allocator, out: output.Output, json: bo
             return;
         }
         try out.stdout("verde integrations install amp --global: installed global Amp plugin in ~/.config/amp/plugins/verde-notify.ts\n", .{});
+        return;
+    }
+
+    if (std.mem.eql(u8, provider.name, "opencode") and global) {
+        provider_hooks.ensureOpencodeGlobalHooks(allocator) catch |err| {
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = "install",
+                    .installed = false,
+                    .status = "error",
+                    .scope = "global",
+                    .reason = @errorName(err),
+                });
+                return;
+            }
+            try out.stderr("verde integrations install opencode --global: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        if (json) {
+            try out.jsonValue(allocator, .{
+                .provider = provider.name,
+                .action = "install",
+                .installed = true,
+                .status = "installed",
+                .scope = "global",
+                .path = "~/.config/opencode/plugin/verde-notify.ts",
+            });
+            return;
+        }
+        try out.stdout("verde integrations install opencode --global: installed global OpenCode plugin in ~/.config/opencode/plugin/verde-notify.ts\n", .{});
         return;
     }
 

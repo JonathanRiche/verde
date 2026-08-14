@@ -28,10 +28,11 @@ float4 main(PSInput input) : SV_Target0
     const float radius = input.sdf_radius_border.x;
     const float border_width = input.sdf_radius_border.y;
     const float distance = sdfRoundedRect(p, half_size, radius);
+    const float aa_radius = 0.75;
 
     if (border_width > 0.0 && input.sdf_border.a > 0.0) {
-        const float outer_alpha = 1.0 - smoothstep(-0.5, 0.5, distance);
-        const float inner_alpha = 1.0 - smoothstep(-0.5, 0.5, distance + border_width);
+        const float outer_alpha = 1.0 - smoothstep(-aa_radius, aa_radius, distance);
+        const float inner_alpha = 1.0 - smoothstep(-aa_radius, aa_radius, distance + border_width);
         const float border_alpha = max(outer_alpha - inner_alpha, 0.0);
         const float4 fill = float4(input.color.rgb, input.color.a * inner_alpha);
         const float border_a = input.sdf_border.a * border_alpha;
@@ -40,6 +41,6 @@ float4 main(PSInput input) : SV_Target0
         return float4(rgb, alpha);
     }
 
-    const float alpha = 1.0 - smoothstep(-0.5, 0.5, distance);
+    const float alpha = 1.0 - smoothstep(-aa_radius, aa_radius, distance);
     return float4(input.color.rgb, input.color.a * alpha);
 }

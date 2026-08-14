@@ -190,11 +190,6 @@ fn scheduleFlushWorker(self: anytype, now_ms: i64) void {
         self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
         return;
     }
-    if (self.lifecycle.selection_only) {
-        scheduleSelectionFlushWorker(self, storage, observed_revision, now_ms);
-        return;
-    }
-
     if (self.lifecycle.snapshot_capture) |*capture| {
         if (capture.dirty_generation != self.lifecycle.dirty_generation) {
             capture.deinit();
@@ -302,10 +297,19 @@ fn flushWorkerMain(args: *FlushWorkerArgs) void {
 
     const fits_transport = args.storage.stateFitsSnapshotTransport(args.loaded.?.value) catch false;
     if (!fits_transport) {
+        var delta = persistence.clonePersistedSpoolDelta(
+            args.allocator,
+            args.loaded.?.value,
+            if (args.baseline) |baseline| baseline.value else null,
+        ) catch {
+            args.result.done.store(true, .release);
+            return;
+        };
+        defer delta.deinit();
         args.storage.writePendingStateSpool(.{
             .capture_revision = args.observed_revision,
             .baseline_revision = if (args.baseline != null) args.observed_revision else null,
-            .current = args.loaded.?.value,
+            .current = delta.value,
             .baseline = if (args.baseline) |baseline| baseline.value else null,
         }) catch {
             args.result.done.store(true, .release);
@@ -421,12 +425,17 @@ pub fn pollFlushWorker(self: anytype) void {
             self.lifecycle.rebase_capture_revision = args.observed_revision;
         } else if (success) {
             // Save acknowledgement and baseline publication are one frame-thread
-            // transaction: move the exact acknowledged payload, then pair it
-            // with the revision returned by that acknowledgement.
+            // transaction. Conflict merges only inspect metadata, so retain a
+            // compact baseline rather than a second copy of every body.
             if (self.lifecycle.projection_baseline) |*old| old.deinit();
-            self.lifecycle.projection_baseline = args.loaded;
-            args.loaded = null;
-            self.lifecycle.projection_baseline_revision = acknowledged_revision;
+            self.lifecycle.projection_baseline = if (args.loaded) |loaded|
+                persistence.clonePersistedBaseline(storage.allocator, loaded.value) catch null
+            else
+                null;
+            self.lifecycle.projection_baseline_revision = if (self.lifecycle.projection_baseline != null)
+                acknowledged_revision
+            else
+                null;
         } else if (self.lifecycle.projection_baseline == null and args.baseline != null) {
             // The worker temporarily owns the revision-paired baseline. On a
             // transport/spool failure, restore it so the next capture remains
@@ -550,7 +559,7 @@ fn flushDirtyBlockingResult(self: anytype) !void {
             if (err == error.StoreRevisionConflict) {
                 var baseline_copy: ?LoadedPersistedState = null;
                 if (self.lifecycle.projection_baseline) |baseline| {
-                    baseline_copy = self.clonePersistedState(self.storage.allocator, baseline.value) catch |clone_err| {
+                    baseline_copy = persistence.clonePersistedBaseline(self.storage.allocator, baseline.value) catch |clone_err| {
                         persisted.deinit();
                         persisted_owned = false;
                         log.err("failed to retain shutdown merge baseline: {s}", .{@errorName(clone_err)});
@@ -581,9 +590,14 @@ fn flushDirtyBlockingResult(self: anytype) !void {
         };
         const acknowledged_revision = self.storage.currentProjectionObservedRevision();
         if (self.lifecycle.projection_baseline) |*old| old.deinit();
-        self.lifecycle.projection_baseline = persisted;
-        persisted_owned = false;
-        self.lifecycle.projection_baseline_revision = acknowledged_revision;
+        self.lifecycle.projection_baseline = persistence.clonePersistedBaseline(
+            self.storage.allocator,
+            persisted.value,
+        ) catch null;
+        self.lifecycle.projection_baseline_revision = if (self.lifecycle.projection_baseline != null)
+            acknowledged_revision
+        else
+            null;
         self.storage.clearPendingStateSpoolBestEffort();
         self.lifecycle.clearDirty();
         self.lifecycle.next_flush_attempt_ms = 0;

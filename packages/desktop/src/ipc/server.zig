@@ -7,6 +7,7 @@ const state_storage = @import("../state/storage.zig");
 const browser_runtime = @import("../browser/mod.zig");
 const browser_ui = @import("../ui/browser.zig");
 const command_palette = @import("../ui/command_palette.zig");
+const sidebar_ui = @import("../ui/sidebar.zig");
 const herdr = @import("../workspace/herdr.zig");
 const loop_wakeup = @import("loop_wakeup");
 const platform_ipc = @import("../platform/ipc.zig");
@@ -1607,16 +1608,148 @@ fn terminalCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Valu
         });
     }
     if (std.mem.eql(u8, command, "screen")) {
-        const screen = (try state.terminalPaneScreenTextForProject(target.project_index, target.pane_id)) orelse
-            return try errorResponseAlloc(allocator, id_value, "not_found", "terminal screen not found");
-        defer state.allocator.free(screen);
-        return try okValueResponse(allocator, id_value, .{
-            .workspace_index = target.project_index,
-            .pane_id = target.pane_id,
-            .text = screen,
-        });
+        return try terminalScreenDumpResponse(allocator, id_value, state, target.project_index, target.pane_id);
     }
     return try errorResponseAlloc(allocator, id_value, "method_not_found", command);
+}
+
+fn terminalScreenDumpResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    state: *app_state.AppState,
+    project_index: usize,
+    pane_id: app_state.WorkspacePaneId,
+) ![]u8 {
+    const screen = (try state.terminalPaneScreenTextForProject(project_index, pane_id)) orelse
+        return try errorResponseAlloc(allocator, id_value, "not_found", "terminal screen not found");
+    defer state.allocator.free(screen);
+    const grid = state.terminalPaneGridSizeForProject(project_index, pane_id);
+    const render = state.terminalPaneRenderStateForProject(project_index, pane_id);
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&s, id_value);
+    try s.objectField("result");
+    try s.beginObject();
+    try s.objectField("workspace_index");
+    try s.write(project_index);
+    try s.objectField("pane_id");
+    try s.write(pane_id);
+    try s.objectField("text");
+    try s.write(screen);
+    try s.objectField("cols");
+    try s.write(if (grid) |size| size.cols else 80);
+    try s.objectField("rows");
+    try s.write(if (grid) |size| size.rows else 24);
+    if (render) |render_state| try writeRenderStateColors(&s, render_state);
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+fn writeRenderStateColors(s: *std.json.Stringify, render_state: *const terminal.RenderState) !void {
+    try s.objectField("bg");
+    try writeRgbHex(s, render_state.colors.background);
+    try s.objectField("fg");
+    try writeRgbHex(s, render_state.colors.foreground);
+    try s.objectField("cursor");
+    try s.beginObject();
+    if (render_state.cursor.viewport) |cursor| {
+        try s.objectField("x");
+        try s.write(cursor.x);
+        try s.objectField("y");
+        try s.write(cursor.y);
+        try s.objectField("visible");
+        try s.write(render_state.cursor.visible);
+    } else {
+        try s.objectField("visible");
+        try s.write(false);
+    }
+    try s.endObject();
+    try s.objectField("palette");
+    try s.beginArray();
+    for (render_state.colors.palette) |rgb| try writeRgbHex(s, rgb);
+    try s.endArray();
+    try s.objectField("cells");
+    try s.beginArray();
+    const row_data = render_state.row_data.slice();
+    const row_cells = row_data.items(.cells);
+    for (row_cells, 0..) |cells, y| {
+        const cells_slice = cells.slice();
+        const raw_cells = cells_slice.items(.raw);
+        const styles = cells_slice.items(.style);
+        for (raw_cells, 0..) |raw_cell, x| {
+            if (raw_cell.wide == .spacer_tail) continue;
+            const style = screenStyleForCell(raw_cell, styles, x);
+            const resolved_bg = style.bg(&raw_cell, &render_state.colors.palette) orelse render_state.colors.background;
+            var fg = style.fg(.{
+                .default = render_state.colors.foreground,
+                .palette = &render_state.colors.palette,
+                .bold = .bright,
+            });
+            var bg = resolved_bg;
+            if (style.flags.inverse) {
+                const swap = bg;
+                bg = fg;
+                fg = swap;
+            }
+            const flags = screenStyleFlags(style);
+            const default_fg = rgbEql(fg, render_state.colors.foreground);
+            const default_bg = rgbEql(bg, render_state.colors.background);
+            if (default_fg and default_bg and flags == 0) continue;
+            try s.beginObject();
+            try s.objectField("x");
+            try s.write(x);
+            try s.objectField("y");
+            try s.write(y);
+            if (!default_fg) {
+                try s.objectField("fg");
+                try writeRgbHex(s, fg);
+            }
+            if (!default_bg) {
+                try s.objectField("bg");
+                try writeRgbHex(s, bg);
+            }
+            if (flags != 0) {
+                try s.objectField("f");
+                try s.write(flags);
+            }
+            try s.endObject();
+        }
+    }
+    try s.endArray();
+}
+
+fn screenStyleForCell(cell: anytype, styles: anytype, index: usize) @TypeOf(styles[0]) {
+    return switch (cell.content_tag) {
+        .bg_color_palette => .{ .bg_color = .{ .palette = @intCast(cell.content.color_palette) } },
+        .bg_color_rgb => .{ .bg_color = .{ .rgb = .{
+            .r = cell.content.color_rgb.r,
+            .g = cell.content.color_rgb.g,
+            .b = cell.content.color_rgb.b,
+        } } },
+        else => if (cell.hasStyling()) styles[index] else .{},
+    };
+}
+
+fn screenStyleFlags(style: anytype) u8 {
+    var flags: u8 = 0;
+    if (style.flags.bold) flags |= 1;
+    if (style.flags.faint) flags |= 2;
+    if (style.flags.italic) flags |= 8;
+    if (style.flags.invisible) flags |= 16;
+    return flags;
+}
+
+fn writeRgbHex(s: *std.json.Stringify, rgb: anytype) !void {
+    var buf: [7]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "#{x:0>2}{x:0>2}{x:0>2}", .{ rgb.r, rgb.g, rgb.b }) catch "#000000";
+    try s.write(text);
+}
+
+fn rgbEql(a: anytype, b: anytype) bool {
+    return a.r == b.r and a.g == b.g and a.b == b.b;
 }
 
 const TerminalKeyParamError = error{
@@ -1877,6 +2010,12 @@ fn writeProjectPanes(s: *std.json.Stringify, state: *app_state.AppState, project
         try writePane(s, state, project_index, pane);
     }
     try s.endArray();
+    try s.objectField("root");
+    if (project.workspace_layout.root) |root_node| {
+        try app_state.WorkspaceLayout.writeWorkspaceNodeJson(s, root_node);
+    } else {
+        try s.write(null);
+    }
     try s.endObject();
 }
 
@@ -1936,6 +2075,7 @@ fn writePane(s: *std.json.Stringify, state: *app_state.AppState, project_index: 
                 try s.objectField("cwd");
                 if (dock.cwd) |cwd| try s.write(cwd) else try s.write(null);
             }
+            try writeTerminalIdentity(s, state, project_index, ref.dock_id);
             const attention = terminalDockHasAttention(state, project_index, project, ref.dock_id);
             try s.objectField("attention");
             try s.write(attention);
@@ -1950,6 +2090,45 @@ fn writePane(s: *std.json.Stringify, state: *app_state.AppState, project_index: 
         },
     }
     try s.endObject();
+}
+
+/// Terminal `title` and `agent_provider` for live pane rows, mirroring the
+/// sidebar derivation (surface title -> live process label -> "Terminal";
+/// foreground comm -> surface provider -> pinned provider) so detached
+/// clients render the same label and provider glyph as the desktop.
+fn writeTerminalIdentity(s: *std.json.Stringify, state: *app_state.AppState, project_index: usize, dock_id: u32) !void {
+    var comm_buf: [96]u8 = undefined;
+    var label_buf: [96]u8 = undefined;
+    const surface = state.projectTerminalSurface(project_index, dock_id);
+    var foreground_process: ?[]const u8 = null;
+    var pinned_provider: ?[]const u8 = null;
+    if (state.projectTerminalDock(project_index, dock_id)) |dock| {
+        foreground_process = dock.activeForegroundProcessName(&comm_buf);
+        pinned_provider = dock.activeTabPinnedProvider();
+    }
+    const title = blk: {
+        if (surface) |item| if (item.title.len > 0) break :blk item.title;
+        if (state.projectTerminalDock(project_index, dock_id)) |dock| {
+            const live = dock.activeProcessLabel(&label_buf);
+            if (live.len > 0) break :blk live;
+        }
+        break :blk "Terminal";
+    };
+    try s.objectField("title");
+    try s.write(sidebar_ui.stripLeadingTitleSymbols(title));
+    try s.objectField("agent_provider");
+    if (sidebar_ui.terminalAgentProviderForMetadata(
+        if (surface) |item| item.provider else null,
+        foreground_process,
+        pinned_provider,
+    )) |provider| try s.write(@tagName(provider)) else try s.write(null);
+    // Surface work status, distinct from `running` (shell process alive):
+    // `working` matches the sidebar's green/active highlight so detached
+    // clients classify active terminals exactly like the desktop.
+    try s.objectField("status");
+    if (surface) |item| try s.write(@tagName(item.displayStatus())) else try s.write(null);
+    try s.objectField("working");
+    try s.write(if (surface) |item| !item.completion_pending and item.status == .working else false);
 }
 
 fn writeThreadSummary(s: *std.json.Stringify, thread: app_state.ChatThread, index: usize) !void {
@@ -2019,6 +2198,7 @@ fn writeTerminalsArray(s: *std.json.Stringify, state: *app_state.AppState, maybe
                 try s.objectField("cwd");
                 if (dock.cwd) |cwd| try s.write(cwd) else try s.write(null);
             }
+            try writeTerminalIdentity(s, state, project_index, ref.dock_id);
             for (project.managed_processes.items) |process| {
                 if (process.dock_id == null or process.dock_id.? != ref.dock_id) continue;
                 try s.objectField("process");
@@ -3322,7 +3502,24 @@ fn chatTranscriptResponse(allocator: std.mem.Allocator, id_value: std.json.Value
     };
     if (ref.thread_index >= project.threads.items.len) return try errorResponseAlloc(allocator, id_value, "not_found", "thread not found");
     const thread = &project.threads.items[ref.thread_index];
-    if (!transcriptFitsLiveResponse(thread.messages.items, LIVE_MAX_RESPONSE_BYTES)) {
+    // In-flight turn parts (tool/system rows and streamed assistant text)
+    // live in SendState until the turn commits into thread.messages. Append
+    // them so detached clients see the stream, not just finished turns.
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    const streaming = send_state.status == .pending;
+    // Same 6x-escaping reserve the committed-row budget uses.
+    var pending_bytes: usize = 0;
+    if (streaming) {
+        for (send_state.pending_events.items) |event| {
+            pending_bytes += 64 + (event.author.len + event.body.len + 16) * 6;
+        }
+        pending_bytes += 64 + (send_state.partial_text.items.len + 32) * 6;
+    }
+    if (pending_bytes >= LIVE_MAX_RESPONSE_BYTES or
+        !transcriptFitsLiveResponse(thread.messages.items, LIVE_MAX_RESPONSE_BYTES - pending_bytes))
+    {
         return try errorResponseAlloc(
             allocator,
             id_value,
@@ -3343,6 +3540,8 @@ fn chatTranscriptResponse(allocator: std.mem.Allocator, id_value: std.json.Value
     try s.write(pane_id);
     try s.objectField("thread_index");
     try s.write(ref.thread_index);
+    try s.objectField("streaming");
+    try s.write(streaming);
     try s.objectField("messages");
     try s.beginArray();
     for (thread.messages.items) |message| {
@@ -3355,10 +3554,47 @@ fn chatTranscriptResponse(allocator: std.mem.Allocator, id_value: std.json.Value
         try s.write(message.body);
         try s.endObject();
     }
+    if (streaming) {
+        for (send_state.pending_events.items) |event| {
+            try s.beginObject();
+            try s.objectField("role");
+            try s.write(@tagName(event.role));
+            try s.objectField("author");
+            try s.write(event.author);
+            try s.objectField("body");
+            try s.write(event.body);
+            try s.objectField("streaming");
+            try s.write(true);
+            try s.endObject();
+        }
+        if (send_state.partial_text.items.len > 0) {
+            try s.beginObject();
+            try s.objectField("role");
+            try s.write("assistant");
+            try s.objectField("author");
+            try s.write(streamAuthorLabel(send_state.provider orelse thread.provider));
+            try s.objectField("body");
+            try s.write(send_state.partial_text.items);
+            try s.objectField("streaming");
+            try s.write(true);
+            try s.endObject();
+        }
+    }
     try s.endArray();
     try s.endObject();
     try s.endObject();
     return try writer.toOwnedSlice();
+}
+
+/// Author label for the not-yet-committed streamed assistant row, matching
+/// what transcript commit will write (`transcript_apply.providerLabel`).
+fn streamAuthorLabel(provider: app_state.Provider) []const u8 {
+    return switch (provider) {
+        .codex => "Codex",
+        .opencode => "OpenCode",
+        .claude => "Claude",
+        .cursor => "Cursor",
+    };
 }
 
 /// JSON escaping can expand each input byte to six bytes. Reserve fixed syntax

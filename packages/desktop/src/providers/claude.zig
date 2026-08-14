@@ -10,6 +10,7 @@ const provider_types = @import("types.zig");
 const runtime_log = @import("../runtime/log.zig");
 
 const MAX_BRIDGE_LINE_BYTES = 8 * 1024 * 1024;
+const BRIDGE_STOP_POLL_MS = 20;
 
 const Mutex = struct {
     inner: std.atomic.Mutex = .unlocked,
@@ -29,6 +30,47 @@ const ActiveProcessState = struct {
 };
 
 var active_process_state: ActiveProcessState = .{};
+
+const BridgeStopMonitor = struct {
+    request: ?provider_types.SendPromptRequest,
+    target: *anyopaque,
+    terminate: *const fn (*anyopaque) void,
+    finished: std.atomic.Value(bool) = .init(false),
+    cancelled: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    fn start(self: *BridgeStopMonitor) !void {
+        const request = self.request orelse return;
+        if (request.on_should_stop == null) return;
+        self.thread = try std.Thread.spawn(.{}, watch, .{self});
+    }
+
+    fn finish(self: *BridgeStopMonitor) void {
+        self.finished.store(true, .release);
+        if (self.thread) |thread| {
+            self.thread = null;
+            thread.join();
+        }
+    }
+
+    fn watch(self: *BridgeStopMonitor) void {
+        const request = self.request orelse return;
+        const should_stop = request.on_should_stop orelse return;
+        while (!self.finished.load(.acquire)) {
+            if (should_stop(request.stream_context)) {
+                self.cancelled.store(true, .release);
+                self.terminate(self.target);
+                return;
+            }
+            platform_runtime.sleepMillis(BRIDGE_STOP_POLL_MS);
+        }
+    }
+};
+
+fn terminateBridgeChild(context: *anyopaque) void {
+    const child: *platform_process.OwnedChild = @ptrCast(@alignCast(context));
+    child.terminateTree();
+}
 
 const CLAUDE_SLASH_COMMANDS = [_]provider_types.ProviderSlashCommand{
     .{
@@ -334,6 +376,13 @@ pub const Client = struct {
         errdefer child.kill(threaded.io());
         registerActiveChild(&child);
         defer unregisterActiveChild(&child);
+        var stop_monitor: BridgeStopMonitor = .{
+            .request = stream_request,
+            .target = &child,
+            .terminate = terminateBridgeChild,
+        };
+        try stop_monitor.start();
+        defer stop_monitor.finish();
 
         try writeJsonLine(self.allocator, child.child.stdin.?, payload);
         const keep_stdin_open = if (stream_request) |request| request.on_approval_request != null else false;
@@ -348,7 +397,10 @@ pub const Client = struct {
         var read_buffer: [16 * 1024]u8 = undefined;
         var reader = child.child.stdout.?.reader(threaded.io(), &read_buffer);
         while (true) {
-            const maybe_line = try takeBridgeLineAlloc(self.allocator, &reader.interface);
+            const maybe_line = takeBridgeLineAlloc(self.allocator, &reader.interface) catch |err| {
+                if (stop_monitor.cancelled.load(.acquire)) return error.ClaudeTurnInterrupted;
+                return err;
+            };
             if (maybe_line == null) break;
             defer self.allocator.free(maybe_line.?);
             const line = std.mem.trimEnd(u8, maybe_line.?, "\r");
@@ -358,12 +410,18 @@ pub const Client = struct {
 
         // Stop exposing the pointer before wait closes its platform handles.
         unregisterActiveChild(&child);
-        const term = try child.wait(threaded.io());
+        const term = child.wait(threaded.io()) catch |err| {
+            stop_monitor.finish();
+            if (stop_monitor.cancelled.load(.acquire)) return error.ClaudeTurnInterrupted;
+            return err;
+        };
+        stop_monitor.finish();
         if (child.child.stdin) |stdin| {
             stdin.close(threaded.io());
             child.child.stdin = null;
         }
         child.child.stdout = null;
+        if (stop_monitor.cancelled.load(.acquire)) return error.ClaudeTurnInterrupted;
         if (response.error_message) |message| {
             provider_diagnostics.logError(.claude_bridge, null, message);
             if (stream_request) |request| {
@@ -866,6 +924,45 @@ test "Claude bridge reader accepts lines larger than its scratch buffer" {
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualStrings("ok", second);
     try std.testing.expectEqual(@as(?[]u8, null), try takeBridgeLineAlloc(std.testing.allocator, &reader));
+}
+
+test "Claude bridge stop monitor interrupts a blocked provider request" {
+    const Capture = struct {
+        stop_requested: std.atomic.Value(bool) = .init(false),
+        terminate_count: std.atomic.Value(usize) = .init(0),
+
+        fn shouldStop(context: ?*anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(context orelse return true));
+            return self.stop_requested.load(.acquire);
+        }
+
+        fn terminate(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            _ = self.terminate_count.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var capture: Capture = .{};
+    var monitor: BridgeStopMonitor = .{
+        .request = .{
+            .prompt = "blocked",
+            .stream_context = &capture,
+            .on_should_stop = Capture.shouldStop,
+        },
+        .target = &capture,
+        .terminate = Capture.terminate,
+    };
+    try monitor.start();
+    defer monitor.finish();
+
+    capture.stop_requested.store(true, .release);
+    var attempts: usize = 0;
+    while (capture.terminate_count.load(.acquire) == 0 and attempts < 100) : (attempts += 1) {
+        platform_runtime.sleepMillis(1);
+    }
+
+    try std.testing.expect(monitor.cancelled.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), capture.terminate_count.load(.acquire));
 }
 
 test "providerSlashCommands exposes Claude usage and compact" {

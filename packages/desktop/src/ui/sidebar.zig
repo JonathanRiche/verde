@@ -178,9 +178,11 @@ pub fn renderPalette(state: *runtime.AppState, rect: palette.Rect) void {
     } else {
         renderPaletteExpandedSidebar(state, rect);
     }
-    if (state.sidebar_context_menu_open) {
-        renderSidebarContextMenu(state, rect);
-    }
+}
+
+/// Renders the context menu after workspace-local clipping has completed.
+pub fn renderContextMenuOverlay(state: *runtime.AppState) void {
+    if (state.sidebar_context_menu_open) renderSidebarContextMenu(state, palette_sidebar_rect);
 }
 
 pub fn pointerOverSidebar(x: f32, y: f32) bool {
@@ -2296,7 +2298,7 @@ fn snapRect(rect: palette.Rect) palette.Rect {
 /// "✳" agents prepend to their terminal title) when it is separated from the
 /// real title by a space. Falls back to the original string otherwise, so plain
 /// or fully non-ASCII titles are left untouched.
-fn stripLeadingTitleSymbols(title: []const u8) []const u8 {
+pub fn stripLeadingTitleSymbols(title: []const u8) []const u8 {
     if (title.len == 0 or title[0] < 0x80) return title;
     var i: usize = 0;
     while (i < title.len and title[i] >= 0x80) {
@@ -2399,7 +2401,7 @@ fn terminalAgentProviderFromProvider(provider: ?SurfaceProvider) ?TerminalAgentP
     };
 }
 
-fn terminalAgentProviderForMetadata(
+pub fn terminalAgentProviderForMetadata(
     surface_provider: ?SurfaceProvider,
     foreground_process: ?[]const u8,
     pinned_provider: ?[]const u8,

@@ -88,13 +88,10 @@ body {
   overflow: hidden;
 }
 
-button, textarea, input {
-  font: inherit;
-  color: inherit;
-  background: none;
-  border: 0;
-}
-
+/* Tailwind v4 preflight (base layer) already resets button/input/textarea
+   background, border, font, and color while staying overridable by utility
+   classes. Do NOT reintroduce an unlayered reset for those properties: it
+   would outrank every bg-/border- utility on form elements. */
 button { cursor: pointer; }
 textarea { resize: none; }
 
@@ -104,6 +101,20 @@ textarea { resize: none; }
 .pulse { animation: pulse 1.6s ease-in-out infinite; }
 @keyframes pulse {
   0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+/* Desktop command-card running dot: 1.4s sine pulse, alpha 0.45–1.0. */
+.cmd-dot-pulse { animation: cmd-dot-pulse 1.4s ease-in-out infinite; }
+@keyframes cmd-dot-pulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
+
+/* Desktop composer stop button: yellow circle pulsing alpha 188–255. */
+.composer-stop { animation: composer-stop-pulse 1.4s ease-in-out infinite; }
+@keyframes composer-stop-pulse {
+  0%, 100% { opacity: 0.74; }
   50% { opacity: 1; }
 }
 
@@ -224,7 +235,9 @@ textarea { resize: none; }
   overflow: auto;
   background: var(--vt-bg, var(--chat-black));
   overscroll-behavior: contain;
-  touch-action: pan-x pan-y;
+  /* Horizontal pans stay native; vertical drags are handled in JS so they can
+     scroll Ghostty history (or feed arrow keys to alternate-screen TUIs). */
+  touch-action: pan-x;
 }
 .niri-zoomed .ghostty-host {
   padding: 8px;
@@ -249,6 +262,26 @@ textarea { resize: none; }
   min-height: 100%;
   background: var(--vt-bg, var(--chat-black));
   outline: none;
+}
+/* Focusable but invisible key sink: canvases cannot raise the virtual
+   keyboard, so taps focus this instead. 16px font stops iOS focus-zoom. */
+.ghostty-key-input {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  margin: 0;
+  opacity: 0;
+  background: transparent;
+  color: transparent;
+  caret-color: transparent;
+  resize: none;
+  outline: none;
+  font-size: 16px;
+  pointer-events: none;
 }
 
 .terminal-screen {

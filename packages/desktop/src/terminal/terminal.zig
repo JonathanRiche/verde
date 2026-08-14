@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const sdl = @import("zsdl3");
 const ghostty_vt = @import("../vendor/ghostty_vt.zig");
+pub const RenderState = ghostty_vt.RenderState;
 const keybinds = @import("../app/keybinds.zig");
 const process_env = @import("../platform/env.zig");
 const platform_runtime = @import("platform_runtime");
@@ -399,6 +400,20 @@ pub const TerminalLaunchProfile = struct {
 };
 
 pub const TerminalRevivePolicy = sessionizer.RevivePolicy;
+
+fn daemonSessionNeedsLaunchFallback(
+    revive_policy: TerminalRevivePolicy,
+    attached_existing_session: bool,
+) bool {
+    return !attached_existing_session and revive_policy == .attach_or_create;
+}
+
+test "daemon recreation requests launch fallback only for a missing persisted session" {
+    try std.testing.expect(daemonSessionNeedsLaunchFallback(.attach_or_create, false));
+    try std.testing.expect(!daemonSessionNeedsLaunchFallback(.attach_or_create, true));
+    try std.testing.expect(!daemonSessionNeedsLaunchFallback(.restart, false));
+    try std.testing.expect(!daemonSessionNeedsLaunchFallback(.attach_only, false));
+}
 
 pub const SessionSnapshot = struct {
     running: bool,
@@ -1048,6 +1063,17 @@ pub const Dock = struct {
         return false;
     }
 
+    /// Returns whether a persisted daemon identity had to be recreated. The
+    /// workspace owner uses this one-shot signal to restore commands that were
+    /// originally typed into a long-lived shell, such as an agent TUI resume.
+    pub fn takeDaemonSessionRecreated(self: *Dock) bool {
+        var recreated = false;
+        for (self.tabs.items) |*tab| {
+            recreated = takeDaemonSessionRecreatedInNode(tab.root) or recreated;
+        }
+        return recreated;
+    }
+
     /// Reserves one automatic recovery attempt while preventing a shell that
     /// exits immediately from being recreated on every main-loop iteration.
     pub fn reserveAutoRestart(self: *Dock, now_ms: i64) bool {
@@ -1146,6 +1172,12 @@ pub const Dock = struct {
         const pane = self.activePaneConst() orelse return null;
         const session = pane.session orelse return null;
         return try session.screenTextAlloc(allocator);
+    }
+
+    pub fn activeGridSize(self: *const Dock) ?struct { cols: u16, rows: u16 } {
+        const pane = self.activePaneConst() orelse return null;
+        const session = pane.session orelse return null;
+        return .{ .cols = session.cols, .rows = session.rows };
     }
 
     pub fn handleKeyDown(
@@ -2181,6 +2213,17 @@ fn paneNodeHasSessionId(node: *const PaneNode) bool {
     };
 }
 
+fn takeDaemonSessionRecreatedInNode(node: *PaneNode) bool {
+    return switch (node.*) {
+        .leaf => |*leaf| if (leaf.session) |session| session.takeDaemonSessionRecreated() else false,
+        .split => |*split| blk: {
+            const first = takeDaemonSessionRecreatedInNode(split.first);
+            const second = takeDaemonSessionRecreatedInNode(split.second);
+            break :blk first or second;
+        },
+    };
+}
+
 fn findPaneLeaf(node: *PaneNode, pane_id: u32) ?*PaneLeaf {
     return switch (node.*) {
         .leaf => |*leaf| if (leaf.id == pane_id) leaf else null,
@@ -2588,6 +2631,10 @@ const UnsupportedSession = struct {
         return false;
     }
 
+    pub fn takeDaemonSessionRecreated(_: *UnsupportedSession) bool {
+        return false;
+    }
+
     pub fn sessionId(_: *const UnsupportedSession) ?[]const u8 {
         return null;
     }
@@ -2708,6 +2755,9 @@ const UnixSession = struct {
     /// replay cannot reconstruct a full TUI frame — the pane comes back as a
     /// garbled mix of partial frames. Only give up after a sustained outage.
     daemon_poll_failures: u32 = 0,
+    /// Set only when attach-or-create found that a persisted daemon session no
+    /// longer existed. Consumers use it to replay higher-level launch intent.
+    daemon_session_recreated: bool = false,
     daemon_prefetched: bool = false,
     daemon_prefetched_changed: bool = false,
     last_daemon_tail_response: std.ArrayList(u8) = .empty,
@@ -3134,6 +3184,12 @@ const UnixSession = struct {
 
     pub fn isRunning(self: *const UnixSession) bool {
         return self.running;
+    }
+
+    pub fn takeDaemonSessionRecreated(self: *UnixSession) bool {
+        const recreated = self.daemon_session_recreated;
+        self.daemon_session_recreated = false;
+        return recreated;
     }
 
     pub fn snapshot(self: *const UnixSession) SessionSnapshot {
@@ -3624,6 +3680,10 @@ const UnixSession = struct {
         if (attached_existing_session) {
             if (options.restored_modes) |modes| self.applyRestoredTerminalModes(modes);
         }
+        self.daemon_session_recreated = daemonSessionNeedsLaunchFallback(
+            options.revive_policy,
+            attached_existing_session,
+        );
         self.suppress_next_daemon_replay = attached_existing_session;
         self.defer_daemon_replay_until_resize = attached_existing_session;
         self.needs_attach_repaint_kick = attached_existing_session;

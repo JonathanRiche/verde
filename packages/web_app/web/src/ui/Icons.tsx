@@ -3,6 +3,8 @@ import openaiUrl from '../../../../desktop/src/assets/OpenAI-white-monoblossom.p
 import claudeUrl from '../../../../desktop/src/assets/claude-logo.png'
 import opencodeUrl from '../../../../desktop/src/assets/opencode-logo-dark.png'
 import cursorUrl from '../../../../desktop/src/assets/editor_logos/cursor.png'
+import grokUrl from '../../../../desktop/src/assets/grok-logo.png'
+import ampUrl from '../../../../desktop/src/assets/amp-logo.png'
 
 export function VerdeLogo(props: { class?: string }) {
   return <img src={logoUrl} alt="" class={props.class ?? 'h-7 w-7'} />
@@ -20,6 +22,10 @@ export function ProviderGlyph(props: { provider?: string; class?: string }) {
         return opencodeUrl
       case 'cursor':
         return cursorUrl
+      case 'grok':
+        return grokUrl
+      case 'amp':
+        return ampUrl
       default:
         return null
     }

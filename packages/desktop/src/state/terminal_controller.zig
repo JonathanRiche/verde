@@ -92,8 +92,9 @@ pub const OPENCODE_TUI_COMMAND =
     \\if [ -n "$candidate" ]; then exec "$candidate"; fi
     \\exec opencode
 ;
-const GROK_TUI_COMMAND = "grok --no-auto-update --no-alt-screen --no-memory --no-subagents --disable-web-search --permission-mode plan --reasoning-effort low";
+const GROK_TUI_COMMAND = "grok --no-auto-update --no-alt-screen --no-memory --disable-web-search --permission-mode plan --reasoning-effort low";
 const LEGACY_GROK_TUI_COMMAND = "grok --no-auto-update";
+const LEGACY_GROK_NO_SUBAGENTS_TUI_COMMAND = "grok --no-auto-update --no-alt-screen --no-memory --no-subagents --disable-web-search --permission-mode plan --reasoning-effort low";
 
 fn opencodeTuiCommandForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
     return if (os_tag == .windows) "opencode" else OPENCODE_TUI_COMMAND;
@@ -102,11 +103,11 @@ fn opencodeTuiCommandForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
 pub fn defaultAgentTui(provider: stack_config.AgentProvider) ?DefaultAgentTui {
     return switch (provider) {
         .codex => .{ .name = "codex", .command = "codex", .provider = .codex, .notify = true, .mcp = true, .hooks = true },
-        .claude => .{ .name = "claude", .command = "claude", .provider = .claude },
-        .opencode => .{ .name = "opencode", .command = opencodeTuiCommandForOs(builtin.os.tag), .provider = .opencode },
+        .claude => .{ .name = "claude", .command = "claude", .provider = .claude, .notify = true, .hooks = true },
+        .opencode => .{ .name = "opencode", .command = opencodeTuiCommandForOs(builtin.os.tag), .provider = .opencode, .notify = true, .hooks = true },
         .cursor => .{ .name = "cursor", .command = "agent", .provider = .cursor, .notify = true, .hooks = true },
         .grok => .{ .name = "grok", .command = GROK_TUI_COMMAND, .provider = .grok, .notify = true, .hooks = true },
-        .amp => .{ .name = "amp", .command = "amp", .provider = .amp },
+        .amp => .{ .name = "amp", .command = "amp", .provider = .amp, .notify = true, .hooks = true },
         .other => null,
     };
 }
@@ -119,6 +120,7 @@ pub fn isKnownDefaultAgentTuiCommand(provider: stack_config.AgentProvider, comma
         .cursor => std.mem.eql(u8, command, "agent"),
         .grok => std.mem.eql(u8, command, "grok") or
             std.mem.eql(u8, command, LEGACY_GROK_TUI_COMMAND) or
+            std.mem.eql(u8, command, LEGACY_GROK_NO_SUBAGENTS_TUI_COMMAND) or
             std.mem.eql(u8, command, GROK_TUI_COMMAND),
         .amp => std.mem.eql(u8, command, "amp"),
         .other => false,
@@ -152,17 +154,27 @@ pub fn agentTuiProviderFromProcessName(name: []const u8) ?stack_config.AgentProv
     return null;
 }
 
+test "managed AI TUI defaults enable lifecycle hooks" {
+    const providers = [_]stack_config.AgentProvider{ .claude, .codex, .cursor, .grok, .amp, .opencode };
+    for (providers) |provider| {
+        const defaults = defaultAgentTui(provider).?;
+        try std.testing.expect(defaults.notify);
+        try std.testing.expect(defaults.hooks);
+    }
+}
+
 test "Grok TUI defaults use the least-privilege launch mode" {
     const defaults = defaultAgentTui(.grok).?;
     try std.testing.expectEqualStrings("grok", defaults.name);
     try std.testing.expectEqualStrings(
-        "grok --no-auto-update --no-alt-screen --no-memory --no-subagents --disable-web-search --permission-mode plan --reasoning-effort low",
+        "grok --no-auto-update --no-alt-screen --no-memory --disable-web-search --permission-mode plan --reasoning-effort low",
         defaults.command,
     );
     try std.testing.expect(defaults.notify);
     try std.testing.expect(defaults.hooks);
     try std.testing.expect(isKnownDefaultAgentTuiCommand(.grok, "grok"));
     try std.testing.expect(isKnownDefaultAgentTuiCommand(.grok, LEGACY_GROK_TUI_COMMAND));
+    try std.testing.expect(isKnownDefaultAgentTuiCommand(.grok, LEGACY_GROK_NO_SUBAGENTS_TUI_COMMAND));
     try std.testing.expectEqual(stack_config.AgentProvider.grok, agentTuiProviderFromProcessName("grok").?);
 }
 
@@ -737,6 +749,19 @@ pub fn pollTerminals(self: anytype) bool {
                 };
                 if (project_index == self.project_controller.selected_index) {
                     visible_changed = true;
+                }
+            }
+            if (entry.dock.takeDaemonSessionRecreated()) {
+                const resumed = self.resumeRecreatedThreadTui(project_index, entry.id) catch |err| blk: {
+                    log.warn("failed to resume recreated TUI dock {d}: {s}", .{ entry.id, @errorName(err) });
+                    break :blk false;
+                };
+                if (resumed) {
+                    log.info("resumed TUI after daemon session recreation for dock {d}", .{entry.id});
+                    if (project_index == self.project_controller.selected_index) {
+                        self.setSidebarNotice("Restored thread in TUI.");
+                        visible_changed = true;
+                    }
                 }
             }
             if (!dock_visible and !entry.dock.hasRunningSession()) continue;

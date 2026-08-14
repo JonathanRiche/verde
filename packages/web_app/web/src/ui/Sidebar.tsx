@@ -128,7 +128,12 @@ function PaneRow(props: { pane: LivePane; activeCluster?: boolean; onClick: () =
       class={`mb-[4px] flex h-[38px] w-full items-center gap-2.5 rounded-[7px] px-2.5 text-left ${focused() ? 'bg-[var(--accent-row)]' : 'hover:bg-[var(--accent-hover)]'}`}
       onClick={props.onClick}
     >
-      <Show when={props.pane.kind === 'chat'} fallback={<Icon name="terminal" class="h-[18px] w-[18px] text-[var(--text-muted)]" />}>
+      {/* Terminal panes hosting a TUI agent carry its provider, mirroring the
+          desktop's agent-terminal glyph; plain shells keep the terminal icon. */}
+      <Show
+        when={props.pane.kind === 'chat' || (props.pane.kind === 'terminal' && props.pane.provider)}
+        fallback={<Icon name="terminal" class="h-[18px] w-[18px] text-[var(--text-muted)]" />}
+      >
         <ProviderGlyph provider={props.pane.provider} />
       </Show>
       <span class="min-w-0 flex-1 truncate text-[13px] text-[var(--text-muted)]">{store.paneTitle(props.pane)}</span>
