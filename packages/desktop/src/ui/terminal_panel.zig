@@ -135,13 +135,13 @@ const TerminalPaneDrawCache = struct {
     cols: u16 = 0,
     font_scale: f32 = 0.0,
     screen: @TypeOf(ghostty_vt.RenderState.empty.screen) = .primary,
-    // Cache the cursor position so a pure cursor move forces a rebuild even
-    // if the dirty flag doesn't propagate (e.g. a same-cell SGR that doesn't
-    // touch the rendered grid). Otherwise the previous frame's cursor
-    // highlight can linger over the old cell.
+    // Cache cursor state so pure moves and visual-style changes force a
+    // rebuild even if the dirty flag doesn't propagate. Otherwise the
+    // previous frame's cursor can linger over the old cell or keep its shape.
     cursor_x: u16 = 0,
     cursor_y: u16 = 0,
     cursor_visible: bool = false,
+    cursor_visual_style: @TypeOf(ghostty_vt.RenderState.empty.cursor.visual_style) = .block,
     row_start: usize = 0,
     visible_rows: usize = 0,
     selection_dynamic: bool = false,
@@ -161,6 +161,15 @@ const TerminalPaneDrawCache = struct {
             self.row_start == row_start and
             self.visible_rows == visible_rows and
             self.selection_dynamic == selection_dynamic;
+    }
+
+    fn cursorStateChanged(self: *const TerminalPaneDrawCache, render_state: *const ghostty_vt.RenderState) bool {
+        const cursor_x: u16 = if (render_state.cursor.viewport) |cursor| @intCast(cursor.x) else 0;
+        const cursor_y: u16 = if (render_state.cursor.viewport) |cursor| @intCast(cursor.y) else 0;
+        return self.cursor_x != cursor_x or
+            self.cursor_y != cursor_y or
+            self.cursor_visible != render_state.cursor.visible or
+            self.cursor_visual_style != render_state.cursor.visual_style;
     }
 
     fn prepareRows(self: *TerminalPaneDrawCache, allocator: std.mem.Allocator, visible_rows: usize, reset_all: bool) bool {
@@ -190,6 +199,7 @@ const TerminalPaneDrawCache = struct {
         self.cursor_x = if (render_state.cursor.viewport) |c| @intCast(c.x) else 0;
         self.cursor_y = if (render_state.cursor.viewport) |c| @intCast(c.y) else 0;
         self.cursor_visible = render_state.cursor.visible;
+        self.cursor_visual_style = render_state.cursor.visual_style;
         self.row_start = row_start;
         self.visible_rows = visible_rows;
         self.selection_dynamic = selection_dynamic;
@@ -707,12 +717,8 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
     const visible_cols = @min(@as(usize, render_state.cols), @as(usize, @intFromFloat(@ceil(rect.w / cell_w))));
     const row_start = visibleRowStart(render_state, visible_rows);
     const geometry_valid = cache.geometryValidFor(render_state, rect, font_scale, row_start, visible_rows, selection_dynamic);
-    const cursor_x: u16 = if (render_state.cursor.viewport) |cursor| @intCast(cursor.x) else 0;
     const cursor_y: u16 = if (render_state.cursor.viewport) |cursor| @intCast(cursor.y) else 0;
-    const cursor_changed = !geometry_valid or
-        cache.cursor_x != cursor_x or
-        cache.cursor_y != cursor_y or
-        cache.cursor_visible != render_state.cursor.visible;
+    const cursor_changed = !geometry_valid or cache.cursorStateChanged(render_state);
     const cache_ready = cache.prepareRows(state.allocator, visible_rows, !geometry_valid);
     const rebuild_all = !cache_ready or
         !geometry_valid or
@@ -805,6 +811,10 @@ fn renderViewportRow(
         const span = @as(f32, @floatFromInt(cellWidthCells(raw_cell)));
         const cell_rect = terminalCellRect(grid_rect, cell_w, cell_h, x, visual_y, span);
         if (cell_rect.x >= rect.x + rect.w) break;
+        var draw_cursor_overlay = false;
+        // Bar, underline, and hollow cursors must be the final cell command so
+        // explicit TUI backgrounds and glyphs cannot paint over them.
+        defer if (draw_cursor_overlay) drawCursor(state, render_state, cell_rect, rect);
         const cell_style = styleForCell(raw_cell, row_styles, x);
         var bg = cell_style.bg(&raw_cell, &render_state.colors.palette) orelse render_state.colors.background;
         var fg = cell_style.fg(.{ .default = render_state.colors.foreground, .palette = &render_state.colors.palette, .bold = .bright });
@@ -826,7 +836,7 @@ fn renderViewportRow(
                     bg = blendRgb(bg, cursor_fill, 0.62);
                     fg = render_state.colors.background;
                 } else {
-                    drawCursor(state, render_state, cell_rect, rect);
+                    draw_cursor_overlay = true;
                 }
             }
         }
@@ -2744,4 +2754,16 @@ test "terminal row cache rebuilds only changed or cursor-affected rows" {
     try std.testing.expect(terminalRowNeedsRebuild(false, true, false, true));
     try std.testing.expect(terminalRowNeedsRebuild(false, false, false, false));
     try std.testing.expect(terminalRowNeedsRebuild(true, true, false, false));
+}
+
+test "terminal row cache detects cursor visual style changes" {
+    var render_state: ghostty_vt.RenderState = .empty;
+    const cache: TerminalPaneDrawCache = .{
+        .cursor_visible = true,
+        .cursor_visual_style = .block,
+    };
+
+    try std.testing.expect(!cache.cursorStateChanged(&render_state));
+    render_state.cursor.visual_style = .bar;
+    try std.testing.expect(cache.cursorStateChanged(&render_state));
 }
