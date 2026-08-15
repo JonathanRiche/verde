@@ -65,6 +65,10 @@ pub const State = struct {
     flush_snapshot_generation: u64 = 0,
     /// Earliest wall-clock ms to attempt another frame-loop flush after a failure.
     next_flush_attempt_ms: i64 = 0,
+    /// First failed save in the current uninterrupted dirty-state episode.
+    /// Daemon read heartbeats must not clear this; only a durable save or spool
+    /// can prove the user's pending changes are safe.
+    persistence_failure_started_at_ms: i64 = 0,
     /// Payload rejected because its capture-time revision lost a race. It is
     /// retained until the cursor refresh rebases its local UI edits.
     rebase_snapshot: ?LoadedPersistedState = null,
@@ -125,9 +129,26 @@ pub const State = struct {
         return self.shouldFlush(now_ms, SAVE_DEBOUNCE_MS);
     }
 
+    pub fn notePersistenceFailure(self: *State, now_ms: i64) void {
+        if (self.persistence_failure_started_at_ms == 0) {
+            self.persistence_failure_started_at_ms = now_ms;
+        }
+    }
+
+    pub fn persistenceFailureForMs(self: State, now_ms: i64) ?i64 {
+        const since_ms = self.persistence_failure_started_at_ms;
+        if (since_ms == 0) return null;
+        return if (now_ms > since_ms) now_ms - since_ms else 0;
+    }
+
+    pub fn clearPersistenceFailure(self: *State) void {
+        self.persistence_failure_started_at_ms = 0;
+    }
+
     pub fn clearDirty(self: *State) void {
         self.dirty = false;
         self.selection_only = false;
+        self.clearPersistenceFailure();
         if (self.snapshot_capture) |*capture| capture.deinit();
         self.snapshot_capture = null;
     }
@@ -276,6 +297,7 @@ fn scheduleFlushWorker(self: anytype, now_ms: i64) void {
         self.lifecycle.projection_baseline_revision = observed_revision;
         storage.allocator.destroy(args);
         storage.allocator.destroy(result);
+        self.lifecycle.notePersistenceFailure(now_ms);
         storage.markPersistenceUnavailable();
         self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
         return;
@@ -387,6 +409,7 @@ fn scheduleSelectionFlushWorker(
         self.lifecycle.projection_baseline_revision = observed_revision;
         storage.allocator.destroy(args);
         storage.allocator.destroy(result);
+        self.lifecycle.notePersistenceFailure(now_ms);
         storage.markPersistenceUnavailable();
         self.lifecycle.next_flush_attempt_ms = now_ms + FLUSH_RETRY_BACKOFF_MS;
         return;
@@ -470,6 +493,7 @@ pub fn pollFlushWorker(self: anytype) void {
         self.lifecycle.next_flush_attempt_ms = now + FLUSH_RETRY_BACKOFF_MS;
     } else {
         log.err("async native state save failed; retaining dirty and backing off", .{});
+        self.lifecycle.notePersistenceFailure(now);
         storage.markPersistenceUnavailable();
         self.lifecycle.next_flush_attempt_ms = now + FLUSH_UNAVAILABLE_PROBE_MS;
     }
@@ -493,6 +517,7 @@ fn logSdlStall(name: []const u8, started_at_ms: i64) void {
 
 fn noteCompletedSpool(state: *State, captured_generation: u64) void {
     if (state.dirty_generation == captured_generation) state.dirty_spooled = true;
+    state.clearPersistenceFailure();
     state.next_flush_attempt_ms = 0;
 }
 
@@ -584,6 +609,7 @@ fn flushDirtyBlockingResult(self: anytype) !void {
             } else {
                 log.err("failed to save native state via daemon: {s}", .{@errorName(err)});
             }
+            self.lifecycle.notePersistenceFailure(platform_runtime.unixTimestampMs());
             self.storage.markPersistenceUnavailable();
             self.lifecycle.next_flush_attempt_ms = platform_runtime.unixTimestampMs() + FLUSH_RETRY_BACKOFF_MS;
             return spoolDirtyState(self, "shutdown save failed");
@@ -621,6 +647,7 @@ fn spoolDirtyState(self: anytype, reason: []const u8) !void {
         return err;
     };
     self.lifecycle.dirty_spooled = true;
+    self.lifecycle.clearPersistenceFailure();
     log.warn("durably spooled dirty native state: {s}", .{reason});
 }
 
@@ -655,6 +682,16 @@ test "lifecycle debounce requires both dirty and interaction quiet periods" {
     try std.testing.expect(state.shouldFlush(950, 750));
     state.clearDirty();
     try std.testing.expect(!state.shouldFlush(2000, 750));
+}
+
+test "persistence failure timing survives retries until durability recovers" {
+    var state: State = .{};
+    try std.testing.expect(state.persistenceFailureForMs(100) == null);
+    state.notePersistenceFailure(100);
+    state.notePersistenceFailure(250);
+    try std.testing.expectEqual(@as(?i64, 300), state.persistenceFailureForMs(400));
+    state.clearPersistenceFailure();
+    try std.testing.expect(state.persistenceFailureForMs(500) == null);
 }
 
 test "incremental snapshot and worker ownership keep frame progress scheduled" {
