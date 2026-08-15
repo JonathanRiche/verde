@@ -91,6 +91,15 @@ Notes for agents:
 - Serve/funnel often need `sudo` or `sudo tailscale set --operator=$USER` once. Do not loop on a failing sudo prompt.
 - Android Chrome **Install app** requires the **https://\*.ts.net** (or Cloudflare HTTPS) URL, not `http://100.x:6783`.
 
+## Terminal engine (ghostty-vt.wasm)
+
+The web terminal uses the official pre-built `ghostty-vt.wasm` from upstream `ghostty-org/ghostty`, vendored at `web/src/assets/` with its pin, SHA-256, and bump procedure documented in `ghostty-vt.NOTICE.md` beside it. The Verde-owned binding is `web/src/lib/ghostty_vt.ts`.
+
+- The wasm commit must match the desktop Zig pin in `packages/desktop/build.zig.zon` — bump both together, never independently.
+- Fresh builds come from `https://tip.files.ghostty.org/<commit>/ghostty-vt.wasm`; update the NOTICE (commit + hash) whenever the wasm changes.
+- The module requires wasm SIMD128 (any current browser).
+- Do not reintroduce third-party wrapper packages (e.g. `@slopus/ghostty-wasm`); extend the binding instead.
+
 ## PWA
 
 Manifest, icons, and `sw.js` live under `web/public/`. Service worker must not cache `/api` or `/ws`. After changing SW/manifest, users may need a hard refresh on the phone.
