@@ -1386,6 +1386,21 @@ pub fn formatCtrlKeyTipAt(buf: []u8, bindings: []const Keybind, index: usize) []
     return buf[0..count];
 }
 
+/// Formats the key portion of the first Ctrl+Shift binding. Commands rebound
+/// away from Ctrl+Shift stay out of Ctrl+Shift reveal mode.
+pub fn formatCtrlShiftKeyTip(buf: []u8, bindings: []const Keybind) []const u8 {
+    for (bindings) |binding| {
+        const primary_is_ctrl = binding.primary and builtin.os.tag != .macos;
+        if ((!binding.ctrl and !primary_is_ctrl) or binding.alt or binding.meta or !binding.shift) continue;
+        const name = keycodeLabel(binding.key);
+        const count = @min(buf.len, name.len);
+        @memcpy(buf[0..count], name[0..count]);
+        for (buf[0..count]) |*byte| byte.* = std.ascii.toUpper(byte.*);
+        return buf[0..count];
+    }
+    return "";
+}
+
 /// Formats the key portion of an indexed Ctrl+Shift binding used by ACTIVE rows.
 pub fn formatCtrlShiftKeyTipAt(buf: []u8, bindings: []const Keybind, index: usize) []const u8 {
     if (index >= bindings.len) return "";
@@ -1634,6 +1649,16 @@ test "parse accelerator matches desktop-style refresh binding" {
     try std.testing.expect(binding.primary);
     try std.testing.expectEqual(false, binding.shift);
     try std.testing.expectEqual(sdl.Keycode.r, binding.key);
+}
+
+test "ctrl shift key tip follows the first matching configured binding" {
+    const bindings: [2]Keybind = .{
+        .{ .alt = true, .shift = true, .key = .x },
+        .{ .ctrl = true, .shift = true, .key = .o },
+    };
+    var buf: [16]u8 = undefined;
+
+    try std.testing.expectEqualStrings("O", formatCtrlShiftKeyTip(&buf, &bindings));
 }
 
 test "array parsing deduplicates repeated bindings" {
