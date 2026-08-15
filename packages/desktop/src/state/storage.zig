@@ -1303,6 +1303,18 @@ pub const Storage = struct {
             {
                 return error.UnknownClientId;
             }
+            // A structurally rejected snapshot is not a connectivity failure.
+            // Retrying the same multi-megabyte payload on the unavailable
+            // cadence only monopolizes the save worker and makes the desktop
+            // appear to freeze while healthy read RPCs continue to succeed.
+            // The lifecycle worker durably spools this generation instead.
+            if (std.mem.eql(u8, err.code, headless.protocol.ERR_INVALID_PARAMS)) {
+                runtime_log.diagnostic(
+                    "persistence mutation failure operation={s} kind=rejected code={s}",
+                    .{ method, err.code },
+                );
+                return error.StoreMutationRejected;
+            }
             runtime_log.diagnostic(
                 "persistence mutation failure operation={s} kind=rpc_error code={s}",
                 .{ method, err.code },
