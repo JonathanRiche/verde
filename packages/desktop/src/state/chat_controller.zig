@@ -3414,6 +3414,54 @@ test "daemon chat tail polling keeps the active display cadence" {
     try std.testing.expect(daemonChatPollDue(100, 10));
 }
 
+test "daemon tail hydrates the missing user row for externally started turns" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "external turn");
+    defer thread.deinit(allocator);
+    thread.send_state.status = .pending;
+    thread.send_state.daemon_owned = true;
+
+    const HydrateState = struct {
+        allocator: std.mem.Allocator,
+        dirty: usize = 0,
+        fn markDirty(self: *@This()) void {
+            self.dirty += 1;
+        }
+        // Comptime requirement of the anytype tail applier; the test response
+        // carries no events, so this never runs.
+        fn applyDaemonChatEventLocked(_: *@This(), _: *SendState, _: []const u8, _: []const u8) !void {}
+    };
+    var state: HydrateState = .{ .allocator = allocator };
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"status":"running","events":[],"next_seq":1,"user_message_id":"web-turn:u1","user_prompt":"hello from web"}}
+    ;
+    try std.testing.expect(try applyDaemonChatTurnTail(&state, &thread, response));
+    try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
+    const row = thread.messages.items[0];
+    try std.testing.expect(row.role == .user);
+    try std.testing.expectEqualStrings("You", row.author);
+    try std.testing.expectEqualStrings("hello from web", row.body);
+    try std.testing.expectEqualStrings("web-turn:u1", row.message_id.?);
+    try std.testing.expectEqual(@as(usize, 1), state.dirty);
+
+    // Idempotent across polls: the same identity never duplicates the row
+    // (this also covers desktop-originated sends, whose staged user row
+    // already carries the acceptance id).
+    _ = try applyDaemonChatTurnTail(&state, &thread, response);
+    try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.dirty);
+}
+
+/// True when the thread transcript already carries a row with this durable
+/// identity (acceptance-staged user rows and adopted daemon rows both qualify).
+fn threadHasMessageId(thread: *const ChatThread, message_id: []const u8) bool {
+    for (thread.messages.items) |message| {
+        const existing = message.message_id orelse continue;
+        if (std.mem.eql(u8, existing, message_id)) return true;
+    }
+    return false;
+}
+
 pub fn applyDaemonChatTurnTail(self: anytype, thread: *ChatThread, response: []const u8) !bool {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response, .{});
     defer parsed.deinit();
@@ -3433,6 +3481,35 @@ pub fn applyDaemonChatTurnTail(self: anytype, thread: *ChatThread, response: []c
     }
     if (jsonValueString(result.object.get("active_turn_id") orelse .null)) |turn_id| {
         try replacePageOwned(&send_state.active_turn_id, turn_id);
+    }
+    // Attach hydration: turns started from another client (web/CLI/MCP) never
+    // staged a local user row, so the desktop transcript was missing the
+    // prompt. Mirror it from the tail's acceptance identity; keyed by
+    // user_message_id so desktop-originated sends (row already staged with
+    // the same id) and repeated polls stay idempotent.
+    if (jsonValueString(result.object.get("user_message_id") orelse .null)) |user_message_id| {
+        if (jsonValueString(result.object.get("user_prompt") orelse .null)) |user_prompt| {
+            if (!threadHasMessageId(thread, user_message_id)) {
+                const owned_author = try self.allocator.dupeZ(u8, "You");
+                errdefer self.allocator.free(owned_author);
+                const owned_body = try self.allocator.dupeZ(u8, user_prompt);
+                errdefer self.allocator.free(owned_body);
+                const owned_extra = try self.allocator.alloc(ChatImageAttachment, 0);
+                errdefer self.allocator.free(owned_extra);
+                const owned_id = try self.allocator.dupe(u8, user_message_id);
+                errdefer self.allocator.free(owned_id);
+                try thread.messages.append(self.allocator, .{
+                    .role = .user,
+                    .author = owned_author,
+                    .body = owned_body,
+                    .extra_images = owned_extra,
+                    .message_id = owned_id,
+                });
+                thread.touch();
+                self.markDirty();
+                changed = true;
+            }
+        }
     }
     if (events == .array) {
         for (events.array.items) |event_value| {

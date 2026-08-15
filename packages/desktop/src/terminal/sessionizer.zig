@@ -8195,6 +8195,12 @@ fn writeChatTurnTail(s: *std.json.Stringify, turn: *const ChatTurn, after_seq: u
     if (turn.provider_thread_id) |value| try s.write(value) else try s.write(null);
     try s.objectField("active_turn_id");
     if (turn.active_turn_id) |value| try s.write(value) else try s.write(null);
+    // Attach hydration: clients that did not start this turn (e.g. desktop
+    // viewing a web-started turn) mirror the user row from these two fields.
+    try s.objectField("user_message_id");
+    if (turn.user_message_id) |value| try s.write(value) else try s.write(null);
+    try s.objectField("user_prompt");
+    try s.write(turn.request.prompt);
     try s.objectField("result_reply_text");
     if (turn.result_reply_text) |value| try s.write(value) else try s.write(null);
     try s.objectField("generated_title");
@@ -8251,6 +8257,13 @@ fn durableChatTurnTailResponse(
     if (record.provider_thread_id) |value| try s.write(value) else try s.write(null);
     try s.objectField("active_turn_id");
     try s.write(null);
+    // Durable fallback: the prompt text is not on the ledger row, so attach
+    // hydration is unavailable here; terminal transcripts converge via the
+    // durable store instead.
+    try s.objectField("user_message_id");
+    if (record.user_message_id) |value| try s.write(value) else try s.write(null);
+    try s.objectField("user_prompt");
+    try s.write(null);
     try s.objectField("result_reply_text");
     try s.write(null);
     try s.objectField("generated_title");
@@ -8284,6 +8297,8 @@ fn chatTailUpperBound(turn: *const ChatTurn, after_seq: u64) usize {
     }
     if (turn.provider_thread_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
     if (turn.active_turn_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
+    if (turn.user_message_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
+    total = saturatedAdd(total, jsonStringUpperBound(turn.request.prompt.len));
     if (turn.result_reply_text) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
     if (turn.generated_title_applied) {
         if (turn.generated_title) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
