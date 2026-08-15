@@ -24,6 +24,8 @@ pub const NativeKeyboardAction = enum {
     chat_page_down,
     workspace_previous,
     workspace_next,
+    workspace_active_previous,
+    workspace_active_next,
     workspace_pane_previous,
     workspace_pane_next,
     workspace_split_chat_vertical,
@@ -137,6 +139,8 @@ pub const NativeKeyboardConfig = struct {
     chat_run_config: []Keybind,
     workspace_previous: []Keybind,
     workspace_next: []Keybind,
+    workspace_active_previous: []Keybind,
+    workspace_active_next: []Keybind,
     workspace_pane_previous: []Keybind,
     workspace_pane_next: []Keybind,
     terminal_new_tab: []Keybind,
@@ -198,6 +202,8 @@ pub const NativeKeyboardConfig = struct {
             .chat_run_config = try cloneDefaultChatRunConfigKeybinds(allocator),
             .workspace_previous = try cloneDefaultWorkspacePreviousKeybinds(allocator),
             .workspace_next = try cloneDefaultWorkspaceNextKeybinds(allocator),
+            .workspace_active_previous = try cloneDefaultWorkspaceActivePreviousKeybinds(allocator),
+            .workspace_active_next = try cloneDefaultWorkspaceActiveNextKeybinds(allocator),
             .workspace_pane_previous = try cloneDefaultWorkspacePanePreviousKeybinds(allocator),
             .workspace_pane_next = try cloneDefaultWorkspacePaneNextKeybinds(allocator),
             .terminal_new_tab = try cloneDefaultTerminalNewTabKeybinds(allocator),
@@ -270,6 +276,8 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.chat_run_config);
         self.allocator.free(self.workspace_previous);
         self.allocator.free(self.workspace_next);
+        self.allocator.free(self.workspace_active_previous);
+        self.allocator.free(self.workspace_active_next);
         self.allocator.free(self.workspace_pane_previous);
         self.allocator.free(self.workspace_pane_next);
         self.allocator.free(self.terminal_new_tab);
@@ -359,6 +367,12 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.workspace_next, event)) {
             return .workspace_next;
+        }
+        if (matchesAny(self.workspace_active_previous, event)) {
+            return .workspace_active_previous;
+        }
+        if (matchesAny(self.workspace_active_next, event)) {
+            return .workspace_active_next;
         }
         if (matchesAny(self.workspace_pane_previous, event)) {
             return .workspace_pane_previous;
@@ -904,6 +918,18 @@ pub const NativeKeyboardConfig = struct {
                 self.workspace_next = bindings;
             }
         }
+        if (workspace_value.object.get("active_previous")) |value| {
+            if (self.parseOverrideValue(value, "workspace.active_previous")) |bindings| {
+                self.allocator.free(self.workspace_active_previous);
+                self.workspace_active_previous = bindings;
+            }
+        }
+        if (workspace_value.object.get("active_next")) |value| {
+            if (self.parseOverrideValue(value, "workspace.active_next")) |bindings| {
+                self.allocator.free(self.workspace_active_next);
+                self.workspace_active_next = bindings;
+            }
+        }
         if (workspace_value.object.get("pane_previous")) |value| {
             if (self.parseOverrideValue(value, "workspace.pane_previous")) |bindings| {
                 self.allocator.free(self.workspace_pane_previous);
@@ -1212,6 +1238,18 @@ fn cloneDefaultWorkspacePreviousKeybinds(allocator: std.mem.Allocator) ![]Keybin
 fn cloneDefaultWorkspaceNextKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Alt+Down"),
+    });
+}
+
+fn cloneDefaultWorkspaceActivePreviousKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Ctrl+Shift+Left"),
+    });
+}
+
+fn cloneDefaultWorkspaceActiveNextKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Ctrl+Shift+Right"),
     });
 }
 
@@ -2014,6 +2052,21 @@ test "default workspace traversal uses alt up and down" {
     try std.testing.expectEqual(sdl.Keycode.down, config.workspace_next[0].key);
 }
 
+test "default ACTIVE pane cycling uses ctrl shift left and right" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.workspace_active_previous.len);
+    try std.testing.expect(config.workspace_active_previous[0].ctrl);
+    try std.testing.expect(config.workspace_active_previous[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.left, config.workspace_active_previous[0].key);
+
+    try std.testing.expectEqual(@as(usize, 1), config.workspace_active_next.len);
+    try std.testing.expect(config.workspace_active_next[0].ctrl);
+    try std.testing.expect(config.workspace_active_next[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.right, config.workspace_active_next[0].key);
+}
+
 test "default pane cycling uses ctrl tab in both directions" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
@@ -2049,6 +2102,28 @@ test "workspace pane cycling keybinds are configurable" {
     try std.testing.expectEqual(@as(usize, 1), config.workspace_pane_next.len);
     try std.testing.expect(config.workspace_pane_next[0].alt);
     try std.testing.expectEqual(sdl.Keycode.n, config.workspace_pane_next[0].key);
+}
+
+test "ACTIVE pane cycling keybinds are configurable" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"workspace": {
+        \\  "active_previous": "Alt+P",
+        \\  "active_next": "Alt+N"
+        \\}}}
+    , .{});
+    defer parsed.deinit();
+
+    config.applyOverrides(parsed.value);
+
+    try std.testing.expectEqual(@as(usize, 1), config.workspace_active_previous.len);
+    try std.testing.expect(config.workspace_active_previous[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.p, config.workspace_active_previous[0].key);
+    try std.testing.expectEqual(@as(usize, 1), config.workspace_active_next.len);
+    try std.testing.expect(config.workspace_active_next[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.n, config.workspace_active_next[0].key);
 }
 
 test "scrolling workspace keybinds are configurable" {

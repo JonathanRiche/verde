@@ -1246,6 +1246,54 @@ pub fn focusAttentionClusterRowAtIndex(state: *runtime.AppState, row_index: usiz
     return true;
 }
 
+/// Cycles through only the rows currently shown in the global ACTIVE section.
+pub fn focusAdjacentAttentionClusterRow(state: *runtime.AppState, delta: i32) bool {
+    if (delta == 0) return false;
+    var rows: [palette_hits.len]AttentionClusterRow = undefined;
+    const row_count = collectAttentionClusterRows(state, &rows);
+    if (row_count == 0) return false;
+    sortAttentionClusterRows(rows[0..row_count]);
+
+    const current_pane_id = if (state.project_controller.selected_index < state.project_controller.projects.items.len)
+        state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.focused_pane_id
+    else
+        null;
+    const target_index = adjacentAttentionClusterRowIndex(
+        rows[0..row_count],
+        state.project_controller.selected_index,
+        current_pane_id,
+        delta,
+    );
+    const row = rows[target_index];
+    state.focusWorkspaceOpenPaneFromSidebar(row.project_index, row.pane.id);
+    return true;
+}
+
+fn adjacentAttentionClusterRowIndex(
+    rows: []const AttentionClusterRow,
+    current_project_index: usize,
+    current_pane_id: ?native_state.WorkspacePaneId,
+    delta: i32,
+) usize {
+    std.debug.assert(rows.len > 0);
+    std.debug.assert(delta != 0);
+    var current_index: ?usize = null;
+    if (current_pane_id) |pane_id| {
+        for (rows, 0..) |row, index| {
+            if (row.project_index == current_project_index and row.pane.id == pane_id) {
+                current_index = index;
+                break;
+            }
+        }
+    }
+
+    if (current_index) |index| {
+        if (delta < 0) return if (index == 0) rows.len - 1 else index - 1;
+        return if (index + 1 == rows.len) 0 else index + 1;
+    }
+    return if (delta < 0) rows.len - 1 else 0;
+}
+
 fn sortAttentionClusterRows(rows: []AttentionClusterRow) void {
     var sort_index: usize = 1;
     while (sort_index < rows.len) : (sort_index += 1) {
@@ -2551,6 +2599,25 @@ test "ACTIVE rows put durable completions first in finish order" {
     try std.testing.expectEqual(@as(native_state.WorkspacePaneId, 3), rows[0].pane.id);
     try std.testing.expectEqual(@as(native_state.WorkspacePaneId, 2), rows[1].pane.id);
     try std.testing.expectEqual(@as(native_state.WorkspacePaneId, 1), rows[2].pane.id);
+}
+
+test "ACTIVE row cycling wraps and enters from either edge" {
+    var panes = [_]native_state.WorkspacePane{
+        .{ .id = 11, .ref = .{ .browser = .{} } },
+        .{ .id = 22, .ref = .{ .browser = .{} } },
+        .{ .id = 33, .ref = .{ .browser = .{} } },
+    };
+    const rows = [_]AttentionClusterRow{
+        .{ .project_index = 0, .pane = &panes[0], .completed_at_ms = null },
+        .{ .project_index = 1, .pane = &panes[1], .completed_at_ms = null },
+        .{ .project_index = 1, .pane = &panes[2], .completed_at_ms = null },
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), adjacentAttentionClusterRowIndex(&rows, 0, 11, -1));
+    try std.testing.expectEqual(@as(usize, 1), adjacentAttentionClusterRowIndex(&rows, 0, 11, 1));
+    try std.testing.expectEqual(@as(usize, 0), adjacentAttentionClusterRowIndex(&rows, 1, 33, 1));
+    try std.testing.expectEqual(@as(usize, 2), adjacentAttentionClusterRowIndex(&rows, 0, null, -1));
+    try std.testing.expectEqual(@as(usize, 0), adjacentAttentionClusterRowIndex(&rows, 0, null, 1));
 }
 
 test "ACTIVE collection sees every restored chat pane and deduplicates one thread owner" {
