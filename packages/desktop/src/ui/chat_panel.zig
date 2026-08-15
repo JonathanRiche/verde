@@ -88,6 +88,15 @@ const TranscriptHit = struct {
 var transcript_hit_count: usize = 0;
 var transcript_hits: [MAX_TRANSCRIPT_HITS]TranscriptHit = [_]TranscriptHit{.{}} ** MAX_TRANSCRIPT_HITS;
 
+const FollowupPinHit = struct {
+    pane_id: ?app_state.WorkspacePaneId = null,
+    rect: palette.Rect = .{},
+};
+
+const MAX_FOLLOWUP_PIN_HITS = 16;
+var followup_pin_hit_count: usize = 0;
+var followup_pin_hits: [MAX_FOLLOWUP_PIN_HITS]FollowupPinHit = [_]FollowupPinHit{.{}} ** MAX_FOLLOWUP_PIN_HITS;
+
 const UsageActionHit = struct {
     rect: palette.Rect = .{},
 };
@@ -200,6 +209,7 @@ pub fn renderWorkspace(state: *app_state.AppState, width: f32, height: f32) void
 
 pub fn resetTranscriptHitCache() void {
     transcript_hit_count = 0;
+    followup_pin_hit_count = 0;
     usage_action_hit_count = 0;
     diff_file_open_hit_count = 0;
     diff_layout_hit_count = 0;
@@ -225,6 +235,7 @@ pub fn clipTranscriptHitCache(bounds: palette.Rect) void {
 
 pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
     resetWorkspaceHeaderHitCache();
+    followup_pin_hit_count = 0;
     renderWorkspaceAtForPane(state, rect, null);
 }
 
@@ -429,13 +440,10 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
                 .h = theme.scaledUi(FOLLOWUP_PIN_HEIGHT),
             };
             renderPendingFollowupPin(state, pin_rect, fp, state.currentThread().provider);
-            // Register the hit rect so a double-click can pull it back for editing.
-            state.setFollowupPinRect(pin_rect);
-        } else {
-            state.setFollowupPinRect(null);
+            // Keep every pane's target: later panes must not erase an earlier
+            // queued card before input routing runs for this frame.
+            appendFollowupPinHit(pane_id, pin_rect);
         }
-    } else {
-        state.setFollowupPinRect(null);
     }
     if (pending_approval) |approval| {
         const card_rect = palette.Rect{
@@ -678,6 +686,44 @@ fn transcriptActionAt(x: f32, y: f32) ?TranscriptAction {
         if (rectContains(hit.rect, x, y)) return .{ .image_open = hit.path };
     }
     return null;
+}
+
+fn appendFollowupPinHit(pane_id: ?app_state.WorkspacePaneId, rect: palette.Rect) void {
+    if (followup_pin_hit_count >= followup_pin_hits.len) return;
+    followup_pin_hits[followup_pin_hit_count] = .{ .pane_id = pane_id, .rect = rect };
+    followup_pin_hit_count += 1;
+}
+
+fn followupPinHitAt(x: f32, y: f32) ?FollowupPinHit {
+    var index = followup_pin_hit_count;
+    while (index > 0) {
+        index -= 1;
+        const hit = followup_pin_hits[index];
+        if (rectContains(hit.rect, x, y)) return hit;
+    }
+    return null;
+}
+
+/// Pulls a queued follow-up in any visible chat pane back into its composer.
+pub fn handleFollowupPinMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
+    const hit = followupPinHitAt(x, y) orelse return false;
+    if (!down) return true;
+    if (hit.pane_id) |pane_id| _ = state.focusCurrentProjectWorkspacePane(pane_id);
+    if (clicks >= 2) state.editPendingFollowup();
+    return true;
+}
+
+test "follow-up edit hits survive rendering another chat pane" {
+    resetTranscriptHitCache();
+    defer resetTranscriptHitCache();
+
+    appendFollowupPinHit(11, .{ .x = 10.0, .y = 20.0, .w = 100.0, .h = 40.0 });
+    appendFollowupPinHit(22, .{ .x = 200.0, .y = 20.0, .w = 100.0, .h = 40.0 });
+
+    const first = followupPinHitAt(40.0, 40.0) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(?app_state.WorkspacePaneId, 11), first.pane_id);
+    const second = followupPinHitAt(240.0, 40.0) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(?app_state.WorkspacePaneId, 22), second.pane_id);
 }
 
 test "transcript action hit testing preserves usage and diff open actions" {

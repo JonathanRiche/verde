@@ -8896,29 +8896,6 @@ pub const AppState = struct {
         }
     }
 
-    /// Records the pinned follow-up card hit rect for this frame (or clears it).
-    /// Called from the chat workspace render so mouse routing can target the pin.
-    pub fn setFollowupPinRect(self: *AppState, rect: ?palette.Rect) void {
-        if (rect) |value| {
-            self.composer_controller.followup_pin_valid = true;
-            self.composer_controller.followup_pin_rect = value;
-        } else {
-            self.composer_controller.followup_pin_valid = false;
-            self.composer_controller.followup_pin_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
-        }
-    }
-
-    /// Routes a click on the pinned follow-up card. A double-click (clicks >= 2)
-    /// pulls the queued prompt back into the composer for editing; a single click
-    /// is swallowed so it does not fall through to the composer/transcript.
-    pub fn handleFollowupPinMouseButton(self: *AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
-        if (!self.composer_controller.followup_pin_valid) return false;
-        const rect = self.composer_controller.followup_pin_rect;
-        if (x < rect.x or y < rect.y or x > rect.x + rect.w or y > rect.y + rect.h) return false;
-        if (down and clicks >= 2) self.editPendingFollowup();
-        return true;
-    }
-
     /// Pulls the queued/steered follow-up back into the composer so a long-waiting
     /// queued message can be revised. Removes the pin (it is no longer queued); the
     /// user re-queues with Tab or sends normally. Refuses to clobber an in-progress
@@ -8959,7 +8936,6 @@ pub const AppState = struct {
         self.resetComposerInputWidget();
         self.composer_controller.composer.focused = true;
         self.composer_controller.focused = true;
-        self.setFollowupPinRect(null);
         self.markDirty();
         self.setSidebarNotice(if (thread.provider == .codex)
             "Editing follow-up. Press Enter to queue it, or Tab to steer."
