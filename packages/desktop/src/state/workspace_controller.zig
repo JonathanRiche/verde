@@ -25,7 +25,6 @@ const DEFAULT_OPENCODE_MODEL = provider_models.DEFAULT_OPENCODE_MODEL;
 const DEFAULT_CLAUDE_MODEL = provider_models.DEFAULT_CLAUDE_MODEL;
 const DEFAULT_CURSOR_MODEL = provider_models.DEFAULT_CURSOR_MODEL;
 const CODEX_MODEL_OPTIONS = provider_models.CODEX_MODEL_OPTIONS;
-const CODEX_REASONING_OPTIONS = provider_models.CODEX_REASONING_OPTIONS;
 const CLAUDE_STANDARD_EFFORT_VALUES = provider_models.CLAUDE_STANDARD_EFFORT_VALUES;
 const parseReasoningEffort = provider_models.parseReasoningEffort;
 const WorkspacePaneId = workspace_layout.WorkspacePaneId;
@@ -1439,7 +1438,7 @@ pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, mode
 
     if (request.reasoning_effort) |effort| {
         const supported = switch (request.provider) {
-            .codex => codexSupportsReasoningEffort(effort),
+            .codex => codexSupportsReasoningEffort(model_ref, effort),
             .claude => blk: {
                 const option = self.modelOptionForProvider(.claude, model_ref) orelse break :blk false;
                 if (!option.reasoning_supported) break :blk false;
@@ -1499,8 +1498,8 @@ pub fn modelOptionForProvider(self: anytype, provider: Provider, model_ref: []co
     return null;
 }
 
-pub fn codexSupportsReasoningEffort(effort: ReasoningEffort) bool {
-    for (CODEX_REASONING_OPTIONS) |option| {
+pub fn codexSupportsReasoningEffort(model_ref: []const u8, effort: ReasoningEffort) bool {
+    for (provider_models.codexReasoningOptions(model_ref)) |option| {
         if (option.value) |value| {
             if (value == effort) return true;
         }

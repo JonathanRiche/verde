@@ -1760,8 +1760,9 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
         .reasoning_changed => |index| {
             const thread = state.currentThreadMutable();
             if (thread.provider == .codex) {
-                if (index >= CODEX_REASONING_OPTIONS.len) return;
-                const next = CODEX_REASONING_OPTIONS[index].value;
+                const options = codexReasoningOptions(thread.model_ref);
+                if (index >= options.len) return;
+                const next = options[index].value;
                 const changed = if (next) |value|
                     thread.reasoning_effort == null or thread.reasoning_effort.? != value
                 else
@@ -2204,8 +2205,9 @@ fn runStepperStateFromContext(context: ?*anyopaque) ?struct { state: *AppState, 
 
 fn runReasoningStepLabel(state: *const AppState, index: usize) []const u8 {
     if (state.currentThread().provider == .codex) {
-        if (index >= CODEX_REASONING_OPTIONS.len) return "";
-        return CODEX_REASONING_OPTIONS[index].label;
+        const options = codexReasoningOptions(state.currentThread().model_ref);
+        if (index >= options.len) return "";
+        return options[index].label;
     }
     const rows = state.opencode_reasoning_menu.items;
     if (index >= rows.len) return "";
@@ -2225,8 +2227,9 @@ fn reasoningEffortStepDescription(effort: ?ReasoningEffort) []const u8 {
 
 fn runReasoningStepDescription(state: *const AppState, index: usize) []const u8 {
     if (state.currentThread().provider == .codex) {
-        if (index >= CODEX_REASONING_OPTIONS.len) return "";
-        return reasoningEffortStepDescription(CODEX_REASONING_OPTIONS[index].value);
+        const options = codexReasoningOptions(state.currentThread().model_ref);
+        if (index >= options.len) return "";
+        return reasoningEffortStepDescription(options[index].value);
     }
     const rows = state.opencode_reasoning_menu.items;
     if (index >= rows.len) return "";
@@ -2363,6 +2366,7 @@ const cursorReasoningValueLabel = provider_models.cursorReasoningValueLabel;
 const parseReasoningEffort = provider_models.parseReasoningEffort;
 const claudeEffortValueLabel = provider_models.claudeEffortValueLabel;
 const reasoningEffortDisplayLabel = provider_models.reasoningEffortDisplayLabel;
+const codexReasoningOptions = provider_models.codexReasoningOptions;
 pub const ReasoningOption = provider_models.ReasoningOption;
 const FastModeOption = provider_models.FastModeOption;
 const AccessModeOption = provider_models.AccessModeOption;
@@ -5541,7 +5545,8 @@ pub const AppState = struct {
         const thread = self.currentThread();
         if (thread.provider == .codex) {
             if (self.composerReasoningIndexForThread(thread)) |index| {
-                if (index < CODEX_REASONING_OPTIONS.len) return std.mem.sliceTo(CODEX_REASONING_OPTIONS[index].label, 0);
+                const options = codexReasoningOptions(thread.model_ref);
+                if (index < options.len) return std.mem.sliceTo(options[index].label, 0);
             }
         }
         // Menu-independent for the other providers: the shared reasoning menu
@@ -5573,8 +5578,8 @@ pub const AppState = struct {
     fn threadReasoningGauge(self: *const AppState, thread: *const ChatThread) ?ReasoningGauge {
         switch (thread.provider) {
             .codex => return .{
-                .index = composerReasoningIndexForOptions(CODEX_REASONING_OPTIONS[0..], thread.reasoning_effort) orelse 0,
-                .count = CODEX_REASONING_OPTIONS.len,
+                .index = composerReasoningIndexForOptions(codexReasoningOptions(thread.model_ref), thread.reasoning_effort) orelse 0,
+                .count = codexReasoningOptions(thread.model_ref).len,
             },
             .claude => {
                 const opt = self.claudeModelOptionForRef(thread.model_ref) orelse return null;
@@ -8176,7 +8181,7 @@ pub const AppState = struct {
         var count: usize = 0;
         const thread = self.currentThread();
         const reasoning_count: usize = if (thread.provider == .codex)
-            CODEX_REASONING_OPTIONS.len
+            codexReasoningOptions(thread.model_ref).len
         else
             self.opencode_reasoning_menu.items.len;
         if (reasoning_count > 0) {
@@ -8203,7 +8208,7 @@ pub const AppState = struct {
             stepper.setFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(13.0)));
         }
         const reasoning = &self.composer_controller.run_steppers[@intFromEnum(RunConfigRowKind.reasoning)];
-        reasoning.setStepCount(if (thread.provider == .codex) CODEX_REASONING_OPTIONS.len else self.opencode_reasoning_menu.items.len);
+        reasoning.setStepCount(if (thread.provider == .codex) codexReasoningOptions(thread.model_ref).len else self.opencode_reasoning_menu.items.len);
         reasoning.setSelected(composerReasoningIndexForThread(self, thread));
         const speed = &self.composer_controller.run_steppers[@intFromEnum(RunConfigRowKind.speed)];
         speed.setStepCount(RUN_SPEED_STEP_LABELS.len);
@@ -9010,6 +9015,13 @@ pub const AppState = struct {
 
         thread.model_ref = if (value) |next| self.allocator.dupeZ(u8, next) catch null else null;
         self.normalizeOpencodeReasoningVariant(thread);
+        if (thread.provider == .codex) {
+            if (thread.reasoning_effort) |effort| {
+                if (!workspace_controller.codexSupportsReasoningEffort(thread.model_ref orelse DEFAULT_CODEX_MODEL, effort)) {
+                    thread.reasoning_effort = null;
+                }
+            }
+        }
         if (thread.provider == .cursor) {
             if (thread.opencode_reasoning_variant) |v| {
                 self.allocator.free(v);
@@ -9045,7 +9057,7 @@ pub const AppState = struct {
 
     fn composerReasoningIndexForThread(self: *const AppState, thread: *const ChatThread) ?usize {
         if (thread.provider == .codex) {
-            return composerReasoningIndexForOptions(CODEX_REASONING_OPTIONS[0..], thread.reasoning_effort);
+            return composerReasoningIndexForOptions(codexReasoningOptions(thread.model_ref), thread.reasoning_effort);
         }
         if (thread.provider == .claude) {
             const rows = self.opencode_reasoning_menu.items;
@@ -10857,11 +10869,15 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
     try std.testing.expectEqual(thread_count_before_rejection, state.project_controller.projects.items[1].threads.items.len);
     try std.testing.expectEqual(pane_count_before_rejection, state.project_controller.projects.items[1].workspace_layout.panes.items.len);
 
-    try std.testing.expectError(error.UnsupportedReasoningEffort, state.openWorkspaceChat(1, .{
+    const max_settings = try state.resolveChatCreationSettings(.{
         .provider = .codex,
         .reasoning_effort = .max,
-        .target_pane_id = 1,
-    }));
+    }, "gpt-5.6-luna");
+    try std.testing.expectEqual(ReasoningEffort.max, max_settings.reasoning_effort.?);
+    try std.testing.expectError(error.UnsupportedReasoningEffort, state.resolveChatCreationSettings(.{
+        .provider = .codex,
+        .reasoning_effort = .max,
+    }, "gpt-5.5"));
     try std.testing.expectError(error.UnsupportedReasoningEffort, state.openWorkspaceChat(1, .{
         .provider = .opencode,
         .reasoning_effort = .medium,
