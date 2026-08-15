@@ -119,6 +119,12 @@ pub const Keybind = struct {
     }
 };
 
+/// Matches the conventional page reload chord reserved for focused browser panes.
+pub fn isBrowserReloadEvent(event: *const sdl.KeyboardEvent) bool {
+    const binding: Keybind = .{ .primary = true, .key = .r };
+    return binding.matches(event);
+}
+
 pub const NativeKeyboardConfig = struct {
     allocator: std.mem.Allocator,
     refresh: []Keybind,
@@ -1013,7 +1019,6 @@ pub const NativeKeyboardConfig = struct {
 
 fn cloneDefaultKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("CommandOrControl+R"),
         try parseDefaultAccelerator("CommandOrControl+Shift+R"),
         try parseDefaultAccelerator("Ctrl+Shift+R"),
         try parseDefaultAccelerator("F5"),

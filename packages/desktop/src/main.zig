@@ -1868,6 +1868,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     return true;
                 }
             }
+            if (handleBrowserReloadShortcut(state, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             const native_browser_focused = state.isNativeBrowserSurfaceFocused();
             if (native_browser_focused) {
                 state.browser_controller.address_focused = false;
@@ -2385,6 +2389,14 @@ fn handleBrowserKeyboardEvent(state: *AppState, event: *const sdl.KeyboardEvent)
         .alt = isKeymodPressed(event.mod, sdl.Keymod.alt),
         .super = isKeymodPressed(event.mod, sdl.Keymod.gui),
     });
+}
+
+fn handleBrowserReloadShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!state.isBrowserVisible()) return false;
+    if (!state.isBrowserPaneFocused() and !state.browser_controller.address_focused) return false;
+    if (!keybinds.isBrowserReloadEvent(event)) return false;
+    state.reloadBrowser();
+    return true;
 }
 
 fn handleBrowserInspectorEscape(state: *AppState, event: *const sdl.KeyboardEvent) bool {
