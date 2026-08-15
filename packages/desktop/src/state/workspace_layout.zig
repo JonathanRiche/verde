@@ -49,6 +49,10 @@ pub fn deinitWorkspacePaneRef(ref: *WorkspacePaneRef, allocator: std.mem.Allocat
 pub const WorkspacePane = struct {
     id: WorkspacePaneId,
     ref: WorkspacePaneRef,
+    /// Optional scrolling-strip size. Null inherits the workspace default so
+    /// dragging one pane does not force every other pane to the same width.
+    scroll_extent_css: ?f32 = null,
+    scroll_extent_ratio: ?f32 = null,
 };
 
 pub const WorkspacePanePlacement = struct {
@@ -139,9 +143,9 @@ pub const WorkspaceLayout = struct {
     /// restart without requiring a database schema change.
     scroll_mode_override: ?app_config.WorkspaceScrollMode = null,
     scroll_threshold_override: ?u8 = null,
-    /// The absolute extent remains for backwards compatibility and for the
-    /// resize affordance's custom-width state. New resizes also persist a
-    /// viewport-relative stride ratio so the layout follows display-size changes.
+    /// Shared default for panes that have not been resized individually.
+    /// Kept for backwards compatibility with workspaces that stored one width
+    /// for the whole strip. New drags write `WorkspacePane.scroll_extent_*`.
     scroll_pane_extent_override: ?f32 = null,
     scroll_pane_extent_ratio_override: ?f32 = null,
 
@@ -371,6 +375,31 @@ pub const WorkspaceLayout = struct {
 
     pub fn hasScrollOverride(self: *const WorkspaceLayout) bool {
         return self.scroll_mode_override != null or self.scroll_threshold_override != null;
+    }
+
+    pub fn hasCustomScrollPaneExtent(self: *const WorkspaceLayout) bool {
+        if (self.scroll_pane_extent_override != null) return true;
+        for (self.panes.items) |pane| {
+            if (pane.scroll_extent_css != null) return true;
+        }
+        return false;
+    }
+
+    pub fn clearScrollPaneExtents(self: *WorkspaceLayout) void {
+        self.scroll_pane_extent_override = null;
+        self.scroll_pane_extent_ratio_override = null;
+        for (self.panes.items) |*pane| {
+            pane.scroll_extent_css = null;
+            pane.scroll_extent_ratio = null;
+        }
+    }
+
+    pub fn setPaneScrollExtent(self: *WorkspaceLayout, pane_id: WorkspacePaneId, extent_css: f32, extent_ratio: f32) bool {
+        const pane = self.paneByIdMutable(pane_id) orelse return false;
+        const clamped = @max(MIN_SCROLL_PANE_EXTENT_CSS, @min(MAX_SCROLL_PANE_EXTENT_CSS, extent_css));
+        pane.scroll_extent_css = clamped;
+        pane.scroll_extent_ratio = if (extent_ratio > 0.0) extent_ratio else null;
+        return true;
     }
 
     pub fn requestLeadingScrollReveal(self: *WorkspaceLayout, pane_id: WorkspacePaneId) void {
@@ -971,6 +1000,14 @@ pub const WorkspaceLayout = struct {
                     try stringify.endArray();
                 },
             }
+            if (pane.scroll_extent_css) |extent| {
+                try stringify.objectField("scroll_extent");
+                try stringify.write(extent);
+                if (pane.scroll_extent_ratio) |ratio| {
+                    try stringify.objectField("scroll_extent_ratio");
+                    try stringify.write(ratio);
+                }
+            }
             try stringify.endObject();
         }
         try stringify.endArray();
@@ -1049,6 +1086,7 @@ pub const WorkspaceLayout = struct {
             if (pane_value != .object) continue;
             const pane_id: WorkspacePaneId = @intCast(jsonInt(pane_value.object.get("id") orelse .null) orelse continue);
             const kind = jsonString(pane_value.object.get("kind") orelse .null) orelse continue;
+            const pane_count_before = next_layout.panes.items.len;
             if (std.mem.eql(u8, kind, "chat")) {
                 const thread_index: usize = @intCast(jsonInt(pane_value.object.get("thread") orelse .null) orelse 0);
                 try next_layout.panes.append(allocator, .{
@@ -1115,6 +1153,9 @@ pub const WorkspaceLayout = struct {
                     .ref = .{ .browser = browser_ref },
                 });
                 browser_ref_owned = false;
+            }
+            if (next_layout.panes.items.len > pane_count_before) {
+                applyPersistedPaneScrollExtent(&next_layout.panes.items[next_layout.panes.items.len - 1], pane_value);
             }
             if (pane_id >= next_layout.next_pane_id) next_layout.next_pane_id = pane_id + 1;
         }
@@ -1431,6 +1472,16 @@ pub const WorkspaceLayout = struct {
         };
     }
 };
+
+fn applyPersistedPaneScrollExtent(pane: *WorkspacePane, pane_value: std.json.Value) void {
+    if (pane_value != .object) return;
+    const extent = WorkspaceLayout.jsonFloat(pane_value.object.get("scroll_extent") orelse .null) orelse return;
+    if (extent < MIN_SCROLL_PANE_EXTENT_CSS or extent > MAX_SCROLL_PANE_EXTENT_CSS) return;
+    pane.scroll_extent_css = extent;
+    if (WorkspaceLayout.jsonFloat(pane_value.object.get("scroll_extent_ratio") orelse .null)) |ratio| {
+        if (ratio > 0.0) pane.scroll_extent_ratio = ratio;
+    }
+}
 
 fn expectPaneOrder(layout: *const WorkspaceLayout, expected: []const WorkspacePaneId) !void {
     try std.testing.expectEqual(expected.len, layout.panes.items.len);
@@ -1805,6 +1856,33 @@ test "workspace layout ignores invalid scrolling policy overrides" {
     try std.testing.expectEqual(@as(u8, 4), layout.effectiveScrollThreshold(4));
     try std.testing.expectEqual(@as(?f32, null), layout.scroll_pane_extent_override);
     try std.testing.expectEqual(@as(?f32, null), layout.scroll_pane_extent_ratio_override);
+}
+
+test "workspace layout persists per-pane scrolling extents" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const second_pane_id = try layout.createTerminalPane(allocator, 10);
+    try layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
+    try std.testing.expect(layout.setPaneScrollExtent(second_pane_id, 720.0, 0.41));
+    try std.testing.expect(layout.hasCustomScrollPaneExtent());
+    try std.testing.expectEqual(@as(?f32, null), layout.panes.items[0].scroll_extent_css);
+
+    const persisted = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(persisted);
+    var restored = try WorkspaceLayout.initDefaultChat(allocator);
+    defer restored.deinit(allocator);
+    try restored.applyPersistedWorkspaceJson(allocator, persisted);
+
+    const restored_second = restored.paneById(second_pane_id) orelse return error.TestExpectedEqual;
+    try std.testing.expectApproxEqAbs(@as(f32, 720.0), restored_second.scroll_extent_css.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.41), restored_second.scroll_extent_ratio.?, 0.0001);
+    try std.testing.expectEqual(@as(?f32, null), restored.paneById(1).?.scroll_extent_css);
+
+    restored.clearScrollPaneExtents();
+    try std.testing.expect(!restored.hasCustomScrollPaneExtent());
+    try std.testing.expectEqual(@as(?f32, null), restored.paneById(second_pane_id).?.scroll_extent_css);
 }
 
 test "closing a maximized pane transfers zoom to the left pane" {
