@@ -2120,7 +2120,27 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
 
     const cold_tail_follow = !thread.transcript_layout_visible_ready;
     const saved_scroll_before_layout = currentTranscriptScrollY(state, pane_id);
-    const content_height = transcriptContentHeight(state, thread, column.w, column.h, pane_id, saved_scroll_before_layout);
+    var content_height = transcriptContentHeight(state, thread, column.w, column.h, pane_id, saved_scroll_before_layout);
+    // A thread continued right after a projection refresh carries only its
+    // new turn rows in memory — the older durable history is paged out and
+    // contributes nothing to the estimate, so the pane renders one bubble
+    // over blank space until a wheel event pages history in. While older
+    // durable rows exist and the materialized content cannot fill the
+    // viewport, hydrate during render: one page per frame until the pane is
+    // full or the history is exhausted, mirroring the empty-transcript
+    // hydration above.
+    if (thread.persisted_message_offset > 0 and content_height < column.h) {
+        const hydrated = state.loadOlderCurrentThreadMessages() catch |err| blk: {
+            log.warn("failed to hydrate transcript tail during render: {s}", .{@errorName(err)});
+            break :blk false;
+        };
+        if (hydrated) {
+            thread = state.currentThread();
+            // Hydration rebases saved anchors; recompute against the fresh
+            // anchor so this frame renders the rows it points at.
+            content_height = transcriptContentHeight(state, thread, column.w, column.h, pane_id, currentTranscriptScrollY(state, pane_id));
+        }
+    }
     // Materializing older rows shifts content coordinates (the estimated
     // history above the viewport changes height) and rebases saved offsets;
     // read the anchor only after the layout pass so this frame renders the
