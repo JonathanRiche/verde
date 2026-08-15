@@ -616,7 +616,7 @@ function App() {
             <p class="themes-note">
               These URLs are ordinary, versioned JSON files, so they also work
               with <code>verde theme validate</code> and automation. Verde still
-              follows <code>~/.config/omarchy/current/theme/colors.toml</code>{' '}
+              follows <code>~/.local/state/omarchy/current/theme/colors.toml</code>{' '}
               automatically. See{' '}
               <a href="/docs/config" class="text-link">Configuration &amp; state</a>{' '}
               for the detection order and manual overrides.

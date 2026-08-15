@@ -195,12 +195,27 @@ fn resolveOmarchyPath(allocator: std.mem.Allocator, env_map: *const std.process.
         const value = std.mem.trim(u8, override, &std.ascii.whitespace);
         if (value.len > 0) return allocator.dupe(u8, value);
     }
+    if (try currentOmarchyThemeFilePath(allocator, env_map, "colors.toml")) |path| return path;
+    return error.FileNotFound;
+}
+
+fn currentOmarchyThemeFilePath(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map, file_name: []const u8) !?[]u8 {
+    const home = env_map.get("HOME") orelse return error.EnvironmentVariableNotFound;
     const config_home = try configHome(allocator, env_map);
     defer allocator.free(config_home);
-    const current = try std.fs.path.join(allocator, &.{ config_home, "omarchy", "current", "theme", "colors.toml" });
-    if (pathExists(current)) return current;
-    allocator.free(current);
-    return error.FileNotFound;
+    return currentOmarchyThemeFilePathAt(allocator, home, config_home, file_name);
+}
+
+fn currentOmarchyThemeFilePathAt(allocator: std.mem.Allocator, home: []const u8, config_home: []const u8, file_name: []const u8) !?[]u8 {
+    const state_path = try std.fs.path.join(allocator, &.{ home, ".local", "state", "omarchy", "current", "theme", file_name });
+    if (pathExists(state_path)) return state_path;
+    allocator.free(state_path);
+
+    // Omarchy before Quattro kept the assembled active theme under config.
+    const legacy_path = try std.fs.path.join(allocator, &.{ config_home, "omarchy", "current", "theme", file_name });
+    if (pathExists(legacy_path)) return legacy_path;
+    allocator.free(legacy_path);
+    return null;
 }
 
 fn applyOmarchyToml(raw: []const u8, target: *Colors, ansi: *[16]?[4]f32) void {
@@ -435,9 +450,7 @@ fn applyAnsiOverrides(terminal: *TerminalTheme, ansi: [16]?[4]f32) void {
 }
 
 fn loadOmarchyGhosttyTheme(allocator: std.mem.Allocator, io: std.Io, env_map: *const std.process.Environ.Map, terminal: *TerminalTheme) !void {
-    const config_home = try configHome(allocator, env_map);
-    defer allocator.free(config_home);
-    const path = try std.fs.path.join(allocator, &.{ config_home, "omarchy", "current", "theme", "ghostty.conf" });
+    const path = (try currentOmarchyThemeFilePath(allocator, env_map, "ghostty.conf")) orelse return error.FileNotFound;
     defer allocator.free(path);
     try parseGhosttyThemeFile(allocator, io, env_map, path, terminal, false);
 }
@@ -523,6 +536,36 @@ test "omarchy toml maps the same way as desktop" {
     try std.testing.expectEqual(rgb(0x1a, 0x1b, 0x26), parsed.background);
     try std.testing.expectEqual(rgb(0x7a, 0xa2, 0xf7), parsed.accent);
     try std.testing.expectEqual(rgb(0xe0, 0xaf, 0x68), parsed.warning);
+}
+
+test "active Omarchy theme prefers the Quattro state path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var threaded = std.Io.Threaded.init_single_threaded;
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const home_path = try std.fs.path.join(std.testing.allocator, &.{ root, "home" });
+    defer std.testing.allocator.free(home_path);
+    const config_home = try std.fs.path.join(std.testing.allocator, &.{ root, "config" });
+    defer std.testing.allocator.free(config_home);
+    const state_dir = try std.fs.path.join(std.testing.allocator, &.{ home_path, ".local", "state", "omarchy", "current", "theme" });
+    defer std.testing.allocator.free(state_dir);
+    const legacy_dir = try std.fs.path.join(std.testing.allocator, &.{ config_home, "omarchy", "current", "theme" });
+    defer std.testing.allocator.free(legacy_dir);
+    try std.Io.Dir.cwd().createDirPath(threaded.io(), state_dir);
+    try std.Io.Dir.cwd().createDirPath(threaded.io(), legacy_dir);
+
+    const state_path = try std.fs.path.join(std.testing.allocator, &.{ state_dir, "colors.toml" });
+    defer std.testing.allocator.free(state_path);
+    const legacy_path = try std.fs.path.join(std.testing.allocator, &.{ legacy_dir, "colors.toml" });
+    defer std.testing.allocator.free(legacy_path);
+    try std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = state_path, .data = "accent = \"#111111\"\n" });
+    try std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = legacy_path, .data = "accent = \"#222222\"\n" });
+
+    const resolved = (try currentOmarchyThemeFilePathAt(std.testing.allocator, home_path, config_home, "colors.toml")).?;
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expectEqualStrings(state_path, resolved);
 }
 
 test {

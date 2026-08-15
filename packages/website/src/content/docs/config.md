@@ -290,8 +290,9 @@ On Omarchy systems, UI colors are loaded from an Omarchy-compatible
 `colors.toml`. Verde honors the first found of:
 
 1. `VERDE_OMARCHY_COLORS=/path/to/colors.toml`
-2. `$XDG_CONFIG_HOME/omarchy/current/theme/colors.toml`
-3. Named Omarchy themes such as `$XDG_CONFIG_HOME/omarchy/themes/verde/colors.toml`
+2. `~/.local/state/omarchy/current/theme/colors.toml` (Omarchy Quattro)
+3. `$XDG_CONFIG_HOME/omarchy/current/theme/colors.toml` (pre-Quattro fallback)
+4. Named Omarchy themes such as `$XDG_CONFIG_HOME/omarchy/themes/verde/colors.toml`
    or `~/.config/omarchy/themes/verde/colors.toml`
 
 Missing values fall back to Verde defaults. See
