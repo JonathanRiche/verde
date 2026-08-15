@@ -4599,11 +4599,12 @@ const LongPollWaiterContext = struct {
     }
 };
 
-/// M5-P3: the real bounded long-poll over the wire. Two connections park in
-/// `core.changes`; a third long-poll hits the Q7 parked-waiter cap and
-/// degrades to an IMMEDIATE heartbeat (pinned: never an error); a plain
-/// request stays responsive on a free worker; one store commit then wakes
-/// BOTH parked waiters with the new entry well before their wait budget.
+/// M5-P3: the real bounded long-poll over the wire. A full parked-cap's
+/// worth of connections park in `core.changes`; one more long-poll hits the
+/// Q7 parked-waiter cap and degrades to an IMMEDIATE heartbeat (pinned:
+/// never an error); a plain request stays responsive on a free worker; one
+/// store commit then wakes EVERY parked waiter with the new entry well
+/// before their wait budget.
 fn runM5LongPollWakeScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     const pref_path = try makePrefPath(allocator, "m5-longpoll-wake");
     defer allocator.free(pref_path);
@@ -4646,26 +4647,30 @@ fn runM5LongPollWakeScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     if (!boot.response.isOk()) return error.M5LongPollBootstrapFailed;
     const cursor = (try client.decodeChanges(&boot)).next_cursor;
 
-    // Both waiters use a 4s budget: long enough to prove "wake, not timeout",
-    // short enough to stay under the 5s transport timeout.
-    var first_waiter: LongPollWaiterContext = .{ .allocator = allocator, .pref_path = pref_path, .cursor = cursor, .wait_ms = 4_000, .request_id = 9101 };
-    var second_waiter: LongPollWaiterContext = .{ .allocator = allocator, .pref_path = pref_path, .cursor = cursor, .wait_ms = 4_000, .request_id = 9102 };
-    const first_thread = try std.Thread.spawn(.{}, LongPollWaiterContext.run, .{&first_waiter});
-    const second_thread = try std.Thread.spawn(.{}, LongPollWaiterContext.run, .{&second_waiter});
+    // Every waiter uses a 4s budget: long enough to prove "wake, not
+    // timeout", short enough to stay under the 5s transport timeout. Fill
+    // the FULL shared Q7 parked cap so the over-cap probe below exercises
+    // the real boundary regardless of the pool size.
+    const park_cap = platform_ipc.MAX_PARKED_LONG_POLL_WAITERS;
+    var waiters: [park_cap]LongPollWaiterContext = undefined;
+    var waiter_threads: [park_cap]?std.Thread = @splat(null);
     var waiters_joined = false;
     // Bounded on every unwind path: a waiter answers by wait_ms + transport
     // margin even if nothing below runs.
-    defer if (!waiters_joined) {
-        first_thread.join();
-        second_thread.join();
+    defer if (!waiters_joined) for (waiter_threads) |maybe_thread| {
+        if (maybe_thread) |thread| thread.join();
     };
+    for (&waiters, &waiter_threads, 0..) |*waiter, *thread_slot, index| {
+        waiter.* = .{ .allocator = allocator, .pref_path = pref_path, .cursor = cursor, .wait_ms = 4_000, .request_id = 9101 + @as(u64, index) };
+        thread_slot.* = try std.Thread.spawn(.{}, LongPollWaiterContext.run, .{waiter});
+    }
 
-    // Let both waiters connect and park (generous for a local endpoint).
+    // Let every waiter connect and park (generous for a local endpoint).
     std.Io.sleep(io, .fromMilliseconds(600), .awake) catch {};
 
-    // Q7 over-cap pin: MAX_PARKED_LONG_POLL_WAITERS (2) slots are occupied,
-    // so a third positive wait answers an immediate heartbeat — NEVER an
-    // error, never a park. This also proves both waiters really are parked.
+    // Q7 over-cap pin: all MAX_PARKED_LONG_POLL_WAITERS slots are occupied,
+    // so one more positive wait answers an immediate heartbeat — NEVER an
+    // error, never a park. This also proves the waiters really are parked.
     const third_started_ms = sessionizer.nowMs();
     const third_req: headless.changes_protocol.ChangesRequest = .{ .cursor = cursor, .wait_ms = 4_000 };
     var third = try client.call(headless.changes_protocol.METHOD_CORE_CHANGES, third_req);
@@ -4695,11 +4700,12 @@ fn runM5LongPollWakeScenario(allocator: std.mem.Allocator, io: std.Io) !void {
     if (!upsert_parsed.response.isOk()) return error.M5LongPollUpsertFailed;
     if (!(try client.decodeWriteResult(&upsert_parsed)).applied) return error.M5LongPollUpsertNotApplied;
 
-    first_thread.join();
-    second_thread.join();
+    for (waiter_threads) |maybe_thread| {
+        if (maybe_thread) |thread| thread.join();
+    }
     waiters_joined = true;
 
-    for ([_]*const LongPollWaiterContext{ &first_waiter, &second_waiter }) |waiter| {
+    for (&waiters) |*waiter| {
         const response = waiter.response orelse return error.M5LongPollWaiterTransportError;
         defer allocator.free(response);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});

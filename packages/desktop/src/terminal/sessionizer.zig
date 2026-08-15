@@ -1834,10 +1834,15 @@ pub const Daemon = struct {
     /// the waiter's read sees the entry or its futex expectation is stale and
     /// the wait returns immediately.
     changes_signal: std.atomic.Value(u32) = .init(0),
-    /// Count of currently parked long-pollers, capped at
-    /// platform_ipc.MAX_PARKED_LONG_POLL_WAITERS (Q7). Over-cap requests
-    /// degrade to an immediate heartbeat — never an error.
-    changes_parked: std.atomic.Value(u32) = .init(0),
+    /// Count of currently parked long-pollers across BOTH park kinds
+    /// (`core.changes` and `chat.turn.tail wait_ms`), capped at
+    /// platform_ipc.MAX_PARKED_LONG_POLL_WAITERS (Q7). One shared counter
+    /// keeps the transport invariant honest — at most half the worker pool
+    /// parked in total, so short requests always find a free worker;
+    /// per-kind counters let combined parks consume the whole pool (the
+    /// saturation that rendered GUI streaming in multi-second chunks).
+    /// Over-cap requests degrade to an immediate answer — never an error.
+    long_poll_parked: std.atomic.Value(u32) = .init(0),
     /// Sticky drain latch (prepareShutdown accepted, or transport draining).
     /// Parked waiters terminate with the structured drain response; new
     /// positive waits degrade to immediate heartbeats.
@@ -1848,9 +1853,6 @@ pub const Daemon = struct {
     /// (Q10) and push through this data-plane signal instead. Bumped on every
     /// turn event append and on durable-commit publication flips.
     turn_events_signal: std.atomic.Value(u32) = .init(0),
-    /// Parked chat.turn.tail waiters, capped like `changes_parked`. Over-cap
-    /// waits degrade to an immediate tail response — never an error.
-    turn_events_parked: std.atomic.Value(u32) = .init(0),
 
     pub fn init(allocator: std.mem.Allocator) Daemon {
         return initWithPrefPath(allocator, "");
@@ -3902,7 +3904,9 @@ pub const Daemon = struct {
     /// append; the futexWake syscall is skipped when nobody is parked.
     fn signalChangesWaiters(self: *Daemon) void {
         _ = self.changes_signal.fetchAdd(1, .release);
-        if (self.changes_parked.load(.acquire) == 0) return;
+        // Shared parked counter: may report a parked waiter of the OTHER
+        // kind, costing one no-op futexWake. Never misses a real waiter.
+        if (self.long_poll_parked.load(.acquire) == 0) return;
         // The Threaded futex shim is stateless; an ephemeral instance is the
         // sanctioned way to reach futexWake from an arbitrary thread.
         var threaded = std.Io.Threaded.init_single_threaded;
@@ -3927,7 +3931,8 @@ pub const Daemon = struct {
     /// caller releases.
     fn signalTurnEventWaiters(self: *Daemon) void {
         _ = self.turn_events_signal.fetchAdd(1, .release);
-        if (self.turn_events_parked.load(.acquire) == 0) return;
+        // Shared parked counter (see signalChangesWaiters).
+        if (self.long_poll_parked.load(.acquire) == 0) return;
         var threaded = std.Io.Threaded.init_single_threaded;
         threaded.io().futexWake(u32, &self.turn_events_signal.raw, std.math.maxInt(u32));
     }
@@ -3937,12 +3942,12 @@ pub const Daemon = struct {
     /// (missed-wake guarantee) and must re-resolve the turn by id after every
     /// wake — a consumed turn frees its memory.
     fn parkForTurnEvents(self: *Daemon, observed_signal: u32, deadline_ms: i64) ChangesParkOutcome {
-        const prev_parked = self.turn_events_parked.fetchAdd(1, .acquire);
+        const prev_parked = self.long_poll_parked.fetchAdd(1, .acquire);
         if (prev_parked >= platform_ipc.MAX_PARKED_LONG_POLL_WAITERS) {
-            _ = self.turn_events_parked.fetchSub(1, .release);
+            _ = self.long_poll_parked.fetchSub(1, .release);
             return .over_cap;
         }
-        defer _ = self.turn_events_parked.fetchSub(1, .release);
+        defer _ = self.long_poll_parked.fetchSub(1, .release);
 
         var threaded = std.Io.Threaded.init_single_threaded;
         const io = threaded.io();
@@ -3967,12 +3972,12 @@ pub const Daemon = struct {
     fn parkForChanges(self: *Daemon, observed_signal: u32, deadline_ms: i64) ChangesParkOutcome {
         // Q7 parked-waiter cap: reserve a slot first; over-cap callers degrade
         // to an immediate heartbeat (never an error — pinned in the IT).
-        const prev_parked = self.changes_parked.fetchAdd(1, .acquire);
+        const prev_parked = self.long_poll_parked.fetchAdd(1, .acquire);
         if (prev_parked >= platform_ipc.MAX_PARKED_LONG_POLL_WAITERS) {
-            _ = self.changes_parked.fetchSub(1, .release);
+            _ = self.long_poll_parked.fetchSub(1, .release);
             return .over_cap;
         }
-        defer _ = self.changes_parked.fetchSub(1, .release);
+        defer _ = self.long_poll_parked.fetchSub(1, .release);
 
         var threaded = std.Io.Threaded.init_single_threaded;
         const io = threaded.io();
@@ -7086,7 +7091,7 @@ test "changes topic filter matches wire spellings and ignores unknown names" {
 test "Q7 core.changes long-poll limits are pinned" {
     // 25s wait ceiling and the pool-derived parked cap (m4m5_decisions Q7).
     try std.testing.expectEqual(@as(u32, 25_000), MAX_CHANGES_WAIT_MS);
-    try std.testing.expectEqual(@as(usize, 2), platform_ipc.MAX_PARKED_LONG_POLL_WAITERS);
+    try std.testing.expectEqual(@as(usize, 8), platform_ipc.MAX_PARKED_LONG_POLL_WAITERS);
     // The daemon-side cap intentionally exceeds the 5s transport client
     // timeout: wire clients are bounded by their own timeout first, while
     // in-process callers may use the full 25s budget.
@@ -7099,12 +7104,14 @@ test "core.changes park protocol: over-cap, woken, timeout, drain" {
     defer daemon.deinit();
 
     // Over-cap: with the Q7 cap's worth of parked waiters, the next park
-    // degrades immediately and releases its reserved slot.
+    // degrades immediately and releases its reserved slot. The counter is
+    // shared with turn-tail parks, so BOTH park kinds respect it.
     const cap: u32 = @intCast(platform_ipc.MAX_PARKED_LONG_POLL_WAITERS);
-    daemon.changes_parked.store(cap, .release);
+    daemon.long_poll_parked.store(cap, .release);
     try std.testing.expectEqual(Daemon.ChangesParkOutcome.over_cap, daemon.parkForChanges(daemon.changes_signal.load(.acquire), nowMs() + 1000));
-    try std.testing.expectEqual(cap, daemon.changes_parked.load(.acquire));
-    daemon.changes_parked.store(0, .release);
+    try std.testing.expectEqual(Daemon.ChangesParkOutcome.over_cap, daemon.parkForTurnEvents(daemon.turn_events_signal.load(.acquire), nowMs() + 1000));
+    try std.testing.expectEqual(cap, daemon.long_poll_parked.load(.acquire));
+    daemon.long_poll_parked.store(0, .release);
 
     // Missed-wake protocol: a signal bump AFTER the observed load but BEFORE
     // the park returns .woken without sleeping.
