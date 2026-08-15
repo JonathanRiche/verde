@@ -3321,6 +3321,23 @@ pub fn backgroundTaskCompletionBodyAlloc(allocator: std.mem.Allocator, task: *co
     return try allocator.dupeZ(u8, owned);
 }
 
+fn stopUnownedBackgroundTasksAtTurnEnd(self: anytype, thread: *ChatThread) void {
+    for (thread.background_tasks.items) |*task| {
+        if (task.status != .running or task.pid_path != null or task.process_id != null) continue;
+        const body = backgroundTaskCompletionBodyAlloc(self.allocator, task) catch |err| {
+            log.warn("failed to build stopped background task body: {s}", .{@errorName(err)});
+            continue;
+        };
+        defer self.allocator.free(body);
+        self.appendMessageToThread(thread, .system, "Background task stopped", body, null, &.{}) catch |err| {
+            log.warn("failed to append stopped background task: {s}", .{@errorName(err)});
+            continue;
+        };
+        task.status = .stopped;
+        task.updated_at_ms = unixTimestampMs();
+    }
+}
+
 pub fn readBackgroundTaskPid(allocator: std.mem.Allocator, pid_path: []const u8) ?u32 {
     var threaded = std.Io.Threaded.init_single_threaded;
     const raw = std.Io.Dir.cwd().readFileAlloc(threaded.io(), pid_path, allocator, .limited(256)) catch return null;
@@ -3921,6 +3938,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
                     self.markDirty();
                     self.setSidebarNotice("Workspace command finished.");
                 }
+                if (!completed_local_command) stopUnownedBackgroundTasksAtTurnEnd(self, thread);
                 if (project_index == self.project_controller.selected_index and thread_index == self.currentProject().selected_thread_index) {
                     self.requestTranscriptScrollToBottomIfFollowing();
                 }
@@ -3951,6 +3969,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             } else {
                 self.setSidebarNotice("Provider request failed.");
             }
+            if (!completed_local_command) stopUnownedBackgroundTasksAtTurnEnd(self, thread);
             // M4-P4 fix: identity-preserving flush — adopt ids (failed turns
             // also commit durably), then flush without gating.
             if (completed_daemon_turn_id) |turn_id| adoptDaemonTranscriptIdentitiesWithRetry(self, project_index, thread, turn_id);
@@ -3982,6 +4001,7 @@ pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, 
             thread.touch();
             self.markDirty();
             self.setSidebarNotice(if (completed_local_command) "Workspace command cancelled." else "Provider reply stopped.");
+            if (!completed_local_command) stopUnownedBackgroundTasksAtTurnEnd(self, thread);
             // M4-P4 fix: identity-preserving flush — adopt ids (aborted turns
             // also commit durably), then flush without gating.
             if (completed_daemon_turn_id) |turn_id| adoptDaemonTranscriptIdentitiesWithRetry(self, project_index, thread, turn_id);
@@ -4876,7 +4896,18 @@ test "adoption refresh veto count survives clear/re-mint and stays terminal" {
     // The marker's workspace is absent from every refresh snapshot, so each
     // validation fails — the shape of a projection that never converges.
     const persisted: db_types.PersistedState = .{};
-    var dummy: struct {} = .{};
+    const TestStorage = struct {
+        pub fn loadMessagePage(
+            _: *const @This(),
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: usize,
+        ) !db_types.LoadedMessagePage {
+            return error.UnexpectedMessagePageLoad;
+        }
+    };
+    var dummy: struct { storage: TestStorage = .{} } = .{};
 
     markAdoptionPending("ws-veto-test", &thread, "turn-veto-test");
     const key = adoptionRetryKeyAlloc("ws-veto-test", thread.local_thread_id, "turn-veto-test").?;

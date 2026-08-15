@@ -522,6 +522,7 @@ pub const ChatThread = struct {
         const item_id = backgroundTaskMetadataValue(body_raw, "Codex item ID:");
         const process_id = backgroundTaskMetadataValue(body_raw, "Process ID:");
         const provider_thread_id = backgroundTaskMetadataValue(body_raw, "Provider thread ID:");
+        var matched_terminal_task: ?*BackgroundTask = null;
         for (self.background_tasks.items) |*task| {
             const identity_matches = (task_id != null and task.task_id != null and std.mem.eql(u8, task.task_id.?, task_id.?)) or
                 (item_id != null and task.item_id != null and provider_thread_id != null and task.provider_thread_id != null and
@@ -532,6 +533,19 @@ pub const ChatThread = struct {
             const legacy_command_matches = task_id == null and item_id == null and process_id == null and task.task_id == null and task.item_id == null and
                 task.process_id == null and std.mem.eql(u8, task.command, command);
             if (!identity_matches and !legacy_command_matches) continue;
+            // Repeated anonymous commands have no provider identity. A
+            // terminal event belongs to the first still-running match; using
+            // an already-terminal match forever leaves its sibling waiting.
+            if (status != .running and task.status != .running) {
+                if (matched_terminal_task == null) matched_terminal_task = task;
+                continue;
+            }
+            task.status = status;
+            task.updated_at_ms = unixTimestampMs();
+            try refreshBackgroundTaskMetadata(task, allocator, body_raw);
+            return;
+        }
+        if (matched_terminal_task) |task| {
             task.status = status;
             task.updated_at_ms = unixTimestampMs();
             try refreshBackgroundTaskMetadata(task, allocator, body_raw);
@@ -555,7 +569,24 @@ pub const ChatThread = struct {
             self.noteBackgroundTaskEvent(allocator, message.author, message.body) catch |err| {
                 log.warn("failed to restore background task metadata: {s}", .{@errorName(err)});
             };
+            if (std.mem.eql(u8, message.author, "Conversation interrupted")) {
+                _ = self.stopUnownedBackgroundTasks();
+            }
         }
+    }
+
+    /// Claude's tracked commands are owned by the query that emitted them and
+    /// intentionally have no detached PID or retained provider process id.
+    /// Once that query ends, such a row cannot still be live.
+    pub fn stopUnownedBackgroundTasks(self: *ChatThread) usize {
+        var stopped: usize = 0;
+        for (self.background_tasks.items) |*task| {
+            if (task.status != .running or task.pid_path != null or task.process_id != null) continue;
+            task.status = .stopped;
+            task.updated_at_ms = unixTimestampMs();
+            stopped += 1;
+        }
+        return stopped;
     }
 
     pub fn backgroundCommandIsRunning(self: *const ChatThread, body_raw: []const u8) bool {
@@ -911,6 +942,49 @@ test "chat activity waits for running background work" {
     thread.send_state.status = .completed;
     thread.background_tasks.items[0].status = .completed;
     try std.testing.expectEqual(ChatActivityStatus.done, thread.activityStatusForUi());
+}
+
+test "interrupted transcript rebuild stops unowned background work" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Interrupted background");
+    defer thread.deinit(allocator);
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "Background command"),
+        .body = try allocator.dupeZ(u8, "wait forever"),
+    });
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "Conversation interrupted"),
+        .body = try allocator.dupeZ(u8, "Tell the model what to do differently."),
+    });
+
+    thread.rebuildBackgroundTasksFromMessages(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), thread.background_tasks.items.len);
+    try std.testing.expectEqual(BackgroundTaskStatus.stopped, thread.background_tasks.items[0].status);
+    try std.testing.expectEqual(ChatActivityStatus.idle, thread.activityStatusForUi());
+}
+
+test "terminal events resolve repeated anonymous background commands in order" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Repeated background");
+    defer thread.deinit(allocator);
+
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "same command"),
+        .status = .running,
+    });
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "same command"),
+        .status = .running,
+    });
+    try thread.noteBackgroundTaskEvent(allocator, "Background task stopped", "same command");
+    try thread.noteBackgroundTaskEvent(allocator, "Background task stopped", "same command");
+
+    try std.testing.expectEqual(@as(usize, 2), thread.background_tasks.items.len);
+    try std.testing.expectEqual(BackgroundTaskStatus.stopped, thread.background_tasks.items[0].status);
+    try std.testing.expectEqual(BackgroundTaskStatus.stopped, thread.background_tasks.items[1].status);
 }
 
 test "background command events accept current and legacy labels" {
