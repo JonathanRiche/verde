@@ -56,7 +56,8 @@ pub const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\verde-sessionizer-";
 // Version 20 repairs durable transcript roles from mixed historical codecs.
 // Version 21 makes first-prompt and generated titles part of daemon-owned
 // chat turns, including turns created through the MCP/headless API.
-pub const PROTOCOL_VERSION: u32 = 21;
+// Version 22 adds bounded live-tail replay for large provider event streams.
+pub const PROTOCOL_VERSION: u32 = 22;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
@@ -4877,12 +4878,14 @@ pub const Daemon = struct {
     /// or the budget/drain ends the wait — then answers with the current
     /// tail, never an error. Over-cap parking degrades to an immediate
     /// response. The turn is re-resolved by id after every wake because a
-    /// consumed turn frees its memory.
+    /// consumed turn frees its memory. Optional `max_bytes` pages event replay;
+    /// terminal status and result fields are withheld until the final page.
     fn chatTurnTailResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
         if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
         const turn_id = jsonString(params.object.get("turn_id") orelse .null) orelse return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing turn_id");
         const after_seq = jsonUsize(params.object.get("after_seq") orelse .null) orelse 0;
         const wait_ms = jsonUsize(params.object.get("wait_ms") orelse .null) orelse 0;
+        const max_bytes = jsonUsize(params.object.get("max_bytes") orelse .null);
         const effective_wait_ms: u32 = @intCast(@min(wait_ms, MAX_CHANGES_WAIT_MS));
         const wait_deadline_ms: i64 = nowMs() + effective_wait_ms;
         var wait_exhausted = false;
@@ -4913,13 +4916,19 @@ pub const Daemon = struct {
                     }
                 }
                 defer turn.mutex.unlock();
-                if (chatTailUpperBound(turn, @intCast(after_seq)) > MAX_RESPONSE_BYTES) return error.ResponseTooLarge;
+                const after: u64 = @intCast(after_seq);
+                const through_seq = if (max_bytes) |requested|
+                    chatTailPageEndSeq(turn, after, @min(requested, MAX_RESPONSE_BYTES))
+                else
+                    turn.next_seq - 1;
+                const has_more_events = chatTailHasEventsAfter(turn, through_seq);
+                if (chatTailUpperBound(turn, after, through_seq, !has_more_events) > MAX_RESPONSE_BYTES) return error.ResponseTooLarge;
                 var writer: std.Io.Writer.Allocating = .init(self.allocator);
                 errdefer writer.deinit();
                 var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
                 try beginOk(&s, id_value);
                 try s.objectField("result");
-                try writeChatTurnTail(&s, turn, @intCast(after_seq));
+                try writeChatTurnTail(&s, turn, after, through_seq, has_more_events);
                 try s.endObject();
                 return try writer.toOwnedSlice();
             }
@@ -8167,18 +8176,29 @@ fn writeChatTurnSummary(s: *std.json.Stringify, turn: *const ChatTurn) !void {
     try s.endObject();
 }
 
-fn writeChatTurnTail(s: *std.json.Stringify, turn: *const ChatTurn, after_seq: u64) !void {
+fn writeChatTurnTail(
+    s: *std.json.Stringify,
+    turn: *const ChatTurn,
+    after_seq: u64,
+    through_seq: u64,
+    has_more_events: bool,
+) !void {
     try s.beginObject();
     try s.objectField("status");
     // Durable-first: tail status=completed/failed/aborted only with the receipt.
-    try s.write(@tagName(chatTurnPublishedStatus(turn)));
+    const published_status = chatTurnPublishedStatus(turn);
+    const page_status: ChatTurnStatus = if (has_more_events and chatTurnStatusIsTerminal(published_status))
+        .running
+    else
+        published_status;
+    try s.write(@tagName(page_status));
     // Same clock the desktop's working timer counts from (turn acceptance).
     try s.objectField("started_at_ms");
     try s.write(turn.started_at_ms);
     try s.objectField("events");
     try s.beginArray();
     for (turn.events.items) |event| {
-        if (event.seq <= after_seq) continue;
+        if (event.seq <= after_seq or event.seq > through_seq) continue;
         try s.beginObject();
         try s.objectField("seq");
         try s.write(event.seq);
@@ -8191,6 +8211,10 @@ fn writeChatTurnTail(s: *std.json.Stringify, turn: *const ChatTurn, after_seq: u
     try s.endArray();
     try s.objectField("next_seq");
     try s.write(turn.next_seq);
+    try s.objectField("page_last_seq");
+    try s.write(through_seq);
+    try s.objectField("has_more_events");
+    try s.write(has_more_events);
     try s.objectField("provider_thread_id");
     if (turn.provider_thread_id) |value| try s.write(value) else try s.write(null);
     try s.objectField("active_turn_id");
@@ -8202,15 +8226,19 @@ fn writeChatTurnTail(s: *std.json.Stringify, turn: *const ChatTurn, after_seq: u
     try s.objectField("user_prompt");
     try s.write(turn.request.prompt);
     try s.objectField("result_reply_text");
-    if (turn.result_reply_text) |value| try s.write(value) else try s.write(null);
+    if (!has_more_events) {
+        if (turn.result_reply_text) |value| try s.write(value) else try s.write(null);
+    } else try s.write(null);
     try s.objectField("generated_title");
-    if (turn.generated_title_applied) {
+    if (!has_more_events and turn.generated_title_applied) {
         if (turn.generated_title) |value| try s.write(value) else try s.write(null);
     } else try s.write(null);
     try s.objectField("generated_title_expected");
-    if (turn.generated_title_applied) try s.write(turn.request.thread_title) else try s.write(null);
+    if (!has_more_events and turn.generated_title_applied) try s.write(turn.request.thread_title) else try s.write(null);
     try s.objectField("error_message");
-    if (turn.error_message) |value| try s.write(value) else try s.write(null);
+    if (!has_more_events) {
+        if (turn.error_message) |value| try s.write(value) else try s.write(null);
+    } else try s.write(null);
     try s.objectField("pending_approval");
     try writePendingApproval(s, turn.pending_approval);
     // M4 durable-commit publication: present only after the store receipt.
@@ -8253,6 +8281,10 @@ fn durableChatTurnTailResponse(
     try s.endArray();
     try s.objectField("next_seq");
     try s.write(0);
+    try s.objectField("page_last_seq");
+    try s.write(0);
+    try s.objectField("has_more_events");
+    try s.write(false);
     try s.objectField("provider_thread_id");
     if (record.provider_thread_id) |value| try s.write(value) else try s.write(null);
     try s.objectField("active_turn_id");
@@ -8287,37 +8319,78 @@ fn durableChatTurnTailResponse(
     return try writer.toOwnedSlice();
 }
 
-fn chatTailUpperBound(turn: *const ChatTurn, after_seq: u64) usize {
-    var total: usize = 4096;
+fn chatTailPageEndSeq(turn: *const ChatTurn, after_seq: u64, max_bytes: usize) u64 {
+    var through_seq = after_seq;
+    var total = chatTailMetadataUpperBound(turn, true);
     for (turn.events.items) |event| {
         if (event.seq <= after_seq) continue;
-        total = saturatedAdd(total, 96);
-        total = saturatedAdd(total, jsonStringUpperBound(event.kind.len));
-        total = saturatedAdd(total, jsonStringUpperBound(event.payload_json.len));
+        const with_event = saturatedAdd(total, chatEventUpperBound(event));
+        if (through_seq != after_seq and with_event > max_bytes) break;
+        total = with_event;
+        through_seq = event.seq;
     }
-    if (turn.provider_thread_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
-    if (turn.active_turn_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
-    if (turn.user_message_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
-    total = saturatedAdd(total, jsonStringUpperBound(turn.request.prompt.len));
-    if (turn.result_reply_text) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
-    if (turn.generated_title_applied) {
-        if (turn.generated_title) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
-        total = saturatedAdd(total, jsonStringUpperBound(turn.request.thread_title.len));
+    return through_seq;
+}
+
+fn chatTailHasEventsAfter(turn: *const ChatTurn, seq: u64) bool {
+    for (turn.events.items) |event| {
+        if (event.seq > seq) return true;
     }
-    if (turn.error_message) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
-    if (turn.pending_approval) |approval| {
-        total = saturatedAdd(total, 96);
-        total = saturatedAdd(total, jsonStringUpperBound(approval.call_id.len));
-        total = saturatedAdd(total, jsonStringUpperBound(approval.title.len));
-        total = saturatedAdd(total, jsonStringUpperBound(approval.body.len));
+    return false;
+}
+
+fn chatTailUpperBound(turn: *const ChatTurn, after_seq: u64, through_seq: u64, include_terminal_fields: bool) usize {
+    var total = chatTailMetadataUpperBound(turn, include_terminal_fields);
+    for (turn.events.items) |event| {
+        if (event.seq <= after_seq or event.seq > through_seq) continue;
+        total = saturatedAdd(total, chatEventUpperBound(event));
     }
     return total;
 }
 
-fn jsonStringUpperBound(byte_len: usize) usize {
-    // This is only a cheap allocation guard; the exact serialized length
-    // check after writing the response is authoritative for the 8 MiB limit.
-    return saturatedAdd(2, byte_len);
+fn chatTailMetadataUpperBound(turn: *const ChatTurn, include_terminal_fields: bool) usize {
+    var total: usize = 4096;
+    if (turn.provider_thread_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
+    if (turn.active_turn_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
+    if (turn.user_message_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
+    total = saturatedAdd(total, jsonStringUpperBound(turn.request.prompt));
+    if (include_terminal_fields) {
+        if (turn.result_reply_text) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
+        if (turn.generated_title_applied) {
+            if (turn.generated_title) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
+            total = saturatedAdd(total, jsonStringUpperBound(turn.request.thread_title));
+        }
+        if (turn.error_message) |value| total = saturatedAdd(total, jsonStringUpperBound(value));
+    }
+    if (turn.pending_approval) |approval| {
+        total = saturatedAdd(total, 96);
+        total = saturatedAdd(total, jsonStringUpperBound(approval.call_id));
+        total = saturatedAdd(total, jsonStringUpperBound(approval.title));
+        total = saturatedAdd(total, jsonStringUpperBound(approval.body));
+    }
+    return total;
+}
+
+fn chatEventUpperBound(event: ChatEvent) usize {
+    var total: usize = 96;
+    total = saturatedAdd(total, jsonStringUpperBound(event.kind));
+    return saturatedAdd(total, jsonStringUpperBound(event.payload_json));
+}
+
+fn jsonStringUpperBound(value: []const u8) usize {
+    var total: usize = 2;
+    for (value) |byte| {
+        total = saturatedAdd(total, switch (byte) {
+            '\\', '"', 0x08, 0x0c, '\n', '\r', '\t' => 2,
+            0x00...0x07, 0x0b, 0x0e...0x1f => 6,
+            else => 1,
+        });
+    }
+    return total;
+}
+
+fn chatTurnStatusIsTerminal(status: ChatTurnStatus) bool {
+    return status == .completed or status == .failed or status == .aborted;
 }
 
 fn saturatedAdd(left: usize, right: usize) usize {
@@ -12725,6 +12798,54 @@ test "durable reads decode canonical and historical daemon chat role codes" {
     );
     defer allocator.free(list_response);
     try std.testing.expect(std.mem.indexOf(u8, list_response, "\"local_thread_id\":\"t-dto\"") != null);
+}
+
+test "chat turn tail pages large replay before publishing terminal status" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const turn = try appendTestChatTurn(&daemon, allocator, "tail-paged", "ws-tail", "/tmp/tail", "Tail", "prompt", .completed, 1);
+    turn.committed_store_revision = 7;
+    turn.result_reply_text = try allocator.dupe(u8, "done");
+
+    const payload = try allocator.alloc(u8, 9000);
+    defer allocator.free(payload);
+    @memset(payload, 'x');
+    const payload_prefix = "{\"text\":\"";
+    @memcpy(payload[0..payload_prefix.len], payload_prefix);
+    payload[payload.len - 2] = '"';
+    payload[payload.len - 1] = '}';
+    turn.appendEvent(allocator, "tool_call", payload);
+    turn.appendEvent(allocator, "diff", payload);
+
+    const first = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"chat.turn.tail","params":{"turn_id":"tail-paged","after_seq":0,"max_bytes":16000}}
+    );
+    defer allocator.free(first);
+    try std.testing.expect(first.len <= 16000);
+    var first_parsed = try std.json.parseFromSlice(std.json.Value, allocator, first, .{});
+    defer first_parsed.deinit();
+    const first_result = first_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings("running", first_result.get("status").?.string);
+    try std.testing.expectEqual(@as(usize, 1), first_result.get("events").?.array.items.len);
+    try std.testing.expectEqual(@as(i64, 1), first_result.get("page_last_seq").?.integer);
+    try std.testing.expect(first_result.get("has_more_events").?.bool);
+    try std.testing.expect(first_result.get("result_reply_text").? == .null);
+
+    const second = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"chat.turn.tail","params":{"turn_id":"tail-paged","after_seq":1,"max_bytes":16000}}
+    );
+    defer allocator.free(second);
+    try std.testing.expect(second.len <= 16000);
+    var second_parsed = try std.json.parseFromSlice(std.json.Value, allocator, second, .{});
+    defer second_parsed.deinit();
+    const second_result = second_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqualStrings("completed", second_result.get("status").?.string);
+    try std.testing.expectEqual(@as(usize, 1), second_result.get("events").?.array.items.len);
+    try std.testing.expectEqual(@as(i64, 2), second_result.get("page_last_seq").?.integer);
+    try std.testing.expect(!second_result.get("has_more_events").?.bool);
+    try std.testing.expectEqualStrings("done", second_result.get("result_reply_text").?.string);
 }
 
 test "chat turn tail falls back to durable terminal record after consume" {

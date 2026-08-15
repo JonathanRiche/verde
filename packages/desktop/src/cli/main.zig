@@ -7625,8 +7625,8 @@ test "daemon-first chat validation requires canonical identity and setting types
     }
 }
 
-test "protocol 21 stale GUI validation falls back only for unsupported methods" {
-    try std.testing.expectEqual(@as(u32, 21), sessionizer.PROTOCOL_VERSION);
+test "stale GUI validation falls back only for unsupported methods" {
+    try std.testing.expectEqual(@as(u32, 22), sessionizer.PROTOCOL_VERSION);
     const allocator = std.testing.allocator;
     const cases = [_]struct { payload: []const u8, expected: ChatOpenValidationRoute }{
         .{
