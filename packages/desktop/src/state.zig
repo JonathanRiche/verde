@@ -9982,13 +9982,28 @@ pub const AppState = struct {
 
     pub fn recordBackgroundTaskActionForMessage(self: *AppState, rect: palette.Rect, message_index: usize, body: []const u8, action: BackgroundTaskAction) void {
         if (rect.w < 2 or rect.h < 2) return;
-        for (self.project_controller.projects.items, 0..) |*project, project_index| for (project.threads.items, 0..) |*thread, thread_index| {
-            if (message_index >= thread.messages.items.len or !std.mem.eql(u8, thread.messages.items[message_index].body, body)) continue;
-            const task = chat_controller.backgroundTaskForEventBody(thread, body) orelse continue;
-            const task_index = (@intFromPtr(task) - @intFromPtr(thread.background_tasks.items.ptr)) / @sizeOf(BackgroundTask);
-            self.recordBackgroundTaskActionHit(.{ .rect = rect, .project_index = project_index, .thread_index = thread_index, .task_index = task_index, .message_index = message_index, .action = action });
-            return;
+        const project_index = self.project_controller.selected_index;
+        if (project_index >= self.project_controller.projects.items.len) return;
+        const project = &self.project_controller.projects.items[project_index];
+        const thread_index = project.selected_thread_index;
+        if (thread_index >= project.threads.items.len) return;
+        const thread = &project.threads.items[thread_index];
+
+        // Pending transcript rows are rendered while their send-state mutex is
+        // held, so inspect that already-protected list directly. Requiring a
+        // committed message here silently dropped Stop/Output hits until the
+        // whole turn finished, leaving the overlapping card toggle to win.
+        const rendered_body = if (message_index < thread.messages.items.len)
+            thread.messages.items[message_index].body
+        else blk: {
+            const pending_index = message_index - thread.messages.items.len;
+            if (pending_index >= thread.send_state.pending_events.items.len) return;
+            break :blk thread.send_state.pending_events.items[pending_index].body;
         };
+        if (!std.mem.eql(u8, rendered_body, body)) return;
+        const task = chat_controller.backgroundTaskForEventBody(thread, body) orelse return;
+        const task_index = (@intFromPtr(task) - @intFromPtr(thread.background_tasks.items.ptr)) / @sizeOf(BackgroundTask);
+        self.recordBackgroundTaskActionHit(.{ .rect = rect, .project_index = project_index, .thread_index = thread_index, .task_index = task_index, .message_index = message_index, .action = action });
     }
 
     pub fn consumeBackgroundTaskActionClick(self: *AppState, x: f32, y: f32) bool {
@@ -9998,10 +10013,9 @@ pub const AppState = struct {
             var project = &self.project_controller.projects.items[hit.project_index];
             if (hit.thread_index >= project.threads.items.len) return true;
             const thread = &project.threads.items[hit.thread_index];
-            if (hit.message_index >= thread.messages.items.len) return true;
             if (hit.task_index >= thread.background_tasks.items.len) return true;
             const task = &thread.background_tasks.items[hit.task_index];
-            if (chat_controller.backgroundTaskForEventBody(thread, thread.messages.items[hit.message_index].body) != task) {
+            if (!backgroundTaskActionHitStillTargets(thread, hit.message_index, task)) {
                 self.setSidebarNotice("Background task is no longer available.");
                 return true;
             }
@@ -10012,6 +10026,18 @@ pub const AppState = struct {
             return true;
         }
         return false;
+    }
+
+    fn backgroundTaskActionHitStillTargets(thread: *ChatThread, message_index: usize, task: *BackgroundTask) bool {
+        if (message_index < thread.messages.items.len) {
+            return chat_controller.backgroundTaskForEventBody(thread, thread.messages.items[message_index].body) == task;
+        }
+
+        thread.send_state.mutex.lock();
+        defer thread.send_state.mutex.unlock();
+        const pending_index = message_index - thread.messages.items.len;
+        if (pending_index >= thread.send_state.pending_events.items.len) return false;
+        return chat_controller.backgroundTaskForEventBody(thread, thread.send_state.pending_events.items[pending_index].body) == task;
     }
 
     fn stopBackgroundTask(self: *AppState, project_index: usize, thread: *ChatThread, task: *BackgroundTask) bool {
@@ -10719,6 +10745,35 @@ test "new Codex threads default to GPT-5.6 Sol with low reasoning" {
     defer thread.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(DEFAULT_CODEX_MODEL, thread.model_ref.?);
     try std.testing.expectEqual(DEFAULT_CODEX_REASONING_EFFORT, thread.reasoning_effort.?);
+}
+
+test "background task action hits remain valid for pending transcript events" {
+    const allocator = std.testing.allocator;
+    const page = std.heap.page_allocator;
+    var thread = try ChatThread.init(allocator, "Background action");
+    defer thread.deinit(allocator);
+
+    const body = "sleep 10\n\nVerde task ID: task-1";
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "sleep 10"),
+        .task_id = try allocator.dupeZ(u8, "task-1"),
+        .status = .running,
+    });
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "Background command"),
+        .body = try allocator.dupeZ(u8, body),
+    });
+    try thread.send_state.pending_events.append(page, .{
+        .role = .system,
+        .author = try page.dupe(u8, "Background command"),
+        .body = try page.dupe(u8, body),
+    });
+
+    const task = &thread.background_tasks.items[0];
+    try std.testing.expect(AppState.backgroundTaskActionHitStillTargets(&thread, 0, task));
+    try std.testing.expect(AppState.backgroundTaskActionHitStillTargets(&thread, 1, task));
+    try std.testing.expect(!AppState.backgroundTaskActionHitStillTargets(&thread, 2, task));
 }
 
 test "provider-aware chat creation scopes mutation and rejects invalid models" {
