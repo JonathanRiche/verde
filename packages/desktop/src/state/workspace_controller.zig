@@ -1034,6 +1034,7 @@ fn focusWorkspacePaneWithCompletionPolicy(
     if (project_index >= self.project_controller.projects.items.len) return false;
     var layout = &self.project_controller.projects.items[project_index].workspace_layout;
     const pane = layout.paneById(pane_id) orelse return false;
+    const pane_focus_changed = layout.focused_pane_id != pane_id;
     // Ordinary focus movement uses the strip's minimal-reveal behavior. A
     // direct navigation path may request leading-edge placement after this
     // method completes.
@@ -1048,6 +1049,7 @@ fn focusWorkspacePaneWithCompletionPolicy(
     switch (pane.ref) {
         .chat => |ref| {
             var project = &self.project_controller.projects.items[project_index];
+            const thread_focus_changed = project.selected_thread_index != ref.thread_index;
             if (ref.thread_index < project.threads.items.len) {
                 persisted_focus_changed = persisted_focus_changed or project.selected_thread_index != ref.thread_index;
                 project.selected_thread_index = ref.thread_index;
@@ -1060,6 +1062,9 @@ fn focusWorkspacePaneWithCompletionPolicy(
                     self.requestComposerFocus();
                 } else {
                     self.restoreComposerFocus();
+                }
+                if (pane_focus_changed or thread_focus_changed) {
+                    self.prepareTranscriptPaneFocus(project_index, pane_id);
                 }
             }
         },

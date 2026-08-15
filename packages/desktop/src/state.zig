@@ -4472,7 +4472,10 @@ pub const AppState = struct {
     pub const flushDirtyNow = lifecycle_controller.flushDirtyNow;
     pub const currentThreadMutable = transcript_controller.currentThreadMutable;
     pub const rememberCurrentTranscriptScroll = transcript_controller.rememberCurrentTranscriptScroll;
+    pub const clearCurrentTranscriptScroll = transcript_controller.clearCurrentTranscriptScroll;
     pub const rememberWorkspaceChatTranscriptScroll = transcript_controller.rememberWorkspaceChatTranscriptScroll;
+    pub const clearWorkspaceChatTranscriptScroll = transcript_controller.clearWorkspaceChatTranscriptScroll;
+    pub const prepareTranscriptPaneFocus = transcript_controller.prepareTranscriptPaneFocus;
     pub const shiftCurrentTranscriptScroll = transcript_controller.shiftCurrentTranscriptScroll;
     pub const currentTranscriptScrollY = transcript_controller.currentTranscriptScrollY;
     pub const workspaceChatTranscriptScrollY = transcript_controller.workspaceChatTranscriptScrollY;
@@ -4658,6 +4661,7 @@ pub const AppState = struct {
                 layout.focused_pane_id = pane_id;
                 self.restorePersistedBrowserPaneAfterProjectSelection(project_index);
                 _ = self.focusWorkspacePane(project_index, pane_id);
+                self.prepareTranscriptPaneFocus(project_index, pane_id);
                 self.markDirty();
                 return;
             }
@@ -4692,6 +4696,7 @@ pub const AppState = struct {
             },
         }
         _ = self.focusWorkspacePane(project_index, pane_id);
+        self.prepareTranscriptPaneFocus(project_index, pane_id);
         if (preserve_viewport) {
             layout.scroll_leading_pane_id = null;
             layout.scroll_revealed_pane_id = null;
