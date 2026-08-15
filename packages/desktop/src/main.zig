@@ -2244,7 +2244,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (event.button.button == 1 and state.handleFollowupPinMouseButton(event.button.x, event.button.y, event.button.down, event.button.clicks)) {
+            if (event.button.button == 1 and chat_panel_ui.handleFollowupPinMouseButton(state, event.button.x, event.button.y, event.button.down, event.button.clicks)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
