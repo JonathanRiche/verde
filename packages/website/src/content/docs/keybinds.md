@@ -21,7 +21,7 @@ in your Verde config — see [Remapping](#remapping) below.
 | `Ctrl+W` / `Cmd+W`, `Alt+X` | Close the focused pane                |
 | `Ctrl+Shift+W` / `Cmd+Shift+W` | Close the current workspace (reopen from the command palette) |
 | `Ctrl+Shift+Space`          | Toggle the experimental Companion (when enabled in Settings) |
-| `Ctrl+R` / `Cmd+R`, `Ctrl+Shift+R`, `F5` | Refresh / reload app         |
+| `Ctrl+Shift+R` / `Cmd+Shift+R`, `F5` | Refresh / reload app            |
 | `Alt+O`                     | Open the default project              |
 | `Ctrl+Shift+O`              | Open in external editor               |
 
@@ -32,6 +32,7 @@ in your Verde config — see [Remapping](#remapping) below.
 | `Ctrl+S` / `Cmd+S`          | Toggle the sidebar (visible ↔ icon)   |
 | `Ctrl+Shift+S`             | Toggle the sidebar's hidden mode      |
 | `Ctrl+Shift+B`              | Toggle the embedded browser pane      |
+| `Ctrl+R` / `Cmd+R`          | Reload the active browser tab (browser pane only) |
 | `Tab`                       | Inside a chat pane, focus the prompt box |
 | `Ctrl+Tab`                  | Focus the next pane in sidebar order     |
 | `Ctrl+Shift+Tab`            | Focus the previous pane in sidebar order |

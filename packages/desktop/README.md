@@ -130,7 +130,7 @@ Config supports UI and terminal font size, scrolling-pane activation and spacing
     "default": "editor"
   },
   "keybinds": {
-    "refresh": ["CommandOrControl+R", "CommandOrControl+Shift+R", "Ctrl+Shift+R", "F5"],
+    "refresh": ["CommandOrControl+Shift+R", "Ctrl+Shift+R", "F5"],
     "open": "Alt+O",
     "new_thread": "CommandOrControl+T",
     "sidebar": "CommandOrControl+S",
