@@ -1262,7 +1262,7 @@ test "legacy Companion cleanup rejects all send-owned presentation and action st
             .decision => send_state.approval_decision = .approve,
             .followup => send_state.pending_followup = .{
                 .kind = .queue,
-                .prompt = try std.heap.page_allocator.dupe(u8, "next"),
+                .prompt = try allocator.dupe(u8, "next"),
             },
             .followup_signal => send_state.pending_followup_signal_sent = true,
             .stop_request => send_state.stop_requested = true,
