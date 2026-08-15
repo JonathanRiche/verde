@@ -2104,8 +2104,12 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
         // A historical thread can render empty for one frame before hydration.
         // Do not turn that transient state into an explicit top offset; retaining
         // the missing offset keeps the hydrated transcript pinned to its tail.
+        // Likewise, when rows are merely paged out (persisted offset set but
+        // hydration hasn't landed yet), never stomp an existing saved anchor
+        // with 0.0 — that rewrote the viewport to the estimated top and made
+        // the restored transcript land somewhere unrelated after recovery.
         const saved_scroll = currentTranscriptScrollY(state, pane_id);
-        if (shouldRememberTranscriptScroll(saved_scroll, false)) {
+        if (thread.persisted_message_offset == 0 and shouldRememberTranscriptScroll(saved_scroll, false)) {
             rememberTranscriptScroll(state, pane_id, 0.0);
         }
         appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect, .column = column, .clip = clip });

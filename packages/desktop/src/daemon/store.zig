@@ -1427,7 +1427,16 @@ pub const Store = struct {
             \\where not exists (
             \\    select 1 from messages m3
             \\    where m3.thread_id = t.id and m3.sort_index = p.sort_index
-            \\);
+            \\)
+            \\-- Identity guard, not just position: a snapshot row can carry this
+            \\-- message_id at a DIFFERENT sort_index (post-adoption reflow). The
+            \\-- doc contract says the snapshot's copy wins; without this filter
+            \\-- the messages_thread_message_id_idx belt aborts the whole apply as
+            \\-- a constraint failure, permanently rejecting the GUI's flush.
+            \\and (p.message_id is null or not exists (
+            \\    select 1 from messages m4
+            \\    where m4.thread_id = t.id and m4.message_id = p.message_id
+            \\));
             \\insert into client_message_keys (thread_id, message_id, message_fingerprint, sort_index,
             \\                                 created_at_ms, updated_at_ms, store_revision)
             \\select t.id, p.message_id, p.key_fingerprint, p.sort_index,
