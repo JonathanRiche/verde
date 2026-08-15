@@ -934,6 +934,213 @@ fn preserveCurrentIdentitiesWithoutBaseline(
     remote.projects = try projects.toOwnedSlice(allocator);
 }
 
+fn projectByIdForViewport(
+    controller: *project_controller.State,
+    project_id: []const u8,
+) ?*project_state.Project {
+    for (controller.projects.items) |*project| {
+        if (std.mem.eql(u8, project.id, project_id)) return project;
+    }
+    for (controller.archived_projects.items) |*project| {
+        if (std.mem.eql(u8, project.id, project_id)) return project;
+    }
+    return null;
+}
+
+fn threadByIdForViewport(project: *project_state.Project, thread_id: []const u8) ?*ChatThread {
+    for (project.threads.items) |*thread| {
+        if (std.mem.eql(u8, thread.local_thread_id, thread_id)) return thread;
+    }
+    for (project.archived_threads.items) |*thread| {
+        if (std.mem.eql(u8, thread.local_thread_id, thread_id)) return thread;
+    }
+    return null;
+}
+
+fn transcriptSnapshotsShareLayout(current: *const ChatThread, replacement: *const ChatThread) bool {
+    if (current.persisted_message_offset != replacement.persisted_message_offset or
+        current.messages.items.len != replacement.messages.items.len)
+    {
+        return false;
+    }
+    for (current.messages.items, replacement.messages.items) |current_message, replacement_message| {
+        if (current_message.role != replacement_message.role or
+            !std.mem.eql(u8, current_message.author, replacement_message.author) or
+            !std.mem.eql(u8, current_message.body, replacement_message.body) or
+            current_message.tool_call_kind != replacement_message.tool_call_kind or
+            current_message.tool_call_status != replacement_message.tool_call_status or
+            (current_message.image != null) != (replacement_message.image != null) or
+            current_message.extra_images.len != replacement_message.extra_images.len)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn sendStateHasRuntime(state: *SendState) bool {
+    state.mutex.lock();
+    defer state.mutex.unlock();
+    return state.status != .idle or state.worker != null or state.daemon_owned;
+}
+
+fn transferProjectionThreadRuntime(current: *ChatThread, replacement: *ChatThread) void {
+    const transfer_send_state = sendStateHasRuntime(current.send_state) or !sendStateHasRuntime(replacement.send_state);
+    if (transfer_send_state) {
+        std.mem.swap(@TypeOf(current.send_state), &current.send_state, &replacement.send_state);
+        std.mem.swap(@TypeOf(current.pending_transcript_body), &current.pending_transcript_body, &replacement.pending_transcript_body);
+    }
+    // Title generation is GUI-owned and is never reconstructed from a daemon
+    // projection, so its worker/result state always follows the stable thread.
+    std.mem.swap(@TypeOf(current.title_generation_state), &current.title_generation_state, &replacement.title_generation_state);
+
+    if (!transcriptSnapshotsShareLayout(current, replacement)) return;
+    std.mem.swap(@TypeOf(current.transcript_markdown_entries), &current.transcript_markdown_entries, &replacement.transcript_markdown_entries);
+    std.mem.swap(@TypeOf(current.transcript_height_entries), &current.transcript_height_entries, &replacement.transcript_height_entries);
+    std.mem.swap(@TypeOf(current.transcript_layout_items), &current.transcript_layout_items, &replacement.transcript_layout_items);
+    std.mem.swap(f32, &current.transcript_layout_width, &replacement.transcript_layout_width);
+    std.mem.swap(f32, &current.transcript_layout_scale, &replacement.transcript_layout_scale);
+    std.mem.swap(u64, &current.transcript_layout_variant_hash, &replacement.transcript_layout_variant_hash);
+    std.mem.swap(usize, &current.transcript_layout_first_message_index, &replacement.transcript_layout_first_message_index);
+    std.mem.swap(usize, &current.transcript_layout_message_count, &replacement.transcript_layout_message_count);
+    std.mem.swap(f32, &current.transcript_layout_committed_height, &replacement.transcript_layout_committed_height);
+    std.mem.swap(f32, &current.transcript_layout_requested_height, &replacement.transcript_layout_requested_height);
+    std.mem.swap(bool, &current.transcript_layout_visible_ready, &replacement.transcript_layout_visible_ready);
+    std.mem.swap(bool, &current.transcript_layout_valid, &replacement.transcript_layout_valid);
+}
+
+fn countProjectionActiveSends(controller: *project_controller.State) usize {
+    var count: usize = 0;
+    const collections = .{ &controller.projects, &controller.archived_projects };
+    inline for (collections) |projects| {
+        for (projects.items) |*project| {
+            for (project.threads.items) |*thread| if (sendStateHasRuntime(thread.send_state)) {
+                count += 1;
+            };
+            for (project.archived_threads.items) |*thread| if (sendStateHasRuntime(thread.send_state)) {
+                count += 1;
+            };
+        }
+    }
+    return count;
+}
+
+/// Projection refreshes replace durable chat data, but live send state,
+/// measured layout, and scroll offsets are frame-local runtime state. Carry
+/// them by stable identity so a daemon update cannot replay a live stream or
+/// reinterpret an offset against a fresh height estimate.
+fn preserveProjectionThreadRuntime(
+    current: *project_controller.State,
+    replacement: *project_controller.State,
+) void {
+    const collections = .{ &replacement.projects, &replacement.archived_projects };
+    inline for (collections) |projects| {
+        for (projects.items) |*next_project| {
+            const current_project = projectByIdForViewport(current, next_project.id) orelse continue;
+
+            for (next_project.threads.items) |*next_thread| {
+                const current_thread = threadByIdForViewport(current_project, next_thread.local_thread_id) orelse continue;
+                next_thread.transcript_scroll_valid = current_thread.transcript_scroll_valid;
+                next_thread.transcript_scroll_y = current_thread.transcript_scroll_y;
+                transferProjectionThreadRuntime(current_thread, next_thread);
+            }
+            for (next_project.archived_threads.items) |*next_thread| {
+                const current_thread = threadByIdForViewport(current_project, next_thread.local_thread_id) orelse continue;
+                next_thread.transcript_scroll_valid = current_thread.transcript_scroll_valid;
+                next_thread.transcript_scroll_y = current_thread.transcript_scroll_y;
+                transferProjectionThreadRuntime(current_thread, next_thread);
+            }
+
+            for (next_project.workspace_layout.panes.items) |*next_pane| {
+                const next_ref = switch (next_pane.ref) {
+                    .chat => |*ref| ref,
+                    else => continue,
+                };
+                if (next_ref.thread_index >= next_project.threads.items.len) continue;
+                const current_pane = current_project.workspace_layout.paneById(next_pane.id) orelse continue;
+                const current_ref = switch (current_pane.ref) {
+                    .chat => |ref| ref,
+                    else => continue,
+                };
+                if (current_ref.thread_index >= current_project.threads.items.len) continue;
+                const next_thread_id = next_project.threads.items[next_ref.thread_index].local_thread_id;
+                const current_thread_id = current_project.threads.items[current_ref.thread_index].local_thread_id;
+                if (!std.mem.eql(u8, next_thread_id, current_thread_id)) continue;
+                next_ref.transcript_scroll_valid = current_ref.transcript_scroll_valid;
+                next_ref.transcript_scroll_y = current_ref.transcript_scroll_y;
+            }
+        }
+    }
+}
+
+test "daemon projection replacement preserves live transcript runtime by identity" {
+    const allocator = std.testing.allocator;
+    var current: project_controller.State = .{};
+    defer {
+        for (current.projects.items) |*project| project.deinit(allocator);
+        current.projects.deinit(allocator);
+    }
+    var replacement: project_controller.State = .{};
+    defer {
+        for (replacement.projects.items) |*project| project.deinit(allocator);
+        replacement.projects.deinit(allocator);
+    }
+
+    var current_project = try project_state.Project.init(allocator, "viewport-project", "Current", "/tmp/current", 0);
+    current.projects.append(allocator, current_project) catch |err| {
+        current_project.deinit(allocator);
+        return err;
+    };
+    const current_thread = &current.projects.items[0].threads.items[0];
+    current_thread.transcript_scroll_valid = true;
+    current_thread.transcript_scroll_y = 840.0;
+    current_thread.transcript_layout_width = 960.0;
+    current_thread.transcript_layout_message_count = 1;
+    current_thread.transcript_layout_committed_height = 280.0;
+    current_thread.transcript_layout_visible_ready = true;
+    try current_thread.transcript_layout_items.append(allocator, .{
+        .message_index = 0,
+        .group_end = 1,
+        .top = -280.0,
+        .height = 268.0,
+    });
+    current_thread.send_state.status = .pending;
+    current_thread.send_state.daemon_owned = true;
+    try current_thread.send_state.partial_text.appendSlice(std.heap.page_allocator, "stable stream");
+    const live_send_state = current_thread.send_state;
+    const live_title_state = current_thread.title_generation_state;
+    const current_pane = current.projects.items[0].workspace_layout.paneByIdMutable(1) orelse return error.MissingChatPane;
+    current_pane.ref.chat.transcript_scroll_valid = true;
+    current_pane.ref.chat.transcript_scroll_y = 720.0;
+
+    var next_project = try project_state.Project.init(allocator, "viewport-project", "Replacement", "/tmp/current", 0);
+    allocator.free(next_project.threads.items[0].local_thread_id);
+    next_project.threads.items[0].local_thread_id = try allocator.dupeZ(u8, current_thread.local_thread_id);
+    replacement.projects.append(allocator, next_project) catch |err| {
+        next_project.deinit(allocator);
+        return err;
+    };
+
+    const replacement_send_state = replacement.projects.items[0].threads.items[0].send_state;
+    preserveProjectionThreadRuntime(&current, &replacement);
+
+    const next_thread = replacement.projects.items[0].threads.items[0];
+    try std.testing.expect(next_thread.transcript_scroll_valid);
+    try std.testing.expectEqual(@as(f32, 840.0), next_thread.transcript_scroll_y);
+    const next_pane = replacement.projects.items[0].workspace_layout.paneById(1) orelse return error.MissingChatPane;
+    try std.testing.expect(next_pane.ref.chat.transcript_scroll_valid);
+    try std.testing.expectEqual(@as(f32, 720.0), next_pane.ref.chat.transcript_scroll_y);
+    try std.testing.expectEqual(live_send_state, next_thread.send_state);
+    try std.testing.expectEqual(replacement_send_state, current.projects.items[0].threads.items[0].send_state);
+    try std.testing.expectEqualStrings("stable stream", next_thread.send_state.partial_text.items);
+    try std.testing.expectEqual(live_title_state, next_thread.title_generation_state);
+    try std.testing.expectEqual(@as(usize, 1), next_thread.transcript_layout_items.items.len);
+    try std.testing.expectEqual(@as(f32, 960.0), next_thread.transcript_layout_width);
+    try std.testing.expectEqual(@as(f32, 280.0), next_thread.transcript_layout_committed_height);
+    try std.testing.expect(next_thread.transcript_layout_visible_ready);
+    try std.testing.expectEqual(@as(usize, 1), countProjectionActiveSends(&replacement));
+}
+
 pub fn paletteUiTextPrefixWidth(text: []const u8, font_size: f32, end: usize) f32 {
     return text_measure.textPrefixWidth(.ui, text, font_size, end);
 }
@@ -8898,6 +9105,7 @@ pub const AppState = struct {
     pub const markSelectionDirty = lifecycle_controller.markSelectionDirty;
     pub const noteInteraction = lifecycle_controller.noteInteraction;
     pub const requestTranscriptScrollToBottom = transcript_controller.requestTranscriptScrollToBottom;
+    pub const requestTranscriptScrollToBottomIfFollowing = transcript_controller.requestTranscriptScrollToBottomIfFollowing;
     pub const requestTranscriptLineScroll = transcript_controller.requestTranscriptLineScroll;
     pub const requestTranscriptPageScroll = transcript_controller.requestTranscriptPageScroll;
 
@@ -9369,6 +9577,12 @@ pub const AppState = struct {
         var seed_owned = true;
         errdefer if (seed_owned) self.storage.discardPreparedCompositeSnapshotSeed(prepared_seed);
 
+        // All fallible staging is complete. Move GUI-owned runtime state only
+        // at this infallible publication boundary so an earlier staging error
+        // can still discard the replacement without touching the live app.
+        preserveProjectionThreadRuntime(&self.project_controller, &staged.project_controller);
+        staged.chat_controller.pending_send_count = countProjectionActiveSends(&staged.project_controller);
+
         const old_projects = self.project_controller;
         const old_surfaces = self.surface_controller;
         var old_sessions = self.terminal_controller.daemon_sessions;
@@ -9376,10 +9590,6 @@ pub const AppState = struct {
         self.surface_controller = staged.surface_controller;
         self.sidebar_collapsed = staged.sidebar_collapsed;
         self.rename_storage = staged.rename_storage;
-        self.transcript_controller.auto_follow_pending = staged.transcript_controller.auto_follow_pending;
-        self.transcript_controller.scroll_to_bottom_frames = staged.transcript_controller.scroll_to_bottom_frames;
-        self.transcript_controller.pending_scroll_px = staged.transcript_controller.pending_scroll_px;
-        self.transcript_controller.pending_page_steps = staged.transcript_controller.pending_page_steps;
         self.chat_controller.pending_send_count = staged.chat_controller.pending_send_count;
         self.terminal_controller.daemon_sessions = staged_sessions;
         staged_owned = false;

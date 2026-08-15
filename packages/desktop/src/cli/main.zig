@@ -19,6 +19,7 @@ const db_types = @import("../db/types.zig");
 const sessionizer = @import("../terminal/sessionizer.zig");
 const terminal = @import("../terminal/terminal.zig");
 const app_config = @import("../app/config.zig");
+const chat_threads = @import("../chat/threads.zig");
 const theme_package = @import("../theme/package.zig");
 const update_installer = @import("../app/update_installer.zig");
 const ui_theme = @import("../ui/theme.zig");
@@ -5057,13 +5058,20 @@ fn chatDaemonSendEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, send: C
 
     const turn_id = send.turn_id orelse try mintChatIdAlloc(arena, io, "cli-turn-");
     const fast_mode = if (thread.fast_mode) |value| std.mem.eql(u8, value, "on") else false;
+    // open_chat must be durable before a prompt exists, so it starts with a
+    // pinned placeholder. The accepted turn owns the same first-prompt
+    // fallback used by GUI-created threads.
+    const thread_title = if (thread.messages.len == 0 and std.mem.eql(u8, thread.title, CHAT_DAEMON_OPEN_TITLE))
+        try chat_threads.makeThreadTitle(arena, send.prompt)
+    else
+        thread.title;
     var start = try client.call("chat.turn.start", .{
         .turn_id = turn_id,
         .workspace_id = send.workspace_id,
         .local_thread_id = send.local_thread_id,
         .project_path = send.project_path,
         .prompt = send.prompt,
-        .thread_title = thread.title,
+        .thread_title = thread_title,
         .provider = thread.provider,
         .harness = thread.harness,
         .model_ref = thread.model_ref,
@@ -7617,8 +7625,8 @@ test "daemon-first chat validation requires canonical identity and setting types
     }
 }
 
-test "protocol 20 stale GUI validation falls back only for unsupported methods" {
-    try std.testing.expectEqual(@as(u32, 20), sessionizer.PROTOCOL_VERSION);
+test "protocol 21 stale GUI validation falls back only for unsupported methods" {
+    try std.testing.expectEqual(@as(u32, 21), sessionizer.PROTOCOL_VERSION);
     const allocator = std.testing.allocator;
     const cases = [_]struct { payload: []const u8, expected: ChatOpenValidationRoute }{
         .{

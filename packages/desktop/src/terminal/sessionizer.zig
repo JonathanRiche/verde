@@ -8,6 +8,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const harness = @import("../providers/harness.zig");
 const headless = @import("headless");
+const app_config = @import("../app/config.zig");
+const chat_threads = @import("../chat/threads.zig");
 const db_types = @import("../db/types.zig");
 const process_registry = @import("../daemon/process_registry.zig");
 const daemon_store = @import("../daemon/store.zig");
@@ -52,7 +54,9 @@ pub const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\verde-sessionizer-";
 // prepare-for-upgrade drain instead of hard-kill, and persistent-by-default
 // idle policy (see headless_verde.md Lifetime).
 // Version 20 repairs durable transcript roles from mixed historical codecs.
-pub const PROTOCOL_VERSION: u32 = 20;
+// Version 21 makes first-prompt and generated titles part of daemon-owned
+// chat turns, including turns created through the MCP/headless API.
+pub const PROTOCOL_VERSION: u32 = 21;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
@@ -1651,6 +1655,8 @@ const ChatTurn = struct {
     provider_thread_id: ?[]u8 = null,
     active_turn_id: ?[]u8 = null,
     result_reply_text: ?[]u8 = null,
+    generated_title: ?[:0]const u8 = null,
+    generated_title_applied: bool = false,
     error_message: ?[]u8 = null,
     pending_approval: ?PendingApproval = null,
     approval_call_id: ?[]u8 = null,
@@ -1677,6 +1683,7 @@ const ChatTurn = struct {
         if (self.provider_thread_id) |value| allocator.free(value);
         if (self.active_turn_id) |value| allocator.free(value);
         if (self.result_reply_text) |value| allocator.free(value);
+        if (self.generated_title) |value| allocator.free(value);
         if (self.error_message) |value| allocator.free(value);
         if (self.pending_approval) |*approval| approval.deinit(allocator);
         if (self.approval_call_id) |value| allocator.free(value);
@@ -6401,6 +6408,7 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
     const provider_thread_id = if (turn.provider_thread_id) |id| try arena.dupe(u8, id) else null;
     const error_message = if (turn.error_message) |msg| try arena.dupe(u8, msg) else null;
     const reply_text = if (turn.result_reply_text) |text| try arena.dupe(u8, text) else "";
+    const generated_title = if (turn.generated_title) |title| try arena.dupe(u8, title) else null;
     var events = try arena.alloc(transcript_apply.ChatEvent, turn.events.items.len);
     for (turn.events.items, 0..) |event, index| {
         events[index] = .{
@@ -6514,6 +6522,8 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
             .fast_mode = @tagName(turn.request.fast_mode),
             .access_mode = @tagName(turn.request.access_mode),
         },
+        .expected_thread_title = if (generated_title != null) thread_title else null,
+        .generated_title = generated_title,
         .error_message = error_message,
         .user_message_id = user_message_id,
         .messages = messages,
@@ -6525,12 +6535,17 @@ fn commitChatTurnDurable(daemon: *Daemon, turn: *ChatTurn) !void {
         } else null,
         .client_id = "daemon",
     });
+    const generated_title_applied = if (generated_title) |title|
+        try service.store.threadTitleEquals(workspace_id, local_thread_id, title)
+    else
+        false;
 
     // 4. Publish revision on the turn after the receipt. The store service
     // mutex is still held here (defer releases at fn exit); store→turn nesting
     // is globally consistent (NIT-1).
     lockTurn(turn);
     turn.committed_store_revision = write_result.store_revision;
+    turn.generated_title_applied = generated_title_applied;
     turn.durability_pending = false;
     turn.mutex.unlock();
     // Durable-first publication flip: the tail status just became terminal
@@ -8175,6 +8190,12 @@ fn writeChatTurnTail(s: *std.json.Stringify, turn: *const ChatTurn, after_seq: u
     if (turn.active_turn_id) |value| try s.write(value) else try s.write(null);
     try s.objectField("result_reply_text");
     if (turn.result_reply_text) |value| try s.write(value) else try s.write(null);
+    try s.objectField("generated_title");
+    if (turn.generated_title_applied) {
+        if (turn.generated_title) |value| try s.write(value) else try s.write(null);
+    } else try s.write(null);
+    try s.objectField("generated_title_expected");
+    if (turn.generated_title_applied) try s.write(turn.request.thread_title) else try s.write(null);
     try s.objectField("error_message");
     if (turn.error_message) |value| try s.write(value) else try s.write(null);
     try s.objectField("pending_approval");
@@ -8225,6 +8246,10 @@ fn durableChatTurnTailResponse(
     try s.write(null);
     try s.objectField("result_reply_text");
     try s.write(null);
+    try s.objectField("generated_title");
+    try s.write(null);
+    try s.objectField("generated_title_expected");
+    try s.write(null);
     try s.objectField("error_message");
     if (record.error_message) |value| try s.write(value) else try s.write(null);
     try s.objectField("pending_approval");
@@ -8253,6 +8278,10 @@ fn chatTailUpperBound(turn: *const ChatTurn, after_seq: u64) usize {
     if (turn.provider_thread_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
     if (turn.active_turn_id) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
     if (turn.result_reply_text) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
+    if (turn.generated_title_applied) {
+        if (turn.generated_title) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
+        total = saturatedAdd(total, jsonStringUpperBound(turn.request.thread_title.len));
+    }
     if (turn.error_message) |value| total = saturatedAdd(total, jsonStringUpperBound(value.len));
     if (turn.pending_approval) |approval| {
         total = saturatedAdd(total, 96);
@@ -8332,6 +8361,114 @@ fn createChatTurnFromParams(allocator: std.mem.Allocator, params: std.json.Value
         .use_stub = use_stub,
     };
     return turn;
+}
+
+fn chatTitleProvider(provider: app_config.ChatTitleProvider) harness.Provider {
+    return switch (provider) {
+        .codex => .codex,
+        .claude => .claude,
+        .cursor => .cursor,
+        .opencode => .opencode,
+    };
+}
+
+fn boundedTitleUtf8Prefix(value: []const u8, max_len: usize) []const u8 {
+    var end = @min(value.len, max_len);
+    while (end > 0 and !std.unicode.utf8ValidateSlice(value[0..end])) end -= 1;
+    return value[0..end];
+}
+
+/// Generate an opening-exchange title under the same durable identity guard
+/// for GUI and headless turns. A manual rename changes the stored title away
+/// from `fallback_title`, so the terminal commit cannot overwrite it.
+fn maybeGenerateAutomaticChatTurnTitle(daemon: *Daemon, turn: *ChatTurn) void {
+    if (turn.use_stub) return;
+
+    lockTurn(turn);
+    const completed = turn.status == .completed and turn.result_reply_text != null;
+    const reply_text = turn.result_reply_text orelse "";
+    turn.mutex.unlock();
+    if (!completed) return;
+
+    var config = app_config.loadAppConfig(daemon.allocator) catch |err| {
+        log.warn("automatic chat title config load failed err={s}", .{@errorName(err)});
+        return;
+    };
+    defer config.deinit(daemon.allocator);
+    if (!config.automatic_chat_titles_enabled) return;
+
+    const fallback_prompt = if (std.mem.trim(u8, turn.request.prompt, &std.ascii.whitespace).len > 0)
+        turn.request.prompt
+    else
+        "Image";
+    const fallback_title = chat_threads.makeThreadTitle(daemon.allocator, fallback_prompt) catch |err| {
+        log.warn("automatic chat fallback title failed err={s}", .{@errorName(err)});
+        return;
+    };
+    defer daemon.allocator.free(fallback_title);
+    if (!std.mem.eql(u8, turn.request.thread_title, fallback_title)) return;
+
+    lockDaemon(daemon);
+    const service = daemon.store_service;
+    if (service) |svc| _ = svc.in_flight.fetchAdd(1, .monotonic);
+    daemon.mutex.unlock();
+    const svc = service orelse return;
+    defer _ = svc.in_flight.fetchSub(1, .monotonic);
+
+    lockStoreService(svc);
+    const eligible = svc.store.canGenerateAutomaticTitle(
+        turn.workspace_id,
+        turn.local_thread_id,
+        fallback_title,
+    ) catch |err| blk: {
+        log.warn("automatic chat title eligibility failed err={s}", .{@errorName(err)});
+        break :blk false;
+    };
+    svc.mutex.unlock();
+    if (!eligible) return;
+
+    const user_text = if (std.mem.trim(u8, turn.request.prompt, &std.ascii.whitespace).len > 0)
+        boundedTitleUtf8Prefix(turn.request.prompt, 4096)
+    else
+        "Image attachment";
+    const title_prompt = chat_threads.makeTitleGenerationPrompt(
+        daemon.allocator,
+        user_text,
+        boundedTitleUtf8Prefix(reply_text, 4096),
+    ) catch |err| {
+        log.warn("automatic chat title prompt failed err={s}", .{@errorName(err)});
+        return;
+    };
+    defer daemon.allocator.free(title_prompt);
+
+    const provider = chatTitleProvider(config.chat_title_provider);
+    const result = send_runner.run(daemon.allocator, .{
+        .provider = provider,
+        .harness_kind = .local_cli,
+        .project_path = turn.request.project_path,
+        .prompt = title_prompt,
+        .model_ref = config.chatTitleModel(),
+        .fast_mode = if (provider == .codex) .on else .off,
+        .access_mode = .supervised,
+    }, .{}) catch |err| {
+        log.warn("automatic chat title generation failed err={s}", .{@errorName(err)});
+        return;
+    };
+    defer daemon.allocator.free(result.provider_thread_id);
+    defer daemon.allocator.free(result.reply_text);
+
+    const generated_title = chat_threads.makeGeneratedThreadTitle(daemon.allocator, result.reply_text) catch |err| {
+        log.warn("automatic chat title normalization failed err={s}", .{@errorName(err)});
+        return;
+    } orelse {
+        log.warn("automatic chat title provider returned an empty title", .{});
+        return;
+    };
+
+    lockTurn(turn);
+    if (turn.generated_title) |old| daemon.allocator.free(old);
+    turn.generated_title = generated_title;
+    turn.mutex.unlock();
 }
 
 fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
@@ -8419,6 +8556,7 @@ fn chatTurnThread(daemon: *Daemon, turn: *ChatTurn) void {
         turn.mutex.unlock();
     }
 
+    maybeGenerateAutomaticChatTurnTitle(daemon, turn);
     finalizeChatTurnWorker(daemon, turn);
 }
 
@@ -12388,6 +12526,7 @@ test "durable turn commit is exactly once and interrupt sweep marks running rows
         .worker_done = true,
         .durability_pending = true,
         .result_reply_text = try allocator.dupe(u8, "reply"),
+        .generated_title = try allocator.dupeZ(u8, "Generated Commit Title"),
         .user_message_id = try allocator.dupe(u8, "user-1"),
     };
     turn.appendStringEvent(allocator, "assistant_delta", "text", "reply");
@@ -12397,7 +12536,17 @@ test "durable turn commit is exactly once and interrupt sweep marks running rows
 
     try commitChatTurnDurable(&daemon, turn);
     try std.testing.expect(turn.committed_store_revision != null);
+    try std.testing.expect(turn.generated_title_applied);
     try std.testing.expect(!turn.durability_pending);
+    {
+        lockStoreService(daemon.store_service.?);
+        defer daemon.store_service.?.mutex.unlock();
+        try std.testing.expect(try daemon.store_service.?.store.threadTitleEquals(
+            "ws-commit",
+            "t-commit",
+            "Generated Commit Title",
+        ));
+    }
     const first_revision = turn.committed_store_revision.?;
 
     // Receipt replay: same turn commit must not append or bump again.

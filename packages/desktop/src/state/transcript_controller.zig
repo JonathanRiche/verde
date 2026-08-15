@@ -48,6 +48,9 @@ pub const State = struct {
     markdown_entries: std.ArrayList(?*TranscriptMarkdownBody) = .empty,
     diff_view_cache: diff_view_cache.Cache = .{},
     auto_follow_pending: bool = true,
+    auto_follow_suspended: bool = false,
+    manual_scroll_pending: bool = false,
+    manual_scroll_toward_tail: bool = false,
     scroll_to_bottom_frames: u8 = 8,
     pending_scroll_px: f32 = 0.0,
     pending_page_steps: i16 = 0,
@@ -454,15 +457,29 @@ pub fn requestTranscriptScrollToBottom(self: anytype) void {
     self.currentThreadMutable().transcript_scroll_valid = false;
     self.currentProjectMutable().workspace_layout.resetChatTranscriptScrollForThread(thread_index);
     self.transcript_controller.auto_follow_pending = true;
+    self.transcript_controller.auto_follow_suspended = false;
+    self.transcript_controller.manual_scroll_pending = false;
+    self.transcript_controller.manual_scroll_toward_tail = false;
     self.transcript_controller.scroll_to_bottom_frames = 8;
     self.transcript_controller.pending_scroll_px = 0;
     self.transcript_controller.pending_page_steps = 0;
+}
+
+/// Follows passive transcript output only while the user has not intentionally
+/// left the tail. Explicit sends and jump-to-bottom still use the unconditional
+/// request above.
+pub fn requestTranscriptScrollToBottomIfFollowing(self: anytype) void {
+    if (self.transcript_controller.auto_follow_suspended) return;
+    self.requestTranscriptScrollToBottom();
 }
 
 pub fn requestTranscriptLineScroll(self: anytype, delta: i16) void {
     if (delta == 0) return;
     self.noteInteraction();
     self.transcript_controller.auto_follow_pending = false;
+    self.transcript_controller.auto_follow_suspended = true;
+    self.transcript_controller.manual_scroll_pending = true;
+    self.transcript_controller.manual_scroll_toward_tail = delta > 0;
     self.transcript_controller.scroll_to_bottom_frames = 0;
     self.transcript_controller.pending_scroll_px += @as(f32, @floatFromInt(delta)) * theme.scaledUi(TRANSCRIPT_KEYBOARD_LINE_PX);
     self.markDirty();
@@ -472,6 +489,9 @@ pub fn requestTranscriptPageScroll(self: anytype, delta: i16) void {
     if (delta == 0) return;
     self.noteInteraction();
     self.transcript_controller.auto_follow_pending = false;
+    self.transcript_controller.auto_follow_suspended = true;
+    self.transcript_controller.manual_scroll_pending = true;
+    self.transcript_controller.manual_scroll_toward_tail = delta > 0;
     self.transcript_controller.scroll_to_bottom_frames = 0;
     const next = @as(i32, self.transcript_controller.pending_page_steps) + @as(i32, delta);
     self.transcript_controller.pending_page_steps = @intCast(std.math.clamp(next, -12, 12));
