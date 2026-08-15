@@ -1783,6 +1783,14 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
         paletteColor(if (browser_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED),
     );
 
+    const pane_focused = if (pane_id) |id| state.isCurrentProjectWorkspacePaneFocused(id) else true;
+    if (state.ctrl_shortcut_hints_visible and state.shift_shortcut_hints_visible and pane_focused) {
+        if (state.command_controller.keyboard_config) |config| {
+            var label_buf: [16]u8 = undefined;
+            renderWorkspaceHeaderShortcutKeyTip(state, open_main_rect, rect, keybinds.formatCtrlShiftKeyTip(&label_buf, config.open_editor));
+        }
+    }
+
     if (!state.workspace_header_open_menu_open or !paneIdEqual(state.workspace_header_open_menu_pane_id, pane_id)) return;
 
     var kinds: [5]WorkspaceHeaderOpenMenuRow = undefined;
@@ -1923,6 +1931,27 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
 
         ry += menu_row_h;
     }
+}
+
+// Workspace header Ctrl+Shift hint beside the focused pane's Open control.
+fn renderWorkspaceHeaderShortcutKeyTip(state: *app_state.AppState, target: palette.Rect, clip: palette.Rect, label: []const u8) void {
+    if (label.len == 0) return;
+    const size = theme.scaledUi(15.0);
+    const tip_rect: palette.Rect = .{
+        .x = target.x - size + theme.scaledUi(2.5),
+        .y = target.y + (target.h - size) * 0.5,
+        .w = size,
+        .h = size,
+    };
+    queuePanel(state, tip_rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.borderMuted()), theme.scaledUi(3.5), theme.scaledUi(0.75));
+    const font_size = theme.scaledUi(9.5);
+    const text_w = app_state.paletteUiTextPrefixWidth(label, font_size, label.len);
+    queueText(state, .{
+        .x = tip_rect.x + @max((tip_rect.w - text_w) * 0.5, 0.0),
+        .y = tip_rect.y + (tip_rect.h - font_size * 1.25) * 0.5,
+        .w = @min(text_w, tip_rect.w),
+        .h = font_size * 1.25,
+    }, label, paletteColor(theme.accent()), font_size, clip);
 }
 
 fn renderEmptyProjects(state: *app_state.AppState, rect: palette.Rect) void {
