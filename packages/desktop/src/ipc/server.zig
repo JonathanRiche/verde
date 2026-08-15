@@ -1723,7 +1723,7 @@ fn writeRenderStateColors(s: *std.json.Stringify, render_state: *const terminal.
 
 fn screenStyleForCell(cell: anytype, styles: anytype, index: usize) @TypeOf(styles[0]) {
     return switch (cell.content_tag) {
-        .bg_color_palette => .{ .bg_color = .{ .palette = @intCast(cell.content.color_palette) } },
+        .bg_color_palette => .{ .bg_color = .{ .palette = cell.content.color_palette.data } },
         .bg_color_rgb => .{ .bg_color = .{ .rgb = .{
             .r = cell.content.color_rgb.r,
             .g = cell.content.color_rgb.g,

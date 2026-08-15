@@ -16,11 +16,8 @@ export default defineConfig({
     tailwindcss(),
     solid(),
   ],
-  // Keep Ghostty out of the prebundle so its wasm URL stays next to the package.
-  // Drop leftover xterm entries after the terminal swap — they white-screen Vite.
   optimizeDeps: {
     include: ['marked', 'solid-js', 'solid-js/web', 'solid-js/store'],
-    exclude: ['@slopus/ghostty-wasm', '@xterm/xterm', '@xterm/addon-fit'],
   },
   assetsInclude: ['**/*.wasm'],
   server: {

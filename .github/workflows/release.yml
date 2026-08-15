@@ -389,7 +389,7 @@ jobs:
             .cache/zig-global
             .zig-cache/windows-deps
             vendor/fff/target
-          key: windows-release-${{ github.event_name }}-${{ github.sha }}-x64-${{ env.ZIG_VERSION }}-${{ env.RUST_VERSION }}-${{ hashFiles('bun.lock', 'package.json', 'scripts/windows-dependencies.json', 'scripts/dev/bootstrap_windows_deps.py', 'scripts/dev/bootstrap-windows-deps.ps1', 'scripts/dev/build-windows.ps1', 'scripts/dev/verify-windows-package.ps1', 'scripts/release/package-windows.ps1', 'scripts/release/package-windows.py', 'scripts/release/sign-windows.ps1', 'packages/desktop/build.zig', 'packages/desktop/build.zig.zon', 'packages/ghostty/build.zig', 'packages/ghostty/build.zig.zon', 'build.zig', 'vendor/fff/Cargo.lock', 'vendor/fff/Cargo.toml') }}
+          key: windows-release-${{ github.event_name }}-${{ github.sha }}-x64-${{ env.ZIG_VERSION }}-${{ env.RUST_VERSION }}-${{ hashFiles('bun.lock', 'package.json', 'scripts/windows-dependencies.json', 'scripts/dev/bootstrap_windows_deps.py', 'scripts/dev/bootstrap-windows-deps.ps1', 'scripts/dev/build-windows.ps1', 'scripts/dev/verify-windows-package.ps1', 'scripts/release/package-windows.ps1', 'scripts/release/package-windows.py', 'scripts/release/sign-windows.ps1', 'packages/desktop/build.zig', 'packages/desktop/build.zig.zon', 'build.zig', 'vendor/fff/Cargo.lock', 'vendor/fff/Cargo.toml') }}
 
       - name: Install JavaScript dependencies
         shell: pwsh

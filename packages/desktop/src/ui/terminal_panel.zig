@@ -1,7 +1,7 @@
 //! Palette-only terminal dock shell.
 
 const std = @import("std");
-const ghostty_vt = @import("../vendor/ghostty_vt.zig");
+const ghostty_vt = @import("../terminal/engine.zig");
 const palette = @import("palette");
 const sdl = @import("zsdl3");
 
@@ -1042,9 +1042,12 @@ const TerminalRgbaPixels = struct {
 fn terminalImageRgba(allocator: std.mem.Allocator, image: *const ghostty_vt.kitty.graphics.Image) ?TerminalRgbaPixels {
     const pixel_count = std.math.mul(usize, image.width, image.height) catch return null;
     const rgba_len = std.math.mul(usize, pixel_count, 4) catch return null;
+    // Image.Data is a union at the pin: a still-pending transmission has no
+    // bytes yet and cannot be rendered this frame.
+    const data = image.data.bytes() orelse return null;
     if (image.format == .rgba) {
-        if (image.data.len != rgba_len) return null;
-        return .{ .pixels = image.data, .owned = false };
+        if (data.len != rgba_len) return null;
+        return .{ .pixels = data, .owned = false };
     }
     const source_bpp: usize = switch (image.format) {
         .rgb => 3,
@@ -1054,24 +1057,24 @@ fn terminalImageRgba(allocator: std.mem.Allocator, image: *const ghostty_vt.kitt
         .png => return null,
     };
     const source_len = std.math.mul(usize, pixel_count, source_bpp) catch return null;
-    if (image.data.len != source_len) return null;
+    if (data.len != source_len) return null;
     const pixels = allocator.alloc(u8, rgba_len) catch return null;
     for (0..pixel_count) |index| {
         const src = index * source_bpp;
         const dst = index * 4;
         switch (image.format) {
             .rgb => {
-                pixels[dst] = image.data[src];
-                pixels[dst + 1] = image.data[src + 1];
-                pixels[dst + 2] = image.data[src + 2];
+                pixels[dst] = data[src];
+                pixels[dst + 1] = data[src + 1];
+                pixels[dst + 2] = data[src + 2];
                 pixels[dst + 3] = 255;
             },
             .gray_alpha => {
-                @memset(pixels[dst .. dst + 3], image.data[src]);
-                pixels[dst + 3] = image.data[src + 1];
+                @memset(pixels[dst .. dst + 3], data[src]);
+                pixels[dst + 3] = data[src + 1];
             },
             .gray => {
-                @memset(pixels[dst .. dst + 3], image.data[src]);
+                @memset(pixels[dst .. dst + 3], data[src]);
                 pixels[dst + 3] = 255;
             },
             .rgba, .png => unreachable,
@@ -1723,7 +1726,7 @@ fn cellWidthCells(cell: ghostty_vt.Cell) u2 {
 
 fn styleForCell(cell: ghostty_vt.Cell, styles: []const ghostty_vt.Style, index: usize) ghostty_vt.Style {
     return switch (cell.content_tag) {
-        .bg_color_palette => .{ .bg_color = .{ .palette = @intCast(cell.content.color_palette) } },
+        .bg_color_palette => .{ .bg_color = .{ .palette = cell.content.color_palette.data } },
         .bg_color_rgb => .{ .bg_color = .{ .rgb = .{
             .r = cell.content.color_rgb.r,
             .g = cell.content.color_rgb.g,
