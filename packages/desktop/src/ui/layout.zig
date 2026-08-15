@@ -15,6 +15,7 @@ const command_palette = @import("command_palette.zig");
 const companion = @import("companion.zig");
 const companion_controller = @import("../state/companion_controller.zig");
 const profiler = @import("../runtime/profiler.zig");
+const platform_runtime = @import("platform_runtime");
 
 const RootLayout = struct {
     sidebar: palette.Rect,
@@ -22,6 +23,7 @@ const RootLayout = struct {
 };
 
 const SIDEBAR_ANIM_DURATION_MS: i64 = 180;
+const PERSISTENCE_BANNER_GRACE_MS: i64 = 6_000;
 /// Above composer overlays (150), pane menus (180), and model cascade (1400).
 const PALETTE_MODAL_Z: i32 = 2000;
 /// Persistent root overlay below true modal ownership and above pane content.
@@ -233,7 +235,11 @@ pub fn isSidebarAnimating() bool {
 /// narrow-width text relies on the clip rect alone for truncation.
 fn renderPersistenceBanner(state: *runtime.AppState, width: f32, height: f32) void {
     _ = height;
-    if (state.storage.isPersistenceAvailable()) return;
+    // The first retry starts after five seconds. Give that retry one second to
+    // succeed so a one-off socket miss never flashes the warning; repeated
+    // failures keep the original timestamp and make the outage visible.
+    const failure_ms = state.lifecycle.persistenceFailureForMs(platform_runtime.unixTimestampMs());
+    if (!shouldShowPersistenceBanner(failure_ms)) return;
     const banner_h = theme.scaledUi(28.0);
     const rect: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = width, .h = banner_h };
     var fill = theme.COLOR_YELLOW;
@@ -242,11 +248,15 @@ fn renderPersistenceBanner(state: *runtime.AppState, width: f32, height: f32) vo
     queuePaletteText(
         state,
         .{ .x = theme.scaledUi(12.0), .y = theme.scaledUi(5.0), .w = width - theme.scaledUi(24.0), .h = theme.scaledUi(18.0) },
-        "Changes not saved — persistence unavailable (read-only until the daemon recovers)",
+        "Changes not saved — persistence is still unavailable (retrying in background)",
         paletteColor(theme.COLOR_BLACK),
         theme.scaledUi(13.0),
         rect,
     );
+}
+
+fn shouldShowPersistenceBanner(failure_ms: ?i64) bool {
+    return (failure_ms orelse return false) >= PERSISTENCE_BANNER_GRACE_MS;
 }
 
 fn computeRootLayout(state: *runtime.AppState, width: f32, height: f32) RootLayout {
@@ -1857,4 +1867,10 @@ fn truncateThreadImportLabel(state: *runtime.AppState, value: []const u8, max_wi
 test "thread import labels use only the first non-empty line" {
     try std.testing.expectEqualStrings("First title", threadImportSingleLineLabel(" \nFirst title  \r\nSecond line"));
     try std.testing.expectEqualStrings("One line", threadImportSingleLineLabel("\tOne line\t"));
+}
+
+test "persistence banner ignores transient daemon failures" {
+    try std.testing.expect(!shouldShowPersistenceBanner(null));
+    try std.testing.expect(!shouldShowPersistenceBanner(PERSISTENCE_BANNER_GRACE_MS - 1));
+    try std.testing.expect(shouldShowPersistenceBanner(PERSISTENCE_BANNER_GRACE_MS));
 }

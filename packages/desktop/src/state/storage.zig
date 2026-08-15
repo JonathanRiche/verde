@@ -12,6 +12,7 @@ const headless = @import("headless");
 const db_client = @import("../db/client.zig");
 const db_types = @import("../db/types.zig");
 const sessionizer = @import("../terminal/sessionizer.zig");
+const runtime_log = @import("../runtime/log.zig");
 const platform_runtime = @import("platform_runtime");
 const persistence = @import("persistence.zig");
 
@@ -126,6 +127,9 @@ const StoreSession = struct {
     /// False when the daemon is unavailable or replacement is blocked; GUI stays
     /// visibly read-only/unsaved and never falls back to a direct writer.
     persistence_available: bool = true,
+    /// First failure in the current uninterrupted connectivity outage, retained
+    /// for timestamped transition diagnostics until a revision read recovers.
+    persistence_unavailable_since_ms: i64 = 0,
     request_counter: u64 = 0,
     // M5-P4 change-cursor projection sync (composite core.snapshot + journal
     // cursor). The cursor is nonce-scoped: it is only meaningful together with
@@ -611,9 +615,19 @@ pub const Storage = struct {
     }
 
     pub fn markPersistenceUnavailable(self: *const Storage) void {
+        const now_ms = platform_runtime.unixTimestampMs();
         self.store_session.lock();
-        defer self.store_session.unlock();
+        const changed = self.store_session.persistence_available;
         self.store_session.persistence_available = false;
+        if (changed) self.store_session.persistence_unavailable_since_ms = now_ms;
+        self.store_session.unlock();
+        if (changed) {
+            log.warn("daemon-backed persistence became unavailable; writes are paused pending recovery", .{});
+            runtime_log.diagnostic(
+                "persistence transition available=false endpoint_base={s}",
+                .{self.pref_path},
+            );
+        }
     }
 
     pub fn currentStoreRevision(self: *const Storage) u64 {
@@ -623,8 +637,12 @@ pub const Storage = struct {
     }
 
     pub fn noteStoreRevision(self: *const Storage, revision: u64) void {
+        const now_ms = platform_runtime.unixTimestampMs();
         self.store_session.lock();
-        defer self.store_session.unlock();
+        const unavailable_since_ms = if (self.store_session.persistence_available)
+            null
+        else
+            self.store_session.persistence_unavailable_since_ms;
         // The durable revision is globally monotonic, so an out-of-order ack
         // (flush worker vs a concurrent granular mutation) must never regress
         // the cached guard.
@@ -635,6 +653,19 @@ pub const Storage = struct {
         }
         self.store_session.revision_known = true;
         self.store_session.persistence_available = true;
+        self.store_session.persistence_unavailable_since_ms = 0;
+        self.store_session.unlock();
+        if (unavailable_since_ms) |since_ms| {
+            const unavailable_ms = if (now_ms > since_ms) now_ms - since_ms else 0;
+            log.info(
+                "daemon-backed persistence recovered after {d}ms at store_revision={d}",
+                .{ unavailable_ms, revision },
+            );
+            runtime_log.diagnostic(
+                "persistence transition available=true unavailable_ms={d} store_revision={d}",
+                .{ unavailable_ms, revision },
+            );
+        }
     }
 
     pub fn currentProjectionObservedRevision(self: *const Storage) u64 {
@@ -871,7 +902,12 @@ pub const Storage = struct {
         self: *const Storage,
         prepared: PreparedCompositeSnapshotSeed,
     ) void {
+        const now_ms = platform_runtime.unixTimestampMs();
         self.store_session.lock();
+        const unavailable_since_ms = if (self.store_session.persistence_available)
+            null
+        else
+            self.store_session.persistence_unavailable_since_ms;
         if (self.store_session.instance_nonce) |old| self.allocator.free(old);
         self.store_session.instance_nonce = prepared.instance_nonce;
         self.store_session.registry_revision = prepared.registry_revision;
@@ -886,7 +922,19 @@ pub const Storage = struct {
         }
         self.store_session.revision_known = true;
         self.store_session.persistence_available = true;
+        self.store_session.persistence_unavailable_since_ms = 0;
         self.store_session.unlock();
+        if (unavailable_since_ms) |since_ms| {
+            const unavailable_ms = if (now_ms > since_ms) now_ms - since_ms else 0;
+            log.info(
+                "daemon-backed persistence recovered after {d}ms during projection sync at store_revision={d}",
+                .{ unavailable_ms, prepared.store_revision },
+            );
+            runtime_log.diagnostic(
+                "persistence transition available=true source=projection_sync unavailable_ms={d} store_revision={d}",
+                .{ unavailable_ms, prepared.store_revision },
+            );
+        }
     }
 
     /// Compatibility helper for tests and non-AppState callers. Production
@@ -1021,6 +1069,11 @@ pub const Storage = struct {
         const exe_path = try std.process.executablePathAlloc(threaded.io(), self.allocator);
         defer self.allocator.free(exe_path);
         sessionizer.ensureDaemon(self.allocator, self.pref_path, exe_path) catch |err| {
+            log.warn("session daemon readiness probe failed: {s}", .{@errorName(err)});
+            runtime_log.diagnostic(
+                "persistence daemon readiness failure error={s}",
+                .{@errorName(err)},
+            );
             self.markPersistenceUnavailable();
             return err;
         };
@@ -1053,9 +1106,22 @@ pub const Storage = struct {
             .timeout_ms = timeout_ms orelse 5_000,
         };
         var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
-        var registered = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = true });
+        var registered = client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = true }) catch |err| {
+            log.warn("session daemon client registration transport failed: {s}", .{@errorName(err)});
+            runtime_log.diagnostic(
+                "persistence daemon client registration failure kind=transport error={s}",
+                .{@errorName(err)},
+            );
+            self.markPersistenceUnavailable();
+            return err;
+        };
         defer registered.deinit();
-        if (registered.response.err) |_| {
+        if (registered.response.err) |err| {
+            log.warn("session daemon client registration failed: {s} ({s})", .{ err.code, err.message });
+            runtime_log.diagnostic(
+                "persistence daemon client registration failure kind=rpc_error code={s}",
+                .{err.code},
+            );
             self.markPersistenceUnavailable();
             return error.SessionDaemonUnavailable;
         }
@@ -1204,6 +1270,11 @@ pub const Storage = struct {
         };
         var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
         var parsed = client.call(method, params) catch |err| {
+            log.warn("store mutation {s} transport failed: {s}", .{ method, @errorName(err) });
+            runtime_log.diagnostic(
+                "persistence mutation failure operation={s} kind=transport error={s}",
+                .{ method, @errorName(err) },
+            );
             self.markPersistenceUnavailable();
             return err;
         };
@@ -1214,6 +1285,10 @@ pub const Storage = struct {
                 std.mem.eql(u8, err.code, headless.protocol.ERR_UNKNOWN_METHOD) or
                 std.mem.eql(u8, err.code, "method_not_found"))
             {
+                runtime_log.diagnostic(
+                    "persistence mutation failure operation={s} kind=rpc_error code={s}",
+                    .{ method, err.code },
+                );
                 self.markPersistenceUnavailable();
                 return error.SessionDaemonUnavailable;
             }
@@ -1228,6 +1303,10 @@ pub const Storage = struct {
             {
                 return error.UnknownClientId;
             }
+            runtime_log.diagnostic(
+                "persistence mutation failure operation={s} kind=rpc_error code={s}",
+                .{ method, err.code },
+            );
             self.markPersistenceUnavailable();
             return error.StoreMutationFailed;
         }
