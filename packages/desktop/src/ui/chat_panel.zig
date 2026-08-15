@@ -799,6 +799,9 @@ fn scrollTranscriptByWheel(state: *app_state.AppState, pane_id: ?app_state.Works
     const delta = -wheel_y * theme.scaledUi(TRANSCRIPT_WHEEL_PIXELS);
     rememberTranscriptScroll(state, pane_id, snapTranscriptScrollY(current + delta, null));
     state.transcript_controller.auto_follow_pending = false;
+    state.transcript_controller.auto_follow_suspended = true;
+    state.transcript_controller.manual_scroll_pending = true;
+    state.transcript_controller.manual_scroll_toward_tail = delta > 0.0;
     state.transcript_controller.scroll_to_bottom_frames = 0;
     state.markDirty();
 }
@@ -1138,8 +1141,12 @@ pub fn handleTranscriptPaletteMouseMotion(state: *app_state.AppState) void {
             state.transcript_controller.palette_mouse_y,
             transcript_scrollbar_drag_grab_offset,
         );
+        const current = currentTranscriptScrollY(state, pane_id) orelse state.transcript_controller.palette_scroll_y;
         rememberTranscriptScroll(state, pane_id, snapTranscriptScrollY(target, transcript_scrollbar_max_scroll));
         state.transcript_controller.auto_follow_pending = false;
+        state.transcript_controller.auto_follow_suspended = true;
+        state.transcript_controller.manual_scroll_pending = true;
+        state.transcript_controller.manual_scroll_toward_tail = target > current;
         state.transcript_controller.scroll_to_bottom_frames = 0;
         state.markDirty();
         return;
@@ -1215,6 +1222,9 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
                 );
                 rememberTranscriptScroll(state, pane_id, snapTranscriptScrollY(target, hit.max_scroll));
                 state.transcript_controller.auto_follow_pending = false;
+                state.transcript_controller.auto_follow_suspended = true;
+                state.transcript_controller.manual_scroll_pending = true;
+                state.transcript_controller.manual_scroll_toward_tail = target > hit.scroll_y;
                 state.transcript_controller.scroll_to_bottom_frames = 0;
                 state.markDirty();
             }
@@ -1877,11 +1887,20 @@ fn renderEmptyProjects(state: *app_state.AppState, rect: palette.Rect) void {
     queueText(state, .{ .x = x, .y = y, .w = rect.w - theme.scaledUi(88.0), .h = theme.scaledUi(28.0) }, "Use the workspace rail to add a folder and start chatting.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(16.0), rect);
 }
 
-/// While the current thread is streaming, keep `transcript_auto_follow_pending` on when the viewport
-/// is at (or near) the tail, or during the initial scroll-to-bottom animation. Wheel on the
-/// transcript clears the latch; scrolling back within ~72px of the bottom turns it on again.
-fn updateTranscriptAutoFollowPalette(state: *app_state.AppState, has_pending_stream: bool, max_scroll: f32, scroll_y: f32) void {
+/// While the current thread is streaming, keep `auto_follow_pending` on when the viewport is at
+/// the tail. Once manual scrolling suspends it, only a later manual scroll near the tail may
+/// re-arm it; transient streaming/layout geometry must not pull the viewport back down.
+fn updateTranscriptAutoFollowPalette(state: *app_state.AppState, has_pending_stream: bool, max_scroll: f32, scroll_y: f32, manual_scroll_requested: bool, manual_scroll_toward_tail: bool) void {
+    if (state.transcript_controller.auto_follow_suspended and
+        shouldReleaseTranscriptAutoFollowSuspension(manual_scroll_requested, manual_scroll_toward_tail, scroll_y, max_scroll))
+    {
+        state.transcript_controller.auto_follow_suspended = false;
+    }
     if (!has_pending_stream) {
+        state.transcript_controller.auto_follow_pending = false;
+        return;
+    }
+    if (state.transcript_controller.auto_follow_suspended) {
         state.transcript_controller.auto_follow_pending = false;
         return;
     }
@@ -1893,6 +1912,10 @@ fn updateTranscriptAutoFollowPalette(state: *app_state.AppState, has_pending_str
 fn transcriptScrollNearBottom(scroll_y: f32, max_scroll: f32) bool {
     if (max_scroll <= 0.0) return true;
     return (max_scroll - scroll_y) <= theme.scaledUi(72.0);
+}
+
+fn shouldReleaseTranscriptAutoFollowSuspension(manual_scroll_requested: bool, manual_scroll_toward_tail: bool, scroll_y: f32, max_scroll: f32) bool {
+    return manual_scroll_requested and manual_scroll_toward_tail and transcriptScrollNearBottom(scroll_y, max_scroll);
 }
 
 fn transcriptShouldFollowTail(active_geometry: bool, implicit_cold_tail_follow: bool, auto_follow_pending: bool, scroll_to_bottom_frames: u8) bool {
@@ -2021,8 +2044,13 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
 
     var scroll_y = snapTranscriptScrollY(saved_scroll orelse max_scroll, max_scroll);
     var manual_scroll_requested = false;
+    var manual_scroll_toward_tail = false;
 
     if (paneOwnsActiveChatState(state, pane_id)) {
+        manual_scroll_requested = state.transcript_controller.manual_scroll_pending;
+        manual_scroll_toward_tail = state.transcript_controller.manual_scroll_toward_tail;
+        state.transcript_controller.manual_scroll_pending = false;
+        state.transcript_controller.manual_scroll_toward_tail = false;
         const pi = state.project_controller.selected_index;
         const ti = state.currentProject().selected_thread_index;
         if (state.transcript_controller.scroll_pending_track_project != pi or state.transcript_controller.scroll_pending_track_thread != ti) {
@@ -2056,7 +2084,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
         mutable_thread.transcript_layout_requested_height = @max(mutable_thread.transcript_layout_requested_height, requested_height);
     }
 
-    if (active_geometry) updateTranscriptAutoFollowPalette(state, has_pending_stream, max_scroll, scroll_y);
+    if (active_geometry) updateTranscriptAutoFollowPalette(state, has_pending_stream, max_scroll, scroll_y, manual_scroll_requested, manual_scroll_toward_tail);
 
     const follow_tail = transcriptShouldFollowTail(
         active_geometry,
@@ -2180,6 +2208,14 @@ test "inactive chat panes cannot consume another pane's tail-follow request" {
     try std.testing.expect(!transcriptShouldFollowTail(false, false, true, 8));
     // A newly materialized inactive pane still follows its own semantic tail.
     try std.testing.expect(transcriptShouldFollowTail(false, true, false, 0));
+}
+
+test "streaming geometry cannot release a manual tail-follow suspension" {
+    try std.testing.expect(transcriptScrollNearBottom(950.0, 1_000.0));
+    try std.testing.expect(!shouldReleaseTranscriptAutoFollowSuspension(false, true, 950.0, 1_000.0));
+    try std.testing.expect(!shouldReleaseTranscriptAutoFollowSuspension(true, false, 950.0, 1_000.0));
+    try std.testing.expect(shouldReleaseTranscriptAutoFollowSuspension(true, true, 950.0, 1_000.0));
+    try std.testing.expect(!shouldReleaseTranscriptAutoFollowSuspension(true, true, 800.0, 1_000.0));
 }
 
 fn transcriptContentHeight(

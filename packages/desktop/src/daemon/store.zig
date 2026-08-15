@@ -77,6 +77,10 @@ pub const TurnCommitRequest = struct {
     /// owners retain GUI metadata; only turn-owned provider identity changes.
     workspace: ?store_protocol.Workspace = null,
     thread: ?store_protocol.Thread = null,
+    /// Automatic titles may replace only the exact first-prompt fallback
+    /// observed by the worker. This keeps a concurrent manual rename intact.
+    expected_thread_title: ?[]const u8 = null,
+    generated_title: ?[]const u8 = null,
     error_message: ?[]const u8 = null,
     user_message_id: ?[]const u8 = null,
     /// Rows are already ordered by transcript_apply; the store appends them
@@ -552,6 +556,10 @@ pub const Store = struct {
             .workspace = self.insertChatTurnWorkspaceIfMissing(request.workspace) catch |err| return mapStoreError(err),
             .thread = self.insertChatTurnThreadIfMissing(request.workspace.workspace_id, request.thread) catch |err| return mapStoreError(err),
         };
+        self.updateTurnPresentationMetadata(
+            request.workspace.workspace_id,
+            request.thread,
+        ) catch |err| return mapStoreError(err);
         self.updateTurnExecutionSettings(
             request.workspace.workspace_id,
             request.thread,
@@ -637,6 +645,8 @@ pub const Store = struct {
             .provider = request.provider,
             .harness = request.harness,
             .provider_thread_id = request.provider_thread_id,
+            .expected_thread_title = request.expected_thread_title,
+            .generated_title = request.generated_title,
             .error_message = request.error_message,
             .user_message_id = request.user_message_id,
             .messages = request.messages,
@@ -672,7 +682,16 @@ pub const Store = struct {
         }
         if (request.thread) |thread| {
             inserted.thread = self.insertChatTurnThreadIfMissing(request.workspace_id, thread) catch |err| return mapStoreError(err);
+            self.updateTurnPresentationMetadata(request.workspace_id, thread) catch |err| return mapStoreError(err);
             self.updateTurnExecutionSettings(request.workspace_id, thread) catch |err| return mapStoreError(err);
+        }
+        if (request.generated_title) |generated_title| {
+            self.applyGeneratedTurnTitle(
+                request.workspace_id,
+                request.local_thread_id,
+                request.expected_thread_title.?,
+                generated_title,
+            ) catch |err| return mapStoreError(err);
         }
         // Provider identity is turn-owned. Assign all three columns including
         // null provider_thread_id so a provider switch clears stale identity.
@@ -1643,6 +1662,83 @@ pub const Store = struct {
         if (self.conn.changes() == 0) return error.ResourceNotFound;
     }
 
+    /// First-turn acceptance owns the prompt fallback. GUI draft rows are
+    /// uncommitted; daemon-created MCP rows are deliberately committed so a
+    /// compatibility snapshot cannot delete them, and use the pinned
+    /// `New Chat` placeholder until their first accepted prompt.
+    fn updateTurnPresentationMetadata(
+        self: *Self,
+        workspace_id: []const u8,
+        thread: store_protocol.Thread,
+    ) !void {
+        try self.conn.exec(
+            "update threads set title = case when committed = 0 or (title = ?1 and not exists " ++
+                "(select 1 from messages m where m.thread_id = threads.id)) then ?2 else title end, committed = 1 " ++
+                "where workspace_id = (select id from workspaces where workspace_id = ?3) and local_thread_id = ?4",
+            .{ "New Chat", thread.title, workspace_id, thread.local_thread_id },
+        );
+        if (self.conn.changes() > 0) return;
+        const owner = try self.conn.row(
+            "select 1 from threads t join workspaces w on w.id = t.workspace_id where w.workspace_id = ?1 and t.local_thread_id = ?2",
+            .{ workspace_id, thread.local_thread_id },
+        );
+        if (owner) |row| {
+            row.deinit();
+            return;
+        }
+        return error.ResourceNotFound;
+    }
+
+    fn applyGeneratedTurnTitle(
+        self: *Self,
+        workspace_id: []const u8,
+        local_thread_id: []const u8,
+        expected_title: []const u8,
+        generated_title: []const u8,
+    ) !void {
+        try self.conn.exec(
+            "update threads set title = ?1 where workspace_id = (select id from workspaces where workspace_id = ?2) " ++
+                "and local_thread_id = ?3 and title = ?4",
+            .{ generated_title, workspace_id, local_thread_id, expected_title },
+        );
+    }
+
+    /// True only for the opening user prompt while the durable title still
+    /// matches the fallback the worker intends to replace.
+    pub fn canGenerateAutomaticTitle(
+        self: *Self,
+        workspace_id: []const u8,
+        local_thread_id: []const u8,
+        expected_title: []const u8,
+    ) StoreError!bool {
+        const row = self.conn.row(
+            "select count(*) from threads t join workspaces w on w.id = t.workspace_id " ++
+                "where w.workspace_id = ?1 and t.local_thread_id = ?2 and t.title = ?3 " ++
+                "and (select count(*) from messages m where m.thread_id = t.id and m.role = 0) = 1",
+            .{ workspace_id, local_thread_id, expected_title },
+        ) catch |err| return mapStoreError(err);
+        const result = row orelse return error.StoreCorrupt;
+        defer result.deinit();
+        return result.int(0) == 1;
+    }
+
+    /// Check the current durable title without exposing SQLite row identity.
+    pub fn threadTitleEquals(
+        self: *Self,
+        workspace_id: []const u8,
+        local_thread_id: []const u8,
+        expected_title: []const u8,
+    ) StoreError!bool {
+        const row = self.conn.row(
+            "select count(*) from threads t join workspaces w on w.id = t.workspace_id " ++
+                "where w.workspace_id = ?1 and t.local_thread_id = ?2 and t.title = ?3",
+            .{ workspace_id, local_thread_id, expected_title },
+        ) catch |err| return mapStoreError(err);
+        const result = row orelse return error.StoreCorrupt;
+        defer result.deinit();
+        return result.int(0) == 1;
+    }
+
     /// Adopt only the exact protocol-19 acceptance shape written before the
     /// atomic acceptance receipt existed. The three old receipts prove the
     /// row was staged by the turn path; the ledger, key fingerprint, and row
@@ -2291,6 +2387,9 @@ fn validateTurnCommit(request: TurnCommitRequest) StoreError!void {
         return error.InvalidParams;
     }
     if (request.client_id.len == 0) return error.InvalidParams;
+    if ((request.expected_thread_title == null) != (request.generated_title == null)) return error.InvalidParams;
+    if (request.expected_thread_title) |value| if (value.len == 0) return error.InvalidParams;
+    if (request.generated_title) |value| if (value.len == 0) return error.InvalidParams;
     _ = providerCode(request.provider) catch return error.InvalidParams;
     _ = harnessCode(request.harness) catch return error.InvalidParams;
     if (request.workspace) |workspace| {
@@ -4004,6 +4103,119 @@ test "turn acceptance provider switch clears stale identity without touching GUI
     try std.testing.expect(failed.nullableText(0) == null);
     try std.testing.expect(failed.nullableText(1) == null);
     try std.testing.expectEqualStrings("failed", failed.text(2));
+}
+
+test "daemon turn titles commit the first prompt and preserve later manual renames" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    const workspace = testWorkspace("workspace-title", "Title workspace");
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("title-workspace", null),
+        .workspace = workspace,
+    });
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("title-thread", 1),
+        .workspace_id = workspace.workspace_id,
+        .thread = testThread("thread-title", "New Chat"),
+    });
+
+    const acceptance: TurnAcceptanceRequest = .{
+        .mutation = testHeader("turn:title:accept", 2),
+        .turn_id = "turn-title",
+        .workspace = workspace,
+        .thread = .{ .local_thread_id = "thread-title", .title = "Explain durable chat titles", .provider = "codex" },
+        .started_at_ms = 10,
+        .provider = "codex",
+        .harness = "local_cli",
+        .user_message = .{
+            .message_id = "title-user",
+            .role = "user",
+            .author = "You",
+            .body = "Explain durable chat titles",
+        },
+    };
+    _ = try store.acceptTurn(acceptance);
+    try std.testing.expect(try store.canGenerateAutomaticTitle(
+        workspace.workspace_id,
+        "thread-title",
+        "Explain durable chat titles",
+    ));
+    var fallback = (try store.conn.row(
+        "select title, committed from threads where local_thread_id = ?1",
+        .{"thread-title"},
+    )).?;
+    defer fallback.deinit();
+    try std.testing.expectEqualStrings("Explain durable chat titles", fallback.text(0));
+    try std.testing.expectEqual(@as(i64, 1), fallback.int(1));
+
+    _ = try store.commitTurn(.{
+        .turn_id = "turn-title",
+        .workspace_id = workspace.workspace_id,
+        .local_thread_id = "thread-title",
+        .status = .completed,
+        .started_at_ms = 10,
+        .finished_at_ms = 20,
+        .provider = "codex",
+        .expected_thread_title = "Explain durable chat titles",
+        .generated_title = "Durable Chat Titles",
+    });
+    try std.testing.expect(try store.threadTitleEquals(workspace.workspace_id, "thread-title", "Durable Chat Titles"));
+
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("manual-title", 4),
+        .workspace_id = workspace.workspace_id,
+        .thread = testThread("thread-title", "My Manual Title"),
+    });
+    _ = try store.commitTurn(.{
+        .turn_id = "turn-title-second",
+        .workspace_id = workspace.workspace_id,
+        .local_thread_id = "thread-title",
+        .status = .completed,
+        .started_at_ms = 30,
+        .finished_at_ms = 40,
+        .provider = "opencode",
+        .expected_thread_title = "Durable Chat Titles",
+        .generated_title = "Should Not Win",
+    });
+    try std.testing.expect(try store.threadTitleEquals(workspace.workspace_id, "thread-title", "My Manual Title"));
+
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("historical-title-thread", null),
+        .workspace_id = workspace.workspace_id,
+        .thread = testThread("thread-historical-title", "New Chat"),
+    });
+    _ = try store.appendMessage(.{
+        .mutation = testHeader("historical-title-message", null),
+        .workspace_id = workspace.workspace_id,
+        .thread_id = "thread-historical-title",
+        .message = .{
+            .message_id = "historical-title-user",
+            .role = "user",
+            .author = "You",
+            .body = "Original prompt",
+        },
+    });
+    _ = try store.acceptTurn(.{
+        .mutation = testHeader("historical-title-accept", null),
+        .turn_id = "historical-title-turn",
+        .workspace = workspace,
+        .thread = .{ .local_thread_id = "thread-historical-title", .title = "Later prompt", .provider = "codex" },
+        .started_at_ms = 50,
+        .provider = "codex",
+        .harness = "local_cli",
+        .user_message = .{
+            .message_id = "historical-title-later-user",
+            .role = "user",
+            .author = "You",
+            .body = "Later prompt",
+        },
+    });
+    try std.testing.expect(try store.threadTitleEquals(workspace.workspace_id, "thread-historical-title", "New Chat"));
 }
 
 test "terminal turn missing-owner failure rolls back and replay cannot resurrect owners" {
