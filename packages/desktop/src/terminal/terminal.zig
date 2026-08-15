@@ -5509,7 +5509,7 @@ test "terminal key encoding uses terminal protocol options" {
 
 test "terminal key encoding follows negotiated terminal input modes" {
     const allocator = std.testing.allocator;
-    var terminal = try ghostty_vt.Terminal.init(allocator, .{
+    var terminal = try ghostty_vt.Terminal.init((ghostty_vt.TinyIo.init).io(), allocator, .{
         .cols = 80,
         .rows = 24,
     });

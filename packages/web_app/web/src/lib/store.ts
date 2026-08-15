@@ -1358,6 +1358,9 @@ function createAppStore() {
     pinnedWorkspaceId = pane.workspace_id
     setWorkspaceId(pane.workspace_id)
     setFocusedPaneId(pane.pane_id)
+    // Zoom follows focus like the desktop: pane navigation while zoomed keeps
+    // the zoom and shows the newly focused pane instead of pinning the old one.
+    if (maximizedPaneId() != null) setMaximizedPaneId(pane.pane_id)
     setDrawerOpen(false)
     void loadTranscript(pane)
   }
@@ -1651,8 +1654,11 @@ function createAppStore() {
   const maximizePane = async (target?: LivePane) => {
     const pane = target ?? focusedPane()
     if (!pane) return
+    // Decide before focusPane: zoom-follows-focus would otherwise mark the
+    // target as already zoomed and turn every icon click into an unzoom.
+    const unzoom = maximizedPaneId() === pane.pane_id
     if (target) focusPane(target)
-    setMaximizedPaneId((current) => (current === pane.pane_id ? null : pane.pane_id))
+    setMaximizedPaneId(unzoom ? null : pane.pane_id)
   }
 
   const selectPaneAt = (index: number, list: LivePane[] = openPanes()) => {
