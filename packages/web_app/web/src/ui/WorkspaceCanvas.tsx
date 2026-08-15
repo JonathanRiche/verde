@@ -3,7 +3,7 @@ import { For, Show, createEffect, onCleanup, onMount } from 'solid-js'
 import { store } from '../lib/store'
 import type { LivePane } from '../lib/types'
 import { ChatPane } from './ChatPane'
-import { Icon } from './Icons'
+import { Icon, ZoomButton } from './Icons'
 import { TerminalView } from './Terminals'
 
 export function WorkspaceCanvas() {
@@ -11,7 +11,17 @@ export function WorkspaceCanvas() {
   let ignore_scroll = false
   let scroll_timer = 0
 
-  const panes = () => store.openPanes()
+  // Zoom renders only the maximized pane; the single column then naturally
+  // fills the strip and other panes remount from daemon state on unzoom.
+  const panes = () => {
+    const all = store.openPanes()
+    const zoomed_id = store.maximizedPaneId()
+    if (zoomed_id != null) {
+      const zoomed = all.filter((pane) => pane.pane_id === zoomed_id)
+      if (zoomed.length > 0) return zoomed
+    }
+    return all
+  }
 
   createEffect(() => {
     const id = store.focusedPaneId()
@@ -106,6 +116,7 @@ function PaneFrame(props: { pane: LivePane }) {
           <Show when={props.pane.running}>
             <span class="text-[11px] tracking-wide text-[var(--accent)]">Live</span>
           </Show>
+          <ZoomButton pane={props.pane} />
         </header>
       </Show>
       <Show when={props.pane.kind === 'chat'}>

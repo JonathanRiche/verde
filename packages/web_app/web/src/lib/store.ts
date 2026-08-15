@@ -1647,9 +1647,11 @@ function createAppStore() {
     await refreshProjection()
   }
 
-  const maximizePane = async () => {
-    const pane = focusedPane()
+  // Toggle zoom for a specific pane (header icon) or the focused pane (Alt+Z).
+  const maximizePane = async (target?: LivePane) => {
+    const pane = target ?? focusedPane()
     if (!pane) return
+    if (target) focusPane(target)
     setMaximizedPaneId((current) => (current === pane.pane_id ? null : pane.pane_id))
   }
 
@@ -1811,6 +1813,7 @@ function createAppStore() {
     focusedPaneId,
     focusedChat,
     maximizedPaneId,
+    maximizePane,
     paletteOpen,
     setPaletteOpen,
     settingsOpen,
