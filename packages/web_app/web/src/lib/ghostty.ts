@@ -1,14 +1,39 @@
+import wasmUrl from '../assets/ghostty-vt.wasm?url'
 import {
-  createGhosttyTerminal,
+  instantiateGhostty,
+  simdSupported,
   type GhosttyColor,
+  type GhosttyRuntime,
   type GhosttySnapshot,
   type GhosttyTerminal,
-} from '@slopus/ghostty-wasm'
+} from './ghostty_vt'
 
 import type { ScreenCell, ScreenCursor } from './pty'
 import { terminalDefaults, terminalPalette } from './theme'
 
 export type { GhosttySnapshot, GhosttyTerminal }
+
+/// One engine instance per page; every terminal pane shares it. Loaded via
+/// arrayBuffer + compile so the gateway's MIME type for .wasm never matters.
+let runtime_promise: Promise<GhosttyRuntime> | null = null
+
+function sharedRuntime(): Promise<GhosttyRuntime> {
+  if (!runtime_promise) {
+    runtime_promise = (async () => {
+      if (!simdSupported()) {
+        throw new Error('Terminal engine unavailable: this browser lacks WebAssembly SIMD128.')
+      }
+      const response = await fetch(wasmUrl)
+      if (!response.ok) throw new Error(`ghostty-vt.wasm fetch failed (${response.status})`)
+      return instantiateGhostty(await response.arrayBuffer())
+    })()
+    // A transient failure (offline fetch) should not poison every later pane.
+    runtime_promise.catch(() => {
+      runtime_promise = null
+    })
+  }
+  return runtime_promise
+}
 
 const FONT_STACK = '"JetBrains Mono", ui-monospace, monospace'
 
@@ -24,7 +49,8 @@ const MOBILE_MAX_STRETCH = 2
 const CELL_ADVANCE_EM = 0.6
 
 export async function openGhostty(cols: number, rows: number): Promise<GhosttyTerminal> {
-  return createGhosttyTerminal({
+  const engine = await sharedRuntime()
+  return engine.createTerminal({
     cols: Math.max(20, cols),
     rows: Math.max(6, rows),
     // Retained history backs wheel/touch scrolling via the native viewport

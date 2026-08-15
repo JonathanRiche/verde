@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const sdl = @import("zsdl3");
-const ghostty_vt = @import("../vendor/ghostty_vt.zig");
+const ghostty_vt = @import("engine.zig");
 pub const RenderState = ghostty_vt.RenderState;
 const keybinds = @import("../app/keybinds.zig");
 const process_env = @import("../platform/env.zig");
@@ -200,15 +200,6 @@ fn decodeTerminalPng(allocator: std.mem.Allocator, bytes: []const u8) ghostty_vt
     };
 }
 
-fn decodeOsc52ClipboardAlloc(allocator: std.mem.Allocator, encoded: []const u8) ![:0]u8 {
-    const decoder = std.base64.standard.Decoder;
-    const decoded_len = try decoder.calcSizeForSlice(encoded);
-    const decoded = try allocator.allocSentinel(u8, decoded_len, 0);
-    errdefer allocator.free(decoded);
-    try decoder.decode(decoded, encoded);
-    return decoded;
-}
-
 // Consecutive tail failures tolerated before declaring the daemon gone.
 // ~2 seconds at display rate; see daemon_poll_failures for why one miss
 // must not trigger a revive.
@@ -235,6 +226,11 @@ const TERMINAL_GET_PGRP_IOCTL: ?c_int = switch (builtin.os.tag) {
 };
 const TerminalStream = @TypeOf((@as(*ghostty_vt.Terminal, undefined)).vtStream());
 const TerminalHandler = @TypeOf((@as(*ghostty_vt.Terminal, undefined)).vtHandler());
+// lib_vt does not re-export the clipboard module, so recover the OSC 52
+// write types from the effect signature to keep the pin the single source.
+const ClipboardWriteFn = @typeInfo(@typeInfo(@FieldType(@FieldType(TerminalHandler, "effects"), "clipboard_write")).optional.child).pointer.child;
+const ClipboardWrite = @typeInfo(ClipboardWriteFn).@"fn".params[1].type.?;
+const ClipboardWriteResult = @typeInfo(ClipboardWriteFn).@"fn".return_type.?;
 const DeviceAttributes = @typeInfo(
     std.meta.Child(std.meta.Child(@TypeOf(TerminalHandler.Effects.readonly.device_attributes))),
 ).@"fn".return_type.?;
@@ -2807,13 +2803,15 @@ const UnixSession = struct {
         const self = try allocator.create(UnixSession);
         errdefer allocator.destroy(self);
 
-        var terminal = try ghostty_vt.Terminal.init(allocator, .{
+        // TinyIo is zero-sized and stateless, so a temporary is safe even
+        // though Screen retains the std.Io interface it produces.
+        var terminal = try ghostty_vt.Terminal.init((ghostty_vt.TinyIo.init).io(), allocator, .{
             .cols = options.cols,
             .rows = options.rows,
             // Ghostty's libterminal default is 10_000 *bytes* (~10 KB), which
             // caps scrollback at a few screenfuls. Match Ghostty's main-app
             // default of 10 MB so long sessions retain meaningful history.
-            .max_scrollback = 10_000_000,
+            .max_scrollback_bytes = 10_000_000,
             .kitty_image_storage_limit = KITTY_IMAGE_STORAGE_LIMIT,
         });
         errdefer terminal.deinit(allocator);
@@ -2843,7 +2841,7 @@ const UnixSession = struct {
             };
             self.stream = self.terminal.vtStream();
             self.stream.handler.effects.write_pty = &UnixSession.streamWritePty;
-            self.stream.handler.effects.clipboard = &UnixSession.streamClipboard;
+            self.stream.handler.effects.clipboard_write = &UnixSession.streamClipboard;
             self.stream.handler.effects.device_attributes = &UnixSession.streamDeviceAttributes;
             self.stream.handler.effects.size = &UnixSession.streamSize;
             self.stream.handler.effects.xtversion = &UnixSession.streamXtVersion;
@@ -2887,7 +2885,7 @@ const UnixSession = struct {
         };
         self.stream = self.terminal.vtStream();
         self.stream.handler.effects.write_pty = &UnixSession.streamWritePty;
-        self.stream.handler.effects.clipboard = &UnixSession.streamClipboard;
+        self.stream.handler.effects.clipboard_write = &UnixSession.streamClipboard;
         self.stream.handler.effects.device_attributes = &UnixSession.streamDeviceAttributes;
         self.stream.handler.effects.size = &UnixSession.streamSize;
         self.stream.handler.effects.xtversion = &UnixSession.streamXtVersion;
@@ -3054,7 +3052,11 @@ const UnixSession = struct {
             // resize the terminal model. Verde must not add emulator-side clears
             // or synthetic redraw input around this resize; the app owns its
             // repaint behavior.
-            try self.terminal.resize(allocator, next_cols, next_rows);
+            try self.terminal.resize(allocator, .{
+                .cols = next_cols,
+                .rows = next_rows,
+                .cell_size_px = .{ .width = self.cell_width, .height = self.cell_height },
+            });
             self.terminal.modes.set(.synchronized_output, false);
             if (terminalLayoutDiagnosticsEnabled()) {
                 // Capture the inputs that decide reflow behavior so we can
@@ -4096,7 +4098,11 @@ const UnixSession = struct {
         const fallback_rows = sanitizeCellCount(self.rows, MIN_ROWS);
 
         if (self.terminal.cols == 0 or self.terminal.rows == 0) {
-            try self.terminal.resize(allocator, fallback_cols, fallback_rows);
+            try self.terminal.resize(allocator, .{
+                .cols = fallback_cols,
+                .rows = fallback_rows,
+                .cell_size_px = .{ .width = self.cell_width, .height = self.cell_height },
+            });
             repaired = true;
         }
 
@@ -4148,17 +4154,20 @@ const UnixSession = struct {
         };
     }
 
-    fn streamClipboard(handler: *TerminalHandler, _: u8, data: []const u8) void {
-        if (std.mem.eql(u8, data, "?")) return;
+    fn streamClipboard(handler: *TerminalHandler, write: ClipboardWrite) ClipboardWriteResult {
+        // Contents arrive already base64-decoded and borrowed; read requests
+        // are filtered upstream. An empty contents slice clears the clipboard.
         const allocator = handler.terminal.gpa();
-        const clipboard_text = decodeOsc52ClipboardAlloc(allocator, data) catch |err| {
-            log.warn("ignored invalid OSC 52 clipboard payload: {s}", .{@errorName(err)});
-            return;
-        };
-        defer allocator.free(clipboard_text);
-        sdl.setClipboardText(clipboard_text) catch |err| {
+        const text: []const u8 = for (write.contents) |content| {
+            if (std.mem.startsWith(u8, content.mime, "text/")) break content.data;
+        } else if (write.contents.len > 0) write.contents[0].data else "";
+        const text_z = allocator.dupeZ(u8, text) catch return .io_error;
+        defer allocator.free(text_z);
+        sdl.setClipboardText(text_z) catch |err| {
             log.warn("failed to set OSC 52 clipboard text: {s}", .{@errorName(err)});
+            return .io_error;
         };
+        return .success;
     }
 
     fn streamDeviceAttributes(_: *TerminalHandler) DeviceAttributes {
@@ -5453,17 +5462,6 @@ fn freeCommand(allocator: std.mem.Allocator, command: [][:0]u8) void {
 
 fn clampf(value: f32, min_value: f32, max_value: f32) f32 {
     return @max(min_value, @min(value, max_value));
-}
-
-test "OSC 52 clipboard decoder accepts UTF-8 text and rejects invalid base64" {
-    const decoded = try decodeOsc52ClipboardAlloc(std.testing.allocator, "c2VsZWN0ZWQgdGV4dCDinJM=");
-    defer std.testing.allocator.free(decoded);
-    try std.testing.expectEqualStrings("selected text ✓", decoded);
-
-    try std.testing.expectError(
-        error.InvalidCharacter,
-        decodeOsc52ClipboardAlloc(std.testing.allocator, "!!!!"),
-    );
 }
 
 test "terminal key chords validate the allowlisted vocabulary" {
