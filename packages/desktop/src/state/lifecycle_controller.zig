@@ -4,7 +4,8 @@
 //! a worker thread. Dirty clears only on daemon acknowledgement; failures back
 //! off and mark persistence unavailable (visible unsaved/read-only). Shutdown
 //! and pre-turn durability still use the blocking flush path. Full snapshots
-//! above the protocol ceiling transfer ownership to the bounded durable spool.
+//! above the protocol ceiling and structurally rejected snapshots transfer
+//! ownership to the bounded durable spool.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -18,6 +19,9 @@ const SAVE_DEBOUNCE_MS: i64 = 750;
 const FLUSH_RETRY_BACKOFF_MS: i64 = 2000;
 /// When persistence is unavailable, probe no more often than this interval.
 const FLUSH_UNAVAILABLE_PROBE_MS: i64 = 5000;
+/// A rejected payload cannot become valid through rapid retries. This path is
+/// reached only when writing its durable fallback spool also failed.
+const FLUSH_REJECTED_RETRY_MS: i64 = 60_000;
 /// Leave enough room below the ten-second process watchdog to durably spool.
 const SHUTDOWN_FLUSH_BUDGET_MS: i64 = 7000;
 const SHUTDOWN_MAX_CONFLICTS: usize = 2;
@@ -33,6 +37,7 @@ const Storage = storage_mod.Storage;
 const FlushWorkerResult = struct {
     success: bool = false,
     conflict: bool = false,
+    rejected: bool = false,
     spooled: bool = false,
     acknowledged_revision: u64 = 0,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -319,37 +324,39 @@ fn flushWorkerMain(args: *FlushWorkerArgs) void {
 
     const fits_transport = args.storage.stateFitsSnapshotTransport(args.loaded.?.value) catch false;
     if (!fits_transport) {
-        var delta = persistence.clonePersistedSpoolDelta(
-            args.allocator,
-            args.loaded.?.value,
-            if (args.baseline) |baseline| baseline.value else null,
-        ) catch {
-            args.result.done.store(true, .release);
-            return;
-        };
-        defer delta.deinit();
-        args.storage.writePendingStateSpool(.{
-            .capture_revision = args.observed_revision,
-            .baseline_revision = if (args.baseline != null) args.observed_revision else null,
-            .current = delta.value,
-            .baseline = if (args.baseline) |baseline| baseline.value else null,
-        }) catch {
-            args.result.done.store(true, .release);
-            return;
-        };
-        args.result.spooled = true;
+        args.result.spooled = spoolFlushWorkerPayload(args);
         args.result.done.store(true, .release);
         return;
     }
     args.storage.saveCaptured(args.loaded.?.value, args.observed_revision) catch |err| {
         args.result.success = false;
         args.result.conflict = err == error.StoreRevisionConflict;
+        args.result.rejected = err == error.StoreMutationRejected;
+        if (args.result.rejected) {
+            args.result.spooled = spoolFlushWorkerPayload(args);
+        }
         args.result.done.store(true, .release);
         return;
     };
     args.result.acknowledged_revision = args.storage.currentProjectionObservedRevision();
     args.result.success = true;
     args.result.done.store(true, .release);
+}
+
+fn spoolFlushWorkerPayload(args: *FlushWorkerArgs) bool {
+    var delta = persistence.clonePersistedSpoolDelta(
+        args.allocator,
+        args.loaded.?.value,
+        if (args.baseline) |baseline| baseline.value else null,
+    ) catch return false;
+    defer delta.deinit();
+    args.storage.writePendingStateSpool(.{
+        .capture_revision = args.observed_revision,
+        .baseline_revision = if (args.baseline != null) args.observed_revision else null,
+        .current = delta.value,
+        .baseline = if (args.baseline) |baseline| baseline.value else null,
+    }) catch return false;
+    return true;
 }
 
 fn prepareFlushWorkerLoaded(args: *FlushWorkerArgs) !void {
@@ -433,6 +440,7 @@ pub fn pollFlushWorker(self: anytype) void {
     }
     const success = result.success;
     const conflict = result.conflict;
+    const rejected = result.rejected;
     const spooled = result.spooled;
     const acknowledged_revision = result.acknowledged_revision;
     const storage = self.storage;
@@ -486,11 +494,19 @@ pub fn pollFlushWorker(self: anytype) void {
     } else if (spooled) {
         // The spool owns exactly the captured generation. A newer edit resets
         // dirty_spooled through markDirty and schedules a replacement spool.
+        if (rejected) log.warn("durably spooled daemon-rejected native state snapshot", .{});
         noteCompletedSpool(&self.lifecycle, self.lifecycle.flush_snapshot_generation);
         clearCloseDurabilityNoticeAfterSuccess(self);
     } else if (conflict) {
         log.warn("async native state save conflicted; awaiting cursor rebase", .{});
         self.lifecycle.next_flush_attempt_ms = now + FLUSH_RETRY_BACKOFF_MS;
+    } else if (rejected) {
+        // A rejected payload cannot heal through immediate retries. If the
+        // durable spool itself failed, keep the state dirty but make retries
+        // rare enough that typing/rendering remain responsive.
+        log.err("native state snapshot rejected and spool failed; retaining dirty", .{});
+        self.lifecycle.notePersistenceFailure(now);
+        self.lifecycle.next_flush_attempt_ms = now + FLUSH_REJECTED_RETRY_MS;
     } else {
         log.err("async native state save failed; retaining dirty and backing off", .{});
         self.lifecycle.notePersistenceFailure(now);
@@ -1014,4 +1030,53 @@ test "completed spool owns only its captured dirty generation" {
     try std.testing.expect(state.dirty_spooled);
     state.markDirty(100);
     try std.testing.expect(!state.dirty_spooled);
+}
+
+test "rejected snapshot with durable spool stops retries without marking daemon unavailable" {
+    const FakeStorage = struct {
+        allocator: std.mem.Allocator,
+        unavailable: bool = false,
+
+        fn markPersistenceUnavailable(self: *@This()) void {
+            self.unavailable = true;
+        }
+        fn clearPendingStateSpoolBestEffort(_: *@This()) void {}
+    };
+    const FakeState = struct {
+        lifecycle: State = .{},
+        storage: *FakeStorage,
+
+        fn clearCloseDurabilityNotice(_: *@This()) void {}
+    };
+
+    var storage: FakeStorage = .{ .allocator = std.testing.allocator };
+    var state: FakeState = .{ .storage = &storage };
+    defer state.lifecycle.deinit();
+    state.lifecycle.dirty = true;
+    state.lifecycle.dirty_generation = 7;
+    state.lifecycle.flush_snapshot_generation = 7;
+    state.lifecycle.notePersistenceFailure(100);
+
+    const result = try std.testing.allocator.create(FlushWorkerResult);
+    result.* = .{ .rejected = true, .spooled = true };
+    result.done.store(true, .release);
+    const args = try std.testing.allocator.create(FlushWorkerArgs);
+    args.* = .{
+        .allocator = std.testing.allocator,
+        .storage = undefined,
+        .loaded = LoadedPersistedState.init(std.testing.allocator),
+        .baseline = null,
+        .observed_revision = 12,
+        .result = result,
+    };
+    state.lifecycle.flush_in_flight = true;
+    state.lifecycle.flush_result = result;
+    state.lifecycle.flush_args = args;
+    pollFlushWorker(&state);
+
+    try std.testing.expect(state.lifecycle.dirty);
+    try std.testing.expect(state.lifecycle.dirty_spooled);
+    try std.testing.expect(!storage.unavailable);
+    try std.testing.expect(state.lifecycle.persistenceFailureForMs(200) == null);
+    try std.testing.expect(!state.lifecycle.persistenceNeedsFrames(1_000_000));
 }
