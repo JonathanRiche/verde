@@ -122,7 +122,7 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "workspace.scrolling_automatic", .title = "Scrolling Layout: Automatic", .keywords = "niri panes mode threshold tiled", .section = .workspaces, .run = runScrollingAutomatic, .enabled = hasProjects },
     .{ .id = "workspace.scrolling_always", .title = "Scrolling Layout: Always", .keywords = "niri panes mode pin enable", .section = .workspaces, .run = runScrollingAlways, .enabled = hasProjects },
     .{ .id = "workspace.scrolling_disabled", .title = "Scrolling Layout: Disabled", .keywords = "niri panes mode tiled off disable", .section = .workspaces, .run = runScrollingDisabled, .enabled = hasProjects },
-    .{ .id = "workspace.scrolling_reset_column_width", .title = "Reset Scrolling Column Width", .keywords = "niri panes resize default per view", .section = .workspaces, .run = runResetScrollingColumnWidth, .enabled = hasCustomScrollingColumnWidth },
+    .{ .id = "workspace.scrolling_reset_column_width", .title = "Reset Scrolling Pane Widths", .keywords = "niri panes resize default per view", .section = .workspaces, .run = runResetScrollingColumnWidth, .enabled = hasCustomScrollingColumnWidth },
     .{ .id = "workspace.add", .title = "Add Workspace", .keywords = "new project folder directory", .section = .workspaces, .run = runAddWorkspace },
     .{ .id = "workspace.rename", .title = "Rename Workspace", .keywords = "label", .section = .workspaces, .run = runRenameWorkspace, .enabled = hasProjects },
     .{ .id = "workspace.close", .title = "Close Workspace", .keywords = "archive remove project save state", .section = .workspaces, .keybind = .workspace_close_current, .run = runCloseWorkspace, .enabled = workspaceNotBusy },
@@ -1074,7 +1074,7 @@ fn hasProjects(state: *runtime.AppState) bool {
 
 fn hasCustomScrollingColumnWidth(state: *runtime.AppState) bool {
     if (state.project_controller.selected_index >= state.project_controller.projects.items.len) return false;
-    return state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.scroll_pane_extent_override != null;
+    return state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.hasCustomScrollPaneExtent();
 }
 
 fn adjacentPaneForCommand(state: *runtime.AppState, previous: bool) ?runtime.WorkspacePaneId {
@@ -1407,8 +1407,8 @@ fn runScrollingUseGlobal(state: *runtime.AppState) void {
 
 fn runResetScrollingColumnWidth(state: *runtime.AppState) void {
     if (state.project_controller.selected_index >= state.project_controller.projects.items.len) return;
-    state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.scroll_pane_extent_override = null;
-    state.setSidebarNotice("Scrolling column width reset to Panes per view.");
+    state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.clearScrollPaneExtents();
+    state.setSidebarNotice("Scrolling pane widths reset to Panes per view.");
     state.markDirty();
 }
 
