@@ -1936,6 +1936,14 @@ fn rememberTranscriptScroll(state: *app_state.AppState, pane_id: ?app_state.Work
     }
 }
 
+fn clearTranscriptScroll(state: *app_state.AppState, pane_id: ?app_state.WorkspacePaneId) void {
+    if (pane_id) |id| {
+        state.clearWorkspaceChatTranscriptScroll(id);
+    } else {
+        state.clearCurrentTranscriptScroll();
+    }
+}
+
 fn findTranscriptHit(x: f32, y: f32) ?TranscriptHit {
     var i = transcript_hit_count;
     while (i > 0) {
@@ -2116,7 +2124,9 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
     // estimated tail coordinate". Cold long-thread estimates can move by many
     // screens as width settles; keep the semantic tail latch until the user
     // explicitly scrolls instead of visibly chasing a stale numeric offset.
-    if (shouldRememberTranscriptScroll(saved_scroll, manual_scroll_requested)) {
+    if (shouldUseSemanticTranscriptTail(follow_tail, manual_scroll_requested, manual_scroll_toward_tail, scroll_y, max_scroll)) {
+        clearTranscriptScroll(state, pane_id);
+    } else if (shouldRememberTranscriptScroll(saved_scroll, manual_scroll_requested)) {
         rememberTranscriptScroll(state, pane_id, scroll_y);
     }
     if (active_geometry) state.transcript_controller.palette_scroll_y = scroll_y;
@@ -2173,6 +2183,20 @@ fn shouldRememberTranscriptScroll(saved_scroll: ?f32, manual_scroll_requested: b
     return saved_scroll != null or manual_scroll_requested;
 }
 
+fn shouldUseSemanticTranscriptTail(
+    follow_tail: bool,
+    manual_scroll_requested: bool,
+    manual_scroll_toward_tail: bool,
+    scroll_y: f32,
+    max_scroll: f32,
+) bool {
+    if (follow_tail) return true;
+    if (manual_scroll_requested) {
+        return manual_scroll_toward_tail and transcriptScrollNearBottom(scroll_y, max_scroll);
+    }
+    return @abs(max_scroll - scroll_y) <= 1.0;
+}
+
 fn shouldImplicitlyFollowColdTail(cold_tail_follow: bool, saved_scroll: ?f32, manual_scroll_requested: bool) bool {
     return cold_tail_follow and saved_scroll == null and !manual_scroll_requested;
 }
@@ -2200,6 +2224,14 @@ test "implicit transcript tail follow survives changing cold-layout estimates" {
     try std.testing.expect(!shouldImplicitlyFollowColdTail(true, null, true));
     try std.testing.expect(!shouldImplicitlyFollowColdTail(true, manual_scroll, false));
     try std.testing.expect(shouldImplicitlyFollowColdTail(true, null, false));
+}
+
+test "numeric bottom offsets return to semantic transcript tail-follow" {
+    try std.testing.expect(shouldUseSemanticTranscriptTail(false, false, false, 1_000.0, 1_000.0));
+    try std.testing.expect(shouldUseSemanticTranscriptTail(false, true, true, 950.0, 1_000.0));
+    try std.testing.expect(!shouldUseSemanticTranscriptTail(false, true, false, 950.0, 1_000.0));
+    try std.testing.expect(!shouldUseSemanticTranscriptTail(false, false, false, 800.0, 1_000.0));
+    try std.testing.expect(shouldUseSemanticTranscriptTail(true, false, false, 800.0, 1_000.0));
 }
 
 test "inactive chat panes cannot consume another pane's tail-follow request" {

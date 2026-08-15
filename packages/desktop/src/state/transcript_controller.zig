@@ -508,6 +508,13 @@ pub fn rememberCurrentTranscriptScroll(self: anytype, scroll_y: f32) void {
     thread.transcript_scroll_y = @max(scroll_y, 0.0);
 }
 
+/// Returns the selected legacy chat viewport to semantic tail-follow.
+pub fn clearCurrentTranscriptScroll(self: anytype) void {
+    const thread = self.currentThreadMutable();
+    thread.transcript_scroll_valid = false;
+    thread.transcript_scroll_y = 0.0;
+}
+
 pub fn rememberWorkspaceChatTranscriptScroll(self: anytype, pane_id: WorkspacePaneId, scroll_y: f32) void {
     if (self.project_controller.projects.items.len == 0) return;
     const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
@@ -518,6 +525,54 @@ pub fn rememberWorkspaceChatTranscriptScroll(self: anytype, pane_id: WorkspacePa
             ref.transcript_scroll_y = @max(scroll_y, 0.0);
         },
         else => {},
+    }
+}
+
+/// Returns one workspace chat pane to semantic tail-follow.
+pub fn clearWorkspaceChatTranscriptScroll(self: anytype, pane_id: WorkspacePaneId) void {
+    if (self.project_controller.projects.items.len == 0) return;
+    const layout = &self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout;
+    const pane = layout.paneByIdMutable(pane_id) orelse return;
+    switch (pane.ref) {
+        .chat => |*ref| {
+            ref.transcript_scroll_valid = false;
+            ref.transcript_scroll_y = 0.0;
+        },
+        else => {},
+    }
+}
+
+/// Resets frame-local scroll intent when navigation activates a chat pane.
+/// The pane's own saved offset remains authoritative; a pane without one
+/// resumes semantic tail-follow instead of inheriting another chat's state.
+pub fn prepareTranscriptPaneFocus(self: anytype, project_index: usize, pane_id: WorkspacePaneId) void {
+    if (project_index >= self.project_controller.projects.items.len or
+        self.project_controller.selected_index != project_index)
+    {
+        return;
+    }
+    const project = &self.project_controller.projects.items[project_index];
+    const pane = project.workspace_layout.paneById(pane_id) orelse return;
+    const ref = switch (pane.ref) {
+        .chat => |chat_ref| chat_ref,
+        else => return,
+    };
+    if (ref.thread_index >= project.threads.items.len) return;
+
+    self.transcript_controller.pending_scroll_px = 0.0;
+    self.transcript_controller.pending_page_steps = 0;
+    self.transcript_controller.manual_scroll_pending = false;
+    self.transcript_controller.manual_scroll_toward_tail = false;
+    self.transcript_controller.scroll_pending_track_project = project_index;
+    self.transcript_controller.scroll_pending_track_thread = ref.thread_index;
+    if (ref.transcript_scroll_valid) {
+        self.transcript_controller.auto_follow_pending = false;
+        self.transcript_controller.auto_follow_suspended = true;
+        self.transcript_controller.scroll_to_bottom_frames = 0;
+    } else {
+        self.transcript_controller.auto_follow_pending = true;
+        self.transcript_controller.auto_follow_suspended = false;
+        self.transcript_controller.scroll_to_bottom_frames = 8;
     }
 }
 
