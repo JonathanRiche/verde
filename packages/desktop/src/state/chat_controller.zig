@@ -4209,6 +4209,36 @@ const AdoptionRetryState = struct {
 
 var adoption_retry_pending: std.StringHashMapUnmanaged(AdoptionRetryState) = .empty;
 
+/// Refresh-veto counts must survive marker churn. `clearAdoptionPending` is
+/// called on paths that only CLAIM resolution (pollThreadSend `.complete`,
+/// pump satisfaction) — when the durable projection keeps regressing (e.g.
+/// rejected flushes), the same turn re-mints a fresh marker whose
+/// `refresh_validation_failures` restarted at zero, so one cycling repair
+/// could veto every projection refresh forever without crossing the terminal
+/// bound. Keys mirror `adoption_retry_pending`; an entry is forgotten only on
+/// durably proven resolution (`.unique` refresh validation), never on clear.
+var adoption_veto_history: std.StringHashMapUnmanaged(u32) = .empty;
+/// Belt on history growth: only keys with at least one failed refresh
+/// validation are recorded, so a real session holds a handful. At the cap new
+/// keys are simply not recorded (worst case: today's restart-from-zero).
+const ADOPTION_VETO_HISTORY_MAX: usize = 256;
+
+fn rememberAdoptionVetoHistory(key: []const u8, failures: u32) void {
+    if (adoption_veto_history.getPtr(key)) |existing| {
+        existing.* = @max(existing.*, failures);
+        return;
+    }
+    if (adoption_veto_history.count() >= ADOPTION_VETO_HISTORY_MAX) return;
+    const owned = std.heap.page_allocator.dupe(u8, key) catch return;
+    adoption_veto_history.put(std.heap.page_allocator, owned, failures) catch {
+        std.heap.page_allocator.free(owned);
+    };
+}
+
+fn forgetAdoptionVetoHistory(key: []const u8) void {
+    if (adoption_veto_history.fetchRemove(key)) |entry| std.heap.page_allocator.free(entry.key);
+}
+
 fn adoptionRetryKeyAlloc(workspace_id: []const u8, local_thread_id: []const u8, turn_id: []const u8) ?[]u8 {
     return std.fmt.allocPrint(std.heap.page_allocator, "{s}\x1f{s}\x1f{s}", .{ workspace_id, local_thread_id, turn_id }) catch null;
 }
@@ -4245,6 +4275,11 @@ fn markAdoptionPending(workspace_id: []const u8, thread: *const ChatThread, turn
             std.heap.page_allocator.free(key);
             return;
         };
+        // A re-minted marker resumes its refresh-veto count. Restarting from
+        // zero let a clear/re-mint cycle outrun the terminal bound forever,
+        // freezing projection convergence app-wide (blank panes until the
+        // render-path rehydration kicked in).
+        gop.value_ptr.refresh_validation_failures = adoption_veto_history.get(key) orelse 0;
     }
     gop.value_ptr.attempts +|= 1;
     const attempts = gop.value_ptr.attempts;
@@ -4307,6 +4342,13 @@ pub fn markAdoptionTerminalRepairForTest(self: anytype, workspace_id: []const u8
 pub fn clearAdoptionRepairForTest(workspace_id: []const u8, local_thread_id: []const u8, turn_id: []const u8) void {
     std.debug.assert(builtin.is_test);
     clearAdoptionPending(workspace_id, local_thread_id, turn_id);
+    // Veto history deliberately survives production clears; tests share the
+    // module-global registry, so their cleanup must also forget it or one
+    // test's veto counts would seed a later test's re-mint of the same key.
+    if (adoptionRetryKeyAlloc(workspace_id, local_thread_id, turn_id)) |key| {
+        defer std.heap.page_allocator.free(key);
+        forgetAdoptionVetoHistory(key);
+    }
 }
 
 /// True while any turn-bound adoption marker owns unresolved correspondence.
@@ -4336,13 +4378,20 @@ const ADOPTION_REPAIR_MAX_REFRESH_VETOES: u32 = 10;
 /// satisfaction; after a bounded number of vetoes the daemon-owned durable
 /// projection wins: the marker is dropped loudly, accepting bounded, visible
 /// divergence in one thread instead of an app-wide convergence freeze.
-pub fn validateAdoptionRepairsForRefresh(_: anytype, persisted: db_types.PersistedState) !void {
+pub fn validateAdoptionRepairsForRefresh(self: anytype, persisted: db_types.PersistedState) !void {
     var dropped_keys: std.ArrayList([]const u8) = .empty;
     defer dropped_keys.deinit(std.heap.page_allocator);
     var veto: ?anyerror = null;
     var iterator = adoption_retry_pending.iterator();
     while (iterator.next()) |entry| {
-        const parts = adoptionRetryKeyParts(entry.key_ptr.*) orelse return error.InvalidAdoptionRepairKey;
+        // A malformed key can never resolve; drop it instead of aborting the
+        // whole pass — an early return here skipped the counter increment for
+        // every marker, letting one bad entry veto refreshes forever.
+        const parts = adoptionRetryKeyParts(entry.key_ptr.*) orelse {
+            log.warn("dropping adoption repair with malformed key: durable projection wins", .{});
+            try dropped_keys.append(std.heap.page_allocator, entry.key_ptr.*);
+            continue;
+        };
         const failure: anyerror = blk: {
             const project = project: {
                 for (persisted.projects) |candidate| {
@@ -4358,8 +4407,25 @@ pub fn validateAdoptionRepairsForRefresh(_: anytype, persisted: db_types.Persist
                 }
                 break :blk error.AdoptionRepairMismatch;
             };
-            switch (try adoptionTurnMatch(thread.messages, entry.value_ptr.rows.items, parts.turn_id)) {
-                .unique => continue,
+            // A match error (page load, allocation) counts like any failed
+            // validation: propagating it out of the loop skipped this
+            // marker's increment and every marker after it, so a single
+            // erroring repair could veto refreshes without ever crossing
+            // the terminal bound.
+            switch (adoptionRefreshTurnMatch(
+                self,
+                parts.workspace_id,
+                parts.local_thread_id,
+                parts.turn_id,
+                thread,
+                entry.value_ptr.rows.items,
+            ) catch |err| break :blk err) {
+                .unique => {
+                    // Durably proven resolved: this key's veto history must
+                    // not poison a later, legitimate repair for the same turn.
+                    forgetAdoptionVetoHistory(entry.key_ptr.*);
+                    continue;
+                },
                 .missing => break :blk error.AdoptionRepairMismatch,
                 // Multiple ordered fingerprint correspondences are not enough
                 // to prove identity.
@@ -4367,6 +4433,7 @@ pub fn validateAdoptionRepairsForRefresh(_: anytype, persisted: db_types.Persist
             }
         };
         entry.value_ptr.refresh_validation_failures +|= 1;
+        rememberAdoptionVetoHistory(entry.key_ptr.*, entry.value_ptr.refresh_validation_failures);
         if (entry.value_ptr.refresh_validation_failures > ADOPTION_REPAIR_MAX_REFRESH_VETOES) {
             log.warn(
                 "dropping unresolvable adoption repair for thread {s} turn {s} after {d} refresh vetoes ({s}): durable projection wins",
@@ -4421,6 +4488,59 @@ fn adoptionTurnMatch(
         1 => .unique,
         else => .ambiguous,
     };
+}
+
+/// Tail pages a bounded-thread probe may materialize before giving up. Four
+/// pages (1024 rows) is far beyond any single turn's footprint relative to
+/// the transcript tail; running out reproduces the pre-existing bounded
+/// `.missing` veto rather than introducing a new failure state.
+const ADOPTION_VALIDATION_MAX_TAIL_PAGES: usize = 4;
+
+/// Judge one repair's turn correspondence against a refresh snapshot.
+/// Bounded durable snapshots (`loadBounded`) carry `messages = &.{}` with
+/// `message_offset` holding the full durable row count, so judging `.missing`
+/// against that emptiness vetoed every refresh while any marker was pending —
+/// a guaranteed veto storm, not evidence of divergence. When rows exist but
+/// were not materialized, page the durable tail in from the projection store
+/// and judge against real rows instead.
+fn adoptionRefreshTurnMatch(
+    self: anytype,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    turn_id: []const u8,
+    thread: db_types.PersistedThread,
+    expected_rows: anytype,
+) !AdoptionTurnMatch {
+    if (thread.messages.len != 0 or thread.message_offset == 0)
+        return adoptionTurnMatch(thread.messages, expected_rows, turn_id);
+    if (expected_rows.len == 0) return .unique;
+    const allocator = std.heap.page_allocator;
+    var pages: [ADOPTION_VALIDATION_MAX_TAIL_PAGES]db_types.LoadedMessagePage = undefined;
+    var page_count: usize = 0;
+    defer for (pages[0..page_count]) |*page| page.deinit();
+    var combined: std.ArrayList(db_types.PersistedMessage) = .empty;
+    defer combined.deinit(allocator);
+    var before_offset: usize = thread.message_offset;
+    while (page_count < pages.len and before_offset > 0) {
+        // A store race (thread deleted, DB briefly unavailable) degrades to
+        // the same bounded veto path a genuine mismatch takes.
+        const page = self.storage.loadMessagePage(
+            allocator,
+            workspace_id,
+            local_thread_id,
+            before_offset,
+        ) catch return .missing;
+        pages[page_count] = page;
+        page_count += 1;
+        if (page.messages.len == 0 or page.offset >= before_offset) break;
+        // Older pages prepend so the accumulated rows keep transcript order
+        // for the ordered-correspondence matcher.
+        try combined.insertSlice(allocator, 0, page.messages);
+        before_offset = page.offset;
+        const match = try adoptionTurnMatch(combined.items, expected_rows, turn_id);
+        if (match != .missing) return match;
+    }
+    return .missing;
 }
 
 test "turn-scoped adoption matcher retains ambiguous fingerprints" {
@@ -4740,6 +4860,61 @@ test "M4-P5 amendment: incomplete adoption retries to a single identity set" {
     defer std.heap.page_allocator.free(key);
     try std.testing.expectEqual(@as(u32, 2), adoption_retry_pending.get(key).?.attempts);
     clearAdoptionPending("ws-adopt-test", thread.local_thread_id, "turn-adopt-test");
+    try std.testing.expect(adoption_retry_pending.get(key) == null);
+}
+
+test "adoption refresh veto count survives clear/re-mint and stays terminal" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Veto thread");
+    defer thread.deinit(allocator);
+    try thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "veto body"),
+    });
+
+    // The marker's workspace is absent from every refresh snapshot, so each
+    // validation fails — the shape of a projection that never converges.
+    const persisted: db_types.PersistedState = .{};
+    var dummy: struct {} = .{};
+
+    markAdoptionPending("ws-veto-test", &thread, "turn-veto-test");
+    const key = adoptionRetryKeyAlloc("ws-veto-test", thread.local_thread_id, "turn-veto-test").?;
+    defer std.heap.page_allocator.free(key);
+    defer clearAdoptionRepairForTest("ws-veto-test", thread.local_thread_id, "turn-veto-test");
+
+    var pass: u32 = 0;
+    while (pass < 5) : (pass += 1) {
+        try std.testing.expectError(
+            error.AdoptionRepairMismatch,
+            validateAdoptionRepairsForRefresh(&dummy, persisted),
+        );
+    }
+    try std.testing.expectEqual(@as(u32, 5), adoption_retry_pending.get(key).?.refresh_validation_failures);
+
+    // A clear (a premature completion claim) followed by a re-mint must
+    // RESUME the veto count: restarting from zero let one cycling repair
+    // freeze projection convergence app-wide forever.
+    clearAdoptionPending("ws-veto-test", thread.local_thread_id, "turn-veto-test");
+    markAdoptionPending("ws-veto-test", &thread, "turn-veto-test");
+    try std.testing.expectEqual(@as(u32, 5), adoption_retry_pending.get(key).?.refresh_validation_failures);
+
+    // The remaining vetoes still fire...
+    pass = 0;
+    while (pass < ADOPTION_REPAIR_MAX_REFRESH_VETOES - 5) : (pass += 1) {
+        try std.testing.expectError(
+            error.AdoptionRepairMismatch,
+            validateAdoptionRepairsForRefresh(&dummy, persisted),
+        );
+    }
+    // ...and the pass that crosses the bound drops the marker without
+    // vetoing: the durable projection wins and the refresh applies.
+    try validateAdoptionRepairsForRefresh(&dummy, persisted);
+    try std.testing.expect(adoption_retry_pending.get(key) == null);
+
+    // A poisoned re-mint seeds past the bound and can never veto again.
+    markAdoptionPending("ws-veto-test", &thread, "turn-veto-test");
+    try validateAdoptionRepairsForRefresh(&dummy, persisted);
     try std.testing.expect(adoption_retry_pending.get(key) == null);
 }
 

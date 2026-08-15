@@ -418,6 +418,10 @@ fn pollCoreChangesOnce(storage: *const Storage, loop: *ChangeCursorLoopState, cu
         return .unavailable;
     }
     loop.publish(signals);
+    // Wake the frame loop like the requested-revision arm does: without this
+    // the published refresh sits undrained until an unrelated input event, so
+    // daemon-side changes only became visible after e.g. a mouse move.
+    loop_wakeup.notify();
     return .advanced;
 }
 
@@ -433,6 +437,9 @@ fn fetchCompositeSnapshotSeed(storage: *const Storage, loop: *ChangeCursorLoopSt
     }
     // The frame applies the payload before it publishes the seed cursor.
     loop.publish(.{ .registry = true, .chat = true, .resync = true });
+    // Same wake contract as pollCoreChangesOnce: a seed published while the
+    // loop sleeps (e.g. after a daemon restart) must not wait for input.
+    loop_wakeup.notify();
     return true;
 }
 
@@ -1070,15 +1077,32 @@ fn preserveProjectionRuntime(
                     .chat => |*ref| ref,
                     else => continue,
                 };
-                if (next_ref.thread_index >= next_project.threads.items.len) continue;
                 const current_pane = current_project.workspace_layout.paneById(next_pane.id) orelse continue;
                 const current_ref = switch (current_pane.ref) {
                     .chat => |ref| ref,
                     else => continue,
                 };
                 if (current_ref.thread_index >= current_project.threads.items.len) continue;
-                const next_thread_id = next_project.threads.items[next_ref.thread_index].local_thread_id;
+                // Pane refs are bare ordinals while the replacement thread
+                // array is remote-ordered (merge appends current-only threads
+                // at the tail and a remote archive pulls a thread out
+                // mid-array), so the same index can now name a different
+                // thread. Rebind by thread identity: the pane must keep
+                // showing the thread it was showing, not whatever slid into
+                // its old slot — that positional drift blanked open panes and
+                // stranded their scroll anchors after daemon refreshes.
                 const current_thread_id = current_project.threads.items[current_ref.thread_index].local_thread_id;
+                const rebound_index: usize = index: {
+                    for (next_project.threads.items, 0..) |*candidate, candidate_index| {
+                        if (std.mem.eql(u8, candidate.local_thread_id, current_thread_id)) break :index candidate_index;
+                    }
+                    // Thread gone from the replacement (deleted or archived
+                    // remotely): leave the normalized fallback binding alone.
+                    break :index next_ref.thread_index;
+                };
+                if (rebound_index >= next_project.threads.items.len) continue;
+                next_ref.thread_index = rebound_index;
+                const next_thread_id = next_project.threads.items[next_ref.thread_index].local_thread_id;
                 if (!std.mem.eql(u8, next_thread_id, current_thread_id)) continue;
                 next_ref.transcript_scroll_valid = current_ref.transcript_scroll_valid;
                 next_ref.transcript_scroll_y = current_ref.transcript_scroll_y;
