@@ -1025,11 +1025,24 @@ fn countProjectionActiveSends(controller: *project_controller.State) usize {
     return count;
 }
 
-/// Projection refreshes replace durable chat data, but live send state,
-/// measured layout, and scroll offsets are frame-local runtime state. Carry
-/// them by stable identity so a daemon update cannot replay a live stream or
-/// reinterpret an offset against a fresh height estimate.
-fn preserveProjectionThreadRuntime(
+fn transferProjectionTerminalRuntime(current: *Project, replacement: *Project) void {
+    _ = replacement.terminal_dock.transferRuntimeFrom(&current.terminal_dock);
+    for (replacement.terminal_docks.items) |*next_entry| {
+        const current_entry = current.terminalDockEntryById(next_entry.id) orelse continue;
+        _ = next_entry.dock.transferRuntimeFrom(&current_entry.dock);
+    }
+    std.mem.swap(
+        @TypeOf(current.pending_terminal_teardowns),
+        &current.pending_terminal_teardowns,
+        &replacement.pending_terminal_teardowns,
+    );
+    replacement.last_content_pane_id = current.last_content_pane_id;
+}
+
+/// Projection refreshes replace durable data, but live sends, terminal
+/// emulators, measured layout, and scroll offsets are frame-local runtime
+/// state. Carry them by stable identity before the old projects are destroyed.
+fn preserveProjectionRuntime(
     current: *project_controller.State,
     replacement: *project_controller.State,
 ) void {
@@ -1037,6 +1050,7 @@ fn preserveProjectionThreadRuntime(
     inline for (collections) |projects| {
         for (projects.items) |*next_project| {
             const current_project = projectByIdForViewport(current, next_project.id) orelse continue;
+            transferProjectionTerminalRuntime(current_project, next_project);
 
             for (next_project.threads.items) |*next_thread| {
                 const current_thread = threadByIdForViewport(current_project, next_thread.local_thread_id) orelse continue;
@@ -1073,7 +1087,7 @@ fn preserveProjectionThreadRuntime(
     }
 }
 
-test "daemon projection replacement preserves live transcript runtime by identity" {
+test "daemon projection replacement preserves live runtime by identity" {
     const allocator = std.testing.allocator;
     var current: project_controller.State = .{};
     defer {
@@ -1122,7 +1136,7 @@ test "daemon projection replacement preserves live transcript runtime by identit
     };
 
     const replacement_send_state = replacement.projects.items[0].threads.items[0].send_state;
-    preserveProjectionThreadRuntime(&current, &replacement);
+    preserveProjectionRuntime(&current, &replacement);
 
     const next_thread = replacement.projects.items[0].threads.items[0];
     try std.testing.expect(next_thread.transcript_scroll_valid);
@@ -9585,7 +9599,7 @@ pub const AppState = struct {
         // All fallible staging is complete. Move GUI-owned runtime state only
         // at this infallible publication boundary so an earlier staging error
         // can still discard the replacement without touching the live app.
-        preserveProjectionThreadRuntime(&self.project_controller, &staged.project_controller);
+        preserveProjectionRuntime(&self.project_controller, &staged.project_controller);
         staged.chat_controller.pending_send_count = countProjectionActiveSends(&staged.project_controller);
 
         const old_projects = self.project_controller;

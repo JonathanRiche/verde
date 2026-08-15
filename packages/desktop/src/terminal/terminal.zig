@@ -749,6 +749,32 @@ pub const Dock = struct {
         self.pending_session_teardowns.deinit(allocator);
     }
 
+    /// Moves live emulator ownership into a freshly restored layout by stable
+    /// daemon identity. Persisted tabs and pane geometry remain authoritative.
+    pub fn transferRuntimeFrom(self: *Dock, current: *Dock) usize {
+        var transferred: usize = 0;
+        for (current.tabs.items) |*tab| {
+            transferPaneNodeSessions(tab.root, self, &transferred);
+        }
+        if (transferred == 0 and current.pending_session_teardowns.items.len == 0) return 0;
+
+        std.mem.swap(@TypeOf(self.cwd), &self.cwd, &current.cwd);
+        std.mem.swap(@TypeOf(self.pref_path), &self.pref_path, &current.pref_path);
+        std.mem.swap(u32, &self.session_dock_id, &current.session_dock_id);
+        std.mem.swap(bool, &self.orphan_prune_done, &current.orphan_prune_done);
+        std.mem.swap(AutoRestartBackoff, &self.auto_restart_backoff, &current.auto_restart_backoff);
+        std.mem.swap(
+            @TypeOf(self.pending_session_teardowns),
+            &self.pending_session_teardowns,
+            &current.pending_session_teardowns,
+        );
+        self.focus_requested = self.focus_requested or current.focus_requested;
+        current.focus_requested = false;
+        self.workspace_changed = self.workspace_changed or current.workspace_changed;
+        current.workspace_changed = false;
+        return transferred;
+    }
+
     pub fn toggle(self: *Dock) bool {
         self.visible = !self.visible;
         if (self.visible) self.focus_requested = true;
@@ -2075,6 +2101,45 @@ fn collectPaneSessionIds(allocator: std.mem.Allocator, node: *PaneNode, session_
             try collectPaneSessionIds(allocator, split.second, session_ids);
         },
     }
+}
+
+fn transferPaneNodeSessions(node: *PaneNode, replacement: *Dock, transferred: *usize) void {
+    switch (node.*) {
+        .leaf => |*leaf| {
+            const session = leaf.session orelse return;
+            const session_id = session.sessionId() orelse leaf.session_id orelse return;
+            const target = findPaneLeafBySessionId(replacement, session_id) orelse return;
+            if (target.session != null) return;
+            target.session = session;
+            leaf.session = null;
+            transferred.* += 1;
+        },
+        .split => |*split| {
+            transferPaneNodeSessions(split.first, replacement, transferred);
+            transferPaneNodeSessions(split.second, replacement, transferred);
+        },
+    }
+}
+
+fn findPaneLeafBySessionId(dock: *Dock, session_id: []const u8) ?*PaneLeaf {
+    for (dock.tabs.items) |*tab| {
+        if (findPaneLeafBySessionIdInNode(tab.root, session_id)) |leaf| return leaf;
+    }
+    return null;
+}
+
+fn findPaneLeafBySessionIdInNode(node: *PaneNode, session_id: []const u8) ?*PaneLeaf {
+    return switch (node.*) {
+        .leaf => |*leaf| blk: {
+            const candidate = if (leaf.session) |session| session.sessionId() orelse leaf.session_id else leaf.session_id;
+            if (candidate) |value| {
+                if (std.mem.eql(u8, value, session_id)) break :blk leaf;
+            }
+            break :blk null;
+        },
+        .split => |*split| findPaneLeafBySessionIdInNode(split.first, session_id) orelse
+            findPaneLeafBySessionIdInNode(split.second, session_id),
+    };
 }
 
 fn collectPaneSessionLifecycleSnapshots(
@@ -5755,6 +5820,45 @@ test "persisted restart revive policy reloads as attach" {
 
     try dock.applyPersistedLayoutJson(allocator, layout_json);
     try std.testing.expectEqual(TerminalRevivePolicy.attach_or_create, dock.activePaneConst().?.revive_policy);
+}
+
+test "persisted dock replacement keeps matching live emulator ownership" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var current = try Dock.init(allocator);
+    defer current.deinit(allocator);
+    try current.restartWithProfile(allocator, "/tmp", .{
+        .kind = .custom,
+        .label = "projection runtime transfer",
+        .command = &.{ "/bin/sh", "-c", "sleep 30" },
+    });
+    try lifecycle_testing.assignActiveSessionId(&current, allocator, "stable-daemon-session");
+    const live_session = current.activePane().?.session.?;
+
+    var replacement = try Dock.init(allocator);
+    defer replacement.deinit(allocator);
+    try replacement.applyPersistedLayoutJson(allocator,
+        \\{
+        \\  "tabs": [{
+        \\    "title": "persisted replacement",
+        \\    "active_pane_id": 42,
+        \\    "root_node_id": 1,
+        \\    "nodes": [{
+        \\      "node_id": 1,
+        \\      "kind": "leaf",
+        \\      "pane_id": 42,
+        \\      "session_id": "stable-daemon-session"
+        \\    }]
+        \\  }]
+        \\}
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), replacement.transferRuntimeFrom(&current));
+    try std.testing.expect(current.activePane().?.session == null);
+    try std.testing.expect(replacement.activePane().?.session.? == live_session);
+    try std.testing.expectEqual(@as(u32, 42), replacement.activePane().?.id);
+    try std.testing.expectEqualStrings("persisted replacement", replacement.tabs.items[0].title.?);
+    try std.testing.expectEqualStrings("/tmp", replacement.cwd.?);
 }
 
 test "session ensure preserves a running non-null session" {
