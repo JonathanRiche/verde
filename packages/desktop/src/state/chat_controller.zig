@@ -5156,12 +5156,7 @@ pub fn issuePendingCodexSteer(
 
     const send_state = thread.send_state;
     if (!send_state.mutex.tryLock()) return;
-    if (send_state.status == .pending and
-        !send_state.stop_requested and
-        send_state.pending_followup != null and
-        send_state.pending_followup.?.kind == .steer and
-        !send_state.pending_followup_signal_sent)
-    {
+    if (pendingCodexSteerCanSignal(send_state)) {
         const pending_thread_id: ?[]const u8 = if (thread.provider_thread_id) |existing|
             existing
         else if (send_state.provisional_provider_thread_id) |provisional|
@@ -5262,6 +5257,33 @@ pub fn issuePendingCodexSteer(
         self.requestTranscriptScrollToBottom();
     }
     self.setSidebarNotice("Codex steer sent. Waiting for the current turn to update.");
+}
+
+fn pendingCodexSteerCanSignal(send_state: *const SendState) bool {
+    const followup = send_state.pending_followup orelse return false;
+    return send_state.status == .pending and
+        !send_state.stop_requested and
+        followup.kind == .steer and
+        followup.state == .pending and
+        !send_state.pending_followup_signal_sent;
+}
+
+test "Codex steer polling stops after fallback to next turn" {
+    const allocator = std.testing.allocator;
+    var send_state: SendState = .{
+        .status = .pending,
+        .pending_followup = .{
+            .kind = .steer,
+            .prompt = try allocator.dupe(u8, "steer this turn"),
+        },
+    };
+    defer freePendingFollowup(allocator, &send_state.pending_followup);
+
+    try std.testing.expect(pendingCodexSteerCanSignal(&send_state));
+    send_state.pending_followup.?.state = .fallback_next_turn;
+    try std.testing.expect(!pendingCodexSteerCanSignal(&send_state));
+    send_state.pending_followup.?.state = .sent_inline;
+    try std.testing.expect(!pendingCodexSteerCanSignal(&send_state));
 }
 
 pub fn dispatchPendingFollowup(self: anytype, project_index: usize, thread_index: usize, thread: *ChatThread) void {
