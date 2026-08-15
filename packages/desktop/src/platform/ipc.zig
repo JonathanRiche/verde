@@ -24,16 +24,22 @@ const RESPONSE_TOO_LARGE_RESPONSE = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":
 // specific resource:
 /// Fixed number of per-connection worker threads. Bounds concurrent in-flight
 /// requests so a slow handler can never spawn unbounded threads; no client
-/// class (desktop included) gets a reserved slot.
-pub const TRANSPORT_WORKER_COUNT: usize = 4;
+/// class (desktop included) gets a reserved slot. Sized for the real client
+/// population (GUI display-rate chat/terminal pollers, web gateway, several
+/// MCP servers, CLI): at 4 workers the pool measurably saturated and GUI
+/// transcript polls queued for seconds, rendering streamed text in chunks.
+pub const TRANSPORT_WORKER_COUNT: usize = 16;
 /// Bounds accepted-but-unassigned connections. Overflow receives the fast
 /// structured busy response below instead of queueing unboundedly.
-pub const TRANSPORT_ACCEPT_QUEUE_CAP: usize = 8;
-/// At most half the pool may be parked in a long-poll (`core.changes`) so
-/// short requests always find a free worker. Handlers that park consult this
-/// cap and degrade an over-cap wait to an immediate check (never an error).
-/// The cap lives here because it is a property of the worker pool; the
-/// enforcement lives with the parking handler, which owns wait semantics.
+pub const TRANSPORT_ACCEPT_QUEUE_CAP: usize = 16;
+/// At most half the pool may be parked in a long-poll so short requests
+/// always find a free worker. This bounds the SHARED total across every
+/// parking handler (`core.changes` and `chat.turn.tail wait_ms` share one
+/// counter) — per-kind counters would let combined parks consume the whole
+/// pool. Handlers that park consult this cap and degrade an over-cap wait to
+/// an immediate check (never an error). The cap lives here because it is a
+/// property of the worker pool; the enforcement lives with the parking
+/// handler, which owns wait semantics.
 pub const MAX_PARKED_LONG_POLL_WAITERS: usize = TRANSPORT_WORKER_COUNT / 2;
 /// Q7 accept-queue overflow reply: `invalid_state` + Error.data.reason="busy".
 /// Written before any request byte is read, so the id is necessarily null.
@@ -1575,11 +1581,12 @@ fn testRejectRequest(ctx: *anyopaque, request: []u8) anyerror![]u8 {
 }
 
 test "Q7 transport concurrency constants are pinned" {
-    // m4m5_decisions Q7: 4 workers, accept-queue cap 8, at most 2 parked
-    // long-pollers. Changing any of these is a design decision, not a patch.
-    try std.testing.expectEqual(@as(usize, 4), TRANSPORT_WORKER_COUNT);
-    try std.testing.expectEqual(@as(usize, 8), TRANSPORT_ACCEPT_QUEUE_CAP);
-    try std.testing.expectEqual(@as(usize, 2), MAX_PARKED_LONG_POLL_WAITERS);
+    // m4m5_decisions Q7, resized after field saturation: 16 workers,
+    // accept-queue cap 16, at most 8 parked long-pollers (shared across park
+    // kinds). Changing any of these is a design decision, not a patch.
+    try std.testing.expectEqual(@as(usize, 16), TRANSPORT_WORKER_COUNT);
+    try std.testing.expectEqual(@as(usize, 16), TRANSPORT_ACCEPT_QUEUE_CAP);
+    try std.testing.expectEqual(@as(usize, 8), MAX_PARKED_LONG_POLL_WAITERS);
     // Overflow reply shape: invalid_state with Error.data.reason="busy".
     try std.testing.expect(std.mem.indexOf(u8, BUSY_RESPONSE, "\"code\":\"invalid_state\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, BUSY_RESPONSE, "\"reason\":\"busy\"") != null);
