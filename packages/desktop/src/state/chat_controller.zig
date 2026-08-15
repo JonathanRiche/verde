@@ -66,6 +66,10 @@ const CODEX_BACKGROUND_TASK_POLL_MAX_MS: i64 = 60_000;
 // Daemon tailing is synchronous IPC. Bounding it to Verde's active frame tier
 // preserves every display opportunity while avoiding duplicate RPCs in event bursts.
 const DAEMON_CHAT_POLL_INTERVAL_MS: i64 = 16;
+// Re-attached turns can carry megabytes of Cursor edit events. Ask the daemon
+// for bounded replay pages so one synchronous tail cannot exceed the IPC cap
+// or monopolize the render thread.
+const DAEMON_CHAT_TAIL_PAGE_BYTES: usize = 1024 * 1024;
 const OPENCODE_LOGO_BYTES = @embedFile("../assets/opencode-logo-dark.png");
 const CODEX_LOGO_BYTES = @embedFile("../assets/OpenAI-white-monoblossom.png");
 const CLAUDE_LOGO_BYTES = @embedFile("../assets/claude-logo.png");
@@ -2048,7 +2052,7 @@ pub fn startDaemonChatTurn(
         .thread_title = thread.title,
         .model_ref = if (thread.model_ref) |model_ref| model_ref else null,
         .reasoning_effort = if (thread.reasoning_effort) |effort| @tagName(effort) else null,
-        .opencode_reasoning_variant = if (thread.provider == .opencode) thread.opencode_reasoning_variant else null,
+        .opencode_reasoning_variant = daemonReasoningVariant(thread.provider, thread.opencode_reasoning_variant),
         .cursor_model_params_json = cursor_model_params_json,
         .fast_mode = thread.fast_mode == .on,
         .access_mode = @tagName(thread.access_mode),
@@ -2063,10 +2067,25 @@ pub fn daemonChatTurnExists(self: anytype, turn_id: []const u8) bool {
     const response = sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.tail", .{
         .turn_id = turn_id,
         .after_seq = 0,
+        .max_bytes = DAEMON_CHAT_TAIL_PAGE_BYTES,
     }, 2) catch return false;
     defer self.allocator.free(response);
     ensureJsonRpcOk(self.allocator, response) catch return false;
     return true;
+}
+
+fn daemonReasoningVariant(provider: Provider, variant: ?[:0]const u8) ?[:0]const u8 {
+    return switch (provider) {
+        .opencode, .cursor => variant,
+        .codex, .claude => null,
+    };
+}
+
+test "daemon turn preserves provider reasoning variants" {
+    try std.testing.expectEqualStrings("high", daemonReasoningVariant(.cursor, "high").?);
+    try std.testing.expectEqualStrings("high", daemonReasoningVariant(.opencode, "high").?);
+    try std.testing.expect(daemonReasoningVariant(.codex, "high") == null);
+    try std.testing.expect(daemonReasoningVariant(.claude, "high") == null);
 }
 
 pub fn cancelDaemonChatTurn(self: anytype, turn_id: []const u8) !void {
@@ -3350,6 +3369,7 @@ pub fn pollDaemonChatTurn(self: anytype, thread: *ChatThread) bool {
         .{
             .turn_id = owned_turn_id,
             .after_seq = after_seq,
+            .max_bytes = DAEMON_CHAT_TAIL_PAGE_BYTES,
         },
         2,
         response_buffer,
@@ -3452,6 +3472,28 @@ test "daemon tail hydrates the missing user row for externally started turns" {
     try std.testing.expectEqual(@as(usize, 1), state.dirty);
 }
 
+test "daemon tail cursor advances only after an event applies" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "retry event");
+    defer thread.deinit(allocator);
+    thread.send_state.status = .pending;
+    thread.send_state.daemon_owned = true;
+
+    const RejectState = struct {
+        allocator: std.mem.Allocator,
+        fn markDirty(_: *@This()) void {}
+        fn applyDaemonChatEventLocked(_: *@This(), _: *SendState, _: []const u8, _: []const u8) !void {
+            return error.TestEventRejected;
+        }
+    };
+    var state: RejectState = .{ .allocator = allocator };
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"status":"running","events":[{"seq":1,"kind":"diff","payload_json":"{}"}],"next_seq":2}}
+    ;
+    try std.testing.expectError(error.TestEventRejected, applyDaemonChatTurnTail(&state, &thread, response));
+    try std.testing.expectEqual(@as(u64, 0), thread.send_state.daemon_last_seq);
+}
+
 /// True when the thread transcript already carries a row with this durable
 /// identity (acceptance-staged user rows and adopted daemon rows both qualify).
 fn threadHasMessageId(thread: *const ChatThread, message_id: []const u8) bool {
@@ -3517,8 +3559,8 @@ pub fn applyDaemonChatTurnTail(self: anytype, thread: *ChatThread, response: []c
             const seq = jsonValueU64(event_value.object.get("seq") orelse .null) orelse continue;
             const kind = jsonValueString(event_value.object.get("kind") orelse .null) orelse continue;
             const payload_json = jsonValueString(event_value.object.get("payload_json") orelse .null) orelse "{}";
-            if (seq > send_state.daemon_last_seq) send_state.daemon_last_seq = seq;
             try self.applyDaemonChatEventLocked(send_state, kind, payload_json);
+            if (seq > send_state.daemon_last_seq) send_state.daemon_last_seq = seq;
             changed = true;
         }
     }
