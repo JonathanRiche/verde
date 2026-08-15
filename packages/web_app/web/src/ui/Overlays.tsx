@@ -7,7 +7,7 @@ const COMMANDS = [
   { id: 'new-thread', title: 'New chat thread', hint: 'Ctrl+T' },
   { id: 'new-terminal', title: 'New terminal split', hint: 'Ctrl+Alt+T' },
   { id: 'toggle-sidebar', title: 'Toggle sidebar', hint: 'Ctrl+S' },
-  { id: 'maximize', title: 'Maximize pane', hint: 'Alt+Z' },
+  { id: 'maximize', title: 'Zoom / unzoom pane', hint: 'Alt+Z' },
   { id: 'settings', title: 'Open settings', hint: 'Ctrl+,' },
 ]
 

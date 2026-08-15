@@ -4,7 +4,7 @@ import { marked } from 'marked'
 import { store } from '../lib/store'
 import { type LivePane, type Message } from '../lib/types'
 import { effortLabel, effortOptionsIn, modelOptionsFor, variantOptionsIn } from '../lib/models'
-import { ProviderGlyph } from './Icons'
+import { ProviderGlyph, ZoomButton } from './Icons'
 
 marked.setOptions({ gfm: true, breaks: true })
 
@@ -192,6 +192,7 @@ export function ChatPane(props: { pane: LivePane }) {
         <Show when={props.pane.send_pending}>
           <span class="text-[11px] tracking-wide text-[var(--accent)]">Working</span>
         </Show>
+        <ZoomButton pane={props.pane} />
       </header>
       <div
         class="min-h-0 flex-1 overflow-y-auto px-3 py-3 scrollbar-thin lg:px-5 lg:py-5"
