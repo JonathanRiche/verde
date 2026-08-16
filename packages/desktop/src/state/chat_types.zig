@@ -46,11 +46,17 @@ pub const TranscriptMarkdownBody = struct {
     render_cache_frame_text: std.ArrayList(u8),
     render_cache_text_arena: std.heap.ArenaAllocator,
     render_cache_key: ?TranscriptRenderCacheKey = null,
+    // Copy-button hits recorded while building the cache (origin-relative
+    // rects, payload offsets into `render_cache_frame_text`). Replay frames
+    // translate and re-register them so fenced-code messages stay
+    // replay-cache eligible instead of re-running markdown every frame.
+    render_cache_copy_buttons: std.ArrayList(chat_markdown.CodeCopyButtonSink) = .empty,
 
     pub fn deinit(self: *TranscriptMarkdownBody, allocator: std.mem.Allocator) void {
         self.render_cache.deinit(allocator);
         self.render_cache_frame_text.deinit(allocator);
         self.render_cache_text_arena.deinit();
+        self.render_cache_copy_buttons.deinit(allocator);
         self.view.deinit(allocator);
         allocator.free(self.owned_body);
         allocator.destroy(self);
@@ -90,6 +96,9 @@ pub const ChatMessage = struct {
     /// terminal. Null until an identity is known; persistence carries it
     /// verbatim so flushes never rewrite daemon-committed identities.
     message_id: ?[]const u8 = null,
+    /// UI-only entrance timestamp for a card appended by a live stream. It is
+    /// intentionally absent from persistence and defaults to fully presented.
+    transcript_card_started_ms: i64 = 0,
 };
 
 pub const ChatImageAttachment = struct {
@@ -326,6 +335,16 @@ pub const ChatThread = struct {
         self.send_state.mutex.lock();
         defer self.send_state.mutex.unlock();
         return self.send_state.status == .pending;
+    }
+
+    /// True while the async chat.turn.start acceptance receipt is still in
+    /// flight for this thread's pending send (7.5). Follow-up queueing and
+    /// steer/stop issuance defer on this so the still-staged composer draft
+    /// cannot be double-sent before acceptance commits.
+    pub fn isSendAcceptancePending(self: *const ChatThread) bool {
+        self.send_state.mutex.lock();
+        defer self.send_state.mutex.unlock();
+        return self.send_state.status == .pending and self.send_state.acceptance_pending;
     }
 
     pub fn isSendPendingForUi(self: *const ChatThread) bool {
@@ -738,12 +757,30 @@ pub const SendState = struct {
     daemon_turn_id: ?[]u8 = null,
     daemon_last_seq: u64 = 0,
     daemon_last_poll_ms: i64 = -1,
+    /// Extra delay before the next chat.turn.tail poll, derived from the last
+    /// round trip's measured cost. The tail RPC blocks the render thread, so
+    /// a slow/overloaded daemon must not be re-polled 16ms later — that turns
+    /// daemon latency into back-to-back frame stalls. Overwritten after every
+    /// poll; 0 while the daemon answers fast.
+    daemon_poll_backoff_ms: i64 = 0,
     daemon_owned: bool = false,
+    /// True from submit until the async chat.turn.start acceptance receipt
+    /// commits (M4-P3 semantics preserved off the event thread). While set:
+    /// the draft stays in the composer, tail polling and steer/stop issuance
+    /// are deferred, and follow-up queueing of the still-staged draft is
+    /// blocked so acceptance cannot double-send the same prompt.
+    acceptance_pending: bool = false,
     /// Consecutive chat.turn.tail failures while daemon-owned (Amendment-2 F5).
     /// Resets on a successful apply; thresholds to a visible failed send so the
     /// GUI does not spin forever after a mid-turn daemon crash/restart.
     daemon_tail_fail_count: u8 = 0,
     partial_text: std.ArrayListUnmanaged(u8) = .empty,
+    /// Memoized measured height of the in-flight streamed assistant body.
+    /// `partial_text` is append-only within a turn, so the paired key (length,
+    /// width, variant, turn identity) fully discriminates. Guarded by `mutex`;
+    /// avoids an O(stream-length) re-measure on every frame. -1 = unmeasured.
+    stream_measured_height: f32 = -1.0,
+    stream_measured_key: u64 = 0,
     /// True while the provider reports an active content-less reasoning item.
     /// Surfaced as "Thinking - mm:ss" in the pending stream header rather
     /// than as a transcript tool row.
@@ -809,6 +846,30 @@ pub const PendingApproval = struct {
     title: []u8,
     body: []u8,
 };
+
+/// Composer snapshots (queued follow-up pin, approval card) cached across
+/// frames keyed on the owning send-state identity plus its ui_revision, so
+/// steady-state rendering stops re-duplicating and freeing them every frame.
+pub const PendingUiSnapshotCache = struct {
+    followup_send_state: usize = 0,
+    followup_revision: u64 = 0,
+    followup_valid: bool = false,
+    followup: ?PendingFollowup = null,
+    approval_send_state: usize = 0,
+    approval_revision: u64 = 0,
+    approval_valid: bool = false,
+    approval: ?PendingApproval = null,
+
+    pub fn deinit(self: *PendingUiSnapshotCache, allocator: std.mem.Allocator) void {
+        if (self.followup) |*followup| followup.deinit(allocator);
+        if (self.approval) |*approval| {
+            allocator.free(approval.call_id);
+            allocator.free(approval.title);
+            allocator.free(approval.body);
+        }
+        self.* = .{};
+    }
+};
 pub const PendingDiffFile = struct {
     path: []u8,
     additions: i64,
@@ -820,7 +881,7 @@ pub const PendingTimelineEvent = struct {
     role: ChatRole,
     author: []u8,
     body: []u8,
-    /// GUI-authored timeline rows, such as an accepted Codex steer, retain
+    /// GUI-authored timeline rows, such as an accepted provider steer, retain
     /// the attachments that were submitted alongside their text.
     images: std.ArrayList(ChatImageAttachment) = .empty,
     /// Daemon payload identity when the event carried one (`message` events);
@@ -835,6 +896,15 @@ pub const PendingTimelineEvent = struct {
     tool_call_error: ?[]u8 = null,
     tool_call_locations: ?[]u8 = null,
     tool_call_raw: ?[]u8 = null,
+    /// Carries the card entrance across pending-to-committed promotion.
+    transcript_card_started_ms: i64 = 0,
+    /// Memoized measured transcript row height (whole-group height when this
+    /// event opens a tool-call group), paired with the key that produced it.
+    /// Long tool-heavy turns otherwise re-measure every pending body twice per
+    /// frame, so frame cost scales with turn size. Guarded by SendState.mutex;
+    /// written only by the chat panel's pending-stream walkers. -1 = unmeasured.
+    measured_row_height: f32 = -1.0,
+    measured_row_key: u64 = 0,
 
     pub fn deinit(self: *PendingTimelineEvent, allocator: std.mem.Allocator) void {
         allocator.free(self.author);

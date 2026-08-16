@@ -607,7 +607,12 @@ fn mainInner(init: std.process.Init) !void {
         var background_tasks_need_render = false;
         recordSpan(&frame_sample, .poll_background_tasks, struct {
             fn run(app_state: *AppState, changed: *bool) void {
-                changed.* = app_state.pollBackgroundTasks();
+                const tasks_changed = app_state.pollBackgroundTasks();
+                // Commit any completed async transcript-page load before this
+                // frame renders so prepended history appears with its anchor
+                // rebased in the same frame.
+                const hydration_changed = app_state.pollTranscriptHydration();
+                changed.* = tasks_changed or hydration_changed;
             }
         }.run, .{ &state, &background_tasks_need_render });
         var browser_needs_render = false;
@@ -1620,10 +1625,10 @@ fn activeContinuousFrames(state: *AppState) bool {
     return state.isPickerPending() or
         state.lifecycle.persistenceNeedsFrames(platform_runtime.unixTimestampMs()) or
         currentTranscriptLayoutNeedsFrames(state) or
+        state.transcriptTransitionNeedsContinuousFrames(platform_runtime.unixTimestampMs()) or
         state.transcriptMarkdownSelectionDragging() or
         workspace_panes_ui.isFocusAnimating() or
         workspace_panes_ui.isScrollAnimating() or
-        workspace_panes_ui.isPaneStatusAnimating() or
         ui_layout.isSidebarAnimating() or
         // Run-config stepper thumbs slide for ~160ms after a selection.
         state.runConfigStepperAnimating() or
@@ -1646,9 +1651,46 @@ fn currentTranscriptLayoutNeedsFrames(state: *const AppState) bool {
 }
 
 fn continuousFrameIntervalMs(state: *AppState) i64 {
-    if (activeContinuousFrames(state)) return ACTIVE_WAIT_TIMEOUT_MS;
+    return continuousFrameIntervalForActivity(pacingActivity(state));
+}
+
+// Sampled per-loop activity flags feeding tier selection. A plain struct so
+// the pacing matrix is unit-testable without constructing an AppState.
+const PacingActivity = struct {
+    active_continuous: bool = false,
+    sidebar_pulse: bool = false,
+    pane_status_animating: bool = false,
+    browser_visible: bool = false,
+    terminal_burst: bool = false,
+    pending_send: bool = false,
+    pending_slash_command: bool = false,
+    background_tasks: bool = false,
+};
+
+fn pacingActivity(state: *AppState) PacingActivity {
+    return .{
+        .active_continuous = activeContinuousFrames(state),
+        .sidebar_pulse = state.sidebar_pulse_animating,
+        .pane_status_animating = workspace_panes_ui.isPaneStatusAnimating(),
+        .browser_visible = state.isBrowserVisible(),
+        .terminal_burst = state.terminalActivityBurstActive(),
+        .pending_send = state.pendingSendCount() > 0,
+        .pending_slash_command = state.hasPendingSlashCommand(),
+        .background_tasks = state.hasRunningBackgroundTasks(),
+    };
+}
+
+fn continuousFrameIntervalForActivity(activity: PacingActivity) i64 {
+    if (activity.active_continuous) return ACTIVE_WAIT_TIMEOUT_MS;
     // These long-lived indicators retain their existing smooth ~30fps tier.
-    if (state.sidebar_pulse_animating or state.pendingSendCount() > 0 or state.hasPendingSlashCommand()) {
+    // Pane status borders are pure clock math (workspace_panes.zig) and look
+    // identical at ~30fps, so they must not escalate to the 16ms tier — that
+    // inversion forced ~60fps full-root rebuilds for the life of a working
+    // pane. Pending sends without visible activity are intentionally absent:
+    // work that is only on a background workspace steps its pip at the ~1Hz
+    // pollSend repaint, while eventWaitBaseTimeoutMs keeps the 33ms wake for
+    // daemon-turn polling and streamed deltas.
+    if (activity.sidebar_pulse or activity.pane_status_animating or activity.pending_slash_command) {
         return PIP_PULSE_WAIT_TIMEOUT_MS;
     }
     return 0;
@@ -1665,18 +1707,27 @@ fn eventWaitTimeoutMs(
 }
 
 fn eventWaitBaseTimeoutMs(state: *AppState) c_int {
-    if (activeContinuousFrames(state) or state.isBrowserRuntimeActive()) return ACTIVE_WAIT_TIMEOUT_MS;
+    return eventWaitBaseTimeoutForActivity(pacingActivity(state));
+}
+
+fn eventWaitBaseTimeoutForActivity(activity: PacingActivity) c_int {
+    // A browser pane in the *current* workspace keeps the display-rate wake so
+    // frame latency does not regress; a runtime owned by a background
+    // workspace pushes loop_wakeup on new frames (linux_wpe.zig) and must not
+    // pin the 16ms wake globally.
+    if (activity.active_continuous or activity.browser_visible) return ACTIVE_WAIT_TIMEOUT_MS;
     // Terminal output only reaches the screen when the loop wakes and polls
     // (daemon sessions tail over an RPC; there is no fd to push a wake from).
     // Recent input starts the same display-rate window before ConPTY has an
     // echo ready, while output extends it for continuously redrawing TUIs.
-    if (state.terminalActivityBurstActive()) return ACTIVE_WAIT_TIMEOUT_MS;
-    if (state.sidebar_pulse_animating) return PIP_PULSE_WAIT_TIMEOUT_MS;
-    // Pending turns own visible activity motion as well as the wall-clock
-    // "Working" label, so they share the sidebar pip's 30fps cadence.
-    if (state.pendingSendCount() > 0) return PENDING_SEND_WAIT_TIMEOUT_MS;
-    if (state.hasPendingSlashCommand()) return SLASH_COMMAND_ANIMATION_WAIT_TIMEOUT_MS;
-    if (state.hasRunningBackgroundTasks()) return BACKGROUND_TASK_WAIT_TIMEOUT_MS;
+    if (activity.terminal_burst) return ACTIVE_WAIT_TIMEOUT_MS;
+    if (activity.sidebar_pulse or activity.pane_status_animating) return PIP_PULSE_WAIT_TIMEOUT_MS;
+    // Pending turns keep the 30fps wake even without visible activity: daemon
+    // -owned turns are pull-based (pollDaemonChatTurn), so this cadence is the
+    // streaming latency floor, and pollSend's ~1Hz label repaint rides on it.
+    if (activity.pending_send) return PENDING_SEND_WAIT_TIMEOUT_MS;
+    if (activity.pending_slash_command) return SLASH_COMMAND_ANIMATION_WAIT_TIMEOUT_MS;
+    if (activity.background_tasks) return BACKGROUND_TASK_WAIT_TIMEOUT_MS;
     return IDLE_WAIT_TIMEOUT_MS;
 }
 
@@ -3068,6 +3119,32 @@ test "linux WM close remains actionable for every presentation state" {
     try std.testing.expect(linuxWindowFlagsPermitWmClose(true, true, false, false, false));
     try std.testing.expect(linuxWindowFlagsPermitWmClose(false, false, false, false, false));
     try std.testing.expect(linuxWindowFlagsPermitWmClose(false, false, true, true, true));
+}
+
+test "frame pacing tiers pace status pulses at 30fps and idle background sends" {
+    // Tier inversion fix: a status-animating pane paces the 33ms pip tier,
+    // never the 16ms active tier. This must be a *continuous* interval, not
+    // only a wake timeout — a wake timeout bounds event-wait latency but
+    // guarantees no repaint cadence, which visibly freezes the pulse.
+    try std.testing.expectEqual(@as(i64, PIP_PULSE_WAIT_TIMEOUT_MS), continuousFrameIntervalForActivity(.{ .pane_status_animating = true }));
+    try std.testing.expectEqual(@as(c_int, PIP_PULSE_WAIT_TIMEOUT_MS), eventWaitBaseTimeoutForActivity(.{ .pane_status_animating = true }));
+    // The same working pane in a non-visible workspace (or with reduced
+    // motion on) never sets pane_status_animating — workspace_panes.zig only
+    // arms it while rendering a visible, motion-enabled pane — so background
+    // work must not pin continuous rendering: a pending send alone renders
+    // event-driven, but keeps the 30fps wake because daemon-owned turns
+    // stream by polling on loop wakes.
+    try std.testing.expectEqual(@as(i64, 0), continuousFrameIntervalForActivity(.{ .pending_send = true }));
+    try std.testing.expectEqual(@as(i64, 0), continuousFrameIntervalForActivity(.{ .pending_send = true, .background_tasks = true }));
+    try std.testing.expectEqual(@as(c_int, PENDING_SEND_WAIT_TIMEOUT_MS), eventWaitBaseTimeoutForActivity(.{ .pending_send = true }));
+    // A pulsing pip on the current workspace still animates continuously.
+    try std.testing.expectEqual(@as(i64, PIP_PULSE_WAIT_TIMEOUT_MS), continuousFrameIntervalForActivity(.{ .sidebar_pulse = true, .pending_send = true }));
+    // The browser pins the display-rate wake only when it is in the current
+    // workspace; elsewhere new frames arrive by loop_wakeup push.
+    try std.testing.expectEqual(@as(c_int, ACTIVE_WAIT_TIMEOUT_MS), eventWaitBaseTimeoutForActivity(.{ .browser_visible = true }));
+    try std.testing.expectEqual(@as(c_int, IDLE_WAIT_TIMEOUT_MS), eventWaitBaseTimeoutForActivity(.{}));
+    // Active continuous animations (focus flash, sidebar slide, …) keep 16ms.
+    try std.testing.expectEqual(@as(i64, ACTIVE_WAIT_TIMEOUT_MS), continuousFrameIntervalForActivity(.{ .active_continuous = true }));
 }
 
 fn macosHostWindowRequestedClose(window: *sdl.Window, state: *AppState) bool {

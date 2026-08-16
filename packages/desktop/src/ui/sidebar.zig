@@ -19,11 +19,13 @@ const SurfaceProvider = native_state.SurfaceProvider;
 const log = std.log.scoped(.native_ui_sidebar);
 
 /// Shared ~1.6s breathing pulse (0.35..1.0) for working/waiting pips and badges.
-/// Marks the frame as hosting an active pip animation so the main loop keeps
-/// a ~30fps tick going; without it the loop sleeps between sends' 1Hz label
-/// updates and the pulse visibly steps.
-fn attentionPulse(state: *runtime.AppState) f32 {
-    state.sidebar_pulse_animating = true;
+/// Only pips belonging to the selected workspace mark the frame as hosting an
+/// active pip animation (the main loop's ~30fps tick); background-workspace
+/// pips draw the same clock-driven pulse but deliberately step at the ~1Hz
+/// pollSend repaint instead of forcing continuous frames app-wide.
+fn attentionPulse(state: *runtime.AppState, project_index: usize) f32 {
+    if (state.app_config.reduced_motion) return 1.0;
+    if (project_index == state.project_controller.selected_index) state.sidebar_pulse_animating = true;
     return 0.35 + 0.65 * theme.activityPulse(profiler.nowNs());
 }
 
@@ -1457,7 +1459,7 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
         // Attention badge tucked into the top-right corner, kept fully inside the
         // narrow rail so it doesn't clip against the panel edge.
         if (workspace_shortcut.len == 0) if (workspaceStatusColor(state, project_index)) |badge| {
-            const pulse = attentionPulse(state);
+            const pulse = attentionPulse(state, project_index);
             const badge_d = theme.scaledUi(8.0);
             queuePaletteRoundedRect(state, .{
                 .x = avatar_rect.x + avatar - badge_d - theme.scaledUi(2.0),
@@ -1714,7 +1716,7 @@ fn collapsedPaneIndicator(
             const animated = running or (if (status) |s| s == .waiting else false);
             return .{
                 .color = status_color,
-                .opacity = if (animated) attentionPulse(state) else 1.0,
+                .opacity = if (animated) attentionPulse(state, project_index) else 1.0,
             };
         }
     }
@@ -1965,7 +1967,7 @@ fn renderOpenPaneRow(
         renderSidebarShortcutKeyTip(state, rect, clip, shortcut_label);
     } else if (paneStatusColor(status, running)) |pip_color| {
         const animated = running or (if (status) |s| s == .working or s == .waiting else false);
-        const pulse: f32 = if (animated) attentionPulse(state) else 1.0;
+        const pulse: f32 = if (animated) attentionPulse(state, project_index) else 1.0;
         const dot = theme.scaledUi(6.0);
         const status_font = theme.scaledUi(11.0);
         // Approximate right-alignment with the same per-char width heuristic

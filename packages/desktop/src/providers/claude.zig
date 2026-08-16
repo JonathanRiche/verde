@@ -11,6 +11,7 @@ const runtime_log = @import("../runtime/log.zig");
 
 const MAX_BRIDGE_LINE_BYTES = 8 * 1024 * 1024;
 const BRIDGE_STOP_POLL_MS = 20;
+const BRIDGE_STEER_RESPONSE_WAIT_MS = 500;
 
 const Mutex = struct {
     inner: std.atomic.Mutex = .unlocked,
@@ -24,9 +25,18 @@ const Mutex = struct {
     }
 };
 
+const ActiveBridge = struct {
+    child: ?*platform_process.OwnedChild = null,
+    thread_id: ?[]u8 = null,
+    pending_steer_request_id: ?u64 = null,
+    steer_response_request_id: ?u64 = null,
+    steer_response_accepted: bool = false,
+};
+
 const ActiveProcessState = struct {
     mutex: Mutex = .{},
-    child: ?*platform_process.OwnedChild = null,
+    bridges: std.ArrayListUnmanaged(ActiveBridge) = .empty,
+    next_steer_request_id: u64 = 1,
 };
 
 var active_process_state: ActiveProcessState = .{};
@@ -338,18 +348,76 @@ pub const Client = struct {
 
     pub fn interruptThread(self: *Client, request: provider_types.InterruptThreadRequest) !void {
         _ = self;
-        _ = request;
         active_process_state.mutex.lock();
         defer active_process_state.mutex.unlock();
-
-        const child = active_process_state.child orelse return;
+        const index = activeBridgeIndexForThreadLocked(request.thread_id) orelse return;
+        const child = active_process_state.bridges.items[index].child orelse return;
         child.terminateTree();
     }
 
     pub fn steerThread(self: *Client, request: provider_types.SteerThreadRequest) !void {
-        _ = self;
-        _ = request;
-        return error.UnsupportedOperation;
+        active_process_state.mutex.lock();
+        const bridge_index = activeBridgeIndexForThreadLocked(request.thread_id) orelse {
+            active_process_state.mutex.unlock();
+            return error.ClaudeActiveTurnNotSteerable;
+        };
+        const bridge = &active_process_state.bridges.items[bridge_index];
+        const child = bridge.child orelse {
+            active_process_state.mutex.unlock();
+            return error.ClaudeActiveTurnNotSteerable;
+        };
+        if (bridge.pending_steer_request_id != null) {
+            active_process_state.mutex.unlock();
+            return error.ClaudeSteerAlreadyPending;
+        }
+        const stdin = child.child.stdin orelse {
+            active_process_state.mutex.unlock();
+            return error.ClaudeActiveTurnNotSteerable;
+        };
+        const request_id = active_process_state.next_steer_request_id;
+        active_process_state.next_steer_request_id +%= 1;
+        if (active_process_state.next_steer_request_id == 0) active_process_state.next_steer_request_id = 1;
+        bridge.pending_steer_request_id = request_id;
+        bridge.steer_response_request_id = null;
+        writeJsonLine(self.allocator, stdin, .{
+            .type = "steer_prompt",
+            .request_id = request_id,
+            .prompt = request.prompt,
+            .images = request.images,
+        }) catch |err| {
+            bridge.pending_steer_request_id = null;
+            active_process_state.mutex.unlock();
+            return err;
+        };
+        active_process_state.mutex.unlock();
+
+        var waited_ms: usize = 0;
+        while (waited_ms < BRIDGE_STEER_RESPONSE_WAIT_MS) : (waited_ms += 1) {
+            active_process_state.mutex.lock();
+            const current_index = activeBridgeIndexForChildLocked(child) orelse {
+                active_process_state.mutex.unlock();
+                return error.ClaudeActiveTurnNotSteerable;
+            };
+            const current = &active_process_state.bridges.items[current_index];
+            if (current.steer_response_request_id == request_id) {
+                const accepted = current.steer_response_accepted;
+                current.pending_steer_request_id = null;
+                current.steer_response_request_id = null;
+                active_process_state.mutex.unlock();
+                if (!accepted) return error.ClaudeActiveTurnNotSteerable;
+                return;
+            }
+            active_process_state.mutex.unlock();
+            platform_runtime.sleepMillis(1);
+        }
+
+        active_process_state.mutex.lock();
+        if (activeBridgeIndexForChildLocked(child)) |current_index| {
+            const current = &active_process_state.bridges.items[current_index];
+            if (current.pending_steer_request_id == request_id) current.pending_steer_request_id = null;
+        }
+        active_process_state.mutex.unlock();
+        return error.ClaudeSteerResponseTimeout;
     }
 
     fn runBridge(self: *Client, payload: anytype, stream_request: ?provider_types.SendPromptRequest) !BridgeResponse {
@@ -374,7 +442,7 @@ pub const Client = struct {
             .environ_map = &env_map,
         });
         errdefer child.kill(threaded.io());
-        registerActiveChild(&child);
+        try registerActiveChild(&child, if (stream_request) |request| request.thread_id else null);
         defer unregisterActiveChild(&child);
         var stop_monitor: BridgeStopMonitor = .{
             .request = stream_request,
@@ -385,7 +453,7 @@ pub const Client = struct {
         defer stop_monitor.finish();
 
         try writeJsonLine(self.allocator, child.child.stdin.?, payload);
-        const keep_stdin_open = if (stream_request) |request| request.on_approval_request != null else false;
+        const keep_stdin_open = stream_request != null;
         if (!keep_stdin_open) {
             child.child.stdin.?.close(threaded.io());
             child.child.stdin = null;
@@ -405,7 +473,7 @@ pub const Client = struct {
             defer self.allocator.free(maybe_line.?);
             const line = std.mem.trimEnd(u8, maybe_line.?, "\r");
             if (line.len == 0) continue;
-            try self.handleBridgeLine(line, stream_request, child.child.stdin, &response);
+            try self.handleBridgeLine(line, stream_request, child.child.stdin, &child, &response);
         }
 
         // Stop exposing the pointer before wait closes its platform handles.
@@ -444,6 +512,7 @@ pub const Client = struct {
         line: []const u8,
         stream_request: ?provider_types.SendPromptRequest,
         stdin: ?std.Io.File,
+        child: *platform_process.OwnedChild,
         response: *BridgeResponse,
     ) !void {
         if (line.len > MAX_BRIDGE_LINE_BYTES) return error.ClaudeMessageTooLarge;
@@ -457,12 +526,24 @@ pub const Client = struct {
             return;
         }
         if (std.mem.eql(u8, kind, "thread_id")) {
-            if (stream_request) |request| {
-                if (request.on_thread_id) |on_thread_id| {
-                    if (getOptionalObjectString(parsed.value, "thread_id")) |thread_id| {
+            if (getOptionalObjectString(parsed.value, "thread_id")) |thread_id| {
+                setActiveThreadId(child, thread_id);
+                if (stream_request) |request| {
+                    if (request.on_thread_id) |on_thread_id| {
                         on_thread_id(request.stream_context, thread_id);
                     }
                 }
+            }
+            parsed.deinit();
+            return;
+        }
+        if (std.mem.eql(u8, kind, "steer_response")) {
+            const request_id = getOptionalObjectInt(parsed.value, "request_id") orelse {
+                parsed.deinit();
+                return;
+            };
+            if (request_id >= 0) {
+                recordSteerResponse(child, @intCast(request_id), getOptionalObjectBool(parsed.value, "accepted") orelse false);
             }
             parsed.deinit();
             return;
@@ -543,7 +624,9 @@ pub const Client = struct {
 pub fn shutdownOwnedServer() void {
     active_process_state.mutex.lock();
     defer active_process_state.mutex.unlock();
-    if (active_process_state.child) |child| child.terminateTree();
+    for (active_process_state.bridges.items) |bridge| {
+        if (bridge.child) |child| child.terminateTree();
+    }
 }
 
 fn takeBridgeLineAlloc(allocator: std.mem.Allocator, reader: *std.Io.Reader) !?[]u8 {
@@ -567,18 +650,62 @@ fn takeBridgeLineAlloc(allocator: std.mem.Allocator, reader: *std.Io.Reader) !?[
     return try writer.toOwnedSlice();
 }
 
-fn registerActiveChild(child: *platform_process.OwnedChild) void {
+fn registerActiveChild(child: *platform_process.OwnedChild, thread_id: ?[]const u8) !void {
     active_process_state.mutex.lock();
     defer active_process_state.mutex.unlock();
-    active_process_state.child = child;
+    const owned_thread_id = if (thread_id) |value| try std.heap.page_allocator.dupe(u8, value) else null;
+    errdefer if (owned_thread_id) |value| std.heap.page_allocator.free(value);
+    try active_process_state.bridges.append(std.heap.page_allocator, .{
+        .child = child,
+        .thread_id = owned_thread_id,
+    });
 }
 
 fn unregisterActiveChild(child: *platform_process.OwnedChild) void {
     active_process_state.mutex.lock();
     defer active_process_state.mutex.unlock();
-    if (active_process_state.child == child) {
-        active_process_state.child = null;
+    const index = activeBridgeIndexForChildLocked(child) orelse return;
+    const bridge = active_process_state.bridges.swapRemove(index);
+    if (bridge.thread_id) |thread_id| std.heap.page_allocator.free(thread_id);
+}
+
+fn activeBridgeIndexForChildLocked(child: *platform_process.OwnedChild) ?usize {
+    for (active_process_state.bridges.items, 0..) |bridge, index| {
+        if (bridge.child == child) return index;
     }
+    return null;
+}
+
+fn activeBridgeIndexForThreadLocked(thread_id: []const u8) ?usize {
+    for (active_process_state.bridges.items, 0..) |bridge, index| {
+        if (bridge.thread_id) |active_thread_id| {
+            if (std.mem.eql(u8, active_thread_id, thread_id)) return index;
+        }
+    }
+    return null;
+}
+
+fn setActiveThreadId(child: *platform_process.OwnedChild, thread_id: []const u8) void {
+    active_process_state.mutex.lock();
+    defer active_process_state.mutex.unlock();
+    const owned = std.heap.page_allocator.dupe(u8, thread_id) catch return;
+    const index = activeBridgeIndexForChildLocked(child) orelse {
+        std.heap.page_allocator.free(owned);
+        return;
+    };
+    const bridge = &active_process_state.bridges.items[index];
+    if (bridge.thread_id) |old| std.heap.page_allocator.free(old);
+    bridge.thread_id = owned;
+}
+
+fn recordSteerResponse(child: *platform_process.OwnedChild, request_id: u64, accepted: bool) void {
+    active_process_state.mutex.lock();
+    defer active_process_state.mutex.unlock();
+    const index = activeBridgeIndexForChildLocked(child) orelse return;
+    const bridge = &active_process_state.bridges.items[index];
+    if (bridge.pending_steer_request_id != request_id) return;
+    bridge.steer_response_request_id = request_id;
+    bridge.steer_response_accepted = accepted;
 }
 
 const BridgeResponse = struct {
@@ -1114,6 +1241,8 @@ test "Claude bridge keeps explicitly backgrounded tools alive for auto continuat
     const source = @embedFile("provider_bridge.ts");
     try std.testing.expect(std.mem.indexOf(u8, source, "item?.input?.run_in_background === true") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "if (alreadyBackgrounded) return;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "prompt: claudePromptStream(await buildClaudePrompt(request), inputDone)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "prompt: promptChannel.messages()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "message?.type === \"steer_prompt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "activeClaudePromptChannel?.push(prompt, \"next\")") != null);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source, "query.close()"));
 }

@@ -20,6 +20,8 @@ const MUTATING_METHODS = [_][]const u8{
     "session.cleanup",
     "chat.turn.start",
     "chat.turn.approve",
+    "chat.turn.steer",
+    "chat.followup",
     "chat.turn.cancel",
     "chat.turn.consume",
     // Registry mutations.
@@ -37,6 +39,7 @@ const MUTATING_METHODS = [_][]const u8{
     "state.snapshot.replace",
     "workspace.upsert",
     "chat.thread.upsert",
+    "chat.draft.set",
     "chat.message.append",
     "surface.upsert",
     "surface.clear",
@@ -268,6 +271,8 @@ test "shared mutator table pins the current sessionizer methods" {
         "session.cleanup",
         "chat.turn.start",
         "chat.turn.approve",
+        "chat.turn.steer",
+        "chat.followup",
         "chat.turn.cancel",
         "chat.turn.consume",
     };
@@ -323,6 +328,7 @@ test "reads are not mutators and store mutators drain" {
         "state.snapshot.replace",
         "workspace.upsert",
         "chat.thread.upsert",
+        "chat.draft.set",
         "chat.message.append",
         "surface.upsert",
         "surface.clear",

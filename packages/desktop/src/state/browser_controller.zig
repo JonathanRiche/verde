@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const sdl = @import("zsdl3");
+const app_config = @import("../app/config.zig");
 const browser_inspector = @import("../browser/inspector.zig");
 const browser_runtime = @import("../browser/mod.zig");
 const browser_screenshot = @import("../browser/screenshot.zig");
@@ -1713,7 +1714,7 @@ pub fn handleBrowserMouse(self: anytype, event: browser_runtime.MouseEvent) bool
     const uses_scaled_wpe_texture = runtime == .native_webview and presentation == .offscreen_texture and self.browserPaneDeviceScale() > 1.0;
     pane_event.x = browserPointerCoordinate(event.x - self.browser_controller.pane_min[0], displayed_width, input_width, uses_scaled_wpe_texture);
     pane_event.y = browserPointerCoordinate(event.y - self.browser_controller.pane_min[1], displayed_height, input_height, uses_scaled_wpe_texture);
-    pane_event.wheel_multiplier = browserWheelMultiplier(self.app_config.browser_fast_scrolling_enabled);
+    pane_event.wheel_multiplier = browserWheelMultiplier(self.app_config.browser_scroll_speed);
 
     const handled = self.browser_controller.runtime.controller.handleMouse(pane_event) catch |err| {
         log.warn("failed to forward browser mouse input: {s}", .{@errorName(err)});
@@ -1743,8 +1744,8 @@ fn browserAutomationPointerCoordinate(logical: f32, device_scale: f32) f32 {
     return logical * device_scale;
 }
 
-fn browserWheelMultiplier(fast_scrolling_enabled: bool) f32 {
-    return if (fast_scrolling_enabled) 1.5 else 1.0;
+fn browserWheelMultiplier(scroll_speed: f32) f32 {
+    return std.math.clamp(scroll_speed, app_config.MIN_BROWSER_SCROLL_SPEED, app_config.MAX_BROWSER_SCROLL_SPEED);
 }
 
 /// Forwards browser-pane keyboard and text input when the pane owns focus.
@@ -3451,9 +3452,10 @@ pub fn isInspectorPromptChangedMessage(message: []const u8) bool {
     return std.mem.indexOf(u8, message, "\"type\":\"prompt:changed\"") != null;
 }
 
-test "browser fast scrolling uses a separate wheel multiplier" {
-    try std.testing.expectEqual(@as(f32, 1.0), browserWheelMultiplier(false));
-    try std.testing.expectEqual(@as(f32, 1.5), browserWheelMultiplier(true));
+test "browser wheel multiplier follows configured scroll speed" {
+    try std.testing.expectEqual(@as(f32, 1.0), browserWheelMultiplier(0.5));
+    try std.testing.expectEqual(@as(f32, 2.5), browserWheelMultiplier(2.5));
+    try std.testing.expectEqual(@as(f32, 5.0), browserWheelMultiplier(8.0));
 }
 
 test "scaled WPE pointer coordinates stay in physical pane space" {

@@ -129,6 +129,9 @@ Config supports UI and terminal font size, scrolling-pane activation and spacing
   "open": {
     "default": "editor"
   },
+  "browser": {
+    "scroll_speed": 2.5
+  },
   "keybinds": {
     "refresh": ["CommandOrControl+Shift+R", "Ctrl+Shift+R", "F5"],
     "open": "Alt+O",

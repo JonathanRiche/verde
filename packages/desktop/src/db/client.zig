@@ -56,6 +56,11 @@ var in_process_write_mutex: InProcessWriteMutex = .{};
 
 pub const STATE_DB_NAME = "state.sqlite";
 pub const TRANSCRIPT_MESSAGE_PAGE_SIZE: usize = 256;
+/// First page for a cold thread: enough rows to fill a tall viewport of
+/// compact rows, so opening a large historical thread materializes what the
+/// user can see instead of a blocking bulk page. Follow-up pages use
+/// TRANSCRIPT_MESSAGE_PAGE_SIZE.
+pub const TRANSCRIPT_FIRST_PAGE_SIZE: usize = 48;
 
 const ThreadMessages = struct {
     offset: usize,
@@ -128,14 +133,16 @@ pub const Client = struct {
         return self.loadSnapshot(backing_allocator, NoopLoadHook{}, false);
     }
 
-    /// Load the page immediately preceding `before_offset` for one durable
-    /// thread. The caller owns the returned arena.
+    /// Load the page of at most `limit` rows immediately preceding
+    /// `before_offset` for one durable thread. The caller owns the returned
+    /// arena.
     pub fn loadMessagePage(
         self: *const Self,
         backing_allocator: std.mem.Allocator,
         workspace_id: []const u8,
         local_thread_id: []const u8,
         before_offset: usize,
+        limit: usize,
     ) !db_types.LoadedMessagePage {
         var arena = std.heap.ArenaAllocator.init(backing_allocator);
         errdefer arena.deinit();
@@ -151,7 +158,7 @@ pub const Client = struct {
             allocator,
             row.int(0),
             before_offset,
-            TRANSCRIPT_MESSAGE_PAGE_SIZE,
+            limit,
         );
         return .{ .arena = arena, .offset = page.offset, .messages = page.messages };
     }
@@ -525,6 +532,18 @@ pub const Client = struct {
         return try completions.toOwnedSlice(allocator);
     }
 
+    /// Probe for an additive column so a projection written by an older,
+    /// not-yet-migrated daemon still loads (mirrors the message_id probe).
+    fn hasColumn(self: *const Self, comptime table: []const u8, comptime column: []const u8) bool {
+        const probe = self.conn.row(
+            "select 1 from pragma_table_info('" ++ table ++ "') where name = '" ++ column ++ "'",
+            .{},
+        ) catch return false;
+        const row = probe orelse return false;
+        row.deinit();
+        return true;
+    }
+
     fn loadThreads(
         self: *const Self,
         allocator: std.mem.Allocator,
@@ -534,9 +553,14 @@ pub const Client = struct {
         var threads: std.ArrayList(PersistedThread) = .empty;
         defer threads.deinit(allocator);
 
+        const has_draft_images = self.hasColumn("threads", "draft_images_json");
         var thread_rows = try self.conn.rows(
-            "select id, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size " ++
-                "from threads where workspace_id = ?1 order by sort_index",
+            if (has_draft_images)
+                "select id, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json " ++
+                    "from threads where workspace_id = ?1 order by sort_index"
+            else
+                "select id, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size, null " ++
+                    "from threads where workspace_id = ?1 order by sort_index",
             .{project_id},
         );
         defer thread_rows.deinit();
@@ -571,6 +595,7 @@ pub const Client = struct {
                     thread_row.nullableText(17),
                     thread_row.nullableInt(18),
                 ),
+                .draft_extra_images = try loadExtraImages(allocator, thread_row.nullableText(19)),
                 .message_offset = loaded_messages.offset,
                 .messages = loaded_messages.messages,
             });
@@ -612,12 +637,16 @@ pub const Client = struct {
             row.deinit();
             break :blk true;
         };
+        const has_extra_images = self.hasColumn("messages", "extra_images_json");
         var message_rows = try self.conn.rows(
-            if (has_message_id)
-                "select role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status, message_id " ++
+            if (has_message_id and has_extra_images)
+                "select role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status, message_id, extra_images_json " ++
+                    "from messages where thread_id = ?1 and sort_index >= ?2 and sort_index < ?3 order by sort_index"
+            else if (has_message_id)
+                "select role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status, message_id, null " ++
                     "from messages where thread_id = ?1 and sort_index >= ?2 and sort_index < ?3 order by sort_index"
             else
-                "select role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status, null " ++
+                "select role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status, null, null " ++
                     "from messages where thread_id = ?1 and sort_index >= ?2 and sort_index < ?3 order by sort_index",
             .{ thread_id, @as(i64, @intCast(offset)), @as(i64, @intCast(end)) },
         );
@@ -635,6 +664,7 @@ pub const Client = struct {
                     message_row.nullableText(4),
                     message_row.nullableInt(5),
                 ),
+                .extra_images = try loadExtraImages(allocator, message_row.nullableText(10)),
                 .tool_call_id = try dupeOptionalText(allocator, message_row.nullableText(6)),
                 .tool_call_kind = decodeOptionalEnum(provider_types.ToolCallKind, message_row.nullableInt(7)),
                 .tool_call_status = decodeOptionalEnum(provider_types.ToolCallStatus, message_row.nullableInt(8)),
@@ -745,6 +775,38 @@ pub const Client = struct {
     }
 };
 
+/// Decode the additive `*_images_json` column (attachments past the primary)
+/// into persisted attachments. Malformed JSON degrades to "no extras" rather
+/// than failing the whole projection load; the daemon read path warns on the
+/// same condition.
+fn loadExtraImages(
+    allocator: std.mem.Allocator,
+    encoded: ?[]const u8,
+) ![]const PersistedImageAttachment {
+    const text = encoded orelse return &.{};
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const parsed = std.json.parseFromSliceLeaky(
+        []schema.StoredExtraImage,
+        arena_state.allocator(),
+        text,
+        .{ .ignore_unknown_fields = true },
+    ) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return &.{};
+    };
+    if (parsed.len == 0) return &.{};
+    const out = try allocator.alloc(PersistedImageAttachment, parsed.len);
+    for (parsed, 0..) |image, index| {
+        out[index] = .{
+            .path = try allocator.dupe(u8, image.path),
+            .mime = try allocator.dupe(u8, image.mime),
+            .byte_size = std.math.cast(usize, image.byte_size) orelse 0,
+        };
+    }
+    return out;
+}
+
 fn loadOptionalImage(
     allocator: std.mem.Allocator,
     path: ?[]const u8,
@@ -835,6 +897,7 @@ test "projection load bounds transcript tails and pages older rows" {
         "paged-workspace",
         "paged-thread",
         loaded_thread.message_offset,
+        TRANSCRIPT_MESSAGE_PAGE_SIZE,
     );
     defer tail_page.deinit();
     try testing.expectEqual(@as(usize, 8), tail_page.offset);
@@ -846,11 +909,24 @@ test "projection load bounds transcript tails and pages older rows" {
         "paged-workspace",
         "paged-thread",
         tail_page.offset,
+        TRANSCRIPT_MESSAGE_PAGE_SIZE,
     );
     defer old_page.deinit();
     try testing.expectEqual(@as(usize, 0), old_page.offset);
     try testing.expectEqual(@as(usize, 8), old_page.messages.len);
     try testing.expectEqualStrings("older", old_page.messages[0].body);
+
+    // Viewport-sized first page: a smaller limit pages in only the newest rows.
+    var first_page = try reader.loadMessagePage(
+        testing.allocator,
+        "paged-workspace",
+        "paged-thread",
+        loaded_thread.message_offset,
+        TRANSCRIPT_FIRST_PAGE_SIZE,
+    );
+    defer first_page.deinit();
+    try testing.expectEqual(loaded_thread.message_offset - TRANSCRIPT_FIRST_PAGE_SIZE, first_page.offset);
+    try testing.expectEqual(TRANSCRIPT_FIRST_PAGE_SIZE, first_page.messages.len);
 }
 
 fn dupeOptionalText(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {

@@ -44,6 +44,7 @@ extern fn verde_browser_linux_test_disables_process_swapping() c_int;
 extern fn verde_browser_linux_test_disables_async_overflow_scrolling() c_int;
 extern fn verde_browser_linux_test_deferred_frame_publishes_on_release() c_int;
 extern fn verde_browser_linux_test_wheel_event_is_smooth(delta_x: f64, delta_y: f64) c_int;
+extern fn verde_browser_linux_test_wheel_uses_smooth_2d() c_int;
 extern fn verde_browser_linux_test_wheel_delta_scale(delta_x: f64, delta_y: f64, wheel_multiplier: f64) f64;
 extern fn verde_browser_linux_test_wheel_axis(delta_x: f64, delta_y: f64) c_uint;
 extern fn verde_browser_linux_test_wheel_value(delta_x: f64, delta_y: f64, wheel_multiplier: f64) i32;
@@ -544,11 +545,12 @@ test "WPE publishes the newest deferred frame when a shared slot is released" {
 
 test "WPE wheel input keeps discrete steps separate from smooth deltas" {
     try std.testing.expectEqual(@as(c_int, 0), verde_browser_linux_test_wheel_event_is_smooth(0.0, -1.0));
-    try std.testing.expectEqual(@as(f64, 120.0), verde_browser_linux_test_wheel_delta_scale(0.0, -1.0, 1.0));
+    try std.testing.expectEqual(@as(c_int, 1), verde_browser_linux_test_wheel_uses_smooth_2d());
+    try std.testing.expectEqual(@as(f64, 40.0), verde_browser_linux_test_wheel_delta_scale(0.0, -1.0, 1.0));
     try std.testing.expectEqual(@as(c_uint, 0), verde_browser_linux_test_wheel_axis(0.0, -1.0));
-    try std.testing.expectEqual(@as(i32, -120), verde_browser_linux_test_wheel_value(0.0, -1.0, 1.0));
+    try std.testing.expectEqual(@as(i32, -40), verde_browser_linux_test_wheel_value(0.0, -1.0, 1.0));
     try std.testing.expectEqual(@as(c_int, 1), verde_browser_linux_test_wheel_event_is_smooth(0.0, -0.25));
     try std.testing.expectEqual(@as(f64, 144.0), verde_browser_linux_test_wheel_delta_scale(0.0, -0.25, 1.5));
     try std.testing.expectEqual(@as(c_uint, 1), verde_browser_linux_test_wheel_axis(1.0, 0.0));
-    try std.testing.expectEqual(@as(i32, 180), verde_browser_linux_test_wheel_value(1.0, 0.0, 1.5));
+    try std.testing.expectEqual(@as(i32, 60), verde_browser_linux_test_wheel_value(1.0, 0.0, 1.5));
 }

@@ -35,6 +35,13 @@ const PersistedSurfaceState = db_types.PersistedSurfaceState;
 const PersistedChatCompletion = db_types.PersistedChatCompletion;
 const log = std.log.scoped(.native_shell);
 
+const ChatDraftPayload = struct {
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    text: []const u8,
+    append: bool,
+};
+
 pub const SurfaceCommitProof = struct {
     request_key: []const u8,
     store_revision: u64,
@@ -276,11 +283,12 @@ pub const Storage = struct {
         workspace_id: []const u8,
         local_thread_id: []const u8,
         before_offset: usize,
+        limit: usize,
     ) !db_types.LoadedMessagePage {
         var client = (try openReadOnlyOptional(allocator, self.projection_store_dir)) orelse
             return error.DatabaseUnavailable;
         defer client.deinit();
-        return client.loadMessagePage(allocator, workspace_id, local_thread_id, before_offset);
+        return client.loadMessagePage(allocator, workspace_id, local_thread_id, before_offset, limit);
     }
 
     pub fn loadLegacyJson(self: *const Storage, allocator: std.mem.Allocator) !?LoadedPersistedState {
@@ -410,6 +418,53 @@ pub const Storage = struct {
     // This stub remains so accidental Client-style call sites fail loudly.
     pub fn saveThread(_: *const Storage, _: []const u8, _: usize, _: PersistedThread) !void {
         return error.UseFullSnapshotSave;
+    }
+
+    /// Persist an externally-authored composer draft before the GUI projection
+    /// is updated. The global store guard makes any older GUI snapshot conflict
+    /// instead of allowing stale composer state to erase this write.
+    pub fn setChatDraft(
+        self: *const Storage,
+        workspace_id: []const u8,
+        local_thread_id: []const u8,
+        text: []const u8,
+        append: bool,
+    ) !headless.store.WriteResult {
+        try self.ensureGranularMutationAllowed();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const payload: ChatDraftPayload = .{
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+            .text = text,
+            .append = append,
+        };
+        const result = try self.withClientRetry(a, headless.store.METHOD_CHAT_DRAFT_SET, struct {
+            fn call(
+                storage: *const Storage,
+                arena_inner: std.mem.Allocator,
+                op: []const u8,
+                client_id: []const u8,
+                expected: u64,
+                draft: ChatDraftPayload,
+            ) !headless.store.WriteResult {
+                const request: headless.store.ChatDraftSetRequest = .{
+                    .mutation = .{
+                        .request_key = try storage.nextRequestKey(arena_inner, op),
+                        .expected_store_revision = if (expected == 0) null else expected,
+                        .client_id = client_id,
+                    },
+                    .workspace_id = draft.workspace_id,
+                    .local_thread_id = draft.local_thread_id,
+                    .text = draft.text,
+                    .append = draft.append,
+                };
+                return storage.callStoreMutationAllowConflict(headless.store.METHOD_CHAT_DRAFT_SET, request);
+            }
+        }.call, payload);
+        self.noteStoreRevision(result.store_revision);
+        return result;
     }
 
     pub fn upsertSurfaceState(self: *const Storage, surface: PersistedSurfaceState) !void {

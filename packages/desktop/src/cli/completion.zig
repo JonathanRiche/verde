@@ -202,6 +202,8 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.pane_resize_flags);
     try w.writeAll("\"\n  local pane_move_flags=\"");
     try writeWords(w, &spec.pane_move_flags);
+    try w.writeAll("\"\n  local pane_maximize_flags=\"");
+    try writeWords(w, &spec.pane_maximize_flags);
     try w.writeAll("\"\n  local workspace_select_flags=\"");
     try writeWords(w, &spec.workspace_select_flags);
     try w.writeAll("\"\n  local workspace_create_flags=\"");
@@ -356,6 +358,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\              split) COMPREPLY=( $(compgen -W "$pane_split_flags" -- "$cur") ) ;;
         \\              resize) COMPREPLY=( $(compgen -W "$pane_resize_flags" -- "$cur") ) ;;
         \\              move) COMPREPLY=( $(compgen -W "$pane_move_flags" -- "$cur") ) ;;
+        \\              maximize) COMPREPLY=( $(compgen -W "$pane_maximize_flags" -- "$cur") ) ;;
         \\              *) COMPREPLY=( $(compgen -W "$pane_flags" -- "$cur") ) ;;
         \\            esac
         \\            ;;
@@ -512,6 +515,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.pane_resize_flags);
     try w.writeAll("\"\n  local pane_move_flags=\"");
     try writeWords(w, &spec.pane_move_flags);
+    try w.writeAll("\"\n  local pane_maximize_flags=\"");
+    try writeWords(w, &spec.pane_maximize_flags);
     try w.writeAll("\"\n  local workspace_select_flags=\"");
     try writeWords(w, &spec.workspace_select_flags);
     try w.writeAll("\"\n  local workspace_create_flags=\"");
@@ -666,6 +671,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\              split) compadd -- ${(s: :)pane_split_flags} ;;
         \\              resize) compadd -- ${(s: :)pane_resize_flags} ;;
         \\              move) compadd -- ${(s: :)pane_move_flags} ;;
+        \\              maximize) compadd -- ${(s: :)pane_maximize_flags} ;;
         \\              *) compadd -- ${(s: :)pane_flags} ;;
         \\            esac
         \\            ;;

@@ -66,6 +66,11 @@ const SESSIONIZER_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum response capacity accepted by the sessionizer protocol.
 pub const MAX_RESPONSE_BYTES: usize = SESSIONIZER_MAX_MESSAGE_BYTES;
 const SESSIONIZER_REQUEST_TIMEOUT_MS: u32 = 5000;
+/// Budget for the interactive daemon reachability probe run on the GUI event
+/// thread right before staging a send (ensureDaemonInteractive). Small enough
+/// that pressing Enter never visibly freezes the UI behind a busy daemon; the
+/// follow-up chat.turn.start RPC still gets the full request timeout.
+const SESSIONIZER_SUBMIT_PROBE_TIMEOUT_MS: u32 = 250;
 /// Q7: hard ceiling for a `core.changes` bounded long-poll (25s). A real
 /// limit, not a tuning knob: it bounds how long a parked waiter can occupy
 /// one of the TRANSPORT_WORKER_COUNT transport workers before answering with
@@ -100,10 +105,57 @@ const TEST_SLOW_IO_ENV_NAME = "VERDE_SESSIONIZER_TEST_SLOW_IO_MS";
 /// Test-only orphan retention override; registry-internal TTLs remain fixed.
 const TEST_RETENTION_ENV_NAME = "VERDE_SESSIONIZER_TEST_RETENTION_MS";
 
+/// Futex-parking mutex with Io-free lock()/unlock() signatures. Zig 0.16 has
+/// no std.Thread.Mutex; the previous `while (!tryLock()) spinLoopHint()` spin
+/// burned a full core for the entire hold time whenever a store request
+/// contended with a multi-second state.snapshot.replace apply. This is the
+/// exact 3-state algorithm of std.Io.Mutex; the ephemeral Threaded instance
+/// is the sanctioned way to reach futexWait/futexWake from an arbitrary
+/// thread (see signalChangesWaiters). Lock ordering is unchanged from the
+/// spin era: lockDaemon → lockTurn and lockDaemon → journal_mutex; store
+/// service mutex → journal_mutex; the journal is a leaf; the store spine is
+/// never taken under lockDaemon.
+const ParkingMutex = struct {
+    state: std.atomic.Value(State) = std.atomic.Value(State).init(.unlocked),
+
+    const State = enum(u32) { unlocked, locked_once, contended };
+
+    fn lock(m: *ParkingMutex) void {
+        const initial_state = m.state.cmpxchgStrong(
+            .unlocked,
+            .locked_once,
+            .acquire,
+            .monotonic,
+        ) orelse {
+            @branchHint(.likely);
+            return;
+        };
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const io = threaded.io();
+        if (initial_state == .contended) {
+            io.futexWaitUncancelable(State, &m.state.raw, .contended);
+        }
+        while (m.state.swap(.contended, .acquire) != .unlocked) {
+            io.futexWaitUncancelable(State, &m.state.raw, .contended);
+        }
+    }
+
+    fn unlock(m: *ParkingMutex) void {
+        switch (m.state.swap(.unlocked, .release)) {
+            .unlocked => unreachable,
+            .locked_once => {},
+            .contended => {
+                @branchHint(.unlikely);
+                var threaded = std.Io.Threaded.init_single_threaded;
+                threaded.io().futexWake(State, &m.state.raw, 1);
+            },
+        }
+    }
+};
+
 /// Store service spine: SQLite work runs under this mutex, never under lockDaemon.
-/// Uses the same spin-lock primitive as the daemon (Zig 0.16 has no std.Thread.Mutex).
 const StoreService = struct {
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: ParkingMutex = .{},
     store: daemon_store.Store,
     /// Mutators only; prepare-shutdown refuses while nonzero.
     in_flight: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -113,7 +165,7 @@ const StoreService = struct {
 };
 
 fn lockStoreService(service: *StoreService) void {
-    while (!service.mutex.tryLock()) std.atomic.spinLoopHint();
+    service.mutex.lock();
 }
 /// Bounded wait while an incompatible daemon drains live state before upgrade.
 const REPLACEMENT_WAIT_MS: i64 = 5 * std.time.ms_per_s;
@@ -481,27 +533,31 @@ const RequestTransport = struct {
     max_response_bytes: usize,
     response_buffer: ?[]u8,
     authenticated_server_process_id: ?u32 = null,
+    /// Per-request deadline. Interactive probes narrow this to the submit
+    /// budget; every other request uses the shared 5s client timeout.
+    timeout_ms: u32 = SESSIONIZER_REQUEST_TIMEOUT_MS,
 
     fn send(ctx: *anyopaque, request_json: []const u8) anyerror![]u8 {
         const self: *RequestTransport = @ptrCast(@alignCast(ctx));
         const socket_path = try socketPath(self.allocator, self.pref_path);
         defer self.allocator.free(socket_path);
 
-        if (builtin.os.tag == .windows) {
-            const result = try platform_ipc.requestWithPeerAlloc(self.allocator, socket_path, request_json, .{
-                .max_message_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
-                .max_response_bytes = self.max_response_bytes,
-                .timeout_ms = SESSIONIZER_REQUEST_TIMEOUT_MS,
-            });
-            self.authenticated_server_process_id = result.server_process_id;
-            return result.response;
-        }
-
-        const stream = try connectUnixStreamAtPath(socket_path);
-        defer stream.close(std.Io.Threaded.global_single_threaded.io());
-        const read_buffer = self.response_buffer orelse try self.allocator.alloc(u8, self.max_response_bytes);
-        defer if (self.response_buffer == null) self.allocator.free(read_buffer);
-        return try requestJsonOnUnixStreamAlloc(self.allocator, stream, request_json, read_buffer);
+        // Both platforms go through the deadline transport so a busy daemon
+        // surfaces error.ConnectionTimedOut after SESSIONIZER_REQUEST_TIMEOUT_MS
+        // instead of blocking the caller indefinitely. The POSIX branch used
+        // to connect/read with no deadline, which froze the GUI event thread
+        // whenever the daemon stalled mid-request. Wire clients are bounded by
+        // this timeout first; only in-process callers use the full
+        // MAX_CHANGES_WAIT_MS long-poll budget (see the Q7 pinning test).
+        // The deadline read path allocates its own scratch, so a caller's
+        // `response_buffer` is intentionally unused here.
+        const result = try platform_ipc.requestWithPeerAlloc(self.allocator, socket_path, request_json, .{
+            .max_message_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
+            .max_response_bytes = self.max_response_bytes,
+            .timeout_ms = self.timeout_ms,
+        });
+        self.authenticated_server_process_id = result.server_process_id;
+        return result.response;
     }
 };
 
@@ -540,29 +596,6 @@ fn validateResponseAndKeepAlloc(allocator: std.mem.Allocator, response: []u8, re
     return response;
 }
 
-fn connectUnixStreamAtPath(socket_path: []const u8) !std.Io.net.Stream {
-    const address = try std.Io.net.UnixAddress.init(socket_path);
-    return address.connect(std.Io.Threaded.global_single_threaded.io());
-}
-
-fn requestJsonOnUnixStreamAlloc(
-    allocator: std.mem.Allocator,
-    stream: std.Io.net.Stream,
-    request_json: []const u8,
-    response_buffer: []u8,
-) ![]u8 {
-    const io = std.Io.Threaded.global_single_threaded.io();
-
-    var write_buffer: [64 * 1024]u8 = undefined;
-    var writer = stream.writer(io, &write_buffer);
-    try writer.interface.writeAll(request_json);
-    try writer.interface.writeByte('\n');
-    try writer.interface.flush();
-
-    var reader = stream.reader(io, response_buffer);
-    const line = try reader.interface.takeDelimiter('\n') orelse return error.ConnectionAborted;
-    return allocator.dupe(u8, std.mem.trim(u8, line, "\r"));
-}
 const DaemonStatus = struct {
     protocol_version: u32,
     pid: ?usize = null,
@@ -697,6 +730,96 @@ pub fn ensureDaemon(allocator: std.mem.Allocator, pref_path: []const u8, exe_pat
         .{ attempts, @errorName(last_probe_error) },
     );
     return error.SessionDaemonUnavailable;
+}
+
+/// How a failed budgeted status probe classifies the daemon endpoint.
+const DaemonProbeOutcome = enum { busy, absent };
+
+/// A deadline expiry means something holds the endpoint but answered too
+/// slowly for the interactive budget (a daemon mid store-commit): alive but
+/// busy. Every other transport error (no socket, connect refused, reset)
+/// means nothing usable is listening.
+fn daemonProbeOutcomeFromError(err: anyerror) DaemonProbeOutcome {
+    return switch (err) {
+        error.ConnectionTimedOut => .busy,
+        else => .absent,
+    };
+}
+
+/// One status round-trip under an explicit per-request deadline. Interactive
+/// callers pass a sub-second budget; everything else keeps the shared client
+/// timeout via requestAlloc.
+fn statusProbeAlloc(allocator: std.mem.Allocator, pref_path: []const u8, timeout_ms: u32) ![]u8 {
+    var transport: RequestTransport = .{
+        .allocator = allocator,
+        .pref_path = pref_path,
+        .max_response_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
+        .response_buffer = null,
+        .timeout_ms = timeout_ms,
+    };
+    var client = headless.Client.init(allocator, &transport, RequestTransport.send);
+    var call = try client.callAllocWithId(0, "status", .{});
+    const response = call.takeResponse();
+    call.deinit(allocator);
+    return response;
+}
+
+/// Event-thread variant of `ensureDaemon` for the GUI submit path, bounded at
+/// roughly SESSIONIZER_SUBMIT_PROBE_TIMEOUT_MS so pressing Enter never freezes
+/// the UI behind a busy daemon:
+/// - Healthy status within budget: done, same as ensureDaemon's happy path.
+/// - Probe deadline expiry or an unparseable/over-capacity answer: the daemon
+///   is alive but slow. Treat it as reachable — the follow-up chat.turn.start
+///   carries its own request deadline plus idempotent lost-reply recovery, so
+///   acceptance stays unambiguous and the send is not spuriously failed.
+/// - Connect failure: daemon absent. Spawn it and wait only the remaining
+///   interactive budget; if it has not bound yet, return an error so the
+///   caller surfaces a visible retryable failure instead of blocking.
+/// - Protocol mismatch: delegate to ensureDaemon's graceful replacement path.
+///   Upgrades are rare and the drain's bounded waits outweigh the UI budget.
+pub fn ensureDaemonInteractive(allocator: std.mem.Allocator, pref_path: []const u8, exe_path: []const u8) !void {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const budget_deadline_ms = nowMs() + SESSIONIZER_SUBMIT_PROBE_TIMEOUT_MS;
+
+    if (statusProbeAlloc(allocator, pref_path, SESSIONIZER_SUBMIT_PROBE_TIMEOUT_MS)) |response| {
+        defer allocator.free(response);
+        if (parseDaemonStatus(allocator, response)) |status| {
+            if (status.protocol_version == PROTOCOL_VERSION) return;
+            return ensureDaemon(allocator, pref_path, exe_path);
+        }
+        // Answered but not a status result (e.g. transport busy heartbeat):
+        // something owns the endpoint, so treat it as reachable-but-busy.
+        return;
+    } else |err| switch (daemonProbeOutcomeFromError(err)) {
+        .busy => return,
+        .absent => {},
+    }
+
+    try spawnDaemon(allocator, exe_path);
+    while (nowMs() <= budget_deadline_ms) {
+        if (statusProbeAlloc(allocator, pref_path, SESSIONIZER_SUBMIT_PROBE_TIMEOUT_MS)) |response| {
+            defer allocator.free(response);
+            if (parseDaemonStatus(allocator, response)) |status| {
+                if (status.protocol_version == PROTOCOL_VERSION) return;
+            }
+        } else |_| {}
+        std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+    }
+    return error.SessionDaemonStarting;
+}
+
+test "interactive submit probe budget and busy/absent classification are pinned" {
+    // ~250ms keeps Enter responsive on the event thread; must stay well under
+    // the shared client timeout wire requests are bounded by.
+    try std.testing.expectEqual(@as(u32, 250), SESSIONIZER_SUBMIT_PROBE_TIMEOUT_MS);
+    try std.testing.expect(SESSIONIZER_SUBMIT_PROBE_TIMEOUT_MS < SESSIONIZER_REQUEST_TIMEOUT_MS);
+    // Only a deadline expiry proves a live-but-slow endpoint; everything else
+    // (missing socket, refused, reset) must take the spawn path.
+    try std.testing.expectEqual(DaemonProbeOutcome.busy, daemonProbeOutcomeFromError(error.ConnectionTimedOut));
+    try std.testing.expectEqual(DaemonProbeOutcome.absent, daemonProbeOutcomeFromError(error.ConnectionRefused));
+    try std.testing.expectEqual(DaemonProbeOutcome.absent, daemonProbeOutcomeFromError(error.FileNotFound));
+    try std.testing.expectEqual(DaemonProbeOutcome.absent, daemonProbeOutcomeFromError(error.ConnectionResetByPeer));
 }
 
 /// Graceful protocol-version replacement (headless_verde.md Lifetime).
@@ -1625,9 +1748,13 @@ const ChatTurn = struct {
     local_thread_id: []u8,
     request: send_runner.Request,
     owned_image_paths: []const []const u8,
+    /// Full attachment metadata for the turn request (path + any mime /
+    /// byte_size the client genuinely knew). Staged onto the durable user row
+    /// at acceptance so committed transcripts keep their images.
+    owned_images: []const store_protocol.Attachment = &.{},
     started_at_ms: i64 = 0,
     finished_at_ms: ?i64 = null,
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: ParkingMutex = .{},
     worker_thread: ?std.Thread = null,
     events: std.ArrayList(ChatEvent) = .empty,
     next_seq: u64 = 1,
@@ -1677,6 +1804,11 @@ const ChatTurn = struct {
         allocator.free(self.workspace_id);
         allocator.free(self.local_thread_id);
         freeRunnerRequest(allocator, self.request, self.owned_image_paths);
+        for (self.owned_images) |attachment| {
+            allocator.free(attachment.path);
+            allocator.free(attachment.mime);
+        }
+        if (self.owned_images.len > 0) allocator.free(self.owned_images);
         for (self.events.items) |*event| event.deinit(allocator);
         self.events.deinit(allocator);
         if (self.user_message_id) |value| allocator.free(value);
@@ -1803,7 +1935,7 @@ pub const Daemon = struct {
     registry: process_registry.ProcessRegistry,
     sessions: std.ArrayList(*PtySession) = .empty,
     chat_turns: std.ArrayList(*ChatTurn) = .empty,
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: ParkingMutex = .{},
     idle_since_ms: ?i64 = null,
     /// null = persistent (no idle exit). Tests set VERDE_SESSION_DAEMON_IDLE_EXIT_MS.
     idle_exit_ms: ?i64 = null,
@@ -1823,10 +1955,10 @@ pub const Daemon = struct {
     /// reset: `instance_nonce` is fixed for this Daemon's lifetime and the
     /// journal starts empty with it, so change_seq restarts at 1 per instance.
     journal: change_journal.ChangeJournal = .{},
-    /// Leaf spin lock for the journal. Lock order: lockDaemon → journal_mutex
+    /// Leaf lock for the journal. Lock order: lockDaemon → journal_mutex
     /// and store service mutex → journal_mutex; the journal path never takes
     /// another lock, so no cycle is possible.
-    journal_mutex: std.atomic.Mutex = .unlocked,
+    journal_mutex: ParkingMutex = .{},
     /// M5-P3 long-poll park state. `changes_signal` is a futex word bumped by
     /// every journal append (after the leaf lock is RELEASED) and by drain;
     /// parked `core.changes` waiters sleep on it holding NO locks. The
@@ -2213,7 +2345,11 @@ pub const Daemon = struct {
         if (isStoreMethod(method)) return try self.handleStoreRequest(id_value, method, params);
         // chat.turn.start owns its drain check under lockDaemon (unlocked serve
         // path); other mutators still gate here under the `.normal` outer lock.
-        if (!std.mem.eql(u8, method, "chat.turn.start") and !self.accepting_mutations and methodMutatesState(method)) {
+        if (!std.mem.eql(u8, method, "chat.turn.start") and
+            !std.mem.eql(u8, method, "chat.turn.steer") and
+            !std.mem.eql(u8, method, "chat.followup") and
+            !self.accepting_mutations and methodMutatesState(method))
+        {
             return try errorResponseAlloc(
                 self.allocator,
                 id_value,
@@ -2237,6 +2373,8 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, "chat.turn.list")) return try self.chatTurnListResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.tail")) return try self.chatTurnTailResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.approve")) return try self.chatTurnApproveResponse(id_value, params);
+        if (std.mem.eql(u8, method, "chat.turn.steer")) return try self.chatTurnSteerResponse(id_value, params);
+        if (std.mem.eql(u8, method, "chat.followup")) return try self.chatFollowupResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.cancel")) return try self.chatTurnCancelResponse(id_value, params);
         if (std.mem.eql(u8, method, "chat.turn.consume")) return try self.chatTurnConsumeResponse(id_value, params);
         if (std.mem.eql(u8, method, "provider.models.list")) return try self.providerModelsListResponse(id_value, params);
@@ -2406,6 +2544,18 @@ pub const Daemon = struct {
                 break :blk null;
             };
             if (req) |value| decoded_mutation = .{ .thread_upsert = value };
+        } else if (std.mem.eql(u8, method, store_protocol.METHOD_CHAT_DRAFT_SET)) {
+            const req = std.json.parseFromValueLeaky(
+                store_protocol.ChatDraftSetRequest,
+                arena,
+                params,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                decode_failed = true;
+                break :blk null;
+            };
+            if (req) |value| decoded_mutation = .{ .chat_draft_set = value };
         } else if (std.mem.eql(u8, method, store_protocol.METHOD_CHAT_MESSAGE_APPEND)) {
             const req = std.json.parseFromValueLeaky(
                 store_protocol.MessageAppendRequest,
@@ -3882,22 +4032,40 @@ pub const Daemon = struct {
         workspace_id: ?[]const u8,
         revision: change_journal.Revision,
     ) void {
-        {
-            lockJournal(self);
-            defer self.journal_mutex.unlock();
-            _ = self.journal.append(self.allocator, topic, resource_id, workspace_id, revision, nowMs()) catch {
-                // The entry the client should have seen was dropped; force every
-                // existing cursor below the new floor so it snapshot-falls-back.
-                self.journal.last_seq += 1;
-                self.journal.journal_floor_seq = self.journal.last_seq;
-            };
-        }
+        self.appendJournalEntryQuiet(topic, resource_id, workspace_id, revision);
         // M5-P3 wake ordering (append → signal, leaf lock released first): a
         // parked core.changes waiter either re-reads the window and sees this
         // entry, or it loaded changes_signal before this bump and its futex
         // wait returns immediately on the changed value — a wake can never be
         // missed, and the waker never holds the lock the woken reader needs.
         self.signalChangesWaiters();
+    }
+
+    /// Append without signaling. Multi-entry commit hooks (snapshot replace,
+    /// turn acceptance/commit) append every entry of one committed
+    /// store_revision, then signal ONCE: a snapshot replace journals one entry
+    /// per carried workspace/thread/completion/surface plus five batch
+    /// tombstone entries, and signaling each one woke every parked long-poll
+    /// waiter N+5 times per commit — each wake re-reading and re-copying the
+    /// whole change window. The M5-P3 ordering still holds for the batch: all
+    /// appends complete (leaf lock released) before the single bump, so a
+    /// waiter either saw the entries in its pre-park window read or its futex
+    /// expectation is stale and it wakes.
+    fn appendJournalEntryQuiet(
+        self: *Daemon,
+        topic: change_journal.Topic,
+        resource_id: []const u8,
+        workspace_id: ?[]const u8,
+        revision: change_journal.Revision,
+    ) void {
+        lockJournal(self);
+        defer self.journal_mutex.unlock();
+        _ = self.journal.append(self.allocator, topic, resource_id, workspace_id, revision, nowMs()) catch {
+            // The entry the client should have seen was dropped; force every
+            // existing cursor below the new floor so it snapshot-falls-back.
+            self.journal.last_seq += 1;
+            self.journal.journal_floor_seq = self.journal.last_seq;
+        };
     }
 
     /// Publish "the journal advanced (or drain began)" to parked long-pollers.
@@ -4973,6 +5141,132 @@ pub const Daemon = struct {
         return try okValueResponse(self.allocator, id_value, .{ .accepted = true });
     }
 
+    /// Inject a Claude follow-up into the exact SDK bridge owned by this daemon.
+    /// The provider call runs outside lockDaemon; only stable request identity is
+    /// copied while the turn is borrowed.
+    fn chatTurnSteerResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
+        const turn_id = jsonString(params.object.get("turn_id") orelse .null) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing turn_id");
+        const prompt = jsonString(params.object.get("prompt") orelse .null) orelse "";
+        const image_paths = try jsonStringArray(self.allocator, params.object.get("image_paths") orelse .null);
+        defer freeStringArray(self.allocator, image_paths);
+        if (std.mem.trim(u8, prompt, &std.ascii.whitespace).len == 0 and image_paths.len == 0) {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "steer prompt is empty");
+        }
+
+        lockDaemon(self);
+        if (!self.accepting_mutations) {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "daemon is preparing shutdown and is not accepting mutations");
+        }
+        const turn = self.findChatTurn(turn_id) orelse {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, "not_found", "turn not found");
+        };
+        lockTurn(turn);
+        if (turn.request.provider != .claude or turn.request.harness_kind != .local_cli) {
+            turn.mutex.unlock();
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "provider does not support daemon steering");
+        }
+        if (turn.status != .running or turn.cancel_requested or turn.pending_approval != null) {
+            turn.mutex.unlock();
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "turn cannot accept steering now");
+        }
+        const provider_thread_id = turn.provider_thread_id orelse turn.request.provider_thread_id orelse {
+            turn.mutex.unlock();
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "provider thread is not ready");
+        };
+        const owned_provider_thread_id = self.allocator.dupe(u8, provider_thread_id) catch |err| {
+            turn.mutex.unlock();
+            self.mutex.unlock();
+            return err;
+        };
+        const owned_project_path = self.allocator.dupe(u8, turn.request.project_path) catch |err| {
+            self.allocator.free(owned_provider_thread_id);
+            turn.mutex.unlock();
+            self.mutex.unlock();
+            return err;
+        };
+        turn.mutex.unlock();
+        self.mutex.unlock();
+        defer self.allocator.free(owned_provider_thread_id);
+        defer self.allocator.free(owned_project_path);
+
+        var client = harness.connect(self.allocator, .{ .claude = .{ .cwd = owned_project_path } }) catch {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "Claude bridge is unavailable");
+        };
+        defer client.deinit();
+        const images = try self.allocator.alloc(harness.types.ImageAttachment, image_paths.len);
+        defer self.allocator.free(images);
+        for (image_paths, 0..) |path, index| images[index] = .{ .path = path };
+        client.steerThread(.{
+            .thread_id = owned_provider_thread_id,
+            .turn_id = "",
+            .prompt = prompt,
+            .images = images,
+        }) catch {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "Claude could not accept steering for this turn");
+        };
+        return try okValueResponse(self.allocator, id_value, .{ .accepted = true });
+    }
+
+    /// Resolve the running daemon turn by stable thread identity, then reuse
+    /// the provider steering path. Detached clients never need GUI pane state.
+    fn chatFollowupResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        lockDaemon(self);
+        if (!self.accepting_mutations) {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "daemon is preparing shutdown and is not accepting mutations");
+        }
+        self.mutex.unlock();
+
+        if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
+        const workspace_id = jsonString(params.object.get("workspace_id") orelse .null) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing workspace_id");
+        const local_thread_id = jsonString(params.object.get("local_thread_id") orelse .null) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing local_thread_id");
+        const prompt = jsonString(params.object.get("prompt") orelse .null) orelse "";
+        if (std.mem.trim(u8, prompt, &std.ascii.whitespace).len == 0) {
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "follow-up prompt is empty");
+        }
+
+        lockDaemon(self);
+        var selected_turn: ?*ChatTurn = null;
+        for (self.chat_turns.items) |turn| {
+            if (turn.consumed or
+                !std.mem.eql(u8, turn.workspace_id, workspace_id) or
+                !std.mem.eql(u8, turn.local_thread_id, local_thread_id)) continue;
+            lockTurn(turn);
+            const active = turn.status == .running or turn.status == .waiting_approval;
+            const newer = selected_turn == null or turn.started_at_ms > selected_turn.?.started_at_ms;
+            turn.mutex.unlock();
+            if (active and newer) selected_turn = turn;
+        }
+        const turn = selected_turn orelse {
+            self.mutex.unlock();
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_state", "thread has no running turn");
+        };
+        const turn_id = self.allocator.dupe(u8, turn.turn_id) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.mutex.unlock();
+        defer self.allocator.free(turn_id);
+
+        var steer_params: std.json.ObjectMap = .empty;
+        defer steer_params.deinit(self.allocator);
+        try steer_params.put(self.allocator, "turn_id", .{ .string = turn_id });
+        try steer_params.put(self.allocator, "prompt", .{ .string = prompt });
+        if (params.object.get("image_paths")) |image_paths| {
+            try steer_params.put(self.allocator, "image_paths", image_paths);
+        }
+        return try self.chatTurnSteerResponse(id_value, .{ .object = steer_params });
+    }
+
     fn chatTurnCancelResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
         if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
         const turn = self.findChatTurn(jsonString(params.object.get("turn_id") orelse .null) orelse return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing turn_id")) orelse
@@ -5930,6 +6224,7 @@ fn isStoreMethod(method: []const u8) bool {
     return std.mem.eql(u8, method, store_protocol.METHOD_STATE_SNAPSHOT_REPLACE) or
         std.mem.eql(u8, method, store_protocol.METHOD_WORKSPACE_UPSERT) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_THREAD_UPSERT) or
+        std.mem.eql(u8, method, store_protocol.METHOD_CHAT_DRAFT_SET) or
         std.mem.eql(u8, method, store_protocol.METHOD_CHAT_MESSAGE_APPEND) or
         std.mem.eql(u8, method, store_protocol.METHOD_SURFACE_UPSERT) or
         std.mem.eql(u8, method, store_protocol.METHOD_SURFACE_CLEAR) or
@@ -5977,20 +6272,22 @@ fn storeMutationCommittedHook(context: *anyopaque, mutation: *const daemon_store
         .snapshot_replace => |request| {
             // A whole-state replace may touch every durable resource; publish
             // identity entries for each carried workspace/thread/completion.
+            // Appends are quiet with ONE signal at the end of the arm (see
+            // appendJournalEntryQuiet for the wake-ordering argument).
             for (request.snapshot.workspaces) |workspace| {
-                daemon.appendJournalEntry(.workspace, workspace.workspace_id, workspace.workspace_id, revision);
+                daemon.appendJournalEntryQuiet(.workspace, workspace.workspace_id, workspace.workspace_id, revision);
                 for (workspace.threads) |thread| {
-                    daemon.appendJournalEntry(.chat_thread, thread.local_thread_id, workspace.workspace_id, revision);
+                    daemon.appendJournalEntryQuiet(.chat_thread, thread.local_thread_id, workspace.workspace_id, revision);
                 }
             }
             for (request.snapshot.chat_completions) |completion| {
-                daemon.appendJournalEntry(.chat_completion, completion.local_thread_id, completion.workspace_id, revision);
+                daemon.appendJournalEntryQuiet(.chat_completion, completion.local_thread_id, completion.workspace_id, revision);
             }
             // M5-P4 Amendment 3 (M5-P3 verify MAJOR): carried surfaces must
             // journal like every other carried resource, matching the
             // surface_upsert arm below.
             for (request.snapshot.surface_states) |surface| {
-                daemon.appendJournalEntry(
+                daemon.appendJournalEntryQuiet(
                     .surface,
                     surface.session_id,
                     if (surface.workspace_id.len != 0) surface.workspace_id else null,
@@ -6007,17 +6304,19 @@ fn storeMutationCommittedHook(context: *anyopaque, mutation: *const daemon_store
             // replace can delete from, or topic-filtered cursors (e.g.
             // {surface}, or chat topics without workspace) would go silently
             // stale forever across a snapshot_replace (M5-P4 Amendment 3).
-            daemon.appendJournalEntry(.workspace, "*", null, revision);
-            daemon.appendJournalEntry(.chat_thread, "*", null, revision);
+            daemon.appendJournalEntryQuiet(.workspace, "*", null, revision);
+            daemon.appendJournalEntryQuiet(.chat_thread, "*", null, revision);
             // Snapshot tombstoning may remove workspace-owned turn records;
             // the durable replay guard is separate, but chat.turn projection
             // subscribers must still re-read after the committed deletion.
-            daemon.appendJournalEntry(.chat_turn, "*", null, revision);
-            daemon.appendJournalEntry(.chat_completion, "*", null, revision);
-            daemon.appendJournalEntry(.surface, "*", null, revision);
+            daemon.appendJournalEntryQuiet(.chat_turn, "*", null, revision);
+            daemon.appendJournalEntryQuiet(.chat_completion, "*", null, revision);
+            daemon.appendJournalEntryQuiet(.surface, "*", null, revision);
+            daemon.signalChangesWaiters();
         },
         .workspace_upsert => |request| daemon.appendJournalEntry(.workspace, request.workspace.workspace_id, request.workspace.workspace_id, revision),
         .thread_upsert => |request| daemon.appendJournalEntry(.chat_thread, request.thread.local_thread_id, request.workspace_id, revision),
+        .chat_draft_set => |request| daemon.appendJournalEntry(.chat_thread, request.local_thread_id, request.workspace_id, revision),
         .message_append => |request| daemon.appendJournalEntry(.chat_thread, request.thread_id, request.workspace_id, revision),
         // MAJOR-1 (M5-P3 amendment): store commits are the ONLY surface
         // publisher (the registry has no surface records or bump variant), so
@@ -6046,14 +6345,16 @@ fn storeTurnCommittedHook(
 ) void {
     const daemon: *Daemon = @ptrCast(@alignCast(context));
     const revision: change_journal.Revision = .{ .store = result.store_revision };
-    if (inserted.workspace) daemon.appendJournalEntry(.workspace, request.workspace_id, request.workspace_id, revision);
-    daemon.appendJournalEntry(.chat_thread, request.local_thread_id, request.workspace_id, revision);
-    daemon.appendJournalEntry(.chat_turn, request.turn_id, request.workspace_id, revision);
+    // One committed revision → quiet appends + one signal (appendJournalEntryQuiet).
+    if (inserted.workspace) daemon.appendJournalEntryQuiet(.workspace, request.workspace_id, request.workspace_id, revision);
+    daemon.appendJournalEntryQuiet(.chat_thread, request.local_thread_id, request.workspace_id, revision);
+    daemon.appendJournalEntryQuiet(.chat_turn, request.turn_id, request.workspace_id, revision);
     // commitTurn writes a completion ledger row whenever the turn completed
     // (deriving one if the request omitted it); mirror that exactly.
     if (request.status == .completed) {
-        daemon.appendJournalEntry(.chat_completion, request.local_thread_id, request.workspace_id, revision);
+        daemon.appendJournalEntryQuiet(.chat_completion, request.local_thread_id, request.workspace_id, revision);
     }
+    daemon.signalChangesWaiters();
 }
 
 /// Acceptance journals the inserted workspace owner (when any), the accepted
@@ -6067,9 +6368,11 @@ fn storeAcceptanceCommittedHook(
     const daemon: *Daemon = @ptrCast(@alignCast(context));
     const workspace_id = request.workspace.workspace_id;
     const revision: change_journal.Revision = .{ .store = result.store_revision };
-    if (inserted.workspace) daemon.appendJournalEntry(.workspace, workspace_id, workspace_id, revision);
-    daemon.appendJournalEntry(.chat_thread, request.thread.local_thread_id, workspace_id, revision);
-    daemon.appendJournalEntry(.chat_turn, request.turn_id, workspace_id, revision);
+    // One committed revision → quiet appends + one signal (appendJournalEntryQuiet).
+    if (inserted.workspace) daemon.appendJournalEntryQuiet(.workspace, workspace_id, workspace_id, revision);
+    daemon.appendJournalEntryQuiet(.chat_thread, request.thread.local_thread_id, workspace_id, revision);
+    daemon.appendJournalEntryQuiet(.chat_turn, request.turn_id, workspace_id, revision);
+    daemon.signalChangesWaiters();
 }
 
 fn mutationHeader(mutation: daemon_store.Mutation) store_protocol.MutationHeader {
@@ -6077,6 +6380,7 @@ fn mutationHeader(mutation: daemon_store.Mutation) store_protocol.MutationHeader
         .snapshot_replace => |request| request.mutation,
         .workspace_upsert => |request| request.mutation,
         .thread_upsert => |request| request.mutation,
+        .chat_draft_set => |request| request.mutation,
         .message_append => |request| request.mutation,
         .surface_upsert => |request| request.mutation,
         .surface_clear => |request| request.mutation,
@@ -6295,11 +6599,35 @@ fn stageAcceptedChatTurn(daemon: *Daemon, turn: *ChatTurn) !AcceptanceOwnership 
     defer svc.mutex.unlock();
 
     const acceptance_key = try std.fmt.allocPrint(arena, "turn:{s}:accept", .{turn_id});
+    // Durable user-row attachments: full client metadata when the turn
+    // carried the additive `images` param, otherwise the bare request paths.
+    // Path is the minimum contract — mime/byte_size are stored only when the
+    // client genuinely supplied them, never invented here.
+    var staged_images: []store_protocol.Attachment = &.{};
+    if (turn.owned_images.len != 0) {
+        const images = try arena.alloc(store_protocol.Attachment, turn.owned_images.len);
+        for (turn.owned_images, 0..) |attachment, index| {
+            images[index] = .{
+                .path = try arena.dupe(u8, attachment.path),
+                .mime = try arena.dupe(u8, attachment.mime),
+                .byte_size = attachment.byte_size,
+            };
+        }
+        staged_images = images;
+    } else if (turn.request.image_paths.len != 0) {
+        const images = try arena.alloc(store_protocol.Attachment, turn.request.image_paths.len);
+        for (turn.request.image_paths, 0..) |path, index| {
+            images[index] = .{ .path = try arena.dupe(u8, path), .mime = "" };
+        }
+        staged_images = images;
+    }
     const user_message: store_protocol.Message = turn.acceptance_message_override orelse .{
         .message_id = user_message_id,
         .role = "user",
         .author = "You",
         .body = prompt,
+        .image = if (staged_images.len != 0) staged_images[0] else null,
+        .images = staged_images,
         .created_at_ms = started_at_ms,
         .updated_at_ms = started_at_ms,
     };
@@ -6641,7 +6969,7 @@ fn loadThreadGetResult(
     if (request.workspace_id.len == 0 or request.local_thread_id.len == 0) return error.InvalidParams;
     const meta_or_null = store.conn.row(
         \\select t.local_thread_id, t.title, t.archived, t.committed, t.last_activity_at,
-        \\       t.provider_thread_id, t.model_ref, t.provider, t.harness, t.id
+        \\       t.provider_thread_id, t.model_ref, t.provider, t.harness, t.id, t.draft
         \\from threads t
         \\join workspaces w on w.id = t.workspace_id
         \\where w.workspace_id = ?1 and t.local_thread_id = ?2
@@ -6664,6 +6992,8 @@ fn loadThreadGetResult(
     errdefer allocator.free(provider);
     const harness_name = allocator.dupe(u8, harnessNameFromCode(meta.int(8))) catch return error.OutOfMemory;
     errdefer allocator.free(harness_name);
+    const draft = allocator.dupe(u8, meta.text(10)) catch return error.OutOfMemory;
+    errdefer allocator.free(draft);
     const archived = meta.int(2) != 0;
     const committed = meta.int(3) != 0;
     const last_activity_at = meta.nullableInt(4);
@@ -6729,6 +7059,7 @@ fn loadThreadGetResult(
             .model_ref = model_ref,
             .provider = provider,
             .harness = harness_name,
+            .draft = draft,
             .messages = try messages_list.toOwnedSlice(allocator),
         },
         .store_revision = store_revision,
@@ -6742,6 +7073,7 @@ fn freeThreadGetResult(allocator: std.mem.Allocator, result: store_protocol.Thre
     if (result.thread.model_ref) |value| allocator.free(value);
     allocator.free(result.thread.provider);
     allocator.free(result.thread.harness);
+    allocator.free(result.thread.draft);
     for (result.thread.messages) |message| freeOwnedMessage(allocator, message);
     allocator.free(result.thread.messages);
 }
@@ -7156,6 +7488,35 @@ test "journal append wakes a parked changes waiter" {
     try std.testing.expectEqual(@as(u32, 1), woken.load(.acquire));
 }
 
+test "batched journal appends signal parked changes waiters exactly once" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const observed = daemon.changes_signal.load(.acquire);
+    const Parker = struct {
+        fn run(d: *Daemon, obs: u32, out: *std.atomic.Value(u32)) void {
+            // Race-free either way: if the batch signal lands first, the
+            // changed signal word makes this return .woken without sleeping.
+            if (d.parkForChanges(obs, nowMs() + 10_000) == .woken) out.store(1, .release);
+        }
+    };
+    var woken: std.atomic.Value(u32) = .init(0);
+    const thread = try std.Thread.spawn(.{}, Parker.run, .{ &daemon, observed, &woken });
+    // A multi-entry commit batch (the snapshot-replace / turn-commit hook
+    // shape): quiet appends never bump the signal word; the one trailing
+    // signal both wakes the waiter and is the only bump for the whole batch.
+    daemon.appendJournalEntryQuiet(.workspace, "w1", "w1", .{ .store = 1 });
+    daemon.appendJournalEntryQuiet(.chat_thread, "t1", "w1", .{ .store = 1 });
+    daemon.appendJournalEntryQuiet(.chat_turn, "turn1", "w1", .{ .store = 1 });
+    daemon.signalChangesWaiters();
+    thread.join();
+    try std.testing.expectEqual(@as(u32, 1), woken.load(.acquire));
+    try std.testing.expectEqual(observed + 1, daemon.changes_signal.load(.acquire));
+    // Every batched entry still landed in the journal.
+    try std.testing.expectEqual(@as(u64, 3), daemon.journal.last_seq);
+}
+
 const LoadedStoreSnapshot = struct {
     snapshot: store_protocol.Snapshot,
     store_revision: u64,
@@ -7186,6 +7547,43 @@ fn loadStoreSnapshotTxn(
     store.conn.commit() catch return error.StoreUnavailable;
     transaction_open = false;
     return .{ .snapshot = snapshot, .store_revision = store_revision };
+}
+
+/// Decode a durable `*_images_json` column into the full attachment list
+/// ([primary] ++ extras). Returns an empty list when there is no primary; a
+/// malformed extras column degrades to primary-only with a warning instead of
+/// failing the whole snapshot read.
+fn decodeAttachmentList(
+    arena: std.mem.Allocator,
+    primary: ?store_protocol.Attachment,
+    encoded: ?[]const u8,
+) daemon_store.StoreError![]const store_protocol.Attachment {
+    const first = primary orelse return &.{};
+    var list: std.ArrayList(store_protocol.Attachment) = .empty;
+    list.append(arena, first) catch return error.OutOfMemory;
+    if (encoded) |text| {
+        // SQLite row memory dies on the next step: own the JSON before parse
+        // so parsed string slices can borrow stable arena bytes.
+        const owned = arena.dupe(u8, text) catch return error.OutOfMemory;
+        const extras = std.json.parseFromSliceLeaky(
+            []daemon_store.StoredExtraImage,
+            arena,
+            owned,
+            .{ .ignore_unknown_fields = true },
+        ) catch |err| blk: {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            log.warn("malformed stored extra-images column dropped err={s}", .{@errorName(err)});
+            break :blk &.{};
+        };
+        for (extras) |extra| {
+            list.append(arena, .{
+                .path = extra.path,
+                .mime = extra.mime,
+                .byte_size = std.math.cast(usize, extra.byte_size) orelse 0,
+            }) catch return error.OutOfMemory;
+        }
+    }
+    return list.items;
 }
 
 /// Materialize the typed store snapshot (workspaces → threads → messages,
@@ -7273,7 +7671,7 @@ fn loadSnapshotContents(
                 \\select id, local_thread_id, title, archived, committed, last_activity_at,
                 \\       provider_thread_id, model_ref, reasoning_effort, reasoning_variant,
                 \\       fast_mode, access_mode, provider, harness, tui_dock_id, draft,
-                \\       draft_image_path, draft_image_mime, draft_image_byte_size
+                \\       draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json
                 \\from threads where workspace_id = ?1 order by sort_index
             , .{workspace_row.row_id}) catch return error.StoreUnavailable;
             defer rows.deinit();
@@ -7283,6 +7681,7 @@ fn loadSnapshotContents(
                     .mime = arena.dupe(u8, row.nullableText(17) orelse "") catch return error.OutOfMemory,
                     .byte_size = if (row.nullableInt(18)) |value| (std.math.cast(usize, value) orelse 0) else 0,
                 } else null;
+                const draft_images = try decodeAttachmentList(arena, draft_image, row.nullableText(19));
                 thread_rows.append(arena, .{
                     .row_id = row.int(0),
                     .thread = .{
@@ -7302,6 +7701,7 @@ fn loadSnapshotContents(
                         .tui_dock_id = if (row.nullableInt(14)) |value| (std.math.cast(u32, value) orelse null) else null,
                         .draft = arena.dupe(u8, row.nullableText(15) orelse "") catch return error.OutOfMemory,
                         .draft_image = draft_image,
+                        .draft_images = draft_images,
                     },
                 }) catch return error.OutOfMemory;
             }
@@ -7314,7 +7714,7 @@ fn loadSnapshotContents(
             var rows = store.conn.rows(
                 \\select message_id, role, author, body, image_path, image_mime,
                 \\       image_byte_size, tool_call_id, tool_call_kind, tool_call_status,
-                \\       created_at_ms, updated_at_ms
+                \\       created_at_ms, updated_at_ms, extra_images_json
                 \\from messages where thread_id = ?1 order by sort_index
             , .{thread_row.row_id}) catch return error.StoreUnavailable;
             defer rows.deinit();
@@ -7324,11 +7724,7 @@ fn loadSnapshotContents(
                     .mime = arena.dupe(u8, row.nullableText(5) orelse "") catch return error.OutOfMemory,
                     .byte_size = if (row.nullableInt(6)) |value| (std.math.cast(usize, value) orelse 0) else 0,
                 } else null;
-                const images: []const store_protocol.Attachment = if (image) |value| blk: {
-                    const slice = arena.alloc(store_protocol.Attachment, 1) catch return error.OutOfMemory;
-                    slice[0] = value;
-                    break :blk slice;
-                } else &.{};
+                const images = try decodeAttachmentList(arena, image, row.nullableText(12));
                 messages.append(arena, .{
                     .message_id = arena.dupe(u8, row.nullableText(0) orelse "") catch return error.OutOfMemory,
                     .role = roleNameFromCode(row.int(1), row.text(2)),
@@ -7446,20 +7842,59 @@ fn methodRunsUnlocked(method: []const u8) bool {
     // mutex only; the `.normal` outer lockDaemon window cannot nest that work.
     return std.mem.eql(u8, method, "chat.turn.start") or
         std.mem.eql(u8, method, "chat.turn.tail") or
+        std.mem.eql(u8, method, "chat.turn.steer") or
+        std.mem.eql(u8, method, "chat.followup") or
         // Read-only provider discovery can block for seconds on provider
         // CLIs/servers; it touches no daemon state, so never hold lockDaemon.
         std.mem.eql(u8, method, "provider.models.list");
 }
 
 fn classifyServerRequest(allocator: std.mem.Allocator, request: []const u8) !ServerRequestClass {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, request, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidRequest;
-    const method = jsonString(parsed.value.object.get("method") orelse .null) orelse return error.InvalidRequest;
-    if (methodNeedsSlowWork(method)) return .slow_registry;
-    if (isStoreMethod(method)) return .store;
-    if (methodRunsUnlocked(method)) return .unlocked_method;
-    return .normal;
+    // Streaming scan for the top-level "method" key only. Request bodies reach
+    // 8 MiB (state.snapshot.replace), and materializing a full std.json.Value
+    // DOM here just to read one field doubled the daemon's parse cost for
+    // every large request; handleRequest still performs the one authoritative
+    // full parse. The tail drain keeps malformed bodies classifying as
+    // invalid_request exactly as the DOM parse did.
+    var scanner = std.json.Scanner.initCompleteInput(allocator, request);
+    defer scanner.deinit();
+    if (try scanner.next() != .object_begin) return error.InvalidRequest;
+    const class: ServerRequestClass = while (true) {
+        const key_token = try scanner.nextAlloc(allocator, .alloc_if_needed);
+        var key_owned: ?[]u8 = null;
+        defer if (key_owned) |owned| allocator.free(owned);
+        const key: []const u8 = switch (key_token) {
+            .string => |value| value,
+            .allocated_string => |value| blk: {
+                key_owned = value;
+                break :blk value;
+            },
+            else => return error.InvalidRequest, // object_end: no "method" key
+        };
+        if (!std.mem.eql(u8, key, "method")) {
+            try scanner.skipValue();
+            continue;
+        }
+        const value_token = try scanner.nextAlloc(allocator, .alloc_if_needed);
+        var method_owned: ?[]u8 = null;
+        defer if (method_owned) |owned| allocator.free(owned);
+        const method: []const u8 = switch (value_token) {
+            .string => |value| value,
+            .allocated_string => |value| blk: {
+                method_owned = value;
+                break :blk value;
+            },
+            else => return error.InvalidRequest,
+        };
+        if (methodNeedsSlowWork(method)) break .slow_registry;
+        if (isStoreMethod(method)) break .store;
+        if (methodRunsUnlocked(method)) break .unlocked_method;
+        break .normal;
+    };
+    // Validate the remainder so a syntax error after "method" still reports
+    // invalid_request instead of reaching the handler misclassified.
+    while (try scanner.next() != .end_of_document) {}
+    return class;
 }
 
 fn sessionizerServerShouldStop(raw_context: *anyopaque) bool {
@@ -7961,15 +8396,15 @@ fn cloneImportedOutcome(allocator: std.mem.Allocator, src: daemon_store.Imported
 }
 
 fn lockDaemon(daemon: *Daemon) void {
-    while (!daemon.mutex.tryLock()) std.atomic.spinLoopHint();
+    daemon.mutex.lock();
 }
 
 fn lockTurn(turn: *ChatTurn) void {
-    while (!turn.mutex.tryLock()) std.atomic.spinLoopHint();
+    turn.mutex.lock();
 }
 
 fn lockJournal(daemon: *Daemon) void {
-    while (!daemon.journal_mutex.tryLock()) std.atomic.spinLoopHint();
+    daemon.journal_mutex.lock();
 }
 
 fn chatTurnKeepsDaemonAlive(
@@ -8197,8 +8632,8 @@ fn writeChatTurnTail(
     try s.write(turn.started_at_ms);
     try s.objectField("events");
     try s.beginArray();
-    for (turn.events.items) |event| {
-        if (event.seq <= after_seq or event.seq > through_seq) continue;
+    for (chatTailEventsAfter(turn, after_seq)) |event| {
+        if (event.seq > through_seq) break;
         try s.beginObject();
         try s.objectField("seq");
         try s.write(event.seq);
@@ -8319,11 +8754,26 @@ fn durableChatTurnTailResponse(
     return try writer.toOwnedSlice();
 }
 
+/// Subslice of events with seq > after_seq. Seqs are dense and ascending
+/// (append-only from next_seq=1, no compaction until M5), so the start index
+/// is arithmetic on the first event's seq — never a scan. Tail polls arrive
+/// at streaming cadence, so any O(turn-events) walk here multiplies into
+/// O(turn) daemon CPU per appended delta on large threads. Must be called
+/// under the turn mutex.
+fn chatTailEventsAfter(turn: *const ChatTurn, after_seq: u64) []const ChatEvent {
+    const items = turn.events.items;
+    if (items.len == 0) return items;
+    const first_seq = items[0].seq;
+    if (after_seq < first_seq) return items;
+    const skip = after_seq - first_seq + 1;
+    if (skip >= items.len) return items[items.len..];
+    return items[skip..];
+}
+
 fn chatTailPageEndSeq(turn: *const ChatTurn, after_seq: u64, max_bytes: usize) u64 {
     var through_seq = after_seq;
     var total = chatTailMetadataUpperBound(turn, true);
-    for (turn.events.items) |event| {
-        if (event.seq <= after_seq) continue;
+    for (chatTailEventsAfter(turn, after_seq)) |event| {
         const with_event = saturatedAdd(total, chatEventUpperBound(event));
         if (through_seq != after_seq and with_event > max_bytes) break;
         total = with_event;
@@ -8333,16 +8783,15 @@ fn chatTailPageEndSeq(turn: *const ChatTurn, after_seq: u64, max_bytes: usize) u
 }
 
 fn chatTailHasEventsAfter(turn: *const ChatTurn, seq: u64) bool {
-    for (turn.events.items) |event| {
-        if (event.seq > seq) return true;
-    }
-    return false;
+    // Ascending seqs: the newest event alone answers "anything past seq?".
+    const items = turn.events.items;
+    return items.len != 0 and items[items.len - 1].seq > seq;
 }
 
 fn chatTailUpperBound(turn: *const ChatTurn, after_seq: u64, through_seq: u64, include_terminal_fields: bool) usize {
     var total = chatTailMetadataUpperBound(turn, include_terminal_fields);
-    for (turn.events.items) |event| {
-        if (event.seq <= after_seq or event.seq > through_seq) continue;
+    for (chatTailEventsAfter(turn, after_seq)) |event| {
+        if (event.seq > through_seq) break;
         total = saturatedAdd(total, chatEventUpperBound(event));
     }
     return total;
@@ -8412,11 +8861,104 @@ fn writePendingApproval(s: *std.json.Stringify, pending: ?PendingApproval) !void
     try s.endObject();
 }
 
+fn freeAttachmentArray(allocator: std.mem.Allocator, attachments: []store_protocol.Attachment) void {
+    for (attachments) |attachment| {
+        allocator.free(attachment.path);
+        allocator.free(attachment.mime);
+    }
+    if (attachments.len > 0) allocator.free(attachments);
+}
+
+/// Parse the additive `images` turn param ([{path, mime?, byte_size?}]) into
+/// owned attachments. Absent/empty yields an empty slice so legacy
+/// `image_paths`-only clients keep working; metadata is stored only when the
+/// client genuinely sent it.
+fn jsonAttachmentArray(allocator: std.mem.Allocator, value: std.json.Value) ![]store_protocol.Attachment {
+    const array = switch (value) {
+        .array => |entries| entries,
+        else => return &.{},
+    };
+    if (array.items.len == 0) return &.{};
+    var list: std.ArrayList(store_protocol.Attachment) = .empty;
+    errdefer {
+        for (list.items) |attachment| {
+            allocator.free(attachment.path);
+            allocator.free(attachment.mime);
+        }
+        list.deinit(allocator);
+    }
+    for (array.items) |item| {
+        const object = switch (item) {
+            .object => |fields| fields,
+            else => return error.InvalidParams,
+        };
+        const path = jsonString(object.get("path") orelse .null) orelse return error.InvalidParams;
+        if (path.len == 0) return error.InvalidParams;
+        const mime = jsonString(object.get("mime") orelse .null) orelse "";
+        const byte_size: usize = if (object.get("byte_size")) |raw| switch (raw) {
+            .integer => |number| std.math.cast(usize, number) orelse 0,
+            else => 0,
+        } else 0;
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+        const owned_mime = try allocator.dupe(u8, mime);
+        errdefer allocator.free(owned_mime);
+        try list.append(allocator, .{ .path = owned_path, .mime = owned_mime, .byte_size = byte_size });
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+test "turn images param and stored extra-image columns round-trip full lists" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Params → owned attachments: metadata only when the client sent it.
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\[{"path":"/tmp/a.png","mime":"image/png","byte_size":11},{"path":"/tmp/b.png"}]
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+    const attachments = try jsonAttachmentArray(allocator, parsed.value);
+    defer freeAttachmentArray(allocator, attachments);
+    try std.testing.expectEqual(@as(usize, 2), attachments.len);
+    try std.testing.expectEqualStrings("/tmp/a.png", attachments[0].path);
+    try std.testing.expectEqualStrings("image/png", attachments[0].mime);
+    try std.testing.expectEqual(@as(usize, 11), attachments[0].byte_size);
+    try std.testing.expectEqualStrings("/tmp/b.png", attachments[1].path);
+    try std.testing.expectEqualStrings("", attachments[1].mime);
+    // Absent and empty params stay empty for legacy image_paths-only clients.
+    try std.testing.expectEqual(@as(usize, 0), (try jsonAttachmentArray(allocator, .null)).len);
+    // A non-object entry is a malformed request, not a silent drop.
+    const bad = try std.json.parseFromSlice(std.json.Value, allocator, "[\"/tmp/x.png\"]", .{});
+    defer bad.deinit();
+    try std.testing.expectError(error.InvalidParams, jsonAttachmentArray(allocator, bad.value));
+
+    // Stored columns → snapshot list: [primary] ++ extras, and a malformed
+    // extras column degrades to primary-only instead of failing the read.
+    const primary: store_protocol.Attachment = .{ .path = "/tmp/a.png", .mime = "image/png", .byte_size = 11 };
+    const full = try decodeAttachmentList(arena, primary, "[{\"path\":\"/tmp/b.png\",\"mime\":\"\",\"byte_size\":22}]");
+    try std.testing.expectEqual(@as(usize, 2), full.len);
+    try std.testing.expectEqualStrings("/tmp/b.png", full[1].path);
+    try std.testing.expectEqual(@as(usize, 22), full[1].byte_size);
+    const degraded = try decodeAttachmentList(arena, primary, "not-json");
+    try std.testing.expectEqual(@as(usize, 1), degraded.len);
+    try std.testing.expectEqualStrings("/tmp/a.png", degraded[0].path);
+    const no_primary = try decodeAttachmentList(arena, null, "[{\"path\":\"/tmp/b.png\"}]");
+    try std.testing.expectEqual(@as(usize, 0), no_primary.len);
+}
+
 fn createChatTurnFromParams(allocator: std.mem.Allocator, params: std.json.Value) !*ChatTurn {
     const turn = try allocator.create(ChatTurn);
     errdefer allocator.destroy(turn);
     const image_paths = try jsonStringArray(allocator, params.object.get("image_paths") orelse .null);
     errdefer freeStringArray(allocator, image_paths);
+    const owned_images = try jsonAttachmentArray(allocator, params.object.get("images") orelse .null);
+    errdefer freeAttachmentArray(allocator, owned_images);
     const provider = parseEnum(harness.Provider, jsonString(params.object.get("provider") orelse .null) orelse return error.InvalidParams) orelse return error.InvalidParams;
     const harness_kind = parseEnum(harness.HarnessKind, jsonString(params.object.get("harness") orelse .null) orelse "local_cli") orelse return error.InvalidParams;
     const request: send_runner.Request = .{
@@ -8451,6 +8993,7 @@ fn createChatTurnFromParams(allocator: std.mem.Allocator, params: std.json.Value
         .local_thread_id = try requiredDupe(allocator, params, "local_thread_id"),
         .request = request,
         .owned_image_paths = image_paths,
+        .owned_images = owned_images,
         .started_at_ms = nowMs(),
         .user_message_id = user_message_id,
         .use_stub = use_stub,
@@ -9514,6 +10057,44 @@ fn appendTestChatTurn(
     owned_image_paths = null;
     owns_turn = false;
     return turn;
+}
+
+test "chat.followup resolves running turns daemon-side and rejects idle or unsupported threads" {
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+
+    const idle_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"chat.followup","params":{"workspace_id":"followup-workspace","local_thread_id":"local-thread","prompt":"continue"}}
+    );
+    defer allocator.free(idle_response);
+    var idle = try std.json.parseFromSlice(std.json.Value, allocator, idle_response, .{});
+    defer idle.deinit();
+    const idle_error = idle.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings("invalid_state", idle_error.get("code").?.string);
+    try std.testing.expectEqualStrings("thread has no running turn", idle_error.get("message").?.string);
+
+    const turn = try appendTestChatTurn(
+        &daemon,
+        allocator,
+        "followup-turn",
+        "followup-workspace",
+        "/tmp/followup",
+        "Follow-up",
+        "original",
+        .running,
+        1,
+    );
+    turn.request.provider = .opencode;
+    const unsupported_response = try daemon.handleRequest(
+        \\{"jsonrpc":"2.0","id":2,"method":"chat.followup","params":{"workspace_id":"followup-workspace","local_thread_id":"local-thread","prompt":"continue"}}
+    );
+    defer allocator.free(unsupported_response);
+    var unsupported = try std.json.parseFromSlice(std.json.Value, allocator, unsupported_response, .{});
+    defer unsupported.deinit();
+    const unsupported_error = unsupported.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings("invalid_state", unsupported_error.get("code").?.string);
+    try std.testing.expectEqualStrings("provider does not support daemon steering", unsupported_error.get("message").?.string);
 }
 
 test "chat turns project into process.list as turn records" {
@@ -11046,6 +11627,8 @@ test "draining dispatcher rejects every state mutator" {
         "session.cleanup",
         "chat.turn.start",
         "chat.turn.approve",
+        "chat.turn.steer",
+        "chat.followup",
         "chat.turn.cancel",
         "chat.turn.consume",
         "process.start",
@@ -11062,6 +11645,7 @@ test "draining dispatcher rejects every state mutator" {
         "state.snapshot.replace",
         "workspace.upsert",
         "chat.thread.upsert",
+        "chat.draft.set",
         "chat.message.append",
         "surface.upsert",
         "surface.clear",
@@ -12703,7 +13287,7 @@ test "durable reads decode canonical and historical daemon chat role codes" {
     _ = try daemon.store_service.?.store.upsertThread(.{
         .mutation = .{ .request_key = "dto-thread", .client_id = "daemon" },
         .workspace_id = "ws-dto",
-        .thread = .{ .local_thread_id = "t-dto", .title = "DTO thread", .provider = "codex", .harness = "local_cli" },
+        .thread = .{ .local_thread_id = "t-dto", .title = "DTO thread", .provider = "codex", .harness = "local_cli", .draft = "staged DTO draft" },
     });
     const thread_row = (try daemon.store_service.?.store.conn.row(
         "select id from threads where local_thread_id = ?1",
@@ -12755,6 +13339,7 @@ test "durable reads decode canonical and historical daemon chat role codes" {
     defer get_parsed.deinit();
     const thread = get_parsed.value.object.get("result").?.object.get("thread").?.object;
     try std.testing.expectEqualStrings("t-dto", thread.get("local_thread_id").?.string);
+    try std.testing.expectEqualStrings("staged DTO draft", thread.get("draft").?.string);
     const messages = thread.get("messages").?.array.items;
     const expected_roles = [_][]const u8{
         "user",      "assistant", "system",

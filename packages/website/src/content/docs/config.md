@@ -38,6 +38,9 @@ file. It is read on startup and on app refresh.
     "default": "folder",
     "links": "verde_browser"
   },
+  "browser": {
+    "scroll_speed": 2.5
+  },
   "terminal": {
     "font_size": 18,
     "profiles": [
@@ -94,6 +97,8 @@ Most of these options also appear in Settings:
   exchange and choose the provider and model used for titles.
 - **Terminal** — font size, launch profiles, and whether terminal link clicks
   open in Verde's browser pane or the system browser.
+- **Browser** — set embedded-page wheel speed from `1.0×` to `5.0×`; the
+  default is `2.5×`.
 - **Workspace** — choose `automatic`, `always`, or `disabled` scrolling layout,
   set the automatic activation threshold (1–64 panes), choose horizontal or
   vertical scrolling, control how many panes fit in one view and their gap,
@@ -114,6 +119,10 @@ Most of these options also appear in Settings:
 Settings that write `verde.json` apply when you choose **Save**. Provider hook
 installation/removal runs immediately because it updates the provider's own
 configuration.
+
+`browser.scroll_speed` accepts values from `1.0` through `5.0`. Older configs
+using `browser.fast_scrolling` remain compatible: `true` maps to the `2.5×`
+default and `false` maps to `1.0×`.
 
 ### Open actions
 

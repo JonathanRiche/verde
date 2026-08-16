@@ -149,6 +149,7 @@ pub const live_capabilities = [_][]const u8{
     "chat.open",
     "chat.status",
     "chat.transcript",
+    "chat.draft.get",
     "chat.draft.set",
     "chat.draft.append",
     "chat.send",
@@ -212,6 +213,20 @@ pub const live_capabilities = [_][]const u8{
     "stack.restart",
 };
 
+/// Stable chat-tool names exposed by the stdio MCP bridge.
+pub const mcp_chat_tools = [_][]const u8{
+    "open_chat",
+    "present_chat",
+    "set_chat_draft",
+    "get_chat_draft",
+    "send_chat_message",
+    "queue_chat_followup",
+    "tail_chat_turn",
+    "approve_chat_turn",
+    "stop_chat_turn",
+    "read_chat_thread",
+};
+
 pub const pane_commands = [_][]const u8{
     "focus",
     "split",
@@ -241,7 +256,7 @@ pub const chat_commands = [_][]const u8{
     "approve",
 };
 
-pub const chat_draft_commands = [_][]const u8{ "set", "append" };
+pub const chat_draft_commands = [_][]const u8{ "get", "set", "append" };
 
 pub const browser_commands = [_][]const u8{
     "open",
@@ -346,6 +361,9 @@ pub const all_flags = [_][]const u8{
     "--reasoning-variant",
     "--fast",
     "--no-fast",
+    "--on",
+    "--off",
+    "--toggle",
     "--lines",
     "--script",
     "--json-payload",
@@ -377,6 +395,7 @@ pub const pane_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--j
 pub const pane_split_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--kind", "--axis", "--json" };
 pub const pane_resize_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--first", "--second", "--axis", "--ratio", "--json" };
 pub const pane_move_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--direction", "--json" };
+pub const pane_maximize_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--on", "--off", "--toggle", "--json" };
 pub const workspace_select_flags = [_][]const u8{ "--workspace", "--project", "--json" };
 pub const workspace_create_flags = [_][]const u8{ "--path", "--json" };
 pub const workspace_rename_flags = [_][]const u8{ "--workspace", "--project", "--label", "--json" };
@@ -397,7 +416,7 @@ pub const chat_open_flags = [_][]const u8{
     "--no-focus",
     "--json",
 };
-pub const chat_draft_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--text", "--json" };
+pub const chat_draft_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--thread", "--text", "--json" };
 pub const chat_send_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--prompt", "--text", "--json" };
 pub const chat_approve_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--call", "--decision", "--json" };
 pub const terminal_write_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--text", "--json" };

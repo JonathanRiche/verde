@@ -19,9 +19,9 @@ const profiler = @import("../runtime/profiler.zig");
 const RootLayout = struct {
     sidebar: palette.Rect,
     workspace: palette.Rect,
+    target_workspace_width: f32,
 };
 
-const SIDEBAR_ANIM_DURATION_MS: i64 = 180;
 /// Above composer overlays (150), pane menus (180), and model cascade (1400).
 const PALETTE_MODAL_Z: i32 = 2000;
 /// Persistent root overlay below true modal ownership and above pane content.
@@ -189,11 +189,11 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     const root_layout = computeRootLayout(state, width, height);
     queueRootBackground(state, width, height);
     if (state.isSidebarHidden()) {
-        workspace_panes.renderAt(state, root_layout.workspace);
+        workspace_panes.renderAtWithTranscriptLayoutWidth(state, root_layout.workspace, root_layout.target_workspace_width);
         sidebar.renderPalette(state, root_layout.sidebar);
     } else {
         sidebar.renderPalette(state, root_layout.sidebar);
-        workspace_panes.renderAt(state, root_layout.workspace);
+        workspace_panes.renderAtWithTranscriptLayoutWidth(state, root_layout.workspace, root_layout.target_workspace_width);
     }
     // Queue this root overlay only after scrolling panes have clipped their
     // local command range; the batch is z-sorted, so pre-queued high-z menu
@@ -246,20 +246,27 @@ fn computeRootLayout(state: *runtime.AppState, width: f32, height: f32) RootLayo
     }
     const dt_ms = @max(now_ms - sidebar_anim_last_ms, 0);
     sidebar_anim_last_ms = now_ms;
-    const step = if (SIDEBAR_ANIM_DURATION_MS <= 0)
+    const duration_ms = theme.motionDurationMs(state.app_config.reduced_motion, theme.MOTION_BASE_MS);
+    const step = if (duration_ms <= 0)
         1.0
     else
-        theme.clampf(@as(f32, @floatFromInt(dt_ms)) / @as(f32, @floatFromInt(SIDEBAR_ANIM_DURATION_MS)), 0.0, 1.0);
-    const eased = 1.0 - std.math.pow(f32, 1.0 - step, 3.0);
+        theme.clampf(@as(f32, @floatFromInt(dt_ms)) / @as(f32, @floatFromInt(duration_ms)), 0.0, 1.0);
+    const eased = theme.easeOutCubic(step);
     sidebar_anim_width = approach(sidebar_anim_width, target_sidebar_width, eased);
     sidebar_anim_x = approach(sidebar_anim_x, target_sidebar_x, eased);
     sidebar_animating = @abs(sidebar_anim_width - target_sidebar_width) > 0.5 or @abs(sidebar_anim_x - target_sidebar_x) > 0.5;
+    if (!sidebar_animating) {
+        sidebar_anim_width = target_sidebar_width;
+        sidebar_anim_x = target_sidebar_x;
+    }
 
     const layout_sidebar_width = if (hidden) 0.0 else sidebar_anim_width;
+    const target_layout_sidebar_width = if (hidden) 0.0 else target_sidebar_width;
     const workspace_width = @max(width - layout_sidebar_width - gap, theme.scaledUi(320.0));
     return .{
         .sidebar = .{ .x = sidebar_anim_x, .y = 0.0, .w = sidebar_anim_width, .h = height },
         .workspace = .{ .x = layout_sidebar_width + gap, .y = 0.0, .w = workspace_width, .h = height },
+        .target_workspace_width = @max(width - target_layout_sidebar_width - gap, theme.scaledUi(320.0)),
     };
 }
 
@@ -537,6 +544,7 @@ fn pointInRect(x: f32, y: f32, rect: palette.Rect) bool {
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
     if (!down) {
         if (state.modal_text_drag_active) state.modal_text_drag_active = false;
+        settings_modal.endBrowserScrollSpeedDrag(state);
     }
     if (state.palette_modal_hits.items.len == 0) return false;
     var i = state.palette_modal_hits.items.len;
@@ -609,7 +617,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                     state.setSidebarNotice("Could not save settings to verde.json.");
                 }
             },
-            .settings_control => settings_modal.applyControl(state, hit.index),
+            .settings_control => settings_modal.applyControlAt(state, hit.index, hit.rect, x),
             .settings_theme_option => settings_modal.applyThemeOption(state, hit.index),
             .settings_title_provider_option => settings_modal.applyChatTitleProviderOption(state, hit.index),
             .settings_title_model_option => settings_modal.applyChatTitleModelOption(state, hit.index),
@@ -677,6 +685,7 @@ fn focusModalInput(state: *runtime.AppState, focus: runtime.PaletteModalTextFocu
 
 /// Routes modal pointer motion and reports whether the workspace is occluded.
 pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) bool {
+    if (settings_modal.updateBrowserScrollSpeedDrag(state, x)) return true;
     if (state.updateImageModalPan(x, y)) return true;
     if (state.modal_text_drag_active and state.palette_modal_text_focus != .none) {
         const value = focusedValue(state);
