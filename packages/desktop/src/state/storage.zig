@@ -1503,8 +1503,8 @@ test "effective projection store is independent from pref artifacts" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDir(std.testing.io, "pref", .fromMode(0o755));
-    try tmp.dir.createDir(std.testing.io, "store", .fromMode(0o755));
+    try tmp.dir.createDir(std.testing.io, "pref", std.Io.File.Permissions.default_dir);
+    try tmp.dir.createDir(std.testing.io, "store", std.Io.File.Permissions.default_dir);
     var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
     const pref_path = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "pref" });
