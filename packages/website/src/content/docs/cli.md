@@ -204,9 +204,20 @@ verde live chat approve --pane <pane-id> --decision approve|deny [--call <id>] [
 - `transcript` returns persisted messages for the pane's thread.
 - `draft set` replaces the current draft; `draft append` appends to it.
 - `send` sends `--prompt`, `--text`, or a trailing prompt argument. If no prompt is supplied, it sends the current draft.
-- `followup` queues or steers a prompt while a send is active.
+- `followup` steers a prompt into the pane's **running** turn. It is
+  daemon-led: it resolves the pane's thread through the session daemon, never
+  changes focus, presentation, or the composer draft, and returns structured
+  results — `disposition: "steered"` on success, `invalid_state` when the pane
+  has no running turn (nothing is staged as a draft), and `not_found` for a
+  missing pane or thread. Steering currently supports Claude local-CLI turns;
+  other provider harnesses return a structured unsupported error.
 - `stop` aborts the current send for that chat thread.
 - `approve` resolves the current pending approval. `--decision` accepts `approve` or `deny`.
+
+Chat turns run in the session daemon, so an accepted turn keeps running and
+lands durably even if the desktop window is closed or restarted mid-turn.
+Drafts and staged image attachments persist with their thread across pane
+switches and app restarts.
 
 ## Terminal and process control
 
@@ -306,6 +317,25 @@ require an explicit confirmed retry so the agent client can ask the user first.
 requires `pane_id`, accepts an optional workspace selector, and takes either a
 named key plus modifier booleans or a chord. It preserves desktop focus and
 does not restart a stopped session.
+
+### Chat control over MCP
+
+The bridge exposes the full GUI-chat surface to agents: `open_chat`,
+`present_chat`, `send_chat_message`, `get_chat_draft` / `set_chat_draft`,
+`read_chat_thread`, `tail_chat_turn`, `stop_chat_turn`, `approve_chat_turn`,
+and `queue_chat_followup`, plus `list_workspaces` / `list_panes` for
+discovery.
+
+- `read_chat_thread` and `queue_chat_followup` are **daemon-direct**: they
+  read persisted thread state through the session daemon, so they work even
+  when the GUI has paged the thread out of memory.
+- `queue_chat_followup` steers a prompt into a running turn with the same
+  semantics as `verde live chat followup` — structured
+  `steered` / `invalid_state` / `not_found` results, no focus or composer
+  changes, and no silent draft staging when the turn is idle.
+- Capabilities are granular: a tool that cannot run in the current
+  configuration returns `capability_unavailable` instead of failing
+  ambiguously. Discover the active surface with `verde capabilities --json`.
 
 ### Process coordination and retained outcomes
 
