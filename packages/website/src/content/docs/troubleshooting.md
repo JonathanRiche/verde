@@ -175,6 +175,20 @@ Exit code `3` means the live server is not running or not ready — start the ap
 first. See [CLI reference](/docs/cli) for the full command surface and exit
 codes.
 
+## The session daemon
+
+Chat turns and persistent terminal sessions run in a background session daemon
+that outlives the desktop window. Useful properties when debugging:
+
+- Closing or restarting the app does **not** kill running agent turns or
+  terminal sessions; the GUI reattaches to them on the next launch.
+- When a newer Verde starts against an older daemon, the daemon drains and
+  upgrades itself automatically. If the CLI reports `method_not_found` for a
+  feature the docs say exists, an old daemon is usually still winding down —
+  retry after a moment, or restart the app.
+- `verde session list --json` shows daemon-owned terminal sessions even while
+  the desktop app is closed.
+
 ## Getting help
 
 - [GitHub issues](https://github.com/JonathanRiche/verde/issues) for bugs and feature requests.
