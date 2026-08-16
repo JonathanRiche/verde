@@ -62,17 +62,28 @@ message stays pinned above the composer. Double-click that pin to pull it back
 into an empty composer for editing, then press `Tab` to queue it again.
 
 **Stop** aborts the active run. Verde keeps the draft with its thread, so
-changing panes does not discard unfinished text.
+changing panes does not discard unfinished text. Drafts — including staged
+image attachments — persist with the thread across pane switches and app
+restarts.
+
+Runs are owned by Verde's session daemon rather than the window: once a send
+is accepted, the turn keeps running and its transcript lands durably even if
+the desktop app is closed or restarted mid-turn.
 
 The same paths are scriptable with `verde live chat send`, `followup`, `stop`,
-and `draft`. See [CLI reference](/docs/cli#chat-control).
+and `draft`, and are exposed to agents over MCP (including daemon-direct
+`read_chat_thread` and `queue_chat_followup`). See
+[CLI reference](/docs/cli#chat-control).
 
 ## Attach images and mention files
 
 Paste an image with `Ctrl+V` (`Cmd+V` on macOS) while the chat composer owns
 focus. Verde stages it above the composer instead of converting it to text.
 Paste again to attach multiple images, remove individual previews before
-sending, and click a transcript image to open its full-size preview.
+sending, and click a transcript image to open its full-size preview. Staged
+attachments are persisted with the thread's draft, so they survive switching
+threads or restarting the app, and sent images remain viewable in the saved
+transcript.
 
 Codex, Claude Code, and OpenCode accept local image attachments. Cursor accepts
 them only when its ACP session advertises image support. Remote Herdr Codex GUI

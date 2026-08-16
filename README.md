@@ -172,16 +172,24 @@ agents:
     hooks: true
 ```
 
+### Headless session daemon
+
+Chat turns and terminal sessions live in a **session daemon**, not the window. The GUI, CLI, MCP bridge, and the experimental web client all attach as detached clients — agent turns keep running and land durably if the window closes, and the daemon drains and upgrades itself when a new Verde version starts. Drafts, image attachments, and transcripts persist across restarts.
+
 ### Scriptable from your shell
 
-Every running instance exposes local IPC (`verde live`). Inspect panes, send prompts, write to terminals, open the browser — from hooks, dotfiles, or automation:
+Every running instance exposes local IPC (`verde live`). Inspect panes, open chats, send prompts, steer a running turn, write to terminals, open the browser — from hooks, dotfiles, or automation:
 
 ```bash
 verde live status --json
+verde live chat open --workspace $WS --provider codex --model gpt-5.6-sol --reasoning high
 verde live chat send --pane $PANE --prompt "run the tests and fix failures"
+verde live chat followup --pane $PANE --prompt "also update the changelog"  # steer the running turn
 verde live terminal write --focused --text $'cargo test\r'
 verde open http://localhost:3000
 ```
+
+The same chat surface is exposed to agents over MCP (`verde mcp`): open panes, send prompts, read transcripts, and queue mid-turn follow-ups — daemon-direct, without stealing focus or touching your composer.
 
 → Full surface: [CLI reference](https://verdeai.dev/docs/cli)
 
@@ -280,9 +288,12 @@ The UI stack is SDL3 (window/events/scale) + SDL_GPU + Palette — not web UI or
 
 - **Zig 0.16** — native executable, no Electron shell
 - **SDL3 + Palette** — windowing, input, and in-tree Zig GUI framework
-- **Ghostty / libghostty-vt** — embedded terminal engine
+- **Headless session daemon** — owns chat turns and PTYs; GUI, web gateway, CLI, and MCP are detached clients, so agent work survives window restarts
+- **Ghostty / libghostty-vt** — embedded terminal engine, pinned to upstream (no vendored fork)
 - **Native webview** — WPE WebKit · WKWebView · WebView2 (no bundled Chromium)
-- **SQLite** — local projects, threads, transcripts
+- **SQLite** — local projects, threads, transcripts, drafts, and image attachments
+
+The render loop is tuned for low idle cost: prompt acceptance is sub-millisecond even on long threads, daemon round-trips run off the render thread, and streaming large transcripts stays O(delta) per update.
 
 Third-party notices and licenses for vendored components are listed under [Third-party components](#third-party-components) below when redistributing.
 
