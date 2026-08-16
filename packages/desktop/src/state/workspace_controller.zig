@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const project_state = @import("project.zig");
+const process_registry = @import("../daemon/process_registry.zig");
 const ai_harness = @import("../providers/harness.zig");
 const chat_threads = @import("../chat/threads.zig");
 const runtime_log = @import("../runtime/log.zig");
@@ -24,7 +25,6 @@ const DEFAULT_OPENCODE_MODEL = provider_models.DEFAULT_OPENCODE_MODEL;
 const DEFAULT_CLAUDE_MODEL = provider_models.DEFAULT_CLAUDE_MODEL;
 const DEFAULT_CURSOR_MODEL = provider_models.DEFAULT_CURSOR_MODEL;
 const CODEX_MODEL_OPTIONS = provider_models.CODEX_MODEL_OPTIONS;
-const CODEX_REASONING_OPTIONS = provider_models.CODEX_REASONING_OPTIONS;
 const CLAUDE_STANDARD_EFFORT_VALUES = provider_models.CLAUDE_STANDARD_EFFORT_VALUES;
 const parseReasoningEffort = provider_models.parseReasoningEffort;
 const WorkspacePaneId = workspace_layout.WorkspacePaneId;
@@ -43,6 +43,7 @@ pub const OpenChatResult = struct {
     pane_id: WorkspacePaneId,
     thread_index: usize,
     focused: bool,
+    presentation_existing: bool = false,
 };
 
 pub const OpenChatRequest = struct {
@@ -51,6 +52,13 @@ pub const OpenChatRequest = struct {
     reasoning_effort: ?ReasoningEffort = null,
     reasoning_variant: ?[]const u8 = null,
     fast_mode: ?FastMode = null,
+    target_pane_id: ?WorkspacePaneId = null,
+    axis: WorkspaceSplitAxis = .horizontal,
+    focus: bool = true,
+};
+
+pub const PresentChatRequest = struct {
+    local_thread_id: []const u8,
     target_pane_id: ?WorkspacePaneId = null,
     axis: WorkspaceSplitAxis = .horizontal,
     focus: bool = true,
@@ -109,115 +117,14 @@ const Project = project_state.Project;
 const WorkspaceLease = project_state.WorkspaceLease;
 const TerminalProcessFinish = project_state.TerminalProcessFinish;
 
-pub const CommandClass = enum {
-    other,
-    build,
-    @"test",
-    formatter,
-    package_install,
-    migration,
-    dev_server,
-};
-
-/// Conservatively classifies commands whose shared output is well-known.
-/// Unknown commands remain concurrent unless callers declare resources.
-pub fn classifyWorkspaceCommand(command: []const u8) CommandClass {
-    if (commandHasAnyToken(command, &.{ "migrate", "migration", "migrations" })) return .migration;
-    if (isPackageInstallCommand(command)) return .package_install;
-    if (commandHasAnyToken(command, &.{ "fmt", "format", "formatter", "prettier", "gofmt", "rustfmt" })) return .formatter;
-    if (commandHasAnyToken(command, &.{ "test", "tests", "pytest", "vitest", "jest" })) return .@"test";
-    if (commandHasAnyToken(command, &.{ "build", "compile" }) or commandStartsWithToken(command, "make")) return .build;
-    if (commandHasAnyToken(command, &.{ "dev", "serve", "server" })) return .dev_server;
-    return .other;
-}
-
-pub fn inferredWorkspaceResource(command: []const u8) ?[]const u8 {
-    return switch (classifyWorkspaceCommand(command)) {
-        .build, .@"test" => "build",
-        .formatter => "source",
-        .package_install => "deps",
-        .migration => "db",
-        .other, .dev_server => null,
-    };
-}
-
-fn commandHasAnyToken(command: []const u8, wanted: []const []const u8) bool {
-    var tokens = std.mem.tokenizeAny(u8, command, " \t\r\n'\"=,:;()[]{}");
-    while (tokens.next()) |token| {
-        for (wanted) |candidate| {
-            if (std.ascii.eqlIgnoreCase(token, candidate)) return true;
-        }
-    }
-    return false;
-}
-
-fn commandStartsWithAnyToken(command: []const u8, wanted: []const []const u8) bool {
-    for (wanted) |candidate| {
-        if (commandStartsWithToken(command, candidate)) return true;
-    }
-    return false;
-}
-
-fn commandStartsWithToken(command: []const u8, wanted: []const u8) bool {
-    var tokens = std.mem.tokenizeAny(u8, command, " \t\r\n'\"");
-    while (tokens.next()) |token| {
-        if (std.ascii.eqlIgnoreCase(token, "exec") or
-            std.ascii.eqlIgnoreCase(token, "sh") or
-            std.ascii.eqlIgnoreCase(token, "bash") or
-            std.ascii.eqlIgnoreCase(token, "zsh") or
-            std.mem.eql(u8, token, "-c") or
-            std.mem.eql(u8, token, "-lc")) continue;
-        return std.ascii.eqlIgnoreCase(std.fs.path.basename(token), wanted);
-    }
-    return false;
-}
-
-fn isPackageInstallCommand(command: []const u8) bool {
-    const managers = [_][]const u8{ "npm", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "cargo", "gem", "bundle", "composer" };
-    const has_manager = commandHasAnyToken(command, &managers) or commandStartsWithAnyToken(command, &managers);
-    return has_manager and commandHasAnyToken(command, &.{ "install", "add", "remove", "update", "upgrade" });
-}
-
-pub fn workspaceResourcesOverlap(left: anytype, right: anytype) bool {
-    for (left) |left_resource| {
-        for (right) |right_resource| {
-            if (std.mem.eql(u8, left_resource, right_resource)) return true;
-        }
-    }
-    return false;
-}
-
-fn workspaceLeaseResourcesEqual(left: anytype, right: anytype) bool {
-    if (left.len != right.len) return false;
-    for (left) |resource| {
-        var found = false;
-        for (right) |candidate| {
-            if (std.mem.eql(u8, resource, candidate)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) return false;
-    }
-    return true;
-}
-
-pub fn appendOwnedString(allocator: std.mem.Allocator, list: *std.ArrayList([]u8), value: []const u8) !void {
-    const owned = try allocator.dupe(u8, value);
-    errdefer allocator.free(owned);
-    try list.append(allocator, owned);
-}
+pub const CommandClass = process_registry.CommandClass;
+pub const classifyWorkspaceCommand = process_registry.classifyWorkspaceCommand;
+pub const inferredWorkspaceResource = process_registry.inferredWorkspaceResource;
+pub const workspaceResourcesOverlap = process_registry.workspaceResourcesOverlap;
+pub const appendOwnedString = process_registry.appendOwnedString;
 
 pub fn pruneExpiredLeases(project: *Project, allocator: std.mem.Allocator, now_ms: i64) void {
-    var index: usize = 0;
-    while (index < project.workspace_leases.items.len) {
-        if (project.workspace_leases.items[index].expires_at_ms > now_ms) {
-            index += 1;
-            continue;
-        }
-        var expired = project.workspace_leases.orderedRemove(index);
-        expired.deinit(allocator);
-    }
+    _ = process_registry.pruneExpiredLeaseList(&project.workspace_leases, allocator, now_ms);
 }
 
 pub fn acquireLease(
@@ -232,72 +139,32 @@ pub fn acquireLease(
 ) !*WorkspaceLease {
     if (owner.len == 0) return error.LeaseOwnerRequired;
     if (resources.len == 0) return error.LeaseResourcesRequired;
-    pruneExpiredLeases(project, allocator, now_ms);
-
-    for (project.workspace_leases.items) |*existing| {
-        if (!std.mem.eql(u8, existing.owner, owner)) continue;
-        if (!workspaceLeaseResourcesEqual(existing.resources.items, resources)) continue;
-        existing.expires_at_ms = now_ms + ttl_ms;
-        if (!std.mem.eql(u8, existing.command, command)) {
-            const replacement = try allocator.dupe(u8, command);
-            allocator.free(existing.command);
-            existing.command = replacement;
-        }
-        return existing;
-    }
-
-    if (!force) {
-        for (project.workspace_leases.items) |existing| {
-            if (std.mem.eql(u8, existing.owner, owner)) continue;
-            if (workspaceResourcesOverlap(existing.resources.items, resources)) return error.LeaseConflict;
-        }
-    }
-
-    var lease: WorkspaceLease = lease: {
-        const id = try std.fmt.allocPrint(allocator, "lease:{d}", .{project.next_workspace_lease_id});
-        errdefer allocator.free(id);
-        const owned_owner = try allocator.dupe(u8, owner);
-        errdefer allocator.free(owned_owner);
-        const owned_command = try allocator.dupe(u8, command);
-        errdefer allocator.free(owned_command);
-        break :lease .{
-            .id = id,
-            .owner = owned_owner,
-            .command = owned_command,
-            .created_at_ms = now_ms,
-            .expires_at_ms = now_ms + ttl_ms,
-        };
-    };
-    project.next_workspace_lease_id += 1;
-    errdefer lease.deinit(allocator);
-    for (resources) |resource| try appendOwnedString(allocator, &lease.resources, resource);
-    try project.workspace_leases.append(allocator, lease);
-    return &project.workspace_leases.items[project.workspace_leases.items.len - 1];
+    const lease_index = try process_registry.acquireLeaseInList(
+        &project.workspace_leases,
+        allocator,
+        owner,
+        command,
+        resources,
+        ttl_ms,
+        force,
+        now_ms,
+        .legacy_decimal,
+        "",
+        &project.next_workspace_lease_id,
+    );
+    return &project.workspace_leases.items[lease_index];
 }
 
 pub fn releaseLease(project: *Project, allocator: std.mem.Allocator, owner: []const u8, lease_id: ?[]const u8, now_ms: i64) usize {
     if (owner.len == 0) return 0;
-    pruneExpiredLeases(project, allocator, now_ms);
-    var released: usize = 0;
-    var index: usize = 0;
-    while (index < project.workspace_leases.items.len) {
-        const existing = &project.workspace_leases.items[index];
-        if (!std.mem.eql(u8, existing.owner, owner) or
-            (lease_id != null and !std.mem.eql(u8, existing.id, lease_id.?)))
-        {
-            index += 1;
-            continue;
-        }
-        var removed = project.workspace_leases.orderedRemove(index);
-        removed.deinit(allocator);
-        released += 1;
-        if (lease_id != null) break;
-    }
-    return released;
+    _ = process_registry.pruneExpiredLeaseList(&project.workspace_leases, allocator, now_ms);
+    return process_registry.releaseLeaseList(&project.workspace_leases, allocator, owner, lease_id);
 }
 
 pub fn releaseLeasesForExactOwner(project: *Project, allocator: std.mem.Allocator, owner: []const u8, now_ms: i64) usize {
-    return releaseLease(project, allocator, owner, null, now_ms);
+    if (owner.len == 0) return 0;
+    _ = process_registry.pruneExpiredLeaseList(&project.workspace_leases, allocator, now_ms);
+    return process_registry.releaseLeasesForExactOwnerList(&project.workspace_leases, allocator, owner);
 }
 
 pub fn ensureCurrentProjectWorkspace(self: anytype) void {
@@ -803,6 +670,31 @@ pub fn terminalPaneScreenTextForProject(self: anytype, project_index: usize, pan
     return try dock.activeScreenTextAlloc(self.allocator);
 }
 
+pub fn terminalPaneRenderStateForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId) ?*const terminal.RenderState {
+    if (project_index >= self.project_controller.projects.items.len) return null;
+    const project = &self.project_controller.projects.items[project_index];
+    const pane = project.workspace_layout.paneById(pane_id) orelse return null;
+    const dock_id = switch (pane.ref) {
+        .terminal => |ref| ref.dock_id,
+        else => return null,
+    };
+    const dock = self.projectTerminalDock(project_index, dock_id) orelse return null;
+    return dock.activeRenderState();
+}
+
+pub fn terminalPaneGridSizeForProject(self: anytype, project_index: usize, pane_id: WorkspacePaneId) ?struct { cols: u16, rows: u16 } {
+    if (project_index >= self.project_controller.projects.items.len) return null;
+    const project = &self.project_controller.projects.items[project_index];
+    const pane = project.workspace_layout.paneById(pane_id) orelse return null;
+    const dock_id = switch (pane.ref) {
+        .terminal => |ref| ref.dock_id,
+        else => return null,
+    };
+    const dock = self.projectTerminalDock(project_index, dock_id) orelse return null;
+    const grid = dock.activeGridSize() orelse return null;
+    return .{ .cols = grid.cols, .rows = grid.rows };
+}
+
 pub fn pollTerminalDockBeforeRead(self: anytype, project_index: usize, dock_id: u32, dock: *terminal.Dock) !void {
     const changed = try dock.poll(self.allocator);
     self.syncTerminalDockProcessLifecycle(project_index, dock_id, dock, null);
@@ -1125,9 +1017,23 @@ pub fn isCurrentProjectWorkspacePaneMaximized(self: anytype, pane_id: WorkspaceP
 }
 
 pub fn focusWorkspacePane(self: anytype, project_index: usize, pane_id: WorkspacePaneId) bool {
+    return focusWorkspacePaneWithCompletionPolicy(self, project_index, pane_id, true);
+}
+
+pub fn restoreWorkspacePaneFocus(self: anytype, project_index: usize, pane_id: WorkspacePaneId) bool {
+    return focusWorkspacePaneWithCompletionPolicy(self, project_index, pane_id, false);
+}
+
+fn focusWorkspacePaneWithCompletionPolicy(
+    self: anytype,
+    project_index: usize,
+    pane_id: WorkspacePaneId,
+    acknowledge_completion: bool,
+) bool {
     if (project_index >= self.project_controller.projects.items.len) return false;
     var layout = &self.project_controller.projects.items[project_index].workspace_layout;
     const pane = layout.paneById(pane_id) orelse return false;
+    const pane_focus_changed = layout.focused_pane_id != pane_id;
     // Ordinary focus movement uses the strip's minimal-reveal behavior. A
     // direct navigation path may request leading-edge placement after this
     // method completes.
@@ -1137,29 +1043,52 @@ pub fn focusWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
     // eating clicks through the popover routing.
     self.closePaletteModelPicker();
     self.closeRunConfigPopover();
+    var persisted_focus_changed = layout.focused_pane_id != pane_id;
     layout.focused_pane_id = pane_id;
     switch (pane.ref) {
         .chat => |ref| {
             var project = &self.project_controller.projects.items[project_index];
+            const thread_focus_changed = project.selected_thread_index != ref.thread_index;
             if (ref.thread_index < project.threads.items.len) {
+                persisted_focus_changed = persisted_focus_changed or project.selected_thread_index != ref.thread_index;
                 project.selected_thread_index = ref.thread_index;
-                _ = self.clearChatCompletion(project_index, ref.thread_index);
+                if (acknowledge_completion) _ = self.clearChatCompletion(project_index, ref.thread_index);
             }
             project.last_content_pane_id = pane_id;
             if (self.project_controller.selected_index == project_index) {
+                if (thread_focus_changed) self.noteTranscriptSelectionChanged();
                 self.syncPaletteComposerFromDraft();
-                self.requestComposerFocus();
+                if (acknowledge_completion) {
+                    self.requestComposerFocus();
+                } else {
+                    self.restoreComposerFocus();
+                }
+                if (pane_focus_changed or thread_focus_changed) {
+                    self.prepareTranscriptPaneFocus(project_index, pane_id);
+                }
             }
         },
         .terminal => |ref| {
             self.project_controller.projects.items[project_index].last_content_pane_id = pane_id;
-            if (self.project_controller.selected_index == project_index) self.requestTerminalDockFocus(ref.dock_id);
+            if (self.project_controller.selected_index == project_index) {
+                if (acknowledge_completion) {
+                    self.requestTerminalDockFocus(ref.dock_id);
+                } else {
+                    self.restoreTerminalDockFocus(ref.dock_id);
+                }
+            }
         },
         .browser => {
-            if (self.project_controller.selected_index == project_index) self.focusBrowserPane();
+            if (self.project_controller.selected_index == project_index) {
+                if (acknowledge_completion) {
+                    self.focusBrowserPaneInWorkspace(project_index, pane_id);
+                } else {
+                    self.restoreBrowserPaneFocus(project_index, pane_id);
+                }
+            }
         },
     }
-    self.markDirty();
+    if (acknowledge_completion and persisted_focus_changed) self.markDirty();
     return true;
 }
 
@@ -1349,11 +1278,7 @@ pub fn closeWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
             self.setSidebarNotice(if (preserve_agent_history) "Agent TUI closed. Reopen it from History." else "Terminal pane closed.");
         },
         .browser => {
-            const removed_runtime_owner = if (self.browser_controller.runtime_project_index) |runtime_project_index|
-                runtime_project_index == project_index
-            else
-                false;
-            self.reconcileBrowserRuntimeAfterPaneRemoval(project_index, removed_runtime_owner);
+            self.reconcileBrowserRuntimeAfterPaneRemoval(project_index, pane_id);
             self.setSidebarNotice("Browser pane closed.");
         },
     }
@@ -1463,6 +1388,50 @@ pub fn openWorkspaceChat(
     return result;
 }
 
+/// Present a daemon-projected thread without creating or replacing its identity.
+pub fn presentWorkspaceChat(self: anytype, project_index: usize, request: PresentChatRequest) !OpenChatResult {
+    if (project_index >= self.project_controller.projects.items.len) return error.ProjectNotFound;
+    var project = &self.project_controller.projects.items[project_index];
+    const thread_index = for (project.threads.items, 0..) |thread, index| {
+        if (std.mem.eql(u8, thread.local_thread_id, request.local_thread_id)) break index;
+    } else return error.ProjectionPending;
+
+    for (project.workspace_layout.panes.items) |pane| switch (pane.ref) {
+        .chat => |chat_ref| if (chat_ref.thread_index == thread_index) {
+            if (request.focus) {
+                project.workspace_layout.focusCreatedPane(pane.id);
+                project.selected_thread_index = thread_index;
+                project.last_content_pane_id = pane.id;
+                self.project_controller.selected_index = project_index;
+                self.requestComposerFocus();
+                self.syncPaletteComposerFromDraft();
+                self.syncRenameBuffer();
+                self.markDirty();
+            }
+            return .{ .pane_id = pane.id, .thread_index = thread_index, .focused = request.focus, .presentation_existing = true };
+        },
+        else => {},
+    };
+
+    const result = try createWorkspaceChatPaneForThread(
+        project,
+        self.allocator,
+        thread_index,
+        request.target_pane_id,
+        request.axis,
+        request.focus,
+    );
+    if (request.focus) {
+        self.project_controller.selected_index = project_index;
+        self.requestComposerFocus();
+        self.syncPaletteComposerFromDraft();
+        self.syncRenameBuffer();
+    }
+    self.setSidebarNotice("Chat pane ready.");
+    self.markDirty();
+    return result;
+}
+
 pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, model_ref: []const u8) !EffectiveChatSettings {
     if (request.reasoning_effort != null and request.reasoning_variant != null) {
         return error.ConflictingReasoningSettings;
@@ -1470,7 +1439,7 @@ pub fn resolveChatCreationSettings(self: anytype, request: OpenChatRequest, mode
 
     if (request.reasoning_effort) |effort| {
         const supported = switch (request.provider) {
-            .codex => codexSupportsReasoningEffort(effort),
+            .codex => codexSupportsReasoningEffort(model_ref, effort),
             .claude => blk: {
                 const option = self.modelOptionForProvider(.claude, model_ref) orelse break :blk false;
                 if (!option.reasoning_supported) break :blk false;
@@ -1530,8 +1499,8 @@ pub fn modelOptionForProvider(self: anytype, provider: Provider, model_ref: []co
     return null;
 }
 
-pub fn codexSupportsReasoningEffort(effort: ReasoningEffort) bool {
-    for (CODEX_REASONING_OPTIONS) |option| {
+pub fn codexSupportsReasoningEffort(model_ref: []const u8, effort: ReasoningEffort) bool {
+    for (provider_models.codexReasoningOptions(model_ref)) |option| {
         if (option.value) |value| {
             if (value == effort) return true;
         }
@@ -1669,6 +1638,80 @@ pub fn createWorkspaceChatPane(
         .thread_index = thread_index,
         .focused = focus,
     };
+}
+
+fn createWorkspaceChatPaneForThread(
+    project: *Project,
+    allocator: std.mem.Allocator,
+    thread_index: usize,
+    target_pane_id: ?WorkspacePaneId,
+    axis: WorkspaceSplitAxis,
+    focus: bool,
+) !OpenChatResult {
+    var layout = &project.workspace_layout;
+    const target_id = target_pane_id orelse layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse
+        return error.TargetPaneNotFound;
+    _ = layout.paneById(target_id) orelse return error.TargetPaneNotFound;
+    const previous_focused_pane_id = layout.focused_pane_id;
+    const previous_maximized_pane_id = layout.maximized_pane_id;
+    const previous_thread_index = project.selected_thread_index;
+    const previous_last_content_pane_id = project.last_content_pane_id;
+    const previous_next_pane_id = layout.next_pane_id;
+    const previous_viewport: WorkspaceViewportSnapshot = .{
+        .offset_x = layout.scroll_offset_x,
+        .target_x = layout.scroll_target_x,
+        .offset_y = layout.scroll_offset_y,
+        .target_y = layout.scroll_target_y,
+        .revealed_pane_id = layout.scroll_revealed_pane_id,
+        .leading_pane_id = layout.scroll_leading_pane_id,
+        .animation_last_ms = layout.scroll_animation_last_ms,
+        .axis_vertical = layout.scroll_axis_vertical,
+    };
+    const previous_quick_pane = layout.quick_pane;
+    errdefer layout.next_pane_id = previous_next_pane_id;
+    const new_pane_id = try layout.createChatPane(allocator, thread_index);
+    var pane_inserted = true;
+    errdefer if (pane_inserted) {
+        if (layout.closePane(allocator, new_pane_id)) |removed| {
+            var removed_ref = removed;
+            deinitWorkspacePaneRef(&removed_ref, allocator);
+        }
+        layout.focused_pane_id = previous_focused_pane_id;
+        layout.maximized_pane_id = previous_maximized_pane_id;
+        project.selected_thread_index = previous_thread_index;
+        project.last_content_pane_id = previous_last_content_pane_id;
+        layout.scroll_offset_x = previous_viewport.offset_x;
+        layout.scroll_target_x = previous_viewport.target_x;
+        layout.scroll_offset_y = previous_viewport.offset_y;
+        layout.scroll_target_y = previous_viewport.target_y;
+        layout.scroll_revealed_pane_id = previous_viewport.revealed_pane_id;
+        layout.scroll_leading_pane_id = previous_viewport.leading_pane_id;
+        layout.scroll_animation_last_ms = previous_viewport.animation_last_ms;
+        layout.scroll_axis_vertical = previous_viewport.axis_vertical;
+        layout.quick_pane = previous_quick_pane;
+    };
+    try layout.splitPaneWithLeaf(allocator, target_id, new_pane_id, axis, true);
+    pane_inserted = false;
+    if (focus) {
+        layout.focusCreatedPane(new_pane_id);
+        project.selected_thread_index = thread_index;
+        project.last_content_pane_id = new_pane_id;
+    } else {
+        layout.focused_pane_id = previous_focused_pane_id;
+        layout.maximized_pane_id = previous_maximized_pane_id;
+        project.selected_thread_index = previous_thread_index;
+        project.last_content_pane_id = previous_last_content_pane_id;
+        layout.scroll_offset_x = previous_viewport.offset_x;
+        layout.scroll_target_x = previous_viewport.target_x;
+        layout.scroll_offset_y = previous_viewport.offset_y;
+        layout.scroll_target_y = previous_viewport.target_y;
+        layout.scroll_revealed_pane_id = previous_viewport.revealed_pane_id;
+        layout.scroll_leading_pane_id = previous_viewport.leading_pane_id;
+        layout.scroll_animation_last_ms = previous_viewport.animation_last_ms;
+        layout.scroll_axis_vertical = previous_viewport.axis_vertical;
+        layout.quick_pane = previous_quick_pane;
+    }
+    return .{ .pane_id = new_pane_id, .thread_index = thread_index, .focused = focus };
 }
 
 pub fn splitCurrentProjectWorkspacePaneWithThread(
@@ -1884,6 +1927,41 @@ pub fn tuiResumeCommand(self: anytype, provider: Provider, thread_id: []const u8
         .claude => std.fmt.allocPrint(self.allocator, "claude --resume {s}\n", .{thread_id}),
         .cursor => std.fmt.allocPrint(self.allocator, "agent --resume {s}\n", .{thread_id}),
     };
+}
+
+fn threadForTuiDock(project: *const Project, dock_id: u32) ?*const ChatThread {
+    for (project.threads.items) |*thread| {
+        if (thread.tui_dock_id == dock_id) return thread;
+    }
+    for (project.archived_threads.items) |*thread| {
+        if (thread.tui_dock_id == dock_id) return thread;
+    }
+    return null;
+}
+
+fn terminalPaneForDock(project: *const Project, dock_id: u32) ?WorkspacePaneId {
+    if (project.workspace_layout.visibleTerminalPaneIdForDock(dock_id)) |pane_id| return pane_id;
+    for (project.workspace_layout.panes.items) |pane| {
+        switch (pane.ref) {
+            .terminal => |ref| if (ref.dock_id == dock_id) return pane.id,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Replays the provider resume command only when the terminal layer reports
+/// that a persisted daemon session had to be recreated. Thread and dock IDs,
+/// rather than mutable display titles, provide the durable association.
+pub fn resumeRecreatedThreadTui(self: anytype, project_index: usize, dock_id: u32) !bool {
+    if (project_index >= self.project_controller.projects.items.len) return false;
+    const project = &self.project_controller.projects.items[project_index];
+    const thread = threadForTuiDock(project, dock_id) orelse return false;
+    const provider_thread_id = thread.provider_thread_id orelse return false;
+    const pane_id = terminalPaneForDock(project, dock_id) orelse return false;
+    const command = try self.tuiResumeCommand(thread.provider, provider_thread_id);
+    defer self.allocator.free(command);
+    return try self.writeWorkspaceTerminalPaneForProject(project_index, pane_id, command);
 }
 
 pub fn splitCurrentProjectWorkspacePaneWithTerminalAxis(self: anytype, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis) bool {
@@ -2102,4 +2180,23 @@ test "background chat creation preserves the scrolling viewport" {
     try std.testing.expectEqual(@as(?WorkspacePaneId, focused_pane_id), layout.scroll_leading_pane_id);
     try std.testing.expectEqual(@as(i64, 456), layout.scroll_animation_last_ms);
     try std.testing.expect(layout.scroll_axis_vertical);
+}
+
+test "TUI restoration associates provider sessions by dock instead of title" {
+    const allocator = std.testing.allocator;
+    var project = try Project.init(allocator, "tui-restore", "TUI restore", "/tmp/tui-restore", 0);
+    defer project.deinit(allocator);
+
+    const first = &project.threads.items[0];
+    first.tui_dock_id = 7;
+    first.provider_thread_id = try allocator.dupeZ(u8, "provider-first");
+    const second_index = try project.addThread(allocator);
+    const second = &project.threads.items[second_index];
+    second.tui_dock_id = 11;
+    second.provider_thread_id = try allocator.dupeZ(u8, "provider-second");
+
+    try std.testing.expectEqualStrings(project.threads.items[0].title, second.title);
+    try std.testing.expectEqualStrings("provider-first", threadForTuiDock(&project, 7).?.provider_thread_id.?);
+    try std.testing.expectEqualStrings("provider-second", threadForTuiDock(&project, 11).?.provider_thread_id.?);
+    try std.testing.expect(threadForTuiDock(&project, 99) == null);
 }

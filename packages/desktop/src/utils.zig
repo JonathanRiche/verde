@@ -609,7 +609,7 @@ pub fn sendWorker(state: *chat_types.SendState, request: *SendWorkerRequest) voi
                 @errorName(err),
             },
         );
-        if (err == error.CodexTurnInterrupted and state.stop_requested) {
+        if ((err == error.CodexTurnInterrupted or err == error.ClaudeTurnInterrupted) and state.stop_requested) {
             state.error_message = null;
             state.result = null;
             state.status = .aborted;
@@ -2214,15 +2214,8 @@ pub fn freePendingApprovalLocked(allocator: std.mem.Allocator, approval: *?chat_
 }
 
 fn freePendingTimelineEvent(allocator: std.mem.Allocator, event: chat_types.PendingTimelineEvent) void {
-    allocator.free(event.author);
-    allocator.free(event.body);
-    if (event.tool_call_id) |call_id| allocator.free(call_id);
-    if (event.tool_call_title) |value| allocator.free(value);
-    if (event.tool_call_input) |value| allocator.free(value);
-    if (event.tool_call_output) |value| allocator.free(value);
-    if (event.tool_call_error) |value| allocator.free(value);
-    if (event.tool_call_locations) |value| allocator.free(value);
-    if (event.tool_call_raw) |value| allocator.free(value);
+    var owned = event;
+    owned.deinit(allocator);
 }
 
 /// Releases owned streamed timeline events copied out of the send worker.
@@ -2394,6 +2387,7 @@ test "structured tool-call updates upsert and merge lifecycle content" {
         .input = "{\"path\":\"/tmp/a.txt\"}",
         .raw = "{\"status\":\"in_progress\"}",
     });
+    events.items[0].transcript_card_started_ms = 123;
     try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
         .call_id = "call-1",
         .title = "",
@@ -2407,6 +2401,7 @@ test "structured tool-call updates upsert and merge lifecycle content" {
     const event = events.items[0];
     try std.testing.expectEqualStrings("call-1", event.tool_call_id.?);
     try std.testing.expectEqual(ai_harness.ToolCallStatus.completed, event.tool_call_status.?);
+    try std.testing.expectEqual(@as(i64, 123), event.transcript_card_started_ms);
     try std.testing.expectEqualStrings("Edit", event.author);
     try std.testing.expect(std.mem.indexOf(u8, event.body, "Edit `/tmp/a.txt`") != null);
     try std.testing.expect(std.mem.indexOf(u8, event.body, "{\"path\":\"/tmp/a.txt\"}") != null);

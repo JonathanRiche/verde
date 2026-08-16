@@ -24,6 +24,8 @@ pub const NativeKeyboardAction = enum {
     chat_page_down,
     workspace_previous,
     workspace_next,
+    workspace_active_previous,
+    workspace_active_next,
     workspace_pane_previous,
     workspace_pane_next,
     workspace_split_chat_vertical,
@@ -117,6 +119,12 @@ pub const Keybind = struct {
     }
 };
 
+/// Matches the conventional page reload chord reserved for focused browser panes.
+pub fn isBrowserReloadEvent(event: *const sdl.KeyboardEvent) bool {
+    const binding: Keybind = .{ .primary = true, .key = .r };
+    return binding.matches(event);
+}
+
 pub const NativeKeyboardConfig = struct {
     allocator: std.mem.Allocator,
     refresh: []Keybind,
@@ -137,6 +145,8 @@ pub const NativeKeyboardConfig = struct {
     chat_run_config: []Keybind,
     workspace_previous: []Keybind,
     workspace_next: []Keybind,
+    workspace_active_previous: []Keybind,
+    workspace_active_next: []Keybind,
     workspace_pane_previous: []Keybind,
     workspace_pane_next: []Keybind,
     terminal_new_tab: []Keybind,
@@ -165,6 +175,7 @@ pub const NativeKeyboardConfig = struct {
     workspace_focus_up: []Keybind,
     workspace_focus_down: []Keybind,
     workspace_focus_prompt: []Keybind,
+    workspace_active_select: []Keybind,
     workspace_pane_select: []Keybind,
     workspace_move_left: []Keybind,
     workspace_move_right: []Keybind,
@@ -197,6 +208,8 @@ pub const NativeKeyboardConfig = struct {
             .chat_run_config = try cloneDefaultChatRunConfigKeybinds(allocator),
             .workspace_previous = try cloneDefaultWorkspacePreviousKeybinds(allocator),
             .workspace_next = try cloneDefaultWorkspaceNextKeybinds(allocator),
+            .workspace_active_previous = try cloneDefaultWorkspaceActivePreviousKeybinds(allocator),
+            .workspace_active_next = try cloneDefaultWorkspaceActiveNextKeybinds(allocator),
             .workspace_pane_previous = try cloneDefaultWorkspacePanePreviousKeybinds(allocator),
             .workspace_pane_next = try cloneDefaultWorkspacePaneNextKeybinds(allocator),
             .terminal_new_tab = try cloneDefaultTerminalNewTabKeybinds(allocator),
@@ -225,6 +238,7 @@ pub const NativeKeyboardConfig = struct {
             .workspace_focus_up = try cloneDefaultWorkspaceFocusUpKeybinds(allocator),
             .workspace_focus_down = try cloneDefaultWorkspaceFocusDownKeybinds(allocator),
             .workspace_focus_prompt = try cloneDefaultWorkspaceFocusPromptKeybinds(allocator),
+            .workspace_active_select = try cloneDefaultWorkspaceActiveSelectKeybinds(allocator),
             .workspace_pane_select = try cloneDefaultWorkspacePaneSelectKeybinds(allocator),
             .workspace_move_left = try cloneDefaultWorkspaceMoveLeftKeybinds(allocator),
             .workspace_move_right = try cloneDefaultWorkspaceMoveRightKeybinds(allocator),
@@ -268,6 +282,8 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.chat_run_config);
         self.allocator.free(self.workspace_previous);
         self.allocator.free(self.workspace_next);
+        self.allocator.free(self.workspace_active_previous);
+        self.allocator.free(self.workspace_active_next);
         self.allocator.free(self.workspace_pane_previous);
         self.allocator.free(self.workspace_pane_next);
         self.allocator.free(self.terminal_new_tab);
@@ -296,6 +312,7 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.workspace_focus_up);
         self.allocator.free(self.workspace_focus_down);
         self.allocator.free(self.workspace_focus_prompt);
+        self.allocator.free(self.workspace_active_select);
         self.allocator.free(self.workspace_pane_select);
         self.allocator.free(self.workspace_move_left);
         self.allocator.free(self.workspace_move_right);
@@ -356,6 +373,12 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.workspace_next, event)) {
             return .workspace_next;
+        }
+        if (matchesAny(self.workspace_active_previous, event)) {
+            return .workspace_active_previous;
+        }
+        if (matchesAny(self.workspace_active_next, event)) {
+            return .workspace_active_next;
         }
         if (matchesAny(self.workspace_pane_previous, event)) {
             return .workspace_pane_previous;
@@ -451,6 +474,13 @@ pub const NativeKeyboardConfig = struct {
             if (binding.matches(event)) {
                 return index;
             }
+        }
+        return null;
+    }
+
+    pub fn workspaceActiveSelectIndexForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?usize {
+        for (self.workspace_active_select, 0..) |binding, index| {
+            if (binding.matches(event)) return index;
         }
         return null;
     }
@@ -816,6 +846,12 @@ pub const NativeKeyboardConfig = struct {
                 self.workspace_focus_prompt = bindings;
             }
         }
+        if (workspace_value.object.get("active_select")) |value| {
+            if (self.parseOverrideValue(value, "workspace.active_select")) |bindings| {
+                self.allocator.free(self.workspace_active_select);
+                self.workspace_active_select = bindings;
+            }
+        }
         if (workspace_value.object.get("pane_select")) |value| {
             if (self.parseOverrideValue(value, "workspace.pane_select")) |bindings| {
                 self.allocator.free(self.workspace_pane_select);
@@ -886,6 +922,18 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(value, "workspace.next")) |bindings| {
                 self.allocator.free(self.workspace_next);
                 self.workspace_next = bindings;
+            }
+        }
+        if (workspace_value.object.get("active_previous")) |value| {
+            if (self.parseOverrideValue(value, "workspace.active_previous")) |bindings| {
+                self.allocator.free(self.workspace_active_previous);
+                self.workspace_active_previous = bindings;
+            }
+        }
+        if (workspace_value.object.get("active_next")) |value| {
+            if (self.parseOverrideValue(value, "workspace.active_next")) |bindings| {
+                self.allocator.free(self.workspace_active_next);
+                self.workspace_active_next = bindings;
             }
         }
         if (workspace_value.object.get("pane_previous")) |value| {
@@ -971,7 +1019,6 @@ pub const NativeKeyboardConfig = struct {
 
 fn cloneDefaultKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("CommandOrControl+R"),
         try parseDefaultAccelerator("CommandOrControl+Shift+R"),
         try parseDefaultAccelerator("Ctrl+Shift+R"),
         try parseDefaultAccelerator("F5"),
@@ -1199,6 +1246,18 @@ fn cloneDefaultWorkspaceNextKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     });
 }
 
+fn cloneDefaultWorkspaceActivePreviousKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Ctrl+Shift+Left"),
+    });
+}
+
+fn cloneDefaultWorkspaceActiveNextKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Ctrl+Shift+Right"),
+    });
+}
+
 fn cloneDefaultWorkspacePanePreviousKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Ctrl+Shift+Tab"),
@@ -1229,6 +1288,21 @@ fn cloneDefaultWorkspacePaneSelectKeybinds(allocator: std.mem.Allocator) ![]Keyb
         try parseDefaultAccelerator("Ctrl+8"),
         try parseDefaultAccelerator("Ctrl+9"),
         try parseDefaultAccelerator("Ctrl+0"),
+    });
+}
+
+fn cloneDefaultWorkspaceActiveSelectKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Ctrl+Shift+1"),
+        try parseDefaultAccelerator("Ctrl+Shift+2"),
+        try parseDefaultAccelerator("Ctrl+Shift+3"),
+        try parseDefaultAccelerator("Ctrl+Shift+4"),
+        try parseDefaultAccelerator("Ctrl+Shift+5"),
+        try parseDefaultAccelerator("Ctrl+Shift+6"),
+        try parseDefaultAccelerator("Ctrl+Shift+7"),
+        try parseDefaultAccelerator("Ctrl+Shift+8"),
+        try parseDefaultAccelerator("Ctrl+Shift+9"),
+        try parseDefaultAccelerator("Ctrl+Shift+0"),
     });
 }
 
@@ -1305,6 +1379,111 @@ fn cloneDefaultWorkspaceSelectKeybinds(allocator: std.mem.Allocator) ![]Keybind 
         try parseDefaultAccelerator("Alt+9"),
         try parseDefaultAccelerator("Alt+0"),
     });
+}
+
+/// Formats the first loaded binding for UI hints. The caller owns `buf`, so
+/// separate controls can render hints in the same frame without shared state.
+pub fn formatFirstKeybind(buf: []u8, bindings: []const Keybind) []const u8 {
+    if (bindings.len == 0) return "";
+    return formatKeybind(buf, bindings[0]);
+}
+
+/// Formats the key portion of the first plain Alt binding. Commands rebound
+/// away from Alt stay out of Alt-reveal mode instead of showing a stale tip.
+pub fn formatAltKeyTip(buf: []u8, bindings: []const Keybind) []const u8 {
+    for (bindings) |binding| {
+        if (!binding.alt or binding.primary or binding.ctrl or binding.meta or binding.shift) continue;
+        const name = keycodeLabel(binding.key);
+        const count = @min(buf.len, name.len);
+        @memcpy(buf[0..count], name[0..count]);
+        for (buf[0..count]) |*byte| byte.* = std.ascii.toUpper(byte.*);
+        return buf[0..count];
+    }
+    return "";
+}
+
+/// Formats the key portion of an indexed plain Alt binding. Workspace rows
+/// use the binding's configured order rather than assuming 1…0.
+pub fn formatAltKeyTipAt(buf: []u8, bindings: []const Keybind, index: usize) []const u8 {
+    if (index >= bindings.len) return "";
+    const binding = bindings[index];
+    if (!binding.alt or binding.primary or binding.ctrl or binding.meta or binding.shift) return "";
+    const name = keycodeLabel(binding.key);
+    const count = @min(buf.len, name.len);
+    @memcpy(buf[0..count], name[0..count]);
+    for (buf[0..count]) |*byte| byte.* = std.ascii.toUpper(byte.*);
+    return buf[0..count];
+}
+
+/// Formats the key portion of an indexed plain Ctrl binding. Sidebar pane
+/// hints use the same ordering as `workspacePaneSelectIndexForEvent`.
+pub fn formatCtrlKeyTipAt(buf: []u8, bindings: []const Keybind, index: usize) []const u8 {
+    if (index >= bindings.len) return "";
+    const binding = bindings[index];
+    const primary_is_ctrl = binding.primary and builtin.os.tag != .macos;
+    if ((!binding.ctrl and !primary_is_ctrl) or binding.alt or binding.meta or binding.shift) return "";
+    const name = keycodeLabel(binding.key);
+    const count = @min(buf.len, name.len);
+    @memcpy(buf[0..count], name[0..count]);
+    for (buf[0..count]) |*byte| byte.* = std.ascii.toUpper(byte.*);
+    return buf[0..count];
+}
+
+/// Formats the key portion of the first Ctrl+Shift binding. Commands rebound
+/// away from Ctrl+Shift stay out of Ctrl+Shift reveal mode.
+pub fn formatCtrlShiftKeyTip(buf: []u8, bindings: []const Keybind) []const u8 {
+    for (bindings) |binding| {
+        const primary_is_ctrl = binding.primary and builtin.os.tag != .macos;
+        if ((!binding.ctrl and !primary_is_ctrl) or binding.alt or binding.meta or !binding.shift) continue;
+        const name = keycodeLabel(binding.key);
+        const count = @min(buf.len, name.len);
+        @memcpy(buf[0..count], name[0..count]);
+        for (buf[0..count]) |*byte| byte.* = std.ascii.toUpper(byte.*);
+        return buf[0..count];
+    }
+    return "";
+}
+
+/// Formats the key portion of an indexed Ctrl+Shift binding used by ACTIVE rows.
+pub fn formatCtrlShiftKeyTipAt(buf: []u8, bindings: []const Keybind, index: usize) []const u8 {
+    if (index >= bindings.len) return "";
+    const binding = bindings[index];
+    const primary_is_ctrl = binding.primary and builtin.os.tag != .macos;
+    if ((!binding.ctrl and !primary_is_ctrl) or binding.alt or binding.meta or !binding.shift) return "";
+    const name = keycodeLabel(binding.key);
+    const count = @min(buf.len, name.len);
+    @memcpy(buf[0..count], name[0..count]);
+    for (buf[0..count]) |*byte| byte.* = std.ascii.toUpper(byte.*);
+    return buf[0..count];
+}
+
+fn formatKeybind(buf: []u8, binding: Keybind) []const u8 {
+    var count: usize = 0;
+    if (binding.primary or binding.ctrl) count += copyInto(buf[count..], "Ctrl+");
+    if (binding.meta) count += copyInto(buf[count..], "Meta+");
+    if (binding.alt) count += copyInto(buf[count..], "Alt+");
+    if (binding.shift) count += copyInto(buf[count..], "Shift+");
+    const name = keycodeLabel(binding.key);
+    count += copyInto(buf[count..], name);
+    if (name.len == 1 and count > 0) buf[count - 1] = std.ascii.toUpper(buf[count - 1]);
+    return buf[0..count];
+}
+
+fn keycodeLabel(key: sdl.Keycode) []const u8 {
+    return switch (key) {
+        .@"return" => "Enter",
+        .left => "Left",
+        .right => "Right",
+        .up => "Up",
+        .down => "Down",
+        else => @tagName(key),
+    };
+}
+
+fn copyInto(dest: []u8, src: []const u8) usize {
+    const count = @min(dest.len, src.len);
+    @memcpy(dest[0..count], src[0..count]);
+    return count;
 }
 
 fn parseDefaultAccelerator(binding: []const u8) !Keybind {
@@ -1515,6 +1694,16 @@ test "parse accelerator matches desktop-style refresh binding" {
     try std.testing.expectEqual(sdl.Keycode.r, binding.key);
 }
 
+test "ctrl shift key tip follows the first matching configured binding" {
+    const bindings: [2]Keybind = .{
+        .{ .alt = true, .shift = true, .key = .x },
+        .{ .ctrl = true, .shift = true, .key = .o },
+    };
+    var buf: [16]u8 = undefined;
+
+    try std.testing.expectEqualStrings("O", formatCtrlShiftKeyTip(&buf, &bindings));
+}
+
 test "array parsing deduplicates repeated bindings" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
@@ -1628,6 +1817,36 @@ test "workspace pane select defaults map ctrl number order" {
     try std.testing.expectEqual(sdl.Keycode.@"1", config.workspace_pane_select[0].key);
     try std.testing.expect(config.workspace_pane_select[9].ctrl);
     try std.testing.expectEqual(sdl.Keycode.@"0", config.workspace_pane_select[9].key);
+}
+
+test "workspace active select defaults map ctrl shift number order" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 10), config.workspace_active_select.len);
+    try std.testing.expect(config.workspace_active_select[0].ctrl);
+    try std.testing.expect(config.workspace_active_select[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.@"1", config.workspace_active_select[0].key);
+    try std.testing.expect(config.workspace_active_select[9].ctrl);
+    try std.testing.expect(config.workspace_active_select[9].shift);
+    try std.testing.expectEqual(sdl.Keycode.@"0", config.workspace_active_select[9].key);
+}
+
+test "workspace active select override accepts ordered accelerator array" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"workspace": {"active_select": ["Alt+Shift+1", "Alt+Shift+2"]}}}
+    , .{});
+    defer parsed.deinit();
+    config.applyOverrides(parsed.value);
+
+    try std.testing.expectEqual(@as(usize, 2), config.workspace_active_select.len);
+    try std.testing.expect(config.workspace_active_select[0].alt);
+    try std.testing.expect(config.workspace_active_select[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.@"1", config.workspace_active_select[0].key);
+    try std.testing.expectEqual(sdl.Keycode.@"2", config.workspace_active_select[1].key);
 }
 
 test "workspace pane select override accepts ordered accelerator array" {
@@ -1838,6 +2057,21 @@ test "default workspace traversal uses alt up and down" {
     try std.testing.expectEqual(sdl.Keycode.down, config.workspace_next[0].key);
 }
 
+test "default ACTIVE pane cycling uses ctrl shift left and right" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.workspace_active_previous.len);
+    try std.testing.expect(config.workspace_active_previous[0].ctrl);
+    try std.testing.expect(config.workspace_active_previous[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.left, config.workspace_active_previous[0].key);
+
+    try std.testing.expectEqual(@as(usize, 1), config.workspace_active_next.len);
+    try std.testing.expect(config.workspace_active_next[0].ctrl);
+    try std.testing.expect(config.workspace_active_next[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.right, config.workspace_active_next[0].key);
+}
+
 test "default pane cycling uses ctrl tab in both directions" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
@@ -1873,6 +2107,28 @@ test "workspace pane cycling keybinds are configurable" {
     try std.testing.expectEqual(@as(usize, 1), config.workspace_pane_next.len);
     try std.testing.expect(config.workspace_pane_next[0].alt);
     try std.testing.expectEqual(sdl.Keycode.n, config.workspace_pane_next[0].key);
+}
+
+test "ACTIVE pane cycling keybinds are configurable" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"workspace": {
+        \\  "active_previous": "Alt+P",
+        \\  "active_next": "Alt+N"
+        \\}}}
+    , .{});
+    defer parsed.deinit();
+
+    config.applyOverrides(parsed.value);
+
+    try std.testing.expectEqual(@as(usize, 1), config.workspace_active_previous.len);
+    try std.testing.expect(config.workspace_active_previous[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.p, config.workspace_active_previous[0].key);
+    try std.testing.expectEqual(@as(usize, 1), config.workspace_active_next.len);
+    try std.testing.expect(config.workspace_active_next[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.n, config.workspace_active_next[0].key);
 }
 
 test "scrolling workspace keybinds are configurable" {

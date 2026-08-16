@@ -31,8 +31,6 @@ pub fn State(
         draft_image_clear_count: usize = 0,
         draft_image_clear_rects: [16]palette.Rect = [_]palette.Rect{.{ .x = 0, .y = 0, .w = 0, .h = 0 }} ** 16,
         draft_image_clear_indices: [16]usize = [_]usize{0} ** 16,
-        followup_pin_valid: bool = false,
-        followup_pin_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
         overlay_scroll_y: f32 = 0.0,
         overlay_follow_cursor: bool = true,
         overlay_last_cursor_pos: usize = 0,
@@ -69,6 +67,10 @@ pub fn State(
 
 pub fn requestComposerFocus(self: anytype) void {
     _ = self.acknowledgeFocusedChatCompletion();
+    restoreComposerFocus(self);
+}
+
+pub fn restoreComposerFocus(self: anytype) void {
     self.composer_controller.composer.focused = true;
     self.composer_controller.focused = true;
     self.terminal_controller.focused = false;

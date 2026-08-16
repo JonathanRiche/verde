@@ -49,6 +49,10 @@ pub fn deinitWorkspacePaneRef(ref: *WorkspacePaneRef, allocator: std.mem.Allocat
 pub const WorkspacePane = struct {
     id: WorkspacePaneId,
     ref: WorkspacePaneRef,
+    /// Optional scrolling-strip size. Null inherits the workspace default so
+    /// dragging one pane does not force every other pane to the same width.
+    scroll_extent_css: ?f32 = null,
+    scroll_extent_ratio: ?f32 = null,
 };
 
 pub const WorkspacePanePlacement = struct {
@@ -139,9 +143,9 @@ pub const WorkspaceLayout = struct {
     /// restart without requiring a database schema change.
     scroll_mode_override: ?app_config.WorkspaceScrollMode = null,
     scroll_threshold_override: ?u8 = null,
-    /// The absolute extent remains for backwards compatibility and for the
-    /// resize affordance's custom-width state. New resizes also persist a
-    /// viewport-relative stride ratio so the layout follows display-size changes.
+    /// Shared default for panes that have not been resized individually.
+    /// Kept for backwards compatibility with workspaces that stored one width
+    /// for the whole strip. New drags write `WorkspacePane.scroll_extent_*`.
     scroll_pane_extent_override: ?f32 = null,
     scroll_pane_extent_ratio_override: ?f32 = null,
 
@@ -269,6 +273,8 @@ pub const WorkspaceLayout = struct {
                 switch (pane.ref) {
                     .chat => |*ref| {
                         ref.thread_index = thread_index;
+                        ref.transcript_scroll_valid = false;
+                        ref.transcript_scroll_y = 0.0;
                         return pane.id;
                     },
                     else => {},
@@ -279,12 +285,46 @@ pub const WorkspaceLayout = struct {
             switch (pane.ref) {
                 .chat => |*ref| {
                     ref.thread_index = thread_index;
+                    ref.transcript_scroll_valid = false;
+                    ref.transcript_scroll_y = 0.0;
                     return pane.id;
                 },
                 else => {},
             }
         }
         return null;
+    }
+
+    /// Moves every valid pane-local offset for the thread by `delta`. Saved
+    /// offsets are measured from the estimated top of the thread's content, so
+    /// when materializing older transcript rows changes that estimate the
+    /// anchors must shift with it to keep pointing at the same rows. Panes in
+    /// tail-follow (no valid offset) stay latched to the tail.
+    pub fn shiftChatTranscriptScrollForThread(self: *WorkspaceLayout, thread_index: usize, delta: f32) void {
+        for (self.panes.items) |*pane| {
+            switch (pane.ref) {
+                .chat => |*ref| {
+                    if (ref.thread_index != thread_index) continue;
+                    if (!ref.transcript_scroll_valid) continue;
+                    ref.transcript_scroll_y = @max(ref.transcript_scroll_y + delta, 0.0);
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// Clears pane-local offsets so every pane showing the thread resumes semantic tail-follow.
+    pub fn resetChatTranscriptScrollForThread(self: *WorkspaceLayout, thread_index: usize) void {
+        for (self.panes.items) |*pane| {
+            switch (pane.ref) {
+                .chat => |*ref| {
+                    if (ref.thread_index != thread_index) continue;
+                    ref.transcript_scroll_valid = false;
+                    ref.transcript_scroll_y = 0.0;
+                },
+                else => {},
+            }
+        }
     }
 
     pub fn visibleTerminalPaneIdForDock(self: *const WorkspaceLayout, dock_id: u32) ?WorkspacePaneId {
@@ -335,6 +375,31 @@ pub const WorkspaceLayout = struct {
 
     pub fn hasScrollOverride(self: *const WorkspaceLayout) bool {
         return self.scroll_mode_override != null or self.scroll_threshold_override != null;
+    }
+
+    pub fn hasCustomScrollPaneExtent(self: *const WorkspaceLayout) bool {
+        if (self.scroll_pane_extent_override != null) return true;
+        for (self.panes.items) |pane| {
+            if (pane.scroll_extent_css != null) return true;
+        }
+        return false;
+    }
+
+    pub fn clearScrollPaneExtents(self: *WorkspaceLayout) void {
+        self.scroll_pane_extent_override = null;
+        self.scroll_pane_extent_ratio_override = null;
+        for (self.panes.items) |*pane| {
+            pane.scroll_extent_css = null;
+            pane.scroll_extent_ratio = null;
+        }
+    }
+
+    pub fn setPaneScrollExtent(self: *WorkspaceLayout, pane_id: WorkspacePaneId, extent_css: f32, extent_ratio: f32) bool {
+        const pane = self.paneByIdMutable(pane_id) orelse return false;
+        const clamped = @max(MIN_SCROLL_PANE_EXTENT_CSS, @min(MAX_SCROLL_PANE_EXTENT_CSS, extent_css));
+        pane.scroll_extent_css = clamped;
+        pane.scroll_extent_ratio = if (extent_ratio > 0.0) extent_ratio else null;
+        return true;
     }
 
     pub fn requestLeadingScrollReveal(self: *WorkspaceLayout, pane_id: WorkspacePaneId) void {
@@ -661,20 +726,64 @@ pub const WorkspaceLayout = struct {
         return true;
     }
 
+    /// Pane that should receive focus after `pane_id` closes: previous in
+    /// sidebar/tiled order (the pane to the left), else the next to the right.
+    /// Call before removing `pane_id` from the tree or panes list.
+    pub fn preferredFocusAfterClose(self: *const WorkspaceLayout, pane_id: WorkspacePaneId) ?WorkspacePaneId {
+        return self.adjacentTiledPaneIdInSidebarOrder(pane_id, .left) orelse
+            self.adjacentTiledPaneIdInSidebarOrder(pane_id, .right) orelse
+            self.sidebarNeighborPaneId(pane_id, true) orelse
+            self.sidebarNeighborPaneId(pane_id, false);
+    }
+
+    /// Previous (left) or next (right) entry in persisted sidebar order.
+    fn sidebarNeighborPaneId(self: *const WorkspaceLayout, pane_id: WorkspacePaneId, previous: bool) ?WorkspacePaneId {
+        const pane_index = self.paneIndexById(pane_id) orelse return null;
+        if (previous) {
+            if (pane_index == 0) return null;
+            return self.panes.items[pane_index - 1].id;
+        }
+        if (pane_index + 1 >= self.panes.items.len) return null;
+        return self.panes.items[pane_index + 1].id;
+    }
+
     pub fn closePane(self: *WorkspaceLayout, allocator: std.mem.Allocator, pane_id: WorkspacePaneId) ?WorkspacePaneRef {
         const pane_index = self.paneIndexById(pane_id) orelse return null;
         const removed_ref = self.panes.items[pane_index].ref;
         const was_maximized = self.maximized_pane_id == pane_id;
-        var next_sidebar_pane_id: ?WorkspacePaneId = null;
-        var next_tiled_pane_id: ?WorkspacePaneId = null;
+        const was_focused = self.focused_pane_id == pane_id;
+        // Capture left-preferring neighbor before the pane leaves the tree.
+        const preferred_neighbor = self.preferredFocusAfterClose(pane_id);
+        var next_focus_pane_id: ?WorkspacePaneId = preferred_neighbor;
+        var next_tiled_pane_id: ?WorkspacePaneId = self.adjacentTiledPaneIdInSidebarOrder(pane_id, .left) orelse
+            self.adjacentTiledPaneIdInSidebarOrder(pane_id, .right);
         if (was_maximized and self.panes.items.len > 1) {
-            var offset: usize = 1;
-            while (offset < self.panes.items.len) : (offset += 1) {
-                const candidate_index = (pane_index + offset) % self.panes.items.len;
-                const candidate_id = self.panes.items[candidate_index].id;
-                if (next_sidebar_pane_id == null) next_sidebar_pane_id = candidate_id;
-                if (next_tiled_pane_id == null and self.rootContainsPane(candidate_id)) {
-                    next_tiled_pane_id = candidate_id;
+            // Detached quick panes stay available after a zoomed close.
+            if (self.quick_pane) |quick| {
+                if (quick.pane_id != pane_id and self.paneById(quick.pane_id) != null) {
+                    next_focus_pane_id = quick.pane_id;
+                }
+            }
+            if (next_tiled_pane_id == null) {
+                var offset: usize = 1;
+                while (offset < self.panes.items.len) : (offset += 1) {
+                    // Scan left first, then right, so zoom transfers toward the left.
+                    const left_index = if (pane_index >= offset) pane_index - offset else null;
+                    const right_index = if (pane_index + offset < self.panes.items.len) pane_index + offset else null;
+                    if (left_index) |index| {
+                        const candidate_id = self.panes.items[index].id;
+                        if (self.rootContainsPane(candidate_id)) {
+                            next_tiled_pane_id = candidate_id;
+                            break;
+                        }
+                    }
+                    if (right_index) |index| {
+                        const candidate_id = self.panes.items[index].id;
+                        if (self.rootContainsPane(candidate_id)) {
+                            next_tiled_pane_id = candidate_id;
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -686,7 +795,7 @@ pub const WorkspaceLayout = struct {
             if (quick.pane_id == pane_id) self.quick_pane = null;
         }
         if (was_maximized) {
-            self.focused_pane_id = next_sidebar_pane_id orelse self.firstVisiblePaneId();
+            self.focused_pane_id = next_focus_pane_id orelse self.firstVisiblePaneId();
             self.maximized_pane_id = next_tiled_pane_id orelse self.firstVisiblePaneId();
             if (self.quick_pane) |*quick| {
                 if (quick.pane_id == self.focused_pane_id) {
@@ -698,7 +807,7 @@ pub const WorkspaceLayout = struct {
                 }
             }
         } else {
-            if (self.focused_pane_id == pane_id) self.focused_pane_id = self.firstVisiblePaneId();
+            if (was_focused) self.focused_pane_id = preferred_neighbor orelse self.firstVisiblePaneId();
             if (self.maximized_pane_id == pane_id) self.maximized_pane_id = null;
         }
         return removed_ref;
@@ -891,6 +1000,14 @@ pub const WorkspaceLayout = struct {
                     try stringify.endArray();
                 },
             }
+            if (pane.scroll_extent_css) |extent| {
+                try stringify.objectField("scroll_extent");
+                try stringify.write(extent);
+                if (pane.scroll_extent_ratio) |ratio| {
+                    try stringify.objectField("scroll_extent_ratio");
+                    try stringify.write(ratio);
+                }
+            }
             try stringify.endObject();
         }
         try stringify.endArray();
@@ -969,6 +1086,7 @@ pub const WorkspaceLayout = struct {
             if (pane_value != .object) continue;
             const pane_id: WorkspacePaneId = @intCast(jsonInt(pane_value.object.get("id") orelse .null) orelse continue);
             const kind = jsonString(pane_value.object.get("kind") orelse .null) orelse continue;
+            const pane_count_before = next_layout.panes.items.len;
             if (std.mem.eql(u8, kind, "chat")) {
                 const thread_index: usize = @intCast(jsonInt(pane_value.object.get("thread") orelse .null) orelse 0);
                 try next_layout.panes.append(allocator, .{
@@ -1035,6 +1153,9 @@ pub const WorkspaceLayout = struct {
                     .ref = .{ .browser = browser_ref },
                 });
                 browser_ref_owned = false;
+            }
+            if (next_layout.panes.items.len > pane_count_before) {
+                applyPersistedPaneScrollExtent(&next_layout.panes.items[next_layout.panes.items.len - 1], pane_value);
             }
             if (pane_id >= next_layout.next_pane_id) next_layout.next_pane_id = pane_id + 1;
         }
@@ -1352,6 +1473,16 @@ pub const WorkspaceLayout = struct {
     }
 };
 
+fn applyPersistedPaneScrollExtent(pane: *WorkspacePane, pane_value: std.json.Value) void {
+    if (pane_value != .object) return;
+    const extent = WorkspaceLayout.jsonFloat(pane_value.object.get("scroll_extent") orelse .null) orelse return;
+    if (extent < MIN_SCROLL_PANE_EXTENT_CSS or extent > MAX_SCROLL_PANE_EXTENT_CSS) return;
+    pane.scroll_extent_css = extent;
+    if (WorkspaceLayout.jsonFloat(pane_value.object.get("scroll_extent_ratio") orelse .null)) |ratio| {
+        if (ratio > 0.0) pane.scroll_extent_ratio = ratio;
+    }
+}
+
 fn expectPaneOrder(layout: *const WorkspaceLayout, expected: []const WorkspacePaneId) !void {
     try std.testing.expectEqual(expected.len, layout.panes.items.len);
     for (expected, layout.panes.items) |expected_id, pane| {
@@ -1661,6 +1792,33 @@ test "workspace layout persists the scrolling target" {
     try std.testing.expectEqual(@as(i64, 0), restored.scroll_animation_last_ms);
 }
 
+test "workspace layout round-trips nonuniform split and explicit focus exactly" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const second_pane_id = try layout.createChatPane(allocator, 1);
+    try layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
+    try std.testing.expect(layout.resizeSplit(1, second_pane_id, .vertical, 0.63));
+    layout.focused_pane_id = second_pane_id;
+
+    const persisted = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(persisted);
+    var restored = try WorkspaceLayout.initDefaultChat(allocator);
+    defer restored.deinit(allocator);
+    try restored.applyPersistedWorkspaceJson(allocator, persisted);
+
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), restored.focused_pane_id);
+    const root = restored.root orelse return error.TestExpectedEqual;
+    switch (root.*) {
+        .split => |split| {
+            try std.testing.expectEqual(WorkspaceSplitAxis.vertical, split.axis);
+            try std.testing.expectApproxEqAbs(@as(f32, 0.63), split.ratio, 0.0001);
+        },
+        .leaf => return error.TestExpectedEqual,
+    }
+}
+
 test "workspace layout persists scrolling policy overrides" {
     const allocator = std.testing.allocator;
     var layout = try WorkspaceLayout.initDefaultChat(allocator);
@@ -1700,7 +1858,34 @@ test "workspace layout ignores invalid scrolling policy overrides" {
     try std.testing.expectEqual(@as(?f32, null), layout.scroll_pane_extent_ratio_override);
 }
 
-test "closing a maximized pane transfers zoom in sidebar order" {
+test "workspace layout persists per-pane scrolling extents" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const second_pane_id = try layout.createTerminalPane(allocator, 10);
+    try layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
+    try std.testing.expect(layout.setPaneScrollExtent(second_pane_id, 720.0, 0.41));
+    try std.testing.expect(layout.hasCustomScrollPaneExtent());
+    try std.testing.expectEqual(@as(?f32, null), layout.panes.items[0].scroll_extent_css);
+
+    const persisted = try layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(persisted);
+    var restored = try WorkspaceLayout.initDefaultChat(allocator);
+    defer restored.deinit(allocator);
+    try restored.applyPersistedWorkspaceJson(allocator, persisted);
+
+    const restored_second = restored.paneById(second_pane_id) orelse return error.TestExpectedEqual;
+    try std.testing.expectApproxEqAbs(@as(f32, 720.0), restored_second.scroll_extent_css.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.41), restored_second.scroll_extent_ratio.?, 0.0001);
+    try std.testing.expectEqual(@as(?f32, null), restored.paneById(1).?.scroll_extent_css);
+
+    restored.clearScrollPaneExtents();
+    try std.testing.expect(!restored.hasCustomScrollPaneExtent());
+    try std.testing.expectEqual(@as(?f32, null), restored.paneById(second_pane_id).?.scroll_extent_css);
+}
+
+test "closing a maximized pane transfers zoom to the left pane" {
     const allocator = std.testing.allocator;
     var layout = try WorkspaceLayout.initDefaultChat(allocator);
     defer layout.deinit(allocator);
@@ -1715,13 +1900,52 @@ test "closing a maximized pane transfers zoom in sidebar order" {
     layout.maximized_pane_id = second_pane_id;
     var removed_ref = layout.closePane(allocator, second_pane_id) orelse return error.TestExpectedEqual;
     deinitWorkspacePaneRef(&removed_ref, allocator);
-    try std.testing.expectEqual(@as(?WorkspacePaneId, third_pane_id), layout.focused_pane_id);
-    try std.testing.expectEqual(@as(?WorkspacePaneId, third_pane_id), layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, first_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, first_pane_id), layout.maximized_pane_id);
 
+    layout.focused_pane_id = third_pane_id;
+    layout.maximized_pane_id = third_pane_id;
     removed_ref = layout.closePane(allocator, third_pane_id) orelse return error.TestExpectedEqual;
     deinitWorkspacePaneRef(&removed_ref, allocator);
     try std.testing.expectEqual(@as(?WorkspacePaneId, first_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, first_pane_id), layout.maximized_pane_id);
+}
+
+test "closing a focused pane focuses the pane to its left" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const first_pane_id = layout.panes.items[0].id;
+    const second_pane_id = try layout.createTerminalPane(allocator, 10);
+    try layout.splitPaneWithLeaf(allocator, first_pane_id, second_pane_id, .vertical, true);
+    const third_pane_id = try layout.createTerminalPane(allocator, 11);
+    try layout.splitPaneWithLeaf(allocator, second_pane_id, third_pane_id, .horizontal, true);
+
+    layout.focused_pane_id = third_pane_id;
+    var removed_ref = layout.closePane(allocator, third_pane_id) orelse return error.TestExpectedEqual;
+    deinitWorkspacePaneRef(&removed_ref, allocator);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.focused_pane_id);
+
+    layout.focused_pane_id = second_pane_id;
+    removed_ref = layout.closePane(allocator, second_pane_id) orelse return error.TestExpectedEqual;
+    deinitWorkspacePaneRef(&removed_ref, allocator);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, first_pane_id), layout.focused_pane_id);
+}
+
+test "closing the leftmost focused pane focuses the pane to its right" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const first_pane_id = layout.panes.items[0].id;
+    const second_pane_id = try layout.createTerminalPane(allocator, 10);
+    try layout.splitPaneWithLeaf(allocator, first_pane_id, second_pane_id, .vertical, true);
+
+    layout.focused_pane_id = first_pane_id;
+    var removed_ref = layout.closePane(allocator, first_pane_id) orelse return error.TestExpectedEqual;
+    deinitWorkspacePaneRef(&removed_ref, allocator);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.focused_pane_id);
 }
 
 test "closing a maximized pane focuses the next quick pane without losing tiled zoom" {
@@ -1758,10 +1982,59 @@ test "workspace chat replacement prefers the focused chat pane" {
     const second_pane_id = try layout.createChatPane(allocator, 1);
     try layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
     layout.focused_pane_id = second_pane_id;
+    layout.paneByIdMutable(second_pane_id).?.ref.chat.transcript_scroll_valid = true;
+    layout.paneByIdMutable(second_pane_id).?.ref.chat.transcript_scroll_y = 420.0;
 
     try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.retargetPreferredChatPane(2));
     const first_pane = layout.paneById(1) orelse return error.TestExpectedEqual;
     const second_pane = layout.paneById(second_pane_id) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 0), first_pane.ref.chat.thread_index);
     try std.testing.expectEqual(@as(usize, 2), second_pane.ref.chat.thread_index);
+    try std.testing.expect(!second_pane.ref.chat.transcript_scroll_valid);
+    try std.testing.expectEqual(@as(f32, 0.0), second_pane.ref.chat.transcript_scroll_y);
+
+    layout.paneByIdMutable(1).?.ref.chat.transcript_scroll_valid = true;
+    layout.paneByIdMutable(1).?.ref.chat.transcript_scroll_y = 160.0;
+    layout.paneByIdMutable(second_pane_id).?.ref.chat.transcript_scroll_valid = true;
+    layout.paneByIdMutable(second_pane_id).?.ref.chat.transcript_scroll_y = 320.0;
+    layout.resetChatTranscriptScrollForThread(2);
+    try std.testing.expect(layout.paneById(1).?.ref.chat.transcript_scroll_valid);
+    try std.testing.expect(!layout.paneById(second_pane_id).?.ref.chat.transcript_scroll_valid);
+    try std.testing.expectEqual(@as(f32, 0.0), layout.paneById(second_pane_id).?.ref.chat.transcript_scroll_y);
+}
+
+test "workspace chat scroll shift rebases saved offsets without breaking tail-follow" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    // Pane 1 shows thread 0 with its own saved offset. Two panes show thread
+    // 2: one manually scrolled up, one in tail-follow (e.g. a historical pane
+    // present at startup, or freshly reset by a command-palette retarget).
+    const second_pane_id = try layout.createChatPane(allocator, 2);
+    try layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
+    const third_pane_id = try layout.createChatPane(allocator, 2);
+    try layout.splitPaneWithLeaf(allocator, second_pane_id, third_pane_id, .vertical, true);
+
+    layout.paneByIdMutable(1).?.ref.chat.transcript_scroll_valid = true;
+    layout.paneByIdMutable(1).?.ref.chat.transcript_scroll_y = 160.0;
+    layout.paneByIdMutable(second_pane_id).?.ref.chat.transcript_scroll_valid = true;
+    layout.paneByIdMutable(second_pane_id).?.ref.chat.transcript_scroll_y = 52_000.0;
+
+    // Older-history materialization shrank thread 2's estimated height; the
+    // saved anchor must move with it while other threads and tail-follow
+    // panes stay untouched.
+    layout.shiftChatTranscriptScrollForThread(2, -48_000.0);
+    try std.testing.expectEqual(@as(f32, 160.0), layout.paneById(1).?.ref.chat.transcript_scroll_y);
+    try std.testing.expectEqual(@as(f32, 4_000.0), layout.paneById(second_pane_id).?.ref.chat.transcript_scroll_y);
+    try std.testing.expect(!layout.paneById(third_pane_id).?.ref.chat.transcript_scroll_valid);
+    try std.testing.expectEqual(@as(f32, 0.0), layout.paneById(third_pane_id).?.ref.chat.transcript_scroll_y);
+
+    // A grown estimate shifts anchors down; an over-shrunk one clamps at the
+    // top without invalidating the manual offset into tail-follow.
+    layout.shiftChatTranscriptScrollForThread(2, 1_250.0);
+    try std.testing.expectEqual(@as(f32, 5_250.0), layout.paneById(second_pane_id).?.ref.chat.transcript_scroll_y);
+    layout.shiftChatTranscriptScrollForThread(2, -9_000.0);
+    try std.testing.expectEqual(@as(f32, 0.0), layout.paneById(second_pane_id).?.ref.chat.transcript_scroll_y);
+    try std.testing.expect(layout.paneById(second_pane_id).?.ref.chat.transcript_scroll_valid);
 }

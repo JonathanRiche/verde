@@ -4,6 +4,7 @@ const std = @import("std");
 const sdl = @import("zsdl3");
 const palette = @import("palette");
 const theme = @import("theme.zig");
+const text_measure = @import("text_measure.zig");
 const colors = @import("colors.zig");
 const sidebar = @import("sidebar.zig");
 const workspace_panes = @import("workspace_panes.zig");
@@ -18,9 +19,9 @@ const profiler = @import("../runtime/profiler.zig");
 const RootLayout = struct {
     sidebar: palette.Rect,
     workspace: palette.Rect,
+    target_workspace_width: f32,
 };
 
-const SIDEBAR_ANIM_DURATION_MS: i64 = 180;
 /// Above composer overlays (150), pane menus (180), and model cascade (1400).
 const PALETTE_MODAL_Z: i32 = 2000;
 /// Persistent root overlay below true modal ownership and above pane content.
@@ -188,12 +189,16 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     const root_layout = computeRootLayout(state, width, height);
     queueRootBackground(state, width, height);
     if (state.isSidebarHidden()) {
-        workspace_panes.renderAt(state, root_layout.workspace);
+        workspace_panes.renderAtWithTranscriptLayoutWidth(state, root_layout.workspace, root_layout.target_workspace_width);
         sidebar.renderPalette(state, root_layout.sidebar);
     } else {
         sidebar.renderPalette(state, root_layout.sidebar);
-        workspace_panes.renderAt(state, root_layout.workspace);
+        workspace_panes.renderAtWithTranscriptLayoutWidth(state, root_layout.workspace, root_layout.target_workspace_width);
     }
+    // Queue this root overlay only after scrolling panes have clipped their
+    // local command range; the batch is z-sorted, so pre-queued high-z menu
+    // commands otherwise move into that range and inherit the workspace clip.
+    sidebar.renderContextMenuOverlay(state);
     workspace_panes.renderPaneDragPreview(state);
     sidebar.renderFloatingDragPreview(state);
     const companion_z = state.palette_overlay_batch.setZIndex(COMPANION_Z);
@@ -241,20 +246,27 @@ fn computeRootLayout(state: *runtime.AppState, width: f32, height: f32) RootLayo
     }
     const dt_ms = @max(now_ms - sidebar_anim_last_ms, 0);
     sidebar_anim_last_ms = now_ms;
-    const step = if (SIDEBAR_ANIM_DURATION_MS <= 0)
+    const duration_ms = theme.motionDurationMs(state.app_config.reduced_motion, theme.MOTION_BASE_MS);
+    const step = if (duration_ms <= 0)
         1.0
     else
-        theme.clampf(@as(f32, @floatFromInt(dt_ms)) / @as(f32, @floatFromInt(SIDEBAR_ANIM_DURATION_MS)), 0.0, 1.0);
-    const eased = 1.0 - std.math.pow(f32, 1.0 - step, 3.0);
+        theme.clampf(@as(f32, @floatFromInt(dt_ms)) / @as(f32, @floatFromInt(duration_ms)), 0.0, 1.0);
+    const eased = theme.easeOutCubic(step);
     sidebar_anim_width = approach(sidebar_anim_width, target_sidebar_width, eased);
     sidebar_anim_x = approach(sidebar_anim_x, target_sidebar_x, eased);
     sidebar_animating = @abs(sidebar_anim_width - target_sidebar_width) > 0.5 or @abs(sidebar_anim_x - target_sidebar_x) > 0.5;
+    if (!sidebar_animating) {
+        sidebar_anim_width = target_sidebar_width;
+        sidebar_anim_x = target_sidebar_x;
+    }
 
     const layout_sidebar_width = if (hidden) 0.0 else sidebar_anim_width;
+    const target_layout_sidebar_width = if (hidden) 0.0 else target_sidebar_width;
     const workspace_width = @max(width - layout_sidebar_width - gap, theme.scaledUi(320.0));
     return .{
         .sidebar = .{ .x = sidebar_anim_x, .y = 0.0, .w = sidebar_anim_width, .h = height },
         .workspace = .{ .x = layout_sidebar_width + gap, .y = 0.0, .w = workspace_width, .h = height },
+        .target_workspace_width = @max(width - target_layout_sidebar_width - gap, theme.scaledUi(320.0)),
     };
 }
 
@@ -532,6 +544,7 @@ fn pointInRect(x: f32, y: f32, rect: palette.Rect) bool {
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
     if (!down) {
         if (state.modal_text_drag_active) state.modal_text_drag_active = false;
+        settings_modal.endBrowserScrollSpeedDrag(state);
     }
     if (state.palette_modal_hits.items.len == 0) return false;
     var i = state.palette_modal_hits.items.len;
@@ -604,7 +617,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                     state.setSidebarNotice("Could not save settings to verde.json.");
                 }
             },
-            .settings_control => settings_modal.applyControl(state, hit.index),
+            .settings_control => settings_modal.applyControlAt(state, hit.index, hit.rect, x),
             .settings_theme_option => settings_modal.applyThemeOption(state, hit.index),
             .settings_title_provider_option => settings_modal.applyChatTitleProviderOption(state, hit.index),
             .settings_title_model_option => settings_modal.applyChatTitleModelOption(state, hit.index),
@@ -672,6 +685,7 @@ fn focusModalInput(state: *runtime.AppState, focus: runtime.PaletteModalTextFocu
 
 /// Routes modal pointer motion and reports whether the workspace is occluded.
 pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) bool {
+    if (settings_modal.updateBrowserScrollSpeedDrag(state, x)) return true;
     if (state.updateImageModalPan(x, y)) return true;
     if (state.modal_text_drag_active and state.palette_modal_text_focus != .none) {
         const value = focusedValue(state);
@@ -1041,7 +1055,7 @@ fn registerMcpOnboardingHits(state: *runtime.AppState, width: f32, height: f32) 
 fn registerWorkspaceAddModalHits(state: *runtime.AppState, width: f32, height: f32) void {
     if (!state.project_controller.show_creator) return;
     const modal_w = theme.clampf(width * 0.34, theme.scaledUi(360.0), theme.scaledUi(500.0));
-    const notice_h: f32 = if (state.sidebarNotice().len > 0) theme.scaledUi(24.0) else 0.0;
+    const notice_h: f32 = if (state.projectImportNotice().len > 0) theme.scaledUi(24.0) else 0.0;
     const modal_h = theme.scaledUi(252.0) + notice_h;
     const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
     registerModalChromeHits(state, width, height, modal, false);
@@ -1469,7 +1483,7 @@ fn renderWorkspaceRenameModal(state: *runtime.AppState, width: f32, height: f32)
 fn renderWorkspaceAddModal(state: *runtime.AppState, width: f32, height: f32) void {
     if (!state.project_controller.show_creator) return;
     const modal_w = theme.clampf(width * 0.34, theme.scaledUi(360.0), theme.scaledUi(500.0));
-    const notice = state.sidebarNotice();
+    const notice = state.projectImportNotice();
     const notice_h: f32 = if (notice.len > 0) theme.scaledUi(24.0) else 0.0;
     const modal_h = theme.scaledUi(252.0) + notice_h;
     const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
@@ -1572,8 +1586,13 @@ fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) vo
             }
             const title_col = paletteColor(theme.COLOR_WHITE);
             const id_col = paletteColor(if (row_hovered) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE);
-            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(4.0), .w = row.w - theme.scaledUi(16.0), .h = theme.scaledUi(18.0) }, thread.title, title_col, theme.scaledUi(13.0), list_rect);
-            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(22.0), .w = row.w - theme.scaledUi(16.0), .h = theme.scaledUi(16.0) }, thread.id, id_col, theme.scaledUi(12.0), list_rect);
+            const text_w = row.w - theme.scaledUi(16.0);
+            const title_font = theme.scaledUi(13.0);
+            const id_font = theme.scaledUi(12.0);
+            const title = truncateThreadImportLabel(state, threadImportSingleLineLabel(thread.title), text_w, title_font);
+            const id = truncateThreadImportLabel(state, threadImportSingleLineLabel(thread.id), text_w, id_font);
+            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(4.0), .w = text_w, .h = theme.scaledUi(18.0) }, title, title_col, title_font, row);
+            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(22.0), .w = text_w, .h = theme.scaledUi(16.0) }, id, id_col, id_font, row);
         }
     }
 
@@ -1786,4 +1805,40 @@ fn emptyThreadImportListNotice(provider: runtime.Provider) []const u8 {
         .claude => "No cached Claude threads to show.",
         .cursor => "No cached Cursor threads to show.",
     };
+}
+
+fn threadImportSingleLineLabel(value: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    const line_end = std.mem.findAny(u8, trimmed, "\r\n") orelse trimmed.len;
+    return std.mem.trimEnd(u8, trimmed[0..line_end], " \t");
+}
+
+// Import summaries come from external providers, so measure and bound their
+// labels before handing them to Palette's fixed-height rows.
+fn truncateThreadImportLabel(state: *runtime.AppState, value: []const u8, max_width: f32, font_size: f32) []const u8 {
+    if (value.len == 0 or text_measure.textWidth(.ui, font_size, value) <= max_width) return value;
+    const ellipsis = "…";
+    const ellipsis_width = text_measure.textWidth(.ui, font_size, ellipsis);
+    var low: usize = 0;
+    var high: usize = value.len - 1;
+    var best: usize = 0;
+    while (low <= high) {
+        const mid = low + (high - low) / 2;
+        var prefix_end = mid;
+        while (prefix_end > 0 and (value[prefix_end] & 0xC0) == 0x80) prefix_end -= 1;
+        if (text_measure.textWidth(.ui, font_size, value[0..prefix_end]) + ellipsis_width <= max_width) {
+            best = @max(best, prefix_end);
+            low = mid + 1;
+        } else {
+            if (mid == 0) break;
+            high = mid - 1;
+        }
+    }
+    if (best == 0) return ellipsis;
+    return std.fmt.allocPrint(state.palette_frame_text_arena.allocator(), "{s}{s}", .{ value[0..best], ellipsis }) catch value;
+}
+
+test "thread import labels use only the first non-empty line" {
+    try std.testing.expectEqualStrings("First title", threadImportSingleLineLabel(" \nFirst title  \r\nSecond line"));
+    try std.testing.expectEqualStrings("One line", threadImportSingleLineLabel("\tOne line\t"));
 }

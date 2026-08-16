@@ -20,7 +20,8 @@ in your Verde config — see [Remapping](#remapping) below.
 | `Ctrl+T` / `Cmd+T`          | New chat thread                       |
 | `Ctrl+W` / `Cmd+W`, `Alt+X` | Close the focused pane                |
 | `Ctrl+Shift+W` / `Cmd+Shift+W` | Close the current workspace (reopen from the command palette) |
-| `Ctrl+R` / `Cmd+R`, `Ctrl+Shift+R`, `F5` | Refresh / reload app         |
+| `Ctrl+Shift+Space`          | Toggle the experimental Companion (when enabled in Settings) |
+| `Ctrl+Shift+R` / `Cmd+Shift+R`, `F5` | Refresh / reload app            |
 | `Alt+O`                     | Open the default project              |
 | `Ctrl+Shift+O`              | Open in external editor               |
 
@@ -31,10 +32,12 @@ in your Verde config — see [Remapping](#remapping) below.
 | `Ctrl+S` / `Cmd+S`          | Toggle the sidebar (visible ↔ icon)   |
 | `Ctrl+Shift+S`             | Toggle the sidebar's hidden mode      |
 | `Ctrl+Shift+B`              | Toggle the embedded browser pane      |
+| `Ctrl+R` / `Cmd+R`          | Reload the active browser tab (browser pane only) |
 | `Tab`                       | Inside a chat pane, focus the prompt box |
 | `Ctrl+Tab`                  | Focus the next pane in sidebar order     |
 | `Ctrl+Shift+Tab`            | Focus the previous pane in sidebar order |
 | `Ctrl+1 … Ctrl+9, Ctrl+0`  | Focus a pane in the current workspace by sidebar order |
+| `Ctrl+Shift+1 … Ctrl+Shift+9, Ctrl+Shift+0` | Jump to a row in the global Active section by displayed order |
 | `Alt+1 … Alt+9, Alt+0`     | Jump between workspaces by sidebar order |
 | `Alt+↑` / `Alt+↓`          | Cycle to the previous / next workspace |
 
@@ -126,6 +129,7 @@ shortcuts on the same action:
   "keybinds": {
     "new_thread": "CommandOrControl+T",
     "browser": "Ctrl+Shift+B",
+    "companion": "Ctrl+Shift+Space",
     "workspace": {
       "close_current": "CommandOrControl+Shift+W",
       "focus_up": "Ctrl+K",
@@ -134,6 +138,7 @@ shortcuts on the same action:
       "focus_right": "Ctrl+L",
       "pane_previous": "Ctrl+Shift+Tab",
       "pane_next": "Ctrl+Tab",
+      "active_select": ["Ctrl+Shift+1", "Ctrl+Shift+2", "Ctrl+Shift+3", "Ctrl+Shift+4", "Ctrl+Shift+5", "Ctrl+Shift+6", "Ctrl+Shift+7", "Ctrl+Shift+8", "Ctrl+Shift+9", "Ctrl+Shift+0"],
       "pane_select": ["Ctrl+1", "Ctrl+2", "Ctrl+3", "Ctrl+4", "Ctrl+5", "Ctrl+6", "Ctrl+7", "Ctrl+8", "Ctrl+9", "Ctrl+0"],
       "previous": "Alt+Up",
       "next": "Alt+Down",
@@ -164,6 +169,9 @@ shortcuts on the same action:
 shown under the current workspace in the sidebar, the second shortcut focuses
 the second pane, and so on.
 
+`workspace.active_select` follows the sorted order currently shown in the
+sidebar's global Active section, including rows from other workspaces.
+
 ## Disabling a binding
 
 Set the binding to `null`, an empty string, or an empty array to disable it:
@@ -190,9 +198,9 @@ or an array of shortcuts.
 
 | Group       | Keys (subset)                                                                                                                                                                                                                     |
 | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| top         | `refresh`, `open_default`, `open_editor`, `new_thread`, `command_palette`, `toggle_sidebar`, `toggle_sidebar_hidden`, `toggle_browser`, `toggle_terminal`                                                                       |
+| top         | `refresh`, `open_default`, `open_editor`, `new_thread`, `command_palette`, `companion`, `toggle_sidebar`, `toggle_sidebar_hidden`, `toggle_browser`, `toggle_terminal`                                                                       |
 | chat        | `chat_up`, `chat_down`, `chat_page_up`, `chat_page_down`                                                                                                                                                                          |
-| `workspace` | `split_chat_vertical`, `split_chat_horizontal`, `split_terminal_vertical`, `split_terminal_horizontal`, `toggle_maximize`, `close`, `close_current`, `focus_left`, `focus_right`, `focus_up`, `focus_down`, `focus_prompt`, `pane_previous`, `pane_next`, `pane_select`, `move_*`, `grow_*`, `select`, `previous`, `next` |
+| `workspace` | `split_chat_vertical`, `split_chat_horizontal`, `split_terminal_vertical`, `split_terminal_horizontal`, `toggle_maximize`, `close`, `close_current`, `focus_left`, `focus_right`, `focus_up`, `focus_down`, `focus_prompt`, `pane_previous`, `pane_next`, `active_select`, `pane_select`, `move_*`, `grow_*`, `select`, `previous`, `next` |
 | `terminal`  | `new_tab`, `close`, `rename_tab`, `tab_previous`, `tab_next`, `split_up`, `split_down`, `split_left`, `split_right`, `focus_up`, `focus_down`, `focus_left`, `focus_right`                                                       |
 
 Keybinds are loaded on startup and on app refresh. See [Configuration &

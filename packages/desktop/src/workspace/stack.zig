@@ -4,6 +4,16 @@ const std = @import("std");
 
 pub const CONFIG_FILENAMES = [_][]const u8{ "verde.yml", "verde.yaml" };
 
+/// Keep config fan-out and launch payloads bounded before daemon-owned PTYs
+/// are created. These limits protect both registry snapshots and responses.
+pub const MAX_PROCESS_DEFINITIONS: usize = 64;
+pub const MAX_PROCESS_COMMAND_BYTES: usize = 8192;
+
+pub const BoundsViolation = struct {
+    resource: []const u8,
+    limit: usize,
+};
+
 pub const ProcessKind = enum {
     process,
     agent,
@@ -118,6 +128,36 @@ pub const Config = struct {
         self.processes.deinit(allocator);
     }
 };
+
+/// Return the first bounded config resource that would exceed daemon limits.
+/// This helper is pure; the daemon performs file loading before calling it.
+pub fn validateDefinitionBounds(config: *const Config) ?BoundsViolation {
+    if (config.processes.items.len > MAX_PROCESS_DEFINITIONS) {
+        return .{ .resource = "process_definition", .limit = MAX_PROCESS_DEFINITIONS };
+    }
+    for (config.processes.items) |*process| {
+        var command_bytes: usize = 0;
+        const values = [_][]const u8{
+            process.command,
+            process.command_windows orelse "",
+            process.command_unix orelse "",
+        };
+        for (values) |value| {
+            command_bytes = std.math.add(usize, command_bytes, value.len) catch
+                return .{ .resource = "process_definition", .limit = MAX_PROCESS_COMMAND_BYTES };
+        }
+        for ([_][]const []u8{ process.argv.items, process.argv_windows.items, process.argv_unix.items }) |argv| {
+            for (argv) |value| {
+                command_bytes = std.math.add(usize, command_bytes, value.len) catch
+                    return .{ .resource = "process_definition", .limit = MAX_PROCESS_COMMAND_BYTES };
+            }
+        }
+        if (command_bytes > MAX_PROCESS_COMMAND_BYTES) {
+            return .{ .resource = "process_definition", .limit = MAX_PROCESS_COMMAND_BYTES };
+        }
+    }
+    return null;
+}
 
 const Section = enum {
     none,
@@ -493,4 +533,20 @@ test "platform-only managed process is retained" {
     try std.testing.expectEqual(@as(usize, 1), config.processes.items.len);
     try std.testing.expect(config.processes.items[0].launchForOs(.linux) == null);
     try std.testing.expectEqualStrings("pwsh.exe -File scripts\\serve.ps1", config.processes.items[0].launchForOs(.windows).?.command);
+}
+
+test "definition bounds validator names the broken limit" {
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(std.testing.allocator);
+    try content.appendSlice(
+        std.testing.allocator,
+        "processes:\n  oversized:\n    command: \"",
+    );
+    try content.appendNTimes(std.testing.allocator, 'x', MAX_PROCESS_COMMAND_BYTES + 1);
+    try content.appendSlice(std.testing.allocator, "\"\n");
+    var config = try parse(std.testing.allocator, content.items, "verde.yml");
+    defer config.deinit(std.testing.allocator);
+    const violation = validateDefinitionBounds(&config) orelse return error.ExpectedBoundsViolation;
+    try std.testing.expectEqualStrings("process_definition", violation.resource);
+    try std.testing.expectEqual(MAX_PROCESS_COMMAND_BYTES, violation.limit);
 }

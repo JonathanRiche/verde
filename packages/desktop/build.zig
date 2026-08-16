@@ -88,6 +88,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const palette_module = palette.module("palette");
+    // GUI-free protocol core. Linked into the session daemon for core.* methods;
+    // headless-test runs this package alone with no SDL/Palette/Ghostty deps.
+    const headless_module = b.createModule(.{
+        .root_source_file = b.path("../headless/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     // Browser contract tests use a narrower module root than the full app, so
     // portable platform helpers must be explicit imports instead of escaping it.
     const platform_runtime_module = b.createModule(.{
@@ -160,6 +167,9 @@ pub fn build(b: *std.Build) void {
         "build",
     });
     build_inspector_bundle.setCwd(b.path("../browser_extensions/inspector"));
+    // ZLS captures its build runner's stdout as JSON, so keep Bun's status
+    // output from contaminating the build configuration stream.
+    _ = build_inspector_bundle.captureStdOut(.{});
 
     const inspector_bundle_files = b.addWriteFiles();
     _ = inspector_bundle_files.addCopyFile(
@@ -200,6 +210,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = build_options_module },
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
+                .{ .name = "headless", .module = headless_module },
                 .{ .name = "loop_wakeup", .module = loop_wakeup_module },
                 .{ .name = "palette", .module = palette_module },
                 .{ .name = "platform_paths", .module = platform_paths_module },
@@ -275,6 +286,7 @@ pub fn build(b: *std.Build) void {
                         .{ .name = "build_options", .module = build_options_module },
                         .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                         .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
+                        .{ .name = "headless", .module = headless_module },
                         .{ .name = "loop_wakeup", .module = loop_wakeup_module },
                         .{ .name = "palette", .module = palette_module },
                         .{ .name = "platform_paths", .module = platform_paths_module },
@@ -493,6 +505,40 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     const test_compile_step = b.step("test-compile", "Compile unit tests without running them");
+    // Headless package tests are hermetic (std only) and intentionally avoid
+    // SDL/Palette/Ghostty/zqlite so they stay a fast focused gate for core.* work.
+    const headless_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("../headless/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const headless_test_step = b.step("headless-test", "Run headless package unit tests (no GUI deps)");
+    addTestArtifact(b, headless_test_step, headless_tests, target);
+    test_compile_step.dependOn(&headless_tests.step);
+    addTestArtifact(b, test_step, headless_tests, target);
+    const transcript_apply_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/chat/transcript_apply.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "headless", .module = headless_module }},
+        }),
+    });
+    addTestArtifact(b, test_step, transcript_apply_tests, target);
+    test_compile_step.dependOn(&transcript_apply_tests.step);
+    // Change journal is std-only by design (process_registry discipline), so
+    // its tests build without GUI deps or the headless module.
+    const change_journal_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/daemon/change_journal.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    addTestArtifact(b, test_step, change_journal_tests, target);
+    test_compile_step.dependOn(&change_journal_tests.step);
     const chat_markdown_tests = b.addTest(.{
         .root_module = chat_markdown,
     });
@@ -568,6 +614,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = build_options_module },
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
+                .{ .name = "headless", .module = headless_module },
                 .{ .name = "loop_wakeup", .module = loop_wakeup_module },
                 .{ .name = "palette", .module = palette.module("palette") },
                 .{ .name = "platform_paths", .module = platform_paths_module },
@@ -638,6 +685,100 @@ pub fn build(b: *std.Build) void {
     }
     addTestArtifact(b, test_step, exe_tests, target);
     test_compile_step.dependOn(&exe_tests.step);
+
+    // Hermetic headless client ↔ real session-daemon subprocess (tmp pref only).
+    // Dedicated binary so the daemon's idle process.exit cannot kill the unit-test runner.
+    const headless_daemon_it_exe = b.addExecutable(.{
+        .name = "headless-daemon-it",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/headless_daemon_it_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "build_options", .module = build_options_module },
+                .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
+                .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
+                .{ .name = "headless", .module = headless_module },
+                .{ .name = "loop_wakeup", .module = loop_wakeup_module },
+                .{ .name = "palette", .module = palette.module("palette") },
+                .{ .name = "platform_paths", .module = platform_paths_module },
+                .{ .name = "platform_runtime", .module = platform_runtime_module },
+                .{ .name = "platform_windows_known_folders", .module = platform_windows_known_folders_module },
+                .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
+                .{ .name = "zig_markdown", .module = zig_markdown.module("zig_markdown") },
+                .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
+                .{ .name = "zqlite", .module = zqlite.module("zqlite") },
+            },
+        }),
+    });
+    headless_daemon_it_exe.build_id = .sha1;
+    if (build_fff) |build_step| headless_daemon_it_exe.step.dependOn(&build_step.step);
+    headless_daemon_it_exe.root_module.addIncludePath(b.path("../../vendor"));
+    headless_daemon_it_exe.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
+    addFffLink(headless_daemon_it_exe, target.result.os.tag, fff_lib_dir, fff_import_lib);
+    headless_daemon_it_exe.root_module.addCSourceFile(.{
+        .file = b.path("../../vendor/stb_image_impl.c"),
+        .flags = &.{},
+    });
+    headless_daemon_it_exe.root_module.link_libc = true;
+    if (target.result.os.tag == .linux) {
+        if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
+            headless_daemon_it_exe.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
+        }
+        headless_daemon_it_exe.root_module.addCSourceFile(.{
+            .file = b.path("src/browser/platform/linux_wayland_subsurface.c"),
+            .flags = &.{},
+        });
+        headless_daemon_it_exe.root_module.linkSystemLibrary("SDL3", .{});
+        headless_daemon_it_exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
+        headless_daemon_it_exe.root_module.linkSystemLibrary("util", .{});
+        headless_daemon_it_exe.root_module.linkSystemLibrary("wayland-client", .{ .use_pkg_config = .force });
+    } else if (target.result.os.tag == .macos) {
+        if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
+            headless_daemon_it_exe.root_module.addFrameworkPath(sdl3_prebuilt.path("Frameworks"));
+        }
+        headless_daemon_it_exe.root_module.addCSourceFile(.{
+            .file = b.path("src/platform/macos_clipboard.m"),
+            .flags = &.{},
+        });
+        if (browser_backend == .native_webview) {
+            addMacOSSwiftWebView(b, headless_daemon_it_exe, target.result.cpu.arch);
+        } else {
+            addMacOSWebViewTestStub(b, headless_daemon_it_exe);
+        }
+        headless_daemon_it_exe.root_module.linkSystemLibrary("sdl3", .{ .use_pkg_config = .yes });
+        headless_daemon_it_exe.root_module.linkSystemLibrary("sdl3-ttf", .{ .use_pkg_config = .yes });
+        headless_daemon_it_exe.root_module.linkFramework("AppKit", .{});
+        headless_daemon_it_exe.root_module.linkFramework("WebKit", .{});
+    } else if (target.result.os.tag == .windows) {
+        addWindowsIntegrations(b, headless_daemon_it_exe);
+        addWindowsWebView2(b, headless_daemon_it_exe, .{
+            .real_webview = browser_backend == .native_webview,
+            .include_dir = webview2_include_dir,
+            .loader_import_lib = webview2_loader_lib,
+        });
+        addWindowsSdlPaths(headless_daemon_it_exe, .{
+            .sdl3_include_dir = sdl3_include_dir,
+            .sdl3_lib_dir = sdl3_lib_dir,
+            .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
+            .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
+        });
+        headless_daemon_it_exe.root_module.linkSystemLibrary("SDL3", .{});
+        headless_daemon_it_exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
+        addWindowsSystemLibraries(headless_daemon_it_exe);
+    }
+    const headless_daemon_it_step = b.step("headless-daemon-it", "Hermetic headless client/session-daemon integration test");
+    const host = b.graph.host.result;
+    const is_native = target.result.os.tag == host.os.tag and
+        target.result.cpu.arch == host.cpu.arch and
+        target.result.abi == host.abi;
+    if (is_native) {
+        const run_it = b.addRunArtifact(headless_daemon_it_exe);
+        headless_daemon_it_step.dependOn(&run_it.step);
+    } else {
+        // Foreign targets: compile-only; never spawn Wine/binfmt.
+        headless_daemon_it_step.dependOn(&headless_daemon_it_exe.step);
+    }
 
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" } });
     test_step.dependOn(&fmt_check.step);

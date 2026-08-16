@@ -1,7 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const sdl = @import("zsdl3");
-const ghostty_vt = @import("../vendor/ghostty_vt.zig");
+const ghostty_vt = @import("engine.zig");
+pub const RenderState = ghostty_vt.RenderState;
 const keybinds = @import("../app/keybinds.zig");
 const process_env = @import("../platform/env.zig");
 const platform_runtime = @import("platform_runtime");
@@ -15,6 +16,11 @@ const log = std.log.scoped(.native_terminal);
 pub const DEFAULT_DOCK_HEIGHT: f32 = 136.0;
 pub const MIN_DOCK_HEIGHT: f32 = 96.0;
 pub const MAX_DOCK_HEIGHT: f32 = 900.0;
+/// Shared persisted/runtime pane-coordinate bound; matches daemon validation.
+pub const MAX_PANE_ID: u32 = 65_535;
+/// Detach is best-effort teardown after terminal identity has already been
+/// persisted; an unhealthy daemon must not hold the process open indefinitely.
+const SESSION_DETACH_TIMEOUT_MS: u32 = 750;
 
 pub const TerminalKey = enum {
     enter,
@@ -194,15 +200,6 @@ fn decodeTerminalPng(allocator: std.mem.Allocator, bytes: []const u8) ghostty_vt
     };
 }
 
-fn decodeOsc52ClipboardAlloc(allocator: std.mem.Allocator, encoded: []const u8) ![:0]u8 {
-    const decoder = std.base64.standard.Decoder;
-    const decoded_len = try decoder.calcSizeForSlice(encoded);
-    const decoded = try allocator.allocSentinel(u8, decoded_len, 0);
-    errdefer allocator.free(decoded);
-    try decoder.decode(decoded, encoded);
-    return decoded;
-}
-
 // Consecutive tail failures tolerated before declaring the daemon gone.
 // ~2 seconds at display rate; see daemon_poll_failures for why one miss
 // must not trigger a revive.
@@ -229,6 +226,11 @@ const TERMINAL_GET_PGRP_IOCTL: ?c_int = switch (builtin.os.tag) {
 };
 const TerminalStream = @TypeOf((@as(*ghostty_vt.Terminal, undefined)).vtStream());
 const TerminalHandler = @TypeOf((@as(*ghostty_vt.Terminal, undefined)).vtHandler());
+// lib_vt does not re-export the clipboard module, so recover the OSC 52
+// write types from the effect signature to keep the pin the single source.
+const ClipboardWriteFn = @typeInfo(@typeInfo(@FieldType(@FieldType(TerminalHandler, "effects"), "clipboard_write")).optional.child).pointer.child;
+const ClipboardWrite = @typeInfo(ClipboardWriteFn).@"fn".params[1].type.?;
+const ClipboardWriteResult = @typeInfo(ClipboardWriteFn).@"fn".return_type.?;
 const DeviceAttributes = @typeInfo(
     std.meta.Child(std.meta.Child(@TypeOf(TerminalHandler.Effects.readonly.device_attributes))),
 ).@"fn".return_type.?;
@@ -394,6 +396,20 @@ pub const TerminalLaunchProfile = struct {
 };
 
 pub const TerminalRevivePolicy = sessionizer.RevivePolicy;
+
+fn daemonSessionNeedsLaunchFallback(
+    revive_policy: TerminalRevivePolicy,
+    attached_existing_session: bool,
+) bool {
+    return !attached_existing_session and revive_policy == .attach_or_create;
+}
+
+test "daemon recreation requests launch fallback only for a missing persisted session" {
+    try std.testing.expect(daemonSessionNeedsLaunchFallback(.attach_or_create, false));
+    try std.testing.expect(!daemonSessionNeedsLaunchFallback(.attach_or_create, true));
+    try std.testing.expect(!daemonSessionNeedsLaunchFallback(.restart, false));
+    try std.testing.expect(!daemonSessionNeedsLaunchFallback(.attach_only, false));
+}
 
 pub const SessionSnapshot = struct {
     running: bool,
@@ -733,6 +749,32 @@ pub const Dock = struct {
         self.pending_session_teardowns.deinit(allocator);
     }
 
+    /// Moves live emulator ownership into a freshly restored layout by stable
+    /// daemon identity. Persisted tabs and pane geometry remain authoritative.
+    pub fn transferRuntimeFrom(self: *Dock, current: *Dock) usize {
+        var transferred: usize = 0;
+        for (current.tabs.items) |*tab| {
+            transferPaneNodeSessions(tab.root, self, &transferred);
+        }
+        if (transferred == 0 and current.pending_session_teardowns.items.len == 0) return 0;
+
+        std.mem.swap(@TypeOf(self.cwd), &self.cwd, &current.cwd);
+        std.mem.swap(@TypeOf(self.pref_path), &self.pref_path, &current.pref_path);
+        std.mem.swap(u32, &self.session_dock_id, &current.session_dock_id);
+        std.mem.swap(bool, &self.orphan_prune_done, &current.orphan_prune_done);
+        std.mem.swap(AutoRestartBackoff, &self.auto_restart_backoff, &current.auto_restart_backoff);
+        std.mem.swap(
+            @TypeOf(self.pending_session_teardowns),
+            &self.pending_session_teardowns,
+            &current.pending_session_teardowns,
+        );
+        self.focus_requested = self.focus_requested or current.focus_requested;
+        current.focus_requested = false;
+        self.workspace_changed = self.workspace_changed or current.workspace_changed;
+        current.workspace_changed = false;
+        return transferred;
+    }
+
     pub fn toggle(self: *Dock) bool {
         self.visible = !self.visible;
         if (self.visible) self.focus_requested = true;
@@ -1043,6 +1085,17 @@ pub const Dock = struct {
         return false;
     }
 
+    /// Returns whether a persisted daemon identity had to be recreated. The
+    /// workspace owner uses this one-shot signal to restore commands that were
+    /// originally typed into a long-lived shell, such as an agent TUI resume.
+    pub fn takeDaemonSessionRecreated(self: *Dock) bool {
+        var recreated = false;
+        for (self.tabs.items) |*tab| {
+            recreated = takeDaemonSessionRecreatedInNode(tab.root) or recreated;
+        }
+        return recreated;
+    }
+
     /// Reserves one automatic recovery attempt while preventing a shell that
     /// exits immediately from being recreated on every main-loop iteration.
     pub fn reserveAutoRestart(self: *Dock, now_ms: i64) bool {
@@ -1141,6 +1194,12 @@ pub const Dock = struct {
         const pane = self.activePaneConst() orelse return null;
         const session = pane.session orelse return null;
         return try session.screenTextAlloc(allocator);
+    }
+
+    pub fn activeGridSize(self: *const Dock) ?struct { cols: u16, rows: u16 } {
+        const pane = self.activePaneConst() orelse return null;
+        const session = pane.session orelse return null;
+        return .{ .cols = session.cols, .rows = session.rows };
     }
 
     pub fn handleKeyDown(
@@ -1250,6 +1309,39 @@ pub const Dock = struct {
     pub fn activePaneConst(self: *const Dock) ?*const PaneLeaf {
         const tab = self.activeTabConst() orelse return null;
         return findPaneLeafConst(tab.root, tab.active_pane_id) orelse findFirstPaneLeafConst(tab.root);
+    }
+
+    /// Coordinate seam for validated daemon snapshot materialization.
+    pub fn paneById(self: *Dock, pane_id: u32) ?*PaneLeaf {
+        return self.findPaneById(pane_id);
+    }
+
+    /// Append one validated daemon-owned pane without round-tripping the whole
+    /// dock through JSON. The caller owns coordinate bounds and collision caps.
+    pub fn appendDaemonSessionPane(
+        self: *Dock,
+        allocator: std.mem.Allocator,
+        pane_id: u32,
+        session_id: []const u8,
+    ) !*PaneLeaf {
+        std.debug.assert(pane_id != 0);
+        std.debug.assert(self.findPaneById(pane_id) == null);
+        const node = try allocator.create(PaneNode);
+        errdefer allocator.destroy(node);
+        const owned_session_id = try allocator.dupe(u8, session_id);
+        errdefer allocator.free(owned_session_id);
+        node.* = .{ .leaf = .{
+            .id = pane_id,
+            .session_id = owned_session_id,
+            .revive_policy = .attach_or_create,
+        } };
+        try self.tabs.append(allocator, .{
+            .id = self.allocateTabId(),
+            .root = node,
+            .active_pane_id = pane_id,
+        });
+        self.next_pane_id = @max(self.next_pane_id, pane_id +| 1);
+        return &node.leaf;
     }
 
     pub fn activeSessionId(self: *const Dock) ?[]const u8 {
@@ -1528,6 +1620,10 @@ pub const Dock = struct {
         var parsed = try std.json.parseFromSlice(PersistedWorkspace, allocator, json, .{});
         defer parsed.deinit();
 
+        // Validate before touching the live dock so corrupt coordinates leave
+        // the previously loaded layout intact and can never introduce aliases.
+        try validatePersistedPaneIds(allocator, parsed.value);
+
         if (parsed.value.font_scale) |font_scale| {
             self.font_scale = clampf(font_scale, MIN_FONT_SCALE, MAX_FONT_SCALE);
         }
@@ -1558,7 +1654,7 @@ pub const Dock = struct {
         }
 
         self.active_tab_index = @min(parsed.value.active_tab_index, self.tabs.items.len - 1);
-        self.next_pane_id = @max(self.next_pane_id, max_pane_id + 1);
+        self.next_pane_id = @max(self.next_pane_id, max_pane_id +| 1);
     }
 
     fn ensureWorkspace(self: *Dock, allocator: std.mem.Allocator) !void {
@@ -1674,7 +1770,8 @@ pub const Dock = struct {
 
     fn createLeafNode(self: *Dock, allocator: std.mem.Allocator, ensure_session: bool) !*PaneNode {
         const node = try allocator.create(PaneNode);
-        node.* = .{ .leaf = .{ .id = self.allocatePaneId(), .session = null } };
+        errdefer allocator.destroy(node);
+        node.* = .{ .leaf = .{ .id = try self.allocatePaneId(), .session = null } };
         if (ensure_session) {
             try self.ensureLeafSession(allocator, &node.leaf);
         }
@@ -1748,10 +1845,26 @@ pub const Dock = struct {
         return id;
     }
 
-    fn allocatePaneId(self: *Dock) u32 {
-        const id = self.next_pane_id;
-        self.next_pane_id += 1;
-        return id;
+    fn allocatePaneId(self: *Dock) !u32 {
+        return self.allocatePaneIdWithin(MAX_PANE_ID);
+    }
+
+    fn allocatePaneIdWithin(self: *Dock, limit: u32) !u32 {
+        std.debug.assert(limit > 0 and limit <= MAX_PANE_ID);
+        var occupied: std.bit_set.StaticBitSet(MAX_PANE_ID + 1) = .empty;
+        for (self.tabs.items) |tab| markOccupiedPaneIds(tab.root, limit, &occupied);
+        if (occupied.count() >= @as(usize, limit)) return error.PaneIdExhausted;
+
+        var candidate = if (self.next_pane_id == 0 or self.next_pane_id > limit) @as(u32, 1) else self.next_pane_id;
+        var attempts: u32 = 0;
+        while (attempts < limit) : (attempts += 1) {
+            if (!occupied.isSet(@intCast(candidate))) {
+                self.next_pane_id = if (candidate == limit) 1 else candidate + 1;
+                return candidate;
+            }
+            candidate = if (candidate == limit) 1 else candidate + 1;
+        }
+        return error.PaneIdExhausted;
     }
 
     fn findTabIndexById(self: *const Dock, tab_id: u32) ?usize {
@@ -1781,6 +1894,7 @@ pub const Dock = struct {
                 if (leaf.id != target_pane_id) break :blk error.PaneNotFound;
 
                 const existing_leaf_node = try allocator.create(PaneNode);
+                errdefer allocator.destroy(existing_leaf_node);
                 existing_leaf_node.* = .{ .leaf = leaf };
                 const new_leaf_node = try self.createLeafNode(allocator, true);
                 const new_pane_id = new_leaf_node.leaf.id;
@@ -1831,6 +1945,22 @@ pub const Dock = struct {
         return true;
     }
 };
+
+fn markOccupiedPaneIds(
+    node: *const PaneNode,
+    limit: u32,
+    occupied: *std.bit_set.StaticBitSet(MAX_PANE_ID + 1),
+) void {
+    switch (node.*) {
+        .leaf => |leaf| {
+            if (leaf.id > 0 and leaf.id <= limit) occupied.set(@intCast(leaf.id));
+        },
+        .split => |split| {
+            markOccupiedPaneIds(split.first, limit, occupied);
+            markOccupiedPaneIds(split.second, limit, occupied);
+        },
+    }
+}
 
 fn deinitPaneNode(node: *PaneNode, allocator: std.mem.Allocator) void {
     switch (node.*) {
@@ -1973,6 +2103,45 @@ fn collectPaneSessionIds(allocator: std.mem.Allocator, node: *PaneNode, session_
     }
 }
 
+fn transferPaneNodeSessions(node: *PaneNode, replacement: *Dock, transferred: *usize) void {
+    switch (node.*) {
+        .leaf => |*leaf| {
+            const session = leaf.session orelse return;
+            const session_id = session.sessionId() orelse leaf.session_id orelse return;
+            const target = findPaneLeafBySessionId(replacement, session_id) orelse return;
+            if (target.session != null) return;
+            target.session = session;
+            leaf.session = null;
+            transferred.* += 1;
+        },
+        .split => |*split| {
+            transferPaneNodeSessions(split.first, replacement, transferred);
+            transferPaneNodeSessions(split.second, replacement, transferred);
+        },
+    }
+}
+
+fn findPaneLeafBySessionId(dock: *Dock, session_id: []const u8) ?*PaneLeaf {
+    for (dock.tabs.items) |*tab| {
+        if (findPaneLeafBySessionIdInNode(tab.root, session_id)) |leaf| return leaf;
+    }
+    return null;
+}
+
+fn findPaneLeafBySessionIdInNode(node: *PaneNode, session_id: []const u8) ?*PaneLeaf {
+    return switch (node.*) {
+        .leaf => |*leaf| blk: {
+            const candidate = if (leaf.session) |session| session.sessionId() orelse leaf.session_id else leaf.session_id;
+            if (candidate) |value| {
+                if (std.mem.eql(u8, value, session_id)) break :blk leaf;
+            }
+            break :blk null;
+        },
+        .split => |*split| findPaneLeafBySessionIdInNode(split.first, session_id) orelse
+            findPaneLeafBySessionIdInNode(split.second, session_id),
+    };
+}
+
 fn collectPaneSessionLifecycleSnapshots(
     allocator: std.mem.Allocator,
     node: *PaneNode,
@@ -2102,6 +2271,17 @@ fn paneNodeHasSessionId(node: *const PaneNode) bool {
     return switch (node.*) {
         .leaf => |leaf| leaf.session_id != null,
         .split => |split| paneNodeHasSessionId(split.first) or paneNodeHasSessionId(split.second),
+    };
+}
+
+fn takeDaemonSessionRecreatedInNode(node: *PaneNode) bool {
+    return switch (node.*) {
+        .leaf => |*leaf| if (leaf.session) |session| session.takeDaemonSessionRecreated() else false,
+        .split => |*split| blk: {
+            const first = takeDaemonSessionRecreatedInNode(split.first);
+            const second = takeDaemonSessionRecreatedInNode(split.second);
+            break :blk first or second;
+        },
     };
 }
 
@@ -2376,6 +2556,44 @@ fn persistedRevivePolicy(revive_policy: TerminalRevivePolicy) TerminalRevivePoli
     };
 }
 
+fn validatePersistedPaneIds(allocator: std.mem.Allocator, persisted: PersistedWorkspace) !void {
+    var seen_pane_ids: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer seen_pane_ids.deinit(allocator);
+    for (persisted.tabs) |tab| {
+        if (tab.active_pane_id > MAX_PANE_ID) return error.InvalidPersistedTerminalLayout;
+
+        var node_indexes: std.AutoHashMapUnmanaged(u32, usize) = .empty;
+        defer node_indexes.deinit(allocator);
+        for (tab.nodes, 0..) |node, index| {
+            const node_entry = try node_indexes.getOrPut(allocator, node.node_id);
+            if (node_entry.found_existing) return error.InvalidPersistedTerminalLayout;
+            node_entry.value_ptr.* = index;
+            if (node.kind == .leaf) {
+                if (node.pane_id == 0 or node.pane_id > MAX_PANE_ID) return error.InvalidPersistedTerminalLayout;
+                const pane_entry = try seen_pane_ids.getOrPut(allocator, node.pane_id);
+                if (pane_entry.found_existing) return error.InvalidPersistedTerminalLayout;
+            }
+        }
+
+        var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer visited.deinit(allocator);
+        var pending: std.ArrayList(u32) = .empty;
+        defer pending.deinit(allocator);
+        try pending.append(allocator, tab.root_node_id);
+        while (pending.pop()) |node_id| {
+            const visited_entry = try visited.getOrPut(allocator, node_id);
+            if (visited_entry.found_existing) return error.InvalidPersistedTerminalLayout;
+            const node_index = node_indexes.get(node_id) orelse return error.InvalidPersistedTerminalLayout;
+            const node = tab.nodes[node_index];
+            if (node.kind == .split) {
+                try pending.append(allocator, node.first_node_id orelse return error.InvalidPersistedTerminalLayout);
+                try pending.append(allocator, node.second_node_id orelse return error.InvalidPersistedTerminalLayout);
+            }
+        }
+        if (visited.count() != tab.nodes.len) return error.InvalidPersistedTerminalLayout;
+    }
+}
+
 fn buildPaneNodeFromPersisted(
     allocator: std.mem.Allocator,
     nodes: []const PersistedNode,
@@ -2471,6 +2689,10 @@ const UnsupportedSession = struct {
     }
 
     pub fn isRunning(_: *const UnsupportedSession) bool {
+        return false;
+    }
+
+    pub fn takeDaemonSessionRecreated(_: *UnsupportedSession) bool {
         return false;
     }
 
@@ -2594,6 +2816,9 @@ const UnixSession = struct {
     /// replay cannot reconstruct a full TUI frame — the pane comes back as a
     /// garbled mix of partial frames. Only give up after a sustained outage.
     daemon_poll_failures: u32 = 0,
+    /// Set only when attach-or-create found that a persisted daemon session no
+    /// longer existed. Consumers use it to replay higher-level launch intent.
+    daemon_session_recreated: bool = false,
     daemon_prefetched: bool = false,
     daemon_prefetched_changed: bool = false,
     last_daemon_tail_response: std.ArrayList(u8) = .empty,
@@ -2643,13 +2868,15 @@ const UnixSession = struct {
         const self = try allocator.create(UnixSession);
         errdefer allocator.destroy(self);
 
-        var terminal = try ghostty_vt.Terminal.init(allocator, .{
+        // TinyIo is zero-sized and stateless, so a temporary is safe even
+        // though Screen retains the std.Io interface it produces.
+        var terminal = try ghostty_vt.Terminal.init((ghostty_vt.TinyIo.init).io(), allocator, .{
             .cols = options.cols,
             .rows = options.rows,
             // Ghostty's libterminal default is 10_000 *bytes* (~10 KB), which
             // caps scrollback at a few screenfuls. Match Ghostty's main-app
             // default of 10 MB so long sessions retain meaningful history.
-            .max_scrollback = 10_000_000,
+            .max_scrollback_bytes = 10_000_000,
             .kitty_image_storage_limit = KITTY_IMAGE_STORAGE_LIMIT,
         });
         errdefer terminal.deinit(allocator);
@@ -2679,7 +2906,7 @@ const UnixSession = struct {
             };
             self.stream = self.terminal.vtStream();
             self.stream.handler.effects.write_pty = &UnixSession.streamWritePty;
-            self.stream.handler.effects.clipboard = &UnixSession.streamClipboard;
+            self.stream.handler.effects.clipboard_write = &UnixSession.streamClipboard;
             self.stream.handler.effects.device_attributes = &UnixSession.streamDeviceAttributes;
             self.stream.handler.effects.size = &UnixSession.streamSize;
             self.stream.handler.effects.xtversion = &UnixSession.streamXtVersion;
@@ -2723,7 +2950,7 @@ const UnixSession = struct {
         };
         self.stream = self.terminal.vtStream();
         self.stream.handler.effects.write_pty = &UnixSession.streamWritePty;
-        self.stream.handler.effects.clipboard = &UnixSession.streamClipboard;
+        self.stream.handler.effects.clipboard_write = &UnixSession.streamClipboard;
         self.stream.handler.effects.device_attributes = &UnixSession.streamDeviceAttributes;
         self.stream.handler.effects.size = &UnixSession.streamSize;
         self.stream.handler.effects.xtversion = &UnixSession.streamXtVersion;
@@ -2890,7 +3117,11 @@ const UnixSession = struct {
             // resize the terminal model. Verde must not add emulator-side clears
             // or synthetic redraw input around this resize; the app owns its
             // repaint behavior.
-            try self.terminal.resize(allocator, next_cols, next_rows);
+            try self.terminal.resize(allocator, .{
+                .cols = next_cols,
+                .rows = next_rows,
+                .cell_size_px = .{ .width = self.cell_width, .height = self.cell_height },
+            });
             self.terminal.modes.set(.synchronized_output, false);
             if (terminalLayoutDiagnosticsEnabled()) {
                 // Capture the inputs that decide reflow behavior so we can
@@ -3020,6 +3251,12 @@ const UnixSession = struct {
 
     pub fn isRunning(self: *const UnixSession) bool {
         return self.running;
+    }
+
+    pub fn takeDaemonSessionRecreated(self: *UnixSession) bool {
+        const recreated = self.daemon_session_recreated;
+        self.daemon_session_recreated = false;
+        return recreated;
     }
 
     pub fn snapshot(self: *const UnixSession) SessionSnapshot {
@@ -3510,6 +3747,10 @@ const UnixSession = struct {
         if (attached_existing_session) {
             if (options.restored_modes) |modes| self.applyRestoredTerminalModes(modes);
         }
+        self.daemon_session_recreated = daemonSessionNeedsLaunchFallback(
+            options.revive_policy,
+            attached_existing_session,
+        );
         self.suppress_next_daemon_replay = attached_existing_session;
         self.defer_daemon_replay_until_resize = attached_existing_session;
         self.needs_attach_repaint_kick = attached_existing_session;
@@ -3835,10 +4076,17 @@ const UnixSession = struct {
         const pref_path = self.pref_path orelse return;
         const session_id = self.session_id orelse return;
         const attach_id = self.attach_id orelse return;
-        const response = sessionizer.requestAlloc(allocator, pref_path, "session.detach", .{
-            .id = session_id,
-            .attach_id = attach_id,
-        }, 1) catch return;
+        const response = sessionizer.requestAllocWithTimeout(
+            allocator,
+            pref_path,
+            "session.detach",
+            .{
+                .id = session_id,
+                .attach_id = attach_id,
+            },
+            1,
+            SESSION_DETACH_TIMEOUT_MS,
+        ) catch return;
         allocator.free(response);
     }
 
@@ -3915,7 +4163,11 @@ const UnixSession = struct {
         const fallback_rows = sanitizeCellCount(self.rows, MIN_ROWS);
 
         if (self.terminal.cols == 0 or self.terminal.rows == 0) {
-            try self.terminal.resize(allocator, fallback_cols, fallback_rows);
+            try self.terminal.resize(allocator, .{
+                .cols = fallback_cols,
+                .rows = fallback_rows,
+                .cell_size_px = .{ .width = self.cell_width, .height = self.cell_height },
+            });
             repaired = true;
         }
 
@@ -3967,17 +4219,20 @@ const UnixSession = struct {
         };
     }
 
-    fn streamClipboard(handler: *TerminalHandler, _: u8, data: []const u8) void {
-        if (std.mem.eql(u8, data, "?")) return;
+    fn streamClipboard(handler: *TerminalHandler, write: ClipboardWrite) ClipboardWriteResult {
+        // Contents arrive already base64-decoded and borrowed; read requests
+        // are filtered upstream. An empty contents slice clears the clipboard.
         const allocator = handler.terminal.gpa();
-        const clipboard_text = decodeOsc52ClipboardAlloc(allocator, data) catch |err| {
-            log.warn("ignored invalid OSC 52 clipboard payload: {s}", .{@errorName(err)});
-            return;
-        };
-        defer allocator.free(clipboard_text);
-        sdl.setClipboardText(clipboard_text) catch |err| {
+        const text: []const u8 = for (write.contents) |content| {
+            if (std.mem.startsWith(u8, content.mime, "text/")) break content.data;
+        } else if (write.contents.len > 0) write.contents[0].data else "";
+        const text_z = allocator.dupeZ(u8, text) catch return .io_error;
+        defer allocator.free(text_z);
+        sdl.setClipboardText(text_z) catch |err| {
             log.warn("failed to set OSC 52 clipboard text: {s}", .{@errorName(err)});
+            return .io_error;
         };
+        return .success;
     }
 
     fn streamDeviceAttributes(_: *TerminalHandler) DeviceAttributes {
@@ -4438,6 +4693,15 @@ fn encodeTerminalKeyChord(
     var utf8_buffer: [1]u8 = undefined;
     const key_event = terminalKeyEvent(chord, &utf8_buffer);
     try ghostty_vt.input.encodeKey(writer, key_event, options);
+}
+
+/// Encode a validated key chord with default terminal protocol options.
+/// Used by headless/daemon-direct MCP key delivery where no local VT model exists.
+pub fn encodeKeyChordDefaultAlloc(allocator: std.mem.Allocator, chord: TerminalKeyChord) ![]u8 {
+    var buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try encodeTerminalKeyChord(&writer, chord, .default);
+    return try allocator.dupe(u8, writer.buffered());
 }
 
 fn terminalKeyEvent(chord: TerminalKeyChord, utf8_buffer: *[1]u8) ghostty_vt.input.KeyEvent {
@@ -5265,17 +5529,6 @@ fn clampf(value: f32, min_value: f32, max_value: f32) f32 {
     return @max(min_value, @min(value, max_value));
 }
 
-test "OSC 52 clipboard decoder accepts UTF-8 text and rejects invalid base64" {
-    const decoded = try decodeOsc52ClipboardAlloc(std.testing.allocator, "c2VsZWN0ZWQgdGV4dCDinJM=");
-    defer std.testing.allocator.free(decoded);
-    try std.testing.expectEqualStrings("selected text ✓", decoded);
-
-    try std.testing.expectError(
-        error.InvalidCharacter,
-        decodeOsc52ClipboardAlloc(std.testing.allocator, "!!!!"),
-    );
-}
-
 test "terminal key chords validate the allowlisted vocabulary" {
     const submit = try TerminalKeyChord.parse("enter");
     try std.testing.expectEqual(TerminalKey.enter, submit.key);
@@ -5321,7 +5574,7 @@ test "terminal key encoding uses terminal protocol options" {
 
 test "terminal key encoding follows negotiated terminal input modes" {
     const allocator = std.testing.allocator;
-    var terminal = try ghostty_vt.Terminal.init(allocator, .{
+    var terminal = try ghostty_vt.Terminal.init((ghostty_vt.TinyIo.init).io(), allocator, .{
         .cols = 80,
         .rows = 24,
     });
@@ -5420,6 +5673,130 @@ test "persisted layout accepts leaves without session metadata" {
     try std.testing.expectEqual(pane.restored_modes.?, round_trip.value.tabs[0].nodes[0].terminal_modes.?);
 }
 
+test "persisted layout rejects out-of-range pane id without replacing live layout" {
+    const allocator = std.testing.allocator;
+    var dock = try Dock.init(allocator);
+    defer dock.deinit(allocator);
+    try dock.tabs.append(allocator, try dock.buildSinglePaneTabWithoutSession(allocator));
+    const live_pane_id = dock.activePaneConst().?.id;
+    const invalid_layout_json =
+        \\{
+        \\  "active_tab_index": 0,
+        \\  "tabs": [{
+        \\    "active_pane_id": 4294967295,
+        \\    "root_node_id": 1,
+        \\    "nodes": [{
+        \\      "node_id": 1,
+        \\      "kind": "leaf",
+        \\      "pane_id": 4294967295
+        \\    }]
+        \\  }]
+        \\}
+    ;
+
+    try std.testing.expectError(
+        error.InvalidPersistedTerminalLayout,
+        dock.applyPersistedLayoutJson(allocator, invalid_layout_json),
+    );
+    try std.testing.expectEqual(@as(usize, 1), dock.tabs.items.len);
+    try std.testing.expectEqual(live_pane_id, dock.activePaneConst().?.id);
+}
+
+test "persisted layout rejects shared child references without replacing live layout" {
+    const allocator = std.testing.allocator;
+    var dock = try Dock.init(allocator);
+    defer dock.deinit(allocator);
+    try dock.tabs.append(allocator, try dock.buildSinglePaneTabWithoutSession(allocator));
+    const live_pane_id = dock.activePaneConst().?.id;
+    const invalid_layout_json =
+        \\{"tabs":[{
+        \\  "active_pane_id":7,"root_node_id":1,"nodes":[
+        \\    {"node_id":1,"kind":"split","first_node_id":2,"second_node_id":2},
+        \\    {"node_id":2,"kind":"leaf","pane_id":7}
+        \\  ]
+        \\}]}
+    ;
+
+    try std.testing.expectError(
+        error.InvalidPersistedTerminalLayout,
+        dock.applyPersistedLayoutJson(allocator, invalid_layout_json),
+    );
+    try std.testing.expectEqual(@as(usize, 1), dock.tabs.items.len);
+    try std.testing.expectEqual(live_pane_id, dock.activePaneConst().?.id);
+}
+
+test "persisted layout rejects cycles without replacing live layout" {
+    const allocator = std.testing.allocator;
+    var dock = try Dock.init(allocator);
+    defer dock.deinit(allocator);
+    try dock.tabs.append(allocator, try dock.buildSinglePaneTabWithoutSession(allocator));
+    const live_pane_id = dock.activePaneConst().?.id;
+    const invalid_layout_json =
+        \\{"tabs":[{
+        \\  "active_pane_id":7,"root_node_id":1,"nodes":[
+        \\    {"node_id":1,"kind":"split","first_node_id":2,"second_node_id":1},
+        \\    {"node_id":2,"kind":"leaf","pane_id":7}
+        \\  ]
+        \\}]}
+    ;
+
+    try std.testing.expectError(
+        error.InvalidPersistedTerminalLayout,
+        dock.applyPersistedLayoutJson(allocator, invalid_layout_json),
+    );
+    try std.testing.expectEqual(@as(usize, 1), dock.tabs.items.len);
+    try std.testing.expectEqual(live_pane_id, dock.activePaneConst().?.id);
+}
+
+test "pane id exhaustion is fallible and never returns a duplicate" {
+    const allocator = std.testing.allocator;
+    var dock = try Dock.init(allocator);
+    defer dock.deinit(allocator);
+    _ = try dock.appendDaemonSessionPane(allocator, 1, "session-1");
+    _ = try dock.appendDaemonSessionPane(allocator, 2, "session-2");
+    _ = try dock.appendDaemonSessionPane(allocator, 3, "session-3");
+    dock.next_pane_id = 1;
+
+    try std.testing.expectError(error.PaneIdExhausted, dock.allocatePaneIdWithin(3));
+    try std.testing.expectEqualStrings("session-1", dock.paneById(1).?.session_id.?);
+    try std.testing.expectEqualStrings("session-2", dock.paneById(2).?.session_id.?);
+    try std.testing.expectEqualStrings("session-3", dock.paneById(3).?.session_id.?);
+}
+
+test "pane id allocation stays linear at the full id bound" {
+    const allocator = std.testing.allocator;
+    var dock = try Dock.init(allocator);
+    defer dock.deinit(allocator);
+
+    var pane_id: u32 = 1;
+    while (pane_id < MAX_PANE_ID) : (pane_id += 1) {
+        const node = try allocator.create(PaneNode);
+        node.* = .{ .leaf = .{ .id = pane_id } };
+        dock.tabs.append(allocator, .{
+            .id = pane_id,
+            .root = node,
+            .active_pane_id = pane_id,
+        }) catch |err| {
+            allocator.destroy(node);
+            return err;
+        };
+    }
+    dock.next_pane_id = 1;
+    try std.testing.expectEqual(MAX_PANE_ID, try dock.allocatePaneIdWithin(MAX_PANE_ID));
+
+    const last_node = try allocator.create(PaneNode);
+    last_node.* = .{ .leaf = .{ .id = MAX_PANE_ID } };
+    dock.tabs.append(allocator, .{
+        .id = MAX_PANE_ID,
+        .root = last_node,
+        .active_pane_id = MAX_PANE_ID,
+    }) catch |err| {
+        allocator.destroy(last_node);
+        return err;
+    };
+    try std.testing.expectError(error.PaneIdExhausted, dock.allocatePaneIdWithin(MAX_PANE_ID));
+}
+
 test "persisted restart revive policy reloads as attach" {
     const allocator = std.testing.allocator;
     var dock = try Dock.init(allocator);
@@ -5443,6 +5820,45 @@ test "persisted restart revive policy reloads as attach" {
 
     try dock.applyPersistedLayoutJson(allocator, layout_json);
     try std.testing.expectEqual(TerminalRevivePolicy.attach_or_create, dock.activePaneConst().?.revive_policy);
+}
+
+test "persisted dock replacement keeps matching live emulator ownership" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var current = try Dock.init(allocator);
+    defer current.deinit(allocator);
+    try current.restartWithProfile(allocator, "/tmp", .{
+        .kind = .custom,
+        .label = "projection runtime transfer",
+        .command = &.{ "/bin/sh", "-c", "sleep 30" },
+    });
+    try lifecycle_testing.assignActiveSessionId(&current, allocator, "stable-daemon-session");
+    const live_session = current.activePane().?.session.?;
+
+    var replacement = try Dock.init(allocator);
+    defer replacement.deinit(allocator);
+    try replacement.applyPersistedLayoutJson(allocator,
+        \\{
+        \\  "tabs": [{
+        \\    "title": "persisted replacement",
+        \\    "active_pane_id": 42,
+        \\    "root_node_id": 1,
+        \\    "nodes": [{
+        \\      "node_id": 1,
+        \\      "kind": "leaf",
+        \\      "pane_id": 42,
+        \\      "session_id": "stable-daemon-session"
+        \\    }]
+        \\  }]
+        \\}
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), replacement.transferRuntimeFrom(&current));
+    try std.testing.expect(current.activePane().?.session == null);
+    try std.testing.expect(replacement.activePane().?.session.? == live_session);
+    try std.testing.expectEqual(@as(u32, 42), replacement.activePane().?.id);
+    try std.testing.expectEqualStrings("persisted replacement", replacement.tabs.items[0].title.?);
+    try std.testing.expectEqualStrings("/tmp", replacement.cwd.?);
 }
 
 test "session ensure preserves a running non-null session" {

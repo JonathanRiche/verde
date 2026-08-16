@@ -31,11 +31,15 @@ file. It is read on startup and on app refresh.
     "workspace_panes_per_view": 2,
     "workspace_scroll_direction": "horizontal",
     "workspace_scroll_mode": "automatic",
-    "workspace_scroll_threshold": 2
+    "workspace_scroll_threshold": 2,
+    "unzoom_on_pane_navigation": false
   },
   "open": {
     "default": "folder",
     "links": "verde_browser"
+  },
+  "browser": {
+    "scroll_speed": 2.5
   },
   "terminal": {
     "font_size": 18,
@@ -68,6 +72,7 @@ file. It is read on startup and on app refresh.
       "focus_right": "Ctrl+L",
       "pane_previous": "Ctrl+Shift+Tab",
       "pane_next": "Ctrl+Tab",
+      "active_select": ["Ctrl+Shift+1", "Ctrl+Shift+2", "Ctrl+Shift+3", "Ctrl+Shift+4", "Ctrl+Shift+5", "Ctrl+Shift+6", "Ctrl+Shift+7", "Ctrl+Shift+8", "Ctrl+Shift+9", "Ctrl+Shift+0"],
       "pane_select": ["Ctrl+1", "Ctrl+2", "Ctrl+3", "Ctrl+4", "Ctrl+5", "Ctrl+6", "Ctrl+7", "Ctrl+8", "Ctrl+9", "Ctrl+0"],
       "previous": "Alt+Up",
       "next": "Alt+Down"
@@ -78,9 +83,9 @@ file. It is read on startup and on app refresh.
 
 Keybinds are loaded on startup and on app refresh. Use a string for one
 shortcut or a string array for multiple shortcuts. Use `null`, an empty string,
-or an empty array to disable a binding. The `workspace.pane_select` array is
-positional and maps its first shortcut to the first pane shown under the current
-workspace in the sidebar, then continues in order. See [Keybinds](/docs/keybinds)
+or an empty array to disable a binding. The `workspace.pane_select` and
+`workspace.active_select` arrays are positional and follow the corresponding
+sidebar lists in displayed order. See [Keybinds](/docs/keybinds)
 for the full keybinds reference.
 
 Most of these options also appear in Settings:
@@ -92,6 +97,8 @@ Most of these options also appear in Settings:
   exchange and choose the provider and model used for titles.
 - **Terminal** — font size, launch profiles, and whether terminal link clicks
   open in Verde's browser pane or the system browser.
+- **Browser** — set embedded-page wheel speed from `1.0×` to `5.0×`; the
+  default is `2.5×`.
 - **Workspace** — choose `automatic`, `always`, or `disabled` scrolling layout,
   set the automatic activation threshold (1–64 panes), choose horizontal or
   vertical scrolling, control how many panes fit in one view and their gap,
@@ -100,14 +107,22 @@ Most of these options also appear in Settings:
   can inherit these global values or be overridden for the currently selected
   workspace. Drag-resized column widths are also saved per workspace and take
   precedence over panes-per-view sizing until reset. Pane gaps are omitted
-  while zoomed.
+  while zoomed. Pane navigation keeps the destination zoomed by default; set
+  `ui.unzoom_on_pane_navigation` to `true` to restore on navigation instead.
 - **Agent integrations** — status-pip hooks for supported provider CLIs.
+- **Experimental features** — enable the Companion sidecar and Mission Control
+  (off by default). **Appearance → Default companion** chooses Sprout, Moss, or
+  Vireo when the companion is on.
 - **Updates** — check now, install an available release, and automatic checks.
 - **Notifications** — enable or disable desktop notifications.
 
 Settings that write `verde.json` apply when you choose **Save**. Provider hook
 installation/removal runs immediately because it updates the provider's own
 configuration.
+
+`browser.scroll_speed` accepts values from `1.0` through `5.0`. Older configs
+using `browser.fast_scrolling` remain compatible: `true` maps to the `2.5×`
+default and `false` maps to `1.0×`.
 
 ### Open actions
 
@@ -284,8 +299,9 @@ On Omarchy systems, UI colors are loaded from an Omarchy-compatible
 `colors.toml`. Verde honors the first found of:
 
 1. `VERDE_OMARCHY_COLORS=/path/to/colors.toml`
-2. `$XDG_CONFIG_HOME/omarchy/current/theme/colors.toml`
-3. Named Omarchy themes such as `$XDG_CONFIG_HOME/omarchy/themes/verde/colors.toml`
+2. `~/.local/state/omarchy/current/theme/colors.toml` (Omarchy Quattro)
+3. `$XDG_CONFIG_HOME/omarchy/current/theme/colors.toml` (pre-Quattro fallback)
+4. Named Omarchy themes such as `$XDG_CONFIG_HOME/omarchy/themes/verde/colors.toml`
    or `~/.config/omarchy/themes/verde/colors.toml`
 
 Missing values fall back to Verde defaults. See

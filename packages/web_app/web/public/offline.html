@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0d1213" />
+    <title>Verde — offline</title>
+    <style>
+      html, body { height: 100%; margin: 0; background: #0d1213; color: #dcd7ba; font-family: system-ui, sans-serif; }
+      main { min-height: 100%; display: grid; place-items: center; padding: 24px; text-align: center; }
+      h1 { font-weight: 500; letter-spacing: -0.03em; }
+      p { color: #b9bbc3; max-width: 22rem; }
+      button { margin-top: 16px; border: 0; border-radius: 8px; padding: 10px 16px; background: #50c878; color: #06210f; font: inherit; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div>
+        <h1>Verde is offline</h1>
+        <p>This client needs the Verde gateway on your Tailscale host. Reconnect and try again.</p>
+        <button type="button" onclick="location.reload()">Retry</button>
+      </div>
+    </main>
+  </body>
+</html>

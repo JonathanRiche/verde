@@ -37,7 +37,7 @@ Run commands from the repository root.
 
 - Normal build/install verification: `mise run build`.
 - Real desktop runtime testing: `mise run dev`.
-- Do not use bare `zig build`; its Debug + WPE default is known to fail in vendored Ghostty and at link time.
+- Do not use bare `zig build`; its Debug + WPE default is known to fail at link time.
 - If a lower-level build is explicitly needed, use `zig build --release=safe -Dbrowser-backend=native_webview`.
 - Do not run generated desktop binaries directly for normal verification.
 
@@ -103,6 +103,26 @@ Treat it as native UI, not HTML/CSS or ImGui.
 - For major layout changes, check wide, laptop-width, short-height, and differing-scale layouts. Rebalance panel ratios rather than merely shrinking text.
 
 Use the real app for runtime layout, input, rendering, resize, or Palette migration checks. When safe to launch externally, use `mise run dev`, interact through the compositor, and verify with screenshots rather than logs alone.
+
+## Terminal Engine (ghostty-vt)
+
+There is no vendored ghostty tree. Both apps consume upstream `ghostty-org/ghostty` pinned to one commit:
+
+- Desktop: a hash-verified Zig package pin in `packages/desktop/build.zig.zon`. `packages/desktop/src/terminal/engine.zig` is the ONLY file that imports the `ghostty-vt` module; name engine types through it so a pin bump stays a one-file audit.
+- Web: the official pre-built `ghostty-vt.wasm` from the SAME commit, vendored at `packages/web_app/web/src/assets/` with a Verde-owned binding in `web/src/lib/ghostty_vt.ts`. Pin, SHA-256, and the bump procedure live in `ghostty-vt.NOTICE.md` next to the wasm.
+
+To bump: update the archive URL + hash in `build.zig.zon` (verify with `zig fetch` from a scratch project) and swap the wasm from `https://tip.files.ghostty.org/<commit>/ghostty-vt.wasm` — always the same commit for both. Expect upstream API drift at the `engine.zig`/`terminal.zig` seam; finish with `mise run build`. Do not reintroduce third-party wasm wrappers.
+
+## Headless Daemon And IPC Transport
+
+Chat turns and PTY sessions are owned by the session daemon (`verde-sessionizer.sock`). The GUI, web gateway (`verde-web`), MCP servers, and CLI are all detached clients: they project `core.snapshot` / `core.changes`, tail turns via `chat.turn.tail`, and speak one request per connection.
+
+- Transport concurrency limits (worker pool, accept queue, long-poll park cap) are pinned in `packages/desktop/src/platform/ipc.zig` with tests. Changing them is a design decision, not a patch.
+- The park cap is SHARED across every parking handler (`core.changes` and `chat.turn.tail wait_ms`) and bounds total parked waiters to half the pool, so short requests always find a free worker. New long-poll surfaces must reuse `long_poll_parked`; per-surface counters can starve the whole transport.
+- Over-cap or empty long-polls answer immediately (never an error). Clients must pace retries after an immediate heartbeat — hot retry loops saturate the pool for every client on the machine.
+- The GUI polls the daemon from the render thread. Daemon request latency is therefore frame latency: if streamed chat text "chunks in" or the UI stutters, check `main-loop gap` and `SDL thread stall operation=...` diagnostics in `verde.stderr.log`, then measure a raw round trip against the socket before touching UI code.
+- Daemon-side changes only take effect after the daemon restarts. Never restart it yourself from a Verde-hosted session; build and ask the user to relaunch.
+- Hermetic end-to-end coverage: `zig build headless-daemon-it --release=safe -Dbrowser-backend=native_webview` (spawns an isolated daemon; safe to run anywhere).
 
 ## Text Input Contract
 

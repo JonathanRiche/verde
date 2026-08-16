@@ -1,7 +1,7 @@
 //! Palette-only terminal dock shell.
 
 const std = @import("std");
-const ghostty_vt = @import("../vendor/ghostty_vt.zig");
+const ghostty_vt = @import("../terminal/engine.zig");
 const palette = @import("palette");
 const sdl = @import("zsdl3");
 
@@ -135,13 +135,13 @@ const TerminalPaneDrawCache = struct {
     cols: u16 = 0,
     font_scale: f32 = 0.0,
     screen: @TypeOf(ghostty_vt.RenderState.empty.screen) = .primary,
-    // Cache the cursor position so a pure cursor move forces a rebuild even
-    // if the dirty flag doesn't propagate (e.g. a same-cell SGR that doesn't
-    // touch the rendered grid). Otherwise the previous frame's cursor
-    // highlight can linger over the old cell.
+    // Cache cursor state so pure moves and visual-style changes force a
+    // rebuild even if the dirty flag doesn't propagate. Otherwise the
+    // previous frame's cursor can linger over the old cell or keep its shape.
     cursor_x: u16 = 0,
     cursor_y: u16 = 0,
     cursor_visible: bool = false,
+    cursor_visual_style: @TypeOf(ghostty_vt.RenderState.empty.cursor.visual_style) = .block,
     row_start: usize = 0,
     visible_rows: usize = 0,
     selection_dynamic: bool = false,
@@ -161,6 +161,15 @@ const TerminalPaneDrawCache = struct {
             self.row_start == row_start and
             self.visible_rows == visible_rows and
             self.selection_dynamic == selection_dynamic;
+    }
+
+    fn cursorStateChanged(self: *const TerminalPaneDrawCache, render_state: *const ghostty_vt.RenderState) bool {
+        const cursor_x: u16 = if (render_state.cursor.viewport) |cursor| @intCast(cursor.x) else 0;
+        const cursor_y: u16 = if (render_state.cursor.viewport) |cursor| @intCast(cursor.y) else 0;
+        return self.cursor_x != cursor_x or
+            self.cursor_y != cursor_y or
+            self.cursor_visible != render_state.cursor.visible or
+            self.cursor_visual_style != render_state.cursor.visual_style;
     }
 
     fn prepareRows(self: *TerminalPaneDrawCache, allocator: std.mem.Allocator, visible_rows: usize, reset_all: bool) bool {
@@ -190,6 +199,7 @@ const TerminalPaneDrawCache = struct {
         self.cursor_x = if (render_state.cursor.viewport) |c| @intCast(c.x) else 0;
         self.cursor_y = if (render_state.cursor.viewport) |c| @intCast(c.y) else 0;
         self.cursor_visible = render_state.cursor.visible;
+        self.cursor_visual_style = render_state.cursor.visual_style;
         self.row_start = row_start;
         self.visible_rows = visible_rows;
         self.selection_dynamic = selection_dynamic;
@@ -707,12 +717,8 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
     const visible_cols = @min(@as(usize, render_state.cols), @as(usize, @intFromFloat(@ceil(rect.w / cell_w))));
     const row_start = visibleRowStart(render_state, visible_rows);
     const geometry_valid = cache.geometryValidFor(render_state, rect, font_scale, row_start, visible_rows, selection_dynamic);
-    const cursor_x: u16 = if (render_state.cursor.viewport) |cursor| @intCast(cursor.x) else 0;
     const cursor_y: u16 = if (render_state.cursor.viewport) |cursor| @intCast(cursor.y) else 0;
-    const cursor_changed = !geometry_valid or
-        cache.cursor_x != cursor_x or
-        cache.cursor_y != cursor_y or
-        cache.cursor_visible != render_state.cursor.visible;
+    const cursor_changed = !geometry_valid or cache.cursorStateChanged(render_state);
     const cache_ready = cache.prepareRows(state.allocator, visible_rows, !geometry_valid);
     const rebuild_all = !cache_ready or
         !geometry_valid or
@@ -805,6 +811,10 @@ fn renderViewportRow(
         const span = @as(f32, @floatFromInt(cellWidthCells(raw_cell)));
         const cell_rect = terminalCellRect(grid_rect, cell_w, cell_h, x, visual_y, span);
         if (cell_rect.x >= rect.x + rect.w) break;
+        var draw_cursor_overlay = false;
+        // Bar, underline, and hollow cursors must be the final cell command so
+        // explicit TUI backgrounds and glyphs cannot paint over them.
+        defer if (draw_cursor_overlay) drawCursor(state, render_state, cell_rect, rect);
         const cell_style = styleForCell(raw_cell, row_styles, x);
         var bg = cell_style.bg(&raw_cell, &render_state.colors.palette) orelse render_state.colors.background;
         var fg = cell_style.fg(.{ .default = render_state.colors.foreground, .palette = &render_state.colors.palette, .bold = .bright });
@@ -826,7 +836,7 @@ fn renderViewportRow(
                     bg = blendRgb(bg, cursor_fill, 0.62);
                     fg = render_state.colors.background;
                 } else {
-                    drawCursor(state, render_state, cell_rect, rect);
+                    draw_cursor_overlay = true;
                 }
             }
         }
@@ -1042,9 +1052,12 @@ const TerminalRgbaPixels = struct {
 fn terminalImageRgba(allocator: std.mem.Allocator, image: *const ghostty_vt.kitty.graphics.Image) ?TerminalRgbaPixels {
     const pixel_count = std.math.mul(usize, image.width, image.height) catch return null;
     const rgba_len = std.math.mul(usize, pixel_count, 4) catch return null;
+    // Image.Data is a union at the pin: a still-pending transmission has no
+    // bytes yet and cannot be rendered this frame.
+    const data = image.data.bytes() orelse return null;
     if (image.format == .rgba) {
-        if (image.data.len != rgba_len) return null;
-        return .{ .pixels = image.data, .owned = false };
+        if (data.len != rgba_len) return null;
+        return .{ .pixels = data, .owned = false };
     }
     const source_bpp: usize = switch (image.format) {
         .rgb => 3,
@@ -1054,24 +1067,24 @@ fn terminalImageRgba(allocator: std.mem.Allocator, image: *const ghostty_vt.kitt
         .png => return null,
     };
     const source_len = std.math.mul(usize, pixel_count, source_bpp) catch return null;
-    if (image.data.len != source_len) return null;
+    if (data.len != source_len) return null;
     const pixels = allocator.alloc(u8, rgba_len) catch return null;
     for (0..pixel_count) |index| {
         const src = index * source_bpp;
         const dst = index * 4;
         switch (image.format) {
             .rgb => {
-                pixels[dst] = image.data[src];
-                pixels[dst + 1] = image.data[src + 1];
-                pixels[dst + 2] = image.data[src + 2];
+                pixels[dst] = data[src];
+                pixels[dst + 1] = data[src + 1];
+                pixels[dst + 2] = data[src + 2];
                 pixels[dst + 3] = 255;
             },
             .gray_alpha => {
-                @memset(pixels[dst .. dst + 3], image.data[src]);
-                pixels[dst + 3] = image.data[src + 1];
+                @memset(pixels[dst .. dst + 3], data[src]);
+                pixels[dst + 3] = data[src + 1];
             },
             .gray => {
-                @memset(pixels[dst .. dst + 3], image.data[src]);
+                @memset(pixels[dst .. dst + 3], data[src]);
                 pixels[dst + 3] = 255;
             },
             .rgba, .png => unreachable,
@@ -1723,7 +1736,7 @@ fn cellWidthCells(cell: ghostty_vt.Cell) u2 {
 
 fn styleForCell(cell: ghostty_vt.Cell, styles: []const ghostty_vt.Style, index: usize) ghostty_vt.Style {
     return switch (cell.content_tag) {
-        .bg_color_palette => .{ .bg_color = .{ .palette = @intCast(cell.content.color_palette) } },
+        .bg_color_palette => .{ .bg_color = .{ .palette = cell.content.color_palette.data } },
         .bg_color_rgb => .{ .bg_color = .{ .rgb = .{
             .r = cell.content.color_rgb.r,
             .g = cell.content.color_rgb.g,
@@ -2429,7 +2442,11 @@ fn queueRoundedBoxCorner(state: *app_state.AppState, rect: palette.Rect, cp: u21
     const center_x = rect.x + @floor((rect.w - stroke) * 0.5) + stroke * 0.5;
     const center_y = rect.y + @floor((rect.h - stroke) * 0.5) + stroke * 0.5;
     const radius = @min(rect.w, rect.h) * 0.5;
-    const circle: palette.Rect = .{ .x = center_x - radius, .y = center_y - radius, .w = radius * 2.0, .h = radius * 2.0 };
+    // Offset the arc center toward the box interior so its endpoints are tangent to both tails.
+    const arc_cx = if (lines.right != .none) center_x + radius else center_x - radius;
+    const arc_cy = if (lines.down != .none) center_y + radius else center_y - radius;
+    const outer_radius = radius + stroke * 0.5;
+    const circle: palette.Rect = .{ .x = arc_cx - outer_radius, .y = arc_cy - outer_radius, .w = outer_radius * 2.0, .h = outer_radius * 2.0 };
     const quadrant: palette.Rect = .{
         .x = if (lines.right != .none) center_x else center_x - radius,
         .y = if (lines.down != .none) center_y else center_y - radius,
@@ -2438,9 +2455,9 @@ fn queueRoundedBoxCorner(state: *app_state.AppState, rect: palette.Rect, cp: u21
     };
     const cell_clip = intersectRect(rect, quadrant) orelse return;
     if (clip) |outer_clip| {
-        if (intersectRect(cell_clip, outer_clip)) |arc_clip| queueClippedBorder(state, circle, color, radius, stroke, arc_clip);
+        if (intersectRect(cell_clip, outer_clip)) |arc_clip| queueClippedBorder(state, circle, color, outer_radius, stroke, arc_clip);
     } else {
-        queueClippedBorder(state, circle, color, radius, stroke, cell_clip);
+        queueClippedBorder(state, circle, color, outer_radius, stroke, cell_clip);
     }
 
     const center_left = center_x - stroke * 0.5;
@@ -2737,4 +2754,16 @@ test "terminal row cache rebuilds only changed or cursor-affected rows" {
     try std.testing.expect(terminalRowNeedsRebuild(false, true, false, true));
     try std.testing.expect(terminalRowNeedsRebuild(false, false, false, false));
     try std.testing.expect(terminalRowNeedsRebuild(true, true, false, false));
+}
+
+test "terminal row cache detects cursor visual style changes" {
+    var render_state: ghostty_vt.RenderState = .empty;
+    const cache: TerminalPaneDrawCache = .{
+        .cursor_visible = true,
+        .cursor_visual_style = .block,
+    };
+
+    try std.testing.expect(!cache.cursorStateChanged(&render_state));
+    render_state.cursor.visual_style = .bar;
+    try std.testing.expect(cache.cursorStateChanged(&render_state));
 }

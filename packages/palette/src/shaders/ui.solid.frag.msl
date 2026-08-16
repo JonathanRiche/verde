@@ -31,10 +31,11 @@ fragment float4 palette_solid_fragment(FSInput input [[stage_in]]) {
     float radius = input.sdf_radius_border.x;
     float border_w = input.sdf_radius_border.y;
     float dist = sdfRoundedRect(p, half_size, radius);
+    constexpr float aa_radius = 0.75;
 
     if (border_w > 0.0 && input.sdf_border.a > 0.0) {
-        float outer_alpha = 1.0 - smoothstep(-0.5, 0.5, dist);
-        float inner_alpha = 1.0 - smoothstep(-0.5, 0.5, dist + border_w);
+        float outer_alpha = 1.0 - smoothstep(-aa_radius, aa_radius, dist);
+        float inner_alpha = 1.0 - smoothstep(-aa_radius, aa_radius, dist + border_w);
         float border_alpha = max(outer_alpha - inner_alpha, 0.0);
         float fill_alpha = inner_alpha;
         float4 fill = float4(input.color.rgb, input.color.a * fill_alpha);
@@ -43,6 +44,6 @@ fragment float4 palette_solid_fragment(FSInput input [[stage_in]]) {
         float a = b_a + fill.a * (1.0 - b_a);
         return float4(rgb, a);
     }
-    float alpha = 1.0 - smoothstep(-0.5, 0.5, dist);
+    float alpha = 1.0 - smoothstep(-aa_radius, aa_radius, dist);
     return float4(input.color.rgb, input.color.a * alpha);
 }

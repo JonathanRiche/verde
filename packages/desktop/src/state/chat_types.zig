@@ -46,11 +46,17 @@ pub const TranscriptMarkdownBody = struct {
     render_cache_frame_text: std.ArrayList(u8),
     render_cache_text_arena: std.heap.ArenaAllocator,
     render_cache_key: ?TranscriptRenderCacheKey = null,
+    // Copy-button hits recorded while building the cache (origin-relative
+    // rects, payload offsets into `render_cache_frame_text`). Replay frames
+    // translate and re-register them so fenced-code messages stay
+    // replay-cache eligible instead of re-running markdown every frame.
+    render_cache_copy_buttons: std.ArrayList(chat_markdown.CodeCopyButtonSink) = .empty,
 
     pub fn deinit(self: *TranscriptMarkdownBody, allocator: std.mem.Allocator) void {
         self.render_cache.deinit(allocator);
         self.render_cache_frame_text.deinit(allocator);
         self.render_cache_text_arena.deinit();
+        self.render_cache_copy_buttons.deinit(allocator);
         self.view.deinit(allocator);
         allocator.free(self.owned_body);
         allocator.destroy(self);
@@ -71,6 +77,7 @@ pub const TranscriptHeightEntry = struct {
 pub const TranscriptLayoutItem = struct {
     message_index: usize,
     group_end: usize,
+    // Negative offset from the estimated committed tail.
     top: f32,
     height: f32,
 };
@@ -84,6 +91,14 @@ pub const ChatMessage = struct {
     tool_call_id: ?[]const u8 = null,
     tool_call_kind: ?ai_harness.ToolCallKind = null,
     tool_call_status: ?ai_harness.ToolCallStatus = null,
+    /// Durable transcript identity (M4-P4): the acceptance-staged client id on
+    /// user rows, or the daemon-minted id adopted from `chat.thread.get` at
+    /// terminal. Null until an identity is known; persistence carries it
+    /// verbatim so flushes never rewrite daemon-committed identities.
+    message_id: ?[]const u8 = null,
+    /// UI-only entrance timestamp for a card appended by a live stream. It is
+    /// intentionally absent from persistence and defaults to fully presented.
+    transcript_card_started_ms: i64 = 0,
 };
 
 pub const ChatImageAttachment = struct {
@@ -168,6 +183,8 @@ pub const ChatThread = struct {
     tui_dock_id: ?u32 = null,
     completion_pending: bool = false,
     completed_at_ms: i64 = 0,
+    /// Durable sort-index boundary before materialized messages.
+    persisted_message_offset: usize = 0,
     messages: std.ArrayList(ChatMessage),
     background_tasks: std.ArrayList(BackgroundTask),
     send_state: *SendState,
@@ -179,8 +196,11 @@ pub const ChatThread = struct {
     transcript_layout_width: f32 = 0.0,
     transcript_layout_scale: f32 = 0.0,
     transcript_layout_variant_hash: u64 = 0,
+    transcript_layout_first_message_index: usize = 0,
     transcript_layout_message_count: usize = 0,
     transcript_layout_committed_height: f32 = 0.0,
+    transcript_layout_requested_height: f32 = 0.0,
+    transcript_layout_visible_ready: bool = false,
     transcript_layout_valid: bool = false,
     transcript_scroll_valid: bool = false,
     transcript_scroll_y: f32 = 0.0,
@@ -212,6 +232,7 @@ pub const ChatThread = struct {
             .tui_dock_id = null,
             .completion_pending = false,
             .completed_at_ms = 0,
+            .persisted_message_offset = 0,
             .messages = .empty,
             .background_tasks = .empty,
             .send_state = send_state,
@@ -316,6 +337,16 @@ pub const ChatThread = struct {
         return self.send_state.status == .pending;
     }
 
+    /// True while the async chat.turn.start acceptance receipt is still in
+    /// flight for this thread's pending send (7.5). Follow-up queueing and
+    /// steer/stop issuance defer on this so the still-staged composer draft
+    /// cannot be double-sent before acceptance commits.
+    pub fn isSendAcceptancePending(self: *const ChatThread) bool {
+        self.send_state.mutex.lock();
+        defer self.send_state.mutex.unlock();
+        return self.send_state.status == .pending and self.send_state.acceptance_pending;
+    }
+
     pub fn isSendPendingForUi(self: *const ChatThread) bool {
         if (!self.send_state.mutex.tryLock()) return true;
         defer self.send_state.mutex.unlock();
@@ -323,16 +354,19 @@ pub const ChatThread = struct {
     }
 
     /// Activity state consumed by provider-neutral pane chrome and the ACTIVE
-    /// cluster. Approval requests are waiting, rather than generic working.
+    /// cluster. Approval requests and live background work are waiting, rather
+    /// than generic working or a misleading completed state.
     pub fn activityStatusForUi(self: *const ChatThread) ChatActivityStatus {
-        if (self.completion_pending) return .done;
         if (!self.send_state.mutex.tryLock()) return .working;
         defer self.send_state.mutex.unlock();
-        return switch (self.send_state.status) {
-            .pending => if (self.send_state.pending_approval != null and self.send_state.approval_decision == null) .waiting else .working,
-            .failed => .@"error",
-            else => .idle,
-        };
+        if (self.send_state.status == .pending) {
+            return if (self.send_state.pending_approval != null and self.send_state.approval_decision == null) .waiting else .working;
+        }
+        for (self.background_tasks.items) |task| {
+            if (task.status == .running) return .waiting;
+        }
+        if (self.completion_pending) return .done;
+        return if (self.send_state.status == .failed) .@"error" else .idle;
     }
 
     /// Unix ms when the in-flight send began, or null when no send is pending
@@ -507,6 +541,7 @@ pub const ChatThread = struct {
         const item_id = backgroundTaskMetadataValue(body_raw, "Codex item ID:");
         const process_id = backgroundTaskMetadataValue(body_raw, "Process ID:");
         const provider_thread_id = backgroundTaskMetadataValue(body_raw, "Provider thread ID:");
+        var matched_terminal_task: ?*BackgroundTask = null;
         for (self.background_tasks.items) |*task| {
             const identity_matches = (task_id != null and task.task_id != null and std.mem.eql(u8, task.task_id.?, task_id.?)) or
                 (item_id != null and task.item_id != null and provider_thread_id != null and task.provider_thread_id != null and
@@ -517,6 +552,19 @@ pub const ChatThread = struct {
             const legacy_command_matches = task_id == null and item_id == null and process_id == null and task.task_id == null and task.item_id == null and
                 task.process_id == null and std.mem.eql(u8, task.command, command);
             if (!identity_matches and !legacy_command_matches) continue;
+            // Repeated anonymous commands have no provider identity. A
+            // terminal event belongs to the first still-running match; using
+            // an already-terminal match forever leaves its sibling waiting.
+            if (status != .running and task.status != .running) {
+                if (matched_terminal_task == null) matched_terminal_task = task;
+                continue;
+            }
+            task.status = status;
+            task.updated_at_ms = unixTimestampMs();
+            try refreshBackgroundTaskMetadata(task, allocator, body_raw);
+            return;
+        }
+        if (matched_terminal_task) |task| {
             task.status = status;
             task.updated_at_ms = unixTimestampMs();
             try refreshBackgroundTaskMetadata(task, allocator, body_raw);
@@ -540,7 +588,24 @@ pub const ChatThread = struct {
             self.noteBackgroundTaskEvent(allocator, message.author, message.body) catch |err| {
                 log.warn("failed to restore background task metadata: {s}", .{@errorName(err)});
             };
+            if (std.mem.eql(u8, message.author, "Conversation interrupted")) {
+                _ = self.stopUnownedBackgroundTasks();
+            }
         }
+    }
+
+    /// Claude's tracked commands are owned by the query that emitted them and
+    /// intentionally have no detached PID or retained provider process id.
+    /// Once that query ends, such a row cannot still be live.
+    pub fn stopUnownedBackgroundTasks(self: *ChatThread) usize {
+        var stopped: usize = 0;
+        for (self.background_tasks.items) |*task| {
+            if (task.status != .running or task.pid_path != null or task.process_id != null) continue;
+            task.status = .stopped;
+            task.updated_at_ms = unixTimestampMs();
+            stopped += 1;
+        }
+        return stopped;
     }
 
     pub fn backgroundCommandIsRunning(self: *const ChatThread, body_raw: []const u8) bool {
@@ -586,7 +651,11 @@ pub const ChatThread = struct {
             std.heap.page_allocator.free(turn_id);
             self.send_state.daemon_turn_id = null;
         }
-        freePendingFollowup(std.heap.page_allocator, &self.send_state.pending_followup);
+        // Steer/queue followups are captured on the main thread with the app
+        // allocator (see storeDraftDuringSend), unlike the worker-owned
+        // page_allocator fields around them; freeing them through
+        // page_allocator panics on alignment.
+        freePendingFollowup(allocator, &self.send_state.pending_followup);
         self.send_state.partial_text.deinit(std.heap.page_allocator);
         freePendingTimelineEvents(std.heap.page_allocator, &self.send_state.pending_events);
         freePendingDiffFiles(std.heap.page_allocator, &self.send_state.pending_diff_files);
@@ -622,6 +691,7 @@ pub const ChatThread = struct {
             allocator.free(message.author);
             allocator.free(message.body);
             if (message.tool_call_id) |call_id| allocator.free(call_id);
+            if (message.message_id) |message_id| allocator.free(message_id);
             if (message.image) |*image| image.deinit(allocator);
             for (message.extra_images) |*image| image.deinit(allocator);
             allocator.free(message.extra_images);
@@ -662,6 +732,14 @@ pub const PendingFollowup = struct {
     kind: FollowupKind,
     state: FollowupState = .pending,
     prompt: []u8,
+    images: std.ArrayList(ChatImageAttachment) = .empty,
+
+    pub fn deinit(self: *PendingFollowup, allocator: std.mem.Allocator) void {
+        allocator.free(self.prompt);
+        for (self.images.items) |*image| image.deinit(allocator);
+        self.images.deinit(allocator);
+        self.* = undefined;
+    }
 };
 pub const SendState = struct {
     mutex: Mutex = .{},
@@ -679,8 +757,30 @@ pub const SendState = struct {
     daemon_turn_id: ?[]u8 = null,
     daemon_last_seq: u64 = 0,
     daemon_last_poll_ms: i64 = -1,
+    /// Extra delay before the next chat.turn.tail poll, derived from the last
+    /// round trip's measured cost. The tail RPC blocks the render thread, so
+    /// a slow/overloaded daemon must not be re-polled 16ms later — that turns
+    /// daemon latency into back-to-back frame stalls. Overwritten after every
+    /// poll; 0 while the daemon answers fast.
+    daemon_poll_backoff_ms: i64 = 0,
     daemon_owned: bool = false,
+    /// True from submit until the async chat.turn.start acceptance receipt
+    /// commits (M4-P3 semantics preserved off the event thread). While set:
+    /// the draft stays in the composer, tail polling and steer/stop issuance
+    /// are deferred, and follow-up queueing of the still-staged draft is
+    /// blocked so acceptance cannot double-send the same prompt.
+    acceptance_pending: bool = false,
+    /// Consecutive chat.turn.tail failures while daemon-owned (Amendment-2 F5).
+    /// Resets on a successful apply; thresholds to a visible failed send so the
+    /// GUI does not spin forever after a mid-turn daemon crash/restart.
+    daemon_tail_fail_count: u8 = 0,
     partial_text: std.ArrayListUnmanaged(u8) = .empty,
+    /// Memoized measured height of the in-flight streamed assistant body.
+    /// `partial_text` is append-only within a turn, so the paired key (length,
+    /// width, variant, turn identity) fully discriminates. Guarded by `mutex`;
+    /// avoids an O(stream-length) re-measure on every frame. -1 = unmeasured.
+    stream_measured_height: f32 = -1.0,
+    stream_measured_key: u64 = 0,
     /// True while the provider reports an active content-less reasoning item.
     /// Surfaced as "Thinking - mm:ss" in the pending stream header rather
     /// than as a transcript tool row.
@@ -746,6 +846,30 @@ pub const PendingApproval = struct {
     title: []u8,
     body: []u8,
 };
+
+/// Composer snapshots (queued follow-up pin, approval card) cached across
+/// frames keyed on the owning send-state identity plus its ui_revision, so
+/// steady-state rendering stops re-duplicating and freeing them every frame.
+pub const PendingUiSnapshotCache = struct {
+    followup_send_state: usize = 0,
+    followup_revision: u64 = 0,
+    followup_valid: bool = false,
+    followup: ?PendingFollowup = null,
+    approval_send_state: usize = 0,
+    approval_revision: u64 = 0,
+    approval_valid: bool = false,
+    approval: ?PendingApproval = null,
+
+    pub fn deinit(self: *PendingUiSnapshotCache, allocator: std.mem.Allocator) void {
+        if (self.followup) |*followup| followup.deinit(allocator);
+        if (self.approval) |*approval| {
+            allocator.free(approval.call_id);
+            allocator.free(approval.title);
+            allocator.free(approval.body);
+        }
+        self.* = .{};
+    }
+};
 pub const PendingDiffFile = struct {
     path: []u8,
     additions: i64,
@@ -757,6 +881,12 @@ pub const PendingTimelineEvent = struct {
     role: ChatRole,
     author: []u8,
     body: []u8,
+    /// GUI-authored timeline rows, such as an accepted provider steer, retain
+    /// the attachments that were submitted alongside their text.
+    images: std.ArrayList(ChatImageAttachment) = .empty,
+    /// Daemon payload identity when the event carried one (`message` events);
+    /// adopted into the projection row so the persistence flush keeps it.
+    message_id: ?[]u8 = null,
     tool_call_id: ?[]u8 = null,
     tool_call_kind: ?ai_harness.ToolCallKind = null,
     tool_call_status: ?ai_harness.ToolCallStatus = null,
@@ -766,6 +896,31 @@ pub const PendingTimelineEvent = struct {
     tool_call_error: ?[]u8 = null,
     tool_call_locations: ?[]u8 = null,
     tool_call_raw: ?[]u8 = null,
+    /// Carries the card entrance across pending-to-committed promotion.
+    transcript_card_started_ms: i64 = 0,
+    /// Memoized measured transcript row height (whole-group height when this
+    /// event opens a tool-call group), paired with the key that produced it.
+    /// Long tool-heavy turns otherwise re-measure every pending body twice per
+    /// frame, so frame cost scales with turn size. Guarded by SendState.mutex;
+    /// written only by the chat panel's pending-stream walkers. -1 = unmeasured.
+    measured_row_height: f32 = -1.0,
+    measured_row_key: u64 = 0,
+
+    pub fn deinit(self: *PendingTimelineEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.author);
+        allocator.free(self.body);
+        for (self.images.items) |*image| image.deinit(allocator);
+        self.images.deinit(allocator);
+        if (self.message_id) |value| allocator.free(value);
+        if (self.tool_call_id) |value| allocator.free(value);
+        if (self.tool_call_title) |value| allocator.free(value);
+        if (self.tool_call_input) |value| allocator.free(value);
+        if (self.tool_call_output) |value| allocator.free(value);
+        if (self.tool_call_error) |value| allocator.free(value);
+        if (self.tool_call_locations) |value| allocator.free(value);
+        if (self.tool_call_raw) |value| allocator.free(value);
+        self.* = undefined;
+    }
 };
 pub const SendResultPayload = struct {
     provider_thread_id: []const u8,
@@ -773,8 +928,8 @@ pub const SendResultPayload = struct {
 };
 
 pub fn freePendingFollowup(allocator: std.mem.Allocator, followup: *?PendingFollowup) void {
-    if (followup.*) |pending| {
-        allocator.free(pending.prompt);
+    if (followup.*) |*pending| {
+        pending.deinit(allocator);
         followup.* = null;
     }
 }
@@ -789,15 +944,8 @@ pub fn freePendingApproval(allocator: std.mem.Allocator, approval: *?PendingAppr
 }
 
 fn freePendingTimelineEvent(allocator: std.mem.Allocator, event: PendingTimelineEvent) void {
-    allocator.free(event.author);
-    allocator.free(event.body);
-    if (event.tool_call_id) |value| allocator.free(value);
-    if (event.tool_call_title) |value| allocator.free(value);
-    if (event.tool_call_input) |value| allocator.free(value);
-    if (event.tool_call_output) |value| allocator.free(value);
-    if (event.tool_call_error) |value| allocator.free(value);
-    if (event.tool_call_locations) |value| allocator.free(value);
-    if (event.tool_call_raw) |value| allocator.free(value);
+    var owned = event;
+    owned.deinit(allocator);
 }
 
 fn freePendingTimelineEvents(allocator: std.mem.Allocator, events: *std.ArrayListUnmanaged(PendingTimelineEvent)) void {
@@ -844,6 +992,69 @@ test "chat activity distinguishes approval waiting from working" {
     try std.testing.expectEqual(ChatActivityStatus.@"error", thread.activityStatusForUi());
     thread.completion_pending = true;
     try std.testing.expectEqual(ChatActivityStatus.done, thread.activityStatusForUi());
+}
+
+test "chat activity waits for running background work" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Background activity");
+    defer thread.deinit(allocator);
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "background task"),
+        .status = .running,
+    });
+
+    thread.completion_pending = true;
+    try std.testing.expectEqual(ChatActivityStatus.waiting, thread.activityStatusForUi());
+
+    thread.send_state.status = .pending;
+    try std.testing.expectEqual(ChatActivityStatus.working, thread.activityStatusForUi());
+
+    thread.send_state.status = .completed;
+    thread.background_tasks.items[0].status = .completed;
+    try std.testing.expectEqual(ChatActivityStatus.done, thread.activityStatusForUi());
+}
+
+test "interrupted transcript rebuild stops unowned background work" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Interrupted background");
+    defer thread.deinit(allocator);
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "Background command"),
+        .body = try allocator.dupeZ(u8, "wait forever"),
+    });
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "Conversation interrupted"),
+        .body = try allocator.dupeZ(u8, "Tell the model what to do differently."),
+    });
+
+    thread.rebuildBackgroundTasksFromMessages(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), thread.background_tasks.items.len);
+    try std.testing.expectEqual(BackgroundTaskStatus.stopped, thread.background_tasks.items[0].status);
+    try std.testing.expectEqual(ChatActivityStatus.idle, thread.activityStatusForUi());
+}
+
+test "terminal events resolve repeated anonymous background commands in order" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "Repeated background");
+    defer thread.deinit(allocator);
+
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "same command"),
+        .status = .running,
+    });
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "same command"),
+        .status = .running,
+    });
+    try thread.noteBackgroundTaskEvent(allocator, "Background task stopped", "same command");
+    try thread.noteBackgroundTaskEvent(allocator, "Background task stopped", "same command");
+
+    try std.testing.expectEqual(@as(usize, 2), thread.background_tasks.items.len);
+    try std.testing.expectEqual(BackgroundTaskStatus.stopped, thread.background_tasks.items[0].status);
+    try std.testing.expectEqual(BackgroundTaskStatus.stopped, thread.background_tasks.items[1].status);
 }
 
 test "background command events accept current and legacy labels" {

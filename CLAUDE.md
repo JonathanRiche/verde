@@ -78,6 +78,12 @@ When editing UI:
 
 Runtime UI changes require the real app when it is safe to launch it. Use compositor interaction/screenshots rather than inferring visual correctness from logs. Logs live at `~/.local/share/verde/Native/logs/verde.stderr.log`; never log clipboard contents.
 
+## Terminal Engine And Daemon Transport
+
+There is no vendored ghostty tree. Desktop pins upstream `ghostty-org/ghostty` in `packages/desktop/build.zig.zon`; `packages/desktop/src/terminal/engine.zig` is the only `ghostty-vt` import boundary. Web vendors the official `ghostty-vt.wasm` from the same commit at `packages/web_app/web/src/assets/` (bump procedure in `ghostty-vt.NOTICE.md`). Keep both on one commit and do not add third-party wrappers.
+
+Chat turns and PTY sessions live in the session daemon; GUI, web gateway, MCP servers, and CLI are detached clients speaking one request per connection. Transport limits (worker pool, accept queue, shared long-poll park cap) are pinned with tests in `packages/desktop/src/platform/ipc.zig` — changing them is a design decision. New long-poll surfaces must reuse the shared `long_poll_parked` cap, and clients must pace retries after an immediate heartbeat. The GUI polls the daemon from the render thread, so daemon latency shows up as frame stutter: check `main-loop gap` and `SDL thread stall` lines in `verde.stderr.log` before touching UI code. Daemon changes require a restart the user must perform. Hermetic coverage: `zig build headless-daemon-it --release=safe -Dbrowser-backend=native_webview`.
+
 ## Text Inputs
 
 Treat every text field as a real editor. New or changed inputs must include:

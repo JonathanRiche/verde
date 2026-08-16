@@ -47,6 +47,7 @@ const AppState = native_state.AppState;
 const Storage = native_state.Storage;
 
 const log = native_state.log;
+const SDL_STALL_LOG_THRESHOLD_NS: u64 = 50 * std.time.ns_per_ms;
 
 extern fn SDL_GetWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int) bool;
 extern fn SDL_GetWindowProperties(window: *sdl.Window) sdl.PropertiesID;
@@ -98,7 +99,6 @@ const MACOS_CMD_W_CLOSE_SUPPRESS_MS: i64 = 750;
 // Some Wayland compositors can emit a burst of SDL close requests while a
 // screenshot/portal overlay is being dismissed. Most of the burst lacks focus,
 // but the final event may briefly report focus again; suppress that tail too.
-const LINUX_SUSPICIOUS_CLOSE_BURST_SUPPRESS_MS: i64 = 3500;
 var linux_wayland_browser_host: browser_runtime.LinuxWaylandHost = .{};
 const SYSTEM_CURSOR_COUNT = @typeInfo(sdl.SystemCursor).@"enum".fields.len;
 
@@ -185,7 +185,6 @@ var macos_launch_close_suppress_until_ms: i64 = 0;
 var macos_last_text_input_timestamp_ns: u64 = 0;
 var macos_last_text_input_len: usize = 0;
 var macos_last_text_input: [64]u8 = std.mem.zeroes([64]u8);
-var linux_last_suspicious_close_ms: i64 = 0;
 const MACOS_DUPLICATE_TEXT_INPUT_SUPPRESS_NS: u64 = 30 * std.time.ns_per_ms;
 const MACOS_LAUNCH_CLOSE_SUPPRESS_MS: i64 = 650;
 
@@ -243,7 +242,10 @@ fn mainInner(init: std.process.Init) !void {
         log.warn("failed to set Windows application identity to {s}", .{windows_integrations.app_user_model_id});
     }
 
-    _ = SDL_SetHint("SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY", "1");
+    // SDL's preferred-Wayland probe can fall through to X11's global scale on mixed-scale Wayland sessions.
+    if (builtin.os.tag == .linux) if (std.c.getenv("WAYLAND_DISPLAY")) |display| {
+        if (std.mem.span(display).len != 0) _ = sdl.setHint("SDL_VIDEO_DRIVER", "wayland,x11");
+    };
     // SDL defaults SDL_VIDEO_ALLOW_SCREENSAVER to "0", which makes it inhibit
     // the OS idle/screensaver for the whole window lifetime (on Wayland via the
     // idle-inhibit protocol). Verde is not a media app, so allow the screensaver
@@ -298,6 +300,11 @@ fn mainInner(init: std.process.Init) !void {
     }
     defer sdl.stopTextInput(window) catch {};
     installWindowIcon(window);
+    // Map the native window immediately. Font materialization, GPU setup, and
+    // the large durable projection all happen below; none should postpone the
+    // compositor-visible launch boundary.
+    _ = SDL_ShowWindow(window);
+    _ = SDL_SyncWindow(window);
 
     const loaded_app_config = app_config.loadAppConfig(allocator) catch |err| blk: {
         log.warn("failed to load app config: {s}", .{@errorName(err)});
@@ -463,6 +470,14 @@ fn mainInner(init: std.process.Init) !void {
     // Apply the global ImGui style after the display scale is known.
     ui_theme.applyTheme(ui_scale);
 
+    // Startup surface: submit one real GPU frame before the potentially large
+    // read-only SQLite projection is materialized into AppState.
+    renderStartupFrame(&palette_renderer, allocator, window) catch |err| {
+        log.warn("failed to render startup frame: {s}", .{@errorName(err)});
+    };
+    _ = SDL_ShowWindow(window);
+    _ = SDL_SyncWindow(window);
+
     var state = try AppState.init(allocator, &storage, loaded_app_config, .{
         .gl_texture_uploads_enabled = false,
         .browser_textures_enabled = palette_renderer.activeBackend() == .sdl_gpu,
@@ -509,7 +524,8 @@ fn mainInner(init: std.process.Init) !void {
     defer log.info("verde main loop exiting", .{});
 
     var running = true;
-    var needs_render = true;
+    var presentation_demand: loop_pacing.PresentationDemand = .{};
+    presentation_demand.request();
     var last_mouse_motion_render_ms: i64 = 0;
     const frame_profile_logging = frameProfileLoggingEnabled();
     var last_frame_profile_log_ms: i64 = 0;
@@ -518,7 +534,24 @@ fn mainInner(init: std.process.Init) !void {
     var render_pacer: loop_pacing.FramePacer = .{};
     var app_config_poll_cadence: loop_pacing.Cadence = .{};
     var pending_wake_sequence: ?u64 = null;
+    var previous_loop_start_ns = profiler.nowNs();
+    var previous_loop_wait: LoopWaitTrace = .{};
     while (running) {
+        const loop_start_ns = profiler.nowNs();
+        const loop_gap_ns = profiler.elapsedNs(previous_loop_start_ns);
+        if (loop_gap_ns > 100 * std.time.ns_per_ms) {
+            runtime_log.diagnostic(
+                "main-loop gap elapsed_ms={d:.2} sleep_reason={s} wait_requested_ms={d} waited_ms={d:.2} pending_frame_on_entry={}",
+                .{
+                    profiler.nsToMs(loop_gap_ns),
+                    @tagName(previous_loop_wait.reason),
+                    previous_loop_wait.requested_timeout_ms,
+                    profiler.nsToMs(previous_loop_wait.waited_ns),
+                    previous_loop_wait.pending_frame_on_entry,
+                },
+            );
+        }
+        previous_loop_start_ns = loop_start_ns;
         if (macosHostWindowRequestedClose(window, &state)) {
             running = false;
             break;
@@ -526,13 +559,19 @@ fn mainInner(init: std.process.Init) !void {
         var frame_sample = profiler.FrameSample{};
         syncWindowTextInput(window, &state);
         var event_flags = EventFlags{};
-        var event_wait_ns: u64 = 0;
+        var loop_wait: LoopWaitTrace = .{
+            .pending_frame_on_entry = presentation_demand.pending,
+        };
         var input_fb_w: c_int = 0;
         var input_fb_h: c_int = 0;
         getWindowSizeInPixels(window, &input_fb_w, &input_fb_h);
         ui_layout.refreshPaletteModalHits(&state, @floatFromInt(input_fb_w), @floatFromInt(input_fb_h));
-        running = processEvents(window, &state, &keyboard, ui_scale, &event_flags, &frame_sample, &event_wait_ns, &render_pacer);
-        frame_sample.waited_ns = event_wait_ns;
+        running = processEvents(window, &state, &keyboard, ui_scale, &event_flags, &frame_sample, &loop_wait, &render_pacer, &presentation_demand);
+        previous_loop_wait = loop_wait;
+        if (!running) break;
+        state.noteWorkspaceSwitchStage("event_drain_complete");
+        frame_sample.waited_ns = loop_wait.waited_ns;
+        state.pollAcknowledgements();
         recordSpan(&frame_sample, .poll_picker, struct {
             fn run(app_state: *AppState) void {
                 app_state.processDeferredProjectDirectoryBrowse();
@@ -552,7 +591,8 @@ fn mainInner(init: std.process.Init) !void {
                 app_state.pollUpdateCheck();
             }
         }.run, .{&state});
-        if (state.consumeUpdateExitRequest()) {
+        if (state.settings_controller.update_exit_requested and closePreflightPassed(&state)) {
+            _ = state.consumeUpdateExitRequest();
             running = false;
             continue;
         }
@@ -567,7 +607,12 @@ fn mainInner(init: std.process.Init) !void {
         var background_tasks_need_render = false;
         recordSpan(&frame_sample, .poll_background_tasks, struct {
             fn run(app_state: *AppState, changed: *bool) void {
-                changed.* = app_state.pollBackgroundTasks();
+                const tasks_changed = app_state.pollBackgroundTasks();
+                // Commit any completed async transcript-page load before this
+                // frame renders so prepended history appears with its anchor
+                // rebased in the same frame.
+                const hydration_changed = app_state.pollTranscriptHydration();
+                changed.* = tasks_changed or hydration_changed;
             }
         }.run, .{ &state, &background_tasks_need_render });
         var browser_needs_render = false;
@@ -582,7 +627,6 @@ fn mainInner(init: std.process.Init) !void {
                 changed.* = app_state.pollTerminals();
             }
         }.run, .{ &state, &terminal_needs_render });
-        syncMouseCursor(&state, &cursor_cache);
         if (app_config_poll_cadence.shouldRun(monotonicMs(), APP_CONFIG_POLL_INTERVAL_MS)) {
             recordSpan(&frame_sample, .poll_config, struct {
                 fn run(app_state: *AppState) void {
@@ -595,8 +639,9 @@ fn mainInner(init: std.process.Init) !void {
             applyAppConfigRuntime(&state);
         }
         if (live_server) |*server| {
-            if (server.processPending(&state)) needs_render = true;
+            if (server.processPending(&state)) presentation_demand.request();
         }
+        state.noteWorkspaceSwitchStage("pre_render_poll_complete");
 
         var observed_fb_width: c_int = 0;
         var observed_fb_height: c_int = 0;
@@ -634,13 +679,15 @@ fn mainInner(init: std.process.Init) !void {
         // A wake-driven send change is covered by the display-rate wake frame.
         // Non-wake polling changes still render immediately.
         const immediate_send_render = send_needs_render and event_flags.loop_wakeup_sequence == null;
-        needs_render = needs_render or immediate_send_render or background_tasks_need_render or browser_needs_render or terminal_needs_render or event_needs_render or framebuffer_size_changed or continuous_frame_due or wake_frame_due;
-        if (!needs_render) {
-            profiler.recordFrame(frame_sample);
+        if (immediate_send_render or background_tasks_need_render or browser_needs_render or terminal_needs_render or event_needs_render or framebuffer_size_changed or continuous_frame_due or wake_frame_due or state.workspaceSwitchFramePending()) {
+            presentation_demand.request();
+        }
+        if (!presentation_demand.pending) {
+            recordSpan(&frame_sample, .sync_cursor, syncMouseCursor, .{ &state, &cursor_cache });
+            recordFrameWithStallDiagnostic(frame_sample);
             maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
             continue;
         }
-        needs_render = false;
 
         var fb_width: c_int = 0;
         var fb_height: c_int = 0;
@@ -671,18 +718,15 @@ fn mainInner(init: std.process.Init) !void {
         state.card_toggle_hits.clearRetainingCapacity();
         state.background_task_action_hits.clearRetainingCapacity();
 
+        state.noteWorkspaceSwitchRenderStarted();
         recordSpan(&frame_sample, .render_root, struct {
             fn run(app_state: *AppState, framebuffer_width: c_int, framebuffer_height: c_int) void {
                 ui_layout.renderRoot(app_state, @floatFromInt(framebuffer_width), @floatFromInt(framebuffer_height));
             }
         }.run, .{ &state, fb_width, fb_height });
-        recordSpan(&frame_sample, .flush_dirty, struct {
-            fn run(app_state: *AppState) void {
-                app_state.flushIfDirty();
-            }
-        }.run, .{&state});
-
-        var frame_submitted = false;
+        recordSpan(&frame_sample, .sync_cursor, syncMouseCursor, .{ &state, &cursor_cache });
+        state.noteWorkspaceSwitchStage("render_root_cursor_complete");
+        var frame_presented = false;
         recordSpan(&frame_sample, .draw_backend, struct {
             fn run(
                 palette_command_renderer: *palette_frame_renderer.Renderer,
@@ -690,9 +734,9 @@ fn mainInner(init: std.process.Init) !void {
                 allocator_arg: std.mem.Allocator,
                 framebuffer_width: c_int,
                 framebuffer_height: c_int,
-                submitted: *bool,
+                presented: *bool,
             ) void {
-                palette_command_renderer.renderBatch(
+                const outcome = palette_command_renderer.renderBatch(
                     allocator_arg,
                     &app_state.palette_overlay_batch,
                     @floatFromInt(framebuffer_width),
@@ -701,24 +745,66 @@ fn mainInner(init: std.process.Init) !void {
                     log.warn("failed to render palette overlay batch: {s}", .{@errorName(err)});
                     return;
                 };
-                submitted.* = true;
+                presented.* = outcome == .presented;
             }
-        }.run, .{ &palette_renderer, &state, allocator, fb_width, fb_height, &frame_submitted });
-        if (frame_submitted) {
+        }.run, .{ &palette_renderer, &state, allocator, fb_width, fb_height, &frame_presented });
+        if (palette_renderer.lastSdlGpuFrameStats()) |stats| {
+            logSlowSdlGpuFrameStages(stats);
+            if (state.pendingWorkspaceSwitchTrace()) |trace| logWorkspaceSwitchSdlGpuFrameStats(trace, stats);
+        }
+        presentation_demand.noteAttempt(frame_presented);
+        if (frame_presented) {
             state.noteBrowserFramePresented();
             render_pacer.noteRendered(monotonicMs());
+            state.noteWorkspaceSwitchPresented();
+            recordSpan(&frame_sample, .flush_dirty, struct {
+                fn run(app_state: *AppState) void {
+                    // Compatibility capture advances under a per-frame byte
+                    // budget; the worker owns all deep-copy/encode/I/O work.
+                    // Advance only after presentation so even the bounded slice
+                    // cannot delay visual feedback for the accepted input.
+                    app_state.pollFlushWorker();
+                    app_state.flushIfDirty();
+                }
+            }.run, .{&state});
+            if (pending_wake_sequence) |sequence| {
+                loop_wakeup.finish(sequence);
+                pending_wake_sequence = null;
+                render_pacer.clearWakeRender();
+            }
+        } else {
+            state.noteWorkspaceSwitchPresentDeferred();
         }
-        if (pending_wake_sequence) |sequence| {
-            loop_wakeup.finish(sequence);
-            pending_wake_sequence = null;
-            render_pacer.clearWakeRender();
-        }
-        const swap_start = profiler.nowNs();
-        frame_sample.add(.swap_window, profiler.elapsedNs(swap_start));
-        frame_sample.rendered = true;
-        profiler.recordFrame(frame_sample);
+        frame_sample.rendered = frame_presented;
+        recordFrameWithStallDiagnostic(frame_sample);
         maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
     }
+}
+
+fn renderStartupFrame(
+    renderer: *palette_frame_renderer.Renderer,
+    allocator: std.mem.Allocator,
+    window: *sdl.Window,
+) !void {
+    var width: c_int = 0;
+    var height: c_int = 0;
+    getWindowSizeInPixels(window, &width, &height);
+    const frame_width: f32 = @floatFromInt(@max(width, 1));
+    const frame_height: f32 = @floatFromInt(@max(height, 1));
+    var batch: palette.RenderBatch = .{};
+    defer batch.deinit(allocator);
+    const text_color = ui_theme.COLOR_TEXT_MUTED;
+    try batch.roleText(
+        allocator,
+        .{ .x = 40.0, .y = frame_height - 64.0, .w = frame_width - 80.0, .h = 28.0 },
+        "Loading workspace…",
+        .{ .r = text_color[0], .g = text_color[1], .b = text_color[2], .a = text_color[3] },
+        16.0,
+        .ui,
+        null,
+        null,
+    );
+    _ = try renderer.renderBatch(allocator, &batch, frame_width, frame_height);
 }
 
 // Resolves the OS mouse cursor each frame: terminal and browser-reported
@@ -1055,6 +1141,20 @@ const EventFlags = struct {
     loop_wakeup_sequence: ?u64 = null,
 };
 
+const LoopSleepReason = enum {
+    none,
+    event_already_queued,
+    wait_event,
+    wait_timeout,
+};
+
+const LoopWaitTrace = struct {
+    reason: LoopSleepReason = .none,
+    requested_timeout_ms: c_int = 0,
+    waited_ns: u64 = 0,
+    pending_frame_on_entry: bool = false,
+};
+
 fn frameProfileLoggingEnabled() bool {
     return std.c.getenv("VERDE_FRAME_PROFILE_LOG") != null;
 }
@@ -1141,8 +1241,13 @@ fn recentSectionStats() SectionStats {
 
 fn logSdlGpuFrameStats(stats: palette.renderer.FrameStats) void {
     runtime_log.diagnostic(
-        "sdlgpu-stage batch_build_ms={d:.2} solid_upload_ms={d:.2} image_prepare_ms={d:.2} image_upload_ms={d:.2} browser_upload_ms={d:.2} text_prepare_ms={d:.2} text_upload_ms={d:.2} submit_present_ms={d:.2} image_uploads={d}/{d} browser_uploads={d}/{d}",
+        "sdlgpu-stage text_cache_rotate_ms={d:.2} text_cache_retire_ms={d:.2}/{d} command_buffer_acquire_ms={d:.2} swapchain_texture_acquire_ms={d:.2} batch_build_ms={d:.2} solid_upload_ms={d:.2} image_prepare_ms={d:.2} image_upload_ms={d:.2} browser_upload_ms={d:.2} text_prepare_ms={d:.2} text_upload_ms={d:.2} render_encode_ms={d:.2} submit_present_ms={d:.2} commands={d} text_draws={d} image_draws={d} image_uploads={d}/{d} browser_uploads={d}/{d} visible_texture_uploads={d} deferred_texture_uploads={d}/{d}",
         .{
+            profiler.nsToMs(stats.text_cache_rotate_ns),
+            profiler.nsToMs(stats.text_cache_retire_ns),
+            stats.text_cache_retired_count,
+            profiler.nsToMs(stats.command_buffer_acquire_ns),
+            profiler.nsToMs(stats.swapchain_texture_acquire_ns),
             profiler.nsToMs(stats.batch_build_ns),
             profiler.nsToMs(stats.solid_upload_ns),
             profiler.nsToMs(stats.image_prepare_ns),
@@ -1150,19 +1255,110 @@ fn logSdlGpuFrameStats(stats: palette.renderer.FrameStats) void {
             profiler.nsToMs(stats.browser_upload_ns),
             profiler.nsToMs(stats.text_prepare_ns),
             profiler.nsToMs(stats.text_upload_ns),
+            profiler.nsToMs(stats.render_encode_ns),
             profiler.nsToMs(stats.submit_present_ns),
+            stats.command_count,
+            stats.text_draw_count,
+            stats.image_draw_count,
             stats.image_upload_count,
             stats.image_upload_bytes,
             stats.browser_upload_count,
             stats.browser_upload_bytes,
+            stats.visible_texture_upload_count,
+            stats.deferred_texture_upload_count,
+            stats.deferred_texture_upload_bytes,
         },
     );
+}
+
+fn logWorkspaceSwitchSdlGpuFrameStats(trace: native_state.WorkspaceSwitchTrace, stats: palette.renderer.FrameStats) void {
+    runtime_log.diagnostic(
+        "workspace-switch-trace seq={d} stage=sdlgpu_stages target_index={d} attempt={d} text_cache_rotate_ms={d:.2} text_cache_retire_ms={d:.2}/{d} command_buffer_acquire_ms={d:.2} swapchain_texture_acquire_ms={d:.2} batch_build_ms={d:.2} solid_upload_ms={d:.2} image_prepare_ms={d:.2} image_upload_ms={d:.2} browser_upload_ms={d:.2} text_prepare_ms={d:.2} text_upload_ms={d:.2} render_encode_ms={d:.2} submit_present_ms={d:.2} commands={d} text_draws={d} image_draws={d} visible_texture_uploads={d} deferred_texture_uploads={d}/{d}",
+        .{
+            trace.sequence,
+            trace.target_index,
+            trace.render_attempt,
+            profiler.nsToMs(stats.text_cache_rotate_ns),
+            profiler.nsToMs(stats.text_cache_retire_ns),
+            stats.text_cache_retired_count,
+            profiler.nsToMs(stats.command_buffer_acquire_ns),
+            profiler.nsToMs(stats.swapchain_texture_acquire_ns),
+            profiler.nsToMs(stats.batch_build_ns),
+            profiler.nsToMs(stats.solid_upload_ns),
+            profiler.nsToMs(stats.image_prepare_ns),
+            profiler.nsToMs(stats.image_upload_ns),
+            profiler.nsToMs(stats.browser_upload_ns),
+            profiler.nsToMs(stats.text_prepare_ns),
+            profiler.nsToMs(stats.text_upload_ns),
+            profiler.nsToMs(stats.render_encode_ns),
+            profiler.nsToMs(stats.submit_present_ns),
+            stats.command_count,
+            stats.text_draw_count,
+            stats.image_draw_count,
+            stats.visible_texture_upload_count,
+            stats.deferred_texture_upload_count,
+            stats.deferred_texture_upload_bytes,
+        },
+    );
+}
+
+fn logSlowSdlGpuFrameStages(stats: palette.renderer.FrameStats) void {
+    const Stage = struct { name: []const u8, elapsed_ns: u64 };
+    const stages = [_]Stage{
+        .{ .name = "text cache rotate", .elapsed_ns = stats.text_cache_rotate_ns },
+        .{ .name = "text cache retire", .elapsed_ns = stats.text_cache_retire_ns },
+        .{ .name = "command buffer acquire", .elapsed_ns = stats.command_buffer_acquire_ns },
+        .{ .name = "swapchain texture acquire", .elapsed_ns = stats.swapchain_texture_acquire_ns },
+        .{ .name = "batch build", .elapsed_ns = stats.batch_build_ns },
+        .{ .name = "solid upload", .elapsed_ns = stats.solid_upload_ns },
+        .{ .name = "image prepare", .elapsed_ns = stats.image_prepare_ns },
+        .{ .name = "image upload", .elapsed_ns = stats.image_upload_ns },
+        .{ .name = "browser upload", .elapsed_ns = stats.browser_upload_ns },
+        .{ .name = "text prepare", .elapsed_ns = stats.text_prepare_ns },
+        .{ .name = "text upload", .elapsed_ns = stats.text_upload_ns },
+        .{ .name = "render encode", .elapsed_ns = stats.render_encode_ns },
+        .{ .name = "submit present", .elapsed_ns = stats.submit_present_ns },
+    };
+    for (stages) |stage| {
+        if (stage.elapsed_ns <= SDL_STALL_LOG_THRESHOLD_NS) continue;
+        runtime_log.diagnostic(
+            "SDL thread stall operation=sdlgpu {s} elapsed_ms={d:.2}",
+            .{ stage.name, profiler.nsToMs(stage.elapsed_ns) },
+        );
+    }
 }
 
 fn recordSpan(frame_sample: *profiler.FrameSample, section: profiler.Section, comptime function: anytype, args: anytype) void {
     const start = profiler.nowNs();
     @call(.auto, function, args);
-    frame_sample.add(section, profiler.elapsedNs(start));
+    const elapsed_ns = profiler.elapsedNs(start);
+    frame_sample.add(section, elapsed_ns);
+    if (elapsed_ns > SDL_STALL_LOG_THRESHOLD_NS) {
+        runtime_log.diagnostic(
+            "SDL thread stall operation={s} elapsed_ms={d:.2}",
+            .{ profiler.sectionName(section), profiler.nsToMs(elapsed_ns) },
+        );
+    }
+}
+
+fn recordFrameWithStallDiagnostic(frame_sample: profiler.FrameSample) void {
+    if (frame_sample.active_ns > SDL_STALL_LOG_THRESHOLD_NS) {
+        var slowest: profiler.Section = .event_handling;
+        var slowest_ns = frame_sample.sectionNs(slowest);
+        inline for (@typeInfo(profiler.Section).@"enum".fields) |field| {
+            const section: profiler.Section = @enumFromInt(field.value);
+            const section_ns = frame_sample.sectionNs(section);
+            if (section_ns > slowest_ns) {
+                slowest = section;
+                slowest_ns = section_ns;
+            }
+        }
+        runtime_log.diagnostic(
+            "SDL thread stall operation=frame slowest={s} elapsed_ms={d:.2} active_ms={d:.2}",
+            .{ profiler.sectionName(slowest), profiler.nsToMs(slowest_ns), profiler.nsToMs(frame_sample.active_ns) },
+        );
+    }
+    profiler.recordFrame(frame_sample);
 }
 
 fn installWindowIcon(window: *sdl.Window) void {
@@ -1311,22 +1507,28 @@ fn processEvents(
     ui_scale: f32,
     event_flags: *EventFlags,
     frame_sample: *profiler.FrameSample,
-    waited_ns: *u64,
+    wait_trace: *LoopWaitTrace,
     render_pacer: *const loop_pacing.FramePacer,
+    presentation_demand: *const loop_pacing.PresentationDemand,
 ) bool {
     event_flags.* = .{};
     var event: sdl.Event = undefined;
 
     if (!sdl.pollEvent(&event)) {
+        const wait_timeout_ms = eventWaitTimeoutMs(state, render_pacer, presentation_demand);
+        wait_trace.requested_timeout_ms = wait_timeout_ms;
         const wait_start = profiler.nowNs();
-        if (!SDL_WaitEventTimeout(&event, eventWaitTimeoutMs(state, render_pacer))) {
-            waited_ns.* +|= profiler.elapsedNs(wait_start);
+        if (!SDL_WaitEventTimeout(&event, wait_timeout_ms)) {
+            wait_trace.waited_ns +|= profiler.elapsedNs(wait_start);
+            wait_trace.reason = .wait_timeout;
             return true;
         }
-        waited_ns.* +|= profiler.elapsedNs(wait_start);
+        wait_trace.waited_ns +|= profiler.elapsedNs(wait_start);
+        wait_trace.reason = .wait_event;
         noteEventForRender(&event, event_flags);
         if (!processOneEvent(window, state, keyboard, ui_scale, &event, frame_sample)) return false;
     } else {
+        wait_trace.reason = .event_already_queued;
         noteEventForRender(&event, event_flags);
         if (!processOneEvent(window, state, keyboard, ui_scale, &event, frame_sample)) return false;
     }
@@ -1421,10 +1623,12 @@ fn openHotkeyWorkspaceChatThread(state: *AppState) bool {
 
 fn activeContinuousFrames(state: *AppState) bool {
     return state.isPickerPending() or
+        state.lifecycle.persistenceNeedsFrames(platform_runtime.unixTimestampMs()) or
+        currentTranscriptLayoutNeedsFrames(state) or
+        state.transcriptTransitionNeedsContinuousFrames(platform_runtime.unixTimestampMs()) or
         state.transcriptMarkdownSelectionDragging() or
         workspace_panes_ui.isFocusAnimating() or
         workspace_panes_ui.isScrollAnimating() or
-        workspace_panes_ui.isPaneStatusAnimating() or
         ui_layout.isSidebarAnimating() or
         // Run-config stepper thumbs slide for ~160ms after a selection.
         state.runConfigStepperAnimating() or
@@ -1432,33 +1636,98 @@ fn activeContinuousFrames(state: *AppState) bool {
         state.settingsModalAnimating();
 }
 
+fn currentTranscriptLayoutNeedsFrames(state: *const AppState) bool {
+    if (state.project_controller.projects.items.len == 0) return false;
+    if (state.currentProjectWorkspaceMaximizedPaneId()) |pane_id| {
+        if (state.workspacePaneKindById(pane_id) != .chat) return false;
+    } else if (!state.currentProject().workspace_layout.hasVisiblePaneKind(.chat)) {
+        return false;
+    }
+    const thread = state.currentThread();
+    return thread.messages.items.len > 0 and
+        !thread.transcript_layout_valid and
+        thread.transcript_layout_message_count > 0 and
+        thread.transcript_layout_committed_height < thread.transcript_layout_requested_height;
+}
+
 fn continuousFrameIntervalMs(state: *AppState) i64 {
-    if (activeContinuousFrames(state)) return ACTIVE_WAIT_TIMEOUT_MS;
+    return continuousFrameIntervalForActivity(pacingActivity(state));
+}
+
+// Sampled per-loop activity flags feeding tier selection. A plain struct so
+// the pacing matrix is unit-testable without constructing an AppState.
+const PacingActivity = struct {
+    active_continuous: bool = false,
+    sidebar_pulse: bool = false,
+    pane_status_animating: bool = false,
+    browser_visible: bool = false,
+    terminal_burst: bool = false,
+    pending_send: bool = false,
+    pending_slash_command: bool = false,
+    background_tasks: bool = false,
+};
+
+fn pacingActivity(state: *AppState) PacingActivity {
+    return .{
+        .active_continuous = activeContinuousFrames(state),
+        .sidebar_pulse = state.sidebar_pulse_animating,
+        .pane_status_animating = workspace_panes_ui.isPaneStatusAnimating(),
+        .browser_visible = state.isBrowserVisible(),
+        .terminal_burst = state.terminalActivityBurstActive(),
+        .pending_send = state.pendingSendCount() > 0,
+        .pending_slash_command = state.hasPendingSlashCommand(),
+        .background_tasks = state.hasRunningBackgroundTasks(),
+    };
+}
+
+fn continuousFrameIntervalForActivity(activity: PacingActivity) i64 {
+    if (activity.active_continuous) return ACTIVE_WAIT_TIMEOUT_MS;
     // These long-lived indicators retain their existing smooth ~30fps tier.
-    if (state.sidebar_pulse_animating or state.pendingSendCount() > 0 or state.hasPendingSlashCommand()) {
+    // Pane status borders are pure clock math (workspace_panes.zig) and look
+    // identical at ~30fps, so they must not escalate to the 16ms tier — that
+    // inversion forced ~60fps full-root rebuilds for the life of a working
+    // pane. Pending sends without visible activity are intentionally absent:
+    // work that is only on a background workspace steps its pip at the ~1Hz
+    // pollSend repaint, while eventWaitBaseTimeoutMs keeps the 33ms wake for
+    // daemon-turn polling and streamed deltas.
+    if (activity.sidebar_pulse or activity.pane_status_animating or activity.pending_slash_command) {
         return PIP_PULSE_WAIT_TIMEOUT_MS;
     }
     return 0;
 }
 
-fn eventWaitTimeoutMs(state: *AppState, render_pacer: *const loop_pacing.FramePacer) c_int {
+fn eventWaitTimeoutMs(
+    state: *AppState,
+    render_pacer: *const loop_pacing.FramePacer,
+    presentation_demand: *const loop_pacing.PresentationDemand,
+) c_int {
     const base_timeout_ms = eventWaitBaseTimeoutMs(state);
-    return render_pacer.nextWaitTimeoutMs(monotonicMs(), base_timeout_ms, ACTIVE_WAIT_TIMEOUT_MS);
+    const paced_timeout_ms = render_pacer.nextWaitTimeoutMs(monotonicMs(), base_timeout_ms, ACTIVE_WAIT_TIMEOUT_MS);
+    return presentation_demand.nextWaitTimeoutMs(paced_timeout_ms, ACTIVE_WAIT_TIMEOUT_MS);
 }
 
 fn eventWaitBaseTimeoutMs(state: *AppState) c_int {
-    if (activeContinuousFrames(state) or state.isBrowserRuntimeActive()) return ACTIVE_WAIT_TIMEOUT_MS;
+    return eventWaitBaseTimeoutForActivity(pacingActivity(state));
+}
+
+fn eventWaitBaseTimeoutForActivity(activity: PacingActivity) c_int {
+    // A browser pane in the *current* workspace keeps the display-rate wake so
+    // frame latency does not regress; a runtime owned by a background
+    // workspace pushes loop_wakeup on new frames (linux_wpe.zig) and must not
+    // pin the 16ms wake globally.
+    if (activity.active_continuous or activity.browser_visible) return ACTIVE_WAIT_TIMEOUT_MS;
     // Terminal output only reaches the screen when the loop wakes and polls
     // (daemon sessions tail over an RPC; there is no fd to push a wake from).
     // Recent input starts the same display-rate window before ConPTY has an
     // echo ready, while output extends it for continuously redrawing TUIs.
-    if (state.terminalActivityBurstActive()) return ACTIVE_WAIT_TIMEOUT_MS;
-    if (state.sidebar_pulse_animating) return PIP_PULSE_WAIT_TIMEOUT_MS;
-    // Pending turns own visible activity motion as well as the wall-clock
-    // "Working" label, so they share the sidebar pip's 30fps cadence.
-    if (state.pendingSendCount() > 0) return PENDING_SEND_WAIT_TIMEOUT_MS;
-    if (state.hasPendingSlashCommand()) return SLASH_COMMAND_ANIMATION_WAIT_TIMEOUT_MS;
-    if (state.hasRunningBackgroundTasks()) return BACKGROUND_TASK_WAIT_TIMEOUT_MS;
+    if (activity.terminal_burst) return ACTIVE_WAIT_TIMEOUT_MS;
+    if (activity.sidebar_pulse or activity.pane_status_animating) return PIP_PULSE_WAIT_TIMEOUT_MS;
+    // Pending turns keep the 30fps wake even without visible activity: daemon
+    // -owned turns are pull-based (pollDaemonChatTurn), so this cadence is the
+    // streaming latency floor, and pollSend's ~1Hz label repaint rides on it.
+    if (activity.pending_send) return PENDING_SEND_WAIT_TIMEOUT_MS;
+    if (activity.pending_slash_command) return SLASH_COMMAND_ANIMATION_WAIT_TIMEOUT_MS;
+    if (activity.background_tasks) return BACKGROUND_TASK_WAIT_TIMEOUT_MS;
     return IDLE_WAIT_TIMEOUT_MS;
 }
 
@@ -1466,7 +1735,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
     switch (event.type) {
         .quit => {
             runtime_log.diagnostic("shutdown requested by SDL quit event", .{});
-            return false;
+            return !closePreflightPassed(state);
         },
         .window_close_requested => {
             const keep_running = handleWindowCloseRequested(window, state);
@@ -1485,10 +1754,25 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
         },
         .window_focus_lost => {
             state.window_input_focus = false;
+            state.alt_shortcut_hints_visible = false;
+            state.ctrl_shortcut_hints_visible = false;
+            state.shift_shortcut_hints_visible = false;
             ui_layout.resetCompanionInputCaptures(state);
             state.blurCompanionComposer();
         },
         .key_down => {
+            if (event.key.scancode == .lalt or event.key.scancode == .ralt) {
+                state.alt_shortcut_hints_visible = true;
+                state.markDirty();
+            }
+            if (event.key.scancode == .lctrl or event.key.scancode == .rctrl) {
+                state.ctrl_shortcut_hints_visible = true;
+                state.markDirty();
+            }
+            if (event.key.scancode == .lshift or event.key.scancode == .rshift) {
+                state.shift_shortcut_hints_visible = true;
+                state.markDirty();
+            }
             if (browserInputDebugEnabled()) {
                 log.info(
                     "browser-input sdl key_down key=0x{x} scancode={} focused={} visible={}",
@@ -1539,6 +1823,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (state.routeCompanionComposerKeyDown(&event.key)) {
                 syncWindowTextInput(window, state);
                 return true;
+            }
+            if (keyboard.workspaceActiveSelectIndexForEvent(&event.key)) |active_ordinal| {
+                if (sidebar_ui.focusAttentionClusterRowAtIndex(state, active_ordinal)) {
+                    syncWindowTextInput(window, state);
+                    return true;
+                }
             }
             if (keyboard.workspacePaneSelectIndexForEvent(&event.key)) |pane_ordinal| {
                 if (state.focusCurrentProjectWorkspacePaneAtSidebarIndex(pane_ordinal)) {
@@ -1593,6 +1883,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (keyboard.workspaceSelectIndexForEvent(&event.key)) |workspace_ordinal| {
+                if (workspace_ordinal < state.project_controller.projects.items.len) {
+                    state.noteWorkspaceSwitchInput(workspace_ordinal, event.key.timestamp, profiler.nowNs());
+                }
                 if (state.selectProjectAtIndex(workspace_ordinal)) {
                     syncWindowTextInput(window, state);
                     return true;
@@ -1625,6 +1918,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     syncWindowTextInput(window, state);
                     return true;
                 }
+            }
+            if (handleBrowserReloadShortcut(state, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
             }
             const native_browser_focused = state.isNativeBrowserSurfaceFocused();
             if (native_browser_focused) {
@@ -1710,6 +2007,18 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
         },
         .key_up => {
+            if (event.key.scancode == .lalt or event.key.scancode == .ralt) {
+                state.alt_shortcut_hints_visible = false;
+                state.markDirty();
+            }
+            if (event.key.scancode == .lctrl or event.key.scancode == .rctrl) {
+                state.ctrl_shortcut_hints_visible = false;
+                state.markDirty();
+            }
+            if (event.key.scancode == .lshift or event.key.scancode == .rshift) {
+                state.shift_shortcut_hints_visible = false;
+                state.markDirty();
+            }
             if (browserInputDebugEnabled()) {
                 log.info(
                     "browser-input sdl key_up key=0x{x} scancode={} focused={} visible={}",
@@ -1841,6 +2150,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (event.button.button == 1 and !event.button.down and state.palette_modal_pointer_captured) {
+                _ = ui_layout.handlePaletteMouseButton(state, event.button.x, event.button.y, false, event.button.clicks);
                 state.palette_modal_pointer_captured = false;
                 state.modal_text_drag_active = false;
                 state.endImageModalPan();
@@ -1870,6 +2180,27 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             // Composer popovers overlay the panes; clicks on (or dismissing)
             // them must not fall through to workspace/transcript handlers.
             if (state.routeComposerPopoverMouseButton(&event.button, ui_scale)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            // The sidebar context menu is a Palette overlay and can extend
+            // across workspace panes when the rail is collapsed. Route its
+            // clicks, and the right-click that opens it, before pane/browser
+            // content so the visual top layer also owns pointer input.
+            if (event.button.button == 1 and event.button.down and state.sidebar_context_menu_open and
+                !sidebar_ui.pointerOverSidebar(event.button.x, event.button.y))
+            {
+                state.closeSidebarContextMenu();
+            }
+            if (event.button.button == 1 and event.button.down and state.sidebar_context_menu_open and
+                sidebar_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down))
+            {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (event.button.down and event.button.button == sidebar_ui.palette_mouse_button_secondary and
+                sidebar_ui.handlePaletteSecondaryMouseButton(state, event.button.x, event.button.y, event.button.down))
+            {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -1927,23 +2258,6 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (event.button.button == 1 and event.button.down and state.sidebar_context_menu_open and
-                !sidebar_ui.pointerOverSidebar(event.button.x, event.button.y))
-            {
-                state.closeSidebarContextMenu();
-            }
-            if (event.button.button == 1 and event.button.down and state.sidebar_context_menu_open and
-                sidebar_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down))
-            {
-                syncWindowTextInput(window, state);
-                return true;
-            }
-            if (event.button.down and event.button.button == sidebar_ui.palette_mouse_button_secondary and
-                sidebar_ui.handlePaletteSecondaryMouseButton(state, event.button.x, event.button.y, event.button.down))
-            {
-                syncWindowTextInput(window, state);
-                return true;
-            }
             // Workspace header (Open / Browser) must run before the sidebar rail so hits are never
             // swallowed by expanded sidebar geometry or rail chrome.
             if (event.button.button == 1 and chat_panel_ui.handleWorkspaceHeaderPaletteMouseButton(
@@ -1985,7 +2299,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (event.button.button == 1 and state.handleFollowupPinMouseButton(event.button.x, event.button.y, event.button.down, event.button.clicks)) {
+            if (event.button.button == 1 and chat_panel_ui.handleFollowupPinMouseButton(state, event.button.x, event.button.y, event.button.down, event.button.clicks)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -2126,6 +2440,14 @@ fn handleBrowserKeyboardEvent(state: *AppState, event: *const sdl.KeyboardEvent)
         .alt = isKeymodPressed(event.mod, sdl.Keymod.alt),
         .super = isKeymodPressed(event.mod, sdl.Keymod.gui),
     });
+}
+
+fn handleBrowserReloadShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!state.isBrowserVisible()) return false;
+    if (!state.isBrowserPaneFocused() and !state.browser_controller.address_focused) return false;
+    if (!keybinds.isBrowserReloadEvent(event)) return false;
+    state.reloadBrowser();
+    return true;
 }
 
 fn handleBrowserInspectorEscape(state: *AppState, event: *const sdl.KeyboardEvent) bool {
@@ -2499,6 +2821,8 @@ fn handleKeyboardAction(
         },
         .workspace_previous => _ = state.selectAdjacentProject(-1),
         .workspace_next => _ = state.selectAdjacentProject(1),
+        .workspace_active_previous => _ = sidebar_ui.focusAdjacentAttentionClusterRow(state, -1),
+        .workspace_active_next => _ = sidebar_ui.focusAdjacentAttentionClusterRow(state, 1),
         .workspace_pane_previous => _ = state.focusCurrentProjectWorkspacePaneInSidebarOrder(-1),
         .workspace_pane_next => _ = state.focusCurrentProjectWorkspacePaneInSidebarOrder(1),
         .workspace_split_chat_vertical => _ = openHotkeyWorkspacePane(state, .chat, .vertical),
@@ -2530,6 +2854,8 @@ fn isWorkspacePaneAction(action: keybinds.NativeKeyboardAction) bool {
         .workspace_focus_right,
         .workspace_focus_up,
         .workspace_focus_down,
+        .workspace_active_previous,
+        .workspace_active_next,
         .workspace_pane_previous,
         .workspace_pane_next,
         .workspace_move_left,
@@ -2588,11 +2914,6 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
             return true;
         }
     }
-    if (builtin.os.tag == .macos) {
-        _ = state.browser_controller.runtime.controller.hide() catch {};
-        verde_macos_host_window_order_out(nativeBrowserHostWindow(window));
-        _ = SDL_HideWindow(window);
-    }
     if (builtin.os.tag == .linux) {
         const now_ms = currentTimeMillis();
         if (state.isPickerPending()) {
@@ -2616,41 +2937,221 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
             runtime_log.diagnostic("ignoring linux window close request after external open launch", .{});
             return true;
         }
-        const suspicious_close = !window_flags.input_focus or
-            !window_flags.mouse_focus or
-            window_flags.hidden or
-            window_flags.minimized or
-            window_flags.occluded;
-        if (suspicious_close) {
-            linux_last_suspicious_close_ms = now_ms;
-            runtime_log.diagnostic(
-                "ignoring suspicious linux window close request focus={} mouse_focus={} hidden={} minimized={} occluded={}",
-                .{ window_flags.input_focus, window_flags.mouse_focus, window_flags.hidden, window_flags.minimized, window_flags.occluded },
-            );
-            return true;
+        // SDL focus/visibility flags describe compositor presentation, not
+        // whether a Wayland WM close request is genuine. In particular,
+        // address-targeted closes for windows on another workspace arrive
+        // hidden/occluded and often without SDL focus. The explicit picker and
+        // external-launch guards above retain the distinguishable phantom-close
+        // protections; every other WM-delivered close is actionable.
+        std.debug.assert(linuxWindowFlagsPermitWmClose(
+            window_flags.input_focus,
+            window_flags.mouse_focus,
+            window_flags.hidden,
+            window_flags.minimized,
+            window_flags.occluded,
+        ));
+    }
+    if (builtin.os.tag == .linux) {
+        // The durability handoff can legitimately outlive the compositor's
+        // close budget for a very large dirty projection. Remove the window
+        // first, but keep all state owners alive until the handoff succeeds.
+        _ = SDL_HideWindow(window);
+        _ = SDL_SyncWindow(window);
+    }
+    if (!closePreflightPassed(state)) {
+        if (builtin.os.tag == .linux) {
+            _ = SDL_ShowWindow(window);
+            _ = SDL_SyncWindow(window);
         }
-        if (linuxCloseRequestFollowsSuspiciousBurst(now_ms)) {
-            runtime_log.diagnostic("ignoring linux window close request after suspicious close burst", .{});
-            return true;
-        }
+        return true;
+    }
+    if (builtin.os.tag == .macos) {
+        _ = state.browser_controller.runtime.controller.hide() catch {};
+        verde_macos_host_window_order_out(nativeBrowserHostWindow(window));
+        _ = SDL_HideWindow(window);
     }
     return false;
 }
 
-fn linuxCloseRequestFollowsSuspiciousBurst(now_ms: i64) bool {
-    if (linux_last_suspicious_close_ms == 0) return false;
-    if (now_ms < linux_last_suspicious_close_ms) {
-        linux_last_suspicious_close_ms = 0;
+// Durability boundary shared by every graceful exit request. A failed handoff
+// leaves the event loop, window, and controllers live for an interactive retry.
+fn closePreflightPassed(state: anytype) bool {
+    const started_at_ms = currentTimeMillis();
+    runtime_log.diagnostic("close durability handoff begin", .{});
+    if (@hasDecl(@TypeOf(state.*), "beginClosePreflight")) state.beginClosePreflight();
+    state.handoffDirtyStateForShutdown() catch |err| {
+        if (@hasDecl(@TypeOf(state.*), "cancelClosePreflight")) state.cancelClosePreflight();
+        state.noteCloseDurabilityFailure(err);
+        runtime_log.diagnostic("close durability handoff failed elapsed_ms={d}", .{currentTimeMillis() - started_at_ms});
         return false;
-    }
-    if (now_ms - linux_last_suspicious_close_ms > LINUX_SUSPICIOUS_CLOSE_BURST_SUPPRESS_MS) return false;
+    };
+    runtime_log.diagnostic("close durability handoff complete elapsed_ms={d}", .{currentTimeMillis() - started_at_ms});
     return true;
+}
+
+test "close preflight keeps loop live after real handoff failure" {
+    const lifecycle_controller = @import("state/lifecycle_controller.zig");
+    const db_types = @import("db/types.zig");
+    const FakeStorage = struct {
+        allocator: std.mem.Allocator,
+        save_fails: bool = true,
+
+        pub fn currentProjectionObservedRevision(_: *const @This()) u64 {
+            return 1;
+        }
+        pub fn saveCaptured(self: *@This(), _: db_types.PersistedState, _: u64) !void {
+            if (self.save_fails) return error.StoreUnavailable;
+        }
+        pub fn markPersistenceUnavailable(_: *@This()) void {}
+        pub fn clearPendingStateSpoolBestEffort(_: *@This()) void {}
+    };
+    const FakeState = struct {
+        lifecycle: lifecycle_controller.State = .{},
+        storage: *FakeStorage,
+        close_failure_notice: bool = false,
+        daemon_stale: bool = true,
+        spool_fails: bool = true,
+
+        pub fn hasUnresolvedAdoptionRows(_: *@This()) bool {
+            return false;
+        }
+        pub fn completePendingProjectionRepairBlocking(_: *@This()) !void {}
+        pub fn buildPersistedState(_: *@This(), allocator: std.mem.Allocator) !db_types.LoadedState {
+            return db_types.LoadedState.init(allocator);
+        }
+        pub fn clonePersistedState(_: *@This(), allocator: std.mem.Allocator, _: db_types.PersistedState) !db_types.LoadedState {
+            return db_types.LoadedState.init(allocator);
+        }
+        pub fn spoolPendingStateForShutdown(self: *@This()) !void {
+            if (self.spool_fails) return error.InjectedSpoolFailure;
+        }
+        fn handoffDirtyStateForShutdown(self: *@This()) !void {
+            try lifecycle_controller.handoffDirtyStateForShutdown(self);
+        }
+        fn noteCloseDurabilityFailure(self: *@This(), _: anyerror) void {
+            self.close_failure_notice = true;
+        }
+        pub fn clearCloseDurabilityNotice(self: *@This()) void {
+            self.close_failure_notice = false;
+        }
+        fn sidebarNotice(self: *const @This()) []const u8 {
+            if (self.close_failure_notice) return "Could not close";
+            if (self.daemon_stale) return "Daemon sync stalled";
+            return "";
+        }
+    };
+
+    var storage: FakeStorage = .{ .allocator = std.testing.allocator };
+    var state: FakeState = .{ .storage = &storage };
+    state.lifecycle.dirty = true;
+    defer state.lifecycle.deinit();
+    try std.testing.expect(!closePreflightPassed(&state));
+    try std.testing.expect(state.lifecycle.dirty);
+    try std.testing.expectEqualStrings("Could not close", state.sidebarNotice());
+    storage.save_fails = false;
+    state.spool_fails = false;
+    try std.testing.expect(closePreflightPassed(&state));
+    try std.testing.expectEqualStrings("Daemon sync stalled", state.sidebarNotice());
+}
+
+test "successful event close preflight skips later frame polls" {
+    const FakeState = struct {
+        dirty_poll_executed: bool = false,
+
+        fn handoffDirtyStateForShutdown(_: *@This()) !void {}
+        fn noteCloseDurabilityFailure(_: *@This(), _: anyerror) void {}
+        fn dirtyPoll(self: *@This()) void {
+            self.dirty_poll_executed = true;
+        }
+    };
+
+    const source = @embedFile("main.zig");
+    const event_assignment = std.mem.indexOf(u8, source, "running = processEvents(").?;
+    const frame_break = std.mem.indexOf(u8, source[event_assignment..], "if (!running) break;").?;
+    const first_poll = std.mem.indexOf(u8, source[event_assignment..], "app_state.processDeferredProjectDirectoryBrowse();").?;
+    try std.testing.expect(frame_break < first_poll);
+
+    var state: FakeState = .{};
+    const running_after_close_event = !closePreflightPassed(&state);
+    if (running_after_close_event) state.dirtyPoll();
+    try std.testing.expect(!state.dirty_poll_executed);
+}
+
+test "startup frame is submitted before the durable projection load" {
+    const source = @embedFile("main.zig");
+    const icon_install = std.mem.indexOf(u8, source, "installWindowIcon(window);").?;
+    const early_show = icon_install + std.mem.indexOf(u8, source[icon_install..], "_ = SDL_ShowWindow(window);").?;
+    const renderer_init = std.mem.indexOf(u8, source, "var palette_renderer = try").?;
+    const startup_frame = std.mem.indexOf(u8, source, "renderStartupFrame(&palette_renderer").?;
+    const app_state_load = std.mem.indexOf(u8, source, "var state = try AppState.init").?;
+    try std.testing.expect(early_show < renderer_init);
+    try std.testing.expect(startup_frame < app_state_load);
+}
+
+test "visual presentation and Linux window removal precede durability work" {
+    const source = @embedFile("main.zig");
+    const frame_submit = std.mem.indexOf(u8, source, "state.noteBrowserFramePresented();").?;
+    const frame_flush = std.mem.indexOf(u8, source, "app_state.flushIfDirty();").?;
+    try std.testing.expect(frame_submit < frame_flush);
+
+    const linux_close = std.mem.indexOf(u8, source, "The durability handoff can legitimately outlive").?;
+    const hide_window = linux_close + std.mem.indexOf(u8, source[linux_close..], "_ = SDL_HideWindow(window);").?;
+    const close_handoff = linux_close + std.mem.indexOf(u8, source[linux_close..], "if (!closePreflightPassed(state))").?;
+    try std.testing.expect(hide_window < close_handoff);
+}
+
+fn linuxWindowFlagsPermitWmClose(
+    input_focus: bool,
+    mouse_focus: bool,
+    hidden: bool,
+    minimized: bool,
+    occluded: bool,
+) bool {
+    _ = input_focus;
+    _ = mouse_focus;
+    _ = hidden;
+    _ = minimized;
+    _ = occluded;
+    return true;
+}
+
+test "linux WM close remains actionable for every presentation state" {
+    try std.testing.expect(linuxWindowFlagsPermitWmClose(true, true, false, false, false));
+    try std.testing.expect(linuxWindowFlagsPermitWmClose(false, false, false, false, false));
+    try std.testing.expect(linuxWindowFlagsPermitWmClose(false, false, true, true, true));
+}
+
+test "frame pacing tiers pace status pulses at 30fps and idle background sends" {
+    // Tier inversion fix: a status-animating pane paces the 33ms pip tier,
+    // never the 16ms active tier. This must be a *continuous* interval, not
+    // only a wake timeout — a wake timeout bounds event-wait latency but
+    // guarantees no repaint cadence, which visibly freezes the pulse.
+    try std.testing.expectEqual(@as(i64, PIP_PULSE_WAIT_TIMEOUT_MS), continuousFrameIntervalForActivity(.{ .pane_status_animating = true }));
+    try std.testing.expectEqual(@as(c_int, PIP_PULSE_WAIT_TIMEOUT_MS), eventWaitBaseTimeoutForActivity(.{ .pane_status_animating = true }));
+    // The same working pane in a non-visible workspace (or with reduced
+    // motion on) never sets pane_status_animating — workspace_panes.zig only
+    // arms it while rendering a visible, motion-enabled pane — so background
+    // work must not pin continuous rendering: a pending send alone renders
+    // event-driven, but keeps the 30fps wake because daemon-owned turns
+    // stream by polling on loop wakes.
+    try std.testing.expectEqual(@as(i64, 0), continuousFrameIntervalForActivity(.{ .pending_send = true }));
+    try std.testing.expectEqual(@as(i64, 0), continuousFrameIntervalForActivity(.{ .pending_send = true, .background_tasks = true }));
+    try std.testing.expectEqual(@as(c_int, PENDING_SEND_WAIT_TIMEOUT_MS), eventWaitBaseTimeoutForActivity(.{ .pending_send = true }));
+    // A pulsing pip on the current workspace still animates continuously.
+    try std.testing.expectEqual(@as(i64, PIP_PULSE_WAIT_TIMEOUT_MS), continuousFrameIntervalForActivity(.{ .sidebar_pulse = true, .pending_send = true }));
+    // The browser pins the display-rate wake only when it is in the current
+    // workspace; elsewhere new frames arrive by loop_wakeup push.
+    try std.testing.expectEqual(@as(c_int, ACTIVE_WAIT_TIMEOUT_MS), eventWaitBaseTimeoutForActivity(.{ .browser_visible = true }));
+    try std.testing.expectEqual(@as(c_int, IDLE_WAIT_TIMEOUT_MS), eventWaitBaseTimeoutForActivity(.{}));
+    // Active continuous animations (focus flash, sidebar slide, …) keep 16ms.
+    try std.testing.expectEqual(@as(i64, ACTIVE_WAIT_TIMEOUT_MS), continuousFrameIntervalForActivity(.{ .active_continuous = true }));
 }
 
 fn macosHostWindowRequestedClose(window: *sdl.Window, state: *AppState) bool {
     if (builtin.os.tag != .macos) return false;
     const host_window = nativeBrowserHostWindow(window);
     if (!verde_macos_host_window_should_close(host_window)) return false;
+    if (!closePreflightPassed(state)) return false;
     _ = state.browser_controller.runtime.controller.hide() catch {};
     verde_macos_host_window_order_out(host_window);
     _ = SDL_HideWindow(window);
@@ -2824,7 +3325,9 @@ test {
     _ = @import("browser/screenshot.zig");
     _ = @import("ipc/server.zig");
     _ = @import("platform/mod.zig");
+    _ = @import("platform/workspace_identity.zig");
     _ = @import("state/browser_controller.zig");
+    _ = @import("state/workspace_layout.zig");
     _ = @import("providers/claude.zig");
     _ = @import("providers/diagnostics.zig");
     _ = @import("providers/opencode.zig");
@@ -2837,4 +3340,7 @@ test {
     _ = @import("ui/companion.zig");
     _ = @import("ui/diff_view_cache.zig");
     _ = @import("compile_tests/windows_conpty.zig");
+    _ = @import("daemon/change_journal.zig");
+    _ = @import("daemon/process_registry.zig");
+    _ = @import("daemon/store.zig");
 }

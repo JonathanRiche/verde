@@ -1,0 +1,37 @@
+{
+  "id": "/",
+  "name": "Verde",
+  "short_name": "Verde",
+  "description": "Live Verde workspace — chats and terminals from the running desktop daemon.",
+  "start_url": "./",
+  "scope": "/",
+  "prefer_related_applications": false,
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui", "browser"],
+  "orientation": "any",
+  "background_color": "#0d1213",
+  "theme_color": "#0d1213",
+  "lang": "en",
+  "dir": "ltr",
+  "categories": ["developer", "productivity"],
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

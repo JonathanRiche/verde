@@ -154,6 +154,51 @@ const RemoteServerState = struct {
 
 var remote_server_state: RemoteServerState = .{};
 
+fn turnSteerRequestPayloadAlloc(
+    allocator: std.mem.Allocator,
+    id: u64,
+    request: provider_types.SteerThreadRequest,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    var stringify: std.json.Stringify = .{
+        .writer = &writer.writer,
+        .options = .{},
+    };
+
+    try stringify.beginObject();
+    try stringify.objectField("method");
+    try stringify.write("turn/steer");
+    try stringify.objectField("id");
+    try stringify.write(id);
+    try stringify.objectField("params");
+    try stringify.beginObject();
+    try stringify.objectField("threadId");
+    try stringify.write(request.thread_id);
+    try stringify.objectField("input");
+    try stringify.beginArray();
+    try stringify.beginObject();
+    try stringify.objectField("type");
+    try stringify.write("text");
+    try stringify.objectField("text");
+    try stringify.write(request.prompt);
+    try stringify.endObject();
+    for (request.images) |image| {
+        try stringify.beginObject();
+        try stringify.objectField("type");
+        try stringify.write("localImage");
+        try stringify.objectField("path");
+        try stringify.write(image.path);
+        try stringify.endObject();
+    }
+    try stringify.endArray();
+    try stringify.objectField("expectedTurnId");
+    try stringify.write(request.turn_id);
+    try stringify.endObject();
+    try stringify.endObject();
+    return writer.toOwnedSlice();
+}
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -1474,16 +1519,7 @@ pub const Client = struct {
     fn callTurnSteerForResultAlloc(self: *Client, request: provider_types.SteerThreadRequest) ![]u8 {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
-            const id = try self.sendRequest("turn/steer", .{
-                .threadId = request.thread_id,
-                .input = .{
-                    .{
-                        .type = "text",
-                        .text = request.prompt,
-                    },
-                },
-                .expectedTurnId = request.turn_id,
-            });
+            const id = try self.sendTurnSteerRequest(request);
             const maybe_payload = self.awaitTurnSteerResultPayloadAlloc(id);
             if (maybe_payload) |payload| {
                 return payload;
@@ -1496,6 +1532,15 @@ pub const Client = struct {
                 else => return err,
             }
         }
+    }
+
+    fn sendTurnSteerRequest(self: *Client, request: provider_types.SteerThreadRequest) !u64 {
+        const id = self.next_request_id;
+        self.next_request_id += 1;
+        const payload = try turnSteerRequestPayloadAlloc(self.allocator, id, request);
+        defer self.allocator.free(payload);
+        try self.writeTextMessage(payload);
+        return id;
     }
 
     fn callRpcForResultAlloc(self: *Client, method: []const u8, params: anytype) ![]u8 {
@@ -3913,6 +3958,31 @@ test "build request target preserves path and query" {
     defer allocator.free(target);
 
     try std.testing.expectEqualStrings("/rpc?client=native", target);
+}
+
+test "turn steer payload preserves multiple local images" {
+    const allocator = std.testing.allocator;
+    const images = [_]provider_types.ImageAttachment{
+        .{ .path = "/tmp/first.png" },
+        .{ .path = "/tmp/second.jpg" },
+    };
+    const payload = try turnSteerRequestPayloadAlloc(allocator, 17, .{
+        .thread_id = "thread-1",
+        .turn_id = "turn-1",
+        .prompt = "compare these",
+        .images = &images,
+    });
+    defer allocator.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const params = parsed.value.object.get("params").?;
+    const input = params.object.get("input").?;
+    try std.testing.expectEqual(@as(usize, 3), input.array.items.len);
+    try std.testing.expectEqualStrings("text", input.array.items[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("localImage", input.array.items[1].object.get("type").?.string);
+    try std.testing.expectEqualStrings("/tmp/first.png", input.array.items[1].object.get("path").?.string);
+    try std.testing.expectEqualStrings("/tmp/second.jpg", input.array.items[2].object.get("path").?.string);
 }
 
 test "compute accept key matches websocket example" {

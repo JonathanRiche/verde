@@ -1,7 +1,11 @@
-//! Persistence snapshot construction and asynchronous schema writes.
+//! Persistence snapshot construction and daemon-routed compatibility payloads.
+//!
+//! Phase 3: the detached SQLite save worker is gone. Snapshot construction
+//! remains as the compatibility payload for `state.snapshot.replace`; actual
+//! commits run in the endpoint-owning daemon.
 
 const std = @import("std");
-const db_client = @import("../db/client.zig");
+const headless = @import("headless");
 const db_types = @import("../db/types.zig");
 const terminal = @import("../terminal/terminal.zig");
 const chat_types = @import("chat_types.zig");
@@ -13,6 +17,7 @@ const LoadedPersistedState = db_types.LoadedState;
 const PersistedState = db_types.PersistedState;
 const PersistedSurfaceState = db_types.PersistedSurfaceState;
 const PersistedChatCompletion = db_types.PersistedChatCompletion;
+const PersistedHerdrWorkspaceLink = db_types.PersistedHerdrWorkspaceLink;
 const PersistedImageAttachment = db_types.PersistedImageAttachment;
 const PersistedMessage = db_types.PersistedMessage;
 const PersistedProject = db_types.PersistedProject;
@@ -42,7 +47,116 @@ pub const SnapshotContext = struct {
     sidebar_collapsed: bool,
 };
 
+/// Incremental copies of transcript bodies for one compatibility snapshot.
+///
+/// Message bodies dominate real-world state size. The SDL thread copies them
+/// in bounded slices over multiple presented frames, then the persistence
+/// worker deep-copies the completed borrowed projection before transport.
+/// `dirty_generation` invalidates this capture before another slice can read
+/// live storage after any mutation.
+pub const IncrementalBodyCapture = struct {
+    const Entry = struct {
+        source: []const u8,
+        copied: []u8,
+    };
+
+    allocator: std.mem.Allocator,
+    dirty_generation: u64,
+    entries: std.ArrayList(Entry) = .empty,
+    entry_index: usize = 0,
+    entry_offset: usize = 0,
+    copied_bytes: usize = 0,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        context: SnapshotContext,
+        dirty_generation: u64,
+    ) !IncrementalBodyCapture {
+        var capture: IncrementalBodyCapture = .{
+            .allocator = allocator,
+            .dirty_generation = dirty_generation,
+        };
+        errdefer capture.deinit();
+
+        for (context.projects) |project| try capture.appendProject(&project);
+        for (context.archived_projects) |project| try capture.appendProject(&project);
+        return capture;
+    }
+
+    pub fn deinit(self: *IncrementalBodyCapture) void {
+        for (self.entries.items) |entry| self.allocator.free(entry.copied);
+        self.entries.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    /// Copy at most `byte_budget` bytes. Returns true when every body is stable.
+    pub fn advance(self: *IncrementalBodyCapture, byte_budget: usize) bool {
+        var remaining = byte_budget;
+        while (remaining > 0 and self.entry_index < self.entries.items.len) {
+            const entry = &self.entries.items[self.entry_index];
+            const available = entry.source.len - self.entry_offset;
+            if (available == 0) {
+                self.entry_index += 1;
+                self.entry_offset = 0;
+                continue;
+            }
+            const count = @min(available, remaining);
+            @memcpy(
+                entry.copied[self.entry_offset..][0..count],
+                entry.source[self.entry_offset..][0..count],
+            );
+            self.entry_offset += count;
+            self.copied_bytes += count;
+            remaining -= count;
+        }
+        while (self.entry_index < self.entries.items.len and
+            self.entry_offset == self.entries.items[self.entry_index].source.len)
+        {
+            self.entry_index += 1;
+            self.entry_offset = 0;
+        }
+        return self.entry_index == self.entries.items.len;
+    }
+
+    fn appendProject(self: *IncrementalBodyCapture, project: *const Project) !void {
+        const retained_thread_index = lastRetainedActiveThreadIndex(project);
+        for (project.threads.items, 0..) |*thread, thread_index| {
+            if (!project.archived and (retained_thread_index == null or thread_index > retained_thread_index.?)) continue;
+            try self.appendThread(thread);
+        }
+        for (project.archived_threads.items) |*thread| try self.appendThread(thread);
+    }
+
+    fn appendThread(self: *IncrementalBodyCapture, thread: *const ChatThread) !void {
+        try self.entries.ensureUnusedCapacity(self.allocator, thread.messages.items.len);
+        for (thread.messages.items) |message| {
+            const copied = try self.allocator.alloc(u8, message.body.len);
+            self.entries.appendAssumeCapacity(.{ .source = message.body, .copied = copied });
+        }
+    }
+};
+
 pub fn buildSnapshot(context: SnapshotContext, backing_allocator: std.mem.Allocator) !LoadedPersistedState {
+    return buildSnapshotWithBodies(context, backing_allocator, null);
+}
+
+/// Finalize the bounded body capture into a projection whose body slices are
+/// borrowed from `body_capture`. The caller must keep the capture alive until
+/// the worker has made its deep-owned copy.
+pub fn buildSnapshotFromBodyCapture(
+    context: SnapshotContext,
+    backing_allocator: std.mem.Allocator,
+    body_capture: *const IncrementalBodyCapture,
+) !LoadedPersistedState {
+    std.debug.assert(body_capture.entry_index == body_capture.entries.items.len);
+    return buildSnapshotWithBodies(context, backing_allocator, body_capture.entries.items);
+}
+
+fn buildSnapshotWithBodies(
+    context: SnapshotContext,
+    backing_allocator: std.mem.Allocator,
+    captured_bodies: ?[]const IncrementalBodyCapture.Entry,
+) !LoadedPersistedState {
     var loaded = LoadedPersistedState.init(backing_allocator);
     errdefer loaded.deinit();
 
@@ -50,12 +164,14 @@ pub fn buildSnapshot(context: SnapshotContext, backing_allocator: std.mem.Alloca
     var projects: std.ArrayList(PersistedProject) = .empty;
     defer projects.deinit(arena);
 
+    var body_index: usize = 0;
     for (context.projects) |project| {
-        try projects.append(arena, try persistedProjectSnapshot(arena, &project));
+        try projects.append(arena, try persistedProjectSnapshot(arena, &project, captured_bodies, &body_index));
     }
     for (context.archived_projects) |project| {
-        try projects.append(arena, try persistedProjectSnapshot(arena, &project));
+        try projects.append(arena, try persistedProjectSnapshot(arena, &project, captured_bodies, &body_index));
     }
+    if (captured_bodies) |bodies| std.debug.assert(body_index == bodies.len);
 
     loaded.value = .{
         .selected_project_index = context.selected_project_index,
@@ -65,7 +181,12 @@ pub fn buildSnapshot(context: SnapshotContext, backing_allocator: std.mem.Alloca
     return loaded;
 }
 
-fn persistedProjectSnapshot(allocator: std.mem.Allocator, project: *const Project) !PersistedProject {
+fn persistedProjectSnapshot(
+    allocator: std.mem.Allocator,
+    project: *const Project,
+    captured_bodies: ?[]const IncrementalBodyCapture.Entry,
+    body_index: *usize,
+) !PersistedProject {
     var threads: std.ArrayList(PersistedThread) = .empty;
     defer threads.deinit(allocator);
     const terminal_layout_json = try project.terminal_dock.persistedLayoutJsonWithContext(allocator, .{
@@ -85,10 +206,10 @@ fn persistedProjectSnapshot(allocator: std.mem.Allocator, project: *const Projec
         // Retaining a contiguous prefix keeps those indexes stable while still
         // dropping abandoned trailing drafts that nothing references.
         if (!project.archived and (retained_thread_index == null or thread_index > retained_thread_index.?)) continue;
-        try threads.append(allocator, try threadSnapshot(allocator, &thread));
+        try threads.append(allocator, try threadSnapshotWithBodies(allocator, &thread, captured_bodies, body_index));
     }
     for (project.archived_threads.items) |thread| {
-        try threads.append(allocator, try threadSnapshot(allocator, &thread));
+        try threads.append(allocator, try threadSnapshotWithBodies(allocator, &thread, captured_bodies, body_index));
     }
 
     return .{
@@ -174,6 +295,45 @@ test "snapshot retains pane-backed draft threads without shifting indexes" {
     try std.testing.expect(std.mem.indexOf(u8, persisted_project.workspace_layout_json.?, "\"thread\":2") != null);
 }
 
+test "incremental snapshot body capture is bounded and finalizes exact transcript bytes" {
+    const allocator = std.testing.allocator;
+    var projects: [1]Project = .{try Project.init(allocator, "workspace-id", "Workspace", "/tmp/workspace", 0)};
+    defer projects[0].deinit(allocator);
+    const thread = &projects[0].threads.items[0];
+    thread.committed = true;
+    const author = try allocator.dupeZ(u8, "Assistant");
+    errdefer allocator.free(author);
+    const body = try allocator.dupeZ(u8, "0123456789abcdef");
+    errdefer allocator.free(body);
+    const extra_images = try allocator.alloc(ChatImageAttachment, 0);
+    errdefer allocator.free(extra_images);
+    try thread.messages.append(allocator, .{
+        .role = .assistant,
+        .author = author,
+        .body = body,
+        .extra_images = extra_images,
+    });
+
+    const context: SnapshotContext = .{
+        .projects = &projects,
+        .archived_projects = &.{},
+        .selected_project_index = 0,
+        .sidebar_collapsed = false,
+    };
+    var capture = try IncrementalBodyCapture.init(allocator, context, 7);
+    defer capture.deinit();
+    try std.testing.expectEqual(@as(u64, 7), capture.dirty_generation);
+    try std.testing.expect(!capture.advance(5));
+    try std.testing.expectEqual(@as(usize, 5), capture.copied_bytes);
+    try std.testing.expect(capture.advance(64));
+
+    var snapshot = try buildSnapshotFromBodyCapture(context, allocator, &capture);
+    defer snapshot.deinit();
+    const persisted_body = snapshot.value.projects[0].threads.?[0].messages[0].body;
+    try std.testing.expectEqualStrings(body, persisted_body);
+    try std.testing.expect(persisted_body.ptr != body.ptr);
+}
+
 test "snapshot retains pane-less Companion identity and stable thread indexes" {
     const allocator = std.testing.allocator;
     var projects: [1]Project = .{try Project.init(allocator, "workspace-id", "Workspace", "/tmp/workspace", 0)};
@@ -196,6 +356,48 @@ test "snapshot retains pane-less Companion identity and stable thread indexes" {
     try std.testing.expectEqual(@as(usize, 2), persisted.threads.?.len);
     try std.testing.expectEqual(selected_before, persisted.selected_thread_index);
     try std.testing.expectEqualStrings(companion.local_thread_id, persisted.threads.?[1].local_thread_id.?);
+}
+
+test "terminal dock snapshot payload round trips through production consumer" {
+    const allocator = std.testing.allocator;
+    const layout_json =
+        \\{"active_tab_index":0,"font_scale":1.125,"tabs":[{"title":"build","active_pane_id":7,"root_node_id":1,"nodes":[{"node_id":1,"kind":"leaf","pane_id":7,"session_id":"session-seven","revive_policy":"attach_or_create"}]}]}
+    ;
+
+    var source = try Project.init(allocator, "dock-source", "Dock source", "/tmp/dock-source", 0);
+    defer source.deinit(allocator);
+    var source_dock = try terminal.Dock.init(allocator);
+    try source_dock.applyPersistedLayoutJson(allocator, layout_json);
+    source.terminal_docks.append(allocator, .{ .id = 4, .dock = source_dock }) catch |err| {
+        source_dock.deinit(allocator);
+        return err;
+    };
+
+    const source_projects = [_]Project{source};
+    var snapshot = try buildSnapshot(.{
+        .projects = &source_projects,
+        .archived_projects = &.{},
+        .selected_project_index = 0,
+        .sidebar_collapsed = false,
+    }, allocator);
+    defer snapshot.deinit();
+    const docks_json = snapshot.value.projects[0].terminal_docks_json orelse return error.TestExpectedEqual;
+
+    var restored = try Project.init(allocator, "dock-restored", "Dock restored", "/tmp/dock-restored", 0);
+    defer restored.deinit(allocator);
+    const Consumer = struct {
+        allocator: std.mem.Allocator,
+        app_config: struct { terminal_font_size: f32 = 13.0 } = .{},
+    };
+    var consumer: Consumer = .{ .allocator = allocator };
+    try applyPersistedTerminalDocksJson(&consumer, &restored, docks_json);
+
+    try std.testing.expectEqual(@as(usize, 1), restored.terminal_docks.items.len);
+    try std.testing.expectEqual(@as(u32, 4), restored.terminal_docks.items[0].id);
+    const restored_pane = restored.terminal_docks.items[0].dock.activePaneConst() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u32, 7), restored_pane.id);
+    try std.testing.expectEqualStrings("session-seven", restored_pane.session_id.?);
+    try std.testing.expectEqual(@as(u32, 5), restored.next_terminal_dock_id);
 }
 
 fn persistedTerminalDocksJson(allocator: std.mem.Allocator, project: *const Project) !?[]u8 {
@@ -228,11 +430,28 @@ fn persistedTerminalDocksJson(allocator: std.mem.Allocator, project: *const Proj
 }
 
 pub fn threadSnapshot(allocator: std.mem.Allocator, thread: *const ChatThread) !PersistedThread {
+    var body_index: usize = 0;
+    return threadSnapshotWithBodies(allocator, thread, null, &body_index);
+}
+
+fn threadSnapshotWithBodies(
+    allocator: std.mem.Allocator,
+    thread: *const ChatThread,
+    captured_bodies: ?[]const IncrementalBodyCapture.Entry,
+    body_index: *usize,
+) !PersistedThread {
     var messages: std.ArrayList(PersistedMessage) = .empty;
     defer messages.deinit(allocator);
 
     for (thread.messages.items) |message| {
-        try messages.append(allocator, try persistedMessageSnapshot(allocator, &message));
+        const captured_body = if (captured_bodies) |bodies| blk: {
+            if (body_index.* >= bodies.len) return error.InvalidIncrementalSnapshot;
+            const entry = bodies[body_index.*];
+            body_index.* += 1;
+            if (entry.source.len != message.body.len) return error.InvalidIncrementalSnapshot;
+            break :blk entry.copied;
+        } else null;
+        try messages.append(allocator, try persistedMessageSnapshot(allocator, &message, captured_body));
     }
 
     return .{
@@ -252,19 +471,29 @@ pub fn threadSnapshot(allocator: std.mem.Allocator, thread: *const ChatThread) !
         .tui_dock_id = thread.tui_dock_id,
         .draft = try allocator.dupe(u8, thread.currentDraft()),
         .draft_image = try imageSnapshot(allocator, thread.draft_image),
+        .draft_extra_images = try imageListSnapshot(allocator, thread.draft_extra_images.items),
+        .message_offset = thread.persisted_message_offset,
         .messages = try messages.toOwnedSlice(allocator),
     };
 }
 
-fn persistedMessageSnapshot(allocator: std.mem.Allocator, message: *const ChatMessage) !PersistedMessage {
+fn persistedMessageSnapshot(
+    allocator: std.mem.Allocator,
+    message: *const ChatMessage,
+    captured_body: ?[]const u8,
+) !PersistedMessage {
     return .{
         .role = message.role,
         .author = try allocator.dupe(u8, message.author),
-        .body = try allocator.dupe(u8, message.body),
+        .body = captured_body orelse try allocator.dupe(u8, message.body),
         .image = try imageSnapshot(allocator, message.image),
+        .extra_images = try imageListSnapshot(allocator, message.extra_images),
         .tool_call_id = try dupeOptionalSlice(allocator, message.tool_call_id),
         .tool_call_kind = message.tool_call_kind,
         .tool_call_status = message.tool_call_status,
+        // Identity carriage (M4-P4): the flush must never re-mint an id the
+        // projection already knows (daemon-adopted or client-staged).
+        .message_id = try dupeOptionalSlice(allocator, message.message_id),
     };
 }
 
@@ -277,23 +506,242 @@ fn imageSnapshot(allocator: std.mem.Allocator, image: ?ChatImageAttachment) !?Pe
     };
 }
 
+pub fn chatImageListFromPersisted(
+    allocator: std.mem.Allocator,
+    images: []const PersistedImageAttachment,
+) ![]ChatImageAttachment {
+    if (images.len == 0) return &.{};
+    const out = try allocator.alloc(ChatImageAttachment, images.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |*image| image.deinit(allocator);
+        allocator.free(out);
+    }
+    for (images) |image| {
+        out[built] = try ChatImageAttachment.init(allocator, image.path, image.mime, image.byte_size);
+        built += 1;
+    }
+    return out;
+}
+
+fn imageListSnapshot(
+    allocator: std.mem.Allocator,
+    images: []const ChatImageAttachment,
+) ![]const PersistedImageAttachment {
+    if (images.len == 0) return &.{};
+    const out = try allocator.alloc(PersistedImageAttachment, images.len);
+    for (images, 0..) |image, index| {
+        out[index] = (try imageSnapshot(allocator, image)).?;
+    }
+    return out;
+}
+
 fn dupeOptionalSlice(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
     return if (value) |slice| try allocator.dupe(u8, slice) else null;
 }
 
-pub fn saveWorker(pref_path: []u8, loaded_state: LoadedPersistedState) void {
-    var loaded = loaded_state;
-    defer loaded.deinit();
-    defer std.heap.page_allocator.free(pref_path);
+/// Identity round-trip helper (M4-P4): the wire encodes "no identity" as an
+/// empty string; the projection uses null. Never carry an empty id inward.
+fn dupeOptionalNonEmptySlice(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
+    const slice = value orelse return null;
+    if (slice.len == 0) return null;
+    return try allocator.dupe(u8, slice);
+}
 
-    var client = db_client.Client.init(std.heap.page_allocator, pref_path) catch |err| {
-        log.err("failed to initialize async native state save: {s}", .{@errorName(err)});
-        return;
+/// Convert a desktop persisted surface row into the store wire DTO.
+pub fn surfaceToProtocol(allocator: std.mem.Allocator, surface: PersistedSurfaceState) !headless.store.SurfaceState {
+    return .{
+        .session_id = try allocator.dupe(u8, surface.session_id),
+        .workspace_id = try allocator.dupe(u8, surface.workspace_id),
+        .workspace_path = try allocator.dupe(u8, surface.workspace_path),
+        .dock_id = surface.dock_id,
+        .pane_id = surface.pane_id,
+        .provider = if (surface.provider) |p| try allocator.dupe(u8, @tagName(p)) else null,
+        .provider_thread_id = try dupeOptionalSlice(allocator, surface.provider_thread_id),
+        .title = try allocator.dupe(u8, surface.title),
+        .status = try allocator.dupe(u8, @tagName(surface.status)),
+        .status_changed_at_ms = surface.status_changed_at_ms,
+        .completed_at_ms = surface.completed_at_ms,
+        .last_event_title = try dupeOptionalSlice(allocator, surface.last_event_title),
+        .last_event_body = try dupeOptionalSlice(allocator, surface.last_event_body),
     };
-    defer client.deinit();
+}
 
-    client.save(loaded.value) catch |err| {
-        log.err("failed to save native state: {s}", .{@errorName(err)});
+/// Convert a full desktop snapshot into the store wire snapshot for
+/// `state.snapshot.replace` (Phase 3 compatibility bridge).
+pub fn persistedStateToProtocolSnapshot(
+    allocator: std.mem.Allocator,
+    state: PersistedState,
+    store_revision: u64,
+) !headless.store.Snapshot {
+    var workspaces = try allocator.alloc(headless.store.Workspace, state.projects.len);
+    for (state.projects, 0..) |project, i| {
+        workspaces[i] = try projectToProtocol(allocator, project);
+    }
+
+    var surfaces = try allocator.alloc(headless.store.SurfaceState, state.surface_states.len);
+    for (state.surface_states, 0..) |surface, i| {
+        surfaces[i] = try surfaceToProtocol(allocator, surface);
+    }
+
+    var completions = try allocator.alloc(headless.store.ChatCompletion, state.chat_completions.len);
+    for (state.chat_completions, 0..) |completion, i| {
+        completions[i] = .{
+            .workspace_id = try allocator.dupe(u8, completion.workspace_id),
+            .local_thread_id = try allocator.dupe(u8, completion.local_thread_id),
+            .completed_at_ms = completion.completed_at_ms,
+        };
+    }
+
+    return .{
+        .schema_version = 1,
+        .store_revision = store_revision,
+        .selected_workspace_index = state.selected_project_index,
+        .sidebar_collapsed = state.sidebar_collapsed,
+        .workspaces = workspaces,
+        .surface_states = surfaces,
+        .chat_completions = completions,
+        .provider = if (state.provider) |p| try allocator.dupe(u8, @tagName(p)) else null,
+        .harness = if (state.harness) |h| try allocator.dupe(u8, @tagName(h)) else null,
+        .draft = try dupeOptionalSlice(allocator, state.draft),
+        .messages = if (state.messages) |msgs| try messagesToProtocol(allocator, msgs, 0) else null,
+    };
+}
+
+fn projectToProtocol(allocator: std.mem.Allocator, project: PersistedProject) !headless.store.Workspace {
+    const workspace_id = if (project.id) |id| try allocator.dupe(u8, id) else try allocator.dupe(u8, project.path);
+    const threads: []const headless.store.Thread = if (project.threads) |src|
+        try threadsToProtocol(allocator, src)
+    else
+        &.{};
+    const messages: []const headless.store.Message = try messagesToProtocol(allocator, project.messages, 0);
+    return .{
+        .workspace_id = workspace_id,
+        .label = try allocator.dupe(u8, project.label),
+        .path = try allocator.dupe(u8, project.path),
+        .archived = project.archived,
+        .unread_count = project.unread_count,
+        .collapsed = project.collapsed,
+        .thread_list_expanded = project.thread_list_expanded,
+        .terminal_height = project.terminal_height,
+        .terminal_layout_json = try dupeOptionalSlice(allocator, project.terminal_layout_json),
+        .terminal_docks_json = try dupeOptionalSlice(allocator, project.terminal_docks_json),
+        .workspace_layout_json = try dupeOptionalSlice(allocator, project.workspace_layout_json),
+        .selected_thread_index = project.selected_thread_index,
+        .companion_thread_local_id = try dupeOptionalSlice(allocator, project.companion_thread_local_id),
+        .herdr_link = if (project.herdr_link) |link| try herdrToProtocol(allocator, link) else null,
+        .provider = try allocator.dupe(u8, @tagName(project.provider)),
+        .harness = try allocator.dupe(u8, @tagName(project.harness)),
+        .draft = try allocator.dupe(u8, project.draft),
+        .threads = threads,
+        .messages = messages,
+    };
+}
+
+fn threadsToProtocol(allocator: std.mem.Allocator, threads: []const PersistedThread) ![]const headless.store.Thread {
+    var out = try allocator.alloc(headless.store.Thread, threads.len);
+    for (threads, 0..) |thread, i| {
+        out[i] = try threadToProtocol(allocator, thread, i);
+    }
+    return out;
+}
+
+fn threadToProtocol(allocator: std.mem.Allocator, thread: PersistedThread, index: usize) !headless.store.Thread {
+    const local_id = if (thread.local_thread_id) |id|
+        try allocator.dupe(u8, id)
+    else
+        try std.fmt.allocPrint(allocator, "thread-{d}", .{index});
+    return .{
+        .local_thread_id = local_id,
+        .title = try allocator.dupe(u8, thread.title),
+        .archived = thread.archived,
+        .committed = thread.committed,
+        .last_activity_at = thread.last_activity_at,
+        .provider_thread_id = try dupeOptionalSlice(allocator, thread.provider_thread_id),
+        .model_ref = try dupeOptionalSlice(allocator, thread.model_ref),
+        .reasoning_effort = if (thread.reasoning_effort) |v| try allocator.dupe(u8, @tagName(v)) else null,
+        .reasoning_variant = try dupeOptionalSlice(allocator, thread.reasoning_variant),
+        .fast_mode = if (thread.fast_mode) |v| try allocator.dupe(u8, @tagName(v)) else null,
+        .access_mode = if (thread.access_mode) |v| try allocator.dupe(u8, @tagName(v)) else null,
+        .provider = try allocator.dupe(u8, @tagName(thread.provider)),
+        .harness = try allocator.dupe(u8, @tagName(thread.harness)),
+        .tui_dock_id = thread.tui_dock_id,
+        .draft = try allocator.dupe(u8, thread.draft),
+        .draft_image = if (thread.draft_image) |img| try imageToProtocol(allocator, img) else null,
+        .draft_images = try imageListToProtocol(allocator, thread.draft_image, thread.draft_extra_images),
+        .message_offset = thread.message_offset,
+        .messages = try messagesToProtocol(allocator, thread.messages, thread.message_offset),
+    };
+}
+
+/// Build the wire full-list attachment shape ([primary] ++ extras). Empty
+/// when there is no primary — extras cannot exist without one.
+fn imageListToProtocol(
+    allocator: std.mem.Allocator,
+    primary: ?PersistedImageAttachment,
+    extras: []const PersistedImageAttachment,
+) ![]const headless.store.Attachment {
+    const first = primary orelse return &.{};
+    const out = try allocator.alloc(headless.store.Attachment, 1 + extras.len);
+    out[0] = try imageToProtocol(allocator, first);
+    for (extras, 0..) |extra, index| {
+        out[index + 1] = try imageToProtocol(allocator, extra);
+    }
+    return out;
+}
+
+fn messagesToProtocol(
+    allocator: std.mem.Allocator,
+    messages: []const PersistedMessage,
+    message_offset: usize,
+) ![]const headless.store.Message {
+    var out = try allocator.alloc(headless.store.Message, messages.len);
+    for (messages, 0..) |message, i| {
+        out[i] = .{
+            // Identity carriage (M4-P4): pass a known projection identity
+            // through verbatim; mint the positional legacy id only for rows
+            // that never had one. Minted ids become sticky on the next load,
+            // so a flush never re-mints an id positionally. Positional minting
+            // cannot collide with a sticky `snap-msg-{j}`: a sticky id keeps
+            // the array index it was minted at (rows only ever append), so a
+            // null-id row always sits at a different index than any sticky id.
+            .message_id = if (message.message_id) |id|
+                try allocator.dupe(u8, id)
+            else
+                try std.fmt.allocPrint(allocator, "snap-msg-{d}", .{message_offset + i}),
+            .role = try allocator.dupe(u8, @tagName(message.role)),
+            .author = try allocator.dupe(u8, message.author),
+            .body = try allocator.dupe(u8, message.body),
+            .image = if (message.image) |img| try imageToProtocol(allocator, img) else null,
+            .images = try imageListToProtocol(allocator, message.image, message.extra_images),
+            .tool_call_id = try dupeOptionalSlice(allocator, message.tool_call_id),
+            .tool_call_kind = if (message.tool_call_kind) |v| try allocator.dupe(u8, @tagName(v)) else null,
+            .tool_call_status = if (message.tool_call_status) |v| try allocator.dupe(u8, @tagName(v)) else null,
+        };
+    }
+    return out;
+}
+
+fn imageToProtocol(allocator: std.mem.Allocator, image: PersistedImageAttachment) !headless.store.Attachment {
+    return .{
+        .path = try allocator.dupe(u8, image.path),
+        .mime = try allocator.dupe(u8, image.mime),
+        .byte_size = image.byte_size,
+    };
+}
+
+fn herdrToProtocol(allocator: std.mem.Allocator, link: db_types.PersistedHerdrWorkspaceLink) !headless.store.HerdrWorkspaceLink {
+    return .{
+        .remote_alias = try allocator.dupe(u8, link.remote_alias),
+        .session_name = try allocator.dupe(u8, link.session_name),
+        .workspace_id = try allocator.dupe(u8, link.workspace_id),
+        .local_dir = try allocator.dupe(u8, link.local_dir),
+        .remote_cwd = try dupeOptionalSlice(allocator, link.remote_cwd),
+        .last_pane_id = try dupeOptionalSlice(allocator, link.last_pane_id),
+        .attach_dock_id = link.attach_dock_id,
+        .attach_pane_id = link.attach_pane_id,
+        .pane_links_json = try dupeOptionalSlice(allocator, link.pane_links_json),
+        .updated_at_ms = link.updated_at_ms,
     };
 }
 
@@ -317,6 +765,8 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
         defer self.allocator.free(project_id);
 
         var loaded = try Project.init(self.allocator, project_id, project.label, project.path, project.unread_count);
+        var loaded_owned = true;
+        errdefer if (loaded_owned) loaded.deinit(self.allocator);
         if (project.companion_thread_local_id) |local_id| {
             loaded.companion_thread_local_id = try self.allocator.dupeZ(u8, local_id);
         }
@@ -382,9 +832,13 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
                 thread.provider = persisted_thread.provider;
                 thread.harness = persisted_thread.harness;
                 thread.tui_dock_id = persisted_thread.tui_dock_id;
+                thread.persisted_message_offset = persisted_thread.message_offset;
                 thread.setDraft(persisted_thread.draft);
                 if (persisted_thread.draft_image) |image| {
                     try thread.setDraftImage(self.allocator, image.path, image.mime, image.byte_size);
+                    for (persisted_thread.draft_extra_images) |extra| {
+                        try thread.addDraftImage(self.allocator, extra.path, extra.mime, extra.byte_size);
+                    }
                 }
                 for (persisted_thread.messages) |message| {
                     try thread.messages.append(self.allocator, .{
@@ -395,9 +849,11 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
                             try ChatImageAttachment.init(self.allocator, image.path, image.mime, image.byte_size)
                         else
                             null,
+                        .extra_images = try chatImageListFromPersisted(self.allocator, message.extra_images),
                         .tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id),
                         .tool_call_kind = message.tool_call_kind,
                         .tool_call_status = message.tool_call_status,
+                        .message_id = try dupeOptionalNonEmptySlice(self.allocator, message.message_id),
                     });
                 }
                 thread.rebuildBackgroundTasksFromMessages(self.allocator);
@@ -435,9 +891,11 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
                         try ChatImageAttachment.init(self.allocator, image.path, image.mime, image.byte_size)
                     else
                         null,
+                    .extra_images = try chatImageListFromPersisted(self.allocator, message.extra_images),
                     .tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id),
                     .tool_call_kind = message.tool_call_kind,
                     .tool_call_status = message.tool_call_status,
+                    .message_id = try dupeOptionalNonEmptySlice(self.allocator, message.message_id),
                 });
             }
             thread.rebuildBackgroundTasksFromMessages(self.allocator);
@@ -466,6 +924,7 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
                     .tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id),
                     .tool_call_kind = message.tool_call_kind,
                     .tool_call_status = message.tool_call_status,
+                    .message_id = try dupeOptionalNonEmptySlice(self.allocator, message.message_id),
                 });
             }
             fallback_thread.rebuildBackgroundTasksFromMessages(self.allocator);
@@ -479,6 +938,7 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
         } else {
             try self.project_controller.projects.append(self.allocator, loaded);
         }
+        loaded_owned = false;
     }
 
     if (self.project_controller.projects.items.len == 0) {
@@ -589,6 +1049,331 @@ pub fn buildPersistedState(self: anytype, backing_allocator: std.mem.Allocator) 
     }, backing_allocator);
 }
 
+fn cloneOptionalSlice(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
+    return if (value) |slice| try allocator.dupe(u8, slice) else null;
+}
+
+fn cloneImage(allocator: std.mem.Allocator, value: ?PersistedImageAttachment) !?PersistedImageAttachment {
+    const image = value orelse return null;
+    return .{
+        .path = try allocator.dupe(u8, image.path),
+        .mime = try allocator.dupe(u8, image.mime),
+        .byte_size = image.byte_size,
+    };
+}
+
+fn cloneImageList(
+    allocator: std.mem.Allocator,
+    images: []const PersistedImageAttachment,
+) ![]const PersistedImageAttachment {
+    if (images.len == 0) return &.{};
+    const cloned = try allocator.alloc(PersistedImageAttachment, images.len);
+    for (images, 0..) |image, index| {
+        cloned[index] = (try cloneImage(allocator, image)).?;
+    }
+    return cloned;
+}
+
+fn cloneMessages(allocator: std.mem.Allocator, messages: []const PersistedMessage) ![]const PersistedMessage {
+    const cloned = try allocator.alloc(PersistedMessage, messages.len);
+    for (messages, 0..) |message, index| {
+        cloned[index] = .{
+            .role = message.role,
+            .author = try allocator.dupe(u8, message.author),
+            .body = try allocator.dupe(u8, message.body),
+            .image = try cloneImage(allocator, message.image),
+            .extra_images = try cloneImageList(allocator, message.extra_images),
+            .tool_call_id = try cloneOptionalSlice(allocator, message.tool_call_id),
+            .tool_call_kind = message.tool_call_kind,
+            .tool_call_status = message.tool_call_status,
+            .message_id = try cloneOptionalSlice(allocator, message.message_id),
+        };
+    }
+    return cloned;
+}
+
+fn cloneThreads(
+    allocator: std.mem.Allocator,
+    threads: ?[]const PersistedThread,
+    include_messages: bool,
+) !?[]const PersistedThread {
+    const source = threads orelse return null;
+    const cloned = try allocator.alloc(PersistedThread, source.len);
+    for (source, 0..) |thread, index| {
+        cloned[index] = .{
+            .title = try allocator.dupe(u8, thread.title),
+            .archived = thread.archived,
+            .committed = thread.committed,
+            .local_thread_id = try cloneOptionalSlice(allocator, thread.local_thread_id),
+            .last_activity_at = thread.last_activity_at,
+            .provider_thread_id = try cloneOptionalSlice(allocator, thread.provider_thread_id),
+            .model_ref = try cloneOptionalSlice(allocator, thread.model_ref),
+            .reasoning_effort = thread.reasoning_effort,
+            .reasoning_variant = try cloneOptionalSlice(allocator, thread.reasoning_variant),
+            .fast_mode = thread.fast_mode,
+            .access_mode = thread.access_mode,
+            .provider = thread.provider,
+            .harness = thread.harness,
+            .tui_dock_id = thread.tui_dock_id,
+            .draft = try allocator.dupe(u8, thread.draft),
+            .draft_image = try cloneImage(allocator, thread.draft_image),
+            .draft_extra_images = try cloneImageList(allocator, thread.draft_extra_images),
+            .message_offset = if (include_messages)
+                thread.message_offset
+            else
+                thread.message_offset + thread.messages.len,
+            .messages = if (include_messages) try cloneMessages(allocator, thread.messages) else &.{},
+        };
+    }
+    return cloned;
+}
+
+fn cloneHerdrLink(allocator: std.mem.Allocator, value: ?PersistedHerdrWorkspaceLink) !?PersistedHerdrWorkspaceLink {
+    const link = value orelse return null;
+    return .{
+        .remote_alias = try allocator.dupe(u8, link.remote_alias),
+        .session_name = try allocator.dupe(u8, link.session_name),
+        .workspace_id = try allocator.dupe(u8, link.workspace_id),
+        .local_dir = try allocator.dupe(u8, link.local_dir),
+        .remote_cwd = try cloneOptionalSlice(allocator, link.remote_cwd),
+        .last_pane_id = try cloneOptionalSlice(allocator, link.last_pane_id),
+        .attach_dock_id = link.attach_dock_id,
+        .attach_pane_id = link.attach_pane_id,
+        .pane_links_json = try cloneOptionalSlice(allocator, link.pane_links_json),
+        .updated_at_ms = link.updated_at_ms,
+    };
+}
+
+fn cloneProjects(
+    allocator: std.mem.Allocator,
+    projects: []const PersistedProject,
+    include_messages: bool,
+) ![]const PersistedProject {
+    const cloned = try allocator.alloc(PersistedProject, projects.len);
+    for (projects, 0..) |project, index| {
+        cloned[index] = .{
+            .id = try cloneOptionalSlice(allocator, project.id),
+            .label = try allocator.dupe(u8, project.label),
+            .path = try allocator.dupe(u8, project.path),
+            .archived = project.archived,
+            .unread_count = project.unread_count,
+            .collapsed = project.collapsed,
+            .thread_list_expanded = project.thread_list_expanded,
+            .terminal_height = project.terminal_height,
+            .terminal_layout_json = try cloneOptionalSlice(allocator, project.terminal_layout_json),
+            .terminal_docks_json = try cloneOptionalSlice(allocator, project.terminal_docks_json),
+            .workspace_layout_json = try cloneOptionalSlice(allocator, project.workspace_layout_json),
+            .selected_thread_index = project.selected_thread_index,
+            .companion_thread_local_id = try cloneOptionalSlice(allocator, project.companion_thread_local_id),
+            .herdr_link = try cloneHerdrLink(allocator, project.herdr_link),
+            .threads = try cloneThreads(allocator, project.threads, include_messages),
+            .provider = project.provider,
+            .harness = project.harness,
+            .draft = try allocator.dupe(u8, project.draft),
+            .messages = if (include_messages) try cloneMessages(allocator, project.messages) else &.{},
+        };
+    }
+    return cloned;
+}
+
+fn cloneSurfaces(allocator: std.mem.Allocator, source: []const PersistedSurfaceState) ![]const PersistedSurfaceState {
+    const cloned = try allocator.alloc(PersistedSurfaceState, source.len);
+    for (source, 0..) |surface, index| {
+        cloned[index] = .{
+            .session_id = try allocator.dupe(u8, surface.session_id),
+            .workspace_id = try allocator.dupe(u8, surface.workspace_id),
+            .workspace_path = try allocator.dupe(u8, surface.workspace_path),
+            .dock_id = surface.dock_id,
+            .pane_id = surface.pane_id,
+            .provider = surface.provider,
+            .provider_thread_id = try cloneOptionalSlice(allocator, surface.provider_thread_id),
+            .title = try allocator.dupe(u8, surface.title),
+            .status = surface.status,
+            .status_changed_at_ms = surface.status_changed_at_ms,
+            .completed_at_ms = surface.completed_at_ms,
+            .last_event_title = try cloneOptionalSlice(allocator, surface.last_event_title),
+            .last_event_body = try cloneOptionalSlice(allocator, surface.last_event_body),
+        };
+    }
+    return cloned;
+}
+
+fn cloneCompletions(allocator: std.mem.Allocator, source: []const PersistedChatCompletion) ![]const PersistedChatCompletion {
+    const cloned = try allocator.alloc(PersistedChatCompletion, source.len);
+    for (source, 0..) |completion, index| {
+        cloned[index] = .{
+            .workspace_id = try allocator.dupe(u8, completion.workspace_id),
+            .local_thread_id = try allocator.dupe(u8, completion.local_thread_id),
+            .completed_at_ms = completion.completed_at_ms,
+        };
+    }
+    return cloned;
+}
+
+fn clonePersistedStateWithMessages(
+    backing_allocator: std.mem.Allocator,
+    source: PersistedState,
+    include_messages: bool,
+) !LoadedPersistedState {
+    var loaded = LoadedPersistedState.init(backing_allocator);
+    errdefer loaded.deinit();
+    const allocator = loaded.allocator();
+    loaded.value = .{
+        .selected_project_index = source.selected_project_index,
+        .sidebar_collapsed = source.sidebar_collapsed,
+        .projects = try cloneProjects(allocator, source.projects, include_messages),
+        .surface_states = try cloneSurfaces(allocator, source.surface_states),
+        .chat_completions = try cloneCompletions(allocator, source.chat_completions),
+        .provider = source.provider,
+        .harness = source.harness,
+        .draft = try cloneOptionalSlice(allocator, source.draft),
+        .messages = if (include_messages and source.messages != null)
+            try cloneMessages(allocator, source.messages.?)
+        else if (source.messages != null)
+            &.{}
+        else
+            null,
+    };
+    return loaded;
+}
+
+/// Deep-copy a persistence projection without retaining a serialized JSON
+/// copy in the destination arena.
+pub fn clonePersistedState(
+    backing_allocator: std.mem.Allocator,
+    source: PersistedState,
+) !LoadedPersistedState {
+    return clonePersistedStateWithMessages(backing_allocator, source, true);
+}
+
+/// Conflict baselines compare only workspace/thread metadata and identities.
+/// Keeping transcript bodies here doubled live history memory for no merge
+/// benefit, so baseline snapshots intentionally omit every message payload.
+pub fn clonePersistedBaseline(
+    backing_allocator: std.mem.Allocator,
+    source: PersistedState,
+) !LoadedPersistedState {
+    return clonePersistedStateWithMessages(backing_allocator, source, false);
+}
+
+fn persistedProjectIndexById(projects: []const PersistedProject, id: []const u8) ?usize {
+    for (projects, 0..) |project, index| {
+        if (project.id) |candidate| if (std.mem.eql(u8, candidate, id)) return index;
+    }
+    return null;
+}
+
+fn persistedThreadIndexById(threads: []const PersistedThread, id: []const u8) ?usize {
+    for (threads, 0..) |thread, index| {
+        if (thread.local_thread_id) |candidate| if (std.mem.eql(u8, candidate, id)) return index;
+    }
+    return null;
+}
+
+/// Build the close sidecar's local overlay. Existing durable identities need
+/// metadata only for the three-way merge; transcript payloads are retained
+/// solely for locally added workspaces/threads that have no durable owner yet.
+pub fn clonePersistedSpoolDelta(
+    backing_allocator: std.mem.Allocator,
+    current: PersistedState,
+    baseline: ?PersistedState,
+) !LoadedPersistedState {
+    const base = baseline orelse return clonePersistedState(backing_allocator, current);
+    var loaded = try clonePersistedBaseline(backing_allocator, current);
+    errdefer loaded.deinit();
+    const allocator = loaded.allocator();
+    const loaded_projects = @constCast(loaded.value.projects);
+
+    for (current.projects, 0..) |project, project_index| {
+        const project_id = project.id orelse {
+            loaded_projects[project_index].messages = try cloneMessages(allocator, project.messages);
+            continue;
+        };
+        const base_project_index = persistedProjectIndexById(base.projects, project_id) orelse {
+            loaded_projects[project_index].messages = try cloneMessages(allocator, project.messages);
+            if (project.threads) |threads| {
+                const loaded_threads = @constCast(loaded_projects[project_index].threads.?);
+                for (threads, 0..) |thread, thread_index| {
+                    loaded_threads[thread_index].messages = try cloneMessages(allocator, thread.messages);
+                }
+            }
+            continue;
+        };
+        const base_threads = base.projects[base_project_index].threads orelse &.{};
+        if (project.threads) |threads| {
+            const loaded_threads = @constCast(loaded_projects[project_index].threads.?);
+            for (threads, 0..) |thread, thread_index| {
+                const thread_id = thread.local_thread_id orelse {
+                    loaded_threads[thread_index].messages = try cloneMessages(allocator, thread.messages);
+                    continue;
+                };
+                const base_thread_index = persistedThreadIndexById(base_threads, thread_id);
+                if (base_thread_index == null) {
+                    loaded_threads[thread_index].messages = try cloneMessages(allocator, thread.messages);
+                } else {
+                    const base_thread = base_threads[base_thread_index.?];
+                    const baseline_end = base_thread.message_offset + base_thread.messages.len;
+                    const current_end = thread.message_offset + thread.messages.len;
+                    if (current_end > baseline_end) {
+                        const suffix_start = @max(baseline_end, thread.message_offset);
+                        loaded_threads[thread_index].message_offset = suffix_start;
+                        loaded_threads[thread_index].messages = try cloneMessages(
+                            allocator,
+                            thread.messages[suffix_start - thread.message_offset ..],
+                        );
+                    }
+                }
+            }
+        }
+    }
+    return loaded;
+}
+
+test "compact baseline and spool delta omit durable transcript bodies" {
+    const old_messages = [_]PersistedMessage{.{ .role = .assistant, .author = "Assistant", .body = "large durable body" }};
+    const extended_messages = [_]PersistedMessage{
+        .{ .role = .assistant, .author = "Assistant", .body = "large durable body" },
+        .{ .role = .user, .author = "You", .body = "new suffix" },
+    };
+    const new_messages = [_]PersistedMessage{.{ .role = .user, .author = "You", .body = "local-only body" }};
+    const baseline_threads = [_]PersistedThread{.{
+        .title = "Durable",
+        .local_thread_id = "durable-thread",
+        .messages = &old_messages,
+    }};
+    const current_threads = [_]PersistedThread{
+        .{ .title = "Renamed", .local_thread_id = "durable-thread", .messages = &extended_messages },
+        .{ .title = "Local", .local_thread_id = "local-thread", .messages = &new_messages },
+    };
+    const baseline_projects = [_]PersistedProject{.{
+        .id = "workspace",
+        .label = "Before",
+        .path = "/tmp/workspace",
+        .threads = &baseline_threads,
+    }};
+    const current_projects = [_]PersistedProject{.{
+        .id = "workspace",
+        .label = "After",
+        .path = "/tmp/workspace",
+        .threads = &current_threads,
+    }};
+    const baseline_state: PersistedState = .{ .projects = &baseline_projects };
+    const current_state: PersistedState = .{ .projects = &current_projects };
+
+    var compact = try clonePersistedBaseline(std.testing.allocator, baseline_state);
+    defer compact.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compact.value.projects[0].threads.?[0].messages.len);
+
+    var delta = try clonePersistedSpoolDelta(std.testing.allocator, current_state, baseline_state);
+    defer delta.deinit();
+    try std.testing.expectEqualStrings("After", delta.value.projects[0].label);
+    try std.testing.expectEqual(@as(usize, 1), delta.value.projects[0].threads.?[0].message_offset);
+    try std.testing.expectEqual(@as(usize, 1), delta.value.projects[0].threads.?[0].messages.len);
+    try std.testing.expectEqualStrings("new suffix", delta.value.projects[0].threads.?[0].messages[0].body);
+    try std.testing.expectEqual(@as(usize, 1), delta.value.projects[0].threads.?[1].messages.len);
+    try std.testing.expectEqualStrings("local-only body", delta.value.projects[0].threads.?[1].messages[0].body);
+}
+
 pub fn applyPersistedTerminalDocksJson(self: anytype, project: *Project, json: []const u8) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, json, .{});
     defer parsed.deinit();
@@ -629,6 +1414,87 @@ pub fn appJsonInt(value: std.json.Value) ?i64 {
         .float => |f| @intFromFloat(f),
         else => null,
     };
+}
+
+test "message identities survive the genuine snapshot chain into a real store" {
+    // M4-P4 fix: the REAL GUI writer chain — projection ChatThread (adopted
+    // ids) → threadSnapshot → persistedStateToProtocolSnapshot → daemon store
+    // applySnapshot — must preserve daemon-minted and client identities and
+    // mint `snap-msg-{i}` only for legacy id-less rows.
+    const store_mod = @import("../daemon/store.zig");
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const db_path = try std.fs.path.joinZ(allocator, &.{ path_buf[0..path_len], "state.sqlite" });
+    defer allocator.free(db_path);
+
+    var thread = try ChatThread.init(allocator, "Identity thread");
+    defer thread.deinit(allocator);
+    thread.committed = true;
+    try thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "hello"),
+        .message_id = try allocator.dupe(u8, "gui-msg:ws-id:t:1"),
+    });
+    try thread.messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Codex"),
+        .body = try allocator.dupeZ(u8, "reply"),
+        .message_id = try allocator.dupe(u8, "turn:turn-x:msg:1"),
+    });
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "System"),
+        .body = try allocator.dupeZ(u8, "legacy row"),
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const persisted_thread = try threadSnapshot(arena, &thread);
+    const persisted_threads = [_]PersistedThread{persisted_thread};
+    const projects = [_]PersistedProject{.{
+        .id = "ws-id",
+        .label = "Identity workspace",
+        .path = "/tmp/ws-id",
+        .threads = &persisted_threads,
+    }};
+    const state: PersistedState = .{ .projects = &projects };
+    const snapshot = try persistedStateToProtocolSnapshot(arena, state, 0);
+    const wire_messages = snapshot.workspaces[0].threads[0].messages;
+    try std.testing.expectEqual(@as(usize, 3), wire_messages.len);
+    try std.testing.expectEqualStrings("gui-msg:ws-id:t:1", wire_messages[0].message_id);
+    try std.testing.expectEqualStrings("turn:turn-x:msg:1", wire_messages[1].message_id);
+    try std.testing.expectEqualStrings("snap-msg-2", wire_messages[2].message_id);
+
+    var writer = try store_mod.Store.init(allocator, db_path);
+    defer writer.deinit();
+    _ = try writer.replaceSnapshot(.{
+        .mutation = .{
+            .request_key = "identity-chain-flush",
+            .client_id = "test-client",
+            // Non-bootstrap snapshots require an explicit guard; a fresh
+            // store sits at revision 0.
+            .expected_store_revision = 0,
+        },
+        .snapshot = snapshot,
+        .bootstrap = false,
+    });
+
+    var rows = try writer.conn.rows("select message_id from messages order by sort_index", .{});
+    defer rows.deinit();
+    const expected_ids = [_][]const u8{ "gui-msg:ws-id:t:1", "turn:turn-x:msg:1", "snap-msg-2" };
+    var row_count: usize = 0;
+    while (rows.next()) |row| : (row_count += 1) {
+        try std.testing.expect(row_count < expected_ids.len);
+        try std.testing.expectEqualStrings(expected_ids[row_count], row.text(0));
+    }
+    if (rows.err) |err| return err;
+    try std.testing.expectEqual(@as(usize, 3), row_count);
 }
 
 pub fn seedDefaultState(self: anytype) !void {

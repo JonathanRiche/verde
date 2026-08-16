@@ -62,6 +62,7 @@ const SharedServerState = struct {
     mutex: Mutex = .{},
     child: ?platform_process.OwnedChild = null,
     owns_child: bool = false,
+    active_clients: usize = 0,
 };
 
 var shared_server_state: SharedServerState = .{};
@@ -103,18 +104,32 @@ fn maybeDumpOpencodeProvidersConfig(body: []const u8) void {
 pub const Client = struct {
     allocator: std.mem.Allocator,
     config: Config,
+    server_lease_held: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
         var client: Client = .{
             .allocator = allocator,
             .config = config,
         };
+        retainSharedServer();
+        client.server_lease_held = true;
+        errdefer client.releaseSharedServer();
         try client.ensureServer();
         return client;
     }
 
     pub fn deinit(self: *Client) void {
-        _ = self;
+        self.releaseSharedServer();
+    }
+
+    fn releaseSharedServer(self: *Client) void {
+        if (!self.server_lease_held) return;
+        self.server_lease_held = false;
+        shared_server_state.mutex.lock();
+        defer shared_server_state.mutex.unlock();
+        std.debug.assert(shared_server_state.active_clients > 0);
+        shared_server_state.active_clients -= 1;
+        if (shared_server_state.active_clients == 0) stopOwnedServerLocked();
     }
 
     pub fn slashCommands(self: *Client) []const provider_types.ProviderSlashCommand {
@@ -1013,6 +1028,12 @@ pub const Client = struct {
         return makeAuthorizationHeaderAlloc(self.allocator, self.config);
     }
 };
+
+fn retainSharedServer() void {
+    shared_server_state.mutex.lock();
+    defer shared_server_state.mutex.unlock();
+    shared_server_state.active_clients += 1;
+}
 
 pub fn shutdownOwnedServer() void {
     shared_server_state.mutex.lock();

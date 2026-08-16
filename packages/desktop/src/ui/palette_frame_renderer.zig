@@ -230,15 +230,15 @@ pub const Renderer = struct {
         batch: *const palette.RenderBatch,
         framebuffer_width: f32,
         framebuffer_height: f32,
-    ) !void {
+    ) !palette.renderer.WindowRenderOutcome {
         _ = framebuffer_width;
         _ = framebuffer_height;
-        try self.renderSdlGpuBatch(allocator, batch);
+        return try self.renderSdlGpuBatch(allocator, batch);
     }
 
-    fn renderSdlGpuBatch(self: *Renderer, allocator: std.mem.Allocator, batch: *const palette.RenderBatch) !void {
+    fn renderSdlGpuBatch(self: *Renderer, allocator: std.mem.Allocator, batch: *const palette.RenderBatch) !palette.renderer.WindowRenderOutcome {
         const window = self.window orelse return error.SdlGpuWindowMissing;
-        try self.gpu.?.renderWindow(
+        return try self.gpu.?.renderWindow(
             allocator,
             @ptrCast(window),
             batch,

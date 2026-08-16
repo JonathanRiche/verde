@@ -15,6 +15,10 @@ const RoleFonts = struct {
 var fonts: ?RoleFonts = null;
 var gpu_renderer: ?*palette.renderer.Renderer = null;
 var prefix_cache: ?PrefixWidthCache = null;
+// Bumped whenever the measuring backend changes so width memos keyed on it
+// (chat_panel chrome labels) drop stale entries instead of serving widths
+// measured against replaced fonts.
+var font_generation: u32 = 0;
 
 // Palette's SDL_GPU text path renders TTF text through the atlas engine at this
 // scale. Keep layout measurement on the same scale so markdown chunk positions
@@ -23,17 +27,25 @@ const GPU_TEXT_FONT_SCALE: f32 = 0.86;
 
 pub fn configure(role_fonts: RoleFonts) void {
     fonts = role_fonts;
+    font_generation +%= 1;
 }
 
 pub fn configureRenderer(renderer: ?*palette.renderer.Renderer) void {
     gpu_renderer = renderer;
     prefix_cache = null;
+    font_generation +%= 1;
 }
 
 pub fn clear() void {
     fonts = null;
     gpu_renderer = null;
     prefix_cache = null;
+    font_generation +%= 1;
+}
+
+/// Identity of the current measuring backend for external width memos.
+pub fn fontGeneration() u32 {
+    return font_generation;
 }
 
 pub fn textWidth(role: palette.FontRole, font_size: f32, text: []const u8) f32 {

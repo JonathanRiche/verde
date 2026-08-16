@@ -14,12 +14,15 @@ const bang_commands = @import("workspace/bang_commands.zig");
 const chat_threads = @import("chat/threads.zig");
 const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
+const daemon_store = @import("daemon/store.zig");
 const herdr = @import("workspace/herdr.zig");
 const keybinds = @import("app/keybinds.zig");
 const loop_wakeup = @import("loop_wakeup");
 const platform_paths = @import("platform_paths");
 const platform_runtime = @import("platform_runtime");
 const platform_process = @import("platform/process.zig");
+const platform_ipc = @import("platform/ipc.zig");
+const workspace_identity = @import("platform/workspace_identity.zig");
 const process_env = @import("platform/env.zig");
 const provider_hooks = @import("providers/hooks.zig");
 const provider_mcp = @import("providers/mcp.zig");
@@ -29,6 +32,7 @@ const slash_commands = @import("chat/slash_commands.zig");
 const stack_config = @import("workspace/stack.zig");
 const stb_image = @import("media/stb_image.zig");
 const sessionizer = @import("terminal/sessionizer.zig");
+const headless = @import("headless");
 const terminal = @import("terminal/terminal.zig");
 const theme = @import("ui/theme.zig");
 const text_measure = @import("ui/text_measure.zig");
@@ -44,6 +48,7 @@ const project_state = @import("state/project.zig");
 const state_storage = @import("state/storage.zig");
 const persistence = @import("state/persistence.zig");
 const command_controller = @import("state/command_controller.zig");
+const acknowledgement_controller = @import("state/acknowledgement_controller.zig");
 const composer_controller = @import("state/composer_controller.zig");
 const companion_controller = @import("state/companion_controller.zig");
 const browser_controller = @import("state/browser_controller.zig");
@@ -67,6 +72,1622 @@ const MANAGED_PROCESS_MAX_RESTART_BACKOFF_MS: i64 = 30000;
 const MANAGED_PROCESS_WATCH_SCAN_MS: i64 = 1000;
 const MANAGED_PROCESS_WATCH_DEBOUNCE_MS: i64 = 500;
 const EXTERNAL_OPEN_CLOSE_SUPPRESS_MS: i64 = 2000;
+const CLOSE_DURABILITY_NOTICE = "Could not close: unsaved changes are not durable. Free space, then close again; keep working to cancel.";
+
+// ---------------------------------------------------------------------------
+// M5-P4 change-cursor loop (desktop read flip).
+//
+// One background thread owns ALL blocking daemon I/O for change tracking:
+// startup issues a single composite core.snapshot, then long-polls
+// core.changes from the seeded cursor. Results are marshaled to the SDL main
+// loop as coalesced boolean signals that the frame-driven pollSend drain
+// consumes — the thread never touches AppState, so the frame loop can never
+// block on a stalled daemon (it just keeps rendering the last synced state).
+// ---------------------------------------------------------------------------
+
+/// Long-poll budget per core.changes call. Kept under the 5s sessionizer
+/// transport timeout so a full-length heartbeat never reads as a failure.
+const CHANGE_CURSOR_WAIT_MS: u32 = 4_000;
+const CHANGE_CURSOR_RETRY_MIN_MS: u64 = 250;
+const CHANGE_CURSOR_RETRY_MAX_MS: u64 = 5_000;
+/// Q7: daemon `invalid_state` marks an over-budget waiter pool ("busy") and
+/// is retried like a heartbeat, just without the long-poll credit.
+const CHANGE_CURSOR_BUSY_RETRY_MS: u64 = 250;
+/// Shutdown-responsive sleep granularity for the loop thread.
+const CHANGE_CURSOR_SHUTDOWN_SLICE_MS: u64 = 50;
+/// Projection staleness horizon: two full long-poll rounds plus slack. Past
+/// this without an accepted result the sidebar shows the stale indicator.
+pub const CHANGE_CURSOR_STALE_AFTER_MS: i64 = 2 * @as(i64, CHANGE_CURSOR_WAIT_MS) + 2_000;
+
+fn projectionStaleAt(
+    has_saved_projection: bool,
+    bootstrap_started_at_ms: i64,
+    last_applied_sync_at_ms: i64,
+    now_ms: i64,
+) bool {
+    const basis = if (last_applied_sync_at_ms != 0) last_applied_sync_at_ms else bootstrap_started_at_ms;
+    if (!has_saved_projection or basis == 0 or now_ms < basis) return false;
+    return now_ms - basis > CHANGE_CURSOR_STALE_AFTER_MS;
+}
+
+fn projectionRefreshApplyGate(
+    dirty: bool,
+    flush_in_flight: bool,
+    has_rebase: bool,
+    adoption_repair: bool,
+    baseline_repair: bool,
+) bool {
+    return !flush_in_flight and (!dirty or has_rebase or adoption_repair or baseline_repair);
+}
+
+/// Coalesced main-loop refresh signals derived from change-journal entries.
+pub const ChangeCursorSignals = struct {
+    /// Registry/workspace-plane resources changed (workspace, surface,
+    /// process, lease, session, notification): run the M2-P3 pull path.
+    registry: bool = false,
+    /// Chat-plane resources changed (chat.thread, chat.turn,
+    /// chat.completion): run the adoption sweep + ledger re-checks.
+    chat: bool = false,
+    /// Cursor was reseeded through a composite snapshot (expiry or daemon
+    /// replacement): refresh both planes from the new basis.
+    resync: bool = false,
+
+    pub fn any(self: ChangeCursorSignals) bool {
+        return self.registry or self.chat or self.resync;
+    }
+
+    pub fn merge(self: *ChangeCursorSignals, other: ChangeCursorSignals) void {
+        self.registry = self.registry or other.registry;
+        self.chat = self.chat or other.chat;
+        self.resync = self.resync or other.resync;
+    }
+};
+
+/// Heap-owned decoded composite snapshot transferred from the blocking
+/// cursor worker to the SDL thread. All result slices live in `arena` until
+/// the frame has completed its bounded in-memory application.
+pub const OwnedProjectionRefresh = struct {
+    backing_allocator: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    result: headless.store.CoreSnapshotResult = undefined,
+    durable: ?LoadedPersistedState = null,
+    requested_projection_revision: ?u64 = null,
+
+    fn create(backing_allocator: std.mem.Allocator) !*OwnedProjectionRefresh {
+        const refresh = try backing_allocator.create(OwnedProjectionRefresh);
+        refresh.* = .{
+            .backing_allocator = backing_allocator,
+            .arena = std.heap.ArenaAllocator.init(backing_allocator),
+        };
+        return refresh;
+    }
+
+    fn deinit(self: *OwnedProjectionRefresh) void {
+        const backing_allocator = self.backing_allocator;
+        if (self.durable) |*durable| durable.deinit();
+        self.arena.deinit();
+        backing_allocator.destroy(self);
+    }
+};
+
+/// Shared bridge between the cursor-loop thread and the SDL main loop. The
+/// thread only ever publishes signals here; the main loop drains them once
+/// per frame from pollSend. Field addresses must be stable before spawn, so
+/// the loop is lazily started from the first frame (AppState.init returns by
+/// value and cannot hand out durable pointers to itself).
+pub const ChangeCursorLoopState = struct {
+    worker: ?std.Thread = null,
+    shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    mutex: Mutex = .{},
+    pending: ChangeCursorSignals = .{},
+    pending_refresh: ?*OwnedProjectionRefresh = null,
+    /// 0=no report, 1=applied, 2=failed/deferred. Written by the frame after
+    /// taking a refresh and consumed by the worker before its next fetch.
+    refresh_apply_outcome: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    requested_projection_revision: ?u64 = null,
+    unavailable_projection_revision: ?u64 = null,
+
+    pub const ProjectionRequestStatus = enum { applied, pending, refresh_unavailable };
+
+    pub fn requestProjectionRevision(self: *ChangeCursorLoopState, revision: u64) ProjectionRequestStatus {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.requested_projection_revision == null or revision > self.requested_projection_revision.?) {
+            self.requested_projection_revision = revision;
+            self.unavailable_projection_revision = null;
+        }
+        return if (self.unavailable_projection_revision == self.requested_projection_revision)
+            .refresh_unavailable
+        else
+            .pending;
+    }
+
+    pub fn requestedProjectionRevision(self: *ChangeCursorLoopState) ?u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.requested_projection_revision;
+    }
+
+    pub fn acknowledgeProjectionRevision(self: *ChangeCursorLoopState, observed_revision: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const requested = self.requested_projection_revision orelse return false;
+        if (observed_revision < requested) return false;
+        self.requested_projection_revision = null;
+        self.unavailable_projection_revision = null;
+        return true;
+    }
+
+    pub fn markProjectionRefreshUnavailable(self: *ChangeCursorLoopState, revision: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.requested_projection_revision == revision) self.unavailable_projection_revision = revision;
+    }
+
+    fn noteProjectionRefreshApplyFailure(self: *ChangeCursorLoopState, refresh: *const OwnedProjectionRefresh, err: anyerror) void {
+        self.noteRefreshApplication(false);
+        if (err != error.ProjectionRefreshDeferred) {
+            if (refresh.requested_projection_revision) |revision| self.markProjectionRefreshUnavailable(revision);
+        }
+    }
+
+    pub fn publish(self: *ChangeCursorLoopState, signals: ChangeCursorSignals) void {
+        if (!signals.any()) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.pending.merge(signals);
+    }
+
+    pub fn take(self: *ChangeCursorLoopState) ChangeCursorSignals {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const out = self.pending;
+        self.pending = .{};
+        return out;
+    }
+
+    pub fn publishRefresh(self: *ChangeCursorLoopState, refresh: *OwnedProjectionRefresh) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.pending_refresh != null) return false;
+        self.pending_refresh = refresh;
+        return true;
+    }
+
+    pub fn takeRefresh(self: *ChangeCursorLoopState) ?*OwnedProjectionRefresh {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const refresh = self.pending_refresh;
+        self.pending_refresh = null;
+        return refresh;
+    }
+
+    pub fn refreshPending(self: *ChangeCursorLoopState) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.pending_refresh != null;
+    }
+
+    pub fn noteRefreshApplication(self: *ChangeCursorLoopState, success: bool) void {
+        self.refresh_apply_outcome.store(if (success) 1 else 2, .release);
+    }
+
+    pub fn takeRefreshApplication(self: *ChangeCursorLoopState) ?bool {
+        return switch (self.refresh_apply_outcome.swap(0, .acq_rel)) {
+            1 => true,
+            2 => false,
+            else => null,
+        };
+    }
+
+    /// Flag-only: lets an in-flight long-poll drain concurrently with the
+    /// rest of deinit before the blocking join happens.
+    pub fn beginShutdown(self: *ChangeCursorLoopState) void {
+        self.shutdown.store(true, .release);
+    }
+
+    pub fn join(self: *ChangeCursorLoopState) void {
+        self.beginShutdown();
+        if (self.worker) |worker| {
+            worker.join();
+            self.worker = null;
+        }
+        if (self.takeRefresh()) |refresh| refresh.deinit();
+    }
+};
+
+/// Map one frozen change-journal topic (m4m5_decisions Q10 nine-topic set)
+/// onto the desktop refresh plane it converts into. Unknown topics refresh
+/// the registry plane conservatively so future additive topics degrade to a
+/// harmless extra pull instead of a silent gap.
+fn changeCursorSignalsForTopic(topic: []const u8) ChangeCursorSignals {
+    if (std.mem.eql(u8, topic, "chat.thread") or
+        std.mem.eql(u8, topic, "chat.turn") or
+        std.mem.eql(u8, topic, "chat.completion"))
+    {
+        return .{ .chat = true };
+    }
+    return .{ .registry = true };
+}
+
+const ChangeCursorPollOutcome = enum { advanced, heartbeat, snapshot_required, busy, unavailable };
+
+/// On null, `failure_reason` names the exact silent arm for the caller's
+/// streak logging (static strings only; safe across the arena teardown).
+fn fetchOwnedCompositeSnapshot(storage: *const Storage, failure_reason: *[]const u8) ?*OwnedProjectionRefresh {
+    failure_reason.* = "refresh allocation failed";
+    const refresh = OwnedProjectionRefresh.create(storage.allocator) catch return null;
+    var refresh_owned = true;
+    defer if (refresh_owned) refresh.deinit();
+    const allocator = refresh.arena.allocator();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = allocator,
+        .pref_path = storage.pref_path,
+    };
+    var client = sessionizer.headlessClient(allocator, &transport);
+    // The durable store can be far larger than the protocol-20 8 MiB
+    // transport ceiling. Capture the cursor and volatile scopes from the live
+    // daemon, then read SQLite locally through a separate coherent RO
+    // transaction. Because the daemon captures the cursor first and the RO
+    // load happens last, concurrent changes can only be over-delivered by the
+    // first core.changes poll.
+    const scopes = [_][]const u8{
+        headless.store.SNAPSHOT_SCOPE_REGISTRY,
+        headless.store.SNAPSHOT_SCOPE_SESSIONS,
+        headless.store.SNAPSHOT_SCOPE_TURNS,
+    };
+    const request: headless.store.CoreSnapshotRequest = .{ .scopes = &scopes };
+    failure_reason.* = "core.snapshot transport call failed";
+    var parsed = client.call(headless.store.METHOD_CORE_SNAPSHOT, request) catch return null;
+    defer parsed.deinit();
+    failure_reason.* = "core.snapshot returned an error response";
+    if (!parsed.response.isOk()) return null;
+    failure_reason.* = "core.snapshot decode failed";
+    refresh.result = client.decodeCompositeSnapshot(&parsed) catch return null;
+    if (refresh.result.incomplete_scopes.len != 0 or
+        refresh.result.envelope == null or
+        refresh.result.change_cursor == null)
+    {
+        failure_reason.* = "core.snapshot incomplete (missing scopes, envelope, or cursor)";
+        return null;
+    }
+    failure_reason.* = "durable projection load failed";
+    var durable = storage.loadProjection(storage.allocator) catch return null;
+    if (durable.store_revision < refresh.result.store_revision) {
+        failure_reason.* = "durable store behind live daemon revision";
+        durable.deinit();
+        return null;
+    }
+    refresh.result.store_revision = durable.store_revision;
+    refresh.durable = durable;
+    refresh_owned = false;
+    return refresh;
+}
+
+/// One core.changes long-poll from the loop thread. Every accepted result —
+/// heartbeats included — flows through Storage.noteChangesResult, whose
+/// PENDING_FIXES #27 nonce compare is the ONLY guard against a replaced
+/// daemon answering a stale cursor with valid-looking regressed heartbeats.
+fn pollCoreChangesOnce(storage: *const Storage, loop: *ChangeCursorLoopState, cursor: u64) ChangeCursorPollOutcome {
+    var decode_arena = std.heap.ArenaAllocator.init(storage.allocator);
+    defer decode_arena.deinit();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = decode_arena.allocator(),
+        .pref_path = storage.pref_path,
+    };
+    var client = sessionizer.headlessClient(decode_arena.allocator(), &transport);
+    const request: headless.changes_protocol.ChangesRequest = .{
+        .cursor = cursor,
+        .wait_ms = CHANGE_CURSOR_WAIT_MS,
+    };
+    var parsed = client.call(headless.changes_protocol.METHOD_CORE_CHANGES, request) catch return .unavailable;
+    defer parsed.deinit();
+    if (parsed.response.err) |err| {
+        if (std.mem.eql(u8, err.code, headless.changes_protocol.ERR_REVISION_EXPIRED)) {
+            // Journal expiry arrives as a structured RPC error (never an ok
+            // result): invalidate for exactly one composite-snapshot fallback.
+            storage.invalidateChangeCursorForSnapshotFallback();
+            return .snapshot_required;
+        }
+        if (std.mem.eql(u8, err.code, headless.changes_protocol.ERR_INVALID_STATE)) return .busy;
+        return .unavailable;
+    }
+    const result = client.decodeChanges(&parsed) catch return .unavailable;
+    const outcome = storage.inspectChangesResult(result);
+    if (outcome.snapshot_required) {
+        loop.publish(.{ .resync = true });
+        return .snapshot_required;
+    }
+    if (result.heartbeat and result.entries.len == 0) {
+        _ = storage.noteChangesResult(result);
+        return .heartbeat;
+    }
+    if (result.entries.len == 0) {
+        _ = storage.noteChangesResult(result);
+        return .advanced;
+    }
+    var signals: ChangeCursorSignals = .{};
+    for (result.entries) |entry| signals.merge(changeCursorSignalsForTopic(entry.topic));
+    var fetch_reason: []const u8 = "";
+    const refresh = fetchOwnedCompositeSnapshot(storage, &fetch_reason) orelse {
+        log.warn("change-cursor snapshot after journal entries failed: {s}", .{fetch_reason});
+        return .unavailable;
+    };
+    if (!loop.publishRefresh(refresh)) {
+        refresh.deinit();
+        return .unavailable;
+    }
+    loop.publish(signals);
+    // Wake the frame loop like the requested-revision arm does: without this
+    // the published refresh sits undrained until an unrelated input event, so
+    // daemon-side changes only became visible after e.g. a mouse move.
+    loop_wakeup.notify();
+    return .advanced;
+}
+
+/// The single composite core.snapshot (bootstrap and every fallback). The
+/// daemon captures the journal cursor BEFORE both state reads, so a cursor
+/// seeded from the result can only over-deliver relative to the snapshot.
+fn fetchCompositeSnapshotSeed(storage: *const Storage, loop: *ChangeCursorLoopState, failure_reason: *[]const u8) bool {
+    const refresh = fetchOwnedCompositeSnapshot(storage, failure_reason) orelse return false;
+    if (!loop.publishRefresh(refresh)) {
+        refresh.deinit();
+        failure_reason.* = "previous refresh still pending in bridge";
+        return false;
+    }
+    // The frame applies the payload before it publishes the seed cursor.
+    loop.publish(.{ .registry = true, .chat = true, .resync = true });
+    // Same wake contract as pollCoreChangesOnce: a seed published while the
+    // loop sleeps (e.g. after a daemon restart) must not wait for input.
+    loop_wakeup.notify();
+    return true;
+}
+
+/// Cursor-loop thread body. Bounded backoff against an absent/stalled daemon
+/// keeps startup non-blocking: the desktop renders its last persisted state
+/// while this thread retries in the background (no local authority claims).
+fn changeCursorLoopMain(storage: *const Storage, loop: *ChangeCursorLoopState) void {
+    log.info("change-cursor loop started", .{});
+    var backoff_ms: u64 = CHANGE_CURSOR_RETRY_MIN_MS;
+    // Streak counters keep every previously-silent retry arm observable
+    // without letting a long daemon outage spam the log (first failure, then
+    // roughly every two minutes at max backoff).
+    var seed_failures: u64 = 0;
+    var poll_failures: u64 = 0;
+    var pending_spins: u64 = 0;
+    while (!loop.shutdown.load(.acquire)) {
+        if (loop.takeRefreshApplication()) |applied| {
+            if (applied) {
+                backoff_ms = CHANGE_CURSOR_RETRY_MIN_MS;
+            } else {
+                changeCursorSleep(loop, backoff_ms);
+                backoff_ms = @min(backoff_ms * 2, CHANGE_CURSOR_RETRY_MAX_MS);
+            }
+        }
+        if (loop.refreshPending()) {
+            // The frame drains the bridge every pollSend; a long spin here
+            // means the main thread stopped consuming published refreshes.
+            pending_spins += 1;
+            if (pending_spins % 200 == 0) {
+                log.warn(
+                    "published projection refresh undrained by frame for ~{d}ms",
+                    .{pending_spins * CHANGE_CURSOR_SHUTDOWN_SLICE_MS},
+                );
+            }
+            changeCursorSleep(loop, CHANGE_CURSOR_SHUTDOWN_SLICE_MS);
+            continue;
+        }
+        pending_spins = 0;
+        if (loop.requestedProjectionRevision()) |requested_revision| {
+            if (storage.currentProjectionObservedRevision() < requested_revision) {
+                var fetch_reason: []const u8 = "";
+                const refresh = fetchOwnedCompositeSnapshot(storage, &fetch_reason) orelse {
+                    log.warn(
+                        "change-cursor refresh for requested revision {d} failed: {s}",
+                        .{ requested_revision, fetch_reason },
+                    );
+                    loop.markProjectionRefreshUnavailable(requested_revision);
+                    changeCursorSleep(loop, backoff_ms);
+                    backoff_ms = @min(backoff_ms * 2, CHANGE_CURSOR_RETRY_MAX_MS);
+                    continue;
+                };
+                refresh.requested_projection_revision = requested_revision;
+                if (!loop.publishRefresh(refresh)) {
+                    refresh.deinit();
+                    continue;
+                }
+                loop.publish(.{ .registry = true, .chat = true });
+                loop_wakeup.notify();
+                continue;
+            }
+        }
+        if (storage.currentChangeCursorForPoll()) |cursor| {
+            const outcome = pollCoreChangesOnce(storage, loop, cursor);
+            if (outcome != .unavailable and poll_failures != 0) {
+                log.info("core.changes poll recovered after {d} failed attempts", .{poll_failures});
+                poll_failures = 0;
+            }
+            switch (outcome) {
+                // Publication is not success: the frame reports whether the
+                // complete generation applied transactionally.
+                .advanced => {},
+                .heartbeat => changeCursorSleep(loop, CHANGE_CURSOR_BUSY_RETRY_MS),
+                // Loop straight around: the fallback snapshot runs on the next
+                // iteration through the null-cursor arm below.
+                .snapshot_required => backoff_ms = CHANGE_CURSOR_RETRY_MIN_MS,
+                .busy => changeCursorSleep(loop, CHANGE_CURSOR_BUSY_RETRY_MS),
+                .unavailable => {
+                    poll_failures += 1;
+                    if (poll_failures == 1 or poll_failures % 24 == 0) {
+                        log.warn("core.changes poll unavailable (attempt {d})", .{poll_failures});
+                    }
+                    changeCursorSleep(loop, backoff_ms);
+                    backoff_ms = @min(backoff_ms * 2, CHANGE_CURSOR_RETRY_MAX_MS);
+                },
+            }
+        } else {
+            var seed_reason: []const u8 = "";
+            if (fetchCompositeSnapshotSeed(storage, loop, &seed_reason)) {
+                // Wait for the frame's application report before resetting.
+                if (seed_failures != 0) {
+                    log.info("change-cursor bootstrap recovered after {d} failed attempts", .{seed_failures});
+                    seed_failures = 0;
+                }
+            } else {
+                seed_failures += 1;
+                if (seed_failures == 1 or seed_failures % 24 == 0) {
+                    log.warn(
+                        "change-cursor bootstrap failing (attempt {d}): {s}",
+                        .{ seed_failures, seed_reason },
+                    );
+                }
+                changeCursorSleep(loop, backoff_ms);
+                backoff_ms = @min(backoff_ms * 2, CHANGE_CURSOR_RETRY_MAX_MS);
+            }
+        }
+    }
+    log.info("change-cursor loop exiting", .{});
+}
+
+fn changeCursorSleep(loop: *ChangeCursorLoopState, total_ms: u64) void {
+    var remaining = total_ms;
+    while (remaining > 0) {
+        if (loop.shutdown.load(.acquire)) return;
+        const slice = @min(remaining, CHANGE_CURSOR_SHUTDOWN_SLICE_MS);
+        platform_runtime.sleepMillis(slice);
+        remaining -= slice;
+    }
+}
+
+fn snapshotEnum(comptime T: type, value: ?[]const u8, fallback: T) T {
+    const text = value orelse return fallback;
+    return std.meta.stringToEnum(T, text) orelse fallback;
+}
+
+fn snapshotOptionalEnum(comptime T: type, value: ?[]const u8) ?T {
+    const text = value orelse return null;
+    return std.meta.stringToEnum(T, text);
+}
+
+fn snapshotAttachment(source: ?headless.store.Attachment) ?PersistedImageAttachment {
+    const image = source orelse return null;
+    return .{ .path = image.path, .mime = image.mime, .byte_size = image.byte_size };
+}
+
+/// Extras past the primary from a wire full-list ([primary] ++ extras).
+/// Borrows strings from the wire snapshot, matching `snapshotAttachment`.
+fn snapshotAttachmentExtras(
+    allocator: std.mem.Allocator,
+    images: []const headless.store.Attachment,
+) ![]const PersistedImageAttachment {
+    if (images.len <= 1) return &.{};
+    const out = try allocator.alloc(PersistedImageAttachment, images.len - 1);
+    for (images[1..], 0..) |image, index| out[index] = snapshotAttachment(image).?;
+    return out;
+}
+
+fn snapshotMessageToPersisted(allocator: std.mem.Allocator, message: headless.store.Message) !PersistedMessage {
+    const image = if (message.images.len > 0) message.images[0] else message.image;
+    return .{
+        .role = snapshotEnum(ChatRole, message.role, .system),
+        .author = message.author,
+        .body = message.body,
+        .image = snapshotAttachment(image),
+        .extra_images = try snapshotAttachmentExtras(allocator, message.images),
+        .tool_call_id = message.tool_call_id,
+        .tool_call_kind = snapshotOptionalEnum(ai_harness.ToolCallKind, message.tool_call_kind),
+        .tool_call_status = snapshotOptionalEnum(ai_harness.ToolCallStatus, message.tool_call_status),
+        .message_id = if (message.message_id.len == 0) null else message.message_id,
+    };
+}
+
+fn snapshotMessagesToPersisted(
+    allocator: std.mem.Allocator,
+    messages: []const headless.store.Message,
+) ![]PersistedMessage {
+    const out = try allocator.alloc(PersistedMessage, messages.len);
+    for (messages, 0..) |message, index| out[index] = try snapshotMessageToPersisted(allocator, message);
+    return out;
+}
+
+fn snapshotThreadToPersisted(
+    allocator: std.mem.Allocator,
+    thread: headless.store.Thread,
+) !PersistedThread {
+    return .{
+        .title = thread.title,
+        .archived = thread.archived,
+        .committed = thread.committed,
+        .local_thread_id = thread.local_thread_id,
+        .last_activity_at = thread.last_activity_at,
+        .provider_thread_id = thread.provider_thread_id,
+        .model_ref = thread.model_ref,
+        .reasoning_effort = snapshotOptionalEnum(ReasoningEffort, thread.reasoning_effort),
+        .reasoning_variant = thread.reasoning_variant,
+        .fast_mode = snapshotOptionalEnum(FastMode, thread.fast_mode),
+        .access_mode = snapshotOptionalEnum(AccessMode, thread.access_mode),
+        .provider = snapshotEnum(Provider, thread.provider, .opencode),
+        .harness = snapshotEnum(Harness, thread.harness, .local_cli),
+        .tui_dock_id = thread.tui_dock_id,
+        .draft = thread.draft,
+        .draft_image = snapshotAttachment(thread.draft_image),
+        .draft_extra_images = try snapshotAttachmentExtras(allocator, thread.draft_images),
+        .message_offset = thread.message_offset,
+        .messages = try snapshotMessagesToPersisted(allocator, thread.messages),
+    };
+}
+
+fn snapshotWorkspaceToPersisted(
+    allocator: std.mem.Allocator,
+    workspace: headless.store.Workspace,
+) !PersistedProject {
+    const threads = try allocator.alloc(PersistedThread, workspace.threads.len);
+    for (workspace.threads, 0..) |thread, index| {
+        threads[index] = try snapshotThreadToPersisted(allocator, thread);
+    }
+    const herdr_link: ?PersistedHerdrWorkspaceLink = if (workspace.herdr_link) |link| .{
+        .remote_alias = link.remote_alias,
+        .session_name = link.session_name,
+        .workspace_id = link.workspace_id,
+        .local_dir = link.local_dir,
+        .remote_cwd = link.remote_cwd,
+        .last_pane_id = link.last_pane_id,
+        .attach_dock_id = link.attach_dock_id,
+        .attach_pane_id = link.attach_pane_id,
+        .pane_links_json = link.pane_links_json,
+        .updated_at_ms = link.updated_at_ms,
+    } else null;
+    return .{
+        .id = workspace.workspace_id,
+        .label = workspace.label,
+        .path = workspace.path,
+        .archived = workspace.archived,
+        .unread_count = @intCast(@min(workspace.unread_count, std.math.maxInt(u8))),
+        .collapsed = workspace.collapsed,
+        .thread_list_expanded = workspace.thread_list_expanded,
+        .terminal_height = workspace.terminal_height,
+        .terminal_layout_json = workspace.terminal_layout_json,
+        .terminal_docks_json = workspace.terminal_docks_json,
+        .workspace_layout_json = workspace.workspace_layout_json,
+        .selected_thread_index = workspace.selected_thread_index,
+        .companion_thread_local_id = workspace.companion_thread_local_id,
+        .herdr_link = herdr_link,
+        .threads = threads,
+        .provider = snapshotEnum(Provider, workspace.provider, .opencode),
+        .harness = snapshotEnum(Harness, workspace.harness, .local_cli),
+        .draft = workspace.draft,
+        .messages = try snapshotMessagesToPersisted(allocator, workspace.messages),
+    };
+}
+
+/// Convert the daemon DTO into the exact projection shape used by the legacy
+/// RO pull. The result borrows strings from the owned composite refresh and
+/// owns only its temporary arrays; applyPersisted duplicates durable data.
+fn compositeSnapshotToPersisted(
+    allocator: std.mem.Allocator,
+    snapshot: headless.store.Snapshot,
+) !PersistedState {
+    const projects = try allocator.alloc(PersistedProject, snapshot.workspaces.len);
+    for (snapshot.workspaces, 0..) |workspace, index| {
+        projects[index] = try snapshotWorkspaceToPersisted(allocator, workspace);
+    }
+    const surfaces = try allocator.alloc(PersistedSurfaceState, snapshot.surface_states.len);
+    for (snapshot.surface_states, 0..) |surface, index| {
+        surfaces[index] = .{
+            .session_id = surface.session_id,
+            .workspace_id = surface.workspace_id,
+            .workspace_path = surface.workspace_path,
+            .dock_id = surface.dock_id,
+            .pane_id = surface.pane_id,
+            .provider = snapshotOptionalEnum(db_types.SurfaceProvider, surface.provider),
+            .provider_thread_id = surface.provider_thread_id,
+            .title = surface.title,
+            .status = snapshotEnum(db_types.SurfaceStatus, surface.status, .idle),
+            .status_changed_at_ms = surface.status_changed_at_ms,
+            .completed_at_ms = surface.completed_at_ms,
+            .last_event_title = surface.last_event_title,
+            .last_event_body = surface.last_event_body,
+        };
+    }
+    const completions = try allocator.alloc(PersistedChatCompletion, snapshot.chat_completions.len);
+    for (snapshot.chat_completions, 0..) |completion, index| {
+        completions[index] = .{
+            .workspace_id = completion.workspace_id,
+            .local_thread_id = completion.local_thread_id,
+            .completed_at_ms = completion.completed_at_ms,
+        };
+    }
+    return .{
+        .selected_project_index = snapshot.selected_workspace_index,
+        .sidebar_collapsed = snapshot.sidebar_collapsed,
+        .projects = projects,
+        .surface_states = surfaces,
+        .chat_completions = completions,
+        .provider = snapshotOptionalEnum(Provider, snapshot.provider),
+        .harness = snapshotOptionalEnum(Harness, snapshot.harness),
+        .draft = snapshot.draft,
+        .messages = if (snapshot.messages) |messages| try snapshotMessagesToPersisted(allocator, messages) else null,
+    };
+}
+
+fn projectIndexById(projects: []const PersistedProject, id: []const u8) ?usize {
+    for (projects, 0..) |project, index| {
+        if (project.id) |candidate| if (std.mem.eql(u8, candidate, id)) return index;
+    }
+    return null;
+}
+
+fn threadIndexById(threads: []const PersistedThread, id: []const u8) ?usize {
+    for (threads, 0..) |thread, index| {
+        if (thread.local_thread_id) |candidate| if (std.mem.eql(u8, candidate, id)) return index;
+    }
+    return null;
+}
+
+fn optionalSliceEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn optionalImageEqual(a: ?db_types.PersistedImageAttachment, b: ?db_types.PersistedImageAttachment) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?.path, b.?.path) and
+        std.mem.eql(u8, a.?.mime, b.?.mime) and
+        a.?.byte_size == b.?.byte_size;
+}
+
+fn imageListEqual(
+    a: []const db_types.PersistedImageAttachment,
+    b: []const db_types.PersistedImageAttachment,
+) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!optionalImageEqual(left, right)) return false;
+    }
+    return true;
+}
+
+fn optionalHerdrEqual(a: ?db_types.PersistedHerdrWorkspaceLink, b: ?db_types.PersistedHerdrWorkspaceLink) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?.remote_alias, b.?.remote_alias) and
+        std.mem.eql(u8, a.?.session_name, b.?.session_name) and
+        std.mem.eql(u8, a.?.workspace_id, b.?.workspace_id) and
+        std.mem.eql(u8, a.?.local_dir, b.?.local_dir) and
+        optionalSliceEqual(a.?.remote_cwd, b.?.remote_cwd) and
+        optionalSliceEqual(a.?.last_pane_id, b.?.last_pane_id) and
+        a.?.attach_dock_id == b.?.attach_dock_id and
+        a.?.attach_pane_id == b.?.attach_pane_id and
+        optionalSliceEqual(a.?.pane_links_json, b.?.pane_links_json) and
+        a.?.updated_at_ms == b.?.updated_at_ms;
+}
+
+fn overlayCurrentThreadEdits(
+    remote: *PersistedThread,
+    baseline: PersistedThread,
+    current: PersistedThread,
+) void {
+    if (!std.mem.eql(u8, current.title, baseline.title)) remote.title = current.title;
+    if (current.archived != baseline.archived) remote.archived = current.archived;
+    if (current.committed != baseline.committed) remote.committed = current.committed;
+    if (current.last_activity_at != baseline.last_activity_at) remote.last_activity_at = current.last_activity_at;
+    if (!optionalSliceEqual(current.model_ref, baseline.model_ref)) remote.model_ref = current.model_ref;
+    if (current.reasoning_effort != baseline.reasoning_effort) remote.reasoning_effort = current.reasoning_effort;
+    if (!optionalSliceEqual(current.reasoning_variant, baseline.reasoning_variant)) remote.reasoning_variant = current.reasoning_variant;
+    if (current.fast_mode != baseline.fast_mode) remote.fast_mode = current.fast_mode;
+    if (current.access_mode != baseline.access_mode) remote.access_mode = current.access_mode;
+    if (current.provider != baseline.provider) remote.provider = current.provider;
+    if (current.harness != baseline.harness) remote.harness = current.harness;
+    if (current.tui_dock_id != baseline.tui_dock_id) remote.tui_dock_id = current.tui_dock_id;
+    if (!std.mem.eql(u8, current.draft, baseline.draft)) remote.draft = current.draft;
+    if (!optionalImageEqual(current.draft_image, baseline.draft_image)) remote.draft_image = current.draft_image;
+    if (!imageListEqual(current.draft_extra_images, baseline.draft_extra_images)) {
+        remote.draft_extra_images = current.draft_extra_images;
+    }
+}
+
+fn overlayCurrentThreadMessages(
+    allocator: std.mem.Allocator,
+    remote: *PersistedThread,
+    baseline: PersistedThread,
+    current: PersistedThread,
+) !void {
+    // Compact baselines encode the durable end position in message_offset.
+    // Only rows after that point are proven local additions. A concurrent
+    // remote refresh may already contain part of the suffix, so append from
+    // the greatest absolute end observed by either side.
+    const baseline_end = baseline.message_offset + baseline.messages.len;
+    const current_end = current.message_offset + current.messages.len;
+    if (current_end <= baseline_end) return;
+    const remote_end = remote.message_offset + remote.messages.len;
+    const append_from = @max(@max(baseline_end, remote_end), current.message_offset);
+    if (append_from >= current_end) return;
+
+    var merged: std.ArrayList(PersistedMessage) = .empty;
+    defer merged.deinit(allocator);
+    try merged.appendSlice(allocator, remote.messages);
+    try merged.appendSlice(allocator, current.messages[append_from - current.message_offset ..]);
+    remote.messages = try merged.toOwnedSlice(allocator);
+}
+
+fn mergeCurrentThreads(
+    allocator: std.mem.Allocator,
+    remote: *PersistedProject,
+    baseline: PersistedProject,
+    current: PersistedProject,
+) !void {
+    const remote_slice = remote.threads orelse &.{};
+    const baseline_threads = baseline.threads orelse &.{};
+    const current_threads = current.threads orelse &.{};
+    var merged: std.ArrayList(PersistedThread) = .empty;
+    defer merged.deinit(allocator);
+    try merged.appendSlice(allocator, remote_slice);
+
+    // Baseline identities deleted locally stay deleted. Remote-only identities
+    // are untouched, while current-only identities are proven local additions.
+    for (baseline_threads) |base_thread| {
+        const id = base_thread.local_thread_id orelse continue;
+        if (threadIndexById(current_threads, id) != null) continue;
+        if (threadIndexById(merged.items, id)) |index| _ = merged.orderedRemove(index);
+    }
+    for (current_threads) |current_thread| {
+        const id = current_thread.local_thread_id orelse continue;
+        const baseline_index = threadIndexById(baseline_threads, id);
+        const remote_index = threadIndexById(merged.items, id);
+        if (baseline_index == null) {
+            if (remote_index == null) try merged.append(allocator, current_thread);
+            continue;
+        }
+        if (remote_index) |index| {
+            const base_thread = baseline_threads[baseline_index.?];
+            overlayCurrentThreadEdits(&merged.items[index], base_thread, current_thread);
+            try overlayCurrentThreadMessages(allocator, &merged.items[index], base_thread, current_thread);
+        }
+        // If remote omitted an identity present in the baseline, that is a
+        // remote deletion and wins over local edits to the old thread.
+    }
+    remote.threads = try merged.toOwnedSlice(allocator);
+}
+
+fn overlayCurrentProjectEdits(
+    remote: *PersistedProject,
+    baseline: PersistedProject,
+    current: PersistedProject,
+) void {
+    if (!std.mem.eql(u8, current.label, baseline.label)) remote.label = current.label;
+    if (!std.mem.eql(u8, current.path, baseline.path)) remote.path = current.path;
+    if (current.archived != baseline.archived) remote.archived = current.archived;
+    if (current.unread_count != baseline.unread_count) remote.unread_count = current.unread_count;
+    if (current.collapsed != baseline.collapsed) remote.collapsed = current.collapsed;
+    if (current.thread_list_expanded != baseline.thread_list_expanded) remote.thread_list_expanded = current.thread_list_expanded;
+    if (current.terminal_height != baseline.terminal_height) remote.terminal_height = current.terminal_height;
+    if (!optionalSliceEqual(current.terminal_layout_json, baseline.terminal_layout_json)) remote.terminal_layout_json = current.terminal_layout_json;
+    if (!optionalSliceEqual(current.terminal_docks_json, baseline.terminal_docks_json)) remote.terminal_docks_json = current.terminal_docks_json;
+    if (!optionalSliceEqual(current.workspace_layout_json, baseline.workspace_layout_json)) remote.workspace_layout_json = current.workspace_layout_json;
+    if (current.selected_thread_index != baseline.selected_thread_index) remote.selected_thread_index = current.selected_thread_index;
+    if (!optionalSliceEqual(current.companion_thread_local_id, baseline.companion_thread_local_id)) remote.companion_thread_local_id = current.companion_thread_local_id;
+    if (!optionalHerdrEqual(current.herdr_link, baseline.herdr_link)) remote.herdr_link = current.herdr_link;
+    if (current.provider != baseline.provider) remote.provider = current.provider;
+    if (current.harness != baseline.harness) remote.harness = current.harness;
+    if (!std.mem.eql(u8, current.draft, baseline.draft)) remote.draft = current.draft;
+}
+
+/// Three-way merge at the frame-thread apply boundary. `baseline` is the
+/// daemon projection observed at capture, `current` includes every later UI
+/// edit, and `remote` supplies durable transcript identities and deletions.
+fn mergeCurrentLocalEdits(
+    allocator: std.mem.Allocator,
+    remote: *PersistedState,
+    baseline: PersistedState,
+    current: PersistedState,
+) !void {
+    if (current.sidebar_collapsed != baseline.sidebar_collapsed) remote.sidebar_collapsed = current.sidebar_collapsed;
+    var merged: std.ArrayList(PersistedProject) = .empty;
+    defer merged.deinit(allocator);
+    try merged.appendSlice(allocator, remote.projects);
+
+    for (baseline.projects) |base_project| {
+        const id = base_project.id orelse continue;
+        if (projectIndexById(current.projects, id) != null) continue;
+        if (projectIndexById(merged.items, id)) |index| _ = merged.orderedRemove(index);
+    }
+    for (current.projects) |current_project| {
+        const id = current_project.id orelse continue;
+        const baseline_index = projectIndexById(baseline.projects, id);
+        const remote_index = projectIndexById(merged.items, id);
+        if (baseline_index == null) {
+            if (remote_index == null) try merged.append(allocator, current_project);
+            continue;
+        }
+        if (remote_index) |index| {
+            const base_project = baseline.projects[baseline_index.?];
+            overlayCurrentProjectEdits(&merged.items[index], base_project, current_project);
+            try mergeCurrentThreads(allocator, &merged.items[index], base_project, current_project);
+        }
+    }
+    remote.projects = try merged.toOwnedSlice(allocator);
+    if (remote.projects.len == 0) {
+        remote.selected_project_index = 0;
+    } else {
+        if (current.selected_project_index != baseline.selected_project_index) {
+            remote.selected_project_index = @min(current.selected_project_index, remote.projects.len - 1);
+        } else {
+            remote.selected_project_index = @min(remote.selected_project_index, remote.projects.len - 1);
+        }
+    }
+}
+
+/// Bootstrap/revision-repair merge used only when no revision-paired baseline
+/// exists. It never consults a stale baseline and conservatively retains every
+/// current-only workspace/thread identity while durable transcript rows remain
+/// authoritative for identities present on both sides.
+fn preserveCurrentIdentitiesWithoutBaseline(
+    allocator: std.mem.Allocator,
+    remote: *PersistedState,
+    current: PersistedState,
+) !void {
+    var projects: std.ArrayList(PersistedProject) = .empty;
+    defer projects.deinit(allocator);
+    try projects.appendSlice(allocator, remote.projects);
+    for (current.projects) |current_project| {
+        const id = current_project.id orelse continue;
+        const remote_index = projectIndexById(projects.items, id) orelse {
+            try projects.append(allocator, current_project);
+            continue;
+        };
+        var remote_project = &projects.items[remote_index];
+        var threads: std.ArrayList(PersistedThread) = .empty;
+        defer threads.deinit(allocator);
+        try threads.appendSlice(allocator, remote_project.threads orelse &.{});
+        for (current_project.threads orelse &.{}) |current_thread| {
+            const thread_id = current_thread.local_thread_id orelse continue;
+            if (threadIndexById(threads.items, thread_id) == null) {
+                try threads.append(allocator, current_thread);
+            }
+        }
+        remote_project.threads = try threads.toOwnedSlice(allocator);
+    }
+    remote.projects = try projects.toOwnedSlice(allocator);
+}
+
+fn projectByIdForViewport(
+    controller: *project_controller.State,
+    project_id: []const u8,
+) ?*project_state.Project {
+    for (controller.projects.items) |*project| {
+        if (std.mem.eql(u8, project.id, project_id)) return project;
+    }
+    for (controller.archived_projects.items) |*project| {
+        if (std.mem.eql(u8, project.id, project_id)) return project;
+    }
+    return null;
+}
+
+fn threadByIdForViewport(project: *project_state.Project, thread_id: []const u8) ?*ChatThread {
+    for (project.threads.items) |*thread| {
+        if (std.mem.eql(u8, thread.local_thread_id, thread_id)) return thread;
+    }
+    for (project.archived_threads.items) |*thread| {
+        if (std.mem.eql(u8, thread.local_thread_id, thread_id)) return thread;
+    }
+    return null;
+}
+
+fn transcriptSnapshotsShareLayout(current: *const ChatThread, replacement: *const ChatThread) bool {
+    if (current.persisted_message_offset != replacement.persisted_message_offset or
+        current.messages.items.len != replacement.messages.items.len)
+    {
+        return false;
+    }
+    for (current.messages.items, replacement.messages.items) |current_message, replacement_message| {
+        if (current_message.role != replacement_message.role or
+            !std.mem.eql(u8, current_message.author, replacement_message.author) or
+            !std.mem.eql(u8, current_message.body, replacement_message.body) or
+            current_message.tool_call_kind != replacement_message.tool_call_kind or
+            current_message.tool_call_status != replacement_message.tool_call_status or
+            (current_message.image != null) != (replacement_message.image != null) or
+            current_message.extra_images.len != replacement_message.extra_images.len)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn chatImagesEqual(a: ChatImageAttachment, b: ChatImageAttachment) bool {
+    return std.mem.eql(u8, a.path, b.path) and
+        std.mem.eql(u8, a.mime, b.mime) and
+        a.byte_size == b.byte_size;
+}
+
+fn optionalChatImageEqual(a: ?ChatImageAttachment, b: ?ChatImageAttachment) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return chatImagesEqual(a.?, b.?);
+}
+
+fn chatMessagesEqualForProjection(a: ChatMessage, b: ChatMessage) bool {
+    if (a.role != b.role or
+        !std.mem.eql(u8, a.author, b.author) or
+        !std.mem.eql(u8, a.body, b.body) or
+        !optionalSliceEqual(a.tool_call_id, b.tool_call_id) or
+        a.tool_call_kind != b.tool_call_kind or
+        a.tool_call_status != b.tool_call_status or
+        !optionalSliceEqual(a.message_id, b.message_id) or
+        !optionalChatImageEqual(a.image, b.image) or
+        a.extra_images.len != b.extra_images.len)
+    {
+        return false;
+    }
+    for (a.extra_images, b.extra_images) |a_image, b_image| {
+        if (!chatImagesEqual(a_image, b_image)) return false;
+    }
+    return true;
+}
+
+/// A refresh normally rematerializes only the durable tail page. If that page
+/// is an unchanged suffix of the GUI's already-hydrated transcript, retain the
+/// wider materialized range. Otherwise the copied numeric scroll offset would
+/// suddenly be interpreted in the compact page's unrelated coordinate space.
+fn replacementTranscriptIsUnchangedCoveredRange(current: *const ChatThread, replacement: *const ChatThread) bool {
+    const current_start = current.persisted_message_offset;
+    const replacement_start = replacement.persisted_message_offset;
+    if (replacement_start < current_start) return false;
+    const skip = replacement_start - current_start;
+    if (skip > current.messages.items.len) return false;
+    if (replacement.messages.items.len > current.messages.items.len - skip) return false;
+    for (current.messages.items[skip..][0..replacement.messages.items.len], replacement.messages.items) |current_message, replacement_message| {
+        if (!chatMessagesEqualForProjection(current_message, replacement_message)) return false;
+    }
+    return true;
+}
+
+fn cloneProjectionImage(allocator: std.mem.Allocator, source: ChatImageAttachment) !ChatImageAttachment {
+    const path = try allocator.dupeZ(u8, source.path);
+    errdefer allocator.free(path);
+    const file_name = try allocator.dupeZ(u8, source.file_name);
+    errdefer allocator.free(file_name);
+    const mime = try allocator.dupeZ(u8, source.mime);
+    return .{
+        .path = path,
+        .file_name = file_name,
+        .mime = mime,
+        .byte_size = source.byte_size,
+    };
+}
+
+fn cloneProjectionOptionalSlice(allocator: std.mem.Allocator, source: ?[]const u8) !?[]const u8 {
+    return if (source) |value| try allocator.dupe(u8, value) else null;
+}
+
+fn cloneProjectionMessage(allocator: std.mem.Allocator, source: ChatMessage) !ChatMessage {
+    const author = try allocator.dupeZ(u8, source.author);
+    errdefer allocator.free(author);
+    const body = try allocator.dupeZ(u8, source.body);
+    errdefer allocator.free(body);
+    const image = if (source.image) |attachment| try cloneProjectionImage(allocator, attachment) else null;
+    errdefer if (image) |attachment| attachment.deinit(allocator);
+    const extra_images = try allocator.alloc(ChatImageAttachment, source.extra_images.len);
+    errdefer allocator.free(extra_images);
+    var copied_extra_count: usize = 0;
+    errdefer for (extra_images[0..copied_extra_count]) |attachment| attachment.deinit(allocator);
+    for (source.extra_images, 0..) |attachment, index| {
+        extra_images[index] = try cloneProjectionImage(allocator, attachment);
+        copied_extra_count += 1;
+    }
+    const tool_call_id = try cloneProjectionOptionalSlice(allocator, source.tool_call_id);
+    errdefer if (tool_call_id) |value| allocator.free(value);
+    const message_id = try cloneProjectionOptionalSlice(allocator, source.message_id);
+    return .{
+        .role = source.role,
+        .author = author,
+        .body = body,
+        .image = image,
+        .extra_images = extra_images,
+        .tool_call_id = tool_call_id,
+        .tool_call_kind = source.tool_call_kind,
+        .tool_call_status = source.tool_call_status,
+        .message_id = message_id,
+        .transcript_card_started_ms = source.transcript_card_started_ms,
+    };
+}
+
+fn deinitProjectionMessage(allocator: std.mem.Allocator, message: ChatMessage) void {
+    allocator.free(message.author);
+    allocator.free(message.body);
+    if (message.image) |attachment| attachment.deinit(allocator);
+    for (message.extra_images) |attachment| attachment.deinit(allocator);
+    allocator.free(message.extra_images);
+    if (message.tool_call_id) |value| allocator.free(value);
+    if (message.message_id) |value| allocator.free(value);
+}
+
+fn deinitProjectionMessages(allocator: std.mem.Allocator, messages: []const ChatMessage) void {
+    for (messages) |message| deinitProjectionMessage(allocator, message);
+}
+
+/// Widen a compact replacement to the GUI's materialized absolute range.
+/// The daemon-owned overlap remains authoritative, while older hydrated rows
+/// and any live rows beyond a stale replacement are cloned around it. This is
+/// fallible staging work and never mutates the live projection.
+fn prepareProjectionTranscriptContinuity(
+    allocator: std.mem.Allocator,
+    current: *const ChatThread,
+    replacement: *ChatThread,
+) !void {
+    if (replacementTranscriptIsUnchangedCoveredRange(current, replacement)) return;
+
+    const current_start = current.persisted_message_offset;
+    const current_end = current_start + current.messages.items.len;
+    const replacement_start = replacement.persisted_message_offset;
+    if (replacement_start < current_start or replacement_start > current_end) return;
+    const replacement_end = replacement_start + replacement.messages.items.len;
+    const prefix_count = replacement_start - current_start;
+    const suffix_start = @min(@max(replacement_end, current_start) - current_start, current.messages.items.len);
+    const suffix = current.messages.items[suffix_start..];
+    if (prefix_count == 0 and suffix.len == 0) return;
+
+    var prefix_clones: std.ArrayList(ChatMessage) = .empty;
+    defer prefix_clones.deinit(allocator);
+    var prefix_owned = true;
+    errdefer if (prefix_owned) deinitProjectionMessages(allocator, prefix_clones.items);
+    for (current.messages.items[0..prefix_count]) |message| {
+        const cloned = try cloneProjectionMessage(allocator, message);
+        prefix_clones.append(allocator, cloned) catch |err| {
+            deinitProjectionMessage(allocator, cloned);
+            return err;
+        };
+    }
+
+    var suffix_clones: std.ArrayList(ChatMessage) = .empty;
+    defer suffix_clones.deinit(allocator);
+    var suffix_owned = true;
+    errdefer if (suffix_owned) deinitProjectionMessages(allocator, suffix_clones.items);
+    for (suffix) |message| {
+        const cloned = try cloneProjectionMessage(allocator, message);
+        suffix_clones.append(allocator, cloned) catch |err| {
+            deinitProjectionMessage(allocator, cloned);
+            return err;
+        };
+    }
+
+    var merged = try std.ArrayList(ChatMessage).initCapacity(
+        allocator,
+        prefix_clones.items.len + replacement.messages.items.len + suffix_clones.items.len,
+    );
+    merged.appendSliceAssumeCapacity(prefix_clones.items);
+    merged.appendSliceAssumeCapacity(replacement.messages.items);
+    merged.appendSliceAssumeCapacity(suffix_clones.items);
+    replacement.messages.deinit(allocator);
+    replacement.messages = merged;
+    replacement.persisted_message_offset = current_start;
+    prefix_owned = false;
+    suffix_owned = false;
+    replacement.rebuildBackgroundTasksFromMessages(allocator);
+}
+
+fn prepareProjectionTranscriptRuntime(
+    allocator: std.mem.Allocator,
+    current: *project_controller.State,
+    replacement: *project_controller.State,
+) !void {
+    const collections = .{ &replacement.projects, &replacement.archived_projects };
+    inline for (collections) |projects| {
+        for (projects.items) |*next_project| {
+            const current_project = projectByIdForViewport(current, next_project.id) orelse continue;
+            for (next_project.threads.items) |*next_thread| {
+                const current_thread = threadByIdForViewport(current_project, next_thread.local_thread_id) orelse continue;
+                try prepareProjectionTranscriptContinuity(allocator, current_thread, next_thread);
+            }
+            for (next_project.archived_threads.items) |*next_thread| {
+                const current_thread = threadByIdForViewport(current_project, next_thread.local_thread_id) orelse continue;
+                try prepareProjectionTranscriptContinuity(allocator, current_thread, next_thread);
+            }
+        }
+    }
+}
+
+fn replacementTranscriptPreservesLayoutCoordinates(current: *const ChatThread, replacement: *const ChatThread) bool {
+    return current.persisted_message_offset == replacement.persisted_message_offset and
+        current.transcript_layout_first_message_index + current.transcript_layout_message_count <= replacement.messages.items.len;
+}
+
+fn replacementTranscriptKeepsCurrentPrefix(current: *const ChatThread, replacement: *const ChatThread) bool {
+    if (current.persisted_message_offset != replacement.persisted_message_offset or
+        current.messages.items.len > replacement.messages.items.len)
+    {
+        return false;
+    }
+    for (current.messages.items, replacement.messages.items[0..current.messages.items.len]) |current_message, replacement_message| {
+        if (!chatMessagesEqualForProjection(current_message, replacement_message)) return false;
+    }
+    return true;
+}
+
+fn sendStateHasRuntime(state: *SendState) bool {
+    state.mutex.lock();
+    defer state.mutex.unlock();
+    return state.status != .idle or state.worker != null or state.daemon_owned;
+}
+
+fn transferProjectionThreadRuntime(current: *ChatThread, replacement: *ChatThread) void {
+    const keep_materialized_transcript = replacementTranscriptIsUnchangedCoveredRange(current, replacement);
+    const layout_content_unchanged = keep_materialized_transcript or replacementTranscriptKeepsCurrentPrefix(current, replacement);
+    const transfer_layout = layout_content_unchanged or
+        transcriptSnapshotsShareLayout(current, replacement) or
+        replacementTranscriptPreservesLayoutCoordinates(current, replacement);
+    if (keep_materialized_transcript) {
+        // Ownership moves by swap at the publication boundary: the old
+        // projection later destroys the compact replacement page, while the
+        // replacement keeps the hydrated rows and their exact layout space.
+        std.mem.swap(usize, &current.persisted_message_offset, &replacement.persisted_message_offset);
+        std.mem.swap(@TypeOf(current.messages), &current.messages, &replacement.messages);
+        std.mem.swap(@TypeOf(current.background_tasks), &current.background_tasks, &replacement.background_tasks);
+    }
+
+    const transfer_send_state = sendStateHasRuntime(current.send_state) or !sendStateHasRuntime(replacement.send_state);
+    if (transfer_send_state) {
+        std.mem.swap(@TypeOf(current.send_state), &current.send_state, &replacement.send_state);
+        std.mem.swap(@TypeOf(current.pending_transcript_body), &current.pending_transcript_body, &replacement.pending_transcript_body);
+    }
+    // Title generation is GUI-owned and is never reconstructed from a daemon
+    // projection, so its worker/result state always follows the stable thread.
+    std.mem.swap(@TypeOf(current.title_generation_state), &current.title_generation_state, &replacement.title_generation_state);
+
+    if (!transfer_layout) return;
+    std.mem.swap(@TypeOf(current.transcript_markdown_entries), &current.transcript_markdown_entries, &replacement.transcript_markdown_entries);
+    std.mem.swap(@TypeOf(current.transcript_height_entries), &current.transcript_height_entries, &replacement.transcript_height_entries);
+    std.mem.swap(@TypeOf(current.transcript_layout_items), &current.transcript_layout_items, &replacement.transcript_layout_items);
+    std.mem.swap(f32, &current.transcript_layout_width, &replacement.transcript_layout_width);
+    std.mem.swap(f32, &current.transcript_layout_scale, &replacement.transcript_layout_scale);
+    std.mem.swap(u64, &current.transcript_layout_variant_hash, &replacement.transcript_layout_variant_hash);
+    std.mem.swap(usize, &current.transcript_layout_first_message_index, &replacement.transcript_layout_first_message_index);
+    std.mem.swap(usize, &current.transcript_layout_message_count, &replacement.transcript_layout_message_count);
+    std.mem.swap(f32, &current.transcript_layout_committed_height, &replacement.transcript_layout_committed_height);
+    std.mem.swap(f32, &current.transcript_layout_requested_height, &replacement.transcript_layout_requested_height);
+    std.mem.swap(bool, &current.transcript_layout_visible_ready, &replacement.transcript_layout_visible_ready);
+    std.mem.swap(bool, &current.transcript_layout_valid, &replacement.transcript_layout_valid);
+    // Same absolute indices with changed durable content can retain the old
+    // row anchor, but must remeasure before presenting the updated rows.
+    if (!layout_content_unchanged) replacement.transcript_layout_valid = false;
+}
+
+fn countProjectionActiveSends(controller: *project_controller.State) usize {
+    var count: usize = 0;
+    const collections = .{ &controller.projects, &controller.archived_projects };
+    inline for (collections) |projects| {
+        for (projects.items) |*project| {
+            for (project.threads.items) |*thread| if (sendStateHasRuntime(thread.send_state)) {
+                count += 1;
+            };
+            for (project.archived_threads.items) |*thread| if (sendStateHasRuntime(thread.send_state)) {
+                count += 1;
+            };
+        }
+    }
+    return count;
+}
+
+fn transferProjectionTerminalRuntime(current: *Project, replacement: *Project) void {
+    _ = replacement.terminal_dock.transferRuntimeFrom(&current.terminal_dock);
+    for (replacement.terminal_docks.items) |*next_entry| {
+        const current_entry = current.terminalDockEntryById(next_entry.id) orelse continue;
+        _ = next_entry.dock.transferRuntimeFrom(&current_entry.dock);
+    }
+    std.mem.swap(
+        @TypeOf(current.pending_terminal_teardowns),
+        &current.pending_terminal_teardowns,
+        &replacement.pending_terminal_teardowns,
+    );
+    replacement.last_content_pane_id = current.last_content_pane_id;
+}
+
+/// Projection refreshes replace durable data, but live sends, terminal
+/// emulators, measured layout, scroll offsets, and pane focus/viewport are
+/// frame-local runtime state. Carry them by stable identity before the old
+/// projects are destroyed.
+fn preserveProjectionRuntime(
+    current: *project_controller.State,
+    replacement: *project_controller.State,
+) void {
+    const collections = .{ &replacement.projects, &replacement.archived_projects };
+    inline for (collections) |projects| {
+        for (projects.items) |*next_project| {
+            const current_project = projectByIdForViewport(current, next_project.id) orelse continue;
+            transferProjectionTerminalRuntime(current_project, next_project);
+            preserveWorkspaceViewportRuntime(current_project, next_project);
+
+            for (next_project.threads.items) |*next_thread| {
+                const current_thread = threadByIdForViewport(current_project, next_thread.local_thread_id) orelse continue;
+                next_thread.transcript_scroll_valid = current_thread.transcript_scroll_valid;
+                next_thread.transcript_scroll_y = current_thread.transcript_scroll_y;
+                transferProjectionThreadRuntime(current_thread, next_thread);
+            }
+            for (next_project.archived_threads.items) |*next_thread| {
+                const current_thread = threadByIdForViewport(current_project, next_thread.local_thread_id) orelse continue;
+                next_thread.transcript_scroll_valid = current_thread.transcript_scroll_valid;
+                next_thread.transcript_scroll_y = current_thread.transcript_scroll_y;
+                transferProjectionThreadRuntime(current_thread, next_thread);
+            }
+
+            for (next_project.workspace_layout.panes.items) |*next_pane| {
+                const next_ref = switch (next_pane.ref) {
+                    .chat => |*ref| ref,
+                    else => continue,
+                };
+                const current_pane = current_project.workspace_layout.paneById(next_pane.id) orelse continue;
+                const current_ref = switch (current_pane.ref) {
+                    .chat => |ref| ref,
+                    else => continue,
+                };
+                if (current_ref.thread_index >= current_project.threads.items.len) continue;
+                // Pane refs are bare ordinals while the replacement thread
+                // array is remote-ordered (merge appends current-only threads
+                // at the tail and a remote archive pulls a thread out
+                // mid-array), so the same index can now name a different
+                // thread. Rebind by thread identity: the pane must keep
+                // showing the thread it was showing, not whatever slid into
+                // its old slot — that positional drift blanked open panes and
+                // stranded their scroll anchors after daemon refreshes.
+                const current_thread_id = current_project.threads.items[current_ref.thread_index].local_thread_id;
+                const rebound_index: usize = index: {
+                    for (next_project.threads.items, 0..) |*candidate, candidate_index| {
+                        if (std.mem.eql(u8, candidate.local_thread_id, current_thread_id)) break :index candidate_index;
+                    }
+                    // Thread gone from the replacement (deleted or archived
+                    // remotely): leave the normalized fallback binding alone.
+                    break :index next_ref.thread_index;
+                };
+                if (rebound_index >= next_project.threads.items.len) continue;
+                next_ref.thread_index = rebound_index;
+                const next_thread_id = next_project.threads.items[next_ref.thread_index].local_thread_id;
+                if (!std.mem.eql(u8, next_thread_id, current_thread_id)) continue;
+                next_ref.transcript_scroll_valid = current_ref.transcript_scroll_valid;
+                next_ref.transcript_scroll_y = current_ref.transcript_scroll_y;
+            }
+        }
+    }
+}
+
+/// The scrolling strip's eased offset and reveal/leading bookkeeping are
+/// never persisted, so a rebuilt projection resets them and the next frame's
+/// auto-reveal scrolls the viewport back to the snapshot's focused pane.
+/// Carry them across the swap. Persisted presentation fields (focus,
+/// maximize, scroll target) are deliberately NOT restored here: they are
+/// patched into the incoming snapshot before baseline capture
+/// (preserveLiveWorkspacePresentationInPersisted), because overwriting them
+/// after apply makes the live layout JSON diverge from the recorded baseline
+/// and later merges would misread that divergence as a local structural edit,
+/// resurrecting panes against a legitimate remote layout change.
+fn preserveWorkspaceViewportRuntime(
+    current_project: *const project_state.Project,
+    next_project: *project_state.Project,
+) void {
+    const current_layout = &current_project.workspace_layout;
+    const next_layout = &next_project.workspace_layout;
+    next_layout.scroll_offset_x = current_layout.scroll_offset_x;
+    next_layout.scroll_offset_y = current_layout.scroll_offset_y;
+    next_layout.scroll_animation_last_ms = current_layout.scroll_animation_last_ms;
+    next_layout.scroll_revealed_pane_id = current_layout.scroll_revealed_pane_id;
+    next_layout.scroll_leading_pane_id = current_layout.scroll_leading_pane_id;
+}
+
+/// Pane focus, maximize, and the strip scroll target are GUI-owned
+/// presentation state: nothing may move them except an explicit user action.
+/// A refresh's snapshot is stale here exactly in the send→turn-start window,
+/// where a local focus change cannot flush yet, so applying the snapshot's
+/// `focused` yanked the user back to the sending pane. Rewrite the snapshot's
+/// layout JSON to the live values BEFORE baseline capture and apply: the
+/// applied layout and the recorded baseline then agree by construction, so
+/// preservation never reads as a local layout edit in later merges.
+fn preserveLiveWorkspacePresentationInPersisted(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    controller: *project_controller.State,
+    persisted: *PersistedState,
+) !void {
+    if (persisted.projects.len == 0) return;
+    // The durable-projection branch shares the snapshot owner's memory, so
+    // patch a shallow arena copy of the project records, never the original.
+    const projects = try arena.dupe(PersistedProject, persisted.projects);
+    var any_patched = false;
+    for (projects) |*project| {
+        const project_id = project.id orelse continue;
+        const live_project = projectByIdForViewport(controller, project_id) orelse continue;
+        // A remote layout clear (null JSON) is durable data; never resurrect
+        // presentation state onto it.
+        const layout_json = project.workspace_layout_json orelse continue;
+        const live_layout = &live_project.workspace_layout;
+        var layout: WorkspaceLayout = .{};
+        defer layout.deinit(gpa);
+        // Malformed JSON falls through to applyPersisted's own handling.
+        layout.applyPersistedWorkspaceJson(gpa, layout_json) catch continue;
+        var changed = false;
+        if (live_layout.focused_pane_id) |pane_id| {
+            // A live focused pane deleted remotely keeps the snapshot value;
+            // repairVisibleRoot re-parks a dangling id on a visible pane.
+            if (layout.paneById(pane_id) != null and
+                (layout.focused_pane_id == null or layout.focused_pane_id.? != pane_id))
+            {
+                layout.focused_pane_id = pane_id;
+                changed = true;
+            }
+        }
+        if (live_layout.maximized_pane_id) |pane_id| {
+            if (layout.paneById(pane_id) != null and
+                (layout.maximized_pane_id == null or layout.maximized_pane_id.? != pane_id))
+            {
+                layout.maximized_pane_id = pane_id;
+                changed = true;
+            }
+        } else if (layout.maximized_pane_id != null) {
+            // A local unmaximize must survive a refresh that still carries
+            // the previously flushed maximized id.
+            layout.maximized_pane_id = null;
+            changed = true;
+        }
+        if (layout.scroll_target_x != live_layout.scroll_target_x or
+            layout.scroll_target_y != live_layout.scroll_target_y)
+        {
+            layout.scroll_target_x = live_layout.scroll_target_x;
+            layout.scroll_target_y = live_layout.scroll_target_y;
+            changed = true;
+        }
+        if (!changed) continue;
+        project.workspace_layout_json = try layout.persistedWorkspaceJson(arena);
+        any_patched = true;
+    }
+    if (any_patched) persisted.projects = projects;
+}
+
+/// Find a thread's draft-attachment baseline inside the last applied
+/// projection snapshot, or null when the baseline does not know the thread.
+fn baselineThreadForAttachments(
+    baseline: ?*const PersistedState,
+    project_id: []const u8,
+    thread_id: []const u8,
+) ?*const PersistedThread {
+    const base = baseline orelse return null;
+    for (base.projects) |*project| {
+        const base_project_id = project.id orelse continue;
+        if (!std.mem.eql(u8, base_project_id, project_id)) continue;
+        const threads = project.threads orelse return null;
+        for (threads) |*thread| {
+            const base_thread_id = thread.local_thread_id orelse continue;
+            if (std.mem.eql(u8, base_thread_id, thread_id)) return thread;
+        }
+        return null;
+    }
+    return null;
+}
+
+/// Carry live composer attachments into a refresh snapshot by identity.
+///
+/// Draft attachments merge by recency, not flush ordering: an image attached
+/// moments before `dirty` cleared must survive a refresh whose snapshot was
+/// captured before the flush landed. The dirty-gated local-edit merge misses
+/// exactly that window, so this runs on every refresh and keeps the live
+/// values whenever they differ from the last applied baseline — a genuine
+/// local edit the snapshot cannot know about yet. When live matches the
+/// baseline the snapshot applies untouched, so an explicit remote clear (or
+/// change) from another client stays authoritative. Runs before the baseline
+/// clone (same rationale as the presentation patch above).
+fn overlayLiveDraftAttachmentsInPersisted(
+    arena: std.mem.Allocator,
+    controller: *project_controller.State,
+    baseline: ?*const PersistedState,
+    persisted: *PersistedState,
+) !void {
+    if (persisted.projects.len == 0) return;
+    // The durable-projection branch shares the snapshot owner's memory, so
+    // patch shallow arena copies of the records, never the originals.
+    const projects = try arena.dupe(PersistedProject, persisted.projects);
+    var any_patched = false;
+    for (projects) |*project| {
+        const project_id = project.id orelse continue;
+        const live_project = projectByIdForViewport(controller, project_id) orelse continue;
+        const persisted_threads = project.threads orelse continue;
+        const threads = try arena.dupe(PersistedThread, persisted_threads);
+        var thread_patched = false;
+        for (threads) |*thread| {
+            const thread_id = thread.local_thread_id orelse continue;
+            const live_thread = threadByIdForViewport(live_project, thread_id) orelse continue;
+            const live_primary: ?db_types.PersistedImageAttachment = if (live_thread.draft_image) |image| .{
+                .path = try arena.dupe(u8, image.path),
+                .mime = try arena.dupe(u8, image.mime),
+                .byte_size = image.byte_size,
+            } else null;
+            var live_extras: []db_types.PersistedImageAttachment = &.{};
+            if (live_thread.draft_extra_images.items.len != 0) {
+                live_extras = try arena.alloc(
+                    db_types.PersistedImageAttachment,
+                    live_thread.draft_extra_images.items.len,
+                );
+                for (live_thread.draft_extra_images.items, 0..) |image, index| {
+                    live_extras[index] = .{
+                        .path = try arena.dupe(u8, image.path),
+                        .mime = try arena.dupe(u8, image.mime),
+                        .byte_size = image.byte_size,
+                    };
+                }
+            }
+            if (optionalImageEqual(thread.draft_image, live_primary) and
+                imageListEqual(thread.draft_extra_images, live_extras))
+            {
+                continue;
+            }
+            // Live equal to the baseline means no local edit since the last
+            // applied refresh: the snapshot's differing value is a legitimate
+            // remote change (or clear) and must win. A missing baseline is
+            // conservative — never drop an attachment through a bootstrap.
+            if (baselineThreadForAttachments(baseline, project_id, thread_id)) |base_thread| {
+                if (optionalImageEqual(base_thread.draft_image, live_primary) and
+                    imageListEqual(base_thread.draft_extra_images, live_extras))
+                {
+                    continue;
+                }
+            }
+            thread.draft_image = live_primary;
+            thread.draft_extra_images = live_extras;
+            thread_patched = true;
+        }
+        if (!thread_patched) continue;
+        project.threads = threads;
+        any_patched = true;
+    }
+    if (any_patched) persisted.projects = projects;
+}
+
+test "daemon projection replacement preserves live runtime by identity" {
+    const allocator = std.testing.allocator;
+    var current: project_controller.State = .{};
+    defer {
+        for (current.projects.items) |*project| project.deinit(allocator);
+        current.projects.deinit(allocator);
+    }
+    var replacement: project_controller.State = .{};
+    defer {
+        for (replacement.projects.items) |*project| project.deinit(allocator);
+        replacement.projects.deinit(allocator);
+    }
+
+    var current_project = try project_state.Project.init(allocator, "viewport-project", "Current", "/tmp/current", 0);
+    current.projects.append(allocator, current_project) catch |err| {
+        current_project.deinit(allocator);
+        return err;
+    };
+    const current_thread = &current.projects.items[0].threads.items[0];
+    current_thread.persisted_message_offset = 0;
+    try current_thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "hydrated older row"),
+        .message_id = try allocator.dupe(u8, "message:older"),
+    });
+    try current_thread.messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Assistant"),
+        .body = try allocator.dupeZ(u8, "stable tail row"),
+        .message_id = try allocator.dupe(u8, "message:tail"),
+    });
+    current_thread.transcript_scroll_valid = true;
+    current_thread.transcript_scroll_y = 840.0;
+    current_thread.transcript_layout_width = 960.0;
+    current_thread.transcript_layout_message_count = 1;
+    current_thread.transcript_layout_committed_height = 280.0;
+    current_thread.transcript_layout_visible_ready = true;
+    try current_thread.transcript_layout_items.append(allocator, .{
+        .message_index = 0,
+        .group_end = 1,
+        .top = -280.0,
+        .height = 268.0,
+    });
+    current_thread.send_state.status = .pending;
+    current_thread.send_state.daemon_owned = true;
+    try current_thread.send_state.partial_text.appendSlice(std.heap.page_allocator, "stable stream");
+    const live_send_state = current_thread.send_state;
+    const live_title_state = current_thread.title_generation_state;
+    const pinned_pane_id = try current.projects.items[0].workspace_layout.createChatPane(allocator, 0);
+    const current_pane = current.projects.items[0].workspace_layout.paneByIdMutable(1) orelse return error.MissingChatPane;
+    current_pane.ref.chat.transcript_scroll_valid = true;
+    current_pane.ref.chat.transcript_scroll_y = 720.0;
+    // Live GUI strip state: the eased offset and reveal bookkeeping are
+    // never persisted, so only this runtime transfer can carry them. The
+    // replacement below arrives with empty strip bookkeeping and a stale
+    // persisted focus/maximize.
+    const current_layout = &current.projects.items[0].workspace_layout;
+    current_layout.focused_pane_id = 1;
+    current_layout.maximized_pane_id = null;
+    current_layout.scroll_offset_x = 480.0;
+    current_layout.scroll_target_x = 480.0;
+    current_layout.scroll_revealed_pane_id = 1;
+
+    var next_project = try project_state.Project.init(allocator, "viewport-project", "Replacement", "/tmp/current", 0);
+    allocator.free(next_project.threads.items[0].local_thread_id);
+    next_project.threads.items[0].local_thread_id = try allocator.dupeZ(u8, current_thread.local_thread_id);
+    next_project.threads.items[0].persisted_message_offset = 1;
+    try next_project.threads.items[0].messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Assistant"),
+        .body = try allocator.dupeZ(u8, "stable tail row"),
+        .message_id = try allocator.dupe(u8, "message:tail"),
+    });
+    try next_project.threads.items[0].messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Assistant"),
+        .body = try allocator.dupeZ(u8, "new durable tail row"),
+        .message_id = try allocator.dupe(u8, "message:new-tail"),
+    });
+    const replacement_pinned_pane_id = try next_project.workspace_layout.createChatPane(allocator, 0);
+    try std.testing.expectEqual(pinned_pane_id, replacement_pinned_pane_id);
+    replacement.projects.append(allocator, next_project) catch |err| {
+        next_project.deinit(allocator);
+        return err;
+    };
+
+    const replacement_send_state = replacement.projects.items[0].threads.items[0].send_state;
+    // Simulate a stale persisted layout: the daemon snapshot still says a
+    // (now nonexistent) pane 7 was focused and maximized, and carries no
+    // strip viewport (those fields are never persisted).
+    const stale_layout = &replacement.projects.items[0].workspace_layout;
+    stale_layout.focused_pane_id = 7;
+    stale_layout.maximized_pane_id = 7;
+    try prepareProjectionTranscriptRuntime(allocator, &current, &replacement);
+    preserveProjectionRuntime(&current, &replacement);
+
+    const next_thread = replacement.projects.items[0].threads.items[0];
+    try std.testing.expectEqual(@as(usize, 0), next_thread.persisted_message_offset);
+    try std.testing.expectEqual(@as(usize, 3), next_thread.messages.items.len);
+    try std.testing.expectEqualStrings("hydrated older row", next_thread.messages.items[0].body);
+    try std.testing.expectEqualStrings("stable tail row", next_thread.messages.items[1].body);
+    try std.testing.expectEqualStrings("new durable tail row", next_thread.messages.items[2].body);
+    try std.testing.expect(next_thread.transcript_scroll_valid);
+    try std.testing.expectEqual(@as(f32, 840.0), next_thread.transcript_scroll_y);
+    const next_pane = replacement.projects.items[0].workspace_layout.paneById(1) orelse return error.MissingChatPane;
+    try std.testing.expect(next_pane.ref.chat.transcript_scroll_valid);
+    try std.testing.expectEqual(@as(f32, 720.0), next_pane.ref.chat.transcript_scroll_y);
+    const next_pinned_pane = replacement.projects.items[0].workspace_layout.paneById(pinned_pane_id) orelse return error.MissingChatPane;
+    try std.testing.expect(!next_pinned_pane.ref.chat.transcript_scroll_valid);
+    try std.testing.expectEqual(@as(f32, 0.0), next_pinned_pane.ref.chat.transcript_scroll_y);
+    try std.testing.expectEqual(live_send_state, next_thread.send_state);
+    try std.testing.expectEqual(replacement_send_state, current.projects.items[0].threads.items[0].send_state);
+    try std.testing.expectEqualStrings("stable stream", next_thread.send_state.partial_text.items);
+    try std.testing.expectEqual(live_title_state, next_thread.title_generation_state);
+    try std.testing.expectEqual(@as(usize, 1), next_thread.transcript_layout_items.items.len);
+    try std.testing.expectEqual(@as(f32, 960.0), next_thread.transcript_layout_width);
+    try std.testing.expectEqual(@as(f32, 280.0), next_thread.transcript_layout_committed_height);
+    try std.testing.expect(next_thread.transcript_layout_visible_ready);
+    try std.testing.expectEqual(@as(usize, 1), countProjectionActiveSends(&replacement));
+    // Focus-steal regression: the never-persisted strip runtime is carried
+    // here, while the persisted presentation fields (focused/maximized/scroll
+    // target) are deliberately untouched — they reach the replacement through
+    // the patched snapshot (preserveLiveWorkspacePresentationInPersisted) so
+    // the live layout JSON stays equal to the recorded projection baseline.
+    const next_layout = &replacement.projects.items[0].workspace_layout;
+    try std.testing.expectEqual(@as(f32, 480.0), next_layout.scroll_offset_x);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), next_layout.scroll_revealed_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 7), next_layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 7), next_layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(f32, 0.0), next_layout.scroll_target_x);
+}
 
 pub fn paletteUiTextPrefixWidth(text: []const u8, font_size: f32, end: usize) f32 {
     return text_measure.textPrefixWidth(.ui, text, font_size, end);
@@ -104,6 +1725,9 @@ fn slashCommandMatchesPrefix(name: []const u8, prefix: []const u8) bool {
 
 pub const SurfaceStatus = surface_controller.SurfaceStatus;
 pub const SurfaceUpdate = surface_controller.SurfaceUpdate;
+pub const SurfaceDurability = surface_controller.SurfaceDurability;
+pub const SurfaceCommitProof = state_storage.SurfaceCommitProof;
+pub const SurfaceCommitProofClassification = state_storage.SurfaceCommitProofClassification;
 pub const SurfaceState = surface_controller.SurfaceState;
 pub const SurfaceProvider = db_types.SurfaceProvider;
 
@@ -204,8 +1828,9 @@ pub const BackgroundTaskActionHit = struct {
     rect: palette.Rect,
     project_index: usize,
     thread_index: usize,
-    task_index: usize,
+    task_index: ?usize,
     message_index: usize,
+    body_hash: u64,
     action: BackgroundTaskAction,
 };
 
@@ -440,7 +2065,7 @@ const COMPOSER_MODEL_PICKER_WIDTH: f32 = 430.0;
 const COMPOSER_MODEL_PICKER_RAIL_WIDTH: f32 = 52.0;
 const COMPOSER_MODEL_PICKER_Z: i32 = 1400;
 pub const COMPOSER_RUN_CONFIG_Z: i32 = 1400;
-const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode, .claude, .cursor };
+const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .claude, .cursor, .opencode };
 
 fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
     if (byte_offset >= text.len) return .{ .byte_len = 0, .width = 0.0 };
@@ -646,7 +2271,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
         },
         .submitted => {
             if (state.currentThread().isSendPendingForUi()) {
-                if (state.currentThread().provider == .codex) {
+                if (state.currentThread().provider == .codex or state.currentThread().provider == .claude) {
                     state.queueDraftDuringSend();
                 } else {
                     state.setSidebarNotice("This thread is still running. Press Tab to queue a follow-up.");
@@ -670,8 +2295,9 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
         .reasoning_changed => |index| {
             const thread = state.currentThreadMutable();
             if (thread.provider == .codex) {
-                if (index >= CODEX_REASONING_OPTIONS.len) return;
-                const next = CODEX_REASONING_OPTIONS[index].value;
+                const options = codexReasoningOptions(thread.model_ref);
+                if (index >= options.len) return;
+                const next = options[index].value;
                 const changed = if (next) |value|
                     thread.reasoning_effort == null or thread.reasoning_effort.? != value
                 else
@@ -1013,6 +2639,9 @@ pub const PaletteModelPicker = palette.richPicker(.{
     .row_height_with_description = 50.0,
     .header_row_height = 26.0,
     .max_body_height = 380.0,
+    // Five model rows stay visible while longer provider lists scroll within
+    // the same popover, preserving pointer and keyboard focus across filters.
+    .fixed_body_height = 250.0,
     .padding_x = 10.0,
     .padding_y = 10.0,
     .row_padding_x = 10.0,
@@ -1111,8 +2740,9 @@ fn runStepperStateFromContext(context: ?*anyopaque) ?struct { state: *AppState, 
 
 fn runReasoningStepLabel(state: *const AppState, index: usize) []const u8 {
     if (state.currentThread().provider == .codex) {
-        if (index >= CODEX_REASONING_OPTIONS.len) return "";
-        return CODEX_REASONING_OPTIONS[index].label;
+        const options = codexReasoningOptions(state.currentThread().model_ref);
+        if (index >= options.len) return "";
+        return options[index].label;
     }
     const rows = state.opencode_reasoning_menu.items;
     if (index >= rows.len) return "";
@@ -1132,8 +2762,9 @@ fn reasoningEffortStepDescription(effort: ?ReasoningEffort) []const u8 {
 
 fn runReasoningStepDescription(state: *const AppState, index: usize) []const u8 {
     if (state.currentThread().provider == .codex) {
-        if (index >= CODEX_REASONING_OPTIONS.len) return "";
-        return reasoningEffortStepDescription(CODEX_REASONING_OPTIONS[index].value);
+        const options = codexReasoningOptions(state.currentThread().model_ref);
+        if (index >= options.len) return "";
+        return reasoningEffortStepDescription(options[index].value);
     }
     const rows = state.opencode_reasoning_menu.items;
     if (index >= rows.len) return "";
@@ -1238,6 +2869,7 @@ const PersistedProject = db_types.PersistedProject;
 const PersistedState = db_types.PersistedState;
 const PersistedSurfaceState = db_types.PersistedSurfaceState;
 const PersistedThread = db_types.PersistedThread;
+const LoadedPersistedState = db_types.LoadedState;
 
 // `utils.zig` owns the cross-cutting runtime helpers that are shared with the UI shell.
 const SendWorkerRequest = utils.SendWorkerRequest;
@@ -1269,6 +2901,7 @@ const cursorReasoningValueLabel = provider_models.cursorReasoningValueLabel;
 const parseReasoningEffort = provider_models.parseReasoningEffort;
 const claudeEffortValueLabel = provider_models.claudeEffortValueLabel;
 const reasoningEffortDisplayLabel = provider_models.reasoningEffortDisplayLabel;
+const codexReasoningOptions = provider_models.codexReasoningOptions;
 pub const ReasoningOption = provider_models.ReasoningOption;
 const FastModeOption = provider_models.FastModeOption;
 const AccessModeOption = provider_models.AccessModeOption;
@@ -1276,8 +2909,62 @@ const AccessModeOption = provider_models.AccessModeOption;
 pub const TranscriptMarkdownBody = chat_types.TranscriptMarkdownBody;
 const TranscriptHeightEntry = chat_types.TranscriptHeightEntry;
 
+/// Async older-page transcript hydration (flush-worker pattern): the render
+/// path requests a page, a worker thread loads it through its own read-only
+/// DB connection, and the frame loop commits it — atomically, into the
+/// workspace/thread the request identified (which may be an unfocused pane's
+/// thread, not the current selection).
+const TranscriptHydration = struct {
+    /// Selection generation stamped into every request; bumped on real
+    /// (user-driven) project/thread selection changes so a slow load for a
+    /// previous selection is dropped instead of committing stale rows. The
+    /// render-path pane thread swap must NOT bump this — unfocused pane
+    /// requests are expected to outlive the swap and commit by identity.
+    generation: u64 = 0,
+    in_flight: bool = false,
+    worker: ?std.Thread = null,
+    args: ?*TranscriptHydrationArgs = null,
+};
+
+const TranscriptHydrationArgs = struct {
+    allocator: std.mem.Allocator,
+    storage: *const Storage,
+    workspace_id: []u8,
+    local_thread_id: []u8,
+    before_offset: usize,
+    limit: usize,
+    generation: u64,
+    // Worker output, readable after `done` is acquired.
+    page: ?db_types.LoadedMessagePage = null,
+    failed: bool = false,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn deinitAndDestroy(self: *TranscriptHydrationArgs) void {
+        if (self.page) |*loaded| loaded.deinit();
+        self.allocator.free(self.workspace_id);
+        self.allocator.free(self.local_thread_id);
+        self.allocator.destroy(self);
+    }
+};
+
+fn transcriptHydrationWorkerMain(args: *TranscriptHydrationArgs) void {
+    args.page = args.storage.loadMessagePage(
+        args.allocator,
+        args.workspace_id,
+        args.local_thread_id,
+        args.before_offset,
+        args.limit,
+    ) catch blk: {
+        args.failed = true;
+        break :blk null;
+    };
+    args.done.store(true, .release);
+}
+
 pub const TranscriptMarkdownSelectionPoint = transcript_controller.MarkdownSelectionPoint;
 pub const TranscriptMarkdownSelection = transcript_controller.MarkdownSelection;
+pub const TranscriptPresentationIdentity = transcript_controller.TranscriptPresentationIdentity;
+pub const shouldPresentTranscriptImmediately = transcript_controller.shouldPresentTranscriptImmediately;
 
 pub const OPENCODE_MODEL_OPTIONS = provider_models.OPENCODE_MODEL_OPTIONS;
 pub const CODEX_MODEL_OPTIONS = provider_models.CODEX_MODEL_OPTIONS;
@@ -1356,6 +3043,7 @@ pub const BrowserOpenResult = browser_controller.BrowserOpenResult;
 
 pub const OpenChatResult = workspace_controller.OpenChatResult;
 pub const OpenChatRequest = workspace_controller.OpenChatRequest;
+pub const PresentChatRequest = workspace_controller.PresentChatRequest;
 
 pub const BrowserScreenshotResult = browser_controller.BrowserScreenshotResult;
 pub const BrowserTabIndicator = browser_controller.BrowserTabIndicator;
@@ -1417,6 +3105,9 @@ const herdrUiFailureMessage = herdr_controller.herdrUiFailureMessage;
 pub const Project = project_state.Project;
 
 pub const Storage = state_storage.Storage;
+/// M5-P4 Amendment 1: display-time filter for committed background
+/// bookkeeping rows (see chat_controller.shouldHideBackgroundTranscriptRow).
+pub const shouldHideBackgroundTranscriptRow = chat_controller.shouldHideBackgroundTranscriptRow;
 
 pub const SendStatus = chat_types.SendStatus;
 pub const FollowupKind = chat_types.FollowupKind;
@@ -1443,6 +3134,15 @@ pub const SidebarThreadHover = struct {
     thread_index: usize,
 };
 
+pub const WorkspaceSwitchTrace = struct {
+    sequence: u64,
+    target_index: usize,
+    input_sdl_timestamp_ns: u64,
+    input_arrival_monotonic_ns: i128,
+    last_stage_monotonic_ns: i128,
+    render_attempt: u32 = 0,
+};
+
 pub const SidebarContextMenuKind = enum {
     none,
     project,
@@ -1467,15 +3167,25 @@ pub const AppState = struct {
     storage: *const Storage,
     project_controller: project_controller.State,
     surface_controller: surface_controller.State,
+    acknowledgement_controller: acknowledgement_controller.State = .{},
     import_path_storage: [DRAFT_CAPACITY:0]u8,
     rename_storage: [256:0]u8,
     sidebar_notice_storage: [256:0]u8,
+    close_durability_notice: bool = false,
     import_thread_id_storage: [256:0]u8,
     import_notice_storage: [256:0]u8,
     herdr_controller: herdr_controller.State,
     sidebar_collapsed: bool,
     sidebar_hidden: bool,
     sidebar_hover_revealed: bool,
+    /// Held Alt exposes small, non-layout-affecting shortcut key tips beside
+    /// visible controls that own a plain Alt binding.
+    alt_shortcut_hints_visible: bool,
+    /// Held Ctrl exposes pane-selection key tips in the selected workspace's
+    /// expanded sidebar list.
+    ctrl_shortcut_hints_visible: bool,
+    /// Distinguishes Ctrl+Shift ACTIVE-row hints from plain Ctrl pane hints.
+    shift_shortcut_hints_visible: bool,
     composer_controller: ComposerControllerState,
     companion_controller: companion_controller,
     companion_composer: CompanionComposerPrompt,
@@ -1490,6 +3200,11 @@ pub const AppState = struct {
     card_toggle_hits: std.ArrayList(CardToggleHit),
     background_task_action_hits: std.ArrayList(BackgroundTaskActionHit),
     expanded_cards: std.AutoHashMap(u64, bool),
+    // Bumped on every card expand/collapse so per-frame layout variant hashing
+    // can compare one counter instead of iterating the map.
+    expanded_cards_revision: u64,
+    pending_ui_snapshot_cache: chat_types.PendingUiSnapshotCache,
+    transcript_hydration: TranscriptHydration,
     palette_modal_text_focus: PaletteModalTextFocus,
     gl_texture_uploads_enabled: bool,
     browser_textures_enabled: bool,
@@ -1589,6 +3304,21 @@ pub const AppState = struct {
     /// a focused SDL close event back to Verde even though the user only opened
     /// the workspace folder.
     external_open_close_suppress_until_ms: i64,
+    /// M5-P4 change-cursor thread bridge (worker + coalesced signals).
+    /// Defaulted so the loop lazily starts from the first pollSend frame.
+    change_cursor_loop: ChangeCursorLoopState = .{},
+    /// One warn per failure streak from the per-frame lazy spawn path.
+    change_cursor_spawn_failure_logged: bool = false,
+    /// Edge detector for the daemon-projection stale sidebar indicator.
+    daemon_projection_stale_notified: bool = false,
+    /// Dedicated synchronization status, independent of generic notices.
+    daemon_projection_stale: bool = false,
+    daemon_projection_bootstrap_started_at_ms: i64 = 0,
+    daemon_projection_has_saved_state: bool = false,
+    workspace_switch_trace_next_sequence: u64 = 1,
+    workspace_switch_trace_input: ?WorkspaceSwitchTrace = null,
+    workspace_switch_trace_pending: ?WorkspaceSwitchTrace = null,
+    workspace_switch_frame_pending: bool = false,
 
     pub const InitOptions = struct {
         gl_texture_uploads_enabled: bool = true,
@@ -1620,6 +3350,9 @@ pub const AppState = struct {
             .sidebar_collapsed = false,
             .sidebar_hidden = false,
             .sidebar_hover_revealed = false,
+            .alt_shortcut_hints_visible = false,
+            .ctrl_shortcut_hints_visible = false,
+            .shift_shortcut_hints_visible = false,
             .composer_controller = ComposerControllerState.init(),
             .companion_controller = companion_controller.init(),
             .companion_composer = CompanionComposerPrompt.init(),
@@ -1634,6 +3367,9 @@ pub const AppState = struct {
             .card_toggle_hits = .empty,
             .background_task_action_hits = .empty,
             .expanded_cards = std.AutoHashMap(u64, bool).init(allocator),
+            .expanded_cards_revision = 0,
+            .pending_ui_snapshot_cache = .{},
+            .transcript_hydration = .{},
             .palette_modal_text_focus = .none,
             .gl_texture_uploads_enabled = options.gl_texture_uploads_enabled,
             .browser_textures_enabled = options.browser_textures_enabled,
@@ -1711,13 +3447,65 @@ pub const AppState = struct {
         };
         state.composer_controller.composer.setCallbacks(.{});
 
+        var pending_spool = try storage.loadPendingStateSpool(allocator);
+        defer if (pending_spool) |*spool| spool.deinit();
         if (try storage.load(allocator)) |persisted_value| {
             var persisted = persisted_value;
             defer persisted.deinit();
+            var projection_baseline = try persistence.clonePersistedBaseline(allocator, persisted.value);
+            errdefer projection_baseline.deinit();
+            if (pending_spool) |*spool| {
+                if (spool.value.baseline) |baseline| {
+                    if (spool.value.baseline_revision == spool.value.capture_revision) {
+                        try mergeCurrentLocalEdits(
+                            persisted.allocator(),
+                            &persisted.value,
+                            baseline,
+                            spool.value.current,
+                        );
+                    } else {
+                        try preserveCurrentIdentitiesWithoutBaseline(
+                            persisted.allocator(),
+                            &persisted.value,
+                            spool.value.current,
+                        );
+                    }
+                } else {
+                    try preserveCurrentIdentitiesWithoutBaseline(
+                        persisted.allocator(),
+                        &persisted.value,
+                        spool.value.current,
+                    );
+                }
+            }
             try state.applyPersisted(persisted.value);
+            state.lifecycle.projection_baseline = projection_baseline;
+            state.lifecycle.projection_baseline_revision = storage.currentProjectionObservedRevision();
+            state.daemon_projection_has_saved_state = true;
+            if (pending_spool) |*spool| {
+                try chat_controller.restorePendingAdoptionRepairs(spool.value.adoption_repairs);
+                state.lifecycle.markDirty(platform_runtime.unixTimestampMs());
+                state.lifecycle.dirty_spooled = true;
+            }
+        } else if (pending_spool) |*spool| {
+            try state.applyPersisted(spool.value.current);
+            state.lifecycle.projection_baseline = LoadedPersistedState.init(allocator);
+            state.lifecycle.projection_baseline_revision = storage.currentProjectionObservedRevision();
+            try chat_controller.restorePendingAdoptionRepairs(spool.value.adoption_repairs);
+            state.lifecycle.markDirty(platform_runtime.unixTimestampMs());
+            state.lifecycle.dirty_spooled = true;
+            state.daemon_projection_has_saved_state = true;
         } else {
+            // A genuinely empty durable store still has a valid revision-0
+            // baseline. Seed local defaults only after pairing that empty
+            // projection so their first save is a proven local addition.
+            state.lifecycle.projection_baseline = LoadedPersistedState.init(allocator);
+            state.lifecycle.projection_baseline_revision = storage.currentProjectionObservedRevision();
             try state.seedDefaultState();
         }
+        // Reattach daemon-owned turns before the asynchronous projection loop
+        // starts. The composite snapshot remains authoritative for durable
+        // state, but a live turn must be visible immediately after relaunch.
         state.restoreDaemonChatTurnsOnLaunch();
         state.loadCursorModelOptionsDiskCache() catch |err| {
             log.warn("failed to load Cursor model cache: {s}", .{@errorName(err)});
@@ -2126,18 +3914,137 @@ pub const AppState = struct {
 
     pub fn selectProjectAtIndex(self: *AppState, index: usize) bool {
         if (index >= self.project_controller.projects.items.len) return false;
+        const switch_started_ms = platform_runtime.unixTimestampMs();
+        const hydration_generation_before_focus = self.transcriptHydrationGeneration();
+        defer {
+            const elapsed_ms = platform_runtime.unixTimestampMs() - switch_started_ms;
+            if (elapsed_ms > 50) {
+                log.warn("SDL thread stall operation=workspace switch elapsed_ms={d} target_index={d}", .{ elapsed_ms, index });
+            }
+        }
         self.blurCompanionComposer();
         self.project_controller.selected_index = index;
         self.ensureCurrentProjectWorkspace();
         self.restorePersistedBrowserPaneAfterProjectSelection(index);
         const focused_pane_id = self.project_controller.projects.items[index].workspace_layout.focused_pane_id;
-        if (focused_pane_id) |pane_id| _ = self.focusWorkspacePane(index, pane_id);
+        if (focused_pane_id) |pane_id| _ = self.restoreWorkspacePaneFocus(index, pane_id);
+        if (self.transcriptHydrationGeneration() == hydration_generation_before_focus) self.noteTranscriptSelectionChanged();
+        if (focused_pane_id) |pane_id| self.prepareTranscriptPaneFocus(index, pane_id);
         self.workspace_header_open_menu_open = false;
         self.workspace_header_open_menu_pane_id = null;
         self.sidebar_context_menu_open = false;
         self.syncRenameBuffer();
-        self.markDirty();
+        self.markSelectionDirty(index);
+        self.noteWorkspaceSwitchApplied(index);
         return true;
+    }
+
+    /// Captures the SDL timestamp and main-thread arrival for a workspace hotkey.
+    pub fn noteWorkspaceSwitchInput(self: *AppState, target_index: usize, sdl_timestamp_ns: u64, arrival_monotonic_ns: i128) void {
+        if (self.workspace_switch_trace_pending) |pending| {
+            runtime_log.diagnostic(
+                "workspace-switch-trace seq={d} stage=superseded target_index={d} by_seq={d}",
+                .{ pending.sequence, pending.target_index, self.workspace_switch_trace_next_sequence },
+            );
+        }
+        const trace: WorkspaceSwitchTrace = .{
+            .sequence = self.nextWorkspaceSwitchTraceSequence(),
+            .target_index = target_index,
+            .input_sdl_timestamp_ns = sdl_timestamp_ns,
+            .input_arrival_monotonic_ns = arrival_monotonic_ns,
+            .last_stage_monotonic_ns = arrival_monotonic_ns,
+        };
+        self.workspace_switch_trace_input = trace;
+        runtime_log.diagnostic(
+            "workspace-switch-trace seq={d} stage=input_receipt target_index={d} sdl_timestamp_ns={d} arrival_monotonic_ns={d}",
+            .{ trace.sequence, target_index, sdl_timestamp_ns, arrival_monotonic_ns },
+        );
+    }
+
+    pub fn workspaceSwitchFramePending(self: *const AppState) bool {
+        return self.workspace_switch_frame_pending;
+    }
+
+    pub fn pendingWorkspaceSwitchTrace(self: *const AppState) ?WorkspaceSwitchTrace {
+        return self.workspace_switch_trace_pending;
+    }
+
+    pub fn noteWorkspaceSwitchStage(self: *AppState, comptime stage: []const u8) void {
+        const trace = &(self.workspace_switch_trace_pending orelse return);
+        const now_ns = profiler.nowNs();
+        const stage_ns: u64 = if (now_ns > trace.last_stage_monotonic_ns) @intCast(now_ns - trace.last_stage_monotonic_ns) else 0;
+        const total_ns: u64 = if (now_ns > trace.input_arrival_monotonic_ns) @intCast(now_ns - trace.input_arrival_monotonic_ns) else 0;
+        runtime_log.diagnostic(
+            "workspace-switch-trace seq={d} stage=" ++ stage ++ " target_index={d} stage_ms={d:.2} elapsed_from_arrival_ms={d:.2}",
+            .{ trace.sequence, trace.target_index, profiler.nsToMs(stage_ns), profiler.nsToMs(total_ns) },
+        );
+        trace.last_stage_monotonic_ns = now_ns;
+    }
+
+    pub fn noteWorkspaceSwitchRenderStarted(self: *AppState) void {
+        const trace = &(self.workspace_switch_trace_pending orelse return);
+        trace.render_attempt +|= 1;
+        runtime_log.diagnostic(
+            "workspace-switch-trace seq={d} stage=render_start target_index={d} attempt={d}",
+            .{ trace.sequence, trace.target_index, trace.render_attempt },
+        );
+    }
+
+    pub fn noteWorkspaceSwitchPresentDeferred(self: *const AppState) void {
+        const trace = self.workspace_switch_trace_pending orelse return;
+        runtime_log.diagnostic(
+            "workspace-switch-trace seq={d} stage=present_deferred target_index={d} attempt={d} reason=no_swapchain_texture",
+            .{ trace.sequence, trace.target_index, trace.render_attempt },
+        );
+    }
+
+    pub fn noteWorkspaceSwitchPresented(self: *AppState) void {
+        const trace = self.workspace_switch_trace_pending orelse return;
+        runtime_log.diagnostic(
+            "workspace-switch-trace seq={d} stage=present_submit_complete target_index={d} attempt={d} elapsed_from_arrival_ms={d:.2}",
+            .{
+                trace.sequence,
+                trace.target_index,
+                trace.render_attempt,
+                profiler.nsToMs(profiler.elapsedNs(trace.input_arrival_monotonic_ns)),
+            },
+        );
+        self.workspace_switch_trace_pending = null;
+        self.workspace_switch_frame_pending = false;
+    }
+
+    fn nextWorkspaceSwitchTraceSequence(self: *AppState) u64 {
+        const sequence = self.workspace_switch_trace_next_sequence;
+        self.workspace_switch_trace_next_sequence +%= 1;
+        if (self.workspace_switch_trace_next_sequence == 0) self.workspace_switch_trace_next_sequence = 1;
+        return sequence;
+    }
+
+    fn noteWorkspaceSwitchApplied(self: *AppState, index: usize) void {
+        var trace = if (self.workspace_switch_trace_input) |input| blk: {
+            self.workspace_switch_trace_input = null;
+            break :blk input;
+        } else blk: {
+            const now_ns = profiler.nowNs();
+            break :blk WorkspaceSwitchTrace{
+                .sequence = self.nextWorkspaceSwitchTraceSequence(),
+                .target_index = index,
+                .input_sdl_timestamp_ns = 0,
+                .input_arrival_monotonic_ns = now_ns,
+                .last_stage_monotonic_ns = now_ns,
+            };
+        };
+        trace.target_index = index;
+        self.workspace_switch_trace_pending = trace;
+        self.workspace_switch_frame_pending = true;
+        runtime_log.diagnostic(
+            "workspace-switch-trace seq={d} stage=selection_applied target_index={d} selected_index={d}",
+            .{ trace.sequence, index, self.project_controller.selected_index },
+        );
+        runtime_log.diagnostic(
+            "workspace-switch-trace seq={d} stage=frame_scheduled target_index={d} reason=selection_pending",
+            .{ trace.sequence, index },
+        );
     }
 
     pub fn selectAdjacentProject(self: *AppState, direction: isize) bool {
@@ -2810,7 +4717,6 @@ pub const AppState = struct {
         removed.archived = true;
         removed.terminal_dock.visible = false;
         self.project_controller.archived_projects.appendAssumeCapacity(removed);
-        self.reconcileBrowserRuntimeAfterPaneRemoval(index, closed_active_browser);
 
         if (self.project_controller.projects.items.len == 0) {
             self.project_controller.selected_index = 0;
@@ -2958,9 +4864,10 @@ pub const AppState = struct {
         self.focusProjectThreadInWorkspace(project_index, thread_index) catch |err| {
             log.err("failed to focus selected thread workspace pane: {s}", .{@errorName(err)});
         };
+        self.noteTranscriptSelectionChanged();
+        if (project.workspace_layout.focused_pane_id) |pane_id| self.prepareTranscriptPaneFocus(project_index, pane_id);
         self.requestComposerFocus();
         self.syncRenameBuffer();
-        self.requestTranscriptScrollToBottom();
         self.markDirty();
     }
 
@@ -2971,7 +4878,8 @@ pub const AppState = struct {
         var layout = &project.workspace_layout;
         _ = try layout.ensureDefaultChat(self.allocator);
 
-        var chat_pane_id = layout.retargetPreferredChatPane(thread_index);
+        var chat_pane_id = layout.visibleChatPaneIdForThread(thread_index) orelse
+            layout.retargetPreferredChatPane(thread_index);
         var created_pane = false;
 
         if (chat_pane_id == null) {
@@ -2986,11 +4894,22 @@ pub const AppState = struct {
             created_pane = true;
         }
 
+        const preserve_viewport = layout.maximized_pane_id != null;
         if (created_pane) {
             layout.focusCreatedPane(chat_pane_id.?);
-        } else {
+        } else if (layout.focused_pane_id != chat_pane_id) {
+            const was_maximized = layout.maximized_pane_id != null;
             layout.focused_pane_id = chat_pane_id;
-            layout.maximized_pane_id = null;
+            if (was_maximized) layout.maximized_pane_id = chat_pane_id;
+        }
+        if (preserve_viewport) {
+            layout.scroll_leading_pane_id = null;
+            layout.scroll_revealed_pane_id = chat_pane_id.?;
+        } else if (!created_pane) {
+            // Current viewport geometry belongs to the renderer. Clear an old
+            // explicit-leading request and let the next strip render decide
+            // whether this existing pane needs a bounded reveal at all.
+            layout.scroll_leading_pane_id = null;
         }
         project.selected_thread_index = thread_index;
         self.terminal_controller.focused = false;
@@ -3012,12 +4931,15 @@ pub const AppState = struct {
     pub const queueDraftDuringSend = chat_controller.queueDraftDuringSend;
     pub const storeDraftDuringSend = chat_controller.storeDraftDuringSend;
     pub const pendingFollowupSnapshot = chat_controller.pendingFollowupSnapshot;
+    pub const pendingFollowupSnapshotCached = chat_controller.pendingFollowupSnapshotCached;
     pub const pendingFollowupHint = chat_controller.pendingFollowupHint;
     pub const sendPromptViaHarness = chat_controller.sendPromptViaHarness;
     pub const interruptThreadViaHarness = chat_controller.interruptThreadViaHarness;
     pub const steerThreadViaHarness = chat_controller.steerThreadViaHarness;
+    pub const steerDaemonChatTurn = chat_controller.steerDaemonChatTurn;
     pub const beginSendForThread = chat_controller.beginSendForThread;
     pub const beginSendForThreadWithReadyDaemon = chat_controller.beginSendForThreadWithReadyDaemon;
+    pub const dispatchDaemonAcceptance = chat_controller.dispatchDaemonAcceptance;
     pub const beginSendDraft = chat_controller.beginSendDraft;
     pub const ensureSessionDaemon = chat_controller.ensureSessionDaemon;
     pub const startDaemonChatTurn = chat_controller.startDaemonChatTurn;
@@ -3026,13 +4948,51 @@ pub const AppState = struct {
     pub const approveDaemonChatTurn = chat_controller.approveDaemonChatTurn;
     pub const consumeDaemonChatTurn = chat_controller.consumeDaemonChatTurn;
     pub const restoreDaemonChatTurnsOnLaunch = chat_controller.restoreDaemonChatTurnsOnLaunch;
+    pub const applyDaemonChatTurnsSnapshot = chat_controller.applyDaemonChatTurnsSnapshot;
+    pub const validateAdoptionRepairsForRefresh = chat_controller.validateAdoptionRepairsForRefresh;
+    pub const clearValidatedAdoptionRepairs = chat_controller.clearValidatedAdoptionRepairs;
+    pub const pendingAdoptionRepairsSnapshot = chat_controller.pendingAdoptionRepairsSnapshot;
+    pub const hasUnresolvedAdoptionRows = chat_controller.hasUnresolvedAdoptionRows;
+    pub const reconcileTerminalDaemonChatTurnsSnapshot = chat_controller.reconcileTerminalDaemonChatTurnsSnapshot;
     pub const threadByLocalId = chat_controller.threadByLocalId;
     pub const projectThreadIndexByLocalId = chat_controller.projectThreadIndexByLocalId;
+    pub const handoffDirtyStateForShutdown = lifecycle_controller.handoffDirtyStateForShutdown;
+    pub const queueChatCompletionAcknowledgement = acknowledgement_controller.queueChat;
+    pub const queueSurfaceAcknowledgement = acknowledgement_controller.queueSurface;
+    pub const containsSurfaceCompletionAcknowledgement = acknowledgement_controller.containsSurfaceCompletion;
+    pub const pollAcknowledgements = acknowledgement_controller.poll;
+    pub fn beginClosePreflight(self: *AppState) void {
+        // Let an in-flight core.changes wait drain while durability handoff is
+        // running instead of serializing that wait after the handoff.
+        self.change_cursor_loop.beginShutdown();
+    }
+
+    pub fn cancelClosePreflight(self: *AppState) void {
+        // A failed durability handoff leaves the app interactive. Retire the
+        // cancelled loop before allowing pollSend to lazily start a fresh one.
+        self.change_cursor_loop.join();
+        self.change_cursor_loop.shutdown.store(false, .release);
+    }
     pub const resolveThreadApprovalByLocalId = chat_controller.resolveThreadApprovalByLocalId;
     pub const applyPersisted = persistence.applyPersisted;
+    pub const applyDaemonSessionProjection = terminal_controller.applyDaemonSessionProjection;
     pub const restorePersistedSurfaceStates = persistence.restorePersistedSurfaceStates;
     pub const restorePersistedChatCompletions = persistence.restorePersistedChatCompletions;
     pub const buildPersistedState = persistence.buildPersistedState;
+    pub fn clonePersistedState(
+        _: *AppState,
+        backing_allocator: std.mem.Allocator,
+        source: PersistedState,
+    ) !db_types.LoadedState {
+        return persistence.clonePersistedState(backing_allocator, source);
+    }
+    pub fn clonePersistedBaseline(
+        _: *AppState,
+        backing_allocator: std.mem.Allocator,
+        source: PersistedState,
+    ) !db_types.LoadedState {
+        return persistence.clonePersistedBaseline(backing_allocator, source);
+    }
     pub const applyPersistedTerminalDocksJson = persistence.applyPersistedTerminalDocksJson;
     pub const seedDefaultState = persistence.seedDefaultState;
     pub const clearSurfaces = surface_controller.clearSurfaces;
@@ -3054,6 +5014,7 @@ pub const AppState = struct {
     pub const toggleCursorGlobalHooks = settings_controller.toggleCursorGlobalHooks;
     pub const toggleGrokGlobalHooks = settings_controller.toggleGrokGlobalHooks;
     pub const toggleAmpGlobalHooks = settings_controller.toggleAmpGlobalHooks;
+    pub const toggleOpencodeGlobalHooks = settings_controller.toggleOpencodeGlobalHooks;
     pub const toggleProviderGlobalHooks = settings_controller.toggleProviderGlobalHooks;
     pub const cancelSettingsModal = settings_controller.cancelSettingsModal;
     pub const saveSettingsModal = settings_controller.saveSettingsModal;
@@ -3109,6 +5070,7 @@ pub const AppState = struct {
     pub const handleTerminalTextInput = terminal_controller.handleTerminalTextInput;
     pub const requestTerminalFocus = terminal_controller.requestTerminalFocus;
     pub const requestTerminalDockFocus = terminal_controller.requestTerminalDockFocus;
+    pub const restoreTerminalDockFocus = terminal_controller.restoreTerminalDockFocus;
     pub const beginHandoffFromFocusedPane = handoff_controller.beginHandoffFromFocusedPane;
     pub const beginThreadHandoff = handoff_controller.beginThreadHandoff;
     pub const cancelHandoff = handoff_controller.cancelHandoff;
@@ -3126,18 +5088,34 @@ pub const AppState = struct {
     pub const commandPaletteQuery = command_controller.commandPaletteQuery;
     pub const commandPaletteQueryBuffer = command_controller.commandPaletteQueryBuffer;
     pub const flushIfDirty = lifecycle_controller.flushIfDirty;
+    pub const pollFlushWorker = lifecycle_controller.pollFlushWorker;
     pub const flushDirtyBlocking = lifecycle_controller.flushDirtyBlocking;
     pub const persistThreadBlocking = lifecycle_controller.persistThreadBlocking;
     pub const flushDirtyNow = lifecycle_controller.flushDirtyNow;
     pub const currentThreadMutable = transcript_controller.currentThreadMutable;
     pub const rememberCurrentTranscriptScroll = transcript_controller.rememberCurrentTranscriptScroll;
+    pub const clearCurrentTranscriptScroll = transcript_controller.clearCurrentTranscriptScroll;
     pub const rememberWorkspaceChatTranscriptScroll = transcript_controller.rememberWorkspaceChatTranscriptScroll;
+    pub const clearWorkspaceChatTranscriptScroll = transcript_controller.clearWorkspaceChatTranscriptScroll;
+    pub const prepareTranscriptPaneFocus = transcript_controller.prepareTranscriptPaneFocus;
+    pub const shiftCurrentTranscriptScroll = transcript_controller.shiftCurrentTranscriptScroll;
     pub const currentTranscriptScrollY = transcript_controller.currentTranscriptScrollY;
     pub const workspaceChatTranscriptScrollY = transcript_controller.workspaceChatTranscriptScrollY;
     pub const acknowledgeFocusedChatCompletion = transcript_controller.acknowledgeFocusedChatCompletion;
     pub const acknowledgeFocusedPaneCompletion = transcript_controller.acknowledgeFocusedPaneCompletion;
     pub const clearChatCompletion = transcript_controller.clearChatCompletion;
+    pub const beginTranscriptSelectionTransition = transcript_controller.beginTranscriptSelectionTransition;
+    pub const noteTranscriptPresented = transcript_controller.noteTranscriptPresented;
+    pub const currentTranscriptPresentation = transcript_controller.currentTranscriptPresentation;
+    pub const presentedTranscriptPresentation = transcript_controller.presentedTranscriptPresentation;
+    pub const transcriptTransitionTargets = transcript_controller.transcriptTransitionTargets;
+    pub const outgoingTranscriptPresentation = transcript_controller.outgoingTranscriptPresentation;
+    pub const clearOutgoingTranscriptPresentation = transcript_controller.clearOutgoingTranscriptPresentation;
+    pub const cancelTranscriptTransition = transcript_controller.cancelTranscriptTransition;
+    pub const clearPresentedTranscriptPresentation = transcript_controller.clearPresentedTranscriptPresentation;
+    pub const transcriptTransitionNeedsContinuousFrames = transcript_controller.transcriptTransitionNeedsContinuousFrames;
     pub const requestComposerFocus = composer_controller.requestComposerFocus;
+    pub const restoreComposerFocus = composer_controller.restoreComposerFocus;
     pub const consumePendingHerdrOpenRequest = herdr_controller.consumePendingHerdrOpenRequest;
     pub const openOrCreateHerdrWorkspace = herdr_controller.openOrCreateHerdrWorkspace;
     pub const handoffHerdrWorkspaces = herdr_controller.handoffHerdrWorkspaces;
@@ -3219,9 +5197,20 @@ pub const AppState = struct {
     }
 
     pub fn shouldSuppressExternalOpenCloseRequest(self: *AppState, now_ms: i64) bool {
-        if (self.external_open_close_suppress_until_ms < now_ms) return false;
-        self.external_open_close_suppress_until_ms = 0;
-        return true;
+        if (self.external_open_close_suppress_until_ms >= now_ms) {
+            self.external_open_close_suppress_until_ms = 0;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn noteCloseDurabilityFailure(self: *AppState, err: anyerror) void {
+        runtime_log.diagnostic("interactive close durability handoff failed: {s}", .{@errorName(err)});
+        self.close_durability_notice = true;
+    }
+
+    pub fn clearCloseDurabilityNotice(self: *AppState) void {
+        self.close_durability_notice = false;
     }
 
     pub fn rethemeTerminalSessions(self: *AppState) !void {
@@ -3241,7 +5230,7 @@ pub const AppState = struct {
 
     /// Selects a pane from the sidebar while keeping a maximized workspace maximized.
     pub fn focusWorkspaceOpenPaneFromSidebar(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) void {
-        self.focusWorkspaceOpenPaneWithZoom(project_index, pane_id, true, true);
+        self.focusWorkspaceOpenPaneWithZoom(project_index, pane_id, true, false);
     }
 
     /// Focuses a pane by its zero-based position in the current workspace's sidebar list.
@@ -3291,6 +5280,7 @@ pub const AppState = struct {
     fn focusWorkspaceOpenPaneWithZoom(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, preserve_zoom: bool, leading_reveal: bool) void {
         if (project_index >= self.project_controller.projects.items.len) return;
         const previous_project_index = self.project_controller.selected_index;
+        const hydration_generation_before_focus = self.transcriptHydrationGeneration();
         if (preserve_zoom and previous_project_index < self.project_controller.projects.items.len and previous_project_index != project_index) {
             const previous_layout = &self.project_controller.projects.items[previous_project_index].workspace_layout;
             if (previous_layout.quick_pane) |*quick| quick.visible = false;
@@ -3304,6 +5294,10 @@ pub const AppState = struct {
                 layout.focused_pane_id = pane_id;
                 self.restorePersistedBrowserPaneAfterProjectSelection(project_index);
                 _ = self.focusWorkspacePane(project_index, pane_id);
+                if (previous_project_index != project_index and self.transcriptHydrationGeneration() == hydration_generation_before_focus) {
+                    self.noteTranscriptSelectionChanged();
+                }
+                self.prepareTranscriptPaneFocus(project_index, pane_id);
                 self.markDirty();
                 return;
             }
@@ -3324,6 +5318,7 @@ pub const AppState = struct {
             }
         }
         const pane = target orelse return;
+        const preserve_viewport = was_maximized;
         layout.focused_pane_id = pane_id;
         layout.maximized_pane_id = if (preserve_zoom and was_maximized) pane_id else null;
         self.restorePersistedBrowserPaneAfterProjectSelection(project_index);
@@ -3337,7 +5332,18 @@ pub const AppState = struct {
             },
         }
         _ = self.focusWorkspacePane(project_index, pane_id);
-        if (leading_reveal) layout.requestLeadingScrollReveal(pane_id);
+        if (previous_project_index != project_index and self.transcriptHydrationGeneration() == hydration_generation_before_focus) {
+            self.noteTranscriptSelectionChanged();
+        }
+        self.prepareTranscriptPaneFocus(project_index, pane_id);
+        if (preserve_viewport) {
+            layout.scroll_leading_pane_id = null;
+            layout.scroll_revealed_pane_id = null;
+        } else if (leading_reveal) {
+            layout.requestLeadingScrollReveal(pane_id);
+        } else {
+            layout.scroll_revealed_pane_id = null;
+        }
         self.markDirty();
     }
 
@@ -3789,6 +5795,9 @@ pub const AppState = struct {
             hydrated.setDraft(existing.currentDraft());
             if (existing.draft_image) |image| {
                 try hydrated.setDraftImage(self.allocator, image.path, image.mime, image.byte_size);
+                for (existing.draft_extra_images.items) |extra| {
+                    try hydrated.addDraftImage(self.allocator, extra.path, extra.mime, extra.byte_size);
+                }
             }
         } else {
             hydrated.provider = .codex;
@@ -3828,6 +5837,7 @@ pub const AppState = struct {
         self.allocator.free(message.author);
         self.allocator.free(message.body);
         if (message.tool_call_id) |call_id| self.allocator.free(call_id);
+        if (message.message_id) |message_id| self.allocator.free(message_id);
         if (message.image) |image| {
             self.evictCachedImageTexture(image.path);
             var owned_image = image;
@@ -4159,7 +6169,8 @@ pub const AppState = struct {
         const thread = self.currentThread();
         if (thread.provider == .codex) {
             if (self.composerReasoningIndexForThread(thread)) |index| {
-                if (index < CODEX_REASONING_OPTIONS.len) return std.mem.sliceTo(CODEX_REASONING_OPTIONS[index].label, 0);
+                const options = codexReasoningOptions(thread.model_ref);
+                if (index < options.len) return std.mem.sliceTo(options[index].label, 0);
             }
         }
         // Menu-independent for the other providers: the shared reasoning menu
@@ -4191,8 +6202,8 @@ pub const AppState = struct {
     fn threadReasoningGauge(self: *const AppState, thread: *const ChatThread) ?ReasoningGauge {
         switch (thread.provider) {
             .codex => return .{
-                .index = composerReasoningIndexForOptions(CODEX_REASONING_OPTIONS[0..], thread.reasoning_effort) orelse 0,
-                .count = CODEX_REASONING_OPTIONS.len,
+                .index = composerReasoningIndexForOptions(codexReasoningOptions(thread.model_ref), thread.reasoning_effort) orelse 0,
+                .count = codexReasoningOptions(thread.model_ref).len,
             },
             .claude => {
                 const opt = self.claudeModelOptionForRef(thread.model_ref) orelse return null;
@@ -4453,6 +6464,325 @@ pub const AppState = struct {
         return self.currentProject().currentThread();
     }
 
+    fn transcriptPageSuffixOverlap(page: []const PersistedMessage, materialized: []const ChatMessage) usize {
+        var overlap = @min(page.len, materialized.len);
+        while (overlap > 0) : (overlap -= 1) {
+            const page_start = page.len - overlap;
+            var index: usize = 0;
+            while (index < overlap) : (index += 1) {
+                const page_id = page[page_start + index].message_id orelse break;
+                const materialized_id = materialized[index].message_id orelse break;
+                if (!std.mem.eql(u8, page_id, materialized_id)) break;
+            }
+            if (index == overlap) return overlap;
+        }
+        return 0;
+    }
+
+    /// Synchronously materialize one older durable transcript page for the
+    /// focused thread. Returns true when rows were prepended. Render paths use
+    /// requestOlderCurrentThreadMessages/pollTranscriptHydration instead so the
+    /// DB read never blocks a frame; this remains the spawn-failure fallback.
+    pub fn loadOlderCurrentThreadMessages(self: *AppState) !bool {
+        const project = self.currentProjectMutable();
+        const thread_index = project.currentThreadIndex();
+        const thread = &project.threads.items[thread_index];
+        const before_offset = thread.persisted_message_offset;
+        if (before_offset == 0) return false;
+
+        var page = try self.storage.loadMessagePage(
+            self.allocator,
+            project.id,
+            thread.local_thread_id,
+            before_offset,
+            transcriptHydrationPageLimit(thread.messages.items.len),
+        );
+        defer page.deinit();
+        return self.commitOlderTranscriptPage(project, thread_index, &page);
+    }
+
+    /// Viewport-sized first page for a cold thread, bulk pages afterwards.
+    fn transcriptHydrationPageLimit(materialized_count: usize) usize {
+        return if (materialized_count == 0)
+            db_client.TRANSCRIPT_FIRST_PAGE_SIZE
+        else
+            db_client.TRANSCRIPT_MESSAGE_PAGE_SIZE;
+    }
+
+    /// Prepend an already-loaded older durable page to the identified thread,
+    /// shifting the render caches and layout bookkeeping so scroll anchors
+    /// stay on their rows. The target is passed explicitly — it may be an
+    /// unfocused pane's thread, not the current selection. Runs on the render
+    /// thread only.
+    fn commitOlderTranscriptPage(
+        self: *AppState,
+        project: *Project,
+        thread_index: usize,
+        page: *const db_types.LoadedMessagePage,
+    ) !bool {
+        const thread = &project.threads.items[thread_index];
+        const before_offset = thread.persisted_message_offset;
+        if (before_offset == 0) return false;
+        if (page.messages.len == 0 or page.offset >= before_offset) return false;
+
+        var prepended: std.ArrayList(ChatMessage) = .empty;
+        defer prepended.deinit(self.allocator);
+        var ownership_transferred = false;
+        defer if (!ownership_transferred) {
+            for (prepended.items) |message| {
+                self.allocator.free(message.author);
+                self.allocator.free(message.body);
+                if (message.image) |owned| owned.deinit(self.allocator);
+                for (message.extra_images) |*owned| owned.deinit(self.allocator);
+                if (message.extra_images.len > 0) self.allocator.free(message.extra_images);
+                if (message.tool_call_id) |owned| self.allocator.free(owned);
+                if (message.message_id) |owned| self.allocator.free(owned);
+            }
+        };
+        // A turn tail can hydrate its durable user row while the compact
+        // projection still counts that row in persisted_message_offset. The
+        // next history page then ends with the same identity. Trim that
+        // overlap before prepending so the prompt is not shown twice until
+        // the first assistant update replaces the projection.
+        const overlap = transcriptPageSuffixOverlap(page.messages, thread.messages.items);
+        const new_messages = page.messages[0 .. page.messages.len - overlap];
+        for (new_messages) |message| {
+            const author = try self.dupeZ(message.author);
+            errdefer self.allocator.free(author);
+            const body = try self.dupeZ(message.body);
+            errdefer self.allocator.free(body);
+            const image = if (message.image) |source|
+                try ChatImageAttachment.init(self.allocator, source.path, source.mime, source.byte_size)
+            else
+                null;
+            errdefer if (image) |owned| owned.deinit(self.allocator);
+            const extra_images = try persistence.chatImageListFromPersisted(self.allocator, message.extra_images);
+            errdefer {
+                for (extra_images) |*owned| owned.deinit(self.allocator);
+                if (extra_images.len > 0) self.allocator.free(extra_images);
+            }
+            const tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id);
+            errdefer if (tool_call_id) |owned| self.allocator.free(owned);
+            const message_id = if (message.message_id) |id|
+                if (id.len == 0) null else try self.allocator.dupe(u8, id)
+            else
+                null;
+            errdefer if (message_id) |owned| self.allocator.free(owned);
+            try prepended.append(self.allocator, .{
+                .role = message.role,
+                .author = author,
+                .body = body,
+                .image = image,
+                .extra_images = extra_images,
+                .tool_call_id = tool_call_id,
+                .tool_call_kind = message.tool_call_kind,
+                .tool_call_status = message.tool_call_status,
+                .message_id = message_id,
+            });
+        }
+        try thread.messages.insertSlice(self.allocator, 0, prepended.items);
+        ownership_transferred = true;
+        const prepended_count = prepended.items.len;
+        thread.persisted_message_offset = page.offset;
+        if (thread.transcript_markdown_entries.items.len > 0) {
+            if (thread.transcript_markdown_entries.addManyAt(self.allocator, 0, prepended_count)) |slots| {
+                @memset(slots, null);
+            } else |_| {
+                // OOM degradation: the user is scrolled near the top during an
+                // older-page load, so dropping the whole cache re-renders every
+                // visible row. Instead shift entries in place toward the tail
+                // (freeing the tail overflow) so surviving slots stay aligned
+                // with their shifted messages; the empty head hydrates lazily.
+                // transcriptBodyEntryForSlot validates owned_body per slot, so
+                // any residual misalignment self-heals.
+                const entries = thread.transcript_markdown_entries.items;
+                const keep = entries.len -| prepended_count;
+                const shift = entries.len - keep;
+                for (entries[keep..]) |entry| {
+                    if (entry) |owned| owned.deinit(self.allocator);
+                }
+                std.mem.copyBackwards(?*TranscriptMarkdownBody, entries[shift..], entries[0..keep]);
+                @memset(entries[0..shift], null);
+            }
+        }
+        if (thread.transcript_height_entries.items.len > 0) {
+            if (thread.transcript_height_entries.addManyAt(self.allocator, 0, prepended_count)) |slots| {
+                @memset(slots, .{});
+            } else |_| {
+                // Same in-place shift as the markdown entries above; height
+                // entries carry no owned memory so the tail simply drops.
+                const entries = thread.transcript_height_entries.items;
+                const keep = entries.len -| prepended_count;
+                const shift = entries.len - keep;
+                std.mem.copyBackwards(TranscriptHeightEntry, entries[shift..], entries[0..keep]);
+                @memset(entries[0..shift], .{});
+            }
+        }
+        for (thread.transcript_layout_items.items) |*item| {
+            item.message_index += prepended_count;
+            item.group_end += prepended_count;
+        }
+        thread.transcript_layout_first_message_index += prepended_count;
+        // Prepending unmaterialized rows inflates the estimated transcript
+        // height by average×prepended before any of them lay out, and saved
+        // scroll offsets are top-relative in that estimate space. Shift them
+        // by the same amount so the viewport keeps the rows it was showing;
+        // otherwise every committed history page makes the view leap into the
+        // freshly prepended blank region (the "scroll jumps while paging
+        // history" bug). Same invariant as ensureTranscriptLayout's extend
+        // rebase: estimate changes outside the layout pass must rebase.
+        if (thread.transcript_layout_message_count > 0) {
+            const average_row_height = thread.transcript_layout_committed_height /
+                @as(f32, @floatFromInt(thread.transcript_layout_message_count));
+            const delta = average_row_height * @as(f32, @floatFromInt(prepended_count));
+            // Same rebase as shiftCurrentTranscriptScroll, applied to the
+            // page's target thread: the commit may land while a different
+            // thread is selected (unfocused pane hydration), so the current
+            // selection's scroll must not move.
+            if (thread.transcript_scroll_valid) {
+                thread.transcript_scroll_y = @max(thread.transcript_scroll_y + delta, 0.0);
+            }
+            project.workspace_layout.shiftChatTranscriptScrollForThread(thread_index, delta);
+        }
+        thread.transcript_layout_valid = false;
+        thread.rebuildBackgroundTasksFromMessages(self.allocator);
+        return prepended_count > 0;
+    }
+
+    /// Render-path entry: request one older durable page for the focused
+    /// thread. Returns immediately; the page loads on a worker thread (each
+    /// Storage.loadMessagePage opens its own read-only connection, so the
+    /// worker shares no DB state with the render thread) and commits in
+    /// pollTranscriptHydration. At most one request is in flight.
+    pub fn requestOlderCurrentThreadMessages(self: *AppState) void {
+        if (self.transcript_hydration.in_flight) return;
+        const project = self.currentProjectMutable();
+        const thread = project.currentThreadMutable();
+        const before_offset = thread.persisted_message_offset;
+        if (before_offset == 0) return;
+
+        const args = self.allocator.create(TranscriptHydrationArgs) catch return;
+        const workspace_id = self.allocator.dupe(u8, project.id) catch {
+            self.allocator.destroy(args);
+            return;
+        };
+        const local_thread_id = self.allocator.dupe(u8, thread.local_thread_id) catch {
+            self.allocator.free(workspace_id);
+            self.allocator.destroy(args);
+            return;
+        };
+        args.* = .{
+            .allocator = self.allocator,
+            .storage = self.storage,
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+            .before_offset = before_offset,
+            .limit = transcriptHydrationPageLimit(thread.messages.items.len),
+            .generation = self.transcript_hydration.generation,
+        };
+        const worker = std.Thread.spawn(.{}, transcriptHydrationWorkerMain, .{args}) catch {
+            // Degradation: with no worker thread available, hydrate on the
+            // render thread so history still appears instead of never loading.
+            args.deinitAndDestroy();
+            _ = self.loadOlderCurrentThreadMessages() catch |err| {
+                log.warn("failed to page older transcript rows synchronously: {s}", .{@errorName(err)});
+            };
+            return;
+        };
+        self.transcript_hydration.worker = worker;
+        self.transcript_hydration.args = args;
+        self.transcript_hydration.in_flight = true;
+    }
+
+    /// Frame-loop entry: commit a completed hydration page into the thread it
+    /// was requested for, resolved by workspace/thread identity — never by the
+    /// current selection. The render path requests pages for unfocused panes
+    /// while their thread is only temporarily swapped in, so by poll time the
+    /// selection may differ; committing by identity is what keeps those panes
+    /// from looping request→drop→re-request and rendering blank. A page for a
+    /// superseded target (generation bump on a real selection change, identity
+    /// no longer present, or offset mismatch against a prior commit) is
+    /// dropped so it commits nowhere. Returns true when rows were prepended
+    /// and a render is needed.
+    pub fn pollTranscriptHydration(self: *AppState) bool {
+        if (!self.transcript_hydration.in_flight) return false;
+        const args = self.transcript_hydration.args orelse return false;
+        if (!args.done.load(.acquire)) return false;
+        if (self.transcript_hydration.worker) |worker| worker.join();
+        self.transcript_hydration.worker = null;
+        self.transcript_hydration.args = null;
+        self.transcript_hydration.in_flight = false;
+        defer args.deinitAndDestroy();
+        if (args.failed) return false;
+        const page = if (args.page) |*loaded| loaded else return false;
+        if (args.generation != self.transcript_hydration.generation) return false;
+        const project = for (self.project_controller.projects.items) |*candidate| {
+            if (std.mem.eql(u8, candidate.id, args.workspace_id)) break candidate;
+        } else return false;
+        const thread_index = for (project.threads.items, 0..) |*candidate, index| {
+            if (std.mem.eql(u8, candidate.local_thread_id, args.local_thread_id)) break index;
+        } else return false;
+        if (project.threads.items[thread_index].persisted_message_offset != args.before_offset) return false;
+        return self.commitOlderTranscriptPage(project, thread_index, page) catch |err| {
+            log.warn("failed to commit older transcript page: {s}", .{@errorName(err)});
+            return false;
+        };
+    }
+
+    /// Invalidate any in-flight or future hydration commit for the previous
+    /// selection. Call on every focused project/thread change.
+    pub fn noteTranscriptSelectionChanged(self: *AppState) void {
+        self.transcript_hydration.generation +%= 1;
+        const target = self.currentTranscriptPresentation();
+        if (target) |identity| {
+            // A projection refresh can bump hydration while the same target is
+            // still entering. Adopt the new guard generation without replaying
+            // the fade from its beginning.
+            if (self.transcriptTransitionTargets(identity)) {
+                self.transcript_controller.transition.generation = self.transcript_hydration.generation;
+                return;
+            }
+            if (transcript_controller.shouldStartTranscriptTransition(
+                self.presentedTranscriptPresentation(),
+                identity,
+            )) {
+                self.beginTranscriptSelectionTransition(
+                    self.transcript_hydration.generation,
+                    platform_runtime.unixTimestampMs(),
+                    identity,
+                );
+                return;
+            }
+        }
+
+        // Pane/project focus and stable-thread projection changes present the
+        // resident transcript directly. Clearing the prior presentation also
+        // prevents a second selection before the next frame from fading content
+        // that this pane never displayed.
+        const target_matches_presented = if (target) |identity|
+            if (self.presentedTranscriptPresentation()) |presented|
+                transcript_controller.sameTranscriptPresentation(presented, identity)
+            else
+                false
+        else
+            false;
+        self.cancelTranscriptTransition();
+        if (!target_matches_presented) self.clearPresentedTranscriptPresentation();
+    }
+
+    pub fn transcriptHydrationGeneration(self: *const AppState) u64 {
+        return self.transcript_hydration.generation;
+    }
+
+    /// Shutdown: join an in-flight hydration worker and drop its result.
+    fn finishTranscriptHydrationWorker(self: *AppState) void {
+        if (self.transcript_hydration.worker) |worker| worker.join();
+        self.transcript_hydration.worker = null;
+        if (self.transcript_hydration.args) |args| args.deinitAndDestroy();
+        self.transcript_hydration.args = null;
+        self.transcript_hydration.in_flight = false;
+    }
+
     pub fn isSidebarCollapsed(self: *const AppState) bool {
         return self.sidebar_collapsed;
     }
@@ -4584,6 +6914,8 @@ pub const AppState = struct {
     pub const consumeSuppressedBrowserClosedEvent = browser_controller.consumeSuppressedBrowserClosedEvent;
     pub const unfocusBrowserPane = browser_controller.unfocusBrowserPane;
     pub const focusBrowserPane = browser_controller.focusBrowserPane;
+    pub const focusBrowserPaneInWorkspace = browser_controller.focusBrowserPaneInWorkspace;
+    pub const restoreBrowserPaneFocus = browser_controller.restoreBrowserPaneFocus;
     pub const isBrowserPaneFocused = browser_controller.isBrowserPaneFocused;
     pub const isNativeBrowserSurfaceFocused = browser_controller.isNativeBrowserSurfaceFocused;
     pub const browserPaneUsesNativeKeyboardSurface = browser_controller.browserPaneUsesNativeKeyboardSurface;
@@ -4708,6 +7040,8 @@ pub const AppState = struct {
     pub const terminalPaneOutputTailForProject = workspace_controller.terminalPaneOutputTailForProject;
     pub const terminalPaneOutputTail = workspace_controller.terminalPaneOutputTail;
     pub const terminalPaneScreenTextForProject = workspace_controller.terminalPaneScreenTextForProject;
+    pub const terminalPaneRenderStateForProject = workspace_controller.terminalPaneRenderStateForProject;
+    pub const terminalPaneGridSizeForProject = workspace_controller.terminalPaneGridSizeForProject;
     pub const pollTerminalDockBeforeRead = workspace_controller.pollTerminalDockBeforeRead;
     pub const pollWorkspaceTerminalProcessLifecycles = workspace_controller.pollWorkspaceTerminalProcessLifecycles;
     pub const pollPendingTerminalSessionTeardowns = workspace_controller.pollPendingTerminalSessionTeardowns;
@@ -5047,7 +7381,9 @@ pub const AppState = struct {
         if (!(process.kind == .agent and process.hooks)) return;
         switch (process.provider orelse return) {
             .codex => try provider_hooks.ensureCodexProjectHooks(self.allocator, project_path),
-            .claude => try provider_hooks.ensureClaudeProjectHooks(self.allocator, project_path),
+            .claude => provider_hooks.ensureClaudeGlobalHooks(self.allocator) catch |err| {
+                log.warn("could not install Claude global status hooks: {s}", .{@errorName(err)});
+            },
             // Hooks add status reporting but are not required to run Cursor.
             // Keep automatic TUI launch fail-open for malformed user config;
             // explicit Settings/CLI installation still reports the error.
@@ -5060,7 +7396,13 @@ pub const AppState = struct {
             .grok => provider_hooks.ensureGrokGlobalHooks(self.allocator) catch |err| {
                 log.warn("could not install Grok personal status hooks: {s}", .{@errorName(err)});
             },
-            .opencode, .amp, .other => {},
+            .opencode => provider_hooks.ensureOpencodeGlobalHooks(self.allocator) catch |err| {
+                log.warn("could not install OpenCode global status plugin: {s}", .{@errorName(err)});
+            },
+            .amp => provider_hooks.ensureAmpGlobalHooks(self.allocator) catch |err| {
+                log.warn("could not install Amp global status plugin: {s}", .{@errorName(err)});
+            },
+            .other => {},
         }
     }
 
@@ -5134,6 +7476,9 @@ pub const AppState = struct {
         new_after: bool,
     ) !bool {
         if (project_index >= self.project_controller.projects.items.len) return false;
+        provider_hooks.ensureAmpGlobalHooks(self.allocator) catch |err| {
+            log.warn("could not install Amp global status plugin: {s}", .{@errorName(err)});
+        };
         self.project_controller.selected_index = project_index;
         self.ensureCurrentProjectWorkspace();
 
@@ -5776,6 +8121,7 @@ pub const AppState = struct {
     pub const isCurrentProjectWorkspacePaneFocused = workspace_controller.isCurrentProjectWorkspacePaneFocused;
     pub const isCurrentProjectWorkspacePaneMaximized = workspace_controller.isCurrentProjectWorkspacePaneMaximized;
     pub const focusWorkspacePane = workspace_controller.focusWorkspacePane;
+    pub const restoreWorkspacePaneFocus = workspace_controller.restoreWorkspacePaneFocus;
     pub const focusCurrentProjectWorkspacePane = workspace_controller.focusCurrentProjectWorkspacePane;
     pub const focusPromptForFocusedChatWorkspacePane = workspace_controller.focusPromptForFocusedChatWorkspacePane;
     pub const swapCurrentProjectWorkspacePanes = workspace_controller.swapCurrentProjectWorkspacePanes;
@@ -5797,6 +8143,7 @@ pub const AppState = struct {
     pub const splitCurrentProjectWorkspacePaneWithChatPlacement = workspace_controller.splitCurrentProjectWorkspacePaneWithChatPlacement;
     pub const splitWorkspacePaneWithChatAxis = workspace_controller.splitWorkspacePaneWithChatAxis;
     pub const openWorkspaceChat = workspace_controller.openWorkspaceChat;
+    pub const presentWorkspaceChat = workspace_controller.presentWorkspaceChat;
     pub const resolveChatCreationSettings = workspace_controller.resolveChatCreationSettings;
     pub const modelOptionForProvider = workspace_controller.modelOptionForProvider;
     pub const codexSupportsReasoningEffort = workspace_controller.codexSupportsReasoningEffort;
@@ -5812,6 +8159,7 @@ pub const AppState = struct {
     pub const openThreadInTui = workspace_controller.openThreadInTui;
     pub const openThreadInChat = workspace_controller.openThreadInChat;
     pub const tuiResumeCommand = workspace_controller.tuiResumeCommand;
+    pub const resumeRecreatedThreadTui = workspace_controller.resumeRecreatedThreadTui;
     pub const splitCurrentProjectWorkspacePaneWithTerminalAxis = workspace_controller.splitCurrentProjectWorkspacePaneWithTerminalAxis;
     pub const splitCurrentProjectWorkspacePaneWithTerminalPlacement = workspace_controller.splitCurrentProjectWorkspacePaneWithTerminalPlacement;
     pub const splitWorkspacePaneWithTerminalAxis = workspace_controller.splitWorkspacePaneWithTerminalAxis;
@@ -6691,7 +9039,7 @@ pub const AppState = struct {
         var count: usize = 0;
         const thread = self.currentThread();
         const reasoning_count: usize = if (thread.provider == .codex)
-            CODEX_REASONING_OPTIONS.len
+            codexReasoningOptions(thread.model_ref).len
         else
             self.opencode_reasoning_menu.items.len;
         if (reasoning_count > 0) {
@@ -6718,7 +9066,7 @@ pub const AppState = struct {
             stepper.setFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(13.0)));
         }
         const reasoning = &self.composer_controller.run_steppers[@intFromEnum(RunConfigRowKind.reasoning)];
-        reasoning.setStepCount(if (thread.provider == .codex) CODEX_REASONING_OPTIONS.len else self.opencode_reasoning_menu.items.len);
+        reasoning.setStepCount(if (thread.provider == .codex) codexReasoningOptions(thread.model_ref).len else self.opencode_reasoning_menu.items.len);
         reasoning.setSelected(composerReasoningIndexForThread(self, thread));
         const speed = &self.composer_controller.run_steppers[@intFromEnum(RunConfigRowKind.speed)];
         speed.setStepCount(RUN_SPEED_STEP_LABELS.len);
@@ -7406,33 +9754,10 @@ pub const AppState = struct {
         }
     }
 
-    /// Records the pinned follow-up card hit rect for this frame (or clears it).
-    /// Called from the chat workspace render so mouse routing can target the pin.
-    pub fn setFollowupPinRect(self: *AppState, rect: ?palette.Rect) void {
-        if (rect) |value| {
-            self.composer_controller.followup_pin_valid = true;
-            self.composer_controller.followup_pin_rect = value;
-        } else {
-            self.composer_controller.followup_pin_valid = false;
-            self.composer_controller.followup_pin_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
-        }
-    }
-
-    /// Routes a click on the pinned follow-up card. A double-click (clicks >= 2)
-    /// pulls the queued prompt back into the composer for editing; a single click
-    /// is swallowed so it does not fall through to the composer/transcript.
-    pub fn handleFollowupPinMouseButton(self: *AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
-        if (!self.composer_controller.followup_pin_valid) return false;
-        const rect = self.composer_controller.followup_pin_rect;
-        if (x < rect.x or y < rect.y or x > rect.x + rect.w or y > rect.y + rect.h) return false;
-        if (down and clicks >= 2) self.editPendingFollowup();
-        return true;
-    }
-
     /// Pulls the queued/steered follow-up back into the composer so a long-waiting
     /// queued message can be revised. Removes the pin (it is no longer queued); the
     /// user re-queues with Tab or sends normally. Refuses to clobber an in-progress
-    /// draft, and ignores Codex steering already accepted inline (`.sent_inline`).
+    /// draft, and ignores provider steering already accepted inline (`.sent_inline`).
     pub fn editPendingFollowup(self: *AppState) void {
         if (self.project_controller.projects.items.len == 0) return;
         const thread = self.currentThreadMutable();
@@ -7449,29 +9774,28 @@ pub const AppState = struct {
         }
 
         const current = thread.currentDraft();
-        if (std.mem.trim(u8, current, &std.ascii.whitespace).len != 0) {
+        if (std.mem.trim(u8, current, &std.ascii.whitespace).len != 0 or thread.draftImageCount() != 0) {
             send_state.mutex.unlock();
             self.setSidebarNotice("Clear the composer to edit the queued message.");
             return;
         }
 
-        const prompt_copy = self.allocator.dupe(u8, pending.prompt) catch {
-            send_state.mutex.unlock();
-            self.setSidebarNotice("Failed to load the queued message.");
-            return;
-        };
-        defer self.allocator.free(prompt_copy);
-        freePendingFollowup(self.allocator, &send_state.pending_followup);
+        var owned_pending = pending;
+        send_state.pending_followup = null;
         send_state.pending_followup_signal_sent = false;
         send_state.mutex.unlock();
+        defer owned_pending.deinit(self.allocator);
 
-        self.setDraft(prompt_copy);
+        self.setDraft(owned_pending.prompt);
+        if (owned_pending.images.items.len > 0) {
+            thread.draft_image = owned_pending.images.orderedRemove(0);
+            std.mem.swap(std.ArrayList(ChatImageAttachment), &thread.draft_extra_images, &owned_pending.images);
+        }
         self.resetComposerInputWidget();
         self.composer_controller.composer.focused = true;
         self.composer_controller.focused = true;
-        self.setFollowupPinRect(null);
         self.markDirty();
-        self.setSidebarNotice(if (thread.provider == .codex)
+        self.setSidebarNotice(if (thread.provider == .codex or thread.provider == .claude)
             "Editing follow-up. Press Enter to queue it, or Tab to steer."
         else
             "Editing queued message. Press Tab to queue it again.");
@@ -7525,6 +9849,13 @@ pub const AppState = struct {
 
         thread.model_ref = if (value) |next| self.allocator.dupeZ(u8, next) catch null else null;
         self.normalizeOpencodeReasoningVariant(thread);
+        if (thread.provider == .codex) {
+            if (thread.reasoning_effort) |effort| {
+                if (!workspace_controller.codexSupportsReasoningEffort(thread.model_ref orelse DEFAULT_CODEX_MODEL, effort)) {
+                    thread.reasoning_effort = null;
+                }
+            }
+        }
         if (thread.provider == .cursor) {
             if (thread.opencode_reasoning_variant) |v| {
                 self.allocator.free(v);
@@ -7560,7 +9891,7 @@ pub const AppState = struct {
 
     fn composerReasoningIndexForThread(self: *const AppState, thread: *const ChatThread) ?usize {
         if (thread.provider == .codex) {
-            return composerReasoningIndexForOptions(CODEX_REASONING_OPTIONS[0..], thread.reasoning_effort);
+            return composerReasoningIndexForOptions(codexReasoningOptions(thread.model_ref), thread.reasoning_effort);
         }
         if (thread.provider == .claude) {
             const rows = self.opencode_reasoning_menu.items;
@@ -7636,8 +9967,10 @@ pub const AppState = struct {
     pub const clearFileSearch = file_search_controller.clearFileSearch;
 
     pub const markDirty = lifecycle_controller.markDirty;
+    pub const markSelectionDirty = lifecycle_controller.markSelectionDirty;
     pub const noteInteraction = lifecycle_controller.noteInteraction;
     pub const requestTranscriptScrollToBottom = transcript_controller.requestTranscriptScrollToBottom;
+    pub const requestTranscriptScrollToBottomIfFollowing = transcript_controller.requestTranscriptScrollToBottomIfFollowing;
     pub const requestTranscriptLineScroll = transcript_controller.requestTranscriptLineScroll;
     pub const requestTranscriptPageScroll = transcript_controller.requestTranscriptPageScroll;
 
@@ -7695,6 +10028,13 @@ pub const AppState = struct {
     }
 
     pub fn sidebarNotice(self: *const AppState) []const u8 {
+        if (self.close_durability_notice) return CLOSE_DURABILITY_NOTICE;
+        if (self.daemon_projection_stale) return "Daemon sync stalled; showing last synced state.";
+        return std.mem.sliceTo(self.sidebar_notice_storage[0..], 0);
+    }
+
+    /// Returns workflow feedback without unrelated global health notices.
+    pub fn projectImportNotice(self: *const AppState) []const u8 {
         return std.mem.sliceTo(self.sidebar_notice_storage[0..], 0);
     }
 
@@ -7729,7 +10069,28 @@ pub const AppState = struct {
 
     pub fn deinit(self: *AppState) void {
         runtime_log.diagnostic("AppState.deinit begin", .{});
+        shutdown_watchdog_deinit_complete.store(false, .release);
+        shutdown_watchdog_state_durable.store(false, .release);
+        // Final fallback for non-window quit paths. Ordinary interactive close
+        // already completed this handoff before leaving the event loop. Keep
+        // every owner live here until durability succeeds; teardown starts
+        // only below this loop.
+        while (true) {
+            self.handoffDirtyStateForShutdown() catch |err| {
+                runtime_log.diagnostic("AppState.deinit pre-teardown durability handoff failed: {s}", .{@errorName(err)});
+                platform_runtime.sleepMillis(500);
+                continue;
+            };
+            break;
+        }
         startShutdownWatchdog();
+        // Flag the cursor loop first so an in-flight long-poll (bounded by
+        // the 4s wait budget + 5s transport timeout) drains concurrently with
+        // the shutdown work below; the blocking join happens further down,
+        // inside the 10s watchdog envelope.
+        self.change_cursor_loop.beginShutdown();
+        self.pollAcknowledgements();
+        acknowledgement_controller.deinit(self);
         self.preparePendingSendsForShutdown();
         runtime_log.diagnostic("AppState.deinit pending sends prepared", .{});
         self.finishPickerThread();
@@ -7746,20 +10107,37 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit provider readiness finished", .{});
         self.deinitBackgroundTaskPoller();
         runtime_log.diagnostic("AppState.deinit background task poller finished", .{});
+        self.finishTranscriptHydrationWorker();
+        runtime_log.diagnostic("AppState.deinit transcript hydration finished", .{});
         self.settings_controller.update.deinit();
         runtime_log.diagnostic("AppState.deinit updater finished", .{});
         self.finishAllSendThreads();
         runtime_log.diagnostic("AppState.deinit send threads finished", .{});
         self.finishAllTitleGenerationThreads();
         runtime_log.diagnostic("AppState.deinit title generation threads finished", .{});
+        self.change_cursor_loop.join();
+        runtime_log.diagnostic("AppState.deinit change cursor loop joined", .{});
         _ = self.pollSend();
         runtime_log.diagnostic("AppState.deinit sends polled", .{});
+        while (true) {
+            self.handoffDirtyStateForShutdown() catch |err| {
+                // Worker settlement can publish a final dirty generation after
+                // the interactive preflight. It must acquire durable ownership
+                // before the watchdog may exit, even though teardown is ending.
+                runtime_log.diagnostic("AppState.deinit final durability handoff failed: {s}", .{@errorName(err)});
+                platform_runtime.sleepMillis(500);
+                continue;
+            };
+            break;
+        }
         self.chat_controller.deinit(self.allocator);
         runtime_log.diagnostic("AppState.deinit chat controller finished", .{});
         ai_harness.shutdownOwnedProviderProcesses();
         runtime_log.diagnostic("AppState.deinit provider processes shutdown", .{});
-        self.flushDirtyBlocking();
-        runtime_log.diagnostic("AppState.deinit dirty state flushed", .{});
+        shutdown_watchdog_state_durable.store(true, .release);
+        chat_controller.deinitProcessGlobalState(self.storage.pref_path);
+        runtime_log.diagnostic("AppState.deinit dirty state durable", .{});
+        self.lifecycle.deinit();
         self.file_search_controller.deinit(self.allocator);
         self.composer_controller.composer.deinit(self.allocator);
         self.companion_composer.deinit(self.allocator);
@@ -7771,6 +10149,7 @@ pub const AppState = struct {
         self.card_toggle_hits.deinit(self.allocator);
         self.background_task_action_hits.deinit(self.allocator);
         self.expanded_cards.deinit();
+        self.pending_ui_snapshot_cache.deinit(self.allocator);
         self.terminal_controller.deinit(self.allocator);
         self.closeTranscriptSelectionModal();
         self.clearProjects();
@@ -7866,13 +10245,17 @@ pub const AppState = struct {
                                 self.setSidebarNotice("Folder selected, but path setup failed.");
                                 return;
                             };
+                            self.project_import_cursor = self.importDirectoryDraft().len;
+                            self.palette_modal_text_focus = .project_import;
+                            self.setSidebarNotice("Type the new folder name, then Create directory.");
+                            self.markDirty();
                         } else {
                             self.setImportPath(path);
+                            self.importProjectFromInput() catch |err| {
+                                log.warn("failed to import selected workspace: {s}", .{@errorName(err)});
+                                self.setSidebarNotice("Folder selected, but workspace import failed.");
+                            };
                         }
-                        self.project_import_cursor = self.importDirectoryDraft().len;
-                        self.palette_modal_text_focus = .project_import;
-                        self.setSidebarNotice(if (create_parent) "Type the new folder name, then Create directory." else "Folder selected.");
-                        self.markDirty();
                     } else {
                         self.setImportPath(path);
                         self.importProjectFromInput() catch |err| {
@@ -7893,7 +10276,402 @@ pub const AppState = struct {
     pub const pollCursorModelOptionsCache = provider_controller.pollCursorModelOptionsCache;
     pub const pollClaudeModelOptionsCache = provider_controller.pollClaudeModelOptionsCache;
 
-    pub const pollSend = chat_controller.pollSend;
+    /// Frame-loop entry point (main.zig calls this every frame): starts the
+    /// M5-P4 change-cursor loop lazily (AppState.init returns by value, so
+    /// the loop-state address is only stable once the caller stored the
+    /// AppState), drains cursor signals into the existing pull paths, then
+    /// runs the unchanged chat send pump.
+    pub fn pollSend(self: *AppState) bool {
+        self.ensureChangeCursorLoopStarted();
+        self.drainChangeCursorSignals();
+        return chat_controller.pollSend(self);
+    }
+
+    fn ensureChangeCursorLoopStarted(self: *AppState) void {
+        if (self.change_cursor_loop.worker != null) return;
+        // Never (re)spawn once shutdown began — deinit's trailing pollSend
+        // drain must not resurrect the thread after the join.
+        if (self.change_cursor_loop.shutdown.load(.acquire)) return;
+        if (self.daemon_projection_bootstrap_started_at_ms == 0) {
+            self.daemon_projection_bootstrap_started_at_ms = platform_runtime.unixTimestampMs();
+        }
+        self.change_cursor_loop.worker = std.Thread.spawn(
+            .{},
+            changeCursorLoopMain,
+            .{ self.storage, &self.change_cursor_loop },
+        ) catch |err| {
+            // Retried next frame; until then the projection stays unsynced
+            // and Live reads keep the legacy inline-pull fallback. Warn once
+            // per streak: this runs every frame, and a spawn failure here
+            // means the desktop silently never converges daemon state.
+            if (!self.change_cursor_spawn_failure_logged) {
+                self.change_cursor_spawn_failure_logged = true;
+                log.warn("failed to start change-cursor loop: {s}", .{@errorName(err)});
+            }
+            return;
+        };
+        self.change_cursor_spawn_failure_logged = false;
+    }
+
+    /// Request a worker-owned refresh through the durable projection floor.
+    /// This method performs no daemon or storage I/O beyond reading the
+    /// already-published observed revision.
+    pub fn requestDaemonProjectionForPresentation(self: *AppState, expected_revision: u64) ChangeCursorLoopState.ProjectionRequestStatus {
+        const observed_revision = self.storage.currentProjectionObservedRevision();
+        if (observed_revision >= expected_revision) {
+            _ = self.change_cursor_loop.acknowledgeProjectionRevision(observed_revision);
+            return .applied;
+        }
+        const status = self.change_cursor_loop.requestProjectionRevision(expected_revision);
+        self.ensureChangeCursorLoopStarted();
+        if (self.change_cursor_loop.worker == null) {
+            self.change_cursor_loop.markProjectionRefreshUnavailable(expected_revision);
+            return .refresh_unavailable;
+        }
+        return status;
+    }
+
+    pub fn daemonProjectionObservedRevision(self: *const AppState) u64 {
+        return self.storage.currentProjectionObservedRevision();
+    }
+
+    /// Main-thread half of the cursor bridge. It performs bounded in-memory
+    /// application only; all daemon reads happened on the cursor worker.
+    fn drainChangeCursorSignals(self: *AppState) void {
+        if (self.change_cursor_loop.shutdown.load(.acquire)) return;
+        if (self.change_cursor_loop.takeRefresh()) |refresh| {
+            defer refresh.deinit();
+            self.applyDaemonProjectionRefreshWithDurable(refresh.result, refresh.durable.?.value) catch |err| {
+                self.change_cursor_loop.noteProjectionRefreshApplyFailure(refresh, err);
+                // The cursor is deliberately still old: the worker will
+                // re-read this dirty range on its next iteration.
+                log.warn("failed to apply daemon projection refresh: {s}", .{@errorName(err)});
+                return;
+            };
+            self.change_cursor_loop.noteRefreshApplication(true);
+            _ = self.change_cursor_loop.acknowledgeProjectionRevision(self.storage.currentProjectionObservedRevision());
+        }
+        const signals = self.change_cursor_loop.take();
+        self.pollDaemonProjectionStaleness();
+        if (signals.registry or signals.resync) self.terminal_controller.poll_requested = true;
+    }
+
+    pub fn applyDaemonProjectionRefresh(self: *AppState, result: headless.store.CoreSnapshotResult) !void {
+        return self.applyDaemonProjectionRefreshWithOptionalDurable(result, null);
+    }
+
+    fn applyDaemonProjectionRefreshWithDurable(
+        self: *AppState,
+        result: headless.store.CoreSnapshotResult,
+        durable: PersistedState,
+    ) !void {
+        return self.applyDaemonProjectionRefreshWithOptionalDurable(result, durable);
+    }
+
+    fn applyDaemonProjectionRefreshWithOptionalDurable(
+        self: *AppState,
+        result: headless.store.CoreSnapshotResult,
+        durable: ?PersistedState,
+    ) !void {
+        const adoption_repair = self.hasUnresolvedAdoptionRows();
+        const observed_revision = self.storage.currentProjectionObservedRevision();
+        const baseline_repair = self.lifecycle.projection_baseline == null or
+            self.lifecycle.projection_baseline_revision != observed_revision;
+        if (!projectionRefreshApplyGate(
+            self.lifecycle.dirty,
+            self.lifecycle.flush_in_flight,
+            self.lifecycle.rebase_snapshot != null,
+            adoption_repair,
+            baseline_repair,
+        )) return error.ProjectionRefreshDeferred;
+        const envelope = result.envelope orelse return error.MissingProjectionEnvelope;
+        const cursor = result.change_cursor orelse return error.MissingProjectionCursor;
+        var conversion_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer conversion_arena.deinit();
+        var persisted = if (durable) |projection|
+            projection
+        else
+            try compositeSnapshotToPersisted(conversion_arena.allocator(), result.snapshot);
+        if (adoption_repair) try self.validateAdoptionRepairsForRefresh(persisted);
+        // Keep the user's pane focus/viewport: patch the snapshot before the
+        // baseline clone so the applied layout and baseline stay identical.
+        try preserveLiveWorkspacePresentationInPersisted(
+            self.allocator,
+            conversion_arena.allocator(),
+            &self.project_controller,
+            &persisted,
+        );
+        // Attachment recency merge reads the last applied baseline only when
+        // it is revision-paired; a stale baseline conservatively keeps live.
+        const attachment_baseline: ?*const PersistedState = if (self.lifecycle.projection_baseline) |*last_applied| blk: {
+            if (self.lifecycle.projection_baseline_revision == observed_revision) break :blk &last_applied.value;
+            break :blk null;
+        } else null;
+        try overlayLiveDraftAttachmentsInPersisted(
+            conversion_arena.allocator(),
+            &self.project_controller,
+            attachment_baseline,
+            &persisted,
+        );
+        var next_baseline = try self.clonePersistedBaseline(self.allocator, persisted);
+        var baseline_owned = true;
+        errdefer if (baseline_owned) next_baseline.deinit();
+        // The merge helpers alias string slices from `current` into `persisted`
+        // without duplication, so `current` must outlive applyPersisted's dupes
+        // below. Scoping it to this block was a use-after-free that stayed
+        // hidden while adoption vetoes rejected every dirty refresh.
+        var current: ?LoadedPersistedState = null;
+        defer if (current) |*captured| captured.deinit();
+        if (self.lifecycle.dirty or self.lifecycle.rebase_snapshot != null or adoption_repair) {
+            current = try self.buildPersistedState(self.allocator);
+            const baseline = if (self.lifecycle.rebase_baseline) |*captured| blk: {
+                if (self.lifecycle.rebase_baseline_revision == self.lifecycle.rebase_capture_revision and
+                    self.lifecycle.rebase_capture_revision == observed_revision)
+                {
+                    break :blk captured.value;
+                }
+                break :blk null;
+            } else if (self.lifecycle.projection_baseline) |*last_applied| blk: {
+                if (self.lifecycle.projection_baseline_revision == observed_revision) break :blk last_applied.value;
+                break :blk null;
+            } else null;
+            if (baseline) |base| {
+                try mergeCurrentLocalEdits(conversion_arena.allocator(), &persisted, base, current.?.value);
+            } else {
+                // Bootstrap or explicit revision mismatch: never merge through
+                // a stale baseline. This fresh remote rebuild conservatively
+                // preserves current-only identities before pairing a new base.
+                try preserveCurrentIdentitiesWithoutBaseline(conversion_arena.allocator(), &persisted, current.?.value);
+            }
+        }
+
+        // Build the complete replacement behind a shallow AppState view whose
+        // owned projection containers are empty. No live pointer is changed
+        // until every allocation (projects, leases, sessions, nonce) succeeds.
+        var staged = self.*;
+        staged.project_controller = .{};
+        staged.surface_controller = .{};
+        staged.chat_controller.pending_send_count = 0;
+        var staged_owned = true;
+        errdefer if (staged_owned) deinitProjectionContainers(self.allocator, &staged.project_controller, &staged.surface_controller);
+        try staged.applyPersisted(persisted);
+        try staged.applyDaemonRegistryProjection(result.processes, result.leases);
+        try staged.applyDaemonSessionProjection(result.sessions);
+        try staged.applyDaemonChatTurnsSnapshot(result.turns);
+        // Projection snapshots normally carry only a compact tail page. Merge
+        // that authoritative range into the GUI's wider hydrated range before
+        // the infallible runtime handoff, so saved scroll anchors keep the same
+        // absolute message coordinate space even when new tail rows arrive.
+        try prepareProjectionTranscriptRuntime(self.allocator, &self.project_controller, &staged.project_controller);
+        var staged_sessions = try terminal_controller.buildDaemonSessionProjection(self.allocator, result.sessions);
+        var sessions_owned = true;
+        errdefer if (sessions_owned) terminal_controller.deinitDaemonSessionProjection(self.allocator, &staged_sessions);
+        const prepared_seed = try self.storage.prepareCompositeSnapshotSeed(envelope, cursor, result.store_revision);
+        var seed_owned = true;
+        errdefer if (seed_owned) self.storage.discardPreparedCompositeSnapshotSeed(prepared_seed);
+
+        // All fallible staging is complete. Move GUI-owned runtime state only
+        // at this infallible publication boundary so an earlier staging error
+        // can still discard the replacement without touching the live app.
+        preserveProjectionRuntime(&self.project_controller, &staged.project_controller);
+        staged.chat_controller.pending_send_count = countProjectionActiveSends(&staged.project_controller);
+
+        const old_projects = self.project_controller;
+        const old_surfaces = self.surface_controller;
+        var old_sessions = self.terminal_controller.daemon_sessions;
+        self.project_controller = staged.project_controller;
+        self.surface_controller = staged.surface_controller;
+        self.sidebar_collapsed = staged.sidebar_collapsed;
+        self.rename_storage = staged.rename_storage;
+        self.chat_controller.pending_send_count = staged.chat_controller.pending_send_count;
+        self.terminal_controller.daemon_sessions = staged_sessions;
+        staged_owned = false;
+        sessions_owned = false;
+
+        var deinit_projects = old_projects;
+        var deinit_surfaces = old_surfaces;
+        deinitProjectionContainers(self.allocator, &deinit_projects, &deinit_surfaces);
+        terminal_controller.deinitDaemonSessionProjection(self.allocator, &old_sessions);
+        self.clearTranscriptMarkdownSelection();
+        self.clearTranscriptMarkdownEntries();
+
+        // Atomic publication boundary: all fallible work and the projection
+        // swap are complete before cursor/write-guard/freshness advance.
+        self.storage.commitPreparedCompositeSnapshotSeed(prepared_seed);
+        seed_owned = false;
+        // Reconciliation derives consume reservations from Storage's current
+        // nonce, so publish the validated replacement seed first. The first
+        // refresh after daemon replacement must never reserve under the old
+        // instance and then release that key on the following cycle.
+        self.clearValidatedAdoptionRepairs();
+        self.reconcileTerminalDaemonChatTurnsSnapshot(result.turns);
+        if (self.lifecycle.rebase_snapshot) |*local| local.deinit();
+        self.lifecycle.rebase_snapshot = null;
+        if (self.lifecycle.rebase_baseline) |*baseline| baseline.deinit();
+        self.lifecycle.rebase_baseline = null;
+        self.lifecycle.rebase_baseline_revision = null;
+        self.lifecycle.rebase_capture_revision = null;
+        if (self.lifecycle.projection_baseline) |*baseline| baseline.deinit();
+        self.lifecycle.projection_baseline = next_baseline;
+        self.lifecycle.projection_baseline_revision = result.store_revision;
+        baseline_owned = false;
+        self.daemon_projection_stale = false;
+        self.daemon_projection_stale_notified = false;
+    }
+
+    /// Complete a conflict/adoption refresh after the cursor worker has
+    /// stopped. The ordinary apply path still performs the transactional
+    /// merge, replacement, and cursor publication.
+    pub fn completePendingProjectionRepairBlocking(self: *AppState) !void {
+        var fetch_reason: []const u8 = "";
+        const refresh = fetchOwnedCompositeSnapshot(self.storage, &fetch_reason) orelse {
+            log.warn("blocking projection repair refresh failed: {s}", .{fetch_reason});
+            return error.ProjectionRefreshUnavailable;
+        };
+        defer refresh.deinit();
+        try self.applyDaemonProjectionRefreshWithDurable(refresh.result, refresh.durable.?.value);
+    }
+
+    /// Transfer dirty projection ownership to a durable sidecar before close.
+    /// The sidecar remains through replay and is removed only by a later full
+    /// snapshot acknowledgement.
+    pub fn spoolPendingStateForShutdown(self: *AppState) !void {
+        var current = try self.buildPersistedState(self.allocator);
+        defer current.deinit();
+        const capture_revision = self.storage.currentProjectionObservedRevision();
+        const baseline: ?PersistedState = if (self.lifecycle.rebase_baseline) |*captured| blk: {
+            if (self.lifecycle.rebase_baseline_revision == self.lifecycle.rebase_capture_revision and
+                self.lifecycle.rebase_capture_revision == capture_revision)
+            {
+                break :blk captured.value;
+            }
+            break :blk null;
+        } else if (self.lifecycle.projection_baseline) |*projection| blk: {
+            if (self.lifecycle.projection_baseline_revision == capture_revision) break :blk projection.value;
+            break :blk null;
+        } else null;
+        const baseline_revision: ?u64 = if (baseline != null) capture_revision else null;
+        var delta = try persistence.clonePersistedSpoolDelta(self.allocator, current.value, baseline);
+        defer delta.deinit();
+        const adoption_repairs = try self.pendingAdoptionRepairsSnapshot(current.allocator());
+        try self.storage.writePendingStateSpool(.{
+            .capture_revision = capture_revision,
+            .baseline_revision = baseline_revision,
+            .current = delta.value,
+            .baseline = baseline,
+            .adoption_repairs = adoption_repairs,
+        });
+    }
+
+    fn deinitProjectionContainers(
+        allocator: std.mem.Allocator,
+        projects: *project_controller.State,
+        surfaces: *surface_controller.State,
+    ) void {
+        for (projects.projects.items) |*project| project.deinit(allocator);
+        projects.projects.deinit(allocator);
+        for (projects.archived_projects.items) |*project| project.deinit(allocator);
+        projects.archived_projects.deinit(allocator);
+        for (surfaces.surfaces.items) |*surface| surface.deinit(allocator);
+        surfaces.surfaces.deinit(allocator);
+        projects.* = .{};
+        surfaces.* = .{};
+    }
+
+    pub fn projectForDaemonId(self: *AppState, workspace_id: []const u8) ?*Project {
+        for (self.project_controller.projects.items) |*project| {
+            if (std.mem.eql(u8, project.id, workspace_id)) return project;
+        }
+        for (self.project_controller.archived_projects.items) |*project| {
+            if (std.mem.eql(u8, project.id, workspace_id)) return project;
+        }
+        return null;
+    }
+
+    fn applyDaemonRegistryProjection(
+        self: *AppState,
+        processes: []const headless.registry.ProcessSnapshot,
+        leases: []const headless.registry.LeaseRecord,
+    ) !void {
+        for (self.project_controller.projects.items) |*project| {
+            for (project.workspace_leases.items) |*lease| lease.deinit(self.allocator);
+            project.workspace_leases.clearRetainingCapacity();
+        }
+        for (self.project_controller.archived_projects.items) |*project| {
+            for (project.workspace_leases.items) |*lease| lease.deinit(self.allocator);
+            project.workspace_leases.clearRetainingCapacity();
+        }
+        for (leases) |lease| {
+            const project = self.projectForDaemonId(lease.workspace_id) orelse continue;
+            var resources: std.ArrayList([]u8) = .empty;
+            errdefer {
+                for (resources.items) |resource| self.allocator.free(resource);
+                resources.deinit(self.allocator);
+            }
+            for (lease.resources) |resource| {
+                try resources.append(self.allocator, try self.allocator.dupe(u8, resource));
+            }
+            const id = try self.allocator.dupe(u8, lease.id);
+            errdefer self.allocator.free(id);
+            const owner = try self.allocator.dupe(u8, lease.owner);
+            errdefer self.allocator.free(owner);
+            const command = try self.allocator.dupe(u8, lease.command);
+            errdefer self.allocator.free(command);
+            try project.workspace_leases.append(self.allocator, .{
+                .id = id,
+                .owner = owner,
+                .command = command,
+                .resources = resources,
+                .created_at_ms = lease.created_at_ms,
+                .expires_at_ms = lease.expires_at_ms,
+            });
+        }
+        for (processes) |snapshot| {
+            const project = self.projectForDaemonId(snapshot.workspace_id) orelse continue;
+            const process = project.managedProcessByName(snapshot.name) orelse continue;
+            process.status = switch (snapshot.status) {
+                .starting => .starting,
+                .running => .running,
+                .stopping => .stopping,
+                .crashed, .failed => .crashed,
+                .restarting => .restarting,
+                .stopped, .completed, .cancelled, .unknown => .stopped,
+            };
+            process.exit_code = snapshot.exit_code;
+            process.signal = snapshot.signal;
+            process.restart_count = snapshot.restart_count;
+            process.dock_id = snapshot.dock_id;
+            process.pane_id = snapshot.pane_id;
+        }
+    }
+
+    /// Sidebar stale indicator (design: stalled daemon keeps the last synced
+    /// snapshot on screen with an explicit indicator, never local authority).
+    fn pollDaemonProjectionStaleness(self: *AppState) void {
+        const now_ms = platform_runtime.unixTimestampMs();
+        const ever_synced = self.storage.daemonProjectionEverSynced();
+        const bootstrap_stale = !ever_synced and projectionStaleAt(
+            self.daemon_projection_has_saved_state,
+            self.daemon_projection_bootstrap_started_at_ms,
+            0,
+            now_ms,
+        );
+        self.daemon_projection_stale = bootstrap_stale or (ever_synced and
+            !self.storage.daemonProjectionSyncedWithinMs(now_ms, CHANGE_CURSOR_STALE_AFTER_MS));
+        self.daemon_projection_stale_notified = self.daemon_projection_stale;
+    }
+
+    pub fn isDaemonProjectionStale(self: *AppState) bool {
+        self.pollDaemonProjectionStaleness();
+        return self.daemon_projection_stale;
+    }
+
+    /// Composite sessions seed matching dock identities transactionally. Keep
+    /// the legacy pull too until every historical session shape is projectable.
+    pub fn pollWorkspaceTerminalProcessLifecyclesForLiveRead(self: *AppState, project_index: usize) void {
+        self.pollWorkspaceTerminalProcessLifecycles(project_index);
+    }
+
     pub const pollTitleGenerations = chat_controller.pollTitleGenerations;
     pub const pollThreadTitleGeneration = chat_controller.pollThreadTitleGeneration;
     pub const openingExchange = chat_controller.openingExchange;
@@ -7928,7 +10706,7 @@ pub const AppState = struct {
     pub const isChatThreadFocused = chat_controller.isChatThreadFocused;
     pub const capturePendingProviderThreadId = chat_controller.capturePendingProviderThreadId;
     pub const issuePendingThreadStop = chat_controller.issuePendingThreadStop;
-    pub const issuePendingCodexSteer = chat_controller.issuePendingCodexSteer;
+    pub const issuePendingProviderSteer = chat_controller.issuePendingProviderSteer;
     pub const dispatchPendingFollowup = chat_controller.dispatchPendingFollowup;
     pub const clearPendingFollowupAfterFailure = chat_controller.clearPendingFollowupAfterFailure;
     pub const finishPickerThread = chat_controller.finishPickerThread;
@@ -7945,6 +10723,7 @@ pub const AppState = struct {
     pub const pendingSendCount = chat_controller.pendingSendCount;
     pub const isPickerPending = chat_controller.isPickerPending;
     pub const pendingApprovalSnapshot = chat_controller.pendingApprovalSnapshot;
+    pub const pendingApprovalSnapshotCached = chat_controller.pendingApprovalSnapshotCached;
     pub const resolvePendingApproval = chat_controller.resolvePendingApproval;
     pub const applySendSuccess = chat_controller.applySendSuccess;
     pub const applyPendingTimelineEvents = chat_controller.applyPendingTimelineEvents;
@@ -7997,11 +10776,7 @@ pub const AppState = struct {
     }
 
     pub fn deriveProjectId(self: *AppState, path: []const u8) ![]u8 {
-        const comparison_key = try platform_paths.projectComparisonKeyAllocForOs(self.allocator, builtin.os.tag, path);
-        defer self.allocator.free(comparison_key);
-        var hasher = std.hash.Wyhash.init(0);
-        hasher.update(comparison_key);
-        return std.fmt.allocPrint(self.allocator, "{x}", .{hasher.final()});
+        return workspace_identity.deriveProjectId(self.allocator, path);
     }
 
     fn dupeOptionalSlice(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
@@ -8063,12 +10838,19 @@ pub const AppState = struct {
         };
     }
 
+    /// True while the ~1.2s post-click "Copied" feedback window is showing.
+    /// Fenced-code messages bypass the transcript replay cache during this
+    /// window so the check glyph renders live.
+    pub fn codeCopyRecentFeedbackActive(self: *const AppState) bool {
+        const now_ms: i64 = @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
+        return self.code_copy_recent_until_ms != 0 and now_ms < self.code_copy_recent_until_ms;
+    }
+
     /// Returns a recorder the markdown renderer can use to register per-frame
     /// code-block copy buttons. The "recent" feedback window (~1.2s) shows a
     /// transient "Copied" label after a click.
     pub fn codeCopyButtonRecorder(self: *AppState) chat_markdown.CodeCopyButtonRecorder {
-        const now_ms: i64 = @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
-        const active = self.code_copy_recent_until_ms != 0 and now_ms < self.code_copy_recent_until_ms;
+        const active = self.codeCopyRecentFeedbackActive();
         return .{
             .context = @ptrCast(self),
             .push_fn = pushCodeCopyButtonTrampoline,
@@ -8094,13 +10876,38 @@ pub const AppState = struct {
 
     pub fn recordBackgroundTaskActionForMessage(self: *AppState, rect: palette.Rect, message_index: usize, body: []const u8, action: BackgroundTaskAction) void {
         if (rect.w < 2 or rect.h < 2) return;
-        for (self.project_controller.projects.items, 0..) |*project, project_index| for (project.threads.items, 0..) |*thread, thread_index| {
-            if (message_index >= thread.messages.items.len or !std.mem.eql(u8, thread.messages.items[message_index].body, body)) continue;
-            const task = chat_controller.backgroundTaskForEventBody(thread, body) orelse continue;
-            const task_index = (@intFromPtr(task) - @intFromPtr(thread.background_tasks.items.ptr)) / @sizeOf(BackgroundTask);
-            self.recordBackgroundTaskActionHit(.{ .rect = rect, .project_index = project_index, .thread_index = thread_index, .task_index = task_index, .message_index = message_index, .action = action });
-            return;
+        const project_index = self.project_controller.selected_index;
+        if (project_index >= self.project_controller.projects.items.len) return;
+        const project = &self.project_controller.projects.items[project_index];
+        const thread_index = project.selected_thread_index;
+        if (thread_index >= project.threads.items.len) return;
+        const thread = &project.threads.items[thread_index];
+
+        // Pending transcript rows are rendered while their send-state mutex is
+        // held, so inspect that already-protected list directly. Requiring a
+        // committed message here silently dropped Stop/Output hits until the
+        // whole turn finished, leaving the overlapping card toggle to win.
+        const rendered_body = if (message_index < thread.messages.items.len)
+            thread.messages.items[message_index].body
+        else blk: {
+            const pending_index = message_index - thread.messages.items.len;
+            if (pending_index >= thread.send_state.pending_events.items.len) return;
+            break :blk thread.send_state.pending_events.items[pending_index].body;
         };
+        if (!std.mem.eql(u8, rendered_body, body)) return;
+        const task_index = if (chat_controller.backgroundTaskForEventBody(thread, body)) |task|
+            (@intFromPtr(task) - @intFromPtr(thread.background_tasks.items.ptr)) / @sizeOf(BackgroundTask)
+        else
+            null;
+        self.recordBackgroundTaskActionHit(.{
+            .rect = rect,
+            .project_index = project_index,
+            .thread_index = thread_index,
+            .task_index = task_index,
+            .message_index = message_index,
+            .body_hash = std.hash.Wyhash.hash(0, body),
+            .action = action,
+        });
     }
 
     pub fn consumeBackgroundTaskActionClick(self: *AppState, x: f32, y: f32) bool {
@@ -8110,20 +10917,56 @@ pub const AppState = struct {
             var project = &self.project_controller.projects.items[hit.project_index];
             if (hit.thread_index >= project.threads.items.len) return true;
             const thread = &project.threads.items[hit.thread_index];
-            if (hit.message_index >= thread.messages.items.len) return true;
-            if (hit.task_index >= thread.background_tasks.items.len) return true;
-            const task = &thread.background_tasks.items[hit.task_index];
-            if (chat_controller.backgroundTaskForEventBody(thread, thread.messages.items[hit.message_index].body) != task) {
+            const target = resolveBackgroundTaskActionHit(thread, hit) orelse {
                 self.setSidebarNotice("Background task is no longer available.");
                 return true;
+            };
+            if (target.task) |task| {
+                switch (hit.action) {
+                    .stop => _ = self.stopBackgroundTask(hit.project_index, thread, task),
+                    .output => self.openBackgroundTaskOutput(hit.project_index, task, hit.message_index),
+                }
+                return true;
             }
+
+            // Provider-owned background commands can reach the transcript
+            // before their durable task metadata. Keep their visible controls
+            // actionable instead of letting the overlapping card toggle win.
             switch (hit.action) {
-                .stop => _ = self.stopBackgroundTask(hit.project_index, thread, task),
-                .output => self.openBackgroundTaskOutput(hit.project_index, task, hit.message_index),
+                .stop => _ = self.abortThreadByLocalId(project.id, thread.local_thread_id),
+                .output => {
+                    self.setCardExpanded(commandCardKey(hit.message_index), true);
+                    self.setSidebarNotice("Background command details are shown in the expanded card.");
+                    self.markDirty();
+                },
             }
             return true;
         }
         return false;
+    }
+
+    const ResolvedBackgroundTaskAction = struct { task: ?*BackgroundTask };
+
+    fn resolveBackgroundTaskActionBody(thread: *ChatThread, hit: BackgroundTaskActionHit, body: []const u8) ?ResolvedBackgroundTaskAction {
+        if (std.hash.Wyhash.hash(0, body) != hit.body_hash) return null;
+        const current_task = chat_controller.backgroundTaskForEventBody(thread, body);
+        const task_index = hit.task_index orelse return .{ .task = current_task };
+        if (task_index >= thread.background_tasks.items.len) return null;
+        const task = &thread.background_tasks.items[task_index];
+        if (current_task != task) return null;
+        return .{ .task = task };
+    }
+
+    fn resolveBackgroundTaskActionHit(thread: *ChatThread, hit: BackgroundTaskActionHit) ?ResolvedBackgroundTaskAction {
+        if (hit.message_index < thread.messages.items.len) {
+            return resolveBackgroundTaskActionBody(thread, hit, thread.messages.items[hit.message_index].body);
+        }
+
+        thread.send_state.mutex.lock();
+        defer thread.send_state.mutex.unlock();
+        const pending_index = hit.message_index - thread.messages.items.len;
+        if (pending_index >= thread.send_state.pending_events.items.len) return null;
+        return resolveBackgroundTaskActionBody(thread, hit, thread.send_state.pending_events.items[pending_index].body);
     }
 
     fn stopBackgroundTask(self: *AppState, project_index: usize, thread: *ChatThread, task: *BackgroundTask) bool {
@@ -8286,7 +11129,7 @@ pub const AppState = struct {
     fn openBackgroundTaskOutput(self: *AppState, project_index: usize, task: *BackgroundTask, message_index: usize) void {
         const log_path = task.log_path orelse {
             const key = commandCardKey(message_index);
-            self.expanded_cards.put(key, true) catch {};
+            self.setCardExpanded(key, true);
             self.setSidebarNotice("Codex process details are shown in the expanded card; retained live output is not exposed by this API.");
             self.markDirty();
             return;
@@ -8329,6 +11172,16 @@ pub const AppState = struct {
         return self.isCardExpandedDefault(key, false);
     }
 
+    /// Single write path for card expansion so the per-frame layout variant
+    /// hash can key on `expanded_cards_revision` instead of iterating the map.
+    pub fn setCardExpanded(self: *AppState, key: u64, expanded: bool) void {
+        self.expanded_cards.put(key, expanded) catch |err| {
+            log.warn("failed to store expanded card: {s}", .{@errorName(err)});
+            return;
+        };
+        self.expanded_cards_revision +%= 1;
+    }
+
     pub fn isCardExpandedDefault(self: *AppState, key: u64, default_expanded: bool) bool {
         return self.expanded_cards.get(key) orelse default_expanded;
     }
@@ -8350,9 +11203,7 @@ pub const AppState = struct {
             if (x < hit.rect.x or x > hit.rect.x + hit.rect.w) continue;
             if (y < hit.rect.y or y > hit.rect.y + hit.rect.h) continue;
             const expanded = !self.isCardExpandedDefault(hit.key, hit.default_expanded);
-            self.expanded_cards.put(hit.key, expanded) catch |err| {
-                log.warn("failed to store expanded card: {s}", .{@errorName(err)});
-            };
+            self.setCardExpanded(hit.key, expanded);
             if (hit.kind == .tool_call_group and self.app_config.tool_call_group_preference == .remember_last) {
                 self.app_config.tool_call_groups_last_expanded = expanded;
                 app_config.saveAppConfig(self.allocator, &self.app_config) catch |err| {
@@ -8407,6 +11258,224 @@ pub const AppState = struct {
         return false;
     }
 };
+
+test "lazy transcript hydration trims a durable page overlap by message identity" {
+    const page = [_]PersistedMessage{
+        .{ .role = .assistant, .author = "Claude", .body = "older reply", .message_id = "turn:old:msg:1" },
+        .{ .role = .user, .author = "You", .body = "submitted prompt", .message_id = "gui-msg:current" },
+    };
+    const materialized = [_]ChatMessage{
+        .{ .role = .user, .author = "You", .body = "submitted prompt", .message_id = "gui-msg:current" },
+    };
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        AppState.transcriptPageSuffixOverlap(&page, &materialized),
+    );
+
+    const different_identity = [_]ChatMessage{
+        .{ .role = .user, .author = "You", .body = "submitted prompt", .message_id = "gui-msg:different" },
+    };
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        AppState.transcriptPageSuffixOverlap(&page, &different_identity),
+    );
+}
+
+test "transcript hydration first page is viewport sized, later pages bulk" {
+    try std.testing.expectEqual(db_client.TRANSCRIPT_FIRST_PAGE_SIZE, AppState.transcriptHydrationPageLimit(0));
+    try std.testing.expectEqual(db_client.TRANSCRIPT_MESSAGE_PAGE_SIZE, AppState.transcriptHydrationPageLimit(1));
+}
+
+/// Shared harness for the async-hydration commit tests: a minimal AppState
+/// with one project/thread and a hand-built completed hydration request, so
+/// pollTranscriptHydration's guard and commit run without worker threads.
+fn testTranscriptHydrationState(allocator: std.mem.Allocator) !AppState {
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.transcript_controller = .{};
+    state.transcript_hydration = .{};
+    var project = try Project.init(allocator, "hydrate-ws", "Hydrate", "/tmp/hydrate", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    return state;
+}
+
+fn testTranscriptHydrationCleanup(state: *AppState) void {
+    const allocator = state.allocator;
+    for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+    state.project_controller.projects.deinit(allocator);
+}
+
+fn testCompletedHydrationArgs(state: *AppState, before_offset: usize) !*TranscriptHydrationArgs {
+    const allocator = state.allocator;
+    const thread = state.currentProjectMutable().currentThreadMutable();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const page_messages = try arena.allocator().alloc(db_types.PersistedMessage, 2);
+    page_messages[0] = .{ .role = .user, .author = "You", .body = "old prompt" };
+    page_messages[1] = .{ .role = .assistant, .author = "Claude", .body = "old reply" };
+    const args = try allocator.create(TranscriptHydrationArgs);
+    errdefer allocator.destroy(args);
+    const workspace_id = try allocator.dupe(u8, state.currentProject().id);
+    errdefer allocator.free(workspace_id);
+    args.* = .{
+        .allocator = allocator,
+        .storage = undefined, // never dereferenced once `done` is set
+        .workspace_id = workspace_id,
+        .local_thread_id = try allocator.dupe(u8, thread.local_thread_id),
+        .before_offset = before_offset,
+        .limit = db_client.TRANSCRIPT_FIRST_PAGE_SIZE,
+        .generation = state.transcript_hydration.generation,
+        .page = .{ .arena = arena, .offset = 0, .messages = page_messages },
+    };
+    args.done.store(true, .release);
+    state.transcript_hydration.args = args;
+    state.transcript_hydration.in_flight = true;
+    return args;
+}
+
+test "async transcript hydration drops a page loaded for a superseded selection" {
+    const allocator = std.testing.allocator;
+    var state = try testTranscriptHydrationState(allocator);
+    defer testTranscriptHydrationCleanup(&state);
+    const thread = state.currentProjectMutable().currentThreadMutable();
+    thread.persisted_message_offset = 2;
+    _ = try testCompletedHydrationArgs(&state, 2);
+
+    // The selection changed while the load was in flight: the slow page must
+    // be dropped, never committed into the newly focused transcript.
+    state.noteTranscriptSelectionChanged();
+    try std.testing.expect(!state.pollTranscriptHydration());
+    try std.testing.expectEqual(@as(usize, 0), thread.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 2), thread.persisted_message_offset);
+    // The request is consumed and its resources freed; a new request may start.
+    try std.testing.expect(state.transcript_hydration.args == null);
+    try std.testing.expect(!state.transcript_hydration.in_flight);
+}
+
+test "async transcript hydration commits a matching page and rebases layout indices" {
+    const allocator = std.testing.allocator;
+    var state = try testTranscriptHydrationState(allocator);
+    defer testTranscriptHydrationCleanup(&state);
+    const thread = state.currentProjectMutable().currentThreadMutable();
+    thread.persisted_message_offset = 2;
+    // One materialized tail row with layout bookkeeping, to observe the
+    // prepend shifting indices — the input the scroll-anchor rebase keys on.
+    try thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "tail prompt"),
+    });
+    try thread.transcript_layout_items.append(allocator, .{
+        .message_index = 0,
+        .group_end = 1,
+        .top = -40.0,
+        .height = 40.0,
+    });
+    thread.transcript_layout_first_message_index = 0;
+    _ = try testCompletedHydrationArgs(&state, 2);
+
+    try std.testing.expect(state.pollTranscriptHydration());
+    try std.testing.expectEqual(@as(usize, 3), thread.messages.items.len);
+    try std.testing.expectEqualStrings("old prompt", thread.messages.items[0].body);
+    try std.testing.expectEqualStrings("tail prompt", thread.messages.items[2].body);
+    try std.testing.expectEqual(@as(usize, 0), thread.persisted_message_offset);
+    // Layout rows follow their messages so saved anchors stay on their rows
+    // (tail-pinned threads keep pointing at the tail rows).
+    try std.testing.expectEqual(@as(usize, 2), thread.transcript_layout_items.items[0].message_index);
+    try std.testing.expectEqual(@as(usize, 3), thread.transcript_layout_items.items[0].group_end);
+    try std.testing.expectEqual(@as(usize, 2), thread.transcript_layout_first_message_index);
+    try std.testing.expect(!thread.transcript_layout_valid);
+    try std.testing.expect(state.transcript_hydration.args == null);
+}
+
+test "async transcript hydration commits by identity into an unfocused thread exactly once" {
+    const allocator = std.testing.allocator;
+    var state = try testTranscriptHydrationState(allocator);
+    defer testTranscriptHydrationCleanup(&state);
+    const project = state.currentProjectMutable();
+    _ = try project.addThread(allocator);
+    const focused_pane_id = try project.workspace_layout.createChatPane(allocator, 1);
+    // Thread X (index 0) belongs to an unfocused pane with durable history;
+    // its request is minted while the render-path pane swap has X selected.
+    const thread_x = &project.threads.items[0];
+    const thread_y = &project.threads.items[1];
+    thread_x.persisted_message_offset = 2;
+    try thread_x.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "tail prompt"),
+    });
+    try thread_x.transcript_layout_items.append(allocator, .{
+        .message_index = 0,
+        .group_end = 1,
+        .top = -40.0,
+        .height = 40.0,
+    });
+    thread_x.transcript_layout_first_message_index = 0;
+    thread_x.transcript_layout_message_count = 1;
+    thread_x.transcript_layout_committed_height = 40.0;
+    thread_x.transcript_scroll_valid = true;
+    thread_x.transcript_scroll_y = 400.0;
+    const pane_x = project.workspace_layout.paneByIdMutable(1) orelse return error.MissingChatPane;
+    pane_x.ref.chat.transcript_scroll_valid = true;
+    pane_x.ref.chat.transcript_scroll_y = 400.0;
+    thread_y.transcript_scroll_valid = true;
+    thread_y.transcript_scroll_y = 900.0;
+    const pane_y = project.workspace_layout.paneByIdMutable(focused_pane_id) orelse return error.MissingChatPane;
+    pane_y.ref.chat.transcript_scroll_valid = true;
+    pane_y.ref.chat.transcript_scroll_y = 700.0;
+    project.selected_thread_index = 0;
+    _ = try testCompletedHydrationArgs(&state, 2);
+    // By poll time the swap has been restored: thread Y (index 1) is the
+    // focused selection. The page must still commit into X — dropping it
+    // here is the regression that looped spawn→load→drop and left the
+    // unfocused pane blank.
+    project.selected_thread_index = 1;
+    project.workspace_layout.focused_pane_id = focused_pane_id;
+    state.transcript_controller.palette_scroll_y = 333.0;
+
+    try std.testing.expect(state.pollTranscriptHydration());
+    try std.testing.expectEqual(@as(usize, 3), thread_x.messages.items.len);
+    try std.testing.expectEqualStrings("old prompt", thread_x.messages.items[0].body);
+    try std.testing.expectEqualStrings("tail prompt", thread_x.messages.items[2].body);
+    try std.testing.expectEqual(@as(usize, 0), thread_x.persisted_message_offset);
+    // X's numeric offsets rebase by the estimated height of its two prepended
+    // rows, keeping its visible row fixed in the expanded coordinate space.
+    try std.testing.expectEqual(@as(f32, 480.0), thread_x.transcript_scroll_y);
+    try std.testing.expectEqual(@as(f32, 480.0), project.workspace_layout.paneById(1).?.ref.chat.transcript_scroll_y);
+    // The focused thread is untouched — no cross-thread commit.
+    try std.testing.expectEqual(@as(usize, 0), thread_y.messages.items.len);
+    try std.testing.expectEqual(@as(f32, 900.0), thread_y.transcript_scroll_y);
+    try std.testing.expectEqual(@as(f32, 700.0), project.workspace_layout.paneById(focused_pane_id).?.ref.chat.transcript_scroll_y);
+    try std.testing.expectEqual(@as(f32, 333.0), state.transcript_controller.palette_scroll_y);
+    try std.testing.expectEqual(@as(usize, 1), project.selected_thread_index);
+    try std.testing.expect(state.transcript_hydration.args == null);
+    try std.testing.expect(!state.transcript_hydration.in_flight);
+    // No request loop: X is fully hydrated, so re-rendering its pane (swap
+    // active again) mints no further request.
+    project.selected_thread_index = 0;
+    state.requestOlderCurrentThreadMessages();
+    try std.testing.expect(!state.transcript_hydration.in_flight);
+}
+
+test "async transcript hydration ignores a stale before-offset after a prior commit" {
+    const allocator = std.testing.allocator;
+    var state = try testTranscriptHydrationState(allocator);
+    defer testTranscriptHydrationCleanup(&state);
+    const thread = state.currentProjectMutable().currentThreadMutable();
+    // The thread's paged-out offset moved (another commit landed): a request
+    // minted against the old offset would double-prepend, so it is dropped.
+    thread.persisted_message_offset = 4;
+    _ = try testCompletedHydrationArgs(&state, 2);
+    try std.testing.expect(!state.pollTranscriptHydration());
+    try std.testing.expectEqual(@as(usize, 0), thread.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 4), thread.persisted_message_offset);
+}
 
 fn importThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
     return switch (provider) {
@@ -8487,6 +11556,7 @@ const SHUTDOWN_WATCHDOG_TIMEOUT_MS: u64 = 10_000;
 const SHUTDOWN_WATCHDOG_POLL_MS: u64 = 200;
 
 var shutdown_watchdog_deinit_complete: std.atomic.Value(bool) = .init(false);
+var shutdown_watchdog_state_durable: std.atomic.Value(bool) = .init(false);
 
 fn startShutdownWatchdog() void {
     const thread = std.Thread.spawn(.{}, shutdownWatchdogMain, .{}) catch |err| {
@@ -8503,6 +11573,14 @@ fn shutdownWatchdogMain() void {
         platform_runtime.sleepMillis(SHUTDOWN_WATCHDOG_POLL_MS);
     }
     if (shutdown_watchdog_deinit_complete.load(.acquire)) return;
+    while (!shutdown_watchdog_state_durable.load(.acquire)) {
+        // Never discard an unsaved/unspooled projection. The owning deinit
+        // remains alive and may recover enough filesystem/allocator capacity
+        // to complete the durability transfer.
+        runtime_log.diagnostic("AppState.deinit watchdog waiting for dirty-state durability", .{});
+        platform_runtime.sleepMillis(SHUTDOWN_WATCHDOG_POLL_MS);
+        if (shutdown_watchdog_deinit_complete.load(.acquire)) return;
+    }
     runtime_log.diagnostic(
         "AppState.deinit watchdog expired after {d} ms; forcing process exit",
         .{SHUTDOWN_WATCHDOG_TIMEOUT_MS},
@@ -8710,6 +11788,7 @@ test "shared browser runtime routes state through its workspace owner" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
     state.allocator = allocator;
+    state.app_config = .{};
     state.project_controller.projects = .empty;
     state.project_controller.selected_index = 0;
     state.browser_controller.runtime_project_index = null;
@@ -8735,12 +11814,14 @@ test "shared browser runtime routes state through its workspace owner" {
     try state.browserPaneRefMutable(1, second_pane_id).?.activeTab().?.recordNavigation(allocator, "https://second.example/");
 
     state.browser_controller.runtime_project_index = 1;
+    state.browser_controller.runtime_pane_id = second_pane_id;
     try std.testing.expectEqual(@as(usize, 1), state.browserWorkspaceLocation().?.index);
     try std.testing.expectEqual(second_pane_id, state.browserWorkspacePaneId().?);
     try std.testing.expectEqualStrings("https://second.example/", state.browserPaneSnapshotUrl(1, second_pane_id).?);
     try std.testing.expectEqualStrings("https://first.example/", state.browserPaneSnapshotUrl(0, first_pane_id).?);
 
     state.browser_controller.runtime_project_index = 0;
+    state.browser_controller.runtime_pane_id = first_pane_id;
     try std.testing.expectEqual(@as(usize, 0), state.browserWorkspaceLocation().?.index);
     try std.testing.expectEqual(first_pane_id, state.browserWorkspacePaneId().?);
     try std.testing.expect(state.browserPaneIdInWorkspace(1) != null);
@@ -8819,6 +11900,58 @@ test "new Codex threads default to GPT-5.6 Sol with low reasoning" {
     defer thread.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(DEFAULT_CODEX_MODEL, thread.model_ref.?);
     try std.testing.expectEqual(DEFAULT_CODEX_REASONING_EFFORT, thread.reasoning_effort.?);
+}
+
+test "background task action hits remain valid for pending transcript events" {
+    const allocator = std.testing.allocator;
+    const page = std.heap.page_allocator;
+    var thread = try ChatThread.init(allocator, "Background action");
+    defer thread.deinit(allocator);
+
+    const body = "sleep 10\n\nVerde task ID: task-1";
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "sleep 10"),
+        .task_id = try allocator.dupeZ(u8, "task-1"),
+        .status = .running,
+    });
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "Background command"),
+        .body = try allocator.dupeZ(u8, body),
+    });
+    try thread.send_state.pending_events.append(page, .{
+        .role = .system,
+        .author = try page.dupe(u8, "Background command"),
+        .body = try page.dupe(u8, body),
+    });
+    const untracked_body = "provider-owned command";
+    try thread.send_state.pending_events.append(page, .{
+        .role = .system,
+        .author = try page.dupe(u8, "Background command"),
+        .body = try page.dupe(u8, untracked_body),
+    });
+
+    const task = &thread.background_tasks.items[0];
+    const tracked_hit: BackgroundTaskActionHit = .{
+        .rect = .{},
+        .project_index = 0,
+        .thread_index = 0,
+        .task_index = 0,
+        .message_index = 0,
+        .body_hash = std.hash.Wyhash.hash(0, body),
+        .action = .stop,
+    };
+    try std.testing.expect(AppState.resolveBackgroundTaskActionHit(&thread, tracked_hit).?.task == task);
+    var pending_hit = tracked_hit;
+    pending_hit.message_index = 1;
+    try std.testing.expect(AppState.resolveBackgroundTaskActionHit(&thread, pending_hit).?.task == task);
+
+    pending_hit.task_index = null;
+    pending_hit.message_index = 2;
+    pending_hit.body_hash = std.hash.Wyhash.hash(0, untracked_body);
+    try std.testing.expect(AppState.resolveBackgroundTaskActionHit(&thread, pending_hit).?.task == null);
+    pending_hit.message_index = 3;
+    try std.testing.expect(AppState.resolveBackgroundTaskActionHit(&thread, pending_hit) == null);
 }
 
 test "provider-aware chat creation scopes mutation and rejects invalid models" {
@@ -8945,11 +12078,15 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
     try std.testing.expectEqual(thread_count_before_rejection, state.project_controller.projects.items[1].threads.items.len);
     try std.testing.expectEqual(pane_count_before_rejection, state.project_controller.projects.items[1].workspace_layout.panes.items.len);
 
-    try std.testing.expectError(error.UnsupportedReasoningEffort, state.openWorkspaceChat(1, .{
+    const max_settings = try state.resolveChatCreationSettings(.{
         .provider = .codex,
         .reasoning_effort = .max,
-        .target_pane_id = 1,
-    }));
+    }, "gpt-5.6-luna");
+    try std.testing.expectEqual(ReasoningEffort.max, max_settings.reasoning_effort.?);
+    try std.testing.expectError(error.UnsupportedReasoningEffort, state.resolveChatCreationSettings(.{
+        .provider = .codex,
+        .reasoning_effort = .max,
+    }, "gpt-5.5"));
     try std.testing.expectError(error.UnsupportedReasoningEffort, state.openWorkspaceChat(1, .{
         .provider = .opencode,
         .reasoning_effort = .medium,
@@ -8980,6 +12117,112 @@ test "provider-aware chat creation scopes mutation and rejects invalid models" {
     }));
     try std.testing.expectEqual(thread_count_before_rejection, state.project_controller.projects.items[1].threads.items.len);
     try std.testing.expectEqual(pane_count_before_rejection, state.project_controller.projects.items[1].workspace_layout.panes.items.len);
+}
+
+test "durable projected chat presentation is idempotent and never mints identity" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.lifecycle.dirty = false;
+    state.lifecycle.last_dirty_at_ms = 0;
+    state.lifecycle.last_interaction_at_ms = 0;
+    state.terminal_controller.focused = false;
+    state.composer_controller.focused = false;
+    state.composer_controller.composer = PaletteComposerPrompt.init();
+    state.composer_controller.model_picker = PaletteModelPicker.init(0);
+    @memset(&state.sidebar_notice_storage, 0);
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.composer_controller.composer.deinit(allocator);
+    }
+    var project = try Project.init(allocator, "durable-workspace", "Durable", "/tmp/durable", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    const thread_index = try state.project_controller.projects.items[0].addThread(allocator);
+    const stable_id = state.project_controller.projects.items[0].threads.items[thread_index].local_thread_id;
+    const pane_count = state.project_controller.projects.items[0].workspace_layout.panes.items.len;
+    var layout = &state.project_controller.projects.items[0].workspace_layout;
+    const focused_before = layout.focused_pane_id;
+    const next_pane_id_before = layout.next_pane_id;
+    layout.maximized_pane_id = focused_before;
+    layout.scroll_offset_x = 11.25;
+    layout.scroll_target_x = 12.5;
+    layout.scroll_offset_y = 21.25;
+    layout.scroll_target_y = 22.5;
+    layout.scroll_revealed_pane_id = focused_before;
+    layout.scroll_leading_pane_id = focused_before;
+    layout.scroll_animation_last_ms = 456;
+    layout.scroll_axis_vertical = true;
+    layout.quick_pane = .{
+        .pane_id = focused_before.?,
+        .visible = true,
+        .detached = true,
+        .return_focus_pane_id = focused_before,
+    };
+
+    try std.testing.expectError(error.ProjectionPending, state.presentWorkspaceChat(0, .{ .local_thread_id = "absent", .focus = false }));
+    try std.testing.expect(!state.lifecycle.dirty);
+    const first = try state.presentWorkspaceChat(0, .{ .local_thread_id = stable_id, .focus = false });
+    try std.testing.expectEqual(pane_count + 1, state.project_controller.projects.items[0].workspace_layout.panes.items.len);
+    try std.testing.expectEqual(focused_before, layout.focused_pane_id);
+    try std.testing.expectEqual(focused_before, layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(f32, 11.25), layout.scroll_offset_x);
+    try std.testing.expectEqual(@as(f32, 12.5), layout.scroll_target_x);
+    try std.testing.expectEqual(@as(f32, 21.25), layout.scroll_offset_y);
+    try std.testing.expectEqual(@as(f32, 22.5), layout.scroll_target_y);
+    try std.testing.expectEqual(focused_before, layout.scroll_revealed_pane_id);
+    try std.testing.expectEqual(focused_before, layout.scroll_leading_pane_id);
+    try std.testing.expectEqual(@as(i64, 456), layout.scroll_animation_last_ms);
+    try std.testing.expect(layout.scroll_axis_vertical);
+    try std.testing.expectEqual(focused_before.?, layout.quick_pane.?.pane_id);
+    try std.testing.expect(layout.quick_pane.?.visible);
+    try std.testing.expect(layout.quick_pane.?.detached);
+    try std.testing.expectEqual(focused_before, layout.quick_pane.?.return_focus_pane_id);
+    try std.testing.expectEqual(next_pane_id_before + 1, layout.next_pane_id);
+    try std.testing.expectEqualStrings(stable_id, state.project_controller.projects.items[0].threads.items[first.thread_index].local_thread_id);
+    const repeated = try state.presentWorkspaceChat(0, .{ .local_thread_id = stable_id, .focus = false });
+    try std.testing.expectEqual(first.pane_id, repeated.pane_id);
+    try std.testing.expectEqual(pane_count + 1, state.project_controller.projects.items[0].workspace_layout.panes.items.len);
+}
+
+test "requested projection revision coalesces and failures stay generation scoped" {
+    var loop: ChangeCursorLoopState = .{};
+    try std.testing.expectEqual(.pending, loop.requestProjectionRevision(10));
+    try std.testing.expectEqual(.pending, loop.requestProjectionRevision(8));
+    try std.testing.expectEqual(@as(?u64, 10), loop.requestedProjectionRevision());
+    try std.testing.expect(!loop.acknowledgeProjectionRevision(9));
+    loop.markProjectionRefreshUnavailable(9);
+    try std.testing.expectEqual(.pending, loop.requestProjectionRevision(10));
+    loop.markProjectionRefreshUnavailable(10);
+    try std.testing.expectEqual(.refresh_unavailable, loop.requestProjectionRevision(10));
+    try std.testing.expectEqual(.pending, loop.requestProjectionRevision(12));
+    loop.markProjectionRefreshUnavailable(10);
+    try std.testing.expectEqual(.pending, loop.requestProjectionRevision(12));
+    try std.testing.expect(loop.acknowledgeProjectionRevision(12));
+    try std.testing.expectEqual(@as(?u64, null), loop.requestedProjectionRevision());
+}
+
+test "published forced refresh failure cannot poison a newer requested floor" {
+    const allocator = std.testing.allocator;
+    var loop: ChangeCursorLoopState = .{};
+    try std.testing.expectEqual(.pending, loop.requestProjectionRevision(10));
+    const refresh = try OwnedProjectionRefresh.create(allocator);
+    refresh.requested_projection_revision = 10;
+    try std.testing.expect(loop.publishRefresh(refresh));
+
+    try std.testing.expectEqual(.pending, loop.requestProjectionRevision(12));
+    const drained = loop.takeRefresh().?;
+    defer drained.deinit();
+    loop.noteProjectionRefreshApplyFailure(drained, error.OutOfMemory);
+
+    try std.testing.expectEqual(@as(?u64, 12), loop.requestedProjectionRevision());
+    try std.testing.expectEqual(.pending, loop.requestProjectionRevision(12));
+    try std.testing.expectEqual(false, loop.takeRefreshApplication().?);
 }
 
 test "provider-aware chat creation focuses requested pane" {
@@ -9019,6 +12262,93 @@ test "provider-aware chat creation focuses requested pane" {
         try std.testing.expectEqualStrings(case.model, project.threads.items[result.thread_index].model_ref.?);
     }
     try std.testing.expectEqual(previous_pane_count + cases.len, project.workspace_layout.panes.items.len);
+}
+
+test "activating a thread already visible focuses its pane without changing split geometry" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.terminal_controller.focused = false;
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+
+    var project = try Project.init(allocator, "existing-pane", "Existing pane", "/tmp/existing-pane", 0);
+    const second_thread_index = try project.addThread(allocator);
+    const second_pane_id = try project.workspace_layout.createChatPane(allocator, second_thread_index);
+    try project.workspace_layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .horizontal, true);
+    try std.testing.expect(project.workspace_layout.resizeSplit(1, second_pane_id, .horizontal, 0.63));
+    project.workspace_layout.focused_pane_id = 1;
+    project.workspace_layout.maximized_pane_id = 1;
+    project.workspace_layout.scroll_offset_x = 73.25;
+    project.workspace_layout.scroll_target_x = 73.25;
+    project.workspace_layout.scroll_offset_y = 19.5;
+    project.workspace_layout.scroll_target_y = 19.5;
+    project.workspace_layout.scroll_revealed_pane_id = 1;
+    const activation_layout_json = try project.workspace_layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(activation_layout_json);
+    try project.workspace_layout.applyPersistedWorkspaceJson(allocator, activation_layout_json);
+    try std.testing.expectEqual(@as(f32, 73.25), project.workspace_layout.scroll_offset_x);
+    try std.testing.expectEqual(@as(f32, 73.25), project.workspace_layout.scroll_target_x);
+    try std.testing.expectEqual(@as(f32, 19.5), project.workspace_layout.scroll_offset_y);
+    try std.testing.expectEqual(@as(f32, 19.5), project.workspace_layout.scroll_target_y);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    var away_project = try Project.init(allocator, "away", "Away", "/tmp/away", 0);
+    state.project_controller.projects.append(allocator, away_project) catch |err| {
+        away_project.deinit(allocator);
+        return err;
+    };
+
+    try state.focusProjectThreadInWorkspace(0, second_thread_index);
+    const layout = &state.project_controller.projects.items[0].workspace_layout;
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_offset_x);
+    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_target_x);
+    try std.testing.expectEqual(@as(f32, 19.5), layout.scroll_offset_y);
+    try std.testing.expectEqual(@as(f32, 19.5), layout.scroll_target_y);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.scroll_revealed_pane_id);
+    try std.testing.expect(layout.scroll_leading_pane_id == null);
+    try std.testing.expectEqual(@as(usize, 0), layout.paneById(1).?.ref.chat.thread_index);
+    try std.testing.expectEqual(second_thread_index, layout.paneById(second_pane_id).?.ref.chat.thread_index);
+    switch (layout.root.?.*) {
+        .split => |split| try std.testing.expectApproxEqAbs(@as(f32, 0.63), split.ratio, 0.0001),
+        .leaf => return error.TestExpectedEqual,
+    }
+    // Existing non-maximized activation leaves current-geometry visibility to
+    // the next workspace render instead of trusting prior-frame membership.
+    layout.maximized_pane_id = null;
+    layout.scroll_revealed_pane_id = second_pane_id;
+    try state.focusProjectThreadInWorkspace(0, 0);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.scroll_revealed_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.scroll_leading_pane_id);
+    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_offset_x);
+    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_target_x);
+    switch (layout.root.?.*) {
+        .split => |split| try std.testing.expectApproxEqAbs(@as(f32, 0.63), split.ratio, 0.0001),
+        .leaf => return error.TestExpectedEqual,
+    }
+
+    // An offscreen pane remains eligible for the renderer's bounded
+    // ensure-visible path; activation itself does not invent a raw offset.
+    layout.scroll_revealed_pane_id = 1;
+    try state.focusProjectThreadInWorkspace(0, second_thread_index);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), layout.scroll_revealed_pane_id);
+    layout.requestLeadingScrollReveal(second_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), layout.scroll_leading_pane_id);
+    try state.focusProjectThreadInWorkspace(0, 0);
+    try state.focusProjectThreadInWorkspace(0, second_thread_index);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.scroll_leading_pane_id);
+    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_offset_x);
+    try std.testing.expectEqual(@as(f32, 73.25), layout.scroll_target_x);
 }
 
 test "focused chat creation transfers zoom to the new pane" {
@@ -9093,6 +12423,7 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     defer {
         for (state.project_controller.projects.items) |*project| project.deinit(allocator);
         state.project_controller.projects.deinit(allocator);
+        for (state.surface_controller.surfaces.items) |*surface| surface.deinit(allocator);
         state.surface_controller.surfaces.deinit(allocator);
         state.composer_controller.composer.deinit(allocator);
         state.browser_controller.deinit(allocator);
@@ -9109,7 +12440,8 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     const clicked_terminal_pane_id = try layout.createTerminalPane(allocator, 2);
 
     state.focusWorkspaceOpenPaneFromSidebar(0, chat_pane_id);
-    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.scroll_leading_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.scroll_leading_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.scroll_revealed_pane_id);
     try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(1));
     try std.testing.expectEqual(@as(?WorkspacePaneId, null), layout.scroll_leading_pane_id);
 
@@ -9126,11 +12458,11 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     try std.testing.expect(!state.browser_controller.address_focused);
 
     try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(1));
-    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.focused_pane_id);
-    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.maximized_pane_id);
-    try std.testing.expect(state.composer_controller.focused);
-    try std.testing.expect(state.composer_controller.composer.focused);
-    try std.testing.expect(!state.terminal_controller.focused);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, first_terminal_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, first_terminal_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(!state.composer_controller.focused);
+    try std.testing.expect(!state.composer_controller.composer.focused);
+    try std.testing.expect(state.terminal_controller.focused);
     try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(-1));
     try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.maximized_pane_id);
@@ -9138,11 +12470,16 @@ test "sidebar open pane focus keeps the clicked terminal pane maximized" {
     try std.testing.expect(!state.composer_controller.focused);
     try std.testing.expect(!state.composer_controller.composer.focused);
     try std.testing.expect(state.focusCurrentProjectWorkspacePaneInSidebarOrder(-1));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, chat_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(state.composer_controller.focused);
+    try std.testing.expect(state.composer_controller.composer.focused);
+    try std.testing.expect(!state.terminal_controller.focused);
+    try std.testing.expect(state.focusCurrentProjectWorkspacePaneAtSidebarIndex(2));
     try std.testing.expectEqual(@as(?WorkspacePaneId, first_terminal_pane_id), layout.focused_pane_id);
     try std.testing.expectEqual(@as(?WorkspacePaneId, first_terminal_pane_id), layout.maximized_pane_id);
-    try std.testing.expect(state.focusCurrentProjectWorkspacePaneAtSidebarIndex(2));
-    try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.focused_pane_id);
-    try std.testing.expectEqual(@as(?WorkspacePaneId, clicked_terminal_pane_id), layout.maximized_pane_id);
+    try std.testing.expect(state.terminal_controller.focused);
+    try std.testing.expect(!state.composer_controller.focused);
     try std.testing.expect(!state.focusCurrentProjectWorkspacePaneAtSidebarIndex(3));
 
     layout.quick_pane = .{
@@ -9364,6 +12701,7 @@ test "workspace selection restores focused pane keyboard ownership" {
     const allocator = std.testing.allocator;
     var state: AppState = undefined;
     state.allocator = allocator;
+    state.app_config = .{};
     state.project_controller.projects = .empty;
     state.surface_controller = .{};
     state.project_controller.selected_index = 0;
@@ -9391,6 +12729,7 @@ test "workspace selection restores focused pane keyboard ownership" {
     defer {
         for (state.project_controller.projects.items) |*project| project.deinit(allocator);
         state.project_controller.projects.deinit(allocator);
+        for (state.surface_controller.surfaces.items) |*surface| surface.deinit(allocator);
         state.surface_controller.surfaces.deinit(allocator);
         state.composer_controller.composer.deinit(allocator);
         state.companion_composer.deinit(allocator);
@@ -9398,6 +12737,14 @@ test "workspace selection restores focused pane keyboard ownership" {
     }
 
     var chat_project = try Project.init(allocator, "chat", "Chat", "/tmp/chat", 0);
+    const second_chat_thread_index = try chat_project.addThread(allocator);
+    const second_chat_pane_id = try chat_project.workspace_layout.createChatPane(allocator, second_chat_thread_index);
+    try chat_project.workspace_layout.splitPaneWithLeaf(allocator, 1, second_chat_pane_id, .vertical, true);
+    try std.testing.expect(chat_project.workspace_layout.resizeSplit(1, second_chat_pane_id, .vertical, 0.63));
+    chat_project.workspace_layout.focused_pane_id = second_chat_pane_id;
+    chat_project.selected_thread_index = second_chat_thread_index;
+    chat_project.threads.items[second_chat_thread_index].completion_pending = true;
+    chat_project.threads.items[second_chat_thread_index].completed_at_ms = 1234;
     state.project_controller.projects.append(allocator, chat_project) catch |err| {
         chat_project.deinit(allocator);
         return err;
@@ -9410,6 +12757,16 @@ test "workspace selection restores focused pane keyboard ownership" {
         terminal_project.deinit(allocator);
         return err;
     };
+    try state.surface_controller.surfaces.append(allocator, .{
+        .session_id = try allocator.dupe(u8, "launch-terminal-session"),
+        .workspace_id = try allocator.dupe(u8, "terminal"),
+        .workspace_path = try allocator.dupe(u8, "/tmp/terminal"),
+        .dock_id = 9,
+        .pane_id = terminal_pane_id,
+        .title = try allocator.dupe(u8, "Launch terminal"),
+        .completion_pending = true,
+        .attention = true,
+    });
 
     state.companion_composer.focused = true;
     state.companion_composer.selection_anchor = 0;
@@ -9430,6 +12787,342 @@ test "workspace selection restores focused pane keyboard ownership" {
     try std.testing.expect(!state.terminal_controller.focused);
     try std.testing.expect(state.composer_controller.focused);
     try std.testing.expect(state.composer_controller.composer.focused);
+    const restored_chat_project = &state.project_controller.projects.items[0];
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_chat_pane_id), restored_chat_project.workspace_layout.focused_pane_id);
+    try std.testing.expectEqual(second_chat_thread_index, restored_chat_project.selected_thread_index);
+    try std.testing.expect(restored_chat_project.threads.items[second_chat_thread_index].completion_pending);
+    switch (restored_chat_project.workspace_layout.root.?.*) {
+        .split => |split| try std.testing.expectApproxEqAbs(@as(f32, 0.63), split.ratio, 0.0001),
+        .leaf => return error.TestExpectedEqual,
+    }
+
+    // Exercise main.zig's actual post-init helper: restored keyboard ownership
+    // never acknowledges completion or dirties persisted state.
+    state.lifecycle.dirty = false;
+    state.applyInitialWorkspaceFocusOnLaunch();
+    try std.testing.expect(restored_chat_project.threads.items[second_chat_thread_index].completion_pending);
+    try std.testing.expect(!state.lifecycle.dirty);
+
+    try std.testing.expect(state.selectProjectAtIndex(1));
+    state.lifecycle.dirty = false;
+    state.surface_controller.surfaces.items[0].attention = true;
+    state.applyInitialWorkspaceFocusOnLaunch();
+    try std.testing.expect(state.surface_controller.surfaces.items[0].attention);
+    try std.testing.expect(state.surface_controller.surfaces.items[0].completion_pending);
+    try std.testing.expect(state.terminal_controller.focused);
+    try std.testing.expect(!state.lifecycle.dirty);
+
+    // Exercise the production close/relaunch seam: live Project capture,
+    // protocol snapshot, Store replacement, RO projection load, layout
+    // materialization, then exact native-runtime binding.
+    var source_project = try Project.init(allocator, "browser", "Browser", "/tmp/browser", 0);
+    defer source_project.deinit(allocator);
+    const source_chat_pane_id = source_project.workspace_layout.focused_pane_id orelse return error.TestExpectedEqual;
+    source_project.threads.items[0].committed = true;
+    const nested_thread_index = try source_project.addThread(allocator);
+    source_project.threads.items[nested_thread_index].committed = true;
+    const nested_chat_pane_id = try source_project.workspace_layout.createChatPane(allocator, nested_thread_index);
+    try source_project.workspace_layout.splitPaneWithLeaf(allocator, source_chat_pane_id, nested_chat_pane_id, .horizontal, true);
+    const exact_terminal_pane_id = try source_project.workspace_layout.createTerminalPane(allocator, 7);
+    try source_project.workspace_layout.ensurePaneInRootSplit(allocator, exact_terminal_pane_id, .vertical, 0.36);
+    const terminal_layout_json =
+        \\{"active_tab_index":0,"font_scale":1.125,"tabs":[{"title":"exact nested launch dock","active_pane_id":31,"root_node_id":1,"nodes":[{"node_id":1,"kind":"leaf","pane_id":31,"session_id":"exact-launch-session-31","revive_policy":"attach_or_create"}]}]}
+    ;
+    var exact_dock = try terminal.Dock.init(allocator);
+    try exact_dock.applyPersistedLayoutJson(allocator, terminal_layout_json);
+    source_project.terminal_docks.append(allocator, .{ .id = 7, .dock = exact_dock }) catch |err| {
+        exact_dock.deinit(allocator);
+        return err;
+    };
+    const exact_browser_pane_id = try source_project.workspace_layout.ensureBrowserPane(allocator);
+    try std.testing.expect(source_project.workspace_layout.resizeSplit(exact_terminal_pane_id, exact_browser_pane_id, .vertical, 0.41));
+    const source_browser = switch (source_project.workspace_layout.paneByIdMutable(exact_browser_pane_id).?.ref) {
+        .browser => |*browser| browser,
+        else => return error.TestExpectedEqual,
+    };
+    const source_tab = source_browser.activeTab() orelse return error.TestExpectedEqual;
+    try source_tab.recordNavigation(allocator, "about:blank");
+    const exact_url = "https://pane-two.example/second/this-is-a-deliberately-long-launch-target/with-distinct-workspace-layout-and-history?proof=revision-21";
+    const exact_title = "Pane two exact persisted launch title that must survive materialization and delayed runtime binding";
+    try source_tab.recordNavigation(allocator, exact_url);
+    try source_tab.setTitle(allocator, exact_title);
+    source_project.workspace_layout.focused_pane_id = exact_browser_pane_id;
+    source_project.workspace_layout.maximized_pane_id = exact_browser_pane_id;
+
+    var prefix_project = try Project.init(allocator, "prefix", "Prefix", "/tmp/prefix", 0);
+    defer prefix_project.deinit(allocator);
+    prefix_project.threads.items[0].committed = true;
+    const prefix_thread_index = try prefix_project.addThread(allocator);
+    prefix_project.threads.items[prefix_thread_index].committed = true;
+    const prefix_pane_id = try prefix_project.workspace_layout.createChatPane(allocator, prefix_thread_index);
+    try prefix_project.workspace_layout.splitPaneWithLeaf(allocator, 1, prefix_pane_id, .horizontal, true);
+    try std.testing.expect(prefix_project.workspace_layout.resizeSplit(1, prefix_pane_id, .horizontal, 0.67));
+    const source_projects = [_]Project{ prefix_project, source_project };
+    var captured = try persistence.buildSnapshot(.{
+        .projects = &source_projects,
+        .archived_projects = &.{},
+        .selected_project_index = 1,
+        .sidebar_collapsed = false,
+    }, allocator);
+    defer captured.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const pref_path = path_buf[0..path_len];
+    const db_path = try std.fs.path.joinZ(allocator, &.{ pref_path, db_client.STATE_DB_NAME });
+    defer allocator.free(db_path);
+    var store = try daemon_store.Store.init(allocator, db_path);
+    defer store.deinit();
+    var protocol_arena = std.heap.ArenaAllocator.init(allocator);
+    defer protocol_arena.deinit();
+    const protocol_snapshot = try persistence.persistedStateToProtocolSnapshot(protocol_arena.allocator(), captured.value, 0);
+    const write = try store.replaceSnapshot(.{
+        .mutation = .{
+            .request_key = "browser-close-relaunch",
+            .client_id = "browser-test-client",
+            .expected_store_revision = 0,
+        },
+        .snapshot = protocol_snapshot,
+        .bootstrap = false,
+    });
+    try std.testing.expect(write.applied);
+    var launch_storage = try state_storage.Storage.initWithPrefPath(allocator, pref_path);
+    defer launch_storage.deinit();
+    var launch_state = try AppState.init(allocator, &launch_storage, .{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer {
+        launch_state.lifecycle.clearDirty();
+        launch_state.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 2), launch_state.project_controller.projects.items.len);
+    try std.testing.expectEqual(@as(usize, 1), launch_state.project_controller.selected_index);
+    const reloaded_layout = &launch_state.project_controller.projects.items[1].workspace_layout;
+    switch (reloaded_layout.paneById(exact_browser_pane_id).?.ref) {
+        .browser => {},
+        else => return error.TestExpectedEqual,
+    }
+    try std.testing.expectEqual(@as(?WorkspacePaneId, exact_browser_pane_id), reloaded_layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, exact_browser_pane_id), reloaded_layout.maximized_pane_id);
+    const reloaded_terminal = launch_state.project_controller.projects.items[1].terminalDockEntryById(7) orelse return error.TestExpectedEqual;
+    const reloaded_terminal_active = reloaded_terminal.dock.activePaneConst() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u32, 31), reloaded_terminal_active.id);
+    try std.testing.expectEqualStrings("exact-launch-session-31", reloaded_terminal_active.session_id.?);
+    try std.testing.expectEqual(@as(u32, 8), launch_state.project_controller.projects.items[1].next_terminal_dock_id);
+    var controller_navigation: std.ArrayList(u8) = .empty;
+    defer controller_navigation.deinit(allocator);
+    launch_state.browser_controller.runtime.controller.test_navigation_capture = &controller_navigation;
+    launch_state.browser_textures_enabled = true;
+    launch_state.browser_controller.runtime_project_index = null;
+    launch_state.browser_controller.runtime_pane_id = null;
+    launch_state.lifecycle.clearDirty();
+    const dirty_generation = launch_state.lifecycle.dirty_generation;
+    launch_state.restorePersistedBrowserPaneOnLaunch();
+    launch_state.applyInitialWorkspaceFocusOnLaunch();
+    _ = launch_state.pollBrowser();
+    _ = launch_state.pollBrowser();
+    try std.testing.expectEqual(@as(?WorkspacePaneId, exact_browser_pane_id), reloaded_layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, exact_browser_pane_id), reloaded_layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, exact_browser_pane_id), launch_state.browser_controller.runtime_pane_id);
+    try std.testing.expectEqualStrings(exact_url, launch_state.browser_controller.runtime.current_url.?);
+    try std.testing.expectEqualStrings(exact_url, launch_state.browser_controller.runtime.addressInput());
+    try std.testing.expectEqualStrings(exact_url, controller_navigation.items);
+    const restored_browser = launch_state.browserPaneRefMutable(1, exact_browser_pane_id) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 2), restored_browser.activeTab().?.history.items.len);
+    try std.testing.expectEqualStrings(exact_title, restored_browser.activeTab().?.title.?);
+    try std.testing.expectEqual(true, launch_state.browser_controller.pane_focused);
+    try std.testing.expectEqual(true, state.surface_controller.surfaces.items[0].attention);
+    try std.testing.expectEqual(false, launch_state.lifecycle.dirty);
+    try std.testing.expectEqual(dirty_generation, launch_state.lifecycle.dirty_generation);
+    try std.testing.expectEqual(@as(u64, 1), try store.storeRevision());
+
+    // A subsequent legitimate mutation may advance the Store, but its
+    // production snapshot must retain the exact restored owners and payloads.
+    try std.testing.expect(launch_state.selectProjectAtIndex(0));
+    var after_user_mutation = try persistence.buildSnapshot(.{
+        .projects = launch_state.project_controller.projects.items,
+        .archived_projects = &.{},
+        .selected_project_index = launch_state.project_controller.selected_index,
+        .sidebar_collapsed = false,
+    }, allocator);
+    defer after_user_mutation.deinit();
+    var second_protocol_arena = std.heap.ArenaAllocator.init(allocator);
+    defer second_protocol_arena.deinit();
+    const second_protocol_snapshot = try persistence.persistedStateToProtocolSnapshot(second_protocol_arena.allocator(), after_user_mutation.value, 1);
+    const second_write = try store.replaceSnapshot(.{
+        .mutation = .{
+            .request_key = "browser-legitimate-user-mutation",
+            .client_id = "browser-test-client",
+            .expected_store_revision = 1,
+        },
+        .snapshot = second_protocol_snapshot,
+        .bootstrap = false,
+    });
+    try std.testing.expect(second_write.applied);
+    try std.testing.expectEqual(@as(u64, 2), second_write.store_revision);
+    var reader = try db_client.Client.initReadOnly(allocator, pref_path);
+    defer reader.deinit();
+    var reloaded = (try reader.load(allocator)).?;
+    defer reloaded.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, reloaded.value.projects[1].workspace_layout_json.?, exact_url) != null);
+    try std.testing.expect(std.mem.indexOf(u8, reloaded.value.projects[1].terminal_docks_json.?, "exact-launch-session-31") != null);
+}
+
+test "ordinary browser focus and deletion preserve exact pane runtime ownership" {
+    const allocator = std.testing.allocator;
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.app_config = .{};
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.surface_controller = .{};
+    state.browser_controller = try browser_controller.State.init(allocator);
+    state.browser_textures_enabled = true;
+    state.browser_controller.pane_focused = false;
+    state.browser_controller.address_focused = false;
+    state.terminal_controller.focused = false;
+    state.composer_controller.focused = false;
+    state.composer_controller.composer = PaletteComposerPrompt.init();
+    state.composer_controller.model_picker = PaletteModelPicker.init(0);
+    state.composer_controller.popover_restore_focus = false;
+    state.composer_controller.run_config_open = false;
+    state.palette_modal_text_focus = .none;
+    state.lifecycle.dirty = false;
+    state.lifecycle.last_dirty_at_ms = 0;
+    state.lifecycle.last_interaction_at_ms = 0;
+    @memset(&state.sidebar_notice_storage, 0);
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+        state.surface_controller.surfaces.deinit(allocator);
+        state.composer_controller.composer.deinit(allocator);
+        state.browser_controller.deinit(allocator);
+    }
+
+    var first_project = try Project.init(allocator, "browser-exact-one", "Browser exact one", "/tmp/browser-exact-one", 0);
+    state.project_controller.projects.append(allocator, first_project) catch |err| {
+        first_project.deinit(allocator);
+        return err;
+    };
+    var second_project = try Project.init(allocator, "browser-exact-two", "Browser exact two", "/tmp/browser-exact-two", 0);
+    state.project_controller.projects.append(allocator, second_project) catch |err| {
+        second_project.deinit(allocator);
+        return err;
+    };
+    const first_layout_json =
+        \\{"v":2,"next":7,"focused":1,"maximized":null,"panes":[
+        \\{"id":1,"kind":"browser","active_tab":0,"tabs":[{"url":"https://pane-one.example/","title":"Pane one","history_index":0,"history":["https://pane-one.example/"]}]},
+        \\{"id":2,"kind":"browser","active_tab":0,"tabs":[{"url":"https://pane-two.example/","title":"Pane two","history_index":0,"history":["https://pane-two.example/"]}]},
+        \\{"id":3,"kind":"browser","active_tab":0,"tabs":[{"url":"https://pane-three.example/","title":"Pane three","history_index":0,"history":["https://pane-three.example/"]}]},
+        \\{"id":4,"kind":"browser","active_tab":0,"tabs":[{"url":"https://pane-four.example/","title":"Pane four","history_index":0,"history":["https://pane-four.example/"]}]},
+        \\{"id":5,"kind":"browser","active_tab":0,"tabs":[{"url":"https://pane-five.example/","title":"Pane five","history_index":0,"history":["https://pane-five.example/"]}]},
+        \\{"id":6,"kind":"browser","active_tab":0,"tabs":[{"url":"https://pane-six.example/","title":"Pane six","history_index":0,"history":["https://pane-six.example/"]}]}],
+        \\"root":{"split":{"axis":"vertical","ratio":0.5,"first":{"split":{"axis":"vertical","ratio":0.5,"first":{"leaf":1},"second":{"leaf":2}}},"second":{"split":{"axis":"vertical","ratio":0.5,"first":{"split":{"axis":"vertical","ratio":0.5,"first":{"leaf":3},"second":{"leaf":4}}},"second":{"split":{"axis":"vertical","ratio":0.5,"first":{"leaf":5},"second":{"leaf":6}}}}}}}}
+    ;
+    const second_layout_json =
+        \\{"v":2,"next":11,"focused":10,"maximized":10,"panes":[
+        \\{"id":10,"kind":"browser","active_tab":0,"tabs":[{"url":"https://other-workspace.example/","title":"Other workspace","history_index":0,"history":["https://other-workspace.example/"]}]}],
+        \\"root":{"leaf":10}}
+    ;
+    try state.project_controller.projects.items[0].workspace_layout.applyPersistedWorkspaceJson(allocator, first_layout_json);
+    try state.project_controller.projects.items[1].workspace_layout.applyPersistedWorkspaceJson(allocator, second_layout_json);
+
+    var controller_navigation: std.ArrayList(u8) = .empty;
+    defer controller_navigation.deinit(allocator);
+    state.browser_controller.runtime.controller.test_navigation_capture = &controller_navigation;
+
+    // Restore is clean and history-neutral; ordinary focus then follows the
+    // exact pane 1 -> pane 2 -> pane 1 sequence and owns keyboard input.
+    try std.testing.expect(state.restoreWorkspacePaneFocus(0, 1));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), state.browser_controller.runtime_pane_id);
+    try std.testing.expectEqualStrings("https://pane-one.example/", controller_navigation.items);
+    try std.testing.expect(!state.lifecycle.dirty);
+    try std.testing.expect(state.focusWorkspacePane(0, 2));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 2), state.project_controller.projects.items[0].workspace_layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 2), state.browser_controller.runtime_pane_id);
+    try std.testing.expectEqualStrings("https://pane-two.example/", state.browser_controller.runtime.addressInput());
+    try std.testing.expectEqualStrings("Pane two", state.browser_controller.runtime.current_title.?);
+    try std.testing.expectEqualStrings("https://pane-two.example/", controller_navigation.items);
+    try std.testing.expect(state.browser_controller.pane_focused);
+    try std.testing.expect(state.lifecycle.dirty);
+    try std.testing.expect(state.focusWorkspacePane(0, 1));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), state.browser_controller.runtime_pane_id);
+    try std.testing.expectEqualStrings("https://pane-one.example/", controller_navigation.items);
+    inline for (1..7) |pane_id| {
+        try std.testing.expectEqual(@as(usize, 1), state.browserPaneRefMutable(0, pane_id).?.activeTab().?.history.items.len);
+    }
+
+    // Maximize and the IPC activation/focus pair target pane 2 without using
+    // the first browser pane or appending a synthetic history entry.
+    try std.testing.expect(state.maximizeWorkspacePane(0, 2));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 2), state.project_controller.projects.items[0].workspace_layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 2), state.browser_controller.runtime_pane_id);
+    try std.testing.expect(state.focusWorkspacePane(0, 1));
+    state.project_controller.projects.items[0].workspace_layout.focused_pane_id = 2;
+    state.lifecycle.dirty = false;
+    const activated = try state.activateBrowserInWorkspace(0);
+    try std.testing.expectEqual(@as(WorkspacePaneId, 2), activated.pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 2), state.browser_controller.runtime_pane_id);
+    state.focusBrowserPane();
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 2), state.project_controller.projects.items[0].workspace_layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 2), state.project_controller.projects.items[0].workspace_layout.maximized_pane_id);
+    try std.testing.expect(state.browser_controller.pane_focused);
+    try std.testing.expect(state.lifecycle.dirty);
+    try std.testing.expectEqual(@as(usize, 1), state.browserPaneRefMutable(0, 2).?.activeTab().?.history.items.len);
+
+    // Closing an unbound sibling leaves pane 2's runtime untouched. Closing
+    // bound/maximized pane 2 transfers focus, zoom, page, and ownership to the
+    // pane on its left without destroying runtime-local state.
+    try state.browser_controller.runtime.setLastEvalResult("retained-runtime-sentinel");
+    try std.testing.expect(state.closeWorkspacePane(0, 3));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 2), state.browser_controller.runtime_pane_id);
+    try std.testing.expectEqualStrings("https://pane-two.example/", controller_navigation.items);
+    try std.testing.expectEqualStrings("retained-runtime-sentinel", state.browser_controller.runtime.last_eval_result.?);
+    try std.testing.expect(state.closeWorkspacePane(0, 2));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), state.project_controller.projects.items[0].workspace_layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), state.project_controller.projects.items[0].workspace_layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), state.browser_controller.runtime_pane_id);
+    try std.testing.expectEqualStrings("https://pane-one.example/", controller_navigation.items);
+    try std.testing.expectEqualStrings("retained-runtime-sentinel", state.browser_controller.runtime.last_eval_result.?);
+
+    // A stale persisted focus falls back deterministically in workspace 2.
+    // While workspace 1 is retained, deleting unbound siblings preserves it;
+    // deleting its bound pane invalidates only the binding, and returning
+    // reuses that runtime while navigating to the right-side survivor (no
+    // left neighbor remains).
+    state.project_controller.selected_index = 1;
+    state.project_controller.projects.items[1].workspace_layout.focused_pane_id = 999;
+    state.lifecycle.dirty = false;
+    state.restorePersistedBrowserPaneAfterProjectSelection(1);
+    state.applyInitialWorkspaceFocusOnLaunch();
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 10), state.project_controller.projects.items[1].workspace_layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 10), state.project_controller.projects.items[1].workspace_layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 10), state.browser_controller.runtime_pane_id);
+    try std.testing.expectEqualStrings("https://other-workspace.example/", controller_navigation.items);
+    try std.testing.expect(!state.lifecycle.dirty);
+
+    try std.testing.expect(state.closeWorkspacePane(0, 5));
+    try std.testing.expect(state.closeWorkspacePane(0, 4));
+    try std.testing.expect(state.closeWorkspacePane(0, 1));
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 6), state.project_controller.projects.items[0].workspace_layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 6), state.project_controller.projects.items[0].workspace_layout.maximized_pane_id);
+    state.project_controller.selected_index = 0;
+    state.lifecycle.dirty = false;
+    state.restorePersistedBrowserPaneAfterProjectSelection(0);
+    state.applyInitialWorkspaceFocusOnLaunch();
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 6), state.project_controller.projects.items[0].workspace_layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 6), state.project_controller.projects.items[0].workspace_layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 6), state.browser_controller.runtime_pane_id);
+    try std.testing.expectEqual(@as(?usize, 0), state.browser_controller.runtime_project_index);
+    try std.testing.expectEqualStrings("https://pane-six.example/", state.browser_controller.runtime.current_url.?);
+    try std.testing.expectEqualStrings("Pane six", state.browser_controller.runtime.current_title.?);
+    try std.testing.expectEqualStrings("https://pane-six.example/", controller_navigation.items);
+    try std.testing.expectEqualStrings("retained-runtime-sentinel", state.browser_controller.runtime.last_eval_result.?);
+    try std.testing.expectEqual(@as(usize, 1), state.browserPaneRefMutable(0, 6).?.activeTab().?.history.items.len);
+    try std.testing.expect(state.browser_controller.pane_focused);
+    try std.testing.expect(!state.lifecycle.dirty);
 }
 
 test "opening Companion is lazy and leaves workspace ownership and persistence untouched" {
@@ -10859,6 +14552,1260 @@ fn unixTimestampMs() i64 {
 test "inspector disabled lifecycle messages are distinguished from other events" {
     try std.testing.expect(AppState.isInspectorDisabledMessage("{\"source\":\"verde-inspector\",\"type\":\"inspector:disabled\"}"));
     try std.testing.expect(!AppState.isInspectorDisabledMessage("{\"source\":\"verde-inspector\",\"type\":\"inspector:enabled\"}"));
+}
+
+test "M5-P4 change topic mapping is total over the frozen nine-topic set" {
+    // m4m5_decisions Q10 froze exactly these journal topics; every one must
+    // convert into at least one refresh plane so no change entry is dropped.
+    const chat_topics = [_][]const u8{ "chat.thread", "chat.turn", "chat.completion" };
+    const registry_topics = [_][]const u8{ "workspace", "surface", "process", "lease", "session", "notification" };
+    for (chat_topics) |topic| {
+        const signals = changeCursorSignalsForTopic(topic);
+        try std.testing.expect(signals.chat and !signals.registry);
+    }
+    for (registry_topics) |topic| {
+        const signals = changeCursorSignalsForTopic(topic);
+        try std.testing.expect(signals.registry and !signals.chat);
+    }
+    // Unknown future additive topics degrade to a conservative registry pull.
+    try std.testing.expect(changeCursorSignalsForTopic("future.topic").registry);
+}
+
+test "M5-P4 cursor signal bridge coalesces publishes and drains non-blocking" {
+    var loop: ChangeCursorLoopState = .{};
+    loop.publish(.{ .registry = true });
+    loop.publish(.{ .chat = true });
+    loop.publish(.{}); // all-false publish is a no-op, never a lock hit
+    const first = loop.take();
+    try std.testing.expect(first.registry and first.chat and !first.resync);
+    // The drain clears the pending set; an empty take is the steady state.
+    const second = loop.take();
+    try std.testing.expect(!second.any());
+    loop.publish(.{ .resync = true });
+    try std.testing.expect(loop.take().resync);
+    loop.noteRefreshApplication(false);
+    try std.testing.expectEqual(false, loop.takeRefreshApplication().?);
+    try std.testing.expect(loop.takeRefreshApplication() == null);
+    loop.noteRefreshApplication(true);
+    try std.testing.expectEqual(true, loop.takeRefreshApplication().?);
+}
+
+test "M5-P4 composite conversion matches the pull-driven durable projection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const messages = [_]headless.store.Message{.{
+        .message_id = "daemon-message",
+        .role = "assistant",
+        .author = "Codex",
+        .body = "durable mutation",
+    }};
+    const threads = [_]headless.store.Thread{.{
+        .local_thread_id = "daemon-thread",
+        .title = "Daemon thread",
+        .provider = "codex",
+        .messages = &messages,
+    }};
+    const workspaces = [_]headless.store.Workspace{.{
+        .workspace_id = "daemon-workspace",
+        .label = "Daemon workspace",
+        .path = "/tmp/daemon-workspace",
+        .threads = &threads,
+    }};
+    const persisted = try compositeSnapshotToPersisted(arena.allocator(), .{
+        .store_revision = 11,
+        .workspaces = &workspaces,
+        .chat_completions = &.{.{
+            .workspace_id = "daemon-workspace",
+            .local_thread_id = "daemon-thread",
+            .completed_at_ms = 12,
+        }},
+    });
+    try std.testing.expectEqual(@as(usize, 1), persisted.projects.len);
+    try std.testing.expectEqualStrings("daemon-workspace", persisted.projects[0].id.?);
+    try std.testing.expectEqualStrings("daemon-thread", persisted.projects[0].threads.?[0].local_thread_id.?);
+    try std.testing.expectEqualStrings("daemon-message", persisted.projects[0].threads.?[0].messages[0].message_id.?);
+    try std.testing.expectEqualStrings("durable mutation", persisted.projects[0].threads.?[0].messages[0].body);
+    try std.testing.expectEqual(Provider.codex, persisted.projects[0].threads.?[0].provider);
+    try std.testing.expectEqual(@as(usize, 1), persisted.chat_completions.len);
+
+    var tmp_pull = std.testing.tmpDir(.{});
+    defer tmp_pull.cleanup();
+    var pull_path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const pull_len = try tmp_pull.dir.realPath(std.testing.io, &pull_path);
+    var pull_storage = try Storage.initWithPrefPath(std.testing.allocator, pull_path[0..pull_len]);
+    defer pull_storage.deinit();
+    var pull_state = try AppState.init(std.testing.allocator, &pull_storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer pull_state.deinit();
+    pull_state.clearProjects();
+    pull_state.clearSurfaces();
+    try pull_state.applyPersisted(persisted);
+
+    var tmp_cursor = std.testing.tmpDir(.{});
+    defer tmp_cursor.cleanup();
+    var cursor_path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cursor_len = try tmp_cursor.dir.realPath(std.testing.io, &cursor_path);
+    var cursor_storage = try Storage.initWithPrefPath(std.testing.allocator, cursor_path[0..cursor_len]);
+    defer cursor_storage.deinit();
+    var cursor_state = try AppState.init(std.testing.allocator, &cursor_storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer cursor_state.deinit();
+    cursor_state.lifecycle.dirty = false;
+    try cursor_state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{
+            .store_revision = 11,
+            .workspaces = &workspaces,
+            .chat_completions = &.{.{
+                .workspace_id = "daemon-workspace",
+                .local_thread_id = "daemon-thread",
+                .completed_at_ms = 12,
+            }},
+        },
+        .store_revision = 11,
+        .envelope = .{ .instance_nonce = "equivalence", .registry_revision = 1 },
+        .change_cursor = 5,
+    });
+    try std.testing.expectEqual(pull_state.project_controller.projects.items.len, cursor_state.project_controller.projects.items.len);
+    const pull_project = &pull_state.project_controller.projects.items[0];
+    const cursor_project = &cursor_state.project_controller.projects.items[0];
+    try std.testing.expectEqualStrings(pull_project.id, cursor_project.id);
+    try std.testing.expectEqual(pull_project.threads.items.len, cursor_project.threads.items.len);
+    try std.testing.expectEqualStrings(
+        pull_project.threads.items[0].messages.items[0].message_id.?,
+        cursor_project.threads.items[0].messages.items[0].message_id.?,
+    );
+    try std.testing.expectEqualStrings(
+        pull_project.threads.items[0].messages.items[0].body,
+        cursor_project.threads.items[0].messages.items[0].body,
+    );
+
+    // Tombstone/deletion equivalence: both production paths replace the prior
+    // workspace projection with the same empty durable snapshot.
+    const deleted = try compositeSnapshotToPersisted(arena.allocator(), .{
+        .store_revision = 12,
+        .workspaces = &.{},
+    });
+    pull_state.clearProjects();
+    pull_state.clearSurfaces();
+    try pull_state.applyPersisted(deleted);
+    cursor_state.lifecycle.dirty = false;
+    try cursor_state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 12, .workspaces = &.{} },
+        .store_revision = 12,
+        .envelope = .{ .instance_nonce = "equivalence", .registry_revision = 2 },
+        .change_cursor = 6,
+    });
+    try std.testing.expectEqual(@as(usize, 0), pull_state.project_controller.projects.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cursor_state.project_controller.projects.items.len);
+}
+
+test "close durability notice has priority over daemon staleness" {
+    var state: AppState = undefined;
+    state.sidebar_notice_storage = std.mem.zeroes([256:0]u8);
+    state.close_durability_notice = false;
+    state.daemon_projection_stale = true;
+    state.noteCloseDurabilityFailure(error.InjectedSpoolFailure);
+    try std.testing.expect(std.mem.startsWith(u8, state.sidebarNotice(), "Could not close:"));
+}
+
+test "M5-P4 three-way conflict merge keeps post-capture edits and local additions without resurrecting remote deletes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const base_threads = [_]PersistedThread{
+        .{ .title = "base kept", .local_thread_id = "thread-kept" },
+        .{ .title = "base deleted", .local_thread_id = "thread-deleted" },
+    };
+    const current_threads = [_]PersistedThread{
+        .{ .title = "edit B after capture", .local_thread_id = "thread-kept", .draft = "draft B" },
+        .{ .title = "base deleted locally unchanged", .local_thread_id = "thread-deleted" },
+        .{ .title = "local addition", .local_thread_id = "thread-local" },
+    };
+    const remote_threads = [_]PersistedThread{
+        .{ .title = "remote kept", .local_thread_id = "thread-kept" },
+    };
+    const baseline_projects = [_]PersistedProject{.{
+        .id = "ws-merge",
+        .label = "baseline",
+        .path = "/tmp/ws-merge",
+        .threads = &base_threads,
+    }};
+    const current_projects = [_]PersistedProject{.{
+        .id = "ws-merge",
+        .label = "current",
+        .path = "/tmp/ws-merge",
+        .threads = &current_threads,
+    }};
+    const remote_projects = [_]PersistedProject{.{
+        .id = "ws-merge",
+        .label = "remote",
+        .path = "/tmp/ws-merge",
+        .threads = &remote_threads,
+    }};
+    var remote: PersistedState = .{ .projects = &remote_projects };
+    try mergeCurrentLocalEdits(
+        arena.allocator(),
+        &remote,
+        .{ .projects = &baseline_projects },
+        .{ .projects = &current_projects },
+    );
+    const threads = remote.projects[0].threads.?;
+    try std.testing.expectEqual(@as(usize, 2), threads.len);
+    try std.testing.expectEqualStrings("edit B after capture", threads[0].title);
+    try std.testing.expectEqualStrings("draft B", threads[0].draft);
+    try std.testing.expectEqualStrings("thread-local", threads[1].local_thread_id.?);
+    try std.testing.expect(threadIndexById(threads, "thread-deleted") == null);
+}
+
+test "M5-P4 acknowledged-save baseline preserves later edit on the same new thread" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const acknowledged_threads = [_]PersistedThread{.{
+        .title = "A",
+        .local_thread_id = "thread-created-by-flush-a",
+        .draft = "draft A",
+    }};
+    const edited_threads = [_]PersistedThread{.{
+        .title = "B",
+        .local_thread_id = "thread-created-by-flush-a",
+        .draft = "draft B",
+    }};
+    const baseline_projects = [_]PersistedProject{.{
+        .id = "ws-ack-baseline",
+        .label = "workspace",
+        .path = "/tmp/ws-ack-baseline",
+        .threads = &acknowledged_threads,
+    }};
+    const current_projects = [_]PersistedProject{.{
+        .id = "ws-ack-baseline",
+        .label = "workspace",
+        .path = "/tmp/ws-ack-baseline",
+        .threads = &edited_threads,
+    }};
+    const remote_projects = [_]PersistedProject{.{
+        .id = "ws-ack-baseline",
+        .label = "workspace remote",
+        .path = "/tmp/ws-ack-baseline",
+        .threads = &acknowledged_threads,
+    }};
+    var remote: PersistedState = .{ .projects = &remote_projects };
+    try mergeCurrentLocalEdits(
+        arena.allocator(),
+        &remote,
+        .{ .projects = &baseline_projects },
+        .{ .projects = &current_projects },
+    );
+    try std.testing.expectEqual(@as(usize, 1), remote.projects[0].threads.?.len);
+    try std.testing.expectEqualStrings("B", remote.projects[0].threads.?[0].title);
+    try std.testing.expectEqualStrings("draft B", remote.projects[0].threads.?[0].draft);
+}
+
+test "daemon refresh preserves explicit clears through clean and unrelated dirty merges" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer {
+        state.lifecycle.dirty = false;
+        state.deinit();
+    }
+
+    var canonical_layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer canonical_layout.deinit(allocator);
+    const second_pane_id = try canonical_layout.createChatPane(allocator, 1);
+    try canonical_layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
+    try std.testing.expect(canonical_layout.resizeSplit(1, second_pane_id, .vertical, 0.63));
+    canonical_layout.focused_pane_id = second_pane_id;
+    const canonical_layout_json = try canonical_layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(canonical_layout_json);
+    const attachment: headless.store.Attachment = .{ .path = "/tmp/draft.png", .mime = "image/png", .byte_size = 42 };
+    const canonical_threads = [_]headless.store.Thread{
+        .{
+            .local_thread_id = "thread-one",
+            .title = "One",
+            .draft = "canonical draft",
+            .draft_image = attachment,
+        },
+        .{ .local_thread_id = "thread-two", .title = "Two" },
+    };
+    const canonical_workspaces = [_]headless.store.Workspace{.{
+        .workspace_id = "workspace-id",
+        .label = "Friendly workspace",
+        .path = "/tmp/friendly-workspace/",
+        .workspace_layout_json = canonical_layout_json,
+        .selected_thread_index = 1,
+        .threads = &canonical_threads,
+    }};
+    state.lifecycle.dirty = false;
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 1, .workspaces = &canonical_workspaces },
+        .store_revision = 1,
+        .envelope = .{ .instance_nonce = "projection-fidelity", .registry_revision = 1 },
+        .change_cursor = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 2), state.project_controller.projects.items[0].workspace_layout.panes.items.len);
+
+    // Explicit remote clears and an intentional raw-ID label are durable data,
+    // not corruption evidence. Root and trailing-separator paths stay exact.
+    const cleared_threads = [_]headless.store.Thread{
+        .{ .local_thread_id = "thread-one", .title = "One", .draft = "" },
+        .{ .local_thread_id = "thread-two", .title = "Two" },
+    };
+    const cleared_workspaces = [_]headless.store.Workspace{.{
+        .workspace_id = "workspace-id",
+        .label = "workspace-id",
+        .path = "/",
+        .workspace_layout_json = null,
+        .selected_thread_index = 0,
+        .threads = &cleared_threads,
+    }};
+    state.lifecycle.dirty = false;
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 2, .workspaces = &cleared_workspaces },
+        .store_revision = 2,
+        .envelope = .{ .instance_nonce = "projection-fidelity", .registry_revision = 2 },
+        .change_cursor = 2,
+    });
+    var project = &state.project_controller.projects.items[0];
+    try std.testing.expectEqualStrings("workspace-id", project.label);
+    try std.testing.expectEqualStrings("/", project.path);
+    try std.testing.expectEqualStrings("", project.threads.items[0].currentDraft());
+    try std.testing.expect(project.threads.items[0].draft_image == null);
+    try std.testing.expectEqual(@as(usize, 1), project.workspace_layout.panes.items.len);
+
+    // A stale clean local tree cannot beat a newer remote layout clear.
+    const stale_pane_id = try project.workspace_layout.createChatPane(allocator, 1);
+    try project.workspace_layout.splitPaneWithLeaf(allocator, 1, stale_pane_id, .horizontal, true);
+    const trailing_workspaces = [_]headless.store.Workspace{.{
+        .workspace_id = "workspace-id",
+        .label = "workspace-id",
+        .path = "/tmp/trailing/",
+        .workspace_layout_json = null,
+        .selected_thread_index = 0,
+        .threads = &cleared_threads,
+    }};
+    state.lifecycle.dirty = false;
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 3, .workspaces = &trailing_workspaces },
+        .store_revision = 3,
+        .envelope = .{ .instance_nonce = "projection-fidelity", .registry_revision = 3 },
+        .change_cursor = 3,
+    });
+    project = &state.project_controller.projects.items[0];
+    try std.testing.expectEqualStrings("/tmp/trailing/", project.path);
+    try std.testing.expectEqual(@as(usize, 1), project.workspace_layout.panes.items.len);
+
+    // Establish a revision-paired baseline, then make one unrelated local edit.
+    // Even the complete historical partial-owner shape is forgeable by an
+    // ordinary remote clear, so every cleared field remains authoritative while
+    // the unrelated edit merges normally.
+    state.lifecycle.dirty = false;
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 4, .workspaces = &canonical_workspaces },
+        .store_revision = 4,
+        .envelope = .{ .instance_nonce = "projection-fidelity", .registry_revision = 4 },
+        .change_cursor = 4,
+    });
+    state.project_controller.projects.items[0].unread_count = 9;
+    state.markDirty();
+    state.lifecycle.rebase_snapshot = try state.buildPersistedState(allocator);
+    const legacy_threads = [_]headless.store.Thread{
+        .{ .local_thread_id = "thread-one", .title = "One", .provider = "codex", .draft = "" },
+        .{ .local_thread_id = "thread-two", .title = "Two" },
+    };
+    const legacy_workspaces = [_]headless.store.Workspace{.{
+        .workspace_id = "workspace-id",
+        .label = "workspace-id",
+        .path = "/tmp/friendly-workspace/",
+        .workspace_layout_json = null,
+        .selected_thread_index = 0,
+        .threads = &legacy_threads,
+    }};
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 5, .workspaces = &legacy_workspaces },
+        .store_revision = 5,
+        .envelope = .{ .instance_nonce = "projection-fidelity", .registry_revision = 5 },
+        .change_cursor = 5,
+    });
+    project = &state.project_controller.projects.items[0];
+    try std.testing.expectEqualStrings("workspace-id", project.label);
+    try std.testing.expectEqualStrings("", project.threads.items[0].currentDraft());
+    try std.testing.expect(project.threads.items[0].draft_image == null);
+    try std.testing.expectEqual(@as(usize, 1), project.workspace_layout.panes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), project.selected_thread_index);
+    try std.testing.expectEqual(@as(u32, 9), project.unread_count);
+    try std.testing.expect(state.lifecycle.dirty);
+}
+
+test "daemon refresh never moves pane focus or strip viewport from live state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer {
+        state.lifecycle.dirty = false;
+        state.deinit();
+    }
+
+    var stale_layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer stale_layout.deinit(allocator);
+    const second_pane_id = try stale_layout.createChatPane(allocator, 1);
+    try stale_layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
+    stale_layout.focused_pane_id = 1;
+    const stale_layout_json = try stale_layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(stale_layout_json);
+    const threads = [_]headless.store.Thread{.{ .local_thread_id = "thread-one", .title = "One" }};
+    const workspaces = [_]headless.store.Workspace{.{
+        .workspace_id = "workspace-id",
+        .label = "Workspace",
+        .path = "/tmp/focus-steal/",
+        .workspace_layout_json = stale_layout_json,
+        .selected_thread_index = 0,
+        .threads = &threads,
+    }};
+    state.lifecycle.dirty = false;
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 1, .workspaces = &workspaces },
+        .store_revision = 1,
+        .envelope = .{ .instance_nonce = "focus-steal", .registry_revision = 1 },
+        .change_cursor = 1,
+    });
+
+    // Explicit user actions: focus pane 2 and scroll the strip. The edit sits
+    // in the send→turn-start window where it has not flushed to the store yet.
+    const live_layout = &state.project_controller.projects.items[0].workspace_layout;
+    live_layout.focused_pane_id = second_pane_id;
+    live_layout.scroll_offset_x = 480.0;
+    live_layout.scroll_target_x = 480.0;
+    live_layout.scroll_revealed_pane_id = second_pane_id;
+
+    // The turn-start refresh echoes the stale persisted layout (focused=1,
+    // scroll target 0). It must not move focus or the strip viewport.
+    state.lifecycle.dirty = false;
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 2, .workspaces = &workspaces },
+        .store_revision = 2,
+        .envelope = .{ .instance_nonce = "focus-steal", .registry_revision = 2 },
+        .change_cursor = 2,
+    });
+    const refreshed = &state.project_controller.projects.items[0].workspace_layout;
+    try std.testing.expectEqual(@as(usize, 2), refreshed.panes.items.len);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), refreshed.focused_pane_id);
+    try std.testing.expectEqual(@as(f32, 480.0), refreshed.scroll_target_x);
+    try std.testing.expectEqual(@as(f32, 480.0), refreshed.scroll_offset_x);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), refreshed.scroll_revealed_pane_id);
+
+    // The preserved focus is recorded in the projection baseline as well, so
+    // it can never read as a local structural edit in a later merge (which
+    // would wrongly resurrect local pane structure against a remote clear).
+    const baseline = state.lifecycle.projection_baseline orelse return error.MissingBaseline;
+    const baseline_json = baseline.value.projects[0].workspace_layout_json orelse return error.MissingLayout;
+    try std.testing.expect(std.mem.indexOf(u8, baseline_json, "\"focused\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, baseline_json, "\"scroll_x\":4.8e2") != null or
+        std.mem.indexOf(u8, baseline_json, "\"scroll_x\":480") != null);
+}
+
+test "daemon refresh keeps just-attached draft images and committed row image extras" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer {
+        state.lifecycle.dirty = false;
+        state.deinit();
+    }
+
+    // Transcript half: a committed user row arrives from the projection with
+    // its full attachment list ([primary] ++ extras) and must materialize as
+    // image + extra_images on the live message.
+    const row_images = [_]headless.store.Attachment{
+        .{ .path = "/tmp/sent-a.png", .mime = "image/png", .byte_size = 11 },
+        .{ .path = "/tmp/sent-b.png", .mime = "image/jpeg", .byte_size = 22 },
+    };
+    const messages = [_]headless.store.Message{.{
+        .message_id = "gui-msg:img:1",
+        .role = "user",
+        .author = "You",
+        .body = "look at these",
+        .image = row_images[0],
+        .images = &row_images,
+    }};
+    const threads = [_]headless.store.Thread{.{
+        .local_thread_id = "thread-one",
+        .title = "One",
+        .committed = true,
+        .messages = &messages,
+    }};
+    const workspaces = [_]headless.store.Workspace{.{
+        .workspace_id = "workspace-id",
+        .label = "Workspace",
+        .path = "/tmp/image-drop/",
+        .selected_thread_index = 0,
+        .threads = &threads,
+    }};
+    state.lifecycle.dirty = false;
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 1, .workspaces = &workspaces },
+        .store_revision = 1,
+        .envelope = .{ .instance_nonce = "image-drop", .registry_revision = 1 },
+        .change_cursor = 1,
+    });
+    {
+        const thread = &state.project_controller.projects.items[0].threads.items[0];
+        try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
+        const message = &thread.messages.items[0];
+        try std.testing.expectEqualStrings("/tmp/sent-a.png", message.image.?.path);
+        try std.testing.expectEqual(@as(usize, 1), message.extra_images.len);
+        try std.testing.expectEqualStrings("/tmp/sent-b.png", message.extra_images[0].path);
+    }
+
+    // Composer half: attach a multi-image draft, then let a refresh echo a
+    // snapshot captured before the flush landed. `dirty` is already clear —
+    // the race window — so only the recency overlay can keep the images.
+    {
+        const thread = &state.project_controller.projects.items[0].threads.items[0];
+        try thread.setDraftImage(allocator, "/tmp/draft-a.png", "image/png", 33);
+        try thread.addDraftImage(allocator, "/tmp/draft-b.png", "image/png", 44);
+    }
+    state.lifecycle.dirty = false;
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 2, .workspaces = &workspaces },
+        .store_revision = 2,
+        .envelope = .{ .instance_nonce = "image-drop", .registry_revision = 2 },
+        .change_cursor = 2,
+    });
+    {
+        const thread = &state.project_controller.projects.items[0].threads.items[0];
+        try std.testing.expectEqualStrings("/tmp/draft-a.png", thread.draft_image.?.path);
+        try std.testing.expectEqual(@as(usize, 1), thread.draft_extra_images.items.len);
+        try std.testing.expectEqualStrings("/tmp/draft-b.png", thread.draft_extra_images.items[0].path);
+        // The committed row's extras also survive the refresh rebuild.
+        const message = &thread.messages.items[0];
+        try std.testing.expectEqual(@as(usize, 1), message.extra_images.len);
+        try std.testing.expectEqualStrings("/tmp/sent-b.png", message.extra_images[0].path);
+    }
+
+    // Flush/spool round-trip: the persisted snapshot carries the full draft
+    // list and the committed row's extras, so a thread switch or restart that
+    // reloads from it cannot narrow the attachments.
+    var spool = try state.buildPersistedState(allocator);
+    defer spool.deinit();
+    const persisted_thread = spool.value.projects[0].threads.?[0];
+    try std.testing.expectEqualStrings("/tmp/draft-a.png", persisted_thread.draft_image.?.path);
+    try std.testing.expectEqual(@as(usize, 1), persisted_thread.draft_extra_images.len);
+    try std.testing.expectEqualStrings("/tmp/draft-b.png", persisted_thread.draft_extra_images[0].path);
+    const persisted_message = persisted_thread.messages[0];
+    try std.testing.expectEqualStrings("/tmp/sent-a.png", persisted_message.image.?.path);
+    try std.testing.expectEqual(@as(usize, 1), persisted_message.extra_images.len);
+    try std.testing.expectEqualStrings("/tmp/sent-b.png", persisted_message.extra_images[0].path);
+}
+
+test "close spool load adoption keeps an unsent draft independent of pending completion" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+
+    const threads = [_]PersistedThread{.{
+        .title = "Draft owner",
+        .local_thread_id = "draft-owner-thread",
+        .draft = "unsent token",
+        .messages = &.{},
+    }};
+    const projects = [_]PersistedProject{.{
+        .id = "draft-owner-workspace",
+        .label = "Draft owner",
+        .path = "/tmp/draft-owner",
+        .threads = &threads,
+    }};
+    const completions = [_]PersistedChatCompletion{.{
+        .workspace_id = "draft-owner-workspace",
+        .local_thread_id = "draft-owner-thread",
+        .completed_at_ms = 777,
+    }};
+    try storage.writePendingStateSpool(.{
+        .capture_revision = 0,
+        .current = .{
+            .projects = &projects,
+            .chat_completions = &completions,
+        },
+    });
+
+    var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer {
+        state.lifecycle.dirty = false;
+        state.deinit();
+    }
+    const thread = &state.project_controller.projects.items[0].threads.items[0];
+    try std.testing.expectEqualStrings("unsent token", thread.currentDraft());
+    try std.testing.expect(thread.completion_pending);
+    try std.testing.expectEqual(@as(usize, 0), thread.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.chat_controller.pending_send_count);
+    thread.send_state.mutex.lock();
+    defer thread.send_state.mutex.unlock();
+    try std.testing.expectEqual(.idle, thread.send_state.status);
+    try std.testing.expect(thread.send_state.worker == null);
+}
+
+test "M5-P4 fix5 production repair failure writes a spool that the next AppState restores" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var closing = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    const initial_threads = [_]PersistedThread{.{
+        .title = "Recovered thread",
+        .local_thread_id = "recovered-thread",
+    }};
+    const initial_projects = [_]PersistedProject{.{
+        .id = "recovered-workspace",
+        .label = "Before failed shutdown",
+        .path = "/tmp/recovered-workspace",
+        .threads = &initial_threads,
+    }};
+    try closing.applyPersisted(.{ .projects = &initial_projects });
+    const project = &closing.project_controller.projects.items[0];
+    allocator.free(project.label);
+    project.label = try allocator.dupeZ(u8, "Recovered after failed shutdown");
+    const thread = &project.threads.items[project.currentThreadIndex()];
+    thread.setDraft("unsaved draft");
+    closing.lifecycle.dirty = true;
+    chat_controller.markAdoptionTerminalRepairForTest(&closing, project.id, thread.local_thread_id, "real-spool-repair");
+    const workspace_id = try allocator.dupe(u8, project.id);
+    defer allocator.free(workspace_id);
+    const local_thread_id = try allocator.dupe(u8, thread.local_thread_id);
+    defer allocator.free(local_thread_id);
+    var closing_live = true;
+    defer if (closing_live) {
+        chat_controller.clearAdoptionRepairForTest(workspace_id, local_thread_id, "real-spool-repair");
+        closing.lifecycle.dirty = false;
+        closing.deinit();
+    };
+    try closing.handoffDirtyStateForShutdown();
+    try std.testing.expect(closing.lifecycle.dirty_spooled);
+    var written = (try storage.loadPendingStateSpool(allocator)).?;
+    try std.testing.expectEqualStrings("Recovered after failed shutdown", written.value.current.projects[0].label);
+    written.deinit();
+    chat_controller.clearAdoptionRepairForTest(workspace_id, local_thread_id, "real-spool-repair");
+    closing.lifecycle.dirty = false;
+    closing.deinit();
+    closing_live = false;
+
+    var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer state.deinit();
+    defer state.lifecycle.dirty = false;
+    try std.testing.expectEqualStrings("Recovered after failed shutdown", state.project_controller.projects.items[0].label);
+    try std.testing.expectEqualStrings("unsaved draft", state.project_controller.projects.items[0].threads.items[0].currentDraft());
+    try std.testing.expect(state.lifecycle.dirty);
+    try std.testing.expect(state.lifecycle.dirty_spooled);
+    try std.testing.expectEqual(@as(?u64, 0), state.lifecycle.projection_baseline_revision);
+}
+
+test "M5-P4 terminal adoption refresh crosses dirty gate and replaces id-less row" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer state.deinit();
+    // This test proves the repair boundary, not daemon persistence. Keep the
+    // hermetic AppState teardown from trying to spawn a session daemon.
+    defer state.lifecycle.dirty = false;
+    const initial_messages = [_]headless.store.Message{.{
+        .message_id = "turn:adopt:user",
+        .role = "user",
+        .author = "You",
+        .body = "hello",
+    }};
+    const refreshed_messages = [_]headless.store.Message{
+        initial_messages[0],
+        .{
+            .message_id = "turn:concurrent:user",
+            .role = "user",
+            .author = "You",
+            .body = "concurrent prompt",
+        },
+        .{
+            .message_id = "turn:concurrent:msg:1",
+            .role = "assistant",
+            .author = "Codex",
+            .body = "concurrent reply",
+        },
+        .{
+            .message_id = "turn:adopt:msg:1",
+            .role = "assistant",
+            .author = "Codex",
+            .body = "durable reply",
+        },
+    };
+    const initial_threads = [_]headless.store.Thread{
+        .{
+            .local_thread_id = "thread-adopt-real",
+            .title = "Adoption",
+            .messages = &initial_messages,
+        },
+        .{
+            .local_thread_id = "thread-remote-delete",
+            .title = "Remote deletion baseline",
+        },
+    };
+    const refreshed_threads = [_]headless.store.Thread{.{
+        .local_thread_id = "thread-adopt-real",
+        .title = "Adoption",
+        .messages = &refreshed_messages,
+    }};
+    const initial_workspaces = [_]headless.store.Workspace{.{
+        .workspace_id = "ws-adopt-real",
+        .label = "Adoption",
+        .path = "/tmp/ws-adopt-real",
+        .threads = &initial_threads,
+    }};
+    const refreshed_workspaces = [_]headless.store.Workspace{.{
+        .workspace_id = "ws-adopt-real",
+        .label = "Adoption",
+        .path = "/tmp/ws-adopt-real",
+        .threads = &refreshed_threads,
+    }};
+    const daemon_sessions = [_]headless.store.SessionSummary{
+        .{
+            .session_id = "daemon-created-session",
+            .workspace_id = "ws-adopt-real",
+            .workspace_path = "/tmp/ws-adopt-real",
+            .cwd = "/tmp/ws-adopt-real",
+            .label = "shell",
+            .command = "bash",
+            .dock_id = 0,
+            .pane_id = 1,
+            .running = true,
+            .status = "running",
+        },
+        .{
+            .session_id = "daemon-missing-pane",
+            .workspace_id = "ws-adopt-real",
+            .workspace_path = "/tmp/ws-adopt-real",
+            .cwd = "/tmp/ws-adopt-real",
+            .label = "second shell",
+            .command = "bash",
+            .dock_id = 0,
+            .pane_id = 9,
+            .running = true,
+            .status = "running",
+        },
+        .{
+            .session_id = "daemon-missing-dock",
+            .workspace_id = "ws-adopt-real",
+            .workspace_path = "/tmp/ws-adopt-real",
+            .cwd = "/tmp/ws-adopt-real",
+            .label = "aux shell",
+            .command = "bash",
+            .dock_id = 7,
+            .pane_id = 4,
+            .running = true,
+            .status = "running",
+        },
+    };
+    state.lifecycle.dirty = false;
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 1, .workspaces = &initial_workspaces },
+        .store_revision = 1,
+        .envelope = .{ .instance_nonce = "adopt-real", .registry_revision = 1 },
+        .change_cursor = 1,
+    });
+    const thread = &state.project_controller.projects.items[0].threads.items[0];
+    try thread.messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Codex"),
+        .body = try allocator.dupeZ(u8, "durable reply"),
+    });
+    thread.setDraft("keep this UI draft");
+    var local_thread = try ChatThread.init(allocator, "Local addition");
+    allocator.free(local_thread.local_thread_id);
+    local_thread.local_thread_id = try allocator.dupeZ(u8, "thread-local-addition");
+    local_thread.committed = true;
+    state.project_controller.projects.items[0].threads.append(allocator, local_thread) catch |err| {
+        local_thread.deinit(allocator);
+        return err;
+    };
+    state.project_controller.projects.items[0].selected_thread_index = 2;
+    state.lifecycle.dirty = true;
+    chat_controller.markAdoptionTerminalRepairForTest(&state, "ws-adopt-real", "thread-adopt-real", "adopt");
+    defer chat_controller.clearAdoptionRepairForTest("ws-adopt-real", "thread-adopt-real", "adopt");
+    try std.testing.expect(state.hasUnresolvedAdoptionRows());
+    state.flushDirtyNow();
+    try std.testing.expect(!state.lifecycle.flush_in_flight);
+    const mismatched_messages = [_]headless.store.Message{.{
+        .message_id = "turn:different:msg:0",
+        .role = "assistant",
+        .author = "Codex",
+        .body = "different durable row",
+    }};
+    const mismatched_threads = [_]headless.store.Thread{.{
+        .local_thread_id = "thread-adopt-real",
+        .title = "Adoption",
+        .messages = &mismatched_messages,
+    }};
+    const mismatched_workspaces = [_]headless.store.Workspace{.{
+        .workspace_id = "ws-adopt-real",
+        .label = "Adoption",
+        .path = "/tmp/ws-adopt-real",
+        .threads = &mismatched_threads,
+    }};
+    try std.testing.expectError(error.AdoptionRepairMismatch, state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 2, .workspaces = &mismatched_workspaces },
+        .store_revision = 2,
+        .envelope = .{ .instance_nonce = "adopt-real", .registry_revision = 2 },
+        .change_cursor = 2,
+    }));
+    const retained_after_mismatch = state.threadByLocalId("ws-adopt-real", "thread-adopt-real").?;
+    try std.testing.expectEqual(@as(usize, 2), retained_after_mismatch.messages.items.len);
+    try std.testing.expect(retained_after_mismatch.messages.items[1].message_id == null);
+    try std.testing.expect(state.hasUnresolvedAdoptionRows());
+    const ambiguous_messages = [_]headless.store.Message{
+        initial_messages[0],
+        .{
+            .message_id = "turn:adopt:msg:1",
+            .role = "assistant",
+            .author = "Codex",
+            .body = "durable reply",
+        },
+        .{
+            .message_id = "turn:adopt:msg:2",
+            .role = "assistant",
+            .author = "Codex",
+            .body = "durable reply",
+        },
+    };
+    const ambiguous_threads = [_]headless.store.Thread{.{
+        .local_thread_id = "thread-adopt-real",
+        .title = "Adoption",
+        .messages = &ambiguous_messages,
+    }};
+    const ambiguous_workspaces = [_]headless.store.Workspace{.{
+        .workspace_id = "ws-adopt-real",
+        .label = "Adoption",
+        .path = "/tmp/ws-adopt-real",
+        .threads = &ambiguous_threads,
+    }};
+    try std.testing.expectError(error.AdoptionRepairAmbiguous, state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 2, .workspaces = &ambiguous_workspaces },
+        .store_revision = 2,
+        .envelope = .{ .instance_nonce = "adopt-real", .registry_revision = 2 },
+        .change_cursor = 3,
+    }));
+    const retained_after_ambiguity = state.threadByLocalId("ws-adopt-real", "thread-adopt-real").?;
+    try std.testing.expectEqual(@as(usize, 2), retained_after_ambiguity.messages.items.len);
+    try std.testing.expect(retained_after_ambiguity.messages.items[1].message_id == null);
+    try std.testing.expect(state.hasUnresolvedAdoptionRows());
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 2, .workspaces = &refreshed_workspaces },
+        .store_revision = 2,
+        .envelope = .{ .instance_nonce = "adopt-real", .registry_revision = 2 },
+        .change_cursor = 4,
+        .sessions = &daemon_sessions,
+    });
+    const repaired = &state.project_controller.projects.items[0].threads.items[0];
+    try std.testing.expectEqual(@as(usize, 4), repaired.messages.items.len);
+    try std.testing.expectEqualStrings("turn:adopt:msg:1", repaired.messages.items[3].message_id.?);
+    try std.testing.expectEqualStrings("keep this UI draft", repaired.currentDraft());
+    try std.testing.expect(state.threadByLocalId("ws-adopt-real", "thread-local-addition") != null);
+    try std.testing.expect(state.threadByLocalId("ws-adopt-real", "thread-remote-delete") == null);
+    const projected_session_id = state.project_controller.projects.items[0].terminal_dock.activeSessionId();
+    try std.testing.expect(projected_session_id != null);
+    try std.testing.expectEqualStrings("daemon-created-session", projected_session_id.?);
+    const missing_dock = state.project_controller.projects.items[0].terminalDockEntryById(7) orelse
+        return error.MissingMaterializedDaemonDock;
+    try std.testing.expectEqualStrings("daemon-missing-dock", missing_dock.dock.activeSessionId().?);
+    const base_layout = (try state.project_controller.projects.items[0].terminal_dock.persistedLayoutJson(allocator)).?;
+    defer allocator.free(base_layout);
+    try std.testing.expect(std.mem.indexOf(u8, base_layout, "daemon-missing-pane") != null);
+    try std.testing.expect(!state.hasUnresolvedAdoptionRows());
+}
+
+test "M5-P4 fix5 daemon session coordinates reject extremes reallocate collisions and cap materialization" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    const fixture_threads = [_]PersistedThread{.{
+        .title = "Coordinate validation",
+        .local_thread_id = "coordinate-thread",
+    }};
+    const fixture_projects = [_]PersistedProject{.{
+        .id = "coordinate-workspace",
+        .label = "Coordinate validation",
+        .path = "/tmp/coordinate-workspace",
+        .threads = &fixture_threads,
+    }};
+    try state.applyPersisted(.{ .projects = &fixture_projects });
+    defer state.deinit();
+    defer state.lifecycle.dirty = false;
+    const project = &state.project_controller.projects.items[0];
+    const initial_dock_count = project.terminal_docks.items.len;
+    const initial_tab_count = project.terminal_dock.tabs.items.len;
+    const collision_sessions = [_]headless.store.SessionSummary{
+        .{
+            .session_id = "coord-first",
+            .workspace_id = project.id,
+            .workspace_path = project.path,
+            .cwd = project.path,
+            .label = "first",
+            .command = "bash",
+            .dock_id = 7,
+            .pane_id = 4,
+            .running = true,
+            .status = "running",
+        },
+        .{
+            .session_id = "coord-second",
+            .workspace_id = project.id,
+            .workspace_path = project.path,
+            .cwd = project.path,
+            .label = "second",
+            .command = "bash",
+            .dock_id = 7,
+            .pane_id = 4,
+            .running = true,
+            .status = "running",
+        },
+        .{
+            .session_id = "coord-max-dock",
+            .workspace_id = project.id,
+            .workspace_path = project.path,
+            .cwd = project.path,
+            .label = "corrupt",
+            .command = "bash",
+            .dock_id = std.math.maxInt(u32),
+            .pane_id = 1,
+            .running = true,
+            .status = "running",
+        },
+        .{
+            .session_id = "coord-max-pane",
+            .workspace_id = project.id,
+            .workspace_path = project.path,
+            .cwd = project.path,
+            .label = "corrupt",
+            .command = "bash",
+            .dock_id = 8,
+            .pane_id = std.math.maxInt(u32),
+            .running = true,
+            .status = "running",
+        },
+    };
+    try state.applyDaemonSessionProjection(&collision_sessions);
+    const collision_dock = project.terminalDockEntryById(7) orelse return error.MissingCollisionDock;
+    try std.testing.expectEqualStrings("coord-first", collision_dock.dock.paneById(4).?.session_id.?);
+    try std.testing.expectEqualStrings("coord-second", collision_dock.dock.paneById(1).?.session_id.?);
+    try std.testing.expect(project.terminalDockEntryById(std.math.maxInt(u32)) == null);
+    try std.testing.expect(project.terminalDockEntryById(8) == null);
+
+    const session_count = terminal_controller.MAX_MATERIALIZED_DAEMON_PANES_PER_REFRESH + 2;
+    const capped_sessions = try allocator.alloc(headless.store.SessionSummary, session_count);
+    defer allocator.free(capped_sessions);
+    var owned_ids: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned_ids.items) |id| allocator.free(id);
+        owned_ids.deinit(allocator);
+    }
+    try owned_ids.ensureTotalCapacity(allocator, session_count);
+    for (capped_sessions, 0..) |*session, index| {
+        const id = try std.fmt.allocPrint(allocator, "cap-session-{d}", .{index});
+        owned_ids.appendAssumeCapacity(id);
+        session.* = .{
+            .session_id = id,
+            .workspace_id = project.id,
+            .workspace_path = project.path,
+            .cwd = project.path,
+            .label = "bounded",
+            .command = "bash",
+            .dock_id = 0,
+            .pane_id = @intCast(1_000 + index),
+            .running = true,
+            .status = "running",
+        };
+    }
+    try state.applyDaemonSessionProjection(capped_sessions);
+    try std.testing.expectEqual(
+        initial_tab_count + terminal_controller.MAX_MATERIALIZED_DAEMON_PANES_PER_REFRESH,
+        project.terminal_dock.tabs.items.len,
+    );
+    try std.testing.expectEqual(initial_dock_count + 1, project.terminal_docks.items.len);
+
+    const dock_cap_input_len = terminal_controller.MAX_MATERIALIZED_DAEMON_DOCKS_PER_REFRESH + 2;
+    const dock_cap_sessions = try allocator.alloc(headless.store.SessionSummary, dock_cap_input_len);
+    defer allocator.free(dock_cap_sessions);
+    var dock_cap_ids: std.ArrayList([]u8) = .empty;
+    defer {
+        for (dock_cap_ids.items) |id| allocator.free(id);
+        dock_cap_ids.deinit(allocator);
+    }
+    try dock_cap_ids.ensureTotalCapacity(allocator, dock_cap_input_len);
+    for (dock_cap_sessions, 0..) |*session, index| {
+        const id = try std.fmt.allocPrint(allocator, "dock-cap-session-{d}", .{index});
+        dock_cap_ids.appendAssumeCapacity(id);
+        session.* = .{
+            .session_id = id,
+            .workspace_id = project.id,
+            .workspace_path = project.path,
+            .cwd = project.path,
+            .label = "bounded dock",
+            .command = "bash",
+            .dock_id = @intCast(100 + index),
+            .pane_id = 1,
+            .running = true,
+            .status = "running",
+        };
+    }
+    const docks_before_cap = project.terminal_docks.items.len;
+    try state.applyDaemonSessionProjection(dock_cap_sessions);
+    try std.testing.expectEqual(
+        docks_before_cap + terminal_controller.MAX_MATERIALIZED_DAEMON_DOCKS_PER_REFRESH,
+        project.terminal_docks.items.len,
+    );
+
+    const owned_cap_input = try allocator.alloc(headless.store.SessionSummary, 1_026);
+    defer allocator.free(owned_cap_input);
+    for (owned_cap_input) |*session| session.* = .{
+        .session_id = "owned-cap-session",
+        .workspace_id = project.id,
+        .workspace_path = project.path,
+        .cwd = project.path,
+        .label = "owned cap",
+        .command = "bash",
+        .running = true,
+        .status = "running",
+    };
+    var owned_projection = try terminal_controller.buildDaemonSessionProjection(allocator, owned_cap_input);
+    defer terminal_controller.deinitDaemonSessionProjection(allocator, &owned_projection);
+    try std.testing.expectEqual(@as(usize, 1_024), owned_projection.items.len);
+}
+
+test "M5-P4 fix5 replacement refresh reconciles consumes under the committed nonce" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const pref_path = path_buf[0..path_len];
+    var storage = try Storage.initWithPrefPath(allocator, pref_path);
+    defer storage.deinit();
+    try storage.noteCompositeSnapshotSeed(.{ .instance_nonce = "old-nonce", .registry_revision = 1 }, 1, 1);
+    try std.testing.expect(chat_controller.reserveTerminalConsumeForTest(pref_path, "old-nonce", "nonce-turn"));
+    try std.testing.expect(chat_controller.reserveTerminalConsumeForTest(pref_path, "new-nonce", "nonce-turn"));
+    defer chat_controller.deinitProcessGlobalState(pref_path);
+    var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer state.deinit();
+    defer state.lifecycle.dirty = false;
+    state.lifecycle.dirty = false;
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 2, .workspaces = &.{} },
+        .store_revision = 2,
+        .envelope = .{ .instance_nonce = "new-nonce", .registry_revision = 2 },
+        .change_cursor = 2,
+    });
+    try std.testing.expect(!chat_controller.terminalConsumeReservedForTest(pref_path, "old-nonce", "nonce-turn"));
+    try std.testing.expect(chat_controller.terminalConsumeReservedForTest(pref_path, "new-nonce", "nonce-turn"));
+}
+
+test "M5-P4 stalled daemon worker cannot block frame-side bridge drain" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const pref_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "/tmp/verde116/m5p4-stall-{d}",
+        .{platform_runtime.unixTimestampMs()},
+    );
+    defer std.testing.allocator.free(pref_path);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, pref_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, pref_path);
+    const endpoint = try sessionizer.socketPath(std.testing.allocator, pref_path);
+    defer std.testing.allocator.free(endpoint);
+    const StallServer = struct {
+        allocator: std.mem.Allocator,
+        endpoint: []const u8,
+        ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        request_started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn shouldStop(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.stop.load(.acquire);
+        }
+        fn handle(raw: *anyopaque, request: []u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.allocator.free(request);
+            self.request_started.store(true, .release);
+            platform_runtime.sleepMillis(200);
+            return try self.allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":\"invalid_state\",\"message\":\"stalled test\"}}");
+        }
+        fn onReady(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ready.store(true, .release);
+        }
+        fn run(self: *@This()) void {
+            platform_ipc.serve(self.allocator, self.endpoint, .{
+                .context = self,
+                .should_stop = shouldStop,
+                .handle_request = handle,
+                .on_ready = onReady,
+            }, .{}) catch {};
+        }
+    };
+    var server: StallServer = .{ .allocator = std.testing.allocator, .endpoint = endpoint };
+    const server_thread = try std.Thread.spawn(.{}, StallServer.run, .{&server});
+    defer {
+        server.stop.store(true, .release);
+        platform_ipc.wake(std.testing.allocator, endpoint, .{});
+        server_thread.join();
+    }
+    var ready_attempts: usize = 0;
+    while (!server.ready.load(.acquire) and ready_attempts < 100) : (ready_attempts += 1) {
+        platform_runtime.sleepMillis(5);
+    }
+    if (!server.ready.load(.acquire)) return error.StallServerNotReady;
+
+    var storage = try Storage.initWithPrefPath(std.testing.allocator, pref_path);
+    defer storage.deinit();
+    const stalledFetch = struct {
+        fn run(store: *const Storage) void {
+            var fetch_reason: []const u8 = "";
+            if (fetchOwnedCompositeSnapshot(store, &fetch_reason)) |refresh| refresh.deinit();
+        }
+    }.run;
+    const worker = try std.Thread.spawn(.{}, stalledFetch, .{&storage});
+    var request_attempts: usize = 0;
+    while (!server.request_started.load(.acquire) and request_attempts < 100) : (request_attempts += 1) {
+        platform_runtime.sleepMillis(5);
+    }
+    if (!server.request_started.load(.acquire)) return error.StallRequestNotStarted;
+    var state: AppState = undefined;
+    state.storage = &storage;
+    state.change_cursor_loop = .{};
+    state.daemon_projection_has_saved_state = false;
+    state.daemon_projection_bootstrap_started_at_ms = 0;
+    state.daemon_projection_stale = false;
+    state.daemon_projection_stale_notified = false;
+    state.terminal_controller.poll_requested = false;
+    const started_ms = platform_runtime.unixTimestampMs();
+    state.drainChangeCursorSignals();
+    const drain_ms = platform_runtime.unixTimestampMs() - started_ms;
+    if (drain_ms >= 50) return error.FrameDrainBlocked;
+    worker.join();
+}
+
+test "M5-P4 stale status covers saved bootstrap and clears after applied refresh" {
+    const started_ms: i64 = 1_000;
+    try std.testing.expect(!projectionStaleAt(true, started_ms, 0, started_ms + CHANGE_CURSOR_STALE_AFTER_MS));
+    try std.testing.expect(projectionStaleAt(true, started_ms, 0, started_ms + CHANGE_CURSOR_STALE_AFTER_MS + 1));
+    try std.testing.expect(!projectionStaleAt(false, started_ms, 0, started_ms + CHANGE_CURSOR_STALE_AFTER_MS + 1));
+    const applied_ms = started_ms + CHANGE_CURSOR_STALE_AFTER_MS + 1;
+    try std.testing.expect(!projectionStaleAt(true, started_ms, applied_ms, applied_ms));
+    // Exercise the same gate used by applyDaemonProjectionRefresh: neither an
+    // in-flight capture nor unrebased dirty state may clear stale status.
+    try std.testing.expect(!projectionRefreshApplyGate(false, true, false, false, false));
+    try std.testing.expect(!projectionRefreshApplyGate(true, false, false, false, false));
+    try std.testing.expect(projectionRefreshApplyGate(true, false, true, false, false));
+    try std.testing.expect(projectionRefreshApplyGate(true, false, false, true, false));
+    try std.testing.expect(projectionRefreshApplyGate(true, false, false, false, true));
+}
+
+test "M5-P4 stale refresh is rejected by the actual transactional apply path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer state.deinit();
+    state.lifecycle.dirty = true;
+    state.daemon_projection_stale = true;
+    const before_projects = state.project_controller.projects.items.len;
+    try std.testing.expectError(error.ProjectionRefreshDeferred, state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 4, .workspaces = &.{} },
+        .store_revision = 4,
+        .envelope = .{ .instance_nonce = "stale-apply", .registry_revision = 4 },
+        .change_cursor = 4,
+    }));
+    try std.testing.expectEqual(before_projects, state.project_controller.projects.items.len);
+    try std.testing.expect(state.daemon_projection_stale);
+    state.lifecycle.dirty = false;
+}
+
+test "M5-P4 cursor loop shutdown flag interrupts sleeps and join is idempotent" {
+    var loop: ChangeCursorLoopState = .{};
+    // join() with a never-spawned worker must be a harmless no-op (deinit
+    // runs before the first frame in some teardown paths).
+    loop.join();
+    loop.shutdown = std.atomic.Value(bool).init(false);
+    // A worker parked in the loop's sleep primitive must observe shutdown
+    // within one 50ms slice; the wall-clock bound proves deinit never waits
+    // out the full backoff interval.
+    const started_ms = platform_runtime.unixTimestampMs();
+    loop.worker = try std.Thread.spawn(.{}, changeCursorSleep, .{ &loop, @as(u64, 60_000) });
+    platform_runtime.sleepMillis(20);
+    loop.join();
+    const waited_ms = platform_runtime.unixTimestampMs() - started_ms;
+    try std.testing.expect(waited_ms < 5_000);
+    try std.testing.expect(loop.worker == null);
 }
 
 test "browser context-menu payload retains an optional link disposition target" {
