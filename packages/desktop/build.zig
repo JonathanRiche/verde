@@ -163,20 +163,26 @@ pub fn build(b: *std.Build) void {
     // Invoke Bun directly so native Windows builds do not require Git Bash.
     const build_inspector_bundle = b.addSystemCommand(&.{
         "bun",
-        "run",
         "build",
+        "src/entry-embed.ts",
+        "--target=browser",
+        "--format=iife",
+        "--outfile",
     });
     build_inspector_bundle.setCwd(b.path("../browser_extensions/inspector"));
+    build_inspector_bundle.addFileInput(b.path("../browser_extensions/inspector/src/entry-embed.ts"));
+    build_inspector_bundle.addFileInput(b.path("../browser_extensions/inspector/src/inspector.ts"));
+    build_inspector_bundle.addFileInput(b.path("../browser_extensions/inspector/src/types.ts"));
+    const inspector_bundle_output = build_inspector_bundle.addOutputFileArg("inspector.js");
     // ZLS captures its build runner's stdout as JSON, so keep Bun's status
     // output from contaminating the build configuration stream.
     _ = build_inspector_bundle.captureStdOut(.{});
 
     const inspector_bundle_files = b.addWriteFiles();
     _ = inspector_bundle_files.addCopyFile(
-        b.path("../browser_extensions/inspector/dist/inspector.js"),
+        inspector_bundle_output,
         "inspector.js",
     );
-    inspector_bundle_files.step.dependOn(&build_inspector_bundle.step);
     const inspector_bundle_module = b.createModule(.{
         .root_source_file = inspector_bundle_files.add("inspector_bundle.zig",
             \\pub const bundle = @embedFile("inspector.js");
