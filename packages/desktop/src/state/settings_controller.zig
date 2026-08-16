@@ -25,8 +25,6 @@ const CHAT_TITLE_PROVIDER_OPTIONS = [_]app_config.ChatTitleProvider{
     .opencode,
 };
 
-const MODAL_FADE_MS: f32 = 160.0;
-
 fn monotonicMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
 }
@@ -59,13 +57,14 @@ pub const Draft = struct {
     workspace_scroll_mode: app_config.WorkspaceScrollMode = .automatic,
     workspace_scroll_threshold: u8 = app_config.DEFAULT_WORKSPACE_SCROLL_THRESHOLD,
     unzoom_on_pane_navigation: bool = false,
+    reduced_motion: bool = false,
     companion_enabled: bool = false,
     companion_character: app_config.CompanionCharacter = .sprout,
     theme_source: theme.ThemeSource = .omarchy,
     theme_choice: usize = 1,
     open_action: OpenAction = .folder,
     link_open_target: app_config.LinkOpenTarget = .verde_browser,
-    browser_fast_scrolling_enabled: bool = true,
+    browser_scroll_speed: f32 = app_config.DEFAULT_BROWSER_SCROLL_SPEED,
     file_links_in_neovim_pane: bool = false,
     tool_call_group_preference: app_config.ToolCallGroupPreference = .collapsed,
     diff_layout_preference: app_config.DiffLayoutPreference = .stacked,
@@ -149,6 +148,9 @@ pub const State = struct {
     mcp_summary: provider_mcp.Summary = .{},
     scroll_y: f32 = 0.0,
     hover_control: ?u8 = null,
+    browser_scroll_speed_drag_active: bool = false,
+    browser_scroll_speed_drag_x: f32 = 0.0,
+    browser_scroll_speed_drag_w: f32 = 0.0,
     close_hovered: bool = false,
     companion_character_dropdown_open: bool = false,
     companion_character_hover_index: ?usize = null,
@@ -274,12 +276,13 @@ pub fn syncSettingsDraftFromConfig(self: anytype) void {
         .workspace_scroll_mode = workspace_scroll_mode,
         .workspace_scroll_threshold = workspace_scroll_threshold,
         .unzoom_on_pane_navigation = self.app_config.unzoom_on_pane_navigation,
+        .reduced_motion = self.app_config.reduced_motion,
         .companion_enabled = self.app_config.companion_enabled,
         .theme_source = self.app_config.theme_config.source,
         .theme_choice = self.app_config.themeChoiceIndex(),
         .open_action = settingsOpenActionFromConfig(self.app_config.default_open_action),
         .link_open_target = self.app_config.link_open_target,
-        .browser_fast_scrolling_enabled = self.app_config.browser_fast_scrolling_enabled,
+        .browser_scroll_speed = self.app_config.browser_scroll_speed,
         .file_links_in_neovim_pane = self.app_config.file_links_in_neovim_pane,
         .tool_call_group_preference = self.app_config.tool_call_group_preference,
         .diff_layout_preference = self.app_config.diff_layout_preference,
@@ -316,11 +319,12 @@ pub fn isSettingsDraftDirty(self: anytype) bool {
     if (draft.workspace_scroll_mode != workspace_scroll_mode) return true;
     if (draft.workspace_scroll_threshold != workspace_scroll_threshold) return true;
     if (draft.unzoom_on_pane_navigation != self.app_config.unzoom_on_pane_navigation) return true;
+    if (draft.reduced_motion != self.app_config.reduced_motion) return true;
     if (draft.companion_enabled != self.app_config.companion_enabled) return true;
     if (isCompanionCharacterDraftDirty(&self.settings_controller, &self.app_config)) return true;
     if (draft.theme_choice != self.app_config.themeChoiceIndex()) return true;
     if (draft.link_open_target != self.app_config.link_open_target) return true;
-    if (draft.browser_fast_scrolling_enabled != self.app_config.browser_fast_scrolling_enabled) return true;
+    if (draft.browser_scroll_speed != self.app_config.browser_scroll_speed) return true;
     if (draft.file_links_in_neovim_pane != self.app_config.file_links_in_neovim_pane) return true;
     if (draft.tool_call_group_preference != self.app_config.tool_call_group_preference) return true;
     if (draft.diff_layout_preference != self.app_config.diff_layout_preference) return true;
@@ -348,6 +352,7 @@ pub fn openSettingsModal(self: anytype) void {
     self.settings_controller.mcp_summary = provider_mcp.inspect(self.allocator);
     self.settings_controller.scroll_y = 0.0;
     self.settings_controller.hover_control = null;
+    self.settings_controller.browser_scroll_speed_drag_active = false;
     self.settings_controller.close_hovered = false;
     self.settings_controller.companion_character_dropdown_open = false;
     self.settings_controller.companion_character_hover_index = null;
@@ -448,6 +453,7 @@ pub fn saveSettingsModal(self: anytype) !void {
     self.app_config.workspace_panes_per_view = std.math.clamp(self.settings_controller.draft.workspace_panes_per_view, app_config.MIN_WORKSPACE_PANES_PER_VIEW, app_config.MAX_WORKSPACE_PANES_PER_VIEW);
     self.app_config.workspace_scroll_direction = self.settings_controller.draft.workspace_scroll_direction;
     self.app_config.unzoom_on_pane_navigation = self.settings_controller.draft.unzoom_on_pane_navigation;
+    self.app_config.reduced_motion = self.settings_controller.draft.reduced_motion;
     self.app_config.companion_enabled = self.settings_controller.draft.companion_enabled;
     self.reconcileCompanionAvailability();
     applyCompanionCharacterDraft(&self.settings_controller, &self.app_config);
@@ -459,7 +465,7 @@ pub fn saveSettingsModal(self: anytype) !void {
         self.app_config.workspace_scroll_threshold = workspace_scroll_threshold;
     }
     self.app_config.link_open_target = self.settings_controller.draft.link_open_target;
-    self.app_config.browser_fast_scrolling_enabled = self.settings_controller.draft.browser_fast_scrolling_enabled;
+    self.app_config.browser_scroll_speed = theme.clampf(self.settings_controller.draft.browser_scroll_speed, app_config.MIN_BROWSER_SCROLL_SPEED, app_config.MAX_BROWSER_SCROLL_SPEED);
     self.app_config.file_links_in_neovim_pane = self.settings_controller.draft.file_links_in_neovim_pane;
     self.app_config.tool_call_group_preference = self.settings_controller.draft.tool_call_group_preference;
     self.app_config.diff_layout_preference = self.settings_controller.draft.diff_layout_preference;
@@ -539,6 +545,7 @@ pub fn reloadAppConfigFromDisk(self: anytype) !void {
 /// blocked) until the fade completes in `tickSettingsModalAnimation`.
 fn beginSettingsModalClose(self: anytype) void {
     if (!self.settings_controller.modal_visible) return;
+    self.settings_controller.browser_scroll_speed_drag_active = false;
     self.settings_controller.modal_closing = true;
     self.settings_controller.modal_anim_last_ms = 0;
 }
@@ -554,7 +561,8 @@ pub fn tickSettingsModalAnimation(self: anytype) void {
     if (last == 0 or now <= last) return;
     // Clamp so a stalled frame advances the fade instead of skipping it.
     const elapsed: f32 = @floatFromInt(@min(now - last, 100));
-    const step = elapsed / MODAL_FADE_MS;
+    const duration_ms = theme.motionDurationMs(self.app_config.reduced_motion, theme.MOTION_BASE_MS);
+    const step = elapsed / @as(f32, @floatFromInt(duration_ms));
     if (self.settings_controller.modal_closing) {
         self.settings_controller.modal_anim_progress -= step;
         if (self.settings_controller.modal_anim_progress <= 0.0) {

@@ -167,6 +167,9 @@ pub fn build(b: *std.Build) void {
         "build",
     });
     build_inspector_bundle.setCwd(b.path("../browser_extensions/inspector"));
+    // ZLS captures its build runner's stdout as JSON, so keep Bun's status
+    // output from contaminating the build configuration stream.
+    _ = build_inspector_bundle.captureStdOut(.{});
 
     const inspector_bundle_files = b.addWriteFiles();
     _ = inspector_bundle_files.addCopyFile(

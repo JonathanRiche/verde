@@ -574,13 +574,26 @@ fn snapshotAttachment(source: ?headless.store.Attachment) ?PersistedImageAttachm
     return .{ .path = image.path, .mime = image.mime, .byte_size = image.byte_size };
 }
 
-fn snapshotMessageToPersisted(message: headless.store.Message) PersistedMessage {
+/// Extras past the primary from a wire full-list ([primary] ++ extras).
+/// Borrows strings from the wire snapshot, matching `snapshotAttachment`.
+fn snapshotAttachmentExtras(
+    allocator: std.mem.Allocator,
+    images: []const headless.store.Attachment,
+) ![]const PersistedImageAttachment {
+    if (images.len <= 1) return &.{};
+    const out = try allocator.alloc(PersistedImageAttachment, images.len - 1);
+    for (images[1..], 0..) |image, index| out[index] = snapshotAttachment(image).?;
+    return out;
+}
+
+fn snapshotMessageToPersisted(allocator: std.mem.Allocator, message: headless.store.Message) !PersistedMessage {
     const image = if (message.images.len > 0) message.images[0] else message.image;
     return .{
         .role = snapshotEnum(ChatRole, message.role, .system),
         .author = message.author,
         .body = message.body,
         .image = snapshotAttachment(image),
+        .extra_images = try snapshotAttachmentExtras(allocator, message.images),
         .tool_call_id = message.tool_call_id,
         .tool_call_kind = snapshotOptionalEnum(ai_harness.ToolCallKind, message.tool_call_kind),
         .tool_call_status = snapshotOptionalEnum(ai_harness.ToolCallStatus, message.tool_call_status),
@@ -593,7 +606,7 @@ fn snapshotMessagesToPersisted(
     messages: []const headless.store.Message,
 ) ![]PersistedMessage {
     const out = try allocator.alloc(PersistedMessage, messages.len);
-    for (messages, 0..) |message, index| out[index] = snapshotMessageToPersisted(message);
+    for (messages, 0..) |message, index| out[index] = try snapshotMessageToPersisted(allocator, message);
     return out;
 }
 
@@ -618,6 +631,7 @@ fn snapshotThreadToPersisted(
         .tui_dock_id = thread.tui_dock_id,
         .draft = thread.draft,
         .draft_image = snapshotAttachment(thread.draft_image),
+        .draft_extra_images = try snapshotAttachmentExtras(allocator, thread.draft_images),
         .message_offset = thread.message_offset,
         .messages = try snapshotMessagesToPersisted(allocator, thread.messages),
     };
@@ -742,6 +756,17 @@ fn optionalImageEqual(a: ?db_types.PersistedImageAttachment, b: ?db_types.Persis
         a.?.byte_size == b.?.byte_size;
 }
 
+fn imageListEqual(
+    a: []const db_types.PersistedImageAttachment,
+    b: []const db_types.PersistedImageAttachment,
+) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!optionalImageEqual(left, right)) return false;
+    }
+    return true;
+}
+
 fn optionalHerdrEqual(a: ?db_types.PersistedHerdrWorkspaceLink, b: ?db_types.PersistedHerdrWorkspaceLink) bool {
     if (a == null or b == null) return a == null and b == null;
     return std.mem.eql(u8, a.?.remote_alias, b.?.remote_alias) and
@@ -775,6 +800,9 @@ fn overlayCurrentThreadEdits(
     if (current.tui_dock_id != baseline.tui_dock_id) remote.tui_dock_id = current.tui_dock_id;
     if (!std.mem.eql(u8, current.draft, baseline.draft)) remote.draft = current.draft;
     if (!optionalImageEqual(current.draft_image, baseline.draft_image)) remote.draft_image = current.draft_image;
+    if (!imageListEqual(current.draft_extra_images, baseline.draft_extra_images)) {
+        remote.draft_extra_images = current.draft_extra_images;
+    }
 }
 
 fn overlayCurrentThreadMessages(
@@ -985,6 +1013,215 @@ fn transcriptSnapshotsShareLayout(current: *const ChatThread, replacement: *cons
     return true;
 }
 
+fn chatImagesEqual(a: ChatImageAttachment, b: ChatImageAttachment) bool {
+    return std.mem.eql(u8, a.path, b.path) and
+        std.mem.eql(u8, a.mime, b.mime) and
+        a.byte_size == b.byte_size;
+}
+
+fn optionalChatImageEqual(a: ?ChatImageAttachment, b: ?ChatImageAttachment) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return chatImagesEqual(a.?, b.?);
+}
+
+fn chatMessagesEqualForProjection(a: ChatMessage, b: ChatMessage) bool {
+    if (a.role != b.role or
+        !std.mem.eql(u8, a.author, b.author) or
+        !std.mem.eql(u8, a.body, b.body) or
+        !optionalSliceEqual(a.tool_call_id, b.tool_call_id) or
+        a.tool_call_kind != b.tool_call_kind or
+        a.tool_call_status != b.tool_call_status or
+        !optionalSliceEqual(a.message_id, b.message_id) or
+        !optionalChatImageEqual(a.image, b.image) or
+        a.extra_images.len != b.extra_images.len)
+    {
+        return false;
+    }
+    for (a.extra_images, b.extra_images) |a_image, b_image| {
+        if (!chatImagesEqual(a_image, b_image)) return false;
+    }
+    return true;
+}
+
+/// A refresh normally rematerializes only the durable tail page. If that page
+/// is an unchanged suffix of the GUI's already-hydrated transcript, retain the
+/// wider materialized range. Otherwise the copied numeric scroll offset would
+/// suddenly be interpreted in the compact page's unrelated coordinate space.
+fn replacementTranscriptIsUnchangedCoveredRange(current: *const ChatThread, replacement: *const ChatThread) bool {
+    const current_start = current.persisted_message_offset;
+    const replacement_start = replacement.persisted_message_offset;
+    if (replacement_start < current_start) return false;
+    const skip = replacement_start - current_start;
+    if (skip > current.messages.items.len) return false;
+    if (replacement.messages.items.len > current.messages.items.len - skip) return false;
+    for (current.messages.items[skip..][0..replacement.messages.items.len], replacement.messages.items) |current_message, replacement_message| {
+        if (!chatMessagesEqualForProjection(current_message, replacement_message)) return false;
+    }
+    return true;
+}
+
+fn cloneProjectionImage(allocator: std.mem.Allocator, source: ChatImageAttachment) !ChatImageAttachment {
+    const path = try allocator.dupeZ(u8, source.path);
+    errdefer allocator.free(path);
+    const file_name = try allocator.dupeZ(u8, source.file_name);
+    errdefer allocator.free(file_name);
+    const mime = try allocator.dupeZ(u8, source.mime);
+    return .{
+        .path = path,
+        .file_name = file_name,
+        .mime = mime,
+        .byte_size = source.byte_size,
+    };
+}
+
+fn cloneProjectionOptionalSlice(allocator: std.mem.Allocator, source: ?[]const u8) !?[]const u8 {
+    return if (source) |value| try allocator.dupe(u8, value) else null;
+}
+
+fn cloneProjectionMessage(allocator: std.mem.Allocator, source: ChatMessage) !ChatMessage {
+    const author = try allocator.dupeZ(u8, source.author);
+    errdefer allocator.free(author);
+    const body = try allocator.dupeZ(u8, source.body);
+    errdefer allocator.free(body);
+    const image = if (source.image) |attachment| try cloneProjectionImage(allocator, attachment) else null;
+    errdefer if (image) |attachment| attachment.deinit(allocator);
+    const extra_images = try allocator.alloc(ChatImageAttachment, source.extra_images.len);
+    errdefer allocator.free(extra_images);
+    var copied_extra_count: usize = 0;
+    errdefer for (extra_images[0..copied_extra_count]) |attachment| attachment.deinit(allocator);
+    for (source.extra_images, 0..) |attachment, index| {
+        extra_images[index] = try cloneProjectionImage(allocator, attachment);
+        copied_extra_count += 1;
+    }
+    const tool_call_id = try cloneProjectionOptionalSlice(allocator, source.tool_call_id);
+    errdefer if (tool_call_id) |value| allocator.free(value);
+    const message_id = try cloneProjectionOptionalSlice(allocator, source.message_id);
+    return .{
+        .role = source.role,
+        .author = author,
+        .body = body,
+        .image = image,
+        .extra_images = extra_images,
+        .tool_call_id = tool_call_id,
+        .tool_call_kind = source.tool_call_kind,
+        .tool_call_status = source.tool_call_status,
+        .message_id = message_id,
+        .transcript_card_started_ms = source.transcript_card_started_ms,
+    };
+}
+
+fn deinitProjectionMessage(allocator: std.mem.Allocator, message: ChatMessage) void {
+    allocator.free(message.author);
+    allocator.free(message.body);
+    if (message.image) |attachment| attachment.deinit(allocator);
+    for (message.extra_images) |attachment| attachment.deinit(allocator);
+    allocator.free(message.extra_images);
+    if (message.tool_call_id) |value| allocator.free(value);
+    if (message.message_id) |value| allocator.free(value);
+}
+
+fn deinitProjectionMessages(allocator: std.mem.Allocator, messages: []const ChatMessage) void {
+    for (messages) |message| deinitProjectionMessage(allocator, message);
+}
+
+/// Widen a compact replacement to the GUI's materialized absolute range.
+/// The daemon-owned overlap remains authoritative, while older hydrated rows
+/// and any live rows beyond a stale replacement are cloned around it. This is
+/// fallible staging work and never mutates the live projection.
+fn prepareProjectionTranscriptContinuity(
+    allocator: std.mem.Allocator,
+    current: *const ChatThread,
+    replacement: *ChatThread,
+) !void {
+    if (replacementTranscriptIsUnchangedCoveredRange(current, replacement)) return;
+
+    const current_start = current.persisted_message_offset;
+    const current_end = current_start + current.messages.items.len;
+    const replacement_start = replacement.persisted_message_offset;
+    if (replacement_start < current_start or replacement_start > current_end) return;
+    const replacement_end = replacement_start + replacement.messages.items.len;
+    const prefix_count = replacement_start - current_start;
+    const suffix_start = @min(@max(replacement_end, current_start) - current_start, current.messages.items.len);
+    const suffix = current.messages.items[suffix_start..];
+    if (prefix_count == 0 and suffix.len == 0) return;
+
+    var prefix_clones: std.ArrayList(ChatMessage) = .empty;
+    defer prefix_clones.deinit(allocator);
+    var prefix_owned = true;
+    errdefer if (prefix_owned) deinitProjectionMessages(allocator, prefix_clones.items);
+    for (current.messages.items[0..prefix_count]) |message| {
+        const cloned = try cloneProjectionMessage(allocator, message);
+        prefix_clones.append(allocator, cloned) catch |err| {
+            deinitProjectionMessage(allocator, cloned);
+            return err;
+        };
+    }
+
+    var suffix_clones: std.ArrayList(ChatMessage) = .empty;
+    defer suffix_clones.deinit(allocator);
+    var suffix_owned = true;
+    errdefer if (suffix_owned) deinitProjectionMessages(allocator, suffix_clones.items);
+    for (suffix) |message| {
+        const cloned = try cloneProjectionMessage(allocator, message);
+        suffix_clones.append(allocator, cloned) catch |err| {
+            deinitProjectionMessage(allocator, cloned);
+            return err;
+        };
+    }
+
+    var merged = try std.ArrayList(ChatMessage).initCapacity(
+        allocator,
+        prefix_clones.items.len + replacement.messages.items.len + suffix_clones.items.len,
+    );
+    merged.appendSliceAssumeCapacity(prefix_clones.items);
+    merged.appendSliceAssumeCapacity(replacement.messages.items);
+    merged.appendSliceAssumeCapacity(suffix_clones.items);
+    replacement.messages.deinit(allocator);
+    replacement.messages = merged;
+    replacement.persisted_message_offset = current_start;
+    prefix_owned = false;
+    suffix_owned = false;
+    replacement.rebuildBackgroundTasksFromMessages(allocator);
+}
+
+fn prepareProjectionTranscriptRuntime(
+    allocator: std.mem.Allocator,
+    current: *project_controller.State,
+    replacement: *project_controller.State,
+) !void {
+    const collections = .{ &replacement.projects, &replacement.archived_projects };
+    inline for (collections) |projects| {
+        for (projects.items) |*next_project| {
+            const current_project = projectByIdForViewport(current, next_project.id) orelse continue;
+            for (next_project.threads.items) |*next_thread| {
+                const current_thread = threadByIdForViewport(current_project, next_thread.local_thread_id) orelse continue;
+                try prepareProjectionTranscriptContinuity(allocator, current_thread, next_thread);
+            }
+            for (next_project.archived_threads.items) |*next_thread| {
+                const current_thread = threadByIdForViewport(current_project, next_thread.local_thread_id) orelse continue;
+                try prepareProjectionTranscriptContinuity(allocator, current_thread, next_thread);
+            }
+        }
+    }
+}
+
+fn replacementTranscriptPreservesLayoutCoordinates(current: *const ChatThread, replacement: *const ChatThread) bool {
+    return current.persisted_message_offset == replacement.persisted_message_offset and
+        current.transcript_layout_first_message_index + current.transcript_layout_message_count <= replacement.messages.items.len;
+}
+
+fn replacementTranscriptKeepsCurrentPrefix(current: *const ChatThread, replacement: *const ChatThread) bool {
+    if (current.persisted_message_offset != replacement.persisted_message_offset or
+        current.messages.items.len > replacement.messages.items.len)
+    {
+        return false;
+    }
+    for (current.messages.items, replacement.messages.items[0..current.messages.items.len]) |current_message, replacement_message| {
+        if (!chatMessagesEqualForProjection(current_message, replacement_message)) return false;
+    }
+    return true;
+}
+
 fn sendStateHasRuntime(state: *SendState) bool {
     state.mutex.lock();
     defer state.mutex.unlock();
@@ -992,6 +1229,20 @@ fn sendStateHasRuntime(state: *SendState) bool {
 }
 
 fn transferProjectionThreadRuntime(current: *ChatThread, replacement: *ChatThread) void {
+    const keep_materialized_transcript = replacementTranscriptIsUnchangedCoveredRange(current, replacement);
+    const layout_content_unchanged = keep_materialized_transcript or replacementTranscriptKeepsCurrentPrefix(current, replacement);
+    const transfer_layout = layout_content_unchanged or
+        transcriptSnapshotsShareLayout(current, replacement) or
+        replacementTranscriptPreservesLayoutCoordinates(current, replacement);
+    if (keep_materialized_transcript) {
+        // Ownership moves by swap at the publication boundary: the old
+        // projection later destroys the compact replacement page, while the
+        // replacement keeps the hydrated rows and their exact layout space.
+        std.mem.swap(usize, &current.persisted_message_offset, &replacement.persisted_message_offset);
+        std.mem.swap(@TypeOf(current.messages), &current.messages, &replacement.messages);
+        std.mem.swap(@TypeOf(current.background_tasks), &current.background_tasks, &replacement.background_tasks);
+    }
+
     const transfer_send_state = sendStateHasRuntime(current.send_state) or !sendStateHasRuntime(replacement.send_state);
     if (transfer_send_state) {
         std.mem.swap(@TypeOf(current.send_state), &current.send_state, &replacement.send_state);
@@ -1001,7 +1252,7 @@ fn transferProjectionThreadRuntime(current: *ChatThread, replacement: *ChatThrea
     // projection, so its worker/result state always follows the stable thread.
     std.mem.swap(@TypeOf(current.title_generation_state), &current.title_generation_state, &replacement.title_generation_state);
 
-    if (!transcriptSnapshotsShareLayout(current, replacement)) return;
+    if (!transfer_layout) return;
     std.mem.swap(@TypeOf(current.transcript_markdown_entries), &current.transcript_markdown_entries, &replacement.transcript_markdown_entries);
     std.mem.swap(@TypeOf(current.transcript_height_entries), &current.transcript_height_entries, &replacement.transcript_height_entries);
     std.mem.swap(@TypeOf(current.transcript_layout_items), &current.transcript_layout_items, &replacement.transcript_layout_items);
@@ -1014,6 +1265,9 @@ fn transferProjectionThreadRuntime(current: *ChatThread, replacement: *ChatThrea
     std.mem.swap(f32, &current.transcript_layout_requested_height, &replacement.transcript_layout_requested_height);
     std.mem.swap(bool, &current.transcript_layout_visible_ready, &replacement.transcript_layout_visible_ready);
     std.mem.swap(bool, &current.transcript_layout_valid, &replacement.transcript_layout_valid);
+    // Same absolute indices with changed durable content can retain the old
+    // row anchor, but must remeasure before presenting the updated rows.
+    if (!layout_content_unchanged) replacement.transcript_layout_valid = false;
 }
 
 fn countProjectionActiveSends(controller: *project_controller.State) usize {
@@ -1047,8 +1301,9 @@ fn transferProjectionTerminalRuntime(current: *Project, replacement: *Project) v
 }
 
 /// Projection refreshes replace durable data, but live sends, terminal
-/// emulators, measured layout, and scroll offsets are frame-local runtime
-/// state. Carry them by stable identity before the old projects are destroyed.
+/// emulators, measured layout, scroll offsets, and pane focus/viewport are
+/// frame-local runtime state. Carry them by stable identity before the old
+/// projects are destroyed.
 fn preserveProjectionRuntime(
     current: *project_controller.State,
     replacement: *project_controller.State,
@@ -1058,6 +1313,7 @@ fn preserveProjectionRuntime(
         for (projects.items) |*next_project| {
             const current_project = projectByIdForViewport(current, next_project.id) orelse continue;
             transferProjectionTerminalRuntime(current_project, next_project);
+            preserveWorkspaceViewportRuntime(current_project, next_project);
 
             for (next_project.threads.items) |*next_thread| {
                 const current_thread = threadByIdForViewport(current_project, next_thread.local_thread_id) orelse continue;
@@ -1111,6 +1367,195 @@ fn preserveProjectionRuntime(
     }
 }
 
+/// The scrolling strip's eased offset and reveal/leading bookkeeping are
+/// never persisted, so a rebuilt projection resets them and the next frame's
+/// auto-reveal scrolls the viewport back to the snapshot's focused pane.
+/// Carry them across the swap. Persisted presentation fields (focus,
+/// maximize, scroll target) are deliberately NOT restored here: they are
+/// patched into the incoming snapshot before baseline capture
+/// (preserveLiveWorkspacePresentationInPersisted), because overwriting them
+/// after apply makes the live layout JSON diverge from the recorded baseline
+/// and later merges would misread that divergence as a local structural edit,
+/// resurrecting panes against a legitimate remote layout change.
+fn preserveWorkspaceViewportRuntime(
+    current_project: *const project_state.Project,
+    next_project: *project_state.Project,
+) void {
+    const current_layout = &current_project.workspace_layout;
+    const next_layout = &next_project.workspace_layout;
+    next_layout.scroll_offset_x = current_layout.scroll_offset_x;
+    next_layout.scroll_offset_y = current_layout.scroll_offset_y;
+    next_layout.scroll_animation_last_ms = current_layout.scroll_animation_last_ms;
+    next_layout.scroll_revealed_pane_id = current_layout.scroll_revealed_pane_id;
+    next_layout.scroll_leading_pane_id = current_layout.scroll_leading_pane_id;
+}
+
+/// Pane focus, maximize, and the strip scroll target are GUI-owned
+/// presentation state: nothing may move them except an explicit user action.
+/// A refresh's snapshot is stale here exactly in the send→turn-start window,
+/// where a local focus change cannot flush yet, so applying the snapshot's
+/// `focused` yanked the user back to the sending pane. Rewrite the snapshot's
+/// layout JSON to the live values BEFORE baseline capture and apply: the
+/// applied layout and the recorded baseline then agree by construction, so
+/// preservation never reads as a local layout edit in later merges.
+fn preserveLiveWorkspacePresentationInPersisted(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    controller: *project_controller.State,
+    persisted: *PersistedState,
+) !void {
+    if (persisted.projects.len == 0) return;
+    // The durable-projection branch shares the snapshot owner's memory, so
+    // patch a shallow arena copy of the project records, never the original.
+    const projects = try arena.dupe(PersistedProject, persisted.projects);
+    var any_patched = false;
+    for (projects) |*project| {
+        const project_id = project.id orelse continue;
+        const live_project = projectByIdForViewport(controller, project_id) orelse continue;
+        // A remote layout clear (null JSON) is durable data; never resurrect
+        // presentation state onto it.
+        const layout_json = project.workspace_layout_json orelse continue;
+        const live_layout = &live_project.workspace_layout;
+        var layout: WorkspaceLayout = .{};
+        defer layout.deinit(gpa);
+        // Malformed JSON falls through to applyPersisted's own handling.
+        layout.applyPersistedWorkspaceJson(gpa, layout_json) catch continue;
+        var changed = false;
+        if (live_layout.focused_pane_id) |pane_id| {
+            // A live focused pane deleted remotely keeps the snapshot value;
+            // repairVisibleRoot re-parks a dangling id on a visible pane.
+            if (layout.paneById(pane_id) != null and
+                (layout.focused_pane_id == null or layout.focused_pane_id.? != pane_id))
+            {
+                layout.focused_pane_id = pane_id;
+                changed = true;
+            }
+        }
+        if (live_layout.maximized_pane_id) |pane_id| {
+            if (layout.paneById(pane_id) != null and
+                (layout.maximized_pane_id == null or layout.maximized_pane_id.? != pane_id))
+            {
+                layout.maximized_pane_id = pane_id;
+                changed = true;
+            }
+        } else if (layout.maximized_pane_id != null) {
+            // A local unmaximize must survive a refresh that still carries
+            // the previously flushed maximized id.
+            layout.maximized_pane_id = null;
+            changed = true;
+        }
+        if (layout.scroll_target_x != live_layout.scroll_target_x or
+            layout.scroll_target_y != live_layout.scroll_target_y)
+        {
+            layout.scroll_target_x = live_layout.scroll_target_x;
+            layout.scroll_target_y = live_layout.scroll_target_y;
+            changed = true;
+        }
+        if (!changed) continue;
+        project.workspace_layout_json = try layout.persistedWorkspaceJson(arena);
+        any_patched = true;
+    }
+    if (any_patched) persisted.projects = projects;
+}
+
+/// Find a thread's draft-attachment baseline inside the last applied
+/// projection snapshot, or null when the baseline does not know the thread.
+fn baselineThreadForAttachments(
+    baseline: ?*const PersistedState,
+    project_id: []const u8,
+    thread_id: []const u8,
+) ?*const PersistedThread {
+    const base = baseline orelse return null;
+    for (base.projects) |*project| {
+        const base_project_id = project.id orelse continue;
+        if (!std.mem.eql(u8, base_project_id, project_id)) continue;
+        const threads = project.threads orelse return null;
+        for (threads) |*thread| {
+            const base_thread_id = thread.local_thread_id orelse continue;
+            if (std.mem.eql(u8, base_thread_id, thread_id)) return thread;
+        }
+        return null;
+    }
+    return null;
+}
+
+/// Carry live composer attachments into a refresh snapshot by identity.
+///
+/// Draft attachments merge by recency, not flush ordering: an image attached
+/// moments before `dirty` cleared must survive a refresh whose snapshot was
+/// captured before the flush landed. The dirty-gated local-edit merge misses
+/// exactly that window, so this runs on every refresh and keeps the live
+/// values whenever they differ from the last applied baseline — a genuine
+/// local edit the snapshot cannot know about yet. When live matches the
+/// baseline the snapshot applies untouched, so an explicit remote clear (or
+/// change) from another client stays authoritative. Runs before the baseline
+/// clone (same rationale as the presentation patch above).
+fn overlayLiveDraftAttachmentsInPersisted(
+    arena: std.mem.Allocator,
+    controller: *project_controller.State,
+    baseline: ?*const PersistedState,
+    persisted: *PersistedState,
+) !void {
+    if (persisted.projects.len == 0) return;
+    // The durable-projection branch shares the snapshot owner's memory, so
+    // patch shallow arena copies of the records, never the originals.
+    const projects = try arena.dupe(PersistedProject, persisted.projects);
+    var any_patched = false;
+    for (projects) |*project| {
+        const project_id = project.id orelse continue;
+        const live_project = projectByIdForViewport(controller, project_id) orelse continue;
+        const persisted_threads = project.threads orelse continue;
+        const threads = try arena.dupe(PersistedThread, persisted_threads);
+        var thread_patched = false;
+        for (threads) |*thread| {
+            const thread_id = thread.local_thread_id orelse continue;
+            const live_thread = threadByIdForViewport(live_project, thread_id) orelse continue;
+            const live_primary: ?db_types.PersistedImageAttachment = if (live_thread.draft_image) |image| .{
+                .path = try arena.dupe(u8, image.path),
+                .mime = try arena.dupe(u8, image.mime),
+                .byte_size = image.byte_size,
+            } else null;
+            var live_extras: []db_types.PersistedImageAttachment = &.{};
+            if (live_thread.draft_extra_images.items.len != 0) {
+                live_extras = try arena.alloc(
+                    db_types.PersistedImageAttachment,
+                    live_thread.draft_extra_images.items.len,
+                );
+                for (live_thread.draft_extra_images.items, 0..) |image, index| {
+                    live_extras[index] = .{
+                        .path = try arena.dupe(u8, image.path),
+                        .mime = try arena.dupe(u8, image.mime),
+                        .byte_size = image.byte_size,
+                    };
+                }
+            }
+            if (optionalImageEqual(thread.draft_image, live_primary) and
+                imageListEqual(thread.draft_extra_images, live_extras))
+            {
+                continue;
+            }
+            // Live equal to the baseline means no local edit since the last
+            // applied refresh: the snapshot's differing value is a legitimate
+            // remote change (or clear) and must win. A missing baseline is
+            // conservative — never drop an attachment through a bootstrap.
+            if (baselineThreadForAttachments(baseline, project_id, thread_id)) |base_thread| {
+                if (optionalImageEqual(base_thread.draft_image, live_primary) and
+                    imageListEqual(base_thread.draft_extra_images, live_extras))
+                {
+                    continue;
+                }
+            }
+            thread.draft_image = live_primary;
+            thread.draft_extra_images = live_extras;
+            thread_patched = true;
+        }
+        if (!thread_patched) continue;
+        project.threads = threads;
+        any_patched = true;
+    }
+    if (any_patched) persisted.projects = projects;
+}
+
 test "daemon projection replacement preserves live runtime by identity" {
     const allocator = std.testing.allocator;
     var current: project_controller.State = .{};
@@ -1130,6 +1575,19 @@ test "daemon projection replacement preserves live runtime by identity" {
         return err;
     };
     const current_thread = &current.projects.items[0].threads.items[0];
+    current_thread.persisted_message_offset = 0;
+    try current_thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "hydrated older row"),
+        .message_id = try allocator.dupe(u8, "message:older"),
+    });
+    try current_thread.messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Assistant"),
+        .body = try allocator.dupeZ(u8, "stable tail row"),
+        .message_id = try allocator.dupe(u8, "message:tail"),
+    });
     current_thread.transcript_scroll_valid = true;
     current_thread.transcript_scroll_y = 840.0;
     current_thread.transcript_layout_width = 960.0;
@@ -1147,27 +1605,68 @@ test "daemon projection replacement preserves live runtime by identity" {
     try current_thread.send_state.partial_text.appendSlice(std.heap.page_allocator, "stable stream");
     const live_send_state = current_thread.send_state;
     const live_title_state = current_thread.title_generation_state;
+    const pinned_pane_id = try current.projects.items[0].workspace_layout.createChatPane(allocator, 0);
     const current_pane = current.projects.items[0].workspace_layout.paneByIdMutable(1) orelse return error.MissingChatPane;
     current_pane.ref.chat.transcript_scroll_valid = true;
     current_pane.ref.chat.transcript_scroll_y = 720.0;
+    // Live GUI strip state: the eased offset and reveal bookkeeping are
+    // never persisted, so only this runtime transfer can carry them. The
+    // replacement below arrives with empty strip bookkeeping and a stale
+    // persisted focus/maximize.
+    const current_layout = &current.projects.items[0].workspace_layout;
+    current_layout.focused_pane_id = 1;
+    current_layout.maximized_pane_id = null;
+    current_layout.scroll_offset_x = 480.0;
+    current_layout.scroll_target_x = 480.0;
+    current_layout.scroll_revealed_pane_id = 1;
 
     var next_project = try project_state.Project.init(allocator, "viewport-project", "Replacement", "/tmp/current", 0);
     allocator.free(next_project.threads.items[0].local_thread_id);
     next_project.threads.items[0].local_thread_id = try allocator.dupeZ(u8, current_thread.local_thread_id);
+    next_project.threads.items[0].persisted_message_offset = 1;
+    try next_project.threads.items[0].messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Assistant"),
+        .body = try allocator.dupeZ(u8, "stable tail row"),
+        .message_id = try allocator.dupe(u8, "message:tail"),
+    });
+    try next_project.threads.items[0].messages.append(allocator, .{
+        .role = .assistant,
+        .author = try allocator.dupeZ(u8, "Assistant"),
+        .body = try allocator.dupeZ(u8, "new durable tail row"),
+        .message_id = try allocator.dupe(u8, "message:new-tail"),
+    });
+    const replacement_pinned_pane_id = try next_project.workspace_layout.createChatPane(allocator, 0);
+    try std.testing.expectEqual(pinned_pane_id, replacement_pinned_pane_id);
     replacement.projects.append(allocator, next_project) catch |err| {
         next_project.deinit(allocator);
         return err;
     };
 
     const replacement_send_state = replacement.projects.items[0].threads.items[0].send_state;
+    // Simulate a stale persisted layout: the daemon snapshot still says a
+    // (now nonexistent) pane 7 was focused and maximized, and carries no
+    // strip viewport (those fields are never persisted).
+    const stale_layout = &replacement.projects.items[0].workspace_layout;
+    stale_layout.focused_pane_id = 7;
+    stale_layout.maximized_pane_id = 7;
+    try prepareProjectionTranscriptRuntime(allocator, &current, &replacement);
     preserveProjectionRuntime(&current, &replacement);
 
     const next_thread = replacement.projects.items[0].threads.items[0];
+    try std.testing.expectEqual(@as(usize, 0), next_thread.persisted_message_offset);
+    try std.testing.expectEqual(@as(usize, 3), next_thread.messages.items.len);
+    try std.testing.expectEqualStrings("hydrated older row", next_thread.messages.items[0].body);
+    try std.testing.expectEqualStrings("stable tail row", next_thread.messages.items[1].body);
+    try std.testing.expectEqualStrings("new durable tail row", next_thread.messages.items[2].body);
     try std.testing.expect(next_thread.transcript_scroll_valid);
     try std.testing.expectEqual(@as(f32, 840.0), next_thread.transcript_scroll_y);
     const next_pane = replacement.projects.items[0].workspace_layout.paneById(1) orelse return error.MissingChatPane;
     try std.testing.expect(next_pane.ref.chat.transcript_scroll_valid);
     try std.testing.expectEqual(@as(f32, 720.0), next_pane.ref.chat.transcript_scroll_y);
+    const next_pinned_pane = replacement.projects.items[0].workspace_layout.paneById(pinned_pane_id) orelse return error.MissingChatPane;
+    try std.testing.expect(!next_pinned_pane.ref.chat.transcript_scroll_valid);
+    try std.testing.expectEqual(@as(f32, 0.0), next_pinned_pane.ref.chat.transcript_scroll_y);
     try std.testing.expectEqual(live_send_state, next_thread.send_state);
     try std.testing.expectEqual(replacement_send_state, current.projects.items[0].threads.items[0].send_state);
     try std.testing.expectEqualStrings("stable stream", next_thread.send_state.partial_text.items);
@@ -1177,6 +1676,17 @@ test "daemon projection replacement preserves live runtime by identity" {
     try std.testing.expectEqual(@as(f32, 280.0), next_thread.transcript_layout_committed_height);
     try std.testing.expect(next_thread.transcript_layout_visible_ready);
     try std.testing.expectEqual(@as(usize, 1), countProjectionActiveSends(&replacement));
+    // Focus-steal regression: the never-persisted strip runtime is carried
+    // here, while the persisted presentation fields (focused/maximized/scroll
+    // target) are deliberately untouched — they reach the replacement through
+    // the patched snapshot (preserveLiveWorkspacePresentationInPersisted) so
+    // the live layout JSON stays equal to the recorded projection baseline.
+    const next_layout = &replacement.projects.items[0].workspace_layout;
+    try std.testing.expectEqual(@as(f32, 480.0), next_layout.scroll_offset_x);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), next_layout.scroll_revealed_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 7), next_layout.focused_pane_id);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 7), next_layout.maximized_pane_id);
+    try std.testing.expectEqual(@as(f32, 0.0), next_layout.scroll_target_x);
 }
 
 pub fn paletteUiTextPrefixWidth(text: []const u8, font_size: f32, end: usize) f32 {
@@ -1318,8 +1828,9 @@ pub const BackgroundTaskActionHit = struct {
     rect: palette.Rect,
     project_index: usize,
     thread_index: usize,
-    task_index: usize,
+    task_index: ?usize,
     message_index: usize,
+    body_hash: u64,
     action: BackgroundTaskAction,
 };
 
@@ -1760,7 +2271,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
         },
         .submitted => {
             if (state.currentThread().isSendPendingForUi()) {
-                if (state.currentThread().provider == .codex) {
+                if (state.currentThread().provider == .codex or state.currentThread().provider == .claude) {
                     state.queueDraftDuringSend();
                 } else {
                     state.setSidebarNotice("This thread is still running. Press Tab to queue a follow-up.");
@@ -2398,8 +2909,62 @@ const AccessModeOption = provider_models.AccessModeOption;
 pub const TranscriptMarkdownBody = chat_types.TranscriptMarkdownBody;
 const TranscriptHeightEntry = chat_types.TranscriptHeightEntry;
 
+/// Async older-page transcript hydration (flush-worker pattern): the render
+/// path requests a page, a worker thread loads it through its own read-only
+/// DB connection, and the frame loop commits it — atomically, into the
+/// workspace/thread the request identified (which may be an unfocused pane's
+/// thread, not the current selection).
+const TranscriptHydration = struct {
+    /// Selection generation stamped into every request; bumped on real
+    /// (user-driven) project/thread selection changes so a slow load for a
+    /// previous selection is dropped instead of committing stale rows. The
+    /// render-path pane thread swap must NOT bump this — unfocused pane
+    /// requests are expected to outlive the swap and commit by identity.
+    generation: u64 = 0,
+    in_flight: bool = false,
+    worker: ?std.Thread = null,
+    args: ?*TranscriptHydrationArgs = null,
+};
+
+const TranscriptHydrationArgs = struct {
+    allocator: std.mem.Allocator,
+    storage: *const Storage,
+    workspace_id: []u8,
+    local_thread_id: []u8,
+    before_offset: usize,
+    limit: usize,
+    generation: u64,
+    // Worker output, readable after `done` is acquired.
+    page: ?db_types.LoadedMessagePage = null,
+    failed: bool = false,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn deinitAndDestroy(self: *TranscriptHydrationArgs) void {
+        if (self.page) |*loaded| loaded.deinit();
+        self.allocator.free(self.workspace_id);
+        self.allocator.free(self.local_thread_id);
+        self.allocator.destroy(self);
+    }
+};
+
+fn transcriptHydrationWorkerMain(args: *TranscriptHydrationArgs) void {
+    args.page = args.storage.loadMessagePage(
+        args.allocator,
+        args.workspace_id,
+        args.local_thread_id,
+        args.before_offset,
+        args.limit,
+    ) catch blk: {
+        args.failed = true;
+        break :blk null;
+    };
+    args.done.store(true, .release);
+}
+
 pub const TranscriptMarkdownSelectionPoint = transcript_controller.MarkdownSelectionPoint;
 pub const TranscriptMarkdownSelection = transcript_controller.MarkdownSelection;
+pub const TranscriptPresentationIdentity = transcript_controller.TranscriptPresentationIdentity;
+pub const shouldPresentTranscriptImmediately = transcript_controller.shouldPresentTranscriptImmediately;
 
 pub const OPENCODE_MODEL_OPTIONS = provider_models.OPENCODE_MODEL_OPTIONS;
 pub const CODEX_MODEL_OPTIONS = provider_models.CODEX_MODEL_OPTIONS;
@@ -2635,6 +3200,11 @@ pub const AppState = struct {
     card_toggle_hits: std.ArrayList(CardToggleHit),
     background_task_action_hits: std.ArrayList(BackgroundTaskActionHit),
     expanded_cards: std.AutoHashMap(u64, bool),
+    // Bumped on every card expand/collapse so per-frame layout variant hashing
+    // can compare one counter instead of iterating the map.
+    expanded_cards_revision: u64,
+    pending_ui_snapshot_cache: chat_types.PendingUiSnapshotCache,
+    transcript_hydration: TranscriptHydration,
     palette_modal_text_focus: PaletteModalTextFocus,
     gl_texture_uploads_enabled: bool,
     browser_textures_enabled: bool,
@@ -2797,6 +3367,9 @@ pub const AppState = struct {
             .card_toggle_hits = .empty,
             .background_task_action_hits = .empty,
             .expanded_cards = std.AutoHashMap(u64, bool).init(allocator),
+            .expanded_cards_revision = 0,
+            .pending_ui_snapshot_cache = .{},
+            .transcript_hydration = .{},
             .palette_modal_text_focus = .none,
             .gl_texture_uploads_enabled = options.gl_texture_uploads_enabled,
             .browser_textures_enabled = options.browser_textures_enabled,
@@ -3342,6 +3915,7 @@ pub const AppState = struct {
     pub fn selectProjectAtIndex(self: *AppState, index: usize) bool {
         if (index >= self.project_controller.projects.items.len) return false;
         const switch_started_ms = platform_runtime.unixTimestampMs();
+        const hydration_generation_before_focus = self.transcriptHydrationGeneration();
         defer {
             const elapsed_ms = platform_runtime.unixTimestampMs() - switch_started_ms;
             if (elapsed_ms > 50) {
@@ -3354,6 +3928,8 @@ pub const AppState = struct {
         self.restorePersistedBrowserPaneAfterProjectSelection(index);
         const focused_pane_id = self.project_controller.projects.items[index].workspace_layout.focused_pane_id;
         if (focused_pane_id) |pane_id| _ = self.restoreWorkspacePaneFocus(index, pane_id);
+        if (self.transcriptHydrationGeneration() == hydration_generation_before_focus) self.noteTranscriptSelectionChanged();
+        if (focused_pane_id) |pane_id| self.prepareTranscriptPaneFocus(index, pane_id);
         self.workspace_header_open_menu_open = false;
         self.workspace_header_open_menu_pane_id = null;
         self.sidebar_context_menu_open = false;
@@ -4288,9 +4864,10 @@ pub const AppState = struct {
         self.focusProjectThreadInWorkspace(project_index, thread_index) catch |err| {
             log.err("failed to focus selected thread workspace pane: {s}", .{@errorName(err)});
         };
+        self.noteTranscriptSelectionChanged();
+        if (project.workspace_layout.focused_pane_id) |pane_id| self.prepareTranscriptPaneFocus(project_index, pane_id);
         self.requestComposerFocus();
         self.syncRenameBuffer();
-        self.requestTranscriptScrollToBottom();
         self.markDirty();
     }
 
@@ -4354,12 +4931,15 @@ pub const AppState = struct {
     pub const queueDraftDuringSend = chat_controller.queueDraftDuringSend;
     pub const storeDraftDuringSend = chat_controller.storeDraftDuringSend;
     pub const pendingFollowupSnapshot = chat_controller.pendingFollowupSnapshot;
+    pub const pendingFollowupSnapshotCached = chat_controller.pendingFollowupSnapshotCached;
     pub const pendingFollowupHint = chat_controller.pendingFollowupHint;
     pub const sendPromptViaHarness = chat_controller.sendPromptViaHarness;
     pub const interruptThreadViaHarness = chat_controller.interruptThreadViaHarness;
     pub const steerThreadViaHarness = chat_controller.steerThreadViaHarness;
+    pub const steerDaemonChatTurn = chat_controller.steerDaemonChatTurn;
     pub const beginSendForThread = chat_controller.beginSendForThread;
     pub const beginSendForThreadWithReadyDaemon = chat_controller.beginSendForThreadWithReadyDaemon;
+    pub const dispatchDaemonAcceptance = chat_controller.dispatchDaemonAcceptance;
     pub const beginSendDraft = chat_controller.beginSendDraft;
     pub const ensureSessionDaemon = chat_controller.ensureSessionDaemon;
     pub const startDaemonChatTurn = chat_controller.startDaemonChatTurn;
@@ -4524,6 +5104,16 @@ pub const AppState = struct {
     pub const acknowledgeFocusedChatCompletion = transcript_controller.acknowledgeFocusedChatCompletion;
     pub const acknowledgeFocusedPaneCompletion = transcript_controller.acknowledgeFocusedPaneCompletion;
     pub const clearChatCompletion = transcript_controller.clearChatCompletion;
+    pub const beginTranscriptSelectionTransition = transcript_controller.beginTranscriptSelectionTransition;
+    pub const noteTranscriptPresented = transcript_controller.noteTranscriptPresented;
+    pub const currentTranscriptPresentation = transcript_controller.currentTranscriptPresentation;
+    pub const presentedTranscriptPresentation = transcript_controller.presentedTranscriptPresentation;
+    pub const transcriptTransitionTargets = transcript_controller.transcriptTransitionTargets;
+    pub const outgoingTranscriptPresentation = transcript_controller.outgoingTranscriptPresentation;
+    pub const clearOutgoingTranscriptPresentation = transcript_controller.clearOutgoingTranscriptPresentation;
+    pub const cancelTranscriptTransition = transcript_controller.cancelTranscriptTransition;
+    pub const clearPresentedTranscriptPresentation = transcript_controller.clearPresentedTranscriptPresentation;
+    pub const transcriptTransitionNeedsContinuousFrames = transcript_controller.transcriptTransitionNeedsContinuousFrames;
     pub const requestComposerFocus = composer_controller.requestComposerFocus;
     pub const restoreComposerFocus = composer_controller.restoreComposerFocus;
     pub const consumePendingHerdrOpenRequest = herdr_controller.consumePendingHerdrOpenRequest;
@@ -4690,6 +5280,7 @@ pub const AppState = struct {
     fn focusWorkspaceOpenPaneWithZoom(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, preserve_zoom: bool, leading_reveal: bool) void {
         if (project_index >= self.project_controller.projects.items.len) return;
         const previous_project_index = self.project_controller.selected_index;
+        const hydration_generation_before_focus = self.transcriptHydrationGeneration();
         if (preserve_zoom and previous_project_index < self.project_controller.projects.items.len and previous_project_index != project_index) {
             const previous_layout = &self.project_controller.projects.items[previous_project_index].workspace_layout;
             if (previous_layout.quick_pane) |*quick| quick.visible = false;
@@ -4703,6 +5294,9 @@ pub const AppState = struct {
                 layout.focused_pane_id = pane_id;
                 self.restorePersistedBrowserPaneAfterProjectSelection(project_index);
                 _ = self.focusWorkspacePane(project_index, pane_id);
+                if (previous_project_index != project_index and self.transcriptHydrationGeneration() == hydration_generation_before_focus) {
+                    self.noteTranscriptSelectionChanged();
+                }
                 self.prepareTranscriptPaneFocus(project_index, pane_id);
                 self.markDirty();
                 return;
@@ -4738,6 +5332,9 @@ pub const AppState = struct {
             },
         }
         _ = self.focusWorkspacePane(project_index, pane_id);
+        if (previous_project_index != project_index and self.transcriptHydrationGeneration() == hydration_generation_before_focus) {
+            self.noteTranscriptSelectionChanged();
+        }
         self.prepareTranscriptPaneFocus(project_index, pane_id);
         if (preserve_viewport) {
             layout.scroll_leading_pane_id = null;
@@ -5198,6 +5795,9 @@ pub const AppState = struct {
             hydrated.setDraft(existing.currentDraft());
             if (existing.draft_image) |image| {
                 try hydrated.setDraftImage(self.allocator, image.path, image.mime, image.byte_size);
+                for (existing.draft_extra_images.items) |extra| {
+                    try hydrated.addDraftImage(self.allocator, extra.path, extra.mime, extra.byte_size);
+                }
             }
         } else {
             hydrated.provider = .codex;
@@ -5864,11 +6464,29 @@ pub const AppState = struct {
         return self.currentProject().currentThread();
     }
 
-    /// Materialize one older durable transcript page for the focused thread.
-    /// Returns true when rows were prepended.
+    fn transcriptPageSuffixOverlap(page: []const PersistedMessage, materialized: []const ChatMessage) usize {
+        var overlap = @min(page.len, materialized.len);
+        while (overlap > 0) : (overlap -= 1) {
+            const page_start = page.len - overlap;
+            var index: usize = 0;
+            while (index < overlap) : (index += 1) {
+                const page_id = page[page_start + index].message_id orelse break;
+                const materialized_id = materialized[index].message_id orelse break;
+                if (!std.mem.eql(u8, page_id, materialized_id)) break;
+            }
+            if (index == overlap) return overlap;
+        }
+        return 0;
+    }
+
+    /// Synchronously materialize one older durable transcript page for the
+    /// focused thread. Returns true when rows were prepended. Render paths use
+    /// requestOlderCurrentThreadMessages/pollTranscriptHydration instead so the
+    /// DB read never blocks a frame; this remains the spawn-failure fallback.
     pub fn loadOlderCurrentThreadMessages(self: *AppState) !bool {
         const project = self.currentProjectMutable();
-        const thread = project.currentThreadMutable();
+        const thread_index = project.currentThreadIndex();
+        const thread = &project.threads.items[thread_index];
         const before_offset = thread.persisted_message_offset;
         if (before_offset == 0) return false;
 
@@ -5877,8 +6495,34 @@ pub const AppState = struct {
             project.id,
             thread.local_thread_id,
             before_offset,
+            transcriptHydrationPageLimit(thread.messages.items.len),
         );
         defer page.deinit();
+        return self.commitOlderTranscriptPage(project, thread_index, &page);
+    }
+
+    /// Viewport-sized first page for a cold thread, bulk pages afterwards.
+    fn transcriptHydrationPageLimit(materialized_count: usize) usize {
+        return if (materialized_count == 0)
+            db_client.TRANSCRIPT_FIRST_PAGE_SIZE
+        else
+            db_client.TRANSCRIPT_MESSAGE_PAGE_SIZE;
+    }
+
+    /// Prepend an already-loaded older durable page to the identified thread,
+    /// shifting the render caches and layout bookkeeping so scroll anchors
+    /// stay on their rows. The target is passed explicitly — it may be an
+    /// unfocused pane's thread, not the current selection. Runs on the render
+    /// thread only.
+    fn commitOlderTranscriptPage(
+        self: *AppState,
+        project: *Project,
+        thread_index: usize,
+        page: *const db_types.LoadedMessagePage,
+    ) !bool {
+        const thread = &project.threads.items[thread_index];
+        const before_offset = thread.persisted_message_offset;
+        if (before_offset == 0) return false;
         if (page.messages.len == 0 or page.offset >= before_offset) return false;
 
         var prepended: std.ArrayList(ChatMessage) = .empty;
@@ -5889,11 +6533,20 @@ pub const AppState = struct {
                 self.allocator.free(message.author);
                 self.allocator.free(message.body);
                 if (message.image) |owned| owned.deinit(self.allocator);
+                for (message.extra_images) |*owned| owned.deinit(self.allocator);
+                if (message.extra_images.len > 0) self.allocator.free(message.extra_images);
                 if (message.tool_call_id) |owned| self.allocator.free(owned);
                 if (message.message_id) |owned| self.allocator.free(owned);
             }
         };
-        for (page.messages) |message| {
+        // A turn tail can hydrate its durable user row while the compact
+        // projection still counts that row in persisted_message_offset. The
+        // next history page then ends with the same identity. Trim that
+        // overlap before prepending so the prompt is not shown twice until
+        // the first assistant update replaces the projection.
+        const overlap = transcriptPageSuffixOverlap(page.messages, thread.messages.items);
+        const new_messages = page.messages[0 .. page.messages.len - overlap];
+        for (new_messages) |message| {
             const author = try self.dupeZ(message.author);
             errdefer self.allocator.free(author);
             const body = try self.dupeZ(message.body);
@@ -5903,6 +6556,11 @@ pub const AppState = struct {
             else
                 null;
             errdefer if (image) |owned| owned.deinit(self.allocator);
+            const extra_images = try persistence.chatImageListFromPersisted(self.allocator, message.extra_images);
+            errdefer {
+                for (extra_images) |*owned| owned.deinit(self.allocator);
+                if (extra_images.len > 0) self.allocator.free(extra_images);
+            }
             const tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id);
             errdefer if (tool_call_id) |owned| self.allocator.free(owned);
             const message_id = if (message.message_id) |id|
@@ -5915,6 +6573,7 @@ pub const AppState = struct {
                 .author = author,
                 .body = body,
                 .image = image,
+                .extra_images = extra_images,
                 .tool_call_id = tool_call_id,
                 .tool_call_kind = message.tool_call_kind,
                 .tool_call_status = message.tool_call_status,
@@ -5929,14 +6588,34 @@ pub const AppState = struct {
             if (thread.transcript_markdown_entries.addManyAt(self.allocator, 0, prepended_count)) |slots| {
                 @memset(slots, null);
             } else |_| {
-                thread.clearTranscriptMarkdownEntries(self.allocator);
+                // OOM degradation: the user is scrolled near the top during an
+                // older-page load, so dropping the whole cache re-renders every
+                // visible row. Instead shift entries in place toward the tail
+                // (freeing the tail overflow) so surviving slots stay aligned
+                // with their shifted messages; the empty head hydrates lazily.
+                // transcriptBodyEntryForSlot validates owned_body per slot, so
+                // any residual misalignment self-heals.
+                const entries = thread.transcript_markdown_entries.items;
+                const keep = entries.len -| prepended_count;
+                const shift = entries.len - keep;
+                for (entries[keep..]) |entry| {
+                    if (entry) |owned| owned.deinit(self.allocator);
+                }
+                std.mem.copyBackwards(?*TranscriptMarkdownBody, entries[shift..], entries[0..keep]);
+                @memset(entries[0..shift], null);
             }
         }
         if (thread.transcript_height_entries.items.len > 0) {
             if (thread.transcript_height_entries.addManyAt(self.allocator, 0, prepended_count)) |slots| {
                 @memset(slots, .{});
             } else |_| {
-                thread.clearTranscriptHeightEntries();
+                // Same in-place shift as the markdown entries above; height
+                // entries carry no owned memory so the tail simply drops.
+                const entries = thread.transcript_height_entries.items;
+                const keep = entries.len -| prepended_count;
+                const shift = entries.len - keep;
+                std.mem.copyBackwards(TranscriptHeightEntry, entries[shift..], entries[0..keep]);
+                @memset(entries[0..shift], .{});
             }
         }
         for (thread.transcript_layout_items.items) |*item| {
@@ -5944,9 +6623,164 @@ pub const AppState = struct {
             item.group_end += prepended_count;
         }
         thread.transcript_layout_first_message_index += prepended_count;
+        // Prepending unmaterialized rows inflates the estimated transcript
+        // height by average×prepended before any of them lay out, and saved
+        // scroll offsets are top-relative in that estimate space. Shift them
+        // by the same amount so the viewport keeps the rows it was showing;
+        // otherwise every committed history page makes the view leap into the
+        // freshly prepended blank region (the "scroll jumps while paging
+        // history" bug). Same invariant as ensureTranscriptLayout's extend
+        // rebase: estimate changes outside the layout pass must rebase.
+        if (thread.transcript_layout_message_count > 0) {
+            const average_row_height = thread.transcript_layout_committed_height /
+                @as(f32, @floatFromInt(thread.transcript_layout_message_count));
+            const delta = average_row_height * @as(f32, @floatFromInt(prepended_count));
+            // Same rebase as shiftCurrentTranscriptScroll, applied to the
+            // page's target thread: the commit may land while a different
+            // thread is selected (unfocused pane hydration), so the current
+            // selection's scroll must not move.
+            if (thread.transcript_scroll_valid) {
+                thread.transcript_scroll_y = @max(thread.transcript_scroll_y + delta, 0.0);
+            }
+            project.workspace_layout.shiftChatTranscriptScrollForThread(thread_index, delta);
+        }
         thread.transcript_layout_valid = false;
         thread.rebuildBackgroundTasksFromMessages(self.allocator);
-        return true;
+        return prepended_count > 0;
+    }
+
+    /// Render-path entry: request one older durable page for the focused
+    /// thread. Returns immediately; the page loads on a worker thread (each
+    /// Storage.loadMessagePage opens its own read-only connection, so the
+    /// worker shares no DB state with the render thread) and commits in
+    /// pollTranscriptHydration. At most one request is in flight.
+    pub fn requestOlderCurrentThreadMessages(self: *AppState) void {
+        if (self.transcript_hydration.in_flight) return;
+        const project = self.currentProjectMutable();
+        const thread = project.currentThreadMutable();
+        const before_offset = thread.persisted_message_offset;
+        if (before_offset == 0) return;
+
+        const args = self.allocator.create(TranscriptHydrationArgs) catch return;
+        const workspace_id = self.allocator.dupe(u8, project.id) catch {
+            self.allocator.destroy(args);
+            return;
+        };
+        const local_thread_id = self.allocator.dupe(u8, thread.local_thread_id) catch {
+            self.allocator.free(workspace_id);
+            self.allocator.destroy(args);
+            return;
+        };
+        args.* = .{
+            .allocator = self.allocator,
+            .storage = self.storage,
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+            .before_offset = before_offset,
+            .limit = transcriptHydrationPageLimit(thread.messages.items.len),
+            .generation = self.transcript_hydration.generation,
+        };
+        const worker = std.Thread.spawn(.{}, transcriptHydrationWorkerMain, .{args}) catch {
+            // Degradation: with no worker thread available, hydrate on the
+            // render thread so history still appears instead of never loading.
+            args.deinitAndDestroy();
+            _ = self.loadOlderCurrentThreadMessages() catch |err| {
+                log.warn("failed to page older transcript rows synchronously: {s}", .{@errorName(err)});
+            };
+            return;
+        };
+        self.transcript_hydration.worker = worker;
+        self.transcript_hydration.args = args;
+        self.transcript_hydration.in_flight = true;
+    }
+
+    /// Frame-loop entry: commit a completed hydration page into the thread it
+    /// was requested for, resolved by workspace/thread identity — never by the
+    /// current selection. The render path requests pages for unfocused panes
+    /// while their thread is only temporarily swapped in, so by poll time the
+    /// selection may differ; committing by identity is what keeps those panes
+    /// from looping request→drop→re-request and rendering blank. A page for a
+    /// superseded target (generation bump on a real selection change, identity
+    /// no longer present, or offset mismatch against a prior commit) is
+    /// dropped so it commits nowhere. Returns true when rows were prepended
+    /// and a render is needed.
+    pub fn pollTranscriptHydration(self: *AppState) bool {
+        if (!self.transcript_hydration.in_flight) return false;
+        const args = self.transcript_hydration.args orelse return false;
+        if (!args.done.load(.acquire)) return false;
+        if (self.transcript_hydration.worker) |worker| worker.join();
+        self.transcript_hydration.worker = null;
+        self.transcript_hydration.args = null;
+        self.transcript_hydration.in_flight = false;
+        defer args.deinitAndDestroy();
+        if (args.failed) return false;
+        const page = if (args.page) |*loaded| loaded else return false;
+        if (args.generation != self.transcript_hydration.generation) return false;
+        const project = for (self.project_controller.projects.items) |*candidate| {
+            if (std.mem.eql(u8, candidate.id, args.workspace_id)) break candidate;
+        } else return false;
+        const thread_index = for (project.threads.items, 0..) |*candidate, index| {
+            if (std.mem.eql(u8, candidate.local_thread_id, args.local_thread_id)) break index;
+        } else return false;
+        if (project.threads.items[thread_index].persisted_message_offset != args.before_offset) return false;
+        return self.commitOlderTranscriptPage(project, thread_index, page) catch |err| {
+            log.warn("failed to commit older transcript page: {s}", .{@errorName(err)});
+            return false;
+        };
+    }
+
+    /// Invalidate any in-flight or future hydration commit for the previous
+    /// selection. Call on every focused project/thread change.
+    pub fn noteTranscriptSelectionChanged(self: *AppState) void {
+        self.transcript_hydration.generation +%= 1;
+        const target = self.currentTranscriptPresentation();
+        if (target) |identity| {
+            // A projection refresh can bump hydration while the same target is
+            // still entering. Adopt the new guard generation without replaying
+            // the fade from its beginning.
+            if (self.transcriptTransitionTargets(identity)) {
+                self.transcript_controller.transition.generation = self.transcript_hydration.generation;
+                return;
+            }
+            if (transcript_controller.shouldStartTranscriptTransition(
+                self.presentedTranscriptPresentation(),
+                identity,
+            )) {
+                self.beginTranscriptSelectionTransition(
+                    self.transcript_hydration.generation,
+                    platform_runtime.unixTimestampMs(),
+                    identity,
+                );
+                return;
+            }
+        }
+
+        // Pane/project focus and stable-thread projection changes present the
+        // resident transcript directly. Clearing the prior presentation also
+        // prevents a second selection before the next frame from fading content
+        // that this pane never displayed.
+        const target_matches_presented = if (target) |identity|
+            if (self.presentedTranscriptPresentation()) |presented|
+                transcript_controller.sameTranscriptPresentation(presented, identity)
+            else
+                false
+        else
+            false;
+        self.cancelTranscriptTransition();
+        if (!target_matches_presented) self.clearPresentedTranscriptPresentation();
+    }
+
+    pub fn transcriptHydrationGeneration(self: *const AppState) u64 {
+        return self.transcript_hydration.generation;
+    }
+
+    /// Shutdown: join an in-flight hydration worker and drop its result.
+    fn finishTranscriptHydrationWorker(self: *AppState) void {
+        if (self.transcript_hydration.worker) |worker| worker.join();
+        self.transcript_hydration.worker = null;
+        if (self.transcript_hydration.args) |args| args.deinitAndDestroy();
+        self.transcript_hydration.args = null;
+        self.transcript_hydration.in_flight = false;
     }
 
     pub fn isSidebarCollapsed(self: *const AppState) bool {
@@ -8923,7 +9757,7 @@ pub const AppState = struct {
     /// Pulls the queued/steered follow-up back into the composer so a long-waiting
     /// queued message can be revised. Removes the pin (it is no longer queued); the
     /// user re-queues with Tab or sends normally. Refuses to clobber an in-progress
-    /// draft, and ignores Codex steering already accepted inline (`.sent_inline`).
+    /// draft, and ignores provider steering already accepted inline (`.sent_inline`).
     pub fn editPendingFollowup(self: *AppState) void {
         if (self.project_controller.projects.items.len == 0) return;
         const thread = self.currentThreadMutable();
@@ -8961,7 +9795,7 @@ pub const AppState = struct {
         self.composer_controller.composer.focused = true;
         self.composer_controller.focused = true;
         self.markDirty();
-        self.setSidebarNotice(if (thread.provider == .codex)
+        self.setSidebarNotice(if (thread.provider == .codex or thread.provider == .claude)
             "Editing follow-up. Press Enter to queue it, or Tab to steer."
         else
             "Editing queued message. Press Tab to queue it again.");
@@ -9273,6 +10107,8 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit provider readiness finished", .{});
         self.deinitBackgroundTaskPoller();
         runtime_log.diagnostic("AppState.deinit background task poller finished", .{});
+        self.finishTranscriptHydrationWorker();
+        runtime_log.diagnostic("AppState.deinit transcript hydration finished", .{});
         self.settings_controller.update.deinit();
         runtime_log.diagnostic("AppState.deinit updater finished", .{});
         self.finishAllSendThreads();
@@ -9313,6 +10149,7 @@ pub const AppState = struct {
         self.card_toggle_hits.deinit(self.allocator);
         self.background_task_action_hits.deinit(self.allocator);
         self.expanded_cards.deinit();
+        self.pending_ui_snapshot_cache.deinit(self.allocator);
         self.terminal_controller.deinit(self.allocator);
         self.closeTranscriptSelectionModal();
         self.clearProjects();
@@ -9556,6 +10393,26 @@ pub const AppState = struct {
         else
             try compositeSnapshotToPersisted(conversion_arena.allocator(), result.snapshot);
         if (adoption_repair) try self.validateAdoptionRepairsForRefresh(persisted);
+        // Keep the user's pane focus/viewport: patch the snapshot before the
+        // baseline clone so the applied layout and baseline stay identical.
+        try preserveLiveWorkspacePresentationInPersisted(
+            self.allocator,
+            conversion_arena.allocator(),
+            &self.project_controller,
+            &persisted,
+        );
+        // Attachment recency merge reads the last applied baseline only when
+        // it is revision-paired; a stale baseline conservatively keeps live.
+        const attachment_baseline: ?*const PersistedState = if (self.lifecycle.projection_baseline) |*last_applied| blk: {
+            if (self.lifecycle.projection_baseline_revision == observed_revision) break :blk &last_applied.value;
+            break :blk null;
+        } else null;
+        try overlayLiveDraftAttachmentsInPersisted(
+            conversion_arena.allocator(),
+            &self.project_controller,
+            attachment_baseline,
+            &persisted,
+        );
         var next_baseline = try self.clonePersistedBaseline(self.allocator, persisted);
         var baseline_owned = true;
         errdefer if (baseline_owned) next_baseline.deinit();
@@ -9601,6 +10458,11 @@ pub const AppState = struct {
         try staged.applyDaemonRegistryProjection(result.processes, result.leases);
         try staged.applyDaemonSessionProjection(result.sessions);
         try staged.applyDaemonChatTurnsSnapshot(result.turns);
+        // Projection snapshots normally carry only a compact tail page. Merge
+        // that authoritative range into the GUI's wider hydrated range before
+        // the infallible runtime handoff, so saved scroll anchors keep the same
+        // absolute message coordinate space even when new tail rows arrive.
+        try prepareProjectionTranscriptRuntime(self.allocator, &self.project_controller, &staged.project_controller);
         var staged_sessions = try terminal_controller.buildDaemonSessionProjection(self.allocator, result.sessions);
         var sessions_owned = true;
         errdefer if (sessions_owned) terminal_controller.deinitDaemonSessionProjection(self.allocator, &staged_sessions);
@@ -9844,7 +10706,7 @@ pub const AppState = struct {
     pub const isChatThreadFocused = chat_controller.isChatThreadFocused;
     pub const capturePendingProviderThreadId = chat_controller.capturePendingProviderThreadId;
     pub const issuePendingThreadStop = chat_controller.issuePendingThreadStop;
-    pub const issuePendingCodexSteer = chat_controller.issuePendingCodexSteer;
+    pub const issuePendingProviderSteer = chat_controller.issuePendingProviderSteer;
     pub const dispatchPendingFollowup = chat_controller.dispatchPendingFollowup;
     pub const clearPendingFollowupAfterFailure = chat_controller.clearPendingFollowupAfterFailure;
     pub const finishPickerThread = chat_controller.finishPickerThread;
@@ -9861,6 +10723,7 @@ pub const AppState = struct {
     pub const pendingSendCount = chat_controller.pendingSendCount;
     pub const isPickerPending = chat_controller.isPickerPending;
     pub const pendingApprovalSnapshot = chat_controller.pendingApprovalSnapshot;
+    pub const pendingApprovalSnapshotCached = chat_controller.pendingApprovalSnapshotCached;
     pub const resolvePendingApproval = chat_controller.resolvePendingApproval;
     pub const applySendSuccess = chat_controller.applySendSuccess;
     pub const applyPendingTimelineEvents = chat_controller.applyPendingTimelineEvents;
@@ -9975,12 +10838,19 @@ pub const AppState = struct {
         };
     }
 
+    /// True while the ~1.2s post-click "Copied" feedback window is showing.
+    /// Fenced-code messages bypass the transcript replay cache during this
+    /// window so the check glyph renders live.
+    pub fn codeCopyRecentFeedbackActive(self: *const AppState) bool {
+        const now_ms: i64 = @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
+        return self.code_copy_recent_until_ms != 0 and now_ms < self.code_copy_recent_until_ms;
+    }
+
     /// Returns a recorder the markdown renderer can use to register per-frame
     /// code-block copy buttons. The "recent" feedback window (~1.2s) shows a
     /// transient "Copied" label after a click.
     pub fn codeCopyButtonRecorder(self: *AppState) chat_markdown.CodeCopyButtonRecorder {
-        const now_ms: i64 = @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
-        const active = self.code_copy_recent_until_ms != 0 and now_ms < self.code_copy_recent_until_ms;
+        const active = self.codeCopyRecentFeedbackActive();
         return .{
             .context = @ptrCast(self),
             .push_fn = pushCodeCopyButtonTrampoline,
@@ -10025,9 +10895,19 @@ pub const AppState = struct {
             break :blk thread.send_state.pending_events.items[pending_index].body;
         };
         if (!std.mem.eql(u8, rendered_body, body)) return;
-        const task = chat_controller.backgroundTaskForEventBody(thread, body) orelse return;
-        const task_index = (@intFromPtr(task) - @intFromPtr(thread.background_tasks.items.ptr)) / @sizeOf(BackgroundTask);
-        self.recordBackgroundTaskActionHit(.{ .rect = rect, .project_index = project_index, .thread_index = thread_index, .task_index = task_index, .message_index = message_index, .action = action });
+        const task_index = if (chat_controller.backgroundTaskForEventBody(thread, body)) |task|
+            (@intFromPtr(task) - @intFromPtr(thread.background_tasks.items.ptr)) / @sizeOf(BackgroundTask)
+        else
+            null;
+        self.recordBackgroundTaskActionHit(.{
+            .rect = rect,
+            .project_index = project_index,
+            .thread_index = thread_index,
+            .task_index = task_index,
+            .message_index = message_index,
+            .body_hash = std.hash.Wyhash.hash(0, body),
+            .action = action,
+        });
     }
 
     pub fn consumeBackgroundTaskActionClick(self: *AppState, x: f32, y: f32) bool {
@@ -10037,31 +10917,56 @@ pub const AppState = struct {
             var project = &self.project_controller.projects.items[hit.project_index];
             if (hit.thread_index >= project.threads.items.len) return true;
             const thread = &project.threads.items[hit.thread_index];
-            if (hit.task_index >= thread.background_tasks.items.len) return true;
-            const task = &thread.background_tasks.items[hit.task_index];
-            if (!backgroundTaskActionHitStillTargets(thread, hit.message_index, task)) {
+            const target = resolveBackgroundTaskActionHit(thread, hit) orelse {
                 self.setSidebarNotice("Background task is no longer available.");
                 return true;
+            };
+            if (target.task) |task| {
+                switch (hit.action) {
+                    .stop => _ = self.stopBackgroundTask(hit.project_index, thread, task),
+                    .output => self.openBackgroundTaskOutput(hit.project_index, task, hit.message_index),
+                }
+                return true;
             }
+
+            // Provider-owned background commands can reach the transcript
+            // before their durable task metadata. Keep their visible controls
+            // actionable instead of letting the overlapping card toggle win.
             switch (hit.action) {
-                .stop => _ = self.stopBackgroundTask(hit.project_index, thread, task),
-                .output => self.openBackgroundTaskOutput(hit.project_index, task, hit.message_index),
+                .stop => _ = self.abortThreadByLocalId(project.id, thread.local_thread_id),
+                .output => {
+                    self.setCardExpanded(commandCardKey(hit.message_index), true);
+                    self.setSidebarNotice("Background command details are shown in the expanded card.");
+                    self.markDirty();
+                },
             }
             return true;
         }
         return false;
     }
 
-    fn backgroundTaskActionHitStillTargets(thread: *ChatThread, message_index: usize, task: *BackgroundTask) bool {
-        if (message_index < thread.messages.items.len) {
-            return chat_controller.backgroundTaskForEventBody(thread, thread.messages.items[message_index].body) == task;
+    const ResolvedBackgroundTaskAction = struct { task: ?*BackgroundTask };
+
+    fn resolveBackgroundTaskActionBody(thread: *ChatThread, hit: BackgroundTaskActionHit, body: []const u8) ?ResolvedBackgroundTaskAction {
+        if (std.hash.Wyhash.hash(0, body) != hit.body_hash) return null;
+        const current_task = chat_controller.backgroundTaskForEventBody(thread, body);
+        const task_index = hit.task_index orelse return .{ .task = current_task };
+        if (task_index >= thread.background_tasks.items.len) return null;
+        const task = &thread.background_tasks.items[task_index];
+        if (current_task != task) return null;
+        return .{ .task = task };
+    }
+
+    fn resolveBackgroundTaskActionHit(thread: *ChatThread, hit: BackgroundTaskActionHit) ?ResolvedBackgroundTaskAction {
+        if (hit.message_index < thread.messages.items.len) {
+            return resolveBackgroundTaskActionBody(thread, hit, thread.messages.items[hit.message_index].body);
         }
 
         thread.send_state.mutex.lock();
         defer thread.send_state.mutex.unlock();
-        const pending_index = message_index - thread.messages.items.len;
-        if (pending_index >= thread.send_state.pending_events.items.len) return false;
-        return chat_controller.backgroundTaskForEventBody(thread, thread.send_state.pending_events.items[pending_index].body) == task;
+        const pending_index = hit.message_index - thread.messages.items.len;
+        if (pending_index >= thread.send_state.pending_events.items.len) return null;
+        return resolveBackgroundTaskActionBody(thread, hit, thread.send_state.pending_events.items[pending_index].body);
     }
 
     fn stopBackgroundTask(self: *AppState, project_index: usize, thread: *ChatThread, task: *BackgroundTask) bool {
@@ -10224,7 +11129,7 @@ pub const AppState = struct {
     fn openBackgroundTaskOutput(self: *AppState, project_index: usize, task: *BackgroundTask, message_index: usize) void {
         const log_path = task.log_path orelse {
             const key = commandCardKey(message_index);
-            self.expanded_cards.put(key, true) catch {};
+            self.setCardExpanded(key, true);
             self.setSidebarNotice("Codex process details are shown in the expanded card; retained live output is not exposed by this API.");
             self.markDirty();
             return;
@@ -10267,6 +11172,16 @@ pub const AppState = struct {
         return self.isCardExpandedDefault(key, false);
     }
 
+    /// Single write path for card expansion so the per-frame layout variant
+    /// hash can key on `expanded_cards_revision` instead of iterating the map.
+    pub fn setCardExpanded(self: *AppState, key: u64, expanded: bool) void {
+        self.expanded_cards.put(key, expanded) catch |err| {
+            log.warn("failed to store expanded card: {s}", .{@errorName(err)});
+            return;
+        };
+        self.expanded_cards_revision +%= 1;
+    }
+
     pub fn isCardExpandedDefault(self: *AppState, key: u64, default_expanded: bool) bool {
         return self.expanded_cards.get(key) orelse default_expanded;
     }
@@ -10288,9 +11203,7 @@ pub const AppState = struct {
             if (x < hit.rect.x or x > hit.rect.x + hit.rect.w) continue;
             if (y < hit.rect.y or y > hit.rect.y + hit.rect.h) continue;
             const expanded = !self.isCardExpandedDefault(hit.key, hit.default_expanded);
-            self.expanded_cards.put(hit.key, expanded) catch |err| {
-                log.warn("failed to store expanded card: {s}", .{@errorName(err)});
-            };
+            self.setCardExpanded(hit.key, expanded);
             if (hit.kind == .tool_call_group and self.app_config.tool_call_group_preference == .remember_last) {
                 self.app_config.tool_call_groups_last_expanded = expanded;
                 app_config.saveAppConfig(self.allocator, &self.app_config) catch |err| {
@@ -10345,6 +11258,224 @@ pub const AppState = struct {
         return false;
     }
 };
+
+test "lazy transcript hydration trims a durable page overlap by message identity" {
+    const page = [_]PersistedMessage{
+        .{ .role = .assistant, .author = "Claude", .body = "older reply", .message_id = "turn:old:msg:1" },
+        .{ .role = .user, .author = "You", .body = "submitted prompt", .message_id = "gui-msg:current" },
+    };
+    const materialized = [_]ChatMessage{
+        .{ .role = .user, .author = "You", .body = "submitted prompt", .message_id = "gui-msg:current" },
+    };
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        AppState.transcriptPageSuffixOverlap(&page, &materialized),
+    );
+
+    const different_identity = [_]ChatMessage{
+        .{ .role = .user, .author = "You", .body = "submitted prompt", .message_id = "gui-msg:different" },
+    };
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        AppState.transcriptPageSuffixOverlap(&page, &different_identity),
+    );
+}
+
+test "transcript hydration first page is viewport sized, later pages bulk" {
+    try std.testing.expectEqual(db_client.TRANSCRIPT_FIRST_PAGE_SIZE, AppState.transcriptHydrationPageLimit(0));
+    try std.testing.expectEqual(db_client.TRANSCRIPT_MESSAGE_PAGE_SIZE, AppState.transcriptHydrationPageLimit(1));
+}
+
+/// Shared harness for the async-hydration commit tests: a minimal AppState
+/// with one project/thread and a hand-built completed hydration request, so
+/// pollTranscriptHydration's guard and commit run without worker threads.
+fn testTranscriptHydrationState(allocator: std.mem.Allocator) !AppState {
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 0;
+    state.transcript_controller = .{};
+    state.transcript_hydration = .{};
+    var project = try Project.init(allocator, "hydrate-ws", "Hydrate", "/tmp/hydrate", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    return state;
+}
+
+fn testTranscriptHydrationCleanup(state: *AppState) void {
+    const allocator = state.allocator;
+    for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+    state.project_controller.projects.deinit(allocator);
+}
+
+fn testCompletedHydrationArgs(state: *AppState, before_offset: usize) !*TranscriptHydrationArgs {
+    const allocator = state.allocator;
+    const thread = state.currentProjectMutable().currentThreadMutable();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const page_messages = try arena.allocator().alloc(db_types.PersistedMessage, 2);
+    page_messages[0] = .{ .role = .user, .author = "You", .body = "old prompt" };
+    page_messages[1] = .{ .role = .assistant, .author = "Claude", .body = "old reply" };
+    const args = try allocator.create(TranscriptHydrationArgs);
+    errdefer allocator.destroy(args);
+    const workspace_id = try allocator.dupe(u8, state.currentProject().id);
+    errdefer allocator.free(workspace_id);
+    args.* = .{
+        .allocator = allocator,
+        .storage = undefined, // never dereferenced once `done` is set
+        .workspace_id = workspace_id,
+        .local_thread_id = try allocator.dupe(u8, thread.local_thread_id),
+        .before_offset = before_offset,
+        .limit = db_client.TRANSCRIPT_FIRST_PAGE_SIZE,
+        .generation = state.transcript_hydration.generation,
+        .page = .{ .arena = arena, .offset = 0, .messages = page_messages },
+    };
+    args.done.store(true, .release);
+    state.transcript_hydration.args = args;
+    state.transcript_hydration.in_flight = true;
+    return args;
+}
+
+test "async transcript hydration drops a page loaded for a superseded selection" {
+    const allocator = std.testing.allocator;
+    var state = try testTranscriptHydrationState(allocator);
+    defer testTranscriptHydrationCleanup(&state);
+    const thread = state.currentProjectMutable().currentThreadMutable();
+    thread.persisted_message_offset = 2;
+    _ = try testCompletedHydrationArgs(&state, 2);
+
+    // The selection changed while the load was in flight: the slow page must
+    // be dropped, never committed into the newly focused transcript.
+    state.noteTranscriptSelectionChanged();
+    try std.testing.expect(!state.pollTranscriptHydration());
+    try std.testing.expectEqual(@as(usize, 0), thread.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 2), thread.persisted_message_offset);
+    // The request is consumed and its resources freed; a new request may start.
+    try std.testing.expect(state.transcript_hydration.args == null);
+    try std.testing.expect(!state.transcript_hydration.in_flight);
+}
+
+test "async transcript hydration commits a matching page and rebases layout indices" {
+    const allocator = std.testing.allocator;
+    var state = try testTranscriptHydrationState(allocator);
+    defer testTranscriptHydrationCleanup(&state);
+    const thread = state.currentProjectMutable().currentThreadMutable();
+    thread.persisted_message_offset = 2;
+    // One materialized tail row with layout bookkeeping, to observe the
+    // prepend shifting indices — the input the scroll-anchor rebase keys on.
+    try thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "tail prompt"),
+    });
+    try thread.transcript_layout_items.append(allocator, .{
+        .message_index = 0,
+        .group_end = 1,
+        .top = -40.0,
+        .height = 40.0,
+    });
+    thread.transcript_layout_first_message_index = 0;
+    _ = try testCompletedHydrationArgs(&state, 2);
+
+    try std.testing.expect(state.pollTranscriptHydration());
+    try std.testing.expectEqual(@as(usize, 3), thread.messages.items.len);
+    try std.testing.expectEqualStrings("old prompt", thread.messages.items[0].body);
+    try std.testing.expectEqualStrings("tail prompt", thread.messages.items[2].body);
+    try std.testing.expectEqual(@as(usize, 0), thread.persisted_message_offset);
+    // Layout rows follow their messages so saved anchors stay on their rows
+    // (tail-pinned threads keep pointing at the tail rows).
+    try std.testing.expectEqual(@as(usize, 2), thread.transcript_layout_items.items[0].message_index);
+    try std.testing.expectEqual(@as(usize, 3), thread.transcript_layout_items.items[0].group_end);
+    try std.testing.expectEqual(@as(usize, 2), thread.transcript_layout_first_message_index);
+    try std.testing.expect(!thread.transcript_layout_valid);
+    try std.testing.expect(state.transcript_hydration.args == null);
+}
+
+test "async transcript hydration commits by identity into an unfocused thread exactly once" {
+    const allocator = std.testing.allocator;
+    var state = try testTranscriptHydrationState(allocator);
+    defer testTranscriptHydrationCleanup(&state);
+    const project = state.currentProjectMutable();
+    _ = try project.addThread(allocator);
+    const focused_pane_id = try project.workspace_layout.createChatPane(allocator, 1);
+    // Thread X (index 0) belongs to an unfocused pane with durable history;
+    // its request is minted while the render-path pane swap has X selected.
+    const thread_x = &project.threads.items[0];
+    const thread_y = &project.threads.items[1];
+    thread_x.persisted_message_offset = 2;
+    try thread_x.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "tail prompt"),
+    });
+    try thread_x.transcript_layout_items.append(allocator, .{
+        .message_index = 0,
+        .group_end = 1,
+        .top = -40.0,
+        .height = 40.0,
+    });
+    thread_x.transcript_layout_first_message_index = 0;
+    thread_x.transcript_layout_message_count = 1;
+    thread_x.transcript_layout_committed_height = 40.0;
+    thread_x.transcript_scroll_valid = true;
+    thread_x.transcript_scroll_y = 400.0;
+    const pane_x = project.workspace_layout.paneByIdMutable(1) orelse return error.MissingChatPane;
+    pane_x.ref.chat.transcript_scroll_valid = true;
+    pane_x.ref.chat.transcript_scroll_y = 400.0;
+    thread_y.transcript_scroll_valid = true;
+    thread_y.transcript_scroll_y = 900.0;
+    const pane_y = project.workspace_layout.paneByIdMutable(focused_pane_id) orelse return error.MissingChatPane;
+    pane_y.ref.chat.transcript_scroll_valid = true;
+    pane_y.ref.chat.transcript_scroll_y = 700.0;
+    project.selected_thread_index = 0;
+    _ = try testCompletedHydrationArgs(&state, 2);
+    // By poll time the swap has been restored: thread Y (index 1) is the
+    // focused selection. The page must still commit into X — dropping it
+    // here is the regression that looped spawn→load→drop and left the
+    // unfocused pane blank.
+    project.selected_thread_index = 1;
+    project.workspace_layout.focused_pane_id = focused_pane_id;
+    state.transcript_controller.palette_scroll_y = 333.0;
+
+    try std.testing.expect(state.pollTranscriptHydration());
+    try std.testing.expectEqual(@as(usize, 3), thread_x.messages.items.len);
+    try std.testing.expectEqualStrings("old prompt", thread_x.messages.items[0].body);
+    try std.testing.expectEqualStrings("tail prompt", thread_x.messages.items[2].body);
+    try std.testing.expectEqual(@as(usize, 0), thread_x.persisted_message_offset);
+    // X's numeric offsets rebase by the estimated height of its two prepended
+    // rows, keeping its visible row fixed in the expanded coordinate space.
+    try std.testing.expectEqual(@as(f32, 480.0), thread_x.transcript_scroll_y);
+    try std.testing.expectEqual(@as(f32, 480.0), project.workspace_layout.paneById(1).?.ref.chat.transcript_scroll_y);
+    // The focused thread is untouched — no cross-thread commit.
+    try std.testing.expectEqual(@as(usize, 0), thread_y.messages.items.len);
+    try std.testing.expectEqual(@as(f32, 900.0), thread_y.transcript_scroll_y);
+    try std.testing.expectEqual(@as(f32, 700.0), project.workspace_layout.paneById(focused_pane_id).?.ref.chat.transcript_scroll_y);
+    try std.testing.expectEqual(@as(f32, 333.0), state.transcript_controller.palette_scroll_y);
+    try std.testing.expectEqual(@as(usize, 1), project.selected_thread_index);
+    try std.testing.expect(state.transcript_hydration.args == null);
+    try std.testing.expect(!state.transcript_hydration.in_flight);
+    // No request loop: X is fully hydrated, so re-rendering its pane (swap
+    // active again) mints no further request.
+    project.selected_thread_index = 0;
+    state.requestOlderCurrentThreadMessages();
+    try std.testing.expect(!state.transcript_hydration.in_flight);
+}
+
+test "async transcript hydration ignores a stale before-offset after a prior commit" {
+    const allocator = std.testing.allocator;
+    var state = try testTranscriptHydrationState(allocator);
+    defer testTranscriptHydrationCleanup(&state);
+    const thread = state.currentProjectMutable().currentThreadMutable();
+    // The thread's paged-out offset moved (another commit landed): a request
+    // minted against the old offset would double-prepend, so it is dropped.
+    thread.persisted_message_offset = 4;
+    _ = try testCompletedHydrationArgs(&state, 2);
+    try std.testing.expect(!state.pollTranscriptHydration());
+    try std.testing.expectEqual(@as(usize, 0), thread.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 4), thread.persisted_message_offset);
+}
 
 fn importThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
     return switch (provider) {
@@ -10793,11 +11924,34 @@ test "background task action hits remain valid for pending transcript events" {
         .author = try page.dupe(u8, "Background command"),
         .body = try page.dupe(u8, body),
     });
+    const untracked_body = "provider-owned command";
+    try thread.send_state.pending_events.append(page, .{
+        .role = .system,
+        .author = try page.dupe(u8, "Background command"),
+        .body = try page.dupe(u8, untracked_body),
+    });
 
     const task = &thread.background_tasks.items[0];
-    try std.testing.expect(AppState.backgroundTaskActionHitStillTargets(&thread, 0, task));
-    try std.testing.expect(AppState.backgroundTaskActionHitStillTargets(&thread, 1, task));
-    try std.testing.expect(!AppState.backgroundTaskActionHitStillTargets(&thread, 2, task));
+    const tracked_hit: BackgroundTaskActionHit = .{
+        .rect = .{},
+        .project_index = 0,
+        .thread_index = 0,
+        .task_index = 0,
+        .message_index = 0,
+        .body_hash = std.hash.Wyhash.hash(0, body),
+        .action = .stop,
+    };
+    try std.testing.expect(AppState.resolveBackgroundTaskActionHit(&thread, tracked_hit).?.task == task);
+    var pending_hit = tracked_hit;
+    pending_hit.message_index = 1;
+    try std.testing.expect(AppState.resolveBackgroundTaskActionHit(&thread, pending_hit).?.task == task);
+
+    pending_hit.task_index = null;
+    pending_hit.message_index = 2;
+    pending_hit.body_hash = std.hash.Wyhash.hash(0, untracked_body);
+    try std.testing.expect(AppState.resolveBackgroundTaskActionHit(&thread, pending_hit).?.task == null);
+    pending_hit.message_index = 3;
+    try std.testing.expect(AppState.resolveBackgroundTaskActionHit(&thread, pending_hit) == null);
 }
 
 test "provider-aware chat creation scopes mutation and rejects invalid models" {
@@ -13791,6 +14945,183 @@ test "daemon refresh preserves explicit clears through clean and unrelated dirty
     try std.testing.expectEqual(@as(usize, 0), project.selected_thread_index);
     try std.testing.expectEqual(@as(u32, 9), project.unread_count);
     try std.testing.expect(state.lifecycle.dirty);
+}
+
+test "daemon refresh never moves pane focus or strip viewport from live state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer {
+        state.lifecycle.dirty = false;
+        state.deinit();
+    }
+
+    var stale_layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer stale_layout.deinit(allocator);
+    const second_pane_id = try stale_layout.createChatPane(allocator, 1);
+    try stale_layout.splitPaneWithLeaf(allocator, 1, second_pane_id, .vertical, true);
+    stale_layout.focused_pane_id = 1;
+    const stale_layout_json = try stale_layout.persistedWorkspaceJson(allocator);
+    defer allocator.free(stale_layout_json);
+    const threads = [_]headless.store.Thread{.{ .local_thread_id = "thread-one", .title = "One" }};
+    const workspaces = [_]headless.store.Workspace{.{
+        .workspace_id = "workspace-id",
+        .label = "Workspace",
+        .path = "/tmp/focus-steal/",
+        .workspace_layout_json = stale_layout_json,
+        .selected_thread_index = 0,
+        .threads = &threads,
+    }};
+    state.lifecycle.dirty = false;
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 1, .workspaces = &workspaces },
+        .store_revision = 1,
+        .envelope = .{ .instance_nonce = "focus-steal", .registry_revision = 1 },
+        .change_cursor = 1,
+    });
+
+    // Explicit user actions: focus pane 2 and scroll the strip. The edit sits
+    // in the send→turn-start window where it has not flushed to the store yet.
+    const live_layout = &state.project_controller.projects.items[0].workspace_layout;
+    live_layout.focused_pane_id = second_pane_id;
+    live_layout.scroll_offset_x = 480.0;
+    live_layout.scroll_target_x = 480.0;
+    live_layout.scroll_revealed_pane_id = second_pane_id;
+
+    // The turn-start refresh echoes the stale persisted layout (focused=1,
+    // scroll target 0). It must not move focus or the strip viewport.
+    state.lifecycle.dirty = false;
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 2, .workspaces = &workspaces },
+        .store_revision = 2,
+        .envelope = .{ .instance_nonce = "focus-steal", .registry_revision = 2 },
+        .change_cursor = 2,
+    });
+    const refreshed = &state.project_controller.projects.items[0].workspace_layout;
+    try std.testing.expectEqual(@as(usize, 2), refreshed.panes.items.len);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), refreshed.focused_pane_id);
+    try std.testing.expectEqual(@as(f32, 480.0), refreshed.scroll_target_x);
+    try std.testing.expectEqual(@as(f32, 480.0), refreshed.scroll_offset_x);
+    try std.testing.expectEqual(@as(?WorkspacePaneId, second_pane_id), refreshed.scroll_revealed_pane_id);
+
+    // The preserved focus is recorded in the projection baseline as well, so
+    // it can never read as a local structural edit in a later merge (which
+    // would wrongly resurrect local pane structure against a remote clear).
+    const baseline = state.lifecycle.projection_baseline orelse return error.MissingBaseline;
+    const baseline_json = baseline.value.projects[0].workspace_layout_json orelse return error.MissingLayout;
+    try std.testing.expect(std.mem.indexOf(u8, baseline_json, "\"focused\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, baseline_json, "\"scroll_x\":4.8e2") != null or
+        std.mem.indexOf(u8, baseline_json, "\"scroll_x\":480") != null);
+}
+
+test "daemon refresh keeps just-attached draft images and committed row image extras" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    var storage = try Storage.initWithPrefPath(allocator, path_buf[0..path_len]);
+    defer storage.deinit();
+    var state = try AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer {
+        state.lifecycle.dirty = false;
+        state.deinit();
+    }
+
+    // Transcript half: a committed user row arrives from the projection with
+    // its full attachment list ([primary] ++ extras) and must materialize as
+    // image + extra_images on the live message.
+    const row_images = [_]headless.store.Attachment{
+        .{ .path = "/tmp/sent-a.png", .mime = "image/png", .byte_size = 11 },
+        .{ .path = "/tmp/sent-b.png", .mime = "image/jpeg", .byte_size = 22 },
+    };
+    const messages = [_]headless.store.Message{.{
+        .message_id = "gui-msg:img:1",
+        .role = "user",
+        .author = "You",
+        .body = "look at these",
+        .image = row_images[0],
+        .images = &row_images,
+    }};
+    const threads = [_]headless.store.Thread{.{
+        .local_thread_id = "thread-one",
+        .title = "One",
+        .committed = true,
+        .messages = &messages,
+    }};
+    const workspaces = [_]headless.store.Workspace{.{
+        .workspace_id = "workspace-id",
+        .label = "Workspace",
+        .path = "/tmp/image-drop/",
+        .selected_thread_index = 0,
+        .threads = &threads,
+    }};
+    state.lifecycle.dirty = false;
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 1, .workspaces = &workspaces },
+        .store_revision = 1,
+        .envelope = .{ .instance_nonce = "image-drop", .registry_revision = 1 },
+        .change_cursor = 1,
+    });
+    {
+        const thread = &state.project_controller.projects.items[0].threads.items[0];
+        try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
+        const message = &thread.messages.items[0];
+        try std.testing.expectEqualStrings("/tmp/sent-a.png", message.image.?.path);
+        try std.testing.expectEqual(@as(usize, 1), message.extra_images.len);
+        try std.testing.expectEqualStrings("/tmp/sent-b.png", message.extra_images[0].path);
+    }
+
+    // Composer half: attach a multi-image draft, then let a refresh echo a
+    // snapshot captured before the flush landed. `dirty` is already clear —
+    // the race window — so only the recency overlay can keep the images.
+    {
+        const thread = &state.project_controller.projects.items[0].threads.items[0];
+        try thread.setDraftImage(allocator, "/tmp/draft-a.png", "image/png", 33);
+        try thread.addDraftImage(allocator, "/tmp/draft-b.png", "image/png", 44);
+    }
+    state.lifecycle.dirty = false;
+    try state.applyDaemonProjectionRefresh(.{
+        .snapshot = .{ .store_revision = 2, .workspaces = &workspaces },
+        .store_revision = 2,
+        .envelope = .{ .instance_nonce = "image-drop", .registry_revision = 2 },
+        .change_cursor = 2,
+    });
+    {
+        const thread = &state.project_controller.projects.items[0].threads.items[0];
+        try std.testing.expectEqualStrings("/tmp/draft-a.png", thread.draft_image.?.path);
+        try std.testing.expectEqual(@as(usize, 1), thread.draft_extra_images.items.len);
+        try std.testing.expectEqualStrings("/tmp/draft-b.png", thread.draft_extra_images.items[0].path);
+        // The committed row's extras also survive the refresh rebuild.
+        const message = &thread.messages.items[0];
+        try std.testing.expectEqual(@as(usize, 1), message.extra_images.len);
+        try std.testing.expectEqualStrings("/tmp/sent-b.png", message.extra_images[0].path);
+    }
+
+    // Flush/spool round-trip: the persisted snapshot carries the full draft
+    // list and the committed row's extras, so a thread switch or restart that
+    // reloads from it cannot narrow the attachments.
+    var spool = try state.buildPersistedState(allocator);
+    defer spool.deinit();
+    const persisted_thread = spool.value.projects[0].threads.?[0];
+    try std.testing.expectEqualStrings("/tmp/draft-a.png", persisted_thread.draft_image.?.path);
+    try std.testing.expectEqual(@as(usize, 1), persisted_thread.draft_extra_images.len);
+    try std.testing.expectEqualStrings("/tmp/draft-b.png", persisted_thread.draft_extra_images[0].path);
+    const persisted_message = persisted_thread.messages[0];
+    try std.testing.expectEqualStrings("/tmp/sent-a.png", persisted_message.image.?.path);
+    try std.testing.expectEqual(@as(usize, 1), persisted_message.extra_images.len);
+    try std.testing.expectEqualStrings("/tmp/sent-b.png", persisted_message.extra_images[0].path);
 }
 
 test "close spool load adoption keeps an unsent draft independent of pending completion" {

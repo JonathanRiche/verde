@@ -66,6 +66,14 @@ const CODEX_BACKGROUND_TASK_POLL_MAX_MS: i64 = 60_000;
 // Daemon tailing is synchronous IPC. Bounding it to Verde's active frame tier
 // preserves every display opportunity while avoiding duplicate RPCs in event bursts.
 const DAEMON_CHAT_POLL_INTERVAL_MS: i64 = 16;
+// Time budget for that synchronous tail: the next poll waits at least
+// FACTOR× the last round trip's measured cost, so a slow daemon consumes at
+// most ~1/FACTOR of the render thread instead of stalling every frame.
+const DAEMON_CHAT_POLL_BUDGET_FACTOR: i64 = 4;
+// Backoff ceiling. Matches the ~1Hz "Working - mm:ss" repaint floor so a
+// flapping daemon (e.g. 250ms connect timeouts) still gets tailed about once
+// a second rather than being abandoned.
+const DAEMON_CHAT_POLL_BACKOFF_MAX_MS: i64 = 1000;
 // Re-attached turns can carry megabytes of Cursor edit events. Ask the daemon
 // for bounded replay pages so one synchronous tail cannot exceed the IPC cap
 // or monopolize the render thread.
@@ -465,9 +473,26 @@ pub const State = struct {
     codex_background_poll: CodexBackgroundPollState = .{},
     daemon_tail_response_buffer: ?[]u8 = null,
     daemon_tail_connection: sessionizer.ReusableRequestConnection = .{},
+    /// In-flight chat.turn.start acceptance workers (7.5): the RPC runs off
+    /// the event thread; outcomes commit on the main thread in pollSend.
+    acceptance_dispatches: std.ArrayListUnmanaged(*AcceptanceDispatch) = .empty,
+    /// Single-slot chat.turn.tail worker: the tail RPC runs off the render
+    /// thread; the response commits on the main thread in pollSend. One slot
+    /// keeps the reusable connection and response buffer exclusive.
+    daemon_tail_worker: ?std.Thread = null,
+    daemon_tail_args: ?*DaemonTailWorkerArgs = null,
 
     /// Releases chat-controller-owned polling scratch space.
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
+        if (self.daemon_tail_worker) |worker| worker.join();
+        self.daemon_tail_worker = null;
+        if (self.daemon_tail_args) |args| args.destroy();
+        self.daemon_tail_args = null;
+        for (self.acceptance_dispatches.items) |dispatch| {
+            if (dispatch.worker) |worker| worker.join();
+            dispatch.destroy(allocator);
+        }
+        self.acceptance_dispatches.deinit(std.heap.page_allocator);
         self.daemon_tail_connection.deinit();
         if (self.daemon_tail_response_buffer) |buffer| allocator.free(buffer);
         self.daemon_tail_response_buffer = null;
@@ -1096,10 +1121,12 @@ test "prospective prompt preflight rejects before thread staging" {
     try std.testing.expectEqual(@as(usize, 0), prospective.messages.items.len);
 }
 
-test "confirmed daemon rejection restores retryable draft; acceptance starts one addressed turn" {
-    // M4-P3: durability is the acceptance receipt, not pre-send persistThreadBlocking.
-    // Confirmed JSON-RPC rejection restores the draft (no provider handoff); a
-    // later acceptance clears the draft and stages exactly one user row in-memory.
+test "failed dispatch restores retryable draft; async acceptance arms one addressed turn" {
+    // M4-P3 via 7.5: durability is the acceptance receipt, now awaited on a
+    // worker. A dispatch failure restores the draft (nothing reached the
+    // daemon); a successful dispatch stages exactly one user row, arms one
+    // pending send, and leaves the draft in the composer until the receipt
+    // commits (commitAcceptanceDispatch is covered separately below).
     const allocator = std.testing.allocator;
     const FakeState = struct {
         allocator: std.mem.Allocator,
@@ -1111,6 +1138,7 @@ test "confirmed daemon rejection restores retryable draft; acceptance starts one
         provider_handoffs: usize = 0,
         failure_rows: usize = 0,
         flushes: usize = 0,
+        dirty_marks: usize = 0,
 
         pub fn providerExecutionTargetForProjectThread(_: *@This(), _: usize, _: *const ChatThread, _: usize) ?ProviderExecutionTarget {
             return .{ .local = "/tmp" };
@@ -1142,16 +1170,26 @@ test "confirmed daemon rejection restores retryable draft; acceptance starts one
             self.allocator.free(message.extra_images);
         }
 
-        pub fn beginSendForThreadWithReadyDaemon(
+        pub fn dispatchDaemonAcceptance(
             self: *@This(),
             _: usize,
-            _: *ChatThread,
+            thread: *ChatThread,
             prompt: []const u8,
             _: ProviderExecutionTarget,
+            _: *InitialSendSnapshot,
+            _: bool,
         ) !void {
             try std.testing.expectEqualStrings("retryable prompt", prompt);
             self.handoff_attempts += 1;
             if (self.handoff_attempts == 1) return error.DaemonRequestFailed;
+            // Mirror production arming: pending send with the acceptance
+            // receipt still in flight.
+            const send_state = thread.send_state;
+            send_state.mutex.lock();
+            defer send_state.mutex.unlock();
+            send_state.status = .pending;
+            send_state.daemon_owned = true;
+            send_state.acceptance_pending = true;
             self.provider_handoffs += 1;
         }
 
@@ -1164,6 +1202,10 @@ test "confirmed daemon rejection restores retryable draft; acceptance starts one
         pub fn setSidebarNotice(_: *@This(), _: []const u8) void {}
         pub fn flushDirtyBlocking(self: *@This()) void {
             self.flushes += 1;
+        }
+
+        pub fn markDirty(self: *@This()) void {
+            self.dirty_marks += 1;
         }
     };
 
@@ -1192,11 +1234,190 @@ test "confirmed daemon rejection restores retryable draft; acceptance starts one
     try std.testing.expect(try sendThreadDraft(&state, 0, 0));
     try std.testing.expectEqual(@as(usize, 1), state.provider_handoffs);
     try std.testing.expectEqual(@as(usize, 2), state.handoff_attempts);
-    try std.testing.expectEqualStrings("", thread.currentDraft());
+    // Async acceptance (7.5): the composer keeps the submitted draft until
+    // the receipt commits, and the pending send blocks a duplicate submit.
+    try std.testing.expectEqualStrings("retryable prompt", thread.currentDraft());
     try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
     try std.testing.expectEqualStrings("retryable prompt", thread.messages.items[0].body);
+    try std.testing.expect(thread.isSendAcceptancePending());
     try std.testing.expect(!try sendThreadDraft(&state, 0, 0));
     try std.testing.expectEqual(@as(usize, 1), state.provider_handoffs);
+    thread.send_state.mutex.lock();
+    thread.send_state.status = .idle;
+    thread.send_state.daemon_owned = false;
+    thread.send_state.acceptance_pending = false;
+    thread.send_state.mutex.unlock();
+}
+
+test "acceptance commit clears unchanged draft, retains message id, and restores on rejection" {
+    const allocator = std.testing.allocator;
+    const FakeState = struct {
+        allocator: std.mem.Allocator,
+        chat_controller: State = .{},
+        project_controller: struct {
+            projects: std.ArrayList(Project) = .empty,
+            selected_index: usize = 0,
+        } = .{},
+        failure_rows: usize = 0,
+        flushes: usize = 0,
+        dirty_marks: usize = 0,
+        composer_resets: usize = 0,
+
+        pub fn projectThreadIndexByLocalId(self: *@This(), workspace_id: []const u8, local_thread_id: []const u8) ?ProjectThreadIndex {
+            return projectThreadIndexByLocalIdImpl(self, workspace_id, local_thread_id);
+        }
+
+        fn projectThreadIndexByLocalIdImpl(self: *@This(), workspace_id: []const u8, local_thread_id: []const u8) ?ProjectThreadIndex {
+            for (self.project_controller.projects.items, 0..) |*project, project_index| {
+                if (!std.mem.eql(u8, project.id, workspace_id)) continue;
+                for (project.threads.items, 0..) |*thread, thread_index| {
+                    if (std.mem.eql(u8, thread.local_thread_id, local_thread_id)) return .{
+                        .project_index = project_index,
+                        .thread_index = thread_index,
+                    };
+                }
+            }
+            return null;
+        }
+
+        pub fn releaseMessage(self: *@This(), message: ChatMessage) void {
+            self.allocator.free(message.author);
+            self.allocator.free(message.body);
+            if (message.message_id) |id| self.allocator.free(id);
+            self.allocator.free(message.extra_images);
+        }
+
+        pub fn appendInitialSendFailure(self: *@This(), _: *ChatThread, _: []const u8) void {
+            self.failure_rows += 1;
+        }
+
+        pub fn requestTranscriptScrollToBottom(_: *@This()) void {}
+        pub fn resetComposerInputWidget(self: *@This()) void {
+            self.composer_resets += 1;
+        }
+        pub fn setSidebarNotice(_: *@This(), _: []const u8) void {}
+        pub fn flushDirtyBlocking(self: *@This()) void {
+            self.flushes += 1;
+        }
+        pub fn markDirty(self: *@This()) void {
+            self.dirty_marks += 1;
+        }
+    };
+
+    var state: FakeState = .{ .allocator = allocator };
+    var project = try Project.init(allocator, "accept-commit", "Accept commit", "/tmp/accept-commit", 0);
+    state.project_controller.projects.append(allocator, project) catch |err| {
+        project.deinit(allocator);
+        return err;
+    };
+    defer {
+        for (state.project_controller.projects.items) |*owned| owned.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+    const thread = &state.project_controller.projects.items[0].threads.items[0];
+    const project_id = state.project_controller.projects.items[0].id;
+
+    const makeDispatch = struct {
+        fn call(pid: []const u8, tid: []const u8, prompt: []const u8, outcome: AcceptanceOutcome) !*AcceptanceDispatch {
+            const page_alloc = std.heap.page_allocator;
+            const dispatch = try page_alloc.create(AcceptanceDispatch);
+            dispatch.* = .{
+                .arena = std.heap.ArenaAllocator.init(page_alloc),
+                .project_id = "",
+                .local_thread_id = "",
+                .pref_path = "",
+                .params = undefined,
+                .snapshot = .{ .message_count = 0, .committed = false, .last_activity_at = 0, .title = null },
+                .outcome = outcome,
+            };
+            const arena = dispatch.arena.allocator();
+            dispatch.project_id = try arena.dupe(u8, pid);
+            dispatch.local_thread_id = try arena.dupe(u8, tid);
+            dispatch.params = .{
+                .turn_id = try arena.dupe(u8, "gui:test:turn"),
+                .workspace_id = dispatch.project_id,
+                .local_thread_id = dispatch.local_thread_id,
+                .provider = "claude",
+                .harness = "cli",
+                .project_path = "/tmp/accept-commit",
+                .prompt = try arena.dupe(u8, prompt),
+                .image_paths = &.{},
+                .images = &.{},
+                .provider_thread_id = null,
+                .thread_title = "",
+                .model_ref = null,
+                .reasoning_effort = null,
+                .opencode_reasoning_variant = null,
+                .cursor_model_params_json = null,
+                .fast_mode = false,
+                .access_mode = "default",
+                .remote_ssh_host = null,
+                .remote_cwd = null,
+                .message_id = try arena.dupe(u8, "gui-msg:test:turn"),
+            };
+            return dispatch;
+        }
+    }.call;
+
+    const armThread = struct {
+        fn call(chat: *State, target: *ChatThread) !void {
+            const send_state = target.send_state;
+            send_state.mutex.lock();
+            defer send_state.mutex.unlock();
+            send_state.status = .pending;
+            send_state.daemon_owned = true;
+            send_state.acceptance_pending = true;
+            if (send_state.daemon_turn_id) |old| std.heap.page_allocator.free(old);
+            send_state.daemon_turn_id = try std.heap.page_allocator.dupe(u8, "gui:test:turn");
+            chat.beginSend();
+        }
+    }.call;
+
+    // Accepted: message id retained on the staged row, unchanged draft cleared.
+    thread.setDraft("submitted prompt");
+    try thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "submitted prompt"),
+        .extra_images = try allocator.alloc(ChatImageAttachment, 0),
+    });
+    try armThread(&state.chat_controller, thread);
+    const accepted = try makeDispatch(project_id, thread.local_thread_id, "submitted prompt", .accepted);
+    try std.testing.expect(commitAcceptanceDispatch(&state, accepted));
+    accepted.destroy(allocator);
+    try std.testing.expectEqualStrings("", thread.currentDraft());
+    try std.testing.expectEqualStrings("gui-msg:test:turn", thread.messages.items[0].message_id.?);
+    try std.testing.expectEqual(@as(usize, 1), state.composer_resets);
+    try std.testing.expect(!thread.isSendAcceptancePending());
+    try std.testing.expect(thread.isSendPending());
+    try std.testing.expectEqual(@as(usize, 0), state.failure_rows);
+
+    // Rejected: staged row popped, send disarmed, failure row + flush emitted.
+    thread.send_state.mutex.lock();
+    thread.send_state.status = .idle;
+    thread.send_state.daemon_owned = false;
+    thread.send_state.mutex.unlock();
+    state.chat_controller.finishSend();
+    thread.setDraft("second prompt");
+    try thread.messages.append(allocator, .{
+        .role = .user,
+        .author = try allocator.dupeZ(u8, "You"),
+        .body = try allocator.dupeZ(u8, "second prompt"),
+        .extra_images = try allocator.alloc(ChatImageAttachment, 0),
+    });
+    try armThread(&state.chat_controller, thread);
+    const rejected = try makeDispatch(project_id, thread.local_thread_id, "second prompt", .rejected);
+    rejected.snapshot.message_count = 1;
+    rejected.snapshot.committed = thread.committed;
+    rejected.snapshot.last_activity_at = thread.last_activity_at;
+    try std.testing.expect(commitAcceptanceDispatch(&state, rejected));
+    rejected.destroy(allocator);
+    try std.testing.expectEqualStrings("second prompt", thread.currentDraft());
+    try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
+    try std.testing.expect(!thread.isSendPending());
+    try std.testing.expectEqual(@as(usize, 1), state.failure_rows);
+    try std.testing.expectEqual(@as(usize, 1), state.flushes);
+    try std.testing.expectEqual(@as(usize, 0), state.chat_controller.pending_send_count);
 }
 
 pub fn providerExecutionTargetForProjectThread(
@@ -1497,40 +1718,23 @@ pub fn sendThreadDraftWithUiPolicy(self: anytype, project_index: usize, thread_i
     };
     project.invalidateSidebarThreadCache();
     // M4-P3: user-message durability is the daemon acceptance receipt.
-    // chat.turn.start stages the user row (keyed by message_id) on the worker
-    // thread before provider work; do not pre-flush via persistThreadBlocking.
-    // Thread metadata dual-write still rides the post-flip M3 store path on
-    // later flushes; transcript application / flushDirtyNow / consume are
-    // deliberately unchanged for this dual-write window.
-    const daemon_start_at_ms = monotonicMs();
-    self.beginSendForThreadWithReadyDaemon(project_index, thread, draft, execution_target) catch |err| {
-        if (err == error.DaemonRequestFailed) {
-            // A daemon JSON-RPC error is a confirmed rejection, so removing
-            // the staged user row is safe and leaves the draft retryable.
-            snapshot.restore(self, thread);
-            self.appendInitialSendFailure(thread, initialSendStartFailureMessage(err));
-        } else {
-            // Transport and response failures may happen after acceptance.
-            // Keep the in-memory user row (daemon may have staged it); clear
-            // the composer so a blind retry cannot duplicate the provider turn.
-            thread.clearDraft();
-            thread.clearDraftImage(self.allocator);
-            if (selected_target) self.resetComposerInputWidget();
-            self.appendInitialSendFailure(thread, ambiguousInitialSendFailureMessage());
-        }
+    // chat.turn.start stages the user row (keyed by message_id) before
+    // provider work; do not pre-flush via persistThreadBlocking. The RPC now
+    // runs on an acceptance worker (7.5) so a busy daemon cannot stall the
+    // event thread; the receipt commits in pollSend with the same
+    // rejected/ambiguous classification, and the draft stays in the composer
+    // until acceptance so failure leaves it retryable.
+    self.dispatchDaemonAcceptance(project_index, thread, draft, execution_target, &snapshot, selected_target) catch |err| {
+        // Dispatch failures happen before anything reaches the daemon, so
+        // restoring the staged user row is safe and the draft stays intact.
+        snapshot.restore(self, thread);
+        self.appendInitialSendFailure(thread, initialSendStartFailureMessage(err));
         project.invalidateSidebarThreadCache();
         if (selected_target) self.requestTranscriptScrollToBottom();
         self.flushDirtyBlocking();
         return err;
     };
-    runtime_log.diagnostic("chat submit accepted daemon_start_ms={d} thread_messages={d}", .{
-        monotonicMs() - daemon_start_at_ms,
-        thread.messages.items.len,
-    });
-    thread.clearDraft();
-    thread.clearDraftImage(self.allocator);
     if (selected_target) {
-        self.resetComposerInputWidget();
         self.requestTranscriptScrollToBottom();
     }
     self.setSidebarNotice("Waiting for provider reply...");
@@ -1576,9 +1780,8 @@ pub fn queueOrSteerDraftDuringSend(self: anytype) void {
     if (self.project_controller.projects.items.len == 0) return;
     const thread = self.currentThreadMutable();
     const kind: FollowupKind = switch (thread.provider) {
-        .codex => .steer,
+        .codex, .claude => .steer,
         .opencode => .queue,
-        .claude => .queue,
         .cursor => .queue,
     };
     self.storeDraftDuringSend(kind);
@@ -1591,11 +1794,14 @@ pub fn storeThreadFollowupPrompt(self: anytype, project_index: usize, thread_ind
     if (thread_index >= project.threads.items.len) return false;
     const thread = &project.threads.items[thread_index];
     if (!thread.isSendPending()) return false;
+    // The submit's acceptance receipt is still in flight; a follow-up staged
+    // now could double-send the same prompt once acceptance commits.
+    if (thread.isSendAcceptancePending()) return false;
     if (std.mem.trim(u8, prompt, &std.ascii.whitespace).len == 0) return false;
 
     const kind: FollowupKind = switch (thread.provider) {
-        .codex => .steer,
-        .opencode, .claude, .cursor => .queue,
+        .codex, .claude => .steer,
+        .opencode, .cursor => .queue,
     };
     const send_state = thread.send_state;
     send_state.mutex.lock();
@@ -1640,7 +1846,7 @@ fn copyDraftImagesToFollowup(
 }
 
 /// Queues the current composer draft as a new turn after the active reply.
-/// Codex uses this for Enter while Tab remains the distinct steer action.
+/// Codex and Claude use this for Enter while Tab remains the distinct steer action.
 pub fn queueDraftDuringSend(self: anytype) void {
     self.storeDraftDuringSend(.queue);
 }
@@ -1650,6 +1856,12 @@ pub fn storeDraftDuringSend(self: anytype, kind: FollowupKind) void {
     const thread = self.currentThreadMutable();
     if (!thread.isSendPending()) {
         self.setSidebarNotice("This chat is not running.");
+        return;
+    }
+    // The composer still holds the just-submitted prompt while its acceptance
+    // receipt is in flight (7.5); queueing it now would double-send.
+    if (thread.isSendAcceptancePending()) {
+        self.setSidebarNotice("Still confirming the previous send...");
         return;
     }
 
@@ -1679,13 +1891,19 @@ pub fn storeDraftDuringSend(self: anytype, kind: FollowupKind) void {
     freePendingFollowup(self.allocator, &send_state.pending_followup);
     send_state.pending_followup_signal_sent = false;
     send_state.pending_followup = next_followup;
+    // The queued-pin snapshot cache keys on this revision; a re-queued prompt
+    // must invalidate it even though presence/state stay unchanged.
+    send_state.ui_revision +%= 1;
 
     self.clearDraft();
     thread.clearDraftImage(self.allocator);
     self.resetComposerInputWidget();
     self.setSidebarNotice(switch (kind) {
         .queue => "Queued. Sends after the current reply.",
-        .steer => "Steer queued. Waiting for Codex to accept it.",
+        .steer => if (thread.provider == .claude)
+            "Steer queued. Waiting for Claude to accept it."
+        else
+            "Steer queued. Waiting for Codex to accept it.",
     });
 }
 
@@ -1703,6 +1921,41 @@ pub fn pendingFollowupSnapshot(self: anytype) !?PendingFollowup {
     };
 }
 
+/// Render-thread view of the queued follow-up, cached across frames on the
+/// send-state identity + ui_revision (+ in-place kind/state transitions, which
+/// do not bump the revision). The returned pointer stays valid until the next
+/// cached-snapshot refresh; render commands copy text into the frame arena.
+pub fn pendingFollowupSnapshotCached(self: anytype) ?*const PendingFollowup {
+    if (self.project_controller.projects.items.len == 0) return null;
+    const send_state = self.currentThread().send_state;
+    const cache = &self.pending_ui_snapshot_cache;
+    const identity: usize = @intFromPtr(send_state);
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+
+    const revision = send_state.ui_revision;
+    const pending = &send_state.pending_followup;
+    const fresh = cache.followup_valid and
+        cache.followup_send_state == identity and
+        cache.followup_revision == revision and
+        (cache.followup != null) == (pending.* != null) and
+        (pending.* == null or
+            (cache.followup.?.state == pending.*.?.state and cache.followup.?.kind == pending.*.?.kind));
+    if (!fresh) {
+        if (cache.followup) |*existing| existing.deinit(self.allocator);
+        cache.followup = null;
+        cache.followup_valid = false;
+        if (pending.*) |value| {
+            const prompt = self.allocator.dupe(u8, value.prompt) catch return null;
+            cache.followup = .{ .kind = value.kind, .state = value.state, .prompt = prompt };
+        }
+        cache.followup_send_state = identity;
+        cache.followup_revision = revision;
+        cache.followup_valid = true;
+    }
+    return if (cache.followup) |*value| value else null;
+}
+
 pub fn pendingFollowupHint(self: anytype) ?[:0]const u8 {
     if (self.project_controller.projects.items.len == 0) return null;
     const thread = self.currentThread();
@@ -1710,7 +1963,7 @@ pub fn pendingFollowupHint(self: anytype) ?[:0]const u8 {
     return switch (thread.provider) {
         .codex => "Enter to queue \u{00B7} Tab to steer",
         .opencode => "Tab to queue",
-        .claude => "Tab to queue",
+        .claude => "Enter to queue \u{00B7} Tab to steer",
         .cursor => "Tab to queue",
     };
 }
@@ -1822,21 +2075,25 @@ pub fn interruptThreadViaHarness(
 pub fn steerThreadViaHarness(
     self: anytype,
     execution_target: ProviderExecutionTarget,
+    provider: Provider,
     thread_id: []const u8,
     turn_id: []const u8,
     prompt: []const u8,
     images: []const ChatImageAttachment,
 ) !void {
+    if (execution_target.remoteHost() != null and provider != .codex) return error.UnsupportedRemoteProvider;
     const provider_cwd = execution_target.cwd();
-    const provider_config = ai_harness.ProviderConfig{
-        .codex = .{
+    const provider_config = switch (provider) {
+        .codex => ai_harness.ProviderConfig{ .codex = .{
             .cwd = provider_cwd,
             .launch_on_connect = false,
             .remote_ssh = if (execution_target.remoteHost()) |host| .{
                 .host = host,
                 .cwd = provider_cwd,
             } else null,
-        },
+        } },
+        .claude => ai_harness.ProviderConfig{ .claude = .{ .cwd = provider_cwd } },
+        .opencode, .cursor => return error.UnsupportedOperation,
     };
 
     var client = try ai_harness.connect(self.allocator, provider_config);
@@ -1852,6 +2109,357 @@ pub fn steerThreadViaHarness(
         .prompt = prompt,
         .images = image_attachments,
     });
+}
+
+pub fn steerDaemonChatTurn(
+    self: anytype,
+    turn_id: []const u8,
+    prompt: []const u8,
+    images: []const ChatImageAttachment,
+) !void {
+    var image_paths: std.ArrayList([]const u8) = .empty;
+    defer image_paths.deinit(self.allocator);
+    for (images) |image| try image_paths.append(self.allocator, image.path);
+    const response = try sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.steer", .{
+        .turn_id = turn_id,
+        .prompt = prompt,
+        .image_paths = image_paths.items,
+    }, 6);
+    defer self.allocator.free(response);
+    try ensureJsonRpcOk(self.allocator, response);
+}
+
+pub const AcceptanceOutcome = enum { accepted, rejected, ambiguous };
+
+const AcceptanceWireAttachment = struct { path: []const u8, mime: []const u8, byte_size: u64 };
+
+/// Wire params for chat.turn.start, arena-owned so the acceptance worker can
+/// serialize them after the submitting call has returned. Field names and
+/// order mirror startDaemonChatTurn's anonymous literal (same JSON shape).
+const AcceptanceTurnStartParams = struct {
+    turn_id: []const u8,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    provider: []const u8,
+    harness: []const u8,
+    project_path: []const u8,
+    prompt: []const u8,
+    image_paths: []const []const u8,
+    images: []const AcceptanceWireAttachment,
+    provider_thread_id: ?[]const u8,
+    thread_title: []const u8,
+    model_ref: ?[]const u8,
+    reasoning_effort: ?[]const u8,
+    opencode_reasoning_variant: ?[]const u8,
+    cursor_model_params_json: ?[]const u8,
+    fast_mode: bool,
+    access_mode: []const u8,
+    remote_ssh_host: ?[]const u8,
+    remote_cwd: ?[]const u8,
+    message_id: []const u8,
+};
+
+/// One in-flight async chat.turn.start acceptance (7.5). The event thread
+/// arms the pending send and hands this to a worker; pollSend commits the
+/// outcome on the main thread with the same M4-P3 classification the old
+/// synchronous path used. Identity guards (project/thread ids + turn id)
+/// protect the commit against thread deletion or reset during the window.
+pub const AcceptanceDispatch = struct {
+    arena: std.heap.ArenaAllocator,
+    project_id: []const u8,
+    local_thread_id: []const u8,
+    pref_path: []const u8,
+    params: AcceptanceTurnStartParams,
+    /// Owned pre-submit rollback state; allocated with the state allocator.
+    snapshot: InitialSendSnapshot,
+    rpc_elapsed_ms: i64 = 0,
+    outcome: AcceptanceOutcome = .ambiguous,
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+    worker: ?std.Thread = null,
+
+    fn destroy(self: *AcceptanceDispatch, allocator: std.mem.Allocator) void {
+        self.snapshot.deinit(allocator);
+        self.arena.deinit();
+        std.heap.page_allocator.destroy(self);
+    }
+};
+
+fn acceptanceWorkerMain(dispatch: *AcceptanceDispatch) void {
+    const alloc = std.heap.page_allocator;
+    const started_ms = monotonicMs();
+    const outcome: AcceptanceOutcome = blk: {
+        const response = sessionizer.requestAlloc(alloc, dispatch.pref_path, "chat.turn.start", dispatch.params, 1) catch |err| {
+            break :blk classifyAcceptanceFailure(alloc, dispatch, err);
+        };
+        defer alloc.free(response);
+        ensureJsonRpcOk(alloc, response) catch |err| {
+            break :blk classifyAcceptanceFailure(alloc, dispatch, err);
+        };
+        break :blk .accepted;
+    };
+    dispatch.rpc_elapsed_ms = monotonicMs() - started_ms;
+    dispatch.outcome = outcome;
+    dispatch.done.store(true, .release);
+}
+
+/// M4-P3 classification, unchanged from the synchronous path: a lost reply
+/// can follow successful acceptance, so probe the exact idempotency key
+/// before exposing a retry that could run twice. A daemon JSON-RPC error is
+/// a confirmed rejection; anything else stays ambiguous.
+fn classifyAcceptanceFailure(alloc: std.mem.Allocator, dispatch: *AcceptanceDispatch, err: anyerror) AcceptanceOutcome {
+    if (daemonChatTurnExistsRaw(alloc, dispatch.pref_path, dispatch.params.turn_id)) return .accepted;
+    dispatch.err = err;
+    return if (err == error.DaemonRequestFailed) .rejected else .ambiguous;
+}
+
+/// Stages the daemon acceptance for a just-appended user row without blocking
+/// the event thread: arms the pending send (draft intentionally NOT cleared —
+/// the acceptance receipt commit clears it, preserving M4-P3), snapshots the
+/// wire params, and spawns the worker. Errors mean nothing was sent, so the
+/// caller may treat them as confirmed-safe failures.
+pub fn dispatchDaemonAcceptance(
+    self: anytype,
+    project_index: usize,
+    thread: *ChatThread,
+    prompt: []const u8,
+    execution_target: ProviderExecutionTarget,
+    snapshot: *InitialSendSnapshot,
+    selected_target: bool,
+) !void {
+    _ = selected_target;
+    const page_alloc = std.heap.page_allocator;
+    const project = &self.project_controller.projects.items[project_index];
+    const now_ms = unixTimestampMs();
+
+    // Readiness checks and other short GUI operations may have launched the
+    // shared Codex app-server in this process. Stop it before the daemon
+    // worker connects so closing Verde cannot kill the server that owns the
+    // durable turn.
+    if (thread.provider == .codex) {
+        self.finishProviderReadinessThread();
+        ai_harness.releaseOwnedCodexServer();
+    }
+
+    const dispatch = try page_alloc.create(AcceptanceDispatch);
+    errdefer page_alloc.destroy(dispatch);
+    dispatch.* = .{
+        .arena = std.heap.ArenaAllocator.init(page_alloc),
+        .project_id = "",
+        .local_thread_id = "",
+        .pref_path = "",
+        .params = undefined,
+        .snapshot = .{ .message_count = 0, .committed = true, .last_activity_at = 0, .title = null },
+    };
+    errdefer dispatch.arena.deinit();
+    const arena = dispatch.arena.allocator();
+
+    const turn_id = try std.fmt.allocPrint(arena, "gui:{s}:{s}:{d}", .{ project.id, thread.local_thread_id, now_ms });
+    // Stable client identity for the staged user row at acceptance (M4-P3);
+    // the daemon keys the durable message by this id.
+    const message_id = try std.fmt.allocPrint(arena, "gui-msg:{s}:{s}:{d}", .{ project.id, thread.local_thread_id, now_ms });
+    const cursor_model_params_json: ?[]const u8 = if (thread.provider == .cursor) try self.cursorModelParamsJsonAlloc(arena, thread) else null;
+
+    var image_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    var wire_images: std.ArrayListUnmanaged(AcceptanceWireAttachment) = .empty;
+    const draft_image_count = thread.draftImageCount();
+    try image_paths.ensureTotalCapacity(arena, draft_image_count);
+    try wire_images.ensureTotalCapacity(arena, draft_image_count);
+    if (thread.draft_image) |image| {
+        const path = try arena.dupe(u8, image.path);
+        image_paths.appendAssumeCapacity(path);
+        wire_images.appendAssumeCapacity(.{ .path = path, .mime = try arena.dupe(u8, image.mime), .byte_size = image.byte_size });
+    }
+    for (thread.draft_extra_images.items) |image| {
+        const path = try arena.dupe(u8, image.path);
+        image_paths.appendAssumeCapacity(path);
+        wire_images.appendAssumeCapacity(.{ .path = path, .mime = try arena.dupe(u8, image.mime), .byte_size = image.byte_size });
+    }
+
+    dispatch.project_id = try arena.dupe(u8, project.id);
+    dispatch.local_thread_id = try arena.dupe(u8, thread.local_thread_id);
+    dispatch.pref_path = try arena.dupe(u8, self.storage.pref_path);
+    dispatch.params = .{
+        .turn_id = turn_id,
+        .workspace_id = dispatch.project_id,
+        .local_thread_id = dispatch.local_thread_id,
+        .provider = @tagName(harnessProviderForDbProvider(thread.provider)),
+        .harness = @tagName(thread.harness),
+        .project_path = try arena.dupe(u8, project.path),
+        .prompt = try arena.dupe(u8, prompt),
+        .image_paths = image_paths.items,
+        .images = wire_images.items,
+        .provider_thread_id = if (thread.provider_thread_id) |thread_id| try arena.dupe(u8, thread_id) else null,
+        .thread_title = try arena.dupe(u8, thread.title),
+        .model_ref = if (thread.model_ref) |model_ref| try arena.dupe(u8, model_ref) else null,
+        .reasoning_effort = if (thread.reasoning_effort) |effort| @tagName(effort) else null,
+        .opencode_reasoning_variant = if (daemonReasoningVariant(thread.provider, thread.opencode_reasoning_variant)) |variant| try arena.dupe(u8, variant) else null,
+        .cursor_model_params_json = cursor_model_params_json,
+        .fast_mode = thread.fast_mode == .on,
+        .access_mode = @tagName(thread.access_mode),
+        .remote_ssh_host = if (execution_target.remoteHost()) |host| try arena.dupe(u8, host) else null,
+        .remote_cwd = if (execution_target.remoteHost() != null) try arena.dupe(u8, execution_target.cwd()) else null,
+        .message_id = message_id,
+    };
+
+    try self.chat_controller.acceptance_dispatches.ensureUnusedCapacity(page_alloc, 1);
+    const send_state_turn_id = try page_alloc.dupe(u8, turn_id);
+
+    // Everything below is infallible until the spawn; the send is armed with
+    // acceptance_pending so tail polling, steer/stop, and follow-up queueing
+    // hold off until the receipt commits.
+    armSendStateForDaemonTurn(self, thread, send_state_turn_id, true);
+    dispatch.snapshot = snapshot.*;
+    snapshot.title = null;
+    self.chat_controller.acceptance_dispatches.appendAssumeCapacity(dispatch);
+
+    dispatch.worker = std.Thread.spawn(.{}, acceptanceWorkerMain, .{dispatch}) catch |err| {
+        // Nothing was sent: un-arm and hand rollback state back to the caller.
+        _ = self.chat_controller.acceptance_dispatches.pop();
+        disarmSendStateAfterFailedDispatch(self, thread);
+        snapshot.* = dispatch.snapshot;
+        dispatch.snapshot = .{ .message_count = 0, .committed = true, .last_activity_at = 0, .title = null };
+        dispatch.destroy(self.allocator);
+        return err;
+    };
+}
+
+fn disarmSendStateAfterFailedDispatch(self: anytype, thread: *ChatThread) void {
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    send_state.status = .idle;
+    send_state.daemon_owned = false;
+    send_state.acceptance_pending = false;
+    if (send_state.daemon_turn_id) |turn_id| {
+        std.heap.page_allocator.free(turn_id);
+        send_state.daemon_turn_id = null;
+    }
+    self.chat_controller.finishSend();
+}
+
+/// Drains completed acceptance workers and commits their outcomes on the
+/// main thread. Runs from pollSend ahead of the has-pending gate's per-thread
+/// polling so a rejected acceptance still tears the armed send down.
+pub fn pollAcceptanceDispatches(self: anytype) bool {
+    var changed = false;
+    var index: usize = 0;
+    while (index < self.chat_controller.acceptance_dispatches.items.len) {
+        const dispatch = self.chat_controller.acceptance_dispatches.items[index];
+        if (!dispatch.done.load(.acquire)) {
+            index += 1;
+            continue;
+        }
+        if (dispatch.worker) |worker| {
+            worker.join();
+            dispatch.worker = null;
+        }
+        _ = self.chat_controller.acceptance_dispatches.swapRemove(index);
+        changed = commitAcceptanceDispatch(self, dispatch) or changed;
+        dispatch.destroy(self.allocator);
+    }
+    return changed;
+}
+
+/// Applies one acceptance outcome with the synchronous path's exact M4-P3
+/// semantics: accepted retains the staged message id and clears the composer
+/// only when it still holds the submitted draft; confirmed rejection restores
+/// the pre-submit thread state and leaves the draft retryable; ambiguous
+/// keeps the staged row and surfaces the preserved-message failure.
+pub fn commitAcceptanceDispatch(self: anytype, dispatch: *AcceptanceDispatch) bool {
+    const resolved = self.projectThreadIndexByLocalId(dispatch.project_id, dispatch.local_thread_id) orelse return false;
+    const project = &self.project_controller.projects.items[resolved.project_index];
+    const thread = &project.threads.items[resolved.thread_index];
+    const send_state = thread.send_state;
+
+    send_state.mutex.lock();
+    const turn_matches = if (send_state.daemon_turn_id) |turn_id| std.mem.eql(u8, turn_id, dispatch.params.turn_id) else false;
+    const armed = send_state.acceptance_pending and send_state.status == .pending and send_state.daemon_owned and turn_matches;
+    if (!armed) {
+        // The send was reset/aborted during the window. Drop the outcome; an
+        // accepted daemon turn stays discoverable through reattach flows.
+        send_state.mutex.unlock();
+        return false;
+    }
+    send_state.acceptance_pending = false;
+    if (dispatch.outcome != .accepted) {
+        send_state.status = .idle;
+        send_state.daemon_owned = false;
+        if (send_state.daemon_turn_id) |turn_id| {
+            std.heap.page_allocator.free(turn_id);
+            send_state.daemon_turn_id = null;
+        }
+    }
+    send_state.mutex.unlock();
+
+    const selected = resolved.project_index == self.project_controller.selected_index and
+        resolved.thread_index == project.currentThreadIndex();
+    switch (dispatch.outcome) {
+        .accepted => {
+            // M4-P4: retain the acceptance-staged client id on the user row
+            // so the persistence flush carries the identity instead of
+            // re-minting a positional `snap-msg-{i}` for it.
+            if (thread.messages.items.len > 0) {
+                const user_row = &thread.messages.items[thread.messages.items.len - 1];
+                if (user_row.role == .user and user_row.message_id == null and std.mem.eql(u8, user_row.body, dispatch.params.prompt)) {
+                    user_row.message_id = self.allocator.dupe(u8, dispatch.params.message_id) catch null;
+                }
+            }
+            // Acceptance may land after the user resumed typing; only clear a
+            // composer that still holds exactly the submitted prompt/images.
+            if (acceptanceDraftUnchanged(thread, dispatch)) {
+                thread.clearDraft();
+                thread.clearDraftImage(self.allocator);
+                self.markDirty();
+                if (selected) self.resetComposerInputWidget();
+            }
+            runtime_log.diagnostic("chat submit accepted daemon_start_ms={d} thread_messages={d}", .{
+                dispatch.rpc_elapsed_ms,
+                thread.messages.items.len,
+            });
+        },
+        .rejected => {
+            self.chat_controller.finishSend();
+            dispatch.snapshot.restore(self, thread);
+            self.appendInitialSendFailure(thread, initialSendStartFailureMessage(dispatch.err orelse error.DaemonRequestFailed));
+            project.invalidateSidebarThreadCache();
+            if (selected) self.requestTranscriptScrollToBottom();
+            self.flushDirtyBlocking();
+        },
+        .ambiguous => {
+            self.chat_controller.finishSend();
+            // Keep the in-memory user row (the daemon may have staged it);
+            // clear the still-unchanged composer so a blind retry cannot
+            // duplicate the provider turn.
+            if (acceptanceDraftUnchanged(thread, dispatch)) {
+                thread.clearDraft();
+                thread.clearDraftImage(self.allocator);
+                self.markDirty();
+                if (selected) self.resetComposerInputWidget();
+            }
+            self.appendInitialSendFailure(thread, ambiguousInitialSendFailureMessage());
+            project.invalidateSidebarThreadCache();
+            if (selected) self.requestTranscriptScrollToBottom();
+            self.flushDirtyBlocking();
+        },
+    }
+    return true;
+}
+
+fn acceptanceDraftUnchanged(thread: *const ChatThread, dispatch: *const AcceptanceDispatch) bool {
+    if (!std.mem.eql(u8, thread.currentDraft(), dispatch.params.prompt)) return false;
+    var live_index: usize = 0;
+    if (thread.draft_image) |image| {
+        if (live_index >= dispatch.params.image_paths.len) return false;
+        if (!std.mem.eql(u8, image.path, dispatch.params.image_paths[live_index])) return false;
+        live_index += 1;
+    }
+    for (thread.draft_extra_images.items) |image| {
+        if (live_index >= dispatch.params.image_paths.len) return false;
+        if (!std.mem.eql(u8, image.path, dispatch.params.image_paths[live_index])) return false;
+        live_index += 1;
+    }
+    return live_index == dispatch.params.image_paths.len;
 }
 
 pub fn beginSendForThread(
@@ -1957,6 +2565,15 @@ fn beginSendForThreadWithReadyDaemonImages(
         }
     }
 
+    armSendStateForDaemonTurn(self, thread, turn_id, false);
+}
+
+/// Resets a thread's send_state into a freshly-armed pending daemon turn and
+/// increments the pending-send count. Takes ownership of the page-allocated
+/// `turn_id`. `acceptance_pending` marks an async chat.turn.start receipt
+/// still in flight (7.5); the synchronous path passes false.
+fn armSendStateForDaemonTurn(self: anytype, thread: *ChatThread, turn_id: []u8, acceptance_pending: bool) void {
+    const page_alloc = std.heap.page_allocator;
     const send_state = thread.send_state;
     send_state.mutex.lock();
     defer send_state.mutex.unlock();
@@ -1981,6 +2598,7 @@ fn beginSendForThreadWithReadyDaemonImages(
     send_state.daemon_last_seq = 0;
     send_state.daemon_last_poll_ms = -1;
     send_state.daemon_owned = true;
+    send_state.acceptance_pending = acceptance_pending;
     send_state.daemon_tail_fail_count = 0;
     send_state.thinking = false;
     send_state.partial_text.clearRetainingCapacity();
@@ -2015,7 +2633,11 @@ pub fn ensureSessionDaemon(self: anytype) !void {
     defer threaded.deinit();
     const exe_path = try std.process.executablePathAlloc(threaded.io(), self.allocator);
     defer self.allocator.free(exe_path);
-    try sessionizer.ensureDaemon(self.allocator, self.storage.pref_path, exe_path);
+    // Submit path runs on the SDL event thread: use the budgeted interactive
+    // probe (~250ms) so Enter never freezes the UI behind a busy daemon. A
+    // busy-but-alive daemon passes; chat.turn.start then carries the full
+    // request deadline plus its idempotent lost-reply recovery.
+    try sessionizer.ensureDaemonInteractive(self.allocator, self.storage.pref_path, exe_path);
 }
 
 pub fn startDaemonChatTurn(
@@ -2030,13 +2652,28 @@ pub fn startDaemonChatTurn(
     message_id: []const u8,
     image_override: ?[]const ChatImageAttachment,
 ) ![]u8 {
+    // Wire shape for the additive `images` param: real metadata the GUI
+    // already holds, so the daemon can stage the durable user row without
+    // inventing mime/byte_size. `image_paths` stays as the legacy mirror.
+    const WireAttachment = struct { path: []const u8, mime: []const u8, byte_size: u64 };
     var image_paths: std.ArrayList([]const u8) = .empty;
     defer image_paths.deinit(self.allocator);
+    var wire_images: std.ArrayList(WireAttachment) = .empty;
+    defer wire_images.deinit(self.allocator);
     if (image_override) |images| {
-        for (images) |image| try image_paths.append(self.allocator, image.path);
+        for (images) |image| {
+            try image_paths.append(self.allocator, image.path);
+            try wire_images.append(self.allocator, .{ .path = image.path, .mime = image.mime, .byte_size = image.byte_size });
+        }
     } else {
-        if (thread.draft_image) |image| try image_paths.append(self.allocator, image.path);
-        for (thread.draft_extra_images.items) |image| try image_paths.append(self.allocator, image.path);
+        if (thread.draft_image) |image| {
+            try image_paths.append(self.allocator, image.path);
+            try wire_images.append(self.allocator, .{ .path = image.path, .mime = image.mime, .byte_size = image.byte_size });
+        }
+        for (thread.draft_extra_images.items) |image| {
+            try image_paths.append(self.allocator, image.path);
+            try wire_images.append(self.allocator, .{ .path = image.path, .mime = image.mime, .byte_size = image.byte_size });
+        }
     }
 
     return sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.start", .{
@@ -2048,6 +2685,7 @@ pub fn startDaemonChatTurn(
         .project_path = self.project_controller.projects.items[project_index].path,
         .prompt = prompt,
         .image_paths = image_paths.items,
+        .images = wire_images.items,
         .provider_thread_id = if (thread.provider_thread_id) |thread_id| thread_id else null,
         .thread_title = thread.title,
         .model_ref = if (thread.model_ref) |model_ref| model_ref else null,
@@ -2064,13 +2702,18 @@ pub fn startDaemonChatTurn(
 }
 
 pub fn daemonChatTurnExists(self: anytype, turn_id: []const u8) bool {
-    const response = sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.tail", .{
+    return daemonChatTurnExistsRaw(self.allocator, self.storage.pref_path, turn_id);
+}
+
+/// Standalone lost-reply probe (no state), callable from acceptance workers.
+fn daemonChatTurnExistsRaw(allocator: std.mem.Allocator, pref_path: []const u8, turn_id: []const u8) bool {
+    const response = sessionizer.requestAlloc(allocator, pref_path, "chat.turn.tail", .{
         .turn_id = turn_id,
         .after_seq = 0,
         .max_bytes = DAEMON_CHAT_TAIL_PAGE_BYTES,
     }, 2) catch return false;
-    defer self.allocator.free(response);
-    ensureJsonRpcOk(self.allocator, response) catch return false;
+    defer allocator.free(response);
+    ensureJsonRpcOk(allocator, response) catch return false;
     return true;
 }
 
@@ -2645,6 +3288,21 @@ pub fn pollSend(self: anytype) bool {
     // poll-test states without the storage surface can drive pollSend.
     if (comptime @hasField(std.meta.Child(@TypeOf(self)), "storage")) {
         changed = retryPendingAdoptions(self) or changed;
+    }
+    // The acceptance/tail commit paths need the full thread-resolution and
+    // tail-apply surface; gate on those decls so slim poll-test fakes (which
+    // never arm dispatches or tail workers) still instantiate pollSend.
+    if (comptime @hasDecl(std.meta.Child(@TypeOf(self)), "projectThreadIndexByLocalId") and
+        @hasDecl(std.meta.Child(@TypeOf(self)), "applyDaemonChatTurnTail"))
+    {
+        // Commit async chat.turn.start receipts (7.5) ahead of per-thread
+        // polling so a rejected acceptance tears the armed send down before
+        // its thread is tail-polled.
+        changed = pollAcceptanceDispatches(self) or changed;
+        // Commit a finished chat.turn.tail response before the per-thread
+        // dispatch pass below (also drains the slot when no send remains,
+        // e.g. after an abort while the worker was in flight).
+        changed = serviceDaemonChatTailWorker(self) or changed;
     }
     if (!self.chat_controller.hasPending()) return changed;
 
@@ -3357,13 +4015,66 @@ pub fn backgroundTaskProcessIsAlive(pid: u32) bool {
 /// a restart handoff without flapping, short enough to end the eternal spinner.
 const DAEMON_CHAT_TAIL_FAIL_THRESHOLD: u8 = 16;
 
+/// One in-flight chat.turn.tail request. `response_buffer` is borrowed from
+/// chat_controller.State scratch — safe because the single worker slot keeps
+/// it (and the reusable connection) exclusive while the worker runs.
+pub const DaemonTailWorkerArgs = struct {
+    pref_path: []u8,
+    turn_id: []u8,
+    after_seq: u64,
+    started_at_ms: i64,
+    response_buffer: []u8,
+    response: ?[]u8 = null,
+    failed: bool = false,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn destroy(self: *DaemonTailWorkerArgs) void {
+        const page_alloc = std.heap.page_allocator;
+        page_alloc.free(self.pref_path);
+        page_alloc.free(self.turn_id);
+        if (self.response) |owned| page_alloc.free(owned);
+        page_alloc.destroy(self);
+    }
+};
+
+fn daemonTailWorkerMain(connection: *sessionizer.ReusableRequestConnection, args: *DaemonTailWorkerArgs) void {
+    const page_alloc = std.heap.page_allocator;
+    const response = connection.requestAllocUsingBuffer(
+        page_alloc,
+        args.pref_path,
+        "chat.turn.tail",
+        .{
+            .turn_id = args.turn_id,
+            .after_seq = args.after_seq,
+            .max_bytes = DAEMON_CHAT_TAIL_PAGE_BYTES,
+        },
+        2,
+        args.response_buffer,
+    ) catch |err| {
+        log.warn("failed to tail daemon chat turn: {s}", .{@errorName(err)});
+        args.failed = true;
+        args.done.store(true, .release);
+        return;
+    };
+    args.response = response;
+    args.done.store(true, .release);
+}
+
+/// Dispatch half of the tail poll: when this thread's turn is due and the
+/// single worker slot is free, hand the RPC to a worker so the render thread
+/// never blocks in daemon IPC. The measured-cost backoff still applies at
+/// service time as the fallback pacing for a slow daemon.
 pub fn pollDaemonChatTurn(self: anytype, thread: *ChatThread) bool {
+    const chat = &self.chat_controller;
+    // Single slot in flight: skip until the response is serviced in pollSend.
+    if (chat.daemon_tail_args != null) return false;
+
     const page_alloc = std.heap.page_allocator;
     const send_state = thread.send_state;
     const now_ms = monotonicMs();
     send_state.mutex.lock();
     const active = send_state.status == .pending and send_state.daemon_owned and send_state.daemon_turn_id != null;
-    const poll_due = active and daemonChatPollDue(send_state.daemon_last_poll_ms, now_ms);
+    const poll_due = active and daemonChatPollDue(send_state.daemon_last_poll_ms, now_ms, send_state.daemon_poll_backoff_ms);
     if (poll_due) send_state.daemon_last_poll_ms = now_ms;
     const turn_id = if (poll_due)
         page_alloc.dupe(u8, send_state.daemon_turn_id.?) catch null
@@ -3373,28 +4084,65 @@ pub fn pollDaemonChatTurn(self: anytype, thread: *ChatThread) bool {
     send_state.mutex.unlock();
 
     const owned_turn_id = turn_id orelse return false;
-    defer page_alloc.free(owned_turn_id);
 
-    const response_buffer = self.chat_controller.daemonTailResponseBuffer(self.allocator) catch |err| {
+    const response_buffer = chat.daemonTailResponseBuffer(self.allocator) catch |err| {
         log.warn("failed to allocate daemon chat tail buffer: {s}", .{@errorName(err)});
+        page_alloc.free(owned_turn_id);
         return false;
     };
-    const response = self.chat_controller.daemon_tail_connection.requestAllocUsingBuffer(
-        page_alloc,
-        self.storage.pref_path,
-        "chat.turn.tail",
-        .{
-            .turn_id = owned_turn_id,
-            .after_seq = after_seq,
-            .max_bytes = DAEMON_CHAT_TAIL_PAGE_BYTES,
-        },
-        2,
-        response_buffer,
-    ) catch |err| {
-        log.warn("failed to tail daemon chat turn: {s}", .{@errorName(err)});
-        return noteDaemonChatTailFailure(thread, "daemon chat turn is unavailable (daemon may have restarted mid-turn)");
+    const pref_path = page_alloc.dupe(u8, self.storage.pref_path) catch {
+        page_alloc.free(owned_turn_id);
+        return false;
     };
-    defer page_alloc.free(response);
+    const args = page_alloc.create(DaemonTailWorkerArgs) catch {
+        page_alloc.free(owned_turn_id);
+        page_alloc.free(pref_path);
+        return false;
+    };
+    args.* = .{
+        .pref_path = pref_path,
+        .turn_id = owned_turn_id,
+        .after_seq = after_seq,
+        .started_at_ms = now_ms,
+        .response_buffer = response_buffer,
+    };
+    chat.daemon_tail_args = args;
+    chat.daemon_tail_worker = std.Thread.spawn(.{}, daemonTailWorkerMain, .{ &chat.daemon_tail_connection, args }) catch |err| {
+        log.warn("failed to spawn daemon chat tail worker: {s}", .{@errorName(err)});
+        chat.daemon_tail_args = null;
+        args.destroy();
+        return false;
+    };
+    return false;
+}
+
+/// Service half of the tail poll (main thread, from pollSend): joins a
+/// finished worker, applies pacing from the measured round trip, and commits
+/// the response to whichever thread still owns the tailed turn.
+pub fn serviceDaemonChatTailWorker(self: anytype) bool {
+    const chat = &self.chat_controller;
+    const args = chat.daemon_tail_args orelse return false;
+    if (!args.done.load(.acquire)) return false;
+    if (chat.daemon_tail_worker) |worker| worker.join();
+    chat.daemon_tail_worker = null;
+    chat.daemon_tail_args = null;
+    defer args.destroy();
+
+    const thread = threadByDaemonTurnId(self, args.turn_id) orelse return false;
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    const still_active = send_state.status == .pending and send_state.daemon_owned;
+    // Fallback pacing (success or failure): the next poll waits at least
+    // FACTOR× the measured round trip so a slow daemon is tailed at spaced
+    // intervals instead of every frame.
+    send_state.daemon_poll_backoff_ms = daemonChatPollBackoffMs(monotonicMs() - args.started_at_ms);
+    send_state.mutex.unlock();
+    if (!still_active) return false;
+
+    if (args.failed) {
+        return noteDaemonChatTailFailure(thread, "daemon chat turn is unavailable (daemon may have restarted mid-turn)");
+    }
+    const response = args.response orelse return false;
 
     // JSON-RPC not_found (turn gone after restart / interrupted sweep with no
     // live memory) — surface immediately rather than spinning.
@@ -3412,6 +4160,21 @@ pub fn pollDaemonChatTurn(self: anytype, thread: *ChatThread) bool {
         send_state.mutex.unlock();
     }
     return applied;
+}
+
+/// Resolves the live thread that owns a daemon turn id; the worker's target
+/// may have been reset or deleted while the RPC was in flight.
+fn threadByDaemonTurnId(self: anytype, turn_id: []const u8) ?*ChatThread {
+    for (self.project_controller.projects.items) |*project| {
+        for (project.threads.items) |*thread| {
+            const send_state = thread.send_state;
+            send_state.mutex.lock();
+            defer send_state.mutex.unlock();
+            const current = send_state.daemon_turn_id orelse continue;
+            if (std.mem.eql(u8, current, turn_id)) return thread;
+        }
+    }
+    return null;
 }
 
 fn daemonTailResponseIsNotFound(response: []const u8) bool {
@@ -3440,15 +4203,40 @@ fn noteDaemonChatTailFailure(thread: *ChatThread, message: []const u8) bool {
     return true;
 }
 
-fn daemonChatPollDue(last_poll_ms: i64, now_ms: i64) bool {
-    return last_poll_ms < 0 or now_ms < last_poll_ms or now_ms - last_poll_ms >= DAEMON_CHAT_POLL_INTERVAL_MS;
+fn daemonChatPollDue(last_poll_ms: i64, now_ms: i64, backoff_ms: i64) bool {
+    return last_poll_ms < 0 or now_ms < last_poll_ms or
+        now_ms - last_poll_ms >= DAEMON_CHAT_POLL_INTERVAL_MS + backoff_ms;
+}
+
+/// Extra wait before the next tail poll so the render thread spends at most
+/// ~1/FACTOR of its time blocked in daemon IPC: the next poll starts no
+/// sooner than FACTOR× the measured round trip. Fast responses (≤ interval /
+/// factor) keep the plain 16ms cadence; the cap keeps a flapping daemon
+/// polled about once a second.
+fn daemonChatPollBackoffMs(elapsed_ms: i64) i64 {
+    const budget_ms = elapsed_ms * DAEMON_CHAT_POLL_BUDGET_FACTOR - DAEMON_CHAT_POLL_INTERVAL_MS;
+    return std.math.clamp(budget_ms, 0, DAEMON_CHAT_POLL_BACKOFF_MAX_MS);
 }
 
 test "daemon chat tail polling keeps the active display cadence" {
-    try std.testing.expect(daemonChatPollDue(-1, 100));
-    try std.testing.expect(!daemonChatPollDue(100, 115));
-    try std.testing.expect(daemonChatPollDue(100, 116));
-    try std.testing.expect(daemonChatPollDue(100, 10));
+    try std.testing.expect(daemonChatPollDue(-1, 100, 0));
+    try std.testing.expect(!daemonChatPollDue(100, 115, 0));
+    try std.testing.expect(daemonChatPollDue(100, 116, 0));
+    try std.testing.expect(daemonChatPollDue(100, 10, 0));
+    // A measured-cost backoff extends the interval; clock rollback still polls.
+    try std.testing.expect(!daemonChatPollDue(100, 259, 144));
+    try std.testing.expect(daemonChatPollDue(100, 260, 144));
+}
+
+test "daemon chat tail backoff bounds the render-thread stall duty cycle" {
+    // A fast daemon (≤4ms round trip) keeps the unmodified 16ms cadence.
+    try std.testing.expectEqual(@as(i64, 0), daemonChatPollBackoffMs(0));
+    try std.testing.expectEqual(@as(i64, 0), daemonChatPollBackoffMs(4));
+    // A 40ms stall (observed "slowest=poll send elapsed_ms=35-41") defers the
+    // next poll to 160ms after the last start: ≤25% of frames can stall.
+    try std.testing.expectEqual(@as(i64, 144), daemonChatPollBackoffMs(40));
+    // A flapping daemon (connect timeouts) is still tailed about once a second.
+    try std.testing.expectEqual(DAEMON_CHAT_POLL_BACKOFF_MAX_MS, daemonChatPollBackoffMs(500));
 }
 
 test "daemon tail hydrates the missing user row for externally started turns" {
@@ -3751,11 +4539,17 @@ pub fn parseToolCallStatus(value: []const u8) ai_harness.ToolCallStatus {
 pub fn pollThreadSend(self: anytype, project_index: usize, thread_index: usize, thread: *ChatThread) bool {
     thread.send_state.mutex.lock();
     const command_pending = thread.send_state.local_command;
+    // While the async chat.turn.start receipt is in flight (7.5) the daemon
+    // turn may not exist yet: defer tailing (which would count not-found
+    // failures toward the tail-fail threshold) and steer/stop issuance until
+    // the acceptance commits. The working-seconds repaint below still runs.
+    const acceptance_pending = thread.send_state.acceptance_pending;
     thread.send_state.mutex.unlock();
-    const daemon_changed = if (command_pending) false else self.pollDaemonChatTurn(thread);
-    if (!command_pending) {
+    const rpc_gated = command_pending or acceptance_pending;
+    const daemon_changed = if (rpc_gated) false else self.pollDaemonChatTurn(thread);
+    if (!rpc_gated) {
         self.capturePendingProviderThreadId(thread);
-        self.issuePendingCodexSteer(project_index, thread_index, thread);
+        self.issuePendingProviderSteer(project_index, thread_index, thread);
         self.issuePendingThreadStop(project_index, self.project_controller.projects.items[project_index].path, thread);
     }
 
@@ -4549,6 +5343,7 @@ fn adoptionRefreshTurnMatch(
             workspace_id,
             local_thread_id,
             before_offset,
+            db_client.TRANSCRIPT_MESSAGE_PAGE_SIZE,
         ) catch return .missing;
         pages[page_count] = page;
         page_count += 1;
@@ -4902,6 +5697,7 @@ test "adoption refresh veto count survives clear/re-mint and stays terminal" {
             _: std.mem.Allocator,
             _: []const u8,
             _: []const u8,
+            _: usize,
             _: usize,
         ) !db_types.LoadedMessagePage {
             return error.UnexpectedMessagePageLoad;
@@ -5385,16 +6181,18 @@ fn nonDaemonStopIdentityMatches(
         std.mem.eql(u8, current_thread_id.?, thread_id) and same_turn;
 }
 
-pub fn issuePendingCodexSteer(
+pub fn issuePendingProviderSteer(
     self: anytype,
     project_index: usize,
     thread_index: usize,
     thread: *ChatThread,
 ) void {
-    if (thread.provider != .codex) return;
+    const provider = thread.provider;
+    if (provider != .codex and provider != .claude) return;
 
     var thread_id: ?[]u8 = null;
     var turn_id: ?[]u8 = null;
+    var daemon_turn_id: ?[]u8 = null;
     var prompt: ?[]u8 = null;
     var images: std.ArrayList(ChatImageAttachment) = .empty;
     defer {
@@ -5404,7 +6202,7 @@ pub fn issuePendingCodexSteer(
 
     const send_state = thread.send_state;
     if (!send_state.mutex.tryLock()) return;
-    if (pendingCodexSteerCanSignal(send_state)) {
+    if (pendingProviderSteerCanSignal(send_state)) {
         const pending_thread_id: ?[]const u8 = if (thread.provider_thread_id) |existing|
             existing
         else if (send_state.provisional_provider_thread_id) |provisional|
@@ -5412,16 +6210,27 @@ pub fn issuePendingCodexSteer(
         else
             null;
         if (pending_thread_id) |resolved_thread_id| {
-            if (send_state.active_turn_id) |active_turn_id| {
+            const resolved_turn_id: ?[]const u8 = switch (provider) {
+                .codex => send_state.active_turn_id,
+                .claude => if (send_state.active_turn_id) |active| active else "",
+                .opencode, .cursor => null,
+            };
+            if (resolved_turn_id) |active_turn_id| {
                 thread_id = self.allocator.dupe(u8, resolved_thread_id) catch null;
                 turn_id = self.allocator.dupe(u8, active_turn_id) catch null;
+                if (provider == .claude and send_state.daemon_owned) {
+                    if (send_state.daemon_turn_id) |daemon_id| {
+                        daemon_turn_id = self.allocator.dupe(u8, daemon_id) catch null;
+                    }
+                }
                 prompt = self.allocator.dupe(u8, send_state.pending_followup.?.prompt) catch null;
                 copyFollowupImages(
                     self.allocator,
                     &images,
                     send_state.pending_followup.?.images.items,
                 ) catch {};
-                send_state.pending_followup_signal_sent = thread_id != null and turn_id != null and prompt != null and
+                const daemon_identity_ready = provider != .claude or !send_state.daemon_owned or daemon_turn_id != null;
+                send_state.pending_followup_signal_sent = thread_id != null and turn_id != null and prompt != null and daemon_identity_ready and
                     images.items.len == send_state.pending_followup.?.images.items.len;
                 if (!send_state.pending_followup_signal_sent) {
                     if (thread_id) |owned_thread_id| {
@@ -5435,6 +6244,10 @@ pub fn issuePendingCodexSteer(
                     if (prompt) |owned_prompt| {
                         self.allocator.free(owned_prompt);
                         prompt = null;
+                    }
+                    if (daemon_turn_id) |owned_daemon_turn_id| {
+                        self.allocator.free(owned_daemon_turn_id);
+                        daemon_turn_id = null;
                     }
                 }
             }
@@ -5455,22 +6268,35 @@ pub fn issuePendingCodexSteer(
     defer self.allocator.free(owned_thread_id);
     defer self.allocator.free(owned_turn_id);
     defer self.allocator.free(owned_prompt);
+    defer if (daemon_turn_id) |owned_daemon_turn_id| self.allocator.free(owned_daemon_turn_id);
 
-    const execution_target = self.providerExecutionTargetForProjectThread(project_index, thread, images.items.len) orelse return;
-
-    self.steerThreadViaHarness(execution_target, owned_thread_id, owned_turn_id, owned_prompt, images.items) catch |err| {
+    var steer_failure: ?anyerror = null;
+    if (provider == .claude and daemon_turn_id != null) {
+        self.steerDaemonChatTurn(daemon_turn_id.?, owned_prompt, images.items) catch |err| {
+            steer_failure = err;
+        };
+    } else if (self.providerExecutionTargetForProjectThread(project_index, thread, images.items.len)) |execution_target| {
+        self.steerThreadViaHarness(execution_target, provider, owned_thread_id, owned_turn_id, owned_prompt, images.items) catch |err| {
+            steer_failure = err;
+        };
+    } else {
+        steer_failure = error.UnsupportedExecutionTarget;
+    }
+    if (steer_failure) |err| {
         send_state.mutex.lock();
         defer send_state.mutex.unlock();
         if (send_state.pending_followup) |*pending_followup| {
             pending_followup.state = .fallback_next_turn;
         }
         send_state.pending_followup_signal_sent = false;
-        self.setSidebarNotice(switch (err) {
+        self.setSidebarNotice(if (provider == .claude)
+            "Claude could not steer this turn. It will send after the current reply finishes."
+        else switch (err) {
             error.CodexActiveTurnNotSteerable => "Codex could not steer this turn. It will send after the current reply finishes.",
             else => "Failed to send Codex steer. It will send after the current reply finishes.",
         });
         return;
-    };
+    }
 
     send_state.mutex.lock();
     if (send_state.pending_followup) |*pending_followup| {
@@ -5490,7 +6316,10 @@ pub fn issuePendingCodexSteer(
             copyFollowupImages(std.heap.page_allocator, &event.images, images.items) catch {
                 event.deinit(std.heap.page_allocator);
                 send_state.mutex.unlock();
-                self.setSidebarNotice("Codex steer sent, but Verde could not display its attachments.");
+                self.setSidebarNotice(if (provider == .claude)
+                    "Claude steer sent, but Verde could not display its attachments."
+                else
+                    "Codex steer sent, but Verde could not display its attachments.");
                 return;
             };
             send_state.pending_events.append(std.heap.page_allocator, event) catch {
@@ -5504,19 +6333,23 @@ pub fn issuePendingCodexSteer(
     if (project_index == self.project_controller.selected_index and thread_index == self.currentProject().selected_thread_index) {
         self.requestTranscriptScrollToBottom();
     }
-    self.setSidebarNotice("Codex steer sent. Waiting for the current turn to update.");
+    self.setSidebarNotice(if (provider == .claude)
+        "Claude steer sent. Waiting for the current turn to update."
+    else
+        "Codex steer sent. Waiting for the current turn to update.");
 }
 
-fn pendingCodexSteerCanSignal(send_state: *const SendState) bool {
+fn pendingProviderSteerCanSignal(send_state: *const SendState) bool {
     const followup = send_state.pending_followup orelse return false;
     return send_state.status == .pending and
         !send_state.stop_requested and
+        send_state.pending_approval == null and
         followup.kind == .steer and
         followup.state == .pending and
         !send_state.pending_followup_signal_sent;
 }
 
-test "Codex steer polling stops after fallback to next turn" {
+test "provider steer polling stops after fallback to next turn or approval wait" {
     const allocator = std.testing.allocator;
     var send_state: SendState = .{
         .status = .pending,
@@ -5527,11 +6360,18 @@ test "Codex steer polling stops after fallback to next turn" {
     };
     defer freePendingFollowup(allocator, &send_state.pending_followup);
 
-    try std.testing.expect(pendingCodexSteerCanSignal(&send_state));
+    try std.testing.expect(pendingProviderSteerCanSignal(&send_state));
+    send_state.pending_approval = .{
+        .call_id = try allocator.dupe(u8, "call"),
+        .title = try allocator.dupe(u8, "Approval"),
+        .body = try allocator.dupe(u8, "Wait"),
+    };
+    try std.testing.expect(!pendingProviderSteerCanSignal(&send_state));
+    chat_types.freePendingApproval(allocator, &send_state.pending_approval);
     send_state.pending_followup.?.state = .fallback_next_turn;
-    try std.testing.expect(!pendingCodexSteerCanSignal(&send_state));
+    try std.testing.expect(!pendingProviderSteerCanSignal(&send_state));
     send_state.pending_followup.?.state = .sent_inline;
-    try std.testing.expect(!pendingCodexSteerCanSignal(&send_state));
+    try std.testing.expect(!pendingProviderSteerCanSignal(&send_state));
 }
 
 pub fn dispatchPendingFollowup(self: anytype, project_index: usize, thread_index: usize, thread: *ChatThread) void {
@@ -5548,7 +6388,7 @@ pub fn dispatchPendingFollowup(self: anytype, project_index: usize, thread_index
     defer followup.deinit(self.allocator);
 
     if (followup.kind == .steer and followup.state == .sent_inline) {
-        self.setSidebarNotice("Codex steer applied.");
+        self.setSidebarNotice(if (thread.provider == .claude) "Claude steer applied." else "Codex steer applied.");
         return;
     }
 
@@ -5571,7 +6411,10 @@ pub fn dispatchPendingFollowup(self: anytype, project_index: usize, thread_index
     }
     self.setSidebarNotice(switch (followup.kind) {
         .queue => "Queued message sent.",
-        .steer => "Codex follow-up sent as a new turn.",
+        .steer => if (thread.provider == .claude)
+            "Claude follow-up sent as a new turn."
+        else
+            "Codex follow-up sent as a new turn.",
     });
 }
 
@@ -5797,6 +6640,53 @@ pub fn pendingApprovalSnapshot(self: anytype) !?PendingApproval {
     };
 }
 
+/// Render-thread view of the pending approval, cached like
+/// `pendingFollowupSnapshotCached`. Approval content changes always bump the
+/// send-state ui_revision (daemon tail apply, local worker), so identity +
+/// revision + presence fully key the copy.
+pub fn pendingApprovalSnapshotCached(self: anytype) ?*const PendingApproval {
+    if (self.project_controller.projects.items.len == 0) return null;
+    const send_state = self.currentThread().send_state;
+    const cache = &self.pending_ui_snapshot_cache;
+    const identity: usize = @intFromPtr(send_state);
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+
+    const revision = send_state.ui_revision;
+    const present = send_state.status == .pending and send_state.pending_approval != null;
+    const fresh = cache.approval_valid and
+        cache.approval_send_state == identity and
+        cache.approval_revision == revision and
+        (cache.approval != null) == present;
+    if (!fresh) {
+        if (cache.approval) |*existing| {
+            self.allocator.free(existing.call_id);
+            self.allocator.free(existing.title);
+            self.allocator.free(existing.body);
+        }
+        cache.approval = null;
+        cache.approval_valid = false;
+        if (present) {
+            const approval = send_state.pending_approval.?;
+            const call_id = self.allocator.dupe(u8, approval.call_id) catch return null;
+            const title = self.allocator.dupe(u8, approval.title) catch {
+                self.allocator.free(call_id);
+                return null;
+            };
+            const body = self.allocator.dupe(u8, approval.body) catch {
+                self.allocator.free(call_id);
+                self.allocator.free(title);
+                return null;
+            };
+            cache.approval = .{ .call_id = call_id, .title = title, .body = body };
+        }
+        cache.approval_send_state = identity;
+        cache.approval_revision = revision;
+        cache.approval_valid = true;
+    }
+    return if (cache.approval) |*value| value else null;
+}
+
 pub fn resolvePendingApproval(self: anytype, decision: ai_harness.ApprovalDecision) void {
     if (self.project_controller.projects.items.len == 0) return;
     _ = resolveThreadPendingApproval(self, self.currentThreadMutable(), decision);
@@ -5946,6 +6836,7 @@ fn appendPendingTimelineEvent(self: anytype, thread: *ChatThread, event: Pending
     const extra_images: []const ChatImageAttachment = if (event.images.items.len > 1) event.images.items[1..] else &.{};
     try self.appendMessageToThread(thread, event.role, event.author, event.body, first_image, extra_images);
     const message = &thread.messages.items[thread.messages.items.len - 1];
+    message.transcript_card_started_ms = event.transcript_card_started_ms;
     message.tool_call_id = owned_tool_call_id;
     message.tool_call_kind = event.tool_call_kind;
     message.tool_call_status = event.tool_call_status;

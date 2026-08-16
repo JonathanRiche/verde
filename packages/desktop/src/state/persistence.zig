@@ -471,6 +471,7 @@ fn threadSnapshotWithBodies(
         .tui_dock_id = thread.tui_dock_id,
         .draft = try allocator.dupe(u8, thread.currentDraft()),
         .draft_image = try imageSnapshot(allocator, thread.draft_image),
+        .draft_extra_images = try imageListSnapshot(allocator, thread.draft_extra_images.items),
         .message_offset = thread.persisted_message_offset,
         .messages = try messages.toOwnedSlice(allocator),
     };
@@ -486,6 +487,7 @@ fn persistedMessageSnapshot(
         .author = try allocator.dupe(u8, message.author),
         .body = captured_body orelse try allocator.dupe(u8, message.body),
         .image = try imageSnapshot(allocator, message.image),
+        .extra_images = try imageListSnapshot(allocator, message.extra_images),
         .tool_call_id = try dupeOptionalSlice(allocator, message.tool_call_id),
         .tool_call_kind = message.tool_call_kind,
         .tool_call_status = message.tool_call_status,
@@ -502,6 +504,36 @@ fn imageSnapshot(allocator: std.mem.Allocator, image: ?ChatImageAttachment) !?Pe
         .mime = try allocator.dupe(u8, source.mime),
         .byte_size = source.byte_size,
     };
+}
+
+pub fn chatImageListFromPersisted(
+    allocator: std.mem.Allocator,
+    images: []const PersistedImageAttachment,
+) ![]ChatImageAttachment {
+    if (images.len == 0) return &.{};
+    const out = try allocator.alloc(ChatImageAttachment, images.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |*image| image.deinit(allocator);
+        allocator.free(out);
+    }
+    for (images) |image| {
+        out[built] = try ChatImageAttachment.init(allocator, image.path, image.mime, image.byte_size);
+        built += 1;
+    }
+    return out;
+}
+
+fn imageListSnapshot(
+    allocator: std.mem.Allocator,
+    images: []const ChatImageAttachment,
+) ![]const PersistedImageAttachment {
+    if (images.len == 0) return &.{};
+    const out = try allocator.alloc(PersistedImageAttachment, images.len);
+    for (images, 0..) |image, index| {
+        out[index] = (try imageSnapshot(allocator, image)).?;
+    }
+    return out;
 }
 
 fn dupeOptionalSlice(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
@@ -636,9 +668,26 @@ fn threadToProtocol(allocator: std.mem.Allocator, thread: PersistedThread, index
         .tui_dock_id = thread.tui_dock_id,
         .draft = try allocator.dupe(u8, thread.draft),
         .draft_image = if (thread.draft_image) |img| try imageToProtocol(allocator, img) else null,
+        .draft_images = try imageListToProtocol(allocator, thread.draft_image, thread.draft_extra_images),
         .message_offset = thread.message_offset,
         .messages = try messagesToProtocol(allocator, thread.messages, thread.message_offset),
     };
+}
+
+/// Build the wire full-list attachment shape ([primary] ++ extras). Empty
+/// when there is no primary — extras cannot exist without one.
+fn imageListToProtocol(
+    allocator: std.mem.Allocator,
+    primary: ?PersistedImageAttachment,
+    extras: []const PersistedImageAttachment,
+) ![]const headless.store.Attachment {
+    const first = primary orelse return &.{};
+    const out = try allocator.alloc(headless.store.Attachment, 1 + extras.len);
+    out[0] = try imageToProtocol(allocator, first);
+    for (extras, 0..) |extra, index| {
+        out[index + 1] = try imageToProtocol(allocator, extra);
+    }
+    return out;
 }
 
 fn messagesToProtocol(
@@ -664,6 +713,7 @@ fn messagesToProtocol(
             .author = try allocator.dupe(u8, message.author),
             .body = try allocator.dupe(u8, message.body),
             .image = if (message.image) |img| try imageToProtocol(allocator, img) else null,
+            .images = try imageListToProtocol(allocator, message.image, message.extra_images),
             .tool_call_id = try dupeOptionalSlice(allocator, message.tool_call_id),
             .tool_call_kind = if (message.tool_call_kind) |v| try allocator.dupe(u8, @tagName(v)) else null,
             .tool_call_status = if (message.tool_call_status) |v| try allocator.dupe(u8, @tagName(v)) else null,
@@ -786,6 +836,9 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
                 thread.setDraft(persisted_thread.draft);
                 if (persisted_thread.draft_image) |image| {
                     try thread.setDraftImage(self.allocator, image.path, image.mime, image.byte_size);
+                    for (persisted_thread.draft_extra_images) |extra| {
+                        try thread.addDraftImage(self.allocator, extra.path, extra.mime, extra.byte_size);
+                    }
                 }
                 for (persisted_thread.messages) |message| {
                     try thread.messages.append(self.allocator, .{
@@ -796,6 +849,7 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
                             try ChatImageAttachment.init(self.allocator, image.path, image.mime, image.byte_size)
                         else
                             null,
+                        .extra_images = try chatImageListFromPersisted(self.allocator, message.extra_images),
                         .tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id),
                         .tool_call_kind = message.tool_call_kind,
                         .tool_call_status = message.tool_call_status,
@@ -837,6 +891,7 @@ pub fn applyPersisted(self: anytype, persisted: PersistedState) !void {
                         try ChatImageAttachment.init(self.allocator, image.path, image.mime, image.byte_size)
                     else
                         null,
+                    .extra_images = try chatImageListFromPersisted(self.allocator, message.extra_images),
                     .tool_call_id = try dupeOptionalSlice(self.allocator, message.tool_call_id),
                     .tool_call_kind = message.tool_call_kind,
                     .tool_call_status = message.tool_call_status,
@@ -1007,6 +1062,18 @@ fn cloneImage(allocator: std.mem.Allocator, value: ?PersistedImageAttachment) !?
     };
 }
 
+fn cloneImageList(
+    allocator: std.mem.Allocator,
+    images: []const PersistedImageAttachment,
+) ![]const PersistedImageAttachment {
+    if (images.len == 0) return &.{};
+    const cloned = try allocator.alloc(PersistedImageAttachment, images.len);
+    for (images, 0..) |image, index| {
+        cloned[index] = (try cloneImage(allocator, image)).?;
+    }
+    return cloned;
+}
+
 fn cloneMessages(allocator: std.mem.Allocator, messages: []const PersistedMessage) ![]const PersistedMessage {
     const cloned = try allocator.alloc(PersistedMessage, messages.len);
     for (messages, 0..) |message, index| {
@@ -1015,6 +1082,7 @@ fn cloneMessages(allocator: std.mem.Allocator, messages: []const PersistedMessag
             .author = try allocator.dupe(u8, message.author),
             .body = try allocator.dupe(u8, message.body),
             .image = try cloneImage(allocator, message.image),
+            .extra_images = try cloneImageList(allocator, message.extra_images),
             .tool_call_id = try cloneOptionalSlice(allocator, message.tool_call_id),
             .tool_call_kind = message.tool_call_kind,
             .tool_call_status = message.tool_call_status,
@@ -1049,6 +1117,7 @@ fn cloneThreads(
             .tui_dock_id = thread.tui_dock_id,
             .draft = try allocator.dupe(u8, thread.draft),
             .draft_image = try cloneImage(allocator, thread.draft_image),
+            .draft_extra_images = try cloneImageList(allocator, thread.draft_extra_images),
             .message_offset = if (include_messages)
                 thread.message_offset
             else

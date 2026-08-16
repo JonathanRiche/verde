@@ -2387,6 +2387,7 @@ test "structured tool-call updates upsert and merge lifecycle content" {
         .input = "{\"path\":\"/tmp/a.txt\"}",
         .raw = "{\"status\":\"in_progress\"}",
     });
+    events.items[0].transcript_card_started_ms = 123;
     try upsertPendingToolCallEvent(std.testing.allocator, &events, .{
         .call_id = "call-1",
         .title = "",
@@ -2400,6 +2401,7 @@ test "structured tool-call updates upsert and merge lifecycle content" {
     const event = events.items[0];
     try std.testing.expectEqualStrings("call-1", event.tool_call_id.?);
     try std.testing.expectEqual(ai_harness.ToolCallStatus.completed, event.tool_call_status.?);
+    try std.testing.expectEqual(@as(i64, 123), event.transcript_card_started_ms);
     try std.testing.expectEqualStrings("Edit", event.author);
     try std.testing.expect(std.mem.indexOf(u8, event.body, "Edit `/tmp/a.txt`") != null);
     try std.testing.expect(std.mem.indexOf(u8, event.body, "{\"path\":\"/tmp/a.txt\"}") != null);

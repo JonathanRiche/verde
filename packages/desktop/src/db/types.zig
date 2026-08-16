@@ -174,6 +174,9 @@ pub const PersistedMessage = struct {
     author: []const u8,
     body: []const u8,
     image: ?PersistedImageAttachment = null,
+    /// Attachments past the primary `image`. Additive (defaults empty) so
+    /// legacy persisted states without the field decode cleanly.
+    extra_images: []const PersistedImageAttachment = &.{},
     tool_call_id: ?[]const u8 = null,
     tool_call_kind: ?ai_harness.ToolCallKind = null,
     tool_call_status: ?ai_harness.ToolCallStatus = null,
@@ -202,6 +205,9 @@ pub const PersistedThread = struct {
     tui_dock_id: ?u32 = null,
     draft: []const u8 = "",
     draft_image: ?PersistedImageAttachment = null,
+    /// Composer attachments past the primary `draft_image`. Additive
+    /// (defaults empty) so legacy persisted states decode cleanly.
+    draft_extra_images: []const PersistedImageAttachment = &.{},
     /// Durable sort-index boundary before the bounded `messages` tail.
     message_offset: usize = 0,
     messages: []const PersistedMessage = &.{},

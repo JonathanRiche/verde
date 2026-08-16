@@ -391,33 +391,33 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
     return try okValueResponse(allocator, id_value, .{
         .protocol_version = PROTOCOL_VERSION,
         .commands = &.{
-            "status",                              "capabilities",                         "workspaces",                         "panes",
-            "active",                              "inspect",                              "threads",                            "terminals",
-            "herdr.open",                          "herdr.handoff",                        "herdr.unlink",                       "herdr.status",
-            "surfaces",                            "surface.list",                         "surface.inspect",                    "surface.focus",
-            "surface.clearAttention",              "notification.create",                  "notification.update",                "notification.clear",
-            "processes",                           "workspace.select",                     "workspace.create",                   "workspace.rename",
-            "workspace.close",                     "workspace.reopen",                     "workspace.archive",                  "pane.focus",
-            "pane.split",                          "pane.resize",                          "pane.move",                          "pane.maximize",
-            "pane.close",                          "chat.open",                            "chat.open.validate",                 "chat.present",
-            "chat.status",                         "chat.transcript",                      "chat.draft.set",                     "chat.draft.append",
-            "chat.send",                           "chat.followup",                        "chat.stop",                          "chat.approve",
-            "browser.open",                        "browser.navigate",                     "browser.status",                     "browser.close",
-            "browser.toggle",                      "browser.back",                         "browser.forward",                    "browser.reload",
-            "browser.focus",                       "browser.blur",                         "browser.restart",                    "browser.reset",
-            "browser.pointerDown",                 "browser.pointerMove",                  "browser.pointerUp",                  "browser.toolbarHit",
-            "browser.selectAllFocused",            "browser.copyFocused",                  "browser.pasteTextFocused",           "browser.eval",
-            "browser.postJson",                    "browser.screenshot",                   "browser.inspector.enable",           "browser.inspector.disable",
-            "browser.inspector.toggle",            "browser.inspector.mode",               "browser.inspector.menuOpen",         "browser.inspector.menuClose",
-            "browser.overlay.workspaceMenuOpen",   "browser.overlay.workspaceMenuClose",   "browser.overlay.sidebarMenuOpen",    "browser.overlay.sidebarMenuClose",
-            "browser.overlay.composerMenuOpen",    "browser.overlay.composerMenuClose",    "browser.overlay.workspaceModalOpen", "browser.overlay.workspaceModalClose",
-            "browser.overlay.threadModalOpen",     "browser.overlay.threadModalClose",     "browser.overlay.imageModalOpen",     "browser.overlay.imageModalClose",
-            "browser.overlay.transcriptModalOpen", "browser.overlay.transcriptModalClose", "palette.list",                       "palette.run",
-            "terminal.write",                      "terminal.key",                         "terminal.tail",                      "terminal.screen",
-            "process.list",                        "process.inspect",                      "process.start",                      "process.stop",
-            "process.restart",                     "process.logs",                         "agent.open",                         "stack.status",
-            "stack.start",                         "stack.stop",                           "stack.restart",                      "workspace.processes",
-            "workspace.checkCommand",              "workspace.acquireLease",               "workspace.releaseLease",
+            "status",                              "capabilities",                        "workspaces",                           "panes",
+            "active",                              "inspect",                             "threads",                              "terminals",
+            "herdr.open",                          "herdr.handoff",                       "herdr.unlink",                         "herdr.status",
+            "surfaces",                            "surface.list",                        "surface.inspect",                      "surface.focus",
+            "surface.clearAttention",              "notification.create",                 "notification.update",                  "notification.clear",
+            "processes",                           "workspace.select",                    "workspace.create",                     "workspace.rename",
+            "workspace.close",                     "workspace.reopen",                    "workspace.archive",                    "pane.focus",
+            "pane.split",                          "pane.resize",                         "pane.move",                            "pane.maximize",
+            "pane.close",                          "chat.open",                           "chat.open.validate",                   "chat.present",
+            "chat.status",                         "chat.transcript",                     "chat.draft.get",                       "chat.draft.set",
+            "chat.draft.append",                   "chat.send",                           "chat.followup",                        "chat.stop",
+            "chat.approve",                        "browser.open",                        "browser.navigate",                     "browser.status",
+            "browser.close",                       "browser.toggle",                      "browser.back",                         "browser.forward",
+            "browser.reload",                      "browser.focus",                       "browser.blur",                         "browser.restart",
+            "browser.reset",                       "browser.pointerDown",                 "browser.pointerMove",                  "browser.pointerUp",
+            "browser.toolbarHit",                  "browser.selectAllFocused",            "browser.copyFocused",                  "browser.pasteTextFocused",
+            "browser.eval",                        "browser.postJson",                    "browser.screenshot",                   "browser.inspector.enable",
+            "browser.inspector.disable",           "browser.inspector.toggle",            "browser.inspector.mode",               "browser.inspector.menuOpen",
+            "browser.inspector.menuClose",         "browser.overlay.workspaceMenuOpen",   "browser.overlay.workspaceMenuClose",   "browser.overlay.sidebarMenuOpen",
+            "browser.overlay.sidebarMenuClose",    "browser.overlay.composerMenuOpen",    "browser.overlay.composerMenuClose",    "browser.overlay.workspaceModalOpen",
+            "browser.overlay.workspaceModalClose", "browser.overlay.threadModalOpen",     "browser.overlay.threadModalClose",     "browser.overlay.imageModalOpen",
+            "browser.overlay.imageModalClose",     "browser.overlay.transcriptModalOpen", "browser.overlay.transcriptModalClose", "palette.list",
+            "palette.run",                         "terminal.write",                      "terminal.key",                         "terminal.tail",
+            "terminal.screen",                     "process.list",                        "process.inspect",                      "process.start",
+            "process.stop",                        "process.restart",                     "process.logs",                         "agent.open",
+            "stack.status",                        "stack.start",                         "stack.stop",                           "stack.restart",
+            "workspace.processes",                 "workspace.checkCommand",              "workspace.acquireLease",               "workspace.releaseLease",
         },
         .events = &.{},
         .encodings = &.{"json"},
@@ -959,7 +959,23 @@ fn paneCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
             return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid pane direction");
         changed = state.moveWorkspacePaneInDirection(target.project_index, target.pane_id, direction);
     } else if (std.mem.eql(u8, command, "maximize")) {
-        changed = state.maximizeWorkspacePane(target.project_index, target.pane_id);
+        const mode = parsePaneMaximizeMode(stringParam(params, "mode") orelse "toggle") orelse
+            return try errorResponseAlloc(allocator, id_value, "invalid_request", "pane.maximize mode must be on, off, or toggle");
+        const layout = &state.project_controller.projects.items[target.project_index].workspace_layout;
+        const was_maximized = layout.maximized_pane_id == target.pane_id;
+        const desired = switch (mode) {
+            .on => true,
+            .off => false,
+            .toggle => !was_maximized,
+        };
+        if (desired != was_maximized) {
+            changed = if (desired)
+                state.maximizeWorkspacePane(target.project_index, target.pane_id)
+            else
+                state.clearWorkspacePaneMaximized(target.project_index);
+            if (!changed) return try errorResponseAlloc(allocator, id_value, "rejected", "pane maximize operation did not apply");
+        }
+        return try paneMaximizeResponse(allocator, id_value, state, target, mode, desired != was_maximized);
     } else if (std.mem.eql(u8, command, "close")) {
         changed = state.closeWorkspacePane(target.project_index, target.pane_id);
     } else {
@@ -968,6 +984,31 @@ fn paneCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
 
     if (!changed) return try errorResponseAlloc(allocator, id_value, "rejected", "pane operation did not apply");
     return try panesResponseForProject(allocator, id_value, state, target.project_index);
+}
+
+const PaneMaximizeMode = enum { on, off, toggle };
+
+fn parsePaneMaximizeMode(value: []const u8) ?PaneMaximizeMode {
+    return std.meta.stringToEnum(PaneMaximizeMode, value);
+}
+
+fn paneMaximizeResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    state: *app_state.AppState,
+    target: PaneTarget,
+    mode: PaneMaximizeMode,
+    changed: bool,
+) ![]u8 {
+    const maximized_pane_id = state.project_controller.projects.items[target.project_index].workspace_layout.maximized_pane_id;
+    return try okValueResponse(allocator, id_value, .{
+        .workspace_index = target.project_index,
+        .pane_id = target.pane_id,
+        .mode = @tagName(mode),
+        .changed = changed,
+        .maximized = maximized_pane_id == target.pane_id,
+        .maximized_pane_id = maximized_pane_id,
+    });
 }
 
 fn chatCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
@@ -981,13 +1022,18 @@ fn chatCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
 
     if (std.mem.eql(u8, command, "status")) return try chatStatusResponse(allocator, id_value, state, target.project_index, target.pane_id);
     if (std.mem.eql(u8, command, "transcript")) return try chatTranscriptResponse(allocator, id_value, state, target.project_index, target.pane_id);
+    if (std.mem.eql(u8, command, "draft.get")) return try chatStatusResponse(allocator, id_value, state, target.project_index, target.pane_id);
 
     var accepted = false;
     if (std.mem.eql(u8, command, "draft.set")) {
         const text = stringParam(params, "text") orelse "";
+        persistExternalChatDraft(state, target, text, false) catch |err|
+            return try errorResponseAlloc(allocator, id_value, "persistence_failed", @errorName(err));
         accepted = try state.setWorkspaceChatPaneDraftForProject(target.project_index, target.pane_id, text, false);
     } else if (std.mem.eql(u8, command, "draft.append")) {
         const text = stringParam(params, "text") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.draft.append requires text");
+        persistExternalChatDraft(state, target, text, true) catch |err|
+            return try errorResponseAlloc(allocator, id_value, "persistence_failed", @errorName(err));
         accepted = try state.setWorkspaceChatPaneDraftForProject(target.project_index, target.pane_id, text, true);
     } else if (std.mem.eql(u8, command, "send")) {
         accepted = try state.sendWorkspaceChatPanePromptForProject(target.project_index, target.pane_id, stringParam(params, "prompt"));
@@ -1006,6 +1052,18 @@ fn chatCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
 
     if (!accepted) return try errorResponseAlloc(allocator, id_value, "rejected", "chat operation did not apply");
     return try chatStatusResponse(allocator, id_value, state, target.project_index, target.pane_id);
+}
+
+fn persistExternalChatDraft(state: *app_state.AppState, target: PaneTarget, text: []const u8, append: bool) !void {
+    const project = &state.project_controller.projects.items[target.project_index];
+    const pane = project.workspace_layout.paneById(target.pane_id) orelse return error.ChatPaneNotFound;
+    const thread_index = switch (pane.ref) {
+        .chat => |chat_ref| chat_ref.thread_index,
+        else => return error.ChatPaneNotFound,
+    };
+    if (thread_index >= project.threads.items.len) return error.ChatThreadNotFound;
+    const thread = &project.threads.items[thread_index];
+    _ = try state.storage.setChatDraft(project.id, thread.local_thread_id, text, append);
 }
 
 const ParsedChatOpenSettings = struct {
@@ -1204,6 +1262,7 @@ fn chatPresentResultResponse(allocator: std.mem.Allocator, id_value: std.json.Va
         .thread_id = thread_id,
         .local_thread_id = thread_id,
         .presented = true,
+        .presentation_status = "presented",
         .presentation = if (result.presentation_existing) "existing" else "created",
         .thread_index = result.thread_index,
         .focused = result.focused,
@@ -3441,6 +3500,10 @@ fn chatStatusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, st
     try writeThreadSummary(&s, thread.*, ref.thread_index);
     try s.objectField("draft_len");
     try s.write(std.mem.sliceTo(thread.draft_storage[0..], 0).len);
+    try s.objectField("draft");
+    try s.write(thread.currentDraft());
+    try s.objectField("draft_store_revision");
+    try s.write(state.storage.currentStoreRevision());
     try s.objectField("pending_approval");
     try writePendingApproval(&s, thread);
     try s.endObject();
@@ -3479,6 +3542,8 @@ fn chatOpenResultResponse(
     try s.write(true);
     try s.objectField("presented");
     try s.write(true);
+    try s.objectField("presentation_status");
+    try s.write("presented");
     try s.objectField("thread_index");
     try s.write(result.thread_index);
     try s.objectField("provider");
@@ -3841,6 +3906,13 @@ fn parseApprovalDecision(value: []const u8) ?provider_types.ApprovalDecision {
     if (std.mem.eql(u8, value, "approve") or std.mem.eql(u8, value, "approved") or std.mem.eql(u8, value, "allow")) return .approve;
     if (std.mem.eql(u8, value, "deny") or std.mem.eql(u8, value, "reject") or std.mem.eql(u8, value, "rejected")) return .deny;
     return null;
+}
+
+test "pane maximize parses explicit modes and defaults to toggle" {
+    try std.testing.expectEqual(PaneMaximizeMode.on, parsePaneMaximizeMode("on").?);
+    try std.testing.expectEqual(PaneMaximizeMode.off, parsePaneMaximizeMode("off").?);
+    try std.testing.expectEqual(PaneMaximizeMode.toggle, parsePaneMaximizeMode("toggle").?);
+    try std.testing.expect(parsePaneMaximizeMode("true") == null);
 }
 
 test "live transcript response budget is bounded before JSON allocation" {

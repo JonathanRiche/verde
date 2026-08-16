@@ -21,7 +21,6 @@ const profiler = @import("../runtime/profiler.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const theme = @import("theme.zig");
 
-const FOCUS_ANIM_DURATION_MS: i64 = 160;
 const THREAD_DROP_PREVIEW_Z: i32 = 140;
 const PANE_ZOOM_CONTROL_Z: i32 = 150;
 const PANE_CONTEXT_MENU_Z: i32 = 180;
@@ -181,9 +180,10 @@ var scrolling_edge_pressed: ?ScrollingEdgeDirection = null;
 var focus_prev_id: ?runtime.WorkspacePaneId = null;
 var focus_curr_id: ?runtime.WorkspacePaneId = null;
 var focus_anim_start_ms: i64 = std.math.minInt(i64) >> 2;
+var focus_anim_duration_ms: i64 = theme.MOTION_BASE_MS;
 
 pub fn isFocusAnimating() bool {
-    return (nowMs() - focus_anim_start_ms) < FOCUS_ANIM_DURATION_MS;
+    return (nowMs() - focus_anim_start_ms) < focus_anim_duration_ms;
 }
 
 pub fn isScrollAnimating() bool {
@@ -705,27 +705,33 @@ fn paneStatusPulse(status: PaneAgentVisualStatus, timestamp_ms: i64) f32 {
     return 0.5 + 0.5 * @sin(phase * std.math.tau);
 }
 
-fn easeOutCubic(t: f32) f32 {
-    const inv = 1.0 - t;
-    return 1.0 - inv * inv * inv;
+fn paneStatusPulseForMotion(status: PaneAgentVisualStatus, timestamp_ms: i64, reduced_motion: bool) f32 {
+    return if (reduced_motion) 1.0 else paneStatusPulse(status, timestamp_ms);
 }
 
 fn focusBorderAlpha(pane_id: runtime.WorkspacePaneId) f32 {
     const elapsed = nowMs() - focus_anim_start_ms;
-    const t = if (elapsed >= FOCUS_ANIM_DURATION_MS)
+    const t = if (elapsed >= focus_anim_duration_ms)
         @as(f32, 1.0)
     else if (elapsed <= 0)
         @as(f32, 0.0)
     else
-        @as(f32, @floatFromInt(elapsed)) / @as(f32, @floatFromInt(FOCUS_ANIM_DURATION_MS));
-    const ease = easeOutCubic(t);
+        @as(f32, @floatFromInt(elapsed)) / @as(f32, @floatFromInt(focus_anim_duration_ms));
+    const ease = theme.easeOutCubic(t);
     if (focus_curr_id) |id| if (id == pane_id) return ease;
     if (focus_prev_id) |id| if (id == pane_id) return 1.0 - ease;
     return 0.0;
 }
 
+/// Renders workspace panes with transcript geometry matching the visible pane.
 pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
+    renderAtWithTranscriptLayoutWidth(state, rect, rect.w);
+}
+
+/// Renders workspace panes while transcripts use their destination sidebar width.
+pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, rect: palette.Rect, target_workspace_width: f32) void {
     last_workspace_rect = rect;
+    focus_anim_duration_ms = theme.motionDurationMs(state.app_config.reduced_motion, theme.MOTION_BASE_MS);
     state.ensureCurrentProjectWorkspace();
     state.terminal_controller.debug_workspace_visible_pane_count = state.currentProjectWorkspaceVisiblePaneCount();
     tickFocusAnimation(state);
@@ -733,6 +739,7 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
     scrolling_layout_rendered = false;
     scrolling_max_offset = 0.0;
     scrolling_animating = false;
+    state.transcript_controller.motion_suppressed = false;
     scrolling_previous_proximity = null;
     scrolling_next_proximity = null;
     hit_cache.count = 0;
@@ -743,38 +750,41 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
     terminal_panel.resetHitCache();
 
     if (state.currentProjectWorkspaceMaximizedPaneId()) |pane_id| {
-        renderLeaf(state, pane_id, rect);
+        renderLeafWithTranscriptLayoutWidth(state, pane_id, rect, target_workspace_width);
     } else if (state.currentProjectWorkspaceRoot()) |root| {
         const layout = &state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout;
         if (scrollingLayoutActive(state, layout)) {
-            renderScrollingStrip(state, layout, rect);
+            renderScrollingStrip(state, layout, rect, target_workspace_width);
         } else {
-            renderNode(state, root, rect);
+            renderNode(state, root, rect, target_workspace_width);
         }
     } else {
-        chat_panel.renderWorkspaceAt(state, rect);
+        chat_panel.renderWorkspaceAtWithTranscriptLayoutWidth(state, rect, target_workspace_width);
     }
 
-    renderQuickPane(state, rect);
+    renderQuickPane(state, rect, target_workspace_width);
     renderSplitMenuOverlay(state, rect);
     if (!browser_pane_rendered) state.noteBrowserPaneNotRendered();
 }
 
 // Floating quick-pane overlay above the unchanged tiled workspace.
-fn renderQuickPane(state: *runtime.AppState, workspace_rect: palette.Rect) void {
+fn renderQuickPane(state: *runtime.AppState, workspace_rect: palette.Rect, target_workspace_width: f32) void {
     const quick = state.currentProjectQuickPane() orelse return;
     if (!quick.visible) return;
     if (!quick.pinned) {
         queueRect(state, workspace_rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL, 92)));
     }
     const rect = quickPaneRect(quick, workspace_rect);
+    var target_workspace_rect = workspace_rect;
+    target_workspace_rect.w = target_workspace_width;
+    const target_rect = quickPaneRect(quick, target_workspace_rect);
     queueRect(state, .{
         .x = rect.x - theme.scaledUi(2.0),
         .y = rect.y - theme.scaledUi(2.0),
         .w = rect.w + theme.scaledUi(4.0),
         .h = rect.h + theme.scaledUi(4.0),
     }, paletteColor(theme.withAlpha(theme.COLOR_PANEL, 210)));
-    renderLeaf(state, quick.pane_id, rect);
+    renderLeafWithTranscriptLayoutWidth(state, quick.pane_id, rect, target_rect.w);
 
     const drag_h = theme.scaledUi(QUICK_PANE_DRAG_H_CSS);
     appendHit(.{
@@ -1288,6 +1298,7 @@ fn renderScrollingStrip(
     state: *runtime.AppState,
     layout: *runtime.WorkspaceLayout,
     workspace: palette.Rect,
+    target_workspace_width: f32,
 ) void {
     const direction = state.app_config.workspace_scroll_direction;
     const vertical = direction == .vertical;
@@ -1315,6 +1326,24 @@ fn renderScrollingStrip(
         gap,
         theme.uiScaleFactor(),
         &extents,
+    );
+    const target_viewport_extent = if (vertical) workspace.h else target_workspace_width;
+    const target_default_extent = responsiveScrollingPaneExtent(
+        target_viewport_extent,
+        gap,
+        state.app_config.workspace_panes_per_view,
+        layout.scroll_pane_extent_override,
+        layout.scroll_pane_extent_ratio_override,
+        theme.uiScaleFactor(),
+    );
+    var target_extents: [MAX_WORKSPACE_PANE_RECTS]f32 = undefined;
+    const target_pane_count = collectScrollingPaneExtents(
+        layout,
+        target_default_extent,
+        target_viewport_extent,
+        gap,
+        theme.uiScaleFactor(),
+        &target_extents,
     );
     const max_offset = scrollingStripMaxOffset(viewport_extent, extents[0..pane_count], gap);
     const offset: *f32 = if (vertical) &layout.scroll_offset_y else &layout.scroll_offset_x;
@@ -1348,6 +1377,10 @@ fn renderScrollingStrip(
     }
 
     tickScrollingAnimation(offset, target.*, &layout.scroll_animation_last_ms);
+    // The strip owns pane-region motion until it reaches its target. A chat
+    // pane rendered below consumes this flag by presenting resident transcript
+    // content directly, avoiding a compounded slide-plus-fade.
+    state.transcript_controller.motion_suppressed = scrolling_animating;
     scrolling_layout_rendered = true;
     scrolling_max_offset = max_offset;
 
@@ -1359,7 +1392,13 @@ fn renderScrollingStrip(
         if (!layout.rootContainsPane(pane.id)) continue;
         if (pane_index >= pane_count) break;
         const pane_extent = extents[pane_index];
-        renderScrollingPane(state, pane.id, workspace, direction, origin, pane_extent, gap, offset.*, pane_index);
+        const target_pane_width = if (vertical)
+            target_workspace_width
+        else if (pane_index < target_pane_count)
+            target_extents[pane_index]
+        else
+            pane_extent;
+        renderScrollingPane(state, pane.id, workspace, direction, origin, pane_extent, target_pane_width, gap, offset.*, pane_index);
         origin += pane_extent + gap;
         pane_index += 1;
     }
@@ -1511,6 +1550,7 @@ fn renderScrollingPane(
     direction: app_config.WorkspaceScrollDirection,
     origin: f32,
     pane_extent: f32,
+    target_pane_width: f32,
     gap: f32,
     offset: f32,
     pane_index: usize,
@@ -1521,7 +1561,7 @@ fn renderScrollingPane(
         .vertical => .{ .x = workspace.x, .y = workspace.y + screen_origin, .w = workspace.w, .h = pane_extent },
     };
     if (intersectRects(rect, workspace) == null) return;
-    renderLeafWithin(state, pane_id, rect, workspace);
+    renderLeafWithin(state, pane_id, rect, workspace, target_pane_width);
     const gutter: palette.Rect = switch (direction) {
         .horizontal => .{ .x = rect.x + rect.w, .y = workspace.y, .w = gap, .h = workspace.h },
         .vertical => .{ .x = workspace.x, .y = rect.y + rect.h, .w = workspace.w, .h = gap },
@@ -1765,7 +1805,7 @@ fn tickScrollingAnimation(offset: *f32, target: f32, animation_last_ms: *i64) vo
 fn advanceScrollOffset(current: f32, target: f32, elapsed_ms: i64) f32 {
     if (elapsed_ms <= 0 or @abs(target - current) <= SCROLLING_ANIMATION_EPSILON) return current;
     const progress = @min(1.0, @as(f32, @floatFromInt(elapsed_ms)) / @as(f32, @floatFromInt(SCROLLING_ANIMATION_DURATION_MS)));
-    return current + (target - current) * easeOutCubic(progress);
+    return current + (target - current) * theme.easeOutCubic(progress);
 }
 
 fn clipWorkspaceBatch(state: *runtime.AppState, command_start: usize, text_run_start: usize, workspace: palette.Rect) void {
@@ -1811,21 +1851,46 @@ fn intersectRects(a: palette.Rect, b: palette.Rect) ?palette.Rect {
     return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
 }
 
-fn renderNode(state: *runtime.AppState, node: *const runtime.WorkspaceNode, rect: palette.Rect) void {
+const VerticalSplitWidths = struct {
+    first: f32,
+    second: f32,
+};
+
+fn verticalSplitWidths(total_width: f32, ratio: f32, gap: f32) VerticalSplitWidths {
+    const first_width = @max(theme.scaledUi(180.0), total_width * ratio - gap * 0.5);
+    const second_width = @max(theme.scaledUi(180.0), total_width - first_width - gap);
+    const clamped_first_width = @max(theme.scaledUi(120.0), total_width - second_width - gap);
+    return .{
+        .first = clamped_first_width,
+        .second = @max(total_width - clamped_first_width - gap, theme.scaledUi(120.0)),
+    };
+}
+
+test "target split widths finish without a corrective transcript reflow" {
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.0);
+
+    const widths = verticalSplitWidths(900.0, 0.42, 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 900.0), widths.first + widths.second + 1.0, 0.001);
+    const final_widths = verticalSplitWidths(720.0, 0.42, 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 720.0), final_widths.first + final_widths.second + 1.0, 0.001);
+}
+
+// Tiled workspace region; pane shells animate while transcript widths stay final.
+fn renderNode(state: *runtime.AppState, node: *const runtime.WorkspaceNode, rect: palette.Rect, target_width: f32) void {
     switch (node.*) {
-        .leaf => |pane_id| renderLeaf(state, pane_id, rect),
+        .leaf => |pane_id| renderLeafWithTranscriptLayoutWidth(state, pane_id, rect, target_width),
         .split => |split| {
             const gap = theme.scaledUi(1.0);
             if (split.axis == .vertical) {
-                const first_w = @max(theme.scaledUi(180.0), rect.w * split.ratio - gap * 0.5);
-                const second_w = @max(theme.scaledUi(180.0), rect.w - first_w - gap);
-                const clamped_first_w = @max(theme.scaledUi(120.0), rect.w - second_w - gap);
-                const first_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = clamped_first_w, .h = rect.h };
-                const gutter_rect = palette.Rect{ .x = rect.x + clamped_first_w, .y = rect.y, .w = gap, .h = rect.h };
-                const second_rect = palette.Rect{ .x = rect.x + clamped_first_w + gap, .y = rect.y, .w = @max(rect.w - clamped_first_w - gap, theme.scaledUi(120.0)), .h = rect.h };
-                renderNode(state, split.first, first_rect);
+                const widths = verticalSplitWidths(rect.w, split.ratio, gap);
+                const target_widths = verticalSplitWidths(target_width, split.ratio, gap);
+                const first_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = widths.first, .h = rect.h };
+                const gutter_rect = palette.Rect{ .x = rect.x + widths.first, .y = rect.y, .w = gap, .h = rect.h };
+                const second_rect = palette.Rect{ .x = rect.x + widths.first + gap, .y = rect.y, .w = widths.second, .h = rect.h };
+                renderNode(state, split.first, first_rect, target_widths.first);
                 renderSplitGutter(state, split.first, split.second, .vertical, gutter_rect, rect);
-                renderNode(state, split.second, second_rect);
+                renderNode(state, split.second, second_rect, target_widths.second);
             } else {
                 const first_h = @max(theme.scaledUi(160.0), rect.h * split.ratio - gap * 0.5);
                 const second_h = @max(theme.scaledUi(120.0), rect.h - first_h - gap);
@@ -1833,9 +1898,9 @@ fn renderNode(state: *runtime.AppState, node: *const runtime.WorkspaceNode, rect
                 const first_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = clamped_first_h };
                 const gutter_rect = palette.Rect{ .x = rect.x, .y = rect.y + clamped_first_h, .w = rect.w, .h = gap };
                 const second_rect = palette.Rect{ .x = rect.x, .y = rect.y + clamped_first_h + gap, .w = rect.w, .h = @max(rect.h - clamped_first_h - gap, theme.scaledUi(120.0)) };
-                renderNode(state, split.first, first_rect);
+                renderNode(state, split.first, first_rect, target_width);
                 renderSplitGutter(state, split.first, split.second, .horizontal, gutter_rect, rect);
-                renderNode(state, split.second, second_rect);
+                renderNode(state, split.second, second_rect, target_width);
             }
         },
     }
@@ -1902,11 +1967,11 @@ fn updateResizeDrag(state: *runtime.AppState, hit: WorkspacePaneHit, x: f32, y: 
     state.resizeCurrentProjectWorkspaceSplit(hit.pane_id, hit.sibling_pane_id, hit.axis, ratio);
 }
 
-fn renderLeaf(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: palette.Rect) void {
-    renderLeafWithin(state, pane_id, rect, null);
+fn renderLeafWithTranscriptLayoutWidth(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: palette.Rect, target_width: f32) void {
+    renderLeafWithin(state, pane_id, rect, null, target_width);
 }
 
-fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: palette.Rect, viewport_clip: ?palette.Rect) void {
+fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: palette.Rect, viewport_clip: ?palette.Rect, target_width: f32) void {
     // Workspace pane contents. Scrolling panes pass the visible workspace so
     // expensive renderers can avoid emitting commands that will be clipped.
     const kind = state.workspacePaneKindById(pane_id) orelse return;
@@ -1922,7 +1987,7 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
         .browser => 0.0,
     };
     switch (kind) {
-        .chat => chat_panel.renderWorkspaceAtForPaneWithReserve(state, rect, pane_id, reserve),
+        .chat => chat_panel.renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(state, rect, pane_id, reserve, target_width),
         .terminal => {
             const dock_id = state.workspaceTerminalDockIdByPane(pane_id) orelse 0;
             if (viewport_clip) |clip| {
@@ -1947,8 +2012,9 @@ fn renderLeafWithin(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, 
     // maximized layouts without tinting the pane's content.
     const agent_status = paneAgentVisualStatus(state, pane_id);
     if (agent_status != .idle) {
-        pane_status_animating = true;
-        const pulse = paneStatusPulse(agent_status, nowMs());
+        const animated = !state.app_config.reduced_motion;
+        pane_status_animating = pane_status_animating or animated;
+        const pulse = paneStatusPulseForMotion(agent_status, nowMs(), state.app_config.reduced_motion);
         var border_color = switch (agent_status) {
             .done => theme.success(),
             .working => theme.accent(),
@@ -2387,6 +2453,8 @@ test "pane status pulses are bounded and use deliberately slow periods" {
         try std.testing.expectApproxEqAbs(@as(f32, 0.5), paneStatusPulse(status, @divTrunc(period, 2)), 0.0001);
         try std.testing.expectApproxEqAbs(@as(f32, 0.0), paneStatusPulse(status, @divTrunc(period * 3, 4)), 0.0001);
     }
+    try std.testing.expectEqual(@as(f32, 1.0), paneStatusPulseForMotion(.working, 0, true));
+    try std.testing.expectEqual(@as(f32, 1.0), paneStatusPulseForMotion(.done, DONE_PULSE_PERIOD_MS * 3 / 4, true));
 }
 
 test "directional navigation transfers zoom unless unzoom is configured" {

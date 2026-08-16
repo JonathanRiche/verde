@@ -46,6 +46,7 @@ pub const Mutation = union(enum) {
     snapshot_replace: store_protocol.SnapshotReplaceRequest,
     workspace_upsert: store_protocol.WorkspaceUpsertRequest,
     thread_upsert: store_protocol.ThreadUpsertRequest,
+    chat_draft_set: store_protocol.ChatDraftSetRequest,
     message_append: store_protocol.MessageAppendRequest,
     surface_upsert: store_protocol.SurfaceUpsertRequest,
     surface_clear: store_protocol.SurfaceClearRequest,
@@ -287,6 +288,7 @@ pub const ImportedLeasesAndOutcomes = struct {
 const SNAPSHOT_REPLACE_OPERATION = store_protocol.METHOD_STATE_SNAPSHOT_REPLACE;
 const WORKSPACE_UPSERT_OPERATION = store_protocol.METHOD_WORKSPACE_UPSERT;
 const THREAD_UPSERT_OPERATION = store_protocol.METHOD_CHAT_THREAD_UPSERT;
+const CHAT_DRAFT_SET_OPERATION = store_protocol.METHOD_CHAT_DRAFT_SET;
 const MESSAGE_APPEND_OPERATION = store_protocol.METHOD_CHAT_MESSAGE_APPEND;
 const SURFACE_UPSERT_OPERATION = store_protocol.METHOD_SURFACE_UPSERT;
 const SURFACE_CLEAR_OPERATION = store_protocol.METHOD_SURFACE_CLEAR;
@@ -459,6 +461,7 @@ pub const Store = struct {
             .snapshot_replace => |request| self.applySnapshot(request.snapshot, next_revision_sql) catch |err| return mapStoreError(err),
             .workspace_upsert => |request| self.applyWorkspace(request.workspace) catch |err| return mapStoreError(err),
             .thread_upsert => |request| self.applyThread(request) catch |err| return mapStoreError(err),
+            .chat_draft_set => |request| self.applyChatDraftSet(request) catch |err| return mapStoreError(err),
             .message_append => |request| self.applyMessageAppend(request, next_revision_sql) catch |err| return mapStoreError(err),
             .surface_upsert => |request| self.applySurfaceUpsert(request.surface) catch |err| return mapStoreError(err),
             .surface_clear => |request| applied = self.applySurfaceClear(request) catch |err| return mapStoreError(err),
@@ -500,6 +503,10 @@ pub const Store = struct {
 
     pub fn upsertThread(self: *Self, request: store_protocol.ThreadUpsertRequest) StoreError!store_protocol.WriteResult {
         return self.applyMutation(.{ .thread_upsert = request });
+    }
+
+    pub fn setChatDraft(self: *Self, request: store_protocol.ChatDraftSetRequest) StoreError!store_protocol.WriteResult {
+        return self.applyMutation(.{ .chat_draft_set = request });
     }
 
     /// Accept a chat turn under one receipt-backed SQLite transaction. The
@@ -1083,6 +1090,12 @@ pub const Store = struct {
                 .workspace_id = request.workspace_id,
                 .thread = request.thread,
             }),
+            .chat_draft_set => |request| self.fingerprintValue(.{
+                .workspace_id = request.workspace_id,
+                .local_thread_id = request.local_thread_id,
+                .text = request.text,
+                .append = request.append,
+            }),
             .message_append => |request| self.fingerprintValue(.{
                 .workspace_id = request.workspace_id,
                 .thread_id = request.thread_id,
@@ -1161,7 +1174,8 @@ pub const Store = struct {
             \\    draft text not null,
             \\    draft_image_path text,
             \\    draft_image_mime text,
-            \\    draft_image_byte_size integer
+            \\    draft_image_byte_size integer,
+            \\    draft_images_json text
             \\);
             \\create temp table if not exists preserved_workspaces (
             \\    workspace_id text not null,
@@ -1208,7 +1222,8 @@ pub const Store = struct {
             \\    key_fingerprint text,
             \\    key_created_at_ms integer,
             \\    key_updated_at_ms integer,
-            \\    key_store_revision integer
+            \\    key_store_revision integer,
+            \\    extra_images_json text
             \\);
             \\create temp table if not exists preserved_lazy_messages (
             \\    workspace_key text not null,
@@ -1229,7 +1244,8 @@ pub const Store = struct {
             \\    key_fingerprint text,
             \\    key_created_at_ms integer,
             \\    key_updated_at_ms integer,
-            \\    key_store_revision integer
+            \\    key_store_revision integer,
+            \\    extra_images_json text
             \\);
             \\delete from preserved_chat_threads;
             \\delete from preserved_chat_messages;
@@ -1258,7 +1274,8 @@ pub const Store = struct {
             \\select w.workspace_id, t.sort_index, t.title, t.archived, t.committed, t.local_thread_id,
             \\       t.last_activity_at, t.provider_thread_id, t.model_ref, t.reasoning_effort,
             \\       t.reasoning_variant, t.fast_mode, t.access_mode, t.provider, t.harness, t.tui_dock_id,
-            \\       t.draft, t.draft_image_path, t.draft_image_mime, t.draft_image_byte_size
+            \\       t.draft, t.draft_image_path, t.draft_image_mime, t.draft_image_byte_size,
+            \\       t.draft_images_json
             \\from threads t join workspaces w on w.id = t.workspace_id
             \\where t.local_thread_id is not null and (
             \\    t.committed != 0
@@ -1272,7 +1289,8 @@ pub const Store = struct {
             \\       m.image_path, m.image_mime, m.image_byte_size,
             \\       m.tool_call_id, m.tool_call_kind, m.tool_call_status,
             \\       m.message_id, m.created_at_ms, m.updated_at_ms,
-            \\       k.message_fingerprint, k.created_at_ms, k.updated_at_ms, k.store_revision
+            \\       k.message_fingerprint, k.created_at_ms, k.updated_at_ms, k.store_revision,
+            \\       m.extra_images_json
             \\from messages m
             \\join threads t on t.id = m.thread_id
             \\join workspaces w on w.id = t.workspace_id
@@ -1298,7 +1316,8 @@ pub const Store = struct {
                     \\       m.image_path, m.image_mime, m.image_byte_size,
                     \\       m.tool_call_id, m.tool_call_kind, m.tool_call_status,
                     \\       m.message_id, m.created_at_ms, m.updated_at_ms,
-                    \\       k.message_fingerprint, k.created_at_ms, k.updated_at_ms, k.store_revision
+                    \\       k.message_fingerprint, k.created_at_ms, k.updated_at_ms, k.store_revision,
+                    \\       m.extra_images_json
                     \\from messages m
                     \\join threads t on t.id = m.thread_id
                     \\join workspaces w on w.id = t.workspace_id
@@ -1416,10 +1435,10 @@ pub const Store = struct {
         );
         try self.conn.execNoArgs(
             \\insert into messages (thread_id, sort_index, role, author, body, image_path, image_mime,
-            \\                      image_byte_size, tool_call_id, tool_call_kind, tool_call_status,
+            \\                      image_byte_size, extra_images_json, tool_call_id, tool_call_kind, tool_call_status,
             \\                      message_id, created_at_ms, updated_at_ms)
             \\select t.id, p.sort_index, p.role, p.author, p.body, p.image_path, p.image_mime,
-            \\       p.image_byte_size, p.tool_call_id, p.tool_call_kind, p.tool_call_status,
+            \\       p.image_byte_size, p.extra_images_json, p.tool_call_id, p.tool_call_kind, p.tool_call_status,
             \\       p.message_id, p.created_at_ms, p.updated_at_ms
             \\from temp.preserved_lazy_messages p
             \\join workspaces w on w.workspace_id = p.workspace_key
@@ -1454,14 +1473,14 @@ pub const Store = struct {
             \\insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id,
             \\                     last_activity_at, provider_thread_id, model_ref, reasoning_effort,
             \\                     reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id,
-            \\                     draft, draft_image_path, draft_image_mime, draft_image_byte_size)
+            \\                     draft, draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json)
             \\select w.id,
             \\       (select coalesce(max(t2.sort_index) + 1, 0) from threads t2 where t2.workspace_id = w.id)
             \\           + (row_number() over (partition by p.workspace_key order by p.sort_index) - 1),
             \\       p.title, p.archived, p.committed, p.local_thread_id, p.last_activity_at,
             \\       p.provider_thread_id, p.model_ref, p.reasoning_effort, p.reasoning_variant,
             \\       p.fast_mode, p.access_mode, p.provider, p.harness, p.tui_dock_id,
-            \\       p.draft, p.draft_image_path, p.draft_image_mime, p.draft_image_byte_size
+            \\       p.draft, p.draft_image_path, p.draft_image_mime, p.draft_image_byte_size, p.draft_images_json
             \\from temp.preserved_chat_threads p
             \\join workspaces w on w.workspace_id = p.workspace_key
             \\where not exists (
@@ -1471,13 +1490,13 @@ pub const Store = struct {
         );
         try self.conn.execNoArgs(
             \\insert into messages (thread_id, sort_index, role, author, body, image_path, image_mime,
-            \\                      image_byte_size, tool_call_id, tool_call_kind, tool_call_status,
+            \\                      image_byte_size, extra_images_json, tool_call_id, tool_call_kind, tool_call_status,
             \\                      message_id, created_at_ms, updated_at_ms)
             \\select t.id,
             \\       (select coalesce(max(m2.sort_index) + 1, 0) from messages m2 where m2.thread_id = t.id)
             \\           + (row_number() over (partition by p.workspace_key, p.thread_key order by p.sort_index) - 1),
             \\       p.role, p.author, p.body, p.image_path, p.image_mime, p.image_byte_size,
-            \\       p.tool_call_id, p.tool_call_kind, p.tool_call_status,
+            \\       p.extra_images_json, p.tool_call_id, p.tool_call_kind, p.tool_call_status,
             \\       p.message_id, p.created_at_ms, p.updated_at_ms
             \\from temp.preserved_chat_messages p
             \\join workspaces w on w.workspace_id = p.workspace_key
@@ -1544,8 +1563,10 @@ pub const Store = struct {
         );
         if (existing) |row| {
             defer row.deinit();
+            const draft_images_json = try encodeExtraImagesJson(self.allocator, thread.draft_images);
+            defer if (draft_images_json) |value| self.allocator.free(value);
             try self.conn.exec(
-                "update threads set title = ?1, archived = ?2, committed = ?3, last_activity_at = ?4, provider_thread_id = ?5, model_ref = ?6, reasoning_effort = ?7, reasoning_variant = ?8, fast_mode = ?9, access_mode = ?10, provider = ?11, harness = ?12, tui_dock_id = ?13, draft = ?14, draft_image_path = ?15, draft_image_mime = ?16, draft_image_byte_size = ?17 where id = ?18",
+                "update threads set title = ?1, archived = ?2, committed = ?3, last_activity_at = ?4, provider_thread_id = ?5, model_ref = ?6, reasoning_effort = ?7, reasoning_variant = ?8, fast_mode = ?9, access_mode = ?10, provider = ?11, harness = ?12, tui_dock_id = ?13, draft = ?14, draft_image_path = ?15, draft_image_mime = ?16, draft_image_byte_size = ?17, draft_images_json = ?18 where id = ?19",
                 .{
                     thread.title,
                     boolToInt(thread.archived),
@@ -1564,6 +1585,7 @@ pub const Store = struct {
                     if (primary_draft_image) |value| value.path else null,
                     if (primary_draft_image) |value| value.mime else null,
                     if (primary_draft_image) |value| @as(i64, @intCast(value.byte_size)) else null,
+                    draft_images_json,
                     row.int(0),
                 },
             );
@@ -1594,6 +1616,15 @@ pub const Store = struct {
             &.{},
             null,
         );
+    }
+
+    fn applyChatDraftSet(self: *Self, request: store_protocol.ChatDraftSetRequest) !void {
+        const statement = if (request.append)
+            "update threads set draft = draft || ?1 where workspace_id = (select id from workspaces where workspace_id = ?2) and local_thread_id = ?3"
+        else
+            "update threads set draft = ?1 where workspace_id = (select id from workspaces where workspace_id = ?2) and local_thread_id = ?3";
+        try self.conn.exec(statement, .{ request.text, request.workspace_id, request.local_thread_id });
+        if (self.conn.changes() == 0) return error.ResourceNotFound;
     }
 
     fn insertChatTurnWorkspaceIfMissing(self: *Self, workspace: store_protocol.Workspace) !bool {
@@ -2204,10 +2235,12 @@ pub const Store = struct {
         const fast_code = if (fast_mode) |value| try fastModeCode(value) else null;
         const access_code = if (access_mode) |value| try accessModeCode(value) else null;
         const primary_draft_image = try firstAttachment(draft_image, draft_images);
+        const draft_images_json = try encodeExtraImagesJson(self.allocator, draft_images);
+        defer if (draft_images_json) |value| self.allocator.free(value);
 
         try self.conn.exec(
-            "insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size) " ++
-                "values (?1, coalesce(?2, (select coalesce(max(sort_index) + 1, 0) from threads where workspace_id = ?1)), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            "insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size, draft_images_json) " ++
+                "values (?1, coalesce(?2, (select coalesce(max(sort_index) + 1, 0) from threads where workspace_id = ?1)), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             .{
                 workspace_row_id,
                 sort_index,
@@ -2229,6 +2262,7 @@ pub const Store = struct {
                 if (primary_draft_image) |value| value.path else null,
                 if (primary_draft_image) |value| value.mime else null,
                 if (primary_draft_image) |value| @as(i64, @intCast(value.byte_size)) else null,
+                draft_images_json,
             },
         );
         const thread_row_id = self.conn.lastInsertedRowId();
@@ -2246,6 +2280,8 @@ pub const Store = struct {
         const kind_code = if (message.tool_call_kind) |value| try toolCallKindCode(value) else null;
         const status_code = if (message.tool_call_status) |value| try toolCallStatusCode(value) else null;
         const image = try firstAttachment(message.image, message.images);
+        const extra_images_json = try encodeExtraImagesJson(self.allocator, message.images);
+        defer if (extra_images_json) |value| self.allocator.free(value);
 
         // M5-P4 Amendment 1 duplicate-id invariant: a snapshot carrying the
         // same (thread, message_id) twice must refresh position/content in
@@ -2254,8 +2290,8 @@ pub const Store = struct {
         // this statement's sequence, so the per-thread unique(sort_index)
         // cannot collide.
         try self.conn.exec(
-            "insert into messages (thread_id, sort_index, role, author, body, image_path, image_mime, image_byte_size, tool_call_id, tool_call_kind, tool_call_status, message_id, created_at_ms, updated_at_ms) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) " ++
-                "on conflict(thread_id, message_id) where message_id is not null do update set sort_index = excluded.sort_index, role = excluded.role, author = excluded.author, body = excluded.body, image_path = excluded.image_path, image_mime = excluded.image_mime, image_byte_size = excluded.image_byte_size, tool_call_id = excluded.tool_call_id, tool_call_kind = excluded.tool_call_kind, tool_call_status = excluded.tool_call_status, created_at_ms = excluded.created_at_ms, updated_at_ms = excluded.updated_at_ms",
+            "insert into messages (thread_id, sort_index, role, author, body, image_path, image_mime, image_byte_size, extra_images_json, tool_call_id, tool_call_kind, tool_call_status, message_id, created_at_ms, updated_at_ms) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) " ++
+                "on conflict(thread_id, message_id) where message_id is not null do update set sort_index = excluded.sort_index, role = excluded.role, author = excluded.author, body = excluded.body, image_path = excluded.image_path, image_mime = excluded.image_mime, image_byte_size = excluded.image_byte_size, extra_images_json = excluded.extra_images_json, tool_call_id = excluded.tool_call_id, tool_call_kind = excluded.tool_call_kind, tool_call_status = excluded.tool_call_status, created_at_ms = excluded.created_at_ms, updated_at_ms = excluded.updated_at_ms",
             .{
                 thread_row_id,
                 sort_index,
@@ -2265,6 +2301,7 @@ pub const Store = struct {
                 if (image) |value| value.path else null,
                 if (image) |value| value.mime else null,
                 if (image) |value| @as(i64, @intCast(value.byte_size)) else null,
+                extra_images_json,
                 message.tool_call_id,
                 kind_code,
                 status_code,
@@ -2329,6 +2366,7 @@ fn mutationHeader(mutation: Mutation) store_protocol.MutationHeader {
         .snapshot_replace => |request| request.mutation,
         .workspace_upsert => |request| request.mutation,
         .thread_upsert => |request| request.mutation,
+        .chat_draft_set => |request| request.mutation,
         .message_append => |request| request.mutation,
         .surface_upsert => |request| request.mutation,
         .surface_clear => |request| request.mutation,
@@ -2342,6 +2380,7 @@ fn mutationOperation(mutation: Mutation) []const u8 {
         .snapshot_replace => SNAPSHOT_REPLACE_OPERATION,
         .workspace_upsert => WORKSPACE_UPSERT_OPERATION,
         .thread_upsert => THREAD_UPSERT_OPERATION,
+        .chat_draft_set => CHAT_DRAFT_SET_OPERATION,
         .message_append => MESSAGE_APPEND_OPERATION,
         .surface_upsert => SURFACE_UPSERT_OPERATION,
         .surface_clear => SURFACE_CLEAR_OPERATION,
@@ -2371,6 +2410,9 @@ fn validateMutation(mutation: Mutation) StoreError!void {
             if (request.workspace_id.len == 0 or request.thread.local_thread_id.len == 0) return error.InvalidParams;
             if (request.thread.messages.len != 0) return error.InvalidParams;
             _ = try firstAttachment(request.thread.draft_image, request.thread.draft_images);
+        },
+        .chat_draft_set => |request| {
+            if (request.workspace_id.len == 0 or request.local_thread_id.len == 0) return error.InvalidParams;
         },
         .message_append => |request| {
             if (request.workspace_id.len == 0 or request.thread_id.len == 0 or request.message.message_id.len == 0) return error.InvalidParams;
@@ -2446,12 +2488,43 @@ fn checkExpectedRevision(mutation: Mutation, current_revision: u64) StoreError!v
 }
 
 fn firstAttachment(single: ?store_protocol.Attachment, many: []const store_protocol.Attachment) !?store_protocol.Attachment {
-    if (many.len > 1) return error.CapabilityUnavailable;
     if (many.len == 0) return single;
     if (single) |legacy| {
         if (!attachmentsEqual(legacy, many[0])) return error.InvalidParams;
     }
     return many[0];
+}
+
+/// Attachments past the primary. The primary stays in the legacy single
+/// image columns for old readers; everything after it rides in the additive
+/// `*_images_json` column so no attachment is silently narrowed to one.
+fn extraAttachments(many: []const store_protocol.Attachment) []const store_protocol.Attachment {
+    if (many.len <= 1) return &.{};
+    return many[1..];
+}
+
+/// Stored shape of one extra attachment inside a `*_images_json` column
+/// (shared with the read-only projection client).
+pub const StoredExtraImage = schema.StoredExtraImage;
+
+/// Encode attachments past the primary as a compact JSON array, or null when
+/// at most one attachment exists. Caller frees the returned slice.
+fn encodeExtraImagesJson(allocator: std.mem.Allocator, many: []const store_protocol.Attachment) StoreError!?[]u8 {
+    const extras = extraAttachments(many);
+    if (extras.len == 0) return null;
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    s.beginArray() catch return error.OutOfMemory;
+    for (extras) |attachment| {
+        s.write(StoredExtraImage{
+            .path = attachment.path,
+            .mime = attachment.mime,
+            .byte_size = attachment.byte_size,
+        }) catch return error.OutOfMemory;
+    }
+    s.endArray() catch return error.OutOfMemory;
+    return writer.toOwnedSlice() catch return error.OutOfMemory;
 }
 
 fn attachmentsEqual(left: store_protocol.Attachment, right: store_protocol.Attachment) bool {
@@ -5031,6 +5104,133 @@ test "snapshot missing unobserved turn rows preserves them in transcript order" 
     }
 }
 
+test "accepted multi-image user row and multi-image draft survive snapshot replace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    // Acceptance path: the durable user row is staged with the full
+    // attachment list — primary in the legacy columns, extras as JSON.
+    const user_images = [_]store_protocol.Attachment{
+        .{ .path = "/tmp/shot-a.png", .mime = "image/png", .byte_size = 11 },
+        .{ .path = "/tmp/shot-b.png", .mime = "image/jpeg", .byte_size = 22 },
+    };
+    const request: TurnAcceptanceRequest = .{
+        .mutation = testHeader("turn:img-turn:accept", null),
+        .turn_id = "img-turn",
+        .workspace = testWorkspace("workspace-img", "Image workspace"),
+        .thread = .{
+            .local_thread_id = "thread-img",
+            .title = "Image thread",
+            .provider = "codex",
+        },
+        .started_at_ms = 100,
+        .provider = "codex",
+        .harness = "local_cli",
+        .user_message = .{
+            .message_id = "gui-msg:img:1",
+            .role = "user",
+            .author = "You",
+            .body = "look at these",
+            .image = user_images[0],
+            .images = &user_images,
+            .created_at_ms = 100,
+            .updated_at_ms = 100,
+        },
+    };
+    _ = try store.acceptTurn(request);
+    {
+        var row = (try store.conn.row(
+            "select image_path, extra_images_json from messages where message_id = 'gui-msg:img:1'",
+            .{},
+        )).?;
+        defer row.deinit();
+        try std.testing.expectEqualStrings("/tmp/shot-a.png", row.text(0));
+        try std.testing.expect(std.mem.indexOf(u8, row.text(1), "/tmp/shot-b.png") != null);
+    }
+
+    // Composer path: a multi-image draft rides the thread upsert the same way.
+    const draft_images = [_]store_protocol.Attachment{
+        .{ .path = "/tmp/draft-a.png", .mime = "image/png", .byte_size = 33 },
+        .{ .path = "/tmp/draft-b.png", .mime = "image/png", .byte_size = 44 },
+    };
+    var draft_thread = testThread("thread-img", "Image thread");
+    draft_thread.draft = "pending prompt";
+    draft_thread.draft_image = draft_images[0];
+    draft_thread.draft_images = &draft_images;
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("img-draft", null),
+        .workspace_id = request.workspace.workspace_id,
+        .thread = draft_thread,
+    });
+    {
+        var row = (try store.conn.row(
+            "select draft_image_path, draft_images_json from threads where local_thread_id = 'thread-img'",
+            .{},
+        )).?;
+        defer row.deinit();
+        try std.testing.expectEqualStrings("/tmp/draft-a.png", row.text(0));
+        try std.testing.expect(std.mem.indexOf(u8, row.text(1), "/tmp/draft-b.png") != null);
+    }
+
+    // Mid-window GUI flush that does not know the accepted user row yet: the
+    // preserved-row pass must restore it with its extras intact, and the
+    // payload thread carrying the full draft list keeps the draft columns.
+    var mid_thread = testThread("thread-img", "Image thread");
+    mid_thread.draft = "pending prompt";
+    mid_thread.draft_image = draft_images[0];
+    mid_thread.draft_images = &draft_images;
+    var mid_workspace = testWorkspace("workspace-img", "Image workspace");
+    mid_workspace.threads = &.{mid_thread};
+    const mid_workspaces = [_]store_protocol.Workspace{mid_workspace};
+    const mid_revision = try store.storeRevision();
+    _ = try store.applyMutation(.{ .snapshot_replace = testSnapshotRequest("img-flush-1", mid_revision, false, testSnapshot(&mid_workspaces)) });
+    {
+        var row = (try store.conn.row(
+            "select m.image_path, m.extra_images_json, t.draft_image_path, t.draft_images_json " ++
+                "from messages m join threads t on t.id = m.thread_id where m.message_id = 'gui-msg:img:1'",
+            .{},
+        )).?;
+        defer row.deinit();
+        try std.testing.expectEqualStrings("/tmp/shot-a.png", row.text(0));
+        try std.testing.expect(std.mem.indexOf(u8, row.text(1), "/tmp/shot-b.png") != null);
+        try std.testing.expectEqualStrings("/tmp/draft-a.png", row.text(2));
+        try std.testing.expect(std.mem.indexOf(u8, row.text(3), "/tmp/draft-b.png") != null);
+    }
+
+    // Converged flush carrying the row with its full image list: identity
+    // upsert refreshes in place — exactly one copy, extras still present.
+    const full_messages = [_]store_protocol.Message{
+        .{
+            .message_id = "gui-msg:img:1",
+            .role = "user",
+            .author = "You",
+            .body = "look at these",
+            .image = user_images[0],
+            .images = &user_images,
+        },
+    };
+    var full_thread = testThread("thread-img", "Image thread");
+    full_thread.messages = &full_messages;
+    var full_workspace = testWorkspace("workspace-img", "Image workspace");
+    full_workspace.threads = &.{full_thread};
+    const full_workspaces = [_]store_protocol.Workspace{full_workspace};
+    const full_revision = try store.storeRevision();
+    _ = try store.applyMutation(.{ .snapshot_replace = testSnapshotRequest("img-flush-2", full_revision, false, testSnapshot(&full_workspaces)) });
+    {
+        var row = (try store.conn.row(
+            "select count(*), min(extra_images_json) from messages where message_id = 'gui-msg:img:1'",
+            .{},
+        )).?;
+        defer row.deinit();
+        try std.testing.expectEqual(@as(i64, 1), row.int(0));
+        try std.testing.expect(std.mem.indexOf(u8, row.text(1), "/tmp/shot-b.png") != null);
+    }
+}
+
 // M4-P4 fix Layer B (iii) / MINOR-5: the daemon-owned chat_completions ledger
 // survives a GUI snapshot that does not know the row yet; removal remains the
 // targeted clear command only.
@@ -5280,7 +5480,7 @@ test "store commit increments durable revision and survives reopen" {
     try std.testing.expectEqualStrings("First", label);
 }
 
-test "store migrates populated v1 WAL state into the v4 chain" {
+test "store migrates populated v1 WAL state into the current chain" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const db_path = try testDbPath(&tmp);
@@ -5297,7 +5497,7 @@ test "store migrates populated v1 WAL state into the v4 chain" {
 
     var store = try Store.init(std.testing.allocator, db_path);
     defer store.deinit();
-    try std.testing.expectEqual(@as(i64, 4), blk: {
+    try std.testing.expectEqual(schema.MAX_SUPPORTED_VERSION, blk: {
         const row = (try store.conn.row("pragma user_version", .{})).?;
         defer row.deinit();
         break :blk row.int(0);
@@ -5305,6 +5505,8 @@ test "store migrates populated v1 WAL state into the v4 chain" {
     try std.testing.expectEqual(@as(i64, 1), try workspaceCount(&store));
     try std.testing.expectEqual(@as(u64, 0), try store.storeRevision());
     try std.testing.expect(try schema.testHasColumn(store.conn, "store_receipts", "response_payload"));
+    try std.testing.expect(try schema.testHasColumn(store.conn, "threads", "draft_images_json"));
+    try std.testing.expect(try schema.testHasColumn(store.conn, "messages", "extra_images_json"));
 }
 
 test "granular mutations are durable, idempotent, and revision guarded" {
@@ -5406,6 +5608,70 @@ test "granular mutations are durable, idempotent, and revision guarded" {
     });
     try std.testing.expect(!clear_missing_completion.applied);
     try std.testing.expectEqual(@as(u64, 9), clear_missing_completion.store_revision);
+}
+
+test "external chat draft mutation is atomic and rejects a stale GUI snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try testDbPath(&tmp);
+    defer std.testing.allocator.free(db_path);
+
+    var store = try Store.init(std.testing.allocator, db_path);
+    defer store.deinit();
+
+    const workspace = testWorkspace("draft-workspace", "Draft workspace");
+    _ = try store.upsertWorkspace(.{
+        .mutation = testHeader("draft-workspace", null),
+        .workspace = workspace,
+    });
+    const thread = testThread("draft-thread", "Draft thread");
+    _ = try store.upsertThread(.{
+        .mutation = testHeader("draft-thread", 1),
+        .workspace_id = workspace.workspace_id,
+        .thread = thread,
+    });
+
+    const set = try store.setChatDraft(.{
+        .mutation = testHeader("draft-set", 2),
+        .workspace_id = workspace.workspace_id,
+        .local_thread_id = thread.local_thread_id,
+        .text = "stage for review",
+    });
+    try std.testing.expectEqual(@as(u64, 3), set.store_revision);
+    const append = try store.setChatDraft(.{
+        .mutation = testHeader("draft-append", 3),
+        .workspace_id = workspace.workspace_id,
+        .local_thread_id = thread.local_thread_id,
+        .text = " please",
+        .append = true,
+    });
+    try std.testing.expectEqual(@as(u64, 4), append.store_revision);
+
+    const row = (try store.conn.row(
+        "select draft from threads t join workspaces w on w.id = t.workspace_id where w.workspace_id = ?1 and t.local_thread_id = ?2",
+        .{ workspace.workspace_id, thread.local_thread_id },
+    )).?;
+    defer row.deinit();
+    try std.testing.expectEqualStrings("stage for review please", row.text(0));
+
+    const stale_thread: store_protocol.Thread = .{
+        .local_thread_id = thread.local_thread_id,
+        .title = thread.title,
+        .draft = "",
+    };
+    const stale_workspace: store_protocol.Workspace = .{
+        .workspace_id = workspace.workspace_id,
+        .label = workspace.label,
+        .path = workspace.path,
+        .threads = &.{stale_thread},
+    };
+    try std.testing.expectError(error.Conflict, store.replaceSnapshot(.{
+        .mutation = testHeader("stale-draft-snapshot", 2),
+        .snapshot = .{
+            .store_revision = 2,
+            .workspaces = &.{stale_workspace},
+        },
+    }));
 }
 
 test "store duplicate request returns the original receipt without reapplying" {

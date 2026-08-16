@@ -14,6 +14,7 @@ const registry_protocol = @import("registry_protocol.zig");
 pub const METHOD_STATE_SNAPSHOT_REPLACE: []const u8 = "state.snapshot.replace";
 pub const METHOD_WORKSPACE_UPSERT: []const u8 = "workspace.upsert";
 pub const METHOD_CHAT_THREAD_UPSERT: []const u8 = "chat.thread.upsert";
+pub const METHOD_CHAT_DRAFT_SET: []const u8 = "chat.draft.set";
 pub const METHOD_CHAT_MESSAGE_APPEND: []const u8 = "chat.message.append";
 pub const METHOD_SURFACE_UPSERT: []const u8 = "surface.upsert";
 pub const METHOD_SURFACE_CLEAR: []const u8 = "surface.clear";
@@ -30,6 +31,7 @@ pub const METHOD_CHAT_TURN_RECORD: []const u8 = "chat.turn.record";
 pub const STATE_SNAPSHOT_REPLACE_METHOD = METHOD_STATE_SNAPSHOT_REPLACE;
 pub const WORKSPACE_UPSERT_METHOD = METHOD_WORKSPACE_UPSERT;
 pub const CHAT_THREAD_UPSERT_METHOD = METHOD_CHAT_THREAD_UPSERT;
+pub const CHAT_DRAFT_SET_METHOD = METHOD_CHAT_DRAFT_SET;
 pub const CHAT_MESSAGE_APPEND_METHOD = METHOD_CHAT_MESSAGE_APPEND;
 pub const SURFACE_UPSERT_METHOD = METHOD_SURFACE_UPSERT;
 pub const SURFACE_CLEAR_METHOD = METHOD_SURFACE_CLEAR;
@@ -215,6 +217,15 @@ pub const ThreadUpsertRequest = struct {
     mutation: MutationHeader,
     workspace_id: []const u8,
     thread: Thread,
+};
+
+/// Atomically replace or append one thread's composer draft.
+pub const ChatDraftSetRequest = struct {
+    mutation: MutationHeader,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    text: []const u8,
+    append: bool = false,
 };
 
 pub const MessageAppendRequest = struct {
@@ -769,6 +780,7 @@ test "store method names and error codes are pinned" {
     try std.testing.expectEqualStrings("state.snapshot.replace", METHOD_STATE_SNAPSHOT_REPLACE);
     try std.testing.expectEqualStrings("workspace.upsert", METHOD_WORKSPACE_UPSERT);
     try std.testing.expectEqualStrings("chat.thread.upsert", METHOD_CHAT_THREAD_UPSERT);
+    try std.testing.expectEqualStrings("chat.draft.set", METHOD_CHAT_DRAFT_SET);
     try std.testing.expectEqualStrings("chat.message.append", METHOD_CHAT_MESSAGE_APPEND);
     try std.testing.expectEqualStrings("surface.upsert", METHOD_SURFACE_UPSERT);
     try std.testing.expectEqualStrings("surface.clear", METHOD_SURFACE_CLEAR);

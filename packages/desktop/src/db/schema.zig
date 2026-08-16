@@ -6,9 +6,18 @@ const zqlite = @import("zqlite");
 /// Latest schema version understood by this build.
 pub const CURRENT_VERSION: i64 = 1;
 /// Maximum schema version understood by read-only clients and the daemon store.
-pub const MAX_SUPPORTED_VERSION: i64 = 4;
+pub const MAX_SUPPORTED_VERSION: i64 = 5;
 /// SQLite busy timeout shared by writer and read-only connections.
 pub const BUSY_TIMEOUT_MS = 5000;
+
+/// Stored shape of one attachment past the primary inside the additive v5
+/// `threads.draft_images_json` / `messages.extra_images_json` columns. Only
+/// genuinely known metadata is stored; mime may be empty.
+pub const StoredExtraImage = struct {
+    path: []const u8,
+    mime: []const u8 = "",
+    byte_size: u64 = 0,
+};
 
 pub const INIT_SQL: [:0]const u8 =
     \\create table if not exists app_state (
@@ -189,6 +198,12 @@ fn migrateToVersion(
                 try conn.execNoArgs("pragma user_version = 4");
                 version = 4;
             },
+            4 => {
+                try migrateV4ToV5(conn);
+                if (failure_point == .before_version_bump) return error.TestMigrationFailure;
+                try conn.execNoArgs("pragma user_version = 5");
+                version = 5;
+            },
             else => return error.DatabaseSchemaInvalid,
         }
     }
@@ -336,6 +351,15 @@ fn migrateV3ToV4(conn: zqlite.Conn) !void {
     );
 }
 
+fn migrateV4ToV5(conn: zqlite.Conn) !void {
+    // Multi-attachment durability: the single image_path/mime/byte_size
+    // columns keep the primary attachment for old readers, while every
+    // attachment past the first is carried as a compact JSON array so no
+    // composer or transcript image is silently narrowed to one.
+    try ensureColumn(conn, "threads", "draft_images_json", "alter table threads add column draft_images_json text");
+    try ensureColumn(conn, "messages", "extra_images_json", "alter table messages add column extra_images_json text");
+}
+
 fn migrateV0ToV1(conn: zqlite.Conn) !void {
     try conn.execNoArgs(INIT_SQL);
     try ensureColumn(conn, "app_state", "sidebar_collapsed", "alter table app_state add column sidebar_collapsed integer not null default 0");
@@ -472,6 +496,11 @@ test "schema migration chain advances v1 to v2 to v3 to v4 and preserves populat
     try std.testing.expect(unmapped_message.nullableText(0) == null);
     try std.testing.expect(unmapped_message.nullableInt(1) == null);
     try std.testing.expect(unmapped_message.nullableInt(2) == null);
+
+    try migrateToVersion(conn, 5, .none);
+    try std.testing.expectEqual(@as(i64, 5), try userVersion(conn));
+    try std.testing.expect(try testHasColumn(conn, "threads", "draft_images_json"));
+    try std.testing.expect(try testHasColumn(conn, "messages", "extra_images_json"));
 }
 
 test "v1 to v2 migration failure before version bump rolls back cleanly" {

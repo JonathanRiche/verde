@@ -335,6 +335,7 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
             .endpoint_env = live_endpoint.ENDPOINT_ENV,
             .terminal_binary_frames = false,
             .mcp_bridge = true,
+            .mcp_chat_tools = spec.mcp_chat_tools[0..],
         },
     };
     if (json) {
@@ -1674,6 +1675,10 @@ fn handleSession(allocator: std.mem.Allocator, out: output.Output, io: std.Io, e
 }
 
 fn handleLive(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8) !void {
+    if (unknownLiveFlag(argv)) |flag| {
+        try out.stderr("unknown flag for verde live: {s}\n", .{flag});
+        std.process.exit(2);
+    }
     const command = args.positional(argv, 0) orelse {
         try out.stderr("missing live command\n", .{});
         std.process.exit(2);
@@ -1742,6 +1747,93 @@ fn handleLive(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv
     }
     try out.stderr("unknown live command: {s}\n", .{command});
     std.process.exit(2);
+}
+
+fn unknownLiveFlag(argv: []const []const u8) ?[]const u8 {
+    var skip_value = false;
+    for (argv) |arg| {
+        if (skip_value) {
+            skip_value = false;
+            continue;
+        }
+        if (arg.len == 0 or arg[0] != '-') continue;
+        if (!liveFlagAllowed(argv, arg)) return arg;
+        skip_value = optionConsumesValue(arg);
+    }
+    return null;
+}
+
+fn liveFlagAllowed(argv: []const []const u8, flag: []const u8) bool {
+    if (std.mem.eql(u8, flag, "--json")) return true;
+    const command = if (argv.len > 0) argv[0] else return false;
+    const subcommand = if (argv.len > 1) argv[1] else "";
+    const draft_command = if (argv.len > 2) argv[2] else "";
+    const workspace_flags = [_][]const u8{ "--workspace", "--project" };
+    const pane_flags = [_][]const u8{ "--workspace", "--project", "--pane", "--focused" };
+
+    if (std.mem.eql(u8, command, "panes") or std.mem.eql(u8, command, "threads") or std.mem.eql(u8, command, "terminals")) {
+        return flagIn(flag, &workspace_flags);
+    }
+    if (std.mem.eql(u8, command, "inspect")) return flagIn(flag, &pane_flags);
+    if (std.mem.eql(u8, command, "workspace")) {
+        if (std.mem.eql(u8, subcommand, "create")) return std.mem.eql(u8, flag, "--path");
+        if (std.mem.eql(u8, subcommand, "rename")) return flagIn(flag, &.{ "--workspace", "--project", "--label", "--name" });
+        if (std.mem.eql(u8, subcommand, "select") or std.mem.eql(u8, subcommand, "close") or
+            std.mem.eql(u8, subcommand, "archive") or std.mem.eql(u8, subcommand, "reopen")) return flagIn(flag, &workspace_flags);
+        return false;
+    }
+    if (std.mem.eql(u8, command, "pane")) {
+        if (std.mem.eql(u8, subcommand, "split")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--focused", "--kind", "--axis" });
+        if (std.mem.eql(u8, subcommand, "resize")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--focused", "--first", "--second", "--axis", "--ratio" });
+        if (std.mem.eql(u8, subcommand, "move")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--focused", "--direction" });
+        if (std.mem.eql(u8, subcommand, "maximize")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--focused", "--on", "--off", "--toggle" });
+        if (std.mem.eql(u8, subcommand, "focus") or std.mem.eql(u8, subcommand, "close")) return flagIn(flag, &pane_flags);
+        return false;
+    }
+    if (std.mem.eql(u8, command, "chat")) {
+        if (std.mem.eql(u8, subcommand, "open")) return flagIn(flag, &.{ "--workspace", "--project", "--provider", "--model", "--reasoning", "--reasoning-variant", "--fast", "--no-fast", "--pane", "--axis", "--no-focus" });
+        if (std.mem.eql(u8, subcommand, "draft")) {
+            if (std.mem.eql(u8, draft_command, "get")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--focused", "--thread" });
+            if (std.mem.eql(u8, draft_command, "set") or std.mem.eql(u8, draft_command, "append")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--focused", "--thread", "--text" });
+            return false;
+        }
+        if (std.mem.eql(u8, subcommand, "send")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--focused", "--prompt", "--text", "--thread", "--path", "--turn" });
+        if (std.mem.eql(u8, subcommand, "followup")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--prompt", "--text" });
+        if (std.mem.eql(u8, subcommand, "approve")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--focused", "--turn", "--call", "--decision" });
+        if (std.mem.eql(u8, subcommand, "stop")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--focused", "--turn" });
+        if (std.mem.eql(u8, subcommand, "tail")) return flagIn(flag, &.{ "--turn", "--after" });
+        if (std.mem.eql(u8, subcommand, "read")) return flagIn(flag, &.{ "--workspace", "--project", "--thread" });
+        if (std.mem.eql(u8, subcommand, "status") or std.mem.eql(u8, subcommand, "transcript")) return flagIn(flag, &pane_flags);
+        return false;
+    }
+    if (std.mem.eql(u8, command, "browser")) {
+        if (std.mem.eql(u8, subcommand, "open")) return flagIn(flag, &.{ "--workspace", "--project", "--url" });
+        if (std.mem.eql(u8, subcommand, "navigate")) return std.mem.eql(u8, flag, "--url");
+        if (std.mem.eql(u8, subcommand, "pointer-down") or std.mem.eql(u8, subcommand, "pointer-move") or std.mem.eql(u8, subcommand, "pointer-up")) return flagIn(flag, &.{ "--x", "--y", "--button", "--ctrl", "--shift", "--alt", "--super" });
+        if (std.mem.eql(u8, subcommand, "toolbar-hit")) return std.mem.eql(u8, flag, "--target");
+        if (std.mem.eql(u8, subcommand, "paste-text")) return std.mem.eql(u8, flag, "--text");
+        if (std.mem.eql(u8, subcommand, "inspector-mode")) return std.mem.eql(u8, flag, "--mode");
+        if (std.mem.eql(u8, subcommand, "eval")) return std.mem.eql(u8, flag, "--script");
+        if (std.mem.eql(u8, subcommand, "post-json")) return std.mem.eql(u8, flag, "--json-payload");
+        return false;
+    }
+    if (std.mem.eql(u8, command, "palette")) return std.mem.eql(u8, subcommand, "run") and std.mem.eql(u8, flag, "--command");
+    if (std.mem.eql(u8, command, "terminal")) {
+        if (std.mem.eql(u8, subcommand, "write")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--focused", "--text" });
+        if (std.mem.eql(u8, subcommand, "key")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--focused", "--key", "--chord", "--ctrl", "--alt", "--shift", "--super" });
+        if (std.mem.eql(u8, subcommand, "tail")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--focused", "--lines" });
+        if (std.mem.eql(u8, subcommand, "submit") or std.mem.eql(u8, subcommand, "screen")) return flagIn(flag, &pane_flags);
+        return false;
+    }
+    if (std.mem.eql(u8, command, "process")) return flagIn(flag, &.{ "--workspace", "--project", "--pane", "--focused", "--name", "--lines" });
+    if (std.mem.eql(u8, command, "agent")) return std.mem.eql(u8, subcommand, "open") and flagIn(flag, &.{ "--workspace", "--project", "--provider" });
+    if (std.mem.eql(u8, command, "stack")) return flagIn(flag, &workspace_flags);
+    return false;
+}
+
+fn flagIn(flag: []const u8, allowed: []const []const u8) bool {
+    for (allowed) |candidate| if (std.mem.eql(u8, flag, candidate)) return true;
+    return false;
 }
 
 fn handleOpen(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
@@ -2621,9 +2713,36 @@ fn handleLivePane(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
         }, json);
         return;
     }
+    if (std.mem.eql(u8, subcommand, "maximize")) {
+        const mode = livePaneMaximizeMode(argv) catch {
+            try out.stderr("verde live pane maximize accepts exactly one of --on, --off, or --toggle\n", .{});
+            std.process.exit(2);
+        };
+        const pane = try paneOption(out, argv);
+        try sendLiveRequest(allocator, out, io, "pane.maximize", .{
+            .workspace = workspaceOption(argv),
+            .pane = pane,
+            .focused = args.hasFlag(argv, "--focused"),
+            .mode = @tagName(mode),
+        }, json);
+        return;
+    }
     const method = try std.fmt.allocPrint(allocator, "pane.{s}", .{subcommand});
     defer allocator.free(method);
     try sendLiveRequest(allocator, out, io, method, commonPaneParams(argv), json);
+}
+
+const LivePaneMaximizeMode = enum { on, off, toggle };
+
+fn livePaneMaximizeMode(argv: []const []const u8) error{ConflictingModes}!LivePaneMaximizeMode {
+    const on = args.hasFlag(argv, "--on");
+    const off = args.hasFlag(argv, "--off");
+    const toggle = args.hasFlag(argv, "--toggle");
+    const count = @as(u8, @intFromBool(on)) + @as(u8, @intFromBool(off)) + @as(u8, @intFromBool(toggle));
+    if (count > 1) return error.ConflictingModes;
+    if (on) return .on;
+    if (off) return .off;
+    return .toggle;
 }
 
 fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
@@ -2674,7 +2793,31 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
             try out.stderr("missing live chat draft command\n", .{});
             std.process.exit(2);
         };
-        const method = if (std.mem.eql(u8, draft_command, "set"))
+        if (args.optionValue(argv, "--thread")) |local_thread_id| {
+            const workspace_id = workspaceOption(argv) orelse {
+                try out.stderr("verde live chat draft {s} --thread requires --workspace\n", .{draft_command});
+                std.process.exit(2);
+            };
+            const response = (if (std.mem.eql(u8, draft_command, "get"))
+                chatDaemonDraftGetEnvelopeAlloc(allocator, io, workspace_id, local_thread_id)
+            else if (std.mem.eql(u8, draft_command, "set") or std.mem.eql(u8, draft_command, "append"))
+                chatDaemonDraftSetEnvelopeAlloc(allocator, io, .{
+                    .workspace_id = workspace_id,
+                    .local_thread_id = local_thread_id,
+                    .text = args.optionValue(argv, "--text") orelse trailingFreeArg(argv, 3) orelse "",
+                    .append = std.mem.eql(u8, draft_command, "append"),
+                })
+            else {
+                try out.stderr("unknown live chat draft command: {s}\n", .{draft_command});
+                std.process.exit(2);
+            }) catch |err| return chatDaemonCliFailure(out, err);
+            defer allocator.free(response);
+            try out.stdout("{s}\n", .{response});
+            return;
+        }
+        const method = if (std.mem.eql(u8, draft_command, "get"))
+            "chat.draft.get"
+        else if (std.mem.eql(u8, draft_command, "set"))
             "chat.draft.set"
         else if (std.mem.eql(u8, draft_command, "append"))
             "chat.draft.append"
@@ -2686,11 +2829,30 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
             .workspace = workspaceOption(argv),
             .pane = try paneOption(out, argv),
             .focused = args.hasFlag(argv, "--focused"),
-            .text = args.optionValue(argv, "--text") orelse trailingFreeArg(argv, 3) orelse "",
+            .text = if (std.mem.eql(u8, draft_command, "get")) null else args.optionValue(argv, "--text") orelse trailingFreeArg(argv, 3) orelse "",
         }, json);
         return;
     }
-    if (std.mem.eql(u8, subcommand, "send") or std.mem.eql(u8, subcommand, "followup")) {
+    if (std.mem.eql(u8, subcommand, "followup")) {
+        const workspace_id = workspaceOption(argv) orelse {
+            try out.stderr("verde live chat followup requires --workspace\n", .{});
+            std.process.exit(2);
+        };
+        const pane_id = (try paneOption(out, argv)).?;
+        const prompt = args.optionValue(argv, "--prompt") orelse args.optionValue(argv, "--text") orelse trailingFreeArg(argv, 2) orelse {
+            try out.stderr("verde live chat followup requires a prompt\n", .{});
+            std.process.exit(2);
+        };
+        const response = chatDaemonFollowupEnvelopeAlloc(allocator, io, .{
+            .workspace_id = workspace_id,
+            .pane_id = pane_id,
+            .prompt = prompt,
+        }) catch |err| return chatDaemonCliFailure(out, err);
+        defer allocator.free(response);
+        try out.stdout("{s}\n", .{response});
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "send")) {
         const prompt = args.optionValue(argv, "--prompt") orelse args.optionValue(argv, "--text") orelse trailingFreeArg(argv, 2);
         // M4-P5: thread-addressed sends are daemon-owned and go daemon-direct
         // (works with no GUI; old daemon → capability_unavailable, no Live
@@ -2718,8 +2880,7 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
             try out.stdout("{s}\n", .{response});
             return;
         }
-        const method = if (std.mem.eql(u8, subcommand, "send")) "chat.send" else "chat.followup";
-        try sendLiveRequest(allocator, out, io, method, .{
+        try sendLiveRequest(allocator, out, io, "chat.send", .{
             .workspace = workspaceOption(argv),
             .pane = try paneOption(out, argv),
             .focused = args.hasFlag(argv, "--focused"),
@@ -3952,7 +4113,11 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
         .{ .name = "workspace", .type_name = "string", .description = "Optional workspace id, index, path, or current; defaults to the desktop-selected workspace." },
     });
     try writeMcpTypedTool(&s, "open_chat", "Create a durable chat thread in an explicitly selected Verde workspace and return its stable ids. The workspace row must already exist in the session daemon store (the desktop dual-write creates it; open_chat never creates workspaces). With the desktop GUI running the thread is also presented as a native chat pane; with no GUI it is created daemon-direct.", &OPEN_CHAT_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "present_chat", "Present an existing durable chat thread in the desktop GUI. Use this to recover a headless or deferred open_chat result.", &CHAT_PRESENT_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "set_chat_draft", "Stage or append a composer draft without sending it. Address either a live pane_id or a durable local_thread_id.", &CHAT_DRAFT_SET_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "get_chat_draft", "Read a staged composer draft without sending it. Address either a live pane_id or a durable local_thread_id.", &CHAT_DRAFT_GET_MCP_INPUTS);
     try writeMcpTypedTool(&s, "send_chat_message", "Send a prompt on an existing chat thread daemon-direct (no GUI required) and return the accepted turn_id. The thread and its workspace row must already exist in the daemon store (open_chat creates the thread, the desktop dual-write creates the workspace). Poll tail_chat_turn for streaming events and completion.", &CHAT_SEND_MCP_INPUTS);
+    try writeMcpTypedTool(&s, "queue_chat_followup", "Queue or steer a prompt into a running chat pane through the session daemon. The durable pane mapping is resolved without the GUI; idle panes and unsupported provider harnesses return a structured invalid_state error.", &CHAT_FOLLOWUP_MCP_INPUTS);
     try writeMcpTypedTool(&s, "tail_chat_turn", "Read a chat turn's streamed events and status daemon-direct. Terminal status (completed/failed/aborted) is published only after the durable transcript commit.", &CHAT_TAIL_MCP_INPUTS);
     try writeMcpTypedTool(&s, "approve_chat_turn", "Approve or deny a chat turn's pending tool approval daemon-direct. Returns not_found both for an unknown turn and for a turn with no pending approval matching call_id; re-check tail_chat_turn before retrying.", &CHAT_APPROVE_MCP_INPUTS);
     try writeMcpTypedTool(&s, "stop_chat_turn", "Stop a running chat turn daemon-direct. The interruption still commits durably. Stopping an already-terminal turn is an accepted no-op, not an error.", &CHAT_STOP_MCP_INPUTS);
@@ -4108,6 +4273,30 @@ const OPEN_CHAT_MCP_INPUTS = [_]McpToolInput{
     .{ .name = "axis", .type_name = "string", .description = "Optional split axis: horizontal or vertical; defaults to horizontal." },
 };
 
+const CHAT_PRESENT_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "workspace_id", .type_name = "string", .description = "Stable workspace id owning the thread.", .required = true },
+    .{ .name = "local_thread_id", .type_name = "string", .description = "Stable existing thread id.", .required = true },
+    .{ .name = "target_pane_id", .type_name = "integer", .description = "Optional pane beside which to place the chat." },
+    .{ .name = "axis", .type_name = "string", .enum_values = &.{ "horizontal", "vertical" }, .description = "Optional split axis; defaults to horizontal." },
+    .{ .name = "focus", .type_name = "boolean", .description = "Focus the presented chat; defaults to true." },
+};
+
+const CHAT_DRAFT_SET_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "workspace_id", .type_name = "string", .description = "Stable workspace id; required with local_thread_id and accepted with pane_id." },
+    .{ .name = "workspace", .type_name = "string", .description = "Live workspace selector used with pane_id." },
+    .{ .name = "local_thread_id", .type_name = "string", .description = "Durable thread address. Use exactly one of local_thread_id or pane_id." },
+    .{ .name = "pane_id", .type_name = "integer", .description = "Live pane address. Use exactly one of pane_id or local_thread_id." },
+    .{ .name = "text", .type_name = "string", .description = "Draft text to stage or append.", .required = true },
+    .{ .name = "append", .type_name = "boolean", .description = "Append instead of replacing; defaults to false." },
+};
+
+const CHAT_DRAFT_GET_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "workspace_id", .type_name = "string", .description = "Stable workspace id; required with local_thread_id and accepted with pane_id." },
+    .{ .name = "workspace", .type_name = "string", .description = "Live workspace selector used with pane_id." },
+    .{ .name = "local_thread_id", .type_name = "string", .description = "Durable thread address. Use exactly one of local_thread_id or pane_id." },
+    .{ .name = "pane_id", .type_name = "integer", .description = "Live pane address. Use exactly one of pane_id or local_thread_id." },
+};
+
 // M4-P5 daemon-direct chat tools: these call `chat.turn.*` / `chat.thread.get`
 // on the session daemon behind the shared chat capability check; an old daemon
 // (chat=false) yields a structured capability_unavailable error and is never
@@ -4118,6 +4307,12 @@ const CHAT_SEND_MCP_INPUTS = [_]McpToolInput{
     .{ .name = "prompt", .type_name = "string", .description = "User prompt text for the new turn.", .required = true },
     .{ .name = "project_path", .type_name = "string", .description = "Optional provider working directory; defaults to VERDE_WORKSPACE_PATH. Required when that environment variable is absent." },
     .{ .name = "turn_id", .type_name = "string", .description = "Optional stable turn id for idempotent retry; minted when omitted." },
+};
+
+const CHAT_FOLLOWUP_MCP_INPUTS = [_]McpToolInput{
+    .{ .name = "workspace_id", .type_name = "string", .description = "Stable workspace id owning the pane.", .required = true },
+    .{ .name = "pane_id", .type_name = "integer", .description = "Durably persisted chat pane id. Resolving it never focuses or scrolls the GUI.", .required = true },
+    .{ .name = "prompt", .type_name = "string", .description = "Text to queue or steer into the running turn.", .required = true },
 };
 
 const CHAT_TAIL_MCP_INPUTS = [_]McpToolInput{
@@ -4348,6 +4543,58 @@ fn mcpToolsCall(
     // M4-P5 daemon-direct chat tools: capability-checked against the session
     // daemon; an old daemon (chat=false) yields the structured
     // capability_unavailable error below and is never re-routed through Live.
+    if (std.mem.eql(u8, tool_name, "set_chat_draft") or std.mem.eql(u8, tool_name, "get_chat_draft")) {
+        const local_thread_id = mcpArgString(arguments, "local_thread_id");
+        const draft_pane_id = mcpArgU32(arguments, "pane_id");
+        if (mcpArgIsNonNull(arguments, "pane_id") and draft_pane_id == null) {
+            return try mcpError(allocator, out, id_value, -32602, "chat draft pane_id must be a non-negative integer");
+        }
+        if ((local_thread_id == null) == (draft_pane_id == null)) {
+            return try mcpError(allocator, out, id_value, -32602, "chat draft tools require exactly one of local_thread_id or pane_id");
+        }
+        const draft_workspace = mcpArgString(arguments, "workspace_id") orelse workspace;
+        if (local_thread_id) |thread_id| {
+            const workspace_id = draft_workspace orelse
+                return try mcpError(allocator, out, id_value, -32602, "thread-addressed chat draft requires workspace_id");
+            const response = if (std.mem.eql(u8, tool_name, "set_chat_draft")) blk: {
+                const draft_text = mcpArgString(arguments, "text") orelse
+                    return try mcpError(allocator, out, id_value, -32602, "set_chat_draft requires text");
+                const append = mcpArgBool(arguments, "append");
+                if (mcpArgIsNonNull(arguments, "append") and append == null) {
+                    return try mcpError(allocator, out, id_value, -32602, "set_chat_draft append must be a boolean");
+                }
+                break :blk chatDaemonDraftSetEnvelopeAlloc(allocator, io, .{
+                    .workspace_id = workspace_id,
+                    .local_thread_id = thread_id,
+                    .text = draft_text,
+                    .append = append orelse false,
+                });
+            } else chatDaemonDraftGetEnvelopeAlloc(allocator, io, workspace_id, thread_id);
+            const resolved = response catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
+            defer allocator.free(resolved);
+            return try mcpToolTextResult(allocator, out, id_value, resolved, tool_name);
+        }
+        const pane = draft_pane_id.?;
+        const response = if (std.mem.eql(u8, tool_name, "set_chat_draft")) blk: {
+            const draft_text = mcpArgString(arguments, "text") orelse
+                return try mcpError(allocator, out, id_value, -32602, "set_chat_draft requires text");
+            const append = mcpArgBool(arguments, "append");
+            if (mcpArgIsNonNull(arguments, "append") and append == null) {
+                return try mcpError(allocator, out, id_value, -32602, "set_chat_draft append must be a boolean");
+            }
+            break :blk sendLiveRequestAlloc(allocator, io, if (append orelse false) "chat.draft.append" else "chat.draft.set", .{
+                .workspace = draft_workspace,
+                .pane = pane,
+                .text = draft_text,
+            }, 1);
+        } else sendLiveRequestAlloc(allocator, io, "chat.draft.get", .{
+            .workspace = draft_workspace,
+            .pane = pane,
+        }, 1);
+        const resolved = response catch |err| return try mcpLiveCallError(allocator, out, id_value, tool_name, err);
+        defer allocator.free(resolved);
+        return try mcpToolLiveTextResult(allocator, out, id_value, resolved, tool_name);
+    }
     if (std.mem.eql(u8, tool_name, "send_chat_message")) {
         const workspace_id = mcpArgString(arguments, "workspace_id") orelse
             return try mcpError(allocator, out, id_value, -32602, "send_chat_message requires workspace_id");
@@ -4364,6 +4611,21 @@ fn mcpToolsCall(
             .prompt = prompt,
             .project_path = project_path,
             .turn_id = mcpArgString(arguments, "turn_id"),
+        }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
+        defer allocator.free(response);
+        return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
+    }
+    if (std.mem.eql(u8, tool_name, "queue_chat_followup")) {
+        const workspace_id = mcpArgString(arguments, "workspace_id") orelse
+            return try mcpError(allocator, out, id_value, -32602, "queue_chat_followup requires workspace_id");
+        const followup_pane_id = mcpArgU32(arguments, "pane_id") orelse
+            return try mcpError(allocator, out, id_value, -32602, "queue_chat_followup requires a non-negative pane_id");
+        const prompt = mcpArgString(arguments, "prompt") orelse
+            return try mcpError(allocator, out, id_value, -32602, "queue_chat_followup requires prompt");
+        const response = chatDaemonFollowupEnvelopeAlloc(allocator, io, .{
+            .workspace_id = workspace_id,
+            .pane_id = followup_pane_id,
+            .prompt = prompt,
         }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
         defer allocator.free(response);
         return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
@@ -4417,6 +4679,89 @@ fn mcpToolsCall(
         defer allocator.free(response);
         return try mcpToolTextResult(allocator, out, id_value, response, tool_name);
     }
+    if (std.mem.eql(u8, tool_name, "present_chat")) {
+        const workspace_id = mcpArgString(arguments, "workspace_id") orelse
+            return try mcpError(allocator, out, id_value, -32602, "present_chat requires workspace_id");
+        const local_thread_id = mcpArgString(arguments, "local_thread_id") orelse
+            return try mcpError(allocator, out, id_value, -32602, "present_chat requires local_thread_id");
+        const target_pane_id = mcpArgU32(arguments, "target_pane_id");
+        if (mcpArgIsNonNull(arguments, "target_pane_id") and target_pane_id == null) {
+            return try mcpError(allocator, out, id_value, -32602, "present_chat target_pane_id must be a non-negative integer");
+        }
+        const axis = mcpArgString(arguments, "axis");
+        if (mcpArgIsNonNull(arguments, "axis") and axis == null) {
+            return try mcpError(allocator, out, id_value, -32602, "present_chat axis must be a string");
+        }
+        const focus = mcpArgBool(arguments, "focus");
+        if (mcpArgIsNonNull(arguments, "focus") and focus == null) {
+            return try mcpError(allocator, out, id_value, -32602, "present_chat focus must be a boolean");
+        }
+
+        const thread_response = chatDaemonCallEnvelopeAlloc(allocator, io, headless.store.METHOD_CHAT_THREAD_GET, .{
+            .workspace_id = workspace_id,
+            .local_thread_id = local_thread_id,
+        }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
+        defer allocator.free(thread_response);
+        var thread_parsed = std.json.parseFromSlice(std.json.Value, allocator, thread_response, .{}) catch |err|
+            return try mcpError(allocator, out, id_value, -32000, @errorName(err));
+        defer thread_parsed.deinit();
+        const thread_ok = if (thread_parsed.value == .object)
+            jsonBool(thread_parsed.value.object.get("ok") orelse .null)
+        else
+            null;
+        if (!(thread_ok orelse false)) {
+            return try mcpToolTextResult(allocator, out, id_value, thread_response, tool_name);
+        }
+        const store_revision = chatThreadEnvelopeStoreRevision(thread_parsed.value) orelse
+            return try mcpError(allocator, out, id_value, -32000, "chat.thread.get response omitted store_revision");
+
+        var presentation_ambiguous = false;
+        const presentation_deadline_ms = sessionizer.monotonicNowMs() +| CHAT_OPEN_PRESENT_DEADLINE_MS;
+        while (presentationRemainingMs(presentation_deadline_ms)) |remaining_ms| {
+            const present = sendLiveRequestAllocWithTimeout(allocator, "chat.present", .{
+                .workspace_id = workspace_id,
+                .local_thread_id = local_thread_id,
+                .store_revision = store_revision,
+                .target_pane_id = target_pane_id,
+                .axis = axis orelse "horizontal",
+                .focus = focus orelse true,
+            }, 1, presentationTransportTimeoutMs(remaining_ms)) catch {
+                presentation_ambiguous = true;
+                sleepChatPresentationRetry(io, presentation_deadline_ms);
+                continue;
+            };
+            defer allocator.free(present);
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, present, .{}) catch {
+                presentation_ambiguous = true;
+                sleepChatPresentationRetry(io, presentation_deadline_ms);
+                continue;
+            };
+            defer parsed.deinit();
+            if (parseChatOpenPresentation(parsed.value, workspace_id, local_thread_id, store_revision) != null) {
+                return try mcpToolLiveTextResult(allocator, out, id_value, present, tool_name);
+            }
+            const error_code = liveEnvelopeErrorCode(parsed.value) orelse {
+                presentation_ambiguous = true;
+                sleepChatPresentationRetry(io, presentation_deadline_ms);
+                continue;
+            };
+            if (!std.mem.eql(u8, error_code, "projection_pending") and
+                !std.mem.eql(u8, error_code, "projection_revision_pending"))
+            {
+                return try mcpToolLiveTextResult(allocator, out, id_value, present, tool_name);
+            }
+            sleepChatPresentationRetry(io, presentation_deadline_ms);
+        }
+        const deferred = try composeChatPresentDeferredAlloc(
+            allocator,
+            workspace_id,
+            local_thread_id,
+            store_revision,
+            presentation_ambiguous,
+        );
+        defer allocator.free(deferred);
+        return try mcpToolTextResult(allocator, out, id_value, deferred, tool_name);
+    }
     if (std.mem.eql(u8, tool_name, "wait_for_process")) {
         const process_id = mcpArgString(arguments, "process_id") orelse
             return try mcpError(allocator, out, id_value, -32602, "wait_for_process requires process_id");
@@ -4454,9 +4799,11 @@ fn mcpToolsCall(
             if (mcpArgIsNonNull(arguments, "axis") and axis == null) {
                 return try mcpError(allocator, out, id_value, -32602, "open_chat axis must be a string");
             }
-            // A running GUI validates first without mutation. Identity is then
-            // created daemon-first and Live only presents that exact projected
-            // identity. No GUI retains the daemon-direct behavior.
+            // A running GUI validates first without mutation, then uses the
+            // same immediate chat.open path as the Live CLI. This is important
+            // while another pane is maximized: chat.open can create and return
+            // the pane immediately, whereas daemon-first projection is gated
+            // until the workspace layout is restored.
             const validation_response = sendLiveRequestAlloc(allocator, io, "chat.open.validate", .{
                 .workspace_id = workspace_id,
                 .provider = provider,
@@ -4483,114 +4830,47 @@ fn mcpToolsCall(
                 if (validation_route == .validated) {
                     const validated = parseChatOpenValidation(validation_parsed.value, workspace_id, provider) orelse
                         return try mcpError(allocator, out, id_value, -32000, "invalid chat.open.validate response");
-                    const daemon_response = chatDaemonOpenThreadEnvelopeAlloc(allocator, io, .{
+                    const live_response = sendLiveRequestAlloc(allocator, io, "chat.open", .{
                         .workspace_id = validated.workspace_id,
                         .provider = validated.provider,
                         .model = validated.model,
                         .reasoning_effort = validated.reasoning_effort,
                         .reasoning_variant = validated.reasoning_variant,
                         .fast_mode = validated.fast_mode,
-                    }) catch |err| return try mcpChatDaemonError(allocator, out, id_value, err);
-                    defer allocator.free(daemon_response);
-                    var daemon_parsed = std.json.parseFromSlice(std.json.Value, allocator, daemon_response, .{}) catch |err| return try mcpError(allocator, out, id_value, -32000, @errorName(err));
-                    defer daemon_parsed.deinit();
-                    const daemon_result = if (daemon_parsed.value == .object) daemon_parsed.value.object.get("result") else null;
-                    if (daemon_result == null or daemon_result.? != .object) return try mcpToolTextResult(allocator, out, id_value, daemon_response, tool_name);
-                    const daemon_core = daemon_result.?.object;
-                    const durable_workspace_id = jsonString(daemon_core.get("workspace_id") orelse .null) orelse
-                        return try mcpToolTextResult(allocator, out, id_value, daemon_response, tool_name);
-                    const local_thread_id = jsonString(daemon_core.get("local_thread_id") orelse .null) orelse
-                        return try mcpToolTextResult(allocator, out, id_value, daemon_response, tool_name);
-                    const daemon_store_revision = nonNegativeJsonInteger(daemon_core.get("store_revision") orelse .null) orelse
-                        return try mcpError(allocator, out, id_value, -32000, "invalid daemon store_revision");
-
-                    var presentation_ambiguous = false;
-                    const presentation_deadline_ms = sessionizer.monotonicNowMs() +| CHAT_OPEN_PRESENT_DEADLINE_MS;
-                    while (presentationRemainingMs(presentation_deadline_ms)) |remaining_ms| {
-                        const present = sendLiveRequestAllocWithTimeout(allocator, "chat.present", .{
-                            .workspace_id = workspace_id,
-                            .local_thread_id = local_thread_id,
-                            .store_revision = daemon_store_revision,
-                            .target_pane_id = target_pane_id,
-                            .axis = axis orelse "horizontal",
-                            .focus = true,
-                        }, 1, presentationTransportTimeoutMs(remaining_ms)) catch {
-                            presentation_ambiguous = true;
-                            sleepChatPresentationRetry(io, presentation_deadline_ms);
-                            continue;
-                        };
-                        defer allocator.free(present);
-                        var parsed = std.json.parseFromSlice(std.json.Value, allocator, present, .{}) catch {
-                            presentation_ambiguous = true;
-                            sleepChatPresentationRetry(io, presentation_deadline_ms);
-                            continue;
-                        };
-                        defer parsed.deinit();
-
-                        if (parsed.value != .object) {
-                            presentation_ambiguous = true;
-                            sleepChatPresentationRetry(io, presentation_deadline_ms);
-                            continue;
-                        }
-                        const present_ok = jsonBool(parsed.value.object.get("ok") orelse .null) orelse {
-                            presentation_ambiguous = true;
-                            sleepChatPresentationRetry(io, presentation_deadline_ms);
-                            continue;
-                        };
-                        if (present_ok) {
-                            const presentation = parseChatOpenPresentation(
-                                parsed.value,
+                        .target_pane_id = target_pane_id,
+                        .axis = axis orelse "horizontal",
+                        .focus = true,
+                    }, 1) catch |err| return try mcpLiveCallError(allocator, out, id_value, tool_name, err);
+                    defer allocator.free(live_response);
+                    var live_parsed = std.json.parseFromSlice(std.json.Value, allocator, live_response, .{}) catch |err|
+                        return try mcpError(allocator, out, id_value, -32000, @errorName(err));
+                    defer live_parsed.deinit();
+                    switch (classifyChatOpenLiveEnvelope(live_parsed.value)) {
+                        .not_ok => return try mcpToolLiveTextResult(allocator, out, id_value, live_response, tool_name),
+                        .missing_ids => return try mcpError(allocator, out, id_value, -32000, "chat.open succeeded without a stable thread id"),
+                        .ids => |ids| {
+                            const durable_workspace_id = ids.workspace_id orelse validated.workspace_id;
+                            const confirmation = chatOpenConfirmThreadDurable(
+                                allocator,
+                                io,
                                 durable_workspace_id,
-                                local_thread_id,
-                                daemon_store_revision,
-                            ) orelse {
-                                presentation_ambiguous = true;
-                                sleepChatPresentationRetry(io, presentation_deadline_ms);
-                                continue;
-                            };
-                            const composed = try composeChatOpenPresentationAlloc(allocator, daemon_core, presentation);
-                            defer allocator.free(composed);
-                            return try mcpToolTextResult(allocator, out, id_value, composed, tool_name);
-                        }
-                        const error_code = liveEnvelopeErrorCode(parsed.value) orelse {
-                            presentation_ambiguous = true;
-                            sleepChatPresentationRetry(io, presentation_deadline_ms);
-                            continue;
-                        };
-                        if (std.mem.eql(u8, error_code, "projection_refresh_unavailable")) {
-                            const status = terminalChatOpenPresentation(presentation_ambiguous, "refresh_unavailable");
-                            const composed = try composeChatOpenStatusAlloc(allocator, daemon_core, status.presented, status.status);
-                            defer allocator.free(composed);
-                            return try mcpToolTextResult(allocator, out, id_value, composed, tool_name);
-                        }
-                        if (std.mem.eql(u8, error_code, "projection_identity_missing") or std.mem.eql(u8, error_code, "projection_superseded")) {
-                            const status = terminalChatOpenPresentation(presentation_ambiguous, "projection_identity_missing");
-                            const composed = try composeChatOpenStatusAlloc(allocator, daemon_core, status.presented, status.status);
-                            defer allocator.free(composed);
-                            return try mcpToolTextResult(allocator, out, id_value, composed, tool_name);
-                        }
-                        if (!std.mem.eql(u8, error_code, "projection_pending") and !std.mem.eql(u8, error_code, "projection_revision_pending")) {
-                            // Durability already succeeded. Preserve the durable
-                            // success shape rather than converting presentation
-                            // failure into a false thread failure.
-                            const composed = if (presentation_ambiguous)
-                                try composeChatOpenStatusAlloc(allocator, daemon_core, null, "unknown")
-                            else
-                                try composeChatOpenStatusAlloc(allocator, daemon_core, false, "rejected");
-                            defer allocator.free(composed);
-                            return try mcpToolTextResult(allocator, out, id_value, composed, tool_name);
-                        }
-                        sleepChatPresentationRetry(io, presentation_deadline_ms);
+                                ids.local_thread_id,
+                                CHAT_OPEN_CONFIRM_ATTEMPTS,
+                                CHAT_OPEN_CONFIRM_DELAY_MS,
+                            ) catch |err| return try mcpError(allocator, out, id_value, -32000, @errorName(err));
+                            switch (confirmation) {
+                                .durable, .capability_skip => return try mcpToolLiveTextResult(allocator, out, id_value, live_response, tool_name),
+                                .timeout => return try mcpChatOpenNotDurable(
+                                    allocator,
+                                    out,
+                                    id_value,
+                                    durable_workspace_id,
+                                    ids.local_thread_id,
+                                    "confirmation deadline elapsed",
+                                ),
+                            }
+                        },
                     }
-                    const exhausted = exhaustedChatOpenPresentation(presentation_ambiguous);
-                    const composed = try composeChatOpenStatusAlloc(
-                        allocator,
-                        daemon_core,
-                        exhausted.presented,
-                        exhausted.status,
-                    );
-                    defer allocator.free(composed);
-                    return try mcpToolTextResult(allocator, out, id_value, composed, tool_name);
                 }
             }
             // No GUI: return through mcpToolTextResult directly so a daemon
@@ -5017,6 +5297,250 @@ fn chatDaemonCallEnvelopeAlloc(
     return try daemonResponseEnvelopeAlloc(allocator, &parsed);
 }
 
+const ChatDaemonDraftSetArgs = struct {
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    text: []const u8,
+    append: bool = false,
+};
+
+fn chatDaemonDraftSetEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, draft: ChatDaemonDraftSetArgs) ![]u8 {
+    const exe_path = try platform_runtime.executablePathAlloc(allocator);
+    defer allocator.free(exe_path);
+    try ensureSessionDaemon(allocator, io, exe_path);
+    const pref_path = try prefPath(allocator);
+    defer allocator.free(pref_path);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    const arena = decode_arena.allocator();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = arena,
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(arena, &transport);
+    try chatDaemonRequireCapability(&client);
+
+    var registered = try client.call(headless.registry.METHOD_DAEMON_CLIENT_REGISTER, .{ .persistent = false });
+    defer registered.deinit();
+    if (registered.response.err != null) return error.SessionDaemonUnavailable;
+    const client_id = (try client.decodeClientRegister(&registered)).client_id;
+    const request_key = try std.fmt.allocPrint(arena, "cli:chat.draft:{s}:{s}:{d}", .{ draft.workspace_id, draft.local_thread_id, unixTimestampMs() });
+
+    var attempt: u8 = 0;
+    while (attempt < 2) : (attempt += 1) {
+        var get = try client.call(headless.store.METHOD_CHAT_THREAD_GET, .{
+            .workspace_id = draft.workspace_id,
+            .local_thread_id = draft.local_thread_id,
+        });
+        defer get.deinit();
+        if (!get.response.isOk()) return try daemonResponseEnvelopeAlloc(allocator, &get);
+        const observed = try client.decodeThreadGet(&get);
+        const next_draft = if (draft.append)
+            try std.fmt.allocPrint(arena, "{s}{s}", .{ observed.thread.draft, draft.text })
+        else
+            draft.text;
+        var written = try client.call(headless.store.METHOD_CHAT_DRAFT_SET, headless.store.ChatDraftSetRequest{
+            .mutation = .{
+                .request_key = request_key,
+                .expected_store_revision = observed.store_revision,
+                .client_id = client_id,
+            },
+            .workspace_id = draft.workspace_id,
+            .local_thread_id = draft.local_thread_id,
+            .text = draft.text,
+            .append = draft.append,
+        });
+        defer written.deinit();
+        if (!written.response.isOk()) {
+            const err = written.response.err.?;
+            if (attempt == 0 and std.mem.eql(u8, err.code, headless.protocol.ERR_CONFLICT)) continue;
+            return try daemonResponseEnvelopeAlloc(allocator, &written);
+        }
+        const result = try client.decodeWriteResult(&written);
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        errdefer writer.deinit();
+        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try s.beginObject();
+        try s.objectField("ok");
+        try s.write(true);
+        try s.objectField("result");
+        try s.write(.{
+            .workspace_id = draft.workspace_id,
+            .local_thread_id = draft.local_thread_id,
+            .draft = next_draft,
+            .draft_len = next_draft.len,
+            .draft_store_revision = result.store_revision,
+            .appended = draft.append,
+        });
+        try s.endObject();
+        return try writer.toOwnedSlice();
+    }
+    unreachable;
+}
+
+fn chatDaemonDraftGetEnvelopeAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+) ![]u8 {
+    const response = try chatDaemonCallEnvelopeAlloc(allocator, io, headless.store.METHOD_CHAT_THREAD_GET, .{
+        .workspace_id = workspace_id,
+        .local_thread_id = local_thread_id,
+    });
+    defer allocator.free(response);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object or !(jsonBool(parsed.value.object.get("ok") orelse .null) orelse false)) {
+        return allocator.dupe(u8, response);
+    }
+    const result = parsed.value.object.get("result") orelse return error.InvalidResponse;
+    if (result != .object) return error.InvalidResponse;
+    const thread = result.object.get("thread") orelse return error.InvalidResponse;
+    if (thread != .object) return error.InvalidResponse;
+    const draft = jsonString(thread.object.get("draft") orelse .null) orelse return error.InvalidResponse;
+    const store_revision = nonNegativeJsonInteger(result.object.get("store_revision") orelse .null) orelse return error.InvalidResponse;
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    try s.objectField("ok");
+    try s.write(true);
+    try s.objectField("result");
+    try s.write(.{
+        .workspace_id = workspace_id,
+        .local_thread_id = local_thread_id,
+        .draft = draft,
+        .draft_len = draft.len,
+        .draft_store_revision = store_revision,
+    });
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+const CHAT_FOLLOWUP_THREAD_LIST_LIMIT: u32 = 10_000;
+
+const ChatDaemonFollowupArgs = struct {
+    workspace_id: []const u8,
+    pane_id: u32,
+    prompt: []const u8,
+};
+
+fn chatPaneThreadIndexFromLayout(allocator: std.mem.Allocator, layout_json: []const u8, pane_id: u32) !?usize {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, layout_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const panes = parsed.value.object.get("panes") orelse return null;
+    if (panes != .array) return null;
+    for (panes.array.items) |pane| {
+        if (pane != .object) continue;
+        const id = jsonUsize(pane.object.get("id") orelse .null) orelse continue;
+        if (id != pane_id) continue;
+        const kind = jsonString(pane.object.get("kind") orelse .null) orelse return null;
+        if (!std.mem.eql(u8, kind, "chat")) return null;
+        return jsonUsize(pane.object.get("thread") orelse .null);
+    }
+    return null;
+}
+
+fn chatDaemonErrorEnvelopeAlloc(allocator: std.mem.Allocator, code: []const u8, message: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.write(.{ .ok = false, .@"error" = .{ .code = code, .message = message } });
+    return try writer.toOwnedSlice();
+}
+
+fn chatDaemonFollowupSuccessEnvelopeAlloc(
+    allocator: std.mem.Allocator,
+    followup: ChatDaemonFollowupArgs,
+    local_thread_id: []const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.write(.{
+        .ok = true,
+        .result = .{
+            .accepted = true,
+            .workspace_id = followup.workspace_id,
+            .pane_id = followup.pane_id,
+            .local_thread_id = local_thread_id,
+            .disposition = "steered",
+        },
+    });
+    return try writer.toOwnedSlice();
+}
+
+/// Resolve a persisted pane through daemon-owned workspace/thread metadata,
+/// then invoke the daemon follow-up method by stable thread identity. This
+/// path never opens the Live socket or reads GUI projection state.
+fn chatDaemonFollowupEnvelopeAlloc(allocator: std.mem.Allocator, io: std.Io, followup: ChatDaemonFollowupArgs) ![]u8 {
+    const exe_path = try platform_runtime.executablePathAlloc(allocator);
+    defer allocator.free(exe_path);
+    try ensureSessionDaemon(allocator, io, exe_path);
+    const pref_path = try prefPath(allocator);
+    defer allocator.free(pref_path);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    const arena = decode_arena.allocator();
+    var transport: sessionizer.HeadlessTransport = .{
+        .allocator = arena,
+        .pref_path = pref_path,
+    };
+    var client = sessionizer.headlessClient(arena, &transport);
+    try chatDaemonRequireCapability(&client);
+
+    var snapshot_response = try client.call(headless.store.METHOD_CORE_SNAPSHOT, headless.store.CoreSnapshotRequest{
+        .workspace_id = followup.workspace_id,
+        .scopes = &.{headless.store.SNAPSHOT_SCOPE_WORKSPACES},
+    });
+    defer snapshot_response.deinit();
+    if (!snapshot_response.response.isOk()) return try daemonResponseEnvelopeAlloc(allocator, &snapshot_response);
+    const snapshot = try client.decodeCompositeSnapshot(&snapshot_response);
+    const workspace = if (snapshot.snapshot.workspaces.len == 1)
+        snapshot.snapshot.workspaces[0]
+    else
+        return try chatDaemonErrorEnvelopeAlloc(allocator, "not_found", "workspace not found");
+    const layout_json = workspace.workspace_layout_json orelse
+        return try chatDaemonErrorEnvelopeAlloc(allocator, "not_found", "chat pane not found");
+    const thread_index = chatPaneThreadIndexFromLayout(arena, layout_json, followup.pane_id) catch
+        return try chatDaemonErrorEnvelopeAlloc(allocator, "invalid_state", "persisted workspace layout is malformed");
+    const wanted_thread_index = thread_index orelse
+        return try chatDaemonErrorEnvelopeAlloc(allocator, "not_found", "chat pane not found");
+
+    var list_response = try client.call(headless.store.METHOD_CHAT_THREAD_LIST, headless.store.ThreadListRequest{
+        .workspace_id = followup.workspace_id,
+        .limit = CHAT_FOLLOWUP_THREAD_LIST_LIMIT,
+    });
+    defer list_response.deinit();
+    if (!list_response.response.isOk()) return try daemonResponseEnvelopeAlloc(allocator, &list_response);
+    const thread_list = try client.decodeThreadList(&list_response);
+    var local_thread_id: ?[]const u8 = null;
+    for (thread_list.threads) |thread| {
+        if (thread.sort_index == wanted_thread_index) {
+            local_thread_id = thread.local_thread_id;
+            break;
+        }
+    }
+    const resolved_thread_id = local_thread_id orelse
+        return try chatDaemonErrorEnvelopeAlloc(allocator, "not_found", "chat pane thread not found");
+
+    var followup_response = try client.call("chat.followup", .{
+        .workspace_id = followup.workspace_id,
+        .local_thread_id = resolved_thread_id,
+        .prompt = followup.prompt,
+    });
+    defer followup_response.deinit();
+    if (!followup_response.response.isOk()) return try daemonResponseEnvelopeAlloc(allocator, &followup_response);
+    const result = followup_response.response.result orelse return error.InvalidResponse;
+    if (result != .object or !(jsonBool(result.object.get("accepted") orelse .null) orelse false)) return error.InvalidResponse;
+    return try chatDaemonFollowupSuccessEnvelopeAlloc(allocator, followup, resolved_thread_id);
+}
+
 const ChatDaemonSendArgs = struct {
     workspace_id: []const u8,
     local_thread_id: []const u8,
@@ -5253,6 +5777,49 @@ fn liveEnvelopeErrorCode(value: std.json.Value) ?[]const u8 {
     const err = value.object.get("error") orelse return null;
     if (err != .object) return null;
     return jsonString(err.object.get("code") orelse .null);
+}
+
+fn chatThreadEnvelopeStoreRevision(value: std.json.Value) ?i64 {
+    if (value != .object) return null;
+    const result = value.object.get("result") orelse return null;
+    if (result != .object) return null;
+    return nonNegativeJsonInteger(result.object.get("store_revision") orelse .null);
+}
+
+fn composeChatPresentDeferredAlloc(
+    allocator: std.mem.Allocator,
+    workspace_id: []const u8,
+    local_thread_id: []const u8,
+    store_revision: i64,
+    ambiguous: bool,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    try s.objectField("ok");
+    try s.write(true);
+    try s.objectField("result");
+    try s.beginObject();
+    try s.objectField("workspace_id");
+    try s.write(workspace_id);
+    try s.objectField("local_thread_id");
+    try s.write(local_thread_id);
+    try s.objectField("thread_id");
+    try s.write(local_thread_id);
+    try s.objectField("store_revision");
+    try s.write(store_revision);
+    try s.objectField("presented");
+    if (ambiguous) try s.write(null) else try s.write(false);
+    try s.objectField("presentation_status");
+    try s.write(if (ambiguous) "unknown" else "projection_pending");
+    try s.objectField("retryable");
+    try s.write(true);
+    try s.objectField("retry_tool");
+    try s.write("present_chat");
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
 }
 
 const ChatOpenValidationRoute = enum {
@@ -6061,7 +6628,11 @@ fn mcpUnavailableCapability(tool_name: []const u8) ?McpUnavailableCapability {
     // M4-P5: daemon-direct chat tools map to the coarse chat capability so an
     // old daemon's rejection carries the stable capability payload.
     if (std.mem.eql(u8, tool_name, "open_chat") or
+        std.mem.eql(u8, tool_name, "present_chat") or
+        std.mem.eql(u8, tool_name, "set_chat_draft") or
+        std.mem.eql(u8, tool_name, "get_chat_draft") or
         std.mem.eql(u8, tool_name, "send_chat_message") or
+        std.mem.eql(u8, tool_name, "queue_chat_followup") or
         std.mem.eql(u8, tool_name, "tail_chat_turn") or
         std.mem.eql(u8, tool_name, "approve_chat_turn") or
         std.mem.eql(u8, tool_name, "stop_chat_turn") or
@@ -6976,6 +7547,9 @@ fn flagIsBare(name: []const u8) bool {
         std.mem.eql(u8, name, "--no-focus") or
         std.mem.eql(u8, name, "--fast") or
         std.mem.eql(u8, name, "--no-fast") or
+        std.mem.eql(u8, name, "--on") or
+        std.mem.eql(u8, name, "--off") or
+        std.mem.eql(u8, name, "--toggle") or
         std.mem.eql(u8, name, "--ctrl") or
         std.mem.eql(u8, name, "--alt") or
         std.mem.eql(u8, name, "--shift") or
@@ -7020,6 +7594,88 @@ test "live chat open parses reasoning and explicit fast mode" {
     try std.testing.expectError(error.MissingReasoningEffort, liveChatOpenSettings(&missing_argv));
     const conflicting_argv = [_][]const u8{ "chat", "open", "--fast", "--no-fast" };
     try std.testing.expectError(error.ConflictingFastMode, liveChatOpenSettings(&conflicting_argv));
+}
+
+test "live subcommands reject unknown and misplaced flags before dispatch" {
+    const reported = [_][]const u8{
+        "chat", "open", "--workspace", "workspace-1", "--provider", "claude", "--bogus-flag",
+    };
+    try std.testing.expectEqualStrings("--bogus-flag", unknownLiveFlag(&reported).?);
+
+    const misplaced = [_][]const u8{ "pane", "close", "--provider", "claude" };
+    try std.testing.expectEqualStrings("--provider", unknownLiveFlag(&misplaced).?);
+
+    const valid_open = [_][]const u8{
+        "chat", "open", "--workspace", "workspace-1", "--provider", "claude", "--no-fast", "--json",
+    };
+    try std.testing.expect(unknownLiveFlag(&valid_open) == null);
+
+    const dash_text = [_][]const u8{ "chat", "draft", "set", "--thread", "thread-1", "--workspace", "workspace-1", "--text", "--literal-draft" };
+    try std.testing.expect(unknownLiveFlag(&dash_text) == null);
+
+    const daemon_followup = [_][]const u8{ "chat", "followup", "--workspace", "workspace-1", "--pane", "7", "--prompt", "continue" };
+    try std.testing.expect(unknownLiveFlag(&daemon_followup) == null);
+    const focused_followup = [_][]const u8{ "chat", "followup", "--workspace", "workspace-1", "--focused", "--prompt", "continue" };
+    try std.testing.expectEqualStrings("--focused", unknownLiveFlag(&focused_followup).?);
+}
+
+test "live pane maximize has explicit on off and toggle modes" {
+    const default_argv = [_][]const u8{ "pane", "maximize", "--pane", "7" };
+    try std.testing.expectEqual(LivePaneMaximizeMode.toggle, try livePaneMaximizeMode(&default_argv));
+
+    const on_argv = [_][]const u8{ "pane", "maximize", "--pane", "7", "--on" };
+    try std.testing.expectEqual(LivePaneMaximizeMode.on, try livePaneMaximizeMode(&on_argv));
+
+    const off_argv = [_][]const u8{ "pane", "maximize", "--pane", "7", "--off" };
+    try std.testing.expectEqual(LivePaneMaximizeMode.off, try livePaneMaximizeMode(&off_argv));
+
+    const conflicting_argv = [_][]const u8{ "pane", "maximize", "--pane", "7", "--off", "--toggle" };
+    try std.testing.expectError(error.ConflictingModes, livePaneMaximizeMode(&conflicting_argv));
+}
+
+test "MCP chat draft and presentation schemas expose recoverable addressing" {
+    var present_workspace = false;
+    var present_thread = false;
+    for (CHAT_PRESENT_MCP_INPUTS) |input| {
+        if (std.mem.eql(u8, input.name, "workspace_id")) present_workspace = input.required;
+        if (std.mem.eql(u8, input.name, "local_thread_id")) present_thread = input.required;
+    }
+    try std.testing.expect(present_workspace and present_thread);
+
+    var set_thread = false;
+    var set_pane = false;
+    var set_text = false;
+    for (CHAT_DRAFT_SET_MCP_INPUTS) |input| {
+        if (std.mem.eql(u8, input.name, "local_thread_id")) set_thread = true;
+        if (std.mem.eql(u8, input.name, "pane_id")) set_pane = true;
+        if (std.mem.eql(u8, input.name, "text")) set_text = input.required;
+    }
+    try std.testing.expect(set_thread and set_pane and set_text);
+
+    const deferred = try composeChatPresentDeferredAlloc(std.testing.allocator, "workspace-1", "thread-1", 42, false);
+    defer std.testing.allocator.free(deferred);
+    try std.testing.expect(std.mem.indexOf(u8, deferred, "\"presentation_status\":\"projection_pending\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, deferred, "\"retry_tool\":\"present_chat\"") != null);
+}
+
+test "daemon chat followup schema and persisted pane resolution are pinned" {
+    var workspace_required = false;
+    var pane_required = false;
+    var prompt_required = false;
+    for (CHAT_FOLLOWUP_MCP_INPUTS) |input| {
+        if (std.mem.eql(u8, input.name, "workspace_id")) workspace_required = input.required;
+        if (std.mem.eql(u8, input.name, "pane_id")) pane_required = input.required;
+        if (std.mem.eql(u8, input.name, "prompt")) prompt_required = input.required;
+    }
+    try std.testing.expect(workspace_required and pane_required and prompt_required);
+    try std.testing.expect(mcpUnavailableCapability("queue_chat_followup") != null);
+
+    const layout =
+        \\{"v":2,"panes":[{"id":7,"kind":"chat","thread":4},{"id":8,"kind":"terminal","dock":1}]}
+    ;
+    try std.testing.expectEqual(@as(?usize, 4), try chatPaneThreadIndexFromLayout(std.testing.allocator, layout, 7));
+    try std.testing.expect(try chatPaneThreadIndexFromLayout(std.testing.allocator, layout, 8) == null);
+    try std.testing.expect(try chatPaneThreadIndexFromLayout(std.testing.allocator, layout, 9) == null);
 }
 
 test "MCP open_chat schema and forwarding expose creation settings" {

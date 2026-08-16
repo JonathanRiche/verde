@@ -8991,7 +8991,12 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             const client_id = (try client.decodeClientRegister(&reg)).client_id;
             const ws_request: headless.store.WorkspaceUpsertRequest = .{
                 .mutation = .{ .request_key = "m4p5-mcp-ws", .client_id = client_id },
-                .workspace = .{ .workspace_id = "ws-mcp", .label = "ws-mcp", .path = pref_path },
+                .workspace = .{
+                    .workspace_id = "ws-mcp",
+                    .label = "ws-mcp",
+                    .path = pref_path,
+                    .workspace_layout_json = "{\"v\":2,\"panes\":[{\"id\":7,\"kind\":\"chat\",\"thread\":0}]}",
+                },
             };
             var parsed = try client.call(headless.store.METHOD_WORKSPACE_UPSERT, ws_request);
             defer parsed.deinit();
@@ -9061,7 +9066,7 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             if (name != .string or !std.mem.eql(u8, name.string, "verde")) return error.McpInitializeName;
         }
 
-        // tools/list → all six chat tools advertised by the real registry.
+        // tools/list → every daemon/headless chat tool advertised by the real registry.
         {
             const request = try std.fmt.allocPrint(
                 allocator,
@@ -9076,8 +9081,10 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             const tools = jsonObjectField(result, "tools") orelse return error.McpToolsListShape;
             if (tools != .array) return error.McpToolsListShape;
             const required = [_][]const u8{
-                "open_chat",         "send_chat_message", "tail_chat_turn",
-                "approve_chat_turn", "stop_chat_turn",    "read_chat_thread",
+                "open_chat",           "present_chat",      "set_chat_draft",
+                "get_chat_draft",      "send_chat_message", "tail_chat_turn",
+                "queue_chat_followup", "approve_chat_turn", "stop_chat_turn",
+                "read_chat_thread",
             };
             for (required) |tool_name| {
                 var found = false;
@@ -9090,6 +9097,30 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
                     return error.McpToolsListMissingChatTool;
                 }
             }
+        }
+
+        // queue_chat_followup resolves the persisted pane through daemon
+        // metadata only. With no running turn, the established follow-up
+        // behavior is a clear invalid_state error rather than draft staging.
+        {
+            const request = try mcpToolCallRequestAlloc(allocator, next_id, "queue_chat_followup", .{
+                .workspace_id = "ws-mcp",
+                .pane_id = 7,
+                .prompt = "continue when ready",
+            });
+            defer allocator.free(request);
+            next_id += 1;
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const tool_text = try mcpToolTextFromResponseAlloc(allocator, response.value);
+            defer allocator.free(tool_text.text);
+            var envelope = try std.json.parseFromSlice(std.json.Value, allocator, tool_text.text, .{});
+            defer envelope.deinit();
+            const ok = jsonObjectField(envelope.value, "ok") orelse return error.McpFollowupShape;
+            if (ok != .bool or ok.bool) return error.McpFollowupIdleAccepted;
+            const err_value = jsonObjectField(envelope.value, "error") orelse return error.McpFollowupShape;
+            const code = jsonObjectField(err_value, "code") orelse return error.McpFollowupShape;
+            if (code != .string or !std.mem.eql(u8, code.string, "invalid_state")) return error.McpFollowupIdleCode;
         }
 
         // open_chat → daemon-direct creation with the unified stable-id
@@ -9126,6 +9157,54 @@ fn runChatMcpToolLayerScenario(allocator: std.mem.Allocator, io: std.Io) !void {
             const presented = jsonObjectField(result, "presented") orelse return error.McpOpenChatShape;
             if (presented != .bool or presented.bool) return error.McpOpenChatPresented;
             local_thread_id = try allocator.dupe(u8, id_value.string);
+        }
+
+        // Draft tools stage and retrieve text without starting a real turn.
+        {
+            const request = try mcpToolCallRequestAlloc(allocator, next_id, "set_chat_draft", .{
+                .workspace_id = "ws-mcp",
+                .local_thread_id = local_thread_id.?,
+                .text = "review this before sending",
+            });
+            defer allocator.free(request);
+            next_id += 1;
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const tool_text = try mcpToolTextFromResponseAlloc(allocator, response.value);
+            defer allocator.free(tool_text.text);
+            if (tool_text.is_error) return error.McpDraftSetToolError;
+            var envelope = try std.json.parseFromSlice(std.json.Value, allocator, tool_text.text, .{});
+            defer envelope.deinit();
+            const ok = jsonObjectField(envelope.value, "ok") orelse return error.McpDraftSetShape;
+            if (ok != .bool or !ok.bool) return error.McpDraftSetNotOk;
+            const result = jsonObjectField(envelope.value, "result") orelse return error.McpDraftSetShape;
+            const draft = jsonObjectField(result, "draft") orelse return error.McpDraftSetShape;
+            if (draft != .string or !std.mem.eql(u8, draft.string, "review this before sending")) return error.McpDraftSetMismatch;
+        }
+        {
+            const request = try mcpToolCallRequestAlloc(allocator, next_id, "get_chat_draft", .{
+                .workspace_id = "ws-mcp",
+                .local_thread_id = local_thread_id.?,
+            });
+            defer allocator.free(request);
+            next_id += 1;
+            var response = try mcpChildCallParsed(allocator, io, &mcp, &reader, request, MCP_CHILD_READ_TIMEOUT_MS);
+            defer response.deinit();
+            const tool_text = try mcpToolTextFromResponseAlloc(allocator, response.value);
+            defer allocator.free(tool_text.text);
+            if (tool_text.is_error) return error.McpDraftGetToolError;
+            var envelope = try std.json.parseFromSlice(std.json.Value, allocator, tool_text.text, .{});
+            defer envelope.deinit();
+            const ok = jsonObjectField(envelope.value, "ok") orelse return error.McpDraftGetShape;
+            if (ok != .bool or !ok.bool) return error.McpDraftGetNotOk;
+            const result = jsonObjectField(envelope.value, "result") orelse return error.McpDraftGetShape;
+            const draft = jsonObjectField(result, "draft") orelse return error.McpDraftGetShape;
+            if (draft != .string or !std.mem.eql(u8, draft.string, "review this before sending")) {
+                std.debug.print("headless-daemon-it: MCP get_chat_draft envelope: {s}\n", .{tool_text.text});
+                return error.McpDraftGetMismatch;
+            }
+            const draft_len = jsonObjectField(result, "draft_len") orelse return error.McpDraftGetShape;
+            if (draft_len != .integer or draft_len.integer != "review this before sending".len) return error.McpDraftLengthMismatch;
         }
 
         // send_chat_message using result.local_thread_id verbatim.

@@ -70,8 +70,14 @@ static enum wpe_input_axis_event_type verde_browser_linux_wheel_event_type(doubl
 }
 
 static double verde_browser_linux_wheel_delta_scale(enum wpe_input_axis_event_type event_type, double wheel_multiplier) {
-    const double base_scale = event_type == wpe_input_axis_event_type_motion ? 120.0 : 96.0;
+    // WebKit reduces discrete WPE axis values to their sign, so use its
+    // standard line-step distance before dispatching the scaled 2D delta.
+    const double base_scale = event_type == wpe_input_axis_event_type_motion ? 40.0 : 96.0;
     return base_scale * wheel_multiplier;
+}
+
+static enum wpe_input_axis_event_type verde_browser_linux_wheel_dispatch_type(void) {
+    return (enum wpe_input_axis_event_type)(wpe_input_axis_event_type_motion_smooth | wpe_input_axis_event_type_mask_2d);
 }
 
 static uint32_t verde_browser_linux_wheel_axis(double delta_x, double delta_y) {
@@ -750,6 +756,12 @@ int verde_browser_linux_test_disables_async_overflow_scrolling(void) {
 
 int verde_browser_linux_test_wheel_event_is_smooth(double delta_x, double delta_y) {
     return verde_browser_linux_wheel_event_type(delta_x, delta_y) == wpe_input_axis_event_type_motion_smooth;
+}
+
+int verde_browser_linux_test_wheel_uses_smooth_2d(void) {
+    const enum wpe_input_axis_event_type event_type = verde_browser_linux_wheel_dispatch_type();
+    return (event_type & wpe_input_axis_event_type_mask_2d) != 0 &&
+        (event_type & (wpe_input_axis_event_type_mask_2d - 1)) == wpe_input_axis_event_type_motion_smooth;
 }
 
 double verde_browser_linux_test_wheel_delta_scale(double delta_x, double delta_y, double wheel_multiplier) {
@@ -1808,20 +1820,24 @@ int verde_browser_linux_mouse_button(struct verde_browser_linux *browser, double
 int verde_browser_linux_mouse_wheel(struct verde_browser_linux *browser, double x, double y, double delta_x, double delta_y, double wheel_multiplier, unsigned int modifiers) {
     if (browser == NULL) return 0;
     verde_browser_linux_mark_active(browser);
-    const enum wpe_input_axis_event_type event_type = verde_browser_linux_wheel_event_type(delta_x, delta_y);
-    const double delta_scale = verde_browser_linux_wheel_delta_scale(event_type, wheel_multiplier);
-    // WPE 2D events duplicate the legacy value into an orthogonal DOM delta,
-    // which makes horizontal carousels cancel otherwise vertical page scroll.
-    struct wpe_input_axis_event event = {
-        .type = event_type,
-        .time = verde_browser_linux_now_ms(),
-        .x = (int)x,
-        .y = (int)y,
-        .axis = verde_browser_linux_wheel_axis(delta_x, delta_y),
-        .value = verde_browser_linux_wheel_value(delta_x, delta_y, delta_scale),
-        .modifiers = verde_browser_linux_encode_modifiers(modifiers) | browser->pointer_modifiers,
+    const enum wpe_input_axis_event_type source_type = verde_browser_linux_wheel_event_type(delta_x, delta_y);
+    const double delta_scale = verde_browser_linux_wheel_delta_scale(source_type, wheel_multiplier);
+    // Smooth 2D events preserve their magnitude in WebKit. Legacy discrete
+    // events preserve only direction, making every configured speed identical.
+    struct wpe_input_axis_2d_event event = {
+        .base = {
+            .type = verde_browser_linux_wheel_dispatch_type(),
+            .time = verde_browser_linux_now_ms(),
+            .x = (int)x,
+            .y = (int)y,
+            .axis = 0,
+            .value = 0,
+            .modifiers = verde_browser_linux_encode_modifiers(modifiers) | browser->pointer_modifiers,
+        },
+        .x_axis = delta_x * delta_scale,
+        .y_axis = delta_y * delta_scale,
     };
-    wpe_view_backend_dispatch_axis_event(browser->view_backend, &event);
+    wpe_view_backend_dispatch_axis_event(browser->view_backend, &event.base);
     return 1;
 }
 

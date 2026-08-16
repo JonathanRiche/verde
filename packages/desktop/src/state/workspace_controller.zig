@@ -1056,6 +1056,7 @@ fn focusWorkspacePaneWithCompletionPolicy(
             }
             project.last_content_pane_id = pane_id;
             if (self.project_controller.selected_index == project_index) {
+                if (thread_focus_changed) self.noteTranscriptSelectionChanged();
                 self.syncPaletteComposerFromDraft();
                 if (acknowledge_completion) {
                     self.requestComposerFocus();
