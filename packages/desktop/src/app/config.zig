@@ -19,6 +19,10 @@ pub const MAX_WORKSPACE_PANES_PER_VIEW: u8 = 6;
 pub const DEFAULT_WORKSPACE_SCROLL_THRESHOLD: u8 = 2;
 pub const MIN_WORKSPACE_SCROLL_THRESHOLD: u8 = 1;
 pub const MAX_WORKSPACE_SCROLL_THRESHOLD: u8 = 64;
+pub const DEFAULT_BROWSER_SCROLL_SPEED: f32 = 2.5;
+pub const MIN_BROWSER_SCROLL_SPEED: f32 = 1.0;
+pub const MAX_BROWSER_SCROLL_SPEED: f32 = 5.0;
+pub const BROWSER_SCROLL_SPEED_STEP: f32 = 0.25;
 pub const DEFAULT_CHAT_TITLE_MODEL = "gpt-5.6-luna";
 
 pub const ChatTitleProvider = enum {
@@ -175,6 +179,8 @@ pub const AppConfig = struct {
     workspace_scroll_direction: WorkspaceScrollDirection = .horizontal,
     workspace_scroll_mode: WorkspaceScrollMode = .automatic,
     workspace_scroll_threshold: u8 = DEFAULT_WORKSPACE_SCROLL_THRESHOLD,
+    unzoom_on_pane_navigation: bool = false,
+    reduced_motion: bool = false,
     companion_enabled: bool = false,
     companion_character: CompanionCharacter = .sprout,
     theme_config: theme.ThemeConfig = .{},
@@ -182,7 +188,7 @@ pub const AppConfig = struct {
     installed_themes: []InstalledTheme = &.{},
     default_open_action: DefaultOpenAction = .folder,
     link_open_target: LinkOpenTarget = .verde_browser,
-    browser_fast_scrolling_enabled: bool = true,
+    browser_scroll_speed: f32 = DEFAULT_BROWSER_SCROLL_SPEED,
     file_links_in_neovim_pane: bool = false,
     terminal_launch_profiles: []TerminalLaunchProfileConfig = &.{},
     tool_call_group_preference: ToolCallGroupPreference = .collapsed,
@@ -416,6 +422,8 @@ fn writeUiSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, con
     try ui_object.put(allocator, "workspace_scroll_direction", .{ .string = @tagName(config.workspace_scroll_direction) });
     try ui_object.put(allocator, "workspace_scroll_mode", .{ .string = @tagName(config.workspace_scroll_mode) });
     try ui_object.put(allocator, "workspace_scroll_threshold", .{ .integer = config.workspace_scroll_threshold });
+    try ui_object.put(allocator, "unzoom_on_pane_navigation", .{ .bool = config.unzoom_on_pane_navigation });
+    try ui_object.put(allocator, "reduced_motion", .{ .bool = config.reduced_motion });
     try ui_object.put(allocator, "companion_enabled", .{ .bool = config.companion_enabled });
     try ui_object.put(allocator, "companion_character", .{ .string = @tagName(config.companion_character) });
 }
@@ -510,7 +518,7 @@ fn writeOpenSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, c
 
 fn writeBrowserSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
     const browser_object = try objectSection(allocator, object, "browser");
-    try browser_object.put(allocator, "fast_scrolling", .{ .bool = config.browser_fast_scrolling_enabled });
+    try browser_object.put(allocator, "scroll_speed", .{ .float = config.browser_scroll_speed });
 }
 
 fn writeTerminalSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
@@ -640,11 +648,26 @@ fn applyBrowserOverrides(config: *AppConfig, browser_value: std.json.Value) void
     }
     if (browser_value.object.get("fast_scrolling")) |enabled_value| {
         if (enabled_value == .bool) {
-            config.browser_fast_scrolling_enabled = enabled_value.bool;
+            config.browser_scroll_speed = if (enabled_value.bool) DEFAULT_BROWSER_SCROLL_SPEED else MIN_BROWSER_SCROLL_SPEED;
         } else {
             log.warn("browser.fast_scrolling must be a boolean when provided", .{});
         }
     }
+    if (browser_value.object.get("scroll_speed")) |speed_value| {
+        switch (speed_value) {
+            .integer => |value| applyBrowserScrollSpeed(config, @floatFromInt(value)),
+            .float => |value| applyBrowserScrollSpeed(config, @floatCast(value)),
+            else => log.warn("browser.scroll_speed must be a number when provided", .{}),
+        }
+    }
+}
+
+fn applyBrowserScrollSpeed(config: *AppConfig, value: f32) void {
+    if (!std.math.isFinite(value) or value < MIN_BROWSER_SCROLL_SPEED or value > MAX_BROWSER_SCROLL_SPEED) {
+        log.warn("ignoring browser.scroll_speed outside supported range {d:.2}-{d:.2}", .{ MIN_BROWSER_SCROLL_SPEED, MAX_BROWSER_SCROLL_SPEED });
+        return;
+    }
+    config.browser_scroll_speed = value;
 }
 
 fn applyTranscriptOverrides(config: *AppConfig, transcript_value: std.json.Value) void {
@@ -983,6 +1006,20 @@ fn applyUiOverrides(config: *AppConfig, ui_value: std.json.Value) void {
             else => log.warn("ui.workspace_scroll_threshold must be an integer when provided", .{}),
         }
     }
+    if (ui_value.object.get("unzoom_on_pane_navigation")) |unzoom_value| {
+        if (unzoom_value == .bool) {
+            config.unzoom_on_pane_navigation = unzoom_value.bool;
+        } else {
+            log.warn("ui.unzoom_on_pane_navigation must be a boolean when provided", .{});
+        }
+    }
+    if (ui_value.object.get("reduced_motion")) |reduced_motion_value| {
+        if (reduced_motion_value == .bool) {
+            config.reduced_motion = reduced_motion_value.bool;
+        } else {
+            log.warn("ui.reduced_motion must be a boolean when provided", .{});
+        }
+    }
     if (ui_value.object.get("companion_enabled")) |enabled_value| {
         if (enabled_value == .bool) {
             config.companion_enabled = enabled_value.bool;
@@ -1298,6 +1335,42 @@ test "app config accepts ui.workspace_panes_per_view override" {
     try std.testing.expectEqual(@as(u8, 3), config.workspace_panes_per_view);
 }
 
+test "app config pane navigation keeps zoom by default and accepts unzoom override" {
+    var root = try parseTestRoot("{\"ui\":{\"unzoom_on_pane_navigation\":true}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expect(!config.unzoom_on_pane_navigation);
+
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+    try std.testing.expect(config.unzoom_on_pane_navigation);
+}
+
+test "app config reduced motion round trips explicit values" {
+    for ([_]bool{ true, false }) |enabled| {
+        var root = try parseTestRoot("{\"plugin_owned\":true,\"ui\":{\"plugin_value\":\"keep\"}}");
+        defer root.deinit();
+
+        const config: AppConfig = .{ .reduced_motion = enabled };
+        try writeUiSection(root.arena.allocator(), &root.value.object, &config);
+        const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, root.value, .{});
+        defer std.testing.allocator.free(encoded);
+
+        var saved = try parseTestRoot(encoded);
+        defer saved.deinit();
+        try std.testing.expect(saved.value.object.get("plugin_owned").?.bool);
+        const saved_ui = saved.value.object.get("ui").?.object;
+        try std.testing.expectEqualStrings("keep", saved_ui.get("plugin_value").?.string);
+        try std.testing.expectEqual(enabled, saved_ui.get("reduced_motion").?.bool);
+
+        var loaded: AppConfig = .{};
+        defer loaded.deinit(std.testing.allocator);
+        applyAppOverrides(std.testing.allocator, &loaded, saved.value);
+        try std.testing.expectEqual(enabled, loaded.reduced_motion);
+    }
+}
+
 test "app config ignores out-of-range ui.workspace_panes_per_view" {
     var root = try parseTestRoot("{\"ui\":{\"workspace_panes_per_view\":7}}");
     defer root.deinit();
@@ -1550,16 +1623,21 @@ test "app config accepts link open target" {
     try std.testing.expectEqual(LinkOpenTarget.system_browser, config.link_open_target);
 }
 
-test "app config defaults to fast browser scrolling and accepts override" {
-    var root = try parseTestRoot("{\"browser\":{\"fast_scrolling\":false}}");
+test "app config accepts browser scroll speed and legacy fast scrolling" {
+    var root = try parseTestRoot("{\"browser\":{\"fast_scrolling\":false,\"scroll_speed\":4.25}}");
     defer root.deinit();
 
     var config: AppConfig = .{};
     defer config.deinit(std.testing.allocator);
-    try std.testing.expect(config.browser_fast_scrolling_enabled);
+    try std.testing.expectEqual(DEFAULT_BROWSER_SCROLL_SPEED, config.browser_scroll_speed);
     applyAppOverrides(std.testing.allocator, &config, root.value);
 
-    try std.testing.expect(!config.browser_fast_scrolling_enabled);
+    try std.testing.expectEqual(@as(f32, 4.25), config.browser_scroll_speed);
+
+    var legacy_root = try parseTestRoot("{\"browser\":{\"fast_scrolling\":false}}");
+    defer legacy_root.deinit();
+    applyAppOverrides(std.testing.allocator, &config, legacy_root.value);
+    try std.testing.expectEqual(MIN_BROWSER_SCROLL_SPEED, config.browser_scroll_speed);
 }
 
 test "app config accepts workspace Neovim file link preference" {

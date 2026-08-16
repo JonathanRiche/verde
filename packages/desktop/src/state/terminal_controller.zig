@@ -9,6 +9,7 @@ const platform_runtime = @import("platform_runtime");
 const stack_config = @import("../workspace/stack.zig");
 const terminal = @import("../terminal/terminal.zig");
 const workspace_layout = @import("workspace_layout.zig");
+const headless = @import("headless");
 
 const log = std.log.scoped(.native_shell);
 const deinitWorkspacePaneRef = workspace_layout.deinitWorkspacePaneRef;
@@ -18,6 +19,11 @@ const POLL_INTERVAL_MS: i64 = 16;
 // Process watch/config/restart maintenance is human-paced and already uses
 // 1-2 second inner cadences. Keep it off the display-rate terminal tail path.
 const MANAGED_PROCESS_POLL_INTERVAL_MS: i64 = 250;
+pub const MAX_DAEMON_SESSION_DOCK_ID: u32 = 4_095;
+pub const MAX_DAEMON_SESSION_PANE_ID: u32 = 65_535;
+pub const MAX_MATERIALIZED_DAEMON_DOCKS_PER_REFRESH: usize = 64;
+pub const MAX_MATERIALIZED_DAEMON_PANES_PER_REFRESH: usize = 256;
+const MAX_OWNED_DAEMON_SESSIONS_PER_REFRESH: usize = 1_024;
 
 fn monotonicMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
@@ -51,6 +57,27 @@ test "managed process maintenance is decoupled from terminal tail cadence" {
     try std.testing.expectEqual(@as(i64, 16), POLL_INTERVAL_MS);
 }
 
+test "composite session scope becomes an owned bounded projection" {
+    const source = [_]headless.store.SessionSummary{.{
+        .session_id = "session-1",
+        .workspace_id = "workspace-1",
+        .workspace_path = "/tmp/workspace-1",
+        .cwd = "/tmp/workspace-1",
+        .label = "shell",
+        .command = "bash",
+        .dock_id = 2,
+        .pane_id = 3,
+        .pid = 42,
+        .running = true,
+        .status = "running",
+    }};
+    var projection = try buildDaemonSessionProjection(std.testing.allocator, &source);
+    defer deinitDaemonSessionProjection(std.testing.allocator, &projection);
+    try std.testing.expectEqual(@as(usize, 1), projection.items.len);
+    try std.testing.expectEqualStrings("session-1", projection.items[0].session_id);
+    try std.testing.expect(projection.items[0].running);
+}
+
 pub const DefaultAgentTui = struct {
     name: []const u8,
     command: []const u8,
@@ -65,7 +92,9 @@ pub const OPENCODE_TUI_COMMAND =
     \\if [ -n "$candidate" ]; then exec "$candidate"; fi
     \\exec opencode
 ;
-const GROK_TUI_COMMAND = "grok --no-auto-update";
+const GROK_TUI_COMMAND = "grok --no-auto-update --no-alt-screen --no-memory --disable-web-search --permission-mode plan --reasoning-effort low";
+const LEGACY_GROK_TUI_COMMAND = "grok --no-auto-update";
+const LEGACY_GROK_NO_SUBAGENTS_TUI_COMMAND = "grok --no-auto-update --no-alt-screen --no-memory --no-subagents --disable-web-search --permission-mode plan --reasoning-effort low";
 
 fn opencodeTuiCommandForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
     return if (os_tag == .windows) "opencode" else OPENCODE_TUI_COMMAND;
@@ -74,11 +103,11 @@ fn opencodeTuiCommandForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
 pub fn defaultAgentTui(provider: stack_config.AgentProvider) ?DefaultAgentTui {
     return switch (provider) {
         .codex => .{ .name = "codex", .command = "codex", .provider = .codex, .notify = true, .mcp = true, .hooks = true },
-        .claude => .{ .name = "claude", .command = "claude", .provider = .claude },
-        .opencode => .{ .name = "opencode", .command = opencodeTuiCommandForOs(builtin.os.tag), .provider = .opencode },
+        .claude => .{ .name = "claude", .command = "claude", .provider = .claude, .notify = true, .hooks = true },
+        .opencode => .{ .name = "opencode", .command = opencodeTuiCommandForOs(builtin.os.tag), .provider = .opencode, .notify = true, .hooks = true },
         .cursor => .{ .name = "cursor", .command = "agent", .provider = .cursor, .notify = true, .hooks = true },
         .grok => .{ .name = "grok", .command = GROK_TUI_COMMAND, .provider = .grok, .notify = true, .hooks = true },
-        .amp => .{ .name = "amp", .command = "amp", .provider = .amp },
+        .amp => .{ .name = "amp", .command = "amp", .provider = .amp, .notify = true, .hooks = true },
         .other => null,
     };
 }
@@ -89,7 +118,10 @@ pub fn isKnownDefaultAgentTuiCommand(provider: stack_config.AgentProvider, comma
         .claude => std.mem.eql(u8, command, "claude"),
         .opencode => std.mem.eql(u8, command, "opencode") or std.mem.eql(u8, command, OPENCODE_TUI_COMMAND),
         .cursor => std.mem.eql(u8, command, "agent"),
-        .grok => std.mem.eql(u8, command, "grok") or std.mem.eql(u8, command, GROK_TUI_COMMAND),
+        .grok => std.mem.eql(u8, command, "grok") or
+            std.mem.eql(u8, command, LEGACY_GROK_TUI_COMMAND) or
+            std.mem.eql(u8, command, LEGACY_GROK_NO_SUBAGENTS_TUI_COMMAND) or
+            std.mem.eql(u8, command, GROK_TUI_COMMAND),
         .amp => std.mem.eql(u8, command, "amp"),
         .other => false,
     };
@@ -122,13 +154,27 @@ pub fn agentTuiProviderFromProcessName(name: []const u8) ?stack_config.AgentProv
     return null;
 }
 
-test "Grok TUI defaults disable auto-update and recognize the process" {
+test "managed AI TUI defaults enable lifecycle hooks" {
+    const providers = [_]stack_config.AgentProvider{ .claude, .codex, .cursor, .grok, .amp, .opencode };
+    for (providers) |provider| {
+        const defaults = defaultAgentTui(provider).?;
+        try std.testing.expect(defaults.notify);
+        try std.testing.expect(defaults.hooks);
+    }
+}
+
+test "Grok TUI defaults use the least-privilege launch mode" {
     const defaults = defaultAgentTui(.grok).?;
     try std.testing.expectEqualStrings("grok", defaults.name);
-    try std.testing.expectEqualStrings("grok --no-auto-update", defaults.command);
+    try std.testing.expectEqualStrings(
+        "grok --no-auto-update --no-alt-screen --no-memory --disable-web-search --permission-mode plan --reasoning-effort low",
+        defaults.command,
+    );
     try std.testing.expect(defaults.notify);
     try std.testing.expect(defaults.hooks);
     try std.testing.expect(isKnownDefaultAgentTuiCommand(.grok, "grok"));
+    try std.testing.expect(isKnownDefaultAgentTuiCommand(.grok, LEGACY_GROK_TUI_COMMAND));
+    try std.testing.expect(isKnownDefaultAgentTuiCommand(.grok, LEGACY_GROK_NO_SUBAGENTS_TUI_COMMAND));
     try std.testing.expectEqual(stack_config.AgentProvider.grok, agentTuiProviderFromProcessName("grok").?);
 }
 
@@ -150,11 +196,207 @@ pub const State = struct {
     poll_requested: bool = false,
     daemon_batch_retry_at_ms: i64 = 0,
     daemon_poll_batch: terminal.DaemonPollBatch = .{},
+    /// Bounded owned projection of the daemon's composite `sessions` scope.
+    /// Terminal byte streams remain owned by their docks; this list supplies
+    /// discovery/lifecycle identity without frame-thread RPC.
+    daemon_sessions: std.ArrayList(OwnedDaemonSessionSummary) = .empty,
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
         self.daemon_poll_batch.deinit(allocator);
+        deinitDaemonSessionProjection(allocator, &self.daemon_sessions);
     }
 };
+
+pub const OwnedDaemonSessionSummary = struct {
+    session_id: []u8,
+    workspace_id: []u8,
+    workspace_path: []u8,
+    cwd: []u8,
+    label: []u8,
+    command: []u8,
+    dock_id: ?u32,
+    pane_id: ?u32,
+    pid: ?i64,
+    running: bool,
+    status: []u8,
+    exit_status: ?i64,
+
+    fn deinit(self: *OwnedDaemonSessionSummary, allocator: std.mem.Allocator) void {
+        allocator.free(self.session_id);
+        allocator.free(self.workspace_id);
+        allocator.free(self.workspace_path);
+        allocator.free(self.cwd);
+        allocator.free(self.label);
+        allocator.free(self.command);
+        allocator.free(self.status);
+    }
+};
+
+pub fn buildDaemonSessionProjection(
+    allocator: std.mem.Allocator,
+    sessions: []const headless.store.SessionSummary,
+) !std.ArrayList(OwnedDaemonSessionSummary) {
+    var out: std.ArrayList(OwnedDaemonSessionSummary) = .empty;
+    errdefer deinitDaemonSessionProjection(allocator, &out);
+    const retained_len = @min(sessions.len, MAX_OWNED_DAEMON_SESSIONS_PER_REFRESH);
+    try out.ensureTotalCapacity(allocator, retained_len);
+    for (sessions[0..retained_len]) |session| {
+        var owned: OwnedDaemonSessionSummary = .{
+            .session_id = try allocator.dupe(u8, session.session_id),
+            .workspace_id = undefined,
+            .workspace_path = undefined,
+            .cwd = undefined,
+            .label = undefined,
+            .command = undefined,
+            .dock_id = session.dock_id,
+            .pane_id = session.pane_id,
+            .pid = session.pid,
+            .running = session.running,
+            .status = undefined,
+            .exit_status = session.exit_status,
+        };
+        errdefer allocator.free(owned.session_id);
+        owned.workspace_id = try allocator.dupe(u8, session.workspace_id);
+        errdefer allocator.free(owned.workspace_id);
+        owned.workspace_path = try allocator.dupe(u8, session.workspace_path);
+        errdefer allocator.free(owned.workspace_path);
+        owned.cwd = try allocator.dupe(u8, session.cwd);
+        errdefer allocator.free(owned.cwd);
+        owned.label = try allocator.dupe(u8, session.label);
+        errdefer allocator.free(owned.label);
+        owned.command = try allocator.dupe(u8, session.command);
+        errdefer allocator.free(owned.command);
+        owned.status = try allocator.dupe(u8, session.status);
+        out.appendAssumeCapacity(owned);
+    }
+    if (sessions.len > retained_len) {
+        log.warn(
+            "daemon session projection capped at {d}; dropped {d} snapshot records",
+            .{ retained_len, sessions.len - retained_len },
+        );
+    }
+    return out;
+}
+
+pub fn deinitDaemonSessionProjection(
+    allocator: std.mem.Allocator,
+    sessions: *std.ArrayList(OwnedDaemonSessionSummary),
+) void {
+    for (sessions.items) |*session| session.deinit(allocator);
+    sessions.deinit(allocator);
+    sessions.* = .empty;
+}
+
+fn daemonSessionDock(project: anytype, dock_id: u32) ?*terminal.Dock {
+    if (dock_id == 0) return &project.terminal_dock;
+    for (project.terminal_docks.items) |*entry| {
+        if (entry.id == dock_id) return &entry.dock;
+    }
+    return null;
+}
+
+fn collisionFreeDaemonPaneId(dock: *terminal.Dock) ?u32 {
+    var candidate: u32 = 1;
+    while (true) {
+        if (dock.paneById(candidate) == null) return candidate;
+        if (candidate == MAX_DAEMON_SESSION_PANE_ID) return null;
+        candidate += 1;
+    }
+}
+
+fn ensureDaemonSessionDock(self: anytype, project: anytype, dock_id: u32) !*terminal.Dock {
+    if (daemonSessionDock(project, dock_id)) |dock| return dock;
+    std.debug.assert(dock_id != 0);
+    var dock = try terminal.Dock.init(self.allocator);
+    dock.setDefaultFontSize(self.app_config.terminal_font_size);
+    errdefer dock.deinit(self.allocator);
+    try project.terminal_docks.append(self.allocator, .{ .id = dock_id, .dock = dock });
+    project.next_terminal_dock_id = @max(project.next_terminal_dock_id, dock_id +| 1);
+    return &project.terminal_docks.items[project.terminal_docks.items.len - 1].dock;
+}
+
+/// Reconcile composite session identities into the real dock projection.
+/// This is allocation-only and runs on staged projects before publication;
+/// normal dock polling then attaches/tails the discovered daemon session.
+pub fn applyDaemonSessionProjection(
+    self: anytype,
+    sessions: []const headless.store.SessionSummary,
+) !void {
+    var materialized_docks: usize = 0;
+    var materialized_panes: usize = 0;
+    for (sessions) |session| {
+        if (!session.running) continue;
+        const project = self.projectForDaemonId(session.workspace_id) orelse continue;
+        if (session.workspace_path.len != 0 and !std.mem.eql(u8, project.path, session.workspace_path)) continue;
+        const dock_id = session.dock_id orelse 0;
+        const requested_pane_id = session.pane_id orelse 1;
+        if (dock_id > MAX_DAEMON_SESSION_DOCK_ID or
+            requested_pane_id == 0 or requested_pane_id > MAX_DAEMON_SESSION_PANE_ID)
+        {
+            log.warn(
+                "dropping daemon session {s} with out-of-range coordinates dock={d} pane={d}",
+                .{ session.session_id, dock_id, requested_pane_id },
+            );
+            continue;
+        }
+        var dock = daemonSessionDock(project, dock_id);
+        if (dock == null) {
+            if (materialized_docks >= MAX_MATERIALIZED_DAEMON_DOCKS_PER_REFRESH or
+                materialized_panes >= MAX_MATERIALIZED_DAEMON_PANES_PER_REFRESH)
+            {
+                log.warn("dropping daemon session {s}: refresh materialization cap reached", .{session.session_id});
+                continue;
+            }
+            dock = try ensureDaemonSessionDock(self, project, dock_id);
+            materialized_docks += 1;
+        }
+        const target_dock = dock.?;
+        var pane = target_dock.paneById(requested_pane_id);
+        if (pane) |existing_pane| {
+            if (existing_pane.session_id) |existing_id| {
+                if (std.mem.eql(u8, existing_id, session.session_id)) continue;
+            }
+            if (existing_pane.session != null or existing_pane.session_id != null) {
+                const replacement_pane_id = collisionFreeDaemonPaneId(target_dock) orelse {
+                    log.warn("dropping daemon session {s}: no collision-free pane coordinate", .{session.session_id});
+                    continue;
+                };
+                if (materialized_panes >= MAX_MATERIALIZED_DAEMON_PANES_PER_REFRESH) {
+                    log.warn("dropping daemon session {s}: pane materialization cap reached", .{session.session_id});
+                    continue;
+                }
+                // First ownership of the requested coordinate wins. A later
+                // valid running session is preserved at a fresh coordinate;
+                // an existing user/restored leaf is never overwritten.
+                log.warn(
+                    "daemon session coordinate collision dock={d} pane={d}; reallocating {s} to pane={d}",
+                    .{ dock_id, requested_pane_id, session.session_id, replacement_pane_id },
+                );
+                pane = try target_dock.appendDaemonSessionPane(
+                    self.allocator,
+                    replacement_pane_id,
+                    session.session_id,
+                );
+                materialized_panes += 1;
+            }
+        } else {
+            if (materialized_panes >= MAX_MATERIALIZED_DAEMON_PANES_PER_REFRESH) {
+                log.warn("dropping daemon session {s}: pane materialization cap reached", .{session.session_id});
+                continue;
+            }
+            pane = try target_dock.appendDaemonSessionPane(self.allocator, requested_pane_id, session.session_id);
+            materialized_panes += 1;
+        }
+        const target_pane = pane orelse continue;
+        if (target_pane.session != null) continue;
+        if (target_pane.session_id) |existing| {
+            if (std.mem.eql(u8, existing, session.session_id)) continue;
+        }
+        const next_session_id = try self.allocator.dupe(u8, session.session_id);
+        target_pane.session_id = next_session_id;
+        target_pane.revive_policy = .attach_or_create;
+    }
+}
 
 pub fn currentProjectTerminal(self: anytype) *const terminal.Dock {
     if (self.focusedWorkspaceTerminalDockId()) |dock_id| {
@@ -414,6 +656,9 @@ pub fn pollTerminals(self: anytype) bool {
     }
     self.terminal_controller.poll_requested = false;
     self.terminal_controller.last_poll_ms = now_ms;
+    // Cursor refresh already applied registry + owned session summaries on
+    // the frame. `poll_requested` only wakes the normal bounded tail pass; it
+    // never triggers a second blocking registry pull here.
     const poll_managed_processes = managedProcessPollDue(
         self.terminal_controller.last_managed_process_poll_ms,
         now_ms,
@@ -504,6 +749,19 @@ pub fn pollTerminals(self: anytype) bool {
                 };
                 if (project_index == self.project_controller.selected_index) {
                     visible_changed = true;
+                }
+            }
+            if (entry.dock.takeDaemonSessionRecreated()) {
+                const resumed = self.resumeRecreatedThreadTui(project_index, entry.id) catch |err| blk: {
+                    log.warn("failed to resume recreated TUI dock {d}: {s}", .{ entry.id, @errorName(err) });
+                    break :blk false;
+                };
+                if (resumed) {
+                    log.info("resumed TUI after daemon session recreation for dock {d}", .{entry.id});
+                    if (project_index == self.project_controller.selected_index) {
+                        self.setSidebarNotice("Restored thread in TUI.");
+                        visible_changed = true;
+                    }
                 }
             }
             if (!dock_visible and !entry.dock.hasRunningSession()) continue;
@@ -620,24 +878,29 @@ pub fn handleTerminalTextInput(self: anytype, text: [*c]const u8) bool {
 
 pub fn requestTerminalFocus(self: anytype) void {
     self.focusCurrentProjectWorkspaceTerminalPane();
-    finishTerminalFocusRequest(self);
+    finishTerminalFocusRequest(self, true);
 }
 
 pub fn requestTerminalDockFocus(self: anytype, dock_id: u32) void {
     self.focusCurrentProjectWorkspaceTerminalDock(dock_id);
-    finishTerminalFocusRequest(self);
+    finishTerminalFocusRequest(self, true);
 }
 
-fn finishTerminalFocusRequest(self: anytype) void {
+pub fn restoreTerminalDockFocus(self: anytype, dock_id: u32) void {
+    self.focusCurrentProjectWorkspaceTerminalDock(dock_id);
+    finishTerminalFocusRequest(self, false);
+}
+
+fn finishTerminalFocusRequest(self: anytype, acknowledge_completion: bool) void {
     self.terminal_controller.focused = true;
     self.composer_controller.focused = false;
     self.composer_controller.composer.focused = false;
     self.unfocusBrowserPane();
     self.browser_controller.address_focused = false;
     self.palette_modal_text_focus = .none;
-    if (self.focusedWorkspaceTerminalDockId()) |dock_id| {
+    if (acknowledge_completion) if (self.focusedWorkspaceTerminalDockId()) |dock_id| {
         _ = self.clearSurfaceAttentionForDock(self.project_controller.selected_index, dock_id);
-    }
+    };
 }
 
 pub fn canRouteTerminalInput(self: anytype) bool {

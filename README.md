@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <em>Codex GUI + Claude Code TUI + Amp + Grok Build — tiled with shell. Every agent local, no hosted relay.</em>
+  <em>Codex GUI + Claude Code TUI + Amp + Grok Build — tiled or scrolled with shell. Every agent local, no hosted relay.</em>
 </p>
 
 ---
@@ -31,7 +31,7 @@
 Most AI coding tools pick a lane: a chat sidebar, a terminal CLI, or a hosted web app. Verde is the **workstation** for the agents you already run locally.
 
 - **One window for every agent.** Codex, Claude Code, OpenCode, and Cursor as native chat *or* TUI panes; Grok Build and Amp as terminal TUIs.
-- **A real tiling workspace.** Split chat, terminal, and browser; rearrange with vim-style keybinds; layouts persist.
+- **A real tiling workspace.** Split chat, terminal, and browser — or scroll them as a Niri-style strip when you open more panes. Layouts persist.
 - **Local-first.** Verde drives the provider CLIs already on your machine. No Verde-hosted inference, no prompt relay, no telemetry sink.
 - **Keyboard-first.** Command palette (`Ctrl+Shift+P`), pane focus, zoom, and workspace jumps — remappable in one config file.
 - **Native, not Electron.** Zig + SDL3 + [Palette](packages/palette) (our in-tree GUI framework), Ghostty VT for terminals, system webview for the browser pane.
@@ -131,7 +131,11 @@ If no GUI provider is ready, Verde shows a **Connect an AI provider** screen so 
 
 ### Tiling workspace, not a chat box
 
-Every pane is first-class. Split a chat beside a browser, drop a terminal underneath, zoom a pane with `Alt+Z`, and rearrange with `Ctrl+Shift+H/J/K/L`. Layouts and per-terminal zoom persist across launches.
+Every pane is first-class. Split a chat beside a browser, drop a terminal next to it, zoom with `Alt+Z`, and rearrange with `Ctrl+Shift+H/J/K/L`. Layouts and per-terminal zoom persist across launches.
+
+### Scrolling pane layout (Niri-style)
+
+With two or more tiled panes, Verde can switch to a horizontal or vertical strip — free-form wheel/touchpad panning, resizable columns, sidebar reorder, and hover-edge navigation. **Settings → Workspace** (or the command palette) chooses Automatic / Always / Disabled, per-workspace overrides, direction, and panes-per-view.
 
 ### Command palette (`Ctrl+Shift+P`)
 
@@ -140,6 +144,10 @@ One Raycast-style launcher ranks threads, open panes, workspaces, and commands. 
 ### Browser + Design Mode
 
 Tile a native webview next to your agent. Point at an element or draw a region, describe the change, and route visual context into a chat or terminal TUI — without leaving the workspace.
+
+### Experimental companion + Mission Control
+
+Opt-in under **Settings → Experimental**: a pane-less orchestration sidecar (Sprout, Moss, or Vireo) with durable threads, operation inspection, and Mission Control for multi-step goals. Still experimental — APIs and UI may change.
 
 ### Project-scoped terminal dock
 
@@ -211,6 +219,7 @@ verde theme import https://verdeai.dev/themes/tokyo-night.json
 | `Ctrl+Shift+T` | Split terminal pane |
 | `Ctrl+Shift+B` | Toggle browser pane |
 | `Ctrl+H/J/K/L` | Focus panes (vim-style); `Ctrl+Arrow` also moves across scrolling panes |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous pane in sidebar order |
 | `Ctrl+Shift+H/J/K/L` | Swap / rearrange panes |
 | `Alt+Z` | Zoom focused pane |
 | `Alt+1`…`Alt+9` | Jump workspaces |
@@ -253,6 +262,7 @@ mise run dev      # build + run (native webview)
 | Dev run | `mise run dev` |
 | Release-style build | `mise run build` |
 | SDL_GPU Palette renderer | `mise run dev-sdl-gpu` |
+| Web client (Zig gateway + Solid SPA) | `mise run web-app` / `mise run web-app-run` |
 
 **Do not use bare `zig build`** — the default Debug + WPE path is known to fail. Prefer `mise run build` / `mise run dev`, or explicitly:
 

@@ -290,4 +290,5 @@ pub const SteerThreadRequest = struct {
     thread_id: []const u8,
     turn_id: []const u8,
     prompt: []const u8,
+    images: []const ImageAttachment = &.{},
 };

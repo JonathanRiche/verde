@@ -1,10 +1,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const headless = @import("headless");
 
 const app_state = @import("../state.zig");
+const state_storage = @import("../state/storage.zig");
 const browser_runtime = @import("../browser/mod.zig");
 const browser_ui = @import("../ui/browser.zig");
 const command_palette = @import("../ui/command_palette.zig");
+const sidebar_ui = @import("../ui/sidebar.zig");
 const herdr = @import("../workspace/herdr.zig");
 const loop_wakeup = @import("loop_wakeup");
 const platform_ipc = @import("../platform/ipc.zig");
@@ -388,33 +391,33 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
     return try okValueResponse(allocator, id_value, .{
         .protocol_version = PROTOCOL_VERSION,
         .commands = &.{
-            "status",                             "capabilities",                        "workspaces",                          "panes",
-            "active",                             "inspect",                             "threads",                             "terminals",
-            "herdr.open",                         "herdr.handoff",                       "herdr.unlink",                        "herdr.status",
-            "surfaces",                           "surface.list",                        "surface.inspect",                     "surface.focus",
-            "surface.clearAttention",             "notification.create",                 "notification.update",                 "notification.clear",
-            "processes",                          "workspace.select",                    "workspace.create",                    "workspace.rename",
-            "workspace.close",                    "workspace.reopen",                    "workspace.archive",                   "pane.focus",
-            "pane.split",                         "pane.resize",                         "pane.move",                           "pane.maximize",
-            "pane.close",                         "chat.open",                           "chat.status",                         "chat.transcript",
-            "chat.draft.set",                     "chat.draft.append",                   "chat.send",                           "chat.followup",
-            "chat.stop",                          "chat.approve",                        "browser.open",                        "browser.navigate",
-            "browser.status",                     "browser.close",                       "browser.toggle",                      "browser.back",
-            "browser.forward",                    "browser.reload",                      "browser.focus",                       "browser.blur",
-            "browser.restart",                    "browser.reset",                       "browser.pointerDown",                 "browser.pointerMove",
-            "browser.pointerUp",                  "browser.toolbarHit",                  "browser.selectAllFocused",            "browser.copyFocused",
-            "browser.pasteTextFocused",           "browser.eval",                        "browser.postJson",                    "browser.screenshot",
-            "browser.inspector.enable",           "browser.inspector.disable",           "browser.inspector.toggle",            "browser.inspector.mode",
-            "browser.inspector.menuOpen",         "browser.inspector.menuClose",         "browser.overlay.workspaceMenuOpen",   "browser.overlay.workspaceMenuClose",
-            "browser.overlay.sidebarMenuOpen",    "browser.overlay.sidebarMenuClose",    "browser.overlay.composerMenuOpen",    "browser.overlay.composerMenuClose",
-            "browser.overlay.workspaceModalOpen", "browser.overlay.workspaceModalClose", "browser.overlay.threadModalOpen",     "browser.overlay.threadModalClose",
-            "browser.overlay.imageModalOpen",     "browser.overlay.imageModalClose",     "browser.overlay.transcriptModalOpen", "browser.overlay.transcriptModalClose",
-            "palette.list",                       "palette.run",                         "terminal.write",                      "terminal.key",
-            "terminal.tail",                      "terminal.screen",                     "process.list",                        "process.inspect",
-            "process.start",                      "process.stop",                        "process.restart",                     "process.logs",
-            "agent.open",                         "stack.status",                        "stack.start",                         "stack.stop",
-            "stack.restart",                      "workspace.processes",                 "workspace.checkCommand",              "workspace.acquireLease",
-            "workspace.releaseLease",
+            "status",                              "capabilities",                        "workspaces",                           "panes",
+            "active",                              "inspect",                             "threads",                              "terminals",
+            "herdr.open",                          "herdr.handoff",                       "herdr.unlink",                         "herdr.status",
+            "surfaces",                            "surface.list",                        "surface.inspect",                      "surface.focus",
+            "surface.clearAttention",              "notification.create",                 "notification.update",                  "notification.clear",
+            "processes",                           "workspace.select",                    "workspace.create",                     "workspace.rename",
+            "workspace.close",                     "workspace.reopen",                    "workspace.archive",                    "pane.focus",
+            "pane.split",                          "pane.resize",                         "pane.move",                            "pane.maximize",
+            "pane.close",                          "chat.open",                           "chat.open.validate",                   "chat.present",
+            "chat.status",                         "chat.transcript",                     "chat.draft.get",                       "chat.draft.set",
+            "chat.draft.append",                   "chat.send",                           "chat.followup",                        "chat.stop",
+            "chat.approve",                        "browser.open",                        "browser.navigate",                     "browser.status",
+            "browser.close",                       "browser.toggle",                      "browser.back",                         "browser.forward",
+            "browser.reload",                      "browser.focus",                       "browser.blur",                         "browser.restart",
+            "browser.reset",                       "browser.pointerDown",                 "browser.pointerMove",                  "browser.pointerUp",
+            "browser.toolbarHit",                  "browser.selectAllFocused",            "browser.copyFocused",                  "browser.pasteTextFocused",
+            "browser.eval",                        "browser.postJson",                    "browser.screenshot",                   "browser.inspector.enable",
+            "browser.inspector.disable",           "browser.inspector.toggle",            "browser.inspector.mode",               "browser.inspector.menuOpen",
+            "browser.inspector.menuClose",         "browser.overlay.workspaceMenuOpen",   "browser.overlay.workspaceMenuClose",   "browser.overlay.sidebarMenuOpen",
+            "browser.overlay.sidebarMenuClose",    "browser.overlay.composerMenuOpen",    "browser.overlay.composerMenuClose",    "browser.overlay.workspaceModalOpen",
+            "browser.overlay.workspaceModalClose", "browser.overlay.threadModalOpen",     "browser.overlay.threadModalClose",     "browser.overlay.imageModalOpen",
+            "browser.overlay.imageModalClose",     "browser.overlay.transcriptModalOpen", "browser.overlay.transcriptModalClose", "palette.list",
+            "palette.run",                         "terminal.write",                      "terminal.key",                         "terminal.tail",
+            "terminal.screen",                     "process.list",                        "process.inspect",                      "process.start",
+            "process.stop",                        "process.restart",                     "process.logs",                         "agent.open",
+            "stack.status",                        "stack.start",                         "stack.stop",                           "stack.restart",
+            "workspace.processes",                 "workspace.checkCommand",              "workspace.acquireLease",               "workspace.releaseLease",
         },
         .events = &.{},
         .encodings = &.{"json"},
@@ -768,6 +771,53 @@ fn notificationUpdateResponse(allocator: std.mem.Allocator, id_value: std.json.V
         return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid surface status") else null;
     const status_requests_attention = if (status) |value| value == .waiting or value == .@"error" else false;
     const requested_attention = boolParam(params, "attention") orelse if (status_requests_attention) true else null;
+    const proof = surfaceCommitProof(params);
+    const status_changed_at_ms = intParam(params, "store_status_changed_at_ms");
+    const completed_at_ms = intParam(params, "store_completed_at_ms");
+    const durability: app_state.SurfaceDurability = if (proof) |commit_proof| verified: {
+        const status_value = status orelse break :verified .durable;
+        if (status_changed_at_ms == null or completed_at_ms == null) break :verified .durable;
+        if (status_value == .idle) {
+            switch (state.storage.classifySurfaceClearCommitProof(commit_proof, session_id) catch .invalid) {
+                .current => break :verified .presentation_only,
+                .superseded => return try supersededSurfaceResponse(allocator, id_value, session_id),
+                .invalid => break :verified .durable,
+            }
+        }
+        const provider_value = if (stringParam(params, "provider")) |value|
+            if (parseSurfaceProvider(value)) |parsed| @tagName(parsed) else null
+        else
+            null;
+        const durable_surface: headless.store.SurfaceState = .{
+            .session_id = session_id,
+            .workspace_id = stringParam(params, "workspace_id") orelse stringParam(params, "workspace") orelse "",
+            .workspace_path = stringParam(params, "workspace_path") orelse "",
+            .dock_id = u32Param(params, "dock_id") orelse u32Param(params, "dock") orelse 0,
+            .pane_id = u32Param(params, "pane_id") orelse u32Param(params, "pane"),
+            .provider = provider_value,
+            .provider_thread_id = stringParam(params, "provider_thread_id"),
+            .title = stringParam(params, "label") orelse stringParam(params, "title") orelse "",
+            .status = @tagName(status_value),
+            .status_changed_at_ms = status_changed_at_ms.?,
+            .completed_at_ms = completed_at_ms.?,
+            .last_event_title = stringParam(params, "title") orelse stringParam(params, "label"),
+            .last_event_body = stringParam(params, "body"),
+        };
+        switch (state.storage.classifySurfaceUpsertCommitProof(commit_proof, durable_surface) catch .invalid) {
+            .current => {
+                // Focus acknowledgement clears presentation before its
+                // targeted Store clear finishes. Replaying that exact receipt
+                // must not resurrect the completion during this window.
+                const canonical = state_storage.protocolSurfaceToPersisted(durable_surface) orelse break :verified .durable;
+                if (status_value == .done and state.containsSurfaceCompletionAcknowledgement(canonical)) {
+                    return try supersededSurfaceResponse(allocator, id_value, session_id);
+                }
+                break :verified .presentation_only;
+            },
+            .superseded => return try supersededSurfaceResponse(allocator, id_value, session_id),
+            .invalid => break :verified .durable,
+        }
+    } else .durable;
     const surface = try state.updateSurface(.{
         .session_id = session_id,
         .workspace_id = stringParam(params, "workspace_id") orelse stringParam(params, "workspace"),
@@ -783,6 +833,9 @@ fn notificationUpdateResponse(allocator: std.mem.Allocator, id_value: std.json.V
         .unread_increment = if (requested_attention orelse false) 1 else 0,
         .last_event_title = stringParam(params, "title") orelse stringParam(params, "label"),
         .last_event_body = stringParam(params, "body"),
+        .status_changed_at_ms = if (durability == .presentation_only) status_changed_at_ms else null,
+        .completed_at_ms = if (durability == .presentation_only) completed_at_ms else null,
+        .durability = durability,
     });
     return try surfaceResultResponse(allocator, id_value, surface);
 }
@@ -790,7 +843,18 @@ fn notificationUpdateResponse(allocator: std.mem.Allocator, id_value: std.json.V
 fn notificationClearResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
     const session_id = stringParam(params, "session_id") orelse stringParam(params, "session") orelse
         return try errorResponseAlloc(allocator, id_value, "invalid_request", "notification.clear requires session_id");
-    const surface = try state.updateSurface(.{ .session_id = session_id, .clear = true });
+    const durability: app_state.SurfaceDurability = if (surfaceCommitProof(params)) |proof| classified: {
+        switch (state.storage.classifySurfaceClearCommitProof(proof, session_id) catch .invalid) {
+            .current => break :classified .presentation_only,
+            .superseded => return try supersededSurfaceResponse(allocator, id_value, session_id),
+            .invalid => break :classified .durable,
+        }
+    } else .durable;
+    const surface = try state.updateSurface(.{
+        .session_id = session_id,
+        .clear = true,
+        .durability = durability,
+    });
     return try surfaceResultResponse(allocator, id_value, surface);
 }
 
@@ -895,7 +959,23 @@ fn paneCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
             return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid pane direction");
         changed = state.moveWorkspacePaneInDirection(target.project_index, target.pane_id, direction);
     } else if (std.mem.eql(u8, command, "maximize")) {
-        changed = state.maximizeWorkspacePane(target.project_index, target.pane_id);
+        const mode = parsePaneMaximizeMode(stringParam(params, "mode") orelse "toggle") orelse
+            return try errorResponseAlloc(allocator, id_value, "invalid_request", "pane.maximize mode must be on, off, or toggle");
+        const layout = &state.project_controller.projects.items[target.project_index].workspace_layout;
+        const was_maximized = layout.maximized_pane_id == target.pane_id;
+        const desired = switch (mode) {
+            .on => true,
+            .off => false,
+            .toggle => !was_maximized,
+        };
+        if (desired != was_maximized) {
+            changed = if (desired)
+                state.maximizeWorkspacePane(target.project_index, target.pane_id)
+            else
+                state.clearWorkspacePaneMaximized(target.project_index);
+            if (!changed) return try errorResponseAlloc(allocator, id_value, "rejected", "pane maximize operation did not apply");
+        }
+        return try paneMaximizeResponse(allocator, id_value, state, target, mode, desired != was_maximized);
     } else if (std.mem.eql(u8, command, "close")) {
         changed = state.closeWorkspacePane(target.project_index, target.pane_id);
     } else {
@@ -906,8 +986,35 @@ fn paneCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
     return try panesResponseForProject(allocator, id_value, state, target.project_index);
 }
 
+const PaneMaximizeMode = enum { on, off, toggle };
+
+fn parsePaneMaximizeMode(value: []const u8) ?PaneMaximizeMode {
+    return std.meta.stringToEnum(PaneMaximizeMode, value);
+}
+
+fn paneMaximizeResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    state: *app_state.AppState,
+    target: PaneTarget,
+    mode: PaneMaximizeMode,
+    changed: bool,
+) ![]u8 {
+    const maximized_pane_id = state.project_controller.projects.items[target.project_index].workspace_layout.maximized_pane_id;
+    return try okValueResponse(allocator, id_value, .{
+        .workspace_index = target.project_index,
+        .pane_id = target.pane_id,
+        .mode = @tagName(mode),
+        .changed = changed,
+        .maximized = maximized_pane_id == target.pane_id,
+        .maximized_pane_id = maximized_pane_id,
+    });
+}
+
 fn chatCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
-    if (std.mem.eql(u8, command, "open")) return try chatOpenResponse(allocator, id_value, state, params);
+    if (std.mem.eql(u8, command, "open")) return try chatOpenResponse(allocator, id_value, state, params, false);
+    if (std.mem.eql(u8, command, "open.validate")) return try chatOpenResponse(allocator, id_value, state, params, true);
+    if (std.mem.eql(u8, command, "present")) return try chatPresentResponse(allocator, id_value, state, params);
 
     const target = resolvePaneTarget(state, params) orelse
         return try errorResponseAlloc(allocator, id_value, "not_found", "chat pane not found");
@@ -915,13 +1022,18 @@ fn chatCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
 
     if (std.mem.eql(u8, command, "status")) return try chatStatusResponse(allocator, id_value, state, target.project_index, target.pane_id);
     if (std.mem.eql(u8, command, "transcript")) return try chatTranscriptResponse(allocator, id_value, state, target.project_index, target.pane_id);
+    if (std.mem.eql(u8, command, "draft.get")) return try chatStatusResponse(allocator, id_value, state, target.project_index, target.pane_id);
 
     var accepted = false;
     if (std.mem.eql(u8, command, "draft.set")) {
         const text = stringParam(params, "text") orelse "";
+        persistExternalChatDraft(state, target, text, false) catch |err|
+            return try errorResponseAlloc(allocator, id_value, "persistence_failed", @errorName(err));
         accepted = try state.setWorkspaceChatPaneDraftForProject(target.project_index, target.pane_id, text, false);
     } else if (std.mem.eql(u8, command, "draft.append")) {
         const text = stringParam(params, "text") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.draft.append requires text");
+        persistExternalChatDraft(state, target, text, true) catch |err|
+            return try errorResponseAlloc(allocator, id_value, "persistence_failed", @errorName(err));
         accepted = try state.setWorkspaceChatPaneDraftForProject(target.project_index, target.pane_id, text, true);
     } else if (std.mem.eql(u8, command, "send")) {
         accepted = try state.sendWorkspaceChatPanePromptForProject(target.project_index, target.pane_id, stringParam(params, "prompt"));
@@ -940,6 +1052,18 @@ fn chatCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
 
     if (!accepted) return try errorResponseAlloc(allocator, id_value, "rejected", "chat operation did not apply");
     return try chatStatusResponse(allocator, id_value, state, target.project_index, target.pane_id);
+}
+
+fn persistExternalChatDraft(state: *app_state.AppState, target: PaneTarget, text: []const u8, append: bool) !void {
+    const project = &state.project_controller.projects.items[target.project_index];
+    const pane = project.workspace_layout.paneById(target.pane_id) orelse return error.ChatPaneNotFound;
+    const thread_index = switch (pane.ref) {
+        .chat => |chat_ref| chat_ref.thread_index,
+        else => return error.ChatPaneNotFound,
+    };
+    if (thread_index >= project.threads.items.len) return error.ChatThreadNotFound;
+    const thread = &project.threads.items[thread_index];
+    _ = try state.storage.setChatDraft(project.id, thread.local_thread_id, text, append);
 }
 
 const ParsedChatOpenSettings = struct {
@@ -980,7 +1104,7 @@ fn parseChatOpenSettings(params: std.json.Value) error{
     };
 }
 
-fn chatOpenResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+fn chatOpenResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, validate_only: bool) ![]u8 {
     _ = stringParam(params, "workspace_id") orelse
         return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.open requires an explicit workspace_id");
     const project_index = resolveProjectIndex(state, params) orelse
@@ -1026,6 +1150,36 @@ fn chatOpenResponse(allocator: std.mem.Allocator, id_value: std.json.Value, stat
         },
     };
 
+    if (target_pane_id) |pane_id| {
+        if (state.project_controller.projects.items[project_index].workspace_layout.paneById(pane_id) == null) {
+            return try errorResponseAlloc(allocator, id_value, "not_found", "target pane not found");
+        }
+    }
+    if (validate_only) {
+        const selected_model = model_ref orelse state.cachedDefaultModelRefForProvider(provider);
+        if (!state.providerSupportsModel(provider, selected_model)) {
+            return try errorResponseAlloc(allocator, id_value, "invalid_model", "model is not available for the requested provider");
+        }
+        const settings = state.resolveChatCreationSettings(.{
+            .provider = provider,
+            .model_ref = selected_model,
+            .reasoning_effort = creation_settings.reasoning_effort,
+            .reasoning_variant = creation_settings.reasoning_variant,
+            .fast_mode = creation_settings.fast_mode,
+        }, selected_model) catch |err| return try errorResponseAlloc(allocator, id_value, "unsupported_combination", @errorName(err));
+        return try okValueResponse(allocator, id_value, .{
+            .workspace_id = state.project_controller.projects.items[project_index].id,
+            .provider = @tagName(provider),
+            .model = selected_model,
+            .reasoning_effort = if (settings.reasoning_effort) |value| @tagName(value) else null,
+            .reasoning_variant = settings.reasoning_variant,
+            .fast_mode = settings.fast_mode == .on,
+            .target_pane_id = target_pane_id,
+            .axis = axis_name,
+            .focus = focus,
+        });
+    }
+
     const result = state.openWorkspaceChat(project_index, .{
         .provider = provider,
         .model_ref = model_ref,
@@ -1056,6 +1210,64 @@ fn chatOpenResponse(allocator: std.mem.Allocator, id_value: std.json.Value, stat
         thread.local_thread_id,
         thread.*,
     );
+}
+
+fn chatPresentResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+    if (paramIsNonNull(params, "workspace_id") and stringParam(params, "workspace_id") == null) return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.present workspace_id must be a string");
+    _ = stringParam(params, "workspace_id") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.present requires workspace_id");
+    _ = resolveProjectIndex(state, params);
+    if (paramIsNonNull(params, "local_thread_id") and stringParam(params, "local_thread_id") == null) return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.present local_thread_id must be a string");
+    const local_thread_id = stringParam(params, "local_thread_id") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.present requires local_thread_id");
+    if (paramIsNonNull(params, "axis") and stringParam(params, "axis") == null) return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.present axis must be a string");
+    const axis = parseAxis(stringParam(params, "axis") orelse "horizontal") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid chat.present split axis");
+    if (paramIsNonNull(params, "focus") and boolParam(params, "focus") == null) return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.present focus must be a boolean");
+    const focus = boolParam(params, "focus") orelse true;
+    if (paramIsNonNull(params, "store_revision") and intParam(params, "store_revision") == null) return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.present store_revision must be a non-negative integer");
+    const raw_store_revision = intParam(params, "store_revision") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.present requires store_revision");
+    if (raw_store_revision < 0) return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.present store_revision must be a non-negative integer");
+    const expected_revision: u64 = @intCast(raw_store_revision);
+    if (paramIsNonNull(params, "target_pane_id") and intParam(params, "target_pane_id") == null) return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.present target_pane_id must be a non-negative integer");
+    const raw_target = intParam(params, "target_pane_id");
+    const target_pane_id: ?app_state.WorkspacePaneId = if (raw_target) |value| blk: {
+        if (value < 0 or value > std.math.maxInt(app_state.WorkspacePaneId)) return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.present target_pane_id is out of range");
+        break :blk @intCast(value);
+    } else null;
+    const projection_status = state.requestDaemonProjectionForPresentation(expected_revision);
+    const observed_revision = state.daemonProjectionObservedRevision();
+    switch (projection_status) {
+        .pending => return try projectionRevisionErrorResponseAlloc(allocator, id_value, "projection_pending", "durable revision is not yet present in the GUI projection", expected_revision, observed_revision),
+        .refresh_unavailable => return try projectionRevisionErrorResponseAlloc(allocator, id_value, "projection_refresh_unavailable", "GUI projection refresh is unavailable", expected_revision, observed_revision),
+        .applied => {},
+    }
+    const project_index = resolveProjectIndex(state, params) orelse return try errorResponseAlloc(allocator, id_value, "projection_identity_missing", "workspace is absent from the applied GUI projection");
+    const result = state.presentWorkspaceChat(project_index, .{
+        .local_thread_id = local_thread_id,
+        .target_pane_id = target_pane_id,
+        .axis = axis,
+        .focus = focus,
+    }) catch |err| switch (err) {
+        error.ProjectionPending => return try errorResponseAlloc(allocator, id_value, "projection_identity_missing", "thread is absent from the applied GUI projection"),
+        error.TargetPaneNotFound => return try errorResponseAlloc(allocator, id_value, "not_found", "target pane not found"),
+        else => return try errorResponseAlloc(allocator, id_value, "internal_error", @errorName(err)),
+    };
+    const project = &state.project_controller.projects.items[project_index];
+    return try chatPresentResultResponse(allocator, id_value, project.id, project_index, result, local_thread_id, observed_revision);
+}
+
+fn chatPresentResultResponse(allocator: std.mem.Allocator, id_value: std.json.Value, workspace_id: []const u8, workspace_index: usize, result: app_state.OpenChatResult, thread_id: []const u8, projected_store_revision: u64) ![]u8 {
+    return try okValueResponse(allocator, id_value, .{
+        .workspace_id = workspace_id,
+        .workspace_index = workspace_index,
+        .pane_id = result.pane_id,
+        .thread_id = thread_id,
+        .local_thread_id = thread_id,
+        .presented = true,
+        .presentation_status = "presented",
+        .presentation = if (result.presentation_existing) "existing" else "created",
+        .thread_index = result.thread_index,
+        .focused = result.focused,
+        .projected_store_revision = projected_store_revision,
+    });
 }
 
 fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
@@ -1455,16 +1667,148 @@ fn terminalCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Valu
         });
     }
     if (std.mem.eql(u8, command, "screen")) {
-        const screen = (try state.terminalPaneScreenTextForProject(target.project_index, target.pane_id)) orelse
-            return try errorResponseAlloc(allocator, id_value, "not_found", "terminal screen not found");
-        defer state.allocator.free(screen);
-        return try okValueResponse(allocator, id_value, .{
-            .workspace_index = target.project_index,
-            .pane_id = target.pane_id,
-            .text = screen,
-        });
+        return try terminalScreenDumpResponse(allocator, id_value, state, target.project_index, target.pane_id);
     }
     return try errorResponseAlloc(allocator, id_value, "method_not_found", command);
+}
+
+fn terminalScreenDumpResponse(
+    allocator: std.mem.Allocator,
+    id_value: std.json.Value,
+    state: *app_state.AppState,
+    project_index: usize,
+    pane_id: app_state.WorkspacePaneId,
+) ![]u8 {
+    const screen = (try state.terminalPaneScreenTextForProject(project_index, pane_id)) orelse
+        return try errorResponseAlloc(allocator, id_value, "not_found", "terminal screen not found");
+    defer state.allocator.free(screen);
+    const grid = state.terminalPaneGridSizeForProject(project_index, pane_id);
+    const render = state.terminalPaneRenderStateForProject(project_index, pane_id);
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&s, id_value);
+    try s.objectField("result");
+    try s.beginObject();
+    try s.objectField("workspace_index");
+    try s.write(project_index);
+    try s.objectField("pane_id");
+    try s.write(pane_id);
+    try s.objectField("text");
+    try s.write(screen);
+    try s.objectField("cols");
+    try s.write(if (grid) |size| size.cols else 80);
+    try s.objectField("rows");
+    try s.write(if (grid) |size| size.rows else 24);
+    if (render) |render_state| try writeRenderStateColors(&s, render_state);
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+fn writeRenderStateColors(s: *std.json.Stringify, render_state: *const terminal.RenderState) !void {
+    try s.objectField("bg");
+    try writeRgbHex(s, render_state.colors.background);
+    try s.objectField("fg");
+    try writeRgbHex(s, render_state.colors.foreground);
+    try s.objectField("cursor");
+    try s.beginObject();
+    if (render_state.cursor.viewport) |cursor| {
+        try s.objectField("x");
+        try s.write(cursor.x);
+        try s.objectField("y");
+        try s.write(cursor.y);
+        try s.objectField("visible");
+        try s.write(render_state.cursor.visible);
+    } else {
+        try s.objectField("visible");
+        try s.write(false);
+    }
+    try s.endObject();
+    try s.objectField("palette");
+    try s.beginArray();
+    for (render_state.colors.palette) |rgb| try writeRgbHex(s, rgb);
+    try s.endArray();
+    try s.objectField("cells");
+    try s.beginArray();
+    const row_data = render_state.row_data.slice();
+    const row_cells = row_data.items(.cells);
+    for (row_cells, 0..) |cells, y| {
+        const cells_slice = cells.slice();
+        const raw_cells = cells_slice.items(.raw);
+        const styles = cells_slice.items(.style);
+        for (raw_cells, 0..) |raw_cell, x| {
+            if (raw_cell.wide == .spacer_tail) continue;
+            const style = screenStyleForCell(raw_cell, styles, x);
+            const resolved_bg = style.bg(&raw_cell, &render_state.colors.palette) orelse render_state.colors.background;
+            var fg = style.fg(.{
+                .default = render_state.colors.foreground,
+                .palette = &render_state.colors.palette,
+                .bold = .bright,
+            });
+            var bg = resolved_bg;
+            if (style.flags.inverse) {
+                const swap = bg;
+                bg = fg;
+                fg = swap;
+            }
+            const flags = screenStyleFlags(style);
+            const default_fg = rgbEql(fg, render_state.colors.foreground);
+            const default_bg = rgbEql(bg, render_state.colors.background);
+            if (default_fg and default_bg and flags == 0) continue;
+            try s.beginObject();
+            try s.objectField("x");
+            try s.write(x);
+            try s.objectField("y");
+            try s.write(y);
+            if (!default_fg) {
+                try s.objectField("fg");
+                try writeRgbHex(s, fg);
+            }
+            if (!default_bg) {
+                try s.objectField("bg");
+                try writeRgbHex(s, bg);
+            }
+            if (flags != 0) {
+                try s.objectField("f");
+                try s.write(flags);
+            }
+            try s.endObject();
+        }
+    }
+    try s.endArray();
+}
+
+fn screenStyleForCell(cell: anytype, styles: anytype, index: usize) @TypeOf(styles[0]) {
+    return switch (cell.content_tag) {
+        .bg_color_palette => .{ .bg_color = .{ .palette = cell.content.color_palette.data } },
+        .bg_color_rgb => .{ .bg_color = .{ .rgb = .{
+            .r = cell.content.color_rgb.r,
+            .g = cell.content.color_rgb.g,
+            .b = cell.content.color_rgb.b,
+        } } },
+        else => if (cell.hasStyling()) styles[index] else .{},
+    };
+}
+
+fn screenStyleFlags(style: anytype) u8 {
+    var flags: u8 = 0;
+    if (style.flags.bold) flags |= 1;
+    if (style.flags.faint) flags |= 2;
+    if (style.flags.italic) flags |= 8;
+    if (style.flags.invisible) flags |= 16;
+    return flags;
+}
+
+fn writeRgbHex(s: *std.json.Stringify, rgb: anytype) !void {
+    var buf: [7]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "#{x:0>2}{x:0>2}{x:0>2}", .{ rgb.r, rgb.g, rgb.b }) catch "#000000";
+    try s.write(text);
+}
+
+fn rgbEql(a: anytype, b: anytype) bool {
+    return a.r == b.r and a.g == b.g and a.b == b.b;
 }
 
 const TerminalKeyParamError = error{
@@ -1725,6 +2069,12 @@ fn writeProjectPanes(s: *std.json.Stringify, state: *app_state.AppState, project
         try writePane(s, state, project_index, pane);
     }
     try s.endArray();
+    try s.objectField("root");
+    if (project.workspace_layout.root) |root_node| {
+        try app_state.WorkspaceLayout.writeWorkspaceNodeJson(s, root_node);
+    } else {
+        try s.write(null);
+    }
     try s.endObject();
 }
 
@@ -1784,6 +2134,7 @@ fn writePane(s: *std.json.Stringify, state: *app_state.AppState, project_index: 
                 try s.objectField("cwd");
                 if (dock.cwd) |cwd| try s.write(cwd) else try s.write(null);
             }
+            try writeTerminalIdentity(s, state, project_index, ref.dock_id);
             const attention = terminalDockHasAttention(state, project_index, project, ref.dock_id);
             try s.objectField("attention");
             try s.write(attention);
@@ -1798,6 +2149,45 @@ fn writePane(s: *std.json.Stringify, state: *app_state.AppState, project_index: 
         },
     }
     try s.endObject();
+}
+
+/// Terminal `title` and `agent_provider` for live pane rows, mirroring the
+/// sidebar derivation (surface title -> live process label -> "Terminal";
+/// foreground comm -> surface provider -> pinned provider) so detached
+/// clients render the same label and provider glyph as the desktop.
+fn writeTerminalIdentity(s: *std.json.Stringify, state: *app_state.AppState, project_index: usize, dock_id: u32) !void {
+    var comm_buf: [96]u8 = undefined;
+    var label_buf: [96]u8 = undefined;
+    const surface = state.projectTerminalSurface(project_index, dock_id);
+    var foreground_process: ?[]const u8 = null;
+    var pinned_provider: ?[]const u8 = null;
+    if (state.projectTerminalDock(project_index, dock_id)) |dock| {
+        foreground_process = dock.activeForegroundProcessName(&comm_buf);
+        pinned_provider = dock.activeTabPinnedProvider();
+    }
+    const title = blk: {
+        if (surface) |item| if (item.title.len > 0) break :blk item.title;
+        if (state.projectTerminalDock(project_index, dock_id)) |dock| {
+            const live = dock.activeProcessLabel(&label_buf);
+            if (live.len > 0) break :blk live;
+        }
+        break :blk "Terminal";
+    };
+    try s.objectField("title");
+    try s.write(sidebar_ui.stripLeadingTitleSymbols(title));
+    try s.objectField("agent_provider");
+    if (sidebar_ui.terminalAgentProviderForMetadata(
+        if (surface) |item| item.provider else null,
+        foreground_process,
+        pinned_provider,
+    )) |provider| try s.write(@tagName(provider)) else try s.write(null);
+    // Surface work status, distinct from `running` (shell process alive):
+    // `working` matches the sidebar's green/active highlight so detached
+    // clients classify active terminals exactly like the desktop.
+    try s.objectField("status");
+    if (surface) |item| try s.write(@tagName(item.displayStatus())) else try s.write(null);
+    try s.objectField("working");
+    try s.write(if (surface) |item| !item.completion_pending and item.status == .working else false);
 }
 
 fn writeThreadSummary(s: *std.json.Stringify, thread: app_state.ChatThread, index: usize) !void {
@@ -1867,6 +2257,7 @@ fn writeTerminalsArray(s: *std.json.Stringify, state: *app_state.AppState, maybe
                 try s.objectField("cwd");
                 if (dock.cwd) |cwd| try s.write(cwd) else try s.write(null);
             }
+            try writeTerminalIdentity(s, state, project_index, ref.dock_id);
             for (project.managed_processes.items) |process| {
                 if (process.dock_id == null or process.dock_id.? != ref.dock_id) continue;
                 try s.objectField("process");
@@ -1894,13 +2285,13 @@ fn workspaceProcessesResponse(allocator: std.mem.Allocator, id_value: std.json.V
     if (project_index) |index| {
         if (index >= state.project_controller.projects.items.len) return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
         if (try refreshStackConfigOrError(allocator, id_value, state, index)) |response| return response;
-        state.pollWorkspaceTerminalProcessLifecycles(index);
+        state.pollWorkspaceTerminalProcessLifecyclesForLiveRead(index);
         state.pruneExpiredWorkspaceLeases(index);
     } else {
         var index: usize = 0;
         while (index < state.project_controller.projects.items.len) : (index += 1) {
             if (try refreshStackConfigOrError(allocator, id_value, state, index)) |response| return response;
-            state.pollWorkspaceTerminalProcessLifecycles(index);
+            state.pollWorkspaceTerminalProcessLifecyclesForLiveRead(index);
             state.pruneExpiredWorkspaceLeases(index);
         }
     }
@@ -2389,7 +2780,7 @@ fn workspaceCheckCommandResponse(
     if (command.len == 0 and resource_request.len == 0) {
         return try errorResponseAlloc(allocator, id_value, "invalid_request", "workspace.checkCommand requires command or resources");
     }
-    state.pollWorkspaceTerminalProcessLifecycles(project_index);
+    state.pollWorkspaceTerminalProcessLifecyclesForLiveRead(project_index);
     state.pruneExpiredWorkspaceLeases(project_index);
 
     var writer: std.Io.Writer.Allocating = .init(allocator);
@@ -2446,7 +2837,7 @@ fn workspaceAcquireLeaseResponse(allocator: std.mem.Allocator, id_value: std.jso
     const force = boolParam(params, "force") orelse false;
     const ttl_ms = std.math.clamp(intParam(params, "ttl_ms") orelse 120_000, 1_000, 3_600_000);
 
-    state.pollWorkspaceTerminalProcessLifecycles(project_index);
+    state.pollWorkspaceTerminalProcessLifecyclesForLiveRead(project_index);
     if (!force and workspaceProcessConflictCount(state, project_index, owner, resources.items()) > 0) {
         return try workspaceCheckCommandResponse(allocator, id_value, state, params, true);
     }
@@ -3059,6 +3450,24 @@ fn surfaceResultResponse(allocator: std.mem.Allocator, id_value: std.json.Value,
     return try writer.toOwnedSlice();
 }
 
+fn supersededSurfaceResponse(allocator: std.mem.Allocator, id_value: std.json.Value, session_id: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&s, id_value);
+    try s.objectField("result");
+    try s.beginObject();
+    try s.objectField("session_id");
+    try s.write(session_id);
+    try s.objectField("ignored");
+    try s.write(true);
+    try s.objectField("superseded");
+    try s.write(true);
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
 fn resolveSurfaceProjectIndex(state: *const app_state.AppState, surface: *const app_state.SurfaceState) ?usize {
     for (state.project_controller.projects.items, 0..) |project, index| {
         if (surface.workspace_id.len > 0 and std.mem.eql(u8, surface.workspace_id, project.id)) return index;
@@ -3091,6 +3500,10 @@ fn chatStatusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, st
     try writeThreadSummary(&s, thread.*, ref.thread_index);
     try s.objectField("draft_len");
     try s.write(std.mem.sliceTo(thread.draft_storage[0..], 0).len);
+    try s.objectField("draft");
+    try s.write(thread.currentDraft());
+    try s.objectField("draft_store_revision");
+    try s.write(state.storage.currentStoreRevision());
     try s.objectField("pending_approval");
     try writePendingApproval(&s, thread);
     try s.endObject();
@@ -3121,6 +3534,16 @@ fn chatOpenResultResponse(
     try s.write(result.pane_id);
     try s.objectField("thread_id");
     try s.write(thread_id);
+    // The GUI Live arm keys threads by local_thread_id; emit it alongside the
+    // legacy thread_id (same value) so both open_chat arms expose one stable id.
+    try s.objectField("local_thread_id");
+    try s.write(thread_id);
+    try s.objectField("created");
+    try s.write(true);
+    try s.objectField("presented");
+    try s.write(true);
+    try s.objectField("presentation_status");
+    try s.write("presented");
     try s.objectField("thread_index");
     try s.write(result.thread_index);
     try s.objectField("provider");
@@ -3144,7 +3567,24 @@ fn chatTranscriptResponse(allocator: std.mem.Allocator, id_value: std.json.Value
     };
     if (ref.thread_index >= project.threads.items.len) return try errorResponseAlloc(allocator, id_value, "not_found", "thread not found");
     const thread = &project.threads.items[ref.thread_index];
-    if (!transcriptFitsLiveResponse(thread.messages.items, LIVE_MAX_RESPONSE_BYTES)) {
+    // In-flight turn parts (tool/system rows and streamed assistant text)
+    // live in SendState until the turn commits into thread.messages. Append
+    // them so detached clients see the stream, not just finished turns.
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    const streaming = send_state.status == .pending;
+    // Same 6x-escaping reserve the committed-row budget uses.
+    var pending_bytes: usize = 0;
+    if (streaming) {
+        for (send_state.pending_events.items) |event| {
+            pending_bytes += 64 + (event.author.len + event.body.len + 16) * 6;
+        }
+        pending_bytes += 64 + (send_state.partial_text.items.len + 32) * 6;
+    }
+    if (pending_bytes >= LIVE_MAX_RESPONSE_BYTES or
+        !transcriptFitsLiveResponse(thread.messages.items, LIVE_MAX_RESPONSE_BYTES - pending_bytes))
+    {
         return try errorResponseAlloc(
             allocator,
             id_value,
@@ -3165,6 +3605,8 @@ fn chatTranscriptResponse(allocator: std.mem.Allocator, id_value: std.json.Value
     try s.write(pane_id);
     try s.objectField("thread_index");
     try s.write(ref.thread_index);
+    try s.objectField("streaming");
+    try s.write(streaming);
     try s.objectField("messages");
     try s.beginArray();
     for (thread.messages.items) |message| {
@@ -3177,10 +3619,47 @@ fn chatTranscriptResponse(allocator: std.mem.Allocator, id_value: std.json.Value
         try s.write(message.body);
         try s.endObject();
     }
+    if (streaming) {
+        for (send_state.pending_events.items) |event| {
+            try s.beginObject();
+            try s.objectField("role");
+            try s.write(@tagName(event.role));
+            try s.objectField("author");
+            try s.write(event.author);
+            try s.objectField("body");
+            try s.write(event.body);
+            try s.objectField("streaming");
+            try s.write(true);
+            try s.endObject();
+        }
+        if (send_state.partial_text.items.len > 0) {
+            try s.beginObject();
+            try s.objectField("role");
+            try s.write("assistant");
+            try s.objectField("author");
+            try s.write(streamAuthorLabel(send_state.provider orelse thread.provider));
+            try s.objectField("body");
+            try s.write(send_state.partial_text.items);
+            try s.objectField("streaming");
+            try s.write(true);
+            try s.endObject();
+        }
+    }
     try s.endArray();
     try s.endObject();
     try s.endObject();
     return try writer.toOwnedSlice();
+}
+
+/// Author label for the not-yet-committed streamed assistant row, matching
+/// what transcript commit will write (`transcript_apply.providerLabel`).
+fn streamAuthorLabel(provider: app_state.Provider) []const u8 {
+    return switch (provider) {
+        .codex => "Codex",
+        .opencode => "OpenCode",
+        .claude => "Claude",
+        .cursor => "Cursor",
+    };
 }
 
 /// JSON escaping can expand each input byte to six bytes. Reserve fixed syntax
@@ -3272,6 +3751,30 @@ fn errorResponseAlloc(allocator: std.mem.Allocator, id_value: ?std.json.Value, c
     return try writer.toOwnedSlice();
 }
 
+fn projectionRevisionErrorResponseAlloc(allocator: std.mem.Allocator, id_value: std.json.Value, code: []const u8, message: []const u8, expected_revision: u64, observed_revision: u64) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    try s.objectField("id");
+    try writeJsonValue(&s, id_value);
+    try s.objectField("ok");
+    try s.write(false);
+    try s.objectField("error");
+    try s.beginObject();
+    try s.objectField("code");
+    try s.write(code);
+    try s.objectField("message");
+    try s.write(message);
+    try s.objectField("expected_store_revision");
+    try s.write(expected_revision);
+    try s.objectField("observed_store_revision");
+    try s.write(observed_revision);
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
 fn writeJsonValue(s: *std.json.Stringify, value: std.json.Value) !void {
     switch (value) {
         .integer => |v| try s.write(v),
@@ -3298,6 +3801,19 @@ fn u32Param(params: std.json.Value, name: []const u8) ?u32 {
     const value = intParam(params, name) orelse return null;
     if (value < 0 or value > std.math.maxInt(u32)) return null;
     return @intCast(value);
+}
+
+fn u64Param(params: std.json.Value, name: []const u8) ?u64 {
+    const value = intParam(params, name) orelse return null;
+    if (value < 0) return null;
+    return @intCast(value);
+}
+
+fn surfaceCommitProof(params: std.json.Value) ?app_state.SurfaceCommitProof {
+    return .{
+        .request_key = stringParam(params, "store_request_key") orelse return null,
+        .store_revision = u64Param(params, "store_revision") orelse return null,
+    };
 }
 
 fn floatParam(params: std.json.Value, name: []const u8) ?f32 {
@@ -3392,6 +3908,13 @@ fn parseApprovalDecision(value: []const u8) ?provider_types.ApprovalDecision {
     return null;
 }
 
+test "pane maximize parses explicit modes and defaults to toggle" {
+    try std.testing.expectEqual(PaneMaximizeMode.on, parsePaneMaximizeMode("on").?);
+    try std.testing.expectEqual(PaneMaximizeMode.off, parsePaneMaximizeMode("off").?);
+    try std.testing.expectEqual(PaneMaximizeMode.toggle, parsePaneMaximizeMode("toggle").?);
+    try std.testing.expect(parsePaneMaximizeMode("true") == null);
+}
+
 test "live transcript response budget is bounded before JSON allocation" {
     const messages = [_]app_state.ChatMessage{.{
         .role = .user,
@@ -3433,6 +3956,12 @@ test "chat open response exposes stable identifiers" {
     try std.testing.expectEqualStrings("workspace-1", jsonString(result.get("workspace_id").?).?);
     try std.testing.expectEqual(@as(i64, 7), jsonInt(result.get("pane_id").?).?);
     try std.testing.expectEqualStrings("chat-123", jsonString(result.get("thread_id").?).?);
+    try std.testing.expectEqualStrings(
+        jsonString(result.get("thread_id").?).?,
+        jsonString(result.get("local_thread_id").?).?,
+    );
+    try std.testing.expect(boolParam(.{ .object = result }, "created").?);
+    try std.testing.expect(boolParam(.{ .object = result }, "presented").?);
     try std.testing.expectEqualStrings("codex", jsonString(result.get("provider").?).?);
     try std.testing.expectEqualStrings("gpt-5.6-sol", jsonString(result.get("model").?).?);
     try std.testing.expectEqualStrings("high", jsonString(result.get("reasoning_effort").?).?);
@@ -4097,4 +4626,318 @@ test "terminal key command rejects non-terminal targets and invalid keys" {
     defer parsed_invalid_key.deinit();
     const invalid_key_error = parsed_invalid_key.value.object.get("error").?.object;
     try std.testing.expectEqualStrings("invalid_key", jsonString(invalid_key_error.get("code").?).?);
+}
+
+test "pane close response matches the next durable projection" {
+    const allocator = std.testing.allocator;
+    const daemon_store = @import("../daemon/store.zig");
+    const db_client = @import("../db/client.zig");
+    const persistence = @import("../state/persistence.zig");
+
+    var state: app_state.AppState = undefined;
+    state.allocator = allocator;
+    state.project_controller.projects = .empty;
+    state.project_controller.selected_index = 1;
+    state.lifecycle = .{};
+    @memset(&state.sidebar_notice_storage, 0);
+    defer {
+        for (state.project_controller.projects.items) |*project| project.deinit(allocator);
+        state.project_controller.projects.deinit(allocator);
+    }
+
+    var target = try app_state.Project.init(allocator, "close-target", "Close target", "/tmp/close-target", 0);
+    const second_thread_index = try target.addThread(allocator);
+    const closed_pane_id = try target.workspace_layout.createChatPane(allocator, second_thread_index);
+    try target.workspace_layout.splitPaneWithLeaf(allocator, 1, closed_pane_id, .horizontal, true);
+    state.project_controller.projects.append(allocator, target) catch |err| {
+        target.deinit(allocator);
+        return err;
+    };
+    var selected = try app_state.Project.init(allocator, "selected", "Selected", "/tmp/selected", 0);
+    state.project_controller.projects.append(allocator, selected) catch |err| {
+        selected.deinit(allocator);
+        return err;
+    };
+
+    const params_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"workspace\":\"close-target\",\"pane\":{d}}}",
+        .{closed_pane_id},
+    );
+    defer allocator.free(params_json);
+    var params = try std.json.parseFromSlice(std.json.Value, allocator, params_json, .{});
+    defer params.deinit();
+    const response_id: std.json.Value = .{ .integer = 77 };
+    const close_response = try paneCommandResponse(allocator, response_id, &state, params.value, "close");
+    defer allocator.free(close_response);
+
+    var captured = try persistence.buildSnapshot(.{
+        .projects = state.project_controller.projects.items,
+        .archived_projects = &.{},
+        .selected_project_index = state.project_controller.selected_index,
+        .sidebar_collapsed = false,
+    }, allocator);
+    defer captured.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const pref_path = path_buf[0..path_len];
+    const db_path = try std.fs.path.joinZ(allocator, &.{ pref_path, db_client.STATE_DB_NAME });
+    defer allocator.free(db_path);
+    var store = try daemon_store.Store.init(allocator, db_path);
+    defer store.deinit();
+    var protocol_arena = std.heap.ArenaAllocator.init(allocator);
+    defer protocol_arena.deinit();
+    const protocol_snapshot = try persistence.persistedStateToProtocolSnapshot(protocol_arena.allocator(), captured.value, 0);
+    const write = try store.replaceSnapshot(.{
+        .mutation = .{
+            .request_key = "pane-close-projection",
+            .client_id = "pane-close-test-client",
+            .expected_store_revision = 0,
+        },
+        .snapshot = protocol_snapshot,
+        .bootstrap = false,
+    });
+    try std.testing.expect(write.applied);
+
+    var reader = try db_client.Client.initReadOnly(allocator, pref_path);
+    defer reader.deinit();
+    var reloaded = (try reader.load(allocator)).?;
+    defer reloaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), reloaded.value.selected_project_index);
+    const layout_json = reloaded.value.projects[0].workspace_layout_json orelse return error.TestExpectedEqual;
+    try state.project_controller.projects.items[0].workspace_layout.applyPersistedWorkspaceJson(allocator, layout_json);
+    const projection_response = try panesResponseForProject(allocator, response_id, &state, 0);
+    defer allocator.free(projection_response);
+    try std.testing.expectEqualStrings(close_response, projection_response);
+}
+
+test "surface receipt proof is current while superseded delivery is inert" {
+    const allocator = std.testing.allocator;
+    const daemon_store = @import("../daemon/store.zig");
+    const db_client = @import("../db/client.zig");
+    const persistence = @import("../state/persistence.zig");
+    const storage_mod = @import("../state/storage.zig");
+    const app_config = @import("../app/config.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const pref_path = path_buf[0..path_len];
+    const db_path = try std.fs.path.joinZ(allocator, &.{ pref_path, db_client.STATE_DB_NAME });
+    defer allocator.free(db_path);
+    var store = try daemon_store.Store.init(allocator, db_path);
+    defer store.deinit();
+
+    var project = try app_state.Project.init(allocator, "live-proof", "Live proof", "/tmp/live-proof", 0);
+    defer project.deinit(allocator);
+    project.threads.items[0].committed = true;
+    const projects = [_]app_state.Project{project};
+    var captured = try persistence.buildSnapshot(.{
+        .projects = &projects,
+        .archived_projects = &.{},
+        .selected_project_index = 0,
+        .sidebar_collapsed = false,
+    }, allocator);
+    defer captured.deinit();
+    var protocol_arena = std.heap.ArenaAllocator.init(allocator);
+    defer protocol_arena.deinit();
+    const protocol_snapshot = try persistence.persistedStateToProtocolSnapshot(protocol_arena.allocator(), captured.value, 0);
+    const snapshot_write = try store.replaceSnapshot(.{
+        .mutation = .{
+            .request_key = "live-proof-snapshot",
+            .client_id = "live-proof-client",
+            .expected_store_revision = 0,
+        },
+        .snapshot = protocol_snapshot,
+        .bootstrap = false,
+    });
+    try std.testing.expectEqual(@as(u64, 1), snapshot_write.store_revision);
+
+    const durable_surface: headless.store.SurfaceState = .{
+        .session_id = "live-proof-session",
+        .workspace_id = "live-proof",
+        .workspace_path = "/tmp/live-proof",
+        .dock_id = 7,
+        .pane_id = 2,
+        .provider = "codex",
+        .provider_thread_id = "provider-thread-proof",
+        .title = "Receipt surface",
+        .status = "done",
+        .status_changed_at_ms = 100,
+        .completed_at_ms = 100,
+        .last_event_title = "Ran command",
+        .last_event_body = "exact body",
+    };
+    const upsert_write = try store.upsertSurface(.{
+        .mutation = .{
+            .request_key = "cli-live-upsert",
+            .client_id = "live-proof-client",
+            .expected_store_revision = 1,
+        },
+        .surface = durable_surface,
+    });
+    try std.testing.expectEqual(@as(u64, 2), upsert_write.store_revision);
+
+    var storage = try storage_mod.Storage.initWithPrefPath(allocator, pref_path);
+    defer storage.deinit();
+    var state = try app_state.AppState.init(allocator, &storage, app_config.AppConfig{}, .{
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = false,
+    });
+    defer {
+        state.lifecycle.clearDirty();
+        state.deinit();
+    }
+    try std.testing.expectEqual(app_state.SurfaceCommitProofClassification.current, try storage.classifySurfaceUpsertCommitProof(.{
+        .request_key = "cli-live-upsert",
+        .store_revision = 2,
+    }, durable_surface));
+    var spoofed_surface = durable_surface;
+    spoofed_surface.title = "spoofed";
+    try std.testing.expectEqual(app_state.SurfaceCommitProofClassification.invalid, try storage.classifySurfaceUpsertCommitProof(.{
+        .request_key = "cli-live-upsert",
+        .store_revision = 2,
+    }, spoofed_surface));
+    try std.testing.expectEqual(app_state.SurfaceCommitProofClassification.invalid, try storage.classifySurfaceUpsertCommitProof(.{
+        .request_key = "cli-live-upsert",
+        .store_revision = 99,
+    }, durable_surface));
+    try std.testing.expectEqual(app_state.SurfaceCommitProofClassification.invalid, try storage.classifySurfaceUpsertCommitProof(.{
+        .request_key = "missing-receipt",
+        .store_revision = 2,
+    }, durable_surface));
+
+    var update_params = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"session_id":"live-proof-session","workspace_id":"live-proof","workspace_path":"/tmp/live-proof","dock_id":7,"pane_id":2,"provider":"codex","provider_thread_id":"provider-thread-proof","label":"Receipt surface","title":"Ran command","body":"exact body","status":"done","store_request_key":"cli-live-upsert","store_revision":2,"store_status_changed_at_ms":100,"store_completed_at_ms":100}
+    , .{});
+    defer update_params.deinit();
+    const update_response = try notificationUpdateResponse(allocator, .{ .integer = 90 }, &state, update_params.value);
+    defer allocator.free(update_response);
+    var parsed_update = try std.json.parseFromSlice(std.json.Value, allocator, update_response, .{});
+    defer parsed_update.deinit();
+    try std.testing.expect(parsed_update.value.object.get("ok").?.bool);
+    try std.testing.expectEqual(@as(u64, 2), try store.storeRevision());
+    const presented = state.surfaceBySessionIdConst("live-proof-session") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(app_state.SurfaceStatus.done, presented.status);
+    try std.testing.expectEqual(@as(i64, 100), presented.status_changed_at_ms);
+    try std.testing.expect(presented.completion_pending);
+    try std.testing.expectEqual(@as(i64, 100), presented.completed_at_ms);
+
+    // Repeating the still-current done receipt does not change the durable
+    // revision or recreate completion state.
+    const repeated_response = try notificationUpdateResponse(allocator, .{ .integer = 91 }, &state, update_params.value);
+    defer allocator.free(repeated_response);
+    try std.testing.expectEqual(@as(u64, 2), try store.storeRevision());
+    try std.testing.expect(state.surfaceBySessionIdConst("live-proof-session").?.completion_pending);
+    try std.testing.expectEqual(@as(i64, 100), state.surfaceBySessionIdConst("live-proof-session").?.completed_at_ms);
+
+    const clear_write = try store.clearSurface(.{
+        .mutation = .{
+            .request_key = "cli-live-clear",
+            .client_id = "live-proof-client",
+            .expected_store_revision = 2,
+        },
+        .session_id = "live-proof-session",
+    });
+    try std.testing.expectEqual(@as(u64, 3), clear_write.store_revision);
+    try std.testing.expectEqual(app_state.SurfaceCommitProofClassification.current, try storage.classifySurfaceClearCommitProof(.{
+        .request_key = "cli-live-clear",
+        .store_revision = 3,
+    }, "live-proof-session"));
+    try std.testing.expectEqual(app_state.SurfaceCommitProofClassification.invalid, try storage.classifySurfaceClearCommitProof(.{
+        .request_key = "cli-live-clear",
+        .store_revision = 3,
+    }, "different-session"));
+
+    var clear_params = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"session_id":"live-proof-session","store_request_key":"cli-live-clear","store_revision":3}
+    , .{});
+    defer clear_params.deinit();
+    const clear_response = try notificationClearResponse(allocator, .{ .integer = 92 }, &state, clear_params.value);
+    defer allocator.free(clear_response);
+    var parsed_clear = try std.json.parseFromSlice(std.json.Value, allocator, clear_response, .{});
+    defer parsed_clear.deinit();
+    try std.testing.expect(parsed_clear.value.object.get("ok").?.bool);
+    try std.testing.expectEqual(@as(u64, 3), try store.storeRevision());
+    try std.testing.expectEqual(app_state.SurfaceStatus.idle, state.surfaceBySessionIdConst("live-proof-session").?.status);
+
+    // The old exact upsert receipt is historical after the clear. Delayed
+    // delivery is acknowledged as superseded without Store or presentation.
+    try std.testing.expectEqual(app_state.SurfaceCommitProofClassification.superseded, try storage.classifySurfaceUpsertCommitProof(.{
+        .request_key = "cli-live-upsert",
+        .store_revision = 2,
+    }, durable_surface));
+    const delayed_upsert = try notificationUpdateResponse(allocator, .{ .integer = 93 }, &state, update_params.value);
+    defer allocator.free(delayed_upsert);
+    var parsed_delayed_upsert = try std.json.parseFromSlice(std.json.Value, allocator, delayed_upsert, .{});
+    defer parsed_delayed_upsert.deinit();
+    try std.testing.expect(parsed_delayed_upsert.value.object.get("result").?.object.get("superseded").?.bool);
+    try std.testing.expectEqual(@as(u64, 3), try store.storeRevision());
+    try std.testing.expectEqual(app_state.SurfaceStatus.idle, state.surfaceBySessionIdConst("live-proof-session").?.status);
+    try std.testing.expect(!state.surfaceBySessionIdConst("live-proof-session").?.completion_pending);
+
+    var working_surface = durable_surface;
+    working_surface.status = "working";
+    working_surface.status_changed_at_ms = 200;
+    working_surface.completed_at_ms = 0;
+    const working_write = try store.upsertSurface(.{
+        .mutation = .{
+            .request_key = "cli-live-working",
+            .client_id = "live-proof-client",
+            .expected_store_revision = 3,
+        },
+        .surface = working_surface,
+    });
+    try std.testing.expectEqual(@as(u64, 4), working_write.store_revision);
+    var working_params = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"session_id":"live-proof-session","workspace_id":"live-proof","workspace_path":"/tmp/live-proof","dock_id":7,"pane_id":2,"provider":"codex","provider_thread_id":"provider-thread-proof","label":"Receipt surface","title":"Ran command","body":"exact body","status":"working","store_request_key":"cli-live-working","store_revision":4,"store_status_changed_at_ms":200,"store_completed_at_ms":0}
+    , .{});
+    defer working_params.deinit();
+    const working_response = try notificationUpdateResponse(allocator, .{ .integer = 94 }, &state, working_params.value);
+    defer allocator.free(working_response);
+    try std.testing.expectEqual(app_state.SurfaceStatus.working, state.surfaceBySessionIdConst("live-proof-session").?.status);
+    try std.testing.expectEqual(@as(u64, 4), try store.storeRevision());
+
+    // Conversely, the old clear receipt cannot hide the newer exact upsert.
+    try std.testing.expectEqual(app_state.SurfaceCommitProofClassification.superseded, try storage.classifySurfaceClearCommitProof(.{
+        .request_key = "cli-live-clear",
+        .store_revision = 3,
+    }, "live-proof-session"));
+    const delayed_clear = try notificationClearResponse(allocator, .{ .integer = 95 }, &state, clear_params.value);
+    defer allocator.free(delayed_clear);
+    var parsed_delayed_clear = try std.json.parseFromSlice(std.json.Value, allocator, delayed_clear, .{});
+    defer parsed_delayed_clear.deinit();
+    try std.testing.expect(parsed_delayed_clear.value.object.get("result").?.object.get("superseded").?.bool);
+    try std.testing.expectEqual(@as(u64, 4), try store.storeRevision());
+    try std.testing.expectEqual(app_state.SurfaceStatus.working, state.surfaceBySessionIdConst("live-proof-session").?.status);
+
+    // A receipt for the opposite operation is invalid, and incomplete proof
+    // JSON is not recognized as proof at all; both therefore retain the raw
+    // durable path instead of being silently ignored.
+    try std.testing.expectEqual(app_state.SurfaceCommitProofClassification.invalid, try storage.classifySurfaceUpsertCommitProof(.{
+        .request_key = "cli-live-clear",
+        .store_revision = 3,
+    }, working_surface));
+    var incomplete = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"store_request_key":"cli-live-working"}
+    , .{});
+    defer incomplete.deinit();
+    try std.testing.expect(surfaceCommitProof(incomplete.value) == null);
+
+    storage.markPersistenceUnavailable();
+    var invalid_clear_params = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"session_id":"live-proof-session","store_request_key":"cli-live-clear","store_revision":99}
+    , .{});
+    defer invalid_clear_params.deinit();
+    try std.testing.expectError(error.SessionDaemonUnavailable, notificationClearResponse(allocator, .{ .integer = 96 }, &state, invalid_clear_params.value));
+    var raw_clear_params = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"session_id":"live-proof-session"}
+    , .{});
+    defer raw_clear_params.deinit();
+    try std.testing.expectError(error.SessionDaemonUnavailable, notificationClearResponse(allocator, .{ .integer = 97 }, &state, raw_clear_params.value));
+    try std.testing.expectEqual(@as(u64, 4), try store.storeRevision());
+    try std.testing.expectEqual(app_state.SurfaceStatus.working, state.surfaceBySessionIdConst("live-proof-session").?.status);
 }

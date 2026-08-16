@@ -18,8 +18,12 @@
             .url = "git+https://github.com/karlseguin/zqlite.zig#5ac4cabe95a6d7faa7baf0da8057a8e6e8a227a1",
             .hash = "zqlite-0.0.1-RWLaY64xnAAxsD2YNT8QqPMJUuaFv2GOzFRR4aGypJv3",
         },
+        // Immutable upstream pin (issue #101): libghostty-vt consumed as a
+        // regular Zig package instead of the vendored packages/ghostty tree.
+        // Same commit as the web app's pre-built ghostty-vt.wasm artifact.
         .ghostty = .{
-            .path = "../ghostty",
+            .url = "https://github.com/ghostty-org/ghostty/archive/d760ee96e54657416eb427b793c7e839f003df7d.tar.gz",
+            .hash = "ghostty-1.3.2-dev-5UdBC_6FQgWGrD6VNNvHKYwtJ0pHa2PRFlw8OIVsvdKY",
         },
     },
     .fingerprint = 0xd77462097ec03b8f,

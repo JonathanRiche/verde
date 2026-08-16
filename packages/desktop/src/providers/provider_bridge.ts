@@ -43,12 +43,24 @@ function textFromContent(content) {
 
 let nextApprovalRequestId = 1;
 const pendingApprovals = new Map();
+let activeClaudePromptChannel = null;
 
 function handleInputLine(line) {
   let message;
   try {
     message = JSON.parse(line);
   } catch {
+    return;
+  }
+  if (message?.type === "steer_prompt" && typeof message.request_id === "number") {
+    let accepted = false;
+    try {
+      const prompt = buildClaudePrompt(message);
+      accepted = activeClaudePromptChannel?.push(prompt, "next") ?? false;
+    } catch {
+      accepted = false;
+    }
+    write({ type: "steer_response", request_id: message.request_id, accepted });
     return;
   }
   if (message?.type !== "approval_response" || typeof message.request_id !== "number") return;
@@ -102,7 +114,7 @@ function claudeRoleFromSdkMessage(message) {
   return undefined;
 }
 
-async function buildClaudePrompt(request) {
+function buildClaudePrompt(request) {
   const images = Array.isArray(request.images) ? request.images : [];
   if (images.length === 0) return request.prompt;
 
@@ -124,14 +136,59 @@ async function buildClaudePrompt(request) {
   return lines.join("\n");
 }
 
-async function* claudePromptStream(prompt, input_done) {
-  yield {
+function claudeUserMessage(prompt, priority) {
+  return {
     type: "user",
     session_id: "",
     message: { role: "user", content: [{ type: "text", text: prompt }] },
     parent_tool_use_id: null,
+    ...(priority ? { priority } : {}),
   };
-  await input_done;
+}
+
+function createClaudePromptChannel(initialPrompt) {
+  const queued = [claudeUserMessage(initialPrompt)];
+  let waiting = null;
+  let closed = false;
+
+  const next = () => {
+    if (queued.length > 0) return Promise.resolve(queued.shift());
+    if (closed) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      waiting = resolve;
+    });
+  };
+
+  return {
+    push(prompt, priority) {
+      if (closed) return false;
+      const message = claudeUserMessage(prompt, priority);
+      if (waiting) {
+        const resolve = waiting;
+        waiting = null;
+        resolve(message);
+      } else {
+        queued.push(message);
+      }
+      return true;
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      if (waiting) {
+        const resolve = waiting;
+        waiting = null;
+        resolve(null);
+      }
+    },
+    async *messages() {
+      while (true) {
+        const message = await next();
+        if (!message) return;
+        yield message;
+      }
+    },
+  };
 }
 
 function emitClaudeSdkMessage(message) {
@@ -984,14 +1041,13 @@ async function handleClaudeSendPrompt(sdk, request) {
     if (typeof data === "string" && data.length > 0) stderrChunks.push(data);
   };
 
-  let finishInput;
-  const inputDone = new Promise((resolve) => {
-    finishInput = resolve;
-  });
+  const promptChannel = createClaudePromptChannel(buildClaudePrompt(request));
+  activeClaudePromptChannel = promptChannel;
+  const finishInput = () => promptChannel.close();
   const query = sdk.query({
     // A string prompt makes the SDK close stdin after Claude's first result,
     // which stops any background tasks before their completion notification.
-    prompt: claudePromptStream(await buildClaudePrompt(request), inputDone),
+    prompt: promptChannel.messages(),
     options,
   });
 
@@ -1042,6 +1098,9 @@ async function handleClaudeSendPrompt(sdk, request) {
     const stderr = stderrChunks.join("").trim();
     if (stderr) throw new Error(`${err?.message ?? String(err)}\n${stderr}`);
     throw err;
+  } finally {
+    finishInput();
+    if (activeClaudePromptChannel === promptChannel) activeClaudePromptChannel = null;
   }
 }
 

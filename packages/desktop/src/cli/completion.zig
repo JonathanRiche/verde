@@ -64,6 +64,7 @@ fn writePowerShell(w: *std.Io.Writer) !void {
     try writePowerShellRoute(w, "integrations remove", &spec.integration_providers);
     try writePowerShellRoute(w, "integrations disable", &spec.integration_providers);
     try writePowerShellRoute(w, "session", &spec.session_commands);
+    try writePowerShellRoute(w, "core", &spec.core_commands);
     try writePowerShellRoute(w, "live", &spec.live_commands);
     try writePowerShellRoute(w, "live workspace", &spec.workspace_commands);
     try writePowerShellRoute(w, "live pane", &spec.pane_commands);
@@ -151,6 +152,8 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.integration_providers);
     try w.writeAll("\"\n  local session=\"");
     try writeWords(w, &spec.session_commands);
+    try w.writeAll("\"\n  local core=\"");
+    try writeWords(w, &spec.core_commands);
     try w.writeAll("\"\n  local live=\"");
     try writeWords(w, &spec.live_commands);
     try w.writeAll("\"\n  local workspace=\"");
@@ -199,6 +202,8 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.pane_resize_flags);
     try w.writeAll("\"\n  local pane_move_flags=\"");
     try writeWords(w, &spec.pane_move_flags);
+    try w.writeAll("\"\n  local pane_maximize_flags=\"");
+    try writeWords(w, &spec.pane_maximize_flags);
     try w.writeAll("\"\n  local workspace_select_flags=\"");
     try writeWords(w, &spec.workspace_select_flags);
     try w.writeAll("\"\n  local workspace_create_flags=\"");
@@ -330,6 +335,9 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\          *) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
         \\        esac
         \\        ;;
+        \\      core)
+        \\        COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") )
+        \\        ;;
         \\      live)
         \\        case "$sub" in
         \\          panes|threads|terminals) COMPREPLY=( $(compgen -W "$project_json_flags" -- "$cur") ) ;;
@@ -350,6 +358,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\              split) COMPREPLY=( $(compgen -W "$pane_split_flags" -- "$cur") ) ;;
         \\              resize) COMPREPLY=( $(compgen -W "$pane_resize_flags" -- "$cur") ) ;;
         \\              move) COMPREPLY=( $(compgen -W "$pane_move_flags" -- "$cur") ) ;;
+        \\              maximize) COMPREPLY=( $(compgen -W "$pane_maximize_flags" -- "$cur") ) ;;
         \\              *) COMPREPLY=( $(compgen -W "$pane_flags" -- "$cur") ) ;;
         \\            esac
         \\            ;;
@@ -407,6 +416,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    2:herdr:*) COMPREPLY=( $(compgen -W "$herdr" -- "$cur") ) ;;
         \\    2:integrations:*) COMPREPLY=( $(compgen -W "$integrations" -- "$cur") ) ;;
         \\    2:session:*) COMPREPLY=( $(compgen -W "$session" -- "$cur") ) ;;
+        \\    2:core:*) COMPREPLY=( $(compgen -W "$core" -- "$cur") ) ;;
         \\    2:live:*) COMPREPLY=( $(compgen -W "$live" -- "$cur") ) ;;
         \\    3:integrations:install:|3:integrations:remove:|3:integrations:disable:) COMPREPLY=( $(compgen -W "$integration_providers" -- "$cur") ) ;;
         \\    3:live:workspace:*) COMPREPLY=( $(compgen -W "$workspace" -- "$cur") ) ;;
@@ -455,6 +465,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.integration_providers);
     try w.writeAll("\"\n  local session=\"");
     try writeWords(w, &spec.session_commands);
+    try w.writeAll("\"\n  local core=\"");
+    try writeWords(w, &spec.core_commands);
     try w.writeAll("\"\n  local live=\"");
     try writeWords(w, &spec.live_commands);
     try w.writeAll("\"\n  local workspace=\"");
@@ -503,6 +515,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.pane_resize_flags);
     try w.writeAll("\"\n  local pane_move_flags=\"");
     try writeWords(w, &spec.pane_move_flags);
+    try w.writeAll("\"\n  local pane_maximize_flags=\"");
+    try writeWords(w, &spec.pane_maximize_flags);
     try w.writeAll("\"\n  local workspace_select_flags=\"");
     try writeWords(w, &spec.workspace_select_flags);
     try w.writeAll("\"\n  local workspace_create_flags=\"");
@@ -634,6 +648,9 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\          *) compadd -- ${(s: :)json_flags} ;;
         \\        esac
         \\        ;;
+        \\      core)
+        \\        compadd -- ${(s: :)json_flags}
+        \\        ;;
         \\      live)
         \\        case "$sub" in
         \\          panes|threads|terminals) compadd -- ${(s: :)project_json_flags} ;;
@@ -654,6 +671,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\              split) compadd -- ${(s: :)pane_split_flags} ;;
         \\              resize) compadd -- ${(s: :)pane_resize_flags} ;;
         \\              move) compadd -- ${(s: :)pane_move_flags} ;;
+        \\              maximize) compadd -- ${(s: :)pane_maximize_flags} ;;
         \\              *) compadd -- ${(s: :)pane_flags} ;;
         \\            esac
         \\            ;;
@@ -711,6 +729,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    3:herdr:*) compadd -- ${(s: :)herdr} ;;
         \\    3:integrations:*) compadd -- ${(s: :)integrations} ;;
         \\    3:session:*) compadd -- ${(s: :)session} ;;
+        \\    3:core:*) compadd -- ${(s: :)core} ;;
         \\    3:live:*) compadd -- ${(s: :)live} ;;
         \\    4:integrations:install:|4:integrations:remove:|4:integrations:disable:) compadd -- ${(s: :)integration_providers} ;;
         \\    4:live:workspace:*) compadd -- ${(s: :)workspace} ;;
@@ -773,6 +792,8 @@ fn writeFish(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.integration_providers);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after session' -a '");
     try writeWords(w, &spec.session_commands);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after core' -a '");
+    try writeWords(w, &spec.core_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live' -a '");
     try writeWords(w, &spec.live_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live workspace' -a '");

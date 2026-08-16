@@ -22,6 +22,11 @@ fn unixTimestampMs() i64 {
 
 pub const SurfaceStatus = db_types.SurfaceStatus;
 
+pub const SurfaceDurability = enum {
+    durable,
+    presentation_only,
+};
+
 pub const SurfaceUpdate = struct {
     session_id: []const u8,
     workspace_id: ?[]const u8 = null,
@@ -38,6 +43,11 @@ pub const SurfaceUpdate = struct {
     last_event_title: ?[]const u8 = null,
     last_event_body: ?[]const u8 = null,
     clear: bool = false,
+    status_changed_at_ms: ?i64 = null,
+    completed_at_ms: ?i64 = null,
+    /// Only the Live server may select presentation_only, after validating an
+    /// exact durable daemon receipt for this mutation.
+    durability: SurfaceDurability = .durable,
 };
 
 pub const SurfaceState = struct {
@@ -59,6 +69,7 @@ pub const SurfaceState = struct {
     last_event_title: ?[]u8 = null,
     last_event_body: ?[]u8 = null,
     last_event_at_ms: i64 = 0,
+    presentation_generation: u64 = 0,
 
     pub fn displayStatus(self: *const SurfaceState) SurfaceStatus {
         return if (self.completion_pending) .done else self.status;
@@ -152,8 +163,9 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
             }
         }
     }
+    s.presentation_generation +%= 1;
     if (update.clear) {
-        _ = try self.storage.client.clearSurfaceState(s.session_id);
+        if (update.durability == .durable) _ = try self.storage.clearSurfaceState(s.session_id);
         if (s.status != .idle) s.status_changed_at_ms = unixTimestampMs();
         s.status = .idle;
         s.completion_pending = false;
@@ -166,12 +178,12 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
         _ = clearTerminalNotificationBySession(self, update.session_id);
     } else {
         if (update.status) |value| {
-            const now_ms = unixTimestampMs();
+            const now_ms = update.status_changed_at_ms orelse unixTimestampMs();
             if (value != s.status) s.status_changed_at_ms = now_ms;
             s.status = value;
             if (value == .done and !s.completion_pending) {
                 s.completion_pending = true;
-                s.completed_at_ms = now_ms;
+                s.completed_at_ms = update.completed_at_ms orelse now_ms;
                 completion_became_pending = true;
             } else if (value != .done) {
                 // A new active/idle state supersedes any older completion.
@@ -193,11 +205,10 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
             s.last_event_at_ms = unixTimestampMs();
         }
         if (s.status == .idle) {
-            if (update.status != null) _ = try self.storage.client.clearSurfaceState(s.session_id);
+            if (update.status != null and update.durability == .durable) _ = try self.storage.clearSurfaceState(s.session_id);
         } else {
-            // Every non-idle hook state is durable. This is also the offline
-            // handoff point used to restore a daemon-owned TUI after restart.
-            try self.storage.client.upsertSurfaceState(persistedSurfaceState(s));
+            // Every non-idle hook state is durable via the daemon store.
+            if (update.durability == .durable) try self.storage.upsertSurfaceState(persistedSurfaceState(s));
         }
     }
     // Notify on the completion edge. Runs on the main thread (live commands
@@ -209,7 +220,7 @@ pub fn updateSurface(self: anytype, update: SurfaceUpdate) !*SurfaceState {
     return s;
 }
 
-fn persistedSurfaceState(surface: *const SurfaceState) PersistedSurfaceState {
+pub fn persistedSurfaceState(surface: *const SurfaceState) PersistedSurfaceState {
     return .{
         .session_id = surface.session_id,
         .workspace_id = surface.workspace_id,
@@ -335,12 +346,7 @@ fn clearSurfaceAttentionAtIndex(self: anytype, surface_index: usize) bool {
     // to act on them).
     const done_ack = surface.completion_pending or surface.status == .done;
     if (!surface.attention and surface.unread_count == 0 and !done_ack) return terminal_changed;
-    if (done_ack) {
-        _ = self.storage.client.clearSurfaceState(surface.session_id) catch |err| {
-            log.err("failed to persist surface acknowledgement: {s}", .{@errorName(err)});
-            return terminal_changed;
-        };
-    }
+    if (done_ack and !self.queueSurfaceAcknowledgement(surface)) return terminal_changed;
     surface.attention = false;
     surface.unread_count = 0;
     if (done_ack) {
@@ -348,7 +354,12 @@ fn clearSurfaceAttentionAtIndex(self: anytype, surface_index: usize) bool {
         surface.completed_at_ms = 0;
         if (surface.status == .done) surface.status = .idle;
     }
-    self.markDirty();
+    surface.presentation_generation +%= 1;
+    // Completion durability is owned by the targeted clear. Attention and
+    // unread counts are volatile daemon/session projections and are not fields
+    // in PersistedSurfaceState, so a compatibility snapshot cannot durably
+    // represent their focus acknowledgement; dirtying 136 MiB here only made
+    // workspace focus schedule redundant full-state work.
     return true;
 }
 
@@ -428,4 +439,53 @@ test "nested provider cannot claim a terminal pinned to another agent" {
     try std.testing.expect(surfaceProviderClaimMatchesPin(.cursor, null));
     try std.testing.expect(surfaceProviderClaimMatchesPin(.cursor, "cursor"));
     try std.testing.expect(!surfaceProviderClaimMatchesPin(.cursor, "amp"));
+}
+
+test "surface focus clear queues persistence and updates local state immediately" {
+    const project_state = @import("project.zig");
+    const FakeState = struct {
+        allocator: std.mem.Allocator,
+        surface_controller: State = .{},
+        project_controller: struct {
+            projects: std.ArrayList(project_state.Project) = .empty,
+        } = .{},
+        queued: bool = false,
+        dirty: bool = false,
+
+        fn queueSurfaceAcknowledgement(self: *@This(), surface: *const SurfaceState) bool {
+            self.queued = std.mem.eql(u8, surface.session_id, "session-a");
+            return true;
+        }
+
+        fn markDirty(self: *@This()) void {
+            self.dirty = true;
+        }
+    };
+
+    var state: FakeState = .{ .allocator = std.testing.allocator };
+    defer state.project_controller.projects.deinit(state.allocator);
+    try state.surface_controller.surfaces.append(state.allocator, .{
+        .session_id = try state.allocator.dupe(u8, "session-a"),
+        .workspace_id = try state.allocator.dupe(u8, "workspace-a"),
+        .workspace_path = try state.allocator.dupe(u8, "/workspace-a"),
+        .title = try state.allocator.dupe(u8, "Done"),
+        .status = .done,
+        .completion_pending = true,
+        .completed_at_ms = 42,
+        .attention = true,
+        .unread_count = 3,
+    });
+    defer {
+        for (state.surface_controller.surfaces.items) |*surface| surface.deinit(state.allocator);
+        state.surface_controller.surfaces.deinit(state.allocator);
+    }
+
+    try std.testing.expect(clearSurfaceAttentionBySession(&state, "session-a"));
+    const surface = &state.surface_controller.surfaces.items[0];
+    try std.testing.expect(state.queued);
+    try std.testing.expect(!state.dirty);
+    try std.testing.expectEqual(SurfaceStatus.idle, surface.status);
+    try std.testing.expect(!surface.completion_pending);
+    try std.testing.expect(!surface.attention);
+    try std.testing.expectEqual(@as(u32, 0), surface.unread_count);
 }

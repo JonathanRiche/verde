@@ -1,0 +1,10 @@
+.{
+    .name = .headless,
+    .version = "0.0.0",
+    .fingerprint = 0xe24a4194bdf8790f,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

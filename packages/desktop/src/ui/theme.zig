@@ -9,6 +9,9 @@ const log = std.log.scoped(.ui_theme);
 
 pub const DEFAULT_FONT_SIZE: f32 = 24.0;
 pub const RESPONSIVE_BASE_FONT_SIZE: f32 = 22.0;
+pub const MOTION_FAST_MS: i64 = 120;
+pub const MOTION_BASE_MS: i64 = 180;
+pub const MOTION_REDUCED_MS: i64 = 80;
 /// Slow, low-distraction cadence shared by live-work indicators.
 pub const ACTIVITY_PULSE_PERIOD_NS: i128 = 1_600_000_000;
 
@@ -268,6 +271,23 @@ pub fn activityPulse(now_ns: i128) f32 {
     const phase = @as(f32, @floatFromInt(@mod(now_ns, ACTIVITY_PULSE_PERIOD_NS))) /
         @as(f32, @floatFromInt(ACTIVITY_PULSE_PERIOD_NS));
     return 0.5 + 0.5 * @sin(phase * std.math.tau);
+}
+
+pub fn easeOutCubic(t: f32) f32 {
+    const clamped = clampf(t, 0.0, 1.0);
+    const inv = 1.0 - clamped;
+    return 1.0 - inv * inv * inv;
+}
+
+pub fn motionDurationMs(reduced_motion: bool, standard_ms: i64) i64 {
+    return if (reduced_motion) MOTION_REDUCED_MS else standard_ms;
+}
+
+test "reduced motion collapses standard transition durations" {
+    try std.testing.expectEqual(MOTION_FAST_MS, motionDurationMs(false, MOTION_FAST_MS));
+    try std.testing.expectEqual(MOTION_BASE_MS, motionDurationMs(false, MOTION_BASE_MS));
+    try std.testing.expectEqual(MOTION_REDUCED_MS, motionDurationMs(true, MOTION_FAST_MS));
+    try std.testing.expectEqual(MOTION_REDUCED_MS, motionDurationMs(true, MOTION_BASE_MS));
 }
 
 pub fn withAlpha(color: [4]f32, alpha: u8) [4]f32 {
@@ -632,6 +652,20 @@ pub fn mix(from: [4]f32, to: [4]f32, amount: f32) [4]f32 {
 }
 
 fn readOmarchyCurrentThemeName(allocator: std.mem.Allocator) !?[]u8 {
+    const home = std.c.getenv("HOME") orelse return error.EnvironmentVariableNotFound;
+    const home_path = std.mem.sliceTo(home, 0);
+    const state_path = try std.fs.path.join(allocator, &.{ home_path, ".local", "state", "omarchy", "current", "theme.name" });
+    defer allocator.free(state_path);
+    var threaded = std.Io.Threaded.init_single_threaded;
+    if (std.Io.Dir.cwd().readFileAlloc(threaded.io(), state_path, allocator, .limited(4096))) |raw| {
+        defer allocator.free(raw);
+        const trimmed = std.mem.trim(u8, raw, &std.ascii.whitespace);
+        if (trimmed.len > 0) return try allocator.dupe(u8, trimmed);
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
     const config_home = try configHome(allocator);
     defer allocator.free(config_home);
 
@@ -646,7 +680,6 @@ fn readOmarchyCurrentThemeName(allocator: std.mem.Allocator) !?[]u8 {
     for (candidates) |candidate| {
         const path = try std.fs.path.join(allocator, &.{ config_home, candidate });
         defer allocator.free(path);
-        var threaded = std.Io.Threaded.init_single_threaded;
         const raw = std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, allocator, .limited(4096)) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
@@ -663,12 +696,23 @@ fn resolveNamedOmarchyThemePath(allocator: std.mem.Allocator, theme_name: []cons
 }
 
 fn currentOmarchyThemeColorsPath(allocator: std.mem.Allocator) !?[]u8 {
+    const home = std.c.getenv("HOME") orelse return error.EnvironmentVariableNotFound;
+    const home_path = std.mem.sliceTo(home, 0);
     const config_home = try configHome(allocator);
     defer allocator.free(config_home);
 
-    const path = try std.fs.path.join(allocator, &.{ config_home, "omarchy", "current", "theme", "colors.toml" });
-    if (fileExists(path)) return path;
-    allocator.free(path);
+    return currentOmarchyThemeColorsPathAt(allocator, home_path, config_home);
+}
+
+fn currentOmarchyThemeColorsPathAt(allocator: std.mem.Allocator, home_path: []const u8, config_home: []const u8) !?[]u8 {
+    const state_path = try std.fs.path.join(allocator, &.{ home_path, ".local", "state", "omarchy", "current", "theme", "colors.toml" });
+    if (fileExists(state_path)) return state_path;
+    allocator.free(state_path);
+
+    // Omarchy before Quattro kept the assembled active theme under config.
+    const legacy_path = try std.fs.path.join(allocator, &.{ config_home, "omarchy", "current", "theme", "colors.toml" });
+    if (fileExists(legacy_path)) return legacy_path;
+    allocator.free(legacy_path);
     return null;
 }
 
@@ -737,4 +781,34 @@ test "parse Omarchy colors.toml keeps fallback values for missing keys" {
     try std.testing.expectEqual(colors.CHAT_BLACK, parsed.background);
     try std.testing.expectEqual(rgba(255, 100, 100, 255), parsed.diff_remove);
     try std.testing.expectEqual(rgb(0x50, 0xc8, 0x78), parsed.accent);
+}
+
+test "active Omarchy theme prefers the Quattro state path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var threaded = std.Io.Threaded.init_single_threaded;
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const home_path = try std.fs.path.join(std.testing.allocator, &.{ root, "home" });
+    defer std.testing.allocator.free(home_path);
+    const config_home = try std.fs.path.join(std.testing.allocator, &.{ root, "config" });
+    defer std.testing.allocator.free(config_home);
+    const state_dir = try std.fs.path.join(std.testing.allocator, &.{ home_path, ".local", "state", "omarchy", "current", "theme" });
+    defer std.testing.allocator.free(state_dir);
+    const legacy_dir = try std.fs.path.join(std.testing.allocator, &.{ config_home, "omarchy", "current", "theme" });
+    defer std.testing.allocator.free(legacy_dir);
+    try std.Io.Dir.cwd().createDirPath(threaded.io(), state_dir);
+    try std.Io.Dir.cwd().createDirPath(threaded.io(), legacy_dir);
+
+    const state_path = try std.fs.path.join(std.testing.allocator, &.{ state_dir, "colors.toml" });
+    defer std.testing.allocator.free(state_path);
+    const legacy_path = try std.fs.path.join(std.testing.allocator, &.{ legacy_dir, "colors.toml" });
+    defer std.testing.allocator.free(legacy_path);
+    try std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = state_path, .data = "accent = \"#111111\"\n" });
+    try std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = legacy_path, .data = "accent = \"#222222\"\n" });
+
+    const resolved = (try currentOmarchyThemeColorsPathAt(std.testing.allocator, home_path, config_home)).?;
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expectEqualStrings(state_path, resolved);
 }

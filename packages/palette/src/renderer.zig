@@ -82,6 +82,8 @@ const PipelineKind = enum { solid, text, image };
 const TEXT_CACHE_MAX_ENTRIES = 16384;
 const GPU_TEXT_FONT_SCALE: f32 = 0.86;
 const RETIRED_BUFFER_FRAME_DELAY = 3;
+const RETIRED_TEXT_CACHE_FRAME_DELAY = 3;
+const TEXT_CACHE_RELEASES_PER_FRAME = 256;
 
 const ViewportUniform = extern struct {
     viewport_size: [2]f32,
@@ -94,6 +96,10 @@ pub const TextureUploadKind = enum {
 };
 
 pub const FrameStats = struct {
+    text_cache_rotate_ns: u64 = 0,
+    text_cache_retire_ns: u64 = 0,
+    command_buffer_acquire_ns: u64 = 0,
+    swapchain_texture_acquire_ns: u64 = 0,
     batch_build_ns: u64 = 0,
     solid_upload_ns: u64 = 0,
     image_prepare_ns: u64 = 0,
@@ -101,24 +107,42 @@ pub const FrameStats = struct {
     browser_upload_ns: u64 = 0,
     text_prepare_ns: u64 = 0,
     text_upload_ns: u64 = 0,
+    render_encode_ns: u64 = 0,
     submit_present_ns: u64 = 0,
     image_upload_bytes: usize = 0,
     browser_upload_bytes: usize = 0,
     image_upload_count: usize = 0,
     browser_upload_count: usize = 0,
+    visible_texture_upload_count: usize = 0,
+    deferred_texture_upload_count: usize = 0,
+    deferred_texture_upload_bytes: usize = 0,
+    command_count: usize = 0,
+    text_draw_count: usize = 0,
+    image_draw_count: usize = 0,
+    text_cache_retired_count: usize = 0,
 
     pub fn hasWork(self: FrameStats) bool {
-        return self.batch_build_ns != 0 or
+        return self.text_cache_rotate_ns != 0 or
+            self.command_buffer_acquire_ns != 0 or
+            self.swapchain_texture_acquire_ns != 0 or
+            self.text_cache_retire_ns != 0 or
+            self.batch_build_ns != 0 or
             self.solid_upload_ns != 0 or
             self.image_prepare_ns != 0 or
             self.image_upload_ns != 0 or
             self.browser_upload_ns != 0 or
             self.text_prepare_ns != 0 or
             self.text_upload_ns != 0 or
+            self.render_encode_ns != 0 or
             self.submit_present_ns != 0 or
             self.image_upload_count != 0 or
             self.browser_upload_count != 0;
     }
+};
+
+pub const WindowRenderOutcome = enum {
+    presented,
+    deferred,
 };
 
 pub const Renderer = struct {
@@ -164,8 +188,9 @@ pub const Renderer = struct {
     image_vertex_transfer_bytes: usize = 0,
     image_index_transfer_bytes: usize = 0,
     retired_buffers: std.ArrayList(RetiredBuffer) = .empty,
+    retired_text_caches: std.ArrayList(RetiredTextCache) = .empty,
     textures: std.AutoHashMap(u32, GpuTexture) = std.AutoHashMap(u32, GpuTexture).init(std.heap.smp_allocator),
-    text_cache: std.AutoHashMap(TextCacheKey, TextCacheEntry) = std.AutoHashMap(TextCacheKey, TextCacheEntry).init(std.heap.smp_allocator),
+    text_cache: TextCache = TextCache.init(std.heap.smp_allocator),
     font_cache: std.AutoHashMap(FontCacheKey, *c.TTF_Font) = std.AutoHashMap(FontCacheKey, *c.TTF_Font).init(std.heap.smp_allocator),
     text_cache_eviction_pending: bool = false,
     command_counts: CommandCounts = .{},
@@ -200,6 +225,8 @@ pub const Renderer = struct {
             if (self.image_pipeline) |pipeline| c.SDL_ReleaseGPUGraphicsPipeline(device, pipeline);
             if (self.sampler) |sampler| c.SDL_ReleaseGPUSampler(device, sampler);
             self.clearTextCache();
+            for (self.retired_text_caches.items) |*retired| retired.deinit();
+            self.retired_text_caches.deinit(std.heap.smp_allocator);
             self.clearFontCache();
             if (self.text_engine) |engine| c.TTF_DestroyGPUTextEngine(engine);
             if (self.vertex_buffer) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
@@ -339,63 +366,82 @@ pub const Renderer = struct {
         }
     }
 
-    pub fn renderWindow(self: *Renderer, allocator: std.mem.Allocator, window: *sdl.Window, batch: *const draw.RenderBatch, clear_color: draw.Color) !void {
+    pub fn renderWindow(self: *Renderer, allocator: std.mem.Allocator, window: *sdl.Window, batch: *const draw.RenderBatch, clear_color: draw.Color) !WindowRenderOutcome {
         const device = self.device orelse return error.SdlGpuCreateDeviceFailed;
         if (self.pipeline == null) return error.MissingGpuPipeline;
         if (CommandCounts.fromBatch(batch).text > 0 and !self.supportsGpuText()) return error.GpuTextAtlasNotConfigured;
+        var stats = self.beginFrameStats();
         if (self.text_cache_eviction_pending) {
-            if (!c.SDL_WaitForGPUIdle(device)) return error.SdlGpuSubmitFailed;
-            self.clearTextCache();
+            const rotate_start = nowNs();
+            try self.retireTextCache();
+            stats.text_cache_rotate_ns +|= elapsedNs(rotate_start);
             self.text_cache_eviction_pending = false;
         }
 
-        var stats = self.beginFrameStats();
         const command_ends = try self.frame_scratch.begin(batch.commands.items.len);
-        const command_buffer = c.SDL_AcquireGPUCommandBuffer(device) orelse return error.SdlGpuCommandBufferFailed;
-        try self.flushPendingTextureUploads(command_buffer, &stats);
-        try self.prepareBatch(allocator, command_buffer, batch, command_ends.solid, &stats);
-        const image_frame = try self.prepareImageFrame(allocator, command_buffer, batch, command_ends.image, &stats);
-        const text_frame = try self.prepareTextFrame(allocator, command_buffer, batch, command_ends.text, &stats);
-
+        try self.frame_scratch.collectVisibleTextureIds(batch);
+        stats.command_count = batch.commands.items.len;
+        const command_buffer_acquire_start = nowNs();
+        const maybe_command_buffer = c.SDL_AcquireGPUCommandBuffer(device);
+        stats.command_buffer_acquire_ns +|= elapsedNs(command_buffer_acquire_start);
+        const command_buffer = maybe_command_buffer orelse return error.SdlGpuCommandBufferFailed;
         var swapchain_texture: ?*c.SDL_GPUTexture = null;
         var width: u32 = 0;
         var height: u32 = 0;
-        if (!c.SDL_AcquireGPUSwapchainTexture(command_buffer, @ptrCast(window), &swapchain_texture, &width, &height)) return error.SdlGpuSwapchainFailed;
-        if (swapchain_texture) |texture| {
-            var target: c.SDL_GPUColorTargetInfo = .{
-                .texture = texture,
-                .mip_level = 0,
-                .layer_or_depth_plane = 0,
-                .clear_color = .{ .r = clear_color.r, .g = clear_color.g, .b = clear_color.b, .a = clear_color.a },
-                .load_op = c.SDL_GPU_LOADOP_CLEAR,
-                .store_op = c.SDL_GPU_STOREOP_STORE,
-                .resolve_texture = null,
-                .resolve_mip_level = 0,
-                .resolve_layer = 0,
-                .cycle = false,
-                .cycle_resolve_texture = false,
-                .padding1 = 0,
-                .padding2 = 0,
-            };
-            const pass = c.SDL_BeginGPURenderPass(command_buffer, &target, 1, null) orelse return error.SdlGpuRenderPassFailed;
-            c.SDL_PushGPUVertexUniformData(command_buffer, 0, &ViewportUniform{ .viewport_size = .{ @floatFromInt(width), @floatFromInt(height) } }, @sizeOf(ViewportUniform));
-            self.renderBatchInterleaved(
-                pass,
-                batch,
-                command_ends.solid,
-                image_frame,
-                command_ends.image,
-                text_frame,
-                command_ends.text,
-                @floatFromInt(height),
-            );
-            c.SDL_EndGPURenderPass(pass);
-        }
+        const swapchain_texture_acquire_start = nowNs();
+        const swapchain_acquired = c.SDL_AcquireGPUSwapchainTexture(command_buffer, @ptrCast(window), &swapchain_texture, &width, &height);
+        stats.swapchain_texture_acquire_ns +|= elapsedNs(swapchain_texture_acquire_start);
+        if (!swapchain_acquired) return error.SdlGpuSwapchainFailed;
+        const texture = swapchain_texture orelse {
+            if (!c.SDL_CancelGPUCommandBuffer(command_buffer)) return error.SdlGpuSubmitFailed;
+            self.last_frame_stats = stats;
+            return .deferred;
+        };
+        try self.flushPendingTextureUploads(command_buffer, self.frame_scratch.visible_texture_ids.items, &stats);
+        try self.prepareBatch(allocator, command_buffer, batch, command_ends.solid, &stats);
+        const image_frame = try self.prepareImageFrame(allocator, command_buffer, batch, command_ends.image, &stats);
+        const text_frame = try self.prepareTextFrame(allocator, command_buffer, batch, command_ends.text, &stats);
+        stats.image_draw_count = image_frame.draws.items.len;
+        stats.text_draw_count = text_frame.draws.items.len;
+        const render_encode_start = nowNs();
+        var target: c.SDL_GPUColorTargetInfo = .{
+            .texture = texture,
+            .mip_level = 0,
+            .layer_or_depth_plane = 0,
+            .clear_color = .{ .r = clear_color.r, .g = clear_color.g, .b = clear_color.b, .a = clear_color.a },
+            .load_op = c.SDL_GPU_LOADOP_CLEAR,
+            .store_op = c.SDL_GPU_STOREOP_STORE,
+            .resolve_texture = null,
+            .resolve_mip_level = 0,
+            .resolve_layer = 0,
+            .cycle = false,
+            .cycle_resolve_texture = false,
+            .padding1 = 0,
+            .padding2 = 0,
+        };
+        const pass = c.SDL_BeginGPURenderPass(command_buffer, &target, 1, null) orelse return error.SdlGpuRenderPassFailed;
+        c.SDL_PushGPUVertexUniformData(command_buffer, 0, &ViewportUniform{ .viewport_size = .{ @floatFromInt(width), @floatFromInt(height) } }, @sizeOf(ViewportUniform));
+        self.renderBatchInterleaved(
+            pass,
+            batch,
+            command_ends.solid,
+            image_frame,
+            command_ends.image,
+            text_frame,
+            command_ends.text,
+            @floatFromInt(height),
+        );
+        c.SDL_EndGPURenderPass(pass);
+        stats.render_encode_ns +|= elapsedNs(render_encode_start);
         const submit_start = nowNs();
         if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) return error.SdlGpuSubmitFailed;
         stats.submit_present_ns +|= elapsedNs(submit_start);
         self.releaseRetiredBuffers(device);
+        const retire_start = nowNs();
+        stats.text_cache_retired_count = self.releaseRetiredTextCaches();
+        stats.text_cache_retire_ns +|= elapsedNs(retire_start);
         self.last_frame_stats = stats;
+        return .presented;
     }
 
     pub fn supportsGpuText(self: *const Renderer) bool {
@@ -814,7 +860,7 @@ pub const Renderer = struct {
         return stats;
     }
 
-    fn flushPendingTextureUploads(self: *Renderer, command_buffer: *c.SDL_GPUCommandBuffer, stats: *FrameStats) !void {
+    fn flushPendingTextureUploads(self: *Renderer, command_buffer: *c.SDL_GPUCommandBuffer, visible_texture_ids: []const u32, stats: *FrameStats) !void {
         var copy_pass: ?*c.SDL_GPUCopyPass = null;
         // Textures whose mip chain needs to be rebuilt after the copy pass
         // closes. `SDL_GenerateMipmapsForGPUTexture` must run outside any pass.
@@ -826,6 +872,11 @@ pub const Renderer = struct {
             var iterator = self.textures.iterator();
             while (iterator.next()) |entry| {
                 if (!entry.value_ptr.dirty) continue;
+                if (!std.mem.containsAtLeastScalar2(u32, visible_texture_ids, entry.key_ptr.*, 1)) {
+                    stats.deferred_texture_upload_count += 1;
+                    stats.deferred_texture_upload_bytes += entry.value_ptr.transfer_size;
+                    continue;
+                }
                 const pass = copy_pass orelse blk: {
                     const created = c.SDL_BeginGPUCopyPass(command_buffer) orelse return error.SdlGpuCopyPassFailed;
                     copy_pass = created;
@@ -859,6 +910,7 @@ pub const Renderer = struct {
                     .image => stats.image_upload_ns +|= elapsed,
                     .browser => stats.browser_upload_ns +|= elapsed,
                 }
+                stats.visible_texture_upload_count += 1;
                 if (texture_entry.num_levels > 1 and mipgen_len < mipgen_buf.len) {
                     mipgen_buf[mipgen_len] = texture_entry.texture;
                     mipgen_len += 1;
@@ -1271,9 +1323,43 @@ pub const Renderer = struct {
     }
 
     fn clearTextCache(self: *Renderer) void {
+        deinitTextCache(&self.text_cache);
+    }
+
+    fn retireTextCache(self: *Renderer) !void {
+        var retired: RetiredTextCache = .{};
+        errdefer retired.deinit();
+        try retired.entries.ensureTotalCapacity(std.heap.smp_allocator, self.text_cache.count());
+        try self.retired_text_caches.ensureUnusedCapacity(std.heap.smp_allocator, 1);
         var iterator = self.text_cache.iterator();
-        while (iterator.next()) |entry| entry.value_ptr.deinit();
-        self.text_cache.clearRetainingCapacity();
+        while (iterator.next()) |entry| retired.entries.appendAssumeCapacity(entry.value_ptr.*);
+        self.text_cache.deinit();
+        self.text_cache = TextCache.init(std.heap.smp_allocator);
+        self.retired_text_caches.appendAssumeCapacity(retired);
+    }
+
+    fn releaseRetiredTextCaches(self: *Renderer) usize {
+        var release_budget: usize = TEXT_CACHE_RELEASES_PER_FRAME;
+        var released: usize = 0;
+        var index: usize = 0;
+        while (index < self.retired_text_caches.items.len and release_budget > 0) {
+            const retired = &self.retired_text_caches.items[index];
+            if (retired.frames_remaining > 0) {
+                retired.frames_remaining -= 1;
+                index += 1;
+                continue;
+            }
+            while (retired.release_cursor < retired.entries.items.len and release_budget > 0) {
+                retired.entries.items[retired.release_cursor].deinit();
+                retired.release_cursor += 1;
+                release_budget -= 1;
+                released += 1;
+            }
+            if (retired.release_cursor < retired.entries.items.len) break;
+            var complete = self.retired_text_caches.orderedRemove(index);
+            complete.deinit();
+        }
+        return released;
     }
 
     fn clearFontCache(self: *Renderer) void {
@@ -1346,6 +1432,12 @@ pub const Renderer = struct {
         gpuSetFullScissor(pass);
     }
 };
+
+fn deinitTextCache(cache: *TextCache) void {
+    var iterator = cache.iterator();
+    while (iterator.next()) |entry| entry.value_ptr.deinit();
+    cache.clearRetainingCapacity();
+}
 
 pub const CommandCounts = struct {
     rects: usize = 0,
@@ -1486,6 +1578,7 @@ const FrameCommandEnds = struct {
 // every used length is reset and rebuilt before the next GPU submission.
 const FrameScratch = struct {
     command_ends: std.ArrayList(u32) = .empty,
+    visible_texture_ids: std.ArrayList(u32) = .empty,
     solid_mesh: Mesh = .{},
     image_frame: ImageFrame = .{},
     text_frame: TextFrame = .{},
@@ -1496,6 +1589,7 @@ const FrameScratch = struct {
         self.solid_mesh.clear();
         self.image_frame.clear();
         self.text_frame.clear();
+        self.visible_texture_ids.clearRetainingCapacity();
         return .{
             .solid = self.command_ends.items[0..command_count],
             .image = self.command_ends.items[command_count .. command_count * 2],
@@ -1503,8 +1597,18 @@ const FrameScratch = struct {
         };
     }
 
+    fn collectVisibleTextureIds(self: *FrameScratch, batch: *const draw.RenderBatch) !void {
+        for (batch.commands.items) |command| {
+            if (command.kind != .image or !command.texture.valid() or command.color.a <= 0.0) continue;
+            const texture_id: u32 = @intCast(command.texture.value);
+            if (std.mem.containsAtLeastScalar2(u32, self.visible_texture_ids.items, texture_id, 1)) continue;
+            try self.visible_texture_ids.append(std.heap.smp_allocator, texture_id);
+        }
+    }
+
     fn deinit(self: *FrameScratch) void {
         self.command_ends.deinit(std.heap.smp_allocator);
+        self.visible_texture_ids.deinit(std.heap.smp_allocator);
         self.solid_mesh.deinit(std.heap.smp_allocator);
         self.image_frame.deinit(std.heap.smp_allocator);
         self.text_frame.deinit(std.heap.smp_allocator);
@@ -1518,6 +1622,20 @@ const TextCacheKey = struct {
     font_size_bits: u32,
     wrap_width_bits: u32,
     font_role: u8,
+};
+
+const TextCache = std.AutoHashMap(TextCacheKey, TextCacheEntry);
+
+const RetiredTextCache = struct {
+    entries: std.ArrayList(TextCacheEntry) = .empty,
+    frames_remaining: u8 = RETIRED_TEXT_CACHE_FRAME_DELAY,
+    release_cursor: usize = 0,
+
+    fn deinit(self: *RetiredTextCache) void {
+        for (self.entries.items[self.release_cursor..]) |*entry| entry.deinit();
+        self.entries.deinit(std.heap.smp_allocator);
+        self.* = undefined;
+    }
 };
 
 const FontCacheKey = struct {

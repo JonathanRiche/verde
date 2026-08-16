@@ -5,6 +5,7 @@ const palette = @import("palette");
 const zig_dif = @import("zig_dif");
 
 const app_state = @import("../state.zig");
+const keybinds = @import("../app/keybinds.zig");
 const ai_harness = @import("../providers/harness.zig");
 const profiler = @import("../runtime/profiler.zig");
 const platform_runtime = @import("platform_runtime");
@@ -21,6 +22,8 @@ const runtime = @import("runtime.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const text_measure = @import("text_measure.zig");
 const theme = @import("theme.zig");
+
+const log = std.log.scoped(.chat_panel);
 
 const TOP_BAR_HEIGHT: f32 = 57.0; // ~70% of legacy 82px cap
 const WORKSPACE_HEADER_ICON_CONTROL_CSS: f32 = 30.0;
@@ -62,6 +65,13 @@ const TRANSCRIPT_MARKDOWN_FONT_SIZE: f32 = app_state.PALETTE_COMPOSER_FONT_SIZE;
 const TRANSCRIPT_WHEEL_PIXELS: f32 = 96.0;
 const TRANSCRIPT_PAGE_VIEW_FRAC: f32 = 0.88;
 const TOOL_OUTPUT_COLLAPSED_LINES: usize = 18;
+// Once the visible tail is ready, cold history advances one row per frame.
+// Markdown rows are indivisible, so the row cap is the reliable bound across
+// machines; the elapsed budget prevents cheap grouped rows from accumulating.
+const TRANSCRIPT_LAYOUT_ROWS_PER_SLICE: usize = 1;
+const TRANSCRIPT_LAYOUT_SLICE_BUDGET_MS: i64 = 12;
+const TRANSCRIPT_LAYOUT_VISIBLE_MARGIN_FRAC: f32 = 0.25;
+const SDL_STALL_LOG_THRESHOLD_MS: i64 = 50;
 
 const MAX_TRANSCRIPT_HITS = 16;
 const TranscriptHit = struct {
@@ -77,6 +87,15 @@ const TranscriptHit = struct {
 
 var transcript_hit_count: usize = 0;
 var transcript_hits: [MAX_TRANSCRIPT_HITS]TranscriptHit = [_]TranscriptHit{.{}} ** MAX_TRANSCRIPT_HITS;
+
+const FollowupPinHit = struct {
+    pane_id: ?app_state.WorkspacePaneId = null,
+    rect: palette.Rect = .{},
+};
+
+const MAX_FOLLOWUP_PIN_HITS = 16;
+var followup_pin_hit_count: usize = 0;
+var followup_pin_hits: [MAX_FOLLOWUP_PIN_HITS]FollowupPinHit = [_]FollowupPinHit{.{}} ** MAX_FOLLOWUP_PIN_HITS;
 
 const UsageActionHit = struct {
     rect: palette.Rect = .{},
@@ -190,6 +209,7 @@ pub fn renderWorkspace(state: *app_state.AppState, width: f32, height: f32) void
 
 pub fn resetTranscriptHitCache() void {
     transcript_hit_count = 0;
+    followup_pin_hit_count = 0;
     usage_action_hit_count = 0;
     diff_file_open_hit_count = 0;
     diff_layout_hit_count = 0;
@@ -214,8 +234,14 @@ pub fn clipTranscriptHitCache(bounds: palette.Rect) void {
 }
 
 pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
+    renderWorkspaceAtWithTranscriptLayoutWidth(state, rect, rect.w);
+}
+
+/// Renders the chat workspace while transcript wrapping uses its destination width.
+pub fn renderWorkspaceAtWithTranscriptLayoutWidth(state: *app_state.AppState, rect: palette.Rect, transcript_layout_width: f32) void {
     resetWorkspaceHeaderHitCache();
-    renderWorkspaceAtForPane(state, rect, null);
+    followup_pin_hit_count = 0;
+    renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(state, rect, null, 0.0, transcript_layout_width);
 }
 
 pub fn paneHeaderHeight(rect: palette.Rect) f32 {
@@ -244,6 +270,17 @@ fn chatContentColumn(lane_x: f32, lane_w: f32) struct { x: f32, w: f32 } {
 }
 
 pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: palette.Rect, pane_id: ?app_state.WorkspacePaneId, header_right_reserve: f32) void {
+    renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(state, rect, pane_id, header_right_reserve, rect.w);
+}
+
+/// Renders one chat pane with transcript geometry fixed at its destination width.
+pub fn renderWorkspaceAtForPaneWithReserveAndTranscriptLayoutWidth(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    pane_id: ?app_state.WorkspacePaneId,
+    header_right_reserve: f32,
+    transcript_layout_width: f32,
+) void {
     const blocked_by_quick = if (state.currentProjectQuickPane()) |quick|
         quick.visible and pane_id != null and pane_id.? != quick.pane_id
     else
@@ -312,23 +349,19 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
 
     // Pin the queued/steered follow-up just above the composer (AMP-TUI style) so
     // every provider gets a visible "this is waiting to send" affordance, not just
-    // Codex inline steering. Snapshotted once per frame; the prompt copy is freed
-    // at the end of this layout pass after `stableText` has duped it into the frame
-    // arena for the render commands. Hidden once Codex accepts steering inline
-    // (`.sent_inline`), since that prompt then appears in the transcript instead.
-    const followup_pin = state.pendingFollowupSnapshot() catch null;
-    defer if (followup_pin) |fp| state.allocator.free(fp.prompt);
+    // provider inline steering. The snapshot is cached across frames on the
+    // send-state ui_revision (borrowed pointer — do not free); `stableText`
+    // dupes the prompt into the frame arena for the render commands. Hidden
+    // once the provider accepts steering inline (`.sent_inline`), since that
+    // prompt then appears in the transcript instead.
+    const followup_pin = state.pendingFollowupSnapshotCached();
     const show_followup_pin = !blocked_by_quick and if (followup_pin) |fp| fp.state != .sent_inline else false;
     const followup_reserve = if (show_followup_pin)
         theme.scaledUi(FOLLOWUP_PIN_HEIGHT) + theme.scaledUi(10.0)
     else
         0.0;
-    const pending_approval = if (live_composer) state.pendingApprovalSnapshot() catch null else null;
-    defer if (pending_approval) |approval| {
-        state.allocator.free(approval.call_id);
-        state.allocator.free(approval.title);
-        state.allocator.free(approval.body);
-    };
+    // Cached like the follow-up pin above: a borrowed per-revision snapshot.
+    const pending_approval = if (live_composer) state.pendingApprovalSnapshotCached() else null;
     const approval_reserve = if (pending_approval != null)
         theme.scaledUi(APPROVAL_CARD_HEIGHT) + theme.scaledUi(10.0)
     else
@@ -345,6 +378,9 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
     const split_chat_browser = browser_visible and body.w >= theme.scaledUi(900.0);
     const stacked_chat_browser = browser_visible and !split_chat_browser and body.h >= theme.scaledUi(300.0);
     const browser_width = if (split_chat_browser) state.browserPanelWidth(body.w) else 0.0;
+    const target_split_chat_browser = browser_visible and transcript_layout_width >= theme.scaledUi(900.0);
+    const target_browser_width = if (target_split_chat_browser) state.browserPanelWidth(transcript_layout_width) else 0.0;
+    const target_chat_width = if (target_split_chat_browser) transcript_layout_width - target_browser_width else transcript_layout_width;
     const composer_lane_w = if (split_chat_browser) body.w - browser_width else body.w;
     const composer_lane_x = body.x;
 
@@ -360,7 +396,7 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
 
     if (split_chat_browser) {
         const chat_rect = palette.Rect{ .x = body.x, .y = body.y, .w = body.w - browser_width, .h = body.h };
-        renderTranscript(state, chat_rect, pane_id);
+        renderTranscript(state, chat_rect, target_chat_width, pane_id);
         // Transcript uses only `body` (above composer). The browser column is empty to the right of the
         // composer, so extend the dock through that strip to the same bottom as the composer row.
         const browser_dock_h = composer_bottom - body.y;
@@ -375,7 +411,7 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
         const browser_height = @min(state.browserPanelHeight(body.h), body.h * 0.48);
         const chat_h = @max(body.h - browser_height - browser_gap, theme.scaledUi(96.0));
         const chat_rect = palette.Rect{ .x = body.x, .y = body.y, .w = body.w, .h = chat_h };
-        renderTranscript(state, chat_rect, pane_id);
+        renderTranscript(state, chat_rect, target_chat_width, pane_id);
         browser_panel.renderDockAt(state, .{
             .x = body.x,
             .y = body.y + chat_h + browser_gap,
@@ -383,7 +419,7 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
             .h = @max(browser_height, theme.scaledUi(120.0)),
         });
     } else {
-        renderTranscript(state, body, pane_id);
+        renderTranscript(state, body, target_chat_width, pane_id);
     }
 
     // Paint after the transcript so the opaque header strip wins over any scrolled
@@ -418,14 +454,11 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
                 .w = composer_rect.w,
                 .h = theme.scaledUi(FOLLOWUP_PIN_HEIGHT),
             };
-            renderPendingFollowupPin(state, pin_rect, fp, state.currentThread().provider);
-            // Register the hit rect so a double-click can pull it back for editing.
-            state.setFollowupPinRect(pin_rect);
-        } else {
-            state.setFollowupPinRect(null);
+            renderPendingFollowupPin(state, pin_rect, fp.*, state.currentThread().provider);
+            // Keep every pane's target: later panes must not erase an earlier
+            // queued card before input routing runs for this frame.
+            appendFollowupPinHit(pane_id, pin_rect);
         }
-    } else {
-        state.setFollowupPinRect(null);
     }
     if (pending_approval) |approval| {
         const card_rect = palette.Rect{
@@ -434,7 +467,7 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
             .w = composer_rect.w,
             .h = theme.scaledUi(APPROVAL_CARD_HEIGHT),
         };
-        renderApprovalCard(state, card_rect, approval, pane_id);
+        renderApprovalCard(state, card_rect, approval.*, pane_id);
     } else if (live_composer) {
         approval_hits = .{};
     }
@@ -670,6 +703,44 @@ fn transcriptActionAt(x: f32, y: f32) ?TranscriptAction {
     return null;
 }
 
+fn appendFollowupPinHit(pane_id: ?app_state.WorkspacePaneId, rect: palette.Rect) void {
+    if (followup_pin_hit_count >= followup_pin_hits.len) return;
+    followup_pin_hits[followup_pin_hit_count] = .{ .pane_id = pane_id, .rect = rect };
+    followup_pin_hit_count += 1;
+}
+
+fn followupPinHitAt(x: f32, y: f32) ?FollowupPinHit {
+    var index = followup_pin_hit_count;
+    while (index > 0) {
+        index -= 1;
+        const hit = followup_pin_hits[index];
+        if (rectContains(hit.rect, x, y)) return hit;
+    }
+    return null;
+}
+
+/// Pulls a queued follow-up in any visible chat pane back into its composer.
+pub fn handleFollowupPinMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
+    const hit = followupPinHitAt(x, y) orelse return false;
+    if (!down) return true;
+    if (hit.pane_id) |pane_id| _ = state.focusCurrentProjectWorkspacePane(pane_id);
+    if (clicks >= 2) state.editPendingFollowup();
+    return true;
+}
+
+test "follow-up edit hits survive rendering another chat pane" {
+    resetTranscriptHitCache();
+    defer resetTranscriptHitCache();
+
+    appendFollowupPinHit(11, .{ .x = 10.0, .y = 20.0, .w = 100.0, .h = 40.0 });
+    appendFollowupPinHit(22, .{ .x = 200.0, .y = 20.0, .w = 100.0, .h = 40.0 });
+
+    const first = followupPinHitAt(40.0, 40.0) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(?app_state.WorkspacePaneId, 11), first.pane_id);
+    const second = followupPinHitAt(240.0, 40.0) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(?app_state.WorkspacePaneId, 22), second.pane_id);
+}
+
 test "transcript action hit testing preserves usage and diff open actions" {
     resetTranscriptHitCache();
     defer resetTranscriptHitCache();
@@ -759,8 +830,7 @@ pub fn handleApprovalPaletteMouseButton(state: *app_state.AppState, x: f32, y: f
 pub fn handleTranscriptPaletteWheel(state: *app_state.AppState, x: f32, y: f32, wheel_y: f32) bool {
     if (wheel_y == 0.0) return false;
     const hit = findTranscriptHit(x, y) orelse return false;
-    const pane_id = hit.pane_id;
-    scrollTranscriptByWheel(state, pane_id, wheel_y);
+    scrollTranscriptByWheel(state, hit.pane_id, wheel_y, hit.scroll_y);
     return true;
 }
 
@@ -772,18 +842,27 @@ pub fn handleTranscriptPaletteWheel(state: *app_state.AppState, x: f32, y: f32, 
 pub fn handleFocusedTranscriptPaletteWheel(state: *app_state.AppState, wheel_y: f32) bool {
     if (wheel_y == 0.0) return false;
     const pane_id = state.focusedWorkspaceChatPaneId() orelse if (state.focusedWorkspacePaneKind() == .chat) null else return false;
-    scrollTranscriptByWheel(state, pane_id, wheel_y);
+    scrollTranscriptByWheel(state, pane_id, wheel_y, state.transcript_controller.palette_scroll_y);
     return true;
 }
 
-fn scrollTranscriptByWheel(state: *app_state.AppState, pane_id: ?app_state.WorkspacePaneId, wheel_y: f32) void {
+fn scrollTranscriptByWheel(state: *app_state.AppState, pane_id: ?app_state.WorkspacePaneId, wheel_y: f32, fallback_scroll_y: f32) void {
     if (pane_id) |id| _ = state.focusCurrentProjectWorkspacePane(id);
     state.transcript_controller.focused = true;
     _ = state.acknowledgeFocusedChatCompletion();
-    const current = currentTranscriptScrollY(state, pane_id) orelse state.transcript_controller.palette_scroll_y;
+    const current = currentTranscriptScrollY(state, pane_id) orelse fallback_scroll_y;
+    if (wheel_y > 0.0 and current <= theme.scaledUi(TRANSCRIPT_WHEEL_PIXELS * 2.0)) {
+        // Async: the page loads off-thread and commits in the frame loop; this
+        // frame scrolls the rows it has and the prepended history lands with
+        // the anchor rebased, so the wheel never blocks on a DB read.
+        state.requestOlderCurrentThreadMessages();
+    }
     const delta = -wheel_y * theme.scaledUi(TRANSCRIPT_WHEEL_PIXELS);
     rememberTranscriptScroll(state, pane_id, snapTranscriptScrollY(current + delta, null));
     state.transcript_controller.auto_follow_pending = false;
+    state.transcript_controller.auto_follow_suspended = true;
+    state.transcript_controller.manual_scroll_pending = true;
+    state.transcript_controller.manual_scroll_toward_tail = delta > 0.0;
     state.transcript_controller.scroll_to_bottom_frames = 0;
     state.markDirty();
 }
@@ -957,34 +1036,26 @@ fn transcriptMarkdownBubbleHit(
     const clip = transcript_hit.clip;
     if (column.w <= 0 or !rectContains(clip, mouse_x, mouse_y)) return null;
 
+    const unloaded_thread = state.currentThread();
+    if (unloaded_thread.messages.items.len == 0 and unloaded_thread.persisted_message_offset > 0) {
+        // Async: nothing is materialized to hit yet; request the tail page so
+        // it commits in a following frame and the hit test works from then on.
+        state.requestOlderCurrentThreadMessages();
+    }
     const thread = state.currentThread();
     const scroll_y = transcript_hit.scroll_y;
-    var content_y = column.y - scroll_y;
-
-    var msg_idx: usize = 0;
-    while (msg_idx < thread.messages.items.len) {
-        const message = thread.messages.items[msg_idx];
-        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) {
-            msg_idx += 1;
-            continue;
+    const content_offset_y = mouse_y - column.y + scroll_y;
+    const estimated_height = estimatedPartialTranscriptHeight(thread);
+    if (transcriptLayoutItemAtContentY(thread.transcript_layout_items.items, estimated_height, content_offset_y)) |item| {
+        if (item.group_end - item.message_index < 2 and item.message_index < thread.messages.items.len) {
+            const message = thread.messages.items[item.message_index];
+            const content_y = column.y - scroll_y + estimated_height + item.top;
+            if (!(message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body))) {
+                if (transcriptSelectableBodyHit(state, column, content_y, item.height, message.role, message.author, message.body, false, false, false, item.message_index, mouse_x, mouse_y)) |hit| {
+                    return hit;
+                }
+            }
         }
-        const group_end = if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) toolCallGroupEnd(thread.messages.items, msg_idx) else msg_idx + 1;
-        if (group_end - msg_idx >= 2) {
-            content_y += toolCallGroupHeight(state, thread.messages.items, msg_idx, group_end, 0, column.w) + theme.scaledUi(12.0);
-            msg_idx = group_end;
-            continue;
-        }
-        const item_h = transcriptCommittedMessageHeight(state, msg_idx, message, column.w);
-        if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
-            content_y += item_h + theme.scaledUi(12.0);
-            msg_idx += 1;
-            continue;
-        }
-        if (transcriptSelectableBodyHit(state, column, content_y, item_h, message.role, message.author, message.body, false, false, false, msg_idx, mouse_x, mouse_y)) |hit| {
-            return hit;
-        }
-        content_y += item_h + theme.scaledUi(12.0);
-        msg_idx += 1;
     }
 
     const send_state = thread.send_state;
@@ -993,10 +1064,11 @@ fn transcriptMarkdownBubbleHit(
     if (send_state.status != .pending) return null;
 
     const base_idx = thread.messages.items.len;
+    var content_y = column.y - scroll_y + estimatedPartialTranscriptHeight(thread);
     var pi: usize = 0;
     while (pi < send_state.pending_events.items.len) {
         const event = send_state.pending_events.items[pi];
-        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) {
+        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(thread, event.author, event.body)) {
             pi += 1;
             continue;
         }
@@ -1007,7 +1079,8 @@ fn transcriptMarkdownBubbleHit(
             continue;
         }
         const pending_msg_idx = base_idx + pi;
-        const item_h = transcriptMessageHeight(null, null, event.body, event.role, column.w, event.author, false);
+        const item_h = transcriptMessageHeight(null, null, event.body, event.role, column.w, event.author, false) +
+            transcriptImageBlockHeightFor(event.role, event.images.items.len, column.w);
         if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
             content_y += item_h + theme.scaledUi(12.0);
             pi += 1;
@@ -1041,32 +1114,18 @@ fn transcriptMarkdownBubbleLinkHit(
 
     const thread = state.currentThread();
     const scroll_y = transcript_hit.scroll_y;
-    var content_y = column.y - scroll_y;
-
-    var msg_idx: usize = 0;
-    while (msg_idx < thread.messages.items.len) {
-        const message = thread.messages.items[msg_idx];
-        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) {
-            msg_idx += 1;
-            continue;
+    const content_offset_y = mouse_y - column.y + scroll_y;
+    const estimated_height = estimatedPartialTranscriptHeight(thread);
+    if (transcriptLayoutItemAtContentY(thread.transcript_layout_items.items, estimated_height, content_offset_y)) |item| {
+        if (item.group_end - item.message_index < 2 and item.message_index < thread.messages.items.len) {
+            const message = thread.messages.items[item.message_index];
+            const content_y = column.y - scroll_y + estimated_height + item.top;
+            if (!(message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body))) {
+                if (assistantTranscriptMarkdownLinkHit(state, column, content_y, item.height, message.role, message.author, message.body, false, false, false, mouse_x, mouse_y)) |hit| {
+                    return hit;
+                }
+            }
         }
-        const group_end = if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) toolCallGroupEnd(thread.messages.items, msg_idx) else msg_idx + 1;
-        if (group_end - msg_idx >= 2) {
-            content_y += toolCallGroupHeight(state, thread.messages.items, msg_idx, group_end, 0, column.w) + theme.scaledUi(12.0);
-            msg_idx = group_end;
-            continue;
-        }
-        const item_h = transcriptCommittedMessageHeight(state, msg_idx, message, column.w);
-        if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
-            content_y += item_h + theme.scaledUi(12.0);
-            msg_idx += 1;
-            continue;
-        }
-        if (assistantTranscriptMarkdownLinkHit(state, column, content_y, item_h, message.role, message.author, message.body, false, false, false, mouse_x, mouse_y)) |hit| {
-            return hit;
-        }
-        content_y += item_h + theme.scaledUi(12.0);
-        msg_idx += 1;
     }
 
     const send_state = thread.send_state;
@@ -1074,10 +1133,11 @@ fn transcriptMarkdownBubbleLinkHit(
     defer send_state.mutex.unlock();
     if (send_state.status != .pending) return null;
 
+    var content_y = column.y - scroll_y + estimatedPartialTranscriptHeight(thread);
     var pi: usize = 0;
     while (pi < send_state.pending_events.items.len) {
         const event = send_state.pending_events.items[pi];
-        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) {
+        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(thread, event.author, event.body)) {
             pi += 1;
             continue;
         }
@@ -1087,7 +1147,8 @@ fn transcriptMarkdownBubbleLinkHit(
             pi = group_end;
             continue;
         }
-        const item_h = transcriptMessageHeight(null, null, event.body, event.role, column.w, event.author, false);
+        const item_h = transcriptMessageHeight(null, null, event.body, event.role, column.w, event.author, false) +
+            transcriptImageBlockHeightFor(event.role, event.images.items.len, column.w);
         if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
             content_y += item_h + theme.scaledUi(12.0);
             pi += 1;
@@ -1141,8 +1202,12 @@ pub fn handleTranscriptPaletteMouseMotion(state: *app_state.AppState) void {
             state.transcript_controller.palette_mouse_y,
             transcript_scrollbar_drag_grab_offset,
         );
+        const current = currentTranscriptScrollY(state, pane_id) orelse state.transcript_controller.palette_scroll_y;
         rememberTranscriptScroll(state, pane_id, snapTranscriptScrollY(target, transcript_scrollbar_max_scroll));
         state.transcript_controller.auto_follow_pending = false;
+        state.transcript_controller.auto_follow_suspended = true;
+        state.transcript_controller.manual_scroll_pending = true;
+        state.transcript_controller.manual_scroll_toward_tail = target > current;
         state.transcript_controller.scroll_to_bottom_frames = 0;
         state.markDirty();
         return;
@@ -1218,6 +1283,9 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
                 );
                 rememberTranscriptScroll(state, pane_id, snapTranscriptScrollY(target, hit.max_scroll));
                 state.transcript_controller.auto_follow_pending = false;
+                state.transcript_controller.auto_follow_suspended = true;
+                state.transcript_controller.manual_scroll_pending = true;
+                state.transcript_controller.manual_scroll_toward_tail = target > hit.scroll_y;
                 state.transcript_controller.scroll_to_bottom_frames = 0;
                 state.markDirty();
             }
@@ -1418,7 +1486,7 @@ fn transcriptMarkdownMessageSnapshot(state: *app_state.AppState, message_index: 
     const n = thread.messages.items.len;
     if (message_index < n) {
         const m = thread.messages.items[message_index];
-        if (m.role == .system and shouldHideCursorLifecycleSystemEvent(m.author, m.body)) return null;
+        if (m.role == .system and shouldHideCursorLifecycleSystemEvent(thread, m.author, m.body)) return null;
         const kind = transcriptSelectableBodyKind(m.role, m.author, m.body, false, false) orelse return null;
         const body_trim = std.mem.trim(u8, m.body, "\n\r\t ");
         const body_rect = transcriptSelectableBodyRect(column, 0.0, 100000.0, m.role, m.author, m.body) orelse return null;
@@ -1432,7 +1500,7 @@ fn transcriptMarkdownMessageSnapshot(state: *app_state.AppState, message_index: 
     const pi = message_index - n;
     if (pi < send_state.pending_events.items.len) {
         const ev = send_state.pending_events.items[pi];
-        if (ev.role == .system and shouldHideCursorLifecycleSystemEvent(ev.author, ev.body)) return null;
+        if (ev.role == .system and shouldHideCursorLifecycleSystemEvent(thread, ev.author, ev.body)) return null;
         const kind = transcriptSelectableBodyKind(ev.role, ev.author, ev.body, false, false) orelse return null;
         const body_trim = std.mem.trim(u8, ev.body, "\n\r\t ");
         const body_rect = transcriptSelectableBodyRect(column, 0.0, 100000.0, ev.role, ev.author, ev.body) orelse return null;
@@ -1730,6 +1798,14 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
         paletteColor(if (browser_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED),
     );
 
+    const pane_focused = if (pane_id) |id| state.isCurrentProjectWorkspacePaneFocused(id) else true;
+    if (state.ctrl_shortcut_hints_visible and state.shift_shortcut_hints_visible and pane_focused) {
+        if (state.command_controller.keyboard_config) |config| {
+            var label_buf: [16]u8 = undefined;
+            renderWorkspaceHeaderShortcutKeyTip(state, open_main_rect, rect, keybinds.formatCtrlShiftKeyTip(&label_buf, config.open_editor));
+        }
+    }
+
     if (!state.workspace_header_open_menu_open or !paneIdEqual(state.workspace_header_open_menu_pane_id, pane_id)) return;
 
     var kinds: [5]WorkspaceHeaderOpenMenuRow = undefined;
@@ -1872,6 +1948,27 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
     }
 }
 
+// Workspace header Ctrl+Shift hint beside the focused pane's Open control.
+fn renderWorkspaceHeaderShortcutKeyTip(state: *app_state.AppState, target: palette.Rect, clip: palette.Rect, label: []const u8) void {
+    if (label.len == 0) return;
+    const size = theme.scaledUi(15.0);
+    const tip_rect: palette.Rect = .{
+        .x = target.x - size + theme.scaledUi(2.5),
+        .y = target.y + (target.h - size) * 0.5,
+        .w = size,
+        .h = size,
+    };
+    queuePanel(state, tip_rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.borderMuted()), theme.scaledUi(3.5), theme.scaledUi(0.75));
+    const font_size = theme.scaledUi(9.5);
+    const text_w = app_state.paletteUiTextPrefixWidth(label, font_size, label.len);
+    queueText(state, .{
+        .x = tip_rect.x + @max((tip_rect.w - text_w) * 0.5, 0.0),
+        .y = tip_rect.y + (tip_rect.h - font_size * 1.25) * 0.5,
+        .w = @min(text_w, tip_rect.w),
+        .h = font_size * 1.25,
+    }, label, paletteColor(theme.accent()), font_size, clip);
+}
+
 fn renderEmptyProjects(state: *app_state.AppState, rect: palette.Rect) void {
     const x = rect.x + theme.scaledUi(44.0);
     var y = rect.y + theme.scaledUi(86.0);
@@ -1880,11 +1977,20 @@ fn renderEmptyProjects(state: *app_state.AppState, rect: palette.Rect) void {
     queueText(state, .{ .x = x, .y = y, .w = rect.w - theme.scaledUi(88.0), .h = theme.scaledUi(28.0) }, "Use the workspace rail to add a folder and start chatting.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(16.0), rect);
 }
 
-/// While the current thread is streaming, keep `transcript_auto_follow_pending` on when the viewport
-/// is at (or near) the tail, or during the initial scroll-to-bottom animation. Wheel on the
-/// transcript clears the latch; scrolling back within ~72px of the bottom turns it on again.
-fn updateTranscriptAutoFollowPalette(state: *app_state.AppState, has_pending_stream: bool, max_scroll: f32, scroll_y: f32) void {
+/// While the current thread is streaming, keep `auto_follow_pending` on when the viewport is at
+/// the tail. Once manual scrolling suspends it, only a later manual scroll near the tail may
+/// re-arm it; transient streaming/layout geometry must not pull the viewport back down.
+fn updateTranscriptAutoFollowPalette(state: *app_state.AppState, has_pending_stream: bool, max_scroll: f32, scroll_y: f32, manual_scroll_requested: bool, manual_scroll_toward_tail: bool) void {
+    if (state.transcript_controller.auto_follow_suspended and
+        shouldReleaseTranscriptAutoFollowSuspension(manual_scroll_requested, manual_scroll_toward_tail, scroll_y, max_scroll))
+    {
+        state.transcript_controller.auto_follow_suspended = false;
+    }
     if (!has_pending_stream) {
+        state.transcript_controller.auto_follow_pending = false;
+        return;
+    }
+    if (state.transcript_controller.auto_follow_suspended) {
         state.transcript_controller.auto_follow_pending = false;
         return;
     }
@@ -1898,6 +2004,17 @@ fn transcriptScrollNearBottom(scroll_y: f32, max_scroll: f32) bool {
     return (max_scroll - scroll_y) <= theme.scaledUi(72.0);
 }
 
+fn shouldReleaseTranscriptAutoFollowSuspension(manual_scroll_requested: bool, manual_scroll_toward_tail: bool, scroll_y: f32, max_scroll: f32) bool {
+    return manual_scroll_requested and manual_scroll_toward_tail and transcriptScrollNearBottom(scroll_y, max_scroll);
+}
+
+fn transcriptShouldFollowTail(saved_scroll: ?f32, manual_scroll_requested: bool) bool {
+    // The pane-local semantic state is authoritative. A missing offset means
+    // tail-follow on every frame, including invalid/rebuilding layouts; the
+    // one exception is the frame carrying new manual input away from the tail.
+    return saved_scroll == null and !manual_scroll_requested;
+}
+
 fn currentTranscriptScrollY(state: *const app_state.AppState, pane_id: ?app_state.WorkspacePaneId) ?f32 {
     if (pane_id) |id| return state.workspaceChatTranscriptScrollY(id);
     return state.currentTranscriptScrollY();
@@ -1908,6 +2025,14 @@ fn rememberTranscriptScroll(state: *app_state.AppState, pane_id: ?app_state.Work
         state.rememberWorkspaceChatTranscriptScroll(id, scroll_y);
     } else {
         state.rememberCurrentTranscriptScroll(scroll_y);
+    }
+}
+
+fn clearTranscriptScroll(state: *app_state.AppState, pane_id: ?app_state.WorkspacePaneId) void {
+    if (pane_id) |id| {
+        state.clearWorkspaceChatTranscriptScroll(id);
+    } else {
+        state.clearCurrentTranscriptScroll();
     }
 }
 
@@ -1964,15 +2089,239 @@ test "transcript hit geometry remains pane-local through scrolling clips" {
     try std.testing.expect(findTranscriptHit(100.0, 300.0) == null);
 }
 
-fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?app_state.WorkspacePaneId) void {
-    // Bubble column comes from the same shared formula as the composer card so
-    // transcript content and the prompt box stay width-aligned at every size.
-    const content_column = chatContentColumn(rect.x, rect.w);
-    const column = snapRect(palette.Rect{ .x = content_column.x, .y = rect.y + theme.scaledUi(28.0), .w = content_column.w, .h = @max(rect.h - theme.scaledUi(42.0), 1.0) });
+fn transcriptColumnAtLayoutWidth(rect: palette.Rect, layout_width: f32) palette.Rect {
+    const content_column = chatContentColumn(rect.x, layout_width);
+    return snapRect(.{
+        .x = content_column.x,
+        .y = rect.y + theme.scaledUi(28.0),
+        .w = content_column.w,
+        .h = @max(rect.h - theme.scaledUi(42.0), 1.0),
+    });
+}
+
+test "sidebar animation keeps transcript wrapping at the destination width" {
+    defer theme.applyTheme(1.0);
+    theme.applyTheme(1.0);
+
+    const first = transcriptColumnAtLayoutWidth(.{ .x = 100.0, .y = 40.0, .w = 620.0, .h = 500.0 }, 480.0);
+    const second = transcriptColumnAtLayoutWidth(.{ .x = 140.0, .y = 40.0, .w = 540.0, .h = 500.0 }, 480.0);
+    try std.testing.expectEqual(first.w, second.w);
+    try std.testing.expectEqual(first.x - 100.0, second.x - 140.0);
+}
+
+const TranscriptRenderOptions = struct {
+    pane_id: ?app_state.WorkspacePaneId,
+    active_geometry: bool,
+    register_hits: bool,
+    request_hydration: bool,
+};
+
+const TranscriptBatchStart = struct {
+    commands: usize,
+    text_runs: usize,
+};
+
+// Transcript switch region; the shell is queued separately and remains opaque.
+fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, layout_width: f32, pane_id: ?app_state.WorkspacePaneId) void {
+    const active_geometry = paneOwnsActiveChatState(state, pane_id);
+    const normal_options: TranscriptRenderOptions = .{
+        .pane_id = pane_id,
+        .active_geometry = active_geometry,
+        .register_hits = true,
+        .request_hydration = true,
+    };
+    if (!active_geometry) {
+        _ = renderTranscriptContent(state, rect, layout_width, normal_options);
+        return;
+    }
+
+    const now_ms = platform_runtime.unixTimestampMs();
+    const generation = state.transcriptHydrationGeneration();
+    const fade_out_ms = theme.motionDurationMs(state.app_config.reduced_motion, theme.MOTION_FAST_MS);
+    const fade_in_ms = theme.motionDurationMs(state.app_config.reduced_motion, theme.MOTION_BASE_MS);
+    var transition = &state.transcript_controller.transition;
+
+    if (transition.phase != .idle and transition.generation != generation) {
+        state.cancelTranscriptTransition();
+    }
+    if (transition.phase == .idle) {
+        _ = renderTranscriptContent(state, rect, layout_width, normal_options);
+        state.noteTranscriptPresented(pane_id);
+        return;
+    }
+    if (app_state.shouldPresentTranscriptImmediately(
+        transition.phase,
+        false,
+        state.transcript_controller.motion_suppressed,
+    )) {
+        state.cancelTranscriptTransition();
+        _ = renderTranscriptContent(state, rect, layout_width, normal_options);
+        state.noteTranscriptPresented(pane_id);
+        return;
+    }
+
+    const preparation_options: TranscriptRenderOptions = .{
+        .pane_id = pane_id,
+        .active_geometry = true,
+        .register_hits = false,
+        .request_hydration = true,
+    };
+    switch (transition.phase) {
+        .idle => unreachable,
+        .fading_out => {
+            // Materialize first. A resident target is already stable, so it
+            // presents directly instead of compounding U1 with pane motion.
+            const incoming_start = transcriptBatchStart(state);
+            const incoming_ready = renderTranscriptContent(state, rect, layout_width, preparation_options);
+            if (app_state.shouldPresentTranscriptImmediately(
+                transition.phase,
+                incoming_ready,
+                false,
+            )) {
+                state.cancelTranscriptTransition();
+                state.noteTranscriptPresented(pane_id);
+                return;
+            }
+            multiplyTranscriptBatchOpacity(state, incoming_start, 0.0);
+
+            if (state.outgoingTranscriptPresentation()) |outgoing| {
+                const batch_start = transcriptBatchStart(state);
+                renderOutgoingTranscript(state, rect, layout_width, outgoing);
+                multiplyTranscriptBatchOpacity(state, batch_start, transition.fadeOutOpacity(now_ms, fade_out_ms));
+            } else {
+                transition.phase = .loading;
+            }
+
+            transition.advance(now_ms, generation, incoming_ready, fade_out_ms, fade_in_ms);
+            if (transition.phase != .fading_out) state.clearOutgoingTranscriptPresentation();
+            if (transition.phase == .fading_in) state.noteTranscriptPresented(pane_id);
+            if (transition.indicatorVisible(now_ms)) renderTranscriptLoadingIndicator(state, rect);
+        },
+        .loading => {
+            const incoming_start = transcriptBatchStart(state);
+            const incoming_ready = renderTranscriptContent(state, rect, layout_width, preparation_options);
+            multiplyTranscriptBatchOpacity(state, incoming_start, 0.0);
+            transition.advance(now_ms, generation, incoming_ready, fade_out_ms, fade_in_ms);
+            if (transition.phase == .fading_in) state.noteTranscriptPresented(pane_id);
+            if (transition.indicatorVisible(now_ms)) renderTranscriptLoadingIndicator(state, rect);
+        },
+        .fading_in => {
+            const batch_start = transcriptBatchStart(state);
+            _ = renderTranscriptContent(state, rect, layout_width, normal_options);
+            multiplyTranscriptBatchOpacity(state, batch_start, transition.fadeInOpacity(now_ms, fade_in_ms));
+            state.noteTranscriptPresented(pane_id);
+            transition.advance(now_ms, generation, true, fade_out_ms, fade_in_ms);
+            if (transition.phase == .idle) state.cancelTranscriptTransition();
+        },
+    }
+}
+
+fn transcriptBatchStart(state: *const app_state.AppState) TranscriptBatchStart {
+    return .{
+        .commands = state.palette_overlay_batch.commands.items.len,
+        .text_runs = state.palette_overlay_batch.text_runs.items.len,
+    };
+}
+
+fn multiplyTranscriptBatchOpacity(state: *app_state.AppState, start: TranscriptBatchStart, opacity: f32) void {
+    const clamped = std.math.clamp(opacity, 0.0, 1.0);
+    for (state.palette_overlay_batch.commands.items[start.commands..]) |*command| {
+        command.color.a *= clamped;
+        if (command.border_color) |*border| border.a *= clamped;
+    }
+    for (state.palette_overlay_batch.text_runs.items[start.text_runs..]) |*run| {
+        run.color.a *= clamped;
+    }
+}
+
+fn transcriptCardEntranceOpacity(started_ms: i64, now_ms: i64, reduced_motion: bool) f32 {
+    const duration_ms = theme.motionDurationMs(reduced_motion, theme.MOTION_FAST_MS);
+    if (started_ms <= 0 or reduced_motion or duration_ms <= 0) return 1.0;
+    const elapsed_ms = @max(now_ms - started_ms, 0);
+    const progress = std.math.clamp(
+        @as(f32, @floatFromInt(elapsed_ms)) / @as(f32, @floatFromInt(duration_ms)),
+        0.0,
+        1.0,
+    );
+    return theme.easeOutCubic(progress);
+}
+
+fn pendingTranscriptCardOpacity(
+    event: *chat_types.PendingTimelineEvent,
+    now_ms: i64,
+    reduced_motion: bool,
+) f32 {
+    if (event.role != .system) return 1.0;
+    if (event.transcript_card_started_ms == 0) event.transcript_card_started_ms = now_ms;
+    return transcriptCardEntranceOpacity(event.transcript_card_started_ms, now_ms, reduced_motion);
+}
+
+test "streamed transcript cards fade with the fast token and reduced motion is instant" {
+    const started_ms: i64 = 1_000;
+    try std.testing.expectEqual(@as(f32, 0.0), transcriptCardEntranceOpacity(started_ms, started_ms, false));
+    const mid = transcriptCardEntranceOpacity(started_ms, started_ms + @divTrunc(theme.MOTION_FAST_MS, 2), false);
+    try std.testing.expect(mid > 0.5 and mid < 1.0);
+    try std.testing.expectEqual(@as(f32, 1.0), transcriptCardEntranceOpacity(started_ms, started_ms + theme.MOTION_FAST_MS, false));
+    try std.testing.expectEqual(@as(f32, 1.0), transcriptCardEntranceOpacity(started_ms, started_ms, true));
+    try std.testing.expectEqual(@as(f32, 1.0), transcriptCardEntranceOpacity(0, started_ms, false));
+}
+
+fn renderOutgoingTranscript(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    layout_width: f32,
+    identity: app_state.TranscriptPresentationIdentity,
+) void {
+    if (identity.project_index >= state.project_controller.projects.items.len) return;
+    const outgoing_project = &state.project_controller.projects.items[identity.project_index];
+    if (identity.thread_index >= outgoing_project.threads.items.len) return;
+
+    const restore_project_index = state.project_controller.selected_index;
+    const restore_thread_index = outgoing_project.selected_thread_index;
+    state.project_controller.selected_index = identity.project_index;
+    outgoing_project.selected_thread_index = identity.thread_index;
+    defer {
+        outgoing_project.selected_thread_index = restore_thread_index;
+        state.project_controller.selected_index = restore_project_index;
+    }
+
+    _ = renderTranscriptContent(state, rect, layout_width, .{
+        .pane_id = identity.pane_id,
+        .active_geometry = false,
+        .register_hits = false,
+        .request_hydration = false,
+    });
+}
+
+// Minimal centered loading affordance; it never changes transcript geometry.
+fn renderTranscriptLoadingIndicator(state: *app_state.AppState, rect: palette.Rect) void {
+    const dot = theme.scaledUi(4.0);
+    const gap = theme.scaledUi(5.0);
+    const total_width = dot * 3.0 + gap * 2.0;
+    const x = rect.x + (rect.w - total_width) * 0.5;
+    const y = rect.y + (rect.h - dot) * 0.5;
+    const color = paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 92));
+    var index: usize = 0;
+    while (index < 3) : (index += 1) {
+        queueRounded(state, .{
+            .x = x + @as(f32, @floatFromInt(index)) * (dot + gap),
+            .y = y,
+            .w = dot,
+            .h = dot,
+        }, color, dot * 0.5);
+    }
+}
+
+// Transcript content: final-width layout clipped to the pane body.
+fn renderTranscriptContent(state: *app_state.AppState, rect: palette.Rect, layout_width: f32, options: TranscriptRenderOptions) bool {
+    // At rest this is the shared composer/transcript formula. During the sidebar
+    // slide only its width is final, preventing a fresh message wrap every frame.
+    const column = transcriptColumnAtLayoutWidth(rect, layout_width);
     // Clip to full transcript body (same x/w as layout rect) so GL text and bubbles
     // stay below the workspace header when scrolled.
     const clip = rect;
-    const active_geometry = paneOwnsActiveChatState(state, pane_id);
+    const active_geometry = options.active_geometry;
+    const pane_id = options.pane_id;
     if (active_geometry) {
         state.transcript_controller.palette_column = column;
         state.transcript_controller.palette_clip = clip;
@@ -1980,22 +2329,66 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
 
     const thread = state.currentThread();
 
-    if (thread.messages.items.len == 0 and !thread.isSendPendingForUi() and state.currentThreadPendingSlashCommandLabel() == null) {
-        if (active_geometry) state.transcript_controller.palette_scroll_y = 0.0;
-        rememberTranscriptScroll(state, pane_id, 0.0);
-        appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect, .column = column, .clip = clip });
-        queueText(state, .{ .x = column.x, .y = column.y, .w = column.w, .h = theme.scaledUi(30.0) }, "No messages yet", paletteColor(theme.COLOR_WHITE), theme.scaledUi(20.0), clip);
-        queueText(state, .{ .x = column.x, .y = column.y + theme.scaledUi(32.0), .w = column.w, .h = theme.scaledUi(26.0) }, "Choose a provider, type a prompt below, and start the first chat for this directory.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), clip);
-        return;
+    // A daemon projection refresh swaps in threads whose transcript tail is
+    // paged out (persisted offset set, no in-memory rows). Request the tail
+    // page here — it loads off-thread and commits in the frame-loop poll, so
+    // history reappears within a frame or two without stalling this one; the
+    // event-path loaders alone left an open pane blank until the next mouse
+    // hit-test.
+    if (options.request_hydration and thread.messages.items.len == 0 and thread.persisted_message_offset > 0) {
+        state.requestOlderCurrentThreadMessages();
     }
 
-    const content_height = transcriptContentHeight(state, thread, column.w);
+    if (thread.messages.items.len == 0 and !thread.isSendPendingForUi() and state.currentThreadPendingSlashCommandLabel() == null) {
+        if (active_geometry) state.transcript_controller.palette_scroll_y = 0.0;
+        // A historical thread can render empty for one frame before hydration.
+        // Do not turn that transient state into an explicit top offset; retaining
+        // the missing offset keeps the hydrated transcript pinned to its tail.
+        // Likewise, when rows are merely paged out (persisted offset set but
+        // hydration hasn't landed yet), never stomp an existing saved anchor
+        // with 0.0 — that rewrote the viewport to the estimated top and made
+        // the restored transcript land somewhere unrelated after recovery.
+        if (options.register_hits) appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect, .column = column, .clip = clip });
+        // Durable history exists and is hydrating asynchronously — render a
+        // quiet blank frame instead of flashing first-chat onboarding copy
+        // over a thread that has messages.
+        if (thread.persisted_message_offset > 0) return false;
+        queueText(state, .{ .x = column.x, .y = column.y, .w = column.w, .h = theme.scaledUi(30.0) }, "No messages yet", paletteColor(theme.COLOR_WHITE), theme.scaledUi(20.0), clip);
+        queueText(state, .{ .x = column.x, .y = column.y + theme.scaledUi(32.0), .w = column.w, .h = theme.scaledUi(26.0) }, "Choose a provider, type a prompt below, and start the first chat for this directory.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), clip);
+        return true;
+    }
+
+    const cold_tail_follow = !thread.transcript_layout_visible_ready;
+    const saved_scroll_before_layout = currentTranscriptScrollY(state, pane_id);
+    const content_height = transcriptContentHeight(state, thread, column.w, column.h, pane_id, saved_scroll_before_layout);
+    // A thread continued right after a projection refresh carries only its
+    // new turn rows in memory — the older durable history is paged out and
+    // contributes nothing to the estimate, so the pane renders one bubble
+    // over blank space until history pages in. While older durable rows
+    // exist and the materialized content cannot fill the viewport, request
+    // the next page: it loads off-thread and commits in the frame-loop poll,
+    // one page per commit until the pane is full or the history is
+    // exhausted, mirroring the empty-transcript hydration above.
+    if (options.request_hydration and thread.persisted_message_offset > 0 and content_height < column.h) {
+        state.requestOlderCurrentThreadMessages();
+    }
+    // Materializing older rows shifts content coordinates (the estimated
+    // history above the viewport changes height) and rebases saved offsets;
+    // read the anchor only after the layout pass so this frame renders the
+    // rows the anchor was pointing at.
+    const saved_scroll = currentTranscriptScrollY(state, pane_id);
     const max_scroll = @max(0.0, content_height - column.h);
     const has_pending_stream = state.hasPendingStream() or state.currentThreadPendingSlashCommandLabel() != null;
 
-    var scroll_y = snapTranscriptScrollY(currentTranscriptScrollY(state, pane_id) orelse max_scroll, max_scroll);
+    var scroll_y = snapTranscriptScrollY(saved_scroll orelse max_scroll, max_scroll);
+    var manual_scroll_requested = false;
+    var manual_scroll_toward_tail = false;
 
-    if (paneOwnsActiveChatState(state, pane_id)) {
+    if (active_geometry) {
+        manual_scroll_requested = state.transcript_controller.manual_scroll_pending;
+        manual_scroll_toward_tail = state.transcript_controller.manual_scroll_toward_tail;
+        state.transcript_controller.manual_scroll_pending = false;
+        state.transcript_controller.manual_scroll_toward_tail = false;
         const pi = state.project_controller.selected_index;
         const ti = state.currentProject().selected_thread_index;
         if (state.transcript_controller.scroll_pending_track_project != pi or state.transcript_controller.scroll_pending_track_thread != ti) {
@@ -2006,28 +2399,66 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
         }
 
         if (state.transcript_controller.pending_scroll_px != 0.0) {
+            manual_scroll_requested = true;
             scroll_y = snapTranscriptScrollY(scroll_y + state.transcript_controller.pending_scroll_px, max_scroll);
             state.transcript_controller.pending_scroll_px = 0.0;
         }
         if (state.transcript_controller.pending_page_steps != 0) {
+            manual_scroll_requested = true;
             const page_h = column.h * TRANSCRIPT_PAGE_VIEW_FRAC;
             scroll_y = snapTranscriptScrollY(scroll_y + @as(f32, @floatFromInt(state.transcript_controller.pending_page_steps)) * page_h, max_scroll);
             state.transcript_controller.pending_page_steps = 0;
         }
     }
 
-    updateTranscriptAutoFollowPalette(state, has_pending_stream, max_scroll, scroll_y);
+    const implicit_cold_tail_follow = shouldImplicitlyFollowColdTail(cold_tail_follow, saved_scroll, manual_scroll_requested);
+    if (!implicit_cold_tail_follow and
+        !thread.transcript_layout_valid and
+        !state.transcript_controller.auto_follow_pending and
+        state.transcript_controller.scroll_to_bottom_frames == 0)
+    {
+        const requested_height = estimatedPartialTranscriptHeight(thread) - scroll_y;
+        const mutable_thread = state.currentThreadMutable();
+        mutable_thread.transcript_layout_requested_height = @max(mutable_thread.transcript_layout_requested_height, requested_height);
+    }
 
-    if (state.transcript_controller.auto_follow_pending or state.transcript_controller.scroll_to_bottom_frames > 0) {
+    if (active_geometry) updateTranscriptAutoFollowPalette(state, has_pending_stream, max_scroll, scroll_y, manual_scroll_requested, manual_scroll_toward_tail);
+
+    const follow_tail = transcriptShouldFollowTail(
+        saved_scroll,
+        manual_scroll_requested,
+    );
+    if (follow_tail) {
         scroll_y = max_scroll;
     }
-    if (state.transcript_controller.scroll_to_bottom_frames > 0) {
+    if (!thread.transcript_layout_valid and !follow_tail) {
+        // Until an earlier region is ready, clamp to the exact suffix rather
+        // than exposing an estimated blank. Each continuation frame moves the
+        // boundary upward by one newly materialized row.
+        const estimated_height = estimatedPartialTranscriptHeight(thread);
+        if (thread.transcript_layout_committed_height < thread.transcript_layout_requested_height) {
+            scroll_y = @min(scroll_y, @max(0.0, estimated_height - thread.transcript_layout_requested_height));
+        }
+        const materialized_top = @max(0.0, estimated_height - thread.transcript_layout_committed_height);
+        scroll_y = @max(scroll_y, materialized_top);
+    }
+    if (active_geometry and thread.transcript_layout_visible_ready and state.transcript_controller.scroll_to_bottom_frames > 0) {
         state.transcript_controller.scroll_to_bottom_frames -= 1;
     }
-    if (state.transcript_controller.scroll_to_bottom_frames == 0 and !has_pending_stream) {
+    if (active_geometry and state.transcript_controller.scroll_to_bottom_frames == 0 and !has_pending_stream) {
         state.transcript_controller.auto_follow_pending = false;
     }
-    rememberTranscriptScroll(state, pane_id, scroll_y);
+    // A missing saved offset means "follow the tail", not "save this frame's
+    // estimated tail coordinate". Cold long-thread estimates can move by many
+    // screens as width settles; keep the semantic tail latch until the user
+    // explicitly scrolls instead of visibly chasing a stale numeric offset.
+    if (manual_scroll_requested) {
+        if (manualScrollReachesTranscriptTail(manual_scroll_toward_tail, scroll_y, max_scroll)) {
+            clearTranscriptScroll(state, pane_id);
+        } else {
+            rememberTranscriptScroll(state, pane_id, scroll_y);
+        }
+    }
     if (active_geometry) state.transcript_controller.palette_scroll_y = scroll_y;
 
     var content_y = renderCommittedTranscript(state, thread, column, scroll_y, clip);
@@ -2045,13 +2476,18 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
         transcript_scrollbar_track = track;
         transcript_scrollbar_thumb = thumb_rect;
         transcript_scrollbar_max_scroll = max_scroll;
-        appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect, .column = column, .clip = clip, .scroll_y = scroll_y, .track = track, .thumb = thumb_rect, .max_scroll = max_scroll });
+        if (options.register_hits) appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect, .column = column, .clip = clip, .scroll_y = scroll_y, .track = track, .thumb = thumb_rect, .max_scroll = max_scroll });
     } else {
         transcript_scrollbar_track = .{};
         transcript_scrollbar_thumb = .{};
         transcript_scrollbar_max_scroll = 0.0;
-        appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect, .column = column, .clip = clip, .scroll_y = scroll_y });
+        if (options.register_hits) appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect, .column = column, .clip = clip, .scroll_y = scroll_y });
     }
+    const visible_region_ready = thread.transcript_layout_visible_ready and
+        (thread.transcript_layout_valid or
+            thread.transcript_layout_committed_height >= thread.transcript_layout_requested_height);
+    const hydration_ready = thread.persisted_message_offset == 0 or content_height >= column.h;
+    return visible_region_ready and hydration_ready;
 }
 
 /// Scrollbar hit-area widened by `SCROLLBAR_HIT_PADDING` CSS px on each side
@@ -2078,39 +2514,178 @@ fn snapTranscriptScrollY(value: f32, max_scroll: ?f32) f32 {
     return std.math.clamp(@round(@max(value, 0.0)), 0.0, upper);
 }
 
-fn transcriptContentHeight(state: *app_state.AppState, thread: anytype, width: f32) f32 {
-    const committed_height = if (ensureTranscriptLayout(state, width))
-        thread.transcript_layout_committed_height
-    else
-        transcriptCommittedHeightUncached(state, thread, width);
+fn manualScrollReachesTranscriptTail(
+    manual_scroll_toward_tail: bool,
+    scroll_y: f32,
+    max_scroll: f32,
+) bool {
+    return manual_scroll_toward_tail and transcriptScrollNearBottom(scroll_y, max_scroll);
+}
+
+fn shouldImplicitlyFollowColdTail(cold_tail_follow: bool, saved_scroll: ?f32, manual_scroll_requested: bool) bool {
+    return cold_tail_follow and saved_scroll == null and !manual_scroll_requested;
+}
+
+test "implicit transcript tail follow survives changing cold-layout estimates" {
+    const changing_max_scroll = [_]f32{ 1_000.0, 4_500.0, 2_800.0, 9_200.0 };
+    var saved_scroll: ?f32 = null;
+    // A transient empty render before historical hydration must not create an
+    // explicit zero offset that the loaded transcript interprets as its top.
+    try std.testing.expect(saved_scroll == null);
+
+    for (changing_max_scroll) |max_scroll| {
+        const scroll_y = snapTranscriptScrollY(saved_scroll orelse max_scroll, max_scroll);
+        try std.testing.expectEqual(max_scroll, scroll_y);
+    }
+    try std.testing.expect(saved_scroll == null);
+
+    const manual_scroll = snapTranscriptScrollY(changing_max_scroll[0] - 240.0, changing_max_scroll[0]);
+    saved_scroll = manual_scroll;
+    try std.testing.expectEqual(manual_scroll, snapTranscriptScrollY(saved_scroll.?, changing_max_scroll[1]));
+
+    try std.testing.expect(!shouldImplicitlyFollowColdTail(true, null, true));
+    try std.testing.expect(!shouldImplicitlyFollowColdTail(true, manual_scroll, false));
+    try std.testing.expect(shouldImplicitlyFollowColdTail(true, null, false));
+}
+
+test "only manual movement toward the bottom returns to semantic transcript tail-follow" {
+    try std.testing.expect(manualScrollReachesTranscriptTail(true, 950.0, 1_000.0));
+    try std.testing.expect(!manualScrollReachesTranscriptTail(false, 950.0, 1_000.0));
+    try std.testing.expect(!manualScrollReachesTranscriptTail(true, 800.0, 1_000.0));
+}
+
+test "pane-local semantic scroll state owns transcript tail-follow" {
+    try std.testing.expect(transcriptShouldFollowTail(null, false));
+    // Manual input must be applied before the frame re-enters tail-follow.
+    try std.testing.expect(!transcriptShouldFollowTail(null, true));
+    // A saved anchor remains authoritative through refresh, streaming, and
+    // pane focus changes regardless of global controller latches.
+    try std.testing.expect(!transcriptShouldFollowTail(420.0, false));
+}
+
+test "streaming geometry cannot release a manual tail-follow suspension" {
+    try std.testing.expect(transcriptScrollNearBottom(950.0, 1_000.0));
+    try std.testing.expect(!shouldReleaseTranscriptAutoFollowSuspension(false, true, 950.0, 1_000.0));
+    try std.testing.expect(!shouldReleaseTranscriptAutoFollowSuspension(true, false, 950.0, 1_000.0));
+    try std.testing.expect(shouldReleaseTranscriptAutoFollowSuspension(true, true, 950.0, 1_000.0));
+    try std.testing.expect(!shouldReleaseTranscriptAutoFollowSuspension(true, true, 800.0, 1_000.0));
+}
+
+fn transcriptContentHeight(
+    state: *app_state.AppState,
+    thread: anytype,
+    width: f32,
+    viewport_height: f32,
+    pane_id: ?app_state.WorkspacePaneId,
+    saved_scroll: ?f32,
+) f32 {
+    const visible_height = viewport_height * (1.0 + TRANSCRIPT_LAYOUT_VISIBLE_MARGIN_FRAC);
+    var requested_height = visible_height;
+    if (thread.transcript_layout_message_count > 0) {
+        const estimated_height = estimatedPartialTranscriptHeight(thread);
+        if (saved_scroll) |scroll_y| requested_height = @max(requested_height, estimated_height - scroll_y);
+        // A clamped on-demand scroll stores the nearest materialized offset.
+        // Retain its original distance-from-tail target until bounded slices
+        // have reached it, so page/scrollbar jumps continue across frames.
+        if (thread.transcript_layout_committed_height < thread.transcript_layout_requested_height) {
+            requested_height = @max(requested_height, thread.transcript_layout_requested_height);
+        }
+    }
+    ensureTranscriptLayout(state, width, visible_height, requested_height, pane_id, saved_scroll);
+    const committed_height = estimatedPartialTranscriptHeight(thread);
     var total = theme.scaledUi(4.0) + committed_height;
     total += transcriptPendingSlashCommandHeight(state, width);
     total += transcriptPendingStreamHeight(state, thread, width);
     return total;
 }
 
-fn transcriptCommittedHeightUncached(state: *app_state.AppState, thread: anytype, width: f32) f32 {
-    var total: f32 = 0.0;
-    var message_index: usize = 0;
-    while (message_index < thread.messages.items.len) {
-        const message = thread.messages.items[message_index];
-        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) {
-            message_index += 1;
-            continue;
-        }
-        const group_end = if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body))
-            toolCallGroupEnd(thread.messages.items, message_index)
-        else
-            message_index + 1;
-        if (group_end - message_index >= 2) {
-            total += toolCallGroupHeight(state, thread.messages.items, message_index, group_end, 0, width) + theme.scaledUi(12.0);
-            message_index = group_end;
-            continue;
-        }
-        total += transcriptCommittedMessageHeight(state, message_index, message, width) + theme.scaledUi(12.0);
-        message_index += 1;
-    }
-    return total;
+fn estimatedPartialTranscriptHeight(thread: anytype) f32 {
+    const materialized_count = thread.transcript_layout_message_count;
+    if (materialized_count == 0 or thread.transcript_layout_first_message_index == 0) return thread.transcript_layout_committed_height;
+    const average = thread.transcript_layout_committed_height / @as(f32, @floatFromInt(materialized_count));
+    return thread.transcript_layout_committed_height + average * @as(f32, @floatFromInt(thread.transcript_layout_first_message_index));
+}
+
+test "partial transcript height projects unfinished rows without a full walk" {
+    const FakeThread = struct {
+        transcript_layout_message_count: usize,
+        transcript_layout_first_message_index: usize,
+        transcript_layout_committed_height: f32,
+        messages: struct { items: []const u8 },
+    };
+    const messages = [_]u8{ 0, 1, 2, 3 };
+    const partial: FakeThread = .{
+        .transcript_layout_message_count = 2,
+        .transcript_layout_first_message_index = 2,
+        .transcript_layout_committed_height = 100.0,
+        .messages = .{ .items = &messages },
+    };
+    try std.testing.expectApproxEqAbs(@as(f32, 200.0), estimatedPartialTranscriptHeight(&partial), 0.001);
+
+    const empty: FakeThread = .{
+        .transcript_layout_message_count = 0,
+        .transcript_layout_first_message_index = 4,
+        .transcript_layout_committed_height = 0.0,
+        .messages = .{ .items = &messages },
+    };
+    try std.testing.expectEqual(@as(f32, 0.0), estimatedPartialTranscriptHeight(&empty));
+}
+
+test "materializing older rows keeps a manual upward scroll on the same content" {
+    const FakeThread = struct {
+        transcript_layout_message_count: usize,
+        transcript_layout_first_message_index: usize,
+        transcript_layout_committed_height: f32,
+    };
+
+    // Frame N: two huge measured tail rows (large tool outputs), 119 older
+    // rows still projected from the running 900px average, viewport anchored
+    // inside the newest row after the user wheeled upward.
+    const items_before = [_]chat_types.TranscriptLayoutItem{
+        .{ .message_index = 120, .group_end = 121, .top = -900.0, .height = 880.0 },
+        .{ .message_index = 119, .group_end = 120, .top = -1_800.0, .height = 880.0 },
+    };
+    const before: FakeThread = .{
+        .transcript_layout_message_count = 2,
+        .transcript_layout_first_message_index = 119,
+        .transcript_layout_committed_height = 1_800.0,
+    };
+    const estimate_before = estimatedPartialTranscriptHeight(&before);
+    const scroll_before = estimate_before - 850.0;
+    try std.testing.expectEqual(@as(usize, 120), transcriptLayoutItemAtContentY(&items_before, estimate_before, scroll_before).?.message_index);
+
+    // Frame N+1: two older rows materialize far smaller than the average, so
+    // the estimated height above the viewport collapses by tens of screens.
+    const items_after = items_before ++ [_]chat_types.TranscriptLayoutItem{
+        .{ .message_index = 118, .group_end = 119, .top = -1_900.0, .height = 88.0 },
+        .{ .message_index = 117, .group_end = 118, .top = -2_000.0, .height = 88.0 },
+    };
+    const after: FakeThread = .{
+        .transcript_layout_message_count = 4,
+        .transcript_layout_first_message_index = 117,
+        .transcript_layout_committed_height = 2_000.0,
+    };
+    const estimate_after = estimatedPartialTranscriptHeight(&after);
+    try std.testing.expect(estimate_after < estimate_before - 40_000.0);
+
+    // Without rebasing, the stale numeric offset points past every
+    // materialized row — the on-screen blank gap and multi-screen leap.
+    try std.testing.expect(transcriptLayoutItemAtContentY(&items_after, estimate_after, scroll_before) == null);
+
+    // Production rebase path: ensureTranscriptLayout shifts saved offsets by
+    // the estimate delta through shiftChatTranscriptScrollForThread.
+    const allocator = std.testing.allocator;
+    var layout = try app_state.WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+    layout.paneByIdMutable(1).?.ref.chat.transcript_scroll_valid = true;
+    layout.paneByIdMutable(1).?.ref.chat.transcript_scroll_y = scroll_before;
+    layout.shiftChatTranscriptScrollForThread(0, estimate_after - estimate_before);
+    const scroll_after = layout.paneById(1).?.ref.chat.transcript_scroll_y;
+
+    // The anchor stays on the same row at the same intra-row offset: no jump.
+    const anchored = transcriptLayoutItemAtContentY(&items_after, estimate_after, scroll_after) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 120), anchored.message_index);
+    try std.testing.expectEqual(scroll_before - estimate_before, scroll_after - estimate_after);
 }
 
 fn transcriptLayoutVariantHash(state: *app_state.AppState) u64 {
@@ -2120,16 +2695,21 @@ fn transcriptLayoutVariantHash(state: *app_state.AppState) u64 {
     hasher.update(std.mem.asBytes(&tool_group_preference));
     hasher.update(std.mem.asBytes(&diff_layout_preference));
     hasher.update(std.mem.asBytes(&state.app_config.tool_call_groups_last_expanded));
-
-    var iterator = state.expanded_cards.iterator();
-    while (iterator.next()) |entry| {
-        hasher.update(std.mem.asBytes(entry.key_ptr));
-        hasher.update(std.mem.asBytes(entry.value_ptr));
-    }
+    // Every card expand/collapse bumps this revision (state.setCardExpanded is
+    // the single write path), so hashing it is equivalent to hashing the map's
+    // contents without iterating it every frame.
+    hasher.update(std.mem.asBytes(&state.expanded_cards_revision));
     return hasher.final();
 }
 
-fn ensureTranscriptLayout(state: *app_state.AppState, width: f32) bool {
+fn ensureTranscriptLayout(
+    state: *app_state.AppState,
+    width: f32,
+    visible_height: f32,
+    requested_height: f32,
+    pane_id: ?app_state.WorkspacePaneId,
+    saved_scroll: ?f32,
+) void {
     const thread = state.currentThreadMutable();
     const scale = theme.uiScaleFactor();
     const variant_hash = transcriptLayoutVariantHash(state);
@@ -2139,73 +2719,272 @@ fn ensureTranscriptLayout(state: *app_state.AppState, width: f32) bool {
         @abs(thread.transcript_layout_scale - scale) <= 0.001 and
         thread.transcript_layout_variant_hash == variant_hash)
     {
-        return true;
+        return;
     }
 
+    const estimate_before = estimatedPartialTranscriptHeight(thread);
+    const layout_covers_current_tail = thread.transcript_layout_first_message_index + thread.transcript_layout_message_count == thread.messages.items.len;
+    const can_extend = @abs(thread.transcript_layout_width - width) <= 0.5 and
+        @abs(thread.transcript_layout_scale - scale) <= 0.001 and
+        thread.transcript_layout_variant_hash == variant_hash and
+        layout_covers_current_tail;
+    // The previous layout describes what was on screen last frame even when it
+    // no longer covers the tail: appending streamed rows never renumbers the
+    // rows already laid out. Anchoring on any reset whose old indices are still
+    // in range keeps the viewport on the row the user was reading instead of
+    // reinterpreting the saved offset against a fresh estimate — the "transcript
+    // leaps while scrolled up / after a pane switch" bug. Only a message set
+    // that SHRANK below the old coverage makes those indices unreliable.
+    const layout_indices_in_range = thread.transcript_layout_first_message_index + thread.transcript_layout_message_count <= thread.messages.items.len;
+    const reset_anchor: ?TranscriptLayoutAnchor = if (!can_extend and layout_indices_in_range)
+        transcriptLayoutAnchor(thread.transcript_layout_items.items, estimate_before, saved_scroll)
+    else
+        null;
+    if (!can_extend) {
+        thread.transcript_layout_valid = false;
+        thread.transcript_layout_items.clearRetainingCapacity();
+        thread.transcript_layout_width = width;
+        thread.transcript_layout_scale = scale;
+        thread.transcript_layout_variant_hash = variant_hash;
+        thread.transcript_layout_first_message_index = thread.messages.items.len;
+        thread.transcript_layout_message_count = 0;
+        thread.transcript_layout_committed_height = 0.0;
+        thread.transcript_layout_requested_height = 0.0;
+        thread.transcript_layout_visible_ready = false;
+    }
+    thread.transcript_layout_requested_height = requested_height;
     thread.transcript_layout_valid = false;
-    thread.transcript_layout_items.clearRetainingCapacity();
-    thread.transcript_layout_items.ensureTotalCapacity(state.allocator, thread.messages.items.len) catch return false;
+    const was_visible_ready = thread.transcript_layout_visible_ready;
+    var rows_built: usize = 0;
+    const started_at_ms = unixTimestampMs();
+    while (thread.transcript_layout_first_message_index > 0) {
+        const reset_anchor_pending = if (reset_anchor) |anchor|
+            thread.transcript_layout_first_message_index > anchor.message_index
+        else
+            false;
+        if (!reset_anchor_pending) {
+            if (thread.transcript_layout_visible_ready and thread.transcript_layout_committed_height >= requested_height) break;
+            const visible_region_ready = thread.transcript_layout_committed_height >= visible_height;
+            if (visible_region_ready and thread.transcript_layout_visible_ready and rows_built >= TRANSCRIPT_LAYOUT_ROWS_PER_SLICE) break;
+            if (visible_region_ready and thread.transcript_layout_visible_ready and unixTimestampMs() - started_at_ms >= TRANSCRIPT_LAYOUT_SLICE_BUDGET_MS) break;
+        }
 
-    var top: f32 = 0.0;
-    var message_index: usize = 0;
-    while (message_index < thread.messages.items.len) {
-        const message = thread.messages.items[message_index];
-        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) {
-            message_index += 1;
+        const before = thread.transcript_layout_first_message_index;
+        const previous_index = before - 1;
+        const previous = thread.messages.items[previous_index];
+        if (previous.role == .system and shouldHideCursorLifecycleSystemEvent(thread, previous.author, previous.body)) {
+            thread.transcript_layout_first_message_index = previous_index;
+            thread.transcript_layout_message_count += 1;
+            rows_built += 1;
             continue;
         }
-        const group_end = if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body))
-            toolCallGroupEnd(thread.messages.items, message_index)
-        else
-            message_index + 1;
+
+        var message_index = previous_index;
+        if (previous.role == .system and shouldRenderPaletteCommandRow(previous.author, previous.body)) {
+            while (message_index > 0) {
+                const candidate = thread.messages.items[message_index - 1];
+                if (candidate.role != .system or !shouldRenderPaletteCommandRow(candidate.author, candidate.body)) break;
+                message_index -= 1;
+            }
+        }
+        const message = thread.messages.items[message_index];
+        const group_end = before;
         const height = if (group_end - message_index >= 2)
             toolCallGroupHeight(state, thread.messages.items, message_index, group_end, 0, width)
         else
             transcriptCommittedMessageHeight(state, message_index, message, width);
-        thread.transcript_layout_items.appendAssumeCapacity(.{
+        const committed_height = thread.transcript_layout_committed_height + height + theme.scaledUi(12.0);
+        // Store tail-relative, newest-first positions. Extending older history
+        // then leaves existing rows untouched and is amortized O(1).
+        thread.transcript_layout_items.append(state.allocator, .{
             .message_index = message_index,
             .group_end = group_end,
-            .top = top,
+            .top = -committed_height,
             .height = height,
-        });
-        top += height + theme.scaledUi(12.0);
-        message_index = group_end;
+        }) catch return;
+        thread.transcript_layout_committed_height = committed_height;
+        rows_built += group_end - message_index;
+        thread.transcript_layout_message_count += group_end - message_index;
+        thread.transcript_layout_first_message_index = message_index;
+        if (thread.transcript_layout_committed_height >= visible_height) thread.transcript_layout_visible_ready = true;
     }
 
-    thread.transcript_layout_width = width;
-    thread.transcript_layout_scale = scale;
-    thread.transcript_layout_variant_hash = variant_hash;
-    thread.transcript_layout_message_count = thread.messages.items.len;
-    thread.transcript_layout_committed_height = top;
-    thread.transcript_layout_valid = true;
-    return true;
+    thread.transcript_layout_valid = thread.transcript_layout_first_message_index == 0;
+    if (thread.transcript_layout_valid) thread.transcript_layout_visible_ready = true;
+    if (reset_anchor) |anchor| {
+        if (transcriptScrollForLayoutAnchor(thread.transcript_layout_items.items, estimatedPartialTranscriptHeight(thread), anchor)) |anchored_scroll| {
+            rememberTranscriptScroll(state, pane_id, anchored_scroll);
+        }
+    }
+    // Extending older history rewrites the estimate for everything above the
+    // materialized region, which moves every row's top-relative coordinate by
+    // the same amount. Rebase saved offsets by that delta so each anchor keeps
+    // its distance from the tail and the viewport keeps the rows it was
+    // showing. Width/scale/variant resets instead restore the semantic row
+    // anchor above, after rebuilding enough of the suffix at its new geometry.
+    if (can_extend) {
+        const estimate_delta = estimatedPartialTranscriptHeight(thread) - estimate_before;
+        if (estimate_delta != 0.0) state.shiftCurrentTranscriptScroll(estimate_delta);
+    }
+    const elapsed_ms = unixTimestampMs() - started_at_ms;
+    if (elapsed_ms > SDL_STALL_LOG_THRESHOLD_MS) {
+        app_state.log.warn(
+            "SDL thread stall operation=transcript layout materialize region={s} elapsed_ms={d} rows={d} remaining={d}",
+            .{ if (was_visible_ready) "history" else "visible-tail", elapsed_ms, rows_built, thread.transcript_layout_first_message_index },
+        );
+    }
 }
 
-fn firstVisibleTranscriptLayoutItem(items: []const chat_types.TranscriptLayoutItem, scroll_y: f32) usize {
+test "cold transcript layout anchors the materialized suffix at the visible tail" {
+    const items: [2]chat_types.TranscriptLayoutItem = .{
+        .{ .message_index = 999, .group_end = 1000, .top = -72.0, .height = 60.0 },
+        .{ .message_index = 998, .group_end = 999, .top = -124.0, .height = 40.0 },
+    };
+
+    try std.testing.expectEqual(@as(usize, 999), items[0].message_index);
+    try std.testing.expectApproxEqAbs(@as(f32, -72.0), items[0].top, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, -124.0), items[1].top, 0.001);
+    try std.testing.expect(transcriptLayoutItemAtContentY(&items, 10_000.0, 9_950.0).?.message_index == 999);
+    try std.testing.expect(transcriptLayoutItemAtContentY(&items, 10_000.0, 5_000.0) == null);
+
+    // Changing only the unfinished-history estimate leaves stored row geometry
+    // untouched and must not move the tail row in tail-follow coordinates.
+    const viewport_height: f32 = 720.0;
+    const first_tail_y = 10_000.0 + items[0].top - (10_000.0 - viewport_height);
+    const second_tail_y = 12_000.0 + items[0].top - (12_000.0 - viewport_height);
+    try std.testing.expectApproxEqAbs(first_tail_y, second_tail_y, 0.001);
+}
+
+fn oldestVisibleTranscriptLayoutItem(items: []const chat_types.TranscriptLayoutItem, scroll_y: f32) ?usize {
     var low: usize = 0;
     var high = items.len;
     while (low < high) {
         const middle = low + (high - low) / 2;
         const item = items[middle];
-        if (item.top + item.height < scroll_y) {
+        if (item.top + item.height >= scroll_y) {
             low = middle + 1;
         } else {
             high = middle;
         }
     }
-    return low;
+    return if (low == 0) null else low - 1;
+}
+
+fn transcriptLayoutItemAtContentY(items: []const chat_types.TranscriptLayoutItem, estimated_height: f32, content_y: f32) ?chat_types.TranscriptLayoutItem {
+    const tail_y = content_y - estimated_height;
+    const index = oldestVisibleTranscriptLayoutItem(items, tail_y) orelse return null;
+    const item = items[index];
+    if (tail_y < item.top or tail_y > item.top + item.height) return null;
+    return item;
+}
+
+const TranscriptLayoutAnchor = struct {
+    message_index: usize,
+    viewport_y: f32,
+};
+
+fn transcriptLayoutAnchor(
+    items: []const chat_types.TranscriptLayoutItem,
+    estimated_height: f32,
+    saved_scroll: ?f32,
+) ?TranscriptLayoutAnchor {
+    const scroll_y = saved_scroll orelse return null;
+    const layout_index = oldestVisibleTranscriptLayoutItem(items, scroll_y - estimated_height) orelse return null;
+    const item = items[layout_index];
+    return .{
+        .message_index = item.message_index,
+        .viewport_y = estimated_height + item.top - scroll_y,
+    };
+}
+
+fn transcriptScrollForLayoutAnchor(
+    items: []const chat_types.TranscriptLayoutItem,
+    estimated_height: f32,
+    anchor: TranscriptLayoutAnchor,
+) ?f32 {
+    for (items) |item| {
+        if (item.message_index != anchor.message_index) continue;
+        return @max(estimated_height + item.top - anchor.viewport_y, 0.0);
+    }
+    return null;
+}
+
+test "transcript width reflow preserves the visible semantic row" {
+    const before_items = [_]chat_types.TranscriptLayoutItem{
+        .{ .message_index = 9, .group_end = 10, .top = -80.0, .height = 68.0 },
+        .{ .message_index = 8, .group_end = 9, .top = -172.0, .height = 80.0 },
+        .{ .message_index = 7, .group_end = 8, .top = -264.0, .height = 80.0 },
+    };
+    const estimate_before: f32 = 1_200.0;
+    const scroll_before: f32 = 1_050.0;
+    const anchor = transcriptLayoutAnchor(&before_items, estimate_before, scroll_before) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 8), anchor.message_index);
+    try std.testing.expectEqual(@as(f32, -22.0), anchor.viewport_y);
+
+    // The wider layout changes both the unfinished-history estimate and every
+    // tail-relative row position. Reusing 1,050px would show another message.
+    const after_items = [_]chat_types.TranscriptLayoutItem{
+        .{ .message_index = 9, .group_end = 10, .top = -56.0, .height = 44.0 },
+        .{ .message_index = 8, .group_end = 9, .top = -116.0, .height = 48.0 },
+        .{ .message_index = 7, .group_end = 8, .top = -176.0, .height = 48.0 },
+    };
+    const estimate_after: f32 = 760.0;
+    const scroll_after = transcriptScrollForLayoutAnchor(&after_items, estimate_after, anchor) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(f32, 666.0), scroll_after);
+    try std.testing.expectEqual(anchor.viewport_y, estimate_after + after_items[1].top - scroll_after);
+}
+
+test "streamed tail append preserves the visible semantic row across reset" {
+    // A layout that no longer covers the tail (rows streamed in below) still
+    // anchors: existing row indices are untouched by appends, so the anchor
+    // found in the stale layout must resolve in the rebuilt one.
+    const before_items = [_]chat_types.TranscriptLayoutItem{
+        .{ .message_index = 9, .group_end = 10, .top = -80.0, .height = 68.0 },
+        .{ .message_index = 8, .group_end = 9, .top = -172.0, .height = 80.0 },
+        .{ .message_index = 7, .group_end = 8, .top = -264.0, .height = 80.0 },
+    };
+    const anchor = transcriptLayoutAnchor(&before_items, 1_200.0, 1_050.0) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 8), anchor.message_index);
+    try std.testing.expectEqual(@as(f32, -22.0), anchor.viewport_y);
+
+    // Rebuilt layout includes two appended tail rows; every old row's
+    // tail-relative top shifted and the unfinished-history estimate changed.
+    const after_items = [_]chat_types.TranscriptLayoutItem{
+        .{ .message_index = 11, .group_end = 12, .top = -60.0, .height = 48.0 },
+        .{ .message_index = 10, .group_end = 11, .top = -120.0, .height = 48.0 },
+        .{ .message_index = 9, .group_end = 10, .top = -200.0, .height = 68.0 },
+        .{ .message_index = 8, .group_end = 9, .top = -292.0, .height = 80.0 },
+        .{ .message_index = 7, .group_end = 8, .top = -384.0, .height = 80.0 },
+    };
+    const estimate_after: f32 = 1_500.0;
+    const scroll_after = transcriptScrollForLayoutAnchor(&after_items, estimate_after, anchor) orelse return error.TestExpectedEqual;
+    // Same semantic row at the same viewport position, whatever the new estimate.
+    try std.testing.expectEqual(anchor.viewport_y, estimate_after + after_items[3].top - scroll_after);
+}
+
+test "transcript layout hit lookup skips gaps and finds rows logarithmically" {
+    const items: [3]chat_types.TranscriptLayoutItem = .{
+        .{ .message_index = 2, .group_end = 4, .top = -50.0, .height = 50.0 },
+        .{ .message_index = 1, .group_end = 2, .top = -92.0, .height = 30.0 },
+        .{ .message_index = 0, .group_end = 1, .top = -144.0, .height = 40.0 },
+    };
+    try std.testing.expectEqual(@as(usize, 0), transcriptLayoutItemAtContentY(&items, 144.0, 20.0).?.message_index);
+    try std.testing.expect(transcriptLayoutItemAtContentY(&items, 144.0, 46.0) == null);
+    try std.testing.expectEqual(@as(usize, 1), transcriptLayoutItemAtContentY(&items, 144.0, 52.0).?.message_index);
+    try std.testing.expectEqual(@as(usize, 2), transcriptLayoutItemAtContentY(&items, 144.0, 144.0).?.message_index);
+    try std.testing.expect(transcriptLayoutItemAtContentY(&items, 144.0, 145.0) == null);
 }
 
 test "transcript layout lookup starts at the first row intersecting the viewport" {
     const items: [3]chat_types.TranscriptLayoutItem = .{
-        .{ .message_index = 0, .group_end = 1, .top = 0.0, .height = 40.0 },
-        .{ .message_index = 1, .group_end = 2, .top = 52.0, .height = 30.0 },
-        .{ .message_index = 2, .group_end = 3, .top = 94.0, .height = 50.0 },
+        .{ .message_index = 2, .group_end = 3, .top = -50.0, .height = 50.0 },
+        .{ .message_index = 1, .group_end = 2, .top = -92.0, .height = 30.0 },
+        .{ .message_index = 0, .group_end = 1, .top = -144.0, .height = 40.0 },
     };
-    try std.testing.expectEqual(@as(usize, 0), firstVisibleTranscriptLayoutItem(&items, 40.0));
-    try std.testing.expectEqual(@as(usize, 1), firstVisibleTranscriptLayoutItem(&items, 41.0));
-    try std.testing.expectEqual(@as(usize, 2), firstVisibleTranscriptLayoutItem(&items, 90.0));
-    try std.testing.expectEqual(items.len, firstVisibleTranscriptLayoutItem(&items, 145.0));
+    try std.testing.expectEqual(@as(usize, 2), oldestVisibleTranscriptLayoutItem(&items, -104.0).?);
+    try std.testing.expectEqual(@as(usize, 1), oldestVisibleTranscriptLayoutItem(&items, -103.0).?);
+    try std.testing.expectEqual(@as(usize, 0), oldestVisibleTranscriptLayoutItem(&items, -54.0).?);
+    try std.testing.expect(oldestVisibleTranscriptLayoutItem(&items, 1.0) == null);
 }
 
 // Renders the visible committed transcript rows from cached layout positions.
@@ -2216,64 +2995,36 @@ fn renderCommittedTranscript(
     scroll_y: f32,
     clip: palette.Rect,
 ) f32 {
-    if (!ensureTranscriptLayout(state, column.w)) {
-        return renderCommittedTranscriptUncached(state, thread, column, scroll_y, clip);
-    }
-
     const items = thread.transcript_layout_items.items;
-    var layout_index = firstVisibleTranscriptLayoutItem(items, scroll_y);
-    const visible_bottom = scroll_y + column.h;
-    while (layout_index < items.len) : (layout_index += 1) {
+    const estimated_height = estimatedPartialTranscriptHeight(thread);
+    var layout_index = oldestVisibleTranscriptLayoutItem(items, scroll_y - estimated_height) orelse
+        return column.y - scroll_y + estimated_height;
+    const visible_bottom = scroll_y + column.h - estimated_height;
+    while (true) {
         const item = items[layout_index];
         if (item.top > visible_bottom) break;
-        const content_y = column.y - scroll_y + item.top;
+        const content_y = column.y - scroll_y + estimated_height + item.top;
         const message = thread.messages.items[item.message_index];
         if (item.group_end - item.message_index >= 2) {
             const last = thread.messages.items[item.group_end - 1];
+            const batch_start = transcriptBatchStart(state);
             renderToolCallGroup(state, thread.messages.items, item.message_index, item.group_end, 0, column, content_y, item.height, clip, thread.backgroundCommandIsRunning(last.body), null);
+            multiplyTranscriptBatchOpacity(
+                state,
+                batch_start,
+                transcriptCardEntranceOpacity(
+                    message.transcript_card_started_ms,
+                    unixTimestampMs(),
+                    state.app_config.reduced_motion,
+                ),
+            );
         } else {
             renderTranscriptMessage(state, thread, column, content_y, item.height, message, clip, item.message_index);
         }
+        if (layout_index == 0) break;
+        layout_index -= 1;
     }
-    return column.y - scroll_y + thread.transcript_layout_committed_height;
-}
-
-// Renders committed transcript rows when allocating the layout cache fails.
-fn renderCommittedTranscriptUncached(
-    state: *app_state.AppState,
-    thread: anytype,
-    column: palette.Rect,
-    scroll_y: f32,
-    clip: palette.Rect,
-) f32 {
-    var content_y = column.y - scroll_y;
-    var message_index: usize = 0;
-    while (message_index < thread.messages.items.len) {
-        const message = thread.messages.items[message_index];
-        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) {
-            message_index += 1;
-            continue;
-        }
-        const group_end = if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body))
-            toolCallGroupEnd(thread.messages.items, message_index)
-        else
-            message_index + 1;
-        const height = if (group_end - message_index >= 2)
-            toolCallGroupHeight(state, thread.messages.items, message_index, group_end, 0, column.w)
-        else
-            transcriptCommittedMessageHeight(state, message_index, message, column.w);
-        if (content_y + height >= column.y and content_y <= column.y + column.h) {
-            if (group_end - message_index >= 2) {
-                const last = thread.messages.items[group_end - 1];
-                renderToolCallGroup(state, thread.messages.items, message_index, group_end, 0, column, content_y, height, clip, thread.backgroundCommandIsRunning(last.body), null);
-            } else {
-                renderTranscriptMessage(state, thread, column, content_y, height, message, clip, message_index);
-            }
-        }
-        content_y += height + theme.scaledUi(12.0);
-        message_index = group_end;
-    }
-    return content_y;
+    return column.y - scroll_y + estimated_height;
 }
 
 fn transcriptPendingSlashCommandHeight(state: *app_state.AppState, column_width: f32) f32 {
@@ -2411,18 +3162,150 @@ fn renderPendingSlashCommandDots(state: *app_state.AppState, rect: palette.Rect,
     }
 }
 
+/// Hash of every input that can change a memoized pending row/group/stream
+/// height: expand-collapse + config variant, column width, UI scale, turn
+/// identity (started_at_ms defeats allocator address reuse across turns),
+/// transcript index (expansion keys are index-addressed), row status, image
+/// count, and body identity (pointer + length — bodies are owned allocations
+/// that are replaced, never edited in place).
+fn pendingRowHeightKey(
+    seed: u64,
+    variant_hash: u64,
+    column_width: f32,
+    turn_started_at_ms: i64,
+    msg_idx: usize,
+    status: ?ai_harness.ToolCallStatus,
+    image_count: usize,
+    body: []const u8,
+) u64 {
+    var hasher = std.hash.Wyhash.init(seed);
+    hasher.update(std.mem.asBytes(&variant_hash));
+    hasher.update(std.mem.asBytes(&column_width));
+    const ui_scale = theme.scaledUi(1.0);
+    hasher.update(std.mem.asBytes(&ui_scale));
+    hasher.update(std.mem.asBytes(&turn_started_at_ms));
+    hasher.update(std.mem.asBytes(&msg_idx));
+    const status_tag: u8 = if (status) |value| @intFromEnum(value) +% 1 else 0;
+    hasher.update(std.mem.asBytes(&status_tag));
+    hasher.update(std.mem.asBytes(&image_count));
+    const body_ptr = @intFromPtr(body.ptr);
+    hasher.update(std.mem.asBytes(&body_ptr));
+    hasher.update(std.mem.asBytes(&body.len));
+    return hasher.final();
+}
+
+const PENDING_SINGLE_ROW_HEIGHT_SEED: u64 = 0x51F0_33C7_A9B4_66D1;
+const PENDING_GROUP_HEIGHT_SEED: u64 = 0x6E2B_84D9_C013_57AF;
+const PENDING_STREAM_HEIGHT_SEED: u64 = 0x9C47_1AE2_5B68_D30F;
+
+/// Measured height of one standalone pending row, memoized on the event.
+fn pendingSingleRowHeight(
+    state: *app_state.AppState,
+    event: *chat_types.PendingTimelineEvent,
+    turn_started_at_ms: i64,
+    msg_idx: usize,
+    column_width: f32,
+    variant_hash: u64,
+) f32 {
+    const key = pendingRowHeightKey(
+        PENDING_SINGLE_ROW_HEIGHT_SEED,
+        variant_hash,
+        column_width,
+        turn_started_at_ms,
+        msg_idx,
+        event.tool_call_status,
+        event.images.items.len,
+        event.body,
+    );
+    if (event.measured_row_height >= 0.0 and event.measured_row_key == key) return event.measured_row_height;
+    const height = transcriptMessageHeight(state, msg_idx, event.body, event.role, column_width, event.author, false) +
+        transcriptImageBlockHeightFor(event.role, event.images.items.len, column_width);
+    event.measured_row_height = height;
+    event.measured_row_key = key;
+    return height;
+}
+
+/// Measured height of a pending tool-call group, memoized on its head event.
+/// The key folds in every member's identity/status so completions, appended
+/// members, and expand toggles re-measure while pure repaints do not.
+fn pendingToolCallGroupHeight(
+    state: *app_state.AppState,
+    events: []chat_types.PendingTimelineEvent,
+    start: usize,
+    end: usize,
+    base_message_index: usize,
+    column_width: f32,
+    turn_started_at_ms: i64,
+    variant_hash: u64,
+) f32 {
+    var hasher = std.hash.Wyhash.init(PENDING_GROUP_HEIGHT_SEED);
+    hasher.update(std.mem.asBytes(&variant_hash));
+    hasher.update(std.mem.asBytes(&column_width));
+    const ui_scale = theme.scaledUi(1.0);
+    hasher.update(std.mem.asBytes(&ui_scale));
+    hasher.update(std.mem.asBytes(&turn_started_at_ms));
+    hasher.update(std.mem.asBytes(&base_message_index));
+    hasher.update(std.mem.asBytes(&start));
+    hasher.update(std.mem.asBytes(&end));
+    for (events[start..end]) |member| {
+        const body_ptr = @intFromPtr(member.body.ptr);
+        hasher.update(std.mem.asBytes(&body_ptr));
+        hasher.update(std.mem.asBytes(&member.body.len));
+        const status_tag: u8 = if (toolCallEntryStatus(member)) |value| @intFromEnum(value) +% 1 else 0;
+        hasher.update(std.mem.asBytes(&status_tag));
+    }
+    const key = hasher.final();
+    const head = &events[start];
+    if (head.measured_row_height >= 0.0 and head.measured_row_key == key) return head.measured_row_height;
+    const height = toolCallGroupHeight(state, events, start, end, base_message_index, column_width);
+    head.measured_row_height = height;
+    head.measured_row_key = key;
+    return height;
+}
+
+/// Measured height of the in-flight streamed assistant body, memoized on the
+/// send state. `partial_text` is append-only within a turn, so length plus
+/// turn identity fully discriminates the content.
+fn pendingStreamBodyHeight(
+    state: *app_state.AppState,
+    send_state: *chat_types.SendState,
+    stream_msg_idx: usize,
+    column_width: f32,
+    variant_hash: u64,
+) f32 {
+    const stream_text: []const u8 = send_state.partial_text.items;
+    const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
+    const key = pendingRowHeightKey(
+        PENDING_STREAM_HEIGHT_SEED,
+        variant_hash,
+        column_width,
+        send_state.started_at_ms,
+        0,
+        null,
+        0,
+        body,
+    );
+    if (send_state.stream_measured_height >= 0.0 and send_state.stream_measured_key == key) return send_state.stream_measured_height;
+    const stream_plain = stream_text.len > 0;
+    const height = transcriptMessageHeightStream(state, stream_msg_idx, body, .assistant, column_width, "", stream_plain, stream_text.len > 0);
+    send_state.stream_measured_height = height;
+    send_state.stream_measured_key = key;
+    return height;
+}
+
 fn transcriptPendingStreamHeight(state: *app_state.AppState, thread: *const app_state.ChatThread, column_width: f32) f32 {
     const send_state = thread.send_state;
     send_state.mutex.lock();
     defer send_state.mutex.unlock();
     if (send_state.status != .pending) return 0;
 
+    const variant_hash = transcriptLayoutVariantHash(state);
     const base = thread.messages.items.len;
     var total: f32 = 0;
     var pi: usize = 0;
     while (pi < send_state.pending_events.items.len) {
-        const event = send_state.pending_events.items[pi];
-        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) {
+        const event = &send_state.pending_events.items[pi];
+        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(thread, event.author, event.body)) {
             pi += 1;
             continue;
         }
@@ -2431,19 +3314,16 @@ fn transcriptPendingStreamHeight(state: *app_state.AppState, thread: *const app_
         else
             pi + 1;
         if (group_end - pi >= 2) {
-            total += toolCallGroupHeight(state, send_state.pending_events.items, pi, group_end, base, column_width) + theme.scaledUi(12.0);
+            total += pendingToolCallGroupHeight(state, send_state.pending_events.items, pi, group_end, base, column_width, send_state.started_at_ms, variant_hash) + theme.scaledUi(12.0);
             pi = group_end;
             continue;
         }
         const msg_idx = base + pi;
-        total += transcriptMessageHeight(state, msg_idx, event.body, event.role, column_width, event.author, false) + theme.scaledUi(12.0);
+        total += pendingSingleRowHeight(state, event, send_state.started_at_ms, msg_idx, column_width, variant_hash) + theme.scaledUi(12.0);
         pi += 1;
     }
-    const stream_text: []const u8 = send_state.partial_text.items;
-    const body_for_height = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
-    const stream_plain = stream_text.len > 0;
     const stream_msg_idx = base + send_state.pending_events.items.len;
-    total += transcriptMessageHeightStream(state, stream_msg_idx, body_for_height, .assistant, column_width, "", stream_plain, stream_text.len > 0) + theme.scaledUi(12.0);
+    total += pendingStreamBodyHeight(state, send_state, stream_msg_idx, column_width, variant_hash) + theme.scaledUi(12.0);
     return total;
 }
 
@@ -2454,11 +3334,13 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
     if (send_state.status != .pending) return;
 
     var y = content_y;
+    const now_ms = unixTimestampMs();
+    const variant_hash = transcriptLayoutVariantHash(state);
     const pending_count = send_state.pending_events.items.len;
     var pi: usize = 0;
     while (pi < pending_count) {
-        const event = send_state.pending_events.items[pi];
-        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) {
+        const event = &send_state.pending_events.items[pi];
+        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(thread, event.author, event.body)) {
             pi += 1;
             continue;
         }
@@ -2467,8 +3349,10 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
         else
             pi + 1;
         if (group_end - pi >= 2) {
-            const item_h = toolCallGroupHeight(state, send_state.pending_events.items, pi, group_end, base_message_index, column.w);
+            const item_h = pendingToolCallGroupHeight(state, send_state.pending_events.items, pi, group_end, base_message_index, column.w, send_state.started_at_ms, variant_hash);
+            const entrance_opacity = pendingTranscriptCardOpacity(event, now_ms, state.app_config.reduced_motion);
             if (y + item_h >= column.y and y <= column.y + column.h) {
+                const batch_start = transcriptBatchStart(state);
                 renderToolCallGroup(
                     state,
                     send_state.pending_events.items,
@@ -2482,13 +3366,19 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
                     group_end == pending_count,
                     send_state.started_at_ms,
                 );
+                multiplyTranscriptBatchOpacity(
+                    state,
+                    batch_start,
+                    entrance_opacity,
+                );
             }
             y += item_h + theme.scaledUi(12.0);
             pi = group_end;
             continue;
         }
         const msg_idx = base_message_index + pi;
-        const item_h = transcriptMessageHeight(state, msg_idx, event.body, event.role, column.w, event.author, false);
+        const item_h = pendingSingleRowHeight(state, event, send_state.started_at_ms, msg_idx, column.w, variant_hash);
+        const batch_start = transcriptBatchStart(state);
         if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
             const is_last = pi + 1 == pending_count;
             const is_backgrounded = chat_types.ChatThread.isBackgroundCommandEvent(event.author);
@@ -2507,8 +3397,16 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
             };
             if (y + item_h >= column.y and y <= column.y + column.h) {
                 renderTranscriptBubbleFromParts(state, column, y, item_h, event.role, role_label, event.body, false, false, clip, msg_idx, false, false);
+                const first_image: ?app_state.ChatImageAttachment = if (event.images.items.len > 0) event.images.items[0] else null;
+                const extra_images: []const app_state.ChatImageAttachment = if (event.images.items.len > 1) event.images.items[1..] else &.{};
+                renderTranscriptImagesFromParts(state, column, y, item_h, event.role, first_image, extra_images, clip);
             }
         }
+        multiplyTranscriptBatchOpacity(
+            state,
+            batch_start,
+            pendingTranscriptCardOpacity(event, now_ms, state.app_config.reduced_motion),
+        );
         y += item_h + theme.scaledUi(12.0);
         pi += 1;
     }
@@ -2522,7 +3420,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
     const stream_plain = stream_text.len > 0;
     const stream_msg_idx = base_message_index + send_state.pending_events.items.len;
-    const assistant_h = transcriptMessageHeightStream(state, stream_msg_idx, body, .assistant, column.w, "", stream_plain, stream_text.len > 0);
+    const assistant_h = pendingStreamBodyHeight(state, send_state, stream_msg_idx, column.w, variant_hash);
     if (y + assistant_h >= column.y and y <= column.y + column.h) {
         renderTranscriptBubbleFromParts(state, column, y, assistant_h, .assistant, working_label, body, stream_text.len == 0, stream_plain, clip, stream_msg_idx, stream_text.len > 0, true);
     }
@@ -2754,12 +3652,39 @@ test "provider-specific MCP authors still render as structured tool cards" {
     ));
 }
 
-fn shouldHideCursorLifecycleSystemEvent(author: []const u8, body_raw: []const u8) bool {
-    _ = author;
+fn shouldHideCursorLifecycleSystemEvent(thread: anytype, author: []const u8, body_raw: []const u8) bool {
+    // M5-P4 Amendment 1: background bookkeeping rows are now committed to the
+    // transcript (daemon reducer parity for adoption's row compare) and are
+    // filtered here at render time only.
+    if (app_state.shouldHideBackgroundTranscriptRow(thread, author, body_raw)) return true;
     const body = std.mem.trim(u8, body_raw, "\n\r\t ");
     return std.mem.eql(u8, body, "pending") or
         std.mem.eql(u8, body, "in_progress") or
         std.mem.eql(u8, body, "completed");
+}
+
+test "M5-P4 background rows persist while the display filter hides known task events" {
+    const allocator = std.testing.allocator;
+    var thread = try app_state.ChatThread.init(allocator, "Background persistence");
+    defer thread.deinit(allocator);
+    try thread.background_tasks.append(allocator, .{
+        .command = try allocator.dupeZ(u8, "mise run build"),
+        .status = .running,
+    });
+    try thread.messages.append(allocator, .{
+        .role = .system,
+        .author = try allocator.dupeZ(u8, "Background command"),
+        .body = try allocator.dupeZ(u8, "mise run build"),
+    });
+
+    // Persistence/identity owns the row; presentation alone suppresses it.
+    try std.testing.expectEqual(@as(usize, 1), thread.messages.items.len);
+    try std.testing.expect(shouldHideCursorLifecycleSystemEvent(
+        &thread,
+        thread.messages.items[0].author,
+        thread.messages.items[0].body,
+    ));
+    try std.testing.expect(!shouldHideCursorLifecycleSystemEvent(&thread, "Notice", "mise run build"));
 }
 
 fn isUsageSummaryBody(body: []const u8, title: []const u8) bool {
@@ -2858,17 +3783,13 @@ fn transcriptImageCount(message: app_state.ChatMessage) usize {
     return (if (message.image != null) @as(usize, 1) else 0) + message.extra_images.len;
 }
 
-fn transcriptImageAt(message: app_state.ChatMessage, index: usize) ?app_state.ChatImageAttachment {
-    if (index == 0) return message.image;
-    const extra_index = index - 1;
-    if (extra_index >= message.extra_images.len) return null;
-    return message.extra_images[extra_index];
+fn transcriptImageBlockHeight(message: app_state.ChatMessage, column_width: f32) f32 {
+    return transcriptImageBlockHeightFor(message.role, transcriptImageCount(message), column_width);
 }
 
-fn transcriptImageBlockHeight(message: app_state.ChatMessage, column_width: f32) f32 {
-    const count = transcriptImageCount(message);
+fn transcriptImageBlockHeightFor(role: app_state.ChatRole, count: usize, column_width: f32) f32 {
     if (count == 0) return 0.0;
-    const bubble_width = if (message.role == .user) column_width * 0.62 else column_width;
+    const bubble_width = if (role == .user) column_width * 0.62 else column_width;
     const inner_w = @max(bubble_width - theme.scaledUi(28.0), theme.scaledUi(80.0));
     const thumb_h = @max(@min(inner_w * 0.56, theme.scaledUi(220.0)), theme.scaledUi(96.0));
     const gap = theme.scaledUi(10.0);
@@ -2986,6 +3907,16 @@ fn queueRoundedShellClipped(
 }
 
 fn renderTranscriptMessage(state: *app_state.AppState, thread: *const app_state.ChatThread, column: palette.Rect, y: f32, height: f32, message: app_state.ChatMessage, clip: palette.Rect, message_index: usize) void {
+    const batch_start = transcriptBatchStart(state);
+    defer multiplyTranscriptBatchOpacity(
+        state,
+        batch_start,
+        transcriptCardEntranceOpacity(
+            message.transcript_card_started_ms,
+            unixTimestampMs(),
+            state.app_config.reduced_motion,
+        ),
+    );
     if (message.role == .system and isSlashCommandResultMessage(message.author, message.body)) {
         renderSlashCommandResultCard(state, column, y, height, message.author, message.body, clip, message_index);
         return;
@@ -3120,20 +4051,36 @@ fn renderProviderFailureActionCard(
 
 // Renders clickable attachment previews beneath a committed chat message.
 fn renderTranscriptImages(state: *app_state.AppState, column: palette.Rect, y: f32, height: f32, message: app_state.ChatMessage, clip: palette.Rect) void {
-    const count = transcriptImageCount(message);
+    renderTranscriptImagesFromParts(state, column, y, height, message.role, message.image, message.extra_images, clip);
+}
+
+fn renderTranscriptImagesFromParts(
+    state: *app_state.AppState,
+    column: palette.Rect,
+    y: f32,
+    height: f32,
+    role: app_state.ChatRole,
+    first_image: ?app_state.ChatImageAttachment,
+    extra_images: []const app_state.ChatImageAttachment,
+    clip: palette.Rect,
+) void {
+    const count = (if (first_image != null) @as(usize, 1) else 0) + extra_images.len;
     if (count == 0) return;
 
-    const bubble_width = if (message.role == .user) column.w * 0.62 else column.w;
-    const bubble_x = if (message.role == .user) column.x + column.w - bubble_width else column.x;
+    const bubble_width = if (role == .user) column.w * 0.62 else column.w;
+    const bubble_x = if (role == .user) column.x + column.w - bubble_width else column.x;
     const pad = theme.scaledUi(14.0);
     const gap = theme.scaledUi(10.0);
     const inner_w = @max(bubble_width - pad * 2.0, theme.scaledUi(80.0));
     const thumb_h = @max(@min(inner_w * 0.56, theme.scaledUi(220.0)), theme.scaledUi(96.0));
-    var image_y = y + height - transcriptImageBlockHeight(message, column.w) + gap;
+    var image_y = y + height - transcriptImageBlockHeightFor(role, count, column.w) + gap;
 
     var index: usize = 0;
     while (index < count) : (index += 1) {
-        const image = transcriptImageAt(message, index) orelse continue;
+        const image = if (first_image) |first|
+            if (index == 0) first else extra_images[index - 1]
+        else
+            extra_images[index];
         const frame = palette.Rect{
             .x = bubble_x + pad,
             .y = image_y,
@@ -5166,19 +6113,39 @@ fn renderSelectableBodyEntry(
     options: chat_markdown.RenderOptions,
     code_copy: bool,
 ) void {
-    if (transcriptBodyRenderCacheEligible(state, message_index, entry.view, code_copy) and
-        replayTranscriptBodyRenderCache(state, rect, entry, clip, options))
+    if (transcriptBodyRenderCacheEligible(state, message_index, rect, clip, entry.view, code_copy) and
+        replayTranscriptBodyRenderCache(state, rect, entry, clip, options, code_copy))
     {
         return;
     }
     renderSelectableBodyView(state, message_index, rect, entry.view, clip, options, code_copy);
 }
 
-fn transcriptBodyRenderCacheEligible(state: *app_state.AppState, message_index: usize, view: chat_markdown.BodyView, code_copy: bool) bool {
+fn transcriptBodyRenderCacheEligible(
+    state: *app_state.AppState,
+    message_index: usize,
+    rect: palette.Rect,
+    clip: palette.Rect,
+    view: chat_markdown.BodyView,
+    code_copy: bool,
+) bool {
     if (state.peekTranscriptMarkdownSelection()) |selection| {
         if (transcriptMessageIntersectsSelection(message_index, selection)) return false;
     }
-    return !code_copy or !transcriptBodyViewHasFencedCode(view);
+    if (!code_copy or !transcriptBodyViewHasFencedCode(view)) return true;
+    // Fenced-code messages replay their cached idle-style commands; only the
+    // frames where a copy button needs live styling render fresh.
+    const mx = state.transcript_controller.palette_mouse_x;
+    const my = state.transcript_controller.palette_mouse_y;
+    const hovered = state.transcript_controller.palette_mouse_in_workspace and
+        rectContains(rect, mx, my) and rectContains(clip, mx, my);
+    return !codeCopyCacheBypass(state.codeCopyRecentFeedbackActive(), hovered);
+}
+
+// Live-style frames for copy buttons: the hover highlight (mouse inside this
+// message) and the ~1.2s "Copied" check glyph both bypass the replay cache.
+fn codeCopyCacheBypass(recent_feedback: bool, hovered: bool) bool {
+    return recent_feedback or hovered;
 }
 
 fn transcriptMessageIntersectsSelection(message_index: usize, selection: app_state.TranscriptMarkdownSelection) bool {
@@ -5200,37 +6167,9 @@ fn replayTranscriptBodyRenderCache(
     entry: *app_state.TranscriptMarkdownBody,
     clip: palette.Rect,
     options: chat_markdown.RenderOptions,
+    code_copy: bool,
 ) bool {
-    const key: chat_types.TranscriptRenderCacheKey = .{
-        .width = rect.w,
-        .height = rect.h,
-        .ui_scale = theme.uiScaleFactor(),
-        .style_hash = transcriptBodyRenderStyleHash(entry.kind, options),
-    };
-
-    if (entry.render_cache_key == null or !transcriptRenderCacheKeysEqual(entry.render_cache_key.?, key)) {
-        entry.render_cache.clear();
-        entry.render_cache_frame_text.clearRetainingCapacity();
-        _ = entry.render_cache_text_arena.reset(.retain_capacity);
-
-        var context: chat_markdown.PaletteRenderContext = .{
-            .allocator = state.allocator,
-            .batch = &entry.render_cache,
-            .frame_text = &entry.render_cache_frame_text,
-            .text_arena = &entry.render_cache_text_arena,
-            .cursor = .{ .x = 0.0, .y = 0.0, .w = rect.w, .h = rect.h },
-            .available_width = rect.w,
-            .mouse_pos = .{ -1.0, -1.0 },
-            .hovered = false,
-            .clip = null,
-            .code_copy_recorder = null,
-        };
-        // Selection-aware frames bypass this cache above. Build the static
-        // commands with the shared visual layout path so an incoming stream
-        // delta does not allocate throwaway per-line selection geometry.
-        chat_markdown.renderPaletteBody(&context, entry.view, options);
-        entry.render_cache_key = key;
-    }
+    ensureTranscriptBodyRenderCache(state.allocator, entry, rect.w, rect.h, options, code_copy);
 
     state.palette_overlay_batch.appendTranslatedBatch(
         state.allocator,
@@ -5238,7 +6177,89 @@ fn replayTranscriptBodyRenderCache(
         .{ .x = rect.x, .y = rect.y },
         clip,
     ) catch return false;
+    // Re-register the cached copy buttons at their translated positions so
+    // clicks keep working on replayed frames; payloads re-enter the live
+    // frame text because hit consumers read `palette_frame_text` offsets.
+    for (entry.render_cache_copy_buttons.items) |hit| {
+        const visible = translatedCopyHitRect(hit.rect, rect.x, rect.y, clip) orelse continue;
+        const payload = entry.render_cache_frame_text.items[hit.payload_offset .. hit.payload_offset + hit.payload_len];
+        state.recordTranscriptCopyHit(visible, payload, hit.identity);
+    }
     return true;
+}
+
+// Builds (or reuses) the origin-relative cached command batch for a message
+// body. Copy buttons are cached in their idle style — hover/recent frames
+// bypass the cache via `transcriptBodyRenderCacheEligible`.
+fn ensureTranscriptBodyRenderCache(
+    allocator: std.mem.Allocator,
+    entry: *app_state.TranscriptMarkdownBody,
+    width: f32,
+    height: f32,
+    options: chat_markdown.RenderOptions,
+    code_copy: bool,
+) void {
+    const key: chat_types.TranscriptRenderCacheKey = .{
+        .width = width,
+        .height = height,
+        .ui_scale = theme.uiScaleFactor(),
+        .style_hash = transcriptBodyRenderStyleHash(entry.kind, options),
+    };
+    if (entry.render_cache_key != null and transcriptRenderCacheKeysEqual(entry.render_cache_key.?, key)) return;
+
+    entry.render_cache.clear();
+    entry.render_cache_frame_text.clearRetainingCapacity();
+    _ = entry.render_cache_text_arena.reset(.retain_capacity);
+    entry.render_cache_copy_buttons.clearRetainingCapacity();
+
+    const CacheCopyRecorder = struct {
+        allocator: std.mem.Allocator,
+        hits: *std.ArrayList(chat_markdown.CodeCopyButtonSink),
+        fn push(context: *anyopaque, hit: chat_markdown.CodeCopyButtonSink) void {
+            const recorder: *@This() = @ptrCast(@alignCast(context));
+            recorder.hits.append(recorder.allocator, hit) catch |err| {
+                log.warn("failed to retain cached code copy hit: {s}", .{@errorName(err)});
+            };
+        }
+    };
+    var copy_recorder: CacheCopyRecorder = .{ .allocator = allocator, .hits = &entry.render_cache_copy_buttons };
+
+    var context: chat_markdown.PaletteRenderContext = .{
+        .allocator = allocator,
+        .batch = &entry.render_cache,
+        .frame_text = &entry.render_cache_frame_text,
+        .text_arena = &entry.render_cache_text_arena,
+        .cursor = .{ .x = 0.0, .y = 0.0, .w = width, .h = height },
+        .available_width = width,
+        .mouse_pos = .{ -1.0, -1.0 },
+        .hovered = false,
+        .clip = null,
+        // Idle styling only: a null recent identity and offscreen mouse make
+        // the recorder capture geometry without hover/"Copied" states.
+        .code_copy_recorder = if (code_copy) .{
+            .context = @ptrCast(&copy_recorder),
+            .push_fn = CacheCopyRecorder.push,
+        } else null,
+    };
+    // Selection-aware frames bypass this cache above. Build the static
+    // commands with the shared visual layout path so an incoming stream
+    // delta does not allocate throwaway per-line selection geometry.
+    chat_markdown.renderPaletteBody(&context, entry.view, options);
+    entry.render_cache_key = key;
+}
+
+// Cached copy-button rects are origin-relative; replay translates them into
+// pane space and clips to the visible transcript region.
+fn translatedCopyHitRect(hit_rect: palette.Rect, origin_x: f32, origin_y: f32, clip: palette.Rect) ?palette.Rect {
+    const translated: palette.Rect = .{
+        .x = hit_rect.x + origin_x,
+        .y = hit_rect.y + origin_y,
+        .w = hit_rect.w,
+        .h = hit_rect.h,
+    };
+    const visible = intersectRect(translated, clip);
+    if (visible.w <= 0.0 or visible.h <= 0.0) return null;
+    return visible;
 }
 
 fn transcriptRenderCacheKeysEqual(a: chat_types.TranscriptRenderCacheKey, b: chat_types.TranscriptRenderCacheKey) bool {
@@ -5281,7 +6302,7 @@ test "transcript render cache key ignores pane translation and viewport clipping
     try std.testing.expect(!transcriptRenderCacheKeysEqual(base, moved));
 }
 
-test "transcript render cache excludes fenced code copy controls" {
+test "transcript render cache detects fenced code and live-style bypass frames" {
     var prose = try chat_markdown.buildBodyView(std.testing.allocator, "A paragraph with **formatting**.");
     defer prose.deinit(std.testing.allocator);
     try std.testing.expect(!transcriptBodyViewHasFencedCode(prose));
@@ -5289,6 +6310,63 @@ test "transcript render cache excludes fenced code copy controls" {
     var code = try chat_markdown.buildBodyView(std.testing.allocator, "```zig\nconst value = 1;\n```");
     defer code.deinit(std.testing.allocator);
     try std.testing.expect(transcriptBodyViewHasFencedCode(code));
+
+    // Fenced-code messages replay from cache except on hover / "Copied" frames.
+    try std.testing.expect(!codeCopyCacheBypass(false, false));
+    try std.testing.expect(codeCopyCacheBypass(true, false));
+    try std.testing.expect(codeCopyCacheBypass(false, true));
+}
+
+test "transcript render cache caches fenced code copy buttons for replay" {
+    const allocator = std.testing.allocator;
+    const body = "```zig\nconst value = 1;\n```";
+    var entry: app_state.TranscriptMarkdownBody = .{
+        .owned_body = try allocator.dupe(u8, body),
+        .kind = .markdown,
+        .view = try chat_markdown.buildBodyView(allocator, body),
+        .render_cache = .{},
+        .render_cache_frame_text = .empty,
+        .render_cache_text_arena = std.heap.ArenaAllocator.init(allocator),
+    };
+    defer {
+        entry.render_cache.deinit(allocator);
+        entry.render_cache_frame_text.deinit(allocator);
+        entry.render_cache_text_arena.deinit();
+        entry.render_cache_copy_buttons.deinit(allocator);
+        entry.view.deinit(allocator);
+        allocator.free(entry.owned_body);
+    }
+
+    ensureTranscriptBodyRenderCache(allocator, &entry, 640.0, 220.0, transcriptMarkdownOptions(), true);
+    try std.testing.expect(entry.render_cache_key != null);
+    try std.testing.expectEqual(@as(usize, 1), entry.render_cache_copy_buttons.items.len);
+    const hit = entry.render_cache_copy_buttons.items[0];
+    // The cached payload is the code block's source text.
+    try std.testing.expectEqualStrings(
+        "const value = 1;",
+        entry.render_cache_frame_text.items[hit.payload_offset .. hit.payload_offset + hit.payload_len],
+    );
+
+    // Cache hit: identical geometry does not rebuild or duplicate hits.
+    const key_before = entry.render_cache_key.?;
+    ensureTranscriptBodyRenderCache(allocator, &entry, 640.0, 220.0, transcriptMarkdownOptions(), true);
+    try std.testing.expectEqual(@as(usize, 1), entry.render_cache_copy_buttons.items.len);
+    try std.testing.expect(transcriptRenderCacheKeysEqual(key_before, entry.render_cache_key.?));
+
+    // Cache miss: a width change rebuilds and re-records exactly one hit.
+    ensureTranscriptBodyRenderCache(allocator, &entry, 512.0, 220.0, transcriptMarkdownOptions(), true);
+    try std.testing.expect(!transcriptRenderCacheKeysEqual(key_before, entry.render_cache_key.?));
+    try std.testing.expectEqual(@as(usize, 1), entry.render_cache_copy_buttons.items.len);
+}
+
+test "replayed copy-button hit rects translate with the message and clip away" {
+    const hit_rect: palette.Rect = .{ .x = 500.0, .y = 4.0, .w = 24.0, .h = 24.0 };
+    const clip: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = 800.0, .h = 600.0 };
+    const visible = translatedCopyHitRect(hit_rect, 100.0, 200.0, clip) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(f32, 600.0), visible.x);
+    try std.testing.expectEqual(@as(f32, 204.0), visible.y);
+    // A message scrolled out of the viewport registers no hit.
+    try std.testing.expect(translatedCopyHitRect(hit_rect, 100.0, 700.0, clip) == null);
 }
 
 test "transcript render cache only invalidates selected messages" {
@@ -6052,6 +7130,7 @@ fn pendingFollowupPinLabel(
         .queue => "Queued \u{00B7} sends after this reply",
         .steer => switch (provider) {
             .codex => "Steering \u{00B7} waiting for Codex to accept",
+            .claude => "Steering \u{00B7} waiting for Claude to accept",
             else => "Steering current turn",
         },
     };
@@ -6059,7 +7138,7 @@ fn pendingFollowupPinLabel(
 
 /// Renders the pinned follow-up card above the composer. Mirrors the AMP TUI:
 /// the queued/steered prompt stays pinned ("waiting to send") for every provider
-/// until it is dispatched as the next turn (or accepted inline by Codex, which
+/// until it is dispatched as the next turn (or accepted inline by the provider, which
 /// removes the pin and shows it in the transcript instead). Reuses the amber tint
 /// of the transcript steering bubble (`COLOR_YELLOW`) for visual continuity.
 fn renderPendingFollowupPin(
@@ -6241,6 +7320,73 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
             .h = icon_size,
         }), icon_color);
     }
+
+    renderComposerShortcutHints(state, model_rect, state.composer_controller.composer.reasoningRect());
+}
+
+// Hover help and held-Alt key tips for the composer toolbar selectors.
+fn renderComposerShortcutHints(state: *app_state.AppState, model_rect: palette.Rect, run_rect: palette.Rect) void {
+    const config = state.command_controller.keyboard_config orelse return;
+    if (state.alt_shortcut_hints_visible) {
+        var model_buf: [16]u8 = undefined;
+        var run_buf: [16]u8 = undefined;
+        renderShortcutKeyTip(state, model_rect, keybinds.formatAltKeyTip(&model_buf, config.chat_model_picker));
+        if (state.composer_controller.composer.showReasoningToggle()) {
+            renderShortcutKeyTip(state, run_rect, keybinds.formatAltKeyTip(&run_buf, config.chat_run_config));
+        }
+        return;
+    }
+    if (state.composer_controller.model_picker.isOpen() or state.composer_controller.run_config_open) return;
+    const point: palette.draw.Vec2 = .{
+        .x = state.transcript_controller.palette_mouse_x,
+        .y = state.transcript_controller.palette_mouse_y,
+    };
+    var shortcut_buf: [32]u8 = undefined;
+    if (model_rect.contains(point)) {
+        renderComposerSelectorTooltip(state, model_rect, "Choose model", keybinds.formatFirstKeybind(&shortcut_buf, config.chat_model_picker));
+    } else if (state.composer_controller.composer.showReasoningToggle() and run_rect.contains(point)) {
+        renderComposerSelectorTooltip(state, run_rect, "Run settings", keybinds.formatFirstKeybind(&shortcut_buf, config.chat_run_config));
+    }
+}
+
+fn renderShortcutKeyTip(state: *app_state.AppState, target: palette.Rect, label: []const u8) void {
+    if (label.len == 0) return;
+    const size = theme.scaledUi(15.0);
+    const inset = theme.scaledUi(4.0);
+    const rect: palette.Rect = .{
+        .x = target.x + target.w - size - inset,
+        .y = target.y - size - theme.scaledUi(3.0),
+        .w = size,
+        .h = size,
+    };
+    queuePanel(state, rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.borderMuted()), theme.scaledUi(3.5), theme.scaledUi(0.75));
+    const font_size = theme.scaledUi(9.5);
+    const text_w = app_state.paletteUiTextPrefixWidth(label, font_size, label.len);
+    queueText(state, .{
+        .x = rect.x + @max((rect.w - text_w) * 0.5, 0.0),
+        .y = rect.y + (rect.h - font_size * 1.25) * 0.5,
+        .w = @min(text_w, rect.w),
+        .h = font_size * 1.25,
+    }, label, paletteColor(theme.accent()), font_size, rect);
+}
+
+fn renderComposerSelectorTooltip(state: *app_state.AppState, target: palette.Rect, title: []const u8, shortcut: []const u8) void {
+    var label_buf: [96]u8 = undefined;
+    const label = if (shortcut.len > 0)
+        std.fmt.bufPrint(&label_buf, "{s}  {s}", .{ title, shortcut }) catch title
+    else
+        title;
+    const font_size = theme.scaledUi(11.0);
+    const text_w = app_state.paletteUiTextPrefixWidth(label, font_size, label.len);
+    const pad_x = theme.scaledUi(7.0);
+    const rect: palette.Rect = .{
+        .x = target.x + @max((target.w - text_w - pad_x * 2.0) * 0.5, 0.0),
+        .y = target.y - theme.scaledUi(28.0),
+        .w = text_w + pad_x * 2.0,
+        .h = theme.scaledUi(22.0),
+    };
+    queuePanel(state, rect, paletteColor(theme.COLOR_PANEL_ALT), paletteColor(theme.borderMuted()), theme.scaledUi(5.0), theme.scaledUi(0.75));
+    queueText(state, .{ .x = rect.x + pad_x, .y = rect.y + (rect.h - font_size * 1.25) * 0.5, .w = text_w, .h = font_size * 1.25 }, label, paletteColor(theme.COLOR_TEXT_MUTED), font_size, rect);
 }
 
 // Nerd Font Symbols glyphs used for composer-toolbar icons. Rendering them
@@ -6405,9 +7551,44 @@ fn queueCenteredChromeLabel(
     font_size: f32,
     clip: ?palette.Rect,
 ) void {
-    const label_w = text_measure.textWidth(.ui, font_size, value);
+    const label_w = chromeLabelWidth(font_size, value);
     const label_h = font_size * 1.4;
     queueChromeLabel(state, centeredLabelRect(rect, label_w, label_h), value, color, font_size, clip);
+}
+
+// Chrome labels repeat the same short strings across frames, but measuring
+// each queue hits the renderer's shaping path. A small direct-mapped memo
+// keyed on (text, font size, font generation) turns the steady-state cost
+// into a hash lookup; entries fall out naturally by slot reuse.
+const CHROME_LABEL_WIDTH_CACHE_LEN: usize = 256;
+const ChromeLabelWidthEntry = struct {
+    text_hash: u64 = 0,
+    font_size: f32 = 0.0,
+    font_generation: u32 = 0,
+    width: f32 = -1.0,
+};
+var chrome_label_width_cache: [CHROME_LABEL_WIDTH_CACHE_LEN]ChromeLabelWidthEntry = @splat(.{});
+
+fn chromeLabelWidth(font_size: f32, value: []const u8) f32 {
+    const text_hash = std.hash.Wyhash.hash(0x3C6E_F372_FE94_F82A, value);
+    const generation = text_measure.fontGeneration();
+    const slot = &chrome_label_width_cache[@as(usize, @intCast(text_hash % CHROME_LABEL_WIDTH_CACHE_LEN))];
+    if (slot.width >= 0.0 and slot.text_hash == text_hash and slot.font_size == font_size and slot.font_generation == generation) {
+        return slot.width;
+    }
+    const width = text_measure.textWidth(.ui, font_size, value);
+    slot.* = .{ .text_hash = text_hash, .font_size = font_size, .font_generation = generation, .width = width };
+    return width;
+}
+
+test "chrome label width memo returns stable widths per text and font size" {
+    const first = chromeLabelWidth(12.0, "Working \u{00B7} 0:42");
+    const again = chromeLabelWidth(12.0, "Working \u{00B7} 0:42");
+    try std.testing.expectEqual(first, again);
+    // A different font size measures independently rather than serving the
+    // cached width for the same text.
+    const larger = chromeLabelWidth(16.0, "Working \u{00B7} 0:42");
+    try std.testing.expect(larger > first);
 }
 
 fn centeredLabelRect(container: palette.Rect, label_w: f32, label_h: f32) palette.Rect {

@@ -56,6 +56,9 @@ pub const RichPickerConfig = struct {
     header_row_height: f32 = 26.0,
     /// Rows beyond this scroll inside the popover body.
     max_body_height: f32 = 340.0,
+    /// Optional stable scroll viewport height. When set, filtering changes the
+    /// rows inside the body without resizing the popover around the pointer.
+    fixed_body_height: ?f32 = null,
     padding_x: f32 = 8.0,
     padding_y: f32 = 8.0,
     row_padding_x: f32 = 10.0,
@@ -260,6 +263,10 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
         /// a copy so the filter survives item-index churn across refreshes.
         active_group_label: std.ArrayList(u8) = .empty,
         hovered_rail: ?usize = null,
+        /// Keyboard focus within the rail. Null keeps arrow navigation in the
+        /// model rows; otherwise the value is the rail entry index (including
+        /// the leading "all groups" entry at zero).
+        focused_rail: ?usize = null,
         search: SearchInput = .{},
         highlighted: ?usize = null,
         selected_item: ?usize = null,
@@ -430,6 +437,7 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
                 .key => |key| return try self.handleKey(allocator, key),
                 .text => |value| {
                     if (!self.open or !self.searchActive()) return false;
+                    self.focused_rail = null;
                     self.search.focused = true;
                     _ = try self.search.handleInput(allocator, .{ .text = value });
                     try self.refilterIfQueryChanged(allocator);
@@ -517,7 +525,10 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             const width = self.scaled(config.width) + self.railWidth();
             const pad_y = self.scaled(config.padding_y);
             const search_h = if (self.searchActive()) self.scaled(config.search_height) + self.scaled(config.search_gap) else 0.0;
-            var body_h = @max(@min(self.contentHeight(), self.scaled(config.max_body_height)), self.scaled(config.row_height));
+            var body_h = if (config.fixed_body_height) |fixed_height|
+                @max(self.scaled(fixed_height), self.scaled(config.row_height))
+            else
+                @max(@min(self.contentHeight(), self.scaled(config.max_body_height)), self.scaled(config.row_height));
             if (self.viewport_rect) |viewport| {
                 // Shrink the scrollable body rather than letting the popover
                 // overflow the viewport (e.g. cover the composer on short
@@ -887,6 +898,7 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             self.rows_dirty = true;
             try self.ensureRows(allocator);
             self.scroll_y = 0.0;
+            self.focused_rail = null;
             self.search.focused = true;
             self.highlighted = blk: {
                 if (self.selected_item) |item| {
@@ -919,6 +931,7 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             self.open = false;
             self.dragging_scrollbar = false;
             self.hovered_rail = null;
+            self.focused_rail = null;
             self.search.focused = false;
             self.clearSearch(allocator) catch {};
             self.emit(.{ .open_changed = false });
@@ -940,6 +953,27 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
         fn handleKey(self: *Component, allocator: std.mem.Allocator, key: Key) !bool {
             if (!self.open) return false;
             try self.ensureRows(allocator);
+            if (self.focused_rail) |rail_index| {
+                switch (key.code) {
+                    .up, .down => {
+                        const entry_count = self.groups.items.len + 1;
+                        const next = if (key.code == .up)
+                            rail_index -| 1
+                        else
+                            @min(rail_index + 1, entry_count - 1);
+                        self.focused_rail = next;
+                        try self.setRailGroup(allocator, if (next == 0) null else next - 1);
+                        return true;
+                    },
+                    .right => {
+                        self.focused_rail = null;
+                        self.search.focused = true;
+                        return true;
+                    },
+                    .left => return true,
+                    else => {},
+                }
+            }
             switch (key.code) {
                 .escape => {
                     // First Escape clears an active query, second closes.
@@ -959,6 +993,16 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
                 },
                 .up => {
                     self.moveHighlight(-1);
+                    return true;
+                },
+                .left => {
+                    if (!self.railActive() or self.last_query.items.len > 0) {
+                        if (!self.searchActive()) return false;
+                        self.search.focused = true;
+                        return try self.search.handleInput(allocator, .{ .key = key });
+                    }
+                    self.focused_rail = self.railIndexForHighlight();
+                    self.search.focused = false;
                     return true;
                 },
                 .page_down => {
@@ -994,6 +1038,22 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             return rows_per_page;
         }
 
+        fn railIndexForHighlight(self: *const Component) usize {
+            if (self.highlighted) |row_index| {
+                if (row_index < self.rows.items.len) {
+                    const item = self.rows.items[row_index].item;
+                    const group = itemText(config.item_group, self.callbacks.context, item);
+                    for (self.groups.items, 0..) |first_item, group_index| {
+                        if (std.mem.eql(u8, itemText(config.item_group, self.callbacks.context, first_item), group)) {
+                            return group_index + 1;
+                        }
+                    }
+                }
+            }
+            if (self.activeGroupIndex()) |group_index| return group_index + 1;
+            return 0;
+        }
+
         fn moveHighlight(self: *Component, delta: i32) void {
             if (self.rows.items.len == 0) return;
             const count = @as(i32, @intCast(self.rows.items.len));
@@ -1025,6 +1085,7 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             if (!self.open) return false;
             try self.ensureRows(allocator);
             if (self.railItemAtPoint(point)) |rail_index| {
+                self.focused_rail = null;
                 try self.setRailGroup(allocator, if (rail_index == 0) null else rail_index - 1);
                 return true;
             }
@@ -1135,7 +1196,7 @@ pub fn RichPicker(comptime config: RichPickerConfig) type {
             while (index < self.groups.items.len + 1) : (index += 1) {
                 const item_rect = self.railItemRect(index);
                 const is_active = if (index == 0) active == null else active != null and active.? == index - 1;
-                if (self.hovered_rail == index and !is_active) {
+                if (self.focused_rail == index or (self.hovered_rail == index and !is_active)) {
                     const pad = self.scaled(4.0);
                     try batch.roundedRectClipped(allocator, .{
                         .x = item_rect.x + pad,
@@ -1476,6 +1537,7 @@ const RailTestPicker = RichPicker(.{
     .row_height = 20,
     .row_height_with_description = 34,
     .max_body_height = 400,
+    .fixed_body_height = 180,
     .search_enabled = true,
     .search_min_items = 3,
     .item_label = TestContext.label,
@@ -1600,6 +1662,7 @@ test "rich picker rail filters by group without headers" {
     // Rail mode renders no header rows even though every item has a group.
     try std.testing.expectEqual(@as(usize, TestContext.labels.len), picker.rows.items.len);
     try std.testing.expectEqual(@as(usize, 3), picker.groups.items.len);
+    const picker_height = picker.pickerRect().h;
 
     // Rail entry 0 is "All"; entry 2 is the second group ("Claude").
     _ = try picker.handleInput(std.testing.allocator, .{ .mouse_down = .{ .point = railItemCenter(&picker, 2) } });
@@ -1607,9 +1670,35 @@ test "rich picker rail filters by group without headers" {
     try std.testing.expectEqual(@as(usize, 2), picker.rows.items.len);
     try std.testing.expectEqual(@as(usize, 2), picker.rows.items[0].item);
     try std.testing.expectEqual(@as(usize, 3), picker.rows.items[1].item);
+    try std.testing.expectEqual(picker_height, picker.pickerRect().h);
 
     _ = try picker.handleInput(std.testing.allocator, .{ .mouse_down = .{ .point = railItemCenter(&picker, 0) } });
     try std.testing.expectEqual(@as(usize, TestContext.labels.len), picker.rows.items.len);
+}
+
+test "rich picker arrows move between model rows and provider rail" {
+    var context: TestContext = .{};
+    var picker = try openedPickerOf(RailTestPicker, &context);
+    defer picker.deinit(std.testing.allocator);
+
+    // Left enters the rail at the provider of the highlighted model.
+    _ = try picker.handleInput(std.testing.allocator, .{ .key = .{ .code = .left } });
+    try std.testing.expectEqual(@as(?usize, 1), picker.focused_rail);
+    try std.testing.expect(!picker.search.focused);
+
+    // Vertical movement chooses and filters to the adjacent provider.
+    _ = try picker.handleInput(std.testing.allocator, .{ .key = .{ .code = .down } });
+    try std.testing.expectEqual(@as(?usize, 2), picker.focused_rail);
+    try std.testing.expectEqual(@as(usize, 2), picker.rows.items.len);
+    try std.testing.expectEqual(@as(usize, 2), picker.rows.items[0].item);
+
+    // Right returns focus to the model list, where vertical navigation works
+    // as before.
+    _ = try picker.handleInput(std.testing.allocator, .{ .key = .{ .code = .right } });
+    try std.testing.expectEqual(@as(?usize, null), picker.focused_rail);
+    try std.testing.expect(picker.search.focused);
+    _ = try picker.handleInput(std.testing.allocator, .{ .key = .{ .code = .down } });
+    try std.testing.expectEqual(@as(?usize, 1), picker.highlighted);
 }
 
 test "rich picker shortcut ordinal selects within the rail filter" {

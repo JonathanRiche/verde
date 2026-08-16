@@ -143,6 +143,59 @@ pub fn build(b: *std.Build) void {
     });
     const test_compile_step = b.step("test-compile", "Compile desktop tests without running them");
     test_compile_step.dependOn(&test_compile_cmd.step);
+
+    // Focused hermetic gate for packages/headless (std only; no desktop GUI deps).
+    // Runs the standalone package build rather than the desktop graph so the
+    // step stays free of SDL/Palette/Ghostty even when those deps are broken.
+    var headless_argv: std.ArrayList([]const u8) = .empty;
+    defer headless_argv.deinit(b.allocator);
+    headless_argv.appendSlice(b.allocator, &.{ "zig", "build", "headless-test" }) catch @panic("OOM");
+    if (test_optimize != .Debug) {
+        headless_argv.append(b.allocator, b.fmt("-Doptimize={s}", .{@tagName(test_optimize)})) catch @panic("OOM");
+    }
+    if (target) |value| {
+        headless_argv.append(b.allocator, b.fmt("-Dtarget={s}", .{value})) catch @panic("OOM");
+    }
+    const headless_test_cmd = b.addSystemCommand(headless_argv.items);
+    headless_test_cmd.setCwd(b.path("packages/headless"));
+    const headless_test_step = b.step("headless-test", "Run headless package unit tests from the repo root");
+    headless_test_step.dependOn(&headless_test_cmd.step);
+
+    // Optional web client gateway. Not on the default desktop install path.
+    const web_app_cmd = b.addSystemCommand(&.{ "zig", "build" });
+    web_app_cmd.setCwd(b.path("packages/web_app"));
+    const web_app_step = b.step("web-app", "Build the Verde web gateway (packages/web_app)");
+    web_app_step.dependOn(&web_app_cmd.step);
+
+    // Hermetic headless client ↔ forked session-daemon integration (desktop graph).
+    const headless_daemon_it_cmd = addDesktopCommand(b, test_optimize, .{
+        .subcommand = "headless-daemon-it",
+        .forward_runtime_args = false,
+        .target = target,
+        .version = version,
+        .ui_debug = ui_debug,
+        .palette_renderer = palette_renderer,
+        .browser_backend = browser_backend,
+        .terminal_backend = terminal_backend,
+        .local_ipc = local_ipc,
+        .windows_integrations = windows_integrations,
+        .build_fff = build_fff,
+        .fff_cargo_target = fff_cargo_target,
+        .fff_lib_dir = fff_lib_dir,
+        .fff_import_lib = fff_import_lib,
+        .fff_runtime_lib = fff_runtime_lib,
+        .sdl3_include_dir = sdl3_include_dir,
+        .sdl3_lib_dir = sdl3_lib_dir,
+        .sdl3_runtime_lib = sdl3_runtime_lib,
+        .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
+        .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
+        .sdl3_ttf_runtime_lib = sdl3_ttf_runtime_lib,
+        .webview2_include_dir = webview2_include_dir,
+        .webview2_loader_lib = webview2_loader_lib,
+        .webview2_loader_dll = webview2_loader_dll,
+    });
+    const headless_daemon_it_step = b.step("headless-daemon-it", "Hermetic headless client/session-daemon integration test");
+    headless_daemon_it_step.dependOn(&headless_daemon_it_cmd.step);
 }
 
 const DesktopCommandOptions = struct {

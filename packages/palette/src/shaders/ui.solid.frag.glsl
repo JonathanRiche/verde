@@ -33,14 +33,14 @@ void main() {
     float border_w = in_sdf_radius_border.y;
     float dist = sdfRoundedRect(p, half_size, radius);
 
-    // Pixel-coverage AA: smoothstep over a 1-px band straddling the geometric
-    // edge. `fwidth` would give per-fragment derivative width but the UI is
-    // rendered 1:1 (no NDC zoom) so a fixed 1-px band matches framebuffer
-    // pixels exactly and avoids the noise fwidth introduces at glancing
-    // angles.
+    // Blend across 1.5 framebuffer pixels. A single-pixel transition leaves
+    // thin, high-contrast rounded borders visibly stair-stepped at small radii.
+    // The slightly wider coverage ramp smooths corners without moving the
+    // geometric edge or changing the requested border width.
+    const float aa_radius = 0.75;
     if (border_w > 0.0 && in_sdf_border.a > 0.0) {
-        float outer_alpha = 1.0 - smoothstep(-0.5, 0.5, dist);
-        float inner_alpha = 1.0 - smoothstep(-0.5, 0.5, dist + border_w);
+        float outer_alpha = 1.0 - smoothstep(-aa_radius, aa_radius, dist);
+        float inner_alpha = 1.0 - smoothstep(-aa_radius, aa_radius, dist + border_w);
         float border_alpha = max(outer_alpha - inner_alpha, 0.0);
         float fill_alpha = inner_alpha;
 
@@ -51,7 +51,7 @@ void main() {
         float a = b_a + fill.a * (1.0 - b_a);
         out_color = vec4(rgb, a);
     } else {
-        float alpha = 1.0 - smoothstep(-0.5, 0.5, dist);
+        float alpha = 1.0 - smoothstep(-aa_radius, aa_radius, dist);
         out_color = vec4(in_color.rgb, in_color.a * alpha);
     }
 }

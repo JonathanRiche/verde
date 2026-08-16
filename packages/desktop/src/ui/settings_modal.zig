@@ -19,6 +19,7 @@ pub const Control = enum(u8) {
     workspace_pane_gap_inc,
     workspace_panes_per_view_dec,
     workspace_panes_per_view_inc,
+    workspace_unzoom_on_navigation,
     workspace_scroll_use_global,
     workspace_scroll_override,
     workspace_scroll_mode_automatic,
@@ -29,6 +30,7 @@ pub const Control = enum(u8) {
     workspace_scroll_horizontal,
     workspace_scroll_vertical,
     theme_dropdown,
+    reduced_motion,
     companion_character_dropdown,
     tool_groups_collapsed,
     tool_groups_expanded,
@@ -48,12 +50,13 @@ pub const Control = enum(u8) {
     file_links_neovim_pane,
     links_verde_browser,
     links_system_browser,
-    browser_fast_scrolling,
+    browser_scroll_speed,
     companion_toggle,
     mcp_tools,
     hooks_claude,
     hooks_codex,
     hooks_cursor,
+    hooks_opencode,
     hooks_grok,
     hooks_amp,
     updates_check,
@@ -141,6 +144,8 @@ const SettingsLayout = struct {
     companion_character_dropdown: palette.Rect,
     ui_font_dec: palette.Rect,
     ui_font_inc: palette.Rect,
+    reduced_motion: palette.Rect,
+    reduced_motion_hint_y: f32,
     transcript_card: palette.Rect,
     tool_groups_collapsed: palette.Rect,
     tool_groups_expanded: palette.Rect,
@@ -159,7 +164,7 @@ const SettingsLayout = struct {
     links_verde_browser: palette.Rect,
     links_system_browser: palette.Rect,
     browser_card: palette.Rect,
-    browser_fast_scrolling: palette.Rect,
+    browser_scroll_speed: palette.Rect,
     browser_hint_y: f32,
     experimental_card: palette.Rect,
     companion_toggle: palette.Rect,
@@ -171,6 +176,8 @@ const SettingsLayout = struct {
     new_chat_replace_pane: palette.Rect,
     file_links_neovim_pane: palette.Rect,
     file_links_hint_y: f32,
+    workspace_unzoom_on_navigation: palette.Rect,
+    workspace_unzoom_on_navigation_hint_y: f32,
     workspace_pane_gap_dec: palette.Rect,
     workspace_pane_gap_inc: palette.Rect,
     workspace_pane_gap_hint_y: f32,
@@ -197,6 +204,7 @@ const SettingsLayout = struct {
     hooks_claude: palette.Rect,
     hooks_codex: palette.Rect,
     hooks_cursor: palette.Rect,
+    hooks_opencode: palette.Rect,
     hooks_grok: palette.Rect,
     hooks_amp: palette.Rect,
     integrations_hint_y: f32,
@@ -306,11 +314,11 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const open_grid_h = @as(f32, @floatFromInt(open_rows)) * m.row_h + @as(f32, @floatFromInt(open_rows - 1)) * m.inner_gap;
     const custom_extra: f32 = if (state.settings_controller.draft.open_action == .custom) m.row_h + m.inner_gap else 0.0;
 
-    // Theme dropdown, Default companion dropdown, then UI font stepper.
+    // Theme dropdown, Default companion dropdown, UI font stepper, then motion.
     const appearance_h = m.card_pad * 2.0 + m.title_h + m.row_gap +
         m.label_h + m.inner_gap + m.row_h + m.row_gap +
         m.label_h + m.inner_gap + m.row_h + m.row_gap +
-        m.row_h;
+        m.row_h + m.row_gap + m.row_h + m.inner_gap + m.label_h;
     const transcript_h = m.card_pad * 2.0 + m.title_h + m.row_gap +
         m.label_h + m.inner_gap + m.row_h + m.row_gap +
         m.label_h + m.inner_gap + m.row_h;
@@ -321,6 +329,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra +
         m.row_gap + m.label_h + m.inner_gap + m.row_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h +
+        m.row_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.row_h + m.inner_gap + m.label_h +
@@ -328,7 +337,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         m.row_gap + m.row_h + m.inner_gap + m.label_h +
         m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     // MCP controls and status, followed by the provider status-hook controls.
-    const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap * 2.0 + m.label_h * 4.0 + m.row_h * 6.0 + m.inner_gap * 8.0;
+    const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap * 2.0 + m.label_h * 4.0 + m.row_h * 7.0 + m.inner_gap * 9.0;
     // Same shape as the integrations card: title, field label, one toggle row, hint.
     const notifications_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     // The modal width depends only on the window, so the notes block can be
@@ -398,6 +407,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     };
     const ui_font_y = companion_row_y + m.row_h + m.row_gap;
     const ui_stepper = stepperRects(appearance_card, m.card_pad, ui_font_y, m);
+    const reduced_motion_y = ui_font_y + m.row_h + m.row_gap;
+    const reduced_motion: palette.Rect = .{ .x = theme_x, .y = reduced_motion_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
+    const reduced_motion_hint_y = reduced_motion_y + m.row_h + m.inner_gap;
 
     y += appearance_h + m.card_gap;
 
@@ -451,9 +463,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     y += terminal_h + m.card_gap;
 
     const browser_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = browser_h };
-    const browser_fast_scrolling_y = browser_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
-    const browser_fast_scrolling: palette.Rect = .{ .x = browser_card.x + m.card_pad, .y = browser_fast_scrolling_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
-    const browser_hint_y = browser_fast_scrolling_y + m.row_h + m.inner_gap;
+    const browser_scroll_speed_y = browser_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
+    const browser_scroll_speed: palette.Rect = .{ .x = browser_card.x + m.card_pad, .y = browser_scroll_speed_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
+    const browser_hint_y = browser_scroll_speed_y + m.row_h + m.inner_gap;
 
     y += browser_h + m.card_gap;
 
@@ -498,7 +510,10 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const file_links_y = file_links_label_y + m.label_h + m.inner_gap;
     const file_links_neovim_pane: palette.Rect = .{ .x = open_x, .y = file_links_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const file_links_hint_y = file_links_y + m.row_h + m.inner_gap;
-    const workspace_scroll_scope_label_y = file_links_hint_y + m.label_h + m.row_gap;
+    const workspace_unzoom_on_navigation_y = file_links_hint_y + m.label_h + m.row_gap;
+    const workspace_unzoom_on_navigation: palette.Rect = .{ .x = open_x, .y = workspace_unzoom_on_navigation_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
+    const workspace_unzoom_on_navigation_hint_y = workspace_unzoom_on_navigation_y + m.row_h + m.inner_gap;
+    const workspace_scroll_scope_label_y = workspace_unzoom_on_navigation_hint_y + m.label_h + m.row_gap;
     const workspace_scroll_scope_y = workspace_scroll_scope_label_y + m.label_h + m.inner_gap;
     const workspace_scroll_scope_w = (content_w - m.card_pad * 2.0) * 0.5;
     const workspace_scroll_use_global: palette.Rect = .{ .x = open_x, .y = workspace_scroll_scope_y, .w = workspace_scroll_scope_w, .h = m.row_h };
@@ -540,7 +555,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const hooks_codex: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_codex_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const hooks_cursor_y = hooks_codex_y + m.row_h + m.inner_gap;
     const hooks_cursor: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_cursor_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
-    const hooks_grok_y = hooks_cursor_y + m.row_h + m.inner_gap;
+    const hooks_opencode_y = hooks_cursor_y + m.row_h + m.inner_gap;
+    const hooks_opencode: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_opencode_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
+    const hooks_grok_y = hooks_opencode_y + m.row_h + m.inner_gap;
     const hooks_grok: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_grok_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const hooks_amp_y = hooks_grok_y + m.row_h + m.inner_gap;
     const hooks_amp: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_amp_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
@@ -596,6 +613,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .companion_character_dropdown = companion_character_dropdown,
         .ui_font_dec = ui_stepper.dec,
         .ui_font_inc = ui_stepper.inc,
+        .reduced_motion = reduced_motion,
+        .reduced_motion_hint_y = reduced_motion_hint_y,
         .transcript_card = transcript_card,
         .tool_groups_collapsed = tool_groups_collapsed,
         .tool_groups_expanded = tool_groups_expanded,
@@ -614,7 +633,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .links_verde_browser = links_verde_browser,
         .links_system_browser = links_system_browser,
         .browser_card = browser_card,
-        .browser_fast_scrolling = browser_fast_scrolling,
+        .browser_scroll_speed = browser_scroll_speed,
         .browser_hint_y = browser_hint_y,
         .experimental_card = experimental_card,
         .companion_toggle = companion_toggle,
@@ -626,6 +645,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .new_chat_replace_pane = new_chat_replace_pane,
         .file_links_neovim_pane = file_links_neovim_pane,
         .file_links_hint_y = file_links_hint_y,
+        .workspace_unzoom_on_navigation = workspace_unzoom_on_navigation,
+        .workspace_unzoom_on_navigation_hint_y = workspace_unzoom_on_navigation_hint_y,
         .workspace_pane_gap_dec = workspace_pane_gap_stepper.dec,
         .workspace_pane_gap_inc = workspace_pane_gap_stepper.inc,
         .workspace_pane_gap_hint_y = workspace_pane_gap_hint_y,
@@ -652,6 +673,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .hooks_claude = hooks_claude,
         .hooks_codex = hooks_codex,
         .hooks_cursor = hooks_cursor,
+        .hooks_opencode = hooks_opencode,
         .hooks_grok = hooks_grok,
         .hooks_amp = hooks_amp,
         .integrations_hint_y = integrations_hint_y,
@@ -851,6 +873,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.companion_character_dropdown, layout.body_clip, .companion_character_dropdown, queue_hit);
     queueControlHit(state, layout.ui_font_dec, layout.body_clip, .ui_font_dec, queue_hit);
     queueControlHit(state, layout.ui_font_inc, layout.body_clip, .ui_font_inc, queue_hit);
+    queueControlHit(state, layout.reduced_motion, layout.body_clip, .reduced_motion, queue_hit);
     queueControlHit(state, layout.tool_groups_collapsed, layout.body_clip, .tool_groups_collapsed, queue_hit);
     queueControlHit(state, layout.tool_groups_expanded, layout.body_clip, .tool_groups_expanded, queue_hit);
     queueControlHit(state, layout.tool_groups_remember_last, layout.body_clip, .tool_groups_remember_last, queue_hit);
@@ -863,7 +886,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.terminal_font_inc, layout.body_clip, .terminal_font_inc, queue_hit);
     queueControlHit(state, layout.links_verde_browser, layout.body_clip, .links_verde_browser, queue_hit);
     queueControlHit(state, layout.links_system_browser, layout.body_clip, .links_system_browser, queue_hit);
-    queueControlHit(state, layout.browser_fast_scrolling, layout.body_clip, .browser_fast_scrolling, queue_hit);
+    queueControlHit(state, browserScrollSliderHitRect(layout.browser_scroll_speed), layout.body_clip, .browser_scroll_speed, queue_hit);
     queueControlHit(state, layout.companion_toggle, layout.body_clip, .companion_toggle, queue_hit);
     for (OPEN_CHOICES, 0..) |choice, index| {
         queueControlHit(state, layout.open_cells[index], layout.body_clip, choice.control, queue_hit);
@@ -871,6 +894,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.new_chat_new_pane, layout.body_clip, .new_chat_new_pane, queue_hit);
     queueControlHit(state, layout.new_chat_replace_pane, layout.body_clip, .new_chat_replace_pane, queue_hit);
     queueControlHit(state, layout.file_links_neovim_pane, layout.body_clip, .file_links_neovim_pane, queue_hit);
+    queueControlHit(state, layout.workspace_unzoom_on_navigation, layout.body_clip, .workspace_unzoom_on_navigation, queue_hit);
     queueControlHit(state, layout.workspace_scroll_use_global, layout.body_clip, .workspace_scroll_use_global, queue_hit);
     queueControlHit(state, layout.workspace_scroll_override, layout.body_clip, .workspace_scroll_override, queue_hit);
     queueControlHit(state, layout.workspace_scroll_mode_automatic, layout.body_clip, .workspace_scroll_mode_automatic, queue_hit);
@@ -888,6 +912,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.hooks_claude, layout.body_clip, .hooks_claude, queue_hit);
     queueControlHit(state, layout.hooks_codex, layout.body_clip, .hooks_codex, queue_hit);
     queueControlHit(state, layout.hooks_cursor, layout.body_clip, .hooks_cursor, queue_hit);
+    queueControlHit(state, layout.hooks_opencode, layout.body_clip, .hooks_opencode, queue_hit);
     queueControlHit(state, layout.hooks_grok, layout.body_clip, .hooks_grok, queue_hit);
     queueControlHit(state, layout.hooks_amp, layout.body_clip, .hooks_amp, queue_hit);
     if (state.settings_controller.update.status != .checking) {
@@ -947,6 +972,13 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     }, "Default companion", paletteColor(textLabel()), theme.scaledUi(12.5), layout.body_clip);
     drawCompanionCharacterDropdown(state, layout);
     drawStepperRow(state, layout.appearance_card, m, layout.ui_font_dec.y, "UI font size", state.settings_controller.draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE, .ui_font_dec, .ui_font_inc, layout.ui_font_dec, layout.ui_font_inc, layout.body_clip);
+    drawSwitchRow(state, layout.reduced_motion, "Reduce motion", state.settings_controller.draft.reduced_motion, isControlHovered(state, .reduced_motion), layout.body_clip);
+    queueText(state, .{
+        .x = layout.appearance_card.x + m.card_pad,
+        .y = layout.reduced_motion_hint_y,
+        .w = layout.appearance_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, "Shortens transitions and keeps status indicators static", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
 
     // Transcript
     drawCardTitle(state, layout.transcript_card, "Transcript", layout.body_clip);
@@ -1010,13 +1042,13 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     // Browser
     drawCardTitle(state, layout.browser_card, "Browser", layout.body_clip);
     drawFieldLabel(state, layout.browser_card, m, "Scrolling", layout.body_clip);
-    drawSwitchRow(state, layout.browser_fast_scrolling, "Faster page scrolling (1.5x)", state.settings_controller.draft.browser_fast_scrolling_enabled, isControlHovered(state, .browser_fast_scrolling), layout.body_clip);
+    drawBrowserScrollSpeedSlider(state, layout.browser_scroll_speed, state.settings_controller.draft.browser_scroll_speed, isControlHovered(state, .browser_scroll_speed), layout.body_clip);
     queueText(state, .{
         .x = layout.browser_card.x + m.card_pad,
         .y = layout.browser_hint_y,
         .w = layout.browser_card.w - m.card_pad * 2.0,
         .h = m.label_h,
-    }, "Turn off to use Verde's standard embedded-browser speed", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+    }, "Adjusts wheel distance from standard (1.0×) to very fast (5.0×)", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
 
     // Experimental features
     drawCardTitle(state, layout.experimental_card, "Experimental features", layout.body_clip);
@@ -1074,6 +1106,13 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .w = layout.file_links_neovim_pane.w,
         .h = m.label_h,
     }, "Used only when Neovim is the configured editor; otherwise uses the default file action", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+    drawSwitchRow(state, layout.workspace_unzoom_on_navigation, "Unzoom on pane navigation", state.settings_controller.draft.unzoom_on_pane_navigation, isControlHovered(state, .workspace_unzoom_on_navigation), layout.body_clip);
+    queueText(state, .{
+        .x = layout.workspace_unzoom_on_navigation.x,
+        .y = layout.workspace_unzoom_on_navigation_hint_y,
+        .w = layout.workspace_unzoom_on_navigation.w,
+        .h = m.label_h,
+    }, "Off keeps zoom active and moves it to the pane selected with directional shortcuts", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
     queueText(state, .{
         .x = layout.workspace_scroll_use_global.x,
         .y = layout.workspace_scroll_use_global.y - m.inner_gap - m.label_h,
@@ -1139,13 +1178,13 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     }, "Space between scrolling panes; zoom stays edge-to-edge", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
     drawStepperRow(state, layout.workspace_card, m, layout.workspace_panes_per_view_dec.y, "Panes per view", @floatFromInt(state.settings_controller.draft.workspace_panes_per_view), @floatFromInt(app_config.MIN_WORKSPACE_PANES_PER_VIEW), @floatFromInt(app_config.MAX_WORKSPACE_PANES_PER_VIEW), .workspace_panes_per_view_dec, .workspace_panes_per_view_inc, layout.workspace_panes_per_view_dec, layout.workspace_panes_per_view_inc, layout.body_clip);
     const custom_scrolling_width = state.project_controller.selected_index < state.project_controller.projects.items.len and
-        state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.scroll_pane_extent_override != null;
+        state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.hasCustomScrollPaneExtent();
     queueText(state, .{
         .x = layout.workspace_card.x + m.card_pad,
         .y = layout.workspace_panes_per_view_hint_y,
         .w = layout.workspace_card.w - m.card_pad * 2.0,
         .h = m.label_h,
-    }, if (custom_scrolling_width) "Custom drag width active; reset it from the command palette to use this value" else "Sets how many scrolling panes fit along the selected direction", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+    }, if (custom_scrolling_width) "Custom pane widths active; reset them from the command palette to use this value" else "Sets how many scrolling panes fit along the selected direction", paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
     queueText(state, .{
         .x = layout.workspace_scroll_horizontal.x,
         .y = layout.workspace_scroll_horizontal.y - m.inner_gap - m.label_h,
@@ -1189,6 +1228,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     drawSwitchRow(state, layout.hooks_claude, "Claude", state.settings_controller.hook_claude_installed, isControlHovered(state, .hooks_claude), layout.body_clip);
     drawSwitchRow(state, layout.hooks_codex, "Codex", state.settings_controller.hook_codex_installed, isControlHovered(state, .hooks_codex), layout.body_clip);
     drawSwitchRow(state, layout.hooks_cursor, "Cursor", state.settings_controller.hook_cursor_installed, isControlHovered(state, .hooks_cursor), layout.body_clip);
+    drawSwitchRow(state, layout.hooks_opencode, "OpenCode", state.settings_controller.hook_opencode_installed, isControlHovered(state, .hooks_opencode), layout.body_clip);
     drawSwitchRow(state, layout.hooks_grok, "Grok", state.settings_controller.hook_grok_installed, isControlHovered(state, .hooks_grok), layout.body_clip);
     drawSwitchRow(state, layout.hooks_amp, "Amp", state.settings_controller.hook_amp_installed, isControlHovered(state, .hooks_amp), layout.body_clip);
     queueText(state, .{
@@ -1388,6 +1428,39 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
 }
 
 /// Applies a settings control interaction to the in-modal draft.
+pub fn applyControlAt(state: *runtime.AppState, control_index: usize, rect: palette.Rect, x: f32) void {
+    applyControl(state, control_index);
+    const control: Control = @enumFromInt(control_index);
+    if (control != .browser_scroll_speed) return;
+    state.settings_controller.browser_scroll_speed_drag_active = true;
+    state.settings_controller.browser_scroll_speed_drag_x = rect.x;
+    state.settings_controller.browser_scroll_speed_drag_w = rect.w;
+    _ = updateBrowserScrollSpeedDrag(state, x);
+}
+
+/// Updates the browser scroll-speed draft while its settings slider owns the pointer.
+pub fn updateBrowserScrollSpeedDrag(state: *runtime.AppState, x: f32) bool {
+    if (!state.settings_controller.browser_scroll_speed_drag_active) return false;
+    const track: palette.Rect = .{
+        .x = state.settings_controller.browser_scroll_speed_drag_x,
+        .y = 0.0,
+        .w = state.settings_controller.browser_scroll_speed_drag_w,
+        .h = 1.0,
+    };
+    const next = browserScrollSpeedFromPoint(track, x);
+    if (next != state.settings_controller.draft.browser_scroll_speed) {
+        state.settings_controller.draft.browser_scroll_speed = next;
+        state.markDirty();
+    }
+    return true;
+}
+
+/// Releases any pointer capture held by the browser scroll-speed slider.
+pub fn endBrowserScrollSpeedDrag(state: *runtime.AppState) void {
+    state.settings_controller.browser_scroll_speed_drag_active = false;
+}
+
+/// Applies a settings control that does not require pointer geometry.
 pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
     const control: Control = @enumFromInt(control_index);
     if (control != .theme_dropdown) {
@@ -1431,6 +1504,7 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         },
         .workspace_scroll_horizontal => state.settings_controller.draft.workspace_scroll_direction = .horizontal,
         .workspace_scroll_vertical => state.settings_controller.draft.workspace_scroll_direction = .vertical,
+        .reduced_motion => state.settings_controller.draft.reduced_motion = !state.settings_controller.draft.reduced_motion,
         .theme_dropdown => {
             state.settings_controller.theme_dropdown_open = !state.settings_controller.theme_dropdown_open;
             if (state.settings_controller.theme_dropdown_open) {
@@ -1484,9 +1558,10 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .open_vscode => state.settings_controller.draft.open_action = .vscode,
         .open_zed => state.settings_controller.draft.open_action = .zed,
         .file_links_neovim_pane => state.settings_controller.draft.file_links_in_neovim_pane = !state.settings_controller.draft.file_links_in_neovim_pane,
+        .workspace_unzoom_on_navigation => state.settings_controller.draft.unzoom_on_pane_navigation = !state.settings_controller.draft.unzoom_on_pane_navigation,
         .links_verde_browser => state.settings_controller.draft.link_open_target = .verde_browser,
         .links_system_browser => state.settings_controller.draft.link_open_target = .system_browser,
-        .browser_fast_scrolling => state.settings_controller.draft.browser_fast_scrolling_enabled = !state.settings_controller.draft.browser_fast_scrolling_enabled,
+        .browser_scroll_speed => {},
         .companion_toggle => state.settings_controller.draft.companion_enabled = !state.settings_controller.draft.companion_enabled,
         // Acts immediately (filesystem side effect), independent of Save/Cancel.
         .mcp_tools => {
@@ -1503,6 +1578,10 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         },
         .hooks_cursor => {
             state.toggleCursorGlobalHooks();
+            return;
+        },
+        .hooks_opencode => {
+            state.toggleOpencodeGlobalHooks();
             return;
         },
         .hooks_grok => {
@@ -2162,6 +2241,51 @@ fn drawSwitchRow(state: *runtime.AppState, rect: palette.Rect, label: []const u8
     queueRoundedRectClipped(state, .{ .x = knob_x, .y = track.y + knob_pad, .w = knob, .h = knob }, paletteColor(knob_color), knob * 0.5, clip);
 }
 
+fn browserScrollSliderHitRect(row: palette.Rect) palette.Rect {
+    const label_w = @min(theme.scaledUi(142.0), row.w * 0.38);
+    const value_w = @min(theme.scaledUi(58.0), row.w * 0.22);
+    return .{
+        .x = row.x + label_w,
+        .y = row.y,
+        .w = @max(row.w - label_w - value_w, 1.0),
+        .h = row.h,
+    };
+}
+
+fn browserScrollSpeedFromPoint(track: palette.Rect, x: f32) f32 {
+    const progress = theme.clampf((x - track.x) / @max(track.w, 1.0), 0.0, 1.0);
+    const span = app_config.MAX_BROWSER_SCROLL_SPEED - app_config.MIN_BROWSER_SCROLL_SPEED;
+    const raw = app_config.MIN_BROWSER_SCROLL_SPEED + progress * span;
+    const steps = @round((raw - app_config.MIN_BROWSER_SCROLL_SPEED) / app_config.BROWSER_SCROLL_SPEED_STEP);
+    return app_config.MIN_BROWSER_SCROLL_SPEED + steps * app_config.BROWSER_SCROLL_SPEED_STEP;
+}
+
+// Browser settings row: wheel-speed slider with its current multiplier.
+fn drawBrowserScrollSpeedSlider(state: *runtime.AppState, row: palette.Rect, value: f32, hovered: bool, clip: palette.Rect) void {
+    const hit = browserScrollSliderHitRect(row);
+    queueText(state, .{
+        .x = row.x + theme.scaledUi(10.0),
+        .y = row.y + (row.h - theme.scaledUi(16.0)) * 0.5,
+        .w = @max(hit.x - row.x - theme.scaledUi(16.0), 1.0),
+        .h = theme.scaledUi(16.0),
+    }, "Wheel speed", paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), clip);
+
+    const track_h = theme.scaledUi(6.0);
+    const track: palette.Rect = .{ .x = hit.x, .y = row.y + (row.h - track_h) * 0.5, .w = hit.w, .h = track_h };
+    const progress = (theme.clampf(value, app_config.MIN_BROWSER_SCROLL_SPEED, app_config.MAX_BROWSER_SCROLL_SPEED) - app_config.MIN_BROWSER_SCROLL_SPEED) /
+        (app_config.MAX_BROWSER_SCROLL_SPEED - app_config.MIN_BROWSER_SCROLL_SPEED);
+    queueRoundedRectClipped(state, track, paletteColor(if (hovered) controlHoverSurface() else controlSurface()), track_h * 0.5, clip);
+    queueRoundedRectClipped(state, .{ .x = track.x, .y = track.y, .w = track.w * progress, .h = track.h }, paletteColor(theme.withAlpha(theme.accent(), 210)), track_h * 0.5, clip);
+
+    const knob_size = theme.scaledUi(16.0);
+    const knob_x = track.x + track.w * progress - knob_size * 0.5;
+    queueRoundedRectClipped(state, .{ .x = knob_x, .y = row.y + (row.h - knob_size) * 0.5, .w = knob_size, .h = knob_size }, paletteColor(theme.COLOR_WHITE), knob_size * 0.5, clip);
+
+    var value_buf: [16]u8 = undefined;
+    const value_text = std.fmt.bufPrint(&value_buf, "{d:.2}×", .{value}) catch "?×";
+    queueCenteredText(state, .{ .x = hit.x + hit.w + theme.scaledUi(8.0), .y = row.y, .w = theme.scaledUi(50.0), .h = row.h }, value_text, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), clip);
+}
+
 // Experimental Companion row with semantic active-theme badge copy.
 fn drawCompanionExperimentalRow(state: *runtime.AppState, rect: palette.Rect, on: bool, hovered: bool, clip: palette.Rect) void {
     drawSwitchRow(state, rect, "Companion", on, hovered, clip);
@@ -2647,6 +2771,56 @@ test "companion character option order is Sprout Moss Vireo" {
     try std.testing.expectEqual(app_config.CompanionCharacter.sprout, COMPANION_CHARACTER_OPTIONS[0]);
     try std.testing.expectEqual(app_config.CompanionCharacter.moss, COMPANION_CHARACTER_OPTIONS[1]);
     try std.testing.expectEqual(app_config.CompanionCharacter.vireo, COMPANION_CHARACTER_OPTIONS[2]);
+}
+
+test "pane navigation unzoom setting is a persisted draft toggle" {
+    const allocator = std.testing.allocator;
+    var state = testSettingsState(allocator);
+    defer deinitTestSettingsState(&state, allocator);
+
+    try std.testing.expect(!state.app_config.unzoom_on_pane_navigation);
+    try std.testing.expect(!state.settings_controller.draft.unzoom_on_pane_navigation);
+    applyControl(&state, @intFromEnum(Control.workspace_unzoom_on_navigation));
+    try std.testing.expect(state.settings_controller.draft.unzoom_on_pane_navigation);
+    try std.testing.expect(state.isSettingsDraftDirty());
+
+    state.app_config.unzoom_on_pane_navigation = state.settings_controller.draft.unzoom_on_pane_navigation;
+    try std.testing.expect(!state.isSettingsDraftDirty());
+}
+
+test "reduced motion setting is a persisted draft toggle" {
+    const allocator = std.testing.allocator;
+    var state = testSettingsState(allocator);
+    defer deinitTestSettingsState(&state, allocator);
+
+    try std.testing.expect(!state.settings_controller.draft.reduced_motion);
+    try std.testing.expect(!state.app_config.reduced_motion);
+    applyControl(&state, @intFromEnum(Control.reduced_motion));
+    try std.testing.expect(state.settings_controller.draft.reduced_motion);
+    try std.testing.expect(state.isSettingsDraftDirty());
+
+    state.app_config.reduced_motion = state.settings_controller.draft.reduced_motion;
+    try std.testing.expect(!state.isSettingsDraftDirty());
+}
+
+test "browser scroll speed slider snaps across the supported range" {
+    const allocator = std.testing.allocator;
+    var state = testSettingsState(allocator);
+    defer deinitTestSettingsState(&state, allocator);
+
+    const track: palette.Rect = .{ .x = 100.0, .y = 20.0, .w = 400.0, .h = 36.0 };
+    applyControlAt(&state, @intFromEnum(Control.browser_scroll_speed), track, track.x);
+    try std.testing.expect(state.settings_controller.browser_scroll_speed_drag_active);
+    try std.testing.expectEqual(app_config.MIN_BROWSER_SCROLL_SPEED, state.settings_controller.draft.browser_scroll_speed);
+
+    try std.testing.expect(updateBrowserScrollSpeedDrag(&state, track.x + track.w * 0.5));
+    try std.testing.expectEqual(@as(f32, 3.0), state.settings_controller.draft.browser_scroll_speed);
+    try std.testing.expect(updateBrowserScrollSpeedDrag(&state, track.x + track.w));
+    try std.testing.expectEqual(app_config.MAX_BROWSER_SCROLL_SPEED, state.settings_controller.draft.browser_scroll_speed);
+
+    endBrowserScrollSpeedDrag(&state);
+    try std.testing.expect(!state.settings_controller.browser_scroll_speed_drag_active);
+    try std.testing.expect(!updateBrowserScrollSpeedDrag(&state, track.x));
 }
 
 test "Companion experimental setting renders one themed immutable toggle row" {

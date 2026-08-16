@@ -174,6 +174,22 @@ pub const CODEX_REASONING_OPTIONS = [_]ReasoningOption{
     .{ .label = "Xhigh", .value = .xhigh },
 };
 
+pub const CODEX_56_REASONING_OPTIONS = CODEX_REASONING_OPTIONS ++ [_]ReasoningOption{
+    .{ .label = "Max", .value = .max },
+};
+
+/// Returns the reasoning efforts supported by the selected Codex model.
+pub fn codexReasoningOptions(model_ref: ?[]const u8) []const ReasoningOption {
+    const model = model_ref orelse DEFAULT_CODEX_MODEL;
+    if (std.mem.eql(u8, model, "gpt-5.6-sol") or
+        std.mem.eql(u8, model, "gpt-5.6-terra") or
+        std.mem.eql(u8, model, "gpt-5.6-luna"))
+    {
+        return CODEX_56_REASONING_OPTIONS[0..];
+    }
+    return CODEX_REASONING_OPTIONS[0..];
+}
+
 pub const CODEX_FAST_MODE_OPTIONS = [_]FastModeOption{
     .{ .label = "Off", .value = .off },
     .{ .label = "On", .value = .on },
@@ -191,6 +207,15 @@ test "Codex model options omit unsupported subscription models" {
     try std.testing.expectEqualStrings("gpt-5.6-terra", CODEX_MODEL_OPTIONS[2].value.?);
     try std.testing.expectEqualStrings("gpt-5.6-luna", CODEX_MODEL_OPTIONS[3].value.?);
     try std.testing.expectEqualStrings("gpt-5.3-codex-spark", CODEX_MODEL_OPTIONS[4].value.?);
+}
+
+test "Codex 5.6 models expose max reasoning" {
+    for ([_][]const u8{ "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna" }) |model| {
+        const options = codexReasoningOptions(model);
+        try std.testing.expectEqual(ReasoningEffort.max, options[options.len - 1].value.?);
+    }
+    try std.testing.expectEqual(@as(usize, 5), codexReasoningOptions("gpt-5.5").len);
+    try std.testing.expectEqual(@as(usize, 5), codexReasoningOptions("gpt-5.3-codex-spark").len);
 }
 
 test "persisted Cursor model cache refreshes duplicate model ids" {

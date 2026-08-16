@@ -21,6 +21,8 @@ const CODEX_HOOK_EVENTS = [_]CodexHookEvent{
     .{ .name = "SessionStart", .status_message = "Syncing Verde session" },
     .{ .name = "UserPromptSubmit", .status_message = "Marking Verde agent busy" },
     .{ .name = "PermissionRequest", .status_message = "Marking Verde agent waiting" },
+    .{ .name = "SubagentStart", .status_message = "Tracking Verde subagent" },
+    .{ .name = "SubagentStop", .status_message = "Updating Verde subagent status" },
     .{ .name = "Stop", .status_message = "Marking Verde agent done" },
 };
 
@@ -28,7 +30,208 @@ const CURSOR_HOOK_MARKER = "verde-cursor-notify-hook";
 const CURSOR_PROJECT_HOOK_REL_PATH = ".cursor/hooks/verde-cursor-notify-hook.sh";
 const CURSOR_WINDOWS_PROJECT_HOOK_REL_PATH = ".cursor/hooks/verde-cursor-notify-hook.ps1";
 const CURSOR_HOOKS_JSON_REL_PATH = ".cursor/hooks.json";
-const CURSOR_HOOK_EVENTS = [_][]const u8{ "sessionStart", "beforeSubmitPrompt", "preToolUse", "stop" };
+const CURSOR_HOOK_EVENTS = [_][]const u8{ "sessionStart", "beforeSubmitPrompt", "preToolUse", "subagentStart", "subagentStop", "stop" };
+
+// Command hooks run in separate processes and can overlap. This state machine
+// serializes updates by Verde pane, deduplicates hooks merged at both global
+// and project scope, and keeps the parent status authoritative while children
+// run. Each provider script maps its native event names to these activities.
+const POSIX_AGENT_ACTIVITY_STATE =
+    \\update_agent_status() {
+    \\  provider="$1"
+    \\  activity="$2"
+    \\  initial_status="$3"
+    \\  case "$VERDE_SESSION_ID" in ""|*[!A-Za-z0-9._-]*) return 1 ;; esac
+    \\  state_root="${TMPDIR:-/tmp}/verde-agent-status"
+    \\  state_dir="$state_root/$provider-$VERDE_SESSION_ID"
+    \\  lock_dir="$state_dir.lock"
+    \\  mkdir -p "$state_root" 2>/dev/null || return 1
+    \\  attempts=0
+    \\  while ! mkdir "$lock_dir" 2>/dev/null; do
+    \\    attempts=$((attempts + 1))
+    \\    [ "$attempts" -lt 100 ] || return 1
+    \\    sleep 0.01
+    \\  done
+    \\  if [ "$activity" = "session-start" ]; then
+    \\    rm -rf "$state_dir"
+    \\  fi
+    \\  children_dir="$state_dir/children"
+    \\  stops_dir="$state_dir/stops"
+    \\  mkdir -p "$children_dir" "$stops_dir" 2>/dev/null || { rmdir "$lock_dir" 2>/dev/null; return 1; }
+    \\  parent="$(cat "$state_dir/parent" 2>/dev/null)"
+    \\  [ -n "$parent" ] || parent="idle"
+    \\  case "$activity" in
+    \\    session-start)
+    \\      parent="$initial_status"
+    \\      ;;
+    \\    parent-working|parent-waiting|parent-error)
+    \\      parent="${activity#parent-}"
+    \\      ;;
+    \\    parent-idle)
+    \\      parent="idle"
+    \\      ;;
+    \\    child-start|child-stop)
+    \\      child_id=""
+    \\      case "$provider" in
+    \\        cursor) child_fields="subagent_id tool_call_id task" ;;
+    \\        grok) child_fields="subagentId subagent_id" ;;
+    \\        *) child_fields="agent_id subagent_id agentId subagentId tool_call_id toolCallId task" ;;
+    \\      esac
+    \\      for field in $child_fields; do
+    \\        if command -v jq >/dev/null 2>&1; then
+    \\          child_id="$(jq -r --arg field "$field" '.[$field] // empty' "$payload" 2>/dev/null)"
+    \\        else
+    \\          child_id="$(sed -n "s/.*\"$field\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$payload" | head -n 1)"
+    \\        fi
+    \\        [ -z "$child_id" ] || break
+    \\      done
+    \\      [ -n "$child_id" ] || child_id="$(cat "$payload" 2>/dev/null)"
+    \\      fingerprint="$(printf '%s' "$child_id" | cksum 2>/dev/null | awk '{print $1 "-" $2}')"
+    \\      [ -n "$fingerprint" ] || fingerprint="$$"
+    \\      child_path="$children_dir/$fingerprint"
+    \\      stop_path="$stops_dir/$fingerprint"
+    \\      if [ "$provider" = "cursor" ]; then
+    \\        task=""
+    \\        if command -v jq >/dev/null 2>&1; then
+    \\          task="$(jq -r '.task // empty' "$payload" 2>/dev/null)"
+    \\        else
+    \\          task="$(sed -n 's/.*"task"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
+    \\        fi
+    \\        task_fingerprint="$(printf '%s' "$task" | cksum 2>/dev/null | awk '{print $1 "-" $2}')"
+    \\        task_stop_path=""
+    \\        [ -z "$task" ] || task_stop_path="$stops_dir/task-$task_fingerprint"
+    \\        if [ "$activity" = "child-start" ]; then
+    \\          stopped=false
+    \\          [ ! -f "$stop_path" ] || stopped=true
+    \\          [ -z "$task_stop_path" ] || [ ! -f "$task_stop_path" ] || stopped=true
+    \\          [ "$stopped" = true ] || printf '%s' "$task_fingerprint" > "$child_path"
+    \\        elif [ ! -f "$stop_path" ]; then
+    \\          : > "$stop_path"
+    \\          [ -z "$task_stop_path" ] || : > "$task_stop_path"
+    \\          if [ -f "$child_path" ]; then
+    \\            rm -f "$child_path"
+    \\          elif [ -n "$task" ]; then
+    \\              for candidate in "$children_dir"/*; do
+    \\                [ -f "$candidate" ] || continue
+    \\                [ "$(cat "$candidate" 2>/dev/null)" = "$task_fingerprint" ] || continue
+    \\                rm -f "$candidate"
+    \\                break
+    \\              done
+    \\          fi
+    \\        fi
+    \\      elif [ "$activity" = "child-start" ]; then
+    \\        [ -f "$stop_path" ] || : > "$child_path"
+    \\      elif [ ! -f "$stop_path" ]; then
+    \\        : > "$stop_path"
+    \\        rm -f "$child_path"
+    \\      fi
+    \\      ;;
+    \\  esac
+    \\  count="$(find "$children_dir" -type f -print 2>/dev/null | wc -l | tr -d '[:space:]')"
+    \\  case "$count" in ""|*[!0-9]*) count=0 ;; esac
+    \\  printf '%s' "$parent" > "$state_dir/parent"
+    \\  if [ "$activity" = "session-start" ]; then
+    \\    status="$initial_status"
+    \\  else
+    \\    case "$parent" in
+    \\      working|waiting|error) status="$parent" ;;
+    \\      *) if [ "$count" -gt 0 ]; then status="waiting"; else status="done"; fi ;;
+    \\    esac
+    \\  fi
+    \\  rmdir "$lock_dir" 2>/dev/null
+    \\  printf '%s' "$status"
+    \\}
+    \\
+;
+
+const POWERSHELL_AGENT_ACTIVITY_STATE =
+    \\function Update-AgentStatus {
+    \\  param([string]$Provider, [string]$Activity, [string]$InitialStatus, [string]$PayloadText)
+    \\  if ($env:VERDE_SESSION_ID -notmatch '^[A-Za-z0-9._-]+$') { return '' }
+    \\  $stateRoot = Join-Path ([IO.Path]::GetTempPath()) 'verde-agent-status'
+    \\  $stateDir = Join-Path $stateRoot ($Provider + '-' + $env:VERDE_SESSION_ID)
+    \\  $lockDir = $stateDir + '.lock'
+    \\  New-Item -ItemType Directory -Path $stateRoot -Force -ErrorAction SilentlyContinue | Out-Null
+    \\  $locked = $false
+    \\  for ($attempt = 0; $attempt -lt 100 -and -not $locked; $attempt++) {
+    \\    try { New-Item -ItemType Directory -Path $lockDir -ErrorAction Stop | Out-Null; $locked = $true }
+    \\    catch { Start-Sleep -Milliseconds 10 }
+    \\  }
+    \\  if (-not $locked) { return '' }
+    \\  try {
+    \\    if ($Activity -eq 'session-start') { Remove-Item -LiteralPath $stateDir -Recurse -Force -ErrorAction SilentlyContinue }
+    \\    $childrenDir = Join-Path $stateDir 'children'
+    \\    $stopsDir = Join-Path $stateDir 'stops'
+    \\    New-Item -ItemType Directory -Path $childrenDir -Force -ErrorAction SilentlyContinue | Out-Null
+    \\    New-Item -ItemType Directory -Path $stopsDir -Force -ErrorAction SilentlyContinue | Out-Null
+    \\    $parentPath = Join-Path $stateDir 'parent'
+    \\    $parent = if (Test-Path -LiteralPath $parentPath) { (Get-Content -LiteralPath $parentPath -Raw) } else { 'idle' }
+    \\    switch ($Activity) {
+    \\      'session-start' { $parent = $InitialStatus }
+    \\      'parent-working' { $parent = 'working' }
+    \\      'parent-waiting' { $parent = 'waiting' }
+    \\      'parent-error' { $parent = 'error' }
+    \\      'parent-idle' { $parent = 'idle' }
+    \\      { $_ -in 'child-start', 'child-stop' } {
+    \\        $childId = ''
+    \\        try {
+    \\          $childPayload = ConvertFrom-Json -InputObject $PayloadText
+    \\          $childFields = switch ($Provider) {
+    \\            'cursor' { @('subagent_id', 'tool_call_id', 'task'); break }
+    \\            'grok' { @('subagentId', 'subagent_id'); break }
+    \\            default { @('agent_id', 'subagent_id', 'agentId', 'subagentId', 'tool_call_id', 'toolCallId', 'task'); break }
+    \\          }
+    \\          foreach ($field in $childFields) {
+    \\            if ($null -ne $childPayload.$field -and -not [string]::IsNullOrWhiteSpace([string]$childPayload.$field)) {
+    \\              $childId = [string]$childPayload.$field
+    \\              break
+    \\            }
+    \\          }
+    \\        } catch {}
+    \\        if ([string]::IsNullOrWhiteSpace($childId)) { $childId = $PayloadText }
+    \\        $bytes = [Text.Encoding]::UTF8.GetBytes($childId)
+    \\        $sha = [Security.Cryptography.SHA256]::Create()
+    \\        try { $fingerprint = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '') } finally { $sha.Dispose() }
+    \\        $childPath = Join-Path $childrenDir $fingerprint
+    \\        $stopPath = Join-Path $stopsDir $fingerprint
+    \\        if ($Provider -eq 'cursor') {
+    \\          $task = if ($null -ne $childPayload -and $null -ne $childPayload.task) { [string]$childPayload.task } else { '' }
+    \\          $taskBytes = [Text.Encoding]::UTF8.GetBytes($task)
+    \\          $taskSha = [Security.Cryptography.SHA256]::Create()
+    \\          try { $taskFingerprint = [BitConverter]::ToString($taskSha.ComputeHash($taskBytes)).Replace('-', '') } finally { $taskSha.Dispose() }
+    \\          $taskStopPath = if ([string]::IsNullOrWhiteSpace($task)) { $null } else { Join-Path $stopsDir ('task-' + $taskFingerprint) }
+    \\          if ($Activity -eq 'child-start') {
+    \\            $stopped = (Test-Path -LiteralPath $stopPath) -or ($null -ne $taskStopPath -and (Test-Path -LiteralPath $taskStopPath))
+    \\            if (-not $stopped) { Set-Content -LiteralPath $childPath -Value $taskFingerprint -NoNewline }
+    \\          } elseif (-not (Test-Path -LiteralPath $stopPath)) {
+    \\            New-Item -ItemType File -Path $stopPath -Force -ErrorAction SilentlyContinue | Out-Null
+    \\            if ($null -ne $taskStopPath) { New-Item -ItemType File -Path $taskStopPath -Force -ErrorAction SilentlyContinue | Out-Null }
+    \\            if (Test-Path -LiteralPath $childPath) {
+    \\              Remove-Item -LiteralPath $childPath -Force -ErrorAction SilentlyContinue
+    \\            } elseif (-not [string]::IsNullOrWhiteSpace($task)) {
+    \\                $match = Get-ChildItem -LiteralPath $childrenDir -File -ErrorAction SilentlyContinue | Where-Object { (Get-Content -LiteralPath $_.FullName -Raw) -eq $taskFingerprint } | Select-Object -First 1
+    \\                if ($null -ne $match) { Remove-Item -LiteralPath $match.FullName -Force -ErrorAction SilentlyContinue }
+    \\            }
+    \\          }
+    \\        } elseif ($Activity -eq 'child-start') {
+    \\          if (-not (Test-Path -LiteralPath $stopPath)) { New-Item -ItemType File -Path $childPath -Force -ErrorAction SilentlyContinue | Out-Null }
+    \\        } elseif (-not (Test-Path -LiteralPath $stopPath)) {
+    \\          New-Item -ItemType File -Path $stopPath -Force -ErrorAction SilentlyContinue | Out-Null
+    \\          Remove-Item -LiteralPath $childPath -Force -ErrorAction SilentlyContinue
+    \\        }
+    \\      }
+    \\    }
+    \\    $count = @(Get-ChildItem -LiteralPath $childrenDir -File -ErrorAction SilentlyContinue).Count
+    \\    Set-Content -LiteralPath $parentPath -Value $parent -NoNewline
+    \\    if ($Activity -eq 'session-start') { return $InitialStatus }
+    \\    if ($parent -in 'working', 'waiting', 'error') { return $parent }
+    \\    return $(if ($count -gt 0) { 'waiting' } else { 'done' })
+    \\  } finally {
+    \\    Remove-Item -LiteralPath $lockDir -Force -ErrorAction SilentlyContinue
+    \\  }
+    \\}
+    \\
+;
 
 pub fn ensureCodexProjectHooks(allocator: std.mem.Allocator, project_path: []const u8) !void {
     var threaded: std.Io.Threaded = .init(allocator, .{});
@@ -44,19 +247,22 @@ pub fn ensureCodexProjectHooks(allocator: std.mem.Allocator, project_path: []con
 
     try ensureParentDir(io, hook_path);
     try writeCodexHookScript(allocator, io, hook_path);
+    const hook_command = try hookCommandAllocForOs(allocator, builtin.os.tag, hook_path);
+    defer allocator.free(hook_command);
 
     if (std.Io.Dir.cwd().readFileAlloc(threaded.io(), hooks_json_path, allocator, .limited(256 * 1024))) |existing| {
         defer allocator.free(existing);
-        if (codexHooksJsonIsManaged(existing)) return;
-        return error.CodexHooksJsonExists;
+        if (!codexHooksJsonIsManaged(existing)) return error.CodexHooksJsonExists;
+        const merged = try mergeCodexHooks(allocator, existing, hook_command);
+        defer if (merged) |content| allocator.free(content);
+        if (merged) |content| try writeFileAtomic(allocator, io, hooks_json_path, content, .default_file);
+        return;
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     }
 
     try ensureParentDir(io, hooks_json_path);
-    const hook_command = try hookCommandAllocForOs(allocator, builtin.os.tag, hook_path);
-    defer allocator.free(hook_command);
     const hooks_json = try codexHooksJsonAlloc(allocator, hook_command);
     defer allocator.free(hooks_json);
     try writeFileAtomic(allocator, io, hooks_json_path, hooks_json, .default_file);
@@ -81,12 +287,13 @@ fn writeCodexHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const 
         \\[ -n "$event" ] || event="$(sed -n 's/.*"event"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
         \\[ -n "$event" ] || event="${1:-}"
         \\
-        \\status=""
+    ++ POSIX_AGENT_ACTIVITY_STATE ++
+        \\activity=""
         \\title=""
         \\case "$event" in
-        \\  SessionStart) status="working" ;;
+        \\  SessionStart) activity="session-start" ;;
         \\  UserPromptSubmit)
-        \\    status="working"
+        \\    activity="parent-working"
         \\    # Codex has no session-title field, but UserPromptSubmit carries the
         \\    # prompt text. Derive a pane label from it (like a chat thread title):
         \\    # prefer jq for correct JSON decoding, else a best-effort sed fallback;
@@ -98,11 +305,15 @@ fn writeCodexHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const 
         \\    fi
         \\    title="$(printf '%s' "$title" | tr '\n\t' '  ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g' | cut -c1-72)"
         \\    ;;
-        \\  PermissionRequest) status="waiting" ;;
-        \\  Stop) status="done" ;;
+        \\  PermissionRequest) activity="parent-waiting" ;;
+        \\  SubagentStart) activity="child-start" ;;
+        \\  SubagentStop) activity="child-stop" ;;
+        \\  Stop) activity="parent-idle" ;;
         \\  *)
         \\    rm -f "$payload"; exit 0 ;;
         \\esac
+        \\status="$(update_agent_status codex "$activity" working)"
+        \\[ -n "$status" ] || { rm -f "$payload"; exit 0; }
         \\
         \\cli="${VERDE_CLI:-verde}"
         \\if ! command -v "$cli" >/dev/null 2>&1; then
@@ -132,10 +343,7 @@ fn codexHooksJsonAlloc(allocator: std.mem.Allocator, hook_path: []const u8) ![]u
     try s.beginObject();
     try s.objectField("hooks");
     try s.beginObject();
-    try writeCodexHookEvent(&s, "SessionStart", hook_path, "Syncing Verde session");
-    try writeCodexHookEvent(&s, "UserPromptSubmit", hook_path, "Marking Verde agent busy");
-    try writeCodexHookEvent(&s, "PermissionRequest", hook_path, "Marking Verde agent waiting");
-    try writeCodexHookEvent(&s, "Stop", hook_path, "Marking Verde agent done");
+    for (CODEX_HOOK_EVENTS) |event| try writeCodexHookEvent(&s, event.name, hook_path, event.status_message);
     try s.endObject();
     try s.endObject();
     return try writer.toOwnedSlice();
@@ -186,19 +394,22 @@ pub fn ensureClaudeProjectHooks(allocator: std.mem.Allocator, project_path: []co
 
     try ensureParentDir(io, hook_path);
     try writeClaudeHookScript(allocator, io, hook_path);
+    const hook_command = try hookCommandAllocForOs(allocator, builtin.os.tag, hook_path);
+    defer allocator.free(hook_command);
 
     if (std.Io.Dir.cwd().readFileAlloc(threaded.io(), settings_path, allocator, .limited(1024 * 1024))) |existing| {
         defer allocator.free(existing);
-        if (claudeSettingsIsManaged(existing)) return;
-        return error.ClaudeSettingsExist;
+        if (!claudeSettingsIsManaged(existing)) return error.ClaudeSettingsExist;
+        const merged = try mergeClaudeHooks(allocator, existing, hook_command);
+        defer if (merged) |content| allocator.free(content);
+        if (merged) |content| try writeFileAtomic(allocator, io, settings_path, content, .default_file);
+        return;
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     }
 
     try ensureParentDir(io, settings_path);
-    const hook_command = try hookCommandAllocForOs(allocator, builtin.os.tag, hook_path);
-    defer allocator.free(hook_command);
     const settings_json = try claudeSettingsJsonAlloc(allocator, hook_command);
     defer allocator.free(settings_json);
     try writeFileAtomic(allocator, io, settings_path, settings_json, .default_file);
@@ -224,22 +435,27 @@ fn writeClaudeHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const
         \\event="$(sed -n 's/.*"hook_event_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
         \\[ -n "$event" ] || event="${1:-}"
         \\
-        \\status=""
+    ++ POSIX_AGENT_ACTIVITY_STATE ++
+        \\activity=""
         \\case "$event" in
-        \\  SessionStart) status="idle" ;;
-        \\  UserPromptSubmit) status="working" ;;
+        \\  SessionStart) activity="session-start" ;;
+        \\  UserPromptSubmit) activity="parent-working" ;;
         \\  Notification)
         \\    # Claude fires Notification for both permission requests and the
         \\    # idle "waiting for your input" nudge. Only the former needs you.
         \\    msg="$(sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
         \\    case "$msg" in
         \\      *"waiting for your input"*|*"is idle"*) rm -f "$payload"; exit 0 ;;
-        \\      *) status="waiting" ;;
+        \\      *) activity="parent-waiting" ;;
         \\    esac ;;
-        \\  Stop) status="done" ;;
+        \\  SubagentStart) activity="child-start" ;;
+        \\  SubagentStop) activity="child-stop" ;;
+        \\  Stop) activity="parent-idle" ;;
         \\  *)
         \\    rm -f "$payload"; exit 0 ;;
         \\esac
+        \\status="$(update_agent_status claude "$activity" idle)"
+        \\[ -n "$status" ] || { rm -f "$payload"; exit 0; }
         \\
         \\cli="${VERDE_CLI:-verde}"
         \\case "$cli" in
@@ -268,10 +484,7 @@ fn claudeSettingsJsonAlloc(allocator: std.mem.Allocator, hook_path: []const u8) 
     try s.beginObject();
     try s.objectField("hooks");
     try s.beginObject();
-    try writeClaudeHookEvent(&s, "SessionStart", hook_path);
-    try writeClaudeHookEvent(&s, "UserPromptSubmit", hook_path);
-    try writeClaudeHookEvent(&s, "Notification", hook_path);
-    try writeClaudeHookEvent(&s, "Stop", hook_path);
+    for (CLAUDE_HOOK_EVENTS) |event| try writeClaudeHookEvent(&s, event, hook_path);
     try s.endObject();
     try s.endObject();
     return try writer.toOwnedSlice();
@@ -343,12 +556,13 @@ fn writeCursorHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const
         \\cat > "$payload" 2>/dev/null || true
         \\event="$(sed -n 's/.*"hook_event_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
         \\
-        \\status=""
+    ++ POSIX_AGENT_ACTIVITY_STATE ++
+        \\activity=""
         \\title=""
         \\case "$event" in
-        \\  sessionStart) status="idle" ;;
+        \\  sessionStart) activity="session-start" ;;
         \\  beforeSubmitPrompt)
-        \\    status="working"
+        \\    activity="parent-working"
         \\    if command -v jq >/dev/null 2>&1; then
         \\      title="$(jq -r '.prompt // empty' "$payload" 2>/dev/null)"
         \\    else
@@ -356,13 +570,17 @@ fn writeCursorHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const
         \\    fi
         \\    title="$(printf '%s' "$title" | tr '\n\t' '  ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g' | cut -c1-72)"
         \\    ;;
-        \\  preToolUse) status="working" ;;
+        \\  preToolUse) activity="parent-working" ;;
+        \\  subagentStart) activity="child-start" ;;
+        \\  subagentStop) activity="child-stop" ;;
         \\  stop)
         \\    result="$(sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
-        \\    if [ "$result" = "error" ]; then status="error"; else status="done"; fi
+        \\    if [ "$result" = "error" ]; then activity="parent-error"; else activity="parent-idle"; fi
         \\    ;;
         \\  *) rm -f "$payload"; exit 0 ;;
         \\esac
+        \\status="$(update_agent_status cursor "$activity" idle)"
+        \\[ -n "$status" ] || { rm -f "$payload"; exit 0; }
         \\
         \\cli="${VERDE_CLI:-verde}"
         \\case "$cli" in
@@ -438,34 +656,41 @@ fn codexPowerShellHookScript() []const u8 {
     \\# verde-codex-notify-hook
     \\if ($env:VERDE -ne '1' -or [string]::IsNullOrWhiteSpace($env:VERDE_SESSION_ID)) { exit 0 }
     \\$payload = $null
+    \\$payloadText = ''
     \\try {
     \\  $payloadText = [Console]::In.ReadToEnd()
     \\  if (-not [string]::IsNullOrWhiteSpace($payloadText)) { $payload = ConvertFrom-Json -InputObject $payloadText }
     \\} catch {}
-    \\$eventName = if ($null -ne $payload -and $null -ne $payload.hook_event_name) { [string]$payload.hook_event_name } elseif ($null -ne $payload -and $null -ne $payload.event) { [string]$payload.event } elseif ($args.Count -gt 0) { [string]$args[0] } else { '' }
-    \\$status = ''
-    \\$title = ''
-    \\switch ($eventName) {
-    \\  'SessionStart' { $status = 'working' }
-    \\  'UserPromptSubmit' {
-    \\    $status = 'working'
-    \\    if ($null -ne $payload -and $null -ne $payload.prompt) {
-    \\      $title = [regex]::Replace([string]$payload.prompt, '\s+', ' ').Trim()
-    \\      if ($title.Length -gt 72) { $title = $title.Substring(0, 72) }
-    \\    }
-    \\  }
-    \\  'PermissionRequest' { $status = 'waiting' }
-    \\  'Stop' { $status = 'done' }
-    \\  default { exit 0 }
-    \\}
-    \\$cli = if ([string]::IsNullOrWhiteSpace($env:VERDE_CLI)) { 'verde.exe' } else { $env:VERDE_CLI }
-    \\if ($cli.EndsWith(' (deleted)')) { $cli = $cli.Substring(0, $cli.Length - 10) }
-    \\$notifyArgs = @('notify', '--quiet', '--status', $status, '--provider', 'codex')
-    \\if (-not [string]::IsNullOrWhiteSpace($title)) { $notifyArgs += @('--title', $title) }
-    \\# $env:VERDE_LIVE_ENDPOINT is inherited, so the CLI targets the exact named pipe advertised by Verde.
-    \\try { & $cli @notifyArgs *> $null } catch {}
-    \\exit 0
     \\
+    ++ POWERSHELL_AGENT_ACTIVITY_STATE ++
+        \\$eventName = if ($null -ne $payload -and $null -ne $payload.hook_event_name) { [string]$payload.hook_event_name } elseif ($null -ne $payload -and $null -ne $payload.event) { [string]$payload.event } elseif ($args.Count -gt 0) { [string]$args[0] } else { '' }
+        \\$activity = ''
+        \\$title = ''
+        \\switch ($eventName) {
+        \\  'SessionStart' { $activity = 'session-start' }
+        \\  'UserPromptSubmit' {
+        \\    $activity = 'parent-working'
+        \\    if ($null -ne $payload -and $null -ne $payload.prompt) {
+        \\      $title = [regex]::Replace([string]$payload.prompt, '\s+', ' ').Trim()
+        \\      if ($title.Length -gt 72) { $title = $title.Substring(0, 72) }
+        \\    }
+        \\  }
+        \\  'PermissionRequest' { $activity = 'parent-waiting' }
+        \\  'SubagentStart' { $activity = 'child-start' }
+        \\  'SubagentStop' { $activity = 'child-stop' }
+        \\  'Stop' { $activity = 'parent-idle' }
+        \\  default { exit 0 }
+        \\}
+        \\$status = Update-AgentStatus -Provider 'codex' -Activity $activity -InitialStatus 'working' -PayloadText $payloadText
+        \\if ([string]::IsNullOrWhiteSpace($status)) { exit 0 }
+        \\$cli = if ([string]::IsNullOrWhiteSpace($env:VERDE_CLI)) { 'verde.exe' } else { $env:VERDE_CLI }
+        \\if ($cli.EndsWith(' (deleted)')) { $cli = $cli.Substring(0, $cli.Length - 10) }
+        \\$notifyArgs = @('notify', '--quiet', '--status', $status, '--provider', 'codex')
+        \\if (-not [string]::IsNullOrWhiteSpace($title)) { $notifyArgs += @('--title', $title) }
+        \\# $env:VERDE_LIVE_ENDPOINT is inherited, so the CLI targets the exact named pipe advertised by Verde.
+        \\try { & $cli @notifyArgs *> $null } catch {}
+        \\exit 0
+        \\
     ;
 }
 
@@ -474,29 +699,36 @@ fn claudePowerShellHookScript() []const u8 {
     \\# verde-claude-notify-hook
     \\if ($env:VERDE -ne '1' -or [string]::IsNullOrWhiteSpace($env:VERDE_SESSION_ID)) { exit 0 }
     \\$payload = $null
+    \\$payloadText = ''
     \\try {
     \\  $payloadText = [Console]::In.ReadToEnd()
     \\  if (-not [string]::IsNullOrWhiteSpace($payloadText)) { $payload = ConvertFrom-Json -InputObject $payloadText }
     \\} catch {}
-    \\$eventName = if ($null -ne $payload -and $null -ne $payload.hook_event_name) { [string]$payload.hook_event_name } elseif ($args.Count -gt 0) { [string]$args[0] } else { '' }
-    \\$status = ''
-    \\switch ($eventName) {
-    \\  'SessionStart' { $status = 'idle' }
-    \\  'UserPromptSubmit' { $status = 'working' }
-    \\  'Notification' {
-    \\    $message = if ($null -ne $payload -and $null -ne $payload.message) { [string]$payload.message } else { '' }
-    \\    if ($message -match 'waiting for your input|is idle') { exit 0 }
-    \\    $status = 'waiting'
-    \\  }
-    \\  'Stop' { $status = 'done' }
-    \\  default { exit 0 }
-    \\}
-    \\$cli = if ([string]::IsNullOrWhiteSpace($env:VERDE_CLI)) { 'verde.exe' } else { $env:VERDE_CLI }
-    \\if ($cli.EndsWith(' (deleted)')) { $cli = $cli.Substring(0, $cli.Length - 10) }
-    \\# $env:VERDE_LIVE_ENDPOINT is inherited, so the CLI targets the exact named pipe advertised by Verde.
-    \\try { & $cli notify --quiet --status $status --provider claude *> $null } catch {}
-    \\exit 0
     \\
+    ++ POWERSHELL_AGENT_ACTIVITY_STATE ++
+        \\$eventName = if ($null -ne $payload -and $null -ne $payload.hook_event_name) { [string]$payload.hook_event_name } elseif ($args.Count -gt 0) { [string]$args[0] } else { '' }
+        \\$activity = ''
+        \\switch ($eventName) {
+        \\  'SessionStart' { $activity = 'session-start' }
+        \\  'UserPromptSubmit' { $activity = 'parent-working' }
+        \\  'Notification' {
+        \\    $message = if ($null -ne $payload -and $null -ne $payload.message) { [string]$payload.message } else { '' }
+        \\    if ($message -match 'waiting for your input|is idle') { exit 0 }
+        \\    $activity = 'parent-waiting'
+        \\  }
+        \\  'SubagentStart' { $activity = 'child-start' }
+        \\  'SubagentStop' { $activity = 'child-stop' }
+        \\  'Stop' { $activity = 'parent-idle' }
+        \\  default { exit 0 }
+        \\}
+        \\$status = Update-AgentStatus -Provider 'claude' -Activity $activity -InitialStatus 'idle' -PayloadText $payloadText
+        \\if ([string]::IsNullOrWhiteSpace($status)) { exit 0 }
+        \\$cli = if ([string]::IsNullOrWhiteSpace($env:VERDE_CLI)) { 'verde.exe' } else { $env:VERDE_CLI }
+        \\if ($cli.EndsWith(' (deleted)')) { $cli = $cli.Substring(0, $cli.Length - 10) }
+        \\# $env:VERDE_LIVE_ENDPOINT is inherited, so the CLI targets the exact named pipe advertised by Verde.
+        \\try { & $cli notify --quiet --status $status --provider claude *> $null } catch {}
+        \\exit 0
+        \\
     ;
 }
 
@@ -505,38 +737,45 @@ fn cursorPowerShellHookScript() []const u8 {
     \\# verde-cursor-notify-hook
     \\if ($env:VERDE -ne '1' -or [string]::IsNullOrWhiteSpace($env:VERDE_SESSION_ID)) { exit 0 }
     \\$payload = $null
+    \\$payloadText = ''
     \\try {
     \\  $payloadText = [Console]::In.ReadToEnd()
     \\  if (-not [string]::IsNullOrWhiteSpace($payloadText)) { $payload = ConvertFrom-Json -InputObject $payloadText }
     \\} catch {}
-    \\$eventName = if ($null -ne $payload -and $null -ne $payload.hook_event_name) { [string]$payload.hook_event_name } else { '' }
-    \\$status = ''
-    \\$title = ''
-    \\switch ($eventName) {
-    \\  'sessionStart' { $status = 'idle' }
-    \\  'beforeSubmitPrompt' {
-    \\    $status = 'working'
-    \\    if ($null -ne $payload -and $null -ne $payload.prompt) {
-    \\      $title = [regex]::Replace([string]$payload.prompt, '\s+', ' ').Trim()
-    \\      if ($title.Length -gt 72) { $title = $title.Substring(0, 72) }
-    \\    }
-    \\  }
-    \\  'preToolUse' { $status = 'working' }
-    \\  'stop' {
-    \\    $result = if ($null -ne $payload -and $null -ne $payload.status) { [string]$payload.status } else { '' }
-    \\    $status = if ($result -eq 'error') { 'error' } else { 'done' }
-    \\  }
-    \\  default { exit 0 }
-    \\}
-    \\$cli = if ([string]::IsNullOrWhiteSpace($env:VERDE_CLI)) { 'verde.exe' } else { $env:VERDE_CLI }
-    \\if ($cli.EndsWith(' (deleted)')) { $cli = $cli.Substring(0, $cli.Length - 10) }
-    \\$notifyArgs = @('notify', '--quiet', '--status', $status, '--provider', 'cursor')
-    \\if (-not [string]::IsNullOrWhiteSpace($title)) { $notifyArgs += @('--title', $title) }
-    \\# $env:VERDE_LIVE_ENDPOINT is inherited, so the CLI reaches the owning Verde pane.
-    \\try { & $cli @notifyArgs *> $null } catch {}
-    \\[Console]::Out.WriteLine('{}')
-    \\exit 0
     \\
+    ++ POWERSHELL_AGENT_ACTIVITY_STATE ++
+        \\$eventName = if ($null -ne $payload -and $null -ne $payload.hook_event_name) { [string]$payload.hook_event_name } else { '' }
+        \\$activity = ''
+        \\$title = ''
+        \\switch ($eventName) {
+        \\  'sessionStart' { $activity = 'session-start' }
+        \\  'beforeSubmitPrompt' {
+        \\    $activity = 'parent-working'
+        \\    if ($null -ne $payload -and $null -ne $payload.prompt) {
+        \\      $title = [regex]::Replace([string]$payload.prompt, '\s+', ' ').Trim()
+        \\      if ($title.Length -gt 72) { $title = $title.Substring(0, 72) }
+        \\    }
+        \\  }
+        \\  'preToolUse' { $activity = 'parent-working' }
+        \\  'subagentStart' { $activity = 'child-start' }
+        \\  'subagentStop' { $activity = 'child-stop' }
+        \\  'stop' {
+        \\    $result = if ($null -ne $payload -and $null -ne $payload.status) { [string]$payload.status } else { '' }
+        \\    $activity = if ($result -eq 'error') { 'parent-error' } else { 'parent-idle' }
+        \\  }
+        \\  default { exit 0 }
+        \\}
+        \\$status = Update-AgentStatus -Provider 'cursor' -Activity $activity -InitialStatus 'idle' -PayloadText $payloadText
+        \\if ([string]::IsNullOrWhiteSpace($status)) { exit 0 }
+        \\$cli = if ([string]::IsNullOrWhiteSpace($env:VERDE_CLI)) { 'verde.exe' } else { $env:VERDE_CLI }
+        \\if ($cli.EndsWith(' (deleted)')) { $cli = $cli.Substring(0, $cli.Length - 10) }
+        \\$notifyArgs = @('notify', '--quiet', '--status', $status, '--provider', 'cursor')
+        \\if (-not [string]::IsNullOrWhiteSpace($title)) { $notifyArgs += @('--title', $title) }
+        \\# $env:VERDE_LIVE_ENDPOINT is inherited, so the CLI reaches the owning Verde pane.
+        \\try { & $cli @notifyArgs *> $null } catch {}
+        \\[Console]::Out.WriteLine('{}')
+        \\exit 0
+        \\
     ;
 }
 
@@ -576,59 +815,66 @@ fn grokPowerShellHookScript() []const u8 {
     \\  exit 0
     \\}
     \\$payload = $null
+    \\$payloadText = ''
     \\try {
     \\  $payloadText = [Console]::In.ReadToEnd()
     \\  if (-not [string]::IsNullOrWhiteSpace($payloadText)) { $payload = ConvertFrom-Json -InputObject $payloadText }
     \\} catch {}
-    \\$eventName = if ($null -ne $payload -and $null -ne $payload.hookEventName) { [string]$payload.hookEventName } elseif (-not [string]::IsNullOrWhiteSpace($env:GROK_HOOK_EVENT)) { $env:GROK_HOOK_EVENT } else { '' }
-    \\$status = ''
-    \\$title = ''
-    \\switch ($eventName) {
-    \\  { $_ -in 'session_start', 'SessionStart' } { $status = 'idle'; break }
-    \\  { $_ -in 'user_prompt_submit', 'UserPromptSubmit' } {
-    \\    $status = 'working'
-    \\    if ($null -ne $payload -and $null -ne $payload.prompt) {
-    \\      $title = [regex]::Replace([string]$payload.prompt, '^\s*<user_query>\s*', '', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-    \\      $title = [regex]::Replace($title, '\s*</user_query>\s*$', '', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-    \\      $title = [regex]::Replace($title, '\s+', ' ').Trim()
-    \\      if ($title.Length -gt 72) { $title = $title.Substring(0, 72) }
-    \\    }
-    \\    break
-    \\  }
-    \\  { $_ -in 'pre_tool_use', 'PreToolUse' } { $status = 'working'; break }
-    \\  { $_ -in 'notification', 'Notification' } {
-    \\    $notificationType = if ($null -ne $payload -and $null -ne $payload.notificationType) { [string]$payload.notificationType } else { '' }
-    \\    $message = if ($null -ne $payload -and $null -ne $payload.message) { [string]$payload.message } else { '' }
-    \\    $notification = ($notificationType + ' ' + $message).ToLowerInvariant()
-    \\    if ($notification -notmatch 'permission|approval|confirm|action.required|input.required|user.input|elicitation') { exit 0 }
-    \\    $status = 'waiting'
-    \\    break
-    \\  }
-    \\  { $_ -in 'stop', 'Stop' } {
-    \\    $reason = if ($null -ne $payload -and $null -ne $payload.reason) { [string]$payload.reason } else { '' }
-    \\    $status = if ([string]::IsNullOrWhiteSpace($reason) -or $reason -eq 'end_turn') { 'done' } else { 'idle' }
-    \\    $sessionId = if ($null -ne $payload -and $null -ne $payload.sessionId) { [string]$payload.sessionId } else { '' }
-    \\    if ($sessionId -match '^[A-Za-z0-9-]+$' -and -not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
-    \\      $env:VERDE_GROK_TITLE_SESSION_ID = $sessionId
-    \\      $env:VERDE_GROK_TITLE_STATUS = $status
-    \\      $quotedScriptPath = '"' + $PSCommandPath + '"'
-    \\      try {
-    \\        Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $quotedScriptPath) -WindowStyle Hidden | Out-Null
-    \\      } catch {}
-    \\      Remove-Item Env:VERDE_GROK_TITLE_SESSION_ID -ErrorAction SilentlyContinue
-    \\      Remove-Item Env:VERDE_GROK_TITLE_STATUS -ErrorAction SilentlyContinue
-    \\    }
-    \\    break
-    \\  }
-    \\  { $_ -in 'stop_failure', 'StopFailure' } { $status = 'error'; break }
-    \\  default { exit 0 }
-    \\}
-    \\$notifyArgs = @('notify', '--quiet', '--status', $status, '--provider', 'grok')
-    \\if (-not [string]::IsNullOrWhiteSpace($title)) { $notifyArgs += @('--title', $title) }
-    \\# $env:VERDE_LIVE_ENDPOINT is inherited, so the CLI reaches the owning Verde pane.
-    \\try { & $cli @notifyArgs *> $null } catch {}
-    \\exit 0
     \\
+    ++ POWERSHELL_AGENT_ACTIVITY_STATE ++
+        \\$eventName = if ($null -ne $payload -and $null -ne $payload.hookEventName) { [string]$payload.hookEventName } elseif (-not [string]::IsNullOrWhiteSpace($env:GROK_HOOK_EVENT)) { $env:GROK_HOOK_EVENT } else { '' }
+        \\$activity = ''
+        \\$title = ''
+        \\$sessionId = ''
+        \\switch ($eventName) {
+        \\  { $_ -in 'session_start', 'SessionStart' } { $activity = 'session-start'; break }
+        \\  { $_ -in 'user_prompt_submit', 'UserPromptSubmit' } {
+        \\    $activity = 'parent-working'
+        \\    if ($null -ne $payload -and $null -ne $payload.prompt) {
+        \\      $title = [regex]::Replace([string]$payload.prompt, '^\s*<user_query>\s*', '', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        \\      $title = [regex]::Replace($title, '\s*</user_query>\s*$', '', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        \\      $title = [regex]::Replace($title, '\s+', ' ').Trim()
+        \\      if ($title.Length -gt 72) { $title = $title.Substring(0, 72) }
+        \\    }
+        \\    break
+        \\  }
+        \\  { $_ -in 'pre_tool_use', 'PreToolUse' } { $activity = 'parent-working'; break }
+        \\  { $_ -in 'notification', 'Notification' } {
+        \\    $notificationType = if ($null -ne $payload -and $null -ne $payload.notificationType) { [string]$payload.notificationType } else { '' }
+        \\    $message = if ($null -ne $payload -and $null -ne $payload.message) { [string]$payload.message } else { '' }
+        \\    $notification = ($notificationType + ' ' + $message).ToLowerInvariant()
+        \\    if ($notification -notmatch 'permission|approval|confirm|action.required|input.required|user.input|elicitation') { exit 0 }
+        \\    $activity = 'parent-waiting'
+        \\    break
+        \\  }
+        \\  { $_ -in 'subagent_start', 'SubagentStart' } { $activity = 'child-start'; break }
+        \\  { $_ -in 'subagent_stop', 'SubagentStop' } { $activity = 'child-stop'; break }
+        \\  { $_ -in 'stop', 'Stop' } {
+        \\    $activity = 'parent-idle'
+        \\    $sessionId = if ($null -ne $payload -and $null -ne $payload.sessionId) { [string]$payload.sessionId } else { '' }
+        \\    break
+        \\  }
+        \\  { $_ -in 'stop_failure', 'StopFailure' } { $activity = 'parent-error'; break }
+        \\  default { exit 0 }
+        \\}
+        \\$status = Update-AgentStatus -Provider 'grok' -Activity $activity -InitialStatus 'idle' -PayloadText $payloadText
+        \\if ([string]::IsNullOrWhiteSpace($status)) { exit 0 }
+        \\if ($sessionId -match '^[A-Za-z0-9-]+$' -and -not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        \\  $env:VERDE_GROK_TITLE_SESSION_ID = $sessionId
+        \\  $env:VERDE_GROK_TITLE_STATUS = $status
+        \\  $quotedScriptPath = '"' + $PSCommandPath + '"'
+        \\  try {
+        \\    Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $quotedScriptPath) -WindowStyle Hidden | Out-Null
+        \\  } catch {}
+        \\  Remove-Item Env:VERDE_GROK_TITLE_SESSION_ID -ErrorAction SilentlyContinue
+        \\  Remove-Item Env:VERDE_GROK_TITLE_STATUS -ErrorAction SilentlyContinue
+        \\}
+        \\$notifyArgs = @('notify', '--quiet', '--status', $status, '--provider', 'grok')
+        \\if (-not [string]::IsNullOrWhiteSpace($title)) { $notifyArgs += @('--title', $title) }
+        \\# $env:VERDE_LIVE_ENDPOINT is inherited, so the CLI reaches the owning Verde pane.
+        \\try { & $cli @notifyArgs *> $null } catch {}
+        \\exit 0
+        \\
     ;
 }
 
@@ -638,7 +884,7 @@ const CLAUDE_GLOBAL_HOOK_REL = ".claude/verde-claude-notify-hook.sh";
 const CLAUDE_WINDOWS_GLOBAL_HOOK_REL = ".claude/verde-claude-notify-hook.ps1";
 const CLAUDE_GLOBAL_SETTINGS_REL = ".claude/settings.json";
 const CLAUDE_GLOBAL_HOOK_NEEDLE = "verde-claude-notify-hook";
-const CLAUDE_HOOK_EVENTS = [_][]const u8{ "SessionStart", "UserPromptSubmit", "Notification", "Stop" };
+const CLAUDE_HOOK_EVENTS = [_][]const u8{ "SessionStart", "UserPromptSubmit", "Notification", "SubagentStart", "SubagentStop", "Stop" };
 
 const CURSOR_GLOBAL_HOOK_REL = ".cursor/hooks/verde-cursor-notify-hook.sh";
 const CURSOR_WINDOWS_GLOBAL_HOOK_REL = ".cursor/hooks/verde-cursor-notify-hook.ps1";
@@ -652,10 +898,12 @@ const GROK_GLOBAL_HOOK_REL = "verde-grok-notify-hook.sh";
 const GROK_WINDOWS_GLOBAL_HOOK_REL = "verde-grok-notify-hook.ps1";
 const GROK_GLOBAL_HOOKS_JSON_REL = "hooks/verde-notify.json";
 const GROK_GLOBAL_HOOK_NEEDLE = "verde-grok-notify-hook";
-const GROK_HOOK_EVENTS = [_][]const u8{ "SessionStart", "UserPromptSubmit", "PreToolUse", "Notification", "Stop", "StopFailure" };
+const GROK_HOOK_EVENTS = [_][]const u8{ "SessionStart", "UserPromptSubmit", "PreToolUse", "Notification", "SubagentStart", "SubagentStop", "Stop", "StopFailure" };
 
 const AMP_GLOBAL_PLUGIN_REL = ".config/amp/plugins/verde-notify.ts";
 const AMP_GLOBAL_PLUGIN_NEEDLE = "verde-amp-notify-plugin";
+const OPENCODE_GLOBAL_PLUGIN_REL = ".config/opencode/plugin/verde-notify.ts";
+const OPENCODE_GLOBAL_PLUGIN_NEEDLE = "verde-opencode-notify-plugin";
 
 fn homeDirAlloc(allocator: std.mem.Allocator) ![]u8 {
     return platform_paths.userHome(allocator);
@@ -1029,12 +1277,14 @@ fn writeGrokHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const u
         \\event="$(sed -n 's/.*"hookEventName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
         \\[ -n "$event" ] || event="${GROK_HOOK_EVENT:-}"
         \\
-        \\status=""
+    ++ POSIX_AGENT_ACTIVITY_STATE ++
+        \\activity=""
         \\title=""
+        \\session_id=""
         \\case "$event" in
-        \\  session_start|SessionStart) status="idle" ;;
+        \\  session_start|SessionStart) activity="session-start" ;;
         \\  user_prompt_submit|UserPromptSubmit)
-        \\    status="working"
+        \\    activity="parent-working"
         \\    if command -v jq >/dev/null 2>&1; then
         \\      title="$(jq -r '.prompt // .userPrompt // empty' "$payload" 2>/dev/null)"
         \\    else
@@ -1042,7 +1292,7 @@ fn writeGrokHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const u
         \\    fi
         \\    title="$(printf '%s' "$title" | tr '\n\t' '  ' | sed -e 's/^[[:space:]]*<user_query>[[:space:]]*//' -e 's/[[:space:]]*<\/user_query>[[:space:]]*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g' | cut -c1-72)"
         \\    ;;
-        \\  pre_tool_use|PreToolUse) status="working" ;;
+        \\  pre_tool_use|PreToolUse) activity="parent-working" ;;
         \\  notification|Notification)
         \\    if command -v jq >/dev/null 2>&1; then
         \\      notification="$(jq -r '[(.notificationType // ""), (.message // ""), (.body // ""), (.title // "")] | join(" ") | ascii_downcase' "$payload" 2>/dev/null)"
@@ -1050,29 +1300,28 @@ fn writeGrokHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const u
         \\      notification="$(sed -n 's/.*"notificationType"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1 | tr '[:upper:]' '[:lower:]')"
         \\    fi
         \\    case "$notification" in
-        \\      *permission*|*approval*|*confirm*|*"action required"*|*action_required*|*action-required*|*"input required"*|*input_required*|*input-required*|*"user input"*|*user_input*|*user-input*|*elicitation*) status="waiting" ;;
+        \\      *permission*|*approval*|*confirm*|*"action required"*|*action_required*|*action-required*|*"input required"*|*input_required*|*input-required*|*"user input"*|*user_input*|*user-input*|*elicitation*) activity="parent-waiting" ;;
         \\      *) rm -f "$payload"; exit 0 ;;
         \\    esac
         \\    ;;
+        \\  subagent_start|SubagentStart) activity="child-start" ;;
+        \\  subagent_stop|SubagentStop) activity="child-stop" ;;
         \\  stop|Stop)
-        \\    if command -v jq >/dev/null 2>&1; then
-        \\      reason="$(jq -r '.reason // empty' "$payload" 2>/dev/null)"
-        \\    else
-        \\      reason="$(sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
-        \\    fi
-        \\    if [ -z "$reason" ] || [ "$reason" = "end_turn" ]; then status="done"; else status="idle"; fi
+        \\    activity="parent-idle"
         \\    if command -v jq >/dev/null 2>&1; then
         \\      session_id="$(jq -r '.sessionId // empty' "$payload" 2>/dev/null)"
         \\    else
         \\      session_id="$(sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
         \\    fi
-        \\    case "$session_id" in
-        \\      ""|*[!A-Za-z0-9-]*) ;;
-        \\      *) VERDE_GROK_TITLE_SESSION_ID="$session_id" VERDE_GROK_TITLE_STATUS="$status" "$0" </dev/null >/dev/null 2>&1 & ;;
-        \\    esac
         \\    ;;
-        \\  stop_failure|StopFailure) status="error" ;;
+        \\  stop_failure|StopFailure) activity="parent-error" ;;
         \\  *) rm -f "$payload"; exit 0 ;;
+        \\esac
+        \\status="$(update_agent_status grok "$activity" idle)"
+        \\[ -n "$status" ] || { rm -f "$payload"; exit 0; }
+        \\case "$session_id" in
+        \\  ""|*[!A-Za-z0-9-]*) ;;
+        \\  *) VERDE_GROK_TITLE_SESSION_ID="$session_id" VERDE_GROK_TITLE_STATUS="$status" "$0" </dev/null >/dev/null 2>&1 & ;;
         \\esac
         \\
         \\if [ -n "$title" ]; then
@@ -1117,6 +1366,164 @@ fn writeGrokHookEvent(s: *std.json.Stringify, event: []const u8, hook_path: []co
     try s.endArray();
     try s.endObject();
     try s.endArray();
+}
+
+/// True when our managed OpenCode plugin is present in the global plugin dir.
+pub fn opencodeGlobalHooksInstalled(allocator: std.mem.Allocator) bool {
+    const home = homeDirAlloc(allocator) catch return false;
+    defer allocator.free(home);
+    const plugin_path = std.fs.path.join(allocator, &.{ home, OPENCODE_GLOBAL_PLUGIN_REL }) catch return false;
+    defer allocator.free(plugin_path);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const content = std.Io.Dir.cwd().readFileAlloc(threaded.io(), plugin_path, allocator, .limited(1024 * 1024)) catch return false;
+    defer allocator.free(content);
+    return std.mem.indexOf(u8, content, OPENCODE_GLOBAL_PLUGIN_NEEDLE) != null;
+}
+
+/// Installs the OpenCode lifecycle plugin globally. OpenCode discovers TypeScript
+/// plugins from ~/.config/opencode/plugin without modifying user configuration.
+pub fn ensureOpencodeGlobalHooks(allocator: std.mem.Allocator) !void {
+    const home = homeDirAlloc(allocator) catch return error.NoHomeDir;
+    defer allocator.free(home);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const plugin_path = try std.fs.path.join(allocator, &.{ home, OPENCODE_GLOBAL_PLUGIN_REL });
+    defer allocator.free(plugin_path);
+    try ensureParentDir(io, plugin_path);
+    try writeOpencodePlugin(allocator, io, plugin_path);
+}
+
+/// Removes the managed OpenCode lifecycle plugin. Idempotent.
+pub fn removeOpencodeGlobalHooks(allocator: std.mem.Allocator) !void {
+    const home = homeDirAlloc(allocator) catch return error.NoHomeDir;
+    defer allocator.free(home);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+
+    const plugin_path = try std.fs.path.join(allocator, &.{ home, OPENCODE_GLOBAL_PLUGIN_REL });
+    defer allocator.free(plugin_path);
+    std.Io.Dir.cwd().deleteFile(threaded.io(), plugin_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn writeOpencodePlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    const plugin =
+        \\// verde-opencode-notify-plugin
+        \\import type { Plugin } from '@opencode-ai/plugin';
+        \\
+        \\type AgentStatus = 'idle' | 'busy' | 'retry';
+        \\type VerdeStatus = 'working' | 'done' | 'waiting';
+        \\type SessionNode = {
+        \\  parentID?: string;
+        \\  status: AgentStatus;
+        \\};
+        \\
+        \\function inVerdePane(): boolean {
+        \\  return process.env.VERDE === '1' && Boolean(process.env.VERDE_SESSION_ID);
+        \\}
+        \\
+        \\function verdeCli(): string {
+        \\  const raw = process.env.VERDE_CLI || (process.platform === 'win32' ? 'verde.exe' : 'verde');
+        \\  return raw.endsWith(' (deleted)') ? raw.slice(0, -10) : raw;
+        \\}
+        \\
+        \\export const VerdeNotificationPlugin: Plugin = async ({ $ }) => {
+        \\  const sessions = new Map<string, SessionNode>();
+        \\  const permissionSessions = new Set<string>();
+        \\  let activitySeen = false;
+        \\  let lastStatus: VerdeStatus | null = null;
+        \\  let pending = Promise.resolve();
+        \\
+        \\  const paneStatus = (): VerdeStatus | null => {
+        \\    for (const node of sessions.values()) {
+        \\      if (!node.parentID && (node.status === 'busy' || node.status === 'retry')) return 'working';
+        \\    }
+        \\    if (permissionSessions.size > 0) return 'waiting';
+        \\    for (const node of sessions.values()) {
+        \\      if (node.parentID && (node.status === 'busy' || node.status === 'retry')) return 'waiting';
+        \\    }
+        \\    return activitySeen ? 'done' : null;
+        \\  };
+        \\
+        \\  const notifyStatus = (): void => {
+        \\    if (!inVerdePane()) return;
+        \\    const status = paneStatus();
+        \\    if (status === null || status === lastStatus) return;
+        \\    lastStatus = status;
+        \\    pending = pending.then(async () => {
+        \\      const cli = verdeCli();
+        \\      try {
+        \\        await $`${cli} notify --quiet --status ${status} --provider opencode`;
+        \\      } catch {
+        \\        // Status reporting is best-effort and must not interrupt OpenCode.
+        \\      }
+        \\    });
+        \\  };
+        \\
+        \\  const setSessionInfo = (info: { id: string; parentID?: string }): void => {
+        \\    const previous = sessions.get(info.id);
+        \\    const status = previous?.status ?? (info.parentID ? 'busy' : 'idle');
+        \\    sessions.set(info.id, { parentID: info.parentID, status });
+        \\    if (info.parentID && status === 'busy') activitySeen = true;
+        \\    notifyStatus();
+        \\  };
+        \\
+        \\  const setSessionStatus = (sessionID: string, status: AgentStatus): void => {
+        \\    const previous = sessions.get(sessionID);
+        \\    sessions.set(sessionID, { parentID: previous?.parentID, status });
+        \\    if (status === 'busy' || status === 'retry') {
+        \\      activitySeen = true;
+        \\      permissionSessions.delete(sessionID);
+        \\    }
+        \\    notifyStatus();
+        \\  };
+        \\
+        \\  return {
+        \\    event: async ({ event }) => {
+        \\      switch (event.type) {
+        \\        case 'session.created':
+        \\        case 'session.updated':
+        \\          setSessionInfo(event.properties.info);
+        \\          break;
+        \\        case 'session.status':
+        \\          setSessionStatus(event.properties.sessionID, event.properties.status.type);
+        \\          break;
+        \\        case 'session.idle':
+        \\          setSessionStatus(event.properties.sessionID, 'idle');
+        \\          break;
+        \\        case 'session.deleted':
+        \\          sessions.delete(event.properties.info.id);
+        \\          permissionSessions.delete(event.properties.info.id);
+        \\          notifyStatus();
+        \\          break;
+        \\        case 'permission.updated':
+        \\          activitySeen = true;
+        \\          permissionSessions.add(event.properties.sessionID);
+        \\          notifyStatus();
+        \\          break;
+        \\        case 'permission.replied':
+        \\          permissionSessions.delete(event.properties.sessionID);
+        \\          notifyStatus();
+        \\          break;
+        \\      }
+        \\    },
+        \\    'permission.ask': async (input, output) => {
+        \\      if (output.status === 'ask') {
+        \\        activitySeen = true;
+        \\        permissionSessions.add(input.sessionID);
+        \\        notifyStatus();
+        \\      }
+        \\    },
+        \\  };
+        \\};
+        \\
+    ;
+    try writeFileAtomic(allocator, io, path, plugin, .default_file);
 }
 
 /// True when our managed Amp plugin is present in the global Amp plugin dir.
@@ -1169,8 +1576,16 @@ fn writeAmpPlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !v
         \\// verde-amp-notify-plugin
         \\import type { PluginAPI, Subscription, ThreadState } from '@ampcode/plugin';
         \\
+        \\type ChildWatch = {
+        \\  active: boolean;
+        \\  revision: number;
+        \\  subscription: Subscription | null;
+        \\};
+        \\
         \\type ThreadWatch = {
         \\  active: boolean;
+        \\  children: Map<string, ChildWatch>;
+        \\  parentState: ThreadState;
         \\  pending: Promise<void>;
         \\  revision: number;
         \\  subscription: Subscription | null;
@@ -1200,31 +1615,109 @@ fn writeAmpPlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !v
         \\  }
         \\}
         \\
+        \\async function notifyThreadStatus(amp: PluginAPI, watch: ThreadWatch): Promise<void> {
+        \\  let status: 'idle' | 'working' | 'done' | 'waiting' | 'error';
+        \\  switch (watch.parentState) {
+        \\    case 'running':
+        \\      status = 'working';
+        \\      break;
+        \\    case 'awaiting-approval':
+        \\      status = 'waiting';
+        \\      break;
+        \\    case 'error':
+        \\      status = 'error';
+        \\      break;
+        \\    case 'idle':
+        \\      status = watch.children.size > 0 ? 'waiting' : watch.active ? 'done' : 'idle';
+        \\      if (status !== 'waiting') watch.active = false;
+        \\      break;
+        \\  }
+        \\  await notify(amp, amp.$, status);
+        \\}
+        \\
         \\function queueThreadState(amp: PluginAPI, threadId: string, watch: ThreadWatch, state: ThreadState): void {
         \\  watch.pending = watch.pending.then(async () => {
         \\    if (threadWatches.get(threadId) !== watch) return;
-        \\
-        \\    let status: 'idle' | 'working' | 'done' | 'waiting' | 'error';
+        \\    watch.parentState = state;
         \\    switch (state) {
         \\      case 'running':
-        \\        watch.active = true;
-        \\        status = 'working';
-        \\        break;
         \\      case 'awaiting-approval':
-        \\        watch.active = true;
-        \\        status = 'waiting';
-        \\        break;
         \\      case 'error':
         \\        watch.active = true;
-        \\        status = 'error';
         \\        break;
         \\      case 'idle':
-        \\        status = watch.active ? 'done' : 'idle';
-        \\        watch.active = false;
         \\        break;
         \\    }
-        \\    await notify(amp, amp.$, status);
+        \\    await notifyThreadStatus(amp, watch);
         \\  });
+        \\}
+        \\
+        \\function queueChildState(amp: PluginAPI, threadId: string, watch: ThreadWatch, childId: string, child: ChildWatch, state: ThreadState): void {
+        \\  watch.pending = watch.pending.then(async () => {
+        \\    if (threadWatches.get(threadId) !== watch || watch.children.get(childId) !== child) return;
+        \\    switch (state) {
+        \\      case 'running':
+        \\      case 'awaiting-approval':
+        \\        child.active = true;
+        \\        break;
+        \\      case 'error':
+        \\        child.subscription?.unsubscribe();
+        \\        watch.children.delete(childId);
+        \\        break;
+        \\      case 'idle':
+        \\        // A freshly created thread can be idle before its executor starts.
+        \\        if (child.active) {
+        \\          child.subscription?.unsubscribe();
+        \\          watch.children.delete(childId);
+        \\        }
+        \\        break;
+        \\    }
+        \\    await notifyThreadStatus(amp, watch);
+        \\  });
+        \\}
+        \\
+        \\function watchChildThread(amp: PluginAPI, threadId: string, watch: ThreadWatch, childId: string): void {
+        \\  if (childId === threadId || watch.children.has(childId)) return;
+        \\  const child: ChildWatch = {
+        \\    active: false,
+        \\    revision: 0,
+        \\    subscription: null,
+        \\  };
+        \\  watch.children.set(childId, child);
+        \\  const childThread = amp.threads.get(childId as `T-${string}`);
+        \\  child.subscription = childThread.state.subscribe((state) => {
+        \\    child.revision += 1;
+        \\    queueChildState(amp, threadId, watch, childId, child, state);
+        \\  });
+        \\  void childThread.state.get().then((state) => {
+        \\    if (threadWatches.get(threadId) === watch && watch.children.get(childId) === child && child.revision === 0) {
+        \\      queueChildState(amp, threadId, watch, childId, child, state);
+        \\    }
+        \\  }).catch((err) => {
+        \\    amp.logger.log(`Verde child thread state failed: ${err instanceof Error ? err.message : String(err)}`);
+        \\  });
+        \\}
+        \\
+        \\function threadIdsFromOutput(output: unknown): Set<string> {
+        \\  const ids = new Set<string>();
+        \\  const seen = new WeakSet<object>();
+        \\  const visit = (value: unknown): void => {
+        \\    if (typeof value === 'string') {
+        \\      for (const match of value.matchAll(/T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi)) {
+        \\        ids.add(match[0]);
+        \\      }
+        \\      return;
+        \\    }
+        \\    if (value === null || typeof value !== 'object' || seen.has(value)) return;
+        \\    seen.add(value);
+        \\    if (Array.isArray(value)) {
+        \\      for (const item of value) visit(item);
+        \\    } else {
+        \\      for (const item of Object.values(value as Record<string, unknown>)) visit(item);
+        \\    }
+        \\  };
+        \\  visit(output);
+        \\  return ids;
         \\}
         \\
         \\export default function (amp: PluginAPI) {
@@ -1232,9 +1725,15 @@ fn writeAmpPlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !v
         \\
         \\  amp.on('session.start', async (event, ctx) => {
         \\    const threadId = event.thread.id;
-        \\    threadWatches.get(threadId)?.subscription?.unsubscribe();
+        \\    const previous = threadWatches.get(threadId);
+        \\    previous?.subscription?.unsubscribe();
+        \\    if (previous) {
+        \\      for (const child of previous.children.values()) child.subscription?.unsubscribe();
+        \\    }
         \\    const watch: ThreadWatch = {
         \\      active: false,
+        \\      children: new Map(),
+        \\      parentState: 'idle',
         \\      pending: Promise.resolve(),
         \\      revision: 0,
         \\      subscription: null,
@@ -1250,8 +1749,21 @@ fn writeAmpPlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !v
         \\    }
         \\  });
         \\
+        \\  amp.on('tool.result', (event) => {
+        \\    if (event.tool !== 'create_thread' || event.status !== 'done') return;
+        \\    const threadId = event.thread.id;
+        \\    const watch = threadWatches.get(threadId);
+        \\    if (!watch) return;
+        \\    for (const childId of threadIdsFromOutput(event.output)) {
+        \\      watchChildThread(amp, threadId, watch, childId);
+        \\    }
+        \\  });
+        \\
         \\  amp.onDispose(() => {
-        \\    for (const watch of threadWatches.values()) watch.subscription?.unsubscribe();
+        \\    for (const watch of threadWatches.values()) {
+        \\      watch.subscription?.unsubscribe();
+        \\      for (const child of watch.children.values()) child.subscription?.unsubscribe();
+        \\    }
         \\    threadWatches.clear();
         \\  });
         \\}
@@ -1575,6 +2087,26 @@ test "ensureCodexProjectHooks accepts existing managed hooks json" {
     try ensureCodexProjectHooks(std.testing.allocator, project_path);
 }
 
+test "managed project hooks gain subagent lifecycle events" {
+    const codex_hook = "/tmp/verde-codex-notify-hook.sh";
+    const codex_legacy =
+        \\{"hooks":{"Stop":[{"matcher":"*","hooks":[{"type":"command","command":"/tmp/verde-codex-notify-hook.sh"}]}]}}
+    ;
+    const codex_merged = (try mergeCodexHooks(std.testing.allocator, codex_legacy, codex_hook)).?;
+    defer std.testing.allocator.free(codex_merged);
+    try std.testing.expect(std.mem.indexOf(u8, codex_merged, "SubagentStart") != null);
+    try std.testing.expect(std.mem.indexOf(u8, codex_merged, "SubagentStop") != null);
+
+    const claude_hook = "/tmp/verde-claude-notify-hook.sh";
+    const claude_legacy =
+        \\{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/tmp/verde-claude-notify-hook.sh"}]}]}}
+    ;
+    const claude_merged = (try mergeClaudeHooks(std.testing.allocator, claude_legacy, claude_hook)).?;
+    defer std.testing.allocator.free(claude_merged);
+    try std.testing.expect(std.mem.indexOf(u8, claude_merged, "SubagentStart") != null);
+    try std.testing.expect(std.mem.indexOf(u8, claude_merged, "SubagentStop") != null);
+}
+
 test "ensureCodexProjectHooks refuses unmanaged hooks json" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1688,7 +2220,7 @@ test "PowerShell hooks use inherited transport-neutral endpoint and safe invocat
     const grok_script = grokPowerShellHookScript();
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "$env:VERDE_LIVE_ENDPOINT") != null);
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "hookEventName") != null);
-    try std.testing.expect(std.mem.indexOf(u8, grok_script, "end_turn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grok_script, "SubagentStart") != null);
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "<user_query>") != null);
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "</user_query>") != null);
     try std.testing.expect(std.mem.indexOf(u8, grok_script, "generated_title") != null);
@@ -1718,7 +2250,7 @@ test "Grok hook file registers native lifecycle events" {
     defer std.testing.allocator.free(script);
     try std.testing.expect(std.mem.indexOf(u8, script, "hookEventName") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "stop_failure") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "end_turn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "SubagentStart") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "<user_query>") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "<\\/user_query>") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "generated_title") != null);
@@ -1771,5 +2303,9 @@ test "Amp plugin follows thread state across automatic retries" {
     try std.testing.expect(std.mem.indexOf(u8, plugin, "case 'error':") != null);
     try std.testing.expect(std.mem.indexOf(u8, plugin, "case 'idle':") != null);
     try std.testing.expect(std.mem.indexOf(u8, plugin, "threadWatches.get(threadId) === watch && watch.revision === 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "amp.on('tool.result'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "event.tool !== 'create_thread'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "watch.children.size > 0 ? 'waiting'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin, "childThread.state.subscribe") != null);
     try std.testing.expect(std.mem.indexOf(u8, plugin, "amp.on('agent.end'") == null);
 }

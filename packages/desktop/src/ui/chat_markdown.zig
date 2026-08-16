@@ -3877,6 +3877,9 @@ fn queuePaletteRoundedShell(
 }
 
 fn queuePaletteText(context: *PaletteRenderContext, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
+    // Fully clipped lines draw nothing; skip the batch command so a tall body
+    // scrolled mostly offscreen does not pay per-line text cost every frame.
+    if (visibleClipRect(clip, rect) == null) return;
     const stable = stablePaletteText(context, value) catch return;
     context.batch.fixedText(
         context.allocator,
@@ -3901,6 +3904,9 @@ fn queuePaletteRoleText(
     font_role: palette.FontRole,
     clip: ?palette.Rect,
 ) void {
+    // Fully clipped lines draw nothing; skip the batch command so a tall body
+    // scrolled mostly offscreen does not pay per-line text cost every frame.
+    if (visibleClipRect(clip, rect) == null) return;
     const stable = stablePaletteText(context, value) catch return;
     // Palette renders `.mono` text through fixed cells; use the measured mono
     // advance so code layout and glyph placement do not drift apart.

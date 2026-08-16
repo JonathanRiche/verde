@@ -70,6 +70,7 @@ const KeybindRef = enum {
     toggle_browser,
     toggle_terminal,
     workspace_close,
+    workspace_close_current,
     workspace_toggle_maximize,
     workspace_toggle_quick_pane,
     workspace_split_chat_vertical,
@@ -121,10 +122,10 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "workspace.scrolling_automatic", .title = "Scrolling Layout: Automatic", .keywords = "niri panes mode threshold tiled", .section = .workspaces, .run = runScrollingAutomatic, .enabled = hasProjects },
     .{ .id = "workspace.scrolling_always", .title = "Scrolling Layout: Always", .keywords = "niri panes mode pin enable", .section = .workspaces, .run = runScrollingAlways, .enabled = hasProjects },
     .{ .id = "workspace.scrolling_disabled", .title = "Scrolling Layout: Disabled", .keywords = "niri panes mode tiled off disable", .section = .workspaces, .run = runScrollingDisabled, .enabled = hasProjects },
-    .{ .id = "workspace.scrolling_reset_column_width", .title = "Reset Scrolling Column Width", .keywords = "niri panes resize default per view", .section = .workspaces, .run = runResetScrollingColumnWidth, .enabled = hasCustomScrollingColumnWidth },
+    .{ .id = "workspace.scrolling_reset_column_width", .title = "Reset Scrolling Pane Widths", .keywords = "niri panes resize default per view", .section = .workspaces, .run = runResetScrollingColumnWidth, .enabled = hasCustomScrollingColumnWidth },
     .{ .id = "workspace.add", .title = "Add Workspace", .keywords = "new project folder directory", .section = .workspaces, .run = runAddWorkspace },
     .{ .id = "workspace.rename", .title = "Rename Workspace", .keywords = "label", .section = .workspaces, .run = runRenameWorkspace, .enabled = hasProjects },
-    .{ .id = "workspace.close", .title = "Close Workspace", .keywords = "archive remove project save state", .section = .workspaces, .run = runCloseWorkspace, .enabled = workspaceNotBusy },
+    .{ .id = "workspace.close", .title = "Close Workspace", .keywords = "archive remove project save state", .section = .workspaces, .keybind = .workspace_close_current, .run = runCloseWorkspace, .enabled = workspaceNotBusy },
     .{ .id = "workspace.reopen", .title = "Reopen Last Closed Workspace", .keywords = "restore archived project", .section = .workspaces, .run = runReopenWorkspace, .enabled = hasClosedWorkspaces },
     .{ .id = "workspace.codex_tui", .title = "Start New Codex TUI", .keywords = "agent terminal workspace fresh openai", .section = .workspaces, .run = runOpenCodexTui, .enabled = hasProjects },
     .{ .id = "workspace.claude_tui", .title = "Start New Claude TUI", .keywords = "agent terminal workspace fresh anthropic claude code", .section = .workspaces, .run = runOpenClaudeTui, .enabled = hasProjects },
@@ -1073,7 +1074,7 @@ fn hasProjects(state: *runtime.AppState) bool {
 
 fn hasCustomScrollingColumnWidth(state: *runtime.AppState) bool {
     if (state.project_controller.selected_index >= state.project_controller.projects.items.len) return false;
-    return state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.scroll_pane_extent_override != null;
+    return state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.hasCustomScrollPaneExtent();
 }
 
 fn adjacentPaneForCommand(state: *runtime.AppState, previous: bool) ?runtime.WorkspacePaneId {
@@ -1406,8 +1407,8 @@ fn runScrollingUseGlobal(state: *runtime.AppState) void {
 
 fn runResetScrollingColumnWidth(state: *runtime.AppState) void {
     if (state.project_controller.selected_index >= state.project_controller.projects.items.len) return;
-    state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.scroll_pane_extent_override = null;
-    state.setSidebarNotice("Scrolling column width reset to Panes per view.");
+    state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.clearScrollPaneExtents();
+    state.setSidebarNotice("Scrolling pane widths reset to Panes per view.");
     state.markDirty();
 }
 
@@ -1770,17 +1771,16 @@ fn renderWorkspaceRow(state: *runtime.AppState, row_index: usize, project_index:
     var buf: [96]u8 = undefined;
     const label = std.fmt.bufPrint(&buf, "Switch to {s}", .{state.project_controller.projects.items[project_index].label}) catch "Switch workspace";
     queueText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = text_y, .w = theme.scaledUi(16.0), .h = font_size * 1.3 }, ">", paletteColor(theme.COLOR_GREEN), font_size, row_clip);
-    const hint_w = theme.scaledUi(64.0);
+    var hint_buf_local: [32]u8 = undefined;
+    const hint = workspaceSelectHintFor(state, &hint_buf_local, project_index);
+    const hint_w = if (hint.len > 0) theme.scaledUi(110.0) else theme.scaledUi(0.0);
     queueText(state, .{
         .x = rect.x + theme.scaledUi(34.0),
         .y = text_y,
         .w = rect.w - theme.scaledUi(34.0) - hint_w - theme.scaledUi(12.0),
         .h = font_size * 1.3,
     }, label, paletteColor(if (emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), font_size, row_clip);
-    // Alt+N hint mirrors the workspace_select ordinal bindings.
-    var ordinal_hint_buf: [12]u8 = undefined;
-    if (project_index < 9) {
-        const hint = std.fmt.bufPrint(&ordinal_hint_buf, "Alt+{d}", .{project_index + 1}) catch "";
+    if (hint.len > 0) {
         queueText(state, .{
             .x = rect.x + rect.w - hint_w - theme.scaledUi(10.0),
             .y = text_y,
@@ -1879,6 +1879,7 @@ fn keybindHintFor(state: *runtime.AppState, ref: ?KeybindRef) []const u8 {
         .toggle_browser => config.toggle_browser,
         .toggle_terminal => config.toggle_terminal,
         .workspace_close => config.workspace_close,
+        .workspace_close_current => config.workspace_close_current,
         .workspace_toggle_maximize => config.workspace_toggle_maximize,
         .workspace_toggle_quick_pane => config.workspace_toggle_quick_pane,
         .workspace_split_chat_vertical => config.workspace_split_chat_vertical,
@@ -1896,6 +1897,16 @@ fn keybindHintFor(state: *runtime.AppState, ref: ?KeybindRef) []const u8 {
     };
     if (bindings.len == 0) return "";
     return formatKeybind(&hint_buf, bindings[0]);
+}
+
+fn workspaceSelectHintFor(state: *runtime.AppState, buf: []u8, project_index: usize) []const u8 {
+    const config = state.command_controller.keyboard_config orelse return "";
+    return indexedKeybindHint(buf, config.workspace_select, project_index);
+}
+
+fn indexedKeybindHint(buf: []u8, bindings: []const keybinds.Keybind, index: usize) []const u8 {
+    if (index >= bindings.len) return "";
+    return formatKeybind(buf, bindings[index]);
 }
 
 /// Formats the first loaded command-palette accelerator for UI hints (the
@@ -2052,6 +2063,22 @@ test "static commands expose scrolling layout controls" {
     }
 }
 
+test "shortcut-backed palette commands expose their keybind references" {
+    const expected = [_]struct { id: []const u8, keybind: KeybindRef }{
+        .{ .id = "workspace.close", .keybind = .workspace_close_current },
+    };
+    for (expected) |entry| {
+        var found = false;
+        for (STATIC_COMMANDS) |command| {
+            if (!std.mem.eql(u8, command.id, entry.id)) continue;
+            try std.testing.expectEqual(entry.keybind, command.keybind.?);
+            found = true;
+            break;
+        }
+        try std.testing.expect(found);
+    }
+}
+
 test "pane traversal commands follow the configured scrolling axis" {
     try std.testing.expectEqual(runtime.WorkspacePaneDirection.left, paneTraversalDirection(.horizontal, true));
     try std.testing.expectEqual(runtime.WorkspacePaneDirection.right, paneTraversalDirection(.horizontal, false));
@@ -2087,4 +2114,15 @@ test "formatKeybind renders modifiers and uppercases single letters" {
     try std.testing.expectEqualStrings("Ctrl+Shift+P", rendered);
     const plain = formatKeybind(&buf, .{ .alt = true, .key = .left });
     try std.testing.expectEqualStrings("Alt+Left", plain);
+}
+
+test "indexed keybind hints follow loaded workspace bindings" {
+    const bindings = [_]keybinds.Keybind{
+        .{ .ctrl = true, .key = .@"1" },
+        .{ .ctrl = true, .key = .@"0" },
+    };
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("Ctrl+1", indexedKeybindHint(&buf, &bindings, 0));
+    try std.testing.expectEqualStrings("Ctrl+0", indexedKeybindHint(&buf, &bindings, 1));
+    try std.testing.expectEqualStrings("", indexedKeybindHint(&buf, &bindings, 2));
 }
