@@ -11,12 +11,49 @@ For the shortest deployment path, use bundled mode:
 
 ```bash
 mise install
+mise run build
+./zig-out/bin/verde core status --json
 mise run web-app-run -- --host 0.0.0.0 --port 6783
 ```
 
-After the build completes, open `http://<VM-IP>:6783/`.
+The first two runtime setup commands build and start the required headless daemon. The final command is the single web-app command: after its build completes, open `http://<VM-IP>:6783/`.
 
-## What runs
+## Important: a headless VM must start the session daemon
+
+The web gateway is only a client of Verde's GUI-free session daemon; it does not replace or automatically start that daemon. On a VM where the Verde desktop GUI is not running, starting the daemon is a **required setup step** for real workspaces, chats, agent turns, and terminal sessions. Without it, the page may still load using review/mock data, which can make an incomplete deployment look healthy.
+
+Build the main Verde CLI from the repository root:
+
+```bash
+mise run build
+```
+
+Then use a public CLI request to ensure the detached headless daemon is running:
+
+```bash
+./zig-out/bin/verde core status --json
+```
+
+`verde core status` automatically starts the session daemon when needed and then queries it. Do not run the internal `__session-daemon` command directly. A successful response must contain an `ok` result, and the Unix socket should now exist:
+
+```bash
+test -S "${VERDE_SESSIONIZER_SOCKET:-$HOME/.local/share/verde/Native/verde-sessionizer.sock}"
+./zig-out/bin/verde core snapshot --json
+```
+
+Keep the daemon running before starting either web-app option below. It is detached from the GUI, so closing an SSH shell or not having a graphical display does not require stopping it. After a reboot, run `./zig-out/bin/verde core status --json` again before bringing up the web server, or arrange for that command to run through the VM's own process supervisor.
+
+The web gateway and daemon must use the same socket. If the VM uses a custom socket location, export it consistently before starting both:
+
+```bash
+export VERDE_SESSIONIZER_SOCKET=/absolute/path/to/verde-sessionizer.sock
+./zig-out/bin/verde core status --json
+mise run web-app-run -- --host 0.0.0.0 --port 6783
+```
+
+Do not expose `verde-sessionizer.sock` over the network. It is a local Unix socket; only the web UI port `6783` should be routed through the remote-access layer.
+
+## What the web-app modes run
 
 - `verde-web`, the Zig HTTP/WebSocket gateway, listens on `127.0.0.1:7420`.
 - Vite serves the browser UI with hot reload on `0.0.0.0:6783` and proxies `/api` and `/ws` to the gateway.
@@ -28,7 +65,7 @@ The gateway expects the Verde session daemon socket on the same VM. Its usual pa
 ~/.local/share/verde/Native/verde-sessionizer.sock
 ```
 
-If the daemon is unavailable, the gateway can still serve a review snapshot, but live workspaces, chats, and terminals will not be fully functional.
+If the daemon is unavailable, the gateway can still serve a review snapshot, but live workspaces, chats, agent turns, and terminals will not be functional. Treat a health response whose source is not `daemon` as an incomplete headless deployment.
 
 ## Prepare the VM
 
@@ -37,6 +74,8 @@ Clone the repository and enter its root, then install the repo-pinned tools:
 ```bash
 mise install
 ```
+
+Next, follow the required headless-daemon instructions above. Do this before starting the Zig web gateway or bundled web server.
 
 Before starting anything, confirm the required ports are free:
 
@@ -93,6 +132,8 @@ The health response should resemble:
 ```json
 {"ok":true,"source":"daemon"}
 ```
+
+The `"source":"daemon"` value is important. It confirms that the web gateway reached the real headless daemon instead of falling back to review data.
 
 Open the UI from another machine at:
 
@@ -162,5 +203,6 @@ In bundled mode, do not also start `mise run web-app-dev`; both would compete fo
 - `6783` already in use: inspect the owning process with `ss -ltnp | rg ':6783\b'`; do not kill it unless it belongs to this task.
 - `7420` already in use: check `curl -fsS http://127.0.0.1:7420/api/health` before deciding whether another gateway is already usable.
 - UI loads but live state is missing: confirm the session daemon socket exists and inspect the gateway startup output for its selected source.
+- Health response does not say `"source":"daemon"`: run `./zig-out/bin/verde core status --json`, verify the socket, and restart the web gateway with the same `VERDE_SESSIONIZER_SOCKET` value.
 - Vite reports proxy failures: start or repair `verde-web` on `127.0.0.1:7420`.
 - Remote browser cannot connect: verify Vite is listening on `0.0.0.0:6783`, then check the VM firewall/security group or use the SSH tunnel above.
