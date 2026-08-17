@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/verde-logo.png" alt="Verde" width="72" />
+  <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/verde-logo.png" alt="Verde" width="72" />
 </p>
 
 <h1 align="center">Verde</h1>
@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/themes/verde.png" alt="Verde tiling workspace — Codex GUI chat, Claude Code TUI, Amp, Grok Build, and shell in one window" width="100%" />
+  <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/themes/verde.png" alt="Verde tiling workspace — Codex GUI chat, Claude Code TUI, Amp, Grok Build, and shell in one window" width="100%" />
 </p>
 
 <p align="center">
@@ -126,7 +126,7 @@ If no GUI provider is ready, Verde shows a **Connect an AI provider** screen so 
 ## Features
 
 <p align="center">
-  <img src="assets/themes/ristretto.png" alt="Same multi-agent layout under the Ristretto theme" width="100%" />
+  <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/themes/ristretto.png" alt="Same multi-agent layout under the Ristretto theme" width="100%" />
 </p>
 
 ### Tiling workspace, not a chat box
@@ -194,14 +194,14 @@ verde theme import https://verdeai.dev/themes/tokyo-night.json
 ```
 
 <p align="center">
-  <img src="assets/themes/tokyo-night.png" alt="Tokyo Night" width="32%" />
-  <img src="assets/themes/catppuccin.png" alt="Catppuccin" width="32%" />
-  <img src="assets/themes/gruvbox.png" alt="Gruvbox" width="32%" />
+  <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/themes/tokyo-night.png" alt="Tokyo Night" width="32%" />
+  <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/themes/catppuccin.png" alt="Catppuccin" width="32%" />
+  <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/themes/gruvbox.png" alt="Gruvbox" width="32%" />
 </p>
 <p align="center">
-  <img src="assets/themes/kanagawa.png" alt="Kanagawa" width="32%" />
-  <img src="assets/themes/osaka-jade.png" alt="Osaka Jade" width="32%" />
-  <img src="assets/themes/matte-black.png" alt="Matte Black" width="32%" />
+  <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/themes/kanagawa.png" alt="Kanagawa" width="32%" />
+  <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/themes/osaka-jade.png" alt="Osaka Jade" width="32%" />
+  <img src="https://raw.githubusercontent.com/JonathanRiche/verde/master/assets/themes/matte-black.png" alt="Matte Black" width="32%" />
 </p>
 
 <p align="center">
