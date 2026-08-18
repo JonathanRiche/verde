@@ -20,6 +20,8 @@ export interface ModelOption {
   efforts?: EffortOption[]
   /// OpenCode reasoning variant keys; undefined hides the variant picker.
   variants?: string[]
+  /// Cursor only; Codex supports Fast for every model.
+  fast_supported?: boolean
 }
 
 /// One row of the daemon's provider.models.list result (harness ModelInfo).
@@ -30,6 +32,8 @@ export interface DynamicModelRow {
   reasoning_supported?: boolean
   reasoning_variant_keys?: string[] | null
   claude_effort_values?: string[] | null
+  cursor_fast_supported?: boolean
+  cursor_reasoning_values?: string[] | null
 }
 
 /// Convert a daemon catalog into picker options, mirroring how the desktop
@@ -64,6 +68,13 @@ export function dynamicModelOptions(provider: string, rows: DynamicModelRow[]): 
               ],
             }
           : {}),
+      })
+    } else if (provider === 'cursor') {
+      options.push({
+        label,
+        value: row.model_id,
+        ...(row.cursor_reasoning_values?.length ? { variants: row.cursor_reasoning_values } : {}),
+        ...(row.cursor_fast_supported ? { fast_supported: true } : {}),
       })
     } else {
       options.push({ label, value: row.model_id })
@@ -126,20 +137,26 @@ const OPENCODE_MODELS: ModelOption[] = [
   { label: 'Gemini 3.1 Pro', value: 'opencode/gemini-3.1-pro' },
 ]
 
-/// Cursor encodes effort in the model id and applies it through provider
-/// params, not thread reasoning_effort, so the web picker offers models only.
+const CURSOR_GROK_VARIANTS = ['low', 'medium', 'high']
+const CURSOR_GPT_FULL_VARIANTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max']
+const CURSOR_GPT_55_VARIANTS = ['none', 'low', 'medium', 'high', 'extra-high']
+const CURSOR_GPT_54_VARIANTS = ['low', 'medium', 'high', 'xhigh']
+const CURSOR_CLAUDE_VARIANTS = ['low', 'medium', 'high', 'xhigh', 'max']
+
+/// Cursor reasoning is stored as a provider variant; Fast is exposed only on
+/// the same model rows marked cursor_fast_supported by the desktop.
 const CURSOR_MODELS: ModelOption[] = [
   { label: 'Auto', value: 'auto' },
-  { label: 'Composer 2.5', value: 'composer-2.5' },
-  { label: 'Cursor Grok 4.5', value: 'cursor-grok-4.5-high' },
-  { label: 'Opus 4.8 Thinking', value: 'claude-opus-4-8-thinking-high' },
-  { label: 'GPT-5.6 Sol', value: 'gpt-5.6-sol-medium' },
-  { label: 'GPT-5.5', value: 'gpt-5.5-medium' },
-  { label: 'Fable 5 Thinking', value: 'claude-fable-5-thinking-high' },
-  { label: 'Sonnet 5 Thinking', value: 'claude-sonnet-5-thinking-high' },
-  { label: 'GPT-5.6 Terra', value: 'gpt-5.6-terra-medium' },
-  { label: 'GPT-5.6 Luna', value: 'gpt-5.6-luna-medium' },
-  { label: 'GPT-5.4', value: 'gpt-5.4-medium' },
+  { label: 'Composer 2.5', value: 'composer-2.5', fast_supported: true },
+  { label: 'Cursor Grok 4.5', value: 'cursor-grok-4.5-high', variants: CURSOR_GROK_VARIANTS, fast_supported: true },
+  { label: 'Opus 4.8 Thinking', value: 'claude-opus-4-8-thinking-high', variants: CURSOR_CLAUDE_VARIANTS, fast_supported: true },
+  { label: 'GPT-5.6 Sol', value: 'gpt-5.6-sol-medium', variants: CURSOR_GPT_FULL_VARIANTS, fast_supported: true },
+  { label: 'GPT-5.5', value: 'gpt-5.5-medium', variants: CURSOR_GPT_55_VARIANTS, fast_supported: true },
+  { label: 'Fable 5 Thinking', value: 'claude-fable-5-thinking-high', variants: CURSOR_CLAUDE_VARIANTS },
+  { label: 'Sonnet 5 Thinking', value: 'claude-sonnet-5-thinking-high', variants: CURSOR_CLAUDE_VARIANTS },
+  { label: 'GPT-5.6 Terra', value: 'gpt-5.6-terra-medium', variants: CURSOR_GPT_FULL_VARIANTS, fast_supported: true },
+  { label: 'GPT-5.6 Luna', value: 'gpt-5.6-luna-medium', variants: CURSOR_GPT_FULL_VARIANTS, fast_supported: true },
+  { label: 'GPT-5.4', value: 'gpt-5.4-medium', variants: CURSOR_GPT_54_VARIANTS, fast_supported: true },
   { label: 'Gemini 3.1 Pro', value: 'gemini-3.1-pro' },
   { label: 'Gemini 3.5 Flash', value: 'gemini-3.5-flash' },
   { label: 'Kimi K3', value: 'kimi-k3' },
@@ -159,6 +176,10 @@ export function modelOptionsFor(provider: string | null | undefined): ModelOptio
     default:
       return []
   }
+}
+
+export function modelSupportsFast(provider: string | null | undefined, option: ModelOption | undefined): boolean {
+  return provider === 'codex' || (provider === 'cursor' && option?.fast_supported === true)
 }
 
 /// Effort menu for the current model within an option list; empty hides the chip.

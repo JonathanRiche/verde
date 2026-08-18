@@ -6969,7 +6969,8 @@ fn loadThreadGetResult(
     if (request.workspace_id.len == 0 or request.local_thread_id.len == 0) return error.InvalidParams;
     const meta_or_null = store.conn.row(
         \\select t.local_thread_id, t.title, t.archived, t.committed, t.last_activity_at,
-        \\       t.provider_thread_id, t.model_ref, t.provider, t.harness, t.id, t.draft
+        \\       t.provider_thread_id, t.model_ref, t.reasoning_effort, t.reasoning_variant,
+        \\       t.fast_mode, t.access_mode, t.provider, t.harness, t.id, t.draft
         \\from threads t
         \\join workspaces w on w.id = t.workspace_id
         \\where w.workspace_id = ?1 and t.local_thread_id = ?2
@@ -6979,7 +6980,7 @@ fn loadThreadGetResult(
     const meta = meta_or_null orelse return error.ResourceNotFound;
     defer meta.deinit();
 
-    const thread_row_id = meta.int(9);
+    const thread_row_id = meta.int(13);
     const local_thread_id = allocator.dupe(u8, meta.text(0)) catch return error.OutOfMemory;
     errdefer allocator.free(local_thread_id);
     const title = allocator.dupe(u8, meta.text(1)) catch return error.OutOfMemory;
@@ -6988,11 +6989,13 @@ fn loadThreadGetResult(
     errdefer if (provider_thread_id) |value| allocator.free(value);
     const model_ref = dupeOptionalText(allocator, meta.nullableText(6)) catch return error.OutOfMemory;
     errdefer if (model_ref) |value| allocator.free(value);
-    const provider = allocator.dupe(u8, providerNameFromCode(meta.int(7))) catch return error.OutOfMemory;
+    const reasoning_variant = dupeOptionalText(allocator, meta.nullableText(8)) catch return error.OutOfMemory;
+    errdefer if (reasoning_variant) |value| allocator.free(value);
+    const provider = allocator.dupe(u8, providerNameFromCode(meta.int(11))) catch return error.OutOfMemory;
     errdefer allocator.free(provider);
-    const harness_name = allocator.dupe(u8, harnessNameFromCode(meta.int(8))) catch return error.OutOfMemory;
+    const harness_name = allocator.dupe(u8, harnessNameFromCode(meta.int(12))) catch return error.OutOfMemory;
     errdefer allocator.free(harness_name);
-    const draft = allocator.dupe(u8, meta.text(10)) catch return error.OutOfMemory;
+    const draft = allocator.dupe(u8, meta.text(14)) catch return error.OutOfMemory;
     errdefer allocator.free(draft);
     const archived = meta.int(2) != 0;
     const committed = meta.int(3) != 0;
@@ -7057,6 +7060,10 @@ fn loadThreadGetResult(
             .last_activity_at = last_activity_at,
             .provider_thread_id = provider_thread_id,
             .model_ref = model_ref,
+            .reasoning_effort = if (meta.nullableInt(7)) |code| reasoningEffortNameFromCode(code) else null,
+            .reasoning_variant = reasoning_variant,
+            .fast_mode = if (meta.nullableInt(9)) |code| fastModeNameFromCode(code) else null,
+            .access_mode = if (meta.nullableInt(10)) |code| accessModeNameFromCode(code) else null,
             .provider = provider,
             .harness = harness_name,
             .draft = draft,
@@ -7071,6 +7078,7 @@ fn freeThreadGetResult(allocator: std.mem.Allocator, result: store_protocol.Thre
     allocator.free(result.thread.title);
     if (result.thread.provider_thread_id) |value| allocator.free(value);
     if (result.thread.model_ref) |value| allocator.free(value);
+    if (result.thread.reasoning_variant) |value| allocator.free(value);
     allocator.free(result.thread.provider);
     allocator.free(result.thread.harness);
     allocator.free(result.thread.draft);
@@ -7104,7 +7112,8 @@ fn loadThreadListResult(
 
     var rows = store.conn.rows(
         \\select t.local_thread_id, t.title, t.archived, t.committed, t.last_activity_at,
-        \\       t.provider_thread_id, t.model_ref, t.provider, t.harness, t.sort_index
+        \\       t.provider_thread_id, t.model_ref, t.reasoning_effort, t.reasoning_variant,
+        \\       t.fast_mode, t.access_mode, t.provider, t.harness, t.sort_index
         \\from threads t
         \\join workspaces w on w.id = t.workspace_id
         \\where w.workspace_id = ?1
@@ -7123,19 +7132,25 @@ fn loadThreadListResult(
         errdefer if (provider_thread_id) |value| allocator.free(value);
         const model_ref = dupeOptionalText(allocator, row.nullableText(6)) catch return error.OutOfMemory;
         errdefer if (model_ref) |value| allocator.free(value);
-        const provider = allocator.dupe(u8, providerNameFromCode(row.int(7))) catch return error.OutOfMemory;
+        const reasoning_variant = dupeOptionalText(allocator, row.nullableText(8)) catch return error.OutOfMemory;
+        errdefer if (reasoning_variant) |value| allocator.free(value);
+        const provider = allocator.dupe(u8, providerNameFromCode(row.int(11))) catch return error.OutOfMemory;
         errdefer allocator.free(provider);
-        const harness_name = allocator.dupe(u8, harnessNameFromCode(row.int(8))) catch return error.OutOfMemory;
+        const harness_name = allocator.dupe(u8, harnessNameFromCode(row.int(12))) catch return error.OutOfMemory;
         errdefer allocator.free(harness_name);
         items.append(allocator, .{
             .local_thread_id = local_thread_id,
             .title = title,
-            .sort_index = std.math.cast(usize, row.int(9)) orelse 0,
+            .sort_index = std.math.cast(usize, row.int(13)) orelse 0,
             .archived = row.int(2) != 0,
             .committed = row.int(3) != 0,
             .last_activity_at = row.nullableInt(4),
             .provider_thread_id = provider_thread_id,
             .model_ref = model_ref,
+            .reasoning_effort = if (row.nullableInt(7)) |code| reasoningEffortNameFromCode(code) else null,
+            .reasoning_variant = reasoning_variant,
+            .fast_mode = if (row.nullableInt(9)) |code| fastModeNameFromCode(code) else null,
+            .access_mode = if (row.nullableInt(10)) |code| accessModeNameFromCode(code) else null,
             .provider = provider,
             .harness = harness_name,
         }) catch return error.OutOfMemory;
@@ -7161,6 +7176,7 @@ fn freeThreadListItem(allocator: std.mem.Allocator, item: store_protocol.ThreadL
     allocator.free(item.title);
     if (item.provider_thread_id) |value| allocator.free(value);
     if (item.model_ref) |value| allocator.free(value);
+    if (item.reasoning_variant) |value| allocator.free(value);
     allocator.free(item.provider);
     allocator.free(item.harness);
 }
@@ -13287,7 +13303,18 @@ test "durable reads decode canonical and historical daemon chat role codes" {
     _ = try daemon.store_service.?.store.upsertThread(.{
         .mutation = .{ .request_key = "dto-thread", .client_id = "daemon" },
         .workspace_id = "ws-dto",
-        .thread = .{ .local_thread_id = "t-dto", .title = "DTO thread", .provider = "codex", .harness = "local_cli", .draft = "staged DTO draft" },
+        .thread = .{
+            .local_thread_id = "t-dto",
+            .title = "DTO thread",
+            .provider = "codex",
+            .harness = "local_cli",
+            .model_ref = "gpt-5.6-sol",
+            .reasoning_effort = "low",
+            .reasoning_variant = "none",
+            .fast_mode = "on",
+            .access_mode = "supervised",
+            .draft = "staged DTO draft",
+        },
     });
     const thread_row = (try daemon.store_service.?.store.conn.row(
         "select id from threads where local_thread_id = ?1",
@@ -13340,6 +13367,11 @@ test "durable reads decode canonical and historical daemon chat role codes" {
     const thread = get_parsed.value.object.get("result").?.object.get("thread").?.object;
     try std.testing.expectEqualStrings("t-dto", thread.get("local_thread_id").?.string);
     try std.testing.expectEqualStrings("staged DTO draft", thread.get("draft").?.string);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", thread.get("model_ref").?.string);
+    try std.testing.expectEqualStrings("low", thread.get("reasoning_effort").?.string);
+    try std.testing.expectEqualStrings("none", thread.get("reasoning_variant").?.string);
+    try std.testing.expectEqualStrings("on", thread.get("fast_mode").?.string);
+    try std.testing.expectEqualStrings("supervised", thread.get("access_mode").?.string);
     const messages = thread.get("messages").?.array.items;
     const expected_roles = [_][]const u8{
         "user",      "assistant", "system",
@@ -13382,7 +13414,15 @@ test "durable reads decode canonical and historical daemon chat role codes" {
         \\{"jsonrpc":"2.0","id":3,"method":"chat.thread.list","params":{"workspace_id":"ws-dto","limit":10}}
     );
     defer allocator.free(list_response);
-    try std.testing.expect(std.mem.indexOf(u8, list_response, "\"local_thread_id\":\"t-dto\"") != null);
+    var list_parsed = try std.json.parseFromSlice(std.json.Value, allocator, list_response, .{});
+    defer list_parsed.deinit();
+    const listed_thread = list_parsed.value.object.get("result").?.object.get("threads").?.array.items[0].object;
+    try std.testing.expectEqualStrings("t-dto", listed_thread.get("local_thread_id").?.string);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", listed_thread.get("model_ref").?.string);
+    try std.testing.expectEqualStrings("low", listed_thread.get("reasoning_effort").?.string);
+    try std.testing.expectEqualStrings("none", listed_thread.get("reasoning_variant").?.string);
+    try std.testing.expectEqualStrings("on", listed_thread.get("fast_mode").?.string);
+    try std.testing.expectEqualStrings("supervised", listed_thread.get("access_mode").?.string);
 }
 
 test "chat turn tail pages large replay before publishing terminal status" {

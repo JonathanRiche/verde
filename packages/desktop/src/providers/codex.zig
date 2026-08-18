@@ -977,8 +977,11 @@ pub const Client = struct {
         var child = platform_process.spawn(self.allocator, threaded_spawn.io(), .{
             .argv = argv[0..],
             .stdin = .ignore,
-            .stdout = .inherit,
-            .stderr = .inherit,
+            // The session daemon outlives the GUI/terminal that launched it;
+            // inherited pipes can therefore have no reader and kill ssh on
+            // its first diagnostic write. Provider traffic uses WebSocket.
+            .stdout = .ignore,
+            .stderr = .ignore,
             .environ_map = &env_map,
         }) catch |err| {
             runtime_log.diagnostic("codex.spawnRemoteWebSocketServer process.spawn failed host_len={d}: {s}", .{ remote.host.len, @errorName(err) });
@@ -1022,8 +1025,10 @@ pub const Client = struct {
         const child = platform_process.spawn(self.allocator, threaded_spawn.io(), .{
             .argv = argv[0..],
             .stdin = .ignore,
-            .stdout = .inherit,
-            .stderr = .inherit,
+            // codex prints a startup banner. A detached daemon may have dead
+            // inherited pipes, so route app-server stdio to the null device.
+            .stdout = .ignore,
+            .stderr = .ignore,
             .cwd = if (self.config.cwd) |path| .{ .path = path } else .inherit,
             .environ_map = &env_map,
         }) catch |err| {

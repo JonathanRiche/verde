@@ -1,5 +1,6 @@
 import { For, Show, createMemo, createResource, createSignal } from 'solid-js'
 
+import { unwrapResult } from '../lib/live'
 import { store } from '../lib/store'
 import { loadTheme } from '../lib/theme'
 
@@ -131,6 +132,167 @@ export function Settings() {
             Close
           </button>
         </div>
+      </div>
+    </Show>
+  )
+}
+
+export function WorkspaceDialog() {
+  const [path, setPath] = createSignal('')
+  const [submitting, setSubmitting] = createSignal(false)
+  const [browserOpen, setBrowserOpen] = createSignal(false)
+  const [browserLoading, setBrowserLoading] = createSignal(false)
+  const [browserError, setBrowserError] = createSignal<string | null>(null)
+  const [directoryListing, setDirectoryListing] = createSignal<{
+    path: string
+    parent?: string | null
+    directories: Array<{ name: string; path: string }>
+  } | null>(null)
+
+  const close = () => {
+    if (submitting()) return
+    setPath('')
+    setBrowserOpen(false)
+    setBrowserError(null)
+    setDirectoryListing(null)
+    store.setWorkspaceDialogOpen(false)
+  }
+
+  const browse = async (requested_path?: string) => {
+    // The projected workspace can belong to a different host than verde-web,
+    // so an empty browser must start from the gateway machine's filesystem.
+    const target = requested_path ?? (path().trim() || '/')
+    setBrowserOpen(true)
+    setBrowserLoading(true)
+    setBrowserError(null)
+    try {
+      const response = await store.client.call('web.directory.list', { path: target })
+      if (response.error || response.ok === false) {
+        setBrowserError(response.error?.message ?? 'could not list directory')
+        return
+      }
+      const listing = unwrapResult<{
+        path: string
+        parent?: string | null
+        directories: Array<{ name: string; path: string }>
+      }>(response)
+      if (!listing || !Array.isArray(listing.directories)) {
+        setBrowserError('directory listing was invalid')
+        return
+      }
+      setDirectoryListing(listing)
+      setPath(listing.path)
+    } catch (err) {
+      setBrowserError(err instanceof Error ? err.message : 'could not list directory')
+    } finally {
+      setBrowserLoading(false)
+    }
+  }
+
+  const submit = async (event: SubmitEvent) => {
+    event.preventDefault()
+    if (!path().trim() || submitting()) return
+    setSubmitting(true)
+    const created = await store.createWorkspace(path())
+    setSubmitting(false)
+    if (created) setPath('')
+  }
+
+  return (
+    <Show when={store.workspaceDialogOpen()}>
+      <div class="fixed inset-0 z-40 bg-black/55" onClick={close}>
+        <form
+          class="mx-auto mt-[16vh] w-[32rem] max-w-[calc(100vw-2rem)] rounded-[10px] border border-[var(--border-muted)] bg-[var(--panel)] p-5 shadow-[0_24px_80px_rgba(0,0,0,0.55)]"
+          onClick={(event) => event.stopPropagation()}
+          onSubmit={submit}
+        >
+          <div class="wordmark text-[28px] leading-none">Add Workspace</div>
+          <p class="mt-2 text-[13px] text-[var(--text-muted)]">
+            Enter the absolute path to a project directory on the machine running Verde.
+          </p>
+          <div class="mt-4 flex gap-2">
+            <input
+              class="mono min-w-0 flex-1 rounded-[7px] border border-[var(--border-muted)] bg-[var(--chat-black)] px-3 py-2 text-[13px] outline-none focus:border-[var(--accent)]"
+              aria-label="Workspace path"
+              placeholder="/path/to/project"
+              autofocus
+              value={path()}
+              onInput={(event) => setPath(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') close()
+              }}
+            />
+            <button
+              type="button"
+              class="shrink-0 rounded-[7px] border border-[var(--border-muted)] px-3 py-2 text-[13px] hover:bg-[var(--accent-hover)]"
+              onClick={() => void browse()}
+            >
+              Browse…
+            </button>
+          </div>
+          <Show when={browserOpen()}>
+            <div class="mt-3 overflow-hidden rounded-[7px] border border-[var(--border-muted)] bg-[var(--chat-black)]">
+              <div class="flex items-center gap-2 border-b border-[var(--border-muted)] p-2">
+                <button
+                  type="button"
+                  class="rounded px-2 py-1 text-[12px] text-[var(--text-muted)] hover:bg-[var(--accent-hover)] disabled:opacity-40"
+                  disabled={!directoryListing()?.parent || browserLoading()}
+                  onClick={() => {
+                    const parent = directoryListing()?.parent
+                    if (parent) void browse(parent)
+                  }}
+                >
+                  Up
+                </button>
+                <span class="mono min-w-0 flex-1 truncate text-[11px] text-[var(--text-subtle)]">
+                  {directoryListing()?.path ?? 'Loading…'}
+                </span>
+              </div>
+              <div class="max-h-[32vh] overflow-y-auto p-1 scrollbar-thin">
+                <Show when={!browserLoading()} fallback={<p class="px-3 py-4 text-xs text-[var(--text-subtle)]">Loading folders…</p>}>
+                  <For
+                    each={directoryListing()?.directories ?? []}
+                    fallback={<p class="px-3 py-4 text-xs text-[var(--text-subtle)]">No subfolders.</p>}
+                  >
+                    {(directory) => (
+                      <button
+                        type="button"
+                        class="flex w-full items-center gap-2 rounded-[5px] px-3 py-1.5 text-left text-[13px] hover:bg-[var(--accent-hover)]"
+                        onClick={() => void browse(directory.path)}
+                      >
+                        <span class="text-[var(--accent)]">▸</span>
+                        <span class="truncate">{directory.name}</span>
+                      </button>
+                    )}
+                  </For>
+                </Show>
+              </div>
+            </div>
+          </Show>
+          <Show when={browserError()}>
+            <p class="mt-2 text-xs text-[var(--warning)]">{browserError()}</p>
+          </Show>
+          <Show when={store.notice()}>
+            <p class="mt-2 text-xs text-[var(--warning)]">{store.notice()}</p>
+          </Show>
+          <div class="mt-4 flex justify-end gap-2">
+            <button
+              type="button"
+              class="rounded-[7px] border border-[var(--border-muted)] px-4 py-2 text-[13px] hover:bg-[var(--accent-hover)]"
+              disabled={submitting()}
+              onClick={close}
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              class="rounded-[7px] bg-[var(--accent)] px-4 py-2 text-[13px] text-white disabled:opacity-50"
+              disabled={!path().trim() || submitting()}
+            >
+              {submitting() ? 'Adding…' : 'Add Workspace'}
+            </button>
+          </div>
+        </form>
       </div>
     </Show>
   )

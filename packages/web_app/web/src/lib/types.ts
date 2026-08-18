@@ -68,6 +68,7 @@ export interface LivePane {
   maximized?: boolean
   kind: PaneKind
   thread_id?: string
+  provider_thread_id?: string | null
   session_id?: string
   thread_index?: number
   thread_title?: string
@@ -76,6 +77,7 @@ export interface LivePane {
   reasoning_effort?: string | null
   reasoning_variant?: string | null
   fast_mode?: boolean | null
+  access_mode?: string | null
   send_pending?: boolean
   completion_pending?: boolean
   completed_at_ms?: number | null
