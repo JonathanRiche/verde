@@ -3924,10 +3924,16 @@ pub const AppState = struct {
         }
         self.blurCompanionComposer();
         self.project_controller.selected_index = index;
-        self.ensureCurrentProjectWorkspace();
         self.restorePersistedBrowserPaneAfterProjectSelection(index);
         const focused_pane_id = self.project_controller.projects.items[index].workspace_layout.focused_pane_id;
-        if (focused_pane_id) |pane_id| _ = self.restoreWorkspacePaneFocus(index, pane_id);
+        if (focused_pane_id) |pane_id| {
+            _ = self.restoreWorkspacePaneFocus(index, pane_id);
+        } else {
+            self.blurPaletteComposer();
+            self.terminal_controller.focused = false;
+            self.unfocusBrowserPane();
+            self.browser_controller.address_focused = false;
+        }
         if (self.transcriptHydrationGeneration() == hydration_generation_before_focus) self.noteTranscriptSelectionChanged();
         if (focused_pane_id) |pane_id| self.prepareTranscriptPaneFocus(index, pane_id);
         self.workspace_header_open_menu_open = false;
@@ -4661,7 +4667,6 @@ pub const AppState = struct {
         try self.project_controller.projects.append(self.allocator, restored);
         restored_appended = true;
         self.project_controller.selected_index = self.project_controller.projects.items.len - 1;
-        self.ensureCurrentProjectWorkspace();
         self.restorePersistedBrowserPaneAfterProjectSelection(self.project_controller.selected_index);
         self.syncRenameBuffer();
         self.markDirty();
@@ -12876,6 +12881,13 @@ test "workspace selection restores focused pane keyboard ownership" {
         terminal_project.deinit(allocator);
         return err;
     };
+    var empty_project = try Project.init(allocator, "empty", "Empty", "/tmp/empty", 0);
+    var removed_empty_ref = empty_project.workspace_layout.closePane(allocator, 1) orelse return error.TestExpectedEqual;
+    deinitWorkspacePaneRef(&removed_empty_ref, allocator);
+    state.project_controller.projects.append(allocator, empty_project) catch |err| {
+        empty_project.deinit(allocator);
+        return err;
+    };
     try state.surface_controller.surfaces.append(allocator, .{
         .session_id = try allocator.dupe(u8, "launch-terminal-session"),
         .workspace_id = try allocator.dupe(u8, "terminal"),
@@ -12914,6 +12926,17 @@ test "workspace selection restores focused pane keyboard ownership" {
         .split => |split| try std.testing.expectApproxEqAbs(@as(f32, 0.63), split.ratio, 0.0001),
         .leaf => return error.TestExpectedEqual,
     }
+
+    // Selecting an intentionally empty workspace must not resurrect its
+    // selected thread as a pane, including through palette/sidebar paths.
+    try std.testing.expect(state.selectProjectAtIndex(2));
+    const empty_layout = &state.project_controller.projects.items[2].workspace_layout;
+    try std.testing.expectEqual(@as(usize, 0), empty_layout.panes.items.len);
+    try std.testing.expect(empty_layout.root == null);
+    try std.testing.expect(empty_layout.focused_pane_id == null);
+    try std.testing.expect(!state.composer_controller.focused);
+    try std.testing.expect(!state.composer_controller.composer.focused);
+    try std.testing.expect(state.selectProjectAtIndex(0));
 
     // Exercise main.zig's actual post-init helper: restored keyboard ownership
     // never acknowledges completion or dirties persisted state.
