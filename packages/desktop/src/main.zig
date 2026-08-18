@@ -1835,6 +1835,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (workspace_panes_ui.handleEmptyWorkspaceKeyDown(state, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (keyboard.workspaceActiveSelectIndexForEvent(&event.key)) |active_ordinal| {
                 if (sidebar_ui.focusAttentionClusterRowAtIndex(state, active_ordinal)) {
                     syncWindowTextInput(window, state);
