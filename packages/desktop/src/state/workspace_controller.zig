@@ -1250,10 +1250,6 @@ pub fn closeWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
     if (project_index >= self.project_controller.projects.items.len) return false;
     var project = &self.project_controller.projects.items[project_index];
     var layout = &project.workspace_layout;
-    if (layout.rootContainsPane(pane_id) and layout.visiblePaneCount() <= 1) {
-        self.setSidebarNotice("Cannot close the last workspace pane.");
-        return false;
-    }
     var removed_ref = layout.closePane(self.allocator, pane_id) orelse return false;
     defer deinitWorkspacePaneRef(&removed_ref, self.allocator);
     switch (removed_ref) {
@@ -1293,6 +1289,12 @@ pub fn closeWorkspacePane(self: anytype, project_index: usize, pane_id: Workspac
     if (self.project_controller.selected_index == project_index) {
         if (layout.focused_pane_id) |focused_pane_id| {
             _ = self.focusWorkspacePane(project_index, focused_pane_id);
+        } else {
+            self.terminal_controller.focused = false;
+            self.composer_controller.focused = false;
+            self.composer_controller.composer.focused = false;
+            self.unfocusBrowserPane();
+            self.browser_controller.address_focused = false;
         }
     }
     self.markDirty();
@@ -1766,9 +1768,42 @@ pub fn splitFocusedWorkspacePaneWithTerminalPlacement(self: anytype, axis: Works
 pub fn openTerminalPaneForProjectIndex(self: anytype, project_index: usize) bool {
     if (project_index >= self.project_controller.projects.items.len) return false;
     self.project_controller.selected_index = project_index;
+    if (self.project_controller.projects.items[project_index].workspace_layout.visiblePaneCount() == 0) {
+        return openTerminalPaneInEmptyWorkspace(self, project_index);
+    }
     self.ensureCurrentProjectWorkspace();
     const pane_id = self.project_controller.projects.items[self.project_controller.selected_index].workspace_layout.focused_pane_id orelse return false;
     return self.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, .horizontal, true);
+}
+
+fn openTerminalPaneInEmptyWorkspace(self: anytype, project_index: usize) bool {
+    const dock_id = self.createProjectTerminalDock(project_index) catch |err| {
+        log.err("failed to allocate terminal dock: {s}", .{@errorName(err)});
+        self.setSidebarNotice("Failed to create terminal dock.");
+        return false;
+    };
+    self.restartTerminalDockForWorkspace(project_index, dock_id) catch |err| {
+        log.err("failed to start terminal dock: {s}", .{@errorName(err)});
+        self.setSidebarNotice("Failed to start terminal.");
+        return false;
+    };
+    var project = &self.project_controller.projects.items[project_index];
+    const pane_id = project.workspace_layout.createTerminalPane(self.allocator, dock_id) catch |err| {
+        log.err("failed to create terminal workspace pane: {s}", .{@errorName(err)});
+        self.setSidebarNotice("Failed to create terminal pane.");
+        return false;
+    };
+    project.workspace_layout.replaceRootWithLeaf(self.allocator, pane_id) catch |err| {
+        log.err("failed to seed terminal workspace pane: {s}", .{@errorName(err)});
+        self.setSidebarNotice("Failed to open terminal pane.");
+        return false;
+    };
+    project.workspace_layout.focusCreatedPane(pane_id);
+    if (self.projectTerminalDockMutable(project_index, dock_id)) |dock| dock.visible = false;
+    self.requestTerminalDockFocus(dock_id);
+    self.setSidebarNotice("Terminal pane created.");
+    self.markDirty();
+    return true;
 }
 
 pub fn openCurrentProjectTerminalPaneForCommand(self: anytype) ?WorkspacePaneId {

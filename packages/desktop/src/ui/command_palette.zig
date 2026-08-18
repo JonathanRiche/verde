@@ -1919,27 +1919,7 @@ pub fn commandPaletteShortcutHint(state: *runtime.AppState) []const u8 {
 }
 
 fn formatKeybind(buf: []u8, keybind: keybinds.Keybind) []const u8 {
-    var n: usize = 0;
-    if (keybind.primary or keybind.ctrl) n += copyInto(buf[n..], "Ctrl+");
-    if (keybind.meta) n += copyInto(buf[n..], "Meta+");
-    if (keybind.alt) n += copyInto(buf[n..], "Alt+");
-    if (keybind.shift) n += copyInto(buf[n..], "Shift+");
-    const key_name = keycodeLabel(keybind.key);
-    n += copyInto(buf[n..], key_name);
-    // Single-letter keys read better uppercased ("Ctrl+Shift+P", not "Ctrl+Shift+p").
-    if (key_name.len == 1 and n > 0) buf[n - 1] = std.ascii.toUpper(buf[n - 1]);
-    return buf[0..n];
-}
-
-fn keycodeLabel(key: sdl.Keycode) []const u8 {
-    return switch (key) {
-        .@"return" => "Enter",
-        .left => "Left",
-        .right => "Right",
-        .up => "Up",
-        .down => "Down",
-        else => @tagName(key),
-    };
+    return keybinds.formatKeybind(buf, keybind);
 }
 
 fn copyInto(dest: []u8, src: []const u8) usize {

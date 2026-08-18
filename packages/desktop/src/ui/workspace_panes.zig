@@ -65,6 +65,9 @@ const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
 const NF_COD_CHEVRON_LEFT = "\u{EAB5}";
 const NF_COD_CHEVRON_RIGHT = "\u{EAB6}";
 const NF_COD_CHEVRON_UP = "\u{EAB7}";
+const NF_COD_EDIT = "\u{EA73}";
+const NF_COD_HISTORY = "\u{EA82}";
+const NF_COD_TERMINAL = "\u{EA85}";
 
 fn nowMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
@@ -78,6 +81,8 @@ const WorkspacePaneAction = enum {
     copy_selection,
     paste_into_prompt,
     new_chat_thread,
+    open_chat_history,
+    open_terminal,
     refresh_chat_thread,
     split_chat_left,
     split_chat_right,
@@ -732,7 +737,6 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
 pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, rect: palette.Rect, target_workspace_width: f32) void {
     last_workspace_rect = rect;
     focus_anim_duration_ms = theme.motionDurationMs(state.app_config.reduced_motion, theme.MOTION_BASE_MS);
-    state.ensureCurrentProjectWorkspace();
     state.terminal_controller.debug_workspace_visible_pane_count = state.currentProjectWorkspaceVisiblePaneCount();
     tickFocusAnimation(state);
     pane_status_animating = false;
@@ -759,12 +763,85 @@ pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, rect: palette
             renderNode(state, root, rect, target_workspace_width);
         }
     } else {
-        chat_panel.renderWorkspaceAtWithTranscriptLayoutWidth(state, rect, target_workspace_width);
+        renderEmptyWorkspace(state, rect);
     }
 
     renderQuickPane(state, rect, target_workspace_width);
     renderSplitMenuOverlay(state, rect);
     if (!browser_pane_rendered) state.noteBrowserPaneNotRendered();
+}
+
+// Empty workspace invitation shown after the final pane closes.
+fn renderEmptyWorkspace(state: *runtime.AppState, rect: palette.Rect) void {
+    queueRect(state, rect, paletteColor(theme.background()));
+
+    const content_w = @max(1.0, @min(rect.w - theme.scaledUi(32.0), theme.scaledUi(380.0)));
+    const title_size = theme.scaledUi(28.0);
+    const body_size = theme.scaledUi(14.0);
+    const button_w = @min(content_w, theme.scaledUi(280.0));
+    const button_h = theme.scaledUi(38.0);
+    const content_h = theme.scaledUi(232.0);
+    const x = rect.x + (rect.w - content_w) * 0.5;
+    var y = rect.y + @max(0.0, (rect.h - content_h) * 0.5);
+
+    const title = "No open panes";
+    const title_w = runtime.paletteUiTextPrefixWidth(title, title_size, title.len);
+    queueText(state, .{ .x = x + @max(0.0, (content_w - title_w) * 0.5), .y = y, .w = @min(content_w, title_w), .h = title_size * 1.3 }, title, paletteColor(theme.COLOR_WHITE), title_size, rect);
+    y += theme.scaledUi(42.0);
+    const body = "Start a chat or open a terminal from this workspace.";
+    const body_w = runtime.paletteUiTextPrefixWidth(body, body_size, body.len);
+    queueText(state, .{ .x = x + @max(0.0, (content_w - body_w) * 0.5), .y = y, .w = @min(content_w, body_w), .h = body_size * 1.4 }, body, paletteColor(theme.COLOR_TEXT_MUTED), body_size, rect);
+    y += theme.scaledUi(34.0);
+
+    var new_chat_hint_buf: [32]u8 = undefined;
+    var history_hint_buf: [32]u8 = undefined;
+    var terminal_hint_buf: [32]u8 = undefined;
+    const config = state.command_controller.keyboard_config;
+    const new_chat_hint = if (config) |loaded| firstKeybindHint(&new_chat_hint_buf, loaded.new_thread) else "Ctrl+T";
+    const history_hint = if (config) |loaded| firstKeybindHint(&history_hint_buf, loaded.command_palette) else "Ctrl+Shift+P";
+    const terminal_hint = if (config) |loaded| firstKeybindHint(&terminal_hint_buf, loaded.workspace_split_terminal_horizontal) else "Ctrl+Shift+T";
+    const button_x = rect.x + (rect.w - button_w) * 0.5;
+    renderEmptyWorkspaceAction(state, .{ .x = button_x, .y = y, .w = button_w, .h = button_h }, NF_COD_EDIT, "New chat", new_chat_hint, .new_chat_thread, true);
+    y += button_h + theme.scaledUi(8.0);
+    renderEmptyWorkspaceAction(state, .{ .x = button_x, .y = y, .w = button_w, .h = button_h }, NF_COD_HISTORY, "Open previous chat", history_hint, .open_chat_history, false);
+    y += button_h + theme.scaledUi(8.0);
+    renderEmptyWorkspaceAction(state, .{ .x = button_x, .y = y, .w = button_w, .h = button_h }, NF_COD_TERMINAL, "Open terminal pane", terminal_hint, .open_terminal, false);
+}
+
+fn firstKeybindHint(buf: []u8, bindings: []const keybinds.Keybind) []const u8 {
+    if (bindings.len == 0) return "";
+    return keybinds.formatKeybind(buf, bindings[0]);
+}
+
+// One empty-workspace action row with its configured shortcut.
+fn renderEmptyWorkspaceAction(
+    state: *runtime.AppState,
+    rect: palette.Rect,
+    icon: []const u8,
+    label: []const u8,
+    shortcut: []const u8,
+    action: WorkspacePaneAction,
+    primary: bool,
+) void {
+    const hovered = state.transcript_controller.palette_mouse_in_workspace and
+        rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
+    const base_color = if (primary) theme.accent() else theme.COLOR_PANEL_ALT;
+    const button_color = if (hovered) theme.lighten(base_color, 0.08) else base_color;
+    queueRounded(state, rect, paletteColor(button_color), theme.scaledUi(7.0));
+    if (!primary) queueBorder(state, rect, paletteColor(theme.borderMuted()), theme.scaledUi(7.0), theme.scaledUi(1.0));
+
+    const font_size = theme.scaledUi(14.0);
+    const icon_size = theme.scaledUi(15.0);
+    const left = rect.x + theme.scaledUi(13.0);
+    queueIcon(state, .{ .x = left, .y = rect.y + (rect.h - icon_size) * 0.5, .w = icon_size, .h = icon_size }, icon, paletteColor(theme.COLOR_WHITE), icon_size, rect);
+    const label_w = runtime.paletteUiTextPrefixWidth(label, font_size, label.len);
+    queueText(state, .{ .x = left + theme.scaledUi(24.0), .y = rect.y + (rect.h - font_size * 1.25) * 0.5, .w = @min(label_w, rect.w * 0.58), .h = font_size * 1.25 }, label, paletteColor(theme.COLOR_WHITE), font_size, rect);
+    if (shortcut.len > 0) {
+        const hint_size = theme.scaledUi(11.0);
+        const hint_w = runtime.paletteUiTextPrefixWidth(shortcut, hint_size, shortcut.len);
+        queueText(state, .{ .x = rect.x + rect.w - theme.scaledUi(13.0) - hint_w, .y = rect.y + (rect.h - hint_size * 1.25) * 0.5, .w = hint_w, .h = hint_size * 1.25 }, shortcut, paletteColor(if (primary) theme.withAlpha(theme.COLOR_WHITE, 190) else theme.COLOR_TEXT_SUBTLE), hint_size, rect);
+    }
+    appendHit(.{ .action = action, .rect = rect });
 }
 
 // Floating quick-pane overlay above the unchanged tiled workspace.
@@ -905,6 +982,14 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
             },
             .new_chat_thread => {
                 if (state.project_controller.projects.items.len > 0) state.createThreadForProject(state.project_controller.selected_index);
+                split_menu_open_for = null;
+            },
+            .open_chat_history => {
+                if (state.project_controller.projects.items.len > 0) state.openCommandPalette(state.project_controller.selected_index);
+                split_menu_open_for = null;
+            },
+            .open_terminal => {
+                if (state.project_controller.projects.items.len > 0) _ = state.openTerminalPaneForProjectIndex(state.project_controller.selected_index);
                 split_menu_open_for = null;
             },
             .refresh_chat_thread => {
