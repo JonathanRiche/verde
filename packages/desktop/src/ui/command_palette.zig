@@ -406,12 +406,7 @@ pub fn activateRow(state: *runtime.AppState, row_index: usize, replace: bool) vo
         },
         .workspace => |pi| {
             state.closeCommandPalette();
-            if (pi < state.project_controller.projects.items.len) {
-                state.project_controller.selected_index = pi;
-                state.ensureCurrentProjectWorkspace();
-                state.syncRenameBuffer();
-                state.markDirty();
-            }
+            _ = state.selectProjectAtIndex(pi);
         },
         .closed_workspace => |ai| {
             state.closeCommandPalette();
