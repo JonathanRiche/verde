@@ -126,6 +126,8 @@ const WorkspacePaneHitCache = struct {
 
 var hit_cache: WorkspacePaneHitCache = .{};
 var resize_drag: ?WorkspacePaneHit = null;
+const EMPTY_WORKSPACE_ACTION_COUNT: usize = 3;
+var empty_workspace_selected_action: usize = 0;
 const QuickPaneDragKind = enum { move, resize };
 const QuickPaneDrag = struct {
     kind: QuickPaneDragKind,
@@ -207,6 +209,62 @@ var pane_status_animating = false;
 
 pub fn isPaneStatusAnimating() bool {
     return pane_status_animating;
+}
+
+/// Handles navigation only while the selected workspace has no open panes.
+pub fn handleEmptyWorkspaceKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!emptyWorkspaceAcceptsKeyboard(state)) {
+        empty_workspace_selected_action = 0;
+        return false;
+    }
+    const modifiers = keymodBits(event.mod);
+    if ((modifiers & (sdl.Keymod.ctrl | sdl.Keymod.gui | sdl.Keymod.alt | sdl.Keymod.shift)) != 0) return false;
+    switch (event.key) {
+        .up, .left => {
+            empty_workspace_selected_action = emptyWorkspaceSelectionAfterMove(empty_workspace_selected_action, -1);
+            state.markDirty();
+            return true;
+        },
+        .down, .right => {
+            empty_workspace_selected_action = emptyWorkspaceSelectionAfterMove(empty_workspace_selected_action, 1);
+            state.markDirty();
+            return true;
+        },
+        .@"return", .kp_enter => {
+            const action: WorkspacePaneAction = switch (empty_workspace_selected_action) {
+                0 => .new_chat_thread,
+                1 => .open_chat_history,
+                else => .open_terminal,
+            };
+            activateEmptyWorkspaceAction(state, action);
+            empty_workspace_selected_action = 0;
+            return true;
+        },
+        else => return false,
+    }
+}
+
+fn emptyWorkspaceAcceptsKeyboard(state: *const runtime.AppState) bool {
+    if (state.project_controller.projects.items.len == 0) return false;
+    if (state.project_controller.selected_index >= state.project_controller.projects.items.len) return false;
+    if (state.project_controller.projects.items[state.project_controller.selected_index].workspace_layout.visiblePaneCount() != 0) return false;
+    if (state.currentProjectQuickPane()) |quick| if (quick.visible) return false;
+    return true;
+}
+
+fn emptyWorkspaceSelectionAfterMove(current: usize, delta: i8) usize {
+    if (delta < 0) return if (current == 0) EMPTY_WORKSPACE_ACTION_COUNT - 1 else current - 1;
+    return (current + 1) % EMPTY_WORKSPACE_ACTION_COUNT;
+}
+
+fn activateEmptyWorkspaceAction(state: *runtime.AppState, action: WorkspacePaneAction) void {
+    if (state.project_controller.projects.items.len == 0) return;
+    switch (action) {
+        .new_chat_thread => state.createThreadForProject(state.project_controller.selected_index),
+        .open_chat_history => state.openCommandPalette(state.project_controller.selected_index),
+        .open_terminal => _ = state.openTerminalPaneForProjectIndex(state.project_controller.selected_index),
+        else => {},
+    }
 }
 
 pub fn hasActivePaneDrag() bool {
@@ -753,6 +811,10 @@ pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, rect: palette
     chat_panel.resetTranscriptHitCache();
     terminal_panel.resetHitCache();
 
+    if (state.project_controller.projects.items.len == 0 or state.currentProjectWorkspaceRoot() != null) {
+        empty_workspace_selected_action = 0;
+    }
+
     if (state.currentProjectWorkspaceMaximizedPaneId()) |pane_id| {
         renderLeafWithTranscriptLayoutWidth(state, pane_id, rect, target_workspace_width);
     } else if (state.currentProjectWorkspaceRoot()) |root| {
@@ -762,8 +824,11 @@ pub fn renderAtWithTranscriptLayoutWidth(state: *runtime.AppState, rect: palette
         } else {
             renderNode(state, root, rect, target_workspace_width);
         }
-    } else {
+    } else if (state.project_controller.projects.items.len > 0) {
         renderEmptyWorkspace(state, rect);
+    } else {
+        empty_workspace_selected_action = 0;
+        chat_panel.renderWorkspaceAtWithTranscriptLayoutWidth(state, rect, target_workspace_width);
     }
 
     renderQuickPane(state, rect, target_workspace_width);
@@ -801,11 +866,11 @@ fn renderEmptyWorkspace(state: *runtime.AppState, rect: palette.Rect) void {
     const history_hint = if (config) |loaded| firstKeybindHint(&history_hint_buf, loaded.command_palette) else "Ctrl+Shift+P";
     const terminal_hint = if (config) |loaded| firstKeybindHint(&terminal_hint_buf, loaded.workspace_split_terminal_horizontal) else "Ctrl+Shift+T";
     const button_x = rect.x + (rect.w - button_w) * 0.5;
-    renderEmptyWorkspaceAction(state, .{ .x = button_x, .y = y, .w = button_w, .h = button_h }, NF_COD_EDIT, "New chat", new_chat_hint, .new_chat_thread, true);
+    renderEmptyWorkspaceAction(state, .{ .x = button_x, .y = y, .w = button_w, .h = button_h }, NF_COD_EDIT, "New chat", new_chat_hint, .new_chat_thread, true, empty_workspace_selected_action == 0);
     y += button_h + theme.scaledUi(8.0);
-    renderEmptyWorkspaceAction(state, .{ .x = button_x, .y = y, .w = button_w, .h = button_h }, NF_COD_HISTORY, "Open previous chat", history_hint, .open_chat_history, false);
+    renderEmptyWorkspaceAction(state, .{ .x = button_x, .y = y, .w = button_w, .h = button_h }, NF_COD_HISTORY, "Open previous chat", history_hint, .open_chat_history, false, empty_workspace_selected_action == 1);
     y += button_h + theme.scaledUi(8.0);
-    renderEmptyWorkspaceAction(state, .{ .x = button_x, .y = y, .w = button_w, .h = button_h }, NF_COD_TERMINAL, "Open terminal pane", terminal_hint, .open_terminal, false);
+    renderEmptyWorkspaceAction(state, .{ .x = button_x, .y = y, .w = button_w, .h = button_h }, NF_COD_TERMINAL, "Open terminal pane", terminal_hint, .open_terminal, false, empty_workspace_selected_action == 2);
 }
 
 fn firstKeybindHint(buf: []u8, bindings: []const keybinds.Keybind) []const u8 {
@@ -822,13 +887,20 @@ fn renderEmptyWorkspaceAction(
     shortcut: []const u8,
     action: WorkspacePaneAction,
     primary: bool,
+    selected: bool,
 ) void {
     const hovered = state.transcript_controller.palette_mouse_in_workspace and
         rectContains(rect, state.transcript_controller.palette_mouse_x, state.transcript_controller.palette_mouse_y);
     const base_color = if (primary) theme.accent() else theme.COLOR_PANEL_ALT;
-    const button_color = if (hovered) theme.lighten(base_color, 0.08) else base_color;
+    const button_color = if (hovered or selected) theme.lighten(base_color, 0.08) else base_color;
     queueRounded(state, rect, paletteColor(button_color), theme.scaledUi(7.0));
-    if (!primary) queueBorder(state, rect, paletteColor(theme.borderMuted()), theme.scaledUi(7.0), theme.scaledUi(1.0));
+    const border_color = if (selected and primary)
+        theme.COLOR_WHITE
+    else if (selected)
+        theme.accent()
+    else
+        theme.borderMuted();
+    if (!primary or selected) queueBorder(state, rect, paletteColor(border_color), theme.scaledUi(7.0), theme.scaledUi(if (selected) 2.0 else 1.0));
 
     const font_size = theme.scaledUi(14.0);
     const icon_size = theme.scaledUi(15.0);
@@ -981,15 +1053,15 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
                 split_menu_open_for = null;
             },
             .new_chat_thread => {
-                if (state.project_controller.projects.items.len > 0) state.createThreadForProject(state.project_controller.selected_index);
+                activateEmptyWorkspaceAction(state, hit.action);
                 split_menu_open_for = null;
             },
             .open_chat_history => {
-                if (state.project_controller.projects.items.len > 0) state.openCommandPalette(state.project_controller.selected_index);
+                activateEmptyWorkspaceAction(state, hit.action);
                 split_menu_open_for = null;
             },
             .open_terminal => {
-                if (state.project_controller.projects.items.len > 0) _ = state.openTerminalPaneForProjectIndex(state.project_controller.selected_index);
+                activateEmptyWorkspaceAction(state, hit.action);
                 split_menu_open_for = null;
             },
             .refresh_chat_thread => {
@@ -2490,6 +2562,10 @@ fn rectContains(rect: palette.Rect, x: f32, y: f32) bool {
     return x >= rect.x and x <= rect.x + rect.w and y >= rect.y and y <= rect.y + rect.h;
 }
 
+fn keymodBits(modifier_state: sdl.Keymod) u16 {
+    return @as(*const u16, @ptrCast(&modifier_state)).*;
+}
+
 fn stableText(state: *runtime.AppState, value: []const u8) []const u8 {
     return state.palette_frame_text_arena.allocator().dupe(u8, value) catch "";
 }
@@ -2525,6 +2601,14 @@ fn queueIcon(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8, co
 
 fn paletteColor(color: [4]f32) palette.Color {
     return .{ .r = color[0], .g = color[1], .b = color[2], .a = color[3] };
+}
+
+test "empty workspace option navigation wraps without external state" {
+    try std.testing.expectEqual(@as(usize, 1), emptyWorkspaceSelectionAfterMove(0, 1));
+    try std.testing.expectEqual(@as(usize, 2), emptyWorkspaceSelectionAfterMove(1, 1));
+    try std.testing.expectEqual(@as(usize, 0), emptyWorkspaceSelectionAfterMove(2, 1));
+    try std.testing.expectEqual(@as(usize, 2), emptyWorkspaceSelectionAfterMove(0, -1));
+    try std.testing.expectEqual(@as(usize, 0), emptyWorkspaceSelectionAfterMove(1, -1));
 }
 
 test "pane status pulses are bounded and use deliberately slow periods" {
